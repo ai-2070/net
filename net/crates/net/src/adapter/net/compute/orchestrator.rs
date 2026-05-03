@@ -5,7 +5,7 @@
 //! routes migration messages, and handles failures/timeouts.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Buf;
 use dashmap::DashMap;
@@ -594,6 +594,22 @@ pub const MAX_TOTAL_CHUNKS: u32 = 700_000;
 /// flood-amplification a malicious peer can produce.
 pub const MAX_PENDING_REASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Maximum age of a pending reassembly entry before it is swept.
+///
+/// Even with the per-entry byte cap, a peer can park up to
+/// `MAX_PENDING_REASSEMBLY_BYTES` indefinitely under a single
+/// `(daemon_origin, seq_through)` key: the cap refuses *additional*
+/// chunks once buffered bytes reach the ceiling, but it doesn't
+/// evict what's already there, and the `seq_through > latest`
+/// eviction never fires while the peer re-uses the same
+/// `seq_through`. Across many distinct `daemon_origin` values that
+/// produces unbounded growth. The age sweep closes that hole by
+/// removing entries whose last-progress timestamp is older than
+/// this duration. Real snapshots complete in seconds; 5 minutes
+/// leaves headroom for a slow legitimate peer while bounding the
+/// persistence of attacker-shaped state.
+pub const MAX_PENDING_REASSEMBLY_AGE: Duration = Duration::from_secs(300);
+
 /// Split a snapshot into chunked `SnapshotReady` messages.
 ///
 /// Small snapshots (<= `MAX_SNAPSHOT_CHUNK_SIZE`) produce a single message
@@ -751,6 +767,12 @@ pub struct SnapshotReassembler {
     /// Latest `seq_through` accepted per daemon, for stale-chunk rejection
     /// even after a reassembly completes and is evicted from `pending`.
     latest_seq: std::collections::HashMap<u32, u64>,
+    /// Max age applied by the opportunistic sweep at the head of
+    /// every `feed`. Defaults to `MAX_PENDING_REASSEMBLY_AGE`. The
+    /// public `sweep_stale` accepts its own `max_age` and ignores
+    /// this; this field exists so tests can drive the implicit
+    /// sweep without waiting wall-clock minutes.
+    max_pending_age: Duration,
 }
 
 struct ReassemblyState {
@@ -761,14 +783,31 @@ struct ReassemblyState {
     /// feed) so the `MAX_PENDING_REASSEMBLY_BYTES` gate is O(1) per
     /// chunk instead of O(chunks).
     bytes_buffered: usize,
+    /// Time of the most recent chunk arrival for this entry. Resets
+    /// on every accepted chunk so a slow-but-progressing peer never
+    /// trips the age sweep; a stalled entry that hasn't received a
+    /// chunk in `MAX_PENDING_REASSEMBLY_AGE` is dropped by either
+    /// `sweep_stale` or the opportunistic sweep at the head of
+    /// `feed`.
+    last_progress_at: Instant,
 }
 
 impl SnapshotReassembler {
-    /// Create a new reassembler.
+    /// Create a new reassembler with the default
+    /// `MAX_PENDING_REASSEMBLY_AGE` opportunistic-sweep age.
     pub fn new() -> Self {
+        Self::with_max_pending_age(MAX_PENDING_REASSEMBLY_AGE)
+    }
+
+    /// Create a reassembler with a custom opportunistic-sweep age.
+    /// Production callers should use `new()`; this exists primarily
+    /// for tests that need to exercise the in-`feed` sweep without
+    /// waiting wall-clock minutes.
+    pub fn with_max_pending_age(max_pending_age: Duration) -> Self {
         Self {
             pending: std::collections::HashMap::new(),
             latest_seq: std::collections::HashMap::new(),
+            max_pending_age,
         }
     }
 
@@ -787,6 +826,14 @@ impl SnapshotReassembler {
         chunk_index: u32,
         total_chunks: u32,
     ) -> Result<Option<Vec<u8>>, ReassemblyError> {
+        // Opportunistic age sweep. Even without an external scheduler
+        // driving `sweep_stale`, the pending map self-heals as new
+        // traffic arrives, so a hostile peer who parks an entry at
+        // the byte cap and goes silent can't keep it alive
+        // indefinitely. Cheap: `pending` is bounded to one entry
+        // per daemon and the retain is O(n) over a small map.
+        self.sweep_stale(self.max_pending_age);
+
         // ---- Per-chunk validation (no mutation until we've passed these) ----
         if total_chunks == 0 {
             return Err(ReassemblyError::ZeroTotalChunks);
@@ -838,6 +885,7 @@ impl SnapshotReassembler {
             total_chunks,
             chunks: std::collections::BTreeMap::new(),
             bytes_buffered: 0,
+            last_progress_at: Instant::now(),
         });
 
         // The first chunk fixes total_chunks; later chunks must agree.
@@ -875,6 +923,7 @@ impl SnapshotReassembler {
             .bytes_buffered
             .saturating_sub(displaced_len)
             .saturating_add(new_len);
+        state.last_progress_at = Instant::now();
 
         // With `chunk_index < total_chunks` enforced above, the BTreeMap's
         // keys are all in 0..total_chunks. Reaching total_chunks entries
@@ -899,6 +948,30 @@ impl SnapshotReassembler {
     pub fn cancel(&mut self, daemon_origin: u32) {
         self.pending
             .retain(|&(origin, _), _| origin != daemon_origin);
+    }
+
+    /// Drop pending reassemblies whose last-progress timestamp is
+    /// older than `max_age`. Returns the number of entries evicted.
+    ///
+    /// Called opportunistically at the head of every `feed`, but
+    /// also exposed publicly so a topology-aware caller (e.g. the
+    /// migration dispatcher's housekeeping tick) can drive it on a
+    /// timer when no inbound traffic is arriving — the
+    /// `seq_through == latest` path in `feed` cannot self-trigger
+    /// the sweep without a fresh chunk to cause it.
+    ///
+    /// Does **not** reset `latest_seq`: a peer that comes back later
+    /// with the same `seq_through` is still rejected via the usual
+    /// `StaleSeqThrough` gate, so dropping the in-flight buffer
+    /// can't be turned into a snapshot-replacement amplifier.
+    pub fn sweep_stale(&mut self, max_age: Duration) -> usize {
+        let before = self.pending.len();
+        let now = Instant::now();
+        self.pending.retain(|_, state| {
+            now.checked_duration_since(state.last_progress_at)
+                .is_none_or(|age| age < max_age)
+        });
+        before - self.pending.len()
     }
 
     /// Number of pending reassemblies.
@@ -2361,6 +2434,134 @@ mod tests {
             "re-sending an already-buffered chunk index must succeed, got {:?}",
             resend
         );
+    }
+
+    /// Regression: an entry parked at the per-entry byte cap could
+    /// stay in `pending` forever because the `seq_through > latest`
+    /// eviction never fires while a hostile peer re-uses the same
+    /// `seq_through`. The age sweep is the second line of defense:
+    /// any entry whose last-progress is older than `max_age` is
+    /// dropped on the next `sweep_stale` call.
+    #[test]
+    fn reassembler_sweep_stale_drops_quiet_entries() {
+        let mut reassembler = SnapshotReassembler::new();
+        reassembler.feed(0xAAAA, vec![1; 10], 1, 0, 3).unwrap();
+        assert_eq!(reassembler.pending_count(), 1);
+
+        // Wait until the entry's last_progress_at is older than the
+        // sweep age, then sweep.
+        std::thread::sleep(Duration::from_millis(20));
+        let evicted = reassembler.sweep_stale(Duration::from_millis(10));
+        assert_eq!(evicted, 1, "stale entry must be evicted");
+        assert_eq!(reassembler.pending_count(), 0);
+    }
+
+    /// Pin the slow-but-progressing legitimate peer case: every
+    /// chunk that lands resets `last_progress_at`, so the sweep
+    /// only kills entries that have actually gone quiet — not ones
+    /// that are simply slow to receive every chunk.
+    #[test]
+    fn reassembler_sweep_keeps_progressing_entries() {
+        let mut reassembler = SnapshotReassembler::new();
+        reassembler.feed(0xAAAA, vec![1; 10], 1, 0, 3).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        // A second chunk lands — last_progress_at refreshes.
+        reassembler.feed(0xAAAA, vec![1; 10], 1, 1, 3).unwrap();
+
+        // Sweep with an age that would have killed the entry from
+        // its original creation, but is generous relative to the
+        // fresh chunk's timestamp.
+        let evicted = reassembler.sweep_stale(Duration::from_millis(15));
+        assert_eq!(
+            evicted, 0,
+            "entry that received a chunk within max_age must survive"
+        );
+        assert_eq!(reassembler.pending_count(), 1);
+    }
+
+    /// Pin the cross-daemon healing path: even if a particular
+    /// daemon's hostile entry never sees another chunk, the
+    /// opportunistic sweep at the head of every `feed` call drops
+    /// it on the next traffic from ANY daemon.
+    #[test]
+    fn reassembler_opportunistic_sweep_in_feed_drops_quiet_entries() {
+        // Use a tiny opportunistic-sweep age so the in-`feed`
+        // sweep fires within test timescales.
+        let mut reassembler = SnapshotReassembler::with_max_pending_age(Duration::from_millis(10));
+
+        // Hostile daemon parks an entry under (origin=0xBAD, seq=1).
+        reassembler.feed(0xBAD, vec![0xFF; 10], 1, 0, 3).unwrap();
+        assert_eq!(reassembler.pending_count(), 1);
+
+        // Time passes; hostile peer never sends anything else.
+        std::thread::sleep(Duration::from_millis(25));
+
+        // A completely unrelated daemon's chunk arrives. The
+        // opportunistic sweep at the head of `feed` must drop the
+        // hostile entry as a side effect — not just the
+        // explicit-`sweep_stale` driver.
+        reassembler.feed(0xC0DE, vec![1; 10], 5, 0, 3).unwrap();
+
+        // Only the new daemon's entry remains; the hostile
+        // 0xBAD entry was swept.
+        assert_eq!(reassembler.pending_count(), 1);
+    }
+
+    /// Sweeping a stale buffer must not amnesia the daemon's
+    /// `latest_seq`: a peer that comes back later trying to
+    /// re-open the same `seq_through` is still rejected as stale,
+    /// so the sweep can't be turned into a snapshot-replacement
+    /// amplifier.
+    #[test]
+    fn reassembler_sweep_stale_preserves_latest_seq() {
+        let mut reassembler = SnapshotReassembler::new();
+        reassembler.feed(0xAAAA, vec![1; 10], 100, 0, 3).unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+        let evicted = reassembler.sweep_stale(Duration::from_millis(10));
+        assert_eq!(evicted, 1);
+
+        // Old seq_through must still be rejected as stale even
+        // though the in-flight buffer was dropped.
+        let stale = reassembler.feed(0xAAAA, vec![1; 10], 50, 0, 3);
+        assert!(
+            matches!(
+                stale,
+                Err(ReassemblyError::StaleSeqThrough {
+                    got: 50,
+                    latest: 100,
+                })
+            ),
+            "post-sweep replay of an older seq_through must still be rejected, got {:?}",
+            stale,
+        );
+    }
+
+    /// Pin the at-cap + quiet attack: a peer fills an entry to
+    /// just under `MAX_PENDING_REASSEMBLY_BYTES` and goes silent.
+    /// Pre-fix the per-entry byte cap blocked further amplification
+    /// but the parked bytes stayed forever; the sweep closes that
+    /// hole.
+    #[test]
+    fn reassembler_sweep_releases_buffer_parked_at_byte_cap() {
+        let mut reassembler = SnapshotReassembler::new();
+        let chunk_full = vec![0xCCu8; MAX_SNAPSHOT_CHUNK_SIZE];
+        let chunks_to_fill = MAX_PENDING_REASSEMBLY_BYTES / MAX_SNAPSHOT_CHUNK_SIZE;
+        let total_chunks = (chunks_to_fill as u32) + 2;
+        for i in 0..(chunks_to_fill as u32) {
+            reassembler
+                .feed(0xAAAA, chunk_full.clone(), 1, i, total_chunks)
+                .unwrap();
+        }
+        assert_eq!(reassembler.pending_count(), 1);
+
+        // Peer goes silent. Pre-fix the entry would stay parked
+        // at ~MAX_PENDING_REASSEMBLY_BYTES indefinitely.
+        std::thread::sleep(Duration::from_millis(20));
+        let evicted = reassembler.sweep_stale(Duration::from_millis(10));
+        assert_eq!(evicted, 1, "parked-at-cap entry must be released by sweep");
+        assert_eq!(reassembler.pending_count(), 0);
     }
 
     #[test]
