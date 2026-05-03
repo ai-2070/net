@@ -5388,11 +5388,28 @@ impl MeshNode {
 
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
+        // Match the rest of the sender call sites
+        // (`send_to_peer:3661`, `send_to_peer:3685`, `send_routed:3755`,
+        // `send_routed:3785`, `send_on_stream:6110`, `mod.rs:1016, 1063`):
+        // thread `reliable` into the packet header. Pre-fix this site
+        // hard-coded `PacketFlags::NONE` and only fed `reliable` into
+        // `open_stream_with`. Today the dispatch path doesn't inspect
+        // `flags.is_reliable()` (reliability is per-stream, set on
+        // open), so the bug is latent — but the per-call-site
+        // inconsistency would silently bite if a future receiver path
+        // started consulting the packet flag the way `proxy.rs` /
+        // `route.rs` / `router.rs` already consult `is_priority` /
+        // `is_control`.
+        let flags = if reliable {
+            PacketFlags::RELIABLE
+        } else {
+            PacketFlags::NONE
+        };
         let packet = builder.build_subprotocol(
             stream_id,
             seq,
             events,
-            PacketFlags::NONE,
+            flags,
             0, /* subprotocol_id 0 = event-plane */
         );
 
@@ -8298,6 +8315,35 @@ mod heartbeat_aead_tests {
     /// serialize is ultimately a contract test on `dashmap`, but the
     /// shape pin guards against a future refactor that reintroduces
     /// the get→insert split.
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #7:
+    /// `publish_to_peer` was the only sender call site that
+    /// hard-coded `PacketFlags::NONE` instead of computing
+    /// `if reliable { PacketFlags::RELIABLE } else { PacketFlags::NONE }`.
+    /// Today the dispatch path doesn't consult `is_reliable()` (per-
+    /// stream reliability is set at open), so the inconsistency is
+    /// latent — but receiver-side code already consults the packet
+    /// flag for `is_priority` / `is_control`, and `is_reliable` is
+    /// the obvious next addition. This source-level pin ensures the
+    /// fix doesn't get reverted before the dispatch path catches up.
+    #[test]
+    fn publish_to_peer_propagates_reliable_to_packet_flags() {
+        let src = include_str!("mesh.rs");
+        let start = src
+            .find("async fn publish_to_peer(")
+            .expect("publish_to_peer must exist");
+        let scan_end = (start + 6000).min(src.len());
+        let body = &src[start..scan_end];
+
+        assert!(
+            body.contains("if reliable") && body.contains("PacketFlags::RELIABLE"),
+            "regression: publish_to_peer must thread `reliable` into the packet \
+             header — pre-fix it hard-coded PacketFlags::NONE while only \
+             feeding `reliable` into open_stream_with, leaving every other \
+             sender call site (send_to_peer, send_routed, send_on_stream) \
+             inconsistent."
+        );
+    }
+
     #[test]
     fn routed_handshake_uses_entry_api_for_atomic_insert() {
         let src = include_str!("mesh.rs");
