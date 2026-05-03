@@ -1,0 +1,25 @@
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  cdf934b360f502d7 218
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  cdf934b360f502d7 8,597-612,770-775,786-792,796-797,799-806,810,829-836,888,926,953-976,2439-2566
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "9ec7600f1fef3a063d60cd0b5f46b48f1c826f20",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3040,
+      "total_deletions": 4,
+      "accepted_lines": 204,
+      "overriden_lines": 0
+    }
+  }
+}
