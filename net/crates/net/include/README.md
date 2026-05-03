@@ -4,6 +4,8 @@ One header, one shared library. This is the entire C SDK.
 
 Unlocks every language that can call C: C++, Zig, Nim, Lua, Ruby, Java, C#, Dart, Swift, Kotlin, Haskell, Erlang, PHP.
 
+Latest release: [v0.10 — "Killing Moon" Phase III](../docs/RELEASE_v0.10_KILLING_MOON_PHASE_III.md) is a hardening release. The FFI surface picked up several behavior changes that affect any C consumer; see [Behavior changes in v0.10 (FFI)](#behavior-changes-in-v010-ffi) below for the per-call summary.
+
 ## Files
 
 - `net.h` — the header
@@ -369,6 +371,125 @@ net_mesh_stream_t   // Opaque per-peer stream handle.
   near-1:1).
 - [`net/README.md`](../README.md) — architectural overview, NAT
   traversal design, channel visibility model.
+
+## Behavior changes in v0.10 (FFI)
+
+### Panics no longer unwind across the FFI boundary
+
+The cdylib is built with `panic = "abort"` and every `extern "C"`
+body is wrapped in `catch_unwind`. A Rust panic that was previously
+*partially* completing the call before unwinding (and silently
+corrupting your process across the cgo / N-API / cffi boundary) now
+either returns a defined error code or aborts the process cleanly.
+Callers that depended on partial-completion no longer get it.
+
+### Length validation on every wide-input entry point
+
+`net_ingest`, `net_ingest_raw`, `net_ingest_raw_batch`,
+`net_ingest_raw_ex`, `net_mesh_publish`, `net_redex_file_append`,
+`net_identity_sign`, `net_identity_install_token`, and
+`net_parse_token` now reject `len > isize::MAX as usize` (i.e.
+`SSIZE_MAX` on 64-bit; `INT_MAX` on 32-bit) before constructing the
+slice. A C caller passing a stray sign-extended `-1` previously
+triggered immediate UB before any guard fired — now it returns an
+error.
+
+### Alignment checks on handle dereferences
+
+Every FFI handle accessor now checks `is_aligned_to::<HandleType>()`
+before dereferencing. A misaligned `*mut` returned from a wrapper
+that allocated through a non-Rust allocator returns a defined error
+instead of UB.
+
+### `net_free_poll_result` is idempotent
+
+After freeing, the function now nulls `result->events`,
+`result->next_id`, and zeros `result->count` / `result->has_more`.
+Subsequent calls on the same struct are no-ops; passing `NULL` is
+also a no-op. Callers that ran their own field-nulling defensively
+can drop it.
+
+### `net_ingest_raw_batch` surfaces dropped indices
+
+The function takes two new optional out-params:
+
+```c
+int net_ingest_raw_batch(
+    net_handle_t handle,
+    const char* const* jsons,
+    const size_t* lens,
+    size_t count,
+    size_t* out_failed_indices,   /* nullable; up to `count` u32 indices */
+    size_t* out_failed_len        /* nullable; written to with the count */
+);
+```
+
+A null entry pointer or an invalid-UTF-8 entry no longer silently
+disappears from the accepted count — the index is appended to
+`out_failed_indices`. Callers passing `NULL` for both new params
+keep the old "count returned" semantics, but should treat
+`returned_count < count` as "drops happened, you don't know which."
+
+### `net_poll` rejects undersized buffers up front
+
+Buffers below `MIN_RESPONSE_BUFFER` (256 bytes) are now rejected
+with `NET_ERR_BUFFER_TOO_SMALL` *before* the cursor is advanced.
+Pre-fix the cursor was advanced first and then the response was
+dropped — every event in the failed serialization was silently
+lost. Sizing rule: `4 KB` is comfortable; the structured
+`net_poll_ex` path is unaffected.
+
+### Strict config parsing
+
+`parse_config_json` (the JSON dialect every FFI `net_init`-shaped
+call accepts) now errors instead of silently falling back:
+
+- Unknown `backpressure_mode` strings (typos like `"DropOldset"`,
+  retired names like `"FailProduce"`) return
+  `NET_ERR_INVALID_JSON`. Pre-fix they silently selected
+  `"drop_newest"` and you got a different durability profile with
+  no signal.
+- Zero values for `retention_max_events`, `retention_max_bytes`,
+  `retention_max_age_ms` are rejected (they previously meant
+  "evict everything immediately on first append" — almost always
+  unintended). Use `null` or omit the field for "no limit."
+- Zero values for `heartbeat_interval_ms`, `session_timeout_ms`
+  (Net adapter), and mesh `heartbeat_ms` are rejected. A 0 ms
+  heartbeat busy-loops a CPU.
+- A new `Sample { rate }` arm is accepted on `backpressure_mode`
+  with `rate` validation.
+
+### `net_mesh_find_*` modality strings strictly validated
+
+`parse_modality_cap` (called from `net_mesh_announce_capabilities`,
+`net_mesh_find_nodes[_scoped]`, `net_mesh_find_best_node[_scoped]`)
+now returns `NET_ERR_CHANNEL` on unknown modality strings instead of
+silently falling back to `Modality::Text`. A typo in
+`require_modalities` previously returned wrong nodes with no error.
+
+### `net_generate_keypair` / `net_free_string` always linkable
+
+Both symbols are now exported in builds without the `net` feature
+(via no-op stubs) so consumers linking against a `net`-less cdylib
+no longer hit load-time missing-symbol errors despite the header
+promising the symbol.
+
+### `MigrationError::NoTargetAvailable`
+
+Auto-placement (the wrappers that take a capability filter and
+pick a target node) returns the typed `NoTargetAvailable` variant
+when the scheduler finds no candidate, instead of fabricating
+`TargetUnavailable(0)` (which surfaced "target node 0x0 unavailable"
+to operators). C consumers that string-matched on the rendered
+error need to add the new arm.
+
+### Concurrent `net_shutdown` is serialized
+
+A second/third caller of `net_shutdown` no longer returns `Success`
+while the first caller is still inside `runtime.block_on(bus.shutdown())`.
+The shutdown is now atomic across concurrent callers; only one
+caller observes the actual shutdown result, the others see a
+defined "already shutting down" return.
 
 ## License
 
