@@ -5432,11 +5432,7 @@ impl MeshNode {
             PacketFlags::NONE
         };
         let packet = builder.build_subprotocol(
-            stream_id,
-            seq,
-            events,
-            flags,
-            0, /* subprotocol_id 0 = event-plane */
+            stream_id, seq, events, flags, 0, /* subprotocol_id 0 = event-plane */
         );
 
         let next_hop = self
@@ -5851,12 +5847,28 @@ impl MeshNode {
         // loop pending_handshakes path via `connect_via`, which
         // avoids recv-loop contention on a post-`start()` node.
         let connect_on_direct_path = |target_addr: std::net::SocketAddr| async move {
-            if session_matches(target_addr) {
-                return Ok(peer_node_id);
-            }
-            self.connect_via(target_addr, peer_pubkey, peer_node_id)
-                .await
-                .map_err(|e| TraversalError::Transport(e.to_string()))
+            let id = if session_matches(target_addr) {
+                peer_node_id
+            } else {
+                self.connect_via(target_addr, peer_pubkey, peer_node_id)
+                    .await
+                    .map_err(|e| TraversalError::Transport(e.to_string()))?
+            };
+            // After a successful direct upgrade (either an
+            // already-matching session or a fresh `connect_via`
+            // landing), point `addr_to_node` at the upgraded
+            // session's wire addr. `connect_via` deliberately does
+            // NOT touch `addr_to_node` so that *relayed* sessions
+            // keep mapping to the relay's own node_id — but a
+            // direct upgrade has a known peer reflex on the wire
+            // and should benefit from the dispatch fast path
+            // (`addr_to_node.get(&source) → peers.get(nid)`).
+            // Without this insert the dispatcher misses on
+            // `target_addr` and falls back to a linear
+            // `peers.iter().find` per packet for the upgraded
+            // session. (#9)
+            self.addr_to_node.insert(target_addr, peer_node_id);
+            Ok::<u64, TraversalError>(id)
         };
 
         // Helper: open a relayed session via `coord_addr`. Short-
@@ -8341,6 +8353,40 @@ mod heartbeat_aead_tests {
     /// serialize is ultimately a contract test on `dashmap`, but the
     /// shape pin guards against a future refactor that reintroduces
     /// the get→insert split.
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #9:
+    /// `connect_on_direct_path` must refresh
+    /// `addr_to_node[target_addr] = peer_node_id` on success.
+    /// Pre-fix the closure called `connect_via` which deliberately
+    /// does NOT touch `addr_to_node` (correct for relayed sessions
+    /// where the relay's address must keep mapping to the relay's
+    /// own node_id), so a successful direct upgrade left the
+    /// dispatch fast path
+    /// (`addr_to_node.get(&source) → peers.get(nid)`) missing on
+    /// the upgraded session's reflex addr — every inbound packet
+    /// then fell back to a linear `peers.iter().find(|e|
+    /// session_id == ...)` for exactly the sessions that benefit
+    /// most from the index. Source-level pin so the closure body
+    /// keeps the `addr_to_node.insert` after the upgrade lands.
+    #[test]
+    fn connect_direct_upgrade_refreshes_addr_to_node() {
+        let src = include_str!("mesh.rs");
+        let start = src
+            .find("let connect_on_direct_path =")
+            .expect("connect_on_direct_path closure must exist");
+        let scan_end = (start + 4000).min(src.len());
+        let body = &src[start..scan_end];
+
+        assert!(
+            body.contains("self.addr_to_node.insert(target_addr, peer_node_id)"),
+            "regression: connect_on_direct_path must refresh addr_to_node \
+             on success — pre-fix the dispatch fast path missed on the \
+             upgraded session's reflex addr and fell back to a linear \
+             peers.iter().find per packet for exactly the sessions that \
+             benefit most from the index."
+        );
+    }
+
     /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #8: the
     /// migration-handler loopback drain in `process_local_packet`
     /// must cap the synchronous self-bounce depth. Pre-fix the
