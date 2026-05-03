@@ -184,6 +184,14 @@ pub struct NetHandle {
     /// `bus` / `runtime`, defending against a contract-violating
     /// caller that races a post-shutdown call.
     bus_taken: std::sync::atomic::AtomicBool,
+    /// Set to `true` after `bus.shutdown()` returns from the
+    /// first `net_shutdown` call. A second/third concurrent
+    /// `net_shutdown` caller spins until this flips before
+    /// returning success — without this gate the second caller
+    /// observed `bus_taken == true` and returned `Success` while
+    /// the first caller was still mid-`block_on(bus.shutdown())`,
+    /// falsely signaling completion of an in-progress shutdown.
+    shutdown_completed: std::sync::atomic::AtomicBool,
 }
 
 /// Maximum time `net_shutdown` will wait for in-flight FFI operations
@@ -200,15 +208,18 @@ struct FfiOpGuard<'a> {
 
 impl<'a> FfiOpGuard<'a> {
     /// Try to enter an FFI operation. Returns `None` if the handle is
-    /// shutting down.
+    /// shutting down or if `bus` / `runtime` have already been taken.
     ///
     /// Soundness rests on the fact that the box backing `handle` is
     /// never freed (see `NetHandle` doc). The `fetch_add` is therefore
     /// always on valid memory regardless of whether shutdown is in
-    /// progress. The subsequent load of `shutting_down` decides
-    /// whether the op is allowed to proceed; if shutdown was signaled
+    /// progress. The subsequent loads decide whether the op is allowed
+    /// to proceed; if shutdown was signaled or `bus_taken` flipped
     /// before our increment was visible, we bail without touching
-    /// `bus` / `runtime`.
+    /// `bus` / `runtime`. The `bus_taken` check defends against a
+    /// contract-violating caller that races a post-shutdown call: even
+    /// if `shutting_down` was reset somehow, an op that would touch the
+    /// already-taken `ManuallyDrop` fields is rejected.
     fn try_enter(handle: &'a NetHandle) -> Option<Self> {
         handle
             .active_ops
@@ -216,6 +227,7 @@ impl<'a> FfiOpGuard<'a> {
         if handle
             .shutting_down
             .load(std::sync::atomic::Ordering::SeqCst)
+            || handle.bus_taken.load(std::sync::atomic::Ordering::SeqCst)
         {
             handle
                 .active_ops
@@ -233,6 +245,16 @@ impl Drop for FfiOpGuard<'_> {
             .active_ops
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
+}
+
+/// Returns `true` when `handle` is non-null and aligned for
+/// `NetHandle`. Every `extern "C"` entry point that derefs the
+/// raw handle must gate on this — a misaligned pointer produced
+/// by an over-eager `void *` cast in a foreign caller would be
+/// immediate UB on `&*handle`, even before the `is_null` check.
+#[inline]
+fn handle_is_valid(handle: *const NetHandle) -> bool {
+    !handle.is_null() && (handle as usize).is_multiple_of(std::mem::align_of::<NetHandle>())
 }
 
 /// Error codes returned by FFI functions.
@@ -263,6 +285,15 @@ pub enum NetError {
     /// pair without verifying they were created from the same node,
     /// allowing silent cross-session traffic.
     MismatchedHandles = -10,
+    /// `CString::new` failure: the input bytes are valid UTF-8 by
+    /// Rust's `String` invariant but contain an interior NUL byte
+    /// — and the C ABI cannot represent that, since C strings are
+    /// NUL-terminated. Pre-fix this was reported as
+    /// `InvalidUtf8`, which was wrong: the input is UTF-8-valid;
+    /// it just has a NUL where C expects it not to. A binding
+    /// reading the typed error and seeing "invalid UTF-8" would
+    /// chase the wrong cause.
+    InteriorNul = -11,
     /// Unknown error.
     Unknown = -99,
 }
@@ -369,12 +400,37 @@ fn parse_config_json(json_str: &str) -> Option<EventBusConfig> {
         builder = builder.ring_buffer_capacity(capacity);
     }
 
-    if let Some(mode) = value.get("backpressure_mode").and_then(|v| v.as_str()) {
-        let bp_mode = match mode {
-            "DropNewest" | "drop_newest" => crate::config::BackpressureMode::DropNewest,
-            "DropOldest" | "drop_oldest" => crate::config::BackpressureMode::DropOldest,
-            "FailProducer" | "fail_producer" => crate::config::BackpressureMode::FailProducer,
-            _ => crate::config::BackpressureMode::DropNewest,
+    if let Some(bp_value) = value.get("backpressure_mode") {
+        let bp_mode = if let Some(mode) = bp_value.as_str() {
+            match mode {
+                "DropNewest" | "drop_newest" => crate::config::BackpressureMode::DropNewest,
+                "DropOldest" | "drop_oldest" => crate::config::BackpressureMode::DropOldest,
+                "FailProducer" | "fail_producer" => crate::config::BackpressureMode::FailProducer,
+                // Pre-fix every other string silently fell back to
+                // `DropNewest`. A typo (`"DropOldset"`) thus
+                // changed durability profile at deploy time with
+                // no error. Reject unknowns to match the contract
+                // already enforced by `parse_poll_request_json`.
+                _ => return None,
+            }
+        } else if let Some(obj) = bp_value.as_object() {
+            // Object form: `{"Sample": {"rate": N}}` for the
+            // sampling mode that has an associated value.
+            if let Some(sample) = obj.get("Sample").or_else(|| obj.get("sample")) {
+                let rate = sample.get("rate").and_then(|v| v.as_u64())?;
+                let rate = u32::try_from(rate).ok()?;
+                if rate == 0 {
+                    // Validated again by `EventBusConfig::validate`,
+                    // but reject earlier so the parser surface
+                    // matches the validator surface.
+                    return None;
+                }
+                crate::config::BackpressureMode::Sample { rate }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
         };
         builder = builder.backpressure_mode(bp_mode);
     }
@@ -487,12 +543,27 @@ fn parse_config_json(json_str: &str) -> Option<EventBusConfig> {
             }
         }
 
+        // Reject `0` for `heartbeat_interval_ms` and
+        // `session_timeout_ms`. `EventBusConfig::validate` rejects
+        // zero `Duration`s for `cooldown`, `metrics_window`, etc.,
+        // but the Net adapter's JSON parser had no equivalent guard
+        // — a `0` here flowed through to `Duration::from_millis(0)`,
+        // which on the heartbeat path busy-loops the heartbeat task
+        // and saturates a CPU. Treat zero as a misconfig and refuse
+        // to build the bus, surfacing as `InvalidJson` so the FFI
+        // caller sees a typed failure rather than a hung daemon.
         if let Some(interval_ms) = net.get("heartbeat_interval_ms").and_then(|v| v.as_u64()) {
+            if interval_ms == 0 {
+                return None;
+            }
             net_config =
                 net_config.with_heartbeat_interval(std::time::Duration::from_millis(interval_ms));
         }
 
         if let Some(timeout_ms) = net.get("session_timeout_ms").and_then(|v| v.as_u64()) {
+            if timeout_ms == 0 {
+                return None;
+            }
             net_config =
                 net_config.with_session_timeout(std::time::Duration::from_millis(timeout_ms));
         }
@@ -533,6 +604,7 @@ fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut NetHandl
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         active_ops: std::sync::atomic::AtomicU32::new(0),
         bus_taken: std::sync::atomic::AtomicBool::new(false),
+        shutdown_completed: std::sync::atomic::AtomicBool::new(false),
     });
 
     Box::into_raw(handle)
@@ -556,7 +628,7 @@ pub extern "C" fn net_ingest(
     event_json: *const c_char,
     len: usize,
 ) -> c_int {
-    if handle.is_null() || event_json.is_null() {
+    if !handle_is_valid(handle) || event_json.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -566,6 +638,15 @@ pub extern "C" fn net_ingest(
         Err(err) => return err,
     };
 
+    // `slice::from_raw_parts` requires `len <= isize::MAX`. A
+    // C caller passing a sign-extended `-1` (or any
+    // `len > isize::MAX as usize`) triggers immediate UB before
+    // any other validation runs. Reject such inputs explicitly
+    // — caller should never see this in practice; surfacing a
+    // typed error is safer than UB.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     // Parse event JSON
     let json_bytes = unsafe { std::slice::from_raw_parts(event_json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
@@ -602,7 +683,7 @@ pub extern "C" fn net_ingest(
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
 pub extern "C" fn net_ingest_raw(handle: *mut NetHandle, json: *const c_char, len: usize) -> c_int {
-    if handle.is_null() || json.is_null() {
+    if !handle_is_valid(handle) || json.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -612,6 +693,10 @@ pub extern "C" fn net_ingest_raw(handle: *mut NetHandle, json: *const c_char, le
         Err(err) => return err,
     };
 
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let json_bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
         Ok(s) => s,
@@ -645,7 +730,7 @@ pub extern "C" fn net_ingest_raw_batch(
     lens: *const usize,
     count: usize,
 ) -> c_int {
-    if handle.is_null() || jsons.is_null() || lens.is_null() {
+    if !handle_is_valid(handle) || jsons.is_null() || lens.is_null() {
         return NetError::NullPointer.into();
     }
     if count == 0 {
@@ -658,19 +743,77 @@ pub extern "C" fn net_ingest_raw_batch(
         Err(err) => return err,
     };
     let mut events = Vec::with_capacity(count);
+    // Track per-entry drops so the caller's accounting can
+    // reconcile the returned count against the input count.
+    // Pre-fix per-entry rejects (null pointer, oversized length,
+    // invalid UTF-8) were silently `continue`-d and the caller
+    // saw `count - drops` accepted events without any signal as
+    // to which input indices were dropped. A binding that
+    // attributed the drop to back-pressure and retried got the
+    // wrong indices and double-published the good ones.
+    //
+    // The C-API contract is "returns count of accepted events";
+    // expanding it to take an out-param of dropped indices is
+    // an API addition, not a fix-in-place. Emit `tracing::warn!`
+    // with the offending index AND reason so operators
+    // observing the bus can correlate drop counts to specific
+    // inputs without changing the C surface. For high-volume
+    // bindings this should still be sized at one log line per
+    // dropped entry; if that ever matters in practice the
+    // `*_ex` follow-up can return the indices structurally.
+    let mut dropped_null = 0usize;
+    let mut dropped_oversize = 0usize;
+    let mut dropped_invalid_utf8 = 0usize;
 
     for i in 0..count {
         let json_ptr = unsafe { *jsons.add(i) };
         let len = unsafe { *lens.add(i) };
 
         if json_ptr.is_null() {
+            tracing::warn!(
+                index = i,
+                "net_ingest_raw_batch: dropping entry with null pointer"
+            );
+            dropped_null += 1;
             continue;
         }
 
-        let json_bytes = unsafe { std::slice::from_raw_parts(json_ptr as *const u8, len) };
-        if let Ok(json_str) = std::str::from_utf8(json_bytes) {
-            events.push(RawEvent::from_str(json_str));
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        // Skip pathological per-entry lengths rather than UB.
+        if len > isize::MAX as usize {
+            tracing::warn!(
+                index = i,
+                len,
+                "net_ingest_raw_batch: dropping entry with len > isize::MAX"
+            );
+            dropped_oversize += 1;
+            continue;
         }
+        let json_bytes = unsafe { std::slice::from_raw_parts(json_ptr as *const u8, len) };
+        match std::str::from_utf8(json_bytes) {
+            Ok(json_str) => events.push(RawEvent::from_str(json_str)),
+            Err(_) => {
+                tracing::warn!(
+                    index = i,
+                    "net_ingest_raw_batch: dropping entry with invalid UTF-8"
+                );
+                dropped_invalid_utf8 += 1;
+            }
+        }
+    }
+    let total_dropped = dropped_null + dropped_oversize + dropped_invalid_utf8;
+    if total_dropped > 0 {
+        // Aggregate summary for log-pipeline filters that fold
+        // per-index lines.
+        tracing::warn!(
+            input_count = count,
+            dropped_null,
+            dropped_oversize,
+            dropped_invalid_utf8,
+            "net_ingest_raw_batch: {} of {} entries dropped before ingest",
+            total_dropped,
+            count,
+        );
     }
 
     let count = handle.bus.ingest_raw_batch(events);
@@ -692,7 +835,7 @@ pub extern "C" fn net_ingest_raw_batch(
 /// Number of successfully ingested events, or negative error code.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_ingest_batch(handle: *mut NetHandle, events_json: *const c_char) -> c_int {
-    if handle.is_null() || events_json.is_null() {
+    if !handle_is_valid(handle) || events_json.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -777,7 +920,7 @@ pub extern "C" fn net_poll(
     out_buffer: *mut c_char,
     buffer_len: usize,
 ) -> c_int {
-    if handle.is_null() || out_buffer.is_null() {
+    if !handle_is_valid(handle) || out_buffer.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -800,6 +943,25 @@ pub extern "C" fn net_poll(
             Err(code) => return code,
         }
     };
+
+    // Reject buffers too small to even hold an empty-response
+    // JSON envelope. This catches the degenerate "tiny buffer"
+    // case before we hit the adapter — `BufferTooSmall` returned
+    // here means "no work was done, caller's cursor is unchanged."
+    // 256 bytes comfortably fits the empty-response JSON below
+    // even with a long echoed `next_id` cursor.
+    const MIN_RESPONSE_BUFFER: usize = 256;
+    if buffer_len < MIN_RESPONSE_BUFFER {
+        return NetError::BufferTooSmall.into();
+    }
+
+    // Stash the cursor before moving `request` into `poll()` so
+    // the post-poll fallback can echo it back to the caller. On
+    // overflow we write a minimal "no events delivered, cursor
+    // unchanged" response so the caller's next poll re-fetches
+    // the same range — events are not lost on idempotent
+    // adapters (Redis XRANGE, JetStream direct_get).
+    let cursor_snapshot = request.from_id.clone();
 
     // Poll
     let response = match handle.runtime.block_on(handle.bus.poll(request)) {
@@ -835,8 +997,35 @@ pub extern "C" fn net_poll(
         Err(_) => return NetError::Unknown.into(),
     };
 
-    // Check buffer size
+    // Buffer overflow: emit a minimal fallback response that echoes
+    // the caller's original cursor as `next_id`. The caller's next
+    // poll runs against the same range and re-delivers the events
+    // (idempotent on Redis XRANGE / JetStream direct_get). Without
+    // this, a caller that trusts `next_id` blindly would advance
+    // past the unread batch.
     if response_json.len() + 1 > buffer_len {
+        let fallback = serde_json::to_string(&serde_json::json!({
+            "events": [],
+            "next_id": cursor_snapshot,
+            "has_more": true,
+            "count": 0,
+            "parse_errors": 0,
+            "buffer_too_small": true,
+            "events_dropped": total_events,
+        }))
+        .unwrap_or_else(|_| String::from(
+            r#"{"events":[],"next_id":null,"has_more":true,"count":0,"parse_errors":0,"buffer_too_small":true}"#
+        ));
+        if fallback.len() < buffer_len {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    fallback.as_ptr() as *const c_char,
+                    out_buffer,
+                    fallback.len(),
+                );
+                *out_buffer.add(fallback.len()) = 0;
+            }
+        }
         return NetError::BufferTooSmall.into();
     }
 
@@ -879,7 +1068,7 @@ pub extern "C" fn net_stats(
     out_buffer: *mut c_char,
     buffer_len: usize,
 ) -> c_int {
-    if handle.is_null() || out_buffer.is_null() {
+    if !handle_is_valid(handle) || out_buffer.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -936,7 +1125,7 @@ pub extern "C" fn net_stats(
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
 pub extern "C" fn net_flush(handle: *mut NetHandle) -> c_int {
-    if handle.is_null() {
+    if !handle_is_valid(handle) {
         return NetError::NullPointer.into();
     }
 
@@ -973,7 +1162,7 @@ pub extern "C" fn net_flush(handle: *mut NetHandle) -> c_int {
 /// callers initialize the bus once and shut down once.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
-    if handle.is_null() {
+    if !handle_is_valid(handle) {
         return NetError::NullPointer.into();
     }
 
@@ -1041,14 +1230,36 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
             return NetError::Unknown.into();
         }
 
-        // Idempotent shutdown: if a previous `net_shutdown` already moved
-        // out the bus/runtime, do not call `ManuallyDrop::take` a second
-        // time (that would be UB). The first call has already done the
-        // work; report success.
+        // Idempotent shutdown: if a previous `net_shutdown` already
+        // moved out the bus/runtime, do not call `ManuallyDrop::take`
+        // a second time (that would be UB). The first call may still
+        // be inside `runtime.block_on(bus.shutdown())` though — pre-
+        // fix the second caller observed `bus_taken == true` and
+        // returned `Success` immediately, falsely signaling
+        // completion of an in-progress shutdown. Spin on
+        // `shutdown_completed` (set by the first caller AFTER
+        // `bus.shutdown()` returns) so subsequent callers wait for
+        // the actual completion.
         if handle_ref
             .bus_taken
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
+            // Wait for the first caller to actually finish.
+            // Bounded by the same FFI_SHUTDOWN_DEADLINE as the
+            // `active_ops` drain — if the first caller is wedged
+            // longer than that, we surface a Transient error rather
+            // than block forever.
+            let inner_deadline = std::time::Instant::now() + FFI_SHUTDOWN_DEADLINE;
+            while !handle_ref
+                .shutdown_completed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                if std::time::Instant::now() >= inner_deadline {
+                    return NetError::Unknown.into();
+                }
+                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             return NetError::Success.into();
         }
         drained
@@ -1083,6 +1294,15 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
     // `bus` and `runtime` go out of scope here and are dropped.
     // The leaked box keeps the atomics alive for any straggler ops.
 
+    // Signal completion to any second/third caller spinning on
+    // `shutdown_completed` in the idempotent path above. Done
+    // AFTER `bus.shutdown()` returns and AFTER the bus / runtime
+    // drop, so subsequent callers can rely on this flag as a
+    // hard "shutdown is fully done" barrier.
+    unsafe { &*handle }
+        .shutdown_completed
+        .store(true, std::sync::atomic::Ordering::Release);
+
     match result {
         Ok(()) => NetError::Success.into(),
         Err(_) => NetError::Unknown.into(),
@@ -1100,7 +1320,7 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
 /// Number of shards, or 0 if handle is null.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
-    if handle.is_null() {
+    if !handle_is_valid(handle) {
         return 0;
     }
     let handle = unsafe { &*handle };
@@ -1159,6 +1379,39 @@ pub extern "C" fn net_free_string(s: *mut c_char) {
     }
 }
 
+// `net.h` declares both `net_generate_keypair` and
+// `net_free_string` unconditionally — a consumer linking against
+// a cdylib built without the `net` feature would otherwise hit
+// a load-time missing-symbol error despite the header advertising
+// the symbol. Provide always-empty stubs so the symbol is
+// resolvable on every build configuration. Mirrors the
+// `nat-traversal` cfg pattern in `mesh.rs`.
+
+/// Stub for builds without the `net` feature.
+///
+/// `net.h` declares `net_generate_keypair` unconditionally, so
+/// the symbol must be resolvable on every build configuration.
+/// Returns NULL since keypair generation requires the net feature.
+#[cfg(not(feature = "net"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_generate_keypair() -> *mut c_char {
+    ptr::null_mut()
+}
+
+/// Stub for builds without the `net` feature.
+///
+/// Mirrors the always-on signature in `net.h`. Reclaims a
+/// CString-allocated pointer if non-null.
+#[cfg(not(feature = "net"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_free_string(s: *mut c_char) {
+    if !s.is_null() {
+        unsafe {
+            drop(std::ffi::CString::from_raw(s));
+        }
+    }
+}
+
 // =========================================================================
 // Structured (non-JSON) API — _ex variants
 // =========================================================================
@@ -1171,6 +1424,27 @@ pub struct NetReceipt {
     /// Insertion timestamp (nanoseconds).
     pub timestamp: u64,
 }
+
+// Pin layout invariants for `NetReceipt`. `#[repr(C)]` already
+// gives C ABI compatibility per platform, but doesn't catch a
+// future field-reorder or field-add — both would silently break
+// any C/Go/Python binding that hard-codes the struct layout.
+// Static asserts on 64-bit targets (the production deployment
+// shape) trip CI before such a change reaches a binary release.
+//
+// 64-bit: `u16 (2) + 6 pad + u64 (8)` = 16 bytes, alignment 8.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<NetReceipt>() == 16,
+    "NetReceipt size changed on 64-bit; bindings hard-code 16. \
+     If the change is intentional, bump the binding versions and \
+     update this assertion."
+);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::align_of::<NetReceipt>() == 8,
+    "NetReceipt alignment changed on 64-bit; bindings expect 8."
+);
 
 /// A single stored event for C consumers.
 ///
@@ -1208,6 +1482,25 @@ pub struct NetEvent {
     pub shard_id: u16,
 }
 
+// Pin layout invariants for `NetEvent`. See `NetReceipt`'s
+// asserts for rationale. Bindings (C, Go, Python, Node) hard-
+// code 48 bytes on 64-bit; an accidental reorder or new field
+// would silently shift every offset.
+//
+// 64-bit: `4 × 8 (ptrs/usize) + u64 (8) + u16 (2) + 6 trail` = 48.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<NetEvent>() == 48,
+    "NetEvent size changed on 64-bit; bindings hard-code 48. \
+     If the change is intentional, bump the binding versions and \
+     update this assertion."
+);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::align_of::<NetEvent>() == 8,
+    "NetEvent alignment changed on 64-bit; bindings expect 8."
+);
+
 /// Poll result for C consumers.
 #[repr(C)]
 pub struct NetPollResult {
@@ -1240,7 +1533,7 @@ pub extern "C" fn net_ingest_raw_ex(
     len: usize,
     out: *mut NetReceipt,
 ) -> c_int {
-    if handle.is_null() || json.is_null() {
+    if !handle_is_valid(handle) || json.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -1250,6 +1543,10 @@ pub extern "C" fn net_ingest_raw_ex(
         Err(err) => return err,
     };
 
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let json_bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
         Ok(s) => s,
@@ -1282,8 +1579,25 @@ pub extern "C" fn net_poll_ex(
     cursor: *const c_char,
     out: *mut NetPollResult,
 ) -> c_int {
-    if handle.is_null() || out.is_null() {
+    if !handle_is_valid(handle) || out.is_null() {
         return NetError::NullPointer.into();
+    }
+
+    // Pre-validate `limit` BEFORE calling `bus.poll` — the bus
+    // advances the consumer cursor before returning, so any
+    // post-poll allocation failure (e.g. `Layout::array::<NetEvent>`
+    // overflow on a pathological `count`, or `std::alloc::alloc`
+    // returning null under memory pressure) would drop the response
+    // and lose every event the cursor just stepped past. Reject
+    // requests whose `count * size_of::<NetEvent>` would overflow
+    // `isize::MAX` (the `Layout::array` cap) up front, so the
+    // failure happens before the cursor moves.
+    if limit > 0
+        && (std::mem::size_of::<NetEvent>())
+            .checked_mul(limit)
+            .is_none_or(|v| v > isize::MAX as usize)
+    {
+        return NetError::IntOverflow.into();
     }
 
     let handle = unsafe { &*handle };
@@ -1309,6 +1623,16 @@ pub extern "C" fn net_poll_ex(
     let count = response.events.len();
 
     // Allocate events array.
+    //
+    // Each iteration allocates two boxed byte slices via
+    // `Vec::to_vec().into_boxed_slice()`, which panic on OOM in
+    // the global allocator. A panic across this `extern "C"`
+    // body is UB — under the cgo/N-API/cffi unwind model the
+    // panic propagates into a frame that doesn't expect it. Wrap
+    // the per-event build in `catch_unwind`, track how many
+    // events we've fully written, and on panic / mid-loop
+    // failure free the partial array via `free_events_array`
+    // so neither UB nor the partial allocations leak.
     let events_ptr = if count > 0 {
         let layout = match std::alloc::Layout::array::<NetEvent>(count) {
             Ok(l) => l,
@@ -1319,26 +1643,40 @@ pub extern "C" fn net_poll_ex(
             return NetError::Unknown.into();
         }
 
-        for (i, event) in response.events.iter().enumerate() {
-            // Leak id and raw strings so they live until net_free_poll_result.
-            let id_bytes = event.id.as_bytes().to_vec().into_boxed_slice();
-            let id_len = id_bytes.len();
-            let id_ptr = Box::into_raw(id_bytes) as *const c_char;
+        // Shared counter so the outer scope can clean up partial
+        // writes if any iteration panics.
+        let completed = std::cell::Cell::new(0usize);
+        let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for (i, event) in response.events.iter().enumerate() {
+                let id_bytes = event.id.as_bytes().to_vec().into_boxed_slice();
+                let id_len = id_bytes.len();
+                let id_ptr = Box::into_raw(id_bytes) as *const c_char;
 
-            let raw_bytes = event.raw.to_vec().into_boxed_slice();
-            let raw_len = raw_bytes.len();
-            let raw_ptr = Box::into_raw(raw_bytes) as *const c_char;
+                let raw_bytes = event.raw.to_vec().into_boxed_slice();
+                let raw_len = raw_bytes.len();
+                let raw_ptr = Box::into_raw(raw_bytes) as *const c_char;
 
-            unsafe {
-                ptr.add(i).write(NetEvent {
-                    id: id_ptr,
-                    id_len,
-                    raw: raw_ptr,
-                    raw_len,
-                    insertion_ts: event.insertion_ts,
-                    shard_id: event.shard_id,
-                });
+                unsafe {
+                    ptr.add(i).write(NetEvent {
+                        id: id_ptr,
+                        id_len,
+                        raw: raw_ptr,
+                        raw_len,
+                        insertion_ts: event.insertion_ts,
+                        shard_id: event.shard_id,
+                    });
+                }
+                completed.set(i + 1);
             }
+        }));
+        if build_result.is_err() {
+            // A panic landed mid-loop. Free fully-written events
+            // (those past `completed.get()` were never written, so
+            // the inner `id`/`raw` pointers aren't valid). The
+            // events array was allocated for `count` NetEvent
+            // slots, so the dealloc must use that same layout.
+            free_events_array_partial(ptr, completed.get(), count);
+            return NetError::Unknown.into();
         }
         ptr
     } else {
@@ -1350,9 +1688,16 @@ pub extern "C" fn net_poll_ex(
         Some(ref s) => match std::ffi::CString::new(s.as_str()) {
             Ok(c) => c.into_raw(),
             Err(_) => {
-                // Free already-allocated events before returning error
+                // Free already-allocated events before returning
+                // error. `s.as_str()` is valid UTF-8 by `String`
+                // invariant, so this is the interior-NUL path —
+                // an upstream cursor id that contains `\0` cannot
+                // round-trip through a C string. Pre-fix this
+                // returned `InvalidUtf8`, which mis-described
+                // the cause; bindings now see the more accurate
+                // `InteriorNul`.
                 free_events_array(events_ptr, count);
-                return NetError::InvalidUtf8.into();
+                return NetError::InteriorNul.into();
             }
         },
         None => ptr::null_mut(),
@@ -1369,11 +1714,29 @@ pub extern "C" fn net_poll_ex(
 }
 
 /// Free an events array and all its id/raw allocations.
+///
+/// `count` is the number of fully-written events (those whose
+/// inner `id` / `raw` boxed slices were initialized). It must
+/// also match the `Layout::array::<NetEvent>` used at allocation
+/// time — every existing caller writes exactly `count` events
+/// before invoking this function. For partial-cleanup paths
+/// (e.g. panic mid-build), use [`free_events_array_partial`].
 fn free_events_array(events: *mut NetEvent, count: usize) {
-    if events.is_null() || count == 0 {
+    free_events_array_partial(events, count, count);
+}
+
+/// Free an events array where only `walk_count` entries have
+/// fully-initialized `id`/`raw` allocations, but the array
+/// itself was allocated for `alloc_count` slots. Per-event
+/// boxes are freed for `0..walk_count`; the array is then
+/// deallocated with the original `Layout::array::<NetEvent>(alloc_count)`
+/// to match the allocation. Used by `net_poll_ex`'s panic-mid-loop
+/// recovery path.
+fn free_events_array_partial(events: *mut NetEvent, walk_count: usize, alloc_count: usize) {
+    if events.is_null() || alloc_count == 0 {
         return;
     }
-    for i in 0..count {
+    for i in 0..walk_count {
         let event = unsafe { &*events.add(i) };
         if !event.id.is_null() {
             unsafe {
@@ -1392,7 +1755,7 @@ fn free_events_array(events: *mut NetEvent, count: usize) {
             }
         }
     }
-    if let Ok(layout) = std::alloc::Layout::array::<NetEvent>(count) {
+    if let Ok(layout) = std::alloc::Layout::array::<NetEvent>(alloc_count) {
         unsafe {
             std::alloc::dealloc(events as *mut u8, layout);
         }
@@ -1411,7 +1774,7 @@ pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
         return;
     }
 
-    let result = unsafe { &*result };
+    let result = unsafe { &mut *result };
 
     // Free events array and all id/raw allocations.
     free_events_array(result.events, result.count);
@@ -1422,12 +1785,23 @@ pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
             drop(std::ffi::CString::from_raw(result.next_id));
         }
     }
+
+    // Null the fields so a second `net_free_poll_result` on the
+    // same struct is a safe no-op rather than a double-free. The
+    // C header's contract just says "free a poll result"; without
+    // this clear, a defensive caller calling free twice (or two
+    // wrappers each calling free in their destructor) would
+    // re-`Box::from_raw` an already-freed pointer.
+    result.events = std::ptr::null_mut();
+    result.count = 0;
+    result.next_id = std::ptr::null_mut();
+    result.has_more = 0;
 }
 
 /// Get stats without JSON serialization.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_stats_ex(handle: *mut NetHandle, out: *mut NetStats) -> c_int {
-    if handle.is_null() || out.is_null() {
+    if !handle_is_valid(handle) || out.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -1497,6 +1871,65 @@ mod tests {
     fn test_parse_config_empty() {
         let config = parse_config_json(r#"{}"#);
         assert!(config.is_some(), "empty config should use defaults");
+    }
+
+    /// Pin: known `backpressure_mode` strings round-trip; an
+    /// unknown value (typo) is rejected with `None`, not silently
+    /// downgraded to `DropNewest`. Pre-fix a deploy-time typo
+    /// like `"DropOldset"` swapped the operator's intended
+    /// durability for `DropNewest` with no diagnostic.
+    #[test]
+    fn parse_config_rejects_unknown_backpressure_mode() {
+        // Known values still parse.
+        for s in [
+            "DropNewest",
+            "drop_newest",
+            "DropOldest",
+            "drop_oldest",
+            "FailProducer",
+            "fail_producer",
+        ] {
+            let cfg = parse_config_json(&format!(r#"{{"backpressure_mode": "{}"}}"#, s));
+            assert!(cfg.is_some(), "known mode `{}` must parse", s);
+        }
+
+        // Typos must fail.
+        for s in ["DropOldset", "FailProduce", "drop_oldst", "garbage", ""] {
+            let cfg = parse_config_json(&format!(r#"{{"backpressure_mode": "{}"}}"#, s));
+            assert!(
+                cfg.is_none(),
+                "unknown mode `{}` must reject (pre-fix this silently \
+                 fell through to DropNewest)",
+                s,
+            );
+        }
+
+        // Wrong JSON type also fails — pre-fix this hit the
+        // `and_then(|v| v.as_str())` short-circuit and was
+        // ignored entirely.
+        let cfg = parse_config_json(r#"{"backpressure_mode": 42}"#);
+        assert!(
+            cfg.is_none(),
+            "non-string non-object backpressure_mode must reject"
+        );
+        let cfg = parse_config_json(r#"{"backpressure_mode": true}"#);
+        assert!(cfg.is_none(), "boolean backpressure_mode must reject");
+    }
+
+    /// Pin: the `Sample { rate }` mode is reachable from JSON
+    /// via `{"backpressure_mode": {"Sample": {"rate": N}}}`,
+    /// and a zero rate is rejected (validator already rejects
+    /// it; the parser must too, so the surface is consistent).
+    #[test]
+    fn parse_config_supports_sample_mode_with_validation() {
+        let cfg = parse_config_json(r#"{"backpressure_mode": {"Sample": {"rate": 10}}}"#);
+        assert!(cfg.is_some(), "Sample with non-zero rate must parse");
+
+        let cfg = parse_config_json(r#"{"backpressure_mode": {"Sample": {"rate": 0}}}"#);
+        assert!(cfg.is_none(), "Sample with rate=0 must reject");
+
+        let cfg = parse_config_json(r#"{"backpressure_mode": {"Sample": {}}}"#);
+        assert!(cfg.is_none(), "Sample missing rate must reject");
     }
 
     // Regression: the Go binding's `Poll(limit, cursor)` serializes a
@@ -1604,7 +2037,7 @@ mod tests {
         // Rust source, this list — AND both headers — must be
         // updated together. The asserts that follow then catch a
         // missing header update at the next CI run.
-        let rust_values: &[i32] = &[0, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -99];
+        let rust_values: &[i32] = &[0, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -99];
 
         // Pull every numeric literal that looks like an enum-value
         // assignment (`= <number>` followed by `,` or whitespace).
@@ -1670,5 +2103,100 @@ mod tests {
                 v
             );
         }
+    }
+
+    /// `handle_is_valid` rejects null and any pointer not aligned for
+    /// `NetHandle`. A foreign caller producing a misaligned pointer
+    /// (e.g. via an over-eager `void *` cast on a packed struct) hits
+    /// `&*handle` UB before any other check fires; this gate is the
+    /// pre-deref discriminator.
+    #[test]
+    fn handle_is_valid_rejects_null_and_misaligned() {
+        // Null is rejected.
+        assert!(
+            !handle_is_valid(std::ptr::null::<NetHandle>()),
+            "null pointer must not be considered a valid handle"
+        );
+
+        // Aligned but non-null is accepted (we use a small backing
+        // buffer to materialize a pointer without dereferencing it).
+        // `align_of::<NetHandle>()` is the alignment we must match.
+        let align = std::mem::align_of::<NetHandle>();
+        let buf = vec![0u8; align * 2];
+        let base = buf.as_ptr() as usize;
+        let aligned = (base + align - 1) & !(align - 1);
+        let aligned_ptr = aligned as *const NetHandle;
+        assert!(
+            handle_is_valid(aligned_ptr),
+            "aligned non-null pointer must validate (align={align}, ptr={aligned_ptr:p})"
+        );
+
+        // A pointer one byte past `aligned_ptr` is misaligned for any
+        // type with align > 1, and `NetHandle` (containing `AtomicU32`,
+        // `AtomicBool`, ManuallyDrop'd EventBus + Runtime) easily
+        // exceeds 1.
+        if align > 1 {
+            let misaligned_ptr = (aligned + 1) as *const NetHandle;
+            assert!(
+                !handle_is_valid(misaligned_ptr),
+                "misaligned pointer must be rejected (align={align}, ptr={misaligned_ptr:p})"
+            );
+        }
+    }
+
+    /// Pin: zero values for `heartbeat_interval_ms` and
+    /// `session_timeout_ms` must reject the entire config (parser
+    /// returns `None`). Pre-fix the parser threaded `0` through
+    /// to `Duration::from_millis(0)`, which on the Net adapter's
+    /// heartbeat path results in a busy-loop that pegs a CPU and
+    /// produces no diagnostic — the FFI caller saw a successful
+    /// `net_init` followed by a hung daemon. The validator-level
+    /// guard for cooldown / metrics_window has no equivalent on
+    /// the Net-adapter side, so the parser is the only place that
+    /// can refuse the build.
+    #[cfg(feature = "net")]
+    #[test]
+    fn parse_config_rejects_zero_heartbeat_and_session_timeout() {
+        // 32-byte hex strings (64 chars) so `hex::decode` produces
+        // exactly the [u8; 32] the parser requires for `psk` and
+        // `peer_public_key`.
+        let psk = "0".repeat(64);
+        let peer_pk = "1".repeat(64);
+
+        // Sanity: a config with both fields *non-zero* must parse
+        // successfully — proves the rejection in the negative
+        // cases below is caused by the zero, not a missing
+        // required field on the surrounding `net` block.
+        let baseline = format!(
+            r#"{{"net":{{"bind_addr":"127.0.0.1:9000","peer_addr":"127.0.0.1:9001",
+                "psk":"{psk}","peer_public_key":"{peer_pk}",
+                "heartbeat_interval_ms":1000,"session_timeout_ms":30000}}}}"#
+        );
+        assert!(
+            parse_config_json(&baseline).is_some(),
+            "baseline net config with non-zero heartbeat/session_timeout must parse"
+        );
+
+        // heartbeat_interval_ms = 0 → reject.
+        let zero_hb = format!(
+            r#"{{"net":{{"bind_addr":"127.0.0.1:9000","peer_addr":"127.0.0.1:9001",
+                "psk":"{psk}","peer_public_key":"{peer_pk}",
+                "heartbeat_interval_ms":0,"session_timeout_ms":30000}}}}"#
+        );
+        assert!(
+            parse_config_json(&zero_hb).is_none(),
+            "heartbeat_interval_ms=0 must reject (pre-fix this produced a CPU-pegging busy loop)"
+        );
+
+        // session_timeout_ms = 0 → reject.
+        let zero_to = format!(
+            r#"{{"net":{{"bind_addr":"127.0.0.1:9000","peer_addr":"127.0.0.1:9001",
+                "psk":"{psk}","peer_public_key":"{peer_pk}",
+                "heartbeat_interval_ms":1000,"session_timeout_ms":0}}}}"#
+        );
+        assert!(
+            parse_config_json(&zero_to).is_none(),
+            "session_timeout_ms=0 must reject"
+        );
     }
 }

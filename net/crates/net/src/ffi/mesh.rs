@@ -184,6 +184,31 @@ fn runtime() -> &'static Arc<Runtime> {
     })
 }
 
+/// `block_on(...)` wrapper that aborts on runtime-in-runtime
+/// rather than panicking across the FFI boundary.
+///
+/// Calling `Runtime::block_on` from a thread that already holds a
+/// tokio runtime context panics with "Cannot start a runtime from
+/// within a runtime". The cortex / mesh FFI functions are
+/// `extern "C"`, so the panic would unwind across cgo / N-API / cffi
+/// — undefined behavior. The check costs one TLS lookup
+/// (`Handle::try_current`) per FFI call, which is negligible against
+/// the work the FFI is about to do (network I/O, JSON parsing,
+/// channel operations). Common-case callers (C / Go / Python without
+/// an embedding Rust runtime) hit the fast path; embedded-Rust
+/// callers who violate the contract get a clean abort with a
+/// diagnosable message instead of UB.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        eprintln!(
+            "FATAL: mesh FFI called from inside a tokio runtime context; \
+             aborting to avoid runtime-in-runtime panic across the FFI boundary"
+        );
+        std::process::abort();
+    }
+    runtime().block_on(future)
+}
+
 /// The output borrow's lifetime is tied (via Rust's elision rules)
 /// to the input reference's lifetime, so the caller cannot pick
 /// `'static` and produce a dangling borrow. The borrow lives only
@@ -193,15 +218,25 @@ fn runtime() -> &'static Arc<Runtime> {
 /// `cortex.rs::c_str_to_owned` which sidesteps the issue entirely
 /// by returning `Option<String>`.
 ///
+/// Returns an OWNED `String` (not a borrowed `&str` tied to the C
+/// buffer). The previous `Option<&str>` signature was a soundness
+/// trap: lifetime elision on `&*const c_char` bound the returned
+/// `&str` to the local pointer reference's stack slot rather than
+/// to the underlying C buffer, so a future refactor that moved the
+/// result into `tokio::spawn(async move { ... })` would compile
+/// silently and hand a dangling pointer to the spawned task. The
+/// owned-`String` shape removes the hazard at the cost of one
+/// allocation per call, which is acceptable on FFI entry paths.
+///
 /// # Safety
 /// Caller must ensure `p` is null or points to a NUL-terminated C
-/// string valid for at least the duration of the returned `&str`.
+/// string valid at least until this function returns.
 #[inline]
-unsafe fn c_str_to_str(p: &*const c_char) -> Option<&str> {
+unsafe fn c_str_to_string(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }
-    CStr::from_ptr(*p).to_str().ok()
+    CStr::from_ptr(p).to_str().ok().map(str::to_owned)
 }
 
 /// Null-check `out_ptr` and `out_len` before writing through them.
@@ -387,10 +422,10 @@ pub extern "C" fn net_mesh_new(
     if config_json.is_null() || out_handle.is_null() {
         return NetError::NullPointer.into();
     }
-    let Some(s) = (unsafe { c_str_to_str(&config_json) }) else {
+    let Some(s) = (unsafe { c_str_to_string(config_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let cfg: MeshNewConfig = match serde_json::from_str(s) {
+    let cfg: MeshNewConfig = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
@@ -409,10 +444,23 @@ pub extern "C" fn net_mesh_new(
     psk.copy_from_slice(&psk_bytes);
 
     let mut node_cfg = MeshNodeConfig::new(bind_addr, psk);
+    // Reject `0` for `heartbeat_ms` and `session_timeout_ms`.
+    // A zero heartbeat interval busy-loops the heartbeat task
+    // (saturating a CPU); a zero session timeout makes every
+    // session expire instantly. The Rust-side configs do their
+    // own validation but the FFI JSON path bypasses that — pin
+    // the guard here so a misconfig fails fast rather than
+    // producing a hung daemon.
     if let Some(ms) = cfg.heartbeat_ms {
+        if ms == 0 {
+            return NetError::InvalidJson.into();
+        }
         node_cfg = node_cfg.with_heartbeat_interval(std::time::Duration::from_millis(ms));
     }
     if let Some(ms) = cfg.session_timeout_ms {
+        if ms == 0 {
+            return NetError::InvalidJson.into();
+        }
         node_cfg = node_cfg.with_session_timeout(std::time::Duration::from_millis(ms));
     }
     if let Some(n) = cfg.num_shards {
@@ -471,8 +519,7 @@ pub extern "C" fn net_mesh_new(
         }
         None => EntityKeypair::generate(),
     };
-    let rt = runtime();
-    let result = rt.block_on(async move { MeshNode::new(identity, node_cfg).await });
+    let result = block_on(async move { MeshNode::new(identity, node_cfg).await });
     match result {
         Ok(mut node) => {
             let channel_configs = Arc::new(ChannelConfigRegistry::new());
@@ -614,14 +661,14 @@ pub extern "C" fn net_mesh_connect(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(addr_s) = (unsafe { c_str_to_str(&peer_addr) }) else {
+    let Some(addr_s) = (unsafe { c_str_to_string(peer_addr) }) else {
         return NetError::InvalidUtf8.into();
     };
     let addr: std::net::SocketAddr = match addr_s.parse() {
         Ok(a) => a,
         Err(_) => return NET_ERR_MESH_HANDSHAKE,
     };
-    let Some(pk_s) = (unsafe { c_str_to_str(&peer_pubkey_hex) }) else {
+    let Some(pk_s) = (unsafe { c_str_to_string(peer_pubkey_hex) }) else {
         return NetError::InvalidUtf8.into();
     };
     let pk_bytes = match hex::decode(pk_s) {
@@ -634,9 +681,8 @@ pub extern "C" fn net_mesh_connect(
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&pk_bytes);
 
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.connect(addr, &pk, peer_node_id).await }) {
+    match block_on(async move { node.connect(addr, &pk, peer_node_id).await }) {
         Ok(_) => 0,
         Err(e) => adapter_err_to_code(&e),
     }
@@ -655,9 +701,8 @@ pub extern "C" fn net_mesh_accept(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.accept(peer_node_id).await }) {
+    match block_on(async move { node.accept(peer_node_id).await }) {
         Ok((addr, _)) => write_string_out(addr.to_string(), out_addr, out_len),
         Err(e) => adapter_err_to_code(&e),
     }
@@ -669,11 +714,10 @@ pub extern "C" fn net_mesh_start(handle: *mut MeshNodeHandle) -> c_int {
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
     let node = h.inner.clone();
     // `start` spawns internal tasks via tokio::spawn; run under the
     // shared runtime.
-    rt.block_on(async move { node.start() });
+    block_on(async move { node.start() });
     0
 }
 
@@ -694,8 +738,7 @@ pub extern "C" fn net_mesh_shutdown(handle: *mut MeshNodeHandle) -> c_int {
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
-    match rt.block_on(async { h.inner.shutdown().await }) {
+    match block_on(async { h.inner.shutdown().await }) {
         Ok(()) => 0,
         Err(e) => adapter_err_to_code(&e),
     }
@@ -805,9 +848,8 @@ pub extern "C" fn net_mesh_probe_reflex(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.probe_reflex(peer_node_id).await }) {
+    match block_on(async move { node.probe_reflex(peer_node_id).await }) {
         Ok(addr) => write_string_out(addr.to_string(), out_str, out_len),
         Err(e) => traversal_err_to_code(&e),
     }
@@ -824,9 +866,8 @@ pub extern "C" fn net_mesh_reclassify_nat(handle: *mut MeshNodeHandle) -> c_int 
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
     let node = h.inner.clone();
-    rt.block_on(async move { node.reclassify_nat().await });
+    block_on(async move { node.reclassify_nat().await });
     0
 }
 
@@ -884,7 +925,7 @@ pub extern "C" fn net_mesh_connect_direct(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(pk_s) = (unsafe { c_str_to_str(&peer_pubkey_hex) }) else {
+    let Some(pk_s) = (unsafe { c_str_to_string(peer_pubkey_hex) }) else {
         return NetError::InvalidUtf8.into();
     };
     let pk_bytes = match hex::decode(pk_s) {
@@ -897,9 +938,8 @@ pub extern "C" fn net_mesh_connect_direct(
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&pk_bytes);
 
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.connect_direct(peer_node_id, &pk, coordinator).await }) {
+    match block_on(async move { node.connect_direct(peer_node_id, &pk, coordinator).await }) {
         Ok(_) => 0,
         Err(e) => traversal_err_to_code(&e),
     }
@@ -922,7 +962,7 @@ pub extern "C" fn net_mesh_set_reflex_override(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(&external) }) else {
+    let Some(s) = (unsafe { c_str_to_string(external) }) else {
         return NetError::InvalidUtf8.into();
     };
     let Ok(addr) = s.parse::<std::net::SocketAddr>() else {
@@ -1093,10 +1133,10 @@ pub extern "C" fn net_mesh_open_stream(
     let cfg_json: StreamOpenConfig = if config_json.is_null() {
         StreamOpenConfig::default()
     } else {
-        let Some(s) = (unsafe { c_str_to_str(&config_json) }) else {
+        let Some(s) = (unsafe { c_str_to_string(config_json) }) else {
             return NetError::InvalidUtf8.into();
         };
-        match serde_json::from_str(s) {
+        match serde_json::from_str(&s) {
             Ok(v) => v,
             Err(_) => return NetError::InvalidJson.into(),
         }
@@ -1162,6 +1202,12 @@ unsafe fn collect_payloads(
             }
             return None;
         }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        // A caller passing a sign-extended `-1` would otherwise
+        // immediately UB before any other validation runs.
+        if len > isize::MAX as usize {
+            return None;
+        }
         let slice = std::slice::from_raw_parts(ptr, len);
         out.push(Bytes::copy_from_slice(slice));
     }
@@ -1199,14 +1245,13 @@ pub extern "C" fn net_mesh_send(
     if !handles_match(sh, nh) {
         return NetError::MismatchedHandles.into();
     }
-    let rt = runtime();
     let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
         Some(v) => v,
         None => return NetError::NullPointer.into(),
     };
     let node = nh.inner.clone();
     let stream = sh.stream.clone();
-    match rt.block_on(async move { node.send_on_stream(&stream, &payloads).await }) {
+    match block_on(async move { node.send_on_stream(&stream, &payloads).await }) {
         Ok(()) => 0,
         Err(e) => stream_err_to_code(&e),
     }
@@ -1232,14 +1277,13 @@ pub extern "C" fn net_mesh_send_with_retry(
     if !handles_match(sh, nh) {
         return NetError::MismatchedHandles.into();
     }
-    let rt = runtime();
     let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
         Some(v) => v,
         None => return NetError::NullPointer.into(),
     };
     let node = nh.inner.clone();
     let stream = sh.stream.clone();
-    match rt.block_on(async move {
+    match block_on(async move {
         node.send_with_retry(&stream, &payloads, max_retries as usize)
             .await
     }) {
@@ -1267,14 +1311,13 @@ pub extern "C" fn net_mesh_send_blocking(
     if !handles_match(sh, nh) {
         return NetError::MismatchedHandles.into();
     }
-    let rt = runtime();
     let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
         Some(v) => v,
         None => return NetError::NullPointer.into(),
     };
     let node = nh.inner.clone();
     let stream = sh.stream.clone();
-    match rt.block_on(async move { node.send_blocking(&stream, &payloads).await }) {
+    match block_on(async move { node.send_blocking(&stream, &payloads).await }) {
         Ok(()) => 0,
         Err(e) => stream_err_to_code(&e),
     }
@@ -1355,9 +1398,8 @@ pub extern "C" fn net_mesh_recv_shard(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
     let node = h.inner.clone();
-    let result = rt.block_on(async move { node.poll_shard(shard_id, None, limit as usize).await });
+    let result = block_on(async move { node.poll_shard(shard_id, None, limit as usize).await });
     let result = match result {
         Ok(r) => r,
         Err(e) => return adapter_err_to_code(&e),
@@ -1448,10 +1490,10 @@ pub extern "C" fn net_mesh_register_channel(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(&config_json) }) else {
+    let Some(s) = (unsafe { c_str_to_string(config_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let input: ChannelConfigInput = match serde_json::from_str(s) {
+    let input: ChannelConfigInput = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
@@ -1524,10 +1566,10 @@ pub extern "C" fn net_mesh_subscribe_channel_with_token(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(&channel) }) else {
+    let Some(s) = (unsafe { c_str_to_string(channel) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let name = match InnerChannelName::new(s) {
+    let name = match InnerChannelName::new(&s) {
         Ok(n) => n,
         Err(_) => return NET_ERR_CHANNEL,
     };
@@ -1536,9 +1578,8 @@ pub extern "C" fn net_mesh_subscribe_channel_with_token(
         Ok(t) => t,
         Err(e) => return token_err_to_code(&e),
     };
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move {
+    match block_on(async move {
         node.subscribe_channel_with_token(publisher_node_id, name, parsed)
             .await
     }) {
@@ -1557,19 +1598,18 @@ fn subscribe_or_unsubscribe(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(&channel) }) else {
+    let Some(s) = (unsafe { c_str_to_string(channel) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let name = match InnerChannelName::new(s) {
+    let name = match InnerChannelName::new(&s) {
         Ok(n) => n,
         Err(_) => return NET_ERR_CHANNEL,
     };
-    let rt = runtime();
     let node = h.inner.clone();
     let outcome = if subscribe {
-        rt.block_on(async move { node.subscribe_channel(publisher_node_id, name).await })
+        block_on(async move { node.subscribe_channel(publisher_node_id, name).await })
     } else {
-        rt.block_on(async move { node.unsubscribe_channel(publisher_node_id, name).await })
+        block_on(async move { node.unsubscribe_channel(publisher_node_id, name).await })
     };
     match outcome {
         Ok(()) => 0,
@@ -1638,20 +1678,20 @@ pub extern "C" fn net_mesh_publish(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(ch) = (unsafe { c_str_to_str(&channel) }) else {
+    let Some(ch) = (unsafe { c_str_to_string(channel) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let name = match InnerChannelName::new(ch) {
+    let name = match InnerChannelName::new(&ch) {
         Ok(n) => n,
         Err(_) => return NET_ERR_CHANNEL,
     };
     let cfg_in: PublishConfigInput = if config_json.is_null() {
         PublishConfigInput::default()
     } else {
-        let Some(s) = (unsafe { c_str_to_str(&config_json) }) else {
+        let Some(s) = (unsafe { c_str_to_string(config_json) }) else {
             return NetError::InvalidUtf8.into();
         };
-        match serde_json::from_str(s) {
+        match serde_json::from_str(&s) {
             Ok(v) => v,
             Err(_) => return NetError::InvalidJson.into(),
         }
@@ -1680,13 +1720,15 @@ pub extern "C" fn net_mesh_publish(
         Bytes::new()
     } else if payload.is_null() {
         return NetError::NullPointer.into();
+    } else if len > isize::MAX as usize {
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        return NetError::InvalidJson.into();
     } else {
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(payload, len) })
     };
 
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.publish(&publisher, bytes).await }) {
+    match block_on(async move { node.publish(&publisher, bytes).await }) {
         Ok(report) => {
             let js = to_publish_report_json(report);
             write_json_out(&js, out_json, out_len)
@@ -1983,16 +2025,16 @@ pub extern "C" fn net_identity_issue_token(
     let Some(subject_id) = entity_id_from_bytes(subject, subject_len) else {
         return NET_ERR_IDENTITY;
     };
-    let Some(scope_s) = (unsafe { c_str_to_str(&scope_json) }) else {
+    let Some(scope_s) = (unsafe { c_str_to_string(scope_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let Some(scope) = parse_scope_list(scope_s) else {
+    let Some(scope) = parse_scope_list(&scope_s) else {
         return NET_ERR_IDENTITY;
     };
-    let Some(channel_s) = (unsafe { c_str_to_str(&channel) }) else {
+    let Some(channel_s) = (unsafe { c_str_to_string(channel) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let Some(channel_hash) = channel_name_to_hash(channel_s) else {
+    let Some(channel_hash) = channel_name_to_hash(&channel_s) else {
         return NET_ERR_IDENTITY;
     };
     let h = unsafe { &*signer };
@@ -2057,10 +2099,10 @@ pub extern "C" fn net_identity_lookup_token(
     let Some(subject_id) = entity_id_from_bytes(subject, subject_len) else {
         return NET_ERR_IDENTITY;
     };
-    let Some(channel_s) = (unsafe { c_str_to_str(&channel) }) else {
+    let Some(channel_s) = (unsafe { c_str_to_string(channel) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let Some(channel_hash) = channel_name_to_hash(channel_s) else {
+    let Some(channel_hash) = channel_name_to_hash(&channel_s) else {
         return NET_ERR_IDENTITY;
     };
     let h = unsafe { &*handle };
@@ -2208,10 +2250,10 @@ pub extern "C" fn net_delegate_token(
     let Some(subject_id) = entity_id_from_bytes(new_subject, new_subject_len) else {
         return NET_ERR_IDENTITY;
     };
-    let Some(scope_s) = (unsafe { c_str_to_str(&restricted_scope_json) }) else {
+    let Some(scope_s) = (unsafe { c_str_to_string(restricted_scope_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let Some(scope) = parse_scope_list(scope_s) else {
+    let Some(scope) = parse_scope_list(&scope_s) else {
         return NET_ERR_IDENTITY;
     };
     let h = unsafe { &*signer };
@@ -2228,10 +2270,10 @@ pub extern "C" fn net_channel_hash(channel: *const c_char, out_hash: *mut u16) -
     if channel.is_null() || out_hash.is_null() {
         return NetError::NullPointer.into();
     }
-    let Some(s) = (unsafe { c_str_to_str(&channel) }) else {
+    let Some(s) = (unsafe { c_str_to_string(channel) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let Some(hash) = channel_name_to_hash(s) else {
+    let Some(hash) = channel_name_to_hash(&s) else {
         return NET_ERR_IDENTITY;
     };
     unsafe {
@@ -2276,16 +2318,24 @@ fn gpu_vendor_to_string_cap(v: GpuVendor) -> &'static str {
     }
 }
 
-fn parse_modality_cap(s: &str) -> Modality {
+fn parse_modality_cap(s: &str) -> Option<Modality> {
     match s.to_ascii_lowercase().as_str() {
-        "text" => Modality::Text,
-        "image" => Modality::Image,
-        "audio" => Modality::Audio,
-        "video" => Modality::Video,
-        "code" => Modality::Code,
-        "embedding" => Modality::Embedding,
-        "tool-use" | "tool_use" | "tooluse" => Modality::ToolUse,
-        _ => Modality::Text,
+        "text" => Some(Modality::Text),
+        "image" => Some(Modality::Image),
+        "audio" => Some(Modality::Audio),
+        "video" => Some(Modality::Video),
+        "code" => Some(Modality::Code),
+        "embedding" => Some(Modality::Embedding),
+        "tool-use" | "tool_use" | "tooluse" => Some(Modality::ToolUse),
+        // Pre-fix unknown strings (typos) silently fell back to
+        // `Modality::Text`. For announce-capabilities that meant
+        // a node advertised "Text" support it didn't actually
+        // have; for find-nodes filters that meant a typo'd
+        // constraint (`require_modalities: ["audoi"]`) was
+        // re-interpreted as "require Text" and returned the
+        // wrong nodes. Now `None`; callers must handle the
+        // unknown case explicitly.
+        _ => None,
     }
 }
 
@@ -2462,7 +2512,21 @@ fn gpu_info_from_json(g: GpuJson) -> GpuInfo {
         info = info.with_tensor_cores(saturating_u16_cap(tc));
     }
     if let Some(tf) = g.fp16_tflops_x10 {
-        info = info.with_fp16_tflops(tf as f32 / 10.0);
+        // Saturate at `u16::MAX` before the f32 conversion. Pre-fix
+        // `tf as f32` lost precision for u32 values ≥ 2²⁴ (f32 has
+        // a 24-bit mantissa), so the round-trip
+        // `u32 → f32/10.0 → with_fp16_tflops → *10.0 as u32`
+        // could land a different `fp16_tflops_x10` than the
+        // operator declared. The neighboring `tops_x10` field
+        // already routes through `saturating_u16_cap` for the same
+        // reason; the matching cap here keeps the round-trip exact
+        // (u16::MAX = 65 535 is far below the f32 precision
+        // boundary of 2²⁴ = 16 777 216) and aligns the two fields'
+        // surfaces. The dynamic range loss (2³² → 2¹⁶) is
+        // acceptable: 6 553.5 TFLOPS is far above any current or
+        // near-future GPU's fp16 throughput.
+        let tf_capped = saturating_u16_cap(tf);
+        info = info.with_fp16_tflops(tf_capped as f32 / 10.0);
     }
     info
 }
@@ -2535,7 +2599,18 @@ fn model_from_json(m: ModelJson) -> ModelCapability {
         mc = mc.with_quantization(q);
     }
     for modality in m.modalities {
-        mc = mc.add_modality(parse_modality_cap(&modality));
+        match parse_modality_cap(&modality) {
+            Some(parsed) => mc = mc.add_modality(parsed),
+            None => {
+                tracing::warn!(
+                    modality = %modality,
+                    "announce_capabilities: unknown modality string (typo?), \
+                     skipping rather than the pre-fix silent fallback to Text — \
+                     advertising a Text capability the node doesn't actually \
+                     have produced wrong scheduling decisions on the receiver",
+                );
+            }
+        }
     }
     if let Some(t) = m.tokens_per_sec {
         mc = mc.with_tokens_per_sec(t);
@@ -2642,7 +2717,31 @@ fn capability_filter_from_json(f: CapabilityFilterJson) -> CapabilityFilter {
         cf = cf.with_min_context(n);
     }
     for m in f.require_modalities {
-        cf = cf.require_modality(parse_modality_cap(&m));
+        match parse_modality_cap(&m) {
+            Some(parsed) => cf = cf.require_modality(parsed),
+            None => {
+                // For a filter, the lossy direction matters even
+                // more than for announce: pre-fix the typo'd
+                // string was re-interpreted as `require Text`,
+                // returning Text-capable nodes that did NOT
+                // satisfy the operator's intended constraint.
+                // Skipping the unknown is also imperfect (the
+                // resulting filter is too permissive — it
+                // returns more nodes than intended), but the
+                // failure mode is "scheduler matched too
+                // broadly" rather than "scheduler matched the
+                // wrong type." The loud warn surfaces the typo
+                // so operators can fix it.
+                tracing::warn!(
+                    modality = %m,
+                    "find_nodes: unknown modality string in require_modalities \
+                     filter (typo?), dropping the constraint; the resulting \
+                     filter is too permissive — pre-fix it was silently \
+                     re-interpreted as `require Text`, which returned the \
+                     wrong nodes",
+                );
+            }
+        }
     }
     cf
 }
@@ -2666,17 +2765,16 @@ pub extern "C" fn net_mesh_announce_capabilities(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(&caps_json) }) else {
+    let Some(s) = (unsafe { c_str_to_string(caps_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let parsed: CapabilitySetJson = match serde_json::from_str(s) {
+    let parsed: CapabilitySetJson = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
     let caps = capability_set_from_json(parsed);
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.announce_capabilities(caps).await }) {
+    match block_on(async move { node.announce_capabilities(caps).await }) {
         Ok(()) => 0,
         Err(_) => NET_ERR_CAPABILITY,
     }
@@ -2695,10 +2793,10 @@ pub extern "C" fn net_mesh_find_nodes(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(&filter_json) }) else {
+    let Some(s) = (unsafe { c_str_to_string(filter_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let parsed: CapabilityFilterJson = match serde_json::from_str(s) {
+    let parsed: CapabilityFilterJson = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
@@ -2861,17 +2959,17 @@ pub extern "C" fn net_mesh_find_nodes_scoped(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(filter_s) = (unsafe { c_str_to_str(&filter_json) }) else {
+    let Some(filter_s) = (unsafe { c_str_to_string(filter_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let Some(scope_s) = (unsafe { c_str_to_str(&scope_json) }) else {
+    let Some(scope_s) = (unsafe { c_str_to_string(scope_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let parsed_filter: CapabilityFilterJson = match serde_json::from_str(filter_s) {
+    let parsed_filter: CapabilityFilterJson = match serde_json::from_str(&filter_s) {
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let parsed_scope: ScopeFilterJson = match serde_json::from_str(scope_s) {
+    let parsed_scope: ScopeFilterJson = match serde_json::from_str(&scope_s) {
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
@@ -2946,10 +3044,10 @@ pub extern "C" fn net_mesh_find_best_node(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(&requirement_json) }) else {
+    let Some(s) = (unsafe { c_str_to_string(requirement_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let parsed: CapabilityRequirementJson = match serde_json::from_str(s) {
+    let parsed: CapabilityRequirementJson = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
@@ -2991,17 +3089,17 @@ pub extern "C" fn net_mesh_find_best_node_scoped(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(req_s) = (unsafe { c_str_to_str(&requirement_json) }) else {
+    let Some(req_s) = (unsafe { c_str_to_string(requirement_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let Some(scope_s) = (unsafe { c_str_to_str(&scope_json) }) else {
+    let Some(scope_s) = (unsafe { c_str_to_string(scope_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let parsed_req: CapabilityRequirementJson = match serde_json::from_str(req_s) {
+    let parsed_req: CapabilityRequirementJson = match serde_json::from_str(&req_s) {
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let parsed_scope: ScopeFilterJson = match serde_json::from_str(scope_s) {
+    let parsed_scope: ScopeFilterJson = match serde_json::from_str(&scope_s) {
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
@@ -3030,10 +3128,10 @@ pub extern "C" fn net_normalize_gpu_vendor(
     if raw.is_null() || out_json.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
-    let Some(s) = (unsafe { c_str_to_str(&raw) }) else {
+    let Some(s) = (unsafe { c_str_to_string(raw) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let canonical = gpu_vendor_to_string_cap(parse_gpu_vendor_cap(s));
+    let canonical = gpu_vendor_to_string_cap(parse_gpu_vendor_cap(&s));
     write_string_out(canonical.to_string(), out_json, out_len)
 }
 
@@ -3059,6 +3157,98 @@ mod tests {
         assert_eq!(saturating_u16_cap(u16::MAX as u32), u16::MAX);
         assert_eq!(saturating_u16_cap(u16::MAX as u32 + 1), u16::MAX);
         assert_eq!(saturating_u16_cap(u32::MAX), u16::MAX);
+    }
+
+    /// Regression: `parse_modality_cap` must surface unknown
+    /// modality strings as `None`, not silently fall back to
+    /// `Modality::Text`. Pre-fix a typo in announce-capabilities
+    /// like `"audoi"` advertised a Text capability the node
+    /// didn't have; in find-nodes filters, the same typo was
+    /// reinterpreted as `require Text` and returned the wrong
+    /// nodes. The strict shape lets callers handle the unknown
+    /// case explicitly (callers in this file warn-and-skip).
+    #[test]
+    fn parse_modality_cap_returns_none_on_unknown_strings() {
+        // Known values still parse.
+        for (s, expected) in [
+            ("text", Modality::Text),
+            ("Text", Modality::Text),
+            ("TEXT", Modality::Text),
+            ("image", Modality::Image),
+            ("audio", Modality::Audio),
+            ("video", Modality::Video),
+            ("code", Modality::Code),
+            ("embedding", Modality::Embedding),
+            ("tool-use", Modality::ToolUse),
+            ("tool_use", Modality::ToolUse),
+            ("tooluse", Modality::ToolUse),
+        ] {
+            assert_eq!(
+                parse_modality_cap(s),
+                Some(expected),
+                "known modality `{s}` must parse",
+            );
+        }
+
+        // Typos and unknowns return None, NOT Modality::Text.
+        for s in ["audoi", "imageX", "vidoe", "embeding", "garbage", ""] {
+            assert_eq!(
+                parse_modality_cap(s),
+                None,
+                "unknown modality `{s}` must return None — pre-fix this \
+                 fell back to Modality::Text, advertising a capability \
+                 the node didn't actually have",
+            );
+        }
+    }
+
+    /// Regression: `gpu_info_from_json` must saturate large
+    /// `fp16_tflops_x10` values at `u16::MAX` before the f32
+    /// conversion. Pre-fix `tf as f32` lost precision for u32
+    /// values above 2²⁴ (f32 has a 24-bit mantissa) — the
+    /// round-trip `u32 → f32/10.0 → with_fp16_tflops → *10.0
+    /// as u32` could land a different `fp16_tflops_x10` than
+    /// the operator declared. The matching saturation aligns
+    /// with the neighboring `tops_x10` field's surface and
+    /// keeps the round-trip exact.
+    #[test]
+    fn gpu_info_from_json_saturates_fp16_tflops_to_u16_max() {
+        // A hostile or just unrealistically large value well
+        // above the f32 precision boundary (2^24 = 16_777_216).
+        let g = GpuJson {
+            vendor: None,
+            model: "test".to_string(),
+            vram_mb: 0,
+            compute_units: None,
+            tensor_cores: None,
+            fp16_tflops_x10: Some(1_000_000_000u32),
+        };
+        let info = gpu_info_from_json(g);
+        // The cap is u16::MAX = 65535; the f32 round-trip back to
+        // x10 storage must reproduce 65_535, NOT some lossily
+        // rounded approximation of 1_000_000_000.
+        assert_eq!(
+            info.fp16_tflops_x10,
+            u16::MAX as u32,
+            "fp16_tflops_x10 must saturate at u16::MAX (65535) instead of \
+             losing precision through the f32 round-trip; got {}",
+            info.fp16_tflops_x10,
+        );
+
+        // Sanity: a small in-range value round-trips exactly.
+        let g_small = GpuJson {
+            vendor: None,
+            model: "test".to_string(),
+            vram_mb: 0,
+            compute_units: None,
+            tensor_cores: None,
+            fp16_tflops_x10: Some(425), // 42.5 TFLOPS
+        };
+        let info_small = gpu_info_from_json(g_small);
+        assert_eq!(
+            info_small.fp16_tflops_x10, 425,
+            "small fp16_tflops_x10 must round-trip exactly"
+        );
     }
 
     /// Regression: `alloc_bytes` used to call `Vec::shrink_to_fit`

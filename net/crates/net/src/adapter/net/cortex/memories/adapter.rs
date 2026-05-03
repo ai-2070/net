@@ -150,7 +150,19 @@ impl MemoriesAdapter {
         })
     }
 
-    /// Store a new memory. Returns the RedEX seq of the append.
+    /// Store or update a memory.
+    ///
+    /// Upsert semantics: if `id` is unknown, a new memory is
+    /// inserted with `pinned: false` and `created_ns = now_ns`.
+    /// If `id` already exists, the entry's `content`, `tags`, and
+    /// `source` are overwritten and `updated_ns` advances to
+    /// `now_ns`, but the existing `pinned` flag and `created_ns`
+    /// timestamp are preserved — `store` will not silently
+    /// un-pin an entry or rewrite its creation time. Use
+    /// [`Self::pin`] / [`Self::unpin`] to change the pin
+    /// explicitly.
+    ///
+    /// Returns the RedEX seq of the append.
     pub fn store(
         &self,
         id: MemoryId,

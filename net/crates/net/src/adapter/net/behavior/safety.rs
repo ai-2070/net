@@ -1200,9 +1200,20 @@ impl SafetyEnforcer {
         } else {
             // Audit-only: still increment so observers see realistic
             // counters without any commit failing.
-            self.rate_limiter
-                .global_tokens
-                .fetch_add(claim.tokens as u64, Ordering::Relaxed);
+            //
+            // Saturating CAS rather than `fetch_add` so a long-lived
+            // process can't tip the audit counter into wrap (release)
+            // or panic (debug). The audit-only path takes no commit
+            // failure on overflow — by definition this counter only
+            // drives observability dashboards — so wrap is silent
+            // corruption (operators see the counter reset to ~0 mid-
+            // window and conclude traffic dropped). `fetch_update`
+            // with saturating_add inside is the standard pattern.
+            let _ = self.rate_limiter.global_tokens.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| Some(v.saturating_add(claim.tokens as u64)),
+            );
         }
 
         // tokens (per-request `usage` counter) — free-running,
@@ -1255,29 +1266,41 @@ impl SafetyEnforcer {
         // `Enforce` is the real-world trigger). The matching
         // tokens/cost paths already use `fetch_update` +
         // `saturating_sub` for exactly this reason.
+        //
+        // Use `AcqRel` (not `Relaxed`) to mirror the acquire path's
+        // `try_fetch_add_capped_u32` ordering. Pre-fix the
+        // asymmetric `Relaxed` release on weakly-ordered cores
+        // (ARM / RISC-V) let a subsequent acquirer observe the
+        // post-release counter while the release-side caller's
+        // prior reads of the freed resource were still visible to
+        // its CPU only — a window where the resource looked
+        // available to the acquirer while the previous owner was
+        // still touching it. The total counter eventually
+        // converges, but the ordering mismatch produced
+        // observable drift on metrics readers.
         let _ =
             self.usage
                 .concurrent
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     Some(current.saturating_sub(claim.concurrent_slots))
                 });
-        let _ =
-            self.usage
-                .memory_mb
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    Some(current.saturating_sub(claim.memory_mb))
-                });
+        let _ = self
+            .usage
+            .memory_mb
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(claim.memory_mb))
+            });
         // Release tokens and cost that were acquired — without this,
         // both counters grow monotonically, hitting limits prematurely.
         let _ = self
             .usage
             .tokens
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(claim.tokens as u64))
             });
         let _ = self.usage.cost_cents_per_hour.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
             |current| Some(current.saturating_sub(claim.cost_cents)),
         );
     }
@@ -1374,15 +1397,16 @@ impl SafetyEnforcer {
     ) -> Result<(), SafetyViolation> {
         let limits = &envelope.rate_limits;
         let burst = limits.burst_multiplier;
+        let outcome = match envelope.mode {
+            EnforcementMode::Enforce => AuditOutcome::Blocked,
+            EnforcementMode::AuditOnly => AuditOutcome::Warning,
+            EnforcementMode::Disabled => AuditOutcome::Warning,
+        };
 
         // Check global RPM
         if let Err(e) = self.rate_limiter.check_global_rpm(limits.global_rpm, burst) {
+            self.log_event(AuditEventType::RateLimitHit, req.source_node, outcome);
             if envelope.mode == EnforcementMode::Enforce {
-                self.log_event(
-                    AuditEventType::RateLimitHit,
-                    req.source_node,
-                    AuditOutcome::Blocked,
-                );
                 return Err(e);
             }
         }
@@ -1393,12 +1417,8 @@ impl SafetyEnforcer {
                 .rate_limiter
                 .check_source_rpm(source, limits.per_source_rpm, burst)
             {
+                self.log_event(AuditEventType::RateLimitHit, req.source_node, outcome);
                 if envelope.mode == EnforcementMode::Enforce {
-                    self.log_event(
-                        AuditEventType::RateLimitHit,
-                        req.source_node,
-                        AuditOutcome::Blocked,
-                    );
                     return Err(e);
                 }
             }
@@ -1410,12 +1430,8 @@ impl SafetyEnforcer {
             limits.tokens_per_minute,
             burst,
         ) {
+            self.log_event(AuditEventType::RateLimitHit, req.source_node, outcome);
             if envelope.mode == EnforcementMode::Enforce {
-                self.log_event(
-                    AuditEventType::RateLimitHit,
-                    req.source_node,
-                    AuditOutcome::Blocked,
-                );
                 return Err(e);
             }
         }
@@ -1878,6 +1894,71 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Pin: in `AuditOnly` mode every rate-limit violation must
+    /// still produce a `RateLimitHit` audit entry (with
+    /// `Warning` outcome) — pre-fix the violation was silently
+    /// dropped because the `log_event` call was nested inside
+    /// the `if mode == Enforce` branch, contradicting the
+    /// envelope's documented "log violations but don't block"
+    /// semantics.
+    #[test]
+    fn audit_only_mode_logs_rate_limit_violations_as_warnings() {
+        let envelope = SafetyEnvelope {
+            mode: EnforcementMode::AuditOnly,
+            rate_limits: RateEnvelope {
+                global_rpm: 1,
+                per_source_rpm: 1,
+                tokens_per_minute: 1000,
+                burst_multiplier: 1.0,
+            },
+            audit: AuditConfig {
+                enabled: true,
+                log_success: false,
+                log_blocked: true,
+                log_warnings: true,
+                max_entries: 100,
+                flush_interval_ms: 5000,
+            },
+            ..Default::default()
+        };
+        let enforcer = SafetyEnforcer::with_envelope(envelope);
+        let source = make_node_id(7);
+        let req = SafetyRequest::new().with_source(source).with_tokens(100);
+
+        // Burn the first request through the limiter so the
+        // second exceeds it.
+        assert!(enforcer.check(&req).is_ok());
+        enforcer.rate_limiter.record_request(Some(&source), 100);
+
+        // Second request: violation under AuditOnly. Must NOT
+        // return Err (audit-only doesn't block) AND must log a
+        // Warning-outcome RateLimitHit.
+        assert!(
+            enforcer.check(&req).is_ok(),
+            "AuditOnly must not block the request"
+        );
+
+        let entries = enforcer.audit_entries(100);
+        let hits: Vec<_> = entries
+            .iter()
+            .filter(|e| e.event_type == AuditEventType::RateLimitHit)
+            .collect();
+        assert!(
+            !hits.is_empty(),
+            "AuditOnly mode must emit a RateLimitHit audit entry on violation; \
+             pre-fix the entry was suppressed because logging was gated on \
+             Enforce mode. Entries: {:?}",
+            entries,
+        );
+        assert!(
+            hits.iter().all(|e| e.outcome == AuditOutcome::Warning),
+            "AuditOnly violations must be logged with Warning outcome \
+             (Blocked is reserved for the Enforce path that actually \
+             returns Err). Outcomes: {:?}",
+            hits.iter().map(|e| e.outcome).collect::<Vec<_>>(),
+        );
     }
 
     /// Regression for BUG_AUDIT_2026_04_30_CORE.md #102: pre-fix

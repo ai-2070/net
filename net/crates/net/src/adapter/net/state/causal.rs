@@ -1,6 +1,6 @@
 //! Causal link and chain validation for distributed state.
 //!
-//! Every event produced by an entity carries a `CausalLink` (24 bytes) that
+//! Every event produced by an entity carries a `CausalLink` (28 bytes) that
 //! chains it to the previous event. The chain provides structural integrity
 //! via xxh3 hashing — tamper resistance comes from Net's AEAD encryption.
 
@@ -245,7 +245,7 @@ pub fn validate_chain_link(
 
 /// Write causal events into a buffer (CausalLink prepended to each event).
 ///
-/// Format per event: `[len: u32][CausalLink: 24 bytes][payload: len-24 bytes]`
+/// Format per event: `[len: u32][CausalLink: 28 bytes][payload: len-28 bytes]`
 ///
 /// Result of a `write_causal_events` call.
 ///
@@ -275,7 +275,7 @@ pub struct WriteCausalEventsResult {
 }
 
 /// Events whose serialized size would overflow the `u32` length
-/// prefix (payload > ~4 GiB − 24 bytes) are skipped rather than
+/// prefix (payload > ~4 GiB − 28 bytes) are skipped rather than
 /// panicking. No realistic caller hands in payloads this size, but
 /// an FFI path forwarding arbitrary `Bytes` could — making a crash
 /// on oversized input a DoS vector. Callers MUST use the returned
@@ -314,7 +314,7 @@ pub fn write_causal_events(events: &[CausalEvent], buf: &mut BytesMut) -> WriteC
 
 /// Read causal events from a buffer.
 ///
-/// Each event is `[len: u32][CausalLink: 24 bytes][payload: len-24 bytes]`.
+/// Each event is `[len: u32][CausalLink: 28 bytes][payload: len-28 bytes]`.
 pub fn read_causal_events(data: Bytes, count: u16) -> Vec<CausalEvent> {
     let cap = (count as usize).min(data.len() / (4 + CAUSAL_LINK_SIZE));
     let mut events = Vec::with_capacity(cap);

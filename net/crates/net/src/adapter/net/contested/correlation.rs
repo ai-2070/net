@@ -144,8 +144,19 @@ impl CorrelatedFailureDetector {
             });
         }
 
-        // Prune events older than the correlation window
-        let cutoff = now - self.config.correlation_window;
+        // Prune events older than the correlation window.
+        //
+        // `now - duration` panics when `duration > now.elapsed()`
+        // (shortly after process start with a long correlation
+        // window). With the default 2s window this is fine, but
+        // configurable windows of hours/days can panic on the
+        // first second of process life. Saturate to the
+        // process-start `Instant` (`now - now.elapsed()`) so the
+        // cutoff is at most as old as the earliest possible
+        // observation — equivalent to "no events to prune yet."
+        let cutoff = now
+            .checked_sub(self.config.correlation_window)
+            .unwrap_or_else(|| now - now.elapsed());
         while self
             .recent_failures
             .front()
@@ -231,9 +242,20 @@ impl CorrelatedFailureDetector {
         for &node_id in failed_nodes {
             if let Some(&subnet) = self.node_subnets.get(&node_id) {
                 with_subnet += 1;
-                // Count at each hierarchy level
+                // Count at each hierarchy level. The break
+                // conditions (`parent == current`, `parent.is_global`)
+                // cover every well-formed `SubnetId::parent`
+                // implementation, but a defensive depth cap
+                // matches the 4-level hierarchy and forecloses
+                // an infinite loop if a future regression in
+                // `SubnetId::parent` ever returns a non-self,
+                // non-global subnet that cycles back to an
+                // ancestor (e.g., a typo in a 4→3→2→1→4 walk
+                // returning to the deepest level). The cap is
+                // generously above the 4-level hierarchy so
+                // legitimate walks always complete inside it.
                 let mut current = subnet;
-                loop {
+                for _ in 0..8 {
                     *subnet_counts.entry(current).or_insert(0) += 1;
                     let parent = current.parent();
                     if parent == current || parent.is_global() {
@@ -504,6 +526,30 @@ mod tests {
         {
             assert_eq!(*suspected_cause, FailureCause::Unknown);
         }
+    }
+
+    /// Pin: a correlation window longer than the time the process
+    /// has been running must NOT panic in the prune path. Pre-fix
+    /// `now - self.config.correlation_window` panicked when
+    /// `correlation_window > now.elapsed()` — trivially reachable
+    /// for any operator-tunable window of hours/days that's
+    /// hit during the first second of process startup.
+    #[test]
+    fn record_failures_does_not_panic_with_long_window_at_startup() {
+        let mut det = CorrelatedFailureDetector::new(CorrelatedFailureConfig {
+            mass_failure_threshold: 0.30,
+            // A correlation window much larger than any plausible
+            // process-uptime-since-Instant-creation. Pre-fix this
+            // panicked inside `now - duration`.
+            correlation_window: std::time::Duration::from_secs(86_400 * 365),
+            ..Default::default()
+        });
+        for i in 0..10 {
+            det.register_node(i, SubnetId::new(&[1]));
+        }
+        // Should not panic; should still produce a valid verdict.
+        let verdict = det.record_failures(&[0, 1, 2, 3], 10);
+        assert!(verdict.is_mass_failure());
     }
 
     /// `failed_nodes` in the verdict (sourced from

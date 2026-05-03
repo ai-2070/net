@@ -86,17 +86,29 @@ fn register_bulky_daemon(
     (kp, origin)
 }
 
-/// Extract `(snapshot_bytes, seq_through)` from a `SnapshotReady`
-/// message. Panics on any other variant; we know what we started.
-fn expect_snapshot_ready(msg: MigrationMessage) -> (Vec<u8>, u64) {
-    match msg {
-        MigrationMessage::SnapshotReady {
-            snapshot_bytes,
-            seq_through,
-            ..
-        } => (snapshot_bytes, seq_through),
-        other => panic!("expected SnapshotReady, got {:?}", other),
+/// Extract `(snapshot_bytes, seq_through)` from a vector of
+/// `SnapshotReady` chunks by reassembling them in chunk_index
+/// order. Panics on any other variant; we know what we started.
+fn expect_snapshot_ready(msgs: Vec<MigrationMessage>) -> (Vec<u8>, u64) {
+    let mut chunks: Vec<(u32, Vec<u8>, u64)> = msgs
+        .into_iter()
+        .map(|m| match m {
+            MigrationMessage::SnapshotReady {
+                snapshot_bytes,
+                seq_through,
+                chunk_index,
+                ..
+            } => (chunk_index, snapshot_bytes, seq_through),
+            other => panic!("expected SnapshotReady, got {:?}", other),
+        })
+        .collect();
+    chunks.sort_by_key(|(i, _, _)| *i);
+    let seq_through = chunks.first().map(|(_, _, s)| *s).unwrap_or(0);
+    let mut bytes = Vec::new();
+    for (_, chunk, _) in chunks {
+        bytes.extend_from_slice(&chunk);
     }
+    (bytes, seq_through)
 }
 
 #[test]

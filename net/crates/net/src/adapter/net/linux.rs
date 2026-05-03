@@ -108,12 +108,11 @@ impl BatchedTransport {
     /// returns a hard error, or we make zero progress (which we
     /// return as `Ok(sent_so_far)` rather than spinning forever).
     pub fn send_batch(&mut self, packets: &[Bytes], target: SocketAddr) -> io::Result<usize> {
-        let total = packets.len().min(MAX_BATCH_SIZE);
-        if total == 0 {
+        if packets.is_empty() {
             return Ok(0);
         }
 
-        // Convert target address
+        // Convert target address once; reused across every chunk.
         let target_addr = match target {
             SocketAddr::V4(addr) => {
                 let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
@@ -130,17 +129,73 @@ impl BatchedTransport {
             }
         };
 
-        // Setup messages for the full batch up front. The retry
-        // loop below issues sendmmsg against the tail starting
-        // at `&self.msgs[sent_so_far]`, so the slot contents
-        // remain valid for the entire call.
-        for (i, packet) in packets.iter().take(total).enumerate() {
+        // Chunk internally rather than silently truncating to the
+        // first `MAX_BATCH_SIZE` packets. Pre-fix `total =
+        // packets.len().min(MAX_BATCH_SIZE)` returned `Ok(64)` for
+        // any `packets.len() > 64`, and the caller compared the
+        // returned count against `packets.len()` to detect partial
+        // sends — so the silent truncation looked like a fully
+        // successful 64-packet send. Reliable streams already
+        // stashed the unsent tail's bytes for retransmit, so they
+        // sat "in flight" without ever reaching the wire until
+        // NACK'd.
+        let mut total_sent: usize = 0;
+        for chunk_start in (0..packets.len()).step_by(MAX_BATCH_SIZE) {
+            let chunk_end = (chunk_start + MAX_BATCH_SIZE).min(packets.len());
+            let chunk_len = chunk_end - chunk_start;
+            let chunk_sent =
+                self.send_batch_chunk(&packets[chunk_start..chunk_end], &target_addr)?;
+            total_sent += chunk_sent;
+            // Partial chunk send means the kernel back-pressured;
+            // surface the running total rather than re-queueing
+            // the tail and risking another partial.
+            if chunk_sent < chunk_len {
+                return Ok(total_sent);
+            }
+        }
+        Ok(total_sent)
+    }
+
+    /// Send up to `MAX_BATCH_SIZE` packets in a single `sendmmsg`,
+    /// retrying the tail on benign errors. Caller is responsible
+    /// for ensuring `packets.len() <= MAX_BATCH_SIZE`.
+    fn send_batch_chunk(
+        &mut self,
+        packets: &[Bytes],
+        target_addr: &libc::sockaddr_in,
+    ) -> io::Result<usize> {
+        debug_assert!(packets.len() <= MAX_BATCH_SIZE);
+        let total = packets.len();
+        if total == 0 {
+            return Ok(0);
+        }
+
+        // Setup messages for the chunk up front. The retry loop
+        // below issues sendmmsg against the tail starting at
+        // `&self.msgs[sent_so_far]`, so the slot contents remain
+        // valid for the entire call.
+        // `iov_base: *mut c_void` is the Linux ABI shape; the
+        // kernel reads through this pointer for sendmmsg and
+        // never writes. The const→mut cast at `packet.as_ptr()
+        // as *mut _` below is API-mandated (libc::iovec doesn't
+        // expose a read-only variant) and the actual behavior is
+        // sound — the `&[Bytes]` argument keeps the storage alive
+        // for the syscall's duration, and the kernel's reads
+        // through `iov_base` don't violate Rust's aliasing model.
+        //
+        // Strict-provenance / Miri does flag the const→mut cast
+        // as "pointer laundering" because Miri can't know the
+        // kernel won't write. Documenting the soundness argument
+        // here is the static answer; a dynamic answer would need
+        // `pointer::with_addr` or a similar provenance-explicit
+        // API once stabilized.
+        for (i, packet) in packets.iter().enumerate() {
             self.iovecs[i] = libc::iovec {
                 iov_base: packet.as_ptr() as *mut _,
                 iov_len: packet.len(),
             };
 
-            self.addrs[i] = target_addr;
+            self.addrs[i] = *target_addr;
 
             // See `new_inner` for the rationale: musl's `msghdr`
             // has private padding fields, so we zero the struct

@@ -135,8 +135,15 @@ pub struct MigrationState {
     snapshot: Option<StateSnapshot>,
     /// Events buffered between snapshot and cutover.
     buffered_events: Vec<CausalEvent>,
-    /// Timestamp when migration started (nanos).
-    started_at: u64,
+    /// Monotonic instant when migration started. Pre-fix this
+    /// was a `u64` of wall-clock nanoseconds, and `elapsed_ms`
+    /// did `current_timestamp().saturating_sub(self.started_at)`
+    /// — a wall-clock jump backward (NTP step, manual `date`,
+    /// VM resume to an earlier moment) would saturate to `0`
+    /// and report the migration as instantaneous, masking
+    /// long-running stalls in operator dashboards. `Instant` is
+    /// monotonic by contract and is unaffected by clock jumps.
+    started_at: std::time::Instant,
 }
 
 impl MigrationState {
@@ -149,7 +156,7 @@ impl MigrationState {
             phase: MigrationPhase::Snapshot,
             snapshot: None,
             buffered_events: Vec::new(),
-            started_at: current_timestamp(),
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -246,9 +253,13 @@ impl MigrationState {
         self.phase == MigrationPhase::Complete
     }
 
-    /// Elapsed time in milliseconds.
+    /// Elapsed time in milliseconds since the migration was
+    /// constructed. Backed by a monotonic `Instant`, so a system
+    /// clock that jumps backward (NTP step, VM resume) does not
+    /// reset this to `0`; long-running migrations stay observable
+    /// in operator dashboards.
     pub fn elapsed_ms(&self) -> u64 {
-        (current_timestamp().saturating_sub(self.started_at)) / 1_000_000
+        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Get the daemon origin hash.
@@ -302,6 +313,14 @@ pub enum MigrationError {
     DaemonNotFound(u32),
     /// Target node unreachable or refused.
     TargetUnavailable(u64),
+    /// Auto-placement found no candidate node satisfying the
+    /// daemon's capability requirements. Distinct from
+    /// `TargetUnavailable(_)` which carries a specific failed
+    /// target — auto-placement never has one to report. Pre-fix
+    /// the auto path constructed `TargetUnavailable(0)`,
+    /// surfacing "target node 0x0 unavailable" to operators when
+    /// no specific node had ever been tried.
+    NoTargetAvailable,
     /// Snapshot/restore failure.
     StateFailed(String),
     /// Migration already in progress for this daemon.
@@ -327,6 +346,12 @@ impl std::fmt::Display for MigrationError {
         match self {
             Self::DaemonNotFound(id) => write!(f, "daemon {:#x} not found", id),
             Self::TargetUnavailable(id) => write!(f, "target node {:#x} unavailable", id),
+            Self::NoTargetAvailable => {
+                write!(
+                    f,
+                    "no candidate node satisfies the daemon's capability requirements"
+                )
+            }
             Self::StateFailed(msg) => write!(f, "state operation failed: {}", msg),
             Self::AlreadyMigrating(id) => write!(f, "daemon {:#x} already migrating", id),
             Self::WrongPhase { expected, got } => {
@@ -348,8 +373,6 @@ impl std::fmt::Display for MigrationError {
 }
 
 impl std::error::Error for MigrationError {}
-
-use crate::adapter::net::current_timestamp;
 
 #[cfg(test)]
 mod tests {
@@ -454,6 +477,97 @@ mod tests {
         assert!(
             state.set_snapshot(snapshot).is_err(),
             "set_snapshot must reject snapshot from a different daemon"
+        );
+    }
+
+    /// Source pin: `started_at` must be a monotonic `Instant`,
+    /// not a wall-clock `u64` of nanoseconds. The pre-fix shape
+    /// stored `current_timestamp()` (UNIX-epoch nanos) and
+    /// computed `elapsed_ms` as `current_timestamp().saturating_sub(started_at)
+    /// / 1_000_000`. A wall-clock jump backward (NTP step,
+    /// manual `date` set, VM resume to an earlier moment)
+    /// would saturate the subtraction to `0` and report a long
+    /// migration as instantaneous, masking stalls in operator
+    /// dashboards.
+    ///
+    /// We can't simulate a clock jump in a unit test, so this
+    /// test pins the shape: the field must be an `Instant`, and
+    /// `elapsed_ms` must derive from `started_at.elapsed()` —
+    /// which is monotonic by contract. A revert to `u64` plus
+    /// `current_timestamp().saturating_sub(...)` re-introduces
+    /// the hazard and is rejected here.
+    #[test]
+    fn started_at_must_be_monotonic_instant_not_wall_clock_u64() {
+        let src = include_str!("migration.rs");
+
+        // Locate the `started_at` field declaration inside
+        // `pub struct MigrationState { ... }`.
+        let struct_marker = "pub struct MigrationState";
+        let struct_start = src
+            .find(struct_marker)
+            .expect("MigrationState struct must exist");
+        // The struct body ends at the next `}` at column 0 (or
+        // before the next top-level `impl`/`pub`).
+        let struct_end_offset = src[struct_start..]
+            .find("\n}\n")
+            .expect("struct body must terminate with `}`")
+            + struct_start;
+        let struct_body = &src[struct_start..struct_end_offset];
+
+        let body_no_comments: String = struct_body
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(idx) => &l[..idx],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            body_no_comments.contains("started_at: std::time::Instant"),
+            "regression: MigrationState.started_at must be a \
+             monotonic `std::time::Instant`. A `u64` of wall-clock \
+             nanoseconds is unsafe — a system clock that steps \
+             backward (NTP / VM resume / manual `date`) saturates \
+             elapsed_ms to 0 and masks long-running stalls."
+        );
+        assert!(
+            !body_no_comments.contains("started_at: u64"),
+            "regression: MigrationState.started_at must not be a \
+             `u64` wall-clock timestamp."
+        );
+
+        // `elapsed_ms` must derive from `started_at.elapsed()`,
+        // not from `current_timestamp().saturating_sub(...)`.
+        let elapsed_marker = "pub fn elapsed_ms(";
+        let elapsed_start = src.find(elapsed_marker).expect("elapsed_ms must exist");
+        let elapsed_end_offset = src[elapsed_start..]
+            .find("\n    }")
+            .expect("elapsed_ms body must terminate")
+            + elapsed_start;
+        let elapsed_body = &src[elapsed_start..elapsed_end_offset];
+
+        let elapsed_no_comments: String = elapsed_body
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(idx) => &l[..idx],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            elapsed_no_comments.contains("self.started_at.elapsed()"),
+            "regression: elapsed_ms must derive from \
+             `self.started_at.elapsed()` to stay monotonic. \
+             Using `current_timestamp().saturating_sub(self.started_at)` \
+             reintroduces the wall-clock-jump-saturates-to-zero hazard."
+        );
+        assert!(
+            !elapsed_no_comments.contains("current_timestamp()"),
+            "regression: elapsed_ms must not call \
+             `current_timestamp()` — that's the wall-clock path \
+             with the saturating-on-jump-backward bug."
         );
     }
 }

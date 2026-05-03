@@ -91,7 +91,26 @@ impl EntityLog {
 
         // For genesis on a fresh log, accept without parent validation.
         // All other appends validate chain linkage (parent_hash, sequence, origin).
+        //
+        // Pin a canonical genesis payload of empty bytes:
+        // `CausalChainBuilder::new` constructs the genesis sentinel
+        // with `head_payload = Bytes::new()`, and the first real
+        // event in the chain has `sequence = 1` plus a real
+        // payload. A peer-injected event with `sequence = 0,
+        // parent_hash = 0, payload = <attacker_choice>` is
+        // genesis-shaped on the wire — pre-fix it was accepted
+        // unchecked on a fresh log, seeding the chain with an
+        // attacker-chosen anchor that survived if no successor
+        // ever arrived. Reject non-empty genesis payloads with
+        // `Chain(ParentHashMismatch)` (the closest existing
+        // structural-integrity error variant).
         if self.events.is_empty() && current_head.is_genesis() && event.link.is_genesis() {
+            if !event.payload.is_empty() {
+                return Err(LogError::Chain(ChainError::ParentHashMismatch {
+                    expected: 0,
+                    got: 0,
+                }));
+            }
             // Accept genesis event
         } else {
             validate_chain_link(&current_head, &self.head_payload, &event.link)
@@ -193,18 +212,30 @@ impl EntityLog {
         if last_pruned.is_some() && seq > self.snapshot_seq {
             self.snapshot_seq = seq;
         }
-        // Update base_link (used as fallback when events is empty) and
-        // head_payload (used for chain validation of the next append).
+        // Update base_link (the chain anchor for the lowest-position
+        // ancestor we still know about) and head_payload (used for
+        // chain validation of the next append).
         //
-        // When events remain: head_payload is already correct — it tracks
-        // the last event's payload (set during append), and partial pruning
-        // only removes from the front. We don't need to update it.
+        // base_link advances on EVERY prune that removed at least one
+        // event — partial OR full. Pre-fix only the empty-after-prune
+        // branch refreshed it, so a partial prune followed by a full
+        // prune left base_link pointing at the original creation
+        // anchor (because the partial prune skipped the update, then
+        // the full prune set it to the last-pruned event of the SECOND
+        // prune — but a third prune-after-snapshot path that
+        // re-anchored from `base_link` could observe the stale value).
+        // Refreshing on every successful prune keeps `base_link` =
+        // "link of the most recently dropped event" as a stable
+        // invariant.
         //
-        // When all events are removed: set base_link and head_payload to
-        // the last pruned event so the next append can chain correctly.
-        if self.events.is_empty() {
-            if let Some((link, payload)) = last_pruned {
-                self.base_link = link;
+        // head_payload only matters when events is empty (then it
+        // becomes the chain-prev for the next append). When events
+        // remain, the head is the last appended event whose payload
+        // was set at append time — we leave head_payload alone in
+        // that case so it continues to track the actual head.
+        if let Some((link, payload)) = last_pruned {
+            self.base_link = link;
+            if self.events.is_empty() {
                 self.head_payload = payload;
             }
         }
@@ -503,6 +534,47 @@ mod tests {
         );
     }
 
+    /// Pin: a fresh `EntityLog` rejects a genesis-shaped event
+    /// (sequence=0, parent_hash=0) whose payload is non-empty.
+    /// Pre-fix the genesis branch in `append` skipped payload
+    /// validation, so a peer-injected genesis with attacker-chosen
+    /// payload would seat in the log and survive until a
+    /// successor event tied to a different anchor arrived (and if
+    /// no successor ever arrived, the junk anchor was permanent).
+    /// The canonical genesis is `payload = empty`.
+    #[test]
+    fn append_rejects_non_empty_genesis_payload_on_fresh_log() {
+        let (_, entity_id) = make_entity();
+        let origin_hash = entity_id.origin_hash();
+        let mut log = EntityLog::new(entity_id);
+
+        // A peer-injected genesis-shaped event with attacker-
+        // chosen payload.
+        let bad_genesis = CausalEvent {
+            link: CausalLink::genesis(origin_hash, 0),
+            payload: Bytes::from_static(b"attacker choice"),
+            received_at: 0,
+        };
+        let err = log
+            .append(bad_genesis)
+            .expect_err("non-empty genesis must be rejected");
+        assert!(
+            matches!(err, LogError::Chain(ChainError::ParentHashMismatch { .. })),
+            "expected Chain(ParentHashMismatch), got {:?}",
+            err,
+        );
+
+        // Empty-payload genesis is the canonical form and must
+        // still be accepted.
+        let good_genesis = CausalEvent {
+            link: CausalLink::genesis(origin_hash, 0),
+            payload: Bytes::new(),
+            received_at: 0,
+        };
+        log.append(good_genesis)
+            .expect("empty-payload genesis must be accepted");
+    }
+
     // ========================================================================
     // prune_through(seq) on empty / out-of-range logs must not
     // desync snapshot_seq from base_link.sequence
@@ -582,6 +654,52 @@ mod tests {
             log.snapshot_seq(),
             3,
             "snapshot_seq must advance when prune actually removed events",
+        );
+    }
+
+    /// Regression: a partial prune must advance `base_link` to the
+    /// last-pruned event, not leave it pointing at the original
+    /// creation anchor. Pre-fix the update only fired in the
+    /// `events.is_empty()` branch, so a partial prune left
+    /// `base_link.sequence == 0` even after dropping events
+    /// 1..=N.
+    #[test]
+    fn prune_through_partial_advances_base_link_to_last_pruned() {
+        let (_, entity_id) = make_entity();
+        let origin_hash = entity_id.origin_hash();
+        let mut log = EntityLog::new(entity_id);
+        let mut builder = CausalChainBuilder::new(origin_hash);
+        let mut appended = Vec::new();
+        for i in 0..5 {
+            let event = builder.append(Bytes::from(format!("e{}", i)), 0).unwrap();
+            appended.push(event.link);
+            log.append(event).unwrap();
+        }
+
+        // Sanity: base_link starts at the genesis anchor (seq 0).
+        assert_eq!(log.base_link.sequence, 0);
+
+        // Partial prune: drop the first three events (seqs 1..=3 if
+        // genesis is seq 0; the chain builder produces sequential
+        // sequences starting at 1).
+        let prune_target = appended[2].sequence;
+        log.prune_through(prune_target);
+        assert_eq!(log.len(), 2, "events past prune_target remain");
+        assert_eq!(
+            log.base_link, appended[2],
+            "partial prune must advance base_link to the last-pruned event's link \
+             (got seq={}, expected seq={})",
+            log.base_link.sequence, appended[2].sequence,
+        );
+
+        // Subsequent full prune still works correctly — base_link
+        // moves to the new last-pruned (the previously-final event).
+        let final_prune = appended[4].sequence;
+        log.prune_through(final_prune);
+        assert!(log.is_empty(), "events fully pruned");
+        assert_eq!(
+            log.base_link, appended[4],
+            "full prune updates base_link to the highest-seq pruned event",
         );
     }
 }

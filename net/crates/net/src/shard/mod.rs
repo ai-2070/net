@@ -427,7 +427,7 @@ impl ShardManager {
     /// [`select_shard_by_hash`]: Self::select_shard_by_hash
     #[inline]
     #[deprecated(
-        since = "0.8.0",
+        since = "0.9.0",
         note = "serializes the value just to hash it; prefer `RawEvent::from_value(v).hash()` + `select_shard_by_hash` to avoid the duplicate serialization"
     )]
     pub fn select_shard(&self, event: &JsonValue) -> u16 {
@@ -690,6 +690,12 @@ impl ShardManager {
         self.table.load().shard_index.keys().copied().collect()
     }
 
+    /// Sum of `len()` across every shard's ring buffer.
+    pub fn total_pending_in_rings(&self) -> u64 {
+        let table = self.table.load();
+        table.shards.iter().map(|s| s.lock().len() as u64).sum()
+    }
+
     /// Get aggregated statistics from all shards.
     ///
     /// Lock-free: reads each shard's atomic counters directly via the
@@ -744,13 +750,35 @@ impl ShardManager {
     ///
     /// [`activate_shard`]: Self::activate_shard
     pub fn add_shard(&self) -> Result<u16, ScalingError> {
+        self.add_shard_inner(false)
+    }
+
+    /// Like [`add_shard`] but bypasses the auto-scaling cooldown.
+    ///
+    /// Used by operator-initiated `manual_scale_up` paths. The
+    /// auto-scaling cooldown protects against the auto-scaling
+    /// monitor reacting too quickly to transient load spikes;
+    /// a deliberate operator action should not be rate-limited
+    /// by that cadence. The `max_shards` budget check still
+    /// applies.
+    ///
+    /// [`add_shard`]: Self::add_shard
+    pub fn add_shard_force(&self) -> Result<u16, ScalingError> {
+        self.add_shard_inner(true)
+    }
+
+    fn add_shard_inner(&self, force: bool) -> Result<u16, ScalingError> {
         let mapper = self.mapper.as_ref().ok_or(ScalingError::InvalidPolicy(
             "Dynamic scaling not enabled".into(),
         ))?;
 
         // Allocate the shard in `Provisioning` state — not yet
         // selectable.
-        let new_ids = mapper.scale_up_provisioning(1)?;
+        let new_ids = if force {
+            mapper.scale_up_provisioning_force(1)?
+        } else {
+            mapper.scale_up_provisioning(1)?
+        };
         let new_id = new_ids[0];
 
         let metrics = mapper.metrics_collector(new_id).ok_or_else(|| {

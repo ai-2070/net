@@ -142,9 +142,16 @@ impl SubnetGateway {
             Visibility::SubnetLocal => ForwardDecision::Drop(DropReason::SubnetLocal),
 
             Visibility::ParentVisible => {
-                if dest_subnet.is_ancestor_of(source_subnet)
-                    || source_subnet.is_ancestor_of(dest_subnet)
-                {
+                // Per the channel-config doc: "Visible to the parent
+                // subnet but not siblings." Traffic flows from a
+                // child up to its ancestor — i.e., dest must be a
+                // (strict or non-strict) ancestor of source.
+                // Forwarding the other direction (parent broadcasts
+                // *down* to descendants) violates the
+                // principle-of-least-privilege framing and silently
+                // leaks region-scoped traffic into every fleet /
+                // vehicle below it.
+                if dest_subnet.is_ancestor_of(source_subnet) {
                     ForwardDecision::Forward
                 } else {
                     ForwardDecision::Drop(DropReason::NotAncestor)
@@ -278,6 +285,44 @@ mod tests {
             0,
         );
         assert_eq!(decision, ForwardDecision::Drop(DropReason::NotAncestor));
+    }
+
+    /// Pin: `ParentVisible` is "visible to the parent subnet but not
+    /// siblings" — strictly upward. A parent broadcast must NOT be
+    /// forwarded *down* into descendants (that would leak parent-
+    /// scoped traffic into every child fleet / vehicle, breaking the
+    /// principle-of-least-privilege framing). Pre-fix the predicate
+    /// accepted both `dest.is_ancestor_of(source)` (correct) and
+    /// `source.is_ancestor_of(dest)` (incorrect downward leak).
+    #[test]
+    fn parent_visible_drops_parent_to_descendant() {
+        let reg = ChannelConfigRegistry::new();
+        let ch = make_channel("test/parent-down", Visibility::ParentVisible, &reg);
+        let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
+
+        // Parent → child must drop.
+        let decision =
+            gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[1, 2]), ch, TEST_TTL, 0);
+        assert_eq!(
+            decision,
+            ForwardDecision::Drop(DropReason::NotAncestor),
+            "parent → descendant must NOT be forwarded under ParentVisible \
+             — `ParentVisible` is unidirectional (child → ancestor only)"
+        );
+
+        // Grandparent → grandchild also blocked.
+        let decision = gw.should_forward(
+            SubnetId::new(&[1]),
+            SubnetId::new(&[1, 2, 3]),
+            ch,
+            TEST_TTL,
+            0,
+        );
+        assert_eq!(
+            decision,
+            ForwardDecision::Drop(DropReason::NotAncestor),
+            "ancestor → distant-descendant must drop too"
+        );
     }
 
     #[test]

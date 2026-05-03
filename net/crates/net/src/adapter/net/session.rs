@@ -540,25 +540,51 @@ impl NetSession {
         }
 
         // Pass 2: if still over the cap, LRU-evict the oldest.
+        //
+        // The (key, last_activity) pair is captured in the same
+        // iteration that selects the victim, then `remove_if`
+        // re-checks the activity stamp atomically before
+        // removing. If a concurrent `open_stream_full` reused the
+        // same `stream_id` slot or `touch`-ed it between selection
+        // and removal, the stamp differs and we skip the eviction
+        // for this round (it'll be re-evaluated on the next sweep
+        // if the cap is still exceeded). Pre-fix the iter then
+        // remove pair was non-atomic, so a freshly-opened stream
+        // could be torn down in the gap between selection and
+        // removal — observed as "stream just opened, immediately
+        // closed" in production logs.
         while self.streams.len() > max_streams {
             let oldest = self
                 .streams
                 .iter()
                 .min_by_key(|e| e.value().last_activity_ns())
-                .map(|e| *e.key());
+                .map(|e| (*e.key(), e.value().last_activity_ns()));
             match oldest {
-                Some(sid) => {
-                    if let Some((_, state)) = self.streams.remove(&sid) {
-                        state.deactivate();
-                        self.recently_closed.insert(sid, Instant::now());
-                        evicted += 1;
-                        tracing::warn!(
-                            stream_id = format!("{:#x}", sid),
-                            reason = "cap_exceeded",
-                            total_streams = self.streams.len(),
-                            max_streams = max_streams,
-                            "stream evicted: max_streams cap"
-                        );
+                Some((sid, expected_activity_ns)) => {
+                    let removed = self
+                        .streams
+                        .remove_if(&sid, |_, v| v.last_activity_ns() == expected_activity_ns);
+                    match removed {
+                        Some((_, state)) => {
+                            state.deactivate();
+                            self.recently_closed.insert(sid, Instant::now());
+                            evicted += 1;
+                            tracing::warn!(
+                                stream_id = format!("{:#x}", sid),
+                                reason = "cap_exceeded",
+                                total_streams = self.streams.len(),
+                                max_streams = max_streams,
+                                "stream evicted: max_streams cap"
+                            );
+                        }
+                        None => {
+                            // The stream was touched / replaced
+                            // between selection and removal. Pick a
+                            // new victim on the next loop iteration.
+                            // Bail if the cap is no longer exceeded,
+                            // otherwise the loop terminates anyway.
+                            continue;
+                        }
                     }
                 }
                 None => break,
@@ -640,6 +666,19 @@ impl NetSession {
     /// cleartext `session_id` and source UDP address could spoof
     /// heartbeats indefinitely.
     pub fn verify_and_touch_heartbeat(&self, parsed: &ParsedPacket) -> bool {
+        // A heartbeat encrypts an empty payload, so the on-wire
+        // ciphertext is exactly the 16-byte AEAD tag (see
+        // `PacketBuilder::build_heartbeat`). Reject any other
+        // length BEFORE invoking the cipher: the AEAD will
+        // catch a length mismatch on its own, but a cheap
+        // up-front check shortcuts a cleartext-flood attacker
+        // who sends short / empty / oversized packets to drain
+        // CPU on the decrypt path. ChaCha20-Poly1305 isn't
+        // hugely expensive per packet, but the gate is free
+        // and removes the cipher from the per-probe budget.
+        if parsed.payload.len() != super::protocol::TAG_SIZE {
+            return false;
+        }
         let aad = parsed.header.aad();
         let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
         if !self.rx_cipher.is_valid_rx_counter(counter) {
@@ -852,8 +891,17 @@ impl RxCreditState {
     /// local view.
     #[inline]
     pub fn outstanding(&self) -> u64 {
-        let g = self.granted.load(Ordering::Acquire);
+        // Read `consumed` first, then `granted`. Paired with the
+        // publication order in `on_bytes_consumed` (granted first,
+        // then consumed), this guarantees `granted >= consumed`:
+        // if our `consumed` load observes a writer's increment, the
+        // writer's earlier `granted` increment is already visible to
+        // our subsequent `granted` load. Pre-fix the loads ran in
+        // the opposite order and `saturating_sub` masked transient
+        // `consumed > granted` to zero, surfacing a false "no
+        // outstanding bytes" reading to metrics during contention.
         let c = self.consumed.load(Ordering::Acquire);
+        let g = self.granted.load(Ordering::Acquire);
         g.saturating_sub(c)
     }
 
@@ -906,8 +954,17 @@ impl RxCreditState {
         // the running cumulative consumed count for the caller to
         // ship as `total_consumed` in an authoritative
         // `StreamWindow` packet.
-        let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        //
+        // Order matters: bump `granted` BEFORE `consumed` so a
+        // concurrent `outstanding()` reader that observes the new
+        // `consumed` is guaranteed to see the matching `granted`
+        // bump as well. With the opposite order, the reader's
+        // computation `granted - consumed` could transiently see
+        // `consumed > granted` (saturated to zero), surfacing a
+        // false "window drained" snapshot to metrics under
+        // contention.
         self.granted.fetch_add(bytes, Ordering::AcqRel);
+        let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
         Some(new_consumed)
     }
 }
@@ -1083,9 +1140,15 @@ impl StreamState {
                 .is_ok()
             {
                 // Bump the committed-bytes counter only after the
-                // CAS wins, so a concurrent grant reconciling against
-                // `tx_bytes_sent` doesn't see inflated in-flight
-                // bytes.
+                // CAS wins. The reverse order (bump then CAS) lets
+                // a concurrent grant observe the bumped watermark,
+                // mint credit up to the window, and then the
+                // pending admission's CAS subtracts that credit —
+                // net loss of one unit per grant-vs-admission race.
+                // The narrow truncation window the audit highlighted
+                // (#97) is self-healing via the next grant; the
+                // window-invariant violation in the alternative
+                // ordering is not.
                 self.tx_bytes_sent
                     .fetch_add(bytes as u64, Ordering::Relaxed);
                 return true;
@@ -2094,6 +2157,107 @@ mod tests {
         // `RxCreditState` rustdoc + `mesh.rs:3110-3135`.
     }
 
+    /// Regression: `outstanding()` must never observe a transient
+    /// `consumed > granted` inversion under contention.
+    ///
+    /// Pre-fix `on_bytes_consumed` bumped `consumed` before
+    /// `granted`, while `outstanding()` loaded `granted` then
+    /// `consumed`. A reader catching the in-flight window saw
+    /// `granted` from before a writer's bump but `consumed` from
+    /// after — `consumed > granted`, masked by `saturating_sub` to
+    /// zero. With the writer-side priming `granted = window_bytes`,
+    /// the post-fix invariant is `outstanding() >= window_bytes` at
+    /// every instant: the publication order (granted first, then
+    /// consumed) plus the matching reader order (consumed first,
+    /// then granted) guarantees any observed `consumed` increment is
+    /// paired with its `granted` increment by the time the reader
+    /// loads `granted`.
+    ///
+    /// Setup: `window_bytes = K`, every writer call mints `K`
+    /// matched bytes. Pre-fix the reader sees outstanding=0 mid-flight;
+    /// post-fix the reader always sees outstanding >= K.
+    #[test]
+    fn rx_credit_outstanding_never_inverts_under_contention() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::Arc;
+        use std::thread;
+
+        const WINDOW: u32 = 64;
+        const WRITERS: usize = 6;
+        const ITERATIONS: usize = 50_000;
+
+        let state = Arc::new(StreamState::new_full(false, 1, WINDOW));
+        let stop = Arc::new(AtomicBool::new(false));
+        let min_seen = Arc::new(AtomicU64::new(u64::MAX));
+        let reader_loops = Arc::new(AtomicU64::new(0));
+
+        // Reader: spin on `outstanding()` and record the minimum
+        // value observed. Stops as soon as the writers signal done.
+        let reader = {
+            let state = Arc::clone(&state);
+            let stop = Arc::clone(&stop);
+            let min_seen = Arc::clone(&min_seen);
+            let reader_loops = Arc::clone(&reader_loops);
+            thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let v = state.rx_credit().outstanding();
+                    let mut current = min_seen.load(std::sync::atomic::Ordering::Relaxed);
+                    while v < current {
+                        match min_seen.compare_exchange_weak(
+                            current,
+                            v,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(seen) => current = seen,
+                        }
+                    }
+                    reader_loops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+
+        // Writers: pound `on_bytes_consumed(WINDOW)` so each call
+        // moves both counters by exactly the priming window. With
+        // K == WINDOW, any inversion of the publication order
+        // surfaces as `consumed > granted` and saturates to zero.
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                thread::spawn(move || {
+                    for _ in 0..ITERATIONS {
+                        let _ = state.on_bytes_consumed(WINDOW as u64);
+                    }
+                })
+            })
+            .collect();
+
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+
+        // Sanity: the reader actually got CPU time. Without this,
+        // the assertion below would silently pass on a single-core
+        // / over-subscribed runner.
+        assert!(
+            reader_loops.load(std::sync::atomic::Ordering::Relaxed) > 1_000,
+            "reader did not get enough CPU time to exercise the race",
+        );
+
+        // The strong invariant: outstanding never drops below the
+        // priming window. Pre-fix this falls to 0 under contention.
+        let observed_min = min_seen.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            observed_min >= WINDOW as u64,
+            "outstanding() inverted under contention: min observed = {} (must be >= {})",
+            observed_min,
+            WINDOW,
+        );
+    }
+
     #[test]
     fn test_rx_credit_window_zero_disables_grants() {
         let state = StreamState::new_full(false, 1, 0);
@@ -2521,6 +2685,67 @@ mod tests {
                 !trimmed.contains(&needle),
                 "CR-12 regression: tx_key accessor reintroduced into session.rs:\n  {}",
                 line
+            );
+        }
+    }
+
+    /// Regression: `verify_and_touch_heartbeat` short-circuits
+    /// any `parsed.payload.len() != TAG_SIZE` packet before
+    /// invoking the cipher. AEAD decryption would catch the
+    /// mismatch on its own, but the pre-check shortcuts a
+    /// cleartext-flood attacker spamming undersized / oversized
+    /// payloads to drain CPU on the decrypt path. The
+    /// session must be unmutated on rejection — a flood that
+    /// nudged `last_activity` would still be a side-channel for
+    /// liveness inference.
+    #[test]
+    fn verify_and_touch_heartbeat_rejects_wrong_length_before_decrypt() {
+        use super::super::protocol::{NetHeader, PacketFlags, TAG_SIZE};
+        use bytes::Bytes;
+
+        let keys = test_keys();
+        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let session = NetSession::new(keys.clone(), peer_addr, 4, false);
+
+        // Capture last_activity before the spoof attempts so we
+        // can assert no mutation.
+        let baseline_activity = session.last_activity.load(Ordering::Acquire);
+
+        // Build a fake heartbeat header with a ciphertext that
+        // ISN'T 16 bytes — the AEAD would reject this anyway,
+        // but we want to assert the length gate fires first
+        // (no cipher work, no last_activity nudge).
+        let mut nonce = [0u8; 12];
+        nonce[0..4].copy_from_slice(&crate::adapter::net::crypto::session_prefix_from_id(
+            keys.session_id,
+        ));
+        nonce[4..12].copy_from_slice(&0u64.to_le_bytes());
+
+        let header = NetHeader::new(
+            keys.session_id,
+            0, // stream_id
+            0, // sequence
+            nonce,
+            0, // payload_len
+            0, // event_count
+            PacketFlags::HEARTBEAT,
+        );
+
+        for bad_len in [0usize, 1, TAG_SIZE - 1, TAG_SIZE + 1, 64] {
+            let parsed = ParsedPacket {
+                header,
+                payload: Bytes::from(vec![0u8; bad_len]),
+                source: peer_addr,
+            };
+            assert!(
+                !session.verify_and_touch_heartbeat(&parsed),
+                "wrong-length payload ({bad_len} bytes, expected {TAG_SIZE}) \
+                 must be rejected before AEAD decrypt"
+            );
+            assert_eq!(
+                session.last_activity.load(Ordering::Acquire),
+                baseline_activity,
+                "rejected heartbeat must not advance last_activity ({bad_len} bytes)"
             );
         }
     }

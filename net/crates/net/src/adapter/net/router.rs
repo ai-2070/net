@@ -483,14 +483,39 @@ impl NetRouter {
             0
         };
 
-        // Record stats
-        self.routing_table.record_in(stream_id, len);
+        // Per-stream `record_in` is deferred until the packet
+        // either delivers locally or survives all drop checks
+        // and is queued for forward. Pre-fix the call fired
+        // here (immediately after parse), so a packet that
+        // failed loop suppression or TTL incremented BOTH
+        // `packets_in` and `packets_dropped` for the stream —
+        // double-counting against any dashboard computing
+        // `delivery rate = packets_out / packets_in` (drops
+        // inflated the denominator without affecting the
+        // numerator, masking healthy networks behind apparent
+        // delivery loss). The drop paths now call
+        // `record_drop` only; `record_in` fires once for each
+        // successful local-delivery / forward.
 
         // Check if local delivery
         if self.routing_table.is_local(routing_header.dest_id) {
+            self.routing_table.record_in(stream_id, len);
             self.packets_local.fetch_add(1, Ordering::Relaxed);
             self.record_latency(start);
             return Ok(RouteAction::Local(data.slice(ROUTING_HEADER_SIZE..)));
+        }
+
+        // Loop suppression: if we're about to forward a packet whose
+        // `src_id` is us, we sent it earlier and it has come back via
+        // a misconfigured route or a malicious peer. Drop it locally
+        // so the only thing breaking the loop is TTL exhaustion;
+        // every looping hop wastes one queue slot and 2x bandwidth
+        // on the link. The `src_id` field is u32; `local_id` is u64
+        // (only the low 32 bits identify us on the wire).
+        if routing_header.src_id == (self.routing_table.local_id() as u32) {
+            self.packets_dropped.fetch_add(1, Ordering::Relaxed);
+            self.routing_table.record_drop(stream_id);
+            return Err(RouterError::RoutingLoop);
         }
 
         // Check TTL
@@ -520,6 +545,10 @@ impl NetRouter {
             self.routing_table.record_drop(stream_id);
             return Err(RouterError::TtlExpired);
         }
+        // All drop gates passed — count this packet as
+        // successfully ingressed for the stream before queueing
+        // the forward.
+        self.routing_table.record_in(stream_id, len);
         fwd_header.write_to(&mut new_data);
         new_data.extend_from_slice(&data[ROUTING_HEADER_SIZE..]);
 
@@ -555,15 +584,25 @@ impl NetRouter {
         self.socket.recv_from(buf).await
     }
 
-    /// Start the router (spawns send loop)
-    pub fn start(&self) -> tokio::task::JoinHandle<()> {
-        self.running.store(true, Ordering::Release);
+    /// Start the router (spawns send loop). Returns `None` if a
+    /// dispatch loop is already running for this router; calling
+    /// twice would otherwise spawn a second loop racing the first
+    /// one's `scheduler.dequeue()`, producing reordered or
+    /// duplicate sends.
+    pub fn start(&self) -> Option<tokio::task::JoinHandle<()>> {
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
 
         let socket = self.socket.clone();
         let scheduler = self.scheduler.clone();
         let running = self.running.clone();
 
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             while running.load(Ordering::Acquire) {
                 // Dequeue and send
                 if let Some(packet) = scheduler.dequeue() {
@@ -576,7 +615,7 @@ impl NetRouter {
                     }
                 }
             }
-        })
+        }))
     }
 
     /// Stop the router
@@ -649,6 +688,9 @@ pub enum RouterError {
     NoRoute,
     /// Queue full
     QueueFull,
+    /// Source is this node — packet looped back via a misconfigured
+    /// route or hostile peer.
+    RoutingLoop,
 }
 
 impl std::fmt::Display for RouterError {
@@ -659,6 +701,7 @@ impl std::fmt::Display for RouterError {
             Self::TtlExpired => write!(f, "TTL expired"),
             Self::NoRoute => write!(f, "no route to destination"),
             Self::QueueFull => write!(f, "queue full"),
+            Self::RoutingLoop => write!(f, "routing loop (packet returned to its source)"),
         }
     }
 }
@@ -802,6 +845,44 @@ mod tests {
         assert_eq!(router.stats().routes, 0);
     }
 
+    /// `start()` must spawn at most one dispatch loop. A second
+    /// call while the first loop is still running would race the
+    /// scheduler's `dequeue` and produce reordered or duplicate
+    /// sends.
+    #[tokio::test]
+    async fn start_is_idempotent_returns_none_when_already_running() {
+        let config = RouterConfig::new(0x1234, "127.0.0.1:0".parse().unwrap());
+        let router = NetRouter::new(config).await.unwrap();
+
+        let first = router.start();
+        assert!(first.is_some(), "first start() should spawn a loop");
+        assert!(router.is_running());
+
+        let second = router.start();
+        assert!(
+            second.is_none(),
+            "second start() while running must NOT spawn a duplicate loop",
+        );
+
+        // After stop(), the first loop exits and a fresh start()
+        // is allowed again.
+        router.stop();
+        // Give the loop a tick to observe `running == false`.
+        if let Some(h) = first {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        }
+
+        let third = router.start();
+        assert!(
+            third.is_some(),
+            "start() after stop() should be allowed to spawn again",
+        );
+        router.stop();
+        if let Some(h) = third {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        }
+    }
+
     #[tokio::test]
     async fn test_router_routing_table() {
         let config = RouterConfig::new(0x1234, "127.0.0.1:0".parse().unwrap());
@@ -855,6 +936,65 @@ mod tests {
             1,
             "stream stats should record 1 packet for stream_id 0x{:X}",
             expected_stream_id
+        );
+    }
+
+    /// Pin: a packet whose `src_id` matches this router's
+    /// `local_id` must be dropped immediately on receipt with
+    /// `RoutingLoop` instead of being forwarded again. Pre-fix
+    /// the router happily looped the packet back along the
+    /// route, only breaking the cycle on TTL exhaustion (so
+    /// every loop wasted up to 64 hops × bandwidth before
+    /// dying).
+    #[tokio::test]
+    async fn route_packet_drops_when_src_id_is_local() {
+        let local_id = 0x1234u64;
+        let dest_id = 0x9999u64;
+        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+
+        let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
+        let router = NetRouter::new(config).await.unwrap();
+        router.routing_table().add_route(dest_id, dest_addr);
+
+        // RoutingHeader stores src_id as u32 — the low 32 bits of
+        // the local node id are what identifies us on the wire.
+        let routing = RoutingHeader::new(dest_id, local_id as u32, 16);
+        let routing_bytes = routing.to_bytes();
+
+        let net = NetHeader::new(
+            0xAAAA,
+            0xBEEF,
+            1,
+            [0u8; 12],
+            0,
+            0,
+            super::super::protocol::PacketFlags::NONE,
+        );
+        let net_bytes = net.to_bytes();
+
+        let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
+        packet.extend_from_slice(&routing_bytes);
+        packet.extend_from_slice(&net_bytes);
+
+        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let result = router.route_packet(packet.freeze(), from);
+        match result {
+            Err(RouterError::RoutingLoop) => {}
+            other => panic!(
+                "expected RoutingLoop for src_id == local_id, got {:?}",
+                other
+            ),
+        }
+
+        // Counters: dropped += 1, forwarded unchanged.
+        let stats = router.stats();
+        assert_eq!(
+            stats.packets_dropped, 1,
+            "looping packet must increment packets_dropped"
+        );
+        assert_eq!(
+            stats.packets_forwarded, 0,
+            "looping packet must NOT be forwarded"
         );
     }
 
@@ -943,6 +1083,71 @@ mod tests {
             Ok(RouteAction::Forwarded(addr)) => assert_eq!(addr, dest_addr),
             other => panic!("expected Forwarded, got {:?}", other),
         }
+    }
+
+    /// Regression: a packet that fails any drop gate (loop
+    /// suppression, pre-decrement TTL, post-decrement TTL) must
+    /// NOT increment the per-stream `packets_in` counter — only
+    /// `packets_dropped`. Pre-fix `record_in` fired immediately
+    /// after parse, so a dropped packet incremented BOTH stream
+    /// counters; a dashboard computing `delivery_rate =
+    /// packets_out / packets_in` would see drops inflate the
+    /// denominator without affecting the numerator, masking
+    /// healthy networks behind apparent delivery loss.
+    ///
+    /// This pins the post-decrement TTL drop path (the audit's
+    /// stated trigger), but the structural change applies to
+    /// every drop path; the per-stream invariant is now
+    /// "packets_in counts only delivered or forwarded packets."
+    #[tokio::test]
+    async fn ttl_drop_does_not_double_count_packets_in_for_stream() {
+        let local_id = 0x1234u64;
+        let dest_id = 0x9999u64;
+        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+
+        let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
+        let router = NetRouter::new(config).await.unwrap();
+        router.routing_table().add_route(dest_id, dest_addr);
+
+        // TTL = 1 hits the post-decrement drop path. Same
+        // setup as `route_packet_drops_when_forward_makes_ttl_zero`.
+        let routing = RoutingHeader::new(dest_id, 0x5678, 1);
+        let routing_bytes = routing.to_bytes();
+        // NetHeader::new params: (session_id, stream_id, sequence, nonce, payload_len, event_count, flags)
+        let session_id = 0xAAAAu64;
+        let stream_id = 0x4242u64;
+        let net = NetHeader::new(
+            session_id,
+            stream_id,
+            1,
+            [0u8; 12],
+            0,
+            0,
+            super::super::protocol::PacketFlags::NONE,
+        );
+        let net_bytes = net.to_bytes();
+        let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
+        packet.extend_from_slice(&routing_bytes);
+        packet.extend_from_slice(&net_bytes);
+        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        let result = router.route_packet(packet.freeze(), from);
+        assert!(matches!(result, Err(RouterError::TtlExpired)));
+
+        let stats = router.routing_table().get_stream_stats(stream_id);
+        assert_eq!(
+            stats.get_packets_in(),
+            0,
+            "regression: a dropped packet must NOT increment per-stream \
+             packets_in. Pre-fix this counter was incremented before \
+             the TTL/loop checks, so drops double-counted as both \
+             ingressed and dropped — masking delivery rate dashboards."
+        );
+        assert_eq!(
+            stats.get_drops(),
+            1,
+            "drop must still increment per-stream packets_dropped"
+        );
     }
 
     #[test]

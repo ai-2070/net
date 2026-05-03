@@ -449,15 +449,15 @@ impl RoutingTable {
 
     /// Add or update a route with an explicit metric.
     ///
-    /// Used by the pingwave-driven route installer. The existing entry is
-    /// preserved (but its `updated_at` is refreshed) if its metric is
-    /// **strictly better** (lower) than the incoming one — this keeps a
-    /// direct route from being replaced by a worse indirect one, while
-    /// still letting a periodic refresh extend the direct route's
-    /// freshness window via the heartbeat loop.
-    ///
-    /// If the new metric is equal or better, the entry is replaced
-    /// (capturing any next-hop change and refreshing `updated_at`).
+    /// Used by the pingwave-driven route installer. The existing entry
+    /// is replaced only if the new metric is **strictly better** (lower)
+    /// than the existing one — this keeps a direct route from being
+    /// overwritten by an indirect one that crafts the same metric (a
+    /// misbehaving or malicious peer that announces metric 1 must not
+    /// be able to displace a real direct route). On equal metrics the
+    /// existing entry is kept but its `updated_at` is refreshed, so the
+    /// arrival of a same-quality alternate path is treated as evidence
+    /// the destination is still reachable.
     pub fn add_route_with_metric(&self, dest_id: u64, next_hop: SocketAddr, metric: u16) {
         use dashmap::mapref::entry::Entry;
         match self.routes.entry(dest_id) {
@@ -465,15 +465,16 @@ impl RoutingTable {
                 v.insert(RouteEntry::with_metric(next_hop, metric));
             }
             Entry::Occupied(mut o) => {
-                if metric <= o.get().metric {
+                if metric < o.get().metric {
                     o.insert(RouteEntry::with_metric(next_hop, metric));
                 } else {
-                    // Existing route is strictly better. Keep it, but
-                    // refresh its freshness — if the better route is
-                    // still there, the worse one's arrival is evidence
-                    // the destination is reachable, so the direct route
-                    // shouldn't time out just because its heartbeat
-                    // happens less often than pingwaves.
+                    // Existing route is at least as good. Keep it, but
+                    // refresh its freshness — if the existing route is
+                    // still installed, the alternate path's arrival is
+                    // evidence the destination is reachable, so the
+                    // installed route shouldn't time out just because
+                    // its own heartbeat happens less often than
+                    // pingwaves.
                     o.get_mut().updated_at = Instant::now();
                 }
             }
@@ -953,14 +954,40 @@ mod tests {
             "worse indirect route must not displace the direct route"
         );
 
-        // An equal-or-better metric DOES replace (captures a next-hop
-        // change, e.g., if the direct peer moved).
+        // A strictly better metric replaces (captures a next-hop
+        // change, e.g., if the direct peer moved AND announced a
+        // shorter path — only achievable for indirect-vs-indirect
+        // since direct's metric=1 is already the floor).
         let better: SocketAddr = "127.0.0.1:4000".parse().unwrap();
-        table.add_route_with_metric(0x2222, better, 1);
+        table.add_route_with_metric(0x2222, better, 0);
         assert_eq!(
             table.lookup(0x2222),
             Some(better),
-            "equal-metric update must replace next_hop"
+            "strictly-better metric update must replace next_hop"
+        );
+    }
+
+    /// Pin: a same-metric pingwave from a different peer must NOT
+    /// displace the installed route. Pre-fix the comparison was
+    /// `<=`, allowing a peer that announced metric 1 (the direct
+    /// floor) to overwrite a real direct route's `next_hop` with
+    /// its own UDP source. The arrival still refreshes
+    /// `updated_at` — the alternate path's existence is evidence
+    /// the destination is reachable.
+    #[test]
+    fn add_route_with_metric_equal_does_not_overwrite_next_hop() {
+        let table = RoutingTable::new(0x1111);
+        let real: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let attacker: SocketAddr = "10.0.0.1:31337".parse().unwrap();
+
+        table.add_route(0x2222, real);
+        // Attacker announces same metric as direct; must NOT win.
+        table.add_route_with_metric(0x2222, attacker, 1);
+        assert_eq!(
+            table.lookup(0x2222),
+            Some(real),
+            "equal-metric pingwave must not overwrite an installed \
+             route's next_hop (security: prevents address poisoning)"
         );
     }
 

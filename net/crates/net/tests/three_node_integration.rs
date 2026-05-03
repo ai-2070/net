@@ -881,7 +881,9 @@ async fn test_router_forwarding_through_middle_node() {
     assert_eq!(stats.packets_local, 0);
 
     router_b.stop();
-    let _ = send_handle.await;
+    if let Some(h) = send_handle {
+        let _ = h.await;
+    }
 }
 
 /// 2.3 — Router delivers locally when dest_id matches local node.
@@ -1027,7 +1029,9 @@ async fn test_router_hop_count_incremented() {
     assert_eq!(fwd_header.dest_id, node_c, "dest_id should be unchanged");
 
     router_b.stop();
-    let _ = send_handle.await;
+    if let Some(h) = send_handle {
+        let _ = h.await;
+    }
 }
 
 /// 2.6 — Router rejects packet with no route to destination.
@@ -1415,7 +1419,9 @@ async fn test_router_end_to_end_forwarding() {
     );
 
     router_b.stop();
-    let _ = send_handle.await;
+    if let Some(h) = send_handle {
+        let _ = h.await;
+    }
 }
 
 /// Multi-hop forwarding: A → B → C with two routers.
@@ -1493,7 +1499,9 @@ async fn test_router_multi_hop_two_routers() {
     assert_eq!(stats_c.packets_local, 1);
 
     router_b.stop();
-    let _ = send_b.await;
+    if let Some(h) = send_b {
+        let _ = h.await;
+    }
 }
 
 // ============================================================================

@@ -64,6 +64,30 @@ fn split_redis_id(s: &str) -> Option<(u64, u64)> {
     Some((ms.parse().ok()?, seq.parse().ok()?))
 }
 
+/// Coarse classifier for a stream id. Two ids of the same
+/// format compare safely via `compare_stream_ids`; two ids of
+/// different formats fall through to a lex compare that may
+/// wedge the cursor (see `update_from_events`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdFormat {
+    /// Redis Streams `<ms>-<seq>`.
+    Redis,
+    /// Plain numeric (JetStream `seq.to_string()`).
+    Numeric,
+    /// Anything else — assumed lex-comparable.
+    Opaque,
+}
+
+pub(crate) fn id_format(s: &str) -> IdFormat {
+    if split_redis_id(s).is_some() {
+        IdFormat::Redis
+    } else if s.parse::<u128>().is_ok() {
+        IdFormat::Numeric
+    } else {
+        IdFormat::Opaque
+    }
+}
+
 /// Backing type for per-shard cursor positions. `Arc<str>` makes
 /// cursor clones (and internal copies during poll merging) cheap by
 /// reference-counting the id bytes rather than copying them.
@@ -130,8 +154,42 @@ impl CompositeCursor {
             .decode(s)
             .map_err(|e| ConsumerError::InvalidCursor(e.to_string()))?;
 
-        let positions: HashMap<u16, CursorPos> = serde_json::from_slice(&bytes)
+        // Two-pass parse so non-canonical shard-id keys (e.g.
+        // `"00"` aliasing `"0"`) are rejected explicitly. Pre-fix
+        // we deserialized straight into `HashMap<u16, _>`; serde
+        // parses each string key as u16, so `"0"` and `"00"`
+        // both produce key 0 and the second insert silently
+        // overwrites the first. The collision is benign in
+        // production (no caller emits non-canonical keys) but
+        // a malicious or buggy producer could inject a hostile
+        // cursor that ambiguates which shard's position a
+        // consumer ended up with on round-trip.
+        let raw_positions: HashMap<String, CursorPos> = serde_json::from_slice(&bytes)
             .map_err(|e| ConsumerError::InvalidCursor(e.to_string()))?;
+        let mut positions: HashMap<u16, CursorPos> = HashMap::with_capacity(raw_positions.len());
+        for (key, val) in raw_positions {
+            let id: u16 = key.parse().map_err(|_| {
+                ConsumerError::InvalidCursor(format!("shard key {key:?} is not a valid u16"))
+            })?;
+            // Reject non-canonical stringifications. The
+            // round-trip `u16 → String` is the canonical form;
+            // any other string that parses to the same u16 is
+            // a non-canonical alias.
+            if id.to_string() != key {
+                return Err(ConsumerError::InvalidCursor(format!(
+                    "non-canonical shard key {key:?} (parses to {id}, \
+                     canonical form is {id})"
+                )));
+            }
+            if positions.insert(id, val).is_some() {
+                // Defensive: if non-canonical detection above
+                // missed something (it shouldn't), a duplicate
+                // canonical key is also a structural error.
+                return Err(ConsumerError::InvalidCursor(format!(
+                    "duplicate shard key {id} after canonicalization"
+                )));
+            }
+        }
 
         Ok(Self { positions })
     }
@@ -166,13 +224,47 @@ impl CompositeCursor {
         for event in events {
             let new_id = event.id.as_str();
             match self.positions.get(&event.shard_id) {
-                Some(existing)
-                    if compare_stream_ids(existing.as_ref(), new_id) != CmpOrdering::Less =>
-                {
-                    // Don't regress (existing is >= new_id under the
-                    // structured comparator).
+                Some(existing) => {
+                    // Detect a backend-format change before
+                    // calling the comparator. Pre-fix a cursor
+                    // at `"42"` (JetStream numeric) confronted
+                    // with a new `"1700-0"` (Redis) fell through
+                    // both structured branches of
+                    // `compare_stream_ids`, hit the lex fallback
+                    // (`'4' > '1'`), and the CAS guard refused
+                    // to update — silent stall requiring manual
+                    // cursor reset. Detect the mismatch
+                    // explicitly: surface a loud error and
+                    // refuse the update so operators see the
+                    // backend migration in logs and reset the
+                    // cursor deliberately. Keeping the existing
+                    // value (rather than blindly accepting the
+                    // new one) avoids a potential regression in
+                    // the other direction.
+                    let existing_fmt = id_format(existing.as_ref());
+                    let new_fmt = id_format(new_id);
+                    if existing_fmt != new_fmt {
+                        tracing::error!(
+                            shard_id = event.shard_id,
+                            existing = %existing,
+                            new = %new_id,
+                            existing_format = ?existing_fmt,
+                            new_format = ?new_fmt,
+                            "stream id format change detected — likely a \
+                             backend migration (e.g. JetStream → Redis). \
+                             Refusing to advance the cursor; operator must \
+                             explicitly reset to consume from the new \
+                             backend.",
+                        );
+                        continue;
+                    }
+                    if compare_stream_ids(existing.as_ref(), new_id) == CmpOrdering::Less {
+                        self.positions.insert(event.shard_id, Arc::from(new_id));
+                    }
+                    // Existing is >= new_id under the structured
+                    // comparator — don't regress.
                 }
-                _ => {
+                None => {
                     self.positions.insert(event.shard_id, Arc::from(new_id));
                 }
             }
@@ -259,6 +351,23 @@ pub struct ConsumeResponse {
     /// invisible to callers. Empty on the happy path; populated
     /// only when a stall was detected and suppressed.
     pub stalled_shards: Vec<u16>,
+    /// Shards whose adapter call returned an error during this
+    /// poll. The merger logs each error at WARN and continues
+    /// with the surviving shards, so the response's `events`
+    /// can come from a strict subset of the configured shards
+    /// and silently miss data the operator expected to see.
+    /// Operators monitoring adapter health need to know WHICH
+    /// shards failed (not just that something logged a warn) so
+    /// they can correlate alerts with specific Redis / JetStream
+    /// nodes.
+    ///
+    /// Pre-fix this signal lived only in the warn log; an
+    /// observer parsing `ConsumeResponse` saw a clean partial-
+    /// shards response with no field indicating *which* shards
+    /// were missing, in contrast to `stalled_shards` which IS
+    /// surfaced. Empty on the happy path; populated only when at
+    /// least one shard's poll errored.
+    pub failed_shards: Vec<u16>,
 }
 
 impl ConsumeResponse {
@@ -270,6 +379,7 @@ impl ConsumeResponse {
             has_more: false,
             truncated_at_per_shard_cap: false,
             stalled_shards: Vec::new(),
+            failed_shards: Vec::new(),
         }
     }
 }
@@ -418,6 +528,14 @@ impl PollMerger {
         // to callers — they saw a clean "no more events" and
         // exited.
         let mut shards_reporting_has_more: Vec<u16> = Vec::new();
+        // Per-shard adapter errors. Pre-fix these were logged at
+        // warn and then dropped on the floor; the response's
+        // `events` was a strict subset of the configured shards
+        // with no field indicating WHICH shards were missing.
+        // Surface the failed shard ids so observers can correlate
+        // alerts with specific Redis / JetStream nodes (parallel
+        // to the existing `stalled_shards` field).
+        let mut failed_shards: Vec<u16> = Vec::new();
         // `new_cursor` (fetched-position tracking) is only consulted on the
         // filter path — building it for unfiltered polls wastes a full
         // HashMap clone plus a `set()` per shard every poll.
@@ -452,6 +570,7 @@ impl PollMerger {
                         error = %e,
                         "Failed to poll shard, skipping"
                     );
+                    failed_shards.push(shard_id);
                     // Continue with other shards
                 }
             }
@@ -676,12 +795,16 @@ impl PollMerger {
         };
         // Return the cursor even when all events were filtered out, so the
         // caller advances past the filtered region instead of re-fetching
-        // the same events forever. The cursor is None only when nothing was
-        // fetched at all (truly empty shards).
+        // the same events forever. When the poll made no progress at
+        // all, echo back the caller's input cursor (if any) instead of
+        // returning `None` — pre-fix a stalled poll dropped the cursor,
+        // so a caller that interpreted `next_id == None` as "no events,
+        // restart from the beginning" silently regressed pagination
+        // across the stall. Echoing preserves the cursor across stalls.
         let next_id = if we_made_progress {
             Some(final_cursor.encode()?)
         } else {
-            None
+            request.from_id.clone()
         };
 
         Ok(ConsumeResponse {
@@ -690,6 +813,7 @@ impl PollMerger {
             has_more,
             truncated_at_per_shard_cap,
             stalled_shards,
+            failed_shards,
         })
     }
 }
@@ -816,6 +940,80 @@ mod tests {
         );
     }
 
+    /// Regression: a backend migration (e.g. JetStream → Redis)
+    /// that lands an id of a different format than the existing
+    /// cursor must NOT silently advance OR silently stall. Pre-
+    /// fix `compare_stream_ids` fell through both structured
+    /// branches and hit the lex fallback: `"42" > "1700-0"` (because
+    /// `'4' > '1'`), so the CAS guard refused to update the
+    /// cursor. Result: the consumer kept seeing `"42"` forever
+    /// while the new Redis backend kept emitting Redis-formatted
+    /// ids, with no surfaced error.
+    ///
+    /// Post-fix: format-mismatch is detected explicitly and
+    /// surfaced via `tracing::error!`. The cursor stays at its
+    /// current value (so we don't regress), and an operator must
+    /// reset the cursor deliberately to consume from the new
+    /// backend. This test pins the "stays at existing value"
+    /// half of the contract; the loud error is observability,
+    /// not behavior, so it isn't asserted here.
+    #[test]
+    fn cursor_refuses_to_advance_across_backend_format_change() {
+        let mut cursor = CompositeCursor::new();
+        // Cursor starts at JetStream-style numeric "42".
+        cursor.update_from_events(&[StoredEvent::from_value("42".to_string(), json!({}), 42, 0)]);
+        assert_eq!(cursor.get(0), Some("42"));
+
+        // A new event arrives in Redis format. Pre-fix this would
+        // hit the lex fallback and the cursor would refuse to
+        // advance silently; post-fix the format mismatch is
+        // detected and the cursor STILL refuses to advance, but
+        // a `tracing::error!` is emitted so operators see the
+        // backend migration.
+        cursor.update_from_events(&[StoredEvent::from_value(
+            "1700000000000-0".to_string(),
+            json!({}),
+            1700000000000,
+            0,
+        )]);
+
+        // Cursor must still be at the original numeric id (not
+        // the new Redis id, which would be a regression-like
+        // jump back in time, AND not unset, which would lose
+        // progress).
+        assert_eq!(
+            cursor.get(0),
+            Some("42"),
+            "regression: cursor must not silently advance through a \
+             backend-format change. The pre-fix lex fallback also \
+             happened to keep the existing value (by `'4' > '1'`), \
+             but only by accident; this test pins the explicit \
+             format-mismatch refusal."
+        );
+
+        // And the reverse direction: a Redis cursor confronted
+        // with a new numeric id must also stay put.
+        let mut cursor = CompositeCursor::new();
+        cursor.update_from_events(&[StoredEvent::from_value(
+            "1700000000000-0".to_string(),
+            json!({}),
+            1700000000000,
+            0,
+        )]);
+        cursor.update_from_events(&[StoredEvent::from_value(
+            "9000".to_string(),
+            json!({}),
+            9000,
+            0,
+        )]);
+        assert_eq!(
+            cursor.get(0),
+            Some("1700000000000-0"),
+            "regression (reverse direction): Redis cursor must not be \
+             silently overwritten by an incoming numeric id"
+        );
+    }
+
     /// CR-1: cross-decade compare on JetStream-style ids.
     #[test]
     fn cursor_advances_from_unpadded_9_to_unpadded_10() {
@@ -938,6 +1136,36 @@ mod tests {
         // Valid base64 but not valid JSON
         let result = CompositeCursor::decode(&BASE64.encode(b"not json"));
         assert!(result.is_err());
+    }
+
+    /// Regression: non-canonical shard-id keys must be rejected
+    /// at decode time. Pre-fix `serde_json::from_slice::<HashMap<u16,
+    /// _>>` parsed `"00"` and `"0"` both as u16 0; the second
+    /// insert silently overwrote the first, leaving the consumer
+    /// with whichever entry happened to come later in the JSON.
+    /// Two distinct stringifications collapsed to one shard
+    /// position with no surfaced error.
+    #[test]
+    fn cursor_decode_rejects_non_canonical_shard_keys() {
+        // Construct a JSON cursor with `"00"` aliasing `"0"`.
+        // Both round-trip to u16 0 under standard parsing.
+        let hostile = br#"{"00":"id_a","1":"id_b"}"#;
+        let encoded = BASE64.encode(hostile);
+        let result = CompositeCursor::decode(&encoded);
+        assert!(
+            result.is_err(),
+            "non-canonical shard key `\"00\"` must reject; \
+             pre-fix this silently parsed as shard 0"
+        );
+
+        // Boundary: the canonical "0" (no leading zero) decodes
+        // normally.
+        let canonical = br#"{"0":"id_a","1":"id_b"}"#;
+        let encoded_ok = BASE64.encode(canonical);
+        let cursor =
+            CompositeCursor::decode(&encoded_ok).expect("canonical shard keys must decode cleanly");
+        assert_eq!(cursor.get(0), Some("id_a"));
+        assert_eq!(cursor.get(1), Some("id_b"));
     }
 
     #[test]
@@ -1309,6 +1537,101 @@ mod tests {
         assert!(response.events.is_empty());
         assert!(response.next_id.is_none());
         assert!(!response.has_more);
+    }
+
+    /// Regression: per-shard adapter errors must surface on
+    /// `ConsumeResponse.failed_shards`, not silently disappear
+    /// after a `tracing::warn!`. Pre-fix the merger logged the
+    /// error and continued; the response carried events from
+    /// the surviving shards with no field indicating WHICH
+    /// shards failed (in contrast to `stalled_shards` which IS
+    /// surfaced). Operators correlating alerts with specific
+    /// Redis / JetStream nodes had to grep logs instead of
+    /// reading a structured response field.
+    #[tokio::test]
+    async fn poll_response_surfaces_failed_shard_ids() {
+        // Mock that fails on a specific shard id.
+        struct FailingShardMock {
+            inner: MockAdapter,
+            fail_shard: u16,
+        }
+
+        #[async_trait]
+        impl Adapter for FailingShardMock {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, _b: Batch) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                shard_id: u16,
+                from_id: Option<&str>,
+                limit: usize,
+            ) -> Result<ShardPollResult, AdapterError> {
+                if shard_id == self.fail_shard {
+                    return Err(AdapterError::Transient(format!(
+                        "synthetic failure on shard {shard_id}"
+                    )));
+                }
+                self.inner.poll_shard(shard_id, from_id, limit).await
+            }
+            fn name(&self) -> &'static str {
+                "failing-mock"
+            }
+        }
+
+        let inner = MockAdapter::new();
+        // Shard 0 has events, shard 1 will fail, shard 2 has events.
+        inner.add_events(
+            0,
+            vec![StoredEvent::from_value(
+                "0-1".to_string(),
+                json!({"shard": 0}),
+                100,
+                0,
+            )],
+        );
+        inner.add_events(
+            2,
+            vec![StoredEvent::from_value(
+                "2-1".to_string(),
+                json!({"shard": 2}),
+                100,
+                2,
+            )],
+        );
+
+        let adapter = Arc::new(FailingShardMock {
+            inner,
+            fail_shard: 1,
+        });
+        let merger = PollMerger::new(adapter, vec![0, 1, 2]);
+
+        let response = merger.poll(ConsumeRequest::new(100)).await.unwrap();
+
+        // Surviving shards' events still come through.
+        assert_eq!(
+            response.events.len(),
+            2,
+            "events from non-failing shards must still be returned"
+        );
+
+        // The failed shard id is surfaced on the response.
+        assert_eq!(
+            response.failed_shards,
+            vec![1],
+            "regression: failed_shards must list the shard whose adapter \
+             errored. Pre-fix this list didn't exist; observers couldn't \
+             tell which shard was missing without log scraping."
+        );
     }
 
     #[tokio::test]
@@ -2339,6 +2662,78 @@ mod tests {
             response.next_id.is_none(),
             "next_id must remain None when no progress was made (#50)"
         );
+    }
+
+    /// Pin: a stalled poll (no events, no cursor advance) that
+    /// was given an input cursor must echo the cursor back to the
+    /// caller. Pre-fix the merger returned `next_id = None` on no
+    /// progress, so a caller that interpreted None as "no events
+    /// — restart from the beginning" silently re-fetched from the
+    /// stream's start across the stall, losing pagination
+    /// continuity.
+    #[tokio::test]
+    async fn stalled_poll_echoes_caller_cursor_back() {
+        struct EmptyAdapter;
+
+        #[async_trait]
+        impl Adapter for EmptyAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _shard_id: u16,
+                _from_id: Option<&str>,
+                _limit: usize,
+            ) -> Result<ShardPollResult, AdapterError> {
+                Ok(ShardPollResult {
+                    events: Vec::new(),
+                    next_id: None,
+                    has_more: false,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "empty"
+            }
+        }
+
+        let adapter: Arc<dyn Adapter> = Arc::new(EmptyAdapter);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
+
+        // Build a real composite cursor for the request to echo.
+        let mut cursor = CompositeCursor::new();
+        cursor.set(0, "1702-0".to_string());
+        cursor.set(1, "1703-0".to_string());
+        let encoded = cursor.encode().unwrap();
+
+        let mut req = ConsumeRequest::new(100);
+        req.from_id = Some(encoded.clone());
+
+        let response = merger.poll(req).await.unwrap();
+
+        assert!(response.events.is_empty());
+        assert_eq!(
+            response.next_id.as_deref(),
+            Some(encoded.as_str()),
+            "stalled poll with input cursor must echo cursor back \
+             (got {:?}); pre-fix this was None and callers paged \
+             back to the stream's start",
+            response.next_id,
+        );
+
+        // Without an input cursor, no progress + no input → still
+        // None (preserving the prior behavior of #50).
+        let response_no_cursor = merger.poll(ConsumeRequest::new(100)).await.unwrap();
+        assert!(response_no_cursor.next_id.is_none());
     }
 
     /// Regression: BUG_REPORT.md #52 — `sort_by_key(|e| e.insertion_ts)`

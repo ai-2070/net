@@ -966,7 +966,19 @@ impl LoadBalancer {
     ) -> Selection {
         let total_weight: f64 = endpoints.iter().map(|e| e.effective_weight()).sum();
 
-        if total_weight <= 0.0 {
+        // Use `!(total_weight > 0.0)` rather than `total_weight <= 0.0`:
+        // NaN compares unequal to everything (including itself), so
+        // `NaN <= 0.0` is `false` — the gate would fall through to
+        // the weighted path below where `total_weight.ceil() as u64`
+        // is undefined for NaN, and the cumulative loop never
+        // exceeds NaN (the `>` comparison is also false), causing
+        // the function to fall through to the fallback-first path
+        // and silently bias every selection to `endpoints[0]`. The
+        // negated-greater check catches NaN as well as ≤ 0.0.
+        // Clippy flags the negated comparison; the lint is wrong
+        // for our NaN-safety intent, so suppress it locally.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        if !(total_weight > 0.0) {
             return self.select_round_robin_at(endpoints, counter as usize);
         }
 
@@ -2275,6 +2287,73 @@ mod tests {
             !ep.half_open_probe.load(Ordering::Acquire),
             "CR-19 regression: panic between claim and commit MUST roll \
              back the probe slot via ProbeGuard::drop"
+        );
+    }
+
+    /// Pin: `select_weighted_round_robin_at` must use the
+    /// NaN-safe guard `!(total_weight > 0.0)` rather than
+    /// `total_weight <= 0.0`. NaN compares unequal to everything
+    /// (including itself), so `NaN <= 0.0` is `false` — the
+    /// gate falls through to the weighted path where
+    /// `total_weight.ceil() as u64` produces an undefined
+    /// (saturating) cast and the cumulative loop never exceeds
+    /// NaN, biasing every selection to `endpoints[0]`. The
+    /// negated-greater check catches NaN as well as zero/negative.
+    ///
+    /// This is a tripwire: a "simplification" PR that flips the
+    /// guard back to `<= 0.0` would silently re-introduce the
+    /// bias whenever any future code path produces a NaN
+    /// effective weight (e.g. an f64 `weight` field). The pin
+    /// is scoped to the round-robin function body — the random
+    /// path elsewhere in this file is governed by its own
+    /// guard and is not part of this regression.
+    #[test]
+    fn weighted_round_robin_guard_must_be_nan_safe() {
+        let src = include_str!("loadbalance.rs");
+
+        // Locate the function header and the next `fn ` after
+        // it; everything between is the body we pin.
+        let header = "fn select_weighted_round_robin_at(";
+        let start = src
+            .find(header)
+            .expect("select_weighted_round_robin_at must exist");
+        // `find` from the next character so we don't match the
+        // header itself.
+        let body_start = start + header.len();
+        let next_fn = src[body_start..]
+            .find("\n    fn ")
+            .expect("a following fn must exist (mod-private impl block)")
+            + body_start;
+        let body = &src[start..next_fn];
+
+        // Strip line comments (everything from `//` to EOL) so a
+        // doc comment that *describes* the rejected pattern
+        // doesn't trip the negative assertion below.
+        let body_no_comments: String = body
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(idx) => &l[..idx],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            body_no_comments.contains("!(total_weight > 0.0)"),
+            "regression: select_weighted_round_robin_at must use the \
+             NaN-safe guard `!(total_weight > 0.0)`. Without it a NaN \
+             total_weight (introduced by a future f64 weight path) \
+             falls through to the weighted code, biasing every \
+             selection onto endpoints[0]."
+        );
+
+        // Also assert the buggy form is gone from THIS function
+        // body. The NaN-safe form does not contain `<= 0.0`, so
+        // this should fail iff someone reverts the guard.
+        assert!(
+            !body_no_comments.contains("total_weight <= 0.0"),
+            "regression: select_weighted_round_robin_at must not \
+             use the NaN-unsafe guard `total_weight <= 0.0`."
         );
     }
 

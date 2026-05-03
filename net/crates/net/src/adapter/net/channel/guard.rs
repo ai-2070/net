@@ -225,6 +225,17 @@ pub struct AuthGuard {
     /// underlying validated `String`, so DashMap keys on the exact
     /// name comparison.
     exact: DashMap<(u64, ChannelName), ()>,
+    /// Count of `revoke()` calls since the last `rebuild_bloom()`.
+    /// Bloom filters don't support deletion, so each revocation
+    /// leaves stale bits in the bloom and the false-positive rate
+    /// climbs over the operating window. Operators / monitoring
+    /// hooks read [`Self::revocations_since_rebuild`] and call
+    /// `rebuild_bloom` when the value crosses a deployment-
+    /// specific threshold (typical: ~1k revocations or ~1% of
+    /// bloom capacity, whichever fires first). Pre-fix the dirty
+    /// rate was unobservable — the false-positive climb produced
+    /// silent CPU waste on `is_authorized_full` fallbacks.
+    revocations_since_rebuild: std::sync::atomic::AtomicU64,
 }
 
 /// Bloom filter size: 2^15 bits = 4KB. Fits in L1 cache.
@@ -237,6 +248,7 @@ impl AuthGuard {
             bloom: BloomCache::new(),
             verified: DashMap::new(),
             exact: DashMap::new(),
+            revocations_since_rebuild: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -297,8 +309,28 @@ impl AuthGuard {
     /// Removes from verified cache. The bloom filter is not cleared
     /// (bloom filters don't support deletion), but the verified cache
     /// miss will cause `NeedsFullCheck` which will then fail.
+    ///
+    /// Bumps [`Self::revocations_since_rebuild`] so operators can
+    /// schedule a `rebuild_bloom` when the dirty count crosses a
+    /// deployment threshold and the false-positive rate makes the
+    /// `NeedsFullCheck` fallback dominate the hot path.
     pub fn revoke(&self, origin_hash: u64, channel_hash: u16) {
         self.verified.remove(&(origin_hash, channel_hash));
+        self.revocations_since_rebuild
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Number of `revoke` calls since the last successful
+    /// `rebuild_bloom`. Operators / monitoring hooks read this to
+    /// decide when to schedule a rebuild — bloom filters can't
+    /// delete bits, so each revoke leaves a dirty bit that
+    /// inflates the false-positive rate. A rule of thumb: rebuild
+    /// when the count crosses ~1k or ~1% of the bloom capacity,
+    /// whichever fires first.
+    #[inline]
+    pub fn revocations_since_rebuild(&self) -> u64 {
+        self.revocations_since_rebuild
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Check if a pair is authorized (verified cache only, no bloom).
@@ -370,6 +402,11 @@ impl AuthGuard {
             let (origin_hash, channel_hash) = *entry.key();
             self.bloom.mark(origin_hash, channel_hash);
         }
+        // Reset the dirty counter so subsequent
+        // `revocations_since_rebuild` queries reflect the post-
+        // rebuild state.
+        self.revocations_since_rebuild
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

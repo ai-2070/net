@@ -131,11 +131,23 @@ impl RedisStreamDedup {
         }
     }
 
-    /// Default-sized helper (4096 ids).
+    /// Default-sized helper (4 096 ids).
     ///
-    /// Suited to low-throughput consumers and short dedup windows.
-    /// Production callers with high throughput or long out-of-order
-    /// horizons should pick a capacity explicitly.
+    /// Sized for low-throughput consumers and short dedup
+    /// windows. At 10 K events/sec this covers ~0.4 seconds —
+    /// far below the "minutes of in-flight" horizon production
+    /// deployments typically require. **Production callers
+    /// with high throughput or long out-of-order horizons must
+    /// pick a capacity explicitly via [`Self::with_capacity`].**
+    /// As a rough guideline, sizing follows
+    /// `peak_events_per_sec × out_of_order_tolerance_seconds`:
+    /// 10 K events/sec with ~1 minute of tolerance needs ~600 K.
+    ///
+    /// Pre-fix the parent module's docs claimed the default
+    /// matched "a few thousand ids, ~minutes of in-flight at
+    /// moderate throughput" — those numbers don't match
+    /// (4 096 / 10 000 ≈ 0.4 s, not minutes). The corrected
+    /// guidance is now explicit on both sides.
     pub fn new() -> Self {
         Self::with_capacity(4096)
     }

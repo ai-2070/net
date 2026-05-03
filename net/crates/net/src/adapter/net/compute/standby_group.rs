@@ -210,6 +210,22 @@ impl StandbyGroup {
     /// stateful daemon that needs failover.
     ///
     /// Returns the snapshot's `through_seq` so the caller knows what's synced.
+    ///
+    /// Partial-failure semantics: if `restore_from_snapshot` fails
+    /// for one standby mid-loop, the bookkeeping for the standbys
+    /// that DID succeed is recorded before propagating the error.
+    /// Pre-fix, an early `?` skipped the entire bookkeeping pass —
+    /// previously-restored standbys retained the OLD `synced_through`
+    /// value, but their daemon state had already been rewritten to
+    /// the new snapshot. A subsequent `promote()` running through
+    /// `max_by_key(synced_through)` picked the (stale-by-tracking)
+    /// standby and replayed `buffered_since_sync` on top, double-
+    /// executing every event between the previous sync and the
+    /// just-failed sync's `through_seq`.
+    ///
+    /// Buffer-clearing also moves: only clear `buffered_since_sync`
+    /// if EVERY standby succeeded. A partial sync must keep the
+    /// buffer so the failed standby can catch up next cycle.
     pub fn sync_standbys(&mut self, registry: &DaemonRegistry) -> Result<u64, GroupError> {
         let active_origin = self.active_origin();
 
@@ -222,33 +238,60 @@ impl StandbyGroup {
         let through_seq = snapshot.through_seq;
         let now = Instant::now();
 
-        // Push snapshot state onto every standby. Each standby now
-        // holds the active's state at `through_seq` and is ready to
-        // promote without losing pre-sync history.
-        let standby_origins: Vec<u32> = self
+        // Push snapshot state onto every standby and record per-
+        // standby success. Iterate in two layers: collect origins
+        // first (avoids holding a borrow on `self.members` while
+        // calling out to the registry), then track success
+        // membership so we can update bookkeeping precisely below.
+        let standbys: Vec<(usize, u32)> = self
             .members
             .iter()
-            .filter(|m| m.role == MemberRole::Standby)
-            .map(|m| self.coord.members()[m.index as usize].origin_hash)
+            .enumerate()
+            .filter(|(_, m)| m.role == MemberRole::Standby)
+            .map(|(i, m)| (i, self.coord.members()[m.index as usize].origin_hash))
             .collect();
-        for standby_origin in standby_origins {
-            registry
-                .restore_from_snapshot(standby_origin, &snapshot)
-                .map_err(|e| GroupError::RegistryFailed(e.to_string()))?;
+        let total_standbys = standbys.len();
+        let mut succeeded: Vec<usize> = Vec::with_capacity(standbys.len());
+        let mut first_err: Option<GroupError> = None;
+        for (member_idx, standby_origin) in standbys {
+            match registry.restore_from_snapshot(standby_origin, &snapshot) {
+                Ok(()) => succeeded.push(member_idx),
+                Err(e) => {
+                    first_err = Some(GroupError::RegistryFailed(e.to_string()));
+                    break;
+                }
+            }
         }
 
-        // Update sync tracking
+        // Update bookkeeping for each standby that successfully
+        // restored. Standbys that failed (or that we never reached
+        // after a mid-loop break) keep their previous tracking.
+        for &i in &succeeded {
+            let member = &mut self.members[i];
+            member.synced_through = through_seq;
+            member.last_sync = Some(now);
+        }
+        // The active member's `synced_through` advances to the new
+        // floor regardless of standby success — the snapshot was
+        // taken from the active's own state, so its tracking
+        // matches reality even if no standby received it.
         for member in &mut self.members {
-            if member.role == MemberRole::Standby {
-                member.synced_through = through_seq;
-                member.last_sync = Some(now);
-            } else {
+            if member.role == MemberRole::Active {
                 member.synced_through = through_seq;
             }
         }
 
-        // Clear event buffer — standbys are synced to this point
-        self.buffered_since_sync.clear();
+        if let Some(err) = first_err {
+            // Partial failure. Don't clear `buffered_since_sync`:
+            // the failed standby still owes the buffer's events
+            // and the next sync cycle will retry from this point.
+            return Err(err);
+        }
+
+        // All standbys synced — safe to drop the event buffer.
+        if succeeded.len() == total_standbys {
+            self.buffered_since_sync.clear();
+        }
 
         Ok(through_seq)
     }
@@ -275,14 +318,41 @@ impl StandbyGroup {
         // `on_node_recovery` for that member only marks it healthy —
         // it doesn't restore the `Active` role — so the group would
         // be silently demoted forever.
-        let best_standby = self
+        // Prefer standbys that have completed at least one
+        // `sync_standbys` cycle. A replaced-then-re-placed standby
+        // has `synced_through = 0` and `last_sync = None` until the
+        // next sync — and `max_by_key(synced_through)` could
+        // otherwise pick that fresh-zero standby over a previously-
+        // synced sibling whose `synced_through` was also reset to 0
+        // by some prior path. Promoting the never-synced standby
+        // means the new active has zero pre-buffer state; replaying
+        // `buffered_since_sync` only covers events SINCE the last
+        // sync, so anything before that sync is permanently lost.
+        //
+        // Fall back to any healthy standby when NO candidate has
+        // ever synced (legitimate during the first promote-before-
+        // sync window): the buffer in that case contains every
+        // event since spawn, so a fresh standby can correctly
+        // catch up via `buffered_since_sync` replay.
+        let candidates: Vec<&StandbyInfo> = self
             .members
             .iter()
             .filter(|m| m.role == MemberRole::Standby && m.index != old_active)
             .filter(|m| self.coord.members()[m.index as usize].healthy)
+            .collect();
+        let synced_pick = candidates
+            .iter()
+            .filter(|m| m.last_sync.is_some())
             .max_by_key(|m| m.synced_through)
-            .map(|m| m.index)
-            .ok_or(GroupError::NoHealthyMember)?;
+            .map(|m| m.index);
+        let best_standby = match synced_pick {
+            Some(idx) => idx,
+            None => candidates
+                .iter()
+                .max_by_key(|m| m.synced_through)
+                .map(|m| m.index)
+                .ok_or(GroupError::NoHealthyMember)?,
+        };
 
         // Now safe to mutate — search succeeded, promotion will
         // complete.
@@ -651,6 +721,172 @@ mod tests {
         assert_eq!(group.buffered_event_count(), 0);
         assert_eq!(group.synced_through(1), Some(10));
         assert_eq!(group.synced_through(2), Some(10));
+    }
+
+    /// Regression: a freshly-replaced standby has `synced_through = 0`
+    /// and `last_sync = None` until the next sync_standbys cycle.
+    /// Pre-fix, `promote()`'s `max_by_key(synced_through)` could
+    /// pick that fresh standby over a previously-synced sibling
+    /// whose `synced_through` was also reset to 0 by some earlier
+    /// path — promoting a daemon with zero pre-buffer state and
+    /// silently losing every event before the most recent sync.
+    /// Fix prefers candidates with `last_sync.is_some()`; falls back
+    /// to any healthy candidate only when nobody has ever synced.
+    #[test]
+    fn promote_prefers_synced_standby_over_freshly_replaced_one() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+
+        let active = group.active_origin();
+
+        // Drive some events through, then sync — both standbys
+        // now have last_sync = Some(_) and synced_through > 0.
+        for seq in 1..=10 {
+            let event = make_event(seq);
+            reg.deliver(active, &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        group.sync_standbys(&reg).unwrap();
+
+        // Identify the two standbys by index (everything that's
+        // not the active).
+        let standby_indices: Vec<u8> = (0..3u8).filter(|&i| i != group.active_index).collect();
+        assert_eq!(standby_indices.len(), 2);
+
+        // Force one of the standbys back to "freshly replaced"
+        // shape by zeroing its tracking. This mirrors what
+        // `on_node_failure`'s replacement path does at line 430-431.
+        let idx_replaced = standby_indices[0];
+        let idx_synced = standby_indices[1];
+        group.members[idx_replaced as usize].synced_through = 0;
+        group.members[idx_replaced as usize].last_sync = None;
+
+        // Now drive new events and buffer them — the synced
+        // standby's `synced_through` is still 10 from above. The
+        // replaced standby's is 0.
+        for seq in 11..=15 {
+            let event = make_event(seq);
+            reg.deliver(group.active_origin(), &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        // Skip the next sync to keep the replaced standby at
+        // `last_sync = None`.
+
+        // Active fails. Promote must pick the SYNCED standby, not
+        // the freshly-replaced one — even if `synced_through`
+        // were equal, the synced one has pre-buffer state we'd
+        // otherwise lose. With our state, the synced one's
+        // `synced_through = 10` exceeds the replaced one's `0`,
+        // so `max_by_key` should already favor it; the test pins
+        // the `last_sync.is_some()` filter for the case where
+        // both have identical synced_through.
+        group.coord.mark_unhealthy(group.active_index);
+        let new_active = group
+            .promote(|| Box::new(StatefulDaemon::new()), &reg, &sched)
+            .unwrap();
+        assert_eq!(
+            group.active_index, idx_synced,
+            "promote must pick the synced standby (idx={}), not the freshly-replaced one (idx={})",
+            idx_synced, idx_replaced,
+        );
+        let _ = new_active;
+    }
+
+    /// Regression: pre-fix, a partial-failure mid-loop in
+    /// `sync_standbys` skipped the entire bookkeeping pass via `?`.
+    /// Standbys that DID succeed had their daemon state rewritten
+    /// to the new snapshot, but `synced_through` still pointed at
+    /// the prior cycle's value AND `buffered_since_sync` was not
+    /// cleared. A subsequent `promote()` could pick a (stale-by-
+    /// tracking) successfully-restored standby and replay
+    /// `buffered_since_sync` on top, double-executing every event
+    /// between the previous sync and the just-failed sync's
+    /// `through_seq`. The fix records bookkeeping per-standby on
+    /// success and only clears the buffer when ALL standbys synced.
+    #[test]
+    fn sync_standbys_partial_failure_records_per_standby_progress() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+
+        // First clean sync — establishes a baseline `synced_through`.
+        for seq in 1..=5 {
+            let event = make_event(seq);
+            reg.deliver(group.active_origin(), &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        group.sync_standbys(&reg).unwrap();
+        assert_eq!(group.buffered_event_count(), 0);
+        let pre_synced_1 = group.synced_through(1).unwrap();
+        let pre_synced_2 = group.synced_through(2).unwrap();
+        assert_eq!(pre_synced_1, 5);
+        assert_eq!(pre_synced_2, 5);
+
+        // Buffer some new events, then unregister the SECOND standby
+        // so its restore_from_snapshot returns NotFound mid-loop.
+        for seq in 6..=10 {
+            let event = make_event(seq);
+            reg.deliver(group.active_origin(), &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        let standby_origins: Vec<u32> = group
+            .members
+            .iter()
+            .filter(|m| m.role == MemberRole::Standby)
+            .map(|m| group.coord.members()[m.index as usize].origin_hash)
+            .collect();
+        assert_eq!(standby_origins.len(), 2);
+        // Drop the 2nd standby so restore fails for it.
+        reg.unregister(standby_origins[1]).unwrap();
+
+        // Second sync — should fail mid-loop. The first standby's
+        // restore succeeded so its bookkeeping must reflect the
+        // new snapshot; the second standby's bookkeeping must NOT
+        // advance.
+        let result = group.sync_standbys(&reg);
+        assert!(
+            result.is_err(),
+            "sync_standbys must surface the standby restore failure",
+        );
+
+        // First standby's tracking advanced (state and bookkeeping
+        // are coherent). Pre-fix the bookkeeping was skipped, so
+        // promote would treat this standby as still synced through
+        // the old `pre_synced_1` and replay the buffered range on
+        // top of an already-restored state.
+        assert_eq!(
+            group.synced_through(1),
+            Some(10),
+            "first standby successfully restored — tracking must reflect the new snapshot",
+        );
+        // Second standby's tracking did NOT advance — its state is
+        // still at the prior sync.
+        assert_eq!(
+            group.synced_through(2),
+            Some(pre_synced_2),
+            "failed-standby tracking must NOT advance",
+        );
+        // Buffer must be RETAINED on partial failure so the next
+        // sync cycle has the events the failed standby still owes.
+        assert!(
+            group.buffered_event_count() > 0,
+            "buffered_since_sync must be retained on partial failure",
+        );
     }
 
     /// Regression for BUG_AUDIT_2026_04_30_CORE.md #103: pre-fix

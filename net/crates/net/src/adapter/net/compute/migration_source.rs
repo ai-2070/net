@@ -46,6 +46,15 @@ pub struct MigrationSourceHandler {
     daemon_registry: Arc<DaemonRegistry>,
     /// Active migrations on this node as source: daemon_origin → state.
     migrations: DashMap<u32, Mutex<SourceMigrationState>>,
+    /// Single-flight claim set: a daemon present here has a snapshot
+    /// in flight. `start_snapshot` CAS-inserts the origin BEFORE
+    /// running the user-supplied `MeshDaemon::snapshot()` and
+    /// removes it on insertion-into-`migrations` OR on early return.
+    /// Pre-fix the contains_key→entry window let two callers each
+    /// run a full snapshot for the same origin, double-firing any
+    /// non-idempotent side-effect (counter bumps, deferred I/O,
+    /// etc.) inside the user's snapshot impl.
+    snapshots_in_progress: DashMap<u32, ()>,
 }
 
 impl MigrationSourceHandler {
@@ -54,6 +63,7 @@ impl MigrationSourceHandler {
         Self {
             daemon_registry,
             migrations: DashMap::new(),
+            snapshots_in_progress: DashMap::new(),
         }
     }
 
@@ -108,13 +118,42 @@ impl MigrationSourceHandler {
             return Err(MigrationError::DaemonNotFound(daemon_origin));
         }
 
-        // Cheap pre-check on the migrations map without holding
-        // a guard across the snapshot. Avoids the wasted snapshot
-        // in the common case where another caller already got
-        // there first.
         if self.migrations.contains_key(&daemon_origin) {
             return Err(MigrationError::AlreadyMigrating(daemon_origin));
         }
+
+        // Single-flight claim. CAS-insert into `snapshots_in_progress`
+        // BEFORE running the user-supplied snapshot — DashMap's
+        // `Entry::Vacant`/`Occupied` is the atomic fence. If we
+        // observe `Occupied`, another caller is mid-snapshot for
+        // this origin; surface AlreadyMigrating without firing the
+        // user's snapshot a second time.
+        match self.snapshots_in_progress.entry(daemon_origin) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(MigrationError::AlreadyMigrating(daemon_origin));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(());
+            }
+        }
+        // RAII drop of the claim regardless of which branch we exit
+        // through. Keeping the claim past `migrations.entry` insert
+        // is fine — the contains_key check at the top of subsequent
+        // callers' `start_snapshot` already returns AlreadyMigrating
+        // once `migrations` is populated.
+        struct ClaimGuard<'a> {
+            map: &'a DashMap<u32, ()>,
+            origin: u32,
+        }
+        impl Drop for ClaimGuard<'_> {
+            fn drop(&mut self) {
+                self.map.remove(&self.origin);
+            }
+        }
+        let _claim_guard = ClaimGuard {
+            map: &self.snapshots_in_progress,
+            origin: daemon_origin,
+        };
 
         let snapshot = self
             .daemon_registry
@@ -124,9 +163,10 @@ impl MigrationSourceHandler {
                 MigrationError::StateFailed("daemon is stateless or snapshot failed".into())
             })?;
 
-        // Atomic insert. If another caller raced past the
-        // pre-check above and inserted first, our snapshot is
-        // wasted but we surface the same AlreadyMigrating error.
+        // Atomic insert. The single-flight claim above guarantees
+        // no second snapshot call ran for this origin while we were
+        // computing — so the Occupied branch here is unreachable
+        // in practice, but kept for defense-in-depth.
         let entry = match self.migrations.entry(daemon_origin) {
             dashmap::mapref::entry::Entry::Occupied(_) => {
                 return Err(MigrationError::AlreadyMigrating(daemon_origin));
@@ -196,9 +236,22 @@ impl MigrationSourceHandler {
         self.migrations.contains_key(&daemon_origin)
     }
 
-    /// Get buffered events for transfer to the target (during replay phase).
+    /// Get buffered events for transfer to the target (during
+    /// snapshot/transfer/restore/replay phases — i.e. the same
+    /// phases that `buffer_event` accepts writes in).
     ///
     /// Drains the buffer — events are moved, not copied.
+    ///
+    /// Returns `WrongPhase` if invoked after cutover. Pre-fix
+    /// the call had no phase guard, so a caller that drained
+    /// post-cutover would silently get an empty `Vec` (since
+    /// `on_cutover` already drained the buffer to its return
+    /// value and any post-cutover writes are rejected by
+    /// `buffer_event`). Distinguishing "no events were
+    /// buffered" from "you called drain in the wrong phase" via
+    /// a typed error catches the latter at the boundary instead
+    /// of letting it manifest as missing-event diagnostics
+    /// downstream.
     pub fn take_buffered_events(
         &self,
         daemon_origin: u32,
@@ -209,7 +262,16 @@ impl MigrationSourceHandler {
             .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;
 
         let mut state = entry.lock();
-        Ok(std::mem::take(&mut state.buffered_events))
+        match state.phase {
+            MigrationPhase::Snapshot
+            | MigrationPhase::Transfer
+            | MigrationPhase::Restore
+            | MigrationPhase::Replay => Ok(std::mem::take(&mut state.buffered_events)),
+            other => Err(MigrationError::WrongPhase {
+                expected: MigrationPhase::Replay,
+                got: other,
+            }),
+        }
     }
 
     /// Phase 4: Cutover — stop accepting writes for this daemon.
@@ -420,5 +482,39 @@ mod tests {
 
         assert!(!handler.is_migrating(origin));
         assert!(reg.contains(origin)); // daemon still registered
+    }
+
+    /// Regression: `take_buffered_events` must refuse to drain
+    /// after `on_cutover` has transitioned the daemon into the
+    /// `Cutover` phase. Pre-fix the call had no phase guard, so
+    /// a caller invoking it post-cutover silently received an
+    /// empty `Vec` (since `on_cutover` already drained the
+    /// buffer to its return value). The empty result was
+    /// indistinguishable from "no events were ever buffered,"
+    /// pushing diagnosis of the misuse to whatever downstream
+    /// code consumed the empty list. Post-fix it returns
+    /// `WrongPhase { expected: Replay, got: Cutover }` so the
+    /// programming error surfaces at the boundary.
+    #[test]
+    fn take_buffered_events_after_cutover_returns_wrong_phase() {
+        let (reg, origin) = setup();
+        let handler = MigrationSourceHandler::new(reg);
+
+        handler.start_snapshot(origin, 0x2222, 0x1111).unwrap();
+        handler.buffer_event(origin, make_event(origin, 1)).unwrap();
+        // on_cutover drains and transitions to Cutover phase.
+        let _ = handler.on_cutover(origin).unwrap();
+
+        let err = handler.take_buffered_events(origin).unwrap_err();
+        match err {
+            MigrationError::WrongPhase { expected, got } => {
+                assert_eq!(expected, MigrationPhase::Replay);
+                assert_eq!(got, MigrationPhase::Cutover);
+            }
+            other => panic!(
+                "expected WrongPhase {{ expected: Replay, got: Cutover }}, got {:?}",
+                other
+            ),
+        }
     }
 }

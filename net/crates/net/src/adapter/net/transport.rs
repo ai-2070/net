@@ -319,11 +319,26 @@ impl BatchedPacketReceiver {
                 // socket clean. The `SO_RCVTIMEO` path is gone.
                 let mut transport = super::linux::BatchedTransport::new(fd);
 
+                // Backoff state for the soft-error path. Pre-fix
+                // the thread spun at 1ms forever on persistent
+                // errors (bad fd, permission revoke), wasting
+                // CPU and producing a wall of repeated `warn!`
+                // entries. We now exponentially back off up to
+                // 100ms, reset on every success, and bail on
+                // hard errors (EBADF, ENOTSOCK) via
+                // `raw_os_error` so an unrecoverable socket
+                // doesn't silently consume a thread.
+                const HARD_ERR_EBADF: i32 = libc::EBADF;
+                const HARD_ERR_ENOTSOCK: i32 = libc::ENOTSOCK;
+                let mut backoff_ms: u64 = 1;
+                const MAX_BACKOFF_MS: u64 = 100;
+
                 while !thread_shutdown.load(Ordering::Acquire) {
                     let result = transport.recv_batch(super::linux::MAX_BATCH_SIZE);
 
                     match result {
                         Ok(packets) => {
+                            backoff_ms = 1;
                             if packets.is_empty() {
                                 // No data available right now — yield
                                 // for 1ms and re-check shutdown. The
@@ -348,8 +363,33 @@ impl BatchedPacketReceiver {
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                                 continue;
                             }
-                            tracing::warn!(error = %e, "batched receive error");
-                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            // Hard errors: socket fd is gone (closed
+                            // out from under us, or never was a
+                            // socket). Looping won't recover; the
+                            // adapter has to be torn down. Surface
+                            // a loud `error!` and exit so the
+                            // channel receiver sees `None` and
+                            // shutdown propagates.
+                            if let Some(raw) = e.raw_os_error() {
+                                if raw == HARD_ERR_EBADF || raw == HARD_ERR_ENOTSOCK {
+                                    tracing::error!(
+                                        error = %e,
+                                        raw_os_error = raw,
+                                        "batched receive: unrecoverable socket error \
+                                         (EBADF/ENOTSOCK), exiting receive thread",
+                                    );
+                                    return;
+                                }
+                            }
+                            // Transient soft error — exponential
+                            // backoff up to MAX_BACKOFF_MS. Pre-fix
+                            // every loop slept exactly 1ms; under a
+                            // sustained soft error that produced a
+                            // 1000 Hz `warn!` storm. Backoff caps
+                            // the storm at ~10 Hz at steady state.
+                            tracing::warn!(error = %e, backoff_ms, "batched receive error");
+                            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                            backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                         }
                     }
                 }
@@ -514,5 +554,57 @@ mod tests {
         // Receive
         let (data, _) = receiver.recv().await.unwrap();
         assert_eq!(&data[..], b"test packet");
+    }
+
+    /// Source pin: the Linux `BatchedPacketReceiver`'s receive
+    /// loop must
+    ///
+    /// 1. exponentially back off on transient errors (rather
+    ///    than a fixed `sleep(1ms)`), so a sustained soft error
+    ///    doesn't produce a 1000Hz `warn!` storm; and
+    /// 2. exit on hard socket errors (`EBADF` / `ENOTSOCK`)
+    ///    rather than spin forever.
+    ///
+    /// Pre-fix every error path slept exactly 1ms and looped
+    /// indefinitely; an unrecoverable socket (closed fd,
+    /// permission revoke) silently consumed a thread until
+    /// shutdown. The runtime check is hard to fault-inject
+    /// portably (the receive thread is Linux-only and the
+    /// errors are platform-specific), so the source pin is the
+    /// cheaper tripwire against a "simplification" PR that
+    /// flips back to the busy-loop shape.
+    #[test]
+    fn batched_recv_loop_must_back_off_and_exit_on_hard_error() {
+        let src = include_str!("transport.rs");
+
+        // Body of the Linux batch-receive thread closure. We
+        // can't easily extract just the loop body, so we look
+        // for the markers in the whole file (other Linux
+        // helpers don't carry these names).
+        let src_no_comments: String = src
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(idx) => &l[..idx],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Backoff doubles up to a cap.
+        assert!(
+            src_no_comments.contains("backoff_ms") && src_no_comments.contains("MAX_BACKOFF_MS"),
+            "regression: batched recv loop must use exponential \
+             backoff (`backoff_ms` / `MAX_BACKOFF_MS`). Pre-fix the \
+             loop slept exactly 1ms forever, producing a 1000Hz \
+             warn! storm under any sustained soft error."
+        );
+
+        // Hard-error early return.
+        assert!(
+            src_no_comments.contains("libc::EBADF") && src_no_comments.contains("libc::ENOTSOCK"),
+            "regression: batched recv loop must check for EBADF / \
+             ENOTSOCK and exit. Without it an unrecoverable socket \
+             silently consumes a thread until shutdown."
+        );
     }
 }

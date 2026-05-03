@@ -237,11 +237,26 @@ impl PartitionDetector {
                 PartitionPhase::Healed => {}
             }
 
-            // Check if healed (after any phase transition)
+            // Check if healed (after any phase transition).
+            // Guard against an empty `other_side`: the ratio
+            // computation would be `0 / 0 = NaN`, and `NaN >=
+            // threshold` is always false, so the partition could
+            // never auto-heal. The current control flow makes
+            // empty `other_side` unreachable inside this branch
+            // (the `contains(&node_id)` filter above eliminates
+            // empties before any phase enters `Healing`), but
+            // future refactors that mutate `other_side` after a
+            // `Healing` transition would silently expose the
+            // bug. Treat an empty `other_side` as already-healed
+            // — there is no remaining side to wait on.
             if let PartitionPhase::Healing { reappeared } = &record.phase {
-                let ratio = reappeared.len() as f32 / record.other_side.len() as f32;
-                if ratio >= self.healing_threshold {
+                if record.other_side.is_empty() {
                     record.phase = PartitionPhase::Healed;
+                } else {
+                    let ratio = reappeared.len() as f32 / record.other_side.len() as f32;
+                    if ratio >= self.healing_threshold {
+                        record.phase = PartitionPhase::Healed;
+                    }
                 }
             }
         }

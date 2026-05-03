@@ -185,6 +185,15 @@ pub struct ReliableStream {
     max_pending: usize,
     /// Maximum retries per packet
     max_retries: u8,
+    /// Number of unacknowledged packets evicted from `pending` because
+    /// the window was full when `on_send` arrived. The evicted packet
+    /// went on the wire (the caller already issued the syscall) but
+    /// is no longer tracked for retransmit — a NACK for that seq can
+    /// no longer recover it. This counter surfaces the silent loss
+    /// to the metrics layer so operators can size `max_pending` for
+    /// their actual sustained reliable-stream throughput. Pre-fix
+    /// the eviction was unobservable.
+    untracked_evictions: u64,
 }
 
 impl ReliableStream {
@@ -206,6 +215,7 @@ impl ReliableStream {
             rto: Self::DEFAULT_RTO,
             max_pending: Self::DEFAULT_MAX_PENDING,
             max_retries: Self::DEFAULT_MAX_RETRIES,
+            untracked_evictions: 0,
         }
     }
 
@@ -218,7 +228,21 @@ impl ReliableStream {
             rto,
             max_pending,
             max_retries,
+            untracked_evictions: 0,
         }
+    }
+
+    /// Number of unacknowledged packets that the stream evicted from
+    /// its retransmit window because the window was full at `on_send`
+    /// time. Each eviction means the caller's syscall succeeded
+    /// (bytes left this node) but the packet is no longer tracked
+    /// for retransmit — a NACK can no longer recover it. A non-zero
+    /// value indicates `max_pending` is undersized for the stream's
+    /// sustained throughput. Operators should size up or apply
+    /// upstream backpressure rather than accepting silent loss.
+    #[inline]
+    pub fn untracked_evictions(&self) -> u64 {
+        self.untracked_evictions
     }
 
     /// Set the retransmit timeout
@@ -312,8 +336,24 @@ impl ReliabilityMode for ReliableStream {
         // this, packets sent when the window is full are silently lost
         // from the retransmit buffer even though they were sent on the
         // wire — a gap the receiver can never recover via NACK.
+        //
+        // Bump `untracked_evictions` on every eviction so the silent
+        // loss surfaces via the `untracked_evictions()` accessor (and
+        // any metrics layer hooked into it). Pre-fix the eviction was
+        // unobservable: a `max_pending`-undersized stream looked
+        // healthy from the sender side until NACKs started arriving
+        // for sequences whose retransmit had already been dropped.
         if self.pending.len() >= self.max_pending {
             self.pending.pop_front();
+            self.untracked_evictions = self.untracked_evictions.saturating_add(1);
+            tracing::warn!(
+                untracked_evictions = self.untracked_evictions,
+                max_pending = self.max_pending,
+                "ReliableStream: retransmit window full; evicted oldest \
+                 unacked packet — NACK for that seq can no longer \
+                 recover it. Increase max_pending or apply upstream \
+                 backpressure.",
+            );
         }
         self.pending.push_back(UnackedPacket {
             descriptor,
@@ -660,6 +700,53 @@ mod tests {
         let missing: Vec<_> = nack.unwrap().missing_sequences().collect();
         // Sequences 2..=64 are missing
         assert!(!missing.is_empty());
+    }
+
+    /// Regression: when `pending.len() >= max_pending`, `on_send`
+    /// evicts the oldest unacked packet to make room for the new
+    /// one. The evicted packet went on the wire but is no longer
+    /// tracked for retransmit — a NACK can no longer recover it.
+    /// Pre-fix the eviction was unobservable. The fix exposes a
+    /// `untracked_evictions()` counter so a metrics layer can
+    /// surface the silent loss to operators.
+    #[test]
+    fn reliable_stream_records_untracked_evictions_when_window_full() {
+        const MAX_PENDING: usize = 4;
+        let mut mode = ReliableStream::with_settings(Duration::from_millis(50), MAX_PENDING, 3);
+        assert_eq!(mode.untracked_evictions(), 0);
+
+        // Fill the window — no evictions yet.
+        for seq in 0..(MAX_PENDING as u64) {
+            mode.on_send(descriptor(seq, Bytes::from(format!("pkt-{seq}"))));
+        }
+        assert_eq!(mode.untracked_evictions(), 0);
+
+        // The next 3 sends each force an eviction.
+        for seq in (MAX_PENDING as u64)..(MAX_PENDING as u64 + 3) {
+            mode.on_send(descriptor(seq, Bytes::from(format!("pkt-{seq}"))));
+        }
+        assert_eq!(
+            mode.untracked_evictions(),
+            3,
+            "every on_send beyond max_pending must bump untracked_evictions",
+        );
+
+        // The evicted seqs (0, 1, 2) are no longer recoverable via
+        // NACK — pin that behavior so a future change that quietly
+        // re-orders eviction is caught. `missing_sequences()` yields
+        // `[next_expected, next_expected+1+i for set bits]`, so
+        // `next_expected: 0, missing_bitmap: 0b011` requests
+        // [0, 1, 2] without spilling into the still-pending seq 3.
+        let nack = NackPayload {
+            next_expected: 0,
+            missing_bitmap: 0b011,
+        };
+        let retransmits = mode.on_nack(&nack);
+        assert!(
+            retransmits.is_empty(),
+            "evicted seqs must not produce retransmit descriptors, got {} entries",
+            retransmits.len(),
+        );
     }
 
     #[test]

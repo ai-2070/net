@@ -92,11 +92,26 @@ where
         // RedEX-seq order (which is NOT the same as `seq_or_ts` order
         // — two adapters writing to the same channel can interleave
         // their per-origin counters), so we want monotonic-up
-        // semantics regardless of arrival order. `saturating_add`
-        // pins the watermark at `u64::MAX` if we somehow see
-        // `seq_or_ts == u64::MAX` (impossible in practice — would
-        // require 2^64 ingests under one origin — but cheap to be
-        // safe).
+        // semantics regardless of arrival order.
+        //
+        // Skip the watermark update if `seq_or_ts == u64::MAX`.
+        // Pre-fix `saturating_add(1)` pinned `app_seq` at `u64::MAX`
+        // when a peer (legitimately compromised, deliberately hostile,
+        // or carrying a malformed payload that survived checksum) wrote
+        // an event with `seq_or_ts == u64::MAX`. The next legitimate
+        // `ingest_typed` then ran `app_seq.fetch_add(1)` on `u64::MAX`,
+        // which panics in debug builds and wraps to 0 in release —
+        // breaking per-origin monotonicity (two distinct events
+        // stamped with the same `seq_or_ts == 0`, the canonical data
+        // corruption this counter exists to prevent). Reaching
+        // `seq_or_ts == u64::MAX` legitimately would require 2^64
+        // ingests under one origin (unreachable in practice), so
+        // every observation of it is necessarily a hostile or
+        // malformed event; refusing to advance keeps `app_seq <
+        // u64::MAX` and preserves the monotonicity invariant.
+        if meta.seq_or_ts == u64::MAX {
+            return Ok(());
+        }
         let next = meta.seq_or_ts.saturating_add(1);
         self.app_seq.fetch_max(next, Ordering::AcqRel);
         Ok(())
@@ -324,16 +339,63 @@ mod tests {
     }
 
     #[test]
-    fn saturating_add_pins_watermark_at_u64_max() {
-        // Unreachable in practice (would require 2^64 ingests under
-        // one origin) but cheap to pin: a `seq_or_ts == u64::MAX`
-        // entry must NOT wrap the watermark to 0 via overflow.
-        let app_seq = Arc::new(AtomicU64::new(0));
+    fn watermark_ignores_seq_or_ts_at_u64_max_to_preserve_monotonicity() {
+        // Pre-fix: `saturating_add(1)` pinned `app_seq` at
+        // `u64::MAX` when a peer wrote an event with
+        // `seq_or_ts == u64::MAX`. The next legitimate ingest's
+        // `fetch_add(1)` on `u64::MAX` then panics (debug) or
+        // wraps to 0 (release), breaking the per-origin
+        // monotonicity invariant. A hostile or malformed peer
+        // could thus poison our adapter with one bad event.
+        //
+        // Post-fix: `seq_or_ts == u64::MAX` is treated as
+        // malformed and ignored. The watermark stays at
+        // whatever it was, the inner fold still receives the
+        // event (delivery is not filtered), and the next
+        // ingest's `fetch_add(1)` is always safe.
+        let app_seq = Arc::new(AtomicU64::new(42));
         let mut wf = WatermarkingFold::new(MockFold::new(), app_seq.clone(), ORIGIN_US);
         let mut state = Vec::new();
 
+        // Inner fold runs (delivery is not filtered), but the
+        // watermark must NOT advance to u64::MAX.
         wf.apply(&ev_with_meta(0, ORIGIN_US, u64::MAX, b""), &mut state)
             .unwrap();
-        assert_eq!(app_seq.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(
+            app_seq.load(Ordering::Acquire),
+            42,
+            "watermark must NOT advance on a u64::MAX seq_or_ts \
+             — a subsequent fetch_add(1) on u64::MAX panics in debug \
+             or wraps to 0 in release, breaking per-origin monotonicity"
+        );
+        assert_eq!(state.len(), 1, "inner fold must still see the event");
+
+        // Confirm normal operation still works after the
+        // poisoning attempt.
+        wf.apply(&ev_with_meta(1, ORIGIN_US, 100, b""), &mut state)
+            .unwrap();
+        assert_eq!(
+            app_seq.load(Ordering::Acquire),
+            101,
+            "subsequent legitimate seq_or_ts must still advance the watermark"
+        );
+
+        // Boundary: seq_or_ts = u64::MAX - 1 still advances (it's
+        // legitimate, even if astronomical). The next state is
+        // app_seq = u64::MAX, which is the highest value an
+        // adapter can ever observe — but that's only a problem
+        // if the NEXT ingest is allowed; the audit's invariant
+        // here is just that hostile u64::MAX inputs don't
+        // accelerate exhaustion.
+        let app_seq2 = Arc::new(AtomicU64::new(0));
+        let mut wf2 = WatermarkingFold::new(MockFold::new(), app_seq2.clone(), ORIGIN_US);
+        let mut state2 = Vec::new();
+        wf2.apply(&ev_with_meta(0, ORIGIN_US, u64::MAX - 1, b""), &mut state2)
+            .unwrap();
+        assert_eq!(
+            app_seq2.load(Ordering::Acquire),
+            u64::MAX,
+            "seq_or_ts = u64::MAX - 1 is legitimate (saturating_add(1) = u64::MAX)"
+        );
     }
 }

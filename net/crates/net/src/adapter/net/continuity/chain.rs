@@ -341,8 +341,21 @@ pub fn assess_continuity(log: &EntityLog, snapshot: Option<&StateSnapshot>) -> C
             // treat None-at-genesis as Some(empty) since that's
             // what the original genesis-anchor branch used.
             match (s.chain_link.sequence, &s.head_payload) {
-                (0, Some(payload)) => Some(compute_parent_hash(&s.chain_link, payload)),
-                (0, None) => Some(compute_parent_hash(&s.chain_link, &[])),
+                // Genesis is sequence 0 with no predecessor
+                // payload — the canonical hash is against the
+                // empty byte slice. A non-empty payload here is
+                // malformed (the caller populated `head_payload`
+                // with junk for a slot that has no real
+                // predecessor). Pre-fix we computed the parent
+                // hash against that junk and the downstream
+                // mismatch surfaced as `Forked`, which routes
+                // operators toward "the chain diverged" rather
+                // than "the snapshot is wrong." Refuse the
+                // anchor entirely so the result is `Unverifiable`
+                // — the typed signal for "we can't decide yet,
+                // re-fetch a clean snapshot."
+                (0, Some(payload)) if !payload.is_empty() => None,
+                (0, Some(_)) | (0, None) => Some(compute_parent_hash(&s.chain_link, &[])),
                 (_, Some(payload)) => Some(compute_parent_hash(&s.chain_link, payload)),
                 (_, None) => None, // missing context — Unverifiable
             }
@@ -968,6 +981,68 @@ mod tests {
             "matching snapshot chain_link + head_payload must anchor cleanly, got {:?}",
             status,
         );
+    }
+
+    /// Regression: a malformed snapshot whose `chain_link.sequence
+    /// == 0` (genesis link) carries a non-empty `head_payload`
+    /// must surface as `Unverifiable`, not `Forked`. Pre-fix the
+    /// non-empty payload was hashed alongside the genesis link and
+    /// the resulting (junk) `parent_hash` was compared to the
+    /// log's first event — the mismatch surfaced as `Forked`,
+    /// routing operators toward "the chain diverged" rather than
+    /// "the snapshot is wrong / re-fetch a clean one." Genesis
+    /// has no predecessor payload by construction; a non-empty
+    /// `head_payload` here is a caller bug, not chain divergence.
+    ///
+    /// To exercise the snapshot path we need `first_seq > 1` so
+    /// the function consults the snapshot rather than the
+    /// canonical genesis short-circuit. We prune the log so its
+    /// first event starts past genesis, but leave `through_seq`
+    /// matching the prune boundary so the snapshot bridges the
+    /// gap arithmetically — leaving the malformed-shape check as
+    /// the only remaining gate.
+    #[test]
+    fn malformed_genesis_snapshot_with_nonempty_head_payload_is_unverifiable() {
+        use crate::adapter::net::state::horizon::ObservedHorizon;
+
+        let (mut log, _) = build_log(20);
+        log.prune_through(10);
+        // `first_seq` is now 11; the snapshot must bridge the
+        // gap. We forge `chain_link.sequence == 0` (the genesis
+        // link's sequence) but populate `head_payload` with junk
+        // — the malformed shape this fix targets.
+        let genesis_link = CausalLink::genesis(log.origin_hash(), 0);
+        let snapshot = StateSnapshot {
+            version: 1,
+            entity_id: log.entity_id().clone(),
+            through_seq: 10,
+            chain_link: genesis_link,
+            state: bytes::Bytes::new(),
+            horizon: ObservedHorizon::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: None,
+            head_payload: Some(bytes::Bytes::from_static(b"not-genesis-payload")),
+        };
+
+        let status = assess_continuity(&log, Some(&snapshot));
+        match status {
+            ContinuityStatus::Unverifiable {
+                last_verified_seq,
+                gap_start,
+            } => {
+                assert_eq!(last_verified_seq, 0);
+                assert_eq!(gap_start, 0);
+            }
+            other => panic!(
+                "regression: genesis-shaped snapshot (chain_link.sequence=0) \
+                 with non-empty head_payload must surface as Unverifiable \
+                 (not Forked / Continuous). Hashing junk against the genesis \
+                 link and surfacing the mismatch as Forked routes operators \
+                 toward the wrong remediation. got {:?}",
+                other
+            ),
+        }
     }
 
     #[test]

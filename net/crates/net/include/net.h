@@ -62,6 +62,16 @@ typedef enum {
      * sessions when a caller bug crosses handles.
      */
     NET_ERR_MISMATCHED_HANDLES = -10,
+    /*
+     * `CString::new` failure: the input bytes are valid UTF-8 (by
+     * Rust's String invariant) but contain an interior NUL byte
+     * that the C ABI's NUL-terminated string can't carry. Pre-fix
+     * this was reported as NET_ERR_INVALID_UTF8, which was wrong:
+     * the input is UTF-8-valid; it just has a NUL where C expects
+     * none. Bindings that branch on the typed error get the right
+     * cause now.
+     */
+    NET_ERR_INTERIOR_NUL     = -11,
     NET_ERR_UNKNOWN          = -99
 } net_error_t;
 

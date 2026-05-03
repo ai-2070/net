@@ -86,6 +86,22 @@ fn runtime() -> &'static Arc<Runtime> {
     })
 }
 
+/// `block_on(...)` wrapper that aborts on runtime-in-runtime
+/// rather than panicking across the FFI boundary. See
+/// `ffi/mesh.rs::block_on` for the full rationale; the check is the
+/// same `Handle::try_current()` test, the abort message names the
+/// cortex surface so the post-mortem is unambiguous.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        eprintln!(
+            "FATAL: cortex FFI called from inside a tokio runtime context; \
+             aborting to avoid runtime-in-runtime panic across the FFI boundary"
+        );
+        std::process::abort();
+    }
+    runtime().block_on(future)
+}
+
 /// Copy a C string into an owned `String`. Returns `None` on null or
 /// non-UTF-8 input.
 ///
@@ -104,11 +120,16 @@ unsafe fn c_str_to_owned(p: *const c_char) -> Option<String> {
 
 /// Serialize `value` as JSON into a C-owned string + length. On
 /// success writes the pointer to `*out_ptr` and the length to
-/// `*out_len` (excluding the null terminator) and returns `0`. The
-/// caller must free the string with `net_free_string`.
-/// Null-checks `out_ptr` and `out_len` before writing through them.
-/// Returns `NetError::NullPointer` so the FFI caller can distinguish
-/// "I forgot output pointers" from "the operation failed."
+/// `*out_len` (excluding the null terminator) and returns `0`.
+/// On non-success the out params are zeroed (`null`, `0`) so a
+/// caller that reads them before checking the return code sees
+/// "no output" rather than stale stack data. The caller must
+/// free the string with `net_free_string` on success.
+///
+/// Null-checks `out_ptr` and `out_len` before writing through
+/// them. Returns `NetError::NullPointer` so the FFI caller can
+/// distinguish "I forgot output pointers" from "the operation
+/// failed."
 fn write_json_out<T: Serialize>(
     value: &T,
     out_ptr: *mut *mut c_char,
@@ -118,10 +139,21 @@ fn write_json_out<T: Serialize>(
         return NetError::NullPointer.into();
     }
     let Ok(s) = serde_json::to_string(value) else {
+        // Pre-zero so the caller can rely on the contract
+        // "non-zero return ⇒ out_ptr is null and out_len is 0"
+        // rather than reading stale data from before the call.
+        unsafe {
+            *out_ptr = ptr::null_mut();
+            *out_len = 0;
+        }
         return NetError::Unknown.into();
     };
     let len = s.len();
     let Ok(cs) = CString::new(s) else {
+        unsafe {
+            *out_ptr = ptr::null_mut();
+            *out_len = 0;
+        }
         return NetError::Unknown.into();
     };
     unsafe {
@@ -130,6 +162,58 @@ fn write_json_out<T: Serialize>(
     }
     0
 }
+
+/// Helper: pre-zero `*out_ptr` and `*out_len` after a null-check.
+/// Call at the top of every FFI function that takes
+/// `(out_json, out_len)` so subsequent error returns leave the
+/// out params as `(null, 0)` rather than stale stack data. The
+/// audit (#136) calls this contract "pre-zero" — every error
+/// return must satisfy "out_json is null AND out_len is 0,"
+/// distinct from the success contract "out_json is heap-allocated
+/// and out_len is its length." Pre-fix several functions
+/// returned errors without touching the out params, so callers
+/// that didn't strictly check the return code dereferenced
+/// stale data.
+fn zero_out_json(out_ptr: *mut *mut c_char, out_len: *mut usize) {
+    if !out_ptr.is_null() {
+        unsafe {
+            *out_ptr = ptr::null_mut();
+        }
+    }
+    if !out_len.is_null() {
+        unsafe {
+            *out_len = 0;
+        }
+    }
+}
+
+// =========================================================================
+// Compile-time Send + Sync assertions for FFI handle inner types.
+//
+// These handles are returned to C as `*mut HandleType` and routinely
+// shared across goroutines / Python threads — the docstrings on
+// every "open" / "watch" function advertise this pattern. Soundness
+// rests entirely on the inner type's `Send + Sync` impl; the FFI
+// layer doesn't typecheck `Send + Sync` itself, so a future refactor
+// that adds a `Cell` / `RefCell` / `Rc` / `*mut` field to one of
+// these types would compile cleanly while silently introducing a
+// data race that any threaded caller would trigger.
+//
+// The `const _: fn() = ...` idiom is a compile-time trait check
+// without pulling in `static_assertions` as a dep. If any inner
+// type loses `Send + Sync`, this block fails to compile.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<InnerRedex>();
+    assert_send_sync::<InnerRedexFile>();
+    assert_send_sync::<InnerTasksAdapter>();
+    assert_send_sync::<InnerMemoriesAdapter>();
+    assert_send_sync::<
+        TokioMutex<Option<BoxStream<'static, std::result::Result<RedexEvent, RedexError>>>>,
+    >();
+    assert_send_sync::<TokioMutex<Option<BoxStream<'static, Vec<Task>>>>>();
+    assert_send_sync::<TokioMutex<Option<BoxStream<'static, Vec<Memory>>>>>();
+};
 
 // =========================================================================
 // Redex manager
@@ -231,6 +315,21 @@ pub extern "C" fn net_redex_open_file(
             cfg.fsync_policy = FsyncPolicy::Interval(std::time::Duration::from_millis(ms))
         }
         _ => {}
+    }
+    // Reject `Some(0)` for every retention dimension at the same
+    // gate that rejects fsync zeros above. Setting
+    // `retention_max_events = 0` (or _bytes / _age_ms) means
+    // "evict everything immediately on first append" — almost
+    // certainly a config mistake intended as "no limit", which in
+    // every JSON schema this crate accepts is expressed as `null`
+    // / omission. Pre-fix `Some(0)` was propagated unchecked,
+    // turning a config typo into silent total data loss on every
+    // write.
+    if matches!(cfg_json.retention_max_events, Some(0))
+        || matches!(cfg_json.retention_max_bytes, Some(0))
+        || matches!(cfg_json.retention_max_age_ms, Some(0))
+    {
+        return NET_ERR_REDEX;
     }
     cfg.retention_max_events = cfg_json.retention_max_events;
     cfg.retention_max_bytes = cfg_json.retention_max_bytes;
@@ -414,9 +513,15 @@ pub extern "C" fn net_redex_tail_next(
     if cursor.is_null() || out_json.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
+    // Pre-zero out params so timeout / stream-end / error
+    // returns leave the caller with `(null, 0)` rather than
+    // stale stack data. The doc-comment establishes this
+    // contract ("non-zero return ⇒ no JSON written"), but pre-
+    // fix the function returned NET_ERR_TIMEOUT and
+    // NET_ERR_STREAM_ENDED without touching the out params.
+    zero_out_json(out_json, out_len);
     let cursor = unsafe { &*cursor };
-    let rt = runtime();
-    rt.block_on(async move {
+    block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
             return NET_ERR_STREAM_ENDED;
@@ -437,6 +542,18 @@ pub extern "C" fn net_redex_tail_next(
         };
         match outcome {
             Some(Ok(ev)) => {
+                // Drop the cursor guard BEFORE the JSON
+                // serialization so concurrent callers on the
+                // same cursor don't stall waiting for our
+                // write_json_out to finish. Pre-fix the
+                // serialization ran inside the TokioMutex
+                // critical section, so a fast event arrival on
+                // a shared cursor under contention serialized
+                // calls behind whichever caller was building
+                // the JSON. The event is owned at this point;
+                // the mutex was only protecting the stream
+                // poll, not the event itself.
+                drop(guard);
                 let js = RedexEventJson::from(ev);
                 write_json_out(&js, out_json, out_len)
             }
@@ -492,9 +609,8 @@ pub extern "C" fn net_tasks_adapter_open(
     };
     // `open_with_config` spawns the fold task via `tokio::spawn` and
     // needs a live reactor; run under our runtime.
-    let rt = runtime();
     let redex_inner = redex.inner.clone();
-    let result = rt.block_on(async move {
+    let result = block_on(async move {
         InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
     });
     match result {
@@ -666,8 +782,7 @@ pub extern "C" fn net_tasks_wait_for_seq(
     }
     let tasks = unsafe { &*handle };
     let adapter = tasks.inner.clone();
-    let rt = runtime();
-    rt.block_on(async move {
+    block_on(async move {
         let fut = adapter.wait_for_seq(seq);
         if timeout_ms == 0 {
             fut.await;
@@ -833,6 +948,10 @@ pub extern "C" fn net_tasks_list(
     if handle.is_null() || out_json.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
+    // Pre-zero so a filter-build error return leaves the out
+    // params at (null, 0) rather than stale stack data — matches
+    // the contract documented on `write_json_out`.
+    zero_out_json(out_json, out_len);
     let tasks = unsafe { &*handle };
     let filter = match build_tasks_list_filter(filter_json) {
         Ok(f) => f,
@@ -876,8 +995,7 @@ pub extern "C" fn net_tasks_snapshot_and_watch(
     // `watcher.stream()` spawns a forwarding task — needs a live
     // reactor.
     let adapter = tasks.inner.clone();
-    let rt = runtime();
-    let (snapshot, stream) = rt.block_on(async move { adapter.snapshot_and_watch(watcher) });
+    let (snapshot, stream) = block_on(async move { adapter.snapshot_and_watch(watcher) });
     let snapshot_json: Vec<TaskJson> = snapshot.into_iter().map(TaskJson::from).collect();
     let code = write_json_out(&snapshot_json, out_snapshot, out_snapshot_len);
     if code != 0 {
@@ -906,8 +1024,7 @@ pub extern "C" fn net_tasks_watch_next(
         return NetError::NullPointer.into();
     }
     let cursor = unsafe { &*cursor };
-    let rt = runtime();
-    rt.block_on(async move {
+    block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
             return NET_ERR_STREAM_ENDED;
@@ -973,9 +1090,8 @@ pub extern "C" fn net_memories_adapter_open(
     } else {
         RedexFileConfig::default()
     };
-    let rt = runtime();
     let redex_inner = redex.inner.clone();
-    let result = rt.block_on(async move {
+    let result = block_on(async move {
         InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
     });
     match result {
@@ -1195,8 +1311,7 @@ pub extern "C" fn net_memories_wait_for_seq(
     }
     let mem = unsafe { &*handle };
     let adapter = mem.inner.clone();
-    let rt = runtime();
-    rt.block_on(async move {
+    block_on(async move {
         let fut = adapter.wait_for_seq(seq);
         if timeout_ms == 0 {
             fut.await;
@@ -1424,8 +1539,7 @@ pub extern "C" fn net_memories_snapshot_and_watch(
         Err(code) => return code,
     };
     let adapter = mem.inner.clone();
-    let rt = runtime();
-    let (snapshot, stream) = rt.block_on(async move { adapter.snapshot_and_watch(watcher) });
+    let (snapshot, stream) = block_on(async move { adapter.snapshot_and_watch(watcher) });
     let snapshot_json: Vec<MemoryJson> = snapshot.into_iter().map(MemoryJson::from).collect();
     let code = write_json_out(&snapshot_json, out_snapshot, out_snapshot_len);
     if code != 0 {
@@ -1451,8 +1565,7 @@ pub extern "C" fn net_memories_watch_next(
         return NetError::NullPointer.into();
     }
     let cursor = unsafe { &*cursor };
-    let rt = runtime();
-    rt.block_on(async move {
+    block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
             return NET_ERR_STREAM_ENDED;
@@ -1565,6 +1678,51 @@ mod tests {
             assert_eq!(
                 rc, NET_ERR_REDEX,
                 "config {name:?} ({cfg}) should be rejected with NET_ERR_REDEX (got {rc})"
+            );
+        }
+
+        net_redex_free(r);
+    }
+
+    /// Pin: `net_redex_open_file` rejects `Some(0)` for any
+    /// retention dimension at the same gate that rejects fsync
+    /// zeros. Pre-fix the retention triple was propagated
+    /// unchecked, so a config typo
+    /// (`{"retention_max_events": 0}` instead of `null`) silently
+    /// configured "evict everything immediately" and lost every
+    /// write to the file.
+    #[test]
+    fn redex_open_file_rejects_zero_retention() {
+        let r = redex();
+        let invalid = [
+            ("zero-events", r#"{"retention_max_events":0}"#),
+            ("zero-bytes", r#"{"retention_max_bytes":0}"#),
+            ("zero-age", r#"{"retention_max_age_ms":0}"#),
+            (
+                "any-zero-among-many",
+                r#"{"retention_max_events":1000,"retention_max_bytes":0}"#,
+            ),
+        ];
+        for (name, cfg) in invalid {
+            let rc = open_file(r, name, Some(cfg));
+            assert_eq!(
+                rc, NET_ERR_REDEX,
+                "config {name:?} ({cfg}) must be rejected with NET_ERR_REDEX (got {rc})"
+            );
+        }
+
+        // Non-zero retention still parses.
+        let valid = [
+            ("non-zero-events", r#"{"retention_max_events":10000}"#),
+            ("non-zero-bytes", r#"{"retention_max_bytes":1048576}"#),
+            ("non-zero-age", r#"{"retention_max_age_ms":60000}"#),
+            ("null-retention", r#"{"retention_max_events":null}"#),
+        ];
+        for (name, cfg) in valid {
+            let rc = open_file(r, name, Some(cfg));
+            assert_eq!(
+                rc, 0,
+                "valid config {name:?} ({cfg}) should succeed (got {rc})"
             );
         }
 

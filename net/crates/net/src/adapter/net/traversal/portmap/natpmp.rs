@@ -553,15 +553,36 @@ impl PortMapperClient for NatPmpMapper {
             external_port_hint: 0,
             lifetime: 0,
         };
-        let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else {
-            return;
+        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    internal_port = mapping.internal_port,
+                    error = %e,
+                    "NAT-PMP remove: failed to bind UDP socket — \
+                     mapping not revoked, gateway holds it until TTL"
+                );
+                return;
+            }
         };
         let target = SocketAddr::new(IpAddr::V4(self.gateway), self.target_port);
-        if sock.connect(target).await.is_err() {
+        if let Err(e) = sock.connect(target).await {
+            tracing::warn!(
+                internal_port = mapping.internal_port,
+                error = %e,
+                "NAT-PMP remove: connect to gateway failed — \
+                 mapping not revoked, gateway holds it until TTL"
+            );
             return;
         }
         let bytes = encode_request(&req);
-        if sock.send(&bytes).await.is_err() {
+        if let Err(e) = sock.send(&bytes).await {
+            tracing::warn!(
+                internal_port = mapping.internal_port,
+                error = %e,
+                "NAT-PMP remove: send to gateway failed — \
+                 mapping not revoked, gateway holds it until TTL"
+            );
             return;
         }
 

@@ -312,12 +312,23 @@ impl ProximityNode {
         // also uses the saturated value so a 255-hop pingwave
         // can never falsely beat a real path.
         let new_hops = pw.hop_count.saturating_add(1);
-        // Only update if newer sequence or better path
-        if pw.seq > self.last_seq || new_hops < self.hops {
+
+        // Separate freshness from path quality. Pre-fix the OR
+        // (`seq > last_seq || new_hops < self.hops`) let a flooded
+        // high-seq pingwave delivered through a long route demote
+        // a previously-cached direct route — the freshness arm
+        // accepted the new (worse) path purely because of seq
+        // monotonicity. Now: track `last_seq` as the freshness
+        // signal even on long routes, but only adopt the new
+        // `addr` / `hops` / `latency_us` when the path is
+        // genuinely no worse than what we have.
+        if pw.seq > self.last_seq {
+            self.last_seq = pw.seq;
+        }
+        if new_hops <= self.hops {
             self.addr = addr;
             self.hops = new_hops;
             self.latency_us = pw.latency_estimate_us();
-            self.last_seq = pw.seq;
         }
 
         // Always update load/health from latest
@@ -606,9 +617,26 @@ impl ProximityGraph {
         // noisy one-way delay; clock-skew-sensitive, but good enough
         // as an equal-hop tiebreaker. EWMA (α = 1/8) smooths
         // successive samples per `(from, to)` pair.
+        //
+        // Throttle the self-edge `(my_id → Z)` update: a hot
+        // pingwave-receive path (one per peer per heartbeat
+        // interval, scaled across N peers) hit the DashMap
+        // entry lock + `Instant::now()` on every receive even
+        // though the liveness signal only needs second-level
+        // freshness. Skip the update when the existing edge is
+        // less than a second old; the multi-hop edge below still
+        // refreshes unconditionally because it carries a fresh
+        // latency sample.
         let now_us = current_time_us();
         let sample_us = now_us.saturating_sub(pw.origin_timestamp_us);
-        self.insert_or_update_edge(self.my_id, from_node, 0);
+        let needs_self_edge_refresh = self
+            .edges
+            .get(&(self.my_id, from_node))
+            .map(|e| e.last_updated.elapsed() >= Duration::from_secs(1))
+            .unwrap_or(true);
+        if needs_self_edge_refresh {
+            self.insert_or_update_edge(self.my_id, from_node, 0);
+        }
         if from_node != pw.origin_id {
             self.insert_or_update_edge(from_node, pw.origin_id, sample_us);
         }
@@ -1132,19 +1160,62 @@ mod tests {
         let mut node = ProximityNode::from_pingwave(&pw_initial, from);
         let initial_hops = node.hops;
 
-        // Update with hop_count = 255. Pre-fix this would panic
-        // in debug. Post-fix the saturated 255+1→255 keeps the
-        // existing (lower) hops in place — better path comparison
-        // correctly rejects the new pingwave.
+        // Update with hop_count = 255. The saturating bump
+        // (`pw.hop_count.saturating_add(1) = 255`) must not panic
+        // in debug or wrap to 0 in release.
         pw_initial.hop_count = u8::MAX;
-        pw_initial.seq = 2; // newer seq so the update path runs
+        pw_initial.seq = 2;
         node.update_from_pingwave(&pw_initial, from);
-        // The "newer seq" branch updates regardless of hops, so
-        // hops should be the saturated 255.
-        assert_eq!(node.hops, u8::MAX);
-        // Sanity: no panic, no wrap to 0.
-        assert_ne!(node.hops, 0);
-        let _ = initial_hops; // suppress unused
+        // The path-quality arm rejects `new_hops=255 > self.hops`,
+        // so the better cached hop count survives. Freshness still
+        // advances `last_seq`. Sanity: no panic, no wrap.
+        assert_eq!(node.hops, initial_hops);
+        assert_eq!(node.last_seq, 2);
+    }
+
+    /// Regression for the "worse path overwrites better" hazard.
+    /// Pre-fix `update_from_pingwave` used an OR predicate
+    /// (`seq > last_seq || new_hops < hops`), so a flooded
+    /// high-seq pingwave reaching us through a long route demoted
+    /// a previously-cached direct route purely on freshness.
+    /// Post-fix `last_seq` always advances on a newer pingwave,
+    /// but `addr` / `hops` / `latency_us` only update when the
+    /// new path is no worse.
+    #[test]
+    fn update_from_pingwave_keeps_better_path_when_newer_seq_arrives_via_longer_route() {
+        // Direct path: 1 hop after the +1 bump.
+        let mut pw_direct = EnhancedPingwave::new(make_node_id(2), 5, 0);
+        let direct_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let mut node = ProximityNode::from_pingwave(&pw_direct, direct_addr);
+        let direct_hops = node.hops;
+        let direct_last_seq = node.last_seq;
+        assert_eq!(direct_hops, 1, "test setup: direct route is 1 hop");
+
+        // A later, higher-seq pingwave for the same node arrives via
+        // a 7-hop indirect path from a different source address.
+        let indirect_addr: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        pw_direct.seq = 9;
+        pw_direct.hop_count = 7;
+        node.update_from_pingwave(&pw_direct, indirect_addr);
+
+        // Path-quality arm: the longer route MUST NOT overwrite the
+        // direct route's address or hop count.
+        assert_eq!(
+            node.hops, direct_hops,
+            "longer-route pingwave must not demote a better cached path",
+        );
+        assert_eq!(
+            node.addr, direct_addr,
+            "longer-route pingwave must not redirect to the indirect source",
+        );
+        // Freshness arm: `last_seq` still advances on the newer
+        // pingwave so subsequent staleness / restart checks see the
+        // current sequence number.
+        assert!(
+            node.last_seq > direct_last_seq,
+            "freshness must still advance"
+        );
+        assert_eq!(node.last_seq, 9);
     }
 
     #[test]

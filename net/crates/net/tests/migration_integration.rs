@@ -15,9 +15,9 @@ use net::adapter::net::behavior::capability::{
 use net::adapter::net::behavior::loadbalance::{RequestContext, Strategy};
 use net::adapter::net::compute::migration_target::RestoreContext;
 use net::adapter::net::compute::{
-    chunk_snapshot, DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, ForkGroup,
-    ForkGroupConfig, GroupCoordinator, GroupError, GroupHealth, MemberInfo, MemberRole, MeshDaemon,
-    MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
+    chunk_snapshot, BufferOutcome, DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry,
+    ForkGroup, ForkGroupConfig, GroupCoordinator, GroupError, GroupHealth, MemberInfo, MemberRole,
+    MeshDaemon, MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
     MigrationTargetHandler, ReplicaGroup, ReplicaGroupConfig, Scheduler, SnapshotReassembler,
     StandbyGroup, StandbyGroupConfig, MAX_SNAPSHOT_CHUNK_SIZE,
 };
@@ -111,11 +111,11 @@ fn test_orchestrator_full_phase_chain() {
     let orch = MigrationOrchestrator::new(reg.clone(), 0x1111);
 
     // Phase 0→1: Start migration (local source)
-    let msg = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+    let msgs = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
     assert_eq!(orch.status(origin), Some(MigrationPhase::Transfer));
-    let _snapshot_bytes = match msg {
-        MigrationMessage::SnapshotReady { snapshot_bytes, .. } => snapshot_bytes,
-        _ => panic!("expected SnapshotReady"),
+    let _snapshot_bytes = match &msgs[0] {
+        MigrationMessage::SnapshotReady { snapshot_bytes, .. } => snapshot_bytes.clone(),
+        other => panic!("expected SnapshotReady, got {:?}", other),
     };
 
     // Phase 1→2: Snapshot ready → forward (simulating orchestrator receiving it back)
@@ -166,7 +166,10 @@ fn test_orchestrator_phase_chain_with_buffered_events() {
 
     // Buffer events while snapshot is in flight
     for seq in 1..=5 {
-        assert!(orch.buffer_event(origin, make_event(0xBBBB, seq)));
+        assert_eq!(
+            orch.buffer_event(origin, make_event(0xBBBB, seq)),
+            BufferOutcome::Buffered,
+        );
     }
 
     // Restore complete → should drain buffered events
@@ -212,15 +215,24 @@ fn test_end_to_end_migration_local_source() {
     let orch = MigrationOrchestrator::new(source_reg.clone(), 0x1111);
 
     // Phase 0: Orchestrator starts migration → takes snapshot locally
-    let msg = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
-    let (snapshot_bytes, seq_through) = match msg {
-        MigrationMessage::SnapshotReady {
-            snapshot_bytes,
-            seq_through,
-            ..
-        } => (snapshot_bytes, seq_through),
-        _ => panic!("expected SnapshotReady"),
-    };
+    let msgs = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+    // Reassemble chunks into the original snapshot bytes (small
+    // snapshots are a single chunk; this loop handles both).
+    let mut snapshot_bytes: Vec<u8> = Vec::new();
+    let mut seq_through: u64 = 0;
+    for m in &msgs {
+        match m {
+            MigrationMessage::SnapshotReady {
+                snapshot_bytes: chunk,
+                seq_through: sq,
+                ..
+            } => {
+                snapshot_bytes.extend_from_slice(chunk);
+                seq_through = *sq;
+            }
+            other => panic!("expected SnapshotReady, got {:?}", other),
+        }
+    }
 
     // Phase 2: Target restores from snapshot
     let snapshot = StateSnapshot::from_bytes(&snapshot_bytes).unwrap();
@@ -318,17 +330,18 @@ fn test_start_migration_auto() {
     let local_caps = CapabilitySet::new();
     let scheduler = Scheduler::new(index, 0x1111, local_caps);
 
-    let (target_node, msg) = orch
+    let (target_node, msgs) = orch
         .start_migration_auto(origin, 0x1111, &scheduler, &CapabilityFilter::default())
         .unwrap();
 
     assert_eq!(target_node, 0x2222);
     assert_eq!(orch.target_node(origin), Some(0x2222));
-    match msg {
+    assert!(!msgs.is_empty(), "must emit at least one chunk");
+    match &msgs[0] {
         MigrationMessage::SnapshotReady { daemon_origin, .. } => {
-            assert_eq!(daemon_origin, origin);
+            assert_eq!(*daemon_origin, origin);
         }
-        _ => panic!("expected SnapshotReady"),
+        other => panic!("expected SnapshotReady, got {:?}", other),
     }
 }
 
@@ -346,9 +359,12 @@ fn test_start_migration_auto_no_targets() {
     let err = orch
         .start_migration_auto(origin, 0x1111, &scheduler, &CapabilityFilter::default())
         .unwrap_err();
+    // start_migration_auto surfaces the typed NoTargetAvailable
+    // when the scheduler finds no candidate; TargetUnavailable(_)
+    // is reserved for paths that already had a specific target id.
     match err {
-        net::adapter::net::MigrationError::TargetUnavailable(_) => {}
-        _ => panic!("expected TargetUnavailable, got {:?}", err),
+        net::adapter::net::MigrationError::NoTargetAvailable => {}
+        _ => panic!("expected NoTargetAvailable, got {:?}", err),
     }
 }
 
@@ -1624,18 +1640,19 @@ fn test_fork_then_migrate() {
     // the group directly in this test, we'll use the snapshot-based migration
     // path which requires matching keypair on target.
     // Instead, we verify the snapshot is valid and the migration orchestrator accepts it.
-    let msg = orch.start_migration(fork_origin, 0x1111, 0x2222).unwrap();
+    let msgs = orch.start_migration(fork_origin, 0x1111, 0x2222).unwrap();
 
-    match msg {
+    assert!(!msgs.is_empty(), "must emit at least one chunk");
+    match &msgs[0] {
         MigrationMessage::SnapshotReady {
             daemon_origin,
             seq_through,
             ..
         } => {
-            assert_eq!(daemon_origin, fork_origin);
-            assert_eq!(seq_through, 5);
+            assert_eq!(*daemon_origin, fork_origin);
+            assert_eq!(*seq_through, 5);
         }
-        _ => panic!("expected SnapshotReady for fork"),
+        other => panic!("expected SnapshotReady for fork, got {:?}", other),
     }
 
     // The fork is a normal daemon in the registry — migration works on it
@@ -1894,20 +1911,21 @@ fn test_standby_group_active_migrates_via_mikoshi() {
 
     // Start a MIKOSHI migration on the active
     let orch = MigrationOrchestrator::new(reg.clone(), 0x1111);
-    let msg = orch.start_migration(active, 0x1111, 0x2222).unwrap();
+    let msgs = orch.start_migration(active, 0x1111, 0x2222).unwrap();
 
     // Migration should succeed — it doesn't know this daemon is part of a group
     assert!(orch.is_migrating(active));
-    match msg {
+    assert!(!msgs.is_empty(), "must emit at least one chunk");
+    match &msgs[0] {
         MigrationMessage::SnapshotReady {
             daemon_origin,
             seq_through,
             ..
         } => {
-            assert_eq!(daemon_origin, active);
-            assert_eq!(seq_through, 7);
+            assert_eq!(*daemon_origin, active);
+            assert_eq!(*seq_through, 7);
         }
-        _ => panic!("expected SnapshotReady"),
+        other => panic!("expected SnapshotReady, got {:?}", other),
     }
 
     // The standby group still tracks the active (even though migration is in-flight)
@@ -2478,18 +2496,27 @@ fn test_migration_full_lifecycle_over_subprotocol_single_chunk() {
     .into_iter()
     .collect();
 
-    // Kick off: orchestrator starts migration. Since the orchestrator is
-    // local to the source, this returns a SnapshotReady directly.
-    let start_msg = source
+    // Kick off: orchestrator starts migration. Local source
+    // returns a vector of SnapshotReady chunks (one per
+    // MAX_SNAPSHOT_CHUNK_SIZE byte slice). Pump every chunk.
+    let start_msgs = source
         .orch
         .start_migration(origin, source.node_id, target.node_id)
         .unwrap();
-    let initial = OutboundMigrationMessage {
-        dest_node: source.node_id,
-        payload: net::adapter::net::compute::orchestrator::wire::encode(&start_msg).unwrap(),
-    };
+    let initial: Vec<(u64, OutboundMigrationMessage)> = start_msgs
+        .iter()
+        .map(|m| {
+            (
+                source.node_id,
+                OutboundMigrationMessage {
+                    dest_node: source.node_id,
+                    payload: net::adapter::net::compute::orchestrator::wire::encode(m).unwrap(),
+                },
+            )
+        })
+        .collect();
 
-    pump_messages(&nodes, vec![(source.node_id, initial)]).unwrap();
+    pump_messages(&nodes, initial).unwrap();
 
     // Assertions: daemon lives on target, gone from source, migration
     // record cleared on both orchestrator and target.
@@ -2625,15 +2652,23 @@ fn test_migration_fails_when_no_factory_registered() {
     .into_iter()
     .collect();
 
-    let start_msg = source
+    let start_msgs = source
         .orch
         .start_migration(origin, source.node_id, target.node_id)
         .unwrap();
-    let initial = OutboundMigrationMessage {
-        dest_node: source.node_id,
-        payload: net::adapter::net::compute::orchestrator::wire::encode(&start_msg).unwrap(),
-    };
-    pump_messages(&nodes, vec![(source.node_id, initial)]).unwrap();
+    let initial: Vec<(u64, OutboundMigrationMessage)> = start_msgs
+        .iter()
+        .map(|m| {
+            (
+                source.node_id,
+                OutboundMigrationMessage {
+                    dest_node: source.node_id,
+                    payload: net::adapter::net::compute::orchestrator::wire::encode(m).unwrap(),
+                },
+            )
+        })
+        .collect();
+    pump_messages(&nodes, initial).unwrap();
 
     // Target should not have the daemon; source should still have it.
     assert!(

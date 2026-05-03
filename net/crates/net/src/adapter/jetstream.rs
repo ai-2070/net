@@ -101,48 +101,75 @@ impl JetStreamAdapter {
     }
 
     /// Deserialize a stored event.
+    ///
+    /// Uses `RawValue` to slice the `r` field directly out of the
+    /// stored bytes — no full JSON tree allocation, no
+    /// re-serialize. Pre-fix the function parsed the payload
+    /// into a `serde_json::Value` tree per event and then
+    /// re-serialized the `r` subtree, allocating ~event-size
+    /// bytes twice per event. At 100 k events/poll this was
+    /// measurable; on a hot replay potentially OOM. The audit
+    /// (`adapter/mod.rs:88`) requires "MUST NOT allocate per-
+    /// event," matching the Redis adapter's pattern.
+    ///
+    /// `s` is parsed as `u64` instead of `u16` so an out-of-
+    /// range stored value surfaces as a typed `Fatal` error
+    /// rather than silently truncating via `serde`'s u16 parse
+    /// (which would mis-route the event at consume time).
     fn deserialize_event(seq: u64, data: &[u8]) -> Result<StoredEvent, AdapterError> {
-        let value: serde_json::Value = serde_json::from_slice(data)?;
+        #[derive(serde::Deserialize)]
+        struct StoredFormat<'a> {
+            #[serde(borrow)]
+            r: &'a serde_json::value::RawValue,
+            #[serde(default)]
+            t: u64,
+            #[serde(default)]
+            s: u64,
+        }
 
-        let raw = value.get("r").cloned().unwrap_or(serde_json::Value::Null);
-        // Pre-fix used `unwrap_or_default()` on the
-        // re-serialize, so a malformed/oversized `r` value whose
-        // serialization failed silently became empty bytes. The
-        // event was then "delivered" with an empty payload
-        // instead of surfacing the corruption — silent on-wire
-        // data loss. `serde_json::to_vec` on a serde_json::Value
-        // can't actually fail under normal conditions (the value
-        // came from a successful from_slice round-trip just
-        // above), but the audit's concern stands as defense in
-        // depth: surface any failure as a fatal parse error so
-        // the corruption is observable.
-        let raw_bytes = Bytes::from(serde_json::to_vec(&raw).map_err(|e| {
-            AdapterError::Fatal(format!(
-                "JetStream stored event seq={seq}: re-serialize of `r` field failed: {e}"
-            ))
-        })?);
-        let insertion_ts = value.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
+        let parsed: StoredFormat = serde_json::from_slice(data)?;
+        // Reject `r: null` (or a missing `r` that round-trips
+        // through `RawValue` as the literal `null`) with a
+        // typed Fatal error rather than handing `b"null"` back
+        // as the event's raw bytes. Pre-fix downstream consumers
+        // that expected an object/array for `raw` got a 4-byte
+        // `null` literal — valid JSON, but not what an event
+        // payload should ever look like, and easy to mis-route
+        // through code that does `if raw.is_empty()` checks.
+        // The audit (#135) calls this out as "may surprise
+        // downstream consumers" — convert the surprise into a
+        // typed error at the boundary.
+        let raw_str = parsed.r.get();
+        if raw_str == "null" {
+            return Err(AdapterError::Fatal(format!(
+                "JetStream stored event seq={seq} has `r: null` — \
+                 the producer wrote either a literal JSON null or \
+                 omitted the field; downstream consumers expect a \
+                 non-null payload",
+            )));
+        }
+        let raw_bytes = Bytes::copy_from_slice(raw_str.as_bytes());
 
         // Pre-fix this was `... as u16`, which silently
         // wrapped on a stored shard_id > 65 535 (e.g. 100 000 →
         // 34 464). The result was a misrouted event at consume
         // time, classified to a different shard than it was
-        // originally written under. Reject the event with a fatal
-        // error so the corruption surfaces at parse time rather
-        // than as a "wrong shard" mystery downstream.
-        let shard_id_raw = value.get("s").and_then(|v| v.as_u64()).unwrap_or(0);
-        let shard_id = u16::try_from(shard_id_raw).map_err(|_| {
+        // originally written under. Reject the event with a
+        // fatal error so the corruption surfaces at parse time
+        // rather than as a "wrong shard" mystery downstream.
+        let shard_id = u16::try_from(parsed.s).map_err(|_| {
             AdapterError::Fatal(format!(
-                "JetStream stored event seq={seq} has shard_id {shard_id_raw} \
+                "JetStream stored event seq={seq} has shard_id {} \
                  outside u16 range (0..=65535); refusing to mis-route as \
-                 truncated value"
+                 truncated value",
+                parsed.s
             ))
         })?;
 
         Ok(StoredEvent::new(
             seq.to_string(),
             raw_bytes,
-            insertion_ts,
+            parsed.t,
             shard_id,
         ))
     }
@@ -187,6 +214,13 @@ impl JetStreamAdapter {
                             num_replicas: self.config.replicas,
                             discard: jetstream::stream::DiscardPolicy::Old,
                             allow_direct: true, // Required for direct_get API
+                            // Wider than the 2-minute NATS default so a
+                            // bus-side retry of `(process_nonce, shard,
+                            // seq)`-keyed publishes after a long backoff
+                            // still hits the dedup table. See the
+                            // `JetStreamAdapterConfig::dedup_window`
+                            // field doc for the rationale.
+                            duplicate_window: self.config.dedup_window,
                             ..Default::default()
                         };
 
@@ -241,6 +275,32 @@ impl Adapter for JetStreamAdapter {
             return Ok(());
         }
 
+        // Re-init after shutdown: `shutdown` flips `initialized =
+        // false` and `drain()`s the client, but doesn't (and
+        // can't, behind `&self`) clear `self.client` /
+        // `self.jetstream`. A reconnect path that calls `init`
+        // here would fall through and overwrite `self.client =
+        // Some(new_client)` below, dropping the prior client
+        // without draining it. If `shutdown` had not run the
+        // drain (e.g. `init` is called WITHOUT a preceding
+        // `shutdown`, just on a re-init flow), in-flight
+        // publishes piggybacking on the prior client would be
+        // silently lost. Drain the prior client first so the
+        // overwrite is safe regardless of whether `shutdown` ran.
+        if let Some(prior) = self.client.take() {
+            if let Err(e) = prior.drain().await {
+                tracing::warn!(
+                    adapter = "jetstream",
+                    error = %e,
+                    "init: failed to drain prior client before overwrite \
+                     (may have been already drained by shutdown)"
+                );
+            }
+            // Drop the prior jetstream context too; it borrows
+            // a clone of the now-drained client.
+            self.jetstream = None;
+        }
+
         let client = async_nats::ConnectOptions::new()
             .connection_timeout(self.config.connect_timeout)
             .request_timeout(Some(self.config.request_timeout))
@@ -267,6 +327,16 @@ impl Adapter for JetStreamAdapter {
     async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
         if batch.is_empty() {
             return Ok(());
+        }
+
+        // Consult `initialized` before reaching `self.jetstream`.
+        // `shutdown` flips this flag and `drain()`s the client, but
+        // does not (and cannot, behind `&self`) clear the `Option`
+        // fields. Without this gate a post-shutdown `on_batch`
+        // would proceed against a drained client, typically erroring
+        // and sometimes hanging depending on async-nats internals.
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(AdapterError::Connection("adapter not initialized".into()));
         }
 
         let js = self
@@ -324,7 +394,25 @@ impl Adapter for JetStreamAdapter {
         // producer when the persistent path is configured.
         // Use the batch's process_nonce field — bus-loaded once
         // and consistent across every batch from this bus instance.
-        let mut acks = Vec::with_capacity(serialized.len());
+        // Pipeline both phases of the publish:
+        //
+        // 1. Enqueue every event into JetStream in parallel —
+        //    `publish_with_headers` is async (it awaits the
+        //    `max_ack_pending` semaphore + the wire write) and
+        //    returns a `PublishAckFuture` once enqueued. Pre-fix
+        //    the loop awaited each `publish_with_headers` inline,
+        //    serializing the wire-side enqueue per event. On a
+        //    1ms-RTT link a 1k-event batch then cost ~1s wall
+        //    time despite the comment claiming "~1 RTT per
+        //    batch."
+        //
+        // 2. Await every `PublishAckFuture` in parallel — these
+        //    are the server acks; the existing code already
+        //    parallelized them via `try_join_all`.
+        //
+        // Both phases use `try_join_all` to short-circuit on the
+        // first error; the JetStream dedup window discards
+        // duplicates from a retry of the same batch.
         let mut msg_id_buf = String::new();
         let _ = write!(
             msg_id_buf,
@@ -333,42 +421,79 @@ impl Adapter for JetStreamAdapter {
         );
         let prefix_len = msg_id_buf.len();
 
+        let mut publishes = Vec::with_capacity(serialized.len());
         for (i, data) in serialized.into_iter().enumerate() {
             // Reset to the cached prefix and append `:{i}`.
             msg_id_buf.truncate(prefix_len);
             let _ = write!(msg_id_buf, ":{i}");
 
             let mut headers = async_nats::HeaderMap::new();
-            // `From<&str> for HeaderValue` copies the bytes into the
-            // header, so reusing `msg_id_buf` on the next iteration is
-            // safe — the header now owns its own copy.
+            // `From<&str> for HeaderValue` copies the bytes, so
+            // reusing `msg_id_buf` on the next iteration is safe.
             headers.insert("Nats-Msg-Id", msg_id_buf.as_str());
 
-            let ack = js
-                .publish_with_headers(subject.clone(), headers, data.into())
-                .await
-                .map_err(|e| {
-                    if is_transient_error(&e) {
-                        AdapterError::Transient(e.to_string())
-                    } else {
-                        AdapterError::Fatal(e.to_string())
-                    }
-                })?;
-            // `PublishAckFuture` implements `IntoFuture`, not `Future`,
-            // so it can't go straight into `try_join_all`. Wrap each
-            // in an async block that handles the await + error
-            // mapping in one place.
-            acks.push(async move {
-                ack.await
-                    .map_err(|e| AdapterError::Transient(e.to_string()))
-            });
+            // Push the un-awaited future. `js.publish_with_headers`
+            // borrows `js`, which lives for the rest of this
+            // function — fine for `try_join_all` here.
+            publishes.push(js.publish_with_headers(subject.clone(), headers, data.into()));
         }
 
-        // Await all server acks in parallel. `try_join_all` short-
-        // circuits on the first error, which is the desired retry
-        // semantic — the JetStream stream's dedup window will discard
-        // duplicates on the retry.
-        futures::future::try_join_all(acks).await?;
+        // Phase 1: enqueue all events in parallel. Wrap in
+        // `tokio::time::timeout` so the bus's outer task
+        // cancellation (or any caller-imposed deadline) doesn't
+        // drop the futures mid-iteration, leaving bytes on the
+        // wire that the dedup window will eventually mask but
+        // that the bus believes never landed. The timeout
+        // surfaces as `Transient` so the bus retries with the
+        // same `Nats-Msg-Id` set — JetStream's dedup window
+        // (configured via `JetStreamAdapterConfig::dedup_window`)
+        // discards the prior copies. Pre-fix the unwrapped
+        // `try_join_all` was vulnerable to outer cancellation
+        // in exactly the way the Redis adapter calls out at
+        // `redis.rs:388-407`.
+        let phase1 = tokio::time::timeout(
+            self.config.request_timeout,
+            futures::future::try_join_all(publishes),
+        );
+        let ack_futures = match phase1.await {
+            Ok(result) => result.map_err(|e| {
+                if is_transient_error(&e) {
+                    AdapterError::Transient(e.to_string())
+                } else {
+                    AdapterError::Fatal(e.to_string())
+                }
+            })?,
+            Err(_) => {
+                return Err(AdapterError::Transient(
+                    "JetStream publish enqueue phase timed out".into(),
+                ))
+            }
+        };
+
+        // Phase 2: await all server acks in parallel.
+        // `PublishAckFuture` implements `IntoFuture` (not `Future`),
+        // so wrap each in an async block to call `.await`.
+        // Wrapped in the same `request_timeout` for the same
+        // cancellation-safety reason as phase 1.
+        let acks = ack_futures.into_iter().map(|ack| async move {
+            ack.await
+                .map_err(|e| AdapterError::Transient(e.to_string()))
+        });
+        match tokio::time::timeout(
+            self.config.request_timeout,
+            futures::future::try_join_all(acks),
+        )
+        .await
+        {
+            Ok(result) => {
+                result?;
+            }
+            Err(_) => {
+                return Err(AdapterError::Transient(
+                    "JetStream publish ack phase timed out".into(),
+                ))
+            }
+        }
 
         tracing::trace!(
             shard_id = batch.shard_id,
@@ -419,6 +544,12 @@ impl Adapter for JetStreamAdapter {
         from_id: Option<&str>,
         limit: usize,
     ) -> Result<ShardPollResult, AdapterError> {
+        // Same shutdown gate as `on_batch` — `shutdown` cannot
+        // clear `self.client` / `self.jetstream` from `&self`, so
+        // we consult the flag instead.
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(AdapterError::Connection("adapter not initialized".into()));
+        }
         let mut stream = self.get_or_create_stream(shard_id).await?;
 
         // Parse the cursor (sequence number).
@@ -449,188 +580,119 @@ impl Adapter for JetStreamAdapter {
         // saturating value cannot itself cause an overflow.
         let fetch_limit = limit.saturating_add(1);
 
-        // Get messages directly from the stream
+        // Get messages directly from the stream.
+        //
+        // Pre-fix this loop walked `current_seq` one at a time,
+        // calling `stream.direct_get(seq)` per sequence. On a
+        // 1ms-RTT link a 100-event poll cost ≥100ms wall, bounded
+        // by latency rather than bandwidth. `direct_get_next_for_subject`
+        // returns the NEXT message at or after `seq` for a given
+        // subject in a single RTT — gaps from deletions, MAXLEN
+        // trims, or sparse writes are skipped server-side. This
+        // also eliminates the cold-stream-bail and
+        // `consecutive_not_found` heuristics, which were
+        // workarounds for the per-seq walk: with next-by-subject,
+        // a NotFound result is definitive ("no more messages at
+        // or after this seq"), not noise.
+        //
+        // The shard-scoped subject (one stream per shard, exact
+        // subject `<prefix>.shard.<id>`) means the next-by-subject
+        // call returns events that belong only to this shard.
         let mut events = Vec::with_capacity(limit);
         let mut current_seq = start_seq;
+        let subject_str = self.subject(shard_id);
 
-        // Use the stream's actual last sequence to bound the search,
-        // rather than an arbitrary multiplier that can miss events in
-        // streams with large gaps (deletions, compaction). The
-        // fallback saturates so a caller-supplied `limit` near
-        // `usize::MAX` cannot wrap to a tiny `max_seq` and silently
-        // cap the poll at zero events.
-        //
-        // Also extract `first_sequence` so the per-event walk below
-        // can skip past a long retention-rollover gap in a single
-        // jump. Without it, `direct_get(seq)` returns NotFound for
-        // every deleted seq and the loop would increment by one
-        // and try again — after a MAXLEN trim of the first 10M
-        // sequences, `poll_shard(from_id=None)` resumes at
-        // `start_seq=1` and the consumer would do 10M sequential
-        // network RTTs before returning a single event (hung for
-        // minutes, request timeout fires, next poll resumes from
-        // where it left off — never made progress). With
-        // `first_sequence` captured up-front, the first `NotFound`
-        // jumps `current_seq` to `first_sequence` in one step.
-        let (max_seq, first_seq) = match stream.info().await {
-            Ok(info) => (info.state.last_sequence, info.state.first_sequence),
-            Err(_) => {
-                let span = (fetch_limit as u64).saturating_mul(10);
-                (start_seq.saturating_add(span), 0)
-            }
-        };
-        // Apply the retention-rollover jump up-front: if
-        // `start_seq` is below the stream's first retained
-        // sequence, advance the cursor immediately rather than
-        // walking the deleted range one-by-one.
-        if first_seq > current_seq {
-            current_seq = first_seq;
+        // We still call `stream.info()` once up-front so a
+        // transient backend hiccup surfaces as `Transient` rather
+        // than "stream is empty." The `max_seq`/`first_seq`
+        // walking heuristics are no longer needed (the
+        // next-by-subject API handles gaps natively), but
+        // failing fast on info() preserves the
+        // recoverable-error contract.
+        if let Err(e) = stream.info().await {
+            return Err(AdapterError::Transient(format!(
+                "JetStream stream.info() failed for shard {} (poll \
+                 suspended; retry after backoff): {}",
+                shard_id, e
+            )));
         }
 
-        // Use direct get to fetch messages by sequence
-        // Use while loop so gaps don't consume our fetch count.
-        // Track every sequence we observe (regardless of deserialize
-        // outcome) so the cursor can advance past corrupt entries
-        // instead of stalling on them.
-        //
-        // The loop's `current_seq > max_seq` short-circuit re-reads
-        // `info()` once before declaring drain, to catch concurrent
-        // writes that appeared after our initial sample. Without
-        // the re-read, a producer writing new messages during the
-        // read would be silently truncated — `has_more=false` would
-        // come back even though the stream tail had more events.
-        // `max_seq_re_checked` tracks whether we've already paid
-        // the one bounded re-read, so a relentless producer can't
-        // spin us forever in a re-info loop.
         let mut last_seen_seq: Option<u64> = None;
-        let mut max_seq = max_seq;
-        let mut max_seq_re_checked = false;
-        // Pre-fix, on `stream.info()` failure for a
-        // cold/empty stream, `first_seq=0` and `max_seq=start_seq+
-        // fetch_limit*10` together caused the loop to walk every
-        // sequence from 1 to `max_seq`, doing one direct_get RTT
-        // per missing seq. With `fetch_limit=101`, that's ~1010
-        // RTTs per poll, observed as "JetStream is slow" in
-        // production.
-        //
-        // After K consecutive NotFound responses, declare the
-        // stream cold and bail. K is `max(64, fetch_limit / 2)` —
-        // big enough to skip ordinary gaps in a dense stream
-        // (the `first_sequence` jump above already collapses huge
-        // retention-rollover gaps in a single step) but small
-        // enough that a cold stream doesn't burn 1000+ RTTs.
-        //
-        // The cap is gated on `first_seq == 0`: when the stream's
-        // first retained sequence is non-zero, `info()` succeeded
-        // and reported real data, so there's no risk of an
-        // unbounded walk on a cold/empty stream — `current_seq >
-        // max_seq` is the natural stop. Applying the cap there
-        // would truncate polling on a *sparse* populated stream
-        // (events at e.g. seq 1, 500, 1000) by breaking before
-        // reaching later valid sequences. `first_seq == 0` covers
-        // both genuinely empty streams and `info()` failures (the
-        // fallback uses `first_seq = 0`); both want the early-
-        // bail protection.
-        let consecutive_not_found_cap = (fetch_limit / 2).max(64);
-        let cold_stream_bail_enabled = first_seq == 0;
-        let mut consecutive_not_found = 0usize;
         while events.len() < fetch_limit {
-            if current_seq > max_seq {
-                // Before declaring drain, re-read `info()` once to
-                // catch concurrent writes that appeared after our
-                // initial sample. One bounded re-read per poll
-                // preserves the loop's O(span) worst-case while
-                // closing the truncation hole.
-                if !max_seq_re_checked {
-                    max_seq_re_checked = true;
-                    if let Ok(info) = stream.info().await {
-                        if info.state.last_sequence > max_seq {
-                            max_seq = info.state.last_sequence;
-                            continue;
-                        }
-                    }
-                }
-                // Searched too far without finding enough events
-                break;
-            }
-
-            match stream.direct_get(current_seq).await {
+            match stream
+                .direct_get_next_for_subject(subject_str.clone(), Some(current_seq))
+                .await
+            {
                 Ok(msg) => {
-                    last_seen_seq = Some(current_seq);
-                    consecutive_not_found = 0;
-                    match Self::deserialize_event(current_seq, &msg.payload) {
-                        Ok(event) => events.push(event),
+                    let msg_seq = msg.sequence;
+                    match Self::deserialize_event(msg_seq, &msg.payload) {
+                        Ok(event) => {
+                            events.push(event);
+                            last_seen_seq = Some(msg_seq);
+                        }
                         // Per-record JSON corruption is treated as a
                         // skippable hole in the stream — the cursor
-                        // still advances (`last_seen_seq` is set
-                        // above) so the consumer doesn't re-fetch the
-                        // bad record forever.
+                        // still advances so the consumer doesn't
+                        // re-fetch the bad record forever.
                         Err(e @ AdapterError::Serialization(_)) => {
                             tracing::warn!(
                                 stream = %self.stream_name(shard_id),
-                                seq = current_seq,
+                                seq = msg_seq,
                                 error = %e,
                                 "Failed to deserialize event, skipping"
                             );
+                            last_seen_seq = Some(msg_seq);
                         }
                         // `deserialize_event` returns
                         // `AdapterError::Fatal` when the stored
                         // record is structurally corrupt (e.g.
                         // `shard_id` outside the u16 range, where
                         // silent truncation would mis-route the
-                        // event). Propagating these surfaces the
-                        // corruption at parse time as the original
-                        // fix intended; logging-and-skipping would
-                        // re-bury it under the existing "wrong
-                        // shard" symptom downstream.
-                        //
-                        // Caveat: any events the loop has
-                        // *already* accumulated in `events` are
-                        // dropped here — the caller sees the
-                        // `Fatal` error and never the partial
-                        // batch. The cursor was not yet returned,
-                        // so a retry of `poll_shard` would
-                        // re-walk those sequences from the start.
-                        // Acceptable because `Fatal` is non-
-                        // retryable (`is_retryable` returns
-                        // false): the caller is expected to
-                        // surface the corruption to operators
-                        // rather than retry, so the dropped
-                        // prefix is a diagnostic price for
-                        // making the corruption observable, not
-                        // a silent data loss.
-                        Err(e) => return Err(e),
+                        // event). Return the good prefix
+                        // accumulated so far with the cursor
+                        // pointing at the LAST GOOD seq, so a
+                        // retry of `poll_shard` re-walks just the
+                        // corrupt record and surfaces the Fatal
+                        // error at that exact seq — without also
+                        // re-emitting the good prefix as
+                        // duplicates.
+                        Err(e) => {
+                            tracing::error!(
+                                stream = %self.stream_name(shard_id),
+                                seq = msg_seq,
+                                accumulated = events.len(),
+                                error = %e,
+                                "JetStream: structurally-corrupt event; \
+                                 returning good prefix with cursor at last \
+                                 good seq so retry surfaces Fatal at the \
+                                 exact corrupt seq"
+                            );
+                            let next_id = last_seen_seq.map(|s| s.to_string());
+                            return Ok(ShardPollResult {
+                                events,
+                                next_id,
+                                has_more: true,
+                            });
+                        }
                     }
-                    current_seq += 1;
+                    // Advance past the seq we just observed.
+                    // Saturating-add guards against `u64::MAX`
+                    // (a stream that's run for ~2^64 events is
+                    // already in trouble, but we won't wrap to 0
+                    // and re-emit from the start).
+                    current_seq = msg_seq.saturating_add(1);
                 }
                 Err(e) => {
                     use async_nats::jetstream::stream::DirectGetErrorKind;
                     match e.kind() {
-                        DirectGetErrorKind::NotFound => {
-                            // Try next sequence (there might be gaps due to deletions),
-                            // but bail after `consecutive_not_found_cap` to avoid
-                            // burning RTTs on a cold stream. Only applies when
-                            // `cold_stream_bail_enabled` (i.e. `first_seq == 0`):
-                            // a sparse populated stream needs to walk past arbitrarily
-                            // long deletion gaps to reach later events.
-                            consecutive_not_found += 1;
-                            if cold_stream_bail_enabled
-                                && consecutive_not_found >= consecutive_not_found_cap
-                            {
-                                tracing::debug!(
-                                    stream = %self.stream_name(shard_id),
-                                    consecutive_not_found,
-                                    current_seq,
-                                    "JetStream poll bailing after consecutive NotFounds"
-                                );
-                                break;
-                            }
-                            current_seq += 1;
-                        }
-                        DirectGetErrorKind::InvalidSubject => {
-                            // No more messages or invalid request
-                            break;
-                        }
+                        // NotFound from `direct_get_next_for_subject`
+                        // is definitive: there is no message at or
+                        // after `current_seq` for this subject.
+                        // Pre-fix the per-seq walk needed cold-stream
+                        // bail / consecutive-NotFound counting; with
+                        // next-by-subject, we just exit.
+                        DirectGetErrorKind::NotFound => break,
+                        DirectGetErrorKind::InvalidSubject => break,
                         _ => {
                             // For other errors, check if we have any events
                             if events.is_empty() {
@@ -688,20 +750,44 @@ impl Adapter for JetStreamAdapter {
 /// every error other than `WrongLastSequence` as retryable. The
 /// permissive default amplified misconfiguration into infinite
 /// retry storms — `StreamNotFound` and the `WrongLast*` variants
-/// are structural problems that do not become recoverable on retry.
+/// are structural problems that do not become recoverable on
+/// retry.
+///
+/// `PublishErrorKind::Other` is async-nats's catch-all for any
+/// error variant that doesn't have a dedicated arm — auth
+/// failures, permission-denied, account-misconfig, malformed-
+/// subject. None of these become retryable on retry; classifying
+/// them as transient (the pre-fix behaviour) drove the bus's
+/// outer retry loop into a tight infinite retry storm against a
+/// backend that would never succeed, which is a production-down
+/// scenario when an operator misconfigures a NATS account at
+/// deploy time. Treat `Other` as fatal so the misconfig
+/// surfaces as a hard error within seconds. Log the inner error
+/// before returning so the actual cause is grep-able from the
+/// logs (the variant doesn't expose enough context on its own).
 fn is_transient_error(e: &async_nats::jetstream::context::PublishError) -> bool {
     use async_nats::jetstream::context::PublishErrorKind;
     match e.kind() {
         // Network / connection / timing / backpressure — retry is meaningful.
         PublishErrorKind::TimedOut
         | PublishErrorKind::BrokenPipe
-        | PublishErrorKind::MaxAckPending
-        | PublishErrorKind::Other => true,
+        | PublishErrorKind::MaxAckPending => true,
         // Structural failures: missing stream and optimistic-concurrency
         // mismatches don't fix themselves under retry.
         PublishErrorKind::StreamNotFound
         | PublishErrorKind::WrongLastMessageId
         | PublishErrorKind::WrongLastSequence => false,
+        // Catch-all variant — log so the underlying cause is
+        // visible, then treat as fatal.
+        PublishErrorKind::Other => {
+            tracing::error!(
+                error = %e,
+                "JetStream publish: PublishErrorKind::Other treated as fatal \
+                 (auth / permission / account / subject config). Retrying \
+                 would loop until the underlying cause is fixed."
+            );
+            false
+        }
     }
 }
 
@@ -833,11 +919,17 @@ mod tests {
         assert!(is_transient_error(&PublishError::new(
             PublishErrorKind::MaxAckPending
         )));
-        assert!(is_transient_error(&PublishError::new(
+
+        // Fatal: structural / config / concurrency / catch-all.
+        // `Other` was pre-fix classified as transient; it's the
+        // async-nats catch-all for auth / permission / account /
+        // malformed-subject errors that never become retryable.
+        // Treating it as transient drove the outer retry loop
+        // into a tight infinite storm against a backend that
+        // would never succeed.
+        assert!(!is_transient_error(&PublishError::new(
             PublishErrorKind::Other
         )));
-
-        // Fatal: structural / config / concurrency.
         assert!(!is_transient_error(&PublishError::new(
             PublishErrorKind::StreamNotFound
         )));

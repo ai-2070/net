@@ -92,25 +92,25 @@ impl MemoriesWatcher {
         self
     }
 
-    /// Restrict to `created_ns > ns`.
+    /// Restrict to `created_ns >= ns` (inclusive).
     pub fn created_after(mut self, ns: u64) -> Self {
         self.spec.created_after_ns = Some(ns);
         self
     }
 
-    /// Restrict to `created_ns < ns`.
+    /// Restrict to `created_ns <= ns` (inclusive).
     pub fn created_before(mut self, ns: u64) -> Self {
         self.spec.created_before_ns = Some(ns);
         self
     }
 
-    /// Restrict to `updated_ns > ns`.
+    /// Restrict to `updated_ns >= ns` (inclusive).
     pub fn updated_after(mut self, ns: u64) -> Self {
         self.spec.updated_after_ns = Some(ns);
         self
     }
 
-    /// Restrict to `updated_ns < ns`.
+    /// Restrict to `updated_ns <= ns` (inclusive).
     pub fn updated_before(mut self, ns: u64) -> Self {
         self.spec.updated_before_ns = Some(ns);
         self

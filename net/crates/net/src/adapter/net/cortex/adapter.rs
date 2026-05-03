@@ -64,6 +64,13 @@ struct AdapterInner<State> {
     /// rejects `last_seq == u64::MAX`, so no real event can ever
     /// occupy that slot.
     folded_through_seq: AtomicU64,
+    /// First RedEX seq this adapter began folding from. Any seq
+    /// strictly below this is conceptually behind us — `wait_for_seq`
+    /// short-circuits without blocking on the watermark, even when
+    /// `start_seq == 0` puts the watermark at the `u64::MAX`
+    /// sentinel. Stored on inner so the wait predicate doesn't
+    /// need to reach back into the open-time `start_seq` local.
+    start_seq: u64,
     fold_errors: AtomicU64,
     running: AtomicBool,
     closed: AtomicBool,
@@ -120,6 +127,18 @@ impl<State> CortexAdapter<State> {
     /// // state reflects the ingest.
     /// ```
     pub async fn wait_for_seq(&self, seq: u64) {
+        // Any seq strictly below `start_seq` is conceptually behind
+        // us — those events were applied before we opened the
+        // adapter (or are explicitly past the LiveOnly cutoff).
+        // Short-circuit returning immediately so a caller that
+        // passes a stale seq cannot hang. This also covers the
+        // `start_seq == 0 && seq == 0` blocked-forever-on-empty-
+        // file case for adapters opened with `FromBeginning` on a
+        // freshly-created log: `seq < start_seq` is false, but the
+        // sentinel check below correctly waits for the first event.
+        if seq < self.inner.start_seq {
+            return;
+        }
         loop {
             let notified = self.inner.notify.notified();
             tokio::pin!(notified);
@@ -303,6 +322,7 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             file: file.clone(),
             state: state.clone(),
             folded_through_seq: AtomicU64::new(initial_watermark),
+            start_seq,
             fold_errors: AtomicU64::new(0),
             running: AtomicBool::new(true),
             closed: AtomicBool::new(false),
@@ -571,6 +591,74 @@ mod tests {
         fn apply(&mut self, _ev: &RedexEvent, state: &mut u64) -> Result<(), RedexError> {
             *state += 1;
             Ok(())
+        }
+    }
+
+    /// Pin: `wait_for_seq(seq)` short-circuits without blocking
+    /// when `seq < start_seq` — those events were applied before
+    /// the adapter opened (e.g. they're folded into the snapshot
+    /// the caller passed to `open_from_snapshot`). Pre-fix the
+    /// function used only the `watermark >= seq` check; until at
+    /// least one event landed under the new adapter, the
+    /// `u64::MAX` "nothing folded yet" sentinel kept the
+    /// comparison false and a caller waiting for a stale seq
+    /// would block forever.
+    #[tokio::test]
+    async fn wait_for_seq_short_circuits_below_start_seq() {
+        let redex = Redex::new();
+        // Pre-populate the file with 5 events via a temporary
+        // FromBeginning adapter, then snapshot.
+        let bytes;
+        let last_seq;
+        {
+            let pre = CortexAdapter::<u64>::open(
+                &redex,
+                &cn("cortex/short-circuit"),
+                RedexFileConfig::default(),
+                CortexAdapterConfig::default(),
+                CountFold,
+                0u64,
+            )
+            .unwrap();
+            for i in 0..5u64 {
+                let meta = EventMeta::new(1, 0, 1, i, 0);
+                let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+                let seq = pre.ingest(env).unwrap();
+                pre.wait_for_seq(seq).await;
+            }
+            let (b, ls) = pre.snapshot().unwrap();
+            bytes = b;
+            last_seq = ls;
+            pre.close().unwrap();
+        }
+
+        // Restore from snapshot: `start_seq` is `last_seq + 1 =
+        // 5` (the snapshot already absorbed seqs 0..=4). Any
+        // wait_for_seq below 5 is conceptually behind us.
+        let adapter = CortexAdapter::<u64>::open_from_snapshot(
+            &redex,
+            &cn("cortex/short-circuit"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            CountFold,
+            &bytes,
+            last_seq,
+        )
+        .unwrap();
+
+        // wait_for_seq(0..5) must all return immediately.
+        // Wrap each in a tight timeout — pre-fix behavior was
+        // an indefinite block.
+        for seq in 0..5u64 {
+            tokio::time::timeout(std::time::Duration::from_secs(2), adapter.wait_for_seq(seq))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "wait_for_seq({}) blocked past start_seq=5 — \
+                     short-circuit regressed",
+                        seq
+                    )
+                });
         }
     }
 

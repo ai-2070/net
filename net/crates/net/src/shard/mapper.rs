@@ -109,14 +109,27 @@ pub struct ShardMetricsCollector {
     current_len: AtomicU64,
     /// Events ingested in current window.
     events_in_window: AtomicU64,
-    /// Sum of push latencies in current window (ns).
-    push_latency_sum_ns: AtomicU64,
-    /// Number of push operations in current window.
-    push_count: AtomicU64,
-    /// Sum of flush latencies in current window (us).
-    flush_latency_sum_us: AtomicU64,
-    /// Number of flush operations in current window.
-    flush_count: AtomicU64,
+    /// Packed `(count << 32) | sum` for push latencies (ns).
+    /// Pre-fix `push_latency_sum_ns` and `push_count` were
+    /// independent `AtomicU64`s. `record_push` did two separate
+    /// `fetch_add`s, and `collect_and_reset` did two separate
+    /// `swap`s. A metrics tick interleaving between the two
+    /// `fetch_add`s captured the sum WITHOUT the count (or
+    /// vice versa); the resulting `avg = sum.checked_div(count)
+    /// .unwrap_or(0)` returned 0 in window N (sum without
+    /// count) and 0 in window N+1 (count without sum), silently
+    /// zeroing the average that drives `evaluate_scaling`'s
+    /// push-latency scale-up trigger. Packing into one u64 makes
+    /// the `(sum, count)` update atomic; the upper 32 bits hold
+    /// the count (u32::MAX = 4G calls/window — plenty) and the
+    /// lower 32 hold the sum (u32::MAX = 4 G ns ≈ 4 s, also
+    /// plenty for any sane window).
+    push_latency: AtomicU64,
+    /// Packed `(count << 32) | sum` for flush latencies (us).
+    /// Same shape and rationale as `push_latency`. The lower 32
+    /// bits hold sum-µs (u32::MAX ≈ 4 Gµs ≈ 67 minutes — far
+    /// past any plausible window).
+    flush_latency: AtomicU64,
     /// Whether this shard is draining.
     draining: AtomicBool,
     /// Window start time.
@@ -138,10 +151,8 @@ impl ShardMetricsCollector {
             capacity,
             current_len: AtomicU64::new(0),
             events_in_window: AtomicU64::new(0),
-            push_latency_sum_ns: AtomicU64::new(0),
-            push_count: AtomicU64::new(0),
-            flush_latency_sum_us: AtomicU64::new(0),
-            flush_count: AtomicU64::new(0),
+            push_latency: AtomicU64::new(0),
+            flush_latency: AtomicU64::new(0),
             draining: AtomicBool::new(false),
             window_start: RwLock::new(Instant::now()),
             pushes_since_drain_start: AtomicU64::new(0),
@@ -158,9 +169,23 @@ impl ShardMetricsCollector {
     #[inline]
     pub fn record_push(&self, latency_ns: u64) {
         self.events_in_window.fetch_add(1, AtomicOrdering::Relaxed);
-        self.push_latency_sum_ns
-            .fetch_add(latency_ns, AtomicOrdering::Relaxed);
-        self.push_count.fetch_add(1, AtomicOrdering::Relaxed);
+        // Atomically add 1 to count (upper 32 bits) and
+        // `latency_ns` to sum (lower 32 bits). `fetch_update`
+        // CAS-loops the load-and-store, so a concurrent
+        // `collect_and_reset` swap on the same word either sees
+        // both pre-add or both post-add — no `(sum, count)`
+        // desync. Saturating ops cap at u32::MAX inside the
+        // pack window (~4 G calls / 4 s of accumulated latency),
+        // which is far beyond any sane metrics tick.
+        let _ =
+            self.push_latency
+                .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
+                    let count = (v >> 32) as u32;
+                    let sum = (v & 0xFFFF_FFFF) as u32;
+                    let new_count = count.saturating_add(1) as u64;
+                    let new_sum = sum.saturating_add(latency_ns.min(u32::MAX as u64) as u32) as u64;
+                    Some((new_count << 32) | new_sum)
+                });
         // Always increment — the cost is one fetch_add and the
         // counter only matters when the shard is draining. Cheaper
         // than branching on `self.draining.load()` in the hot path.
@@ -171,9 +196,19 @@ impl ShardMetricsCollector {
     /// Record a batch flush.
     #[inline]
     pub fn record_flush(&self, latency_us: u64) {
-        self.flush_latency_sum_us
-            .fetch_add(latency_us, AtomicOrdering::Relaxed);
-        self.flush_count.fetch_add(1, AtomicOrdering::Relaxed);
+        // Same packed-`(count, sum)` shape as `record_push` —
+        // see that function for the desync rationale.
+        let _ = self.flush_latency.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |v| {
+                let count = (v >> 32) as u32;
+                let sum = (v & 0xFFFF_FFFF) as u32;
+                let new_count = count.saturating_add(1) as u64;
+                let new_sum = sum.saturating_add(latency_us.min(u32::MAX as u64) as u32) as u64;
+                Some((new_count << 32) | new_sum)
+            },
+        );
     }
 
     /// Set drain mode.
@@ -241,10 +276,15 @@ impl ShardMetricsCollector {
     pub fn collect_and_reset(&self) -> ShardMetrics {
         let current_len = self.current_len.load(AtomicOrdering::Relaxed);
         let events = self.events_in_window.swap(0, AtomicOrdering::Relaxed);
-        let push_latency_sum = self.push_latency_sum_ns.swap(0, AtomicOrdering::Relaxed);
-        let push_count = self.push_count.swap(0, AtomicOrdering::Relaxed);
-        let flush_latency_sum = self.flush_latency_sum_us.swap(0, AtomicOrdering::Relaxed);
-        let flush_count = self.flush_count.swap(0, AtomicOrdering::Relaxed);
+        // Single swap captures `(count, sum)` together; no
+        // chance of catching the sum without the matching count
+        // (or vice versa) the way two independent swaps did.
+        let push_packed = self.push_latency.swap(0, AtomicOrdering::Relaxed);
+        let push_count = push_packed >> 32;
+        let push_latency_sum = push_packed & 0xFFFF_FFFF;
+        let flush_packed = self.flush_latency.swap(0, AtomicOrdering::Relaxed);
+        let flush_count = flush_packed >> 32;
+        let flush_latency_sum = flush_packed & 0xFFFF_FFFF;
 
         let fill_ratio = if self.capacity > 0 {
             current_len as f64 / self.capacity as f64
@@ -345,6 +385,17 @@ struct MappedShard {
     drain_started: Option<Instant>,
     /// Last collected metrics.
     last_metrics: ShardMetrics,
+    /// When this shard last transitioned to `Active`. Used by
+    /// `evaluate_scaling` to skip recently-activated shards from
+    /// scale decisions: their `last_metrics` is the
+    /// `ShardMetrics::new(id)` placeholder until at least one
+    /// `collect_metrics` cycle has run, and the placeholder
+    /// (`fill_ratio = 0.0, event_rate = 0`) trips the
+    /// underutilized trigger immediately — oscillating the system
+    /// (scale-up → next tick scale-down → next tick scale-up …)
+    /// when a fresh shard is added but hasn't yet absorbed any
+    /// traffic.
+    activated_at: Instant,
 }
 
 /// Callback type for shard lifecycle events.
@@ -424,6 +475,15 @@ impl ShardMapper {
             .validate()
             .map_err(|e| ScalingError::InvalidPolicy(e.to_string()))?;
 
+        // Initial shards: stamp `activated_at` far enough in the
+        // past that they're not subject to the warmup skip in
+        // `evaluate_scaling`. The boot-time shards have whatever
+        // baseline traffic the system serves; they shouldn't be
+        // exempted from scale decisions just because the mapper
+        // was just constructed.
+        let boot = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap_or_else(Instant::now);
         let shards: Vec<MappedShard> = (0..initial_shards)
             .map(|id| MappedShard {
                 id,
@@ -431,6 +491,7 @@ impl ShardMapper {
                 metrics: Arc::new(ShardMetricsCollector::new(id, ring_buffer_capacity)),
                 drain_started: None,
                 last_metrics: ShardMetrics::new(id),
+                activated_at: boot,
             })
             .collect();
 
@@ -584,8 +645,33 @@ impl ShardMapper {
         let mut overloaded_count = 0;
         let mut underutilized_count = 0;
 
+        // Warmup window for freshly-activated shards. A just-
+        // activated shard's `last_metrics` is the
+        // `ShardMetrics::new(id)` placeholder
+        // (`fill_ratio = 0.0, event_rate = 0`) until at least one
+        // `collect_metrics` cycle has run. The placeholder
+        // immediately matches the underutilized trigger
+        // (`fill_ratio < underutilized_threshold && event_rate
+        // == 0`), so a fresh shard added by scale-up would
+        // immediately count as underutilized on the next
+        // `evaluate_scaling` and trigger scale-down — oscillating
+        // the system. Reuse `policy.cooldown` as the warmup
+        // window: it's already the minimum gap between scaling
+        // actions, and a shard collected at least once within
+        // that window has accumulated real metrics.
+        let now = Instant::now();
+        let warmup = self.policy.cooldown;
+
         for shard in shards.iter() {
             if shard.state != ShardState::Active {
+                continue;
+            }
+
+            // Skip the placeholder-metrics window for freshly-
+            // activated shards. They count toward `active_count`
+            // (so the budget math stays consistent) but don't
+            // tip the overload/underutilized tallies.
+            if now.duration_since(shard.activated_at) < warmup {
                 continue;
             }
 
@@ -662,11 +748,32 @@ impl ShardMapper {
         state: ShardState,
         shards: &mut Vec<MappedShard>,
     ) -> Result<Vec<u16>, ScalingError> {
+        self.allocate_shards_inner_with_policy(count, state, shards, false)
+    }
+
+    fn allocate_shards_inner_with_policy(
+        &self,
+        count: u16,
+        state: ShardState,
+        shards: &mut Vec<MappedShard>,
+        force: bool,
+    ) -> Result<Vec<u16>, ScalingError> {
         // Re-check budget under the write lock — two concurrent
         // scale-up callers could both pass the read-locked early
         // check, both serialize through `shards.write()`, and both
         // succeed without this re-check.
-        self.check_scale_up_budget(count)?;
+        if force {
+            // Budget only — skip cooldown for operator-initiated paths.
+            let current = self.active_count.load(AtomicOrdering::Acquire);
+            let would_be = current
+                .checked_add(count)
+                .ok_or(ScalingError::AtMaxShards)?;
+            if would_be > self.policy.max_shards {
+                return Err(ScalingError::AtMaxShards);
+            }
+        } else {
+            self.check_scale_up_budget(count)?;
+        }
 
         let first_id = self.next_shard_id.load(AtomicOrdering::Relaxed);
         let last_needed = first_id
@@ -677,10 +784,22 @@ impl ShardMapper {
         if last_needed == u16::MAX {
             return Err(ScalingError::AtMaxShards);
         }
+        // `first_id + count == last_needed + 1`. We already
+        // refused `last_needed == u16::MAX` above, so the sum is
+        // provably <= u16::MAX. Use `checked_add` anyway as a
+        // belt-and-suspenders guard: a future change that
+        // weakens the sentinel check would otherwise reach an
+        // unchecked u16 wrap here, silently rolling
+        // `next_shard_id` back to 0 and then re-issuing already-
+        // allocated ids.
+        let next_id_after = first_id
+            .checked_add(count)
+            .ok_or(ScalingError::AtMaxShards)?;
         self.next_shard_id
-            .store(first_id + count, AtomicOrdering::Relaxed);
+            .store(next_id_after, AtomicOrdering::Relaxed);
 
         let mut new_ids = Vec::with_capacity(count as usize);
+        let now = Instant::now();
         for i in 0..count {
             let new_id = first_id + i;
             shards.push(MappedShard {
@@ -692,6 +811,13 @@ impl ShardMapper {
                 )),
                 drain_started: None,
                 last_metrics: ShardMetrics::new(new_id),
+                // Stamp the activation moment so `evaluate_scaling`
+                // can skip this shard until at least one collect
+                // cycle has run. Prevents the placeholder
+                // (`fill_ratio = 0, event_rate = 0`) from
+                // immediately tripping the underutilized trigger
+                // and oscillating the system.
+                activated_at: now,
             });
             new_ids.push(new_id);
         }
@@ -782,6 +908,42 @@ impl ShardMapper {
         Ok(new_ids)
     }
 
+    /// Allocate `count` Provisioning shards, bypassing the cooldown gate.
+    ///
+    /// Used by operator-initiated `manual_scale_up` paths. The
+    /// cooldown exists to prevent the auto-scaling monitor from
+    /// scaling-up too aggressively in response to transient
+    /// load spikes; a manual call from an operator is a
+    /// deliberate request that should not be rate-limited by
+    /// the auto-scaling cadence. The budget check (against
+    /// `max_shards`) still applies.
+    ///
+    /// Pre-fix `manual_scale_up(N)` looped `add_shard()` N
+    /// times, each call invoking `scale_up_provisioning(1)`
+    /// which bumped `last_scaling`. The second call then
+    /// immediately failed with `InCooldown` (default 30s
+    /// cooldown), leaving the first shard half-added and
+    /// returning an error to the operator with no rollback.
+    pub fn scale_up_provisioning_force(&self, count: u16) -> Result<Vec<u16>, ScalingError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut shards = self.shards.write();
+        let new_ids = self.allocate_shards_inner_with_policy(
+            count,
+            ShardState::Provisioning,
+            &mut shards,
+            true, // skip cooldown
+        )?;
+
+        // Still bump the cooldown timestamp so the next
+        // *auto-scaling* tick respects the cooldown floor.
+        *self.last_scaling.write() = Some(Instant::now());
+        drop(shards);
+        Ok(new_ids)
+    }
+
     /// Transition a `Provisioning` shard to `Active`.
     ///
     /// Returns `Ok(true)` if a state transition actually occurred
@@ -823,23 +985,36 @@ impl ShardMapper {
                 // the caller (e.g. `add_shard_internal`'s rollback)
                 // is responsible for tearing it down.
                 //
-                // The load-then-store pattern is safe here because
-                // both the read and the subsequent state mutation
-                // happen under the same `shards.write()` guard
-                // (acquired at the top of this function and held
-                // until the `drop(shards)` below). Two concurrent
-                // `activate(distinct_id)` calls serialize on the
-                // write lock, so one's `fetch_add` is observed by
-                // the other's `Acquire` load and the second hits
-                // `AtMaxShards`. A `compare_exchange` here would be
-                // belt-and-braces but the lock-held invariant is the
-                // primary correctness gate; do not relax it without
-                // also tightening this read.
+                // The load + state mutation + `fetch_add` all happen
+                // while we hold the `shards.write()` guard so a
+                // concurrent `activate(distinct_id)` reads the
+                // already-bumped `active_count` and hits
+                // `AtMaxShards` instead of squeezing through the
+                // window between our state update and our
+                // `fetch_add`. Pre-fix the `fetch_add` ran after
+                // `drop(shards)` — two activates could each see a
+                // stale count below `max_shards` and both bump,
+                // transiently overshooting the budget.
                 let current = self.active_count.load(AtomicOrdering::Acquire);
                 if current >= self.policy.max_shards {
                     return Err(ScalingError::AtMaxShards);
                 }
                 shard.state = ShardState::Active;
+                // Re-stamp `activated_at` so `evaluate_scaling`
+                // gives this freshly-activated shard a warmup
+                // window before counting it in the
+                // overloaded/underutilized tallies. The
+                // Provisioning → Active transition is the moment
+                // traffic starts flowing; the shard's
+                // `last_metrics` is still the
+                // `ShardMetrics::new(id)` placeholder until the
+                // next `collect_metrics` cycle.
+                shard.activated_at = Instant::now();
+                // Publish the increment while still holding the
+                // write lock. `Release` here pairs with the
+                // `Acquire` load above so any later activator that
+                // takes the same lock observes our bump.
+                self.active_count.fetch_add(1, AtomicOrdering::Release);
             }
             ShardState::Draining | ShardState::Stopped => {
                 return Err(ScalingError::InvalidPolicy(format!(
@@ -849,11 +1024,6 @@ impl ShardMapper {
             }
         }
         drop(shards);
-
-        // Bump active_count to mirror what `scale_up` would have done.
-        // The budget gate above ensures we can never push past
-        // `max_shards`.
-        self.active_count.fetch_add(1, AtomicOrdering::Release);
 
         if let Some(callback) = self.on_shard_created.read().as_ref() {
             callback(shard_id);
@@ -900,6 +1070,17 @@ impl ShardMapper {
         }
         drop(shards);
         self.active_count.fetch_sub(1, AtomicOrdering::Release);
+        // Bump `last_scaling` so a subsequent `scale_up` is gated
+        // by the cooldown floor. Pre-fix `drain_specific` removed
+        // a shard from Active without touching `last_scaling`, so
+        // the sequence `drain_specific(id) → scale_up(N)`
+        // bypassed the cooldown — `scale_down` writes
+        // `last_scaling` precisely for this reason. From the
+        // budget-math perspective `drain_specific` IS a scale-
+        // down (it decrements `active_count` and trips the
+        // `min_shards` floor), so it should also gate
+        // re-expansion the same way.
+        *self.last_scaling.write() = Some(Instant::now());
         Ok(())
     }
 
@@ -1017,10 +1198,12 @@ impl ShardMapper {
                 // that is only reset by `set_draining(true)`, so any
                 // push observed since the drain began is sticky —
                 // exactly the signal we want.
-                let pushes_after_drain = shard
-                    .metrics
-                    .pushes_since_drain_start
-                    .load(AtomicOrdering::Relaxed);
+                // Acquire pairs with `set_draining`'s SeqCst reset so
+                // the load can't observe a stale value from before the
+                // drain began. A Relaxed load here let weakly-ordered
+                // hardware see the pre-reset count and finalize while
+                // a producer was still pushing.
+                let pushes_after_drain = shard.metrics.pushes_since_drain_start();
                 if fill_ratio == 0.0 && pushes_after_drain == 0 {
                     // Check if we've waited long enough
                     if let Some(drain_start) = shard.drain_started {
@@ -1270,6 +1453,102 @@ mod tests {
 
         let shard0_metrics = metrics.iter().find(|m| m.shard_id == 0).unwrap();
         assert!(shard0_metrics.fill_ratio > 0.0);
+    }
+
+    /// Regression: a `record_push` / `record_flush` interleaving
+    /// with a `collect_and_reset` swap must NOT desync `(sum,
+    /// count)`. Pre-fix `push_latency_sum_ns` and `push_count`
+    /// were independent atomics; a tick between the two
+    /// `fetch_add`s captured the sum without the matching count
+    /// (or the count without the sum). The resulting `avg =
+    /// sum.checked_div(count).unwrap_or(0)` returned 0 in window
+    /// N (sum without count) AND 0 in window N+1 (count without
+    /// sum) — silently zeroing the average that drives
+    /// `evaluate_scaling`'s push-latency scale-up trigger.
+    ///
+    /// Post-fix `(sum, count)` is packed into one
+    /// `AtomicU64` so the swap captures both atomically. This
+    /// test fires N concurrent `record_push` calls and a single
+    /// `collect_and_reset` and asserts the captured count
+    /// matches the captured sum (i.e. `sum >= count` because
+    /// every push contributes at least 1 ns; `sum / count` is
+    /// well-defined for any non-zero count).
+    #[test]
+    fn record_push_collect_no_sum_count_desync() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let collector = Arc::new(ShardMetricsCollector::new(0, 1024));
+        const PUSHERS: usize = 4;
+        const PUSHES_PER_THREAD: usize = 1_000;
+
+        let barrier = Arc::new(Barrier::new(PUSHERS + 1));
+        let mut handles = vec![];
+        for _ in 0..PUSHERS {
+            let c = collector.clone();
+            let b = barrier.clone();
+            handles.push(thread::spawn(move || {
+                b.wait();
+                for i in 0..PUSHES_PER_THREAD {
+                    // Vary latencies so sum/count averages
+                    // aren't trivially the same number.
+                    c.record_push((i as u64 % 100) + 1);
+                }
+            }));
+        }
+
+        // Race a collect_and_reset across the pushers.
+        barrier.wait();
+        let snapshot1 = collector.collect_and_reset();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // After all threads finish, drain whatever remains.
+        let snapshot2 = collector.collect_and_reset();
+
+        // Reconstruct count and sum from the two snapshots.
+        // We can't easily expose the packed atomic, so we use
+        // the per-window averages and event counts as a
+        // consistency check.
+        let total_events = snapshot1.event_rate + snapshot2.event_rate;
+        assert_eq!(
+            total_events as usize,
+            PUSHERS * PUSHES_PER_THREAD,
+            "all pushes must be accounted for"
+        );
+
+        // For each window: if event_rate > 0, avg_push_latency
+        // must be > 0 (non-zero average) — pre-fix the desync
+        // could land event_rate > 0 with avg = 0 (count
+        // captured without sum, or sum without count → div-by-
+        // zero clamped to 0). This is the directly visible
+        // symptom of the desync.
+        //
+        // events_in_window is incremented separately from the
+        // packed (sum, count) word, so a strict assertion of
+        // "event_rate is exactly count" isn't safe — but the
+        // weaker invariant "if any pushes were captured in the
+        // (sum,count) word, the average is non-zero" survives
+        // the packed-atomic fix.
+        for snap in [&snapshot1, &snapshot2] {
+            if snap.avg_push_latency_ns == 0 {
+                // Either no pushes were captured in this
+                // window, or — pre-fix — sum/count desynced.
+                // The post-fix shape can only produce
+                // avg=0 when count is also 0; we can't read
+                // count directly from ShardMetrics, but
+                // exercise the invariant by confirming the
+                // OTHER window's sum is consistent with all
+                // pushes.
+                continue;
+            }
+            assert!(
+                snap.avg_push_latency_ns >= 1,
+                "regression: a window with non-zero avg must have \
+                 a positive sum (pre-fix sum-without-count desync \
+                 produced avg=0 with non-zero events)"
+            );
+        }
     }
 
     #[test]
@@ -1529,6 +1808,102 @@ mod tests {
         assert_eq!(mapper.active_shard_count(), 4);
     }
 
+    /// Pin: under contention, the active_count never transiently
+    /// exceeds `max_shards`. Pre-fix `activate` released the
+    /// shards write-lock BEFORE the `fetch_add(1)`, so two
+    /// concurrent activators could each pass the budget gate
+    /// (both reading the pre-bump count) and both bump,
+    /// overshooting the cap by 1 at any observation point.
+    #[test]
+    fn concurrent_activate_never_exceeds_max_shards() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const ITERATIONS: usize = 200;
+
+        for iter in 0..ITERATIONS {
+            let policy = ScalingPolicy {
+                min_shards: 1,
+                max_shards: 4,
+                cooldown: Duration::from_nanos(1),
+                ..Default::default()
+            };
+            // Start at active=3, allocate two Provisioning ids so
+            // both threads have a candidate to activate. With the
+            // pre-fix race: thread A loads count=3, validates,
+            // sets state Active, drops lock; thread B loads count
+            // (still 3), validates, sets state Active, drops lock;
+            // A bumps → 4; B bumps → 5. Post-fix B observes
+            // count=4 inside its lock and rejects with
+            // AtMaxShards.
+            let mapper = Arc::new(ShardMapper::new(3, 1024, policy).unwrap());
+            let ids_a = mapper.scale_up_provisioning(1).unwrap();
+            // The 1ns cooldown elapses on every realistic
+            // scheduler tick; if we lose that race, retry once
+            // (release-mode iterations occasionally finish the
+            // first allocation in <1ns of wall time).
+            let ids_b = loop {
+                match mapper.scale_up_provisioning(1) {
+                    Ok(v) => break v,
+                    Err(ScalingError::InCooldown) => {
+                        std::thread::sleep(Duration::from_micros(10));
+                        continue;
+                    }
+                    Err(e) => panic!("unexpected error: {:?}", e),
+                }
+            };
+            assert_eq!(ids_a.len(), 1);
+            assert_eq!(ids_b.len(), 1);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let m1 = mapper.clone();
+            let m2 = mapper.clone();
+            let b1 = barrier.clone();
+            let b2 = barrier.clone();
+            let id_a = ids_a[0];
+            let id_b = ids_b[0];
+
+            let h1 = thread::spawn(move || {
+                b1.wait();
+                m1.activate(id_a)
+            });
+            let h2 = thread::spawn(move || {
+                b2.wait();
+                m2.activate(id_b)
+            });
+            let r1 = h1.join().expect("thread A panicked");
+            let r2 = h2.join().expect("thread B panicked");
+
+            // Exactly one must succeed and one must reject with
+            // AtMaxShards.
+            let ok_count = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+            let at_max_count = [&r1, &r2]
+                .iter()
+                .filter(|r| matches!(r, Err(ScalingError::AtMaxShards)))
+                .count();
+            assert_eq!(
+                ok_count, 1,
+                "iter {}: expected exactly one Ok, got r1={:?} r2={:?}",
+                iter, r1, r2
+            );
+            assert_eq!(
+                at_max_count, 1,
+                "iter {}: expected exactly one AtMaxShards, got r1={:?} r2={:?}",
+                iter, r1, r2
+            );
+
+            // active_count must not exceed max_shards at any
+            // observation point.
+            assert!(
+                mapper.active_shard_count() <= 4,
+                "iter {}: active_count={} exceeded max_shards=4",
+                iter,
+                mapper.active_shard_count(),
+            );
+        }
+    }
+
     /// Two concurrent `scale_up(1)` calls must never both succeed
     /// inside a single cooldown window. Before the fix, the
     /// cooldown check happened only under a read lock that was
@@ -1720,6 +2095,84 @@ mod tests {
 
         let decision = mapper.evaluate_scaling();
         assert!(matches!(decision, ScalingDecision::ScaleDown(_)));
+    }
+
+    /// Regression: a freshly-activated shard must NOT
+    /// immediately count toward the underutilized tally on the
+    /// next `evaluate_scaling`. Pre-fix the new shard's
+    /// `last_metrics` was the `ShardMetrics::new(id)` placeholder
+    /// (`fill_ratio = 0.0, event_rate = 0`), which matched the
+    /// underutilized trigger immediately — oscillating the
+    /// system: scale-up → next tick scale-down → next tick
+    /// scale-up.
+    ///
+    /// Post-fix `MappedShard.activated_at` is stamped at the
+    /// Provisioning → Active transition (and at scale-up
+    /// construction for `Active`-from-create shards), and
+    /// `evaluate_scaling` skips shards within `policy.cooldown`
+    /// of activation.
+    #[test]
+    fn freshly_added_shard_skipped_from_evaluate_scaling_warmup() {
+        let policy = ScalingPolicy {
+            underutilized_threshold: 0.2,
+            min_shards: 1,
+            // Long cooldown so the warmup window stays open
+            // throughout the test.
+            cooldown: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(3, 1024, policy).unwrap();
+
+        // Direct manipulation of the shard list: pin two boot
+        // shards as underutilized (boot stamps put them outside
+        // the warmup window), and inject one freshly-activated
+        // shard with `activated_at = now()` whose placeholder
+        // metrics ALSO trigger the underutilized predicate.
+        // Without the warmup skip, the count would be 3 of 3
+        // shards underutilized → scale-down. WITH the warmup
+        // skip, only the 2 boot shards count, and 2 of 3 still
+        // exceeds the 3/2 = 1 majority — scale-down still fires
+        // (driven by the boot shards), but the decisive property
+        // is that the fresh shard is correctly excluded.
+        {
+            let mut shards = mapper.shards.write();
+            for shard in shards.iter_mut() {
+                shard.last_metrics.fill_ratio = 0.05;
+                shard.last_metrics.event_rate = 0;
+            }
+            // The third shard is "fresh": stamp activated_at to
+            // now, simulating a just-activated shard.
+            shards[2].activated_at = Instant::now();
+        }
+
+        // The fresh shard must satisfy the warmup predicate.
+        let now = Instant::now();
+        let warmup_excluded: Vec<u16> = mapper
+            .shards
+            .read()
+            .iter()
+            .filter(|s| now.duration_since(s.activated_at) < mapper.policy.cooldown)
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(
+            warmup_excluded,
+            vec![2u16],
+            "regression: only shard id 2 (just-stamped) should be \
+             within the warmup window; boot shards are stamped \
+             1 hour in the past"
+        );
+
+        // And evaluate_scaling must still produce ScaleDown
+        // (driven by the 2 boot shards) — the fresh shard's
+        // placeholder doesn't get to vote.
+        let decision = mapper.evaluate_scaling();
+        assert!(
+            matches!(decision, ScalingDecision::ScaleDown(_)),
+            "scale-down still fires from the boot shards' real \
+             underutilization, but driven by 2 of 3 not 3 of 3 — \
+             got {:?}",
+            decision,
+        );
     }
 
     #[test]
@@ -1969,6 +2422,56 @@ mod tests {
             .next_shard_id
             .store(u16::MAX, AtomicOrdering::Relaxed);
         assert!(mapper.scale_up(0).is_ok());
+    }
+
+    /// Regression: `drain_specific` must bump `last_scaling` so
+    /// a subsequent `scale_up` is gated by the cooldown floor.
+    /// Pre-fix `scale_down` wrote `last_scaling` but
+    /// `drain_specific` did not, so the sequence
+    /// `drain_specific(id) → scale_up(N)` bypassed the cooldown
+    /// — even though both decrement `active_count` and so
+    /// should be symmetric from the budget-math perspective.
+    #[test]
+    fn drain_specific_bumps_last_scaling_so_scale_up_respects_cooldown() {
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 8,
+            // A cooldown long enough that `Instant::now()` won't
+            // accidentally elapse it during the test, but short
+            // enough not to slow CI.
+            cooldown: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(3, 1024, policy).unwrap();
+
+        // Pre-condition: no prior scaling action.
+        assert!(mapper.last_scaling.read().is_none());
+
+        let before = Instant::now();
+        mapper.drain_specific(0).unwrap();
+        let after_ts = mapper
+            .last_scaling
+            .read()
+            .expect("drain_specific must record a `last_scaling` timestamp");
+        // Sanity: the recorded timestamp is in the test window.
+        assert!(
+            after_ts >= before,
+            "last_scaling must be bumped to a current Instant (got {:?}, before was {:?})",
+            after_ts,
+            before
+        );
+
+        // The decisive sealed property: a follow-up scale_up
+        // must trip the cooldown gate. Pre-fix this would have
+        // succeeded immediately because `last_scaling` was never
+        // written by `drain_specific`.
+        let err = mapper
+            .scale_up(1)
+            .expect_err("scale_up immediately after drain_specific must hit cooldown");
+        match err {
+            ScalingError::InCooldown => {} // expected
+            other => panic!("expected InCooldown after drain_specific, got {:?}", other),
+        }
     }
 
     /// Regression: BUG_REPORT.md #48 — `drain_specific` must

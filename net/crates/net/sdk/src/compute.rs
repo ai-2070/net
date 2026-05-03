@@ -63,9 +63,9 @@ use ::net::adapter::net::identity::PermissionToken;
 
 use ::net::adapter::net::behavior::capability::CapabilitySet;
 use ::net::adapter::net::compute::{
-    orchestrator::wire as migration_wire, DaemonFactoryRegistry, DaemonHost, DaemonRegistry,
-    MigrationMessage, MigrationOrchestrator, MigrationSourceHandler, MigrationTargetHandler,
-    Scheduler,
+    chunk_snapshot, orchestrator::wire as migration_wire, DaemonFactoryRegistry, DaemonHost,
+    DaemonRegistry, MigrationMessage, MigrationOrchestrator, MigrationSourceHandler,
+    MigrationTargetHandler, Scheduler,
 };
 use ::net::adapter::net::identity::EntityId;
 use ::net::adapter::net::subprotocol::{
@@ -1363,57 +1363,35 @@ impl DaemonRuntime {
         if let Ok(mut map) = self.inner.recent_failures.lock() {
             map.remove(&origin_hash);
         }
-        let mut first_msg = self
+        let msgs = self
             .inner
             .orchestrator
             .start_migration(origin_hash, source_node, target_node)
             .map_err(DaemonError::Migration)?;
 
-        // Local-source path: `start_migration` builds `SnapshotReady`
-        // synchronously from the local registry. If the caller asked
-        // for identity transport, seal the envelope HERE — the
-        // dispatcher's source-side seal only fires on the TakeSnapshot
-        // path (remote source). Decoding + re-encoding isolates the
-        // payload cleanly.
-        if opts.transport_identity {
-            if let MigrationMessage::SnapshotReady {
-                ref mut snapshot_bytes,
-                ..
-            } = first_msg
-            {
-                // `transport_identity: true` is a strict opt-in:
-                // prerequisites-missing (e.g. NKpsk0-responder)
-                // surfaces as `Err` and aborts the migration, not a
-                // silent downgrade to unsealed. `Ok(None)` is
-                // reserved for "snapshot already carries an
-                // envelope" (not a downgrade, just no-op here).
-                match self.maybe_seal_local_snapshot(origin_hash, target_node, snapshot_bytes) {
-                    Ok(Some(sealed)) => *snapshot_bytes = sealed,
-                    Ok(None) => {}
-                    Err(e) => {
-                        // The orchestrator record was created by the
-                        // preceding `start_migration` call — roll it
-                        // back so a retry starts from phase 0.
-                        let _ = self
-                            .inner
-                            .orchestrator
-                            .abort_migration(origin_hash, format!("envelope seal failed: {e}"));
-                        return Err(e);
-                    }
-                }
-            }
-        }
+        // Local-source path: `start_migration` builds chunked
+        // `SnapshotReady` messages synchronously from the local
+        // registry. If the caller asked for identity transport, seal
+        // the envelope HERE — the dispatcher's source-side seal only
+        // fires on the TakeSnapshot path (remote source). Sealing
+        // operates on the whole snapshot, so reassemble the chunks,
+        // seal, and rechunk.
+        let msgs = if opts.transport_identity {
+            self.maybe_seal_chunked_snapshot(origin_hash, target_node, msgs)
+                .await?
+        } else {
+            msgs
+        };
 
-        // Send the first message to the appropriate node. `start_migration`
-        // returns `TakeSnapshot` when source is remote, `SnapshotReady`
-        // when source is local.
-        let (dest_node, payload) = match &first_msg {
-            MigrationMessage::TakeSnapshot { target_node: _, .. } => (source_node, &first_msg),
-            MigrationMessage::SnapshotReady { .. } => (target_node, &first_msg),
-            other => {
-                // `start_migration` on the core orchestrator is
-                // documented to return one of these two variants;
-                // anything else is a protocol bug. Abort + surface.
+        // Determine dest_node from the first message variant and
+        // send all messages in order. `start_migration` returns
+        // `TakeSnapshot` (single message) when source is remote, or
+        // a non-empty run of `SnapshotReady` chunks when source is
+        // local.
+        let dest_node = match msgs.first() {
+            Some(MigrationMessage::TakeSnapshot { .. }) => source_node,
+            Some(MigrationMessage::SnapshotReady { .. }) => target_node,
+            Some(other) => {
                 let _ = self
                     .inner
                     .orchestrator
@@ -1425,14 +1403,25 @@ impl DaemonRuntime {
                     ),
                 )));
             }
+            None => {
+                let _ = self
+                    .inner
+                    .orchestrator
+                    .abort_migration(origin_hash, "orchestrator returned no messages".into());
+                return Err(DaemonError::Migration(MigrationError::StateFailed(
+                    "orchestrator returned no migration messages".into(),
+                )));
+            }
         };
 
-        if let Err(e) = self.send_migration_message(dest_node, payload).await {
-            let _ = self
-                .inner
-                .orchestrator
-                .abort_migration(origin_hash, format!("initial send failed: {e}"));
-            return Err(e);
+        for msg in &msgs {
+            if let Err(e) = self.send_migration_message(dest_node, msg).await {
+                let _ = self
+                    .inner
+                    .orchestrator
+                    .abort_migration(origin_hash, format!("initial send failed: {e}"));
+                return Err(e);
+            }
         }
 
         Ok(MigrationHandle {
@@ -1516,6 +1505,71 @@ impl DaemonRuntime {
                     "identity envelope seal failed for daemon {daemon_origin:#x}: {e}"
                 )))
             })
+    }
+
+    /// Reassemble chunked `SnapshotReady` messages into the full
+    /// snapshot, seal the identity envelope, and rechunk.
+    ///
+    /// `start_migration` returns chunked `SnapshotReady` messages on
+    /// the local-source path; sealing operates on the whole snapshot
+    /// so chunks must be reassembled first. If `msgs` does not start
+    /// with `SnapshotReady` (i.e. remote-source `TakeSnapshot` path)
+    /// the messages are returned unchanged — the dispatcher seals
+    /// on that path.
+    ///
+    /// On any seal failure the orchestrator record is aborted so a
+    /// retry starts from phase 0.
+    async fn maybe_seal_chunked_snapshot(
+        &self,
+        origin_hash: u32,
+        target_node: u64,
+        mut msgs: Vec<MigrationMessage>,
+    ) -> Result<Vec<MigrationMessage>, DaemonError> {
+        if !matches!(msgs.first(), Some(MigrationMessage::SnapshotReady { .. })) {
+            return Ok(msgs);
+        }
+
+        let seq_through = match msgs.first() {
+            Some(MigrationMessage::SnapshotReady { seq_through, .. }) => *seq_through,
+            _ => unreachable!("checked by matches! above"),
+        };
+
+        // `chunk_snapshot` emits chunks in `chunk_index` order, but
+        // sort defensively in case a future caller hands us a
+        // pre-mixed Vec.
+        msgs.sort_by_key(|m| match m {
+            MigrationMessage::SnapshotReady { chunk_index, .. } => *chunk_index,
+            _ => 0,
+        });
+        let mut reassembled: Vec<u8> = Vec::new();
+        for m in &msgs {
+            if let MigrationMessage::SnapshotReady { snapshot_bytes, .. } = m {
+                reassembled.extend_from_slice(snapshot_bytes);
+            }
+        }
+
+        // `transport_identity: true` is a strict opt-in:
+        // prerequisites-missing (e.g. NKpsk0-responder) surfaces as
+        // `Err` and aborts the migration, not a silent downgrade to
+        // unsealed. `Ok(None)` is reserved for "snapshot already
+        // carries an envelope" — return the original chunks.
+        match self.maybe_seal_local_snapshot(origin_hash, target_node, &reassembled) {
+            Ok(Some(sealed)) => chunk_snapshot(origin_hash, sealed, seq_through).map_err(|e| {
+                let _ = self
+                    .inner
+                    .orchestrator
+                    .abort_migration(origin_hash, format!("rechunk after seal failed: {e}"));
+                DaemonError::Migration(e)
+            }),
+            Ok(None) => Ok(msgs),
+            Err(e) => {
+                let _ = self
+                    .inner
+                    .orchestrator
+                    .abort_migration(origin_hash, format!("envelope seal failed: {e}"));
+                Err(e)
+            }
+        }
     }
 
     async fn send_migration_message(
@@ -2005,41 +2059,25 @@ impl MigrationHandle {
     /// [`DaemonRuntime::start_migration_with`] but without building
     /// a new handle (we keep the existing one).
     async fn reinitiate_attempt(&self) -> Result<(), DaemonError> {
-        let mut first_msg = self
+        let msgs = self
             .runtime
             .inner
             .orchestrator
             .start_migration(self.origin_hash, self.source_node, self.target_node)
             .map_err(DaemonError::Migration)?;
 
-        if self.opts.transport_identity {
-            if let MigrationMessage::SnapshotReady {
-                ref mut snapshot_bytes,
-                ..
-            } = first_msg
-            {
-                match self.runtime.maybe_seal_local_snapshot(
-                    self.origin_hash,
-                    self.target_node,
-                    snapshot_bytes,
-                ) {
-                    Ok(Some(sealed)) => *snapshot_bytes = sealed,
-                    Ok(None) => {}
-                    Err(e) => {
-                        let _ = self.runtime.inner.orchestrator.abort_migration(
-                            self.origin_hash,
-                            format!("retry envelope seal failed: {e}"),
-                        );
-                        return Err(e);
-                    }
-                }
-            }
-        }
+        let msgs = if self.opts.transport_identity {
+            self.runtime
+                .maybe_seal_chunked_snapshot(self.origin_hash, self.target_node, msgs)
+                .await?
+        } else {
+            msgs
+        };
 
-        let (dest_node, payload) = match &first_msg {
-            MigrationMessage::TakeSnapshot { .. } => (self.source_node, &first_msg),
-            MigrationMessage::SnapshotReady { .. } => (self.target_node, &first_msg),
-            other => {
+        let dest_node = match msgs.first() {
+            Some(MigrationMessage::TakeSnapshot { .. }) => self.source_node,
+            Some(MigrationMessage::SnapshotReady { .. }) => self.target_node,
+            Some(other) => {
                 let _ = self
                     .runtime
                     .inner
@@ -2049,11 +2087,21 @@ impl MigrationHandle {
                     format!("unexpected retry initial message: {other:?}"),
                 )));
             }
+            None => {
+                let _ = self.runtime.inner.orchestrator.abort_migration(
+                    self.origin_hash,
+                    "orchestrator returned no retry messages".into(),
+                );
+                return Err(DaemonError::Migration(MigrationError::StateFailed(
+                    "orchestrator returned no migration messages on retry".into(),
+                )));
+            }
         };
 
-        self.runtime
-            .send_migration_message(dest_node, payload)
-            .await
+        for msg in &msgs {
+            self.runtime.send_migration_message(dest_node, msg).await?;
+        }
+        Ok(())
     }
 
     /// Pop the most recent `MigrationFailureReason` the dispatcher

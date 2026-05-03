@@ -115,6 +115,19 @@ impl DaemonBindings {
             return None;
         }
         let count = cursor.get_u32_le() as usize;
+        // Bound the pre-allocation against remaining bytes. Each
+        // subscription needs at minimum 11 bytes on the wire
+        // (publisher u64 + name_len u16 + zero name bytes +
+        // token_flag u8). A peer claiming `count = u32::MAX`
+        // would otherwise force a ~96 GiB `Vec::with_capacity`
+        // allocation before any per-entry validation runs —
+        // attacker-controlled DoS on the migration target. Reject
+        // counts that obviously cannot be satisfied by the
+        // remaining bytes.
+        const MIN_BINDING_SIZE: usize = 11;
+        if count > cursor.remaining() / MIN_BINDING_SIZE {
+            return None;
+        }
         let mut subscriptions = Vec::with_capacity(count);
         for _ in 0..count {
             if cursor.remaining() < 8 + 2 {
@@ -249,5 +262,43 @@ mod tests {
         buf.extend_from_slice(name);
         buf.put_u8(0x7F); // invalid flag
         assert!(DaemonBindings::from_bytes(&buf).is_none());
+    }
+
+    /// Pin: an attacker who declares a `count` larger than the
+    /// remaining bytes can support is rejected immediately —
+    /// before `Vec::with_capacity(count)` can pre-allocate
+    /// gigabytes of memory. Pre-fix `count = u32::MAX` would
+    /// force a ~96 GiB allocation on the migration target on
+    /// any peer-supplied snapshot, before any per-entry
+    /// validation ran.
+    #[test]
+    fn rejects_count_exceeding_remaining_bytes() {
+        let mut buf = Vec::new();
+        // Declare a huge count but provide no entries.
+        buf.put_u32_le(u32::MAX);
+        // No further bytes — clearly cannot satisfy u32::MAX × 11
+        // bytes of binding data.
+        assert!(DaemonBindings::from_bytes(&buf).is_none());
+
+        // Even count = 1_000_000 with only a few hundred bytes is
+        // rejected, well before the per-entry parse loop.
+        let mut buf = Vec::new();
+        buf.put_u32_le(1_000_000);
+        buf.extend_from_slice(&[0u8; 256]);
+        assert!(DaemonBindings::from_bytes(&buf).is_none());
+
+        // Boundary: a `count` consistent with the remaining bytes
+        // is admitted. 1 binding requires at minimum 11 bytes
+        // (8 publisher + 2 name_len + 0 name + 1 flag).
+        let mut buf = Vec::new();
+        buf.put_u32_le(1);
+        buf.put_u64_le(0);
+        buf.put_u16_le(0); // empty name — caught by ChannelName::new later
+        buf.put_u8(0);
+        // ChannelName::new("") rejects, so the parse fails on the
+        // *name* check, not the count check — that's correct, the
+        // pre-allocation gate let us through to the real
+        // validation.
+        let _ = DaemonBindings::from_bytes(&buf);
     }
 }

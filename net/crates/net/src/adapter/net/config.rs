@@ -96,12 +96,16 @@ impl NetAdapterConfig {
     /// Default handshake timeout
     pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Upper bound on `packet_pool_size`. Pre-fix this
-    /// was unbounded, so a typo'd `with_pool_size(1_000_000_000)`
-    /// walked past validate() and OOMed at first allocation. The
-    /// 1 << 20 (1 048 576) cap is far above any realistic
-    /// production setting; the default is 64.
-    pub const MAX_PACKET_POOL_SIZE: usize = 1 << 20;
+    /// Upper bound on `packet_pool_size`. Pre-fix this was 1 << 20
+    /// (1 048 576), which sounds defensive but `ThreadLocalPool::
+    /// with_local_capacity` eagerly pre-allocates `size`
+    /// `PacketBuilder` instances of ~16 KB each — at the old ceiling
+    /// that's ~16 GiB up-front per session, a guaranteed OOM. The
+    /// cap was intended to *prevent* OOM; pre-fix it just postponed
+    /// the death by one validation step. 16 384 is well past every
+    /// realistic production setting (the default is 64) while
+    /// bounding the worst-case at ~256 MiB.
+    pub const MAX_PACKET_POOL_SIZE: usize = 1 << 14;
 
     /// Upper bound on `handshake_retries`. Pre-fix
     /// unbounded; a misconfigured large value just took forever to

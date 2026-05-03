@@ -45,11 +45,37 @@
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 /// Opaque handle for the dedup helper. Crossed as `void*` from C.
 pub struct RedisStreamDedupHandle {
     inner: Mutex<crate::adapter::RedisStreamDedup>,
+}
+
+/// Run an FFI body under `catch_unwind`. With `panic = "unwind"`
+/// (Rust's default), any panic inside an `extern "C"` function would
+/// be UB across the cgo / N-API / cffi boundary. The shim catches
+/// the unwind, logs at error level, and returns a caller-supplied
+/// fallback value.
+///
+/// The body is wrapped in `AssertUnwindSafe` because every entry
+/// point here is FFI-style — the work is short, side-effect-only
+/// against handles owned externally, and a panic mid-function leaves
+/// no observable Rust state for the caller to misuse afterwards.
+#[inline]
+fn ffi_guard<R>(name: &'static str, fallback: R, f: impl FnOnce() -> R) -> R {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::error!(
+                ffi_function = name,
+                "panic caught in net_redis_dedup FFI; returning fallback to avoid \
+                 UB across the C boundary",
+            );
+            fallback
+        }
+    }
 }
 
 /// Create a helper. `capacity == 0` means use the default (4096).
@@ -59,27 +85,31 @@ pub struct RedisStreamDedupHandle {
 /// process (same as every other crate-internal `Box::new` path).
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redis_dedup_new(capacity: usize) -> *mut RedisStreamDedupHandle {
-    let inner = if capacity == 0 {
-        crate::adapter::RedisStreamDedup::new()
-    } else {
-        crate::adapter::RedisStreamDedup::with_capacity(capacity)
-    };
-    Box::into_raw(Box::new(RedisStreamDedupHandle {
-        inner: Mutex::new(inner),
-    }))
+    ffi_guard("net_redis_dedup_new", std::ptr::null_mut(), || {
+        let inner = if capacity == 0 {
+            crate::adapter::RedisStreamDedup::new()
+        } else {
+            crate::adapter::RedisStreamDedup::with_capacity(capacity)
+        };
+        Box::into_raw(Box::new(RedisStreamDedupHandle {
+            inner: Mutex::new(inner),
+        }))
+    })
 }
 
 /// Free a helper handle. NULL is a no-op.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redis_dedup_free(handle: *mut RedisStreamDedupHandle) {
-    if handle.is_null() {
-        return;
-    }
-    // Safety: caller upheld the handle-ownership contract documented
-    // on `net_redis_dedup_new`.
-    unsafe {
-        drop(Box::from_raw(handle));
-    }
+    ffi_guard("net_redis_dedup_free", (), || {
+        if handle.is_null() {
+            return;
+        }
+        // Safety: caller upheld the handle-ownership contract documented
+        // on `net_redis_dedup_new`.
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    })
 }
 
 /// Test-and-insert. Returns 1 on duplicate, 0 on new, negative on
@@ -90,88 +120,98 @@ pub extern "C" fn net_redis_dedup_is_duplicate(
     handle: *mut RedisStreamDedupHandle,
     dedup_id: *const c_char,
 ) -> c_int {
-    if handle.is_null() || dedup_id.is_null() {
-        return -1;
-    }
-    // Safety: caller-supplied null-terminated C string.
-    let id = unsafe { CStr::from_ptr(dedup_id) };
-    let Ok(id_str) = id.to_str() else {
-        return -2;
-    };
-    // Safety: handle is non-NULL and points at a `Box`-allocated
-    // `RedisStreamDedupHandle` per the constructor contract.
-    let h = unsafe { &*handle };
-    let mut guard = h
-        .inner
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard.is_duplicate(id_str) {
-        1
-    } else {
-        0
-    }
+    ffi_guard("net_redis_dedup_is_duplicate", -1, || {
+        if handle.is_null() || dedup_id.is_null() {
+            return -1;
+        }
+        // Safety: caller-supplied null-terminated C string.
+        let id = unsafe { CStr::from_ptr(dedup_id) };
+        let Ok(id_str) = id.to_str() else {
+            return -2;
+        };
+        // Safety: handle is non-NULL and points at a `Box`-allocated
+        // `RedisStreamDedupHandle` per the constructor contract.
+        let h = unsafe { &*handle };
+        let mut guard = h
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_duplicate(id_str) {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// Number of distinct ids currently tracked. Returns 0 on NULL
 /// handle (mirrors the "no ids" semantic).
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redis_dedup_len(handle: *mut RedisStreamDedupHandle) -> usize {
-    if handle.is_null() {
-        return 0;
-    }
-    let h = unsafe { &*handle };
-    let guard = h
-        .inner
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.len()
+    ffi_guard("net_redis_dedup_len", 0, || {
+        if handle.is_null() {
+            return 0;
+        }
+        let h = unsafe { &*handle };
+        let guard = h
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.len()
+    })
 }
 
 /// Configured maximum capacity. Returns 0 on NULL handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redis_dedup_capacity(handle: *mut RedisStreamDedupHandle) -> usize {
-    if handle.is_null() {
-        return 0;
-    }
-    let h = unsafe { &*handle };
-    let guard = h
-        .inner
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.capacity()
+    ffi_guard("net_redis_dedup_capacity", 0, || {
+        if handle.is_null() {
+            return 0;
+        }
+        let h = unsafe { &*handle };
+        let guard = h
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.capacity()
+    })
 }
 
 /// Returns 1 if no ids are tracked, 0 if the helper has at least
 /// one id, -1 on NULL handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redis_dedup_is_empty(handle: *mut RedisStreamDedupHandle) -> c_int {
-    if handle.is_null() {
-        return -1;
-    }
-    let h = unsafe { &*handle };
-    let guard = h
-        .inner
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard.is_empty() {
-        1
-    } else {
-        0
-    }
+    ffi_guard("net_redis_dedup_is_empty", -1, || {
+        if handle.is_null() {
+            return -1;
+        }
+        let h = unsafe { &*handle };
+        let guard = h
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_empty() {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// Clear all tracked ids. NULL is a no-op.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redis_dedup_clear(handle: *mut RedisStreamDedupHandle) {
-    if handle.is_null() {
-        return;
-    }
-    let h = unsafe { &*handle };
-    let mut guard = h
-        .inner
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.clear();
+    ffi_guard("net_redis_dedup_clear", (), || {
+        if handle.is_null() {
+            return;
+        }
+        let h = unsafe { &*handle };
+        let mut guard = h
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.clear();
+    })
 }
 
 #[cfg(test)]
@@ -184,6 +224,28 @@ mod tests {
     use super::*;
     use std::ffi::CString;
     use std::ptr;
+
+    /// `ffi_guard` must catch panics rather than letting them
+    /// unwind across the `extern "C"` boundary. With `panic =
+    /// "unwind"` (the Rust default for `cdylib`), an uncaught
+    /// panic crossing into cgo / N-API is undefined behavior.
+    /// Pin the catch-and-fallback shape so a regression where the
+    /// guard is removed (or `panic = "abort"` is the only line of
+    /// defense) is surfaced by the test rather than discovered
+    /// in a downstream binding's segfault.
+    #[test]
+    fn ffi_guard_catches_panic_and_returns_fallback() {
+        // The `f` closure panics; the guard must catch and return
+        // the supplied fallback (-42).
+        let v = ffi_guard("test_guard", -42i32, || {
+            panic!("intentional FFI panic");
+        });
+        assert_eq!(v, -42);
+
+        // Sanity: a non-panicking body returns its own value.
+        let v = ffi_guard("test_guard", 0i32, || 7);
+        assert_eq!(v, 7);
+    }
 
     #[test]
     fn null_handle_returns_negative() {

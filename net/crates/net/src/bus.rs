@@ -54,6 +54,18 @@ pub struct EventBus {
     adapter: Arc<dyn Adapter>,
     /// Poll merger for cross-shard consumption.
     poll_merger: arc_swap::ArcSwap<PollMerger>,
+    /// Serializes the `shard_manager.shard_ids() → poll_merger.store`
+    /// block in `add_shard_internal` / `remove_shard_internal`.
+    /// Without this lock, two callers (e.g. scaling-monitor
+    /// add_shard racing manual_scale_down's remove_shard) read the
+    /// shard ids snapshot at slightly different points and then
+    /// race on the `arc_swap.store`. The write that lands second
+    /// can clobber the more-current view: T1 reads `{0..5}`, T2
+    /// reads `{1..4}`, T2 stores `{1..4}`, T1 stores `{0..5}` —
+    /// the published merger then routes polls to the just-removed
+    /// shard 0 until the next topology change repairs the
+    /// snapshot.
+    poll_merger_swap_lock: parking_lot::Mutex<()>,
     /// Per-shard worker handles. Stored separately so shutdown can
     /// await drain workers *before* batch workers — the drain
     /// worker's final sweep races the batch worker's exit
@@ -336,6 +348,7 @@ impl EventBus {
             shard_manager,
             adapter,
             poll_merger,
+            poll_merger_swap_lock: parking_lot::Mutex::new(()),
             batch_workers: parking_lot::Mutex::new(batch_workers),
             batch_senders: parking_lot::RwLock::new(batch_senders),
             shutdown,
@@ -414,11 +427,26 @@ impl EventBus {
     ///   3. `activate_shard()` flips state to `Active`. Only now
     ///      does `select_shard` start routing producer pushes.
     async fn add_shard_internal(&self) -> Result<u16, AdapterError> {
+        self.add_shard_internal_with_cooldown_policy(false).await
+    }
+
+    /// Like [`add_shard_internal`] but bypasses the auto-scaling
+    /// cooldown. See [`ShardManager::add_shard_force`].
+    async fn add_shard_internal_force(&self) -> Result<u16, AdapterError> {
+        self.add_shard_internal_with_cooldown_policy(true).await
+    }
+
+    async fn add_shard_internal_with_cooldown_policy(
+        &self,
+        force: bool,
+    ) -> Result<u16, AdapterError> {
         // Step 1: provisioning add — not yet selectable.
-        let new_id = self
-            .shard_manager
-            .add_shard()
-            .map_err(|e| AdapterError::Fatal(e.to_string()))?;
+        let new_id = if force {
+            self.shard_manager.add_shard_force()
+        } else {
+            self.shard_manager.add_shard()
+        }
+        .map_err(|e| AdapterError::Fatal(e.to_string()))?;
 
         // Step 2: spawn workers and register the sender.
         let (tx, rx) = mpsc::channel::<Vec<crate::event::InternalEvent>>(1024);
@@ -531,6 +559,17 @@ impl EventBus {
             // detached task can't observe new work and will exit
             // on its next loop iteration.
             let workers = self.batch_workers.lock().remove(&new_id);
+            // `worker_detached` is set when either join times out
+            // — the worker is still running on a leaked
+            // JoinHandle. In that case the `next_sequence` atomic
+            // is no longer a reliable upper bound: the detached
+            // worker may publish a final batch whose msg-ids land
+            // in the same `[next_sequence..N]` range we'd use for
+            // the stranded-flush, producing duplicate XADDs or
+            // JetStream dedup hits. Skip the stranded-flush when
+            // detached and surface the loss explicitly so the
+            // operator sees it.
+            let mut worker_detached = false;
             let final_next_sequence = if let Some(workers) = workers {
                 let bound = self.config.adapter_timeout.saturating_mul(2);
                 match tokio::time::timeout(bound, workers.drain).await {
@@ -548,6 +587,7 @@ impl EventBus {
                             timeout_ms = bound.as_millis() as u64,
                             "drain worker did not exit within timeout on activate-failure rollback; detaching"
                         );
+                        worker_detached = true;
                     }
                 }
                 match tokio::time::timeout(bound, workers.batch).await {
@@ -565,6 +605,7 @@ impl EventBus {
                             timeout_ms = bound.as_millis() as u64,
                             "BatchWorker did not exit within timeout on activate-failure rollback; detaching"
                         );
+                        worker_detached = true;
                     }
                 }
                 workers.next_sequence.load(AtomicOrdering::Acquire)
@@ -575,8 +616,30 @@ impl EventBus {
             // 4. Dispatch any stranded events as a single-shot
             //    batch so they reach durable storage with the
             //    correct sequence-id segment. Identical to the
-            //    `remove_shard_internal` teardown.
-            if !stranded.is_empty() {
+            //    `remove_shard_internal` teardown — but only when
+            //    the worker actually exited. If it timed out and
+            //    is still running on a leaked handle, dispatching
+            //    here would emit msg-ids overlapping the worker's
+            //    final flush; surface the events as dropped
+            //    instead so the duplicate-on-the-wire hazard is
+            //    avoided.
+            if !stranded.is_empty() && worker_detached {
+                let count = stranded.len();
+                self.stats
+                    .events_dropped
+                    .fetch_add(count as u64, AtomicOrdering::Relaxed);
+                self.stats
+                    .shutdown_was_lossy
+                    .store(true, AtomicOrdering::Release);
+                tracing::error!(
+                    shard_id = new_id,
+                    count,
+                    "activate-failure rollback: skipping stranded-flush \
+                     because a worker JoinHandle timed out and may still \
+                     be running; events would collide with the detached \
+                     worker's final batch on the wire. Counted as dropped."
+                );
+            } else if !stranded.is_empty() {
                 let count = stranded.len();
                 let batch = crate::event::Batch::with_nonce(
                     new_id,
@@ -617,11 +680,18 @@ impl EventBus {
             return Err(AdapterError::Fatal(e.to_string()));
         }
 
-        // Update poll merger with the post-add id set.
-        self.poll_merger.store(Arc::new(PollMerger::new(
-            self.adapter.clone(),
-            self.shard_manager.shard_ids(),
-        )));
+        // Update poll merger with the post-add id set. Hold
+        // `poll_merger_swap_lock` across the snapshot-and-store so a
+        // concurrent remove_shard can't sneak between our `shard_ids()`
+        // read and our `arc_swap.store` and clobber the published view
+        // with a stale snapshot.
+        {
+            let _swap_guard = self.poll_merger_swap_lock.lock();
+            self.poll_merger.store(Arc::new(PollMerger::new(
+                self.adapter.clone(),
+                self.shard_manager.shard_ids(),
+            )));
+        }
 
         tracing::info!(shard_id = new_id, "Added new shard");
         Ok(new_id)
@@ -672,42 +742,63 @@ impl EventBus {
         // via the standard `dispatch_batch` path with their PROPER
         // `next_sequence` values, and exits.
         //
-        // Await both handles before constructing the stranded
-        // batch. Dropping the `JoinHandle`s without await would let
-        // a draining shard whose ring buffer transiently emptied
-        // finalize and remove while the BatchWorker still had
-        // events in its `current_batch` or in the mpsc channel —
-        // those events would be dispatched (the worker keeps
-        // running on a dropped handle) but their dispatch could
-        // overlap with this function's own stranded-flush, racing
-        // through JetStream dedup with their msg-ids. Awaiting
-        // first means we observe a quiescent worker before
-        // constructing the stranded batch.
+        // Await order: drain first, then batch. The drain worker's
+        // `Some(N>0)` arm `mem::replace`s scratch into a batch and
+        // `sender.send(batch).await`s it; that send must complete
+        // (or fail) before drain breaks. The batch worker's
+        // `Ok(None)` arm runs after the sender drops and flushes
+        // any pending batch. Awaiting in the reverse order would
+        // park here forever: the batch worker's `recv()` only
+        // returns `None` once every sender clone (including the
+        // drain worker's) has dropped.
+        //
+        // Both awaits are bounded by `2 × adapter_timeout` so a
+        // worker parked inside a slow adapter call cannot pin
+        // teardown indefinitely. A timeout leaks the JoinHandle —
+        // acceptable because step 1 already removed the bus-side
+        // sender and step 2 unmapped the shard, so the detached
+        // task can't observe new work and will exit on its next
+        // loop iteration.
         let workers = self.batch_workers.lock().remove(&shard_id);
         let final_next_sequence = if let Some(workers) = workers {
-            // Errors here mean the task panicked or was cancelled.
-            // We log and proceed — the stranded-flush still runs
-            // either way, and the atomic was last written under the
-            // worker's last successful flush so it remains a valid
-            // upper bound (just possibly stale by one batch's worth
-            // of events the worker never finished dispatching).
-            if let Err(e) = workers.batch.await {
-                tracing::warn!(
-                    shard_id,
-                    error = %e,
-                    "BatchWorker JoinHandle errored on await; \
-                     proceeding with stranded-flush using last \
-                     published next_sequence",
-                );
+            let bound = self.config.adapter_timeout.saturating_mul(2);
+            match tokio::time::timeout(bound, workers.drain).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        shard_id,
+                        error = %e,
+                        "drain worker JoinHandle errored on await; \
+                         drain worker should have already exited via \
+                         `with_shard -> None`",
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        shard_id,
+                        timeout_ms = bound.as_millis() as u64,
+                        "drain worker did not exit within timeout on remove_shard; detaching",
+                    );
+                }
             }
-            if let Err(e) = workers.drain.await {
-                tracing::warn!(
-                    shard_id,
-                    error = %e,
-                    "drain worker JoinHandle errored on await; \
-                     drain worker should have already exited via \
-                     `with_shard -> None`",
-                );
+            match tokio::time::timeout(bound, workers.batch).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        shard_id,
+                        error = %e,
+                        "BatchWorker JoinHandle errored on await; \
+                         proceeding with stranded-flush using last \
+                         published next_sequence",
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        shard_id,
+                        timeout_ms = bound.as_millis() as u64,
+                        "BatchWorker did not exit within timeout on remove_shard; detaching",
+                    );
+                }
             }
             workers.next_sequence.load(AtomicOrdering::Acquire)
         } else {
@@ -776,10 +867,16 @@ impl EventBus {
         // would still iterate `0..num_shards` and skip the live shard
         // whose id is now the largest, while polling a nonexistent /
         // recreated shard at the bottom of the range.
-        self.poll_merger.store(Arc::new(PollMerger::new(
-            self.adapter.clone(),
-            self.shard_manager.shard_ids(),
-        )));
+        //
+        // `poll_merger_swap_lock` serializes against
+        // `add_shard_internal`'s matching block — see the field doc.
+        {
+            let _swap_guard = self.poll_merger_swap_lock.lock();
+            self.poll_merger.store(Arc::new(PollMerger::new(
+                self.adapter.clone(),
+                self.shard_manager.shard_ids(),
+            )));
+        }
 
         tracing::info!(shard_id = shard_id, "Removed shard");
         Ok(())
@@ -983,6 +1080,16 @@ impl EventBus {
         self.shard_manager.stats()
     }
 
+    /// Sum of `len()` across every shard's ring buffer.
+    ///
+    /// Mainly useful in tests and operational diagnostics: a
+    /// non-zero value at the time of `Drop` (without an awaited
+    /// `shutdown()`) would be silently lost, so `Drop` folds this
+    /// into `events_dropped` before the bus disappears.
+    pub fn pending_in_rings(&self) -> u64 {
+        self.shard_manager.total_pending_in_rings()
+    }
+
     /// Flush all pending batches.
     ///
     /// Waits for all shard ring buffers to drain, then for the
@@ -1055,13 +1162,25 @@ impl EventBus {
         // single-`max_delay`-sleep approach a frequent flake.
         let target_ingested = self.stats.events_ingested.load(AtomicOrdering::Acquire);
         let dropped_at_start = self.stats.events_dropped.load(AtomicOrdering::Acquire);
+        let dispatched_at_start = self.stats.events_dispatched.load(AtomicOrdering::Acquire);
 
         // Outer deadline still bounds Phase 2 in case a wedged
         // adapter never returns. `max_delay * num_workers` is the
         // worst-case shape (one partially-filled batch per worker,
         // each waiting its full `max_delay` to time out), capped at
         // 2 s — same upper bound as before.
-        let n_workers = self.batch_workers.lock().len();
+        //
+        // Read the worker count via the shard manager's atomic-
+        // backed `num_shards()` rather than `batch_workers.lock()
+        // .len()`. The previous spinlock-backed `.lock()` inside
+        // an `async fn` could stall the runtime worker thread
+        // under contention with concurrent `add_shard_internal` /
+        // `remove_shard_internal` callers; the atomic accessor is
+        // both faster and async-safe. Mismatch in the
+        // worker-count vs shard-count snapshot only changes the
+        // phase2 deadline by at most one `max_delay` step, which
+        // is bounded by the outer 2s cap regardless.
+        let n_workers = usize::from(self.shard_manager.num_shards());
         let phase2_budget = self
             .config
             .batch
@@ -1079,16 +1198,31 @@ impl EventBus {
         loop {
             let dispatched = self.stats.events_dispatched.load(AtomicOrdering::Acquire);
             let dropped = self.stats.events_dropped.load(AtomicOrdering::Acquire);
-            // `dropped - dropped_at_start` is the number of events
-            // dropped *during* flush() (e.g. an adapter that
-            // exhausted retries on a pre-flush ingest). Those count
-            // toward the barrier — the corresponding `events_ingested`
-            // bumps already happened pre-flush so the dispatched
-            // bucket and the dropped-during-flush bucket together
-            // must catch up to `target_ingested` for the barrier to
-            // be met.
-            let dropped_during_flush = dropped.saturating_sub(dropped_at_start);
-            if dispatched.saturating_add(dropped_during_flush) >= target_ingested
+            // The barrier: every event ingested pre-flush has been
+            // either dispatched or dropped. The bus's invariant
+            // `events_ingested = events_dispatched + events_dropped`
+            // holds at quiescence; we wait until
+            // `dispatched + dropped >= target_ingested`.
+            //
+            // Pre-fix this used `dispatched + (dropped -
+            // dropped_at_start) >= target_ingested`, which under-
+            // counted by `dropped_at_start`: even after every
+            // pre-flush event was processed, the inequality
+            // required `dropped_at_start` MORE post-flush events
+            // before signalling done. Workloads with no post-flush
+            // ingest hung at the barrier until the deadline fired.
+            //
+            // Cross-shard race remains: a fast shard's post-flush
+            // dispatches can satisfy the global target while a
+            // slow shard's pre-flush events linger in its mpsc
+            // channel or pending batch. `all_shards_empty()`
+            // checks ring buffers but not those downstream
+            // queues. Operators relying on flush as a hard
+            // delivery barrier should call it during quiet
+            // ingest, or in `shutdown` (which gates ingest via
+            // `try_enter_ingest`).
+            let _ = dispatched_at_start; // reserved for future per-shard accounting
+            if dispatched.saturating_add(dropped) >= target_ingested
                 && self.shard_manager.all_shards_empty()
             {
                 break;
@@ -1196,9 +1330,14 @@ impl EventBus {
             // override is `#[cfg(test)]`-only; production cargo
             // builds compile out the override entirely.
             let deadline_dur = shutdown_via_ref_spin_deadline();
-            let deadline = std::time::Instant::now() + deadline_dur;
+            // Use `tokio::time::Instant` so tests using
+            // `tokio::time::pause()` virtualize this clock too.
+            // Pre-fix `std::time::Instant` was wall-clock and
+            // ignored `pause()`, breaking timeout-bounded tests
+            // that wanted to fast-forward the spin deadline.
+            let deadline = tokio::time::Instant::now() + deadline_dur;
             while !self.shutdown_completed.load(AtomicOrdering::Acquire) {
-                if std::time::Instant::now() >= deadline {
+                if tokio::time::Instant::now() >= deadline {
                     return Err(AdapterError::Transient(
                         "shutdown_via_ref: another caller is mid-shutdown; \
                          deadline elapsed before shutdown_completed \
@@ -1208,7 +1347,11 @@ impl EventBus {
                             .into(),
                     ));
                 }
-                tokio::task::yield_now().await;
+                // `yield_now` re-queues immediately and keeps the
+                // task hot, starving the workers we're waiting on
+                // under contention. A short `sleep` parks the task
+                // and lets the runtime schedule the workers.
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
             return Ok(());
         }
@@ -1242,10 +1385,21 @@ impl EventBus {
         // log below (so it's diagnosable). The "no stranding"
         // promise on the happy path stands; the deadline path is
         // the documented escape hatch.
-        let in_flight_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Use `tokio::time::Instant` so tests using
+        // `tokio::time::pause()` virtualize this 5-second
+        // deadline too — pre-fix the `std::time::Instant`
+        // was wall-clock and ignored the test's paused clock.
+        let in_flight_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Snapshot of `(stranded, ingested, dispatched)` at the
+        // deadline — Some(...) iff we hit the deadline path. The
+        // post-drain reconciliation reads this to compute the
+        // actual drop count (see comment further down).
+        let mut deadline_snapshot: Option<(u64, u64, u64)> = None;
         while self.in_flight_ingests.load(AtomicOrdering::SeqCst) > 0 {
-            if std::time::Instant::now() >= in_flight_deadline {
+            if tokio::time::Instant::now() >= in_flight_deadline {
                 let stranded = self.in_flight_ingests.load(AtomicOrdering::SeqCst);
+                let ingested_now = self.stats.events_ingested.load(AtomicOrdering::Acquire);
+                let dispatched_now = self.stats.events_dispatched.load(AtomicOrdering::Acquire);
                 tracing::warn!(
                     in_flight = stranded,
                     lossy = true,
@@ -1254,23 +1408,30 @@ impl EventBus {
                      past final drain (documented data-loss path)",
                     stranded,
                 );
-                // Surface the stranded count via `events_dropped`
-                // so SDK consumers reading `bus.stats()` see the
-                // loss, matching the bus's at-least-once-or-
-                // surfaced-as-dropped contract.
-                self.stats
-                    .events_dropped
-                    .fetch_add(stranded, AtomicOrdering::Relaxed);
-                // Also set the dedicated lossy-shutdown
-                // flag so `shutdown_via_ref` callers can detect a
-                // lossy outcome without parsing log lines or
-                // diffing `events_dropped` snapshots.
+                // Set the lossy flag immediately so a fast `is_*`
+                // poll observes the outcome before the drain
+                // finishes. The actual `events_dropped` bump is
+                // deferred until after the final drain runs (see
+                // "post-drain reconciliation" below) so we don't
+                // double-count events that the drain still
+                // successfully delivers — pre-fix this bumped
+                // `events_dropped += stranded` here and the same
+                // events that the final sweep then drained landed
+                // in BOTH `events_ingested` and `events_dropped`,
+                // breaking the bus's
+                // `ingested == dispatched + dropped` invariant
+                // and turning `shutdown_was_lossy` into a false
+                // positive on every deadline-triggered shutdown.
                 self.stats
                     .shutdown_was_lossy
                     .store(true, AtomicOrdering::Release);
+                deadline_snapshot = Some((stranded, ingested_now, dispatched_now));
                 break;
             }
-            tokio::task::yield_now().await;
+            // Park instead of `yield_now`. The producers we're
+            // waiting on contend for the same runtime threads;
+            // re-queuing immediately starves their progress.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
 
         // 1b. Release the drain-finalize gate.
@@ -1328,13 +1489,31 @@ impl EventBus {
         // time makes shutdown painful.
         let (drains, batch_handles): (Vec<_>, Vec<_>) = workers
             .into_iter()
-            .map(|(_shard_id, ShardWorkers { batch, drain, .. })| (drain, batch))
+            .map(|(shard_id, ShardWorkers { batch, drain, .. })| {
+                ((shard_id, drain), (shard_id, batch))
+            })
             .unzip();
-        // We don't care about individual results — `JoinError` from
-        // a panicking drain worker would already have surfaced
-        // through `tracing::error` inside the worker itself. Just
-        // wait for all of them to terminate.
-        let _ = futures::future::join_all(drains).await;
+
+        // Surface drain-worker JoinErrors explicitly. The default
+        // Tokio runtime does NOT log spawned-task panics, so a
+        // `let _ = join_all(...)` would silently swallow a panic
+        // and mask stranded events. tracing::error per failure
+        // makes the incident grep-able post-mortem.
+        let drain_handles: Vec<_> = drains.into_iter().map(|(_, h)| h).collect();
+        let drain_ids: Vec<u16> = batch_handles.iter().map(|(id, _)| *id).collect();
+        for (shard_id, result) in drain_ids
+            .iter()
+            .copied()
+            .zip(futures::future::join_all(drain_handles).await)
+        {
+            if let Err(e) = result {
+                tracing::error!(
+                    shard_id,
+                    error = %e,
+                    "drain worker JoinHandle errored on shutdown await"
+                );
+            }
+        }
 
         // 3. Drop the original senders so the channels close once
         //    drain-worker sender clones (already dropped above)
@@ -1345,8 +1524,21 @@ impl EventBus {
         // 4. Await batch workers. They drain their channel until
         //    `recv() = None`, flush, and exit.
         //
-        // Same parallelization as the drain phase.
-        let _ = futures::future::join_all(batch_handles).await;
+        // Same parallelization as the drain phase, with the same
+        // explicit JoinError surfacing.
+        let batch_only: Vec<_> = batch_handles.into_iter().map(|(_, h)| h).collect();
+        for (shard_id, result) in drain_ids
+            .into_iter()
+            .zip(futures::future::join_all(batch_only).await)
+        {
+            if let Err(e) = result {
+                tracing::error!(
+                    shard_id,
+                    error = %e,
+                    "BatchWorker JoinHandle errored on shutdown await"
+                );
+            }
+        }
 
         // Flush and shutdown adapter (with timeout to prevent hanging)
         let timeout = self.config.adapter_timeout;
@@ -1359,6 +1551,52 @@ impl EventBus {
         let result = tokio::time::timeout(timeout, self.adapter.shutdown())
             .await
             .map_err(|_| AdapterError::Fatal("adapter shutdown timed out".into()))?;
+
+        // Post-drain reconciliation for the lossy-shutdown path.
+        //
+        // If we hit the in-flight deadline above, `deadline_snapshot`
+        // holds `(stranded, ingested@deadline, dispatched@deadline)`.
+        // Some of those `stranded` producers' events landed in the
+        // ring AFTER our deadline check but BEFORE the
+        // `drain_finalize_ready` gate flipped — those events are
+        // now successfully ingested, drained, and dispatched through
+        // the adapter. They appear in `events_dispatched` (the
+        // delta since the deadline), so:
+        //
+        //   actual_drops = stranded
+        //                  - (dispatched_after_drain - dispatched@deadline)
+        //                  - (ingested_after_drain - ingested@deadline)
+        //                       only counting events that landed but
+        //                       weren't dispatched (dropped under
+        //                       backpressure, etc.)
+        //
+        // The cleaner reconciliation: events that completed
+        // `try_enter_ingest` AFTER the deadline either completed
+        // ingest (bumping `events_ingested`) or were dropped on
+        // backpressure (bumping `events_dropped` from the existing
+        // backpressure paths). The `stranded - delta_ingested`
+        // remainder is producers whose `try_enter_ingest` succeeded
+        // but never reached `shard_manager.ingest()` — those are
+        // the genuinely-lost events we should account for.
+        if let Some((stranded, ingested_at_deadline, _dispatched_at_deadline)) = deadline_snapshot {
+            let ingested_after = self.stats.events_ingested.load(AtomicOrdering::Acquire);
+            let post_deadline_ingests = ingested_after.saturating_sub(ingested_at_deadline);
+            let actual_drops = stranded.saturating_sub(post_deadline_ingests);
+            if actual_drops > 0 {
+                self.stats
+                    .events_dropped
+                    .fetch_add(actual_drops, AtomicOrdering::Relaxed);
+            }
+            tracing::warn!(
+                stranded_at_deadline = stranded,
+                post_deadline_ingests,
+                actual_drops,
+                "lossy shutdown reconciled: post-drain `events_dropped` bumped \
+                 by stranded - post-deadline-ingests (pre-fix this bumped by \
+                 the full `stranded` count, double-counting events the drain \
+                 still successfully delivered)",
+            );
+        }
 
         // Mark shutdown as completed so Drop knows not to warn.
         self.shutdown_completed.store(true, AtomicOrdering::Release);
@@ -1390,10 +1628,19 @@ impl EventBus {
     }
 
     /// Manually trigger a scale-up (for testing or manual intervention).
+    ///
+    /// Bypasses the auto-scaling cooldown so a deliberate operator
+    /// request isn't rate-limited by the auto-scaling cadence.
+    /// Pre-fix this looped `add_shard_internal()` N times, each
+    /// of which bumped `last_scaling`, so iteration 1+ failed
+    /// with `InCooldown` against any non-zero cooldown — the
+    /// first shard was left half-added (workers spawned, routing
+    /// entry installed) while the error propagated to the
+    /// caller. The `max_shards` budget check still applies.
     pub async fn manual_scale_up(&self, count: u16) -> Result<Vec<u16>, AdapterError> {
         let mut new_ids = Vec::with_capacity(count as usize);
         for _ in 0..count {
-            let id = self.add_shard_internal().await?;
+            let id = self.add_shard_internal_force().await?;
             new_ids.push(id);
         }
         Ok(new_ids)
@@ -1437,9 +1684,21 @@ impl EventBus {
         while finalized.len() < target.len() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let stopped = mapper.finalize_draining();
+            // `finalize_draining` is destructive — every qualifying
+            // Draining shard transitions to Stopped in one shot,
+            // regardless of who initiated the drain. Pre-fix the
+            // `if target.contains(&shard_id)` filter dropped non-
+            // target ids on the floor; if the scaling monitor (or
+            // a parallel `manual_scale_down` on a different target
+            // set) finalized one of THEIR shards in the same tick,
+            // that shard ended up Stopped with workers + routing
+            // entry intact — leaked. Always tear down via
+            // `remove_shard_internal` so the bus-side state
+            // (workers, sender, routing) is freed; only count the
+            // target subset toward the returned Vec.
             for shard_id in stopped {
+                let _ = self.remove_shard_internal(shard_id).await;
                 if target.contains(&shard_id) {
-                    let _ = self.remove_shard_internal(shard_id).await;
                     finalized.insert(shard_id);
                 }
             }
@@ -1515,10 +1774,37 @@ impl Drop for EventBus {
         // never started"; an in-progress shutdown is fine because the
         // call site is awaiting it.
         if !self.shutdown_completed.load(AtomicOrdering::Acquire) {
+            // Count events still sitting in shard ring buffers. They
+            // are stranded — the drain workers will see `shutdown =
+            // true` and exit without flushing, the adapter's
+            // `flush()`/`shutdown()` never run, so anything in the
+            // rings at this point is permanently lost. Surface that
+            // loss via `events_dropped` so post-mortem stats reflect
+            // reality (operators alerting on `events_dropped > 0`
+            // would otherwise miss the entire incident), and set
+            // `shutdown_was_lossy` so the boolean view is consistent
+            // with the counter view.
+            //
+            // Events in the BatchWorker mpsc channels or pending
+            // batches are not counted here — those workers may still
+            // observe the shutdown flag and exit, but we have no
+            // synchronous way from Drop to enumerate them. The ring-
+            // buffer count is a lower bound on the stranded total.
+            let stranded_in_rings = self.shard_manager.total_pending_in_rings();
+            if stranded_in_rings > 0 {
+                self.stats
+                    .events_dropped
+                    .fetch_add(stranded_in_rings, AtomicOrdering::Relaxed);
+                self.stats
+                    .shutdown_was_lossy
+                    .store(true, AtomicOrdering::Release);
+            }
+
             let stats = self.shard_manager.stats();
             tracing::warn!(
                 events_ingested = stats.events_ingested,
                 events_dropped = stats.events_dropped,
+                stranded_in_rings,
                 "EventBus dropped without an awaited shutdown(). Any in-flight \
                  events still in the ring buffers or batch channels will be lost \
                  — the adapter's flush()/shutdown() never ran. Call \
@@ -1991,7 +2277,10 @@ fn spawn_drain_worker_for_shard(
                         );
                         break;
                     }
-                    tokio::task::yield_now().await;
+                    // Park instead of `yield_now` so we don't
+                    // starve the workers / producers we're waiting
+                    // on under contention.
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
 
                 // Final drain: loop until the ring buffer is empty.
@@ -2035,7 +2324,23 @@ fn spawn_drain_worker_for_shard(
                     consecutive_zeros = 0;
                     let batch =
                         std::mem::replace(&mut final_scratch, Vec::with_capacity(FINAL_BATCH));
-                    if sender.send(batch).await.is_err() {
+                    let batch_len = batch.len();
+                    if let Err(_send_err) = sender.send(batch).await {
+                        // Batch worker exited before drain. The
+                        // `mem::replace` already pulled events out
+                        // of the ring buffer, so the dropped batch
+                        // is unrecoverable — the SendError carries
+                        // it back but the consumer is gone. Surface
+                        // the count loudly so the loss is
+                        // observable in operator dashboards rather
+                        // than a silent miss in shutdown stats.
+                        tracing::error!(
+                            shard_id,
+                            dropped = batch_len,
+                            "drain worker (final): batch worker dropped \
+                             channel before final drain completed; \
+                             events removed from ring buffer cannot be redelivered",
+                        );
                         break;
                     }
                 }
@@ -2059,7 +2364,30 @@ fn spawn_drain_worker_for_shard(
                 }
                 Some(_) => {
                     let batch = std::mem::replace(&mut scratch, Vec::with_capacity(STEADY_BATCH));
-                    if sender.send(batch).await.is_err() {
+                    let batch_len = batch.len();
+                    if let Err(_send_err) = sender.send(batch).await {
+                        // Steady-state: the only way the batch
+                        // worker drops the channel is if it
+                        // panicked or `remove_shard_internal`
+                        // tore it down out of order with the
+                        // drain worker (which the documented
+                        // shutdown sequence forbids). Either way,
+                        // the events are unrecoverable — the
+                        // `mem::replace` above already pulled them
+                        // out of the ring buffer. Pre-fix this
+                        // simply `break`-d, leaving the loss
+                        // invisible. Surface a loud error with
+                        // the dropped count so an out-of-order
+                        // shutdown or batch-worker panic shows up
+                        // in dashboards rather than as a silent
+                        // metric gap.
+                        tracing::error!(
+                            shard_id,
+                            dropped = batch_len,
+                            "drain worker: batch worker dropped channel \
+                             during steady-state drain; events removed from \
+                             ring buffer cannot be redelivered",
+                        );
                         break;
                     }
                 }

@@ -112,6 +112,7 @@ fn format_migration_error(err: &SdkMigrationError) -> String {
     match err {
         SdkMigrationError::DaemonNotFound(origin) => format!("daemon-not-found: {origin:#x}"),
         SdkMigrationError::TargetUnavailable(node) => format!("target-unavailable: {node:#x}"),
+        SdkMigrationError::NoTargetAvailable => "no-target-available".to_string(),
         SdkMigrationError::StateFailed(msg) => format!("state-failed: {msg}"),
         SdkMigrationError::AlreadyMigrating(origin) => format!("already-migrating: {origin:#x}"),
         SdkMigrationError::WrongPhase { expected, got } => {

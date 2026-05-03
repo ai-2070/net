@@ -194,7 +194,19 @@ impl PacketBuilder {
         header_bytes[12..16].copy_from_slice(&session_prefix_from_id(self.session_id));
         header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
 
-        // Patch payload_len to exclude the 16-byte auth tag (bytes 60..62)
+        // Patch payload_len to exclude the 16-byte auth tag (bytes 60..62).
+        // The `as u16` cast is safe under current MAX_PAYLOAD_SIZE
+        // (8112 << u16::MAX), but a future config that raised the cap
+        // past `u16::MAX + 16` would silently truncate the wire
+        // length and the receiver would mis-frame. The
+        // debug_assert is a tripwire so the truncation surfaces in
+        // CI before it reaches production.
+        debug_assert!(
+            self.payload.len() - 16 <= u16::MAX as usize,
+            "payload length {} would truncate the u16 wire field; \
+             revisit MAX_PAYLOAD_SIZE before raising the cap past u16::MAX + 16",
+            self.payload.len() - 16,
+        );
         let payload_len = (self.payload.len() - 16) as u16;
         header_bytes[60..62].copy_from_slice(&payload_len.to_le_bytes());
 
@@ -262,6 +274,15 @@ impl PacketBuilder {
 
         header_bytes[12..16].copy_from_slice(&session_prefix_from_id(self.session_id));
         header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
+        // See `build()` for why this debug_assert exists. Same
+        // safety argument: `as u16` truncates if MAX_PAYLOAD_SIZE
+        // is ever raised past u16::MAX + 16.
+        debug_assert!(
+            self.payload.len() - 16 <= u16::MAX as usize,
+            "payload length {} would truncate the u16 wire field; \
+             revisit MAX_PAYLOAD_SIZE before raising the cap past u16::MAX + 16",
+            self.payload.len() - 16,
+        );
         let payload_len = (self.payload.len() - 16) as u16;
         header_bytes[60..62].copy_from_slice(&payload_len.to_le_bytes());
 
@@ -563,12 +584,24 @@ impl std::fmt::Debug for PooledBuilder<'_> {
 // ============================================================================
 
 use std::cell::RefCell;
+use std::sync::Weak;
+
+/// Per-pool TLS entry. The `Weak<()>` is a liveness witness for
+/// the owning `ThreadLocalPool` instance: when the pool is
+/// dropped, its `Arc<()>` reaches strong-count 0, the weak fails
+/// to upgrade, and the TLS slot is reaped on the next access by
+/// any pool. Without this, a long-lived daemon that churns
+/// `ThreadLocalPool` instances (NAT rebind, peer reconnect,
+/// mesh rebuild) would leak `local_capacity × num_threads`
+/// `PacketBuilder` slots — ~16 KB each — for every dropped
+/// pool, OOMing in proportion to lifetime peer-churn count.
+type LocalBuildersEntry = (Weak<()>, Vec<PacketBuilder>);
 
 thread_local! {
     /// Thread-local cache of fast packet builders, keyed by a unique pool ID
     /// to prevent cross-pool contamination when multiple `ThreadLocalPool`
     /// instances exist (which may use different encryption keys).
-    static LOCAL_BUILDERS: RefCell<std::collections::HashMap<u64, Vec<PacketBuilder>>> =
+    static LOCAL_BUILDERS: RefCell<std::collections::HashMap<u64, LocalBuildersEntry>> =
         RefCell::new(std::collections::HashMap::new());
 }
 
@@ -598,6 +631,13 @@ pub struct ThreadLocalPool {
     /// Unique ID for this pool instance — used as key in thread-local storage
     /// to prevent cross-pool builder contamination.
     pool_id: u64,
+    /// Liveness witness for thread-local entries. Cloned on
+    /// `acquire`/`release` and stored alongside each TLS entry
+    /// as a `Weak<()>`; when this `Arc<()>` is dropped (the pool
+    /// itself drops), every thread's stale entry's `Weak` fails
+    /// to upgrade and the entry is reaped on the next TLS
+    /// access. See `LocalBuildersEntry` for the full rationale.
+    alive: Arc<()>,
     /// Shared fallback pool
     shared: ArrayQueue<PacketBuilder>,
     /// Encryption key for new builders
@@ -658,6 +698,7 @@ impl ThreadLocalPool {
 
         Self {
             pool_id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
+            alive: Arc::new(()),
             shared,
             key: *key,
             session_id,
@@ -676,7 +717,15 @@ impl ThreadLocalPool {
     pub fn acquire(&self) -> PacketBuilder {
         LOCAL_BUILDERS.with(|pools| {
             let mut pools = pools.borrow_mut();
-            let pool = pools.entry(self.pool_id).or_insert_with(Vec::new);
+            // Reap any TLS entries whose owning pool has been
+            // dropped (Weak fails to upgrade). Cheap: typical
+            // entry count per thread is 1–2; the `retain` walk
+            // is amortized into every TLS access.
+            pools.retain(|_, (weak, _)| weak.strong_count() > 0);
+            let entry = pools
+                .entry(self.pool_id)
+                .or_insert_with(|| (Arc::downgrade(&self.alive), Vec::new()));
+            let pool = &mut entry.1;
 
             // Fast path: pop from local cache (no atomics)
             if let Some(mut builder) = pool.pop() {
@@ -734,7 +783,15 @@ impl ThreadLocalPool {
 
         LOCAL_BUILDERS.with(|pools| {
             let mut pools = pools.borrow_mut();
-            let pool = pools.entry(self.pool_id).or_insert_with(Vec::new);
+            // Reap dead entries on the release path too — release
+            // may run on threads that haven't called acquire
+            // recently and would otherwise hold dead entries
+            // until their next acquire.
+            pools.retain(|_, (weak, _)| weak.strong_count() > 0);
+            let entry = pools
+                .entry(self.pool_id)
+                .or_insert_with(|| (Arc::downgrade(&self.alive), Vec::new()));
+            let pool = &mut entry.1;
 
             if pool.len() < self.local_capacity * 2 {
                 // Keep in local cache
@@ -1177,6 +1234,70 @@ mod tests {
             session_a,
             "builder acquired from pool A after pool B activity must still \
              have pool A's session_id"
+        );
+    }
+
+    /// Pin: TLS entries for dropped `ThreadLocalPool` instances
+    /// are reaped on the next access. Pre-fix `LOCAL_BUILDERS`
+    /// kept the entry forever, leaking ~16 KB × `local_capacity`
+    /// per dropped pool per thread that ever touched it. The
+    /// bug surfaced as production OOM in proportion to
+    /// peer-churn count on long-lived daemons.
+    #[test]
+    fn dropped_thread_local_pool_evicts_tls_entry_on_next_access() {
+        // Build a pool, populate its TLS slot, then drop it.
+        // Construct another pool and call acquire to trigger
+        // the reap pass. Snapshot the TLS map size before and
+        // after to confirm the dead entry was removed.
+        let key = [0x33u8; 32];
+
+        // Capture the TLS map's pre-state to isolate from
+        // unrelated entries left over from prior tests.
+        let pre_size = LOCAL_BUILDERS.with(|m| m.borrow().len());
+
+        let pool_a = ThreadLocalPool::new(4, &key, 0xA);
+        // Touch acquire to populate the TLS slot.
+        let b = pool_a.acquire();
+        pool_a.release(b);
+        let pool_a_id = pool_a.pool_id;
+        let with_a = LOCAL_BUILDERS.with(|m| m.borrow().contains_key(&pool_a_id));
+        assert!(
+            with_a,
+            "pool A's TLS slot must be populated after acquire/release"
+        );
+
+        // Drop the pool.
+        drop(pool_a);
+
+        // Without doing any TLS access, the entry is still
+        // present (Drop on `ThreadLocalPool` doesn't walk every
+        // thread's TLS — that's not feasible from within a
+        // single thread's drop). The reap happens on the next
+        // access to `LOCAL_BUILDERS`, regardless of which pool
+        // triggered it.
+        //
+        // Trigger the reap by acquire-ing from a fresh pool.
+        let pool_b = ThreadLocalPool::new(4, &key, 0xB);
+        let b = pool_b.acquire();
+        pool_b.release(b);
+
+        // After the reap, the dead pool's entry is gone and
+        // only pool B's entry remains (modulo any pre-existing
+        // entries from earlier tests).
+        let post_size = LOCAL_BUILDERS.with(|m| m.borrow().len());
+        let still_has_a = LOCAL_BUILDERS.with(|m| m.borrow().contains_key(&pool_a_id));
+        assert!(
+            !still_has_a,
+            "pool A's dead TLS entry must be reaped on next access — \
+             pre-fix this leaked forever (production OOM under peer churn)"
+        );
+        // The TLS map should not have grown: pool A's entry
+        // was removed and pool B's added, so size <= pre_size + 1.
+        assert!(
+            post_size <= pre_size + 1,
+            "TLS map size grew unexpectedly: pre={} post={}",
+            pre_size,
+            post_size
         );
     }
 

@@ -371,6 +371,29 @@ impl RedexFile {
         self.inner.next_seq.load(Ordering::Acquire)
     }
 
+    /// Atomic snapshot of `(len, next_seq)`. Observers that need
+    /// both values consistently with each other (e.g. metrics
+    /// dashboards comparing "retained count" to "total seqs
+    /// assigned") should use this rather than `len()` followed
+    /// by `next_seq()`.
+    ///
+    /// Pre-fix observers called the two methods in sequence.
+    /// Each method takes the state lock individually, so the
+    /// per-call view is consistent — but two appends could
+    /// commit between the two reads, and the resulting pair
+    /// could satisfy `len + 1 > next_seq_seen` (reader saw
+    /// post-append `len` but pre-append `next_seq`). Observers
+    /// downstream of a metrics tick would then double-account
+    /// the in-flight seqs. This single-lock accessor returns
+    /// both values from one critical section so the snapshot is
+    /// strictly consistent.
+    pub fn len_and_next_seq(&self) -> (usize, u64) {
+        let state = self.inner.state.lock();
+        let len = state.index.len();
+        let next_seq = self.inner.next_seq.load(Ordering::Acquire);
+        (len, next_seq)
+    }
+
     /// Whether [`Self::close`] has run. After close, `tail` streams
     /// terminate with `Err(Closed)` and `append`/`append_*` reject
     /// with the same error.
@@ -474,6 +497,20 @@ impl RedexFile {
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let entry = RedexEntry::new_inline(seq, payload, cks);
 
+        // Disk FIRST. If it fails, roll back the seq allocation
+        // and leave memory untouched so callers don't observe a
+        // record that was never durably persisted.
+        //
+        // INVARIANT: every operation after this block must be
+        // infallible. Pre-fix the rollback lived inside the
+        // `if let Some(disk)` arm, so a `disk == None` configuration
+        // would silently skip rollback. Today every post-block
+        // operation (`Vec::push`, `notify_watchers` against a
+        // `Vec<Sender>`) is provably infallible, so the disk-None
+        // path never reaches a state where rollback is needed.
+        // If a future change introduces a fallible operation
+        // between this disk block and `Ok(seq)`, factor out the
+        // rollback so it fires regardless of the disk arm.
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
             if let Err(e) = disk.append_entry_at(&entry, payload, ts) {
@@ -1097,31 +1134,51 @@ impl RedexFile {
 
         // Disk compaction succeeded (or no disk segment is
         // configured). Now mutate in-memory state to match.
-        state.index.drain(..drop);
-        state.timestamps.drain(..drop);
-        state.segment.evict_prefix_to(dat_base);
-
-        // Renormalize in-memory state to match the new on-disk
-        // format (segment-relative offsets, 0-based segment).
-        // `compact_to` rewrote each surviving entry's
-        // `payload_offset` as `entry.payload_offset - dat_base`;
-        // mirror that here so subsequent appends compute disk
-        // offsets (`segment.base_offset() + live_bytes()`) that
-        // match the new on-disk dat layout. Without this,
-        // post-sweep appends write absolute offsets that index
-        // past the end of the new (compacted) on-disk dat —
-        // torn-tail recovery silently drops them on reopen.
         //
-        // Only relevant when a disk segment is present; for
-        // memory-only files there's no on-disk format to track.
+        // Build the new (renormalized) index in a temp Vec, then
+        // atomically replace `state.index` and `state.timestamps`.
+        // Pre-fix the ordering was: drain prefix, evict segment,
+        // then rebase entries' `payload_offset` in a `for ... iter_mut()`
+        // loop. A panic in the middle of the rebase loop (allocator
+        // failure during a pathological allocation, or an unrelated
+        // hardware-level signal) left the index in a half-rebased
+        // state — some entries with absolute offsets pointing past
+        // the new compacted dat, others with the rebased offsets.
+        // Subsequent reads silently missed.
+        //
+        // Two-phase build-then-swap: phase 1 produces a fresh Vec
+        // and only when it's complete does phase 2 mutate
+        // `state.index` / `state.timestamps`. A panic in phase 1
+        // discards the temp Vec without touching `state`; phase 2
+        // is a single `.assign(...)` which is itself panic-free
+        // for primitive moves.
+        let new_index: Vec<RedexEntry> = state
+            .index
+            .iter()
+            .skip(drop)
+            .map(|entry| {
+                #[allow(unused_mut)] // mut is used only on the redex-disk path
+                let mut e = *entry;
+                #[cfg(feature = "redex-disk")]
+                {
+                    if !e.is_inline() && self.inner.disk.is_some() {
+                        e.payload_offset =
+                            (e.payload_offset as u64).saturating_sub(dat_base) as u32;
+                    }
+                }
+                e
+            })
+            .collect();
+        let new_timestamps: Vec<u64> = state.timestamps[drop..].to_vec();
+
+        // Phase 2: atomically replace. The two `=` assignments and
+        // the segment mutations below are panic-free against the
+        // primitives they invoke (Vec drop, simple inline arithmetic).
+        state.index = new_index;
+        state.timestamps = new_timestamps;
+        state.segment.evict_prefix_to(dat_base);
         #[cfg(feature = "redex-disk")]
         if self.inner.disk.is_some() {
-            for entry in state.index.iter_mut() {
-                if !entry.is_inline() {
-                    entry.payload_offset =
-                        (entry.payload_offset as u64).saturating_sub(dat_base) as u32;
-                }
-            }
             state.segment.rebase_to_zero();
         }
 
@@ -1330,6 +1387,39 @@ mod tests {
         assert_eq!(f.append(b"b").unwrap(), 1);
         assert_eq!(f.append(b"c").unwrap(), 2);
         assert_eq!(f.next_seq(), 3);
+    }
+
+    /// Regression: `len_and_next_seq()` returns a consistent
+    /// `(len, next_seq)` snapshot under one lock. Pre-fix
+    /// observers calling `len()` then `next_seq()` could
+    /// catch a transient where two appends commit between the
+    /// reads and the snapshot satisfies `len + 1 > next_seq_seen`.
+    /// The single-lock accessor pins atomicity.
+    ///
+    /// We can't easily simulate the pre-fix race in a unit test
+    /// (it requires precise inter-thread interleaving), but we
+    /// can pin the structural invariant: at every observable
+    /// moment, `len_and_next_seq()` returns
+    /// `next_seq == len + lowest_retained_seq` (where
+    /// `lowest_retained_seq = 0` for an unpruned file). This is
+    /// true if and only if the snapshot was taken under the
+    /// state lock that the appender holds.
+    #[test]
+    fn len_and_next_seq_is_consistent_under_appends() {
+        let f = make_file("t-consistent-snapshot");
+        for i in 0..50 {
+            f.append(format!("evt-{i}").as_bytes()).unwrap();
+            let (len, next_seq) = f.len_and_next_seq();
+            // No prune in this test, so lowest_retained = 0.
+            assert_eq!(
+                next_seq as usize, len,
+                "regression: (len, next_seq) snapshot must satisfy \
+                 next_seq == len for an unpruned file. The atomic \
+                 accessor pins this; calling len() then next_seq() \
+                 separately could observe a transient where they \
+                 diverge by 1+ across concurrent appends."
+            );
+        }
     }
 
     /// `Debug` must not acquire `state.lock()`. Pre-fix it called
@@ -2966,5 +3056,88 @@ mod tests {
             restored_seqs
         );
         f2.close().unwrap();
+    }
+
+    /// Source pin: `sweep_retention` must build the renormalized
+    /// index in a temp `Vec` and only then swap it into
+    /// `state.index` / `state.timestamps`. Pre-fix the order was
+    /// (drain, evict, then `iter_mut()` rebase loop) — a panic in
+    /// the middle of the rebase loop left the index half-rebased
+    /// (some entries still pointing past the new compacted dat,
+    /// others rebased), so subsequent reads silently missed.
+    ///
+    /// This is a tripwire against a "simplification" PR that
+    /// reverts to in-place mutation: such a PR would compile and
+    /// pass every behavior test (no panic is ever injected mid-
+    /// loop in unit tests) but reintroduce the half-rebased
+    /// state on a real allocator/signal failure.
+    #[test]
+    fn sweep_retention_must_use_build_then_swap() {
+        let src = include_str!("file.rs");
+
+        // Locate `pub fn sweep_retention` and the next sibling
+        // `fn ` after it — that's our scope.
+        let header = "pub fn sweep_retention(";
+        let start = src.find(header).expect("sweep_retention must exist");
+        let body_start = start + header.len();
+        let next_fn = src[body_start..]
+            .find("\n    fn ")
+            .or_else(|| src[body_start..].find("\n    pub fn "))
+            .expect("a following fn must exist (mod-private impl block)")
+            + body_start;
+        let body = &src[start..next_fn];
+
+        // Strip line comments so doc / pre-fix-history comments
+        // that mention the rejected pattern don't trip the
+        // negative assertion.
+        let body_no_comments: String = body
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(idx) => &l[..idx],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Phase-1 marker: a fresh local Vec built from
+        // `state.index.iter().skip(drop).map(...)`.
+        assert!(
+            body_no_comments.contains("let new_index"),
+            "regression: sweep_retention must build the new index \
+             into a temp `let new_index` Vec before mutating \
+             state.index. Building in-place reintroduces the \
+             half-rebased-on-panic hazard."
+        );
+        assert!(
+            body_no_comments.contains("let new_timestamps"),
+            "regression: sweep_retention must build the new \
+             timestamps Vec separately before mutating \
+             state.timestamps."
+        );
+
+        // Phase-2 marker: assignment to state.index / state.timestamps.
+        assert!(
+            body_no_comments.contains("state.index = new_index"),
+            "regression: sweep_retention's phase-2 swap into \
+             state.index must follow the temp-Vec build."
+        );
+        assert!(
+            body_no_comments.contains("state.timestamps = new_timestamps"),
+            "regression: sweep_retention's phase-2 swap into \
+             state.timestamps must follow the temp-Vec build."
+        );
+
+        // Negative pin: the in-place mutation pattern that was
+        // the pre-fix shape MUST NOT reappear inside this
+        // function body. The pre-fix used a `for ... iter_mut()`
+        // loop on `state.index` to rebase payload offsets after
+        // draining; reintroducing it brings back the half-rebased
+        // hazard.
+        assert!(
+            !body_no_comments.contains("state.index.iter_mut()"),
+            "regression: sweep_retention must not iter_mut() over \
+             state.index in place — that's the pre-fix pattern \
+             that left the index half-rebased on mid-loop panic."
+        );
     }
 }

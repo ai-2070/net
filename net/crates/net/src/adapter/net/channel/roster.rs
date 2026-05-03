@@ -77,18 +77,17 @@ impl SubscriberRoster {
         }
         // Clean up empty shells so the roster doesn't leak per-channel entries
         // for ephemeral channels that churn through many subscribers.
-        if let Some(set) = self.subs.get(channel) {
-            if set.is_empty() {
-                drop(set);
-                self.subs.remove_if(channel, |_, v| v.is_empty());
-            }
-        }
-        if let Some(set) = self.by_peer.get(&node_id) {
-            if set.is_empty() {
-                drop(set);
-                self.by_peer.remove_if(&node_id, |_, v| v.is_empty());
-            }
-        }
+        // The pre-check `if let Some + is_empty` was a TOCTOU window
+        // closed only by `remove_if`'s atomic re-check of the
+        // predicate — but the pre-check itself was load-bearing only
+        // for skipping the call. `remove_if` already returns `None`
+        // (no-op) when the predicate is false, so the unconditional
+        // call is equivalent in correctness and harder to misread.
+        // Pre-fix the pattern was idempotent but a future reader
+        // could remove the `remove_if` predicate, thinking the outer
+        // `is_empty` already covered the race.
+        self.subs.remove_if(channel, |_, v| v.is_empty());
+        self.by_peer.remove_if(&node_id, |_, v| v.is_empty());
         removed
     }
 

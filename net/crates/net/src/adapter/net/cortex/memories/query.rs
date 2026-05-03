@@ -74,13 +74,20 @@ impl MemoriesFilterSpec {
                 return false;
             }
         }
+        // Treat `Some(vec![])` as "no constraint" rather than as a
+        // pathological matcher. Pre-fix `require_any_tag(empty)`
+        // excluded everything (`any` over an empty list is false),
+        // while `require_all_tags(empty)` included everything
+        // (`all` over an empty list is true) — asymmetric and
+        // trap-prone for callers building filters from UI multi-
+        // select widgets that emit empty vectors.
         if let Some(tags) = &self.require_any_tag {
-            if !tags.iter().any(|want| m.tags.iter().any(|t| t == want)) {
+            if !tags.is_empty() && !tags.iter().any(|want| m.tags.iter().any(|t| t == want)) {
                 return false;
             }
         }
         if let Some(tags) = &self.require_all_tags {
-            if !tags.iter().all(|want| m.tags.iter().any(|t| t == want)) {
+            if !tags.is_empty() && !tags.iter().all(|want| m.tags.iter().any(|t| t == want)) {
                 return false;
             }
         }
@@ -344,6 +351,42 @@ mod tests {
             .where_all_tags(["personal".into(), "work".into()])
             .collect();
         assert!(none.is_empty());
+    }
+
+    /// Pin: passing an empty `Vec` to `require_any_tag` /
+    /// `require_all_tags` is treated as "no constraint" — the
+    /// filter is skipped. Pre-fix `Some(vec![])` was a
+    /// pathological matcher: `require_any_tag(empty)` rejected
+    /// every memory (`any` over empty = false), while
+    /// `require_all_tags(empty)` accepted every memory (`all`
+    /// over empty = true). UI multi-select widgets that emit
+    /// empty vectors would silently flip query semantics.
+    #[test]
+    fn empty_tag_filters_are_treated_as_no_constraint() {
+        let s = sample();
+        let total = s.memories.len();
+
+        // `require_any_tag(empty)` → no constraint, returns all.
+        let any_empty: Vec<_> = s.query().where_any_tag(Vec::<String>::new()).collect();
+        assert_eq!(
+            any_empty.len(),
+            total,
+            "require_any_tag(empty) must be treated as no constraint \
+             (got {}/{}); pre-fix this rejected every memory",
+            any_empty.len(),
+            total,
+        );
+
+        // `require_all_tags(empty)` → also no constraint, returns
+        // all (this branch was already accepting all pre-fix; the
+        // assertion ensures the new semantics keep the same
+        // result for callers).
+        let all_empty: Vec<_> = s.query().where_all_tags(Vec::<String>::new()).collect();
+        assert_eq!(
+            all_empty.len(),
+            total,
+            "require_all_tags(empty) must return all memories"
+        );
     }
 
     #[test]

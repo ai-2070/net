@@ -11,6 +11,13 @@ use crate::adapter::net::subnet::SubnetId;
 
 use super::propagation::PropagationModel;
 
+/// Soft cap on tracked entities. Bounds the worst-case memory cost
+/// of a peer-driven flood that ships novel origin hashes — pre-cap,
+/// `last_observed` and `estimated_delay` grew linearly with attacker
+/// cardinality. When at cap, the oldest-seen entry (smallest
+/// `last_observed` timestamp) is evicted to admit the new entry.
+pub const MAX_TRACKED_ENTITIES: usize = 65_536;
+
 /// Enriched observation horizon with temporal context.
 ///
 /// Tracks not just what was observed (origin_hash, sequence) but when
@@ -47,6 +54,26 @@ impl ObservationWindow {
         }
     }
 
+    /// Evict the oldest-observed entry when admitting `origin_hash`
+    /// would exceed [`MAX_TRACKED_ENTITIES`]. A refresh of an
+    /// existing entry never trips the cap; only NOVEL origins are
+    /// rejected, mirroring the token cache's "novel-key-only"
+    /// policy. We evict the entry with the smallest `last_observed`
+    /// timestamp (LRU by observation), matching the eviction policy
+    /// the audit recommends. Returns the evicted origin_hash if any.
+    fn evict_if_at_cap(&mut self, origin_hash: u32) {
+        if self.last_observed.contains_key(&origin_hash) {
+            return;
+        }
+        if self.last_observed.len() < MAX_TRACKED_ENTITIES {
+            return;
+        }
+        if let Some((&oldest, _)) = self.last_observed.iter().min_by_key(|(_, &ts)| ts) {
+            self.last_observed.remove(&oldest);
+            self.estimated_delay.remove(&oldest);
+        }
+    }
+
     /// Record an observation with propagation context.
     pub fn observe_with_context(
         &mut self,
@@ -58,6 +85,7 @@ impl ObservationWindow {
     ) {
         self.horizon.observe(origin_hash, sequence);
 
+        self.evict_if_at_cap(origin_hash);
         let now = current_timestamp();
         self.last_observed.insert(origin_hash, now);
 
@@ -70,6 +98,7 @@ impl ObservationWindow {
     /// Simple observation (no propagation context).
     pub fn observe(&mut self, origin_hash: u32, sequence: u64) {
         self.horizon.observe(origin_hash, sequence);
+        self.evict_if_at_cap(origin_hash);
         self.last_observed.insert(origin_hash, current_timestamp());
     }
 
@@ -112,7 +141,13 @@ impl ObservationWindow {
             match other.horizon.get(origin) {
                 Some(other_seq) => {
                     common += 1;
-                    seq_diff_sum += self_seq.abs_diff(other_seq);
+                    // Saturating: a long-running pair of horizons
+                    // with billions of entries × multi-billion
+                    // sequence differences would otherwise wrap
+                    // `seq_diff_sum` and report a misleadingly
+                    // small divergence (potentially zero), making
+                    // `is_converged()` falsely return true.
+                    seq_diff_sum = seq_diff_sum.saturating_add(self_seq.abs_diff(other_seq));
                 }
                 None => only_self += 1,
             }
@@ -250,6 +285,84 @@ mod tests {
         assert_eq!(div.entities_only_self, 1); // 0xBBBB
         assert_eq!(div.entities_only_other, 1); // 0xCCCC
         assert_eq!(div.total_seq_difference, 5); // |10 - 15|
+    }
+
+    /// `last_observed` / `estimated_delay` must be bounded against
+    /// a peer-driven flood of novel origin hashes. Pre-fix the
+    /// maps grew linearly with attacker cardinality. Post-fix, at
+    /// `MAX_TRACKED_ENTITIES`, novel origins evict the oldest-seen
+    /// entry rather than grow the map further. Also pin that an
+    /// existing entry's refresh never trips the cap.
+    ///
+    /// Setup keeps the test fast by mutating `last_observed`
+    /// directly to fill the cap, then exercising `observe()` once
+    /// to trigger the eviction path.
+    #[test]
+    fn observation_window_evicts_oldest_at_cap() {
+        let mut window = ObservationWindow::new(SubnetId::new(&[1]));
+
+        // Direct-fill `last_observed` to the cap with synthesized
+        // entries. We use distinct origin hashes whose `last_observed`
+        // timestamps form a strict order so the LRU-by-timestamp
+        // pick is deterministic.
+        for i in 0..MAX_TRACKED_ENTITIES as u32 {
+            window.last_observed.insert(i, i as u64);
+            window.estimated_delay.insert(i, 0);
+            window.horizon.observe(i, 0);
+        }
+        assert_eq!(window.last_observed.len(), MAX_TRACKED_ENTITIES);
+
+        // Refreshing an existing origin must NOT trip the cap or
+        // evict.
+        window.observe(0, 1);
+        assert_eq!(window.last_observed.len(), MAX_TRACKED_ENTITIES);
+        assert!(window.last_observed.contains_key(&0));
+
+        // A novel origin at the cap must evict the oldest. Origin 0
+        // had the smallest synthetic timestamp BUT was just refreshed
+        // to `current_timestamp()` above — so origin 1 is now the
+        // oldest and should be the eviction target.
+        let novel = (MAX_TRACKED_ENTITIES + 1000) as u32;
+        window.observe(novel, 1);
+        assert_eq!(window.last_observed.len(), MAX_TRACKED_ENTITIES);
+        assert!(window.last_observed.contains_key(&novel));
+        assert!(
+            !window.last_observed.contains_key(&1),
+            "oldest-by-timestamp entry must have been evicted",
+        );
+        // Sanity: matching `estimated_delay` was also evicted.
+        assert!(!window.estimated_delay.contains_key(&1));
+    }
+
+    /// `seq_diff_sum` must use saturating addition so a long-running
+    /// pair of horizons can't wrap and report a falsely-small
+    /// (or zero) divergence. The `is_converged()` check is the
+    /// load-bearing gate that depends on this.
+    #[test]
+    fn divergence_seq_diff_saturates_on_overflow() {
+        // Build two windows with two common entities whose sequence
+        // differences each exceed half of u64::MAX. Pre-fix the
+        // accumulator wraps to a small number; post-fix it
+        // saturates at u64::MAX.
+        let mut w1 = ObservationWindow::new(SubnetId::new(&[1]));
+        let mut w2 = ObservationWindow::new(SubnetId::new(&[1]));
+
+        w1.observe(0xAAAA, u64::MAX);
+        w2.observe(0xAAAA, 0);
+        w1.observe(0xBBBB, u64::MAX);
+        w2.observe(0xBBBB, 0);
+
+        let div = w1.divergence_from(&w2);
+        assert_eq!(div.common_entities, 2);
+        assert_eq!(
+            div.total_seq_difference,
+            u64::MAX,
+            "two u64::MAX-sized diffs must saturate, not wrap",
+        );
+        assert!(
+            !div.is_converged(),
+            "saturated divergence must not falsely report converged",
+        );
     }
 
     #[test]

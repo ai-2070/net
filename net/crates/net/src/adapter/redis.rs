@@ -51,12 +51,19 @@
 //! - If the id is in the seen-set, skip the entry.
 //! - Otherwise, process the event and add the id to the set.
 //!
-//! The seen-set is a small LRU sized to the worst-case
-//! out-of-window dedup horizon the caller cares about (default
-//! configurations: a few thousand ids, ~minutes of in-flight at
-//! moderate throughput). The reference helper
-//! [`net_sdk::RedisStreamDedup`] (Rust SDK) provides exactly this;
-//! cross-language wrappers (NAPI / PyO3) ship in the bindings.
+//! The seen-set is an LRU sized to the worst-case
+//! out-of-window dedup horizon the caller cares about. The
+//! reference helper [`net_sdk::RedisStreamDedup`] (Rust SDK)
+//! ships with a 4 096-entry default tuned for low-throughput
+//! / short-window deployments; production callers must size
+//! explicitly via `RedisStreamDedup::with_capacity`. As a
+//! rough guideline, capacity must cover at least
+//! `peak_events_per_sec × out_of_order_tolerance_seconds`:
+//! 10 K events/sec with ~1 minute of tolerance needs ~600 K,
+//! and the default 4 096 covers ~0.4 s at that throughput —
+//! two orders of magnitude below the "minutes" horizon the
+//! older documentation implied. Cross-language wrappers
+//! (NAPI / PyO3) ship in the bindings.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -171,7 +178,19 @@ impl RedisAdapter {
     }
 
     /// Get a connection (with error handling).
+    ///
+    /// Pre-fix this returned the cached `ConnectionManager` whenever
+    /// `self.conn` was `Some(_)`, even after `shutdown()` had run.
+    /// `shutdown` only flips `initialized = false`; the
+    /// `ConnectionManager` field itself stays set (we can't clear
+    /// it from `&self` without interior mutability), so a
+    /// post-shutdown `on_batch` / `poll_shard` would happily write
+    /// to Redis after the operator believes the adapter is gone.
+    /// Consult `initialized` first to refuse cleanly.
     async fn get_conn(&self) -> Result<ConnectionManager, AdapterError> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(AdapterError::Fatal("adapter not initialized".into()));
+        }
         self.conn
             .clone()
             .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))
@@ -455,14 +474,30 @@ impl Adapter for RedisAdapter {
 
         // XRANGE key start + COUNT limit
         // Returns array of [id, [field, value, field, value, ...]]
-        let results: Value = redis::cmd("XRANGE")
-            .arg(&*stream_key)
+        //
+        // Wrap the XRANGE in `command_timeout` so a slow or wedged
+        // Redis node doesn't block this poll indefinitely. Pre-fix
+        // `poll_shard` relied entirely on the `ConnectionManager`'s
+        // implicit timeout, while `on_batch` (line 408) and
+        // `is_healthy` (line 516) wrap their pipelines in
+        // `tokio::time::timeout(self.config.command_timeout, ...)`.
+        // The inconsistent timeout policy meant that a partially-
+        // healthy Redis (returns connections but stalls on commands)
+        // would let `on_batch` and `is_healthy` surface a Transient
+        // error within `command_timeout`, while `poll_shard` hung
+        // until Redis itself replied or the connection broke. Apply
+        // the same wrapper here so the timeout contract is uniform
+        // across the adapter.
+        let mut cmd = redis::cmd("XRANGE");
+        cmd.arg(&*stream_key)
             .arg(&start)
             .arg("+") // To end
             .arg("COUNT")
-            .arg(fetch_limit)
-            .query_async(&mut conn)
+            .arg(fetch_limit);
+        let fut = cmd.query_async::<Value>(&mut conn);
+        let results = tokio::time::timeout(self.config.command_timeout, fut)
             .await
+            .map_err(|_| AdapterError::Transient("Redis XRANGE timeout".into()))?
             .map_err(|e| AdapterError::Transient(e.to_string()))?;
 
         Ok(Self::parse_xrange_response(results, limit, &stream_key))
@@ -477,43 +512,74 @@ impl Adapter for RedisAdapter {
             return false;
         }
 
-        // Pre-fix, the PING relied entirely on the
-        // `ConnectionManager`'s configured request timeout. If
-        // that's unset or large, a network partition leaves the
-        // health check blocked indefinitely, making the adapter
-        // appear "pending" rather than "unhealthy" — a real risk
-        // for liveness probes in orchestrators that treat slow
-        // health responses as "OK". Wrap explicitly in
-        // `command_timeout` so an unhealthy backend always
-        // returns `false` within a bounded window.
-        if let Ok(mut conn) = self.get_conn().await {
-            let cmd = redis::cmd("PING");
-            let fut = cmd.query_async::<String>(&mut conn);
-            matches!(
-                tokio::time::timeout(self.config.command_timeout, fut).await,
-                Ok(Ok(_))
-            )
-        } else {
-            false
-        }
+        // Use a dedicated single-shot multiplexed connection for
+        // the health check rather than the shared
+        // `ConnectionManager` used by `on_batch` / `poll_shard`.
+        // `tokio::time::timeout` cancels the PING future locally
+        // but does NOT roll back bytes already on the wire (same
+        // hazard documented for `on_batch` above). On the SHARED
+        // connection a leftover PING reply could in principle
+        // confuse the multiplexed correlation when followed by
+        // a real command — using a fresh connection that's
+        // dropped after the PING means any leftover bytes go to
+        // a connection that's already being torn down.
+        //
+        // Also bounds the check by `command_timeout` so an
+        // unhealthy backend always returns `false` within a
+        // predictable window (orchestrator liveness probes
+        // require a deterministic cap).
+        let conn_fut = self.client.get_multiplexed_async_connection();
+        let mut conn = match tokio::time::timeout(self.config.command_timeout, conn_fut).await {
+            Ok(Ok(c)) => c,
+            _ => return false,
+        };
+        let cmd = redis::cmd("PING");
+        let fut = cmd.query_async::<String>(&mut conn);
+        matches!(
+            tokio::time::timeout(self.config.command_timeout, fut).await,
+            Ok(Ok(_))
+        )
+        // `conn` is dropped here, so any leftover PING reply
+        // ends up on a torn-down connection rather than the
+        // shared multiplex.
     }
 }
 
 /// Check if a Redis error is transient (retryable).
 fn is_transient_error(e: &RedisError) -> bool {
-    use redis::ErrorKind;
+    use redis::{ErrorKind, ServerErrorKind};
     match e.kind() {
         // I/O errors are always transient
         ErrorKind::Io => true,
         // Cluster connection issues are transient
         ErrorKind::ClusterConnectionNotFound => true,
-        // Server errors may be transient - check the message
-        ErrorKind::Server(_) => {
+        // Typed server errors with documented retryable semantics.
+        // Pre-fix the cluster-topology errors (Moved/Ask/ReadOnly/
+        // ClusterDown) were classified fatal, taking the adapter
+        // offline until process restart on any cluster slot move
+        // or replica-failover event.
+        ErrorKind::Server(ServerErrorKind::BusyLoading)
+        | ErrorKind::Server(ServerErrorKind::Moved)
+        | ErrorKind::Server(ServerErrorKind::Ask)
+        | ErrorKind::Server(ServerErrorKind::TryAgain)
+        | ErrorKind::Server(ServerErrorKind::ClusterDown)
+        | ErrorKind::Server(ServerErrorKind::MasterDown)
+        | ErrorKind::Server(ServerErrorKind::ReadOnly) => true,
+        // Catch-all for `Server(ResponseError)` and unknown
+        // extension errors that surface only via the message
+        // body. Includes `NOREPLICAS` (a wait-aof timeout) which
+        // doesn't have a typed kind in this redis crate version.
+        ErrorKind::Server(_) | ErrorKind::Extension => {
             let msg = e.to_string().to_uppercase();
             msg.contains("LOADING")
                 || msg.contains("BUSY")
                 || msg.contains("TRYAGAIN")
                 || msg.contains("MASTERDOWN")
+                || msg.contains("MOVED")
+                || msg.contains("ASK")
+                || msg.contains("READONLY")
+                || msg.contains("CLUSTERDOWN")
+                || msg.contains("NOREPLICAS")
         }
         _ => false,
     }
@@ -650,5 +716,84 @@ mod tests {
         assert!(result.events.is_empty());
         assert!(result.next_id.is_none());
         assert!(!result.has_more);
+    }
+
+    /// Pin: Redis Cluster topology errors (`MOVED`, `ASK`,
+    /// `READONLY`, `CLUSTERDOWN`, etc.) must be classified as
+    /// transient. Pre-fix only `LOADING | BUSY | TRYAGAIN |
+    /// MASTERDOWN` substrings matched — every cluster failover
+    /// took the adapter offline until process restart.
+    #[test]
+    fn is_transient_error_recognizes_cluster_recoverables() {
+        use redis::{ErrorKind, ServerErrorKind};
+
+        // Typed server errors — the production path. Cluster-
+        // topology errors map to specific `ServerErrorKind`
+        // variants and must classify as transient.
+        let typed_transient: &[(ErrorKind, &str)] = &[
+            (ErrorKind::Server(ServerErrorKind::Moved), "MOVED redirect"),
+            (ErrorKind::Server(ServerErrorKind::Ask), "ASK redirect"),
+            (
+                ErrorKind::Server(ServerErrorKind::ClusterDown),
+                "cluster down",
+            ),
+            (
+                ErrorKind::Server(ServerErrorKind::MasterDown),
+                "master down",
+            ),
+            (
+                ErrorKind::Server(ServerErrorKind::ReadOnly),
+                "read-only replica",
+            ),
+            (ErrorKind::Server(ServerErrorKind::BusyLoading), "loading"),
+            (ErrorKind::Server(ServerErrorKind::TryAgain), "try again"),
+            (ErrorKind::Io, "I/O error"),
+            (
+                ErrorKind::ClusterConnectionNotFound,
+                "no cluster connection",
+            ),
+        ];
+        for (kind, label) in typed_transient {
+            let err = RedisError::from((*kind, "test"));
+            assert!(
+                is_transient_error(&err),
+                "{} ({:?}) must classify as transient",
+                label,
+                kind,
+            );
+        }
+
+        // Untyped extension errors — message-substring branch.
+        // `NOREPLICAS` doesn't have a typed kind in this redis
+        // crate version, so it surfaces as Extension.
+        let extension_transient: &[&str] = &["NOREPLICAS Not enough good replicas to write"];
+        for msg in extension_transient {
+            let err = RedisError::from((ErrorKind::Extension, "test", msg.to_string()));
+            assert!(
+                is_transient_error(&err),
+                "extension `{}` must classify as transient",
+                msg,
+            );
+        }
+
+        // Genuinely fatal — must remain non-transient.
+        let fatal: &[ErrorKind] = &[
+            ErrorKind::AuthenticationFailed,
+            ErrorKind::UnexpectedReturnType,
+            ErrorKind::InvalidClientConfig,
+            ErrorKind::Client,
+            ErrorKind::Server(ServerErrorKind::ExecAbort),
+            ErrorKind::Server(ServerErrorKind::NoScript),
+            ErrorKind::Server(ServerErrorKind::CrossSlot),
+            ErrorKind::Server(ServerErrorKind::NoPerm),
+        ];
+        for kind in fatal {
+            let err = RedisError::from((*kind, "test"));
+            assert!(
+                !is_transient_error(&err),
+                "{:?} must classify as fatal (non-transient)",
+                kind,
+            );
+        }
     }
 }

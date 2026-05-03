@@ -1915,7 +1915,17 @@ impl MeshNode {
 
         let recv_handle = self.spawn_receive_loop();
         let heartbeat_handle = self.spawn_heartbeat_loop();
-        let router_handle = self.router.start();
+        let router_handle = match self.router.start() {
+            Some(h) => h,
+            None => {
+                tracing::warn!(
+                    "MeshNode::start called while the router dispatch loop \
+                     was already running; ignoring the duplicate start. \
+                     This usually indicates start() was invoked twice."
+                );
+                return;
+            }
+        };
         let capability_gc_handle = self.spawn_capability_gc_loop();
         let token_sweep_handle = self.spawn_token_sweep_loop();
         // Port-mapping task is opt-in — only spawned when the
@@ -2735,7 +2745,35 @@ impl MeshNode {
         // Registration happens BEFORE the send so that even if the
         // spawned send task is cancelled or panics post-send, the
         // initiator that just derived matching keys finds us.
+        //
+        // Replay guard: if a live session already exists for
+        // `peer_node_id` with the SAME `remote_static_pub`, drop the
+        // new handshake. NKpsk0's responder uses a fresh ephemeral
+        // on each reply so a captured msg1 replayed by a passive
+        // attacker would otherwise overwrite the live session keys
+        // — the legitimate initiator still holds the old keys and
+        // every subsequent AEAD-protected packet would fail open and
+        // be dropped, a trivial DoS against any node that ever
+        // handshook on a routed path. Re-handshake from the same
+        // identity is gated by session expiry / explicit removal,
+        // not by overwriting an active session in place.
         let remote_static_pub = keys.remote_static_pub;
+        if let Some(existing) = ctx.peers.get(&peer_node_id) {
+            if existing.remote_static_pub == remote_static_pub {
+                tracing::warn!(
+                    peer_node_id,
+                    "routed handshake: dropping msg1 — live session already \
+                     established for this peer with matching remote_static_pub \
+                     (replay guard)"
+                );
+                return;
+            }
+            // Different remote_static_pub for the same node_id is
+            // either a peer rotating its static key (legitimate) or
+            // an attacker forging a different static — let the
+            // initiator's matching-keys check resolve which.
+            // Fall through to insert below.
+        }
         let session = Arc::new(NetSession::new(
             keys,
             source,
@@ -4188,7 +4226,14 @@ impl MeshNode {
         // the forwarder has the current view of `hop_count`.
         if ann.hop_count < MAX_CAPABILITY_HOPS - 1 {
             let mut forwarded = ann.clone();
-            forwarded.hop_count += 1;
+            // Saturating bump matches every other hop-count
+            // increment in the crate (`swarm.rs:122`, `route.rs:254`).
+            // The `< MAX_CAPABILITY_HOPS - 1` guard above already
+            // bounds this in practice, but a future refactor that
+            // raises the cap or relaxes the check would otherwise
+            // turn an attacker-controlled byte into a debug-panic /
+            // release-wraparound.
+            forwarded.hop_count = forwarded.hop_count.saturating_add(1);
             // `to_bytes` on a clone with the bumped counter —
             // signature remains valid because `signed_payload()`
             // zeros `hop_count` on verify.
@@ -4813,9 +4858,13 @@ impl MeshNode {
             Visibility::Global => true,
             Visibility::SubnetLocal => source.is_same_subnet(dest),
             Visibility::ParentVisible => {
-                source.is_same_subnet(dest)
-                    || source.is_ancestor_of(dest)
-                    || dest.is_ancestor_of(source)
+                // "Visible to the parent subnet but not siblings" —
+                // strictly upward. A child's broadcast reaches its
+                // own subnet (covered by `is_ancestor_of` since a
+                // subnet is its own ancestor) and any ancestor; a
+                // parent broadcasting down to descendants would leak
+                // region-scoped traffic and is rejected.
+                dest.is_ancestor_of(source)
             }
             Visibility::Exported => false,
         }
@@ -7947,6 +7996,41 @@ mod heartbeat_aead_tests {
                  every payload past the first.\n  line: {}",
                 lineno + 1,
                 line
+            );
+        }
+    }
+
+    /// Source-level pin: every `hop_count += 1` / `hop_count = X + 1`
+    /// pattern in this file MUST go through `saturating_add`.
+    /// `hop_count: u8` saturates at 255; an attacker-controlled
+    /// inbound packet whose `hop_count` is already u8::MAX would
+    /// debug-panic (`overflow`) or release-wraparound to 0 on a
+    /// bare `+= 1`. Today the upstream `< MAX_CAPABILITY_HOPS - 1`
+    /// guard bounds the value at 14 before the bump, so the
+    /// saturating call is dormant — but a future change that
+    /// raises the cap or relaxes the guard would otherwise turn
+    /// an attacker byte into UB / wrap. This pin ensures the
+    /// hardening stays in place even if the upstream gate moves.
+    #[test]
+    fn hop_count_increments_must_be_saturating() {
+        // Build the forbidden token at runtime so this test's source
+        // doesn't trigger itself.
+        let bare_bump = format!("hop_count {} 1", "+=");
+
+        let src = include_str!("mesh.rs");
+        for (lineno, line) in src.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // Comments are allowed to mention the pre-fix shape.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !trimmed.contains(&bare_bump),
+                "hop_count regression: bare `+= 1` reintroduced at \
+                 mesh.rs:{} — use `saturating_add(1)` so an attacker-\
+                 controlled `hop_count == u8::MAX` cannot wrap.\n  line: {}",
+                lineno + 1,
+                line,
             );
         }
     }

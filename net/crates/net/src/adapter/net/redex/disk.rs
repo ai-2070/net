@@ -251,6 +251,10 @@ impl DiskSegment {
 
         // Torn-idx tail: the last 20-byte write was partial (crash
         // mid-append). Truncate idx to a whole multiple of 20 bytes.
+        // The `set_len` MUST be paired with `sync_all`: a crash
+        // between truncation and the next durable write would otherwise
+        // leave the torn tail on disk and we'd re-recover the same
+        // bytes on the next open, indefinitely.
         if idx_len_truncated {
             let file = OpenOptions::new()
                 .write(true)
@@ -258,6 +262,7 @@ impl DiskSegment {
                 .map_err(RedexError::io)?;
             file.set_len((index.len() * REDEX_ENTRY_SIZE) as u64)
                 .map_err(RedexError::io)?;
+            file.sync_all().map_err(RedexError::io)?;
         }
 
         // Torn-dat tail: our write ordering is dat-before-idx, so a
@@ -308,6 +313,9 @@ impl DiskSegment {
                 .map_err(RedexError::io)?;
             file.set_len((index.len() * REDEX_ENTRY_SIZE) as u64)
                 .map_err(RedexError::io)?;
+            // sync_all so a crash before the next durable write
+            // doesn't reincarnate the torn idx entries.
+            file.sync_all().map_err(RedexError::io)?;
         }
         // Trim any trailing dat bytes that no idx entry references.
         // Finds the highest `(offset + len)` among retained heap
@@ -324,6 +332,11 @@ impl DiskSegment {
                 .open(&dat_path)
                 .map_err(RedexError::io)?;
             file.set_len(retained_dat_end).map_err(RedexError::io)?;
+            // sync_all so the dat-trim survives a crash that lands
+            // before the next durable write — otherwise reopening
+            // would observe the un-trimmed dat past `retained_dat_end`
+            // and re-trigger the recovery walk.
+            file.sync_all().map_err(RedexError::io)?;
             payload_bytes.truncate(retained_dat_end as usize);
         }
 
@@ -576,6 +589,89 @@ impl DiskSegment {
         }
     }
 
+    /// Roll back one of the three append files to a recorded length.
+    /// If the open or `set_len` fails, log AND poison the segment:
+    /// the on-disk state is now inconsistent and any subsequent
+    /// append would compound the divergence rather than narrow it.
+    ///
+    /// Pre-fix the rollback used `if let Ok(f) = ...` and silently
+    /// continued on open failure, leaving the segment in a
+    /// permanently-divergent state with no diagnostic.
+    fn rollback_truncate(&self, file_name: &str, target_len: u64) {
+        let path = self.dir.join(file_name);
+        match OpenOptions::new().write(true).open(&path) {
+            Ok(f) => {
+                if let Err(e) = f.set_len(target_len) {
+                    tracing::error!(
+                        error = %e,
+                        path = %path.display(),
+                        "redex disk rollback: {file_name} set_len failed; poisoning segment",
+                    );
+                    self.poisoned.store(true, Ordering::Release);
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    path = %path.display(),
+                    "redex disk rollback: {file_name} open failed; poisoning segment",
+                );
+                self.poisoned.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Roll back a partial single-entry append after the idx (or
+    /// ts-metadata read) failed. The dat rollback uses
+    /// (current_len - payload_len) as the target since the
+    /// single-entry path doesn't snapshot the pre-write dat length.
+    fn rollback_after_idx_failure(&self, pre_idx_len: u64, dat_rollback: Option<u64>) {
+        self.rollback_truncate("idx", pre_idx_len);
+        if let Some(payload_len) = dat_rollback {
+            let dat_path = self.dir.join("dat");
+            let dat_target = match OpenOptions::new().read(true).open(&dat_path) {
+                Ok(f) => match f.metadata() {
+                    Ok(m) => Some(m.len().saturating_sub(payload_len)),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            path = %dat_path.display(),
+                            "redex disk rollback: dat metadata failed; poisoning segment",
+                        );
+                        self.poisoned.store(true, Ordering::Release);
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        path = %dat_path.display(),
+                        "redex disk rollback: dat open(read) failed; poisoning segment",
+                    );
+                    self.poisoned.store(true, Ordering::Release);
+                    None
+                }
+            };
+            if let Some(target) = dat_target {
+                self.rollback_truncate("dat", target);
+            }
+        }
+    }
+
+    /// Roll back a partial single-entry append after the ts write
+    /// failed: idx + ts + (optionally) dat all need to be trimmed
+    /// back. Same poison-on-failure semantics as
+    /// `rollback_after_idx_failure`.
+    fn rollback_after_ts_failure(
+        &self,
+        pre_idx_len: u64,
+        pre_ts_len: u64,
+        dat_rollback: Option<u64>,
+    ) {
+        self.rollback_truncate("ts", pre_ts_len);
+        self.rollback_after_idx_failure(pre_idx_len, dat_rollback);
+    }
+
     /// Test-only: arm a one-shot failure on the next
     /// `append_entry` / `append_entries` call. Returns `Io` before
     /// touching either file. Used to exercise the caller's rollback
@@ -718,20 +814,12 @@ impl DiskSegment {
         };
         if let Err(e) = idx.write_all(&entry.to_bytes()) {
             drop(idx);
-            let idx_path = self.dir.join("idx");
-            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                let _ = f.set_len(pre_idx_len);
-            }
-            // Also roll back any dat bytes we just wrote — leaving
-            // them as orphaned tail bytes is the same hazard the
-            // dat-side rollback closes.
-            if !entry.is_inline() {
-                let dat_path = self.dir.join("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
-                    let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
-                }
-            }
+            let dat_rollback = if entry.is_inline() {
+                None
+            } else {
+                Some(payload.len() as u64)
+            };
+            self.rollback_after_idx_failure(pre_idx_len, dat_rollback);
             return Err(RedexError::io(e));
         }
         drop(idx);
@@ -761,38 +849,23 @@ impl DiskSegment {
             Ok(m) => m.len(),
             Err(e) => {
                 drop(ts);
-                let idx_path = self.dir.join("idx");
-                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                    let _ = f.set_len(pre_idx_len);
-                }
-                if !entry.is_inline() {
-                    let dat_path = self.dir.join("dat");
-                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                        let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
-                        let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
-                    }
-                }
+                let dat_rollback = if entry.is_inline() {
+                    None
+                } else {
+                    Some(payload.len() as u64)
+                };
+                self.rollback_after_idx_failure(pre_idx_len, dat_rollback);
                 return Err(RedexError::io(e));
             }
         };
         if let Err(e) = ts.write_all(&timestamp_ns.to_le_bytes()) {
             drop(ts);
-            let ts_path = self.dir.join("ts");
-            if let Ok(f) = OpenOptions::new().write(true).open(&ts_path) {
-                let _ = f.set_len(pre_ts_len);
-            }
-            // Roll back idx by 20 bytes (one entry).
-            let idx_path = self.dir.join("idx");
-            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                let _ = f.set_len(pre_idx_len);
-            }
-            if !entry.is_inline() {
-                let dat_path = self.dir.join("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
-                    let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
-                }
-            }
+            let dat_rollback = if entry.is_inline() {
+                None
+            } else {
+                Some(payload.len() as u64)
+            };
+            self.rollback_after_ts_failure(pre_idx_len, pre_ts_len, dat_rollback);
             return Err(RedexError::io(e));
         }
         drop(ts);
@@ -909,10 +982,7 @@ impl DiskSegment {
             let pre_len = dat.metadata().map_err(RedexError::io)?.len();
             if let Err(e) = dat.write_all(&dat_buf) {
                 drop(dat);
-                let dat_path = self.dir.join("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let _ = f.set_len(pre_len);
-                }
+                self.rollback_truncate("dat", pre_len);
                 return Err(RedexError::io(e));
             }
             drop(dat);
@@ -938,25 +1008,16 @@ impl DiskSegment {
             Err(e) => {
                 drop(idx);
                 if let Some(pre_len) = dat_pre_len {
-                    let dat_path = self.dir.join("dat");
-                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                        let _ = f.set_len(pre_len);
-                    }
+                    self.rollback_truncate("dat", pre_len);
                 }
                 return Err(RedexError::io(e));
             }
         };
         if let Err(e) = idx.write_all(&idx_buf) {
             drop(idx);
-            let idx_path = self.dir.join("idx");
-            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                let _ = f.set_len(idx_pre_len);
-            }
+            self.rollback_truncate("idx", idx_pre_len);
             if let Some(pre_len) = dat_pre_len {
-                let dat_path = self.dir.join("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let _ = f.set_len(pre_len);
-                }
+                self.rollback_truncate("dat", pre_len);
             }
             return Err(RedexError::io(e));
         }
@@ -981,34 +1042,19 @@ impl DiskSegment {
             Ok(m) => m.len(),
             Err(e) => {
                 drop(ts);
-                let idx_path = self.dir.join("idx");
-                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                    let _ = f.set_len(idx_pre_len);
-                }
+                self.rollback_truncate("idx", idx_pre_len);
                 if let Some(pre_len) = dat_pre_len {
-                    let dat_path = self.dir.join("dat");
-                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                        let _ = f.set_len(pre_len);
-                    }
+                    self.rollback_truncate("dat", pre_len);
                 }
                 return Err(RedexError::io(e));
             }
         };
         if let Err(e) = ts.write_all(&ts_buf) {
             drop(ts);
-            let ts_path = self.dir.join("ts");
-            if let Ok(f) = OpenOptions::new().write(true).open(&ts_path) {
-                let _ = f.set_len(ts_pre_len);
-            }
-            let idx_path = self.dir.join("idx");
-            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                let _ = f.set_len(idx_pre_len);
-            }
+            self.rollback_truncate("ts", ts_pre_len);
+            self.rollback_truncate("idx", idx_pre_len);
             if let Some(pre_len) = dat_pre_len {
-                let dat_path = self.dir.join("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let _ = f.set_len(pre_len);
-                }
+                self.rollback_truncate("dat", pre_len);
             }
             return Err(RedexError::io(e));
         }
@@ -1192,8 +1238,27 @@ impl DiskSegment {
             if entry.is_inline() {
                 new_idx_bytes.extend_from_slice(&entry.to_bytes());
             } else {
+                // Heap entry offsets are absolute in the original
+                // dat. Rebase to the new dat by subtracting
+                // `dat_base`. By invariant, every surviving heap
+                // entry has `payload_offset >= dat_base` (dat_base
+                // is derived from the first surviving heap entry's
+                // offset), so a `< dat_base` value indicates the
+                // caller violated the invariant — surface as an
+                // error rather than silently writing 0 (which
+                // would point the entry at unrelated bytes in the
+                // new dat).
+                let abs = entry.payload_offset as u64;
+                let rebased = abs.checked_sub(dat_base).ok_or_else(|| {
+                    RedexError::Encode(format!(
+                        "compact_to: heap entry with payload_offset={} \
+                         below dat_base={} would corrupt the new dat \
+                         layout",
+                        abs, dat_base
+                    ))
+                })?;
                 let mut e = *entry;
-                e.payload_offset = (entry.payload_offset as u64).saturating_sub(dat_base) as u32;
+                e.payload_offset = rebased as u32;
                 new_idx_bytes.extend_from_slice(&e.to_bytes());
             }
         }
@@ -1269,6 +1334,29 @@ impl DiskSegment {
             std::env::temp_dir().join(format!("redex-compact-dat-{}", placeholder_suffix));
         let placeholder_ts =
             std::env::temp_dir().join(format!("redex-compact-ts-{}", placeholder_suffix));
+        // RAII cleanup of the three placeholder files. Pre-fix the
+        // happy-path removal at the bottom of `compact_to` only ran
+        // when every post-rename reopen succeeded; any `?` early
+        // return on `open_or_poison` / `clone_or_poison` left the
+        // placeholders behind in `/tmp` forever, growing without
+        // bound on every reopen-failure event.
+        struct PlaceholderCleanup<'a> {
+            paths: [&'a Path; 3],
+        }
+        impl Drop for PlaceholderCleanup<'_> {
+            fn drop(&mut self) {
+                for path in self.paths {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let _placeholder_cleanup = PlaceholderCleanup {
+            paths: [
+                placeholder_idx.as_path(),
+                placeholder_dat.as_path(),
+                placeholder_ts.as_path(),
+            ],
+        };
         let null_idx = OpenOptions::new()
             .create(true)
             .write(true)
@@ -1405,12 +1493,9 @@ impl DiskSegment {
         *worker_dat_guard = new_dat_worker;
         *worker_ts_guard = new_ts_worker;
 
-        // Clean up placeholders. Best-effort; if the rename
-        // succeeded we can tolerate a stray file in the OS temp
-        // dir.
-        let _ = std::fs::remove_file(&placeholder_idx);
-        let _ = std::fs::remove_file(&placeholder_dat);
-        let _ = std::fs::remove_file(&placeholder_ts);
+        // Placeholder cleanup is handled by `_placeholder_cleanup`'s
+        // Drop above — runs whether we reach this success path OR
+        // bail via an earlier `?` on a post-rename reopen failure.
 
         Ok(())
     }
@@ -2679,5 +2764,155 @@ mod tests {
         );
 
         cleanup(&base);
+    }
+
+    /// Source pin: the idx/dat truncations in
+    /// `pub(super) fn open` recovery MUST each be followed by
+    /// `sync_all()` on the same handle. Pre-fix the recovery code
+    /// did `set_len` without `sync_all`, so a crash between
+    /// truncation and the next durable write could leave the
+    /// torn tail on disk; on next reopen the dat-vs-idx
+    /// invariants would still hold transiently, but a later
+    /// append (which extends the file from the un-synced length
+    /// the OS buffers held) could resurrect the torn region.
+    ///
+    /// The ts (timestamp) sidecar uses `set_len(index.len() * 8)`
+    /// to align length with the (already-recovered) idx — a
+    /// crash here is idempotent because reopen recomputes the
+    /// same surviving index and applies the same alignment, so
+    /// that one set_len is intentionally NOT in scope of this
+    /// pin.
+    ///
+    /// We assert the two recovery-path truncations are present
+    /// in the post-fix shape: `set_len((index.len() * REDEX_ENTRY_SIZE)`
+    /// for idx and `set_len(retained_dat_end)` for dat. For each,
+    /// the next non-blank, non-comment, non-`?` continuation
+    /// line within a small window must contain `sync_all()`.
+    #[test]
+    fn recovery_idx_dat_truncations_must_be_paired_with_sync_all() {
+        let src = include_str!("disk.rs");
+
+        let header = "pub(super) fn open(";
+        let start = src.find(header).expect("DiskSegment::open must exist");
+        let body_start = start + header.len();
+        let next_fn_offsets: Vec<usize> = ["\n    fn ", "\n    pub fn ", "\n    pub(super) fn "]
+            .iter()
+            .filter_map(|p| src[body_start..].find(p).map(|i| i + body_start))
+            .collect();
+        let next_fn = *next_fn_offsets
+            .iter()
+            .min()
+            .expect("a following fn must exist after open()");
+        let body = &src[start..next_fn];
+
+        let lines: Vec<&str> = body
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(idx) => &l[..idx],
+                None => l,
+            })
+            .collect();
+
+        // The two recovery-path truncations the audit's #11 fix
+        // added sync_all for. The ts-sidecar `set_len` is
+        // intentionally excluded (idempotent across crashes).
+        let in_scope_markers = [
+            "set_len((index.len() * REDEX_ENTRY_SIZE)",
+            "set_len(retained_dat_end)",
+        ];
+
+        let mut found_any = [false; 2];
+        let window = 5;
+        for (i, line) in lines.iter().enumerate() {
+            for (mi, marker) in in_scope_markers.iter().enumerate() {
+                if !line.contains(marker) {
+                    continue;
+                }
+                found_any[mi] = true;
+
+                let mut paired = false;
+                for off in 1..=window {
+                    if i + off >= lines.len() {
+                        break;
+                    }
+                    if lines[i + off].contains("sync_all()") {
+                        paired = true;
+                        break;
+                    }
+                }
+                assert!(
+                    paired,
+                    "regression: `{}` in DiskSegment::open recovery at \
+                     (relative) line {} is not followed within {} lines \
+                     by `sync_all()`. A crash between truncation and \
+                     the next durable write reincarnates the torn tail.",
+                    marker, i, window
+                );
+            }
+        }
+
+        for (mi, marker) in in_scope_markers.iter().enumerate() {
+            assert!(
+                found_any[mi],
+                "expected to find `{}` in DiskSegment::open — the \
+                 recovery walk's truncation step appears to have \
+                 been removed or refactored. Audit the new shape \
+                 to confirm the fsync pairing is preserved.",
+                marker
+            );
+        }
+    }
+
+    /// Source pin: `rollback_truncate` must poison the segment
+    /// on BOTH the open-failure and `set_len`-failure branches.
+    /// Pre-fix the rollback used `if let Ok(f) = OpenOptions::...`
+    /// and silently dropped the open error, leaving the segment
+    /// in a permanently-divergent state with no diagnostic. The
+    /// fixed shape uses `match` and stores `true` to
+    /// `self.poisoned` in every error arm.
+    #[test]
+    fn rollback_truncate_must_poison_on_failure() {
+        let src = include_str!("disk.rs");
+
+        let header = "fn rollback_truncate(";
+        let start = src.find(header).expect("rollback_truncate must exist");
+        let body_start = start + header.len();
+        let next_fn_offsets: Vec<usize> = ["\n    fn ", "\n    pub fn ", "\n    pub(super) fn "]
+            .iter()
+            .filter_map(|p| src[body_start..].find(p).map(|i| i + body_start))
+            .collect();
+        let next_fn = *next_fn_offsets
+            .iter()
+            .min()
+            .expect("a following fn must exist after rollback_truncate");
+        let body = &src[start..next_fn];
+
+        // The `poisoned.store(true, Ordering::Release)` line
+        // must appear at least twice in the body (once for the
+        // set_len failure arm, once for the open failure arm).
+        // Pre-fix the function silently swallowed the open error
+        // — only one (or zero) `poisoned.store` calls were
+        // present. Two-or-more is the post-fix shape.
+        let poison_count = body.matches("poisoned.store(true").count();
+        assert!(
+            poison_count >= 2,
+            "regression: rollback_truncate must call \
+             `poisoned.store(true, ...)` in BOTH the open-failure \
+             and set_len-failure arms (saw {} occurrences). \
+             Pre-fix the open-failure arm silently dropped the \
+             error and left the segment divergent.",
+            poison_count
+        );
+
+        // The buggy pattern `if let Ok(f) = OpenOptions::` (which
+        // discards the Err and proceeds without poisoning) must
+        // not reappear inside this function.
+        assert!(
+            !body.contains("if let Ok(f) = OpenOptions::"),
+            "regression: rollback_truncate must not use the \
+             `if let Ok(f) = OpenOptions::...` shape — that \
+             discards the open error, the exact pre-fix bug. \
+             Use `match` and poison on the Err arm."
+        );
     }
 }

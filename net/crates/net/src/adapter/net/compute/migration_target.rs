@@ -241,6 +241,22 @@ impl MigrationTargetHandler {
     ///
     /// Events that arrive out-of-order are buffered in the BTreeMap and
     /// will be replayed in sequence order.
+    ///
+    /// Phase guard: once `activate()` has flipped the state to
+    /// `Cutover`, the normal delivery path is authoritative for this
+    /// daemon — a stale migration-path event arriving here would be
+    /// inserted into `pending_events` and `drain_pending` would
+    /// re-deliver it through the registry, producing duplicate
+    /// execution alongside the post-cutover normal-path delivery of
+    /// the same sequence. Reject `Cutover` events with `Ok(false)`
+    /// (same surface as a not-found origin) so the caller treats the
+    /// event as already-handled rather than retrying.
+    ///
+    /// `MigrationPhase::Complete` is not checked here because
+    /// `complete()` removes the entry from `self.migrations` rather
+    /// than advancing the phase: a `Complete`-phased entry never
+    /// exists in this map, and the `migrations.get` miss above
+    /// returns `Ok(false)` first.
     pub fn buffer_event(
         &self,
         daemon_origin: u32,
@@ -252,6 +268,9 @@ impl MigrationTargetHandler {
         };
 
         let mut state = entry.lock();
+        if state.phase == MigrationPhase::Cutover {
+            return Ok(false);
+        }
         state.pending_events.insert(event.link.sequence, event);
 
         // Try to drain any contiguous events
@@ -359,11 +378,26 @@ impl MigrationTargetHandler {
     }
 
     /// Abort migration — unregister daemon and clean up.
+    ///
+    /// Also clears any idempotency record in `completed`. Pre-fix
+    /// only the active-migration entry was removed; a daemon that
+    /// had been `complete`-d (and thus already had a `completed`
+    /// idempotency record) and was THEN aborted would leak the
+    /// completed entry indefinitely. The leak was minor (one
+    /// 32-bit key + a `CompletedTargetState` per affected
+    /// daemon) but unbounded — every aborted post-completion
+    /// migration accumulated forever, since the only other
+    /// clearance path (`forget_completed`) is keyed off a
+    /// successful source-side cleanup that never arrives in the
+    /// abort path. Clearing both indices makes `abort`
+    /// idempotent in the strong sense: post-abort state
+    /// matches pre-`start_restore` state.
     pub fn abort(&self, daemon_origin: u32) -> Result<(), MigrationError> {
         if self.migrations.remove(&daemon_origin).is_some() {
             // Unregister daemon (it's not authoritative, source still has it)
             let _ = self.daemon_registry.unregister(daemon_origin);
         }
+        self.completed.remove(&daemon_origin);
         Ok(())
     }
 
@@ -635,6 +669,117 @@ mod tests {
         assert_eq!(handler.replayed_through(origin), Some(3));
     }
 
+    /// `buffer_event` must reject events once `activate()` has
+    /// flipped the migration to `Cutover`. Pre-fix the call would
+    /// insert the late event into `pending_events` and `drain_pending`
+    /// would re-deliver it through the daemon registry — duplicate
+    /// execution alongside the post-cutover normal-path delivery of
+    /// the same sequence. The fix returns `Ok(false)` (the same
+    /// surface as a missing migration entry), telling the caller to
+    /// treat the event as already-handled.
+    #[test]
+    fn buffer_event_rejects_post_cutover_events() {
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+
+        let snapshot = make_snapshot(&kp, 5, 5);
+
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        // Activate flips phase to Cutover; the daemon is now driven
+        // by the normal delivery path, not migration buffering.
+        handler.activate(origin).unwrap();
+        assert_eq!(handler.phase(origin), Some(MigrationPhase::Cutover));
+        let replayed_at_cutover = handler.replayed_through(origin).unwrap();
+
+        // A late migration-path event arriving after cutover MUST
+        // NOT be buffered — that would double-deliver against the
+        // normal-path delivery for the same sequence.
+        let accepted = handler
+            .buffer_event(origin, make_event(0xBBBB, replayed_at_cutover + 1))
+            .unwrap();
+        assert!(
+            !accepted,
+            "buffer_event must reject post-cutover events to avoid duplicate delivery",
+        );
+        // Replayed cursor must not have advanced — the event was
+        // dropped, not consumed.
+        assert_eq!(
+            handler.replayed_through(origin),
+            Some(replayed_at_cutover),
+            "replayed_through must not advance from a rejected post-cutover event",
+        );
+    }
+
+    /// Companion to `buffer_event_rejects_post_cutover_events`: once
+    /// `complete()` has run, the migration entry is removed from
+    /// `self.migrations` (rather than transitioned to `Complete`),
+    /// so the `migrations.get` miss is the rejection path. Pin that
+    /// `buffer_event` returns `Ok(false)` and never resurrects the
+    /// removed entry. If a future refactor switches `complete()` to
+    /// keep the entry around with `MigrationPhase::Complete`, this
+    /// test surfaces the regression by failing — the caller then
+    /// owes a phase check matching the new shape.
+    #[test]
+    fn buffer_event_rejects_after_complete() {
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+
+        let snapshot = make_snapshot(&kp, 5, 5);
+
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        // Drive the migration to fully completed.
+        handler.activate(origin).unwrap();
+        handler.complete(origin).unwrap();
+        assert!(
+            !handler.is_migrating(origin),
+            "complete() must remove the migration entry from `migrations`",
+        );
+
+        // A post-complete `buffer_event` must not resurrect the
+        // entry or re-deliver through the registry.
+        let accepted = handler
+            .buffer_event(origin, make_event(0xBBBB, 99))
+            .unwrap();
+        assert!(
+            !accepted,
+            "buffer_event after complete() must return Ok(false)",
+        );
+        assert!(
+            !handler.is_migrating(origin),
+            "buffer_event must not resurrect the migration entry post-complete",
+        );
+    }
+
     #[test]
     fn test_activate_and_complete() {
         let reg = Arc::new(DaemonRegistry::new());
@@ -692,6 +837,60 @@ mod tests {
         handler.abort(origin).unwrap();
         assert!(!handler.is_migrating(origin));
         assert!(!reg.contains(origin)); // daemon unregistered on abort
+    }
+
+    /// Regression: `abort` must clear the `completed`
+    /// idempotency record in addition to removing the active
+    /// migration entry. Pre-fix only `migrations.remove` ran;
+    /// a daemon that had been completed and was THEN aborted
+    /// (e.g. an explicit operator abort after a successful
+    /// migration before `forget_completed` clearance arrived)
+    /// left the `completed` entry in place forever, since the
+    /// only other clearance path keys off a successful source
+    /// cleanup that never reaches an aborted migration. Per
+    /// the audit (#141) this was a minor unbounded leak — one
+    /// `CompletedTargetState` per affected daemon, accumulating
+    /// indefinitely.
+    #[test]
+    fn abort_clears_completed_idempotency_record() {
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+
+        let snapshot = make_snapshot(&kp, 0, 0);
+
+        // Restore + complete → entry lives in `completed`.
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+        handler.complete(origin).unwrap();
+
+        // Sanity: the completed record exists before abort.
+        assert!(
+            handler.completed.contains_key(&origin),
+            "precondition: completed record must exist after complete()"
+        );
+
+        // Abort must clear it.
+        handler.abort(origin).unwrap();
+        assert!(
+            !handler.completed.contains_key(&origin),
+            "regression: abort must clear the completed idempotency \
+             record. Pre-fix the entry leaked indefinitely — the only \
+             other clearance path (forget_completed) keys off a source \
+             cleanup that never arrives for aborted migrations."
+        );
     }
 
     #[test]

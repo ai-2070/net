@@ -133,6 +133,7 @@ fn format_migration_error(err: &SdkMigrationError) -> String {
         SdkMigrationError::TargetUnavailable(node) => {
             format!("migration: target-unavailable: {node:#x}")
         }
+        SdkMigrationError::NoTargetAvailable => "migration: no-target-available".to_string(),
         SdkMigrationError::StateFailed(msg) => format!("migration: state-failed: {msg}"),
         SdkMigrationError::AlreadyMigrating(origin) => {
             format!("migration: already-migrating: {origin:#x}")

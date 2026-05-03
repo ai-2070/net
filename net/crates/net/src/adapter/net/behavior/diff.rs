@@ -226,18 +226,13 @@ impl CapabilityDiff {
 
     /// Serialize to bytes (legacy — silent empty-on-failure path).
     ///
-    /// Prefer [`Self::try_to_bytes`], which validates that the
-    /// encoded diff fits inside the receiver's
-    /// [`MAX_DIFF_BYTES`] / [`MAX_DIFF_OPS`] caps before
-    /// returning. `to_bytes` returns `Vec::new()` on any failure
-    /// (encoding error OR cap violation) — historically callers
-    /// treated an empty result as "encode failed, drop", so the
-    /// cap integration here is bug-compatible. Without the
-    /// pre-emit cap check a sender could build a 100 MB diff and
-    /// dump it to bytes, then every receiver's [`Self::from_bytes`]
-    /// would silently reject it via the same caps, producing
-    /// silent state divergence indistinguishable from a network
-    /// drop.
+    /// Returns `Vec::new()` on any encoding error or cap violation,
+    /// indistinguishable from a legitimate empty diff. A sender
+    /// that hit the cap silently transmits zero bytes; the receiver
+    /// drops the empty payload and the two sides diverge with no
+    /// diagnostic. New callers MUST use [`Self::try_to_bytes`],
+    /// which surfaces the cap violation as a typed error.
+    #[deprecated(note = "use `try_to_bytes` — `to_bytes` swallows cap-violations as an empty Vec")]
     pub fn to_bytes(&self) -> Vec<u8> {
         self.try_to_bytes().unwrap_or_default()
     }
@@ -1206,7 +1201,7 @@ mod tests {
             vec![DiffOp::AddTag("test".into()), DiffOp::UpdateMemory(65536)],
         );
 
-        let bytes = diff.to_bytes();
+        let bytes = diff.try_to_bytes().expect("normal-size diff must encode");
         let parsed = CapabilityDiff::from_bytes(&bytes).unwrap();
 
         assert_eq!(diff.node_id, parsed.node_id);
@@ -1253,7 +1248,12 @@ mod tests {
             .map(|i| DiffOp::AddTag(format!("t{}", i % 10)))
             .collect();
         let diff = CapabilityDiff::new(1, 1, 2, ops);
-        let bytes = diff.to_bytes();
+        // Bypass the cap-aware encoders (`to_bytes` / `try_to_bytes`)
+        // so we can construct a wire payload that is well-formed JSON
+        // but exceeds `MAX_DIFF_OPS`. Going through `to_bytes` here
+        // would yield `Vec::new()` (cap-violation suppression) and
+        // the test would falsely pass against an empty input.
+        let bytes = serde_json::to_vec(&diff).unwrap();
 
         // Sanity-check: the wire payload fits under the byte cap,
         // so the op-count guard is the discriminator.
@@ -1496,7 +1496,9 @@ mod tests {
             .map(|i| DiffOp::AddTag(format!("t{}", i % 10)))
             .collect();
         let diff = CapabilityDiff::new(1, 1, 2, ops);
-        let bytes = diff.to_bytes();
+        let bytes = diff
+            .try_to_bytes()
+            .expect("diff at the exact MAX_DIFF_OPS boundary must encode");
         // Defence-in-depth: if MAX_DIFF_OPS is later raised past
         // what fits in MAX_DIFF_BYTES, this `assert!` fires and the
         // test author can adjust either cap rather than chase a
@@ -1591,12 +1593,13 @@ mod tests {
         assert_eq!(parsed.ops.len(), 2);
     }
 
-    /// CR-10: the legacy `to_bytes` returns Vec::new() on cap
-    /// violation (pre-fix it returned the oversized bytes; post-fix
-    /// it goes through `try_to_bytes` and surfaces "" on Err). Pin
-    /// this so a future caller that relies on empty-means-failure
-    /// stays correct.
+    /// The legacy `to_bytes` returns Vec::new() on cap violation —
+    /// indistinguishable from an empty diff. New callers must use
+    /// `try_to_bytes`; this test pins the legacy path's
+    /// silent-empty behavior so any future change that switches
+    /// the failure mode (e.g. to a panic) doesn't go unnoticed.
     #[test]
+    #[allow(deprecated)]
     fn to_bytes_returns_empty_when_cap_exceeded() {
         let ops: Vec<DiffOp> = (0..(MAX_DIFF_OPS + 5))
             .map(|i| DiffOp::AddTag(format!("t{}", i)))
@@ -1651,6 +1654,41 @@ mod tests {
              the version-naive entry point should warn callers off the \
              silent-rollback hazard. Definition at diff.rs:{}",
             apply_lineno + 1
+        );
+    }
+
+    /// `CapabilityDiff::to_bytes` must carry `#[deprecated]` so a
+    /// future caller doesn't accidentally emit `Vec::new()` on a
+    /// cap violation and assume the encode succeeded. The
+    /// preferred entry point is `try_to_bytes`, which surfaces the
+    /// failure mode as a typed error.
+    #[test]
+    fn capability_diff_to_bytes_must_be_deprecated() {
+        let src = include_str!("diff.rs");
+        let needle = "pub fn to_bytes(";
+        let lines: Vec<&str> = src.lines().collect();
+        let to_bytes_lineno = lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .expect("CapabilityDiff::to_bytes definition must exist");
+
+        let mut found = false;
+        for i in (0..to_bytes_lineno).rev() {
+            let line = lines[i].trim();
+            if line.is_empty() {
+                break;
+            }
+            if line.starts_with("#[deprecated") {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "CapabilityDiff::to_bytes must carry #[deprecated]: \
+             the silent-empty-on-cap-violation behavior is a footgun. \
+             Definition at diff.rs:{}",
+            to_bytes_lineno + 1
         );
     }
 }

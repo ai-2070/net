@@ -596,7 +596,32 @@ impl LocalGraph {
                 // with seq=2 which looks like strict-progress and
                 // DOES overwrite `n.addr`.
                 let likely_restart = n.last_seq > 1 && pw.seq < n.last_seq.saturating_div(2);
-                let strict_progress = pw.seq > n.last_seq || hops < n.hops;
+                // Require BOTH a non-regressing sequence AND a
+                // path no worse than what we have. Pre-fix this
+                // was an OR: `pw.seq > n.last_seq || hops <
+                // n.hops`. The OR's `hops < n.hops` arm let an
+                // attacker who had observed legitimate pingwaves
+                // spoof `(origin_id=Y, seq=K, hops=0)` for any K
+                // strictly less than the current `last_seq`
+                // (e.g. via a not-yet-seen K from before the
+                // dedup-filter window). The dedup filter
+                // admitted the entry, `hops < n.hops` flipped
+                // strict-progress true, and `n.addr` was
+                // overwritten with the attacker's UDP source.
+                //
+                // The AND form requires the attacker to
+                // simultaneously land a fresh seq AND a
+                // non-worse hop count — the fresh-seq half
+                // forces them to have already heard our peer's
+                // current state, and the legitimate "shorter
+                // path discovered" case still triggers because
+                // a real peer producing forward progress also
+                // emits fresh seqs.
+                let strict_progress = pw.seq >= n.last_seq && hops <= n.hops;
+                // Reject the degenerate "no progress at all"
+                // sub-case: when both seq and hops match exactly,
+                // it's a duplicate — touch only.
+                let strict_progress = strict_progress && (pw.seq > n.last_seq || hops < n.hops);
                 if strict_progress {
                     n.last_seq = pw.seq;
                     n.hops = hops;
@@ -1074,6 +1099,60 @@ mod tests {
              a lowered last_seq lets a follow-up seq=2 spoof masquerade as \
              strict progress and overwrite n.addr"
         );
+    }
+
+    /// Pin: a pingwave whose `seq` is below the recorded
+    /// `last_seq` but whose `hops` is shorter MUST NOT
+    /// overwrite the recorded address. Pre-fix the predicate
+    /// was `pw.seq > last_seq || hops < n.hops` — the OR
+    /// arm let an attacker spoofing
+    /// `(origin_id=Y, seq=K, hops=0)` for any K below
+    /// `last_seq` repoint Y's recorded address. Post-fix
+    /// requires BOTH a non-regressing seq AND a non-worse
+    /// hop count.
+    #[test]
+    fn on_pingwave_below_last_seq_with_shorter_hops_does_not_overwrite_addr() {
+        let graph = LocalGraph::new(0x1, 8);
+        let legit: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+
+        // Establish a high seq from the legitimate peer at
+        // recorded hops=3 (constructor's hop_count starts at 0;
+        // we bump it so the +1 inside on_pingwave records 3).
+        for seq in [100u64, 500, 1000].iter() {
+            let mut pw = Pingwave::new(0xBEEF, *seq, 8);
+            pw.hop_count = 2;
+            graph.on_pingwave(pw, legit);
+        }
+        assert_eq!(
+            graph
+                .nodes
+                .get(&0xBEEF)
+                .map(|n| (n.addr, n.last_seq, n.hops))
+                .unwrap(),
+            (legit, 1000, 3),
+        );
+
+        // Attacker spoofs a stale seq with shorter hops
+        // (recorded hops would become 1) from their own UDP
+        // source. Pre-fix `hops < n.hops` (1 < 3) flipped
+        // strict_progress true and overwrote n.addr.
+        let attacker: SocketAddr = "192.0.2.99:31337".parse().unwrap();
+        let spoof = Pingwave::new(0xBEEF, 800, 8);
+        graph.on_pingwave(spoof, attacker);
+
+        let (recorded_addr, recorded_last_seq, recorded_hops) = graph
+            .nodes
+            .get(&0xBEEF)
+            .map(|n| (n.addr, n.last_seq, n.hops))
+            .unwrap();
+        assert_eq!(
+            recorded_addr, legit,
+            "stale-seq + shorter-hops spoof must NOT repoint addr; \
+             got {:?}",
+            recorded_addr,
+        );
+        assert_eq!(recorded_last_seq, 1000, "last_seq must not regress");
+        assert_eq!(recorded_hops, 3, "hops must not be lowered by stale seq");
     }
 
     /// Sanity: a small seq regression that is NOT below

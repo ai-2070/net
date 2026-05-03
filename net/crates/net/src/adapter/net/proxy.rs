@@ -336,15 +336,50 @@ impl NetProxy {
                 ref packet,
                 latency_ns,
             } => {
-                self.socket
-                    .send_to(packet, next_hop)
-                    .await
-                    .map_err(|e| ProxyError::SendFailed(e.to_string()))?;
-                Ok(ForwardResult::Forwarded {
-                    next_hop,
-                    packet: packet.clone(),
-                    latency_ns,
-                })
+                let packet_len = packet.len() as u64;
+                match self.socket.send_to(packet, next_hop).await {
+                    Ok(_) => Ok(ForwardResult::Forwarded {
+                        next_hop,
+                        packet: packet.clone(),
+                        latency_ns,
+                    }),
+                    Err(e) => {
+                        // Roll back the telemetry counters
+                        // `forward()` bumped speculatively. Pre-fix
+                        // `packets_forwarded` / `bytes_forwarded` /
+                        // `total_latency_ns` / `latency_samples` all
+                        // counted the prepared packet as if it had
+                        // shipped, even when the kernel rejected the
+                        // send below — operators reading the
+                        // forwarded-packet rate saw a count that
+                        // included would-be sends that never crossed
+                        // the wire. Saturating-sub guards against an
+                        // arithmetic underflow if the counter was
+                        // somehow reset between the bump and this
+                        // rollback.
+                        self.packets_forwarded
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                Some(v.saturating_sub(1))
+                            })
+                            .ok();
+                        self.bytes_forwarded
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                Some(v.saturating_sub(packet_len))
+                            })
+                            .ok();
+                        self.total_latency_ns
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                Some(v.saturating_sub(latency_ns))
+                            })
+                            .ok();
+                        self.latency_samples
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                Some(v.saturating_sub(1))
+                            })
+                            .ok();
+                        Err(ProxyError::SendFailed(e.to_string()))
+                    }
+                }
             }
             ForwardResult::Local(payload) => Ok(ForwardResult::Local(payload)),
             ForwardResult::Dropped(e) => Err(e),

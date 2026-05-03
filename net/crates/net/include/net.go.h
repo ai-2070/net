@@ -39,6 +39,8 @@ typedef enum {
     NET_ERR_INT_OVERFLOW = -9,
     /* Stream handle does not belong to the supplied node. */
     NET_ERR_MISMATCHED_HANDLES = -10,
+    /* CString::new interior NUL — see net.h for full rationale. */
+    NET_ERR_INTERIOR_NUL = -11,
     NET_ERR_UNKNOWN = -99,
     /* CortEX / RedEX surface (compiled when the Rust cdylib has
      * `netdb` + `redex-disk` features on). Codes below -99 so they

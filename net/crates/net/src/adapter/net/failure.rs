@@ -294,7 +294,13 @@ impl FailureDetector {
 
     /// Clean up stale entries (nodes that have been failed for too long)
     pub fn cleanup(&self) -> usize {
-        let mut last = self.last_cleanup.lock().unwrap();
+        // Recover from poisoning rather than panic. A panic
+        // anywhere holding this mutex would otherwise turn every
+        // subsequent `cleanup()` call into a runtime panic that
+        // takes the failure-detection loop down with it. Matches
+        // the recovery pattern used elsewhere in the crate
+        // (e.g. `crypto.rs::sliding_window`).
+        let mut last = self.last_cleanup.lock().unwrap_or_else(|p| p.into_inner());
         if last.elapsed() < self.config.cleanup_interval {
             return 0;
         }
@@ -547,7 +553,7 @@ impl CircuitBreaker {
         // Fast path: read lock for the common Closed/HalfOpen case so
         // typical allow() calls don't contend on the writer lock.
         {
-            let state = *self.state.read().unwrap();
+            let state = *self.state.read().unwrap_or_else(|p| p.into_inner());
             match state {
                 CircuitState::Closed | CircuitState::HalfOpen => return true,
                 CircuitState::Open => {} // fall through to slow path
@@ -562,11 +568,15 @@ impl CircuitBreaker {
         // state. record_success/record_failure deliberately hold the
         // write lock throughout for the same reason; allow() was the
         // outlier.
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
         match *state {
             CircuitState::Closed | CircuitState::HalfOpen => true,
             CircuitState::Open => {
-                let elapsed = self.last_state_change.lock().unwrap().elapsed();
+                let elapsed = self
+                    .last_state_change
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .elapsed();
                 if elapsed >= self.reset_timeout {
                     Self::transition_locked(
                         &mut state,
@@ -589,7 +599,7 @@ impl CircuitBreaker {
         // Hold write lock through the entire read-decide-transition path
         // to prevent TOCTOU races where concurrent threads undo each other's
         // state transitions.
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
         match *state {
             CircuitState::Closed => {
                 // Reset failure count on success
@@ -617,7 +627,7 @@ impl CircuitBreaker {
         // Hold write lock through the entire read-decide-transition path
         // to prevent TOCTOU races where concurrent threads undo each other's
         // state transitions.
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
         match *state {
             CircuitState::Closed => {
                 let count = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -649,7 +659,7 @@ impl CircuitBreaker {
 
     /// Get current state
     pub fn state(&self) -> CircuitState {
-        *self.state.read().unwrap()
+        *self.state.read().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Get total trip count
@@ -665,7 +675,7 @@ impl CircuitBreaker {
     }
 
     fn transition_to(&self, new_state: CircuitState) {
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
         Self::transition_locked(
             &mut state,
             new_state,
@@ -689,7 +699,7 @@ impl CircuitBreaker {
         let old_state = *state;
         if old_state != new_state {
             *state = new_state;
-            *last_state_change.lock().unwrap() = Instant::now();
+            *last_state_change.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
 
             // Reset counters on transition
             failure_count.store(0, Ordering::Relaxed);
@@ -782,14 +792,25 @@ impl RecoveryManager {
 
     /// Handle a node failure
     pub fn on_failure(&self, node_id: u64, alternates: Vec<u64>) -> RecoveryAction {
-        self.failed_nodes.insert(
-            node_id,
-            FailedNodeState {
+        // Repeat failures must NOT reset `failed_at` or
+        // `retry_count`. A flapping peer that fails, gets one or
+        // more retries, then fails again would otherwise have its
+        // retry budget restored from zero each time and never
+        // reach `max_retries` in `get_action`. Preserve the
+        // existing state on a repeat; refresh `alternates` so a
+        // newly-discovered reroute path takes effect.
+        self.failed_nodes
+            .entry(node_id)
+            .and_modify(|s| {
+                if !alternates.is_empty() {
+                    s.alternates = alternates.clone();
+                }
+            })
+            .or_insert_with(|| FailedNodeState {
                 failed_at: Instant::now(),
                 retry_count: 0,
                 alternates: alternates.clone(),
-            },
-        );
+            });
 
         if !alternates.is_empty() {
             self.reroutes.fetch_add(1, Ordering::Relaxed);
@@ -798,7 +819,7 @@ impl RecoveryManager {
             self.queued.fetch_add(1, Ordering::Relaxed);
             self.recovery_queue
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .push_back((node_id, Instant::now()));
             RecoveryAction::Queue
         }
@@ -835,8 +856,17 @@ impl RecoveryManager {
                 reason: "max retries exceeded".into(),
             }
         } else {
-            // Node not in failed list, normal operation
-            RecoveryAction::Retry { delay_ms: 0 }
+            // Node not in failed list — caller asked for an action
+            // on a node we don't track as failed. Pre-fix this
+            // returned `Retry { delay_ms: 0 }`, which a caller
+            // dutifully respecting the delay would busy-loop on.
+            // The semantically-cleanest answer is "no action
+            // needed, treat as healthy," but the variant doesn't
+            // exist. Return the same 100ms first-backoff step the
+            // failed-node path uses on its first retry, so the
+            // caller paces itself even when get_action was called
+            // by mistake on a healthy node.
+            RecoveryAction::Retry { delay_ms: 100 }
         }
     }
 
@@ -1270,6 +1300,89 @@ mod tests {
         assert_eq!(stats.queued, 1);
     }
 
+    /// Pin: a flapping peer (fail, retry, fail, retry, ...) must
+    /// reach `max_retries` and be dropped. Pre-fix `on_failure`
+    /// unconditionally re-`insert`-ed the node, resetting
+    /// `retry_count` to 0 every time, so `get_action` never saw
+    /// the count climb past 1 and the node was retried forever.
+    #[test]
+    fn on_failure_preserves_retry_count_on_repeat() {
+        let mgr = RecoveryManager::new();
+        let node = 0x42u64;
+        let max_retries = 3u32;
+
+        // Failure 1 → enters the failed list with retry_count=0,
+        // no alternates so action is Queue.
+        let action = mgr.on_failure(node, vec![]);
+        assert!(matches!(action, RecoveryAction::Queue));
+
+        // Drive `get_action` to bump retry_count up to the cap.
+        for expected_count in 1..=max_retries {
+            match mgr.get_action(node, max_retries) {
+                RecoveryAction::Retry { .. } => {}
+                other => panic!(
+                    "expected Retry on attempt {} (count would become {}), got {:?}",
+                    expected_count, expected_count, other
+                ),
+            }
+        }
+
+        // Now simulate a re-failure WITHOUT recovery in between
+        // (the flapping case). Pre-fix this re-`insert`-ed and
+        // wiped `retry_count` back to 0, restoring an unbounded
+        // retry budget.
+        let _ = mgr.on_failure(node, vec![]);
+
+        // The very next `get_action` must return Drop — the
+        // budget set by the prior Retries should still apply.
+        match mgr.get_action(node, max_retries) {
+            RecoveryAction::Drop { .. } => {}
+            other => panic!(
+                "expected Drop after exhausting retries across a flap; got {:?} \
+                 (pre-fix on_failure reset retry_count to 0 on repeat)",
+                other
+            ),
+        }
+    }
+
+    /// Pin: a repeat `on_failure` carrying newly-discovered
+    /// alternates must update the alternates list (so a node
+    /// that was unreachable can become reroutable when topology
+    /// changes), but must NOT reset `retry_count`.
+    #[test]
+    fn on_failure_repeat_updates_alternates_without_resetting_count() {
+        let mgr = RecoveryManager::new();
+        let node = 0x99u64;
+        let max_retries = 2u32;
+
+        // First failure with no alternates → Queue.
+        let _ = mgr.on_failure(node, vec![]);
+        // Bump the retry count once via get_action.
+        let _ = mgr.get_action(node, max_retries);
+
+        // Second failure now learns of an alternate — semantics
+        // should switch to Reroute, but the prior retry_count
+        // must be preserved.
+        let action = mgr.on_failure(node, vec![0xDEAD]);
+        match action {
+            RecoveryAction::Reroute { via } => assert_eq!(via, vec![0xDEAD]),
+            other => panic!("expected Reroute, got {:?}", other),
+        }
+
+        // One more get_action without alternates path: clear
+        // alternates and confirm retry budget is exhausted at
+        // max_retries (count was 1 after first get_action; one
+        // more retry brings it to 2; the next call must Drop).
+        if let Some(mut s) = mgr.failed_nodes.get_mut(&node) {
+            s.alternates.clear();
+        }
+        let _ = mgr.get_action(node, max_retries); // count → 2 (== max)
+        match mgr.get_action(node, max_retries) {
+            RecoveryAction::Drop { .. } => {}
+            other => panic!("expected Drop after exhausting retries; got {:?}", other),
+        }
+    }
+
     /// Regression: BUG_REPORT.md #14 — `heartbeat` and `check_all`
     /// previously invoked the user-supplied recovery / failure
     /// callbacks while still holding the DashMap shard's write
@@ -1340,5 +1453,44 @@ mod tests {
              a deadlock here would manifest as the test hanging (#14)"
         );
         let _ = detector;
+    }
+
+    /// Pin: `get_action` on a node not in the failed list must
+    /// return a non-zero retry delay. Pre-fix the unfailed-node
+    /// branch returned `Retry { delay_ms: 0 }`, which a caller
+    /// dutifully respecting the delay would busy-loop on,
+    /// pegging a CPU. The fix returns the same first-step
+    /// backoff (100ms) the failed-node path uses on retry 1, so
+    /// the caller paces itself even when `get_action` was
+    /// called by mistake on a healthy node.
+    #[test]
+    fn get_action_on_unfailed_node_does_not_busy_loop() {
+        let mgr = RecoveryManager::new();
+        let untracked = 0xDEAD_BEEFu64;
+
+        // Sanity: node is not in the failed list.
+        assert!(
+            !mgr.is_failed(untracked),
+            "precondition: node must not be tracked as failed"
+        );
+
+        let action = mgr.get_action(untracked, 3);
+        match action {
+            RecoveryAction::Retry { delay_ms } => {
+                assert!(
+                    delay_ms > 0,
+                    "regression: get_action on an unfailed node returned \
+                     Retry {{ delay_ms: 0 }} — a delay-respecting caller \
+                     would busy-loop on this and saturate a CPU"
+                );
+                assert_eq!(
+                    delay_ms, 100,
+                    "first-step backoff should match the failed-node \
+                     path's retry-1 delay (100ms) so callers pace \
+                     consistently across both branches"
+                );
+            }
+            other => panic!("unfailed-node branch must return Retry, got {:?}", other),
+        }
     }
 }

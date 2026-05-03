@@ -93,13 +93,37 @@ impl PropagationModel {
         } else {
             *self.level_multipliers.last().unwrap_or(&1.0)
         };
-        if multiplier == 0.0 {
+        // Guard against pathological multipliers. The original
+        // `== 0.0` check missed NaN (NaN compares unequal to
+        // everything, including zero) — a calibrated multiplier
+        // that turned NaN would slip through and propagate NaN
+        // through the EWMA, locking subsequent `estimate_latency`
+        // calls at zero or u64::MAX. Negative multipliers are also
+        // nonsense for a latency scale and would invert the EWMA.
+        if !multiplier.is_finite() || multiplier <= 0.0 {
             return;
         }
 
         // Compute implied per-hop base latency: RTT / 2 / hops / multiplier
-        let per_hop =
-            (measured_rtt_nanos as f64 / (2.0 * hop_count as f64 * multiplier as f64)) as u64;
+        let per_hop_f = measured_rtt_nanos as f64 / (2.0 * hop_count as f64 * multiplier as f64);
+        // Reject samples that overflow the u64 cast or aren't a
+        // real number. Pre-fix, a pathological RTT (or a NaN
+        // multiplier slipping through) clamped `per_hop` at
+        // u64::MAX via the saturating `as u64` cast, then the EWMA
+        // pulled `base_hop_latency_nanos` toward u64::MAX
+        // permanently — every later `estimate_latency` returned an
+        // absurd duration and `max_depth_within` rejected every
+        // depth.
+        if !per_hop_f.is_finite() || per_hop_f < 0.0 {
+            return;
+        }
+        // A single sample that implies a per-hop RTT > 1 second is
+        // either measurement noise or a degenerate hop count; the
+        // EWMA would otherwise incorporate ~10% of `u64::MAX` and
+        // never recover. Cap the sample's contribution at a sane
+        // upper bound rather than ingesting infinity.
+        const MAX_REASONABLE_PER_HOP_NANOS: f64 = 1_000_000_000.0;
+        let per_hop = per_hop_f.min(MAX_REASONABLE_PER_HOP_NANOS) as u64;
         let alpha = if self.sample_count < 10 { 0.5 } else { 0.1 };
 
         self.base_hop_latency_nanos =
@@ -225,6 +249,65 @@ mod tests {
         // Base should move toward 5us from default 100us
         model.calibrate(a, b, 2, 20_000);
         assert!(model.base_hop_latency_nanos < PropagationModel::DEFAULT_BASE_HOP_NANOS);
+    }
+
+    /// Pathological RTT measurements must not poison the EWMA.
+    /// Pre-fix, an absurdly large `measured_rtt_nanos` clamped
+    /// `per_hop` at `u64::MAX` via the lossy `as u64` cast, then
+    /// the EWMA pulled `base_hop_latency_nanos` toward `u64::MAX`
+    /// permanently. Once poisoned, every later `estimate_latency`
+    /// returned an absurd duration and `max_depth_within` rejected
+    /// every depth.
+    #[test]
+    fn calibrate_rejects_pathological_samples() {
+        let mut model = PropagationModel::new();
+        let a = SubnetId::new(&[1]);
+        let b = SubnetId::new(&[1, 2]);
+        let baseline = model.base_hop_latency_nanos;
+
+        // u64::MAX RTT — the pathological case.
+        model.calibrate(a, b, 1, u64::MAX);
+        // The EWMA must NOT have run away. With the per-hop cap at
+        // 1s, the alpha=0.5 first-sample weighting can move the
+        // base by at most 500ms — far below the explosion the bug
+        // produced (which would land near u64::MAX).
+        assert!(
+            model.base_hop_latency_nanos < 1_000_000_000,
+            "EWMA must not be poisoned by pathological RTT (got {} ns)",
+            model.base_hop_latency_nanos,
+        );
+        // A subsequent sane calibration must still converge toward
+        // the implied value — the EWMA can't be locked.
+        let after_pathological = model.base_hop_latency_nanos;
+        for _ in 0..50 {
+            model.calibrate(a, b, 2, 20_000); // 5 us per hop
+        }
+        assert!(
+            model.base_hop_latency_nanos < after_pathological,
+            "EWMA stuck after pathological sample (still at {} ns, started this phase at {})",
+            model.base_hop_latency_nanos,
+            after_pathological,
+        );
+        let _ = baseline;
+    }
+
+    /// A NaN multiplier (e.g. via a corrupted `level_multipliers`
+    /// entry) must skip the calibration sample rather than feed
+    /// NaN into the EWMA. Pre-fix the `multiplier == 0.0` guard
+    /// missed NaN (NaN compares unequal to everything).
+    #[test]
+    fn calibrate_rejects_nan_multiplier() {
+        let mut model = PropagationModel::new();
+        // Inject NaN at the level used by depth=0.
+        model.level_multipliers[0] = f32::NAN;
+        let a = SubnetId::new(&[1, 2]);
+        let baseline = model.base_hop_latency_nanos;
+
+        model.calibrate(a, a, 2, 50_000);
+        assert_eq!(
+            model.base_hop_latency_nanos, baseline,
+            "NaN multiplier must skip calibration, not corrupt the EWMA",
+        );
     }
 
     #[test]

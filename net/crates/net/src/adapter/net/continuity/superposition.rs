@@ -103,9 +103,24 @@ impl SuperpositionState {
         self.target_head = new_head;
         self.target_replayed_through = new_head.sequence;
 
-        // Check if target has caught up to source
+        // Check if target has caught up to source. Pre-fix this
+        // only transitioned from `Superposed`. If `target_replayed`
+        // arrived while still in `Spreading` (target catches up
+        // before `advance(Replay)` flips the phase to Superposed),
+        // the catch-up was observed but the phase was stuck —
+        // `target_replayed` is wire-driven, not re-invoked on phase
+        // change, so `ReadyToCollapse` never fired and the
+        // migration stalled.
+        //
+        // Transition from either `Spreading` or `Superposed` on
+        // catch-up. The other phases (`Localized` before the
+        // migration starts, `ReadyToCollapse` / `Collapsed` /
+        // `Resolved` after) shouldn't react.
         if self.target_replayed_through >= self.source_head.sequence
-            && self.phase == SuperpositionPhase::Superposed
+            && matches!(
+                self.phase,
+                SuperpositionPhase::Superposed | SuperpositionPhase::Spreading
+            )
         {
             self.phase = SuperpositionPhase::ReadyToCollapse;
         }
@@ -260,6 +275,38 @@ mod tests {
 
         state.resolve();
         assert_eq!(state.phase(), SuperpositionPhase::Resolved);
+    }
+
+    /// Pin: `target_replayed` must transition from `Spreading`
+    /// to `ReadyToCollapse` when the target catches up before
+    /// the migration phase has been advanced to Replay. Pre-fix
+    /// the transition only fired from `Superposed`; if the
+    /// target catch-up signal arrived while still in
+    /// `Spreading` (target replayed faster than the
+    /// orchestrator's phase advance), the migration stalled —
+    /// `target_replayed` is wire-driven and isn't re-invoked
+    /// when `advance(Replay)` later flips the phase.
+    #[test]
+    fn target_replayed_can_transition_from_spreading() {
+        let source_head = make_link(0xAAAA, 100);
+        let mut state = SuperpositionState::new(0xAAAA, source_head);
+
+        // Migration starts; phase is Spreading (Transfer).
+        state.advance(MigrationPhase::Transfer);
+        assert_eq!(state.phase(), SuperpositionPhase::Spreading);
+
+        // Target catches up before the orchestrator advances
+        // to Replay.
+        state.target_replayed(make_link(0xAAAA, 100));
+        assert!(state.target_caught_up());
+        // Pre-fix this stayed at `Spreading`. Post-fix it
+        // transitions directly to `ReadyToCollapse`.
+        assert_eq!(
+            state.phase(),
+            SuperpositionPhase::ReadyToCollapse,
+            "target_replayed must transition Spreading → ReadyToCollapse \
+             when target catches up; pre-fix this stuck at Spreading"
+        );
     }
 
     #[test]

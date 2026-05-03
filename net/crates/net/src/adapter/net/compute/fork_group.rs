@@ -222,11 +222,41 @@ impl ForkGroup {
                 });
             }
         } else if n < current {
+            // Pre-fix this loop relied on an unstated invariant
+            // — `coord.remove_last()` returning `Some` always
+            // implies a parallel `forks` entry to `pop`. The two
+            // structures are populated in lockstep above (every
+            // `coord.add_member` is followed by `self.forks.push`),
+            // but the loop offered no defense against a divergent
+            // state and would spin forever if `remove_last`
+            // returned `None` while `member_count() > n` (e.g. a
+            // future invariant violation introduced elsewhere).
+            //
+            // Two hardening steps:
+            // 1. `break` on `None` from `remove_last` — a divergence
+            //    is reported via the debug_assert; in release we
+            //    refuse to spin and exit the loop with the rest of
+            //    state best-effort.
+            // 2. `debug_assert!` that `forks.pop` returned `Some`
+            //    matching the coord remove. CI catches divergence;
+            //    release silently moves on.
             while self.coord.member_count() > n {
-                if let Some(info) = self.coord.remove_last() {
-                    let _ = registry.unregister(info.origin_hash);
-                    self.forks.pop();
-                }
+                let Some(info) = self.coord.remove_last() else {
+                    debug_assert!(
+                        false,
+                        "fork_group: coord.member_count() > n but remove_last() returned None — \
+                         coord/forks invariant violated"
+                    );
+                    break;
+                };
+                let _ = registry.unregister(info.origin_hash);
+                let popped = self.forks.pop();
+                debug_assert!(
+                    popped.is_some(),
+                    "fork_group: removed coord member {origin:#x} but forks vec was empty — \
+                     coord and forks must stay in lockstep",
+                    origin = info.origin_hash,
+                );
             }
         }
 

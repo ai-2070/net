@@ -53,8 +53,20 @@ impl TokenScope {
     }
 
     /// Check if this scope includes another.
+    ///
+    /// A scope never "contains" `NONE`: the bit-mask identity
+    /// `(self.bits & 0) == 0` would otherwise return true for every
+    /// token, so a caller that builds `action: TokenScope` from
+    /// external input — e.g. a wire `u32` masked into a smaller
+    /// subset — that happens to mask to `NONE` would receive a
+    /// blanket `true` against any token. Short-circuit `NONE` so the
+    /// caller's "do they have permission X" question rejects the
+    /// no-op action.
     #[inline]
     pub const fn contains(self, other: Self) -> bool {
+        if other.bits == 0 {
+            return false;
+        }
         (self.bits & other.bits) == other.bits
     }
 
@@ -407,23 +419,40 @@ impl PermissionToken {
         Ok(child)
     }
 
-    /// Serialize the fields that are covered by the signature.
-    fn signed_payload(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(Self::SIGNED_PAYLOAD_SIZE);
-        buf.extend_from_slice(self.issuer.as_bytes());
-        buf.extend_from_slice(self.subject.as_bytes());
-        buf.extend_from_slice(&self.scope.bits().to_le_bytes());
-        buf.extend_from_slice(&self.channel_hash.to_le_bytes());
-        buf.extend_from_slice(&self.not_before.to_le_bytes());
-        buf.extend_from_slice(&self.not_after.to_le_bytes());
-        buf.push(self.delegation_depth);
-        buf.extend_from_slice(&self.nonce.to_le_bytes());
+    /// Serialize the fields that are covered by the signature into
+    /// a fixed-size stack buffer. The struct's signed-payload size
+    /// is a compile-time constant (95 bytes), so we don't need a
+    /// heap allocation per verify — the previous `Vec::with_capacity`
+    /// allocated and freed 95 bytes on every signature check, which
+    /// is the hottest path on every authenticated mesh packet.
+    /// Returning `[u8; SIGNED_PAYLOAD_SIZE]` keeps the layout
+    /// identical to the heap version (the existing callers'
+    /// `&payload` still resolves to a `&[u8]`).
+    fn signed_payload(&self) -> [u8; Self::SIGNED_PAYLOAD_SIZE] {
+        let mut buf = [0u8; Self::SIGNED_PAYLOAD_SIZE];
+        let mut off = 0;
+        buf[off..off + 32].copy_from_slice(self.issuer.as_bytes());
+        off += 32;
+        buf[off..off + 32].copy_from_slice(self.subject.as_bytes());
+        off += 32;
+        buf[off..off + 4].copy_from_slice(&self.scope.bits().to_le_bytes());
+        off += 4;
+        buf[off..off + 2].copy_from_slice(&self.channel_hash.to_le_bytes());
+        off += 2;
+        buf[off..off + 8].copy_from_slice(&self.not_before.to_le_bytes());
+        off += 8;
+        buf[off..off + 8].copy_from_slice(&self.not_after.to_le_bytes());
+        off += 8;
+        buf[off] = self.delegation_depth;
+        off += 1;
+        buf[off..off + 8].copy_from_slice(&self.nonce.to_le_bytes());
         buf
     }
 
     /// Serialize to wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = self.signed_payload();
+        let mut buf = Vec::with_capacity(Self::WIRE_SIZE);
+        buf.extend_from_slice(&self.signed_payload());
         buf.extend_from_slice(&self.signature);
         buf
     }
@@ -572,24 +601,38 @@ impl TokenCache {
 
         // Slot cap: only refuse NOVEL keys at the cap so existing
         // peers' token refreshes still work under flood pressure.
-        // The cap is read from the DashMap atomically
-        // per shard; the `contains_key` + `len` race is benign for
-        // a soft cap (overshoot by O(shards) is tolerable).
-        if !self.tokens.contains_key(&key) && self.tokens.len() >= MAX_TOKEN_SLOTS {
-            return;
-        }
+        // The cap is enforced AFTER releasing the per-shard entry
+        // lock — calling `self.tokens.len()` while holding the
+        // entry's write guard would deadlock on our own shard
+        // (DashMap's `len` walks every shard's lock). We accept a
+        // brief observable overshoot — the inserted token is valid
+        // and short-lived between `insert` and `remove` — in
+        // exchange for guaranteed convergence. Pre-fix, a parallel
+        // `contains_key` + `len` pre-check let N callers all see
+        // `len < cap` and overshoot by N, with no rollback.
+        let inserted_novel_key = {
+            let mut entry = self.tokens.entry(key).or_default();
+            let was_empty = entry.is_empty();
+            // Replace any existing token with exactly the same scope;
+            // otherwise push so distinct-scope tokens coexist.
+            if let Some(slot) = entry.iter_mut().find(|t| t.scope == token.scope) {
+                *slot = token;
+            } else if entry.len() < MAX_TOKENS_PER_SLOT {
+                // Within-slot cap: drop novel-scope tokens when the
+                // slot is already at capacity. Refresh of an existing
+                // scope still hits the branch above, so this only
+                // fires on attempts to stack a new scope.
+                entry.push(token);
+            }
+            was_empty
+        };
 
-        let mut entry = self.tokens.entry(key).or_default();
-        // Replace any existing token with exactly the same scope;
-        // otherwise push so distinct-scope tokens coexist.
-        if let Some(slot) = entry.iter_mut().find(|t| t.scope == token.scope) {
-            *slot = token;
-        } else if entry.len() < MAX_TOKENS_PER_SLOT {
-            // Within-slot cap: drop novel-scope tokens when the
-            // slot is already at capacity. Refresh of an existing
-            // scope still hits the branch above, so this
-            // only fires on attempts to stack a new scope.
-            entry.push(token);
+        // Post-insert rollback: if we just admitted a fresh slot
+        // key and the cache is now over the soft cap, remove the
+        // slot we inserted. Concurrent racers all hit this branch
+        // and converge to `len() <= MAX_TOKEN_SLOTS`.
+        if inserted_novel_key && self.tokens.len() > MAX_TOKEN_SLOTS {
+            self.tokens.remove(&key);
         }
     }
 
@@ -1201,6 +1244,47 @@ mod tests {
         assert_eq!(parsed.channel_hash, 0xBEEF);
         assert_eq!(parsed.delegation_depth, 3);
         assert_eq!(parsed.nonce, token.nonce);
+    }
+
+    /// `TokenScope::contains(NONE)` must return `false` — the bit
+    /// identity `(bits & 0) == 0` is unconditionally true, so any
+    /// token would otherwise "contain" the no-op action. A caller
+    /// that builds `action: TokenScope` from external input (e.g. a
+    /// wire `u32` masked into a smaller subset) would then receive
+    /// a blanket `true` against any token whenever the masked input
+    /// happened to land on `NONE`.
+    #[test]
+    fn token_scope_does_not_contain_none() {
+        // Any defined scope must NOT contain NONE.
+        for s in [
+            TokenScope::PUBLISH,
+            TokenScope::SUBSCRIBE,
+            TokenScope::ADMIN,
+            TokenScope::DELEGATE,
+            TokenScope::WILDCARD,
+            TokenScope::ALL,
+            TokenScope::PUBLISH.union(TokenScope::SUBSCRIBE),
+        ] {
+            assert!(
+                !s.contains(TokenScope::NONE),
+                "scope {:?} must not contain NONE",
+                s.bits(),
+            );
+        }
+        // Even NONE itself does not "contain" NONE — the question is
+        // "do you authorize this action," and the no-op action is
+        // never authorized.
+        assert!(
+            !TokenScope::NONE.contains(TokenScope::NONE),
+            "NONE.contains(NONE) must be false (no token authorizes the no-op action)",
+        );
+
+        // Sanity: contains is still correct for non-NONE arguments.
+        assert!(TokenScope::ALL.contains(TokenScope::PUBLISH));
+        assert!(!TokenScope::PUBLISH.contains(TokenScope::ADMIN));
+        assert!(TokenScope::PUBLISH
+            .union(TokenScope::SUBSCRIBE)
+            .contains(TokenScope::SUBSCRIBE));
     }
 
     #[test]
@@ -2047,6 +2131,105 @@ mod tests {
         assert_eq!(
             refreshed.nonce, 1111,
             "refresh-of-existing-scope must succeed at cap"
+        );
+    }
+
+    /// Concurrent novel-key inserts must NOT overshoot
+    /// `MAX_TOKEN_SLOTS`. Pre-fix the path was:
+    ///
+    /// ```ignore
+    /// if !contains_key(&key) && len() >= cap { return; }
+    /// entry(key).or_default()...
+    /// ```
+    ///
+    /// N threads could all observe `len() < cap` simultaneously and
+    /// each go on to `or_default()` a fresh entry — overshoot
+    /// proportional to N (bounded only by concurrency, NOT by
+    /// `DashMap` shard count as the prior comment claimed). Under a
+    /// peer-driven token flood across a multi-core daemon, this
+    /// uncaps the cache.
+    ///
+    /// Prefill the DashMap directly (bypassing the expensive
+    /// PermissionToken::issue ed25519-sign + clone pipeline) to
+    /// `MAX_TOKEN_SLOTS - SLACK`, then run `THREADS` concurrent
+    /// `insert_unchecked` calls each carrying a distinct novel key.
+    /// After the dust settles, the cache must hold at most
+    /// `MAX_TOKEN_SLOTS` — the slack lets a few inserts succeed
+    /// (correct) while the rest must roll back (the gate).
+    #[test]
+    fn insert_unchecked_does_not_overshoot_under_concurrent_novel_inserts() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const SLACK: usize = 4;
+        const THREADS: usize = 32;
+
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let cache = Arc::new(TokenCache::new());
+
+        // Build one template token (one ed25519 sign) and seed
+        // `MAX_TOKEN_SLOTS - SLACK` slot keys directly into the
+        // backing `DashMap`. We aren't testing what the prefill
+        // path does — we're testing the cap gate against a single
+        // wave of concurrent novel inserts, so prefill speed
+        // matters, not prefill semantics.
+        let template = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+        let prefill = MAX_TOKEN_SLOTS - SLACK;
+        for ch in 0u32..prefill as u32 {
+            let mut t = template.clone();
+            t.channel_hash = ch as u16;
+            cache
+                .tokens
+                .insert((*subject.entity_id().as_bytes(), ch as u16), vec![t]);
+        }
+        assert_eq!(cache.tokens.len(), prefill);
+
+        // Each thread inserts a unique novel key (different subject
+        // bytes — synthesized directly so we don't pay an ed25519
+        // generate per thread). The race is around the gate's
+        // len()-check vs entry-insert.
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for tid in 0..THREADS {
+            let cache = Arc::clone(&cache);
+            let mut novel = template.clone();
+            // Synthesize a novel subject by mutating the bytes —
+            // identity verification is bypassed by `insert_unchecked`.
+            let mut subj_bytes = *subject.entity_id().as_bytes();
+            subj_bytes[0] ^= (tid as u8).wrapping_add(1);
+            subj_bytes[1] ^= ((tid >> 8) as u8).wrapping_add(1);
+            novel.subject = EntityId::from_bytes(subj_bytes);
+            novel.channel_hash = (prefill + tid) as u16;
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                cache.insert_unchecked(novel);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The strong invariant: NEVER exceed cap. Pre-fix this would
+        // overshoot to up to `prefill + THREADS = cap - SLACK + THREADS`.
+        let final_len = cache.tokens.len();
+        assert!(
+            final_len <= MAX_TOKEN_SLOTS,
+            "cache overshot cap under concurrent novel inserts: {final_len} > {MAX_TOKEN_SLOTS}",
+        );
+        // Sanity: at least the prefill survives — concurrent inserts
+        // must never remove pre-existing slots.
+        assert!(
+            final_len >= prefill,
+            "prefill leaked: {final_len} < {prefill}",
         );
     }
 

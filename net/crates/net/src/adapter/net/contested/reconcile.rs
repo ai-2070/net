@@ -154,23 +154,22 @@ pub fn reconcile_entity(
             let their_len = their_events.len() - idx;
 
             // Longest chain wins. Tie: lower payload hash, then
-            // lexicographic on the divergent payload bytes.
-            // parent_hash is identical at the divergence point
-            // (both diverge from the same parent), so this is a
-            // perspective-independent ordering — peer A computing
-            // `(our=A, their=B)` produces the inverse of peer B
-            // computing `(our=B, their=A)`, so both peers reach
-            // the same canonical winner.
-            //
-            // The divergence detection at line ~106 only enters
-            // the conflict branch when `our_events[idx].payload
-            // != their_events[idx].payload`, so the payload-bytes
-            // comparison is guaranteed to return `Less` or
-            // `Greater` — `Equal` is unreachable. We assert that
-            // explicitly so a future change to the divergence
-            // detection (e.g. relaxing the byte-equality check)
-            // would surface as a clear panic rather than a silent
-            // permanent partition like the original `<=` bug.
+            // lexicographic on the divergent payload bytes, then
+            // on `(parent_hash, sequence)`. The trailing
+            // `(parent_hash, sequence)` tier is what lets us
+            // resolve the case where divergence at idx came from
+            // a `parent_hash` / `sequence` mismatch but the
+            // payloads happen to be byte-identical (e.g. after
+            // pruning + re-issue of the same payload under a
+            // different parent). Pre-fix that case fell into
+            // `Ordering::Equal` and panicked the reconciliation
+            // worker via `unreachable!()` — a malformed-but-
+            // signed remote chain crashed the worker thread. Now
+            // we fall through to a deterministic tiebreak on the
+            // chain-link metadata that's *guaranteed* to differ
+            // (the divergence detection above only enters this
+            // branch when at least one of those bytes differs or
+            // the payloads do).
             let winning_side = if our_len > their_len {
                 Side::Ours
             } else if their_len > our_len {
@@ -180,18 +179,40 @@ pub fn reconcile_entity(
                 let their_payload = &their_events[idx].payload;
                 let our_hash = xxhash_rust::xxh3::xxh3_64(our_payload);
                 let their_hash = xxhash_rust::xxh3::xxh3_64(their_payload);
+                let our_link = &our_events[idx].link;
+                let their_link = &their_events[idx].link;
                 use std::cmp::Ordering::{Equal, Greater, Less};
                 match our_hash
                     .cmp(&their_hash)
                     .then_with(|| our_payload.as_ref().cmp(their_payload.as_ref()))
+                    .then_with(|| our_link.parent_hash.cmp(&their_link.parent_hash))
+                    .then_with(|| our_link.sequence.cmp(&their_link.sequence))
                 {
                     Less => Side::Ours,
                     Greater => Side::Theirs,
-                    Equal => unreachable!(
-                        "reconcile_entity: divergence at idx={} but payloads are \
-                         byte-identical — divergence detection contract violated",
-                        idx
-                    ),
+                    Equal => {
+                        // True equality across payload + link
+                        // metadata means the divergence detection
+                        // promoted us into this branch on byte-
+                        // identical events — likely a future
+                        // detection-contract change. Pick a
+                        // deterministic side rather than
+                        // panicking; logging is the diagnostic
+                        // signal. The choice is `Side::Ours`
+                        // arbitrarily (peer A and peer B both
+                        // pick "their own" side, which surfaces
+                        // as `AlreadyConverged` on the next
+                        // round once both forks merge).
+                        tracing::warn!(
+                            idx,
+                            origin_hash = our_log.origin_hash(),
+                            "reconcile_entity: divergence detected but events \
+                             are byte-identical across payload + link metadata. \
+                             Selecting Side::Ours arbitrarily; investigate \
+                             the divergence detector."
+                        );
+                        Side::Ours
+                    }
                 }
             };
 

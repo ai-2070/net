@@ -98,13 +98,20 @@ impl TimestampGenerator {
     /// - Under contention: may loop due to CAS, but still lock-free
     #[inline(always)]
     pub fn next(&self) -> u64 {
-        // Read TSC (no syscall) and convert to nanoseconds against
-        // the construction-time baseline.
-        let raw = self.clock.raw();
-        let now = self.clock.delta_as_nanos(self.baseline_raw, raw);
-
-        // Ensure strict monotonicity via CAS loop
+        // Ensure strict monotonicity via CAS loop. The TSC read
+        // happens INSIDE the loop so a CAS retry under
+        // contention re-samples real time. Pre-fix `raw` / `now`
+        // were captured once before the loop; if a contended
+        // retry took even a few microseconds (worst case under
+        // heavy contention) the returned timestamp was `last+1`
+        // — wall-clock-correct only as long as no thread won
+        // the CAS in the meantime. Under sustained contention
+        // the generator drifted arbitrarily far behind real
+        // time. Re-reading the TSC is cheap (~1ns, no syscall)
+        // and restores the wall-clock contract per call.
         loop {
+            let raw = self.clock.raw();
+            let now = self.clock.delta_as_nanos(self.baseline_raw, raw);
             let last = self.last.load(Ordering::Acquire);
 
             // Guard against u64::MAX exhaustion: saturating_add(1) at MAX
@@ -153,13 +160,31 @@ impl TimestampGenerator {
         self.clock.raw()
     }
 
-    /// Convert a raw timestamp to approximate nanoseconds since epoch.
+    /// Convert a raw timestamp to nanoseconds since this
+    /// generator was constructed (i.e. since `baseline_raw`).
+    /// Output units match `next()`: the value returned by
+    /// `raw_to_nanos(self.now_raw())` is comparable to
+    /// recently-`next()`-returned timestamps from the same
+    /// generator (modulo the monotonicity floor `next()` enforces).
     ///
-    /// Note: This is approximate and should only be used for debugging
-    /// or logging, not for ordering guarantees.
+    /// Note: NOT "nanoseconds since UNIX epoch". The reference
+    /// point is the per-generator construction moment, so two
+    /// generators created at different times produce values with
+    /// different offsets. For wall-clock-anchored debugging,
+    /// combine with `SystemTime::now()` at generator-construction
+    /// time (recorded externally).
+    ///
+    /// Pre-fix this called `delta_as_nanos(0, raw)`, where the
+    /// `0` baseline was an unspecified quanta-internal reference
+    /// (typically system boot under Windows QPC or the clock's
+    /// first-call moment elsewhere). The returned ns values
+    /// were in the order of system uptime — not comparable to
+    /// `next()` output, despite the function's previous "ns
+    /// since epoch" doc-claim. Aligning both to `baseline_raw`
+    /// makes the surface consistent.
     #[inline]
     pub fn raw_to_nanos(&self, raw: u64) -> u64 {
-        self.clock.delta_as_nanos(0, raw)
+        self.clock.delta_as_nanos(self.baseline_raw, raw)
     }
 
     /// Get the last generated timestamp.
@@ -190,6 +215,73 @@ mod tests {
             assert!(ts > prev, "timestamps must be strictly increasing");
             prev = ts;
         }
+    }
+
+    /// Source pin: `TimestampGenerator::next` must re-read the
+    /// TSC inside the CAS loop. Pre-fix `let raw = self.clock
+    /// .raw()` and `let now = ...` were captured ONCE before
+    /// the loop; under sustained contention a CAS retry reused
+    /// the stale `now` and the returned timestamp was `last+1`
+    /// rather than wall-clock-now, drifting arbitrarily far
+    /// behind real time. The TSC read is ~1ns and is inside
+    /// the loop now.
+    ///
+    /// We can't reliably reproduce the drift in a unit test
+    /// (the worst case requires sustained heavy contention
+    /// over enough retries that real-time advances measurably
+    /// past the stale capture). The source pin catches a
+    /// "simplification" PR that hoists the read back outside.
+    #[test]
+    fn timestamp_next_reads_tsc_inside_cas_loop() {
+        let src = include_str!("timestamp.rs");
+
+        // Locate the body of `pub fn next(&self) -> u64`.
+        let header = "pub fn next(&self) -> u64 {";
+        let start = src
+            .find(header)
+            .expect("TimestampGenerator::next must exist");
+        // The body ends at the next `\n    fn ` or `\n    pub fn ` at
+        // the impl indent.
+        let after_header = start + header.len();
+        let next_fn = src[after_header..]
+            .find("\n    pub fn ")
+            .or_else(|| src[after_header..].find("\n    fn "))
+            .expect("a sibling fn must follow next()")
+            + after_header;
+        let body = &src[start..next_fn];
+
+        // Strip line comments so the doc-comment that *describes*
+        // the rejected pattern doesn't trip the negative
+        // assertions.
+        let body_no_comments: String = body
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(idx) => &l[..idx],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Find the `loop {` opening — the CAS loop body must
+        // contain BOTH the TSC read and the delta_as_nanos
+        // call.
+        let loop_idx = body_no_comments
+            .find("loop {")
+            .expect("CAS loop must exist in next()");
+        let loop_body = &body_no_comments[loop_idx..];
+
+        assert!(
+            loop_body.contains("self.clock.raw()"),
+            "regression: `self.clock.raw()` must be inside the CAS \
+             loop in TimestampGenerator::next. Hoisted outside, a \
+             retry under contention reuses the stale TSC and the \
+             returned timestamp drifts behind real time."
+        );
+        assert!(
+            loop_body.contains("delta_as_nanos"),
+            "regression: `delta_as_nanos` must be inside the CAS \
+             loop alongside the TSC read."
+        );
     }
 
     #[test]

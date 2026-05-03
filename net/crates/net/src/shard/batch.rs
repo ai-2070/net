@@ -58,7 +58,18 @@ impl AdaptiveBatcher {
     /// Call this each time events are drained from the ring buffer.
     #[inline]
     pub fn record_events(&mut self, count: usize) -> usize {
-        self.total_events += count as u64;
+        // Saturating-add: a stream that's ingested ~2^64 events
+        // is already in trouble, but a wrap from `u64::MAX` to a
+        // small value would interact with the
+        // `saturating_sub(oldest_count)` in `calculate_velocity`
+        // — the saturating-sub would underflow to 0 across the
+        // wraparound boundary and `velocity` would collapse to 0,
+        // forcing the batcher to its `min_size` floor right when
+        // sustained high throughput is exactly what the adaptive
+        // path was meant to handle. Saturating instead clamps at
+        // `u64::MAX` and `newest - oldest = 0` is the documented
+        // stop state.
+        self.total_events = self.total_events.saturating_add(count as u64);
 
         if !self.config.adaptive {
             return self.config.max_size;
@@ -70,12 +81,23 @@ impl AdaptiveBatcher {
         self.velocity_samples.push_back((now, self.total_events));
 
         // Remove old samples outside the time window.
-        let window_start = now - self.config.velocity_window;
-        while let Some(&(ts, _)) = self.velocity_samples.front() {
-            if ts < window_start {
-                self.velocity_samples.pop_front();
-            } else {
-                break;
+        //
+        // `Instant - Duration` panics on underflow, and on Windows
+        // `Instant` is QPC-relative to boot — a process that
+        // starts within `velocity_window` (typically a few
+        // seconds) of boot would abort the batch worker task
+        // here. `checked_sub` returns `None` on underflow; in
+        // that case skip the time-based eviction (every existing
+        // sample is "newer than the window floor" by definition,
+        // since the floor predates `Instant::now()`'s zero point).
+        // The sample-count cap below still bounds memory.
+        if let Some(window_start) = now.checked_sub(self.config.velocity_window) {
+            while let Some(&(ts, _)) = self.velocity_samples.front() {
+                if ts < window_start {
+                    self.velocity_samples.pop_front();
+                } else {
+                    break;
+                }
             }
         }
 
@@ -131,15 +153,40 @@ impl AdaptiveBatcher {
         // Scale batch size with velocity
         // At 1M events/sec → batch size ~5,000
         // At 10M events/sec → batch size ~50,000 (capped at max)
+        //
+        // Explicit `clamp(0.0, usize::MAX as f64)` before the `as
+        // usize` cast: Rust's `as` cast on f64 → usize is
+        // saturating in current versions, but the explicit clamp
+        // documents intent and survives any future edition that
+        // tightens the cast (e.g. requires `try_from` on
+        // overflow). The `velocity > 0.0` guard above already
+        // rules out NaN and negative; the upper bound here only
+        // matters for the unreachable `velocity > usize::MAX *
+        // 200.0` case (~3.7e21 events/sec), but the saturation
+        // is cheaper than reasoning about future cast semantics.
         let target = if velocity > 0.0 {
-            ((velocity / 200.0) as usize).clamp(self.config.min_size, self.config.max_size)
+            let scaled = (velocity / 200.0).clamp(0.0, usize::MAX as f64);
+            (scaled as usize).clamp(self.config.min_size, self.config.max_size)
         } else {
             self.config.min_size
         };
 
         // Smooth transitions using exponential moving average
         // new = (old * 3 + target) / 4
-        self.current_batch_size = (self.current_batch_size * 3 + target) / 4;
+        //
+        // Saturating: `BatchConfig::validate` doesn't bound
+        // `max_size` from above, so a hostile config that pushes
+        // `current_batch_size` near `usize::MAX / 3` would
+        // overflow the multiply (debug: panic; release: wrap to a
+        // tiny value, collapsing the batcher to its `min_size`
+        // floor on the next clamp). Saturating preserves the
+        // intent — clamp at `usize::MAX` and let the bounds
+        // clamp below pull it back into the configured window.
+        self.current_batch_size = self
+            .current_batch_size
+            .saturating_mul(3)
+            .saturating_add(target)
+            / 4;
 
         // Ensure we stay within bounds
         self.current_batch_size = self
@@ -479,6 +526,47 @@ mod tests {
 
         // Batch size should have increased
         assert!(batcher.batch_size() > 100);
+    }
+
+    /// Regression: `recalculate_batch_size` previously did
+    /// `current_batch_size * 3 + target` with bare arithmetic. A
+    /// hostile `BatchConfig` with `max_size` near `usize::MAX / 3`
+    /// could push `current_batch_size` near that threshold, where
+    /// the multiply overflows — debug build panics, release wraps
+    /// to a tiny value. The fix saturates both the multiply and
+    /// add. Pin the saturation so a future revert ("simplify" the
+    /// arithmetic) is caught by the test rather than discovered
+    /// in production via a debug-build crash.
+    #[test]
+    fn recalculate_batch_size_saturates_on_hostile_max_size() {
+        let config = BatchConfig {
+            min_size: 1,
+            max_size: usize::MAX,
+            max_delay: Duration::from_secs(10),
+            adaptive: true,
+            velocity_window: Duration::from_millis(100),
+        };
+        let mut batcher = AdaptiveBatcher::new(config);
+
+        // Drive `current_batch_size` to a value where `* 3` would
+        // overflow. The field is module-private but we're in the
+        // same module, so direct mutation is fine.
+        batcher.current_batch_size = usize::MAX - 1;
+
+        // Pre-fix this would either debug-panic (`overflow when
+        // multiplying`) or release-wrap to a small value.
+        // Post-fix: saturating_mul keeps the result at usize::MAX
+        // and the bounds clamp pulls it back into [min_size,
+        // max_size]. Either way, no panic and no wrap to tiny.
+        batcher.recalculate_batch_size();
+
+        // Sanity: the resulting size is still inside the
+        // configured window and didn't wrap to a small value.
+        assert!(
+            batcher.current_batch_size >= 1,
+            "post-recalc batch size must respect min_size, got {}",
+            batcher.current_batch_size,
+        );
     }
 
     #[test]

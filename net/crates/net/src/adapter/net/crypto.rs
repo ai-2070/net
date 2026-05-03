@@ -401,7 +401,18 @@ struct ReplayWindow {
 
 impl ReplayWindow {
     const WINDOW_SIZE: u64 = 1024;
-    const MAX_FORWARD: u64 = 65536;
+    /// Maximum forward jump in counter values that this window
+    /// will accept on a single packet. Pre-fix this was 65_536,
+    /// far past `WINDOW_SIZE`. Any jump greater than `WINDOW_SIZE`
+    /// forced the bitmap to be zeroed (since the bitmap has
+    /// `BITMAP_WORDS × 64 = WINDOW_SIZE` bits), erasing the
+    /// "seen" markers for the previous `WINDOW_SIZE - 1` counters
+    /// — those sequence numbers became replayable until the new
+    /// window had been populated. Cap the forward jump at
+    /// `WINDOW_SIZE` so any gap that would discard replay state
+    /// is rejected; the peer must re-handshake to legitimately
+    /// resume past such a gap.
+    const MAX_FORWARD: u64 = Self::WINDOW_SIZE;
     const BITMAP_WORDS: usize = 16;
 
     const fn new() -> Self {
@@ -413,6 +424,23 @@ impl ReplayWindow {
 
     /// Read-only check: is `received` in range and not yet committed?
     fn is_valid(&self, received: u64) -> bool {
+        // Reject the ceiling counter unconditionally. If `commit`
+        // accepted `received == u64::MAX`, `rx_counter` would
+        // saturate at `u64::MAX` (since `rx_counter = received
+        // .saturating_add(1)` clamps), and the early-return guard
+        // at the top of `commit` would then refuse every
+        // subsequent packet — permanent receive-path poisoning
+        // from a single authenticated packet. The session is
+        // already designed to re-handshake long before counter
+        // exhaustion (2^64 packets is unreachable in practice),
+        // so excising the ceiling value costs nothing and closes
+        // the poisoning vector at the gate. `commit` retains its
+        // own `rx_counter == u64::MAX` early return as a
+        // defense-in-depth backstop in case a future caller skips
+        // `is_valid`.
+        if received == u64::MAX {
+            return false;
+        }
         if received >= self.rx_counter {
             received.saturating_sub(self.rx_counter) <= Self::MAX_FORWARD
         } else {
@@ -439,6 +467,17 @@ impl ReplayWindow {
     /// prefer an explicit refusal to a subtle ambiguity at the
     /// ceiling.
     fn commit(&mut self, received: u64) -> bool {
+        // Refuse the ceiling counter directly. `is_valid` is the
+        // primary gate (see `ReplayWindow::is_valid`) but if a
+        // future caller skips it and invokes `commit` directly,
+        // accepting `received == u64::MAX` here would saturate
+        // `rx_counter` (line below: `received.saturating_add(1)`)
+        // and the subsequent-commit guard would then reject every
+        // legitimate packet. Refusing at the top prevents the
+        // saturation in the first place.
+        if received == u64::MAX {
+            return false;
+        }
         if self.rx_counter == u64::MAX {
             return false;
         }
@@ -964,14 +1003,145 @@ mod tests {
             "counter far beyond MAX_FORWARD should be rejected"
         );
         // rx_counter is 2001 after update_rx_counter(2000), so
-        // MAX_FORWARD boundary is 2001 + 65536 = 67537
+        // MAX_FORWARD boundary is 2001 + WINDOW_SIZE (1024) = 3025.
+        // Pre-fix MAX_FORWARD was 65_536 (far past WINDOW_SIZE);
+        // any jump > WINDOW_SIZE forced the bitmap to be zeroed,
+        // erasing replay state for the previous 1023 counters.
         assert!(
-            cipher.is_valid_rx_counter(67537),
+            cipher.is_valid_rx_counter(3025),
             "counter at MAX_FORWARD boundary should be accepted"
         );
         assert!(
-            !cipher.is_valid_rx_counter(67538),
+            !cipher.is_valid_rx_counter(3026),
             "counter just past MAX_FORWARD should be rejected"
+        );
+    }
+
+    /// Pin: a forward jump greater than `WINDOW_SIZE` is rejected
+    /// before it can zero the bitmap. Pre-fix `MAX_FORWARD` was
+    /// 65_536 — a single authenticated packet whose counter
+    /// jumped past `rx_counter + WINDOW_SIZE` would clear the
+    /// bitmap, marking the previous 1023 counters as
+    /// "unseen" and replayable.
+    #[test]
+    fn replay_window_rejects_jump_beyond_window_size() {
+        let key = [0x42u8; 32];
+        let cipher = PacketCipher::new(&key, 0xCAFEu64);
+
+        // Burn 100 counters in.
+        for c in 0..100u64 {
+            cipher.update_rx_counter(c);
+        }
+        // rx_counter is now 100. A jump of WINDOW_SIZE = 1024
+        // (target = 100 + 1024 = 1124) is the boundary; one past
+        // (1125) must be rejected.
+        assert!(
+            cipher.is_valid_rx_counter(1124),
+            "counter at WINDOW_SIZE boundary must still be accepted"
+        );
+        assert!(
+            !cipher.is_valid_rx_counter(1125),
+            "counter past WINDOW_SIZE must be rejected — accepting it \
+             would zero the bitmap and re-open the prior {} counters \
+             to replay",
+            1024,
+        );
+
+        // After committing a counter near the boundary, prior
+        // counters in the window are still tracked (not zeroed).
+        cipher.update_rx_counter(1124);
+        // 1124 was just committed; replaying it must fail.
+        assert!(
+            !cipher.is_valid_rx_counter(1124),
+            "just-committed counter must remain non-replayable"
+        );
+        // A counter from before the jump (e.g. 99) is now far
+        // behind rx_counter. With WINDOW_SIZE=1024, age = 1125 -
+        // 1 - 99 = 1025 > 1024, so it's outside the window and
+        // rejected as too-old (correct — these old counters were
+        // already committed before the jump and the bitmap still
+        // tracks them within the window).
+        assert!(
+            !cipher.is_valid_rx_counter(99),
+            "counter from before the jump must reject as too-old"
+        );
+    }
+
+    /// Regression: `received == u64::MAX` must be rejected at
+    /// `is_valid` AND at `commit`. Pre-fix the absolute ceiling
+    /// could be committed: `rx_counter` saturated at
+    /// `u64::MAX`, then commit's `rx_counter == u64::MAX` early
+    /// return rejected every subsequent legitimate packet —
+    /// permanent receive-path poisoning from a single
+    /// authenticated packet that happened to ride the ceiling
+    /// nonce.
+    ///
+    /// The trigger requires `rx_counter` to be within
+    /// `MAX_FORWARD` of `u64::MAX` already (otherwise
+    /// `is_valid`'s `MAX_FORWARD` ceiling already rejects), so
+    /// reproducing it via the public API is gated behind
+    /// committing one packet near the ceiling. We exercise both
+    /// the `is_valid` gate and the `commit` defense-in-depth
+    /// guard.
+    #[test]
+    fn replay_window_ceiling_counter_does_not_poison_receive_path() {
+        let key = [0x42u8; 32];
+        let cipher = PacketCipher::new(&key, 0xC0FFEEu64);
+
+        // Walk rx_counter up to u64::MAX - 1 in one accepted
+        // commit. We can't use `update_rx_counter` directly here
+        // because it must clear `is_valid`; we cheat by locking
+        // the inner ReplayWindow and setting `rx_counter`
+        // directly so the next commit sees a near-ceiling state.
+        // Visibility note: ReplayWindow is mod-private but this
+        // test lives in the same `mod tests`, so we can reach
+        // the field.
+        {
+            let mut w = cipher.rx_window.lock().unwrap();
+            // Set the window to "everything just before the
+            // ceiling has already been seen": rx_counter sits
+            // at u64::MAX - MAX_FORWARD so that `is_valid` would
+            // accept any counter in [u64::MAX - MAX_FORWARD,
+            // u64::MAX - MAX_FORWARD + MAX_FORWARD] = […, u64::MAX].
+            w.rx_counter = u64::MAX - ReplayWindow::MAX_FORWARD;
+        }
+
+        // is_valid for `u64::MAX` must reject (the ceiling
+        // guard) — even though arithmetic-wise it's within
+        // MAX_FORWARD.
+        assert!(
+            !cipher.is_valid_rx_counter(u64::MAX),
+            "u64::MAX must be rejected by is_valid even when in MAX_FORWARD range"
+        );
+
+        // commit for `u64::MAX` must also reject directly. Pre-
+        // fix this would saturate rx_counter to u64::MAX and
+        // poison the receive path; post-fix the early return
+        // refuses without mutating state.
+        assert!(
+            !cipher.update_rx_counter(u64::MAX),
+            "commit on u64::MAX must reject — accepting it saturates rx_counter and poisons the receive path"
+        );
+
+        // Confirm rx_counter was not advanced to u64::MAX (the
+        // poisoning state). It remains at the pre-test value.
+        let post = cipher.rx_window.lock().unwrap().rx_counter;
+        assert_eq!(
+            post,
+            u64::MAX - ReplayWindow::MAX_FORWARD,
+            "rx_counter must not have been mutated by the rejected u64::MAX commit"
+        );
+
+        // A legitimate counter just below the ceiling still
+        // works — we haven't broken the normal accept path.
+        let safe = u64::MAX - 1;
+        assert!(
+            cipher.is_valid_rx_counter(safe),
+            "u64::MAX - 1 must still be acceptable when in MAX_FORWARD range"
+        );
+        assert!(
+            cipher.update_rx_counter(safe),
+            "u64::MAX - 1 must still commit when in MAX_FORWARD range"
         );
     }
 
@@ -1073,25 +1243,39 @@ mod tests {
 
     #[test]
     fn test_regression_rx_counter_u64_max_no_wrap() {
-        // Regression: update_rx_counter used `received + 1` which wraps to 0
-        // when received == u64::MAX. Now uses saturating_add in commit().
+        // Regression: update_rx_counter used `received + 1` which
+        // wrapped to 0 when received == u64::MAX. Saturating_add
+        // closed that wrap, but saturating still let rx_counter
+        // reach u64::MAX — and once there, the receive path was
+        // permanently dead (every subsequent counter rejected by
+        // the `rx_counter == u64::MAX` early return). The current
+        // fix refuses `received == u64::MAX` outright at both
+        // `is_valid` and `commit`, so the wrap-arithmetic path
+        // is now unreachable.
         let key = [0x42u8; 32];
         let cipher = PacketCipher::new(&key, 0x1234);
 
         // Advance counter to a high value first
         assert!(cipher.update_rx_counter(1000));
 
-        // u64::MAX would be rejected by is_valid_rx_counter (beyond
-        // MAX_FORWARD), but if it somehow reached update_rx_counter,
-        // it must not wrap the counter to 0.
-        assert!(cipher.update_rx_counter(u64::MAX));
+        // u64::MAX is rejected outright now — both at is_valid
+        // (the gate) and at commit (defense-in-depth). The
+        // refusal happens before any saturating arithmetic so
+        // wrap-to-0 is unreachable by construction.
+        assert!(
+            !cipher.update_rx_counter(u64::MAX),
+            "u64::MAX must be rejected at commit; pre-fix it was \
+             accepted-then-saturated, poisoning the receive path"
+        );
 
-        // Counter should saturate at u64::MAX, not wrap to 0.
+        // rx_counter must NOT have advanced — the rejection
+        // happens before mutation. This is stronger than the
+        // pre-fix saturating-at-u64::MAX guarantee.
         let counter = cipher.rx_window.lock().unwrap().rx_counter;
         assert_eq!(
-            counter,
-            u64::MAX,
-            "rx_counter must saturate at u64::MAX, not wrap to 0"
+            counter, 1001,
+            "rx_counter must remain at the post-1000-commit value; \
+             a rejected u64::MAX commit must not mutate state"
         );
     }
 
@@ -1204,27 +1388,40 @@ mod tests {
         // bitmap by 1 and re-set bit 0, returning `true` each time
         // — replaying the same nonce would pass replay detection.
         //
-        // Fix: once `rx_counter == u64::MAX`, all further commits
-        // return `false` explicitly.
+        // The earlier fix added a `rx_counter == u64::MAX` early
+        // return so subsequent commits were refused. The newer fix
+        // (audit #159) goes further: `received == u64::MAX` is
+        // refused at the gate, so `rx_counter` never reaches the
+        // ceiling. Both the original "no replay accepted" property
+        // and the stronger "ceiling never reachable" property hold.
         let key = [0x42u8; 32];
         let cipher = PacketCipher::new(&key, 0x1234);
 
-        // Force rx_counter to saturate by committing u64::MAX.
-        // (Practical attackers can't reach this — 2^64 packets per
-        // session is unreachable — but we want the ceiling to refuse
-        // cleanly rather than silently re-accept.)
-        assert!(cipher.update_rx_counter(u64::MAX));
-
-        // The window internally saturated rx_counter at u64::MAX
-        // (saturating_add). A second commit of the same counter must
-        // be rejected, not silently reaccepted.
+        // The very first u64::MAX commit is rejected. Pre-#159
+        // this returned true; post-#159 it returns false because
+        // accepting it would set rx_counter to u64::MAX and
+        // permanently poison the receive path (single-packet
+        // availability attack from a hostile authenticated peer).
         assert!(
             !cipher.update_rx_counter(u64::MAX),
-            "second commit of u64::MAX must be rejected (replay)"
+            "u64::MAX must be rejected at the gate — accepting it \
+             saturates rx_counter and dead-ends the receive path"
         );
         assert!(
-            !cipher.update_rx_counter(u64::MAX - 1),
-            "any further commit after ceiling must also be rejected"
+            !cipher.update_rx_counter(u64::MAX),
+            "second commit of u64::MAX must also be rejected"
+        );
+
+        // The receive path's actual gate against far-future
+        // counters is `is_valid_rx_counter` (see session.rs:671),
+        // not `update_rx_counter`. is_valid catches `u64::MAX - 1`
+        // here because `MAX_FORWARD == WINDOW_SIZE == 1024` and
+        // `u64::MAX - 1` is well past that boundary. The
+        // production code calls `is_valid_rx_counter` *before*
+        // `update_rx_counter` so this is the right gate.
+        assert!(
+            !cipher.is_valid_rx_counter(u64::MAX - 1),
+            "u64::MAX - 1 from rx_counter=0 must reject at is_valid (past MAX_FORWARD)"
         );
     }
 }

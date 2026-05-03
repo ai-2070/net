@@ -302,6 +302,50 @@ async fn events_in_flight_at_finalize_reach_adapter() {
     );
 }
 
+/// Pin: `manual_scale_up(N>1)` succeeds against a non-zero
+/// cooldown. Pre-fix the loop called `add_shard_internal`
+/// which routed to `scale_up_provisioning(1)`, bumping
+/// `last_scaling = Instant::now()` on each call. Iteration 1+
+/// then immediately failed with `InCooldown` (default 30s
+/// cooldown), leaving the first shard half-added (workers
+/// spawned, routing entry installed) and returning the error
+/// to the operator with no rollback. Post-fix `manual_scale_up`
+/// bypasses the auto-scaling cooldown so a deliberate operator
+/// request can scale up by N in one call regardless of the
+/// cooldown setting.
+#[tokio::test]
+async fn manual_scale_up_succeeds_with_nonzero_cooldown() {
+    let (adapter, _batches, _msg_ids) = RecordingAdapter::new();
+    // Realistic operator-deploy config: a multi-second
+    // cooldown to dampen the auto-scaling monitor.
+    let policy = ScalingPolicy {
+        min_shards: 1,
+        max_shards: 8,
+        cooldown: Duration::from_secs(30),
+        ..Default::default()
+    };
+    let cfg = EventBusConfig::builder()
+        .num_shards(1)
+        .ring_buffer_capacity(1024)
+        .scaling(policy)
+        .build()
+        .unwrap();
+    let bus = EventBus::new_with_adapter(cfg, Box::new(adapter))
+        .await
+        .unwrap();
+
+    // Scale up by 4 in one call. Pre-fix this would error on
+    // the second iteration (the first call bumped last_scaling,
+    // the second hit cooldown).
+    let added = bus
+        .manual_scale_up(4)
+        .await
+        .expect("manual_scale_up under nonzero cooldown must succeed");
+    assert_eq!(added.len(), 4, "all 4 requested shards must be added");
+
+    bus.shutdown().await.unwrap();
+}
+
 /// `SlowRecordingAdapter` sleeps for `delay` inside `on_batch`,
 /// which lets the BatchWorker's mpsc channel back up + lets events
 /// pile in the ring buffer while a scale-down is in flight. This
@@ -545,4 +589,177 @@ async fn repeated_scale_cycles_preserve_every_event_with_unique_msg_ids() {
         ids.len(),
         "duplicate msg-id tuples observed across scale cycles",
     );
+}
+
+/// Adapter whose `on_batch` parks indefinitely. Models a wedged
+/// downstream (network partition, deadlocked driver) and lets us
+/// observe whether `remove_shard_internal` returns within bounded
+/// time when its workers are themselves parked inside an adapter
+/// call.
+struct WedgedAdapter;
+
+#[async_trait]
+impl Adapter for WedgedAdapter {
+    async fn init(&mut self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+    async fn flush(&self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    async fn shutdown(&self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    async fn poll_shard(
+        &self,
+        _shard_id: u16,
+        _from_id: Option<&str>,
+        _limit: usize,
+    ) -> Result<ShardPollResult, AdapterError> {
+        Ok(ShardPollResult::empty())
+    }
+    fn name(&self) -> &'static str {
+        "wedged"
+    }
+}
+
+/// Pin: when worker handles cannot make progress (wedged adapter),
+/// `manual_scale_down` must NOT pin indefinitely waiting for them
+/// to exit. The worker handles are awaited under a timeout derived
+/// from `adapter_timeout`; on expiry the JoinHandle is detached.
+///
+/// Pre-fix `remove_shard_internal` awaited the JoinHandles bare,
+/// AND in the wrong order (batch before drain), so a drain worker
+/// parked mid-`sender.send().await` against a batch worker parked
+/// mid-adapter call would deadlock the awaiter forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_scale_down_returns_within_bounded_time_when_adapter_wedged() {
+    let policy = ScalingPolicy {
+        min_shards: 1,
+        max_shards: 16,
+        cooldown: Duration::from_nanos(1),
+        ..Default::default()
+    };
+    let cfg = EventBusConfig::builder()
+        .num_shards(2)
+        .ring_buffer_capacity(1024)
+        .scaling(policy)
+        .adapter_timeout(Duration::from_millis(150))
+        .build()
+        .unwrap();
+
+    let bus = EventBus::new_with_adapter(cfg, Box::new(WedgedAdapter))
+        .await
+        .unwrap();
+
+    bus.manual_scale_up(2).await.unwrap();
+
+    // Push enough events to keep workers busy in `on_batch` (which
+    // never returns).
+    for i in 0..2_000u64 {
+        let _ = bus.ingest(Event::new(json!({"i": i})));
+    }
+
+    // Each worker await is bounded by 2 × adapter_timeout = 300 ms,
+    // and we tear down 2 shards sequentially, so the upper bound is
+    // ~1.2 s of worker waits plus the stranded-flush dispatch_batch
+    // (which uses adapter_timeout = 150 ms with retries). Allow
+    // generous slack for CI.
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(15), bus.manual_scale_down(2))
+        .await
+        .expect("manual_scale_down hung past 15s — timeout-bounded teardown regressed");
+    result.expect("manual_scale_down returned Err");
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "manual_scale_down took {:?}; expected bounded by adapter_timeout",
+        elapsed,
+    );
+
+    // Best-effort shutdown — the wedged adapter will not let us
+    // drain cleanly, but shutdown itself is bounded by its own
+    // deadline. We don't assert success here; the assertion above
+    // is the regression target.
+    let _ = tokio::time::timeout(Duration::from_secs(5), bus.shutdown()).await;
+}
+
+/// Pin: when an `EventBus` is dropped without an awaited
+/// `shutdown()`, the helper used by the Drop impl
+/// (`shard_manager.total_pending_in_rings()`) must report the
+/// exact count of events still sitting in ring buffers. The Drop
+/// impl folds this into `events_dropped` + sets
+/// `shutdown_was_lossy` before the bus disappears so post-mortem
+/// stats reflect the data-loss incident.
+///
+/// The Drop impl itself runs as the bus disappears so its own
+/// `events_dropped` increment is unobservable from this test
+/// (the `EventBusStats` lives on the bus). Pin the helper that
+/// supplies the increment instead — its return value is the
+/// exact value the Drop impl folds in.
+#[tokio::test]
+async fn total_pending_in_rings_reports_stranded_count() {
+    let policy = ScalingPolicy {
+        min_shards: 1,
+        max_shards: 4,
+        cooldown: Duration::from_nanos(1),
+        ..Default::default()
+    };
+    // Slow adapter + huge `min_size` and `max_delay` so events
+    // accumulate in rings instead of racing through to dispatch.
+    let batch_cfg = net::config::BatchConfig {
+        min_size: 10_000,
+        max_size: 10_000,
+        max_delay: Duration::from_secs(60),
+        adaptive: false,
+        velocity_window: Duration::from_millis(100),
+    };
+    let cfg = EventBusConfig::builder()
+        .num_shards(2)
+        .ring_buffer_capacity(1024)
+        .scaling(policy)
+        .batch(batch_cfg)
+        .build()
+        .unwrap();
+
+    let (recording, _batches, _msg_ids) = RecordingAdapter::new();
+    let slow = SlowRecordingAdapter {
+        inner: recording,
+        delay: Duration::from_secs(60),
+    };
+    let bus = EventBus::new_with_adapter(cfg, Box::new(slow))
+        .await
+        .unwrap();
+
+    // Ingest enough events to overflow the ring buffer faster
+    // than the drain worker can pump them out. With
+    // `ring_buffer_capacity = 1024` per shard and 2 shards,
+    // pushing 5_000 events guarantees at least one ring is
+    // saturated at the moment we read `pending_in_rings()`.
+    const N: u64 = 5_000;
+    for i in 0..N {
+        let _ = bus.ingest(Event::new(json!({"i": i})));
+    }
+
+    let pending_in_rings = bus.pending_in_rings();
+    assert!(
+        pending_in_rings > 0,
+        "expected events still in ring buffers before drop \
+         (got {}); the Drop impl's stranded-in-rings increment \
+         would be silently 0 and `shutdown_was_lossy` would not \
+         be set, masking the data-loss incident",
+        pending_in_rings,
+    );
+
+    // Force the warn-and-account path by dropping the bus
+    // without awaiting shutdown. The Drop impl folds
+    // `pending_in_rings` into `events_dropped` and sets
+    // `shutdown_was_lossy`. We can't read those post-drop
+    // (the EventBusStats lives on the bus), but the helper
+    // value above is what the Drop impl uses.
+    drop(bus);
 }

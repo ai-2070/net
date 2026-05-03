@@ -93,23 +93,38 @@ impl NetDb {
     /// against the same `Redex` instance replays or snapshots them.
     /// Idempotent.
     ///
-    /// Both closes are attempted regardless of failure and the FIRST
-    /// error is surfaced; the second error (if any) is dropped
-    /// silently — `close` is best-effort teardown and the dominant
-    /// failure mode is "underlying redex already closed," which
-    /// produces the same error from both adapters and is
-    /// uninteresting to disambiguate.
+    /// Both closes are attempted regardless of failure and the
+    /// FIRST error is surfaced as the function's return; the
+    /// SECOND error is logged at `warn` so a double-failure is
+    /// observable in tracing without conflating the typed
+    /// error surface. Pre-fix the second error was dropped
+    /// silently — operators investigating a `close()` failure
+    /// from the typed return would never see the second adapter's
+    /// error. The dominant double-failure mode is "underlying
+    /// redex already closed," which produces the same error
+    /// from both adapters and is uninteresting to disambiguate
+    /// in the typed return; the warn-log makes it observable
+    /// without adding a new error variant.
     pub fn close(&self) -> Result<(), NetDbError> {
         let tasks_result = self.tasks.as_ref().map(|t| t.close()).unwrap_or(Ok(()));
         let memories_result = self.memories.as_ref().map(|m| m.close()).unwrap_or(Ok(()));
 
         // Surface the first error; if both errored, the tasks one
         // wins by convention (matches the pre-fix shape where tasks
-        // ran first).
+        // ran first). Log the second so it's not invisible.
         match (tasks_result, memories_result) {
             (Ok(()), Ok(())) => Ok(()),
-            (Err(e), _) => Err(e.into()),
+            (Err(e), Ok(())) => Err(e.into()),
             (Ok(()), Err(e)) => Err(e.into()),
+            (Err(tasks_err), Err(memories_err)) => {
+                tracing::warn!(
+                    tasks_error = %tasks_err,
+                    memories_error = %memories_err,
+                    "netdb close: both adapters failed; surfacing tasks error \
+                     and logging memories error",
+                );
+                Err(tasks_err.into())
+            }
         }
     }
 
