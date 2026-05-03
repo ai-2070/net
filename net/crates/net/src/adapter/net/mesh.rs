@@ -1821,11 +1821,20 @@ impl MeshNode {
         struct AcceptGuard<'a>(&'a std::sync::atomic::AtomicUsize);
         impl Drop for AcceptGuard<'_> {
             fn drop(&mut self) {
-                self.0.fetch_sub(1, AtOrd::AcqRel);
+                // SeqCst (not AcqRel): the mutual-exclusion proof
+                // in `start`'s doc-comment relies on a SeqCst
+                // total order across BOTH atomics. AcqRel RMWs do
+                // not participate in the SC total order, so on
+                // weakly-ordered cores (AArch64 / RISC-V) `start`
+                // could read the pre-increment 0 in
+                // `accept_in_flight` while `accept` simultaneously
+                // reads `started == false` — exactly the race the
+                // counter was added to prevent.
+                self.0.fetch_sub(1, AtOrd::SeqCst);
             }
         }
 
-        self.accept_in_flight.fetch_add(1, AtOrd::AcqRel);
+        self.accept_in_flight.fetch_add(1, AtOrd::SeqCst);
         let _guard = AcceptGuard(&self.accept_in_flight);
 
         if self.started.load(AtOrd::SeqCst) {
