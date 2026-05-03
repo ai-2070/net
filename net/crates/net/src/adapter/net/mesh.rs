@@ -196,6 +196,54 @@ impl Drop for PeerRegistrationGuard {
     }
 }
 
+/// Outcome of the routed-handshake key-rotation gate.
+///
+/// The gate runs inside `peers.entry(peer_node_id)`'s write guard so
+/// the decision and the subsequent insert are atomic; see
+/// `MeshNode::handle_routed_handshake` for the call site.
+#[derive(Debug, PartialEq, Eq)]
+enum RoutedRotationOutcome {
+    /// A live session for the same `peer_node_id` is already
+    /// established with the SAME `remote_static_pub` — drop the
+    /// inbound msg1 as a replay. NKpsk0's responder uses a fresh
+    /// ephemeral on each reply, so without this guard a captured
+    /// msg1 replayed by a passive attacker would derive new session
+    /// keys and silently swap them in, breaking AEAD verification
+    /// on the legitimate peer's subsequent packets.
+    DropReplay,
+    /// A live session for the same `peer_node_id` exists with a
+    /// DIFFERENT `remote_static_pub`. Refuse the rotation: the
+    /// existing session is still within `session_timeout`. Pre-fix
+    /// this branch unconditionally overwrote the live session,
+    /// opening a trivial DoS — anyone holding the PSK and any valid
+    /// Noise static could swap session keys for any peer that ever
+    /// handshook on a routed path. A legitimate peer rotating its
+    /// static must wait for its existing session to time out before
+    /// the new keys are accepted.
+    RefuseFresh,
+    /// No conflict (or the existing session has timed out). The
+    /// caller should construct a fresh session and insert it under
+    /// the same entry guard.
+    AcceptRotation,
+}
+
+/// Decide whether an inbound routed handshake is allowed to install
+/// new session keys for `peer_node_id`.
+fn routed_rotation_outcome(
+    existing: &PeerInfo,
+    new_static: &[u8; 32],
+    session_timeout: Duration,
+) -> RoutedRotationOutcome {
+    if existing.remote_static_pub == *new_static {
+        return RoutedRotationOutcome::DropReplay;
+    }
+    if existing.session.is_timed_out(session_timeout) {
+        RoutedRotationOutcome::AcceptRotation
+    } else {
+        RoutedRotationOutcome::RefuseFresh
+    }
+}
+
 /// Shared context for the packet dispatch loop.
 struct DispatchCtx {
     local_node_id: u64,
@@ -250,6 +298,11 @@ struct DispatchCtx {
     /// handshake responder completes here).
     packet_pool_size: usize,
     default_reliable: bool,
+    /// Idle/heartbeat window for an established session. Used by the
+    /// routed-handshake rotation gate to refuse swapping a live
+    /// session's keys until the existing session has gone silent for
+    /// at least this long. See `routed_rotation_outcome`.
+    session_timeout: Duration,
     /// Subscriber roster for channel fan-out.
     roster: Arc<SubscriberRoster>,
     /// Channel config registry used to authorize incoming Subscribe.
@@ -1821,11 +1874,20 @@ impl MeshNode {
         struct AcceptGuard<'a>(&'a std::sync::atomic::AtomicUsize);
         impl Drop for AcceptGuard<'_> {
             fn drop(&mut self) {
-                self.0.fetch_sub(1, AtOrd::AcqRel);
+                // SeqCst (not AcqRel): the mutual-exclusion proof
+                // in `start`'s doc-comment relies on a SeqCst
+                // total order across BOTH atomics. AcqRel RMWs do
+                // not participate in the SC total order, so on
+                // weakly-ordered cores (AArch64 / RISC-V) `start`
+                // could read the pre-increment 0 in
+                // `accept_in_flight` while `accept` simultaneously
+                // reads `started == false` — exactly the race the
+                // counter was added to prevent.
+                self.0.fetch_sub(1, AtOrd::SeqCst);
             }
         }
 
-        self.accept_in_flight.fetch_add(1, AtOrd::AcqRel);
+        self.accept_in_flight.fetch_add(1, AtOrd::SeqCst);
         let _guard = AcceptGuard(&self.accept_in_flight);
 
         if self.started.load(AtOrd::SeqCst) {
@@ -2254,6 +2316,7 @@ impl MeshNode {
             partition_filter: self.partition_filter.clone(),
             packet_pool_size: self.config.packet_pool_size,
             default_reliable: self.config.default_reliable,
+            session_timeout: self.config.session_timeout,
             roster: self.roster.clone(),
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
@@ -2746,49 +2809,92 @@ impl MeshNode {
         // spawned send task is cancelled or panics post-send, the
         // initiator that just derived matching keys finds us.
         //
-        // Replay guard: if a live session already exists for
-        // `peer_node_id` with the SAME `remote_static_pub`, drop the
-        // new handshake. NKpsk0's responder uses a fresh ephemeral
-        // on each reply so a captured msg1 replayed by a passive
-        // attacker would otherwise overwrite the live session keys
-        // — the legitimate initiator still holds the old keys and
-        // every subsequent AEAD-protected packet would fail open and
-        // be dropped, a trivial DoS against any node that ever
-        // handshook on a routed path. Re-handshake from the same
-        // identity is gated by session expiry / explicit removal,
-        // not by overwriting an active session in place.
+        // Replay guard + rotation gate, atomic via `peers.entry()`.
+        //
+        // Pre-fix this was `peers.get()` followed by `peers.insert()`,
+        // which had two distinct bugs:
+        //
+        // 1. (#6) The read-guard from `get()` was dropped before the
+        //    `insert()`. Two concurrent routed handshakes for the same
+        //    `peer_node_id` could both pass the `existing.remote_static_pub`
+        //    check and race the insert; the loser's `pending_handshakes`
+        //    state stayed armed waiting for a msg2 that was now bound to
+        //    the winner's session, until the per-call `handshake_timeout`
+        //    fired.
+        //
+        // 2. (#3) When the existing entry's `remote_static_pub` differed
+        //    from the inbound msg1's, the code unconditionally fell
+        //    through and overwrote the live session with attacker-derived
+        //    keys. The legitimate initiator still held the old keys, so
+        //    every subsequent AEAD-protected packet failed open and was
+        //    silently dropped — a trivial DoS against any node that ever
+        //    handshook on a routed path, requiring only the PSK and a
+        //    second valid Noise static. The rotation gate now refuses
+        //    rotation while the existing session is still within
+        //    `session_timeout`. Once the live session has gone silent
+        //    long enough to be considered dead, a fresh handshake from
+        //    the legitimate peer (or a permitted key rotation) installs
+        //    the new keys cleanly.
+        //
+        // The replay guard fires for the SAME `remote_static_pub`:
+        // NKpsk0's responder uses a fresh ephemeral on each reply, so
+        // a captured-and-replayed msg1 derives different session keys
+        // every time. Without this guard the live session's keys would
+        // get overwritten on every replay.
         let remote_static_pub = keys.remote_static_pub;
-        if let Some(existing) = ctx.peers.get(&peer_node_id) {
-            if existing.remote_static_pub == remote_static_pub {
-                tracing::warn!(
-                    peer_node_id,
-                    "routed handshake: dropping msg1 — live session already \
-                     established for this peer with matching remote_static_pub \
-                     (replay guard)"
-                );
-                return;
+        match ctx.peers.entry(peer_node_id) {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                match routed_rotation_outcome(occ.get(), &remote_static_pub, ctx.session_timeout) {
+                    RoutedRotationOutcome::DropReplay => {
+                        tracing::warn!(
+                            peer_node_id,
+                            "routed handshake: dropping msg1 — live session already \
+                             established for this peer with matching remote_static_pub \
+                             (replay guard)"
+                        );
+                        return;
+                    }
+                    RoutedRotationOutcome::RefuseFresh => {
+                        tracing::warn!(
+                            peer_node_id,
+                            "routed handshake: refusing key rotation — existing \
+                             session is still within session_timeout. New keys \
+                             can be installed once the live session has gone \
+                             silent for at least session_timeout (rotation gate)"
+                        );
+                        return;
+                    }
+                    RoutedRotationOutcome::AcceptRotation => {
+                        let session = Arc::new(NetSession::new(
+                            keys,
+                            source,
+                            ctx.packet_pool_size,
+                            ctx.default_reliable,
+                        ));
+                        occ.insert(PeerInfo {
+                            node_id: peer_node_id,
+                            addr: source,
+                            session,
+                            remote_static_pub,
+                        });
+                    }
+                }
             }
-            // Different remote_static_pub for the same node_id is
-            // either a peer rotating its static key (legitimate) or
-            // an attacker forging a different static — let the
-            // initiator's matching-keys check resolve which.
-            // Fall through to insert below.
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                let session = Arc::new(NetSession::new(
+                    keys,
+                    source,
+                    ctx.packet_pool_size,
+                    ctx.default_reliable,
+                ));
+                vac.insert(PeerInfo {
+                    node_id: peer_node_id,
+                    addr: source,
+                    session,
+                    remote_static_pub,
+                });
+            }
         }
-        let session = Arc::new(NetSession::new(
-            keys,
-            source,
-            ctx.packet_pool_size,
-            ctx.default_reliable,
-        ));
-        ctx.peers.insert(
-            peer_node_id,
-            PeerInfo {
-                node_id: peer_node_id,
-                addr: source,
-                session,
-                remote_static_pub,
-            },
-        );
         ctx.peer_addrs.insert(peer_node_id, source);
         ctx.router.add_route(peer_node_id, source);
 
@@ -2949,9 +3055,35 @@ impl MeshNode {
                             //
                             // Handler work is synchronous and cheap; doing
                             // it on the receive-loop task is fine.
+                            //
+                            // Depth-cap the self-bounce drain so a buggy
+                            // handler (or attacker-influenced state inside
+                            // a "trusted" handler) that always emits a
+                            // self-bound follow-up cannot spin this loop
+                            // synchronously on the dispatch task and
+                            // starve every other peer's packets. A
+                            // correct migration handler converges in a
+                            // small, bounded number of self-bounces.
+                            const MAX_MIGRATION_LOOPBACK_DEPTH: usize = 32;
                             let mut pending: std::collections::VecDeque<_> = outbound.into();
+                            let mut loopback_count: usize = 0;
                             while let Some(msg) = pending.pop_front() {
                                 if msg.dest_node == ctx.local_node_id {
+                                    loopback_count += 1;
+                                    if loopback_count > MAX_MIGRATION_LOOPBACK_DEPTH {
+                                        tracing::warn!(
+                                            depth = loopback_count,
+                                            from_node = from_node,
+                                            cap = MAX_MIGRATION_LOOPBACK_DEPTH,
+                                            "migration handler loopback exceeded \
+                                             MAX_MIGRATION_LOOPBACK_DEPTH; dropping \
+                                             remaining queue to keep the dispatch \
+                                             task responsive to other peers. A \
+                                             correct handler should converge in a \
+                                             small bounded number of self-bounces.",
+                                        );
+                                        break;
+                                    }
                                     match handler.handle_message(&msg.payload, ctx.local_node_id) {
                                         Ok(more) => pending.extend(more),
                                         Err(e) => {
@@ -3510,25 +3642,39 @@ impl MeshNode {
                         let pw = proximity_graph.create_pingwave(HealthStatus::Healthy);
                         let pw_bytes = pw.to_bytes();
 
-                        for entry in peers.iter() {
-                            let peer_addr = entry.value().addr;
-                            if partition_filter.contains(&peer_addr) {
-                                continue;
-                            }
-                            let session = &entry.value().session;
-                            // `Session::build_heartbeat` routes
-                            // through `thread_local_pool` (same
-                            // pool the data path uses) so
-                            // heartbeats and data share a single
-                            // `tx_counter`. Constructing a fresh
-                            // `PacketBuilder::new(&[0u8; 32],
-                            // session.session_id())` per heartbeat
-                            // would (a) use the wrong key so the
-                            // receiver's AEAD verify would reject
-                            // every tag, and (b) reuse counter=0
-                            // across heartbeats so the replay
-                            // window would reject every heartbeat
-                            // after the first.
+                        // Snapshot the peer set into a Vec before
+                        // awaiting any send — pre-fix the loop held
+                        // a DashMap shard `Ref` guard across each
+                        // `socket.send_to(...).await` (twice per peer:
+                        // heartbeat then pingwave), blocking every
+                        // other task that touched the same shard
+                        // (`peers.insert` from `connect`/`accept`/
+                        // `handle_routed_handshake`, `peers.get` from
+                        // the data path, etc.) for the cumulative
+                        // round-trip of N×2 sends per heartbeat tick.
+                        // `Session::build_heartbeat` routes through
+                        // `thread_local_pool` (same pool the data path
+                        // uses) so heartbeats and data share a single
+                        // `tx_counter`; constructing a fresh
+                        // `PacketBuilder::new(&[0u8; 32],
+                        // session.session_id())` per heartbeat would
+                        // (a) use the wrong key so the receiver's AEAD
+                        // verify would reject every tag, and (b) reuse
+                        // counter=0 across heartbeats so the replay
+                        // window would reject every heartbeat after
+                        // the first.
+                        let snapshot: Vec<(SocketAddr, Arc<NetSession>)> = peers
+                            .iter()
+                            .filter_map(|entry| {
+                                let peer_addr = entry.value().addr;
+                                if partition_filter.contains(&peer_addr) {
+                                    None
+                                } else {
+                                    Some((peer_addr, entry.value().session.clone()))
+                                }
+                            })
+                            .collect();
+                        for (peer_addr, session) in snapshot {
                             let packet = session.build_heartbeat();
                             let _ = socket.send_to(&packet, peer_addr).await;
                             // Pingwave (raw UDP — not encrypted, topology is public)
@@ -4678,7 +4824,36 @@ impl MeshNode {
         if Self::is_auth_throttled(from_node, ctx) {
             return (false, Some(AckReason::RateLimited));
         }
-        if ctx.roster.channels_for_peer_count(from_node) >= ctx.max_channels_per_peer {
+        // Idempotent re-subscribe handling. Pre-fix a peer sitting
+        // at the per-peer channel cap that retransmitted a Subscribe
+        // for a channel it already held was rejected with
+        // `TooManyChannels`, even though `SubscriberRoster` is
+        // set-typed and `add` would be a no-op for the existing
+        // pair. The rejection AckReason is filtered out of the
+        // auth-failure budget so it didn't trip the throttle, but
+        // the legitimate re-subscribe still failed at the wire
+        // level.
+        //
+        // The fix SUPPRESSES THE CAP REJECTION ONLY when the pair
+        // is already in the roster — it does NOT short-circuit the
+        // visibility / registry / token / capability gates further
+        // down. A re-emitted Subscribe with a now-revoked token,
+        // tightened visibility, or removed channel must reject the
+        // same way a fresh Subscribe would; otherwise the wire-
+        // level acceptance silently outlives the auth state. The
+        // periodic token-expiry sweep (`evict_unauthorized_subscribers`)
+        // does remove expired-token entries, but it doesn't catch
+        // visibility tightening or the brief window before the
+        // sweep fires, so we re-validate on every Subscribe.
+        // The clone of `channel` is unavoidable for the O(1)
+        // `DashSet<ChannelId>::contains` lookup; it's a small
+        // String clone and runs ahead of the AEAD/ed25519 work
+        // already on this path.
+        let channel_id = ChannelId::new(channel.clone());
+        let already_subscribed = ctx.roster.is_subscribed(from_node, &channel_id);
+        if !already_subscribed
+            && ctx.roster.channels_for_peer_count(from_node) >= ctx.max_channels_per_peer
+        {
             return (false, Some(AckReason::TooManyChannels));
         }
         let Some(ref configs) = ctx.channel_configs else {
@@ -5252,12 +5427,25 @@ impl MeshNode {
 
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
+        // Match the rest of the sender call sites
+        // (`send_to_peer:3661`, `send_to_peer:3685`, `send_routed:3755`,
+        // `send_routed:3785`, `send_on_stream:6110`, `mod.rs:1016, 1063`):
+        // thread `reliable` into the packet header. Pre-fix this site
+        // hard-coded `PacketFlags::NONE` and only fed `reliable` into
+        // `open_stream_with`. Today the dispatch path doesn't inspect
+        // `flags.is_reliable()` (reliability is per-stream, set on
+        // open), so the bug is latent — but the per-call-site
+        // inconsistency would silently bite if a future receiver path
+        // started consulting the packet flag the way `proxy.rs` /
+        // `route.rs` / `router.rs` already consult `is_priority` /
+        // `is_control`.
+        let flags = if reliable {
+            PacketFlags::RELIABLE
+        } else {
+            PacketFlags::NONE
+        };
         let packet = builder.build_subprotocol(
-            stream_id,
-            seq,
-            events,
-            PacketFlags::NONE,
-            0, /* subprotocol_id 0 = event-plane */
+            stream_id, seq, events, flags, 0, /* subprotocol_id 0 = event-plane */
         );
 
         let next_hop = self
@@ -5672,12 +5860,28 @@ impl MeshNode {
         // loop pending_handshakes path via `connect_via`, which
         // avoids recv-loop contention on a post-`start()` node.
         let connect_on_direct_path = |target_addr: std::net::SocketAddr| async move {
-            if session_matches(target_addr) {
-                return Ok(peer_node_id);
-            }
-            self.connect_via(target_addr, peer_pubkey, peer_node_id)
-                .await
-                .map_err(|e| TraversalError::Transport(e.to_string()))
+            let id = if session_matches(target_addr) {
+                peer_node_id
+            } else {
+                self.connect_via(target_addr, peer_pubkey, peer_node_id)
+                    .await
+                    .map_err(|e| TraversalError::Transport(e.to_string()))?
+            };
+            // After a successful direct upgrade (either an
+            // already-matching session or a fresh `connect_via`
+            // landing), point `addr_to_node` at the upgraded
+            // session's wire addr. `connect_via` deliberately does
+            // NOT touch `addr_to_node` so that *relayed* sessions
+            // keep mapping to the relay's own node_id — but a
+            // direct upgrade has a known peer reflex on the wire
+            // and should benefit from the dispatch fast path
+            // (`addr_to_node.get(&source) → peers.get(nid)`).
+            // Without this insert the dispatcher misses on
+            // `target_addr` and falls back to a linear
+            // `peers.iter().find` per packet for the upgraded
+            // session. (#9)
+            self.addr_to_node.insert(target_addr, peer_node_id);
+            Ok::<u64, TraversalError>(id)
         };
 
         // Helper: open a relayed session via `coord_addr`. Short-
@@ -7151,13 +7355,30 @@ impl MeshNode {
             tracing::debug!("nat-traversal: reflex override installed mid-sweep, skipping commit");
             return;
         }
+        // No-observation guard: when every probe failed we have no
+        // fresh reflex to publish. Pre-fix the commit still wrote
+        // `nat_class` (typically degenerating to `Unknown`) but
+        // left the previous `reflex_addr` in place — a torn
+        // `(fresh class, stale reflex)` snapshot that violates the
+        // `traversal_publish_mu` invariant a downstream
+        // `announce_capabilities_with` reader expects to see
+        // coherent. Match the deadline-expired branch in
+        // `reclassify_nat` (the `tokio::time::timeout` Err arm
+        // above): treat "no observations this sweep" as a transient
+        // signal and leave the previously-published pair untouched.
+        // A subsequent sweep can install a fresh class+reflex
+        // together.
+        let Some(addr) = latest_reflex else {
+            tracing::debug!(
+                "nat-traversal: no probe observations this sweep, keeping prior (class, reflex) pair"
+            );
+            return;
+        };
         self.nat_class.store(class.as_u8(), Ordering::Release);
-        if let Some(addr) = latest_reflex {
-            self.reflex_addr.store(Some(Arc::new(addr)));
-        }
+        self.reflex_addr.store(Some(Arc::new(addr)));
         tracing::debug!(
             nat_class = ?class,
-            reflex = ?latest_reflex,
+            reflex = ?addr,
             "nat-traversal: reclassified",
         );
     }
@@ -7506,6 +7727,52 @@ mod reclassify_override_race_tests {
              missed",
         );
         assert_eq!(node.reflex_addr(), Some(override_addr));
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #4: when every
+    /// probe in a sweep failed (`latest_reflex == None`) and the
+    /// override is INACTIVE, the commit must skip both stores
+    /// rather than writing `nat_class` (typically `Unknown`) over
+    /// the previously-published class while leaving the previous
+    /// `reflex_addr` in place — that pair is torn from the
+    /// `traversal_publish_mu` reader's perspective. Match the
+    /// deadline-expired branch in `reclassify_nat`: treat
+    /// "no observations this sweep" as transient and keep the
+    /// previously-published pair coherent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_skips_both_stores_when_no_observation_and_no_override() {
+        let node = build_node_for_test().await;
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        // Seed a coherent (Cone, Some(probed)) pair via the same
+        // commit path; no override is installed so this must apply.
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+        assert_eq!(node.nat_class(), NatClass::Cone);
+        assert_eq!(node.reflex_addr(), Some(probed));
+
+        // Simulate the next sweep where every probe failed.
+        // Pre-fix this would have stored `Unknown` over `Cone`
+        // while keeping `Some(probed)` as the reflex — torn pair.
+        // Post-fix the function returns early and both fields
+        // remain untouched.
+        node.commit_reclassify_observations(NatClass::Unknown, None);
+
+        assert_eq!(
+            node.nat_class(),
+            NatClass::Cone,
+            "no-observation sweep flapped nat_class from Cone to \
+             Unknown; pre-fix the store landed unconditionally even \
+             though the paired reflex store was gated by Some",
+        );
+        assert_eq!(
+            node.reflex_addr(),
+            Some(probed),
+            "reflex_addr was not torn (good) but nat_class was \
+             rewritten — the pair an `announce_capabilities_with` \
+             reader sees under traversal_publish_mu becomes \
+             (fresh class, stale reflex) which violates the mutex's \
+             coherent-snapshot invariant",
+        );
     }
 
     /// After `clear_reflex_override` is called, the classifier
@@ -8011,6 +8278,261 @@ mod heartbeat_aead_tests {
     /// raises the cap or relaxes the guard would otherwise turn
     /// an attacker byte into UB / wrap. This pin ensures the
     /// hardening stays in place even if the upstream gate moves.
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #3 (replay
+    /// guard arm): a routed msg1 whose `remote_static_pub` matches
+    /// the live session's static must be dropped so the live
+    /// session's keys aren't overwritten by NKpsk0's fresh-ephemeral
+    /// reply.
+    #[test]
+    fn routed_rotation_outcome_drops_replay_for_matching_static() {
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        let static_a = [0xAAu8; 32];
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            addr,
+            session,
+            remote_static_pub: static_a,
+        };
+        assert_eq!(
+            routed_rotation_outcome(&info, &static_a, Duration::from_secs(30)),
+            RoutedRotationOutcome::DropReplay,
+        );
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #3 (rotation
+    /// gate, fresh-session arm): a routed msg1 with a *different*
+    /// `remote_static_pub` for an existing peer must NOT overwrite
+    /// the live session while the existing session is still within
+    /// `session_timeout`. Pre-fix this branch unconditionally
+    /// inserted the new keys, opening a trivial DoS where any party
+    /// with the PSK and a valid Noise static could break AEAD
+    /// verification on every legitimate packet to the affected peer.
+    #[test]
+    fn routed_rotation_outcome_refuses_rotation_while_session_is_fresh() {
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            addr,
+            session,
+            remote_static_pub: [0xAAu8; 32],
+        };
+        let new_static = [0xBBu8; 32];
+        assert_eq!(
+            routed_rotation_outcome(&info, &new_static, Duration::from_secs(30)),
+            RoutedRotationOutcome::RefuseFresh,
+        );
+    }
+
+    /// Companion to the fresh-session refusal: once the live session
+    /// has gone silent for at least `session_timeout`, a rotation
+    /// from a different `remote_static_pub` IS accepted. This pins
+    /// that the gate eventually unblocks — a permanent refusal would
+    /// be a different kind of bug (legitimate peers rotating keys
+    /// could never reconnect).
+    #[test]
+    fn routed_rotation_outcome_accepts_rotation_after_session_timeout() {
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            addr,
+            session,
+            remote_static_pub: [0xAAu8; 32],
+        };
+        // Wait past a 1 ms session_timeout. `current_timestamp()`
+        // uses wall-clock `SystemTime::now()` so a real sleep
+        // advances it.
+        std::thread::sleep(Duration::from_millis(5));
+        let new_static = [0xBBu8; 32];
+        assert_eq!(
+            routed_rotation_outcome(&info, &new_static, Duration::from_millis(1)),
+            RoutedRotationOutcome::AcceptRotation,
+        );
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #9:
+    /// `connect_on_direct_path` must refresh
+    /// `addr_to_node[target_addr] = peer_node_id` on success.
+    /// Pre-fix the closure called `connect_via` which deliberately
+    /// does NOT touch `addr_to_node` (correct for relayed sessions
+    /// where the relay's address must keep mapping to the relay's
+    /// own node_id), so a successful direct upgrade left the
+    /// dispatch fast path
+    /// (`addr_to_node.get(&source) → peers.get(nid)`) missing on
+    /// the upgraded session's reflex addr — every inbound packet
+    /// then fell back to a linear `peers.iter().find(|e|
+    /// session_id == ...)` for exactly the sessions that benefit
+    /// most from the index. Source-level pin so the closure body
+    /// keeps the `addr_to_node.insert` after the upgrade lands.
+    #[test]
+    fn connect_direct_upgrade_refreshes_addr_to_node() {
+        let src = include_str!("mesh.rs");
+        let start = src
+            .find("let connect_on_direct_path =")
+            .expect("connect_on_direct_path closure must exist");
+        let scan_end = (start + 4000).min(src.len());
+        let body = &src[start..scan_end];
+
+        assert!(
+            body.contains("self.addr_to_node.insert(target_addr, peer_node_id)"),
+            "regression: connect_on_direct_path must refresh addr_to_node \
+             on success — pre-fix the dispatch fast path missed on the \
+             upgraded session's reflex addr and fell back to a linear \
+             peers.iter().find per packet for exactly the sessions that \
+             benefit most from the index."
+        );
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #8: the
+    /// migration-handler loopback drain in `process_local_packet`
+    /// must cap the synchronous self-bounce depth. Pre-fix the
+    /// in-place `pending: VecDeque` loop drained as long as the
+    /// handler emitted self-bound follow-ups, so a buggy or
+    /// attacker-influenced handler that always emitted a self-bound
+    /// message would spin the dispatch task forever, starving every
+    /// other peer's packets. Source-level pin: the constant
+    /// `MAX_MIGRATION_LOOPBACK_DEPTH` and a `> MAX_..._DEPTH` guard
+    /// must be present in the file. A future change that drops the
+    /// guard fails this pin loudly rather than silently
+    /// reintroducing the starvation.
+    #[test]
+    fn migration_loopback_drain_caps_self_bounce_depth() {
+        let src = include_str!("mesh.rs");
+        assert!(
+            src.contains("const MAX_MIGRATION_LOOPBACK_DEPTH: usize"),
+            "regression: process_local_packet's migration loopback drain \
+             must declare a `MAX_MIGRATION_LOOPBACK_DEPTH` cap. Pre-fix \
+             the loop ran unbounded so a handler stuck in a self-bounce \
+             state would starve the dispatch task."
+        );
+        assert!(
+            src.contains("loopback_count > MAX_MIGRATION_LOOPBACK_DEPTH"),
+            "regression: the migration loopback drain must short-circuit \
+             past the depth cap with a warn — the bare `loopback_count += 1; \
+             match handler.handle_message(...)` shape without the threshold \
+             check leaves the unbounded-spin hazard in place."
+        );
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #7:
+    /// `publish_to_peer` was the only sender call site that
+    /// hard-coded `PacketFlags::NONE` instead of computing
+    /// `if reliable { PacketFlags::RELIABLE } else { PacketFlags::NONE }`.
+    /// Today the dispatch path doesn't consult `is_reliable()` (per-
+    /// stream reliability is set at open), so the inconsistency is
+    /// latent — but receiver-side code already consults the packet
+    /// flag for `is_priority` / `is_control`, and `is_reliable` is
+    /// the obvious next addition. This source-level pin ensures the
+    /// fix doesn't get reverted before the dispatch path catches up.
+    #[test]
+    fn publish_to_peer_propagates_reliable_to_packet_flags() {
+        let src = include_str!("mesh.rs");
+        let start = src
+            .find("async fn publish_to_peer(")
+            .expect("publish_to_peer must exist");
+        let scan_end = (start + 6000).min(src.len());
+        let body = &src[start..scan_end];
+
+        assert!(
+            body.contains("if reliable") && body.contains("PacketFlags::RELIABLE"),
+            "regression: publish_to_peer must thread `reliable` into the packet \
+             header — pre-fix it hard-coded PacketFlags::NONE while only \
+             feeding `reliable` into open_stream_with, leaving every other \
+             sender call site (send_to_peer, send_routed, send_on_stream) \
+             inconsistent."
+        );
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #6: the
+    /// routed-handshake replay/rotation decision and the subsequent
+    /// `peers.insert` must happen under a single `peers.entry`
+    /// write guard so two concurrent routed handshakes for the same
+    /// `peer_node_id` cannot both pass the existing-static check
+    /// and race the insert. The shape pin guards against a future
+    /// refactor that reintroduces the get→insert split.
+    #[test]
+    fn routed_handshake_uses_entry_api_for_atomic_insert() {
+        let src = include_str!("mesh.rs");
+        // Find `fn handle_routed_handshake` and scan to the next
+        // function definition (or 16 KB, whichever comes first).
+        let start = src
+            .find("fn handle_routed_handshake")
+            .expect("handle_routed_handshake must exist");
+        let scan_end = (start + 16_000).min(src.len());
+        let body = &src[start..scan_end];
+        assert!(
+            body.contains("ctx.peers.entry(peer_node_id)"),
+            "regression: handle_routed_handshake must use peers.entry() so the \
+             replay/rotation decision and the insert are atomic. Pre-fix the \
+             function used `peers.get` followed by `peers.insert`, which let \
+             two concurrent handshakes race the insert and wedge the loser's \
+             pending_handshakes state until handshake_timeout."
+        );
+        // Negative pin: the bare insert pattern outside the entry
+        // block would signal a regression to the get→insert split.
+        assert!(
+            !body.contains("ctx.peers.insert(\n            peer_node_id,"),
+            "regression: bare ctx.peers.insert(peer_node_id, ...) reintroduced \
+             outside the peers.entry() block — the insert must be gated by the \
+             same entry guard as the existing-static check."
+        );
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #5 (narrow form):
+    /// the idempotent re-subscribe handling in `authorize_subscribe`
+    /// must SUPPRESS THE CAP REJECTION ONLY — not short-circuit the
+    /// whole auth chain. The original fix (returning `(true, None)`
+    /// directly when `is_subscribed` was true) bypassed visibility,
+    /// registry, and token validation for any peer already in the
+    /// roster, silently outliving auth-state changes (e.g., a
+    /// re-emitted Subscribe with a now-revoked token would have been
+    /// admitted at the wire level even though the periodic sweep
+    /// would later evict the entry). Pin the narrower combined check
+    /// so a future "simplification" back to the broad form fails
+    /// loudly here rather than re-introducing the bypass.
+    #[test]
+    fn authorize_subscribe_only_suppresses_cap_for_already_subscribed() {
+        let src = include_str!("mesh.rs");
+        let start = src
+            .find("fn authorize_subscribe(")
+            .expect("authorize_subscribe must exist");
+        let scan_end = (start + 4_000).min(src.len());
+        let body = &src[start..scan_end];
+
+        // Positive: the combined predicate must be present.
+        assert!(
+            body.contains("let already_subscribed = ctx.roster.is_subscribed("),
+            "regression: authorize_subscribe must capture an \
+             `already_subscribed` boolean and use it to gate ONLY the \
+             cap rejection."
+        );
+        assert!(
+            body.contains("!already_subscribed") && body.contains(">= ctx.max_channels_per_peer"),
+            "regression: the cap rejection must be guarded by \
+             `!already_subscribed && ... >= max_channels_per_peer` so \
+             an under-cap or already-subscribed peer falls through to \
+             the visibility / registry / token gates rather than being \
+             admitted with `(true, None)` ahead of them."
+        );
+
+        // Negative: the broad short-circuit `if is_subscribed { return (true, None) }`
+        // must NOT reappear — that was the original over-broad form
+        // that bypassed the rest of the auth chain.
+        assert!(
+            !body.contains("if ctx.roster.is_subscribed(from_node, &channel_id) {\n            return (true, None);"),
+            "regression: the broad `if is_subscribed -> return (true, None)` \
+             short-circuit reintroduced — this bypasses visibility, \
+             registry, and token validation for any peer already in the \
+             roster. Use the narrower `!already_subscribed && >= cap` \
+             form so the cap rejection is the ONLY thing suppressed."
+        );
+    }
+
     #[test]
     fn hop_count_increments_must_be_saturating() {
         // Build the forbidden token at runtime so this test's source
