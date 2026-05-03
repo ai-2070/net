@@ -3055,9 +3055,35 @@ impl MeshNode {
                             //
                             // Handler work is synchronous and cheap; doing
                             // it on the receive-loop task is fine.
+                            //
+                            // Depth-cap the self-bounce drain so a buggy
+                            // handler (or attacker-influenced state inside
+                            // a "trusted" handler) that always emits a
+                            // self-bound follow-up cannot spin this loop
+                            // synchronously on the dispatch task and
+                            // starve every other peer's packets. A
+                            // correct migration handler converges in a
+                            // small, bounded number of self-bounces.
+                            const MAX_MIGRATION_LOOPBACK_DEPTH: usize = 32;
                             let mut pending: std::collections::VecDeque<_> = outbound.into();
+                            let mut loopback_count: usize = 0;
                             while let Some(msg) = pending.pop_front() {
                                 if msg.dest_node == ctx.local_node_id {
+                                    loopback_count += 1;
+                                    if loopback_count > MAX_MIGRATION_LOOPBACK_DEPTH {
+                                        tracing::warn!(
+                                            depth = loopback_count,
+                                            from_node = from_node,
+                                            cap = MAX_MIGRATION_LOOPBACK_DEPTH,
+                                            "migration handler loopback exceeded \
+                                             MAX_MIGRATION_LOOPBACK_DEPTH; dropping \
+                                             remaining queue to keep the dispatch \
+                                             task responsive to other peers. A \
+                                             correct handler should converge in a \
+                                             small bounded number of self-bounces.",
+                                        );
+                                        break;
+                                    }
                                     match handler.handle_message(&msg.payload, ctx.local_node_id) {
                                         Ok(more) => pending.extend(more),
                                         Err(e) => {
@@ -8315,6 +8341,37 @@ mod heartbeat_aead_tests {
     /// serialize is ultimately a contract test on `dashmap`, but the
     /// shape pin guards against a future refactor that reintroduces
     /// the get→insert split.
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #8: the
+    /// migration-handler loopback drain in `process_local_packet`
+    /// must cap the synchronous self-bounce depth. Pre-fix the
+    /// in-place `pending: VecDeque` loop drained as long as the
+    /// handler emitted self-bound follow-ups, so a buggy or
+    /// attacker-influenced handler that always emitted a self-bound
+    /// message would spin the dispatch task forever, starving every
+    /// other peer's packets. Source-level pin: the constant
+    /// `MAX_MIGRATION_LOOPBACK_DEPTH` and a `> MAX_..._DEPTH` guard
+    /// must be present in the file. A future change that drops the
+    /// guard fails this pin loudly rather than silently
+    /// reintroducing the starvation.
+    #[test]
+    fn migration_loopback_drain_caps_self_bounce_depth() {
+        let src = include_str!("mesh.rs");
+        assert!(
+            src.contains("const MAX_MIGRATION_LOOPBACK_DEPTH: usize"),
+            "regression: process_local_packet's migration loopback drain \
+             must declare a `MAX_MIGRATION_LOOPBACK_DEPTH` cap. Pre-fix \
+             the loop ran unbounded so a handler stuck in a self-bounce \
+             state would starve the dispatch task."
+        );
+        assert!(
+            src.contains("loopback_count > MAX_MIGRATION_LOOPBACK_DEPTH"),
+            "regression: the migration loopback drain must short-circuit \
+             past the depth cap with a warn — the bare `loopback_count += 1; \
+             match handler.handle_message(...)` shape without the threshold \
+             check leaves the unbounded-spin hazard in place."
+        );
+    }
+
     /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #7:
     /// `publish_to_peer` was the only sender call site that
     /// hard-coded `PacketFlags::NONE` instead of computing
