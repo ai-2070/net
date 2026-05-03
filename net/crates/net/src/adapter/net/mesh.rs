@@ -3519,25 +3519,39 @@ impl MeshNode {
                         let pw = proximity_graph.create_pingwave(HealthStatus::Healthy);
                         let pw_bytes = pw.to_bytes();
 
-                        for entry in peers.iter() {
-                            let peer_addr = entry.value().addr;
-                            if partition_filter.contains(&peer_addr) {
-                                continue;
-                            }
-                            let session = &entry.value().session;
-                            // `Session::build_heartbeat` routes
-                            // through `thread_local_pool` (same
-                            // pool the data path uses) so
-                            // heartbeats and data share a single
-                            // `tx_counter`. Constructing a fresh
-                            // `PacketBuilder::new(&[0u8; 32],
-                            // session.session_id())` per heartbeat
-                            // would (a) use the wrong key so the
-                            // receiver's AEAD verify would reject
-                            // every tag, and (b) reuse counter=0
-                            // across heartbeats so the replay
-                            // window would reject every heartbeat
-                            // after the first.
+                        // Snapshot the peer set into a Vec before
+                        // awaiting any send — pre-fix the loop held
+                        // a DashMap shard `Ref` guard across each
+                        // `socket.send_to(...).await` (twice per peer:
+                        // heartbeat then pingwave), blocking every
+                        // other task that touched the same shard
+                        // (`peers.insert` from `connect`/`accept`/
+                        // `handle_routed_handshake`, `peers.get` from
+                        // the data path, etc.) for the cumulative
+                        // round-trip of N×2 sends per heartbeat tick.
+                        // `Session::build_heartbeat` routes through
+                        // `thread_local_pool` (same pool the data path
+                        // uses) so heartbeats and data share a single
+                        // `tx_counter`; constructing a fresh
+                        // `PacketBuilder::new(&[0u8; 32],
+                        // session.session_id())` per heartbeat would
+                        // (a) use the wrong key so the receiver's AEAD
+                        // verify would reject every tag, and (b) reuse
+                        // counter=0 across heartbeats so the replay
+                        // window would reject every heartbeat after
+                        // the first.
+                        let snapshot: Vec<(SocketAddr, Arc<NetSession>)> = peers
+                            .iter()
+                            .filter_map(|entry| {
+                                let peer_addr = entry.value().addr;
+                                if partition_filter.contains(&peer_addr) {
+                                    None
+                                } else {
+                                    Some((peer_addr, entry.value().session.clone()))
+                                }
+                            })
+                            .collect();
+                        for (peer_addr, session) in snapshot {
                             let packet = session.build_heartbeat();
                             let _ = socket.send_to(&packet, peer_addr).await;
                             // Pingwave (raw UDP — not encrypted, topology is public)
