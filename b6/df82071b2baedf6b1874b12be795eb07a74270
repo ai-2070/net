@@ -1,0 +1,23 @@
+net/crates/net/docs/RELEASE_v0.10_KILLING_MOON_PHASE_III.md
+  726f3eb25aff9828 1-338
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b6df82071b2baedf6b1874b12be795eb07a74270",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 338,
+      "total_deletions": 0,
+      "accepted_lines": 338,
+      "overriden_lines": 0
+    }
+  }
+}
