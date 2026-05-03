@@ -7271,13 +7271,30 @@ impl MeshNode {
             tracing::debug!("nat-traversal: reflex override installed mid-sweep, skipping commit");
             return;
         }
+        // No-observation guard: when every probe failed we have no
+        // fresh reflex to publish. Pre-fix the commit still wrote
+        // `nat_class` (typically degenerating to `Unknown`) but
+        // left the previous `reflex_addr` in place — a torn
+        // `(fresh class, stale reflex)` snapshot that violates the
+        // `traversal_publish_mu` invariant a downstream
+        // `announce_capabilities_with` reader expects to see
+        // coherent. Match the deadline-expired branch in
+        // `reclassify_nat` (the `tokio::time::timeout` Err arm
+        // above): treat "no observations this sweep" as a transient
+        // signal and leave the previously-published pair untouched.
+        // A subsequent sweep can install a fresh class+reflex
+        // together.
+        let Some(addr) = latest_reflex else {
+            tracing::debug!(
+                "nat-traversal: no probe observations this sweep, keeping prior (class, reflex) pair"
+            );
+            return;
+        };
         self.nat_class.store(class.as_u8(), Ordering::Release);
-        if let Some(addr) = latest_reflex {
-            self.reflex_addr.store(Some(Arc::new(addr)));
-        }
+        self.reflex_addr.store(Some(Arc::new(addr)));
         tracing::debug!(
             nat_class = ?class,
-            reflex = ?latest_reflex,
+            reflex = ?addr,
             "nat-traversal: reclassified",
         );
     }
@@ -7626,6 +7643,52 @@ mod reclassify_override_race_tests {
              missed",
         );
         assert_eq!(node.reflex_addr(), Some(override_addr));
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #4: when every
+    /// probe in a sweep failed (`latest_reflex == None`) and the
+    /// override is INACTIVE, the commit must skip both stores
+    /// rather than writing `nat_class` (typically `Unknown`) over
+    /// the previously-published class while leaving the previous
+    /// `reflex_addr` in place — that pair is torn from the
+    /// `traversal_publish_mu` reader's perspective. Match the
+    /// deadline-expired branch in `reclassify_nat`: treat
+    /// "no observations this sweep" as transient and keep the
+    /// previously-published pair coherent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_skips_both_stores_when_no_observation_and_no_override() {
+        let node = build_node_for_test().await;
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        // Seed a coherent (Cone, Some(probed)) pair via the same
+        // commit path; no override is installed so this must apply.
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+        assert_eq!(node.nat_class(), NatClass::Cone);
+        assert_eq!(node.reflex_addr(), Some(probed));
+
+        // Simulate the next sweep where every probe failed.
+        // Pre-fix this would have stored `Unknown` over `Cone`
+        // while keeping `Some(probed)` as the reflex — torn pair.
+        // Post-fix the function returns early and both fields
+        // remain untouched.
+        node.commit_reclassify_observations(NatClass::Unknown, None);
+
+        assert_eq!(
+            node.nat_class(),
+            NatClass::Cone,
+            "no-observation sweep flapped nat_class from Cone to \
+             Unknown; pre-fix the store landed unconditionally even \
+             though the paired reflex store was gated by Some",
+        );
+        assert_eq!(
+            node.reflex_addr(),
+            Some(probed),
+            "reflex_addr was not torn (good) but nat_class was \
+             rewritten — the pair an `announce_capabilities_with` \
+             reader sees under traversal_publish_mu becomes \
+             (fresh class, stale reflex) which violates the mutex's \
+             coherent-snapshot invariant",
+        );
     }
 
     /// After `clear_reflex_override` is called, the classifier
