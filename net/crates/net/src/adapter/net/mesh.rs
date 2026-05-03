@@ -196,6 +196,54 @@ impl Drop for PeerRegistrationGuard {
     }
 }
 
+/// Outcome of the routed-handshake key-rotation gate.
+///
+/// The gate runs inside `peers.entry(peer_node_id)`'s write guard so
+/// the decision and the subsequent insert are atomic; see
+/// `MeshNode::handle_routed_handshake` for the call site.
+#[derive(Debug, PartialEq, Eq)]
+enum RoutedRotationOutcome {
+    /// A live session for the same `peer_node_id` is already
+    /// established with the SAME `remote_static_pub` — drop the
+    /// inbound msg1 as a replay. NKpsk0's responder uses a fresh
+    /// ephemeral on each reply, so without this guard a captured
+    /// msg1 replayed by a passive attacker would derive new session
+    /// keys and silently swap them in, breaking AEAD verification
+    /// on the legitimate peer's subsequent packets.
+    DropReplay,
+    /// A live session for the same `peer_node_id` exists with a
+    /// DIFFERENT `remote_static_pub`. Refuse the rotation: the
+    /// existing session is still within `session_timeout`. Pre-fix
+    /// this branch unconditionally overwrote the live session,
+    /// opening a trivial DoS — anyone holding the PSK and any valid
+    /// Noise static could swap session keys for any peer that ever
+    /// handshook on a routed path. A legitimate peer rotating its
+    /// static must wait for its existing session to time out before
+    /// the new keys are accepted.
+    RefuseFresh,
+    /// No conflict (or the existing session has timed out). The
+    /// caller should construct a fresh session and insert it under
+    /// the same entry guard.
+    AcceptRotation,
+}
+
+/// Decide whether an inbound routed handshake is allowed to install
+/// new session keys for `peer_node_id`.
+fn routed_rotation_outcome(
+    existing: &PeerInfo,
+    new_static: &[u8; 32],
+    session_timeout: Duration,
+) -> RoutedRotationOutcome {
+    if existing.remote_static_pub == *new_static {
+        return RoutedRotationOutcome::DropReplay;
+    }
+    if existing.session.is_timed_out(session_timeout) {
+        RoutedRotationOutcome::AcceptRotation
+    } else {
+        RoutedRotationOutcome::RefuseFresh
+    }
+}
+
 /// Shared context for the packet dispatch loop.
 struct DispatchCtx {
     local_node_id: u64,
@@ -250,6 +298,11 @@ struct DispatchCtx {
     /// handshake responder completes here).
     packet_pool_size: usize,
     default_reliable: bool,
+    /// Idle/heartbeat window for an established session. Used by the
+    /// routed-handshake rotation gate to refuse swapping a live
+    /// session's keys until the existing session has gone silent for
+    /// at least this long. See `routed_rotation_outcome`.
+    session_timeout: Duration,
     /// Subscriber roster for channel fan-out.
     roster: Arc<SubscriberRoster>,
     /// Channel config registry used to authorize incoming Subscribe.
@@ -2263,6 +2316,7 @@ impl MeshNode {
             partition_filter: self.partition_filter.clone(),
             packet_pool_size: self.config.packet_pool_size,
             default_reliable: self.config.default_reliable,
+            session_timeout: self.config.session_timeout,
             roster: self.roster.clone(),
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
@@ -2755,49 +2809,92 @@ impl MeshNode {
         // spawned send task is cancelled or panics post-send, the
         // initiator that just derived matching keys finds us.
         //
-        // Replay guard: if a live session already exists for
-        // `peer_node_id` with the SAME `remote_static_pub`, drop the
-        // new handshake. NKpsk0's responder uses a fresh ephemeral
-        // on each reply so a captured msg1 replayed by a passive
-        // attacker would otherwise overwrite the live session keys
-        // — the legitimate initiator still holds the old keys and
-        // every subsequent AEAD-protected packet would fail open and
-        // be dropped, a trivial DoS against any node that ever
-        // handshook on a routed path. Re-handshake from the same
-        // identity is gated by session expiry / explicit removal,
-        // not by overwriting an active session in place.
+        // Replay guard + rotation gate, atomic via `peers.entry()`.
+        //
+        // Pre-fix this was `peers.get()` followed by `peers.insert()`,
+        // which had two distinct bugs:
+        //
+        // 1. (#6) The read-guard from `get()` was dropped before the
+        //    `insert()`. Two concurrent routed handshakes for the same
+        //    `peer_node_id` could both pass the `existing.remote_static_pub`
+        //    check and race the insert; the loser's `pending_handshakes`
+        //    state stayed armed waiting for a msg2 that was now bound to
+        //    the winner's session, until the per-call `handshake_timeout`
+        //    fired.
+        //
+        // 2. (#3) When the existing entry's `remote_static_pub` differed
+        //    from the inbound msg1's, the code unconditionally fell
+        //    through and overwrote the live session with attacker-derived
+        //    keys. The legitimate initiator still held the old keys, so
+        //    every subsequent AEAD-protected packet failed open and was
+        //    silently dropped — a trivial DoS against any node that ever
+        //    handshook on a routed path, requiring only the PSK and a
+        //    second valid Noise static. The rotation gate now refuses
+        //    rotation while the existing session is still within
+        //    `session_timeout`. Once the live session has gone silent
+        //    long enough to be considered dead, a fresh handshake from
+        //    the legitimate peer (or a permitted key rotation) installs
+        //    the new keys cleanly.
+        //
+        // The replay guard fires for the SAME `remote_static_pub`:
+        // NKpsk0's responder uses a fresh ephemeral on each reply, so
+        // a captured-and-replayed msg1 derives different session keys
+        // every time. Without this guard the live session's keys would
+        // get overwritten on every replay.
         let remote_static_pub = keys.remote_static_pub;
-        if let Some(existing) = ctx.peers.get(&peer_node_id) {
-            if existing.remote_static_pub == remote_static_pub {
-                tracing::warn!(
-                    peer_node_id,
-                    "routed handshake: dropping msg1 — live session already \
-                     established for this peer with matching remote_static_pub \
-                     (replay guard)"
-                );
-                return;
+        match ctx.peers.entry(peer_node_id) {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                match routed_rotation_outcome(occ.get(), &remote_static_pub, ctx.session_timeout) {
+                    RoutedRotationOutcome::DropReplay => {
+                        tracing::warn!(
+                            peer_node_id,
+                            "routed handshake: dropping msg1 — live session already \
+                             established for this peer with matching remote_static_pub \
+                             (replay guard)"
+                        );
+                        return;
+                    }
+                    RoutedRotationOutcome::RefuseFresh => {
+                        tracing::warn!(
+                            peer_node_id,
+                            "routed handshake: refusing key rotation — existing \
+                             session is still within session_timeout. New keys \
+                             can be installed once the live session has gone \
+                             silent for at least session_timeout (rotation gate)"
+                        );
+                        return;
+                    }
+                    RoutedRotationOutcome::AcceptRotation => {
+                        let session = Arc::new(NetSession::new(
+                            keys,
+                            source,
+                            ctx.packet_pool_size,
+                            ctx.default_reliable,
+                        ));
+                        occ.insert(PeerInfo {
+                            node_id: peer_node_id,
+                            addr: source,
+                            session,
+                            remote_static_pub,
+                        });
+                    }
+                }
             }
-            // Different remote_static_pub for the same node_id is
-            // either a peer rotating its static key (legitimate) or
-            // an attacker forging a different static — let the
-            // initiator's matching-keys check resolve which.
-            // Fall through to insert below.
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                let session = Arc::new(NetSession::new(
+                    keys,
+                    source,
+                    ctx.packet_pool_size,
+                    ctx.default_reliable,
+                ));
+                vac.insert(PeerInfo {
+                    node_id: peer_node_id,
+                    addr: source,
+                    session,
+                    remote_static_pub,
+                });
+            }
         }
-        let session = Arc::new(NetSession::new(
-            keys,
-            source,
-            ctx.packet_pool_size,
-            ctx.default_reliable,
-        ));
-        ctx.peers.insert(
-            peer_node_id,
-            PeerInfo {
-                node_id: peer_node_id,
-                addr: source,
-                session,
-                remote_static_pub,
-            },
-        );
         ctx.peer_addrs.insert(peer_node_id, source);
         ctx.router.add_route(peer_node_id, source);
 
@@ -8034,6 +8131,122 @@ mod heartbeat_aead_tests {
     /// raises the cap or relaxes the guard would otherwise turn
     /// an attacker byte into UB / wrap. This pin ensures the
     /// hardening stays in place even if the upstream gate moves.
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #3 (replay
+    /// guard arm): a routed msg1 whose `remote_static_pub` matches
+    /// the live session's static must be dropped so the live
+    /// session's keys aren't overwritten by NKpsk0's fresh-ephemeral
+    /// reply.
+    #[test]
+    fn routed_rotation_outcome_drops_replay_for_matching_static() {
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        let static_a = [0xAAu8; 32];
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            addr,
+            session,
+            remote_static_pub: static_a,
+        };
+        assert_eq!(
+            routed_rotation_outcome(&info, &static_a, Duration::from_secs(30)),
+            RoutedRotationOutcome::DropReplay,
+        );
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #3 (rotation
+    /// gate, fresh-session arm): a routed msg1 with a *different*
+    /// `remote_static_pub` for an existing peer must NOT overwrite
+    /// the live session while the existing session is still within
+    /// `session_timeout`. Pre-fix this branch unconditionally
+    /// inserted the new keys, opening a trivial DoS where any party
+    /// with the PSK and a valid Noise static could break AEAD
+    /// verification on every legitimate packet to the affected peer.
+    #[test]
+    fn routed_rotation_outcome_refuses_rotation_while_session_is_fresh() {
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            addr,
+            session,
+            remote_static_pub: [0xAAu8; 32],
+        };
+        let new_static = [0xBBu8; 32];
+        assert_eq!(
+            routed_rotation_outcome(&info, &new_static, Duration::from_secs(30)),
+            RoutedRotationOutcome::RefuseFresh,
+        );
+    }
+
+    /// Companion to the fresh-session refusal: once the live session
+    /// has gone silent for at least `session_timeout`, a rotation
+    /// from a different `remote_static_pub` IS accepted. This pins
+    /// that the gate eventually unblocks — a permanent refusal would
+    /// be a different kind of bug (legitimate peers rotating keys
+    /// could never reconnect).
+    #[test]
+    fn routed_rotation_outcome_accepts_rotation_after_session_timeout() {
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            addr,
+            session,
+            remote_static_pub: [0xAAu8; 32],
+        };
+        // Wait past a 1 ms session_timeout. `current_timestamp()`
+        // uses wall-clock `SystemTime::now()` so a real sleep
+        // advances it.
+        std::thread::sleep(Duration::from_millis(5));
+        let new_static = [0xBBu8; 32];
+        assert_eq!(
+            routed_rotation_outcome(&info, &new_static, Duration::from_millis(1)),
+            RoutedRotationOutcome::AcceptRotation,
+        );
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #6: the routed-
+    /// handshake replay/rotation decision and the subsequent
+    /// `peers.insert` must happen under a single `peers.entry` write
+    /// guard so two concurrent routed handshakes for the same
+    /// `peer_node_id` cannot both pass the existing-static check and
+    /// race the insert. This test pins the structural shape — the
+    /// production path now uses `match ctx.peers.entry(peer_node_id)`.
+    /// A simple test that two concurrent `peers.entry()` calls
+    /// serialize is ultimately a contract test on `dashmap`, but the
+    /// shape pin guards against a future refactor that reintroduces
+    /// the get→insert split.
+    #[test]
+    fn routed_handshake_uses_entry_api_for_atomic_insert() {
+        let src = include_str!("mesh.rs");
+        // Find `fn handle_routed_handshake` and scan to the next
+        // function definition (or 16 KB, whichever comes first).
+        let start = src
+            .find("fn handle_routed_handshake")
+            .expect("handle_routed_handshake must exist");
+        let scan_end = (start + 16_000).min(src.len());
+        let body = &src[start..scan_end];
+        assert!(
+            body.contains("ctx.peers.entry(peer_node_id)"),
+            "regression: handle_routed_handshake must use peers.entry() so the \
+             replay/rotation decision and the insert are atomic. Pre-fix the \
+             function used `peers.get` followed by `peers.insert`, which let \
+             two concurrent handshakes race the insert and wedge the loser's \
+             pending_handshakes state until handshake_timeout."
+        );
+        // Negative pin: the bare insert pattern outside the entry
+        // block would signal a regression to the get→insert split.
+        assert!(
+            !body.contains("ctx.peers.insert(\n            peer_node_id,"),
+            "regression: bare ctx.peers.insert(peer_node_id, ...) reintroduced \
+             outside the peers.entry() block — the insert must be gated by the \
+             same entry guard as the existing-static check."
+        );
+    }
+
     #[test]
     fn hop_count_increments_must_be_saturating() {
         // Build the forbidden token at runtime so this test's source
