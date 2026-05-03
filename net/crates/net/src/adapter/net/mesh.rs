@@ -4824,23 +4824,36 @@ impl MeshNode {
         if Self::is_auth_throttled(from_node, ctx) {
             return (false, Some(AckReason::RateLimited));
         }
-        // Idempotent re-subscribe short-circuit. Pre-fix a peer
-        // sitting at the per-peer channel cap that retransmitted a
-        // Subscribe for a channel it already held was rejected
-        // with `TooManyChannels`, even though `SubscriberRoster`
-        // is set-typed and `add` is a no-op for the existing pair.
-        // The rejection AckReason is filtered out of the auth-
-        // failure budget so it didn't trip the throttle, but the
-        // legitimate re-subscribe still failed at the wire level.
+        // Idempotent re-subscribe handling. Pre-fix a peer sitting
+        // at the per-peer channel cap that retransmitted a Subscribe
+        // for a channel it already held was rejected with
+        // `TooManyChannels`, even though `SubscriberRoster` is
+        // set-typed and `add` would be a no-op for the existing
+        // pair. The rejection AckReason is filtered out of the
+        // auth-failure budget so it didn't trip the throttle, but
+        // the legitimate re-subscribe still failed at the wire
+        // level.
+        //
+        // The fix SUPPRESSES THE CAP REJECTION ONLY when the pair
+        // is already in the roster — it does NOT short-circuit the
+        // visibility / registry / token / capability gates further
+        // down. A re-emitted Subscribe with a now-revoked token,
+        // tightened visibility, or removed channel must reject the
+        // same way a fresh Subscribe would; otherwise the wire-
+        // level acceptance silently outlives the auth state. The
+        // periodic token-expiry sweep (`evict_unauthorized_subscribers`)
+        // does remove expired-token entries, but it doesn't catch
+        // visibility tightening or the brief window before the
+        // sweep fires, so we re-validate on every Subscribe.
         // The clone of `channel` is unavoidable for the O(1)
         // `DashSet<ChannelId>::contains` lookup; it's a small
         // String clone and runs ahead of the AEAD/ed25519 work
         // already on this path.
         let channel_id = ChannelId::new(channel.clone());
-        if ctx.roster.is_subscribed(from_node, &channel_id) {
-            return (true, None);
-        }
-        if ctx.roster.channels_for_peer_count(from_node) >= ctx.max_channels_per_peer {
+        let already_subscribed = ctx.roster.is_subscribed(from_node, &channel_id);
+        if !already_subscribed
+            && ctx.roster.channels_for_peer_count(from_node) >= ctx.max_channels_per_peer
+        {
             return (false, Some(AckReason::TooManyChannels));
         }
         let Some(ref configs) = ctx.channel_configs else {
@@ -8467,6 +8480,56 @@ mod heartbeat_aead_tests {
             "regression: bare ctx.peers.insert(peer_node_id, ...) reintroduced \
              outside the peers.entry() block — the insert must be gated by the \
              same entry guard as the existing-static check."
+        );
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #5 (narrow form):
+    /// the idempotent re-subscribe handling in `authorize_subscribe`
+    /// must SUPPRESS THE CAP REJECTION ONLY — not short-circuit the
+    /// whole auth chain. The original fix (returning `(true, None)`
+    /// directly when `is_subscribed` was true) bypassed visibility,
+    /// registry, and token validation for any peer already in the
+    /// roster, silently outliving auth-state changes (e.g., a
+    /// re-emitted Subscribe with a now-revoked token would have been
+    /// admitted at the wire level even though the periodic sweep
+    /// would later evict the entry). Pin the narrower combined check
+    /// so a future "simplification" back to the broad form fails
+    /// loudly here rather than re-introducing the bypass.
+    #[test]
+    fn authorize_subscribe_only_suppresses_cap_for_already_subscribed() {
+        let src = include_str!("mesh.rs");
+        let start = src
+            .find("fn authorize_subscribe(")
+            .expect("authorize_subscribe must exist");
+        let scan_end = (start + 4_000).min(src.len());
+        let body = &src[start..scan_end];
+
+        // Positive: the combined predicate must be present.
+        assert!(
+            body.contains("let already_subscribed = ctx.roster.is_subscribed("),
+            "regression: authorize_subscribe must capture an \
+             `already_subscribed` boolean and use it to gate ONLY the \
+             cap rejection."
+        );
+        assert!(
+            body.contains("!already_subscribed") && body.contains(">= ctx.max_channels_per_peer"),
+            "regression: the cap rejection must be guarded by \
+             `!already_subscribed && ... >= max_channels_per_peer` so \
+             an under-cap or already-subscribed peer falls through to \
+             the visibility / registry / token gates rather than being \
+             admitted with `(true, None)` ahead of them."
+        );
+
+        // Negative: the broad short-circuit `if is_subscribed { return (true, None) }`
+        // must NOT reappear — that was the original over-broad form
+        // that bypassed the rest of the auth chain.
+        assert!(
+            !body.contains("if ctx.roster.is_subscribed(from_node, &channel_id) {\n            return (true, None);"),
+            "regression: the broad `if is_subscribed -> return (true, None)` \
+             short-circuit reintroduced — this bypasses visibility, \
+             registry, and token validation for any peer already in the \
+             roster. Use the narrower `!already_subscribed && >= cap` \
+             form so the cap rejection is the ONLY thing suppressed."
         );
     }
 

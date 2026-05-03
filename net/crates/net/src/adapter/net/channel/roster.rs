@@ -157,12 +157,16 @@ impl SubscriberRoster {
     }
 
     /// True if `node_id` is currently subscribed to `channel`. Used by
-    /// `MeshNode::authorize_subscribe` to short-circuit idempotent
-    /// re-subscribes ahead of the per-peer channel cap check — pre-fix
+    /// `MeshNode::authorize_subscribe` to gate the per-peer channel
+    /// cap check: an idempotent re-subscribe (already in the roster)
+    /// suppresses the `TooManyChannels` rejection only — pre-fix
     /// a peer at the cap that retransmitted a Subscribe for a channel
     /// it already held was rejected with `TooManyChannels`, even though
     /// the underlying `add` is set-typed and the operation would have
-    /// been a no-op.
+    /// been a no-op. The visibility / registry / token gates further
+    /// down the auth chain still run on every Subscribe, so a re-emitted
+    /// Subscribe with a now-revoked token or under tightened visibility
+    /// rejects the same way a fresh Subscribe would.
     pub fn is_subscribed(&self, node_id: u64, channel: &ChannelId) -> bool {
         match self.by_peer.get(&node_id) {
             Some(set) => set.contains(channel),
@@ -239,12 +243,11 @@ mod tests {
     }
 
     /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #5: the
-    /// idempotent re-subscribe fast path in
-    /// `MeshNode::authorize_subscribe` calls
-    /// `SubscriberRoster::is_subscribed` to short-circuit ahead of
-    /// the per-peer cap check. Pin the predicate here so a future
-    /// reshuffling of the bidirectional index can't silently break
-    /// the short-circuit (which would re-introduce the
+    /// idempotent re-subscribe path in `MeshNode::authorize_subscribe`
+    /// calls `SubscriberRoster::is_subscribed` to suppress the
+    /// per-peer channel cap rejection. Pin the predicate here so a
+    /// future reshuffling of the bidirectional index can't silently
+    /// break the suppression (which would re-introduce the
     /// `TooManyChannels` rejection of a no-op re-subscribe at the
     /// cap).
     #[test]
@@ -267,17 +270,24 @@ mod tests {
         assert!(!r.is_subscribed(1, &a));
     }
 
-    /// Mirrors the authorize_subscribe production logic order: first
-    /// `is_subscribed(node, channel)` short-circuit-accepts, then
-    /// `channels_for_peer_count(node) >= cap` rejects with
-    /// `TooManyChannels`. Pre-fix this order was reversed, so a peer
-    /// at the cap that retransmitted a Subscribe on a channel it
-    /// already held was rejected with `TooManyChannels` even though
-    /// `add` would have been a no-op. This test pins that the at-cap
-    /// idempotent re-subscribe is detectable BEFORE the cap check, by
-    /// checking the same predicates the production path consults.
+    /// Mirrors the authorize_subscribe production logic for the
+    /// cap-check arm. The cap rejection fires only when the peer is
+    /// NOT already subscribed AND is at the cap; an already-subscribed
+    /// peer at the cap is admitted past the cap check (and then
+    /// continues into the visibility / registry / token gates further
+    /// down the chain — those are not modeled here, but their
+    /// independent enforcement is the reason this test deliberately
+    /// does NOT assert `(true, None)` for the at-cap re-subscribe).
+    /// Pre-fix, the cap check ran unconditionally and the at-cap
+    /// re-subscribe was rejected with `TooManyChannels` even though
+    /// `add` would have been a no-op. The combined predicate pinned
+    /// here matches the new dispatch order:
+    ///
+    /// ```text
+    /// !is_subscribed(node, ch) && channels_for_peer_count(node) >= cap
+    /// ```
     #[test]
-    fn at_cap_idempotent_resubscribe_is_detectable_before_cap_check() {
+    fn cap_rejection_is_suppressed_only_for_already_subscribed_peers() {
         let r = SubscriberRoster::new();
         let cap = 3usize;
 
@@ -286,18 +296,39 @@ mod tests {
         }
         assert_eq!(r.channels_for_peer_count(42), cap);
 
-        // Already-subscribed channel: short-circuit detects it.
-        let already = ch("ch/0");
-        assert!(r.is_subscribed(42, &already));
+        // Helper mirroring the production combined predicate.
+        let cap_would_reject = |node: u64, channel: &ChannelId| -> bool {
+            !r.is_subscribed(node, channel) && r.channels_for_peer_count(node) >= cap
+        };
 
-        // Genuinely new channel at cap: short-circuit doesn't fire,
-        // so the cap check (`>= cap`) takes over and would reject —
-        // exactly the pre-fix behavior we want to KEEP for new
-        // channels. Pin both halves so the dispatch order can't
-        // drift in either direction.
+        // At-cap re-subscribe of an already-held channel: cap
+        // rejection is suppressed. (The production path then runs
+        // visibility / registry / token validation; if those pass,
+        // the peer is admitted. If they don't, the peer is rejected
+        // for the right reason — not for `TooManyChannels`.)
+        let already = ch("ch/0");
+        assert!(
+            !cap_would_reject(42, &already),
+            "regression: an at-cap re-subscribe to a channel the peer \
+             already holds must NOT be cap-rejected — `add` is set-typed \
+             and the operation is a no-op."
+        );
+
+        // Genuinely new channel at cap: cap rejection still fires.
         let fresh = ch("ch/new");
-        assert!(!r.is_subscribed(42, &fresh));
-        assert!(r.channels_for_peer_count(42) >= cap);
+        assert!(
+            cap_would_reject(42, &fresh),
+            "regression: a new channel at cap must still hit the \
+             TooManyChannels rejection — the suppression is keyed on \
+             already-subscribed pairs only, otherwise the cap is moot."
+        );
+
+        // Under-cap peer (not at cap, not already subscribed): cap
+        // rejection does not fire — the under-cap fall-through still
+        // exercises the rest of the auth chain.
+        let under_cap_peer = 99u64;
+        assert_eq!(r.channels_for_peer_count(under_cap_peer), 0);
+        assert!(!cap_would_reject(under_cap_peer, &fresh));
     }
 
     #[test]
