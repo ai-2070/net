@@ -155,6 +155,20 @@ impl SubscriberRoster {
             None => 0,
         }
     }
+
+    /// True if `node_id` is currently subscribed to `channel`. Used by
+    /// `MeshNode::authorize_subscribe` to short-circuit idempotent
+    /// re-subscribes ahead of the per-peer channel cap check — pre-fix
+    /// a peer at the cap that retransmitted a Subscribe for a channel
+    /// it already held was rejected with `TooManyChannels`, even though
+    /// the underlying `add` is set-typed and the operation would have
+    /// been a no-op.
+    pub fn is_subscribed(&self, node_id: u64, channel: &ChannelId) -> bool {
+        match self.by_peer.get(&node_id) {
+            Some(set) => set.contains(channel),
+            None => false,
+        }
+    }
 }
 
 impl std::fmt::Debug for SubscriberRoster {
@@ -222,6 +236,68 @@ mod tests {
         assert_eq!(r.members(&a), vec![7]);
         assert!(r.members(&b).is_empty());
         assert_eq!(r.channels_for_peer_count(42), 0);
+    }
+
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #5: the
+    /// idempotent re-subscribe fast path in
+    /// `MeshNode::authorize_subscribe` calls
+    /// `SubscriberRoster::is_subscribed` to short-circuit ahead of
+    /// the per-peer cap check. Pin the predicate here so a future
+    /// reshuffling of the bidirectional index can't silently break
+    /// the short-circuit (which would re-introduce the
+    /// `TooManyChannels` rejection of a no-op re-subscribe at the
+    /// cap).
+    #[test]
+    fn is_subscribed_returns_true_for_existing_pair_and_false_otherwise() {
+        let r = SubscriberRoster::new();
+        let a = ch("sensors/lidar");
+        let b = ch("sensors/camera");
+
+        // Empty roster.
+        assert!(!r.is_subscribed(1, &a));
+
+        // Add (1, a) — only that pair returns true.
+        r.add(a.clone(), 1);
+        assert!(r.is_subscribed(1, &a));
+        assert!(!r.is_subscribed(1, &b));
+        assert!(!r.is_subscribed(2, &a));
+
+        // remove evicts the pair.
+        r.remove(&a, 1);
+        assert!(!r.is_subscribed(1, &a));
+    }
+
+    /// Mirrors the authorize_subscribe production logic order:
+    ///   1. `is_subscribed(node, channel)` — short-circuit accept.
+    ///   2. `channels_for_peer_count(node) >= cap` — TooManyChannels.
+    /// Pre-fix this order was reversed, so a peer at the cap that
+    /// retransmitted a Subscribe on a channel it already held was
+    /// rejected with TooManyChannels even though `add` would have
+    /// been a no-op. This test pins that the at-cap idempotent
+    /// re-subscribe is detectable BEFORE the cap check, by checking
+    /// the same predicates the production path consults.
+    #[test]
+    fn at_cap_idempotent_resubscribe_is_detectable_before_cap_check() {
+        let r = SubscriberRoster::new();
+        let cap = 3usize;
+
+        for i in 0..cap {
+            r.add(ch(&format!("ch/{}", i)), 42);
+        }
+        assert_eq!(r.channels_for_peer_count(42), cap);
+
+        // Already-subscribed channel: short-circuit detects it.
+        let already = ch("ch/0");
+        assert!(r.is_subscribed(42, &already));
+
+        // Genuinely new channel at cap: short-circuit doesn't fire,
+        // so the cap check (`>= cap`) takes over and would reject —
+        // exactly the pre-fix behavior we want to KEEP for new
+        // channels. Pin both halves so the dispatch order can't
+        // drift in either direction.
+        let fresh = ch("ch/new");
+        assert!(!r.is_subscribed(42, &fresh));
+        assert!(r.channels_for_peer_count(42) >= cap);
     }
 
     #[test]

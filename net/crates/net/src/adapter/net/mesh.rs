@@ -4798,6 +4798,22 @@ impl MeshNode {
         if Self::is_auth_throttled(from_node, ctx) {
             return (false, Some(AckReason::RateLimited));
         }
+        // Idempotent re-subscribe short-circuit. Pre-fix a peer
+        // sitting at the per-peer channel cap that retransmitted a
+        // Subscribe for a channel it already held was rejected
+        // with `TooManyChannels`, even though `SubscriberRoster`
+        // is set-typed and `add` is a no-op for the existing pair.
+        // The rejection AckReason is filtered out of the auth-
+        // failure budget so it didn't trip the throttle, but the
+        // legitimate re-subscribe still failed at the wire level.
+        // The clone of `channel` is unavoidable for the O(1)
+        // `DashSet<ChannelId>::contains` lookup; it's a small
+        // String clone and runs ahead of the AEAD/ed25519 work
+        // already on this path.
+        let channel_id = ChannelId::new(channel.clone());
+        if ctx.roster.is_subscribed(from_node, &channel_id) {
+            return (true, None);
+        }
         if ctx.roster.channels_for_peer_count(from_node) >= ctx.max_channels_per_peer {
             return (false, Some(AckReason::TooManyChannels));
         }
