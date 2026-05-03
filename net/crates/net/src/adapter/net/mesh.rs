@@ -8342,18 +8342,6 @@ mod heartbeat_aead_tests {
         );
     }
 
-    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #6: the routed-
-    /// handshake replay/rotation decision and the subsequent
-    /// `peers.insert` must happen under a single `peers.entry` write
-    /// guard so two concurrent routed handshakes for the same
-    /// `peer_node_id` cannot both pass the existing-static check and
-    /// race the insert. This test pins the structural shape — the
-    /// production path now uses `match ctx.peers.entry(peer_node_id)`.
-    /// A simple test that two concurrent `peers.entry()` calls
-    /// serialize is ultimately a contract test on `dashmap`, but the
-    /// shape pin guards against a future refactor that reintroduces
-    /// the get→insert split.
-
     /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #9:
     /// `connect_on_direct_path` must refresh
     /// `addr_to_node[target_addr] = peer_node_id` on success.
@@ -8447,6 +8435,13 @@ mod heartbeat_aead_tests {
         );
     }
 
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #6: the
+    /// routed-handshake replay/rotation decision and the subsequent
+    /// `peers.insert` must happen under a single `peers.entry`
+    /// write guard so two concurrent routed handshakes for the same
+    /// `peer_node_id` cannot both pass the existing-static check
+    /// and race the insert. The shape pin guards against a future
+    /// refactor that reintroduces the get→insert split.
     #[test]
     fn routed_handshake_uses_entry_api_for_atomic_insert() {
         let src = include_str!("mesh.rs");

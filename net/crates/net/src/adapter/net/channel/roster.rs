@@ -267,15 +267,15 @@ mod tests {
         assert!(!r.is_subscribed(1, &a));
     }
 
-    /// Mirrors the authorize_subscribe production logic order:
-    ///   1. `is_subscribed(node, channel)` — short-circuit accept.
-    ///   2. `channels_for_peer_count(node) >= cap` — TooManyChannels.
-    /// Pre-fix this order was reversed, so a peer at the cap that
-    /// retransmitted a Subscribe on a channel it already held was
-    /// rejected with TooManyChannels even though `add` would have
-    /// been a no-op. This test pins that the at-cap idempotent
-    /// re-subscribe is detectable BEFORE the cap check, by checking
-    /// the same predicates the production path consults.
+    /// Mirrors the authorize_subscribe production logic order: first
+    /// `is_subscribed(node, channel)` short-circuit-accepts, then
+    /// `channels_for_peer_count(node) >= cap` rejects with
+    /// `TooManyChannels`. Pre-fix this order was reversed, so a peer
+    /// at the cap that retransmitted a Subscribe on a channel it
+    /// already held was rejected with `TooManyChannels` even though
+    /// `add` would have been a no-op. This test pins that the at-cap
+    /// idempotent re-subscribe is detectable BEFORE the cap check, by
+    /// checking the same predicates the production path consults.
     #[test]
     fn at_cap_idempotent_resubscribe_is_detectable_before_cap_check() {
         let r = SubscriberRoster::new();
