@@ -1,0 +1,23 @@
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03_MESH.md
+  de51bd305dc0ab4b 1-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "0800cde3f8bc935a8741a537959c054fd5f8a791",
+  "prompts": {
+    "de51bd305dc0ab4b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59e26b99-c2c5-4ff2-9bf9-9e5d9c65958b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 40,
+      "total_deletions": 0,
+      "accepted_lines": 40,
+      "overriden_lines": 0
+    }
+  }
+}
