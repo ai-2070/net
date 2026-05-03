@@ -427,7 +427,7 @@ impl ShardManager {
     /// [`select_shard_by_hash`]: Self::select_shard_by_hash
     #[inline]
     #[deprecated(
-        since = "0.9.0",
+        since = "0.10.0",
         note = "serializes the value just to hash it; prefer `RawEvent::from_value(v).hash()` + `select_shard_by_hash` to avoid the duplicate serialization"
     )]
     pub fn select_shard(&self, event: &JsonValue) -> u16 {

@@ -4,7 +4,7 @@ name: Release NPM SDK
 # `sdk-ts/`) to npm. The napi binding `@ai2070/net` ships via
 # `release-npm.yml`; this is the higher-level wrapper on top.
 #
-# Tag schema: `npm-sdk-v<semver>` (e.g. `npm-sdk-v0.9.0`).
+# Tag schema: `npm-sdk-v<semver>` (e.g. `npm-sdk-v0.10.0`).
 #
 # Required repository secret: `NPM_TOKEN`
 #   Generate at https://www.npmjs.com/settings/<user>/tokens with

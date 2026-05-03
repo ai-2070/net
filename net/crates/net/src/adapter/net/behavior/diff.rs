@@ -654,7 +654,7 @@ impl DiffEngine {
     /// new_version=3` diff and silently roll state back, so
     /// callers MUST gate via `apply_with_version` outside tests.
     #[deprecated(
-        since = "0.9.0",
+        since = "0.10.0",
         note = "version-naive — use apply_with_version to enforce the \
                 base_version check; this entry point is retained only for \
                 hand-built diffs in unit tests"
