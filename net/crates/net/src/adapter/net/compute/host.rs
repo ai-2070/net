@@ -13,7 +13,7 @@ use super::daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon};
 use crate::adapter::net::behavior::capability::CapabilityFilter;
 use crate::adapter::net::channel::ChannelName;
 use crate::adapter::net::identity::EntityKeypair;
-use crate::adapter::net::state::causal::{CausalChainBuilder, CausalEvent};
+use crate::adapter::net::state::causal::{CausalChainBuilder, CausalEvent, CausalLink};
 use crate::adapter::net::state::horizon::ObservedHorizon;
 use crate::adapter::net::state::snapshot::StateSnapshot;
 
@@ -398,6 +398,26 @@ impl DaemonHost {
     #[inline]
     pub fn sequence(&self) -> u64 {
         self.chain.sequence()
+    }
+
+    /// Get the current causal-chain head link.
+    ///
+    /// Returns the link of the most-recently-applied event:
+    /// `(origin_hash, horizon_encoded, sequence, parent_hash)`.
+    /// The `parent_hash` is the forward hash of the event at
+    /// `sequence - 1`, i.e. the cryptographic anchor that
+    /// continuity proofs verify against.
+    ///
+    /// Used by the migration orchestrator's
+    /// `on_replay_complete` to stamp the *real* `parent_hash`
+    /// into the superposition's `target_head` instead of the
+    /// pre-fix synthetic `0`. Audit #64: a synthetic
+    /// `parent_hash: 0` produces a `ContinuityProof` that no
+    /// downstream verifier holding the real chain can ever
+    /// reconcile.
+    #[inline]
+    pub fn head_link(&self) -> CausalLink {
+        *self.chain.head()
     }
 
     /// Get runtime statistics.

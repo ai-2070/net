@@ -1349,12 +1349,60 @@ impl MigrationOrchestrator {
 
         let mut record = entry.lock();
 
-        // Update target head in superposition
-        let target_head = CausalLink {
-            origin_hash: daemon_origin,
-            horizon_encoded: 0,
-            sequence: replayed_seq,
-            parent_hash: 0, // we don't have the exact hash here
+        // Audit #64: query the freshly-replayed daemon for its
+        // *real* head link so the superposition's `target_head`
+        // carries the actual cryptographic anchor (parent_hash)
+        // — not the pre-fix synthetic `parent_hash: 0` that no
+        // downstream verifier could ever reconcile against the
+        // chain. The replay just landed on this node's daemon
+        // registry, so the local host's chain head is by
+        // construction the head we just produced.
+        //
+        // If the daemon registry doesn't have the host (a Stale
+        // race after register/replace, or a snapshot-only path
+        // that didn't actually populate state), fall back to a
+        // synthetic link with `parent_hash: 0` and a
+        // `tracing::warn!`. The continuity proof from a synthetic
+        // link is unverifiable downstream — same failure mode as
+        // pre-fix — but at least the operator sees the gap.
+        let target_head = match self
+            .daemon_registry
+            .with_host(daemon_origin, |host| host.head_link())
+        {
+            Ok(link) => {
+                // Sanity: the host's head sequence should equal
+                // `replayed_seq`. If it doesn't, the replay
+                // pipeline diverged from what `on_replay_complete`
+                // was told. Use the host's head (it's the source
+                // of truth) but log so operators can spot the
+                // pipeline disagreement.
+                if link.sequence != replayed_seq {
+                    tracing::warn!(
+                        daemon_origin = format_args!("{:#x}", daemon_origin),
+                        host_seq = link.sequence,
+                        replayed_seq,
+                        "on_replay_complete: replayed_seq disagrees with host's chain \
+                         head sequence; using host's head as the authoritative anchor"
+                    );
+                }
+                link
+            }
+            Err(e) => {
+                tracing::warn!(
+                    daemon_origin = format_args!("{:#x}", daemon_origin),
+                    error = ?e,
+                    replayed_seq,
+                    "on_replay_complete: daemon not registered locally; \
+                     falling back to synthetic target_head with parent_hash=0 — \
+                     downstream continuity-proof verification will fail"
+                );
+                CausalLink {
+                    origin_hash: daemon_origin,
+                    horizon_encoded: 0,
+                    sequence: replayed_seq,
+                    parent_hash: 0,
+                }
+            }
         };
         record.superposition.target_replayed(target_head);
 

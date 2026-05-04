@@ -140,17 +140,42 @@ together (audit #25 needs both for the `Arc::ptr_eq` UAF in
 `handles_match`). Then the rest of cortex (`Tasks`, `Memories`)
 together. Then `RedisDedupHandle` and `IdentityHandle` (small).
 
-### D — Identity / envelope hardening (Medium)
+### D — Identity / envelope hardening (Medium, deferred — both need wire-bump cycle)
 
 | #   | File:line                                          | Ask                                                                                                                                                  |
 | --- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 56  | `adapter/net/identity/origin.rs:42-43`             | `origin_hash: u32` has a ~65k birthday-collision floor — either rename to `origin_tag` (signal not-an-identity) or widen to u64 in a wire bump.      |
 | 102 | `adapter/net/identity/envelope.rs:361-396` (v0 fallback) | Pin a wire-format version byte at the envelope head so `open` selects v0/v1 deterministically. Today the v1→v0 retry path does double AEAD per probe. |
 
-**Sequencing:** #102 first (it's a CPU-DoS amplifier under
-attacker traffic). #56 is a wire-bump decision — can be deferred
-if a wire-version increment isn't on the near-term roadmap; rename
-is the cheap interim.
+**Status: deferred to a wire-format-bump cycle.** Both items
+require coordinated wire-format work that exceeds the
+single-PR-per-item shape this branch follows:
+
+- **#102:** the proper fix (version byte) bumps
+  `IDENTITY_ENVELOPE_SIZE` from 208 to 209. That width is also
+  embedded in the snapshot wire format
+  (`adapter/net/state/snapshot.rs` reads/writes envelopes at
+  fixed offsets) — closing the audit gap requires a snapshot
+  format bump too. The CPU-DoS amplification is bounded (2× per
+  failing probe; outer Noise NK already authenticates senders so
+  the threat is constrained to authenticated peers replaying
+  bogus envelopes), so the cost of deferring is small relative
+  to the wire-bump scope. The existing
+  `open_accepts_v0_envelope_for_rolling_upgrade_compat` test
+  pins the v0 fallback explicitly — removing it would conflict
+  with the project's deliberate rolling-upgrade compat decision.
+
+- **#56:** rename hits 660+ sites; widen to u64 hits the wire
+  format. Either way it's a wire-bump-shape change. The `u32`
+  birthday-collision floor is structural; ~65k peers is the
+  collision floor under birthday but production deployments
+  with that many distinct origins are rare and the cross-channel
+  accounting impact is bounded (alias-not-identity-takeover).
+
+**When to revisit:** next time a wire-format bump is on the
+roadmap (e.g., another protocol-level change like #1's
+manifest-pointer rework). Bundle #102 and #56 into the same
+bump to amortize the migration cost.
 
 ### E — Compute / orchestrator / merge fixes (Medium, independent)
 

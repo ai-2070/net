@@ -2096,6 +2096,96 @@ mod tests {
         );
     }
 
+    /// Audit #73 regression: a single-shard request with a filter
+    /// where every fetched event matches AND the per-shard cap
+    /// clamps the fetch must not stall — each poll must advance
+    /// the cursor by `request.limit` matches and the loop must
+    /// drain in `ceil(total / limit)` iterations.
+    ///
+    /// Pre-fix concern (per the audit): the rollback step rolled
+    /// the cursor back to the original position, and without a
+    /// matching forward override the cursor never advanced —
+    /// re-fetching the same events on every poll. The current
+    /// rollback+override logic resolves this: Step 1 rolls back
+    /// for shards with truncated matches; Step 2 overrides to
+    /// the last *returned* match's id so each poll makes
+    /// `request.limit` worth of forward progress.
+    #[tokio::test]
+    async fn poll_merger_does_not_stall_on_single_shard_filter_under_cap() {
+        // Adapter holds 50 events on shard 0. With a filter that
+        // matches every event, request.limit = 10 → per_shard_limit
+        // could be 30 (limit×3 over_fetch_factor) without the cap;
+        // here we keep numbers small so the test is deterministic.
+        let adapter = Arc::new(MockAdapter::new());
+        let mut events: Vec<StoredEvent> = (0..50)
+            .map(|i| {
+                StoredEvent::from_value(
+                    format!("0-{}", i),
+                    json!({"keep": true}),
+                    (i + 1) as u64,
+                    0,
+                )
+            })
+            .collect();
+        adapter.add_events(0, events.split_off(0));
+
+        let merger = PollMerger::new(adapter.clone(), vec![0]);
+        // Filter that matches everything ('keep': true on all events).
+        let make_request = |from_id: Option<String>| ConsumeRequest {
+            limit: 10,
+            from_id,
+            shards: None,
+            filter: Some(Filter::eq("keep", json!(true))),
+            ordering: Ordering::None,
+        };
+
+        let mut cursor: Option<String> = None;
+        let mut total = 0;
+        let mut polls = 0;
+        loop {
+            polls += 1;
+            assert!(
+                polls < 20,
+                "audit #73: poll loop must terminate; got {} polls without draining \
+                 (cursor={:?}, total={})",
+                polls,
+                cursor,
+                total,
+            );
+            let response = merger.poll(make_request(cursor.clone())).await.unwrap();
+            total += response.events.len();
+            let new_cursor = response.next_id.clone();
+            assert!(
+                new_cursor.is_some(),
+                "audit #73: response must surface a cursor on every progress poll \
+                 (poll={}, returned={})",
+                polls,
+                response.events.len(),
+            );
+            // The cursor MUST advance OR has_more must be false.
+            // Pre-fix the cursor would echo back unchanged on a
+            // stall; we'd hit the polls<20 watchdog above.
+            if cursor == new_cursor {
+                assert!(
+                    !response.has_more,
+                    "audit #73: cursor stuck at {:?} but has_more=true → stall",
+                    cursor,
+                );
+                break;
+            }
+            cursor = new_cursor;
+            if !response.has_more && response.events.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            total, 50,
+            "audit #73: full draining of 50 events must succeed without stall \
+             (got {} in {} polls)",
+            total, polls,
+        );
+    }
+
     /// Corollary: a small request that fits well below
     /// the cap must NOT flag truncation.
     #[tokio::test]
