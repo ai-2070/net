@@ -34,10 +34,15 @@ use crate::adapter::net::identity::{
 /// changes shape.
 const V1_MAGIC: [u8; 4] = *b"CDS1";
 
-/// Current snapshot wire version. The plan reserves this byte for
-/// future bumps — unknown versions are rejected up-front by
-/// [`StateSnapshot::from_bytes`].
-pub const SNAPSHOT_VERSION: u8 = 1;
+/// Current snapshot wire version. Bumped from 1 → 2 in the
+/// audit-#102 envelope wire-bump (embedded
+/// `IdentityEnvelope` grew from 208 → 209 bytes for the new
+/// version byte). v1 readers cannot consume v2 bytes (the
+/// envelope offsets shift); v2 readers reject v1 bytes via the
+/// version-byte check below. Rolling-upgrade compat from v1 was
+/// removed deliberately — see the audit doc and the project
+/// release notes for the migration cliff.
+pub const SNAPSHOT_VERSION: u8 = 2;
 
 /// Errors from snapshot serialization.
 ///
@@ -342,10 +347,15 @@ impl StateSnapshot {
 
     /// Deserialize from bytes.
     ///
-    /// Accepts both v1 (current) and v0 (pre-identity-migration)
-    /// layouts. v0 bytes surface with defaulted `bindings_bytes` +
-    /// `identity_envelope` so a rolling upgrade between pre- and
-    /// post-v1 nodes doesn't stall.
+    /// Accepts only v2 (post-audit-#102 wire bump) layouts. v1
+    /// and pre-magic v0 bytes are rejected — see the project
+    /// release notes for the migration cliff. The audit-#102 bump
+    /// changed `IDENTITY_ENVELOPE_SIZE` (208 → 209), shifting
+    /// every offset in the v1 trailer; a v1 reader cannot
+    /// consume v2 bytes correctly, and conversely. v1 bytes
+    /// reach this function with the current magic but a stale
+    /// version byte; the version-byte check inside `from_bytes_v2`
+    /// rejects them.
     ///
     /// `head_payload` is runtime-only and always defaults to empty
     /// after deserialize; callers must populate it from the head
@@ -353,13 +363,16 @@ impl StateSnapshot {
     /// [`super::log::EntityLog::from_snapshot`].
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() >= V1_MAGIC.len() && data[..V1_MAGIC.len()] == V1_MAGIC {
-            Self::from_bytes_v1(&data[V1_MAGIC.len()..])
+            Self::from_bytes_v2(&data[V1_MAGIC.len()..])
         } else {
-            Self::from_bytes_v0(data)
+            // No magic prefix → pre-magic-era v0 layout. Rejected
+            // post-bump; rolling upgrade from that era is no
+            // longer supported.
+            None
         }
     }
 
-    fn from_bytes_v1(data: &[u8]) -> Option<Self> {
+    fn from_bytes_v2(data: &[u8]) -> Option<Self> {
         let mut cursor = data;
         if cursor.remaining() < 1 {
             return None;
@@ -456,69 +469,9 @@ impl StateSnapshot {
         })
     }
 
-    fn from_bytes_v0(data: &[u8]) -> Option<Self> {
-        let header_size = 32 + 8 + CAUSAL_LINK_SIZE + 8 + 4;
-        if data.len() < header_size {
-            return None;
-        }
-
-        let mut cursor = data;
-
-        let mut entity_bytes = [0u8; 32];
-        cursor.copy_to_slice(&mut entity_bytes);
-        let entity_id = EntityId::from_bytes(entity_bytes);
-
-        let through_seq = cursor.get_u64_le();
-
-        let mut link_bytes = [0u8; CAUSAL_LINK_SIZE];
-        cursor.copy_to_slice(&mut link_bytes);
-        let chain_link = CausalLink::from_bytes(&link_bytes)?;
-
-        let created_at = cursor.get_u64_le();
-
-        let state_len = cursor.get_u32_le() as usize;
-        if cursor.remaining() < state_len {
-            return None;
-        }
-
-        let state = Bytes::copy_from_slice(&cursor[..state_len]);
-        // Enforce strict length. The v1 path already does this; v0
-        // silently accepted trailing bytes, which made the parser
-        // tolerant to corrupted / partial input that should be
-        // rejected.
-        if cursor.len() != state_len {
-            return None;
-        }
-
-        // Validate internal consistency
-        if chain_link.sequence != through_seq {
-            return None;
-        }
-        if chain_link.origin_hash != entity_id.origin_hash() {
-            return None;
-        }
-
-        Some(Self {
-            // Surface the snapshot as the current version for
-            // downstream uniformity; writers always emit current,
-            // so a fresh round-trip is a v0 → current operation
-            // after this read.
-            version: SNAPSHOT_VERSION,
-            entity_id,
-            through_seq,
-            chain_link,
-            state,
-            horizon: ObservedHorizon::new(), // reconstructed separately
-            created_at,
-            bindings_bytes: Vec::new(),
-            identity_envelope: None,
-            head_payload: None,
-        })
-    }
-
-    /// Compact header size (excluding state payload). Kept for the
-    /// v0 compatibility path — v1 writers allocate from
-    /// [`Self::to_bytes`]'s own sizing math.
+    /// Compact header size (excluding state payload). Historical
+    /// constant from the v0 compat path — kept for any external
+    /// caller that may still reference it for sizing math.
     pub const HEADER_SIZE: usize = 32 + 8 + CAUSAL_LINK_SIZE + 8 + 4; // 80 bytes (was 76 pre-#130)
 
     /// Age of this snapshot in seconds.
@@ -1194,37 +1147,10 @@ mod tests {
         assert_eq!(parsed.state, Bytes::from_static(b"state"));
     }
 
-    #[test]
-    fn v0_bytes_decode_as_v1_with_empty_extras() {
-        // Construct the exact v0 wire layout from first principles:
-        // pre-magic writers just concatenated the header + state.
-        // A v1 reader must still decode these successfully so a
-        // rolling upgrade between pre- and post-v1 nodes doesn't
-        // stall.
-        let kp = EntityKeypair::generate();
-        let entity_id = kp.entity_id().clone();
-        let mut builder = CausalChainBuilder::new(kp.origin_hash());
-        builder.append(Bytes::from_static(b"e"), 0).unwrap();
-
-        let head = *builder.head();
-        let state = Bytes::from_static(b"legacy-state");
-
-        let mut v0 = Vec::new();
-        v0.extend_from_slice(entity_id.as_bytes());
-        v0.extend_from_slice(&head.sequence.to_le_bytes());
-        v0.extend_from_slice(&head.to_bytes());
-        v0.extend_from_slice(&0u64.to_le_bytes()); // created_at
-        v0.extend_from_slice(&(state.len() as u32).to_le_bytes());
-        v0.extend_from_slice(&state);
-
-        let parsed = StateSnapshot::from_bytes(&v0)
-            .expect("v1 reader must accept v0 bytes for rolling upgrade");
-        assert_eq!(parsed.version, SNAPSHOT_VERSION);
-        assert_eq!(parsed.entity_id, entity_id);
-        assert_eq!(parsed.state, state);
-        assert!(parsed.bindings_bytes.is_empty());
-        assert!(parsed.identity_envelope.is_none());
-    }
+    // The pre-magic v0 → v1 rolling-upgrade compat test was
+    // removed in the audit-#102 wire bump (see
+    // `from_bytes_rejects_pre_magic_v0_layout` for the
+    // post-bump rejection invariant).
 
     #[test]
     fn v1_rejects_trailing_garbage() {
@@ -1408,19 +1334,13 @@ mod tests {
         );
     }
 
-    /// Regression: BUG_REPORT.md #40 — `from_bytes_v0` previously
-    /// accepted trailing bytes past the declared `state_len`. The
-    /// v1 path enforces strict length; v0 silently accepted junk
-    /// after the state, masking corrupt or partial input that
-    /// should be rejected. This test pins v0 to the same
-    /// strict-length contract.
+    /// Audit #102 wire-bump: the pre-magic-era v0 reader was
+    /// removed. Any input lacking the `CDS1` magic prefix is now
+    /// rejected at `from_bytes`, regardless of the body shape.
     #[test]
-    fn from_bytes_v0_rejects_trailing_garbage() {
-        // Build a v0 snapshot via the same chain builder used by
-        // other tests so `chain_link.sequence == through_seq` and
-        // `chain_link.origin_hash == entity_id.origin_hash()` (the
-        // parser enforces both invariants and we want them both to
-        // pass — we're isolating the trailing-bytes check).
+    fn from_bytes_rejects_pre_magic_v0_layout() {
+        // Construct what would have been a valid v0 body
+        // (no magic prefix) — should reject post-bump.
         let kp = EntityKeypair::generate();
         let mut builder = CausalChainBuilder::new(kp.origin_hash());
         builder.append(Bytes::from_static(b"e1"), 0).unwrap();
@@ -1437,17 +1357,33 @@ mod tests {
         buf.put_u32_le(state.len() as u32);
         buf.put_slice(state);
 
-        // Sanity: the round-trip works as-is.
         assert!(
-            StateSnapshot::from_bytes_v0(&buf).is_some(),
-            "valid v0 snapshot must parse"
+            StateSnapshot::from_bytes(&buf).is_none(),
+            "post-#102 reader must reject pre-magic v0 layout (no CDS1 prefix); \
+             rolling-upgrade compat from that era is gone"
         );
+    }
 
-        // Append trailing junk. The strict-length check rejects.
-        buf.put_slice(b"trailing-junk");
+    /// Audit #102 wire-bump: a v1-version-byte snapshot (correct
+    /// magic, but version=1) is rejected because v1's embedded
+    /// envelope was 208 bytes — every offset in the v1 trailer
+    /// shifts under v2's 209-byte envelope, so silent acceptance
+    /// would mis-parse the rest.
+    #[test]
+    fn from_bytes_rejects_v1_version_byte() {
+        // Smallest possible v1-shaped buffer with valid magic +
+        // wrong version. We don't need a full body — the
+        // version-byte check rejects before any header parse.
+        let mut buf = bytes::BytesMut::new();
+        use bytes::BufMut;
+        buf.put_slice(&V1_MAGIC);
+        buf.put_u8(1); // pre-bump SNAPSHOT_VERSION
+        // 32 (entity) + 8 (seq) + CAUSAL_LINK_SIZE + 8 (created) + 4 (state_len)
+        buf.put_bytes(0u8, 32 + 8 + CAUSAL_LINK_SIZE + 8 + 4);
         assert!(
-            StateSnapshot::from_bytes_v0(&buf).is_none(),
-            "v0 must reject trailing bytes past state_len (#40)"
+            StateSnapshot::from_bytes(&buf).is_none(),
+            "post-#102 reader must reject the v1 version byte; the embedded \
+             envelope size shifted from 208 → 209 so v1 trailers are unparseable"
         );
     }
 
