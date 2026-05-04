@@ -544,7 +544,7 @@ pub extern "C" fn net_compute_register_factory_with_func(
 /// return code `0` on success, non-zero if the Go side failed.
 pub type ProcessFn = unsafe extern "C" fn(
     daemon_id: u64,
-    origin_hash: u32,
+    origin_hash: u64,
     sequence: u64,
     payload_ptr: *const u8,
     payload_len: usize,
@@ -818,7 +818,7 @@ impl MeshDaemon for GoBridge {
 /// handle plus the `origin_hash` / `entity_id` accessors the Go
 /// side surfaces as methods.
 pub struct DaemonHandleC {
-    origin_hash: u32,
+    origin_hash: u64,
     entity_id: [u8; 32],
     #[allow(dead_code)]
     inner: SdkDaemonHandle,
@@ -828,7 +828,7 @@ pub struct DaemonHandleC {
 /// (callers can't hit this normally — a spawned daemon always
 /// has a non-zero origin_hash).
 #[no_mangle]
-pub extern "C" fn net_compute_daemon_handle_origin_hash(h: *const DaemonHandleC) -> u32 {
+pub extern "C" fn net_compute_daemon_handle_origin_hash(h: *const DaemonHandleC) -> u64 {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
@@ -982,7 +982,7 @@ pub extern "C" fn net_compute_spawn(
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_stop(
     handle: *mut DaemonRuntimeHandle,
-    origin_hash: u32,
+    origin_hash: u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
     let Some(h) = (unsafe { handle.as_ref() }) else {
@@ -1012,7 +1012,7 @@ pub extern "C" fn net_compute_runtime_stop(
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_snapshot(
     handle: *mut DaemonRuntimeHandle,
-    origin_hash: u32,
+    origin_hash: u64,
     out_outputs: *mut *mut OutputsVec,
     err_out: *mut *mut c_char,
 ) -> c_int {
@@ -1174,7 +1174,7 @@ pub extern "C" fn net_compute_spawn_from_snapshot(
 /// the SDK `MigrationHandle` plus cached `origin_hash` /
 /// `source_node` / `target_node` for zero-cost accessors from Go.
 pub struct MigrationHandleC {
-    origin_hash: u32,
+    origin_hash: u64,
     source_node: u64,
     target_node: u64,
     inner: SdkMigrationHandle,
@@ -1194,7 +1194,7 @@ pub extern "C" fn net_compute_migration_handle_free(h: *mut MigrationHandleC) {
 }
 
 #[no_mangle]
-pub extern "C" fn net_compute_migration_handle_origin_hash(h: *const MigrationHandleC) -> u32 {
+pub extern "C" fn net_compute_migration_handle_origin_hash(h: *const MigrationHandleC) -> u64 {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
@@ -1310,7 +1310,7 @@ pub extern "C" fn net_compute_migration_handle_cancel(
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn net_compute_start_migration(
     handle: *mut DaemonRuntimeHandle,
-    origin_hash: u32,
+    origin_hash: u64,
     source_node: u64,
     target_node: u64,
     transport_identity: u8,  // 0 = false, non-zero = true
@@ -1372,7 +1372,7 @@ pub extern "C" fn net_compute_expect_migration(
     handle: *mut DaemonRuntimeHandle,
     kind_ptr: *const c_char,
     kind_len: usize,
-    origin_hash: u32,
+    origin_hash: u64,
     auto_snapshot_interval: u64,
     max_log_entries: u32,
     err_out: *mut *mut c_char,
@@ -1453,7 +1453,7 @@ pub extern "C" fn net_compute_register_migration_target_identity(
 #[no_mangle]
 pub extern "C" fn net_compute_migration_phase(
     handle: *mut DaemonRuntimeHandle,
-    origin_hash: u32,
+    origin_hash: u64,
 ) -> *mut c_char {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return std::ptr::null_mut();
@@ -1477,8 +1477,8 @@ pub extern "C" fn net_compute_migration_phase(
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn net_compute_runtime_deliver(
     handle: *mut DaemonRuntimeHandle,
-    origin_hash: u32,
-    event_origin_hash: u32,
+    origin_hash: u64,
+    event_origin_hash: u64,
     event_sequence: u64,
     event_payload: *const u8,
     event_payload_len: usize,
@@ -2011,7 +2011,7 @@ pub extern "C" fn net_compute_replica_group_route_event(
     h: *const ReplicaGroupHandle,
     routing_key_ptr: *const c_char,
     routing_key_len: usize,
-    out_origin: *mut u32,
+    out_origin: *mut u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
     let Some(h) = (unsafe { h.as_ref() }) else {
@@ -2101,7 +2101,7 @@ pub extern "C" fn net_compute_fork_group_spawn(
     runtime: *mut DaemonRuntimeHandle,
     kind_ptr: *const c_char,
     kind_len: usize,
-    parent_origin: u32,
+    parent_origin: u64,
     fork_seq: u64,
     fork_count: u32,
     lb_strategy_ptr: *const c_char,
@@ -2175,7 +2175,7 @@ pub extern "C" fn net_compute_fork_group_healthy_count(h: *const ForkGroupHandle
 }
 
 #[no_mangle]
-pub extern "C" fn net_compute_fork_group_parent_origin(h: *const ForkGroupHandle) -> u32 {
+pub extern "C" fn net_compute_fork_group_parent_origin(h: *const ForkGroupHandle) -> u64 {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
@@ -2356,7 +2356,7 @@ pub extern "C" fn net_compute_standby_group_active_index(h: *const StandbyGroupH
 }
 
 #[no_mangle]
-pub extern "C" fn net_compute_standby_group_active_origin(h: *const StandbyGroupHandle) -> u32 {
+pub extern "C" fn net_compute_standby_group_active_origin(h: *const StandbyGroupHandle) -> u64 {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
@@ -2417,7 +2417,7 @@ pub extern "C" fn net_compute_standby_group_sync_standbys(
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_promote(
     h: *const StandbyGroupHandle,
-    out_origin: *mut u32,
+    out_origin: *mut u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
     let Some(h) = (unsafe { h.as_ref() }) else {

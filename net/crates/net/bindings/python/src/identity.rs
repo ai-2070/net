@@ -197,9 +197,9 @@ impl Identity {
         self.keypair.entity_id().as_bytes().to_vec()
     }
 
-    /// Derived 32-bit origin hash used in packet headers.
+    /// Derived 64-bit origin hash used in packet headers.
     #[getter]
-    fn origin_hash(&self) -> u32 {
+    fn origin_hash(&self) -> u64 {
         self.keypair.origin_hash()
     }
 

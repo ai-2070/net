@@ -534,7 +534,7 @@ impl PyTasksAdapter {
     /// `persistent_dir`; otherwise raises `RuntimeError`.
     #[staticmethod]
     #[pyo3(signature = (redex, origin_hash, persistent = false))]
-    fn open(redex: &PyRedex, origin_hash: u32, persistent: bool) -> PyResult<Self> {
+    fn open(redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
         let runtime = make_runtime()?;
         let redex_inner = redex.inner.clone();
         let cfg = cfg_from_persistent(persistent);
@@ -555,7 +555,7 @@ impl PyTasksAdapter {
     #[pyo3(signature = (redex, origin_hash, state_bytes, last_seq = None, persistent = false))]
     fn open_from_snapshot(
         redex: &PyRedex,
-        origin_hash: u32,
+        origin_hash: u64,
         state_bytes: &[u8],
         last_seq: Option<u64>,
         persistent: bool,
@@ -996,7 +996,7 @@ impl PyMemoriesAdapter {
     /// `TasksAdapter.open` for `persistent` semantics.
     #[staticmethod]
     #[pyo3(signature = (redex, origin_hash, persistent = false))]
-    fn open(redex: &PyRedex, origin_hash: u32, persistent: bool) -> PyResult<Self> {
+    fn open(redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
         let runtime = make_runtime()?;
         let redex_inner = redex.inner.clone();
         let cfg = cfg_from_persistent(persistent);
@@ -1016,7 +1016,7 @@ impl PyMemoriesAdapter {
     #[pyo3(signature = (redex, origin_hash, state_bytes, last_seq = None, persistent = false))]
     fn open_from_snapshot(
         redex: &PyRedex,
-        origin_hash: u32,
+        origin_hash: u64,
         state_bytes: &[u8],
         last_seq: Option<u64>,
         persistent: bool,
@@ -1465,7 +1465,7 @@ impl PyNetDb {
         with_memories = false,
     ))]
     fn open(
-        origin_hash: u32,
+        origin_hash: u64,
         persistent_dir: Option<String>,
         persistent: bool,
         with_tasks: bool,
@@ -1511,7 +1511,7 @@ impl PyNetDb {
     ))]
     fn open_from_snapshot(
         bundle: &[u8],
-        origin_hash: u32,
+        origin_hash: u64,
         persistent_dir: Option<String>,
         persistent: bool,
         with_tasks: bool,

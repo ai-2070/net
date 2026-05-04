@@ -35,7 +35,7 @@ def test_generate_produces_valid_entity_id() -> None:
     eid = ident.entity_id
     assert isinstance(eid, bytes)
     assert len(eid) == 32
-    assert ident.origin_hash != 0 or eid == b"\x00" * 32  # u32 derived
+    assert ident.origin_hash != 0 or eid == b"\x00" * 32  # u64 derived
     assert ident.node_id != 0 or eid == b"\x00" * 32
 
 

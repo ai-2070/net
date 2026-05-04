@@ -871,7 +871,7 @@ class Identity:
         ...
     @property
     def origin_hash(self) -> int:
-        """Derived 32-bit origin hash used in packet headers."""
+        """Derived 64-bit origin hash used in packet headers."""
         ...
     @property
     def node_id(self) -> int:
