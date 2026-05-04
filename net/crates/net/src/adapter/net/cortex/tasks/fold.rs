@@ -2,7 +2,9 @@
 //! mutates [`super::state::TasksState`].
 
 use super::super::super::redex::{RedexError, RedexEvent, RedexFold};
-use super::super::meta::{compute_checksum, compute_checksum_with_meta, EventMeta, EVENT_META_SIZE};
+use super::super::meta::{
+    compute_checksum, compute_checksum_with_meta, EventMeta, EVENT_META_SIZE,
+};
 use super::dispatch::{
     DISPATCH_TASK_COMPLETED, DISPATCH_TASK_CREATED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RENAMED,
 };

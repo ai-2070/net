@@ -386,10 +386,7 @@ impl IdentityEnvelope {
         // unambiguous.
         let aad = chain_link.to_bytes();
         let aead = XChaCha20Poly1305::new((&key).into());
-        let mut seed_vec = match aead.decrypt(
-            (&nonce).into(),
-            Payload { msg: ct, aad: &aad },
-        ) {
+        let mut seed_vec = match aead.decrypt((&nonce).into(), Payload { msg: ct, aad: &aad }) {
             Ok(v) => v,
             Err(_) => {
                 // Scrub the derived AEAD `key` BEFORE returning

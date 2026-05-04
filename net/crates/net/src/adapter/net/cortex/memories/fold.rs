@@ -2,7 +2,9 @@
 //! mutates [`super::state::MemoriesState`].
 
 use super::super::super::redex::{RedexError, RedexEvent, RedexFold};
-use super::super::meta::{compute_checksum, compute_checksum_with_meta, EventMeta, EVENT_META_SIZE};
+use super::super::meta::{
+    compute_checksum, compute_checksum_with_meta, EventMeta, EVENT_META_SIZE,
+};
 use super::dispatch::{
     DISPATCH_MEMORY_DELETED, DISPATCH_MEMORY_PINNED, DISPATCH_MEMORY_RETAGGED,
     DISPATCH_MEMORY_STORED, DISPATCH_MEMORY_UNPINNED,

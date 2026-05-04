@@ -166,9 +166,7 @@ impl DaemonRegistry {
     ) -> Result<(), DaemonError> {
         match self.get_arc(origin_hash) {
             None => Err(DaemonError::Stale(origin_hash)),
-            Some(current) if !Arc::ptr_eq(&current, held) => {
-                Err(DaemonError::Stale(origin_hash))
-            }
+            Some(current) if !Arc::ptr_eq(&current, held) => Err(DaemonError::Stale(origin_hash)),
             Some(_) => Ok(()),
         }
     }

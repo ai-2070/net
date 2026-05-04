@@ -672,10 +672,7 @@ where
         let applied = matches!(&r, Ok(()));
         let recoverable_decode = matches!(&r, Err(e) if e.is_recoverable_decode());
         let advance = applied
-            || matches!(
-                (&r, policy),
-                (Err(_), FoldErrorPolicy::LogAndContinue)
-            )
+            || matches!((&r, policy), (Err(_), FoldErrorPolicy::LogAndContinue))
             || recoverable_decode;
         if applied {
             // Strict-prefix advance: bump by exactly one if this
@@ -1373,12 +1370,9 @@ mod tests {
         // the post-fix split must preserve it. (If `wait_for_seq`
         // ever silently switches to `applied_through_seq`, this
         // regresses with an indefinite hang.)
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            adapter.wait_for_seq(seq),
-        )
-        .await
-        .expect("wait_for_seq must return promptly even for a recoverable-decode-skipped seq");
+        tokio::time::timeout(std::time::Duration::from_secs(2), adapter.wait_for_seq(seq))
+            .await
+            .expect("wait_for_seq must return promptly even for a recoverable-decode-skipped seq");
 
         // Confirm what was actually observable at return:
         // folded reached seq, applied did not.

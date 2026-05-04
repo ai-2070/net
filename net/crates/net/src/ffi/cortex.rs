@@ -576,8 +576,9 @@ pub extern "C" fn net_redex_file_close(handle: *mut RedexFileHandle) -> c_int {
 
 /// Type alias to keep the [`RedexTailHandle`] field type from
 /// tripping clippy's `type_complexity` lint without `#[allow]`.
-type RedexTailStream =
-    ManuallyDrop<TokioMutex<Option<BoxStream<'static, std::result::Result<RedexEvent, RedexError>>>>>;
+type RedexTailStream = ManuallyDrop<
+    TokioMutex<Option<BoxStream<'static, std::result::Result<RedexEvent, RedexError>>>>,
+>;
 
 /// FFI handle for a tail cursor over a [`RedexFileHandle`].
 ///

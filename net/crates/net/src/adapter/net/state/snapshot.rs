@@ -1378,7 +1378,7 @@ mod tests {
         use bytes::BufMut;
         buf.put_slice(&V1_MAGIC);
         buf.put_u8(1); // pre-bump SNAPSHOT_VERSION
-        // 32 (entity) + 8 (seq) + CAUSAL_LINK_SIZE + 8 (created) + 4 (state_len)
+                       // 32 (entity) + 8 (seq) + CAUSAL_LINK_SIZE + 8 (created) + 4 (state_len)
         buf.put_bytes(0u8, 32 + 8 + CAUSAL_LINK_SIZE + 8 + 4);
         assert!(
             StateSnapshot::from_bytes(&buf).is_none(),

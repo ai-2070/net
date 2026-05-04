@@ -1663,8 +1663,13 @@ fn durable_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
     // strings owned by `Vec<u16>` for the duration of the call.
     // `MoveFileExW`'s contract is: read the wide strings, return
     // BOOL. No aliasing, no escaping references.
-    let ok =
-        unsafe { MoveFileExW(src_w.as_ptr(), dst_w.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
+    let ok = unsafe {
+        MoveFileExW(
+            src_w.as_ptr(),
+            dst_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
     if ok == 0 {
         Err(std::io::Error::last_os_error())
     } else {

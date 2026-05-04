@@ -294,6 +294,9 @@ mod tests {
         let t2 = std::thread::spawn(move || g2.begin_free(Duration::from_millis(50)));
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();
-        assert!(r1 && r2, "both concurrent free callers must observe drained");
+        assert!(
+            r1 && r2,
+            "both concurrent free callers must observe drained"
+        );
     }
 }
