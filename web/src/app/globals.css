@@ -1,27 +1,183 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+@theme {
+  --color-deep: #07080a;
+  --color-panel: #0c0e12;
+  --color-raised: #11141a;
+  --color-line: #1c2029;
+  --color-line2: #262b36;
+  --color-ink: #e9ecf1;
+  --color-muted: #a8b0bd;
+  --color-dim: #6b7280;
+  --color-accent: #7cf5c0;
+  --color-accent2: #67d3ff;
+  --color-warn: #ffb86b;
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+  --font-sans: var(--font-inter), -apple-system, BlinkMacSystemFont, system-ui,
+    sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, Menlo,
+    monospace;
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+  --breakpoint-sm: 540px;
+  --breakpoint-md: 760px;
+  --breakpoint-lg: 880px;
+  --breakpoint-xl: 980px;
+  --breakpoint-2xl: 1200px;
+
+  --animate-pulse-soft: pulse-soft 2.4s ease-in-out infinite;
+
+  @keyframes pulse-soft {
+    0%,
+    100% {
+      opacity: 0.6;
+    }
+    50% {
+      opacity: 1;
+    }
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer base {
+  html,
+  body {
+    background: var(--color-deep);
+    color: var(--color-ink);
+  }
+  body {
+    font-family: var(--font-sans);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+  }
+  ::selection {
+    background: rgba(124, 245, 192, 0.25);
+    color: var(--color-ink);
+  }
+}
+
+@utility grad-text {
+  background: linear-gradient(135deg, #7cf5c0 0%, #67d3ff 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+@utility grad-fill {
+  background: linear-gradient(135deg, #7cf5c0 0%, #67d3ff 100%);
+}
+
+@utility logo-mark {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, #7cf5c0 0%, #67d3ff 100%);
+  box-shadow:
+    0 0 0 1px rgba(124, 245, 192, 0.3) inset,
+    0 0 24px rgba(124, 245, 192, 0.25);
+  position: relative;
+
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 5px;
+    border-radius: 3px;
+    background: var(--color-deep);
+  }
+  &::before {
+    content: "";
+    position: absolute;
+    inset: 9px;
+    border-radius: 1px;
+    background: linear-gradient(135deg, #7cf5c0 0%, #67d3ff 100%);
+    z-index: 1;
+  }
+}
+
+@utility hero-grid-bg {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 64px 64px;
+  position: absolute;
+  inset: 0;
+  mask-image: radial-gradient(
+    900px 500px at 50% 0%,
+    black 30%,
+    transparent 80%
+  );
+  -webkit-mask-image: radial-gradient(
+    900px 500px at 50% 0%,
+    black 30%,
+    transparent 80%
+  );
+  pointer-events: none;
+}
+
+@utility hero-bg {
+  background:
+    radial-gradient(
+      1200px 600px at 50% -10%,
+      rgba(124, 245, 192, 0.1),
+      transparent 60%
+    ),
+    radial-gradient(
+      800px 400px at 90% 30%,
+      rgba(103, 211, 255, 0.06),
+      transparent 60%
+    );
+}
+
+@utility cta-grid-bg {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(
+    500px 200px at 50% 0%,
+    black 30%,
+    transparent 80%
+  );
+  -webkit-mask-image: radial-gradient(
+    500px 200px at 50% 0%,
+    black 30%,
+    transparent 80%
+  );
+}
+
+@utility cta-fade {
+  background:
+    linear-gradient(180deg, rgba(124, 245, 192, 0.06) 0%, transparent 60%),
+    var(--color-panel);
+}
+
+@utility gap-fade {
+  background: linear-gradient(180deg, var(--color-panel), var(--color-deep));
+}
+
+@utility arch-fade {
+  background: linear-gradient(
+    180deg,
+    var(--color-panel) 0%,
+    var(--color-deep) 100%
+  );
+}
+
+@utility nav-glass {
+  background: rgba(7, 8, 10, 0.72);
+  backdrop-filter: saturate(160%) blur(14px);
+  -webkit-backdrop-filter: saturate(160%) blur(14px);
+}
+
+@utility bar-track {
+  background: linear-gradient(90deg, #4a4f5c 0%, #6b7280 100%);
+}
+@utility bar-net {
+  background: linear-gradient(135deg, #7cf5c0 0%, #67d3ff 100%);
+  box-shadow: 0 0 24px rgba(124, 245, 192, 0.3);
+}
+@utility bar-physics {
+  background: linear-gradient(90deg, #ffb86b 0%, #ffd9a3 100%);
 }
