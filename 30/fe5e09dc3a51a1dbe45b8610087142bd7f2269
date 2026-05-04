@@ -1,0 +1,31 @@
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  cdf934b360f502d7 64
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03_REMAINING_PLAN.md
+  cdf934b360f502d7 89-141
+net/crates/net/src/ffi/handle_guard.rs
+  cdf934b360f502d7 1-299
+net/crates/net/src/ffi/cortex.rs
+  cdf934b360f502d7 18,43,272-283,285-286,357-358,374-407,423-430,479-486,503-506,522-525,538-541,564-567,1865-2029
+net/crates/net/src/ffi/mod.rs
+  cdf934b360f502d7 107-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "30fe5e09dc3a51a1dbe45b8610087142bd7f2269",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3191,
+      "total_deletions": 60,
+      "accepted_lines": 618,
+      "overriden_lines": 2
+    }
+  }
+}
