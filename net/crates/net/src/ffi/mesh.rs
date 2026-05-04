@@ -1527,6 +1527,10 @@ pub extern "C" fn net_mesh_stream_stats(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*node_handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match h.inner.stream_stats(peer_node_id, stream_id) {
         Some(s) => {
             let js = StreamStatsJson {
@@ -2280,6 +2284,13 @@ pub extern "C" fn net_identity_issue_token(
         return NET_ERR_IDENTITY;
     };
     let h = unsafe { &*signer };
+    // Audit #24: gate before touching `h.keypair` (which lives in
+    // `ManuallyDrop`). A concurrent `net_identity_free` would
+    // otherwise drop the keypair while `try_issue` borrows it.
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     // Route through `try_issue` so a public-only signer keypair
     // (post-migration zeroize, etc.) surfaces as
     // `TokenError::ReadOnly` → `NET_ERR_IDENTITY` instead of
@@ -2512,6 +2523,13 @@ pub extern "C" fn net_delegate_token(
         return NET_ERR_IDENTITY;
     };
     let h = unsafe { &*signer };
+    // Audit #24: gate before touching `h.keypair` (in `ManuallyDrop`).
+    // A concurrent `net_identity_free` would otherwise drop the
+    // keypair while `parent_tok.delegate` borrows it.
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match parent_tok.delegate(&h.keypair, subject_id, scope) {
         Ok(child) => alloc_bytes(&child.to_bytes(), out_token, out_token_len),
         Err(e) => token_err_to_code(&e),
@@ -3721,6 +3739,139 @@ mod tests {
         }
         net_mesh_free(nh_a);
         net_mesh_free(nh_b);
+    }
+
+    /// Audit #24 regression: post-free `net_mesh_stream_stats`
+    /// must bail with ShuttingDown rather than touching the
+    /// freed `inner: ManuallyDrop<Arc<MeshNode>>`. Pre-fix the
+    /// function did `&*node_handle; h.inner.stream_stats(...)`
+    /// without `try_enter`, racing UAF against `net_mesh_free`.
+    #[test]
+    fn net_mesh_stream_stats_returns_shutting_down_after_free() {
+        let cfg = serde_json::json!({
+            "bind_addr": "127.0.0.1:0",
+            "psk_hex": "0".repeat(64),
+        });
+        let cfg_c = CString::new(cfg.to_string()).unwrap();
+        let mut nh: *mut MeshNodeHandle = std::ptr::null_mut();
+        assert_eq!(net_mesh_new(cfg_c.as_ptr(), &mut nh), 0);
+        assert!(!nh.is_null());
+
+        // Free first; subsequent stream_stats must bail before
+        // touching the taken-out inner.
+        net_mesh_free(nh);
+
+        let mut out_json: *mut c_char = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = net_mesh_stream_stats(nh, 0xDEAD, 1, &mut out_json, &mut out_len);
+        assert_eq!(
+            rc,
+            NetError::ShuttingDown as c_int,
+            "post-free stream_stats must surface ShuttingDown (got {rc})",
+        );
+        assert!(
+            out_json.is_null(),
+            "no payload may be written after the guard fires",
+        );
+    }
+
+    /// Audit #24 regression: post-free `net_identity_issue_token`
+    /// must bail with ShuttingDown rather than borrowing the
+    /// freed keypair (which lives in `ManuallyDrop` and is taken
+    /// out by `net_identity_free`).
+    #[test]
+    fn net_identity_issue_token_returns_shutting_down_after_free() {
+        let mut signer: *mut IdentityHandle = std::ptr::null_mut();
+        assert_eq!(net_identity_generate(&mut signer), 0);
+        assert!(!signer.is_null());
+        net_identity_free(signer);
+
+        // Well-formed inputs (so we reach the guard rather than
+        // bailing on parse).
+        let subject = [0u8; 32];
+        let scope = CString::new("[\"publish\"]").unwrap();
+        let channel = CString::new("test-channel").unwrap();
+        let mut out_token: *mut u8 = std::ptr::null_mut();
+        let mut out_token_len: usize = 0;
+        let rc = net_identity_issue_token(
+            signer,
+            subject.as_ptr(),
+            subject.len(),
+            scope.as_ptr(),
+            channel.as_ptr(),
+            60,
+            0,
+            &mut out_token,
+            &mut out_token_len,
+        );
+        assert_eq!(
+            rc,
+            NetError::ShuttingDown as c_int,
+            "post-free issue_token must surface ShuttingDown (got {rc})",
+        );
+        assert!(out_token.is_null(), "no token bytes may be allocated");
+    }
+
+    /// Audit #24 regression: post-free `net_delegate_token` must
+    /// bail with ShuttingDown rather than borrowing the freed
+    /// signer keypair. The parent token must validate first
+    /// (parse before guard), so we issue a real one from a live
+    /// signer, then free that signer and reuse it as the
+    /// delegating signer.
+    #[test]
+    fn net_delegate_token_returns_shutting_down_after_free() {
+        let mut signer: *mut IdentityHandle = std::ptr::null_mut();
+        assert_eq!(net_identity_generate(&mut signer), 0);
+        assert!(!signer.is_null());
+
+        // Issue a real parent token while signer is alive.
+        let subject = [0u8; 32];
+        let scope = CString::new("[\"publish\",\"delegate\"]").unwrap();
+        let channel = CString::new("test-channel").unwrap();
+        let mut parent_bytes: *mut u8 = std::ptr::null_mut();
+        let mut parent_len: usize = 0;
+        assert_eq!(
+            net_identity_issue_token(
+                signer,
+                subject.as_ptr(),
+                subject.len(),
+                scope.as_ptr(),
+                channel.as_ptr(),
+                60,
+                1,
+                &mut parent_bytes,
+                &mut parent_len,
+            ),
+            0,
+        );
+        assert!(!parent_bytes.is_null());
+
+        // Now free the signer and try to delegate using it.
+        net_identity_free(signer);
+
+        let new_subject = [1u8; 32];
+        let restricted = CString::new("[\"publish\"]").unwrap();
+        let mut child_bytes: *mut u8 = std::ptr::null_mut();
+        let mut child_len: usize = 0;
+        let rc = net_delegate_token(
+            signer,
+            parent_bytes,
+            parent_len,
+            new_subject.as_ptr(),
+            new_subject.len(),
+            restricted.as_ptr(),
+            &mut child_bytes,
+            &mut child_len,
+        );
+        assert_eq!(
+            rc,
+            NetError::ShuttingDown as c_int,
+            "post-free delegate_token must surface ShuttingDown (got {rc})",
+        );
+        assert!(child_bytes.is_null(), "no child token may be allocated");
+
+        // Cleanup: free the parent token bytes.
+        net_free_bytes(parent_bytes, parent_len);
     }
 
     #[test]

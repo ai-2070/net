@@ -2186,6 +2186,91 @@ mod tests {
         );
     }
 
+    /// Audit #73, multi-shard variant. The rollback+override
+    /// logic must drain every match across multiple shards when
+    /// each poll truncates matches from BOTH shards (so both
+    /// shards land in the `rolled_back` set on the same poll).
+    /// Pre-fix concern: a stall on either shard would leave
+    /// matches stranded; this exercises the dual-rollback path
+    /// the single-shard test doesn't.
+    #[tokio::test]
+    async fn poll_merger_does_not_stall_on_multi_shard_filter_truncation() {
+        let adapter = Arc::new(MockAdapter::new());
+        // Two shards, 30 matching events each. Limit=10 means
+        // every poll truncates matches from both shards
+        // simultaneously (the global sort interleaves them, and
+        // 10 < 2*30).
+        for shard_id in 0..2u16 {
+            let events: Vec<StoredEvent> = (0..30)
+                .map(|i| {
+                    StoredEvent::from_value(
+                        format!("{}-{}", shard_id, i),
+                        json!({"keep": true}),
+                        // Stagger timestamps so the global sort
+                        // interleaves shards: shard 0 ts even,
+                        // shard 1 ts odd.
+                        (i * 2 + shard_id as usize) as u64 + 1,
+                        shard_id,
+                    )
+                })
+                .collect();
+            adapter.add_events(shard_id, events);
+        }
+
+        let merger = PollMerger::new(adapter, vec![0, 1]);
+        let make_request = |from_id: Option<String>| ConsumeRequest {
+            limit: 10,
+            from_id,
+            shards: None,
+            filter: Some(Filter::eq("keep", json!(true))),
+            ordering: Ordering::None,
+        };
+
+        let mut cursor: Option<String> = None;
+        let mut returned: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut polls = 0;
+        loop {
+            polls += 1;
+            assert!(
+                polls < 30,
+                "audit #73 multi-shard: poll loop must terminate; \
+                 got {} polls without draining (cursor={:?}, returned={})",
+                polls,
+                cursor,
+                returned.len(),
+            );
+            let response = merger.poll(make_request(cursor.clone())).await.unwrap();
+            for e in &response.events {
+                returned.insert(e.id.clone());
+            }
+            let new_cursor = response.next_id.clone();
+            // Same stall guard as the single-shard test: the
+            // cursor must advance OR has_more must be false on
+            // any poll that returned events.
+            if cursor == new_cursor {
+                assert!(
+                    !response.has_more,
+                    "audit #73 multi-shard: cursor stuck at {:?} but \
+                     has_more=true → stall",
+                    cursor,
+                );
+                break;
+            }
+            cursor = new_cursor;
+            if !response.has_more && response.events.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            returned.len(),
+            60,
+            "audit #73 multi-shard: every match across both shards must \
+             surface exactly once (got {} unique in {} polls)",
+            returned.len(),
+            polls,
+        );
+    }
+
     /// Corollary: a small request that fits well below
     /// the cap must NOT flag truncation.
     #[tokio::test]
