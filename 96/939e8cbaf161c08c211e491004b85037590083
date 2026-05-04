@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  cdf934b360f502d7 61-78,80-109,135-145,156-184,198-201,211-212,214-223,420-425,484-497,499-516,518-523,529,603,643-672,674-696,912-934,1027-1388
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  cdf934b360f502d7 30,32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "96939e8cbaf161c08c211e491004b85037590083",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2262,
+      "total_deletions": 2161,
+      "accepted_lines": 590,
+      "overriden_lines": 0
+    }
+  }
+}
