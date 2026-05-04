@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/compute/host.rs
+  cdf934b360f502d7 16,403-422
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  cdf934b360f502d7 148,166
+net/crates/net/src/consumer/merge.rs
+  cdf934b360f502d7 2099-2188
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  cdf934b360f502d7 1352-1405
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03_REMAINING_PLAN.md
+  cdf934b360f502d7 143,150-178
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "076422e230c356e6f7b1cd066d1c0622ac5c8203",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 4014,
+      "total_deletions": 14,
+      "accepted_lines": 203,
+      "overriden_lines": 0
+    }
+  }
+}
