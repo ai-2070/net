@@ -610,8 +610,8 @@ impl NetRouter {
                 } else {
                     // Wait for new packets (with timeout).
                     //
-                    // Audit #128 disposition: the `notify_one` →
-                    // `wait()` pattern is sound — `tokio::sync::Notify`
+                    // The `notify_one` → `wait()` pattern is
+                    // sound — `tokio::sync::Notify`
                     // stores a permit when `notify_one` is called
                     // with no waiter, and the next `notified().await`
                     // consumes it immediately. So an enqueue that

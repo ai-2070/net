@@ -111,7 +111,7 @@ pub enum DaemonError {
     /// land — the registry detected the orphaned `Arc` after
     /// acquiring the inner lock and bailed before invoking the
     /// host. Retry the operation against the current
-    /// registered host (if any). Audit #13/#68.
+    /// registered host (if any).
     Stale(u64),
 }
 

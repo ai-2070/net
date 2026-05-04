@@ -1334,9 +1334,9 @@ mod tests {
         );
     }
 
-    /// Audit #102 wire-bump: the pre-magic-era v0 reader was
-    /// removed. Any input lacking the `CDS1` magic prefix is now
-    /// rejected at `from_bytes`, regardless of the body shape.
+    /// Wire-bump: the pre-magic-era v0 reader was removed. Any
+    /// input lacking the `CDS1` magic prefix is now rejected at
+    /// `from_bytes`, regardless of the body shape.
     #[test]
     fn from_bytes_rejects_pre_magic_v0_layout() {
         // Construct what would have been a valid v0 body
@@ -1359,16 +1359,16 @@ mod tests {
 
         assert!(
             StateSnapshot::from_bytes(&buf).is_none(),
-            "post-#102 reader must reject pre-magic v0 layout (no CDS1 prefix); \
+            "reader must reject pre-magic v0 layout (no CDS1 prefix); \
              rolling-upgrade compat from that era is gone"
         );
     }
 
-    /// Audit #102 wire-bump: a v1-version-byte snapshot (correct
-    /// magic, but version=1) is rejected because v1's embedded
-    /// envelope was 208 bytes — every offset in the v1 trailer
-    /// shifts under v2's 209-byte envelope, so silent acceptance
-    /// would mis-parse the rest.
+    /// Wire-bump: a v1-version-byte snapshot (correct magic, but
+    /// version=1) is rejected because v1's embedded envelope was
+    /// 208 bytes — every offset in the v1 trailer shifts under
+    /// v2's 209-byte envelope, so silent acceptance would
+    /// mis-parse the rest.
     #[test]
     fn from_bytes_rejects_v1_version_byte() {
         // Smallest possible v1-shaped buffer with valid magic +

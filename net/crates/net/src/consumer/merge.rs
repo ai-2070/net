@@ -2096,20 +2096,20 @@ mod tests {
         );
     }
 
-    /// Audit #73 regression: a single-shard request with a filter
-    /// where every fetched event matches AND the per-shard cap
-    /// clamps the fetch must not stall — each poll must advance
-    /// the cursor by `request.limit` matches and the loop must
-    /// drain in `ceil(total / limit)` iterations.
+    /// A single-shard request with a filter where every fetched
+    /// event matches AND the per-shard cap clamps the fetch must
+    /// not stall — each poll must advance the cursor by
+    /// `request.limit` matches and the loop must drain in
+    /// `ceil(total / limit)` iterations.
     ///
-    /// Pre-fix concern (per the audit): the rollback step rolled
-    /// the cursor back to the original position, and without a
-    /// matching forward override the cursor never advanced —
-    /// re-fetching the same events on every poll. The current
-    /// rollback+override logic resolves this: Step 1 rolls back
-    /// for shards with truncated matches; Step 2 overrides to
-    /// the last *returned* match's id so each poll makes
-    /// `request.limit` worth of forward progress.
+    /// Without the rollback+override pairing, the rollback step
+    /// would roll the cursor back to the original position with
+    /// no matching forward override, so the cursor never
+    /// advances — re-fetching the same events on every poll. The
+    /// current logic resolves this: Step 1 rolls back for shards
+    /// with truncated matches; Step 2 overrides to the last
+    /// *returned* match's id so each poll makes `request.limit`
+    /// worth of forward progress.
     #[tokio::test]
     async fn poll_merger_does_not_stall_on_single_shard_filter_under_cap() {
         // Adapter holds 50 events on shard 0. With a filter that
@@ -2146,7 +2146,7 @@ mod tests {
             polls += 1;
             assert!(
                 polls < 20,
-                "audit #73: poll loop must terminate; got {} polls without draining \
+                "poll loop must terminate; got {} polls without draining \
                  (cursor={:?}, total={})",
                 polls,
                 cursor,
@@ -2157,7 +2157,7 @@ mod tests {
             let new_cursor = response.next_id.clone();
             assert!(
                 new_cursor.is_some(),
-                "audit #73: response must surface a cursor on every progress poll \
+                "response must surface a cursor on every progress poll \
                  (poll={}, returned={})",
                 polls,
                 response.events.len(),
@@ -2168,7 +2168,7 @@ mod tests {
             if cursor == new_cursor {
                 assert!(
                     !response.has_more,
-                    "audit #73: cursor stuck at {:?} but has_more=true → stall",
+                    "cursor stuck at {:?} but has_more=true → stall",
                     cursor,
                 );
                 break;
@@ -2180,19 +2180,19 @@ mod tests {
         }
         assert_eq!(
             total, 50,
-            "audit #73: full draining of 50 events must succeed without stall \
+            "full draining of 50 events must succeed without stall \
              (got {} in {} polls)",
             total, polls,
         );
     }
 
-    /// Audit #73, multi-shard variant. The rollback+override
-    /// logic must drain every match across multiple shards when
-    /// each poll truncates matches from BOTH shards (so both
-    /// shards land in the `rolled_back` set on the same poll).
-    /// Pre-fix concern: a stall on either shard would leave
-    /// matches stranded; this exercises the dual-rollback path
-    /// the single-shard test doesn't.
+    /// Multi-shard variant. The rollback+override logic must
+    /// drain every match across multiple shards when each poll
+    /// truncates matches from BOTH shards (so both shards land
+    /// in the `rolled_back` set on the same poll). Without it,
+    /// a stall on either shard would leave matches stranded;
+    /// this exercises the dual-rollback path the single-shard
+    /// test doesn't.
     #[tokio::test]
     async fn poll_merger_does_not_stall_on_multi_shard_filter_truncation() {
         let adapter = Arc::new(MockAdapter::new());
@@ -2233,7 +2233,7 @@ mod tests {
             polls += 1;
             assert!(
                 polls < 30,
-                "audit #73 multi-shard: poll loop must terminate; \
+                "multi-shard: poll loop must terminate; \
                  got {} polls without draining (cursor={:?}, returned={})",
                 polls,
                 cursor,
@@ -2250,7 +2250,7 @@ mod tests {
             if cursor == new_cursor {
                 assert!(
                     !response.has_more,
-                    "audit #73 multi-shard: cursor stuck at {:?} but \
+                    "multi-shard: cursor stuck at {:?} but \
                      has_more=true → stall",
                     cursor,
                 );
@@ -2264,7 +2264,7 @@ mod tests {
         assert_eq!(
             returned.len(),
             60,
-            "audit #73 multi-shard: every match across both shards must \
+            "multi-shard: every match across both shards must \
              surface exactly once (got {} unique in {} polls)",
             returned.len(),
             polls,

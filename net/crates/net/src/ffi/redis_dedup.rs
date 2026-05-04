@@ -53,10 +53,9 @@ use super::handle_guard::{HandleGuard, FFI_HANDLE_FREE_DEADLINE};
 
 /// Opaque handle for the dedup helper. Crossed as `void*` from C.
 ///
-/// Audit #24: same `HandleGuard` recipe as the cortex/mesh
-/// handles. Box stays leaked across `_free`; inner Mutex lives in
-/// `ManuallyDrop` so the free can take and drop it after
-/// quiescing in-flight ops.
+/// Same `HandleGuard` recipe as the cortex/mesh handles. Box stays
+/// leaked across `_free`; inner Mutex lives in `ManuallyDrop` so
+/// the free can take and drop it after quiescing in-flight ops.
 pub struct RedisStreamDedupHandle {
     inner: ManuallyDrop<Mutex<crate::adapter::RedisStreamDedup>>,
     guard: HandleGuard,
@@ -114,9 +113,9 @@ pub extern "C" fn net_redis_dedup_free(handle: *mut RedisStreamDedupHandle) {
         if handle.is_null() {
             return;
         }
-        // Audit #24: quiesce in-flight ops before dropping inner.
-        // Box stays leaked. Safety: caller upheld the handle-
-        // ownership contract documented on `net_redis_dedup_new`.
+        // Quiesce in-flight ops before dropping inner. Box stays
+        // leaked. Safety: caller upheld the handle-ownership
+        // contract documented on `net_redis_dedup_new`.
         let h: &RedisStreamDedupHandle = unsafe { &*handle };
         if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
             // SAFETY: drained; sole writable reference.
@@ -153,8 +152,7 @@ pub extern "C" fn net_redis_dedup_is_duplicate(
         // Safety: handle is non-NULL and points at a `Box`-allocated
         // `RedisStreamDedupHandle` per the constructor contract.
         let h = unsafe { &*handle };
-        // Audit #24: bail with -1 (same shape as NULL handle) if
-        // _free has begun.
+        // Bail with -1 (same shape as NULL handle) if _free has begun.
         let _op = match h.guard.try_enter() {
             Some(op) => op,
             None => return -1,

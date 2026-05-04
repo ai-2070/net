@@ -410,11 +410,10 @@ impl DaemonHost {
     ///
     /// Used by the migration orchestrator's
     /// `on_replay_complete` to stamp the *real* `parent_hash`
-    /// into the superposition's `target_head` instead of the
-    /// pre-fix synthetic `0`. Audit #64: a synthetic
-    /// `parent_hash: 0` produces a `ContinuityProof` that no
-    /// downstream verifier holding the real chain can ever
-    /// reconcile.
+    /// into the superposition's `target_head` instead of a
+    /// synthetic `0`. A synthetic `parent_hash: 0` produces a
+    /// `ContinuityProof` that no downstream verifier holding the
+    /// real chain can ever reconcile.
     #[inline]
     pub fn head_link(&self) -> CausalLink {
         *self.chain.head()

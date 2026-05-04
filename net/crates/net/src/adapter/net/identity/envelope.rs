@@ -76,19 +76,18 @@ use crate::adapter::net::state::causal::{CausalLink, CAUSAL_LINK_SIZE};
 
 /// Wire-format version byte stamped at the head of every
 /// serialized `IdentityEnvelope`. Producers always emit this
-/// value; readers reject any other byte. Audit #102: pre-fix
-/// the envelope had no version marker, so `open` had to try v1
-/// AAD then fall back to v0 (empty) AAD on failure — doubling
-/// AEAD CPU per probe of legitimate v0 envelopes during a
-/// rolling upgrade. The wire-bump cycle that landed
-/// `IDENTITY_ENVELOPE_VERSION = 1` drops v0 support entirely
-/// (no backwards compat — the migration cliff is documented in
-/// the project release notes).
+/// value; readers reject any other byte. Without it, `open`
+/// would have to try v1 AAD then fall back to v0 (empty) AAD on
+/// failure — doubling AEAD CPU per probe of legitimate v0
+/// envelopes during a rolling upgrade. The wire-bump cycle that
+/// landed `IDENTITY_ENVELOPE_VERSION = 1` drops v0 support
+/// entirely (no backwards compat — the migration cliff is
+/// documented in the project release notes).
 pub const IDENTITY_ENVELOPE_VERSION: u8 = 1;
 
 /// Fixed wire size of a serialized `IdentityEnvelope`. Bumped
-/// from 208 to 209 in the audit-#102 wire-bump to make room for
-/// the leading version byte.
+/// from 208 to 209 in the wire-bump to make room for the
+/// leading version byte.
 pub const IDENTITY_ENVELOPE_SIZE: usize = 1 + 32 + 80 + 32 + 64;
 
 /// Domain separator for the sealed-box AEAD key derivation.
@@ -375,12 +374,12 @@ impl IdentityEnvelope {
         // the chain_link to the ciphertext. A tampered link will
         // fail the signature check above AND the AEAD tag here.
         //
-        // Audit #102: the wire-bump that landed
-        // `IDENTITY_ENVELOPE_VERSION = 1` makes the AAD
-        // deterministic — there's no fallback path here. Pre-fix
-        // we tried v1 AAD then fell back to v0 (empty) AAD on
-        // failure, doubling AEAD CPU per legitimate-v0-replay
-        // probe during a rolling upgrade. Post-fix v0 envelopes
+        // The wire-bump that landed `IDENTITY_ENVELOPE_VERSION = 1`
+        // makes the AAD deterministic — there's no fallback path
+        // here. Without the version byte, the reader would try v1
+        // AAD then fall back to v0 (empty) AAD on failure,
+        // doubling AEAD CPU per legitimate-v0-replay probe during
+        // a rolling upgrade. With the version byte, v0 envelopes
         // are rejected at `from_bytes`'s version check, so by the
         // time we reach this AEAD attempt, the AAD is known
         // unambiguous.
@@ -458,11 +457,11 @@ impl IdentityEnvelope {
     /// would swallow data the parent frame expects to consume
     /// next.
     ///
-    /// Audit #102: pre-fix the wire had no version byte so the
-    /// reader had to try v1 AAD then fall back to v0 (empty AAD)
-    /// on AEAD failure — the doubled CPU per legitimate-v0-replay
-    /// probe. Post-fix the version byte is the deterministic
-    /// selector; the v0 fallback path is gone.
+    /// Without the version byte, the reader would have to try v1
+    /// AAD then fall back to v0 (empty AAD) on AEAD failure —
+    /// doubled CPU per legitimate-v0-replay probe. The version
+    /// byte is the deterministic selector; the v0 fallback path
+    /// is gone.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() != IDENTITY_ENVELOPE_SIZE {
             return None;
@@ -586,7 +585,7 @@ mod tests {
 
     #[test]
     fn wire_size_is_209_bytes() {
-        // Audit #102 wire bump: 208 → 209 (one leading version byte).
+        // Wire bump: 208 → 209 (one leading version byte).
         assert_eq!(IDENTITY_ENVELOPE_SIZE, 209);
         assert_eq!(raw_fixture().to_bytes().len(), 209);
     }
@@ -814,17 +813,16 @@ mod tests {
         assert_eq!(err, EnvelopeError::SourceReadOnly);
     }
 
-    /// Audit #102 wire-bump: rolling-upgrade compatibility from
-    /// v0 (pre-version-byte) was REMOVED in this branch. A
-    /// hand-built v0 envelope (or any 208-byte payload that
-    /// would have been a v0 envelope) is now rejected at
-    /// `from_bytes`'s version-byte check — the v0 AEAD fallback
-    /// path that used to double CPU per legitimate-v0-replay
-    /// probe is gone.
+    /// Rolling-upgrade compatibility from v0 (pre-version-byte)
+    /// was REMOVED in this wire-bump. A hand-built v0 envelope
+    /// (or any 208-byte payload that would have been a v0
+    /// envelope) is now rejected at `from_bytes`'s version-byte
+    /// check — the v0 AEAD fallback path that used to double CPU
+    /// per legitimate-v0-replay probe is gone.
     ///
-    /// This test pins that the post-bump reader rejects any
-    /// 208-byte input AND any 209-byte input whose first byte is
-    /// not [`IDENTITY_ENVELOPE_VERSION`] = 1.
+    /// This test pins that the reader rejects any 208-byte input
+    /// AND any 209-byte input whose first byte is not
+    /// [`IDENTITY_ENVELOPE_VERSION`] = 1.
     #[test]
     fn open_rejects_pre_wire_bump_v0_envelope() {
         let env = raw_fixture();

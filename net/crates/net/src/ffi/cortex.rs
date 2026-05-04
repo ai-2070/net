@@ -223,12 +223,12 @@ const _: fn() = || {
 
 /// FFI handle wrapping an [`InnerRedex`] manager.
 ///
-/// Carries a [`HandleGuard`] (audit #23 recipe) so a Go cgo /
-/// Python-thread caller racing `net_redex_free` against
-/// `net_redex_open_file` / `net_tasks_adapter_open` /
-/// `net_memories_adapter_open` doesn't UAF the dropped inner.
-/// Box is intentionally leaked on free; inner Arc lives in
-/// [`ManuallyDrop`] for take-and-drop after the drain.
+/// Carries a [`HandleGuard`] so a Go cgo / Python-thread caller
+/// racing `net_redex_free` against `net_redex_open_file` /
+/// `net_tasks_adapter_open` / `net_memories_adapter_open` doesn't
+/// UAF the dropped inner. Box is intentionally leaked on free;
+/// inner Arc lives in [`ManuallyDrop`] for take-and-drop after
+/// the drain.
 pub struct RedexHandle {
     inner: ManuallyDrop<Arc<InnerRedex>>,
     guard: HandleGuard,
@@ -259,7 +259,7 @@ pub extern "C" fn net_redex_free(handle: *mut RedexHandle) {
     if handle.is_null() {
         return;
     }
-    // Audit #23: quiesce in-flight ops before dropping the inner.
+    // Quiesce in-flight ops before dropping the inner.
     // Box stays leaked. See `super::handle_guard` for soundness.
     let h: &RedexHandle = unsafe { &*handle };
     if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
@@ -398,7 +398,7 @@ pub extern "C" fn net_redex_file_free(handle: *mut RedexFileHandle) {
     if handle.is_null() {
         return;
     }
-    // Audit #23: quiesce in-flight ops before dropping the inner.
+    // Quiesce in-flight ops before dropping the inner.
     // The outer Box is intentionally leaked — see
     // `super::handle_guard` for the soundness story (concurrent
     // ops doing `try_enter`'s `fetch_add` on a deallocated atomic
@@ -447,10 +447,10 @@ pub extern "C" fn net_redex_file_append(
         return NetError::NullPointer.into();
     }
     let file = unsafe { &*handle };
-    // Audit #23: refuse to touch `inner` if `_free` has begun.
-    // Without this gate, a Go cgo / Python-thread caller racing
-    // `_free` against this function reads freed memory after
-    // `_free` drops the inner.
+    // Refuse to touch `inner` if `_free` has begun. Without this
+    // gate, a Go cgo / Python-thread caller racing `_free`
+    // against this function reads freed memory after `_free`
+    // drops the inner.
     let _op = match file.guard.try_enter() {
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
@@ -582,7 +582,7 @@ type RedexTailStream = ManuallyDrop<
 
 /// FFI handle for a tail cursor over a [`RedexFileHandle`].
 ///
-/// Audit #23: same `HandleGuard` recipe applies. The inner is a
+/// Same `HandleGuard` recipe applies. The inner is a
 /// `TokioMutex<Option<BoxStream<...>>>`; on free we drain
 /// in-flight `next` calls before taking the inner via
 /// `ManuallyDrop`. Box stays leaked.
@@ -699,8 +699,8 @@ pub extern "C" fn net_redex_tail_free(cursor: *mut RedexTailHandle) {
     if cursor.is_null() {
         return;
     }
-    // Audit #23: quiesce in-flight `_next` ops before dropping the
-    // inner stream. Box stays leaked.
+    // Quiesce in-flight `_next` ops before dropping the inner
+    // stream. Box stays leaked.
     let h: &RedexTailHandle = unsafe { &*cursor };
     if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
         // SAFETY: drained; sole writable reference.
@@ -723,9 +723,9 @@ pub extern "C" fn net_redex_tail_free(cursor: *mut RedexTailHandle) {
 
 /// FFI handle wrapping an [`InnerTasksAdapter`].
 ///
-/// Audit #23: same `HandleGuard` recipe as `RedexHandle` /
-/// `RedexFileHandle`. Box leaked on free; inner Arc lives in
-/// `ManuallyDrop` for take-and-drop after drain.
+/// Same `HandleGuard` recipe as `RedexHandle` / `RedexFileHandle`.
+/// Box leaked on free; inner Arc lives in `ManuallyDrop` for
+/// take-and-drop after drain.
 pub struct TasksAdapterHandle {
     inner: ManuallyDrop<Arc<InnerTasksAdapter>>,
     guard: HandleGuard,
@@ -796,7 +796,7 @@ pub extern "C" fn net_tasks_adapter_free(handle: *mut TasksAdapterHandle) {
     if handle.is_null() {
         return;
     }
-    // Audit #23: quiesce in-flight ops before dropping inner; box leaked.
+    // Quiesce in-flight ops before dropping inner; box leaked.
     let h: &TasksAdapterHandle = unsafe { &*handle };
     if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
         // SAFETY: drained; sole writable reference.
@@ -1153,8 +1153,8 @@ pub extern "C" fn net_tasks_list(
 
 /// FFI handle for a tasks-watch cursor.
 ///
-/// Audit #23: same `HandleGuard` recipe. Box leaked on free;
-/// inner stream lives in `ManuallyDrop`.
+/// Same `HandleGuard` recipe. Box leaked on free; inner stream
+/// lives in `ManuallyDrop`.
 pub struct TasksWatchHandle {
     stream: ManuallyDrop<TokioMutex<Option<BoxStream<'static, Vec<Task>>>>>,
     guard: HandleGuard,
@@ -1282,9 +1282,9 @@ pub extern "C" fn net_tasks_watch_free(cursor: *mut TasksWatchHandle) {
 
 /// FFI handle wrapping an [`InnerMemoriesAdapter`].
 ///
-/// Audit #23: same `HandleGuard` recipe as the other cortex
-/// handles. Box leaked on free; inner Arc lives in
-/// `ManuallyDrop` for take-and-drop after drain.
+/// Same `HandleGuard` recipe as the other cortex handles. Box
+/// leaked on free; inner Arc lives in `ManuallyDrop` for
+/// take-and-drop after drain.
 pub struct MemoriesAdapterHandle {
     inner: ManuallyDrop<Arc<InnerMemoriesAdapter>>,
     guard: HandleGuard,
@@ -1350,7 +1350,7 @@ pub extern "C" fn net_memories_adapter_free(handle: *mut MemoriesAdapterHandle) 
     if handle.is_null() {
         return;
     }
-    // Audit #23: quiesce in-flight ops before dropping inner; box leaked.
+    // Quiesce in-flight ops before dropping inner; box leaked.
     let h: &MemoriesAdapterHandle = unsafe { &*handle };
     if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
         // SAFETY: drained; sole writable reference.
@@ -1779,7 +1779,7 @@ pub extern "C" fn net_memories_list(
 }
 
 /// FFI handle for a memories-watch cursor. Same `HandleGuard`
-/// recipe as `TasksWatchHandle` (audit #23).
+/// recipe as `TasksWatchHandle`.
 pub struct MemoriesWatchHandle {
     stream: ManuallyDrop<TokioMutex<Option<BoxStream<'static, Vec<Memory>>>>>,
     guard: HandleGuard,
@@ -2067,26 +2067,25 @@ mod tests {
         net_redex_free(r);
     }
 
-    /// Audit #23 regression: a Go cgo / Python-thread caller racing
+    /// A Go cgo / Python-thread caller racing
     /// `net_redex_file_free` against a concurrent
-    /// `net_redex_file_append` (or any RedexFile op) must not produce
-    /// a use-after-free. Pre-fix `_free` was an unconditional
-    /// `Box::from_raw`, so the concurrent op's `&*handle` deref read
-    /// freed memory.
+    /// `net_redex_file_append` (or any RedexFile op) must not
+    /// produce a use-after-free. Without the guard, `_free` would
+    /// be an unconditional `Box::from_raw` and the concurrent
+    /// op's `&*handle` deref would read freed memory.
     ///
     /// We can't deterministically inject the race in a unit test
     /// without race-injection scaffolding, but we CAN pin the two
-    /// load-bearing post-fix invariants:
+    /// load-bearing invariants:
     ///   1. After `_free`, future ops bail with `ShuttingDown`
     ///      rather than touching the (taken-out) inner.
-    ///   2. `_free` is idempotent — a second call after the first
-    ///      drained also returns immediately without touching the
-    ///      already-taken inner. (The leaked outer Box stays
-    ///      valid; the second begin_free observes
-    ///      `active_ops == 0` and returns true; the
-    ///      `ManuallyDrop::take` inside the if-branch panics if
-    ///      called twice — so the test additionally pins that
-    ///      `_free` doesn't re-run that branch.)
+    ///   2. `_free` is idempotent — a second call returns
+    ///      immediately without touching the already-taken inner.
+    ///      The leaked outer Box stays valid; the second
+    ///      `begin_free` observes `freeing=true` (set by the
+    ///      first caller's `compare_exchange`) and returns
+    ///      `false`, skipping the `ManuallyDrop::take` branch
+    ///      entirely.
     #[test]
     fn redex_file_free_blocks_subsequent_ops_with_shutting_down() {
         let r = redex();
@@ -2153,16 +2152,16 @@ mod tests {
         net_redex_free(r);
     }
 
-    /// Audit #23 regression: a `net_redex_file_free` racing an
-    /// in-flight `net_redex_file_append` from another thread must
-    /// wait for the append to finish before taking the inner.
-    /// Pre-fix the free would proceed immediately and the append's
+    /// A `net_redex_file_free` racing an in-flight
+    /// `net_redex_file_append` from another thread must wait for
+    /// the append to finish before taking the inner. Without the
+    /// guard, free would proceed immediately and the append's
     /// subsequent `&*handle` deref would UAF the dropped inner.
     ///
-    /// We use a long-running append (large payload + sync after) on
-    /// a background thread and call `_free` from the main thread
-    /// once the append has been observed to start. The post-fix
-    /// `_free` blocks until the append's `try_enter` guard drops.
+    /// We use a long-running append (large payload + sync after)
+    /// on a background thread and call `_free` from the main
+    /// thread once the append has been observed to start. `_free`
+    /// blocks until the append's `try_enter` guard drops.
     #[test]
     fn redex_file_free_waits_for_inflight_append() {
         use std::sync::atomic::{AtomicBool, Ordering};

@@ -427,8 +427,8 @@ impl Drop for ResourceGuard {
 ///
 /// Stores `(window_floor, count)` packed in a single `AtomicU64`
 /// so a single CAS atomically resets the count when the window
-/// rolls over. Eliminates the lost-write race that audit #125
-/// flagged: pre-fix, `RateLimiter::maybe_reset` called
+/// rolls over. Eliminates a lost-write race: under the older
+/// design, `RateLimiter::maybe_reset` called
 /// `per_source.clear()` at minute boundaries; an in-flight
 /// `record_request` could fetch_add into the OLD `AtomicU64` just
 /// as `clear()` removed it from the map, orphaning the increment
@@ -609,11 +609,11 @@ impl RateLimiter {
             if last.elapsed() >= self.reset_interval {
                 self.global_requests.store(0, Ordering::Relaxed);
                 self.global_tokens.store(0, Ordering::Relaxed);
-                // Audit #125: per_source buckets self-reset on
-                // access — no `clear()` call here. Periodically
-                // sweep stale entries (more than 5 windows old)
-                // so the map doesn't grow unbounded under
-                // long-tail source churn.
+                // per_source buckets self-reset on access — no
+                // `clear()` call here. Periodically sweep stale
+                // entries (more than 5 windows old) so the map
+                // doesn't grow unbounded under long-tail source
+                // churn.
                 self.gc_per_source_stale();
                 *last = Instant::now();
             }
@@ -749,7 +749,7 @@ impl RateLimiter {
 
     /// CAS-based "check and increment" for per-source RPM. Same
     /// commit-or-rollback contract as `try_acquire_global_rpm`.
-    /// Audit #125: each per-source bucket carries its own
+    /// Each per-source bucket carries its own
     /// `(window_floor, count)` packed atomic and self-resets when
     /// the floor advances — no global `clear()` race window.
     fn try_acquire_source_rpm(
@@ -2465,11 +2465,11 @@ mod tests {
         );
     }
 
-    /// Audit #125 regression: per-source RPM bucket self-resets
-    /// on window rollover via packed `(window_floor, count)`
-    /// atomic — no global `clear()` race window where a
-    /// concurrent `record_request`'s `fetch_add` lands in an
-    /// AtomicU64 that's about to be removed from the map.
+    /// Per-source RPM bucket self-resets on window rollover via
+    /// packed `(window_floor, count)` atomic — no global
+    /// `clear()` race window where a concurrent
+    /// `record_request`'s `fetch_add` lands in an AtomicU64
+    /// that's about to be removed from the map.
     ///
     /// This test pins the bucket-level invariant directly: an
     /// initial floor stamps count to 1; a stale-floor read sees
@@ -2503,11 +2503,11 @@ mod tests {
         assert_eq!(bucket.current_count(0), 0);
     }
 
-    /// Audit #125 end-to-end: under concurrent rate-limit
-    /// pressure across multiple sources, no source ever exceeds
-    /// its per-source cap by more than 1 (the single race window
-    /// is between fetch_update's load and CAS, NOT the
-    /// previously-unbounded clear-and-reinsert race).
+    /// End-to-end: under concurrent rate-limit pressure across
+    /// multiple sources, no source ever exceeds its per-source
+    /// cap by more than 1 (the single race window is between
+    /// fetch_update's load and CAS, NOT the previously-unbounded
+    /// clear-and-reinsert race).
     ///
     /// Pre-fix this test would intermittently fail because the
     /// minute-boundary `per_source.clear()` could land between

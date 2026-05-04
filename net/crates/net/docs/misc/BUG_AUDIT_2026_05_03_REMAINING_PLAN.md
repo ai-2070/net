@@ -92,7 +92,7 @@ fix is to port the `active_ops` + `bus_taken` CAS protocol that
   `FFI_HANDLE_FREE_DEADLINE` extracted. Five unit tests pin
   try_enter, post-free bail, drain-wait, drain-timeout, and
   idempotent concurrent free callers.
-- ✅ `RedexFileHandle` (audit #23 specific call-out) ported. Three
+- ✅ `RedexFileHandle` (23 specific call-out) ported. Three
   regression tests pin post-free `ShuttingDown` on every entry
   point, idempotent `_free`, and `_free` waiting for an in-flight
   `_append` to drain.
@@ -136,7 +136,8 @@ points are wired (post-free `ShuttingDown`) and `_free` is sound
 
 **Sequencing:** the remaining handles can be tackled in any
 order. Suggested next: `MeshStreamHandle` + `MeshNodeHandle`
-together (audit #25 needs both for the `Arc::ptr_eq` UAF in
+together (
+25 needs both for the `Arc::ptr_eq` UAF in
 `handles_match`). Then the rest of cortex (`Tasks`, `Memories`)
 together. Then `RedisDedupHandle` and `IdentityHandle` (small).
 

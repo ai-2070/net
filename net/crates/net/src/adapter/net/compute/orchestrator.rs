@@ -1349,12 +1349,12 @@ impl MigrationOrchestrator {
 
         let mut record = entry.lock();
 
-        // Audit #64: query the freshly-replayed daemon for its
-        // *real* head link so the superposition's `target_head`
-        // carries the actual cryptographic anchor (parent_hash)
-        // — not the pre-fix synthetic `parent_hash: 0` that no
-        // downstream verifier could ever reconcile against the
-        // chain. The replay just landed on this node's daemon
+        // Query the freshly-replayed daemon for its *real* head
+        // link so the superposition's `target_head` carries the
+        // actual cryptographic anchor (parent_hash) — not a
+        // synthetic `parent_hash: 0` that no downstream verifier
+        // could ever reconcile against the chain. The replay just
+        // landed on this node's daemon
         // registry, so the local host's chain head is by
         // construction the head we just produced.
         //

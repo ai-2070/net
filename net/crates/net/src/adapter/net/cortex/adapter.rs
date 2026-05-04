@@ -1022,17 +1022,16 @@ mod tests {
     }
 
     // ========================================================================
-    // Audit #6 + #7: applied_through_seq vs folded_through_seq
+    // applied_through_seq vs folded_through_seq
     // ========================================================================
 
-    /// Regression for audit #6: under `Stop` policy, a per-event
-    /// recoverable decode error advances `folded_through_seq`
-    /// (so live consumers don't deadlock on a permanently-bad
-    /// event) but must NOT advance `applied_through_seq` (state
-    /// at the skipped seq was never written). Pre-fix the two
-    /// were the same atomic and `wait_for_seq(seq)` returned
-    /// claiming "state reflects seq" for events whose mutation
-    /// never landed.
+    /// Under `Stop` policy, a per-event recoverable decode error
+    /// advances `folded_through_seq` (so live consumers don't
+    /// deadlock on a permanently-bad event) but must NOT advance
+    /// `applied_through_seq` (state at the skipped seq was never
+    /// written). When the two were the same atomic,
+    /// `wait_for_seq(seq)` returned claiming "state reflects seq"
+    /// for events whose mutation never landed.
     #[tokio::test]
     async fn recoverable_decode_skip_advances_folded_but_not_applied() {
         let redex = Redex::new();
@@ -1087,8 +1086,8 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Acquire), 6);
     }
 
-    /// Regression for audit #6 (continued): when the FIRST event
-    /// is skipped via recoverable_decode, `applied_through_seq`
+    /// When the FIRST event is skipped via
+    /// recoverable_decode, `applied_through_seq`
     /// stays at the "nothing applied yet" sentinel until a
     /// subsequent successful fold. This is the strict shape: an
     /// adapter freshly opened that has only seen skipped events
@@ -1128,8 +1127,8 @@ mod tests {
         assert_eq!(*adapter.state().read(), 0);
     }
 
-    /// Regression for audit #7: `snapshot()` must use
-    /// `applied_through_seq`, not `folded_through_seq`. Pre-fix,
+    /// `snapshot()` must use `applied_through_seq`, not
+    /// `folded_through_seq`. When the two were the same atomic,
     /// snapshot persisted the highest folded seq — including
     /// skipped events — so a restore tailed from past the skip
     /// and the skipped seq became permanently lost from durable
@@ -1179,11 +1178,11 @@ mod tests {
         assert_eq!(last_seq, Some(4));
     }
 
-    /// Regression for audit #7 (strict shape): when the LAST
-    /// processed event is skipped, snapshot's `last_seq` must
-    /// stay at the highest *applied* seq — not advance to the
-    /// skipped one. Pre-fix: snapshot returned the skipped seq;
-    /// restore tailed from past it; skipped event was lost.
+    /// Strict shape: when the LAST processed event is skipped,
+    /// snapshot's `last_seq` must stay at the highest *applied*
+    /// seq — not advance to the skipped one. Without the split,
+    /// snapshot returned the skipped seq; restore tailed from
+    /// past it; skipped event was lost.
     #[tokio::test]
     async fn snapshot_last_seq_does_not_advance_to_a_skipped_tail() {
         let redex = Redex::new();
@@ -1226,15 +1225,15 @@ mod tests {
         );
     }
 
-    /// Regression for audit #6+#7 end-to-end: an adapter whose
-    /// fold previously skipped seq N via recoverable_decode is
-    /// snapshotted, closed, and reopened via
-    /// `open_from_snapshot` with a fold that NOW handles seq N
-    /// successfully (e.g. a software upgrade fixed the decoder).
-    /// On restore, seq N must be re-fed to the fold function —
-    /// pre-fix snapshot's `last_seq` was the highest folded
-    /// (advanced over skips), restore tailed from past the
-    /// skipped seq, and the previously-skipped event was
+    /// End-to-end: an adapter whose fold previously skipped seq
+    /// N via recoverable_decode is snapshotted, closed, and
+    /// reopened via `open_from_snapshot` with a fold that NOW
+    /// handles seq N successfully (e.g. a software upgrade fixed
+    /// the decoder). On restore, seq N must be re-fed to the
+    /// fold function — without the strict-prefix watermark,
+    /// snapshot's `last_seq` would be the highest folded
+    /// (advanced over skips), restore would tail from past the
+    /// skipped seq, and the previously-skipped event would be
     /// permanently lost.
     ///
     /// Asserts the strict-prefix `last_seq` and that the skipped

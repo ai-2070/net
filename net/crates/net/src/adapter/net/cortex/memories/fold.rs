@@ -39,12 +39,13 @@ impl RedexFold<MemoriesState> for MemoriesFold {
         // Verify the corruption-detection checksum stamped at
         // ingest against the bytes we received from RedEX.
         //
-        // Audit #8: try the v2 (header + tail) checksum first, fall
-        // back to v1 (tail-only) for records written by pre-fix
-        // adapters. New writes pass v2 and detect bit-flips in the
-        // header (e.g. a `STORED → DELETED` dispatch flip); legacy
-        // records pass v1 with the original undercoverage gap
-        // documented as a known limitation. See `compute_checksum`'s
+        // Try the v2 (header + tail) checksum first, fall back
+        // to v1 (tail-only) for records written by pre-v2
+        // adapters. New writes pass v2 and detect bit-flips in
+        // the header (e.g. a `STORED → DELETED` dispatch flip);
+        // legacy records pass v1 with the original undercoverage
+        // gap documented as a known limitation. See
+        // `compute_checksum`'s
         // doc for the full scope and migration story.
         let v2_expected = compute_checksum_with_meta(&meta, tail);
         let valid = if meta.checksum == v2_expected {

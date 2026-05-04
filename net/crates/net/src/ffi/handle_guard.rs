@@ -237,10 +237,10 @@ mod tests {
         assert_eq!(g.active_ops.load(Ordering::SeqCst), 0);
     }
 
-    /// Audit #23/#24/#25 regression: a `_free` racing an in-flight
-    /// op must wait for the op to finish before returning success.
-    /// Pre-fix `_free` was an unconditional `Box::from_raw`, so
-    /// the op's subsequent dereference was UAF.
+    /// A `_free` racing an in-flight op must wait for the op to
+    /// finish before returning success. Without the guard, `_free`
+    /// would be an unconditional `Box::from_raw` and the op's
+    /// subsequent dereference would UAF.
     #[test]
     fn begin_free_waits_for_inflight_op() {
         let g = Arc::new(HandleGuard::new());

@@ -387,8 +387,8 @@ impl MemoriesAdapter {
         // Build the meta with checksum=0 first; `compute_checksum_with_meta`
         // hashes the header (with the checksum slot zeroed) AND the
         // tail, so we have to materialize the rest of the header
-        // before computing the checksum. Audit #8: the legacy
-        // tail-only `compute_checksum` left the dispatch / flags /
+        // before computing the checksum. The legacy tail-only
+        // `compute_checksum` left the dispatch / flags /
         // origin_hash / seq_or_ts bytes outside the integrity
         // check.
         let mut meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, 0);

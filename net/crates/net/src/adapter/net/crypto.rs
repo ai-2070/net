@@ -1389,11 +1389,11 @@ mod tests {
         // — replaying the same nonce would pass replay detection.
         //
         // The earlier fix added a `rx_counter == u64::MAX` early
-        // return so subsequent commits were refused. The newer fix
-        // (audit #159) goes further: `received == u64::MAX` is
-        // refused at the gate, so `rx_counter` never reaches the
-        // ceiling. Both the original "no replay accepted" property
-        // and the stronger "ceiling never reachable" property hold.
+        // return so subsequent commits were refused. The newer
+        // fix goes further: `received == u64::MAX` is refused at
+        // the gate, so `rx_counter` never reaches the ceiling.
+        // Both the original "no replay accepted" property and the
+        // stronger "ceiling never reachable" property hold.
         let key = [0x42u8; 32];
         let cipher = PacketCipher::new(&key, 0x1234);
 

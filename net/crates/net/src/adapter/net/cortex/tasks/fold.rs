@@ -42,12 +42,12 @@ impl RedexFold<TasksState> for TasksFold {
         // Verify the corruption-detection checksum stamped at
         // ingest against the bytes we received from RedEX.
         //
-        // Audit #8: v2 covers (header-with-zeroed-checksum-slot ||
-        // tail), so a bit-flip in the dispatch byte (or any other
-        // header field) is caught — pre-fix the legacy tail-only
-        // hash left those bytes unprotected and a `STORED →
-        // DELETED` flip silently re-routed the event to the wrong
-        // fold arm. Fall back to v1 (tail-only) for records
+        // v2 covers (header-with-zeroed-checksum-slot || tail),
+        // so a bit-flip in the dispatch byte (or any other
+        // header field) is caught — the legacy tail-only hash
+        // left those bytes unprotected and a `STORED → DELETED`
+        // flip silently re-routed the event to the wrong fold
+        // arm. Fall back to v1 (tail-only) for records
         // written by pre-fix adapters; legacy records keep their
         // original limitation, new writes get full coverage.
         let v2_expected = compute_checksum_with_meta(&meta, tail);

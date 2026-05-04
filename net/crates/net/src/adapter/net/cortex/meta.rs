@@ -128,11 +128,11 @@ impl EventMeta {
 /// introduced have a tail-only checksum and would fail v2
 /// verification.
 ///
-/// Pre-fix, `compute_checksum` was also used by producers, which
-/// left the 20-byte header unprotected: a stray bit-flip in the
-/// `dispatch` byte (e.g. `STORED → DELETED`) was undetected by
+/// When `compute_checksum` was also used by producers, the
+/// 20-byte header was unprotected: a stray bit-flip in the
+/// `dispatch` byte (e.g. `STORED → DELETED`) went undetected by
 /// the per-event integrity check and silently re-routed the
-/// event to the wrong fold arm. Audit #8.
+/// event to the wrong fold arm.
 ///
 /// **Scope:** an *accidental-corruption* detector, NOT a tamper
 /// detector. Two specific limits make it unsuitable for
@@ -308,7 +308,7 @@ mod tests {
     }
 
     // ====================================================================
-    // Audit #8: compute_checksum_with_meta — header coverage
+    // compute_checksum_with_meta — header coverage
     // ====================================================================
 
     /// `compute_checksum_with_meta` zeroes the checksum slot in
@@ -333,12 +333,11 @@ mod tests {
         );
     }
 
-    /// Audit #8 regression. A bit-flip in the `dispatch` byte is
-    /// detected by `compute_checksum_with_meta` but invisible to
-    /// the legacy `compute_checksum`. Pin both directions so a
-    /// future refactor that accidentally drops the helper or
-    /// silently routes producers back through the legacy
-    /// function trips.
+    /// A bit-flip in the `dispatch` byte is detected by
+    /// `compute_checksum_with_meta` but invisible to the legacy
+    /// `compute_checksum`. Pin both directions so a future
+    /// refactor that accidentally drops the helper or silently
+    /// routes producers back through the legacy function trips.
     #[test]
     fn compute_checksum_with_meta_detects_dispatch_bit_flip() {
         let tail = b"unchanged payload";

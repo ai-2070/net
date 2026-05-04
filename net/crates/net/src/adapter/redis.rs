@@ -329,7 +329,7 @@ impl Adapter for RedisAdapter {
             "Redis adapter initialized"
         );
 
-        // Audit #81 surfacing: every XADD this adapter emits carries
+        // Surfacing: every XADD this adapter emits carries
         // a `dedup_id` field stable across producer retries (see the
         // module docs). Consumers that ignore the field will see
         // duplicates on any timeout-cancellation or pipeline-retry

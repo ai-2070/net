@@ -399,12 +399,11 @@ struct MeshNewConfig {
 
 /// FFI handle for a [`MeshNode`].
 ///
-/// Audit #24: pre-fix `net_mesh_free` was an unconditional
-/// `Box::from_raw`, racing concurrent `net_mesh_send` (and ~60
-/// other entry points) into UAF on the dropped Box. `HandleGuard`
-/// (audit #23 recipe) closes both: the box stays leaked across
-/// `_free`; ops register via `try_enter` and `_free` quiesces
-/// them via `begin_free`.
+/// `HandleGuard`-protected: the box stays leaked across `_free`;
+/// ops register via `try_enter` and `_free` quiesces them via
+/// `begin_free`. Without this, an unconditional `Box::from_raw`
+/// would race concurrent `net_mesh_send` (and ~60 other entry
+/// points) into UAF on the dropped Box.
 ///
 /// `inner` and `channel_configs` live in `ManuallyDrop` so
 /// `_free` can take them out after the drain. Other Arc clones
@@ -563,8 +562,8 @@ pub extern "C" fn net_mesh_free(handle: *mut MeshNodeHandle) {
     if handle.is_null() {
         return;
     }
-    // Audit #24: quiesce in-flight ops before dropping the inner.
-    // Box stays leaked. Other Arc clones held by surviving
+    // Quiesce in-flight ops before dropping the inner. Box stays
+    // leaked. Other Arc clones held by surviving
     // MeshStreamHandle._node keep MeshNode alive until their own
     // _free runs.
     let h: &MeshNodeHandle = unsafe { &*handle };
@@ -1224,18 +1223,18 @@ struct StreamOpenConfig {
 
 /// FFI handle for an open stream against a [`MeshNode`].
 ///
-/// Audit #25: pre-fix `_node: Arc<MeshNode>` kept the underlying
-/// node alive but **not** the `MeshStreamHandle` Box itself —
+/// `HandleGuard`-protected. Without it, two distinct UAFs can
+/// fire: `_node: Arc<MeshNode>` keeps the underlying node alive
+/// but **not** the `MeshStreamHandle` Box itself —
 /// `net_mesh_free(node_handle)` could deallocate the node
 /// handle's box while `net_mesh_send` was deref'ing
 /// `&*node_handle` for the `Arc::ptr_eq` check in
 /// `handles_match`. The same hazard applies to this stream
 /// handle's own box: a concurrent `net_mesh_stream_free` while
 /// `net_mesh_send` was reading `sh.stream` / `sh._node` would
-/// UAF the dropped fields. `HandleGuard` (audit #23 recipe)
-/// closes both: the box stays leaked across `_free`; ops
-/// register via `try_enter` and `_free` quiesces them via
-/// `begin_free`.
+/// UAF the dropped fields. The guard closes both: the box stays
+/// leaked across `_free`; ops register via `try_enter` and
+/// `_free` quiesces them via `begin_free`.
 pub struct MeshStreamHandle {
     stream: ManuallyDrop<CoreStream>,
     // Keep the node alive as long as the stream is alive so sends
@@ -1304,8 +1303,7 @@ pub extern "C" fn net_mesh_stream_free(handle: *mut MeshStreamHandle) {
     if handle.is_null() {
         return;
     }
-    // Audit #25: quiesce in-flight ops before dropping the inner.
-    // Box stays leaked.
+    // Quiesce in-flight ops before dropping the inner. Box stays leaked.
     let h: &MeshStreamHandle = unsafe { &*handle };
     if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
         // SAFETY: drained; sole writable reference.
@@ -1390,8 +1388,8 @@ pub extern "C" fn net_mesh_send(
     }
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
-    // Audit #24/#25: gate both handles; either being freed
-    // concurrently would otherwise UAF the inner deref below.
+    // Gate both handles; either being freed concurrently would
+    // otherwise UAF the inner deref below.
     let _sh_op = match sh.guard.try_enter() {
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
@@ -1432,8 +1430,8 @@ pub extern "C" fn net_mesh_send_with_retry(
     }
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
-    // Audit #24/#25: gate both handles; either being freed
-    // concurrently would otherwise UAF the inner deref below.
+    // Gate both handles; either being freed concurrently would
+    // otherwise UAF the inner deref below.
     let _sh_op = match sh.guard.try_enter() {
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
@@ -1476,8 +1474,8 @@ pub extern "C" fn net_mesh_send_blocking(
     }
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
-    // Audit #24/#25: gate both handles; either being freed
-    // concurrently would otherwise UAF the inner deref below.
+    // Gate both handles; either being freed concurrently would
+    // otherwise UAF the inner deref below.
     let _sh_op = match sh.guard.try_enter() {
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
@@ -1948,10 +1946,10 @@ pub extern "C" fn net_mesh_publish(
 /// cheap to clone (both fields are `Arc`s inside the core), and the
 /// cache is owned by the handle rather than shared across peers.
 ///
-/// Audit #24: same `HandleGuard` recipe as the cortex handles
-/// (see `super::handle_guard` for soundness). Box stays leaked
-/// across `_free`; inner Arcs live in `ManuallyDrop` so the free
-/// can take and drop them after quiescing in-flight ops.
+/// Same `HandleGuard` recipe as the cortex handles (see
+/// `super::handle_guard` for soundness). Box stays leaked across
+/// `_free`; inner Arcs live in `ManuallyDrop` so the free can
+/// take and drop them after quiescing in-flight ops.
 pub struct IdentityHandle {
     keypair: ManuallyDrop<Arc<EntityKeypair>>,
     cache: ManuallyDrop<Arc<TokenCache>>,
@@ -2135,7 +2133,7 @@ pub extern "C" fn net_identity_free(handle: *mut IdentityHandle) {
     if handle.is_null() {
         return;
     }
-    // Audit #24: quiesce in-flight ops before dropping inner; box leaked.
+    // Quiesce in-flight ops before dropping inner; box leaked.
     let h: &IdentityHandle = unsafe { &*handle };
     if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
         // SAFETY: drained; sole writable reference.
@@ -2284,7 +2282,7 @@ pub extern "C" fn net_identity_issue_token(
         return NET_ERR_IDENTITY;
     };
     let h = unsafe { &*signer };
-    // Audit #24: gate before touching `h.keypair` (which lives in
+    // Gate before touching `h.keypair` (which lives in
     // `ManuallyDrop`). A concurrent `net_identity_free` would
     // otherwise drop the keypair while `try_issue` borrows it.
     let _op = match h.guard.try_enter() {
@@ -2523,7 +2521,7 @@ pub extern "C" fn net_delegate_token(
         return NET_ERR_IDENTITY;
     };
     let h = unsafe { &*signer };
-    // Audit #24: gate before touching `h.keypair` (in `ManuallyDrop`).
+    // Gate before touching `h.keypair` (in `ManuallyDrop`).
     // A concurrent `net_identity_free` would otherwise drop the
     // keypair while `parent_tok.delegate` borrows it.
     let _op = match h.guard.try_enter() {
@@ -3779,11 +3777,10 @@ mod tests {
         net_identity_free(h);
     }
 
-    /// Audit #24 regression: a `net_mesh_free` racing an in-flight
-    /// op via the same handle must wait for the op to drop its
-    /// `try_enter` guard before taking the inner. Pre-fix `_free`
-    /// would proceed immediately and the op's subsequent inner
-    /// deref would UAF.
+    /// `net_mesh_free` racing an in-flight op via the same handle
+    /// must wait for the op to drop its `try_enter` guard before
+    /// taking the inner. Without the guard, `_free` would proceed
+    /// immediately and the op's subsequent inner deref would UAF.
     ///
     /// We exercise the guard directly (rather than through a
     /// long-running FFI op) so the timing window is deterministic
@@ -3852,11 +3849,12 @@ mod tests {
         worker.join().unwrap();
     }
 
-    /// Audit #24 regression: post-free `net_mesh_stream_stats`
-    /// must bail with ShuttingDown rather than touching the
-    /// freed `inner: ManuallyDrop<Arc<MeshNode>>`. Pre-fix the
-    /// function did `&*node_handle; h.inner.stream_stats(...)`
-    /// without `try_enter`, racing UAF against `net_mesh_free`.
+    /// Post-free `net_mesh_stream_stats` must bail with
+    /// ShuttingDown rather than touching the freed
+    /// `inner: ManuallyDrop<Arc<MeshNode>>`. Without the guard,
+    /// the function would do `&*node_handle;
+    /// h.inner.stream_stats(...)` and race UAF against
+    /// `net_mesh_free`.
     #[test]
     fn net_mesh_stream_stats_returns_shutting_down_after_free() {
         let cfg = serde_json::json!({
@@ -3886,10 +3884,10 @@ mod tests {
         );
     }
 
-    /// Audit #24 regression: post-free `net_identity_issue_token`
-    /// must bail with ShuttingDown rather than borrowing the
-    /// freed keypair (which lives in `ManuallyDrop` and is taken
-    /// out by `net_identity_free`).
+    /// Post-free `net_identity_issue_token` must bail with
+    /// ShuttingDown rather than borrowing the freed keypair
+    /// (which lives in `ManuallyDrop` and is taken out by
+    /// `net_identity_free`).
     #[test]
     fn net_identity_issue_token_returns_shutting_down_after_free() {
         let mut signer: *mut IdentityHandle = std::ptr::null_mut();
@@ -3923,12 +3921,11 @@ mod tests {
         assert!(out_token.is_null(), "no token bytes may be allocated");
     }
 
-    /// Audit #24 regression: post-free `net_delegate_token` must
-    /// bail with ShuttingDown rather than borrowing the freed
-    /// signer keypair. The parent token must validate first
-    /// (parse before guard), so we issue a real one from a live
-    /// signer, then free that signer and reuse it as the
-    /// delegating signer.
+    /// Post-free `net_delegate_token` must bail with ShuttingDown
+    /// rather than borrowing the freed signer keypair. The parent
+    /// token must validate first (parse before guard), so we
+    /// issue a real one from a live signer, then free that signer
+    /// and reuse it as the delegating signer.
     #[test]
     fn net_delegate_token_returns_shutting_down_after_free() {
         let mut signer: *mut IdentityHandle = std::ptr::null_mut();
