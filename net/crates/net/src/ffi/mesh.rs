@@ -16,6 +16,7 @@
 //! identical to the one used by `ffi/cortex.rs`.
 
 use std::ffi::{c_char, c_int, CStr, CString};
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -36,6 +37,7 @@ use crate::adapter::net::{SubnetId, SubnetPolicy, SubnetRule};
 use crate::adapter::Adapter;
 use crate::error::AdapterError;
 
+use super::handle_guard::{HandleGuard, FFI_HANDLE_FREE_DEADLINE};
 use super::NetError;
 
 // =========================================================================
@@ -395,9 +397,23 @@ struct MeshNewConfig {
     try_port_mapping: bool,
 }
 
+/// FFI handle for a [`MeshNode`].
+///
+/// Audit #24: pre-fix `net_mesh_free` was an unconditional
+/// `Box::from_raw`, racing concurrent `net_mesh_send` (and ~60
+/// other entry points) into UAF on the dropped Box. `HandleGuard`
+/// (audit #23 recipe) closes both: the box stays leaked across
+/// `_free`; ops register via `try_enter` and `_free` quiesces
+/// them via `begin_free`.
+///
+/// `inner` and `channel_configs` live in `ManuallyDrop` so
+/// `_free` can take them out after the drain. Other Arc clones
+/// held by surviving `MeshStreamHandle._node` keep `MeshNode`
+/// alive until those streams are also freed.
 pub struct MeshNodeHandle {
-    inner: Arc<MeshNode>,
-    channel_configs: Arc<ChannelConfigRegistry>,
+    inner: ManuallyDrop<Arc<MeshNode>>,
+    channel_configs: ManuallyDrop<Arc<ChannelConfigRegistry>>,
+    guard: HandleGuard,
 }
 
 /// Create a new mesh node. `config_json` is:
@@ -529,8 +545,9 @@ pub extern "C" fn net_mesh_new(
             // Matches the PyO3 / NAPI behaviour.
             node.set_token_cache(Arc::new(TokenCache::new()));
             let handle = Box::new(MeshNodeHandle {
-                inner: Arc::new(node),
-                channel_configs,
+                inner: ManuallyDrop::new(Arc::new(node)),
+                channel_configs: ManuallyDrop::new(channel_configs),
+                guard: HandleGuard::new(),
             });
             unsafe {
                 *out_handle = Box::into_raw(handle);
@@ -546,8 +563,25 @@ pub extern "C" fn net_mesh_free(handle: *mut MeshNodeHandle) {
     if handle.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(handle));
+    // Audit #24: quiesce in-flight ops before dropping the inner.
+    // Box stays leaked. Other Arc clones held by surviving
+    // MeshStreamHandle._node keep MeshNode alive until their own
+    // _free runs.
+    let h: &MeshNodeHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference.
+        unsafe {
+            let mh = &mut *handle;
+            let inner = ManuallyDrop::take(&mut mh.inner);
+            let configs = ManuallyDrop::take(&mut mh.channel_configs);
+            drop(inner);
+            drop(configs);
+        }
+    } else {
+        tracing::warn!(
+            "net_mesh_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -564,7 +598,13 @@ pub extern "C" fn net_mesh_arc_clone(handle: *mut MeshNodeHandle) -> *mut Arc<Me
         return std::ptr::null_mut();
     }
     let h = unsafe { &*handle };
-    Box::into_raw(Box::new(h.inner.clone()))
+    // Returns NULL on shutting-down — same shape as absent-handle.
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return std::ptr::null_mut(),
+    };
+    let cloned: Arc<MeshNode> = Arc::clone(&h.inner);
+    Box::into_raw(Box::new(cloned))
 }
 
 /// Clone the shared `Arc<ChannelConfigRegistry>` backing this
@@ -581,7 +621,13 @@ pub extern "C" fn net_mesh_channel_configs_arc_clone(
         return std::ptr::null_mut();
     }
     let h = unsafe { &*handle };
-    Box::into_raw(Box::new(h.channel_configs.clone()))
+    // Returns NULL on shutting-down — same shape as absent-handle.
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return std::ptr::null_mut(),
+    };
+    let cloned: Arc<ChannelConfigRegistry> = Arc::clone(&h.channel_configs);
+    Box::into_raw(Box::new(cloned))
 }
 
 /// Free an `Arc<MeshNode>` handle produced by
@@ -620,6 +666,10 @@ pub extern "C" fn net_mesh_public_key_hex(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let s = hex::encode(h.inner.public_key());
     write_string_out(s, out_ptr, out_len)
 }
@@ -630,6 +680,11 @@ pub extern "C" fn net_mesh_node_id(handle: *mut MeshNodeHandle) -> u64 {
         return 0;
     }
     let h = unsafe { &*handle };
+    // Returns 0 on shutting-down — same shape as absent-handle.
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return 0,
+    };
     h.inner.node_id()
 }
 
@@ -642,6 +697,10 @@ pub extern "C" fn net_mesh_entity_id(handle: *mut MeshNodeHandle, out: *mut u8) 
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let bytes = h.inner.entity_id().as_bytes();
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, 32);
@@ -661,6 +720,10 @@ pub extern "C" fn net_mesh_connect(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(addr_s) = (unsafe { c_str_to_string(peer_addr) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -701,6 +764,10 @@ pub extern "C" fn net_mesh_accept(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let node = h.inner.clone();
     match block_on(async move { node.accept(peer_node_id).await }) {
         Ok((addr, _)) => write_string_out(addr.to_string(), out_addr, out_len),
@@ -714,6 +781,10 @@ pub extern "C" fn net_mesh_start(handle: *mut MeshNodeHandle) -> c_int {
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let node = h.inner.clone();
     // `start` spawns internal tasks via tokio::spawn; run under the
     // shared runtime.
@@ -738,6 +809,10 @@ pub extern "C" fn net_mesh_shutdown(handle: *mut MeshNodeHandle) -> c_int {
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match block_on(async { h.inner.shutdown().await }) {
         Ok(()) => 0,
         Err(e) => adapter_err_to_code(&e),
@@ -776,6 +851,10 @@ pub extern "C" fn net_mesh_nat_type(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     write_string_out(
         nat_class_to_str(h.inner.nat_class()).to_string(),
         out_str,
@@ -798,6 +877,10 @@ pub extern "C" fn net_mesh_reflex_addr(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let s = h
         .inner
         .reflex_addr()
@@ -821,6 +904,10 @@ pub extern "C" fn net_mesh_peer_nat_type(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     write_string_out(
         nat_class_to_str(h.inner.peer_nat_class(peer_node_id)).to_string(),
         out_str,
@@ -848,6 +935,10 @@ pub extern "C" fn net_mesh_probe_reflex(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let node = h.inner.clone();
     match block_on(async move { node.probe_reflex(peer_node_id).await }) {
         Ok(addr) => write_string_out(addr.to_string(), out_str, out_len),
@@ -866,6 +957,10 @@ pub extern "C" fn net_mesh_reclassify_nat(handle: *mut MeshNodeHandle) -> c_int 
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let node = h.inner.clone();
     block_on(async move { node.reclassify_nat().await });
     0
@@ -887,6 +982,10 @@ pub extern "C" fn net_mesh_traversal_stats(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let snap = h.inner.traversal_stats();
     unsafe {
         if !out_punches_attempted.is_null() {
@@ -925,6 +1024,10 @@ pub extern "C" fn net_mesh_connect_direct(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(pk_s) = (unsafe { c_str_to_string(peer_pubkey_hex) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -962,6 +1065,10 @@ pub extern "C" fn net_mesh_set_reflex_override(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(s) = (unsafe { c_str_to_string(external) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -986,6 +1093,10 @@ pub extern "C" fn net_mesh_clear_reflex_override(handle: *mut MeshNodeHandle) ->
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     h.inner.clear_reflex_override();
     0
 }
@@ -1111,11 +1222,26 @@ struct StreamOpenConfig {
     fairness_weight: Option<u8>,
 }
 
+/// FFI handle for an open stream against a [`MeshNode`].
+///
+/// Audit #25: pre-fix `_node: Arc<MeshNode>` kept the underlying
+/// node alive but **not** the `MeshStreamHandle` Box itself —
+/// `net_mesh_free(node_handle)` could deallocate the node
+/// handle's box while `net_mesh_send` was deref'ing
+/// `&*node_handle` for the `Arc::ptr_eq` check in
+/// `handles_match`. The same hazard applies to this stream
+/// handle's own box: a concurrent `net_mesh_stream_free` while
+/// `net_mesh_send` was reading `sh.stream` / `sh._node` would
+/// UAF the dropped fields. `HandleGuard` (audit #23 recipe)
+/// closes both: the box stays leaked across `_free`; ops
+/// register via `try_enter` and `_free` quiesces them via
+/// `begin_free`.
 pub struct MeshStreamHandle {
-    stream: CoreStream,
+    stream: ManuallyDrop<CoreStream>,
     // Keep the node alive as long as the stream is alive so sends
     // don't race a concurrent shutdown.
-    _node: Arc<MeshNode>,
+    _node: ManuallyDrop<Arc<MeshNode>>,
+    guard: HandleGuard,
 }
 
 #[unsafe(no_mangle)]
@@ -1130,6 +1256,10 @@ pub extern "C" fn net_mesh_open_stream(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let cfg_json: StreamOpenConfig = if config_json.is_null() {
         StreamOpenConfig::default()
     } else {
@@ -1154,9 +1284,11 @@ pub extern "C" fn net_mesh_open_stream(
         .with_fairness_weight(weight);
     match h.inner.open_stream(peer_node_id, stream_id, cfg) {
         Ok(stream) => {
+            let node_clone: Arc<MeshNode> = Arc::clone(&h.inner);
             let sh = Box::new(MeshStreamHandle {
-                stream,
-                _node: h.inner.clone(),
+                stream: ManuallyDrop::new(stream),
+                _node: ManuallyDrop::new(node_clone),
+                guard: HandleGuard::new(),
             });
             unsafe {
                 *out_stream = Box::into_raw(sh);
@@ -1172,8 +1304,24 @@ pub extern "C" fn net_mesh_stream_free(handle: *mut MeshStreamHandle) {
     if handle.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(handle));
+    // Audit #25: quiesce in-flight ops before dropping the inner.
+    // Box stays leaked.
+    let h: &MeshStreamHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference.
+        unsafe {
+            // CoreStream is Copy/non-Drop; just take it out and let
+            // it fall out of scope. The Arc<MeshNode> needs explicit
+            // drop() to release its refcount.
+            let _stream = ManuallyDrop::take(&mut (*handle).stream);
+            let node = ManuallyDrop::take(&mut (*handle)._node);
+            drop(node);
+        }
+    } else {
+        tracing::warn!(
+            "net_mesh_stream_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -1242,6 +1390,16 @@ pub extern "C" fn net_mesh_send(
     }
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
+    // Audit #24/#25: gate both handles; either being freed
+    // concurrently would otherwise UAF the inner deref below.
+    let _sh_op = match sh.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let _nh_op = match nh.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     if !handles_match(sh, nh) {
         return NetError::MismatchedHandles.into();
     }
@@ -1274,6 +1432,16 @@ pub extern "C" fn net_mesh_send_with_retry(
     }
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
+    // Audit #24/#25: gate both handles; either being freed
+    // concurrently would otherwise UAF the inner deref below.
+    let _sh_op = match sh.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let _nh_op = match nh.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     if !handles_match(sh, nh) {
         return NetError::MismatchedHandles.into();
     }
@@ -1308,6 +1476,16 @@ pub extern "C" fn net_mesh_send_blocking(
     }
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
+    // Audit #24/#25: gate both handles; either being freed
+    // concurrently would otherwise UAF the inner deref below.
+    let _sh_op = match sh.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let _nh_op = match nh.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     if !handles_match(sh, nh) {
         return NetError::MismatchedHandles.into();
     }
@@ -1398,6 +1576,10 @@ pub extern "C" fn net_mesh_recv_shard(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let node = h.inner.clone();
     let result = block_on(async move { node.poll_shard(shard_id, None, limit as usize).await });
     let result = match result {
@@ -1490,6 +1672,10 @@ pub extern "C" fn net_mesh_register_channel(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(s) = (unsafe { c_str_to_string(config_json) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -1566,6 +1752,10 @@ pub extern "C" fn net_mesh_subscribe_channel_with_token(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(s) = (unsafe { c_str_to_string(channel) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -1598,6 +1788,10 @@ fn subscribe_or_unsubscribe(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(s) = (unsafe { c_str_to_string(channel) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -1678,6 +1872,10 @@ pub extern "C" fn net_mesh_publish(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(ch) = (unsafe { c_str_to_string(channel) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -1745,9 +1943,15 @@ pub extern "C" fn net_mesh_publish(
 /// `TokenCache`. Matches the PyO3 / NAPI `Identity` pyclass layout —
 /// cheap to clone (both fields are `Arc`s inside the core), and the
 /// cache is owned by the handle rather than shared across peers.
+///
+/// Audit #24: same `HandleGuard` recipe as the cortex handles
+/// (see `super::handle_guard` for soundness). Box stays leaked
+/// across `_free`; inner Arcs live in `ManuallyDrop` so the free
+/// can take and drop them after quiescing in-flight ops.
 pub struct IdentityHandle {
-    keypair: Arc<EntityKeypair>,
-    cache: Arc<TokenCache>,
+    keypair: ManuallyDrop<Arc<EntityKeypair>>,
+    cache: ManuallyDrop<Arc<TokenCache>>,
+    guard: HandleGuard,
 }
 
 /// Allocate and copy `src` into a freshly allocated buffer owned by
@@ -1884,8 +2088,9 @@ pub extern "C" fn net_identity_generate(out_handle: *mut *mut IdentityHandle) ->
         return NetError::NullPointer.into();
     }
     let handle = Box::new(IdentityHandle {
-        keypair: Arc::new(EntityKeypair::generate()),
-        cache: Arc::new(TokenCache::new()),
+        keypair: ManuallyDrop::new(Arc::new(EntityKeypair::generate())),
+        cache: ManuallyDrop::new(Arc::new(TokenCache::new())),
+        guard: HandleGuard::new(),
     });
     unsafe {
         *out_handle = Box::into_raw(handle);
@@ -1911,8 +2116,9 @@ pub extern "C" fn net_identity_from_seed(
     let mut arr = [0u8; 32];
     arr.copy_from_slice(unsafe { std::slice::from_raw_parts(seed, 32) });
     let handle = Box::new(IdentityHandle {
-        keypair: Arc::new(EntityKeypair::from_bytes(arr)),
-        cache: Arc::new(TokenCache::new()),
+        keypair: ManuallyDrop::new(Arc::new(EntityKeypair::from_bytes(arr))),
+        cache: ManuallyDrop::new(Arc::new(TokenCache::new())),
+        guard: HandleGuard::new(),
     });
     unsafe {
         *out_handle = Box::into_raw(handle);
@@ -1925,8 +2131,22 @@ pub extern "C" fn net_identity_free(handle: *mut IdentityHandle) {
     if handle.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(handle));
+    // Audit #24: quiesce in-flight ops before dropping inner; box leaked.
+    let h: &IdentityHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference.
+        unsafe {
+            let mh = &mut *handle;
+            let kp = ManuallyDrop::take(&mut mh.keypair);
+            let cache = ManuallyDrop::take(&mut mh.cache);
+            drop(kp);
+            drop(cache);
+        }
+    } else {
+        tracing::warn!(
+            "net_identity_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -1938,6 +2158,10 @@ pub extern "C" fn net_identity_to_seed(handle: *mut IdentityHandle, out: *mut u8
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let seed = h.keypair.secret_bytes();
     unsafe {
         std::ptr::copy_nonoverlapping(seed.as_ptr(), out, 32);
@@ -1952,6 +2176,10 @@ pub extern "C" fn net_identity_entity_id(handle: *mut IdentityHandle, out: *mut 
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let id = h.keypair.entity_id().as_bytes();
     unsafe {
         std::ptr::copy_nonoverlapping(id.as_ptr(), out, 32);
@@ -1965,6 +2193,11 @@ pub extern "C" fn net_identity_node_id(handle: *mut IdentityHandle) -> u64 {
         return 0;
     }
     let h = unsafe { &*handle };
+    // Returns 0 on shutting-down — same shape as absent-handle.
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return 0,
+    };
     h.keypair.node_id()
 }
 
@@ -1974,6 +2207,11 @@ pub extern "C" fn net_identity_origin_hash(handle: *mut IdentityHandle) -> u32 {
         return 0;
     }
     let h = unsafe { &*handle };
+    // Returns 0 on shutting-down — same shape as absent-handle.
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return 0,
+    };
     h.keypair.origin_hash()
 }
 
@@ -1993,6 +2231,10 @@ pub extern "C" fn net_identity_sign(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let slice = if len == 0 {
         &[][..]
     } else {
@@ -2075,6 +2317,10 @@ pub extern "C" fn net_identity_install_token(
         Err(e) => return token_err_to_code(&e),
     };
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match h.cache.insert(parsed) {
         Ok(()) => 0,
         Err(e) => token_err_to_code(&e),
@@ -2106,6 +2352,10 @@ pub extern "C" fn net_identity_lookup_token(
         return NET_ERR_IDENTITY;
     };
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match h.cache.get(&subject_id, channel_hash) {
         Some(token) => alloc_bytes(&token.to_bytes(), out_token, out_token_len),
         None => {
@@ -2124,6 +2374,11 @@ pub extern "C" fn net_identity_token_cache_len(handle: *mut IdentityHandle) -> u
         return 0;
     }
     let h = unsafe { &*handle };
+    // Returns 0 on shutting-down — same shape as absent-handle.
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return 0,
+    };
     h.cache.len() as u32
 }
 
@@ -2765,6 +3020,10 @@ pub extern "C" fn net_mesh_announce_capabilities(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(s) = (unsafe { c_str_to_string(caps_json) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -2793,6 +3052,10 @@ pub extern "C" fn net_mesh_find_nodes(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(s) = (unsafe { c_str_to_string(filter_json) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -2959,6 +3222,10 @@ pub extern "C" fn net_mesh_find_nodes_scoped(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(filter_s) = (unsafe { c_str_to_string(filter_json) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -3044,6 +3311,10 @@ pub extern "C" fn net_mesh_find_best_node(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(s) = (unsafe { c_str_to_string(requirement_json) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -3089,6 +3360,10 @@ pub extern "C" fn net_mesh_find_best_node_scoped(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(req_s) = (unsafe { c_str_to_string(requirement_json) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -3350,7 +3625,7 @@ mod tests {
         // live stream handle would look like from the guard's POV.
         let inner_clone = {
             let h = unsafe { &*out };
-            h.inner.clone()
+            Arc::clone(&h.inner)
         };
         assert!(Arc::strong_count(&inner_clone) >= 2);
         assert!(!inner_clone.is_shutdown());
@@ -3363,7 +3638,10 @@ mod tests {
         );
 
         drop(inner_clone);
-        let _ = unsafe { Box::from_raw(out) };
+        // Use the production _free; it drains via HandleGuard and
+        // takes inner. The outer box is intentionally leaked
+        // (small per-call leak; acceptable in tests).
+        net_mesh_free(out);
     }
 
     /// Regression: BUG_REPORT.md #19 — `net_mesh_send` family
@@ -3404,14 +3682,16 @@ mod tests {
         // since we're in the same module.
         let sh_a = {
             let h = unsafe { &*nh_a };
+            let node_clone: Arc<MeshNode> = Arc::clone(&h.inner);
             MeshStreamHandle {
-                stream: CoreStream {
+                stream: ManuallyDrop::new(CoreStream {
                     peer_node_id: 0xDEAD,
                     stream_id: 1,
                     epoch: 0,
                     config: StreamConfig::new(),
-                },
-                _node: h.inner.clone(),
+                }),
+                _node: ManuallyDrop::new(node_clone),
+                guard: HandleGuard::new(),
             }
         };
 
@@ -3426,9 +3706,21 @@ mod tests {
             "stream from node_a + node_b handle must be rejected (#19)"
         );
 
-        // Cleanup: drop the boxes.
-        let _ = unsafe { Box::from_raw(nh_a) };
-        let _ = unsafe { Box::from_raw(nh_b) };
+        // Cleanup: take ManuallyDrop inner fields out of sh_a so
+        // they're properly dropped (rather than leaking when sh_a
+        // falls out of scope). Then call production _free on the
+        // node handles (drains via HandleGuard; leaks the outer
+        // boxes per the soundness rule — acceptable for tests).
+        // SAFETY: sh_a was just built on this thread; no
+        // concurrent access; ManuallyDrop fields haven't been
+        // taken yet.
+        unsafe {
+            let mut sh_a = sh_a;
+            let _ = ManuallyDrop::take(&mut sh_a.stream);
+            let _ = ManuallyDrop::take(&mut sh_a._node);
+        }
+        net_mesh_free(nh_a);
+        net_mesh_free(nh_b);
     }
 
     #[test]
