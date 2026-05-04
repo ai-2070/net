@@ -1423,14 +1423,14 @@ async fn shutdown_clears_failure_cache() {
     rt.start().await.unwrap();
 
     // Inject a handful of stale entries.
-    for origin in 0..16u32 {
+    for origin in 0..16u64 {
         rt.inject_migration_failure(origin, MigrationFailureReason::NotReady);
     }
     assert!(rt.peek_migration_failure(0).is_some());
 
     rt.shutdown().await.expect("shutdown");
 
-    for origin in 0..16u32 {
+    for origin in 0..16u64 {
         assert_eq!(
             rt.peek_migration_failure(origin),
             None,
@@ -1441,7 +1441,7 @@ async fn shutdown_clears_failure_cache() {
 
 // ---- Helpers -----------------------------------------------------------
 
-fn make_event(origin_hash: u32, seq: u64, payload: &'static [u8]) -> CausalEvent {
+fn make_event(origin_hash: u64, seq: u64, payload: &'static [u8]) -> CausalEvent {
     use net::adapter::net::state::causal::CausalLink;
     CausalEvent {
         link: CausalLink {

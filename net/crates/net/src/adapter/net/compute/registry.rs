@@ -74,7 +74,7 @@ impl DaemonRegistry {
     /// the map (between `get_arc` and `arc.lock()` inside one of
     /// the public mutators) and then completes its lock
     /// acquisition AFTER this call returns will be detected by
-    /// the per-mutator [`Self::guard_identity`] re-check and
+    /// the per-mutator `guard_identity` re-check and
     /// surfaced as `DaemonError::Stale` — its mutation does not
     /// land on the orphaned host.
     ///
@@ -110,7 +110,7 @@ impl DaemonRegistry {
     /// currently registered"). Any in-flight mutator that had
     /// already cloned the now-removed `Arc` and then completes
     /// its lock acquisition AFTER this returns is detected by
-    /// the per-mutator [`Self::guard_identity`] re-check and
+    /// the per-mutator `guard_identity` re-check and
     /// surfaced as `DaemonError::Stale`. The audit's "splits
     /// writes" failure mode (orphan host receives writes from
     /// in-flight mutators while a fresh `register` of the same

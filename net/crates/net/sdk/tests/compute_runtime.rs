@@ -82,7 +82,7 @@ async fn runtime() -> DaemonRuntime {
     DaemonRuntime::new(Arc::new(mesh))
 }
 
-fn event(origin_hash: u32, seq: u64, payload: &'static [u8]) -> CausalEvent {
+fn event(origin_hash: u64, seq: u64, payload: &'static [u8]) -> CausalEvent {
     CausalEvent {
         link: CausalLink {
             origin_hash,
@@ -291,38 +291,43 @@ async fn spawn_from_snapshot_rejects_identity_mismatch() {
 }
 
 /// Regression (Cubic-AI P1): `spawn_from_snapshot` used to compare
-/// only `origin_hash` (a 32-bit BLAKE2s projection of the entity
-/// pubkey), not the full 32-byte `entity_id`. On a birthday-bounded
-/// collision (~2^16 daemons in a pool, ~2^32 across a runtime's
-/// lifetime), two legitimately-different identities can share the
-/// same `origin_hash`. Pre-fix, the SDK would accept the mismatched
-/// identity at its check layer, create a factory entry, and only
-/// fail much later when `DaemonHost::from_snapshot` did its own
-/// full-bytes check — surfacing as `DaemonError::Core(RestoreFailed)`
-/// rather than the semantically correct `SnapshotIdentityMismatch`.
-/// Callers relying on the typed error (the docstring advertises it)
-/// would never see it.
+/// only `origin_hash`, not the full 32-byte `entity_id`. On a
+/// birthday-bounded collision two legitimately-different identities
+/// can share the same projected origin hash. Pre-fix, the SDK would
+/// accept the mismatched identity at its check layer, create a factory
+/// entry, and only fail much later when `DaemonHost::from_snapshot`
+/// did its own full-bytes check — surfacing as
+/// `DaemonError::Core(RestoreFailed)` rather than the semantically
+/// correct `SnapshotIdentityMismatch`. Callers relying on the typed
+/// error (the docstring advertises it) would never see it.
 ///
-/// This test brute-force searches for a real origin_hash collision
-/// between two ed25519 keypairs, then feeds the snapshot of one
-/// through `spawn_from_snapshot` with the other's identity.
+/// `origin_hash` is a 64-bit value; finding a true u64 collision via
+/// brute force is infeasible (~2^32 expected work). The routing path,
+/// however, downcasts to u32 (`origin_hash as u32`), and that is the
+/// projection the legacy SDK check would compare on. So this test
+/// brute-forces a u32-projection collision between two ed25519
+/// keypairs, then feeds the snapshot of one through
+/// `spawn_from_snapshot` with the other's identity. The SDK must still
+/// reject via the full-entity_id check.
 ///
 /// Runtime: ~1–3 seconds on modern hardware (birthday-bound ~2^16
-/// keygens against a 32-bit hash). Bounded at 300 000 attempts to
-/// prevent pathological CI hangs.
+/// keygens against a 32-bit projection). Bounded at 300 000 attempts
+/// to prevent pathological CI hangs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_from_snapshot_checks_full_entity_id_not_just_origin_hash() {
     use std::collections::HashMap;
 
     // Deterministic-seed brute force: Identity::from_seed takes any
     // 32-byte value, so iterate a counter → seed for reproducibility.
+    // Key the dedup map by the *low 32 bits* of `origin_hash` — that's
+    // the routing-side projection the SDK guard used to compare on.
     let mut seen: HashMap<u32, Identity> = HashMap::new();
     let mut collision: Option<(Identity, Identity)> = None;
     for i in 0u64..300_000 {
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&i.to_le_bytes());
         let id = Identity::from_seed(seed);
-        let h = id.keypair().origin_hash();
+        let h = id.keypair().origin_hash() as u32;
         if let Some(prior) = seen.remove(&h) {
             if prior.entity_id() != id.entity_id() {
                 collision = Some((prior, id));
@@ -334,9 +339,9 @@ async fn spawn_from_snapshot_checks_full_entity_id_not_just_origin_hash() {
     let (ident_a, ident_b) = collision
         .expect("no origin_hash collision found within the attempt budget — try raising the bound");
     assert_eq!(
-        ident_a.keypair().origin_hash(),
-        ident_b.keypair().origin_hash(),
-        "fixture: pair must collide on origin_hash",
+        ident_a.keypair().origin_hash() as u32,
+        ident_b.keypair().origin_hash() as u32,
+        "fixture: pair must collide on the u32 routing projection of origin_hash",
     );
     assert_ne!(
         ident_a.entity_id(),
@@ -830,7 +835,7 @@ async fn expect_migration_collision_is_rejected() {
         .expect("register");
     rt.start().await.expect("start");
 
-    let origin_hash = 0xDEAD_BEEFu32;
+    let origin_hash = 0xDEAD_BEEFu64;
     rt.expect_migration("echo", origin_hash, DaemonHostConfig::default())
         .expect("first expect_migration");
     let err = rt

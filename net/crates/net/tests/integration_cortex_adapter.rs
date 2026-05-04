@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use net::adapter::net::channel::ChannelName;
-use net::adapter::net::cortex::{CortexAdapter, CortexAdapterConfig, EventEnvelope, EventMeta};
+use net::adapter::net::cortex::{
+    CortexAdapter, CortexAdapterConfig, EventEnvelope, EventMeta, EVENT_META_SIZE,
+};
 use net::adapter::net::redex::{Redex, RedexError, RedexEvent, RedexFileConfig, RedexFold};
 
 fn cn(s: &str) -> ChannelName {
@@ -35,7 +37,7 @@ struct RecorderFold;
 
 impl RedexFold<RecorderState> for RecorderFold {
     fn apply(&mut self, ev: &RedexEvent, state: &mut RecorderState) -> Result<(), RedexError> {
-        let meta = EventMeta::from_bytes(&ev.payload[..20])
+        let meta = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
             .ok_or_else(|| RedexError::Encode("bad EventMeta".into()))?;
         state.seen.push((meta.dispatch, meta.seq_or_ts));
         Ok(())
@@ -233,9 +235,9 @@ struct TaskFold;
 
 impl RedexFold<TaskState> for TaskFold {
     fn apply(&mut self, ev: &RedexEvent, state: &mut TaskState) -> Result<(), RedexError> {
-        let meta = EventMeta::from_bytes(&ev.payload[..20])
+        let meta = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
             .ok_or_else(|| RedexError::Encode("bad EventMeta".into()))?;
-        let tail = &ev.payload[20..];
+        let tail = &ev.payload[EVENT_META_SIZE..];
         let id = meta.seq_or_ts;
         match meta.dispatch {
             DISPATCH_TASK_CREATED | DISPATCH_TASK_RENAMED => {

@@ -436,9 +436,9 @@ impl IdentityEnvelope {
     }
 
     /// Serialize to its fixed 209-byte wire layout. First byte is
-    /// [`IDENTITY_ENVELOPE_VERSION`] (audit #102). Producer always
-    /// stamps the current version; readers reject any other byte
-    /// via [`Self::from_bytes`].
+    /// [`IDENTITY_ENVELOPE_VERSION`]. Producer always stamps the
+    /// current version; readers reject any other byte via
+    /// [`Self::from_bytes`].
     pub fn to_bytes(&self) -> [u8; IDENTITY_ENVELOPE_SIZE] {
         let mut buf = [0u8; IDENTITY_ENVELOPE_SIZE];
         let mut cursor = &mut buf[..];

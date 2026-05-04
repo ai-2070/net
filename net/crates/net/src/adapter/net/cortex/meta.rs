@@ -27,7 +27,7 @@ pub const FLAG_CAUSAL: u8 = 0b0000_0001;
 /// Flag bit: this event carries a continuity proof.
 pub const FLAG_CONTINUITY_PROOF: u8 = 0b0000_0010;
 
-/// Fixed 20-byte prefix on every payload appended through the
+/// Fixed 24-byte prefix on every payload appended through the
 /// CortEX adapter.
 ///
 /// The in-memory layout is whatever the compiler chooses; the wire /
@@ -49,7 +49,7 @@ pub struct EventMeta {
     /// identity — orthogonal to the RedEX storage sequence.
     pub seq_or_ts: u64,
     /// xxh3 truncation of the type-specific tail (the bytes after
-    /// the 20-byte prefix in the RedEX payload).
+    /// the 24-byte prefix in the RedEX payload).
     pub checksum: u32,
 }
 
@@ -118,7 +118,7 @@ impl EventMeta {
 }
 
 /// Legacy tail-only checksum. The xxh3 hash of the payload bytes
-/// after the 20-byte `EventMeta` prefix, truncated to the low 32
+/// after the 24-byte `EventMeta` prefix, truncated to the low 32
 /// bits.
 ///
 /// **Use [`compute_checksum_with_meta`] for new writes.** This
@@ -164,7 +164,7 @@ pub fn compute_checksum(tail: &[u8]) -> u32 {
 }
 
 /// Corruption-detection checksum covering BOTH the
-/// 20-byte `EventMeta` header (with the `checksum` slot zeroed,
+/// 24-byte `EventMeta` header (with the `checksum` slot zeroed,
 /// since that's what the value being computed will go into) and
 /// the payload `tail`. Stamped into [`EventMeta::checksum`] at
 /// ingest by current writers.
@@ -206,8 +206,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_size_is_twenty() {
-        assert_eq!(EVENT_META_SIZE, 20);
+    fn test_size_is_twenty_four() {
+        assert_eq!(EVENT_META_SIZE, 24);
     }
 
     #[test]
@@ -220,7 +220,7 @@ mod tests {
             0xCAFE_BABE,
         );
         let bytes = m.to_bytes();
-        assert_eq!(bytes.len(), 20);
+        assert_eq!(bytes.len(), 24);
         let decoded = EventMeta::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, m);
         assert_eq!(decoded.dispatch, 0x42);
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_short_slice_returns_none() {
-        let buf = [0u8; 19];
+        let buf = [0u8; 23];
         assert!(EventMeta::from_bytes(&buf).is_none());
     }
 
@@ -281,10 +281,10 @@ mod tests {
     fn test_nonzero_pad_tolerated_on_read() {
         // Pad bytes must be zero on write, but garbage on read should
         // not corrupt other fields.
-        let mut bytes = [0u8; 20];
+        let mut bytes = [0u8; 24];
         bytes[2] = 0xAA;
         bytes[3] = 0xBB;
-        bytes[8..16].copy_from_slice(&0x1234_5678_9ABC_DEF0u64.to_le_bytes());
+        bytes[12..20].copy_from_slice(&0x1234_5678_9ABC_DEF0u64.to_le_bytes());
         let decoded = EventMeta::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.seq_or_ts, 0x1234_5678_9ABC_DEF0);
         // Pad is carried through verbatim — surface it for forensic

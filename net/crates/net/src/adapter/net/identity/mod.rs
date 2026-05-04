@@ -10,7 +10,9 @@ mod origin;
 mod token;
 
 pub use entity::{EntityError, EntityId, EntityKeypair};
-pub use envelope::{EnvelopeError, IdentityEnvelope, IDENTITY_ENVELOPE_SIZE};
+pub use envelope::{
+    EnvelopeError, IdentityEnvelope, IDENTITY_ENVELOPE_SIZE, IDENTITY_ENVELOPE_VERSION,
+};
 pub use origin::OriginStamp;
 pub use token::{
     PermissionToken, TokenCache, TokenError, TokenScope, MAX_TOKENS_PER_SLOT, MAX_TOKEN_SLOTS,

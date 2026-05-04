@@ -193,10 +193,10 @@ impl Identity {
         Buffer::from(self.keypair.entity_id().as_bytes().to_vec())
     }
 
-    /// Derived 32-bit origin hash used in packet headers.
+    /// Derived 64-bit origin hash used in packet headers.
     #[napi(getter)]
-    pub fn origin_hash(&self) -> u32 {
-        self.keypair.origin_hash()
+    pub fn origin_hash(&self) -> BigInt {
+        BigInt::from(self.keypair.origin_hash())
     }
 
     /// Derived 64-bit node id used for routing / addressing.

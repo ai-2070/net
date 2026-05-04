@@ -214,7 +214,7 @@ impl From<SdkGroupHealth> for GroupHealthJs {
 #[napi(object)]
 pub struct MemberInfoJs {
     pub index: u32,
-    pub origin_hash: u32,
+    pub origin_hash: BigInt,
     pub node_id: BigInt,
     pub entity_id: Buffer,
     pub healthy: bool,
@@ -224,7 +224,7 @@ impl From<&SdkMemberInfo> for MemberInfoJs {
     fn from(m: &SdkMemberInfo) -> Self {
         Self {
             index: m.index as u32,
-            origin_hash: m.origin_hash,
+            origin_hash: BigInt::from(m.origin_hash),
             node_id: BigInt::from(m.node_id),
             entity_id: Buffer::from(m.entity_id_bytes.to_vec()),
             healthy: m.healthy,
@@ -234,8 +234,8 @@ impl From<&SdkMemberInfo> for MemberInfoJs {
 
 #[napi(object)]
 pub struct ForkRecordJs {
-    pub original_origin: u32,
-    pub forked_origin: u32,
+    pub original_origin: BigInt,
+    pub forked_origin: BigInt,
     pub fork_seq: BigInt,
     pub from_snapshot_seq: Option<BigInt>,
 }
@@ -243,8 +243,8 @@ pub struct ForkRecordJs {
 impl From<&SdkForkRecord> for ForkRecordJs {
     fn from(r: &SdkForkRecord) -> Self {
         Self {
-            original_origin: r.original_origin,
-            forked_origin: r.forked_origin,
+            original_origin: BigInt::from(r.original_origin),
+            forked_origin: BigInt::from(r.forked_origin),
             fork_seq: BigInt::from(r.fork_seq),
             from_snapshot_seq: r.from_snapshot_seq.map(BigInt::from),
         }
@@ -347,7 +347,7 @@ pub(crate) async fn spawn_replica_group(
 pub(crate) async fn spawn_fork_group(
     runtime: SdkDaemonRuntime,
     kind: String,
-    parent_origin: u32,
+    parent_origin: u64,
     fork_seq: u64,
     config: ForkGroupConfigJs,
 ) -> Result<ForkGroup> {
@@ -408,9 +408,12 @@ impl ReplicaGroup {
     /// Resolve `ctx` to the best-available replica's `origin_hash`.
     /// Caller hands the returned hash to `runtime.deliver(...)`.
     #[napi]
-    pub fn route_event(&self, ctx: RequestContextJs) -> Result<u32> {
+    pub fn route_event(&self, ctx: RequestContextJs) -> Result<BigInt> {
         let rc: SdkRequestContext = ctx.into();
-        self.inner.route_event(&rc).map_err(group_err)
+        self.inner
+            .route_event(&rc)
+            .map(BigInt::from)
+            .map_err(group_err)
     }
 
     /// Resize the group to `n` replicas. The kind is fixed at
@@ -495,8 +498,11 @@ pub struct ForkGroup {
 #[napi]
 impl ForkGroup {
     #[napi]
-    pub fn route_event(&self, ctx: RequestContextJs) -> Result<u32> {
-        self.inner.route_event(&ctx.into()).map_err(group_err)
+    pub fn route_event(&self, ctx: RequestContextJs) -> Result<BigInt> {
+        self.inner
+            .route_event(&ctx.into())
+            .map(BigInt::from)
+            .map_err(group_err)
     }
 
     #[napi]
@@ -535,8 +541,8 @@ impl ForkGroup {
     }
 
     #[napi(getter)]
-    pub fn parent_origin(&self) -> u32 {
-        self.inner.parent_origin()
+    pub fn parent_origin(&self) -> BigInt {
+        BigInt::from(self.inner.parent_origin())
     }
 
     #[napi(getter)]
@@ -588,8 +594,8 @@ impl StandbyGroup {
     /// so every delivery is automatically captured in the replay
     /// buffer — no caller-side pairing required.
     #[napi(getter)]
-    pub fn active_origin(&self) -> u32 {
-        self.inner.active_origin()
+    pub fn active_origin(&self) -> BigInt {
+        BigInt::from(self.inner.active_origin())
     }
 
     #[napi]
@@ -616,9 +622,10 @@ impl StandbyGroup {
         // `daemon_bigint_u64` would leak through as plain `DaemonError`
         // and break the typed-error contract this class promises.
         let sequence = group_bigint_u64("event.sequence", event.sequence)?;
+        let event_origin = group_bigint_u64("event.originHash", event.origin_hash)?;
         let core_event = CausalEvent {
             link: CausalLink {
-                origin_hash: event.origin_hash,
+                origin_hash: event_origin,
                 horizon_encoded: 0,
                 sequence,
                 parent_hash: 0,
@@ -631,14 +638,22 @@ impl StandbyGroup {
     }
 
     #[napi]
-    pub async fn promote(&self) -> Result<u32> {
-        self.inner.clone().promote().map_err(group_err)
+    pub async fn promote(&self) -> Result<BigInt> {
+        self.inner
+            .clone()
+            .promote()
+            .map(BigInt::from)
+            .map_err(group_err)
     }
 
     #[napi]
-    pub async fn on_node_failure(&self, failed_node_id: BigInt) -> Result<Option<u32>> {
+    pub async fn on_node_failure(&self, failed_node_id: BigInt) -> Result<Option<BigInt>> {
         let node = group_bigint_u64("failedNodeId", failed_node_id)?;
-        self.inner.clone().on_node_failure(node).map_err(group_err)
+        self.inner
+            .clone()
+            .on_node_failure(node)
+            .map(|opt| opt.map(BigInt::from))
+            .map_err(group_err)
     }
 
     #[napi]

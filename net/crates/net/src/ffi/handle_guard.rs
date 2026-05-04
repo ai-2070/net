@@ -8,20 +8,20 @@
 //!
 //! 1. **Use-after-free on the inner.** `_free` does
 //!    `Box::from_raw(handle); drop(...)`; a concurrent op that already
-//!    dereferenced `&*handle` keeps reading freed memory. Audit #23
-//!    (cortex) and #24 (mesh) both fire on this shape.
+//!    dereferenced `&*handle` keeps reading freed memory.
 //!
 //! 2. **Use-after-free on the handle box itself.** Even with the
-//!    inner held alive via an `Arc<Inner>` clone (audit #25:
+//!    inner held alive via an `Arc<Inner>` clone (e.g.
 //!    `MeshStreamHandle._node` keeps the node alive but not the
 //!    handle box), a concurrent `_free` can deallocate the outer Box
 //!    while the op is still doing pointer-equality / handle-matching
 //!    checks via `&*handle`.
 //!
-//! [`HandleGuard`] is the shared building block. Each handle struct
-//! embeds one inline; every `extern "C"` op gates on
-//! [`HandleGuard::try_enter`]; every `_free` drives
-//! [`HandleGuard::begin_free`].
+//! [`crate::ffi::handle_guard::HandleGuard`] is the shared building
+//! block. Each handle struct embeds one inline; every `extern "C"` op
+//! gates on [`crate::ffi::handle_guard::HandleGuard::try_enter`];
+//! every `_free` drives
+//! [`crate::ffi::handle_guard::HandleGuard::begin_free`].
 //!
 //! ## Soundness: the box must outlive `try_enter`'s `fetch_add`
 //!

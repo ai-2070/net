@@ -9,10 +9,10 @@
  */
 export declare class DaemonHandle {
   /**
-   * 32-bit hash of the daemon's identity — the key used by the
+   * 64-bit hash of the daemon's identity — the key used by the
    * registry, factory registry, and migration dispatcher.
    */
-  get originHash(): number
+  get originHash(): bigint
   /**
    * Full 32-byte `EntityId` (ed25519 public key) of the
    * daemon's identity. Returned as a `Buffer` to match the
@@ -117,12 +117,12 @@ export declare class DaemonRuntime {
   /**
    * Stop a daemon, removing it from the runtime's registry.
    *
-   * `origin_hash` is the 32-bit identifier carried on
+   * `origin_hash` is the 64-bit identifier carried on
    * [`DaemonHandle`]. A second call for the same origin is a
    * no-op during `ShuttingDown` and an error otherwise; the
    * SDK's error is surfaced verbatim with the `daemon:` prefix.
    */
-  stop(originHash: number): Promise<void>
+  stop(originHash: bigint): Promise<void>
   /**
    * Take a snapshot of a running daemon by `origin_hash`.
    *
@@ -137,7 +137,7 @@ export declare class DaemonRuntime {
    * turn fires the JS `snapshot` TSFN stored at spawn time.
    * Same TSFN-blocking pattern as `deliver`.
    */
-  snapshot(originHash: number): Promise<Buffer | null>
+  snapshot(originHash: bigint): Promise<Buffer | null>
   /**
    * Spawn a daemon from a previously-taken `snapshot_bytes`
    * payload. The daemon instance is built from the
@@ -171,7 +171,7 @@ export declare class DaemonRuntime {
    * later stage, at which point this method becomes test
    * sugar rather than the primary entry point.
    */
-  deliver(originHash: number, event: CausalEventJs): Promise<Array<Buffer>>
+  deliver(originHash: bigint, event: CausalEventJs): Promise<Array<Buffer>>
   /**
    * Initiate a migration for the daemon identified by
    * `originHash`, moving it from `sourceNode` to `targetNode`.
@@ -190,14 +190,14 @@ export declare class DaemonRuntime {
    * migrations drive the state machine entirely via inbound
    * wire messages.
    */
-  startMigration(originHash: number, sourceNode: bigint, targetNode: bigint): Promise<MigrationHandle>
+  startMigration(originHash: bigint, sourceNode: bigint, targetNode: bigint): Promise<MigrationHandle>
   /**
    * `startMigration` with caller-supplied options. Use this to
    * opt out of identity transport (when the daemon doesn't need
    * to sign on the target) or to disable / shorten the
    * NotReady-retry budget.
    */
-  startMigrationWith(originHash: number, sourceNode: bigint, targetNode: bigint, opts: MigrationOptsJs): Promise<MigrationHandle>
+  startMigrationWith(originHash: bigint, sourceNode: bigint, targetNode: bigint, opts: MigrationOptsJs): Promise<MigrationHandle>
   /**
    * Declare on the target node that a migration will land here
    * for `origin_hash` of the given `kind`. Registers a
@@ -214,7 +214,7 @@ export declare class DaemonRuntime {
    * `transport_identity: true` (default); without the envelope
    * the dispatcher emits `IdentityTransportFailed`.
    */
-  expectMigration(kind: string, originHash: number, config?: DaemonHostConfigJs | undefined | null): void
+  expectMigration(kind: string, originHash: bigint, config?: DaemonHostConfigJs | undefined | null): void
   /**
    * Pre-register a target-side identity for a migration that
    * will NOT carry an identity envelope (e.g., the source used
@@ -237,7 +237,7 @@ export declare class DaemonRuntime {
    * Works on any node — source, target, or an observer that
    * heard the migration on the mesh.
    */
-  migrationPhase(originHash: number): string | null
+  migrationPhase(originHash: bigint): string | null
   /**
    * Spawn a `ReplicaGroup` of `config.replicaCount` members
    * using the factory registered under `kind`.
@@ -253,7 +253,7 @@ export declare class DaemonRuntime {
    * `forkSeq`. Same deadlock-avoidance argument as
    * `spawnReplicaGroup`.
    */
-  spawnForkGroup(kind: string, parentOrigin: number, forkSeq: bigint, config: ForkGroupConfigJs): Promise<ForkGroup>
+  spawnForkGroup(kind: string, parentOrigin: bigint, forkSeq: bigint, config: ForkGroupConfigJs): Promise<ForkGroup>
   /**
    * Spawn a `StandbyGroup`. Same deadlock-avoidance argument
    * as `spawnReplicaGroup`.
@@ -262,12 +262,12 @@ export declare class DaemonRuntime {
 }
 
 export declare class ForkGroup {
-  routeEvent(ctx: RequestContextJs): number
+  routeEvent(ctx: RequestContextJs): bigint
   scaleTo(n: number): Promise<void>
   onNodeFailure(failedNodeId: bigint): Promise<Array<number>>
   onNodeRecovery(recoveredNodeId: bigint): void
   get health(): GroupHealthJs
-  get parentOrigin(): number
+  get parentOrigin(): bigint
   get forkSeq(): bigint
   get forkRecords(): Array<ForkRecordJs>
   verifyLineage(): boolean
@@ -304,8 +304,8 @@ export declare class Identity {
   toBytes(): Buffer
   /** Ed25519 public key. 32 bytes. */
   get entityId(): Buffer
-  /** Derived 32-bit origin hash used in packet headers. */
-  get originHash(): number
+  /** Derived 64-bit origin hash used in packet headers. */
+  get originHash(): bigint
   /** Derived 64-bit node id used for routing / addressing. */
   get nodeId(): bigint
   /** Sign arbitrary bytes. Returns 64 bytes (ed25519 signature). */
@@ -342,9 +342,9 @@ export declare class MemoriesAdapter {
    * Open the memories adapter against a Redex manager. See
    * [`TasksAdapter::open`] for `persistent` semantics.
    */
-  static open(redex: Redex, originHash: number, persistent?: boolean | undefined | null): Promise<MemoriesAdapter>
+  static open(redex: Redex, originHash: bigint, persistent?: boolean | undefined | null): Promise<MemoriesAdapter>
   /** Open from a snapshot captured via [`Self::snapshot`]. */
-  static openFromSnapshot(redex: Redex, originHash: number, stateBytes: Buffer, lastSeq?: bigint | undefined | null, persistent?: boolean | undefined | null): Promise<MemoriesAdapter>
+  static openFromSnapshot(redex: Redex, originHash: bigint, stateBytes: Buffer, lastSeq?: bigint | undefined | null, persistent?: boolean | undefined | null): Promise<MemoriesAdapter>
   /**
    * Capture a state snapshot for restore via
    * [`Self::open_from_snapshot`].
@@ -417,8 +417,8 @@ export declare class MemoryWatchIter {
  * Callers who want to observe or abort must hold onto the handle.
  */
 export declare class MigrationHandle {
-  /** 32-bit origin hash of the daemon being migrated. */
-  get originHash(): number
+  /** 64-bit origin hash of the daemon being migrated. */
+  get originHash(): bigint
   /**
    * Node ID of the source (currently hosting) node. BigInt to
    * match the u64 hash without precision loss.
@@ -912,50 +912,12 @@ export declare class RedexTailIter {
   close(): void
 }
 
-/**
- * Consumer-side dedup helper for the Redis Streams adapter.
- *
- * See `net::adapter::redis` module docs for the producer-side
- * contract that produces the `dedup_id` field this helper
- * filters on.
- */
-export declare class RedisStreamDedup {
-  /**
-   * Create a helper with the given LRU capacity. Defaults to
-   * 4096 if omitted. `0` is clamped to 1.
-   *
-   * Sizing: a consumer at ~10k events/sec with a 1 min
-   * dedup window should pick ~600k.
-   */
-  constructor(capacity?: number | undefined | null)
-  /**
-   * Test-and-insert: returns `true` if the caller should treat
-   * the entry as a DUPLICATE (skip it), `false` if it's the
-   * first time we've seen this `dedupId`.
-   *
-   * Matches the Rust `is_duplicate(&mut self, &str) -> bool`.
-   */
-  isDuplicate(dedupId: string): boolean
-  /** Number of distinct ids currently tracked. */
-  get len(): number
-  /** Configured maximum capacity. */
-  get capacity(): number
-  /** True if no ids are tracked yet. */
-  get isEmpty(): boolean
-  /**
-   * Clear all tracked ids. Use after a consumer-group
-   * rebalance to reset the dedup window without losing the
-   * helper instance.
-   */
-  clear(): void
-}
-
 export declare class ReplicaGroup {
   /**
    * Resolve `ctx` to the best-available replica's `origin_hash`.
    * Caller hands the returned hash to `runtime.deliver(...)`.
    */
-  routeEvent(ctx: RequestContextJs): number
+  routeEvent(ctx: RequestContextJs): bigint
   /**
    * Resize the group to `n` replicas. The kind is fixed at
    * spawn time — no external `kind` parameter is accepted so
@@ -992,7 +954,7 @@ export declare class StandbyGroup {
    * so every delivery is automatically captured in the replay
    * buffer — no caller-side pairing required.
    */
-  get activeOrigin(): number
+  get activeOrigin(): bigint
   syncStandbys(): Promise<bigint>
   /**
    * **Test-only.** Manually push an event into the replay
@@ -1005,8 +967,8 @@ export declare class StandbyGroup {
    * stable public API.
    */
   onEventDelivered(event: CausalEventJs): void
-  promote(): Promise<number>
-  onNodeFailure(failedNodeId: bigint): Promise<number | null>
+  promote(): Promise<bigint>
+  onNodeFailure(failedNodeId: bigint): Promise<bigint | null>
   onNodeRecovery(recoveredNodeId: bigint): void
   get health(): GroupHealthJs
   get activeHealthy(): boolean
@@ -1050,12 +1012,12 @@ export declare class TasksAdapter {
    * active — the underlying `CortexAdapter::open` spawns the
    * fold task via `tokio::spawn` and needs a live reactor.
    */
-  static open(redex: Redex, originHash: number, persistent?: boolean | undefined | null): Promise<TasksAdapter>
+  static open(redex: Redex, originHash: bigint, persistent?: boolean | undefined | null): Promise<TasksAdapter>
   /**
    * Open from a snapshot captured via [`Self::snapshot`]. Skips
    * replay of events `[0, lastSeq]` on the underlying file.
    */
-  static openFromSnapshot(redex: Redex, originHash: number, stateBytes: Buffer, lastSeq?: bigint | undefined | null, persistent?: boolean | undefined | null): Promise<TasksAdapter>
+  static openFromSnapshot(redex: Redex, originHash: bigint, stateBytes: Buffer, lastSeq?: bigint | undefined | null, persistent?: boolean | undefined | null): Promise<TasksAdapter>
   /**
    * Capture a state snapshot. Persist both fields together; restore
    * via [`Self::open_from_snapshot`].
@@ -1204,8 +1166,8 @@ export interface CapabilitySetJs {
  * truncate.
  */
 export interface CausalEventJs {
-  /** 32-bit hash of the emitting entity. */
-  originHash: number
+  /** 64-bit hash of the emitting entity. */
+  originHash: bigint
   /** Sequence number in the emitter's causal chain. */
   sequence: bigint
   /**
@@ -1352,8 +1314,8 @@ export interface ForkGroupConfigJs {
 }
 
 export interface ForkRecordJs {
-  originalOrigin: number
-  forkedOrigin: number
+  originalOrigin: bigint
+  forkedOrigin: bigint
   forkSeq: bigint
   fromSnapshotSeq?: bigint
 }
@@ -1455,7 +1417,7 @@ export interface JetStreamOptions {
 
 export interface MemberInfoJs {
   index: number
-  originHash: number
+  originHash: bigint
   nodeId: bigint
   entityId: Buffer
   healthy: boolean
@@ -1641,7 +1603,7 @@ export interface NetDbOpenConfig {
    */
   persistentDir?: string
   /** Producer origin hash stamped on every `EventMeta`. */
-  originHash: number
+  originHash: bigint
   /**
    * Open enabled adapters with `persistent: true`. Requires
    * `persistentDir`.

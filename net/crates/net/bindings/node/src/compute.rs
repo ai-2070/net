@@ -582,14 +582,15 @@ impl DaemonRuntime {
 
     /// Stop a daemon, removing it from the runtime's registry.
     ///
-    /// `origin_hash` is the 32-bit identifier carried on
+    /// `origin_hash` is the 64-bit identifier carried on
     /// [`DaemonHandle`]. A second call for the same origin is a
     /// no-op during `ShuttingDown` and an error otherwise; the
     /// SDK's error is surfaced verbatim with the `daemon:` prefix.
     #[napi]
-    pub async fn stop(&self, origin_hash: u32) -> Result<()> {
+    pub async fn stop(&self, origin_hash: BigInt) -> Result<()> {
+        let origin = daemon_bigint_u64("originHash", origin_hash)?;
         self.inner
-            .stop(origin_hash)
+            .stop(origin)
             .await
             .map_err(|e| daemon_err(e.to_string()))
     }
@@ -607,10 +608,11 @@ impl DaemonRuntime {
     /// turn fires the JS `snapshot` TSFN stored at spawn time.
     /// Same TSFN-blocking pattern as `deliver`.
     #[napi]
-    pub async fn snapshot(&self, origin_hash: u32) -> Result<Option<Buffer>> {
+    pub async fn snapshot(&self, origin_hash: BigInt) -> Result<Option<Buffer>> {
+        let origin = daemon_bigint_u64("originHash", origin_hash)?;
         let snap = self
             .inner
-            .snapshot(origin_hash)
+            .snapshot(origin)
             .await
             .map_err(|e| daemon_err(e.to_string()))?;
         Ok(snap.map(|s| Buffer::from(s.to_bytes())))
@@ -728,14 +730,16 @@ impl DaemonRuntime {
     /// later stage, at which point this method becomes test
     /// sugar rather than the primary entry point.
     #[napi]
-    pub async fn deliver(&self, origin_hash: u32, event: CausalEventJs) -> Result<Vec<Buffer>> {
+    pub async fn deliver(&self, origin_hash: BigInt, event: CausalEventJs) -> Result<Vec<Buffer>> {
         use bytes::Bytes as BytesType;
         use net::adapter::net::state::causal::CausalLink;
 
+        let origin = daemon_bigint_u64("originHash", origin_hash)?;
+        let event_origin = daemon_bigint_u64("event.originHash", event.origin_hash)?;
         let sequence = daemon_bigint_u64("event.sequence", event.sequence)?;
         let core_event = CausalEvent {
             link: CausalLink {
-                origin_hash: event.origin_hash,
+                origin_hash: event_origin,
                 horizon_encoded: 0,
                 sequence,
                 parent_hash: 0,
@@ -752,7 +756,7 @@ impl DaemonRuntime {
         // return just the payload buffers.
         let outputs = self
             .inner
-            .deliver(origin_hash, &core_event)
+            .deliver(origin, &core_event)
             .map_err(|e| daemon_err(e.to_string()))?;
 
         Ok(outputs
@@ -780,15 +784,16 @@ impl DaemonRuntime {
     #[napi]
     pub async fn start_migration(
         &self,
-        origin_hash: u32,
+        origin_hash: BigInt,
         source_node: BigInt,
         target_node: BigInt,
     ) -> Result<MigrationHandle> {
+        let origin = daemon_bigint_u64("originHash", origin_hash)?;
         let source = daemon_bigint_u64("sourceNode", source_node)?;
         let target = daemon_bigint_u64("targetNode", target_node)?;
         let handle = self
             .inner
-            .start_migration(origin_hash, source, target)
+            .start_migration(origin, source, target)
             .await
             .map_err(daemon_err_from_sdk)?;
         Ok(MigrationHandle::from_sdk(handle))
@@ -801,17 +806,18 @@ impl DaemonRuntime {
     #[napi]
     pub async fn start_migration_with(
         &self,
-        origin_hash: u32,
+        origin_hash: BigInt,
         source_node: BigInt,
         target_node: BigInt,
         opts: MigrationOptsJs,
     ) -> Result<MigrationHandle> {
+        let origin = daemon_bigint_u64("originHash", origin_hash)?;
         let source = daemon_bigint_u64("sourceNode", source_node)?;
         let target = daemon_bigint_u64("targetNode", target_node)?;
         let core_opts = opts.into_core()?;
         let handle = self
             .inner
-            .start_migration_with(origin_hash, source, target, core_opts)
+            .start_migration_with(origin, source, target, core_opts)
             .await
             .map_err(daemon_err_from_sdk)?;
         Ok(MigrationHandle::from_sdk(handle))
@@ -835,15 +841,16 @@ impl DaemonRuntime {
     pub fn expect_migration(
         &self,
         kind: String,
-        origin_hash: u32,
+        origin_hash: BigInt,
         config: Option<DaemonHostConfigJs>,
     ) -> Result<()> {
+        let origin = daemon_bigint_u64("originHash", origin_hash)?;
         let sdk_config = match config {
             Some(c) => c.into_core()?,
             None => DaemonHostConfig::default(),
         };
         self.inner
-            .expect_migration(&kind, origin_hash, sdk_config)
+            .expect_migration(&kind, origin, sdk_config)
             .map_err(|e| daemon_err(e.to_string()))
     }
 
@@ -882,10 +889,9 @@ impl DaemonRuntime {
     /// Works on any node — source, target, or an observer that
     /// heard the migration on the mesh.
     #[napi]
-    pub fn migration_phase(&self, origin_hash: u32) -> Option<String> {
-        self.inner
-            .migration_phase(origin_hash)
-            .map(migration_phase_str)
+    pub fn migration_phase(&self, origin_hash: BigInt) -> Option<String> {
+        let origin = daemon_bigint_u64("originHash", origin_hash).ok()?;
+        self.inner.migration_phase(origin).map(migration_phase_str)
     }
 }
 
@@ -925,19 +931,13 @@ impl DaemonRuntime {
     pub async fn spawn_fork_group(
         &self,
         kind: String,
-        parent_origin: u32,
+        parent_origin: BigInt,
         fork_seq: BigInt,
         config: crate::groups::ForkGroupConfigJs,
     ) -> Result<crate::groups::ForkGroup> {
+        let parent = daemon_bigint_u64("parentOrigin", parent_origin)?;
         let seq = daemon_bigint_u64("forkSeq", fork_seq)?;
-        crate::groups::spawn_fork_group(
-            self.sdk_runtime().clone(),
-            kind,
-            parent_origin,
-            seq,
-            config,
-        )
-        .await
+        crate::groups::spawn_fork_group(self.sdk_runtime().clone(), kind, parent, seq, config).await
     }
 
     /// Spawn a `StandbyGroup`. Same deadlock-avoidance argument
@@ -1009,7 +1009,7 @@ impl MigrationOptsJs {
 /// Callers who want to observe or abort must hold onto the handle.
 #[napi]
 pub struct MigrationHandle {
-    origin_hash: u32,
+    origin_hash: u64,
     source_node: u64,
     target_node: u64,
     inner: SdkMigrationHandle,
@@ -1028,10 +1028,10 @@ impl MigrationHandle {
 
 #[napi]
 impl MigrationHandle {
-    /// 32-bit origin hash of the daemon being migrated.
+    /// 64-bit origin hash of the daemon being migrated.
     #[napi(getter)]
-    pub fn origin_hash(&self) -> u32 {
-        self.origin_hash
+    pub fn origin_hash(&self) -> BigInt {
+        BigInt::from(self.origin_hash)
     }
 
     /// Node ID of the source (currently hosting) node. BigInt to
@@ -1120,8 +1120,8 @@ fn migration_phase_str(phase: CoreMigrationPhase) -> String {
 /// truncate.
 #[napi(object)]
 pub struct CausalEventJs {
-    /// 32-bit hash of the emitting entity.
-    pub origin_hash: u32,
+    /// 64-bit hash of the emitting entity.
+    pub origin_hash: BigInt,
     /// Sequence number in the emitter's causal chain.
     pub sequence: BigInt,
     /// Opaque payload bytes — identical to `event.payload` on the
@@ -1132,7 +1132,7 @@ pub struct CausalEventJs {
 impl From<&CausalEvent> for CausalEventJs {
     fn from(event: &CausalEvent) -> Self {
         Self {
-            origin_hash: event.link.origin_hash,
+            origin_hash: BigInt::from(event.link.origin_hash),
             sequence: BigInt::from(event.link.sequence),
             payload: Buffer::from(event.payload.as_ref()),
         }
@@ -1198,7 +1198,7 @@ impl DaemonHostConfigJs {
 /// [`DaemonRuntime::stop`] the origin.
 #[napi]
 pub struct DaemonHandle {
-    origin_hash: u32,
+    origin_hash: u64,
     entity_id: [u8; 32],
     inner: SdkDaemonHandle,
 }
@@ -1217,11 +1217,11 @@ impl DaemonHandle {
 
 #[napi]
 impl DaemonHandle {
-    /// 32-bit hash of the daemon's identity — the key used by the
+    /// 64-bit hash of the daemon's identity — the key used by the
     /// registry, factory registry, and migration dispatcher.
     #[napi(getter)]
-    pub fn origin_hash(&self) -> u32 {
-        self.origin_hash
+    pub fn origin_hash(&self) -> BigInt {
+        BigInt::from(self.origin_hash)
     }
 
     /// Full 32-byte `EntityId` (ed25519 public key) of the
