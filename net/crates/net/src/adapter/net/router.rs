@@ -608,7 +608,35 @@ impl NetRouter {
                 if let Some(packet) = scheduler.dequeue() {
                     let _ = socket.send_to(&packet.data, packet.dest).await;
                 } else {
-                    // Wait for new packets (with timeout)
+                    // Wait for new packets (with timeout).
+                    //
+                    // Audit #128 disposition: the `notify_one` →
+                    // `wait()` pattern is sound — `tokio::sync::Notify`
+                    // stores a permit when `notify_one` is called
+                    // with no waiter, and the next `notified().await`
+                    // consumes it immediately. So an enqueue that
+                    // races our `dequeue() → None` transition is
+                    // observed on the next loop iteration regardless
+                    // of which side won the race; no notify is lost.
+                    //
+                    // The 1ms polling fallback is **defensive
+                    // paranoia**, not load-bearing for correctness:
+                    // it bounds the worst-case wakeup latency under
+                    // any future refactor that accidentally breaks
+                    // the permit-stash invariant. It also catches
+                    // the edge case where a `select!` branch fires
+                    // while `notified()` is still in its
+                    // pre-sleep registration window, dropping the
+                    // notified future without consuming the permit.
+                    // Cost: at most one wakeup per millisecond on
+                    // an idle router; negligible.
+                    //
+                    // The audit suggested `Notify::notify_waiters`
+                    // — that's wrong for this site: `notify_waiters`
+                    // does NOT store a permit when no one is
+                    // waiting, so it would re-introduce the genuine
+                    // lost-wakeup case the permit-stash semantics
+                    // close.
                     tokio::select! {
                         _ = scheduler.wait() => {}
                         _ = tokio::time::sleep(Duration::from_millis(1)) => {}

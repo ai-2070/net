@@ -329,6 +329,34 @@ impl Adapter for RedisAdapter {
             "Redis adapter initialized"
         );
 
+        // Audit #81 surfacing: every XADD this adapter emits carries
+        // a `dedup_id` field stable across producer retries (see the
+        // module docs). Consumers that ignore the field will see
+        // duplicates on any timeout-cancellation or pipeline-retry
+        // event — the producer side cannot prevent this because
+        // bytes already on the wire survive the local future
+        // cancellation. Emit a one-time-per-process warn pointing
+        // at the consumer-side helper so deployments running the
+        // adapter without `RedisStreamDedup` (or an equivalent
+        // dedup pass) at least surface the contract.
+        //
+        // The warn fires once per process even if multiple Redis
+        // adapters are instantiated — once a deployment knows the
+        // contract, repeating the warn is just log noise.
+        static DEDUP_WARN_FIRED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !DEDUP_WARN_FIRED.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                adapter = "redis",
+                helper = "net_sdk::RedisStreamDedup",
+                "Redis adapter emits a `dedup_id` field on every XADD that is \
+                 stable across producer retries. Consumers MUST filter on this \
+                 field (e.g. via `net_sdk::RedisStreamDedup`) or accept \
+                 at-least-once delivery with retry duplicates. See the \
+                 `adapter::redis` module docs for the full contract."
+            );
+        }
+
         Ok(())
     }
 
