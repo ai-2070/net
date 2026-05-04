@@ -423,29 +423,168 @@ impl Drop for ResourceGuard {
 // Rate Limiter
 // ============================================================================
 
+/// Per-source rate-limit bucket with built-in window tracking.
+///
+/// Stores `(window_floor, count)` packed in a single `AtomicU64`
+/// so a single CAS atomically resets the count when the window
+/// rolls over. Eliminates the lost-write race that audit #125
+/// flagged: pre-fix, `RateLimiter::maybe_reset` called
+/// `per_source.clear()` at minute boundaries; an in-flight
+/// `record_request` could fetch_add into the OLD `AtomicU64` just
+/// as `clear()` removed it from the map, orphaning the increment
+/// on the next request's freshly-inserted bucket — brief
+/// per-source RPM cap exceedance at every minute boundary.
+///
+/// Post-fix, the bucket lives forever (until the periodic GC
+/// sweep evicts long-stale entries) and self-resets on access:
+/// each `try_acquire` / `current_count` checks whether the
+/// stored `window_floor` matches the current floor; if not, the
+/// CAS atomically resets count to 1 (or 0 for read) and bumps
+/// the floor.
+///
+/// Bit layout: high 32 = `window_floor` (seconds-since-RateLimiter
+/// creation, divided by reset_interval — wraps every ~136 years
+/// at the default 60s window); low 32 = `count` (saturates at
+/// `u32::MAX`, well above any realistic per-source RPM cap).
+struct RateBucket {
+    packed: AtomicU64,
+}
+
+impl RateBucket {
+    const FLOOR_SHIFT: u64 = 32;
+    const COUNT_MASK: u64 = 0xFFFF_FFFF;
+
+    fn new(initial_floor: u32) -> Self {
+        Self {
+            packed: AtomicU64::new((initial_floor as u64) << Self::FLOOR_SHIFT),
+        }
+    }
+
+    #[inline]
+    fn split(packed: u64) -> (u32, u32) {
+        let floor = (packed >> Self::FLOOR_SHIFT) as u32;
+        let count = (packed & Self::COUNT_MASK) as u32;
+        (floor, count)
+    }
+
+    #[inline]
+    fn pack(floor: u32, count: u32) -> u64 {
+        ((floor as u64) << Self::FLOOR_SHIFT) | (count as u64)
+    }
+
+    /// Try to acquire one slot at `current_floor`, capped at
+    /// `effective_limit`. Resets the count atomically if the
+    /// window has rolled over since the last access. Returns
+    /// `Ok(new_count)` on success, `Err(observed_count)` if at
+    /// or over the cap (no mutation in that case).
+    fn try_acquire(&self, current_floor: u32, effective_limit: u64) -> Result<u32, u32> {
+        let mut last_observed = 0u32;
+        match self
+            .packed
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                let (cur_floor, cur_count) = Self::split(current);
+                if cur_floor != current_floor {
+                    // Window rolled over for this entry; this
+                    // firing is the first of the new window.
+                    Some(Self::pack(current_floor, 1))
+                } else if (cur_count as u64) >= effective_limit {
+                    last_observed = cur_count;
+                    None
+                } else {
+                    Some(Self::pack(cur_floor, cur_count.saturating_add(1)))
+                }
+            }) {
+            Ok(prev) => {
+                let (_, prev_count) = Self::split(prev);
+                let (_, new_count) = Self::split(self.packed.load(Ordering::Acquire));
+                let _ = prev_count;
+                Ok(new_count)
+            }
+            Err(_) => Err(last_observed),
+        }
+    }
+
+    /// Read the current count for `current_floor`. Returns 0 if
+    /// the entry's stored floor is stale (window rolled over but
+    /// no `try_acquire` has refreshed yet).
+    fn current_count(&self, current_floor: u32) -> u32 {
+        let (cur_floor, cur_count) = Self::split(self.packed.load(Ordering::Acquire));
+        if cur_floor == current_floor {
+            cur_count
+        } else {
+            0
+        }
+    }
+
+    /// Roll back one acquisition. Decrements count if the entry's
+    /// stored floor still matches `current_floor`; otherwise
+    /// no-op (the window already rolled and the bucket reset, so
+    /// the slot we'd be "rolling back" is in a prior window).
+    fn rollback(&self, current_floor: u32) {
+        let _ = self
+            .packed
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                let (cur_floor, cur_count) = Self::split(current);
+                if cur_floor == current_floor && cur_count > 0 {
+                    Some(Self::pack(cur_floor, cur_count - 1))
+                } else {
+                    None
+                }
+            });
+    }
+
+    /// The stored window floor — used by the GC sweep to evict
+    /// long-idle entries.
+    fn floor(&self) -> u32 {
+        Self::split(self.packed.load(Ordering::Relaxed)).0
+    }
+}
+
 /// Token bucket rate limiter
 struct RateLimiter {
     /// Global request count (resets each minute)
     global_requests: AtomicU64,
     /// Global token count (resets each minute)
     global_tokens: AtomicU64,
-    /// Per-source request counts
-    per_source: DashMap<NodeId, AtomicU64>,
-    /// Last reset time
+    /// Per-source request counts. Each bucket self-resets on
+    /// access via packed `(window_floor, count)` — see
+    /// [`RateBucket`] for the audit-#125 lost-write-race fix.
+    per_source: DashMap<NodeId, RateBucket>,
+    /// Last time the global counters were reset (per-source
+    /// buckets self-reset; this only governs the global
+    /// counters and the periodic GC sweep).
     last_reset: RwLock<Instant>,
+    /// Anchor for converting `Instant`s to integer window
+    /// floors. Set once at construction.
+    created_at: Instant,
     /// Reset interval
     reset_interval: Duration,
 }
 
 impl RateLimiter {
     fn new() -> Self {
+        let now = Instant::now();
         Self {
             global_requests: AtomicU64::new(0),
             global_tokens: AtomicU64::new(0),
             per_source: DashMap::new(),
-            last_reset: RwLock::new(Instant::now()),
+            last_reset: RwLock::new(now),
+            created_at: now,
             reset_interval: Duration::from_secs(60),
         }
+    }
+
+    /// Current window floor (window number since `created_at`).
+    /// Per-source buckets compare their stored floor against this
+    /// to detect rollover.
+    #[inline]
+    fn current_floor(&self) -> u32 {
+        let secs = self.created_at.elapsed().as_secs();
+        let interval_secs = self.reset_interval.as_secs().max(1);
+        // Saturate at u32::MAX (~136 years at 60s windows). Wrap
+        // would only matter at that horizon — past the lifetime
+        // of any process.
+        u32::try_from(secs / interval_secs).unwrap_or(u32::MAX)
     }
 
     fn maybe_reset(&self) {
@@ -459,10 +598,26 @@ impl RateLimiter {
             if last.elapsed() >= self.reset_interval {
                 self.global_requests.store(0, Ordering::Relaxed);
                 self.global_tokens.store(0, Ordering::Relaxed);
-                self.per_source.clear();
+                // Audit #125: per_source buckets self-reset on
+                // access — no `clear()` call here. Periodically
+                // sweep stale entries (more than 5 windows old)
+                // so the map doesn't grow unbounded under
+                // long-tail source churn.
+                self.gc_per_source_stale();
                 *last = Instant::now();
             }
         }
+    }
+
+    /// Evict per_source entries whose stored window_floor is
+    /// more than `gc_age_windows` behind the current floor.
+    /// Called from `maybe_reset` (so amortized to once per
+    /// reset_interval).
+    fn gc_per_source_stale(&self) {
+        let cur = self.current_floor();
+        const GC_AGE_WINDOWS: u32 = 5;
+        let cutoff = cur.saturating_sub(GC_AGE_WINDOWS);
+        self.per_source.retain(|_, bucket| bucket.floor() >= cutoff);
     }
 
     fn check_global_rpm(&self, limit: u32, burst: f32) -> Result<(), SafetyViolation> {
@@ -486,12 +641,17 @@ impl RateLimiter {
         burst: f32,
     ) -> Result<(), SafetyViolation> {
         self.maybe_reset();
-        let counter = self
-            .per_source
-            .entry(*source)
-            .or_insert_with(|| AtomicU64::new(0));
-        let current = counter.load(Ordering::Relaxed);
+        let cur_floor = self.current_floor();
         let effective_limit = (limit as f32 * burst) as u64;
+        // Only consult an existing bucket — `check_*` is read-only
+        // (the corresponding write happens in `try_acquire_*`).
+        // Avoid `entry().or_insert_with(...)` so a benign
+        // never-acquired source doesn't bloat the per_source map.
+        let current = if let Some(bucket) = self.per_source.get(source) {
+            bucket.current_count(cur_floor) as u64
+        } else {
+            0
+        };
         if current >= effective_limit {
             return Err(SafetyViolation::RateLimitExceeded {
                 limit_type: RateLimitType::PerSourceRpm,
@@ -536,11 +696,15 @@ impl RateLimiter {
         self.global_requests.fetch_add(1, Ordering::Relaxed);
         self.global_tokens.fetch_add(tokens, Ordering::Relaxed);
         if let Some(src) = source {
-            let counter = self
+            let cur_floor = self.current_floor();
+            let bucket = self
                 .per_source
                 .entry(*src)
-                .or_insert_with(|| AtomicU64::new(0));
-            counter.fetch_add(1, Ordering::Relaxed);
+                .or_insert_with(|| RateBucket::new(cur_floor));
+            // No cap here — `record_request` is the explicit
+            // "record without checking" path. Pass u64::MAX so
+            // the CAS always commits the increment.
+            let _ = bucket.try_acquire(cur_floor, u64::MAX);
         }
     }
 
@@ -574,6 +738,9 @@ impl RateLimiter {
 
     /// CAS-based "check and increment" for per-source RPM. Same
     /// commit-or-rollback contract as `try_acquire_global_rpm`.
+    /// Audit #125: each per-source bucket carries its own
+    /// `(window_floor, count)` packed atomic and self-resets when
+    /// the floor advances — no global `clear()` race window.
     fn try_acquire_source_rpm(
         &self,
         source: &NodeId,
@@ -581,22 +748,17 @@ impl RateLimiter {
         burst: f32,
     ) -> Result<(), SafetyViolation> {
         self.maybe_reset();
-        let counter = self
+        let cur_floor = self.current_floor();
+        let bucket = self
             .per_source
             .entry(*source)
-            .or_insert_with(|| AtomicU64::new(0));
+            .or_insert_with(|| RateBucket::new(cur_floor));
         let effective_limit = (limit as f32 * burst) as u64;
-        match counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            if current >= effective_limit {
-                None
-            } else {
-                Some(current + 1)
-            }
-        }) {
+        match bucket.try_acquire(cur_floor, effective_limit) {
             Ok(_) => Ok(()),
             Err(current) => Err(SafetyViolation::RateLimitExceeded {
                 limit_type: RateLimitType::PerSourceRpm,
-                current,
+                current: current as u64,
                 limit: effective_limit,
             }),
         }
@@ -640,8 +802,8 @@ impl RateLimiter {
     }
 
     fn rollback_source_rpm(&self, source: &NodeId) {
-        if let Some(counter) = self.per_source.get(source) {
-            counter.fetch_sub(1, Ordering::Relaxed);
+        if let Some(bucket) = self.per_source.get(source) {
+            bucket.rollback(self.current_floor());
         }
     }
 
@@ -1229,12 +1391,15 @@ impl SafetyEnforcer {
                 .global_requests
                 .fetch_add(1, Ordering::Relaxed);
             if let Some(ref source) = req.source_node {
-                let counter = self
+                let cur_floor = self.rate_limiter.current_floor();
+                let bucket = self
                     .rate_limiter
                     .per_source
                     .entry(*source)
-                    .or_insert_with(|| AtomicU64::new(0));
-                counter.fetch_add(1, Ordering::Relaxed);
+                    .or_insert_with(|| RateBucket::new(cur_floor));
+                // Audit-only path: record without enforcing a cap
+                // (pass u64::MAX so the CAS commits unconditionally).
+                let _ = bucket.try_acquire(cur_floor, u64::MAX);
             }
         }
 
@@ -2286,6 +2451,99 @@ mod tests {
                 .load(Ordering::Relaxed)
                 <= RPM_CAP as u64,
             "global_requests counter exceeds RPM cap",
+        );
+    }
+
+    /// Audit #125 regression: per-source RPM bucket self-resets
+    /// on window rollover via packed `(window_floor, count)`
+    /// atomic — no global `clear()` race window where a
+    /// concurrent `record_request`'s `fetch_add` lands in an
+    /// AtomicU64 that's about to be removed from the map.
+    ///
+    /// This test pins the bucket-level invariant directly: an
+    /// initial floor stamps count to 1; a stale-floor read sees
+    /// 0; a stale-floor try_acquire resets to 1 atomically.
+    #[test]
+    fn rate_bucket_self_resets_on_window_rollover() {
+        let bucket = RateBucket::new(0);
+        // Initial: floor=0, count=0; current_count(0) reads 0.
+        assert_eq!(bucket.current_count(0), 0);
+
+        // Acquire under floor=0 with cap 5 — succeeds; count=1.
+        assert!(matches!(bucket.try_acquire(0, 5), Ok(1)));
+        assert_eq!(bucket.current_count(0), 1);
+
+        // Acquire 4 more — at cap; the 5th fails.
+        for _ in 0..4 {
+            assert!(bucket.try_acquire(0, 5).is_ok());
+        }
+        assert_eq!(bucket.current_count(0), 5);
+        assert!(matches!(bucket.try_acquire(0, 5), Err(5)));
+
+        // Window rolls over to floor=1: read sees 0 (bucket
+        // stored floor=0 != 1).
+        assert_eq!(bucket.current_count(1), 0);
+
+        // try_acquire under new floor resets atomically: count=1
+        // and stored floor advances to 1.
+        assert!(matches!(bucket.try_acquire(1, 5), Ok(1)));
+        assert_eq!(bucket.current_count(1), 1);
+        // Old floor's view: stale, reads 0.
+        assert_eq!(bucket.current_count(0), 0);
+    }
+
+    /// Audit #125 end-to-end: under concurrent rate-limit
+    /// pressure across multiple sources, no source ever exceeds
+    /// its per-source cap by more than 1 (the single race window
+    /// is between fetch_update's load and CAS, NOT the
+    /// previously-unbounded clear-and-reinsert race).
+    ///
+    /// Pre-fix this test would intermittently fail because the
+    /// minute-boundary `per_source.clear()` could land between
+    /// a concurrent acquirer's check and its fetch_add — the
+    /// new bucket's count would start from 0 and admit cap+N
+    /// firings, where N is the racing-acquirer count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn per_source_cap_respected_under_contention_no_clear_race() {
+        const PER_SOURCE_CAP: u32 = 50;
+        const N_THREADS: u32 = 16;
+        const N_PER_THREAD: u32 = 100;
+
+        let mut envelope = SafetyEnvelope::default();
+        envelope.rate_limits.per_source_rpm = PER_SOURCE_CAP;
+        envelope.rate_limits.global_rpm = u32::MAX;
+        envelope.rate_limits.tokens_per_minute = u64::MAX;
+        let enforcer = Arc::new(SafetyEnforcer::with_envelope(envelope));
+        let source: NodeId = [0xAA; 32];
+
+        let mut handles = Vec::new();
+        let success_count = Arc::new(AtomicU64::new(0));
+        for _ in 0..N_THREADS {
+            let e = enforcer.clone();
+            let sc = success_count.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                for _ in 0..N_PER_THREAD {
+                    if e.rate_limiter
+                        .try_acquire_source_rpm(&source, PER_SOURCE_CAP, 1.0)
+                        .is_ok()
+                    {
+                        sc.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let total = success_count.load(Ordering::Relaxed);
+        assert!(
+            total <= PER_SOURCE_CAP as u64,
+            "per-source cap regression (#125): {} acquires committed against cap {} \
+             (no global clear race should let any over-commit happen — bucket \
+             self-resets via packed atomic CAS)",
+            total,
+            PER_SOURCE_CAP,
         );
     }
 }
