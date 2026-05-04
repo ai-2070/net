@@ -1,0 +1,91 @@
+net/crates/net/src/adapter/net/continuity/superposition.rs
+  cdf934b360f502d7 197,237
+net/crates/net/tests/integration_cortex_memories.rs
+  cdf934b360f502d7 16,654-655
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  cdf934b360f502d7 101,112,134,201,747,938,978,988,1068,1086,1200
+net/crates/net/src/adapter/net/redex/manager.rs
+  cdf934b360f502d7 113
+net/crates/net/src/adapter/net/compute/migration.rs
+  cdf934b360f502d7 267,313,327
+net/crates/net/tests/migration_target_failure_mid_chunking.rs
+  cdf934b360f502d7 74,356
+net/crates/net/src/adapter/net/cortex/watermark.rs
+  cdf934b360f502d7 196-197
+net/crates/net/src/adapter/net/contested/reconcile.rs
+  cdf934b360f502d7 252
+net/crates/net/src/adapter/net/compute/replica_group.rs
+  cdf934b360f502d7 152
+net/crates/net/src/adapter/net/protocol.rs
+  cdf934b360f502d7 175-179,300-305
+net/crates/net/src/adapter/net/identity/entity.rs
+  cdf934b360f502d7 32-36,38,40,168-169,248-249,251
+net/crates/net/src/adapter/net/continuity/observation.rs
+  cdf934b360f502d7 125,308-309,325
+net/crates/net/src/adapter/net/compute/migration_source.rs
+  cdf934b360f502d7 146,193,206,235,257,278,294,307,313,366,379
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  cdf934b360f502d7 13,133
+net/crates/net/src/adapter/net/continuity/discontinuity.rs
+  cdf934b360f502d7 84,86,100-101,116,162-163,214-216,223-224
+net/crates/net/tests/integration_cortex_tasks.rs
+  cdf934b360f502d7 18,839-840
+net/crates/net/include/net.go.h
+  cdf934b360f502d7 576
+net/crates/net/src/adapter/net/compute/registry.rs
+  cdf934b360f502d7 261,266
+net/crates/net/src/adapter/net/compute/migration_target.rs
+  cdf934b360f502d7 552,1098,1102,1110,1128
+net/crates/net/src/adapter/net/identity/origin.rs
+  cdf934b360f502d7 42,67-70,72
+net/crates/net/src/adapter/net/continuity/cone.rs
+  cdf934b360f502d7 66,175,202,335,337-338,345-347
+net/crates/net/src/adapter/net/state/horizon.rs
+  cdf934b360f502d7 110,195,221,239,241,387-388,397,413-414,425,478-479,489,525-526,596,598-599,623,640
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  cdf934b360f502d7 29,42,56,64,72,80,86,96,108,114,170,182,194,202,210,215,222,256,269,276,296,300,305-306,311,358,364,369,375,380,386,391,397,401,406,415,420,481,487,491,495,564,622,766,769,823,948,1030,1090,1224,1252,1305,1342,1428,1459,1493,1517,1539,1557,1579,1584,1591,1598,1607,1615,1684,2635,2654,2673,2859
+net/crates/net/tests/integration_netdb.rs
+  cdf934b360f502d7 15
+net/crates/net/tests/migration_integration.rs
+  cdf934b360f502d7 80,93,1486,1541,1605,2177,2185,2311,2333,2346
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  cdf934b360f502d7 184,246,309,392,847
+net/crates/net/src/adapter/net/continuity/chain.rs
+  cdf934b360f502d7 50,57,69,226-230,245-249
+net/crates/net/src/ffi/mesh.rs
+  cdf934b360f502d7 2205
+net/crates/net/src/adapter/net/state/causal.rs
+  cdf934b360f502d7 24,26,28,30,41-47,65,88,93,108,152,159,206,379,381,601,604-612,617-618
+net/crates/net/src/adapter/net/compute/fork_group.rs
+  cdf934b360f502d7 74,97,159,374
+net/crates/net/src/adapter/net/state/log.rs
+  cdf934b360f502d7 163,267,282,290
+net/crates/net/src/adapter/net/compute/group_coord.rs
+  cdf934b360f502d7 134,247
+net/crates/net/src/adapter/net/compute/host.rs
+  cdf934b360f502d7 367,509
+net/crates/net/benches/cortex.rs
+  cdf934b360f502d7 24
+net/crates/net/src/adapter/net/cortex/meta.rs
+  cdf934b360f502d7 1,3,8,18,45-47,58,69,78-80,84-85,94-96,114-115,305
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "2c1a26e3cb27205cd64d64654340037922fc8141",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 153769,
+      "total_deletions": 1045,
+      "accepted_lines": 282,
+      "overriden_lines": 0
+    }
+  }
+}
