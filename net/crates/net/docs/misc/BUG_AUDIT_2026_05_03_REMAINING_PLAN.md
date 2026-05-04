@@ -151,7 +151,15 @@ together. Then `RedisDedupHandle` and `IdentityHandle` (small).
 require coordinated wire-format work that exceeds the
 single-PR-per-item shape this branch follows:
 
-- **#102:** the proper fix (version byte) bumps
+- **#102:** the audit's "CPU-DoS amplifier on random ciphertext"
+  framing is overstated — `open` runs the ed25519 signature
+  check BEFORE any AEAD, and random ciphertext can't forge a
+  valid signature over `target_pub || chain_link`. The 2× AEAD
+  attempts only fire for envelopes that already passed signature
+  verification — i.e., legitimate-but-replayed v0 envelopes
+  during a rolling upgrade. The doubling is the documented cost
+  of the v0 fallback, not a DoS amplifier on random traffic.
+  Even so, the proper fix (version byte) bumps
   `IDENTITY_ENVELOPE_SIZE` from 208 to 209. That width is also
   embedded in the snapshot wire format
   (`adapter/net/state/snapshot.rs` reads/writes envelopes at
