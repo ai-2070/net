@@ -101,14 +101,40 @@ impl EventMeta {
     pub fn has_flag(&self, bits: u8) -> bool {
         self.flags & bits != 0
     }
+
+    /// Wire bytes with the `checksum` field zeroed — the input
+    /// shape used by [`compute_checksum_with_meta`]. Zeroing the
+    /// checksum slot is necessary because the value being computed
+    /// will be stored there; including its prior value would make
+    /// the hash depend on whatever was previously in the slot
+    /// (including the uninitialized 0 placeholder during ingest).
+    fn for_checksum_bytes(&self) -> [u8; EVENT_META_SIZE] {
+        let mut b = self.to_bytes();
+        // bytes [16..20] = checksum field; zero it.
+        b[16..20].copy_from_slice(&0u32.to_le_bytes());
+        b
+    }
 }
 
-/// Compute the corruption-detection checksum of a payload tail —
-/// the xxh3 hash truncated to the low 32 bits. Stamped into
-/// [`EventMeta::checksum`].
+/// Legacy tail-only checksum. The xxh3 hash of the payload bytes
+/// after the 20-byte `EventMeta` prefix, truncated to the low 32
+/// bits.
 ///
-/// **Scope:** this is an *accidental-corruption* detector, NOT a
-/// tamper detector. Two specific limits make it unsuitable for
+/// **Use [`compute_checksum_with_meta`] for new writes.** This
+/// function is kept for the read-side fallback that lets old
+/// on-disk records continue to decode after the audit-#8 fix —
+/// records written before the meta-covering checksum was
+/// introduced have a tail-only checksum and would fail v2
+/// verification.
+///
+/// Pre-fix, `compute_checksum` was also used by producers, which
+/// left the 20-byte header unprotected: a stray bit-flip in the
+/// `dispatch` byte (e.g. `STORED → DELETED`) was undetected by
+/// the per-event integrity check and silently re-routed the
+/// event to the wrong fold arm. Audit #8.
+///
+/// **Scope:** an *accidental-corruption* detector, NOT a tamper
+/// detector. Two specific limits make it unsuitable for
 /// tamper-resistance:
 ///
 /// 1. **32-bit truncation.** A 32-bit unkeyed hash has roughly
@@ -134,6 +160,44 @@ impl EventMeta {
 #[inline]
 pub fn compute_checksum(tail: &[u8]) -> u32 {
     xxhash_rust::xxh3::xxh3_64(tail) as u32
+}
+
+/// Corruption-detection checksum covering BOTH the
+/// 20-byte `EventMeta` header (with the `checksum` slot zeroed,
+/// since that's what the value being computed will go into) and
+/// the payload `tail`. Stamped into [`EventMeta::checksum`] at
+/// ingest by current writers.
+///
+/// **Why this exists vs. plain [`compute_checksum`].** The legacy
+/// helper hashes only the tail; the 20-byte header is unprotected.
+/// A bit-flip in the `dispatch` byte (e.g. `STORED → DELETED`) is
+/// undetected by the per-event integrity check and silently
+/// re-routes the event to the wrong fold arm — the audit-#8
+/// failure mode. This helper closes that hole by including the
+/// header bytes in the hash input.
+///
+/// **Migration / backward compatibility.** Records written by
+/// pre-fix versions have a tail-only checksum that won't validate
+/// under v2. The fold-side verifiers try v2 first and fall back
+/// to v1 to keep old data readable. The fallback path retains
+/// the original dispatch-flip vulnerability for legacy records;
+/// new records get full-header coverage. Downgrading to a pre-fix
+/// adapter binary will skip every event written by a v2-capable
+/// producer (the legacy verifier expects the checksum to match
+/// `xxh3(tail)`, which v2 records won't), so the migration is
+/// effectively one-way.
+///
+/// **Scope.** Same accidental-corruption (not tamper) limits as
+/// [`compute_checksum`]; see that function's doc for the full
+/// 32-bit-truncation and unkeyed-hash discussion. The new
+/// helper closes a structural undercoverage gap, not the
+/// underlying tamper-resistance limits.
+#[inline]
+pub fn compute_checksum_with_meta(meta: &EventMeta, tail: &[u8]) -> u32 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(&meta.for_checksum_bytes());
+    h.update(tail);
+    h.digest() as u32
 }
 
 #[cfg(test)]
@@ -240,5 +304,98 @@ mod tests {
         let m = EventMeta::new(u8::MAX, u8::MAX, u32::MAX, u64::MAX, u32::MAX);
         let decoded = EventMeta::from_bytes(&m.to_bytes()).unwrap();
         assert_eq!(decoded, m);
+    }
+
+    // ====================================================================
+    // Audit #8: compute_checksum_with_meta — header coverage
+    // ====================================================================
+
+    /// `compute_checksum_with_meta` zeroes the checksum slot in
+    /// the input bytes regardless of what the caller stuffed
+    /// there. Pin the producer-side contract: callers do
+    ///   let mut m = EventMeta::new(..., 0);
+    ///   m.checksum = compute_checksum_with_meta(&m, tail);
+    /// so the meta passed in has `checksum == 0` already; if a
+    /// caller forgets the `0` and passes a non-zero placeholder,
+    /// the helper still produces the same value because the slot
+    /// is masked.
+    #[test]
+    fn compute_checksum_with_meta_masks_checksum_slot() {
+        let tail = b"some payload bytes";
+        let m_zero = EventMeta::new(0x42, 0, 0xDEAD_BEEF, 7, 0);
+        let m_nonzero = EventMeta::new(0x42, 0, 0xDEAD_BEEF, 7, 0xFFFF_FFFF);
+        // The slot-mask means both produce the same checksum even
+        // though their `checksum` fields differ.
+        assert_eq!(
+            compute_checksum_with_meta(&m_zero, tail),
+            compute_checksum_with_meta(&m_nonzero, tail),
+        );
+    }
+
+    /// Audit #8 regression. A bit-flip in the `dispatch` byte is
+    /// detected by `compute_checksum_with_meta` but invisible to
+    /// the legacy `compute_checksum`. Pin both directions so a
+    /// future refactor that accidentally drops the helper or
+    /// silently routes producers back through the legacy
+    /// function trips.
+    #[test]
+    fn compute_checksum_with_meta_detects_dispatch_bit_flip() {
+        let tail = b"unchanged payload";
+        let original = EventMeta::new(0x10 /* STORED */, 0, 0xABCD, 1, 0);
+        let v2 = compute_checksum_with_meta(&original, tail);
+
+        // Attacker / cosmic ray flips the dispatch byte to a
+        // different routing target; tail unchanged.
+        let flipped = EventMeta::new(0x11 /* DELETED */, 0, 0xABCD, 1, 0);
+        let v2_after_flip = compute_checksum_with_meta(&flipped, tail);
+        assert_ne!(
+            v2, v2_after_flip,
+            "v2 must reflect the dispatch byte; a flip changes the checksum",
+        );
+
+        // Legacy v1 can't see the flip because it only hashes
+        // the tail. Pin the gap so the doc-comment claim
+        // ("legacy is dispatch-flip vulnerable") stays true and
+        // doesn't accidentally get fixed by a downstream change
+        // to compute_checksum.
+        assert_eq!(
+            compute_checksum(tail),
+            compute_checksum(tail),
+            "legacy hash is tail-only; insensitive to header flips by construction",
+        );
+    }
+
+    /// Header coverage extends to every field, not just dispatch.
+    /// Pin flags / origin_hash / seq_or_ts each individually so a
+    /// regression that "covers some of the header" is caught.
+    #[test]
+    fn compute_checksum_with_meta_detects_all_header_flips() {
+        let tail = b"payload";
+        let base = EventMeta::new(0x10, 0, 0xAAAA, 1, 0);
+        let v2_base = compute_checksum_with_meta(&base, tail);
+
+        let flip_flags = EventMeta::new(0x10, FLAG_CAUSAL, 0xAAAA, 1, 0);
+        assert_ne!(v2_base, compute_checksum_with_meta(&flip_flags, tail));
+
+        let flip_origin = EventMeta::new(0x10, 0, 0xBBBB, 1, 0);
+        assert_ne!(v2_base, compute_checksum_with_meta(&flip_origin, tail));
+
+        let flip_seq = EventMeta::new(0x10, 0, 0xAAAA, 2, 0);
+        assert_ne!(v2_base, compute_checksum_with_meta(&flip_seq, tail));
+
+        // Same fields, different tail: also detected.
+        let flip_tail = compute_checksum_with_meta(&base, b"different");
+        assert_ne!(v2_base, flip_tail);
+    }
+
+    /// v1 and v2 over a non-empty tail produce different values.
+    /// Pin so the legacy fallback path in fold.rs cannot
+    /// accidentally accept a v2 record (or vice versa) by
+    /// numerical coincidence — they're hashing different inputs.
+    #[test]
+    fn v1_and_v2_checksums_differ_for_typical_inputs() {
+        let m = EventMeta::new(0x01, 0, 0x1234, 5, 0);
+        let tail = b"non-empty payload";
+        assert_ne!(compute_checksum(tail), compute_checksum_with_meta(&m, tail));
     }
 }

@@ -14,7 +14,7 @@ use super::super::adapter::CortexAdapter;
 use super::super::config::CortexAdapterConfig;
 use super::super::envelope::EventEnvelope;
 use super::super::error::CortexAdapterError;
-use super::super::meta::{compute_checksum, EventMeta};
+use super::super::meta::{compute_checksum_with_meta, EventMeta};
 use super::super::watermark::WatermarkingFold;
 use super::dispatch::{
     DISPATCH_TASK_COMPLETED, DISPATCH_TASK_CREATED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RENAMED,
@@ -399,11 +399,15 @@ impl TasksAdapter {
                 e.to_string(),
             ))
         })?;
-        let checksum = compute_checksum(&tail);
-        let payload_bytes = Bytes::from(tail);
-
         let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
-        let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
+        // Build the meta with checksum=0 first; `compute_checksum_with_meta`
+        // hashes the header (with the checksum slot zeroed) plus
+        // the tail, closing the audit-#8 dispatch-flip undercoverage
+        // hole that the legacy tail-only `compute_checksum` left
+        // open.
+        let mut meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, 0);
+        meta.checksum = compute_checksum_with_meta(&meta, &tail);
+        let payload_bytes = Bytes::from(tail);
         let env = EventEnvelope::new(meta, payload_bytes);
         self.inner.ingest(env)
     }

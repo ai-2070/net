@@ -14,7 +14,7 @@ use super::super::adapter::CortexAdapter;
 use super::super::config::CortexAdapterConfig;
 use super::super::envelope::EventEnvelope;
 use super::super::error::CortexAdapterError;
-use super::super::meta::{compute_checksum, EventMeta};
+use super::super::meta::{compute_checksum_with_meta, EventMeta};
 use super::super::watermark::WatermarkingFold;
 use super::dispatch::{
     DISPATCH_MEMORY_DELETED, DISPATCH_MEMORY_PINNED, DISPATCH_MEMORY_RETAGGED,
@@ -381,13 +381,19 @@ impl MemoriesAdapter {
                 e.to_string(),
             ))
         })?;
-        let checksum = compute_checksum(&tail);
-        let payload_bytes = Bytes::from(tail);
-
         // See `tasks/adapter.rs::ingest_typed` for the full
         // fetch_add rationale.
         let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
-        let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
+        // Build the meta with checksum=0 first; `compute_checksum_with_meta`
+        // hashes the header (with the checksum slot zeroed) AND the
+        // tail, so we have to materialize the rest of the header
+        // before computing the checksum. Audit #8: the legacy
+        // tail-only `compute_checksum` left the dispatch / flags /
+        // origin_hash / seq_or_ts bytes outside the integrity
+        // check.
+        let mut meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, 0);
+        meta.checksum = compute_checksum_with_meta(&meta, &tail);
+        let payload_bytes = Bytes::from(tail);
         let env = EventEnvelope::new(meta, payload_bytes);
         self.inner.ingest(env)
     }

@@ -2,7 +2,7 @@
 //! mutates [`super::state::MemoriesState`].
 
 use super::super::super::redex::{RedexError, RedexEvent, RedexFold};
-use super::super::meta::{compute_checksum, EventMeta, EVENT_META_SIZE};
+use super::super::meta::{compute_checksum, compute_checksum_with_meta, EventMeta, EVENT_META_SIZE};
 use super::dispatch::{
     DISPATCH_MEMORY_DELETED, DISPATCH_MEMORY_PINNED, DISPATCH_MEMORY_RETAGGED,
     DISPATCH_MEMORY_STORED, DISPATCH_MEMORY_UNPINNED,
@@ -35,19 +35,26 @@ impl RedexFold<MemoriesState> for MemoriesFold {
         let tail = &ev.payload[EVENT_META_SIZE..];
 
         // Verify the corruption-detection checksum stamped at
-        // ingest against the tail we received from RedEX.
+        // ingest against the bytes we received from RedEX.
         //
-        // This catches accidental disk corruption (stray bit
-        // flips, truncated writes, mis-aligned reads). It is NOT a
-        // tamper detector — the 32-bit unkeyed xxh3 truncation is
-        // recomputable by any party that can write to the
-        // underlying file. See `compute_checksum`'s doc for the
-        // full scope.
-        let expected = compute_checksum(tail);
-        if meta.checksum != expected {
+        // Audit #8: try the v2 (header + tail) checksum first, fall
+        // back to v1 (tail-only) for records written by pre-fix
+        // adapters. New writes pass v2 and detect bit-flips in the
+        // header (e.g. a `STORED → DELETED` dispatch flip); legacy
+        // records pass v1 with the original undercoverage gap
+        // documented as a known limitation. See `compute_checksum`'s
+        // doc for the full scope and migration story.
+        let v2_expected = compute_checksum_with_meta(&meta, tail);
+        let valid = if meta.checksum == v2_expected {
+            true
+        } else {
+            // Fallback for legacy records.
+            meta.checksum == compute_checksum(tail)
+        };
+        if !valid {
             return Err(RedexError::Decode(format!(
-                "memories fold: EventMeta checksum mismatch at seq {} (got {:#010x}, tail hashes to {:#010x})",
-                ev.entry.seq, meta.checksum, expected
+                "memories fold: EventMeta checksum mismatch at seq {} (got {:#010x}, v2 expected {:#010x})",
+                ev.entry.seq, meta.checksum, v2_expected
             )));
         }
 
