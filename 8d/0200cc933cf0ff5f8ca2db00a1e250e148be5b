@@ -1,0 +1,63 @@
+net/crates/net/src/adapter/net/cortex/meta.rs
+  cdf934b360f502d7 30,52,121,167,209-210,223,276,284,287
+net/crates/net/sdk/tests/cortex_surface.rs
+  cdf934b360f502d7 13
+net/crates/net/bindings/node/src/identity.rs
+  cdf934b360f502d7 196,198-199
+net/crates/net/sdk/src/identity.rs
+  cdf934b360f502d7 113-114
+net/crates/net/bindings/node/src/groups.rs
+  cdf934b360f502d7 217,227,237-238,246-247,350,411,413-416,501-505,544-545,597-598,625,628,641-646,650,652-656
+net/crates/net/src/ffi/handle_guard.rs
+  cdf934b360f502d7 11,14,20-24
+net/crates/net/src/adapter/net/cortex/mod.rs
+  cdf934b360f502d7 38-39
+net/crates/net/sdk/src/compute.rs
+  cdf934b360f502d7 106,206,240,265,351,531,538,571,607,922-923,925,996,1014,1031,1076,1091,1108,1119,1148,1200,1291,1329,1348,1468,1524,1676,1678,1738,1879
+net/crates/net/src/adapter/net/identity/mod.rs
+  cdf934b360f502d7 13-15
+net/crates/net/sdk/src/groups/replica.rs
+  cdf934b360f502d7 119
+net/crates/net/sdk/tests/groups_surface.rs
+  cdf934b360f502d7 114,176,196
+net/crates/net/sdk/tests/compute_runtime.rs
+  cdf934b360f502d7 85,294-302,304-311,314-315,322-323,330,342-344,838
+net/crates/net/sdk/src/groups/standby.rs
+  cdf934b360f502d7 144,163,200,222
+net/crates/net/sdk/src/groups/fork.rs
+  cdf934b360f502d7 62,95,139
+net/crates/net/src/shard/mapper.rs
+  cdf934b360f502d7 1788-1800
+net/crates/net/bindings/node/src/compute.rs
+  cdf934b360f502d7 585,590-591,593,611-612,615,733,737-738,742,759,787,791,796,809,814,820,844,847,853,892-894,934,938,940,1012,1031,1033-1034,1123-1124,1135,1201,1220,1223-1224
+net/crates/net/bindings/node/src/cortex.rs
+  cdf934b360f502d7 599-601,603,605-606,619,625,629,1081-1083,1085,1087-1088,1100,1106,1110,1386,1441,1445,1456,1476,1481,1485,1499,1503
+net/crates/net/src/adapter/net/identity/envelope.rs
+  cdf934b360f502d7 439-441
+net/crates/net/src/adapter/net/compute/registry.rs
+  cdf934b360f502d7 77,113
+net/crates/net/tests/integration_cortex_adapter.rs
+  cdf934b360f502d7 21-23,40,238,240
+net/crates/net/sdk/tests/compute_migration.rs
+  cdf934b360f502d7 1426,1433,1444
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "8d0200cc933cf0ff5f8ca2db00a1e250e148be5b",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 13973,
+      "total_deletions": 167,
+      "accepted_lines": 220,
+      "overriden_lines": 2
+    }
+  }
+}
