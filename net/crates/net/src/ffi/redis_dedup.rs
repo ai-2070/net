@@ -44,13 +44,21 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::CStr;
+use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
+use super::handle_guard::{HandleGuard, FFI_HANDLE_FREE_DEADLINE};
+
 /// Opaque handle for the dedup helper. Crossed as `void*` from C.
+///
+/// Same `HandleGuard` recipe as the cortex/mesh handles. Box stays
+/// leaked across `_free`; inner Mutex lives in `ManuallyDrop` so
+/// the free can take and drop it after quiescing in-flight ops.
 pub struct RedisStreamDedupHandle {
-    inner: Mutex<crate::adapter::RedisStreamDedup>,
+    inner: ManuallyDrop<Mutex<crate::adapter::RedisStreamDedup>>,
+    guard: HandleGuard,
 }
 
 /// Run an FFI body under `catch_unwind`. With `panic = "unwind"`
@@ -92,7 +100,8 @@ pub extern "C" fn net_redis_dedup_new(capacity: usize) -> *mut RedisStreamDedupH
             crate::adapter::RedisStreamDedup::with_capacity(capacity)
         };
         Box::into_raw(Box::new(RedisStreamDedupHandle {
-            inner: Mutex::new(inner),
+            inner: ManuallyDrop::new(Mutex::new(inner)),
+            guard: HandleGuard::new(),
         }))
     })
 }
@@ -104,10 +113,21 @@ pub extern "C" fn net_redis_dedup_free(handle: *mut RedisStreamDedupHandle) {
         if handle.is_null() {
             return;
         }
-        // Safety: caller upheld the handle-ownership contract documented
-        // on `net_redis_dedup_new`.
-        unsafe {
-            drop(Box::from_raw(handle));
+        // Quiesce in-flight ops before dropping inner. Box stays
+        // leaked. Safety: caller upheld the handle-ownership
+        // contract documented on `net_redis_dedup_new`.
+        let h: &RedisStreamDedupHandle = unsafe { &*handle };
+        if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+            // SAFETY: drained; sole writable reference.
+            unsafe {
+                let inner = ManuallyDrop::take(&mut (*handle).inner);
+                drop(inner);
+            }
+        } else {
+            tracing::warn!(
+                "net_redis_dedup_free: in-flight ops did not drain within deadline; \
+                 leaking inner to avoid use-after-free"
+            );
         }
     })
 }
@@ -132,6 +152,11 @@ pub extern "C" fn net_redis_dedup_is_duplicate(
         // Safety: handle is non-NULL and points at a `Box`-allocated
         // `RedisStreamDedupHandle` per the constructor contract.
         let h = unsafe { &*handle };
+        // Bail with -1 (same shape as NULL handle) if _free has begun.
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return -1,
+        };
         let mut guard = h
             .inner
             .lock()
@@ -153,6 +178,10 @@ pub extern "C" fn net_redis_dedup_len(handle: *mut RedisStreamDedupHandle) -> us
             return 0;
         }
         let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return 0,
+        };
         let guard = h
             .inner
             .lock()
@@ -169,6 +198,10 @@ pub extern "C" fn net_redis_dedup_capacity(handle: *mut RedisStreamDedupHandle) 
             return 0;
         }
         let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return 0,
+        };
         let guard = h
             .inner
             .lock()
@@ -186,6 +219,10 @@ pub extern "C" fn net_redis_dedup_is_empty(handle: *mut RedisStreamDedupHandle) 
             return -1;
         }
         let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return -1,
+        };
         let guard = h
             .inner
             .lock()
@@ -206,6 +243,10 @@ pub extern "C" fn net_redis_dedup_clear(handle: *mut RedisStreamDedupHandle) {
             return;
         }
         let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return,
+        };
         let mut guard = h
             .inner
             .lock()

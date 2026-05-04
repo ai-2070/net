@@ -71,7 +71,7 @@ fn register_bulky_daemon(
     registry: &DaemonRegistry,
     count: u64,
     payload_size: usize,
-) -> (EntityKeypair, u32) {
+) -> (EntityKeypair, u64) {
     let kp = EntityKeypair::generate();
     let origin = kp.origin_hash();
     let host = DaemonHost::new(
@@ -353,7 +353,7 @@ fn reassembler_cancel_is_idempotent_across_repeated_target_failures() {
     // (e.g. both `session_lost` and `MigrationFailed` arrive), we
     // must not panic and must not erase `latest_seq`.
     let mut r = SnapshotReassembler::new();
-    let origin = 0xCAFE_BABEu32;
+    let origin = 0xCAFE_BABEu64;
     let seq = 999u64;
 
     // Seed with one chunk from a 4-chunk snapshot.

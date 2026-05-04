@@ -10,10 +10,10 @@
 use futures::StreamExt;
 use net::adapter::net::channel::ChannelName;
 use net::adapter::net::cortex::memories::{MemoriesAdapter, OrderBy, MEMORIES_CHANNEL};
-use net::adapter::net::cortex::{compute_checksum, EventMeta, EVENT_META_SIZE};
+use net::adapter::net::cortex::{compute_checksum_with_meta, EventMeta, EVENT_META_SIZE};
 use net::adapter::net::redex::Redex;
 
-const ORIGIN: u32 = 0x0BAD_F00D;
+const ORIGIN: u64 = 0x0BAD_F00D;
 
 #[tokio::test]
 async fn test_full_memory_lifecycle() {
@@ -651,8 +651,8 @@ async fn test_regression_open_ignores_other_origins_when_advancing_app_seq() {
     // events whose `origin_hash` matches the adapter's; cross-origin
     // events sharing the channel must not pollute our counter.
     let redex = Redex::new();
-    const ORIGIN_A: u32 = 0x0000_AABB;
-    const ORIGIN_B: u32 = 0x0000_CCDD;
+    const ORIGIN_A: u64 = 0x0000_AABB;
+    const ORIGIN_B: u64 = 0x0000_CCDD;
 
     {
         let b = MemoriesAdapter::open(&redex, ORIGIN_B).await.unwrap();
@@ -687,10 +687,11 @@ async fn test_regression_open_ignores_other_origins_when_advancing_app_seq() {
 #[tokio::test]
 async fn test_regression_checksum_is_computed_not_zero() {
     // Regression: `EventMeta::checksum` used to be hardcoded to 0 in
-    // the memories adapter's `ingest_typed`. The documented contract
-    // (see `EventMeta` struct doc in meta.rs) is xxh3 truncation of
-    // the payload tail. Verify the on-disk event's meta.checksum
-    // matches `compute_checksum(tail)`.
+    // the memories adapter's `ingest_typed`. Producers now stamp the
+    // header-covering v2 checksum (`compute_checksum_with_meta`) so
+    // a bit-flip in the EventMeta header — not just the tail — is
+    // detected. Verify the on-disk event's meta.checksum matches
+    // the v2 hash.
     let redex = Redex::new();
     let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
@@ -720,8 +721,8 @@ async fn test_regression_checksum_is_computed_not_zero() {
     assert_ne!(meta.checksum, 0, "checksum must not be hardcoded to 0");
     assert_eq!(
         meta.checksum,
-        compute_checksum(tail),
-        "meta.checksum must match xxh3 truncation of the payload tail"
+        compute_checksum_with_meta(&meta, tail),
+        "meta.checksum must match the v2 header-covering hash",
     );
 }
 

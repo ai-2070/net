@@ -149,7 +149,7 @@ impl ReplicaGroup {
     }
 
     /// Route an inbound event to the best available replica.
-    pub fn route_event(&self, ctx: &RequestContext) -> Result<u32, GroupError> {
+    pub fn route_event(&self, ctx: &RequestContext) -> Result<u64, GroupError> {
         self.coord.route_event(ctx)
     }
 
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(group.health(), GroupHealth::Healthy);
         assert_eq!(reg.count(), 3);
 
-        let hashes: HashSet<u32> = group.replicas().iter().map(|r| r.origin_hash).collect();
+        let hashes: HashSet<u64> = group.replicas().iter().map(|r| r.origin_hash).collect();
         assert_eq!(hashes.len(), 3);
     }
 

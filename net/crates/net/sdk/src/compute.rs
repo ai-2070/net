@@ -103,7 +103,7 @@ pub enum DaemonError {
     #[error(
         "snapshot/identity mismatch: snapshot origin {snapshot:#x} != identity origin {identity:#x}"
     )]
-    SnapshotIdentityMismatch { snapshot: u32, identity: u32 },
+    SnapshotIdentityMismatch { snapshot: u64, identity: u64 },
     /// Pass-through for errors surfaced by the core compute layer.
     #[error(transparent)]
     Core(#[from] CoreDaemonError),
@@ -203,7 +203,7 @@ struct Inner {
     /// Mutex because the SDK's dependency set doesn't include
     /// `dashmap` directly, and this map sees low write frequency
     /// (one entry per failed migration).
-    recent_failures: Mutex<HashMap<u32, MigrationFailureReason>>,
+    recent_failures: Mutex<HashMap<u64, MigrationFailureReason>>,
     /// Test-only knob: when set to `true`, the readiness callback
     /// reports "not ready" even when the runtime is in `Ready`.
     /// Lets integration tests drive the `NotReady` retry path
@@ -237,7 +237,7 @@ struct Inner {
     /// stable public API. The observer list is a `Vec` so unrelated
     /// subsystems (future audit / metrics hooks) could coexist on
     /// the same origin without one overwriting another.
-    observers: Mutex<HashMap<u32, Vec<(u64, DeliverObserver)>>>,
+    observers: Mutex<HashMap<u64, Vec<(u64, DeliverObserver)>>>,
     /// Monotonic id minted by `register_deliver_observer`, used by
     /// the returned `ObserverHandle` to identify its entry on
     /// `Drop`/`unregister`.
@@ -262,7 +262,7 @@ pub(crate) type DeliverObserver = Arc<dyn Fn(&CausalEvent) + Send + Sync>;
 /// dropped: the `Weak` upgrade in `Drop` silently no-ops.
 pub(crate) struct ObserverHandle {
     runtime: std::sync::Weak<Inner>,
-    origin: u32,
+    origin: u64,
     id: u64,
 }
 
@@ -348,7 +348,7 @@ impl DaemonRuntime {
     /// See the `observers` field on [`Inner`] for the design rationale.
     pub(crate) fn register_deliver_observer(
         &self,
-        origin: u32,
+        origin: u64,
         cb: DeliverObserver,
     ) -> ObserverHandle {
         let id = self
@@ -528,14 +528,14 @@ impl DaemonRuntime {
         // `MeshNode::migration_identity_context`.
         let ctx = self.inner.mesh.inner().migration_identity_context();
         let inner_for_rebind = self.inner.clone();
-        let post_restore: PostRestoreCallback = Arc::new(move |origin_hash: u32| {
+        let post_restore: PostRestoreCallback = Arc::new(move |origin_hash: u64| {
             let inner = inner_for_rebind.clone();
             tokio::spawn(async move {
                 replay_subscriptions(inner, origin_hash).await;
             });
         });
         let inner_for_teardown = self.inner.clone();
-        let pre_cleanup: PreCleanupCallback = Arc::new(move |origin_hash: u32| {
+        let pre_cleanup: PreCleanupCallback = Arc::new(move |origin_hash: u64| {
             // Snapshot the ledger BEFORE cleanup drops the host —
             // after that, the ledger is gone. Spawn async
             // unsubscribes so the dispatcher thread returns
@@ -568,7 +568,7 @@ impl DaemonRuntime {
         });
         let inner_for_failure = self.inner.clone();
         let failure: FailureCallback =
-            Arc::new(move |origin_hash: u32, reason: MigrationFailureReason| {
+            Arc::new(move |origin_hash: u64, reason: MigrationFailureReason| {
                 if let Ok(mut map) = inner_for_failure.recent_failures.lock() {
                     map.insert(origin_hash, reason);
                 }
@@ -604,7 +604,7 @@ impl DaemonRuntime {
         // Drain the registry. `list()` snapshots origin_hashes under
         // its internal read guard; iterating is safe because we own
         // the unregister path.
-        let origins: Vec<u32> = self
+        let origins: Vec<u64> = self
             .inner
             .registry
             .list()
@@ -919,10 +919,10 @@ impl DaemonRuntime {
         let entity_id = keypair.entity_id().clone();
 
         // Compare the **full** 32-byte `entity_id`, not just the
-        // 32-bit `origin_hash` projection. `origin_hash` is a
-        // birthday-bounded 32-bit hash of the ed25519 public key;
+        // 64-bit `origin_hash` projection. `origin_hash` is a
+        // birthday-bounded 64-bit hash of the ed25519 public key;
         // two legitimately-different identities can collide on
-        // `origin_hash` with probability ~2^-16 after ~65k daemons.
+        // `origin_hash` with probability ~2^-32 after ~4B daemons.
         // A collision would let the *wrong* identity restore the
         // snapshot, producing a daemon signed under one pubkey
         // but claiming to be another — downstream signatures then
@@ -993,7 +993,7 @@ impl DaemonRuntime {
     /// while `Ready` and (idempotently) during `ShuttingDown` —
     /// `ShuttingDown` paths through here are a no-op because the
     /// shutdown sweep has already drained the registry.
-    pub async fn stop(&self, origin_hash: u32) -> Result<(), DaemonError> {
+    pub async fn stop(&self, origin_hash: u64) -> Result<(), DaemonError> {
         if self.state() == State::Registering {
             return Err(DaemonError::NotReady);
         }
@@ -1011,7 +1011,7 @@ impl DaemonRuntime {
 
     /// Take a snapshot of a running daemon by `origin_hash`. Returns
     /// `Ok(None)` when the daemon is stateless.
-    pub async fn snapshot(&self, origin_hash: u32) -> Result<Option<StateSnapshot>, DaemonError> {
+    pub async fn snapshot(&self, origin_hash: u64) -> Result<Option<StateSnapshot>, DaemonError> {
         self.require_ready()?;
         self.inner
             .registry
@@ -1028,7 +1028,7 @@ impl DaemonRuntime {
     /// testing sugar rather than the primary ingress.
     pub fn deliver(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         event: &CausalEvent,
     ) -> Result<Vec<CausalEvent>, DaemonError> {
         self.require_ready()?;
@@ -1073,7 +1073,7 @@ impl DaemonRuntime {
     /// removed). Useful for tests that assert the migration reached
     /// true completion (record gone via `ActivateAck`) rather than
     /// simply advancing to the `Complete` phase.
-    pub fn migration_phase(&self, origin_hash: u32) -> Option<MigrationPhase> {
+    pub fn migration_phase(&self, origin_hash: u64) -> Option<MigrationPhase> {
         self.inner.orchestrator.status(origin_hash)
     }
 
@@ -1088,7 +1088,7 @@ impl DaemonRuntime {
     /// Exposed publicly because SDK integration tests live in a
     /// separate crate; not part of the stable surface.
     #[doc(hidden)]
-    pub fn peek_migration_failure(&self, origin_hash: u32) -> Option<MigrationFailureReason> {
+    pub fn peek_migration_failure(&self, origin_hash: u64) -> Option<MigrationFailureReason> {
         self.inner
             .recent_failures
             .lock()
@@ -1105,7 +1105,7 @@ impl DaemonRuntime {
     /// because SDK integration tests live out-of-crate; not part of
     /// the stable surface.
     #[doc(hidden)]
-    pub fn inject_migration_failure(&self, origin_hash: u32, reason: MigrationFailureReason) {
+    pub fn inject_migration_failure(&self, origin_hash: u64, reason: MigrationFailureReason) {
         if let Ok(mut m) = self.inner.recent_failures.lock() {
             m.insert(origin_hash, reason);
         }
@@ -1116,7 +1116,7 @@ impl DaemonRuntime {
     /// to via [`Self::subscribe_channel`]. Used by the migration
     /// target path to drive replay and by tests / operators to
     /// observe what a daemon is subscribed to.
-    pub fn subscriptions(&self, origin_hash: u32) -> Result<Vec<SubscriptionBinding>, DaemonError> {
+    pub fn subscriptions(&self, origin_hash: u64) -> Result<Vec<SubscriptionBinding>, DaemonError> {
         self.inner
             .registry
             .with_host(origin_hash, |host| host.bindings_snapshot().subscriptions)
@@ -1145,7 +1145,7 @@ impl DaemonRuntime {
     /// token-gated channels; `None` for open channels.
     pub async fn subscribe_channel(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         publisher: u64,
         channel: ChannelName,
         token: Option<PermissionToken>,
@@ -1197,7 +1197,7 @@ impl DaemonRuntime {
     /// ledger update.
     pub async fn unsubscribe_channel(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         publisher: u64,
         channel: ChannelName,
     ) -> Result<(), DaemonError> {
@@ -1288,7 +1288,7 @@ impl DaemonRuntime {
     pub fn expect_migration(
         &self,
         kind: &str,
-        origin_hash: u32,
+        origin_hash: u64,
         config: DaemonHostConfig,
     ) -> Result<(), DaemonError> {
         if self.state() == State::ShuttingDown {
@@ -1326,7 +1326,7 @@ impl DaemonRuntime {
     /// inbound wire messages.
     pub async fn start_migration(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         source_node: u64,
         target_node: u64,
     ) -> Result<MigrationHandle, DaemonError> {
@@ -1345,7 +1345,7 @@ impl DaemonRuntime {
     /// doesn't need to sign anything on the target.
     pub async fn start_migration_with(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         source_node: u64,
         target_node: u64,
         opts: MigrationOpts,
@@ -1465,7 +1465,7 @@ impl DaemonRuntime {
     /// isn't reachable; proceed unsealed."
     fn maybe_seal_local_snapshot(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         target_node: u64,
         snapshot_bytes: &[u8],
     ) -> Result<Option<Vec<u8>>, DaemonError> {
@@ -1521,7 +1521,7 @@ impl DaemonRuntime {
     /// retry starts from phase 0.
     async fn maybe_seal_chunked_snapshot(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         target_node: u64,
         mut msgs: Vec<MigrationMessage>,
     ) -> Result<Vec<MigrationMessage>, DaemonError> {
@@ -1673,9 +1673,9 @@ impl DaemonRuntime {
 /// the daemon — call [`DaemonRuntime::stop`] explicitly.
 #[derive(Clone)]
 pub struct DaemonHandle {
-    /// Daemon's 32-bit origin hash. Stable for the daemon's lifetime
+    /// Daemon's 64-bit origin hash. Stable for the daemon's lifetime
     /// and across migrations.
-    pub origin_hash: u32,
+    pub origin_hash: u64,
     /// Daemon's full 32-byte entity id.
     pub entity_id: EntityId,
     inner: Arc<Inner>,
@@ -1735,7 +1735,7 @@ impl std::fmt::Debug for DaemonHandle {
 ///
 /// Runs in a tokio task spawned by the post-restore callback
 /// installed on `MigrationSubprotocolHandler`.
-async fn replay_subscriptions(inner: Arc<Inner>, origin_hash: u32) {
+async fn replay_subscriptions(inner: Arc<Inner>, origin_hash: u64) {
     let bindings = match inner
         .registry
         .with_host(origin_hash, |host| host.bindings_snapshot().subscriptions)
@@ -1876,7 +1876,7 @@ fn not_ready_backoff(attempt: u8) -> std::time::Duration {
 #[derive(Clone)]
 pub struct MigrationHandle {
     /// Daemon being migrated.
-    pub origin_hash: u32,
+    pub origin_hash: u64,
     /// Source node that currently hosts the daemon.
     pub source_node: u64,
     /// Target node that will host the daemon after cutover.

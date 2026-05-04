@@ -35,5 +35,6 @@ pub use config::{CortexAdapterConfig, FoldErrorPolicy, StartPosition};
 pub use envelope::{EventEnvelope, IntoRedexPayload};
 pub use error::CortexAdapterError;
 pub use meta::{
-    compute_checksum, EventMeta, DISPATCH_RAW, EVENT_META_SIZE, FLAG_CAUSAL, FLAG_CONTINUITY_PROOF,
+    compute_checksum, compute_checksum_with_meta, EventMeta, DISPATCH_RAW, EVENT_META_SIZE,
+    FLAG_CAUSAL, FLAG_CONTINUITY_PROOF,
 };

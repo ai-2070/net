@@ -98,7 +98,7 @@ pub struct OutboundMigrationMessage {
 /// The callback runs synchronously on the dispatcher thread; it
 /// should kick off any async work via `tokio::spawn` rather than
 /// blocking the dispatch loop.
-pub type PostRestoreCallback = Arc<dyn Fn(u32) + Send + Sync>;
+pub type PostRestoreCallback = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// Callback fired on the source side at `CutoverNotify` handling,
 /// immediately before `source_handler.cleanup` unregisters the
@@ -109,7 +109,7 @@ pub type PostRestoreCallback = Arc<dyn Fn(u32) + Send + Sync>;
 /// session-timeout window.
 ///
 /// Sync on the dispatcher thread; async work must `tokio::spawn`.
-pub type PreCleanupCallback = Arc<dyn Fn(u32) + Send + Sync>;
+pub type PreCleanupCallback = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// Readiness predicate — returns `true` when the local runtime is
 /// prepared to accept inbound migrations (target path). When
@@ -131,7 +131,7 @@ pub type ReadinessCallback = Arc<dyn Fn() -> bool + Send + Sync>;
 ///
 /// Sync on the dispatcher thread.
 pub type FailureCallback =
-    Arc<dyn Fn(u32, crate::adapter::net::compute::MigrationFailureReason) + Send + Sync>;
+    Arc<dyn Fn(u64, crate::adapter::net::compute::MigrationFailureReason) + Send + Sync>;
 
 /// Callback that opens an identity envelope carried on a
 /// [`crate::adapter::net::state::snapshot::StateSnapshot`], using a
@@ -198,7 +198,7 @@ pub struct MigrationSubprotocolHandler {
     ///
     /// Wrapped in `Mutex` because `SnapshotReassembler::feed` requires
     /// `&mut self`.
-    reassemblers: DashMap<u32, Mutex<SnapshotReassembler>>,
+    reassemblers: DashMap<u64, Mutex<SnapshotReassembler>>,
     /// Identity-transport context. `None` = envelopes ignored
     /// (pre-identity-envelope fallback).
     identity_context: Option<MigrationIdentityContext>,
@@ -744,7 +744,7 @@ impl MigrationSubprotocolHandler {
     /// been attempted.
     fn restore_on_target(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         snapshot_bytes: Vec<u8>,
         seq_through: u64,
         chunk_index: u32,
@@ -935,7 +935,7 @@ impl MigrationSubprotocolHandler {
     fn maybe_seal_envelope(
         &self,
         snapshot: StateSnapshot,
-        daemon_origin: u32,
+        daemon_origin: u64,
         target_node: u64,
     ) -> Result<StateSnapshot, MigrationError> {
         let Some(ctx) = &self.identity_context else {
@@ -975,7 +975,7 @@ impl MigrationSubprotocolHandler {
     /// typical wiring, so checking via source is sufficient; the
     /// `target_handler_registry_keypair` fallback exists for
     /// asymmetric setups where they diverge.
-    fn source_handler_registry_keypair(&self, daemon_origin: u32) -> Option<EntityKeypair> {
+    fn source_handler_registry_keypair(&self, daemon_origin: u64) -> Option<EntityKeypair> {
         let _ = daemon_origin;
         // `MigrationSourceHandler` doesn't expose the registry
         // publicly, so reach through the orchestrator which shares
@@ -985,7 +985,7 @@ impl MigrationSubprotocolHandler {
             .daemon_keypair(daemon_origin)
     }
 
-    fn target_handler_registry_keypair(&self, daemon_origin: u32) -> Option<EntityKeypair> {
+    fn target_handler_registry_keypair(&self, daemon_origin: u64) -> Option<EntityKeypair> {
         // Parallel path — the target-side registry may in some
         // configurations be distinct. Today it's the same `Arc`, so
         // this returns the same value as the source path; kept as a
@@ -1065,7 +1065,7 @@ impl MigrationSubprotocolHandler {
     /// [`Self::fail_migration_with_reason`].
     fn fail_migration(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         from_node: u64,
         reason: &str,
     ) -> Result<Vec<OutboundMigrationMessage>, MigrationError> {
@@ -1083,7 +1083,7 @@ impl MigrationSubprotocolHandler {
     /// `FactoryNotFound` — a retry won't find what isn't there).
     fn fail_migration_with_reason(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         from_node: u64,
         reason: crate::adapter::net::compute::MigrationFailureReason,
     ) -> Result<Vec<OutboundMigrationMessage>, MigrationError> {
@@ -1197,7 +1197,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (MigrationSubprotocolHandler, Arc<DaemonRegistry>, u32) {
+    fn setup() -> (MigrationSubprotocolHandler, Arc<DaemonRegistry>, u64) {
         let reg = Arc::new(DaemonRegistry::new());
         let kp = EntityKeypair::generate();
         let origin = kp.origin_hash();

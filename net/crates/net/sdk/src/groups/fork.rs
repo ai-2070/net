@@ -59,7 +59,7 @@ impl ForkGroup {
     pub fn fork(
         runtime: &DaemonRuntime,
         kind: &str,
-        parent_origin: u32,
+        parent_origin: u64,
         fork_seq: u64,
         config: ForkGroupConfig,
     ) -> Result<Self, GroupError> {
@@ -92,7 +92,7 @@ impl ForkGroup {
         &self.kind
     }
 
-    pub fn route_event(&self, ctx: &RequestContext) -> Result<u32, GroupError> {
+    pub fn route_event(&self, ctx: &RequestContext) -> Result<u64, GroupError> {
         Ok(self
             .inner
             .lock()
@@ -136,7 +136,7 @@ impl ForkGroup {
             .health()
     }
 
-    pub fn parent_origin(&self) -> u32 {
+    pub fn parent_origin(&self) -> u64 {
         self.inner
             .lock()
             .expect("ForkGroup mutex poisoned")

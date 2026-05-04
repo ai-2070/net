@@ -39,7 +39,7 @@ use super::entity::{EntityId, EntityKeypair};
 #[derive(Debug, Clone)]
 pub struct OriginStamp {
     entity_id: EntityId,
-    origin_hash: u32,
+    origin_hash: u64,
     node_id: u64,
 }
 
@@ -64,9 +64,12 @@ impl OriginStamp {
         }
     }
 
-    /// Get the origin hash for the Net header (4 bytes).
+    /// Get the full 8-byte origin hash for application-layer
+    /// accounting. The per-packet `NetHeader::origin_hash` (still
+    /// 4 bytes) downcasts via `as u32` — the low 32 bits are
+    /// what feed routing.
     #[inline]
-    pub fn origin_hash(&self) -> u32 {
+    pub fn origin_hash(&self) -> u64 {
         self.origin_hash
     }
 

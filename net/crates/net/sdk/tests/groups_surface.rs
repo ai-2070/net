@@ -111,7 +111,7 @@ async fn replica_group_route_event_returns_live_origin() {
     // Route 30 requests via consistent-hash on distinct keys — we
     // only care that every routed origin is one of the group's
     // live member origin_hashes.
-    let live: std::collections::HashSet<u32> =
+    let live: std::collections::HashSet<u64> =
         group.replicas().iter().map(|m| m.origin_hash).collect();
     for i in 0..30u64 {
         let ctx = RequestContext::new().with_routing_key(format!("req-{i}"));
@@ -173,7 +173,7 @@ async fn replica_group_unknown_kind_errors_with_factory_not_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_group_forks_produce_unique_origins_with_verifiable_lineage() {
     let rt = runtime_with_peers(4).await;
-    let parent_origin: u32 = 0xabcd_ef01;
+    let parent_origin: u64 = 0xabcd_ef01;
     let fork_seq: u64 = 42;
     let group = ForkGroup::fork(
         &rt,
@@ -193,7 +193,7 @@ async fn fork_group_forks_produce_unique_origins_with_verifiable_lineage() {
     assert_eq!(group.fork_seq(), fork_seq);
 
     let members = group.members();
-    let mut origins: Vec<u32> = members.iter().map(|m| m.origin_hash).collect();
+    let mut origins: Vec<u64> = members.iter().map(|m| m.origin_hash).collect();
     origins.sort_unstable();
     origins.dedup();
     assert_eq!(origins.len(), 3, "each fork must have a unique origin_hash");

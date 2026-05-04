@@ -18,7 +18,7 @@ use crate::adapter::net::state::snapshot::StateSnapshot;
 /// Per-daemon source-side migration state.
 #[allow(dead_code)]
 struct SourceMigrationState {
-    daemon_origin: u32,
+    daemon_origin: u64,
     target_node: u64,
     /// Node that initiated this migration. Replies (SnapshotReady,
     /// CleanupComplete) are routed here, not to the immediate wire hop
@@ -45,7 +45,7 @@ pub struct MigrationSourceHandler {
     /// Local daemon registry.
     daemon_registry: Arc<DaemonRegistry>,
     /// Active migrations on this node as source: daemon_origin → state.
-    migrations: DashMap<u32, Mutex<SourceMigrationState>>,
+    migrations: DashMap<u64, Mutex<SourceMigrationState>>,
     /// Single-flight claim set: a daemon present here has a snapshot
     /// in flight. `start_snapshot` CAS-inserts the origin BEFORE
     /// running the user-supplied `MeshDaemon::snapshot()` and
@@ -54,7 +54,7 @@ pub struct MigrationSourceHandler {
     /// run a full snapshot for the same origin, double-firing any
     /// non-idempotent side-effect (counter bumps, deferred I/O,
     /// etc.) inside the user's snapshot impl.
-    snapshots_in_progress: DashMap<u32, ()>,
+    snapshots_in_progress: DashMap<u64, ()>,
 }
 
 impl MigrationSourceHandler {
@@ -75,7 +75,7 @@ impl MigrationSourceHandler {
     /// than to whatever hop forwarded the wire packet.
     pub fn start_snapshot(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         target_node: u64,
         orchestrator_node: u64,
     ) -> Result<StateSnapshot, MigrationError> {
@@ -142,8 +142,8 @@ impl MigrationSourceHandler {
         // callers' `start_snapshot` already returns AlreadyMigrating
         // once `migrations` is populated.
         struct ClaimGuard<'a> {
-            map: &'a DashMap<u32, ()>,
-            origin: u32,
+            map: &'a DashMap<u64, ()>,
+            origin: u64,
         }
         impl Drop for ClaimGuard<'_> {
             fn drop(&mut self) {
@@ -190,7 +190,7 @@ impl MigrationSourceHandler {
     /// Recorded orchestrator for an active source-side migration.
     ///
     /// Returns `None` once the migration has been cleaned up.
-    pub fn orchestrator_node(&self, daemon_origin: u32) -> Option<u64> {
+    pub fn orchestrator_node(&self, daemon_origin: u64) -> Option<u64> {
         self.migrations
             .get(&daemon_origin)
             .map(|e| e.lock().orchestrator_node)
@@ -203,7 +203,7 @@ impl MigrationSourceHandler {
     /// or past cutover. Returns `Err` if the daemon was cut over (writes rejected).
     pub fn buffer_event(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         event: CausalEvent,
     ) -> Result<bool, MigrationError> {
         let entry = match self.migrations.get(&daemon_origin) {
@@ -232,7 +232,7 @@ impl MigrationSourceHandler {
     }
 
     /// Check if a daemon is being migrated from this node.
-    pub fn is_migrating(&self, daemon_origin: u32) -> bool {
+    pub fn is_migrating(&self, daemon_origin: u64) -> bool {
         self.migrations.contains_key(&daemon_origin)
     }
 
@@ -254,7 +254,7 @@ impl MigrationSourceHandler {
     /// downstream.
     pub fn take_buffered_events(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
     ) -> Result<Vec<CausalEvent>, MigrationError> {
         let entry = self
             .migrations
@@ -275,7 +275,7 @@ impl MigrationSourceHandler {
     }
 
     /// Phase 4: Cutover — stop accepting writes for this daemon.
-    pub fn on_cutover(&self, daemon_origin: u32) -> Result<Vec<CausalEvent>, MigrationError> {
+    pub fn on_cutover(&self, daemon_origin: u64) -> Result<Vec<CausalEvent>, MigrationError> {
         let entry = self
             .migrations
             .get(&daemon_origin)
@@ -291,7 +291,7 @@ impl MigrationSourceHandler {
     /// Phase 5: Cleanup — unregister daemon from this node.
     ///
     /// Removes the daemon from the local registry and clears migration state.
-    pub fn cleanup(&self, daemon_origin: u32) -> Result<(), MigrationError> {
+    pub fn cleanup(&self, daemon_origin: u64) -> Result<(), MigrationError> {
         // Unregister daemon from local registry
         let _ = self.daemon_registry.unregister(daemon_origin);
 
@@ -304,13 +304,13 @@ impl MigrationSourceHandler {
     /// Abort a migration — return to normal operation.
     ///
     /// Clears migration state. The daemon remains registered locally.
-    pub fn abort(&self, daemon_origin: u32) -> Result<(), MigrationError> {
+    pub fn abort(&self, daemon_origin: u64) -> Result<(), MigrationError> {
         self.migrations.remove(&daemon_origin);
         Ok(())
     }
 
     /// Get the current phase of a migration on this source.
-    pub fn phase(&self, daemon_origin: u32) -> Option<MigrationPhase> {
+    pub fn phase(&self, daemon_origin: u64) -> Option<MigrationPhase> {
         self.migrations
             .get(&daemon_origin)
             .map(|entry| entry.lock().phase)
@@ -363,7 +363,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (Arc<DaemonRegistry>, u32) {
+    fn setup() -> (Arc<DaemonRegistry>, u64) {
         let reg = Arc::new(DaemonRegistry::new());
         let kp = EntityKeypair::generate();
         let origin = kp.origin_hash();
@@ -376,7 +376,7 @@ mod tests {
         (reg, origin)
     }
 
-    fn make_event(origin: u32, seq: u64) -> CausalEvent {
+    fn make_event(origin: u64, seq: u64) -> CausalEvent {
         CausalEvent {
             link: CausalLink {
                 origin_hash: origin,

@@ -31,7 +31,7 @@ use crate::adapter::net::state::snapshot::StateSnapshot;
 /// closure can't stall other daemons that happen to hash to the
 /// same shard.
 pub struct DaemonRegistry {
-    daemons: DashMap<u32, Arc<Mutex<DaemonHost>>>,
+    daemons: DashMap<u64, Arc<Mutex<DaemonHost>>>,
 }
 
 impl DaemonRegistry {
@@ -68,6 +68,29 @@ impl DaemonRegistry {
     /// (concurrent registration race) and left the slot orphaned.
     /// `replace` collapses the swap into a single map operation so
     /// the slot is never empty between callers.
+    ///
+    /// **Concurrency contract.** A caller that had already cloned
+    /// the prior `Arc<Mutex<DaemonHost>>` out of the map
+    /// (between `get_arc` and `arc.lock()` inside one of the
+    /// public mutators) and then completes its lock acquisition
+    /// AFTER this call returns will be detected by the
+    /// per-mutator `guard_identity` re-check and surfaced as
+    /// `DaemonError::Stale` — its mutation does not land on the
+    /// orphaned host.
+    ///
+    /// **Residual.** A mutator that was *already holding* the
+    /// inner Mutex when `replace` ran will still write its
+    /// in-progress mutation to the now-orphaned OLD host (the
+    /// write is lost when OLD is dropped). Closing this window
+    /// would require either snapshot/restore-mid-flight on the
+    /// host trait, or a `try_lock`-with-timeout protocol that
+    /// would deadlock with the documented `with_host`
+    /// re-entrancy contract. The relevant call sites
+    /// (`replica_group::on_node_failure`,
+    /// `fork_group::on_node_failure`,
+    /// `standby_group::on_node_failure`) are typically not
+    /// racing concurrent traffic on the failing daemon, so the
+    /// residual window is small.
     pub fn replace(&self, host: DaemonHost) {
         let origin_hash = host.origin_hash();
         self.daemons.insert(origin_hash, Arc::new(Mutex::new(host)));
@@ -79,16 +102,32 @@ impl DaemonRegistry {
     /// thread) keep the host alive until they release their
     /// reference, then the host is dropped naturally.
     ///
+    /// **Concurrency contract.** Removes whatever entry is
+    /// currently at `origin_hash` (matching the historical
+    /// "unregister this slot" semantic — the caller passes an
+    /// `origin_hash`, not an `Arc`, so they can't distinguish
+    /// "the host I had in mind" from "the host currently
+    /// registered"). Any in-flight mutator that had already
+    /// cloned the now-removed `Arc` and then completes its lock
+    /// acquisition AFTER this returns is detected by the
+    /// per-mutator `guard_identity` re-check and surfaced as
+    /// `DaemonError::Stale`. The "splits writes" failure mode
+    /// (orphan host receives writes from in-flight mutators
+    /// while a fresh `register` of the same origin spawns a NEW
+    /// host receiving writes from new callers) becomes a typed
+    /// Stale error instead of a silent state divergence.
+    ///
     /// Returns `DaemonError::NotFound` if no daemon with this
-    /// `origin_hash` is registered. This method used to return
-    /// `Result<DaemonHost, _>` (consuming the host back to the
-    /// caller), but no production caller actually needed the
-    /// returned host — they all used `let _ =`. Dropping the
-    /// return value instead of trying to `Arc::try_unwrap` avoids
-    /// a subtle race where the caller could get back a transient
-    /// `Err` if any other thread happened to be reading the same
-    /// daemon via `with_host` at the moment of unregister.
-    pub fn unregister(&self, origin_hash: u32) -> Result<(), DaemonError> {
+    /// `origin_hash` is registered.
+    ///
+    /// **Re-entrancy (Cubic-AI P2).** Does not acquire the inner
+    /// per-daemon Mutex; safe to call from inside a
+    /// [`Self::with_host`] closure on the same `origin_hash`.
+    /// Mutators currently inside the inner lock will finish on
+    /// the now-orphaned host (their writes are lost when the
+    /// final `Arc` drops) — this is the same residual hazard
+    /// [`Self::replace`] documents.
+    pub fn unregister(&self, origin_hash: u64) -> Result<(), DaemonError> {
         self.daemons
             .remove(&origin_hash)
             .map(|_| ())
@@ -100,29 +139,78 @@ impl DaemonRegistry {
     /// clone the Arc — never across user work — is the whole
     /// point of wrapping the host in an `Arc`. Internal helper;
     /// the public accessors below build on it.
-    fn get_arc(&self, origin_hash: u32) -> Option<Arc<Mutex<DaemonHost>>> {
+    fn get_arc(&self, origin_hash: u64) -> Option<Arc<Mutex<DaemonHost>>> {
         self.daemons.get(&origin_hash).map(|e| e.value().clone())
     }
 
+    /// Fail-fast guard against swap/unregister races. Called by every public
+    /// mutator AFTER it has acquired the inner `Mutex<DaemonHost>`
+    /// to confirm the entry currently in the map is still the
+    /// same `Arc` we locked. If a concurrent `replace` or
+    /// `unregister` swapped (or removed) the entry while we were
+    /// preparing to mutate, the held `Arc` is the now-orphaned
+    /// OLD; mutating it would silently discard the work when
+    /// the final reference drops. Surface `DaemonError::Stale`
+    /// so the caller can retry against the current registered
+    /// host (which may itself have been swapped again — caller
+    /// can decide).
+    ///
+    /// Cheap: one shard read lock acquisition + an `Arc::ptr_eq`
+    /// pointer comparison. No allocation, no inner-lock
+    /// contention.
+    fn guard_identity(
+        &self,
+        origin_hash: u64,
+        held: &Arc<Mutex<DaemonHost>>,
+    ) -> Result<(), DaemonError> {
+        match self.get_arc(origin_hash) {
+            None => Err(DaemonError::Stale(origin_hash)),
+            Some(current) if !Arc::ptr_eq(&current, held) => Err(DaemonError::Stale(origin_hash)),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Test-only accessor for the per-origin `Arc`. Lets the
+    /// regression tests deterministically simulate the
+    /// "caller cloned an Arc, registry was then swapped or
+    /// unregistered, caller tried to mutate" race that the
+    /// public API doesn't expose.
+    #[cfg(test)]
+    pub(super) fn arc_for_test(&self, origin_hash: u64) -> Option<Arc<Mutex<DaemonHost>>> {
+        self.get_arc(origin_hash)
+    }
+
     /// Deliver an event to the daemon identified by `origin_hash`.
+    ///
+    /// If a concurrent [`Self::replace`] / [`Self::unregister`]
+    /// swapped the entry between this caller's `get_arc` and its
+    /// `arc.lock()`, returns `DaemonError::Stale` rather than
+    /// silently mutating the orphaned host.
     pub fn deliver(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         event: &CausalEvent,
     ) -> Result<Vec<CausalEvent>, DaemonError> {
         let arc = self
             .get_arc(origin_hash)
             .ok_or(DaemonError::NotFound(origin_hash))?;
         let mut host = arc.lock();
+        self.guard_identity(origin_hash, &arc)?;
         host.deliver(event)
     }
 
     /// Take a snapshot of a specific daemon.
-    pub fn snapshot(&self, origin_hash: u32) -> Result<Option<StateSnapshot>, DaemonError> {
+    ///
+    /// Returns `DaemonError::Stale` if a concurrent swap landed
+    /// between this caller's `get_arc` and its lock acquisition
+    /// — the snapshot we'd take would reflect the orphaned OLD
+    /// host's state, not the live host's.
+    pub fn snapshot(&self, origin_hash: u64) -> Result<Option<StateSnapshot>, DaemonError> {
         let arc = self
             .get_arc(origin_hash)
             .ok_or(DaemonError::NotFound(origin_hash))?;
         let host = arc.lock();
+        self.guard_identity(origin_hash, &arc)?;
         Ok(host.take_snapshot())
     }
 
@@ -135,34 +223,43 @@ impl DaemonRegistry {
     /// Used by `StandbyGroup::sync_standbys` to push the active's
     /// state onto each standby so a promoted standby has the same
     /// state the active had at snapshot time.
+    ///
+    /// Returns `DaemonError::Stale` if a concurrent swap landed
+    /// during the get_arc → lock window.
     pub fn restore_from_snapshot(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         snapshot: &StateSnapshot,
     ) -> Result<(), DaemonError> {
         let arc = self
             .get_arc(origin_hash)
             .ok_or(DaemonError::NotFound(origin_hash))?;
         let mut host = arc.lock();
+        self.guard_identity(origin_hash, &arc)?;
         host.restore_from_snapshot(snapshot)
     }
 
     /// Get stats for a specific daemon.
-    pub fn stats(&self, origin_hash: u32) -> Result<DaemonStats, DaemonError> {
+    ///
+    /// Returns `DaemonError::Stale` if a concurrent swap landed
+    /// during the get_arc → lock window — the stats would
+    /// reflect the orphaned host, not the live one.
+    pub fn stats(&self, origin_hash: u64) -> Result<DaemonStats, DaemonError> {
         let arc = self
             .get_arc(origin_hash)
             .ok_or(DaemonError::NotFound(origin_hash))?;
         let host = arc.lock();
+        self.guard_identity(origin_hash, &arc)?;
         Ok(host.stats().clone())
     }
 
     /// List all registered daemon origin hashes and names.
-    pub fn list(&self) -> Vec<(u32, String)> {
+    pub fn list(&self) -> Vec<(u64, String)> {
         // Snapshot `(origin_hash, Arc<Mutex<Host>>)` under each
         // shard read lock, then drop the Ref before locking the
         // inner Mutex for `name()`. Keeps shard lock hold time
         // bounded to a Vec push per entry.
-        let arcs: Vec<(u32, Arc<Mutex<DaemonHost>>)> = self
+        let arcs: Vec<(u64, Arc<Mutex<DaemonHost>>)> = self
             .daemons
             .iter()
             .map(|entry| (*entry.key(), entry.value().clone()))
@@ -181,7 +278,7 @@ impl DaemonRegistry {
     }
 
     /// Check if a daemon is registered.
-    pub fn contains(&self, origin_hash: u32) -> bool {
+    pub fn contains(&self, origin_hash: u64) -> bool {
         self.daemons.contains_key(&origin_hash)
     }
 
@@ -206,7 +303,7 @@ impl DaemonRegistry {
     /// re-lock the per-daemon `Mutex`. `parking_lot::Mutex` is
     /// not re-entrant; keeping the outer shard lock out of the
     /// way is what fixes the broader deadlock class.
-    pub fn with_host<F, R>(&self, origin_hash: u32, f: F) -> Result<R, DaemonError>
+    pub fn with_host<F, R>(&self, origin_hash: u64, f: F) -> Result<R, DaemonError>
     where
         F: FnOnce(&DaemonHost) -> R,
     {
@@ -214,6 +311,11 @@ impl DaemonRegistry {
             .get_arc(origin_hash)
             .ok_or(DaemonError::NotFound(origin_hash))?;
         let host = arc.lock();
+        // Fail-fast if a concurrent swap landed between get_arc
+        // and arc.lock(). Without this the closure would run
+        // against the orphaned OLD host whose mutations are
+        // silently discarded when the final Arc drops.
+        self.guard_identity(origin_hash, &arc)?;
         Ok(f(&host))
     }
 
@@ -229,10 +331,23 @@ impl DaemonRegistry {
     /// outlives the host's internal lock guard.
     pub fn daemon_keypair(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
     ) -> Option<crate::adapter::net::identity::EntityKeypair> {
         let arc = self.get_arc(origin_hash)?;
         let host = arc.lock();
+        // A concurrent swap means the keypair we would clone is
+        // from the orphaned OLD host — not the live one's.
+        // Returning `None` matches the existing "daemon not
+        // registered" return shape (callers already handle
+        // absent keypairs); surfacing Stale would require
+        // changing the signature to a Result. The keypair
+        // mismatch is consequential — caller would seal an
+        // identity envelope under a key that doesn't match the
+        // currently-registered daemon — so silently returning
+        // the stale keypair is worse than returning None.
+        if self.guard_identity(origin_hash, &arc).is_err() {
+            return None;
+        }
         Some(host.keypair().clone())
     }
 }
@@ -499,5 +614,122 @@ mod tests {
         release.store(true, Ordering::Release);
         long_reader.join().unwrap();
         short_reader.join().unwrap();
+    }
+
+    // ====================================================================
+    // Stale-detection on swap / unregister race
+    // ====================================================================
+
+    /// Build a fresh DaemonHost that registers under the SAME
+    /// `origin_hash` as `existing`. Used by the swap regressions
+    /// to construct a legitimate replacement (origin_hash is
+    /// determined by the keypair; cloning the keypair preserves
+    /// it).
+    fn make_host_with_keypair(kp: EntityKeypair) -> DaemonHost {
+        DaemonHost::new(Box::new(NoopDaemon), kp, DaemonHostConfig::default())
+    }
+
+    /// A caller that cloned the `Arc<Mutex<DaemonHost>>` out of
+    /// the map (between the internal `get_arc` and the
+    /// `arc.lock()`) and then observes a concurrent `replace`
+    /// must surface `DaemonError::Stale` when it tries to mutate
+    /// via the orphaned Arc. Without this guard, `replace` would
+    /// silently succeed and the caller's mutation would land on
+    /// the orphaned host whose state is dropped when the final
+    /// Arc reference goes away.
+    #[test]
+    fn guard_identity_returns_stale_after_replace() {
+        let reg = DaemonRegistry::new();
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+        reg.register(make_host_with_keypair(kp.clone())).unwrap();
+
+        // Caller's perspective: cloned the Arc out of the map.
+        let old_arc = reg.arc_for_test(origin).expect("registered");
+
+        // Concurrent path: someone calls replace with a fresh
+        // host that registers under the same origin_hash.
+        reg.replace(make_host_with_keypair(kp));
+
+        // Caller proceeds to lock + check. Lock succeeds (no
+        // contention). guard_identity sees the NEW Arc in the
+        // map — ptr_eq with our held OLD fails — Stale.
+        let _guard = old_arc.lock();
+        let result = reg.guard_identity(origin, &old_arc);
+        assert!(
+            matches!(result, Err(DaemonError::Stale(o)) if o == origin),
+            "post-replace mutator via orphaned Arc must surface Stale, got {:?}",
+            result,
+        );
+    }
+
+    /// Same shape as the replace race but for `unregister`
+    /// followed by mutation. The orphaned host must not be
+    /// mutated; surface Stale.
+    #[test]
+    fn guard_identity_returns_stale_after_unregister() {
+        let reg = DaemonRegistry::new();
+        let host = make_host(NoopDaemon);
+        let origin = host.origin_hash();
+        reg.register(host).unwrap();
+
+        let old_arc = reg.arc_for_test(origin).expect("registered");
+        reg.unregister(origin).unwrap();
+
+        let _guard = old_arc.lock();
+        let result = reg.guard_identity(origin, &old_arc);
+        assert!(
+            matches!(result, Err(DaemonError::Stale(o)) if o == origin),
+            "post-unregister mutator via orphaned Arc must surface Stale, got {:?}",
+            result,
+        );
+    }
+
+    /// Pin the happy path: with no concurrent swap, a
+    /// `guard_identity` call after locking the Arc that
+    /// `arc_for_test` returned succeeds.
+    #[test]
+    fn guard_identity_succeeds_when_no_swap_landed() {
+        let reg = DaemonRegistry::new();
+        let host = make_host(NoopDaemon);
+        let origin = host.origin_hash();
+        reg.register(host).unwrap();
+
+        let arc = reg.arc_for_test(origin).expect("registered");
+        let _guard = arc.lock();
+        reg.guard_identity(origin, &arc)
+            .expect("no swap → guard must pass");
+    }
+
+    /// Pin: `unregister` returns `NotFound` for an origin that
+    /// was never registered (preserves the existing contract).
+    #[test]
+    fn unregister_returns_not_found_when_origin_never_registered() {
+        let reg = DaemonRegistry::new();
+        let result = reg.unregister(0xDEAD);
+        assert_eq!(result, Err(DaemonError::NotFound(0xDEAD)));
+    }
+
+    /// End-to-end pin: after a `replace`, a brand-new
+    /// `deliver` call (which goes through the registry's
+    /// public API and re-resolves the Arc internally) hits the
+    /// NEW host successfully. The Stale path is for callers
+    /// holding an OLD Arc; fresh callers see no error.
+    #[test]
+    fn replace_then_fresh_deliver_targets_new_host() {
+        let reg = DaemonRegistry::new();
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+        reg.register(make_host_with_keypair(kp.clone())).unwrap();
+        reg.replace(make_host_with_keypair(kp));
+
+        // Fresh deliver: get_arc returns NEW; lock NEW; guard
+        // sees NEW == NEW; succeeds.
+        let result = reg.deliver(origin, &make_event());
+        assert!(
+            result.is_ok(),
+            "deliver after replace must reach NEW host without Stale, got {:?}",
+            result,
+        );
     }
 }

@@ -110,8 +110,8 @@ impl Identity {
         self.keypair.entity_id()
     }
 
-    /// Derived 32-bit hash used in packet headers (`OriginStamp`).
-    pub fn origin_hash(&self) -> u32 {
+    /// Derived 64-bit hash used in packet headers (`OriginStamp`).
+    pub fn origin_hash(&self) -> u64 {
         self.keypair.origin_hash()
     }
 

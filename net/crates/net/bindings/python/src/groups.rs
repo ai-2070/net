@@ -253,7 +253,7 @@ impl PyReplicaGroup {
     /// Route to the best-available replica. Returns the target
     /// `origin_hash`; caller hands it to `runtime.deliver(...)`.
     #[pyo3(signature = (ctx=None))]
-    fn route_event(&self, ctx: Option<&Bound<'_, PyDict>>) -> PyResult<u32> {
+    fn route_event(&self, ctx: Option<&Bound<'_, PyDict>>) -> PyResult<u64> {
         let rc = request_context_from_dict(ctx)?;
         self.inner.route_event(&rc).map_err(group_err)
     }
@@ -346,7 +346,7 @@ impl PyForkGroup {
     fn fork(
         runtime: &PyDaemonRuntime,
         kind: String,
-        parent_origin: u32,
+        parent_origin: u64,
         fork_seq: u64,
         fork_count: u8,
         lb_strategy: &str,
@@ -365,7 +365,7 @@ impl PyForkGroup {
     }
 
     #[pyo3(signature = (ctx=None))]
-    fn route_event(&self, ctx: Option<&Bound<'_, PyDict>>) -> PyResult<u32> {
+    fn route_event(&self, ctx: Option<&Bound<'_, PyDict>>) -> PyResult<u64> {
         let rc = request_context_from_dict(ctx)?;
         self.inner.route_event(&rc).map_err(group_err)
     }
@@ -391,7 +391,7 @@ impl PyForkGroup {
     }
 
     #[getter]
-    fn parent_origin(&self) -> u32 {
+    fn parent_origin(&self) -> u64 {
         self.inner.parent_origin()
     }
 
@@ -477,7 +477,7 @@ impl PyStandbyGroup {
     }
 
     #[getter]
-    fn active_origin(&self) -> u32 {
+    fn active_origin(&self) -> u64 {
         self.inner.active_origin()
     }
 
@@ -489,11 +489,11 @@ impl PyStandbyGroup {
 
     /// Promotion may run a snapshot-restore on the
     /// promoted standby; release the GIL.
-    fn promote(&self, py: Python<'_>) -> PyResult<u32> {
+    fn promote(&self, py: Python<'_>) -> PyResult<u64> {
         py.detach(|| self.inner.promote()).map_err(group_err)
     }
 
-    fn on_node_failure(&self, py: Python<'_>, failed_node_id: u64) -> PyResult<Option<u32>> {
+    fn on_node_failure(&self, py: Python<'_>, failed_node_id: u64) -> PyResult<Option<u64>> {
         py.detach(|| self.inner.on_node_failure(failed_node_id))
             .map_err(group_err)
     }

@@ -74,8 +74,21 @@ use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Secret};
 use super::entity::{EntityError, EntityKeypair};
 use crate::adapter::net::state::causal::{CausalLink, CAUSAL_LINK_SIZE};
 
-/// Fixed wire size of a serialized `IdentityEnvelope`.
-pub const IDENTITY_ENVELOPE_SIZE: usize = 32 + 80 + 32 + 64;
+/// Wire-format version byte stamped at the head of every
+/// serialized `IdentityEnvelope`. Producers always emit this
+/// value; readers reject any other byte. Without it, `open`
+/// would have to try v1 AAD then fall back to v0 (empty) AAD on
+/// failure — doubling AEAD CPU per probe of legitimate v0
+/// envelopes during a rolling upgrade. The wire-bump cycle that
+/// landed `IDENTITY_ENVELOPE_VERSION = 1` drops v0 support
+/// entirely (no backwards compat — the migration cliff is
+/// documented in the project release notes).
+pub const IDENTITY_ENVELOPE_VERSION: u8 = 1;
+
+/// Fixed wire size of a serialized `IdentityEnvelope`. Bumped
+/// from 208 to 209 in the wire-bump to make room for the
+/// leading version byte.
+pub const IDENTITY_ENVELOPE_SIZE: usize = 1 + 32 + 80 + 32 + 64;
 
 /// Domain separator for the sealed-box AEAD key derivation.
 const KDF_DOMAIN_KEY: &[u8] = b"net-identity-envelope";
@@ -110,6 +123,17 @@ pub enum EnvelopeError {
     /// signing half). The envelope needs an attestation signature;
     /// a public-only caller can't produce one.
     SourceReadOnly,
+    /// Wire-format version byte at the head of the envelope is
+    /// not [`IDENTITY_ENVELOPE_VERSION`]. Either the bytes were
+    /// produced by a pre-`v1` peer (the rolling-upgrade cliff
+    /// documented in the audit-#102 wire bump) or the bytes are
+    /// not an `IdentityEnvelope` at all.
+    UnknownVersion {
+        /// The first byte we read.
+        got: u8,
+        /// What we expected.
+        expected: u8,
+    },
 }
 
 impl std::fmt::Display for EnvelopeError {
@@ -135,6 +159,10 @@ impl std::fmt::Display for EnvelopeError {
             Self::SourceReadOnly => write!(
                 f,
                 "identity envelope: source keypair is public-only; cannot attest"
+            ),
+            Self::UnknownVersion { got, expected } => write!(
+                f,
+                "identity envelope: unknown wire version {got:#04x} (expected {expected:#04x})"
             ),
         }
     }
@@ -346,53 +374,28 @@ impl IdentityEnvelope {
         // the chain_link to the ciphertext. A tampered link will
         // fail the signature check above AND the AEAD tag here.
         //
-        // Rolling-upgrade compatibility: legacy envelopes were
-        // sealed with `aad = &[]`; current envelopes seal with
-        // `aad = chain_link.to_bytes()`. The on-the-wire shape is
-        // byte-identical (AAD is a hashed input to the AEAD tag,
-        // not stored in the ciphertext), so we cannot distinguish
-        // v0 from v1 by inspection. We try v1 first, and on AEAD
-        // failure fall back to v0 — the legacy envelope opens
-        // cleanly during a rolling upgrade. The signature check
-        // above already rebound the chain_link, so authenticity
-        // doesn't degrade: an attacker still cannot forge an
-        // envelope; they can at most spend one extra AEAD attempt
-        // per attack. New envelopes always seal with v1 AAD.
-        let aad_v1 = chain_link.to_bytes();
+        // The wire-bump that landed `IDENTITY_ENVELOPE_VERSION = 1`
+        // makes the AAD deterministic — there's no fallback path
+        // here. Without the version byte, the reader would try v1
+        // AAD then fall back to v0 (empty) AAD on failure,
+        // doubling AEAD CPU per legitimate-v0-replay probe during
+        // a rolling upgrade. With the version byte, v0 envelopes
+        // are rejected at `from_bytes`'s version check, so by the
+        // time we reach this AEAD attempt, the AAD is known
+        // unambiguous.
+        let aad = chain_link.to_bytes();
         let aead = XChaCha20Poly1305::new((&key).into());
-        let decrypt_result = aead.decrypt(
-            (&nonce).into(),
-            Payload {
-                msg: ct,
-                aad: &aad_v1,
-            },
-        );
-        let mut seed_vec = match decrypt_result {
+        let mut seed_vec = match aead.decrypt((&nonce).into(), Payload { msg: ct, aad: &aad }) {
             Ok(v) => v,
             Err(_) => {
-                // v0 fallback: legacy seal used empty AAD. The
-                // signature was already verified against the v1
-                // transcript above, so trying v0 here is safe —
-                // we're only retrying the AEAD with a DIFFERENT
-                // associated data binding. Any envelope that
-                // succeeds under v0 AAD also passed the v1
-                // attestation, so it's a legitimate legacy
-                // envelope from a rolling-upgrade peer.
-                //
-                // On the fallback's decrypt failure path we scrub
-                // the derived AEAD `key` BEFORE returning Err so
-                // the key (a function of the shared DH output —
-                // sensitive material) doesn't sit on the stack
-                // until natural drop. `[u8; 32]`'s default Drop
-                // does NOT zeroize, so an early return via `?`
-                // would leak it.
-                match aead.decrypt((&nonce).into(), Payload { msg: ct, aad: &[] }) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        volatile_zero(&mut key);
-                        return Err(EnvelopeError::SealOpenFailed);
-                    }
-                }
+                // Scrub the derived AEAD `key` BEFORE returning
+                // Err so the key (a function of the shared DH
+                // output — sensitive material) doesn't sit on
+                // the stack until natural drop. `[u8; 32]`'s
+                // default Drop does NOT zeroize, so an early
+                // return via `?` would leak it.
+                volatile_zero(&mut key);
+                return Err(EnvelopeError::SealOpenFailed);
             }
         };
         if seed_vec.len() != SEED_LEN {
@@ -431,10 +434,14 @@ impl IdentityEnvelope {
         Ok(kp)
     }
 
-    /// Serialize to its fixed 208-byte wire layout.
+    /// Serialize to its fixed 209-byte wire layout. First byte is
+    /// [`IDENTITY_ENVELOPE_VERSION`]. Producer always stamps the
+    /// current version; readers reject any other byte via
+    /// [`Self::from_bytes`].
     pub fn to_bytes(&self) -> [u8; IDENTITY_ENVELOPE_SIZE] {
         let mut buf = [0u8; IDENTITY_ENVELOPE_SIZE];
         let mut cursor = &mut buf[..];
+        cursor.put_u8(IDENTITY_ENVELOPE_VERSION);
         cursor.put_slice(&self.target_static_pub);
         cursor.put_slice(&self.sealed_seed);
         cursor.put_slice(&self.signer_pub);
@@ -443,15 +450,26 @@ impl IdentityEnvelope {
     }
 
     /// Deserialize from bytes. Returns `None` if the input is
-    /// shorter than [`IDENTITY_ENVELOPE_SIZE`]. Trailing bytes are
-    /// an error because a short envelope is indistinguishable from
-    /// a truncation, and a long envelope would swallow data the
-    /// parent frame expects to consume next.
+    /// not exactly [`IDENTITY_ENVELOPE_SIZE`] bytes OR if the
+    /// leading version byte isn't [`IDENTITY_ENVELOPE_VERSION`].
+    /// Trailing bytes are an error because a short envelope is
+    /// indistinguishable from a truncation, and a long envelope
+    /// would swallow data the parent frame expects to consume
+    /// next.
+    ///
+    /// Without the version byte, the reader would have to try v1
+    /// AAD then fall back to v0 (empty AAD) on AEAD failure —
+    /// doubled CPU per legitimate-v0-replay probe. The version
+    /// byte is the deterministic selector; the v0 fallback path
+    /// is gone.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() != IDENTITY_ENVELOPE_SIZE {
             return None;
         }
-        let mut cursor = data;
+        if data[0] != IDENTITY_ENVELOPE_VERSION {
+            return None;
+        }
+        let mut cursor = &data[1..];
         let mut target_static_pub = [0u8; 32];
         cursor.copy_to_slice(&mut target_static_pub);
         let mut sealed_seed = [0u8; 80];
@@ -566,9 +584,29 @@ mod tests {
     // ---- Wire format ----
 
     #[test]
-    fn wire_size_is_208_bytes() {
-        assert_eq!(IDENTITY_ENVELOPE_SIZE, 208);
-        assert_eq!(raw_fixture().to_bytes().len(), 208);
+    fn wire_size_is_209_bytes() {
+        // Wire bump: 208 → 209 (one leading version byte).
+        assert_eq!(IDENTITY_ENVELOPE_SIZE, 209);
+        assert_eq!(raw_fixture().to_bytes().len(), 209);
+    }
+
+    #[test]
+    fn first_byte_is_version_marker() {
+        let bytes = raw_fixture().to_bytes();
+        assert_eq!(bytes[0], IDENTITY_ENVELOPE_VERSION);
+        assert_eq!(IDENTITY_ENVELOPE_VERSION, 1);
+    }
+
+    #[test]
+    fn from_bytes_rejects_unknown_version() {
+        let mut bytes = raw_fixture().to_bytes();
+        bytes[0] = 0; // pre-#102 v0 wire shape (no version byte)
+        assert!(
+            IdentityEnvelope::from_bytes(&bytes).is_none(),
+            "post-#102 reader must reject the v0 shape; rolling-upgrade compat is gone"
+        );
+        bytes[0] = 0xFF;
+        assert!(IdentityEnvelope::from_bytes(&bytes).is_none());
     }
 
     #[test]
@@ -583,7 +621,7 @@ mod tests {
     fn from_bytes_rejects_truncated() {
         let env = raw_fixture();
         let bytes = env.to_bytes();
-        assert!(IdentityEnvelope::from_bytes(&bytes[..207]).is_none());
+        assert!(IdentityEnvelope::from_bytes(&bytes[..208]).is_none());
         assert!(IdentityEnvelope::from_bytes(&[]).is_none());
     }
 
@@ -775,78 +813,30 @@ mod tests {
         assert_eq!(err, EnvelopeError::SourceReadOnly);
     }
 
-    /// CR-5: rolling-upgrade compatibility. A "v0" envelope —
-    /// produced by a peer running master (pre-#127), where the
-    /// AEAD AAD was `&[]` rather than `chain_link.to_bytes()` —
-    /// must open cleanly under the new HEAD verifier. We construct
-    /// the v0 wire form by hand here (re-implementing the seal
-    /// path with empty AAD) since master is not in this tree.
+    /// Rolling-upgrade compatibility from v0 (pre-version-byte)
+    /// was REMOVED in this wire-bump. A hand-built v0 envelope
+    /// (or any 208-byte payload that would have been a v0
+    /// envelope) is now rejected at `from_bytes`'s version-byte
+    /// check — the v0 AEAD fallback path that used to double CPU
+    /// per legitimate-v0-replay probe is gone.
     ///
-    /// Pre-CR-5 the AEAD verify call used only the v1 AAD, so
-    /// every legitimate v0 envelope landing on a HEAD peer failed
-    /// with `SealOpenFailed`. Post-CR-5 the verifier tries v1
-    /// first, then falls back to v0 — so the v0 envelope opens.
-    /// The signature is independent of the AEAD AAD, so attestation
-    /// continues to bind the chain_link properly under both forms.
+    /// This test pins that the reader rejects any 208-byte input
+    /// AND any 209-byte input whose first byte is not
+    /// [`IDENTITY_ENVELOPE_VERSION`] = 1.
     #[test]
-    fn open_accepts_v0_envelope_for_rolling_upgrade_compat() {
-        let source = EntityKeypair::generate();
-        let (target_sk, target_pk) = fresh_x25519();
-        let link = chain_link_at(7);
-
-        // Build a v0-style envelope by replicating `seal` minus the
-        // chain_link AAD binding.
-        let mut rng_bytes = [0u8; 32];
-        getrandom::fill(&mut rng_bytes).unwrap();
-        let eph_sk = X25519Secret::from(rng_bytes);
-        let eph_pk = X25519Pub::from(&eph_sk);
-        let target_pk_obj = X25519Pub::from(target_pk);
-        let shared = eph_sk.diffie_hellman(&target_pk_obj);
-        let key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
-        let nonce = derive_nonce(eph_pk.as_bytes(), &target_pk);
-
-        let aead = XChaCha20Poly1305::new((&key).into());
-        let seed: &[u8; 32] = source.secret_bytes();
-        // Pre-#127: empty AAD. This is the master shape we need
-        // to be backward-compatible with.
-        let ciphertext = aead
-            .encrypt(
-                (&nonce).into(),
-                Payload {
-                    msg: seed.as_slice(),
-                    aad: &[],
-                },
-            )
-            .unwrap();
-
-        let mut sealed_seed = [0u8; 80];
-        sealed_seed[..EPH_PK_LEN].copy_from_slice(eph_pk.as_bytes());
-        sealed_seed[EPH_PK_LEN..].copy_from_slice(&ciphertext);
-
-        // Attestation transcript is unchanged across v0/v1 — both
-        // sign over `target_static_pub || chain_link.to_bytes()`.
-        let transcript = attestation_transcript(&target_pk, &link);
-        let sig = source.try_sign(&transcript).unwrap();
-
-        let v0_env = IdentityEnvelope {
-            target_static_pub: target_pk,
-            sealed_seed,
-            signer_pub: *source.entity_id().as_bytes(),
-            signature: sig.to_bytes(),
-        };
-
-        // Open under the HEAD verifier. v1 AEAD attempt fails (the
-        // AAD differs); v0 fallback succeeds. The opened keypair
-        // is the original.
-        let opened = v0_env
-            .open(&target_sk, &link, None)
-            .expect("v0 envelope must open under v1 verifier (rolling-upgrade compat)");
-        assert_eq!(opened.entity_id(), source.entity_id());
+    fn open_rejects_pre_wire_bump_v0_envelope() {
+        let env = raw_fixture();
+        let v1_bytes = env.to_bytes();
+        // 208 bytes (pre-bump shape): rejected on length.
+        assert!(IdentityEnvelope::from_bytes(&v1_bytes[1..]).is_none());
+        // 209 bytes with version=0: rejected on version byte.
+        let mut v0_shape = v1_bytes;
+        v0_shape[0] = 0;
+        assert!(IdentityEnvelope::from_bytes(&v0_shape).is_none());
     }
 
-    /// CR-5: pin that v1 envelopes still open without exercising
-    /// the fallback path. This is the post-#127 happy-path; the
-    /// v0 fallback must NOT change the cost or behavior here.
+    /// Pin that v1 envelopes open with a single AEAD attempt —
+    /// no fallback path remains.
     #[test]
     fn open_accepts_v1_envelope_on_first_try() {
         let source = EntityKeypair::generate();

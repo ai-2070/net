@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 
 import { NetDb, TaskStatus, TasksOrderBy, MemoriesOrderBy } from '../index'
 
-const ORIGIN = 0xabcdef01
+const ORIGIN = 0xabcdef01n
 
 describe('NetDb — build + inspect', () => {
   it('opens with both models', async () => {

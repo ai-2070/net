@@ -12,7 +12,7 @@ use net::adapter::net::cortex::tasks::{OrderBy as TasksOrderBy, TaskStatus};
 use net::adapter::net::netdb::{MemoriesFilter, NetDb, NetDbSnapshot, TasksFilter};
 use net::adapter::net::redex::Redex;
 
-const ORIGIN: u32 = 0xABCD_EF01;
+const ORIGIN: u64 = 0xABCD_EF01;
 
 #[tokio::test]
 async fn test_netdb_build_with_both_models() {

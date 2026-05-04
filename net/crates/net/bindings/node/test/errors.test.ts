@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest'
 import { MemoriesAdapter, NetDb, Redex, TasksAdapter } from '../index'
 import { classifyError, CortexError, NetDbError } from '../errors'
 
-const ORIGIN = 0xabcdef01
+const ORIGIN = 0xabcdef01n
 
 function nowNs(): bigint {
   return BigInt(Date.now()) * 1_000_000n

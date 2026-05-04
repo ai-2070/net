@@ -141,7 +141,7 @@ impl StandbyGroup {
 
     /// Replace the observer so it now fires for `new_origin`. Used
     /// on promote / on_node_failure when the active member changes.
-    fn rebind_observer(&self, new_origin: u32) {
+    fn rebind_observer(&self, new_origin: u64) {
         let observer = make_buffer_observer(&self.inner);
         let new_handle = self.runtime.register_deliver_observer(new_origin, observer);
         // Swap in the new handle; the old one's `Drop` unregisters
@@ -160,7 +160,7 @@ impl StandbyGroup {
 
     /// `origin_hash` of the current active member. Events always
     /// go through the active; standbys don't process inputs.
-    pub fn active_origin(&self) -> u32 {
+    pub fn active_origin(&self) -> u64 {
         self.inner
             .lock()
             .expect("StandbyGroup mutex poisoned")
@@ -197,7 +197,7 @@ impl StandbyGroup {
     /// Returns the promoted member's new `origin_hash` (stays
     /// the same as before — keypair is re-derived deterministically).
     /// Reuses the group's spawn kind; no external parameter.
-    pub fn promote(&self) -> Result<u32, GroupError> {
+    pub fn promote(&self) -> Result<u64, GroupError> {
         let factory = self
             .runtime
             .factory_for_kind_pub(&self.kind)
@@ -219,7 +219,7 @@ impl StandbyGroup {
     /// auto-promotes the most-synced standby and returns its
     /// `origin_hash`. If only standbys were affected, returns
     /// `None` — the caller can re-sync those standbys later.
-    pub fn on_node_failure(&self, failed_node_id: u64) -> Result<Option<u32>, GroupError> {
+    pub fn on_node_failure(&self, failed_node_id: u64) -> Result<Option<u64>, GroupError> {
         let factory = self
             .runtime
             .factory_for_kind_pub(&self.kind)

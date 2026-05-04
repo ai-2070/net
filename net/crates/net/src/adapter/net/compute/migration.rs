@@ -124,7 +124,7 @@ impl std::fmt::Display for MigrationFailureReason {
 /// State of an in-progress migration.
 pub struct MigrationState {
     /// Origin hash of the daemon being migrated.
-    daemon_origin: u32,
+    daemon_origin: u64,
     /// Source node ID.
     source_node: u64,
     /// Target node ID.
@@ -148,7 +148,7 @@ pub struct MigrationState {
 
 impl MigrationState {
     /// Create a new migration.
-    pub fn new(daemon_origin: u32, source_node: u64, target_node: u64) -> Self {
+    pub fn new(daemon_origin: u64, source_node: u64, target_node: u64) -> Self {
         Self {
             daemon_origin,
             source_node,
@@ -264,7 +264,7 @@ impl MigrationState {
 
     /// Get the daemon origin hash.
     #[inline]
-    pub fn daemon_origin(&self) -> u32 {
+    pub fn daemon_origin(&self) -> u64 {
         self.daemon_origin
     }
 
@@ -310,7 +310,7 @@ impl std::fmt::Debug for MigrationState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationError {
     /// Daemon not registered locally.
-    DaemonNotFound(u32),
+    DaemonNotFound(u64),
     /// Target node unreachable or refused.
     TargetUnavailable(u64),
     /// Auto-placement found no candidate node satisfying the
@@ -324,7 +324,7 @@ pub enum MigrationError {
     /// Snapshot/restore failure.
     StateFailed(String),
     /// Migration already in progress for this daemon.
-    AlreadyMigrating(u32),
+    AlreadyMigrating(u64),
     /// Attempted to advance from wrong phase.
     WrongPhase {
         /// Expected phase.

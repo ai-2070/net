@@ -116,7 +116,7 @@ impl ReplicaGroup {
     /// returning the target `origin_hash`. The caller then calls
     /// [`DaemonRuntime::deliver`](crate::compute::DaemonRuntime::deliver)
     /// with the returned hash.
-    pub fn route_event(&self, ctx: &RequestContext) -> Result<u32, GroupError> {
+    pub fn route_event(&self, ctx: &RequestContext) -> Result<u64, GroupError> {
         let guard = self.inner.lock().expect("ReplicaGroup mutex poisoned");
         Ok(guard.route_event(ctx)?)
     }

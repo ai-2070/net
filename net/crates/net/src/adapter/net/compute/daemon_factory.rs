@@ -61,7 +61,7 @@ pub struct ConstructedInputs {
 /// Thread-safe registry of daemon factories keyed by `origin_hash`.
 #[derive(Default)]
 pub struct DaemonFactoryRegistry {
-    entries: DashMap<u32, FactoryEntry>,
+    entries: DashMap<u64, FactoryEntry>,
 }
 
 impl DaemonFactoryRegistry {
@@ -130,7 +130,7 @@ impl DaemonFactoryRegistry {
     /// on an already-registered `origin_hash`, never clobbers.
     pub fn register_placeholder<F>(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         config: DaemonHostConfig,
         factory: F,
     ) -> Result<(), DaemonError>
@@ -158,7 +158,7 @@ impl DaemonFactoryRegistry {
     /// to retain the factory in case the attempt fails (e.g., transient
     /// snapshot parse error). Call [`Self::remove`] after a successful
     /// restore to mark the migration single-shot.
-    pub fn construct(&self, origin_hash: u32) -> Option<ConstructedInputs> {
+    pub fn construct(&self, origin_hash: u64) -> Option<ConstructedInputs> {
         let entry = self.entries.get(&origin_hash)?;
         Some(ConstructedInputs {
             daemon: (entry.factory)(),
@@ -170,7 +170,7 @@ impl DaemonFactoryRegistry {
     /// Remove the factory entry for `origin_hash` (e.g., after a
     /// successful restore). Idempotent: removing a non-existent entry is
     /// a no-op.
-    pub fn remove(&self, origin_hash: u32) {
+    pub fn remove(&self, origin_hash: u64) {
         self.entries.remove(&origin_hash);
     }
 
@@ -180,12 +180,12 @@ impl DaemonFactoryRegistry {
     /// Prefer [`Self::construct`] + [`Self::remove`] in callers that want
     /// to retry restore on failure — `take` discards the entry even if the
     /// caller hasn't actually used it yet.
-    pub fn take(&self, origin_hash: u32) -> Option<FactoryEntry> {
+    pub fn take(&self, origin_hash: u64) -> Option<FactoryEntry> {
         self.entries.remove(&origin_hash).map(|(_, entry)| entry)
     }
 
     /// Whether a factory is currently registered for `origin_hash`.
-    pub fn contains(&self, origin_hash: u32) -> bool {
+    pub fn contains(&self, origin_hash: u64) -> bool {
         self.entries.contains_key(&origin_hash)
     }
 

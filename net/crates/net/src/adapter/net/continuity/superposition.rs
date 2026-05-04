@@ -59,7 +59,7 @@ impl SuperpositionPhase {
 /// `MigrationState` from L5.
 pub struct SuperpositionState {
     /// Entity being migrated.
-    origin_hash: u32,
+    origin_hash: u64,
     /// Source node's chain head at snapshot time.
     source_head: CausalLink,
     /// Target node's chain head (advances during replay).
@@ -74,7 +74,7 @@ pub struct SuperpositionState {
 
 impl SuperpositionState {
     /// Create a new superposition state when migration begins.
-    pub fn new(origin_hash: u32, source_head: CausalLink) -> Self {
+    pub fn new(origin_hash: u64, source_head: CausalLink) -> Self {
         Self {
             origin_hash,
             source_head,
@@ -194,7 +194,7 @@ impl SuperpositionState {
 
     /// Get the origin hash.
     #[inline]
-    pub fn origin_hash(&self) -> u32 {
+    pub fn origin_hash(&self) -> u64 {
         self.origin_hash
     }
 
@@ -234,7 +234,7 @@ impl std::fmt::Debug for SuperpositionState {
 mod tests {
     use super::*;
 
-    fn make_link(origin: u32, seq: u64) -> CausalLink {
+    fn make_link(origin: u64, seq: u64) -> CausalLink {
         CausalLink {
             origin_hash: origin,
             horizon_encoded: 0,

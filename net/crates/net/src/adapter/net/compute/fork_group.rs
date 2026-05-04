@@ -71,7 +71,7 @@ pub struct ForkInfo {
 /// The group coordinates routing, health, and replacement across forks.
 pub struct ForkGroup {
     /// Origin hash of the parent daemon that was forked.
-    parent_origin: u32,
+    parent_origin: u64,
     /// Sequence number at which the fork occurred.
     fork_seq: u64,
     /// Configuration.
@@ -94,7 +94,7 @@ impl ForkGroup {
     ///
     /// The parent daemon is NOT modified — it continues unchanged.
     pub fn fork<F>(
-        parent_origin: u32,
+        parent_origin: u64,
         fork_seq: u64,
         config: ForkGroupConfig,
         daemon_factory: F,
@@ -156,7 +156,7 @@ impl ForkGroup {
     }
 
     /// Route an inbound event to the best available fork.
-    pub fn route_event(&self, ctx: &RequestContext) -> Result<u32, GroupError> {
+    pub fn route_event(&self, ctx: &RequestContext) -> Result<u64, GroupError> {
         self.coord.route_event(ctx)
     }
 
@@ -371,7 +371,7 @@ impl ForkGroup {
     }
 
     /// Get the parent daemon's origin hash.
-    pub fn parent_origin(&self) -> u32 {
+    pub fn parent_origin(&self) -> u64 {
         self.parent_origin
     }
 
@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(reg.count(), 3);
 
         // Each fork has a unique origin_hash
-        let hashes: HashSet<u32> = group.members().iter().map(|m| m.origin_hash).collect();
+        let hashes: HashSet<u64> = group.members().iter().map(|m| m.origin_hash).collect();
         assert_eq!(hashes.len(), 3);
     }
 
@@ -705,11 +705,11 @@ mod tests {
         .unwrap();
 
         // Each fork should have a unique origin
-        let origins: HashSet<u32> = group.members().iter().map(|m| m.origin_hash).collect();
+        let origins: HashSet<u64> = group.members().iter().map(|m| m.origin_hash).collect();
         assert_eq!(origins.len(), 5);
 
         // Each fork record should have a unique forked_origin
-        let forked: HashSet<u32> = group
+        let forked: HashSet<u64> = group
             .fork_records()
             .iter()
             .map(|r| r.forked_origin)

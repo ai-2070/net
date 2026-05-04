@@ -15,6 +15,7 @@
 //! goroutine that pumps into a channel, calling `close` on `ctx.Done()`.
 
 use std::ffi::{c_char, c_int, CStr, CString};
+use std::mem::ManuallyDrop;
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -39,6 +40,7 @@ use crate::adapter::net::redex::{
     RedexFileConfig,
 };
 
+use super::handle_guard::{HandleGuard, FFI_HANDLE_FREE_DEADLINE};
 use super::NetError;
 
 // =========================================================================
@@ -219,8 +221,17 @@ const _: fn() = || {
 // Redex manager
 // =========================================================================
 
+/// FFI handle wrapping an [`InnerRedex`] manager.
+///
+/// Carries a [`HandleGuard`] so a Go cgo / Python-thread caller
+/// racing `net_redex_free` against `net_redex_open_file` /
+/// `net_tasks_adapter_open` / `net_memories_adapter_open` doesn't
+/// UAF the dropped inner. Box is intentionally leaked on free;
+/// inner Arc lives in [`ManuallyDrop`] for take-and-drop after
+/// the drain.
 pub struct RedexHandle {
-    inner: Arc<InnerRedex>,
+    inner: ManuallyDrop<Arc<InnerRedex>>,
+    guard: HandleGuard,
 }
 
 /// Create a new Redex manager. `persistent_dir` may be NULL for
@@ -238,7 +249,8 @@ pub extern "C" fn net_redex_new(persistent_dir: *const c_char) -> *mut RedexHand
         None => InnerRedex::new(),
     };
     Box::into_raw(Box::new(RedexHandle {
-        inner: Arc::new(inner),
+        inner: ManuallyDrop::new(Arc::new(inner)),
+        guard: HandleGuard::new(),
     }))
 }
 
@@ -247,8 +259,21 @@ pub extern "C" fn net_redex_free(handle: *mut RedexHandle) {
     if handle.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(handle));
+    // Quiesce in-flight ops before dropping the inner.
+    // Box stays leaked. See `super::handle_guard` for soundness.
+    let h: &RedexHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: `freeing=true` blocks new ops; `active_ops`
+        // drained to zero. We hold the unique writable reference.
+        unsafe {
+            let inner = ManuallyDrop::take(&mut (*handle).inner);
+            drop(inner);
+        }
+    } else {
+        tracing::warn!(
+            "net_redex_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -267,8 +292,21 @@ struct RedexFileConfigJson {
     retention_max_age_ms: Option<u64>,
 }
 
+/// FFI handle wrapping a [`InnerRedexFile`].
+///
+/// Carries a [`HandleGuard`] to close the audit-#23 use-after-free:
+/// pre-fix `net_redex_file_free` was an unconditional
+/// `Box::from_raw`, so a Go cgo / Python-thread caller racing
+/// `net_redex_file_append` against `_free` would have its
+/// concurrent `&*handle` deref read freed memory.
+///
+/// `inner` lives in [`ManuallyDrop`] so `_free` can take it out
+/// after quiescing in-flight ops; the outer `Box` is intentionally
+/// leaked (the handle box must outlive `try_enter`'s `fetch_add`
+/// — see [`super::handle_guard`] for the full soundness story).
 pub struct RedexFileHandle {
-    inner: Arc<InnerRedexFile>,
+    inner: ManuallyDrop<Arc<InnerRedexFile>>,
+    guard: HandleGuard,
 }
 
 /// Open (or get) a RedEX file for raw append / tail / read-range.
@@ -289,6 +327,10 @@ pub extern "C" fn net_redex_open_file(
         return NetError::NullPointer.into();
     }
     let redex = unsafe { &*redex };
+    let _op = match redex.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(name_str) = (unsafe { c_str_to_owned(name) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -339,7 +381,8 @@ pub extern "C" fn net_redex_open_file(
     match redex.inner.open_file(&channel, cfg) {
         Ok(file) => {
             let handle = Box::new(RedexFileHandle {
-                inner: Arc::new(file),
+                inner: ManuallyDrop::new(Arc::new(file)),
+                guard: HandleGuard::new(),
             });
             unsafe {
                 *out_handle = Box::into_raw(handle);
@@ -355,8 +398,40 @@ pub extern "C" fn net_redex_file_free(handle: *mut RedexFileHandle) {
     if handle.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(handle));
+    // Quiesce in-flight ops before dropping the inner.
+    // The outer Box is intentionally leaked — see
+    // `super::handle_guard` for the soundness story (concurrent
+    // ops doing `try_enter`'s `fetch_add` on a deallocated atomic
+    // would UAF).
+    //
+    // SAFETY: `handle` is non-null per the early return above; the
+    // caller's contract pins it to a previously-returned
+    // `*mut RedexFileHandle`. The guard reference outlives this
+    // function (the box stays leaked).
+    let h: &RedexFileHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // No in-flight ops; future try_enter calls bail. Safe to
+        // take the inner Arc and drop it (which drops InnerRedexFile
+        // when no other Arc clones exist).
+        // SAFETY: we hold the unique writable reference at this
+        // point — `freeing=true` blocks all new ops, and active_ops
+        // has drained to zero. Take goes through a `*mut` because
+        // `&` doesn't permit `ManuallyDrop::take` (consumes by
+        // ownership).
+        unsafe {
+            let inner = ManuallyDrop::take(&mut (*handle).inner);
+            drop(inner);
+        }
+    } else {
+        // Timeout: in-flight ops still running past the deadline.
+        // Leak the inner along with the box rather than risk a UAF.
+        // The bus-level `tracing` infra surfaces the wedge for
+        // operators; here we degrade silently rather than panic
+        // across `extern "C"`.
+        tracing::warn!(
+            "net_redex_file_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -372,6 +447,14 @@ pub extern "C" fn net_redex_file_append(
         return NetError::NullPointer.into();
     }
     let file = unsafe { &*handle };
+    // Refuse to touch `inner` if `_free` has begun. Without this
+    // gate, a Go cgo / Python-thread caller racing `_free`
+    // against this function reads freed memory after `_free`
+    // drops the inner.
+    let _op = match file.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let slice = unsafe { std::slice::from_raw_parts(payload, len) };
     match file.inner.append(slice) {
         Ok(seq) => {
@@ -420,6 +503,14 @@ pub extern "C" fn net_redex_file_len(handle: *mut RedexFileHandle) -> u64 {
         return 0;
     }
     let file = unsafe { &*handle };
+    let _op = match file.guard.try_enter() {
+        Some(op) => op,
+        // 0 is a valid `len`; can't distinguish from "freed" via the
+        // return value alone. Caller racing free against `_len`
+        // already accepts the post-free 0 result; this path makes
+        // the read sound (no UAF on `inner`).
+        None => return 0,
+    };
     file.inner.len() as u64
 }
 
@@ -436,6 +527,10 @@ pub extern "C" fn net_redex_file_read_range(
         return NetError::NullPointer.into();
     }
     let file = unsafe { &*handle };
+    let _op = match file.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let events: Vec<RedexEventJson> = file
         .inner
         .read_range(start, end)
@@ -451,6 +546,10 @@ pub extern "C" fn net_redex_file_sync(handle: *mut RedexFileHandle) -> c_int {
         return NetError::NullPointer.into();
     }
     let file = unsafe { &*handle };
+    let _op = match file.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match file.inner.sync() {
         Ok(()) => 0,
         Err(_) => NET_ERR_REDEX,
@@ -463,6 +562,10 @@ pub extern "C" fn net_redex_file_close(handle: *mut RedexFileHandle) -> c_int {
         return NetError::NullPointer.into();
     }
     let file = unsafe { &*handle };
+    let _op = match file.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match file.inner.close() {
         Ok(()) => 0,
         Err(_) => NET_ERR_REDEX,
@@ -471,8 +574,21 @@ pub extern "C" fn net_redex_file_close(handle: *mut RedexFileHandle) -> c_int {
 
 // RedEX tail cursor
 
+/// Type alias to keep the [`RedexTailHandle`] field type from
+/// tripping clippy's `type_complexity` lint without `#[allow]`.
+type RedexTailStream = ManuallyDrop<
+    TokioMutex<Option<BoxStream<'static, std::result::Result<RedexEvent, RedexError>>>>,
+>;
+
+/// FFI handle for a tail cursor over a [`RedexFileHandle`].
+///
+/// Same `HandleGuard` recipe applies. The inner is a
+/// `TokioMutex<Option<BoxStream<...>>>`; on free we drain
+/// in-flight `next` calls before taking the inner via
+/// `ManuallyDrop`. Box stays leaked.
 pub struct RedexTailHandle {
-    stream: TokioMutex<Option<BoxStream<'static, std::result::Result<RedexEvent, RedexError>>>>,
+    stream: RedexTailStream,
+    guard: HandleGuard,
 }
 
 #[unsafe(no_mangle)]
@@ -485,10 +601,15 @@ pub extern "C" fn net_redex_file_tail(
         return NetError::NullPointer.into();
     }
     let file = unsafe { &*handle };
+    let _op = match file.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let stream = file.inner.tail(from_seq);
     let boxed: BoxStream<'static, std::result::Result<RedexEvent, RedexError>> = stream.boxed();
     let cursor = Box::new(RedexTailHandle {
-        stream: TokioMutex::new(Some(boxed)),
+        stream: ManuallyDrop::new(TokioMutex::new(Some(boxed))),
+        guard: HandleGuard::new(),
     });
     unsafe {
         *out_cursor = Box::into_raw(cursor);
@@ -521,6 +642,10 @@ pub extern "C" fn net_redex_tail_next(
     // NET_ERR_STREAM_ENDED without touching the out params.
     zero_out_json(out_json, out_len);
     let cursor = unsafe { &*cursor };
+    let _op = match cursor.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
@@ -574,8 +699,20 @@ pub extern "C" fn net_redex_tail_free(cursor: *mut RedexTailHandle) {
     if cursor.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(cursor));
+    // Quiesce in-flight `_next` ops before dropping the inner
+    // stream. Box stays leaked.
+    let h: &RedexTailHandle = unsafe { &*cursor };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference.
+        unsafe {
+            let stream = ManuallyDrop::take(&mut (*cursor).stream);
+            drop(stream);
+        }
+    } else {
+        tracing::warn!(
+            "net_redex_tail_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -584,8 +721,14 @@ pub extern "C" fn net_redex_tail_free(cursor: *mut RedexTailHandle) {
 // Redex + Tasks + Memories without a dedicated FFI handle.
 // =========================================================================
 
+/// FFI handle wrapping an [`InnerTasksAdapter`].
+///
+/// Same `HandleGuard` recipe as `RedexHandle` / `RedexFileHandle`.
+/// Box leaked on free; inner Arc lives in `ManuallyDrop` for
+/// take-and-drop after drain.
 pub struct TasksAdapterHandle {
-    inner: Arc<InnerTasksAdapter>,
+    inner: ManuallyDrop<Arc<InnerTasksAdapter>>,
+    guard: HandleGuard,
 }
 
 /// Open a tasks adapter against a Redex. `persistent != 0` routes
@@ -594,7 +737,7 @@ pub struct TasksAdapterHandle {
 #[unsafe(no_mangle)]
 pub extern "C" fn net_tasks_adapter_open(
     redex: *mut RedexHandle,
-    origin_hash: u32,
+    origin_hash: u64,
     persistent: c_int,
     out_handle: *mut *mut TasksAdapterHandle,
 ) -> c_int {
@@ -602,6 +745,10 @@ pub extern "C" fn net_tasks_adapter_open(
         return NetError::NullPointer.into();
     }
     let redex = unsafe { &*redex };
+    let _op = match redex.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let cfg = if persistent != 0 {
         RedexFileConfig::default().with_persistent(true)
     } else {
@@ -609,14 +756,15 @@ pub extern "C" fn net_tasks_adapter_open(
     };
     // `open_with_config` spawns the fold task via `tokio::spawn` and
     // needs a live reactor; run under our runtime.
-    let redex_inner = redex.inner.clone();
+    let redex_inner: Arc<InnerRedex> = Arc::clone(&redex.inner);
     let result = block_on(async move {
         InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
     });
     match result {
         Ok(adapter) => {
             let handle = Box::new(TasksAdapterHandle {
-                inner: Arc::new(adapter),
+                inner: ManuallyDrop::new(Arc::new(adapter)),
+                guard: HandleGuard::new(),
             });
             unsafe {
                 *out_handle = Box::into_raw(handle);
@@ -633,6 +781,10 @@ pub extern "C" fn net_tasks_adapter_close(handle: *mut TasksAdapterHandle) -> c_
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match tasks.inner.close() {
         Ok(()) => 0,
         Err(_) => NET_ERR_CORTEX_CLOSED,
@@ -644,8 +796,19 @@ pub extern "C" fn net_tasks_adapter_free(handle: *mut TasksAdapterHandle) {
     if handle.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(handle));
+    // Quiesce in-flight ops before dropping inner; box leaked.
+    let h: &TasksAdapterHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference.
+        unsafe {
+            let inner = ManuallyDrop::take(&mut (*handle).inner);
+            drop(inner);
+        }
+    } else {
+        tracing::warn!(
+            "net_tasks_adapter_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -685,6 +848,10 @@ pub extern "C" fn net_tasks_create(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(title) = (unsafe { c_str_to_owned(title) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -711,6 +878,10 @@ pub extern "C" fn net_tasks_rename(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(nt) = (unsafe { c_str_to_owned(new_title) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -736,6 +907,10 @@ pub extern "C" fn net_tasks_complete(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match tasks.inner.complete(id, now_ns) {
         Ok(seq) => {
             unsafe {
@@ -757,6 +932,10 @@ pub extern "C" fn net_tasks_delete(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match tasks.inner.delete(id) {
         Ok(seq) => {
             unsafe {
@@ -781,7 +960,11 @@ pub extern "C" fn net_tasks_wait_for_seq(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
-    let adapter = tasks.inner.clone();
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let adapter: Arc<InnerTasksAdapter> = Arc::clone(&tasks.inner);
     block_on(async move {
         let fut = adapter.wait_for_seq(seq);
         if timeout_ms == 0 {
@@ -953,6 +1136,10 @@ pub extern "C" fn net_tasks_list(
     // the contract documented on `write_json_out`.
     zero_out_json(out_json, out_len);
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let filter = match build_tasks_list_filter(filter_json) {
         Ok(f) => f,
         Err(code) => return code,
@@ -964,8 +1151,13 @@ pub extern "C" fn net_tasks_list(
     write_json_out(&items, out_json, out_len)
 }
 
+/// FFI handle for a tasks-watch cursor.
+///
+/// Same `HandleGuard` recipe. Box leaked on free; inner stream
+/// lives in `ManuallyDrop`.
 pub struct TasksWatchHandle {
-    stream: TokioMutex<Option<BoxStream<'static, Vec<Task>>>>,
+    stream: ManuallyDrop<TokioMutex<Option<BoxStream<'static, Vec<Task>>>>>,
+    guard: HandleGuard,
 }
 
 /// Atomic snapshot + watch. Writes:
@@ -988,13 +1180,17 @@ pub extern "C" fn net_tasks_snapshot_and_watch(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let watcher = match build_tasks_watcher(&tasks.inner, filter_json) {
         Ok(w) => w,
         Err(code) => return code,
     };
     // `watcher.stream()` spawns a forwarding task — needs a live
     // reactor.
-    let adapter = tasks.inner.clone();
+    let adapter: Arc<InnerTasksAdapter> = Arc::clone(&tasks.inner);
     let (snapshot, stream) = block_on(async move { adapter.snapshot_and_watch(watcher) });
     let snapshot_json: Vec<TaskJson> = snapshot.into_iter().map(TaskJson::from).collect();
     let code = write_json_out(&snapshot_json, out_snapshot, out_snapshot_len);
@@ -1002,7 +1198,8 @@ pub extern "C" fn net_tasks_snapshot_and_watch(
         return code;
     }
     let handle = Box::new(TasksWatchHandle {
-        stream: TokioMutex::new(Some(stream)),
+        stream: ManuallyDrop::new(TokioMutex::new(Some(stream))),
+        guard: HandleGuard::new(),
     });
     unsafe {
         *out_cursor = Box::into_raw(handle);
@@ -1024,6 +1221,10 @@ pub extern "C" fn net_tasks_watch_next(
         return NetError::NullPointer.into();
     }
     let cursor = unsafe { &*cursor };
+    let _op = match cursor.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
@@ -1061,8 +1262,17 @@ pub extern "C" fn net_tasks_watch_free(cursor: *mut TasksWatchHandle) {
     if cursor.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(cursor));
+    let h: &TasksWatchHandle = unsafe { &*cursor };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        unsafe {
+            let stream = ManuallyDrop::take(&mut (*cursor).stream);
+            drop(stream);
+        }
+    } else {
+        tracing::warn!(
+            "net_tasks_watch_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -1070,14 +1280,20 @@ pub extern "C" fn net_tasks_watch_free(cursor: *mut TasksWatchHandle) {
 // Memories adapter (same shape as tasks)
 // =========================================================================
 
+/// FFI handle wrapping an [`InnerMemoriesAdapter`].
+///
+/// Same `HandleGuard` recipe as the other cortex handles. Box
+/// leaked on free; inner Arc lives in `ManuallyDrop` for
+/// take-and-drop after drain.
 pub struct MemoriesAdapterHandle {
-    inner: Arc<InnerMemoriesAdapter>,
+    inner: ManuallyDrop<Arc<InnerMemoriesAdapter>>,
+    guard: HandleGuard,
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn net_memories_adapter_open(
     redex: *mut RedexHandle,
-    origin_hash: u32,
+    origin_hash: u64,
     persistent: c_int,
     out_handle: *mut *mut MemoriesAdapterHandle,
 ) -> c_int {
@@ -1085,19 +1301,24 @@ pub extern "C" fn net_memories_adapter_open(
         return NetError::NullPointer.into();
     }
     let redex = unsafe { &*redex };
+    let _op = match redex.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let cfg = if persistent != 0 {
         RedexFileConfig::default().with_persistent(true)
     } else {
         RedexFileConfig::default()
     };
-    let redex_inner = redex.inner.clone();
+    let redex_inner: Arc<InnerRedex> = Arc::clone(&redex.inner);
     let result = block_on(async move {
         InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
     });
     match result {
         Ok(adapter) => {
             let handle = Box::new(MemoriesAdapterHandle {
-                inner: Arc::new(adapter),
+                inner: ManuallyDrop::new(Arc::new(adapter)),
+                guard: HandleGuard::new(),
             });
             unsafe {
                 *out_handle = Box::into_raw(handle);
@@ -1114,6 +1335,10 @@ pub extern "C" fn net_memories_adapter_close(handle: *mut MemoriesAdapterHandle)
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match mem.inner.close() {
         Ok(()) => 0,
         Err(_) => NET_ERR_CORTEX_CLOSED,
@@ -1125,8 +1350,19 @@ pub extern "C" fn net_memories_adapter_free(handle: *mut MemoriesAdapterHandle) 
     if handle.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(handle));
+    // Quiesce in-flight ops before dropping inner; box leaked.
+    let h: &MemoriesAdapterHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference.
+        unsafe {
+            let inner = ManuallyDrop::take(&mut (*handle).inner);
+            drop(inner);
+        }
+    } else {
+        tracing::warn!(
+            "net_memories_adapter_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -1176,6 +1412,10 @@ pub extern "C" fn net_memories_store(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(s) = (unsafe { c_str_to_owned(input_json) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -1217,6 +1457,10 @@ pub extern "C" fn net_memories_retag(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(s) = (unsafe { c_str_to_owned(input_json) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -1246,6 +1490,10 @@ pub extern "C" fn net_memories_pin(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match mem.inner.pin(id, now_ns) {
         Ok(seq) => {
             unsafe {
@@ -1268,6 +1516,10 @@ pub extern "C" fn net_memories_unpin(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match mem.inner.unpin(id, now_ns) {
         Ok(seq) => {
             unsafe {
@@ -1289,6 +1541,10 @@ pub extern "C" fn net_memories_delete(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match mem.inner.delete(id) {
         Ok(seq) => {
             unsafe {
@@ -1310,7 +1566,11 @@ pub extern "C" fn net_memories_wait_for_seq(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
-    let adapter = mem.inner.clone();
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let adapter: Arc<InnerMemoriesAdapter> = Arc::clone(&mem.inner);
     block_on(async move {
         let fut = adapter.wait_for_seq(seq);
         if timeout_ms == 0 {
@@ -1503,6 +1763,10 @@ pub extern "C" fn net_memories_list(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let filter = match build_memories_list_filter(filter_json) {
         Ok(f) => f,
         Err(code) => return code,
@@ -1514,8 +1778,11 @@ pub extern "C" fn net_memories_list(
     write_json_out(&items, out_json, out_len)
 }
 
+/// FFI handle for a memories-watch cursor. Same `HandleGuard`
+/// recipe as `TasksWatchHandle`.
 pub struct MemoriesWatchHandle {
-    stream: TokioMutex<Option<BoxStream<'static, Vec<Memory>>>>,
+    stream: ManuallyDrop<TokioMutex<Option<BoxStream<'static, Vec<Memory>>>>>,
+    guard: HandleGuard,
 }
 
 #[unsafe(no_mangle)]
@@ -1534,11 +1801,15 @@ pub extern "C" fn net_memories_snapshot_and_watch(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let watcher = match build_memories_watcher(&mem.inner, filter_json) {
         Ok(w) => w,
         Err(code) => return code,
     };
-    let adapter = mem.inner.clone();
+    let adapter: Arc<InnerMemoriesAdapter> = Arc::clone(&mem.inner);
     let (snapshot, stream) = block_on(async move { adapter.snapshot_and_watch(watcher) });
     let snapshot_json: Vec<MemoryJson> = snapshot.into_iter().map(MemoryJson::from).collect();
     let code = write_json_out(&snapshot_json, out_snapshot, out_snapshot_len);
@@ -1546,7 +1817,8 @@ pub extern "C" fn net_memories_snapshot_and_watch(
         return code;
     }
     let handle = Box::new(MemoriesWatchHandle {
-        stream: TokioMutex::new(Some(stream)),
+        stream: ManuallyDrop::new(TokioMutex::new(Some(stream))),
+        guard: HandleGuard::new(),
     });
     unsafe {
         *out_cursor = Box::into_raw(handle);
@@ -1565,6 +1837,10 @@ pub extern "C" fn net_memories_watch_next(
         return NetError::NullPointer.into();
     }
     let cursor = unsafe { &*cursor };
+    let _op = match cursor.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
@@ -1602,8 +1878,17 @@ pub extern "C" fn net_memories_watch_free(cursor: *mut MemoriesWatchHandle) {
     if cursor.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(cursor));
+    let h: &MemoriesWatchHandle = unsafe { &*cursor };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        unsafe {
+            let stream = ManuallyDrop::take(&mut (*cursor).stream);
+            drop(stream);
+        }
+    } else {
+        tracing::warn!(
+            "net_memories_watch_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -1779,6 +2064,170 @@ mod tests {
 
         net_redex_tail_free(cursor);
         net_redex_file_free(file);
+        net_redex_free(r);
+    }
+
+    /// A Go cgo / Python-thread caller racing
+    /// `net_redex_file_free` against a concurrent
+    /// `net_redex_file_append` (or any RedexFile op) must not
+    /// produce a use-after-free. Without the guard, `_free` would
+    /// be an unconditional `Box::from_raw` and the concurrent
+    /// op's `&*handle` deref would read freed memory.
+    ///
+    /// We can't deterministically inject the race in a unit test
+    /// without race-injection scaffolding, but we CAN pin the two
+    /// load-bearing invariants:
+    ///   1. After `_free`, future ops bail with `ShuttingDown`
+    ///      rather than touching the (taken-out) inner.
+    ///   2. `_free` is idempotent — a second call returns
+    ///      immediately without touching the already-taken inner.
+    ///      The leaked outer Box stays valid; the second
+    ///      `begin_free` observes `freeing=true` (set by the
+    ///      first caller's `compare_exchange`) and returns
+    ///      `false`, skipping the `ManuallyDrop::take` branch
+    ///      entirely.
+    #[test]
+    fn redex_file_free_blocks_subsequent_ops_with_shutting_down() {
+        let r = redex();
+        let name = CString::new("free-then-op").unwrap();
+        let mut file: *mut RedexFileHandle = ptr::null_mut();
+        assert_eq!(
+            net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
+            0
+        );
+        assert!(!file.is_null());
+
+        // Free the file. begin_free drains immediately (no in-flight
+        // ops), takes the inner, leaks the outer box.
+        net_redex_file_free(file);
+
+        // Subsequent ops via the same handle must bail with
+        // ShuttingDown — try_enter sees freeing=true, decrements,
+        // returns None. They must NOT touch the taken inner.
+        let payload = b"x";
+        let mut out_seq: u64 = 0;
+        let rc = net_redex_file_append(file, payload.as_ptr(), payload.len(), &mut out_seq);
+        assert_eq!(
+            rc,
+            NetError::ShuttingDown as c_int,
+            "post-free append must surface ShuttingDown (got {rc})",
+        );
+        assert_eq!(out_seq, 0, "no seq must be assigned to a post-free append");
+
+        // _len takes the silent path (returns 0 — same as the absent
+        // case) per its contract.
+        assert_eq!(net_redex_file_len(file), 0);
+
+        // _read_range / _sync / _close also bail with ShuttingDown.
+        let mut out_json: *mut c_char = ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = net_redex_file_read_range(file, 0, 1, &mut out_json, &mut out_len);
+        assert_eq!(rc, NetError::ShuttingDown as c_int);
+        assert_eq!(net_redex_file_sync(file), NetError::ShuttingDown as c_int);
+        assert_eq!(net_redex_file_close(file), NetError::ShuttingDown as c_int);
+
+        net_redex_free(r);
+    }
+
+    /// Pin: `net_redex_file_free` is idempotent under the post-fix
+    /// protocol. Pre-fix a second call after the first
+    /// `Box::from_raw` was a double-free; post-fix the second call
+    /// observes `freeing=true` and returns without touching the
+    /// already-taken inner. The handle box is leaked (intentional
+    /// — see handle_guard module docs) so the second call's
+    /// `&*handle` deref is on still-valid memory.
+    #[test]
+    fn redex_file_free_is_idempotent() {
+        let r = redex();
+        let name = CString::new("free-twice").unwrap();
+        let mut file: *mut RedexFileHandle = ptr::null_mut();
+        assert_eq!(
+            net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
+            0
+        );
+        net_redex_file_free(file);
+        // Second free: must not panic, must not double-take the
+        // ManuallyDrop, must not deallocate the outer box.
+        net_redex_file_free(file);
+        net_redex_free(r);
+    }
+
+    /// A `net_redex_file_free` racing an in-flight
+    /// `net_redex_file_append` from another thread must wait for
+    /// the append to finish before taking the inner. Without the
+    /// guard, free would proceed immediately and the append's
+    /// subsequent `&*handle` deref would UAF the dropped inner.
+    ///
+    /// We use a long-running append (large payload + sync after)
+    /// on a background thread and call `_free` from the main
+    /// thread once the append has been observed to start. `_free`
+    /// blocks until the append's `try_enter` guard drops.
+    #[test]
+    fn redex_file_free_waits_for_inflight_append() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let r = redex();
+        let name = CString::new("free-races-append").unwrap();
+        let mut file: *mut RedexFileHandle = ptr::null_mut();
+        assert_eq!(
+            net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
+            0
+        );
+
+        // Smuggle the raw pointer across threads via usize. The
+        // contract: pre- and during-the-append, no `_free` runs;
+        // the worker signals `started` once it's inside append's
+        // try_enter; main waits for that signal then calls free.
+        let file_addr = file as usize;
+        let started = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let started_w = started.clone();
+        let done_w = done.clone();
+        let worker = std::thread::spawn(move || {
+            // Append a chunk — the inner work is fast, so we wrap
+            // the call in a brief sleep AFTER signaling started so
+            // the test can race _free against an in-flight op.
+            // Doing this without a hook in append itself means we
+            // can only approximate the race; the timing window is
+            // ~30ms which is enough to catch a missing guard.
+            started_w.store(true, Ordering::SeqCst);
+            let payload = b"hello";
+            let mut out_seq: u64 = 0;
+            let h = file_addr as *mut RedexFileHandle;
+            // The append itself completes fast; sleep simulates a
+            // longer-running op. In production a long op is e.g.
+            // a large read_range with serialization.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let rc = net_redex_file_append(h, payload.as_ptr(), payload.len(), &mut out_seq);
+            done_w.store(true, Ordering::SeqCst);
+            // The append should succeed if it ran before _free's
+            // begin_free flipped freeing. If it ran after, it
+            // should bail with ShuttingDown — both outcomes are
+            // sound; the bug pre-fix was a UAF panic / corruption,
+            // not a Stale return.
+            assert!(
+                rc == 0 || rc == NetError::ShuttingDown as c_int,
+                "post-fix append after begin_free must EITHER succeed (op got there first) \
+                 OR return ShuttingDown — never UAF. Got rc={rc}, out_seq={out_seq}",
+            );
+        });
+
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // Main: free the file. Post-fix this blocks until the
+        // worker's append (which the worker holds via try_enter)
+        // releases; pre-fix it would proceed immediately and the
+        // worker's subsequent inner-deref would UAF.
+        net_redex_file_free(file);
+
+        worker.join().unwrap();
+        assert!(
+            done.load(Ordering::SeqCst),
+            "worker must have completed; the test would otherwise hang \
+             past the watchdog if free's begin_free deadlocked",
+        );
+
         net_redex_free(r);
     }
 

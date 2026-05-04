@@ -29,7 +29,7 @@ pub enum Causality {
 #[derive(Debug, Clone)]
 pub struct CausalCone {
     /// Origin of the event this cone belongs to.
-    origin_hash: u32,
+    origin_hash: u64,
     /// Sequence of the event.
     sequence: u64,
     /// Full horizon at this point (exact, if available locally).
@@ -63,7 +63,7 @@ impl CausalCone {
     }
 
     /// Could event from `other_origin` at `other_seq` have influenced this event?
-    pub fn could_have_influenced(&self, other_origin: u32, other_seq: u64) -> Causality {
+    pub fn could_have_influenced(&self, other_origin: u64, other_seq: u64) -> Causality {
         // Same entity: strictly ordered by sequence
         if other_origin == self.origin_hash {
             return if other_seq < self.sequence {
@@ -172,7 +172,7 @@ impl CausalCone {
 
     /// Get the origin hash.
     #[inline]
-    pub fn origin_hash(&self) -> u32 {
+    pub fn origin_hash(&self) -> u64 {
         self.origin_hash
     }
 
@@ -199,7 +199,7 @@ impl CausalCone {
 mod tests {
     use super::*;
 
-    fn make_link(origin: u32, seq: u64, horizon: u64) -> CausalLink {
+    fn make_link(origin: u64, seq: u64, horizon: u64) -> CausalLink {
         CausalLink {
             origin_hash: origin,
             horizon_encoded: horizon,
@@ -332,19 +332,19 @@ mod tests {
         // Build A's horizon with 32 distinct origins, NOT including
         // B's origin (0xBBBB).
         let mut h_a = ObservedHorizon::new();
-        for i in 0u32..32 {
+        for i in 0u64..32 {
             // Skip 0xBBBB so A genuinely hasn't observed B.
-            let origin = 0x10000u32 + i;
-            h_a.observe(origin, i as u64 + 1);
+            let origin = 0x10000u64 + i;
+            h_a.observe(origin, i + 1);
         }
         h_a.observe(0xAAAA, 100); // A's own origin
 
         // Build B's horizon with 32 distinct origins, NOT including
         // A's origin (0xAAAA).
         let mut h_b = ObservedHorizon::new();
-        for i in 0u32..32 {
-            let origin = 0x20000u32 + i;
-            h_b.observe(origin, i as u64 + 1);
+        for i in 0u64..32 {
+            let origin = 0x20000u64 + i;
+            h_b.observe(origin, i + 1);
         }
         h_b.observe(0xBBBB, 100); // B's own origin
 

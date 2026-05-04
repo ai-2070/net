@@ -1785,7 +1785,19 @@ mod tests {
         // active_count = 3, max = 4. Allocate TWO Provisioning
         // shards; both pass the budget gate (it sees active_count=3).
         let ids_a = mapper.scale_up_provisioning(1).unwrap();
-        let ids_b = mapper.scale_up_provisioning(1).unwrap();
+        // The 1ns cooldown elapses on every realistic scheduler
+        // tick; if we lose that race, retry. Release-mode and
+        // some debug-build paths occasionally finish the first
+        // allocation in <1ns of wall time.
+        let ids_b = loop {
+            match mapper.scale_up_provisioning(1) {
+                Ok(v) => break v,
+                Err(ScalingError::InCooldown) => {
+                    std::thread::sleep(Duration::from_nanos(50));
+                }
+                Err(e) => panic!("unexpected error from scale_up_provisioning: {:?}", e),
+            }
+        };
         assert_eq!(ids_a.len(), 1);
         assert_eq!(ids_b.len(), 1);
 

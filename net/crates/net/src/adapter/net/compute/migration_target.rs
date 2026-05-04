@@ -23,7 +23,7 @@ use crate::adapter::net::state::snapshot::StateSnapshot;
 /// Per-daemon target-side migration state.
 #[allow(dead_code)]
 struct TargetMigrationState {
-    daemon_origin: u32,
+    daemon_origin: u64,
     source_node: u64,
     /// Node that initiated the migration. Replies
     /// (RestoreComplete / ReplayComplete / ActivateAck) are routed here.
@@ -56,7 +56,7 @@ struct CompletedTargetState {
 pub struct RestoreContext<'a> {
     /// `origin_hash` of the daemon being migrated. Must match
     /// `snapshot.entity_id.origin_hash()`.
-    pub daemon_origin: u32,
+    pub daemon_origin: u64,
     /// The snapshot to restore from.
     pub snapshot: &'a StateSnapshot,
     /// Node the daemon is migrating from.
@@ -77,7 +77,7 @@ pub struct MigrationTargetHandler {
     /// Target node's daemon registry.
     daemon_registry: Arc<DaemonRegistry>,
     /// Active migrations on this node as target: daemon_origin → state.
-    migrations: DashMap<u32, Mutex<TargetMigrationState>>,
+    migrations: DashMap<u64, Mutex<TargetMigrationState>>,
     /// Factories for constructing daemon instances during restore.
     ///
     /// Consulted by the subprotocol handler when it has a reassembled
@@ -89,7 +89,7 @@ pub struct MigrationTargetHandler {
     /// retried `ActivateTarget` after a lost `ActivateAck` looks up the
     /// stored `(orchestrator_node, replayed_through)` and re-sends the
     /// same ack instead of failing with `DaemonNotFound`.
-    completed: DashMap<u32, CompletedTargetState>,
+    completed: DashMap<u64, CompletedTargetState>,
 }
 
 impl MigrationTargetHandler {
@@ -200,7 +200,7 @@ impl MigrationTargetHandler {
 
     /// Recorded orchestrator for an active or recently-completed
     /// target-side migration.
-    pub fn orchestrator_node(&self, daemon_origin: u32) -> Option<u64> {
+    pub fn orchestrator_node(&self, daemon_origin: u64) -> Option<u64> {
         if let Some(e) = self.migrations.get(&daemon_origin) {
             return Some(e.lock().orchestrator_node);
         }
@@ -215,7 +215,7 @@ impl MigrationTargetHandler {
     /// in strict order. Returns the sequence number replayed through.
     pub fn replay_events(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         events: Vec<CausalEvent>,
     ) -> Result<u64, MigrationError> {
         let entry = self
@@ -259,7 +259,7 @@ impl MigrationTargetHandler {
     /// returns `Ok(false)` first.
     pub fn buffer_event(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         event: CausalEvent,
     ) -> Result<bool, MigrationError> {
         let entry = match self.migrations.get(&daemon_origin) {
@@ -292,7 +292,7 @@ impl MigrationTargetHandler {
     /// over a completed record for the same origin: a new migration for
     /// the same daemon (e.g., migrated back to us later) must not be
     /// skipped just because we still remember the previous completion.
-    pub fn activate(&self, daemon_origin: u32) -> Result<u64, MigrationError> {
+    pub fn activate(&self, daemon_origin: u64) -> Result<u64, MigrationError> {
         if let Some(entry) = self.migrations.get(&daemon_origin) {
             let mut state = entry.lock();
             state.phase = MigrationPhase::Cutover;
@@ -334,7 +334,7 @@ impl MigrationTargetHandler {
     /// thread observing both maps still sees the migration in at least
     /// one of them at every instant — closing the original
     /// `DaemonNotFound` gap on `activate()` retries.
-    pub fn complete(&self, daemon_origin: u32) -> Result<(), MigrationError> {
+    pub fn complete(&self, daemon_origin: u64) -> Result<(), MigrationError> {
         use dashmap::mapref::entry::Entry;
         match self.migrations.entry(daemon_origin) {
             Entry::Occupied(occ) => {
@@ -373,7 +373,7 @@ impl MigrationTargetHandler {
     /// Forget a completed migration's retry-idempotency record. Safe to
     /// call at any time; a subsequent retried `ActivateTarget` would
     /// then fail normally with `DaemonNotFound`.
-    pub fn forget_completed(&self, daemon_origin: u32) -> bool {
+    pub fn forget_completed(&self, daemon_origin: u64) -> bool {
         self.completed.remove(&daemon_origin).is_some()
     }
 
@@ -392,7 +392,7 @@ impl MigrationTargetHandler {
     /// abort path. Clearing both indices makes `abort`
     /// idempotent in the strong sense: post-abort state
     /// matches pre-`start_restore` state.
-    pub fn abort(&self, daemon_origin: u32) -> Result<(), MigrationError> {
+    pub fn abort(&self, daemon_origin: u64) -> Result<(), MigrationError> {
         if self.migrations.remove(&daemon_origin).is_some() {
             // Unregister daemon (it's not authoritative, source still has it)
             let _ = self.daemon_registry.unregister(daemon_origin);
@@ -402,19 +402,19 @@ impl MigrationTargetHandler {
     }
 
     /// Check if a daemon is being migrated to this node.
-    pub fn is_migrating(&self, daemon_origin: u32) -> bool {
+    pub fn is_migrating(&self, daemon_origin: u64) -> bool {
         self.migrations.contains_key(&daemon_origin)
     }
 
     /// Get the current phase of a target-side migration.
-    pub fn phase(&self, daemon_origin: u32) -> Option<MigrationPhase> {
+    pub fn phase(&self, daemon_origin: u64) -> Option<MigrationPhase> {
         self.migrations
             .get(&daemon_origin)
             .map(|entry| entry.lock().phase)
     }
 
     /// Get the sequence number replayed through.
-    pub fn replayed_through(&self, daemon_origin: u32) -> Option<u64> {
+    pub fn replayed_through(&self, daemon_origin: u64) -> Option<u64> {
         self.migrations
             .get(&daemon_origin)
             .map(|entry| entry.lock().replayed_through)
@@ -549,7 +549,7 @@ mod tests {
         }
     }
 
-    fn make_event(origin: u32, seq: u64) -> CausalEvent {
+    fn make_event(origin: u64, seq: u64) -> CausalEvent {
         CausalEvent {
             link: CausalLink {
                 origin_hash: origin,
@@ -1095,11 +1095,11 @@ mod tests {
         // the gap. With the bug, this hits `DaemonNotFound` reliably.
         // With the fix, it never does.
         use std::collections::HashSet;
-        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::thread;
 
         const TRIALS: u32 = 2_000;
-        const STOP: u32 = u32::MAX;
+        const STOP: u64 = u64::MAX;
 
         let reg = Arc::new(DaemonRegistry::new());
         let handler = Arc::new(MigrationTargetHandler::new(reg.clone()));
@@ -1107,7 +1107,7 @@ mod tests {
         // Observer is signaled by writing the current trial's origin
         // into `current_origin`; `STOP` ends the observer. The observer
         // reports any DaemonNotFound it sees via `gap_seen`.
-        let current_origin = Arc::new(AtomicU32::new(0));
+        let current_origin = Arc::new(AtomicU64::new(0));
         let gap_seen = Arc::new(AtomicU64::new(0));
 
         let h_observer = handler.clone();
@@ -1125,7 +1125,7 @@ mod tests {
             match h_observer.activate(origin) {
                 Ok(_) => {}
                 Err(MigrationError::DaemonNotFound(o)) => {
-                    gap_observer.store(o as u64, Ordering::Release);
+                    gap_observer.store(o, Ordering::Release);
                     return;
                 }
                 Err(_) => {}
@@ -1140,7 +1140,7 @@ mod tests {
         // 2_000 trials of a 32-bit space is ~5e-4, so without this
         // guard the test would hang on the unwrap a small fraction
         // of the time.
-        let mut seen_origins: HashSet<u32> = HashSet::with_capacity(TRIALS as usize);
+        let mut seen_origins: HashSet<u64> = HashSet::with_capacity(TRIALS as usize);
 
         for _ in 0..TRIALS {
             if gap_seen.load(Ordering::Acquire) != 0 {
@@ -1221,7 +1221,7 @@ mod tests {
 
         let reg = Arc::new(DaemonRegistry::new());
         let handler = Arc::new(MigrationTargetHandler::new(reg.clone()));
-        let mut seen_origins: HashSet<u32> = HashSet::with_capacity(TRIALS as usize);
+        let mut seen_origins: HashSet<u64> = HashSet::with_capacity(TRIALS as usize);
 
         for _ in 0..TRIALS {
             let kp = EntityKeypair::generate();

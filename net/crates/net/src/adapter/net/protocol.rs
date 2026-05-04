@@ -172,7 +172,11 @@ pub struct NetHeader {
     // — mesh topology (48-59) —
     /// Subnet identifier for gateway routing
     pub subnet_id: u32,
-    /// Truncated blake2 hash of origin node identity
+    /// Truncated blake2 hash of origin node identity. Stays u32
+    /// (per-packet routing fast-path); application-layer
+    /// callers downcast `kp.origin_hash() as u32` when stuffing
+    /// this field. Bumping per-packet header has a much larger
+    /// blast radius than the routing-collision benefit.
     pub origin_hash: u32,
     /// Fragment group identifier
     pub fragment_id: u16,
@@ -293,8 +297,12 @@ impl NetHeader {
 
     /// Set origin node hash
     #[inline]
-    pub fn with_origin(mut self, origin_hash: u32) -> Self {
-        self.origin_hash = origin_hash;
+    /// Set the origin hash. Takes u64 (matches
+    /// `EntityKeypair::origin_hash()`) and downcasts to the
+    /// per-packet wire u32 — the per-packet header stays at 64
+    /// bytes; routing-hash collisions there are benign.
+    pub fn with_origin(mut self, origin_hash: u64) -> Self {
+        self.origin_hash = origin_hash as u32;
         self
     }
 

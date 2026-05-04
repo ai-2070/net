@@ -174,9 +174,9 @@ fn migration_phase_str(phase: CoreMigrationPhase) -> &'static str {
 #[pyclass(name = "CausalEvent", module = "net._net", from_py_object)]
 #[derive(Clone)]
 pub struct PyCausalEvent {
-    /// 32-bit hash of the emitting entity.
+    /// 64-bit hash of the emitting entity.
     #[pyo3(get)]
-    pub origin_hash: u32,
+    pub origin_hash: u64,
     /// Sequence number in the emitter's causal chain.
     #[pyo3(get)]
     pub sequence: u64,
@@ -191,7 +191,7 @@ impl PyCausalEvent {
     /// `DaemonRuntime.deliver` directly.
     #[new]
     #[pyo3(signature = (origin_hash, sequence, payload))]
-    fn new(origin_hash: u32, sequence: u64, payload: Vec<u8>) -> Self {
+    fn new(origin_hash: u64, sequence: u64, payload: Vec<u8>) -> Self {
         Self {
             origin_hash,
             sequence,
@@ -260,7 +260,7 @@ fn daemon_host_config_from_dict(config: Option<&Bound<'_, PyDict>>) -> PyResult<
 /// daemon — callers must call `stop(handle.origin_hash)`.
 #[pyclass(name = "DaemonHandle", module = "net._net")]
 pub struct PyDaemonHandle {
-    origin_hash: u32,
+    origin_hash: u64,
     entity_id: [u8; 32],
     #[allow(dead_code)]
     inner: SdkDaemonHandle,
@@ -280,9 +280,9 @@ impl PyDaemonHandle {
 
 #[pymethods]
 impl PyDaemonHandle {
-    /// 32-bit hash of the daemon's identity.
+    /// 64-bit hash of the daemon's identity.
     #[getter]
-    fn origin_hash(&self) -> u32 {
+    fn origin_hash(&self) -> u64 {
         self.origin_hash
     }
 
@@ -483,7 +483,7 @@ impl PyDaemonRuntime {
     /// Stop a daemon, removing it from the runtime's registry.
     /// Idempotent during `ShuttingDown`; raises for other
     /// failures with the `daemon:` prefix.
-    fn stop(&self, py: Python<'_>, origin_hash: u32) -> PyResult<()> {
+    fn stop(&self, py: Python<'_>, origin_hash: u64) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
         py.detach(move || {
@@ -504,7 +504,7 @@ impl PyDaemonRuntime {
     fn snapshot<'py>(
         &self,
         py: Python<'py>,
-        origin_hash: u32,
+        origin_hash: u64,
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
@@ -589,7 +589,7 @@ impl PyDaemonRuntime {
     fn deliver(
         &self,
         py: Python<'_>,
-        origin_hash: u32,
+        origin_hash: u64,
         event: &PyCausalEvent,
     ) -> PyResult<Vec<Py<PyBytes>>> {
         let core_event = CausalEvent {
@@ -637,7 +637,7 @@ impl PyDaemonRuntime {
     fn start_migration(
         &self,
         py: Python<'_>,
-        origin_hash: u32,
+        origin_hash: u64,
         source_node: u64,
         target_node: u64,
     ) -> PyResult<PyMigrationHandle> {
@@ -661,7 +661,7 @@ impl PyDaemonRuntime {
     fn start_migration_with(
         &self,
         py: Python<'_>,
-        origin_hash: u32,
+        origin_hash: u64,
         source_node: u64,
         target_node: u64,
         opts: &Bound<'_, PyDict>,
@@ -711,7 +711,7 @@ impl PyDaemonRuntime {
     fn expect_migration(
         &self,
         kind: String,
-        origin_hash: u32,
+        origin_hash: u64,
         config: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
         let cfg = daemon_host_config_from_dict(config)?;
@@ -743,7 +743,7 @@ impl PyDaemonRuntime {
     /// (`snapshot` | `transfer` | `restore` | `replay` |
     /// `cutover` | `complete`) or `None` if no migration is in
     /// flight for that origin.
-    fn migration_phase(&self, origin_hash: u32) -> Option<&'static str> {
+    fn migration_phase(&self, origin_hash: u64) -> Option<&'static str> {
         self.inner
             .migration_phase(origin_hash)
             .map(migration_phase_str)
@@ -771,7 +771,7 @@ impl PyDaemonRuntime {
 /// Keep the handle to observe phase transitions or request abort.
 #[pyclass(name = "MigrationHandle", module = "net._net")]
 pub struct PyMigrationHandle {
-    origin_hash: u32,
+    origin_hash: u64,
     source_node: u64,
     target_node: u64,
     inner: SdkMigrationHandle,
@@ -792,9 +792,9 @@ impl PyMigrationHandle {
 
 #[pymethods]
 impl PyMigrationHandle {
-    /// 32-bit origin hash of the daemon being migrated.
+    /// 64-bit origin hash of the daemon being migrated.
     #[getter]
-    fn origin_hash(&self) -> u32 {
+    fn origin_hash(&self) -> u64 {
         self.origin_hash
     }
 
@@ -1276,7 +1276,7 @@ mod tests {
         );
         let event = CausalEvent {
             link: ::net::adapter::net::state::causal::CausalLink {
-                origin_hash: 0xdead_beef,
+                origin_hash: 0xdead_beef_dead_beef,
                 horizon_encoded: 0,
                 sequence: 1,
                 parent_hash: 0,

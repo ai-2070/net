@@ -104,7 +104,15 @@ pub enum DaemonError {
     /// Restore from snapshot failed.
     RestoreFailed(String),
     /// Daemon not found in registry.
-    NotFound(u32),
+    NotFound(u64),
+    /// The daemon at this origin_hash was concurrently swapped
+    /// (`replace`d) or `unregister`ed while this caller was
+    /// preparing to mutate it. The caller's mutation did not
+    /// land — the registry detected the orphaned `Arc` after
+    /// acquiring the inner lock and bailed before invoking the
+    /// host. Retry the operation against the current
+    /// registered host (if any).
+    Stale(u64),
 }
 
 impl std::fmt::Display for DaemonError {
@@ -114,6 +122,11 @@ impl std::fmt::Display for DaemonError {
             Self::SnapshotFailed(msg) => write!(f, "snapshot failed: {}", msg),
             Self::RestoreFailed(msg) => write!(f, "restore failed: {}", msg),
             Self::NotFound(id) => write!(f, "daemon not found: {:#x}", id),
+            Self::Stale(id) => write!(
+                f,
+                "daemon {:#x} was swapped or unregistered concurrently; mutation did not land",
+                id
+            ),
         }
     }
 }

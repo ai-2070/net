@@ -2,7 +2,9 @@
 //! mutates [`super::state::TasksState`].
 
 use super::super::super::redex::{RedexError, RedexEvent, RedexFold};
-use super::super::meta::{compute_checksum, EventMeta, EVENT_META_SIZE};
+use super::super::meta::{
+    compute_checksum, compute_checksum_with_meta, EventMeta, EVENT_META_SIZE,
+};
 use super::dispatch::{
     DISPATCH_TASK_COMPLETED, DISPATCH_TASK_CREATED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RENAMED,
 };
@@ -38,20 +40,26 @@ impl RedexFold<TasksState> for TasksFold {
         let tail = &ev.payload[EVENT_META_SIZE..];
 
         // Verify the corruption-detection checksum stamped at
-        // ingest against the tail we received from RedEX.
+        // ingest against the bytes we received from RedEX.
         //
-        // This catches accidental disk corruption (stray bit
-        // flips, truncated writes, mis-aligned reads). It is NOT a
-        // tamper detector — the 32-bit unkeyed xxh3 truncation is
-        // recomputable by any party that can write to the
-        // underlying file. See `compute_checksum`'s doc for the
-        // full scope. Tamper resistance must be layered higher
-        // (e.g. the AEAD-protected mesh envelope).
-        let expected = compute_checksum(tail);
-        if meta.checksum != expected {
+        // v2 covers (header-with-zeroed-checksum-slot || tail),
+        // so a bit-flip in the dispatch byte (or any other
+        // header field) is caught — the legacy tail-only hash
+        // left those bytes unprotected and a `STORED → DELETED`
+        // flip silently re-routed the event to the wrong fold
+        // arm. Fall back to v1 (tail-only) for records
+        // written by pre-fix adapters; legacy records keep their
+        // original limitation, new writes get full coverage.
+        let v2_expected = compute_checksum_with_meta(&meta, tail);
+        let valid = if meta.checksum == v2_expected {
+            true
+        } else {
+            meta.checksum == compute_checksum(tail)
+        };
+        if !valid {
             return Err(RedexError::Decode(format!(
-                "tasks fold: EventMeta checksum mismatch at seq {} (got {:#010x}, tail hashes to {:#010x})",
-                ev.entry.seq, meta.checksum, expected
+                "tasks fold: EventMeta checksum mismatch at seq {} (got {:#010x}, v2 expected {:#010x})",
+                ev.entry.seq, meta.checksum, v2_expected
             )));
         }
 

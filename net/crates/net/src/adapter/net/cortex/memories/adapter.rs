@@ -14,7 +14,7 @@ use super::super::adapter::CortexAdapter;
 use super::super::config::CortexAdapterConfig;
 use super::super::envelope::EventEnvelope;
 use super::super::error::CortexAdapterError;
-use super::super::meta::{compute_checksum, EventMeta};
+use super::super::meta::{compute_checksum_with_meta, EventMeta};
 use super::super::watermark::WatermarkingFold;
 use super::dispatch::{
     DISPATCH_MEMORY_DELETED, DISPATCH_MEMORY_PINNED, DISPATCH_MEMORY_RETAGGED,
@@ -60,7 +60,7 @@ struct MemoriesSnapshotPayload {
 pub struct MemoriesAdapter {
     inner: CortexAdapter<MemoriesState>,
     /// Producer identity stamped on every `EventMeta`.
-    origin_hash: u32,
+    origin_hash: u64,
     /// Monotonic per-origin counter for `EventMeta::seq_or_ts`.
     /// Shared with the inner `WatermarkingFold` wrapper around
     /// [`MemoriesFold`]: the fold task advances this counter via
@@ -106,14 +106,14 @@ impl MemoriesAdapter {
     /// The pre-fix doc said "the first `ingest_typed` after open
     /// cannot collide with an already-stored event" full-stop;
     /// the qualifier "THIS ADAPTER caused" is the correction.
-    pub async fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
+    pub async fn open(redex: &Redex, origin_hash: u64) -> Result<Self, CortexAdapterError> {
         Self::open_with_config(redex, origin_hash, RedexFileConfig::default()).await
     }
 
     /// Like [`Self::open`] but with a caller-supplied `RedexFileConfig`.
     pub async fn open_with_config(
         redex: &Redex,
-        origin_hash: u32,
+        origin_hash: u64,
         redex_config: RedexFileConfig,
     ) -> Result<Self, CortexAdapterError> {
         let name = ChannelName::new(MEMORIES_CHANNEL).map_err(|e| {
@@ -302,7 +302,7 @@ impl MemoriesAdapter {
     /// See [`Self::open`] for why this is `async`.
     pub async fn open_from_snapshot(
         redex: &Redex,
-        origin_hash: u32,
+        origin_hash: u64,
         state_bytes: &[u8],
         last_seq: Option<u64>,
     ) -> Result<Self, CortexAdapterError> {
@@ -320,7 +320,7 @@ impl MemoriesAdapter {
     /// `RedexFileConfig`.
     pub async fn open_from_snapshot_with_config(
         redex: &Redex,
-        origin_hash: u32,
+        origin_hash: u64,
         redex_config: RedexFileConfig,
         state_bytes: &[u8],
         last_seq: Option<u64>,
@@ -381,13 +381,19 @@ impl MemoriesAdapter {
                 e.to_string(),
             ))
         })?;
-        let checksum = compute_checksum(&tail);
-        let payload_bytes = Bytes::from(tail);
-
         // See `tasks/adapter.rs::ingest_typed` for the full
         // fetch_add rationale.
         let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
-        let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
+        // Build the meta with checksum=0 first; `compute_checksum_with_meta`
+        // hashes the header (with the checksum slot zeroed) AND the
+        // tail, so we have to materialize the rest of the header
+        // before computing the checksum. The legacy tail-only
+        // `compute_checksum` left the dispatch / flags /
+        // origin_hash / seq_or_ts bytes outside the integrity
+        // check.
+        let mut meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, 0);
+        meta.checksum = compute_checksum_with_meta(&meta, &tail);
+        let payload_bytes = Bytes::from(tail);
         let env = EventEnvelope::new(meta, payload_bytes);
         self.inner.ingest(env)
     }

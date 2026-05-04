@@ -1397,16 +1397,25 @@ impl DiskSegment {
         // distinguish from a clean half-finished compact. A full
         // fix is a manifest-pointer scheme (write versioned
         // filenames, atomically swap a single "manifest" pointer),
-        // which is a format change deferred. The interim
-        // mitigation is the parent-dir fsync below: on POSIX,
-        // individual renames are not durable until the dirent is
-        // fsynced, so without that fsync a power loss could leave
-        // the directory pointing at the OLD inodes even after all
-        // three rename calls returned successfully. The fsync
-        // narrows but does not close the cross-file gap.
-        std::fs::rename(&idx_tmp, &idx_path).map_err(RedexError::io)?;
-        std::fs::rename(&dat_tmp, &dat_path).map_err(RedexError::io)?;
-        std::fs::rename(&ts_tmp, &ts_path).map_err(RedexError::io)?;
+        // which is a format change deferred.
+        //
+        // Per-rename durability is provided by `durable_rename`:
+        //   - On POSIX, a plain `rename` plus the parent-dir
+        //     `fsync_dir` below covers the dirent durability.
+        //   - On Windows, the stdlib `rename` returns once the
+        //     metadata reaches the cache; a power loss before the
+        //     NTFS journal commits can revert the directory even
+        //     after all three calls return successfully.
+        //     `durable_rename` switches to `MoveFileExW` with
+        //     `MOVEFILE_WRITE_THROUGH` so each rename blocks until
+        //     the disk has acknowledged. The cross-file mixed-state
+        //     window between renames is unchanged on either
+        //     platform — the manifest-pointer rework remains the
+        //     long-term fix — but the post-call durability gap is
+        //     now closed on Windows too.
+        durable_rename(&idx_tmp, &idx_path).map_err(RedexError::io)?;
+        durable_rename(&dat_tmp, &dat_path).map_err(RedexError::io)?;
+        durable_rename(&ts_tmp, &ts_path).map_err(RedexError::io)?;
         fsync_dir(&self.dir).map_err(RedexError::io)?;
 
         // Open all six new handles (3 base + 3 worker clones) into
@@ -1445,17 +1454,18 @@ impl DiskSegment {
         let new_dat = open_or_poison(&dat_path)?;
         let new_ts = open_or_poison(&ts_path)?;
 
-        // Per-file durability flush. On POSIX `fsync_dir`
-        // above already covered the dir-level rename durability;
-        // on Windows it's a no-op (stdlib doesn't expose the
-        // dir-flush API). Calling `sync_all` on each renamed
-        // file's freshly-opened handle here ensures FILE CONTENT
-        // is durable on every target, even when dir-level
-        // atomicity is best-effort. Best-effort on the sync_all
-        // itself: a failure here does NOT roll back the rename
-        // (already committed), so we log and continue rather than
-        // surfacing a fail-the-compact error after the disk state
-        // has flipped.
+        // Per-file durability flush. On POSIX `fsync_dir` above
+        // covered the dir-level rename durability; on Windows
+        // each `durable_rename` call already wrote through to the
+        // disk via `MOVEFILE_WRITE_THROUGH`, so the dir-fsync
+        // below is the no-op variant. Calling `sync_all` on each
+        // renamed file's freshly-opened handle here ensures FILE
+        // CONTENT is durable on every target, regardless of
+        // platform. Best-effort on the sync_all itself: a failure
+        // here does NOT roll back the rename (already committed),
+        // so we log and continue rather than surfacing a
+        // fail-the-compact error after the disk state has
+        // flipped.
         if let Err(e) = new_idx.sync_all() {
             tracing::warn!(error = %e, "post-compact sync_all on idx failed (best-effort)");
         }
@@ -1581,34 +1591,95 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
-/// On non-Unix targets the `fsync_dir` helper is a no-op. Stdlib
-/// does not expose the Windows equivalent (`MoveFileExW` with
-/// `MOVEFILE_WRITE_THROUGH`, or `FlushFileBuffers` on a directory
-/// handle), so a power-loss between successful renames can leave
-/// the directory pointing at the OLD inodes even after every
-/// individual file has been flushed.
-///
-/// We log loudly ONCE per process so operators see the durability
-/// gap rather than silently relying on an empty-Ok return that
-/// looks indistinguishable from a successful POSIX fsync. The
-/// `compact_to` caller still benefits from per-file `sync_all`
-/// calls earlier in the sequence, so file CONTENT is durable —
-/// only the directory-level atomicity of the three-rename
-/// sequence is best-effort.
+/// On non-Unix targets the `fsync_dir` helper is a no-op. Windows
+/// has no `FlushFileBuffers`-on-a-directory-handle equivalent, but
+/// per-rename durability is provided by `durable_rename`'s
+/// `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` — so the dir-fsync
+/// step `fsync_dir` represents on POSIX is already covered on
+/// Windows by the rename call itself. This function exists only so
+/// the call site at the end of `compact_to` doesn't have to
+/// `cfg`-fork.
 #[cfg(not(unix))]
 fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::AcqRel) {
-        tracing::warn!(
-            os = std::env::consts::OS,
-            "redex fsync_dir is a NO-OP on this platform — directory-level \
-             rename atomicity is best-effort. Per-file content remains durable \
-             via the explicit sync_all calls in compact_to, but the cross-file \
-             rename sequence is not transactional."
-        );
-    }
     Ok(())
+}
+
+/// Rename `src` over `dst` with per-call durability.
+///
+/// On POSIX, equivalent to `std::fs::rename`. The caller is
+/// expected to follow up with `fsync_dir(parent)` to make the
+/// dirent change durable — `compact_to` does so at the end of the
+/// rename sequence.
+///
+/// On Windows, uses `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`:
+///   - `REPLACE_EXISTING` matches POSIX rename semantics on a
+///     pre-existing destination (the prior `fs::rename` path
+///     relied on the same behavior; Windows defaults are
+///     stricter).
+///   - `WRITE_THROUGH` blocks the call until the rename is
+///     committed to the physical disk via the NTFS journal,
+///     closing the durability hole that the stdlib `fs::rename`
+///     leaves open. Without this flag, every individual rename
+///     call could "succeed" while the dirent still lived only in
+///     the OS cache — a power loss after all three renames in
+///     `compact_to` could then revert the directory to the OLD
+///     filenames pointing at the OLD inodes.
+///
+/// The cross-file mixed-state window between two renames is
+/// unaffected on any platform; that's the deferred manifest-
+/// pointer rework. This helper only covers the within-rename
+/// durability gap.
+#[cfg(unix)]
+fn durable_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::rename(src, dst)
+}
+
+#[cfg(windows)]
+fn durable_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    fn to_wide_null(p: &Path) -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+    let src_w = to_wide_null(src);
+    let dst_w = to_wide_null(dst);
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    // SAFETY: `src_w` and `dst_w` are valid null-terminated UTF-16
+    // strings owned by `Vec<u16>` for the duration of the call.
+    // `MoveFileExW`'s contract is: read the wide strings, return
+    // BOOL. No aliasing, no escaping references.
+    let ok = unsafe {
+        MoveFileExW(
+            src_w.as_ptr(),
+            dst_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn durable_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::rename(src, dst)
 }
 
 /// Read the full idx file into a `Vec<RedexEntry>`.
@@ -2504,17 +2575,15 @@ mod tests {
         let _ = std::fs::remove_dir(&tmp);
     }
 
-    /// CR-11: on non-Unix targets, `fsync_dir` is a no-op that
-    /// returns `Ok(())` on ANY input — even a path that does not
-    /// exist, even a path that is not a directory. This pins the
-    /// no-op contract so a future "let's fail closed on Windows"
-    /// change has to also update this test (and consider whether
-    /// the change actually closes the durability hazard or just
-    /// trades durability gap for crash-on-bad-path).
-    ///
-    /// The compact_to caller covers the per-file durability via
-    /// the `sync_all` calls added in CR-11 — that's where the
-    /// real durability work happens on Windows.
+    /// On non-Unix targets, `fsync_dir` is a no-op that returns
+    /// `Ok(())` on ANY input — even a path that does not exist,
+    /// even a path that is not a directory. The directory-rename
+    /// durability that POSIX `fsync_dir` provides is covered on
+    /// Windows by `durable_rename`'s `MOVEFILE_WRITE_THROUGH`
+    /// flag, so the dir-fsync step is correctly a no-op there.
+    /// This test pins that no-op contract so a future "let's fail
+    /// closed on Windows" change has to also update both this
+    /// test AND the `durable_rename` durability story.
     #[cfg(not(unix))]
     #[test]
     fn fsync_dir_no_op_on_non_unix_returns_ok_even_for_nonexistent_paths() {
@@ -2530,6 +2599,80 @@ mod tests {
         ));
         assert!(!bogus.exists(), "test fixture: bogus path must not exist");
         super::fsync_dir(&bogus).expect("non-Unix fsync_dir must be a no-op Ok");
+    }
+
+    /// `durable_rename` must move `src` to `dst` and unlink `src`,
+    /// with byte-equal content preserved. Pins the cross-platform
+    /// contract — POSIX uses plain `rename`; Windows routes
+    /// through `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING |
+    /// MOVEFILE_WRITE_THROUGH)`. True power-loss durability of
+    /// the WRITE_THROUGH flag isn't unit-testable; this test
+    /// covers the syscall-correctness contract that the helper
+    /// is wired up at all and that its arguments translate
+    /// correctly through the FFI conversion.
+    #[test]
+    fn durable_rename_moves_file_and_preserves_contents() {
+        let dir = tmpdir();
+        let src = dir.join("durable_rename_src");
+        let dst = dir.join("durable_rename_dst");
+        std::fs::write(&src, b"durable_rename payload").expect("seed src");
+        assert!(src.exists());
+        assert!(!dst.exists());
+
+        super::durable_rename(&src, &dst).expect("durable_rename must succeed");
+
+        assert!(!src.exists(), "src must be unlinked after rename");
+        assert!(dst.exists(), "dst must exist after rename");
+        let bytes = std::fs::read(&dst).expect("read dst");
+        assert_eq!(bytes, b"durable_rename payload");
+    }
+
+    /// `durable_rename` must replace a pre-existing `dst`. Pins
+    /// the `MOVEFILE_REPLACE_EXISTING` semantic on Windows
+    /// (without that flag, the call would fail with
+    /// `ERROR_ALREADY_EXISTS`) and the matching POSIX
+    /// over-rename behavior. The three rename calls in
+    /// `compact_to` rely on this — the destination paths
+    /// (idx/dat/ts) always exist when compact runs against a
+    /// non-empty channel.
+    #[test]
+    fn durable_rename_replaces_existing_destination() {
+        let dir = tmpdir();
+        let src = dir.join("durable_rename_replace_src");
+        let dst = dir.join("durable_rename_replace_dst");
+        std::fs::write(&src, b"new contents").expect("seed src");
+        std::fs::write(&dst, b"old contents to be replaced").expect("seed dst");
+
+        super::durable_rename(&src, &dst).expect("rename over existing dst must succeed");
+
+        assert!(!src.exists(), "src must be unlinked after rename");
+        let bytes = std::fs::read(&dst).expect("read dst");
+        assert_eq!(
+            bytes, b"new contents",
+            "dst must hold src's content, not the old payload"
+        );
+    }
+
+    /// `durable_rename` must surface the OS error when `src` does
+    /// not exist — both POSIX `ENOENT` and Windows
+    /// `ERROR_FILE_NOT_FOUND` should round-trip through
+    /// `io::Error::last_os_error`. Pins that the helper does NOT
+    /// silently swallow failures; if the FFI return-value check
+    /// inverts (treats 0 as success on Windows), this test trips.
+    #[test]
+    fn durable_rename_surfaces_missing_source_error() {
+        let dir = tmpdir();
+        let bogus_src = dir.join("definitely-not-here");
+        let dst = dir.join("durable_rename_missing_dst");
+        assert!(!bogus_src.exists());
+
+        let err = super::durable_rename(&bogus_src, &dst)
+            .expect_err("rename of nonexistent src must fail");
+        assert!(!dst.exists(), "no dst should be created on failed rename");
+        // Stable check: the error kind must be NotFound across
+        // both platforms (POSIX ENOENT and Win32
+        // ERROR_FILE_NOT_FOUND both map there).
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     /// CR-4: `reopen_with_retries` must succeed on the first

@@ -27,7 +27,7 @@ use std::path::PathBuf;
 pub struct Redex {
     files: DashMap<ChannelName, RedexFile>,
     auth: Option<Arc<AuthGuard>>,
-    origin_hash: u32,
+    origin_hash: u64,
     #[cfg(feature = "redex-disk")]
     persistent_dir: Option<PathBuf>,
     /// Cumulative count of `build_file` invocations. Sits next to the
@@ -60,7 +60,7 @@ impl Redex {
     /// via [`AuthGuard::allow_channel`]. Uses the exact 64-bit
     /// channel identity, not the 16-bit wire hash — see the module
     /// docs for rationale.
-    pub fn with_auth(guard: Arc<AuthGuard>, origin_hash: u32) -> Self {
+    pub fn with_auth(guard: Arc<AuthGuard>, origin_hash: u64) -> Self {
         Self {
             files: DashMap::new(),
             auth: Some(guard),
@@ -110,7 +110,7 @@ impl Redex {
             // entity lives in the lower 2^32 and remote subscribers'
             // full node_ids occupy the full range, so there is no
             // cross-contamination.
-            if !auth.is_authorized_full(self.origin_hash as u64, name) {
+            if !auth.is_authorized_full(self.origin_hash, name) {
                 return Err(RedexError::Unauthorized);
             }
         }

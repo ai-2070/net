@@ -10,7 +10,7 @@
 use futures::StreamExt;
 use net_sdk::cortex::{MemoriesAdapter, NetDb, Redex, TaskStatus, TasksAdapter};
 
-const ORIGIN: u32 = 0xABCD_EF01;
+const ORIGIN: u64 = 0xABCD_EF01;
 
 #[tokio::test]
 async fn netdb_builder_bundles_both_adapters() {

@@ -29,14 +29,15 @@ impl EntityId {
         &self.0
     }
 
-    /// Derive the 4-byte origin hash for the Net header.
-    ///
-    /// Uses BLAKE2s-MAC keyed with `"net-origin"` to produce a truncated
-    /// hash. This is what goes into `NetHeader::origin_hash`.
+    /// Derive the 8-byte origin hash for application-layer
+    /// accounting (DashMap keys, `CausalLink`, `EventMeta`,
+    /// migration registries). The per-packet
+    /// `NetHeader::origin_hash` stays u32 (routing fast-path);
+    /// callers there downcast `kp.origin_hash() as u32`.
     #[inline]
-    pub fn origin_hash(&self) -> u32 {
+    pub fn origin_hash(&self) -> u64 {
         let hash = self.blake2s_hash(b"net-origin-v1");
-        u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]])
+        u64::from_le_bytes(hash[0..8].try_into().unwrap())
     }
 
     /// Derive the 8-byte node ID for swarm/routing.
@@ -164,8 +165,8 @@ pub struct EntityKeypair {
     /// [zeroized](Self::zeroize)). `Some(_)` is the normal path.
     signing_key: Option<SigningKey>,
     entity_id: EntityId,
-    /// Cached origin_hash (computed once)
-    origin_hash: u32,
+    /// Cached origin_hash.
+    origin_hash: u64,
     /// Cached node_id (computed once)
     node_id: u64,
 }
@@ -244,9 +245,10 @@ impl EntityKeypair {
         &self.entity_id
     }
 
-    /// Get the cached origin hash for the Net header.
+    /// Get the cached origin hash. The per-packet
+    /// `NetHeader::origin_hash` callers downcast via `as u32`.
     #[inline]
-    pub fn origin_hash(&self) -> u32 {
+    pub fn origin_hash(&self) -> u64 {
         self.origin_hash
     }
 
