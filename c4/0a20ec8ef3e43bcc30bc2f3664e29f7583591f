@@ -1,0 +1,33 @@
+net/crates/net/src/adapter/net/cortex/meta.rs
+  cdf934b360f502d7 104-116,119-128,130-137,165-202,308-400
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  cdf934b360f502d7 17,403-410
+net/crates/net/src/adapter/net/cortex/tasks/fold.rs
+  cdf934b360f502d7 5,41,43-57,59-60
+net/crates/net/src/adapter/net/cortex/memories/fold.rs
+  cdf934b360f502d7 5,38,40-54,56-57
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  cdf934b360f502d7 34
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  cdf934b360f502d7 17,387-396
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "c40a20ec8ef3e43bcc30bc2f3664e29f7583591f",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 222,
+      "total_deletions": 42,
+      "accepted_lines": 222,
+      "overriden_lines": 0
+    }
+  }
+}
