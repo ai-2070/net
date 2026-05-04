@@ -221,8 +221,17 @@ const _: fn() = || {
 // Redex manager
 // =========================================================================
 
+/// FFI handle wrapping an [`InnerRedex`] manager.
+///
+/// Carries a [`HandleGuard`] (audit #23 recipe) so a Go cgo /
+/// Python-thread caller racing `net_redex_free` against
+/// `net_redex_open_file` / `net_tasks_adapter_open` /
+/// `net_memories_adapter_open` doesn't UAF the dropped inner.
+/// Box is intentionally leaked on free; inner Arc lives in
+/// [`ManuallyDrop`] for take-and-drop after the drain.
 pub struct RedexHandle {
-    inner: Arc<InnerRedex>,
+    inner: ManuallyDrop<Arc<InnerRedex>>,
+    guard: HandleGuard,
 }
 
 /// Create a new Redex manager. `persistent_dir` may be NULL for
@@ -240,7 +249,8 @@ pub extern "C" fn net_redex_new(persistent_dir: *const c_char) -> *mut RedexHand
         None => InnerRedex::new(),
     };
     Box::into_raw(Box::new(RedexHandle {
-        inner: Arc::new(inner),
+        inner: ManuallyDrop::new(Arc::new(inner)),
+        guard: HandleGuard::new(),
     }))
 }
 
@@ -249,8 +259,21 @@ pub extern "C" fn net_redex_free(handle: *mut RedexHandle) {
     if handle.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(handle));
+    // Audit #23: quiesce in-flight ops before dropping the inner.
+    // Box stays leaked. See `super::handle_guard` for soundness.
+    let h: &RedexHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: `freeing=true` blocks new ops; `active_ops`
+        // drained to zero. We hold the unique writable reference.
+        unsafe {
+            let inner = ManuallyDrop::take(&mut (*handle).inner);
+            drop(inner);
+        }
+    } else {
+        tracing::warn!(
+            "net_redex_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -304,6 +327,10 @@ pub extern "C" fn net_redex_open_file(
         return NetError::NullPointer.into();
     }
     let redex = unsafe { &*redex };
+    let _op = match redex.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(name_str) = (unsafe { c_str_to_owned(name) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -547,8 +574,20 @@ pub extern "C" fn net_redex_file_close(handle: *mut RedexFileHandle) -> c_int {
 
 // RedEX tail cursor
 
+/// Type alias to keep the [`RedexTailHandle`] field type from
+/// tripping clippy's `type_complexity` lint without `#[allow]`.
+type RedexTailStream =
+    ManuallyDrop<TokioMutex<Option<BoxStream<'static, std::result::Result<RedexEvent, RedexError>>>>>;
+
+/// FFI handle for a tail cursor over a [`RedexFileHandle`].
+///
+/// Audit #23: same `HandleGuard` recipe applies. The inner is a
+/// `TokioMutex<Option<BoxStream<...>>>`; on free we drain
+/// in-flight `next` calls before taking the inner via
+/// `ManuallyDrop`. Box stays leaked.
 pub struct RedexTailHandle {
-    stream: TokioMutex<Option<BoxStream<'static, std::result::Result<RedexEvent, RedexError>>>>,
+    stream: RedexTailStream,
+    guard: HandleGuard,
 }
 
 #[unsafe(no_mangle)]
@@ -568,7 +607,8 @@ pub extern "C" fn net_redex_file_tail(
     let stream = file.inner.tail(from_seq);
     let boxed: BoxStream<'static, std::result::Result<RedexEvent, RedexError>> = stream.boxed();
     let cursor = Box::new(RedexTailHandle {
-        stream: TokioMutex::new(Some(boxed)),
+        stream: ManuallyDrop::new(TokioMutex::new(Some(boxed))),
+        guard: HandleGuard::new(),
     });
     unsafe {
         *out_cursor = Box::into_raw(cursor);
@@ -601,6 +641,10 @@ pub extern "C" fn net_redex_tail_next(
     // NET_ERR_STREAM_ENDED without touching the out params.
     zero_out_json(out_json, out_len);
     let cursor = unsafe { &*cursor };
+    let _op = match cursor.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
@@ -654,8 +698,20 @@ pub extern "C" fn net_redex_tail_free(cursor: *mut RedexTailHandle) {
     if cursor.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(cursor));
+    // Audit #23: quiesce in-flight `_next` ops before dropping the
+    // inner stream. Box stays leaked.
+    let h: &RedexTailHandle = unsafe { &*cursor };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference.
+        unsafe {
+            let stream = ManuallyDrop::take(&mut (*cursor).stream);
+            drop(stream);
+        }
+    } else {
+        tracing::warn!(
+            "net_redex_tail_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -664,8 +720,14 @@ pub extern "C" fn net_redex_tail_free(cursor: *mut RedexTailHandle) {
 // Redex + Tasks + Memories without a dedicated FFI handle.
 // =========================================================================
 
+/// FFI handle wrapping an [`InnerTasksAdapter`].
+///
+/// Audit #23: same `HandleGuard` recipe as `RedexHandle` /
+/// `RedexFileHandle`. Box leaked on free; inner Arc lives in
+/// `ManuallyDrop` for take-and-drop after drain.
 pub struct TasksAdapterHandle {
-    inner: Arc<InnerTasksAdapter>,
+    inner: ManuallyDrop<Arc<InnerTasksAdapter>>,
+    guard: HandleGuard,
 }
 
 /// Open a tasks adapter against a Redex. `persistent != 0` routes
@@ -682,6 +744,10 @@ pub extern "C" fn net_tasks_adapter_open(
         return NetError::NullPointer.into();
     }
     let redex = unsafe { &*redex };
+    let _op = match redex.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let cfg = if persistent != 0 {
         RedexFileConfig::default().with_persistent(true)
     } else {
@@ -689,14 +755,15 @@ pub extern "C" fn net_tasks_adapter_open(
     };
     // `open_with_config` spawns the fold task via `tokio::spawn` and
     // needs a live reactor; run under our runtime.
-    let redex_inner = redex.inner.clone();
+    let redex_inner: Arc<InnerRedex> = Arc::clone(&redex.inner);
     let result = block_on(async move {
         InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
     });
     match result {
         Ok(adapter) => {
             let handle = Box::new(TasksAdapterHandle {
-                inner: Arc::new(adapter),
+                inner: ManuallyDrop::new(Arc::new(adapter)),
+                guard: HandleGuard::new(),
             });
             unsafe {
                 *out_handle = Box::into_raw(handle);
@@ -713,6 +780,10 @@ pub extern "C" fn net_tasks_adapter_close(handle: *mut TasksAdapterHandle) -> c_
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match tasks.inner.close() {
         Ok(()) => 0,
         Err(_) => NET_ERR_CORTEX_CLOSED,
@@ -724,8 +795,19 @@ pub extern "C" fn net_tasks_adapter_free(handle: *mut TasksAdapterHandle) {
     if handle.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(handle));
+    // Audit #23: quiesce in-flight ops before dropping inner; box leaked.
+    let h: &TasksAdapterHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference.
+        unsafe {
+            let inner = ManuallyDrop::take(&mut (*handle).inner);
+            drop(inner);
+        }
+    } else {
+        tracing::warn!(
+            "net_tasks_adapter_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -765,6 +847,10 @@ pub extern "C" fn net_tasks_create(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(title) = (unsafe { c_str_to_owned(title) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -791,6 +877,10 @@ pub extern "C" fn net_tasks_rename(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(nt) = (unsafe { c_str_to_owned(new_title) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -816,6 +906,10 @@ pub extern "C" fn net_tasks_complete(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match tasks.inner.complete(id, now_ns) {
         Ok(seq) => {
             unsafe {
@@ -837,6 +931,10 @@ pub extern "C" fn net_tasks_delete(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match tasks.inner.delete(id) {
         Ok(seq) => {
             unsafe {
@@ -861,7 +959,11 @@ pub extern "C" fn net_tasks_wait_for_seq(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
-    let adapter = tasks.inner.clone();
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let adapter: Arc<InnerTasksAdapter> = Arc::clone(&tasks.inner);
     block_on(async move {
         let fut = adapter.wait_for_seq(seq);
         if timeout_ms == 0 {
@@ -1033,6 +1135,10 @@ pub extern "C" fn net_tasks_list(
     // the contract documented on `write_json_out`.
     zero_out_json(out_json, out_len);
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let filter = match build_tasks_list_filter(filter_json) {
         Ok(f) => f,
         Err(code) => return code,
@@ -1044,8 +1150,13 @@ pub extern "C" fn net_tasks_list(
     write_json_out(&items, out_json, out_len)
 }
 
+/// FFI handle for a tasks-watch cursor.
+///
+/// Audit #23: same `HandleGuard` recipe. Box leaked on free;
+/// inner stream lives in `ManuallyDrop`.
 pub struct TasksWatchHandle {
-    stream: TokioMutex<Option<BoxStream<'static, Vec<Task>>>>,
+    stream: ManuallyDrop<TokioMutex<Option<BoxStream<'static, Vec<Task>>>>>,
+    guard: HandleGuard,
 }
 
 /// Atomic snapshot + watch. Writes:
@@ -1068,13 +1179,17 @@ pub extern "C" fn net_tasks_snapshot_and_watch(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let watcher = match build_tasks_watcher(&tasks.inner, filter_json) {
         Ok(w) => w,
         Err(code) => return code,
     };
     // `watcher.stream()` spawns a forwarding task — needs a live
     // reactor.
-    let adapter = tasks.inner.clone();
+    let adapter: Arc<InnerTasksAdapter> = Arc::clone(&tasks.inner);
     let (snapshot, stream) = block_on(async move { adapter.snapshot_and_watch(watcher) });
     let snapshot_json: Vec<TaskJson> = snapshot.into_iter().map(TaskJson::from).collect();
     let code = write_json_out(&snapshot_json, out_snapshot, out_snapshot_len);
@@ -1082,7 +1197,8 @@ pub extern "C" fn net_tasks_snapshot_and_watch(
         return code;
     }
     let handle = Box::new(TasksWatchHandle {
-        stream: TokioMutex::new(Some(stream)),
+        stream: ManuallyDrop::new(TokioMutex::new(Some(stream))),
+        guard: HandleGuard::new(),
     });
     unsafe {
         *out_cursor = Box::into_raw(handle);
@@ -1104,6 +1220,10 @@ pub extern "C" fn net_tasks_watch_next(
         return NetError::NullPointer.into();
     }
     let cursor = unsafe { &*cursor };
+    let _op = match cursor.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
@@ -1141,8 +1261,17 @@ pub extern "C" fn net_tasks_watch_free(cursor: *mut TasksWatchHandle) {
     if cursor.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(cursor));
+    let h: &TasksWatchHandle = unsafe { &*cursor };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        unsafe {
+            let stream = ManuallyDrop::take(&mut (*cursor).stream);
+            drop(stream);
+        }
+    } else {
+        tracing::warn!(
+            "net_tasks_watch_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -1150,8 +1279,14 @@ pub extern "C" fn net_tasks_watch_free(cursor: *mut TasksWatchHandle) {
 // Memories adapter (same shape as tasks)
 // =========================================================================
 
+/// FFI handle wrapping an [`InnerMemoriesAdapter`].
+///
+/// Audit #23: same `HandleGuard` recipe as the other cortex
+/// handles. Box leaked on free; inner Arc lives in
+/// `ManuallyDrop` for take-and-drop after drain.
 pub struct MemoriesAdapterHandle {
-    inner: Arc<InnerMemoriesAdapter>,
+    inner: ManuallyDrop<Arc<InnerMemoriesAdapter>>,
+    guard: HandleGuard,
 }
 
 #[unsafe(no_mangle)]
@@ -1165,19 +1300,24 @@ pub extern "C" fn net_memories_adapter_open(
         return NetError::NullPointer.into();
     }
     let redex = unsafe { &*redex };
+    let _op = match redex.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let cfg = if persistent != 0 {
         RedexFileConfig::default().with_persistent(true)
     } else {
         RedexFileConfig::default()
     };
-    let redex_inner = redex.inner.clone();
+    let redex_inner: Arc<InnerRedex> = Arc::clone(&redex.inner);
     let result = block_on(async move {
         InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
     });
     match result {
         Ok(adapter) => {
             let handle = Box::new(MemoriesAdapterHandle {
-                inner: Arc::new(adapter),
+                inner: ManuallyDrop::new(Arc::new(adapter)),
+                guard: HandleGuard::new(),
             });
             unsafe {
                 *out_handle = Box::into_raw(handle);
@@ -1194,6 +1334,10 @@ pub extern "C" fn net_memories_adapter_close(handle: *mut MemoriesAdapterHandle)
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match mem.inner.close() {
         Ok(()) => 0,
         Err(_) => NET_ERR_CORTEX_CLOSED,
@@ -1205,8 +1349,19 @@ pub extern "C" fn net_memories_adapter_free(handle: *mut MemoriesAdapterHandle) 
     if handle.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(handle));
+    // Audit #23: quiesce in-flight ops before dropping inner; box leaked.
+    let h: &MemoriesAdapterHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference.
+        unsafe {
+            let inner = ManuallyDrop::take(&mut (*handle).inner);
+            drop(inner);
+        }
+    } else {
+        tracing::warn!(
+            "net_memories_adapter_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
@@ -1256,6 +1411,10 @@ pub extern "C" fn net_memories_store(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(s) = (unsafe { c_str_to_owned(input_json) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -1297,6 +1456,10 @@ pub extern "C" fn net_memories_retag(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let Some(s) = (unsafe { c_str_to_owned(input_json) }) else {
         return NetError::InvalidUtf8.into();
     };
@@ -1326,6 +1489,10 @@ pub extern "C" fn net_memories_pin(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match mem.inner.pin(id, now_ns) {
         Ok(seq) => {
             unsafe {
@@ -1348,6 +1515,10 @@ pub extern "C" fn net_memories_unpin(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match mem.inner.unpin(id, now_ns) {
         Ok(seq) => {
             unsafe {
@@ -1369,6 +1540,10 @@ pub extern "C" fn net_memories_delete(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     match mem.inner.delete(id) {
         Ok(seq) => {
             unsafe {
@@ -1390,7 +1565,11 @@ pub extern "C" fn net_memories_wait_for_seq(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
-    let adapter = mem.inner.clone();
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let adapter: Arc<InnerMemoriesAdapter> = Arc::clone(&mem.inner);
     block_on(async move {
         let fut = adapter.wait_for_seq(seq);
         if timeout_ms == 0 {
@@ -1583,6 +1762,10 @@ pub extern "C" fn net_memories_list(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let filter = match build_memories_list_filter(filter_json) {
         Ok(f) => f,
         Err(code) => return code,
@@ -1594,8 +1777,11 @@ pub extern "C" fn net_memories_list(
     write_json_out(&items, out_json, out_len)
 }
 
+/// FFI handle for a memories-watch cursor. Same `HandleGuard`
+/// recipe as `TasksWatchHandle` (audit #23).
 pub struct MemoriesWatchHandle {
-    stream: TokioMutex<Option<BoxStream<'static, Vec<Memory>>>>,
+    stream: ManuallyDrop<TokioMutex<Option<BoxStream<'static, Vec<Memory>>>>>,
+    guard: HandleGuard,
 }
 
 #[unsafe(no_mangle)]
@@ -1614,11 +1800,15 @@ pub extern "C" fn net_memories_snapshot_and_watch(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     let watcher = match build_memories_watcher(&mem.inner, filter_json) {
         Ok(w) => w,
         Err(code) => return code,
     };
-    let adapter = mem.inner.clone();
+    let adapter: Arc<InnerMemoriesAdapter> = Arc::clone(&mem.inner);
     let (snapshot, stream) = block_on(async move { adapter.snapshot_and_watch(watcher) });
     let snapshot_json: Vec<MemoryJson> = snapshot.into_iter().map(MemoryJson::from).collect();
     let code = write_json_out(&snapshot_json, out_snapshot, out_snapshot_len);
@@ -1626,7 +1816,8 @@ pub extern "C" fn net_memories_snapshot_and_watch(
         return code;
     }
     let handle = Box::new(MemoriesWatchHandle {
-        stream: TokioMutex::new(Some(stream)),
+        stream: ManuallyDrop::new(TokioMutex::new(Some(stream))),
+        guard: HandleGuard::new(),
     });
     unsafe {
         *out_cursor = Box::into_raw(handle);
@@ -1645,6 +1836,10 @@ pub extern "C" fn net_memories_watch_next(
         return NetError::NullPointer.into();
     }
     let cursor = unsafe { &*cursor };
+    let _op = match cursor.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
     block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
@@ -1682,8 +1877,17 @@ pub extern "C" fn net_memories_watch_free(cursor: *mut MemoriesWatchHandle) {
     if cursor.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(cursor));
+    let h: &MemoriesWatchHandle = unsafe { &*cursor };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        unsafe {
+            let stream = ManuallyDrop::take(&mut (*cursor).stream);
+            drop(stream);
+        }
+    } else {
+        tracing::warn!(
+            "net_memories_watch_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
     }
 }
 
