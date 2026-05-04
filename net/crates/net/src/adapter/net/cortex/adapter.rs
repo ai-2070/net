@@ -58,12 +58,55 @@ struct AdapterInner<State> {
     /// Highest RedEX seq applied to state, as a signed i64 so we can
     /// sentinel "nothing folded yet" with `start_seq - 1` (can be
     /// negative when `start_seq == 0`).
-    /// Highest RedEX seq folded into state, or `u64::MAX` as the
-    /// "nothing folded yet" sentinel. `u64::MAX` is safe as a
-    /// sentinel because the `open_from_snapshot` overflow guard
-    /// rejects `last_seq == u64::MAX`, so no real event can ever
-    /// occupy that slot.
+    /// Highest RedEX seq the fold task has *processed* — applied
+    /// successfully OR skipped via `recoverable_decode` under
+    /// `Stop` policy. The skip-and-continue path advances this
+    /// watermark so live consumers waiting via `wait_for_seq`
+    /// don't deadlock on a single permanently-bad event (the
+    /// DoS-resistance contract documented on
+    /// `RedexError::is_recoverable_decode`).
+    ///
+    /// **Use `applied_through_seq` instead** if you need
+    /// "state actually reflects this seq" semantics — that
+    /// watermark only advances on `Ok(())` folds, and is what
+    /// `snapshot` persists so restore tails from a position
+    /// consistent with the in-memory state.
+    ///
+    /// `u64::MAX` is the "nothing folded yet" sentinel; safe
+    /// because the `open_from_snapshot` overflow guard rejects
+    /// `last_seq == u64::MAX`, so no real event can ever occupy
+    /// that slot.
     folded_through_seq: AtomicU64,
+    /// Highest RedEX seq K such that **every** seq in
+    /// `start_seq..=K` was applied to state via a successful
+    /// `RedexFold::apply`. A *strict-prefix* watermark — any
+    /// skip (`recoverable_decode` under `Stop`, or any error
+    /// under `LogAndContinue`) breaks the prefix at the skipped
+    /// seq, and `applied_through_seq` cannot advance past it
+    /// even when later seqs apply successfully. Distinct from
+    /// `folded_through_seq`, which is the highest *processed*
+    /// seq and advances over skips so live consumers don't
+    /// deadlock.
+    ///
+    /// Snapshot persists this value, so restore tails from
+    /// `applied_through_seq + 1` with the guarantee that **every
+    /// prior seq is reflected in state**. Without strict-prefix
+    /// semantics, a skip at seq M followed by successful applies
+    /// at M+1, M+2 would advance `applied` to M+2 (highest
+    /// individual apply); snapshot persists M+2; restore tails
+    /// from M+3; seq M is never re-attempted on restore — its
+    /// mutations are permanently lost from durable state, even
+    /// though the log still carries the event. That's the
+    /// "violates log is the source of truth" failure audited as
+    /// #6+#7.
+    ///
+    /// Same `u64::MAX` "nothing applied yet" sentinel as
+    /// `folded_through_seq`. `start_seq == 0` is the only
+    /// configuration that initializes to sentinel; an
+    /// `open_from_snapshot` with `last_seq = Some(K)` initializes
+    /// to `K` (the snapshot's contract is that `start_seq..=K`
+    /// is already in the rehydrated state).
+    applied_through_seq: AtomicU64,
     /// First RedEX seq this adapter began folding from. Any seq
     /// strictly below this is conceptually behind us — `wait_for_seq`
     /// short-circuits without blocking on the watermark, even when
@@ -89,10 +132,49 @@ impl<State> CortexAdapter<State> {
         self.inner.state.clone()
     }
 
-    /// Highest RedEX sequence that has been folded into state.
+    /// Highest RedEX sequence the fold task has *processed* —
+    /// applied successfully OR skipped via `recoverable_decode`
+    /// under `Stop` policy.
+    ///
+    /// Use [`Self::applied_through_seq`] if you need "state
+    /// actually reflects this seq" semantics; the difference
+    /// matters under `Stop`+recoverable-decode where the
+    /// skip-and-continue path advances *this* watermark (so
+    /// `wait_for_seq` doesn't deadlock on a bad event) but
+    /// leaves `applied_through_seq` behind.
+    ///
     /// `None` if no event has been folded yet since open.
     pub fn folded_through_seq(&self) -> Option<u64> {
         let v = self.inner.folded_through_seq.load(Ordering::Acquire);
+        if v == u64::MAX {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// Highest RedEX sequence K such that *every* seq in
+    /// `start_seq..=K` was successfully applied to state via
+    /// `Ok(()) RedexFold::apply`. A *strict-prefix* watermark:
+    /// any skip (`recoverable_decode` under `Stop`, or any error
+    /// under `LogAndContinue`) at seq M permanently caps this
+    /// watermark at M-1, even if subsequent seqs apply
+    /// successfully.
+    ///
+    /// `snapshot` persists this value, so a restore tails from
+    /// `applied_through_seq + 1` and re-attempts every seq from
+    /// the first skip onwards — preserving "log is the source
+    /// of truth" even across the skip-and-continue path.
+    ///
+    /// Distinct from [`Self::folded_through_seq`], which is the
+    /// highest *processed* seq and advances over skips so live
+    /// consumers don't deadlock.
+    ///
+    /// `None` if no event has been applied yet since open
+    /// (start_seq=0 with no successful applies, or start_seq=0
+    /// with the very first event having been skipped).
+    pub fn applied_through_seq(&self) -> Option<u64> {
+        let v = self.inner.applied_through_seq.load(Ordering::Acquire);
         if v == u64::MAX {
             None
         } else {
@@ -113,8 +195,10 @@ impl<State> CortexAdapter<State> {
         self.inner.running.load(Ordering::Acquire)
     }
 
-    /// Block until the fold task has applied every event up through
-    /// `seq`, or until the fold task stops (e.g. close, fold error
+    /// Block until the fold task has *processed* every event up
+    /// through `seq` (applied successfully OR skipped via
+    /// `recoverable_decode` under `Stop` policy), or until the
+    /// fold task stops (e.g. close, non-recoverable fold error
     /// under `Stop`). Returning after the task has stopped is
     /// correct behavior — callers should re-check
     /// [`Self::is_running`] if they need to distinguish.
@@ -124,8 +208,19 @@ impl<State> CortexAdapter<State> {
     /// let seq = adapter.ingest(envelope)?;
     /// adapter.wait_for_seq(seq).await;
     /// let state = adapter.state().read();
-    /// // state reflects the ingest.
+    /// // state reflects the ingest, UNLESS the event at `seq`
+    /// // was skipped via recoverable_decode under `Stop`.
     /// ```
+    ///
+    /// **Subtle point.** This method waits on
+    /// [`Self::folded_through_seq`], which advances over
+    /// events the fold task processed but skipped via
+    /// `RedexError::is_recoverable_decode`. The skip-and-
+    /// continue path is the documented DoS-resistance contract
+    /// (a single corrupt event must not wedge the task forever).
+    /// If you need to confirm `state` actually reflects the
+    /// ingest at `seq`, follow up with
+    /// `adapter.applied_through_seq() >= Some(seq)`.
     pub async fn wait_for_seq(&self, seq: u64) {
         // Any seq strictly below `start_seq` is conceptually behind
         // us — those events were applied before we opened the
@@ -322,6 +417,12 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             file: file.clone(),
             state: state.clone(),
             folded_through_seq: AtomicU64::new(initial_watermark),
+            // Mirror folded's initial watermark: the snapshot/restore
+            // contract treats the sentinel as "nothing applied yet"
+            // and the (start_seq - 1) seed as "applied through the
+            // pre-snapshot prefix" — same semantics, applied to the
+            // strict watermark.
+            applied_through_seq: AtomicU64::new(initial_watermark),
             start_seq,
             fold_errors: AtomicU64::new(0),
             running: AtomicBool::new(true),
@@ -380,23 +481,52 @@ where
     ///
     /// Returns `(state_bytes, last_seq)` where `state_bytes` is the
     /// postcard-serialized state and `last_seq` is the highest RedEX
-    /// sequence folded into it. Persist both together — they form a
-    /// consistent pair, guaranteed by the adapter holding the state
-    /// write lock while advancing the watermark.
+    /// sequence successfully *applied* to it as a strict prefix
+    /// (i.e. [`Self::applied_through_seq`]). Persist both together —
+    /// they form a consistent pair, guaranteed by the adapter
+    /// holding the state write lock while advancing the watermark.
     ///
-    /// Restore via [`Self::open_from_snapshot`] on a State that also
-    /// implements `DeserializeOwned`.
+    /// Restore via [`Self::open_from_snapshot`] on a State that
+    /// also implements `DeserializeOwned`. Restore tails from
+    /// `last_seq + 1`, so any events that were processed but
+    /// *skipped* via `recoverable_decode` between snapshots are
+    /// re-attempted on restore — preserving "log is the source of
+    /// truth" even across the skip-and-continue path. (Pre-fix,
+    /// `snapshot` read `folded_through_seq`, which advances over
+    /// skipped events; restore tailed from past them and the gap
+    /// became permanent in durable state.)
     ///
-    /// `last_seq` is `None` if no event has been folded yet since
-    /// open (the snapshot is still meaningful — it represents the
-    /// initial State — but callers typically wait until
-    /// [`Self::wait_for_seq`] has returned before snapshotting).
+    /// **Re-apply double-counting.** `state_bytes` reflects
+    /// in-memory state at snapshot time, which includes the
+    /// effects of every successful fold *including* applies past
+    /// any prior skip. Restore tails from the strict-prefix
+    /// `last_seq + 1`, so seqs past the skip are re-fed to the
+    /// fold function — fold functions that are not idempotent
+    /// against re-application will produce divergent state on
+    /// restore. The mitigations: (1) make the fold idempotent
+    /// (the standard event-sourcing recommendation); (2)
+    /// snapshot only when `applied_through_seq() ==
+    /// folded_through_seq()` (no gap → no re-apply); or (3)
+    /// accept best-effort restore semantics for adapters that
+    /// have ever observed a recoverable_decode skip. The
+    /// trade-off vs. the pre-fix behavior is asymmetric:
+    /// pre-fix, the skipped seq was permanently lost; post-fix,
+    /// the skipped seq is re-attempted, at the cost of
+    /// double-applying intervening successful seqs for
+    /// non-idempotent folds.
+    ///
+    /// `last_seq` is `None` if no event has been applied yet
+    /// since open (the snapshot is still meaningful — it
+    /// represents the initial State — but callers typically wait
+    /// until [`Self::wait_for_seq`] has returned and
+    /// [`Self::applied_through_seq`] has advanced before
+    /// snapshotting).
     pub fn snapshot(&self) -> Result<(Vec<u8>, Option<u64>), CortexAdapterError> {
         let state = self.inner.state.read();
         let bytes = postcard::to_allocvec(&*state).map_err(|e| {
             CortexAdapterError::Redex(RedexError::Encode(format!("snapshot serialize: {}", e)))
         })?;
-        let watermark = self.inner.folded_through_seq.load(Ordering::Acquire);
+        let watermark = self.inner.applied_through_seq.load(Ordering::Acquire);
         let last_seq = if watermark == u64::MAX {
             None
         } else {
@@ -470,6 +600,7 @@ impl<State> std::fmt::Debug for CortexAdapter<State> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CortexAdapter")
             .field("folded_through_seq", &self.folded_through_seq())
+            .field("applied_through_seq", &self.applied_through_seq())
             .field("fold_errors", &self.fold_errors())
             .field("running", &self.is_running())
             .field("closed", &self.inner.closed.load(Ordering::Acquire))
@@ -509,11 +640,60 @@ where
         // (`Io`, `Closed`, `Lagged`) and authorization /
         // configuration errors still halt under `Stop` as
         // documented.
+        //
+        // Two watermarks; both written under the state write lock
+        // so a concurrent `snapshot` reading either one observes a
+        // value consistent with the state it sees:
+        //   - `applied_through_seq` is a STRICT-PREFIX watermark:
+        //     it advances by exactly one only when this seq is
+        //     the immediate successor of the current value (or
+        //     equals `start_seq` from the sentinel state). Any
+        //     skip — `recoverable_decode` under `Stop`, OR any
+        //     error under `LogAndContinue` — breaks the prefix
+        //     at the skipped seq; further successful applies
+        //     cannot heal it. `snapshot` persists this watermark
+        //     so restore tails from a position guaranteed to
+        //     have every prior seq reflected in state.
+        //   - `folded_through_seq` is the HIGHEST PROCESSED
+        //     watermark: advances on `Ok(())` AND on every skip
+        //     path. Live consumers waiting via `wait_for_seq` use
+        //     this watermark so a single bad event doesn't
+        //     deadlock them — the DoS-resistance contract.
+        // Why two watermarks, not one strict-prefix that lives
+        // consumers also wait on: collapsing them re-introduces
+        // the deadlock — a consumer waiting for the skipped seq
+        // would block forever even though the fold task has
+        // moved on.
+        // Order: `applied` is stored first so any reader that
+        // observes the `folded` Release also synchronizes-with
+        // the `applied` Release that preceded it — `applied <=
+        // folded` is therefore an invariant at every observable
+        // point.
+        let applied = matches!(&r, Ok(()));
         let recoverable_decode = matches!(&r, Err(e) if e.is_recoverable_decode());
-        let advance = matches!(
-            (&r, policy),
-            (Ok(()), _) | (Err(_), FoldErrorPolicy::LogAndContinue)
-        ) || recoverable_decode;
+        let advance = applied
+            || matches!(
+                (&r, policy),
+                (Err(_), FoldErrorPolicy::LogAndContinue)
+            )
+            || recoverable_decode;
+        if applied {
+            // Strict-prefix advance: bump by exactly one if this
+            // seq is the immediate successor of the current
+            // applied watermark (or this is the very first event
+            // and matches `start_seq`). Otherwise the prefix is
+            // broken by a prior skip; leave the watermark alone
+            // and let restore re-attempt from the gap.
+            let prev = inner.applied_through_seq.load(Ordering::Acquire);
+            let advance_applied = if prev == u64::MAX {
+                seq == inner.start_seq
+            } else {
+                seq == prev.wrapping_add(1)
+            };
+            if advance_applied {
+                inner.applied_through_seq.store(seq, Ordering::Release);
+            }
+        }
         if advance {
             inner.folded_through_seq.store(seq, Ordering::Release);
         }
@@ -729,6 +909,29 @@ mod tests {
         }
     }
 
+    /// Returns `RedexError::Decode` (recoverable) at the
+    /// configured seqs; counts the attempt so tests can assert
+    /// re-attempt after restore. Apply on any other seq bumps
+    /// state.
+    struct FailDecodeAtSeqs {
+        skip: std::collections::HashSet<u64>,
+        attempts: Arc<AtomicU64>,
+    }
+    impl RedexFold<u64> for FailDecodeAtSeqs {
+        fn apply(&mut self, ev: &RedexEvent, state: &mut u64) -> Result<(), RedexError> {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            if self.skip.contains(&ev.entry.seq) {
+                Err(RedexError::Decode(format!(
+                    "deliberate decode skip at seq {}",
+                    ev.entry.seq
+                )))
+            } else {
+                *state += 1;
+                Ok(())
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_stop_policy_halts_on_first_error() {
         let redex = Redex::new();
@@ -819,6 +1022,368 @@ mod tests {
              pre-fix this would include 3 (the failing seq) as a \
              phantom Seq(3) event, mis-routing subscribers' state"
         );
+    }
+
+    // ========================================================================
+    // Audit #6 + #7: applied_through_seq vs folded_through_seq
+    // ========================================================================
+
+    /// Regression for audit #6: under `Stop` policy, a per-event
+    /// recoverable decode error advances `folded_through_seq`
+    /// (so live consumers don't deadlock on a permanently-bad
+    /// event) but must NOT advance `applied_through_seq` (state
+    /// at the skipped seq was never written). Pre-fix the two
+    /// were the same atomic and `wait_for_seq(seq)` returned
+    /// claiming "state reflects seq" for events whose mutation
+    /// never landed.
+    #[tokio::test]
+    async fn recoverable_decode_skip_advances_folded_but_not_applied() {
+        let redex = Redex::new();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let fold = FailDecodeAtSeqs {
+            skip: [3u64].into_iter().collect(),
+            attempts: attempts.clone(),
+        };
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/audit-6-skip"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(), // Stop is default
+            fold,
+            0u64,
+        )
+        .unwrap();
+
+        for i in 0..6u64 {
+            let meta = EventMeta::new(0, 0, 0, i, 0);
+            let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+            adapter.ingest(env).unwrap();
+        }
+        adapter.wait_for_seq(5).await;
+
+        // Live consumer didn't deadlock — folded reached the tail.
+        assert_eq!(
+            adapter.folded_through_seq(),
+            Some(5),
+            "folded must advance over the recoverable_decode skip",
+        );
+        // STRICT-PREFIX: applied caps at 2 (the last consecutive
+        // successful seq before the gap at seq 3). Subsequent
+        // successful applies at 4 and 5 do NOT heal the prefix.
+        assert_eq!(
+            adapter.applied_through_seq(),
+            Some(2),
+            "strict-prefix watermark caps at the last consecutive Ok before the skip",
+        );
+        // State count = 5 (seqs 0,1,2,4,5 applied; 3 skipped).
+        // The fold function still mutated state for the seqs it
+        // saw — only the WATERMARK is strict-prefix.
+        assert_eq!(*adapter.state().read(), 5);
+        assert_eq!(adapter.fold_errors(), 1);
+        // Task still running — recoverable decode does not halt
+        // under Stop.
+        assert!(adapter.is_running());
+        // Six attempts (one per event). The `attempts` counter
+        // pins that the fold function was invoked for the
+        // skipped seq (skip is detected inside the fold, not
+        // upstream).
+        assert_eq!(attempts.load(Ordering::Acquire), 6);
+    }
+
+    /// Regression for audit #6 (continued): when the FIRST event
+    /// is skipped via recoverable_decode, `applied_through_seq`
+    /// stays at the "nothing applied yet" sentinel until a
+    /// subsequent successful fold. This is the strict shape: an
+    /// adapter freshly opened that has only seen skipped events
+    /// reports `None` from `applied_through_seq`, even though
+    /// `folded_through_seq` reports the highest skipped seq.
+    #[tokio::test]
+    async fn applied_stays_at_sentinel_when_only_skipped_events_processed() {
+        let redex = Redex::new();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let fold = FailDecodeAtSeqs {
+            skip: [0u64, 1, 2].into_iter().collect(),
+            attempts: attempts.clone(),
+        };
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/audit-6-only-skips"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            fold,
+            0u64,
+        )
+        .unwrap();
+
+        for i in 0..3u64 {
+            let meta = EventMeta::new(0, 0, 0, i, 0);
+            let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+            adapter.ingest(env).unwrap();
+        }
+        adapter.wait_for_seq(2).await;
+
+        assert_eq!(adapter.folded_through_seq(), Some(2));
+        assert_eq!(
+            adapter.applied_through_seq(),
+            None,
+            "no successful apply ⇒ applied_through_seq stays at sentinel",
+        );
+        assert_eq!(*adapter.state().read(), 0);
+    }
+
+    /// Regression for audit #7: `snapshot()` must use
+    /// `applied_through_seq`, not `folded_through_seq`. Pre-fix,
+    /// snapshot persisted the highest folded seq — including
+    /// skipped events — so a restore tailed from past the skip
+    /// and the skipped seq became permanently lost from durable
+    /// state, even though the in-memory state at snapshot time
+    /// never reflected it.
+    #[tokio::test]
+    async fn snapshot_last_seq_reflects_applied_not_folded_after_skip() {
+        let redex = Redex::new();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let fold = FailDecodeAtSeqs {
+            skip: [5u64].into_iter().collect(),
+            attempts: attempts.clone(),
+        };
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/audit-7-snapshot"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            fold,
+            0u64,
+        )
+        .unwrap();
+
+        // 8 events; seq 5 will be skipped via recoverable_decode.
+        for i in 0..8u64 {
+            let meta = EventMeta::new(0, 0, 0, i, 0);
+            let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+            adapter.ingest(env).unwrap();
+        }
+        adapter.wait_for_seq(7).await;
+
+        let folded = adapter.folded_through_seq();
+        let applied = adapter.applied_through_seq();
+        assert_eq!(folded, Some(7), "folded includes the skipped seq's slot");
+        assert_eq!(
+            applied,
+            Some(4),
+            "strict-prefix applied caps at the last consecutive Ok (seq 4) before the gap at seq 5",
+        );
+
+        let (_bytes, last_seq) = adapter.snapshot().unwrap();
+        // snapshot reflects applied (strict-prefix), not folded.
+        // Pre-fix snapshot returned Some(7) — restore would tail
+        // from seq 8 and seq 5 would be permanently lost from
+        // durable state.
+        assert_eq!(last_seq, applied);
+        assert_eq!(last_seq, Some(4));
+    }
+
+    /// Regression for audit #7 (strict shape): when the LAST
+    /// processed event is skipped, snapshot's `last_seq` must
+    /// stay at the highest *applied* seq — not advance to the
+    /// skipped one. Pre-fix: snapshot returned the skipped seq;
+    /// restore tailed from past it; skipped event was lost.
+    #[tokio::test]
+    async fn snapshot_last_seq_does_not_advance_to_a_skipped_tail() {
+        let redex = Redex::new();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let fold = FailDecodeAtSeqs {
+            // Skip the LAST event so applied < folded at snapshot time.
+            skip: [4u64].into_iter().collect(),
+            attempts: attempts.clone(),
+        };
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/audit-7-tail-skip"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            fold,
+            0u64,
+        )
+        .unwrap();
+
+        for i in 0..5u64 {
+            let meta = EventMeta::new(0, 0, 0, i, 0);
+            let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+            adapter.ingest(env).unwrap();
+        }
+        adapter.wait_for_seq(4).await;
+
+        assert_eq!(adapter.folded_through_seq(), Some(4));
+        assert_eq!(
+            adapter.applied_through_seq(),
+            Some(3),
+            "tail apply was skipped ⇒ applied stays at the prior successful seq",
+        );
+
+        let (_bytes, last_seq) = adapter.snapshot().unwrap();
+        assert_eq!(
+            last_seq,
+            Some(3),
+            "pre-fix this would be Some(4) and a restore would tail from 5, \
+             dropping seq 4 permanently from durable state",
+        );
+    }
+
+    /// Regression for audit #6+#7 end-to-end: an adapter whose
+    /// fold previously skipped seq N via recoverable_decode is
+    /// snapshotted, closed, and reopened via
+    /// `open_from_snapshot` with a fold that NOW handles seq N
+    /// successfully (e.g. a software upgrade fixed the decoder).
+    /// On restore, seq N must be re-fed to the fold function —
+    /// pre-fix snapshot's `last_seq` was the highest folded
+    /// (advanced over skips), restore tailed from past the
+    /// skipped seq, and the previously-skipped event was
+    /// permanently lost.
+    ///
+    /// Asserts the strict-prefix `last_seq` and that the skipped
+    /// seq is re-fed on restore. State-count after restore is
+    /// fold-dependent (see `snapshot` doc on the re-apply
+    /// double-counting trade-off) and is not pinned here.
+    #[tokio::test]
+    async fn restore_after_skip_re_attempts_skipped_event() {
+        let redex = Redex::new();
+        let pre_attempts = Arc::new(AtomicU64::new(0));
+        let pre_fold = FailDecodeAtSeqs {
+            skip: [2u64].into_iter().collect(),
+            attempts: pre_attempts.clone(),
+        };
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/audit-6-7-restore-reattempt"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            pre_fold,
+            0u64,
+        )
+        .unwrap();
+
+        for i in 0..5u64 {
+            let meta = EventMeta::new(0, 0, 0, i, 0);
+            let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+            adapter.ingest(env).unwrap();
+        }
+        adapter.wait_for_seq(4).await;
+
+        // Pre-snapshot state: STRICT-PREFIX applied caps at 1
+        // (seq 2 was skipped; the prefix breaks there). Folded
+        // reached 4. The fold function still wrote state for
+        // every Ok (0,1,3,4) so state count is 4.
+        assert_eq!(adapter.applied_through_seq(), Some(1));
+        assert_eq!(adapter.folded_through_seq(), Some(4));
+        assert_eq!(*adapter.state().read(), 4);
+        let (bytes, last_seq) = adapter.snapshot().unwrap();
+        // snapshot must reflect applied (strict-prefix), so
+        // restore tails from seq 2 and re-attempts the skipped
+        // event plus everything after.
+        assert_eq!(last_seq, Some(1));
+        adapter.close().unwrap();
+
+        // Reopen with a fold that handles seq 2 successfully
+        // this time (no entries in `skip`). The previously-
+        // skipped event must be re-fed, AND so must seqs 3 and
+        // 4 (because their prior application is not part of the
+        // snapshot's strict-prefix watermark — only seqs 0..=1
+        // are guaranteed reflected in the rehydrated state).
+        let post_attempts = Arc::new(AtomicU64::new(0));
+        let post_fold = FailDecodeAtSeqs {
+            skip: std::collections::HashSet::new(),
+            attempts: post_attempts.clone(),
+        };
+        let restored = CortexAdapter::<u64>::open_from_snapshot(
+            &redex,
+            &cn("cortex/audit-6-7-restore-reattempt"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            post_fold,
+            &bytes,
+            last_seq,
+        )
+        .unwrap();
+
+        restored.wait_for_seq(4).await;
+
+        // Pre-fix this assertion would FAIL: snapshot would have
+        // returned Some(4) (folded), restore would tail from
+        // seq 5, the post_fold would never see seq 2, and the
+        // skipped event would be permanently lost.
+        let post_invocations = post_attempts.load(Ordering::Acquire);
+        assert_eq!(
+            post_invocations, 3,
+            "post-restore fold must be re-fed seqs 2, 3, 4 (everything past the \
+             snapshot's strict-prefix watermark)",
+        );
+        // After restore, the strict-prefix watermark heals all
+        // the way to seq 4 because every event from start_seq=2
+        // onwards applied successfully on the second pass.
+        assert_eq!(restored.applied_through_seq(), Some(4));
+        // State count is fold-dependent on idempotency. CountFold
+        // is *not* idempotent (each apply increments), so seqs
+        // 3 and 4 are double-counted: pre-restore in-memory
+        // state was 4 (seqs 0,1,3,4 applied), snapshot bytes
+        // serialized that 4, restore deserializes 4 + applies
+        // seqs 2,3,4 = 7. The audit-fix's *correctness* claim is
+        // not "state matches what a re-fold from scratch would
+        // produce" — that requires either an idempotent fold or
+        // snapshotting only when there's no gap (see `snapshot`
+        // doc). The claim is "the skipped seq is re-fed instead
+        // of being permanently lost from durable state" — pinned
+        // by `post_invocations == 3` above.
+        assert_eq!(
+            *restored.state().read(),
+            7,
+            "non-idempotent CountFold double-counts seqs past the gap; this is the \
+             documented re-apply trade-off, not a bug",
+        );
+    }
+
+    /// Pin: `wait_for_seq(seq)` returns promptly even when seq
+    /// was skipped via recoverable_decode. The DoS-resistance
+    /// contract (one bad event must not deadlock live consumers)
+    /// is preserved by the `applied`/`folded` split — `wait_for_seq`
+    /// still waits on `folded`, which advances over skips.
+    #[tokio::test]
+    async fn wait_for_seq_returns_after_recoverable_decode_skip() {
+        let redex = Redex::new();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let fold = FailDecodeAtSeqs {
+            skip: [0u64].into_iter().collect(),
+            attempts: attempts.clone(),
+        };
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/audit-6-no-deadlock"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            fold,
+            0u64,
+        )
+        .unwrap();
+
+        let meta = EventMeta::new(0, 0, 0, 0, 0);
+        let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+        let seq = adapter.ingest(env).unwrap();
+
+        // wait_for_seq must NOT block on the skipped seq.
+        // Tight timeout — pre-fix shape never had this hazard;
+        // the post-fix split must preserve it. (If `wait_for_seq`
+        // ever silently switches to `applied_through_seq`, this
+        // regresses with an indefinite hang.)
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            adapter.wait_for_seq(seq),
+        )
+        .await
+        .expect("wait_for_seq must return promptly even for a recoverable-decode-skipped seq");
+
+        // Confirm what was actually observable at return:
+        // folded reached seq, applied did not.
+        assert_eq!(adapter.folded_through_seq(), Some(0));
+        assert_eq!(adapter.applied_through_seq(), None);
     }
 
     // ========================================================================
