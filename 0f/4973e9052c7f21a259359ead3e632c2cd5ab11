@@ -1,0 +1,23 @@
+net/crates/net/docs/misc/REDEX_MANIFEST_POINTER_DESIGN.md
+  cdf934b360f502d7 1-190
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "0f4973e9052c7f21a259359ead3e632c2cd5ab11",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 4061,
+      "total_deletions": 3737,
+      "accepted_lines": 324,
+      "overriden_lines": 0
+    }
+  }
+}
