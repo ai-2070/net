@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/identity/envelope.rs
+  cdf934b360f502d7 77-92,127-137,164-167,378-387,389,391-392,395-402,441-444,448,457-468,473-476,591-613,628,820-826,828-830,832-840,843-844
+net/crates/net/src/adapter/net/state/snapshot.rs
+  cdf934b360f502d7 37-45,350-358,366,368-371,375,472-474,1150-1153,1337-1339,1341-1343,1361-1363,1365,1367-1382,1384-1386
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  cdf934b360f502d7 13-14,225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "a1dcd255957f585d0ab11216efeba6e8bad3ade8",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2572,
+      "total_deletions": 251,
+      "accepted_lines": 181,
+      "overriden_lines": 0
+    }
+  }
+}
