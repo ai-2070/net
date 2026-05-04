@@ -114,23 +114,50 @@ impl HandleGuard {
     }
 
     /// Mark the handle as freeing and wait for in-flight ops to
-    /// drain. Returns `true` if drained within
-    /// [`FFI_HANDLE_FREE_DEADLINE`]; `false` on timeout (caller
-    /// must leak the inner — concurrent ops may still be holding
-    /// references to it).
+    /// drain. Returns `true` if THIS call won the race to flip
+    /// `freeing` AND in-flight ops drained within
+    /// [`FFI_HANDLE_FREE_DEADLINE`]. Returns `false` on timeout
+    /// OR if a prior caller already flipped `freeing`.
     ///
-    /// Idempotent: calling `begin_free` after a previous
-    /// `begin_free` has set `freeing` is harmless — the second
-    /// caller waits for the same drain. Both callers observe the
-    /// same boolean outcome on timeout.
+    /// **Single-winner contract.** Only ONE caller across the
+    /// lifetime of this guard ever sees `true`. That winning
+    /// caller is the one that owns the right to take the inner
+    /// out of `ManuallyDrop` exactly once. Subsequent callers
+    /// (whether concurrent or strictly after) see `false` and
+    /// MUST NOT touch the inner — the winner has it (or had it,
+    /// and dropped it).
+    ///
+    /// This is what makes `_free` idempotent: a second `_free`
+    /// call gates the `ManuallyDrop::take` behind this method's
+    /// `true` return, so it bails before the double-take that
+    /// would UAF the inner allocation.
+    ///
+    /// On timeout (winner observed `freeing=false→true` but
+    /// drain didn't complete), the caller must NOT take the
+    /// inner — concurrent ops may still be holding it. Leak
+    /// inner along with the box.
     ///
     /// Future `try_enter` calls will see `freeing=true` and bail,
-    /// regardless of whether this call's drain succeeded or timed
-    /// out. The guarantee is "no NEW ops will start"; "in-flight
-    /// ops have finished" is the deadline-bounded property.
+    /// regardless of whether the winner's drain succeeded, timed
+    /// out, or this caller is the loser. "No NEW ops will start"
+    /// is set as soon as the winner flips the flag.
     pub fn begin_free(&self, deadline: Duration) -> bool {
-        // SeqCst pairs with `try_enter`'s SeqCst load.
-        self.freeing.store(true, Ordering::SeqCst);
+        // compare_exchange so only one caller wins the right to
+        // flip false→true. Losers (whether racing concurrently
+        // or strictly after) get an Err and bail without ever
+        // entering the drain loop. SeqCst pairs with
+        // `try_enter`'s SeqCst load and matches the rest of the
+        // protocol's ordering. Pre-fix this was a `store(true)`
+        // which made every caller "win" — the cortex / mesh
+        // `_free` then double-took the inner via `ManuallyDrop::
+        // take`, UAF on the second call.
+        if self
+            .freeing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
         let start = Instant::now();
         // Spin-with-sleep is appropriate: ops are sub-second; the
         // deadline catches pathological wedge cases. We don't have
@@ -281,22 +308,85 @@ mod tests {
         worker.join().unwrap();
     }
 
-    /// Pin: `begin_free` is idempotent — calling it twice from the
-    /// same thread, or from concurrent threads, is safe and both
-    /// callers see the drained outcome.
+    /// Pin: exactly ONE caller wins the `begin_free` race, even
+    /// under concurrent invocation. The single-winner contract
+    /// is what makes the per-handle `_free` (which gates
+    /// `ManuallyDrop::take` on `begin_free` returning `true`)
+    /// idempotent — a second caller that also returned `true`
+    /// would double-take the inner and UAF.
+    ///
+    /// Pre-fix `begin_free` did a plain `store(true)` so every
+    /// caller saw `true` and every `_free` re-took the inner.
+    /// The post-fix `compare_exchange(false, true)` flips the
+    /// flag exactly once and subsequent callers return `false`.
     #[test]
-    fn begin_free_idempotent_across_concurrent_callers() {
-        let g = Arc::new(HandleGuard::new());
+    fn begin_free_has_exactly_one_winner_under_concurrency() {
+        const ROUNDS: usize = 32;
+        for _ in 0..ROUNDS {
+            let g = Arc::new(HandleGuard::new());
+            let g1 = g.clone();
+            let g2 = g.clone();
+            let t1 = std::thread::spawn(move || g1.begin_free(Duration::from_millis(50)));
+            let t2 = std::thread::spawn(move || g2.begin_free(Duration::from_millis(50)));
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+            assert!(
+                r1 ^ r2,
+                "exactly one caller must win begin_free; got r1={r1} r2={r2}",
+            );
+        }
+    }
 
-        let g1 = g.clone();
-        let g2 = g.clone();
-        let t1 = std::thread::spawn(move || g1.begin_free(Duration::from_millis(50)));
-        let t2 = std::thread::spawn(move || g2.begin_free(Duration::from_millis(50)));
-        let r1 = t1.join().unwrap();
-        let r2 = t2.join().unwrap();
+    /// Pin: a strictly-sequential second `begin_free` call after
+    /// a successful first call returns `false`. This is the path
+    /// every `_free` takes on a second invocation — the second
+    /// caller must skip the `ManuallyDrop::take` branch.
+    #[test]
+    fn begin_free_returns_false_on_second_sequential_call() {
+        let g = HandleGuard::new();
+        assert!(g.begin_free(Duration::from_millis(50)));
         assert!(
-            r1 && r2,
-            "both concurrent free callers must observe drained"
+            !g.begin_free(Duration::from_millis(50)),
+            "second begin_free must bail — only the first caller \
+             owns the right to take the inner",
+        );
+    }
+
+    /// Pin: a second `begin_free` after a TIMED-OUT first call
+    /// also returns `false`. The first caller's
+    /// `compare_exchange` already flipped `freeing=true`, so the
+    /// second caller observes the flag and bails — the
+    /// already-taken inner (or inner that the timed-out caller
+    /// left in place to be leaked) must not be re-taken.
+    #[test]
+    fn begin_free_returns_false_after_timed_out_first_call() {
+        let g = Arc::new(HandleGuard::new());
+        let g_op = g.clone();
+        let release = Arc::new(AtomicBool::new(false));
+        let release_op = release.clone();
+        let worker = std::thread::spawn(move || {
+            let op = g_op.try_enter().expect("op must enter");
+            while !release_op.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(op);
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        // First call times out (op still in flight) — returns false
+        // but freeing is set.
+        assert!(!g.begin_free(Duration::from_millis(40)));
+
+        // Let the op drain.
+        release.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+
+        // Second call must still bail — the first call won the
+        // freeing flag even though it timed out, so no second
+        // caller may claim the right to take the inner.
+        assert!(
+            !g.begin_free(Duration::from_millis(50)),
+            "second begin_free after a timed-out first call must bail",
         );
     }
 }

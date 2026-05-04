@@ -3741,6 +3741,117 @@ mod tests {
         net_mesh_free(nh_b);
     }
 
+    /// `net_mesh_free` must be idempotent — the post-fix protocol
+    /// does `if begin_free { ManuallyDrop::take(...) }`, so a
+    /// second call must observe `freeing=true` and skip the take
+    /// branch (taking again would panic since `ManuallyDrop` is
+    /// already moved out). The `HandleGuard` core test pins the
+    /// protocol; this test pins the per-handle wiring is correct.
+    #[test]
+    fn net_mesh_free_is_idempotent() {
+        let cfg = serde_json::json!({
+            "bind_addr": "127.0.0.1:0",
+            "psk_hex": "0".repeat(64),
+        });
+        let cfg_c = CString::new(cfg.to_string()).unwrap();
+        let mut nh: *mut MeshNodeHandle = std::ptr::null_mut();
+        assert_eq!(net_mesh_new(cfg_c.as_ptr(), &mut nh), 0);
+        assert!(!nh.is_null());
+
+        net_mesh_free(nh);
+        // Second free: must not panic, must not double-take the
+        // ManuallyDrop fields, must not deallocate the (leaked)
+        // outer box.
+        net_mesh_free(nh);
+    }
+
+    /// `net_identity_free` must be idempotent; same wiring check
+    /// as `net_mesh_free_is_idempotent` for the IdentityHandle
+    /// (which holds keypair + cache in `ManuallyDrop`).
+    #[test]
+    fn net_identity_free_is_idempotent() {
+        let mut h: *mut IdentityHandle = std::ptr::null_mut();
+        assert_eq!(net_identity_generate(&mut h), 0);
+        assert!(!h.is_null());
+
+        net_identity_free(h);
+        // Second free: must not panic.
+        net_identity_free(h);
+    }
+
+    /// Audit #24 regression: a `net_mesh_free` racing an in-flight
+    /// op via the same handle must wait for the op to drop its
+    /// `try_enter` guard before taking the inner. Pre-fix `_free`
+    /// would proceed immediately and the op's subsequent inner
+    /// deref would UAF.
+    ///
+    /// We exercise the guard directly (rather than through a
+    /// long-running FFI op) so the timing window is deterministic
+    /// and not dependent on real network / IO latency. The
+    /// worker holds a `try_enter` op until released; main thread
+    /// calls `_free`, which post-fix must block on `begin_free`'s
+    /// drain loop until the worker drops the op.
+    #[test]
+    fn net_mesh_free_waits_for_inflight_op() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let cfg = serde_json::json!({
+            "bind_addr": "127.0.0.1:0",
+            "psk_hex": "0".repeat(64),
+        });
+        let cfg_c = CString::new(cfg.to_string()).unwrap();
+        let mut nh: *mut MeshNodeHandle = std::ptr::null_mut();
+        assert_eq!(net_mesh_new(cfg_c.as_ptr(), &mut nh), 0);
+        assert!(!nh.is_null());
+
+        // Smuggle the raw pointer to the worker via usize (same
+        // shape as cortex's `redex_file_free_waits_for_inflight_append`).
+        let nh_addr = nh as usize;
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let started_w = started.clone();
+        let release_w = release.clone();
+
+        let worker = std::thread::spawn(move || {
+            let h = unsafe { &*(nh_addr as *mut MeshNodeHandle) };
+            // Take the guard directly — every gated FFI entry
+            // point does this internally. Holding it past the
+            // main thread's begin_free is what we're testing.
+            let op = h.guard.try_enter().expect("entry must succeed pre-free");
+            started_w.store(true, Ordering::SeqCst);
+            while !release_w.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(op);
+        });
+
+        // Wait for the worker to enter the op.
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+
+        // Schedule release ~50ms out so begin_free has time to
+        // observe `active_ops > 0` and enter its drain loop.
+        let release_clone = release.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            release_clone.store(true, Ordering::SeqCst);
+        });
+
+        // _free MUST block until the worker drops its op.
+        let t0 = Instant::now();
+        net_mesh_free(nh);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "net_mesh_free returned in {:?} — pre-fix it would have proceeded \
+             immediately and the worker's subsequent op would UAF",
+            elapsed,
+        );
+        worker.join().unwrap();
+    }
+
     /// Audit #24 regression: post-free `net_mesh_stream_stats`
     /// must bail with ShuttingDown rather than touching the
     /// freed `inner: ManuallyDrop<Arc<MeshNode>>`. Pre-fix the
