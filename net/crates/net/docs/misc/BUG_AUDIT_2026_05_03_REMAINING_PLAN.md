@@ -184,16 +184,21 @@ bump to amortize the migration cost.
 | 64 | `adapter/net/compute/orchestrator.rs:1177-1182`     | `on_replay_complete` synthesizes a `target_head` with `parent_hash: 0`; downstream verifiers can't reconcile. Compute the real parent_hash or surface as typed error. |
 | 73 | `consumer/merge.rs:384`                              | Per-shard cap currently rolls the cursor BACK on `unclamped_per_shard > PER_SHARD_FETCH_CAP`; advance it to the last fetched event id instead.                    |
 
-### F — Adapter / behavior / network polish (Lower, independent)
+### F — Adapter / behavior / network polish (Lower, independent — triaged)
 
-| #   | File:line                                       | Ask                                                                                                                          |
-| --- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| 81  | `adapter/redis.rs:316-405`                      | Wire `RedisStreamDedup` by default for Go consumers (or surface a config error when it's missing). Pipeline timeout duplicate hazard documented but unfixed. |
-| 118 | `adapter/net/behavior/rules.rs:1247-1253`       | Window reset to `0` not `1` so the post-reset window doesn't admit `max-1` further firings.                                  |
-| 121 | `adapter/net/behavior/loadbalance.rs:1183-1187` | `select_power_of_two` degenerates to deterministic pair when `len == 2`; fall back to a single-target pick or skew the second draw. |
-| 125 | `adapter/net/behavior/safety.rs:451-466`        | `per_source.clear()` at minute boundary drops just-incremented counters; window the reset.                                   |
-| 127 | `adapter/net/mod.rs:495-522`                    | Initiator handshake path needs a `HandshakePacer`-style rate limit (responder already has one; #26 added the routed-handshake guard but the initiator side is still uncapped). |
-| 128 | `adapter/net/router.rs:198-222`                 | `notify_one` lost-wakeup window currently bounded to 1ms by polling fallback — switch to `Notify::notify_waiters` or document the floor.                 |
+After hands-on review, most of Cluster F items are either misreads
+of the current code, degenerate-case observations, or known
+bounded design tradeoffs — not concrete bugs that warrant a
+focused fix. Per-item disposition (see audit doc for details):
+
+| #   | File:line                                       | Disposition                                                                                                |
+| --- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| 81  | `adapter/redis.rs:316-405`                      | **Deferred** — config/deployment shape; needs config-error surfacing when consumer skips dedup helper.    |
+| 118 | `adapter/net/behavior/rules.rs:1247-1253`       | **Obsolete** — current `reset to 1` IS the correct rate-limit semantic; the audit's `reset to 0` would allow `max+1` firings per window. |
+| 121 | `adapter/net/behavior/loadbalance.rs:1183-1187` | **Obsolete** — degenerate `len==2` case IS the P2C algorithm with 2 inputs.                                |
+| 125 | `adapter/net/behavior/safety.rs:451-466`        | **Deferred** — bounded by 60s reset interval; sliding-window refactor is bigger than the brief slip warrants. |
+| 127 | `adapter/net/mod.rs:495-522`                    | **Deferred** — needs per-(peer, us) in-flight handshake registry; structural refactor not a one-line guard. |
+| 128 | `adapter/net/router.rs:198-222`                 | **Deferred** — known bounded latency floor; closing it requires `notify_waiters` or counted-permit scheme. |
 
 ## Skipped (do not pick up)
 
