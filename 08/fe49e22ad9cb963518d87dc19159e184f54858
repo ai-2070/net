@@ -1,0 +1,25 @@
+net/crates/net/src/ffi/mesh.rs
+  8c5e925534ef4498 1530-1533,2287-2293,2526-2532,3744-3876
+net/crates/net/src/consumer/merge.rs
+  8c5e925534ef4498 2189-2273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "08fe49e22ad9cb963518d87dc19159e184f54858",
+  "prompts": {
+    "8c5e925534ef4498": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b9c362b0-aa1b-4f3b-b713-ff66f21760da",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 8739,
+      "total_deletions": 4,
+      "accepted_lines": 236,
+      "overriden_lines": 0
+    }
+  }
+}
