@@ -1,0 +1,76 @@
+net/crates/net/src/adapter/net/state/snapshot.rs
+  8c5e925534ef4498 1337-1339,1362,1367-1371
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  8c5e925534ef4498 1025,1028-1034,1089-1090,1130-1131,1181-1185,1228-1236
+net/crates/net/src/adapter/net/compute/host.rs
+  8c5e925534ef4498 413-416
+net/crates/net/src/ffi/cortex.rs
+  8c5e925534ef4498 226-231,262,401,450-453,585,702-703,726-728,799,1156-1157,1285-1287,1353,1782,2070,2072-2075,2079,2082-2088,2155-2158,2161-2164
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  8c5e925534ef4498 1352-1357
+net/crates/net/src/adapter/net/compute/daemon.rs
+  8c5e925534ef4498 114
+net/crates/net/docs/RELEASE_v0.11_KILLING_MOON_PHASE_IV.md
+  cdf934b360f502d7 1-194
+net/crates/net/src/ffi/mesh.rs
+  8c5e925534ef4498 402-406,565-566,1226-1228,1235-1237,1306,1391-1392,1433-1434,1477-1478,1949-1952,2136,2285,2524,3780-3783,3852-3857,3887-3890,3924-3928
+net/crates/net/src/adapter/redis.rs
+  8c5e925534ef4498 332
+net/crates/net/src/adapter/net/compute/registry.rs
+  8c5e925534ef4498 72-79,88,105-118,146,188,207,228,246,314-317,338-342,620,632-639,666-668
+net/crates/net/src/adapter/net/cortex/meta.rs
+  8c5e925534ef4498 131-133,135,311,336-340
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  8c5e925534ef4498 390-391
+net/crates/net/src/adapter/net/cortex/tasks/fold.rs
+  8c5e925534ef4498 45-50
+net/crates/net/src/adapter/net/router.rs
+  8c5e925534ef4498 613-614
+net/crates/net/src/adapter/net/identity/envelope.rs
+  8c5e925534ef4498 79-85,89-90,377-382,460-464,588,816-821,823-825
+net/crates/net/src/consumer/merge.rs
+  8c5e925534ef4498 2099-2103,2105-2112,2149,2160,2171,2183,2189-2195,2236,2253,2267
+net/crates/net/src/ffi/redis_dedup.rs
+  8c5e925534ef4498 56-58,116-118,155
+net/crates/net/src/adapter/net/cortex/memories/fold.rs
+  8c5e925534ef4498 42-48
+net/crates/net/src/adapter/net/crypto.rs
+  8c5e925534ef4498 1392-1396
+net/crates/net/src/ffi/handle_guard.rs
+  8c5e925534ef4498 240-243
+net/crates/net/src/adapter/net/behavior/safety.rs
+  8c5e925534ef4498 430-431,612-616,752,2468-2472,2506-2510
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "41cd958c7ab53bf470bc662c6ab96bfe018a5650",
+  "prompts": {
+    "8c5e925534ef4498": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b9c362b0-aa1b-4f3b-b713-ff66f21760da",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 26767,
+      "total_deletions": 321,
+      "accepted_lines": 307,
+      "overriden_lines": 0
+    },
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 194,
+      "total_deletions": 0,
+      "accepted_lines": 194,
+      "overriden_lines": 0
+    }
+  }
+}
