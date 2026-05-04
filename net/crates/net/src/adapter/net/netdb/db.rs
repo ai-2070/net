@@ -159,7 +159,7 @@ impl std::fmt::Debug for NetDb {
 /// Builder for [`NetDb`].
 pub struct NetDbBuilder {
     redex: Redex,
-    origin_hash: u32,
+    origin_hash: u64,
     persistent: bool,
     want_tasks: bool,
     want_memories: bool,
@@ -168,7 +168,7 @@ pub struct NetDbBuilder {
 impl NetDbBuilder {
     /// Set the producer origin_hash stamped on every `EventMeta` by
     /// the bundled adapters.
-    pub fn origin(mut self, origin_hash: u32) -> Self {
+    pub fn origin(mut self, origin_hash: u64) -> Self {
         self.origin_hash = origin_hash;
         self
     }

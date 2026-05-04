@@ -15,7 +15,7 @@ pub struct EntityLog {
     /// Entity identity.
     entity_id: EntityId,
     /// Truncated entity hash.
-    origin_hash: u32,
+    origin_hash: u64,
     /// Events in causal order (by sequence number).
     events: Vec<CausalEvent>,
     /// Base link — genesis for new logs, snapshot head for restored logs.
@@ -160,7 +160,7 @@ impl EntityLog {
 
     /// Get the origin hash.
     #[inline]
-    pub fn origin_hash(&self) -> u32 {
+    pub fn origin_hash(&self) -> u64 {
         self.origin_hash
     }
 
@@ -264,7 +264,7 @@ impl std::fmt::Debug for EntityLog {
 ///
 /// O(1) lookup for per-packet routing to the correct entity log.
 pub struct LogIndex {
-    logs: DashMap<u32, EntityLog>,
+    logs: DashMap<u64, EntityLog>,
 }
 
 impl LogIndex {
@@ -279,7 +279,7 @@ impl LogIndex {
     pub fn get_or_create(
         &self,
         entity_id: EntityId,
-    ) -> dashmap::mapref::one::RefMut<'_, u32, EntityLog> {
+    ) -> dashmap::mapref::one::RefMut<'_, u64, EntityLog> {
         let origin_hash = entity_id.origin_hash();
         self.logs
             .entry(origin_hash)
@@ -287,7 +287,7 @@ impl LogIndex {
     }
 
     /// Get the log for an entity (read-only).
-    pub fn get(&self, origin_hash: u32) -> Option<dashmap::mapref::one::Ref<'_, u32, EntityLog>> {
+    pub fn get(&self, origin_hash: u64) -> Option<dashmap::mapref::one::Ref<'_, u64, EntityLog>> {
         self.logs.get(&origin_hash)
     }
 
@@ -297,7 +297,7 @@ impl LogIndex {
     }
 
     /// Remove an entity's log.
-    pub fn remove(&self, origin_hash: u32) -> Option<EntityLog> {
+    pub fn remove(&self, origin_hash: u64) -> Option<EntityLog> {
         self.logs.remove(&origin_hash).map(|(_, log)| log)
     }
 }

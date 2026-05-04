@@ -47,14 +47,14 @@ pub enum ContinuityStatus {
     },
 }
 
-/// Compact proof of continuity that can be transmitted (36 bytes).
+/// Compact proof of continuity that can be transmitted (40 bytes).
 ///
 /// A node can send this to another node to prove its chain is intact
 /// over a given sequence range, without transferring the full log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContinuityProof {
     /// Entity origin hash.
-    pub origin_hash: u32,
+    pub origin_hash: u64,
     /// Start of the proven range.
     pub from_seq: u64,
     /// End of the proven range.
@@ -66,7 +66,7 @@ pub struct ContinuityProof {
 }
 
 /// Wire size of a ContinuityProof.
-pub const CONTINUITY_PROOF_SIZE: usize = 36; // 4 + 8 + 8 + 8 + 8
+pub const CONTINUITY_PROOF_SIZE: usize = 40; // 8 + 8 + 8 + 8 + 8
 
 /// Maximum number of events `ContinuityProof::verify_against` will
 /// walk between `from_seq` and `to_seq` (inclusive). Without this
@@ -223,11 +223,11 @@ impl ContinuityProof {
     /// Serialize to bytes.
     pub fn to_bytes(&self) -> [u8; CONTINUITY_PROOF_SIZE] {
         let mut buf = [0u8; CONTINUITY_PROOF_SIZE];
-        buf[0..4].copy_from_slice(&self.origin_hash.to_le_bytes());
-        buf[4..12].copy_from_slice(&self.from_seq.to_le_bytes());
-        buf[12..20].copy_from_slice(&self.to_seq.to_le_bytes());
-        buf[20..28].copy_from_slice(&self.from_hash.to_le_bytes());
-        buf[28..36].copy_from_slice(&self.to_hash.to_le_bytes());
+        buf[0..8].copy_from_slice(&self.origin_hash.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.from_seq.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.to_seq.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.from_hash.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.to_hash.to_le_bytes());
         buf
     }
 
@@ -242,11 +242,11 @@ impl ContinuityProof {
             return None;
         }
         Some(Self {
-            origin_hash: u32::from_le_bytes(data[0..4].try_into().unwrap()),
-            from_seq: u64::from_le_bytes(data[4..12].try_into().unwrap()),
-            to_seq: u64::from_le_bytes(data[12..20].try_into().unwrap()),
-            from_hash: u64::from_le_bytes(data[20..28].try_into().unwrap()),
-            to_hash: u64::from_le_bytes(data[28..36].try_into().unwrap()),
+            origin_hash: u64::from_le_bytes(data[0..8].try_into().unwrap()),
+            from_seq: u64::from_le_bytes(data[8..16].try_into().unwrap()),
+            to_seq: u64::from_le_bytes(data[16..24].try_into().unwrap()),
+            from_hash: u64::from_le_bytes(data[24..32].try_into().unwrap()),
+            to_hash: u64::from_le_bytes(data[32..40].try_into().unwrap()),
         })
     }
 }

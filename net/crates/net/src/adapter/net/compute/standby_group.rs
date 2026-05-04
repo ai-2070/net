@@ -181,7 +181,7 @@ impl StandbyGroup {
     ///
     /// Use this with `DaemonRegistry::deliver()` to send events to the
     /// active daemon. Only the active processes events.
-    pub fn active_origin(&self) -> u32 {
+    pub fn active_origin(&self) -> u64 {
         self.coord.members()[self.active_index as usize].origin_hash
     }
 
@@ -243,7 +243,7 @@ impl StandbyGroup {
         // first (avoids holding a borrow on `self.members` while
         // calling out to the registry), then track success
         // membership so we can update bookkeeping precisely below.
-        let standbys: Vec<(usize, u32)> = self
+        let standbys: Vec<(usize, u64)> = self
             .members
             .iter()
             .enumerate()
@@ -306,7 +306,7 @@ impl StandbyGroup {
         _daemon_factory: impl Fn() -> Box<dyn MeshDaemon>,
         registry: &DaemonRegistry,
         _scheduler: &Scheduler,
-    ) -> Result<u32, GroupError> {
+    ) -> Result<u64, GroupError> {
         let old_active = self.active_index;
 
         // The search for a replacement runs FIRST; only if it
@@ -389,7 +389,7 @@ impl StandbyGroup {
         daemon_factory: F,
         scheduler: &Scheduler,
         registry: &DaemonRegistry,
-    ) -> Result<Option<u32>, GroupError>
+    ) -> Result<Option<u64>, GroupError>
     where
         F: Fn() -> Box<dyn MeshDaemon>,
     {
@@ -844,7 +844,7 @@ mod tests {
             reg.deliver(group.active_origin(), &event).unwrap();
             group.on_event_delivered(event);
         }
-        let standby_origins: Vec<u32> = group
+        let standby_origins: Vec<u64> = group
             .members
             .iter()
             .filter(|m| m.role == MemberRole::Standby)

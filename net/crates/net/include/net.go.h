@@ -573,7 +573,7 @@ int      net_identity_to_seed(net_identity_t* handle, uint8_t* out);
 int      net_identity_entity_id(net_identity_t* handle, uint8_t* out);
 
 uint64_t net_identity_node_id(net_identity_t* handle);
-uint32_t net_identity_origin_hash(net_identity_t* handle);
+uint64_t net_identity_origin_hash(net_identity_t* handle);
 
 /* Signs `msg[len]`; writes a 64-byte ed25519 signature into `out_sig[64]`. */
 int      net_identity_sign(net_identity_t* handle,

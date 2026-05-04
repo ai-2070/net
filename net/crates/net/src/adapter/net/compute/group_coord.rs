@@ -22,7 +22,7 @@ pub struct MemberInfo {
     /// Member index (0-based).
     pub index: u8,
     /// The member's origin_hash (from its keypair).
-    pub origin_hash: u32,
+    pub origin_hash: u64,
     /// Node where this member is placed.
     pub node_id: u64,
     /// The member's entity ID bytes (used as LoadBalancer NodeId).
@@ -131,7 +131,7 @@ impl GroupCoordinator {
     /// Route an event to the best available member.
     ///
     /// Returns the `origin_hash` for delivery via `DaemonRegistry::deliver()`.
-    pub fn route_event(&self, ctx: &RequestContext) -> Result<u32, GroupError> {
+    pub fn route_event(&self, ctx: &RequestContext) -> Result<u64, GroupError> {
         let selection = self
             .lb
             .select(ctx)
@@ -244,7 +244,7 @@ impl GroupCoordinator {
     }
 
     /// Look up origin_hash from a LoadBalancer entity ID.
-    fn origin_hash_for_entity_id(&self, entity_id: &NodeId) -> Option<u32> {
+    fn origin_hash_for_entity_id(&self, entity_id: &NodeId) -> Option<u64> {
         self.members
             .iter()
             .find(|m| m.entity_id_bytes == *entity_id)

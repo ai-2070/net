@@ -16,7 +16,7 @@ use crate::adapter::net::state::causal::{
 #[derive(Debug, Clone)]
 pub struct Discontinuity {
     /// Entity whose chain broke.
-    pub origin_hash: u32,
+    pub origin_hash: u64,
     /// Last verified event in the original chain.
     pub last_verified: CausalLink,
     /// The event that could not be linked (if available).
@@ -81,9 +81,9 @@ impl std::fmt::Display for DiscontinuityReason {
 #[derive(Debug, Clone)]
 pub struct ForkRecord {
     /// The original entity's origin hash.
-    pub original_origin: u32,
+    pub original_origin: u64,
     /// The forked entity's origin hash (new keypair).
-    pub forked_origin: u32,
+    pub forked_origin: u64,
     /// Sequence at which the fork occurred.
     pub fork_seq: u64,
     /// The forked entity's genesis link.
@@ -97,8 +97,8 @@ pub struct ForkRecord {
 /// `parent_hash = xxh3(original_origin ++ fork_seq ++ "fork")`
 ///
 /// Any node can verify a fork record by recomputing this sentinel.
-pub fn fork_sentinel(original_origin: u32, fork_seq: u64) -> u64 {
-    let mut buf = Vec::with_capacity(4 + 8 + 4);
+pub fn fork_sentinel(original_origin: u64, fork_seq: u64) -> u64 {
+    let mut buf = Vec::with_capacity(8 + 8 + 4);
     buf.extend_from_slice(&original_origin.to_le_bytes());
     buf.extend_from_slice(&fork_seq.to_le_bytes());
     buf.extend_from_slice(b"fork");
@@ -113,7 +113,7 @@ pub fn fork_sentinel(original_origin: u32, fork_seq: u64) -> u64 {
 /// Returns the new keypair, fork record, and chain builder ready to
 /// produce events.
 pub fn fork_entity(
-    original_origin: u32,
+    original_origin: u64,
     fork_seq: u64,
     from_snapshot_seq: Option<u64>,
 ) -> (EntityKeypair, ForkRecord, CausalChainBuilder) {
@@ -159,8 +159,8 @@ impl ForkRecord {
             && self.original_origin != self.forked_origin
     }
 
-    /// Wire size: 4 + 4 + 8 + CAUSAL_LINK_SIZE + 1 + 8 = 53 bytes.
-    pub const WIRE_SIZE: usize = 4 + 4 + 8 + CAUSAL_LINK_SIZE + 1 + 8;
+    /// Wire size: 8 + 8 + 8 + CAUSAL_LINK_SIZE + 1 + 8 bytes.
+    pub const WIRE_SIZE: usize = 8 + 8 + 8 + CAUSAL_LINK_SIZE + 1 + 8;
 
     /// Serialize to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -211,17 +211,17 @@ impl ForkRecord {
         if data.len() != Self::WIRE_SIZE {
             return None;
         }
-        let original_origin = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        let forked_origin = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        let fork_seq = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        let original_origin = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        let forked_origin = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        let fork_seq = u64::from_le_bytes(data[16..24].try_into().unwrap());
         // Field offsets are computed from the prefix lengths above
         // plus `CAUSAL_LINK_SIZE` so a future wire-size change to
         // the causal link is picked up here automatically. Pre-#130
         // these were hand-encoded (16..40 for the link, 40 for the
         // snapshot flag, 41..49 for the snapshot seq) and silently
         // mis-parsed when the link width changed.
-        let link_end = 16 + CAUSAL_LINK_SIZE;
-        let fork_genesis = CausalLink::from_bytes(&data[16..link_end])?;
+        let link_end = 24 + CAUSAL_LINK_SIZE;
+        let fork_genesis = CausalLink::from_bytes(&data[24..link_end])?;
         let has_snapshot = data[link_end] != 0;
         let snapshot_seq = u64::from_le_bytes(data[link_end + 1..link_end + 9].try_into().unwrap());
         let from_snapshot_seq = if has_snapshot {

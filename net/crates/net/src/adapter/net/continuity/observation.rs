@@ -28,9 +28,9 @@ pub struct ObservationWindow {
     /// This observer's subnet.
     local_subnet: SubnetId,
     /// Last time each entity was directly observed (local nanos timestamp).
-    last_observed: HashMap<u32, u64>,
+    last_observed: HashMap<u64, u64>,
     /// Estimated propagation delay per entity (nanos).
-    estimated_delay: HashMap<u32, u64>,
+    estimated_delay: HashMap<u64, u64>,
 }
 
 impl ObservationWindow {
@@ -61,7 +61,7 @@ impl ObservationWindow {
     /// policy. We evict the entry with the smallest `last_observed`
     /// timestamp (LRU by observation), matching the eviction policy
     /// the audit recommends. Returns the evicted origin_hash if any.
-    fn evict_if_at_cap(&mut self, origin_hash: u32) {
+    fn evict_if_at_cap(&mut self, origin_hash: u64) {
         if self.last_observed.contains_key(&origin_hash) {
             return;
         }
@@ -77,7 +77,7 @@ impl ObservationWindow {
     /// Record an observation with propagation context.
     pub fn observe_with_context(
         &mut self,
-        origin_hash: u32,
+        origin_hash: u64,
         sequence: u64,
         hop_count: u8,
         source_subnet: SubnetId,
@@ -96,14 +96,14 @@ impl ObservationWindow {
     }
 
     /// Simple observation (no propagation context).
-    pub fn observe(&mut self, origin_hash: u32, sequence: u64) {
+    pub fn observe(&mut self, origin_hash: u64, sequence: u64) {
         self.horizon.observe(origin_hash, sequence);
         self.evict_if_at_cap(origin_hash);
         self.last_observed.insert(origin_hash, current_timestamp());
     }
 
     /// How long since an entity was last observed.
-    pub fn staleness(&self, origin_hash: u32) -> Option<Duration> {
+    pub fn staleness(&self, origin_hash: u64) -> Option<Duration> {
         self.last_observed.get(&origin_hash).map(|&ts| {
             let now = current_timestamp();
             Duration::from_nanos(now.saturating_sub(ts))
@@ -112,7 +112,7 @@ impl ObservationWindow {
 
     /// Whether an entity is within the observer's causal cone
     /// (observed recently enough given propagation delay).
-    pub fn is_within_cone(&self, origin_hash: u32, max_delay_nanos: u64) -> bool {
+    pub fn is_within_cone(&self, origin_hash: u64, max_delay_nanos: u64) -> bool {
         let delay = self.estimated_delay.get(&origin_hash).copied().unwrap_or(0);
         let staleness = match self.staleness(origin_hash) {
             Some(s) => s.as_nanos() as u64,
@@ -122,7 +122,7 @@ impl ObservationWindow {
     }
 
     /// Entities observed within a given hop radius.
-    pub fn reachable_entities(&self, max_delay_nanos: u64) -> Vec<u32> {
+    pub fn reachable_entities(&self, max_delay_nanos: u64) -> Vec<u64> {
         self.last_observed
             .keys()
             .filter(|&&origin| self.is_within_cone(origin, max_delay_nanos))
@@ -305,8 +305,8 @@ mod tests {
         // entries. We use distinct origin hashes whose `last_observed`
         // timestamps form a strict order so the LRU-by-timestamp
         // pick is deterministic.
-        for i in 0..MAX_TRACKED_ENTITIES as u32 {
-            window.last_observed.insert(i, i as u64);
+        for i in 0..MAX_TRACKED_ENTITIES as u64 {
+            window.last_observed.insert(i, i);
             window.estimated_delay.insert(i, 0);
             window.horizon.observe(i, 0);
         }
@@ -322,7 +322,7 @@ mod tests {
         // had the smallest synthetic timestamp BUT was just refreshed
         // to `current_timestamp()` above — so origin 1 is now the
         // oldest and should be the eviction target.
-        let novel = (MAX_TRACKED_ENTITIES + 1000) as u32;
+        let novel = (MAX_TRACKED_ENTITIES + 1000) as u64;
         window.observe(novel, 1);
         assert_eq!(window.last_observed.len(), MAX_TRACKED_ENTITIES);
         assert!(window.last_observed.contains_key(&novel));

@@ -60,7 +60,7 @@ struct MemoriesSnapshotPayload {
 pub struct MemoriesAdapter {
     inner: CortexAdapter<MemoriesState>,
     /// Producer identity stamped on every `EventMeta`.
-    origin_hash: u32,
+    origin_hash: u64,
     /// Monotonic per-origin counter for `EventMeta::seq_or_ts`.
     /// Shared with the inner `WatermarkingFold` wrapper around
     /// [`MemoriesFold`]: the fold task advances this counter via
@@ -106,14 +106,14 @@ impl MemoriesAdapter {
     /// The pre-fix doc said "the first `ingest_typed` after open
     /// cannot collide with an already-stored event" full-stop;
     /// the qualifier "THIS ADAPTER caused" is the correction.
-    pub async fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
+    pub async fn open(redex: &Redex, origin_hash: u64) -> Result<Self, CortexAdapterError> {
         Self::open_with_config(redex, origin_hash, RedexFileConfig::default()).await
     }
 
     /// Like [`Self::open`] but with a caller-supplied `RedexFileConfig`.
     pub async fn open_with_config(
         redex: &Redex,
-        origin_hash: u32,
+        origin_hash: u64,
         redex_config: RedexFileConfig,
     ) -> Result<Self, CortexAdapterError> {
         let name = ChannelName::new(MEMORIES_CHANNEL).map_err(|e| {
@@ -302,7 +302,7 @@ impl MemoriesAdapter {
     /// See [`Self::open`] for why this is `async`.
     pub async fn open_from_snapshot(
         redex: &Redex,
-        origin_hash: u32,
+        origin_hash: u64,
         state_bytes: &[u8],
         last_seq: Option<u64>,
     ) -> Result<Self, CortexAdapterError> {
@@ -320,7 +320,7 @@ impl MemoriesAdapter {
     /// `RedexFileConfig`.
     pub async fn open_from_snapshot_with_config(
         redex: &Redex,
-        origin_hash: u32,
+        origin_hash: u64,
         redex_config: RedexFileConfig,
         state_bytes: &[u8],
         last_seq: Option<u64>,

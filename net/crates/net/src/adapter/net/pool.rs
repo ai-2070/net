@@ -25,7 +25,7 @@ pub struct PacketBuilder {
     /// Session ID for this builder
     session_id: u64,
     /// Origin hash from entity identity (0 if no identity configured)
-    origin_hash: u32,
+    origin_hash: u64,
     /// Channel hash for the current stream (0 if not bound to a channel)
     channel_hash: u16,
 }
@@ -55,7 +55,7 @@ impl PacketBuilder {
     }
 
     /// Create a new packet builder with origin identity
-    pub fn with_origin(key: &[u8; 32], session_id: u64, origin_hash: u32) -> Self {
+    pub fn with_origin(key: &[u8; 32], session_id: u64, origin_hash: u64) -> Self {
         Self {
             payload: BytesMut::with_capacity(MAX_PAYLOAD_SIZE),
             cipher: PacketCipher::new(key, session_id),
@@ -74,7 +74,7 @@ impl PacketBuilder {
     pub fn with_shared_counter(
         key: &[u8; 32],
         session_id: u64,
-        origin_hash: u32,
+        origin_hash: u64,
         tx_counter: Arc<AtomicU64>,
     ) -> Self {
         Self {
@@ -100,7 +100,7 @@ impl PacketBuilder {
     }
 
     /// Set the origin hash
-    pub fn set_origin_hash(&mut self, origin_hash: u32) {
+    pub fn set_origin_hash(&mut self, origin_hash: u64) {
         self.origin_hash = origin_hash;
     }
 
@@ -392,7 +392,7 @@ pub struct PacketPool {
     /// Session ID for builders
     session_id: u64,
     /// Origin hash for L1 identity
-    origin_hash: u32,
+    origin_hash: u64,
     /// Pool capacity
     capacity: usize,
     /// Shared TX counter — all builders atomically increment this to prevent
@@ -407,7 +407,7 @@ impl PacketPool {
     }
 
     /// Create a new packet pool with origin identity
-    pub fn with_origin(size: usize, key: &[u8; 32], session_id: u64, origin_hash: u32) -> Self {
+    pub fn with_origin(size: usize, key: &[u8; 32], session_id: u64, origin_hash: u64) -> Self {
         let tx_counter = Arc::new(AtomicU64::new(0));
         let builders = ArrayQueue::new(size);
 
@@ -645,7 +645,7 @@ pub struct ThreadLocalPool {
     /// Session ID for builders
     session_id: u64,
     /// Origin hash for L1 identity
-    origin_hash: u32,
+    origin_hash: u64,
     /// Maximum builders per thread-local cache
     local_capacity: usize,
     /// Total pool capacity
@@ -665,7 +665,7 @@ impl ThreadLocalPool {
     }
 
     /// Create a new thread-local pool with origin identity
-    pub fn with_origin(size: usize, key: &[u8; 32], session_id: u64, origin_hash: u32) -> Self {
+    pub fn with_origin(size: usize, key: &[u8; 32], session_id: u64, origin_hash: u64) -> Self {
         Self::with_local_capacity(
             size,
             key,
@@ -680,7 +680,7 @@ impl ThreadLocalPool {
         size: usize,
         key: &[u8; 32],
         session_id: u64,
-        origin_hash: u32,
+        origin_hash: u64,
         local_capacity: usize,
     ) -> Self {
         let tx_counter = Arc::new(AtomicU64::new(0));

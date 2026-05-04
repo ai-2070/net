@@ -736,7 +736,7 @@ pub struct TasksAdapterHandle {
 #[unsafe(no_mangle)]
 pub extern "C" fn net_tasks_adapter_open(
     redex: *mut RedexHandle,
-    origin_hash: u32,
+    origin_hash: u64,
     persistent: c_int,
     out_handle: *mut *mut TasksAdapterHandle,
 ) -> c_int {
@@ -1292,7 +1292,7 @@ pub struct MemoriesAdapterHandle {
 #[unsafe(no_mangle)]
 pub extern "C" fn net_memories_adapter_open(
     redex: *mut RedexHandle,
-    origin_hash: u32,
+    origin_hash: u64,
     persistent: c_int,
     out_handle: *mut *mut MemoriesAdapterHandle,
 ) -> c_int {

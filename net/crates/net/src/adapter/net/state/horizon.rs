@@ -40,7 +40,7 @@ use xxhash_rust::xxh3::xxh3_64;
 #[derive(Debug, Clone, Default)]
 pub struct ObservedHorizon {
     /// origin_hash -> highest sequence observed from that entity.
-    entries: HashMap<u32, u64>,
+    entries: HashMap<u64, u64>,
     /// Logical time (incremented on each observation).
     logical_time: u64,
 }
@@ -59,7 +59,7 @@ impl ObservedHorizon {
     /// streams could otherwise panic the receive loop in debug
     /// builds. The `merge` path at line 75 uses the same
     /// convention.
-    pub fn observe(&mut self, origin_hash: u32, sequence: u64) {
+    pub fn observe(&mut self, origin_hash: u64, sequence: u64) {
         let entry = self.entries.entry(origin_hash).or_insert(0);
         if sequence > *entry {
             *entry = sequence;
@@ -68,7 +68,7 @@ impl ObservedHorizon {
     }
 
     /// Get the highest observed sequence for an entity.
-    pub fn get(&self, origin_hash: u32) -> Option<u64> {
+    pub fn get(&self, origin_hash: u64) -> Option<u64> {
         self.entries.get(&origin_hash).copied()
     }
 
@@ -77,7 +77,7 @@ impl ObservedHorizon {
     /// `HorizonEncoder::might_contain` would saturate — past
     /// ~16 active origins per event the bloom approximation
     /// becomes unreliable.
-    pub fn has_observed(&self, origin_hash: u32, sequence: u64) -> bool {
+    pub fn has_observed(&self, origin_hash: u64, sequence: u64) -> bool {
         self.entries
             .get(&origin_hash)
             .is_some_and(|&seq| seq >= sequence)
@@ -92,7 +92,7 @@ impl ObservedHorizon {
     /// mis-reporting genuinely concurrent events as causally
     /// ordered.
     #[inline]
-    pub fn contains_origin(&self, origin_hash: u32) -> bool {
+    pub fn contains_origin(&self, origin_hash: u64) -> bool {
         self.entries.contains_key(&origin_hash)
     }
 
@@ -107,7 +107,7 @@ impl ObservedHorizon {
     }
 
     /// Iterate over all (origin_hash, sequence) pairs.
-    pub fn iter(&self) -> impl Iterator<Item = (&u32, &u64)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &u64)> {
         self.entries.iter()
     }
 
@@ -192,7 +192,7 @@ impl HorizonEncoder {
     /// Returns a `u64` with exactly 3 bits set (the union of the
     /// three positions).
     #[inline]
-    fn bloom_bits_for_origin(origin_hash: u32) -> u64 {
+    fn bloom_bits_for_origin(origin_hash: u64) -> u64 {
         let h = xxh3_64(&origin_hash.to_le_bytes());
         let h1 = h as u32;
         let h2 = ((h >> 32) as u32) | 1; // force odd — see above
@@ -218,7 +218,7 @@ impl HorizonEncoder {
     /// the number of distinct origins encoded; see the type-level
     /// FPR table). Bloom invariant: every inserted origin reports
     /// `true`.
-    pub fn might_contain(encoded: u64, origin_hash: u32) -> bool {
+    pub fn might_contain(encoded: u64, origin_hash: u64) -> bool {
         let bits = Self::bloom_bits_for_origin(origin_hash);
         (encoded & bits) == bits
     }
@@ -236,9 +236,9 @@ impl HorizonEncoder {
     /// the full [`ObservedHorizon`].
     pub fn potentially_concurrent(
         horizon_a: u64,
-        origin_b: u32,
+        origin_b: u64,
         horizon_b: u64,
-        origin_a: u32,
+        origin_a: u64,
     ) -> bool {
         !Self::might_contain(horizon_a, origin_b) && !Self::might_contain(horizon_b, origin_a)
     }
@@ -384,8 +384,8 @@ mod tests {
     #[test]
     fn might_contain_has_no_false_negatives_for_inserted_origins() {
         let mut h = ObservedHorizon::new();
-        let origins: Vec<u32> = (0..50u32)
-            .map(|i| 0xDEAD_0000_u32 ^ i.wrapping_mul(0x9E37_79B1))
+        let origins: Vec<u64> = (0..50u64)
+            .map(|i| 0xDEAD_0000_u64 ^ i.wrapping_mul(0x9E37_79B1))
             .collect();
         for &o in &origins {
             h.observe(o, 1);
@@ -394,7 +394,7 @@ mod tests {
         for &o in &origins {
             assert!(
                 HorizonEncoder::might_contain(encoded, o),
-                "every inserted origin (here 0x{o:08X}) must report `true` — bloom invariant",
+                "every inserted origin (here 0x{o:016X}) must report `true` — bloom invariant",
             );
         }
     }
@@ -410,8 +410,8 @@ mod tests {
     #[test]
     fn might_contain_fpr_at_n_8_is_well_below_pre_fix_saturation() {
         let mut h = ObservedHorizon::new();
-        let inserted: Vec<u32> = (0..8u32)
-            .map(|i| 0x1000_0000_u32.wrapping_add(i.wrapping_mul(0xC0FF_EEAB)))
+        let inserted: Vec<u64> = (0..8u64)
+            .map(|i| 0x1000_0000_u64.wrapping_add(i.wrapping_mul(0xC0FF_EEAB)))
             .collect();
         for &o in &inserted {
             h.observe(o, 1);
@@ -422,7 +422,7 @@ mod tests {
         let trials = 1000;
         for i in 0..trials {
             // Probe origin not in the inserted set.
-            let probe = 0xBEEF_0000_u32.wrapping_add((i as u32).wrapping_mul(0x9E37_79B9));
+            let probe = 0xBEEF_0000_u64.wrapping_add((i as u64).wrapping_mul(0x9E37_79B9));
             if inserted.contains(&probe) {
                 continue;
             }
@@ -475,8 +475,8 @@ mod tests {
     #[test]
     fn might_contain_fpr_at_documented_ceiling_stays_under_60_percent() {
         let mut h = ObservedHorizon::new();
-        let inserted: Vec<u32> = (0..16u32)
-            .map(|i| 0x2000_0000_u32.wrapping_add(i.wrapping_mul(0x9E37_79B9)))
+        let inserted: Vec<u64> = (0..16u64)
+            .map(|i| 0x2000_0000_u64.wrapping_add(i.wrapping_mul(0x9E37_79B9)))
             .collect();
         for &o in &inserted {
             h.observe(o, 1);
@@ -486,7 +486,7 @@ mod tests {
         let mut false_positives = 0;
         let trials = 1000;
         for i in 0..trials {
-            let probe = 0xFEED_0000_u32.wrapping_add((i as u32).wrapping_mul(0xC0FF_EEAB));
+            let probe = 0xFEED_0000_u64.wrapping_add((i as u64).wrapping_mul(0xC0FF_EEAB));
             if inserted.contains(&probe) {
                 continue;
             }
@@ -522,8 +522,8 @@ mod tests {
         // disjoint 4-element sets so any one fortunate hash doesn't
         // mask a regression. Pair k draws left from
         // `[k*8 .. k*8+4)` and right from `[k*8+4 .. k*8+8)`.
-        let candidates: Vec<u32> = (0..32u32)
-            .map(|i| 0x3000_0000_u32.wrapping_add(i.wrapping_mul(0xDEAD_BEEF)))
+        let candidates: Vec<u64> = (0..32u64)
+            .map(|i| 0x3000_0000_u64.wrapping_add(i.wrapping_mul(0xDEAD_BEEF)))
             .collect();
 
         for split in 0..3 {
@@ -593,10 +593,10 @@ mod tests {
         use crate::adapter::net::state::causal::CausalLink;
 
         let mut h = ObservedHorizon::new();
-        for i in 0..8u32 {
+        for i in 0..8u64 {
             h.observe(
-                0x4000_0000_u32.wrapping_add(i.wrapping_mul(0xCAFE_F00D)),
-                i as u64 + 1,
+                0x4000_0000_u64.wrapping_add(i.wrapping_mul(0xCAFE_F00D)),
+                i + 1,
             );
         }
         let encoded = h.encode();
@@ -620,7 +620,7 @@ mod tests {
         for (&origin, _) in h.iter() {
             assert!(
                 HorizonEncoder::might_contain(parsed.horizon_encoded, origin),
-                "round-tripped horizon must still recognize inserted origin 0x{origin:08X}",
+                "round-tripped horizon must still recognize inserted origin 0x{origin:016X}",
             );
         }
     }
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn bloom_does_not_collapse_to_one_bit_for_typical_origins() {
         let mut single_bit_count = 0;
-        for i in 0..256u32 {
+        for i in 0..256u64 {
             let mut h = ObservedHorizon::new();
             h.observe(i, 1);
             let encoded = h.encode();

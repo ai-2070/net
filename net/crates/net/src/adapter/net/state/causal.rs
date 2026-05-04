@@ -21,13 +21,13 @@ pub const SUBPROTOCOL_SNAPSHOT: u16 = 0x0401;
 /// origins, defeating concurrency detection. See
 /// `state/horizon.rs` for the FPR table and the
 /// out-of-band-fallback escape hatch.
-pub const CAUSAL_LINK_SIZE: usize = 28;
+pub const CAUSAL_LINK_SIZE: usize = 32;
 
-/// Causal link — 28 bytes prepended to each event in causal-framed EventFrames.
+/// Causal link — 32 bytes prepended to each event in causal-framed EventFrames.
 ///
-/// Wire format (28 bytes, no padding):
+/// Wire format (32 bytes, no padding):
 /// ```text
-/// origin_hash:      4 bytes (u32) — entity identity
+/// origin_hash:      8 bytes (u64) — entity identity
 /// horizon_encoded:  8 bytes (u64) — compressed observed horizon
 /// sequence:         8 bytes (u64) — monotonic per-entity
 /// parent_hash:      8 bytes (u64) — xxh3 of (prev link ++ prev payload)
@@ -38,8 +38,13 @@ pub const CAUSAL_LINK_SIZE: usize = 28;
 /// padding the compiler chooses doesn't leak to the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CausalLink {
-    /// Truncated entity identity (matches Net header origin_hash).
-    pub origin_hash: u32,
+    /// Entity identity. The low 32 bits match
+    /// `NetHeader::origin_hash` (still u32 on the per-packet
+    /// wire); the full u64 is used for chain integrity and
+    /// cross-channel accounting where the wider tag avoids the
+    /// ~65k peer birthday-collision floor a u32 truncation
+    /// would produce.
+    pub origin_hash: u64,
     /// Compressed observed horizon (64-bit bloom sketch).
     ///
     /// Approximate, with documented FPR-vs-cardinality table on
@@ -57,7 +62,7 @@ pub struct CausalLink {
 
 impl CausalLink {
     /// Create the genesis link for a new entity (no parent).
-    pub fn genesis(origin_hash: u32, horizon_encoded: u64) -> Self {
+    pub fn genesis(origin_hash: u64, horizon_encoded: u64) -> Self {
         Self {
             origin_hash,
             horizon_encoded,
@@ -80,12 +85,12 @@ impl CausalLink {
         })
     }
 
-    /// Serialize to 28 bytes.
+    /// Serialize to 32 bytes.
     #[inline]
     pub fn to_bytes(&self) -> [u8; CAUSAL_LINK_SIZE] {
         let mut buf = [0u8; CAUSAL_LINK_SIZE];
         let mut cursor = &mut buf[..];
-        cursor.put_u32_le(self.origin_hash);
+        cursor.put_u64_le(self.origin_hash);
         cursor.put_u64_le(self.horizon_encoded);
         cursor.put_u64_le(self.sequence);
         cursor.put_u64_le(self.parent_hash);
@@ -100,7 +105,7 @@ impl CausalLink {
         }
         let mut cursor = &data[..CAUSAL_LINK_SIZE];
         Some(Self {
-            origin_hash: cursor.get_u32_le(),
+            origin_hash: cursor.get_u64_le(),
             horizon_encoded: cursor.get_u64_le(),
             sequence: cursor.get_u64_le(),
             parent_hash: cursor.get_u64_le(),
@@ -144,14 +149,14 @@ pub struct CausalEvent {
 ///
 /// Tracks the head of the chain and produces correctly-linked events.
 pub struct CausalChainBuilder {
-    origin_hash: u32,
+    origin_hash: u64,
     head: CausalLink,
     head_payload: Bytes,
 }
 
 impl CausalChainBuilder {
     /// Create a new chain builder for an entity.
-    pub fn new(origin_hash: u32) -> Self {
+    pub fn new(origin_hash: u64) -> Self {
         let genesis = CausalLink::genesis(origin_hash, 0);
         Self {
             origin_hash,
@@ -198,7 +203,7 @@ impl CausalChainBuilder {
 
     /// Get the origin hash.
     #[inline]
-    pub fn origin_hash(&self) -> u32 {
+    pub fn origin_hash(&self) -> u64 {
         self.origin_hash
     }
 }
@@ -371,9 +376,9 @@ pub enum ChainError {
     /// Event's origin_hash doesn't match the chain's entity.
     OriginMismatch {
         /// Expected origin_hash.
-        expected: u32,
+        expected: u64,
         /// Actual origin_hash.
-        got: u32,
+        got: u64,
     },
     /// Sequence number is not prev + 1.
     SequenceGap {
@@ -593,21 +598,24 @@ mod tests {
     // ---- Regression tests for Cubic AI findings ----
 
     #[test]
-    fn test_regression_causal_link_wire_size_is_28() {
+    fn test_regression_causal_link_wire_size_is_32() {
         // Regression: original repr(C) with field order u32, u64,
         // u64, u32 padded to 32 bytes; an earlier fix reordered to
-        // u32, u32, u64, u64 (24 bytes). The bloom-widening fix widens
-        // `horizon_encoded` from u32 to u64 to give the bloom
-        // filter enough bits to be useful past ~6 origins, taking
-        // the wire size to 28 bytes (4 + 8 + 8 + 8). Pin the new
-        // size so a future refactor that drops bytes (or adds
-        // padding) trips this test.
+        // u32, u32, u64, u64 (24 bytes). The bloom-widening fix
+        // widened `horizon_encoded` from u32 to u64 (28 bytes:
+        // 4 + 8 + 8 + 8). The origin-widening fix widens
+        // `origin_hash` from u32 to u64 to push the per-channel
+        // birthday-collision floor above the ~65k peer ceiling a
+        // u32 truncation would impose, taking the wire size to
+        // 32 bytes (8 + 8 + 8 + 8). Pin the new size so a future
+        // refactor that drops bytes (or adds padding) trips this
+        // test.
         let link = CausalLink::genesis(0xDEADBEEF, 0xCAFE);
         let bytes = link.to_bytes();
         assert_eq!(
             bytes.len(),
-            28,
-            "CausalLink wire size must be exactly 28 bytes"
+            32,
+            "CausalLink wire size must be exactly 32 bytes"
         );
         assert_eq!(bytes.len(), CAUSAL_LINK_SIZE);
 

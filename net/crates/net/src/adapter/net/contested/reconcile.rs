@@ -37,7 +37,7 @@ pub enum ReconcileOutcome {
     /// One side has events the other doesn't, no conflict.
     Catchup {
         /// Entity origin hash.
-        origin_hash: u32,
+        origin_hash: u64,
         /// Events to replay on the behind side.
         missing_events: Vec<CausalEvent>,
         /// Which side needs the events.
@@ -46,7 +46,7 @@ pub enum ReconcileOutcome {
     /// Both sides produced events during the split.
     Conflict {
         /// Entity origin hash.
-        origin_hash: u32,
+        origin_hash: u64,
         /// Sequence where divergence begins.
         diverge_seq: u64,
         /// Resolution applied.
@@ -249,7 +249,7 @@ pub fn reconcile_entity(
 ///
 /// Returns `Ok(())` on an empty slice (nothing to trust).
 pub fn verify_remote_chain(
-    expected_origin: u32,
+    expected_origin: u64,
     events: &[CausalEvent],
     expected_first_seq: Option<u64>,
 ) -> Result<(), ChainError> {

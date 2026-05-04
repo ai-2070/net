@@ -1,11 +1,11 @@
-//! Fixed 20-byte `EventMeta` prefix on every CortEX-adapted payload.
+//! Fixed 24-byte `EventMeta` prefix on every CortEX-adapted payload.
 //!
-//! Wire layout (little-endian, 20 bytes total):
+//! Wire layout (little-endian, 24 bytes total):
 //!
 //! ```text
 //! ┌──────────┬───────┬──────┬─────────────┬───────────┬──────────┐
 //! │ dispatch │ flags │ _pad │ origin_hash │ seq_or_ts │ checksum │
-//! │   u8     │  u8   │  2B  │    u32      │    u64    │   u32    │
+//! │   u8     │  u8   │  2B  │    u64      │    u64    │   u32    │
 //! └──────────┴───────┴──────┴─────────────┴───────────┴──────────┘
 //! ```
 //!
@@ -15,7 +15,7 @@
 //! file breaks fold ordering assumptions.
 
 /// Size of an `EventMeta` in its wire / on-disk format.
-pub const EVENT_META_SIZE: usize = 20;
+pub const EVENT_META_SIZE: usize = 24;
 
 /// Dispatch value reserved for "raw" payloads — no CortEX-level
 /// semantics. Callers that don't need dispatch routing should use
@@ -42,8 +42,9 @@ pub struct EventMeta {
     pub flags: u8,
     /// Reserved; must be zero on write, ignored on read.
     pub _pad: [u8; 2],
-    /// Producer identity (xxh3 truncation of the origin).
-    pub origin_hash: u32,
+    /// Producer identity — full `EntityKeypair::origin_hash()`
+    /// value, not a truncation.
+    pub origin_hash: u64,
     /// Per-origin monotonic counter OR unix nanos. Application
     /// identity — orthogonal to the RedEX storage sequence.
     pub seq_or_ts: u64,
@@ -54,7 +55,7 @@ pub struct EventMeta {
 
 impl EventMeta {
     /// Build an `EventMeta` with zeroed pad bytes.
-    pub fn new(dispatch: u8, flags: u8, origin_hash: u32, seq_or_ts: u64, checksum: u32) -> Self {
+    pub fn new(dispatch: u8, flags: u8, origin_hash: u64, seq_or_ts: u64, checksum: u32) -> Self {
         Self {
             dispatch,
             flags,
@@ -65,7 +66,7 @@ impl EventMeta {
         }
     }
 
-    /// Encode to the 20-byte little-endian wire format. The reserved
+    /// Encode to the 24-byte little-endian wire format. The reserved
     /// `_pad` bytes are always written as zero regardless of what the
     /// caller stuffed into them — the wire contract says "zero on
     /// write, ignored on read."
@@ -74,14 +75,14 @@ impl EventMeta {
         out[0] = self.dispatch;
         out[1] = self.flags;
         // out[2..4] stays [0, 0] (reserved pad).
-        out[4..8].copy_from_slice(&self.origin_hash.to_le_bytes());
-        out[8..16].copy_from_slice(&self.seq_or_ts.to_le_bytes());
-        out[16..20].copy_from_slice(&self.checksum.to_le_bytes());
+        out[4..12].copy_from_slice(&self.origin_hash.to_le_bytes());
+        out[12..20].copy_from_slice(&self.seq_or_ts.to_le_bytes());
+        out[20..24].copy_from_slice(&self.checksum.to_le_bytes());
         out
     }
 
-    /// Decode from a 20-byte slice. Returns `None` if the slice is
-    /// shorter than 20 bytes.
+    /// Decode from a 24-byte slice. Returns `None` if the slice is
+    /// shorter than 24 bytes.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < EVENT_META_SIZE {
             return None;
@@ -90,9 +91,9 @@ impl EventMeta {
             dispatch: bytes[0],
             flags: bytes[1],
             _pad: [bytes[2], bytes[3]],
-            origin_hash: u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")),
-            seq_or_ts: u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")),
-            checksum: u32::from_le_bytes(bytes[16..20].try_into().expect("4 bytes")),
+            origin_hash: u64::from_le_bytes(bytes[4..12].try_into().expect("8 bytes")),
+            seq_or_ts: u64::from_le_bytes(bytes[12..20].try_into().expect("8 bytes")),
+            checksum: u32::from_le_bytes(bytes[20..24].try_into().expect("4 bytes")),
         })
     }
 
@@ -110,8 +111,8 @@ impl EventMeta {
     /// (including the uninitialized 0 placeholder during ingest).
     fn for_checksum_bytes(&self) -> [u8; EVENT_META_SIZE] {
         let mut b = self.to_bytes();
-        // bytes [16..20] = checksum field; zero it.
-        b[16..20].copy_from_slice(&0u32.to_le_bytes());
+        // bytes [20..24] = checksum field; zero it.
+        b[20..24].copy_from_slice(&0u32.to_le_bytes());
         b
     }
 }
@@ -301,7 +302,7 @@ mod tests {
     #[test]
     fn test_field_boundaries_isolated() {
         // Write max values in each field; decode must return them all.
-        let m = EventMeta::new(u8::MAX, u8::MAX, u32::MAX, u64::MAX, u32::MAX);
+        let m = EventMeta::new(u8::MAX, u8::MAX, u64::MAX, u64::MAX, u32::MAX);
         let decoded = EventMeta::from_bytes(&m.to_bytes()).unwrap();
         assert_eq!(decoded, m);
     }

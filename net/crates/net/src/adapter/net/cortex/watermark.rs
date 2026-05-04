@@ -43,12 +43,12 @@ use super::meta::{EventMeta, EVENT_META_SIZE};
 pub(super) struct WatermarkingFold<S, F> {
     inner: F,
     app_seq: Arc<AtomicU64>,
-    origin_hash: u32,
+    origin_hash: u64,
     _state: PhantomData<fn(&mut S)>,
 }
 
 impl<S, F> WatermarkingFold<S, F> {
-    pub(super) fn new(inner: F, app_seq: Arc<AtomicU64>, origin_hash: u32) -> Self {
+    pub(super) fn new(inner: F, app_seq: Arc<AtomicU64>, origin_hash: u64) -> Self {
         Self {
             inner,
             app_seq,
@@ -172,7 +172,7 @@ mod tests {
 
     /// Build a synthetic `RedexEvent` whose payload is `EventMeta` (with
     /// the given origin/seq_or_ts) followed by `tail`.
-    fn ev_with_meta(seq: u64, origin_hash: u32, seq_or_ts: u64, tail: &[u8]) -> RedexEvent {
+    fn ev_with_meta(seq: u64, origin_hash: u64, seq_or_ts: u64, tail: &[u8]) -> RedexEvent {
         let meta = EventMeta::new(0xAB, 0, origin_hash, seq_or_ts, 0);
         let mut payload = Vec::with_capacity(EVENT_META_SIZE + tail.len());
         payload.extend_from_slice(&meta.to_bytes());
@@ -193,8 +193,8 @@ mod tests {
         }
     }
 
-    const ORIGIN_US: u32 = 0xAAAA_BBBB;
-    const ORIGIN_OTHER: u32 = 0xCCCC_DDDD;
+    const ORIGIN_US: u64 = 0xAAAA_BBBB;
+    const ORIGIN_OTHER: u64 = 0xCCCC_DDDD;
 
     #[test]
     fn matching_origin_advances_app_seq_via_fetch_max() {

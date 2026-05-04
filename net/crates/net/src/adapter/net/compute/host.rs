@@ -364,7 +364,7 @@ impl DaemonHost {
 
     /// Get the daemon's origin hash.
     #[inline]
-    pub fn origin_hash(&self) -> u32 {
+    pub fn origin_hash(&self) -> u64 {
         self.keypair.origin_hash()
     }
 
@@ -506,7 +506,7 @@ mod tests {
         }
     }
 
-    fn make_event(origin: u32, seq: u64, payload: &[u8]) -> CausalEvent {
+    fn make_event(origin: u64, seq: u64, payload: &[u8]) -> CausalEvent {
         CausalEvent {
             link: CausalLink {
                 origin_hash: origin,

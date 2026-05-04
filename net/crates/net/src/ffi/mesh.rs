@@ -2202,7 +2202,7 @@ pub extern "C" fn net_identity_node_id(handle: *mut IdentityHandle) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_origin_hash(handle: *mut IdentityHandle) -> u32 {
+pub extern "C" fn net_identity_origin_hash(handle: *mut IdentityHandle) -> u64 {
     if handle.is_null() {
         return 0;
     }

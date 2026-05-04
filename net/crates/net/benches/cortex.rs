@@ -21,7 +21,7 @@ use net::adapter::net::netdb::NetDbSnapshot;
 use net::adapter::net::redex::Redex;
 use tokio::runtime::Runtime;
 
-const ORIGIN: u32 = 0xABCD_EF01;
+const ORIGIN: u64 = 0xABCD_EF01;
 
 /// A shared tokio runtime for all bench scenarios. `CortexAdapter::open`
 /// and every ingest path touch `tokio::spawn` / `broadcast::Sender::send`

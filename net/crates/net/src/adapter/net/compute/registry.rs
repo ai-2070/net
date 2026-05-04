@@ -31,7 +31,7 @@ use crate::adapter::net::state::snapshot::StateSnapshot;
 /// closure can't stall other daemons that happen to hash to the
 /// same shard.
 pub struct DaemonRegistry {
-    daemons: DashMap<u32, Arc<Mutex<DaemonHost>>>,
+    daemons: DashMap<u64, Arc<Mutex<DaemonHost>>>,
 }
 
 impl DaemonRegistry {
@@ -128,7 +128,7 @@ impl DaemonRegistry {
     /// the now-orphaned host (their writes are lost when the
     /// final `Arc` drops) — this is the same residual hazard
     /// [`Self::replace`] documents.
-    pub fn unregister(&self, origin_hash: u32) -> Result<(), DaemonError> {
+    pub fn unregister(&self, origin_hash: u64) -> Result<(), DaemonError> {
         self.daemons
             .remove(&origin_hash)
             .map(|_| ())
@@ -140,7 +140,7 @@ impl DaemonRegistry {
     /// clone the Arc — never across user work — is the whole
     /// point of wrapping the host in an `Arc`. Internal helper;
     /// the public accessors below build on it.
-    fn get_arc(&self, origin_hash: u32) -> Option<Arc<Mutex<DaemonHost>>> {
+    fn get_arc(&self, origin_hash: u64) -> Option<Arc<Mutex<DaemonHost>>> {
         self.daemons.get(&origin_hash).map(|e| e.value().clone())
     }
 
@@ -161,7 +161,7 @@ impl DaemonRegistry {
     /// contention.
     fn guard_identity(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         held: &Arc<Mutex<DaemonHost>>,
     ) -> Result<(), DaemonError> {
         match self.get_arc(origin_hash) {
@@ -179,7 +179,7 @@ impl DaemonRegistry {
     /// unregistered, caller tried to mutate" race that the
     /// public API doesn't expose.
     #[cfg(test)]
-    pub(super) fn arc_for_test(&self, origin_hash: u32) -> Option<Arc<Mutex<DaemonHost>>> {
+    pub(super) fn arc_for_test(&self, origin_hash: u64) -> Option<Arc<Mutex<DaemonHost>>> {
         self.get_arc(origin_hash)
     }
 
@@ -191,7 +191,7 @@ impl DaemonRegistry {
     /// silently mutating the orphaned host. See audit #13/#68.
     pub fn deliver(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         event: &CausalEvent,
     ) -> Result<Vec<CausalEvent>, DaemonError> {
         let arc = self
@@ -208,7 +208,7 @@ impl DaemonRegistry {
     /// between this caller's `get_arc` and its lock acquisition
     /// — the snapshot we'd take would reflect the orphaned OLD
     /// host's state, not the live host's. See audit #13/#68.
-    pub fn snapshot(&self, origin_hash: u32) -> Result<Option<StateSnapshot>, DaemonError> {
+    pub fn snapshot(&self, origin_hash: u64) -> Result<Option<StateSnapshot>, DaemonError> {
         let arc = self
             .get_arc(origin_hash)
             .ok_or(DaemonError::NotFound(origin_hash))?;
@@ -231,7 +231,7 @@ impl DaemonRegistry {
     /// during the get_arc → lock window. See audit #13/#68.
     pub fn restore_from_snapshot(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
         snapshot: &StateSnapshot,
     ) -> Result<(), DaemonError> {
         let arc = self
@@ -248,7 +248,7 @@ impl DaemonRegistry {
     /// during the get_arc → lock window — the stats would
     /// reflect the orphaned host, not the live one. See audit
     /// #13/#68.
-    pub fn stats(&self, origin_hash: u32) -> Result<DaemonStats, DaemonError> {
+    pub fn stats(&self, origin_hash: u64) -> Result<DaemonStats, DaemonError> {
         let arc = self
             .get_arc(origin_hash)
             .ok_or(DaemonError::NotFound(origin_hash))?;
@@ -258,12 +258,12 @@ impl DaemonRegistry {
     }
 
     /// List all registered daemon origin hashes and names.
-    pub fn list(&self) -> Vec<(u32, String)> {
+    pub fn list(&self) -> Vec<(u64, String)> {
         // Snapshot `(origin_hash, Arc<Mutex<Host>>)` under each
         // shard read lock, then drop the Ref before locking the
         // inner Mutex for `name()`. Keeps shard lock hold time
         // bounded to a Vec push per entry.
-        let arcs: Vec<(u32, Arc<Mutex<DaemonHost>>)> = self
+        let arcs: Vec<(u64, Arc<Mutex<DaemonHost>>)> = self
             .daemons
             .iter()
             .map(|entry| (*entry.key(), entry.value().clone()))
@@ -282,7 +282,7 @@ impl DaemonRegistry {
     }
 
     /// Check if a daemon is registered.
-    pub fn contains(&self, origin_hash: u32) -> bool {
+    pub fn contains(&self, origin_hash: u64) -> bool {
         self.daemons.contains_key(&origin_hash)
     }
 
@@ -307,7 +307,7 @@ impl DaemonRegistry {
     /// re-lock the per-daemon `Mutex`. `parking_lot::Mutex` is
     /// not re-entrant; keeping the outer shard lock out of the
     /// way is what fixes the broader deadlock class.
-    pub fn with_host<F, R>(&self, origin_hash: u32, f: F) -> Result<R, DaemonError>
+    pub fn with_host<F, R>(&self, origin_hash: u64, f: F) -> Result<R, DaemonError>
     where
         F: FnOnce(&DaemonHost) -> R,
     {
@@ -336,7 +336,7 @@ impl DaemonRegistry {
     /// outlives the host's internal lock guard.
     pub fn daemon_keypair(
         &self,
-        origin_hash: u32,
+        origin_hash: u64,
     ) -> Option<crate::adapter::net::identity::EntityKeypair> {
         let arc = self.get_arc(origin_hash)?;
         let host = arc.lock();

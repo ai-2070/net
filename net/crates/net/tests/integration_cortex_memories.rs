@@ -13,7 +13,7 @@ use net::adapter::net::cortex::memories::{MemoriesAdapter, OrderBy, MEMORIES_CHA
 use net::adapter::net::cortex::{compute_checksum, EventMeta, EVENT_META_SIZE};
 use net::adapter::net::redex::Redex;
 
-const ORIGIN: u32 = 0x0BAD_F00D;
+const ORIGIN: u64 = 0x0BAD_F00D;
 
 #[tokio::test]
 async fn test_full_memory_lifecycle() {
@@ -651,8 +651,8 @@ async fn test_regression_open_ignores_other_origins_when_advancing_app_seq() {
     // events whose `origin_hash` matches the adapter's; cross-origin
     // events sharing the channel must not pollute our counter.
     let redex = Redex::new();
-    const ORIGIN_A: u32 = 0x0000_AABB;
-    const ORIGIN_B: u32 = 0x0000_CCDD;
+    const ORIGIN_A: u64 = 0x0000_AABB;
+    const ORIGIN_B: u64 = 0x0000_CCDD;
 
     {
         let b = MemoriesAdapter::open(&redex, ORIGIN_B).await.unwrap();

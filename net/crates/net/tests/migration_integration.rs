@@ -77,7 +77,7 @@ impl MeshDaemon for CounterDaemon {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn make_event(origin: u32, seq: u64) -> CausalEvent {
+fn make_event(origin: u64, seq: u64) -> CausalEvent {
     CausalEvent {
         link: CausalLink {
             origin_hash: origin,
@@ -90,7 +90,7 @@ fn make_event(origin: u32, seq: u64) -> CausalEvent {
     }
 }
 
-fn register_counter_daemon(registry: &DaemonRegistry, initial_count: u64) -> (EntityKeypair, u32) {
+fn register_counter_daemon(registry: &DaemonRegistry, initial_count: u64) -> (EntityKeypair, u64) {
     let kp = EntityKeypair::generate();
     let origin = kp.origin_hash();
     let host = DaemonHost::new(
@@ -1483,7 +1483,7 @@ fn test_fork_group_causal_chain_carries_sentinel() {
     let reg = DaemonRegistry::new();
     let sched = make_scheduler_for_groups();
 
-    let parent_origin: u32 = 0xAAAA;
+    let parent_origin: u64 = 0xAAAA;
     let fork_seq: u64 = 100;
 
     let group = ForkGroup::fork(
@@ -1538,7 +1538,7 @@ fn test_fork_group_recovery_preserves_chain_identity() {
     let reg = DaemonRegistry::new();
     let sched = make_scheduler_for_groups();
 
-    let parent_origin: u32 = 0xBBBB;
+    let parent_origin: u64 = 0xBBBB;
     let fork_seq: u64 = 50;
 
     let mut group = ForkGroup::fork(
@@ -1602,7 +1602,7 @@ fn test_fork_then_migrate() {
     let _target_reg = Arc::new(DaemonRegistry::new());
     let sched = make_scheduler_for_groups();
 
-    let parent_origin: u32 = 0xCCCC;
+    let parent_origin: u64 = 0xCCCC;
     let fork_seq: u64 = 200;
 
     // Create a fork group on the source registry
@@ -2174,7 +2174,7 @@ fn test_gap_scale_to_same_size_noop() {
     )
     .unwrap();
 
-    let origins_before: Vec<u32> = replica_group
+    let origins_before: Vec<u64> = replica_group
         .replicas()
         .iter()
         .map(|r| r.origin_hash)
@@ -2182,7 +2182,7 @@ fn test_gap_scale_to_same_size_noop() {
     replica_group
         .scale_to(3, || Box::new(CounterDaemon::new()), &sched, &reg)
         .unwrap();
-    let origins_after: Vec<u32> = replica_group
+    let origins_after: Vec<u64> = replica_group
         .replicas()
         .iter()
         .map(|r| r.origin_hash)
@@ -2308,7 +2308,7 @@ fn test_regression_buffered_events_rejects_unbounded_count() {
     // bytes. Pre-fix, this allocated ~4 billion vec slots.
     let mut bad = Vec::new();
     bad.put_u8(7); // MSG_BUFFERED_EVENTS
-    bad.put_u32_le(0xAAAA_BBBB); // daemon_origin
+    bad.put_u64_le(0xAAAA_BBBB); // daemon_origin
     bad.put_u32_le(u32::MAX); // count — unbounded!
                               // No event bytes follow.
 
@@ -2330,7 +2330,7 @@ fn test_regression_buffered_events_rejects_unbounded_count() {
     // matching byte supply would still be rejected by the hard cap.
     let mut bad2 = Vec::new();
     bad2.put_u8(7);
-    bad2.put_u32_le(0);
+    bad2.put_u64_le(0);
     bad2.put_u32_le(2_000_000); // > 1M hard cap
                                 // Pad with enough filler bytes to defeat the remaining-bytes check.
     bad2.resize(bad2.len() + 2_000_000 * 36, 0);
@@ -2343,7 +2343,7 @@ fn test_regression_buffered_events_rejects_unbounded_count() {
     // Sanity: a well-formed BufferedEvents with count=0 still decodes.
     let mut good = Vec::new();
     good.put_u8(7);
-    good.put_u32_le(0x1234);
+    good.put_u64_le(0x1234);
     good.put_u32_le(0);
     let result = wire::decode(&good);
     assert!(result.is_ok(), "count=0 must still decode: {:?}", result);

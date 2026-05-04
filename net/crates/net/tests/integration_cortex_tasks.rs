@@ -15,7 +15,7 @@ use net::adapter::net::redex::Redex;
 #[cfg(feature = "redex-disk")]
 use net::adapter::net::redex::RedexFileConfig;
 
-const ORIGIN: u32 = 0xABCD_EF01;
+const ORIGIN: u64 = 0xABCD_EF01;
 
 fn now_ns() -> u64 {
     std::time::SystemTime::now()
@@ -836,8 +836,8 @@ async fn test_regression_open_ignores_other_origins_when_advancing_app_seq() {
     // sharing a channel would interleave each other's counters and
     // every per-origin sequence space would collide.
     let redex = Redex::new();
-    const ORIGIN_A: u32 = 0x0000_00AA;
-    const ORIGIN_B: u32 = 0x0000_00BB;
+    const ORIGIN_A: u64 = 0x0000_00AA;
+    const ORIGIN_B: u64 = 0x0000_00BB;
 
     // Origin B writes some events.
     {

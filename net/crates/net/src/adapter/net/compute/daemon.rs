@@ -104,7 +104,7 @@ pub enum DaemonError {
     /// Restore from snapshot failed.
     RestoreFailed(String),
     /// Daemon not found in registry.
-    NotFound(u32),
+    NotFound(u64),
     /// The daemon at this origin_hash was concurrently swapped
     /// (`replace`d) or `unregister`ed while this caller was
     /// preparing to mutate it. The caller's mutation did not
@@ -112,7 +112,7 @@ pub enum DaemonError {
     /// acquiring the inner lock and bailed before invoking the
     /// host. Retry the operation against the current
     /// registered host (if any). Audit #13/#68.
-    Stale(u32),
+    Stale(u64),
 }
 
 impl std::fmt::Display for DaemonError {

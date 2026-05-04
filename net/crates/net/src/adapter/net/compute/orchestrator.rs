@@ -26,7 +26,7 @@ pub enum MigrationMessage {
     /// Phase 0→1: Request snapshot on source.
     TakeSnapshot {
         /// Origin hash of daemon to migrate.
-        daemon_origin: u32,
+        daemon_origin: u64,
         /// Destination node ID.
         target_node: u64,
     },
@@ -39,7 +39,7 @@ pub enum MigrationMessage {
     /// `chunk_index = 0, total_chunks = 1`.
     SnapshotReady {
         /// Origin hash of daemon being migrated.
-        daemon_origin: u32,
+        daemon_origin: u64,
         /// Serialized `StateSnapshot` bytes (or chunk thereof).
         snapshot_bytes: Vec<u8>,
         /// Sequence number the snapshot covers through.
@@ -53,7 +53,7 @@ pub enum MigrationMessage {
     /// Phase 2→3: Target restored daemon from snapshot.
     RestoreComplete {
         /// Origin hash of daemon being migrated.
-        daemon_origin: u32,
+        daemon_origin: u64,
         /// Sequence number restored through.
         restored_seq: u64,
     },
@@ -61,7 +61,7 @@ pub enum MigrationMessage {
     /// Phase 3→4: Target finished replaying buffered events.
     ReplayComplete {
         /// Origin hash of daemon being migrated.
-        daemon_origin: u32,
+        daemon_origin: u64,
         /// Sequence number replayed through.
         replayed_seq: u64,
     },
@@ -69,7 +69,7 @@ pub enum MigrationMessage {
     /// Phase 4: Source stops accepting writes, routing switches.
     CutoverNotify {
         /// Origin hash of daemon being migrated.
-        daemon_origin: u32,
+        daemon_origin: u64,
         /// Target node that is now authoritative.
         target_node: u64,
     },
@@ -77,13 +77,13 @@ pub enum MigrationMessage {
     /// Phase 5: Source cleaned up.
     CleanupComplete {
         /// Origin hash of daemon whose migration is complete.
-        daemon_origin: u32,
+        daemon_origin: u64,
     },
 
     /// Any phase: Abort migration.
     MigrationFailed {
         /// Origin hash of daemon whose migration failed.
-        daemon_origin: u32,
+        daemon_origin: u64,
         /// Structured reason code — source dispatches on this to
         /// decide whether the migration is retriable. See
         /// [`MigrationFailureReason`].
@@ -93,7 +93,7 @@ pub enum MigrationMessage {
     /// Buffered events from source for replay on target.
     BufferedEvents {
         /// Origin hash of daemon being migrated.
-        daemon_origin: u32,
+        daemon_origin: u64,
         /// Events to replay, in causal order.
         events: Vec<CausalEvent>,
     },
@@ -105,13 +105,13 @@ pub enum MigrationMessage {
     /// replies with `ActivateAck`.
     ActivateTarget {
         /// Origin hash of daemon whose target should activate.
-        daemon_origin: u32,
+        daemon_origin: u64,
     },
 
     /// Phase 6: Target has activated and is now authoritative.
     ActivateAck {
         /// Origin hash of daemon whose migration is complete.
-        daemon_origin: u32,
+        daemon_origin: u64,
         /// Sequence number the target is authoritative through.
         replayed_seq: u64,
     },
@@ -167,7 +167,7 @@ pub mod wire {
                 target_node,
             } => {
                 buf.put_u8(MSG_TAKE_SNAPSHOT);
-                buf.put_u32_le(*daemon_origin);
+                buf.put_u64_le(*daemon_origin);
                 buf.put_u64_le(*target_node);
             }
             MigrationMessage::SnapshotReady {
@@ -179,7 +179,7 @@ pub mod wire {
             } => {
                 let payload_len = len_u32("snapshot_bytes", snapshot_bytes.len())?;
                 buf.put_u8(MSG_SNAPSHOT_READY);
-                buf.put_u32_le(*daemon_origin);
+                buf.put_u64_le(*daemon_origin);
                 buf.put_u64_le(*seq_through);
                 buf.put_u32_le(*chunk_index);
                 buf.put_u32_le(*total_chunks);
@@ -191,7 +191,7 @@ pub mod wire {
                 restored_seq,
             } => {
                 buf.put_u8(MSG_RESTORE_COMPLETE);
-                buf.put_u32_le(*daemon_origin);
+                buf.put_u64_le(*daemon_origin);
                 buf.put_u64_le(*restored_seq);
             }
             MigrationMessage::ReplayComplete {
@@ -199,7 +199,7 @@ pub mod wire {
                 replayed_seq,
             } => {
                 buf.put_u8(MSG_REPLAY_COMPLETE);
-                buf.put_u32_le(*daemon_origin);
+                buf.put_u64_le(*daemon_origin);
                 buf.put_u64_le(*replayed_seq);
             }
             MigrationMessage::CutoverNotify {
@@ -207,19 +207,19 @@ pub mod wire {
                 target_node,
             } => {
                 buf.put_u8(MSG_CUTOVER_NOTIFY);
-                buf.put_u32_le(*daemon_origin);
+                buf.put_u64_le(*daemon_origin);
                 buf.put_u64_le(*target_node);
             }
             MigrationMessage::CleanupComplete { daemon_origin } => {
                 buf.put_u8(MSG_CLEANUP_COMPLETE);
-                buf.put_u32_le(*daemon_origin);
+                buf.put_u64_le(*daemon_origin);
             }
             MigrationMessage::MigrationFailed {
                 daemon_origin,
                 reason,
             } => {
                 buf.put_u8(MSG_FAILED);
-                buf.put_u32_le(*daemon_origin);
+                buf.put_u64_le(*daemon_origin);
                 // Wire layout:
                 //   code:  u16 le
                 //   then variant-specific payload (0 bytes for
@@ -253,7 +253,7 @@ pub mod wire {
             } => {
                 let event_count = len_u32("events", events.len())?;
                 buf.put_u8(MSG_BUFFERED_EVENTS);
-                buf.put_u32_le(*daemon_origin);
+                buf.put_u64_le(*daemon_origin);
                 buf.put_u32_le(event_count);
                 for event in events {
                     let payload_len = len_u32("event payload", event.payload.len())?;
@@ -266,14 +266,14 @@ pub mod wire {
             }
             MigrationMessage::ActivateTarget { daemon_origin } => {
                 buf.put_u8(MSG_ACTIVATE_TARGET);
-                buf.put_u32_le(*daemon_origin);
+                buf.put_u64_le(*daemon_origin);
             }
             MigrationMessage::ActivateAck {
                 daemon_origin,
                 replayed_seq,
             } => {
                 buf.put_u8(MSG_ACTIVATE_ACK);
-                buf.put_u32_le(*daemon_origin);
+                buf.put_u64_le(*daemon_origin);
                 buf.put_u64_le(*replayed_seq);
             }
         }
@@ -293,22 +293,22 @@ pub mod wire {
 
         match msg_type {
             MSG_TAKE_SNAPSHOT => {
-                if cur.remaining() < 12 {
+                if cur.remaining() < 16 {
                     return Err(MigrationError::StateFailed("truncated TakeSnapshot".into()));
                 }
                 Ok(MigrationMessage::TakeSnapshot {
-                    daemon_origin: cur.get_u32_le(),
+                    daemon_origin: cur.get_u64_le(),
                     target_node: cur.get_u64_le(),
                 })
             }
             MSG_SNAPSHOT_READY => {
-                // daemon_origin(4) + seq_through(8) + chunk_index(4) + total_chunks(4) + len(4) = 24
-                if cur.remaining() < 24 {
+                // daemon_origin(8) + seq_through(8) + chunk_index(4) + total_chunks(4) + len(4) = 28
+                if cur.remaining() < 28 {
                     return Err(MigrationError::StateFailed(
                         "truncated SnapshotReady".into(),
                     ));
                 }
-                let daemon_origin = cur.get_u32_le();
+                let daemon_origin = cur.get_u64_le();
                 let seq_through = cur.get_u64_le();
                 let chunk_index = cur.get_u32_le();
                 let total_chunks = cur.get_u32_le();
@@ -355,55 +355,55 @@ pub mod wire {
                 })
             }
             MSG_RESTORE_COMPLETE => {
-                if cur.remaining() < 12 {
+                if cur.remaining() < 16 {
                     return Err(MigrationError::StateFailed(
                         "truncated RestoreComplete".into(),
                     ));
                 }
                 Ok(MigrationMessage::RestoreComplete {
-                    daemon_origin: cur.get_u32_le(),
+                    daemon_origin: cur.get_u64_le(),
                     restored_seq: cur.get_u64_le(),
                 })
             }
             MSG_REPLAY_COMPLETE => {
-                if cur.remaining() < 12 {
+                if cur.remaining() < 16 {
                     return Err(MigrationError::StateFailed(
                         "truncated ReplayComplete".into(),
                     ));
                 }
                 Ok(MigrationMessage::ReplayComplete {
-                    daemon_origin: cur.get_u32_le(),
+                    daemon_origin: cur.get_u64_le(),
                     replayed_seq: cur.get_u64_le(),
                 })
             }
             MSG_CUTOVER_NOTIFY => {
-                if cur.remaining() < 12 {
+                if cur.remaining() < 16 {
                     return Err(MigrationError::StateFailed(
                         "truncated CutoverNotify".into(),
                     ));
                 }
                 Ok(MigrationMessage::CutoverNotify {
-                    daemon_origin: cur.get_u32_le(),
+                    daemon_origin: cur.get_u64_le(),
                     target_node: cur.get_u64_le(),
                 })
             }
             MSG_CLEANUP_COMPLETE => {
-                if cur.remaining() < 4 {
+                if cur.remaining() < 8 {
                     return Err(MigrationError::StateFailed(
                         "truncated CleanupComplete".into(),
                     ));
                 }
                 Ok(MigrationMessage::CleanupComplete {
-                    daemon_origin: cur.get_u32_le(),
+                    daemon_origin: cur.get_u64_le(),
                 })
             }
             MSG_FAILED => {
-                if cur.remaining() < 4 + 2 {
+                if cur.remaining() < 8 + 2 {
                     return Err(MigrationError::StateFailed(
                         "truncated MigrationFailed header".into(),
                     ));
                 }
-                let daemon_origin = cur.get_u32_le();
+                let daemon_origin = cur.get_u64_le();
                 let code = cur.get_u16_le();
                 let reason = decode_failure_reason(&mut cur, code)?;
                 Ok(MigrationMessage::MigrationFailed {
@@ -412,12 +412,12 @@ pub mod wire {
                 })
             }
             MSG_BUFFERED_EVENTS => {
-                if cur.remaining() < 8 {
+                if cur.remaining() < 12 {
                     return Err(MigrationError::StateFailed(
                         "truncated BufferedEvents".into(),
                     ));
                 }
-                let daemon_origin = cur.get_u32_le();
+                let daemon_origin = cur.get_u64_le();
                 let count = cur.get_u32_le() as usize;
                 // Bound `count` against the remaining wire bytes before
                 // allocating. Each event on the wire is at least
@@ -478,21 +478,21 @@ pub mod wire {
                 })
             }
             MSG_ACTIVATE_TARGET => {
-                if cur.remaining() < 4 {
+                if cur.remaining() < 8 {
                     return Err(MigrationError::StateFailed(
                         "truncated ActivateTarget".into(),
                     ));
                 }
                 Ok(MigrationMessage::ActivateTarget {
-                    daemon_origin: cur.get_u32_le(),
+                    daemon_origin: cur.get_u64_le(),
                 })
             }
             MSG_ACTIVATE_ACK => {
-                if cur.remaining() < 12 {
+                if cur.remaining() < 16 {
                     return Err(MigrationError::StateFailed("truncated ActivateAck".into()));
                 }
                 Ok(MigrationMessage::ActivateAck {
-                    daemon_origin: cur.get_u32_le(),
+                    daemon_origin: cur.get_u64_le(),
                     replayed_seq: cur.get_u64_le(),
                 })
             }
@@ -561,7 +561,7 @@ fn read_u16_string(cur: &mut std::io::Cursor<&[u8]>, ctx: &str) -> Result<String
 
 /// Maximum snapshot chunk size. Sized to fit within `MAX_PAYLOAD_SIZE` after
 /// accounting for the SnapshotReady wire header overhead
-/// (msg_type + daemon_origin + seq_through + chunk_index + total_chunks + len = 25 bytes)
+/// (msg_type + daemon_origin + seq_through + chunk_index + total_chunks + len = 29 bytes)
 /// and leaving headroom for the outer transport framing.
 pub const MAX_SNAPSHOT_CHUNK_SIZE: usize = 7000;
 
@@ -619,7 +619,7 @@ pub const MAX_PENDING_REASSEMBLY_AGE: Duration = Duration::from_secs(300);
 /// Returns `MigrationError::SnapshotTooLarge` if the snapshot exceeds
 /// `MAX_SNAPSHOT_SIZE` (~28 TB).
 pub fn chunk_snapshot(
-    daemon_origin: u32,
+    daemon_origin: u64,
     snapshot_bytes: Vec<u8>,
     seq_through: u64,
 ) -> Result<Vec<MigrationMessage>, MigrationError> {
@@ -763,10 +763,10 @@ impl std::error::Error for ReassemblyError {}
 /// state for that daemon, and chunks for older `seq_through` are rejected.
 pub struct SnapshotReassembler {
     /// Pending reassemblies: (daemon_origin, seq_through) → chunks.
-    pending: std::collections::HashMap<(u32, u64), ReassemblyState>,
+    pending: std::collections::HashMap<(u64, u64), ReassemblyState>,
     /// Latest `seq_through` accepted per daemon, for stale-chunk rejection
     /// even after a reassembly completes and is evicted from `pending`.
-    latest_seq: std::collections::HashMap<u32, u64>,
+    latest_seq: std::collections::HashMap<u64, u64>,
     /// Max age applied by the opportunistic sweep at the head of
     /// every `feed`. Defaults to `MAX_PENDING_REASSEMBLY_AGE`. The
     /// public `sweep_stale` accepts its own `max_age` and ignores
@@ -820,7 +820,7 @@ impl SnapshotReassembler {
     /// in-flight state.
     pub fn feed(
         &mut self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         snapshot_bytes: Vec<u8>,
         seq_through: u64,
         chunk_index: u32,
@@ -945,7 +945,7 @@ impl SnapshotReassembler {
     /// Removes all pending reassemblies for this daemon regardless of
     /// `seq_through`. Does **not** reset `latest_seq`, so a subsequent
     /// replay of old chunks is still rejected.
-    pub fn cancel(&mut self, daemon_origin: u32) {
+    pub fn cancel(&mut self, daemon_origin: u64) {
         self.pending
             .retain(|&(origin, _), _| origin != daemon_origin);
     }
@@ -1027,7 +1027,7 @@ pub enum BufferOutcome {
 /// and cleaning up the source.
 pub struct MigrationOrchestrator {
     /// In-flight migrations: daemon_origin → record.
-    migrations: DashMap<u32, Mutex<MigrationRecord>>,
+    migrations: DashMap<u64, Mutex<MigrationRecord>>,
     /// Local daemon registry (for taking snapshots on local daemons).
     daemon_registry: Arc<DaemonRegistry>,
     /// Local node ID.
@@ -1087,7 +1087,7 @@ impl MigrationOrchestrator {
     /// caller to send to the source node.
     pub fn start_migration(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         source_node: u64,
         target_node: u64,
     ) -> Result<Vec<MigrationMessage>, MigrationError> {
@@ -1221,7 +1221,7 @@ impl MigrationOrchestrator {
     /// Returns the target node ID and the first migration message.
     pub fn start_migration_auto(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         source_node: u64,
         scheduler: &super::Scheduler,
         daemon_filter: &crate::adapter::net::behavior::capability::CapabilityFilter,
@@ -1249,7 +1249,7 @@ impl MigrationOrchestrator {
     /// and phase advancement — subsequent chunks are forwarded as-is.
     pub fn on_snapshot_ready(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         snapshot_bytes: Vec<u8>,
         seq_through: u64,
         chunk_index: u32,
@@ -1302,7 +1302,7 @@ impl MigrationOrchestrator {
     /// are any, or None if no events were buffered.
     pub fn on_restore_complete(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         _restored_seq: u64,
     ) -> Result<Option<MigrationMessage>, MigrationError> {
         let entry = self
@@ -1339,7 +1339,7 @@ impl MigrationOrchestrator {
     /// Returns `CutoverNotify` to send to the source node.
     pub fn on_replay_complete(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         replayed_seq: u64,
     ) -> Result<MigrationMessage, MigrationError> {
         let entry = self
@@ -1425,7 +1425,7 @@ impl MigrationOrchestrator {
     /// Handle cutover acknowledged by source.
     ///
     /// Source has stopped accepting writes. Advances to Complete.
-    pub fn on_cutover_acknowledged(&self, daemon_origin: u32) -> Result<(), MigrationError> {
+    pub fn on_cutover_acknowledged(&self, daemon_origin: u64) -> Result<(), MigrationError> {
         let entry = self
             .migrations
             .get(&daemon_origin)
@@ -1456,7 +1456,7 @@ impl MigrationOrchestrator {
     /// `target_node` when it needs to route `ActivateTarget`.
     pub fn on_cleanup_complete(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
     ) -> Result<MigrationMessage, MigrationError> {
         let entry = self
             .migrations
@@ -1490,7 +1490,7 @@ impl MigrationOrchestrator {
     /// removed here, not in `on_cleanup_complete`.
     pub fn on_activate_ack(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         _replayed_seq: u64,
     ) -> Result<(), MigrationError> {
         self.migrations
@@ -1514,7 +1514,7 @@ impl MigrationOrchestrator {
     /// Return a typed [`BufferOutcome`] so the caller can branch
     /// on the actual state instead of inferring the wrong
     /// behavior from an ambiguous bool.
-    pub fn buffer_event(&self, daemon_origin: u32, event: CausalEvent) -> BufferOutcome {
+    pub fn buffer_event(&self, daemon_origin: u64, event: CausalEvent) -> BufferOutcome {
         if let Some(entry) = self.migrations.get(&daemon_origin) {
             let mut record = entry.lock();
             let phase = record.state.phase();
@@ -1536,7 +1536,7 @@ impl MigrationOrchestrator {
     /// variants.
     pub fn abort_migration(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         reason: String,
     ) -> Result<MigrationMessage, MigrationError> {
         self.abort_migration_with_reason(daemon_origin, MigrationFailureReason::StateFailed(reason))
@@ -1554,7 +1554,7 @@ impl MigrationOrchestrator {
     /// migration the orchestrator believed was already aborted.
     pub fn abort_migration_with_reason(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
         reason: MigrationFailureReason,
     ) -> Result<MigrationMessage, MigrationError> {
         self.migrations
@@ -1576,26 +1576,26 @@ impl MigrationOrchestrator {
     }
 
     /// Check if a daemon is currently being migrated.
-    pub fn is_migrating(&self, daemon_origin: u32) -> bool {
+    pub fn is_migrating(&self, daemon_origin: u64) -> bool {
         self.migrations.contains_key(&daemon_origin)
     }
 
     /// Get migration status for a daemon.
-    pub fn status(&self, daemon_origin: u32) -> Option<MigrationPhase> {
+    pub fn status(&self, daemon_origin: u64) -> Option<MigrationPhase> {
         self.migrations
             .get(&daemon_origin)
             .map(|entry| entry.lock().state.phase())
     }
 
     /// Get the source node for an in-flight migration.
-    pub fn source_node(&self, daemon_origin: u32) -> Option<u64> {
+    pub fn source_node(&self, daemon_origin: u64) -> Option<u64> {
         self.migrations
             .get(&daemon_origin)
             .map(|entry| entry.lock().state.source_node())
     }
 
     /// Get the target node for an in-flight migration.
-    pub fn target_node(&self, daemon_origin: u32) -> Option<u64> {
+    pub fn target_node(&self, daemon_origin: u64) -> Option<u64> {
         self.migrations
             .get(&daemon_origin)
             .map(|entry| entry.lock().state.target_node())
@@ -1604,7 +1604,7 @@ impl MigrationOrchestrator {
     /// Get superposition phase for a daemon.
     pub fn superposition_phase(
         &self,
-        daemon_origin: u32,
+        daemon_origin: u64,
     ) -> Option<crate::adapter::net::continuity::superposition::SuperpositionPhase> {
         self.migrations
             .get(&daemon_origin)
@@ -1612,7 +1612,7 @@ impl MigrationOrchestrator {
     }
 
     /// List all in-flight migrations: (daemon_origin, phase, elapsed_ms).
-    pub fn list_migrations(&self) -> Vec<(u32, MigrationPhase, u64)> {
+    pub fn list_migrations(&self) -> Vec<(u64, MigrationPhase, u64)> {
         self.migrations
             .iter()
             .map(|entry| {
@@ -1681,7 +1681,7 @@ mod tests {
         }
     }
 
-    fn setup_registry() -> (Arc<DaemonRegistry>, u32) {
+    fn setup_registry() -> (Arc<DaemonRegistry>, u64) {
         let reg = Arc::new(DaemonRegistry::new());
         let kp = EntityKeypair::generate();
         let origin = kp.origin_hash();
@@ -2632,7 +2632,7 @@ mod tests {
         use bytes::BufMut;
         let mut buf = Vec::new();
         buf.put_u8(wire::MSG_SNAPSHOT_READY);
-        buf.put_u32_le(0xAAAA); // daemon_origin
+        buf.put_u64_le(0xAAAA); // daemon_origin
         buf.put_u64_le(1); // seq_through
         buf.put_u32_le(0); // chunk_index
         buf.put_u32_le(0); // total_chunks — invalid
@@ -2651,7 +2651,7 @@ mod tests {
         use bytes::BufMut;
         let mut buf = Vec::new();
         buf.put_u8(wire::MSG_SNAPSHOT_READY);
-        buf.put_u32_le(0xAAAA);
+        buf.put_u64_le(0xAAAA);
         buf.put_u64_le(1);
         buf.put_u32_le(5); // chunk_index
         buf.put_u32_le(3); // total_chunks — index out of range
@@ -2670,7 +2670,7 @@ mod tests {
         use bytes::BufMut;
         let mut buf = Vec::new();
         buf.put_u8(wire::MSG_SNAPSHOT_READY);
-        buf.put_u32_le(0xAAAA);
+        buf.put_u64_le(0xAAAA);
         buf.put_u64_le(1);
         buf.put_u32_le(0);
         buf.put_u32_le(u32::MAX); // total_chunks — exceeds MAX_TOTAL_CHUNKS
@@ -2856,7 +2856,7 @@ mod tests {
         // variant). Decoder must refuse rather than mis-parse.
         let mut buf = Vec::new();
         buf.put_u8(wire::MSG_FAILED);
-        buf.put_u32_le(0xBEEF);
+        buf.put_u64_le(0xBEEF);
         buf.put_u16_le(0xFFFF); // unknown code
         let err = wire::decode(&buf).expect_err("unknown code must reject");
         match err {
