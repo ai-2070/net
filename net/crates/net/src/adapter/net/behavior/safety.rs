@@ -495,9 +495,20 @@ impl RateBucket {
                 }
             }) {
             Ok(prev) => {
-                let (_, prev_count) = Self::split(prev);
-                let (_, new_count) = Self::split(self.packed.load(Ordering::Acquire));
-                let _ = prev_count;
+                // Compute the count our CAS produced from `prev`
+                // (the value BEFORE our update) — re-loading
+                // `self.packed` here would observe any subsequent
+                // racing CAS, returning a count that doesn't
+                // reflect what THIS acquire committed. Mirrors
+                // the closure logic so the Ok value is "the count
+                // assigned to this caller's slot", which is what
+                // the regression tests assert.
+                let (cur_floor, cur_count) = Self::split(prev);
+                let new_count = if cur_floor != current_floor {
+                    1
+                } else {
+                    cur_count.saturating_add(1)
+                };
                 Ok(new_count)
             }
             Err(_) => Err(last_observed),
