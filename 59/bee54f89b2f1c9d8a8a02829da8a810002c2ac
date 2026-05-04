@@ -1,0 +1,43 @@
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  cdf934b360f502d7 547,821,831,985,1015,1177,1197,1313,1375,1456,1480-1481,2014,2104,2178,2359,2420
+net/crates/net/bindings/python/src/cortex.rs
+  cdf934b360f502d7 537,558,999,1019,1468,1514
+net/crates/net/bindings/node/test/netdb.test.ts
+  cdf934b360f502d7 7
+net/crates/net/bindings/python/tests/test_identity.py
+  cdf934b360f502d7 38
+net/crates/net/bindings/python/python/net/_net.pyi
+  cdf934b360f502d7 874
+net/crates/net/bindings/python/src/compute.rs
+  cdf934b360f502d7 177,179,194,263,283,285,486,507,592,640,664,714,746,774,795,797,1279
+net/crates/net/bindings/python/src/identity.rs
+  cdf934b360f502d7 200,202
+net/crates/net/include/net.go.h
+  cdf934b360f502d7 283,309,885,951,967,975-976,998,1039,1054,1075,1081,1156,1174,1186,1214,1224
+net/crates/net/bindings/node/test/cortex.test.ts
+  cdf934b360f502d7 33
+net/crates/net/bindings/node/test/errors.test.ts
+  cdf934b360f502d7 10
+net/crates/net/bindings/python/src/groups.rs
+  cdf934b360f502d7 256,349,368,394,480,492,496
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "59bee54f89b2f1c9d8a8a02829da8a810002c2ac",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 9855,
+      "total_deletions": 70,
+      "accepted_lines": 69,
+      "overriden_lines": 0
+    }
+  }
+}
