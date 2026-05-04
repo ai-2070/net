@@ -10,7 +10,9 @@
 use futures::StreamExt;
 use net::adapter::net::channel::ChannelName;
 use net::adapter::net::cortex::tasks::{OrderBy, TaskStatus, TasksAdapter, TASKS_CHANNEL};
-use net::adapter::net::cortex::{compute_checksum, EventMeta, EVENT_META_SIZE};
+use net::adapter::net::cortex::{
+    compute_checksum, compute_checksum_with_meta, EventMeta, EVENT_META_SIZE,
+};
 use net::adapter::net::redex::Redex;
 #[cfg(feature = "redex-disk")]
 use net::adapter::net::redex::RedexFileConfig;
@@ -876,10 +878,11 @@ async fn test_regression_open_ignores_other_origins_when_advancing_app_seq() {
 #[tokio::test]
 async fn test_regression_checksum_is_computed_not_zero() {
     // Regression: `EventMeta::checksum` used to be hardcoded to 0 in
-    // the tasks adapter's `ingest_typed`. The documented contract
-    // (see `EventMeta` struct doc in meta.rs) is xxh3 truncation of
-    // the payload tail. Verify the on-disk event's meta.checksum
-    // matches `compute_checksum(tail)`.
+    // the tasks adapter's `ingest_typed`. Producers now stamp the
+    // header-covering v2 checksum (`compute_checksum_with_meta`) so
+    // a bit-flip in the EventMeta header — not just the tail — is
+    // detected. Verify the on-disk event's meta.checksum matches
+    // the v2 hash.
     let redex = Redex::new();
     let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
@@ -902,8 +905,8 @@ async fn test_regression_checksum_is_computed_not_zero() {
     assert_ne!(meta.checksum, 0, "checksum must not be hardcoded to 0");
     assert_eq!(
         meta.checksum,
-        compute_checksum(tail),
-        "meta.checksum must match xxh3 truncation of the payload tail"
+        compute_checksum_with_meta(&meta, tail),
+        "meta.checksum must match the v2 header-covering hash",
     );
 }
 
