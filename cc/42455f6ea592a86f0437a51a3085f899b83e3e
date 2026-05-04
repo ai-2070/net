@@ -1,0 +1,25 @@
+net/crates/net/src/ffi/handle_guard.rs
+  8c5e925534ef4498 117-120,122-138,141-143,145-160,311-360,362,364-382,384-386,388-389
+net/crates/net/src/ffi/mesh.rs
+  8c5e925534ef4498 3744-3854
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "cc42455f6ea592a86f0437a51a3085f899b83e3e",
+  "prompts": {
+    "8c5e925534ef4498": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b9c362b0-aa1b-4f3b-b713-ff66f21760da",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 4397,
+      "total_deletions": 26,
+      "accepted_lines": 227,
+      "overriden_lines": 0
+    }
+  }
+}
