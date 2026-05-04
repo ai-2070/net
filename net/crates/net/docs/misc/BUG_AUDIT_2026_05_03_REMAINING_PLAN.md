@@ -86,27 +86,59 @@ fix is to port the `active_ops` + `bus_taken` CAS protocol that
 `ffi/mod.rs` already implements (and was hardened in
 `928bd520` / `41ebbf8f`).
 
-| #  | File                | Ask                                                                                            |
-| -- | ------------------- | ---------------------------------------------------------------------------------------------- |
-| 23 | `ffi/cortex.rs`     | Port `active_ops` + `bus_taken` from `ffi/mod.rs`. ~30 entry points; touch every `&*handle`.   |
-| 24 | `ffi/mesh.rs`       | Same protocol for `net_mesh_*` / `net_identity_*` / `net_redis_dedup_*` handles.               |
-| 25 | `ffi/mesh.rs:1078-1079` | `MeshStreamHandle._node` keeps node alive; the handle's `Box` is still UAFable on free.    |
+**Status (post-bugfixes-12 work):**
 
-**Approach:** factor the existing protocol from `ffi/mod.rs` into a
-shared `FfiHandleGuard<T>` helper in `ffi/handle_guard.rs`. Both
-cortex and mesh handles wrap their inner `Arc` in `FfiHandleGuard`.
-Free-paths CAS `bus_taken`; entry-paths CAS `active_ops`. Avoid
-copy-pasting — the existing logic in `ffi/mod.rs` is the
-specification.
+- ✅ Shared helper `ffi::handle_guard::HandleGuard` + `HandleOp` +
+  `FFI_HANDLE_FREE_DEADLINE` extracted. Five unit tests pin
+  try_enter, post-free bail, drain-wait, drain-timeout, and
+  idempotent concurrent free callers.
+- ✅ `RedexFileHandle` (audit #23 specific call-out) ported. Three
+  regression tests pin post-free `ShuttingDown` on every entry
+  point, idempotent `_free`, and `_free` waiting for an in-flight
+  `_append` to drain.
+- ⏳ Remaining handles: `RedexHandle`, `RedexTailHandle`,
+  `TasksAdapterHandle`, `TasksWatchHandle`,
+  `MemoriesAdapterHandle`, `MemoriesWatchHandle` (cortex #23
+  remaining). All `MeshNodeHandle` / `MeshStreamHandle` /
+  `IdentityHandle` / `RedisDedupHandle` entry points (#24, #25).
+  All follow the identical recipe — the proof-of-pattern lives in
+  `RedexFileHandle`'s structure plus its `_free` and `try_enter`
+  call sites.
 
-**Test surface:** races. Two threads (one calling free, one
-calling a hot op); pin that the free returns only after the op
-returns, and that no UAF / double-free is observable. Miri-runnable
-where possible.
+| #  | File                | Status                                                                                               |
+| -- | ------------------- | ---------------------------------------------------------------------------------------------------- |
+| 23 | `ffi/cortex.rs`     | RedexFileHandle done. ~25 sites remaining across 5 other handle types; mechanical port of the recipe. |
+| 24 | `ffi/mesh.rs`       | Pending. ~60 entry points spread across 4 handle types.                                              |
+| 25 | `ffi/mesh.rs:1078-1079` | Pending. The MeshStreamHandle UAF is closed by gating MeshNodeHandle's send-family ops; also pending. |
 
-**Sequencing:** ship the shared helper first (refactor `ffi/mod.rs`
-to use it; verify no behavior change), then layer cortex (#23) and
-mesh (#24+#25) on top in two separate PRs.
+**Recipe for remaining handles (apply per type):**
+
+1. Add `guard: HandleGuard` field; wrap the inner Arc(s) in
+   `ManuallyDrop`.
+2. In the constructor: initialize `guard: HandleGuard::new()`,
+   wrap inner in `ManuallyDrop::new(...)`.
+3. In `_free`: drop the inner via `ManuallyDrop::take` only AFTER
+   `begin_free(FFI_HANDLE_FREE_DEADLINE)` returns true. On
+   timeout, leak (log a warning). The outer Box is always leaked
+   — never `Box::from_raw` here.
+4. In every entry point that does `&*handle`: gate on
+   `let _op = match h.guard.try_enter() { Some(op) => op, None =>
+   return NetError::ShuttingDown.into() };` after the null check
+   and before any inner deref.
+5. Pin three regression tests per handle: post-free op returns
+   `ShuttingDown`, `_free` is idempotent, `_free` waits for
+   in-flight ops.
+
+**Test surface:** the helper module already has its own race-
+injection tests; per-handle tests need only verify the entry
+points are wired (post-free `ShuttingDown`) and `_free` is sound
+(idempotent + waits).
+
+**Sequencing:** the remaining handles can be tackled in any
+order. Suggested next: `MeshStreamHandle` + `MeshNodeHandle`
+together (audit #25 needs both for the `Arc::ptr_eq` UAF in
+`handles_match`). Then the rest of cortex (`Tasks`, `Memories`)
+together. Then `RedisDedupHandle` and `IdentityHandle` (small).
 
 ### D — Identity / envelope hardening (Medium)
 

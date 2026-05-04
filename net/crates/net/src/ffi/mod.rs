@@ -104,6 +104,18 @@ use crate::event::{Event, RawEvent};
 /// shims over already-documented Rust adapters, and the per-function
 /// contract is documented in the binding-side READMEs (Go / TS / Py).
 /// Re-documenting each shim would duplicate with drift risk.
+/// Per-FFI-handle quiescing protocol shared by cortex / mesh
+/// handles to close the audit-#23/#24/#25 use-after-free hazards
+/// when a `_free` races a concurrent op. See module docs for the
+/// soundness story (intentional box leak) and the per-handle
+/// recipe.
+#[cfg(any(
+    all(feature = "netdb", feature = "redex-disk"),
+    feature = "net",
+    feature = "redis",
+))]
+pub mod handle_guard;
+
 #[cfg(all(feature = "netdb", feature = "redex-disk"))]
 #[allow(missing_docs)]
 pub mod cortex;
