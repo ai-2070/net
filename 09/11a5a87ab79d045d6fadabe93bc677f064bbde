@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/safety.rs
+  cdf934b360f502d7 426-542,549-555,557-559,566,571-572,577-589,601-606,612-622,644,646-654,699-700,703-707,741-743,751-752,755,757,761,805-806,1394-1395,1399-1402,2456-2548
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  cdf934b360f502d7 13,273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "0911a5a87ab79d045d6fadabe93bc677f064bbde",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 289,
+      "total_deletions": 31,
+      "accepted_lines": 288,
+      "overriden_lines": 0
+    }
+  }
+}
