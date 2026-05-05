@@ -344,7 +344,21 @@ pub struct RpcStream {
     /// methods can serialize against the underlying stream's
     /// `&mut Self::poll_next`. Tokio mutex (not parking_lot)
     /// because the lock is held across the await.
+    ///
+    /// Note on contention: `next()` holds the lock for the
+    /// duration of an in-flight chunk wait, which serializes any
+    /// `grant`/`close` issued from a separate JS task against
+    /// it. `flow_controlled` is short-circuited via a cached
+    /// snapshot below so at least *that* method is lock-free.
+    /// Improving `grant` requires SDK plumbing to expose a
+    /// control handle independent of the polling future — out of
+    /// scope for the binding alone.
     inner: Arc<tokio::sync::Mutex<Option<InnerRpcStream>>>,
+    /// Cached at construction time so `flow_controlled()` doesn't
+    /// take the mutex (and thus doesn't block on an in-flight
+    /// `next()`). The underlying flow-control mode is fixed at
+    /// stream creation, so the cache never goes stale.
+    flow_controlled_cached: bool,
 }
 
 #[napi]
@@ -378,6 +392,13 @@ impl RpcStream {
     /// `streamWindowInitial`; otherwise a no-op. Use this to
     /// implement custom drain cadence (e.g. grant a half-window
     /// every half-window chunks consumed).
+    ///
+    /// **Contention note:** this currently serializes against an
+    /// in-flight `next()` because the SDK's `RpcStream` doesn't
+    /// expose a separable control handle. If you need to grant
+    /// while a `next()` is parked, either drain `next()` first or
+    /// rely on auto-grant (1 credit per delivered chunk) which
+    /// keeps the server's credit at roughly the initial window.
     #[napi]
     pub async fn grant(&self, n: u32) -> Result<()> {
         let guard = self.inner.lock().await;
@@ -389,10 +410,13 @@ impl RpcStream {
 
     /// `true` if the stream was opened with a non-`None`
     /// `streamWindowInitial`. Diagnostic / test helper.
+    ///
+    /// Lock-free: the underlying flow-control mode is fixed at
+    /// stream creation, so the value is captured then and read
+    /// without taking the inner mutex.
     #[napi]
     pub async fn flow_controlled(&self) -> bool {
-        let guard = self.inner.lock().await;
-        guard.as_ref().map(|s| s.flow_controlled()).unwrap_or(false)
+        self.flow_controlled_cached
     }
 
     /// Close the stream. Emits CANCEL to the server (best-effort)
@@ -534,8 +558,10 @@ impl MeshRpc {
             )
             .await
             .map_err(nrpc_err_from_inner)?;
+        let flow_controlled_cached = inner.flow_controlled();
         Ok(RpcStream {
             inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+            flow_controlled_cached,
         })
     }
 
