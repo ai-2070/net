@@ -39,6 +39,35 @@ use crate::error::{Result, SdkError};
 use crate::mesh::Mesh;
 
 // ============================================================================
+// Application-status code reservations for the typed wrappers.
+//
+// These sit in the application-defined band (0x8000..=0xFFFF) per
+// the wire-format spec — callers can pattern-match on them via
+// `RpcError::ServerError { status, .. }` to distinguish a typed-
+// handler reject from an arbitrary application error.
+//
+// Pre-fix the typed wrappers used 0x4000 / 0x4001, which sit in
+// the reserved-for-future-canonical-status band (0x0008..=0x7FFF).
+// Moved to the application range so a future canonical status can
+// safely take 0x4000+ without colliding with the typed-wrapper
+// SDK contract.
+// ============================================================================
+
+/// Surfaced when the typed handler's `Codec::decode(request_body)`
+/// fails — the request reached the server but its body couldn't
+/// be deserialized into the handler's `Req` type. The caller's
+/// typed `RpcError::ServerError` carries this status and a UTF-8
+/// diagnostic in the `message` field.
+pub const NRPC_TYPED_BAD_REQUEST: u16 = 0x8000;
+
+/// Surfaced when the typed handler's user closure returns
+/// `Err(String)`. The string is round-tripped as the
+/// `RpcError::ServerError::message`. Distinguishable from
+/// `NRPC_TYPED_BAD_REQUEST` so callers can route validation
+/// errors vs. handler errors to different fall-back paths.
+pub const NRPC_TYPED_HANDLER_ERROR: u16 = 0x8001;
+
+// ============================================================================
 // Codec selection.
 // ============================================================================
 
@@ -318,8 +347,8 @@ impl Mesh {
     /// a deserialized `Req` plus a [`ResponseSinkTyped<Resp>`] that
     /// auto-encodes each `send(&value)` per the codec. Returning
     /// `Ok(())` closes the stream cleanly; `Err(message)` closes it
-    /// with `RpcStatus::Application(0x4001)` and the message in the
-    /// terminal frame's body.
+    /// with `RpcStatus::Application(NRPC_TYPED_HANDLER_ERROR)` and
+    /// the message in the terminal frame's body.
     pub fn serve_rpc_streaming_typed<Req, Resp, F, Fut>(
         &self,
         service: &str,
@@ -501,7 +530,7 @@ where
             Ok(r) => r,
             Err(e) => {
                 return Err(RpcHandlerError::Application {
-                    code: 0x4000,
+                    code: NRPC_TYPED_BAD_REQUEST,
                     message: format!("typed handler: bad request body: {e}"),
                 })
             }
@@ -510,7 +539,7 @@ where
         let resp = (self.inner)(req)
             .await
             .map_err(|message| RpcHandlerError::Application {
-                code: 0x4001,
+                code: NRPC_TYPED_HANDLER_ERROR,
                 message,
             })?;
         // Encode the response body.
@@ -570,7 +599,7 @@ where
         (self.inner)(req, typed_sink)
             .await
             .map_err(|message| RpcHandlerError::Application {
-                code: 0x4001,
+                code: NRPC_TYPED_HANDLER_ERROR,
                 message,
             })
     }

@@ -361,7 +361,7 @@ fn default_retryable_classifies_canonical_errors() {
     }));
     // ServerError(Application / NotFound / Unauthorized / etc.) → not retry.
     assert!(!default_retryable(&RpcError::ServerError {
-        status: RpcStatus::Application(0x4001).to_wire(),
+        status: RpcStatus::Application(net_sdk::mesh_rpc::NRPC_TYPED_HANDLER_ERROR).to_wire(),
         message: "x".into(),
     }));
     assert!(!default_retryable(&RpcError::ServerError {

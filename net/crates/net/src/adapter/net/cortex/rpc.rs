@@ -300,10 +300,24 @@ pub enum RpcCodecError {
 impl RpcRequestPayload {
     /// Encode to the wire format. The result is the bytes that
     /// follow the 24-byte `EventMeta` prefix in the RedEX payload.
+    ///
+    /// **Encoder bounds:** every field that has a `MAX_RPC_*` cap
+    /// is asserted against that cap. In debug builds an oversize
+    /// field panics with a useful diagnostic so the programmer
+    /// notices in tests; in release builds the assert is dropped
+    /// (the decoder side still enforces the cap, so a malformed
+    /// frame would be rejected by the receiver — but constructing
+    /// one is always a caller bug).
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64 + self.body.len());
         // service
         let svc = self.service.as_bytes();
+        debug_assert!(
+            svc.len() <= MAX_RPC_SERVICE_NAME_LEN,
+            "service name {} exceeds MAX_RPC_SERVICE_NAME_LEN ({})",
+            svc.len(),
+            MAX_RPC_SERVICE_NAME_LEN,
+        );
         buf.put_u8(svc.len() as u8);
         buf.extend_from_slice(svc);
         // deadline_ns
@@ -313,6 +327,12 @@ impl RpcRequestPayload {
         // headers
         encode_headers(&self.headers, &mut buf);
         // body
+        debug_assert!(
+            self.body.len() <= MAX_RPC_BODY_LEN,
+            "body length {} exceeds MAX_RPC_BODY_LEN ({})",
+            self.body.len(),
+            MAX_RPC_BODY_LEN,
+        );
         buf.put_u32_le(self.body.len() as u32);
         buf.extend_from_slice(&self.body);
         buf
@@ -391,10 +411,18 @@ impl RpcRequestPayload {
 impl RpcResponsePayload {
     /// Encode to the wire format. The result is the bytes that
     /// follow the 24-byte `EventMeta` prefix in the RedEX payload.
+    /// Same encoder-bounds policy as
+    /// [`RpcRequestPayload::encode`] — see that method's doc.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(16 + self.body.len());
         buf.put_u16_le(self.status.to_wire());
         encode_headers(&self.headers, &mut buf);
+        debug_assert!(
+            self.body.len() <= MAX_RPC_BODY_LEN,
+            "body length {} exceeds MAX_RPC_BODY_LEN ({})",
+            self.body.len(),
+            MAX_RPC_BODY_LEN,
+        );
         buf.put_u32_le(self.body.len() as u32);
         buf.extend_from_slice(&self.body);
         buf
@@ -490,9 +518,27 @@ pub fn build_trace_headers(ctx: &TraceContext) -> Vec<RpcHeader> {
 }
 
 fn encode_headers(headers: &[RpcHeader], buf: &mut Vec<u8>) {
+    debug_assert!(
+        headers.len() <= MAX_RPC_HEADERS,
+        "headers count {} exceeds MAX_RPC_HEADERS ({})",
+        headers.len(),
+        MAX_RPC_HEADERS,
+    );
     buf.put_u8(headers.len() as u8);
     for (name, value) in headers {
         let nbytes = name.as_bytes();
+        debug_assert!(
+            nbytes.len() <= MAX_RPC_HEADER_NAME_LEN,
+            "header name {} exceeds MAX_RPC_HEADER_NAME_LEN ({})",
+            nbytes.len(),
+            MAX_RPC_HEADER_NAME_LEN,
+        );
+        debug_assert!(
+            value.len() <= MAX_RPC_HEADER_VALUE_LEN,
+            "header value {} exceeds MAX_RPC_HEADER_VALUE_LEN ({})",
+            value.len(),
+            MAX_RPC_HEADER_VALUE_LEN,
+        );
         buf.put_u8(nbytes.len() as u8);
         buf.extend_from_slice(nbytes);
         buf.put_u16_le(value.len() as u16);
@@ -2024,6 +2070,54 @@ mod tests {
         assert_eq!(DISPATCH_RPC_RESPONSE, 0x11);
         assert_eq!(DISPATCH_RPC_CANCEL, 0x12);
         assert_eq!(DISPATCH_RPC_DEADLINE_EXCEEDED, 0x13);
+    }
+
+    /// Regression: encoder bounds. Encoding a service name longer
+    /// than `MAX_RPC_SERVICE_NAME_LEN` panics in debug, catching
+    /// the programmer error in tests rather than silently writing
+    /// a truncated `as u8` length that the receiver decodes as
+    /// garbage. The matching debug_asserts guard body length,
+    /// header count, header name length, and header value length.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "service name")]
+    fn request_encode_panics_on_oversize_service_name() {
+        let p = RpcRequestPayload {
+            service: "x".repeat(MAX_RPC_SERVICE_NAME_LEN + 1),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: vec![],
+        };
+        let _ = p.encode();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "body length")]
+    fn request_encode_panics_on_oversize_body() {
+        let p = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: vec![0; MAX_RPC_BODY_LEN + 1],
+        };
+        let _ = p.encode();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "header name")]
+    fn request_encode_panics_on_oversize_header_name() {
+        let p = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![("a".repeat(MAX_RPC_HEADER_NAME_LEN + 1), vec![])],
+            body: vec![],
+        };
+        let _ = p.encode();
     }
 
     /// Bit 0 of `RpcRequestPayload::flags` is reserved (was the
