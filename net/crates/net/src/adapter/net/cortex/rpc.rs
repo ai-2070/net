@@ -1263,7 +1263,7 @@ type FlowControlMap = Arc<Mutex<HashMap<(u64, u64), Arc<tokio::sync::Semaphore>>
 /// non-terminal/terminal via the `nrpc-streaming` header.
 ///
 /// State `()` — like the unary fold, the handler owns user state
-/// via captured Arc<Mutex<S>>. The fold's own state (in-flight
+/// via captured `Arc<Mutex<S>>`. The fold's own state (in-flight
 /// cancellation tokens) lives on `&mut self`.
 pub struct RpcServerStreamingFold {
     handler: Arc<dyn RpcStreamingHandler>,

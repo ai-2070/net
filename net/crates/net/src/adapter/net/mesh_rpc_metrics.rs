@@ -171,7 +171,8 @@ pub(super) enum CallOutcome {
 
 /// Per-Mesh registry of `service` → counters. Built once at
 /// `MeshNode::new`; all caller-side hooks consult it via
-/// [`MeshNode::rpc_metrics_arc`].
+/// `MeshNode::rpc_metrics_arc` (a `pub(super)` accessor used by
+/// the `mesh_rpc::Mesh::call` glue).
 pub struct RpcMetricsRegistry {
     services: DashMap<String, Arc<ServiceMetricsAtomic>>,
 }
