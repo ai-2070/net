@@ -1,0 +1,29 @@
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  d1b11a1287c1706a 504-523,526
+net/crates/net/bindings/go/net/mesh_rpc.go
+  d1b11a1287c1706a 114,819-840,847,866-874,882
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  d1b11a1287c1706a 468-475,481,484-489
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  d1b11a1287c1706a 674-679,689,714-718,721,1213
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "6a45ed93b0bb3d8305c3a082b5cdadb06a07fde9",
+  "prompts": {
+    "d1b11a1287c1706a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 84,
+      "total_deletions": 11,
+      "accepted_lines": 755,
+      "overriden_lines": 0
+    }
+  }
+}
