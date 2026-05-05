@@ -1,0 +1,29 @@
+net/crates/net/bindings/go/net/resilience.go
+  cfca4517ad394ef2 1-396
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  cfca4517ad394ef2 44,57,60,84-113,730-949,1030-1097
+net/crates/net/bindings/go/rpc-ffi/Cargo.toml
+  cfca4517ad394ef2 38-40
+net/crates/net/bindings/go/net/mesh_rpc.go
+  cfca4517ad394ef2 58,73,119-138,374-390,514-673
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "9cf612ab5232b960199ab238d7d90e3f1e02fa2f",
+  "prompts": {
+    "cfca4517ad394ef2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c8c8999-2a05-4bfc-a843-35946dde9df4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1967,
+      "total_deletions": 20,
+      "accepted_lines": 1016,
+      "overriden_lines": 0
+    }
+  }
+}
