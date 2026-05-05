@@ -539,12 +539,18 @@ layers:
   the runtime.
 - **Typed wrapper** — `net.mesh_rpc.TypedMeshRpc`: JSON
   encode/decode at the binding boundary so user code works with
-  plain Python objects (dicts, lists, dataclasses via custom
-  encoders). Resilience helpers (`RetryPolicy`, `HedgePolicy`,
+  plain Python objects (dicts, lists, strings, numbers, bools,
+  None). The default codec is `json.dumps` / `json.loads` — to
+  send dataclasses, Pydantic models, or numpy arrays, convert to
+  a JSON-serializable shape before calling (e.g.
+  `dataclasses.asdict(x)` or `model.model_dump()`); a non-
+  serializable input raises `RpcCodecError` before the call hits
+  the wire so the diagnostic points at the call site rather than
+  the server. Resilience helpers (`RetryPolicy`, `HedgePolicy`,
   `CircuitBreaker`) plus the typed exception classes
   (`RpcNoRouteError`, `RpcTimeoutError`, `RpcServerError`,
-  `RpcTransportError`, `RpcCodecError`, `BreakerOpenError`) live
-  here too.
+  `RpcTransportError`, `RpcCodecError`, `RpcAppError`,
+  `BreakerOpenError`) live here too.
 
 ```python
 from net import NetMesh
