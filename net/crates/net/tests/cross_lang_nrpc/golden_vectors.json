@@ -1,0 +1,59 @@
+{
+  "service": "cross_lang_echo_sum",
+  "description": "Canonical cross-binding nRPC compatibility service. Every binding's wire-format compat test loads this file and asserts: encoding request_json on each side, dispatching through the handler, and decoding the response yields response_json that semantically matches expected. Status codes, header names, and the JSON shape are all part of the contract — see ../README.md for the full spec.",
+  "abi_version_expected": 1,
+  "ok_cases": [
+    {
+      "name": "single_number",
+      "request_json": { "text": "hello", "numbers": [42] },
+      "expected_response_json": { "echo": "hello", "sum": 42 }
+    },
+    {
+      "name": "small_array",
+      "request_json": { "text": "world", "numbers": [1, 2, 3, 4, 5] },
+      "expected_response_json": { "echo": "world", "sum": 15 }
+    },
+    {
+      "name": "empty_array",
+      "request_json": { "text": "edge", "numbers": [] },
+      "expected_response_json": { "echo": "edge", "sum": 0 }
+    },
+    {
+      "name": "negative_and_zero",
+      "request_json": { "text": "signed", "numbers": [-10, 0, 10] },
+      "expected_response_json": { "echo": "signed", "sum": 0 }
+    },
+    {
+      "name": "unicode_echo",
+      "request_json": { "text": "héllo 世界", "numbers": [7] },
+      "expected_response_json": { "echo": "héllo 世界", "sum": 7 }
+    },
+    {
+      "name": "empty_text",
+      "request_json": { "text": "", "numbers": [100, 200] },
+      "expected_response_json": { "echo": "", "sum": 300 }
+    }
+  ],
+  "error_cases": [
+    {
+      "name": "missing_text_field",
+      "request_json": { "numbers": [1, 2, 3] },
+      "expected_error_kind_prefix": "server_error",
+      "expected_status": 32768,
+      "_status_hex": "0x8000",
+      "_note": "Handler signals bad-request via NRPC_TYPED_BAD_REQUEST = 0x8000 (application-defined range 0x8000..=0xFFFF, per `sdk/mesh_rpc.rs:61`)."
+    },
+    {
+      "name": "missing_numbers_field",
+      "request_json": { "text": "lonely" },
+      "expected_error_kind_prefix": "server_error",
+      "expected_status": 32768
+    },
+    {
+      "name": "wrong_type_for_numbers",
+      "request_json": { "text": "bad", "numbers": "not-an-array" },
+      "expected_error_kind_prefix": "server_error",
+      "expected_status": 32768
+    }
+  ]
+}
