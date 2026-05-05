@@ -598,8 +598,16 @@ impl PyMeshRpc {
 
     /// All node ids currently advertising `nrpc:<service>` in the
     /// local capability index. Returns a list of `int`.
-    fn find_service_nodes(&self, service: String) -> Vec<u64> {
-        self.node.find_service_nodes(&service)
+    ///
+    /// Releases the GIL across the lookup. The capability index
+    /// is parking-lot-locked; with the GIL held we'd block other
+    /// Python threads on every discovery query — which is the
+    /// hot path on a service-discovery-driven caller. Drops to
+    /// the same convention as `call` / `call_service` /
+    /// `call_streaming`.
+    fn find_service_nodes(&self, py: Python<'_>, service: String) -> Vec<u64> {
+        let node = self.node.clone();
+        py.detach(|| node.find_service_nodes(&service))
     }
 }
 
