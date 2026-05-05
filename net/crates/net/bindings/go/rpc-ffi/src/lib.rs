@@ -351,32 +351,39 @@ pub extern "C" fn net_rpc_free_cstring(s: *mut c_char) {
     }
 }
 
-/// Free a Vec<u8> previously returned out-of-band by this crate
-/// (e.g. response bytes from `net_rpc_call`). Idempotent on NULL
-/// or zero-length.
+/// Free a buffer of `len` u8s previously returned out-of-band by
+/// this crate (e.g. response bytes from `net_rpc_call`). Idempotent
+/// on NULL or zero-length.
+///
+/// Layout invariant: every site that hands a buffer out via
+/// [`write_response`] does so by `Box::into_raw(Vec::into_boxed_slice)`,
+/// whose memory layout is `(ptr, len)` with `cap == len` baked in —
+/// no `shrink_to_fit` best-effort hazard. The free path
+/// reconstructs the same `Box<[u8]>` and drops it.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_response_free(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
         return;
     }
     unsafe {
-        // Reconstruct the Vec from its raw parts. `cap == len` is
-        // load-bearing — every site that hands a response buffer
-        // out shrinks-to-fit before extracting raw parts so the
-        // capacity matches the length.
-        let _ = Vec::from_raw_parts(ptr, len, len);
+        let slice: *mut [u8] = std::slice::from_raw_parts_mut(ptr, len);
+        drop(Box::from_raw(slice));
     }
 }
 
 /// Free an array of u64 node ids previously returned by
 /// [`net_rpc_find_service_nodes`]. Idempotent on NULL or zero.
+///
+/// Same Box<[u64]> layout discipline as
+/// [`net_rpc_response_free`] — see its doc.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_find_service_nodes_free(ptr: *mut u64, len: usize) {
     if ptr.is_null() || len == 0 {
         return;
     }
     unsafe {
-        let _ = Vec::from_raw_parts(ptr, len, len);
+        let slice: *mut [u64] = std::slice::from_raw_parts_mut(ptr, len);
+        drop(Box::from_raw(slice));
     }
 }
 
@@ -557,14 +564,19 @@ pub extern "C" fn net_rpc_call_service(
 }
 
 /// Hand a `Vec<u8>` to the Go caller as a raw pointer + length.
-/// Shrinks to fit so `cap == len` — the matching
-/// `net_rpc_response_free` reconstructs `Vec<u8>` from
-/// `(ptr, len, len)`.
-fn write_response(mut body: Vec<u8>, out_ptr: *mut *mut u8, out_len: *mut usize) {
-    body.shrink_to_fit();
-    let len = body.len();
-    let ptr = body.as_mut_ptr();
-    std::mem::forget(body);
+///
+/// Uses `Vec::into_boxed_slice` rather than `shrink_to_fit + Vec::
+/// from_raw_parts(ptr, len, len)`: `shrink_to_fit` is documented
+/// "best effort" and an allocator that rounds up (mimalloc on
+/// some platforms, jemalloc historically) would leave `cap > len`,
+/// making the freer's `Vec::from_raw_parts(_, len, len)` a
+/// soundness violation (UB on dealloc — wrong layout). Boxed
+/// slices have an exact `(ptr, len)` representation; the matching
+/// free reconstructs `Box<[u8]>` directly.
+fn write_response(body: Vec<u8>, out_ptr: *mut *mut u8, out_len: *mut usize) {
+    let boxed: Box<[u8]> = body.into_boxed_slice();
+    let len = boxed.len();
+    let ptr = Box::into_raw(boxed) as *mut u8;
     unsafe {
         *out_ptr = ptr;
         *out_len = len;
@@ -604,11 +616,12 @@ pub extern "C" fn net_rpc_find_service_nodes(
         }
         return NET_RPC_OK;
     }
-    let mut buf = nodes;
-    buf.shrink_to_fit();
-    let count = buf.len();
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
+    // Same boxed-slice discipline as `write_response` — `cap ==
+    // len` exactly, no `shrink_to_fit` best-effort hazard. The
+    // matching free is `net_rpc_find_service_nodes_free`.
+    let boxed: Box<[u64]> = nodes.into_boxed_slice();
+    let count = boxed.len();
+    let ptr = Box::into_raw(boxed) as *mut u64;
     unsafe {
         *out_ptr = ptr;
         *out_count = count;
@@ -1033,8 +1046,8 @@ mod tests {
     }
 
     /// `write_response` round-trips through the freer without
-    /// leaking. Reconstructs the Vec via the matching
-    /// `from_raw_parts(ptr, len, len)`.
+    /// leaking. The boxed-slice layout means `cap == len` is
+    /// guaranteed, not best-effort.
     #[test]
     fn write_response_then_response_free_round_trips() {
         let body = b"hello world".to_vec();
@@ -1043,8 +1056,30 @@ mod tests {
         write_response(body, &mut out_ptr, &mut out_len);
         assert_eq!(out_len, 11);
         assert!(!out_ptr.is_null());
-        // Free should run without panicking — the matching
-        // Vec::from_raw_parts is the load-bearing test.
+        net_rpc_response_free(out_ptr, out_len);
+    }
+
+    /// Regression: a Vec with capacity strictly greater than its
+    /// length still round-trips correctly. The previous
+    /// implementation called `shrink_to_fit` (best-effort) before
+    /// `Vec::from_raw_parts(ptr, len, len)`; on an allocator that
+    /// rounded the shrink up, the freer would deallocate with the
+    /// wrong layout and trip UB. The boxed-slice layout used now
+    /// removes that hazard — `into_boxed_slice` forces the cap to
+    /// the exact len at the type level.
+    #[test]
+    fn write_response_handles_overallocated_vec() {
+        let mut body: Vec<u8> = Vec::with_capacity(1024);
+        body.extend_from_slice(b"short");
+        // Sanity: cap > len so we exercise the formerly-hazardous path.
+        assert!(body.capacity() > body.len());
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        write_response(body, &mut out_ptr, &mut out_len);
+        assert_eq!(out_len, 5);
+        assert!(!out_ptr.is_null());
+        // Round-trip: the freer's Box<[u8]> reconstruction sees
+        // matching layout and frees cleanly.
         net_rpc_response_free(out_ptr, out_len);
     }
 
