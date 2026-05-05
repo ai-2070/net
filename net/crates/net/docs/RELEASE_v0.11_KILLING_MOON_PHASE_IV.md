@@ -28,7 +28,9 @@ Two layered fixes; the first patches per-call durability on Windows, the second 
 
     `compact_to` writes the new generation's files in full, fsyncs them, then `durable_rename(manifest.tmp → manifest)` is the single linearizing event. Before the rename, recovery sees the old manifest and uses `v<N>/`. After it, recovery sees the new manifest and uses `v<N+1>/`. There is no mixed state — every generation directory is either complete or orphaned, never partially live. Recovery falls back to the highest validated `v<NNN>/` if the manifest is torn or missing, and sweeps every generation directory other than the live one on every open (cleaning up orphans left by a crashed prior compact).
 
-    Legacy v0.10 / v0.11 channels with the flat `<channel>/{idx,dat,ts}` layout migrate transparently into `<channel>/v0000000001/{idx,dat,ts}` on first open. The migration is one-shot per channel and idempotent. Pinned by 12 new regression tests including all 10 crash-injection points sketched in `BUG_AUDIT_2026_05_03_REMAINING_PLAN.md`'s long-term-follow-up section. Design recorded in `docs/misc/REDEX_MANIFEST_POINTER_DESIGN.md`.
+    The post-rename `fsync_dir(channel_dir)` is treated as best-effort: a rare POSIX failure after the linearizing rename is logged and swallowed rather than surfaced as `Err`, so the cached-handle swap still proceeds and on-disk + in-memory stay aligned. Surfacing the error would have lied to the caller about whether the flip happened, leaving any in-process appends between the failed compact and process exit landing in a now-dead generation. The residual durability gap (a power loss before the next implicit dirent flush could revert the rename) is recovered by the orphan-generation sweep on next open, which converges on a single consistent live generation regardless of which side of the rename survived.
+
+    Legacy v0.10 / v0.11 channels with the flat `<channel>/{idx,dat,ts}` layout migrate transparently into `<channel>/v0000000001/{idx,dat,ts}` on first open. The migration is one-shot per channel and idempotent. Pinned by 20 new regression tests including all 10 crash-injection points sketched in `BUG_AUDIT_2026_05_03_REMAINING_PLAN.md`'s long-term-follow-up section, plus mid-rename partial-migration recovery, fault-injected `fsync_dir` failure handling, and source-shape guards against the deleted post-rename-reopen failure mode drifting back. Design recorded in `docs/misc/REDEX_MANIFEST_POINTER_DESIGN.md`.
 
 ### Compute registry quiescence
 
@@ -183,6 +185,7 @@ These aren't strictly API-breaking but tests that asserted the pre-fix behavior 
 - **Mesh `accept` / `start` use SeqCst on `accept_in_flight`** — tests on AArch64 / RISC-V hardware that relied on the pre-fix race window to construct concurrent-accept-and-start state will see the documented mutual exclusion.
 - **Mesh routed-handshake refuses key rotation while a session is live** — tests that asserted the silent overwrite (e.g. simulating a Sybil swap-in via routed msg1) will see the rotation refused.
 - **`authorize_subscribe` short-circuits idempotent re-subscribes ahead of the cap-check** — tests that asserted at-cap re-subscribe surfaced `TooManyChannels` will see success instead.
+- **RedEX poisoning error strings now reference `"partial-write rollback could not restore on-disk state to match in-memory"`** — log alerting / string assertions that matched the prior `"compact_to post-rename reopen failure"` parenthetical (which described a setter the manifest-pointer rework deleted) need updating. The poisoning condition itself is unchanged: only the partial-write rollback paths set the flag, and the error wording now accurately names them.
 
 ---
 
