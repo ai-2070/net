@@ -324,8 +324,18 @@ func writeCError(out **C.char, msg string) {
 // `NewMeshRpc(node)` where `node` is an `Arc<MeshNode>` pointer
 // obtained from the `compute-ffi` Go binding (typically via
 // `mesh.ArcClone()`).
+//
+// Concurrency: the handle is guarded by an RWMutex so a `Close()`
+// racing arbitrarily many in-flight `Call` / `Serve` / etc.
+// invocations can never observe a use-after-free. Method bodies
+// take the RLock, validate `handle != nil`, perform the cgo call,
+// then drop the lock; `Close` takes the write lock so it sees a
+// quiescent set of in-flight ops.
 type MeshRpc struct {
+	mu     sync.RWMutex
 	handle *C.MeshRpcHandle
+	// closed snapshot for the cheap pre-check; the lock-guarded
+	// `handle != nil` is the load-bearing invariant.
 	closed atomic.Bool
 }
 
@@ -347,25 +357,51 @@ func NewMeshRpc(nodeArcPtr unsafe.Pointer) (*MeshRpc, error) {
 	return r, nil
 }
 
+// withHandle runs `fn` with the live C handle under the read
+// lock. Returns ErrClosed if Close has already taken the handle
+// down.
+func (r *MeshRpc) withHandle(fn func(handle *C.MeshRpcHandle)) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.handle == nil {
+		return ErrClosed
+	}
+	fn(r.handle)
+	// Without KeepAlive, escape analysis on aggressively-inlined
+	// builds could free `r` between `r.mu.RUnlock()` and the
+	// caller's next instruction. The fn body already touched
+	// r.handle, so escape analysis usually keeps r live, but
+	// "usually" isn't a load-bearing invariant for FFI code.
+	runtime.KeepAlive(r)
+	return nil
+}
+
 // ID returns the monotonic id of this MeshRpc — useful for
 // diagnostics / logs that correlate FFI-side state with Go-side
 // state.
 func (r *MeshRpc) ID() uint64 {
-	if r.closed.Load() {
-		return 0
-	}
-	return uint64(C.net_rpc_id(r.handle))
+	var id uint64
+	_ = r.withHandle(func(h *C.MeshRpcHandle) {
+		id = uint64(C.net_rpc_id(h))
+	})
+	return id
 }
 
 // Close releases the C handle. Idempotent. Subsequent operations
-// on this MeshRpc return ErrClosed.
+// on this MeshRpc return ErrClosed. Blocks briefly on any
+// in-flight Call / Serve / etc. — those hold the read lock for
+// the duration of their cgo invocation.
 func (r *MeshRpc) Close() {
 	if r.closed.Swap(true) {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	runtime.SetFinalizer(r, nil)
-	C.net_rpc_free(r.handle)
-	r.handle = nil
+	if r.handle != nil {
+		C.net_rpc_free(r.handle)
+		r.handle = nil
+	}
 }
 
 func (r *MeshRpc) finalize() { r.Close() }
@@ -436,9 +472,6 @@ func (r *MeshRpc) Call(
 	service string,
 	req []byte,
 ) ([]byte, error) {
-	if r.closed.Load() {
-		return nil, ErrClosed
-	}
 	deadlineMs := contextDeadlineMs(ctx)
 	cService := stringToCBytes(service)
 	defer C.free(cService.ptr)
@@ -448,15 +481,20 @@ func (r *MeshRpc) Call(
 	var outResp *C.uint8_t
 	var outRespLen C.size_t
 	var outErr *C.char
-	code := C.net_rpc_call(
-		r.handle,
-		C.uint64_t(targetNodeID),
-		(*C.char)(cService.ptr), cService.len,
-		cReq.ptr, cReq.len,
-		C.uint64_t(deadlineMs),
-		&outResp, &outRespLen,
-		&outErr,
-	)
+	var code C.int
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		code = C.net_rpc_call(
+			h,
+			C.uint64_t(targetNodeID),
+			(*C.char)(cService.ptr), cService.len,
+			cReq.ptr, cReq.len,
+			C.uint64_t(deadlineMs),
+			&outResp, &outRespLen,
+			&outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
 	return readCallResult(code, outResp, outRespLen, outErr)
 }
 
@@ -467,9 +505,6 @@ func (r *MeshRpc) CallService(
 	service string,
 	req []byte,
 ) ([]byte, error) {
-	if r.closed.Load() {
-		return nil, ErrClosed
-	}
 	deadlineMs := contextDeadlineMs(ctx)
 	cService := stringToCBytes(service)
 	defer C.free(cService.ptr)
@@ -479,14 +514,19 @@ func (r *MeshRpc) CallService(
 	var outResp *C.uint8_t
 	var outRespLen C.size_t
 	var outErr *C.char
-	code := C.net_rpc_call_service(
-		r.handle,
-		(*C.char)(cService.ptr), cService.len,
-		cReq.ptr, cReq.len,
-		C.uint64_t(deadlineMs),
-		&outResp, &outRespLen,
-		&outErr,
-	)
+	var code C.int
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		code = C.net_rpc_call_service(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			cReq.ptr, cReq.len,
+			C.uint64_t(deadlineMs),
+			&outResp, &outRespLen,
+			&outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
 	return readCallResult(code, outResp, outRespLen, outErr)
 }
 
@@ -494,21 +534,23 @@ func (r *MeshRpc) CallService(
 // `nrpc:<service>` in the local capability index. Empty slice ==
 // no providers; nil error in that case.
 func (r *MeshRpc) FindServiceNodes(service string) ([]uint64, error) {
-	if r.closed.Load() {
-		return nil, ErrClosed
-	}
 	cService := stringToCBytes(service)
 	defer C.free(cService.ptr)
 
 	var outPtr *C.uint64_t
 	var outCount C.size_t
 	var outErr *C.char
-	code := C.net_rpc_find_service_nodes(
-		r.handle,
-		(*C.char)(cService.ptr), cService.len,
-		&outPtr, &outCount,
-		&outErr,
-	)
+	var code C.int
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		code = C.net_rpc_find_service_nodes(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			&outPtr, &outCount,
+			&outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
 	if code != 0 {
 		err := readCError(outErr)
 		return nil, parseRpcError(err)
@@ -597,9 +639,6 @@ func (r *MeshRpc) CallStreaming(
 	req []byte,
 	opts StreamOptions,
 ) (*RpcStream, error) {
-	if r.closed.Load() {
-		return nil, ErrClosed
-	}
 	deadlineMs := contextDeadlineMs(ctx)
 	cService := stringToCBytes(service)
 	defer C.free(cService.ptr)
@@ -608,16 +647,21 @@ func (r *MeshRpc) CallStreaming(
 
 	var outStream *C.RpcStreamHandleC
 	var outErr *C.char
-	code := C.net_rpc_call_streaming(
-		r.handle,
-		C.uint64_t(targetNodeID),
-		(*C.char)(cService.ptr), cService.len,
-		cReq.ptr, cReq.len,
-		C.uint64_t(deadlineMs),
-		C.uint32_t(opts.Window),
-		&outStream,
-		&outErr,
-	)
+	var code C.int
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		code = C.net_rpc_call_streaming(
+			h,
+			C.uint64_t(targetNodeID),
+			(*C.char)(cService.ptr), cService.len,
+			cReq.ptr, cReq.len,
+			C.uint64_t(deadlineMs),
+			C.uint32_t(opts.Window),
+			&outStream,
+			&outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
 	if code != 0 {
 		msg := readCError(outErr)
 		return nil, parseRpcError(msg)
@@ -781,9 +825,6 @@ var ErrAlreadyServing = errors.New("net.Serve: service already served by this Me
 // Tokio dispatcher between `serve_rpc` returning and any
 // language-side bookkeeping must always find the callable.
 func (r *MeshRpc) Serve(service string, handler Handler) (*ServeHandle, error) {
-	if r.closed.Load() {
-		return nil, ErrClosed
-	}
 	if handler == nil {
 		return nil, errors.New("net.Serve: handler must be non-nil")
 	}
@@ -803,12 +844,19 @@ func (r *MeshRpc) Serve(service string, handler Handler) (*ServeHandle, error) {
 	defer C.free(cService.ptr)
 
 	var outErr *C.char
-	handle := C.net_rpc_serve(
-		r.handle,
-		(*C.char)(cService.ptr), cService.len,
-		C.uint64_t(hID),
-		&outErr,
-	)
+	var handle *C.ServeHandleC
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		handle = C.net_rpc_serve(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			C.uint64_t(hID),
+			&outErr,
+		)
+	}); err != nil {
+		// MeshRpc is closed — drop the registry insert.
+		handlerRegistry.Delete(hID)
+		return nil, err
+	}
 	if handle == nil {
 		// Roll the registry insert back so a retry doesn't trip
 		// over a stale dispatcher entry — and so we don't leak
