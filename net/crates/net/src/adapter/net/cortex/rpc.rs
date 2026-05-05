@@ -666,8 +666,11 @@ pub const HEADER_NRPC_STREAMING_END: &[u8] = b"end";
 /// to that count and the pump awaits one credit per emitted chunk.
 /// The caller refills via [`DISPATCH_RPC_STREAM_GRANT`] events.
 ///
-/// Absent → unlimited credit (back-compat: behaves identically to
-/// the pre-flow-control streaming path).
+/// Absent → unbounded credit (the pump emits chunks as fast as
+/// the publish path can take them). Long-running streams that
+/// could outpace a slow consumer SHOULD opt into flow control —
+/// without it, the server's sink mpsc grows unbounded under a
+/// stalled caller.
 pub const HEADER_NRPC_STREAM_WINDOW_INITIAL: &str = "nrpc-stream-window-initial";
 
 /// Encode a stream-grant payload — 4 bytes big-endian `u32`
@@ -1274,8 +1277,8 @@ pub struct RpcServerStreamingFold {
     /// `Some(sem)` means "pump must `acquire().await` one permit
     /// per chunk before emitting; STREAM_GRANT events
     /// `add_permits(n)`". Absence of an entry for a `(origin,
-    /// call_id)` key means unbounded credit (back-compat —
-    /// pre-flow-control callers don't get throttled).
+    /// call_id)` key means unbounded credit (no flow control —
+    /// pump emits as fast as the publish path can take chunks).
     flow_control: FlowControlMap,
     /// Optional per-service metrics handle. Same shape as
     /// `RpcServerFold::metrics`; the streaming fold ALSO bumps
