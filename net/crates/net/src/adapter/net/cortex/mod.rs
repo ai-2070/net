@@ -41,9 +41,10 @@ pub use meta::{
 };
 pub use rpc::{
     request_wire_size, response_wire_size, RpcCancellationToken, RpcClientFold, RpcClientPending,
-    RpcCodecError, RpcContext, RpcHandler, RpcHandlerError, RpcHeader, RpcRequestPayload,
-    RpcResponseEmitter, RpcResponsePayload, RpcServerFold, RpcStatus, DISPATCH_RPC_CANCEL,
-    DISPATCH_RPC_DEADLINE_EXCEEDED, DISPATCH_RPC_REQUEST, DISPATCH_RPC_RESPONSE,
-    FLAG_RPC_IDEMPOTENT, FLAG_RPC_PROPAGATE_TRACE, FLAG_RPC_STREAMING_RESPONSE, MAX_RPC_BODY_LEN,
-    MAX_RPC_HEADERS, MAX_RPC_HEADER_NAME_LEN, MAX_RPC_HEADER_VALUE_LEN, MAX_RPC_SERVICE_NAME_LEN,
+    RpcCodecError, RpcContext, RpcHandler, RpcHandlerError, RpcHeader, RpcInboundDispatcher,
+    RpcInboundEvent, RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload, RpcServerFold,
+    RpcStatus, DISPATCH_RPC_CANCEL, DISPATCH_RPC_DEADLINE_EXCEEDED, DISPATCH_RPC_REQUEST,
+    DISPATCH_RPC_RESPONSE, FLAG_RPC_IDEMPOTENT, FLAG_RPC_PROPAGATE_TRACE,
+    FLAG_RPC_STREAMING_RESPONSE, MAX_RPC_BODY_LEN, MAX_RPC_HEADERS, MAX_RPC_HEADER_NAME_LEN,
+    MAX_RPC_HEADER_VALUE_LEN, MAX_RPC_SERVICE_NAME_LEN,
 };

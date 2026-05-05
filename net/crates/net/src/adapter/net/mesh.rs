@@ -256,6 +256,10 @@ struct DispatchCtx {
     router: Arc<NetRouter>,
     failure_detector: Arc<FailureDetector>,
     inbound: InboundQueues,
+    /// Per-channel-hash dispatch hook for nRPC. See the matching
+    /// field on `MeshNode`.
+    rpc_inbound_dispatchers:
+        Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
     ///
@@ -1049,6 +1053,14 @@ pub struct MeshNode {
     failure_detector: Arc<FailureDetector>,
     /// Inbound event queues (shared with receive loop)
     inbound: InboundQueues,
+    /// Per-channel-hash dispatch hook for nRPC. When an inbound
+    /// event's `channel_hash` matches a registered dispatcher,
+    /// the event is routed there directly instead of landing in
+    /// the per-shard `inbound` queue. Lookup is one DashMap get
+    /// per packet on the hot path; absent registrations skip the
+    /// branch entirely.
+    rpc_inbound_dispatchers:
+        Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
     /// Optional migration subprotocol handler — same `ArcSwapOption`
     /// surface as on `MeshNode`, propagated into the dispatch
     /// context so the packet-receive loop stays lock-free.
@@ -1479,6 +1491,7 @@ impl MeshNode {
             router,
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
+            rpc_inbound_dispatchers: Arc::new(DashMap::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             pending_direct_initiators,
@@ -2305,6 +2318,7 @@ impl MeshNode {
             router: self.router.clone(),
             failure_detector: self.failure_detector.clone(),
             inbound: self.inbound.clone(),
+            rpc_inbound_dispatchers: self.rpc_inbound_dispatchers.clone(),
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
@@ -3533,6 +3547,31 @@ impl MeshNode {
             }
         }
 
+        // nRPC dispatch hook: if a dispatcher is registered for the
+        // inbound packet's `channel_hash`, route every event from
+        // this packet directly to the dispatcher and skip the
+        // shard-inbound push. RPC needs per-channel routing
+        // (events for `<service>.requests` drive the server fold;
+        // events for `<service>.replies.<origin>` drive the
+        // client fold) which the shard queue can't provide because
+        // it strips the channel name on ingress.
+        //
+        // Hot-path cost: one DashMap get per packet. Absent
+        // registrations skip the loop entirely.
+        if let Some(dispatcher) = ctx.rpc_inbound_dispatchers.get(&parsed.header.channel_hash) {
+            let dispatcher = dispatcher.clone();
+            let channel_hash = parsed.header.channel_hash;
+            let origin_hash = parsed.header.origin_hash;
+            for event_data in events.into_iter() {
+                dispatcher(crate::adapter::net::cortex::RpcInboundEvent {
+                    channel_hash,
+                    origin_hash,
+                    payload: event_data,
+                });
+            }
+            return;
+        }
+
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
@@ -3954,6 +3993,44 @@ impl MeshNode {
     /// to enumerate subscribers; exposed for diagnostics.
     pub fn roster(&self) -> &Arc<SubscriberRoster> {
         &self.roster
+    }
+
+    /// Register a per-channel-hash inbound dispatcher for nRPC.
+    ///
+    /// When the mesh's inbound dispatch sees a packet whose
+    /// `NetHeader::channel_hash` matches `channel_hash`, it routes
+    /// every event in the packet to `dispatcher` and skips the
+    /// per-shard inbound queue. Used by `Mesh::serve_rpc` /
+    /// `Mesh::call` to receive RPC events without polling the
+    /// shard queue.
+    ///
+    /// Returns the previous dispatcher (if any) so callers can
+    /// detect a slot collision (typically a programming error —
+    /// two `serve_rpc` registrations for the same service on the
+    /// same node, or a hash collision between two different
+    /// channel names; the latter is bounded at ~1/65536 per pair).
+    ///
+    /// **Hot-path cost.** One DashMap get per inbound packet.
+    /// Absent registrations skip the conditional entirely.
+    pub fn register_rpc_inbound(
+        &self,
+        channel_hash: u16,
+        dispatcher: crate::adapter::net::cortex::RpcInboundDispatcher,
+    ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
+        self.rpc_inbound_dispatchers.insert(channel_hash, dispatcher)
+    }
+
+    /// Remove the registered dispatcher for `channel_hash`. Returns
+    /// the prior dispatcher if one was registered. After removal,
+    /// inbound events for `channel_hash` resume landing in the
+    /// per-shard inbound queue.
+    pub fn unregister_rpc_inbound(
+        &self,
+        channel_hash: u16,
+    ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
+        self.rpc_inbound_dispatchers
+            .remove(&channel_hash)
+            .map(|(_, v)| v)
     }
 
     /// Install a `ChannelConfigRegistry` whose `can_subscribe` /
@@ -5385,7 +5462,7 @@ impl MeshNode {
                 // results anyway.
                 for peer_id in &subscribers {
                     match self
-                        .publish_to_peer(*peer_id, stream_id, reliable, events)
+                        .publish_to_peer(*peer_id, channel_hash, stream_id, reliable, events)
                         .await
                     {
                         Ok(()) => report.delivered += 1,
@@ -5406,8 +5483,14 @@ impl MeshNode {
                         let _permit = permit.acquire_owned().await.ok();
                         (
                             peer_id,
-                            self.publish_to_peer(peer_id, stream_id, reliable, &events_owned)
-                                .await,
+                            self.publish_to_peer(
+                                peer_id,
+                                channel_hash,
+                                stream_id,
+                                reliable,
+                                &events_owned,
+                            )
+                            .await,
                         )
                     };
                     handles.push(fut);
@@ -5460,6 +5543,7 @@ impl MeshNode {
     async fn publish_to_peer(
         &self,
         peer_node_id: u64,
+        channel_hash: u16,
         stream_id: u64,
         reliable: bool,
         events: &[Bytes],
@@ -5511,6 +5595,17 @@ impl MeshNode {
 
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
+        // Stamp `channel_hash` on the outbound packet header so the
+        // receiver can route per-channel. The mesh's pub/sub
+        // historically routed entirely via the subscriber roster
+        // and the wire-level `channel_hash` rode at 0, so per-
+        // channel inbound dispatchers (e.g. nRPC's
+        // `register_rpc_inbound`) couldn't differentiate. Stamping
+        // it makes the wire carry the channel identity the receiver
+        // needs; the roster path is unaffected (the receiver's
+        // shard-inbound queue still gets the event when no per-
+        // channel dispatcher is registered).
+        builder.set_channel_hash(channel_hash);
         // Match the rest of the sender call sites
         // (`send_to_peer:3661`, `send_to_peer:3685`, `send_routed:3755`,
         // `send_routed:3785`, `send_on_stream:6110`, `mod.rs:1016, 1063`):
@@ -8519,7 +8614,14 @@ mod heartbeat_aead_tests {
         let start = src
             .find("async fn publish_to_peer(")
             .expect("publish_to_peer must exist");
-        let scan_end = (start + 6000).min(src.len());
+        // Round down to a char boundary — the source has multibyte
+        // box-drawing characters in doc comments, and a fixed-byte
+        // window can land mid-UTF-8 sequence after edits to the
+        // surrounding code shift offsets.
+        let mut scan_end = (start + 6000).min(src.len());
+        while scan_end < src.len() && !src.is_char_boundary(scan_end) {
+            scan_end += 1;
+        }
         let body = &src[start..scan_end];
 
         assert!(

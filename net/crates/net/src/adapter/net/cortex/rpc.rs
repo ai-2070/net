@@ -509,6 +509,62 @@ pub fn response_wire_size(payload: &RpcResponsePayload) -> usize {
 }
 
 // ============================================================================
+// Mesh inbound dispatch hook.
+//
+// `MeshNode::dispatch_packet` normally pushes inbound channel
+// events onto a per-shard `inbound` queue keyed by `shard_id`. The
+// channel name / hash is stripped on the way in — by the time the
+// event lands in the queue, only the payload remains.
+//
+// RPC needs per-channel routing (events for `<service>.requests`
+// drive the server fold; events for `<service>.replies.<origin>`
+// drive the client fold). Without channel info on the queued
+// event, we can't filter from the consumer side.
+//
+// The hook below adds a per-`channel_hash` dispatcher map that the
+// mesh's inbound dispatch consults BEFORE pushing to the shard
+// queue. If a dispatcher is registered for the event's
+// `channel_hash`, the event is routed there directly (bypassing
+// the shard queue); otherwise the existing shard-queue path runs.
+//
+// Collision caveat: `channel_hash` is 16 bits. Two channels that
+// hash-collide will flow through the same dispatcher. The
+// collision probability per pair is ~1/65536; for N services
+// active simultaneously, the joint probability of any collision
+// is ~N²/131072. Phase 2 will widen the dispatch key (or carry
+// the full channel name on the inbound event) to close this gap;
+// for Phase 1 the limit is documented and operators size their
+// service set accordingly.
+// ============================================================================
+
+/// One inbound event delivered to a registered RPC dispatcher.
+#[derive(Debug, Clone)]
+pub struct RpcInboundEvent {
+    /// 16-bit hash of the channel this event arrived on. The
+    /// `channel_hash` from `NetHeader`. Subject to collisions; see
+    /// the module-level note above.
+    pub channel_hash: u16,
+    /// Caller's `origin_hash` from the packet header (32-bit
+    /// routing projection of the AEAD-verified peer's full
+    /// `EntityKeypair::origin_hash()` — see `OriginStamp` doc).
+    /// The dispatcher should treat this as routing metadata, not
+    /// identity authentication.
+    pub origin_hash: u32,
+    /// Event payload bytes — the same bytes that would have been
+    /// pushed onto the shard inbound queue. For RPC events these
+    /// start with a 24-byte `EventMeta` followed by the
+    /// `RpcRequestPayload` / `RpcResponsePayload` encoding.
+    pub payload: bytes::Bytes,
+}
+
+/// Type-erased callback fired by the mesh's inbound dispatch
+/// when an event arrives for a registered `channel_hash`. The
+/// callback runs on the mesh's dispatch task, so the body should
+/// be quick (push the event onto an mpsc / fold consumer rather
+/// than do real work).
+pub type RpcInboundDispatcher = Arc<dyn Fn(RpcInboundEvent) + Send + Sync + 'static>;
+
+// ============================================================================
 // Server-side fold.
 //
 // `RpcServerFold` is the `RedexFold` half of the server. It sees
