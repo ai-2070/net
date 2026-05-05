@@ -1342,24 +1342,49 @@ impl RedexFold<()> for RpcServerFold {
 /// terminal non-`Ok` RESPONSE.
 ///
 /// `send` is best-effort and infallible: the underlying mpsc is
-/// unbounded, so the handler never blocks on backpressure. If the
-/// caller cancels mid-stream, the dispatcher drops the receiver
-/// and subsequent `send` calls are silently discarded —
-/// cooperative cancellation via `ctx.cancellation` is the right
-/// way for the handler to notice and stop.
+/// **bounded** at [`STREAMING_PUMP_CAPACITY`] chunks. If the pump
+/// can't keep up (publish path is congested, caller hasn't granted
+/// flow-control credits), `send` discards on overflow — same
+/// observable shape as a closed receiver (caller cancelled mid-
+/// stream). Counts the drop in `streaming_chunks_dropped_total` so
+/// operators can see backpressure occurring. Cooperative
+/// cancellation via `ctx.cancellation` is the right way for the
+/// handler to notice the consumer is gone; opt-in flow control via
+/// `CallOptions::stream_window_initial` is the right way to
+/// throttle a fast handler against a slow consumer.
 pub struct RpcResponseSink {
-    inner: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
+    inner: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    /// Optional metrics handle so a dropped-on-full chunk bumps the
+    /// `streaming_chunks_dropped_total` counter. `None` for unit-
+    /// test folds that construct without metrics.
+    metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
 }
 
 impl RpcResponseSink {
-    /// Emit one non-terminal chunk. Cheap (unbounded mpsc send);
-    /// never blocks. Discarded silently if the caller has
-    /// cancelled the stream.
+    /// Emit one non-terminal chunk. Cheap (`try_send` on a
+    /// [`STREAMING_PUMP_CAPACITY`]-bounded mpsc); never blocks. On
+    /// overflow OR receiver-closed, the chunk is dropped and (when
+    /// metrics are wired) `streaming_chunks_dropped_total` is
+    /// incremented for the service.
     pub fn send(&self, body: impl Into<bytes::Bytes>) {
-        // Best-effort: discard on receiver-closed (caller cancelled).
-        let _ = self.inner.send(body.into());
+        if self.inner.try_send(body.into()).is_err() {
+            if let Some(m) = self.metrics.as_ref() {
+                m.streaming_chunks_dropped_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 }
+
+/// Bounded capacity for the streaming pump's internal mpsc. A
+/// runaway handler that produces chunks faster than the publish
+/// path can drain them stops blocking the runtime past this many
+/// queued chunks — additional chunks are dropped (and counted via
+/// `streaming_chunks_dropped_total`). 1024 is generous for typical
+/// streaming patterns; opt-in flow control via
+/// `CallOptions::stream_window_initial` is the right primitive for
+/// strict throttling.
+pub const STREAMING_PUMP_CAPACITY: usize = 1024;
 
 /// User-supplied streaming handler. Receives the same `RpcContext`
 /// as a unary handler plus a `RpcResponseSink` for emitting chunks.
@@ -1589,8 +1614,18 @@ impl RedexFold<()> for RpcServerStreamingFold {
                     // pump that forwards each chunk to the emit
                     // closure. The handler's `sink.send(...)`
                     // calls show up here as items on the receiver.
-                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
-                    let sink = RpcResponseSink { inner: tx };
+                    // **Bounded** at STREAMING_PUMP_CAPACITY: a
+                    // runaway handler that produces chunks faster
+                    // than the publish path can drain stops
+                    // blocking the runtime past this many queued
+                    // chunks; additional chunks are dropped and
+                    // counted via streaming_chunks_dropped_total.
+                    let (tx, mut rx) =
+                        tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_PUMP_CAPACITY);
+                    let sink = RpcResponseSink {
+                        inner: tx,
+                        metrics: metrics.clone(),
+                    };
                     let pump_emit = emit.clone();
                     let pump_metrics = metrics.clone();
                     let pump_flow = flow_sem.clone();
@@ -3615,6 +3650,41 @@ mod tests {
         let result = fold.apply(&rpc_stream_grant_event(99, 42, 5), &mut ());
         assert!(result.is_ok(), "GRANT for unknown call_id must be Ok");
         assert!(captured.lock().is_empty(), "no emit for unknown GRANT");
+    }
+
+    /// Regression for M20: the streaming pump's mpsc is bounded
+    /// at `STREAMING_PUMP_CAPACITY`. A handler that produces
+    /// chunks faster than the pump drains gets its excess
+    /// `sink.send(...)` calls silently dropped (matching the
+    /// "caller cancelled" semantic) — and the metric counter
+    /// `streaming_chunks_dropped_total` increments.
+    ///
+    /// We construct the sink directly with a tiny bounded mpsc
+    /// (capacity 2) and a metrics handle, then call `send` 5
+    /// times without a receiver. The first 2 fit in the channel;
+    /// the next 3 are dropped and counted.
+    #[tokio::test]
+    async fn streaming_sink_drops_on_full_and_increments_metric() {
+        use crate::adapter::net::mesh_rpc_metrics::{RpcMetricsRegistry, ServiceMetricsAtomic};
+        // Tiny channel to make overflow easy to observe.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(2);
+        let registry = RpcMetricsRegistry::new();
+        let metrics: Arc<ServiceMetricsAtomic> = registry.for_service("drop_test");
+        let sink = RpcResponseSink {
+            inner: tx,
+            metrics: Some(metrics.clone()),
+        };
+        // 5 sends; first 2 buffer, next 3 drop.
+        for i in 0..5u8 {
+            sink.send(vec![i]);
+        }
+        assert_eq!(
+            metrics
+                .streaming_chunks_dropped_total
+                .load(Ordering::Relaxed),
+            3,
+            "expected 3 dropped chunks (capacity=2, sent 5)",
+        );
     }
 
     /// Malformed REQUEST payload on the streaming fold: emits one

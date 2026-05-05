@@ -91,6 +91,13 @@ pub struct ServiceMetricsAtomic {
     /// handlers for this service. Bumped per `sink.send(...)` in
     /// the streaming fold's pump task.
     pub streaming_chunks_emitted_total: AtomicU64,
+    /// Streaming-only: total chunks dropped because the per-call
+    /// pump mpsc was full at `sink.send(...)` time. Indicates the
+    /// handler is producing chunks faster than the publish path
+    /// can drain — usually because the caller didn't enable flow
+    /// control via `CallOptions::stream_window_initial`. A non-
+    /// zero value means data loss.
+    pub streaming_chunks_dropped_total: AtomicU64,
 }
 
 impl ServiceMetricsAtomic {
@@ -112,6 +119,7 @@ impl ServiceMetricsAtomic {
             handler_duration_count: AtomicU64::new(0),
             handler_duration_buckets: Default::default(),
             streaming_chunks_emitted_total: AtomicU64::new(0),
+            streaming_chunks_dropped_total: AtomicU64::new(0),
         }
     }
 
@@ -285,6 +293,9 @@ impl RpcMetricsRegistry {
                 streaming_chunks_emitted_total: m
                     .streaming_chunks_emitted_total
                     .load(Ordering::Relaxed),
+                streaming_chunks_dropped_total: m
+                    .streaming_chunks_dropped_total
+                    .load(Ordering::Relaxed),
             });
         }
         services.sort_by(|a, b| a.service.cmp(&b.service));
@@ -367,6 +378,13 @@ pub struct ServiceMetrics {
     /// of this service via `RpcResponseSink::send`. Zero for
     /// services that only register unary handlers.
     pub streaming_chunks_emitted_total: u64,
+    /// Total streaming chunks DROPPED because the per-call pump
+    /// mpsc was full at `sink.send(...)` time. Non-zero implies
+    /// data loss — the handler is producing chunks faster than
+    /// the publish path can drain. Operators should either lower
+    /// the producer rate or have the caller enable per-call flow
+    /// control via `CallOptions::stream_window_initial`.
+    pub streaming_chunks_dropped_total: u64,
 }
 
 impl RpcMetricsSnapshot {
@@ -561,6 +579,20 @@ impl RpcMetricsSnapshot {
                 "nrpc_streaming_chunks_emitted_total{{service=\"{}\"}} {}",
                 escape_label(&s.service),
                 s.streaming_chunks_emitted_total
+            );
+        }
+
+        // streaming_chunks_dropped_total
+        out.push_str(
+            "# HELP nrpc_streaming_chunks_dropped_total Streaming chunks dropped because the per-call pump mpsc was full (handler outpaced the publish path).\n",
+        );
+        out.push_str("# TYPE nrpc_streaming_chunks_dropped_total counter\n");
+        for s in &self.services {
+            let _ = writeln!(
+                out,
+                "nrpc_streaming_chunks_dropped_total{{service=\"{}\"}} {}",
+                escape_label(&s.service),
+                s.streaming_chunks_dropped_total
             );
         }
 
