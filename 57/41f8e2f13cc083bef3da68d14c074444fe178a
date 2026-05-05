@@ -1,0 +1,33 @@
+net/crates/net/bindings/node/mesh_rpc.js
+  cfca4517ad394ef2 1-729
+net/crates/net/bindings/node/errors.js
+  cfca4517ad394ef2 1,4-5,16-17,23,41-116,130-132,136-161,165-170
+net/crates/net/bindings/node/errors.d.ts
+  cfca4517ad394ef2 25-97,100-103
+net/crates/net/bindings/node/mesh_rpc.d.ts
+  cfca4517ad394ef2 1-240
+net/crates/net/bindings/node/package.json
+  cfca4517ad394ef2 15-18,53-54
+net/crates/net/bindings/node/test/mesh_rpc.test.ts
+  cfca4517ad394ef2 1-438
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "5741f8e2f13cc083bef3da68d14c074444fe178a",
+  "prompts": {
+    "cfca4517ad394ef2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c8c8999-2a05-4bfc-a843-35946dde9df4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3614,
+      "total_deletions": 252,
+      "accepted_lines": 1705,
+      "overriden_lines": 0
+    }
+  }
+}
