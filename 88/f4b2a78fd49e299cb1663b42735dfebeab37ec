@@ -1,0 +1,29 @@
+net/crates/net/tests/integration_nrpc_mesh.rs
+  cfca4517ad394ef2 279-324
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  cfca4517ad394ef2 3080-3115
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  cfca4517ad394ef2 1361-1374,1380-1382
+net/crates/net/sdk/tests/mesh_rpc_hedge.rs
+  cfca4517ad394ef2 296-383
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "88f4b2a78fd49e299cb1663b42735dfebeab37ec",
+  "prompts": {
+    "cfca4517ad394ef2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c8c8999-2a05-4bfc-a843-35946dde9df4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 5076,
+      "total_deletions": 8,
+      "accepted_lines": 187,
+      "overriden_lines": 0
+    }
+  }
+}
