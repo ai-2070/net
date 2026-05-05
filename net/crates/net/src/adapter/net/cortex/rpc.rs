@@ -77,20 +77,19 @@ pub const DISPATCH_RPC_STREAM_GRANT: u8 = 0x14;
 // `RpcRequestPayload::flags` bit assignments.
 // ============================================================================
 
-/// Set if the request is safe to retry. Server may dedup against the
-/// `(origin_hash, call_id)` pair within its idempotency window;
-/// replay returns the cached response without re-running the handler.
-/// **Caller's contract**: a request marked `IDEMPOTENT` whose
-/// (origin_hash, call_id) reappears must produce a byte-equivalent
-/// response when re-folded. Application code is responsible for
-/// honoring this.
-pub const FLAG_RPC_IDEMPOTENT: u16 = 1 << 0;
+// Bit 0 (`1 << 0`) is RESERVED — was previously documented as
+// `FLAG_RPC_IDEMPOTENT`, but the server-side replay-cache (LRU of
+// `(origin_hash, call_id) -> RpcResponsePayload`) was never landed,
+// so the flag silently no-op'd despite a load-bearing contract in
+// its doc-string. Removed to avoid shipping a documented behavior
+// the runtime doesn't implement; reservation kept so a future
+// re-add (with the LRU) preserves wire compatibility.
 
 /// Set if the server may emit multiple `DISPATCH_RPC_RESPONSE` events
 /// for this call. Without it, the first response terminates the
 /// call. With it, each response except the terminal one carries
 /// `headers["nrpc-streaming"] = b"continue"`; the terminal response
-/// has either `b"end"` (success) or a non-`Ok` status. Phase 3.
+/// has either `b"end"` (success) or a non-`Ok` status.
 pub const FLAG_RPC_STREAMING_RESPONSE: u16 = 1 << 1;
 
 /// Set if the request carries W3C Trace Context headers
@@ -1961,6 +1960,19 @@ mod tests {
         assert_eq!(DISPATCH_RPC_DEADLINE_EXCEEDED, 0x13);
     }
 
+    /// Bit 0 of `RpcRequestPayload::flags` is reserved (was the
+    /// removed `FLAG_RPC_IDEMPOTENT`). Pin: live flag constants
+    /// must NOT collide with bit 0, so a future re-add can safely
+    /// reuse it without breaking existing senders.
+    #[test]
+    fn flag_bit_assignments_leave_idempotent_slot_reserved() {
+        // Bit 0 (1 << 0) is reserved; the live flags occupy higher bits.
+        assert_eq!(FLAG_RPC_STREAMING_RESPONSE, 1 << 1);
+        assert_eq!(FLAG_RPC_PROPAGATE_TRACE, 1 << 2);
+        assert_eq!(FLAG_RPC_STREAMING_RESPONSE & 1, 0);
+        assert_eq!(FLAG_RPC_PROPAGATE_TRACE & 1, 0);
+    }
+
     // --------------------------------------------------------------------
     // RpcRequestPayload codec.
     // --------------------------------------------------------------------
@@ -1984,7 +1996,7 @@ mod tests {
         let p = RpcRequestPayload {
             service: "echo.v1".to_string(),
             deadline_ns: 1_700_000_000_000_000_000,
-            flags: FLAG_RPC_IDEMPOTENT | FLAG_RPC_PROPAGATE_TRACE,
+            flags: FLAG_RPC_PROPAGATE_TRACE,
             headers: vec![
                 header("traceparent", b"00-aabb..."),
                 header("idempotency-key", &7u64.to_le_bytes()),
