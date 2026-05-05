@@ -937,17 +937,24 @@ impl MeshNode {
     fn select_target(&self, candidates: &[u64], policy: &RoutingPolicy) -> u64 {
         match policy {
             RoutingPolicy::RoundRobin => {
-                let idx = (self.rpc_next_call_id_arc().load(Ordering::Relaxed) as usize)
-                    % candidates.len();
-                candidates[idx]
+                // `fetch_add(1)` on a dedicated cursor — NOT a
+                // `load(call_id)` — so two concurrent
+                // `call_service` invocations always observe
+                // distinct values and pick distinct targets.
+                let n = self
+                    .rpc_round_robin_cursor_arc()
+                    .fetch_add(1, Ordering::Relaxed);
+                candidates[(n as usize) % candidates.len()]
             }
             RoutingPolicy::Random => {
-                // Lightweight RNG via the call-id counter mixed with
-                // process-fresh entropy; avoids pulling in `rand` for
-                // a tiny use case. Sufficient for load distribution;
+                // Lightweight RNG via a fresh fetch_add (same
+                // counter, separate per-call value) mixed through
+                // xxh3. Sufficient for load distribution;
                 // not cryptographically random.
-                let raw = self.rpc_next_call_id_arc().load(Ordering::Relaxed);
-                let mixed = xxhash_rust::xxh3::xxh3_64(&raw.to_le_bytes());
+                let n = self
+                    .rpc_round_robin_cursor_arc()
+                    .fetch_add(1, Ordering::Relaxed);
+                let mixed = xxhash_rust::xxh3::xxh3_64(&n.to_le_bytes());
                 candidates[(mixed as usize) % candidates.len()]
             }
             RoutingPolicy::Sticky { key } => {

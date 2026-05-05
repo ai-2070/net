@@ -1074,6 +1074,15 @@ pub struct MeshNode {
     /// events.
     #[cfg(feature = "cortex")]
     rpc_next_call_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Independent fetch_add counter used by `RoutingPolicy::
+    /// RoundRobin` and `Random` so two concurrent `call_service`
+    /// invocations don't observe the same value (which would have
+    /// happened if we consulted `rpc_next_call_id` via `load` —
+    /// since the actual call_id allocation happens later in
+    /// `call(...)`, two concurrent selections could read the same
+    /// pre-bump value and pick the same target).
+    #[cfg(feature = "cortex")]
+    rpc_round_robin_cursor: Arc<std::sync::atomic::AtomicU64>,
     /// Tracks `(target_node_id, service)` pairs we've already
     /// established a reply-channel subscription for. `Mesh::call`
     /// consults this to skip the round-trip subscribe on
@@ -1530,6 +1539,8 @@ impl MeshNode {
             rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
             #[cfg(feature = "cortex")]
             rpc_next_call_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            #[cfg(feature = "cortex")]
+            rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
             rpc_reply_subscriptions: Arc::new(parking_lot::Mutex::new(Vec::new())),
             #[cfg(feature = "cortex")]
@@ -4097,6 +4108,15 @@ impl MeshNode {
     #[cfg(feature = "cortex")]
     pub(super) fn rpc_next_call_id_arc(&self) -> Arc<std::sync::atomic::AtomicU64> {
         self.rpc_next_call_id.clone()
+    }
+
+    /// Independent rotation counter for `RoutingPolicy::RoundRobin`
+    /// / `Random`. See the field's doc-comment on `MeshNode` for
+    /// the rationale (avoid concurrent `select_target` calls
+    /// observing the same value).
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_round_robin_cursor_arc(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.rpc_round_robin_cursor.clone()
     }
 
     /// Tracks already-established (target, service) reply
