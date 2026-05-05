@@ -155,6 +155,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"runtime/cgo"
 	"strings"
@@ -384,10 +385,43 @@ func ABIVersion() uint32 { return uint32(C.net_rpc_abi_version()) }
 
 // ExpectedABIVersion is the C-ABI version this Go wrapper is
 // known to be source-compatible with. Bumped in lockstep with
-// `NET_RPC_ABI_VERSION` on the Rust side. A consumer's `init()`
-// SHOULD assert `ABIVersion() == ExpectedABIVersion` and refuse
-// to start otherwise.
+// `NET_RPC_ABI_VERSION` on the Rust side.
 const ExpectedABIVersion uint32 = 0x0001
+
+// errABIMismatch is the typed error returned by CheckABI on a
+// version mismatch. Use `errors.Is(err, ErrABIMismatch)` to
+// branch.
+var ErrABIMismatch = errors.New("net.RPC: linked libnet_rpc ABI version differs from this Go wrapper's expected version")
+
+// CheckABI compares the linked cdylib's exported ABI version
+// against ExpectedABIVersion and returns ErrABIMismatch (with
+// detail) on drift. Idempotent; cheap.
+func CheckABI() error {
+	got := ABIVersion()
+	if got == ExpectedABIVersion {
+		return nil
+	}
+	return fmt.Errorf("%w: linked = 0x%04x, expected = 0x%04x", ErrABIMismatch, got, ExpectedABIVersion)
+}
+
+// init asserts the linked cdylib's ABI version matches the Go
+// wrapper's compile-time expectation. Emitting a panic on drift
+// is the correct behavior — a wrapper compiled against version A
+// linked at runtime against version B has undefined memory layout
+// for the opaque handles, and any subsequent FFI call is UB.
+//
+// Override the panic via the env var
+// `NET_RPC_SKIP_ABI_CHECK=1` only when you're knowingly running
+// against an in-development cdylib (e.g. CI bisect, local SDK
+// debugging). Production code should never set it.
+func init() {
+	if os.Getenv("NET_RPC_SKIP_ABI_CHECK") == "1" {
+		return
+	}
+	if err := CheckABI(); err != nil {
+		panic(err)
+	}
+}
 
 // =====================================================================
 // Calls
