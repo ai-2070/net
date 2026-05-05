@@ -273,6 +273,76 @@ async fn rpc_deadline_surfaces_as_timeout_and_emits_cancel() {
     }
 }
 
+/// Caller drops the unary `call` future before it resolves
+/// (e.g. via `tokio::select!` losing) → the call's RAII
+/// `UnaryCallGuard` fires CANCEL → the server-side handler
+/// observes its `ctx.cancellation` token. Pins the cancel-on-
+/// drop semantics that `hedge` and other "race + take winner"
+/// callers depend on.
+#[tokio::test]
+async fn rpc_dropped_call_future_fires_cancel_to_server() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct CancelObservingSlow {
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl RpcHandler for CancelObservingSlow {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            tokio::select! {
+                _ = ctx.cancellation.cancelled() => {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                    Err(RpcHandlerError::Internal("cancelled by caller".into()))
+                }
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    Ok(RpcResponsePayload {
+                        status: RpcStatus::Ok,
+                        headers: vec![],
+                        body: vec![],
+                    })
+                }
+            }
+        }
+    }
+    let _serve = server
+        .serve_rpc(
+            "slow_observe",
+            Arc::new(CancelObservingSlow {
+                cancelled: cancelled.clone(),
+            }),
+        )
+        .expect("serve_rpc");
+
+    // Issue the call inside a `select!` that races against a
+    // short timer; the timer wins, the call future is dropped,
+    // and the guard's Drop fires CANCEL to the server.
+    let server_id = server.node_id();
+    let caller_clone = caller.clone();
+    tokio::select! {
+        _ = caller_clone.call(
+            server_id,
+            "slow_observe",
+            Bytes::from_static(b"go"),
+            CallOptions::default(),
+        ) => panic!("call should not complete in this window"),
+        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+    }
+
+    // Wait for the CANCEL to traverse the network and the
+    // handler's `select!` arm to fire. Generous because RTTs vary.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !cancelled.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "server handler must observe ctx.cancellation after caller drops the call future",
+    );
+}
+
 /// Caller sets `CallOptions::trace_context` → server's
 /// `RpcContext::trace_context` is populated with the same values.
 /// Pin the W3C-trace-context propagation end-to-end through real

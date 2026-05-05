@@ -182,6 +182,110 @@ async fn hedge_zero_degrades_to_single_call() {
     assert_eq!(reply.body.as_ref(), b"hello-no-hedge");
 }
 
+/// Hedge winner returns first → loser's future is dropped on the
+/// caller side → loser's `UnaryCallGuard::Drop` fires CANCEL →
+/// the slow primary's handler observes `ctx.cancellation`. Pins
+/// the close of the documented "hedge cancellation gap" — losers
+/// must actually free server-side resources, not just be silently
+/// abandoned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hedge_loser_handler_observes_cancellation() {
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use net_sdk::mesh_rpc::{
+        RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    };
+
+    /// Slow handler that explicitly observes cancellation.
+    struct ObserveCancelHandler {
+        cancelled: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl RpcHandler for ObserveCancelHandler {
+        async fn call(
+            &self,
+            _ctx: RpcContext,
+        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            tokio::select! {
+                _ = _ctx.cancellation.cancelled() => {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                    Err(RpcHandlerError::Internal("cancelled by hedge".into()))
+                }
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    Ok(RpcResponsePayload {
+                        status: RpcStatus::Ok,
+                        headers: vec![],
+                        body: b"slow-finished".to_vec(),
+                    })
+                }
+            }
+        }
+    }
+    struct InstantHandler;
+    #[async_trait]
+    impl RpcHandler for InstantHandler {
+        async fn call(
+            &self,
+            _ctx: RpcContext,
+        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: b"fast".to_vec(),
+            })
+        }
+    }
+
+    let psk = [0x42u8; 32];
+    let caller = build_mesh(&psk).await;
+    let primary = build_mesh(&psk).await;
+    let backup = build_mesh(&psk).await;
+    handshake(&caller, &primary).await;
+    handshake(&caller, &backup).await;
+
+    let observed = Arc::new(AtomicBool::new(false));
+    let _serve_primary = primary
+        .serve_rpc(
+            "lookup",
+            Arc::new(ObserveCancelHandler {
+                cancelled: observed.clone(),
+            }),
+        )
+        .expect("serve_rpc primary");
+    let _serve_backup = backup
+        .serve_rpc("lookup", Arc::new(InstantHandler))
+        .expect("serve_rpc backup");
+
+    let policy = HedgePolicy {
+        delay: Duration::from_millis(50),
+        hedges: 1,
+    };
+
+    let reply = caller
+        .call_with_hedge_to(
+            &[primary.inner().node_id(), backup.inner().node_id()],
+            "lookup",
+            bytes::Bytes::from_static(b""),
+            CallOptions::default(),
+            &policy,
+        )
+        .await
+        .expect("hedge must succeed");
+    assert_eq!(reply.body.as_ref(), b"fast", "backup must win");
+
+    // Wait for the CANCEL to traverse and the primary's handler
+    // to observe it. Generous because handshake-level RTTs vary
+    // and the spawn-then-publish path adds a tokio scheduling hop.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !observed.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "primary's handler must observe ctx.cancellation after hedge winner returns",
+    );
+}
+
 /// Empty targets → immediate `RpcError::NoRoute`. Pin: no panic,
 /// no hang, error surfaces with a diagnostic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

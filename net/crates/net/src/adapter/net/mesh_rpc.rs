@@ -291,28 +291,86 @@ impl Drop for RpcStream {
         // Also clear our pending entry so any in-flight chunks
         // are dropped on arrival.
         self.mesh.rpc_client_pending_arc().cancel(self.call_id);
-        let mesh = Arc::clone(&self.mesh);
-        let request_channel = self.request_channel.clone();
-        let self_origin = self.self_origin;
-        let call_id = self.call_id;
-        let target = self.target_node_id;
-        tokio::spawn(async move {
-            let meta = EventMeta::new(DISPATCH_RPC_CANCEL, 0, self_origin, call_id, 0);
-            let request_channel_id = ChannelId::new(request_channel);
-            let request_channel_hash = request_channel_id.hash();
-            let stream_id = MeshNode::publish_stream_id(&request_channel_id);
-            let payload = Bytes::from(meta.to_bytes().to_vec());
-            let _ = mesh
-                .publish_to_peer(
-                    target,
-                    request_channel_hash,
-                    stream_id,
-                    /* reliable */ true,
-                    std::slice::from_ref(&payload),
-                )
-                .await;
-        });
+        spawn_cancel_publish(
+            Arc::clone(&self.mesh),
+            self.target_node_id,
+            self.request_channel.clone(),
+            self.self_origin,
+            self.call_id,
+        );
     }
+}
+
+// ============================================================================
+// Unary call: CANCEL-on-drop guard.
+// ============================================================================
+
+/// RAII guard that fires CANCEL to the server if the unary call
+/// future is dropped before a response arrives. Without this, a
+/// `select!`-loser future (e.g. hedge runner-up) would leave the
+/// server-side handler running to completion — wasting CPU on a
+/// reply nobody will read.
+///
+/// The guard is built *after* the REQUEST has been successfully
+/// published — if the publish fails, no guard is constructed and
+/// no CANCEL is sent. On the success path the call function flips
+/// `completed = true` so Drop becomes a no-op (the server already
+/// finished and removed its in-flight entry).
+struct UnaryCallGuard {
+    pending: Arc<super::cortex::RpcClientPending>,
+    mesh: Arc<MeshNode>,
+    target_node_id: u64,
+    request_channel: ChannelName,
+    self_origin: u64,
+    call_id: u64,
+    /// True after the call resolved Ok or got a definitive
+    /// non-cancellable Err. Drop checks this — `false` fires
+    /// CANCEL, `true` is a no-op (still removes the pending
+    /// entry).
+    completed: bool,
+}
+
+impl Drop for UnaryCallGuard {
+    fn drop(&mut self) {
+        self.pending.cancel(self.call_id);
+        if !self.completed {
+            spawn_cancel_publish(
+                Arc::clone(&self.mesh),
+                self.target_node_id,
+                self.request_channel.clone(),
+                self.self_origin,
+                self.call_id,
+            );
+        }
+    }
+}
+
+/// Shared CANCEL-publish helper: spawn a task that fires a
+/// CANCEL event for `call_id` to `target` on the request channel.
+/// Both [`RpcStream::Drop`] and [`UnaryCallGuard::Drop`] use it.
+fn spawn_cancel_publish(
+    mesh: Arc<MeshNode>,
+    target: u64,
+    request_channel: ChannelName,
+    self_origin: u64,
+    call_id: u64,
+) {
+    tokio::spawn(async move {
+        let meta = EventMeta::new(DISPATCH_RPC_CANCEL, 0, self_origin, call_id, 0);
+        let request_channel_id = ChannelId::new(request_channel);
+        let request_channel_hash = request_channel_id.hash();
+        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
+        let payload = Bytes::from(meta.to_bytes().to_vec());
+        let _ = mesh
+            .publish_to_peer(
+                target,
+                request_channel_hash,
+                stream_id,
+                /* reliable */ true,
+                std::slice::from_ref(&payload),
+            )
+            .await;
+    });
 }
 
 
@@ -893,8 +951,26 @@ impl MeshNode {
             return Err(RpcError::Transport(e));
         }
 
-        // Race the receiver against the deadline. On timeout or
-        // drop, send a CANCEL so the server can drop the handler.
+        // From here on, the REQUEST is in flight on the server.
+        // Wrap the rest of the call in an RAII guard whose Drop
+        // fires CANCEL if `guard.completed` isn't set — covering:
+        //  - the call future being dropped mid-flight (e.g. hedge
+        //    loser, select!-cancelled future, caller awaiting a
+        //    `JoinHandle` that gets cancelled).
+        //  - the timeout path (we leave `completed=false` so Drop
+        //    handles CANCEL emission; no need for a separate
+        //    `send_rpc_cancel` call).
+        let mut guard = UnaryCallGuard {
+            pending: Arc::clone(&pending),
+            mesh: Arc::clone(self),
+            target_node_id,
+            request_channel: request_channel.clone(),
+            self_origin,
+            call_id,
+            completed: false,
+        };
+
+        // Race the receiver against the deadline.
         let outcome: Result<Result<RpcResponsePayload, _>, tokio::time::error::Elapsed> =
             match opts.deadline {
                 None => Ok(rx.await),
@@ -905,19 +981,23 @@ impl MeshNode {
             };
 
         let resp = match outcome {
-            Ok(Ok(resp)) => resp,
+            Ok(Ok(resp)) => {
+                guard.completed = true;
+                resp
+            }
             Ok(Err(_recv_err)) => {
-                pending.cancel(call_id);
+                // Sender dropped externally — pending entry is
+                // already gone (someone else removed it). Mark
+                // completed so Drop doesn't fire a useless CANCEL
+                // for a server that's no longer tracking this id.
+                guard.completed = true;
                 return Err(RpcError::Transport(AdapterError::Connection(
                     "rpc client pending sender dropped (no response will arrive)".into(),
                 )));
             }
             Err(_elapsed) => {
-                // Timeout: emit CANCEL so the server can drop the
-                // handler, clear the pending entry, surface to caller.
-                pending.cancel(call_id);
-                self.send_rpc_cancel(target_node_id, &request_channel, self_origin, call_id)
-                    .await;
+                // Timeout: leave `completed=false` so Drop emits
+                // CANCEL automatically; surface Timeout to caller.
                 return Err(RpcError::Timeout {
                     elapsed_ms: started.elapsed().as_millis() as u64,
                 });
@@ -1018,39 +1098,6 @@ impl MeshNode {
         Ok(())
     }
 
-    /// Best-effort: direct-send a CANCEL event for `call_id` to
-    /// the server. Used by the call-side timeout / drop path.
-    /// Failure is logged but not surfaced — the server's in-flight
-    /// entry will be reaped by either the per-call handler's own
-    /// cancellation observation (deadline-passed short-circuit) or
-    /// the handler running to completion with the response getting
-    /// dropped on the caller side (pending entry already removed).
-    async fn send_rpc_cancel(
-        self: &Arc<Self>,
-        target_node_id: u64,
-        request_channel: &ChannelName,
-        self_origin: u64,
-        call_id: u64,
-    ) {
-        let meta = EventMeta::new(DISPATCH_RPC_CANCEL, 0, self_origin, call_id, 0);
-        let request_channel_id = ChannelId::new(request_channel.clone());
-        let request_channel_hash = request_channel_id.hash();
-        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
-        let payload = Bytes::from(meta.to_bytes().to_vec());
-        if let Err(e) = self
-            .publish_to_peer(
-                target_node_id,
-                request_channel_hash,
-                stream_id,
-                /* reliable */ true,
-                std::slice::from_ref(&payload),
-            )
-            .await
-        {
-            tracing::debug!(error = %e, call_id,
-                "rpc call: best-effort CANCEL send failed");
-        }
-    }
 }
 
 // ============================================================================
