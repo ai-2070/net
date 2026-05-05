@@ -3988,13 +3988,15 @@ impl MeshNode {
     /// accepted the subscribe; `AckReason` failures surface as
     /// `AdapterError::Connection`. No token is presented — use
     /// [`Self::subscribe_channel_with_token`] for channels with
-    /// `require_token` set.
+    /// `require_token` set. Mode defaults to `Broadcast` (every published
+    /// event delivered to this subscriber); use
+    /// [`Self::subscribe_channel_in_queue_group`] for work-distribution.
     pub async fn subscribe_channel(
         &self,
         publisher_node_id: u64,
         channel: ChannelName,
     ) -> Result<(), AdapterError> {
-        self.send_membership_request(publisher_node_id, channel, true, None)
+        self.send_membership_request(publisher_node_id, channel, true, None, None)
             .await
     }
 
@@ -4008,18 +4010,69 @@ impl MeshNode {
         channel: ChannelName,
         token: PermissionToken,
     ) -> Result<(), AdapterError> {
-        self.send_membership_request(publisher_node_id, channel, true, Some(token.to_bytes()))
-            .await
+        self.send_membership_request(
+            publisher_node_id,
+            channel,
+            true,
+            Some(token.to_bytes()),
+            None,
+        )
+        .await
+    }
+
+    /// Subscribe in the named queue group: every published event is
+    /// delivered to exactly ONE member of the group, distributed
+    /// round-robin across members. The publisher's roster carries
+    /// the mode; the same `(channel, queue_group)` pair across
+    /// multiple subscribers forms one work-distribution pool. Used
+    /// by request/response patterns (nRPC) and any one-of-N
+    /// job-distribution shape.
+    pub async fn subscribe_channel_in_queue_group(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+        queue_group: String,
+    ) -> Result<(), AdapterError> {
+        self.send_membership_request(
+            publisher_node_id,
+            channel,
+            true,
+            None,
+            Some(queue_group),
+        )
+        .await
+    }
+
+    /// Queue-group subscribe with a pre-issued
+    /// [`PermissionToken`]. Same auth flow as
+    /// [`Self::subscribe_channel_with_token`], queue-group
+    /// semantics from [`Self::subscribe_channel_in_queue_group`].
+    pub async fn subscribe_channel_in_queue_group_with_token(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+        queue_group: String,
+        token: PermissionToken,
+    ) -> Result<(), AdapterError> {
+        self.send_membership_request(
+            publisher_node_id,
+            channel,
+            true,
+            Some(token.to_bytes()),
+            Some(queue_group),
+        )
+        .await
     }
 
     /// Ask `publisher_node_id` to remove this node from `channel`'s
-    /// subscriber set. Mirror of `subscribe_channel`.
+    /// subscriber set. Mirror of `subscribe_channel`. Mode-agnostic
+    /// — unsubscribe finds the peer in whichever mode they're in.
     pub async fn unsubscribe_channel(
         &self,
         publisher_node_id: u64,
         channel: ChannelName,
     ) -> Result<(), AdapterError> {
-        self.send_membership_request(publisher_node_id, channel, false, None)
+        self.send_membership_request(publisher_node_id, channel, false, None, None)
             .await
     }
 
@@ -4029,6 +4082,7 @@ impl MeshNode {
         channel: ChannelName,
         subscribe: bool,
         token: Option<Vec<u8>>,
+        queue_group: Option<String>,
     ) -> Result<(), AdapterError> {
         let peer_addr = {
             let peer = self.peers.get(&publisher_node_id).ok_or_else(|| {
@@ -4050,6 +4104,7 @@ impl MeshNode {
                 channel: channel.clone(),
                 nonce,
                 token,
+                queue_group,
             }
         } else {
             MembershipMsg::Unsubscribe {
@@ -4114,6 +4169,7 @@ impl MeshNode {
                 channel,
                 nonce,
                 token,
+                queue_group,
             } => {
                 let (accepted, reason) =
                     Self::authorize_subscribe(&channel, from_node, token.as_deref(), ctx);
@@ -4121,12 +4177,24 @@ impl MeshNode {
                     // Populate the AuthGuard fast path so publish
                     // fan-out can admit this subscriber in <10 ns
                     // without re-walking the ACL. Mirrors the
-                    // `roster.add` below — both are keyed on the
-                    // channel name so they stay consistent.
+                    // `roster.add_with_mode` below — both are
+                    // keyed on the channel name so they stay
+                    // consistent. Auth is mode-agnostic: a
+                    // subscriber's queue-group choice doesn't
+                    // change which capability tokens authorize the
+                    // channel.
                     ctx.auth_guard
                         .allow_channel(subscriber_origin_hash(from_node), &channel);
                     let id = ChannelId::new(channel);
-                    ctx.roster.add(id, from_node);
+                    let mode = match queue_group {
+                        None => crate::adapter::net::channel::SubscriptionMode::Broadcast,
+                        Some(name) => {
+                            crate::adapter::net::channel::SubscriptionMode::QueueGroup(
+                                crate::adapter::net::channel::QueueGroupName::new(name),
+                            )
+                        }
+                    };
+                    ctx.roster.add_with_mode(id, from_node, mode);
                     Self::clear_auth_failures(from_node, ctx);
                 } else if !matches!(
                     reason,
@@ -5161,7 +5229,23 @@ impl MeshNode {
         // Snapshot subscribers at call time; late subscribers won't see
         // this publish, early-unsubscribes may still receive it — both
         // are documented non-goals.
-        let mut subscribers = self.roster.members(publisher.channel());
+        //
+        // `dispatch_recipients` is the per-publish view: every
+        // `Broadcast` subscriber plus one selected member of each
+        // queue group on this channel. The `members()` API still
+        // exists for set-membership queries; this path wants the
+        // dispatch view because that's what enforces the
+        // one-of-N delivery semantic for queue-group subscribers.
+        //
+        // Sharp edge: if a queue-group member is selected here and
+        // then denied by the auth-guard / visibility filters
+        // below, the publish is dropped for that group on this
+        // call (no per-publish retry against a different group
+        // member). In practice queue-group members share a
+        // capability posture (same operator, same tokens), so the
+        // failure case is rare; documented in
+        // `docs/misc/NRPC_DESIGN.md` open-questions.
+        let mut subscribers = self.roster.dispatch_recipients(publisher.channel());
 
         // Subnet visibility filter. Look up the channel's
         // configured visibility; if the channel has no registry

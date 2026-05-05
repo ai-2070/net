@@ -50,6 +50,18 @@ pub enum MembershipMsg {
         /// when the sender has no token to offer — the publisher's
         /// `authorize_subscribe` decides whether a token is required.
         token: Option<Vec<u8>>,
+        /// Subscription mode. `None` → `Broadcast` (every published
+        /// event delivered to this subscriber, the historic
+        /// pub/sub semantic). `Some(name)` → `QueueGroup(name)`
+        /// (work-distribution: every published event delivered to
+        /// exactly ONE subscriber in the named group). The
+        /// publisher's `authorize_subscribe` is mode-agnostic — the
+        /// capability tokens that gate the channel apply equally.
+        ///
+        /// Wire-compat: encoded as a `u8` length prefix + UTF-8
+        /// bytes after the token. Length `0` (or absent trailing
+        /// bytes — pre-queue-group senders) means `Broadcast`.
+        queue_group: Option<String>,
     },
     /// Ask the publisher to remove this node from `channel`'s subscriber set.
     Unsubscribe {
@@ -93,6 +105,12 @@ pub enum MembershipCodecError {
 /// Matches `name::MAX_NAME_LEN`; duplicated here to keep the wire check local.
 const MAX_CHANNEL_NAME_LEN: usize = 255;
 
+/// Maximum queue-group name length, in bytes. Bounded by the u8
+/// length prefix in the wire format. Long names work but bloat
+/// every Subscribe; recommend keeping group names short and
+/// human-readable.
+const MAX_QUEUE_GROUP_NAME_LEN: usize = 255;
+
 /// Encode a membership message to bytes.
 pub fn encode(msg: &MembershipMsg) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
@@ -101,6 +119,7 @@ pub fn encode(msg: &MembershipMsg) -> Vec<u8> {
             channel,
             nonce,
             token,
+            queue_group,
         } => {
             buf.put_u8(MSG_SUBSCRIBE);
             buf.put_u64_le(*nonce);
@@ -114,6 +133,14 @@ pub fn encode(msg: &MembershipMsg) -> Vec<u8> {
             let token_bytes: &[u8] = token.as_deref().unwrap_or(&[]);
             buf.put_u16_le(token_bytes.len() as u16);
             buf.extend_from_slice(token_bytes);
+            // Queue-group payload: u8 length + UTF-8 bytes. Zero
+            // length means `Broadcast`. Pre-queue-group senders that
+            // stop after the token are decoded as Broadcast (zero
+            // remaining → None) for forward compat. Names are bound
+            // by `MAX_QUEUE_GROUP_NAME_LEN` to keep the prefix u8.
+            let qg_bytes: &[u8] = queue_group.as_deref().map(|s| s.as_bytes()).unwrap_or(&[]);
+            buf.put_u8(qg_bytes.len() as u8);
+            buf.extend_from_slice(qg_bytes);
         }
         MembershipMsg::Unsubscribe { channel, nonce } => {
             buf.put_u8(MSG_UNSUBSCRIBE);
@@ -212,19 +239,53 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                         }
                     }
                 };
-                // Enforce strict-trailer rejection after
-                // the token (now that cur is correctly past it).
-                // Pre-fix, SUBSCRIBE accepted arbitrary garbage
-                // after a valid token.
+                // Queue-group: u8 length + UTF-8 bytes. Forward-
+                // compat with pre-queue-group senders: zero
+                // remaining bytes after the token decodes as
+                // `Broadcast` (queue_group = None). A non-zero
+                // length but a malformed (non-UTF-8) name surfaces
+                // as a decode error rather than a silent acceptance.
+                let queue_group = match cur.remaining() {
+                    0 => None,
+                    _ => {
+                        let qg_len = cur.get_u8() as usize;
+                        if qg_len == 0 {
+                            None
+                        } else if qg_len > MAX_QUEUE_GROUP_NAME_LEN {
+                            return Err(MembershipCodecError::NameTooLong(
+                                qg_len,
+                                MAX_QUEUE_GROUP_NAME_LEN,
+                            ));
+                        } else if cur.remaining() < qg_len {
+                            return Err(MembershipCodecError::Overflow(qg_len, cur.remaining()));
+                        } else {
+                            let qstart = cur.position() as usize;
+                            let qend = qstart + qg_len;
+                            cur.set_position(qend as u64);
+                            let s = std::str::from_utf8(&data[qstart..qend]).map_err(|_| {
+                                MembershipCodecError::Truncated(
+                                    "non-utf8 subscribe queue-group name",
+                                )
+                            })?;
+                            Some(s.to_string())
+                        }
+                    }
+                };
+                // Strict-trailer rejection after the queue-group
+                // bytes (the new outermost optional field). Pre-
+                // queue-group, this guarded against arbitrary
+                // garbage after the token; the guard moves outward
+                // by one field.
                 if cur.remaining() != 0 {
                     return Err(MembershipCodecError::Truncated(
-                        "trailing bytes after subscribe token",
+                        "trailing bytes after subscribe queue-group",
                     ));
                 }
                 Ok(MembershipMsg::Subscribe {
                     channel,
                     nonce,
                     token,
+                    queue_group,
                 })
             } else {
                 // Advance cur past the channel name we read by
@@ -298,6 +359,7 @@ mod tests {
             channel: ch("sensors/lidar"),
             nonce: 0xDEAD_BEEF_CAFE_F00D,
             token: None,
+            queue_group: None,
         };
         let bytes = encode(&msg);
         let decoded = decode(&bytes).unwrap();
@@ -313,6 +375,7 @@ mod tests {
             channel: ch("sensors/lidar"),
             nonce: 0xCAFE,
             token: Some(token_bytes),
+            queue_group: None,
         };
         let bytes = encode(&msg);
         let decoded = decode(&bytes).unwrap();
@@ -337,6 +400,7 @@ mod tests {
                 channel: ch("lab/x"),
                 nonce: 42,
                 token: None,
+                queue_group: None,
             }
         );
     }
@@ -534,14 +598,153 @@ mod tests {
             channel: ch("sensors/lidar"),
             nonce: 0xCAFE,
             token: Some(vec![0xAB; 32]),
+            queue_group: None,
         };
         let mut bytes = encode(&msg);
+        // Append two arbitrary bytes that aren't a valid
+        // queue_group prefix-length+payload (the first is read as
+        // qg_len=0xDE which then demands 0xDE bytes that aren't
+        // there).
         bytes.extend_from_slice(&[0xDE, 0xAD]);
         let err = decode(&bytes).unwrap_err();
+        // After the queue-group field landed on the wire, trailing
+        // bytes after a valid token are interpreted as the start
+        // of the queue-group field. The first byte (`0xDE`) is
+        // read as `qg_len = 222`; the second byte is then short of
+        // the demanded payload, so the decoder errors with
+        // `Overflow`. Pre-queue-group, the same bytes were
+        // rejected as `Truncated("trailing bytes after subscribe
+        // token")`. Either error proves the load-bearing property:
+        // arbitrary garbage past a valid Subscribe is NOT silently
+        // accepted.
         assert!(
-            matches!(err, MembershipCodecError::Truncated(s) if s.contains("subscribe")),
-            "expected trailing-after-subscribe error, got {:?}",
+            matches!(
+                err,
+                MembershipCodecError::Truncated(_) | MembershipCodecError::Overflow(_, _)
+            ),
+            "expected trailing-after-subscribe rejection (Truncated or Overflow), got {:?}",
             err
+        );
+    }
+
+    // ====================================================================
+    // SUBSCRIBE queue-group field — wire-format extension.
+    //
+    // The codec's forward-compat property: pre-queue-group senders
+    // (no trailing bytes after the token) decode as Broadcast
+    // (queue_group = None). New senders that include the field
+    // round-trip cleanly.
+    // ====================================================================
+
+    /// SUBSCRIBE with a queue group set round-trips through
+    /// encode/decode unchanged.
+    #[test]
+    fn subscribe_queue_group_roundtrip() {
+        let msg = MembershipMsg::Subscribe {
+            channel: ch("svc/req"),
+            nonce: 7,
+            token: None,
+            queue_group: Some("workers".to_string()),
+        };
+        let bytes = encode(&msg);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    /// SUBSCRIBE with both a token AND a queue group round-trips.
+    /// Pin the field ordering (token then queue group) so a
+    /// future re-ordering tickles the test.
+    #[test]
+    fn subscribe_token_and_queue_group_roundtrip() {
+        let msg = MembershipMsg::Subscribe {
+            channel: ch("svc/req"),
+            nonce: 11,
+            token: Some(vec![0xAB; 80]),
+            queue_group: Some("workers-pool-a".to_string()),
+        };
+        let bytes = encode(&msg);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    /// SUBSCRIBE with `queue_group: None` is byte-equivalent to a
+    /// pre-queue-group SUBSCRIBE that stops right after the token.
+    /// Both encode to (token+0x00) trailing the channel name; the
+    /// decoder treats `qg_len = 0` and "no remaining bytes" as
+    /// the same Broadcast-default outcome.
+    #[test]
+    fn subscribe_pre_queue_group_payload_decodes_as_broadcast() {
+        // Forge a wire payload that stops after the token (no qg
+        // byte) — this is what a pre-queue-group sender produces.
+        use bytes::BufMut;
+        let mut buf = Vec::new();
+        buf.put_u8(MSG_SUBSCRIBE);
+        buf.put_u64_le(99);
+        let name = b"sensors/lidar";
+        buf.put_u8(name.len() as u8);
+        buf.extend_from_slice(name);
+        // Token of length 0.
+        buf.put_u16_le(0);
+        // No qg byte at all — matches a pre-queue-group sender.
+        let decoded = decode(&buf).unwrap();
+        assert_eq!(
+            decoded,
+            MembershipMsg::Subscribe {
+                channel: ch("sensors/lidar"),
+                nonce: 99,
+                token: None,
+                queue_group: None,
+            },
+            "pre-queue-group payload (no trailing bytes after token) \
+             must decode as Broadcast",
+        );
+    }
+
+    /// A queue-group name that exceeds `MAX_QUEUE_GROUP_NAME_LEN`
+    /// in the wire-format invariant `qg_len <= u8::MAX` is
+    /// structurally impossible (the prefix can't encode a longer
+    /// length). But a malformed sender that writes
+    /// `qg_len > remaining` must surface as `Overflow`. Pin so a
+    /// future change can't silently accept short reads.
+    #[test]
+    fn subscribe_queue_group_overflow_is_rejected() {
+        use bytes::BufMut;
+        let mut buf = Vec::new();
+        buf.put_u8(MSG_SUBSCRIBE);
+        buf.put_u64_le(1);
+        let name = b"svc/req";
+        buf.put_u8(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf.put_u16_le(0); // no token
+        // Claim a 200-byte queue-group name but only provide 5.
+        buf.put_u8(200);
+        buf.extend_from_slice(b"short");
+        let err = decode(&buf).unwrap_err();
+        assert!(
+            matches!(err, MembershipCodecError::Overflow(claimed, remaining) if claimed == 200 && remaining == 5),
+            "expected Overflow(200, 5), got {:?}",
+            err,
+        );
+    }
+
+    /// Non-UTF-8 bytes in the queue-group payload are rejected.
+    #[test]
+    fn subscribe_queue_group_non_utf8_is_rejected() {
+        use bytes::BufMut;
+        let mut buf = Vec::new();
+        buf.put_u8(MSG_SUBSCRIBE);
+        buf.put_u64_le(1);
+        let name = b"svc/req";
+        buf.put_u8(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf.put_u16_le(0);
+        buf.put_u8(2);
+        buf.extend_from_slice(&[0xFF, 0xFE]); // not valid UTF-8 in this position
+        let err = decode(&buf).unwrap_err();
+        assert!(
+            matches!(err, MembershipCodecError::Truncated(s) if s.contains("non-utf8")),
+            "expected non-utf8 rejection, got {:?}",
+            err,
         );
     }
 }
