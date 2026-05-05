@@ -16,8 +16,14 @@
 //! on top.
 
 use bytes::{Buf, BufMut};
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::Notify;
 
-use super::meta::EVENT_META_SIZE;
+use super::super::redex::{RedexError, RedexEvent, RedexFold};
+use super::meta::{EventMeta, EVENT_META_SIZE};
 
 // ============================================================================
 // `EventMeta::dispatch` byte assignments for nRPC.
@@ -502,6 +508,354 @@ pub fn response_wire_size(payload: &RpcResponsePayload) -> usize {
     EVENT_META_SIZE + payload.encode().len()
 }
 
+// ============================================================================
+// Server-side fold.
+//
+// `RpcServerFold` is the `RedexFold` half of the server. It sees
+// REQUEST events on the channel the cortex adapter is opened against,
+// spawns the user handler in a tokio task, and emits the RESPONSE
+// via a callback the `Mesh::serve_rpc` glue layer wires up. The
+// fold itself is small and pure — all I/O happens in the spawned
+// task and the emitter callback.
+//
+// Cancellation: each in-flight call gets an `RpcCancellationToken`
+// that the handler can `select!` on. CANCEL events flip the
+// matching token; the handler observes `cancellation.cancelled()`
+// firing and aborts cooperatively.
+// ============================================================================
+
+/// Cancellation signal for an in-flight RPC handler.
+///
+/// Created when the fold dispatches a REQUEST; cloned into the
+/// handler's `RpcContext` and held in the fold's in-flight map. A
+/// matching CANCEL event flips the token; handlers observe via
+/// either [`Self::is_cancelled`] (synchronous probe) or
+/// [`Self::cancelled`] (await for the signal).
+#[derive(Clone, Default)]
+pub struct RpcCancellationToken {
+    inner: Arc<RpcCancellationInner>,
+}
+
+#[derive(Default)]
+struct RpcCancellationInner {
+    fired: AtomicBool,
+    notify: Notify,
+}
+
+impl RpcCancellationToken {
+    /// Construct a fresh, un-fired token.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Flip the token. Idempotent — repeated calls are no-ops.
+    /// Wakes any task currently in [`Self::cancelled`].
+    pub fn cancel(&self) {
+        // Release pairs with the Acquire load in `is_cancelled`
+        // so a handler that observes `is_cancelled() == true` is
+        // guaranteed to see every prior write the canceller did.
+        self.inner.fired.store(true, Ordering::Release);
+        self.inner.notify.notify_waiters();
+    }
+
+    /// Synchronous probe. `true` once `cancel()` has been called.
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.fired.load(Ordering::Acquire)
+    }
+
+    /// Await the cancellation. Returns immediately if already
+    /// cancelled. Otherwise registers as a waiter and returns when
+    /// `cancel()` is called.
+    ///
+    /// Race-safe: registering the `notified()` future BEFORE the
+    /// `is_cancelled` check means a `cancel()` racing this method
+    /// either (a) is observed by the post-register check and we
+    /// return immediately, OR (b) lands after we register and wakes
+    /// our future. Either way we don't sleep past a cancellation.
+    pub async fn cancelled(&self) {
+        let notified = self.inner.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Context handed to a `RpcHandler::call`. Carries everything the
+/// handler needs to fulfill the request: the AEAD-verified caller
+/// identity, the request payload, and a cancellation token.
+pub struct RpcContext {
+    /// AEAD-verified caller `origin_hash`. The bus sets this from
+    /// the verified peer; not self-claimable from the request body.
+    pub caller_origin: u64,
+    /// Caller-generated correlation id. Same value on the matching
+    /// CANCEL or RESPONSE.
+    pub call_id: u64,
+    /// Decoded request payload.
+    pub payload: RpcRequestPayload,
+    /// Cancellation signal. Handlers should `select!` on
+    /// `cancellation.cancelled()` if their work is async-cancellable;
+    /// long-running synchronous handlers should periodically check
+    /// `cancellation.is_cancelled()`.
+    pub cancellation: RpcCancellationToken,
+}
+
+/// Handler-side error that doesn't fit the application's normal
+/// `Ok(RpcResponsePayload)` channel. The fold maps these onto a
+/// failure-status `RpcResponsePayload` for the caller.
+#[derive(Debug, thiserror::Error)]
+pub enum RpcHandlerError {
+    /// Application-defined error. The fold encodes this as
+    /// `RpcStatus::Application(code)` with `message` as the body.
+    #[error("application error {code:#06x}: {message}")]
+    Application {
+        /// Application error code; surfaces as `RpcStatus::Application(code)`
+        /// to the caller. Use `0x8000..=0xFFFF` to avoid the
+        /// reserved canonical range.
+        code: u16,
+        /// Diagnostic. Becomes the response body (UTF-8 bytes).
+        message: String,
+    },
+    /// Catch-all for handler-internal failures. The fold encodes this
+    /// as `RpcStatus::Internal` with `message` as the body.
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+/// User-supplied handler. Implementors typically wrap their state
+/// (or an `Arc<Mutex<State>>`) and route to the appropriate logic
+/// based on `ctx.payload.service` or per-handler dispatch.
+///
+/// Multiple `Mesh::serve_rpc` registrations on different services
+/// each install their own handler; a single handler typically
+/// services one service.
+#[async_trait::async_trait]
+pub trait RpcHandler: Send + Sync + 'static {
+    /// Process one request and return the response payload. The
+    /// fold spawns this in a tokio task; the fold itself doesn't
+    /// block on it. Handlers should respect `ctx.cancellation` for
+    /// cooperative early-abort.
+    async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError>;
+}
+
+/// Callback the fold invokes to publish a response back to the
+/// caller. Wired up by `Mesh::serve_rpc` to publish on
+/// `<service>.replies.<caller_origin>`. Type-erased so the fold
+/// doesn't depend on the mesh layer directly.
+///
+/// Arguments: `(caller_origin, call_id, response_payload)`.
+pub type RpcResponseEmitter = Arc<
+    dyn Fn(u64, u64, RpcResponsePayload) + Send + Sync + 'static,
+>;
+
+/// Server-side fold. Sees REQUEST events on the configured channel,
+/// dispatches to the user-supplied handler, emits RESPONSE events
+/// via the supplied emitter. CANCEL events flip the matching
+/// in-flight token.
+///
+/// State `()` — the user's state lives on whatever the `RpcHandler`
+/// captures (typically `Arc<Mutex<S>>`). The fold's own state (the
+/// in-flight map) lives on `&mut self` and is shared with spawned
+/// handler tasks via `Arc<Mutex<...>>` so the task can self-clean
+/// on completion.
+pub struct RpcServerFold {
+    handler: Arc<dyn RpcHandler>,
+    emit: RpcResponseEmitter,
+    /// (caller_origin, call_id) → cancellation token for the
+    /// in-flight handler. Inserted on REQUEST, removed by either
+    /// the spawned handler task on completion or by the fold on
+    /// CANCEL. Wrapped in `Arc<Mutex<...>>` so spawned tasks can
+    /// remove their own entries without going back through the
+    /// fold.
+    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    /// Optional clock override for tests. `None` → real wall-clock
+    /// `unix_nanos`. `Some(...)` → fixed value, lets tests pin
+    /// deadline-already-passed behavior without sleeping.
+    #[cfg(test)]
+    test_now_ns: Option<u64>,
+}
+
+impl RpcServerFold {
+    /// Construct a server fold around `handler`. `emit` is the
+    /// callback that publishes RESPONSE events to the caller's
+    /// reply channel — `Mesh::serve_rpc` wires this to the
+    /// publisher for `<service>.replies.<caller_origin>`.
+    pub fn new(handler: Arc<dyn RpcHandler>, emit: RpcResponseEmitter) -> Self {
+        Self {
+            handler,
+            emit,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            test_now_ns: None,
+        }
+    }
+
+    /// Test-only: pin the clock the fold uses for deadline
+    /// short-circuit. Lets a unit test exercise the
+    /// deadline-already-passed branch without waiting for wall
+    /// time.
+    #[cfg(test)]
+    pub fn with_test_now_ns(mut self, now_ns: u64) -> Self {
+        self.test_now_ns = Some(now_ns);
+        self
+    }
+
+    /// Test-only: snapshot of the in-flight call set.
+    #[cfg(test)]
+    pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
+        self.in_flight.lock().keys().copied().collect()
+    }
+
+    fn now_ns(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(t) = self.test_now_ns {
+            return t;
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+}
+
+impl RedexFold<()> for RpcServerFold {
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        // Decode the meta header. A garbled meta means the event
+        // doesn't even claim to be an RPC packet — log and skip
+        // rather than killing the fold. Returning `Err(Decode)`
+        // here would stop the entire cortex adapter for one
+        // malformed event, which is wrong for an RPC server that
+        // needs to keep serving.
+        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+        } else {
+            None
+        }) else {
+            tracing::warn!(
+                payload_len = ev.payload.len(),
+                "rpc server fold: event payload too short for EventMeta; skipping",
+            );
+            return Ok(());
+        };
+        let key = (meta.origin_hash, meta.seq_or_ts);
+        match meta.dispatch {
+            DISPATCH_RPC_REQUEST => {
+                let payload = match RpcRequestPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Malformed request payload. Surface as
+                        // `UnknownVersion` to the caller — they sent
+                        // bytes we couldn't parse, which usually
+                        // means a wire-format mismatch (the most
+                        // common cause). Log so operators can
+                        // diagnose.
+                        tracing::warn!(
+                            error = %e,
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc server fold: malformed request payload",
+                        );
+                        let resp = RpcResponsePayload {
+                            status: RpcStatus::UnknownVersion,
+                            headers: vec![],
+                            body: format!("malformed request: {e}").into_bytes(),
+                        };
+                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        return Ok(());
+                    }
+                };
+                // Fast deadline-already-passed short-circuit.
+                // Server-side `Timeout` without invoking the handler.
+                if payload.deadline_ns != 0 && self.now_ns() > payload.deadline_ns {
+                    let resp = RpcResponsePayload {
+                        status: RpcStatus::Timeout,
+                        headers: vec![],
+                        body: b"deadline already passed when request landed".to_vec(),
+                    };
+                    (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                    return Ok(());
+                }
+                let cancellation = RpcCancellationToken::new();
+                self.in_flight.lock().insert(key, cancellation.clone());
+                let handler = self.handler.clone();
+                let emit = self.emit.clone();
+                let in_flight = self.in_flight.clone();
+                let caller_origin = meta.origin_hash;
+                let call_id = meta.seq_or_ts;
+                tokio::spawn(async move {
+                    let ctx = RpcContext {
+                        caller_origin,
+                        call_id,
+                        payload,
+                        cancellation,
+                    };
+                    // Catch panics so a misbehaving handler can't
+                    // take down the runtime. `AssertUnwindSafe` is
+                    // load-bearing because `RpcHandler::call`
+                    // returns a future that may borrow non-
+                    // `UnwindSafe` types from the handler; we
+                    // accept the assertion because the handler's
+                    // state is untouched on panic (we just don't
+                    // observe its in-progress mutations).
+                    let resp = match futures::FutureExt::catch_unwind(
+                        std::panic::AssertUnwindSafe(handler.call(ctx)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(payload)) => payload,
+                        Ok(Err(RpcHandlerError::Application { code, message })) => {
+                            RpcResponsePayload {
+                                status: RpcStatus::Application(code),
+                                headers: vec![],
+                                body: message.into_bytes(),
+                            }
+                        }
+                        Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
+                            status: RpcStatus::Internal,
+                            headers: vec![],
+                            body: message.into_bytes(),
+                        },
+                        Err(panic) => {
+                            let panic_msg = panic
+                                .downcast_ref::<&'static str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "<non-string panic>".into());
+                            tracing::error!(
+                                caller_origin = format!("{:#x}", caller_origin),
+                                call_id,
+                                panic = %panic_msg,
+                                "rpc server handler panicked",
+                            );
+                            RpcResponsePayload {
+                                status: RpcStatus::Internal,
+                                headers: vec![],
+                                body: format!("handler panicked: {panic_msg}").into_bytes(),
+                            }
+                        }
+                    };
+                    in_flight.lock().remove(&key);
+                    emit(caller_origin, call_id, resp);
+                });
+            }
+            DISPATCH_RPC_CANCEL => {
+                if let Some(token) = self.in_flight.lock().remove(&key) {
+                    token.cancel();
+                }
+                // Idempotent — CANCEL for an unknown call_id (e.g.
+                // a CANCEL that races the handler's completion) is
+                // a no-op rather than an error.
+            }
+            // RESPONSE / DEADLINE_EXCEEDED are server-emitted; if
+            // the server's own fold sees them (e.g. from a replay)
+            // there's nothing to do.
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,5 +1101,444 @@ mod tests {
         // 2 (status) + 1 (headers count) + 4 (body len) = 7
         assert_eq!(size, 7, "minimum response encodes in 7 bytes");
         assert_eq!(response_wire_size(&p), EVENT_META_SIZE + 7);
+    }
+
+    // ====================================================================
+    // RpcServerFold — server-side dispatch behavior.
+    //
+    // These tests drive the fold directly with synthetic events
+    // and observe the emitter callback. The end-to-end story
+    // (Mesh::serve_rpc + bus + cortex adapter) is integration-
+    // tested separately once the glue layer lands.
+    // ====================================================================
+
+    use super::super::super::redex::{RedexEntry, RedexEvent};
+    use std::time::Duration;
+
+    /// Captured-response store. Test-local typedef so the
+    /// `capturing_emitter` signature stays under the `clippy::
+    /// type_complexity` lint.
+    type CapturedResponses = Arc<Mutex<Vec<(u64, u64, RpcResponsePayload)>>>;
+
+    /// Build a synthetic RedexEvent carrying an RPC request payload.
+    /// Tests use this to drive the fold without going through the
+    /// real ingest/cortex pipeline.
+    fn rpc_request_event(
+        caller_origin: u64,
+        call_id: u64,
+        payload: RpcRequestPayload,
+    ) -> RedexEvent {
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&payload.encode());
+        RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        }
+    }
+
+    fn rpc_cancel_event(caller_origin: u64, call_id: u64) -> RedexEvent {
+        let meta = EventMeta::new(DISPATCH_RPC_CANCEL, 0, caller_origin, call_id, 0);
+        let buf = meta.to_bytes().to_vec();
+        RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        }
+    }
+
+    /// Captures responses emitted by the fold for assertion in tests.
+    fn capturing_emitter() -> (RpcResponseEmitter, CapturedResponses) {
+        let captured: CapturedResponses = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let emit: RpcResponseEmitter = Arc::new(move |origin, call_id, resp| {
+            captured_clone.lock().push((origin, call_id, resp));
+        });
+        (emit, captured)
+    }
+
+    /// A handler that just echoes the request body back as the
+    /// response body, with `RpcStatus::Ok`.
+    struct EchoHandler;
+    #[async_trait::async_trait]
+    impl RpcHandler for EchoHandler {
+        async fn call(
+            &self,
+            ctx: RpcContext,
+        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: ctx.payload.body,
+            })
+        }
+    }
+
+    /// Wait until `pred` is true, polling at 10ms intervals up to
+    /// `timeout`. Used to await spawned-handler completion in tests
+    /// without a sleep-and-pray.
+    async fn wait_until<F: Fn() -> bool>(pred: F, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if pred() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pred()
+    }
+
+    /// Happy path: a REQUEST event triggers the handler; the fold
+    /// emits a RESPONSE with the handler's payload.
+    #[tokio::test]
+    async fn server_fold_request_invokes_handler_and_emits_response() {
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(Arc::new(EchoHandler), emit);
+        let req = RpcRequestPayload {
+            service: "echo".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: b"hello".to_vec(),
+        };
+        let ev = rpc_request_event(0xCAFE, 7, req);
+        fold.apply(&ev, &mut ()).unwrap();
+
+        // Handler runs in tokio::spawn; wait for the emit.
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "expected one emitted response"
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1);
+        let (origin, call_id, resp) = &captured[0];
+        assert_eq!(*origin, 0xCAFE);
+        assert_eq!(*call_id, 7);
+        assert_eq!(resp.status, RpcStatus::Ok);
+        assert_eq!(resp.body, b"hello");
+        // In-flight set is cleaned up after the handler completes.
+        assert!(fold.in_flight_keys().is_empty());
+    }
+
+    /// Application error: handler returns
+    /// `RpcHandlerError::Application` → fold emits a response with
+    /// `RpcStatus::Application(code)` and the message as body.
+    #[tokio::test]
+    async fn server_fold_application_error_maps_to_application_status() {
+        struct AppErrHandler;
+        #[async_trait::async_trait]
+        impl RpcHandler for AppErrHandler {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+                Err(RpcHandlerError::Application {
+                    code: 0xBEEF,
+                    message: "bad input".to_string(),
+                })
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(Arc::new(AppErrHandler), emit);
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
+        assert!(wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await);
+        let captured = captured.lock();
+        let (_, _, resp) = &captured[0];
+        assert_eq!(resp.status, RpcStatus::Application(0xBEEF));
+        assert_eq!(resp.body, b"bad input");
+    }
+
+    /// Internal error: handler returns `RpcHandlerError::Internal`
+    /// → fold emits `RpcStatus::Internal` with the message body.
+    #[tokio::test]
+    async fn server_fold_internal_error_maps_to_internal_status() {
+        struct IntErrHandler;
+        #[async_trait::async_trait]
+        impl RpcHandler for IntErrHandler {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+                Err(RpcHandlerError::Internal("db timeout".to_string()))
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(Arc::new(IntErrHandler), emit);
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
+        assert!(wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await);
+        let captured = captured.lock();
+        let (_, _, resp) = &captured[0];
+        assert_eq!(resp.status, RpcStatus::Internal);
+        assert_eq!(resp.body, b"db timeout");
+    }
+
+    /// Handler panic: caught by the fold's `catch_unwind`; surfaces
+    /// as `RpcStatus::Internal` to the caller. Pre-fix the panic
+    /// would propagate up the spawned task, log a tokio
+    /// uncaught-panic message, and silently leave the caller
+    /// waiting forever.
+    #[tokio::test]
+    async fn server_fold_handler_panic_surfaces_as_internal_status() {
+        struct PanicHandler;
+        #[async_trait::async_trait]
+        impl RpcHandler for PanicHandler {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+                panic!("kaboom");
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(Arc::new(PanicHandler), emit);
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
+        assert!(wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await);
+        let captured = captured.lock();
+        let (_, _, resp) = &captured[0];
+        assert_eq!(resp.status, RpcStatus::Internal);
+        assert!(
+            String::from_utf8_lossy(&resp.body).contains("kaboom"),
+            "panic message must surface in body, got {}",
+            String::from_utf8_lossy(&resp.body),
+        );
+    }
+
+    /// Deadline already passed: server short-circuits with
+    /// `Timeout` without invoking the handler. Pinned via the
+    /// `with_test_now_ns` clock override so the test doesn't race
+    /// wall time.
+    #[tokio::test]
+    async fn server_fold_deadline_already_passed_short_circuits_to_timeout() {
+        let invoked = Arc::new(AtomicBool::new(false));
+        struct CountingHandler {
+            invoked: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl RpcHandler for CountingHandler {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+                self.invoked.store(true, Ordering::Release);
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: vec![],
+                })
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(
+            Arc::new(CountingHandler {
+                invoked: invoked.clone(),
+            }),
+            emit,
+        )
+        .with_test_now_ns(2_000);
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            // Deadline in the past relative to `with_test_now_ns(2000)`.
+            deadline_ns: 1_000,
+            flags: 0,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
+        // Emit happens synchronously in the deadline-passed branch
+        // (no handler spawn).
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1);
+        let (_, _, resp) = &captured[0];
+        assert_eq!(resp.status, RpcStatus::Timeout);
+        assert!(
+            !invoked.load(Ordering::Acquire),
+            "handler must NOT be invoked when deadline already passed",
+        );
+    }
+
+    /// CANCEL flips the matching in-flight token. The handler that
+    /// `select!`s on the cancellation observes the signal and can
+    /// short-circuit. The fold removes the in-flight entry on
+    /// CANCEL.
+    #[tokio::test]
+    async fn server_fold_cancel_flips_token_and_clears_in_flight() {
+        let resumed_after_cancel = Arc::new(AtomicBool::new(false));
+        struct CancelObservingHandler {
+            resumed: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl RpcHandler for CancelObservingHandler {
+            async fn call(
+                &self,
+                ctx: RpcContext,
+            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+                tokio::select! {
+                    _ = ctx.cancellation.cancelled() => {
+                        self.resumed.store(true, Ordering::Release);
+                        Err(RpcHandlerError::Internal("cancelled by caller".to_string()))
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        Ok(RpcResponsePayload {
+                            status: RpcStatus::Ok,
+                            headers: vec![],
+                            body: b"slept the full window".to_vec(),
+                        })
+                    }
+                }
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(
+            Arc::new(CancelObservingHandler {
+                resumed: resumed_after_cancel.clone(),
+            }),
+            emit,
+        );
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(1, 42, req), &mut ()).unwrap();
+        // Wait until the handler's `select!` is parked; then send
+        // CANCEL.
+        assert!(
+            wait_until(
+                || fold.in_flight_keys().contains(&(1, 42)),
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        fold.apply(&rpc_cancel_event(1, 42), &mut ()).unwrap();
+        // The cancellation is observed by the handler; it returns
+        // `Internal("cancelled by caller")` which the fold encodes
+        // as RpcStatus::Internal in the response.
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "handler should observe cancellation and emit response"
+        );
+        assert!(
+            resumed_after_cancel.load(Ordering::Acquire),
+            "handler must observe cancellation"
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1);
+        // CANCEL also removes the in-flight entry directly.
+        // Handler completion removes it again (idempotent).
+        assert!(fold.in_flight_keys().is_empty());
+    }
+
+    /// CANCEL for an unknown call_id is a no-op (no panic, no
+    /// stray emission). This is the case where a CANCEL races a
+    /// handler completion or a duplicate CANCEL arrives.
+    #[tokio::test]
+    async fn server_fold_cancel_for_unknown_call_id_is_no_op() {
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(Arc::new(EchoHandler), emit);
+        // CANCEL with no matching REQUEST.
+        fold.apply(&rpc_cancel_event(1, 999), &mut ()).unwrap();
+        assert!(captured.lock().is_empty());
+        assert!(fold.in_flight_keys().is_empty());
+    }
+
+    /// Malformed request payload: fold emits a
+    /// `RpcStatus::UnknownVersion` response and continues. A
+    /// regression that returned `Err` here would kill the cortex
+    /// adapter's tail-and-fold task on the first malformed event,
+    /// which is the wrong behavior for an RPC server that needs
+    /// to keep serving past garbage.
+    #[tokio::test]
+    async fn server_fold_malformed_payload_emits_unknown_version_and_keeps_going() {
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(Arc::new(EchoHandler), emit);
+        // Build an event with valid meta but a garbage tail (just
+        // a single 0x00 byte, which fails the service-len check).
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 7, 1, 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.push(0x00); // svc_len = 0 → empty service → Truncated
+        let ev = RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        };
+        let result = fold.apply(&ev, &mut ());
+        assert!(
+            result.is_ok(),
+            "fold must NOT return Err on malformed payload (would kill the adapter); got {result:?}"
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1);
+        let (_, _, resp) = &captured[0];
+        assert_eq!(resp.status, RpcStatus::UnknownVersion);
+    }
+
+    /// Cancellation token roundtrip: `cancel()` sets `is_cancelled`
+    /// and wakes a parked `cancelled().await`.
+    #[tokio::test]
+    async fn cancellation_token_signals_waiters() {
+        let token = RpcCancellationToken::new();
+        assert!(!token.is_cancelled());
+        let token2 = token.clone();
+        let waiter = tokio::spawn(async move {
+            token2.cancelled().await;
+        });
+        // Give the waiter a chance to park.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        token.cancel();
+        // Waiter wakes.
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must wake within 1s")
+            .expect("waiter task must not panic");
+        assert!(token.is_cancelled());
+    }
+
+    /// Race: cancel fires AFTER the future is registered but
+    /// BEFORE the await actually parks. The token's
+    /// `notified()`-then-check ordering must catch this case
+    /// without sleeping past the cancellation.
+    #[tokio::test]
+    async fn cancellation_token_does_not_miss_cancel_racing_register() {
+        for _ in 0..50 {
+            let token = RpcCancellationToken::new();
+            let token2 = token.clone();
+            let waiter = tokio::spawn(async move {
+                token2.cancelled().await;
+            });
+            // No sleep — fire cancel as fast as possible against
+            // the just-spawned waiter. In the worst case the
+            // waiter has not yet reached `notified()`; it will see
+            // `is_cancelled() == true` on its first check and
+            // return immediately. In the other case it parks and
+            // gets woken by `notify_waiters`.
+            token.cancel();
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter must complete within 1s")
+                .expect("waiter task must not panic");
+        }
     }
 }
