@@ -1,0 +1,25 @@
+net/crates/net/tests/integration_nrpc_loopback.rs
+  cfca4517ad394ef2 339-343
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  cfca4517ad394ef2 1108-1111,1153-1167,1169-1181,1184-1202,1216-1221,1428-1432,1524-1530,1532-1552,1555-1573,2451-2456,2467-2472,2478-2532
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "2e9d5dc3c06a6f7b1fd18dd118d07693451eed50",
+  "prompts": {
+    "cfca4517ad394ef2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c8c8999-2a05-4bfc-a843-35946dde9df4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3119,
+      "total_deletions": 72,
+      "accepted_lines": 184,
+      "overriden_lines": 0
+    }
+  }
+}
