@@ -1,0 +1,23 @@
+net/crates/net/bindings/go/net/resilience.go
+  d1b11a1287c1706a 18,118-119,125,132-137,146-147,193-204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "9822c7055fe84ee4bb51192abfd7f57a1c1c9b89",
+  "prompts": {
+    "d1b11a1287c1706a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 24,
+      "total_deletions": 8,
+      "accepted_lines": 695,
+      "overriden_lines": 0
+    }
+  }
+}
