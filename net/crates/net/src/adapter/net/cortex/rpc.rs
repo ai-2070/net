@@ -3078,11 +3078,11 @@ mod tests {
     }
 
     /// Regression for M21: `extract_trace_context` does
-    /// case-INsensitive matching on the header names, matching W3C
-    /// + HTTP convention. A peer that emits `Traceparent` (capital
-    /// T) or `TRACESTATE` must still be picked up — the previous
-    /// implementation used `name.as_str() == "traceparent"` and
-    /// silently dropped any non-lowercase variant.
+    /// case-INsensitive matching on the header names, matching the
+    /// W3C and HTTP conventions. A peer that emits capitalized
+    /// `Traceparent` or `TRACESTATE` must still be picked up — the
+    /// previous implementation used `name.as_str() == "traceparent"`
+    /// and silently dropped any non-lowercase variant.
     #[test]
     fn extract_trace_context_is_case_insensitive_on_header_names() {
         // Capital-T traceparent + uppercase TRACESTATE — both must

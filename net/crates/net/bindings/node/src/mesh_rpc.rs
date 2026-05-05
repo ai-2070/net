@@ -505,7 +505,7 @@ impl MeshRpc {
         self.node
             .find_service_nodes(&service)
             .into_iter()
-            .map(|n| BigInt::from(n))
+            .map(BigInt::from)
             .collect()
     }
 }

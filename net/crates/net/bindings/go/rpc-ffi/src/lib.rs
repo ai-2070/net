@@ -54,8 +54,8 @@ use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use net::adapter::net::mesh_rpc::{
-    CallOptions as InnerCallOptions, RoutingPolicy as InnerRoutingPolicy,
-    RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
+    CallOptions as InnerCallOptions, RpcError as InnerRpcError, RpcStream as InnerRpcStream,
+    ServeHandle as InnerServeHandle,
 };
 use net::adapter::net::MeshNode;
 
@@ -99,10 +99,9 @@ pub const NET_RPC_ERR_STREAM_DONE: c_int = -6;
 /// expected version at process init and refuse to load a mismatch.
 ///
 ///   - **0001** — initial release: lifecycle + unary `call` /
-///                `call_service` / `find_service_nodes` / `serve`
-///                + Phase B6 streaming (`call_streaming`,
-///                `stream_next`, `stream_grant`, `stream_close`,
-///                `stream_free`).
+///     `call_service` / `find_service_nodes` / `serve` plus
+///     Phase B6 streaming (`call_streaming`, `stream_next`,
+///     `stream_grant`, `stream_close`, `stream_free`).
 pub const NET_RPC_ABI_VERSION: u32 = 0x0001;
 
 /// Returns the current ABI version. Consumers SHOULD call this at
@@ -445,7 +444,6 @@ fn build_call_options(deadline_ms: u64) -> InnerCallOptions {
     if deadline_ms > 0 {
         inner.deadline = Some(Instant::now() + Duration::from_millis(deadline_ms));
     }
-    inner.routing_policy = InnerRoutingPolicy::default();
     inner
 }
 
@@ -734,8 +732,9 @@ pub extern "C" fn net_rpc_serve_handle_free(handle: *mut ServeHandleC) {
 ///     the SDK's `Drop` impl) and remain idempotent.
 ///   - `next()` locks, polls, and re-stores `Some(stream)` until
 ///     the stream terminates.
-/// Once `close()` runs OR the stream has yielded its terminal
-/// item, subsequent `next()` calls return `NET_RPC_ERR_STREAM_DONE`.
+///
+/// Once `close()` runs OR the stream has yielded its terminal item,
+/// subsequent `next()` calls return `NET_RPC_ERR_STREAM_DONE`.
 pub struct RpcStreamHandleC {
     inner: Arc<Mutex<Option<InnerRpcStream>>>,
     /// Mirrors the SDK's `RpcStream::call_id`. Captured at

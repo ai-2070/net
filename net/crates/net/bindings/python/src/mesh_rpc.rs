@@ -56,8 +56,8 @@ use ::net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use ::net::adapter::net::mesh_rpc::{
-    CallOptions as InnerCallOptions, RoutingPolicy as InnerRoutingPolicy,
-    RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
+    CallOptions as InnerCallOptions, RpcError as InnerRpcError, RpcStream as InnerRpcStream,
+    ServeHandle as InnerServeHandle,
 };
 use ::net::adapter::net::MeshNode;
 
@@ -154,7 +154,6 @@ fn rpc_error_to_pyerr(err: InnerRpcError) -> PyErr {
 
 fn call_options_from_dict(opts: Option<&Bound<'_, PyDict>>) -> PyResult<InnerCallOptions> {
     let mut inner = InnerCallOptions::default();
-    inner.routing_policy = InnerRoutingPolicy::default();
     let Some(d) = opts else {
         return Ok(inner);
     };
@@ -330,18 +329,35 @@ impl PyRpcStream {
         let inner = self.inner.clone();
         let result = py.detach(|| {
             runtime.block_on(async move {
-                let mut guard = inner.lock().unwrap_or_else(|p| p.into_inner());
-                let stream = guard
-                    .as_mut()
-                    .ok_or_else(|| RpcError::new_err("stream already closed"))?;
+                // Take the inner stream out of the mutex while we
+                // await — holding a `std::sync::MutexGuard` across
+                // an `.await` is unsound (and clippy-flagged). A
+                // concurrent `close()` that takes the inner first
+                // races us cleanly: we observe `None` and report
+                // "stream already closed."
+                let mut stream = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(s) => s,
+                    None => return Err(RpcError::new_err("stream already closed")),
+                };
                 let next = stream.next().await;
                 match next {
-                    Some(Ok(bytes)) => Ok::<Option<Bytes>, PyErr>(Some(bytes)),
-                    Some(Err(e)) => Err(rpc_error_to_pyerr(e)),
+                    Some(Ok(bytes)) => {
+                        // Put the stream back so subsequent __next__
+                        // polls keep going.
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(stream);
+                        Ok::<Option<Bytes>, PyErr>(Some(bytes))
+                    }
+                    Some(Err(e)) => {
+                        // Mid-stream error — drop the stream (CANCEL
+                        // is unnecessary; the server already
+                        // terminated us) and surface the error.
+                        drop(stream);
+                        Err(rpc_error_to_pyerr(e))
+                    }
                     None => {
                         // Clean EOF — drop the inner stream so the
                         // CANCEL-on-drop guard fires immediately.
-                        let _ = guard.take();
+                        drop(stream);
                         Ok(None)
                     }
                 }
