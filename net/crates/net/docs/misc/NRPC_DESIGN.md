@@ -1,118 +1,243 @@
-# nRPC — request/response as a Net subprotocol
+# nRPC — request/response as a CortEX fold convention
 
-Plan for a first-class request/response primitive on top of the existing mesh transport. Closes the structural gap that today forces every microservice consumer to roll its own correlation IDs, deadlines, retries, and cancellation on top of pub/sub channels.
+Plan for a first-class request/response primitive on Net. **Architectural anchor: nRPC is not a new subsystem. It is a convention layer over CortEX folds plus one missing channel-layer primitive.** Every piece of the request/response state machine — correlation, idempotency, snapshot/restore, replay-debugging, causal-chain integration, capability-token authz — already exists in CortEX with different names. nRPC is a typed `dispatch` enum on `EventMeta`, a channel-naming convention, and small caller-side / server-side helpers.
 
-**Architectural anchor: nRPC is a subprotocol, not a new packet shape.** The mesh already has a `subprotocol_id: u16` slot in `NetHeader`, a manifest-negotiation handshake (`SUBPROTOCOL_NEGOTIATION = 0x0600`), and an automatic capability tag (`subprotocol:0x0NNN`) so peers can discover support via the existing `CapabilityIndex`. nRPC slots in alongside `causal`, `migration`, `snapshot`, and `stream-window`. **No wire-format bump is required**; nRPC ships as one new subprotocol ID with its own framed payload.
+## The framing
 
-## What's already there
+An RPC server is a CortEX fold:
 
-- **Subprotocol machinery** — `SubprotocolDescriptor` (id + name + version + min_compatible), `SubprotocolRegistry`, manifest exchange via `negotiate()`, automatic capability-tag plumbing. nRPC adopts this verbatim; we add `pub const SUBPROTOCOL_NRPC: u16 = 0x0C00;` and a descriptor.
-- **Reliable encrypted streams** — `MeshNode::open_stream_with(peer, reliable=true, ...)` plus `StreamWindow` (the `SUBPROTOCOL_STREAM_WINDOW` subprotocol) for receiver-authoritative credit grants. Streams are multiplexed over the existing AEAD session, so opening many of them is cheap (no new UDP socket, no new crypto context).
-- **Identity & authz** — `EntityKeypair`, `OriginStamp`, signed capability announcements, `PermissionToken` with `TokenScope`. Server-side `RpcContext::caller` will be the AEAD-verified `EntityId`, not a self-claimed value in the request payload.
-- **Per-daemon dispatch** — `DaemonRuntime::deliver(origin_hash, event)` is the existing typed unicast path inside one process. nRPC's server-side handler dispatch reuses this shape (keyed by service name instead of `origin_hash`).
-- **Capability announcements** — periodically broadcast, signed, hop-counted. Today they advertise channels and modalities. nRPC extends them with a `services: Vec<ServiceDescriptor>` field for Layer 7 (Phase 2 of this plan).
-- **Health & latency signals** — heartbeat loop, `RecoveryManager` retry-counted failure state, `proximity.rs` exposes per-route p50. Phase 2's routing policies consume these directly.
+| RPC concept | CortEX equivalent |
+|------|------|
+| Server's accumulated state | `RedexFold::State` |
+| A request | An `EventEnvelope` with `meta.dispatch = REQUEST` |
+| Correlation ID | `EventMeta::seq_or_ts` (per-caller monotonic) |
+| Caller identity | `EventMeta::origin_hash` (AEAD-verified upstream) |
+| Response | An `EventEnvelope` with `meta.dispatch = RESPONSE`, same `seq_or_ts` |
+| Awaiting a response | `wait_for_seq(call_id)` on the reply channel |
+| Snapshot of in-flight RPC state | `CortexAdapter::snapshot()` |
+| Mid-call crash recovery | Replay from log (the request was durable before processing) |
+| Idempotency | Fold's natural state — replaying the same `seq_or_ts` is a no-op |
+| Cancellation | A `CANCEL` event with the request's `seq_or_ts` |
+| Distributed tracing | `FLAG_CAUSAL` + the existing causal-chain integration |
+| Service authorization | Channel-level capability tokens (existing) |
+| Replay debugging | "Which request caused the bad state" — replay the channel |
 
-## Architecture
+This is the same pattern that drives event-sourcing and CQRS architectures. We get all of it for the price of a `dispatch` enum extension.
 
-Two new pieces, both layered on top of what exists:
+## The one missing primitive: `SubscriptionMode::QueueGroup`
 
-```text
-Layer 7 (capabilities):
-  CapabilityAnnouncement gains a `services: Vec<ServiceDescriptor>`
-  field. Receivers index `(entity_id, service_name) → ServiceDescriptor`
-  in a local ServiceRegistry. Same TTL as the rest of the auth
-  surface; no new wire kind.
+Channels today broadcast every published event to every subscriber. That's correct for events but wrong for request/response: N replica servers each running the request and racing on the reply is wasteful work and a synchronization headache (which response is canonical?). RPC needs **work-distribution semantics**: one-of-N delivery to a named group of co-equal subscribers.
 
-Layer 6 (subprotocols):
-  SUBPROTOCOL_NRPC = 0x0C00. Stream-based: every call opens one
-  reliable stream tagged with this id; the stream's frames are the
-  request, response, and (Phase 3) intermediate streaming responses.
-  Stream-close = call done; stream-reset = cancellation.
+JetStream / NATS / SQS all settled on the same shape. We adopt it:
 
-Layer ≤ 5 (transport, sessions, AEAD, channels):
-  Unchanged.
+```rust
+pub enum SubscriptionMode {
+    /// Existing behavior: every published event is delivered to
+    /// this subscriber. Multiple subscribers in this mode receive
+    /// independent copies. Right for events.
+    Broadcast,
+
+    /// Work-distribution: every published event is delivered to
+    /// exactly one subscriber in the named group. Multiple
+    /// subscribers in the same `QueueGroup(name)` divide the
+    /// stream amongst themselves. Right for request/response.
+    QueueGroup(String),
+}
 ```
 
-Stream lifecycle == call lifecycle is the load-bearing simplification. We get correlation (stream id), cancellation (stream reset), backpressure (`StreamWindow`), ordered delivery, and per-call resource accounting from the reliable-stream layer for free. The nRPC subprotocol only has to define the *frame format* inside the stream.
+A subscriber's mode is set at `subscribe` time and is stable for the lifetime of the subscription. The roster bookkeeping changes from `subscribers: HashSet<EntityId>` to `subscribers: HashMap<EntityId, SubscriptionMode>`; the dispatch path picks one queue-group member (round-robin or P2C) per event, and broadcasts to all `Broadcast` subscribers.
 
-## Wire format (in-stream framing)
+This primitive is useful beyond RPC: any work-queue pattern (background job processing, ETL pipeline shards, batched fetchers) wants the same shape today. RPC is the forcing function but the surface is general.
 
-Each call opens one reliable stream tagged with `subprotocol_id = SUBPROTOCOL_NRPC`. Frames inside the stream are length-delimited (`u32 LE` length prefix + frame body). All frames share a 1-byte type tag.
+## What's already there (that we don't have to build)
 
-### `RequestFrame` (0x01) — first frame on the stream, caller → server
+- **Typed dispatch on `EventMeta`** — `dispatch: u8` with `0x00..0x7F` reserved for CortEX-internal and `0x80..0xFF` for application/vendor. nRPC consumes a small block of the cortex-internal range.
+- **Per-event integrity** — `compute_checksum_with_meta` covers the meta header (audit #8), so a bit-flip in `dispatch: REQUEST → RESPONSE` is detected by the per-event check.
+- **Per-origin monotonic counters** — `seq_or_ts` is documented as either per-origin monotonic OR unix nanos. RPC uses per-caller monotonic; that's the deterministic-fold-order option, no extra work.
+- **`wait_for_seq` futures** — `CortexAdapter::wait_for_seq(seq).await` returns when the fold has applied `seq`. This is literally the response-await primitive.
+- **Snapshot / restore** — `applied_through_seq` strict-prefix watermark snapshots cleanly; in-flight RPC state survives restart with the rest of the fold's state.
+- **Causal chain** — `FLAG_CAUSAL` events carry a `parent_hash`. RPC requests in the same trace chain together for free.
+- **Capability tokens** — `PermissionToken` with `TokenScope::PUBLISH` / `SUBSCRIBE` already gates channel access. Service-level authorization is a small extension (a per-token service allowlist).
+- **Mesh-level channel routing** — `SubscriberRoster` + the existing dispatch path already routes published events to remote subscribers across the mesh. No transport changes.
+- **Backpressure** — RedEX append is the natural rate-limiter; events that can't be appended fast enough surface to the publisher as a typed error.
+- **Identity verification** — `origin_hash` on incoming events is set by the bus from the AEAD-verified peer; not self-claimable.
 
-```text
-┌──────┬─────────┬──────────────┬────────┬────────────┬──────────┬─────────┐
-│ tag  │ version │ deadline_ns  │ flags  │ service    │ headers  │ payload │
-│ 0x01 │  1 B    │ 8 B (u64 LE) │  2 B   │ varint+B   │ varint+B │  bytes  │
-└──────┴─────────┴──────────────┴────────┴────────────┴──────────┴─────────┘
-```
+What's left to build is the *convention layer* on top.
 
-- **`version`** — `1`. Future bumps additive; readers reject unknown via `ResponseFrame{status: UnknownVersion}` and close the stream. (Per-subprotocol versioning is also exchanged at manifest-negotiation time, so version mismatches are usually caught earlier.)
-- **`deadline_ns`** — absolute deadline (unix nanos). `0` means "no deadline; cancel via stream reset only." Server short-circuits with `Timeout` if `now_ns() > deadline_ns` before starting work.
-- **`flags`** — `u16` bitfield:
-  - `bit 0` (`IDEMPOTENT`) — request is safe for the server to dedup against an idempotency key carried in headers.
-  - `bit 1` (`STREAMING_RESPONSE`) — server may emit multiple `ResponseFrame`s on this stream (Phase 3). Without it, the first `ResponseFrame` ends the call.
-  - `bit 2` (`PROPAGATE_TRACE`) — request carries `traceparent` / `tracestate` headers.
-  - `bits 3–15` reserved, must be zero on write, ignored on read.
-- **`service`** — varint length + UTF-8 bytes (max 256). Server-side dispatch key.
-- **`headers`** — varint count + `(name, value)` pairs (each varint-length-prefixed). Used for trace context, idempotency key, content-type hints.
-- **`payload`** — opaque bytes. Caller serializes (JSON, postcard, protobuf — caller's choice).
+## Conventions
 
-No `request_id` field — the stream id is the correlation id. Cancellation = `stream.reset()`. Deadline expiry = caller resets the stream after the local timer fires; server's handler observes the reset via its `CancellationToken`.
-
-### `ResponseFrame` (0x02) — server → caller
+### Channel naming
 
 ```text
-┌──────┬─────────┬────────┬──────────┬─────────┐
-│ tag  │ version │ status │ headers  │ payload │
-│ 0x02 │  1 B    │  2 B   │ varint+B │  bytes  │
-└──────┴─────────┴────────┴──────────┴─────────┘
+<service>.requests                       — server(s) subscribe in QueueGroup(<service>)
+<service>.replies.<caller_origin_hash>   — caller subscribes in Broadcast (sole subscriber)
 ```
 
-- **`status`** — `u16`:
-  - `0x0000` — `Ok` (terminal unless `STREAMING_RESPONSE`)
-  - `0x0001` — `NotFound` (no service registered with that name)
-  - `0x0002` — `Unauthorized` (token doesn't include the requested service)
-  - `0x0003` — `Timeout` (server observed deadline expired before starting)
-  - `0x0004` — `Backpressure` (per-service queue full)
-  - `0x0005` — `Cancelled` (caller closed the stream before server completed)
-  - `0x0006` — `Internal` (handler panicked or returned an error)
-  - `0x0007` — `UnknownVersion` (request version not supported by server)
-  - `0x0008..0x7FFF` — reserved
-  - `0x8000..0xFFFF` — application-defined (server's choice)
-- **`headers`** — varint count + `(name, value)` pairs. v1 has a small enumerated set; unknown headers are passed through.
-- **`payload`** — opaque bytes; meaning depends on `status`. For `Ok` it's the application response; for the error variants it's a UTF-8 diagnostic.
+Caller publishes the request to `<service>.requests`. Exactly one server in the queue group receives it (work-distribution). Server publishes the response to `<service>.replies.<origin_hash>` — a private channel scoped to the caller. Caller is already subscribed (subscription is established lazily on first call to a service and cached for reuse).
 
-For unary calls: server emits one `ResponseFrame`, then closes the stream gracefully. For Phase 3 streaming responses: server emits N `ResponseFrame`s with `status = Ok`, then closes the stream (or emits a terminal `ResponseFrame` with a non-`Ok` status to signal an in-flight error).
+This naming matches the existing `ChannelName` shape (forward-slash-separated segments under `cortex::adapter::net::channel`). The reply-channel name encodes the caller's `origin_hash` so each caller subscribes only to their own replies — no cross-caller fan-out.
 
-### Why no `RpcCancel` packet kind
+### `EventMeta::dispatch` values
 
-The first design proposed an `RpcCancel` packet at the mesh-frame layer. With stream-based framing it's unnecessary: dropping the caller's `RpcCall` future calls `stream.reset()`, which the server observes as a stream-level event without a new packet kind. Same for deadline expiry — caller-side timer fires, caller resets the stream.
+In the cortex-internal range (`0x00..0x7F`):
 
-Total fixed wire overhead per call: ~14 B for the request prefix (version + deadline + flags + service-length + headers-length + payload-length) and ~6 B for the response prefix, before the payload. Comparable to gRPC framing.
+```rust
+pub const DISPATCH_RPC_REQUEST: u8 = 0x10;
+pub const DISPATCH_RPC_RESPONSE: u8 = 0x11;
+pub const DISPATCH_RPC_CANCEL: u8 = 0x12;
+pub const DISPATCH_RPC_DEADLINE_EXCEEDED: u8 = 0x13;
+```
+
+The rest of the dispatch space is unaffected. CortEX adapters that don't care about RPC ignore these dispatches as they ignore any other unknown dispatch.
+
+### Payload shape (after the 24-byte `EventMeta`)
+
+```rust
+struct RpcRequestPayload {
+    service: String,                    // varint+bytes (max 256)
+    deadline_ns: u64,                   // 0 = no deadline
+    flags: u16,                         // IDEMPOTENT | STREAMING_RESPONSE | PROPAGATE_TRACE | ...
+    headers: Vec<(String, Vec<u8>)>,    // varint count + name/value pairs
+    body: Bytes,                        // application-defined
+}
+
+struct RpcResponsePayload {
+    status: u16,                        // 0x0000 = Ok; see status table
+    headers: Vec<(String, Vec<u8>)>,
+    body: Bytes,                        // for Ok = app response; for errors = UTF-8 diagnostic
+}
+
+struct RpcCancelPayload {}              // empty; the seq_or_ts in EventMeta is the call_id
+struct RpcDeadlineExceededPayload {}    // empty; same
+```
+
+Encoded with `postcard` for compactness (matches the rest of the cortex envelope conventions).
+
+`status` codes (Net-native, with documented gRPC equivalence in this doc):
+
+| status | meaning | gRPC analog |
+|---|---|---|
+| `0x0000` | `Ok` | OK |
+| `0x0001` | `NotFound` (no service registered with that name) | NOT_FOUND |
+| `0x0002` | `Unauthorized` (token doesn't include the requested service) | PERMISSION_DENIED |
+| `0x0003` | `Timeout` (server observed deadline expired before starting) | DEADLINE_EXCEEDED |
+| `0x0004` | `Backpressure` (server's per-service queue full) | RESOURCE_EXHAUSTED |
+| `0x0005` | `Cancelled` (caller emitted CANCEL before server completed) | CANCELLED |
+| `0x0006` | `Internal` (handler panicked or returned an error) | INTERNAL |
+| `0x0007` | `UnknownVersion` (request payload version not supported) | UNIMPLEMENTED |
+| `0x0008..0x7FFF` | reserved | — |
+| `0x8000..0xFFFF` | application-defined | — |
+
+### Correlation
+
+`EventMeta::seq_or_ts` is the `call_id`. Caller-generated, per-caller monotonic. Same value on the request, the response, and any associated CANCEL or DEADLINE_EXCEEDED events.
+
+No separate UUID needed — `seq_or_ts` is already 8 bytes and it's already the deterministic-fold-order field.
+
+## The fold pattern
+
+### Server-side: `RpcServerFold`
+
+```rust
+pub trait RpcHandler<S>: Send + Sync + 'static {
+    type Future: Future<Output = Result<RpcResponsePayload, RpcHandlerError>> + Send;
+    fn call(&self, ctx: RpcContext, state: &mut S) -> Self::Future;
+}
+
+pub struct RpcServerFold<H, S> {
+    handler: H,
+    /// Per-caller in-flight set; entries cleared on RESPONSE emission
+    /// or on CANCEL / DEADLINE_EXCEEDED.
+    in_flight: DashMap<(u64, u64), CancellationToken>, // (origin_hash, call_id) -> token
+    /// LRU of completed idempotent calls; key is (origin_hash,
+    /// call_id), value is the cached RESPONSE payload. Bounded so a
+    /// long-running fold doesn't grow without bound.
+    completed_idempotent: lru::LruCache<(u64, u64), RpcResponsePayload>,
+    _state: PhantomData<S>,
+}
+
+impl<H, S> RedexFold<S> for RpcServerFold<H, S>
+where
+    H: RpcHandler<S>,
+    S: Send + Sync,
+{
+    fn apply(&mut self, ev: &RedexEvent, state: &mut S) -> Result<(), RedexError> {
+        let meta = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])?;
+        let key = (meta.origin_hash, meta.seq_or_ts);
+        match meta.dispatch {
+            DISPATCH_RPC_REQUEST => {
+                let req: RpcRequestPayload = postcard::from_bytes(&ev.payload[EVENT_META_SIZE..])?;
+                // Idempotency: replay of a previously-completed call
+                // returns the cached response without re-running.
+                if req.flags & IDEMPOTENT != 0 {
+                    if let Some(cached) = self.completed_idempotent.get(&key) {
+                        self.emit_response(meta.origin_hash, meta.seq_or_ts, cached.clone());
+                        return Ok(());
+                    }
+                }
+                // Fast deadline-already-passed short-circuit: emit
+                // Timeout without running the handler.
+                if req.deadline_ns != 0 && now_ns() > req.deadline_ns {
+                    self.emit_response(meta.origin_hash, meta.seq_or_ts, RpcResponsePayload::timeout());
+                    return Ok(());
+                }
+                let cancel = CancellationToken::new();
+                self.in_flight.insert(key, cancel.clone());
+                let ctx = RpcContext { caller: meta.origin_hash, call_id: meta.seq_or_ts, request: req, cancel };
+                // Spawn the handler off the fold thread. The fold
+                // returns immediately so subsequent events
+                // (including CANCEL for *this* call_id) can be
+                // processed without head-of-line blocking.
+                tokio::spawn(self.handler.call(ctx, state));
+            }
+            DISPATCH_RPC_CANCEL => {
+                if let Some((_, token)) = self.in_flight.remove(&key) {
+                    token.cancel();
+                }
+            }
+            _ => {} // RESPONSE / DEADLINE_EXCEEDED: ignored on the server side
+        }
+        Ok(())
+    }
+}
+```
+
+The handler runs in a `tokio::spawn` so the fold doesn't block on application work. When the handler completes, it emits the RESPONSE event via `emit_response`, which publishes to `<service>.replies.<caller_origin_hash>`. The fold sees the RESPONSE indirectly when its `wait_for_seq` future resolves on the reply channel.
+
+Note the head-of-line property: a long-running call doesn't block subsequent calls (or the CANCEL of itself). The fold itself never awaits.
+
+### Caller-side: `RpcClientFold`
+
+```rust
+pub struct RpcClientFold {
+    /// Pending calls awaiting a response. Each call owns a oneshot
+    /// receiver; the fold completes the sender when the matching
+    /// RESPONSE arrives.
+    pending: DashMap<u64, oneshot::Sender<RpcResponsePayload>>, // call_id -> sender
+}
+
+impl RedexFold<()> for RpcClientFold {
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        let meta = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])?;
+        if meta.dispatch != DISPATCH_RPC_RESPONSE { return Ok(()); }
+        let resp: RpcResponsePayload = postcard::from_bytes(&ev.payload[EVENT_META_SIZE..])?;
+        if let Some((_, tx)) = self.pending.remove(&meta.seq_or_ts) {
+            let _ = tx.send(resp);
+        }
+        Ok(())
+    }
+}
+```
+
+This fold has empty user state — it's purely a routing index from `call_id` → caller's awaiting future. The actual RPC state is on the server's fold.
 
 ## API surface
 
-### Caller side (`Mesh::call`)
+### Caller: `Mesh::call`
 
 ```rust
 impl Mesh {
-    /// Direct entity-to-entity unary call. Opens a reliable stream
-    /// tagged SUBPROTOCOL_NRPC, sends the request frame, awaits the
-    /// response frame, closes the stream.
     pub async fn call(
-        &self,
-        target: &EntityId,
-        service: &str,
-        payload: Bytes,
-        opts: CallOptions,
-    ) -> Result<RpcReply, RpcError>;
-
-    /// Service-name dispatch (Phase 2). Looks up a healthy instance
-    /// from the local ServiceRegistry, then delegates to `call`.
-    pub async fn call_service(
         &self,
         service: &str,
         payload: Bytes,
@@ -123,92 +248,52 @@ impl Mesh {
 #[derive(Debug, Clone, Default)]
 pub struct CallOptions {
     pub deadline: Option<Instant>,
-    pub idempotency_key: Option<u64>,
+    pub idempotent: bool,
     pub trace_context: Option<TraceContext>,
-    /// Caller-side semaphore on concurrent in-flight calls per
-    /// (local, target) pair. Default 64; bounds local resource
-    /// exhaustion when a downstream stalls.
-    pub max_in_flight_per_target: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct RpcReply {
-    pub payload: Bytes,
-    pub headers: HashMap<HeaderName, HeaderValue>,
-    pub latency_ns: u64,
-    pub server_entity: EntityId,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum RpcError {
-    #[error("no route to target")]
-    NoRoute,
-    #[error("timeout after {elapsed_ms}ms")]
-    Timeout { elapsed_ms: u64 },
-    #[error("server returned {status:?}: {message}")]
-    ServerError { status: RpcStatus, message: String },
-    #[error("local cancellation")]
-    Cancelled,
-    #[error("subprotocol negotiation failed: peer does not speak nRPC")]
-    SubprotocolUnsupported,
-    #[error("transport: {0}")]
-    Transport(#[from] TransportError),
+    pub max_in_flight: u32, // caller-side semaphore (default 64)
 }
 ```
 
-The future returned by `call()` is the call. Drop = `stream.reset()` = cancellation. `await` = wait for the first `ResponseFrame` then close. Deadline behavior: if `opts.deadline` is set, the future races a `tokio::time::sleep_until`; whichever fires first wins, and a timer-driven loss resets the stream.
+Internals: `Mesh::call`
+1. Allocates a fresh `call_id` from the per-caller monotonic counter.
+2. Registers a oneshot in the local `RpcClientFold::pending` keyed on `call_id`.
+3. Publishes a REQUEST event to `<service>.requests` with `meta.seq_or_ts = call_id`, `meta.origin_hash = self.identity.origin_hash()`, `dispatch = DISPATCH_RPC_REQUEST`.
+4. Awaits the oneshot. If `opts.deadline` fires first → publishes a CANCEL event (so the server can drop the in-flight entry) and returns `RpcError::Timeout`. If the future is dropped before the response → publishes a CANCEL event.
+5. On response: returns the decoded `RpcReply`.
 
-The `SubprotocolUnsupported` error is the new failure mode introduced by riding on subprotocol negotiation — a peer whose manifest exchange didn't list `0x0C00` cannot accept nRPC calls. This is detected at the mesh layer at session-establishment time, so callers see it as a fast-fail rather than a timeout.
+**Subscription**: the first `Mesh::call(service, ...)` lazily subscribes to `<service>.replies.<origin_hash>` in `Broadcast` mode (it's the only subscriber by construction). Subsequent calls reuse the subscription. A background task tears down the reply subscription after `idle_reply_subscription_ttl` of no in-flight calls.
 
-### Server side (`Mesh::serve`)
+### Server: `Mesh::serve_rpc`
 
 ```rust
 impl Mesh {
-    /// Register a handler for `service`. Multiple registrations for
-    /// the same service on one node are an error (use replica/fork
-    /// groups for that). Returns a `ServeHandle` whose Drop deregisters.
-    pub fn serve<F, Fut>(&self, service: &str, handler: F) -> Result<ServeHandle, ServeError>
+    /// Register a handler for `service`. Subscribes to
+    /// `<service>.requests` in QueueGroup(<service>) mode; multiple
+    /// nodes calling `serve_rpc` for the same service automatically
+    /// form a load-balanced group. Returns a `ServeHandle` whose
+    /// Drop deregisters and unsubscribes.
+    pub fn serve_rpc<S, H>(
+        &self,
+        service: &str,
+        initial_state: S,
+        handler: H,
+    ) -> Result<ServeHandle, ServeError>
     where
-        F: Fn(RpcContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Bytes, RpcHandlerError>> + Send;
-}
-
-pub struct RpcContext {
-    pub caller: EntityId,            // AEAD-verified
-    pub service: String,
-    pub payload: Bytes,
-    pub headers: HashMap<HeaderName, HeaderValue>,
-    pub deadline: Option<Instant>,
-    pub cancellation: CancellationToken,
-    pub trace_context: Option<TraceContext>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum RpcHandlerError {
-    #[error("application error {code:#06x}: {message}")]
-    Application { code: u16, message: String },
-    #[error("handler panicked")]
-    Panic,
-    #[error("internal: {0}")]
-    Internal(String),
+        S: Send + Sync + 'static,
+        H: RpcHandler<S>;
 }
 ```
 
-Server-side dispatch is straightforward: the nRPC subprotocol handler intercepts new streams tagged `SUBPROTOCOL_NRPC`, reads the first frame (must be `RequestFrame`), looks up `service` in the per-node `serve` registry, spawns the handler with an `RpcContext`, and writes the returned `Bytes` back as a `ResponseFrame`. Stream reset from the caller flips the `cancellation` token.
+Internals: `serve_rpc` opens a CortEX adapter on `<service>.requests` with an `RpcServerFold` wrapping the user's handler. The adapter subscribes to the channel in `QueueGroup(<service>)` mode. The `ServeHandle` carries a `Drop` that closes the adapter and unsubscribes.
 
-### `nRPC` over the SDK
+Multi-instance is automatic: every node that calls `serve_rpc("foo", ...)` joins the `foo` queue group. The channel layer's queue-group dispatch picks one of them per request.
+
+### SDK typed wrapper
 
 ```rust
-impl DaemonRuntime {
-    pub fn rpc(&self) -> RpcClient;
-}
-
-pub struct RpcClient { /* shares the underlying Mesh */ }
-
 impl RpcClient {
     pub async fn call<Req, Resp>(
         &self,
-        target: &EntityId,
         service: &str,
         request: &Req,
     ) -> Result<Resp, RpcError>
@@ -218,130 +303,101 @@ impl RpcClient {
 }
 ```
 
-Higher-level than the raw `Bytes` API, with codec selection (`serde_json`, `postcard`) via an `RpcCodec` enum on the client. Bindings (Node / Python / Go) get parallel typed surfaces; in Node the codec is JSON by default.
+Codec selectable per client (`serde_json` / `postcard`). Bindings (Node / Python / Go) get parallel typed surfaces.
 
-## Service discovery (Layer 7, Phase 2)
+## Service discovery (Phase 2)
 
-### Capability-announcement extension
-
-`CapabilityAnnouncement` gains a `services` field. Each receiving node accumulates `(entity_id, service_name) → ServiceDescriptor` into a local `ServiceRegistry`:
+Reuses the existing `CapabilityAnnouncement` machinery. Each receiving node already learns "node X subscribes to channel Y" from announcements; we just add a small derived index:
 
 ```rust
-pub struct ServiceDescriptor {
-    pub name: String,                  // unique within node
-    pub version: SemVer,               // for compatible-version routing
-    pub schema_hash: Option<[u8; 32]>, // advisory; readers may dedup
-    pub max_in_flight: u32,            // server-side queue cap
-    pub flags: ServiceFlags,           // IDEMPOTENT, STATELESS, etc.
+pub struct ServiceRegistry {
+    /// service_name -> nodes serving it (derived from
+    /// CapabilityAnnouncement subscriptions to <service>.requests)
+    services: DashMap<String, BTreeSet<EntityId>>,
 }
 ```
 
-Announcements ride the existing signed-capability infrastructure. Discovery requires no new wire kind.
+The registry is populated automatically from existing channel announcements — no new wire kind. A `Mesh::call_service(name, ...)` shortcut consults the registry to confirm at least one server is reachable; the actual routing decision (which of N servers) happens at the channel layer via the queue-group dispatcher.
 
-The `subprotocol:0x0C00` capability tag (auto-generated by `SubprotocolDescriptor::capability_tag()`) signals "this node speaks nRPC" — a separate signal from "this node serves these services." Both are useful: the subprotocol tag lets routers prefer nRPC-capable hops; the service descriptors let `Mesh::call_service` find a target.
+For routing-policy pluggability (round-robin, P2C, sticky, lowest-latency), the policy is configured per `serve_rpc` call (server-side) AND per `Mesh::call` (caller can hint). The default is P2C against in-flight count, which is what `behavior::loadbalance.rs` already implements.
 
-### Routing policy
+## Authorization
 
-`Mesh::call_service(name, ...)` consults the local registry:
+Two layers, both load-bearing:
 
-1. Filter to instances whose `version` matches the caller's required range.
-2. Drop instances whose `proximity::node_health(entity_id)` shows `Unhealthy`.
-3. Apply the configured `RoutingPolicy`:
-   - `RoundRobin` — even distribution.
-   - `PowerOfTwoChoices` — pick two at random, send to the one with lower in-flight count. Default.
-   - `Sticky { key }` — hash the key, pick the consistent-hashed instance. Session affinity.
-   - `LowestLatency` — pick the instance with the lowest p50 from `proximity.rs`.
-4. Apply caller-side per-target concurrency cap (semaphore from `CallOptions`).
+1. **Channel-level (existing).** Capability tokens already gate `subscribe` and `publish` per channel. Calling an RPC service requires `publish` on `<service>.requests` and `subscribe` on `<service>.replies.<self_origin_hash>`. The latter is naturally scoped to the caller's own origin (no other token has the right to subscribe to *your* reply channel).
+2. **Service-level allowlist (new).** Add `rpc_services: Vec<String>` to `PermissionToken`. Server-side, the RPC fold rejects requests whose token doesn't list the service in scope; rejection is `RpcStatus::Unauthorized`. Empty list = no services allowed (defense-in-depth default; tokens predating the field don't authorize RPC).
 
-Health is passive (heartbeat-driven) plus active (RPC error-rate threshold per target); unhealthy instances cool off for `health_recovery_ms` before re-entering the routing pool.
+End-to-end identity: `meta.origin_hash` is set by the bus from the AEAD-verified peer; not self-claimable. nRPC inherits the existing in-channel-identity-spoofability tradeoff (see `adapter/net/identity/origin.rs`).
 
-### Service-level authorization
+## What naturally falls out of CortEX (free wins)
 
-Extend `TokenScope` with a `RPC_CALL` bit and add a `services: Vec<String>` allowlist on `PermissionToken`. Servers reject calls whose token doesn't list the requested service in scope; the rejection is `RpcStatus::Unauthorized`. Empty allowlist means "no services allowed" (defense-in-depth default; existing tokens without the field don't authorize RPC).
+- **Crash recovery.** A request that was appended to the channel before the server crashed is replayed when the server's fold rehydrates from the log. The `applied_through_seq` strict-prefix watermark guarantees at-least-once handler execution. Pair with `IDEMPOTENT` flag for safe retry semantics.
+- **Snapshot-based migration.** A server's in-flight RPC state migrates with the rest of its fold state (compute layer's snapshot/restore). In-flight calls survive a planned migration; in-flight calls survive a process restart.
+- **Time-travel debugging.** "Which request caused the bad state?" — open the channel, replay events, see exactly which REQUEST flipped the fold into the broken state. Causal-chain integration shows the trace.
+- **Audit trail.** Every RPC call is durable. Operators get a free per-service audit log without instrumenting handlers.
+- **Backpressure.** RedEX append rate-limits naturally; over-cap publishers see `RedexError::Append` and surface it as `RpcError::Backpressure`.
 
-## Backpressure, concurrency, cancellation
+## What we lose vs. a transport-level RPC (and why we're OK with it)
 
-- **Per-stream backpressure (free).** Each call's stream is governed by `StreamWindow` — receiver-authoritative credit grants under `SUBPROTOCOL_STREAM_WINDOW`. Large request or response payloads ride the existing window mechanism without additional flow control in nRPC.
-- **Server-side per-service queue.** Each `serve()` registration gets a `tokio::sync::Semaphore` sized to `ServiceDescriptor::max_in_flight`. `acquire_owned` happens on the dispatcher before the handler is spawned; over-cap requests get an immediate `ResponseFrame{status: Backpressure}` and the stream closes.
-- **Server-side per-caller concurrency cap.** Separate from the per-service cap, a per-(caller, service) counter prevents one slow caller from starving others. Defaults to `min(8, max_in_flight / 4)`.
-- **Caller-side per-target semaphore.** `CallOptions::max_in_flight_per_target` (default 64) bounds the in-flight call count per `(local, target)` pair, preventing local resource exhaustion when a downstream stalls.
-- **Cancellation propagation.** Caller drops the `RpcCall` future → stream reset → server's handler sees `cancellation.cancelled().await` fire. Both sides clean up their state-machine entries on cancellation, on `ResponseFrame` arrival, or on the per-call deadline. No `RpcCancel` packet kind needed.
-
-## Tracing
-
-W3C Trace Context style. The request's `traceparent` and `tracestate` headers (in the `RequestFrame::headers` block) propagate through the call:
-
-- Server appends to its own span tree using whatever exporter the operator has configured; nRPC defines no exporter itself (interop with `tracing-opentelemetry`, Datadog, etc. lives in user code).
-- Hedged or retried requests propagate the same `trace_id` with a fresh `span_id` per attempt.
-- Discovery lookups, queue waits, and handler latency are instrumented as nested spans by the runtime; operators get end-to-end traces without instrumenting their handlers.
+- **Per-call latency floor.** Each call goes through the redex append → fold dispatch → response publish → caller fold pipeline. Even with in-memory redex this is a few extra microseconds vs. a direct stream send/receive. Acceptable for any call where the network alone is hundreds of microseconds, which is every realistic microservice RPC.
+- **Stream-level backpressure.** Stream-based RPC (gRPC's per-stream window) gives finer-grained flow control than channel-level append backpressure. For the streaming-response case (Phase 3) we may need to add channel-level credit grants — an extension of the existing `SUBPROTOCOL_STREAM_WINDOW` shape — but that's a small follow-up, not a blocker.
+- **Direct unicast.** Every request goes through a channel even when the caller knows the target's `entity_id`. This is fine: the mesh's dispatcher already optimizes pub/sub to direct-deliver when there's a single subscriber. Queue-group dispatch is the same cost as broadcast-with-one-recipient.
 
 ## Phasing
 
 | Phase | Release | Scope |
 |------|---------|-------|
-| **1** | v0.12 | `SUBPROTOCOL_NRPC = 0x0C00` registered. Frame codec (`RequestFrame`, `ResponseFrame`). Direct entity-to-entity unary `Mesh::call(target, ...)` + `Mesh::serve(name, ...)`. Per-call deadline, cancellation via stream-reset, in-flight semaphores. Token-scope check (`RPC_CALL`). Test suite covering correlation (stream id), timeout, cancel, backpressure-rejection, server panic, subprotocol-unsupported peer. |
-| **2** | v0.13 | Service registry + capability-announcement extension. `Mesh::call_service(name, ...)` with routing policies (RoundRobin, P2C, Sticky, LowestLatency). Health-aware filtering. Per-(caller, service) concurrency cap. SDK typed wrappers (Rust + Node + Python + Go bindings). |
-| **3** | v0.14 | Server-streaming responses (`STREAMING_RESPONSE` flag, multiple `ResponseFrame`s per stream). Caller-side helpers: `with_retry(policy)`, `with_circuit_breaker(...)`, `with_hedge(n)`. W3C Trace Context propagation hardened (interop tests against OpenTelemetry collector). Per-call latency / error-rate metrics on a Prometheus-compatible endpoint. |
+| **1** | v0.12 | `SubscriptionMode::QueueGroup(name)` lands on the channel layer; existing `Broadcast` semantics unchanged. `RpcServerFold` + `RpcClientFold` + the four `dispatch` constants. `Mesh::call` / `Mesh::serve_rpc` API. Channel naming convention enforced by helpers. Token-scope check (`rpc_services` allowlist on `PermissionToken`). Test suite covering: queue-group one-of-N delivery, correlation, deadline → CANCEL emission, idempotency replay, server panic, backpressure, token-scope rejection, identity guard. |
+| **2** | v0.13 | `ServiceRegistry` derived from existing channel-subscription announcements. `Mesh::call_service` shortcut + routing-policy hooks (RoundRobin, P2C, Sticky, LowestLatency) wired into queue-group dispatch. Health-aware filtering against `proximity::node_health`. SDK typed wrappers for Rust / Node / Python / Go. |
+| **3** | v0.14 | Streaming responses (`STREAMING_RESPONSE` flag → multiple `DISPATCH_RPC_RESPONSE` events with same `seq_or_ts` and a `is_terminal` payload bit). Per-streaming-response window grants. Caller-side helpers: `with_retry`, `with_circuit_breaker`, `with_hedge`. W3C Trace Context propagation hardened. Per-call latency / error-rate metrics on a Prometheus-compatible endpoint. |
 | **deferred** | v0.15+ | Client-streaming, bidirectional streaming, schema registry / IDL codegen (`.nrpc` files → typed Rust/TS/Python clients). |
-
-Each phase ships independently. Phase 1 is materially smaller than the original (no new packet kinds, no wire bump) — the bulk is the frame codec, the stream-handler hookup, and the per-call state machine.
-
-## Authorization model
-
-Two layers, both load-bearing:
-
-1. **Subprotocol-level admission.** A peer that didn't advertise `SUBPROTOCOL_NRPC` in its manifest is filtered at session-establishment time; calls return `SubprotocolUnsupported` immediately. This is automatic from the existing manifest-negotiation flow.
-2. **Service-level allowlist.** `PermissionToken::rpc_services: Vec<String>` lists the services this token may call. Empty list means none. Server rejects with `Unauthorized` on mismatch. `*` is allowed as "any service" for trusted introspection / admin tokens.
-
-End-to-end identity: every `RpcContext::caller` is the verified `EntityId` from the AEAD session, not a self-claimed value in the request payload. nRPC inherits the mesh's existing in-channel-identity-spoofability tradeoff (see `adapter/net/identity/origin.rs` doc comment) — within an authenticated channel, any peer can mint a request claiming an arbitrary `origin_hash`. Callers needing end-to-end origin authentication must layer a signed envelope inside the payload.
 
 ## Test surface
 
 ### Phase 1
-- **Stream-id correlation.** Spawn N concurrent `call()` futures against one target; assert each gets its own response on its own stream. Pin that out-of-order responses arrive at the right callers.
-- **Deadline expiration.** Server that sleeps past the deadline produces `Timeout` on the caller side, AND the server's handler sees `cancellation.cancelled()` fire when the deadline passes.
-- **Caller cancellation.** Dropping the `RpcCall` future before the response arrives closes the stream; server's handler observes the token and aborts.
-- **Server panic.** Handler that panics surfaces as `RpcStatus::Internal` to the caller (runs inside `catch_unwind`); the stream still closes cleanly.
-- **Backpressure rejection.** Fill the per-service queue past `max_in_flight`; over-cap caller gets `ResponseFrame{status: Backpressure}` immediately, no queueing, stream closes.
-- **Token scope rejection.** Token without `RPC_CALL` gets `Unauthorized`; with `RPC_CALL` but missing the service in the `rpc_services` allowlist, also `Unauthorized`.
-- **Subprotocol negotiation.** A peer whose manifest didn't include `0x0C00` causes `call()` to return `SubprotocolUnsupported` at the mesh layer, before any stream is opened.
-- **Frame version negotiation.** A v2 server receiving a v1 request handles it; a v1 server receiving a v2 request returns `ResponseFrame{status: UnknownVersion}` and closes. Subprotocol-version negotiation at manifest time should normally prevent this, but the in-frame guard is the floor.
-- **Frame round-trip.** `RequestFrame::to_bytes` + `from_bytes` for every field combination; reject malformed inputs (truncated, bad tag, garbage flags).
-- **Identity guard.** `RpcContext::caller` is the AEAD-verified peer entity, not the value in the payload.
+- **Queue-group one-of-N delivery.** Spawn 4 servers in `QueueGroup("foo")`; publish 1000 requests; assert each request is processed by exactly one server, and load is approximately balanced (within 10% of even).
+- **Queue-group + broadcast coexistence.** Same channel, mix of `Broadcast` subscribers (e.g., audit logger) and `QueueGroup("worker")` subscribers; assert broadcast subscribers see every event, queue-group sees one-of-N.
+- **Correlation across concurrent calls.** Spawn N concurrent `call()` futures; assert each gets its own response keyed on the right `call_id`.
+- **Deadline → CANCEL.** Caller's deadline fires before response; assert a CANCEL event is published; server's fold removes the in-flight entry; the response (if it was already mid-flight) lands on a non-existent oneshot and is dropped harmlessly.
+- **Caller drop → CANCEL.** Caller drops the future; same CANCEL flow.
+- **Idempotency replay.** Replay a request with `IDEMPOTENT` flag set after the original completed; assert the cached response is returned without re-running the handler.
+- **Server panic.** Handler that panics surfaces as `RpcStatus::Internal` to the caller (caught by the spawn boundary's `JoinHandle` / `catch_unwind`).
+- **Backpressure on overload.** Fill the redex append capacity; assert publishers see `RpcError::Backpressure`.
+- **Token-scope rejection.** Token without `rpc_services` listing the service rejects the call with `Unauthorized`.
+- **Identity guard.** `RpcContext::caller` is the AEAD-verified peer; not the value in the payload.
+- **Crash recovery.** Append a request, kill the server before it processes, restart; assert the request is processed on rehydrate (at-least-once) and the response lands on the caller's reply channel.
 
 ### Phase 2
-- **Service-descriptor propagation.** Service descriptors travel through capability announcements; receivers register them with the right TTL; expired entries are pruned.
-- **Routing policy correctness.** `PowerOfTwoChoices` distributes load across N healthy instances; `Sticky` is consistent across calls with the same key; `LowestLatency` picks the lowest-p50 instance.
-- **Health-aware filtering.** Instances marked unhealthy are excluded; recovery puts them back after `health_recovery_ms`.
-- **Per-(caller, service) concurrency.** One slow caller can't starve others; cap fires per-caller, not globally.
-- **Migration interaction.** When a daemon migrates (compute layer), its serving capacity follows; in-flight RPCs get `Cancelled` rather than disappearing silently.
+- **ServiceRegistry derivation.** Bring up N servers calling `serve_rpc("foo", ...)`; assert every node's local `ServiceRegistry` learns of "foo" within one capability-announcement interval.
+- **Health-aware exclusion.** Mark one server unhealthy via `proximity`; assert subsequent calls don't route to it; assert recovery puts it back.
+- **Routing-policy correctness.** `Sticky` is consistent across calls with the same key; `LowestLatency` picks the lowest-p50 instance.
 
 ### Phase 3
-- **Server-streaming order.** N `ResponseFrame`s arrive in order; cancellation mid-stream cleanly closes both ends with no orphaned in-flight handler.
-- **Trace context propagation.** `traceparent` / `tracestate` headers round-trip; hedged retries share `trace_id` but emit fresh `span_id`s.
-- **Hedged requests.** Hedge of N=2 wins on the faster reply, cancels the loser via stream reset.
-- **Circuit breaker.** `OPEN` state short-circuits calls; `HALF_OPEN` probes; `CLOSED` resumes; transitions match the documented state machine.
+- **Streaming responses in order.** N RESPONSE events with same `seq_or_ts`; assert order; assert the terminal bit closes the call.
+- **Stream cancellation mid-flight.** Caller cancels; assert subsequent RESPONSE events are dropped on arrival (the pending entry is gone).
+- **Trace context propagation.** `traceparent` / `tracestate` round-trip through the headers block.
 
 ## Out of scope
 
-- **Pub/sub replacement.** nRPC complements channels, doesn't replace them. Event-bus use cases stay on channels.
-- **Service-mesh sidecar.** nRPC runs in-process. There's no plan for a separate sidecar binary that intercepts traffic à la Istio / Linkerd.
-- **Mutual TLS / cert rotation.** Net's existing AEAD + capability-token model is the auth substrate; nRPC inherits it.
-- **Schema-validated payloads in v1.** Payloads are `Bytes`. Optional schema registry is a deferred follow-up; until then, application code owns serde.
-- **Sync RPC.** Every API is async-only; no blocking `call_blocking` shape.
+- **Pub/sub replacement.** Channels-as-event-bus stay. RPC and events coexist on the same channel mechanism.
+- **Service-mesh sidecar.** nRPC runs in-process.
+- **Mutual TLS / cert rotation.** Net's existing AEAD + capability-token model is the substrate.
+- **Schema-validated payloads in v1.** Payloads are `Bytes`; schema registry is deferred.
+- **Sync RPC.** Async-only API.
 
 ## Open design questions
 
-These are the calls I want sanity-checked before code lands:
+1. **Queue-group dispatch policy default.** P2C (against in-flight count, observed locally per channel publisher) is the recommended default; round-robin is the documented alternative. Either is fine for v1; pick one to ship and add the other later. Recommend P2C — it composes better with heterogeneous server capacity.
 
-1. **Subprotocol ID assignment.** The existing IDs cluster around `0x0400` (causal), `0x0500-ish` (snapshot), `0x0600` (negotiation), `0x0B00` (stream-window). `0x0C00` is the proposed slot for nRPC. If there's a numbering convention I haven't pieced together (e.g., reserve `0x0C00..0x0CFF` for service-mesh primitives), say so.
+2. **Reply-channel naming with `origin_hash` vs `entity_id`.** `origin_hash` (8 bytes after the widening) is structurally fine for channel naming but has a known birthday-collision floor; using `entity_id` (32 bytes) eliminates collisions but produces a longer channel name. Per-caller reply channels are private to the caller anyway (capability tokens scope `subscribe` to your own `origin_hash`-named channel), so collisions don't cause cross-caller leakage — they just mean two callers share a channel. Recommend `origin_hash` for terseness; revisit if `entity_id`-keyed channels become a uniform convention elsewhere.
 
-2. **Stream-per-call vs. multiplexed control stream.** Stream-per-call (this plan) is simple and gives natural cancellation, but at extreme RPS each call still has stream-state-machine setup cost. An alternative — one persistent control stream per peer carrying all in-flight calls demuxed by an in-frame `call_id` — has lower per-call cost but reintroduces the correlation/cancellation/backpressure machinery the original design proposed. Recommend stream-per-call; revisit if a real workload trips on the per-stream cost.
+3. **Where does the queue-group selection happen — sender or receiver side?** Either works:
+   - **Sender-side:** publisher consults the local roster, picks one queue-group member, sends to that one. Lower fan-out cost; biased view of who's healthy.
+   - **Receiver-side:** publisher broadcasts to all queue-group members; each receiver picks a deterministic "should I take this one?" decision (consistent hash on `seq_or_ts`). Higher fan-out but unbiased.
+   
+   Recommend sender-side — it's what the existing dispatcher already does for unicast and it composes with the proximity-driven load metrics. Receiver-side is the fallback for cases where the sender doesn't have a complete roster view (e.g., partition healing).
 
-3. **`RpcStatus` numbering.** Should `0x0001..0x7FFF` mirror gRPC status codes (`NotFound = 5`, etc.) for operator familiarity, or be a Net-native enumeration? Mirroring eases interop with existing tooling but locks us into gRPC's shape forever. Recommend Net-native with documented gRPC-equivalence in this doc, not at the wire level.
+4. **Idempotency cache eviction.** `completed_idempotent` LRU needs a sized bound. Default 10K entries per server fold? Per-caller? Per-(caller, service)? Recommend a single per-fold LRU sized at 10K with TTL of 5 minutes — covers reasonable retry windows without unbounded growth. Operator-tunable.
 
-4. **`CallOptions::deadline` as `Instant` vs `Duration`.** `Instant` is unambiguous about clock semantics but doesn't encode well across the wire (the server's `Instant` is incomparable). The wire carries `unix_nanos`; the API takes `Instant` and converts at the call boundary. Document that "deadline" is a hint to the server, not a contract — server may complete after the deadline if it didn't observe cancellation in time.
-
-5. **Hedging in v1?** Implementing it requires the cancellation machinery to be airtight (the loser's response must be discarded cleanly, the loser's stream cleanly reset). Phase 3 is the right home, but if we want hedging earlier, Phase 1's cancellation tests are the prerequisite. Plan above keeps hedging in Phase 3.
-
-6. **Idempotency-key location.** Original plan put `idempotency_key: u64` in the request prefix; this revision moves it into headers (varint name + value). Headers compose better with future additions (TTL, dedup-window-override) but cost a few more bytes. Keep in headers.
+5. **Streaming-response ordering across queue-group failover.** If the server handling a streaming response dies mid-stream, queue-group dispatch reroutes subsequent events to a peer that has no context. Need either (a) sticky session affinity (queue group with `Sticky(call_id)` policy ensures all events for a call_id go to the same server) or (b) explicit takeover via the snapshot-restore path. Phase 3 problem; flagging early so the design accommodates it.
