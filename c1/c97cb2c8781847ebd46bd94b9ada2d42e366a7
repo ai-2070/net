@@ -1,0 +1,23 @@
+net/crates/net/bindings/node/src/lib.rs
+  d1b11a1287c1706a 1906-1912,1915-1919
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "c1c97cb2c8781847ebd46bd94b9ada2d42e366a7",
+  "prompts": {
+    "d1b11a1287c1706a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 12,
+      "total_deletions": 2,
+      "accepted_lines": 683,
+      "overriden_lines": 0
+    }
+  }
+}
