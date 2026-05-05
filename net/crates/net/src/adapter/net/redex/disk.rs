@@ -3621,7 +3621,11 @@ mod tests {
         assert!(v1.join("idx").is_file());
         assert!(v1.join("dat").is_file());
         assert!(v1.join("ts").is_file());
-        assert_eq!(recovered.index.len(), 1, "the pre-crash idx entry must survive");
+        assert_eq!(
+            recovered.index.len(),
+            1,
+            "the pre-crash idx entry must survive"
+        );
         assert_eq!(recovered.payload_bytes, payload);
         assert_eq!(recovered.timestamps.as_deref(), Some(&[4567u64][..]));
 
@@ -4006,10 +4010,7 @@ mod tests {
         // assertion. Two halves joined by `-` reproduces the
         // exact pre-fix substring without it appearing anywhere
         // in the source verbatim.
-        let stale_marker = format!(
-            "{}{}{}",
-            "compact_to post", "-", "rename reopen failure",
-        );
+        let stale_marker = format!("{}{}{}", "compact_to post", "-", "rename reopen failure",);
         assert!(
             !src.contains(&stale_marker),
             "regression: source must not contain '{stale_marker}'. \
@@ -4031,10 +4032,7 @@ mod tests {
         // other would leave operators with mixed messaging.
         // Subtract one occurrence for this test's own reference
         // to the marker (the message immediately below).
-        let new_marker = format!(
-            "{} {}",
-            "partial-write rollback", "could not restore",
-        );
+        let new_marker = format!("{} {}", "partial-write rollback", "could not restore",);
         let occurrences = src.matches(&new_marker).count();
         assert!(
             occurrences >= 2,
@@ -4064,8 +4062,7 @@ mod tests {
     fn write_manifest_atomic_swallows_fsync_dir_failure_after_rename() {
         let chan = tmpdir();
         // Establish a baseline manifest at gen 1.
-        super::write_manifest_atomic(&chan, 1)
-            .expect("baseline manifest write must succeed");
+        super::write_manifest_atomic(&chan, 1).expect("baseline manifest write must succeed");
         assert_eq!(super::read_manifest(&chan), Some(1));
 
         // The next write does: open tmp, write, fsync_all (no
@@ -4239,9 +4236,7 @@ mod tests {
         // surrounding test wording, we strip THIS function's
         // body before counting.
         let test_fn_header = "fn migrate_flat_layout_has_exactly_one_caller(";
-        let test_fn_start = src
-            .find(test_fn_header)
-            .expect("this test must exist");
+        let test_fn_start = src.find(test_fn_header).expect("this test must exist");
         // Walk backward to the start of the test's `#[test]`
         // attribute / rustdoc — close enough to slice off
         // everything after the `///` block. We use a coarse
