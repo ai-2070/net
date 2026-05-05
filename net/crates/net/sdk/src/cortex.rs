@@ -26,7 +26,8 @@
 //!     .origin(0xABCD_EF01)
 //!     .with_tasks()
 //!     .with_memories()
-//!     .build()?;
+//!     .build()
+//!     .await?;
 //!
 //! // Drive the tasks adapter:
 //! let seq = db.tasks().create(1, "write docs", 0)?;
@@ -50,14 +51,17 @@
 //! ```no_run
 //! # use net_sdk::cortex::{NetDb, Redex};
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # tokio::runtime::Runtime::new()?.block_on(async {
 //! let redex = Redex::new().with_persistent_dir("/var/lib/net/redex");
 //! let db = NetDb::builder(redex)
 //!     .origin(0xABCD_EF01)
 //!     .persistent(true)
 //!     .with_tasks()
-//!     .build()?;
+//!     .build()
+//!     .await?;
 //! # drop(db);
-//! # Ok(())
+//! # Ok::<_, Box<dyn std::error::Error>>(())
+//! # })
 //! # }
 //! ```
 

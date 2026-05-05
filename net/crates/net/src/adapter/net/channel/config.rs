@@ -168,6 +168,17 @@ pub struct ChannelConfigRegistry {
     configs: DashMap<String, ChannelConfig>,
     /// Reverse index: hash → names (for hash-based lookups)
     by_hash: DashMap<u16, Vec<String>>,
+    /// Prefix registry: prefix → config. Consulted by
+    /// `get_by_name` when no exact match exists; the first prefix
+    /// that the queried name starts with wins. Used by nRPC's
+    /// SDK glue to register `<service>.replies.` once and admit
+    /// every `<service>.replies.<caller_origin>` subscribe that
+    /// follows.
+    ///
+    /// Prefix lookups are O(num_prefixes) — a small constant in
+    /// practice (one prefix per nRPC service). The exact-match
+    /// hot path is unaffected.
+    prefix_configs: DashMap<String, ChannelConfig>,
 }
 
 impl ChannelConfigRegistry {
@@ -176,7 +187,39 @@ impl ChannelConfigRegistry {
         Self {
             configs: DashMap::new(),
             by_hash: DashMap::new(),
+            prefix_configs: DashMap::new(),
         }
+    }
+
+    /// Register a prefix-matched channel configuration. Any
+    /// channel name starting with `prefix` that has no exact-match
+    /// entry will resolve to `config` via [`Self::get_by_name`].
+    ///
+    /// **Use sparingly.** Prefix lookups bypass the `by_hash`
+    /// fast path and walk the prefix list on the slow path; one
+    /// prefix per service is fine, hundreds is not. nRPC uses
+    /// this for its dynamic per-caller reply channels
+    /// (`<service>.replies.<caller_origin>`) — one prefix per
+    /// `serve_rpc` registration.
+    ///
+    /// `config.channel_id` should carry the prefix as a sentinel
+    /// name (e.g. `<svc>.replies.`); it isn't used for hash
+    /// lookups, so the channel-name validation rules don't apply
+    /// strictly. Prefix entries are collision-safe with respect
+    /// to each other (DashMap on the prefix string). When multiple
+    /// prefixes match a queried name, [`Self::get_by_name`] returns
+    /// the LONGEST one — so a more specific entry safely overrides
+    /// a more general one. Resolution is deterministic across
+    /// processes (the longest-length tiebreaker can never tie since
+    /// DashMap deduplicates keys).
+    pub fn insert_prefix(&self, prefix: impl Into<String>, config: ChannelConfig) {
+        self.prefix_configs.insert(prefix.into(), config);
+    }
+
+    /// Remove a prefix-matched config. Returns the removed config
+    /// if it existed.
+    pub fn remove_prefix(&self, prefix: &str) -> Option<ChannelConfig> {
+        self.prefix_configs.remove(prefix).map(|(_, v)| v)
     }
 
     /// Register a channel configuration.
@@ -211,11 +254,42 @@ impl ChannelConfigRegistry {
     }
 
     /// Look up a channel config by exact name (collision-safe).
+    ///
+    /// Falls back to the prefix registry if no exact match exists.
+    /// Resolution is **longest-prefix-match** (the standard semantic
+    /// for prefix tables): if both `foo.` and `foo.bar.` are
+    /// registered and the queried name is `foo.bar.baz`, the
+    /// `foo.bar.` config wins because it's the more specific match.
+    /// Length ties are impossible (DashMap deduplicates keys), so
+    /// resolution is fully deterministic across processes.
+    ///
+    /// Used by nRPC's dynamic reply channels — one
+    /// `<service>.replies.` prefix admits every per-caller
+    /// `<service>.replies.<caller_origin>` subscribe.
     pub fn get_by_name(
         &self,
         name: &str,
     ) -> Option<dashmap::mapref::one::Ref<'_, String, ChannelConfig>> {
-        self.configs.get(name)
+        if let Some(exact) = self.configs.get(name) {
+            return Some(exact);
+        }
+        // Slow path: walk the prefix table. Cheap in the typical
+        // case (zero or one prefix entries); the fast path is
+        // unaffected. Picks the LONGEST matching prefix so a more
+        // specific entry overrides a more general one — and so
+        // resolution is deterministic across runs (the previous
+        // "first match wins" was DashMap-shard-order dependent and
+        // would silently flip across builds).
+        let mut best_len = 0usize;
+        let mut best_key: Option<String> = None;
+        for entry in self.prefix_configs.iter() {
+            let prefix = entry.key();
+            if name.starts_with(prefix) && prefix.len() >= best_len {
+                best_len = prefix.len();
+                best_key = Some(prefix.clone());
+            }
+        }
+        self.prefix_configs.get(&best_key?)
     }
 
     /// Remove a channel config by hash.
@@ -557,6 +631,50 @@ mod tests {
         let removed2 = reg.remove(shared_hash).unwrap();
         assert_eq!(removed2.visibility, Visibility::Global);
         assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn prefix_resolution_picks_longest_match_deterministically() {
+        // Regression: prior `get_by_name` used DashMap iteration
+        // order to pick "first matching prefix wins", which is shard-
+        // order dependent and non-deterministic across processes.
+        // With both `foo.` and `foo.bar.` registered against
+        // `foo.bar.baz`, the longer (more specific) prefix must win.
+        let reg = ChannelConfigRegistry::new();
+        reg.insert_prefix(
+            "foo.",
+            ChannelConfig::new(ChannelId::parse("foo.sentinel").unwrap()).with_priority(1),
+        );
+        reg.insert_prefix(
+            "foo.bar.",
+            ChannelConfig::new(ChannelId::parse("foo.bar.sentinel").unwrap()).with_priority(2),
+        );
+        reg.insert_prefix(
+            "foo.bar.baz.",
+            ChannelConfig::new(ChannelId::parse("foo.bar.baz.sentinel").unwrap()).with_priority(3),
+        );
+
+        // Most-specific match wins regardless of insertion order.
+        let c = reg.get_by_name("foo.bar.baz.qux").unwrap();
+        assert_eq!(c.priority, 3, "longest matching prefix must win");
+
+        // Slightly shorter target — `foo.bar.baz.` no longer matches
+        // (target doesn't start with the trailing dot), so `foo.bar.`
+        // wins.
+        let c = reg.get_by_name("foo.bar.something").unwrap();
+        assert_eq!(c.priority, 2);
+
+        // Shortest matching prefix wins when no others apply.
+        let c = reg.get_by_name("foo.something").unwrap();
+        assert_eq!(c.priority, 1);
+
+        // No match.
+        assert!(reg.get_by_name("other.thing").is_none());
+
+        // Run the lookup many times; result must be stable.
+        for _ in 0..100 {
+            assert_eq!(reg.get_by_name("foo.bar.baz.x").unwrap().priority, 3);
+        }
     }
 
     #[test]

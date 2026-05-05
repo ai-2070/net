@@ -69,9 +69,18 @@ Drops in Net are loud-by-stats, silent-by-protocol. Check `node.stats().events_d
 
 ## "How do I do request/reply (RPC)?"
 
-**The bus is one-way.** There is no built-in request/reply. The model is event streams, not request/response.
+**The bus is one-way, but nRPC isn't.** The bus surface (`channel.publish` / `channel.subscribe` / `node.emit`) is broadcast pub/sub with no return value. **nRPC** is a separate convention layer that ships in the same library and adds typed request/response over the mesh — with deadlines, retries, hedging, response streaming, and end-to-end cancellation.
 
-What to do: implement it yourself with two channels — `requests/foo` for the request and `responses/foo/<correlation_id>` for the reply. Or use mesh transport's bidirectional streams (`Stream` per peer with `Reliability::Reliable`) for true RPC. Or pick a different tool — gRPC if RPC is the dominant pattern.
+What to do: read `nrpc.md` and use `TypedMeshRpc.serve` + `TypedMeshRpc.call`. Don't roll your own with two channels + correlation id — that's exactly what nRPC already implements, with the resilience helpers and cross-binding contract baked in.
+
+```rust
+// Rust: feature = "cortex"
+let _h = server.serve_rpc_typed("echo", |req: Req| async { Ok::<_, String>(handle(req)) })?;
+let resp: Resp = client.call_typed(target, "echo", &req,
+    CallOptions::default().with_deadline(Duration::from_millis(200))).await?;
+```
+
+If RPC is the **dominant** pattern (most calls, no broadcast) and the user wants a stable IDL with codegen, gRPC is still the right tool. nRPC's wire format is JSON over the mesh and there's no IDL step — typed serializers on each side are the contract. nRPC's value-add is "RPC over the same encrypted mesh you're already using for pub/sub, no separate broker / proxy / sidecar."
 
 ## "I need ordering guarantees across all consumers"
 

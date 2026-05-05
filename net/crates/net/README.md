@@ -47,6 +47,7 @@ Crate / module names inside source code (`net::`, `net_sdk::`, `from net import`
 - [RedEX](#redex)
 - [CortEX](#cortex)
 - [NetDB](#netdb)
+- [nRPC](#nrpc)
 - [Module Map](#module-map)
 - [Adapters](#adapters)
 - [SDKs](#sdks)
@@ -543,6 +544,76 @@ Whole-db snapshot is a single call. `db.snapshot()` walks every enabled model un
 
 NetDB ships the same surface on Rust, Node (`@ai2070/net` napi bindings), and Python (`net._net` PyO3 bindings). The Node and Python handles carry the same CRUD + query methods; `NetDb.open(config)` on both sides is failure-atomic and supports the same whole-db snapshot bundle cross-language (postcard is stable across the FFI boundary).
 
+## nRPC
+
+nRPC is the request/response convention layer riding on top of the pub/sub mesh + CortEX folds. It turns a directed channel pair (`<service>.requests` / `<service>.replies.<caller_origin>`) into a typed RPC surface with deadlines, queue-group fan-out, response streaming, and end-to-end cancellation.
+
+**Wire shape.** Every RPC is two events on the bus:
+
+- A **REQUEST** on `<service>.requests` carrying `RpcRequestPayload { service, deadline_ns, flags, headers, body }` plus a per-caller `call_id` in the `EventMeta`.
+- A **RESPONSE** on `<service>.replies.<caller_origin>` carrying `RpcResponsePayload { status, headers, body }` correlated via the same `call_id`. Streaming RPCs emit multiple chunks plus a terminal end-or-error frame; flow-controlled streams add a GRANT subprotocol.
+
+The reply-channel-per-caller convention keeps subscriptions cheap: a server holds one subscription per service name; a caller holds one subscription per `(service, target)` pair, lazily subscribed on first call and reused. CANCEL fires when the caller drops the future or `RpcStream` mid-stream.
+
+**Status codes.** `RpcStatus` is a `u16`. The protocol-defined band is `0x0000..=0x7FFF` (`Ok`, `Internal`, `Backpressure`, `Timeout`, `NotFound`, `BadRequest`, …); the application-defined band is `0x8000..=0xFFFF`. Two stable application-status constants ship with the SDK:
+
+| Status hex | Constant                       | Trigger                                          |
+| ---------- | ------------------------------ | ------------------------------------------------ |
+| `0x0000`   | `RpcStatus::Ok`                | Normal response.                                 |
+| `0x8000`   | `NRPC_TYPED_BAD_REQUEST`       | Typed handler couldn't decode the request body.  |
+| `0x8001`   | `NRPC_TYPED_HANDLER_ERROR`     | Typed handler ran but returned an exception.     |
+
+**Error model (every binding).** Caller-side failures surface with a stable `nrpc:` prefix so cross-language code can pattern-match:
+
+| Kind segment    | Source                                    |
+| --------------- | ----------------------------------------- |
+| `no_route`      | No session to target / capability gone    |
+| `timeout`       | Deadline elapsed before reply             |
+| `server_error`  | Handler returned a non-OK status          |
+| `transport`     | Wire-level send / receive failure         |
+| `codec_encode`  | Caller-side encode failure                |
+| `codec_decode`  | Caller-side decode failure                |
+
+Each binding exposes typed error subclasses (`RpcNoRouteError`, `RpcTimeoutError`, `RpcServerError`, `RpcTransportError`, `RpcCodecError`, plus a `BreakerOpenError` from the resilience helpers). The Node + Python wrappers add `classifyError(e)` / `classify_error(e)` to map a raw `nrpc:`-prefixed exception into the typed class.
+
+**Resilience helpers.** Every typed surface ships `call_with_retry` (exponential backoff + jitter, retriable predicate defaulting to `no_route` + `transport`), `call_with_hedge` (parallel races on a delay; first success wins, losers cancelled), and `CircuitBreaker` (closed → open → half-open with configurable failure predicate). The Node binding throws `BreakerOpenError`; the Python binding raises `BreakerOpenError`; the Go binding returns `ErrBreakerOpen`. All three carry the `nrpc:breaker_open:` prefix in the error string.
+
+### Cross-binding contract
+
+The canonical interop contract — used by every binding's wire-format compat test — is the `cross_lang_echo_sum` service:
+
+```jsonc
+// Request
+{ "text": "string to echo", "numbers": [1, 2, 3] }
+// Response
+{ "echo": "string from text field", "sum": 6 }
+```
+
+**Behavior:** echo `text` as-is, sum `numbers` left-to-right. Empty `numbers` ⇒ `sum = 0`. Missing or wrong-type `text` / `numbers` ⇒ `RpcStatus::Application(0x8000)` surfaced as `nrpc:server_error: status=0x8000 message=…`.
+
+The shared fixture at [`tests/cross_lang_nrpc/golden_vectors.json`](tests/cross_lang_nrpc/golden_vectors.json) is the single source of truth. Every binding loads it and runs the same matrix — 6 ok cases (single number, small array, empty array, negatives, unicode echo, empty text) + 3 error cases (missing text, missing numbers, wrong-type numbers):
+
+| Binding | Test file                                                    | Pattern                                                  |
+| ------- | ------------------------------------------------------------ | -------------------------------------------------------- |
+| Rust    | `tests/integration_nrpc_cross_lang.rs`                       | In-process loopback handler against the spec.            |
+| Node    | `bindings/node/test/cross_lang_compat.test.ts`               | Loads the fixture, runs against `TypedMeshRpc` stubs.    |
+| Python  | `bindings/python/tests/test_cross_lang_compat.py`            | Loads the fixture, runs against `TypedMeshRpc` stubs.    |
+| Go      | (downstream — reference consumer at `bindings/go/net/`)      | Same shape; downstream fixture-driven test once Go ships. |
+
+These are wire-format compat tests, not subprocess-based interop tests. Cargo can't easily orchestrate Node + Python subprocesses portably (PATH discovery, pre-built native modules); the fixture-driven approach catches the same drift bugs at lower cost. The fixture is versioned via `abi_version_expected` mirroring `NET_RPC_ABI_VERSION` from `bindings/go/rpc-ffi/src/lib.rs` — bumping the ABI invalidates the fixture and forces every binding's compat test to update.
+
+True subprocess-based interop tests (Node caller → Rust server, Python caller → Rust server, Node ↔ Python, etc.) remain out of scope. When Cargo can portably orchestrate Node / Python subprocesses AND both bindings ship pre-built native modules in CI, add a `tests/cross_lang_nrpc.rs` driver that gates on `CROSS_LANG_NRPC=1` + `NET_NODE_BUILT=1` / `NET_PYTHON_BUILT=1` and spawns binding-side caller scripts via `Command::new`.
+
+### Per-binding usage
+
+See each SDK README for the typed surface, resilience helpers, and streaming semantics specific to that language:
+
+- **Rust** — [`sdk/README.md`](sdk/README.md): `Mesh::serve_rpc_typed`, `Mesh::call_typed`, `Mesh::call_streaming_typed`, plus the `mesh_rpc::retry` / `hedge` / `CircuitBreaker` modules.
+- **TypeScript** — [`sdk-ts/README.md`](sdk-ts/README.md): `TypedMeshRpc.from(mesh)` with `.serve` / `.call` / `.callService` / `.callStreaming`, plus `RetryPolicy` / `HedgePolicy` / `CircuitBreaker`.
+- **Python** — [`sdk-py/README.md`](sdk-py/README.md): `TypedMeshRpc.from_mesh(mesh)` with the same surface; `serve` registers an async-or-sync handler dispatched under `tokio::task::spawn_blocking` so the GIL doesn't starve the runtime.
+- **Python (low-level binding)** — [`bindings/python/README.md`](bindings/python/README.md): the raw `net.MeshRpc` pyclass that the typed wrapper sits on top of.
+- **Go** — [`bindings/go/net/`](bindings/go/net/): reference cgo wrapper around the C ABI (`libnet_rpc`) at `bindings/go/rpc-ffi/`. Documents `MeshRpc.Call` / `CallService` / `Serve` / `CallStreaming` with ctx-cancel watcher; the Go module ships downstream.
+
 ## Module Map
 
 Top-level `src/` is the event-bus core; the heavy mesh code lives under `adapter/net/`.
@@ -578,6 +649,8 @@ src/adapter/net/
 ├── transport.rs           # UDP socket abstraction, batched I/O
 ├── session.rs             # Session state, stream multiplexing, thread-local pools
 ├── stream.rs              # Application-facing typed Stream handle over NetSession
+├── mesh_rpc.rs            # nRPC client surface — call / call_service / call_streaming + RpcStream
+├── mesh_rpc_metrics.rs    # nRPC per-service counters, prometheus_text() formatter
 ├── router.rs              # FairScheduler, stream routing, priority bypass
 ├── route.rs               # RoutingTable, multi-hop headers, stream stats
 ├── reroute.rs             # Automatic rerouting policy — failure-detector-driven route updates
@@ -699,6 +772,7 @@ src/adapter/net/
 │   ├── error.rs           #   CortexAdapterError
 │   ├── adapter.rs         #   CortexAdapter<State>: fold task, wait_for_seq, changes() broadcast
 │   ├── watermark.rs       #   WatermarkingFold — discovers per-origin app_seq during replay
+│   ├── rpc.rs             #   nRPC server-side fold + RpcServerFold + RpcClientFold + RpcContext
 │   │
 │   ├── tasks/             # First CortEX model — mutate-by-id CRUD (feature `cortex`)
 │   │   ├── types.rs       #     Task, TaskStatus, TaskId + serde payload structs

@@ -91,6 +91,7 @@ name = "ai2070-net-sdk"
 version = "0.11.0"
 dependencies = [
  "ai2070-net",
+ "async-trait",
  "bytes",
  "futures",
  "pin-project-lite",
@@ -1443,6 +1444,7 @@ dependencies = [
  "ai2070-net",
  "ai2070-net-sdk",
  "arc-swap",
+ "async-trait",
  "bytes",
  "dashmap",
  "futures",
@@ -1461,6 +1463,7 @@ version = "0.11.0"
 dependencies = [
  "ai2070-net",
  "ai2070-net-sdk",
+ "async-trait",
  "bytes",
  "dashmap",
  "futures",
@@ -1468,6 +1471,19 @@ dependencies = [
  "pyo3",
  "pyo3-build-config",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "net-rpc-ffi"
+version = "0.11.0"
+dependencies = [
+ "ai2070-net",
+ "async-trait",
+ "bytes",
+ "futures",
+ "libc",
+ "parking_lot",
  "tokio",
 ]
 

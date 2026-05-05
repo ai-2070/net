@@ -154,9 +154,19 @@ describe('Subnet enforcement', () => {
     expect(report.delivered).toBe(1);
   }, LONG_TIMEOUT);
 
-  it('ParentVisible admits a descendant, rejects a sibling at level 1', async () => {
+  it('ParentVisible admits an ancestor, rejects a sibling at the same depth', async () => {
+    // `Visibility::ParentVisible` is **strictly upward** since
+    // commit `0a79c368` ("Make ParentVisible strictly upward in
+    // gateway and mesh"): the predicate is
+    // `dest.is_ancestor_of(source)`. The channel owner is the
+    // *source* (publisher); a subscriber is admitted only if
+    // its subnet is an ancestor of the channel owner's subnet.
+    // A descendant of the channel owner is now REJECTED — that
+    // would be downward leakage, the exact thing the tightening
+    // prevents. So this test pins the post-fix behavior:
+    // ancestor admitted, sibling rejected.
     const aAddr = nextPort();
-    const descAddr = nextPort();
+    const ancAddr = nextPort();
     const sibAddr = nextPort();
 
     const a = await MeshNode.create({
@@ -165,54 +175,62 @@ describe('Subnet enforcement', () => {
       subnet: { levels: [3, 7, 2] },
       subnetPolicy: sharedPolicy,
     });
-    const desc = await MeshNode.create({
-      bindAddr: descAddr,
+    const ancestor = await MeshNode.create({
+      bindAddr: ancAddr,
       psk: PSK,
-      subnet: { levels: [3, 7, 2, 5] },
-      // Descendant's policy doesn't need to resolve to this exact
-      // SubnetId for the test — A's view of desc is what matters,
-      // and A uses its own policy against desc's caps.
+      // Ancestor lives one level shallower than A. Its subnet
+      // [3, 7] is a strict prefix of A's [3, 7, 2], so
+      // `ancestor.is_ancestor_of(A)` holds.
+      subnet: { levels: [3, 7] },
       subnetPolicy: sharedPolicy,
     });
     const sibling = await MeshNode.create({
       bindAddr: sibAddr,
       psk: PSK,
-      subnet: { levels: [3, 9, 1] },
+      // Sibling lives at the same depth as A but with a different
+      // last level — same parent subnet, different leaf. NOT an
+      // ancestor of A.
+      subnet: { levels: [3, 7, 3] },
       subnetPolicy: sharedPolicy,
     });
-    nodes.push(a, desc, sibling);
+    nodes.push(a, ancestor, sibling);
 
-    await handshakeNoStart(a, desc, descAddr);
+    await handshakeNoStart(a, ancestor, ancAddr);
     await handshakeNoStart(a, sibling, sibAddr);
-    await startAll(a, desc, sibling);
+    await startAll(a, ancestor, sibling);
 
-    // Subnet derivation on A's side:
+    // Subnet derivation on A's side (used by the auth check):
     //
-    //   a's tags  = [region:us, fleet:blue, unit:alpha]      → [3,7,2]
-    //   desc's    = [region:us, fleet:blue, unit:alpha, host:h1] → [3,7,2,5]
-    //   sibling's = [region:us, fleet:green, unit:gamma]     → [3,8,1]
+    //   a's tags        = [region:us, fleet:blue, unit:alpha]   → [3,7,2]
+    //   ancestor's tags = [region:us, fleet:blue]               → [3,7]
+    //   sibling's tags  = [region:us, fleet:blue, unit:beta]    → [3,7,3]
     //
-    // Crucially: desc's derived SubnetId is a STRICT descendant
-    // of A's — it adds one level beyond A's depth. This forces
-    // the `is_ancestor_of` branch of `ParentVisible` to fire
-    // rather than the same-subnet short-circuit. Cubic flagged
-    // the prior version of this test where desc and A announced
-    // identical tags: they both derived `[3,7,2]`, so A saw desc
-    // as same-subnet and the ancestor logic never ran.
-    await a.announceCapabilities({ tags: ['region:us', 'fleet:blue', 'unit:alpha'] });
-    await desc.announceCapabilities({
-      tags: ['region:us', 'fleet:blue', 'unit:alpha', 'host:h1'],
+    // ancestor has only the first two policy-recognized tags, so
+    // its derived SubnetId is depth 2 — a strict prefix of A's.
+    // sibling has unit:beta (level 2 = 3), giving [3,7,3] at the
+    // same depth as A but with a different last level.
+    //
+    // The `role:*` tags below aren't in the policy and so don't
+    // affect derivation; they're just unique identifiers for
+    // `findNodes` to wait on each peer being learned.
+    await a.announceCapabilities({
+      tags: ['region:us', 'fleet:blue', 'unit:alpha', 'role:owner'],
     });
-    await sibling.announceCapabilities({ tags: ['region:us', 'fleet:green', 'unit:gamma'] });
+    await ancestor.announceCapabilities({
+      tags: ['region:us', 'fleet:blue', 'role:ancestor'],
+    });
+    await sibling.announceCapabilities({
+      tags: ['region:us', 'fleet:blue', 'unit:beta', 'role:sibling'],
+    });
 
     const learned = await waitUntil(() => {
-      const descMatches = a
-        .findNodes({ requireTags: ['fleet:blue'] })
-        .includes(desc.nodeId());
+      const ancMatches = a
+        .findNodes({ requireTags: ['role:ancestor'] })
+        .includes(ancestor.nodeId());
       const sibMatches = a
-        .findNodes({ requireTags: ['fleet:green'] })
+        .findNodes({ requireTags: ['role:sibling'] })
         .includes(sibling.nodeId());
-      return descMatches && sibMatches;
+      return ancMatches && sibMatches;
     });
     expect(learned).toBe(true);
 
@@ -220,12 +238,10 @@ describe('Subnet enforcement', () => {
     a.registerChannel({ name: chanName, visibility: 'parent-visible' });
 
     const aId = a.nodeId();
-    // `parent-visible` admits via the ancestor branch:
-    //   source=A=[3,7,2].is_ancestor_of(dest=desc=[3,7,2,5]) → true.
-    // Under `subnet-local` the same subscribe rejects (verified
-    // locally) — the ancestor branch is what's under test here,
-    // not same-subnet.
-    await expect(desc.subscribeChannel(aId, chanName)).resolves.toBeUndefined();
+    // Strict-upward predicate: `dest.is_ancestor_of(source)`.
+    //   ancestor=[3,7].is_ancestor_of(A=[3,7,2]) → true  → admitted.
+    //   sibling=[3,7,3].is_ancestor_of(A=[3,7,2]) → false → rejected.
+    await expect(ancestor.subscribeChannel(aId, chanName)).resolves.toBeUndefined();
     await expect(sibling.subscribeChannel(aId, chanName)).rejects.toThrow();
 
     const report = await a.publish(chanName, Buffer.from('pv'), {

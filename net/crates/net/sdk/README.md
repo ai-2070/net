@@ -742,6 +742,143 @@ the full narrative and
 [`docs/CORTEX_ADAPTER_PLAN.md`](../docs/CORTEX_ADAPTER_PLAN.md) for the
 design.
 
+## nRPC (request / response over the mesh)
+
+nRPC is the request/response convention layer riding on top of the
+pub/sub mesh + CortEX folds. It turns a directed channel pair
+(`<service>.requests` / `<service>.replies.<caller_origin>`) into a
+typed RPC surface with deadlines, queue-group fan-out, response
+streaming, and end-to-end cancellation. Enable the `cortex` feature
+(nRPC depends on the CortEX rpc.rs fold).
+
+### Typed serve + call
+
+```rust
+use net_sdk::mesh::{Mesh, MeshBuilder};
+use net_sdk::mesh_rpc::CallOptions;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+#[derive(Serialize, Deserialize)]
+struct EchoSumRequest { text: String, numbers: Vec<i64> }
+#[derive(Serialize, Deserialize)]
+struct EchoSumResponse { echo: String, sum: i64 }
+
+# async fn example() -> net_sdk::error::Result<()> {
+let server = MeshBuilder::new("127.0.0.1:9001", &[0x42u8; 32])?.build().await?;
+let client = MeshBuilder::new("127.0.0.1:9000", &[0x42u8; 32])?.build().await?;
+// (handshake omitted — see Mesh Streams example)
+
+// Server side: register a typed handler. Returns a `ServeHandle`
+// that unregisters on Drop AND lets in-flight handlers complete
+// (no abort).
+let _handle = server.serve_rpc_typed(
+    "echo_sum",
+    |req: EchoSumRequest| async move {
+        Ok::<_, String>(EchoSumResponse {
+            echo: req.text,
+            sum: req.numbers.iter().sum(),
+        })
+    },
+)?;
+
+// Client side: typed call with a 200ms deadline.
+let opts = CallOptions::default().with_deadline(Duration::from_millis(200));
+let resp: EchoSumResponse = client.call_typed(
+    server.inner().node_id(),
+    "echo_sum",
+    &EchoSumRequest { text: "hi".into(), numbers: vec![1, 2, 3] },
+    opts,
+).await?;
+assert_eq!(resp.sum, 6);
+# Ok(())
+# }
+```
+
+`call_typed` and `call_service_typed` (service-discovery variant)
+default to JSON. Use the raw-bytes path (`call` / `call_service`)
+when you own the encoding.
+
+### Streaming responses
+
+```rust
+use futures::StreamExt;
+use net_sdk::mesh_rpc::CallOptions;
+
+# async fn example(client: net_sdk::mesh::Mesh, target: u64) -> net_sdk::error::Result<()> {
+// Optional flow control: install an initial credit window.
+let opts = CallOptions::default().with_stream_window_initial(8);
+let mut stream = client.call_streaming_typed::<MyReq, MyChunk>(
+    target, "tail", &MyReq { tail: "events" }, opts,
+).await?;
+while let Some(chunk) = stream.next().await {
+    let chunk = chunk?;          // Result<MyChunk, RpcError>
+    process(chunk);
+}
+// Dropping the stream emits CANCEL to the server (best-effort);
+// in-flight chunks are silently discarded by the client fold.
+# Ok(())
+# }
+# fn process<T>(_: T) {}
+# #[derive(serde::Serialize, serde::Deserialize)] struct MyReq { tail: &'static str }
+# #[derive(serde::Serialize, serde::Deserialize)] struct MyChunk;
+```
+
+`RpcStream::grant(amount)` issues an explicit credit publish
+when batched cadence is preferable to the per-chunk auto-grant
+default (no-op on streams that didn't opt into flow control).
+
+### Resilience helpers
+
+`Mesh::call_with_retry` wraps a unary call in exponential backoff
+with jitter; the default `RetryPolicy::default()` retries
+`no_route` + `transport` and skips terminal errors:
+
+```rust
+use net_sdk::mesh_rpc_resilience::{RetryPolicy, HedgePolicy};
+use net_sdk::mesh_rpc::CallOptions;
+use bytes::Bytes;
+use std::time::Duration;
+
+# async fn example(client: net_sdk::mesh::Mesh, target: u64) -> net_sdk::error::Result<()> {
+let policy = RetryPolicy::default()
+    .with_max_attempts(4)
+    .with_initial_backoff(Duration::from_millis(50))
+    .with_max_backoff(Duration::from_secs(1));
+let resp = client.call_with_retry(
+    target, "echo", Bytes::from_static(b"hi"),
+    CallOptions::default(), policy,
+).await?;
+
+// Hedging fans out parallel attempts on a delay; first success wins.
+let _hedge = HedgePolicy::default().with_max_parallel(3);
+# let _ = resp;
+# Ok(())
+# }
+```
+
+`CircuitBreaker` (in `mesh_rpc_resilience`) tracks consecutive
+failures and trips open after a threshold; open breakers reject
+calls outright until the cooldown allows a half-open probe.
+
+### Errors
+
+`RpcError` is the unified failure surface. Variants: `NoRoute`,
+`Timeout`, `ServerError { status, message }`, `Transport`,
+`Codec { direction, message }`. Status codes use `u16`; the
+application-defined band is `0x8000..=0xFFFF`. Two stable
+constants ship in `net_sdk::mesh_rpc`:
+
+| Status hex | Constant                       | Trigger                                          |
+| ---------- | ------------------------------ | ------------------------------------------------ |
+| `0x0000`   | `RpcStatus::Ok`                | Normal response.                                 |
+| `0x8000`   | `NRPC_TYPED_BAD_REQUEST`       | Typed handler couldn't decode the request body.  |
+| `0x8001`   | `NRPC_TYPED_HANDLER_ERROR`     | Typed handler ran but returned an exception.     |
+
+Cross-binding contract spec — including the canonical
+`cross_lang_echo_sum` service used by every binding's wire-format
+compat test — lives in [`../README.md#nrpc`](../README.md#nrpc).
+
 ## Compute (daemons + migration)
 
 Enable the `compute` feature to run `MeshDaemon`s from your SDK

@@ -5,6 +5,7 @@ members = [
     "bindings/node",
     "bindings/python",
     "bindings/go/compute-ffi",
+    "bindings/go/rpc-ffi",
 ]
 
 [package]
@@ -223,6 +224,16 @@ required-features = ["cortex"]
 name = "integration_netdb"
 path = "tests/integration_netdb.rs"
 required-features = ["netdb"]
+
+[[test]]
+# Cross-binding nRPC wire-format compatibility — Phase B7.
+# Loads the shared `tests/cross_lang_nrpc/golden_vectors.json` fixture
+# and asserts the canonical `cross_lang_echo_sum` service round-trips
+# correctly through the Rust runtime. The same fixture drives the
+# binding-side compat tests in `bindings/{node,python}`.
+name = "integration_nrpc_cross_lang"
+path = "tests/integration_nrpc_cross_lang.rs"
+required-features = ["cortex"]
 
 [profile.release]
 lto = true

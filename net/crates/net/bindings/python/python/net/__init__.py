@@ -106,6 +106,46 @@ else:
         ]
     )
 
+# nRPC surface (Phase B3). Separate try block from the broader
+# cortex import above so a wheel built with cortex but BEFORE the
+# B3 surface landed (e.g. an upgrade-in-progress install) still
+# exposes the legacy cortex symbols. New users get both groups
+# once the wheel is rebuilt with `maturin develop`.
+try:
+    from ._net import (
+        Cancellable,
+        MeshRpc,
+        RpcAppError,
+        RpcCancelledError,
+        RpcCodecError,
+        RpcError,
+        RpcNoRouteError,
+        RpcServerError,
+        RpcStream,
+        RpcTimeoutError,
+        RpcTransportError,
+        ServeHandle,
+    )
+except ImportError:
+    pass
+else:
+    __all__.extend(
+        [
+            "Cancellable",
+            "MeshRpc",
+            "RpcAppError",
+            "RpcCancelledError",
+            "RpcCodecError",
+            "RpcError",
+            "RpcNoRouteError",
+            "RpcServerError",
+            "RpcStream",
+            "RpcTimeoutError",
+            "RpcTransportError",
+            "ServeHandle",
+        ]
+    )
+
 # Encrypted mesh transport + per-peer streams. Present iff the native
 # module was built with the `net` feature.
 try:

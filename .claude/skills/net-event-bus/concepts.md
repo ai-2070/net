@@ -116,6 +116,29 @@ Out of scope for most event-bus integrations, but you should know the words:
 
 If the user is just publishing and subscribing on a single trusted mesh, you don't need any of this. If they ask "how do I keep dev events out of prod?" or "can I require auth for this channel?" — point at `net/README.md` § Capabilities, Subnets, and Security surface.
 
+## nRPC: request/response on top of the bus (brief)
+
+The bus is **broadcast pub/sub** — fire-and-forget, no return value, hot subscribers. **nRPC** is a separate convention layer that turns a directed channel pair (`<service>.requests` / `<service>.replies.<caller_origin>`) into a typed request/response surface with deadlines, queue-group fan-out, response streaming, and end-to-end cancellation.
+
+The two surfaces share the same encrypted mesh transport but have different costs and contracts:
+
+- **Bus**: zero-cost when idle, broadcast to all subscribers, no return value, drop-on-overload.
+- **nRPC**: per-call cost (one extra subscription per `(service, target)` pair, lazily created and reused), typed call → typed reply, deadlines + retry/hedge/circuit-breaker as resilience helpers.
+
+When the user describes a task, decide which surface fits:
+
+| Need                                                     | Surface     |
+| -------------------------------------------------------- | ----------- |
+| Broadcast event to N subscribers, no reply               | **Bus**     |
+| Hot subscriber that sees events emitted after join       | **Bus**     |
+| Typed call → typed response                              | **nRPC**    |
+| Deadline + retry/hedge                                   | **nRPC**    |
+| Server emits a stream of chunks for one request          | **nRPC**    |
+| Cancel mid-flight                                        | **nRPC**    |
+| Persistence / replay                                     | **Bus + RedEX/adapter** |
+
+If it's nRPC, point at `nrpc.md` — the full surface (Rust `Mesh::serve_rpc_typed` / `call_typed`, TS / Python `TypedMeshRpc`, Go reference cgo wrapper, error model, status codes, resilience helpers, cross-binding contract) lives there.
+
 ## Persistence (brief)
 
 The bus itself is **transient by design**. Events flow through ring buffers; if no one consumes them in time, they are gone. This is not a bug — it is the property that makes nanosecond-scale operation possible.
@@ -139,6 +162,7 @@ Common analogy traps. If the user is using these mental models, gently redirect:
 - **Not a service mesh.** No sidecars, no service discovery via DNS, no mTLS configuration. Identity is built in.
 - **Not actor model.** Daemons exist (see Mikoshi) but the basic publish/subscribe model is just typed pub/sub, not message-passing-with-mailboxes.
 - **Not best-effort UDP.** The mesh transport adds encryption, ordering (optional, per stream), causal chains, and automatic rerouting on top of UDP.
+- **Not gRPC** — but nRPC fills the same niche. See `nrpc.md` if the user wants typed call → typed reply with deadlines + cancellation. The wire format is JSON over the mesh, not protobuf over HTTP/2; there is no IDL codegen step, just typed serializers on each side.
 
 ---
 

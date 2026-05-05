@@ -12,14 +12,234 @@
 
 use dashmap::DashMap;
 use dashmap::DashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::name::ChannelId;
 
+/// Named queue group identifier. Wraps `String` so it's a distinct
+/// type from `ChannelId` at the API boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QueueGroupName(String);
+
+impl QueueGroupName {
+    /// Construct from any `Into<String>`. No syntactic restrictions
+    /// today — the name is opaque routing metadata.
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    /// Borrow the underlying string. Useful for logs / metrics
+    /// that want to tag dispatches with the group name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for QueueGroupName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How a subscriber wants to receive events from a channel.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SubscriptionMode {
+    /// Existing behavior: every published event is delivered to
+    /// this subscriber. Multiple `Broadcast` subscribers each
+    /// receive an independent copy of every event. Right for
+    /// pub/sub event-bus semantics.
+    Broadcast,
+    /// Work-distribution: every published event is delivered to
+    /// exactly ONE subscriber across all peers in the named
+    /// queue group. Multiple subscribers in the same
+    /// `QueueGroup(name)` divide the stream amongst themselves.
+    /// Right for request/response (nRPC) and any one-of-N
+    /// job-distribution pattern.
+    QueueGroup(QueueGroupName),
+}
+
+/// One queue group's state on a single channel.
+struct QueueGroup {
+    members: DashSet<u64>,
+    /// Round-robin cursor. `select()` snapshots `members` into a
+    /// Vec and returns `members[cursor.fetch_add(1) % vec.len()]`.
+    /// `Relaxed` is sufficient — there's no happens-before edge
+    /// the cursor needs to enforce; uneven distribution under
+    /// reordering is a metric, not a correctness concern.
+    cursor: AtomicUsize,
+}
+
+impl QueueGroup {
+    fn new() -> Self {
+        Self {
+            members: DashSet::new(),
+            cursor: AtomicUsize::new(0),
+        }
+    }
+
+    /// Pick one member for this dispatch. Returns `None` if the
+    /// group is empty. The selection is round-robin against a
+    /// snapshot — concurrent membership changes don't poison the
+    /// dispatch (they take effect on the next call).
+    fn select(&self) -> Option<u64> {
+        let snapshot: Vec<u64> = self.members.iter().map(|e| *e).collect();
+        if snapshot.is_empty() {
+            return None;
+        }
+        let idx = self.cursor.fetch_add(1, Ordering::Relaxed) % snapshot.len();
+        Some(snapshot[idx])
+    }
+}
+
+/// Per-channel subscriber set: a flat broadcast roster plus zero
+/// or more named queue groups. Both flavors coexist on one channel
+/// so a service with both an audit logger (`Broadcast`) and
+/// load-balanced workers (`QueueGroup`) is naturally expressible.
+struct ChannelSubscribers {
+    broadcasters: DashSet<u64>,
+    queue_groups: DashMap<QueueGroupName, QueueGroup>,
+}
+
+impl ChannelSubscribers {
+    fn new() -> Self {
+        Self {
+            broadcasters: DashSet::new(),
+            queue_groups: DashMap::new(),
+        }
+    }
+
+    /// True if no broadcasters and every queue group is empty.
+    /// The outer `subs` map evicts on this predicate to avoid
+    /// leaking per-channel entries for ephemeral channels.
+    fn is_empty(&self) -> bool {
+        self.broadcasters.is_empty()
+            && self
+                .queue_groups
+                .iter()
+                .all(|e| e.value().members.is_empty())
+    }
+
+    /// All subscribers regardless of mode. The set-membership view
+    /// (`SubscriberRoster::members`) uses this. Each peer appears
+    /// once even if a future relaxation lets a peer be in
+    /// multiple groups.
+    fn all_subscribers(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = self.broadcasters.iter().map(|e| *e).collect();
+        for grp in self.queue_groups.iter() {
+            for m in grp.value().members.iter() {
+                if !out.contains(&m) {
+                    out.push(*m);
+                }
+            }
+        }
+        out
+    }
+
+    /// Per-publish dispatch view: every broadcaster, plus one
+    /// selected member of each non-empty queue group. Per-publish
+    /// queue-group selection is round-robin (see `QueueGroup::select`).
+    fn dispatch_recipients(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = self.broadcasters.iter().map(|e| *e).collect();
+        for grp in self.queue_groups.iter() {
+            if let Some(picked) = grp.value().select() {
+                if !out.contains(&picked) {
+                    out.push(picked);
+                }
+            }
+        }
+        out
+    }
+
+    /// Mode under which `node_id` is subscribed to this channel,
+    /// if any. Used by `remove` to know which inner container to
+    /// touch and by diagnostics.
+    fn mode_of(&self, node_id: u64) -> Option<SubscriptionMode> {
+        if self.broadcasters.contains(&node_id) {
+            return Some(SubscriptionMode::Broadcast);
+        }
+        for grp in self.queue_groups.iter() {
+            if grp.value().members.contains(&node_id) {
+                return Some(SubscriptionMode::QueueGroup(grp.key().clone()));
+            }
+        }
+        None
+    }
+
+    /// Add `node_id` under `mode`. If the peer was previously
+    /// subscribed under a different mode on this channel, that
+    /// prior subscription is removed first (mode-change
+    /// semantics — re-subscribing in the same mode is a no-op,
+    /// re-subscribing under a different mode moves the peer).
+    /// Returns `true` if the (peer, mode) pair is newly inserted,
+    /// `false` if the peer was already subscribed under the same
+    /// mode.
+    fn add(&self, node_id: u64, mode: SubscriptionMode) -> bool {
+        // Mode-change: clear any prior subscription on this channel
+        // before inserting. The current-mode check is cheap because
+        // most peers don't change modes.
+        if let Some(prev) = self.mode_of(node_id) {
+            if prev == mode {
+                return false; // idempotent same-mode re-add
+            }
+            self.remove(node_id);
+        }
+        match mode {
+            SubscriptionMode::Broadcast => self.broadcasters.insert(node_id),
+            SubscriptionMode::QueueGroup(name) => {
+                let grp = self
+                    .queue_groups
+                    .entry(name)
+                    .or_insert_with(QueueGroup::new);
+                grp.members.insert(node_id)
+            }
+        }
+    }
+
+    /// Remove `node_id` from whichever container it sits in.
+    /// Returns `true` if the peer was present.
+    ///
+    /// Evicts the queue-group entry when its last member leaves.
+    /// Without eviction, a peer that subscribes/unsubscribes under
+    /// N distinct group names leaves N empty `QueueGroup` shells
+    /// per channel — bounded only by attacker effort. The cost of
+    /// evict-then-readd for a churning legit group is one cursor
+    /// reset (round-robin restarts at the "first" member), which
+    /// is acceptable because round-robin distribution is already
+    /// best-effort.
+    fn remove(&self, node_id: u64) -> bool {
+        if self.broadcasters.remove(&node_id).is_some() {
+            return true;
+        }
+        // Find the group that contains the peer, remove the peer,
+        // remember the group name if it just became empty.
+        let mut now_empty: Option<QueueGroupName> = None;
+        let mut found = false;
+        for grp in self.queue_groups.iter() {
+            if grp.value().members.remove(&node_id).is_some() {
+                found = true;
+                if grp.value().members.is_empty() {
+                    now_empty = Some(grp.key().clone());
+                }
+                break;
+            }
+        }
+        if let Some(name) = now_empty {
+            // Re-check inside the conditional remove in case a
+            // concurrent `add_with_mode` raced our removal and
+            // re-populated the group between our `is_empty()` and
+            // the eviction below. Only evict if STILL empty.
+            self.queue_groups
+                .remove_if(&name, |_, g| g.members.is_empty());
+        }
+        found
+    }
+}
+
 /// Subscriber roster keyed by `ChannelId`.
 ///
 /// Bidirectional index:
-/// * `subs[channel] -> {node_ids}` for `members(channel)` lookups.
+/// * `subs[channel] -> ChannelSubscribers` for `members(channel)` /
+///   `dispatch_recipients(channel)` lookups.
 /// * `by_peer[node_id] -> {channels}` for cheap `remove_peer` on failure.
 ///
 /// The two indices can briefly disagree during concurrent updates; readers
@@ -27,7 +247,7 @@ use super::name::ChannelId;
 /// the forward index only.
 #[derive(Default)]
 pub struct SubscriberRoster {
-    subs: DashMap<ChannelId, Arc<DashSet<u64>>>,
+    subs: DashMap<ChannelId, Arc<ChannelSubscribers>>,
     by_peer: DashMap<u64, Arc<DashSet<ChannelId>>>,
 }
 
@@ -37,24 +257,45 @@ impl SubscriberRoster {
         Self::default()
     }
 
-    /// Add `node_id` as a subscriber of `channel`. Returns true if the
-    /// pair was newly inserted, false if it was already present.
+    /// Add `node_id` as a `Broadcast` subscriber of `channel`.
+    /// Back-compat shim around [`Self::add_with_mode`]; existing
+    /// callers that don't yet care about queue groups continue to
+    /// get the current behavior. Returns `true` if newly inserted,
+    /// `false` if the peer was already subscribed in the same mode.
+    pub fn add(&self, channel: ChannelId, node_id: u64) -> bool {
+        self.add_with_mode(channel, node_id, SubscriptionMode::Broadcast)
+    }
+
+    /// Add `node_id` as a subscriber of `channel` under the given
+    /// `mode`. Returns `true` if the (peer, mode) pair is newly
+    /// inserted, `false` if the peer was already subscribed in the
+    /// same mode (idempotent re-add).
     ///
-    /// Insertion into each inner `DashSet` happens **inside** the
-    /// outer-map entry guard. A previous implementation cloned the
-    /// inner `Arc` out of the guard first and then inserted; between
-    /// those two steps a concurrent `remove()` on the same channel
-    /// could observe an empty set and evict the outer entry via
+    /// **Mode-change semantics.** If the peer was previously
+    /// subscribed to this channel under a different mode (e.g.
+    /// `Broadcast` and now `QueueGroup("workers")`, or moving
+    /// between groups), the prior subscription is removed first
+    /// and the new one inserted. The peer is in exactly one mode
+    /// per channel at any time.
+    ///
+    /// **Orphan-prevention.** The mutation of the inner
+    /// `ChannelSubscribers` (insert into broadcasters or into a
+    /// queue group's member set) happens **inside** the outer-map
+    /// entry guard. A previous implementation cloned the inner
+    /// `Arc` out of the guard before mutating; between those two
+    /// steps a concurrent `remove()` on the same channel could
+    /// observe an empty set and evict the outer entry via
     /// `remove_if`, leaving our cloned `Arc` orphaned — the
     /// subscription would appear in `by_peer` but never in
-    /// `members(channel)`, silently breaking fan-out.
-    pub fn add(&self, channel: ChannelId, node_id: u64) -> bool {
+    /// `members(channel)`, silently breaking fan-out. Keeping the
+    /// inner mutation under the entry guard closes that race.
+    pub fn add_with_mode(&self, channel: ChannelId, node_id: u64, mode: SubscriptionMode) -> bool {
         let inserted = {
             let entry = self
                 .subs
                 .entry(channel.clone())
-                .or_insert_with(|| Arc::new(DashSet::new()));
-            entry.insert(node_id)
+                .or_insert_with(|| Arc::new(ChannelSubscribers::new()));
+            entry.add(node_id, mode)
         };
         {
             let entry = self
@@ -66,10 +307,13 @@ impl SubscriberRoster {
         inserted
     }
 
-    /// Remove `node_id` from `channel`. Returns true if the pair was present.
+    /// Remove `node_id` from `channel`, regardless of mode. Returns
+    /// `true` if the pair was present. Caller doesn't have to know
+    /// whether the peer was a `Broadcast` subscriber or a member of
+    /// some queue group — `remove` finds whichever it was.
     pub fn remove(&self, channel: &ChannelId, node_id: u64) -> bool {
         let removed = match self.subs.get(channel) {
-            Some(set) => set.remove(&node_id).is_some(),
+            Some(subs) => subs.remove(node_id),
             None => false,
         };
         if let Some(peer_set) = self.by_peer.get(&node_id) {
@@ -86,6 +330,10 @@ impl SubscriberRoster {
         // Pre-fix the pattern was idempotent but a future reader
         // could remove the `remove_if` predicate, thinking the outer
         // `is_empty` already covered the race.
+        //
+        // `ChannelSubscribers::is_empty` is "no broadcasters AND
+        // every queue group is empty" — the channel-level eviction
+        // semantic is unchanged from the pre-queue-group shape.
         self.subs.remove_if(channel, |_, v| v.is_empty());
         self.by_peer.remove_if(&node_id, |_, v| v.is_empty());
         removed
@@ -113,20 +361,50 @@ impl SubscriberRoster {
             Err(arc) => arc.iter().map(|c| c.clone()).collect(),
         };
         for ch in &channels {
-            if let Some(set) = self.subs.get(ch) {
-                set.remove(&node_id);
+            if let Some(subs) = self.subs.get(ch) {
+                subs.remove(node_id);
             }
             self.subs.remove_if(ch, |_, v| v.is_empty());
         }
         channels
     }
 
-    /// Snapshot of current subscribers for `channel`.
+    /// Snapshot of current subscribers for `channel`, regardless of
+    /// mode. Each peer appears at most once. This is the **set
+    /// membership** view — used by anything that asks "is this peer
+    /// subscribed?" or counts subscribers. The per-publish dispatch
+    /// view (broadcasters + one-of-N per queue group) is
+    /// [`Self::dispatch_recipients`].
     pub fn members(&self, channel: &ChannelId) -> Vec<u64> {
         match self.subs.get(channel) {
-            Some(set) => set.iter().map(|entry| *entry).collect(),
+            Some(subs) => subs.all_subscribers(),
             None => Vec::new(),
         }
+    }
+
+    /// Per-publish dispatch list for `channel`: every `Broadcast`
+    /// subscriber, plus one selected member of each non-empty queue
+    /// group. Each peer appears at most once. The publisher iterates
+    /// this list and unicasts to each recipient.
+    ///
+    /// Selection inside each queue group is round-robin against a
+    /// snapshot of the group's members — concurrent membership
+    /// changes don't poison this dispatch (they take effect on the
+    /// next call).
+    pub fn dispatch_recipients(&self, channel: &ChannelId) -> Vec<u64> {
+        match self.subs.get(channel) {
+            Some(subs) => subs.dispatch_recipients(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Mode under which `node_id` is subscribed to `channel`, if
+    /// any. Used for diagnostics and by code that needs to
+    /// distinguish broadcast subscribers from queue-group members
+    /// (e.g., the membership-change handler that surfaces a
+    /// `QueueGroup` event back to the originating peer).
+    pub fn subscriber_mode(&self, node_id: u64, channel: &ChannelId) -> Option<SubscriptionMode> {
+        self.subs.get(channel).and_then(|s| s.mode_of(node_id))
     }
 
     /// Snapshot of channels `node_id` subscribes to.
@@ -432,5 +710,274 @@ mod tests {
                 members.len(),
             );
         }
+    }
+
+    // ====================================================================
+    // SubscriptionMode::QueueGroup — work-distribution semantics.
+    //
+    // These pin the new primitive that nRPC needs: queue-group
+    // subscribers divide a stream of events among themselves
+    // (one-of-N), broadcast subscribers each receive every event
+    // (all-of-N), and the two coexist on one channel without
+    // interfering.
+    // ====================================================================
+
+    fn qg(name: &str) -> SubscriptionMode {
+        SubscriptionMode::QueueGroup(QueueGroupName::new(name))
+    }
+
+    /// Backward compat: existing callers using plain `add()` get
+    /// `Broadcast` semantics, identical to pre-change behavior.
+    /// `members()` still returns "all subscribers."
+    #[test]
+    fn add_without_mode_is_broadcast() {
+        let r = SubscriberRoster::new();
+        let c = ch("svc/req");
+        r.add(c.clone(), 1);
+        r.add(c.clone(), 2);
+        assert_eq!(
+            r.subscriber_mode(1, &c),
+            Some(SubscriptionMode::Broadcast),
+            "default add must be Broadcast",
+        );
+        assert_eq!(r.subscriber_mode(2, &c), Some(SubscriptionMode::Broadcast));
+        let mut members = r.members(&c);
+        members.sort();
+        assert_eq!(members, vec![1, 2]);
+        // dispatch_recipients matches members for broadcast-only channels.
+        let mut dispatched = r.dispatch_recipients(&c);
+        dispatched.sort();
+        assert_eq!(dispatched, vec![1, 2]);
+    }
+
+    /// Two subscribers in the same queue group: each call to
+    /// `dispatch_recipients` returns exactly ONE of them. Across
+    /// many calls the round-robin selector visits both.
+    #[test]
+    fn queue_group_dispatch_picks_one_member_per_call() {
+        let r = SubscriberRoster::new();
+        let c = ch("svc/req");
+        r.add_with_mode(c.clone(), 1, qg("workers"));
+        r.add_with_mode(c.clone(), 2, qg("workers"));
+
+        // Each individual dispatch picks exactly one of the two.
+        let mut counts = [0usize; 3];
+        for _ in 0..20 {
+            let picks = r.dispatch_recipients(&c);
+            assert_eq!(
+                picks.len(),
+                1,
+                "queue group must produce exactly one recipient per dispatch",
+            );
+            counts[picks[0] as usize] += 1;
+        }
+        assert!(
+            counts[1] > 0 && counts[2] > 0,
+            "round-robin must visit both members across 20 dispatches; got {counts:?}",
+        );
+    }
+
+    /// Broadcast and queue-group subscribers coexist on one
+    /// channel: every dispatch reaches every broadcaster AND
+    /// exactly one member of each queue group. This is the shape
+    /// nRPC needs when an audit logger broadcasts alongside
+    /// load-balanced workers.
+    #[test]
+    fn broadcast_and_queue_group_coexist_on_one_channel() {
+        let r = SubscriberRoster::new();
+        let c = ch("svc/req");
+        // 1 = audit logger (Broadcast)
+        r.add_with_mode(c.clone(), 1, SubscriptionMode::Broadcast);
+        // 10, 11, 12 = worker pool (QueueGroup)
+        r.add_with_mode(c.clone(), 10, qg("workers"));
+        r.add_with_mode(c.clone(), 11, qg("workers"));
+        r.add_with_mode(c.clone(), 12, qg("workers"));
+
+        for _ in 0..30 {
+            let picks = r.dispatch_recipients(&c);
+            // The broadcaster (1) must always be in the dispatch list.
+            assert!(picks.contains(&1), "broadcaster must always receive");
+            // Exactly one worker (10/11/12) must also be in the list.
+            let workers_in_dispatch: Vec<u64> =
+                picks.iter().copied().filter(|n| *n >= 10).collect();
+            assert_eq!(
+                workers_in_dispatch.len(),
+                1,
+                "exactly one queue-group member per dispatch; got {workers_in_dispatch:?}",
+            );
+        }
+
+        // Set membership view: members() returns ALL subscribers,
+        // not just dispatch picks.
+        let mut all = r.members(&c);
+        all.sort();
+        assert_eq!(all, vec![1, 10, 11, 12]);
+    }
+
+    /// Two distinct queue groups on the same channel each
+    /// independently pick one member per dispatch. Useful for
+    /// patterns like "request workers" + "audit shippers" where
+    /// both want one-of-N but they're disjoint pools.
+    #[test]
+    fn distinct_queue_groups_dispatch_independently() {
+        let r = SubscriberRoster::new();
+        let c = ch("svc/req");
+        r.add_with_mode(c.clone(), 1, qg("group_a"));
+        r.add_with_mode(c.clone(), 2, qg("group_a"));
+        r.add_with_mode(c.clone(), 100, qg("group_b"));
+        r.add_with_mode(c.clone(), 101, qg("group_b"));
+
+        for _ in 0..20 {
+            let picks = r.dispatch_recipients(&c);
+            // Exactly one from each group.
+            let from_a = picks.iter().filter(|&&n| n < 10).count();
+            let from_b = picks.iter().filter(|&&n| n >= 100).count();
+            assert_eq!(from_a, 1, "exactly one from group_a per dispatch");
+            assert_eq!(from_b, 1, "exactly one from group_b per dispatch");
+            assert_eq!(picks.len(), 2, "no other recipients");
+        }
+    }
+
+    /// Mode-change: re-subscribing the same peer under a different
+    /// mode moves them. The peer must end up in the new mode and
+    /// not appear in the old one. Returns `true` (newly inserted in
+    /// the new mode); same-mode re-add returns `false`.
+    #[test]
+    fn re_add_with_different_mode_moves_subscription() {
+        let r = SubscriberRoster::new();
+        let c = ch("svc/req");
+        // Start as broadcaster.
+        assert!(r.add_with_mode(c.clone(), 7, SubscriptionMode::Broadcast));
+        assert_eq!(r.subscriber_mode(7, &c), Some(SubscriptionMode::Broadcast));
+
+        // Move to a queue group: returns true (mode-change is a real insert).
+        assert!(r.add_with_mode(c.clone(), 7, qg("workers")));
+        assert_eq!(r.subscriber_mode(7, &c), Some(qg("workers")));
+
+        // Re-add to the same group: idempotent, returns false.
+        assert!(!r.add_with_mode(c.clone(), 7, qg("workers")));
+
+        // The peer appears exactly once in `members` (set membership).
+        assert_eq!(r.members(&c), vec![7]);
+        // And exactly once in `dispatch_recipients` (one-of-N from
+        // the workers group, which has only 7 in it).
+        assert_eq!(r.dispatch_recipients(&c), vec![7]);
+    }
+
+    /// `remove` finds the peer regardless of which mode they're in.
+    /// Channel eviction still fires when the channel goes fully
+    /// empty (broadcasters AND every queue group empty).
+    #[test]
+    fn remove_finds_peer_in_either_mode_and_evicts_empty_channel() {
+        let r = SubscriberRoster::new();
+        let c = ch("svc/req");
+        r.add_with_mode(c.clone(), 1, SubscriptionMode::Broadcast);
+        r.add_with_mode(c.clone(), 2, qg("workers"));
+
+        // Remove the broadcaster.
+        assert!(r.remove(&c, 1));
+        assert_eq!(r.members(&c), vec![2]);
+        // Channel still present (queue-group member remains).
+        assert_eq!(r.channel_count(), 1);
+
+        // Remove the last queue-group member.
+        assert!(r.remove(&c, 2));
+        // Channel evicted.
+        assert_eq!(r.channel_count(), 0);
+
+        // Removing an absent peer is a no-op.
+        assert!(!r.remove(&c, 1));
+    }
+
+    /// Regression: when the last member of a queue group leaves,
+    /// the QueueGroup entry itself is evicted from the
+    /// `queue_groups` map. Without this, a peer that subscribes /
+    /// unsubscribes under N distinct group names leaves N empty
+    /// shells per channel — bounded only by attacker effort. The
+    /// `is_empty` channel-eviction predicate also depends on
+    /// post-removal cleanup so a churning channel doesn't leak
+    /// unbounded empty groups.
+    #[test]
+    fn empty_queue_groups_are_evicted_on_last_member_leaving() {
+        let r = SubscriberRoster::new();
+        let c = ch("svc/req");
+        // Three distinct group names, one subscriber each.
+        r.add_with_mode(c.clone(), 1, qg("group-a"));
+        r.add_with_mode(c.clone(), 2, qg("group-b"));
+        r.add_with_mode(c.clone(), 3, qg("group-c"));
+
+        // Probe the internal map size via a channel-level helper —
+        // we can't borrow the internal DashMap directly, so check
+        // `dispatch_recipients` which iterates `queue_groups`. With
+        // 3 groups, dispatch returns 3 recipients (one per group).
+        assert_eq!(r.dispatch_recipients(&c).len(), 3);
+
+        // Remove all three. After the last removal the channel
+        // entry itself should be evicted.
+        assert!(r.remove(&c, 1));
+        assert!(r.remove(&c, 2));
+        assert!(r.remove(&c, 3));
+        // No queue-group shells left → channel is fully empty →
+        // outer `subs` map evicts the channel entry.
+        assert_eq!(r.channel_count(), 0);
+
+        // Re-add a fresh subscriber with one of the previously-used
+        // group names: succeeds (the prior shell was evicted, so we
+        // start clean) and the channel reappears.
+        assert!(r.add_with_mode(c.clone(), 1, qg("group-a")));
+        assert_eq!(r.channel_count(), 1);
+        assert_eq!(r.dispatch_recipients(&c), vec![1]);
+    }
+
+    /// `remove_peer` (failure-driven cleanup) clears the peer from
+    /// every channel they were subscribed to, regardless of mode on
+    /// each. Pin so a future change to `ChannelSubscribers::remove`
+    /// can't quietly miss queue-group entries.
+    #[test]
+    fn remove_peer_clears_across_modes() {
+        let r = SubscriberRoster::new();
+        let a = ch("a/svc");
+        let b = ch("b/svc");
+        r.add_with_mode(a.clone(), 42, SubscriptionMode::Broadcast);
+        r.add_with_mode(b.clone(), 42, qg("workers"));
+        r.add_with_mode(a.clone(), 7, SubscriptionMode::Broadcast);
+
+        let cleared = r.remove_peer(42);
+        assert_eq!(cleared.len(), 2);
+        assert_eq!(r.members(&a), vec![7]);
+        assert!(r.members(&b).is_empty());
+        assert_eq!(r.channels_for_peer_count(42), 0);
+    }
+
+    /// The set-membership cap (`channels_for_peer_count`) counts a
+    /// peer's subscriptions across modes. A peer subscribed to 3
+    /// channels — one Broadcast, two QueueGroup — counts as 3
+    /// against the per-peer channel cap. Pin so the cap stays
+    /// mode-agnostic (it's a resource cap on subscription state,
+    /// not a "broadcast budget").
+    #[test]
+    fn channels_for_peer_count_aggregates_across_modes() {
+        let r = SubscriberRoster::new();
+        r.add_with_mode(ch("a/x"), 1, SubscriptionMode::Broadcast);
+        r.add_with_mode(ch("b/x"), 1, qg("g1"));
+        r.add_with_mode(ch("c/x"), 1, qg("g2"));
+        assert_eq!(r.channels_for_peer_count(1), 3);
+    }
+
+    /// The idempotent-resubscribe cap-suppression that mesh.rs
+    /// `authorize_subscribe` relies on (`is_subscribed` returning
+    /// true for any mode the peer is in) must still work for
+    /// queue-group peers. A peer at the per-peer channel cap that
+    /// resubscribes to a channel they already hold (in any mode)
+    /// must NOT trip `TooManyChannels`.
+    #[test]
+    fn is_subscribed_returns_true_regardless_of_mode() {
+        let r = SubscriberRoster::new();
+        let c = ch("svc/req");
+        r.add_with_mode(c.clone(), 1, SubscriptionMode::Broadcast);
+        r.add_with_mode(c.clone(), 2, qg("workers"));
+        assert!(r.is_subscribed(1, &c));
+        assert!(r.is_subscribed(2, &c));
+        assert!(!r.is_subscribed(3, &c));
     }
 }

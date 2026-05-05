@@ -372,6 +372,91 @@ net_mesh_stream_t   // Opaque per-peer stream handle.
 - [`net/README.md`](../README.md) — architectural overview, NAT
   traversal design, channel visibility model.
 
+## nRPC (request / response over the mesh)
+
+nRPC is the request/response convention layer (deadlines,
+queue-group fan-out, response streaming, end-to-end cancellation)
+riding on top of the pub/sub mesh. The C SDK at `net.h` does
+**not** expose the nRPC surface today; the C ABI lives in a
+separate cdylib at [`bindings/go/rpc-ffi`](../bindings/go/rpc-ffi)
+that's primarily consumed by the Go binding but is callable from
+any C-ABI consumer.
+
+**Library:** `libnet_rpc` (cdylib + staticlib). Build:
+
+```bash
+cargo build --release -p net-rpc-ffi
+# Header: there's no shipped .h for libnet_rpc today — the canonical
+# C signatures live in:
+#   bindings/go/net/mesh_rpc.go   (cgo include block — drop-in template)
+#   bindings/go/rpc-ffi/src/lib.rs (Rust definitions of every export)
+```
+
+**ABI version:** consumers SHOULD call `net_rpc_abi_version() ->
+uint32_t` at process init and refuse to load on mismatch. Version
+`0x0001` covers Phase B5 (lifecycle + unary call + serve +
+service discovery) plus B6 (streaming + ABI version stamp).
+
+**Entry-point families:**
+
+```c
+// Lifecycle.
+extern uint32_t net_rpc_abi_version(void);
+extern void     net_rpc_set_handler_dispatcher(RpcHandlerFn dispatcher);
+extern MeshRpcHandle* net_rpc_new(void* node_arc);  // consumes Arc<MeshNode>
+extern void           net_rpc_free(MeshRpcHandle*);
+
+// Unary calls — synchronous (block_on under the hood).
+extern int net_rpc_call(MeshRpcHandle*, uint64_t target, ...);
+extern int net_rpc_call_service(MeshRpcHandle*, ...);
+
+// Service discovery.
+extern int net_rpc_find_service_nodes(MeshRpcHandle*, ...);
+
+// Serve — caller registers a handler in its own registry keyed
+// on the returned handler_id, then `net_rpc_set_handler_dispatcher`
+// gets invoked back into the consumer with that id.
+extern ServeHandleC* net_rpc_serve(MeshRpcHandle*, ...);
+extern void          net_rpc_serve_handle_close(ServeHandleC*);
+extern void          net_rpc_serve_handle_free(ServeHandleC*);
+
+// Streaming — opaque RpcStream handle, blocking next, explicit grant.
+extern int  net_rpc_call_streaming(MeshRpcHandle*, ...);
+extern int  net_rpc_stream_next(RpcStreamHandleC*, ...);
+extern int  net_rpc_stream_grant(RpcStreamHandleC*, uint32_t amount);
+extern void net_rpc_stream_close(RpcStreamHandleC*);
+extern void net_rpc_stream_free(RpcStreamHandleC*);
+
+// Ownership: every Vec<u8> / CString returned out-of-band is
+// freed via the matching net_rpc_response_free /
+// net_rpc_find_service_nodes_free / net_rpc_free_cstring.
+```
+
+**Error codes (`int` return):**
+
+| Code | Constant                       | Meaning                                              |
+| ---- | ------------------------------ | ---------------------------------------------------- |
+|  `0` | `NET_RPC_OK`                   | Success.                                             |
+| `-1` | `NET_RPC_ERR_NULL`             | NULL pointer where a handle was expected.            |
+| `-2` | `NET_RPC_ERR_CALL_FAILED`      | Generic — structured detail in `**out_err` CString.  |
+| `-3` | `NET_RPC_ERR_ALREADY_SERVING`  | `serve` rejected — handler already registered.       |
+| `-4` | `NET_RPC_ERR_NO_DISPATCHER`    | `set_handler_dispatcher` was never called.           |
+| `-5` | `NET_RPC_ERR_INVALID_UTF8`     | Non-UTF-8 bytes where a string was expected.         |
+| `-6` | `NET_RPC_ERR_STREAM_DONE`      | Stream produced its terminal item; release handle.   |
+
+**Structured error format:** `format_rpc_error` emits
+`<kind>: <detail>` (no `nrpc:` prefix; consumers add it). Kinds:
+`no_route`, `timeout`, `server_error` (`status=0xNNNN`),
+`transport`, `codec_encode`, `codec_decode`. Application-defined
+status codes are in `0x8000..=0xFFFF`; the SDK stables
+`NRPC_TYPED_BAD_REQUEST = 0x8000` and
+`NRPC_TYPED_HANDLER_ERROR = 0x8001` for typed-handler decode /
+runtime errors.
+
+For the canonical cross-binding contract spec — including the
+`cross_lang_echo_sum` service used by every binding's wire-format
+compat test — see [`net/README.md#nrpc`](../README.md#nrpc).
+
 ## Behavior changes in v0.10 (FFI)
 
 ### Panics no longer unwind across the FFI boundary

@@ -18,4 +18,4 @@ pub use membership::{
 };
 pub use name::{channel_hash, ChannelError, ChannelId, ChannelName, ChannelRegistry};
 pub use publisher::{ChannelPublisher, OnFailure, PublishConfig, PublishReport};
-pub use roster::SubscriberRoster;
+pub use roster::{QueueGroupName, SubscriberRoster, SubscriptionMode};

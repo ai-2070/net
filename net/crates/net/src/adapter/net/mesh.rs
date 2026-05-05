@@ -256,6 +256,12 @@ struct DispatchCtx {
     router: Arc<NetRouter>,
     failure_detector: Arc<FailureDetector>,
     inbound: InboundQueues,
+    /// Per-channel-hash dispatch hook for nRPC. See the matching
+    /// field on `MeshNode`. Gated on `cortex` because the nRPC
+    /// dispatcher type lives there and the `--features net`-only
+    /// build doesn't compile the cortex layer.
+    #[cfg(feature = "cortex")]
+    rpc_inbound_dispatchers: Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
     ///
@@ -1049,6 +1055,54 @@ pub struct MeshNode {
     failure_detector: Arc<FailureDetector>,
     /// Inbound event queues (shared with receive loop)
     inbound: InboundQueues,
+    /// Per-channel-hash dispatch hook for nRPC. When an inbound
+    /// event's `channel_hash` matches a registered dispatcher,
+    /// the event is routed there directly instead of landing in
+    /// the per-shard `inbound` queue. Lookup is one DashMap get
+    /// per packet on the hot path; absent registrations skip the
+    /// branch entirely.
+    #[cfg(feature = "cortex")]
+    rpc_inbound_dispatchers: Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
+    /// Pending oneshots for in-flight `Mesh::call` invocations.
+    /// Shared with the per-Mesh `RpcClientFold` so RESPONSE events
+    /// arriving on reply channels complete the right call's
+    /// awaiting future.
+    #[cfg(feature = "cortex")]
+    rpc_client_pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
+    /// Per-caller monotonic call id allocator. Used as the
+    /// `EventMeta::seq_or_ts` correlation id on outgoing REQUEST
+    /// events.
+    #[cfg(feature = "cortex")]
+    rpc_next_call_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Independent fetch_add counter used by `RoutingPolicy::
+    /// RoundRobin` and `Random` so two concurrent `call_service`
+    /// invocations don't observe the same value (which would have
+    /// happened if we consulted `rpc_next_call_id` via `load` —
+    /// since the actual call_id allocation happens later in
+    /// `call(...)`, two concurrent selections could read the same
+    /// pre-bump value and pick the same target).
+    #[cfg(feature = "cortex")]
+    rpc_round_robin_cursor: Arc<std::sync::atomic::AtomicU64>,
+    /// Tracks `(target_node_id, service)` pairs we've already
+    /// established a reply-channel subscription for. `Mesh::call`
+    /// consults this to skip the round-trip subscribe on
+    /// subsequent calls to the same (target, service).
+    #[cfg(feature = "cortex")]
+    rpc_reply_subscriptions: Arc<parking_lot::Mutex<Vec<(u64, String)>>>,
+    /// nRPC services the local node currently handles (registered
+    /// via `Mesh::serve_rpc`, deregistered when the `ServeHandle`
+    /// drops). `announce_capabilities` merges these as
+    /// `nrpc:<service>` tags into the announced `CapabilitySet`,
+    /// so other nodes' capability indexes can find this node via
+    /// `Mesh::find_service_nodes(name)`.
+    #[cfg(feature = "cortex")]
+    rpc_local_services: Arc<dashmap::DashSet<String>>,
+    /// Caller-side per-service nRPC metrics. Updated by
+    /// `Mesh::call` via the `mesh_rpc_metrics::CallMetricsGuard`
+    /// RAII shim; read out via `Self::rpc_metrics_snapshot` for
+    /// Prometheus exposure or custom observability.
+    #[cfg(feature = "cortex")]
+    rpc_metrics: Arc<crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry>,
     /// Optional migration subprotocol handler — same `ArcSwapOption`
     /// surface as on `MeshNode`, propagated into the dispatch
     /// context so the packet-receive loop stays lock-free.
@@ -1479,6 +1533,20 @@ impl MeshNode {
             router,
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
+            #[cfg(feature = "cortex")]
+            rpc_inbound_dispatchers: Arc::new(DashMap::new()),
+            #[cfg(feature = "cortex")]
+            rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
+            #[cfg(feature = "cortex")]
+            rpc_next_call_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            #[cfg(feature = "cortex")]
+            rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "cortex")]
+            rpc_reply_subscriptions: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            #[cfg(feature = "cortex")]
+            rpc_local_services: Arc::new(dashmap::DashSet::new()),
+            #[cfg(feature = "cortex")]
+            rpc_metrics: Arc::new(crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             pending_direct_initiators,
@@ -2305,6 +2373,8 @@ impl MeshNode {
             router: self.router.clone(),
             failure_detector: self.failure_detector.clone(),
             inbound: self.inbound.clone(),
+            #[cfg(feature = "cortex")]
+            rpc_inbound_dispatchers: self.rpc_inbound_dispatchers.clone(),
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
@@ -3533,6 +3603,32 @@ impl MeshNode {
             }
         }
 
+        // nRPC dispatch hook: if a dispatcher is registered for the
+        // inbound packet's `channel_hash`, route every event from
+        // this packet directly to the dispatcher and skip the
+        // shard-inbound push. RPC needs per-channel routing
+        // (events for `<service>.requests` drive the server fold;
+        // events for `<service>.replies.<origin>` drive the
+        // client fold) which the shard queue can't provide because
+        // it strips the channel name on ingress.
+        //
+        // Hot-path cost: one DashMap get per packet. Absent
+        // registrations skip the loop entirely.
+        #[cfg(feature = "cortex")]
+        if let Some(dispatcher) = ctx.rpc_inbound_dispatchers.get(&parsed.header.channel_hash) {
+            let dispatcher = dispatcher.clone();
+            let channel_hash = parsed.header.channel_hash;
+            let origin_hash = parsed.header.origin_hash;
+            for event_data in events.into_iter() {
+                dispatcher(crate::adapter::net::cortex::RpcInboundEvent {
+                    channel_hash,
+                    origin_hash,
+                    payload: event_data,
+                });
+            }
+            return;
+        }
+
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
@@ -3956,6 +4052,158 @@ impl MeshNode {
         &self.roster
     }
 
+    /// Register a per-channel-hash inbound dispatcher for nRPC.
+    ///
+    /// When the mesh's inbound dispatch sees a packet whose
+    /// `NetHeader::channel_hash` matches `channel_hash`, it routes
+    /// every event in the packet to `dispatcher` and skips the
+    /// per-shard inbound queue. Used by `Mesh::serve_rpc` /
+    /// `Mesh::call` to receive RPC events without polling the
+    /// shard queue.
+    ///
+    /// Returns the previous dispatcher (if any) so callers can
+    /// detect a slot collision (typically a programming error —
+    /// two `serve_rpc` registrations for the same service on the
+    /// same node, or a hash collision between two different
+    /// channel names; the latter is bounded at ~1/65536 per pair).
+    ///
+    /// **Hot-path cost.** One DashMap get per inbound packet.
+    /// Absent registrations skip the conditional entirely.
+    #[cfg(feature = "cortex")]
+    pub fn register_rpc_inbound(
+        &self,
+        channel_hash: u16,
+        dispatcher: crate::adapter::net::cortex::RpcInboundDispatcher,
+    ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
+        self.rpc_inbound_dispatchers
+            .insert(channel_hash, dispatcher)
+    }
+
+    /// Remove the registered dispatcher for `channel_hash`. Returns
+    /// the prior dispatcher if one was registered. After removal,
+    /// inbound events for `channel_hash` resume landing in the
+    /// per-shard inbound queue.
+    #[cfg(feature = "cortex")]
+    pub fn unregister_rpc_inbound(
+        &self,
+        channel_hash: u16,
+    ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
+        self.rpc_inbound_dispatchers
+            .remove(&channel_hash)
+            .map(|(_, v)| v)
+    }
+
+    /// Cheap probe: is a dispatcher already registered for this
+    /// channel hash? Used by the caller-side
+    /// `ensure_reply_subscription` to skip a redundant registration
+    /// when multiple targets serve the same service (they share
+    /// one reply channel + one dispatcher per caller).
+    #[cfg(feature = "cortex")]
+    pub fn rpc_inbound_dispatcher_registered(&self, channel_hash: u16) -> bool {
+        self.rpc_inbound_dispatchers.contains_key(&channel_hash)
+    }
+
+    /// Per-Mesh shared `RpcClientPending` — accessor for the
+    /// `mesh_rpc::Mesh::call` glue. Pending oneshots awaiting
+    /// RESPONSE events live here.
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_client_pending_arc(
+        &self,
+    ) -> Arc<crate::adapter::net::cortex::RpcClientPending> {
+        self.rpc_client_pending.clone()
+    }
+
+    /// Per-Mesh monotonic call-id allocator. Accessor for
+    /// `mesh_rpc::Mesh::call`.
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_next_call_id_arc(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.rpc_next_call_id.clone()
+    }
+
+    /// Independent rotation counter for `RoutingPolicy::RoundRobin`
+    /// / `Random`. See the field's doc-comment on `MeshNode` for
+    /// the rationale (avoid concurrent `select_target` calls
+    /// observing the same value).
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_round_robin_cursor_arc(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.rpc_round_robin_cursor.clone()
+    }
+
+    /// Tracks already-established (target, service) reply
+    /// subscriptions. Accessor for `mesh_rpc::Mesh::call`'s
+    /// lazy-subscribe path.
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_reply_subscriptions_arc(
+        &self,
+    ) -> Arc<parking_lot::Mutex<Vec<(u64, String)>>> {
+        self.rpc_reply_subscriptions.clone()
+    }
+
+    /// This node's `origin_hash` (8-byte BLAKE2s of the entity
+    /// public key). Accessor for `mesh_rpc::Mesh::serve_rpc` /
+    /// `Mesh::call` to stamp on outgoing REQUEST / RESPONSE meta
+    /// headers.
+    #[cfg(feature = "cortex")]
+    pub(super) fn public_key_origin_hash(&self) -> u64 {
+        self.identity.entity_id().origin_hash()
+    }
+
+    /// Registry of nRPC services this node currently serves.
+    /// `mesh_rpc::serve_rpc` adds entries; `ServeHandle::Drop`
+    /// removes them. `announce_capabilities` reads this to
+    /// auto-merge `nrpc:<service>` tags.
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_local_services_arc(&self) -> Arc<dashmap::DashSet<String>> {
+        self.rpc_local_services.clone()
+    }
+
+    /// Per-Mesh caller-side nRPC metrics registry. Accessor for
+    /// `mesh_rpc::Mesh::call` to bump counters on each outgoing
+    /// call.
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_metrics_arc(
+        &self,
+    ) -> Arc<crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry> {
+        self.rpc_metrics.clone()
+    }
+
+    /// Snapshot of caller-side nRPC metrics. Cheap (one DashMap
+    /// iteration); call on every Prometheus scrape. Format with
+    /// `RpcMetricsSnapshot::prometheus_text`.
+    #[cfg(feature = "cortex")]
+    pub fn rpc_metrics_snapshot(
+        &self,
+    ) -> crate::adapter::net::mesh_rpc_metrics::RpcMetricsSnapshot {
+        self.rpc_metrics.snapshot()
+    }
+
+    /// Capability index — accessor for `mesh_rpc::Mesh::find_service_nodes`
+    /// to query nodes carrying the `nrpc:<service>` tag.
+    #[cfg(feature = "cortex")]
+    pub(super) fn capability_index_arc(
+        &self,
+    ) -> Arc<crate::adapter::net::behavior::capability::CapabilityIndex> {
+        self.capability_index.clone()
+    }
+
+    /// Bridge from session-layer `node_id: u64` to entity-layer
+    /// `[u8; 32]` (the ed25519 public key, used as the
+    /// `ProximityGraph` key). `mesh_rpc`'s `LowestLatency` policy
+    /// and `filter_unhealthy` option use this to look up
+    /// proximity / health data per RPC candidate.
+    ///
+    /// Returns `None` for nodes the local mesh has not yet seen
+    /// an `IdentityEnvelope` from (typically: a node we know
+    /// about via capability announcement but haven't completed
+    /// a handshake with). Callers treat `None` as "no
+    /// proximity-derivable signal," not as "node is dead."
+    #[cfg(feature = "cortex")]
+    pub(super) fn entity_id_for_node(&self, node_id: u64) -> Option<[u8; 32]> {
+        self.peer_entity_ids
+            .get(&node_id)
+            .map(|e| *e.value().as_bytes())
+    }
+
     /// Install a `ChannelConfigRegistry` whose `can_subscribe` /
     /// `can_publish` rules are consulted for incoming Subscribe
     /// messages.
@@ -3988,13 +4236,15 @@ impl MeshNode {
     /// accepted the subscribe; `AckReason` failures surface as
     /// `AdapterError::Connection`. No token is presented — use
     /// [`Self::subscribe_channel_with_token`] for channels with
-    /// `require_token` set.
+    /// `require_token` set. Mode defaults to `Broadcast` (every published
+    /// event delivered to this subscriber); use
+    /// [`Self::subscribe_channel_in_queue_group`] for work-distribution.
     pub async fn subscribe_channel(
         &self,
         publisher_node_id: u64,
         channel: ChannelName,
     ) -> Result<(), AdapterError> {
-        self.send_membership_request(publisher_node_id, channel, true, None)
+        self.send_membership_request(publisher_node_id, channel, true, None, None)
             .await
     }
 
@@ -4008,18 +4258,63 @@ impl MeshNode {
         channel: ChannelName,
         token: PermissionToken,
     ) -> Result<(), AdapterError> {
-        self.send_membership_request(publisher_node_id, channel, true, Some(token.to_bytes()))
+        self.send_membership_request(
+            publisher_node_id,
+            channel,
+            true,
+            Some(token.to_bytes()),
+            None,
+        )
+        .await
+    }
+
+    /// Subscribe in the named queue group: every published event is
+    /// delivered to exactly ONE member of the group, distributed
+    /// round-robin across members. The publisher's roster carries
+    /// the mode; the same `(channel, queue_group)` pair across
+    /// multiple subscribers forms one work-distribution pool. Used
+    /// by request/response patterns (nRPC) and any one-of-N
+    /// job-distribution shape.
+    pub async fn subscribe_channel_in_queue_group(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+        queue_group: String,
+    ) -> Result<(), AdapterError> {
+        self.send_membership_request(publisher_node_id, channel, true, None, Some(queue_group))
             .await
     }
 
+    /// Queue-group subscribe with a pre-issued
+    /// [`PermissionToken`]. Same auth flow as
+    /// [`Self::subscribe_channel_with_token`], queue-group
+    /// semantics from [`Self::subscribe_channel_in_queue_group`].
+    pub async fn subscribe_channel_in_queue_group_with_token(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+        queue_group: String,
+        token: PermissionToken,
+    ) -> Result<(), AdapterError> {
+        self.send_membership_request(
+            publisher_node_id,
+            channel,
+            true,
+            Some(token.to_bytes()),
+            Some(queue_group),
+        )
+        .await
+    }
+
     /// Ask `publisher_node_id` to remove this node from `channel`'s
-    /// subscriber set. Mirror of `subscribe_channel`.
+    /// subscriber set. Mirror of `subscribe_channel`. Mode-agnostic
+    /// — unsubscribe finds the peer in whichever mode they're in.
     pub async fn unsubscribe_channel(
         &self,
         publisher_node_id: u64,
         channel: ChannelName,
     ) -> Result<(), AdapterError> {
-        self.send_membership_request(publisher_node_id, channel, false, None)
+        self.send_membership_request(publisher_node_id, channel, false, None, None)
             .await
     }
 
@@ -4029,6 +4324,7 @@ impl MeshNode {
         channel: ChannelName,
         subscribe: bool,
         token: Option<Vec<u8>>,
+        queue_group: Option<String>,
     ) -> Result<(), AdapterError> {
         let peer_addr = {
             let peer = self.peers.get(&publisher_node_id).ok_or_else(|| {
@@ -4050,6 +4346,7 @@ impl MeshNode {
                 channel: channel.clone(),
                 nonce,
                 token,
+                queue_group,
             }
         } else {
             MembershipMsg::Unsubscribe {
@@ -4114,6 +4411,7 @@ impl MeshNode {
                 channel,
                 nonce,
                 token,
+                queue_group,
             } => {
                 let (accepted, reason) =
                     Self::authorize_subscribe(&channel, from_node, token.as_deref(), ctx);
@@ -4121,12 +4419,22 @@ impl MeshNode {
                     // Populate the AuthGuard fast path so publish
                     // fan-out can admit this subscriber in <10 ns
                     // without re-walking the ACL. Mirrors the
-                    // `roster.add` below — both are keyed on the
-                    // channel name so they stay consistent.
+                    // `roster.add_with_mode` below — both are
+                    // keyed on the channel name so they stay
+                    // consistent. Auth is mode-agnostic: a
+                    // subscriber's queue-group choice doesn't
+                    // change which capability tokens authorize the
+                    // channel.
                     ctx.auth_guard
                         .allow_channel(subscriber_origin_hash(from_node), &channel);
                     let id = ChannelId::new(channel);
-                    ctx.roster.add(id, from_node);
+                    let mode = match queue_group {
+                        None => crate::adapter::net::channel::SubscriptionMode::Broadcast,
+                        Some(name) => crate::adapter::net::channel::SubscriptionMode::QueueGroup(
+                            crate::adapter::net::channel::QueueGroupName::new(name),
+                        ),
+                    };
+                    ctx.roster.add_with_mode(id, from_node, mode);
                     Self::clear_auth_failures(from_node, ctx);
                 } else if !matches!(
                     reason,
@@ -5161,7 +5469,23 @@ impl MeshNode {
         // Snapshot subscribers at call time; late subscribers won't see
         // this publish, early-unsubscribes may still receive it — both
         // are documented non-goals.
-        let mut subscribers = self.roster.members(publisher.channel());
+        //
+        // `dispatch_recipients` is the per-publish view: every
+        // `Broadcast` subscriber plus one selected member of each
+        // queue group on this channel. The `members()` API still
+        // exists for set-membership queries; this path wants the
+        // dispatch view because that's what enforces the
+        // one-of-N delivery semantic for queue-group subscribers.
+        //
+        // Sharp edge: if a queue-group member is selected here and
+        // then denied by the auth-guard / visibility filters
+        // below, the publish is dropped for that group on this
+        // call (no per-publish retry against a different group
+        // member). In practice queue-group members share a
+        // capability posture (same operator, same tokens), so the
+        // failure case is rare; documented in
+        // `docs/misc/NRPC_DESIGN.md` open-questions.
+        let mut subscribers = self.roster.dispatch_recipients(publisher.channel());
 
         // Subnet visibility filter. Look up the channel's
         // configured visibility; if the channel has no registry
@@ -5301,7 +5625,7 @@ impl MeshNode {
                 // results anyway.
                 for peer_id in &subscribers {
                     match self
-                        .publish_to_peer(*peer_id, stream_id, reliable, events)
+                        .publish_to_peer(*peer_id, channel_hash, stream_id, reliable, events)
                         .await
                     {
                         Ok(()) => report.delivered += 1,
@@ -5322,8 +5646,14 @@ impl MeshNode {
                         let _permit = permit.acquire_owned().await.ok();
                         (
                             peer_id,
-                            self.publish_to_peer(peer_id, stream_id, reliable, &events_owned)
-                                .await,
+                            self.publish_to_peer(
+                                peer_id,
+                                channel_hash,
+                                stream_id,
+                                reliable,
+                                &events_owned,
+                            )
+                            .await,
                         )
                     };
                     handles.push(fut);
@@ -5363,7 +5693,7 @@ impl MeshNode {
     /// ordering holds within a session. Hash collisions between channels
     /// are possible but harmless here — streams are opaque u64 to the
     /// transport and have no ACL meaning.
-    fn publish_stream_id(channel: &ChannelId) -> u64 {
+    pub(super) fn publish_stream_id(channel: &ChannelId) -> u64 {
         // Place channel hash in the low 16 bits; the upper bits stay zero
         // so that channel-keyed publisher streams don't alias the common
         // subprotocol range (0x0400..0x0A00).
@@ -5373,9 +5703,15 @@ impl MeshNode {
     /// Send one per-peer leg of a publish. Reuses the same packet-build
     /// path as `send_on_stream`, with an explicit stream opened per
     /// `(peer, channel)` pair.
-    async fn publish_to_peer(
+    /// Direct unicast publish of `events` to `peer_node_id` on the
+    /// channel identified by `channel_hash`. Used by `Mesh::publish`
+    /// (which routes via the subscriber roster) and by the
+    /// `mesh_rpc` glue (which knows the target directly and bypasses
+    /// the roster).
+    pub(super) async fn publish_to_peer(
         &self,
         peer_node_id: u64,
+        channel_hash: u16,
         stream_id: u64,
         reliable: bool,
         events: &[Bytes],
@@ -5427,6 +5763,17 @@ impl MeshNode {
 
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
+        // Stamp `channel_hash` on the outbound packet header so the
+        // receiver can route per-channel. The mesh's pub/sub
+        // historically routed entirely via the subscriber roster
+        // and the wire-level `channel_hash` rode at 0, so per-
+        // channel inbound dispatchers (e.g. nRPC's
+        // `register_rpc_inbound`) couldn't differentiate. Stamping
+        // it makes the wire carry the channel identity the receiver
+        // needs; the roster path is unaffected (the receiver's
+        // shard-inbound queue still gets the event when no per-
+        // channel dispatcher is registered).
+        builder.set_channel_hash(channel_hash);
         // Match the rest of the sender call sites
         // (`send_to_peer:3661`, `send_to_peer:3685`, `send_routed:3755`,
         // `send_routed:3785`, `send_on_stream:6110`, `mod.rs:1016, 1063`):
@@ -5549,6 +5896,28 @@ impl MeshNode {
         ttl: Duration,
         sign: bool,
     ) -> Result<(), AdapterError> {
+        // Merge nRPC service registrations as `nrpc:<service>` tags.
+        // Other nodes' capability indexes pick these up, letting
+        // `Mesh::find_service_nodes(name)` resolve us as a server
+        // for the registered services. Local-only state from
+        // `Mesh::serve_rpc`; deduped against existing tags so a
+        // user that pre-tagged manually doesn't get double entries.
+        // Gated on `cortex` because `rpc_local_services` only
+        // exists when the cortex layer (which provides serve_rpc)
+        // is compiled in.
+        #[cfg(feature = "cortex")]
+        let caps = if self.rpc_local_services.is_empty() {
+            caps
+        } else {
+            let mut merged = caps;
+            for svc in self.rpc_local_services.iter() {
+                let tag = format!("nrpc:{}", svc.as_str());
+                if !merged.tags.iter().any(|t| t == &tag) {
+                    merged.tags.push(tag);
+                }
+            }
+            merged
+        };
         let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Piggyback the current NAT classification as a `nat:*`
@@ -8435,7 +8804,14 @@ mod heartbeat_aead_tests {
         let start = src
             .find("async fn publish_to_peer(")
             .expect("publish_to_peer must exist");
-        let scan_end = (start + 6000).min(src.len());
+        // Round down to a char boundary — the source has multibyte
+        // box-drawing characters in doc comments, and a fixed-byte
+        // window can land mid-UTF-8 sequence after edits to the
+        // surrounding code shift offsets.
+        let mut scan_end = (start + 6000).min(src.len());
+        while scan_end < src.len() && !src.is_char_boundary(scan_end) {
+            scan_end += 1;
+        }
         let body = &src[start..scan_end];
 
         assert!(

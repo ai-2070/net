@@ -22,6 +22,7 @@ mod config;
 mod envelope;
 mod error;
 mod meta;
+pub mod rpc;
 #[cfg(feature = "cortex")]
 mod watermark;
 
@@ -37,4 +38,17 @@ pub use error::CortexAdapterError;
 pub use meta::{
     compute_checksum, compute_checksum_with_meta, EventMeta, DISPATCH_RAW, EVENT_META_SIZE,
     FLAG_CAUSAL, FLAG_CONTINUITY_PROOF,
+};
+pub use rpc::{
+    build_trace_headers, classify_streaming_chunk, decode_stream_grant, encode_stream_grant,
+    extract_trace_context, parse_stream_window_initial, request_wire_size, response_wire_size,
+    RpcAsyncResponseEmitter, RpcCancellationToken, RpcClientFold, RpcClientPending, RpcCodecError,
+    RpcContext, RpcHandler, RpcHandlerError, RpcHeader, RpcInboundDispatcher, RpcInboundEvent,
+    RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload, RpcResponseSink, RpcServerFold,
+    RpcServerStreamingFold, RpcStatus, RpcStreamingHandler, StreamItem, StreamingChunkKind,
+    TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_DEADLINE_EXCEEDED, DISPATCH_RPC_REQUEST,
+    DISPATCH_RPC_RESPONSE, DISPATCH_RPC_STREAM_GRANT, FLAG_RPC_PROPAGATE_TRACE,
+    FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_CONTINUE,
+    HEADER_NRPC_STREAMING_END, HEADER_NRPC_STREAM_WINDOW_INITIAL, MAX_RPC_BODY_LEN,
+    MAX_RPC_HEADERS, MAX_RPC_HEADER_NAME_LEN, MAX_RPC_HEADER_VALUE_LEN, MAX_RPC_SERVICE_NAME_LEN,
 };

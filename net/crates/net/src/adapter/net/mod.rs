@@ -43,6 +43,16 @@ mod crypto;
 mod failure;
 pub mod identity;
 mod mesh;
+// nRPC glue + metrics depend on the cortex fold types (RpcServerFold,
+// RpcClientPending, etc.) and the per-channel-hash inbound dispatcher
+// hook the cortex layer wires up. They're meaningless without
+// `cortex` enabled, and unconditionally exposing them broke `--features
+// net` builds (mesh_rpc.rs references `super::cortex::*`). Gating both
+// keeps the bare-net build clean.
+#[cfg(feature = "cortex")]
+pub mod mesh_rpc;
+#[cfg(feature = "cortex")]
+pub mod mesh_rpc_metrics;
 #[cfg(feature = "netdb")]
 pub mod netdb;
 mod pool;

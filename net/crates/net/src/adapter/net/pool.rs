@@ -895,6 +895,19 @@ impl<'a> ThreadLocalPooledBuilder<'a> {
             .build_subprotocol(stream_id, sequence, events, flags, subprotocol_id)
     }
 
+    /// Set the channel hash on the underlying builder so the next
+    /// `build*` call stamps it on the outgoing packet header.
+    /// Used by the publish path to thread the channel identity onto
+    /// the wire (so receiver-side per-channel dispatchers like
+    /// nRPC's `register_rpc_inbound` can route).
+    #[inline]
+    pub fn set_channel_hash(&mut self, channel_hash: u16) {
+        self.builder
+            .as_mut()
+            .expect("BUG: PooledBuilder used after drop")
+            .set_channel_hash(channel_hash);
+    }
+
     /// Check if events would fit in a single packet
     #[inline]
     pub fn would_fit(&self, events: &[Bytes]) -> bool {

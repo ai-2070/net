@@ -15,8 +15,13 @@ mod compute;
 mod cortex;
 #[cfg(feature = "groups")]
 mod groups;
+// nRPC binding (B1: raw-bytes serve_rpc / call / call_streaming).
+// Reuses the cortex feature gate because nRPC is part of the
+// cortex / netdb feature unit.
 #[cfg(feature = "net")]
 mod identity;
+#[cfg(feature = "cortex")]
+mod mesh_rpc;
 #[cfg(feature = "redis")]
 mod redis_dedup;
 #[cfg(feature = "net")]
@@ -1893,20 +1898,35 @@ mod mesh_bindings {
         }
 
         /// Clone an `Arc<MeshNode>` out of the `ArcSwapOption`
-        /// slot. Used by sibling modules (currently: `compute`)
+        /// slot. Used by sibling modules (`compute`, `mesh_rpc`)
         /// that build their own SDK-level wrappers against the
         /// same live node — no second UDP socket, no second
         /// handshake table. Returns an error if the node has
         /// been shut down.
-        #[cfg(feature = "compute")]
+        ///
+        /// Read the slot once and inspect the snapshot — a
+        /// concurrent shutdown can swap to None between the
+        /// `load` inside `load_node` and a subsequent re-check,
+        /// so the previous "load_node + as_ref + expect" pattern
+        /// could panic on a real shutdown race. Surface as a
+        /// typed error instead.
+        #[cfg(any(feature = "compute", feature = "cortex"))]
         pub(crate) fn node_arc_clone(&self) -> Result<Arc<MeshNode>> {
-            let guard = self.load_node()?;
-            Ok(guard.as_ref().expect("load_node ensures Some").clone())
+            let guard = self.node.load();
+            match guard.as_ref() {
+                Some(arc) => Ok(arc.clone()),
+                None => Err(Error::from_reason("MeshNode has been shut down")),
+            }
         }
 
         /// Share the `ChannelConfigRegistry` for sibling-module
         /// access. Same rationale as [`Self::node_arc_clone`].
-        #[cfg(feature = "compute")]
+        /// Currently consumed by `compute` only; nRPC's serve_rpc
+        /// auto-registers via the SDK glue without needing
+        /// per-binding access. Kept gated on either feature so the
+        /// accessor is available if `mesh_rpc` ever needs it.
+        #[cfg(any(feature = "compute", feature = "cortex"))]
+        #[cfg_attr(all(feature = "cortex", not(feature = "compute")), allow(dead_code))]
         pub(crate) fn channel_configs_arc(&self) -> Arc<net::adapter::net::ChannelConfigRegistry> {
             self.channel_configs.clone()
         }

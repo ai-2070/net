@@ -359,6 +359,27 @@ impl Mesh {
         self.node.local_addr()
     }
 
+    /// Crate-internal accessor for the underlying `MeshNode`.
+    /// Used by `mesh_rpc` to delegate the typed RPC API; not
+    /// intended for downstream consumers (the public surface
+    /// stays on `Mesh` itself). Gated on the same feature
+    /// combination as its sole consumer (`mesh_rpc` /
+    /// `mesh_rpc_resilience`) so feature combinations that
+    /// exclude either don't trip dead-code lints.
+    #[cfg(all(feature = "net", feature = "cortex"))]
+    pub(crate) fn node(&self) -> &Arc<MeshNode> {
+        &self.node
+    }
+
+    /// Crate-internal accessor for the SDK's
+    /// `ChannelConfigRegistry`. Used by `mesh_rpc` to
+    /// auto-register the request channel + reply prefix on
+    /// `serve_rpc`.
+    #[cfg(all(feature = "net", feature = "cortex"))]
+    pub(crate) fn channel_configs_arc(&self) -> &Arc<ChannelConfigRegistry> {
+        &self.channel_configs
+    }
+
     /// Connect to a peer as initiator.
     ///
     /// The peer must be listening (call `accept()` on their side).

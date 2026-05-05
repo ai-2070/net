@@ -521,6 +521,122 @@ SDK behaviour is fixed by the Rust integration suite; see
 [`tests/channel_auth.rs`](../../tests/channel_auth.rs) and
 [`tests/channel_auth_hardening.rs`](../../tests/channel_auth_hardening.rs).
 
+## nRPC (request / response over the mesh)
+
+nRPC is the request/response convention layer riding on top of
+the pub/sub mesh + CortEX folds. Built with the `cortex` feature
+(maturin's default picks it up). The native module exposes two
+layers:
+
+- **Raw bytes** — `net.MeshRpc` (pyclass): `serve(service, fn) ->
+  ServeHandle`, `call(target, service, bytes) -> bytes`,
+  `call_service(service, bytes) -> bytes`,
+  `call_streaming(target, service, bytes) -> RpcStream`,
+  `find_service_nodes(service) -> list[int]`. Synchronous calls
+  release the GIL across `runtime.block_on(...)` so other Python
+  threads run; handler callbacks dispatch under
+  `tokio::task::spawn_blocking` so GIL acquisition doesn't starve
+  the runtime.
+- **Typed wrapper** — `net.mesh_rpc.TypedMeshRpc`: JSON
+  encode/decode at the binding boundary so user code works with
+  plain Python objects (dicts, lists, strings, numbers, bools,
+  None). The default codec is `json.dumps` / `json.loads` — to
+  send dataclasses, Pydantic models, or numpy arrays, convert to
+  a JSON-serializable shape before calling (e.g.
+  `dataclasses.asdict(x)` or `model.model_dump()`); a non-
+  serializable input raises `RpcCodecError` before the call hits
+  the wire so the diagnostic points at the call site rather than
+  the server. Resilience helpers (`RetryPolicy`, `HedgePolicy`,
+  `CircuitBreaker`) plus the typed exception classes
+  (`RpcNoRouteError`, `RpcTimeoutError`, `RpcServerError`,
+  `RpcTransportError`, `RpcCodecError`, `RpcAppError`,
+  `BreakerOpenError`) live here too.
+
+```python
+from net import NetMesh
+from net.mesh_rpc import (
+    NRPC_TYPED_BAD_REQUEST,
+    RetryPolicy,
+    RpcServerError,
+    TypedMeshRpc,
+)
+
+server = NetMesh("127.0.0.1:9001", "42" * 32)
+client = NetMesh("127.0.0.1:9000", "42" * 32)
+# (handshake omitted — see "Net Encrypted UDP Transport")
+
+# Server side: register a typed handler. ServeHandle is a context
+# manager — `with` ensures unregister on exit.
+server_rpc = TypedMeshRpc.from_mesh(server)
+def echo_sum(req: dict) -> dict:
+    return {"echo": req["text"], "sum": sum(req["numbers"])}
+
+with server_rpc.serve("echo_sum", echo_sum):
+    client_rpc = TypedMeshRpc.from_mesh(client)
+    reply = client_rpc.call(
+        server.node_id(), "echo_sum",
+        {"text": "hi", "numbers": [1, 2, 3]},
+        opts={"deadline_ms": 200},
+    )
+    # reply == {"echo": "hi", "sum": 6}
+
+# Streaming responses iterate decoded chunks until EOF or terminal error.
+# `stream_window_initial` is the canonical key; `stream_window` is an
+# alias accepted for ergonomic parity.
+stream = client_rpc.call_streaming(
+    target_node_id, "tail", {"tail": "events"},
+    opts={"deadline_ms": 5000, "stream_window_initial": 8},
+)
+for chunk in stream:
+    process(chunk)
+# stream.close() emits CANCEL to the server (best-effort).
+# stream.grant(n) issues an explicit credit publish for batched cadence.
+
+# Resilience helpers: retry / hedge / circuit breaker.
+policy = RetryPolicy(max_attempts=4, initial_backoff_ms=50, max_backoff_ms=1000)
+client_rpc.call_with_retry(target_node_id, "echo", {"hi": 1}, policy)
+```
+
+### Status codes + error model
+
+Every caller-side failure is a typed exception whose message
+carries the canonical `nrpc:<kind>: <detail>` prefix. The set of
+kinds is fixed by the cross-binding contract: `no_route`,
+`timeout`, `server_error`, `transport`, `codec_encode`,
+`codec_decode`, `breaker_open`. The `classify_error(e)` helper
+in `net.mesh_rpc` extracts the kind string from a caught
+exception's message — useful for fallback paths where
+discriminating without `isinstance` is awkward (e.g. when the
+native module wasn't built and every typed alias collapses to
+plain `Exception`):
+
+```python
+from net.mesh_rpc import classify_error
+
+try:
+    rpc.call(target, "echo", body, opts={"deadline_ms": 200})
+except Exception as e:
+    kind = classify_error(e)
+    if kind == "no_route":
+        ...      # capability index didn't surface a target
+    elif kind == "timeout":
+        ...      # caller-side deadline elapsed
+    elif kind == "server_error":
+        ...      # str(e) carries `status=0xNNNN message=...`
+```
+
+| Constant                       | Hex      | Meaning                                          |
+| ------------------------------ | -------- | ------------------------------------------------ |
+| `NRPC_TYPED_BAD_REQUEST`       | `0x8000` | Typed handler couldn't decode the request body.  |
+| `NRPC_TYPED_HANDLER_ERROR`     | `0x8001` | Typed handler ran but returned an exception.     |
+
+Cross-binding contract spec — including the canonical
+`cross_lang_echo_sum` service used by every binding's wire-format
+compat test — lives in
+[`../../README.md#nrpc`](../../README.md#nrpc). The Python
+binding's own compat suite is at
+[`tests/test_cross_lang_compat.py`](tests/test_cross_lang_compat.py).
+
 ## Compute (daemons + migration)
 
 Run `MeshDaemon`s directly from Python. `DaemonRuntime` owns the

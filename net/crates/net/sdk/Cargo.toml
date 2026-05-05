@@ -26,6 +26,7 @@ futures = "0.3"
 tokio = { version = "1", features = ["rt", "time", "sync"] }
 pin-project-lite = "0.2"
 thiserror = "2"
+async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
@@ -81,3 +82,8 @@ groups = ["compute"]
 local = ["net", "cortex", "compute", "groups"]
 # Everything — local stack plus external transports.
 full = ["local", "redis", "jetstream"]
+
+# nRPC quickstart — requires net + cortex.
+[[example]]
+name = "nrpc_echo"
+required-features = ["net", "cortex"]
