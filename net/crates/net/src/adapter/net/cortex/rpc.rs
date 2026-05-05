@@ -474,18 +474,19 @@ pub fn extract_trace_context(headers: &[RpcHeader]) -> Option<TraceContext> {
     let mut traceparent: Option<String> = None;
     let mut tracestate = String::new();
     for (name, value) in headers {
-        match name.as_str() {
-            "traceparent" => {
-                if let Ok(s) = std::str::from_utf8(value) {
-                    traceparent = Some(s.to_string());
-                }
+        // Header names are case-insensitive (matches W3C and HTTP
+        // convention) — same comparison style as `parse_stream_
+        // window_initial` for consistency. The wire spec doesn't
+        // mandate case so a peer that emits `Traceparent` (capital
+        // T) shouldn't be silently ignored.
+        if name.eq_ignore_ascii_case("traceparent") {
+            if let Ok(s) = std::str::from_utf8(value) {
+                traceparent = Some(s.to_string());
             }
-            "tracestate" => {
-                if let Ok(s) = std::str::from_utf8(value) {
-                    tracestate = s.to_string();
-                }
+        } else if name.eq_ignore_ascii_case("tracestate") {
+            if let Ok(s) = std::str::from_utf8(value) {
+                tracestate = s.to_string();
             }
-            _ => {}
         }
     }
     traceparent.map(|tp| TraceContext {
@@ -1072,7 +1073,31 @@ impl RpcServerFold {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0)
     }
+
+    /// `true` if the request's deadline has already elapsed at
+    /// the server's current wall-clock — accounting for a small
+    /// tolerance window that absorbs clock skew between caller
+    /// and server. Without the tolerance, a request from a peer
+    /// whose clock is a few hundred ms ahead of the server's
+    /// would be timed out before the handler even saw it. Matches
+    /// gRPC's default deadline-clock-skew tolerance shape (gRPC
+    /// uses ~10 s).
+    fn deadline_already_passed(&self, deadline_ns: u64) -> bool {
+        if deadline_ns == 0 {
+            return false;
+        }
+        self.now_ns().saturating_sub(DEADLINE_SKEW_TOLERANCE_NS) > deadline_ns
+    }
 }
+
+/// Tolerance for clock skew between caller and server when the
+/// server short-circuits a request whose `deadline_ns` looks like
+/// it has already elapsed. The check is
+/// `now_ns - SKEW > deadline_ns`, so a request from a peer whose
+/// clock is up to `SKEW` nanoseconds ahead of ours never hits the
+/// short-circuit path. 10 s matches gRPC's default and is well
+/// within the threshold an NTP-disciplined cluster ever drifts to.
+pub const DEADLINE_SKEW_TOLERANCE_NS: u64 = 10_000_000_000; // 10 seconds
 
 impl RedexFold<()> for RpcServerFold {
     fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
@@ -1121,8 +1146,12 @@ impl RedexFold<()> for RpcServerFold {
                     }
                 };
                 // Fast deadline-already-passed short-circuit.
-                // Server-side `Timeout` without invoking the handler.
-                if payload.deadline_ns != 0 && self.now_ns() > payload.deadline_ns {
+                // Server-side `Timeout` without invoking the
+                // handler. Includes a clock-skew tolerance window
+                // so a peer with a slightly-fast clock isn't
+                // prematurely timed out — see
+                // `deadline_already_passed`.
+                if self.deadline_already_passed(payload.deadline_ns) {
                     let resp = RpcResponsePayload {
                         status: RpcStatus::Timeout,
                         headers: vec![],
@@ -1907,9 +1936,21 @@ impl RpcClientPending {
                     StreamingChunkKind::Unary => {
                         // Streaming entry but unary-shaped
                         // response (no `nrpc-streaming` header,
-                        // status Ok). The server probably bridged
-                        // a unary path; treat as terminal end with
-                        // body as a single chunk.
+                        // status Ok). This usually indicates a
+                        // server-side bug — the caller opened a
+                        // streaming call but the server replied
+                        // through the unary path. Warn so
+                        // operators can see the mismatch in logs;
+                        // treat as terminal end with body as a
+                        // single chunk so the caller still gets
+                        // the data instead of hanging.
+                        tracing::warn!(
+                            call_id,
+                            body_len = resp.body.len(),
+                            "rpc client: streaming consumer received unary-shaped \
+                             response (no nrpc-streaming header); server may have \
+                             bridged a unary path. Bridging to single-chunk + EOF.",
+                        );
                         if !resp.body.is_empty() {
                             let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
                         }
@@ -2546,10 +2587,14 @@ mod tests {
             }),
             emit,
         )
-        .with_test_now_ns(2_000);
+        // Use a clock value > DEADLINE_SKEW_TOLERANCE_NS + 1
+        // (10s + 1ns) so the deadline-passed check fires past the
+        // skew tolerance window. With now=20s and deadline=1ns,
+        // (now - 10s) > 1ns.
+        .with_test_now_ns(20_000_000_000);
         let req = RpcRequestPayload {
             service: "x".to_string(),
-            // Deadline in the past relative to `with_test_now_ns(2000)`.
+            // Deadline well in the past — past the skew tolerance.
             deadline_ns: 1_000,
             flags: 0,
             headers: vec![],
@@ -2566,6 +2611,54 @@ mod tests {
             !invoked.load(Ordering::Acquire),
             "handler must NOT be invoked when deadline already passed",
         );
+    }
+
+    /// Regression: a deadline that has elapsed by less than
+    /// `DEADLINE_SKEW_TOLERANCE_NS` does NOT short-circuit. A
+    /// peer with a slightly-fast clock would otherwise be
+    /// prematurely timed out before the handler ever ran.
+    #[tokio::test]
+    async fn server_fold_deadline_within_skew_tolerance_invokes_handler() {
+        let invoked = Arc::new(AtomicBool::new(false));
+        struct CountingHandler {
+            invoked: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl RpcHandler for CountingHandler {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                self.invoked.store(true, Ordering::Release);
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: vec![],
+                })
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(
+            Arc::new(CountingHandler {
+                invoked: invoked.clone(),
+            }),
+            emit,
+        )
+        // now = 100s, deadline = 95s → elapsed = 5s, within the
+        // 10s skew tolerance.
+        .with_test_now_ns(100_000_000_000);
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 95_000_000_000,
+            flags: 0,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
+        assert!(
+            wait_until(|| invoked.load(Ordering::Acquire), Duration::from_secs(1)).await,
+            "handler must run when deadline is within skew tolerance",
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].2.status, RpcStatus::Ok);
     }
 
     /// CANCEL flips the matching in-flight token. The handler that
