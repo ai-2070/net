@@ -1,0 +1,29 @@
+net/crates/net/tests/integration_nrpc_streaming.rs
+  cdf934b360f502d7 215-416
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  cdf934b360f502d7 61-75,662-704,1266-1272,1296,1371-1381,1385,1417,1420-1441,1527-1531,1544-1579
+net/crates/net/src/adapter/net/cortex/mod.rs
+  cdf934b360f502d7 43-49,51-54
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  cdf934b360f502d7 38-44,123-134,145,254-259,268-334,349-365,759-761,768-773,815
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "26b84251d3f45f2d71208875643538c716797a59",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3311,
+      "total_deletions": 16,
+      "accepted_lines": 476,
+      "overriden_lines": 0
+    }
+  }
+}
