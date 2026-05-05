@@ -37,8 +37,9 @@ use super::channel::{ChannelId, ChannelName, ChannelPublisher, PublishConfig};
 use super::cortex::{
     build_trace_headers, EventMeta, RpcCancellationToken, RpcClientFold, RpcContext, RpcHandler,
     RpcHandlerError, RpcInboundDispatcher, RpcInboundEvent, RpcRequestPayload,
-    RpcResponseEmitter, RpcResponsePayload, RpcServerFold, RpcStatus, TraceContext,
-    DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST, EVENT_META_SIZE, FLAG_RPC_PROPAGATE_TRACE,
+    RpcResponseEmitter, RpcResponsePayload, RpcServerFold, RpcServerStreamingFold, RpcStatus,
+    RpcStreamingHandler, StreamItem, TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
+    EVENT_META_SIZE, FLAG_RPC_PROPAGATE_TRACE, FLAG_RPC_STREAMING_RESPONSE,
 };
 use crate::error::AdapterError;
 
@@ -211,6 +212,108 @@ impl Drop for ServeHandle {
     }
 }
 
+// ============================================================================
+// Streaming caller-side: RpcStream.
+// ============================================================================
+
+/// An open streaming RPC call. Implements `Stream<Item =
+/// Result<Bytes, RpcError>>` — yields chunks as the server emits
+/// them, terminates on a clean stream-end frame OR a non-`Ok`
+/// status (which is yielded as the last `Err` item before the
+/// stream closes).
+///
+/// Dropping the stream emits a CANCEL to the server (best-effort)
+/// and discards the pending entry — any chunks the server emits
+/// after the drop are silently discarded by the client fold.
+pub struct RpcStream {
+    mesh: Arc<MeshNode>,
+    target_node_id: u64,
+    request_channel: ChannelName,
+    self_origin: u64,
+    call_id: u64,
+    inner: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
+    /// Set true once we've yielded the terminal item (or an
+    /// error). Subsequent polls return `None`.
+    done: bool,
+}
+
+impl RpcStream {
+    /// Server-assigned `call_id`. Useful for trace correlation /
+    /// custom logging at the call site.
+    pub fn call_id(&self) -> u64 {
+        self.call_id
+    }
+}
+
+impl futures::Stream for RpcStream {
+    type Item = Result<Bytes, RpcError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        match self.inner.poll_recv(cx) {
+            std::task::Poll::Ready(Some(StreamItem::Chunk(body))) => {
+                std::task::Poll::Ready(Some(Ok(body)))
+            }
+            std::task::Poll::Ready(Some(StreamItem::End)) => {
+                self.done = true;
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(StreamItem::Error(resp))) => {
+                self.done = true;
+                let status = resp.status.to_wire();
+                let message = String::from_utf8(resp.body).unwrap_or_else(|e| {
+                    format!("<{} bytes of non-utf8 body>", e.into_bytes().len())
+                });
+                std::task::Poll::Ready(Some(Err(RpcError::ServerError {
+                    status,
+                    message,
+                })))
+            }
+            std::task::Poll::Ready(None) => {
+                self.done = true;
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for RpcStream {
+    fn drop(&mut self) {
+        // Best-effort CANCEL to the server. Spawn a task because
+        // Drop can't be async; the publish happens off-thread.
+        // Also clear our pending entry so any in-flight chunks
+        // are dropped on arrival.
+        self.mesh.rpc_client_pending_arc().cancel(self.call_id);
+        let mesh = Arc::clone(&self.mesh);
+        let request_channel = self.request_channel.clone();
+        let self_origin = self.self_origin;
+        let call_id = self.call_id;
+        let target = self.target_node_id;
+        tokio::spawn(async move {
+            let meta = EventMeta::new(DISPATCH_RPC_CANCEL, 0, self_origin, call_id, 0);
+            let request_channel_id = ChannelId::new(request_channel);
+            let request_channel_hash = request_channel_id.hash();
+            let stream_id = MeshNode::publish_stream_id(&request_channel_id);
+            let payload = Bytes::from(meta.to_bytes().to_vec());
+            let _ = mesh
+                .publish_to_peer(
+                    target,
+                    request_channel_hash,
+                    stream_id,
+                    /* reliable */ true,
+                    std::slice::from_ref(&payload),
+                )
+                .await;
+        });
+    }
+}
+
 
 // ============================================================================
 // MeshNode extensions.
@@ -345,6 +448,186 @@ impl MeshNode {
             service: service.to_string(),
             bridge: Some(bridge),
             mesh: Arc::clone(self),
+        })
+    }
+
+    /// Streaming variant of [`Self::serve_rpc`]. The handler
+    /// receives an [`RpcResponseSink`](super::cortex::RpcResponseSink)
+    /// it writes chunks to via `sink.send(body)`; returning
+    /// `Ok(())` closes the stream cleanly, `Err(_)` closes with
+    /// an error frame.
+    ///
+    /// Wire-level identical to the unary path apart from the
+    /// per-chunk `nrpc-streaming` header markers
+    /// (`continue` / `end`). Same auto-registration of
+    /// `<service>.requests` + `<service>.replies.` prefix.
+    pub fn serve_rpc_streaming<H: RpcStreamingHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+    ) -> Result<ServeHandle, ServeError> {
+        let request_channel = ChannelName::new(&format!("{service}.requests"))
+            .map_err(|e| ServeError::InvalidServiceName(e.to_string()))?;
+        let channel_hash = request_channel.hash();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
+
+        let mesh_for_emit = Arc::clone(self);
+        let service_for_emit = service.to_string();
+        let server_origin = self.identity_origin_hash();
+        let emit: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
+            let mesh = Arc::clone(&mesh_for_emit);
+            let service = service_for_emit.clone();
+            tokio::spawn(async move {
+                let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
+                let reply_channel = match ChannelName::new(&reply_channel_name) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(error = %e, channel = %reply_channel_name,
+                            "rpc serve_rpc_streaming: invalid reply channel name");
+                        return;
+                    }
+                };
+                let meta = EventMeta::new(
+                    super::cortex::DISPATCH_RPC_RESPONSE,
+                    0,
+                    server_origin,
+                    call_id,
+                    0,
+                );
+                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
+                buf.extend_from_slice(&meta.to_bytes());
+                buf.extend_from_slice(&resp.encode());
+                let publisher =
+                    ChannelPublisher::new(reply_channel, PublishConfig::default());
+                if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
+                    tracing::warn!(error = %e, caller_origin = format!("{:#x}", caller_origin),
+                        call_id, "rpc serve_rpc_streaming: chunk publish failed");
+                }
+            });
+        });
+
+        let fold = Arc::new(Mutex::new(RpcServerStreamingFold::new(
+            handler as Arc<dyn RpcStreamingHandler>,
+            emit,
+        )));
+        let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
+            let _ = tx.try_send(ev);
+        });
+        if self
+            .register_rpc_inbound(channel_hash, dispatcher)
+            .is_some()
+        {
+            return Err(ServeError::AlreadyServing(service.to_string()));
+        }
+        let bridge = tokio::spawn(async move {
+            while let Some(inbound) = rx.recv().await {
+                let payload = inbound.payload;
+                let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
+                let ev = RedexEvent { entry, payload };
+                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                    tracing::warn!(error = %e, "rpc serve_rpc_streaming: fold apply error");
+                }
+            }
+        });
+        self.rpc_local_services_arc().insert(service.to_string());
+        Ok(ServeHandle {
+            channel_hash,
+            service: service.to_string(),
+            bridge: Some(bridge),
+            mesh: Arc::clone(self),
+        })
+    }
+
+    /// Streaming variant of [`Self::call`]. Returns an
+    /// [`RpcStream`] that yields chunks (as `Result<Bytes, RpcError>`)
+    /// until the server closes the stream.
+    ///
+    /// Sets `FLAG_RPC_STREAMING_RESPONSE` on the request so the
+    /// server's streaming fold knows to expect multi-fire emits.
+    /// Same lazy reply-subscription + direct-unicast REQUEST
+    /// as the unary `call` path.
+    ///
+    /// Cancellation: dropping the returned `RpcStream` emits a
+    /// CANCEL to the server (best-effort) and discards any
+    /// in-flight chunks.
+    pub async fn call_streaming(
+        self: &Arc<Self>,
+        target_node_id: u64,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+    ) -> Result<RpcStream, RpcError> {
+        let request_channel = ChannelName::new(&format!("{service}.requests"))
+            .map_err(|e| RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!("invalid service name: {e}"),
+            })?;
+        let self_origin = self.identity_origin_hash();
+        let reply_channel_name = format!("{service}.replies.{self_origin:016x}");
+        let reply_channel = ChannelName::new(&reply_channel_name).map_err(|e| {
+            RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!("invalid reply channel name: {e}"),
+            }
+        })?;
+        let reply_hash = reply_channel.hash();
+        self.ensure_reply_subscription(target_node_id, service, reply_channel.clone(), reply_hash)
+            .await?;
+
+        let call_id = self.rpc_next_call_id().fetch_add(1, Ordering::Relaxed);
+        let pending = self.rpc_client_pending();
+        let rx = pending.register_streaming(call_id);
+
+        // Build the REQUEST: STREAMING_RESPONSE flag plus optional
+        // trace-context headers / propagate-trace flag, same as
+        // unary `call`.
+        let mut flags = FLAG_RPC_STREAMING_RESPONSE;
+        let mut headers = Vec::new();
+        if let Some(tc) = opts.trace_context.as_ref() {
+            flags |= FLAG_RPC_PROPAGATE_TRACE;
+            headers.extend(build_trace_headers(tc));
+        }
+        let req = RpcRequestPayload {
+            service: service.to_string(),
+            deadline_ns: opts
+                .deadline
+                .map(instant_to_unix_nanos)
+                .unwrap_or(0),
+            flags,
+            headers,
+            body: payload.to_vec(),
+        };
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.body.len() + 32);
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&req.encode());
+
+        let request_channel_id = ChannelId::new(request_channel.clone());
+        let request_channel_hash = request_channel_id.hash();
+        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
+        let payload_bytes = Bytes::from(buf);
+        if let Err(e) = self
+            .publish_to_peer(
+                target_node_id,
+                request_channel_hash,
+                stream_id,
+                /* reliable */ true,
+                std::slice::from_ref(&payload_bytes),
+            )
+            .await
+        {
+            pending.cancel(call_id);
+            return Err(RpcError::Transport(e));
+        }
+
+        Ok(RpcStream {
+            mesh: Arc::clone(self),
+            target_node_id,
+            request_channel,
+            self_origin,
+            call_id,
+            inner: rx,
+            done: false,
         })
     }
 

@@ -618,6 +618,75 @@ pub struct RpcInboundEvent {
 pub type RpcInboundDispatcher = Arc<dyn Fn(RpcInboundEvent) + Send + Sync + 'static>;
 
 // ============================================================================
+// Streaming-response protocol markers.
+//
+// When a caller sets `FLAG_RPC_STREAMING_RESPONSE` on the request,
+// the server emits multiple `DISPATCH_RPC_RESPONSE` events for the
+// same `call_id`. Non-terminal chunks carry the
+// `nrpc-streaming = continue` header; the terminal chunk carries
+// `nrpc-streaming = end` (or any non-`Ok` status, which is also
+// terminal). The client-side stream collects chunks until it sees
+// a terminal marker.
+// ============================================================================
+
+/// Header name nRPC uses to mark streaming-response chunks.
+/// Present on every chunk of a streaming response, with one of two
+/// values defined below.
+pub const HEADER_NRPC_STREAMING: &str = "nrpc-streaming";
+
+/// `nrpc-streaming` value on a non-terminal chunk. The client-side
+/// stream yields the chunk's body and continues waiting for more.
+pub const HEADER_NRPC_STREAMING_CONTINUE: &[u8] = b"continue";
+
+/// `nrpc-streaming` value on the terminal chunk. The client-side
+/// stream yields the chunk's body (if non-empty) and then closes.
+/// A non-`Ok` status is also terminal, regardless of header — the
+/// stream yields the error and closes.
+pub const HEADER_NRPC_STREAMING_END: &[u8] = b"end";
+
+/// Inspect a `RpcResponsePayload`'s headers and decide whether
+/// it's a non-terminal streaming chunk (`continue`), a terminal
+/// streaming chunk (`end` OR non-`Ok` status), OR a unary
+/// response (no streaming header at all). Used by the client-side
+/// fold to demux streaming vs unary responses without needing a
+/// separate flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingChunkKind {
+    /// Non-terminal chunk — yield body, continue waiting.
+    Continue,
+    /// Terminal chunk — yield body (if any), close stream.
+    Terminal,
+    /// Not a streaming response — unary semantics apply.
+    Unary,
+}
+
+/// Classify a response per the streaming-protocol markers.
+pub fn classify_streaming_chunk(resp: &RpcResponsePayload) -> StreamingChunkKind {
+    // Non-Ok status is always terminal regardless of header — the
+    // stream surfaces the error and closes.
+    if !resp.status.is_ok() {
+        return StreamingChunkKind::Terminal;
+    }
+    // Walk headers for the streaming marker. Absence = unary
+    // semantics (caller used `call`, not `call_streaming`).
+    for (name, value) in &resp.headers {
+        if name == HEADER_NRPC_STREAMING {
+            return if value.as_slice() == HEADER_NRPC_STREAMING_END {
+                StreamingChunkKind::Terminal
+            } else if value.as_slice() == HEADER_NRPC_STREAMING_CONTINUE {
+                StreamingChunkKind::Continue
+            } else {
+                // Unknown marker value — be defensive, treat as
+                // terminal so a misbehaving server doesn't keep
+                // a stream open forever.
+                StreamingChunkKind::Terminal
+            };
+        }
+    }
+    StreamingChunkKind::Unary
+}
+
+// ============================================================================
 // Server-side fold.
 //
 // `RpcServerFold` is the `RedexFold` half of the server. It sees
@@ -1009,6 +1078,241 @@ impl RedexFold<()> for RpcServerFold {
 }
 
 // ============================================================================
+// Streaming server-side: handler trait + sink + fold.
+// ============================================================================
+
+/// Sink the handler writes to in order to emit streaming-response
+/// chunks. Each `send` produces one non-terminal `RESPONSE` event
+/// to the caller. The terminal frame is emitted automatically when
+/// the sink is dropped — the handler returning `Ok(())` drops the
+/// sink, which closes the stream cleanly. Returning
+/// `Err(RpcHandlerError)` drops the sink and emits the error as a
+/// terminal non-`Ok` RESPONSE.
+///
+/// `send` is best-effort and infallible: the underlying mpsc is
+/// unbounded, so the handler never blocks on backpressure. If the
+/// caller cancels mid-stream, the dispatcher drops the receiver
+/// and subsequent `send` calls are silently discarded —
+/// cooperative cancellation via `ctx.cancellation` is the right
+/// way for the handler to notice and stop.
+pub struct RpcResponseSink {
+    inner: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
+}
+
+impl RpcResponseSink {
+    /// Emit one non-terminal chunk. Cheap (unbounded mpsc send);
+    /// never blocks. Discarded silently if the caller has
+    /// cancelled the stream.
+    pub fn send(&self, body: impl Into<bytes::Bytes>) {
+        // Best-effort: discard on receiver-closed (caller cancelled).
+        let _ = self.inner.send(body.into());
+    }
+}
+
+/// User-supplied streaming handler. Receives the same `RpcContext`
+/// as a unary handler plus a `RpcResponseSink` for emitting chunks.
+/// Returning `Ok(())` closes the stream cleanly with a terminal
+/// `Ok` RESPONSE; `Err(RpcHandlerError)` closes the stream with a
+/// terminal non-`Ok` RESPONSE carrying the diagnostic.
+///
+/// **Cancellation contract.** Long-running streams should
+/// `select!` on `ctx.cancellation.cancelled()` so a caller-side
+/// drop / deadline correctly stops the handler. Continuing to
+/// `send` after cancellation is harmless (sink discards) but
+/// wastes work.
+#[async_trait::async_trait]
+pub trait RpcStreamingHandler: Send + Sync + 'static {
+    /// Process one streaming request. Emit chunks via `sink.send(...)`.
+    /// Drop the sink (or return) to close the stream.
+    async fn call(
+        &self,
+        ctx: RpcContext,
+        sink: RpcResponseSink,
+    ) -> Result<(), RpcHandlerError>;
+}
+
+/// Server-side fold for streaming RPC. Parallel to `RpcServerFold`
+/// but multi-fire emit: each handler invocation may produce many
+/// `RESPONSE` events for the same `call_id`, marked
+/// non-terminal/terminal via the `nrpc-streaming` header.
+///
+/// State `()` — like the unary fold, the handler owns user state
+/// via captured Arc<Mutex<S>>. The fold's own state (in-flight
+/// cancellation tokens) lives on `&mut self`.
+pub struct RpcServerStreamingFold {
+    handler: Arc<dyn RpcStreamingHandler>,
+    emit: RpcResponseEmitter,
+    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+}
+
+impl RpcServerStreamingFold {
+    /// Construct a streaming server fold. `emit` publishes
+    /// individual chunks (and the terminal frame) on the caller's
+    /// reply channel — same emitter contract as the unary fold.
+    pub fn new(handler: Arc<dyn RpcStreamingHandler>, emit: RpcResponseEmitter) -> Self {
+        Self {
+            handler,
+            emit,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Test-only: snapshot of the in-flight call set.
+    #[cfg(test)]
+    pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
+        self.in_flight.lock().keys().copied().collect()
+    }
+}
+
+impl RedexFold<()> for RpcServerStreamingFold {
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+        } else {
+            None
+        }) else {
+            tracing::warn!(
+                payload_len = ev.payload.len(),
+                "rpc streaming server fold: event payload too short for EventMeta",
+            );
+            return Ok(());
+        };
+        let key = (meta.origin_hash, meta.seq_or_ts);
+        match meta.dispatch {
+            DISPATCH_RPC_REQUEST => {
+                let payload = match RpcRequestPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc streaming server fold: malformed request payload",
+                        );
+                        // Surface as a terminal error chunk.
+                        let resp = RpcResponsePayload {
+                            status: RpcStatus::UnknownVersion,
+                            headers: vec![(
+                                HEADER_NRPC_STREAMING.to_string(),
+                                HEADER_NRPC_STREAMING_END.to_vec(),
+                            )],
+                            body: format!("malformed request: {e}").into_bytes(),
+                        };
+                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        return Ok(());
+                    }
+                };
+                // Cancellation token + in-flight bookkeeping —
+                // identical to the unary fold's pattern.
+                let cancellation = RpcCancellationToken::new();
+                self.in_flight.lock().insert(key, cancellation.clone());
+                let handler = self.handler.clone();
+                let emit = self.emit.clone();
+                let in_flight = self.in_flight.clone();
+                let caller_origin = meta.origin_hash;
+                let call_id = meta.seq_or_ts;
+                let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
+                    extract_trace_context(&payload.headers)
+                } else {
+                    None
+                };
+                tokio::spawn(async move {
+                    let ctx = RpcContext {
+                        caller_origin,
+                        call_id,
+                        payload,
+                        cancellation,
+                        trace_context,
+                    };
+                    // Build the sink + receive end. Spawn a
+                    // pump that forwards each chunk to the emit
+                    // closure. The handler's `sink.send(...)`
+                    // calls show up here as items on the receiver.
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+                    let sink = RpcResponseSink { inner: tx };
+                    let pump_emit = emit.clone();
+                    let pump = tokio::spawn(async move {
+                        while let Some(chunk) = rx.recv().await {
+                            let resp = RpcResponsePayload {
+                                status: RpcStatus::Ok,
+                                headers: vec![(
+                                    HEADER_NRPC_STREAMING.to_string(),
+                                    HEADER_NRPC_STREAMING_CONTINUE.to_vec(),
+                                )],
+                                body: chunk.to_vec(),
+                            };
+                            pump_emit(caller_origin, call_id, resp);
+                        }
+                    });
+                    // Run the handler. Catch panics so a
+                    // misbehaving handler can't take down the
+                    // runtime — same shape as the unary fold.
+                    let outcome = futures::FutureExt::catch_unwind(
+                        std::panic::AssertUnwindSafe(handler.call(ctx, sink)),
+                    )
+                    .await;
+                    // The handler dropped the sink (either by
+                    // returning or by panicking through the
+                    // catch_unwind). Wait for the pump to drain
+                    // any final in-flight chunks.
+                    let _ = pump.await;
+                    // Emit the terminal frame.
+                    let terminal = match outcome {
+                        Ok(Ok(())) => RpcResponsePayload {
+                            status: RpcStatus::Ok,
+                            headers: vec![(
+                                HEADER_NRPC_STREAMING.to_string(),
+                                HEADER_NRPC_STREAMING_END.to_vec(),
+                            )],
+                            body: vec![],
+                        },
+                        Ok(Err(RpcHandlerError::Application { code, message })) => {
+                            RpcResponsePayload {
+                                status: RpcStatus::Application(code),
+                                headers: vec![],
+                                body: message.into_bytes(),
+                            }
+                        }
+                        Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
+                            status: RpcStatus::Internal,
+                            headers: vec![],
+                            body: message.into_bytes(),
+                        },
+                        Err(panic) => {
+                            let panic_msg = panic
+                                .downcast_ref::<&'static str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "<non-string panic>".into());
+                            tracing::error!(
+                                caller_origin = format!("{:#x}", caller_origin),
+                                call_id,
+                                panic = %panic_msg,
+                                "rpc streaming server handler panicked",
+                            );
+                            RpcResponsePayload {
+                                status: RpcStatus::Internal,
+                                headers: vec![],
+                                body: format!("handler panicked: {panic_msg}").into_bytes(),
+                            }
+                        }
+                    };
+                    in_flight.lock().remove(&key);
+                    emit(caller_origin, call_id, terminal);
+                });
+            }
+            DISPATCH_RPC_CANCEL => {
+                if let Some(token) = self.in_flight.lock().remove(&key) {
+                    token.cancel();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Client-side fold.
 //
 // `RpcClientFold` is the symmetric companion of `RpcServerFold`.
@@ -1024,13 +1328,47 @@ impl RedexFold<()> for RpcServerFold {
 // when the matching RESPONSE arrives.
 // ============================================================================
 
+/// One pending entry — either a unary oneshot or a streaming
+/// mpsc. The fold dispatches to the right variant based on
+/// what's registered for the `call_id`.
+enum PendingEntry {
+    /// Unary call — exactly one RESPONSE expected. Completes the
+    /// oneshot with the decoded payload.
+    Unary(tokio::sync::oneshot::Sender<RpcResponsePayload>),
+    /// Streaming call — multiple non-terminal `Continue` chunks
+    /// followed by one terminal frame. Each non-terminal chunk
+    /// pushes a `StreamItem::Chunk(body)` onto the mpsc; the
+    /// terminal frame pushes `StreamItem::End` (Ok) or
+    /// `StreamItem::Error(payload)` (non-Ok status) and the
+    /// pending entry is removed.
+    Streaming(tokio::sync::mpsc::UnboundedSender<StreamItem>),
+}
+
+/// One item delivered to a streaming caller. The caller's
+/// `RpcStream` translates these into `Stream::Item =
+/// Result<Bytes, RpcError>` plus stream termination.
+#[derive(Debug, Clone)]
+pub enum StreamItem {
+    /// Non-terminal chunk — a body slice from the server.
+    Chunk(bytes::Bytes),
+    /// Terminal frame, server signaled clean stream end.
+    End,
+    /// Terminal frame with a non-`Ok` status. Body is the
+    /// server's diagnostic; status is the wire `RpcStatus` value.
+    Error(RpcResponsePayload),
+}
+
 /// Shared pending-call state. Held by both the `RpcClientFold`
-/// (writer side: completes oneshot senders on RESPONSE arrival)
-/// and the `Mesh::call` API (reader side: registers oneshots
-/// before publishing the REQUEST). Concurrent access is mediated
-/// by `DashMap`.
+/// (writer side: completes oneshot senders / pushes streaming
+/// chunks on RESPONSE arrival) and the `Mesh::call*` APIs (reader
+/// side: registers entries before publishing the REQUEST).
+/// Concurrent access is mediated by `DashMap`.
+///
+/// Multiplexes unary AND streaming calls in a single map keyed
+/// on `call_id` — the entry's enum variant tells the fold how
+/// to dispatch incoming RESPONSE events.
 pub struct RpcClientPending {
-    senders: dashmap::DashMap<u64, tokio::sync::oneshot::Sender<RpcResponsePayload>>,
+    senders: dashmap::DashMap<u64, PendingEntry>,
 }
 
 impl RpcClientPending {
@@ -1041,10 +1379,11 @@ impl RpcClientPending {
         }
     }
 
-    /// Register a oneshot for `call_id`. Returns the receiver the
-    /// caller awaits. The caller MUST publish the REQUEST after
-    /// registration (and not before) so the matching RESPONSE
-    /// can't arrive while the pending entry is missing.
+    /// Register a oneshot for a unary `call_id`. Returns the
+    /// receiver the caller awaits. The caller MUST publish the
+    /// REQUEST after registration (and not before) so the
+    /// matching RESPONSE can't arrive while the pending entry is
+    /// missing.
     ///
     /// If a sender already exists for `call_id` (improperly reused
     /// id), it is replaced and the old receiver gets a
@@ -1053,29 +1392,101 @@ impl RpcClientPending {
     /// to the wrong waiter.
     pub fn register(&self, call_id: u64) -> tokio::sync::oneshot::Receiver<RpcResponsePayload> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.senders.insert(call_id, tx);
+        self.senders.insert(call_id, PendingEntry::Unary(tx));
+        rx
+    }
+
+    /// Register a streaming entry for `call_id`. Returns the
+    /// receive end of an mpsc the fold will push chunks onto.
+    /// Same registration ordering rules as `register` —
+    /// publisher must call this BEFORE publishing the REQUEST.
+    pub fn register_streaming(
+        &self,
+        call_id: u64,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<StreamItem> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.senders
+            .insert(call_id, PendingEntry::Streaming(tx));
         rx
     }
 
     /// Drop the pending entry for `call_id`. Called by the
     /// caller-side cancellation path (e.g. `Mesh::call`'s future
-    /// being dropped, or its deadline timer firing). The matching
-    /// RESPONSE that may still arrive afterwards is silently
-    /// discarded by [`Self::deliver`].
+    /// being dropped, the stream being dropped, or a deadline
+    /// timer firing). The matching RESPONSE(s) that may still
+    /// arrive afterwards are silently discarded by `deliver`.
     pub fn cancel(&self, call_id: u64) {
         self.senders.remove(&call_id);
     }
 
-    /// Deliver `resp` to the waiter for `call_id`, if any. Idempotent
-    /// — a second delivery for the same call_id is a no-op (the
-    /// first delivery removed the entry).
+    /// Deliver `resp` to the waiter for `call_id`, if any.
+    ///
+    /// For a unary entry: completes the oneshot and removes the
+    /// entry.
+    ///
+    /// For a streaming entry: examines the response's headers to
+    /// decide whether it's a non-terminal chunk (`Continue` —
+    /// push `StreamItem::Chunk`, keep the entry) or terminal
+    /// (`End` / non-`Ok` — push `StreamItem::End` or `Error`,
+    /// remove the entry).
+    ///
+    /// Idempotent on subsequent deliveries to a removed entry.
     fn deliver(&self, call_id: u64, resp: RpcResponsePayload) {
-        if let Some((_, tx)) = self.senders.remove(&call_id) {
-            // `send` fails iff the receiver has been dropped (the
-            // caller cancelled or timed out between register and
-            // delivery). That's a normal cleanup path, not an
-            // error — discard silently.
-            let _ = tx.send(resp);
+        // Look up the entry — but DON'T remove it yet, because for
+        // streaming we may want to keep it for non-terminal chunks.
+        // The remove decision is per-variant.
+        let entry = self.senders.get(&call_id);
+        let Some(entry) = entry else { return };
+        match entry.value() {
+            PendingEntry::Unary(_) => {
+                drop(entry);
+                if let Some((_, PendingEntry::Unary(tx))) = self.senders.remove(&call_id) {
+                    let _ = tx.send(resp);
+                }
+            }
+            PendingEntry::Streaming(tx) => {
+                let kind = classify_streaming_chunk(&resp);
+                match kind {
+                    StreamingChunkKind::Continue => {
+                        // Non-terminal: push the chunk, keep the
+                        // entry for future RESPONSE events.
+                        let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
+                    }
+                    StreamingChunkKind::Terminal => {
+                        // Terminal: classify Ok-end vs Error-end
+                        // and remove the entry.
+                        let item = if resp.status.is_ok() {
+                            // Ok terminal frame: emit a final
+                            // chunk if the body is non-empty,
+                            // then End.
+                            if !resp.body.is_empty() {
+                                let _ = tx
+                                    .send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
+                            }
+                            StreamItem::End
+                        } else {
+                            StreamItem::Error(resp)
+                        };
+                        let _ = tx.send(item);
+                        drop(entry);
+                        self.senders.remove(&call_id);
+                    }
+                    StreamingChunkKind::Unary => {
+                        // Streaming entry but unary-shaped
+                        // response (no `nrpc-streaming` header,
+                        // status Ok). The server probably bridged
+                        // a unary path; treat as terminal end with
+                        // body as a single chunk.
+                        if !resp.body.is_empty() {
+                            let _ = tx
+                                .send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
+                        }
+                        let _ = tx.send(StreamItem::End);
+                        drop(entry);
+                        self.senders.remove(&call_id);
+                    }
+                }
+            }
         }
     }
 
