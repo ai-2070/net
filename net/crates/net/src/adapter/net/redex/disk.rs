@@ -1801,12 +1801,33 @@ fn sweep_orphan_generations(channel_dir: &Path, keep: u32) {
 /// the second invocation observes the manifest written by the first
 /// and returns early).
 ///
+/// # Precedence assumption (load-bearing)
+///
+/// This function assumes its caller has already established that
+/// neither a valid manifest NOR a complete `v<NNN>/` generation
+/// directory exists for this channel — i.e. flat-layout files
+/// are the only authoritative on-disk state. `resolve_live_generation`
+/// is the only caller and enforces this by gating the call behind
+/// the manifest-read and enumerate-fallback branches both failing
+/// to produce a complete generation.
+///
+/// If that gate ever weakens (e.g. a future caller invokes this
+/// function unconditionally on open), the per-file renames here
+/// would clobber a real `v0000000001/{idx,dat,ts}` produced by
+/// some prior compact, silently substituting the flat-file
+/// content for the post-compact content. **Do not** call from any
+/// path where a complete `v1/` could already be the live
+/// generation. The "overwrite v1 on partial-prior-migration"
+/// behavior documented inline is correct ONLY because the gate
+/// guarantees v1 was never live in that scenario.
+///
 /// Returns `Ok(true)` if migration ran (and we now have a v1
 /// generation + manifest), `Ok(false)` if there was nothing to
-/// migrate (no flat files present and no manifest), or `Err` on a
-/// real I/O failure mid-migration. A failure between renames leaves
-/// the per-file moves in whichever state they reached; the next open
-/// re-runs the migration (idempotent).
+/// migrate (no flat files present), or `Err` on a real I/O
+/// failure mid-migration. A failure between renames leaves the
+/// per-file moves in whichever state they reached; the next open
+/// re-runs the migration (idempotent — the per-source-file
+/// `is_file()` guards skip files already moved).
 fn migrate_flat_layout_if_needed(channel_dir: &Path) -> std::io::Result<bool> {
     let flat_idx = channel_dir.join("idx");
     let flat_dat = channel_dir.join("dat");
@@ -1819,7 +1840,10 @@ fn migrate_flat_layout_if_needed(channel_dir: &Path) -> std::io::Result<bool> {
     // pre-existing v1 directory left over from a partially-completed
     // prior migration is overwritten by these renames — that's
     // correct behavior, the prior migration didn't reach the
-    // manifest write so v1 was never the live generation.
+    // manifest write so v1 was never the live generation. See the
+    // function-level "precedence assumption" rustdoc above for
+    // why this is safe only under the gate `resolve_live_generation`
+    // imposes (no valid manifest AND no complete generation dir).
     let v1 = gen_dir(channel_dir, FIRST_GENERATION);
     std::fs::create_dir_all(&v1)?;
     if flat_idx.is_file() {
@@ -4180,6 +4204,78 @@ mod tests {
              exit would land in the (now-dead) cur_gen. Wrap the \
              call in `if let Err(e) = ... {{ tracing::warn!(...) }}` \
              that logs and continues."
+        );
+    }
+
+    /// Source-text guard for the `migrate_flat_layout_if_needed`
+    /// precedence assumption: the function MUST have exactly
+    /// one call site in this file (`resolve_live_generation`),
+    /// and that call site must sit AFTER the manifest-read and
+    /// enumerate-fallback branches. The function clobbers any
+    /// pre-existing `v0000000001/{idx,dat,ts}` with the flat-
+    /// layout content — safe ONLY because the gate at the call
+    /// site guarantees v1 wasn't a live generation. A future
+    /// refactor that adds a second caller (especially one
+    /// without the gate) would silently substitute legacy flat
+    /// content for whatever post-compact data v1 actually held.
+    /// Catch that at build time rather than as a corrupted
+    /// channel in production.
+    #[test]
+    fn migrate_flat_layout_has_exactly_one_caller() {
+        let src = include_str!("disk.rs");
+        // Count occurrences of the function name. One is the
+        // definition (`fn migrate_flat_layout_if_needed(`),
+        // one is the call site (`migrate_flat_layout_if_needed(`),
+        // and one is the rustdoc cross-reference inside the
+        // function rustdoc itself. We count strictly the
+        // call-shape with `(` immediately following the name —
+        // that excludes the rustdoc mention (which is followed
+        // by a space).
+        let needle_call = "migrate_flat_layout_if_needed(";
+        let total = src.matches(needle_call).count();
+        // Definition + one caller + this test's own reference
+        // (in the assertion message + this needle string above).
+        // To make the count deterministic regardless of the
+        // surrounding test wording, we strip THIS function's
+        // body before counting.
+        let test_fn_header = "fn migrate_flat_layout_has_exactly_one_caller(";
+        let test_fn_start = src
+            .find(test_fn_header)
+            .expect("this test must exist");
+        // Walk backward to the start of the test's `#[test]`
+        // attribute / rustdoc — close enough to slice off
+        // everything after the `///` block. We use a coarse
+        // approximation: cut at the most recent blank line
+        // before the test header.
+        let pre_test = &src[..test_fn_start];
+        let cut = pre_test.rfind("\n\n").unwrap_or(0);
+        let src_minus_this_test = &src[..cut];
+        let outside = src_minus_this_test.matches(needle_call).count();
+        assert_eq!(
+            outside, 2,
+            "regression: `migrate_flat_layout_if_needed` must have \
+             exactly two source occurrences with the `(` call shape \
+             outside this test (one definition + one caller in \
+             `resolve_live_generation`); saw {outside}. The function \
+             clobbers any pre-existing v1 with flat-layout content, \
+             which is safe only under the precedence gate that \
+             `resolve_live_generation` enforces. A second caller \
+             would silently lose post-compact data on channels \
+             where flat files lingered alongside a real generation \
+             directory. See the function's `# Precedence assumption` \
+             rustdoc.",
+        );
+        // Also note: total includes this test's own usage. Sanity
+        // check it grows by exactly 2 (the needle string above
+        // appears twice in the test source: in `let needle_call`
+        // and in the rustdoc slice setup). If a future edit adds
+        // more in-test occurrences, bump this and double-check the
+        // outside-count math still holds.
+        assert!(
+            total >= outside,
+            "sanity: total occurrences ({total}) cannot exceed \
+             outside ({outside}); test self-reference accounting \
+             is broken.",
         );
     }
 }
