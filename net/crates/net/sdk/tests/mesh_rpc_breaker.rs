@@ -322,6 +322,83 @@ fn breaker_reset_clears_state() {
         .block_on(body);
 }
 
+/// Regression: a panic inside a HalfOpen probe future must NOT
+/// leak `probe_in_flight=true` (which would wedge the breaker
+/// HalfOpen forever — every subsequent call short-circuits with
+/// `Open`, recoverable only via `reset()`). The RAII probe guard
+/// catches this and re-opens the breaker with a fresh cooldown,
+/// the same semantic as a probe that returned a counted error.
+#[test]
+fn breaker_half_open_panic_reopens_instead_of_wedging() {
+    let body = async move {
+        // Tight cooldown so we can drive Closed → Open → HalfOpen
+        // quickly. failure_threshold=1 trips on the first failure.
+        let cfg = CircuitBreakerConfig {
+            failure_threshold: 1,
+            reset_after: Duration::from_millis(10),
+            success_threshold: 1,
+            failure_predicate: Arc::new(net_sdk::mesh_rpc_resilience::default_breaker_failure),
+        };
+        let breaker = Arc::new(CircuitBreaker::new(cfg));
+
+        // Trip into Open.
+        let _ = breaker
+            .call(|| async { Err::<(), _>(RpcError::Timeout { elapsed_ms: 5 }) })
+            .await;
+        assert_eq!(breaker.state(), BreakerState::Open);
+
+        // Wait out cooldown so the next call probes.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // Probe panics. Catch the unwind so the test binary doesn't
+        // abort; the breaker's RAII guard must clear `probe_in_flight`
+        // and re-open the breaker.
+        let breaker_for_probe = breaker.clone();
+        let probe_result = tokio::spawn(async move {
+            breaker_for_probe
+                .call(|| async {
+                    panic!("simulated handler panic during HalfOpen probe");
+                    #[allow(unreachable_code)]
+                    Ok::<(), _>(())
+                })
+                .await
+        })
+        .await;
+        assert!(
+            probe_result.is_err(),
+            "panic must propagate out of breaker.call (so the caller observes the failure)"
+        );
+
+        // Wait for the (presumed-still-Open) cooldown to elapse so
+        // the next call probes again. If the breaker was wedged with
+        // `probe_in_flight=true`, this call would be rejected with
+        // `BreakerError::Open` immediately — the RAII guard prevents
+        // that.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // Next call must successfully reach the inner closure (i.e.
+        // be admitted as a probe).
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_inner = invoked.clone();
+        let result = breaker
+            .call(|| async {
+                invoked_inner.store(true, Ordering::SeqCst);
+                Ok::<u32, _>(42)
+            })
+            .await;
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "after a panic during a probe, the breaker must accept a fresh probe — got {result:?}",
+        );
+        assert!(matches!(result, Ok(42)));
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(body);
+}
+
 /// `BreakerError::into_rpc_error` flattens the breaker distinction
 /// for callers who don't care about it.
 #[test]

@@ -764,22 +764,29 @@ impl CircuitBreaker {
         }
     }
 
+    /// Lock the inner state, recovering from poison. The breaker's
+    /// state is monotonic counters; partial updates aren't safety-
+    /// critical, so a poisoned mutex (a thread panicked while
+    /// holding the lock — should never happen in practice since
+    /// the lock is never held across an await) is preferable to
+    /// a process-wide panic propagation that wedges every caller.
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, BreakerInner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Current operational state. Cheap snapshot — useful for
     /// metrics / logging. Note that `Open` may have actually
     /// elapsed its cooldown; the next `call` will transition to
     /// `HalfOpen` on entry.
     pub fn state(&self) -> BreakerState {
-        self.inner.lock().expect("breaker mutex poisoned").state
+        self.lock_inner().state
     }
 
     /// Snapshot of the consecutive-failure counter (resets to 0
     /// on success or transition out of `Closed`). Useful for
     /// alerting "we're approaching the trip threshold".
     pub fn consecutive_failures(&self) -> u32 {
-        self.inner
-            .lock()
-            .expect("breaker mutex poisoned")
-            .consecutive_failures
+        self.lock_inner().consecutive_failures
     }
 
     /// Test-only / operator override: force the breaker back to
@@ -787,7 +794,7 @@ impl CircuitBreaker {
     /// ("we manually verified the downstream is healthy, reset")
     /// or test setup.
     pub fn reset(&self) {
-        let mut g = self.inner.lock().expect("breaker mutex poisoned");
+        let mut g = self.lock_inner();
         g.state = BreakerState::Closed;
         g.consecutive_failures = 0;
         g.consecutive_successes = 0;
@@ -823,11 +830,26 @@ impl CircuitBreaker {
             AdmissionOutcome::Reject => return Err(BreakerError::Open),
         };
 
+        // RAII probe-in-flight guard. If `f().await` panics, the
+        // guard's Drop clears `probe_in_flight=false` AND re-opens
+        // the breaker with a fresh cooldown — without this, a
+        // panicking probe wedges the breaker in HalfOpen forever
+        // (every subsequent call short-circuits with `Open`,
+        // unrecoverable except via `reset()`).
+        let _probe_guard = ProbeGuard {
+            breaker: self,
+            admission: admitted_as,
+            disarmed: std::cell::Cell::new(false),
+        };
+
         // Run the inner call.
         let outcome = f().await;
 
-        // Outcome bookkeeping — short, no awaits.
-        let mut g = self.inner.lock().expect("breaker mutex poisoned");
+        // Outcome bookkeeping — short, no awaits. Disarm the
+        // probe guard before mutating state ourselves so we don't
+        // double-write `probe_in_flight=false`.
+        _probe_guard.disarmed.set(true);
+        let mut g = self.lock_inner();
         match (&outcome, admitted_as) {
             (Ok(_), Admission::Closed) => {
                 g.consecutive_failures = 0;
@@ -883,7 +905,7 @@ impl CircuitBreaker {
     /// - `HalfOpenProbe` — this caller becomes the probe.
     /// - `Reject` — short-circuit with `Open`.
     fn try_admit(&self) -> AdmissionOutcome {
-        let mut g = self.inner.lock().expect("breaker mutex poisoned");
+        let mut g = self.lock_inner();
         match g.state {
             BreakerState::Closed => AdmissionOutcome::Closed,
             BreakerState::Open => {
@@ -905,6 +927,41 @@ impl CircuitBreaker {
                     AdmissionOutcome::HalfOpenProbe
                 }
             }
+        }
+    }
+}
+
+/// RAII guard that ensures a HalfOpen probe correctly clears its
+/// `probe_in_flight` flag and re-opens the breaker if the inner
+/// future panics. Disarmed via `disarmed.set(true)` before the
+/// normal bookkeeping path so the success / inner-error paths
+/// don't double-write the flag.
+struct ProbeGuard<'a> {
+    breaker: &'a CircuitBreaker,
+    admission: Admission,
+    disarmed: std::cell::Cell<bool>,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.disarmed.get() {
+            return;
+        }
+        // The future panicked between admission and bookkeeping.
+        // For Closed admissions there's nothing to clean up — we
+        // just propagate the panic. For HalfOpenProbe admissions
+        // we MUST clear `probe_in_flight=false` (otherwise every
+        // subsequent caller short-circuits with `Open` forever)
+        // AND re-open with a fresh cooldown (a panicking probe is
+        // a failed probe — same semantic as a probe that returned
+        // a counted error).
+        if matches!(self.admission, Admission::HalfOpenProbe) {
+            let mut g = self.breaker.lock_inner();
+            g.probe_in_flight = false;
+            g.state = BreakerState::Open;
+            g.opened_at = Some(std::time::Instant::now());
+            g.consecutive_failures = 0;
+            g.consecutive_successes = 0;
         }
     }
 }
