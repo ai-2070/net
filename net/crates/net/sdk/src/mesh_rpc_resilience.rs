@@ -6,6 +6,10 @@
 //!
 //! - **`call_with_retry` / `call_typed_with_retry`** — re-issue
 //!   transient failures with exponential backoff + jitter.
+//! - **`call_with_hedge_to` / `call_service_with_hedge`** — fire
+//!   a backup request after a delay; race the responses; first
+//!   one wins. Bounds tail latency at the cost of duplicated
+//!   work on the loser.
 //!
 //! Each helper composes with the others (and with the underlying
 //! `CallOptions` deadline / routing policy) without special
@@ -278,6 +282,262 @@ where
     Err(last_err.unwrap_or_else(|| RpcError::Transport(
         net::error::AdapterError::Connection(
             "retry_loop: exhausted with no error captured (bug)".into(),
+        ),
+    )))
+}
+
+// ============================================================================
+// Hedge policy.
+// ============================================================================
+
+/// Hedge configuration for [`Mesh::call_with_hedge_to`] and
+/// friends. **Fire-then-race** semantics: issue the primary
+/// request immediately, then after `delay` issue one or more
+/// backup requests in parallel and return whichever finishes
+/// first.
+///
+/// **What hedging buys you.** Bounds tail latency. A single slow
+/// replica (GC pause, cold cache, hostile NIC) stops dominating
+/// the p99 — once `delay` elapses without an answer, a healthy
+/// peer gets a chance and the first reply back wins.
+///
+/// **What it costs you.** The losers' work is wasted: the server
+/// runs the handler, publishes a response, and the client
+/// silently discards it on arrival. Pick `delay` close to your
+/// observed p95 (so most calls don't trigger a hedge) and
+/// `hedges` small (1 covers the common slow-replica case;
+/// values >1 multiply your server-side load).
+///
+/// **Cancellation note.** Loser hedges are NOT explicitly
+/// cancelled today — when the winner returns, the in-flight
+/// loser futures are dropped, but the underlying server-side
+/// handlers continue to completion. The reply payloads come
+/// back, find no pending entry, and are silently discarded.
+/// Bandwidth is paid; correctness is preserved. A future
+/// enhancement will wire CANCEL emission into the unary call's
+/// drop path; for now, set realistic deadlines so a slow loser
+/// short-circuits via `Timeout`.
+#[derive(Debug, Clone)]
+pub struct HedgePolicy {
+    /// Wait this long after the primary call before firing the
+    /// first hedge. Subsequent hedges (if `hedges > 1`) fire at
+    /// `delay * idx` after the primary. Default: 50ms.
+    pub delay: Duration,
+    /// Number of hedge requests to fire IN ADDITION to the
+    /// primary. `1` is the canonical "primary + one backup"
+    /// shape; `0` disables hedging (the wrapper degrades to a
+    /// straight call). Default: 1.
+    pub hedges: u32,
+}
+
+impl Default for HedgePolicy {
+    fn default() -> Self {
+        Self {
+            delay: Duration::from_millis(50),
+            hedges: 1,
+        }
+    }
+}
+
+// ============================================================================
+// Mesh extensions: hedge.
+// ============================================================================
+
+impl Mesh {
+    /// Hedge across an explicit set of target node ids. The first
+    /// element of `targets` is the primary (fired immediately);
+    /// subsequent elements are hedges fired at `policy.delay * idx`.
+    /// Whichever call resolves first wins (Ok or Err). Losing
+    /// in-flight calls are dropped on the caller side.
+    ///
+    /// Returns `RpcError::NoRoute` if `targets` is empty. If every
+    /// candidate fails, returns the LAST observed error (after
+    /// all hedges have been awaited).
+    pub async fn call_with_hedge_to(
+        &self,
+        targets: &[u64],
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+        policy: &HedgePolicy,
+    ) -> std::result::Result<RpcReply, RpcError> {
+        if targets.is_empty() {
+            return Err(RpcError::NoRoute {
+                target: 0,
+                reason: "call_with_hedge_to: targets is empty".into(),
+            });
+        }
+        let total = (1 + policy.hedges as usize).min(targets.len());
+        let chosen: Vec<u64> = targets[..total].to_vec();
+        hedge_race(self, &chosen, service, payload, opts, policy.delay).await
+    }
+
+    /// Hedge across `1 + policy.hedges` candidates picked from the
+    /// service registry. Candidates are sorted (so the picks are
+    /// deterministic for a stable registry) and the prefix is
+    /// taken. If fewer candidates exist than requested, hedges
+    /// degrade to whatever's available (no error if `hedges=2` but
+    /// only 1 candidate exists — you just get a straight call).
+    ///
+    /// `opts.routing_policy` is ignored (hedge picks its own
+    /// candidates from the service registry).
+    /// `opts.filter_unhealthy` is also ignored: hedge's whole
+    /// premise is "be robust to per-node slowness" — filtering
+    /// unhealthy candidates reduces the redundancy that hedge
+    /// buys you. If you want health-aware single-target dispatch,
+    /// use `call_service` directly with a routing policy.
+    pub async fn call_service_with_hedge(
+        &self,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+        policy: &HedgePolicy,
+    ) -> std::result::Result<RpcReply, RpcError> {
+        let candidates = self.resolve_hedge_candidates(service)?;
+        let total = (1 + policy.hedges as usize).min(candidates.len());
+        let chosen = &candidates[..total];
+        hedge_race(self, chosen, service, payload, opts, policy.delay).await
+    }
+
+    /// Typed counterpart of [`Self::call_with_hedge_to`]. Encodes
+    /// once, hedges, decodes the winner's reply.
+    pub async fn call_typed_with_hedge_to<Req, Resp>(
+        &self,
+        targets: &[u64],
+        service: &str,
+        request: &Req,
+        opts: CallOptionsTyped,
+        policy: &HedgePolicy,
+    ) -> std::result::Result<Resp, RpcError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let codec = opts.codec;
+        let body = codec.encode(request).map_err(|e| RpcError::ServerError {
+            status: RpcStatus::Internal.to_wire(),
+            message: format!("client encode: {e}"),
+        })?;
+        let reply = self
+            .call_with_hedge_to(targets, service, Bytes::from(body), opts.raw, policy)
+            .await?;
+        codec
+            .decode(&reply.body)
+            .map_err(|e| RpcError::ServerError {
+                status: RpcStatus::Internal.to_wire(),
+                message: format!("client decode: {e}"),
+            })
+    }
+
+    /// Typed counterpart of [`Self::call_service_with_hedge`].
+    pub async fn call_service_typed_with_hedge<Req, Resp>(
+        &self,
+        service: &str,
+        request: &Req,
+        opts: CallOptionsTyped,
+        policy: &HedgePolicy,
+    ) -> std::result::Result<Resp, RpcError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let codec = opts.codec;
+        let body = codec.encode(request).map_err(|e| RpcError::ServerError {
+            status: RpcStatus::Internal.to_wire(),
+            message: format!("client encode: {e}"),
+        })?;
+        let reply = self
+            .call_service_with_hedge(service, Bytes::from(body), opts.raw, policy)
+            .await?;
+        codec
+            .decode(&reply.body)
+            .map_err(|e| RpcError::ServerError {
+                status: RpcStatus::Internal.to_wire(),
+                message: format!("client decode: {e}"),
+            })
+    }
+
+    fn resolve_hedge_candidates(
+        &self,
+        service: &str,
+    ) -> std::result::Result<Vec<u64>, RpcError> {
+        let mut candidates = self.find_service_nodes(service);
+        if candidates.is_empty() {
+            return Err(RpcError::NoRoute {
+                target: 0,
+                reason: format!("no nodes advertise `nrpc:{service}`"),
+            });
+        }
+        // Sort so the prefix taken by the hedge is deterministic
+        // for a stable registry. Composes with caller-side
+        // observability (the same call always picks the same
+        // primary unless the registry has churned).
+        candidates.sort_unstable();
+        Ok(candidates)
+    }
+}
+
+// ============================================================================
+// Internals: hedge race.
+// ============================================================================
+
+async fn hedge_race(
+    mesh: &Mesh,
+    targets: &[u64],
+    service: &str,
+    payload: Bytes,
+    opts: CallOptions,
+    delay: Duration,
+) -> std::result::Result<RpcReply, RpcError> {
+    use futures::future::FutureExt;
+
+    // Clone the underlying Arc<MeshNode> once; each spawned future
+    // owns a clone for its `call(...)` invocation. Cheap (Arc bump).
+    let node = mesh.node_arc();
+    let service_owned = service.to_string();
+
+    // Build one future per target. The first fires immediately; each
+    // subsequent one waits `delay * idx` before invoking. Boxed +
+    // pinned so they share a `select_all`-compatible type.
+    let mut futures: Vec<futures::future::BoxFuture<'static, std::result::Result<RpcReply, RpcError>>> = targets
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(idx, target)| {
+            let node = Arc::clone(&node);
+            let service = service_owned.clone();
+            let payload = payload.clone();
+            let opts = opts.clone();
+            let wait = delay.saturating_mul(idx as u32);
+            async move {
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                node.call(target, &service, payload, opts).await
+            }
+            .boxed()
+        })
+        .collect();
+
+    // Race them. Drop losers as they're left in `remaining`. If the
+    // first to resolve is `Ok`, return immediately (drop the rest).
+    // If `Err`, keep waiting on the remaining hedges before
+    // surfacing — a fast Err shouldn't disqualify slower-but-Ok
+    // alternates.
+    let mut last_err: Option<RpcError> = None;
+    while !futures.is_empty() {
+        let (result, _idx, remaining) = futures::future::select_all(futures).await;
+        match result {
+            Ok(reply) => return Ok(reply),
+            Err(e) => {
+                last_err = Some(e);
+                futures = remaining;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| RpcError::Transport(
+        net::error::AdapterError::Connection(
+            "hedge_race: drained with no error captured (bug)".into(),
         ),
     )))
 }
