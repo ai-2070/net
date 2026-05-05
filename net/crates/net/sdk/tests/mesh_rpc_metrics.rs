@@ -186,14 +186,28 @@ async fn server_side_metrics_increment_for_unary_and_streaming() {
         RpcStreamingHandler,
     };
 
+    /// Sleep duration the handler uses so the duration histogram
+    /// has observations that land in a predictable bucket. Picked
+    /// so that `HANDLER_SLEEP + worst-case scheduler overhead`
+    /// is comfortably below the `≤100ms` bucket boundary (index 4
+    /// in DEFAULT_LATENCY_BUCKETS_SECS):
+    ///   - 30ms sleep
+    ///   - + ~15ms worst-case Windows timer tick
+    ///   = ~45ms actual handler duration
+    /// The previous test used a 2ms sleep + asserted ≤5ms bucket,
+    /// which routinely flaked on Windows where scheduler overhead
+    /// can push a 2ms sleep to 5-15ms actual.
+    const HANDLER_SLEEP: Duration = Duration::from_millis(30);
+    /// Bucket index whose upper bound is 100ms. Must hold
+    /// `HANDLER_SLEEP + scheduler_overhead < 100ms` for the
+    /// assertion below to be stable.
+    const HANDLER_BUCKET_INDEX: usize = 4;
+
     struct Echo;
     #[async_trait]
     impl RpcHandler for Echo {
         async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
-            // Add a small sleep so the handler-duration histogram
-            // has a non-zero observation that lands in a known
-            // bucket window.
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(HANDLER_SLEEP).await;
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
@@ -308,12 +322,24 @@ async fn server_side_metrics_increment_for_unary_and_streaming() {
         4,
         "+Inf bucket equals handler_duration_count",
     );
-    // 2ms sleep → lands in <= 5ms bucket (index 0).
+    // 30ms sleep → comfortably under the 100ms bucket boundary
+    // even with worst-case Windows scheduler overhead. The
+    // bucket is cumulative (counts everything ≤ 100ms) so a
+    // healthy run lands all 4 observations here.
     assert!(
-        echo.handler_duration_buckets[0] >= 1,
-        "at least one handler should land in the ≤5ms bucket; got {:?}",
+        echo.handler_duration_buckets[HANDLER_BUCKET_INDEX] >= 1,
+        "at least one handler must land in the ≤100ms bucket; got {:?}",
         echo.handler_duration_buckets,
     );
+    // Stronger invariant: the cumulative-histogram math holds
+    // (later buckets are ≥ earlier ones, +Inf bucket equals total).
+    for window in echo.handler_duration_buckets.windows(2) {
+        assert!(
+            window[1] >= window[0],
+            "cumulative histogram must be monotonic; got {:?}",
+            echo.handler_duration_buckets,
+        );
+    }
 
     let stream_svc = snap
         .services

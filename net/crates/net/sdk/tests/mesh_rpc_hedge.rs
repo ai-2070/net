@@ -78,11 +78,25 @@ async fn hedge_backup_wins_when_primary_is_slow() {
     handshake(&caller, &primary).await;
     handshake(&caller, &backup).await;
 
+    // Wide gap between primary and backup so the assertion has
+    // generous slack across loaded CI / Windows scheduler noise:
+    //   - primary sleeps 1500ms
+    //   - backup is instant
+    //   - hedge delay 50ms
+    // Expected wall clock: ~50ms (hedge fire) + a few ms backup
+    // round-trip, with up to several hundred ms scheduler /
+    // network overhead. Asserting `< 1200ms` proves the backup
+    // won (well under primary's 1500ms) without depending on
+    // tight latency budgets that flake under load.
+    const PRIMARY_SLEEP_MS: u64 = 1500;
+    const HEDGE_DELAY_MS: u64 = 50;
+    const HEDGE_MAX_WALL_CLOCK_MS: u64 = 1200;
+
     let _serve_primary = primary
         .serve_rpc(
             "lookup",
             Arc::new(DelayHandler {
-                sleep_ms: 800,
+                sleep_ms: PRIMARY_SLEEP_MS,
                 body: b"slow-primary",
             }),
         )
@@ -98,7 +112,7 @@ async fn hedge_backup_wins_when_primary_is_slow() {
         .expect("serve_rpc backup");
 
     let policy = HedgePolicy {
-        delay: Duration::from_millis(50),
+        delay: Duration::from_millis(HEDGE_DELAY_MS),
         hedges: 1,
     };
 
@@ -121,11 +135,16 @@ async fn hedge_backup_wins_when_primary_is_slow() {
         "backup must win the race (got {:?})",
         std::str::from_utf8(reply.body.as_ref()).unwrap_or("<non-utf8>"),
     );
-    // Wall-clock should be ~hedge delay + backup latency, well
-    // under the primary's 800ms.
+    // Body assertion above already proves the backup won. The
+    // wall-clock assertion here just guards against the "primary
+    // accidentally won" pathological case (e.g. a regression that
+    // skipped the hedge delay or routed both calls to the same
+    // target). 1200ms vs. primary's 1500ms gives 300ms of slack
+    // — comfortable under loaded CI without trivializing the
+    // assertion.
     assert!(
-        elapsed < Duration::from_millis(600),
-        "wall-clock {elapsed:?} must be much less than primary's 800ms",
+        elapsed < Duration::from_millis(HEDGE_MAX_WALL_CLOCK_MS),
+        "wall-clock {elapsed:?} must be well under primary's {PRIMARY_SLEEP_MS}ms",
     );
 }
 

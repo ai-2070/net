@@ -249,20 +249,42 @@ async fn rpc_streaming_window_throttles_pump_until_grants() {
         .expect("call_streaming");
     assert!(stream.flow_controlled(), "stream must be flow-controlled");
 
-    // DON'T poll. Wait for the server to attempt all 20 emits;
-    // flow control should hold the pump at 3.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let snap = server.rpc_metrics_snapshot();
-    let throttle = snap
-        .services
-        .iter()
-        .find(|s| s.service == "throttle")
-        .expect("throttle service must appear");
+    // Two-phase poll-then-verify-stable: (1) wait until the
+    // pump has emitted the initial window (proves the server
+    // got the request and started streaming), (2) sleep a small
+    // margin and re-read — flow control should hold the count
+    // STILL at 3 (proves the pump genuinely blocks on credit,
+    // not "everything goes through, caller just hasn't drained").
+    // The previous version used `sleep(300ms); assert == 3`,
+    // which flaked when the server was slow to emit even the
+    // initial 3 (read too early → assertion saw < 3 chunks).
+    let count = |service: &str| -> u64 {
+        server
+            .rpc_metrics_snapshot()
+            .services
+            .iter()
+            .find(|s| s.service == service)
+            .map(|s| s.streaming_chunks_emitted_total)
+            .unwrap_or(0)
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while count("throttle") < 3 {
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "pump didn't reach initial window of 3 within 2s; got {}",
+                count("throttle"),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Now verify the count stays at 3 over a stability window —
+    // the server's pump should be blocked on the empty
+    // semaphore, not racing toward 20.
+    tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
-        throttle.streaming_chunks_emitted_total, 3,
-        "pump must stop at initial_window=3 without grants; got {}",
-        throttle.streaming_chunks_emitted_total,
+        count("throttle"),
+        3,
+        "pump must stop at initial_window=3 without grants",
     );
 
     // Hold the stream so it doesn't drop and tear down the
@@ -372,34 +394,55 @@ async fn rpc_streaming_explicit_grant_unblocks_pump() {
         .await
         .expect("call_streaming");
 
-    // Wait for the initial 2 credits to be consumed.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let snap = server.rpc_metrics_snapshot();
-    let svc = snap
-        .services
-        .iter()
-        .find(|s| s.service == "explicitgrant")
-        .unwrap();
+    // Two-phase: (1) poll until initial window is consumed,
+    // (2) verify stable. Same shape as the throttle test above —
+    // removes the dependency on a hard-coded sleep being long
+    // enough for the server to get going AND short enough that
+    // the test doesn't drag.
+    let count = |service: &str| -> u64 {
+        server
+            .rpc_metrics_snapshot()
+            .services
+            .iter()
+            .find(|s| s.service == service)
+            .map(|s| s.streaming_chunks_emitted_total)
+            .unwrap_or(0)
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while count("explicitgrant") < 2 {
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "pump didn't reach initial window of 2 within 2s; got {}",
+                count("explicitgrant"),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
-        svc.streaming_chunks_emitted_total, 2,
+        count("explicitgrant"),
+        2,
         "pump must stall at the initial window with no consumption + no grants",
     );
 
-    // Explicit grant of 5 → server should now emit 5 more (total 7).
+    // Explicit grant of 5 → server should now emit 5 more
+    // (total 7). Poll until reached, then verify stable.
     stream.grant(5);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let snap = server.rpc_metrics_snapshot();
-    let svc = snap
-        .services
-        .iter()
-        .find(|s| s.service == "explicitgrant")
-        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while count("explicitgrant") < 7 {
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "after grant(5), pump didn't reach 7 within 2s; got {}",
+                count("explicitgrant"),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
-        svc.streaming_chunks_emitted_total, 7,
-        "after grant(5), pump must emit 5 more (total 7); got {}",
-        svc.streaming_chunks_emitted_total,
+        count("explicitgrant"),
+        7,
+        "after grant(5), pump must emit exactly 5 more (total 7) and stop again",
     );
 
     drop(stream);
