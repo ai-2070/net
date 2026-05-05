@@ -1,0 +1,25 @@
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  d1b11a1287c1706a 636,638-663,669,687-693,699-702,704-707,1118-1178
+net/crates/net/bindings/go/net/mesh_rpc.go
+  d1b11a1287c1706a 109,113,689-693,697-702,711-721,729,733-736,738-745
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "84517dad850db8545b880e5034523e093e1e0706",
+  "prompts": {
+    "d1b11a1287c1706a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 141,
+      "total_deletions": 33,
+      "accepted_lines": 812,
+      "overriden_lines": 0
+    }
+  }
+}
