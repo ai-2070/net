@@ -257,7 +257,10 @@ struct DispatchCtx {
     failure_detector: Arc<FailureDetector>,
     inbound: InboundQueues,
     /// Per-channel-hash dispatch hook for nRPC. See the matching
-    /// field on `MeshNode`.
+    /// field on `MeshNode`. Gated on `cortex` because the nRPC
+    /// dispatcher type lives there and the `--features net`-only
+    /// build doesn't compile the cortex layer.
+    #[cfg(feature = "cortex")]
     rpc_inbound_dispatchers: Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
@@ -1058,20 +1061,24 @@ pub struct MeshNode {
     /// the per-shard `inbound` queue. Lookup is one DashMap get
     /// per packet on the hot path; absent registrations skip the
     /// branch entirely.
+    #[cfg(feature = "cortex")]
     rpc_inbound_dispatchers: Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
     /// Pending oneshots for in-flight `Mesh::call` invocations.
     /// Shared with the per-Mesh `RpcClientFold` so RESPONSE events
     /// arriving on reply channels complete the right call's
     /// awaiting future.
+    #[cfg(feature = "cortex")]
     rpc_client_pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
     /// Per-caller monotonic call id allocator. Used as the
     /// `EventMeta::seq_or_ts` correlation id on outgoing REQUEST
     /// events.
+    #[cfg(feature = "cortex")]
     rpc_next_call_id: Arc<std::sync::atomic::AtomicU64>,
     /// Tracks `(target_node_id, service)` pairs we've already
     /// established a reply-channel subscription for. `Mesh::call`
     /// consults this to skip the round-trip subscribe on
     /// subsequent calls to the same (target, service).
+    #[cfg(feature = "cortex")]
     rpc_reply_subscriptions: Arc<parking_lot::Mutex<Vec<(u64, String)>>>,
     /// nRPC services the local node currently handles (registered
     /// via `Mesh::serve_rpc`, deregistered when the `ServeHandle`
@@ -1079,11 +1086,13 @@ pub struct MeshNode {
     /// `nrpc:<service>` tags into the announced `CapabilitySet`,
     /// so other nodes' capability indexes can find this node via
     /// `Mesh::find_service_nodes(name)`.
+    #[cfg(feature = "cortex")]
     rpc_local_services: Arc<dashmap::DashSet<String>>,
     /// Caller-side per-service nRPC metrics. Updated by
-    /// `Mesh::call` via the [`mesh_rpc_metrics::CallMetricsGuard`]
-    /// RAII shim; read out via [`Self::rpc_metrics_snapshot`] for
+    /// `Mesh::call` via the `mesh_rpc_metrics::CallMetricsGuard`
+    /// RAII shim; read out via `Self::rpc_metrics_snapshot` for
     /// Prometheus exposure or custom observability.
+    #[cfg(feature = "cortex")]
     rpc_metrics: Arc<crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry>,
     /// Optional migration subprotocol handler — same `ArcSwapOption`
     /// surface as on `MeshNode`, propagated into the dispatch
@@ -1515,11 +1524,17 @@ impl MeshNode {
             router,
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
+            #[cfg(feature = "cortex")]
             rpc_inbound_dispatchers: Arc::new(DashMap::new()),
+            #[cfg(feature = "cortex")]
             rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
+            #[cfg(feature = "cortex")]
             rpc_next_call_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            #[cfg(feature = "cortex")]
             rpc_reply_subscriptions: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            #[cfg(feature = "cortex")]
             rpc_local_services: Arc::new(dashmap::DashSet::new()),
+            #[cfg(feature = "cortex")]
             rpc_metrics: Arc::new(crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
@@ -2347,6 +2362,7 @@ impl MeshNode {
             router: self.router.clone(),
             failure_detector: self.failure_detector.clone(),
             inbound: self.inbound.clone(),
+            #[cfg(feature = "cortex")]
             rpc_inbound_dispatchers: self.rpc_inbound_dispatchers.clone(),
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
@@ -3587,6 +3603,7 @@ impl MeshNode {
         //
         // Hot-path cost: one DashMap get per packet. Absent
         // registrations skip the loop entirely.
+        #[cfg(feature = "cortex")]
         if let Some(dispatcher) = ctx.rpc_inbound_dispatchers.get(&parsed.header.channel_hash) {
             let dispatcher = dispatcher.clone();
             let channel_hash = parsed.header.channel_hash;
@@ -4041,6 +4058,7 @@ impl MeshNode {
     ///
     /// **Hot-path cost.** One DashMap get per inbound packet.
     /// Absent registrations skip the conditional entirely.
+    #[cfg(feature = "cortex")]
     pub fn register_rpc_inbound(
         &self,
         channel_hash: u16,
@@ -4054,6 +4072,7 @@ impl MeshNode {
     /// the prior dispatcher if one was registered. After removal,
     /// inbound events for `channel_hash` resume landing in the
     /// per-shard inbound queue.
+    #[cfg(feature = "cortex")]
     pub fn unregister_rpc_inbound(
         &self,
         channel_hash: u16,
@@ -4066,6 +4085,7 @@ impl MeshNode {
     /// Per-Mesh shared `RpcClientPending` — accessor for the
     /// `mesh_rpc::Mesh::call` glue. Pending oneshots awaiting
     /// RESPONSE events live here.
+    #[cfg(feature = "cortex")]
     pub(super) fn rpc_client_pending_arc(
         &self,
     ) -> Arc<crate::adapter::net::cortex::RpcClientPending> {
@@ -4074,6 +4094,7 @@ impl MeshNode {
 
     /// Per-Mesh monotonic call-id allocator. Accessor for
     /// `mesh_rpc::Mesh::call`.
+    #[cfg(feature = "cortex")]
     pub(super) fn rpc_next_call_id_arc(&self) -> Arc<std::sync::atomic::AtomicU64> {
         self.rpc_next_call_id.clone()
     }
@@ -4081,6 +4102,7 @@ impl MeshNode {
     /// Tracks already-established (target, service) reply
     /// subscriptions. Accessor for `mesh_rpc::Mesh::call`'s
     /// lazy-subscribe path.
+    #[cfg(feature = "cortex")]
     pub(super) fn rpc_reply_subscriptions_arc(
         &self,
     ) -> Arc<parking_lot::Mutex<Vec<(u64, String)>>> {
@@ -4091,6 +4113,7 @@ impl MeshNode {
     /// public key). Accessor for `mesh_rpc::Mesh::serve_rpc` /
     /// `Mesh::call` to stamp on outgoing REQUEST / RESPONSE meta
     /// headers.
+    #[cfg(feature = "cortex")]
     pub(super) fn public_key_origin_hash(&self) -> u64 {
         self.identity.entity_id().origin_hash()
     }
@@ -4099,6 +4122,7 @@ impl MeshNode {
     /// `mesh_rpc::serve_rpc` adds entries; `ServeHandle::Drop`
     /// removes them. `announce_capabilities` reads this to
     /// auto-merge `nrpc:<service>` tags.
+    #[cfg(feature = "cortex")]
     pub(super) fn rpc_local_services_arc(&self) -> Arc<dashmap::DashSet<String>> {
         self.rpc_local_services.clone()
     }
@@ -4106,6 +4130,7 @@ impl MeshNode {
     /// Per-Mesh caller-side nRPC metrics registry. Accessor for
     /// `mesh_rpc::Mesh::call` to bump counters on each outgoing
     /// call.
+    #[cfg(feature = "cortex")]
     pub(super) fn rpc_metrics_arc(
         &self,
     ) -> Arc<crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry> {
@@ -4114,7 +4139,8 @@ impl MeshNode {
 
     /// Snapshot of caller-side nRPC metrics. Cheap (one DashMap
     /// iteration); call on every Prometheus scrape. Format with
-    /// [`crate::adapter::net::mesh_rpc_metrics::RpcMetricsSnapshot::prometheus_text`].
+    /// `RpcMetricsSnapshot::prometheus_text`.
+    #[cfg(feature = "cortex")]
     pub fn rpc_metrics_snapshot(
         &self,
     ) -> crate::adapter::net::mesh_rpc_metrics::RpcMetricsSnapshot {
@@ -4123,6 +4149,7 @@ impl MeshNode {
 
     /// Capability index — accessor for `mesh_rpc::Mesh::find_service_nodes`
     /// to query nodes carrying the `nrpc:<service>` tag.
+    #[cfg(feature = "cortex")]
     pub(super) fn capability_index_arc(
         &self,
     ) -> Arc<crate::adapter::net::behavior::capability::CapabilityIndex> {
@@ -4140,6 +4167,7 @@ impl MeshNode {
     /// about via capability announcement but haven't completed
     /// a handshake with). Callers treat `None` as "no
     /// proximity-derivable signal," not as "node is dead."
+    #[cfg(feature = "cortex")]
     pub(super) fn entity_id_for_node(&self, node_id: u64) -> Option<[u8; 32]> {
         self.peer_entity_ids
             .get(&node_id)
@@ -5844,6 +5872,10 @@ impl MeshNode {
         // for the registered services. Local-only state from
         // `Mesh::serve_rpc`; deduped against existing tags so a
         // user that pre-tagged manually doesn't get double entries.
+        // Gated on `cortex` because `rpc_local_services` only
+        // exists when the cortex layer (which provides serve_rpc)
+        // is compiled in.
+        #[cfg(feature = "cortex")]
         let caps = if self.rpc_local_services.is_empty() {
             caps
         } else {
