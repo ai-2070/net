@@ -160,14 +160,15 @@ describe('DaemonRuntime (Stage 3 sub-step 2a: spawn + stop)', () => {
     const handle = await rt.spawn('echo', id);
 
     expect(handle).toBeInstanceOf(DaemonHandle);
-    expect(typeof handle.originHash).toBe('number');
+    expect(typeof handle.originHash).toBe('bigint');
     expect(handle.entityId).toBeInstanceOf(Buffer);
     expect(handle.entityId.length).toBe(32);
-    // originHash matches identity's origin hash (first 4 bytes of
-    // the BLAKE2s-derived hash). We don't recompute here — just
-    // assert it's non-zero, because `Identity.generate()` produces
-    // random bytes that essentially never hash to zero.
-    expect(handle.originHash).not.toBe(0);
+    // originHash matches identity's origin hash (the 8-byte
+    // BLAKE2s-derived hash widened to u64 in v0.11). We don't
+    // recompute here — just assert it's non-zero, because
+    // `Identity.generate()` produces random bytes that essentially
+    // never hash to zero.
+    expect(handle.originHash).not.toBe(0n);
 
     expect(rt.daemonCount()).toBe(1);
   });
@@ -230,7 +231,7 @@ describe('DaemonRuntime (Stage 3 sub-step 2a: spawn + stop)', () => {
       autoSnapshotInterval: 128n,
       maxLogEntries: 2048,
     });
-    expect(handle.originHash).not.toBe(0);
+    expect(handle.originHash).not.toBe(0n);
   });
 
   it('factory is invoked exactly once per spawn; each invocation gets its own closure state', async () => {
@@ -285,7 +286,7 @@ describe('DaemonRuntime (Stage 3 sub-step 2a: spawn + stop)', () => {
     expect(factoryResolved).toBe(false);
     const handle = await rt.spawn('async-echo', Identity.generate());
     expect(factoryResolved).toBe(true);
-    expect(handle.originHash).not.toBe(0);
+    expect(handle.originHash).not.toBe(0n);
   });
 
   it('snapshot / restore methods are optional', async () => {
@@ -302,7 +303,7 @@ describe('DaemonRuntime (Stage 3 sub-step 2a: spawn + stop)', () => {
     await rt.start();
 
     const handle = await rt.spawn('stateless', Identity.generate());
-    expect(handle.originHash).not.toBe(0);
+    expect(handle.originHash).not.toBe(0n);
     await rt.stop(handle.originHash);
     expect(rt.daemonCount()).toBe(0);
   });
@@ -470,8 +471,8 @@ describe('DaemonRuntime (Stage 3 sub-step 3: event dispatch)', () => {
     await rt.start();
 
     await expect(
-      rt.deliver(0xdeadbeef, {
-        originHash: 0xdeadbeef,
+      rt.deliver(0xdeadbeefn, {
+        originHash: 0xdeadbeefn,
         sequence: 1n,
         payload: Buffer.from('x'),
       }),
@@ -616,7 +617,7 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     rt.registerFactory('counter', counterFactory());
     await rt.start();
 
-    await expect(rt.snapshot(0xdeadbeef)).rejects.toThrow(DaemonError);
+    await expect(rt.snapshot(0xdeadbeefn)).rejects.toThrow(DaemonError);
   });
 
   it('spawnFromSnapshot with corrupted bytes rejects with DaemonError', async () => {
@@ -762,7 +763,7 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
 
     const selfId = mesh.nodeId();
     await expect(
-      rt.startMigration(0xdeadbeef, selfId, selfId),
+      rt.startMigration(0xdeadbeefn, selfId, selfId),
     ).rejects.toThrow(DaemonError);
   });
 
@@ -787,7 +788,7 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     cleanups.push(() => rt.shutdown());
     await rt.start();
 
-    expect(() => rt.expectMigration('never-registered', 0x1234)).toThrow(
+    expect(() => rt.expectMigration('never-registered', 0x1234n)).toThrow(
       DaemonError,
     );
   });
@@ -802,8 +803,8 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
 
     // First call is fine — second for the same origin should fail
     // (registry slot already occupied).
-    rt.expectMigration('counter', 0xabcd_ef01);
-    expect(() => rt.expectMigration('counter', 0xabcd_ef01)).toThrow(
+    rt.expectMigration('counter', 0xabcd_ef01n);
+    expect(() => rt.expectMigration('counter', 0xabcd_ef01n)).toThrow(
       DaemonError,
     );
   });
@@ -831,7 +832,7 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     const rt = DaemonRuntime.create(mesh);
     cleanups.push(() => rt.shutdown());
     await rt.start();
-    expect(rt.migrationPhase(0xdeadbeef)).toBeNull();
+    expect(rt.migrationPhase(0xdeadbeefn)).toBeNull();
   });
 
   it('migrationPhase returns a phase string for an in-flight migration', async () => {
@@ -1550,7 +1551,7 @@ describe('regression: BigInt boundary validation (compute)', () => {
     const rt = await startedRuntime();
     // Any origin_hash works — the BigInt validation fires before
     // the migration orchestrator ever looks for a local daemon.
-    await expect(rt.startMigration(0xdead_beef, -1n, 1n)).rejects.toThrow(
+    await expect(rt.startMigration(0xdead_beefn, -1n, 1n)).rejects.toThrow(
       /non-negative/,
     );
   });
@@ -1558,14 +1559,14 @@ describe('regression: BigInt boundary validation (compute)', () => {
   it('startMigration rejects an overflow targetNode', async () => {
     const rt = await startedRuntime();
     await expect(
-      rt.startMigration(0xdead_beef, 1n, 2n ** 65n),
+      rt.startMigration(0xdead_beefn, 1n, 2n ** 65n),
     ).rejects.toThrow(/u64 range/);
   });
 
   it('startMigrationWith rejects a negative retryNotReadyMs', async () => {
     const rt = await startedRuntime();
     await expect(
-      rt.startMigrationWith(0xdead_beef, 1n, 2n, {
+      rt.startMigrationWith(0xdead_beefn, 1n, 2n, {
         retryNotReadyMs: -100n,
       }),
     ).rejects.toThrow(/non-negative/);

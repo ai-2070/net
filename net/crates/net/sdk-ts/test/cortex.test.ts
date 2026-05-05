@@ -18,7 +18,7 @@ import {
   type Task,
 } from '../src/cortex';
 
-const ORIGIN = 0xabcdef01;
+const ORIGIN = 0xabcdef01n;
 
 function nowNs(): bigint {
   return BigInt(Date.now()) * 1_000_000n;

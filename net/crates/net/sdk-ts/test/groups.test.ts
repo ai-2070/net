@@ -86,7 +86,7 @@ describe('ReplicaGroup', () => {
     expect(group.replicas).toHaveLength(3);
     for (const r of group.replicas) {
       expect(r.healthy).toBe(true);
-      expect(r.originHash).not.toBe(0);
+      expect(r.originHash).not.toBe(0n);
     }
   });
 
@@ -191,13 +191,13 @@ describe('ForkGroup', () => {
     cleanups.push(() => mesh.shutdown());
     cleanups.push(() => rt.shutdown());
 
-    const group = await ForkGroup.fork(rt, 'noop', 0xabcd_ef01, 42n, {
+    const group = await ForkGroup.fork(rt, 'noop', 0xabcd_ef01n, 42n, {
       forkCount: 3,
       lbStrategy: 'round-robin',
     });
 
     expect(group.forkCount).toBe(3);
-    expect(group.parentOrigin).toBe(0xabcd_ef01);
+    expect(group.parentOrigin).toBe(0xabcd_ef01n);
     expect(group.forkSeq).toBe(42n);
     expect(group.verifyLineage()).toBe(true);
 
@@ -214,7 +214,7 @@ describe('ForkGroup', () => {
     rt.registerFactory('noop', () => new NoopDaemon());
 
     try {
-      await ForkGroup.fork(rt, 'noop', 0x1234, 1n, {
+      await ForkGroup.fork(rt, 'noop', 0x1234n, 1n, {
         forkCount: 2,
         lbStrategy: 'round-robin',
       });
@@ -254,7 +254,7 @@ describe('StandbyGroup', () => {
     expect(group.standbyCount).toBe(2);
     expect(group.activeIndex).toBe(0);
     expect(group.activeHealthy).toBe(true);
-    expect(group.activeOrigin).not.toBe(0);
+    expect(group.activeOrigin).not.toBe(0n);
     expect(group.bufferedEventCount).toBe(0);
     expect(group.memberRole(0)).toBe('active');
     expect(group.memberRole(1)).toBe('standby');
