@@ -209,8 +209,6 @@ These aren't strictly API-breaking but tests that asserted the pre-fix behavior 
 9. **RedEX on-disk layout has changed.** Each channel now stores its files under `<channel>/v0000000001/{idx,dat,ts}` plus a 16-byte `<channel>/manifest` pointer file, replacing the flat `<channel>/{idx,dat,ts}` layout. The migration runs automatically on first open of a v0.10 / v0.11 channel (one-shot, idempotent) — no code change required from callers. Tools or scripts that read RedEX files directly (rare; the supported access path is the `RedexFile` API) need to follow the manifest to the live generation directory.
 10. **If you embed FFI handles in a custom Rust wrapper** (rare), embed `HandleGuard` from the new `ffi::handle_guard` module and route every entry point through `try_enter` / `begin_free`. The recipe matches the bundled handles' implementation; the helper module's tests double as documentation.
 
-The audit queue is now drained. The next release will pick up structural items (`MigrationOrchestrator` placement-policy work, persistent JetStream sequence numbering for cross-restart msg-id durability) rather than another bug-fix sweep.
-
 ---
 
 Released 2026-05-05.
