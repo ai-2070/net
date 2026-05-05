@@ -276,6 +276,84 @@ async fn rpc_deadline_surfaces_as_timeout_and_emits_cancel() {
     }
 }
 
+/// Regression for H16 — Phase 1 coverage gap. The previous
+/// `rpc_deadline_surfaces_as_timeout_and_emits_cancel` test only
+/// checked the caller's view (Timeout returned). It did NOT
+/// confirm the server-side handler actually observed the CANCEL
+/// event the caller's deadline-fire path is supposed to publish.
+///
+/// This test installs a handler that signals an `AtomicBool` when
+/// `ctx.cancellation.cancelled()` resolves, then verifies the
+/// signal fires after the caller's deadline elapses — proving
+/// the deadline path actually emits CANCEL across the wire (not
+/// just locally synthesizes a Timeout error).
+#[tokio::test]
+async fn rpc_deadline_actually_emits_cancel_to_server_handler() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct CancelObservingHandler {
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl RpcHandler for CancelObservingHandler {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            tokio::select! {
+                _ = ctx.cancellation.cancelled() => {
+                    self.cancelled.store(true, std::sync::atomic::Ordering::Release);
+                    Err(RpcHandlerError::Internal("cancelled".into()))
+                }
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    Ok(RpcResponsePayload {
+                        status: RpcStatus::Ok,
+                        headers: vec![],
+                        body: vec![],
+                    })
+                }
+            }
+        }
+    }
+    let _serve = server
+        .serve_rpc(
+            "deadline_cancel",
+            Arc::new(CancelObservingHandler {
+                cancelled: cancelled.clone(),
+            }),
+        )
+        .expect("serve_rpc");
+
+    let err = caller
+        .call(
+            server.node_id(),
+            "deadline_cancel",
+            Bytes::from_static(b"hang"),
+            CallOptions {
+                deadline: Some(Instant::now() + Duration::from_millis(200)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("call must time out");
+    assert!(matches!(err, RpcError::Timeout { .. }));
+
+    // Server-side handler must observe CANCEL within a generous
+    // window past the caller's deadline (network round-trip +
+    // CANCEL publish + handler's select! wake).
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !cancelled.load(std::sync::atomic::Ordering::Acquire)
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        cancelled.load(std::sync::atomic::Ordering::Acquire),
+        "deadline-fire path must publish CANCEL — server handler must \
+         observe ctx.cancellation within 3s of the caller timeout",
+    );
+}
+
 /// Caller drops the unary `call` future before it resolves
 /// (e.g. via `tokio::select!` losing) → the call's RAII
 /// `UnaryCallGuard` fires CANCEL → the server-side handler
