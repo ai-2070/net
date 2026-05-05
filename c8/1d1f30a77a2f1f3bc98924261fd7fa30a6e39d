@@ -1,0 +1,25 @@
+net/crates/net/sdk/examples/nrpc_echo.rs
+  cfca4517ad394ef2 98-105,114
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  cfca4517ad394ef2 301-324,436-452,660,666,2240-2281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "c81d1f30a77a2f1f3bc98924261fd7fa30a6e39d",
+  "prompts": {
+    "cfca4517ad394ef2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c8c8999-2a05-4bfc-a843-35946dde9df4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 94,
+      "total_deletions": 4,
+      "accepted_lines": 94,
+      "overriden_lines": 0
+    }
+  }
+}
