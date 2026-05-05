@@ -16,9 +16,23 @@ Two of the closures required a wire-format bump that v0.10 deliberately avoided.
 - **Snapshot persisted `last_seq` for skipped events** — same root cause as the watermark fix above. Once the strict-prefix watermark is the source of truth, snapshots no longer carry sequence numbers for events whose state was never applied; the on-disk log remains the source of truth on restore.
 - **Per-event checksum did not cover the EventMeta header** — `compute_checksum(tail)` was xxh3 over only the payload tail; a stray bit-flip in the 20-byte `EventMeta` header (e.g. `dispatch: STORED → DELETED`) was undetected by the per-event integrity check and silently re-routed the event to the wrong fold arm. The new `compute_checksum_with_meta(&meta, tail)` covers both the header (with the `checksum` slot zeroed) and the tail. Producers stamp v2; readers try v2 first and fall back to v1 to keep pre-fix on-disk records readable. Downgrading to a pre-v0.11 binary will skip every event written by a v0.11 producer (the legacy verifier expects `xxh3(tail)`, which v2 records won't match) — the migration is effectively one-way.
 
-### RedEX `compact_to` durability on Windows
+### RedEX `compact_to` durability + atomicity (manifest-pointer flip)
 
-- **Per-rename `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`** — `compact_to`'s three-rename sequence (`idx → idx`, `dat → dat`, `ts → ts`) used `std::fs::rename`, which on Windows is `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` with no write-through — the destination metadata could be cached and lost on power-loss. Now driven through a `durable_rename` helper that calls `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` on Windows; POSIX is unchanged (`fs::rename` is durable as long as the directory is `fsync`'d, which the surrounding code already does). The cross-file atomicity gap (`compact_to` performs three sequential renames; a crash between rename N and rename N+1 leaves the on-disk channel in a mixed state) is platform-independent and a separate manifest-pointer rework remains queued; the per-rename durability hole is closed in this release.
+Two layered fixes; the first patches per-call durability on Windows, the second closes the cross-file mixed-state window structurally.
+
+- **Per-rename `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`** — `compact_to`'s rename calls used `std::fs::rename`, which on Windows is `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` with no write-through — the destination metadata could be cached and lost on power-loss. Now driven through a `durable_rename` helper that calls `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` on Windows; POSIX is unchanged (`fs::rename` is durable as long as the directory is `fsync`'d, which the surrounding code already does).
+
+- **Cross-file atomicity via manifest-pointer layout.** The old `compact_to` did three sequential renames (`idx`, `dat`, `ts`). A crash between rename N and N+1 left the on-disk channel in a mixed state (`idx` at gen K+1 paired with `dat`/`ts` still at gen K) that recovery could not distinguish from a clean half-finished compact. The new layout puts each generation's files under its own directory and atomically swaps a single manifest pointer:
+
+    ```text
+    <channel>/manifest                        # 16-byte pointer file
+    <channel>/v0000000001/{idx,dat,ts}        # current live generation
+    <channel>/v0000000002/{idx,dat,ts}        # next generation (mid-compact)
+    ```
+
+    `compact_to` writes the new generation's files in full, fsyncs them, then `durable_rename(manifest.tmp → manifest)` is the single linearizing event. Before the rename, recovery sees the old manifest and uses `v<N>/`. After it, recovery sees the new manifest and uses `v<N+1>/`. There is no mixed state — every generation directory is either complete or orphaned, never partially live. Recovery falls back to the highest validated `v<NNN>/` if the manifest is torn or missing, and sweeps every generation directory other than the live one on every open (cleaning up orphans left by a crashed prior compact).
+
+    Legacy v0.10 / v0.11 channels with the flat `<channel>/{idx,dat,ts}` layout migrate transparently into `<channel>/v0000000001/{idx,dat,ts}` on first open. The migration is one-shot per channel and idempotent. Pinned by 12 new regression tests including all 10 crash-injection points sketched in `BUG_AUDIT_2026_05_03_REMAINING_PLAN.md`'s long-term-follow-up section. Design recorded in `docs/misc/REDEX_MANIFEST_POINTER_DESIGN.md`.
 
 ### Compute registry quiescence
 
@@ -84,13 +98,13 @@ The 9 items the v0.10 release note flagged "queued for the next release" all lan
 
 ## Known issues — queued for the next release
 
-The audit queue from `BUG_AUDIT_2026_05_03.md` is drained — every item is either fixed, triaged-as-obsolete with a written reason, or explicitly deferred with a stated boundary. The deferrals carried forward:
+The audit queue from `BUG_AUDIT_2026_05_03.md` is drained — every item is either fixed in this release, triaged-as-obsolete with a written reason, or explicitly deferred with a stated boundary. Specifically:
 
-- **#1 `compact_to` cross-rename atomicity** — the per-rename durability hole on Windows is closed in this release; the cross-file mixed-state window (rename N succeeds, crash, recovery sees idx at gen N+1 but dat/ts at gen N) is platform-independent and remains. The proper fix is the manifest-pointer rework sketched in `BUG_AUDIT_2026_05_03_REMAINING_PLAN.md` (a `<channel>/manifest` pointer file plus `<channel>/v0000000001/{idx,dat,ts}` generation directories, swapped via a single `durable_rename(manifest.tmp → manifest)`). Sized at ~600–1000 LOC + ~20 crash-injection tests; pulled when bare-metal deployments without battery-backed write cache become a real risk profile, otherwise queued behind the next major format bump.
-- **#39 JetStream msg-id `sequence_start` monotonicity test** — needs persistent-sequence feature work, not a bug fix. The unit test pinning the monotonicity invariant is the small scoped piece that may land independently.
-- **#97 `apply_authoritative_grant` clamp ordering** — the audit's suggested reorder conflicts with the credit-window invariant enforced by `try_acquire_tx_credit`. Self-healing under the original analysis; the audit recommendation does not apply.
+- **#1 `compact_to` cross-rename atomicity — fixed.** The manifest-pointer rework lands in this release (see *Addressed → RedEX `compact_to` durability + atomicity* above). The pre-fix per-call durability hole on Windows is closed via `MoveFileExW(MOVEFILE_WRITE_THROUGH)`, and the cross-file mixed-state window is closed structurally by routing each generation through its own directory under a single atomic manifest-pointer flip.
+- **#39 JetStream msg-id `sequence_start` monotonicity — pinned by regression test.** The full persistent-sequence feature (msg-id durability across process restarts) is feature-shaped and remains future work; the within-process monotonicity invariant the per-process `process_nonce` relies on is now pinned by `bus::tests::sequence_start_is_per_shard_monotonic_and_gap_free`.
+- **#97 `apply_authoritative_grant` clamp ordering — no action required.** The audit's suggested reorder (bump `tx_bytes_sent` before decrementing `tx_credit_remaining`) conflicts with the credit-window invariant enforced by `try_acquire_tx_credit`. The current CAS-with-delta form correctly closes the race the `.store()`-based recompute approach left open; the rationale is documented in code at `adapter/net/session.rs::apply_authoritative_grant` and the codec-side abstract at `adapter/net/subprotocol/stream_window.rs`.
 
-The mesh-audit queue (`BUG_AUDIT_2026_05_03_MESH.md`) is fully drained.
+The mesh-audit queue (`BUG_AUDIT_2026_05_03_MESH.md`) is fully drained. Both audit queues are now empty.
 
 ---
 
@@ -98,7 +112,7 @@ The mesh-audit queue (`BUG_AUDIT_2026_05_03_MESH.md`) is fully drained.
 
 ### Wire format (v0.10 ↔ v0.11 do not interop)
 
-This is the consequential upgrade. Two structural format changes land together; they are NOT backwards-compatible across the wire and on-disk records written by v0.10 will need to be either re-tailed or carefully migrated.
+This is the consequential upgrade. Three structural format changes land together; the wire-format pair are NOT backwards-compatible across the wire (v0.10 ↔ v0.11 do not interop), and the RedEX on-disk layout migrates automatically on first open per channel.
 
 #### `IdentityEnvelope` v0 → v1 (208 B → 209 B)
 
@@ -127,6 +141,14 @@ The `DaemonRegistry`'s public surface (`register`, `unregister`, `snapshot`, `de
 #### Cortex per-event checksum v1 → v2
 
 Producers stamp `compute_checksum_with_meta(&meta, tail)` (header-covering). Readers try v2 first and fall back to v1 (`compute_checksum(tail)`) so pre-v0.11 records remain readable. New writes are v2-only. Downgrading to a pre-v0.11 binary will skip every event written by a v0.11 producer — the migration is one-way.
+
+#### RedEX on-disk layout: flat → manifest-pointer + generation directories
+
+Each channel's `<base>/<channel>/{idx,dat,ts}` files now live one level deeper at `<base>/<channel>/v0000000001/{idx,dat,ts}`, alongside a single `<base>/<channel>/manifest` pointer file (16 bytes) that names the live generation. Compactions roll the live generation by writing a fresh `v<N+1>/` directory and atomically swapping the manifest.
+
+**Migration is automatic and transparent.** On first open, a v0.10 / v0.11 channel with the flat layout is migrated by renaming each of `{idx,dat,ts}` into `v0000000001/`, then writing a manifest pointing at it. The migration is one-shot per channel and idempotent; failure mid-migration leaves the per-file moves in whichever state they reached and the next open re-runs the migration.
+
+**Tools that read RedEX files directly** (rare; the supported access path is the `RedexFile` API) need to read the manifest first and follow it to the live generation directory. The 16-byte manifest format is documented in `docs/misc/REDEX_MANIFEST_POINTER_DESIGN.md`.
 
 ### Rust core (`net` crate) — API surface
 
@@ -180,10 +202,10 @@ These aren't strictly API-breaking but tests that asserted the pre-fix behavior 
 6. **Python callers need no source changes** — `int` is arbitrary precision and PyO3 handles the marshalling transparently. Re-test fixtures that round-trip an `origin_hash` through external storage (databases, message queues) to confirm the upper 32 bits are preserved.
 7. **C callers: widen `uint32_t` typed pointers to `uint64_t` for every `origin_hash` parameter and out-param.** Anyone hand-rolling against `include/net.go.h` must regenerate their bindings.
 8. **If your tests covered any of the items in *Behavioral fixes that may surface as test breakage*, update the assertions.** The cortex `applied_through_seq` semantic and the v2 checksum migration each have a one-line fix at the assertion site; the v0 envelope removal requires deleting the fixture entirely.
-9. **If your deployment uses Windows hosts for RedEX persistence**, the `compact_to` per-rename durability fix lands automatically with no code change. The cross-file atomicity gap (per the *Known issues* section) remains; if power-loss-mid-compact is on your real risk profile, track the manifest-pointer rework.
+9. **RedEX on-disk layout has changed.** Each channel now stores its files under `<channel>/v0000000001/{idx,dat,ts}` plus a 16-byte `<channel>/manifest` pointer file, replacing the flat `<channel>/{idx,dat,ts}` layout. The migration runs automatically on first open of a v0.10 / v0.11 channel (one-shot, idempotent) — no code change required from callers. Tools or scripts that read RedEX files directly (rare; the supported access path is the `RedexFile` API) need to follow the manifest to the live generation directory.
 10. **If you embed FFI handles in a custom Rust wrapper** (rare), embed `HandleGuard` from the new `ffi::handle_guard` module and route every entry point through `try_enter` / `begin_free`. The recipe matches the bundled handles' implementation; the helper module's tests double as documentation.
 
-The audit queue is now drained. The next release will pick up structural items (manifest-pointer atomic-flip for `compact_to`, `MigrationOrchestrator` placement-policy work) rather than another bug-fix sweep.
+The audit queue is now drained. The next release will pick up structural items (`MigrationOrchestrator` placement-policy work, persistent JetStream sequence numbering for cross-restart msg-id durability) rather than another bug-fix sweep.
 
 ---
 
