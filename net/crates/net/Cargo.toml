@@ -5,6 +5,7 @@ members = [
     "bindings/node",
     "bindings/python",
     "bindings/go/compute-ffi",
+    "bindings/go/rpc-ffi",
 ]
 
 [package]
