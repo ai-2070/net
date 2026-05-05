@@ -35,6 +35,9 @@ async-trait = "0.1"
 # `libc::free` for any cross-FFI buffers that need releasing
 # through the C runtime allocator (matches compute-ffi).
 libc = "0.2"
+# `StreamExt::next` for polling the SDK's `RpcStream` from the
+# C-ABI's blocking `net_rpc_stream_next` entry point.
+futures = "0.3"
 
 [profile.release]
 lto = true

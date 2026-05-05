@@ -55,6 +55,7 @@ package net
 // Forward-declared opaque handle types from `libnet_rpc`.
 typedef struct MeshRpcHandle MeshRpcHandle;
 typedef struct ServeHandleC ServeHandleC;
+typedef struct RpcStreamHandleC RpcStreamHandleC;
 
 // Handler dispatcher signature — Rust calls back into Go via this
 // function pointer to invoke a registered handler. The Go side
@@ -69,6 +70,7 @@ typedef int (*RpcHandlerFn)(
 );
 
 // Imported FFI surface from `net-rpc-ffi`.
+extern uint32_t net_rpc_abi_version(void);
 extern void net_rpc_set_handler_dispatcher(RpcHandlerFn dispatcher);
 extern void net_rpc_free_cstring(char* s);
 extern void net_rpc_response_free(uint8_t* ptr, size_t len);
@@ -113,6 +115,26 @@ extern ServeHandleC* net_rpc_serve(
 extern uint64_t net_rpc_serve_handle_id(const ServeHandleC* handle);
 extern void net_rpc_serve_handle_close(ServeHandleC* handle);
 extern void net_rpc_serve_handle_free(ServeHandleC* handle);
+
+extern int net_rpc_call_streaming(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms,
+    uint32_t stream_window,
+    RpcStreamHandleC** out_stream,
+    char** out_err
+);
+extern int net_rpc_stream_next(
+    RpcStreamHandleC* stream,
+    uint8_t** out_chunk_ptr, size_t* out_chunk_len,
+    char** out_err
+);
+extern int net_rpc_stream_grant(RpcStreamHandleC* stream, uint32_t amount);
+extern uint64_t net_rpc_stream_call_id(const RpcStreamHandleC* stream);
+extern void net_rpc_stream_close(RpcStreamHandleC* stream);
+extern void net_rpc_stream_free(RpcStreamHandleC* stream);
 
 // Trampoline that Rust calls back through. Defined below as a Go
 // `//export` function and registered via
@@ -349,6 +371,23 @@ func (r *MeshRpc) finalize() { r.Close() }
 // ErrClosed is returned by operations on a closed MeshRpc.
 var ErrClosed = errors.New("net.MeshRpc: handle is closed")
 
+// ErrStreamDone signals that a streaming RPC has produced its
+// terminal item. Callers MUST stop polling and call `Close()` to
+// release the handle.
+var ErrStreamDone = errors.New("net.RpcStream: stream is done")
+
+// ABIVersion returns the C-ABI version exported by the linked
+// `libnet_rpc`. Compare against `ExpectedABIVersion` at process
+// init to detect drift.
+func ABIVersion() uint32 { return uint32(C.net_rpc_abi_version()) }
+
+// ExpectedABIVersion is the C-ABI version this Go wrapper is
+// known to be source-compatible with. Bumped in lockstep with
+// `NET_RPC_ABI_VERSION` on the Rust side. A consumer's `init()`
+// SHOULD assert `ABIVersion() == ExpectedABIVersion` and refuse
+// to start otherwise.
+const ExpectedABIVersion uint32 = 0x0001
+
 // =====================================================================
 // Calls
 // =====================================================================
@@ -471,6 +510,166 @@ func readCallResult(
 	copy(out, src)
 	return out, nil
 }
+
+// =====================================================================
+// Streaming
+// =====================================================================
+
+// StreamOptions configures a streaming call's flow control. The
+// zero value disables explicit flow control (server runs free,
+// client auto-grants on each chunk delivery).
+type StreamOptions struct {
+	// Window installs `nrpc-stream-window-initial=<window>` on the
+	// REQUEST. Server pumps up to `window` chunks ahead before
+	// pausing for credit. Auto-grant from
+	// `(*RpcStream).Recv` keeps the credit at roughly `window`.
+	// Zero == no flow control.
+	Window uint32
+}
+
+// RpcStream is an open streaming RPC call. Recv blocks until the
+// next chunk arrives, the deadline fires, or the stream
+// terminates. Close MUST be called eventually (defer is fine);
+// dropping a stream without Close leaks the C handle until the
+// finalizer runs.
+type RpcStream struct {
+	rpc    *MeshRpc
+	handle *C.RpcStreamHandleC
+	callID uint64
+	closed atomic.Bool
+	// cancel fires the ctx-cancel watcher goroutine's parent
+	// context, so it unblocks and exits when Close() runs even
+	// if the user-supplied ctx never cancels. The watcher exits
+	// naturally — no WaitGroup needed because Close is idempotent.
+	cancel context.CancelFunc
+}
+
+// CallStreaming opens a streaming RPC. The returned RpcStream
+// MUST be Closed (defer is fine). If `ctx` cancels before the
+// stream terminates, a watcher goroutine fires `Close()` on the
+// stream; the watcher pins to the stream's lifetime so it doesn't
+// leak past Close.
+func (r *MeshRpc) CallStreaming(
+	ctx context.Context,
+	targetNodeID uint64,
+	service string,
+	req []byte,
+	opts StreamOptions,
+) (*RpcStream, error) {
+	if r.closed.Load() {
+		return nil, ErrClosed
+	}
+	deadlineMs := contextDeadlineMs(ctx)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+	cReq, freeReq := bytesToCBytes(req)
+	defer freeReq()
+
+	var outStream *C.RpcStreamHandleC
+	var outErr *C.char
+	code := C.net_rpc_call_streaming(
+		r.handle,
+		C.uint64_t(targetNodeID),
+		(*C.char)(cService.ptr), cService.len,
+		cReq.ptr, cReq.len,
+		C.uint64_t(deadlineMs),
+		C.uint32_t(opts.Window),
+		&outStream,
+		&outErr,
+	)
+	if code != 0 {
+		msg := readCError(outErr)
+		return nil, parseRpcError(msg)
+	}
+	stream := &RpcStream{
+		rpc:    r,
+		handle: outStream,
+		callID: uint64(C.net_rpc_stream_call_id(outStream)),
+	}
+	runtime.SetFinalizer(stream, (*RpcStream).finalize)
+
+	// Spawn a watcher goroutine that closes the stream when ctx is
+	// canceled. Pinned to the stream's lifetime via a WaitGroup
+	// joined in Close — no leaks past the stream.
+	if ctx != nil && ctx.Done() != nil {
+		watchCtx, cancel := context.WithCancel(ctx)
+		stream.cancel = cancel
+		go func() {
+			<-watchCtx.Done()
+			// Either ctx fired (user canceled) or Close() called
+			// our cancel(); both lead to the same action — and
+			// Close() is idempotent so the second-comer no-ops.
+			stream.Close()
+		}()
+	}
+	return stream, nil
+}
+
+// CallID returns the server-assigned id for this streaming call —
+// useful for trace correlation.
+func (s *RpcStream) CallID() uint64 { return s.callID }
+
+// Recv blocks until the next chunk arrives or the stream
+// terminates. Returns `ErrStreamDone` (wrapped) on clean end. A
+// mid-stream protocol error returns a typed `*RpcError`. After
+// any non-nil error EXCEPT `ErrStreamDone`, the stream is closed
+// implicitly and further Recv returns `ErrStreamDone`.
+func (s *RpcStream) Recv() ([]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrStreamDone
+	}
+	var outChunk *C.uint8_t
+	var outChunkLen C.size_t
+	var outErr *C.char
+	code := C.net_rpc_stream_next(s.handle, &outChunk, &outChunkLen, &outErr)
+	switch code {
+	case 0: // chunk
+		if outChunkLen == 0 || outChunk == nil {
+			return []byte{}, nil
+		}
+		defer C.net_rpc_response_free(outChunk, outChunkLen)
+		src := unsafe.Slice((*byte)(unsafe.Pointer(outChunk)), int(outChunkLen))
+		out := make([]byte, int(outChunkLen))
+		copy(out, src)
+		return out, nil
+	case -6: // NET_RPC_ERR_STREAM_DONE — clean end
+		return nil, ErrStreamDone
+	case -2: // NET_RPC_ERR_CALL_FAILED — mid-stream error
+		msg := readCError(outErr)
+		return nil, parseRpcError(msg)
+	default:
+		msg := readCError(outErr)
+		return nil, fmt.Errorf("net_rpc_stream_next returned %d: %s", int(code), msg)
+	}
+}
+
+// Grant gives the server `amount` more credits. No-op if flow
+// control wasn't enabled for this stream OR the stream is already
+// done.
+func (s *RpcStream) Grant(amount uint32) {
+	if s.closed.Load() {
+		return
+	}
+	C.net_rpc_stream_grant(s.handle, C.uint32_t(amount))
+}
+
+// Close cancels the stream (best-effort CANCEL to the server) and
+// releases the C handle. Idempotent. Joins the ctx-cancel watcher
+// goroutine before returning.
+func (s *RpcStream) Close() {
+	if s.closed.Swap(true) {
+		return
+	}
+	runtime.SetFinalizer(s, nil)
+	C.net_rpc_stream_close(s.handle)
+	C.net_rpc_stream_free(s.handle)
+	s.handle = nil
+	if s.cancel != nil {
+		s.cancel()
+	}
+}
+
+func (s *RpcStream) finalize() { s.Close() }
 
 // =====================================================================
 // ServeHandle

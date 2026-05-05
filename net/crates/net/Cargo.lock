@@ -1481,6 +1481,7 @@ dependencies = [
  "ai2070-net",
  "async-trait",
  "bytes",
+ "futures",
  "libc",
  "parking_lot",
  "tokio",

@@ -41,7 +41,7 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -54,9 +54,10 @@ use net::adapter::net::cortex::{
 };
 use net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, RoutingPolicy as InnerRoutingPolicy,
-    RpcError as InnerRpcError, ServeHandle as InnerServeHandle,
+    RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
 };
 use net::adapter::net::MeshNode;
+use futures::StreamExt;
 
 // =========================================================================
 // Error codes
@@ -80,6 +81,36 @@ pub const NET_RPC_ERR_NO_DISPATCHER: c_int = -4;
 /// Caller passed a UTF-8-invalid byte sequence where a string
 /// was expected (e.g. service name).
 pub const NET_RPC_ERR_INVALID_UTF8: c_int = -5;
+/// `net_rpc_stream_next` was called on a stream that has already
+/// produced its terminal item (clean end OR a mid-stream error).
+/// Surfaced as a sentinel separate from `NET_RPC_OK` so the Go
+/// side can distinguish "stream is done — release the handle"
+/// from "no chunk available right now."
+pub const NET_RPC_ERR_STREAM_DONE: c_int = -6;
+
+// =========================================================================
+// ABI version stamp.
+// =========================================================================
+
+/// ABI version stamp. Bumped on any breaking change to the C-ABI
+/// surface (signature changes, error-code re-numbering, layout
+/// changes to opaque structs, semantic shifts in lifetime
+/// contracts). Consumers SHOULD compare against their compiled-in
+/// expected version at process init and refuse to load a mismatch.
+///
+///   - **0001** — initial release: lifecycle + unary `call` /
+///                `call_service` / `find_service_nodes` / `serve`
+///                + Phase B6 streaming (`call_streaming`,
+///                `stream_next`, `stream_grant`, `stream_close`,
+///                `stream_free`).
+pub const NET_RPC_ABI_VERSION: u32 = 0x0001;
+
+/// Returns the current ABI version. Consumers SHOULD call this at
+/// init and compare against their expected value.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_abi_version() -> u32 {
+    NET_RPC_ABI_VERSION
+}
 
 // =========================================================================
 // Runtime + counters.
@@ -697,6 +728,226 @@ pub extern "C" fn net_rpc_serve_handle_free(handle: *mut ServeHandleC) {
 }
 
 // =========================================================================
+// Streaming — opaque RpcStreamHandle, blocking next, explicit grant.
+// =========================================================================
+
+/// Opaque RpcStream handle exposed to Go. The inner SDK stream sits
+/// behind an `Arc<Mutex<Option<...>>>` so:
+///   - `close()` can `take()` the stream (which fires CANCEL via
+///     the SDK's `Drop` impl) and remain idempotent.
+///   - `next()` locks, polls, and re-stores `Some(stream)` until
+///     the stream terminates.
+/// Once `close()` runs OR the stream has yielded its terminal
+/// item, subsequent `next()` calls return `NET_RPC_ERR_STREAM_DONE`.
+pub struct RpcStreamHandleC {
+    inner: Arc<Mutex<Option<InnerRpcStream>>>,
+    /// Mirrors the SDK's `RpcStream::call_id`. Captured at
+    /// construction so the diagnostic accessor doesn't need to
+    /// re-acquire the mutex.
+    call_id: u64,
+    /// `true` once a terminal item (clean end OR error) has been
+    /// observed. Latched separately from the `Option` so we don't
+    /// re-take the inner stream just to check this state.
+    done: AtomicBool,
+}
+
+/// Direct-addressed streaming call. Constructs the underlying
+/// `RpcStream` synchronously (via `runtime.block_on`) and returns
+/// an opaque handle. Per-chunk delivery is via
+/// [`net_rpc_stream_next`].
+///
+/// `stream_window` of `0` disables flow control (auto-grant only).
+/// Non-zero installs an initial credit window equal to the value
+/// (matches `CallOptions::stream_window_initial`).
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_streaming(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    stream_window: u32,
+    out_stream: *mut *mut RpcStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    let node = h.node.clone();
+
+    let result = runtime().block_on(async move {
+        node.call_streaming(target_node_id, &service, req_bytes, opts)
+            .await
+    });
+
+    match result {
+        Ok(stream) => {
+            let call_id = stream.call_id();
+            let boxed = Box::new(RpcStreamHandleC {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_stream = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Block until the next chunk arrives, OR the stream terminates,
+/// OR a mid-stream error fires.
+///
+/// Outcomes:
+///   - chunk available: `*out_chunk_ptr / *out_chunk_len` set,
+///     returns `NET_RPC_OK`. Caller frees the buffer via
+///     [`net_rpc_response_free`].
+///   - clean end: `*out_chunk_ptr == NULL`, `*out_chunk_len == 0`,
+///     returns `NET_RPC_ERR_STREAM_DONE`. Subsequent calls return
+///     the same code.
+///   - mid-stream error: `*out_err` set, returns
+///     `NET_RPC_ERR_CALL_FAILED`. The stream is also marked done;
+///     subsequent calls return `NET_RPC_ERR_STREAM_DONE`.
+///   - close raced: returns `NET_RPC_ERR_STREAM_DONE` (the take()
+///     beat us to the inner stream).
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_stream_next(
+    stream: *mut RpcStreamHandleC,
+    out_chunk_ptr: *mut *mut u8,
+    out_chunk_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(s) = (unsafe { stream.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if s.done.load(Ordering::Relaxed) {
+        unsafe {
+            *out_chunk_ptr = std::ptr::null_mut();
+            *out_chunk_len = 0;
+        }
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    // Take the inner stream out of the mutex while we await — so
+    // a concurrent `close()` (which `take()`s) can race us cleanly
+    // by either taking ownership before us (we observe `None`,
+    // return STREAM_DONE) or after us (we put the stream back; the
+    // next close() takes it then).
+    let inner_opt = s.inner.lock().take();
+    let mut inner = match inner_opt {
+        Some(i) => i,
+        None => {
+            s.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    let result = runtime().block_on(async { inner.next().await });
+    match result {
+        Some(Ok(chunk)) => {
+            // Put the stream back so subsequent `next()` polls keep
+            // going.
+            *s.inner.lock() = Some(inner);
+            write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
+            NET_RPC_OK
+        }
+        Some(Err(e)) => {
+            // Mid-stream error — the SDK guarantees no further items.
+            // Drop the inner (firing CANCEL is unnecessary since the
+            // server already terminated us) and latch done.
+            drop(inner);
+            s.done.store(true, Ordering::Relaxed);
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        None => {
+            // Clean end. Drop the inner and latch done.
+            drop(inner);
+            s.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            NET_RPC_ERR_STREAM_DONE
+        }
+    }
+}
+
+/// Explicitly grant `amount` more credits to the server's pump.
+/// No-op if flow control wasn't enabled for this stream OR the
+/// stream is already done. See `RpcStream::grant` for semantics.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_stream_grant(stream: *mut RpcStreamHandleC, amount: u32) -> c_int {
+    let Some(s) = (unsafe { stream.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if s.done.load(Ordering::Relaxed) || amount == 0 {
+        return NET_RPC_OK;
+    }
+    let guard = s.inner.lock();
+    if let Some(inner) = guard.as_ref() {
+        inner.grant(amount);
+    }
+    NET_RPC_OK
+}
+
+/// Diagnostic accessor: server-assigned call_id for this stream.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_stream_call_id(stream: *const RpcStreamHandleC) -> u64 {
+    let Some(s) = (unsafe { stream.as_ref() }) else {
+        return 0;
+    };
+    s.call_id
+}
+
+/// Cancel the stream (best-effort CANCEL via the SDK's Drop impl)
+/// and latch it as done. Idempotent on NULL or already-closed.
+/// Subsequent `next()` calls return `NET_RPC_ERR_STREAM_DONE`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_stream_close(stream: *mut RpcStreamHandleC) {
+    let Some(s) = (unsafe { stream.as_ref() }) else {
+        return;
+    };
+    s.done.store(true, Ordering::Relaxed);
+    let _ = s.inner.lock().take();
+}
+
+/// Free the stream handle. Implicitly closes if not already
+/// closed. Idempotent on NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_stream_free(stream: *mut RpcStreamHandleC) {
+    if stream.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(stream));
+    }
+}
+
+// =========================================================================
 // Tests for pure-logic helpers.
 // =========================================================================
 
@@ -775,5 +1026,73 @@ mod tests {
         // Free should run without panicking — the matching
         // Vec::from_raw_parts is the load-bearing test.
         net_rpc_response_free(out_ptr, out_len);
+    }
+
+    /// `net_rpc_abi_version` exposes the same constant declared
+    /// in the source — drift between the consumer's expected
+    /// version and the linked cdylib's actual version is the
+    /// whole reason this stamp exists.
+    #[test]
+    fn abi_version_matches_constant() {
+        assert_eq!(net_rpc_abi_version(), NET_RPC_ABI_VERSION);
+        assert_eq!(NET_RPC_ABI_VERSION, 0x0001);
+    }
+
+    /// `net_rpc_stream_next` on a `done`-latched handle returns
+    /// `STREAM_DONE` without touching the inner mutex (which is
+    /// `None` after close). Subsequent calls keep returning the
+    /// same code — no transition to OK.
+    #[test]
+    fn stream_next_after_close_returns_stream_done() {
+        let handle = Box::into_raw(Box::new(RpcStreamHandleC {
+            inner: Arc::new(Mutex::new(None)),
+            call_id: 42,
+            done: AtomicBool::new(false),
+        }));
+        // Pre-close — no inner stream → take() returns None →
+        // latches done + returns STREAM_DONE.
+        let mut chunk_ptr: *mut u8 = std::ptr::null_mut();
+        let mut chunk_len: usize = 0;
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let code1 = net_rpc_stream_next(handle, &mut chunk_ptr, &mut chunk_len, &mut err_ptr);
+        assert_eq!(code1, NET_RPC_ERR_STREAM_DONE);
+        assert!(chunk_ptr.is_null());
+        assert_eq!(chunk_len, 0);
+        // Second call hits the early-out via the latched flag.
+        let code2 = net_rpc_stream_next(handle, &mut chunk_ptr, &mut chunk_len, &mut err_ptr);
+        assert_eq!(code2, NET_RPC_ERR_STREAM_DONE);
+        // Cleanup.
+        net_rpc_stream_free(handle);
+    }
+
+    /// `net_rpc_stream_close` on a freshly-built handle latches
+    /// `done` and clears the inner option, even when called
+    /// multiple times.
+    #[test]
+    fn stream_close_is_idempotent() {
+        let handle = Box::into_raw(Box::new(RpcStreamHandleC {
+            inner: Arc::new(Mutex::new(None)),
+            call_id: 7,
+            done: AtomicBool::new(false),
+        }));
+        net_rpc_stream_close(handle);
+        net_rpc_stream_close(handle); // second close — no panic
+        // call_id stays addressable even after close.
+        assert_eq!(net_rpc_stream_call_id(handle), 7);
+        net_rpc_stream_free(handle);
+    }
+
+    /// `net_rpc_stream_grant` on a closed stream is a quiet
+    /// no-op — never panics, never publishes spurious credit.
+    #[test]
+    fn stream_grant_after_close_is_noop() {
+        let handle = Box::into_raw(Box::new(RpcStreamHandleC {
+            inner: Arc::new(Mutex::new(None)),
+            call_id: 99,
+            done: AtomicBool::new(true),
+        }));
+        let code = net_rpc_stream_grant(handle, 16);
+        assert_eq!(code, NET_RPC_OK);
+        net_rpc_stream_free(handle);
     }
 }
