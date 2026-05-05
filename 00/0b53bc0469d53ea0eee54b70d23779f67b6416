@@ -1,0 +1,27 @@
+net/crates/net/bindings/python/python/net/mesh_rpc.py
+  cfca4517ad394ef2 1-671
+net/crates/net/bindings/python/python/net/__init__.py
+  cfca4517ad394ef2 109-139
+net/crates/net/bindings/python/tests/test_mesh_rpc.py
+  cfca4517ad394ef2 1-454
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "000b53bc0469d53ea0eee54b70d23779f67b6416",
+  "prompts": {
+    "cfca4517ad394ef2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c8c8999-2a05-4bfc-a843-35946dde9df4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2617,
+      "total_deletions": 105,
+      "accepted_lines": 1259,
+      "overriden_lines": 0
+    }
+  }
+}
