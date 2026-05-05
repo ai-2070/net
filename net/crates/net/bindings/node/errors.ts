@@ -16,22 +16,20 @@
 // Prefixes mirror `ERR_*_PREFIX` in `bindings/node/src/cortex.rs`
 // and `bindings/node/src/mesh_rpc.rs`. Keep the strings in lockstep.
 
-'use strict'
-
 const ERR_CORTEX_PREFIX = 'cortex:'
 const ERR_NETDB_PREFIX = 'netdb:'
 const ERR_NRPC_PREFIX = 'nrpc:'
 
-class CortexError extends Error {
-  constructor(detail) {
+export class CortexError extends Error {
+  constructor(detail?: string) {
     super(detail ?? 'cortex adapter error')
     this.name = 'CortexError'
     Object.setPrototypeOf(this, CortexError.prototype)
   }
 }
 
-class NetDbError extends Error {
-  constructor(detail) {
+export class NetDbError extends Error {
+  constructor(detail?: string) {
     super(detail ?? 'netdb error')
     this.name = 'NetDbError'
     Object.setPrototypeOf(this, NetDbError.prototype)
@@ -48,6 +46,7 @@ class NetDbError extends Error {
 //   nrpc:transport      -> RpcTransportError
 //   nrpc:codec_encode   -> RpcCodecError(direction='encode')
 //   nrpc:codec_decode   -> RpcCodecError(direction='decode')
+//   nrpc:cancelled      -> RpcCancelledError
 //   nrpc:* (anything else) -> RpcError (the base class)
 //
 // Catch with `instanceof RpcError` for "any nRPC failure", or
@@ -56,24 +55,26 @@ class NetDbError extends Error {
 // skip RpcCodecError (caller-fixable local bug) by default — same
 // behavior as the Rust SDK's default_retryable predicate.
 
-class RpcError extends Error {
-  constructor(detail) {
+export class RpcError extends Error {
+  constructor(detail?: string) {
     super(detail ?? 'rpc error')
     this.name = 'RpcError'
     Object.setPrototypeOf(this, RpcError.prototype)
   }
 }
 
-class RpcNoRouteError extends RpcError {
-  constructor(detail) {
+export class RpcNoRouteError extends RpcError {
+  constructor(detail?: string) {
     super(detail ?? 'no route to target')
     this.name = 'RpcNoRouteError'
     Object.setPrototypeOf(this, RpcNoRouteError.prototype)
   }
 }
 
-class RpcTimeoutError extends RpcError {
-  constructor(detail) {
+export class RpcTimeoutError extends RpcError {
+  /** Caller-side elapsed time, parsed out of `elapsed_ms=N` in the message. */
+  readonly elapsedMs?: number
+  constructor(detail?: string) {
     super(detail ?? 'rpc timeout')
     this.name = 'RpcTimeoutError'
     Object.setPrototypeOf(this, RpcTimeoutError.prototype)
@@ -84,8 +85,10 @@ class RpcTimeoutError extends RpcError {
   }
 }
 
-class RpcServerError extends RpcError {
-  constructor(detail) {
+export class RpcServerError extends RpcError {
+  /** Wire-level RpcStatus parsed out of `status=0xNNNN` in the message. */
+  readonly status?: number
+  constructor(detail?: string) {
     super(detail ?? 'rpc server error')
     this.name = 'RpcServerError'
     Object.setPrototypeOf(this, RpcServerError.prototype)
@@ -97,19 +100,21 @@ class RpcServerError extends RpcError {
   }
 }
 
-class RpcTransportError extends RpcError {
-  constructor(detail) {
+export class RpcTransportError extends RpcError {
+  constructor(detail?: string) {
     super(detail ?? 'rpc transport error')
     this.name = 'RpcTransportError'
     Object.setPrototypeOf(this, RpcTransportError.prototype)
   }
 }
 
-class RpcCodecError extends RpcError {
-  constructor(detail, direction) {
+export class RpcCodecError extends RpcError {
+  /** Which side of the call surfaced the codec failure. */
+  readonly direction?: 'encode' | 'decode'
+  constructor(detail?: string, direction?: 'encode' | 'decode') {
     super(detail ?? 'rpc codec error')
     this.name = 'RpcCodecError'
-    this.direction = direction // 'encode' | 'decode'
+    this.direction = direction
     Object.setPrototypeOf(this, RpcCodecError.prototype)
   }
 }
@@ -122,8 +127,8 @@ class RpcCodecError extends RpcError {
  * handler observes its `ctx.cancellation` token. Caller-fixable
  * / terminal — NOT retried by the default retry policy.
  */
-class RpcCancelledError extends RpcError {
-  constructor(detail) {
+export class RpcCancelledError extends RpcError {
+  constructor(detail?: string) {
     super(detail ?? 'rpc cancelled')
     this.name = 'RpcCancelledError'
     Object.setPrototypeOf(this, RpcCancelledError.prototype)
@@ -135,8 +140,8 @@ class RpcCancelledError extends RpcError {
  * matches the napi binding's contract. Non-matching errors are
  * returned unchanged — caller can `throw` the result unconditionally.
  */
-function classifyError(e) {
-  const msg = (e && e.message) || ''
+export function classifyError(e: unknown): unknown {
+  const msg = (e instanceof Error ? e.message : '') || ''
   if (msg.startsWith(ERR_CORTEX_PREFIX)) {
     return new CortexError(msg)
   }
@@ -149,7 +154,7 @@ function classifyError(e) {
   return e
 }
 
-function classifyRpcError(msg) {
+function classifyRpcError(msg: string): RpcError {
   // Strip the `nrpc:` prefix; the next segment up to the first
   // `:` is the kind. Examples:
   //   nrpc:no_route: target=0x... reason=...
@@ -175,17 +180,4 @@ function classifyRpcError(msg) {
     default:
       return new RpcError(msg)
   }
-}
-
-module.exports = {
-  CortexError,
-  NetDbError,
-  RpcError,
-  RpcNoRouteError,
-  RpcTimeoutError,
-  RpcServerError,
-  RpcTransportError,
-  RpcCodecError,
-  RpcCancelledError,
-  classifyError,
 }
