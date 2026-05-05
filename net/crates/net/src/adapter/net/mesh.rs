@@ -1084,6 +1084,11 @@ pub struct MeshNode {
     /// so other nodes' capability indexes can find this node via
     /// `Mesh::find_service_nodes(name)`.
     rpc_local_services: Arc<dashmap::DashSet<String>>,
+    /// Caller-side per-service nRPC metrics. Updated by
+    /// `Mesh::call` via the [`mesh_rpc_metrics::CallMetricsGuard`]
+    /// RAII shim; read out via [`Self::rpc_metrics_snapshot`] for
+    /// Prometheus exposure or custom observability.
+    rpc_metrics: Arc<crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry>,
     /// Optional migration subprotocol handler — same `ArcSwapOption`
     /// surface as on `MeshNode`, propagated into the dispatch
     /// context so the packet-receive loop stays lock-free.
@@ -1521,6 +1526,9 @@ impl MeshNode {
             rpc_next_call_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             rpc_reply_subscriptions: Arc::new(parking_lot::Mutex::new(Vec::new())),
             rpc_local_services: Arc::new(dashmap::DashSet::new()),
+            rpc_metrics: Arc::new(
+                crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new(),
+            ),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             pending_direct_initiators,
@@ -4100,6 +4108,24 @@ impl MeshNode {
     /// auto-merge `nrpc:<service>` tags.
     pub(super) fn rpc_local_services_arc(&self) -> Arc<dashmap::DashSet<String>> {
         self.rpc_local_services.clone()
+    }
+
+    /// Per-Mesh caller-side nRPC metrics registry. Accessor for
+    /// `mesh_rpc::Mesh::call` to bump counters on each outgoing
+    /// call.
+    pub(super) fn rpc_metrics_arc(
+        &self,
+    ) -> Arc<crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry> {
+        self.rpc_metrics.clone()
+    }
+
+    /// Snapshot of caller-side nRPC metrics. Cheap (one DashMap
+    /// iteration); call on every Prometheus scrape. Format with
+    /// [`crate::adapter::net::mesh_rpc_metrics::RpcMetricsSnapshot::prometheus_text`].
+    pub fn rpc_metrics_snapshot(
+        &self,
+    ) -> crate::adapter::net::mesh_rpc_metrics::RpcMetricsSnapshot {
+        self.rpc_metrics.snapshot()
     }
 
     /// Capability index — accessor for `mesh_rpc::Mesh::find_service_nodes`

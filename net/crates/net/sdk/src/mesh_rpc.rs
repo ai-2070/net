@@ -30,6 +30,9 @@ pub use net::adapter::net::cortex::{
 pub use net::adapter::net::mesh_rpc::{
     CallOptions, RoutingPolicy, RpcError, RpcReply, RpcStream, ServeError, ServeHandle,
 };
+pub use net::adapter::net::mesh_rpc_metrics::{
+    RpcMetricsSnapshot, ServiceMetrics, DEFAULT_LATENCY_BUCKETS_SECS,
+};
 
 use crate::error::{Result, SdkError};
 use crate::mesh::Mesh;
@@ -180,6 +183,14 @@ impl Mesh {
     /// caller-side routing logic.
     pub fn find_service_nodes(&self, service: &str) -> Vec<u64> {
         self.node().find_service_nodes(service)
+    }
+
+    /// Snapshot of caller-side nRPC metrics for this Mesh. Cheap
+    /// (one DashMap iteration); call on every Prometheus scrape.
+    /// Use [`RpcMetricsSnapshot::prometheus_text`] to format as
+    /// `text/plain; version=0.0.4` for a `/metrics` endpoint.
+    pub fn rpc_metrics_snapshot(&self) -> RpcMetricsSnapshot {
+        self.node().rpc_metrics_snapshot()
     }
 
     // ---- Typed (serde) ----

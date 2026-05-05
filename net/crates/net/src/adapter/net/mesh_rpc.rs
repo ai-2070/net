@@ -42,6 +42,7 @@ use super::cortex::{
     DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST, EVENT_META_SIZE, FLAG_RPC_PROPAGATE_TRACE,
     FLAG_RPC_STREAMING_RESPONSE,
 };
+use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome};
 use crate::error::AdapterError;
 
 use super::mesh::MeshNode;
@@ -878,9 +879,25 @@ impl MeshNode {
         })?;
         let reply_hash = reply_channel.hash();
 
+        // Caller-side metrics guard. Bumps `in_flight` immediately;
+        // each early-return path calls `metrics_guard.record(...)`
+        // with the outcome, and Drop records the latency + bumps
+        // the matching counter. A future dropped before any
+        // `record(...)` call (e.g. a hedge loser) leaves the guard
+        // with `outcome = None` so `in_flight` decrements but no
+        // outcome is double-counted.
+        let metrics_registry = self.rpc_metrics_arc();
+        let mut metrics_guard =
+            CallMetricsGuard::new(metrics_registry.for_service(service));
+
         // Lazy reply-channel subscription. Once per (target, service).
-        self.ensure_reply_subscription(target_node_id, service, reply_channel.clone(), reply_hash)
-            .await?;
+        if let Err(e) = self
+            .ensure_reply_subscription(target_node_id, service, reply_channel.clone(), reply_hash)
+            .await
+        {
+            metrics_guard.record(CallOutcome::NoRoute);
+            return Err(e);
+        }
 
         // Allocate a fresh call_id. Per-caller monotonic.
         let call_id = self.rpc_next_call_id().fetch_add(1, Ordering::Relaxed);
@@ -948,6 +965,7 @@ impl MeshNode {
             .await
         {
             pending.cancel(call_id);
+            metrics_guard.record(CallOutcome::Transport);
             return Err(RpcError::Transport(e));
         }
 
@@ -991,6 +1009,7 @@ impl MeshNode {
                 // completed so Drop doesn't fire a useless CANCEL
                 // for a server that's no longer tracking this id.
                 guard.completed = true;
+                metrics_guard.record(CallOutcome::Transport);
                 return Err(RpcError::Transport(AdapterError::Connection(
                     "rpc client pending sender dropped (no response will arrive)".into(),
                 )));
@@ -998,6 +1017,7 @@ impl MeshNode {
             Err(_elapsed) => {
                 // Timeout: leave `completed=false` so Drop emits
                 // CANCEL automatically; surface Timeout to caller.
+                metrics_guard.record(CallOutcome::Timeout);
                 return Err(RpcError::Timeout {
                     elapsed_ms: started.elapsed().as_millis() as u64,
                 });
@@ -1006,12 +1026,14 @@ impl MeshNode {
 
         // Map the wire status onto the public Result type.
         if resp.status.is_ok() {
+            metrics_guard.record(CallOutcome::Ok);
             Ok(RpcReply {
                 body: Bytes::from(resp.body),
                 headers: resp.headers,
                 latency_ns: started.elapsed().as_nanos() as u64,
             })
         } else {
+            metrics_guard.record(CallOutcome::ServerError);
             let status = resp.status.to_wire();
             let message = String::from_utf8(resp.body)
                 .unwrap_or_else(|e| format!("<{} bytes of non-utf8 body>", e.into_bytes().len()));
