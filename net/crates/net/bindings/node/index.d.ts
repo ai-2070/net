@@ -790,19 +790,6 @@ export declare class NetMesh {
   findNodesScoped(filter: CapabilityFilterJs, scope: ScopeFilterJs): Array<bigint>
   /** Shutdown the mesh node. */
   shutdown(): Promise<void>
-  /**
-   * **Test-only** helper for the vitest groups suite.
-   * Injects a synthetic capability announcement directly
-   * into the local capability index, simulating a peer
-   * announcement without going through a real handshake.
-   *
-   * Gated behind the `test-helpers` feature so it is
-   * **not** exported to production JS consumers. Enabling
-   * `groups` alone does not pull this in; vitest builds with
-   * `--features groups,test-helpers` explicitly. Production
-   * code uses the normal `announce_capabilities` path.
-   */
-  testInjectSyntheticPeer(nodeId: bigint): void
 }
 
 /**
@@ -910,6 +897,44 @@ export declare class RedexTailIter {
   next(): Promise<RedexEventJs | null>
   /** Terminate the iterator. Idempotent. */
   close(): void
+}
+
+/**
+ * Consumer-side dedup helper for the Redis Streams adapter.
+ *
+ * See `net::adapter::redis` module docs for the producer-side
+ * contract that produces the `dedup_id` field this helper
+ * filters on.
+ */
+export declare class RedisStreamDedup {
+  /**
+   * Create a helper with the given LRU capacity. Defaults to
+   * 4096 if omitted. `0` is clamped to 1.
+   *
+   * Sizing: a consumer at ~10k events/sec with a 1 min
+   * dedup window should pick ~600k.
+   */
+  constructor(capacity?: number | undefined | null)
+  /**
+   * Test-and-insert: returns `true` if the caller should treat
+   * the entry as a DUPLICATE (skip it), `false` if it's the
+   * first time we've seen this `dedupId`.
+   *
+   * Matches the Rust `is_duplicate(&mut self, &str) -> bool`.
+   */
+  isDuplicate(dedupId: string): boolean
+  /** Number of distinct ids currently tracked. */
+  get len(): number
+  /** Configured maximum capacity. */
+  get capacity(): number
+  /** True if no ids are tracked yet. */
+  get isEmpty(): boolean
+  /**
+   * Clear all tracked ids. Use after a consumer-group
+   * rebalance to reset the dedup window without losing the
+   * helper instance.
+   */
+  clear(): void
 }
 
 export declare class ReplicaGroup {

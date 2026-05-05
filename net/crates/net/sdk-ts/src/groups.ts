@@ -247,7 +247,7 @@ export class ReplicaGroup {
 
   /** Route to the best-available replica; returns the target
    *  `origin_hash` which the caller feeds to `runtime.deliver`. */
-  routeEvent(ctx: RequestContext = {}): number {
+  routeEvent(ctx: RequestContext = {}): bigint {
     try {
       return this.inner.routeEvent(ctx);
     } catch (e) {
@@ -330,7 +330,7 @@ export class ForkGroup {
   static async fork(
     runtime: DaemonRuntime,
     kind: string,
-    parentOrigin: number,
+    parentOrigin: bigint,
     forkSeq: bigint,
     config: ForkGroupConfig,
   ): Promise<ForkGroup> {
@@ -347,7 +347,7 @@ export class ForkGroup {
     }
   }
 
-  routeEvent(ctx: RequestContext = {}): number {
+  routeEvent(ctx: RequestContext = {}): bigint {
     try {
       return this.inner.routeEvent(ctx);
     } catch (e) {
@@ -383,7 +383,7 @@ export class ForkGroup {
     return this.inner.health;
   }
 
-  get parentOrigin(): number {
+  get parentOrigin(): bigint {
     return this.inner.parentOrigin;
   }
 
@@ -460,7 +460,7 @@ export class StandbyGroup {
 
   /** `origin_hash` of the current active. Target for inbound
    *  events; standbys don't process inputs. */
-  get activeOrigin(): number {
+  get activeOrigin(): bigint {
     return this.inner.activeOrigin;
   }
 
@@ -499,7 +499,7 @@ export class StandbyGroup {
    *  can't accidentally promote with the wrong factory. Call
    *  manually for planned failover; {@link onNodeFailure} calls
    *  automatically when the active's node fails. */
-  async promote(): Promise<number> {
+  async promote(): Promise<bigint> {
     try {
       return await this.inner.promote();
     } catch (e) {
@@ -510,7 +510,7 @@ export class StandbyGroup {
   /** Handle node failure. Returns the new active's `origin_hash`
    *  if the active was on `failedNodeId`; `null` if only standbys
    *  were affected. Reuses the group's spawn kind. */
-  async onNodeFailure(failedNodeId: bigint): Promise<number | null> {
+  async onNodeFailure(failedNodeId: bigint): Promise<bigint | null> {
     try {
       const r = await this.inner.onNodeFailure(failedNodeId);
       return r ?? null;

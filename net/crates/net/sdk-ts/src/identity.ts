@@ -271,8 +271,8 @@ export class Identity {
     return this.inner.entityId;
   }
 
-  /** Derived 32-bit origin hash used in packet headers. */
-  get originHash(): number {
+  /** Derived 64-bit origin hash used in packet headers. */
+  get originHash(): bigint {
     return this.inner.originHash;
   }
 

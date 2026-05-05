@@ -797,6 +797,7 @@ module.exports.NetStream = nativeBinding.NetStream;
 module.exports.Redex = nativeBinding.Redex;
 module.exports.RedexFile = nativeBinding.RedexFile;
 module.exports.RedexTailIter = nativeBinding.RedexTailIter;
+module.exports.RedisStreamDedup = nativeBinding.RedisStreamDedup;
 module.exports.ReplicaGroup = nativeBinding.ReplicaGroup;
 module.exports.StandbyGroup = nativeBinding.StandbyGroup;
 module.exports.TasksAdapter = nativeBinding.TasksAdapter;

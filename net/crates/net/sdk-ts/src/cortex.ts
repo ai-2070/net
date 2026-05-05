@@ -397,7 +397,7 @@ export class TasksAdapter {
    */
   static async open(
     redex: Redex,
-    originHash: number,
+    originHash: bigint,
     opts?: { persistent?: boolean },
   ): Promise<TasksAdapter> {
     try {
@@ -411,7 +411,7 @@ export class TasksAdapter {
   /** Restore from a snapshot captured via {@link TasksAdapter.snapshot}. */
   static async openFromSnapshot(
     redex: Redex,
-    originHash: number,
+    originHash: bigint,
     snapshot: CortexSnapshot,
     opts?: { persistent?: boolean },
   ): Promise<TasksAdapter> {
@@ -557,7 +557,7 @@ export class MemoriesAdapter {
 
   static async open(
     redex: Redex,
-    originHash: number,
+    originHash: bigint,
     opts?: { persistent?: boolean },
   ): Promise<MemoriesAdapter> {
     try {
@@ -570,7 +570,7 @@ export class MemoriesAdapter {
 
   static async openFromSnapshot(
     redex: Redex,
-    originHash: number,
+    originHash: bigint,
     snapshot: CortexSnapshot,
     opts?: { persistent?: boolean },
   ): Promise<MemoriesAdapter> {

@@ -282,8 +282,8 @@ export interface MigrationOptions {
  * the factory signature is callable today.
  */
 export interface CausalEvent {
-  /** 32-bit origin hash of the emitting entity. */
-  readonly originHash: number;
+  /** 64-bit origin hash of the emitting entity. */
+  readonly originHash: bigint;
   /** Sequence number in the emitter's causal chain. */
   readonly sequence: bigint;
   /** Opaque payload bytes. */
@@ -393,10 +393,10 @@ export class DaemonHandle {
   }
 
   /**
-   * 32-bit hash of the daemon's identity — the key used by the
+   * 64-bit hash of the daemon's identity — the key used by the
    * registry, factory registry, and migration dispatcher.
    */
-  get originHash(): number {
+  get originHash(): bigint {
     return this.inner.originHash;
   }
 
@@ -445,8 +445,8 @@ export class MigrationHandle {
     this.inner = inner;
   }
 
-  /** 32-bit origin hash of the daemon being migrated. */
-  get originHash(): number {
+  /** 64-bit origin hash of the daemon being migrated. */
+  get originHash(): bigint {
     return this.inner.originHash;
   }
 
@@ -828,7 +828,7 @@ export class DaemonRuntime {
    * Feed it unchanged to {@link DaemonRuntime.spawnFromSnapshot}
    * to restore the daemon on another node or after a restart.
    */
-  async snapshot(originHash: number): Promise<Buffer | null> {
+  async snapshot(originHash: bigint): Promise<Buffer | null> {
     try {
       const buf = await this.inner.snapshot(originHash);
       return buf ?? null;
@@ -843,7 +843,7 @@ export class DaemonRuntime {
    * {@link DaemonError} during `Registering` or when the origin
    * is unknown.
    */
-  async stop(originHash: number): Promise<void> {
+  async stop(originHash: bigint): Promise<void> {
     try {
       await this.inner.stop(originHash);
     } catch (e) {
@@ -868,7 +868,7 @@ export class DaemonRuntime {
    * runtime is shutting down.
    */
   async deliver(
-    originHash: number,
+    originHash: bigint,
     event: CausalEvent,
   ): Promise<Buffer[]> {
     try {
@@ -897,7 +897,7 @@ export class DaemonRuntime {
    * precision loss past 2^53.
    */
   async startMigration(
-    originHash: number,
+    originHash: bigint,
     sourceNode: bigint,
     targetNode: bigint,
   ): Promise<MigrationHandle> {
@@ -920,7 +920,7 @@ export class DaemonRuntime {
    * budget.
    */
   async startMigrationWith(
-    originHash: number,
+    originHash: bigint,
     sourceNode: bigint,
     targetNode: bigint,
     opts: MigrationOptions,
@@ -960,7 +960,7 @@ export class DaemonRuntime {
    */
   expectMigration(
     kind: string,
-    originHash: number,
+    originHash: bigint,
     config?: DaemonHostConfig,
   ): void {
     try {
@@ -1019,7 +1019,7 @@ export class DaemonRuntime {
    * that origin. Works on any node — source, target, or an
    * observer that heard the migration on the mesh.
    */
-  migrationPhase(originHash: number): MigrationPhase | null {
+  migrationPhase(originHash: bigint): MigrationPhase | null {
     const p = this.inner.migrationPhase(originHash);
     return (p as MigrationPhase | null) ?? null;
   }
