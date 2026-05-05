@@ -1,0 +1,25 @@
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  d1b11a1287c1706a 175-184,186
+net/crates/net/bindings/python/README.md
+  d1b11a1287c1706a 578-579,582
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d2b07db8c1c037c6085f1ee927216acaeec32478",
+  "prompts": {
+    "d1b11a1287c1706a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 643,
+      "total_deletions": 1432,
+      "accepted_lines": 720,
+      "overriden_lines": 0
+    }
+  }
+}
