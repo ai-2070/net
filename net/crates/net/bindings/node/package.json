@@ -1,6 +1,6 @@
 {
   "name": "@ai2070/net",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "High-performance, schema-agnostic event bus for AI runtime workloads",
   "main": "index.js",
   "types": "index.d.ts",

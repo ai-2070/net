@@ -5,7 +5,7 @@ name: Release Python SDK
 # `release-python.yml`; this is the higher-level setuptools
 # package on top.
 #
-# Tag schema: `pypi-sdk-v<semver>` (e.g. `pypi-sdk-v0.10.0`).
+# Tag schema: `pypi-sdk-v<semver>` (e.g. `pypi-sdk-v0.11.0`).
 #
 # Authentication: PyPI Trusted Publishing — the `pypi`
 # environment + `id-token: write` permission combination below.
