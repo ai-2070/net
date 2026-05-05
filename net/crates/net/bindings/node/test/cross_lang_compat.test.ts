@@ -12,7 +12,7 @@
 // the same wire-format-compat pattern documented in
 // `net/crates/net/README.md#nrpc`.
 
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
@@ -50,6 +50,20 @@ const FIXTURE_PATH = resolve(
   __dirname,
   '../../../tests/cross_lang_nrpc/golden_vectors.json',
 )
+if (!existsSync(FIXTURE_PATH)) {
+  // Surface a clear error pointing at the missing fixture, not a
+  // generic JSON parse failure. The path is brittle relative to
+  // __dirname; if the test gets moved or vitest runs from a
+  // different cwd, the failure mode should be diagnosable
+  // without diff-spelunking. Pinned by `fixture_present` test
+  // below.
+  throw new Error(
+    `cross_lang nRPC fixture not found at ${FIXTURE_PATH} — has the test ` +
+      `or fixture moved? The contract expects the fixture under ` +
+      `net/crates/net/tests/cross_lang_nrpc/golden_vectors.json relative ` +
+      `to the workspace root.`,
+  )
+}
 const fixture: Fixture = JSON.parse(readFileSync(FIXTURE_PATH, 'utf-8'))
 
 // ---------------------------------------------------------------
@@ -131,6 +145,15 @@ class LoopbackHandlerRpc {
 // ---------------------------------------------------------------
 
 describe('Cross-language nRPC wire-format compat (Node side)', () => {
+  it('fixture file is present at the expected location', () => {
+    // Pinned because the path is brittle relative to __dirname;
+    // a future test refactor could silently break the loader and
+    // the only signal would be a JSON parse error. The
+    // top-of-file existsSync guard already throws — this test
+    // makes the invariant visible in the suite output.
+    expect(existsSync(FIXTURE_PATH), `fixture missing at ${FIXTURE_PATH}`).toBe(true)
+  })
+
   it('fixture metadata matches the canonical contract constants', () => {
     expect(fixture.service).toBe('cross_lang_echo_sum')
     expect(fixture.abi_version_expected).toBe(0x0001)
