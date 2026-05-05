@@ -1,0 +1,23 @@
+net/crates/net/bindings/node/test/cross_lang_compat.test.ts
+  d1b11a1287c1706a 15,53-66,148-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "32335f00a742664263ae74f0e0e5f9207eb6ced3",
+  "prompts": {
+    "d1b11a1287c1706a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 224,
+      "total_deletions": 1,
+      "accepted_lines": 695,
+      "overriden_lines": 0
+    }
+  }
+}
