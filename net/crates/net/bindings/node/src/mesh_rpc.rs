@@ -150,6 +150,31 @@ impl CallOptions {
 /// existing `compute` binding's `DEFAULT_CALLBACK_TIMEOUT_MS`.
 const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Stable `nrpc:app_error:` error-message prefix the JS-side
+/// `serve` wrapper uses to signal "I want a typed Application
+/// status code surfaced to the caller, not a generic Internal."
+/// JS handlers throw `new Error("nrpc:app_error:0x8000:<json
+/// body>")` and this side maps it to
+/// `RpcHandlerError::Application { code, message }`. Mirrors
+/// the Python binding's `RpcAppError(code, body)` mechanism.
+const JS_APP_ERROR_PREFIX: &str = "nrpc:app_error:";
+
+/// Parse a JS-thrown `nrpc:app_error:0x<code>:<body>` message
+/// into the (code, body) pair the SDK expects for
+/// `RpcHandlerError::Application`. Returns `None` if the prefix
+/// is absent or the format is malformed (caller falls through to
+/// the generic Internal mapping). Format chosen to be
+/// human-readable + grep-friendly; Python's pyo3 path uses an
+/// exception class instead because raising a typed exception is
+/// the natural pattern there.
+fn parse_js_app_error(message: &str) -> Option<(u16, String)> {
+    let rest = message.strip_prefix(JS_APP_ERROR_PREFIX)?;
+    let (code_str, body) = rest.split_once(':')?;
+    let code_hex = code_str.strip_prefix("0x").or(code_str.strip_prefix("0X"))?;
+    let code = u16::from_str_radix(code_hex, 16).ok()?;
+    Some((code, body.to_string()))
+}
+
 type RpcHandlerTsfn = ThreadsafeFunction<Buffer, Promise<Buffer>, Buffer, napi::Status, false>;
 
 struct NodeRpcHandler {
@@ -218,9 +243,29 @@ impl RpcHandler for NodeRpcHandler {
         //    is `Send + 'static` and implements Future via an
         //    internal "promise resolved" callback that completes a
         //    oneshot — no main-thread polling required.
-        let resp_buf = promise
-            .await
-            .map_err(|e| RpcHandlerError::Internal(format!("JS handler promise rejected: {e}")))?;
+        let resp_buf = match promise.await {
+            Ok(buf) => buf,
+            Err(e) => {
+                // Inspect the rejection message — a JS handler that
+                // wants to signal a typed application status throws
+                // `new Error("nrpc:app_error:0x8000:<body>")`. Map
+                // that to RpcHandlerError::Application so the fold
+                // emits RpcResponsePayload { status: Application(_),
+                // body }; otherwise fall through to the generic
+                // Internal mapping. Mirrors the Python binding's
+                // RpcAppError pathway.
+                let msg = e.to_string();
+                if let Some((code, body)) = parse_js_app_error(&msg) {
+                    return Err(RpcHandlerError::Application {
+                        code,
+                        message: body,
+                    });
+                }
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS handler promise rejected: {e}"
+                )));
+            }
+        };
 
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
@@ -597,5 +642,57 @@ mod tests {
         let empty = CallOptions::default().into_inner();
         assert!(empty.deadline.is_none());
         assert!(empty.stream_window_initial.is_none());
+    }
+
+    /// `parse_js_app_error` parses canonical
+    /// `nrpc:app_error:0x<code>:<body>` and surfaces the
+    /// (code, body) pair the SDK expects for
+    /// RpcHandlerError::Application. Pinned because the JS-side
+    /// `appError(code, body)` helper produces this format and a
+    /// drift would silently break typed bad-request mapping.
+    #[test]
+    fn parse_js_app_error_round_trips_canonical_format() {
+        // Canonical form: `nrpc:app_error:0x8000:<json body>`.
+        let (code, body) = parse_js_app_error(
+            "nrpc:app_error:0x8000:{\"error\":\"invalid_request\",\"detail\":\"bad json\"}",
+        )
+        .expect("canonical form parses");
+        assert_eq!(code, 0x8000);
+        assert_eq!(body, "{\"error\":\"invalid_request\",\"detail\":\"bad json\"}");
+
+        // Body containing colons is preserved verbatim — the
+        // parser splits only on the first colon AFTER the code.
+        let (code, body) =
+            parse_js_app_error("nrpc:app_error:0x8001:status: bad").expect("colon-in-body parses");
+        assert_eq!(code, 0x8001);
+        assert_eq!(body, "status: bad");
+
+        // Uppercase 0X variant tolerated.
+        let (code, body) =
+            parse_js_app_error("nrpc:app_error:0X4001:detail").expect("uppercase 0X");
+        assert_eq!(code, 0x4001);
+        assert_eq!(body, "detail");
+
+        // Empty body permitted.
+        let (code, body) = parse_js_app_error("nrpc:app_error:0x0001:").expect("empty body");
+        assert_eq!(code, 1);
+        assert_eq!(body, "");
+    }
+
+    /// Anything not matching the canonical shape is rejected;
+    /// the caller falls through to the generic Internal mapping
+    /// so user-thrown plain errors keep their existing semantics.
+    #[test]
+    fn parse_js_app_error_rejects_malformed_messages() {
+        // No prefix.
+        assert!(parse_js_app_error("plain error").is_none());
+        // Missing trailing body / colon.
+        assert!(parse_js_app_error("nrpc:app_error:0x8000").is_none());
+        // Non-hex code.
+        assert!(parse_js_app_error("nrpc:app_error:zz:body").is_none());
+        // Code overflows u16.
+        assert!(parse_js_app_error("nrpc:app_error:0x10000:body").is_none());
+        // Empty (just prefix).
+        assert!(parse_js_app_error("nrpc:app_error:").is_none());
     }
 }

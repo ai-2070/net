@@ -25,6 +25,7 @@ import {
 import {
   BreakerOpenError,
   CircuitBreaker,
+  appError,
   defaultBreakerFailure,
   defaultRetryable,
   HedgePolicy,
@@ -464,5 +465,46 @@ describe('HedgePolicy', () => {
   it('NRPC_TYPED_BAD_REQUEST and NRPC_TYPED_HANDLER_ERROR constants are stable', () => {
     expect(NRPC_TYPED_BAD_REQUEST).toBe(0x8000)
     expect(NRPC_TYPED_HANDLER_ERROR).toBe(0x8001)
+  })
+})
+
+// ============================================================================
+// appError — typed application-status helper for serve handlers.
+//
+// Pinned because the Rust binding's parse_js_app_error reads this
+// exact format; a drift would silently break typed bad-request
+// mapping. See `src/mesh_rpc.rs::parse_js_app_error_*` tests for
+// the matching parser side.
+// ============================================================================
+
+describe('appError', () => {
+  it('formats canonical nrpc:app_error:0x<code>:<body>', () => {
+    const e = appError(0x8000, '{"err":"bad"}')
+    expect(e.message).toBe('nrpc:app_error:0x8000:{"err":"bad"}')
+  })
+
+  it('zero-pads the hex code to four digits', () => {
+    expect(appError(1, 'x').message).toBe('nrpc:app_error:0x0001:x')
+    expect(appError(0xffff, 'x').message).toBe('nrpc:app_error:0xffff:x')
+  })
+
+  it('accepts Buffer body and utf-8-decodes it', () => {
+    const body = Buffer.from('héllo', 'utf-8')
+    const e = appError(0x8001, body)
+    expect(e.message).toBe('nrpc:app_error:0x8001:héllo')
+  })
+
+  it('rejects out-of-range and non-numeric codes', () => {
+    expect(() => appError(-1, 'x')).toThrow(TypeError)
+    expect(() => appError(0x10000, 'x')).toThrow(TypeError)
+    // @ts-expect-error — wrong type intentionally
+    expect(() => appError('foo', 'x')).toThrow(TypeError)
+  })
+
+  it('preserves colons in the body verbatim', () => {
+    // The Rust parser splits on the FIRST colon after `0x<hex>:`,
+    // so a body like "status: bad" must survive intact.
+    const e = appError(0x8000, 'status: bad')
+    expect(e.message).toBe('nrpc:app_error:0x8000:status: bad')
   })
 })

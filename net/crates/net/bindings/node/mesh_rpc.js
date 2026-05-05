@@ -143,17 +143,24 @@ class TypedMeshRpc {
    */
   serve(service, handler) {
     return this._raw.serve(service, async (reqBuf) => {
-      // Decode failures here surface to the caller as
-      // RpcServerError(Internal) because we're past the wire —
-      // the caller's `call` already returned successfully. This
-      // matches the Rust SDK's typed-handler bad-request path.
+      // Decode failures on the request surface to the caller as
+      // a canonical typed-bad-request: the Rust binding maps any
+      // promise rejection whose message starts with
+      // `nrpc:app_error:0x<code>:<body>` to
+      // RpcHandlerError::Application { code, message: body },
+      // which the fold emits as RpcStatus::Application(code).
+      // Status 0x8000 == NRPC_TYPED_BAD_REQUEST per the cross-
+      // binding contract pinned in
+      // `tests/cross_lang_nrpc/golden_vectors.json`.
       let req
       try {
         req = jsonDecode(reqBuf)
       } catch (e) {
-        // Re-throw — napi will route to the caller as a
-        // RpcServerError with the codec_decode message embedded.
-        throw new Error(`server-side decode failed: ${e?.message ?? e}`)
+        const body = JSON.stringify({
+          error: 'invalid_request',
+          detail: e?.message ?? String(e),
+        })
+        throw appError(0x8000, body)
       }
       const resp = await handler(req)
       return jsonEncode(resp)
@@ -720,6 +727,43 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/**
+ * Build an Error a typed serve handler can throw to surface a
+ * specific application status code to the caller. The Rust
+ * binding parses messages of the form
+ * `nrpc:app_error:0x<code>:<body>` and maps them to
+ * `RpcStatus::Application(code)` — without this prefix the
+ * thrown error becomes a generic `RpcStatus::Internal`. Mirrors
+ * the Python binding's `RpcAppError(code, body)`.
+ *
+ * Use cases: typed handlers that want to return 4xx-style
+ * application errors (`NRPC_TYPED_BAD_REQUEST`,
+ * `NRPC_TYPED_HANDLER_ERROR`, custom app codes >= 0x8000).
+ *
+ * @param {number} code - Application status code (typically >= 0x8000)
+ * @param {string|Buffer} body - Response body (utf-8 encoded if Buffer)
+ * @returns {Error}
+ */
+function appError(code, body) {
+  if (typeof code !== 'number' || code < 0 || code > 0xffff) {
+    throw new TypeError(
+      `appError: code must be a 0..=0xFFFF integer (got ${code})`,
+    )
+  }
+  let bodyStr
+  if (typeof body === 'string') {
+    bodyStr = body
+  } else if (Buffer.isBuffer(body)) {
+    bodyStr = body.toString('utf8')
+  } else {
+    bodyStr = String(body ?? '')
+  }
+  // The Rust parser splits on the FIRST colon after `0x<hex>:`,
+  // so the body itself can contain colons safely.
+  const codeHex = code.toString(16).padStart(4, '0')
+  return new Error(`nrpc:app_error:0x${codeHex}:${bodyStr}`)
+}
+
 module.exports = {
   TypedMeshRpc,
   TypedRpcStream,
@@ -727,6 +771,7 @@ module.exports = {
   HedgePolicy,
   CircuitBreaker,
   BreakerOpenError,
+  appError,
   defaultRetryable,
   defaultBreakerFailure,
   // Status code constants (parallel to NRPC_TYPED_BAD_REQUEST /

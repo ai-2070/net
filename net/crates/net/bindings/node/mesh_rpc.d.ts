@@ -262,6 +262,26 @@ export function defaultRetryable(err: unknown): boolean
 /** Default breaker-failure predicate. Same set as {@link defaultRetryable}. */
 export function defaultBreakerFailure(err: unknown): boolean
 
+/**
+ * Build an Error a typed serve handler can throw to surface a
+ * specific `RpcStatus::Application(code)` to the caller. The
+ * Rust binding parses messages of the form
+ * `nrpc:app_error:0x<code>:<body>` and emits the response with
+ * the matching application status. Use this for typed bad-
+ * request paths (`NRPC_TYPED_BAD_REQUEST`) and any custom app
+ * error codes (>= 0x8000).
+ *
+ * @example
+ *   rpc.serve('echo', (req) => {
+ *     if (typeof req.text !== 'string') {
+ *       throw appError(NRPC_TYPED_BAD_REQUEST,
+ *                      JSON.stringify({error: 'missing text'}))
+ *     }
+ *     return { echo: req.text }
+ *   })
+ */
+export function appError(code: number, body: string | Buffer): Error
+
 // Status codes — parallel to the Rust SDK's named consts.
 /** RpcStatus::Application(0x8000): typed handler bad-request body. */
 export const NRPC_TYPED_BAD_REQUEST: 0x8000
