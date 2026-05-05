@@ -16,10 +16,34 @@ What's landed in-tree (post-Phase-1 prerequisites):
 
 What's still pending:
 
-- ⏳ **`Mesh::serve_rpc(service, handler)` / `Mesh::call(service, payload, opts)` glue**. This is the wire-up between the existing publish/subscribe machinery and the RPC folds. Concretely:
-  - `serve_rpc` opens a `CortexAdapter` on `<service>.requests` with the `RpcServerFold`. Calls `subscribe_channel_in_queue_group(self, "<service>.requests", "<service>")` so multiple replica servers form a load-balanced group automatically. Builds the `RpcResponseEmitter` closure to publish RESPONSEs via `ChannelPublisher` on `<service>.replies.<caller_origin>`. Returns a `ServeHandle` whose Drop unsubscribes + closes the adapter.
-  - `call` allocates a `call_id` from a per-Mesh `AtomicU64`, lazily ensures a subscription to `<service>.replies.<self_origin>` (with a `RpcClientFold`), registers a oneshot in the local `RpcClientPending`, publishes the REQUEST envelope to `<service>.requests`, awaits the receiver. Drop sends a CANCEL.
-  - Bridging concern: the cortex adapter expects events to come through its tail of the local redex log, but RPC events arrive over the network via the mesh's subscriber path. Either (a) extend the adapter with a "subscribe and ingest into log" mode, OR (b) bypass the redex log and feed subscribed events directly into the fold via a tokio channel. Option (a) preserves the persistence/replay benefit; option (b) is lighter weight. The decision lives at this seam.
+- ⏳ **`Mesh::serve_rpc(service, handler)` / `Mesh::call(service, payload, opts)` glue**. The shape is locked; the implementation is the next concrete pickup.
+
+  **Seam decision (locked): Option A — cortex adapter on the request channel.** `serve_rpc` opens a real `CortexAdapter` on `<service>.requests` with the `RpcServerFold` as its fold. Subscribed inbound events (delivered via the existing `inbound: DashMap<u16, SegQueue<StoredEvent>>` path) are ingested into the adapter's local redex log; the adapter's tail-and-fold task drives `RpcServerFold::apply` from there. The alternative (Option B — bypass the redex log, feed subscribed events directly into the fold via a tokio channel) was rejected for Phase 1 because (a) it requires a hot-path code change to the mesh's inbound delivery point, and (b) Option A reuses every existing piece of plumbing while gaining durability + replay + snapshot-restore of in-flight RPC state for free. The per-call redex-append latency cost (~microseconds) is acceptable when the network alone is hundreds of microseconds.
+
+  Concrete steps:
+
+  1. **`serve_rpc(service, handler)`**:
+     - Open `CortexAdapter::open(redex, "<service>.requests", ..., RpcServerFold::new(handler, emit), ())`.
+     - Where `emit: RpcResponseEmitter` builds an `EventEnvelope` (meta + `RpcResponsePayload::encode()`) and calls `Mesh::publish(channel_publisher_for("<service>.replies.<caller_origin>"), payload)`. Reply-channel naming uses the caller's `origin_hash` (8-byte hex), so each caller's reply channel is private and naturally subscribed only by them.
+     - Self-subscribe via `Mesh::subscribe_channel_in_queue_group(self_node_id, "<service>.requests", "<service>")`. This is a local-only roster mutation; the queue-group dispatch then routes one-of-N requests across replicas that all subscribe with the same group name.
+     - Bridge inbound events into the cortex adapter's ingest path. The mesh already pushes subscribed events into `inbound[shard_id]`. The bridge spawns a task that polls `MeshNode::poll_shard(...)` for the relevant shard, filters to events for the channel, and calls `adapter.ingest(envelope)`. (A future optimization: hook directly at the inbound-delivery point to skip the poll loop. Phase 2 work.)
+     - Return a `ServeHandle` whose Drop closes the adapter, unsubscribes, and stops the bridge task.
+
+  2. **`call(service, payload, opts)`**:
+     - Lazily ensure: (a) a subscription to `<service>.replies.<self_origin>` (Broadcast mode, sole subscriber by construction), (b) a `CortexAdapter` on that channel with `RpcClientFold` as its fold, (c) the same inbound bridge as above.
+     - Allocate `call_id` from a per-Mesh `AtomicU64`.
+     - `pending.register(call_id) -> oneshot::Receiver`.
+     - Publish REQUEST envelope on `<service>.requests` via `Mesh::publish`.
+     - Await the receiver under `opts.deadline` (race with `tokio::time::sleep_until`).
+     - On future-drop OR deadline-fire: publish CANCEL envelope on `<service>.requests` and `pending.cancel(call_id)`.
+
+  3. **Per-Mesh state** (a small extension to `MeshNode`):
+     - `rpc_servers: DashMap<String /* service */, ServeHandle>` — active server registrations.
+     - `rpc_client_pending: Arc<RpcClientPending>` — the singleton pending-calls store.
+     - `rpc_next_call_id: AtomicU64`.
+     - `rpc_reply_subscription: Mutex<Option<ReplySubscription>>` — lazily initialized on first `call`, torn down after `idle_reply_subscription_ttl` of no in-flight calls.
+
+  4. **End-to-end integration test** (once the glue lands): two `MeshNode` instances in one process. Node A: `serve_rpc("echo", echo_handler)`. Node B: `call("echo", b"hi")`. Assert round-trip + queue-group load distribution across N>1 servers + cancellation + crash-recovery (kill node A mid-call, restart with the same redex; the request gets re-folded on rehydrate and the response lands).
 - ⏳ **End-to-end integration test against real Mesh instances** — once the glue lands, two Mesh nodes in one process: one calls `serve_rpc("echo", ...)`, the other calls `call("echo", ...)`; assert round-trip + queue-group load distribution across N servers + cancellation flowing across the network.
 - ⏳ **Phase 2** — service registry derived from existing capability announcements; routing policies; SDK typed wrappers for the four bindings.
 - ⏳ **Phase 3** — streaming responses, tracing context propagation, retry/circuit-breaker/hedging helpers.
