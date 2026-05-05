@@ -575,9 +575,11 @@ with server_rpc.serve("echo_sum", echo_sum):
     # reply == {"echo": "hi", "sum": 6}
 
 # Streaming responses iterate decoded chunks until EOF or terminal error.
+# `stream_window_initial` is the canonical key; `stream_window` is an
+# alias accepted for ergonomic parity.
 stream = client_rpc.call_streaming(
     target_node_id, "tail", {"tail": "events"},
-    opts={"deadline_ms": 5000, "stream_window": 8},
+    opts={"deadline_ms": 5000, "stream_window_initial": 8},
 )
 for chunk in stream:
     process(chunk)

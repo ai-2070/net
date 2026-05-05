@@ -172,11 +172,18 @@ fn call_options_from_dict(opts: Option<&Bound<'_, PyDict>>) -> PyResult<InnerCal
         })?;
         inner.deadline = Some(Instant::now() + Duration::from_millis(ms));
     }
-    if let Some(v) = d.get_item("stream_window_initial")? {
+    // `stream_window_initial` is the canonical key; `stream_window`
+    // is an alias accepted for parity with the README example. We
+    // prefer the canonical key when both are present so a user
+    // mid-migration doesn't get a surprise from the alias overriding
+    // an explicit canonical setting.
+    let stream_window = match d.get_item("stream_window_initial")? {
+        Some(v) => Some(("stream_window_initial", v)),
+        None => d.get_item("stream_window")?.map(|v| ("stream_window", v)),
+    };
+    if let Some((key, v)) = stream_window {
         let n: u32 = v.extract().map_err(|e| {
-            pyo3::exceptions::PyTypeError::new_err(format!(
-                "stream_window_initial must be int: {e}"
-            ))
+            pyo3::exceptions::PyTypeError::new_err(format!("{key} must be int: {e}"))
         })?;
         inner.stream_window_initial = Some(n);
     }
