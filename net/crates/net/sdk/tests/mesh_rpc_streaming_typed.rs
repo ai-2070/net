@@ -215,13 +215,17 @@ async fn typed_streaming_chunk_decode_failure_terminates_stream() {
         .expect("must yield exactly one item")
         .expect_err("must surface as decode error");
     match first {
-        RpcError::ServerError { message, .. } => {
+        RpcError::Codec {
+            direction,
+            ref message,
+        } => {
+            assert_eq!(direction, net_sdk::mesh_rpc::CodecDirection::Decode);
             assert!(
                 message.contains("client decode"),
                 "decode-failure diagnostic must be marked, got {message:?}",
             );
         }
-        other => panic!("expected ServerError(Internal), got {other:?}"),
+        other => panic!("expected RpcError::Codec(Decode), got {other:?}"),
     }
     // Subsequent polls return None — the typed stream marks itself
     // done after a decode failure.

@@ -195,6 +195,30 @@ pub enum RpcError {
     /// etc.).
     #[error("transport: {0}")]
     Transport(#[from] AdapterError),
+    /// Client-local serialization or deserialization failure.
+    /// `direction = Encode` means the typed wrapper failed to
+    /// encode the request before it ever hit the wire;
+    /// `direction = Decode` means the response landed but the
+    /// typed wrapper failed to decode it. Either way this is a
+    /// caller-fixable bug (wrong codec, schema drift, malformed
+    /// `Serialize` impl) — NOT a transient infra failure — so
+    /// retry / circuit-breaker predicates skip it by default.
+    #[error("codec ({direction:?}): {message}")]
+    Codec {
+        /// Which side of the call the codec failure happened on.
+        direction: CodecDirection,
+        /// Decode/encode diagnostic from the underlying serde impl.
+        message: String,
+    },
+}
+
+/// Which side of the call surfaced a [`RpcError::Codec`] failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecDirection {
+    /// Encoding the outbound request failed before the call was issued.
+    Encode,
+    /// Decoding the inbound response failed after the call returned Ok.
+    Decode,
 }
 
 /// RAII handle returned by [`MeshNode::serve_rpc`]. Dropping it

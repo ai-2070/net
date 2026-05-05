@@ -28,7 +28,8 @@ pub use net::adapter::net::cortex::{
     RpcStreamingHandler, StreamItem,
 };
 pub use net::adapter::net::mesh_rpc::{
-    CallOptions, RoutingPolicy, RpcError, RpcReply, RpcStream, ServeError, ServeHandle,
+    CallOptions, CodecDirection, RoutingPolicy, RpcError, RpcReply, RpcStream, ServeError,
+    ServeHandle,
 };
 pub use net::adapter::net::mesh_rpc_metrics::{
     RpcMetricsSnapshot, ServiceMetrics, DEFAULT_LATENCY_BUCKETS_SECS,
@@ -239,22 +240,17 @@ impl Mesh {
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let body = opts
-            .codec
-            .encode(request)
-            .map_err(|e| RpcError::ServerError {
-                status: RpcStatus::Internal.to_wire(),
-                message: format!("client encode: {e}"),
-            })?;
+        let body = opts.codec.encode(request).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!("client encode: {e}"),
+        })?;
         let reply = self
             .call(target_node_id, service, Bytes::from(body), opts.raw)
             .await?;
-        opts.codec
-            .decode(&reply.body)
-            .map_err(|e| RpcError::ServerError {
-                status: RpcStatus::Internal.to_wire(),
-                message: format!("client decode: {e}"),
-            })
+        opts.codec.decode(&reply.body).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Decode,
+            message: format!("client decode: {e}"),
+        })
     }
 
     /// Service-name typed call. Same as [`Self::call_typed`] but
@@ -269,22 +265,17 @@ impl Mesh {
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let body = opts
-            .codec
-            .encode(request)
-            .map_err(|e| RpcError::ServerError {
-                status: RpcStatus::Internal.to_wire(),
-                message: format!("client encode: {e}"),
-            })?;
+        let body = opts.codec.encode(request).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!("client encode: {e}"),
+        })?;
         let reply = self
             .call_service(service, Bytes::from(body), opts.raw)
             .await?;
-        opts.codec
-            .decode(&reply.body)
-            .map_err(|e| RpcError::ServerError {
-                status: RpcStatus::Internal.to_wire(),
-                message: format!("client decode: {e}"),
-            })
+        opts.codec.decode(&reply.body).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Decode,
+            message: format!("client decode: {e}"),
+        })
     }
 
     // ---- Streaming (raw) ----
@@ -368,13 +359,10 @@ impl Mesh {
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let body = opts
-            .codec
-            .encode(request)
-            .map_err(|e| RpcError::ServerError {
-                status: RpcStatus::Internal.to_wire(),
-                message: format!("client encode: {e}"),
-            })?;
+        let body = opts.codec.encode(request).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!("client encode: {e}"),
+        })?;
         let inner = self
             .call_streaming(target_node_id, service, Bytes::from(body), opts.raw)
             .await?;
@@ -459,8 +447,8 @@ impl<Resp: DeserializeOwned + Unpin> futures::Stream for RpcStreamTyped<Resp> {
                 Ok(value) => std::task::Poll::Ready(Some(Ok(value))),
                 Err(e) => {
                     self.done = true;
-                    std::task::Poll::Ready(Some(Err(RpcError::ServerError {
-                        status: RpcStatus::Internal.to_wire(),
+                    std::task::Poll::Ready(Some(Err(RpcError::Codec {
+                        direction: CodecDirection::Decode,
                         message: format!("client decode: {e}"),
                     })))
                 }

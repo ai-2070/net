@@ -262,6 +262,78 @@ async fn retry_exhaustion_surfaces_last_error() {
     );
 }
 
+/// Regression: a typed call whose response body cannot be decoded
+/// into the caller's `Resp` type surfaces as `RpcError::Codec` and
+/// is NOT retried by the default predicate. Without this guarantee,
+/// a permanent local schema-drift bug burns the full retry budget
+/// (and trips the circuit breaker) on a deterministic local fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn codec_decode_failure_is_not_retried() {
+    let psk = [0x42u8; 32];
+    let (caller, server, addr_server) = two_meshes(&psk).await;
+    handshake(&caller, &server, addr_server).await;
+
+    // Server returns a response body that does NOT round-trip as
+    // `PingResponse`. Each call increments the handler counter so
+    // we can assert the retry layer issued exactly one wire call.
+    use async_trait::async_trait;
+    use net_sdk::mesh_rpc::{RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus};
+    struct ReturnsBadShape {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl RpcHandler for ReturnsBadShape {
+        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // Valid JSON, but a shape `PingResponse { pong: u64 }`
+            // can't decode (wrong field, wrong type).
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: br#"{"unexpected":"string"}"#.to_vec(),
+            })
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc(
+            "bad_shape",
+            Arc::new(ReturnsBadShape {
+                calls: calls.clone(),
+            }),
+        )
+        .expect("serve_rpc");
+
+    let policy = RetryPolicy {
+        max_attempts: 5,
+        initial_backoff: Duration::from_millis(5),
+        max_backoff: Duration::from_millis(20),
+        backoff_multiplier: 2.0,
+        jitter: false,
+        ..Default::default()
+    };
+    let err = caller
+        .call_typed_with_retry::<PingRequest, PingResponse>(
+            server.inner().node_id(),
+            "bad_shape",
+            &PingRequest { seq: 1 },
+            CallOptionsTyped::default(),
+            &policy,
+        )
+        .await
+        .expect_err("decode must fail");
+    assert!(
+        matches!(err, RpcError::Codec { .. }),
+        "decode failure must surface as RpcError::Codec, got {err:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "codec failures must NOT trigger retry — got {} attempts",
+        calls.load(Ordering::SeqCst),
+    );
+}
+
 /// `default_retryable` correctly classifies each `RpcError` shape.
 #[test]
 fn default_retryable_classifies_canonical_errors() {
@@ -303,5 +375,16 @@ fn default_retryable_classifies_canonical_errors() {
     assert!(!default_retryable(&RpcError::ServerError {
         status: RpcStatus::UnknownVersion.to_wire(),
         message: "x".into(),
+    }));
+    // Codec failures are caller-fixable bugs (wrong codec, schema
+    // drift, malformed Serialize/Deserialize impl). Retrying just
+    // burns the backoff budget on the same deterministic failure.
+    assert!(!default_retryable(&RpcError::Codec {
+        direction: net_sdk::mesh_rpc::CodecDirection::Encode,
+        message: "non-finite f64".into(),
+    }));
+    assert!(!default_retryable(&RpcError::Codec {
+        direction: net_sdk::mesh_rpc::CodecDirection::Decode,
+        message: "trailing garbage".into(),
     }));
 }

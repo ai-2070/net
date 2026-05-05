@@ -29,7 +29,9 @@ use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::mesh::Mesh;
-use crate::mesh_rpc::{CallOptions, CallOptionsTyped, RpcError, RpcReply, RpcStatus};
+use crate::mesh_rpc::{
+    CallOptions, CallOptionsTyped, CodecDirection, RpcError, RpcReply, RpcStatus,
+};
 
 // ============================================================================
 // Retry policy.
@@ -116,9 +118,10 @@ impl RetryPolicy {
 /// Default predicate for [`RetryPolicy::retryable`]. Retries:
 /// `Timeout`, `Transport`, and `ServerError` for the canonical
 /// transient statuses (`Internal`, `Backpressure`, server-observed
-/// `Timeout`). Does NOT retry: `NoRoute`, `ServerError` for
-/// `Application` / `NotFound` / `Unauthorized` / `UnknownVersion` /
-/// `Cancelled` (those are caller-fixable or terminal).
+/// `Timeout`). Does NOT retry: `NoRoute`, `Codec` (caller-fixable
+/// local bug), or `ServerError` for `Application` / `NotFound` /
+/// `Unauthorized` / `UnknownVersion` / `Cancelled` (those are
+/// caller-fixable or terminal).
 pub fn default_retryable(err: &RpcError) -> bool {
     match err {
         RpcError::NoRoute { .. } => false,
@@ -129,6 +132,12 @@ pub fn default_retryable(err: &RpcError) -> bool {
                 || *status == RpcStatus::Backpressure.to_wire()
                 || *status == RpcStatus::Timeout.to_wire()
         }
+        // Codec failures are caller-fixable bugs (wrong codec,
+        // schema drift, malformed `Serialize`/`Deserialize` impl).
+        // Retrying burns the backoff budget on the same
+        // deterministic failure and risks tripping the circuit
+        // breaker on a local-only fault.
+        RpcError::Codec { .. } => false,
     }
 }
 
@@ -198,8 +207,8 @@ impl Mesh {
         Resp: DeserializeOwned,
     {
         let codec = opts.codec;
-        let body = codec.encode(request).map_err(|e| RpcError::ServerError {
-            status: RpcStatus::Internal.to_wire(),
+        let body = codec.encode(request).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
             message: format!("client encode: {e}"),
         })?;
         let body = Bytes::from(body);
@@ -208,8 +217,8 @@ impl Mesh {
             .await?;
         codec
             .decode(&reply.body)
-            .map_err(|e| RpcError::ServerError {
-                status: RpcStatus::Internal.to_wire(),
+            .map_err(|e| RpcError::Codec {
+                direction: CodecDirection::Decode,
                 message: format!("client decode: {e}"),
             })
     }
@@ -229,8 +238,8 @@ impl Mesh {
         Resp: DeserializeOwned,
     {
         let codec = opts.codec;
-        let body = codec.encode(request).map_err(|e| RpcError::ServerError {
-            status: RpcStatus::Internal.to_wire(),
+        let body = codec.encode(request).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
             message: format!("client encode: {e}"),
         })?;
         let body = Bytes::from(body);
@@ -239,8 +248,8 @@ impl Mesh {
             .await?;
         codec
             .decode(&reply.body)
-            .map_err(|e| RpcError::ServerError {
-                status: RpcStatus::Internal.to_wire(),
+            .map_err(|e| RpcError::Codec {
+                direction: CodecDirection::Decode,
                 message: format!("client decode: {e}"),
             })
     }
@@ -419,8 +428,8 @@ impl Mesh {
         Resp: DeserializeOwned,
     {
         let codec = opts.codec;
-        let body = codec.encode(request).map_err(|e| RpcError::ServerError {
-            status: RpcStatus::Internal.to_wire(),
+        let body = codec.encode(request).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
             message: format!("client encode: {e}"),
         })?;
         let reply = self
@@ -428,8 +437,8 @@ impl Mesh {
             .await?;
         codec
             .decode(&reply.body)
-            .map_err(|e| RpcError::ServerError {
-                status: RpcStatus::Internal.to_wire(),
+            .map_err(|e| RpcError::Codec {
+                direction: CodecDirection::Decode,
                 message: format!("client decode: {e}"),
             })
     }
@@ -447,8 +456,8 @@ impl Mesh {
         Resp: DeserializeOwned,
     {
         let codec = opts.codec;
-        let body = codec.encode(request).map_err(|e| RpcError::ServerError {
-            status: RpcStatus::Internal.to_wire(),
+        let body = codec.encode(request).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
             message: format!("client encode: {e}"),
         })?;
         let reply = self
@@ -456,8 +465,8 @@ impl Mesh {
             .await?;
         codec
             .decode(&reply.body)
-            .map_err(|e| RpcError::ServerError {
-                status: RpcStatus::Internal.to_wire(),
+            .map_err(|e| RpcError::Codec {
+                direction: CodecDirection::Decode,
                 message: format!("client decode: {e}"),
             })
     }
