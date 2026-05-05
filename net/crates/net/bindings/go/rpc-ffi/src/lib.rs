@@ -148,9 +148,11 @@ static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// Entry removal happens either by the awaiting task (on
 /// completion) or by `net_rpc_cancel_call` (on user-driven
 /// cancellation) — whichever runs first wins.
-fn cancel_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>> {
-    static REG: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>>> =
-        OnceLock::new();
+fn cancel_registry(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>> {
+    static REG: OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>>,
+    > = OnceLock::new();
     REG.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -589,10 +591,7 @@ struct CancelledError;
 ///
 /// `token == 0` short-circuits to a plain `block_on` so the
 /// non-cancellable path stays free of registry overhead.
-fn run_cancellable<F, T>(
-    cancel_token: u64,
-    fut: F,
-) -> std::result::Result<T, CancelledError>
+fn run_cancellable<F, T>(cancel_token: u64, fut: F) -> std::result::Result<T, CancelledError>
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,

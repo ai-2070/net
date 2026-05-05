@@ -254,7 +254,9 @@ const JS_APP_ERROR_PREFIX: &str = "nrpc:app_error:";
 fn parse_js_app_error(message: &str) -> Option<(u16, String)> {
     let rest = message.strip_prefix(JS_APP_ERROR_PREFIX)?;
     let (code_str, body) = rest.split_once(':')?;
-    let code_hex = code_str.strip_prefix("0x").or(code_str.strip_prefix("0X"))?;
+    let code_hex = code_str
+        .strip_prefix("0x")
+        .or(code_str.strip_prefix("0X"))?;
     let code = u16::from_str_radix(code_hex, 16).ok()?;
     Some((code, body.to_string()))
 }
@@ -812,7 +814,10 @@ mod tests {
         )
         .expect("canonical form parses");
         assert_eq!(code, 0x8000);
-        assert_eq!(body, "{\"error\":\"invalid_request\",\"detail\":\"bad json\"}");
+        assert_eq!(
+            body,
+            "{\"error\":\"invalid_request\",\"detail\":\"bad json\"}"
+        );
 
         // Body containing colons is preserved verbatim — the
         // parser splits only on the first colon AFTER the code.

@@ -147,9 +147,9 @@ fn rpc_error_to_pyerr(err: InnerRpcError) -> PyErr {
         InnerRpcError::NoRoute { target, reason } => RpcNoRouteError::new_err(format!(
             "{ERR_NRPC_PREFIX}no_route: target=0x{target:x} reason={reason}"
         )),
-        InnerRpcError::Timeout { elapsed_ms } => RpcTimeoutError::new_err(format!(
-            "{ERR_NRPC_PREFIX}timeout: elapsed_ms={elapsed_ms}"
-        )),
+        InnerRpcError::Timeout { elapsed_ms } => {
+            RpcTimeoutError::new_err(format!("{ERR_NRPC_PREFIX}timeout: elapsed_ms={elapsed_ms}"))
+        }
         InnerRpcError::ServerError { status, message } => RpcServerError::new_err(format!(
             "{ERR_NRPC_PREFIX}server_error: status=0x{status:04x} message={message}"
         )),
@@ -220,8 +220,7 @@ impl PyCancellable {
 
     /// `True` once cancel() has been called.
     fn is_cancelled(&self) -> bool {
-        self.cancelled
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -409,9 +408,9 @@ impl RpcHandler for PyRpcHandler {
                     match callable.call1(py, args) {
                         Ok(ret) => {
                             let bound = ret.into_bound(py);
-                            let bytes_vec: Vec<u8> = bound.extract().map_err(|e| {
-                                format!("Python handler must return bytes: {e}")
-                            })?;
+                            let bytes_vec: Vec<u8> = bound
+                                .extract()
+                                .map_err(|e| format!("Python handler must return bytes: {e}"))?;
                             Ok(HandlerOutcome::Ok(bytes_vec))
                         }
                         Err(pyerr) => {
@@ -627,7 +626,11 @@ where
     // Pre-check: cancel() may have been called BEFORE we got
     // here. Honor it without entering the runtime.
     let already_cancelled = Python::attach(|py| {
-        cancel_py.bind(py).borrow().cancelled.load(std::sync::atomic::Ordering::Acquire)
+        cancel_py
+            .bind(py)
+            .borrow()
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
     });
     if already_cancelled {
         return Err(PyCancelledError);
