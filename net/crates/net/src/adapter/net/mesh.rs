@@ -4110,6 +4110,23 @@ impl MeshNode {
         self.capability_index.clone()
     }
 
+    /// Bridge from session-layer `node_id: u64` to entity-layer
+    /// `[u8; 32]` (the ed25519 public key, used as the
+    /// `ProximityGraph` key). `mesh_rpc`'s `LowestLatency` policy
+    /// and `filter_unhealthy` option use this to look up
+    /// proximity / health data per RPC candidate.
+    ///
+    /// Returns `None` for nodes the local mesh has not yet seen
+    /// an `IdentityEnvelope` from (typically: a node we know
+    /// about via capability announcement but haven't completed
+    /// a handshake with). Callers treat `None` as "no
+    /// proximity-derivable signal," not as "node is dead."
+    pub(super) fn entity_id_for_node(&self, node_id: u64) -> Option<[u8; 32]> {
+        self.peer_entity_ids
+            .get(&node_id)
+            .map(|e| *e.value().as_bytes())
+    }
+
     /// Install a `ChannelConfigRegistry` whose `can_subscribe` /
     /// `can_publish` rules are consulted for incoming Subscribe
     /// messages.

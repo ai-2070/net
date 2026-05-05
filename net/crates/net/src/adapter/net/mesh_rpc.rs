@@ -71,12 +71,16 @@ pub enum RoutingPolicy {
         /// id depending on the application.
         key: u64,
     },
-    // TODO Phase 2: `LowestLatency` policy. Needs an
-    // `EntityId ↔ node_id` bridge because `ProximityGraph` is
-    // keyed on `EntityId` ([u8; 32]) while `find_service_nodes`
-    // returns `Vec<u64>` (session node_ids). The mapping exists
-    // (`MeshNode::peer_entity_ids`) but isn't currently exposed;
-    // wiring it through is a follow-up.
+    /// Pick the candidate with the smallest measured `latency_us`
+    /// per the local `ProximityGraph`. Candidates the proximity
+    /// graph hasn't observed yet (no entity ↔ node_id mapping or
+    /// no pingwave received) sort to the bottom — better to pick
+    /// a known-fast node than gamble on an unknown one.
+    ///
+    /// Falls back deterministically to the first sorted candidate
+    /// when no candidates have proximity data, so a freshly-
+    /// discovered service still routes consistently.
+    LowestLatency,
 }
 
 /// Options for [`MeshNode::call`] and [`MeshNode::call_service`].
@@ -93,9 +97,13 @@ pub struct CallOptions {
     /// (which takes an explicit `target_node_id`). Default:
     /// `RoundRobin`.
     pub routing_policy: RoutingPolicy,
-    // TODO Phase 2: `filter_unhealthy: bool` to skip candidates
-    // the proximity graph marks unavailable. Same identifier-bridge
-    // dependency as the `LowestLatency` policy above.
+    /// Skip candidates whose `ProximityGraph` entry reports
+    /// `!is_available()` (i.e. `Unhealthy` or `Unknown`).
+    /// Default `true`. Candidates with no proximity entry at all
+    /// are KEPT — absence of evidence is not evidence of
+    /// unhealth, and a freshly-announced service shouldn't be
+    /// filtered just because pingwaves haven't propagated yet.
+    pub filter_unhealthy: bool,
     /// Per-call concurrency cap. Future Phase 2 work; v1 ignores
     /// this and the per-Mesh `RpcClientPending` doesn't bound
     /// in-flight count.
@@ -107,6 +115,7 @@ impl Default for CallOptions {
         Self {
             deadline: None,
             routing_policy: RoutingPolicy::default(),
+            filter_unhealthy: true,
             max_in_flight_per_target: 64,
         }
     }
@@ -373,10 +382,43 @@ impl MeshNode {
             });
         }
 
+        // Health filtering. Skip candidates the proximity graph
+        // marks unhealthy (`!is_available()`). Candidates with no
+        // proximity entry at all are KEPT — absence of evidence
+        // is not evidence of unhealth, and a freshly-announced
+        // service shouldn't be filtered just because pingwaves
+        // haven't propagated yet.
+        //
+        // The bridge: each candidate's session-layer `node_id: u64`
+        // is mapped to the entity-layer `[u8; 32]` via
+        // `MeshNode::entity_id_for_node`. The proximity graph is
+        // keyed on the entity id.
+        if opts.filter_unhealthy {
+            let proximity = self.proximity_graph();
+            candidates.retain(|node_id| match self.entity_id_for_node(*node_id) {
+                Some(entity_id) => match proximity.get_node(&entity_id) {
+                    Some(node) => node.is_available(),
+                    None => true, // no proximity data → keep
+                },
+                None => true, // no entity-id mapping → keep
+            });
+            if candidates.is_empty() {
+                return Err(RpcError::NoRoute {
+                    target: 0,
+                    reason: format!(
+                        "every node advertising `nrpc:{service}` is marked \
+                         unhealthy by the local proximity graph",
+                    ),
+                });
+            }
+        }
+
         // Sort once so consistent-hash policies (Sticky) produce
         // a stable ordering across calls regardless of how the
-        // capability index returned the candidates. Cheap — the
-        // candidate set is typically small.
+        // capability index returned the candidates, and so the
+        // LowestLatency-with-no-proximity-data fallback is
+        // deterministic. Cheap — the candidate set is typically
+        // small.
         candidates.sort_unstable();
 
         let target = self.select_target(&candidates, &opts.routing_policy);
@@ -410,6 +452,35 @@ impl MeshNode {
                 // (server failover) reshuffles roughly 1/N of keys.
                 let h = xxhash_rust::xxh3::xxh3_64(&key.to_le_bytes());
                 candidates[(h as usize) % candidates.len()]
+            }
+            RoutingPolicy::LowestLatency => {
+                // Walk candidates, look up each via the bridge
+                // → proximity graph, pick the smallest
+                // `latency_us`. Candidates without a proximity
+                // entry (no observed pingwave or no entity-id
+                // mapping yet) are treated as `u64::MAX` so they
+                // sort to the bottom — a known-fast node beats an
+                // unknown one.
+                //
+                // Determinism on tie / no-data: `best_node` starts
+                // at `candidates[0]` (the lexicographically first
+                // sorted candidate), so all-ties or all-unknown
+                // collapse to that consistent fallback.
+                let proximity = self.proximity_graph();
+                let mut best_node = candidates[0];
+                let mut best_latency = u64::MAX;
+                for &node_id in candidates {
+                    let lat = self
+                        .entity_id_for_node(node_id)
+                        .and_then(|eid| proximity.get_node(&eid))
+                        .map(|n| n.latency_us)
+                        .unwrap_or(u64::MAX);
+                    if lat < best_latency {
+                        best_latency = lat;
+                        best_node = node_id;
+                    }
+                }
+                best_node
             }
         }
     }

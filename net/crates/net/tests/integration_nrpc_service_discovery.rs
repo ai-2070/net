@@ -329,6 +329,152 @@ async fn random_routing_distributes_across_servers() {
     );
 }
 
+/// `LowestLatency` falls back deterministically when no
+/// candidates have proximity data (the bridge returns `None` for
+/// every candidate). The fallback picks the lexicographically
+/// first sorted node id, so all calls land on the same server
+/// even though we asked for "lowest latency."
+#[tokio::test]
+async fn lowest_latency_falls_back_to_first_when_no_proximity_data() {
+    let server_a = build_node().await;
+    let server_b = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server_a).await;
+    handshake_pair(&caller, &server_b).await;
+
+    let count_a = Arc::new(AtomicUsize::new(0));
+    let count_b = Arc::new(AtomicUsize::new(0));
+    let _serve_a = server_a
+        .serve_rpc(
+            "echo",
+            Arc::new(CountingEcho {
+                count: count_a.clone(),
+            }),
+        )
+        .unwrap();
+    let _serve_b = server_b
+        .serve_rpc(
+            "echo",
+            Arc::new(CountingEcho {
+                count: count_b.clone(),
+            }),
+        )
+        .unwrap();
+    server_a
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .unwrap();
+    server_b
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .unwrap();
+    assert!(
+        wait_until(
+            || caller.find_service_nodes("echo").len() == 2,
+            Duration::from_secs(5),
+        )
+        .await,
+    );
+
+    // 20 calls under LowestLatency. Without proximity data
+    // populated by pingwave broadcast (which the test config
+    // doesn't enable), every candidate looks like u64::MAX
+    // latency, so the fallback picks `candidates[0]` (the
+    // lexicographically smallest sorted node id) deterministically.
+    let opts = CallOptions {
+        routing_policy: RoutingPolicy::LowestLatency,
+        ..Default::default()
+    };
+    for _ in 0..20 {
+        caller
+            .call_service("echo", Bytes::from_static(b"x"), opts.clone())
+            .await
+            .expect("call_service");
+    }
+    let a = count_a.load(Ordering::Relaxed);
+    let b = count_b.load(Ordering::Relaxed);
+    assert_eq!(a + b, 20, "every call must land on exactly one server");
+    assert!(
+        (a == 20 && b == 0) || (a == 0 && b == 20),
+        "LowestLatency with no proximity data must pin all calls to one \
+         deterministic fallback target; got A={a}, B={b}",
+    );
+}
+
+/// `filter_unhealthy=true` (the default) does NOT incorrectly
+/// remove candidates that have no proximity-graph entry. Pin the
+/// "absence of evidence is not evidence of unhealth" semantic so
+/// freshly-discovered servers don't get falsely filtered just
+/// because pingwaves haven't propagated yet.
+#[tokio::test]
+async fn filter_unhealthy_keeps_candidates_with_no_proximity_data() {
+    let server_a = build_node().await;
+    let server_b = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server_a).await;
+    handshake_pair(&caller, &server_b).await;
+
+    let count_a = Arc::new(AtomicUsize::new(0));
+    let count_b = Arc::new(AtomicUsize::new(0));
+    let _serve_a = server_a
+        .serve_rpc(
+            "echo",
+            Arc::new(CountingEcho {
+                count: count_a.clone(),
+            }),
+        )
+        .unwrap();
+    let _serve_b = server_b
+        .serve_rpc(
+            "echo",
+            Arc::new(CountingEcho {
+                count: count_b.clone(),
+            }),
+        )
+        .unwrap();
+    server_a
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .unwrap();
+    server_b
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .unwrap();
+    assert!(
+        wait_until(
+            || caller.find_service_nodes("echo").len() == 2,
+            Duration::from_secs(5),
+        )
+        .await,
+    );
+
+    // 20 calls with filter_unhealthy=true (the default). The
+    // proximity graph hasn't observed either server (no pingwave
+    // exchange in this test config), so the bridge returns None
+    // for both. The "keep on None" semantic means BOTH stay in
+    // the candidate set; round-robin then distributes across them.
+    let opts = CallOptions {
+        // Default is filter_unhealthy=true; spell it out for the
+        // doc-as-test value.
+        filter_unhealthy: true,
+        ..Default::default()
+    };
+    for _ in 0..20 {
+        caller
+            .call_service("echo", Bytes::from_static(b"x"), opts.clone())
+            .await
+            .expect("call_service");
+    }
+    let a = count_a.load(Ordering::Relaxed);
+    let b = count_b.load(Ordering::Relaxed);
+    assert_eq!(a + b, 20);
+    assert!(
+        a > 0 && b > 0,
+        "filter_unhealthy must NOT exclude candidates with no proximity \
+         data; both servers should be visited. got A={a}, B={b}",
+    );
+}
+
 /// `call_service` returns `RpcError::NoRoute` when no server has
 /// announced the requested service.
 #[tokio::test]

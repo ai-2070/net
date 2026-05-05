@@ -31,9 +31,14 @@ What's landed in-tree (post-Phase-1 prerequisites):
   - `RoundRobin` — naive `call_id % len`. Even distribution.
   - `Random` — xxh3 of `call_id`, modulo. Stateless, even.
   - `Sticky { key: u64 }` — xxh3 of key, modulo a sorted candidate list. Same key → same target while the candidate set is stable. Useful for session affinity / shard routing / conversation pinning.
-  - **Deferred** to a follow-up: `LowestLatency` and a `filter_unhealthy: bool` option. Both depend on a `EntityId ↔ node_id` bridge — `ProximityGraph` is keyed on `EntityId` ([u8; 32]) while `find_service_nodes` returns `Vec<u64>` (session node ids). The mapping exists (`MeshNode::peer_entity_ids`) but isn't currently exposed; wiring it through is a small follow-up.
+  - `LowestLatency` — picks the candidate with smallest `latency_us` per the local `ProximityGraph`. Candidates with no proximity entry fall to `u64::MAX` and lose; if every candidate lacks proximity data, falls back deterministically to the lexicographically-first sorted node id (so a freshly-discovered service still routes consistently).
+- ✅ **`filter_unhealthy: bool` on `CallOptions`** (default `true`) — skips candidates whose `ProximityGraph` entry reports `!is_available()` (i.e. `Unhealthy` / `Unknown`). Pin: candidates with NO proximity entry are KEPT (absence of evidence ≠ evidence of unhealth), so a freshly-announced server isn't falsely filtered just because pingwaves haven't propagated yet.
+- ✅ **EntityId ↔ node_id bridge** — `MeshNode::entity_id_for_node(u64) -> Option<[u8; 32]>` accessor consults `peer_entity_ids` to map session-layer node ids to entity-layer keys. This is the single piece that was missing; `LowestLatency` and `filter_unhealthy` both flow through it.
+- ✅ **Two new bridge tests** in `tests/integration_nrpc_service_discovery.rs`:
+  - `lowest_latency_falls_back_to_first_when_no_proximity_data` — 20 calls under `LowestLatency` with no pingwaves exchanged. All 20 land on the lexicographically-first sorted candidate (deterministic fallback).
+  - `filter_unhealthy_keeps_candidates_with_no_proximity_data` — 20 calls with `filter_unhealthy=true` against two fresh servers (no proximity data); both servers receive a non-zero share. Pins the "absence of evidence ≠ unhealth" semantic.
 
-Phase 1 + Phase 2 (first chunk + routing policies) are functionally complete. The asymmetric routing pattern (REQUESTs direct-unicast, RESPONSEs roster-based) is what Phase 1 settled on and remains in Phase 2 — the discovery layer just removes the need for the caller to specify `target_node_id` explicitly, and the routing policies let the caller hint at session affinity or even distribution.
+Phase 1 + Phase 2 are functionally complete. The asymmetric routing pattern (REQUESTs direct-unicast, RESPONSEs roster-based) is what Phase 1 settled on and remains in Phase 2 — the discovery layer just removes the need for the caller to specify `target_node_id` explicitly, and the four routing policies + health filter let the caller hint at session affinity, even distribution, latency-driven selection, or unhealthy exclusion.
 
 What's still pending:
 
