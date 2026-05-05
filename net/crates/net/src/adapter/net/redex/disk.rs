@@ -1628,8 +1628,31 @@ fn read_manifest(channel_dir: &Path) -> Option<u32> {
 /// 2. `durable_rename(manifest.tmp → manifest)` — atomic flip.
 /// 3. fsync_dir on `channel_dir` to make the dirent durable.
 ///
-/// On any error, the previous manifest (if any) is preserved
-/// because the rename is the linearizing event.
+/// Failure semantics:
+///
+/// - Any error BEFORE the rename (open/write/fsync of tmp, or
+///   the rename itself) propagates as `Err`. The previous
+///   manifest is preserved — the flip didn't happen.
+/// - An error from `fsync_dir` AFTER a successful rename does
+///   NOT propagate. The rename is the linearizing event; once
+///   it commits, the manifest is visible to every subsequent
+///   read regardless of whether the dirent has been flushed.
+///   Surfacing the fsync error would lie to the caller about
+///   whether the flip happened: `compact_to` would interpret
+///   `Err` as "live state still at cur_gen, no cached-handle
+///   swap" while the on-disk manifest already points at
+///   next_gen — every in-process append between this point
+///   and process exit would land in the now-dead generation
+///   and be discarded by the orphan sweep on next open. We
+///   log loudly, return `Ok(())`, and let the caller proceed
+///   with the cached-handle swap so on-disk and in-memory
+///   stay aligned. The residual durability gap (a power loss
+///   before the next implicit dirent flush could revert the
+///   rename) is recovered by the orphan-generation sweep on
+///   next open: if the manifest reverts to cur_gen, next_gen
+///   still exists and is swept; if the manifest stays at
+///   next_gen, cur_gen is swept. Either way recovery
+///   converges to a single consistent live generation.
 fn write_manifest_atomic(channel_dir: &Path, generation: u32) -> std::io::Result<()> {
     let bytes = encode_manifest(generation);
     let tmp = manifest_tmp_path(channel_dir);
@@ -1644,7 +1667,18 @@ fn write_manifest_atomic(channel_dir: &Path, generation: u32) -> std::io::Result
         f.sync_all()?;
     }
     durable_rename(&tmp, &target)?;
-    fsync_dir(channel_dir)?;
+    if let Err(e) = fsync_dir(channel_dir) {
+        tracing::warn!(
+            error = %e,
+            path = %channel_dir.display(),
+            "redex manifest write: rename committed but fsync_dir failed; \
+             manifest is visible to subsequent reads but dirent is not yet \
+             durable on disk. Treating as success so the caller's cached-\
+             handle swap proceeds (on-disk and in-memory must stay aligned). \
+             Recovery's orphan-generation sweep handles a post-power-loss \
+             revert.",
+        );
+    }
     Ok(())
 }
 
@@ -1868,6 +1902,10 @@ fn resolve_live_generation(channel_dir: &Path) -> std::io::Result<u32> {
 /// best-effort under the current implementation.
 #[cfg(unix)]
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(e) = test_fsync_dir_consume_injected_failure() {
+        return Err(e);
+    }
     std::fs::File::open(dir)?.sync_all()
 }
 
@@ -1881,7 +1919,56 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 /// `cfg`-fork.
 #[cfg(not(unix))]
 fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(e) = test_fsync_dir_consume_injected_failure() {
+        return Err(e);
+    }
     Ok(())
+}
+
+// Test-only fault injection for `fsync_dir`. A countdown stored
+// in thread-local state lets each test arm a failure on the Nth
+// `fsync_dir` call from THIS thread; reaching `0` returns the
+// injected error and disables further injection. Per-thread
+// isolation matters because Rust's test runner parallelizes
+// across threads — a global atomic would race between unrelated
+// tests. Only one `fsync_dir` call per pass is targeted; tests
+// that need a wider window arm the countdown again.
+#[cfg(test)]
+thread_local! {
+    static FSYNC_DIR_FAIL_COUNTDOWN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Arm the next `fsync_dir` call (Nth-from-now) on this thread to
+/// return an injected `io::Error`. `n = 1` fails the very next
+/// call; `n = 2` lets one call through then fails the second; etc.
+/// `n = 0` disables the injector. The countdown is consumed by the
+/// targeted call and not re-armed automatically.
+#[cfg(test)]
+pub(super) fn arm_fsync_dir_failure_at(n: u32) {
+    FSYNC_DIR_FAIL_COUNTDOWN.with(|c| c.set(n));
+}
+
+/// Consume one tick of the test injector. Returns `Some(err)` if
+/// THIS call should fail, `None` otherwise. Decrements the
+/// countdown on every call until it reaches 0.
+#[cfg(test)]
+fn test_fsync_dir_consume_injected_failure() -> Option<std::io::Error> {
+    FSYNC_DIR_FAIL_COUNTDOWN.with(|c| {
+        let cur = c.get();
+        if cur == 0 {
+            return None;
+        }
+        c.set(cur - 1);
+        if cur == 1 {
+            Some(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "test-injected fsync_dir failure",
+            ))
+        } else {
+            None
+        }
+    })
 }
 
 /// Rename `src` over `dst` with per-call durability.
@@ -3806,6 +3893,168 @@ mod tests {
              append path) must use the wording '{new_marker}' to \
              point operators at the real cause; saw {occurrences} \
              occurrences in the source.",
+        );
+    }
+
+    /// `write_manifest_atomic` must NOT propagate a `fsync_dir`
+    /// failure that happens AFTER `durable_rename` succeeded.
+    /// The rename is the linearizing event of the manifest flip;
+    /// once it commits, the manifest is visible to every subsequent
+    /// reader regardless of whether the dirent has been flushed.
+    /// Surfacing the fsync error would lie to the caller about
+    /// whether the flip happened: `compact_to` would interpret
+    /// `Err` as "live state unchanged, no cached-handle swap"
+    /// while the on-disk manifest already names next_gen — every
+    /// in-process append between the failed write_manifest_atomic
+    /// and process exit would land in cur_gen and then be
+    /// discarded by the orphan sweep on next open. This test arms
+    /// the fsync_dir injector to fail on the call AFTER the
+    /// rename and verifies (a) `write_manifest_atomic` returns
+    /// `Ok(())`, (b) the on-disk manifest reflects the new value.
+    #[test]
+    fn write_manifest_atomic_swallows_fsync_dir_failure_after_rename() {
+        let chan = tmpdir();
+        // Establish a baseline manifest at gen 1.
+        super::write_manifest_atomic(&chan, 1)
+            .expect("baseline manifest write must succeed");
+        assert_eq!(super::read_manifest(&chan), Some(1));
+
+        // The next write does: open tmp, write, fsync_all (no
+        // fsync_dir yet), durable_rename, fsync_dir(channel_dir).
+        // We want to fail ONLY the fsync_dir(channel_dir) call —
+        // which is the FIRST fsync_dir call this write_manifest
+        // makes. Arm at n=1.
+        super::arm_fsync_dir_failure_at(1);
+        super::write_manifest_atomic(&chan, 2).expect(
+            "write_manifest_atomic must return Ok when fsync_dir fails \
+             AFTER durable_rename succeeded; surfacing Err would lie \
+             about whether the flip happened",
+        );
+
+        // The injector is consumed; the on-disk manifest reflects
+        // the new generation (the rename committed before the
+        // injected failure).
+        assert_eq!(
+            super::read_manifest(&chan),
+            Some(2),
+            "manifest must reflect the post-rename value even though \
+             the dirent fsync was injected to fail",
+        );
+
+        // Disable injector explicitly (defensive — thread might
+        // be reused by another test).
+        super::arm_fsync_dir_failure_at(0);
+        cleanup(&chan);
+    }
+
+    /// Errors BEFORE the rename (open/write/fsync of `manifest.tmp`)
+    /// MUST still propagate. The injector here fires on the first
+    /// `fsync_dir` call inside `write_manifest_atomic`. To exercise
+    /// the pre-rename failure path we'd need a different injection
+    /// site, but we can pin the propagation contract with a path
+    /// that fails the tmp open: a `channel_dir` that doesn't exist
+    /// makes `OpenOptions::create(true).open(tmp)` fail with
+    /// NotFound, and that error must surface as Err.
+    #[test]
+    fn write_manifest_atomic_propagates_pre_rename_failures() {
+        let nonexistent = tmpdir().join("does_not_exist_subdir");
+        // No `create_dir_all` — the tmp open must fail.
+        let err = super::write_manifest_atomic(&nonexistent, 1)
+            .expect_err("write into a nonexistent dir must fail");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "pre-rename failures (here: tmp open against missing dir) \
+             must surface as Err so the caller knows the flip didn't \
+             happen; got {:?}",
+            err,
+        );
+    }
+
+    /// End-to-end: `compact_to` must succeed when the
+    /// post-rename `fsync_dir` fails. The cached handles MUST be
+    /// swapped to the new generation and `live_gen` MUST advance
+    /// — otherwise in-process appends keep hitting the
+    /// (now-dead) cur_gen and get discarded on the next open's
+    /// orphan sweep. The injector fires on the second
+    /// `fsync_dir` call: compact_to does `fsync_dir(next_dir)`
+    /// first (must succeed for content durability) then
+    /// `fsync_dir(channel_dir)` inside `write_manifest_atomic`
+    /// (the post-rename one we want to fail).
+    #[test]
+    fn compact_to_succeeds_when_post_rename_fsync_dir_fails() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/compact_post_fsync_fail").unwrap();
+        let r = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let payload = b"survives-fsync_dir-failure";
+        let e = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        r.disk.append_entry_at(&e, payload, 5).unwrap();
+        r.disk.sync().unwrap();
+
+        // Arm the injector to fire on the SECOND fsync_dir from
+        // this thread. compact_to's fsync_dir order:
+        //   1. fsync_dir(&next_dir)        — content durability
+        //   2. fsync_dir(channel_dir)      — post-rename dirent
+        // We want #2 to fail; #1 must succeed (failing it would
+        // correctly fail compact, which isn't what we're testing).
+        super::arm_fsync_dir_failure_at(2);
+
+        r.disk.compact_to(&[e], &[5], 0).expect(
+            "compact_to must report success when fsync_dir fails \
+             AFTER the manifest rename succeeded",
+        );
+
+        // The on-disk and in-memory state both advanced.
+        assert_eq!(
+            r.disk.live_gen(),
+            FIRST_GENERATION + 1,
+            "live_gen must advance after a successful compact even \
+             when post-rename fsync_dir failed",
+        );
+        let chan = channel_dir(&base, &name);
+        assert_eq!(
+            super::read_manifest(&chan),
+            Some(FIRST_GENERATION + 1),
+            "on-disk manifest must reflect next_gen — the rename \
+             committed before the injected fsync_dir failure",
+        );
+
+        // Disable injector explicitly.
+        super::arm_fsync_dir_failure_at(0);
+        cleanup(&base);
+    }
+
+    /// Belt-and-braces source-shape guard. `write_manifest_atomic`
+    /// must NOT propagate the post-rename `fsync_dir` via `?`. The
+    /// pre-fix shape (`fsync_dir(channel_dir)?;`) is the bug we
+    /// closed in this commit; if a future refactor accidentally
+    /// re-introduces it, the behavioral test above catches it on
+    /// the next run, but this static check fails immediately at
+    /// build time and points at the exact line.
+    #[test]
+    fn write_manifest_atomic_must_not_propagate_post_rename_fsync_dir() {
+        let src = include_str!("disk.rs");
+        let header = "fn write_manifest_atomic(";
+        let start = src.find(header).expect("write_manifest_atomic must exist");
+        // Find the function body's closing brace to bound the search.
+        let body_after = &src[start..];
+        let next_top_level = body_after
+            .find("\nfn ")
+            .or_else(|| body_after.find("\n#[cfg(test)]"))
+            .expect("a following item must exist");
+        let body = &body_after[..next_top_level];
+
+        assert!(
+            !body.contains("fsync_dir(channel_dir)?;"),
+            "regression: write_manifest_atomic must NOT propagate \
+             fsync_dir(channel_dir) errors via `?` after a successful \
+             durable_rename. The rename is the linearizing event — \
+             once it commits, returning Err lies to the caller about \
+             whether the flip happened, and any in-process appends \
+             between the failed write_manifest_atomic and process \
+             exit would land in the (now-dead) cur_gen. Wrap the \
+             call in `if let Err(e) = ... {{ tracing::warn!(...) }}` \
+             that logs and continues."
         );
     }
 }
