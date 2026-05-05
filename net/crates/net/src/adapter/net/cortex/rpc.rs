@@ -3077,6 +3077,42 @@ mod tests {
         assert_eq!(extracted, tc);
     }
 
+    /// Regression for M21: `extract_trace_context` does
+    /// case-INsensitive matching on the header names, matching W3C
+    /// + HTTP convention. A peer that emits `Traceparent` (capital
+    /// T) or `TRACESTATE` must still be picked up — the previous
+    /// implementation used `name.as_str() == "traceparent"` and
+    /// silently dropped any non-lowercase variant.
+    #[test]
+    fn extract_trace_context_is_case_insensitive_on_header_names() {
+        // Capital-T traceparent + uppercase TRACESTATE — both must
+        // be picked up by the extractor.
+        let headers = vec![
+            (
+                "Traceparent".to_string(),
+                b"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_vec(),
+            ),
+            ("TRACESTATE".to_string(), b"vendor=value".to_vec()),
+        ];
+        let extracted =
+            extract_trace_context(&headers).expect("capital-T traceparent must be recognized");
+        assert_eq!(
+            extracted.traceparent,
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        );
+        assert_eq!(extracted.tracestate, "vendor=value");
+
+        // Mixed-case still works.
+        let headers = vec![
+            ("traceParent".to_string(), b"00-aa-bb-01".to_vec()),
+            ("TraceState".to_string(), b"v=1".to_vec()),
+        ];
+        let extracted =
+            extract_trace_context(&headers).expect("mixed-case traceparent must be recognized");
+        assert_eq!(extracted.traceparent, "00-aa-bb-01");
+        assert_eq!(extracted.tracestate, "v=1");
+    }
+
     /// Empty `tracestate` is omitted on the wire (W3C convention)
     /// but extracted as empty on the receive side.
     #[test]

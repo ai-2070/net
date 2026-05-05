@@ -293,6 +293,94 @@ async fn hedge_loser_handler_observes_cancellation() {
     );
 }
 
+/// Regression for M19: when every hedge fails, the surfaced
+/// error must be the PRIMARY's (`targets[0]`'s), not whichever
+/// hedge happened to lose its race. The previous implementation
+/// used `select_all`'s completion-order "last error wins" which
+/// flipped depending on machine load — flake-prone diagnostics
+/// in production logs.
+///
+/// We tag each server's error with a unique payload
+/// (`primary-error` vs `backup-error`) and assert the surfaced
+/// message contains the primary's tag across multiple runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hedge_all_failing_surfaces_primary_error_deterministically() {
+    use async_trait::async_trait;
+    use net_sdk::mesh_rpc::{RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload};
+    /// Always returns `Internal(message)`. Used to make every
+    /// hedge fail with a tagged diagnostic.
+    struct AlwaysFail {
+        message: &'static str,
+        delay_ms: u64,
+    }
+    #[async_trait]
+    impl RpcHandler for AlwaysFail {
+        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            Err(RpcHandlerError::Internal(self.message.into()))
+        }
+    }
+
+    let psk = [0x42u8; 32];
+    let caller = build_mesh(&psk).await;
+    let primary = build_mesh(&psk).await;
+    let backup = build_mesh(&psk).await;
+    handshake(&caller, &primary).await;
+    handshake(&caller, &backup).await;
+
+    // Primary is SLOWER than the backup so naive last-error-wins
+    // would surface "backup-error" — proves the determinism fix
+    // (we always prefer target_idx 0 when present).
+    let _serve_primary = primary
+        .serve_rpc(
+            "lookup_fail",
+            Arc::new(AlwaysFail {
+                message: "primary-error",
+                delay_ms: 100,
+            }),
+        )
+        .expect("serve_rpc primary");
+    let _serve_backup = backup
+        .serve_rpc(
+            "lookup_fail",
+            Arc::new(AlwaysFail {
+                message: "backup-error",
+                delay_ms: 0,
+            }),
+        )
+        .expect("serve_rpc backup");
+
+    let policy = HedgePolicy {
+        delay: Duration::from_millis(20),
+        hedges: 1,
+    };
+
+    // Run 5 times to make a "completion order accidentally
+    // matches primary order" coincidence fail-stop loud.
+    for run in 0..5u32 {
+        let err = caller
+            .call_with_hedge_to(
+                &[primary.inner().node_id(), backup.inner().node_id()],
+                "lookup_fail",
+                bytes::Bytes::from_static(b""),
+                CallOptions::default(),
+                &policy,
+            )
+            .await
+            .expect_err("both servers always fail");
+        match err {
+            RpcError::ServerError { ref message, .. } => {
+                assert!(
+                    message.contains("primary-error"),
+                    "run {run}: surfaced error must be primary's deterministically; \
+                     got {message:?} (likely a regression to last-completer-wins)",
+                );
+            }
+            other => panic!("run {run}: expected ServerError, got {other:?}"),
+        }
+    }
+}
+
 /// Empty targets → immediate `RpcError::NoRoute`. Pin: no panic,
 /// no hang, error surfaces with a diagnostic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

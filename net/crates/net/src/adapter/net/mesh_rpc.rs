@@ -1358,18 +1358,28 @@ pub enum ServeError {
 // Helpers.
 // ============================================================================
 
-/// Detect the "publish_to_peer found no session for the target
-/// node id" sub-case of [`AdapterError::Connection`]. The
-/// publish path emits a message containing
-/// `"publish: no session for subscriber"` (see
-/// `mesh.rs::publish_to_peer`); when we observe that pattern we
-/// surface it as [`RpcError::NoRoute`] rather than `Transport`,
+/// Detect the "no session to the target node id" sub-case of
+/// [`AdapterError::Connection`]. The publish path can surface
+/// this through one of two messages depending on which inner
+/// helper landed it:
+///
+///   - `"publish: no session for subscriber {hash}"` — emitted
+///     by `mesh.rs::publish_to_peer` when the subscriber-roster
+///     path can't find an active session.
+///   - `"no session to publisher {hash}"` — emitted by the lower
+///     mesh.rs send path when there's no active session to the
+///     target's publisher record at all.
+///
+/// Both mean "I can't reach this peer". When we observe either,
+/// we surface as [`RpcError::NoRoute`] rather than `Transport`
 /// because retrying the same target without a session is
 /// pointless and the right behavior for a routing helper is to
 /// try a different target.
 fn classify_publish_no_session(err: &AdapterError) -> bool {
     match err {
-        AdapterError::Connection(msg) => msg.contains("no session for subscriber"),
+        AdapterError::Connection(msg) => {
+            msg.contains("no session for subscriber") || msg.contains("no session to publisher")
+        }
         _ => false,
     }
 }

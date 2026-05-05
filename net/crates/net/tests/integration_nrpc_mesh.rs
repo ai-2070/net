@@ -276,6 +276,52 @@ async fn rpc_deadline_surfaces_as_timeout_and_emits_cancel() {
     }
 }
 
+/// Regression for M22 — calling an unknown `target_node_id` (no
+/// session established) must surface as `RpcError::NoRoute`, NOT
+/// `RpcError::Transport`. The distinction matters because the
+/// retry helper retries Transport (would burn budget on a target
+/// that's structurally unreachable) and skips NoRoute. The
+/// publish path emits the no-session signal as
+/// `AdapterError::Connection("publish: no session for subscriber
+/// ...")`; `classify_publish_no_session` matches that string and
+/// remaps the surface error to NoRoute. This test pins the
+/// remap so a future change to the publish_to_peer error message
+/// doesn't silently revert callers to retrying dead targets.
+#[tokio::test]
+async fn rpc_unknown_target_surfaces_as_no_route_not_transport() {
+    // Build a single mesh — no peers, no sessions to anyone. Any
+    // call against an arbitrary node_id triggers the no-session
+    // path inside publish_to_peer.
+    let caller = build_node().await;
+    caller.start();
+
+    let unknown_target: u64 = 0xDEAD_BEEF_CAFE_BABE;
+    let err = caller
+        .call(
+            unknown_target,
+            "any_service",
+            Bytes::from_static(b""),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("call to unknown target must fail");
+
+    match err {
+        RpcError::NoRoute { target, ref reason } => {
+            assert_eq!(target, unknown_target, "NoRoute must carry the target id");
+            assert!(
+                reason.contains("no session"),
+                "NoRoute reason must surface the underlying \
+                 publish-no-session diagnostic, got: {reason:?}",
+            );
+        }
+        other => panic!(
+            "expected RpcError::NoRoute (so retry helpers skip the call); \
+             got {other:?} which would be retried as Transport"
+        ),
+    }
+}
+
 /// Regression for H16 — Phase 1 coverage gap. The previous
 /// `rpc_deadline_surfaces_as_timeout_and_emits_cancel` test only
 /// checked the caller's view (Timeout returned). It did NOT
