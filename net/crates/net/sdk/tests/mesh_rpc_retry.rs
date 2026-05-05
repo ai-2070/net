@@ -277,7 +277,9 @@ async fn codec_decode_failure_is_not_retried() {
     // `PingResponse`. Each call increments the handler counter so
     // we can assert the retry layer issued exactly one wire call.
     use async_trait::async_trait;
-    use net_sdk::mesh_rpc::{RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus};
+    use net_sdk::mesh_rpc::{
+        RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    };
     struct ReturnsBadShape {
         calls: Arc<AtomicUsize>,
     }

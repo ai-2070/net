@@ -215,12 +215,10 @@ impl Mesh {
         let reply = self
             .call_with_retry(target_node_id, service, body, opts.raw, policy)
             .await?;
-        codec
-            .decode(&reply.body)
-            .map_err(|e| RpcError::Codec {
-                direction: CodecDirection::Decode,
-                message: format!("client decode: {e}"),
-            })
+        codec.decode(&reply.body).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Decode,
+            message: format!("client decode: {e}"),
+        })
     }
 
     /// Service-name typed call with retry. Same caveat as
@@ -246,12 +244,10 @@ impl Mesh {
         let reply = self
             .call_service_with_retry(service, body, opts.raw, policy)
             .await?;
-        codec
-            .decode(&reply.body)
-            .map_err(|e| RpcError::Codec {
-                direction: CodecDirection::Decode,
-                message: format!("client decode: {e}"),
-            })
+        codec.decode(&reply.body).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Decode,
+            message: format!("client decode: {e}"),
+        })
     }
 }
 
@@ -434,12 +430,10 @@ impl Mesh {
         let reply = self
             .call_with_hedge_to(targets, service, Bytes::from(body), opts.raw, policy)
             .await?;
-        codec
-            .decode(&reply.body)
-            .map_err(|e| RpcError::Codec {
-                direction: CodecDirection::Decode,
-                message: format!("client decode: {e}"),
-            })
+        codec.decode(&reply.body).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Decode,
+            message: format!("client decode: {e}"),
+        })
     }
 
     /// Typed counterpart of [`Self::call_service_with_hedge`].
@@ -462,12 +456,10 @@ impl Mesh {
         let reply = self
             .call_service_with_hedge(service, Bytes::from(body), opts.raw, policy)
             .await?;
-        codec
-            .decode(&reply.body)
-            .map_err(|e| RpcError::Codec {
-                direction: CodecDirection::Decode,
-                message: format!("client decode: {e}"),
-            })
+        codec.decode(&reply.body).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Decode,
+            message: format!("client decode: {e}"),
+        })
     }
 
     fn resolve_hedge_candidates(&self, service: &str) -> std::result::Result<Vec<u64>, RpcError> {
@@ -512,10 +504,7 @@ async fn hedge_race(
     // The first fires immediately; subsequent ones wait
     // `delay * idx`.
     let mut futures: Vec<
-        futures::future::BoxFuture<
-            'static,
-            (usize, std::result::Result<RpcReply, RpcError>),
-        >,
+        futures::future::BoxFuture<'static, (usize, std::result::Result<RpcReply, RpcError>)>,
     > = targets
         .iter()
         .copied()

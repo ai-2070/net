@@ -243,9 +243,7 @@ impl RpcMetricsRegistry {
         // (The overflow bucket itself counts as one slot and is
         // created lazily on first overflow — net: at most cap+1
         // entries.)
-        if self.services.len() >= MAX_TRACKED_SERVICES
-            && !self.services.contains_key(service)
-        {
+        if self.services.len() >= MAX_TRACKED_SERVICES && !self.services.contains_key(service) {
             return self
                 .services
                 .entry(OVERFLOW_SERVICE_LABEL.to_string())

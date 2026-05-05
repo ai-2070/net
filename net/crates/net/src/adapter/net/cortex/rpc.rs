@@ -2898,7 +2898,8 @@ mod tests {
             body: vec![],
         };
         // First REQUEST — handler spawns and parks in sleep.
-        fold.apply(&rpc_request_event(1, 99, req.clone()), &mut ()).unwrap();
+        fold.apply(&rpc_request_event(1, 99, req.clone()), &mut ())
+            .unwrap();
         assert!(
             wait_until(
                 || fold.in_flight_keys().contains(&(1, 99)),
@@ -3470,7 +3471,8 @@ mod tests {
             headers: vec![],
             body: vec![],
         };
-        fold.apply(&rpc_request_event(11, 22, req), &mut ()).unwrap();
+        fold.apply(&rpc_request_event(11, 22, req), &mut ())
+            .unwrap();
         // 5 continue chunks + 1 terminal end frame.
         assert!(
             wait_until(|| captured.lock().len() == 6, Duration::from_secs(2)).await,
