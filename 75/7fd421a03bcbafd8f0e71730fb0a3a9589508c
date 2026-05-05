@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/channel/membership.rs
+  cdf934b360f502d7 53-64,108-113,122,136-143,242-278,281,288,362,378,403,601,604-607,610-619,621-625,629-747
+net/crates/net/src/adapter/net/mesh.rs
+  cdf934b360f502d7 3991-3993,3999,4013-4064,4068-4069,4075,4085,4107,4172,4180-4185,4189-4197,5232-5248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "757fd421a03bcbafd8f0e71730fb0a3a9589508c",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 912,
+      "total_deletions": 17,
+      "accepted_lines": 304,
+      "overriden_lines": 0
+    }
+  }
+}
