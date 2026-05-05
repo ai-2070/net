@@ -95,7 +95,14 @@ async fn main() -> net_sdk::error::Result<()> {
     // closure takes a typed Req and returns Result<Resp, String>;
     // the SDK auto serde via the JSON codec.
     // ──────────────────────────────────────────────────────────────
-    let _serve_echo = server
+    // IMPORTANT: bind the ServeHandle to a leading-underscore name
+    // (`_echo_handle`) — NOT a bare `_` — because `let _ = ...`
+    // drops the handle IMMEDIATELY after the expression, which
+    // unregisters the dispatcher and stops the bridge task before
+    // any caller can hit the service. Leading-underscore-named
+    // bindings live until the end of the enclosing scope (here,
+    // until `main` returns), so the service stays serving.
+    let _echo_handle = server
         .serve_rpc_typed("echo", Codec::Json, |req: EchoRequest| async move {
             Ok(EchoResponse {
                 echoed: req.message,
@@ -104,7 +111,7 @@ async fn main() -> net_sdk::error::Result<()> {
         })
         .map_err(|e| net_sdk::error::SdkError::Config(format!("serve echo: {e}")))?;
 
-    let _serve_add = server
+    let _add_handle = server
         .serve_rpc_typed("add", Codec::Json, |req: AddRequest| async move {
             if req.a < 0 || req.b < 0 {
                 Err(format!(

@@ -298,6 +298,30 @@ pub enum RpcCodecError {
 }
 
 impl RpcRequestPayload {
+    /// Compute the encoded byte length WITHOUT actually encoding.
+    /// Used by [`request_wire_size`] and any caller that needs to
+    /// budget event size at the bus layer (e.g., to refuse a
+    /// request that wouldn't fit in the configured packet budget)
+    /// without paying the encode cost.
+    pub fn encoded_len(&self) -> usize {
+        // service: u8 length + bytes
+        1 + self.service.len()
+            // deadline_ns: u64
+            + 8
+            // flags: u16
+            + 2
+            // headers: u8 count + per-header (u8 name_len + name + u16 value_len + value)
+            + 1
+            + self
+                .headers
+                .iter()
+                .map(|(n, v)| 1 + n.len() + 2 + v.len())
+                .sum::<usize>()
+            // body: u32 length + bytes
+            + 4
+            + self.body.len()
+    }
+
     /// Encode to the wire format. The result is the bytes that
     /// follow the 24-byte `EventMeta` prefix in the RedEX payload.
     ///
@@ -409,6 +433,23 @@ impl RpcRequestPayload {
 }
 
 impl RpcResponsePayload {
+    /// Compute the encoded byte length WITHOUT actually encoding.
+    /// See [`RpcRequestPayload::encoded_len`].
+    pub fn encoded_len(&self) -> usize {
+        // status: u16
+        2
+            // headers: u8 count + per-header
+            + 1
+            + self
+                .headers
+                .iter()
+                .map(|(n, v)| 1 + n.len() + 2 + v.len())
+                .sum::<usize>()
+            // body: u32 length + bytes
+            + 4
+            + self.body.len()
+    }
+
     /// Encode to the wire format. The result is the bytes that
     /// follow the 24-byte `EventMeta` prefix in the RedEX payload.
     /// Same encoder-bounds policy as
@@ -616,13 +657,13 @@ fn decode_headers(
 /// Exposed so callers can budget the total event size at the bus
 /// layer without doing the encode first.
 pub fn request_wire_size(payload: &RpcRequestPayload) -> usize {
-    EVENT_META_SIZE + payload.encode().len()
+    EVENT_META_SIZE + payload.encoded_len()
 }
 
 /// Same for `RpcResponsePayload` after the `EventMeta` prefix in a
 /// `DISPATCH_RPC_RESPONSE` event.
 pub fn response_wire_size(payload: &RpcResponsePayload) -> usize {
-    EVENT_META_SIZE + payload.encode().len()
+    EVENT_META_SIZE + payload.encoded_len()
 }
 
 // ============================================================================
@@ -2194,6 +2235,48 @@ mod tests {
             body: vec![],
         };
         let _ = p.encode();
+    }
+
+    /// `encoded_len()` must agree with `encode().len()` for every
+    /// payload shape — pin this so a future codec change can't
+    /// silently desynchronize the size-budgeting helper from the
+    /// actual wire size.
+    #[test]
+    fn encoded_len_matches_encode_len_for_request_and_response() {
+        let req = RpcRequestPayload {
+            service: "echo.v1".to_string(),
+            deadline_ns: 1_700_000_000_000_000_000,
+            flags: FLAG_RPC_PROPAGATE_TRACE,
+            headers: vec![
+                header("traceparent", b"00-aabb"),
+                header("idempotency-key", &7u64.to_le_bytes()),
+            ],
+            body: b"{\"hello\":\"world\"}".to_vec(),
+        };
+        assert_eq!(req.encoded_len(), req.encode().len());
+
+        let resp = RpcResponsePayload {
+            status: RpcStatus::Application(0x8001),
+            headers: vec![header("content-type", b"application/json")],
+            body: b"ok".to_vec(),
+        };
+        assert_eq!(resp.encoded_len(), resp.encode().len());
+
+        // Empty edge cases.
+        let empty_req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: vec![],
+        };
+        assert_eq!(empty_req.encoded_len(), empty_req.encode().len());
+        let empty_resp = RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: vec![],
+        };
+        assert_eq!(empty_resp.encoded_len(), empty_resp.encode().len());
     }
 
     /// Bit 0 of `RpcRequestPayload::flags` is reserved (was the
