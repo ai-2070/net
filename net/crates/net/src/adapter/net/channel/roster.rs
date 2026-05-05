@@ -197,23 +197,41 @@ impl ChannelSubscribers {
 
     /// Remove `node_id` from whichever container it sits in.
     /// Returns `true` if the peer was present.
+    ///
+    /// Evicts the queue-group entry when its last member leaves.
+    /// Without eviction, a peer that subscribes/unsubscribes under
+    /// N distinct group names leaves N empty `QueueGroup` shells
+    /// per channel — bounded only by attacker effort. The cost of
+    /// evict-then-readd for a churning legit group is one cursor
+    /// reset (round-robin restarts at the "first" member), which
+    /// is acceptable because round-robin distribution is already
+    /// best-effort.
     fn remove(&self, node_id: u64) -> bool {
         if self.broadcasters.remove(&node_id).is_some() {
             return true;
         }
+        // Find the group that contains the peer, remove the peer,
+        // remember the group name if it just became empty.
+        let mut now_empty: Option<QueueGroupName> = None;
+        let mut found = false;
         for grp in self.queue_groups.iter() {
             if grp.value().members.remove(&node_id).is_some() {
-                // Don't evict the empty queue group entry — if a
-                // membership churn cycle (last member leaves, new
-                // joiner) hits the same name, evict-then-readd
-                // costs an extra cursor reset. Empty groups are
-                // small (a `DashSet` shell + an atomic), so the
-                // memory cost is bounded by the number of distinct
-                // group names ever used on this channel.
-                return true;
+                found = true;
+                if grp.value().members.is_empty() {
+                    now_empty = Some(grp.key().clone());
+                }
+                break;
             }
         }
-        false
+        if let Some(name) = now_empty {
+            // Re-check inside the conditional remove in case a
+            // concurrent `add_with_mode` raced our removal and
+            // re-populated the group between our `is_empty()` and
+            // the eviction below. Only evict if STILL empty.
+            self.queue_groups
+                .remove_if(&name, |_, g| g.members.is_empty());
+        }
+        found
     }
 }
 
@@ -869,6 +887,46 @@ mod tests {
 
         // Removing an absent peer is a no-op.
         assert!(!r.remove(&c, 1));
+    }
+
+    /// Regression: when the last member of a queue group leaves,
+    /// the QueueGroup entry itself is evicted from the
+    /// `queue_groups` map. Without this, a peer that subscribes /
+    /// unsubscribes under N distinct group names leaves N empty
+    /// shells per channel — bounded only by attacker effort. The
+    /// `is_empty` channel-eviction predicate also depends on
+    /// post-removal cleanup so a churning channel doesn't leak
+    /// unbounded empty groups.
+    #[test]
+    fn empty_queue_groups_are_evicted_on_last_member_leaving() {
+        let r = SubscriberRoster::new();
+        let c = ch("svc/req");
+        // Three distinct group names, one subscriber each.
+        r.add_with_mode(c.clone(), 1, qg("group-a"));
+        r.add_with_mode(c.clone(), 2, qg("group-b"));
+        r.add_with_mode(c.clone(), 3, qg("group-c"));
+
+        // Probe the internal map size via a channel-level helper —
+        // we can't borrow the internal DashMap directly, so check
+        // `dispatch_recipients` which iterates `queue_groups`. With
+        // 3 groups, dispatch returns 3 recipients (one per group).
+        assert_eq!(r.dispatch_recipients(&c).len(), 3);
+
+        // Remove all three. After the last removal the channel
+        // entry itself should be evicted.
+        assert!(r.remove(&c, 1));
+        assert!(r.remove(&c, 2));
+        assert!(r.remove(&c, 3));
+        // No queue-group shells left → channel is fully empty →
+        // outer `subs` map evicts the channel entry.
+        assert_eq!(r.channel_count(), 0);
+
+        // Re-add a fresh subscriber with one of the previously-used
+        // group names: succeeds (the prior shell was evicted, so we
+        // start clean) and the channel reappears.
+        assert!(r.add_with_mode(c.clone(), 1, qg("group-a")));
+        assert_eq!(r.channel_count(), 1);
+        assert_eq!(r.dispatch_recipients(&c), vec![1]);
     }
 
     /// `remove_peer` (failure-driven cleanup) clears the peer from

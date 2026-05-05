@@ -169,10 +169,31 @@ pub(super) enum CallOutcome {
     Transport,
 }
 
+/// Hard cap on the number of distinct services tracked per
+/// registry. New services past this cap share a single fall-back
+/// "overflow" counter set so a malicious peer (or a bug emitting
+/// random service names) can't grow the DashMap unboundedly.
+/// 4096 is comfortable for any realistic deployment — typical
+/// node serves O(10) services; large clusters might track O(100)
+/// across all callers/servers.
+pub const MAX_TRACKED_SERVICES: usize = 4096;
+
+/// Sentinel service name used when [`MAX_TRACKED_SERVICES`] is
+/// exceeded. Counters under this name aggregate every overflow
+/// service, so operators can still see "we lost detail past the
+/// cap" without leaking memory.
+pub const OVERFLOW_SERVICE_LABEL: &str = "__overflow__";
+
 /// Per-Mesh registry of `service` → counters. Built once at
 /// `MeshNode::new`; all caller-side hooks consult it via
 /// `MeshNode::rpc_metrics_arc` (a `pub(super)` accessor used by
 /// the `mesh_rpc::Mesh::call` glue).
+///
+/// **Bounded.** New services past [`MAX_TRACKED_SERVICES`] are
+/// folded into a single `__overflow__` counter set, so a peer
+/// that emits a fresh service name per request can't grow the
+/// DashMap without bound. The first-N services keep their own
+/// per-service counters.
 pub struct RpcMetricsRegistry {
     services: DashMap<String, Arc<ServiceMetricsAtomic>>,
 }
@@ -195,6 +216,12 @@ impl RpcMetricsRegistry {
     /// hot path (single DashMap get); falls back to an entry-API
     /// insert on first access for a service.
     ///
+    /// **Bounded:** if the registry is at [`MAX_TRACKED_SERVICES`]
+    /// and `service` isn't already known, returns the shared
+    /// `__overflow__` counter set instead of inserting a new
+    /// entry. This prevents unbounded growth from a peer emitting
+    /// distinct service names per request.
+    ///
     /// `pub(crate)` so the cortex-side server folds (in
     /// `adapter/net/cortex/rpc.rs`) can grab a per-service
     /// counter handle at construction time and bump it from the
@@ -202,6 +229,20 @@ impl RpcMetricsRegistry {
     pub(crate) fn for_service(&self, service: &str) -> Arc<ServiceMetricsAtomic> {
         if let Some(m) = self.services.get(service) {
             return m.clone();
+        }
+        // Cap check BEFORE the entry-API insert: if we're at the
+        // limit, fold this call into the overflow bucket.
+        // (The overflow bucket itself counts as one slot and is
+        // created lazily on first overflow — net: at most cap+1
+        // entries.)
+        if self.services.len() >= MAX_TRACKED_SERVICES
+            && !self.services.contains_key(service)
+        {
+            return self
+                .services
+                .entry(OVERFLOW_SERVICE_LABEL.to_string())
+                .or_insert_with(|| Arc::new(ServiceMetricsAtomic::new()))
+                .clone();
         }
         self.services
             .entry(service.to_string())
@@ -703,6 +744,44 @@ mod tests {
         // malformed line terminator.
         assert_eq!(escape_label("line1\nline2"), "line1\\nline2");
         assert_eq!(escape_label("dos\r\nstyle"), "dos\\r\\nstyle");
+    }
+
+    /// Regression: the registry caps service-name growth at
+    /// `MAX_TRACKED_SERVICES`. Past the cap, additional services
+    /// share the `__overflow__` counter set so a peer that emits
+    /// a fresh service name per request can't grow the DashMap
+    /// without bound.
+    #[test]
+    fn registry_caps_service_count_at_max_tracked_services() {
+        let reg = RpcMetricsRegistry::new();
+        // Fill up to the cap.
+        for i in 0..MAX_TRACKED_SERVICES {
+            let _ = reg.for_service(&format!("svc-{i}"));
+        }
+        assert_eq!(reg.services.len(), MAX_TRACKED_SERVICES);
+        // Adding more services routes them to the overflow bucket.
+        // The overflow entry itself counts as one new slot, but
+        // every subsequent overflow request reuses it.
+        let m1 = reg.for_service("overflow-1");
+        let m2 = reg.for_service("overflow-2");
+        let m3 = reg.for_service("overflow-3");
+        assert!(
+            Arc::ptr_eq(&m1, &m2) && Arc::ptr_eq(&m2, &m3),
+            "overflow services must share the __overflow__ counter set",
+        );
+        // Cap+1 (the original cap entries plus the overflow slot)
+        // is the maximum the registry ever reaches.
+        assert_eq!(
+            reg.services.len(),
+            MAX_TRACKED_SERVICES + 1,
+            "registry size must never exceed MAX_TRACKED_SERVICES + 1",
+        );
+        // An already-known service still returns its own counter set.
+        let known = reg.for_service("svc-0");
+        assert!(
+            !Arc::ptr_eq(&known, &m1),
+            "known services keep their dedicated counters",
+        );
     }
 
     /// Regression: the in_flight gauge can momentarily read
