@@ -4093,6 +4093,16 @@ impl MeshNode {
             .map(|(_, v)| v)
     }
 
+    /// Cheap probe: is a dispatcher already registered for this
+    /// channel hash? Used by the caller-side
+    /// `ensure_reply_subscription` to skip a redundant registration
+    /// when multiple targets serve the same service (they share
+    /// one reply channel + one dispatcher per caller).
+    #[cfg(feature = "cortex")]
+    pub fn rpc_inbound_dispatcher_registered(&self, channel_hash: u16) -> bool {
+        self.rpc_inbound_dispatchers.contains_key(&channel_hash)
+    }
+
     /// Per-Mesh shared `RpcClientPending` — accessor for the
     /// `mesh_rpc::Mesh::call` glue. Pending oneshots awaiting
     /// RESPONSE events live here.

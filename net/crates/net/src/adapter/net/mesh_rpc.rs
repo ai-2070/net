@@ -1214,13 +1214,19 @@ impl MeshNode {
     /// existing one (eviction could rip out a healthy in-flight
     /// reply path).
     ///
-    /// **Refuses on dispatcher hash collision**: two distinct
-    /// reply-channel names whose 16-bit hashes collide can't both
-    /// register a dispatcher — we'd silently overwrite the prior
-    /// one and orphan its pending oneshots. Refuse the new
-    /// (target, service) with `NoRoute` instead so the caller
-    /// gets a clear "this target is unreachable from this Mesh"
-    /// signal.
+    /// **Dispatcher reuse**: the reply-channel name embeds the
+    /// CALLER's `self_origin`, NOT the target's, so a single
+    /// caller talking to multiple servers for the same service
+    /// reuses the same reply channel (same hash). We register the
+    /// dispatcher only if the slot is unoccupied; subsequent
+    /// (target, service) pairs that hash to the same slot are
+    /// allowed to share the existing dispatcher (which routes to
+    /// the same per-Mesh `pending` map regardless of target). A
+    /// genuine cross-service hash collision is detected at
+    /// `serve_rpc` time (the AlreadyServing path) for the server
+    /// side; on the caller side here, sharing the dispatcher is
+    /// the correct behavior because all RESPONSE events route
+    /// through the same `RpcClientPending` keyed by `call_id`.
     async fn ensure_reply_subscription(
         self: &Arc<Self>,
         target_node_id: u64,
@@ -1263,47 +1269,37 @@ impl MeshNode {
                 reason: e.to_string(),
             })?;
 
-        // Register the inbound dispatcher: feed RESPONSE events
-        // to the per-Mesh `RpcClientFold`. We construct a fresh
-        // fold here per (target, service) registration — the fold
-        // itself is stateless apart from the shared `pending`
-        // map. (Future: lift the fold to a single per-Mesh
-        // instance shared across all reply channels; for now the
-        // per-channel fold is fine because the inbound dispatcher
-        // map is keyed on channel_hash.)
-        let pending = self.rpc_client_pending();
-        let fold = Arc::new(Mutex::new(RpcClientFold::new(pending)));
-        let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
-            let entry = RedexEntry::new_heap(0, 0, ev.payload.len() as u32, 0, 0);
-            let redex_event = RedexEvent {
-                entry,
-                payload: ev.payload,
-            };
-            if let Err(e) = fold.lock().apply(&redex_event, &mut ()) {
-                tracing::warn!(error = %e, "rpc client fold: apply error");
-            }
-        });
-        // Refuse on hash collision instead of silently overwriting
-        // — the prior dispatcher's pending oneshots would be
-        // orphaned and never resolve. Restore the prior
-        // registration and surface the new (target, service) as
-        // NoRoute so the caller knows it can't reach this target
-        // through this Mesh until the conflicting registration is
-        // released.
-        if let Some(prev) = self.register_rpc_inbound(reply_hash, dispatcher) {
-            // Roll back: re-install the prior dispatcher. The new
-            // one we just installed is dropped here.
-            let _ = self.register_rpc_inbound(reply_hash, prev);
-            return Err(RpcError::NoRoute {
-                target: target_node_id,
-                reason: format!(
-                    "reply-channel hash collision at {:#06x}: another (target, service) \
-                     pair already owns this dispatcher slot. Phase-2 dispatch keys will \
-                     widen the slot to avoid this; for now the new (target={target_node_id:#x}, \
-                     service={service:?}) is refused.",
-                    reply_hash,
-                ),
+        // Register the inbound dispatcher only if the slot is
+        // unoccupied. The reply-channel name embeds *self_origin*,
+        // not the target, so multiple targets serving the same
+        // service share one reply channel + one dispatcher. The
+        // existing dispatcher routes to the same per-Mesh
+        // `RpcClientPending` keyed by call_id, so reuse is safe.
+        if !self.rpc_inbound_dispatcher_registered(reply_hash) {
+            let pending = self.rpc_client_pending();
+            let fold = Arc::new(Mutex::new(RpcClientFold::new(pending)));
+            let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
+                let entry = RedexEntry::new_heap(0, 0, ev.payload.len() as u32, 0, 0);
+                let redex_event = RedexEvent {
+                    entry,
+                    payload: ev.payload,
+                };
+                if let Err(e) = fold.lock().apply(&redex_event, &mut ()) {
+                    tracing::warn!(error = %e, "rpc client fold: apply error");
+                }
             });
+            // Race-safe: a concurrent caller might have just
+            // registered between our check and our insert. In that
+            // case `register_rpc_inbound` returns the prior
+            // dispatcher; our new fresh fold is dropped here, and
+            // the prior dispatcher (which routes to the same
+            // shared `pending`) keeps doing the job. No collision
+            // — both folds are functionally equivalent.
+            if let Some(prev) = self.register_rpc_inbound(reply_hash, dispatcher) {
+                // Roll back: keep the prior dispatcher (it's
+                // already wired to the same shared pending map).
+                let _ = self.register_rpc_inbound(reply_hash, prev);
+            }
         }
 
         let _ = reply_hash; // captured into the dispatcher above; surfaced for debug
