@@ -1452,12 +1452,26 @@ impl DiskSegment {
         }
 
         // Manifest flipped. From this point recovery would land on
-        // `next_gen` — atomically swap the cached handles to match,
-        // and update `live_gen` so the rollback paths follow.
-        // `live_gen` is updated AFTER the cached handles are in
-        // place so a rollback running concurrently (it would block
-        // on the file locks we hold, but defense in depth)
-        // observes a consistent (cached_handle, live_gen) pair.
+        // `next_gen` — atomically swap the cached handles to match
+        // (so the next append goes to next_gen via the cached
+        // handles rather than cur_gen), then update `live_gen` so
+        // the rollback paths construct paths under next_gen.
+        //
+        // Ordering note: the cached-handle slots are written
+        // BEFORE the `live_gen.store(Release)`. The handle slots
+        // and `live_gen` are read by disjoint code paths — the
+        // append path reads only the cached handles, and the
+        // rollback path reads only `live_gen` (it re-opens by
+        // path via `live_gen_path()` rather than using the cached
+        // handle). So neither path observes the pair; they each
+        // observe their one half. The ordering still matters as
+        // a defensive invariant: anyone who later writes code
+        // that reads BOTH expects to see (handles, live_gen)
+        // consistent, and the rule "swap handles, then publish
+        // live_gen" is the simple one to follow. There is no
+        // need for the swap and store to happen under the same
+        // lock — the file locks we hold across this block already
+        // exclude every concurrent reader of the cached handles.
         *idx_guard = new_idx;
         *dat_guard = new_dat;
         *ts_guard = new_ts;
