@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/channel/membership.rs
+  cfca4517ad394ef2 136-163,690-727
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "69b56d6a50d9af3754790d9df288c068c0080f11",
+  "prompts": {
+    "cfca4517ad394ef2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c8c8999-2a05-4bfc-a843-35946dde9df4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 874,
+      "total_deletions": 8,
+      "accepted_lines": 66,
+      "overriden_lines": 0
+    }
+  }
+}
