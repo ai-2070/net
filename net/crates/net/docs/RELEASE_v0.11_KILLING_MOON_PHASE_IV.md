@@ -2,10 +2,6 @@
 
 v0.11 closes the audit work that v0.10 left open. Same shape: a hardening release with no new transports, no new SDK surfaces, no new feature gates. Every commit on this branch is a bug fix, a regression test, a triage decision, or a wire-format bump that closes a structural gap the previous release flagged but couldn't ship inside its envelope.
 
-The work is sourced from two queues that v0.10 explicitly deferred: the 22 unfixed items from `BUG_AUDIT_2026_05_03.md` (1 critical, 7 high, 13 medium-or-lower; the audit's "5" lumps the FFI handle-lifetime cluster as one) and the 9-item single-file deep read of `adapter/net/mesh.rs`. Both are now drained: every High closed, every Medium either closed or triaged with a written reason, every Low resolved.
-
-Two of the closures required a wire-format bump that v0.10 deliberately avoided. They land here together because amortizing them across one upgrade cycle costs operators less than two: the `IdentityEnvelope` gains a leading version byte, and the application-layer `origin_hash` is widened from 32 to 64 bits. v0.10 ↔ v0.11 nodes do not interop on the wire — see *Breaking changes* and *How to upgrade*.
-
 ---
 
 ## Addressed in this release
@@ -103,12 +99,6 @@ The 9 items the v0.10 release note flagged "queued for the next release" all lan
 One audit item resolved as "no code change needed, but the rationale must live in code so a future contributor doesn't re-open the question":
 
 - **`apply_authoritative_grant` clamp ordering** — the audit recommended reordering the `tx_bytes_sent` bump and the `tx_credit_remaining` decrement. The current form uses a CAS-with-delta against `max_consumed_seen` and adds the delta to `tx_credit_remaining` via `fetch_update`; this composes atomically with the CAS in `try_acquire_tx_credit` and the `fetch_update` in `refund_tx_credit`. The audit's reorder presumed a `.store()`-based recompute from a racy snapshot of `tx_bytes_sent` — a shape the current code deliberately avoids. The rationale is documented in code at `adapter/net/session.rs::apply_authoritative_grant` and the codec-side abstract at `adapter/net/subprotocol/stream_window.rs::StreamWindow`.
-
----
-
-## Known issues — queued for the next release
-
-Both audit queues (`BUG_AUDIT_2026_05_03.md` and `BUG_AUDIT_2026_05_03_MESH.md`) are drained. The next release will pick up structural feature work (`MigrationOrchestrator` placement-policy, persistent JetStream sequence numbering for cross-restart msg-id durability) rather than another bug-fix sweep.
 
 ---
 
@@ -212,7 +202,3 @@ These aren't strictly API-breaking but tests that asserted the pre-fix behavior 
 ---
 
 Released 2026-05-05.
-
-## License
-
-See [LICENSE](../../LICENSE).
