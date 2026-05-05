@@ -10,6 +10,11 @@
 //!   a backup request after a delay; race the responses; first
 //!   one wins. Bounds tail latency at the cost of duplicated
 //!   work on the loser.
+//! - **[`CircuitBreaker`]** — a long-lived stateful guard that
+//!   trips after N consecutive failures, short-circuits while
+//!   open, and probes for recovery via a half-open state.
+//!   Compose around any async call (raw, typed, retried,
+//!   hedged) via `breaker.call(|| async { ... }).await`.
 //!
 //! Each helper composes with the others (and with the underlying
 //! `CallOptions` deadline / routing policy) without special
@@ -574,4 +579,343 @@ fn compute_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
         capped
     };
     Duration::from_secs_f64(final_secs.max(0.0))
+}
+
+// ============================================================================
+// Circuit breaker.
+// ============================================================================
+
+/// Per-call decision: does this `RpcError` count as a failure for
+/// the breaker? Defaults to [`default_breaker_failure`], which
+/// treats the same set of "transient infrastructure" errors as
+/// [`default_retryable`] — `Timeout`, `Transport`, `Internal`,
+/// `Backpressure`, server-observed `Timeout`. Application errors
+/// don't trip the breaker (they're caller-fixable bugs, not server
+/// health signals).
+pub type BreakerFailurePredicate = Arc<dyn Fn(&RpcError) -> bool + Send + Sync>;
+
+/// Configuration for [`CircuitBreaker`].
+#[derive(Clone)]
+pub struct CircuitBreakerConfig {
+    /// Consecutive failures while `Closed` before tripping to
+    /// `Open`. Must be >= 1; values below 1 are treated as 1.
+    /// Default: 5.
+    pub failure_threshold: u32,
+    /// Consecutive `HalfOpen` probe successes before transitioning
+    /// back to `Closed`. Must be >= 1. Default: 1 (one good probe
+    /// is enough).
+    pub success_threshold: u32,
+    /// `Open` cooldown — how long the breaker rejects every call
+    /// before transitioning to `HalfOpen` and allowing one probe.
+    /// Default: 30 seconds.
+    pub reset_after: Duration,
+    /// Predicate deciding which errors count toward the failure
+    /// counter. Default: [`default_breaker_failure`].
+    pub failure_predicate: BreakerFailurePredicate,
+}
+
+impl std::fmt::Debug for CircuitBreakerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CircuitBreakerConfig")
+            .field("failure_threshold", &self.failure_threshold)
+            .field("success_threshold", &self.success_threshold)
+            .field("reset_after", &self.reset_after)
+            .field("failure_predicate", &"<fn>")
+            .finish()
+    }
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            success_threshold: 1,
+            reset_after: Duration::from_secs(30),
+            failure_predicate: Arc::new(default_breaker_failure),
+        }
+    }
+}
+
+/// Default breaker-failure predicate. Returns `true` for the same
+/// "transient infrastructure" errors that [`default_retryable`]
+/// considers retryable — these are the signals that a downstream
+/// is unhealthy. Application errors and routing failures do NOT
+/// trip the breaker.
+pub fn default_breaker_failure(err: &RpcError) -> bool {
+    default_retryable(err)
+}
+
+/// Operational state of a [`CircuitBreaker`]. Exposed via
+/// [`CircuitBreaker::state`] for diagnostics / observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerState {
+    /// Normal operation — calls go through. Failures are counted;
+    /// once `failure_threshold` consecutive failures land,
+    /// transitions to `Open`.
+    Closed,
+    /// Tripped — calls are short-circuited with
+    /// [`BreakerError::Open`]. After `reset_after` elapsed since
+    /// the trip, the next call transitions to `HalfOpen`.
+    Open,
+    /// Probing — at most ONE call may pass through to test
+    /// recovery. Concurrent calls during `HalfOpen` short-circuit
+    /// with [`BreakerError::Open`]. The probe's outcome decides:
+    /// success → consecutive_successes++ (transition to `Closed`
+    /// when threshold met); failure → back to `Open` with
+    /// cooldown reset.
+    HalfOpen,
+}
+
+/// What [`CircuitBreaker::call`] returns on failure: either the
+/// breaker rejected the call (`Open`) or the underlying call
+/// returned an error (`Inner`). Pattern-match to distinguish
+/// "I should fall back" (Open) from "the actual call failed and
+/// I should handle the error" (Inner).
+#[derive(Debug, thiserror::Error)]
+pub enum BreakerError {
+    /// Breaker is currently `Open` (or `HalfOpen` with a probe
+    /// already in flight). The wrapped call did NOT execute.
+    #[error("circuit breaker is open")]
+    Open,
+    /// The wrapped call executed and returned this error. The
+    /// breaker recorded it (per `failure_predicate`) before
+    /// surfacing.
+    #[error("inner: {0}")]
+    Inner(#[from] RpcError),
+}
+
+impl BreakerError {
+    /// Convert to the underlying `RpcError`, mapping the `Open`
+    /// short-circuit to an `RpcError::NoRoute` so callers that
+    /// don't care about the breaker distinction can flatten.
+    pub fn into_rpc_error(self) -> RpcError {
+        match self {
+            BreakerError::Open => RpcError::NoRoute {
+                target: 0,
+                reason: "circuit breaker is open".into(),
+            },
+            BreakerError::Inner(e) => e,
+        }
+    }
+}
+
+/// Three-state circuit breaker: `Closed` → `Open` → `HalfOpen` →
+/// `Closed`. Long-lived; instantiate once per logical downstream
+/// (one per service, or one per (service, target) pair, depending
+/// on how granular you want failure isolation to be) and reuse
+/// across calls.
+///
+/// **Thread-safety**: the breaker is `Send + Sync`; share via
+/// `Arc<CircuitBreaker>` across tasks. State transitions take a
+/// brief blocking lock — never held across `await`.
+///
+/// **Composition**: pass any closure returning a `Future<Output =
+/// Result<T, RpcError>>`. The breaker is generic over `T` so it
+/// works with raw [`RpcReply`], typed `Resp`, `Vec<RpcReply>`
+/// (hedge results), etc.
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use net_sdk::mesh_rpc_resilience::{CircuitBreaker, CircuitBreakerConfig};
+///
+/// let breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default()));
+/// let result = breaker.call(|| async {
+///     mesh.call_typed::<MyReq, MyResp>(target, "svc", &req, opts).await
+/// }).await;
+/// ```
+pub struct CircuitBreaker {
+    config: CircuitBreakerConfig,
+    inner: std::sync::Mutex<BreakerInner>,
+}
+
+struct BreakerInner {
+    state: BreakerState,
+    consecutive_failures: u32,
+    consecutive_successes: u32,
+    /// When `state == Open`, the instant the trip happened;
+    /// transitions to `HalfOpen` after `reset_after` elapsed.
+    /// `None` outside of `Open`.
+    opened_at: Option<std::time::Instant>,
+    /// True while a `HalfOpen` probe is in flight. Other calls
+    /// arriving during HalfOpen short-circuit on this flag.
+    probe_in_flight: bool,
+}
+
+impl CircuitBreaker {
+    /// Construct a breaker in the `Closed` state.
+    pub fn new(config: CircuitBreakerConfig) -> Self {
+        Self {
+            config,
+            inner: std::sync::Mutex::new(BreakerInner {
+                state: BreakerState::Closed,
+                consecutive_failures: 0,
+                consecutive_successes: 0,
+                opened_at: None,
+                probe_in_flight: false,
+            }),
+        }
+    }
+
+    /// Current operational state. Cheap snapshot — useful for
+    /// metrics / logging. Note that `Open` may have actually
+    /// elapsed its cooldown; the next `call` will transition to
+    /// `HalfOpen` on entry.
+    pub fn state(&self) -> BreakerState {
+        self.inner.lock().expect("breaker mutex poisoned").state
+    }
+
+    /// Snapshot of the consecutive-failure counter (resets to 0
+    /// on success or transition out of `Closed`). Useful for
+    /// alerting "we're approaching the trip threshold".
+    pub fn consecutive_failures(&self) -> u32 {
+        self.inner
+            .lock()
+            .expect("breaker mutex poisoned")
+            .consecutive_failures
+    }
+
+    /// Test-only / operator override: force the breaker back to
+    /// `Closed` and zero all counters. Useful for runbooks
+    /// ("we manually verified the downstream is healthy, reset")
+    /// or test setup.
+    pub fn reset(&self) {
+        let mut g = self.inner.lock().expect("breaker mutex poisoned");
+        g.state = BreakerState::Closed;
+        g.consecutive_failures = 0;
+        g.consecutive_successes = 0;
+        g.opened_at = None;
+        g.probe_in_flight = false;
+    }
+
+    /// Wrap an async call. Returns:
+    ///
+    /// - `Ok(T)` if the inner call succeeded (and the breaker
+    ///   recorded the success).
+    /// - `Err(BreakerError::Open)` if the breaker rejected the
+    ///   call without running it (state was `Open` within
+    ///   cooldown, OR `HalfOpen` with a probe in flight).
+    /// - `Err(BreakerError::Inner(e))` if the inner call returned
+    ///   an error (recorded per `failure_predicate`).
+    ///
+    /// Successes always reset `consecutive_failures` to 0 (in
+    /// `Closed`) or increment `consecutive_successes` (in
+    /// `HalfOpen`, transitioning to `Closed` when threshold met).
+    /// Failures matching the predicate increment counters per
+    /// state.
+    pub async fn call<F, Fut, T>(&self, f: F) -> std::result::Result<T, BreakerError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, RpcError>>,
+    {
+        // Admission decision — short, no awaits.
+        let admitted_as = self.try_admit();
+        let admitted_as = match admitted_as {
+            AdmissionOutcome::Closed => Admission::Closed,
+            AdmissionOutcome::HalfOpenProbe => Admission::HalfOpenProbe,
+            AdmissionOutcome::Reject => return Err(BreakerError::Open),
+        };
+
+        // Run the inner call.
+        let outcome = f().await;
+
+        // Outcome bookkeeping — short, no awaits.
+        let mut g = self.inner.lock().expect("breaker mutex poisoned");
+        match (&outcome, admitted_as) {
+            (Ok(_), Admission::Closed) => {
+                g.consecutive_failures = 0;
+            }
+            (Ok(_), Admission::HalfOpenProbe) => {
+                g.probe_in_flight = false;
+                g.consecutive_successes = g.consecutive_successes.saturating_add(1);
+                if g.consecutive_successes >= self.config.success_threshold.max(1) {
+                    g.state = BreakerState::Closed;
+                    g.consecutive_failures = 0;
+                    g.consecutive_successes = 0;
+                    g.opened_at = None;
+                }
+            }
+            (Err(e), admission) => {
+                let counts = (self.config.failure_predicate)(e);
+                if matches!(admission, Admission::HalfOpenProbe) {
+                    g.probe_in_flight = false;
+                }
+                if counts {
+                    match admission {
+                        Admission::Closed => {
+                            g.consecutive_failures =
+                                g.consecutive_failures.saturating_add(1);
+                            if g.consecutive_failures
+                                >= self.config.failure_threshold.max(1)
+                            {
+                                g.state = BreakerState::Open;
+                                g.opened_at = Some(std::time::Instant::now());
+                                g.consecutive_successes = 0;
+                            }
+                        }
+                        Admission::HalfOpenProbe => {
+                            // Single bad probe → re-open with a
+                            // fresh cooldown.
+                            g.state = BreakerState::Open;
+                            g.opened_at = Some(std::time::Instant::now());
+                            g.consecutive_failures = 0;
+                            g.consecutive_successes = 0;
+                        }
+                    }
+                }
+                // If the predicate didn't classify this as a
+                // failure (e.g. application error), leave counters
+                // unchanged — the breaker treats it as a no-op
+                // signal.
+            }
+        }
+        drop(g);
+
+        outcome.map_err(BreakerError::Inner)
+    }
+
+    /// Pure admission decision. Returns one of:
+    /// - `Closed` — call goes through, count successes/failures.
+    /// - `HalfOpenProbe` — this caller becomes the probe.
+    /// - `Reject` — short-circuit with `Open`.
+    fn try_admit(&self) -> AdmissionOutcome {
+        let mut g = self.inner.lock().expect("breaker mutex poisoned");
+        match g.state {
+            BreakerState::Closed => AdmissionOutcome::Closed,
+            BreakerState::Open => {
+                let elapsed = g
+                    .opened_at
+                    .map(|i| i.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                if elapsed >= self.config.reset_after {
+                    g.state = BreakerState::HalfOpen;
+                    g.consecutive_successes = 0;
+                    g.probe_in_flight = true;
+                    AdmissionOutcome::HalfOpenProbe
+                } else {
+                    AdmissionOutcome::Reject
+                }
+            }
+            BreakerState::HalfOpen => {
+                if g.probe_in_flight {
+                    AdmissionOutcome::Reject
+                } else {
+                    g.probe_in_flight = true;
+                    AdmissionOutcome::HalfOpenProbe
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionOutcome {
+    Closed,
+    HalfOpenProbe,
+    Reject,
+}
+
+#[derive(Clone, Copy)]
+enum Admission {
+    Closed,
+    HalfOpenProbe,
 }
