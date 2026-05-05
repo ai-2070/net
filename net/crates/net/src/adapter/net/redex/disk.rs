@@ -80,7 +80,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -112,11 +112,17 @@ pub(super) struct RecoveredSegment {
 /// so a 1-hour retention on a process restarted every 30 minutes
 /// never evicted anything.
 pub(super) struct DiskSegment {
-    /// Full path to the per-channel directory. Used by the
-    /// partial-write rollback paths (which open a fresh write
-    /// handle for `set_len` because the cached append-mode
-    /// handle can't truncate on every platform).
+    /// Full path to the per-channel **root** directory (i.e.
+    /// `<base>/<channel_path>/`). Holds the manifest pointer file
+    /// plus zero-or-more `v<NNN>/` generation directories. The
+    /// actual idx/dat/ts files live one level deeper, under
+    /// `live_gen_dir()`.
     dir: PathBuf,
+    /// Current live generation. Names the `v<NNN>/` directory
+    /// under `dir` that holds the live `{idx, dat, ts}` files.
+    /// Updated by `compact_to` after the manifest flip; read by
+    /// the rollback paths to construct file paths.
+    live_gen: AtomicU32,
     idx_file: Mutex<File>,
     dat_file: Mutex<File>,
     /// Per-entry timestamps (8 bytes each, little-endian unix
@@ -161,16 +167,26 @@ pub(super) struct DiskSegment {
     /// AND a worker is listening (spawned by
     /// `RedexFile::open_persistent`).
     pub(super) fsync_signal: Arc<Notify>,
-    /// Segment poisoning. Set to `true` when `compact_to`'s
-    /// post-rename re-open phase fails after the renames committed
-    /// AND the cached file handles are pointing at temp-dir
-    /// placeholders rather than the channel files. Once poisoned,
-    /// every append / sync / compact path returns
-    /// `RedexError::Io` immediately — preventing acknowledged
-    /// writes from landing in `/tmp` instead of the channel
-    /// directory. Operators recover by closing and re-opening the
-    /// channel (which constructs a fresh `DiskSegment` with valid
-    /// handles).
+    /// Segment poisoning. Set to `true` when one of the
+    /// partial-write rollback paths
+    /// ([`Self::rollback_truncate`],
+    /// [`Self::rollback_after_idx_failure`]) cannot complete the
+    /// truncation that would restore the file to its pre-failure
+    /// length — at that point the on-disk state has diverged from
+    /// in-memory and a subsequent append would compound the
+    /// corruption rather than land cleanly. Once poisoned, every
+    /// append / sync / compact path returns `RedexError::Io`
+    /// immediately. Operators recover by closing and re-opening
+    /// the channel (which constructs a fresh `DiskSegment` and
+    /// runs the crash-recovery walks against on-disk truth).
+    ///
+    /// Historical note: the prior pre-manifest-pointer
+    /// `compact_to` also set this flag from a "post-rename
+    /// reopen failure / temp-dir placeholder" path that no
+    /// longer exists; the manifest-pointer rework opens the new
+    /// generation's handles BEFORE the atomic flip, so a failed
+    /// open aborts the compact while live state is still
+    /// intact. The rollback paths are now the only setters.
     poisoned: std::sync::atomic::AtomicBool,
     /// Test-only injection: when set, the next `append_entry` /
     /// `append_entries` call returns `RedexError::Io` before touching
@@ -242,8 +258,25 @@ impl DiskSegment {
     ) -> Result<RecoveredSegment, RedexError> {
         let dir = channel_dir(base_dir, name);
         std::fs::create_dir_all(&dir).map_err(RedexError::io)?;
-        let idx_path = dir.join("idx");
-        let dat_path = dir.join("dat");
+        // Resolve the live generation via the manifest pointer (or
+        // fall back to enumerating `v<NNN>/` directories, or migrate
+        // a legacy flat-layout channel, or create a fresh one). The
+        // resulting `gen` names the live `<channel>/v<gen>/` directory
+        // that holds the actual idx/dat/ts files; recovery walks run
+        // against those paths.
+        let live_gen = resolve_live_generation(&dir).map_err(RedexError::io)?;
+        let live_dir = gen_dir(&dir, live_gen);
+        // Make absolutely sure the generation directory exists. The
+        // resolver creates it for the brand-new and migration paths
+        // but a manifest pointing at a generation dir that someone
+        // externally rm'd between resolve and here would slip through
+        // (`generation_is_complete` checked file presence at resolve
+        // time, but a vanished dir wouldn't trip the migration
+        // fallback). Defensive create is a no-op when the directory
+        // already exists.
+        std::fs::create_dir_all(&live_dir).map_err(RedexError::io)?;
+        let idx_path = live_dir.join("idx");
+        let dat_path = live_dir.join("dat");
 
         // Recover existing index.
         let (mut index, idx_len_truncated) = read_index(&idx_path)?;
@@ -347,7 +380,7 @@ impl DiskSegment {
         // entries with the **first N** timestamps after the filter
         // would misalign every surviving entry that follows a dropped
         // one.
-        let ts_path = dir.join("ts");
+        let ts_path = live_dir.join("ts");
         let original_timestamps = read_timestamps(&ts_path, index.len())?;
 
         // Verify per-entry checksums during recovery. Without
@@ -473,9 +506,18 @@ impl DiskSegment {
         let worker_dat_file = dat_file.try_clone().map_err(RedexError::io)?;
         let worker_ts_file = ts_file.try_clone().map_err(RedexError::io)?;
 
+        // Sweep any orphan generation directories left behind by a
+        // crashed prior `compact_to`. A crash between writing
+        // `v<N+1>/{idx,dat,ts}` and the manifest flip leaves the
+        // partial `v<N+1>/` behind; recovery picked the older `v<N>/`
+        // and now we delete the stale newer one. Best-effort — sweep
+        // failures are logged but don't block open.
+        sweep_orphan_generations(&dir, live_gen);
+
         Ok(RecoveredSegment {
             disk: DiskSegment {
                 dir,
+                live_gen: AtomicU32::new(live_gen),
                 idx_file: Mutex::new(idx_file),
                 dat_file: Mutex::new(dat_file),
                 ts_file: Mutex::new(ts_file),
@@ -597,8 +639,32 @@ impl DiskSegment {
     /// Pre-fix the rollback used `if let Ok(f) = ...` and silently
     /// continued on open failure, leaving the segment in a
     /// permanently-divergent state with no diagnostic.
+    /// Path under the live generation directory. Equivalent to
+    /// `dir/v<live_gen>/file_name`. Used by rollback paths and
+    /// other internal callers that need to re-open a file by path
+    /// for `set_len` (the cached append-mode handle can't truncate
+    /// on every platform).
+    fn live_gen_path(&self, file_name: &str) -> PathBuf {
+        gen_dir(&self.dir, self.live_gen.load(Ordering::Acquire)).join(file_name)
+    }
+
+    /// Test-only: live generation number. Lets tests construct
+    /// paths under `<channel>/v<gen>/` to inspect on-disk state.
+    #[cfg(test)]
+    pub(super) fn live_gen(&self) -> u32 {
+        self.live_gen.load(Ordering::Acquire)
+    }
+
+    /// Test-only: live generation directory. Equivalent to
+    /// `gen_dir(channel_root, live_gen)`. Tests use this to read
+    /// raw idx/dat/ts files rather than reconstructing the path.
+    #[cfg(test)]
+    pub(super) fn live_dir(&self) -> PathBuf {
+        gen_dir(&self.dir, self.live_gen.load(Ordering::Acquire))
+    }
+
     fn rollback_truncate(&self, file_name: &str, target_len: u64) {
-        let path = self.dir.join(file_name);
+        let path = self.live_gen_path(file_name);
         match OpenOptions::new().write(true).open(&path) {
             Ok(f) => {
                 if let Err(e) = f.set_len(target_len) {
@@ -628,7 +694,7 @@ impl DiskSegment {
     fn rollback_after_idx_failure(&self, pre_idx_len: u64, dat_rollback: Option<u64>) {
         self.rollback_truncate("idx", pre_idx_len);
         if let Some(payload_len) = dat_rollback {
-            let dat_path = self.dir.join("dat");
+            let dat_path = self.live_gen_path("dat");
             let dat_target = match OpenOptions::new().read(true).open(&dat_path) {
                 Ok(f) => match f.metadata() {
                     Ok(m) => Some(m.len().saturating_sub(payload_len)),
@@ -723,15 +789,16 @@ impl DiskSegment {
         payload: &[u8],
         timestamp_ns: u64,
     ) -> Result<(), RedexError> {
-        // Refuse writes against a poisoned segment. `compact_to`
-        // sets this flag when its post-rename re-open phase fails
-        // — the cached file handles are pointing at temp-dir
-        // placeholders and any append would land in `/tmp`
-        // instead of the channel directory.
+        // Refuse writes against a poisoned segment. The flag is
+        // set by the partial-write rollback paths when they
+        // cannot truncate the file back to its pre-failure
+        // length — on-disk and in-memory have diverged, and any
+        // further append would compound the corruption rather
+        // than land cleanly. See the `poisoned` field rustdoc.
         if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
             return Err(RedexError::Io(
-                "redex segment is poisoned (compact_to post-rename reopen failure); \
-                 close and re-open the channel to recover"
+                "redex segment is poisoned (partial-write rollback could not restore \
+                 on-disk state to match in-memory); close and re-open the channel to recover"
                     .into(),
             ));
         }
@@ -760,7 +827,7 @@ impl DiskSegment {
                 // so use a fresh write handle. If even that fails
                 // (filesystem error), surface the original error.
                 drop(dat);
-                let dat_path = self.dir.join("dat");
+                let dat_path = self.live_gen_path("dat");
                 if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
                     let _ = f.set_len(pre_len);
                 }
@@ -772,7 +839,7 @@ impl DiskSegment {
         #[cfg(test)]
         if self.fail_after_dat_write.swap(false, Ordering::AcqRel) {
             if !entry.is_inline() {
-                let dat_path = self.dir.join("dat");
+                let dat_path = self.live_gen_path("dat");
                 if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
                     let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
                     let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
@@ -803,7 +870,7 @@ impl DiskSegment {
             Err(e) => {
                 drop(idx);
                 if !entry.is_inline() {
-                    let dat_path = self.dir.join("dat");
+                    let dat_path = self.live_gen_path("dat");
                     if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
                         let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
                         let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
@@ -940,8 +1007,8 @@ impl DiskSegment {
         // `append_entry_inner` for the full rationale.
         if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
             return Err(RedexError::Io(
-                "redex segment is poisoned (compact_to post-rename reopen failure); \
-                 close and re-open the channel to recover"
+                "redex segment is poisoned (partial-write rollback could not restore \
+                 on-disk state to match in-memory); close and re-open the channel to recover"
                     .into(),
             ));
         }
@@ -1165,16 +1232,41 @@ impl DiskSegment {
     /// `dat_base` is the absolute offset of the first heap entry's
     /// payload in the *original* dat file (i.e., the byte-position
     /// at which the new dat must start).
+    ///
+    /// # Atomic flip via manifest pointer
+    ///
+    /// The new content is written to a fresh `v<N+1>/` directory
+    /// alongside the live `v<N>/`, fsync'd in full, and then the
+    /// channel's `manifest` pointer is atomically swapped to point
+    /// at `v<N+1>/`. The manifest rename is the single linearizing
+    /// event:
+    ///
+    /// - Before it, recovery sees the old manifest and uses
+    ///   `v<N>/`. The half-written `v<N+1>/` is swept as an
+    ///   orphan on the next open.
+    /// - After it, recovery sees the new manifest and uses
+    ///   `v<N+1>/`. The superseded `v<N>/` is swept (best-effort
+    ///   here, again on the next open if the local cleanup is
+    ///   interrupted).
+    ///
+    /// The pre-rework three-rename sequence had a cross-file
+    /// mixed-state window where recovery could land on
+    /// `idx@N+1 + dat@N + ts@N` after a crash between rename N
+    /// and N+1. The new layout removes that window: every
+    /// generation directory is either complete or orphaned, never
+    /// mixed.
     pub(super) fn compact_to(
         &self,
         surviving_index: &[RedexEntry],
         surviving_timestamps: &[u64],
         dat_base: u64,
     ) -> Result<(), RedexError> {
-        // Refuse compact against a poisoned segment. A poisoned
-        // segment's cached handles point at temp-dir placeholders;
-        // running another compact would compound the
-        // off-channel-directory hazard.
+        // Refuse compact against a poisoned segment. The flag
+        // is set by the partial-write rollback paths when they
+        // can't restore on-disk state to match in-memory; running
+        // compact_to against a diverged segment would copy that
+        // divergence into the new generation and cement the
+        // corruption past the next manifest flip.
         if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
             return Err(RedexError::Io(
                 "redex segment is poisoned; refusing compact_to".into(),
@@ -1192,45 +1284,33 @@ impl DiskSegment {
             )));
         }
 
-        // Atomic-rewrite pattern: write each file into `*.tmp`
-        // alongside the original, fsync, then rename over. A
-        // crash before the rename leaves the original intact;
-        // after the rename, the new content is durable.
-        let idx_path = self.dir.join("idx");
-        let dat_path = self.dir.join("dat");
-        let ts_path = self.dir.join("ts");
-        let idx_tmp = self.dir.join("idx.tmp");
-        let dat_tmp = self.dir.join("dat.tmp");
-        let ts_tmp = self.dir.join("ts.tmp");
-
-        // Drop the cached append handles before the rename so
-        // the original files aren't held open. We'll re-open
-        // them at the end of this method.
-        //
-        // Acquire in (appender) dat → idx → ts → (worker) dat → idx
-        // → ts order to match the global lock discipline documented
-        // in the module rustdoc. This is the only path that holds
-        // multiple file locks simultaneously; the appender and the
-        // worker each only hold one at a time, so the order is
-        // incidentally safe today, but a future change that
-        // overlaps locks on either path could deadlock if compaction
-        // held them in any other order.
-        //
-        // Worker handles also point at the destination paths (they
-        // were `try_clone`d at open time), so they pin the OS files
-        // the same way the appender handles do — both must be
-        // swapped to placeholders before the rename can succeed
-        // on Windows.
-        let mut dat_guard = self.dat_file.lock();
-        let mut idx_guard = self.idx_file.lock();
-        let mut ts_guard = self.ts_file.lock();
-        let mut worker_dat_guard = self.worker_dat_file.lock();
-        let mut worker_idx_guard = self.worker_idx_file.lock();
-        let mut worker_ts_guard = self.worker_ts_file.lock();
+        // Snapshot the live generation. We're the only writer of
+        // `live_gen` (compact_to is serialized by the file locks
+        // we'll acquire below; no other code path mutates it after
+        // open), so a relaxed read is sufficient — but Acquire
+        // matches `live_gen.store(Release)` at the end of the
+        // happy path, future-proofing if a second writer ever
+        // appears.
+        let cur_gen = self.live_gen.load(Ordering::Acquire);
+        let next_gen = cur_gen.checked_add(1).ok_or_else(|| {
+            RedexError::Io(
+                "compact_to: live_gen at u32::MAX; refusing further compactions \
+                 (re-create the channel to reset)"
+                    .into(),
+            )
+        })?;
+        let cur_dir = gen_dir(&self.dir, cur_gen);
+        let next_dir = gen_dir(&self.dir, next_gen);
 
         // Build the new idx, ts contents in-memory; the dat tail
-        // we rewrite by reading the surviving range from the old
-        // dat file.
+        // we rewrite by reading the surviving range from the
+        // CURRENT generation's dat file. The reads can run without
+        // any file lock — readers don't block readers, and the
+        // appender writes to the same files under their own lock.
+        // The compact-as-of-now snapshot is implicitly consistent
+        // because in-memory `surviving_index` was computed from a
+        // consistent snapshot of the heap, and `dat_base` was
+        // derived from that same snapshot.
         let mut new_idx_bytes = Vec::with_capacity(surviving_index.len() * REDEX_ENTRY_SIZE);
         for entry in surviving_index {
             // Rewrite the heap offsets so the surviving entries
@@ -1266,21 +1346,30 @@ impl DiskSegment {
         for &t in surviving_timestamps {
             new_ts_bytes.extend_from_slice(&t.to_le_bytes());
         }
-        // Read the surviving dat tail.
-        let old_dat = read_payload(&dat_path)?;
+        // Read the surviving dat tail from the current generation.
+        let cur_dat_path = cur_dir.join("dat");
+        let old_dat = read_payload(&cur_dat_path)?;
         let new_dat = if dat_base as usize >= old_dat.len() {
             Vec::new()
         } else {
             old_dat[dat_base as usize..].to_vec()
         };
 
-        // Write tmp files.
+        // Create the new generation directory and write its three
+        // files. Until the manifest flip below, none of this is
+        // referenced by the live state — a crash at any point
+        // here leaves `v<next_gen>/` as an orphan that the next
+        // open's sweep removes.
+        std::fs::create_dir_all(&next_dir).map_err(RedexError::io)?;
+        let next_idx_path = next_dir.join("idx");
+        let next_dat_path = next_dir.join("dat");
+        let next_ts_path = next_dir.join("ts");
         {
             let mut f = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&idx_tmp)
+                .open(&next_idx_path)
                 .map_err(RedexError::io)?;
             f.write_all(&new_idx_bytes).map_err(RedexError::io)?;
             f.sync_all().map_err(RedexError::io)?;
@@ -1290,7 +1379,7 @@ impl DiskSegment {
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&dat_tmp)
+                .open(&next_dat_path)
                 .map_err(RedexError::io)?;
             f.write_all(&new_dat).map_err(RedexError::io)?;
             f.sync_all().map_err(RedexError::io)?;
@@ -1300,249 +1389,112 @@ impl DiskSegment {
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&ts_tmp)
+                .open(&next_ts_path)
                 .map_err(RedexError::io)?;
             f.write_all(&new_ts_bytes).map_err(RedexError::io)?;
             f.sync_all().map_err(RedexError::io)?;
         }
+        fsync_dir(&next_dir).map_err(RedexError::io)?;
 
-        // Drop the old open append handles before rename. On
-        // Windows, an open handle to the destination prevents
-        // rename; POSIX is more permissive but the consistency is
-        // valuable.
-        //
-        // We need each `File` slot to hold a valid `File` value
-        // (it's not `Option<File>`), so swap in a throwaway file
-        // outside the channel directory. Using `std::env::temp_dir`
-        // keeps the channel dir clean — the OS reclaims the
-        // placeholder if a crash mid-compaction prevents our
-        // explicit `remove_file` below from running. A unique
-        // suffix (process id + nanos) prevents two concurrent
-        // compactions across different channels from colliding on
-        // the same placeholder name.
-        let placeholder_suffix = format!(
-            "{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        let placeholder_idx =
-            std::env::temp_dir().join(format!("redex-compact-idx-{}", placeholder_suffix));
-        let placeholder_dat =
-            std::env::temp_dir().join(format!("redex-compact-dat-{}", placeholder_suffix));
-        let placeholder_ts =
-            std::env::temp_dir().join(format!("redex-compact-ts-{}", placeholder_suffix));
-        // RAII cleanup of the three placeholder files. Pre-fix the
-        // happy-path removal at the bottom of `compact_to` only ran
-        // when every post-rename reopen succeeded; any `?` early
-        // return on `open_or_poison` / `clone_or_poison` left the
-        // placeholders behind in `/tmp` forever, growing without
-        // bound on every reopen-failure event.
-        struct PlaceholderCleanup<'a> {
-            paths: [&'a Path; 3],
-        }
-        impl Drop for PlaceholderCleanup<'_> {
-            fn drop(&mut self) {
-                for path in self.paths {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-        }
-        let _placeholder_cleanup = PlaceholderCleanup {
-            paths: [
-                placeholder_idx.as_path(),
-                placeholder_dat.as_path(),
-                placeholder_ts.as_path(),
-            ],
-        };
-        let null_idx = OpenOptions::new()
+        // Open the new generation's append + worker handles ahead
+        // of the manifest flip. If any open fails, we abort the
+        // compact entirely — `live_gen` is unchanged, the cached
+        // handles still point at `cur_dir`, and the orphaned
+        // `next_dir` will be swept on the next open. No
+        // poisoning needed: the live state is unchanged.
+        let new_idx = OpenOptions::new()
             .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&placeholder_idx)
+            .read(true)
+            .append(true)
+            .open(&next_idx_path)
             .map_err(RedexError::io)?;
-        let null_dat = OpenOptions::new()
+        let new_dat = OpenOptions::new()
             .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&placeholder_dat)
+            .read(true)
+            .append(true)
+            .open(&next_dat_path)
             .map_err(RedexError::io)?;
-        let null_ts = OpenOptions::new()
+        let new_ts = OpenOptions::new()
             .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&placeholder_ts)
+            .read(true)
+            .append(true)
+            .open(&next_ts_path)
             .map_err(RedexError::io)?;
-        // Clone the placeholders for the worker slots — cheaper
-        // than opening three more temp files, and works for our
-        // purposes since the placeholder is just "any valid File
-        // value to park in the slot until we re-open."
-        let null_idx_worker = null_idx.try_clone().map_err(RedexError::io)?;
-        let null_dat_worker = null_dat.try_clone().map_err(RedexError::io)?;
-        let null_ts_worker = null_ts.try_clone().map_err(RedexError::io)?;
-        *idx_guard = null_idx;
-        *dat_guard = null_dat;
-        *ts_guard = null_ts;
-        *worker_idx_guard = null_idx_worker;
-        *worker_dat_guard = null_dat_worker;
-        *worker_ts_guard = null_ts_worker;
+        let new_idx_worker = new_idx.try_clone().map_err(RedexError::io)?;
+        let new_dat_worker = new_dat.try_clone().map_err(RedexError::io)?;
+        let new_ts_worker = new_ts.try_clone().map_err(RedexError::io)?;
 
-        // Atomic renames.
-        //
-        // This is a *three-rename* sequence rather than one
-        // atomic flip — a crash between renames N and N+1 leaves
-        // a mixed-version on-disk state that recovery cannot
-        // distinguish from a clean half-finished compact. A full
-        // fix is a manifest-pointer scheme (write versioned
-        // filenames, atomically swap a single "manifest" pointer),
-        // which is a format change deferred.
-        //
-        // Per-rename durability is provided by `durable_rename`:
-        //   - On POSIX, a plain `rename` plus the parent-dir
-        //     `fsync_dir` below covers the dirent durability.
-        //   - On Windows, the stdlib `rename` returns once the
-        //     metadata reaches the cache; a power loss before the
-        //     NTFS journal commits can revert the directory even
-        //     after all three calls return successfully.
-        //     `durable_rename` switches to `MoveFileExW` with
-        //     `MOVEFILE_WRITE_THROUGH` so each rename blocks until
-        //     the disk has acknowledged. The cross-file mixed-state
-        //     window between renames is unchanged on either
-        //     platform — the manifest-pointer rework remains the
-        //     long-term fix — but the post-call durability gap is
-        //     now closed on Windows too.
-        durable_rename(&idx_tmp, &idx_path).map_err(RedexError::io)?;
-        durable_rename(&dat_tmp, &dat_path).map_err(RedexError::io)?;
-        durable_rename(&ts_tmp, &ts_path).map_err(RedexError::io)?;
-        fsync_dir(&self.dir).map_err(RedexError::io)?;
+        // Acquire all six file locks before the atomic flip. From
+        // here through the cached-handle swap below we are the
+        // exclusive writer; concurrent appends block until we drop
+        // the locks. Order matches the global lock discipline
+        // documented in the module rustdoc.
+        let mut dat_guard = self.dat_file.lock();
+        let mut idx_guard = self.idx_file.lock();
+        let mut ts_guard = self.ts_file.lock();
+        let mut worker_dat_guard = self.worker_dat_file.lock();
+        let mut worker_idx_guard = self.worker_idx_file.lock();
+        let mut worker_ts_guard = self.worker_ts_file.lock();
 
-        // Open all six new handles (3 base + 3 worker clones) into
-        // local variables first, with bounded retry on transient
-        // failures (ENFILE / EMFILE / antivirus interference /
-        // brief permission flap). If ANY of them fails after
-        // retries, set `poisoned = true` so the segment refuses
-        // all further write paths until the channel is re-opened.
-        //
-        // A `?` early-return here would leave the cached guards
-        // pointing at the temp-dir placeholders even though the
-        // disk state is already post-compact (the renames have
-        // committed) — any subsequent `append_entry_inner` call
-        // would then write into `/tmp` rather than the channel
-        // dir. The in-memory state preservation contract still
-        // holds, but the next append would still hit the
-        // placeholders, so the `poisoned` flag gates that: append
-        // paths consult it and refuse to write rather than
-        // dropping events into temp-dir placeholders. This trades
-        // a noisy hard-error for silent write-to-`/tmp`.
-        let open_or_poison = |path: &Path| -> Result<File, RedexError> {
-            reopen_with_retries(path).map_err(|e| {
-                self.poisoned
-                    .store(true, std::sync::atomic::Ordering::Release);
-                tracing::error!(
-                    error = %e,
-                    path = %path.display(),
-                    "redex compact_to: post-rename reopen FAILED — segment \
-                     poisoned to prevent writes from landing in temp-dir \
-                     placeholders. Channel must be re-opened to recover."
-                );
-                RedexError::io(e)
-            })
-        };
-        let new_idx = open_or_poison(&idx_path)?;
-        let new_dat = open_or_poison(&dat_path)?;
-        let new_ts = open_or_poison(&ts_path)?;
-
-        // Per-file durability flush. On POSIX `fsync_dir` above
-        // covered the dir-level rename durability; on Windows
-        // each `durable_rename` call already wrote through to the
-        // disk via `MOVEFILE_WRITE_THROUGH`, so the dir-fsync
-        // below is the no-op variant. Calling `sync_all` on each
-        // renamed file's freshly-opened handle here ensures FILE
-        // CONTENT is durable on every target, regardless of
-        // platform. Best-effort on the sync_all itself: a failure
-        // here does NOT roll back the rename (already committed),
-        // so we log and continue rather than surfacing a
-        // fail-the-compact error after the disk state has
-        // flipped.
-        if let Err(e) = new_idx.sync_all() {
-            tracing::warn!(error = %e, "post-compact sync_all on idx failed (best-effort)");
-        }
-        if let Err(e) = new_dat.sync_all() {
-            tracing::warn!(error = %e, "post-compact sync_all on dat failed (best-effort)");
-        }
-        if let Err(e) = new_ts.sync_all() {
-            tracing::warn!(error = %e, "post-compact sync_all on ts failed (best-effort)");
+        // ATOMIC FLIP: write the new manifest pointing at next_gen.
+        // `write_manifest_atomic` writes manifest.tmp, fsyncs, then
+        // `durable_rename(manifest.tmp -> manifest)`. Before the
+        // rename, recovery sees the old manifest and uses
+        // `cur_dir`. After the rename, recovery sees the new
+        // manifest and uses `next_dir`. The rename is the single
+        // linearizing event of the compact.
+        if let Err(e) = write_manifest_atomic(&self.dir, next_gen) {
+            // Manifest write failed BEFORE the flip — the live
+            // state is unchanged, the next_gen directory is
+            // orphaned and will be swept on the next open. Drop
+            // the new handles (RAII) and surface the error.
+            return Err(RedexError::io(e));
         }
 
-        // Clone failures also poison (same hazard — the cached
-        // guard slots aren't yet swapped, but a `?` early-return
-        // here would leave the slots at temp-dir placeholders).
-        let clone_or_poison = |f: &File, kind: &str| -> Result<File, RedexError> {
-            f.try_clone().map_err(|e| {
-                self.poisoned
-                    .store(true, std::sync::atomic::Ordering::Release);
-                tracing::error!(
-                    error = %e,
-                    kind = kind,
-                    "redex compact_to: post-rename try_clone FAILED — segment poisoned"
-                );
-                RedexError::io(e)
-            })
-        };
-        let new_idx_worker = clone_or_poison(&new_idx, "idx")?;
-        let new_dat_worker = clone_or_poison(&new_dat, "dat")?;
-        let new_ts_worker = clone_or_poison(&new_ts, "ts")?;
-
-        // All six handles open successfully — atomically slot them.
+        // Manifest flipped. From this point recovery would land on
+        // `next_gen` — atomically swap the cached handles to match
+        // (so the next append goes to next_gen via the cached
+        // handles rather than cur_gen), then update `live_gen` so
+        // the rollback paths construct paths under next_gen.
+        //
+        // Ordering note: the cached-handle slots are written
+        // BEFORE the `live_gen.store(Release)`. The handle slots
+        // and `live_gen` are read by disjoint code paths — the
+        // append path reads only the cached handles, and the
+        // rollback path reads only `live_gen` (it re-opens by
+        // path via `live_gen_path()` rather than using the cached
+        // handle). So neither path observes the pair; they each
+        // observe their one half. The ordering still matters as
+        // a defensive invariant: anyone who later writes code
+        // that reads BOTH expects to see (handles, live_gen)
+        // consistent, and the rule "swap handles, then publish
+        // live_gen" is the simple one to follow. There is no
+        // need for the swap and store to happen under the same
+        // lock — the file locks we hold across this block already
+        // exclude every concurrent reader of the cached handles.
         *idx_guard = new_idx;
         *dat_guard = new_dat;
         *ts_guard = new_ts;
         *worker_idx_guard = new_idx_worker;
         *worker_dat_guard = new_dat_worker;
         *worker_ts_guard = new_ts_worker;
+        self.live_gen.store(next_gen, Ordering::Release);
 
-        // Placeholder cleanup is handled by `_placeholder_cleanup`'s
-        // Drop above — runs whether we reach this success path OR
-        // bail via an earlier `?` on a post-rename reopen failure.
+        // Drop locks before the best-effort sweep of the prior
+        // generation. Sweep failures are logged but not surfaced —
+        // the live state is correct; an undeleted `cur_dir` is
+        // just slow GC and gets cleaned up on the next open.
+        drop(worker_ts_guard);
+        drop(worker_idx_guard);
+        drop(worker_dat_guard);
+        drop(ts_guard);
+        drop(idx_guard);
+        drop(dat_guard);
+
+        delete_generation(&self.dir, cur_gen);
 
         Ok(())
     }
-}
-
-/// Reopen a redex file with bounded retry on transient
-/// failures (ENFILE, EMFILE, brief antivirus locking, sharing
-/// violations). All redex files are opened with the same flag
-/// shape — `create+read+append` — so this helper is the single
-/// canonical re-open primitive for the post-compact path.
-///
-/// Retry schedule: 5 attempts at 0ms, 25ms, 50ms, 100ms, 200ms
-/// (total <= 375ms). This window covers all the realistic
-/// transient causes without blocking the sweep path for
-/// noticeably long. If all five attempts fail, the most recent
-/// error is surfaced — the caller (only `compact_to` today) wraps
-/// it in `RedexError::io`.
-fn reopen_with_retries(path: &Path) -> std::io::Result<File> {
-    const ATTEMPTS: u32 = 5;
-    let mut last_err: Option<std::io::Error> = None;
-    for attempt in 0..ATTEMPTS {
-        if attempt > 0 {
-            // 25ms, 50ms, 100ms, 200ms.
-            let delay = std::time::Duration::from_millis(25u64 << (attempt - 1));
-            std::thread::sleep(delay);
-        }
-        match OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)
-        {
-            Ok(f) => return Ok(f),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(last_err.expect("at least one attempt must have run"))
 }
 
 #[inline]
@@ -1567,6 +1519,406 @@ fn channel_dir(base_dir: &Path, name: &ChannelName) -> PathBuf {
     p
 }
 
+// ===========================================================================
+// Manifest-pointer layout helpers.
+//
+// Each channel directory holds a single `manifest` pointer file plus
+// zero-or-more generation directories `v0000000001/`, `v0000000002/`, …
+// containing the actual `{idx, dat, ts}` files. `compact_to` writes a
+// new generation directory and atomically swaps the manifest to point
+// at it; recovery reads the manifest (or falls back to the highest
+// validated generation directory if the manifest is torn or missing).
+// ===========================================================================
+
+/// Magic bytes at the head of the manifest. `REDM` for "RedEX
+/// Manifest." Distinguishes a fresh-format manifest from a torn or
+/// otherwise-corrupt 16-byte file.
+const MANIFEST_MAGIC: [u8; 4] = *b"REDM";
+
+/// Wire-format version of the manifest. v1 is the only version
+/// today. Future bumps (e.g. wider generation field, additional
+/// metadata) must reject older versions on read.
+const MANIFEST_VERSION: u8 = 1;
+
+/// Fixed wire size of the manifest file. 16 bytes — small enough
+/// to fit inside any filesystem's atomic-write boundary, but
+/// atomicity is provided by the rename of `manifest.tmp → manifest`
+/// rather than by relying on single-write atomicity.
+const MANIFEST_SIZE: usize = 16;
+
+/// First valid generation number. `0` is reserved so a torn all-zero
+/// 16-byte file is unambiguously invalid (magic + checksum would
+/// also fail, but using a reserved sentinel adds defense in depth).
+const FIRST_GENERATION: u32 = 1;
+
+/// Format the generation number into the directory name
+/// `v` + 10-digit zero-padded decimal. Pads to 10 digits so a
+/// channel that survives ~4 B compactions still sorts
+/// lexicographically by generation; saturation at `u32::MAX` would
+/// require ~136 years of one compaction per second.
+fn gen_dir_name(gen: u32) -> String {
+    format!("v{:010}", gen)
+}
+
+/// Path to the manifest pointer file under `channel_dir`.
+fn manifest_path(channel_dir: &Path) -> PathBuf {
+    channel_dir.join("manifest")
+}
+
+/// Path to the manifest's tmp-write companion. Rename
+/// `manifest.tmp → manifest` is the single atomic flip.
+fn manifest_tmp_path(channel_dir: &Path) -> PathBuf {
+    channel_dir.join("manifest.tmp")
+}
+
+/// Path to the live generation directory `v<gen>/` under
+/// `channel_dir`.
+fn gen_dir(channel_dir: &Path, gen: u32) -> PathBuf {
+    channel_dir.join(gen_dir_name(gen))
+}
+
+/// Encode a manifest payload into the 16-byte wire format.
+///
+/// Layout (little-endian):
+///   [0..4]   magic = `REDM`
+///   [4]      version (u8) = 1
+///   [5..9]   generation (u32 LE)
+///   [9..12]  reserved = `[0, 0, 0]`
+///   [12..16] checksum (u32 LE) = xxh3 over [0..12]
+fn encode_manifest(generation: u32) -> [u8; MANIFEST_SIZE] {
+    let mut buf = [0u8; MANIFEST_SIZE];
+    buf[0..4].copy_from_slice(&MANIFEST_MAGIC);
+    buf[4] = MANIFEST_VERSION;
+    buf[5..9].copy_from_slice(&generation.to_le_bytes());
+    // buf[9..12] stays [0, 0, 0] (reserved).
+    let checksum = xxhash_rust::xxh3::xxh3_64(&buf[0..12]) as u32;
+    buf[12..16].copy_from_slice(&checksum.to_le_bytes());
+    buf
+}
+
+/// Decode a 16-byte manifest payload, validating magic, version,
+/// reserved bytes, generation > 0, and checksum. Returns the
+/// generation on success, or `None` for any kind of corruption — the
+/// caller falls back to the directory-scan path.
+fn decode_manifest(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() != MANIFEST_SIZE {
+        return None;
+    }
+    if bytes[0..4] != MANIFEST_MAGIC {
+        return None;
+    }
+    if bytes[4] != MANIFEST_VERSION {
+        return None;
+    }
+    if bytes[9..12] != [0, 0, 0] {
+        return None;
+    }
+    let claimed_checksum = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+    let computed_checksum = xxhash_rust::xxh3::xxh3_64(&bytes[0..12]) as u32;
+    if claimed_checksum != computed_checksum {
+        return None;
+    }
+    let generation = u32::from_le_bytes(bytes[5..9].try_into().ok()?);
+    if generation < FIRST_GENERATION {
+        return None;
+    }
+    Some(generation)
+}
+
+/// Read the manifest under `channel_dir`. Returns the generation if
+/// the manifest exists and validates; `None` if missing, short, or
+/// corrupt. Caller falls back to the directory-scan path.
+fn read_manifest(channel_dir: &Path) -> Option<u32> {
+    let path = manifest_path(channel_dir);
+    let mut f = File::open(&path).ok()?;
+    let mut bytes = [0u8; MANIFEST_SIZE];
+    f.read_exact(&mut bytes).ok()?;
+    decode_manifest(&bytes)
+}
+
+/// Write a new manifest pointing at `generation` durably.
+///
+/// 1. Write `manifest.tmp` with the encoded bytes; fsync.
+/// 2. `durable_rename(manifest.tmp → manifest)` — atomic flip.
+/// 3. fsync_dir on `channel_dir` to make the dirent durable.
+///
+/// Failure semantics:
+///
+/// - Any error BEFORE the rename (open/write/fsync of tmp, or
+///   the rename itself) propagates as `Err`. The previous
+///   manifest is preserved — the flip didn't happen.
+/// - An error from `fsync_dir` AFTER a successful rename does
+///   NOT propagate. The rename is the linearizing event; once
+///   it commits, the manifest is visible to every subsequent
+///   read regardless of whether the dirent has been flushed.
+///   Surfacing the fsync error would lie to the caller about
+///   whether the flip happened: `compact_to` would interpret
+///   `Err` as "live state still at cur_gen, no cached-handle
+///   swap" while the on-disk manifest already points at
+///   next_gen — every in-process append between this point
+///   and process exit would land in the now-dead generation
+///   and be discarded by the orphan sweep on next open. We
+///   log loudly, return `Ok(())`, and let the caller proceed
+///   with the cached-handle swap so on-disk and in-memory
+///   stay aligned. The residual durability gap (a power loss
+///   before the next implicit dirent flush could revert the
+///   rename) is recovered by the orphan-generation sweep on
+///   next open: if the manifest reverts to cur_gen, next_gen
+///   still exists and is swept; if the manifest stays at
+///   next_gen, cur_gen is swept. Either way recovery
+///   converges to a single consistent live generation.
+fn write_manifest_atomic(channel_dir: &Path, generation: u32) -> std::io::Result<()> {
+    let bytes = encode_manifest(generation);
+    let tmp = manifest_tmp_path(channel_dir);
+    let target = manifest_path(channel_dir);
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    durable_rename(&tmp, &target)?;
+    if let Err(e) = fsync_dir(channel_dir) {
+        tracing::warn!(
+            error = %e,
+            path = %channel_dir.display(),
+            "redex manifest write: rename committed but fsync_dir failed; \
+             manifest is visible to subsequent reads but dirent is not yet \
+             durable on disk. Treating as success so the caller's cached-\
+             handle swap proceeds (on-disk and in-memory must stay aligned). \
+             Recovery's orphan-generation sweep handles a post-power-loss \
+             revert.",
+        );
+    }
+    Ok(())
+}
+
+/// Enumerate all `v<NNN>/` generation directories under
+/// `channel_dir`, returning the parsed generation numbers in
+/// descending order (highest first). Non-matching entries (anything
+/// not named `v` + exactly 10 ASCII digits, or anything that's not a
+/// directory) are silently skipped.
+fn enumerate_generations(channel_dir: &Path) -> std::io::Result<Vec<u32>> {
+    let mut gens: Vec<u32> = Vec::new();
+    let dir_iter = match std::fs::read_dir(channel_dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(gens),
+        Err(e) => return Err(e),
+    };
+    for entry in dir_iter.flatten() {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if name_str.len() != 11 || !name_str.starts_with('v') {
+            continue;
+        }
+        let digits = &name_str[1..];
+        if !digits.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let gen: u32 = match digits.parse() {
+            Ok(n) if n >= FIRST_GENERATION => n,
+            _ => continue,
+        };
+        // Must be a directory (skip stray files named like `v0000000001`).
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => gens.push(gen),
+            _ => continue,
+        }
+    }
+    gens.sort_unstable_by(|a, b| b.cmp(a)); // descending
+    Ok(gens)
+}
+
+/// True if `gen_dir(channel_dir, gen)` contains all three of
+/// `{idx, dat, ts}` (any of them may be empty — a brand-new channel
+/// has zero-byte files; absence is the disqualifier). Used by the
+/// fallback path when the manifest is missing or torn.
+fn generation_is_complete(channel_dir: &Path, gen: u32) -> bool {
+    let dir = gen_dir(channel_dir, gen);
+    dir.join("idx").is_file() && dir.join("dat").is_file() && dir.join("ts").is_file()
+}
+
+/// Best-effort delete of `gen_dir(channel_dir, gen)`. Failure is
+/// logged but not surfaced — orphan generation cleanup is a
+/// background concern; the live generation is unaffected.
+fn delete_generation(channel_dir: &Path, gen: u32) {
+    let dir = gen_dir(channel_dir, gen);
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        // Not-found is fine — sweep can race a concurrent compact's
+        // own cleanup, or another node may have already swept this
+        // generation on a previous open.
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                error = %e,
+                path = %dir.display(),
+                "redex sweep: failed to delete orphan generation directory (non-fatal)",
+            );
+        }
+    }
+}
+
+/// Sweep every generation directory under `channel_dir` other than
+/// `keep`. Called at the end of `open` (to clean up orphans from a
+/// crashed prior compact) and at the end of `compact_to` (to clean up
+/// the just-superseded prior generation).
+fn sweep_orphan_generations(channel_dir: &Path, keep: u32) {
+    let gens = match enumerate_generations(channel_dir) {
+        Ok(gs) => gs,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %channel_dir.display(),
+                "redex sweep: failed to enumerate generation directories (non-fatal)",
+            );
+            return;
+        }
+    };
+    for gen in gens {
+        if gen == keep {
+            continue;
+        }
+        delete_generation(channel_dir, gen);
+    }
+    // Best-effort manifest.tmp cleanup — a crash between
+    // `manifest.tmp` write and the rename leaves a stale
+    // manifest.tmp behind. Removing it is harmless on success
+    // (manifest itself is the live pointer) and prevents the next
+    // crash-recovery from being confused by stale .tmp data.
+    let _ = std::fs::remove_file(manifest_tmp_path(channel_dir));
+}
+
+/// Migrate a legacy flat-layout channel (v0.10 / v0.11
+/// `<channel>/{idx,dat,ts}`) into the new generation-directory
+/// layout (`<channel>/v0000000001/{idx,dat,ts}` plus a manifest).
+///
+/// One-shot per channel; idempotent (re-running is a no-op because
+/// the second invocation observes the manifest written by the first
+/// and returns early).
+///
+/// # Precedence assumption (load-bearing)
+///
+/// This function assumes its caller has already established that
+/// neither a valid manifest NOR a complete `v<NNN>/` generation
+/// directory exists for this channel — i.e. flat-layout files
+/// are the only authoritative on-disk state. `resolve_live_generation`
+/// is the only caller and enforces this by gating the call behind
+/// the manifest-read and enumerate-fallback branches both failing
+/// to produce a complete generation.
+///
+/// If that gate ever weakens (e.g. a future caller invokes this
+/// function unconditionally on open), the per-file renames here
+/// would clobber a real `v0000000001/{idx,dat,ts}` produced by
+/// some prior compact, silently substituting the flat-file
+/// content for the post-compact content. **Do not** call from any
+/// path where a complete `v1/` could already be the live
+/// generation. The "overwrite v1 on partial-prior-migration"
+/// behavior documented inline is correct ONLY because the gate
+/// guarantees v1 was never live in that scenario.
+///
+/// Returns `Ok(true)` if migration ran (and we now have a v1
+/// generation + manifest), `Ok(false)` if there was nothing to
+/// migrate (no flat files present), or `Err` on a real I/O
+/// failure mid-migration. A failure between renames leaves the
+/// per-file moves in whichever state they reached; the next open
+/// re-runs the migration (idempotent — the per-source-file
+/// `is_file()` guards skip files already moved).
+fn migrate_flat_layout_if_needed(channel_dir: &Path) -> std::io::Result<bool> {
+    let flat_idx = channel_dir.join("idx");
+    let flat_dat = channel_dir.join("dat");
+    let flat_ts = channel_dir.join("ts");
+    let any_flat = flat_idx.is_file() || flat_dat.is_file() || flat_ts.is_file();
+    if !any_flat {
+        return Ok(false);
+    }
+    // The migration target is generation 1 by definition. Any
+    // pre-existing v1 directory left over from a partially-completed
+    // prior migration is overwritten by these renames — that's
+    // correct behavior, the prior migration didn't reach the
+    // manifest write so v1 was never the live generation. See the
+    // function-level "precedence assumption" rustdoc above for
+    // why this is safe only under the gate `resolve_live_generation`
+    // imposes (no valid manifest AND no complete generation dir).
+    let v1 = gen_dir(channel_dir, FIRST_GENERATION);
+    std::fs::create_dir_all(&v1)?;
+    if flat_idx.is_file() {
+        durable_rename(&flat_idx, &v1.join("idx"))?;
+    }
+    if flat_dat.is_file() {
+        durable_rename(&flat_dat, &v1.join("dat"))?;
+    }
+    if flat_ts.is_file() {
+        durable_rename(&flat_ts, &v1.join("ts"))?;
+    }
+    fsync_dir(&v1)?;
+    fsync_dir(channel_dir)?;
+    write_manifest_atomic(channel_dir, FIRST_GENERATION)?;
+    Ok(true)
+}
+
+/// Resolve the live generation for `channel_dir` on open.
+///
+/// 1. Read manifest. If it validates, that's the answer.
+/// 2. Otherwise enumerate `v<NNN>/` directories and pick the
+///    highest one that contains all three of `{idx, dat, ts}`.
+///    Write a fresh manifest pointing at it (best-effort — a
+///    failure here doesn't block recovery; the next compact
+///    refreshes the manifest).
+/// 3. If neither path produces a generation, attempt the
+///    flat-layout migration. If that succeeds, the live generation
+///    is `FIRST_GENERATION`.
+/// 4. If even migration didn't produce a generation, this is a
+///    brand-new channel: create `v<FIRST_GENERATION>/` and write a
+///    fresh manifest pointing at it.
+///
+/// Returns the live generation. The caller proceeds with the
+/// existing recovery walks against `gen_dir(channel_dir, gen)`.
+fn resolve_live_generation(channel_dir: &Path) -> std::io::Result<u32> {
+    if let Some(gen) = read_manifest(channel_dir) {
+        // Manifest valid — but verify the generation directory it
+        // names actually exists. A manifest pointing at a missing
+        // directory means someone deleted v<N>/ between opens; treat
+        // that as torn-manifest and fall back to enumeration.
+        if generation_is_complete(channel_dir, gen) {
+            return Ok(gen);
+        }
+    }
+    // Fallback: enumerate generations, pick highest valid.
+    let candidates = enumerate_generations(channel_dir)?;
+    for gen in candidates {
+        if generation_is_complete(channel_dir, gen) {
+            // Refresh the manifest. Best-effort — if the write fails
+            // (read-only fs, permissions flap), recovery still
+            // proceeds against this generation.
+            if let Err(e) = write_manifest_atomic(channel_dir, gen) {
+                tracing::warn!(
+                    error = %e,
+                    path = %channel_dir.display(),
+                    gen,
+                    "redex resolve: failed to refresh manifest after fallback (non-fatal)",
+                );
+            }
+            return Ok(gen);
+        }
+    }
+    // No valid generation. Try migration.
+    if migrate_flat_layout_if_needed(channel_dir)? {
+        return Ok(FIRST_GENERATION);
+    }
+    // Brand-new channel. Create the first generation directory and
+    // write its initial manifest. The directory is empty until the
+    // first append.
+    std::fs::create_dir_all(gen_dir(channel_dir, FIRST_GENERATION))?;
+    fsync_dir(channel_dir)?;
+    write_manifest_atomic(channel_dir, FIRST_GENERATION)?;
+    Ok(FIRST_GENERATION)
+}
+
 /// Fsync a directory inode so any prior `rename()` calls into
 /// it become durable.
 ///
@@ -1588,6 +1940,10 @@ fn channel_dir(base_dir: &Path, name: &ChannelName) -> PathBuf {
 /// best-effort under the current implementation.
 #[cfg(unix)]
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(e) = test_fsync_dir_consume_injected_failure() {
+        return Err(e);
+    }
     std::fs::File::open(dir)?.sync_all()
 }
 
@@ -1601,7 +1957,53 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 /// `cfg`-fork.
 #[cfg(not(unix))]
 fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(e) = test_fsync_dir_consume_injected_failure() {
+        return Err(e);
+    }
     Ok(())
+}
+
+// Test-only fault injection for `fsync_dir`. A countdown stored
+// in thread-local state lets each test arm a failure on the Nth
+// `fsync_dir` call from THIS thread; reaching `0` returns the
+// injected error and disables further injection. Per-thread
+// isolation matters because Rust's test runner parallelizes
+// across threads — a global atomic would race between unrelated
+// tests. Only one `fsync_dir` call per pass is targeted; tests
+// that need a wider window arm the countdown again.
+#[cfg(test)]
+thread_local! {
+    static FSYNC_DIR_FAIL_COUNTDOWN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Arm the next `fsync_dir` call (Nth-from-now) on this thread to
+/// return an injected `io::Error`. `n = 1` fails the very next
+/// call; `n = 2` lets one call through then fails the second; etc.
+/// `n = 0` disables the injector. The countdown is consumed by the
+/// targeted call and not re-armed automatically.
+#[cfg(test)]
+pub(super) fn arm_fsync_dir_failure_at(n: u32) {
+    FSYNC_DIR_FAIL_COUNTDOWN.with(|c| c.set(n));
+}
+
+/// Consume one tick of the test injector. Returns `Some(err)` if
+/// THIS call should fail, `None` otherwise. Decrements the
+/// countdown on every call until it reaches 0.
+#[cfg(test)]
+fn test_fsync_dir_consume_injected_failure() -> Option<std::io::Error> {
+    FSYNC_DIR_FAIL_COUNTDOWN.with(|c| {
+        let cur = c.get();
+        if cur == 0 {
+            return None;
+        }
+        c.set(cur - 1);
+        if cur == 1 {
+            Some(std::io::Error::other("test-injected fsync_dir failure"))
+        } else {
+            None
+        }
+    })
 }
 
 /// Rename `src` over `dst` with per-call durability.
@@ -1839,7 +2241,7 @@ mod tests {
         }
 
         // Manually append 7 garbage bytes to simulate a torn write.
-        let idx_path = channel_dir(&base, &name).join("idx");
+        let idx_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("idx");
         let mut f = OpenOptions::new().append(true).open(&idx_path).unwrap();
         f.write_all(&[0xFF; 7]).unwrap();
         f.sync_all().unwrap();
@@ -1963,7 +2365,7 @@ mod tests {
         }
 
         // Phase 2 — externally truncate dat to kill heap3 only.
-        let dat_path = channel_dir(&base, &name).join("dat");
+        let dat_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("dat");
         OpenOptions::new()
             .write(true)
             .open(&dat_path)
@@ -2002,7 +2404,7 @@ mod tests {
         );
         // Index must have been re-trimmed to drop heap3's record
         // (one 20-byte slot removed from the tail).
-        let idx_path = channel_dir(&base, &name).join("idx");
+        let idx_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("idx");
         assert_eq!(
             std::fs::metadata(&idx_path).unwrap().len(),
             (4 * REDEX_ENTRY_SIZE) as u64,
@@ -2078,7 +2480,7 @@ mod tests {
         }
 
         // Truncate dat to keep heap1 only.
-        let dat_path = channel_dir(&base, &name).join("dat");
+        let dat_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("dat");
         OpenOptions::new()
             .write(true)
             .open(&dat_path)
@@ -2125,7 +2527,7 @@ mod tests {
     fn append_failure_after_dat_write_rolls_back_dat() {
         let base = tmpdir();
         let name = ChannelName::new("t/rollback").unwrap();
-        let dat_path = channel_dir(&base, &name).join("dat");
+        let dat_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("dat");
 
         let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
 
@@ -2193,7 +2595,7 @@ mod tests {
     fn checksum_filter_preserves_ts_pairing_on_mid_file_drop() {
         let base = tmpdir();
         let name = ChannelName::new("t/ts_pair").unwrap();
-        let dat_path = channel_dir(&base, &name).join("dat");
+        let dat_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("dat");
 
         // Append four entries with distinct, recognizable timestamps.
         // Use the explicit-timestamp variant so we can pin which
@@ -2299,7 +2701,7 @@ mod tests {
 
         // dat must contain exactly h1 || h2 — inline bytes must NOT
         // have been appended to the dat buffer during stitching.
-        let dat_path = channel_dir(&base, &name).join("dat");
+        let dat_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("dat");
         let dat_bytes = std::fs::read(&dat_path).unwrap();
         assert_eq!(dat_bytes.len(), h1.len() + h2.len());
         assert_eq!(&dat_bytes[..h1.len()], h1);
@@ -2358,7 +2760,7 @@ mod tests {
 
         // dat file was created by `open` but should still be empty —
         // no heap payloads means the dat write path was skipped.
-        let dat_path = channel_dir(&base, &name).join("dat");
+        let dat_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("dat");
         assert_eq!(
             std::fs::metadata(&dat_path).unwrap().len(),
             0,
@@ -2415,9 +2817,9 @@ mod tests {
         // Cross-check against the on-disk files. If the worker
         // handles pointed at separate files (regression scenario),
         // these would diverge.
-        let dat_path = channel_dir(&base, &name).join("dat");
-        let idx_path = channel_dir(&base, &name).join("idx");
-        let ts_path = channel_dir(&base, &name).join("ts");
+        let dat_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("dat");
+        let idx_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("idx");
+        let ts_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("ts");
         assert_eq!(dat_w, std::fs::metadata(&dat_path).unwrap().len());
         assert_eq!(idx_w, std::fs::metadata(&idx_path).unwrap().len());
         assert_eq!(ts_w, std::fs::metadata(&ts_path).unwrap().len());
@@ -2483,18 +2885,24 @@ mod tests {
             .compact_to(&surviving, &surviving_ts, third_dat_base)
             .unwrap();
 
-        // Worker handles must now reflect the compacted file sizes,
-        // not the placeholder (which had size 0). This is the
-        // direct probe for the re-clone in `compact_to`.
-        let dat_path = channel_dir(&base, &name).join("dat");
-        let idx_path = channel_dir(&base, &name).join("idx");
-        let ts_path = channel_dir(&base, &name).join("ts");
+        // Worker handles must now reflect the compacted file sizes.
+        // After `compact_to`, the live generation has rolled
+        // (`live_gen` was 1, now 2), so the post-compact files
+        // live under `<channel>/v<live_gen>/`. The previous
+        // generation's directory has been swept by `compact_to`'s
+        // best-effort cleanup.
+        let live = recovered.disk.live_dir();
+        let dat_path = live.join("dat");
+        let idx_path = live.join("idx");
+        let ts_path = live.join("ts");
         let on_disk_dat = std::fs::metadata(&dat_path).unwrap().len();
         let on_disk_idx = std::fs::metadata(&idx_path).unwrap().len();
         let on_disk_ts = std::fs::metadata(&ts_path).unwrap().len();
         assert_eq!(on_disk_dat, payloads[2].len() as u64, "sanity");
         assert_eq!(on_disk_idx, REDEX_ENTRY_SIZE as u64, "sanity");
         assert_eq!(on_disk_ts, 8, "sanity");
+        // Sanity: live_gen rolled exactly once.
+        assert_eq!(recovered.disk.live_gen(), FIRST_GENERATION + 1);
         let (dat_w, idx_w, ts_w) = recovered.disk.worker_file_lens();
         assert_eq!(
             dat_w, on_disk_dat,
@@ -2675,98 +3083,18 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
-    /// CR-4: `reopen_with_retries` must succeed on the first
-    /// attempt for a normally-openable redex file path. This pins
-    /// the happy path — if the helper accidentally always took a
-    /// retry delay, the post-compact path would acquire 25ms of
-    /// wall-clock latency per call.
-    #[test]
-    fn reopen_with_retries_succeeds_immediately_on_normal_path() {
-        let dir = tmpdir();
-        let path = dir.join("idx_existing");
-        // Create the file with the same options redex uses so the
-        // open flags match the production path.
-        {
-            let _ = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .append(true)
-                .open(&path)
-                .expect("seed file");
-        }
-        let start = std::time::Instant::now();
-        let f = super::reopen_with_retries(&path).expect("reopen normal file");
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_millis(20),
-            "happy-path reopen must NOT incur a retry delay; took {:?}",
-            elapsed
-        );
-        // Confirm the handle is usable (write-then-flush via the
-        // append handle returned).
-        drop(f);
-        cleanup(&dir);
-    }
-
-    /// CR-4: `reopen_with_retries` must surface the LAST io::Error
-    /// when all attempts fail. We fake a permanent failure with a
-    /// path whose parent directory does not exist (so every open
-    /// attempt returns NotFound). Returning a meaningful error
-    /// from the final attempt is what lets the caller wrap it in
-    /// `RedexError::io` with a real diagnosis.
-    #[test]
-    fn reopen_with_retries_returns_last_error_after_exhaustion() {
-        let dir = tmpdir();
-        // Path INSIDE a directory that doesn't exist — every
-        // `OpenOptions::open` call will fail with NotFound. The
-        // `create(true)` flag won't auto-create parent dirs, so
-        // this is a permanent failure.
-        let bogus = dir.join("does_not_exist_subdir").join("idx");
-        let start = std::time::Instant::now();
-        let err =
-            super::reopen_with_retries(&bogus).expect_err("nonexistent parent dir must fail open");
-        let elapsed = start.elapsed();
-        // We attempt 5 times with 0+25+50+100+200 = 375ms of
-        // total sleep across the retries. Allow generous slack
-        // for slow CI but pin the order-of-magnitude.
-        assert!(
-            elapsed >= std::time::Duration::from_millis(300),
-            "must have done full retry budget before giving up; took {:?}",
-            elapsed
-        );
-        // The error MUST be a real io::Error (NotFound on most
-        // platforms when the parent doesn't exist), not a
-        // synthesized placeholder. This is what makes the
-        // surfaced `RedexError::io(err)` debuggable.
-        assert!(
-            matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ),
-            "expected NotFound or PermissionDenied; got {:?}: {}",
-            err.kind(),
-            err
-        );
-        cleanup(&dir);
-    }
-
-    /// CR-4: pin the post-rename atomic-swap invariant directly.
-    /// If `reopen_with_retries` returned `Err` for any of the six
-    /// post-rename opens, the cached slots in `DiskSegment` MUST
-    /// still hold the placeholder files (NOT mid-swap mixed
-    /// state) — pre-CR-4 the `?` early-return would leave some
-    /// slots updated and others not, depending on which call
-    /// failed.
+    /// Pin the post-compact atomic-swap invariant directly. The
+    /// new manifest-pointer flow opens all six handles in the
+    /// new generation directory BEFORE flipping the manifest, so a
+    /// failure during the open phase aborts the compact entirely
+    /// (live state stays at the prior generation; the orphan
+    /// `v<N+1>/` is swept on next open).
     ///
-    /// The current production design opens all six handles into
-    /// LOCAL VARIABLES first and only swaps after all six
-    /// succeed. We don't have a clean fault-injection seam for
-    /// the post-rename open phase (a real test would need an
-    /// fs-level hook), but we CAN exercise the success path's
-    /// post-conditions under a real `compact_to`: all worker
-    /// handles must come out of the call pointing at the new
-    /// channel files (sizes match the on-disk metadata), with
-    /// zero placeholder contamination.
+    /// We exercise the success path's post-conditions under a
+    /// real `compact_to`: all worker handles must come out of
+    /// the call pointing at the new generation's files (sizes
+    /// match the on-disk metadata), with no divergence between
+    /// the cached slots and the live disk state.
     #[test]
     fn compact_to_post_rename_swap_is_atomic_on_success_path() {
         let base = tmpdir();
@@ -2801,21 +3129,30 @@ mod tests {
             .expect("happy path compact must succeed");
 
         // After successful compact, every cached file slot must
-        // point at the channel directory's idx/dat/ts — NOT at a
-        // placeholder in the OS temp dir. We probe via worker
-        // handle sizes (the worker handles are `try_clone`d from
-        // the appender slots, so if EITHER kind ended up holding
-        // a placeholder, the size would be 0 / wrong).
-        let dat_path = channel_dir(&base, &name).join("dat");
-        let idx_path = channel_dir(&base, &name).join("idx");
-        let ts_path = channel_dir(&base, &name).join("ts");
+        // point at the new generation's idx/dat/ts. We probe via
+        // worker handle sizes (the worker handles are `try_clone`d
+        // from the appender slots, so divergence on EITHER kind
+        // surfaces here).
+        let live = recovered.disk.live_dir();
+        let dat_path = live.join("dat");
+        let idx_path = live.join("idx");
+        let ts_path = live.join("ts");
         let on_disk_dat = std::fs::metadata(&dat_path).unwrap().len();
         let on_disk_idx = std::fs::metadata(&idx_path).unwrap().len();
         let on_disk_ts = std::fs::metadata(&ts_path).unwrap().len();
         let (dat_w, idx_w, ts_w) = recovered.disk.worker_file_lens();
-        assert_eq!(dat_w, on_disk_dat, "worker dat must NOT hold a placeholder");
-        assert_eq!(idx_w, on_disk_idx, "worker idx must NOT hold a placeholder");
-        assert_eq!(ts_w, on_disk_ts, "worker ts must NOT hold a placeholder");
+        assert_eq!(
+            dat_w, on_disk_dat,
+            "worker dat must point at the new generation"
+        );
+        assert_eq!(
+            idx_w, on_disk_idx,
+            "worker idx must point at the new generation"
+        );
+        assert_eq!(
+            ts_w, on_disk_ts,
+            "worker ts must point at the new generation"
+        );
 
         // Also exercise that the appender slots are usable: a new
         // append must reach the on-disk dat file (placeholder dat
@@ -3056,6 +3393,881 @@ mod tests {
              `if let Ok(f) = OpenOptions::...` shape — that \
              discards the open error, the exact pre-fix bug. \
              Use `match` and poison on the Err arm."
+        );
+    }
+
+    // ====================================================================
+    // Manifest-pointer layout tests.
+    //
+    // These pin the new generation-directory layout's invariants:
+    //   - manifest codec round-trip + corruption rejection
+    //   - migration from legacy flat layout
+    //   - fallback to highest valid generation when manifest is torn
+    //   - sweep of orphan generation directories
+    //   - crash-injection at each step of `compact_to`
+    // ====================================================================
+
+    #[test]
+    fn manifest_codec_roundtrip() {
+        for &gen in &[FIRST_GENERATION, 2, 100, 1_000_000, u32::MAX] {
+            let bytes = encode_manifest(gen);
+            assert_eq!(
+                bytes.len(),
+                MANIFEST_SIZE,
+                "wire size must be {MANIFEST_SIZE}"
+            );
+            assert_eq!(
+                decode_manifest(&bytes),
+                Some(gen),
+                "round-trip must preserve generation {gen}",
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_codec_rejects_garbage() {
+        // Wrong magic.
+        let mut bad = encode_manifest(1);
+        bad[0] = b'X';
+        assert_eq!(decode_manifest(&bad), None, "bad magic must be rejected");
+
+        // Wrong version.
+        let mut bad = encode_manifest(1);
+        bad[4] = 99;
+        assert_eq!(
+            decode_manifest(&bad),
+            None,
+            "unknown version must be rejected"
+        );
+
+        // Generation 0 (reserved).
+        let mut bad = encode_manifest(1);
+        bad[5..9].copy_from_slice(&0u32.to_le_bytes());
+        // Re-checksum so corruption is via the value, not via the
+        // checksum, to prove the value-level guard fires.
+        let cs = xxhash_rust::xxh3::xxh3_64(&bad[0..12]) as u32;
+        bad[12..16].copy_from_slice(&cs.to_le_bytes());
+        assert_eq!(decode_manifest(&bad), None, "gen 0 must be rejected");
+
+        // Non-zero reserved bytes.
+        let mut bad = encode_manifest(1);
+        bad[10] = 0xAA;
+        let cs = xxhash_rust::xxh3::xxh3_64(&bad[0..12]) as u32;
+        bad[12..16].copy_from_slice(&cs.to_le_bytes());
+        assert_eq!(
+            decode_manifest(&bad),
+            None,
+            "non-zero reserved must be rejected (defense in depth against \
+             a future producer that stuffs bits we may want to repurpose)",
+        );
+
+        // Bit-flip in the generation field, checksum unchanged.
+        let mut bad = encode_manifest(7);
+        bad[5] ^= 0x01;
+        assert_eq!(
+            decode_manifest(&bad),
+            None,
+            "bit-flip in generation must trip the checksum",
+        );
+
+        // Short slice.
+        assert_eq!(
+            decode_manifest(&[0u8; 15]),
+            None,
+            "short slice must be rejected"
+        );
+        assert_eq!(decode_manifest(&[]), None, "empty slice must be rejected");
+    }
+
+    /// On a brand-new channel, `open` must create both
+    /// `<channel>/v<FIRST_GENERATION>/` and a manifest pointing at it.
+    /// This is the bedrock of the new layout — nothing else works if
+    /// the initial-state path is broken.
+    #[test]
+    fn open_brand_new_channel_creates_v1_and_manifest() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_init").unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(recovered.disk.live_gen(), FIRST_GENERATION);
+
+        let chan = channel_dir(&base, &name);
+        let manifest = manifest_path(&chan);
+        assert!(
+            manifest.is_file(),
+            "manifest must exist on brand-new channel"
+        );
+        let mut buf = [0u8; MANIFEST_SIZE];
+        std::fs::File::open(&manifest)
+            .unwrap()
+            .read_exact(&mut buf)
+            .unwrap();
+        assert_eq!(decode_manifest(&buf), Some(FIRST_GENERATION));
+
+        let v1 = gen_dir(&chan, FIRST_GENERATION);
+        assert!(v1.is_dir(), "v0000000001/ must exist");
+        cleanup(&base);
+    }
+
+    /// Legacy v0.10 / v0.11 flat-layout channels must migrate
+    /// transparently into `v0000000001/` on first open. Pin the
+    /// rename-each-file → write-manifest sequence so a future change
+    /// can't accidentally drop the migration shim.
+    #[test]
+    fn open_migrates_flat_layout_to_v1_generation() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_migrate").unwrap();
+        let chan = channel_dir(&base, &name);
+        std::fs::create_dir_all(&chan).unwrap();
+        // Write flat-layout files directly (simulating an on-disk
+        // channel from a pre-manifest binary).
+        let payload = b"legacy-payload-bytes";
+        let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        std::fs::write(chan.join("idx"), entry.to_bytes()).unwrap();
+        std::fs::write(chan.join("dat"), payload).unwrap();
+        std::fs::write(chan.join("ts"), 1234u64.to_le_bytes()).unwrap();
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(recovered.disk.live_gen(), FIRST_GENERATION);
+        assert_eq!(recovered.index.len(), 1, "migrated entry must survive");
+        assert_eq!(recovered.payload_bytes, payload);
+        assert_eq!(recovered.timestamps.as_deref(), Some(&[1234u64][..]));
+
+        // Flat files must have moved into v<FIRST_GENERATION>/.
+        assert!(!chan.join("idx").exists(), "flat idx must be migrated");
+        assert!(!chan.join("dat").exists(), "flat dat must be migrated");
+        assert!(!chan.join("ts").exists(), "flat ts must be migrated");
+        let v1 = gen_dir(&chan, FIRST_GENERATION);
+        assert!(v1.join("idx").is_file());
+        assert!(v1.join("dat").is_file());
+        assert!(v1.join("ts").is_file());
+
+        // Manifest must exist and point at v1.
+        assert_eq!(read_manifest(&chan), Some(FIRST_GENERATION));
+
+        // Re-opening is idempotent (no second migration).
+        drop(recovered);
+        let r2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(r2.disk.live_gen(), FIRST_GENERATION);
+        assert_eq!(r2.index.len(), 1);
+        cleanup(&base);
+    }
+
+    /// Crash-injection: design-doc row 9 (mid-migration partial
+    /// rename). Simulate `flat/idx` rename succeeding but the
+    /// process crashing before `flat/dat` and `flat/ts` are
+    /// moved. Re-open must resume the migration cleanly:
+    ///
+    ///   - the partially-populated `v1/` (only `idx` so far) is
+    ///     NOT confused for a complete generation by the
+    ///     enumerate-fallback branch (it's missing `dat` + `ts`),
+    ///   - the still-extant flat files (`dat`, `ts`) trigger the
+    ///     migration shim a second time,
+    ///   - the shim's per-file `if flat_*.is_file()` guard
+    ///     correctly skips the already-migrated `idx` and
+    ///     completes the move for `dat` + `ts`,
+    ///   - the manifest is then written and recovery succeeds
+    ///     with all three files present.
+    ///
+    /// Pin so a future change that breaks idempotency (e.g.
+    /// dropping the per-file `is_file()` guards in favor of an
+    /// unconditional rename, or changing the resolution order to
+    /// trust an incomplete `v1/` directory) trips here rather
+    /// than as silent data loss in production.
+    #[test]
+    fn open_resumes_migration_after_partial_flat_rename_crash() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_partial_migration").unwrap();
+        let chan = channel_dir(&base, &name);
+        std::fs::create_dir_all(&chan).unwrap();
+
+        // Set up: legacy flat-layout content, then SIMULATE a
+        // crash where `idx` was renamed into `v1/` but `dat` +
+        // `ts` were still flat. We do this by creating `v1/`
+        // ourselves with a partial migration result rather than
+        // relying on a fault injector.
+        let payload = b"resume-migration-payload";
+        let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        let v1 = gen_dir(&chan, FIRST_GENERATION);
+        std::fs::create_dir_all(&v1).unwrap();
+        // Half-migrated: idx already in v1/.
+        std::fs::write(v1.join("idx"), entry.to_bytes()).unwrap();
+        // Still flat: dat + ts.
+        std::fs::write(chan.join("dat"), payload).unwrap();
+        std::fs::write(chan.join("ts"), 4567u64.to_le_bytes()).unwrap();
+        // No manifest — the prior partial migration didn't reach
+        // `write_manifest_atomic`.
+        assert!(!manifest_path(&chan).exists());
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+
+        // Migration completed: live gen = 1, manifest written,
+        // every flat file moved, every v1 file present, content
+        // intact.
+        assert_eq!(recovered.disk.live_gen(), FIRST_GENERATION);
+        assert_eq!(read_manifest(&chan), Some(FIRST_GENERATION));
+        assert!(
+            !chan.join("dat").exists(),
+            "remaining flat dat must have completed its migration",
+        );
+        assert!(
+            !chan.join("ts").exists(),
+            "remaining flat ts must have completed its migration",
+        );
+        // `idx` was already migrated — must NOT have been
+        // duplicated/clobbered (its content must be preserved).
+        assert!(v1.join("idx").is_file());
+        assert!(v1.join("dat").is_file());
+        assert!(v1.join("ts").is_file());
+        assert_eq!(
+            recovered.index.len(),
+            1,
+            "the pre-crash idx entry must survive"
+        );
+        assert_eq!(recovered.payload_bytes, payload);
+        assert_eq!(recovered.timestamps.as_deref(), Some(&[4567u64][..]));
+
+        // Idempotent: a second open observes the manifest and
+        // takes the new-layout path (no re-migration).
+        drop(recovered);
+        let r2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(r2.disk.live_gen(), FIRST_GENERATION);
+        assert_eq!(r2.index.len(), 1);
+        cleanup(&base);
+    }
+
+    /// Symmetric case: the OTHER mid-migration partial — only
+    /// `dat` was flat at crash time, `idx` and `ts` already in
+    /// v1/. Pins that the per-file guards work for any subset
+    /// of remaining flat files, not just the "idx came first"
+    /// ordering above.
+    #[test]
+    fn open_resumes_migration_when_only_dat_remains_flat() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_partial_migration_dat_only").unwrap();
+        let chan = channel_dir(&base, &name);
+        std::fs::create_dir_all(&chan).unwrap();
+
+        let payload = b"dat-only-resume";
+        let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        let v1 = gen_dir(&chan, FIRST_GENERATION);
+        std::fs::create_dir_all(&v1).unwrap();
+        std::fs::write(v1.join("idx"), entry.to_bytes()).unwrap();
+        std::fs::write(v1.join("ts"), 99u64.to_le_bytes()).unwrap();
+        std::fs::write(chan.join("dat"), payload).unwrap();
+        assert!(!manifest_path(&chan).exists());
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(recovered.disk.live_gen(), FIRST_GENERATION);
+        assert_eq!(read_manifest(&chan), Some(FIRST_GENERATION));
+        assert!(!chan.join("dat").exists());
+        assert!(v1.join("dat").is_file());
+        assert_eq!(recovered.index.len(), 1);
+        assert_eq!(recovered.payload_bytes, payload);
+        assert_eq!(recovered.timestamps.as_deref(), Some(&[99u64][..]));
+        cleanup(&base);
+    }
+
+    /// If the manifest is missing entirely (e.g. it was never
+    /// written, or it was deleted out of band), but generation
+    /// directories exist, recovery must enumerate them and pick the
+    /// highest validated one. This is the catastrophic-recovery
+    /// branch — the live layer should never reach it under normal
+    /// operation, but it's the safety net.
+    #[test]
+    fn open_falls_back_to_highest_complete_generation_when_manifest_missing() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_fallback").unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        // Force a compact so v2 exists and is live.
+        let payload = b"x";
+        let e = RedexEntry::new_heap(0, 0, 1, 0, payload_checksum(payload));
+        recovered.disk.append_entry_at(&e, payload, 1).unwrap();
+        recovered.disk.sync().unwrap();
+        let surviving = vec![*recovered.index.first().unwrap_or(&e)];
+        let _ = recovered.disk.compact_to(&surviving, &[1], 0);
+        // We don't actually care whether compact succeeded; only
+        // that there's a v<live>/ directory we can corrupt the
+        // manifest to test against.
+        let live_after_compact = recovered.disk.live_gen();
+        drop(recovered);
+
+        // Delete the manifest. Fallback path must enumerate
+        // generation directories and pick the highest valid one.
+        let chan = channel_dir(&base, &name);
+        std::fs::remove_file(manifest_path(&chan)).unwrap();
+        let recovered2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(
+            recovered2.disk.live_gen(),
+            live_after_compact,
+            "fallback must pick the highest validated generation",
+        );
+        // Manifest must have been refreshed.
+        assert_eq!(read_manifest(&chan), Some(live_after_compact));
+        cleanup(&base);
+    }
+
+    /// A torn manifest (corrupted bytes, e.g. cosmic-ray bit-flip
+    /// in the checksum field) must trigger the same fallback path
+    /// as a missing manifest. Pin so a future change can't make
+    /// `decode_manifest` permissive without breaking this test.
+    #[test]
+    fn open_falls_back_when_manifest_checksum_bad() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_torn").unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let payload = b"y";
+        let e = RedexEntry::new_heap(0, 0, 1, 0, payload_checksum(payload));
+        recovered.disk.append_entry_at(&e, payload, 2).unwrap();
+        recovered.disk.sync().unwrap();
+        drop(recovered);
+
+        // Flip a bit in the checksum field of the manifest.
+        let chan = channel_dir(&base, &name);
+        let mut bytes = [0u8; MANIFEST_SIZE];
+        std::fs::File::open(manifest_path(&chan))
+            .unwrap()
+            .read_exact(&mut bytes)
+            .unwrap();
+        bytes[12] ^= 0x01;
+        std::fs::write(manifest_path(&chan), bytes).unwrap();
+        // Confirm the bit-flip actually invalidates the manifest.
+        assert_eq!(read_manifest(&chan), None, "checksum guard must fire");
+
+        let recovered2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(
+            recovered2.disk.live_gen(),
+            FIRST_GENERATION,
+            "fallback must still find v1 after the manifest is torn",
+        );
+        // Manifest must have been refreshed (now valid).
+        assert_eq!(read_manifest(&chan), Some(FIRST_GENERATION));
+        cleanup(&base);
+    }
+
+    /// Crash-injection: simulate a crash after writing
+    /// `v<N+1>/{idx,dat,ts}` but BEFORE the manifest flip. Recovery
+    /// must use the old generation `v<N>/`, and the orphan
+    /// `v<N+1>/` must be swept on next open.
+    ///
+    /// We simulate the crash by manually creating an orphan
+    /// `v<N+1>/` directory alongside the live `v<N>/` and verifying
+    /// that `open` (a) keeps `v<N>/` as live, (b) deletes the orphan.
+    #[test]
+    fn open_sweeps_orphan_newer_generation_left_by_crashed_compact() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_orphan_newer").unwrap();
+        let r = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let payload = b"live";
+        let e = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        r.disk.append_entry_at(&e, payload, 7).unwrap();
+        r.disk.sync().unwrap();
+        drop(r);
+
+        // Create a partially-written `v0000000002/` as if a compact
+        // had crashed mid-flight.
+        let chan = channel_dir(&base, &name);
+        let v2 = gen_dir(&chan, FIRST_GENERATION + 1);
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(v2.join("idx"), b"\x00\x00").unwrap(); // partial garbage
+                                                              // Note: NO manifest update — manifest still points at v1.
+
+        let r2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        // Live must still be v1 (manifest unchanged).
+        assert_eq!(r2.disk.live_gen(), FIRST_GENERATION);
+        // The orphaned v2 must have been swept on open.
+        assert!(
+            !v2.exists(),
+            "orphan generation directory must be swept on next open",
+        );
+        // The live entry must still be readable.
+        assert_eq!(r2.index.len(), 1);
+        assert_eq!(r2.payload_bytes, payload);
+        cleanup(&base);
+    }
+
+    /// Crash-injection: simulate a crash after the manifest flip but
+    /// BEFORE the post-flip cleanup of the prior generation. Open
+    /// must use the new generation (manifest is the source of truth)
+    /// AND sweep the now-superseded prior generation.
+    #[test]
+    fn open_sweeps_orphan_older_generation_left_by_crashed_post_flip_cleanup() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_orphan_older").unwrap();
+        let r = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let payload = b"v1-payload";
+        let e = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        r.disk.append_entry_at(&e, payload, 8).unwrap();
+        r.disk.sync().unwrap();
+        drop(r);
+
+        // Simulate post-flip-pre-cleanup state: manifest already
+        // points at v2 (post-compact), v2 holds the new content, v1
+        // still exists as an orphan.
+        let chan = channel_dir(&base, &name);
+        let v1 = gen_dir(&chan, FIRST_GENERATION);
+        let v2 = gen_dir(&chan, FIRST_GENERATION + 1);
+        std::fs::create_dir_all(&v2).unwrap();
+        let new_payload = b"v2-payload";
+        let new_entry = RedexEntry::new_heap(
+            5,
+            0,
+            new_payload.len() as u32,
+            0,
+            payload_checksum(new_payload),
+        );
+        std::fs::write(v2.join("idx"), new_entry.to_bytes()).unwrap();
+        std::fs::write(v2.join("dat"), new_payload).unwrap();
+        std::fs::write(v2.join("ts"), 9u64.to_le_bytes()).unwrap();
+        // Atomically flip the manifest to point at v2.
+        write_manifest_atomic(&chan, FIRST_GENERATION + 1).unwrap();
+        // v1 still exists at this point — we never cleaned it up.
+        assert!(v1.exists(), "setup: v1 must still be present pre-recovery");
+
+        let r2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(r2.disk.live_gen(), FIRST_GENERATION + 1);
+        // The superseded v1 must have been swept on open.
+        assert!(
+            !v1.exists(),
+            "superseded prior generation must be swept on next open",
+        );
+        // v2's content must be live.
+        assert_eq!(r2.index.len(), 1);
+        assert_eq!(r2.payload_bytes, new_payload);
+        cleanup(&base);
+    }
+
+    /// `compact_to` must roll the live generation by exactly one,
+    /// place the new content under `v<N+1>/`, swap the manifest,
+    /// and delete the old `v<N>/`. Pin all four observable
+    /// invariants so a regression in any of them trips here rather
+    /// than as silent on-disk garbage.
+    #[test]
+    fn compact_to_advances_generation_and_swaps_manifest_atomically() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_compact_flow").unwrap();
+        let r = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let payload = b"to-be-compacted";
+        let e = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        r.disk.append_entry_at(&e, payload, 11).unwrap();
+        r.disk.sync().unwrap();
+
+        let chan = channel_dir(&base, &name);
+        assert_eq!(r.disk.live_gen(), FIRST_GENERATION);
+        assert_eq!(read_manifest(&chan), Some(FIRST_GENERATION));
+
+        // Compact: surviving = the one entry, dat_base = 0.
+        let surviving = vec![e];
+        r.disk.compact_to(&surviving, &[11], 0).unwrap();
+
+        // Generation rolled by exactly one.
+        assert_eq!(r.disk.live_gen(), FIRST_GENERATION + 1);
+        // Manifest rolled atomically with it.
+        assert_eq!(read_manifest(&chan), Some(FIRST_GENERATION + 1));
+        // v<N+1>/ is populated.
+        let v2 = gen_dir(&chan, FIRST_GENERATION + 1);
+        assert!(v2.join("idx").is_file());
+        assert!(v2.join("dat").is_file());
+        assert!(v2.join("ts").is_file());
+        // v<N>/ has been swept.
+        let v1 = gen_dir(&chan, FIRST_GENERATION);
+        assert!(!v1.exists(), "prior generation must be swept post-compact");
+
+        // Reopen sees the new generation as live.
+        drop(r);
+        let r2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(r2.disk.live_gen(), FIRST_GENERATION + 1);
+        assert_eq!(r2.index.len(), 1);
+        cleanup(&base);
+    }
+
+    /// Full crash-recovery story: a "crash" (simulated by NOT
+    /// running compact_to's post-flip cleanup) leaves both
+    /// generations on disk plus the manifest pointing at the
+    /// new one. Reopen must use the new one and sweep the
+    /// stale older one in one step. Equivalent to "recovery
+    /// converges to a single live generation in one open."
+    #[test]
+    fn recovery_converges_to_single_live_generation() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_converge").unwrap();
+        let r = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let p1 = b"first-gen";
+        let e1 = RedexEntry::new_heap(0, 0, p1.len() as u32, 0, payload_checksum(p1));
+        r.disk.append_entry_at(&e1, p1, 100).unwrap();
+        r.disk.sync().unwrap();
+
+        // Compact rolls v1 -> v2 and sweeps v1.
+        r.disk.compact_to(&[e1], &[100], 0).unwrap();
+        assert_eq!(r.disk.live_gen(), FIRST_GENERATION + 1);
+
+        // Append once more so v2 has a meaningful tail. Then
+        // simulate a crash mid-second-compact: we manually create a
+        // partial v3 directory but DON'T flip the manifest.
+        let p2 = b"second-gen";
+        let e2 = RedexEntry::new_heap(1, p1.len() as u32, p2.len() as u32, 0, payload_checksum(p2));
+        r.disk.append_entry_at(&e2, p2, 200).unwrap();
+        r.disk.sync().unwrap();
+        drop(r);
+
+        let chan = channel_dir(&base, &name);
+        let v3 = gen_dir(&chan, FIRST_GENERATION + 2);
+        std::fs::create_dir_all(&v3).unwrap();
+        std::fs::write(v3.join("idx"), b"\xAB\xCD").unwrap(); // partial garbage
+                                                              // Manifest unchanged — still points at v2.
+
+        let r2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(r2.disk.live_gen(), FIRST_GENERATION + 1);
+        assert!(!v3.exists(), "orphan v3 must be swept");
+        // v2 must contain both entries (the second was appended
+        // post-compact under v2 directly).
+        assert_eq!(r2.index.len(), 2);
+        cleanup(&base);
+    }
+
+    /// Pin the orphan-sweep behavior at the helper level: only the
+    /// `keep` generation survives, every other `v<NNN>/` is removed.
+    #[test]
+    fn sweep_orphan_generations_keeps_only_designated_generation() {
+        let base = tmpdir();
+        let chan = base.join("sweep_test");
+        std::fs::create_dir_all(&chan).unwrap();
+        for gen in &[1u32, 2, 5, 7] {
+            std::fs::create_dir_all(gen_dir(&chan, *gen)).unwrap();
+        }
+        // A non-matching directory must not be touched (defense in
+        // depth against accidental wipe of unrelated content).
+        std::fs::create_dir_all(chan.join("not-a-gen-dir")).unwrap();
+        // A stray manifest.tmp must be cleaned up (post-crash
+        // remnant from a manifest write that didn't reach the
+        // rename).
+        std::fs::write(chan.join("manifest.tmp"), b"stale").unwrap();
+
+        sweep_orphan_generations(&chan, 5);
+
+        assert!(gen_dir(&chan, 5).exists(), "kept generation must survive");
+        assert!(!gen_dir(&chan, 1).exists(), "v1 must be swept");
+        assert!(!gen_dir(&chan, 2).exists(), "v2 must be swept");
+        assert!(!gen_dir(&chan, 7).exists(), "v7 must be swept");
+        assert!(
+            chan.join("not-a-gen-dir").exists(),
+            "non-matching directories must NOT be swept",
+        );
+        assert!(
+            !chan.join("manifest.tmp").exists(),
+            "stale manifest.tmp must be cleaned up",
+        );
+        let _ = std::fs::remove_dir_all(&chan);
+    }
+
+    /// Generation-directory enumeration must filter out anything
+    /// that doesn't match the `v` + 10-digit pattern, and must
+    /// return generations in descending order.
+    #[test]
+    fn enumerate_generations_filters_and_sorts() {
+        let base = tmpdir();
+        let chan = base.join("enumerate_test");
+        std::fs::create_dir_all(&chan).unwrap();
+        for d in &["v0000000001", "v0000000002", "v0000000010", "v0000000003"] {
+            std::fs::create_dir_all(chan.join(d)).unwrap();
+        }
+        // Decoys: file (not directory), wrong prefix, wrong digit
+        // count, non-digit characters, generation 0 (reserved).
+        std::fs::write(chan.join("v0000000001.txt"), b"file").unwrap();
+        std::fs::create_dir_all(chan.join("vXXXXXXXXXX")).unwrap();
+        std::fs::create_dir_all(chan.join("v00000001")).unwrap(); // 8 digits not 10
+        std::fs::create_dir_all(chan.join("v0000000000")).unwrap(); // gen 0
+
+        let gens = enumerate_generations(&chan).unwrap();
+        assert_eq!(
+            gens,
+            vec![10u32, 3, 2, 1],
+            "must return matching generations in descending order, \
+             skipping decoys and the reserved gen 0",
+        );
+        let _ = std::fs::remove_dir_all(&chan);
+    }
+
+    /// Source-text guard: the `poisoned` field rustdoc and the
+    /// runtime error strings returned from append paths must
+    /// describe the ACTUAL setters (the partial-write rollback
+    /// paths) rather than a `compact_to` failure-mode parenthetical
+    /// that the manifest-pointer rework deleted. The test
+    /// reconstructs the deleted phrase at runtime to avoid
+    /// matching itself. An operator hitting one of the runtime
+    /// errors today would otherwise chase a phantom; future
+    /// maintainers would learn the wrong invariant from the
+    /// field doc. This test fails loudly if either drifts back.
+    #[test]
+    fn poisoning_docs_and_errors_describe_actual_setters() {
+        let src = include_str!("disk.rs");
+
+        // Build the stale marker at runtime so the test's own
+        // assertion message (which has to NAME the marker for
+        // operator readability) doesn't itself trip the
+        // assertion. Two halves joined by `-` reproduces the
+        // exact pre-fix substring without it appearing anywhere
+        // in the source verbatim.
+        let stale_marker = format!("{}{}{}", "compact_to post", "-", "rename reopen failure",);
+        assert!(
+            !src.contains(&stale_marker),
+            "regression: source must not contain '{stale_marker}'. \
+             That parenthetical described a `compact_to` failure \
+             path that was deleted in the manifest-pointer rework \
+             (the rework opens the new generation's handles BEFORE \
+             the atomic flip, so a failed open aborts the compact \
+             with live state still intact). The `poisoned` flag's \
+             only setters now are the partial-write rollback paths \
+             (rollback_truncate, rollback_after_idx_failure); both \
+             the field rustdoc and the runtime error strings must \
+             describe that reality, not the deleted setter."
+        );
+
+        // Conversely, the new wording must appear in BOTH
+        // append-path setters (`append_entry_inner` and
+        // `append_entries_inner`). Two-or-more is the post-fix
+        // shape; a regression that updates one site but not the
+        // other would leave operators with mixed messaging.
+        // Subtract one occurrence for this test's own reference
+        // to the marker (the message immediately below).
+        let new_marker = format!("{} {}", "partial-write rollback", "could not restore",);
+        let occurrences = src.matches(&new_marker).count();
+        assert!(
+            occurrences >= 2,
+            "regression: at least two error messages (one per \
+             append path) must use the wording '{new_marker}' to \
+             point operators at the real cause; saw {occurrences} \
+             occurrences in the source.",
+        );
+    }
+
+    /// `write_manifest_atomic` must NOT propagate a `fsync_dir`
+    /// failure that happens AFTER `durable_rename` succeeded.
+    /// The rename is the linearizing event of the manifest flip;
+    /// once it commits, the manifest is visible to every subsequent
+    /// reader regardless of whether the dirent has been flushed.
+    /// Surfacing the fsync error would lie to the caller about
+    /// whether the flip happened: `compact_to` would interpret
+    /// `Err` as "live state unchanged, no cached-handle swap"
+    /// while the on-disk manifest already names next_gen — every
+    /// in-process append between the failed write_manifest_atomic
+    /// and process exit would land in cur_gen and then be
+    /// discarded by the orphan sweep on next open. This test arms
+    /// the fsync_dir injector to fail on the call AFTER the
+    /// rename and verifies (a) `write_manifest_atomic` returns
+    /// `Ok(())`, (b) the on-disk manifest reflects the new value.
+    #[test]
+    fn write_manifest_atomic_swallows_fsync_dir_failure_after_rename() {
+        let chan = tmpdir();
+        // Establish a baseline manifest at gen 1.
+        super::write_manifest_atomic(&chan, 1).expect("baseline manifest write must succeed");
+        assert_eq!(super::read_manifest(&chan), Some(1));
+
+        // The next write does: open tmp, write, fsync_all (no
+        // fsync_dir yet), durable_rename, fsync_dir(channel_dir).
+        // We want to fail ONLY the fsync_dir(channel_dir) call —
+        // which is the FIRST fsync_dir call this write_manifest
+        // makes. Arm at n=1.
+        super::arm_fsync_dir_failure_at(1);
+        super::write_manifest_atomic(&chan, 2).expect(
+            "write_manifest_atomic must return Ok when fsync_dir fails \
+             AFTER durable_rename succeeded; surfacing Err would lie \
+             about whether the flip happened",
+        );
+
+        // The injector is consumed; the on-disk manifest reflects
+        // the new generation (the rename committed before the
+        // injected failure).
+        assert_eq!(
+            super::read_manifest(&chan),
+            Some(2),
+            "manifest must reflect the post-rename value even though \
+             the dirent fsync was injected to fail",
+        );
+
+        // Disable injector explicitly (defensive — thread might
+        // be reused by another test).
+        super::arm_fsync_dir_failure_at(0);
+        cleanup(&chan);
+    }
+
+    /// Errors BEFORE the rename (open/write/fsync of `manifest.tmp`)
+    /// MUST still propagate. The injector here fires on the first
+    /// `fsync_dir` call inside `write_manifest_atomic`. To exercise
+    /// the pre-rename failure path we'd need a different injection
+    /// site, but we can pin the propagation contract with a path
+    /// that fails the tmp open: a `channel_dir` that doesn't exist
+    /// makes `OpenOptions::create(true).open(tmp)` fail with
+    /// NotFound, and that error must surface as Err.
+    #[test]
+    fn write_manifest_atomic_propagates_pre_rename_failures() {
+        let nonexistent = tmpdir().join("does_not_exist_subdir");
+        // No `create_dir_all` — the tmp open must fail.
+        let err = super::write_manifest_atomic(&nonexistent, 1)
+            .expect_err("write into a nonexistent dir must fail");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "pre-rename failures (here: tmp open against missing dir) \
+             must surface as Err so the caller knows the flip didn't \
+             happen; got {:?}",
+            err,
+        );
+    }
+
+    /// End-to-end: `compact_to` must succeed when the
+    /// post-rename `fsync_dir` fails. The cached handles MUST be
+    /// swapped to the new generation and `live_gen` MUST advance
+    /// — otherwise in-process appends keep hitting the
+    /// (now-dead) cur_gen and get discarded on the next open's
+    /// orphan sweep. The injector fires on the second
+    /// `fsync_dir` call: compact_to does `fsync_dir(next_dir)`
+    /// first (must succeed for content durability) then
+    /// `fsync_dir(channel_dir)` inside `write_manifest_atomic`
+    /// (the post-rename one we want to fail).
+    #[test]
+    fn compact_to_succeeds_when_post_rename_fsync_dir_fails() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/compact_post_fsync_fail").unwrap();
+        let r = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let payload = b"survives-fsync_dir-failure";
+        let e = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        r.disk.append_entry_at(&e, payload, 5).unwrap();
+        r.disk.sync().unwrap();
+
+        // Arm the injector to fire on the SECOND fsync_dir from
+        // this thread. compact_to's fsync_dir order:
+        //   1. fsync_dir(&next_dir)        — content durability
+        //   2. fsync_dir(channel_dir)      — post-rename dirent
+        // We want #2 to fail; #1 must succeed (failing it would
+        // correctly fail compact, which isn't what we're testing).
+        super::arm_fsync_dir_failure_at(2);
+
+        r.disk.compact_to(&[e], &[5], 0).expect(
+            "compact_to must report success when fsync_dir fails \
+             AFTER the manifest rename succeeded",
+        );
+
+        // The on-disk and in-memory state both advanced.
+        assert_eq!(
+            r.disk.live_gen(),
+            FIRST_GENERATION + 1,
+            "live_gen must advance after a successful compact even \
+             when post-rename fsync_dir failed",
+        );
+        let chan = channel_dir(&base, &name);
+        assert_eq!(
+            super::read_manifest(&chan),
+            Some(FIRST_GENERATION + 1),
+            "on-disk manifest must reflect next_gen — the rename \
+             committed before the injected fsync_dir failure",
+        );
+
+        // Disable injector explicitly.
+        super::arm_fsync_dir_failure_at(0);
+        cleanup(&base);
+    }
+
+    /// Belt-and-braces source-shape guard. `write_manifest_atomic`
+    /// must NOT propagate the post-rename `fsync_dir` via `?`. The
+    /// pre-fix shape (`fsync_dir(channel_dir)?;`) is the bug we
+    /// closed in this commit; if a future refactor accidentally
+    /// re-introduces it, the behavioral test above catches it on
+    /// the next run, but this static check fails immediately at
+    /// build time and points at the exact line.
+    #[test]
+    fn write_manifest_atomic_must_not_propagate_post_rename_fsync_dir() {
+        let src = include_str!("disk.rs");
+        let header = "fn write_manifest_atomic(";
+        let start = src.find(header).expect("write_manifest_atomic must exist");
+        // Find the function body's closing brace to bound the search.
+        let body_after = &src[start..];
+        let next_top_level = body_after
+            .find("\nfn ")
+            .or_else(|| body_after.find("\n#[cfg(test)]"))
+            .expect("a following item must exist");
+        let body = &body_after[..next_top_level];
+
+        assert!(
+            !body.contains("fsync_dir(channel_dir)?;"),
+            "regression: write_manifest_atomic must NOT propagate \
+             fsync_dir(channel_dir) errors via `?` after a successful \
+             durable_rename. The rename is the linearizing event — \
+             once it commits, returning Err lies to the caller about \
+             whether the flip happened, and any in-process appends \
+             between the failed write_manifest_atomic and process \
+             exit would land in the (now-dead) cur_gen. Wrap the \
+             call in `if let Err(e) = ... {{ tracing::warn!(...) }}` \
+             that logs and continues."
+        );
+    }
+
+    /// Source-text guard for the `migrate_flat_layout_if_needed`
+    /// precedence assumption: the function MUST have exactly
+    /// one call site in this file (`resolve_live_generation`),
+    /// and that call site must sit AFTER the manifest-read and
+    /// enumerate-fallback branches. The function clobbers any
+    /// pre-existing `v0000000001/{idx,dat,ts}` with the flat-
+    /// layout content — safe ONLY because the gate at the call
+    /// site guarantees v1 wasn't a live generation. A future
+    /// refactor that adds a second caller (especially one
+    /// without the gate) would silently substitute legacy flat
+    /// content for whatever post-compact data v1 actually held.
+    /// Catch that at build time rather than as a corrupted
+    /// channel in production.
+    #[test]
+    fn migrate_flat_layout_has_exactly_one_caller() {
+        let src = include_str!("disk.rs");
+        // Count occurrences of the function name. One is the
+        // definition (`fn migrate_flat_layout_if_needed(`),
+        // one is the call site (`migrate_flat_layout_if_needed(`),
+        // and one is the rustdoc cross-reference inside the
+        // function rustdoc itself. We count strictly the
+        // call-shape with `(` immediately following the name —
+        // that excludes the rustdoc mention (which is followed
+        // by a space).
+        let needle_call = "migrate_flat_layout_if_needed(";
+        let total = src.matches(needle_call).count();
+        // Definition + one caller + this test's own reference
+        // (in the assertion message + this needle string above).
+        // To make the count deterministic regardless of the
+        // surrounding test wording, we strip THIS function's
+        // body before counting.
+        let test_fn_header = "fn migrate_flat_layout_has_exactly_one_caller(";
+        let test_fn_start = src.find(test_fn_header).expect("this test must exist");
+        // Walk backward to the start of the test's `#[test]`
+        // attribute / rustdoc — close enough to slice off
+        // everything after the `///` block. We use a coarse
+        // approximation: cut at the most recent blank line
+        // before the test header.
+        let pre_test = &src[..test_fn_start];
+        let cut = pre_test.rfind("\n\n").unwrap_or(0);
+        let src_minus_this_test = &src[..cut];
+        let outside = src_minus_this_test.matches(needle_call).count();
+        assert_eq!(
+            outside, 2,
+            "regression: `migrate_flat_layout_if_needed` must have \
+             exactly two source occurrences with the `(` call shape \
+             outside this test (one definition + one caller in \
+             `resolve_live_generation`); saw {outside}. The function \
+             clobbers any pre-existing v1 with flat-layout content, \
+             which is safe only under the precedence gate that \
+             `resolve_live_generation` enforces. A second caller \
+             would silently lose post-compact data on channels \
+             where flat files lingered alongside a real generation \
+             directory. See the function's `# Precedence assumption` \
+             rustdoc.",
+        );
+        // Also note: total includes this test's own usage. Sanity
+        // check it grows by exactly 2 (the needle string above
+        // appears twice in the test source: in `let needle_call`
+        // and in the rustdoc slice setup). If a future edit adds
+        // more in-test occurrences, bump this and double-check the
+        // outside-count math still holds.
+        assert!(
+            total >= outside,
+            "sanity: total occurrences ({total}) cannot exceed \
+             outside ({outside}); test self-reference accounting \
+             is broken.",
         );
     }
 }

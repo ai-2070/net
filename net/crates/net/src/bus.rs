@@ -3422,6 +3422,141 @@ mod tests {
         let _ = std::fs::remove_file(&nonce_path);
     }
 
+    /// Regression guard for the `(process_nonce, shard_id,
+    /// sequence_start, i)` JetStream / Redis msg-id construction.
+    /// Within one bus instance, `sequence_start` per shard MUST be
+    /// strictly monotonic across batches AND every two adjacent
+    /// batches `n` and `n+1` from the same shard MUST satisfy
+    /// `seq_start[n+1] == seq_start[n] + len(events[n])` — no gaps,
+    /// no overlap. A regression here breaks the at-most-once dedup
+    /// every persistent adapter relies on: gaps reuse a `(shard,
+    /// seq, i)` tuple after the dedup window closes, and overlap
+    /// silently overlays a later batch on an earlier one's slot.
+    ///
+    /// The cross-restart variant (persistent `next_sequence` across
+    /// process boots) is feature-shaped, not a bug fix — without
+    /// persistence, restart relies on `process_nonce` rotating to
+    /// disjoin the msg-id namespace (pinned by
+    /// `persistent_producer_nonce_survives_bus_restart`). This test
+    /// pins the within-process invariant the persistent nonce
+    /// builds on.
+    #[tokio::test]
+    async fn sequence_start_is_per_shard_monotonic_and_gap_free() {
+        struct ShardSeqRecorder {
+            batches: Arc<parking_lot::Mutex<Vec<(u16, u64, usize)>>>,
+        }
+        #[async_trait::async_trait]
+        impl crate::adapter::Adapter for ShardSeqRecorder {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+                self.batches.lock().push((
+                    batch.shard_id,
+                    batch.sequence_start,
+                    batch.events.len(),
+                ));
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _: u16,
+                _: Option<&str>,
+                _: usize,
+            ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+                Ok(crate::adapter::ShardPollResult::empty())
+            }
+            fn name(&self) -> &'static str {
+                "shard-seq-recorder"
+            }
+        }
+
+        let batches = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let config = EventBusConfig::builder()
+            .num_shards(4)
+            .ring_buffer_capacity(1024)
+            .build()
+            .unwrap();
+        let bus = EventBus::new_with_adapter(
+            config,
+            Box::new(ShardSeqRecorder {
+                batches: batches.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Three drive-then-flush rounds so each shard sees multiple
+        // batches; the across-batch monotonicity invariant is what
+        // we're pinning, so a single batch per shard wouldn't
+        // exercise it.
+        for round in 0..3u64 {
+            for i in 0..200u64 {
+                bus.ingest(Event::new(json!({"r": round, "i": i}))).unwrap();
+            }
+            bus.flush().await.unwrap();
+        }
+        bus.shutdown().await.unwrap();
+
+        let observed = batches.lock().clone();
+        assert!(
+            !observed.is_empty(),
+            "expected the adapter to have observed at least one batch",
+        );
+
+        // Bucket batches per shard, preserving dispatch order.
+        let mut by_shard: std::collections::HashMap<u16, Vec<(u64, usize)>> =
+            std::collections::HashMap::new();
+        for (shard, seq_start, len) in observed {
+            by_shard.entry(shard).or_default().push((seq_start, len));
+        }
+
+        for (shard, runs) in &by_shard {
+            assert!(
+                !runs.is_empty(),
+                "shard {shard}: must have at least one batch",
+            );
+            // First batch of every shard starts at the per-shard
+            // zero — `BatchWorker::next_sequence` is initialized to
+            // 0 and the first `flush()` reads it before the
+            // `saturating_add`. A regression that lazily seeds
+            // `next_sequence` from a non-zero source (e.g. wall
+            // clock) would trip here.
+            assert_eq!(
+                runs[0].0, 0,
+                "shard {shard}: first batch must start at sequence 0, got {}",
+                runs[0].0,
+            );
+            for window in runs.windows(2) {
+                let (prev_start, prev_len) = window[0];
+                let (next_start, _next_len) = window[1];
+                let expected_next = prev_start
+                    .checked_add(prev_len as u64)
+                    .expect("test bounds keep us well below u64::MAX");
+                assert!(
+                    next_start > prev_start,
+                    "shard {shard}: sequence_start must be strictly monotonic; \
+                     saw {prev_start} → {next_start}",
+                );
+                assert_eq!(
+                    next_start, expected_next,
+                    "shard {shard}: gap or overlap in sequence_start; \
+                     prev=({prev_start}, len={prev_len}) → next={next_start}, \
+                     expected {expected_next}. A gap reuses (shard, seq, i) \
+                     tuples after the JetStream/Redis dedup window closes; an \
+                     overlap silently overlays a later batch on an earlier \
+                     one's slot.",
+                );
+            }
+        }
+    }
+
     /// Pin the within-process caching contract for the fallback
     /// (no-`producer_nonce_path`) path: two bus instances created
     /// in the same process see the SAME `batch_process_nonce()`

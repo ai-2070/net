@@ -917,7 +917,10 @@ mod persistent {
 
         // Simulate a torn dat write: append partial payload bytes to
         // dat without updating idx. Reopen must discard them.
-        let dat_path = base.join("durable/torn/dat");
+        // The on-disk layout puts files under
+        // `<channel>/v0000000001/{idx,dat,ts}` (manifest-pointer
+        // generation directory); reach in there directly.
+        let dat_path = base.join("durable/torn/v0000000001/dat");
         let mut dat = std::fs::OpenOptions::new()
             .append(true)
             .open(&dat_path)
@@ -989,9 +992,10 @@ mod persistent {
         // file is untouched, so Heap1 (still in idx) now references
         // bytes 0..16 but dat only has bytes 0..8 — that's torn. The
         // trailing Inline2 in idx would mask this from the pre-fix
-        // walk.
-        let dat_path = base.join("durable/torn_inline/dat");
-        let idx_path = base.join("durable/torn_inline/idx");
+        // walk. Files live one level deep inside the live generation
+        // directory (`v0000000001/` for a never-compacted channel).
+        let dat_path = base.join("durable/torn_inline/v0000000001/dat");
+        let idx_path = base.join("durable/torn_inline/v0000000001/idx");
         let dat = std::fs::OpenOptions::new()
             .write(true)
             .open(&dat_path)

@@ -1978,7 +1978,11 @@ mod tests {
 
         // Prime with one entry so the dat file has known content.
         f.append(b"AAAAAAAAA").unwrap();
-        let dat_path = dir.join("t_rollback").join("idx_meta").join("dat");
+        // RedEX persists files under `<channel>/v<live_gen>/{idx,dat,ts}`
+        // — pull the live directory off the disk segment so this
+        // test stays correct across compactions and on-disk format
+        // changes.
+        let dat_path = f.inner.disk.as_ref().unwrap().live_dir().join("dat");
         let pre_dat_len = std::fs::metadata(&dat_path).unwrap().len();
         assert_eq!(pre_dat_len, 9, "primed payload must be 9 bytes on disk");
 
@@ -2016,8 +2020,9 @@ mod tests {
         let f = make_persistent("t_rollback/ts_meta", &dir);
 
         f.append(b"AAAAAAAAA").unwrap();
-        let dat_path = dir.join("t_rollback").join("ts_meta").join("dat");
-        let idx_path = dir.join("t_rollback").join("ts_meta").join("idx");
+        let live = f.inner.disk.as_ref().unwrap().live_dir();
+        let dat_path = live.join("dat");
+        let idx_path = live.join("idx");
         let pre_dat_len = std::fs::metadata(&dat_path).unwrap().len();
         let pre_idx_len = std::fs::metadata(&idx_path).unwrap().len();
 
