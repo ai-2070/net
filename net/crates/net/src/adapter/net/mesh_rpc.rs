@@ -35,12 +35,13 @@ use tokio::task::JoinHandle;
 
 use super::channel::{ChannelId, ChannelName, ChannelPublisher, PublishConfig};
 use super::cortex::{
-    build_trace_headers, EventMeta, RpcAsyncResponseEmitter, RpcCancellationToken, RpcClientFold,
-    RpcContext, RpcHandler, RpcHandlerError, RpcInboundDispatcher, RpcInboundEvent,
-    RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload, RpcServerFold,
-    RpcServerStreamingFold, RpcStatus, RpcStreamingHandler, StreamItem, TraceContext,
-    DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST, EVENT_META_SIZE, FLAG_RPC_PROPAGATE_TRACE,
-    FLAG_RPC_STREAMING_RESPONSE,
+    build_trace_headers, encode_stream_grant, EventMeta, RpcAsyncResponseEmitter,
+    RpcCancellationToken, RpcClientFold, RpcContext, RpcHandler, RpcHandlerError,
+    RpcInboundDispatcher, RpcInboundEvent, RpcRequestPayload, RpcResponseEmitter,
+    RpcResponsePayload, RpcServerFold, RpcServerStreamingFold, RpcStatus, RpcStreamingHandler,
+    StreamItem, TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
+    DISPATCH_RPC_STREAM_GRANT, EVENT_META_SIZE, FLAG_RPC_PROPAGATE_TRACE,
+    FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_STREAM_WINDOW_INITIAL,
 };
 use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome};
 use crate::error::AdapterError;
@@ -119,6 +120,18 @@ pub struct CallOptions {
     /// this and the per-Mesh `RpcClientPending` doesn't bound
     /// in-flight count.
     pub max_in_flight_per_target: u32,
+    /// **Streaming responses only.** Initial credit window for
+    /// per-streaming-response flow control. When `Some(n)`, the
+    /// caller emits `nrpc-stream-window-initial: n` on the
+    /// REQUEST and the server's pump task awaits one credit per
+    /// emitted chunk. The returned [`RpcStream`] auto-grants 1
+    /// credit per consumed chunk so the in-flight credit holds
+    /// near `n` (or use [`RpcStream::grant`] for batched / custom
+    /// cadence). `None` (the default) → unbounded: server pumps
+    /// chunks as fast as the publish path can take them
+    /// (back-compat / pre-flow-control behavior). Ignored by
+    /// non-streaming `call` / `call_service`.
+    pub stream_window_initial: Option<u32>,
 }
 
 impl Default for CallOptions {
@@ -129,6 +142,7 @@ impl Default for CallOptions {
             filter_unhealthy: true,
             trace_context: None,
             max_in_flight_per_target: 64,
+            stream_window_initial: None,
         }
     }
 }
@@ -237,6 +251,12 @@ pub struct RpcStream {
     /// Set true once we've yielded the terminal item (or an
     /// error). Subsequent polls return `None`.
     done: bool,
+    /// `Some(_)` if this stream uses flow control (caller set
+    /// `CallOptions::stream_window_initial`). Auto-grant emits 1
+    /// credit per delivered chunk, which keeps the server's
+    /// credit at roughly the initial window. `None` → no flow
+    /// control; `poll_next` does not emit grants.
+    stream_window: Option<u32>,
 }
 
 impl RpcStream {
@@ -245,6 +265,73 @@ impl RpcStream {
     pub fn call_id(&self) -> u64 {
         self.call_id
     }
+
+    /// Whether this stream is flow-controlled (caller set
+    /// `CallOptions::stream_window_initial`). Useful for tests +
+    /// diagnostics; user code typically doesn't need to inspect
+    /// this.
+    pub fn flow_controlled(&self) -> bool {
+        self.stream_window.is_some()
+    }
+
+    /// Explicitly grant `amount` more credits to the server's
+    /// pump. Spawns a fire-and-forget publish; doesn't await
+    /// acknowledgement. **No-op when flow control was not enabled
+    /// for this stream** — the server would silently drop the
+    /// grant anyway, and emitting wire traffic with no purpose
+    /// would just burn bandwidth.
+    ///
+    /// Auto-grant (1 credit per delivered chunk) covers the
+    /// common case; use this for batched cadence (e.g. grant
+    /// `window/2` after every `window/2` chunks consumed) when
+    /// `auto_grant`-style amortization isn't enough.
+    pub fn grant(&self, amount: u32) {
+        if !self.flow_controlled() || amount == 0 {
+            return;
+        }
+        spawn_grant_publish(
+            Arc::clone(&self.mesh),
+            self.target_node_id,
+            self.request_channel.clone(),
+            self.self_origin,
+            self.call_id,
+            amount,
+        );
+    }
+}
+
+/// Shared fire-and-forget GRANT-publish helper. Used by
+/// [`RpcStream::grant`] (explicit) and the auto-grant in
+/// [`RpcStream::poll_next`]. Same direct-unicast publish path as
+/// [`spawn_cancel_publish`], just with a different dispatch byte
+/// + a 4-byte u32 payload.
+fn spawn_grant_publish(
+    mesh: Arc<MeshNode>,
+    target: u64,
+    request_channel: ChannelName,
+    self_origin: u64,
+    call_id: u64,
+    amount: u32,
+) {
+    tokio::spawn(async move {
+        let meta = EventMeta::new(DISPATCH_RPC_STREAM_GRANT, 0, self_origin, call_id, 0);
+        let request_channel_id = ChannelId::new(request_channel);
+        let request_channel_hash = request_channel_id.hash();
+        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + 4);
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&encode_stream_grant(amount));
+        let payload = Bytes::from(buf);
+        let _ = mesh
+            .publish_to_peer(
+                target,
+                request_channel_hash,
+                stream_id,
+                /* reliable */ true,
+                std::slice::from_ref(&payload),
+            )
+            .await;
+    });
 }
 
 impl futures::Stream for RpcStream {
@@ -259,6 +346,23 @@ impl futures::Stream for RpcStream {
         }
         match self.inner.poll_recv(cx) {
             std::task::Poll::Ready(Some(StreamItem::Chunk(body))) => {
+                // Auto-grant 1 credit per delivered chunk so the
+                // server's pump stays at roughly the initial
+                // window. No-op when the stream isn't flow-
+                // controlled. For batched cadence, callers can
+                // skip auto-grant by NOT setting
+                // `stream_window_initial` and using `RpcStream::grant`
+                // directly with their preferred batching.
+                if self.stream_window.is_some() {
+                    spawn_grant_publish(
+                        Arc::clone(&self.mesh),
+                        self.target_node_id,
+                        self.request_channel.clone(),
+                        self.self_origin,
+                        self.call_id,
+                        1,
+                    );
+                }
                 std::task::Poll::Ready(Some(Ok(body)))
             }
             std::task::Poll::Ready(Some(StreamItem::End)) => {
@@ -652,12 +756,20 @@ impl MeshNode {
 
         // Build the REQUEST: STREAMING_RESPONSE flag plus optional
         // trace-context headers / propagate-trace flag, same as
-        // unary `call`.
+        // unary `call`. Plus the optional flow-control header
+        // (`nrpc-stream-window-initial`) when the caller opted in
+        // via `CallOptions::stream_window_initial`.
         let mut flags = FLAG_RPC_STREAMING_RESPONSE;
         let mut headers = Vec::new();
         if let Some(tc) = opts.trace_context.as_ref() {
             flags |= FLAG_RPC_PROPAGATE_TRACE;
             headers.extend(build_trace_headers(tc));
+        }
+        if let Some(window) = opts.stream_window_initial {
+            headers.push((
+                HEADER_NRPC_STREAM_WINDOW_INITIAL.to_string(),
+                window.to_string().into_bytes(),
+            ));
         }
         let req = RpcRequestPayload {
             service: service.to_string(),
@@ -700,6 +812,7 @@ impl MeshNode {
             call_id,
             inner: rx,
             done: false,
+            stream_window: opts.stream_window_initial,
         })
     }
 

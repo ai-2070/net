@@ -212,6 +212,208 @@ async fn rpc_streaming_drop_cancels_handler() {
     );
 }
 
+/// Flow control: server emits 20 chunks back-to-back; caller
+/// sets `stream_window_initial = 3` and DOES NOT consume. The
+/// server-side metric `streaming_chunks_emitted_total` should
+/// stall at 3 (the initial window). Pin: server pump genuinely
+/// blocks on credit, not "everything goes through, caller just
+/// drains slowly."
+#[tokio::test]
+async fn rpc_streaming_window_throttles_pump_until_grants() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    /// Emits N chunks back-to-back via sink.send (handler-side
+    /// is non-blocking; the pump is what's flow-controlled).
+    struct EmitNHandler {
+        n: usize,
+    }
+    #[async_trait::async_trait]
+    impl net::adapter::net::cortex::RpcStreamingHandler for EmitNHandler {
+        async fn call(
+            &self,
+            _ctx: RpcContext,
+            sink: net::adapter::net::cortex::RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            for i in 0..self.n {
+                sink.send(format!("chunk-{i}").into_bytes());
+            }
+            Ok(())
+        }
+    }
+
+    let _serve = server
+        .serve_rpc_streaming("throttle", Arc::new(EmitNHandler { n: 20 }))
+        .expect("serve_rpc_streaming");
+
+    let stream = caller
+        .call_streaming(
+            server.node_id(),
+            "throttle",
+            Bytes::from_static(b""),
+            CallOptions {
+                stream_window_initial: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("call_streaming");
+    assert!(stream.flow_controlled(), "stream must be flow-controlled");
+
+    // DON'T poll. Wait for the server to attempt all 20 emits;
+    // flow control should hold the pump at 3.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let snap = server.rpc_metrics_snapshot();
+    let throttle = snap
+        .services
+        .iter()
+        .find(|s| s.service == "throttle")
+        .expect("throttle service must appear");
+    assert_eq!(
+        throttle.streaming_chunks_emitted_total, 3,
+        "pump must stop at initial_window=3 without grants; got {}",
+        throttle.streaming_chunks_emitted_total,
+    );
+
+    // Hold the stream so it doesn't drop and tear down the
+    // server-side handler. Drop releases the test's reference.
+    drop(stream);
+}
+
+/// Flow control under auto-grant: caller sets a small window, the
+/// server emits N >> window chunks, and the caller drains
+/// normally. RpcStream::poll_next auto-grants 1 credit per
+/// delivered chunk → server pump never starves → all N chunks
+/// arrive in order.
+#[tokio::test]
+async fn rpc_streaming_auto_grant_drains_full_stream_under_small_window() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    struct EmitN {
+        n: usize,
+    }
+    #[async_trait::async_trait]
+    impl net::adapter::net::cortex::RpcStreamingHandler for EmitN {
+        async fn call(
+            &self,
+            _ctx: RpcContext,
+            sink: net::adapter::net::cortex::RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            for i in 0..self.n {
+                sink.send(format!("c-{i}").into_bytes());
+            }
+            Ok(())
+        }
+    }
+
+    let _serve = server
+        .serve_rpc_streaming("autograntn", Arc::new(EmitN { n: 25 }))
+        .expect("serve_rpc_streaming");
+
+    use futures::StreamExt;
+    let mut stream = caller
+        .call_streaming(
+            server.node_id(),
+            "autograntn",
+            Bytes::from_static(b""),
+            CallOptions {
+                stream_window_initial: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("call_streaming");
+
+    let mut got = Vec::new();
+    while let Some(item) = stream.next().await {
+        got.push(String::from_utf8(item.expect("ok").to_vec()).unwrap());
+    }
+    let want: Vec<String> = (0..25).map(|i| format!("c-{i}")).collect();
+    assert_eq!(got, want, "auto-grant must let the full stream flow through");
+}
+
+/// Explicit `RpcStream::grant(n)` adds credit on demand. Pin:
+/// after open with window=2, manually granting 5 should let the
+/// pump emit (2 + 5) = 7 chunks total even with no auto-grant
+/// (which only fires when chunks are consumed via poll_next —
+/// here we never poll until the end).
+#[tokio::test]
+async fn rpc_streaming_explicit_grant_unblocks_pump() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    struct EmitN {
+        n: usize,
+    }
+    #[async_trait::async_trait]
+    impl net::adapter::net::cortex::RpcStreamingHandler for EmitN {
+        async fn call(
+            &self,
+            _ctx: RpcContext,
+            sink: net::adapter::net::cortex::RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            for i in 0..self.n {
+                sink.send(format!("g-{i}").into_bytes());
+            }
+            Ok(())
+        }
+    }
+
+    let _serve = server
+        .serve_rpc_streaming("explicitgrant", Arc::new(EmitN { n: 20 }))
+        .expect("serve_rpc_streaming");
+
+    let stream = caller
+        .call_streaming(
+            server.node_id(),
+            "explicitgrant",
+            Bytes::from_static(b""),
+            CallOptions {
+                stream_window_initial: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("call_streaming");
+
+    // Wait for the initial 2 credits to be consumed.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let snap = server.rpc_metrics_snapshot();
+    let svc = snap
+        .services
+        .iter()
+        .find(|s| s.service == "explicitgrant")
+        .unwrap();
+    assert_eq!(
+        svc.streaming_chunks_emitted_total, 2,
+        "pump must stall at the initial window with no consumption + no grants",
+    );
+
+    // Explicit grant of 5 → server should now emit 5 more (total 7).
+    stream.grant(5);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let snap = server.rpc_metrics_snapshot();
+    let svc = snap
+        .services
+        .iter()
+        .find(|s| s.service == "explicitgrant")
+        .unwrap();
+    assert_eq!(
+        svc.streaming_chunks_emitted_total, 7,
+        "after grant(5), pump must emit 5 more (total 7); got {}",
+        svc.streaming_chunks_emitted_total,
+    );
+
+    drop(stream);
+}
+
 /// Server emits 2 chunks then returns Err → caller sees those 2
 /// chunks then a terminal `RpcError::ServerError`.
 #[tokio::test]

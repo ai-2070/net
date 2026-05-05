@@ -58,6 +58,21 @@ pub const DISPATCH_RPC_CANCEL: u8 = 0x12;
 /// the request's `call_id`. Empty payload.
 pub const DISPATCH_RPC_DEADLINE_EXCEEDED: u8 = 0x13;
 
+/// Caller → server. Stream credit grant. Carries a 4-byte
+/// big-endian `u32` in the payload after `EventMeta`: the number
+/// of additional response chunks the caller is willing to accept
+/// for the streaming call identified by `EventMeta::seq_or_ts`.
+///
+/// Only meaningful when the caller opted into flow control via
+/// the `nrpc-stream-window-initial` request header
+/// ([`HEADER_NRPC_STREAM_WINDOW_INITIAL`]). On a flow-controlled
+/// stream the server's pump task awaits one credit per chunk; on
+/// a non-flow-controlled stream (no header) the server ignores
+/// every GRANT.
+///
+/// Phase 3.
+pub const DISPATCH_RPC_STREAM_GRANT: u8 = 0x14;
+
 // ============================================================================
 // `RpcRequestPayload::flags` bit assignments.
 // ============================================================================
@@ -644,6 +659,49 @@ pub const HEADER_NRPC_STREAMING_CONTINUE: &[u8] = b"continue";
 /// stream yields the error and closes.
 pub const HEADER_NRPC_STREAMING_END: &[u8] = b"end";
 
+/// Header on a streaming REQUEST that opts into flow control with
+/// the given initial credit window. Value is the ASCII decimal
+/// representation of a `u32` (e.g. `"32"`). When present, the
+/// server's streaming fold creates a per-call semaphore initialized
+/// to that count and the pump awaits one credit per emitted chunk.
+/// The caller refills via [`DISPATCH_RPC_STREAM_GRANT`] events.
+///
+/// Absent → unlimited credit (back-compat: behaves identically to
+/// the pre-flow-control streaming path).
+pub const HEADER_NRPC_STREAM_WINDOW_INITIAL: &str = "nrpc-stream-window-initial";
+
+/// Encode a stream-grant payload — 4 bytes big-endian `u32`
+/// representing additional credit. Pair with [`decode_stream_grant`]
+/// on the server side.
+pub fn encode_stream_grant(amount: u32) -> Vec<u8> {
+    amount.to_be_bytes().to_vec()
+}
+
+/// Decode a stream-grant payload. Returns `None` if the slice is
+/// not exactly 4 bytes — defends the server fold against
+/// malformed grants without killing the cortex adapter.
+pub fn decode_stream_grant(payload: &[u8]) -> Option<u32> {
+    if payload.len() != 4 {
+        return None;
+    }
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(payload);
+    Some(u32::from_be_bytes(bytes))
+}
+
+/// Parse the `nrpc-stream-window-initial` header from a request's
+/// header list. Returns `Some(window)` if a valid u32 ASCII-decimal
+/// value is present, else `None` (no header / malformed value /
+/// non-utf8 — all treated as "no flow control").
+pub fn parse_stream_window_initial(headers: &[RpcHeader]) -> Option<u32> {
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case(HEADER_NRPC_STREAM_WINDOW_INITIAL) {
+            return std::str::from_utf8(value).ok()?.parse::<u32>().ok();
+        }
+    }
+    None
+}
+
 /// Inspect a `RpcResponsePayload`'s headers and decide whether
 /// it's a non-terminal streaming chunk (`continue`), a terminal
 /// streaming chunk (`end` OR non-`Ok` status), OR a unary
@@ -1205,6 +1263,13 @@ pub struct RpcServerStreamingFold {
     handler: Arc<dyn RpcStreamingHandler>,
     emit: RpcAsyncResponseEmitter,
     in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    /// Per-call flow-control semaphore (when the caller opted in).
+    /// `Some(sem)` means "pump must `acquire().await` one permit
+    /// per chunk before emitting; STREAM_GRANT events
+    /// `add_permits(n)`". Absence of an entry for a `(origin,
+    /// call_id)` key means unbounded credit (back-compat —
+    /// pre-flow-control callers don't get throttled).
+    flow_control: Arc<Mutex<HashMap<(u64, u64), Arc<tokio::sync::Semaphore>>>>,
     /// Optional per-service metrics handle. Same shape as
     /// `RpcServerFold::metrics`; the streaming fold ALSO bumps
     /// `streaming_chunks_emitted_total` from the pump task on
@@ -1228,6 +1293,7 @@ impl RpcServerStreamingFold {
             handler,
             emit,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            flow_control: Arc::new(Mutex::new(HashMap::new())),
             metrics: None,
         }
     }
@@ -1302,9 +1368,21 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 // identical to the unary fold's pattern.
                 let cancellation = RpcCancellationToken::new();
                 self.in_flight.lock().insert(key, cancellation.clone());
+                // Flow-control opt-in: parse the
+                // `nrpc-stream-window-initial` header. When
+                // present, install a per-call semaphore the pump
+                // task will await per chunk; subsequent
+                // STREAM_GRANT events refill it. When absent, no
+                // entry → pump skips the await (back-compat).
+                let flow_sem = parse_stream_window_initial(&payload.headers).map(|n| {
+                    let sem = Arc::new(tokio::sync::Semaphore::new(n as usize));
+                    self.flow_control.lock().insert(key, sem.clone());
+                    sem
+                });
                 let handler = self.handler.clone();
                 let emit = self.emit.clone();
                 let in_flight = self.in_flight.clone();
+                let flow_control = self.flow_control.clone();
                 let caller_origin = meta.origin_hash;
                 let call_id = meta.seq_or_ts;
                 let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
@@ -1336,8 +1414,31 @@ impl RedexFold<()> for RpcServerStreamingFold {
                     let sink = RpcResponseSink { inner: tx };
                     let pump_emit = emit.clone();
                     let pump_metrics = metrics.clone();
+                    let pump_flow = flow_sem.clone();
                     let pump = tokio::spawn(async move {
                         while let Some(chunk) = rx.recv().await {
+                            // Flow control: when the caller opted
+                            // in, await one semaphore permit per
+                            // chunk before publishing. The semaphore
+                            // starts at the caller's `initial_window`
+                            // and refills when the caller sends
+                            // STREAM_GRANT events. `forget()`
+                            // consumes the slot — each chunk uses
+                            // exactly one credit, never returned.
+                            // No-op when `pump_flow` is None
+                            // (back-compat path).
+                            if let Some(sem) = pump_flow.as_ref() {
+                                let permit = match sem.clone().acquire_owned().await {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        // Semaphore was closed —
+                                        // shouldn't happen during
+                                        // normal operation; bail.
+                                        break;
+                                    }
+                                };
+                                permit.forget();
+                            }
                             if let Some(m) = pump_metrics.as_ref() {
                                 m.streaming_chunks_emitted_total
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1423,6 +1524,11 @@ impl RedexFold<()> for RpcServerStreamingFold {
                         }
                     };
                     in_flight.lock().remove(&key);
+                    // Drop the per-call flow-control semaphore
+                    // (if any) so a stale GRANT arriving after
+                    // termination is silently dropped — the entry
+                    // is gone, lookup misses.
+                    flow_control.lock().remove(&key);
                     // Await the terminal frame's publish too so it
                     // arrives strictly AFTER the last chunk on the
                     // wire (the pump has already drained, but the
@@ -1434,6 +1540,43 @@ impl RedexFold<()> for RpcServerStreamingFold {
             DISPATCH_RPC_CANCEL => {
                 if let Some(token) = self.in_flight.lock().remove(&key) {
                     token.cancel();
+                }
+                // Also drop the flow-control entry — the spawned
+                // task's terminal cleanup will run too, but doing
+                // it here makes the CANCEL path immediately stop
+                // refilling the pump (the pending `acquire().await`
+                // will resolve once the semaphore is dropped or
+                // when the task exits).
+                self.flow_control.lock().remove(&key);
+            }
+            DISPATCH_RPC_STREAM_GRANT => {
+                // Add credit to the per-call semaphore. Silently
+                // drop GRANT events for unknown / non-flow-
+                // controlled calls — server can't tell whether
+                // the caller is racing a terminal vs. sending a
+                // grant for a non-flow-controlled stream, and
+                // both are harmless to ignore.
+                let amount = match decode_stream_grant(&ev.payload[EVENT_META_SIZE..]) {
+                    Some(n) => n,
+                    None => {
+                        tracing::debug!(
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc streaming server fold: malformed STREAM_GRANT payload",
+                        );
+                        return Ok(());
+                    }
+                };
+                if amount == 0 {
+                    return Ok(());
+                }
+                if let Some(sem) = self.flow_control.lock().get(&key).cloned() {
+                    // Tokio's `Semaphore::add_permits` is bounded
+                    // by `MAX_PERMITS = usize::MAX >> 3`. A
+                    // misbehaving caller flooding huge grants
+                    // would eventually saturate; cap defensively.
+                    let safe = (amount as usize).min(usize::MAX >> 4);
+                    sem.add_permits(safe);
                 }
             }
             _ => {}
