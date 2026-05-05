@@ -31,7 +31,8 @@
 //! NRPC_BINDINGS_PLAN.md — the JS-side wrapper layer matches on
 //! the prefix to re-throw typed errors.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -39,6 +40,7 @@ use futures::StreamExt;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
+use tokio::task::AbortHandle;
 
 use ::net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
@@ -91,6 +93,61 @@ fn nrpc_err_from_inner(err: InnerRpcError) -> Error {
 }
 
 // ============================================================================
+// Cancellation surface.
+//
+// AbortSignal-friendly cancel registry for in-flight unary calls.
+// JS users mint a `cancelToken: bigint` via `MeshRpc.reserveCancelToken()`,
+// pass it on the call's options, then call `MeshRpc.cancelCall(token)`
+// from a parallel context (e.g. an AbortSignal listener). The Rust
+// side spawns the call as a tokio task whose `AbortHandle` is
+// stashed under the token; cancel triggers an abort which drops the
+// SDK future and fires CANCEL on the wire.
+// ============================================================================
+
+/// Monotonic counter for cancel tokens. Starts at 1 so 0 is the
+/// "no cancel" sentinel.
+static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Process-global cancel-token registry. Populated when a call
+/// is dispatched with a non-zero token; queried by `cancel_call`.
+fn cancel_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<u64, AbortHandle>> {
+    static REG: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, AbortHandle>>> =
+        OnceLock::new();
+    REG.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Internal sentinel for "task aborted by `cancel_call`."
+struct NodeCancelled;
+
+/// Run `fut` under a cancellable wrapper if `cancel_token != 0`,
+/// otherwise just `await` it directly. The cancellable path
+/// spawns the future as a tokio task and stashes its abort
+/// handle in the registry under the token; a parallel
+/// `cancel_call(token)` aborts mid-flight (drop fires CANCEL).
+async fn run_cancellable_call<F, T>(
+    cancel_token: u64,
+    fut: F,
+) -> std::result::Result<T, NodeCancelled>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    if cancel_token == 0 {
+        return Ok(fut.await);
+    }
+    let task = tokio::spawn(fut);
+    let abort_handle = task.abort_handle();
+    cancel_registry().lock().insert(cancel_token, abort_handle);
+    let result = task.await;
+    cancel_registry().lock().remove(&cancel_token);
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) if e.is_cancelled() => Err(NodeCancelled),
+        Err(_) => Err(NodeCancelled),
+    }
+}
+
+// ============================================================================
 // CallOptions — JS object surface.
 //
 // Subset of the inner CallOptions struct that's safe and useful to
@@ -114,17 +171,44 @@ pub struct CallOptions {
     /// `RpcStream::grant`." `None` (the default) → unbounded.
     /// Ignored by non-streaming `call` / `callService`.
     pub stream_window_initial: Option<u32>,
+    /// Caller-side cancel token for AbortSignal integration. Mint
+    /// via `MeshRpc.reserveCancelToken()`, pass here, then call
+    /// `MeshRpc.cancelCall(token)` from your AbortSignal listener
+    /// (or any other cancel trigger) to abort the in-flight call.
+    /// On cancel the call rejects with `nrpc:cancelled:` so user
+    /// code can match via `classifyError`. Defaults to no cancel
+    /// surface (cheaper fast path; no tokio spawn / registry
+    /// overhead).
+    pub cancel_token: Option<BigInt>,
 }
 
 impl CallOptions {
-    fn into_inner(self) -> InnerCallOptions {
+    /// Split the user-facing options into (inner SDK options,
+    /// optional cancel token). The cancel token is independent
+    /// of the SDK-level options and lives only on the binding
+    /// side.
+    fn split(self) -> (InnerCallOptions, u64) {
         let mut opts = InnerCallOptions::default();
         if let Some(ms) = self.deadline_ms {
             opts.deadline = Some(Instant::now() + Duration::from_millis(ms as u64));
         }
         opts.stream_window_initial = self.stream_window_initial;
         opts.routing_policy = InnerRoutingPolicy::default();
-        opts
+        let token = self
+            .cancel_token
+            .map(crate::common::bigint_u64)
+            .transpose()
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        (opts, token)
+    }
+
+    /// Convenience for paths that don't need the cancel token
+    /// (only `call_streaming` keeps using this — we don't yet
+    /// plumb cancel into streaming start).
+    fn into_inner(self) -> InnerCallOptions {
+        self.split().0
     }
 }
 
@@ -498,6 +582,34 @@ impl MeshRpc {
 
     // ---- call -----------------------------------------------------------
 
+    /// Reserve a fresh cancel token. Pass on a subsequent call
+    /// via `opts.cancelToken`; later, call
+    /// [`MeshRpc.cancel_call`] from anywhere to abort the in-
+    /// flight task. Tokens are monotonically increasing,
+    /// process-global, never reused — an unused reservation is
+    /// harmless (no cleanup required).
+    #[napi]
+    pub fn reserve_cancel_token(&self) -> BigInt {
+        BigInt::from(NEXT_CANCEL_TOKEN.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Abort the in-flight call associated with `token`.
+    /// Idempotent — no-op if the token was never used or the call
+    /// already finished. The aborted task drops the SDK future
+    /// (which fires CANCEL on the wire); the awaiting `call` /
+    /// `callService` rejects with `nrpc:cancelled:`.
+    #[napi]
+    pub fn cancel_call(&self, token: BigInt) -> Result<()> {
+        let token = crate::common::bigint_u64(token)?;
+        if token == 0 {
+            return Ok(());
+        }
+        if let Some(handle) = cancel_registry().lock().remove(&token) {
+            handle.abort();
+        }
+        Ok(())
+    }
+
     /// Direct-addressed unary call. Caller specifies
     /// `targetNodeId`; the SDK does NOT consult the capability
     /// index. Returns the response body as a Buffer; throws
@@ -511,18 +623,18 @@ impl MeshRpc {
         opts: Option<CallOptions>,
     ) -> Result<Buffer> {
         let target = crate::common::bigint_u64(target_node_id)?;
-        let opts = opts.unwrap_or_default().into_inner();
-        let reply = self
-            .node
-            .call(
-                target,
-                &service,
-                Bytes::copy_from_slice(request.as_ref()),
-                opts,
-            )
-            .await
-            .map_err(nrpc_err_from_inner)?;
-        Ok(Buffer::from(reply.body.as_ref()))
+        let (inner_opts, cancel_token) = opts.unwrap_or_default().split();
+        let node = self.node.clone();
+        let req_bytes = Bytes::copy_from_slice(request.as_ref());
+        let result = run_cancellable_call(cancel_token, async move {
+            node.call(target, &service, req_bytes, inner_opts).await
+        })
+        .await;
+        match result {
+            Ok(Ok(reply)) => Ok(Buffer::from(reply.body.as_ref())),
+            Ok(Err(e)) => Err(nrpc_err_from_inner(e)),
+            Err(NodeCancelled) => Err(nrpc_err("cancelled", "call cancelled by caller")),
+        }
     }
 
     /// Service-discovery unary call. Resolves `service` against
@@ -535,13 +647,18 @@ impl MeshRpc {
         request: Buffer,
         opts: Option<CallOptions>,
     ) -> Result<Buffer> {
-        let opts = opts.unwrap_or_default().into_inner();
-        let reply = self
-            .node
-            .call_service(&service, Bytes::copy_from_slice(request.as_ref()), opts)
-            .await
-            .map_err(nrpc_err_from_inner)?;
-        Ok(Buffer::from(reply.body.as_ref()))
+        let (inner_opts, cancel_token) = opts.unwrap_or_default().split();
+        let node = self.node.clone();
+        let req_bytes = Bytes::copy_from_slice(request.as_ref());
+        let result = run_cancellable_call(cancel_token, async move {
+            node.call_service(&service, req_bytes, inner_opts).await
+        })
+        .await;
+        match result {
+            Ok(Ok(reply)) => Ok(Buffer::from(reply.body.as_ref())),
+            Ok(Err(e)) => Err(nrpc_err_from_inner(e)),
+            Err(NodeCancelled) => Err(nrpc_err("cancelled", "call cancelled by caller")),
+        }
     }
 
     // ---- streaming ------------------------------------------------------

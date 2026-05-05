@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   classifyError,
+  RpcCancelledError,
   RpcCodecError,
   RpcError,
   RpcNoRouteError,
@@ -476,6 +477,134 @@ describe('HedgePolicy', () => {
 // mapping. See `src/mesh_rpc.rs::parse_js_app_error_*` tests for
 // the matching parser side.
 // ============================================================================
+
+// ============================================================================
+// AbortSignal integration — wireAbortSignal converts an AbortSignal
+// into a raw cancelToken + listener. The actual cancel propagation
+// requires the napi backend; here we exercise just the wrapper's
+// signal-handling behavior via a stub that records calls.
+// ============================================================================
+
+describe('AbortSignal wiring on the typed wrapper', () => {
+  // Stub raw MeshRpc that captures opts.cancelToken and supports
+  // reserveCancelToken / cancelCall. Lets us pin: (a) signal is
+  // translated to a non-zero cancelToken on the raw call, (b) abort
+  // fires cancelCall(token), (c) signal is detached after the call.
+  class CancelTrackingRaw {
+    public reservations: bigint[] = []
+    public capturedTokens: bigint[] = []
+    public cancelCalls: bigint[] = []
+    public capturedOpts: unknown = null
+    private nextToken = 100n
+    private callBlock?: () => Promise<Buffer>
+
+    setCallBlock(fn: () => Promise<Buffer>): void {
+      this.callBlock = fn
+    }
+
+    async call(
+      _target: bigint,
+      _service: string,
+      _req: Buffer,
+      opts?: { cancelToken?: bigint } & Record<string, unknown>,
+    ): Promise<Buffer> {
+      this.capturedOpts = opts
+      if (opts && opts.cancelToken !== undefined) {
+        this.capturedTokens.push(opts.cancelToken)
+      }
+      if (this.callBlock) {
+        return await this.callBlock()
+      }
+      return Buffer.from('null', 'utf-8')
+    }
+    async callService(
+      _service: string,
+      _req: Buffer,
+      _opts?: unknown,
+    ): Promise<Buffer> {
+      return Buffer.from('null', 'utf-8')
+    }
+    async callStreaming(): Promise<never> {
+      throw new Error('not implemented')
+    }
+    serve(): never {
+      throw new Error('not implemented')
+    }
+    findServiceNodes(): bigint[] {
+      return []
+    }
+    reserveCancelToken(): bigint {
+      const t = this.nextToken++
+      this.reservations.push(t)
+      return t
+    }
+    cancelCall(token: bigint): void {
+      this.cancelCalls.push(token)
+    }
+  }
+
+  it('strips signal from rawOpts and inserts a cancelToken', async () => {
+    const raw = new CancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw as unknown)
+    const ac = new AbortController()
+    await rpc.call(0n, 'echo', { x: 1 }, { signal: ac.signal })
+    expect(raw.reservations.length).toBe(1)
+    expect(raw.capturedTokens.length).toBe(1)
+    expect(raw.capturedTokens[0]).toBe(raw.reservations[0])
+    // signal must NOT be passed through to the napi side; it's a
+    // JS-only concept the napi struct doesn't understand.
+    expect(
+      (raw.capturedOpts as { signal?: AbortSignal }).signal,
+    ).toBeUndefined()
+  })
+
+  it('aborting the signal mid-call invokes raw.cancelCall(token)', async () => {
+    const raw = new CancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw as unknown)
+    const ac = new AbortController()
+    let resolveCall: ((b: Buffer) => void) | null = null
+    raw.setCallBlock(
+      () =>
+        new Promise<Buffer>((resolve) => {
+          resolveCall = resolve
+        }),
+    )
+    const callPromise = rpc.call(0n, 'echo', { x: 1 }, { signal: ac.signal })
+    // Yield once so the call has a chance to register the abort listener.
+    await new Promise((r) => setImmediate(r))
+    ac.abort()
+    expect(raw.cancelCalls.length).toBe(1)
+    expect(raw.cancelCalls[0]).toBe(raw.reservations[0])
+    // Resolve the underlying call so the test doesn't hang.
+    resolveCall!(Buffer.from('null', 'utf-8'))
+    await callPromise
+  })
+
+  it('rejects pre-aborted signals without starting the call', async () => {
+    const raw = new CancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw as unknown)
+    const ac = new AbortController()
+    ac.abort()
+    let caught: Error | null = null
+    try {
+      await rpc.call(0n, 'echo', { x: 1 }, { signal: ac.signal })
+    } catch (e) {
+      caught = e as Error
+    }
+    expect(caught).not.toBeNull()
+    expect(caught!.message).toContain('nrpc:cancelled:')
+    // No cancelCall invoked because we never minted a token.
+    expect(raw.reservations.length).toBe(0)
+    expect(raw.cancelCalls.length).toBe(0)
+  })
+
+  it('classifies nrpc:cancelled: as RpcCancelledError', () => {
+    const e = new Error('nrpc:cancelled: call cancelled by caller')
+    const typed = classifyError(e)
+    expect(typed).toBeInstanceOf(RpcCancelledError)
+    expect(typed).toBeInstanceOf(RpcError)
+  })
+})
 
 describe('appError', () => {
   it('formats canonical nrpc:app_error:0x<code>:<body>', () => {

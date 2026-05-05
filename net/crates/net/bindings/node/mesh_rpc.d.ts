@@ -18,6 +18,22 @@ export interface CallOptions {
    * response flow control. `undefined` → unbounded.
    */
   streamWindowInitial?: number
+  /**
+   * Caller-driven cancellation. Pass an `AbortSignal`; the typed
+   * wrapper attaches a one-shot listener that aborts the in-
+   * flight call. The call rejects with `RpcCancelledError`.
+   * Recognized by `TypedMeshRpc` only — the raw napi `MeshRpc`
+   * uses `cancelToken` directly (see {@link RawMeshRpcWithCancel}).
+   */
+  signal?: AbortSignal
+  /**
+   * Raw cancel token (advanced; usually set automatically by the
+   * typed wrapper from `signal`). Mint via
+   * `MeshRpc.reserveCancelToken()` and pair with
+   * `MeshRpc.cancelCall(token)`. Most users should use `signal`
+   * instead.
+   */
+  cancelToken?: bigint
 }
 
 /**
@@ -59,6 +75,10 @@ export interface RawMeshRpc {
     opts?: CallOptions,
   ): Promise<unknown>
   findServiceNodes(service: string): bigint[]
+  /** Mint a fresh cancel token (`bigint`). */
+  reserveCancelToken(): bigint
+  /** Abort the in-flight call associated with `token`. Idempotent. */
+  cancelCall(token: bigint): void
 }
 
 /**

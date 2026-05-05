@@ -96,6 +96,19 @@ export class RpcCodecError extends RpcError {
 }
 
 /**
+ * Caller-driven cancellation. Raised when an in-flight unary call
+ * is aborted via `MeshRpc.cancelCall(token)` or via an
+ * `AbortSignal` attached through the typed wrapper's
+ * `opts.signal`. CANCEL has been published to the server; the
+ * server-side handler observes its `ctx.cancellation` token.
+ * Caller-fixable / terminal — NOT retried by the default retry
+ * policy.
+ */
+export class RpcCancelledError extends RpcError {
+  constructor(detail?: string)
+}
+
+/**
  * Inspect a caught error's message prefix and return a typed
  * {@link CortexError} / {@link NetDbError} / {@link RpcError}
  * subclass if it matches the binding's contract. Non-matching

@@ -173,17 +173,34 @@ class TypedMeshRpc {
    * failure (matched by the napi prefix → JS class mapping in
    * `errors.js`).
    *
+   * Pass `opts.signal` (AbortSignal) for caller-driven
+   * cancellation. The wrapper mints a cancel token via the raw
+   * binding's `reserveCancelToken()`, attaches an abort listener,
+   * and lets the abort fire `cancelCall(token)` to drop the in-
+   * flight call (CANCEL fires on the wire, the call rejects with
+   * `nrpc:cancelled:`).
+   *
    * @template Req, Resp
    * @param {bigint} targetNodeId
    * @param {string} service
    * @param {Req} req
-   * @param {object} [opts] - { deadlineMs?, streamWindowInitial? }
+   * @param {object} [opts] - { deadlineMs?, streamWindowInitial?, signal? }
    * @returns {Promise<Resp>}
    */
   async call(targetNodeId, service, req, opts) {
     const reqBuf = jsonEncode(req)
-    const respBuf = await this._raw.call(targetNodeId, service, reqBuf, opts)
-    return jsonDecode(respBuf)
+    const { rawOpts, detach } = wireAbortSignal(this._raw, opts)
+    try {
+      const respBuf = await this._raw.call(
+        targetNodeId,
+        service,
+        reqBuf,
+        rawOpts,
+      )
+      return jsonDecode(respBuf)
+    } finally {
+      detach()
+    }
   }
 
   /**
@@ -194,13 +211,18 @@ class TypedMeshRpc {
    * @template Req, Resp
    * @param {string} service
    * @param {Req} req
-   * @param {object} [opts]
+   * @param {object} [opts] - { deadlineMs?, streamWindowInitial?, signal? }
    * @returns {Promise<Resp>}
    */
   async callService(service, req, opts) {
     const reqBuf = jsonEncode(req)
-    const respBuf = await this._raw.callService(service, reqBuf, opts)
-    return jsonDecode(respBuf)
+    const { rawOpts, detach } = wireAbortSignal(this._raw, opts)
+    try {
+      const respBuf = await this._raw.callService(service, reqBuf, rawOpts)
+      return jsonDecode(respBuf)
+    } finally {
+      detach()
+    }
   }
 
   /**
@@ -725,6 +747,59 @@ class CircuitBreaker {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Wire an AbortSignal (`opts.signal`) into the raw napi cancel
+ * surface. Returns `{ rawOpts, detach }`:
+ *
+ *   - `rawOpts` is the option object to pass to the raw call,
+ *     with `cancelToken` populated when a signal was provided
+ *     (the raw napi side does not understand `signal`).
+ *   - `detach` MUST be called from a `finally` block on the call
+ *     site to remove the abort listener regardless of
+ *     success/failure path. Idempotent.
+ *
+ * If no signal is provided (or the signal is already aborted),
+ * the wrapper either short-circuits or returns the rawOpts
+ * unchanged so the non-cancellable fast path stays free of
+ * tokio-spawn / registry overhead.
+ */
+function wireAbortSignal(raw, opts) {
+  if (!opts || !opts.signal) {
+    return { rawOpts: opts, detach: () => {} }
+  }
+  const signal = opts.signal
+  // If the signal is already aborted, fail fast — don't even
+  // start the call.
+  if (signal.aborted) {
+    throw new Error('nrpc:cancelled: AbortSignal already aborted')
+  }
+  // Mint a token, copy opts (drop `signal` since the napi side
+  // doesn't know it), attach a listener that calls cancelCall on
+  // abort. The listener removes itself on detach so the AbortSignal
+  // can be reused for a subsequent call without leaking handlers.
+  const token = raw.reserveCancelToken()
+  const rawOpts = { ...opts, cancelToken: token }
+  delete rawOpts.signal
+  let detached = false
+  const onAbort = () => {
+    if (detached) return
+    try {
+      raw.cancelCall(token)
+    } catch (_) {
+      /* swallow — best-effort */
+    }
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  return {
+    rawOpts,
+    detach: () => {
+      if (detached) return
+      detached = true
+      signal.removeEventListener('abort', onAbort)
+    },
+  }
 }
 
 /**

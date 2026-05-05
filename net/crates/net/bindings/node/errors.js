@@ -115,6 +115,22 @@ class RpcCodecError extends RpcError {
 }
 
 /**
+ * Caller-driven cancellation. Raised when an in-flight unary
+ * call is aborted via `MeshRpc.cancelCall(token)` or via an
+ * AbortSignal attached through the typed wrapper's `opts.signal`.
+ * CANCEL has been published to the server; the server-side
+ * handler observes its `ctx.cancellation` token. Caller-fixable
+ * / terminal — NOT retried by the default retry policy.
+ */
+class RpcCancelledError extends RpcError {
+  constructor(detail) {
+    super(detail ?? 'rpc cancelled')
+    this.name = 'RpcCancelledError'
+    Object.setPrototypeOf(this, RpcCancelledError.prototype)
+  }
+}
+
+/**
  * Inspect an error's message prefix and return a typed error if it
  * matches the napi binding's contract. Non-matching errors are
  * returned unchanged — caller can `throw` the result unconditionally.
@@ -154,6 +170,8 @@ function classifyRpcError(msg) {
       return new RpcCodecError(msg, 'encode')
     case 'codec_decode':
       return new RpcCodecError(msg, 'decode')
+    case 'cancelled':
+      return new RpcCancelledError(msg)
     default:
       return new RpcError(msg)
   }
@@ -168,5 +186,6 @@ module.exports = {
   RpcServerError,
   RpcTransportError,
   RpcCodecError,
+  RpcCancelledError,
   classifyError,
 }
