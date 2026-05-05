@@ -1444,6 +1444,7 @@ dependencies = [
  "ai2070-net",
  "ai2070-net-sdk",
  "arc-swap",
+ "async-trait",
  "bytes",
  "dashmap",
  "futures",

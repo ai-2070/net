@@ -15,6 +15,11 @@ mod compute;
 mod cortex;
 #[cfg(feature = "groups")]
 mod groups;
+// nRPC binding (B1: raw-bytes serve_rpc / call / call_streaming).
+// Reuses the cortex feature gate because nRPC is part of the
+// cortex / netdb feature unit.
+#[cfg(feature = "cortex")]
+mod mesh_rpc;
 #[cfg(feature = "net")]
 mod identity;
 #[cfg(feature = "redis")]
@@ -1893,12 +1898,12 @@ mod mesh_bindings {
         }
 
         /// Clone an `Arc<MeshNode>` out of the `ArcSwapOption`
-        /// slot. Used by sibling modules (currently: `compute`)
+        /// slot. Used by sibling modules (`compute`, `mesh_rpc`)
         /// that build their own SDK-level wrappers against the
         /// same live node — no second UDP socket, no second
         /// handshake table. Returns an error if the node has
         /// been shut down.
-        #[cfg(feature = "compute")]
+        #[cfg(any(feature = "compute", feature = "cortex"))]
         pub(crate) fn node_arc_clone(&self) -> Result<Arc<MeshNode>> {
             let guard = self.load_node()?;
             Ok(guard.as_ref().expect("load_node ensures Some").clone())
@@ -1906,7 +1911,15 @@ mod mesh_bindings {
 
         /// Share the `ChannelConfigRegistry` for sibling-module
         /// access. Same rationale as [`Self::node_arc_clone`].
-        #[cfg(feature = "compute")]
+        /// Currently consumed by `compute` only; nRPC's serve_rpc
+        /// auto-registers via the SDK glue without needing
+        /// per-binding access. Kept gated on either feature so the
+        /// accessor is available if `mesh_rpc` ever needs it.
+        #[cfg(any(feature = "compute", feature = "cortex"))]
+        #[cfg_attr(
+            all(feature = "cortex", not(feature = "compute")),
+            allow(dead_code)
+        )]
         pub(crate) fn channel_configs_arc(&self) -> Arc<net::adapter::net::ChannelConfigRegistry> {
             self.channel_configs.clone()
         }
