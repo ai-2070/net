@@ -1077,6 +1077,13 @@ pub struct MeshNode {
     /// subsequent calls to the same (target, service).
     rpc_reply_subscriptions:
         Arc<parking_lot::Mutex<Vec<(u64, String)>>>,
+    /// nRPC services the local node currently handles (registered
+    /// via `Mesh::serve_rpc`, deregistered when the `ServeHandle`
+    /// drops). `announce_capabilities` merges these as
+    /// `nrpc:<service>` tags into the announced `CapabilitySet`,
+    /// so other nodes' capability indexes can find this node via
+    /// `Mesh::find_service_nodes(name)`.
+    rpc_local_services: Arc<dashmap::DashSet<String>>,
     /// Optional migration subprotocol handler — same `ArcSwapOption`
     /// surface as on `MeshNode`, propagated into the dispatch
     /// context so the packet-receive loop stays lock-free.
@@ -1513,6 +1520,7 @@ impl MeshNode {
             ),
             rpc_next_call_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             rpc_reply_subscriptions: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            rpc_local_services: Arc::new(dashmap::DashSet::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             pending_direct_initiators,
@@ -4086,6 +4094,22 @@ impl MeshNode {
         self.identity.entity_id().origin_hash()
     }
 
+    /// Registry of nRPC services this node currently serves.
+    /// `mesh_rpc::serve_rpc` adds entries; `ServeHandle::Drop`
+    /// removes them. `announce_capabilities` reads this to
+    /// auto-merge `nrpc:<service>` tags.
+    pub(super) fn rpc_local_services_arc(&self) -> Arc<dashmap::DashSet<String>> {
+        self.rpc_local_services.clone()
+    }
+
+    /// Capability index — accessor for `mesh_rpc::Mesh::find_service_nodes`
+    /// to query nodes carrying the `nrpc:<service>` tag.
+    pub(super) fn capability_index_arc(
+        &self,
+    ) -> Arc<crate::adapter::net::behavior::capability::CapabilityIndex> {
+        self.capability_index.clone()
+    }
+
     /// Install a `ChannelConfigRegistry` whose `can_subscribe` /
     /// `can_publish` rules are consulted for incoming Subscribe
     /// messages.
@@ -5786,6 +5810,24 @@ impl MeshNode {
         ttl: Duration,
         sign: bool,
     ) -> Result<(), AdapterError> {
+        // Merge nRPC service registrations as `nrpc:<service>` tags.
+        // Other nodes' capability indexes pick these up, letting
+        // `Mesh::find_service_nodes(name)` resolve us as a server
+        // for the registered services. Local-only state from
+        // `Mesh::serve_rpc`; deduped against existing tags so a
+        // user that pre-tagged manually doesn't get double entries.
+        let caps = if self.rpc_local_services.is_empty() {
+            caps
+        } else {
+            let mut merged = caps;
+            for svc in self.rpc_local_services.iter() {
+                let tag = format!("nrpc:{}", svc.as_str());
+                if !merged.tags.iter().any(|t| t == &tag) {
+                    merged.tags.push(tag);
+                }
+            }
+            merged
+        };
         let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Piggyback the current NAT classification as a `nat:*`

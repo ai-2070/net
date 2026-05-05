@@ -20,8 +20,15 @@ What's landed in-tree (post-Phase-1 prerequisites):
   - **`ServeHandle`** (RAII) unregisters the dispatcher and aborts the bridge task on Drop.
   - **Per-Mesh state additions** on `MeshNode`: `rpc_client_pending: Arc<RpcClientPending>`, `rpc_next_call_id: Arc<AtomicU64>`, `rpc_reply_subscriptions: Arc<Mutex<Vec<(u64, String)>>>`. All initialized in the constructor, exposed via `pub(super)` accessors.
 - ✅ **End-to-end Mesh integration test** (`tests/integration_nrpc_mesh.rs`, 4 tests through real network handshake): round-trip echo, multiple sequential calls reusing the lazy reply subscription with exactly-once handler invocation, server panic surfaces as `Internal`, deadline emits CANCEL and surfaces as `Timeout` to the caller.
+- ✅ **Real-network queue-group coverage** (`tests/queue_group_dispatch.rs`, 2 tests): two `QueueGroup` subscribers on different nodes divide a stream of 100 events between them with exactly-once delivery; broadcast subscriber + queue-group pool coexist on one channel ("audit logger + worker pool" pattern from the design doc).
+- ✅ **Phase 2 first chunk: service discovery via capability announcements**. `Mesh::serve_rpc` auto-registers the service in a per-Mesh `rpc_local_services` set; `announce_capabilities[_with]` auto-merges `nrpc:<service>` tags onto the announced `CapabilitySet`, propagating through the existing capability-broadcast machinery. Two new public APIs:
+  - `Mesh::find_service_nodes(service) -> Vec<u64>` queries the local capability index for nodes carrying the `nrpc:<service>` tag.
+  - `Mesh::call_service(service, payload, opts) -> Result<RpcReply, RpcError>` shortcut: finds candidates, picks one via naive `call_id %  len()` round-robin, dispatches via the existing direct-addressed `call(target, ...)`. Returns `RpcError::NoRoute` if no servers advertise the tag.
+  
+  `ServeHandle::Drop` removes the service from the local registry so subsequent announcements stop emitting the tag.
+- ✅ **Phase 2 end-to-end test** (`tests/integration_nrpc_service_discovery.rs`, 2 tests): three nodes, two serve "echo", one caller uses `call_service` with no knowledge of target node IDs — asserts both servers are exercised by round-robin distribution, and that `call_service` for an unknown service returns `RpcError::NoRoute` with a diagnostic naming the missing tag.
 
-Phase 1 is functionally complete. The design has shipped with the asymmetric routing pattern (REQUESTs direct-unicast, RESPONSEs roster-based), which is the pragmatic Phase 1 answer to the publisher-led-roster constraint.
+Phase 1 + Phase 2 (first chunk) are functionally complete. The asymmetric routing pattern (REQUESTs direct-unicast, RESPONSEs roster-based) is what Phase 1 settled on and remains in Phase 2 — the discovery layer just removes the need for the caller to specify `target_node_id` explicitly.
 
 What's still pending:
 

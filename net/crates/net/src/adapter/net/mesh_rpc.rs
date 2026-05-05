@@ -125,8 +125,10 @@ pub enum RpcError {
 }
 
 /// RAII handle returned by [`MeshNode::serve_rpc`]. Dropping it
-/// unregisters the inbound dispatcher and stops the bridge task,
-/// removing the service from the local node.
+/// unregisters the inbound dispatcher, removes the service from
+/// the local-services registry (so subsequent
+/// `announce_capabilities` calls stop emitting the
+/// `nrpc:<service>` tag), and stops the bridge task.
 ///
 /// Outstanding handler executions (already-spawned tokio tasks)
 /// continue to completion — the handle's Drop only stops
@@ -134,6 +136,8 @@ pub enum RpcError {
 pub struct ServeHandle {
     /// Channel hash to unregister on Drop.
     channel_hash: u16,
+    /// Service name to remove from `rpc_local_services` on Drop.
+    service: String,
     /// The bridge task — `JoinHandle::abort` on Drop stops it.
     bridge: Option<JoinHandle<()>>,
     /// Hold an Arc back to the mesh so we can unregister on Drop
@@ -144,6 +148,7 @@ pub struct ServeHandle {
 impl Drop for ServeHandle {
     fn drop(&mut self) {
         self.mesh.unregister_rpc_inbound(self.channel_hash);
+        self.mesh.rpc_local_services_arc().remove(&self.service);
         if let Some(handle) = self.bridge.take() {
             handle.abort();
         }
@@ -273,11 +278,71 @@ impl MeshNode {
             }
         });
 
+        // Register in the local-services set so the next
+        // `announce_capabilities` call merges an `nrpc:<service>`
+        // tag onto the announced CapabilitySet, making this node
+        // discoverable via `Mesh::find_service_nodes(service)`.
+        self.rpc_local_services_arc().insert(service.to_string());
+
         Ok(ServeHandle {
             channel_hash,
+            service: service.to_string(),
             bridge: Some(bridge),
             mesh: Arc::clone(self),
         })
+    }
+
+    /// Find every node currently advertising `service` via the
+    /// `nrpc:<service>` capability tag. Returns node IDs in
+    /// roster order; the caller picks one (or use [`Self::call_service`]
+    /// for the round-robin shortcut).
+    ///
+    /// Pre-Phase 2: requires the target nodes to have called
+    /// `serve_rpc` AND `announce_capabilities` so the
+    /// `nrpc:<service>` tag has propagated through capability
+    /// announcements. The local node's own services are NOT
+    /// automatically included (callers don't typically invoke
+    /// themselves via the network — for in-process invocation,
+    /// the user has the handler directly).
+    pub fn find_service_nodes(&self, service: &str) -> Vec<u64> {
+        use crate::adapter::net::behavior::capability::CapabilityFilter;
+        let tag = format!("nrpc:{service}");
+        let filter = CapabilityFilter::default().require_tag(tag);
+        self.capability_index_arc().query(&filter)
+    }
+
+    /// Issue an RPC call to `service`, picking one node at random
+    /// from those advertising the `nrpc:<service>` tag in the
+    /// local capability index.
+    ///
+    /// Returns `RpcError::NoRoute` if no nodes advertise the
+    /// service. The selection is naive round-robin (`call_id %
+    /// nodes.len()`); future Phase 2 work will plug in
+    /// `RoutingPolicy` (P2C, Sticky, LowestLatency) here.
+    pub async fn call_service(
+        self: &Arc<Self>,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+    ) -> Result<RpcReply, RpcError> {
+        let candidates = self.find_service_nodes(service);
+        if candidates.is_empty() {
+            return Err(RpcError::NoRoute {
+                target: 0,
+                reason: format!(
+                    "no nodes advertise `nrpc:{service}` (have any servers \
+                     for this service called serve_rpc + announce_capabilities?)"
+                ),
+            });
+        }
+        // Naive round-robin via the per-Mesh call_id counter so
+        // selection across concurrent calls is balanced. Doesn't
+        // consult per-node health — Phase 2 plugs in proximity-
+        // driven scoring here.
+        let idx = (self.rpc_next_call_id_arc().load(Ordering::Relaxed) as usize)
+            % candidates.len();
+        let target = candidates[idx];
+        self.call(target, service, payload, opts).await
     }
 
     /// Issue an RPC call to `target_node_id` for `service`.
