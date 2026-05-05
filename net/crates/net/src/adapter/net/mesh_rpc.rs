@@ -1108,8 +1108,22 @@ impl MeshNode {
             .await
         {
             pending.cancel(call_id);
-            metrics_guard.record(CallOutcome::Transport);
-            return Err(RpcError::Transport(e));
+            // Distinguish "I don't know how to reach this peer"
+            // from a generic transport blip: when the publish path
+            // surfaces a no-session error, that's NoRoute (the
+            // routing layer's job, retry won't help). Other
+            // transport errors stay as Transport so retry is
+            // applicable.
+            return Err(if classify_publish_no_session(&e) {
+                metrics_guard.record(CallOutcome::NoRoute);
+                RpcError::NoRoute {
+                    target: target_node_id,
+                    reason: e.to_string(),
+                }
+            } else {
+                metrics_guard.record(CallOutcome::Transport);
+                RpcError::Transport(e)
+            });
         }
 
         // From here on, the REQUEST is in flight on the server.
@@ -1303,6 +1317,22 @@ pub enum ServeError {
 // ============================================================================
 // Helpers.
 // ============================================================================
+
+/// Detect the "publish_to_peer found no session for the target
+/// node id" sub-case of [`AdapterError::Connection`]. The
+/// publish path emits a message containing
+/// `"publish: no session for subscriber"` (see
+/// `mesh.rs::publish_to_peer`); when we observe that pattern we
+/// surface it as [`RpcError::NoRoute`] rather than `Transport`,
+/// because retrying the same target without a session is
+/// pointless and the right behavior for a routing helper is to
+/// try a different target.
+fn classify_publish_no_session(err: &AdapterError) -> bool {
+    match err {
+        AdapterError::Connection(msg) => msg.contains("no session for subscriber"),
+        _ => false,
+    }
+}
 
 fn instant_to_unix_nanos(instant: Instant) -> u64 {
     // `Instant` is monotonic and not wall-clock — convert via the
