@@ -1,0 +1,36 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_05_NRPC.md
+  cfca4517ad394ef2 1-131
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "a09c87221432b70a6b76007e835993c6bef7f381",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1427,
+      "total_deletions": 38,
+      "accepted_lines": 54,
+      "overriden_lines": 0
+    },
+    "cfca4517ad394ef2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c8c8999-2a05-4bfc-a843-35946dde9df4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 131,
+      "total_deletions": 0,
+      "accepted_lines": 131,
+      "overriden_lines": 0
+    }
+  }
+}
