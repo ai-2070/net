@@ -133,14 +133,34 @@ pub fn encode(msg: &MembershipMsg) -> Vec<u8> {
             let token_bytes: &[u8] = token.as_deref().unwrap_or(&[]);
             buf.put_u16_le(token_bytes.len() as u16);
             buf.extend_from_slice(token_bytes);
-            // Queue-group payload: u8 length + UTF-8 bytes. Zero
-            // length means `Broadcast`. Pre-queue-group senders that
-            // stop after the token are decoded as Broadcast (zero
-            // remaining → None) for forward compat. Names are bound
-            // by `MAX_QUEUE_GROUP_NAME_LEN` to keep the prefix u8.
-            let qg_bytes: &[u8] = queue_group.as_deref().map(|s| s.as_bytes()).unwrap_or(&[]);
-            buf.put_u8(qg_bytes.len() as u8);
-            buf.extend_from_slice(qg_bytes);
+            // Queue-group payload: u8 length + UTF-8 bytes. We
+            // OMIT the field entirely when `None` — the decoder
+            // treats zero remaining bytes after the token as
+            // Broadcast (queue_group = None), so `None` round-
+            // trips byte-equivalent to the pre-queue-group wire
+            // shape. This is load-bearing for backward
+            // compatibility: pre-queue-group nodes' strict-trailer
+            // guard rejects a SUBSCRIBE that has trailing bytes
+            // beyond the token, so always-emitting the `qg_len=0`
+            // byte would break new→old SUBSCRIBE delivery.
+            //
+            // Names are bound by `MAX_QUEUE_GROUP_NAME_LEN` to
+            // keep the prefix u8 — overlength names panic in debug
+            // (programmer error) and saturate in release. Encoders
+            // should pre-validate group names; the panic here is a
+            // last-resort defense, not a routine path.
+            if let Some(qg) = queue_group {
+                let qg_bytes = qg.as_bytes();
+                debug_assert!(
+                    qg_bytes.len() <= MAX_QUEUE_GROUP_NAME_LEN,
+                    "queue-group name {} exceeds MAX_QUEUE_GROUP_NAME_LEN ({})",
+                    qg_bytes.len(),
+                    MAX_QUEUE_GROUP_NAME_LEN,
+                );
+                let len = qg_bytes.len().min(MAX_QUEUE_GROUP_NAME_LEN) as u8;
+                buf.put_u8(len);
+                buf.extend_from_slice(&qg_bytes[..len as usize]);
+            }
         }
         MembershipMsg::Unsubscribe { channel, nonce } => {
             buf.put_u8(MSG_UNSUBSCRIBE);
@@ -665,6 +685,44 @@ mod tests {
         let bytes = encode(&msg);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    /// Backward-compat regression: encoding a SUBSCRIBE with
+    /// `queue_group: None` MUST produce a wire payload that is
+    /// byte-equivalent to what a pre-queue-group sender would
+    /// produce — i.e. ZERO trailing bytes after the token block.
+    /// Pre-queue-group nodes' decoders run a strict-trailer guard
+    /// that rejects any bytes past a valid token; if we always
+    /// emit the `qg_len=0` byte, those nodes reject every new-
+    /// sender SUBSCRIBE and roll-out becomes lockstep-only.
+    #[test]
+    fn subscribe_none_queue_group_omits_qg_byte_for_wire_compat() {
+        let new_msg = MembershipMsg::Subscribe {
+            channel: ch("sensors/lidar"),
+            nonce: 99,
+            token: None,
+            queue_group: None,
+        };
+        let new_bytes = encode(&new_msg);
+
+        // Build the exact byte sequence a pre-queue-group sender
+        // would emit (no qg byte at all).
+        use bytes::BufMut;
+        let mut legacy_bytes = Vec::new();
+        legacy_bytes.put_u8(MSG_SUBSCRIBE);
+        legacy_bytes.put_u64_le(99);
+        let name = b"sensors/lidar";
+        legacy_bytes.put_u8(name.len() as u8);
+        legacy_bytes.extend_from_slice(name);
+        legacy_bytes.put_u16_le(0);
+        // NO qg byte.
+
+        assert_eq!(
+            new_bytes, legacy_bytes,
+            "encode(queue_group: None) must be byte-equivalent to the \
+             pre-queue-group wire shape so old peers' strict-trailer \
+             guard accepts the SUBSCRIBE",
+        );
     }
 
     /// SUBSCRIBE with `queue_group: None` is byte-equivalent to a
