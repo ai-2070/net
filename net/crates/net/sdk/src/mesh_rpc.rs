@@ -24,10 +24,11 @@ use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 
 pub use net::adapter::net::cortex::{
-    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink, RpcStatus,
+    RpcStreamingHandler, StreamItem,
 };
 pub use net::adapter::net::mesh_rpc::{
-    CallOptions, RoutingPolicy, RpcError, RpcReply, ServeError, ServeHandle,
+    CallOptions, RoutingPolicy, RpcError, RpcReply, RpcStream, ServeError, ServeHandle,
 };
 
 use crate::error::{Result, SdkError};
@@ -266,6 +267,193 @@ impl Mesh {
                 message: format!("client decode: {e}"),
             })
     }
+
+    // ---- Streaming (raw) ----
+
+    /// Register a raw-bytes streaming RPC handler on `service`. The
+    /// handler receives the request body plus an [`RpcResponseSink`]
+    /// it writes raw chunks to via `sink.send(body)`. Wire codec is
+    /// the user's concern.
+    ///
+    /// Same auto-registration as [`Self::serve_rpc`] (request channel
+    /// plus reply prefix). For typed handlers (auto serde), use
+    /// [`Self::serve_rpc_streaming_typed`] instead.
+    pub fn serve_rpc_streaming<H: RpcStreamingHandler>(
+        &self,
+        service: &str,
+        handler: Arc<H>,
+    ) -> std::result::Result<ServeHandle, ServeError> {
+        self.auto_register_rpc_channels(service);
+        self.node().serve_rpc_streaming(service, handler)
+    }
+
+    /// Direct-addressed streaming call. Returns an [`RpcStream`] that
+    /// yields raw chunks as `Result<Bytes, RpcError>`. Dropping the
+    /// stream emits CANCEL to the server.
+    pub async fn call_streaming(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+    ) -> std::result::Result<RpcStream, RpcError> {
+        self.node()
+            .call_streaming(target_node_id, service, payload, opts)
+            .await
+    }
+
+    // ---- Streaming (typed) ----
+
+    /// Register a typed streaming RPC handler. The handler receives
+    /// a deserialized `Req` plus a [`ResponseSinkTyped<Resp>`] that
+    /// auto-encodes each `send(&value)` per the codec. Returning
+    /// `Ok(())` closes the stream cleanly; `Err(message)` closes it
+    /// with `RpcStatus::Application(0x4001)` and the message in the
+    /// terminal frame's body.
+    pub fn serve_rpc_streaming_typed<Req, Resp, F, Fut>(
+        &self,
+        service: &str,
+        codec: Codec,
+        handler: F,
+    ) -> std::result::Result<ServeHandle, ServeError>
+    where
+        Req: DeserializeOwned + Send + Sync + 'static,
+        Resp: Serialize + Send + Sync + 'static,
+        F: Fn(Req, ResponseSinkTyped<Resp>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
+    {
+        let typed = TypedStreamingRpcHandler {
+            codec,
+            inner: Arc::new(handler),
+            _req: std::marker::PhantomData::<Req>,
+            _resp: std::marker::PhantomData::<Resp>,
+        };
+        self.auto_register_rpc_channels(service);
+        self.node().serve_rpc_streaming(service, Arc::new(typed))
+    }
+
+    /// Direct-addressed typed streaming call. Encodes `request` via
+    /// `opts.codec`, opens the streaming call, returns an
+    /// [`RpcStreamTyped<Resp>`] that decodes each chunk on the fly.
+    /// Decode failures terminate the stream with a single
+    /// `RpcError::ServerError(Internal)` carrying the decode
+    /// diagnostic.
+    pub async fn call_streaming_typed<Req, Resp>(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        request: &Req,
+        opts: CallOptionsTyped,
+    ) -> std::result::Result<RpcStreamTyped<Resp>, RpcError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let body = opts.codec.encode(request).map_err(|e| RpcError::ServerError {
+            status: RpcStatus::Internal.to_wire(),
+            message: format!("client encode: {e}"),
+        })?;
+        let inner = self
+            .call_streaming(target_node_id, service, Bytes::from(body), opts.raw)
+            .await?;
+        Ok(RpcStreamTyped {
+            inner,
+            codec: opts.codec,
+            done: false,
+            _resp: std::marker::PhantomData,
+        })
+    }
+}
+
+// ============================================================================
+// Typed streaming sink + stream wrappers.
+// ============================================================================
+
+/// Typed counterpart of [`RpcResponseSink`]. Each `send(&value)`
+/// encodes via the codec captured at handler registration, then
+/// hands the bytes to the underlying raw sink.
+///
+/// Encode failures are surfaced as a `String` `Err` so the handler
+/// can decide whether to abort the stream (return `Err`) or
+/// continue. The raw sink itself never blocks and never errors
+/// from a back-pressure standpoint — it discards if the caller has
+/// already dropped the stream.
+pub struct ResponseSinkTyped<Resp> {
+    inner: RpcResponseSink,
+    codec: Codec,
+    _resp: std::marker::PhantomData<fn(Resp)>,
+}
+
+impl<Resp: Serialize> ResponseSinkTyped<Resp> {
+    /// Encode `value` with the captured codec and emit it as one
+    /// non-terminal chunk. Returns `Err(message)` if encoding fails;
+    /// the chunk is NOT sent in that case.
+    pub fn send(&self, value: &Resp) -> std::result::Result<(), String> {
+        let bytes = self
+            .codec
+            .encode(value)
+            .map_err(|e| format!("typed streaming sink encode: {e}"))?;
+        self.inner.send(bytes);
+        Ok(())
+    }
+}
+
+/// Typed counterpart of [`RpcStream`]. Auto-decodes each chunk to
+/// `Resp` per the codec captured at call time. Implements
+/// `futures::Stream<Item = Result<Resp, RpcError>>`.
+///
+/// **Decode failure terminates the stream** — once a chunk fails to
+/// decode, the next poll yields the decode-error `Err` and
+/// subsequent polls return `None`. The underlying [`RpcStream`]'s
+/// CANCEL-on-Drop semantics still apply.
+pub struct RpcStreamTyped<Resp> {
+    inner: RpcStream,
+    codec: Codec,
+    done: bool,
+    _resp: std::marker::PhantomData<fn() -> Resp>,
+}
+
+impl<Resp> RpcStreamTyped<Resp> {
+    /// Server-assigned `call_id` of the underlying stream — useful
+    /// for trace correlation / custom logging.
+    pub fn call_id(&self) -> u64 {
+        self.inner.call_id()
+    }
+}
+
+impl<Resp: DeserializeOwned + Unpin> futures::Stream for RpcStreamTyped<Resp> {
+    type Item = std::result::Result<Resp, RpcError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        let codec = self.codec;
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => match codec.decode::<Resp>(&bytes) {
+                Ok(value) => std::task::Poll::Ready(Some(Ok(value))),
+                Err(e) => {
+                    self.done = true;
+                    std::task::Poll::Ready(Some(Err(RpcError::ServerError {
+                        status: RpcStatus::Internal.to_wire(),
+                        message: format!("client decode: {e}"),
+                    })))
+                }
+            },
+            std::task::Poll::Ready(Some(Err(e))) => {
+                self.done = true;
+                std::task::Poll::Ready(Some(Err(e)))
+            }
+            std::task::Poll::Ready(None) => {
+                self.done = true;
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 // ============================================================================
@@ -325,6 +513,56 @@ where
             headers: vec![],
             body,
         })
+    }
+}
+
+// ============================================================================
+// Internal: typed streaming-handler adapter.
+//
+// Bridges `Fn(Req, ResponseSinkTyped<Resp>) -> Future<Result<(),
+// String>>` to the raw `RpcStreamingHandler` trait.
+// ============================================================================
+
+struct TypedStreamingRpcHandler<Req, Resp, F> {
+    codec: Codec,
+    inner: Arc<F>,
+    _req: std::marker::PhantomData<Req>,
+    _resp: std::marker::PhantomData<Resp>,
+}
+
+#[async_trait]
+impl<Req, Resp, F, Fut> RpcStreamingHandler for TypedStreamingRpcHandler<Req, Resp, F>
+where
+    Req: DeserializeOwned + Send + Sync + 'static,
+    Resp: Serialize + Send + Sync + 'static,
+    F: Fn(Req, ResponseSinkTyped<Resp>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
+{
+    async fn call(
+        &self,
+        ctx: RpcContext,
+        sink: RpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let req: Req = match self.codec.decode(&ctx.payload.body) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(RpcHandlerError::Application {
+                    code: 0x4000,
+                    message: format!("typed streaming handler: bad request body: {e}"),
+                })
+            }
+        };
+        let typed_sink = ResponseSinkTyped {
+            inner: sink,
+            codec: self.codec,
+            _resp: std::marker::PhantomData,
+        };
+        (self.inner)(req, typed_sink)
+            .await
+            .map_err(|message| RpcHandlerError::Application {
+                code: 0x4001,
+                message,
+            })
     }
 }
 

@@ -858,6 +858,22 @@ pub type RpcResponseEmitter = Arc<
     dyn Fn(u64, u64, RpcResponsePayload) + Send + Sync + 'static,
 >;
 
+/// Async counterpart of [`RpcResponseEmitter`] used by the
+/// streaming fold's pump task to serialize per-call publishes.
+///
+/// The streaming pump awaits each emit before reading the next
+/// chunk from the sink — this guarantees that chunks for one
+/// `call_id` reach the network publish path in the order the
+/// handler emitted them. (The unary fold has no such requirement
+/// — it emits exactly one RESPONSE per call — so it sticks with
+/// the simpler sync `RpcResponseEmitter`.)
+pub type RpcAsyncResponseEmitter = Arc<
+    dyn Fn(u64, u64, RpcResponsePayload) -> futures::future::BoxFuture<'static, ()>
+        + Send
+        + Sync
+        + 'static,
+>;
+
 /// Server-side fold. Sees REQUEST events on the configured channel,
 /// dispatches to the user-supplied handler, emits RESPONSE events
 /// via the supplied emitter. CANCEL events flip the matching
@@ -1141,15 +1157,21 @@ pub trait RpcStreamingHandler: Send + Sync + 'static {
 /// cancellation tokens) lives on `&mut self`.
 pub struct RpcServerStreamingFold {
     handler: Arc<dyn RpcStreamingHandler>,
-    emit: RpcResponseEmitter,
+    emit: RpcAsyncResponseEmitter,
     in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
 }
 
 impl RpcServerStreamingFold {
     /// Construct a streaming server fold. `emit` publishes
     /// individual chunks (and the terminal frame) on the caller's
-    /// reply channel — same emitter contract as the unary fold.
-    pub fn new(handler: Arc<dyn RpcStreamingHandler>, emit: RpcResponseEmitter) -> Self {
+    /// reply channel.
+    ///
+    /// Uses the **async** emitter variant so the pump task can
+    /// serialize per-call publishes — without that ordering
+    /// guarantee, two chunks emitted in succession can race into
+    /// the publish path and arrive at the caller out of order
+    /// (or be eclipsed by the terminal frame and lost entirely).
+    pub fn new(handler: Arc<dyn RpcStreamingHandler>, emit: RpcAsyncResponseEmitter) -> Self {
         Self {
             handler,
             emit,
@@ -1189,7 +1211,10 @@ impl RedexFold<()> for RpcServerStreamingFold {
                             call_id = meta.seq_or_ts,
                             "rpc streaming server fold: malformed request payload",
                         );
-                        // Surface as a terminal error chunk.
+                        // Surface as a terminal error chunk. Spawn
+                        // because the apply method is sync and the
+                        // emit is async; this is a one-shot publish
+                        // so ordering doesn't matter here.
                         let resp = RpcResponsePayload {
                             status: RpcStatus::UnknownVersion,
                             headers: vec![(
@@ -1198,7 +1223,12 @@ impl RedexFold<()> for RpcServerStreamingFold {
                             )],
                             body: format!("malformed request: {e}").into_bytes(),
                         };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        let emit = self.emit.clone();
+                        let caller_origin = meta.origin_hash;
+                        let call_id = meta.seq_or_ts;
+                        tokio::spawn(async move {
+                            emit(caller_origin, call_id, resp).await;
+                        });
                         return Ok(());
                     }
                 };
@@ -1241,7 +1271,14 @@ impl RedexFold<()> for RpcServerStreamingFold {
                                 )],
                                 body: chunk.to_vec(),
                             };
-                            pump_emit(caller_origin, call_id, resp);
+                            // Await per-chunk publish so chunks for
+                            // one call_id reach the network in send
+                            // order. Without this, two chunks emitted
+                            // in tight succession can race into the
+                            // publish path and arrive out of order
+                            // (or be eclipsed by the terminal frame
+                            // and lost entirely on the caller side).
+                            pump_emit(caller_origin, call_id, resp).await;
                         }
                     });
                     // Run the handler. Catch panics so a
@@ -1298,7 +1335,12 @@ impl RedexFold<()> for RpcServerStreamingFold {
                         }
                     };
                     in_flight.lock().remove(&key);
-                    emit(caller_origin, call_id, terminal);
+                    // Await the terminal frame's publish too so it
+                    // arrives strictly AFTER the last chunk on the
+                    // wire (the pump has already drained, but the
+                    // emit itself is still async and we must await
+                    // it before the spawned task ends).
+                    emit(caller_origin, call_id, terminal).await;
                 });
             }
             DISPATCH_RPC_CANCEL => {

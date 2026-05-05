@@ -41,13 +41,14 @@ pub use meta::{
 };
 pub use rpc::{
     build_trace_headers, classify_streaming_chunk, extract_trace_context, request_wire_size,
-    response_wire_size, RpcCancellationToken, RpcClientFold, RpcClientPending, RpcCodecError,
-    RpcContext, RpcHandler, RpcHandlerError, RpcHeader, RpcInboundDispatcher, RpcInboundEvent,
-    RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload, RpcResponseSink, RpcServerFold,
-    RpcServerStreamingFold, RpcStatus, RpcStreamingHandler, StreamItem, StreamingChunkKind,
-    TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_DEADLINE_EXCEEDED, DISPATCH_RPC_REQUEST,
-    DISPATCH_RPC_RESPONSE, FLAG_RPC_IDEMPOTENT, FLAG_RPC_PROPAGATE_TRACE,
-    FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_CONTINUE,
-    HEADER_NRPC_STREAMING_END, MAX_RPC_BODY_LEN, MAX_RPC_HEADERS, MAX_RPC_HEADER_NAME_LEN,
-    MAX_RPC_HEADER_VALUE_LEN, MAX_RPC_SERVICE_NAME_LEN,
+    response_wire_size, RpcAsyncResponseEmitter, RpcCancellationToken, RpcClientFold,
+    RpcClientPending, RpcCodecError, RpcContext, RpcHandler, RpcHandlerError, RpcHeader,
+    RpcInboundDispatcher, RpcInboundEvent, RpcRequestPayload, RpcResponseEmitter,
+    RpcResponsePayload, RpcResponseSink, RpcServerFold, RpcServerStreamingFold, RpcStatus,
+    RpcStreamingHandler, StreamItem, StreamingChunkKind, TraceContext, DISPATCH_RPC_CANCEL,
+    DISPATCH_RPC_DEADLINE_EXCEEDED, DISPATCH_RPC_REQUEST, DISPATCH_RPC_RESPONSE,
+    FLAG_RPC_IDEMPOTENT, FLAG_RPC_PROPAGATE_TRACE, FLAG_RPC_STREAMING_RESPONSE,
+    HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_CONTINUE, HEADER_NRPC_STREAMING_END,
+    MAX_RPC_BODY_LEN, MAX_RPC_HEADERS, MAX_RPC_HEADER_NAME_LEN, MAX_RPC_HEADER_VALUE_LEN,
+    MAX_RPC_SERVICE_NAME_LEN,
 };

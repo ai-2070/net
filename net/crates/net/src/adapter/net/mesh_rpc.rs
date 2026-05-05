@@ -35,11 +35,12 @@ use tokio::task::JoinHandle;
 
 use super::channel::{ChannelId, ChannelName, ChannelPublisher, PublishConfig};
 use super::cortex::{
-    build_trace_headers, EventMeta, RpcCancellationToken, RpcClientFold, RpcContext, RpcHandler,
-    RpcHandlerError, RpcInboundDispatcher, RpcInboundEvent, RpcRequestPayload,
-    RpcResponseEmitter, RpcResponsePayload, RpcServerFold, RpcServerStreamingFold, RpcStatus,
-    RpcStreamingHandler, StreamItem, TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
-    EVENT_META_SIZE, FLAG_RPC_PROPAGATE_TRACE, FLAG_RPC_STREAMING_RESPONSE,
+    build_trace_headers, EventMeta, RpcAsyncResponseEmitter, RpcCancellationToken, RpcClientFold,
+    RpcContext, RpcHandler, RpcHandlerError, RpcInboundDispatcher, RpcInboundEvent,
+    RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload, RpcServerFold,
+    RpcServerStreamingFold, RpcStatus, RpcStreamingHandler, StreamItem, TraceContext,
+    DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST, EVENT_META_SIZE, FLAG_RPC_PROPAGATE_TRACE,
+    FLAG_RPC_STREAMING_RESPONSE,
 };
 use crate::error::AdapterError;
 
@@ -474,37 +475,43 @@ impl MeshNode {
         let mesh_for_emit = Arc::clone(self);
         let service_for_emit = service.to_string();
         let server_origin = self.identity_origin_hash();
-        let emit: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
-            let mesh = Arc::clone(&mesh_for_emit);
-            let service = service_for_emit.clone();
-            tokio::spawn(async move {
-                let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
-                let reply_channel = match ChannelName::new(&reply_channel_name) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(error = %e, channel = %reply_channel_name,
-                            "rpc serve_rpc_streaming: invalid reply channel name");
-                        return;
+        // Async emit so the streaming fold's pump can `.await` each
+        // publish — guarantees per-call chunk ordering on the wire.
+        let emit: RpcAsyncResponseEmitter =
+            Arc::new(move |caller_origin, call_id, resp| {
+                let mesh = Arc::clone(&mesh_for_emit);
+                let service = service_for_emit.clone();
+                Box::pin(async move {
+                    let reply_channel_name =
+                        format!("{service}.replies.{caller_origin:016x}");
+                    let reply_channel = match ChannelName::new(&reply_channel_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(error = %e, channel = %reply_channel_name,
+                                "rpc serve_rpc_streaming: invalid reply channel name");
+                            return;
+                        }
+                    };
+                    let meta = EventMeta::new(
+                        super::cortex::DISPATCH_RPC_RESPONSE,
+                        0,
+                        server_origin,
+                        call_id,
+                        0,
+                    );
+                    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
+                    buf.extend_from_slice(&meta.to_bytes());
+                    buf.extend_from_slice(&resp.encode());
+                    let publisher =
+                        ChannelPublisher::new(reply_channel, PublishConfig::default());
+                    if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
+                        tracing::warn!(error = %e,
+                            caller_origin = format!("{:#x}", caller_origin),
+                            call_id,
+                            "rpc serve_rpc_streaming: chunk publish failed");
                     }
-                };
-                let meta = EventMeta::new(
-                    super::cortex::DISPATCH_RPC_RESPONSE,
-                    0,
-                    server_origin,
-                    call_id,
-                    0,
-                );
-                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
-                buf.extend_from_slice(&meta.to_bytes());
-                buf.extend_from_slice(&resp.encode());
-                let publisher =
-                    ChannelPublisher::new(reply_channel, PublishConfig::default());
-                if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
-                    tracing::warn!(error = %e, caller_origin = format!("{:#x}", caller_origin),
-                        call_id, "rpc serve_rpc_streaming: chunk publish failed");
-                }
+                })
             });
-        });
 
         let fold = Arc::new(Mutex::new(RpcServerStreamingFold::new(
             handler as Arc<dyn RpcStreamingHandler>,
