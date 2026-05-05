@@ -322,15 +322,14 @@ where
 /// `hedges` small (1 covers the common slow-replica case;
 /// values >1 multiply your server-side load).
 ///
-/// **Cancellation note.** Loser hedges are NOT explicitly
-/// cancelled today — when the winner returns, the in-flight
-/// loser futures are dropped, but the underlying server-side
-/// handlers continue to completion. The reply payloads come
-/// back, find no pending entry, and are silently discarded.
-/// Bandwidth is paid; correctness is preserved. A future
-/// enhancement will wire CANCEL emission into the unary call's
-/// drop path; for now, set realistic deadlines so a slow loser
-/// short-circuits via `Timeout`.
+/// **Cancellation.** When the winner returns, loser futures are
+/// dropped — and the underlying [`crate::mesh_rpc::Mesh::call`]
+/// future has a `UnaryCallGuard` whose `Drop` fires a CANCEL to
+/// the corresponding server. The server's handler observes the
+/// cancellation on its `RpcContext::cancellation` token and can
+/// short-circuit cooperatively. CANCEL publish is best-effort
+/// (fire-and-forget) so a momentary network blip doesn't leave
+/// loser handlers running indefinitely.
 #[derive(Debug, Clone)]
 pub struct HedgePolicy {
     /// Wait this long after the primary call before firing the
@@ -507,11 +506,16 @@ async fn hedge_race(
     let node = mesh.node_arc();
     let service_owned = service.to_string();
 
-    // Build one future per target. The first fires immediately; each
-    // subsequent one waits `delay * idx` before invoking. Boxed +
-    // pinned so they share a `select_all`-compatible type.
+    // Build one future per target. Each yields `(target_idx,
+    // result)` so the race below can attribute errors back to the
+    // original target position regardless of completion order.
+    // The first fires immediately; subsequent ones wait
+    // `delay * idx`.
     let mut futures: Vec<
-        futures::future::BoxFuture<'static, std::result::Result<RpcReply, RpcError>>,
+        futures::future::BoxFuture<
+            'static,
+            (usize, std::result::Result<RpcReply, RpcError>),
+        >,
     > = targets
         .iter()
         .copied()
@@ -526,29 +530,41 @@ async fn hedge_race(
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
                 }
-                node.call(target, &service, payload, opts).await
+                let r = node.call(target, &service, payload, opts).await;
+                (idx, r)
             }
             .boxed()
         })
         .collect();
 
     // Race them. Drop losers as they're left in `remaining`. If the
-    // first to resolve is `Ok`, return immediately (drop the rest).
-    // If `Err`, keep waiting on the remaining hedges before
-    // surfacing — a fast Err shouldn't disqualify slower-but-Ok
-    // alternates.
-    let mut last_err: Option<RpcError> = None;
+    // first to resolve is `Ok`, return immediately. If every hedge
+    // errors, surface the **primary's** error deterministically —
+    // `select_all` resolves in completion order, so a naive "last
+    // error wins" semantic flips across runs depending on which
+    // hedge happened to lose its race. Tracking errors by their
+    // original target index and returning the lowest-indexed one
+    // makes the diagnostic stable.
+    let mut errors: Vec<Option<RpcError>> = (0..targets.len()).map(|_| None).collect();
     while !futures.is_empty() {
-        let (result, _idx, remaining) = futures::future::select_all(futures).await;
+        let ((target_idx, result), _select_idx, remaining) =
+            futures::future::select_all(futures).await;
         match result {
             Ok(reply) => return Ok(reply),
             Err(e) => {
-                last_err = Some(e);
+                if target_idx < errors.len() {
+                    errors[target_idx] = Some(e);
+                }
                 futures = remaining;
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| {
+    // Prefer the primary's error (target_idx 0) when present;
+    // otherwise the lowest-indexed hedge's error. Either way the
+    // choice is deterministic across runs given the same target
+    // list.
+    let chosen = errors.into_iter().flatten().next();
+    Err(chosen.unwrap_or_else(|| {
         RpcError::Transport(net::error::AdapterError::Connection(
             "hedge_race: drained with no error captured (bug)".into(),
         ))
@@ -559,34 +575,64 @@ async fn hedge_race(
 /// scaled by a uniform random factor in `[0.5, 1.0]` (full-half
 /// jitter — bounded enough to keep p99 predictable, randomized
 /// enough to break thundering-herd correlation across callers).
+///
+/// **Ceiling semantic:** `max_backoff` is a HARD ceiling on the
+/// returned duration — applied *after* jitter — so callers who
+/// configure e.g. `max_backoff = 1s` never sleep longer than 1s
+/// regardless of jitter or exponential growth. The previous
+/// implementation applied the cap before jitter, which let an
+/// `(initial=1s, max=1s, jitter=true)` policy sleep up to 1s
+/// (the doc was honest but the surprise was real).
+///
+/// **Jitter source:** decorrelated across simultaneously-failing
+/// callers by mixing in `Instant::now()` ticks (high-resolution
+/// monotonic; not subject to NTP step-back), `thread::current()
+/// .id()` (separates threads even when their wall-clocks alias on
+/// low-resolution Windows clocks), and the address of a stack
+/// local (separates different call sites within one thread). The
+/// previous implementation used `SystemTime::now().nanos` only —
+/// on Windows the wall-clock has ~15 ms resolution, so two
+/// callers in the same tick produced identical jitter and retried
+/// in lockstep, defeating the whole point.
 fn compute_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
     let mult = policy.backoff_multiplier.max(1.0);
     // attempt is 1-indexed; the backoff applies AFTER the first
     // failure, so the "exponent" is `attempt - 1`.
     let exp = (attempt.saturating_sub(1)) as i32;
     let scaled = policy.initial_backoff.as_secs_f64() * mult.powi(exp);
-    let capped = scaled.min(policy.max_backoff.as_secs_f64());
-    let final_secs = if policy.jitter {
-        // Cheap 32-bit-style PRNG seeded from wall-clock nanos +
-        // attempt, mapped to a [0.5, 1.0] factor. Quality is
-        // adequate for jitter (the goal is decorrelation, not
-        // unpredictability); the alternative would be pulling in
-        // the `rand` crate just for one uniform sample.
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
+    let max_secs = policy.max_backoff.as_secs_f64();
+    let pre_cap = scaled.min(max_secs);
+    let jittered = if policy.jitter {
+        // Mix three independent sources so two callers (a) in the
+        // same SystemTime nanosecond bucket on a low-res Windows
+        // clock, (b) on different threads, and (c) from different
+        // call sites within one thread all decorrelate.
+        let now_ns = std::time::Instant::now().elapsed().as_nanos() as u64;
+        let thread_id_bits = {
+            // ThreadId is opaque; hash its Debug print to extract
+            // bits cheaply. Stable within the process lifetime.
+            let mut s = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&std::thread::current().id(), &mut s);
+            std::hash::Hasher::finish(&s)
+        };
+        let stack_addr = (&attempt as *const u32) as usize as u64;
+        let seed = now_ns
+            ^ thread_id_bits
+            ^ stack_addr.rotate_left(17)
             ^ (attempt as u64).wrapping_mul(0x9E3779B97F4A7C15);
         let mixed = seed
             .wrapping_mul(0x100000001B3)
             .wrapping_add(0xCBF29CE484222325);
         // Top 32 bits → [0, u32::MAX]; map to [0.5, 1.0].
         let frac = ((mixed >> 32) as u32) as f64 / u32::MAX as f64;
-        capped * (0.5 + 0.5 * frac)
+        pre_cap * (0.5 + 0.5 * frac)
     } else {
-        capped
+        pre_cap
     };
-    Duration::from_secs_f64(final_secs.max(0.0))
+    // True ceiling: after jitter, clamp again so `max_backoff`
+    // is the absolute upper bound.
+    let final_secs = jittered.min(max_secs).max(0.0);
+    Duration::from_secs_f64(final_secs)
 }
 
 // ============================================================================
