@@ -15,6 +15,12 @@ mod compute;
 mod groups;
 #[cfg(feature = "net")]
 mod identity;
+// nRPC binding (B3: raw-bytes serve_rpc / call / call_streaming).
+// Reuses the cortex feature gate because nRPC is part of the
+// cortex / netdb feature unit. Sync handler API; async-Python
+// handler support lands as a follow-up phase.
+#[cfg(feature = "cortex")]
+mod mesh_rpc;
 #[cfg(feature = "redis")]
 mod redis_dedup;
 #[cfg(feature = "net")]
@@ -2054,9 +2060,10 @@ mod mesh_bindings {
         }
 
         /// Clone the `Arc<MeshNode>` backing this `NetMesh`. Used
-        /// by the compute feature's `DaemonRuntime` to share the
-        /// live mesh node without opening a second socket.
-        #[cfg(feature = "compute")]
+        /// by sibling-feature modules (`compute`, `mesh_rpc`) to
+        /// share the live mesh node without opening a second
+        /// socket.
+        #[cfg(any(feature = "compute", feature = "cortex"))]
         pub(crate) fn node_arc_clone(&self) -> PyResult<Arc<MeshNode>> {
             self.node
                 .as_ref()
@@ -2064,18 +2071,24 @@ mod mesh_bindings {
                 .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
         }
 
-        /// Shared `ChannelConfigRegistry`. `DaemonRuntime` reuses
-        /// the registry for channel-bind replay on daemon spawn.
-        #[cfg(feature = "compute")]
+        /// Shared `ChannelConfigRegistry`. Currently consumed by
+        /// `compute` only; nRPC's `serve_rpc` auto-registers via
+        /// the SDK glue without needing per-binding access. Kept
+        /// gated on either feature so the accessor is available
+        /// if `mesh_rpc` ever needs it.
+        #[cfg(any(feature = "compute", feature = "cortex"))]
+        #[cfg_attr(
+            all(feature = "cortex", not(feature = "compute")),
+            allow(dead_code)
+        )]
         pub(crate) fn channel_configs_arc(&self) -> Arc<ChannelConfigRegistry> {
             self.channel_configs.clone()
         }
 
-        /// Shared tokio runtime. `DaemonRuntime` uses this for
-        /// async method bridging (`start`, `shutdown`, `spawn`,
-        /// `deliver`, migration calls) so we don't spin up a
-        /// second runtime per mesh.
-        #[cfg(feature = "compute")]
+        /// Shared tokio runtime. `DaemonRuntime` and `MeshRpc`
+        /// both use this for async method bridging so we don't
+        /// spin up a second runtime per mesh.
+        #[cfg(any(feature = "compute", feature = "cortex"))]
         pub(crate) fn runtime_arc(&self) -> Arc<Runtime> {
             self.runtime.clone()
         }
@@ -2140,6 +2153,33 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("CortexError", m.py().get_type::<cortex::CortexError>())?;
         m.add("NetDbError", m.py().get_type::<cortex::NetDbError>())?;
         m.add("RedexError", m.py().get_type::<cortex::RedexError>())?;
+        // nRPC surface (B3 raw-bytes phase). Typed wrappers + retry
+        // / hedge / breaker land in a follow-up phase as a Python
+        // wrapper module on top of these classes.
+        m.add_class::<mesh_rpc::PyMeshRpc>()?;
+        m.add_class::<mesh_rpc::PyServeHandle>()?;
+        m.add_class::<mesh_rpc::PyRpcStream>()?;
+        m.add("RpcError", m.py().get_type::<mesh_rpc::RpcError>())?;
+        m.add(
+            "RpcNoRouteError",
+            m.py().get_type::<mesh_rpc::RpcNoRouteError>(),
+        )?;
+        m.add(
+            "RpcTimeoutError",
+            m.py().get_type::<mesh_rpc::RpcTimeoutError>(),
+        )?;
+        m.add(
+            "RpcServerError",
+            m.py().get_type::<mesh_rpc::RpcServerError>(),
+        )?;
+        m.add(
+            "RpcTransportError",
+            m.py().get_type::<mesh_rpc::RpcTransportError>(),
+        )?;
+        m.add(
+            "RpcCodecError",
+            m.py().get_type::<mesh_rpc::RpcCodecError>(),
+        )?;
     }
     #[cfg(feature = "compute")]
     {
