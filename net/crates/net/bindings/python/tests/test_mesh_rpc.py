@@ -515,3 +515,75 @@ def test_typed_call_decode_failure_raises_codec_error() -> None:
 def test_status_constants_are_stable() -> None:
     assert NRPC_TYPED_BAD_REQUEST == 0x8000
     assert NRPC_TYPED_HANDLER_ERROR == 0x8001
+
+
+# =========================================================================
+# TypedMeshRpc.serve — typed-bad-request path
+# =========================================================================
+
+
+class _CapturingServeStub:
+    """Stub that captures the inner handler ``TypedMeshRpc.serve``
+    passes down to the raw layer, so we can drive the wrapper's
+    decode-failure path directly without a live binding."""
+
+    def __init__(self) -> None:
+        self.inner = None
+
+    def serve(self, service: str, handler) -> object:  # noqa: ARG002
+        self.inner = handler
+        return object()
+
+
+def test_typed_serve_decode_failure_raises_app_error_with_bad_request_status() -> None:
+    """Regression: a malformed request body must surface as a
+    canonical typed-bad-request — ``RpcAppError(NRPC_TYPED_BAD_REQUEST,
+    body)`` — NOT a generic ``RuntimeError`` that the binding
+    squashes into ``RpcStatus::Internal``. Pinned because the cross-
+    binding compat fixture (``golden_vectors.json``) and the Rust
+    integration test ``cross_lang_error_cases_surface_typed_bad_request``
+    both assert ``Application(0x8000)`` on this path.
+    """
+    from net.mesh_rpc import RpcAppError
+
+    stub = _CapturingServeStub()
+    rpc = TypedMeshRpc(stub)
+
+    def handler(_req):  # pragma: no cover — not reached for malformed input
+        return {"unused": True}
+
+    rpc.serve("echo_sum", handler)
+    assert stub.inner is not None
+
+    with pytest.raises(RpcAppError) as exc_info:
+        stub.inner(b"{not json")
+
+    err = exc_info.value
+    assert err.args[0] == NRPC_TYPED_BAD_REQUEST, (
+        "decode-failure must signal NRPC_TYPED_BAD_REQUEST (0x8000)"
+    )
+    body = err.args[1]
+    assert isinstance(body, (bytes, bytearray)), "body must be bytes for Rust to wire-encode"
+    import json as _json
+    decoded = _json.loads(bytes(body).decode("utf-8"))
+    assert decoded["error"] == "invalid_request"
+    assert "detail" in decoded
+
+
+def test_typed_serve_handler_runtime_exception_still_surfaces_as_internal() -> None:
+    """Sanity: a handler that raises a plain exception is NOT
+    coerced to RpcAppError — only decode failures are. The Rust
+    side maps the un-RpcAppError exception to RpcStatus::Internal
+    (the historical behavior; pinned so a future "everything maps
+    to AppError" regression is loud).
+    """
+    stub = _CapturingServeStub()
+    rpc = TypedMeshRpc(stub)
+
+    def handler(_req):
+        raise RuntimeError("boom")
+
+    rpc.serve("echo", handler)
+    assert stub.inner is not None
+    with pytest.raises(RuntimeError, match="boom"):
+        stub.inner(b'{"any": "valid_json"}')

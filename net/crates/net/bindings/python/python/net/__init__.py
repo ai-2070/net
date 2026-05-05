@@ -114,6 +114,7 @@ else:
 try:
     from ._net import (
         MeshRpc,
+        RpcAppError,
         RpcCodecError,
         RpcError,
         RpcNoRouteError,
@@ -129,6 +130,7 @@ else:
     __all__.extend(
         [
             "MeshRpc",
+            "RpcAppError",
             "RpcCodecError",
             "RpcError",
             "RpcNoRouteError",

@@ -119,6 +119,17 @@ create_exception!(
      the default retry policy."
 );
 
+create_exception!(
+    _net,
+    RpcAppError,
+    RpcError,
+    "Raised inside a serve handler to signal an application-defined status code \
+     (e.g. NRPC_TYPED_BAD_REQUEST = 0x8000). The Rust side translates a raised \
+     `RpcAppError(code, body)` into `RpcStatus::Application(code)` with `body` \
+     as the response body. Use this from typed wrappers to surface a typed \
+     bad-request without going through the generic Internal mapping."
+);
+
 // ============================================================================
 // Helpers — convert inner RpcError to the matching Python exception.
 // ============================================================================
@@ -212,6 +223,46 @@ struct PyRpcHandler {
     timeout: Duration,
 }
 
+/// Internal handler-return discriminator. Either an Ok body, or
+/// an application-status signal that the typed wrapper raised via
+/// `RpcAppError(code, body)` so the Rust side can emit
+/// `RpcResponsePayload { status: Application(code), body }` instead
+/// of squashing it into `RpcStatus::Internal`.
+enum HandlerOutcome {
+    Ok(Vec<u8>),
+    AppError { code: u16, body: Vec<u8> },
+}
+
+/// Inspect a Python exception. If it's an `RpcAppError(code, body)`,
+/// extract the (code, body) pair so the handler can surface it as
+/// `RpcResponsePayload { status: Application(code) }`. Anything
+/// else returns `None` and the caller maps to `Internal`.
+fn extract_app_error(py: Python<'_>, pyerr: &PyErr) -> Option<(u16, Vec<u8>)> {
+    if !pyerr.is_instance_of::<RpcAppError>(py) {
+        return None;
+    }
+    let value = pyerr.value(py);
+    let args = value.getattr("args").ok()?.cast_into::<PyTuple>().ok()?;
+    if args.len() < 2 {
+        return None;
+    }
+    let code: u16 = args.get_item(0).ok()?.extract().ok()?;
+    // The body field is canonically `bytes`. Accept `str` too — the
+    // typed wrapper's JSON encoder always produces utf-8 bytes, but
+    // a hand-written user handler that raises `RpcAppError(0x8001,
+    // "boom")` with a str shouldn't get a generic "must return
+    // bytes" — surface their string as the body.
+    let body_obj = args.get_item(1).ok()?;
+    let body: Vec<u8> = if let Ok(b) = body_obj.extract::<Vec<u8>>() {
+        b
+    } else if let Ok(s) = body_obj.extract::<String>() {
+        s.into_bytes()
+    } else {
+        return None;
+    };
+    Some((code, body))
+}
+
 #[async_trait::async_trait]
 impl RpcHandler for PyRpcHandler {
     async fn call(
@@ -226,45 +277,57 @@ impl RpcHandler for PyRpcHandler {
         let req_body = ctx.payload.body;
         let result = tokio::time::timeout(
             self.timeout,
-            tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-                Python::attach(|py| -> Result<Vec<u8>, String> {
+            tokio::task::spawn_blocking(move || -> Result<HandlerOutcome, String> {
+                Python::attach(|py| -> Result<HandlerOutcome, String> {
                     let req_bytes = PyBytes::new(py, &req_body);
                     let args = PyTuple::new(py, [req_bytes.into_any()])
                         .map_err(|e| format!("failed to build args: {e}"))?;
-                    let ret = callable
-                        .call1(py, args)
-                        .map_err(|e| format!("Python handler raised: {e}"))?;
-                    let bound = ret.into_bound(py);
-                    let bytes_vec: Vec<u8> = bound
-                        .extract()
-                        .map_err(|e| format!("Python handler must return bytes: {e}"))?;
-                    Ok(bytes_vec)
+                    match callable.call1(py, args) {
+                        Ok(ret) => {
+                            let bound = ret.into_bound(py);
+                            let bytes_vec: Vec<u8> = bound.extract().map_err(|e| {
+                                format!("Python handler must return bytes: {e}")
+                            })?;
+                            Ok(HandlerOutcome::Ok(bytes_vec))
+                        }
+                        Err(pyerr) => {
+                            if let Some((code, body)) = extract_app_error(py, &pyerr) {
+                                Ok(HandlerOutcome::AppError { code, body })
+                            } else {
+                                Err(format!("Python handler raised: {pyerr}"))
+                            }
+                        }
+                    }
                 })
             }),
         )
         .await;
 
-        let body = match result {
-            Ok(Ok(Ok(body))) => body,
-            Ok(Ok(Err(msg))) => return Err(RpcHandlerError::Internal(msg)),
-            Ok(Err(join_err)) => {
-                return Err(RpcHandlerError::Internal(format!(
-                    "spawn_blocking task panicked: {join_err}"
-                )))
+        match result {
+            Ok(Ok(Ok(HandlerOutcome::Ok(body)))) => Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body,
+            }),
+            Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
+                Err(RpcHandlerError::Application {
+                    code,
+                    // RpcHandlerError::Application carries `message:
+                    // String`. The fold encodes it as the response
+                    // body; lossy-utf8 is fine because the typed
+                    // wrappers always produce utf-8 JSON.
+                    message: String::from_utf8_lossy(&body).into_owned(),
+                })
             }
-            Err(_) => {
-                return Err(RpcHandlerError::Internal(format!(
-                    "Python handler did not respond within {} ms",
-                    self.timeout.as_millis()
-                )))
-            }
-        };
-
-        Ok(RpcResponsePayload {
-            status: RpcStatus::Ok,
-            headers: vec![],
-            body,
-        })
+            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
+                "spawn_blocking task panicked: {join_err}"
+            ))),
+            Err(_) => Err(RpcHandlerError::Internal(format!(
+                "Python handler did not respond within {} ms",
+                self.timeout.as_millis()
+            ))),
+        }
     }
 }
 

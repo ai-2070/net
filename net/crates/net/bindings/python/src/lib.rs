@@ -2177,6 +2177,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             "RpcCodecError",
             m.py().get_type::<mesh_rpc::RpcCodecError>(),
         )?;
+        m.add("RpcAppError", m.py().get_type::<mesh_rpc::RpcAppError>())?;
     }
     #[cfg(feature = "compute")]
     {

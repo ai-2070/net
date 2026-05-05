@@ -41,6 +41,7 @@ from typing import Any, Callable, Iterator, Optional, Sequence
 try:
     from net._net import (
         MeshRpc as _RawMeshRpc,
+        RpcAppError,
         RpcCodecError,
         RpcError,
         RpcNoRouteError,
@@ -59,6 +60,21 @@ except ImportError:  # pragma: no cover — feature-flag path
     RpcServerError = RpcError  # type: ignore[misc,assignment]
     RpcTransportError = RpcError  # type: ignore[misc,assignment]
     RpcCodecError = RpcError  # type: ignore[misc,assignment]
+
+    # Fallback `RpcAppError` carries (status, body) on `args` so the
+    # cross-binding semantics still hold against test stubs. The
+    # native class registered in lib.rs has the same shape; users
+    # writing typed handlers raise it identically in both paths.
+    class RpcAppError(RpcError):  # type: ignore[no-redef]
+        """Application-status signal for typed serve handlers.
+
+        Arguments: ``(status: int, body: bytes | str)``. The Rust
+        side translates this to ``RpcStatus::Application(status)``
+        with ``body`` as the response body. Pure-Python fallback
+        used when the native module isn't available; same shape so
+        user code is portable across both paths.
+        """
+
     ServeHandle = Any  # type: ignore[misc,assignment]
 
 
@@ -209,20 +225,28 @@ class TypedMeshRpc:
         decoded request and returns a response (which gets JSON-
         encoded back to the wire).
 
-        Encode/decode failures inside the handler surface to the
-        caller as ``RpcServerError`` (the napi binding maps the
-        handler exception to RpcStatus::Internal).
+        Decode failures on the request surface to the caller as a
+        canonical typed-bad-request: status
+        ``NRPC_TYPED_BAD_REQUEST`` (``0x8000``), JSON body
+        ``{"error": "invalid_request", "detail": ...}``. This
+        matches the Rust integration test contract pinned in
+        ``tests/integration_nrpc_cross_lang.rs`` and the cross-
+        binding fixture under
+        ``tests/cross_lang_nrpc/golden_vectors.json``. Other
+        handler-raised exceptions still map to
+        ``RpcStatus::Internal``; raise ``RpcAppError(status, body)``
+        explicitly to surface a custom application status.
         """
 
         def _wrapped(req_bytes: bytes) -> bytes:
             try:
                 req = _json_decode(req_bytes)
             except RpcCodecError as e:
-                # Re-raise as a generic exception so the binding
-                # reports it as RpcStatus::Internal. The caller's
-                # decode failure on the response would be the
-                # equivalent surface on the typed-call path.
-                raise RuntimeError(f"server-side decode failed: {e}") from e
+                body = json.dumps(
+                    {"error": "invalid_request", "detail": str(e)},
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                raise RpcAppError(NRPC_TYPED_BAD_REQUEST, body) from e
             resp = handler(req)
             return _json_encode(resp)
 
@@ -727,6 +751,7 @@ __all__ = [
     # wrapper AND the typed exceptions can `from net.mesh_rpc
     # import RpcCodecError` from one place. These are the SAME
     # objects exposed under `net.RpcError` etc.
+    "RpcAppError",
     "RpcCodecError",
     "RpcError",
     "RpcNoRouteError",
