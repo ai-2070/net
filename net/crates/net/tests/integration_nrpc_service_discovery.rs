@@ -34,7 +34,7 @@ use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
-use net::adapter::net::mesh_rpc::CallOptions;
+use net::adapter::net::mesh_rpc::{CallOptions, RoutingPolicy};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -195,6 +195,137 @@ async fn call_service_discovers_servers_via_capability_announcements() {
     assert!(
         a > 0 && b > 0,
         "round-robin must visit both servers across {n} calls; got A={a}, B={b}",
+    );
+}
+
+/// `RoutingPolicy::Sticky` consistently routes the same `key` to
+/// the same server across calls. Pin the contract: 20 calls with
+/// the same key all hit one server (count == 20 on one, 0 on the
+/// other); a different key may hit either, but a given key is
+/// stable.
+#[tokio::test]
+async fn sticky_routing_pins_a_key_to_one_server() {
+    let server_a = build_node().await;
+    let server_b = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server_a).await;
+    handshake_pair(&caller, &server_b).await;
+
+    let count_a = Arc::new(AtomicUsize::new(0));
+    let count_b = Arc::new(AtomicUsize::new(0));
+    let _serve_a = server_a
+        .serve_rpc(
+            "echo",
+            Arc::new(CountingEcho {
+                count: count_a.clone(),
+            }),
+        )
+        .expect("serve_rpc A");
+    let _serve_b = server_b
+        .serve_rpc(
+            "echo",
+            Arc::new(CountingEcho {
+                count: count_b.clone(),
+            }),
+        )
+        .expect("serve_rpc B");
+    server_a
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce A");
+    server_b
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce B");
+    assert!(
+        wait_until(
+            || caller.find_service_nodes("echo").len() == 2,
+            Duration::from_secs(5),
+        )
+        .await,
+    );
+
+    // 20 calls with key=42. All must land on the same server.
+    let opts = CallOptions {
+        routing_policy: RoutingPolicy::Sticky { key: 42 },
+        ..Default::default()
+    };
+    for _ in 0..20 {
+        caller
+            .call_service("echo", Bytes::from_static(b"sticky"), opts.clone())
+            .await
+            .expect("call_service");
+    }
+    let a = count_a.load(Ordering::Relaxed);
+    let b = count_b.load(Ordering::Relaxed);
+    assert_eq!(a + b, 20, "every call must land on exactly one server");
+    assert!(
+        (a == 20 && b == 0) || (a == 0 && b == 20),
+        "Sticky routing must pin all calls with the same key to one server; got A={a}, B={b}",
+    );
+}
+
+/// `RoutingPolicy::Random` distributes calls across both servers.
+/// We don't assert exact 50/50 (XX% variance is normal for small
+/// N), just that both servers are hit.
+#[tokio::test]
+async fn random_routing_distributes_across_servers() {
+    let server_a = build_node().await;
+    let server_b = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server_a).await;
+    handshake_pair(&caller, &server_b).await;
+
+    let count_a = Arc::new(AtomicUsize::new(0));
+    let count_b = Arc::new(AtomicUsize::new(0));
+    let _serve_a = server_a
+        .serve_rpc(
+            "echo",
+            Arc::new(CountingEcho {
+                count: count_a.clone(),
+            }),
+        )
+        .unwrap();
+    let _serve_b = server_b
+        .serve_rpc(
+            "echo",
+            Arc::new(CountingEcho {
+                count: count_b.clone(),
+            }),
+        )
+        .unwrap();
+    server_a
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .unwrap();
+    server_b
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .unwrap();
+    assert!(
+        wait_until(
+            || caller.find_service_nodes("echo").len() == 2,
+            Duration::from_secs(5),
+        )
+        .await,
+    );
+
+    let opts = CallOptions {
+        routing_policy: RoutingPolicy::Random,
+        ..Default::default()
+    };
+    for _ in 0..40 {
+        caller
+            .call_service("echo", Bytes::from_static(b"r"), opts.clone())
+            .await
+            .expect("call_service");
+    }
+    let a = count_a.load(Ordering::Relaxed);
+    let b = count_b.load(Ordering::Relaxed);
+    assert_eq!(a + b, 40, "every call must land on exactly one server");
+    assert!(
+        a > 0 && b > 0,
+        "Random must visit both servers across 40 calls; got A={a}, B={b}",
     );
 }
 

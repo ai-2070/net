@@ -26,9 +26,14 @@ What's landed in-tree (post-Phase-1 prerequisites):
   - `Mesh::call_service(service, payload, opts) -> Result<RpcReply, RpcError>` shortcut: finds candidates, picks one via naive `call_id %  len()` round-robin, dispatches via the existing direct-addressed `call(target, ...)`. Returns `RpcError::NoRoute` if no servers advertise the tag.
   
   `ServeHandle::Drop` removes the service from the local registry so subsequent announcements stop emitting the tag.
-- ✅ **Phase 2 end-to-end test** (`tests/integration_nrpc_service_discovery.rs`, 2 tests): three nodes, two serve "echo", one caller uses `call_service` with no knowledge of target node IDs — asserts both servers are exercised by round-robin distribution, and that `call_service` for an unknown service returns `RpcError::NoRoute` with a diagnostic naming the missing tag.
+- ✅ **Phase 2 end-to-end test** (`tests/integration_nrpc_service_discovery.rs`, 4 tests): three nodes, two serve "echo", one caller uses `call_service` — `call_service_discovers_servers_via_capability_announcements` asserts both servers are exercised by round-robin distribution; `sticky_routing_pins_a_key_to_one_server` pins consistency under `RoutingPolicy::Sticky`; `random_routing_distributes_across_servers` validates `RoutingPolicy::Random`; `call_service_with_no_servers_returns_no_route` returns `RpcError::NoRoute` with a diagnostic naming the missing tag.
+- ✅ **`RoutingPolicy` enum** plumbed onto `CallOptions` (default `RoundRobin`):
+  - `RoundRobin` — naive `call_id % len`. Even distribution.
+  - `Random` — xxh3 of `call_id`, modulo. Stateless, even.
+  - `Sticky { key: u64 }` — xxh3 of key, modulo a sorted candidate list. Same key → same target while the candidate set is stable. Useful for session affinity / shard routing / conversation pinning.
+  - **Deferred** to a follow-up: `LowestLatency` and a `filter_unhealthy: bool` option. Both depend on a `EntityId ↔ node_id` bridge — `ProximityGraph` is keyed on `EntityId` ([u8; 32]) while `find_service_nodes` returns `Vec<u64>` (session node ids). The mapping exists (`MeshNode::peer_entity_ids`) but isn't currently exposed; wiring it through is a small follow-up.
 
-Phase 1 + Phase 2 (first chunk) are functionally complete. The asymmetric routing pattern (REQUESTs direct-unicast, RESPONSEs roster-based) is what Phase 1 settled on and remains in Phase 2 — the discovery layer just removes the need for the caller to specify `target_node_id` explicitly.
+Phase 1 + Phase 2 (first chunk + routing policies) are functionally complete. The asymmetric routing pattern (REQUESTs direct-unicast, RESPONSEs roster-based) is what Phase 1 settled on and remains in Phase 2 — the discovery layer just removes the need for the caller to specify `target_node_id` explicitly, and the routing policies let the caller hint at session affinity or even distribution.
 
 What's still pending:
 

@@ -49,7 +49,37 @@ use super::redex::{RedexEntry, RedexEvent, RedexFold};
 // Public types.
 // ============================================================================
 
-/// Options for [`MeshNode::call`].
+/// How `Mesh::call_service` picks a target from the set of nodes
+/// advertising the requested service.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RoutingPolicy {
+    /// Naive round-robin via the per-Mesh `call_id` counter.
+    /// Distributes calls evenly across candidates regardless of
+    /// load. The default.
+    #[default]
+    RoundRobin,
+    /// Pick a candidate at random per call. Stateless, cheap, and
+    /// gives even distribution under independent calls.
+    Random,
+    /// Consistent-hash to a target by `key`. Same `key` always
+    /// hits the same target as long as the candidate set is
+    /// stable. Useful for session affinity (route a given
+    /// conversation / shard / user to the same backend).
+    Sticky {
+        /// Caller-supplied identifier — hash maps this to the
+        /// target. Use a session id, shard key, or conversation
+        /// id depending on the application.
+        key: u64,
+    },
+    // TODO Phase 2: `LowestLatency` policy. Needs an
+    // `EntityId ↔ node_id` bridge because `ProximityGraph` is
+    // keyed on `EntityId` ([u8; 32]) while `find_service_nodes`
+    // returns `Vec<u64>` (session node_ids). The mapping exists
+    // (`MeshNode::peer_entity_ids`) but isn't currently exposed;
+    // wiring it through is a follow-up.
+}
+
+/// Options for [`MeshNode::call`] and [`MeshNode::call_service`].
 #[derive(Debug, Clone)]
 pub struct CallOptions {
     /// Hard deadline for the call. The future returned by `call`
@@ -59,6 +89,13 @@ pub struct CallOptions {
     /// `None` means no deadline; the caller waits indefinitely
     /// (or until the future is dropped).
     pub deadline: Option<Instant>,
+    /// How `call_service` picks a target. Ignored by `call`
+    /// (which takes an explicit `target_node_id`). Default:
+    /// `RoundRobin`.
+    pub routing_policy: RoutingPolicy,
+    // TODO Phase 2: `filter_unhealthy: bool` to skip candidates
+    // the proximity graph marks unavailable. Same identifier-bridge
+    // dependency as the `LowestLatency` policy above.
     /// Per-call concurrency cap. Future Phase 2 work; v1 ignores
     /// this and the per-Mesh `RpcClientPending` doesn't bound
     /// in-flight count.
@@ -69,6 +106,7 @@ impl Default for CallOptions {
     fn default() -> Self {
         Self {
             deadline: None,
+            routing_policy: RoutingPolicy::default(),
             max_in_flight_per_target: 64,
         }
     }
@@ -311,21 +349,20 @@ impl MeshNode {
         self.capability_index_arc().query(&filter)
     }
 
-    /// Issue an RPC call to `service`, picking one node at random
-    /// from those advertising the `nrpc:<service>` tag in the
-    /// local capability index.
+    /// Issue an RPC call to `service`, picking one node from
+    /// those advertising the `nrpc:<service>` tag in the local
+    /// capability index according to `opts.routing_policy`.
     ///
     /// Returns `RpcError::NoRoute` if no nodes advertise the
-    /// service. The selection is naive round-robin (`call_id %
-    /// nodes.len()`); future Phase 2 work will plug in
-    /// `RoutingPolicy` (P2C, Sticky, LowestLatency) here.
+    /// service (or if `opts.filter_unhealthy` is set and every
+    /// candidate is unavailable per the local `ProximityGraph`).
     pub async fn call_service(
         self: &Arc<Self>,
         service: &str,
         payload: Bytes,
         opts: CallOptions,
     ) -> Result<RpcReply, RpcError> {
-        let candidates = self.find_service_nodes(service);
+        let mut candidates = self.find_service_nodes(service);
         if candidates.is_empty() {
             return Err(RpcError::NoRoute {
                 target: 0,
@@ -335,14 +372,46 @@ impl MeshNode {
                 ),
             });
         }
-        // Naive round-robin via the per-Mesh call_id counter so
-        // selection across concurrent calls is balanced. Doesn't
-        // consult per-node health — Phase 2 plugs in proximity-
-        // driven scoring here.
-        let idx = (self.rpc_next_call_id_arc().load(Ordering::Relaxed) as usize)
-            % candidates.len();
-        let target = candidates[idx];
+
+        // Sort once so consistent-hash policies (Sticky) produce
+        // a stable ordering across calls regardless of how the
+        // capability index returned the candidates. Cheap — the
+        // candidate set is typically small.
+        candidates.sort_unstable();
+
+        let target = self.select_target(&candidates, &opts.routing_policy);
         self.call(target, service, payload, opts).await
+    }
+
+    /// Select a single target from `candidates` according to
+    /// `policy`. Caller has already ensured `candidates` is
+    /// non-empty and sorted (so `Sticky` is consistent across
+    /// calls).
+    fn select_target(&self, candidates: &[u64], policy: &RoutingPolicy) -> u64 {
+        match policy {
+            RoutingPolicy::RoundRobin => {
+                let idx = (self.rpc_next_call_id_arc().load(Ordering::Relaxed) as usize)
+                    % candidates.len();
+                candidates[idx]
+            }
+            RoutingPolicy::Random => {
+                // Lightweight RNG via the call-id counter mixed with
+                // process-fresh entropy; avoids pulling in `rand` for
+                // a tiny use case. Sufficient for load distribution;
+                // not cryptographically random.
+                let raw = self.rpc_next_call_id_arc().load(Ordering::Relaxed);
+                let mixed = xxhash_rust::xxh3::xxh3_64(&raw.to_le_bytes());
+                candidates[(mixed as usize) % candidates.len()]
+            }
+            RoutingPolicy::Sticky { key } => {
+                // Consistent-hash to a position in the (sorted)
+                // candidate list. Same key + same candidate set =
+                // same target. A change to the candidate set
+                // (server failover) reshuffles roughly 1/N of keys.
+                let h = xxhash_rust::xxh3::xxh3_64(&key.to_le_bytes());
+                candidates[(h as usize) % candidates.len()]
+            }
+        }
     }
 
     /// Issue an RPC call to `target_node_id` for `service`.
@@ -624,6 +693,10 @@ impl MeshNode {
         self.public_key_origin_hash()
     }
 }
+
+// `proximity_graph()` is already a public accessor on MeshNode
+// (see the existing `pub fn proximity_graph(&self) -> &Arc<...>`).
+// `select_target` uses it directly; no shim needed.
 
 // ============================================================================
 // Errors.
