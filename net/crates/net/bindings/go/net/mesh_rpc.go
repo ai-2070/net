@@ -106,10 +106,11 @@ extern int net_rpc_find_service_nodes(
     char** out_err
 );
 
+extern uint64_t net_rpc_reserve_handler_id(void);
 extern ServeHandleC* net_rpc_serve(
     MeshRpcHandle* handle,
     const char* service_ptr, size_t service_len,
-    uint64_t* out_handler_id,
+    uint64_t handler_id,
     char** out_err
 );
 extern uint64_t net_rpc_serve_handle_id(const ServeHandleC* handle);
@@ -685,9 +686,20 @@ type ServeHandle struct {
 	closed    atomic.Bool
 }
 
+// ErrAlreadyServing is returned by Serve when the underlying
+// MeshNode already has a handler registered for the requested
+// service. Use `errors.Is(err, ErrAlreadyServing)` to dispatch.
+var ErrAlreadyServing = errors.New("net.Serve: service already served by this MeshNode")
+
 // Serve registers `handler` for `service`. The returned
 // `*ServeHandle` MUST be closed when the service should stop
 // accepting new requests.
+//
+// Pre-registers the handler in the Go-side dispatch registry
+// BEFORE crossing the FFI boundary, closing the
+// "request-arrives-before-Store" race: a request landing in the
+// Tokio dispatcher between `serve_rpc` returning and any
+// language-side bookkeeping must always find the callable.
 func (r *MeshRpc) Serve(service string, handler Handler) (*ServeHandle, error) {
 	if r.closed.Load() {
 		return nil, ErrClosed
@@ -696,29 +708,43 @@ func (r *MeshRpc) Serve(service string, handler Handler) (*ServeHandle, error) {
 		return nil, errors.New("net.Serve: handler must be non-nil")
 	}
 	registerDispatcher()
+
+	// 1. Reserve the id Rust will use for this handler. The Rust
+	//    side hands out monotonic ids and never reuses; an unused
+	//    reservation is harmless.
+	hID := uint64(C.net_rpc_reserve_handler_id())
+
+	// 2. Insert the callable BEFORE calling serve. Even if the
+	//    very first request lands the instant `net_rpc_serve`
+	//    returns, the trampoline finds the handler.
+	handlerRegistry.Store(hID, handler)
+
 	cService := stringToCBytes(service)
 	defer C.free(cService.ptr)
 
-	var outHandlerID C.uint64_t
 	var outErr *C.char
-
-	// Reserve an id by pre-registering a placeholder; the Rust side
-	// allocates its own id and writes it to outHandlerID. We then
-	// move the registry entry under the right key. This avoids the
-	// "request lands before registry insert" race noted in the
-	// plan.
 	handle := C.net_rpc_serve(
 		r.handle,
 		(*C.char)(cService.ptr), cService.len,
-		&outHandlerID,
+		C.uint64_t(hID),
 		&outErr,
 	)
 	if handle == nil {
+		// Roll the registry insert back so a retry doesn't trip
+		// over a stale dispatcher entry — and so we don't leak
+		// the user's `handler` reference forever.
+		handlerRegistry.Delete(hID)
 		msg := readCError(outErr)
+		// Surface ServeError::AlreadyServing as a typed sentinel
+		// so callers can branch on `errors.Is(err, ErrAlreadyServing)`.
+		// The Rust side's `Display` for ServeError emits messages
+		// like `"serve failed: already serving service \"...\""`;
+		// match on the substring to map.
+		if strings.Contains(msg, "already serving") {
+			return nil, fmt.Errorf("%w: %s", ErrAlreadyServing, msg)
+		}
 		return nil, fmt.Errorf("serve failed: %s", msg)
 	}
-	hID := uint64(outHandlerID)
-	handlerRegistry.Store(hID, handler)
 
 	sh := &ServeHandle{rpc: r, handle: handle, handlerID: hID}
 	runtime.SetFinalizer(sh, (*ServeHandle).finalize)
