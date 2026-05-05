@@ -20,10 +20,6 @@
 //   const policy = new RetryPolicy({ maxAttempts: 3 })
 //   const reply = await rpc.callWithRetry(targetId, 'echo', req, undefined, policy)
 
-'use strict'
-
-const native = require('./index')
-
 // Convention: every error this module throws is a plain `Error`
 // with a stable `nrpc:<kind>:` message prefix. User code's catch
 // sites should call `classifyError(e)` from `@ai2070/net/errors`
@@ -42,6 +38,110 @@ const native = require('./index')
 // dual-module-safe) and `err.message` prefix.
 
 // ============================================================================
+// Native binding shape — runtime-loaded via require('./index').
+//
+// The auto-generated `index.d.ts` shipped today was emitted from
+// a napi build without the `cortex` feature, so it doesn't carry
+// types for `MeshRpc` / `ServeHandle` / `RpcStream`. Released
+// builds (which DO include cortex) provide these classes at
+// runtime — we declare a minimal structural shape here so
+// the TS source compiles independently of which features the
+// linked .node binary was built with.
+// ============================================================================
+
+/**
+ * Per-call options forwarded to the raw napi `MeshRpc`. Mirrors
+ * the napi `CallOptions` struct. Routing policy + trace context
+ * land in a later phase.
+ */
+export interface CallOptions {
+  /** Hard deadline, milliseconds from now. */
+  deadlineMs?: number
+  /**
+   * Streaming-only: initial credit window for per-streaming-
+   * response flow control. `undefined` → unbounded.
+   */
+  streamWindowInitial?: number
+  /**
+   * Caller-driven cancellation. Pass an `AbortSignal`; the typed
+   * wrapper attaches a one-shot listener that aborts the in-
+   * flight call. The call rejects with `RpcCancelledError`.
+   * Recognized by `TypedMeshRpc` only — the raw napi `MeshRpc`
+   * uses `cancelToken` directly.
+   */
+  signal?: AbortSignal
+  /**
+   * Raw cancel token (advanced; usually set automatically by the
+   * typed wrapper from `signal`). Mint via
+   * `MeshRpc.reserveCancelToken()` and pair with
+   * `MeshRpc.cancelCall(token)`. Most users should use `signal`
+   * instead.
+   */
+  cancelToken?: bigint
+}
+
+/**
+ * Handle returned by {@link TypedMeshRpc.serve}. Calling `close()`
+ * unregisters the service; in-flight handlers continue to
+ * completion. Always call `close()` explicitly when done — V8 GC
+ * eventually finalizes the underlying napi class but timing is
+ * non-deterministic.
+ */
+export interface ServeHandle {
+  close(): void
+  isClosed(): boolean
+}
+
+/**
+ * Raw napi `MeshRpc` shape. Test stubs and the runtime-loaded
+ * `native.MeshRpc` instance both conform to this interface. Used
+ * as the `TypedMeshRpc` constructor parameter type.
+ */
+export interface RawMeshRpc {
+  serve(service: string, handler: (req: Buffer) => Promise<Buffer>): ServeHandle
+  call(
+    targetNodeId: bigint,
+    service: string,
+    request: Buffer,
+    opts?: CallOptions,
+  ): Promise<Buffer>
+  callService(
+    service: string,
+    request: Buffer,
+    opts?: CallOptions,
+  ): Promise<Buffer>
+  callStreaming(
+    targetNodeId: bigint,
+    service: string,
+    request: Buffer,
+    opts?: CallOptions,
+  ): Promise<RawRpcStream>
+  findServiceNodes(service: string): bigint[]
+  /** Mint a fresh cancel token (`bigint`). */
+  reserveCancelToken(): bigint
+  /** Abort the in-flight call associated with `token`. Idempotent. */
+  cancelCall(token: bigint): void
+}
+
+/** Raw napi `RpcStream` — minimal shape consumed by `TypedRpcStream`. */
+export interface RawRpcStream {
+  next(): Promise<Buffer | null>
+  grant(n: number): Promise<void>
+  flowControlled(): Promise<boolean>
+  close(): Promise<void>
+}
+
+/** Module-level shape of the napi `_net` runtime exports. */
+interface NativeBindings {
+  MeshRpc: {
+    fromMesh(mesh: object): RawMeshRpc
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const native = require('./index') as NativeBindings
+
+// ============================================================================
 // JSON codec.
 //
 // Default codec for typed wrappers. Matches the Rust SDK's
@@ -54,12 +154,13 @@ const native = require('./index')
 const utf8 = new TextEncoder()
 const utf8d = new TextDecoder('utf-8', { fatal: true })
 
-function jsonEncode(value) {
-  let json
+function jsonEncode(value: unknown): Buffer {
+  let json: string | undefined
   try {
     json = JSON.stringify(value)
   } catch (e) {
-    throw new Error(`nrpc:codec_encode: ${e?.message ?? e}`)
+    const detail = e instanceof Error ? e.message : String(e)
+    throw new Error(`nrpc:codec_encode: ${detail}`)
   }
   if (json === undefined) {
     // JSON.stringify(undefined) === undefined. nRPC expects bytes.
@@ -70,27 +171,14 @@ function jsonEncode(value) {
   return Buffer.from(utf8.encode(json))
 }
 
-function jsonDecode(buf) {
+function jsonDecode(buf: Buffer): unknown {
   try {
     return JSON.parse(utf8d.decode(buf))
   } catch (e) {
-    throw new Error(`nrpc:codec_decode: ${e?.message ?? e}`)
+    const detail = e instanceof Error ? e.message : String(e)
+    throw new Error(`nrpc:codec_decode: ${detail}`)
   }
 }
-
-// ============================================================================
-// Wrap-and-rethrow helper.
-//
-// Every public typed call passes through this so a raw napi
-// `Error` (with `nrpc:` prefix) becomes the appropriate
-// `RpcError` subclass before it bubbles to user code. Without
-// this the user has to call `classifyError(e)` themselves at
-// every catch site.
-// ============================================================================
-
-// (No internal classification — see top-of-file note. Errors are
-// re-thrown as-is with their `nrpc:` prefix; user catch sites
-// call `classifyError` to reconstruct typed instances.)
 
 // ============================================================================
 // TypedMeshRpc — the user-facing typed wrapper class.
@@ -104,28 +192,32 @@ function jsonDecode(buf) {
 // land further down — they're separate so the user can mix-and-match.
 // ============================================================================
 
-class TypedMeshRpc {
+/** Handler signature: receives the decoded request and returns a response. */
+export type TypedHandler<Req = unknown, Resp = unknown> = (
+  req: Req,
+) => Resp | Promise<Resp>
+
+export class TypedMeshRpc {
+  private readonly _raw: RawMeshRpc
+
   /**
    * Build a TypedMeshRpc against a NetMesh. Cheap; returns a
    * new wrapper around an internal raw MeshRpc.
-   * @param {object} mesh - a NetMesh from `@ai2070/net`
-   * @returns {TypedMeshRpc}
    */
-  static fromMesh(mesh) {
+  static fromMesh(mesh: object): TypedMeshRpc {
     return new TypedMeshRpc(native.MeshRpc.fromMesh(mesh))
   }
 
   /**
    * Build a TypedMeshRpc from an already-constructed raw MeshRpc.
    * Useful if you need the raw + typed surface side by side.
-   * @param {object} rawMeshRpc
    */
-  constructor(rawMeshRpc) {
+  constructor(rawMeshRpc: RawMeshRpc) {
     this._raw = rawMeshRpc
   }
 
-  /** Underlying raw {@link MeshRpc} for users who want the Buffer-level surface. */
-  get raw() {
+  /** Underlying raw `MeshRpc` for users who want the Buffer-level surface. */
+  get raw(): RawMeshRpc {
     return this._raw
   }
 
@@ -135,14 +227,12 @@ class TypedMeshRpc {
    * encode/decode happens at the binding boundary; encode
    * failure inside the handler surfaces to the caller as
    * `RpcServerError(status=0x0006 Internal)`.
-   *
-   * @template Req, Resp
-   * @param {string} service
-   * @param {(req: Req) => Resp | Promise<Resp>} handler
-   * @returns {object} ServeHandle
    */
-  serve(service, handler) {
-    return this._raw.serve(service, async (reqBuf) => {
+  serve<Req = unknown, Resp = unknown>(
+    service: string,
+    handler: TypedHandler<Req, Resp>,
+  ): ServeHandle {
+    return this._raw.serve(service, async (reqBuf: Buffer): Promise<Buffer> => {
       // Decode failures on the request surface to the caller as
       // a canonical typed-bad-request: the Rust binding maps any
       // promise rejection whose message starts with
@@ -152,13 +242,14 @@ class TypedMeshRpc {
       // Status 0x8000 == NRPC_TYPED_BAD_REQUEST per the cross-
       // binding contract pinned in
       // `tests/cross_lang_nrpc/golden_vectors.json`.
-      let req
+      let req: Req
       try {
-        req = jsonDecode(reqBuf)
+        req = jsonDecode(reqBuf) as Req
       } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e)
         const body = JSON.stringify({
           error: 'invalid_request',
-          detail: e?.message ?? String(e),
+          detail,
         })
         throw appError(0x8000, body)
       }
@@ -179,15 +270,13 @@ class TypedMeshRpc {
    * and lets the abort fire `cancelCall(token)` to drop the in-
    * flight call (CANCEL fires on the wire, the call rejects with
    * `nrpc:cancelled:`).
-   *
-   * @template Req, Resp
-   * @param {bigint} targetNodeId
-   * @param {string} service
-   * @param {Req} req
-   * @param {object} [opts] - { deadlineMs?, streamWindowInitial?, signal? }
-   * @returns {Promise<Resp>}
    */
-  async call(targetNodeId, service, req, opts) {
+  async call<Req = unknown, Resp = unknown>(
+    targetNodeId: bigint,
+    service: string,
+    req: Req,
+    opts?: CallOptions,
+  ): Promise<Resp> {
     const reqBuf = jsonEncode(req)
     const { rawOpts, detach } = wireAbortSignal(this._raw, opts)
     try {
@@ -197,7 +286,7 @@ class TypedMeshRpc {
         reqBuf,
         rawOpts,
       )
-      return jsonDecode(respBuf)
+      return jsonDecode(respBuf) as Resp
     } finally {
       detach()
     }
@@ -207,19 +296,17 @@ class TypedMeshRpc {
    * Service-discovery typed call. Resolves `service` against the
    * local capability index, picks a target per the routing
    * policy, calls. Throws an `RpcError` subclass on failure.
-   *
-   * @template Req, Resp
-   * @param {string} service
-   * @param {Req} req
-   * @param {object} [opts] - { deadlineMs?, streamWindowInitial?, signal? }
-   * @returns {Promise<Resp>}
    */
-  async callService(service, req, opts) {
+  async callService<Req = unknown, Resp = unknown>(
+    service: string,
+    req: Req,
+    opts?: CallOptions,
+  ): Promise<Resp> {
     const reqBuf = jsonEncode(req)
     const { rawOpts, detach } = wireAbortSignal(this._raw, opts)
     try {
       const respBuf = await this._raw.callService(service, reqBuf, rawOpts)
-      return jsonDecode(respBuf)
+      return jsonDecode(respBuf) as Resp
     } finally {
       detach()
     }
@@ -228,15 +315,13 @@ class TypedMeshRpc {
   /**
    * Open a typed streaming call. Returns a `TypedRpcStream` that
    * yields decoded `Resp` values per `next()` until EOF.
-   *
-   * @template Req, Resp
-   * @param {bigint} targetNodeId
-   * @param {string} service
-   * @param {Req} req
-   * @param {object} [opts]
-   * @returns {Promise<TypedRpcStream<Resp>>}
    */
-  async callStreaming(targetNodeId, service, req, opts) {
+  async callStreaming<Req = unknown, Resp = unknown>(
+    targetNodeId: bigint,
+    service: string,
+    req: Req,
+    opts?: CallOptions,
+  ): Promise<TypedRpcStream<Resp>> {
     const reqBuf = jsonEncode(req)
     const inner = await this._raw.callStreaming(
       targetNodeId,
@@ -244,11 +329,11 @@ class TypedMeshRpc {
       reqBuf,
       opts,
     )
-    return new TypedRpcStream(inner)
+    return new TypedRpcStream<Resp>(inner)
   }
 
-  /** Pass-through to {@link MeshRpc.findServiceNodes}. */
-  findServiceNodes(service) {
+  /** Pass-through to `MeshRpc.findServiceNodes`. */
+  findServiceNodes(service: string): bigint[] {
     return this._raw.findServiceNodes(service)
   }
 
@@ -256,44 +341,40 @@ class TypedMeshRpc {
 
   /**
    * Direct-addressed typed call with retry. See {@link RetryPolicy}.
-   *
-   * @template Req, Resp
-   * @param {bigint} targetNodeId
-   * @param {string} service
-   * @param {Req} req
-   * @param {object|undefined} opts
-   * @param {RetryPolicy} policy
-   * @returns {Promise<Resp>}
    */
-  async callWithRetry(targetNodeId, service, req, opts, policy) {
+  async callWithRetry<Req = unknown, Resp = unknown>(
+    targetNodeId: bigint,
+    service: string,
+    req: Req,
+    opts: CallOptions | undefined,
+    policy: RetryPolicy,
+  ): Promise<Resp> {
     // Encode once and reuse across attempts (matches the Rust
     // SDK's call_typed_with_retry contract).
     const reqBuf = jsonEncode(req)
     const respBuf = await runRetry(policy, async () => {
       return await this._raw.call(targetNodeId, service, reqBuf, opts)
     })
-    return jsonDecode(respBuf)
+    return jsonDecode(respBuf) as Resp
   }
 
   /**
    * Hedge typed call across the listed targets. First reply
    * (Ok or Err) wins; if every target fails, the surfaced error
    * is the primary's (target index 0) for stable diagnostics.
-   *
-   * @template Req, Resp
-   * @param {bigint[]} targets
-   * @param {string} service
-   * @param {Req} req
-   * @param {object|undefined} opts
-   * @param {HedgePolicy} policy
-   * @returns {Promise<Resp>}
    */
-  async callWithHedgeTo(targets, service, req, opts, policy) {
+  async callWithHedgeTo<Req = unknown, Resp = unknown>(
+    targets: bigint[],
+    service: string,
+    req: Req,
+    opts: CallOptions | undefined,
+    policy: HedgePolicy,
+  ): Promise<Resp> {
     const reqBuf = jsonEncode(req)
     const respBuf = await runHedge(policy, targets, async (targetId) => {
       return await this._raw.call(targetId, service, reqBuf, opts)
     })
-    return jsonDecode(respBuf)
+    return jsonDecode(respBuf) as Resp
   }
 }
 
@@ -301,8 +382,11 @@ class TypedMeshRpc {
 // TypedRpcStream — typed wrapper around the raw RpcStream.
 // ============================================================================
 
-class TypedRpcStream {
-  constructor(rawRpcStream) {
+export class TypedRpcStream<Resp = unknown> implements AsyncIterable<Resp> {
+  private readonly _raw: RawRpcStream
+  private _done: boolean
+
+  constructor(rawRpcStream: RawRpcStream) {
     this._raw = rawRpcStream
     this._done = false
   }
@@ -312,12 +396,10 @@ class TypedRpcStream {
    * Throws `RpcCodecError(direction='decode')` if a chunk fails
    * to decode (terminates the stream — the underlying CANCEL is
    * fired by the raw RpcStream's drop).
-   * @template Resp
-   * @returns {Promise<Resp | null>}
    */
-  async next() {
+  async next(): Promise<Resp | null> {
     if (this._done) return null
-    let buf
+    let buf: Buffer | null
     try {
       buf = await this._raw.next()
     } catch (e) {
@@ -329,7 +411,7 @@ class TypedRpcStream {
       return null
     }
     try {
-      return jsonDecode(buf)
+      return jsonDecode(buf) as Resp
     } catch (e) {
       this._done = true
       // Close the underlying stream so the server's handler
@@ -337,7 +419,7 @@ class TypedRpcStream {
       // subsequent chunks we can't decode.
       try {
         await this._raw.close()
-      } catch (_) {
+      } catch {
         /* swallow — best-effort */
       }
       throw e
@@ -345,7 +427,7 @@ class TypedRpcStream {
   }
 
   /** Async iterator support: `for await (const chunk of stream) { ... }`. */
-  async *[Symbol.asyncIterator]() {
+  async *[Symbol.asyncIterator](): AsyncIterator<Resp> {
     while (true) {
       const value = await this.next()
       if (value === null) return
@@ -354,21 +436,21 @@ class TypedRpcStream {
   }
 
   /** Grant `n` flow-control credits to the server pump. */
-  async grant(n) {
+  async grant(n: number): Promise<void> {
     await this._raw.grant(n)
   }
 
   /** `true` if the call set `streamWindowInitial`. */
-  async flowControlled() {
+  async flowControlled(): Promise<boolean> {
     return await this._raw.flowControlled()
   }
 
   /** Close the stream; emits CANCEL to the server. Idempotent. */
-  async close() {
+  async close(): Promise<void> {
     this._done = true
     try {
       await this._raw.close()
-    } catch (_) {
+    } catch {
       /* swallow — best-effort */
     }
   }
@@ -397,7 +479,7 @@ const STATUS_INTERNAL = 0x0006
 const STATUS_BACKPRESSURE = 0x0004
 const STATUS_TIMEOUT = 0x0003
 
-function defaultRetryable(err) {
+export function defaultRetryable(err: unknown): boolean {
   // Per Rust SDK: NoRoute + Codec are caller-fixable / terminal
   // and never retried. Timeout (caller-side) and Transport
   // always retry. ServerError retries only for canonical
@@ -406,8 +488,9 @@ function defaultRetryable(err) {
   // Detection strategy: try `err.name` first (a runtime string,
   // dual-module-safe), then fall back to message-prefix matching
   // for raw napi errors that haven't been classified yet.
-  if (!err) return false
-  const name = err.name || ''
+  if (!err || typeof err !== 'object') return false
+  const errAny = err as { name?: string; status?: number; message?: string }
+  const name = errAny.name ?? ''
   switch (name) {
     case 'RpcNoRouteError':
     case 'RpcCodecError':
@@ -418,10 +501,10 @@ function defaultRetryable(err) {
     case 'RpcServerError': {
       // Prefer err.status (set by RpcServerError constructor);
       // fall back to parsing the message.
-      let status =
-        typeof err.status === 'number'
-          ? err.status
-          : parseStatusFromMessage(err.message)
+      const status =
+        typeof errAny.status === 'number'
+          ? errAny.status
+          : parseStatusFromMessage(errAny.message)
       return (
         status === STATUS_INTERNAL ||
         status === STATUS_BACKPRESSURE ||
@@ -430,7 +513,7 @@ function defaultRetryable(err) {
     }
   }
   // Fall back to message prefix.
-  const msg = err.message || ''
+  const msg = errAny.message ?? ''
   if (!msg.startsWith('nrpc:')) return false
   if (msg.startsWith('nrpc:no_route:')) return false
   if (msg.startsWith('nrpc:codec_')) return false
@@ -446,44 +529,78 @@ function defaultRetryable(err) {
   return true
 }
 
-function parseStatusFromMessage(msg) {
+function parseStatusFromMessage(msg: string | undefined): number | undefined {
   if (!msg) return undefined
   const m = /status=0x([0-9a-fA-F]+)/.exec(msg)
   return m ? parseInt(m[1], 16) : undefined
 }
 
-class RetryPolicy {
-  constructor(opts) {
+export interface RetryPolicyOptions {
+  /** Total attempts (NOT additional retries). Default 3. Must be >= 1. */
+  maxAttempts?: number
+  /** Backoff before the first retry, in ms. Default 50. */
+  initialBackoffMs?: number
+  /** Upper bound on per-attempt backoff (true ceiling, after jitter). Default 1000. */
+  maxBackoffMs?: number
+  /** Multiplicative growth factor between attempts. Default 2.0. */
+  backoffMultiplier?: number
+  /** Full-half jitter on backoffs. Default true. */
+  jitter?: boolean
+  /** Predicate: should this error be retried? Default {@link defaultRetryable}. */
+  retryable?: (err: unknown) => boolean
+}
+
+/**
+ * Retry policy. Defaults: 3 attempts, 50ms→1s exponential backoff,
+ * full-half jitter on, retryable predicate matches the Rust SDK's
+ * `default_retryable` (skips RpcCodecError, RpcNoRouteError, and
+ * non-transient ServerError statuses).
+ */
+export class RetryPolicy {
+  readonly maxAttempts: number
+  readonly initialBackoffMs: number
+  readonly maxBackoffMs: number
+  readonly backoffMultiplier: number
+  readonly jitter: boolean
+  readonly retryable: (err: unknown) => boolean
+
+  constructor(opts?: RetryPolicyOptions) {
     const merged = { ...DEFAULT_RETRY, ...(opts ?? {}) }
     this.maxAttempts = Math.max(1, merged.maxAttempts | 0)
     this.initialBackoffMs = Math.max(0, merged.initialBackoffMs)
     this.maxBackoffMs = Math.max(this.initialBackoffMs, merged.maxBackoffMs)
     this.backoffMultiplier = Math.max(1.0, merged.backoffMultiplier)
     this.jitter = !!merged.jitter
-    const retryable = merged.retryable ?? defaultRetryable
+    const retryable = (opts?.retryable ?? defaultRetryable) as unknown
     if (typeof retryable !== 'function') {
       throw new TypeError(
-        'RetryPolicy.retryable must be a function (received ' + typeof retryable + ')',
+        'RetryPolicy.retryable must be a function (received ' +
+          typeof retryable +
+          ')',
       )
     }
-    this.retryable = retryable
+    this.retryable = retryable as (err: unknown) => boolean
   }
 
   /**
    * Compute the backoff for `attempt` (1-indexed). Caps at
    * `maxBackoffMs` AFTER jitter so the cap is a true ceiling.
    */
-  computeBackoffMs(attempt) {
+  computeBackoffMs(attempt: number): number {
     const exp = Math.max(0, attempt - 1)
-    const scaled = this.initialBackoffMs * Math.pow(this.backoffMultiplier, exp)
+    const scaled =
+      this.initialBackoffMs * Math.pow(this.backoffMultiplier, exp)
     const preCap = Math.min(this.maxBackoffMs, scaled)
     const jittered = this.jitter ? preCap * (0.5 + 0.5 * Math.random()) : preCap
     return Math.min(this.maxBackoffMs, jittered)
   }
 }
 
-async function runRetry(policy, op) {
-  let lastErr
+async function runRetry<T>(
+  policy: RetryPolicy,
+  op: () => Promise<T>,
+): Promise<T> {
+  let lastErr: unknown
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
     try {
       return await op()
@@ -497,8 +614,7 @@ async function runRetry(policy, op) {
     }
   }
   // Unreachable under normal control flow (the loop returns or
-  // throws), but ESLint's no-fallthrough rule prefers an explicit
-  // throw here.
+  // throws), but TS's exhaustiveness requires an explicit throw.
   throw lastErr
 }
 
@@ -516,15 +632,34 @@ const DEFAULT_HEDGE = Object.freeze({
   hedges: 1,
 })
 
-class HedgePolicy {
-  constructor(opts) {
+export interface HedgePolicyOptions {
+  /** Wait this long after the primary before firing the first hedge. Default 50ms. */
+  delayMs?: number
+  /** Number of hedge requests in addition to the primary. Default 1. */
+  hedges?: number
+}
+
+/**
+ * Hedge policy. Fire-then-race: primary at t=0, hedges at
+ * t = delayMs * idx. First reply wins; if every hedge fails,
+ * the primary's error is surfaced deterministically.
+ */
+export class HedgePolicy {
+  readonly delayMs: number
+  readonly hedges: number
+
+  constructor(opts?: HedgePolicyOptions) {
     const merged = { ...DEFAULT_HEDGE, ...(opts ?? {}) }
     this.delayMs = Math.max(0, merged.delayMs)
     this.hedges = Math.max(0, merged.hedges | 0)
   }
 }
 
-async function runHedge(policy, targets, op) {
+async function runHedge<T>(
+  policy: HedgePolicy,
+  targets: bigint[],
+  op: (target: bigint) => Promise<T>,
+): Promise<T> {
   if (!Array.isArray(targets) || targets.length === 0) {
     // Plain Error with the stable prefix; user's catch site
     // calls classifyError() to get a typed RpcNoRouteError.
@@ -536,15 +671,15 @@ async function runHedge(policy, targets, op) {
   }
   // Cap hedges to the available targets (primary + N-1 hedges).
   const fanout = Math.min(targets.length, 1 + policy.hedges)
-  const errors = new Array(fanout).fill(undefined)
+  const errors: Array<unknown> = new Array(fanout).fill(undefined)
   let resolved = false
-  let firstOk = null
+  let firstOk: T | null = null
   let okIndex = -1
   // Each launch is a Promise that either:
   //  - resolves with { ok: true, value } if op succeeds AND we're first
   //  - resolves with { idx, err } if op fails
   //  - never resolves if a previous launch already won
-  const launches = []
+  const launches: Array<Promise<unknown>> = []
   for (let i = 0; i < fanout; i++) {
     const idx = i
     launches.push(
@@ -567,7 +702,7 @@ async function runHedge(policy, targets, op) {
     )
   }
   await Promise.all(launches)
-  if (okIndex >= 0) return firstOk
+  if (okIndex >= 0) return firstOk as T
   // All failed — surface the primary's error (or the lowest-
   // indexed defined error). Deterministic across runs.
   for (let i = 0; i < errors.length; i++) {
@@ -587,9 +722,11 @@ async function runHedge(policy, targets, op) {
 // composes around any async op.
 // ============================================================================
 
-const STATE_CLOSED = 'closed'
-const STATE_OPEN = 'open'
-const STATE_HALF_OPEN = 'half-open'
+export type BreakerState = 'closed' | 'open' | 'half-open'
+
+const STATE_CLOSED: BreakerState = 'closed'
+const STATE_OPEN: BreakerState = 'open'
+const STATE_HALF_OPEN: BreakerState = 'half-open'
 
 const DEFAULT_BREAKER = Object.freeze({
   failureThreshold: 5,
@@ -597,7 +734,7 @@ const DEFAULT_BREAKER = Object.freeze({
   successThreshold: 1,
 })
 
-function defaultBreakerFailure(err) {
+export function defaultBreakerFailure(err: unknown): boolean {
   // Mirror default_retryable — same set of "transient infra
   // failures" counts toward tripping; codec / no-route / app
   // errors don't.
@@ -612,7 +749,7 @@ function defaultBreakerFailure(err) {
 // breaker. The `nrpc:breaker_open:` message prefix lets
 // `classifyError` route this through the generic `RpcError` base
 // for users who want a unified catch.
-class BreakerOpenError extends Error {
+export class BreakerOpenError extends Error {
   constructor() {
     super('nrpc:breaker_open: circuit breaker is open')
     this.name = 'BreakerOpenError'
@@ -620,13 +757,43 @@ class BreakerOpenError extends Error {
   }
 }
 
-class CircuitBreaker {
-  constructor(opts) {
+export interface CircuitBreakerOptions {
+  /** Consecutive failures before tripping. Default 5. */
+  failureThreshold?: number
+  /** Cooldown before transitioning Open → HalfOpen. Default 30000. */
+  resetAfterMs?: number
+  /** Successful probes needed to close from HalfOpen. Default 1. */
+  successThreshold?: number
+  /** Predicate: does this error count as a failure? Default {@link defaultBreakerFailure}. */
+  failurePredicate?: (err: unknown) => boolean
+}
+
+type Admission = 'closed' | 'half-open-probe' | 'reject'
+
+/**
+ * Three-state circuit breaker. Long-lived; instantiate once per
+ * logical downstream and share. `breaker.call(() => ...)`
+ * composes around any async op.
+ */
+export class CircuitBreaker {
+  readonly failureThreshold: number
+  readonly resetAfterMs: number
+  readonly successThreshold: number
+  readonly failurePredicate: (err: unknown) => boolean
+
+  private _state: BreakerState
+  private _consecutiveFailures: number
+  private _consecutiveSuccesses: number
+  private _openedAt: number
+  private _probeInFlight: boolean
+
+  constructor(opts?: CircuitBreakerOptions) {
     const merged = { ...DEFAULT_BREAKER, ...(opts ?? {}) }
     this.failureThreshold = Math.max(1, merged.failureThreshold | 0)
     this.resetAfterMs = Math.max(0, merged.resetAfterMs)
     this.successThreshold = Math.max(1, merged.successThreshold | 0)
-    const predicate = merged.failurePredicate ?? defaultBreakerFailure
+    const predicate = (opts?.failurePredicate ??
+      defaultBreakerFailure) as unknown
     if (typeof predicate !== 'function') {
       throw new TypeError(
         'CircuitBreaker.failurePredicate must be a function (received ' +
@@ -634,7 +801,7 @@ class CircuitBreaker {
           ')',
       )
     }
-    this.failurePredicate = predicate
+    this.failurePredicate = predicate as (err: unknown) => boolean
     this._state = STATE_CLOSED
     this._consecutiveFailures = 0
     this._consecutiveSuccesses = 0
@@ -642,17 +809,17 @@ class CircuitBreaker {
     this._probeInFlight = false
   }
 
-  state() {
+  state(): BreakerState {
     // Lazy "Open → HalfOpen on cooldown elapsed" transition: we
     // probe at admission time, not on a background timer.
     return this._state
   }
 
-  consecutiveFailures() {
+  consecutiveFailures(): number {
     return this._consecutiveFailures
   }
 
-  reset() {
+  reset(): void {
     this._state = STATE_CLOSED
     this._consecutiveFailures = 0
     this._consecutiveSuccesses = 0
@@ -672,7 +839,7 @@ class CircuitBreaker {
    * synchronous throw inside `op` (rare — `await` is always at
    * `op`'s call site) is still routed through the catch arm.
    */
-  async call(op) {
+  async call<T>(op: () => Promise<T>): Promise<T> {
     const admission = this._tryAdmit()
     if (admission === 'reject') {
       throw new BreakerOpenError()
@@ -687,7 +854,7 @@ class CircuitBreaker {
     }
   }
 
-  _tryAdmit() {
+  private _tryAdmit(): Admission {
     if (this._state === STATE_CLOSED) return 'closed'
     if (this._state === STATE_OPEN) {
       const elapsed = Date.now() - this._openedAt
@@ -705,7 +872,11 @@ class CircuitBreaker {
     return 'half-open-probe'
   }
 
-  _recordOutcome(admission, ok, err) {
+  private _recordOutcome(
+    admission: Admission,
+    ok: boolean,
+    err: unknown,
+  ): void {
     if (admission === 'closed') {
       if (ok) {
         this._consecutiveFailures = 0
@@ -745,8 +916,13 @@ class CircuitBreaker {
 // Helpers.
 // ============================================================================
 
-function sleep(ms) {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+interface WiredAbortSignal {
+  rawOpts: CallOptions | undefined
+  detach: () => void
 }
 
 /**
@@ -765,7 +941,10 @@ function sleep(ms) {
  * unchanged so the non-cancellable fast path stays free of
  * tokio-spawn / registry overhead.
  */
-function wireAbortSignal(raw, opts) {
+function wireAbortSignal(
+  raw: RawMeshRpc,
+  opts: CallOptions | undefined,
+): WiredAbortSignal {
   if (!opts || !opts.signal) {
     return { rawOpts: opts, detach: () => {} }
   }
@@ -780,14 +959,14 @@ function wireAbortSignal(raw, opts) {
   // abort. The listener removes itself on detach so the AbortSignal
   // can be reused for a subsequent call without leaking handlers.
   const token = raw.reserveCancelToken()
-  const rawOpts = { ...opts, cancelToken: token }
+  const rawOpts: CallOptions = { ...opts, cancelToken: token }
   delete rawOpts.signal
   let detached = false
-  const onAbort = () => {
+  const onAbort = (): void => {
     if (detached) return
     try {
       raw.cancelCall(token)
-    } catch (_) {
+    } catch {
       /* swallow — best-effort */
     }
   }
@@ -815,17 +994,22 @@ function wireAbortSignal(raw, opts) {
  * application errors (`NRPC_TYPED_BAD_REQUEST`,
  * `NRPC_TYPED_HANDLER_ERROR`, custom app codes >= 0x8000).
  *
- * @param {number} code - Application status code (typically >= 0x8000)
- * @param {string|Buffer} body - Response body (utf-8 encoded if Buffer)
- * @returns {Error}
+ * @example
+ *   rpc.serve('echo', (req) => {
+ *     if (typeof req.text !== 'string') {
+ *       throw appError(NRPC_TYPED_BAD_REQUEST,
+ *                      JSON.stringify({error: 'missing text'}))
+ *     }
+ *     return { echo: req.text }
+ *   })
  */
-function appError(code, body) {
+export function appError(code: number, body: string | Buffer): Error {
   if (typeof code !== 'number' || code < 0 || code > 0xffff) {
     throw new TypeError(
       `appError: code must be a 0..=0xFFFF integer (got ${code})`,
     )
   }
-  let bodyStr
+  let bodyStr: string
   if (typeof body === 'string') {
     bodyStr = body
   } else if (Buffer.isBuffer(body)) {
@@ -839,18 +1023,9 @@ function appError(code, body) {
   return new Error(`nrpc:app_error:0x${codeHex}:${bodyStr}`)
 }
 
-module.exports = {
-  TypedMeshRpc,
-  TypedRpcStream,
-  RetryPolicy,
-  HedgePolicy,
-  CircuitBreaker,
-  BreakerOpenError,
-  appError,
-  defaultRetryable,
-  defaultBreakerFailure,
-  // Status code constants (parallel to NRPC_TYPED_BAD_REQUEST /
-  // NRPC_TYPED_HANDLER_ERROR in the Rust SDK).
-  NRPC_TYPED_BAD_REQUEST: 0x8000,
-  NRPC_TYPED_HANDLER_ERROR: 0x8001,
-}
+// Status code constants (parallel to NRPC_TYPED_BAD_REQUEST /
+// NRPC_TYPED_HANDLER_ERROR in the Rust SDK).
+/** RpcStatus::Application(0x8000): typed handler bad-request body. */
+export const NRPC_TYPED_BAD_REQUEST = 0x8000 as const
+/** RpcStatus::Application(0x8001): typed handler returned `throw`. */
+export const NRPC_TYPED_HANDLER_ERROR = 0x8001 as const
