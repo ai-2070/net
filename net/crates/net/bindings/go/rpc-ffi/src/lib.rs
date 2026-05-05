@@ -671,6 +671,12 @@ pub extern "C" fn net_rpc_reserve_handler_id() -> u64 {
 /// under the supplied id, otherwise an early-arriving request
 /// gets dropped as "no handler registered."
 ///
+/// `handler_timeout_ms` caps the per-call wait for the Go-side
+/// handler to respond. Pass `0` for the default (60 000ms / 60s);
+/// pass a positive value for an explicit cap; pass `u64::MAX`
+/// to effectively disable the cap (not recommended — a stuck
+/// handler holds a runtime worker indefinitely).
+///
 /// Returns: heap-allocated ServeHandle on success; NULL with an
 /// error message on `out_err` on failure (e.g. service already
 /// served by this MeshNode).
@@ -680,6 +686,7 @@ pub extern "C" fn net_rpc_serve(
     service_ptr: *const c_char,
     service_len: usize,
     handler_id: u64,
+    handler_timeout_ms: u64,
     out_err: *mut *mut c_char,
 ) -> *mut ServeHandleC {
     let Some(h) = (unsafe { handle.as_ref() }) else {
@@ -704,9 +711,14 @@ pub extern "C" fn net_rpc_serve(
         );
         return std::ptr::null_mut();
     }
+    let timeout = if handler_timeout_ms == 0 {
+        DEFAULT_HANDLER_TIMEOUT
+    } else {
+        Duration::from_millis(handler_timeout_ms)
+    };
     let rust_handler = Arc::new(GoRpcHandler {
         handler_id,
-        timeout: DEFAULT_HANDLER_TIMEOUT,
+        timeout,
     });
     match h.node.serve_rpc(&service, rust_handler) {
         Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
@@ -1197,6 +1209,7 @@ mod tests {
             std::ptr::null_mut(),
             svc.as_ptr() as *const c_char,
             svc.len(),
+            0,
             0,
             &mut err,
         );

@@ -501,10 +501,29 @@ impl PyMeshRpc {
     /// Returns a [`PyServeHandle`] context manager whose `close()`
     /// unregisters; in-flight handlers continue to completion
     /// after close.
-    fn serve(&self, service: String, handler: Py<PyAny>) -> PyResult<PyServeHandle> {
+    ///
+    /// `handler_timeout_ms` caps the per-call wait for the Python
+    /// handler to respond — defaults to 60 000 (60s). A wedged
+    /// handler past the cap surfaces to the caller as
+    /// `RpcStatus::Internal` "Python handler did not respond
+    /// within N ms" so the in-flight slot doesn't leak. Set to
+    /// 0 to disable the cap (not recommended — a stuck handler
+    /// will hold a runtime worker indefinitely).
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve(
+        &self,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = match handler_timeout_ms {
+            Some(0) => Duration::from_secs(u64::MAX / 1000),
+            Some(ms) => Duration::from_millis(ms),
+            None => DEFAULT_HANDLER_TIMEOUT,
+        };
         let rust_handler = Arc::new(PyRpcHandler {
             callable: handler,
-            timeout: DEFAULT_HANDLER_TIMEOUT,
+            timeout,
         });
         let inner = self
             .node

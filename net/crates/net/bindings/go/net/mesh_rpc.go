@@ -111,6 +111,7 @@ extern ServeHandleC* net_rpc_serve(
     MeshRpcHandle* handle,
     const char* service_ptr, size_t service_len,
     uint64_t handler_id,
+    uint64_t handler_timeout_ms,
     char** out_err
 );
 extern uint64_t net_rpc_serve_handle_id(const ServeHandleC* handle);
@@ -815,16 +816,35 @@ type ServeHandle struct {
 // service. Use `errors.Is(err, ErrAlreadyServing)` to dispatch.
 var ErrAlreadyServing = errors.New("net.Serve: service already served by this MeshNode")
 
-// Serve registers `handler` for `service`. The returned
-// `*ServeHandle` MUST be closed when the service should stop
-// accepting new requests.
+// ServeOptions tweaks Serve's per-handler behavior. Zero value
+// uses the binding defaults (60s handler timeout).
+type ServeOptions struct {
+	// HandlerTimeout caps the per-call wait for the Go-side
+	// handler to respond. Past this, the caller observes
+	// `RpcStatus::Internal` "Go handler did not respond within
+	// N ms" so the in-flight slot doesn't leak. Zero means
+	// "use default" (60s); set to a large value to disable
+	// effectively (not recommended — a stuck handler holds a
+	// runtime worker indefinitely).
+	HandlerTimeout time.Duration
+}
+
+// Serve registers `handler` for `service` with binding defaults.
+// See ServeWithOptions for tunables.
+func (r *MeshRpc) Serve(service string, handler Handler) (*ServeHandle, error) {
+	return r.ServeWithOptions(service, handler, ServeOptions{})
+}
+
+// ServeWithOptions registers `handler` for `service`. The
+// returned `*ServeHandle` MUST be closed when the service should
+// stop accepting new requests.
 //
 // Pre-registers the handler in the Go-side dispatch registry
 // BEFORE crossing the FFI boundary, closing the
 // "request-arrives-before-Store" race: a request landing in the
 // Tokio dispatcher between `serve_rpc` returning and any
 // language-side bookkeeping must always find the callable.
-func (r *MeshRpc) Serve(service string, handler Handler) (*ServeHandle, error) {
+func (r *MeshRpc) ServeWithOptions(service string, handler Handler, opts ServeOptions) (*ServeHandle, error) {
 	if handler == nil {
 		return nil, errors.New("net.Serve: handler must be non-nil")
 	}
@@ -843,6 +863,15 @@ func (r *MeshRpc) Serve(service string, handler Handler) (*ServeHandle, error) {
 	cService := stringToCBytes(service)
 	defer C.free(cService.ptr)
 
+	var timeoutMs uint64
+	if opts.HandlerTimeout > 0 {
+		ms := opts.HandlerTimeout.Milliseconds()
+		if ms < 0 {
+			ms = 0
+		}
+		timeoutMs = uint64(ms)
+	}
+
 	var outErr *C.char
 	var handle *C.ServeHandleC
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
@@ -850,6 +879,7 @@ func (r *MeshRpc) Serve(service string, handler Handler) (*ServeHandle, error) {
 			h,
 			(*C.char)(cService.ptr), cService.len,
 			C.uint64_t(hID),
+			C.uint64_t(timeoutMs),
 			&outErr,
 		)
 	}); err != nil {

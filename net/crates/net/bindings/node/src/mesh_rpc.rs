@@ -465,17 +465,28 @@ impl MeshRpc {
     /// Handler shape: `(req: Buffer) => Promise<Buffer>`. Sync
     /// handlers can `Promise.resolve(buf)` or simply be declared
     /// `async`.
+    ///
+    /// `handlerTimeoutMs` caps the per-call wait for the JS
+    /// handler — defaults to 60 000 (60s). A wedged handler past
+    /// the cap surfaces to the caller as `RpcStatus::Internal`
+    /// "JS handler did not respond within N ms" so the in-flight
+    /// slot doesn't leak. Pass 0 to disable the cap (not
+    /// recommended — a stuck handler holds a runtime worker
+    /// indefinitely).
     #[napi]
     pub fn serve(
         &self,
         service: String,
         handler: Function<'_, Buffer, Promise<Buffer>>,
+        handler_timeout_ms: Option<u32>,
     ) -> Result<ServeHandle> {
         let tsfn: RpcHandlerTsfn = handler.build_threadsafe_function().build()?;
-        let rust_handler = Arc::new(NodeRpcHandler {
-            tsfn,
-            timeout: DEFAULT_HANDLER_TIMEOUT,
-        });
+        let timeout = match handler_timeout_ms {
+            Some(0) => Duration::from_secs(u64::MAX / 1000),
+            Some(ms) => Duration::from_millis(ms as u64),
+            None => DEFAULT_HANDLER_TIMEOUT,
+        };
+        let rust_handler = Arc::new(NodeRpcHandler { tsfn, timeout });
         let inner = self
             .node
             .serve_rpc(&service, rust_handler)
