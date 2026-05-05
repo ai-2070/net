@@ -424,3 +424,75 @@ async fn rpc_trace_context_propagates_to_server() {
         "no trace_context on the call → server gets None, got {observed:?}",
     );
 }
+
+/// Regression for H8: dropping a `ServeHandle` while a request is
+/// being processed must NOT abort the bridge task — it must
+/// complete the in-flight handler and emit its RESPONSE.
+///
+/// Mechanism: the dispatcher closure owns the only `mpsc::Sender`
+/// for the bridge's incoming channel; `unregister_rpc_inbound`
+/// drops the dispatcher, which closes the channel; the bridge's
+/// `rx.recv()` then yields `None` after draining queued events
+/// and the task exits cleanly. Aborting the JoinHandle would race
+/// the in-flight `fold.lock().apply(...)` and orphan its handler
+/// task without emitting a RESPONSE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serve_handle_drop_does_not_abort_in_flight_request() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    // Slow handler so we have a clear window in which to drop the
+    // ServeHandle while the request is being processed.
+    struct SlowEcho;
+    #[async_trait::async_trait]
+    impl RpcHandler for SlowEcho {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: ctx.payload.body,
+            })
+        }
+    }
+    let serve = server
+        .serve_rpc("slow_echo", Arc::new(SlowEcho))
+        .expect("serve_rpc");
+
+    // Issue the call from a spawned task so the test can drop
+    // `serve` while the call is mid-flight.
+    let caller_clone = caller.clone();
+    let server_id = server.node_id();
+    let call = tokio::spawn(async move {
+        caller_clone
+            .call(
+                server_id,
+                "slow_echo",
+                Bytes::from_static(b"hello"),
+                CallOptions {
+                    deadline: Some(Instant::now() + Duration::from_secs(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+
+    // Give the call time to publish its REQUEST and the bridge
+    // time to forward it into the fold (which spawns the handler
+    // and parks in the 150ms sleep). 80ms is well past the
+    // network round-trip on loopback but well before the 150ms
+    // handler completes.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Drop the serve handle. The in-flight handler task should
+    // continue and its RESPONSE should still reach the caller.
+    drop(serve);
+
+    let reply = tokio::time::timeout(Duration::from_secs(3), call)
+        .await
+        .expect("call task must finish")
+        .expect("call task must not panic")
+        .expect("in-flight handler must complete and RESPONSE must arrive");
+    assert_eq!(reply.body.as_ref(), b"hello");
+}

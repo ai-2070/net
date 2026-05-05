@@ -222,21 +222,35 @@ pub enum CodecDirection {
 }
 
 /// RAII handle returned by [`MeshNode::serve_rpc`]. Dropping it
-/// unregisters the inbound dispatcher, removes the service from
-/// the local-services registry (so subsequent
+/// unregisters the inbound dispatcher and removes the service
+/// from the local-services registry (so subsequent
 /// `announce_capabilities` calls stop emitting the
-/// `nrpc:<service>` tag), and stops the bridge task.
+/// `nrpc:<service>` tag).
+///
+/// **Bridge task lifecycle.** The bridge task that drains the
+/// inbound mpsc into the fold is NOT aborted on Drop. The
+/// `register_rpc_inbound` dispatcher closure owns the only
+/// `mpsc::Sender` clone, so `unregister_rpc_inbound` (which drops
+/// the dispatcher) closes the channel; the bridge's `rx.recv()`
+/// then yields `None` and the task exits cleanly after draining
+/// any queued events. Aborting would race events that are
+/// mid-`fold.lock().apply()` — those events would be killed
+/// without their RESPONSE being emitted, so the corresponding
+/// callers would just time out.
 ///
 /// Outstanding handler executions (already-spawned tokio tasks)
-/// continue to completion — the handle's Drop only stops
-/// new request dispatch.
+/// continue to completion regardless.
 pub struct ServeHandle {
     /// Channel hash to unregister on Drop.
     channel_hash: u16,
     /// Service name to remove from `rpc_local_services` on Drop.
     service: String,
-    /// The bridge task — `JoinHandle::abort` on Drop stops it.
-    bridge: Option<JoinHandle<()>>,
+    /// The bridge task. Held only so callers can introspect /
+    /// detach it; Drop does NOT abort it (see struct doc-comment).
+    /// Detaches naturally when the handle is dropped — the bridge
+    /// exits on its own once the dispatcher's `mpsc::Sender` is
+    /// dropped via `unregister_rpc_inbound`.
+    _bridge: JoinHandle<()>,
     /// Hold an Arc back to the mesh so we can unregister on Drop
     /// without the mesh having to track us.
     mesh: Arc<MeshNode>,
@@ -244,11 +258,14 @@ pub struct ServeHandle {
 
 impl Drop for ServeHandle {
     fn drop(&mut self) {
+        // Order matters: unregister the dispatcher FIRST so no new
+        // events can land in the bridge's mpsc, THEN drop the
+        // service-tag entry. The bridge task drains any in-flight
+        // events naturally and exits when its `rx.recv()` yields
+        // `None` (which happens as soon as the dispatcher closure
+        // — the sole `tx` owner — is dropped above).
         self.mesh.unregister_rpc_inbound(self.channel_hash);
         self.mesh.rpc_local_services_arc().remove(&self.service);
-        if let Some(handle) = self.bridge.take() {
-            handle.abort();
-        }
     }
 }
 
@@ -630,7 +647,7 @@ impl MeshNode {
         Ok(ServeHandle {
             channel_hash,
             service: service.to_string(),
-            bridge: Some(bridge),
+            _bridge: bridge,
             mesh: Arc::clone(self),
         })
     }
@@ -724,7 +741,7 @@ impl MeshNode {
         Ok(ServeHandle {
             channel_hash,
             service: service.to_string(),
-            bridge: Some(bridge),
+            _bridge: bridge,
             mesh: Arc::clone(self),
         })
     }
