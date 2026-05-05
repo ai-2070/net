@@ -3274,4 +3274,392 @@ mod tests {
         assert!(inner.is_err(), "re-register must close prior receiver");
         assert_eq!(pending.pending_count(), 1);
     }
+
+    // ====================================================================
+    // RpcServerStreamingFold — coverage for the multi-fire emit path.
+    //
+    // The streaming fold is the most complex code in this file:
+    //   - Per-call cancellation token (same as unary)
+    //   - Pump task that drains an mpsc and awaits each emit to
+    //     enforce per-call ordering
+    //   - Optional flow-control semaphore (caller-set window +
+    //     STREAM_GRANT credit refills)
+    //   - Terminal-frame emission with CANCEL-wins override
+    //
+    // These tests pin each branch: ordered chunks + clean EOF;
+    // application error after partial stream; panic surfacing as
+    // Internal; CANCEL flipping the cancellation token AND being
+    // surfaced as the terminal status; STREAM_GRANT permits;
+    // duplicate-REQUEST refusal.
+    // ====================================================================
+
+    /// Build an async `RpcAsyncResponseEmitter` that captures every
+    /// emit into a shared Vec. Streaming fold tests use this to
+    /// inspect the multi-frame emit pattern.
+    fn capturing_async_emitter() -> (RpcAsyncResponseEmitter, CapturedResponses) {
+        let captured: CapturedResponses = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let emit: RpcAsyncResponseEmitter = Arc::new(move |origin, call_id, resp| {
+            let captured_clone = captured_clone.clone();
+            Box::pin(async move {
+                captured_clone.lock().push((origin, call_id, resp));
+            })
+        });
+        (emit, captured)
+    }
+
+    /// Synthesize a STREAM_GRANT event for a `(caller_origin, call_id)`
+    /// asking for `n` additional credits.
+    fn rpc_stream_grant_event(caller_origin: u64, call_id: u64, n: u32) -> RedexEvent {
+        let meta = EventMeta::new(DISPATCH_RPC_STREAM_GRANT, 0, caller_origin, call_id, 0);
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + 4);
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&encode_stream_grant(n));
+        RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        }
+    }
+
+    /// Streaming handler that emits N chunks and returns Ok. The
+    /// caller-side test asserts (a) all N chunks arrive in order
+    /// with the `nrpc-streaming: continue` header, (b) a final
+    /// terminal frame with `nrpc-streaming: end` follows.
+    #[tokio::test]
+    async fn streaming_fold_emits_chunks_in_order_and_clean_terminal() {
+        struct CountingHandler {
+            n: usize,
+        }
+        #[async_trait::async_trait]
+        impl RpcStreamingHandler for CountingHandler {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+                sink: RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                for i in 0..self.n {
+                    sink.send(format!("chunk-{i}").into_bytes());
+                }
+                Ok(())
+            }
+        }
+        let (emit, captured) = capturing_async_emitter();
+        let mut fold = RpcServerStreamingFold::new(Arc::new(CountingHandler { n: 5 }), emit);
+        let req = RpcRequestPayload {
+            service: "stream".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_STREAMING_RESPONSE,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(11, 22, req), &mut ()).unwrap();
+        // 5 continue chunks + 1 terminal end frame.
+        assert!(
+            wait_until(|| captured.lock().len() == 6, Duration::from_secs(2)).await,
+            "expected 6 frames (5 chunks + terminal end), got {}",
+            captured.lock().len(),
+        );
+        let captured = captured.lock();
+        for (i, (_, _, resp)) in captured.iter().take(5).enumerate() {
+            assert_eq!(resp.status, RpcStatus::Ok);
+            // continue header on every non-terminal chunk
+            let hdr = resp
+                .headers
+                .iter()
+                .find(|(n, _)| n == HEADER_NRPC_STREAMING)
+                .expect("streaming header present");
+            assert_eq!(hdr.1.as_slice(), HEADER_NRPC_STREAMING_CONTINUE);
+            assert_eq!(resp.body, format!("chunk-{i}").into_bytes());
+        }
+        // Terminal frame
+        let (_, _, term) = captured.last().unwrap();
+        assert_eq!(term.status, RpcStatus::Ok);
+        let hdr = term
+            .headers
+            .iter()
+            .find(|(n, _)| n == HEADER_NRPC_STREAMING)
+            .expect("terminal must have streaming header");
+        assert_eq!(hdr.1.as_slice(), HEADER_NRPC_STREAMING_END);
+        assert!(term.body.is_empty());
+    }
+
+    /// Handler returns `Err(Internal)` after sending 2 chunks. Caller
+    /// must see (a) both chunks with the continue header, (b) a
+    /// terminal frame carrying `RpcStatus::Internal` (NOT the end
+    /// marker — the terminal-error path drops the header).
+    #[tokio::test]
+    async fn streaming_fold_terminal_error_after_partial_stream() {
+        struct PartialErrHandler;
+        #[async_trait::async_trait]
+        impl RpcStreamingHandler for PartialErrHandler {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+                sink: RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                sink.send(b"first".to_vec());
+                sink.send(b"second".to_vec());
+                Err(RpcHandlerError::Internal("ran out of fuel".into()))
+            }
+        }
+        let (emit, captured) = capturing_async_emitter();
+        let mut fold = RpcServerStreamingFold::new(Arc::new(PartialErrHandler), emit);
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_STREAMING_RESPONSE,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
+        assert!(
+            wait_until(|| captured.lock().len() == 3, Duration::from_secs(2)).await,
+            "expected 2 chunks + 1 terminal error",
+        );
+        let captured = captured.lock();
+        assert_eq!(captured[0].2.body, b"first");
+        assert_eq!(captured[1].2.body, b"second");
+        let (_, _, term) = &captured[2];
+        assert_eq!(term.status, RpcStatus::Internal);
+        assert!(
+            String::from_utf8_lossy(&term.body).contains("ran out of fuel"),
+            "diagnostic must round-trip, got {:?}",
+            String::from_utf8_lossy(&term.body),
+        );
+    }
+
+    /// Handler panics. The fold's `catch_unwind` surfaces it as a
+    /// terminal `RpcStatus::Internal` rather than killing the
+    /// runtime.
+    #[tokio::test]
+    async fn streaming_fold_handler_panic_surfaces_as_internal_terminal() {
+        struct PanicHandler;
+        #[async_trait::async_trait]
+        impl RpcStreamingHandler for PanicHandler {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+                _sink: RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                panic!("kaboom in streaming handler");
+            }
+        }
+        let (emit, captured) = capturing_async_emitter();
+        let mut fold = RpcServerStreamingFold::new(Arc::new(PanicHandler), emit);
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_STREAMING_RESPONSE,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(1, 2, req), &mut ()).unwrap();
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "panic must surface as a terminal frame",
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1);
+        let (_, _, resp) = &captured[0];
+        assert_eq!(resp.status, RpcStatus::Internal);
+        assert!(
+            String::from_utf8_lossy(&resp.body).contains("kaboom"),
+            "panic message must surface, got {:?}",
+            String::from_utf8_lossy(&resp.body),
+        );
+    }
+
+    /// CANCEL during a streaming call overrides the terminal frame
+    /// with `RpcStatus::Cancelled` — same CANCEL-wins ordering as
+    /// the unary fold.
+    #[tokio::test]
+    async fn streaming_fold_cancel_overrides_terminal_with_cancelled() {
+        struct CooperativeHandler;
+        #[async_trait::async_trait]
+        impl RpcStreamingHandler for CooperativeHandler {
+            async fn call(
+                &self,
+                ctx: RpcContext,
+                sink: RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                sink.send(b"chunk-0".to_vec());
+                tokio::select! {
+                    _ = ctx.cancellation.cancelled() => Ok(()),
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => Ok(()),
+                }
+            }
+        }
+        let (emit, captured) = capturing_async_emitter();
+        let mut fold = RpcServerStreamingFold::new(Arc::new(CooperativeHandler), emit);
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_STREAMING_RESPONSE,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(7, 13, req), &mut ()).unwrap();
+        // Wait until at least the first chunk is captured AND the
+        // handler is parked (in_flight key present), then CANCEL.
+        assert!(
+            wait_until(
+                || !captured.lock().is_empty() && fold.in_flight_keys().contains(&(7, 13)),
+                Duration::from_secs(2)
+            )
+            .await
+        );
+        fold.apply(&rpc_cancel_event(7, 13), &mut ()).unwrap();
+        // Wait for the terminal frame.
+        assert!(
+            wait_until(|| captured.lock().len() >= 2, Duration::from_secs(2)).await,
+            "expected first chunk + terminal frame",
+        );
+        let captured = captured.lock();
+        // First emit was the chunk; the LAST should be the
+        // Cancelled terminal.
+        assert_eq!(
+            captured.last().unwrap().2.status,
+            RpcStatus::Cancelled,
+            "CANCEL must override terminal status",
+        );
+    }
+
+    /// Duplicate REQUEST with the same `(origin, call_id)` is
+    /// refused with a synthetic Internal terminal frame and does
+    /// NOT spawn a second handler. Mirror of the unary fold's
+    /// regression at server_fold_duplicate_request_refuses_*.
+    #[tokio::test]
+    async fn streaming_fold_duplicate_request_refuses_without_double_dispatch() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        struct CountingHandler {
+            invocations: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl RpcStreamingHandler for CountingHandler {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+                sink: RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                self.invocations.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                sink.send(b"chunk".to_vec());
+                Ok(())
+            }
+        }
+        let (emit, captured) = capturing_async_emitter();
+        let mut fold = RpcServerStreamingFold::new(
+            Arc::new(CountingHandler {
+                invocations: invocations.clone(),
+            }),
+            emit,
+        );
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_STREAMING_RESPONSE,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(1, 99, req.clone()), &mut ())
+            .unwrap();
+        assert!(
+            wait_until(
+                || fold.in_flight_keys().contains(&(1, 99)),
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        // Duplicate REQUEST — must emit a synthetic Internal
+        // terminal and not invoke the handler a second time.
+        fold.apply(&rpc_request_event(1, 99, req), &mut ()).unwrap();
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(1)).await,
+            "synthetic refusal should be emitted",
+        );
+        // First emit (chronologically) is the synthetic refusal.
+        let refusal = captured.lock()[0].clone();
+        assert_eq!(refusal.2.status, RpcStatus::Internal);
+        assert!(String::from_utf8_lossy(&refusal.2.body).contains("duplicate"));
+        // Wait for the original handler to complete (chunk + terminal).
+        assert!(
+            wait_until(|| captured.lock().len() >= 3, Duration::from_secs(2)).await,
+            "first handler should still complete normally",
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "duplicate REQUEST must NOT spawn a second handler",
+        );
+    }
+
+    /// STREAM_GRANT for an unknown call_id is silently dropped
+    /// (no panic, no tracing event escalation). Pin the
+    /// always-safe behavior so a misbehaving caller (or a CANCEL/
+    /// GRANT race) can't crash the fold.
+    #[tokio::test]
+    async fn streaming_fold_grant_for_unknown_call_id_is_no_op() {
+        struct NoopHandler;
+        #[async_trait::async_trait]
+        impl RpcStreamingHandler for NoopHandler {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+                _sink: RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                Ok(())
+            }
+        }
+        let (emit, captured) = capturing_async_emitter();
+        let mut fold = RpcServerStreamingFold::new(Arc::new(NoopHandler), emit);
+        let result = fold.apply(&rpc_stream_grant_event(99, 42, 5), &mut ());
+        assert!(result.is_ok(), "GRANT for unknown call_id must be Ok");
+        assert!(captured.lock().is_empty(), "no emit for unknown GRANT");
+    }
+
+    /// Malformed REQUEST payload on the streaming fold: emits one
+    /// terminal `UnknownVersion` frame and continues — same
+    /// keep-the-adapter-alive contract as the unary fold.
+    #[tokio::test]
+    async fn streaming_fold_malformed_payload_emits_unknown_version_terminal() {
+        struct NoopHandler;
+        #[async_trait::async_trait]
+        impl RpcStreamingHandler for NoopHandler {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+                _sink: RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                Ok(())
+            }
+        }
+        let (emit, captured) = capturing_async_emitter();
+        let mut fold = RpcServerStreamingFold::new(Arc::new(NoopHandler), emit);
+        // Garbage tail: valid meta + 0x00 svc_len → Truncated.
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 1, 1, 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.push(0x00);
+        let ev = RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        };
+        let result = fold.apply(&ev, &mut ());
+        assert!(
+            result.is_ok(),
+            "malformed payload must NOT kill the adapter",
+        );
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "synthetic UnknownVersion terminal must arrive",
+        );
+        let captured = captured.lock();
+        assert_eq!(captured[0].2.status, RpcStatus::UnknownVersion);
+        let hdr = captured[0]
+            .2
+            .headers
+            .iter()
+            .find(|(n, _)| n == HEADER_NRPC_STREAMING);
+        assert!(hdr.is_some(), "malformed terminal must include end marker");
+    }
 }
