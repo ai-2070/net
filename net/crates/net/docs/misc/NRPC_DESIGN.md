@@ -47,18 +47,13 @@ Phase 1 + Phase 2 are functionally complete. The asymmetric routing pattern (REQ
   - **Re-exports** of `RpcError`, `RpcReply`, `CallOptions`, `RoutingPolicy`, `ServeHandle`, `RpcContext`, `RpcHandler`, `RpcHandlerError`, `RpcStatus`, `ServeError` from the SDK so users have one place to import from.
   - **4 unit tests** (`sdk/tests/mesh_rpc_typed.rs`) pinning the typed-handler trait round-trip, application-error mapping, malformed-body short-circuit (user closure NOT invoked), and codec round-trip semantics.
 
-### Known follow-up: SDK channel-registry friction
-
-The SDK's `MeshBuilder::build` installs a `ChannelConfigRegistry` by default, which fail-closes on unknown channels via `AckReason::UnknownChannel`. nRPC's reply channels (`<svc>.replies.<caller_origin>`) are dynamic per caller and can't be pre-registered, which makes end-to-end SDK nRPC over the network fail at subscribe time.
-
-The SDK's `serve_rpc_typed` doesn't yet auto-register the request channel or whitelist the reply-channel namespace. End-to-end network tests in `sdk/tests/` are blocked on this. The unit-test layer (this commit) verifies the typed glue without crossing the network.
-
-Resolution options for the follow-up:
-1. **Auto-register `<svc>.requests`** in the SDK's `serve_rpc` + `call_service`. Per-caller reply channels still need a wildcard / prefix mechanism the registry doesn't currently support.
-2. **Add prefix-match support** to `ChannelConfigRegistry` so the SDK can register `<svc>.replies.*` once.
-3. **Have the SDK skip the registry install** when no `ChannelConfig`s are explicitly registered — fall back to the permissive `MeshNode` default. Behavior change for existing SDK users.
-
-Option 2 is the cleanest. Out of scope for this turn.
+- ✅ **`ChannelConfigRegistry` prefix-match** — new `insert_prefix(prefix, config)` / `remove_prefix(prefix)` API. `get_by_name(name)` falls back to a prefix walk when no exact match exists; the first prefix `name` starts with wins. The exact-match hot path (DashMap get) is unaffected; prefix lookups are O(num_prefixes) on the slow path. Documented as "use sparingly — one prefix per service is fine, hundreds is not."
+- ✅ **SDK auto-registration** in `Mesh::serve_rpc` and `Mesh::serve_rpc_typed` — registers two `ChannelConfig` entries per service:
+  - Exact: `<service>.requests` (channel callers publish REQUESTs onto).
+  - Prefix: `<service>.replies.` (admits every per-caller `<service>.replies.<caller_origin>` subscribe without pre-registration).
+  Both default to permissive (no `publish_caps`, no `require_token`); operators who want RPC ACLs can call `register_channel` / `register_channel_prefix` themselves before `serve_rpc` to override. Resolves the SDK channel-registry friction noted in the prior follow-up.
+- ✅ **End-to-end SDK nRPC tests** in `sdk/tests/mesh_rpc_typed.rs` (4 tests, real network handshake): typed `call_typed` round-trip, handler `Err(String)` mapping, `call_service_typed` discovers the server via capability announcements, codec round-trip semantics. **All four tests pass over the SDK's default `MeshBuilder::build` path** — no special opt-in required.
+- ✅ **W3C Trace Context propagation** (`cortex::rpc::TraceContext` + `extract_trace_context` / `build_trace_headers` helpers). New `CallOptions::trace_context: Option<TraceContext>` and `RpcContext::trace_context: Option<TraceContext>` fields. When the caller sets `CallOptions::trace_context`, the SDK emits `traceparent` / `tracestate` headers and sets `FLAG_RPC_PROPAGATE_TRACE`; the server's fold extracts the headers and populates `RpcContext::trace_context`. nRPC is **transport-only** — application code on both sides reads/writes via whatever tracing backend it has wired up (`tracing-opentelemetry`, Datadog, etc.). Empty `tracestate` is omitted on the wire (W3C convention). 4 unit tests + 1 end-to-end test (`integration_nrpc_mesh::rpc_trace_context_propagates_to_server`) prove the round-trip via real network publish.
 
 What's still pending:
 

@@ -35,10 +35,10 @@ use tokio::task::JoinHandle;
 
 use super::channel::{ChannelId, ChannelName, ChannelPublisher, PublishConfig};
 use super::cortex::{
-    EventMeta, RpcCancellationToken, RpcClientFold, RpcContext, RpcHandler, RpcHandlerError,
-    RpcInboundDispatcher, RpcInboundEvent, RpcRequestPayload, RpcResponseEmitter,
-    RpcResponsePayload, RpcServerFold, RpcStatus, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
-    EVENT_META_SIZE,
+    build_trace_headers, EventMeta, RpcCancellationToken, RpcClientFold, RpcContext, RpcHandler,
+    RpcHandlerError, RpcInboundDispatcher, RpcInboundEvent, RpcRequestPayload,
+    RpcResponseEmitter, RpcResponsePayload, RpcServerFold, RpcStatus, TraceContext,
+    DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST, EVENT_META_SIZE, FLAG_RPC_PROPAGATE_TRACE,
 };
 use crate::error::AdapterError;
 
@@ -104,6 +104,14 @@ pub struct CallOptions {
     /// unhealth, and a freshly-announced service shouldn't be
     /// filtered just because pingwaves haven't propagated yet.
     pub filter_unhealthy: bool,
+    /// W3C Trace Context to propagate to the server. When `Some`,
+    /// the call sets `FLAG_RPC_PROPAGATE_TRACE` on the request and
+    /// emits `traceparent` / `tracestate` headers; the server's
+    /// `RpcContext::trace_context` will be populated with the same
+    /// values. nRPC is transport-only — application code on both
+    /// sides reads / writes this via whatever tracing backend it
+    /// has wired up (tracing-opentelemetry, Datadog, etc.).
+    pub trace_context: Option<TraceContext>,
     /// Per-call concurrency cap. Future Phase 2 work; v1 ignores
     /// this and the per-Mesh `RpcClientPending` doesn't bound
     /// in-flight count.
@@ -116,6 +124,7 @@ impl Default for CallOptions {
             deadline: None,
             routing_policy: RoutingPolicy::default(),
             filter_unhealthy: true,
+            trace_context: None,
             max_in_flight_per_target: 64,
         }
     }
@@ -533,15 +542,22 @@ impl MeshNode {
         let pending = self.rpc_client_pending();
         let rx = pending.register(call_id);
 
-        // Build the REQUEST envelope.
+        // Build the REQUEST envelope. If a trace context is set,
+        // emit `traceparent` / `tracestate` headers and signal
+        // via `FLAG_RPC_PROPAGATE_TRACE` so the server's fold
+        // populates `RpcContext::trace_context`.
+        let (flags, headers) = match opts.trace_context.as_ref() {
+            Some(tc) => (FLAG_RPC_PROPAGATE_TRACE, build_trace_headers(tc)),
+            None => (0u16, Vec::new()),
+        };
         let req = RpcRequestPayload {
             service: service.to_string(),
             deadline_ns: opts
                 .deadline
                 .map(instant_to_unix_nanos)
                 .unwrap_or(0),
-            flags: 0,
-            headers: vec![],
+            flags,
+            headers,
             body: payload.to_vec(),
         };
         let meta = EventMeta::new(

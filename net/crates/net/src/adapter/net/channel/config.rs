@@ -168,6 +168,17 @@ pub struct ChannelConfigRegistry {
     configs: DashMap<String, ChannelConfig>,
     /// Reverse index: hash → names (for hash-based lookups)
     by_hash: DashMap<u16, Vec<String>>,
+    /// Prefix registry: prefix → config. Consulted by
+    /// `get_by_name` when no exact match exists; the first prefix
+    /// that the queried name starts with wins. Used by nRPC's
+    /// SDK glue to register `<service>.replies.` once and admit
+    /// every `<service>.replies.<caller_origin>` subscribe that
+    /// follows.
+    ///
+    /// Prefix lookups are O(num_prefixes) — a small constant in
+    /// practice (one prefix per nRPC service). The exact-match
+    /// hot path is unaffected.
+    prefix_configs: DashMap<String, ChannelConfig>,
 }
 
 impl ChannelConfigRegistry {
@@ -176,7 +187,36 @@ impl ChannelConfigRegistry {
         Self {
             configs: DashMap::new(),
             by_hash: DashMap::new(),
+            prefix_configs: DashMap::new(),
         }
+    }
+
+    /// Register a prefix-matched channel configuration. Any
+    /// channel name starting with `prefix` that has no exact-match
+    /// entry will resolve to `config` via [`Self::get_by_name`].
+    ///
+    /// **Use sparingly.** Prefix lookups bypass the `by_hash`
+    /// fast path and walk the prefix list on the slow path; one
+    /// prefix per service is fine, hundreds is not. nRPC uses
+    /// this for its dynamic per-caller reply channels
+    /// (`<service>.replies.<caller_origin>`) — one prefix per
+    /// `serve_rpc` registration.
+    ///
+    /// `config.channel_id` should carry the prefix as a sentinel
+    /// name (e.g. `<svc>.replies.`); it isn't used for hash
+    /// lookups, so the channel-name validation rules don't apply
+    /// strictly. Prefix entries are collision-safe with respect
+    /// to each other (DashMap on the prefix string), but the
+    /// matching order across overlapping prefixes is unspecified —
+    /// avoid registering overlapping prefixes.
+    pub fn insert_prefix(&self, prefix: impl Into<String>, config: ChannelConfig) {
+        self.prefix_configs.insert(prefix.into(), config);
+    }
+
+    /// Remove a prefix-matched config. Returns the removed config
+    /// if it existed.
+    pub fn remove_prefix(&self, prefix: &str) -> Option<ChannelConfig> {
+        self.prefix_configs.remove(prefix).map(|(_, v)| v)
     }
 
     /// Register a channel configuration.
@@ -211,11 +251,30 @@ impl ChannelConfigRegistry {
     }
 
     /// Look up a channel config by exact name (collision-safe).
+    ///
+    /// Falls back to the prefix registry if no exact match exists:
+    /// the first registered prefix that `name` starts with wins.
+    /// Used by nRPC's dynamic reply channels — one
+    /// `<service>.replies.` prefix admits every per-caller
+    /// `<service>.replies.<caller_origin>` subscribe.
     pub fn get_by_name(
         &self,
         name: &str,
     ) -> Option<dashmap::mapref::one::Ref<'_, String, ChannelConfig>> {
-        self.configs.get(name)
+        if let Some(exact) = self.configs.get(name) {
+            return Some(exact);
+        }
+        // Slow path: walk the prefix table. Cheap in the typical
+        // case (zero or one prefix entries); the fast path is
+        // unaffected. Returns the first matching prefix's config —
+        // overlapping prefixes have unspecified resolution order
+        // (documented on `insert_prefix`).
+        let matched = self
+            .prefix_configs
+            .iter()
+            .find(|entry| name.starts_with(entry.key()))
+            .map(|entry| entry.key().clone())?;
+        self.prefix_configs.get(&matched)
     }
 
     /// Remove a channel config by hash.

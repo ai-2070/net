@@ -419,6 +419,59 @@ impl RpcResponsePayload {
     }
 }
 
+/// Pull `traceparent` / `tracestate` out of `headers` if present.
+/// Caller-side helper: callers building an `RpcRequestPayload`
+/// with a `TraceContext` use [`build_trace_headers`] to emit the
+/// matching headers; this is the inverse on the server side.
+///
+/// Returns `Some(TraceContext)` if `traceparent` is present;
+/// `None` otherwise. `tracestate` defaults to empty when absent
+/// — W3C says tracestate is optional even when traceparent is
+/// set.
+pub fn extract_trace_context(headers: &[RpcHeader]) -> Option<TraceContext> {
+    let mut traceparent: Option<String> = None;
+    let mut tracestate = String::new();
+    for (name, value) in headers {
+        match name.as_str() {
+            "traceparent" => {
+                if let Ok(s) = std::str::from_utf8(value) {
+                    traceparent = Some(s.to_string());
+                }
+            }
+            "tracestate" => {
+                if let Ok(s) = std::str::from_utf8(value) {
+                    tracestate = s.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    traceparent.map(|tp| TraceContext {
+        traceparent: tp,
+        tracestate,
+    })
+}
+
+/// Build the headers a caller appends to its
+/// `RpcRequestPayload::headers` to propagate the trace context
+/// across the call. Set `RpcRequestPayload::flags |= FLAG_RPC_PROPAGATE_TRACE`
+/// alongside this so the server's fold knows to extract them.
+///
+/// Always emits `traceparent`. Emits `tracestate` only when
+/// non-empty (matches the W3C convention of skipping empty
+/// tracestate values on the wire).
+pub fn build_trace_headers(ctx: &TraceContext) -> Vec<RpcHeader> {
+    let mut headers = Vec::with_capacity(2);
+    headers.push((
+        "traceparent".to_string(),
+        ctx.traceparent.clone().into_bytes(),
+    ));
+    if !ctx.tracestate.is_empty() {
+        headers.push(("tracestate".to_string(), ctx.tracestate.clone().into_bytes()));
+    }
+    headers
+}
+
 fn encode_headers(headers: &[RpcHeader], buf: &mut Vec<u8>) {
     buf.put_u8(headers.len() as u8);
     for (name, value) in headers {
@@ -638,6 +691,30 @@ impl RpcCancellationToken {
     }
 }
 
+/// W3C Trace Context — `traceparent` and `tracestate` headers
+/// propagated through nRPC for distributed-tracing systems.
+///
+/// `traceparent` carries the trace id, parent span id, and flags;
+/// `tracestate` carries vendor-specific tracing extensions. nRPC
+/// is **transport-only** for these — it doesn't parse or generate
+/// IDs, doesn't emit spans, doesn't talk to any tracing backend.
+/// Application code (typically via `tracing-opentelemetry` or a
+/// Datadog client) reads these on the server side and continues
+/// the trace.
+///
+/// See <https://www.w3.org/TR/trace-context/> for the wire format
+/// of each field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraceContext {
+    /// `traceparent` header value (e.g.
+    /// `"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"`).
+    /// Required by the W3C spec; nRPC treats it as opaque bytes.
+    pub traceparent: String,
+    /// `tracestate` header value — vendor-specific extensions.
+    /// Optional in W3C; empty string when absent.
+    pub tracestate: String,
+}
+
 /// Context handed to a `RpcHandler::call`. Carries everything the
 /// handler needs to fulfill the request: the AEAD-verified caller
 /// identity, the request payload, and a cancellation token.
@@ -655,6 +732,13 @@ pub struct RpcContext {
     /// long-running synchronous handlers should periodically check
     /// `cancellation.is_cancelled()`.
     pub cancellation: RpcCancellationToken,
+    /// W3C Trace Context propagated from the caller, if the
+    /// caller set `FLAG_RPC_PROPAGATE_TRACE` and supplied
+    /// `traceparent` / `tracestate` headers in the request. The
+    /// server's handler reads this to continue the distributed
+    /// trace. `None` for calls that didn't propagate trace
+    /// context.
+    pub trace_context: Option<TraceContext>,
 }
 
 /// Handler-side error that doesn't fit the application's normal
@@ -839,12 +923,24 @@ impl RedexFold<()> for RpcServerFold {
                 let in_flight = self.in_flight.clone();
                 let caller_origin = meta.origin_hash;
                 let call_id = meta.seq_or_ts;
+                // Decode the W3C Trace Context if the caller
+                // signaled it via `FLAG_RPC_PROPAGATE_TRACE` and
+                // included the `traceparent` / `tracestate`
+                // headers. nRPC is transport-only — application
+                // code reads `ctx.trace_context` to continue the
+                // trace via whatever backend it has wired up.
+                let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
+                    extract_trace_context(&payload.headers)
+                } else {
+                    None
+                };
                 tokio::spawn(async move {
                     let ctx = RpcContext {
                         caller_origin,
                         call_id,
                         payload,
                         cancellation,
+                        trace_context,
                     };
                     // Catch panics so a misbehaving handler can't
                     // take down the runtime. `AssertUnwindSafe` is
@@ -1719,6 +1815,138 @@ mod tests {
             .expect("waiter must wake within 1s")
             .expect("waiter task must not panic");
         assert!(token.is_cancelled());
+    }
+
+    // ====================================================================
+    // W3C Trace Context propagation.
+    // ====================================================================
+
+    /// `build_trace_headers` + `extract_trace_context` round-trip
+    /// a typical W3C trace context through the request headers.
+    #[test]
+    fn trace_context_round_trips_through_headers() {
+        let tc = TraceContext {
+            traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                .to_string(),
+            tracestate: "vendor1=opaque-value,vendor2=other".to_string(),
+        };
+        let headers = build_trace_headers(&tc);
+        assert_eq!(headers.len(), 2, "non-empty tracestate emits both headers");
+        let extracted = extract_trace_context(&headers).expect("must extract");
+        assert_eq!(extracted, tc);
+    }
+
+    /// Empty `tracestate` is omitted on the wire (W3C convention)
+    /// but extracted as empty on the receive side.
+    #[test]
+    fn trace_context_empty_tracestate_omitted_from_wire() {
+        let tc = TraceContext {
+            traceparent: "00-aa-bb-01".to_string(),
+            tracestate: String::new(),
+        };
+        let headers = build_trace_headers(&tc);
+        assert_eq!(
+            headers.len(),
+            1,
+            "empty tracestate must NOT be emitted on the wire",
+        );
+        assert_eq!(headers[0].0, "traceparent");
+        let extracted = extract_trace_context(&headers).expect("must extract");
+        assert_eq!(extracted.traceparent, "00-aa-bb-01");
+        assert_eq!(extracted.tracestate, "");
+    }
+
+    /// Headers without `traceparent` decode as `None`. Useful for
+    /// the FLAG_RPC_PROPAGATE_TRACE-set-but-no-headers misuse
+    /// case — the server gets `None` rather than a bogus context.
+    #[test]
+    fn trace_context_missing_traceparent_returns_none() {
+        let headers = vec![
+            ("content-type".to_string(), b"application/json".to_vec()),
+            ("idempotency-key".to_string(), b"abc".to_vec()),
+        ];
+        assert!(extract_trace_context(&headers).is_none());
+    }
+
+    /// Server fold populates `RpcContext::trace_context` only when
+    /// the caller signals `FLAG_RPC_PROPAGATE_TRACE`. End-to-end
+    /// through the fold's apply path.
+    #[tokio::test]
+    async fn server_fold_propagates_trace_context_via_flag() {
+        struct CapturingHandler {
+            captured: Arc<Mutex<Option<Option<TraceContext>>>>,
+        }
+        #[async_trait::async_trait]
+        impl RpcHandler for CapturingHandler {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                *self.captured.lock() = Some(ctx.trace_context.clone());
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: vec![],
+                })
+            }
+        }
+
+        // Helper: run one request through a fresh fold and return
+        // what the handler captured for trace_context.
+        async fn run(req: RpcRequestPayload) -> Option<TraceContext> {
+            let captured: Arc<Mutex<Option<Option<TraceContext>>>> = Arc::new(Mutex::new(None));
+            let (emit, _captured_responses) = capturing_emitter();
+            let handler = Arc::new(CapturingHandler {
+                captured: captured.clone(),
+            });
+            let mut fold = RpcServerFold::new(handler, emit);
+            fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
+            // Wait for the spawned handler to finish.
+            assert!(
+                wait_until(|| captured.lock().is_some(), Duration::from_secs(2)).await,
+                "handler must run"
+            );
+            let observed = captured.lock().take().unwrap();
+            observed
+        }
+
+        // Case 1: FLAG_RPC_PROPAGATE_TRACE NOT set → trace_context is None.
+        let req_no_flag = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![("traceparent".to_string(), b"00-aa-bb-01".to_vec())],
+            body: vec![],
+        };
+        assert!(
+            run(req_no_flag).await.is_none(),
+            "without the flag, server must NOT extract trace_context"
+        );
+
+        // Case 2: FLAG set + headers present → server gets the context.
+        let tc = TraceContext {
+            traceparent: "00-trace-span-01".to_string(),
+            tracestate: "vendor=value".to_string(),
+        };
+        let req_with_flag = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_PROPAGATE_TRACE,
+            headers: build_trace_headers(&tc),
+            body: vec![],
+        };
+        let observed = run(req_with_flag).await.expect("flag set → should be Some");
+        assert_eq!(observed, tc);
+
+        // Case 3: FLAG set but headers missing → None (defensive).
+        let req_flag_no_headers = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_PROPAGATE_TRACE,
+            headers: vec![],
+            body: vec![],
+        };
+        assert!(
+            run(req_flag_no_headers).await.is_none(),
+            "flag set but no headers → server gets None (no synthesis)"
+        );
     }
 
     /// Race: cancel fires AFTER the future is registered but

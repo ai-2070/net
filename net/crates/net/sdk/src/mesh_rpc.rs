@@ -94,6 +94,24 @@ impl Mesh {
     /// the response body as `Bytes`. Wire codec is the user's
     /// concern.
     ///
+    /// **Auto-registers two `ChannelConfig` entries** so the
+    /// per-caller subscribe + per-call publish work under the
+    /// SDK's default `ChannelConfigRegistry` (which fail-closes
+    /// on unknown channels):
+    ///
+    ///   1. Exact-match `<service>.requests` — the channel
+    ///      callers publish REQUESTs onto.
+    ///   2. Prefix-match `<service>.replies.` — admits every
+    ///      `<service>.replies.<caller_origin>` subscribe that
+    ///      arrives, no per-caller pre-registration needed.
+    ///
+    /// Both entries default to permissive (no `publish_caps`,
+    /// no `require_token`) — channel-level ACLs on RPC traffic
+    /// are a Phase 3 concern (alongside the per-service token
+    /// allowlist). Operators who need RPC ACLs today can call
+    /// `register_channel` / `register_channel_prefix` themselves
+    /// before `serve_rpc` to override.
+    ///
     /// For typed handlers (auto serde), use
     /// [`Self::serve_rpc_typed`].
     pub fn serve_rpc<H: RpcHandler>(
@@ -101,7 +119,35 @@ impl Mesh {
         service: &str,
         handler: Arc<H>,
     ) -> std::result::Result<ServeHandle, ServeError> {
+        self.auto_register_rpc_channels(service);
         self.node().serve_rpc(service, handler)
+    }
+
+    /// Internal helper used by `serve_rpc` / `serve_rpc_typed` to
+    /// auto-register the request channel + reply prefix in the
+    /// SDK's `ChannelConfigRegistry`. Idempotent — repeated calls
+    /// for the same service are no-ops (DashMap insert overwrites
+    /// with the same default permissive config).
+    fn auto_register_rpc_channels(&self, service: &str) {
+        use crate::ChannelConfig;
+        use net::adapter::net::channel::{ChannelId, ChannelName};
+        // Exact: `<service>.requests`.
+        let req_name = format!("{service}.requests");
+        if let Ok(req_channel) = ChannelName::new(&req_name) {
+            self.register_channel(ChannelConfig::new(ChannelId::new(req_channel)));
+        }
+        // Prefix: `<service>.replies.` — admits every per-caller
+        // `<service>.replies.<caller_origin>` subscribe.
+        let prefix = format!("{service}.replies.");
+        // Sentinel ChannelId for the prefix entry; not used for
+        // hash lookups, just carried so the ChannelConfig is
+        // structurally well-formed.
+        if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
+            self.channel_configs_arc().insert_prefix(
+                prefix,
+                ChannelConfig::new(ChannelId::new(sentinel_name)),
+            );
+        }
     }
 
     /// Direct-addressed call. Caller specifies `target_node_id`;
@@ -163,6 +209,7 @@ impl Mesh {
             _req: std::marker::PhantomData::<Req>,
             _resp: std::marker::PhantomData::<Resp>,
         };
+        self.auto_register_rpc_channels(service);
         self.node().serve_rpc(service, Arc::new(typed))
     }
 

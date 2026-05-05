@@ -367,6 +367,14 @@ impl Mesh {
         &self.node
     }
 
+    /// Crate-internal accessor for the SDK's
+    /// `ChannelConfigRegistry`. Used by `mesh_rpc` to
+    /// auto-register the request channel + reply prefix on
+    /// `serve_rpc`.
+    pub(crate) fn channel_configs_arc(&self) -> &Arc<ChannelConfigRegistry> {
+        &self.channel_configs
+    }
+
     /// Connect to a peer as initiator.
     ///
     /// The peer must be listening (call `accept()` on their side).

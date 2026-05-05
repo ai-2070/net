@@ -82,3 +82,8 @@ groups = ["compute"]
 local = ["net", "cortex", "compute", "groups"]
 # Everything — local stack plus external transports.
 full = ["local", "redis", "jetstream"]
+
+# nRPC quickstart — requires net + cortex.
+[[example]]
+name = "nrpc_echo"
+required-features = ["net", "cortex"]

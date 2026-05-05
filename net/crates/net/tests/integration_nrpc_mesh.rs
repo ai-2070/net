@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use net::adapter::net::cortex::{
-    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus, TraceContext,
 };
 use net::adapter::net::mesh_rpc::{CallOptions, RpcError};
+use parking_lot::Mutex;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -270,4 +271,83 @@ async fn rpc_deadline_surfaces_as_timeout_and_emits_cancel() {
         }
         other => panic!("expected Timeout, got {other:?}"),
     }
+}
+
+/// Caller sets `CallOptions::trace_context` → server's
+/// `RpcContext::trace_context` is populated with the same values.
+/// Pin the W3C-trace-context propagation end-to-end through real
+/// network publish.
+#[tokio::test]
+async fn rpc_trace_context_propagates_to_server() {
+    struct CapturingTraceHandler {
+        captured: Arc<Mutex<Option<Option<TraceContext>>>>,
+    }
+    #[async_trait::async_trait]
+    impl RpcHandler for CapturingTraceHandler {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            *self.captured.lock() = Some(ctx.trace_context.clone());
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: vec![],
+            })
+        }
+    }
+
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    let captured = Arc::new(Mutex::new(None));
+    let _serve = server
+        .serve_rpc(
+            "echo",
+            Arc::new(CapturingTraceHandler {
+                captured: captured.clone(),
+            }),
+        )
+        .expect("serve_rpc");
+
+    // Caller sends with a trace context.
+    let tc = TraceContext {
+        traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+        tracestate: "vendor=opaque-value".to_string(),
+    };
+    let _reply = caller
+        .call(
+            server.node_id(),
+            "echo",
+            Bytes::from_static(b""),
+            CallOptions {
+                trace_context: Some(tc.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("call must succeed");
+
+    let observed = captured
+        .lock()
+        .clone()
+        .expect("handler must run")
+        .expect("trace context must be present");
+    assert_eq!(observed, tc);
+
+    // Sanity: a call WITHOUT trace_context leaves the server's
+    // RpcContext.trace_context as None.
+    *captured.lock() = None;
+    let _reply = caller
+        .call(
+            server.node_id(),
+            "echo",
+            Bytes::from_static(b""),
+            CallOptions::default(),
+        )
+        .await
+        .expect("call must succeed");
+    let observed = captured.lock().clone().expect("handler must run");
+    assert!(
+        observed.is_none(),
+        "no trace_context on the call → server gets None, got {observed:?}",
+    );
 }
