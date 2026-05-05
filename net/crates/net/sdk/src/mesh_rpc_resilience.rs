@@ -319,7 +319,7 @@ where
 /// values >1 multiply your server-side load).
 ///
 /// **Cancellation.** When the winner returns, loser futures are
-/// dropped — and the underlying [`crate::mesh_rpc::Mesh::call`]
+/// dropped — and the underlying [`Mesh::call`](crate::mesh::Mesh::call)
 /// future has a `UnaryCallGuard` whose `Drop` fires a CANCEL to
 /// the corresponding server. The server's handler observes the
 /// cancellation on its `RpcContext::cancellation` token and can

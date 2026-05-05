@@ -1310,10 +1310,10 @@ impl MeshNode {
 
 /// Hard cap on the number of distinct (target_node_id, service)
 /// pairs the caller-side reply-subscription registry will hold.
-/// Past the cap, [`MeshNode::ensure_reply_subscription`] refuses
-/// new entries with `RpcError::NoRoute`. 1024 is generous for
-/// any realistic deployment — a caller that needs more should
-/// reuse existing reply paths.
+/// Past the cap, the lazy-subscribe path inside [`MeshNode::call`]
+/// refuses new entries with [`RpcError::NoRoute`]. 1024 is
+/// generous for any realistic deployment — a caller that needs
+/// more should reuse existing reply paths.
 pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 
 // ============================================================================
