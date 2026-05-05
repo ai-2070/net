@@ -1,0 +1,33 @@
+net/crates/net/bindings/node/errors.d.ts
+  d1b11a1287c1706a 99-110
+net/crates/net/bindings/node/mesh_rpc.d.ts
+  d1b11a1287c1706a 21-36,78-81
+net/crates/net/bindings/node/test/mesh_rpc.test.ts
+  d1b11a1287c1706a 18,481-608
+net/crates/net/bindings/node/errors.js
+  d1b11a1287c1706a 118-132,173-174,189
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  d1b11a1287c1706a 34-35,43,95-149,174-182,186-190,197-211,585-612,626-637,650-661
+net/crates/net/bindings/node/mesh_rpc.js
+  d1b11a1287c1706a 176-182,187,192-203,214,219-225,752-804
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "ac2844c6349e230286d67f9fd8d66972d13ef25c",
+  "prompts": {
+    "d1b11a1287c1706a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2727,
+      "total_deletions": 28,
+      "accepted_lines": 1072,
+      "overriden_lines": 0
+    }
+  }
+}
