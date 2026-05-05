@@ -8,7 +8,7 @@
 //!   - `bindings/node/test/cross_lang_compat.test.ts`
 //!   - `bindings/python/tests/test_cross_lang_compat.py`
 //!
-//! See `tests/cross_lang_nrpc/README.md` for the canonical service
+//! See `net/crates/net/README.md#nrpc` for the canonical service
 //! contract spec.
 //!
 //! What this test proves:

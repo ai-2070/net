@@ -1,6 +1,6 @@
 {
   "service": "cross_lang_echo_sum",
-  "description": "Canonical cross-binding nRPC compatibility service. Every binding's wire-format compat test loads this file and asserts: encoding request_json on each side, dispatching through the handler, and decoding the response yields response_json that semantically matches expected. Status codes, header names, and the JSON shape are all part of the contract — see ../README.md for the full spec.",
+  "description": "Canonical cross-binding nRPC compatibility service. Every binding's wire-format compat test loads this file and asserts: encoding request_json on each side, dispatching through the handler, and decoding the response yields response_json that semantically matches expected. Status codes, header names, and the JSON shape are all part of the contract — see net/crates/net/README.md#nrpc for the full spec.",
   "abi_version_expected": 1,
   "ok_cases": [
     {

@@ -724,6 +724,137 @@ CortEX-boundary errors are typed and catchable via `instanceof`:
 All three are re-exported from `@ai2070/net-sdk`; you don't need a
 separate import path.
 
+## nRPC (request / response over the mesh)
+
+nRPC is the request/response convention layer riding on top of the
+pub/sub mesh. It turns a directed channel pair
+(`<service>.requests` / `<service>.replies.<caller_origin>`) into
+a typed RPC surface with deadlines, queue-group fan-out, response
+streaming, and end-to-end cancellation.
+
+The typed surface ships in the napi binding at
+`@ai2070/net/mesh_rpc` (the SDK's `MeshNode` wraps a `NetMesh`
+that nRPC consumes directly):
+
+```typescript
+import { MeshNode } from '@ai2070/net-sdk'
+import { classifyError, RpcServerError } from '@ai2070/net/errors'
+import {
+  CircuitBreaker,
+  HedgePolicy,
+  NRPC_TYPED_BAD_REQUEST,
+  RetryPolicy,
+  TypedMeshRpc,
+} from '@ai2070/net/mesh_rpc'
+
+const server = await MeshNode.create({ bindAddr: '127.0.0.1:9001', psk })
+const client = await MeshNode.create({ bindAddr: '127.0.0.1:9000', psk })
+// (handshake omitted — see Mesh Streams example)
+
+interface EchoSumRequest  { text: string; numbers: number[] }
+interface EchoSumResponse { echo: string; sum: number }
+
+// Server side: register a typed handler. Returned `serveHandle`
+// MUST be `close()`d to stop accepting new requests; in-flight
+// handlers complete (no abort).
+const serverRpc = TypedMeshRpc.fromMesh((server as any)._native)
+const serveHandle = serverRpc.serve<EchoSumRequest, EchoSumResponse>(
+  'echo_sum',
+  async (req) => ({ echo: req.text, sum: req.numbers.reduce((a, b) => a + b, 0) }),
+)
+
+// Client side: typed call with a 200ms deadline.
+const clientRpc = TypedMeshRpc.fromMesh((client as any)._native)
+try {
+  const reply = await clientRpc.call<EchoSumRequest, EchoSumResponse>(
+    server.nodeId(),
+    'echo_sum',
+    { text: 'hi', numbers: [1, 2, 3] },
+    { deadlineMs: 200 },
+  )
+  // reply.sum === 6
+} catch (e) {
+  // Errors carry a stable `nrpc:` prefix; classifyError() routes
+  // them to typed subclasses for instanceof checks.
+  const typed = classifyError(e)
+  if (typed instanceof RpcServerError && typed.status === NRPC_TYPED_BAD_REQUEST) {
+    // handler bad-request
+  }
+}
+
+await serveHandle.close()
+```
+
+### Streaming responses
+
+```typescript
+const stream = await clientRpc.callStreaming<MyReq, MyChunk>(
+  targetNodeId, 'tail', { tail: 'events' },
+  { deadlineMs: 5_000, streamWindow: 8 },  // optional flow control
+)
+for await (const chunk of stream) {
+  // chunk is decoded MyChunk
+}
+// stream.close() emits CANCEL to the server (best-effort);
+// in-flight chunks are silently discarded.
+// stream.grant(n) issues an explicit credit publish for batched
+// cadence (no-op on streams without flow control).
+```
+
+### Resilience helpers
+
+```typescript
+const policy = new RetryPolicy({
+  maxAttempts: 4,
+  initialBackoffMs: 50,
+  maxBackoffMs: 1000,
+  jitter: 0.2,
+})
+const reply = await clientRpc.callWithRetry(
+  targetNodeId, 'echo', { hello: 'world' }, policy,
+)
+
+// HedgePolicy fans out parallel attempts on a delay;
+// first success wins, losers cancelled.
+const hedge = new HedgePolicy({ maxParallel: 3, hedgeDelayMs: 50 })
+await clientRpc.callWithHedgeTo(targetNodeIds, 'echo', { ... }, hedge)
+
+// CircuitBreaker — closed → open → half-open with a configurable
+// failure predicate. Open breakers throw `BreakerOpenError` carrying
+// the `nrpc:breaker_open:` prefix.
+const breaker = new CircuitBreaker({ failureThreshold: 5, resetAfterMs: 1000 })
+await breaker.call(() => clientRpc.call(targetNodeId, 'echo', {}))
+```
+
+### Errors
+
+Caller-side failures throw a plain `Error` whose `.message`
+starts with the stable `nrpc:` prefix (the binding throws plain
+`Error` rather than typed classes to sidestep vitest's
+dual-module-instance hazard; `classifyError(e)` reconstructs the
+typed subclass at the catch site):
+
+| Kind segment    | Typed class           |
+| --------------- | --------------------- |
+| `no_route`      | `RpcNoRouteError`     |
+| `timeout`       | `RpcTimeoutError`     |
+| `server_error`  | `RpcServerError`      |
+| `transport`     | `RpcTransportError`   |
+| `codec_encode`  | `RpcCodecError`       |
+| `codec_decode`  | `RpcCodecError`       |
+| `breaker_open`  | `BreakerOpenError`    |
+
+Two stable status constants exposed by `@ai2070/net/mesh_rpc`:
+
+| Constant                       | Hex      | Meaning                                          |
+| ------------------------------ | -------- | ------------------------------------------------ |
+| `NRPC_TYPED_BAD_REQUEST`       | `0x8000` | Typed handler couldn't decode the request body.  |
+| `NRPC_TYPED_HANDLER_ERROR`     | `0x8001` | Typed handler ran but returned an exception.     |
+
+Cross-binding contract spec — including the canonical
+`cross_lang_echo_sum` service used by every binding's wire-format
+compat test — lives in [`../README.md#nrpc`](../README.md#nrpc).
+
 ## Compute (daemons + migration)
 
 Run `MeshDaemon`s directly from TypeScript. `DaemonRuntime` owns

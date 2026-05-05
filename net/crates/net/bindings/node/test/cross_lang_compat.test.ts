@@ -10,7 +10,7 @@
 // the encoded request through a stub raw MeshRpc that runs the
 // handler in-process and returns the encoded response. This is
 // the same wire-format-compat pattern documented in
-// `tests/cross_lang_nrpc/README.md`.
+// `net/crates/net/README.md#nrpc`.
 
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'

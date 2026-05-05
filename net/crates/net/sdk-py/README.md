@@ -360,6 +360,130 @@ Cross-SDK contract + rationale:
 > paths. Follow-up work to proxy them through `net_sdk` is tracked
 > in [`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md).
 
+## nRPC (request / response over the mesh)
+
+nRPC is the request/response convention layer riding on top of
+the pub/sub mesh. It turns a directed channel pair
+(`<service>.requests` / `<service>.replies.<caller_origin>`) into
+a typed RPC surface with deadlines, queue-group fan-out, response
+streaming, and end-to-end cancellation.
+
+The typed surface ships in the native `net` PyO3 package at
+`net.mesh_rpc` (synchronous calls; the binding releases the GIL
+across `runtime.block_on(...)` so other Python threads can run,
+and dispatches handler callbacks under
+`tokio::task::spawn_blocking` so GIL acquisition doesn't starve
+the runtime):
+
+```python
+from net import NetMesh
+from net.mesh_rpc import (
+    CircuitBreaker,
+    HedgePolicy,
+    NRPC_TYPED_BAD_REQUEST,
+    RetryPolicy,
+    RpcServerError,
+    TypedMeshRpc,
+)
+
+server = NetMesh("127.0.0.1:9001", "42" * 32)
+client = NetMesh("127.0.0.1:9000", "42" * 32)
+# (handshake omitted — see Mesh Streams example)
+
+# Server side: register a typed handler. The returned ServeHandle
+# is a context manager — `with` ensures unregister on exit.
+server_rpc = TypedMeshRpc.from_mesh(server)
+def echo_sum(req: dict) -> dict:
+    return {"echo": req["text"], "sum": sum(req["numbers"])}
+
+with server_rpc.serve("echo_sum", echo_sum) as handle:
+    # Client side: typed call with a 200ms deadline.
+    client_rpc = TypedMeshRpc.from_mesh(client)
+    try:
+        reply = client_rpc.call(
+            server.node_id(),
+            "echo_sum",
+            {"text": "hi", "numbers": [1, 2, 3]},
+            opts={"deadline_ms": 200},
+        )
+        # reply == {"echo": "hi", "sum": 6}
+    except RpcServerError as e:
+        # The status is encoded in the error message; helper:
+        from net.mesh_rpc import classify_error
+        kind = classify_error(e)
+        # ...dispatch on kind...
+```
+
+### Streaming responses
+
+```python
+stream = client_rpc.call_streaming(
+    target_node_id, "tail", {"tail": "events"},
+    opts={"deadline_ms": 5000, "stream_window": 8},  # optional flow control
+)
+for chunk in stream:               # decoded objects
+    process(chunk)
+# stream.close() emits CANCEL to the server (best-effort);
+# in-flight chunks are silently discarded.
+# stream.grant(n) issues an explicit credit publish for batched
+# cadence (no-op on streams without flow control).
+```
+
+### Resilience helpers
+
+```python
+policy = RetryPolicy(
+    max_attempts=4,
+    initial_backoff_ms=50,
+    max_backoff_ms=1000,
+    jitter=0.2,
+)
+reply = client_rpc.call_with_retry(
+    target_node_id, "echo", {"hello": "world"}, policy,
+)
+
+# HedgePolicy fans out parallel attempts on a delay;
+# first success wins, losers cancelled.
+hedge = HedgePolicy(max_parallel=3, hedge_delay_ms=50)
+client_rpc.call_with_hedge_to(target_node_ids, "echo", {...}, hedge)
+
+# CircuitBreaker — closed → open → half-open with a configurable
+# failure predicate. Open breakers raise `BreakerOpenError`
+# carrying the `nrpc:breaker_open:` prefix.
+breaker = CircuitBreaker(failure_threshold=5, reset_after_ms=1000)
+breaker.call(lambda: client_rpc.call(target_node_id, "echo", {}))
+```
+
+### Errors
+
+Every caller-side failure is a typed exception with a stable
+`nrpc:` prefix in the message. Subclasses (all in `net.mesh_rpc`):
+
+| Exception                | Kind segment    | Trigger                                  |
+| ------------------------ | --------------- | ---------------------------------------- |
+| `RpcNoRouteError`        | `no_route`      | No session to target / capability gone   |
+| `RpcTimeoutError`        | `timeout`       | Deadline elapsed before reply            |
+| `RpcServerError`         | `server_error`  | Handler returned a non-OK status         |
+| `RpcTransportError`      | `transport`     | Wire-level send / receive failure        |
+| `RpcCodecError`          | `codec_encode` / `codec_decode` | Encode / decode failure |
+| `BreakerOpenError`       | `breaker_open`  | Circuit breaker rejected the call        |
+
+Two stable status constants exposed by `net.mesh_rpc`:
+
+| Constant                       | Hex      | Meaning                                          |
+| ------------------------------ | -------- | ------------------------------------------------ |
+| `NRPC_TYPED_BAD_REQUEST`       | `0x8000` | Typed handler couldn't decode the request body.  |
+| `NRPC_TYPED_HANDLER_ERROR`     | `0x8001` | Typed handler ran but returned an exception.     |
+
+Cross-binding contract spec — including the canonical
+`cross_lang_echo_sum` service used by every binding's wire-format
+compat test — lives in [`../README.md#nrpc`](../README.md#nrpc).
+
+> **Note.** The `net_sdk` wrapper doesn't yet re-export
+> `TypedMeshRpc` — use the native `net` package directly. Same
+> follow-up plan as the security surface
+> ([`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md)).
+
 ## Compute (daemons + migration)
 
 The full compute surface — `DaemonRuntime`, `MeshDaemon`

@@ -10,7 +10,7 @@ test exercises the JSON codec + typed-error mapping by piping the
 encoded request through a stub raw MeshRpc that runs the handler
 in-process and returns the encoded response — same wire-format-
 compat pattern documented at
-``net/crates/net/tests/cross_lang_nrpc/README.md``.
+``net/crates/net/README.md#nrpc``.
 """
 
 from __future__ import annotations
