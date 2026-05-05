@@ -1085,6 +1085,32 @@ impl RedexFold<()> for RpcServerFold {
                     (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
                     return Ok(());
                 }
+                // Refuse a duplicate REQUEST with the same
+                // `(origin_hash, call_id)` — see streaming fold for
+                // the full rationale. For the unary fold this would
+                // spawn a second handler under the same key, and
+                // whichever handler completes first removes the
+                // in-flight entry — leaving the second handler's
+                // CANCEL handling broken (CANCEL events look up
+                // the now-missing key and no-op). Cleaner to refuse.
+                {
+                    let in_flight = self.in_flight.lock();
+                    if in_flight.contains_key(&key) {
+                        drop(in_flight);
+                        tracing::warn!(
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc server fold: duplicate REQUEST for in-flight call_id; refusing",
+                        );
+                        let resp = RpcResponsePayload {
+                            status: RpcStatus::Internal,
+                            headers: vec![],
+                            body: b"duplicate REQUEST for already-in-flight call_id".to_vec(),
+                        };
+                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        return Ok(());
+                    }
+                }
                 let cancellation = RpcCancellationToken::new();
                 self.in_flight.lock().insert(key, cancellation.clone());
                 let handler = self.handler.clone();
@@ -1397,6 +1423,46 @@ impl RedexFold<()> for RpcServerStreamingFold {
                         return Ok(());
                     }
                 };
+                // Refuse a duplicate REQUEST with the same
+                // `(origin_hash, call_id)`. Without this, a retry
+                // that arrives while the first attempt's pump is
+                // still draining will overwrite the prior
+                // semaphore Arc in `flow_control`, leaving the
+                // first pump awaiting an orphaned semaphore (the
+                // terminal cleanup keys on `key` and removes the
+                // *new* entry, so the orphan never gets dropped
+                // and the first handler hangs forever).
+                //
+                // Idempotent for the caller: we emit a terminal
+                // `Internal` chunk so the duplicate sender sees a
+                // clean refusal rather than waiting on a stream
+                // that will never produce output.
+                {
+                    let in_flight = self.in_flight.lock();
+                    if in_flight.contains_key(&key) {
+                        drop(in_flight);
+                        tracing::warn!(
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc streaming server fold: duplicate REQUEST for in-flight call_id; refusing",
+                        );
+                        let resp = RpcResponsePayload {
+                            status: RpcStatus::Internal,
+                            headers: vec![(
+                                HEADER_NRPC_STREAMING.to_string(),
+                                HEADER_NRPC_STREAMING_END.to_vec(),
+                            )],
+                            body: b"duplicate REQUEST for already-in-flight call_id".to_vec(),
+                        };
+                        let emit = self.emit.clone();
+                        let caller_origin = meta.origin_hash;
+                        let call_id = meta.seq_or_ts;
+                        tokio::spawn(async move {
+                            emit(caller_origin, call_id, resp).await;
+                        });
+                        return Ok(());
+                    }
+                }
                 // Cancellation token + in-flight bookkeeping —
                 // identical to the unary fold's pattern.
                 let cancellation = RpcCancellationToken::new();
@@ -2158,6 +2224,7 @@ mod tests {
     // ====================================================================
 
     use super::super::super::redex::{RedexEntry, RedexEvent};
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     /// Captured-response store. Test-local typedef so the
@@ -2485,6 +2552,82 @@ mod tests {
         // CANCEL also removes the in-flight entry directly.
         // Handler completion removes it again (idempotent).
         assert!(fold.in_flight_keys().is_empty());
+    }
+
+    /// Regression: a duplicate REQUEST for an already-in-flight
+    /// `(origin_hash, call_id)` must be refused with a synthetic
+    /// `Internal` response and must NOT spawn a second handler.
+    /// Without the refusal, two handlers race under the same key
+    /// and CANCEL handling is broken (CANCEL removes the entry
+    /// the first handler reinserts, etc.).
+    #[tokio::test]
+    async fn server_fold_duplicate_request_refuses_without_double_dispatch() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        struct CountingHandler {
+            invocations: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl RpcHandler for CountingHandler {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                self.invocations.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: b"done".to_vec(),
+                })
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(
+            Arc::new(CountingHandler {
+                invocations: invocations.clone(),
+            }),
+            emit,
+        );
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: vec![],
+        };
+        // First REQUEST — handler spawns and parks in sleep.
+        fold.apply(&rpc_request_event(1, 99, req.clone()), &mut ()).unwrap();
+        assert!(
+            wait_until(
+                || fold.in_flight_keys().contains(&(1, 99)),
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        // Second REQUEST with same key — must be refused
+        // synchronously with a synthetic Internal response.
+        fold.apply(&rpc_request_event(1, 99, req), &mut ()).unwrap();
+        // The refusal emit happens synchronously in the fold's
+        // sync emitter path.
+        let after_dup = captured.lock().clone();
+        assert_eq!(
+            after_dup.len(),
+            1,
+            "duplicate REQUEST must emit exactly one synthetic refusal",
+        );
+        assert_eq!(after_dup[0].2.status, RpcStatus::Internal);
+        assert!(String::from_utf8_lossy(&after_dup[0].2.body).contains("duplicate"));
+        // Wait for the first handler to complete.
+        assert!(
+            wait_until(|| captured.lock().len() == 2, Duration::from_secs(2)).await,
+            "first handler should still complete normally"
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 2);
+        // The first handler's response is the second emit (Ok).
+        assert_eq!(captured[1].2.status, RpcStatus::Ok);
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "duplicate REQUEST must NOT spawn a second handler",
+        );
     }
 
     /// Regression: a CANCEL that fires while the handler is mid-
