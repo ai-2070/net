@@ -359,6 +359,14 @@ impl Mesh {
         self.node.local_addr()
     }
 
+    /// Crate-internal accessor for the underlying `MeshNode`.
+    /// Used by `mesh_rpc` to delegate the typed RPC API; not
+    /// intended for downstream consumers (the public surface
+    /// stays on `Mesh` itself).
+    pub(crate) fn node(&self) -> &Arc<MeshNode> {
+        &self.node
+    }
+
     /// Connect to a peer as initiator.
     ///
     /// The peer must be listening (call `accept()` on their side).

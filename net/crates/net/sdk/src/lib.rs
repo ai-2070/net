@@ -44,6 +44,8 @@ pub mod error;
 pub mod groups;
 #[cfg(feature = "net")]
 pub mod mesh;
+#[cfg(all(feature = "net", feature = "cortex"))]
+pub mod mesh_rpc;
 mod net;
 #[cfg(feature = "redis")]
 pub mod redis_dedup;

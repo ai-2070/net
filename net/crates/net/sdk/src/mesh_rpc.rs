@@ -1,0 +1,291 @@
+//! nRPC SDK surface — typed `serve_rpc_typed` / `call_typed` over
+//! the underlying `MeshNode::serve_rpc` / `call` raw-bytes API.
+//!
+//! See `docs/misc/NRPC_DESIGN.md` for the architectural framing.
+//! This module is the user-facing wrapper that:
+//!
+//! - Hides the `Bytes`-in / `Bytes`-out shape behind serde
+//!   codecs (JSON by default; the codec is per-call selectable
+//!   via [`Codec`]).
+//! - Provides typed handlers — `Fn(Req) -> Future<Output =
+//!   Result<Resp, _>>` instead of the trait-based
+//!   [`net::adapter::net::cortex::RpcHandler`].
+//! - Re-exports the supporting types so users don't have to dig
+//!   through `net::adapter::net::*` paths.
+//!
+//! Raw `Bytes`-typed APIs are also exposed (`serve_rpc`, `call`,
+//! `call_service`) for users who manage their own serialization
+//! (e.g. protobuf via prost, postcard, or hand-rolled formats).
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use serde::{de::DeserializeOwned, Serialize};
+
+pub use net::adapter::net::cortex::{
+    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+};
+pub use net::adapter::net::mesh_rpc::{
+    CallOptions, RoutingPolicy, RpcError, RpcReply, ServeError, ServeHandle,
+};
+
+use crate::error::{Result, SdkError};
+use crate::mesh::Mesh;
+
+// ============================================================================
+// Codec selection.
+// ============================================================================
+
+/// Application-payload encoding for typed RPC. Per-call selectable
+/// via [`CallOptionsTyped::codec`]; per-handler via
+/// [`Mesh::serve_rpc_typed`]'s closure choice. Caller and server
+/// must agree on the codec out of band.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum Codec {
+    /// `serde_json`. The default — human-readable, ubiquitous,
+    /// works across every binding language.
+    #[default]
+    Json,
+    /// `serde_json::to_vec_pretty`. Same wire format as `Json`,
+    /// just emitted with indentation. Useful for debugging /
+    /// human inspection of recorded RPC traffic.
+    JsonPretty,
+}
+
+impl Codec {
+    /// Encode a value to bytes.
+    pub fn encode<T: Serialize>(self, value: &T) -> Result<Vec<u8>> {
+        let bytes = match self {
+            Codec::Json => serde_json::to_vec(value),
+            Codec::JsonPretty => serde_json::to_vec_pretty(value),
+        };
+        bytes.map_err(|e| SdkError::Config(format!("rpc codec encode: {e}")))
+    }
+    /// Decode bytes into a value.
+    pub fn decode<T: DeserializeOwned>(self, bytes: &[u8]) -> Result<T> {
+        match self {
+            Codec::Json | Codec::JsonPretty => serde_json::from_slice(bytes)
+                .map_err(|e| SdkError::Config(format!("rpc codec decode: {e}"))),
+        }
+    }
+}
+
+/// Options for the typed-call APIs ([`Mesh::call_typed`],
+/// [`Mesh::call_service_typed`]). Wraps [`CallOptions`] plus the
+/// per-call [`Codec`].
+#[derive(Debug, Clone, Default)]
+pub struct CallOptionsTyped {
+    /// Underlying `CallOptions` (deadline, routing policy, etc.).
+    pub raw: CallOptions,
+    /// Codec used to (en/de)code request and response bodies.
+    pub codec: Codec,
+}
+
+// ============================================================================
+// Mesh SDK extensions — raw + typed nRPC surface.
+// ============================================================================
+
+impl Mesh {
+    // ---- Raw (Bytes-in / Bytes-out) ----
+
+    /// Register a raw-bytes RPC handler on `service`. The user
+    /// handler receives the request body as `Bytes` and returns
+    /// the response body as `Bytes`. Wire codec is the user's
+    /// concern.
+    ///
+    /// For typed handlers (auto serde), use
+    /// [`Self::serve_rpc_typed`].
+    pub fn serve_rpc<H: RpcHandler>(
+        &self,
+        service: &str,
+        handler: Arc<H>,
+    ) -> std::result::Result<ServeHandle, ServeError> {
+        self.node().serve_rpc(service, handler)
+    }
+
+    /// Direct-addressed call. Caller specifies `target_node_id`;
+    /// the SDK does NOT consult the capability index.
+    pub async fn call(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+    ) -> std::result::Result<RpcReply, RpcError> {
+        self.node().call(target_node_id, service, payload, opts).await
+    }
+
+    /// Service-name call. Consults the capability index for nodes
+    /// advertising `nrpc:<service>`, picks one per
+    /// `opts.routing_policy`, calls.
+    pub async fn call_service(
+        &self,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+    ) -> std::result::Result<RpcReply, RpcError> {
+        self.node().call_service(service, payload, opts).await
+    }
+
+    /// All node ids currently advertising `nrpc:<service>` in the
+    /// local capability index. Useful for diagnostics + custom
+    /// caller-side routing logic.
+    pub fn find_service_nodes(&self, service: &str) -> Vec<u64> {
+        self.node().find_service_nodes(service)
+    }
+
+    // ---- Typed (serde) ----
+
+    /// Register a typed RPC handler on `service`. The handler
+    /// receives a deserialized `Req` and returns either an `Ok(Resp)`
+    /// (encoded as the response body) or an `Err(message)`
+    /// (surfaced as `RpcStatus::Internal` with the message as the
+    /// body).
+    ///
+    /// Codec is the [`Codec`] passed to the handler factory; the
+    /// same codec must be used by the caller.
+    pub fn serve_rpc_typed<Req, Resp, F, Fut>(
+        &self,
+        service: &str,
+        codec: Codec,
+        handler: F,
+    ) -> std::result::Result<ServeHandle, ServeError>
+    where
+        Req: DeserializeOwned + Send + Sync + 'static,
+        Resp: Serialize + Send + Sync + 'static,
+        F: Fn(Req) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<Resp, String>> + Send + 'static,
+    {
+        let typed = TypedRpcHandler {
+            codec,
+            inner: Arc::new(handler),
+            _req: std::marker::PhantomData::<Req>,
+            _resp: std::marker::PhantomData::<Resp>,
+        };
+        self.node().serve_rpc(service, Arc::new(typed))
+    }
+
+    /// Direct-addressed typed call. Encodes `request` via
+    /// `opts.codec`, calls the underlying raw `call`, decodes the
+    /// reply body into `Resp`.
+    pub async fn call_typed<Req, Resp>(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        request: &Req,
+        opts: CallOptionsTyped,
+    ) -> std::result::Result<Resp, RpcError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let body = opts.codec.encode(request).map_err(|e| RpcError::ServerError {
+            status: RpcStatus::Internal.to_wire(),
+            message: format!("client encode: {e}"),
+        })?;
+        let reply = self
+            .call(target_node_id, service, Bytes::from(body), opts.raw)
+            .await?;
+        opts.codec
+            .decode(&reply.body)
+            .map_err(|e| RpcError::ServerError {
+                status: RpcStatus::Internal.to_wire(),
+                message: format!("client decode: {e}"),
+            })
+    }
+
+    /// Service-name typed call. Same as [`Self::call_typed`] but
+    /// uses the capability index to pick the target.
+    pub async fn call_service_typed<Req, Resp>(
+        &self,
+        service: &str,
+        request: &Req,
+        opts: CallOptionsTyped,
+    ) -> std::result::Result<Resp, RpcError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let body = opts.codec.encode(request).map_err(|e| RpcError::ServerError {
+            status: RpcStatus::Internal.to_wire(),
+            message: format!("client encode: {e}"),
+        })?;
+        let reply = self.call_service(service, Bytes::from(body), opts.raw).await?;
+        opts.codec
+            .decode(&reply.body)
+            .map_err(|e| RpcError::ServerError {
+                status: RpcStatus::Internal.to_wire(),
+                message: format!("client decode: {e}"),
+            })
+    }
+}
+
+// ============================================================================
+// Internal: typed-handler adapter.
+//
+// Bridges the user's typed `Fn(Req) -> Future<Result<Resp, _>>`
+// closure to the raw `RpcHandler` trait the underlying mesh layer
+// expects.
+// ============================================================================
+
+struct TypedRpcHandler<Req, Resp, F> {
+    codec: Codec,
+    inner: Arc<F>,
+    _req: std::marker::PhantomData<Req>,
+    _resp: std::marker::PhantomData<Resp>,
+}
+
+#[async_trait]
+impl<Req, Resp, F, Fut> RpcHandler for TypedRpcHandler<Req, Resp, F>
+where
+    Req: DeserializeOwned + Send + Sync + 'static,
+    Resp: Serialize + Send + Sync + 'static,
+    F: Fn(Req) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<Resp, String>> + Send + 'static,
+{
+    async fn call(
+        &self,
+        ctx: RpcContext,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        // Decode the request body. A bad body is a caller error
+        // — surface as `Application(0x4000)` with the decode
+        // diagnostic so the caller can distinguish "I sent
+        // nonsense" from a server-internal failure.
+        let req: Req = match self.codec.decode(&ctx.payload.body) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(RpcHandlerError::Application {
+                    code: 0x4000,
+                    message: format!("typed handler: bad request body: {e}"),
+                })
+            }
+        };
+        // Run the user's closure.
+        let resp = (self.inner)(req).await.map_err(|message| {
+            RpcHandlerError::Application {
+                code: 0x4001,
+                message,
+            }
+        })?;
+        // Encode the response body.
+        let body = self
+            .codec
+            .encode(&resp)
+            .map_err(|e| RpcHandlerError::Internal(format!("typed handler encode: {e}")))?;
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body,
+        })
+    }
+}
+
+// `Mesh::node()` is a private accessor on `crate::mesh::Mesh` that
+// returns the underlying `Arc<MeshNode>`. Add it (or expose the
+// existing field) as a small `pub(crate)` shim if it isn't there
+// yet.
+//
+// The `crate::mesh::Mesh` type holds `node: Arc<MeshNode>` (private).
+// We expose a `pub(crate) fn node(&self) -> &Arc<MeshNode>` accessor
+// on `Mesh` in the same commit so this module can delegate.
