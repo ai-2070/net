@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/redex/disk.rs
+  cdf934b360f502d7 2954-2959,2961-2965
+net/crates/net/tests/integration_redex.rs
+  cdf934b360f502d7 920-923,995-998
+net/crates/net/src/bus.rs
+  cdf934b360f502d7 3425-3456,3458-3559
+net/crates/net/src/adapter/net/redex/file.rs
+  cdf934b360f502d7 1981-1985,2023-2025
+net/crates/net/docs/RELEASE_v0.11_KILLING_MOON_PHASE_IV.md
+  cdf934b360f502d7 19,21-35,101,103-105,107,115,145-152,205,208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "a3ffa444c0e2f5bd85969d05a645b3ef2a2ea9eb",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 4554,
+      "total_deletions": 416,
+      "accepted_lines": 193,
+      "overriden_lines": 1
+    }
+  }
+}
