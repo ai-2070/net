@@ -86,6 +86,7 @@ extern int net_rpc_call(
     const char* service_ptr, size_t service_len,
     const uint8_t* req_ptr, size_t req_len,
     uint64_t deadline_ms,
+    uint64_t cancel_token,
     uint8_t** out_resp_ptr, size_t* out_resp_len,
     char** out_err
 );
@@ -95,9 +96,13 @@ extern int net_rpc_call_service(
     const char* service_ptr, size_t service_len,
     const uint8_t* req_ptr, size_t req_len,
     uint64_t deadline_ms,
+    uint64_t cancel_token,
     uint8_t** out_resp_ptr, size_t* out_resp_len,
     char** out_err
 );
+
+extern uint64_t net_rpc_reserve_cancel_token(void);
+extern void net_rpc_cancel_call(uint64_t token);
 
 extern int net_rpc_find_service_nodes(
     MeshRpcHandle* handle,
@@ -467,6 +472,14 @@ func init() {
 // Call invokes `service` on `targetNodeID` with `req` as the body.
 // Blocks the calling goroutine until the response arrives, the
 // deadline fires, or `ctx` is canceled.
+//
+// If `ctx` cancels mid-call, a watcher goroutine fires
+// `net_rpc_cancel_call(token)` to abort the in-flight tokio
+// task on the Rust side, which drops the SDK future and triggers
+// CANCEL on the wire. The call returns `ctx.Err()` once the FFI
+// call unblocks. Cancellation is best-effort: a race between
+// completion and ctx.Done() lets whichever side wins decide the
+// outcome.
 func (r *MeshRpc) Call(
 	ctx context.Context,
 	targetNodeID uint64,
@@ -479,6 +492,9 @@ func (r *MeshRpc) Call(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
+	cancelToken, stopWatcher := installCancelWatcher(ctx)
+	defer stopWatcher()
+
 	var outResp *C.uint8_t
 	var outRespLen C.size_t
 	var outErr *C.char
@@ -490,17 +506,19 @@ func (r *MeshRpc) Call(
 			(*C.char)(cService.ptr), cService.len,
 			cReq.ptr, cReq.len,
 			C.uint64_t(deadlineMs),
+			C.uint64_t(cancelToken),
 			&outResp, &outRespLen,
 			&outErr,
 		)
 	}); err != nil {
 		return nil, err
 	}
-	return readCallResult(code, outResp, outRespLen, outErr)
+	return readCancellableResult(ctx, code, outResp, outRespLen, outErr)
 }
 
 // CallService invokes `service` on a node selected via local
-// service discovery. Same blocking semantics as Call.
+// service discovery. Same blocking semantics as Call, including
+// ctx-driven cancellation.
 func (r *MeshRpc) CallService(
 	ctx context.Context,
 	service string,
@@ -512,6 +530,9 @@ func (r *MeshRpc) CallService(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
+	cancelToken, stopWatcher := installCancelWatcher(ctx)
+	defer stopWatcher()
+
 	var outResp *C.uint8_t
 	var outRespLen C.size_t
 	var outErr *C.char
@@ -522,13 +543,14 @@ func (r *MeshRpc) CallService(
 			(*C.char)(cService.ptr), cService.len,
 			cReq.ptr, cReq.len,
 			C.uint64_t(deadlineMs),
+			C.uint64_t(cancelToken),
 			&outResp, &outRespLen,
 			&outErr,
 		)
 	}); err != nil {
 		return nil, err
 	}
-	return readCallResult(code, outResp, outRespLen, outErr)
+	return readCancellableResult(ctx, code, outResp, outRespLen, outErr)
 }
 
 // FindServiceNodes returns the node IDs advertising
@@ -587,6 +609,73 @@ func readCallResult(
 	out := make([]byte, int(respLen))
 	copy(out, src)
 	return out, nil
+}
+
+// readCancellableResult is `readCallResult` plus ctx-aware error
+// remapping: when the call was aborted via the cancellation
+// surface and ctx is also done, surface ctx.Err() so callers
+// matching on `errors.Is(err, context.Canceled)` work as
+// expected. Otherwise behaves identically to readCallResult.
+func readCancellableResult(
+	ctx context.Context,
+	code C.int,
+	respPtr *C.uint8_t,
+	respLen C.size_t,
+	errPtr *C.char,
+) ([]byte, error) {
+	out, err := readCallResult(code, respPtr, respLen, errPtr)
+	if err == nil {
+		return out, nil
+	}
+	// The Rust side emits "cancelled: call cancelled by caller"
+	// for our cancel-token path. parseRpcError tags those as
+	// kind=unknown (the canonical kind set doesn't include
+	// "cancelled" yet — adding it is a follow-up). Detect by
+	// substring and surface the user's ctx.Err() if it fired.
+	if ctx != nil && ctx.Err() != nil {
+		if rpcErr, ok := err.(*RpcError); ok &&
+			strings.Contains(rpcErr.Message, "cancelled by caller") {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, err
+}
+
+// installCancelWatcher reserves a cancel token and, if `ctx` has
+// a Done channel, spawns a watcher goroutine that fires
+// `net_rpc_cancel_call(token)` when ctx fires. Returns the token
+// and a `stop` callback the caller MUST `defer` so the watcher
+// exits even on the success path. Idempotent stop.
+//
+// `ctx == nil` or a context without a Done channel returns
+// `(0, noop)`: no token, no watcher, no cancel surface — the FFI
+// call runs in the non-cancellable fast path.
+func installCancelWatcher(ctx context.Context) (uint64, func()) {
+	if ctx == nil || ctx.Done() == nil {
+		return 0, func() {}
+	}
+	token := uint64(C.net_rpc_reserve_cancel_token())
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			C.net_rpc_cancel_call(C.uint64_t(token))
+		case <-stop:
+		}
+	}()
+	return token, func() {
+		// Idempotent stop. The watcher exits on either branch of
+		// the select; closing `stop` is safe to call once.
+		select {
+		case <-stop:
+			// already closed
+		default:
+			close(stop)
+		}
+		<-done
+	}
 }
 
 // =====================================================================
