@@ -856,6 +856,155 @@ impl RedexFold<()> for RpcServerFold {
     }
 }
 
+// ============================================================================
+// Client-side fold.
+//
+// `RpcClientFold` is the symmetric companion of `RpcServerFold`.
+// It sees RESPONSE events on the caller's reply channel
+// (`<service>.replies.<self_origin>`) and routes each one to the
+// matching call's awaiting `oneshot::Receiver` keyed on `call_id`
+// (the `EventMeta::seq_or_ts`).
+//
+// The fold's mutable state (the pending-senders map) is shared
+// with the `Mesh::call` API via a clone of the same Arc — so the
+// publisher side can `register(call_id)` to stage a receiver
+// before publishing the REQUEST, and the fold side can `deliver`
+// when the matching RESPONSE arrives.
+// ============================================================================
+
+/// Shared pending-call state. Held by both the `RpcClientFold`
+/// (writer side: completes oneshot senders on RESPONSE arrival)
+/// and the `Mesh::call` API (reader side: registers oneshots
+/// before publishing the REQUEST). Concurrent access is mediated
+/// by `DashMap`.
+pub struct RpcClientPending {
+    senders: dashmap::DashMap<u64, tokio::sync::oneshot::Sender<RpcResponsePayload>>,
+}
+
+impl RpcClientPending {
+    /// Construct an empty pending-call store.
+    pub fn new() -> Self {
+        Self {
+            senders: dashmap::DashMap::new(),
+        }
+    }
+
+    /// Register a oneshot for `call_id`. Returns the receiver the
+    /// caller awaits. The caller MUST publish the REQUEST after
+    /// registration (and not before) so the matching RESPONSE
+    /// can't arrive while the pending entry is missing.
+    ///
+    /// If a sender already exists for `call_id` (improperly reused
+    /// id), it is replaced and the old receiver gets a
+    /// `RecvError::Closed` — surfacing the misuse as a hard error
+    /// at the caller rather than silently delivering the response
+    /// to the wrong waiter.
+    pub fn register(&self, call_id: u64) -> tokio::sync::oneshot::Receiver<RpcResponsePayload> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.senders.insert(call_id, tx);
+        rx
+    }
+
+    /// Drop the pending entry for `call_id`. Called by the
+    /// caller-side cancellation path (e.g. `Mesh::call`'s future
+    /// being dropped, or its deadline timer firing). The matching
+    /// RESPONSE that may still arrive afterwards is silently
+    /// discarded by [`Self::deliver`].
+    pub fn cancel(&self, call_id: u64) {
+        self.senders.remove(&call_id);
+    }
+
+    /// Deliver `resp` to the waiter for `call_id`, if any. Idempotent
+    /// — a second delivery for the same call_id is a no-op (the
+    /// first delivery removed the entry).
+    fn deliver(&self, call_id: u64, resp: RpcResponsePayload) {
+        if let Some((_, tx)) = self.senders.remove(&call_id) {
+            // `send` fails iff the receiver has been dropped (the
+            // caller cancelled or timed out between register and
+            // delivery). That's a normal cleanup path, not an
+            // error — discard silently.
+            let _ = tx.send(resp);
+        }
+    }
+
+    /// Test-only: how many pending calls are registered. Used by
+    /// integration tests to confirm cleanup after happy-path / cancel.
+    #[cfg(test)]
+    pub fn pending_count(&self) -> usize {
+        self.senders.len()
+    }
+}
+
+impl Default for RpcClientPending {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Client-side fold. Decodes RESPONSE events and routes them to
+/// awaiting oneshots in the shared [`RpcClientPending`].
+///
+/// `Mesh::call` clones the same `Arc<RpcClientPending>` to register
+/// oneshots before publishing REQUESTs.
+pub struct RpcClientFold {
+    pending: Arc<RpcClientPending>,
+}
+
+impl RpcClientFold {
+    /// Construct a client fold that delivers responses through
+    /// `pending`. Typical pattern:
+    ///
+    /// ```ignore
+    /// let pending = Arc::new(RpcClientPending::new());
+    /// let fold = RpcClientFold::new(pending.clone());
+    /// let adapter = CortexAdapter::open(..., fold, ())?;
+    /// // `pending` is still usable for register / cancel.
+    /// ```
+    pub fn new(pending: Arc<RpcClientPending>) -> Self {
+        Self { pending }
+    }
+}
+
+impl RedexFold<()> for RpcClientFold {
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+        } else {
+            None
+        }) else {
+            tracing::warn!(
+                payload_len = ev.payload.len(),
+                "rpc client fold: event payload too short for EventMeta; skipping",
+            );
+            return Ok(());
+        };
+        // Only RESPONSE events are routed; the caller's reply
+        // channel shouldn't carry REQUEST/CANCEL traffic, but if a
+        // misconfigured publisher sent some, ignore them rather
+        // than killing the fold.
+        if meta.dispatch != DISPATCH_RPC_RESPONSE {
+            return Ok(());
+        }
+        match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+            Ok(resp) => self.pending.deliver(meta.seq_or_ts, resp),
+            Err(e) => {
+                // Malformed RESPONSE on the reply channel. We can't
+                // fabricate a synthetic response (the call_id might
+                // be valid; we just can't tell what it was supposed
+                // to mean). Log and leave the pending entry intact
+                // — the caller's deadline / cancellation path will
+                // eventually clean it up.
+                tracing::warn!(
+                    error = %e,
+                    call_id = meta.seq_or_ts,
+                    "rpc client fold: malformed response payload",
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1540,5 +1689,179 @@ mod tests {
                 .expect("waiter must complete within 1s")
                 .expect("waiter task must not panic");
         }
+    }
+
+    // ====================================================================
+    // RpcClientFold — caller-side response routing.
+    // ====================================================================
+
+    fn rpc_response_event(
+        caller_origin: u64,
+        call_id: u64,
+        payload: RpcResponsePayload,
+    ) -> RedexEvent {
+        let meta = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, caller_origin, call_id, 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&payload.encode());
+        RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        }
+    }
+
+    /// Happy path: register a call, drive the matching RESPONSE
+    /// through the fold, the awaiting receiver gets the payload.
+    #[tokio::test]
+    async fn client_fold_routes_response_to_registered_waiter() {
+        let pending = Arc::new(RpcClientPending::new());
+        let mut fold = RpcClientFold::new(pending.clone());
+        let rx = pending.register(42);
+        assert_eq!(pending.pending_count(), 1);
+
+        let resp = RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: b"hello back".to_vec(),
+        };
+        fold.apply(&rpc_response_event(0xCAFE, 42, resp.clone()), &mut ())
+            .unwrap();
+
+        // Receiver is completed.
+        let got = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("receiver must complete within 1s")
+            .expect("sender must not be dropped");
+        assert_eq!(got, resp);
+        // Pending entry cleared after delivery.
+        assert_eq!(pending.pending_count(), 0);
+    }
+
+    /// RESPONSE for an unknown call_id is a no-op (no panic, no
+    /// stray side effect). This is the case where a stale RESPONSE
+    /// arrives after the caller has cancelled or timed out.
+    #[tokio::test]
+    async fn client_fold_response_for_unknown_call_id_is_no_op() {
+        let pending = Arc::new(RpcClientPending::new());
+        let mut fold = RpcClientFold::new(pending.clone());
+        let resp = RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_response_event(1, 999, resp), &mut ())
+            .unwrap();
+        assert_eq!(pending.pending_count(), 0);
+    }
+
+    /// REQUEST / CANCEL events on the reply channel are ignored
+    /// rather than producing a stray decode-error or affecting
+    /// pending state. The reply channel shouldn't carry these in
+    /// practice (they belong on `<service>.requests`), but a
+    /// misconfigured publisher must not break the fold.
+    #[tokio::test]
+    async fn client_fold_ignores_non_response_dispatches() {
+        let pending = Arc::new(RpcClientPending::new());
+        let mut fold = RpcClientFold::new(pending.clone());
+        let _rx = pending.register(7);
+
+        // REQUEST event landing on the caller's reply channel is
+        // ignored.
+        let req = RpcRequestPayload {
+            service: "stray".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(1, 7, req), &mut ()).unwrap();
+        // Pending entry untouched.
+        assert_eq!(pending.pending_count(), 1);
+
+        // CANCEL on the reply channel: also ignored.
+        fold.apply(&rpc_cancel_event(1, 7), &mut ()).unwrap();
+        assert_eq!(pending.pending_count(), 1);
+    }
+
+    /// `cancel(call_id)` removes the pending entry; a subsequent
+    /// RESPONSE for that call_id is dropped silently.
+    #[tokio::test]
+    async fn client_pending_cancel_drops_subsequent_response() {
+        let pending = Arc::new(RpcClientPending::new());
+        let mut fold = RpcClientFold::new(pending.clone());
+        let rx = pending.register(5);
+        pending.cancel(5);
+        assert_eq!(pending.pending_count(), 0);
+
+        let resp = RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_response_event(1, 5, resp), &mut ()).unwrap();
+
+        // Receiver was dropped along with the cancel. The previously-
+        // returned `rx` errors with `Closed`.
+        let result = tokio::time::timeout(Duration::from_secs(1), rx).await;
+        let inner = result.expect("must complete within 1s");
+        assert!(
+            inner.is_err(),
+            "receiver after cancel must error (sender dropped)",
+        );
+    }
+
+    /// Malformed RESPONSE payload: fold returns Ok (does not kill
+    /// the cortex adapter) and leaves the pending entry intact for
+    /// the caller's deadline / cancellation path to clean up. Pre-
+    /// fix a bad payload could either kill the fold or fabricate a
+    /// synthetic response — both wrong.
+    #[tokio::test]
+    async fn client_fold_malformed_response_is_logged_not_fatal() {
+        let pending = Arc::new(RpcClientPending::new());
+        let mut fold = RpcClientFold::new(pending.clone());
+        let rx = pending.register(11);
+
+        // Build a malformed RESPONSE: valid meta, garbage tail
+        // (just `[0xFF]`, which is shorter than the required 2-byte
+        // status + 1-byte headers count + 4-byte body length).
+        let meta = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, 1, 11, 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.push(0xFF);
+        let ev = RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        };
+        let result = fold.apply(&ev, &mut ());
+        assert!(result.is_ok(), "fold must not return Err on malformed response");
+        // Pending entry NOT cleared — the caller's cancellation
+        // path will eventually clean it up via `cancel(call_id)`.
+        assert_eq!(pending.pending_count(), 1);
+        // Receiver is still pending (not delivered, not closed).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx)
+                .await
+                .is_err(),
+            "receiver should still be parked (no delivery, no drop)",
+        );
+    }
+
+    /// Re-registering the same call_id replaces the prior sender;
+    /// the prior `Receiver` errors with `RecvError::Closed`. This
+    /// is the misuse-detection path — call_ids should be unique
+    /// per (caller, target) for the lifetime of the call, and a
+    /// clash surfaces as a hard error rather than silently
+    /// delivering the response to the wrong waiter.
+    #[tokio::test]
+    async fn client_pending_re_register_closes_prior_receiver() {
+        let pending = Arc::new(RpcClientPending::new());
+        let rx_a = pending.register(99);
+        let _rx_b = pending.register(99);
+        // The first receiver is now closed (sender dropped on
+        // re-insert).
+        let result = tokio::time::timeout(Duration::from_secs(1), rx_a).await;
+        let inner = result.expect("must complete within 1s");
+        assert!(inner.is_err(), "re-register must close prior receiver");
+        assert_eq!(pending.pending_count(), 1);
     }
 }

@@ -2,6 +2,28 @@
 
 Plan for a first-class request/response primitive on Net. **Architectural anchor: nRPC is not a new subsystem. It is a convention layer over CortEX folds plus one missing channel-layer primitive.** Every piece of the request/response state machine — correlation, idempotency, snapshot/restore, replay-debugging, causal-chain integration, capability-token authz — already exists in CortEX with different names. nRPC is a typed `dispatch` enum on `EventMeta`, a channel-naming convention, and small caller-side / server-side helpers.
 
+## Build status
+
+What's landed in-tree (post-Phase-1 prerequisites):
+
+- ✅ **`SubscriptionMode::QueueGroup`** on the channel roster (`channel/roster.rs`) — work-distribution dispatch alongside the existing `Broadcast` mode. `add_with_mode` / `dispatch_recipients` / `subscriber_mode` API; back-compat shims preserve every existing call site. 8 regression tests.
+- ✅ **`MembershipMsg::Subscribe.queue_group: Option<String>`** wire field (`channel/membership.rs`) — `u8` length + UTF-8 bytes after the existing token field. Forward-compat: pre-queue-group senders (zero remaining bytes after token) decode as `Broadcast`. 5 regression tests.
+- ✅ **`Mesh::subscribe_channel_in_queue_group[_with_token]`** public APIs and the inbound-Subscribe handler routes mode through to `roster.add_with_mode`. The publisher (`mesh.rs:5164`) consumes `dispatch_recipients` instead of `members`, so queue-group subscribers actually load-balance.
+- ✅ **`cortex::rpc` codec** (`cortex/rpc.rs`) — dispatch constants (`DISPATCH_RPC_REQUEST/RESPONSE/CANCEL/DEADLINE_EXCEEDED`), flag bits (`FLAG_RPC_IDEMPOTENT/STREAMING_RESPONSE/PROPAGATE_TRACE`), `RpcStatus` enum (Net-native with documented gRPC equivalence), `RpcRequestPayload` / `RpcResponsePayload` round-trip codec with `MAX_RPC_*` caps. 15 regression tests pin wire stability + decode-rejection of malformed payloads.
+- ✅ **`RpcServerFold`** (`cortex/rpc.rs`) — `RedexFold<()>` that decodes REQUEST events, dispatches the handler in tokio, emits RESPONSE via a `RpcResponseEmitter` callback. `RpcCancellationToken` (Notify+AtomicBool wrapper, race-safe), `RpcContext` (caller_origin + decoded payload + cancellation), `RpcHandler` async-trait, `RpcHandlerError` (Application/Internal). Handler panic caught via `catch_unwind` and surfaced as `RpcStatus::Internal`. Fast deadline-already-passed short-circuit. CANCEL flips the in-flight token. Malformed payloads emit `UnknownVersion` and continue (do not kill the cortex adapter). 10 regression tests.
+- ✅ **`RpcClientFold`** + **`RpcClientPending`** (`cortex/rpc.rs`) — symmetric caller side. `RpcClientPending::register(call_id) -> oneshot::Receiver`; the fold's `apply` decodes RESPONSE events and routes them to the matching pending sender. Re-register of the same call_id closes the prior receiver (misuse detection). 5 regression tests.
+- ✅ **End-to-end loopback integration test** (`tests/integration_nrpc_loopback.rs`) — proves the server + client folds compose into a working request/response round trip without going through the real Mesh publish path (uses synthesized `RedexEvent`s). 6 tests: round-trip, multiplexed concurrent calls, exactly-once handler invocation, cancellation flowing into the handler, application error round-trip, panic surfacing as Internal.
+
+What's still pending:
+
+- ⏳ **`Mesh::serve_rpc(service, handler)` / `Mesh::call(service, payload, opts)` glue**. This is the wire-up between the existing publish/subscribe machinery and the RPC folds. Concretely:
+  - `serve_rpc` opens a `CortexAdapter` on `<service>.requests` with the `RpcServerFold`. Calls `subscribe_channel_in_queue_group(self, "<service>.requests", "<service>")` so multiple replica servers form a load-balanced group automatically. Builds the `RpcResponseEmitter` closure to publish RESPONSEs via `ChannelPublisher` on `<service>.replies.<caller_origin>`. Returns a `ServeHandle` whose Drop unsubscribes + closes the adapter.
+  - `call` allocates a `call_id` from a per-Mesh `AtomicU64`, lazily ensures a subscription to `<service>.replies.<self_origin>` (with a `RpcClientFold`), registers a oneshot in the local `RpcClientPending`, publishes the REQUEST envelope to `<service>.requests`, awaits the receiver. Drop sends a CANCEL.
+  - Bridging concern: the cortex adapter expects events to come through its tail of the local redex log, but RPC events arrive over the network via the mesh's subscriber path. Either (a) extend the adapter with a "subscribe and ingest into log" mode, OR (b) bypass the redex log and feed subscribed events directly into the fold via a tokio channel. Option (a) preserves the persistence/replay benefit; option (b) is lighter weight. The decision lives at this seam.
+- ⏳ **End-to-end integration test against real Mesh instances** — once the glue lands, two Mesh nodes in one process: one calls `serve_rpc("echo", ...)`, the other calls `call("echo", ...)`; assert round-trip + queue-group load distribution across N servers + cancellation flowing across the network.
+- ⏳ **Phase 2** — service registry derived from existing capability announcements; routing policies; SDK typed wrappers for the four bindings.
+- ⏳ **Phase 3** — streaming responses, tracing context propagation, retry/circuit-breaker/hedging helpers.
+
 ## The framing
 
 An RPC server is a CortEX fold:
