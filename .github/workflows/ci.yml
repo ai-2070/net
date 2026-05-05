@@ -191,19 +191,29 @@ jobs:
       # `sdk-ts/package.json` carries `@ai2070/net: file:../bindings/node`
       # as a devDependency, so `npm i` over there picks up the sibling
       # binding from the working tree. The binding's `.node` cdylib has
-      # to be built first or `npm test` will fail to load it. Mirror the
-      # `node-tests` job's feature flags (no `redis` default, plus
-      # `test-helpers` so `_testInjectSyntheticPeer` is exported for
-      # the group-placement fixtures) — `sdk-ts/test/groups.test.ts`
-      # uses the same hook the bindings suite does. Skip the `redis`
-      # default for the same reason: no service container is wired up,
-      # and the SDK's redis-dedup re-export is import-only at typecheck
-      # time.
+      # to be built first or `npm test` will fail to load it.
+      #
+      # Feature flags MUST include `redis` even though the suite never
+      # opens a Redis connection: `sdk-ts/src/redis-dedup.ts` does a
+      # real `export { RedisStreamDedup } from '@ai2070/net'`, and the
+      # napi-generated `index.d.ts` only carries the `RedisStreamDedup`
+      # declaration when the binding was built with the `redis`
+      # feature. Without it, tsc fails the SDK build with
+      # `Module '"@ai2070/net"' has no exported member
+      # 'RedisStreamDedup'`. The runtime side is also satisfied — the
+      # `.node` cdylib carries the class — but the runtime never opens
+      # a connection because no SDK code instantiates the helper in
+      # the test suite.
+      #
+      # `test-helpers` is required so `_testInjectSyntheticPeer` is
+      # exported for the group-placement fixtures —
+      # `sdk-ts/test/groups.test.ts` uses the same hook the bindings
+      # suite does.
       - name: Build native module
         working-directory: net/crates/net/bindings/node
         run: |
           npm i --ignore-scripts
-          npx napi build --platform --no-default-features --features net,cortex,compute,groups,test-helpers
+          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,test-helpers
 
       - name: Install npm dependencies
         run: npm i
