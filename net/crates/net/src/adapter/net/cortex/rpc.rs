@@ -1251,6 +1251,13 @@ pub trait RpcStreamingHandler: Send + Sync + 'static {
     ) -> Result<(), RpcHandlerError>;
 }
 
+/// Per-call flow-control map type. Keyed on
+/// `(caller_origin_hash, call_id)`; value is a tokio
+/// `Semaphore` shared between the pump task (which awaits
+/// permits) and the fold's `apply()` method handling
+/// STREAM_GRANT events (which add permits).
+type FlowControlMap = Arc<Mutex<HashMap<(u64, u64), Arc<tokio::sync::Semaphore>>>>;
+
 /// Server-side fold for streaming RPC. Parallel to `RpcServerFold`
 /// but multi-fire emit: each handler invocation may produce many
 /// `RESPONSE` events for the same `call_id`, marked
@@ -1269,7 +1276,7 @@ pub struct RpcServerStreamingFold {
     /// `add_permits(n)`". Absence of an entry for a `(origin,
     /// call_id)` key means unbounded credit (back-compat —
     /// pre-flow-control callers don't get throttled).
-    flow_control: Arc<Mutex<HashMap<(u64, u64), Arc<tokio::sync::Semaphore>>>>,
+    flow_control: FlowControlMap,
     /// Optional per-service metrics handle. Same shape as
     /// `RpcServerFold::metrics`; the streaming fold ALSO bumps
     /// `streaming_chunks_emitted_total` from the pump task on
