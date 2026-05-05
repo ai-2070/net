@@ -167,16 +167,26 @@ pub(super) struct DiskSegment {
     /// AND a worker is listening (spawned by
     /// `RedexFile::open_persistent`).
     pub(super) fsync_signal: Arc<Notify>,
-    /// Segment poisoning. Set to `true` when `compact_to`'s
-    /// post-rename re-open phase fails after the renames committed
-    /// AND the cached file handles are pointing at temp-dir
-    /// placeholders rather than the channel files. Once poisoned,
-    /// every append / sync / compact path returns
-    /// `RedexError::Io` immediately — preventing acknowledged
-    /// writes from landing in `/tmp` instead of the channel
-    /// directory. Operators recover by closing and re-opening the
-    /// channel (which constructs a fresh `DiskSegment` with valid
-    /// handles).
+    /// Segment poisoning. Set to `true` when one of the
+    /// partial-write rollback paths
+    /// ([`Self::rollback_truncate`],
+    /// [`Self::rollback_after_idx_failure`]) cannot complete the
+    /// truncation that would restore the file to its pre-failure
+    /// length — at that point the on-disk state has diverged from
+    /// in-memory and a subsequent append would compound the
+    /// corruption rather than land cleanly. Once poisoned, every
+    /// append / sync / compact path returns `RedexError::Io`
+    /// immediately. Operators recover by closing and re-opening
+    /// the channel (which constructs a fresh `DiskSegment` and
+    /// runs the crash-recovery walks against on-disk truth).
+    ///
+    /// Historical note: the prior pre-manifest-pointer
+    /// `compact_to` also set this flag from a "post-rename
+    /// reopen failure / temp-dir placeholder" path that no
+    /// longer exists; the manifest-pointer rework opens the new
+    /// generation's handles BEFORE the atomic flip, so a failed
+    /// open aborts the compact while live state is still
+    /// intact. The rollback paths are now the only setters.
     poisoned: std::sync::atomic::AtomicBool,
     /// Test-only injection: when set, the next `append_entry` /
     /// `append_entries` call returns `RedexError::Io` before touching
@@ -779,15 +789,16 @@ impl DiskSegment {
         payload: &[u8],
         timestamp_ns: u64,
     ) -> Result<(), RedexError> {
-        // Refuse writes against a poisoned segment. `compact_to`
-        // sets this flag when its post-rename re-open phase fails
-        // — the cached file handles are pointing at temp-dir
-        // placeholders and any append would land in `/tmp`
-        // instead of the channel directory.
+        // Refuse writes against a poisoned segment. The flag is
+        // set by the partial-write rollback paths when they
+        // cannot truncate the file back to its pre-failure
+        // length — on-disk and in-memory have diverged, and any
+        // further append would compound the corruption rather
+        // than land cleanly. See the `poisoned` field rustdoc.
         if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
             return Err(RedexError::Io(
-                "redex segment is poisoned (compact_to post-rename reopen failure); \
-                 close and re-open the channel to recover"
+                "redex segment is poisoned (partial-write rollback could not restore \
+                 on-disk state to match in-memory); close and re-open the channel to recover"
                     .into(),
             ));
         }
@@ -996,8 +1007,8 @@ impl DiskSegment {
         // `append_entry_inner` for the full rationale.
         if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
             return Err(RedexError::Io(
-                "redex segment is poisoned (compact_to post-rename reopen failure); \
-                 close and re-open the channel to recover"
+                "redex segment is poisoned (partial-write rollback could not restore \
+                 on-disk state to match in-memory); close and re-open the channel to recover"
                     .into(),
             ));
         }
@@ -1250,13 +1261,12 @@ impl DiskSegment {
         surviving_timestamps: &[u64],
         dat_base: u64,
     ) -> Result<(), RedexError> {
-        // Refuse compact against a poisoned segment. Poisoning
-        // can no longer come from the cached-handles-point-at-
-        // placeholders failure mode (the new layout opens fresh
-        // handles ahead of the manifest flip and bails before
-        // touching the slots if any open fails), but the rollback
-        // paths still set the flag and we honor it here for
-        // defense in depth.
+        // Refuse compact against a poisoned segment. The flag
+        // is set by the partial-write rollback paths when they
+        // can't restore on-disk state to match in-memory; running
+        // compact_to against a diverged segment would copy that
+        // divergence into the new generation and cement the
+        // corruption past the next manifest flip.
         if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
             return Err(RedexError::Io(
                 "redex segment is poisoned; refusing compact_to".into(),
@@ -3738,5 +3748,64 @@ mod tests {
              skipping decoys and the reserved gen 0",
         );
         let _ = std::fs::remove_dir_all(&chan);
+    }
+
+    /// Source-text guard: the `poisoned` field rustdoc and the
+    /// runtime error strings returned from append paths must
+    /// describe the ACTUAL setters (the partial-write rollback
+    /// paths) rather than a `compact_to` failure-mode parenthetical
+    /// that the manifest-pointer rework deleted. The test
+    /// reconstructs the deleted phrase at runtime to avoid
+    /// matching itself. An operator hitting one of the runtime
+    /// errors today would otherwise chase a phantom; future
+    /// maintainers would learn the wrong invariant from the
+    /// field doc. This test fails loudly if either drifts back.
+    #[test]
+    fn poisoning_docs_and_errors_describe_actual_setters() {
+        let src = include_str!("disk.rs");
+
+        // Build the stale marker at runtime so the test's own
+        // assertion message (which has to NAME the marker for
+        // operator readability) doesn't itself trip the
+        // assertion. Two halves joined by `-` reproduces the
+        // exact pre-fix substring without it appearing anywhere
+        // in the source verbatim.
+        let stale_marker = format!(
+            "{}{}{}",
+            "compact_to post", "-", "rename reopen failure",
+        );
+        assert!(
+            !src.contains(&stale_marker),
+            "regression: source must not contain '{stale_marker}'. \
+             That parenthetical described a `compact_to` failure \
+             path that was deleted in the manifest-pointer rework \
+             (the rework opens the new generation's handles BEFORE \
+             the atomic flip, so a failed open aborts the compact \
+             with live state still intact). The `poisoned` flag's \
+             only setters now are the partial-write rollback paths \
+             (rollback_truncate, rollback_after_idx_failure); both \
+             the field rustdoc and the runtime error strings must \
+             describe that reality, not the deleted setter."
+        );
+
+        // Conversely, the new wording must appear in BOTH
+        // append-path setters (`append_entry_inner` and
+        // `append_entries_inner`). Two-or-more is the post-fix
+        // shape; a regression that updates one site but not the
+        // other would leave operators with mixed messaging.
+        // Subtract one occurrence for this test's own reference
+        // to the marker (the message immediately below).
+        let new_marker = format!(
+            "{} {}",
+            "partial-write rollback", "could not restore",
+        );
+        let occurrences = src.matches(&new_marker).count();
+        assert!(
+            occurrences >= 2,
+            "regression: at least two error messages (one per \
+             append path) must use the wording '{new_marker}' to \
+             point operators at the real cause; saw {occurrences} \
+             occurrences in the source.",
+        );
     }
 }
