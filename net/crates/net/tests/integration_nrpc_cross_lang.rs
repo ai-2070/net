@@ -89,8 +89,14 @@ impl RpcHandler for EchoSumHandler {
         // Saturating sum so a malicious caller can't crash the
         // handler with an i64 overflow. The fixture doesn't
         // exercise overflow; this is defensive.
-        let sum = req.numbers.iter().fold(0i64, |acc, n| acc.saturating_add(*n));
-        let resp = EchoSumResponse { echo: req.text, sum };
+        let sum = req
+            .numbers
+            .iter()
+            .fold(0i64, |acc, n| acc.saturating_add(*n));
+        let resp = EchoSumResponse {
+            echo: req.text,
+            sum,
+        };
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
@@ -138,7 +144,10 @@ impl Loopback {
         let client_fold = Arc::new(Mutex::new(RpcClientFold::new(pending.clone())));
         let emit: RpcResponseEmitter = Arc::new(move |origin, call_id, resp| {
             let ev = response_event(origin, call_id, &resp);
-            client_fold.lock().apply(&ev, &mut ()).expect("client fold apply");
+            client_fold
+                .lock()
+                .apply(&ev, &mut ())
+                .expect("client fold apply");
         });
         let server_fold = Arc::new(Mutex::new(RpcServerFold::new(
             Arc::new(EchoSumHandler),
@@ -163,7 +172,10 @@ impl Loopback {
             body,
         };
         let ev = request_event(self.caller_origin, call_id, &req);
-        self.server_fold.lock().apply(&ev, &mut ()).expect("server fold apply");
+        self.server_fold
+            .lock()
+            .apply(&ev, &mut ())
+            .expect("server fold apply");
         tokio::time::timeout(Duration::from_secs(2), rx)
             .await
             .expect("response within 2s")
@@ -228,14 +240,14 @@ async fn cross_lang_ok_cases_round_trip() {
     let fx = load_fixture();
     let lb = Loopback::new();
     for case in &fx.ok_cases {
-        let req_bytes = serde_json::to_vec(&case.request_json)
-            .expect("request_json -> bytes");
+        let req_bytes = serde_json::to_vec(&case.request_json).expect("request_json -> bytes");
         let resp = lb.call_json(req_bytes).await;
         assert_eq!(
             resp.status,
             RpcStatus::Ok,
             "ok-case '{}' must return Ok status, got {:?}",
-            case.name, resp.status,
+            case.name,
+            resp.status,
         );
         let actual: JsonValue = serde_json::from_slice(&resp.body)
             .unwrap_or_else(|_| panic!("ok-case '{}' response is not valid JSON", case.name));
@@ -252,13 +264,13 @@ async fn cross_lang_error_cases_surface_typed_bad_request() {
     let fx = load_fixture();
     let lb = Loopback::new();
     for case in &fx.error_cases {
-        let req_bytes = serde_json::to_vec(&case.request_json)
-            .expect("request_json -> bytes");
+        let req_bytes = serde_json::to_vec(&case.request_json).expect("request_json -> bytes");
         let resp = lb.call_json(req_bytes).await;
         match resp.status {
             RpcStatus::Application(code) => assert_eq!(
                 code, case.expected_status,
-                "error-case '{}' status code mismatch", case.name,
+                "error-case '{}' status code mismatch",
+                case.name,
             ),
             other => panic!(
                 "error-case '{}' expected Application({:#06x}), got {:?}",

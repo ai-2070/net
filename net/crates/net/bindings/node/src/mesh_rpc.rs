@@ -44,8 +44,8 @@ use ::net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use ::net::adapter::net::mesh_rpc::{
-    CallOptions as InnerCallOptions, RoutingPolicy as InnerRoutingPolicy, RpcError as InnerRpcError,
-    RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
+    CallOptions as InnerCallOptions, RoutingPolicy as InnerRoutingPolicy,
+    RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
 };
 use ::net::adapter::net::MeshNode;
 
@@ -150,8 +150,7 @@ impl CallOptions {
 /// existing `compute` binding's `DEFAULT_CALLBACK_TIMEOUT_MS`.
 const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
 
-type RpcHandlerTsfn =
-    ThreadsafeFunction<Buffer, Promise<Buffer>, Buffer, napi::Status, false>;
+type RpcHandlerTsfn = ThreadsafeFunction<Buffer, Promise<Buffer>, Buffer, napi::Status, false>;
 
 struct NodeRpcHandler {
     tsfn: RpcHandlerTsfn,
@@ -435,7 +434,12 @@ impl MeshRpc {
         let opts = opts.unwrap_or_default().into_inner();
         let reply = self
             .node
-            .call(target, &service, Bytes::copy_from_slice(request.as_ref()), opts)
+            .call(
+                target,
+                &service,
+                Bytes::copy_from_slice(request.as_ref()),
+                opts,
+            )
             .await
             .map_err(nrpc_err_from_inner)?;
         Ok(Buffer::from(reply.body.as_ref()))
@@ -477,7 +481,12 @@ impl MeshRpc {
         let opts = opts.unwrap_or_default().into_inner();
         let inner = self
             .node
-            .call_streaming(target, &service, Bytes::copy_from_slice(request.as_ref()), opts)
+            .call_streaming(
+                target,
+                &service,
+                Bytes::copy_from_slice(request.as_ref()),
+                opts,
+            )
             .await
             .map_err(nrpc_err_from_inner)?;
         Ok(RpcStream {
@@ -533,7 +542,9 @@ mod tests {
                     format!("{ERR_NRPC_PREFIX}timeout: elapsed_ms={elapsed_ms}")
                 }
                 InnerRpcError::ServerError { status, message } => {
-                    format!("{ERR_NRPC_PREFIX}server_error: status=0x{status:04x} message={message}")
+                    format!(
+                        "{ERR_NRPC_PREFIX}server_error: status=0x{status:04x} message={message}"
+                    )
                 }
                 InnerRpcError::Transport(e) => format!("{ERR_NRPC_PREFIX}transport: {e}"),
                 InnerRpcError::Codec { direction, message } => {
@@ -551,8 +562,9 @@ mod tests {
             reason: "x".into(),
         })
         .starts_with("nrpc:no_route:"));
-        assert!(format_kind(InnerRpcError::Timeout { elapsed_ms: 100 })
-            .starts_with("nrpc:timeout:"));
+        assert!(
+            format_kind(InnerRpcError::Timeout { elapsed_ms: 100 }).starts_with("nrpc:timeout:")
+        );
         assert!(format_kind(InnerRpcError::ServerError {
             status: 0x4001,
             message: "x".into(),

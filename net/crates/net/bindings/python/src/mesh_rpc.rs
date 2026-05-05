@@ -56,8 +56,8 @@ use ::net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use ::net::adapter::net::mesh_rpc::{
-    CallOptions as InnerCallOptions, RoutingPolicy as InnerRoutingPolicy, RpcError as InnerRpcError,
-    RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
+    CallOptions as InnerCallOptions, RoutingPolicy as InnerRoutingPolicy,
+    RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
 };
 use ::net::adapter::net::MeshNode;
 
@@ -125,15 +125,15 @@ create_exception!(
 
 fn rpc_error_to_pyerr(err: InnerRpcError) -> PyErr {
     match err {
-        InnerRpcError::NoRoute { target, reason } => RpcNoRouteError::new_err(format!(
-            "no route to target 0x{target:x}: {reason}"
-        )),
+        InnerRpcError::NoRoute { target, reason } => {
+            RpcNoRouteError::new_err(format!("no route to target 0x{target:x}: {reason}"))
+        }
         InnerRpcError::Timeout { elapsed_ms } => {
             RpcTimeoutError::new_err(format!("rpc timeout after {elapsed_ms}ms"))
         }
-        InnerRpcError::ServerError { status, message } => RpcServerError::new_err(format!(
-            "server returned status 0x{status:04x}: {message}"
-        )),
+        InnerRpcError::ServerError { status, message } => {
+            RpcServerError::new_err(format!("server returned status 0x{status:04x}: {message}"))
+        }
         InnerRpcError::Transport(e) => RpcTransportError::new_err(format!("transport: {e}")),
         InnerRpcError::Codec { direction, message } => {
             let dir = match direction {
@@ -331,9 +331,9 @@ impl PyRpcStream {
         let result = py.detach(|| {
             runtime.block_on(async move {
                 let mut guard = inner.lock().unwrap_or_else(|p| p.into_inner());
-                let stream = guard.as_mut().ok_or_else(|| {
-                    RpcError::new_err("stream already closed")
-                })?;
+                let stream = guard
+                    .as_mut()
+                    .ok_or_else(|| RpcError::new_err("stream already closed"))?;
                 let next = stream.next().await;
                 match next {
                     Some(Ok(bytes)) => Ok::<Option<Bytes>, PyErr>(Some(bytes)),

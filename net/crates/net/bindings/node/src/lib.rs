@@ -18,10 +18,10 @@ mod groups;
 // nRPC binding (B1: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit.
-#[cfg(feature = "cortex")]
-mod mesh_rpc;
 #[cfg(feature = "net")]
 mod identity;
+#[cfg(feature = "cortex")]
+mod mesh_rpc;
 #[cfg(feature = "redis")]
 mod redis_dedup;
 #[cfg(feature = "net")]
@@ -1916,10 +1916,7 @@ mod mesh_bindings {
         /// per-binding access. Kept gated on either feature so the
         /// accessor is available if `mesh_rpc` ever needs it.
         #[cfg(any(feature = "compute", feature = "cortex"))]
-        #[cfg_attr(
-            all(feature = "cortex", not(feature = "compute")),
-            allow(dead_code)
-        )]
+        #[cfg_attr(all(feature = "cortex", not(feature = "compute")), allow(dead_code))]
         pub(crate) fn channel_configs_arc(&self) -> Arc<net::adapter::net::ChannelConfigRegistry> {
             self.channel_configs.clone()
         }

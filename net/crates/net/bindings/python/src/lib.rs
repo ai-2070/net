@@ -2077,10 +2077,7 @@ mod mesh_bindings {
         /// gated on either feature so the accessor is available
         /// if `mesh_rpc` ever needs it.
         #[cfg(any(feature = "compute", feature = "cortex"))]
-        #[cfg_attr(
-            all(feature = "cortex", not(feature = "compute")),
-            allow(dead_code)
-        )]
+        #[cfg_attr(all(feature = "cortex", not(feature = "compute")), allow(dead_code))]
         pub(crate) fn channel_configs_arc(&self) -> Arc<ChannelConfigRegistry> {
             self.channel_configs.clone()
         }

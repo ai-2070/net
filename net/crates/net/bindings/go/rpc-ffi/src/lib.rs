@@ -49,6 +49,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
+use futures::StreamExt;
 use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
@@ -57,7 +58,6 @@ use net::adapter::net::mesh_rpc::{
     RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
 };
 use net::adapter::net::MeshNode;
-use futures::StreamExt;
 
 // =========================================================================
 // Error codes
@@ -288,9 +288,7 @@ impl RpcHandler for GoRpcHandler {
                     // Copy the Go-allocated response bytes into a
                     // Rust-owned Vec so the lifetime is decoupled
                     // from the Go-malloc'd buffer.
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(resp_ptr, resp_len).to_vec()
-                    };
+                    let bytes = unsafe { std::slice::from_raw_parts(resp_ptr, resp_len).to_vec() };
                     // Release the Go-allocated buffer.
                     unsafe { libc::free(resp_ptr as *mut libc::c_void) };
                     Ok(bytes)
@@ -499,9 +497,8 @@ pub extern "C" fn net_rpc_call(
     let opts = build_call_options(deadline_ms);
     let node = h.node.clone();
 
-    let result = runtime().block_on(async move {
-        node.call(target_node_id, &service, req_bytes, opts).await
-    });
+    let result = runtime()
+        .block_on(async move { node.call(target_node_id, &service, req_bytes, opts).await });
 
     match result {
         Ok(reply) => {
@@ -967,17 +964,20 @@ mod tests {
             reason: "x".into(),
         })
         .starts_with("no_route:"));
-        assert!(format_rpc_error(&InnerRpcError::Timeout { elapsed_ms: 100 })
-            .starts_with("timeout:"));
+        assert!(
+            format_rpc_error(&InnerRpcError::Timeout { elapsed_ms: 100 }).starts_with("timeout:")
+        );
         assert!(format_rpc_error(&InnerRpcError::ServerError {
             status: 0x4001,
             message: "x".into(),
         })
         .starts_with("server_error:"));
-        assert!(format_rpc_error(&InnerRpcError::Transport(
-            AdapterError::Connection("boom".into())
-        ))
-        .starts_with("transport:"));
+        assert!(
+            format_rpc_error(&InnerRpcError::Transport(AdapterError::Connection(
+                "boom".into()
+            )))
+            .starts_with("transport:")
+        );
         assert!(format_rpc_error(&InnerRpcError::Codec {
             direction: CodecDirection::Encode,
             message: "x".into(),
@@ -1077,7 +1077,7 @@ mod tests {
         }));
         net_rpc_stream_close(handle);
         net_rpc_stream_close(handle); // second close — no panic
-        // call_id stays addressable even after close.
+                                      // call_id stays addressable even after close.
         assert_eq!(net_rpc_stream_call_id(handle), 7);
         net_rpc_stream_free(handle);
     }
