@@ -160,6 +160,66 @@ jobs:
       - name: Run tests
         run: npm test
 
+  sdk-ts-tests:
+    name: TypeScript SDK tests (vitest + tsc)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net/sdk-ts
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-sdk-ts-${{ hashFiles('**/Cargo.lock') }}
+
+      # `sdk-ts/package.json` carries `@ai2070/net: file:../bindings/node`
+      # as a devDependency, so `npm i` over there picks up the sibling
+      # binding from the working tree. The binding's `.node` cdylib has
+      # to be built first or `npm test` will fail to load it. Mirror the
+      # `node-tests` job's feature flags (no `redis` default, plus
+      # `test-helpers` so `_testInjectSyntheticPeer` is exported for
+      # the group-placement fixtures) — `sdk-ts/test/groups.test.ts`
+      # uses the same hook the bindings suite does. Skip the `redis`
+      # default for the same reason: no service container is wired up,
+      # and the SDK's redis-dedup re-export is import-only at typecheck
+      # time.
+      - name: Build native module
+        working-directory: net/crates/net/bindings/node
+        run: |
+          npm i --ignore-scripts
+          npx napi build --platform --no-default-features --features net,cortex,compute,groups,test-helpers
+
+      - name: Install npm dependencies
+        run: npm i
+
+      # `tsc` first — the v0.11 `originHash` widening (u32 → u64,
+      # number → bigint) cascaded through every method signature and
+      # interface in the SDK's source. Type-check failures here mean
+      # the SDK's type surface drifted away from the binding's
+      # generated `.d.ts`; surface them as a CI failure rather than
+      # only as a `npm run build` failure on a developer workstation.
+      - name: Type-check (tsc)
+        run: npm run build
+
+      - name: Run vitest
+        run: npm test
+
   python-tests:
     name: Python bindings tests (pytest)
     runs-on: ubuntu-latest
