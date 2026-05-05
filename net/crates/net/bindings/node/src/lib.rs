@@ -1903,10 +1903,20 @@ mod mesh_bindings {
         /// same live node — no second UDP socket, no second
         /// handshake table. Returns an error if the node has
         /// been shut down.
+        ///
+        /// Read the slot once and inspect the snapshot — a
+        /// concurrent shutdown can swap to None between the
+        /// `load` inside `load_node` and a subsequent re-check,
+        /// so the previous "load_node + as_ref + expect" pattern
+        /// could panic on a real shutdown race. Surface as a
+        /// typed error instead.
         #[cfg(any(feature = "compute", feature = "cortex"))]
         pub(crate) fn node_arc_clone(&self) -> Result<Arc<MeshNode>> {
-            let guard = self.load_node()?;
-            Ok(guard.as_ref().expect("load_node ensures Some").clone())
+            let guard = self.node.load();
+            match guard.as_ref() {
+                Some(arc) => Ok(arc.clone()),
+                None => Err(Error::from_reason("MeshNode has been shut down")),
+            }
         }
 
         /// Share the `ChannelConfigRegistry` for sibling-module
