@@ -1,0 +1,29 @@
+net/crates/net/bindings/node/tsconfig.build.json
+  d1b11a1287c1706a 1-36
+.gitignore
+  d1b11a1287c1706a 13-24
+net/crates/net/bindings/node/package.json
+  d1b11a1287c1706a 68-69,73
+net/crates/net/bindings/node/errors.ts
+  d1b11a1287c1706a 23-24,31-32,49,58-59,66-67,74-77,88-91,103-104,111-114,117,130-131,143-144,157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "539ca2b08612e4e1c75c321a138ba2cd0a2b801a",
+  "prompts": {
+    "d1b11a1287c1706a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 387,
+      "total_deletions": 231,
+      "accepted_lines": 387,
+      "overriden_lines": 0
+    }
+  }
+}
