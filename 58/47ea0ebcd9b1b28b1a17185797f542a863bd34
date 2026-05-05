@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  cfca4517ad394ef2 1217-1229,1272-1289,1291-1302
+net/crates/net/src/adapter/net/mesh.rs
+  cfca4517ad394ef2 4096-4105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "5847ea0ebcd9b1b28b1a17185797f542a863bd34",
+  "prompts": {
+    "cfca4517ad394ef2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c8c8999-2a05-4bfc-a843-35946dde9df4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 53,
+      "total_deletions": 47,
+      "accepted_lines": 53,
+      "overriden_lines": 0
+    }
+  }
+}
