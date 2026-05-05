@@ -1999,10 +1999,7 @@ fn test_fsync_dir_consume_injected_failure() -> Option<std::io::Error> {
         }
         c.set(cur - 1);
         if cur == 1 {
-            Some(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "test-injected fsync_dir failure",
-            ))
+            Some(std::io::Error::other("test-injected fsync_dir failure"))
         } else {
             None
         }
