@@ -2156,6 +2156,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<mesh_rpc::PyMeshRpc>()?;
         m.add_class::<mesh_rpc::PyServeHandle>()?;
         m.add_class::<mesh_rpc::PyRpcStream>()?;
+        m.add_class::<mesh_rpc::PyCancellable>()?;
         m.add("RpcError", m.py().get_type::<mesh_rpc::RpcError>())?;
         m.add(
             "RpcNoRouteError",
@@ -2178,6 +2179,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             m.py().get_type::<mesh_rpc::RpcCodecError>(),
         )?;
         m.add("RpcAppError", m.py().get_type::<mesh_rpc::RpcAppError>())?;
+        m.add(
+            "RpcCancelledError",
+            m.py().get_type::<mesh_rpc::RpcCancelledError>(),
+        )?;
     }
     #[cfg(feature = "compute")]
     {

@@ -40,8 +40,10 @@ from typing import Any, Callable, Iterator, Optional, Sequence
 # will have cortex enabled.
 try:
     from net._net import (
+        Cancellable,
         MeshRpc as _RawMeshRpc,
         RpcAppError,
+        RpcCancelledError,
         RpcCodecError,
         RpcError,
         RpcNoRouteError,
@@ -60,6 +62,7 @@ except ImportError:  # pragma: no cover — feature-flag path
     RpcServerError = RpcError  # type: ignore[misc,assignment]
     RpcTransportError = RpcError  # type: ignore[misc,assignment]
     RpcCodecError = RpcError  # type: ignore[misc,assignment]
+    RpcCancelledError = RpcError  # type: ignore[misc,assignment]
 
     # Fallback `RpcAppError` carries (status, body) on `args` so the
     # cross-binding semantics still hold against test stubs. The
@@ -74,6 +77,26 @@ except ImportError:  # pragma: no cover — feature-flag path
         used when the native module isn't available; same shape so
         user code is portable across both paths.
         """
+
+    # Fallback Cancellable for non-native test paths. The native
+    # class hooks into the tokio runtime; the fallback just
+    # latches the cancel flag so user code that constructs and
+    # cancels works without a built wheel — but cancellation has
+    # no effect on whatever stub raw layer is in use.
+    class Cancellable:  # type: ignore[no-redef]
+        """Caller-side cancel token. Pure-Python fallback used
+        when the native module isn't available; cancel() latches
+        but doesn't reach into a runtime.
+        """
+
+        def __init__(self) -> None:
+            self._cancelled = False
+
+        def cancel(self) -> None:
+            self._cancelled = True
+
+        def is_cancelled(self) -> bool:
+            return self._cancelled
 
     ServeHandle = Any  # type: ignore[misc,assignment]
 
@@ -382,6 +405,7 @@ _NRPC_KINDS = frozenset({
     "codec_encode",
     "codec_decode",
     "breaker_open",
+    "cancelled",
 })
 
 
@@ -751,7 +775,9 @@ __all__ = [
     # wrapper AND the typed exceptions can `from net.mesh_rpc
     # import RpcCodecError` from one place. These are the SAME
     # objects exposed under `net.RpcError` etc.
+    "Cancellable",
     "RpcAppError",
+    "RpcCancelledError",
     "RpcCodecError",
     "RpcError",
     "RpcNoRouteError",

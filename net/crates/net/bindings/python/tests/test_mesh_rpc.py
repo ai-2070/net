@@ -35,6 +35,7 @@ import pytest
 
 from net.mesh_rpc import (
     BreakerOpenError,
+    Cancellable,
     CircuitBreaker,
     HedgePolicy,
     NRPC_TYPED_BAD_REQUEST,
@@ -568,6 +569,36 @@ def test_typed_serve_decode_failure_raises_app_error_with_bad_request_status() -
     decoded = _json.loads(bytes(body).decode("utf-8"))
     assert decoded["error"] == "invalid_request"
     assert "detail" in decoded
+
+
+# =========================================================================
+# Cancellable — caller-side cancel token
+# =========================================================================
+
+
+def test_cancellable_starts_uncancelled_and_latches_on_cancel() -> None:
+    """The pure-Python fallback (and the native class — same API)
+    starts unset, flips to cancelled on `cancel()`, and is
+    idempotent. Pinned because the Cancellable participates in
+    cross-binding cancellation tests."""
+    c = Cancellable()
+    assert c.is_cancelled() is False
+    c.cancel()
+    assert c.is_cancelled() is True
+    # Idempotent
+    c.cancel()
+    assert c.is_cancelled() is True
+
+
+def test_classify_error_recognizes_cancelled_kind() -> None:
+    """Regression: the cancelled kind is part of the canonical
+    set; classify_error must dispatch on it. Drift breaks every
+    cross-binding fallback path that wants to special-case
+    user-driven cancellation."""
+    assert (
+        classify_error(Exception("nrpc:cancelled: call cancelled by caller"))
+        == "cancelled"
+    )
 
 
 def test_typed_serve_handler_runtime_exception_still_surfaces_as_internal() -> None:

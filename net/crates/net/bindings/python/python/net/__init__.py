@@ -113,8 +113,10 @@ else:
 # once the wheel is rebuilt with `maturin develop`.
 try:
     from ._net import (
+        Cancellable,
         MeshRpc,
         RpcAppError,
+        RpcCancelledError,
         RpcCodecError,
         RpcError,
         RpcNoRouteError,
@@ -129,8 +131,10 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "Cancellable",
             "MeshRpc",
             "RpcAppError",
+            "RpcCancelledError",
             "RpcCodecError",
             "RpcError",
             "RpcNoRouteError",
