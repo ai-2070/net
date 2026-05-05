@@ -110,10 +110,21 @@ static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Process-global cancel-token registry. Populated when a call
 /// is dispatched with a non-zero token; queried by `cancel_call`.
-fn cancel_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<u64, AbortHandle>> {
-    static REG: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, AbortHandle>>> =
+/// Uses `std::sync::Mutex` to avoid pulling parking_lot as a new
+/// dep — the lock is only taken briefly at call start / end /
+/// cancel, never across an await.
+fn cancel_registry() -> &'static std::sync::Mutex<std::collections::HashMap<u64, AbortHandle>> {
+    static REG: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, AbortHandle>>> =
         OnceLock::new();
-    REG.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Lock the cancel registry, recovering from a poisoned mutex
+/// (a thread panicked while holding it). Registry entries are
+/// independent so partial state is fine.
+fn lock_cancel_registry(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<u64, AbortHandle>> {
+    cancel_registry().lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// Internal sentinel for "task aborted by `cancel_call`."
@@ -137,9 +148,9 @@ where
     }
     let task = tokio::spawn(fut);
     let abort_handle = task.abort_handle();
-    cancel_registry().lock().insert(cancel_token, abort_handle);
+    lock_cancel_registry().insert(cancel_token, abort_handle);
     let result = task.await;
-    cancel_registry().lock().remove(&cancel_token);
+    lock_cancel_registry().remove(&cancel_token);
     match result {
         Ok(v) => Ok(v),
         Err(e) if e.is_cancelled() => Err(NodeCancelled),
@@ -606,7 +617,7 @@ impl MeshRpc {
         if token == 0 {
             return Ok(());
         }
-        if let Some(handle) = cancel_registry().lock().remove(&token) {
+        if let Some(handle) = lock_cancel_registry().remove(&token) {
             handle.abort();
         }
         Ok(())
@@ -790,6 +801,7 @@ mod tests {
         let opts = CallOptions {
             deadline_ms: Some(500),
             stream_window_initial: Some(8),
+            cancel_token: None,
         };
         let inner = opts.into_inner();
         assert!(inner.deadline.is_some(), "deadline must be Some when set");

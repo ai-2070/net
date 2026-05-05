@@ -411,8 +411,7 @@ pub extern "C" fn net_rpc_response_free(ptr: *mut u8, len: usize) {
         return;
     }
     unsafe {
-        let slice: *mut [u8] = std::slice::from_raw_parts_mut(ptr, len);
-        drop(Box::from_raw(slice));
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
     }
 }
 
@@ -427,8 +426,7 @@ pub extern "C" fn net_rpc_find_service_nodes_free(ptr: *mut u64, len: usize) {
         return;
     }
     unsafe {
-        let slice: *mut [u64] = std::slice::from_raw_parts_mut(ptr, len);
-        drop(Box::from_raw(slice));
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
     }
 }
 
