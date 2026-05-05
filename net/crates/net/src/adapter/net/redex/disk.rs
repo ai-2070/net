@@ -3531,6 +3531,117 @@ mod tests {
         cleanup(&base);
     }
 
+    /// Crash-injection: design-doc row 9 (mid-migration partial
+    /// rename). Simulate `flat/idx` rename succeeding but the
+    /// process crashing before `flat/dat` and `flat/ts` are
+    /// moved. Re-open must resume the migration cleanly:
+    ///
+    ///   - the partially-populated `v1/` (only `idx` so far) is
+    ///     NOT confused for a complete generation by the
+    ///     enumerate-fallback branch (it's missing `dat` + `ts`),
+    ///   - the still-extant flat files (`dat`, `ts`) trigger the
+    ///     migration shim a second time,
+    ///   - the shim's per-file `if flat_*.is_file()` guard
+    ///     correctly skips the already-migrated `idx` and
+    ///     completes the move for `dat` + `ts`,
+    ///   - the manifest is then written and recovery succeeds
+    ///     with all three files present.
+    ///
+    /// Pin so a future change that breaks idempotency (e.g.
+    /// dropping the per-file `is_file()` guards in favor of an
+    /// unconditional rename, or changing the resolution order to
+    /// trust an incomplete `v1/` directory) trips here rather
+    /// than as silent data loss in production.
+    #[test]
+    fn open_resumes_migration_after_partial_flat_rename_crash() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_partial_migration").unwrap();
+        let chan = channel_dir(&base, &name);
+        std::fs::create_dir_all(&chan).unwrap();
+
+        // Set up: legacy flat-layout content, then SIMULATE a
+        // crash where `idx` was renamed into `v1/` but `dat` +
+        // `ts` were still flat. We do this by creating `v1/`
+        // ourselves with a partial migration result rather than
+        // relying on a fault injector.
+        let payload = b"resume-migration-payload";
+        let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        let v1 = gen_dir(&chan, FIRST_GENERATION);
+        std::fs::create_dir_all(&v1).unwrap();
+        // Half-migrated: idx already in v1/.
+        std::fs::write(v1.join("idx"), entry.to_bytes()).unwrap();
+        // Still flat: dat + ts.
+        std::fs::write(chan.join("dat"), payload).unwrap();
+        std::fs::write(chan.join("ts"), 4567u64.to_le_bytes()).unwrap();
+        // No manifest — the prior partial migration didn't reach
+        // `write_manifest_atomic`.
+        assert!(!manifest_path(&chan).exists());
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+
+        // Migration completed: live gen = 1, manifest written,
+        // every flat file moved, every v1 file present, content
+        // intact.
+        assert_eq!(recovered.disk.live_gen(), FIRST_GENERATION);
+        assert_eq!(read_manifest(&chan), Some(FIRST_GENERATION));
+        assert!(
+            !chan.join("dat").exists(),
+            "remaining flat dat must have completed its migration",
+        );
+        assert!(
+            !chan.join("ts").exists(),
+            "remaining flat ts must have completed its migration",
+        );
+        // `idx` was already migrated — must NOT have been
+        // duplicated/clobbered (its content must be preserved).
+        assert!(v1.join("idx").is_file());
+        assert!(v1.join("dat").is_file());
+        assert!(v1.join("ts").is_file());
+        assert_eq!(recovered.index.len(), 1, "the pre-crash idx entry must survive");
+        assert_eq!(recovered.payload_bytes, payload);
+        assert_eq!(recovered.timestamps.as_deref(), Some(&[4567u64][..]));
+
+        // Idempotent: a second open observes the manifest and
+        // takes the new-layout path (no re-migration).
+        drop(recovered);
+        let r2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(r2.disk.live_gen(), FIRST_GENERATION);
+        assert_eq!(r2.index.len(), 1);
+        cleanup(&base);
+    }
+
+    /// Symmetric case: the OTHER mid-migration partial — only
+    /// `dat` was flat at crash time, `idx` and `ts` already in
+    /// v1/. Pins that the per-file guards work for any subset
+    /// of remaining flat files, not just the "idx came first"
+    /// ordering above.
+    #[test]
+    fn open_resumes_migration_when_only_dat_remains_flat() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/manifest_partial_migration_dat_only").unwrap();
+        let chan = channel_dir(&base, &name);
+        std::fs::create_dir_all(&chan).unwrap();
+
+        let payload = b"dat-only-resume";
+        let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        let v1 = gen_dir(&chan, FIRST_GENERATION);
+        std::fs::create_dir_all(&v1).unwrap();
+        std::fs::write(v1.join("idx"), entry.to_bytes()).unwrap();
+        std::fs::write(v1.join("ts"), 99u64.to_le_bytes()).unwrap();
+        std::fs::write(chan.join("dat"), payload).unwrap();
+        assert!(!manifest_path(&chan).exists());
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(recovered.disk.live_gen(), FIRST_GENERATION);
+        assert_eq!(read_manifest(&chan), Some(FIRST_GENERATION));
+        assert!(!chan.join("dat").exists());
+        assert!(v1.join("dat").is_file());
+        assert_eq!(recovered.index.len(), 1);
+        assert_eq!(recovered.payload_bytes, payload);
+        assert_eq!(recovered.timestamps.as_deref(), Some(&[99u64][..]));
+        cleanup(&base);
+    }
+
     /// If the manifest is missing entirely (e.g. it was never
     /// written, or it was deleted out of band), but generation
     /// directories exist, recovery must enumerate them and pick the
