@@ -1206,6 +1206,21 @@ impl MeshNode {
     /// register an inbound dispatcher that drives the per-Mesh
     /// `RpcClientFold`. Idempotent — subsequent calls for the
     /// same (target, service) pair are no-ops.
+    ///
+    /// **Bounded** at [`MAX_REPLY_SUBSCRIPTIONS`]: a caller talking
+    /// to many short-lived (target, service) pairs would otherwise
+    /// grow the registry indefinitely. Past the cap we refuse the
+    /// new subscription with `NoRoute` rather than evict an
+    /// existing one (eviction could rip out a healthy in-flight
+    /// reply path).
+    ///
+    /// **Refuses on dispatcher hash collision**: two distinct
+    /// reply-channel names whose 16-bit hashes collide can't both
+    /// register a dispatcher — we'd silently overwrite the prior
+    /// one and orphan its pending oneshots. Refuse the new
+    /// (target, service) with `NoRoute` instead so the caller
+    /// gets a clear "this target is unreachable from this Mesh"
+    /// signal.
     async fn ensure_reply_subscription(
         self: &Arc<Self>,
         target_node_id: u64,
@@ -1221,6 +1236,20 @@ impl MeshNode {
                 .any(|(t, s)| *t == target_node_id && s == service)
             {
                 return Ok(());
+            }
+            // Cap the registry. New entries past the cap are
+            // refused — caller should reuse an existing
+            // (target, service) pair or operate on fewer.
+            if entries.len() >= MAX_REPLY_SUBSCRIPTIONS {
+                return Err(RpcError::NoRoute {
+                    target: target_node_id,
+                    reason: format!(
+                        "reply-subscription registry at cap ({} entries); refusing new \
+                         (target={target_node_id:#x}, service={service:?}). Caller should \
+                         reuse an existing target+service pair or shrink the active set.",
+                        MAX_REPLY_SUBSCRIPTIONS,
+                    ),
+                });
             }
         }
 
@@ -1254,20 +1283,27 @@ impl MeshNode {
                 tracing::warn!(error = %e, "rpc client fold: apply error");
             }
         });
-        // Slot collision (two services using the same reply channel
-        // hash) is ~1/65536 per pair; in the rare collision the
-        // earlier registration wins. The replaced dispatcher's
-        // events would route to the new fold instead — surfaces
-        // as cross-service oneshot misses (the mismatched call_id
-        // doesn't match any pending entry, event is silently
-        // dropped). Document; revisit in Phase 2 with a wider
-        // dispatch key.
-        if let Some(_prev) = self.register_rpc_inbound(reply_hash, dispatcher) {
-            tracing::warn!(
-                channel_hash = format!("{:#06x}", reply_hash),
-                service,
-                "rpc call: reply-channel hash collision with prior registration",
-            );
+        // Refuse on hash collision instead of silently overwriting
+        // — the prior dispatcher's pending oneshots would be
+        // orphaned and never resolve. Restore the prior
+        // registration and surface the new (target, service) as
+        // NoRoute so the caller knows it can't reach this target
+        // through this Mesh until the conflicting registration is
+        // released.
+        if let Some(prev) = self.register_rpc_inbound(reply_hash, dispatcher) {
+            // Roll back: re-install the prior dispatcher. The new
+            // one we just installed is dropped here.
+            let _ = self.register_rpc_inbound(reply_hash, prev);
+            return Err(RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!(
+                    "reply-channel hash collision at {:#06x}: another (target, service) \
+                     pair already owns this dispatcher slot. Phase-2 dispatch keys will \
+                     widen the slot to avoid this; for now the new (target={target_node_id:#x}, \
+                     service={service:?}) is refused.",
+                    reply_hash,
+                ),
+            });
         }
 
         let _ = reply_hash; // captured into the dispatcher above; surfaced for debug
@@ -1275,6 +1311,14 @@ impl MeshNode {
         Ok(())
     }
 }
+
+/// Hard cap on the number of distinct (target_node_id, service)
+/// pairs the caller-side reply-subscription registry will hold.
+/// Past the cap, [`MeshNode::ensure_reply_subscription`] refuses
+/// new entries with `RpcError::NoRoute`. 1024 is generous for
+/// any realistic deployment — a caller that needs more should
+/// reuse existing reply paths.
+pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 
 // ============================================================================
 // Internal: tiny shims so the `serve_rpc` / `call` impls stay
