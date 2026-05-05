@@ -62,6 +62,62 @@ Or use the Redis/JetStream transports directly so anything that consumes those s
 
 There is no built-in bridge product. It's an application — three to ten lines of code per direction.
 
+## "I want request/response — call a service and get a typed reply"
+
+**Recipe:** nRPC (`TypedMeshRpc.serve` + `TypedMeshRpc.call`). Read `nrpc.md` for the full surface.
+
+The bus is broadcast pub/sub, no return value. nRPC is a separate convention layer over the same encrypted mesh that adds typed call → typed reply, deadlines, retries, hedging, response streaming, and end-to-end cancellation. **Do not roll your own with two channels + correlation id** — that's exactly what nRPC already implements, with the resilience helpers and cross-binding contract baked in.
+
+```rust
+// Rust — Mesh::serve_rpc_typed + call_typed (feature = "cortex")
+let _handle = server.serve_rpc_typed("echo_sum",
+    |req: Req| async move { Ok::<_, String>(handle(req)) })?;
+let resp: Resp = client.call_typed(server_node_id, "echo_sum", &req,
+    CallOptions::default().with_deadline(Duration::from_millis(200))).await?;
+```
+
+```typescript
+// TS — TypedMeshRpc.serve + .call (from @ai2070/net/mesh_rpc)
+const rpc = TypedMeshRpc.fromMesh((mesh as any)._native)
+const handle = rpc.serve('echo_sum', async (req) => handleSync(req))
+const resp = await rpc.call(serverNodeId, 'echo_sum', req, { deadlineMs: 200 })
+await handle.close()  // MUST close — finalizers are non-deterministic
+```
+
+```python
+# Python — TypedMeshRpc.from_mesh + .serve / .call (feature = "cortex")
+rpc = TypedMeshRpc.from_mesh(mesh)
+with rpc.serve('echo_sum', handler):
+    resp = rpc.call(server_node_id, 'echo_sum', req, opts={'deadline_ms': 200})
+```
+
+If the user is in **Go**, the consumer-side reference cgo wrapper is at `bindings/go/net/mesh_rpc.go` (Go module ships downstream; the upstream net repo only ships the C-ABI cdylib at `bindings/go/rpc-ffi/`).
+
+If the user is in **C**, nRPC is **not in `net.h`** — the C-ABI lives in the separate `libnet_rpc` cdylib. See `nrpc.md` § C-not-in-net.h.
+
+## "I need streaming responses for one request"
+
+**Recipe:** nRPC `call_streaming` (server emits chunks, client iterates).
+
+```typescript
+const stream = await rpc.callStreaming(targetNodeID, 'tail', req,
+  { deadlineMs: 5_000, streamWindow: 8 })  // optional flow control
+for await (const chunk of stream) { /* decoded chunk */ }
+// stream.close() emits CANCEL; stream.grant(n) issues explicit credit.
+```
+
+Same shape in Rust / Python / Go. Auto-grant covers the common case (1 credit per delivered chunk); explicit `grant(window/2)` cadence is preferable for uniform-sized chunks where you want fewer round-trips. Read `nrpc.md` for the full streaming contract.
+
+## "I want retry / hedging / circuit-breaker for my RPC calls"
+
+**Recipe:** the resilience helpers ship in every binding alongside the typed surface.
+
+- `RetryPolicy` + `callWithRetry` — exponential backoff with jitter; default predicate retries `no_route` + `transport`, skips terminal `server_error` / `codec_*`.
+- `HedgePolicy` + `callWithHedgeTo` — fans out parallel attempts on a delay; first success wins, losers cancelled.
+- `CircuitBreaker` — closed → open → half-open with a configurable failure predicate. Open breakers reject calls outright with `BreakerOpenError` (carries `nrpc:breaker_open:` prefix).
+
+Stack them: `breaker.call(() => callWithRetry(...))` is the typical "give up fast on a wedged target, but tolerate single retries" combo. **Don't** retry `codec_*` errors (caller bugs). **Don't** install a breaker that opens on `no_route` alone (flaps before any handshake). See `nrpc.md` § Resilience helpers for the full guidance.
+
 ## "I want a publisher to also see its own events"
 
 By default, **the publisher does not receive its own emits via subscribe.** If you need that, the publisher subscribes to the same channel explicitly, and its own roster will deliver to it.
@@ -153,4 +209,14 @@ Topic-based pub/sub?
 │   ├── TS or Python? → node.channel('name')
 │   └── Rust / Go / C? → emit typed events; filter on consumer
 └── No, single firehose? → node.emit() / node.subscribe(), no channel API needed
+```
+
+```
+Need a typed reply / RPC semantics?
+├── No (fire-and-forget broadcast)? → bus surface above
+└── Yes → nRPC (`nrpc.md`)
+    ├── Direct-addressed (you know the target node id)? → TypedMeshRpc.call
+    ├── Service-discovery (any node advertising the service)? → TypedMeshRpc.callService
+    ├── Streaming response from one request? → TypedMeshRpc.callStreaming
+    └── Need deadline + retries / hedging? → callWithRetry / callWithHedge / CircuitBreaker
 ```

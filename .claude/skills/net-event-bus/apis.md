@@ -33,8 +33,11 @@ Two surfaces exist across the SDKs:
 | **Named channels** (`node.channel("name")` → publish/subscribe) | Topic-based pub/sub. Channel name is embedded in payload as `_channel` and used as a subscribe filter. Subscriber roster held by publisher. | TypeScript, Python |
 | **Raw typed firehose** (`node.emit(struct)` → `node.subscribe()`) | Single stream of typed events. Consumers receive everything; filter/discriminate on the receive side. | Rust, TypeScript, Python |
 | **Raw poll** (`bus.IngestRaw` → `bus.Poll(cursor)`) | Push JSON in, poll JSON out with a cursor. No async, no channels. | Go, C |
+| **nRPC** (`TypedMeshRpc.serve` + `TypedMeshRpc.call`) — request/response | Typed call → typed reply with deadlines, retries, hedging, response streaming. **Different surface from this file** — see `nrpc.md` for the full API. | Rust, TypeScript, Python, Go |
 
 If the user wants topic-based fan-out and they're in Rust, Go, or C: there is no built-in named-channel API. They filter on the consumer.
+
+If the user wants request/response (typed call → typed reply): **stop reading this file** and go to `nrpc.md`. The bus surface below has no return-value mechanism — nRPC is the answer.
 
 ---
 
@@ -240,6 +243,7 @@ These bite people regardless of language. Internalize them.
 
 Out-of-scope features (read these directly from source):
 
+- **nRPC (request/response)** — typed `serve` + `call` + `callStreaming` with deadlines / retry / hedge / circuit-breaker. Separate convention layer over the bus. See `nrpc.md` and `net/crates/net/README.md` § nRPC.
 - **Mesh transport configuration** (peer discovery, NAT traversal, port mapping, identity keys) — each SDK exposes mesh-specific kwargs. See SDK README's "Mesh" section.
 - **Subnets and capability tags** — set on node construction; affect channel visibility. See `net/README.md` § Subnets and Capabilities.
 - **Capability discovery** — `mesh.find_nodes(filter)` / `find_nodes_scoped(filter, scope)` / `find_best_node(req)` for picking the right peer by hardware/model/tag. Reserved `scope:tenant:*` / `scope:region:*` / `scope:subnet-local` tags narrow discovery to per-tenant or per-region pools without channel-level subnet routing.

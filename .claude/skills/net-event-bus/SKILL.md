@@ -1,6 +1,6 @@
 ---
 name: net-event-bus
-description: "Use this skill when the user is integrating the Net library (`@ai2070/net-sdk`, Rust `net-sdk`, Python `net-sdk`, Go `net` binding, or C `net.h`) as an event bus — anything involving publishing to or subscribing from a Net channel, wiring a producer/consumer/relay against the Net SDK, or migrating from Kafka/NATS/Redis Streams/Pulsar. Triggers on imports of those packages and on phrases like 'use Net for events', 'pub/sub with Net', 'wire up a Net channel', 'Net subscriber', 'Net publisher'. Skip for unrelated event-bus work or for editing Net's own internals."
+description: "Use this skill when the user is integrating the Net library (`@ai2070/net-sdk`, Rust `net-sdk`, Python `net-sdk`, Go `net` binding, or C `net.h`) as an event bus OR for nRPC request/response over the mesh — anything involving publishing to or subscribing from a Net channel, wiring a producer/consumer/relay against the Net SDK, calling a service via `serve_rpc` / `call_typed` / `TypedMeshRpc`, or migrating from Kafka/NATS/Redis Streams/Pulsar/gRPC. Triggers on imports of those packages and on phrases like 'use Net for events', 'pub/sub with Net', 'wire up a Net channel', 'Net subscriber', 'Net publisher', 'nRPC', 'mesh RPC', 'request/reply over the mesh'. Skip for unrelated event-bus work or for editing Net's own internals."
 allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 ---
 
@@ -22,6 +22,7 @@ You have several reference files in this directory. Load them on demand — do n
 | `mesh.md` | When the user is deploying multi-host. Production transport recipe — PSK / identity bootstrap, peer discovery, NAT traversal toggles, port mapping, 2-node and 3-node working configs. |
 | `capabilities.md` | When the user wants to route to "the GPU node" or "a node that has model X loaded". `find_nodes` / `find_best_node` / scope filters. The differentiator vs Kafka/NATS/Redis. |
 | `streams.md` | When the user needs ordered point-to-point delivery (large payloads, telemetry-to-one-peer, credit-grant backpressure). Per-peer streams — different surface from the bus despite overlapping vocabulary. |
+| `nrpc.md` | When the user needs **request/response** (typed call → typed reply, deadlines, retries, hedging, response streaming). Separate convention layer on top of the bus — don't reach for it for fire-and-forget broadcast. |
 | `runtime.md` | When writing a `shutdown` path, handling errors, integrating into an existing async runtime (axum, FastAPI, Express), or debugging "why are my events missing?" |
 | `observability.md` | When the user asks "how do I know events are being dropped?" or wires Prometheus/OTel. Stat fields per SDK, the silent-drop trap, tuning knobs. |
 | `payloads.md` | When the user is shaping their event schema or asking about size limits, large blobs, batching, or cross-language schema interop (u64/BigInt edges, casing, optional/null, schema evolution). |
@@ -55,13 +56,14 @@ If the user's design language conflicts with any of these (e.g. "the broker", "t
 6. **Generate code from `apis.md`** — these templates are verified against the SDK source. Adapt the payload type and channel name; do not invent new methods.
 7. **If the task is "route to a specific kind of node"** (GPU box, machine with model X loaded, particular tenant), read `capabilities.md`. Capability filters replace topic-based routing for placement.
 8. **If the task is "ordered point-to-point" or "large payload with backpressure"**, read `streams.md`. The bus is fan-out + transient; per-peer streams are the right primitive when you need order + credit-grant flow control.
-9. **Wire the lifecycle correctly** — read `runtime.md` for the shutdown contract and async-runtime integration before plugging into the user's existing app. Always add a `shutdown` path. The ring buffer needs a clean drain.
-10. **Handle errors per `runtime.md`** — `Backpressure` is the only retry-safe error; everything else indicates state change, bug, or config issue.
-11. **Shape the payload using `payloads.md`** — small JSON events on the bus, references for large blobs, batched events for telemetry streams. The Schema-interop section covers cross-language traps (u64/BigInt, casing, optional/null, schema evolution).
-12. **Wire observability per `observability.md`** — under default backpressure modes, drops are silent. Always alert on `events_dropped`. The file lists stat fields per SDK and Prometheus/OTel wiring patterns.
-13. **Write tests using `testing.md`** — memory transport, two in-process nodes, subscribe-before-publish, clean shutdown in teardown.
-14. **If the user is migrating** from Kafka / NATS / Redis Streams / Pulsar, read `gotchas.md` first — broker assumptions will produce broken-but-compiling code.
-15. **If you're unsure about an API**, read the SDK source directly:
+9. **If the task is "request → typed reply" / "RPC over the mesh" / "I need a deadline + retry"**, read `nrpc.md`. The bus has no return-value mechanism; nRPC adds typed call / serve, deadlines, response streaming, and end-to-end cancellation as a convention layer on top. Don't reach for it for fire-and-forget broadcast.
+10. **Wire the lifecycle correctly** — read `runtime.md` for the shutdown contract and async-runtime integration before plugging into the user's existing app. Always add a `shutdown` path. The ring buffer needs a clean drain.
+11. **Handle errors per `runtime.md`** — `Backpressure` is the only retry-safe error; everything else indicates state change, bug, or config issue.
+12. **Shape the payload using `payloads.md`** — small JSON events on the bus, references for large blobs, batched events for telemetry streams. The Schema-interop section covers cross-language traps (u64/BigInt, casing, optional/null, schema evolution).
+13. **Wire observability per `observability.md`** — under default backpressure modes, drops are silent. Always alert on `events_dropped`. The file lists stat fields per SDK and Prometheus/OTel wiring patterns.
+14. **Write tests using `testing.md`** — memory transport, two in-process nodes, subscribe-before-publish, clean shutdown in teardown.
+15. **If the user is migrating** from Kafka / NATS / Redis Streams / Pulsar, read `gotchas.md` first — broker assumptions will produce broken-but-compiling code.
+16. **If you're unsure about an API**, read the SDK source directly:
    - Rust: `net/crates/net/sdk/src/` and `net/crates/net/sdk/examples/`
    - TypeScript: `net/crates/net/sdk-ts/src/`
    - Python: `net/crates/net/sdk-py/src/net_sdk/`
