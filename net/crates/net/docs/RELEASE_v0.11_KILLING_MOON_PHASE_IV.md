@@ -93,18 +93,22 @@ The 9 items the v0.10 release note flagged "queued for the next release" all lan
 - **`durable_rename` Windows behavior** — three regression tests pinning the `MoveFileExW(MOVEFILE_WRITE_THROUGH)` path on Windows and the POSIX fast-path passthrough.
 - **Identity envelope version-byte rejection** — pins that envelopes with any leading byte other than `IDENTITY_ENVELOPE_VERSION = 1` surface `EnvelopeError::UnknownVersion` and never reach the AEAD path.
 - **Mesh-audit regression coverage** — the heartbeat snapshot, `accept`/`start` SeqCst, routed-handshake atomic entry, NAT class/reflex coherence, idempotent re-subscribe, reliable flag propagation, loopback depth cap, and `addr_to_node` direct-upgrade refresh each carry a pinned regression test in `tests/mesh_audit.rs`.
+- **JetStream msg-id `sequence_start` per-shard monotonicity** — pins that within one bus instance, every shard's batches advance their `sequence_start` strictly monotonically AND gap-free (`seq_start[n+1] == seq_start[n] + len(events[n])`). A regression that introduced a gap would let `(process_nonce, shard, seq, i)` tuples be reused after the JetStream / Redis dedup window closes; an overlap would silently overlay a later batch on an earlier one's slot. Pinned by `bus::tests::sequence_start_is_per_shard_monotonic_and_gap_free`. The cross-restart variant (persistent `next_sequence` across process boots) remains feature-shaped and is not in this release; today's invariant relies on `process_nonce` rotating to disjoin the msg-id namespace.
+- **Manifest-pointer crash-injection** — 12 regression tests covering manifest codec round-trip + corruption rejection, brand-new-channel init, flat-layout migration, fallback when manifest is missing or torn, sweep of orphan newer / older generation directories, generation advancement + manifest atomicity, and recovery convergence in one open. Maps onto the 10-row crash-injection table in `docs/misc/REDEX_MANIFEST_POINTER_DESIGN.md`.
+
+---
+
+## Triage decisions recorded in code
+
+One audit item resolved as "no code change needed, but the rationale must live in code so a future contributor doesn't re-open the question":
+
+- **`apply_authoritative_grant` clamp ordering** — the audit recommended reordering the `tx_bytes_sent` bump and the `tx_credit_remaining` decrement. The current form uses a CAS-with-delta against `max_consumed_seen` and adds the delta to `tx_credit_remaining` via `fetch_update`; this composes atomically with the CAS in `try_acquire_tx_credit` and the `fetch_update` in `refund_tx_credit`. The audit's reorder presumed a `.store()`-based recompute from a racy snapshot of `tx_bytes_sent` — a shape the current code deliberately avoids. The rationale is documented in code at `adapter/net/session.rs::apply_authoritative_grant` and the codec-side abstract at `adapter/net/subprotocol/stream_window.rs::StreamWindow`.
 
 ---
 
 ## Known issues — queued for the next release
 
-The audit queue from `BUG_AUDIT_2026_05_03.md` is drained — every item is either fixed in this release, triaged-as-obsolete with a written reason, or explicitly deferred with a stated boundary. Specifically:
-
-- **#1 `compact_to` cross-rename atomicity — fixed.** The manifest-pointer rework lands in this release (see *Addressed → RedEX `compact_to` durability + atomicity* above). The pre-fix per-call durability hole on Windows is closed via `MoveFileExW(MOVEFILE_WRITE_THROUGH)`, and the cross-file mixed-state window is closed structurally by routing each generation through its own directory under a single atomic manifest-pointer flip.
-- **#39 JetStream msg-id `sequence_start` monotonicity — pinned by regression test.** The full persistent-sequence feature (msg-id durability across process restarts) is feature-shaped and remains future work; the within-process monotonicity invariant the per-process `process_nonce` relies on is now pinned by `bus::tests::sequence_start_is_per_shard_monotonic_and_gap_free`.
-- **#97 `apply_authoritative_grant` clamp ordering — no action required.** The audit's suggested reorder (bump `tx_bytes_sent` before decrementing `tx_credit_remaining`) conflicts with the credit-window invariant enforced by `try_acquire_tx_credit`. The current CAS-with-delta form correctly closes the race the `.store()`-based recompute approach left open; the rationale is documented in code at `adapter/net/session.rs::apply_authoritative_grant` and the codec-side abstract at `adapter/net/subprotocol/stream_window.rs`.
-
-The mesh-audit queue (`BUG_AUDIT_2026_05_03_MESH.md`) is fully drained. Both audit queues are now empty.
+Both audit queues (`BUG_AUDIT_2026_05_03.md` and `BUG_AUDIT_2026_05_03_MESH.md`) are drained. The next release will pick up structural feature work (`MigrationOrchestrator` placement-policy, persistent JetStream sequence numbering for cross-restart msg-id durability) rather than another bug-fix sweep.
 
 ---
 
