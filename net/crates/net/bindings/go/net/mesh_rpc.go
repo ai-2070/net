@@ -639,11 +639,24 @@ func (r *MeshRpc) CallStreaming(
 		stream.cancel = cancel
 		stream.watcherDone = make(chan struct{})
 		go func(s *RpcStream, watchCtx context.Context) {
-			defer close(s.watcherDone)
 			<-watchCtx.Done()
 			// Either ctx fired (user canceled) or Close() called
-			// our cancel(); both lead to the same action — and
-			// Close() is idempotent so the second-comer no-ops.
+			// our cancel(); both paths lead to s.Close().
+			//
+			// Signal watcherDone BEFORE calling Close — Close
+			// waits on watcherDone, so closing it after the call
+			// would self-deadlock when the watcher races to
+			// Close before any user-side Close. With this order:
+			//   - watcher reaches here, closes watcherDone, then
+			//     calls Close. The Close path observes
+			//     watcherDone already closed → its wait returns
+			//     immediately.
+			//   - A concurrent user-side Close races on the
+			//     `closed.Swap` flag (only one wins); whichever
+			//     loses no-ops. The winner blocks on watcherDone
+			//     until the watcher closes it just below — a
+			//     bounded wait of "watcher unblock latency."
+			close(s.watcherDone)
 			s.Close()
 		}(stream, watchCtx)
 	}
@@ -700,14 +713,15 @@ func (s *RpcStream) Grant(amount uint32) {
 
 // Close cancels the stream (best-effort CANCEL to the server) and
 // releases the C handle. Idempotent. Joins the ctx-cancel watcher
-// goroutine before returning so the user can drop this *RpcStream
-// reference immediately afterwards without a residual goroutine
-// still touching it.
+// goroutine (the one CallStreaming may have spawned) before
+// returning, so the user can drop this *RpcStream reference
+// immediately afterwards without a residual goroutine still
+// touching the freed FFI handle.
 //
-// One subtle case: when Close runs from inside the watcher
-// goroutine itself (because the user's ctx canceled), `cancel()`
-// is the watcher's own parent-ctx cancel — already firing. Skip
-// the watcherDone wait in that case to avoid self-deadlock.
+// Self-deadlock-safe: when Close runs from inside the watcher
+// itself (user-supplied ctx canceled → watcher woke → calls
+// Close), the watcher closes watcherDone *before* invoking Close,
+// so the wait below sees a closed channel and returns immediately.
 func (s *RpcStream) Close() {
 	if s.closed.Swap(true) {
 		return
@@ -717,27 +731,21 @@ func (s *RpcStream) Close() {
 	C.net_rpc_stream_free(s.handle)
 	s.handle = nil
 
-	// Trigger the watcher's exit (no-op if it never started or
-	// has already exited).
+	// Trigger the watcher's exit (no-op if it never started).
 	if s.cancel != nil {
 		s.cancel()
 	}
 
-	// Best-effort wait. If the watcher hasn't completed yet AND we
-	// aren't being called from inside it, block until it does. The
-	// `select` with a 250ms cap keeps a buggy watcher from wedging
-	// the caller forever — Close's contract is "after this returns,
-	// the FFI handle is released," not "the goroutine is gone come
-	// hell or high water." (For the common case the watcher exits
-	// within microseconds of cancel().)
+	// Wait for the watcher to acknowledge that it won't touch the
+	// stream anymore. Bounded by an internal cap so a buggy
+	// watcher (shouldn't happen — the goroutine is one line of
+	// our code) can't wedge a caller forever; Close's contract is
+	// "FFI handle released," and we honor that even on the
+	// degenerate path.
 	if s.watcherDone != nil {
 		select {
 		case <-s.watcherDone:
 		case <-time.After(250 * time.Millisecond):
-			// Bug: watcher didn't exit promptly. We can't unblock
-			// it from here without unsafe stunts; surface via a
-			// weak signal (the caller can grep logs for this).
-			// In practice this branch never fires.
 		}
 	}
 }
