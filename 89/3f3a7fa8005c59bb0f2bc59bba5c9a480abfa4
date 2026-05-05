@@ -1,0 +1,29 @@
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  cdf934b360f502d7 128-131,139-140,151,281-286,289,295-345
+net/crates/net/src/adapter/net/mesh.rs
+  cdf934b360f502d7 1080-1086,1523,4097-4112,5813-5830
+net/crates/net/docs/misc/NRPC_DESIGN.md
+  cdf934b360f502d7 23-29,31
+net/crates/net/tests/integration_nrpc_service_discovery.rs
+  cdf934b360f502d7 1-227
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "893f3a7fa8005c59bb0f2bc59bba5c9a480abfa4",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 9868,
+      "total_deletions": 4,
+      "accepted_lines": 344,
+      "overriden_lines": 0
+    }
+  }
+}
