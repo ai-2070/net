@@ -318,6 +318,36 @@ describe('CircuitBreaker', () => {
     expect(b.state()).toBe('closed')
     expect(b.consecutiveFailures()).toBe(0)
   })
+
+  it('rejects non-function failurePredicate at construction time', () => {
+    // Regression: a user-supplied non-function failurePredicate
+    // would previously deep-throw with a TypeError inside
+    // _recordOutcome. Validate eagerly at construction so the
+    // diagnostic points at the call site that misconfigured the
+    // breaker.
+    expect(
+      () =>
+        new CircuitBreaker({
+          // @ts-expect-error — intentionally wrong type
+          failurePredicate: 'not-a-fn',
+        }),
+    ).toThrow(TypeError)
+  })
+})
+
+describe('RetryPolicy validation', () => {
+  it('rejects non-function retryable at construction time', () => {
+    // Regression — a non-function retryable would previously
+    // deep-throw a TypeError inside runRetry. Eager validation
+    // surfaces the misuse at the policy construction site.
+    expect(
+      () =>
+        new RetryPolicy({
+          // @ts-expect-error — intentionally wrong type
+          retryable: 42,
+        }),
+    ).toThrow(TypeError)
+  })
 })
 
 // ============================================================================

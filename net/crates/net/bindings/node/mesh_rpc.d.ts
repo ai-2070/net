@@ -33,6 +33,35 @@ export interface ServeHandle {
 }
 
 /**
+ * Minimal structural shape of the raw napi MeshRpc that
+ * `TypedMeshRpc` wraps. Exposed primarily so test stubs can
+ * declare conformance without pulling in the full napi types
+ * surface. Real consumers should pass a `NetMesh` (via
+ * `fromMesh`) and let TypeScript infer the rest.
+ */
+export interface RawMeshRpc {
+  serve(service: string, handler: (req: Buffer) => Promise<Buffer>): ServeHandle
+  call(
+    targetNodeId: bigint,
+    service: string,
+    request: Buffer,
+    opts?: CallOptions,
+  ): Promise<Buffer>
+  callService(
+    service: string,
+    request: Buffer,
+    opts?: CallOptions,
+  ): Promise<Buffer>
+  callStreaming(
+    targetNodeId: bigint,
+    service: string,
+    request: Buffer,
+    opts?: CallOptions,
+  ): Promise<unknown>
+  findServiceNodes(service: string): bigint[]
+}
+
+/**
  * Typed wrapper around the raw napi `MeshRpc` class. Encodes /
  * decodes JSON at the binding boundary so the user works with
  * plain JS values; re-throws errors as `RpcError` subclasses
@@ -40,13 +69,13 @@ export interface ServeHandle {
  */
 export class TypedMeshRpc {
   /** Build a TypedMeshRpc against an existing NetMesh. */
-  static fromMesh(mesh: unknown): TypedMeshRpc
+  static fromMesh(mesh: object): TypedMeshRpc
 
   /** Build from an already-constructed raw MeshRpc. */
-  constructor(rawMeshRpc: unknown)
+  constructor(rawMeshRpc: RawMeshRpc)
 
   /** Underlying raw napi `MeshRpc` (Buffer surface). */
-  readonly raw: unknown
+  readonly raw: RawMeshRpc
 
   /**
    * Register a typed handler. Handler receives the decoded

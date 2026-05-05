@@ -431,7 +431,13 @@ class RetryPolicy {
     this.maxBackoffMs = Math.max(this.initialBackoffMs, merged.maxBackoffMs)
     this.backoffMultiplier = Math.max(1.0, merged.backoffMultiplier)
     this.jitter = !!merged.jitter
-    this.retryable = merged.retryable ?? defaultRetryable
+    const retryable = merged.retryable ?? defaultRetryable
+    if (typeof retryable !== 'function') {
+      throw new TypeError(
+        'RetryPolicy.retryable must be a function (received ' + typeof retryable + ')',
+      )
+    }
+    this.retryable = retryable
   }
 
   /**
@@ -591,7 +597,15 @@ class CircuitBreaker {
     this.failureThreshold = Math.max(1, merged.failureThreshold | 0)
     this.resetAfterMs = Math.max(0, merged.resetAfterMs)
     this.successThreshold = Math.max(1, merged.successThreshold | 0)
-    this.failurePredicate = merged.failurePredicate ?? defaultBreakerFailure
+    const predicate = merged.failurePredicate ?? defaultBreakerFailure
+    if (typeof predicate !== 'function') {
+      throw new TypeError(
+        'CircuitBreaker.failurePredicate must be a function (received ' +
+          typeof predicate +
+          ')',
+      )
+    }
+    this.failurePredicate = predicate
     this._state = STATE_CLOSED
     this._consecutiveFailures = 0
     this._consecutiveSuccesses = 0
@@ -622,32 +636,25 @@ class CircuitBreaker {
    * failure (or on rejection). When the breaker is `Open` within
    * its cooldown, throws `BreakerOpenError` without invoking
    * `op`.
+   *
+   * Both success and failure paths record the outcome through
+   * `_recordOutcome`, which is responsible for clearing
+   * `_probeInFlight` on the half-open-probe admission. A
+   * synchronous throw inside `op` (rare — `await` is always at
+   * `op`'s call site) is still routed through the catch arm.
    */
   async call(op) {
     const admission = this._tryAdmit()
     if (admission === 'reject') {
       throw new BreakerOpenError()
     }
-    // RAII guard equivalent: ensure probe_in_flight clears even
-    // if op throws synchronously (rare in JS but possible if op
-    // isn't actually async).
-    let armed = admission === 'half-open-probe'
     try {
       const value = await op()
       this._recordOutcome(admission, true, undefined)
-      armed = false
       return value
     } catch (e) {
       this._recordOutcome(admission, false, e)
-      armed = false
       throw e
-    } finally {
-      if (armed) {
-        // op rejected without us hitting either success/failure
-        // path (synchronous throw before the await would do this).
-        // Treat as a failed probe.
-        this._recordOutcome(admission, false, undefined)
-      }
     }
   }
 
