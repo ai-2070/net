@@ -22,6 +22,7 @@ mod config;
 mod envelope;
 mod error;
 mod meta;
+pub mod rpc;
 #[cfg(feature = "cortex")]
 mod watermark;
 
@@ -37,4 +38,11 @@ pub use error::CortexAdapterError;
 pub use meta::{
     compute_checksum, compute_checksum_with_meta, EventMeta, DISPATCH_RAW, EVENT_META_SIZE,
     FLAG_CAUSAL, FLAG_CONTINUITY_PROOF,
+};
+pub use rpc::{
+    request_wire_size, response_wire_size, RpcCodecError, RpcHeader, RpcRequestPayload,
+    RpcResponsePayload, RpcStatus, DISPATCH_RPC_CANCEL, DISPATCH_RPC_DEADLINE_EXCEEDED,
+    DISPATCH_RPC_REQUEST, DISPATCH_RPC_RESPONSE, FLAG_RPC_IDEMPOTENT, FLAG_RPC_PROPAGATE_TRACE,
+    FLAG_RPC_STREAMING_RESPONSE, MAX_RPC_BODY_LEN, MAX_RPC_HEADERS, MAX_RPC_HEADER_NAME_LEN,
+    MAX_RPC_HEADER_VALUE_LEN, MAX_RPC_SERVICE_NAME_LEN,
 };
