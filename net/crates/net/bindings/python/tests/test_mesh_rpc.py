@@ -47,6 +47,7 @@ from net.mesh_rpc import (
     RpcTimeoutError,
     RpcTransportError,
     TypedMeshRpc,
+    classify_error,
     default_breaker_failure,
     default_retryable,
     run_hedge,
@@ -101,14 +102,34 @@ def test_default_retryable_retries_timeout_and_transport() -> None:
 
 
 def test_default_retryable_server_error_status_classification() -> None:
-    # Internal (0x0006), Backpressure (0x0004), server-Timeout (0x0003) → retry
+    # Internal (0x0006), Backpressure (0x0004), server-Timeout (0x0003) → retry.
+    # Both legacy (`status 0x...`) and canonical (`status=0x...`)
+    # message shapes parse the same way — the regex tolerates both
+    # so a future formatter change doesn't silently break retry.
     assert default_retryable(_err("RpcServerError", "status 0x0006: oops")) is True
+    assert default_retryable(_err("RpcServerError", "status=0x0006 message=oops")) is True
     assert default_retryable(_err("RpcServerError", "status 0x0004: bp")) is True
+    assert default_retryable(_err("RpcServerError", "status=0x0004 message=bp")) is True
     assert default_retryable(_err("RpcServerError", "status 0x0003: timeout")) is True
-    # Application range (0x8000+) → skip
+    assert default_retryable(_err("RpcServerError", "status=0x0003 message=timeout")) is True
+    # Application range (0x8000+) → skip.
     assert default_retryable(_err("RpcServerError", "status 0x8001: app")) is False
+    assert default_retryable(_err("RpcServerError", "status=0x8001 message=app")) is False
     assert default_retryable(_err("RpcServerError", "status 0x8000: app")) is False
-    # NotFound (0x0001), Unauthorized (0x0002) → skip
+    # Canonical RPC binding format: `nrpc:server_error: status=0x... message=...`.
+    assert (
+        default_retryable(
+            _err("RpcServerError", "nrpc:server_error: status=0x0006 message=oops")
+        )
+        is True
+    )
+    assert (
+        default_retryable(
+            _err("RpcServerError", "nrpc:server_error: status=0x8001 message=app")
+        )
+        is False
+    )
+    # NotFound (0x0001), Unauthorized (0x0002) → skip.
     assert default_retryable(_err("RpcServerError", "status 0x0001: nf")) is False
     assert default_retryable(_err("RpcServerError", "status 0x0002: u")) is False
 
@@ -126,6 +147,48 @@ def test_default_breaker_failure_matches_default_retryable() -> None:
     ]
     for err, expected in cases:
         assert default_breaker_failure(err) is expected, repr(err)
+
+
+# =========================================================================
+# classify_error — canonical nrpc: prefix dispatch
+# =========================================================================
+
+
+def test_classify_error_recognizes_each_canonical_kind() -> None:
+    """Every kind produced by ``rpc_error_to_pyerr`` (Rust binding)
+    or ``BreakerOpenError`` (Python wrapper) must be recognized.
+    Drift here breaks every cross-binding fallback path that
+    discriminates on kind without ``isinstance``.
+    """
+    cases = [
+        ("nrpc:no_route: target=0x1 reason=x", "no_route"),
+        ("nrpc:timeout: elapsed_ms=200", "timeout"),
+        ("nrpc:server_error: status=0x8001 message=app", "server_error"),
+        ("nrpc:transport: connection error: x", "transport"),
+        ("nrpc:codec_encode: bad json", "codec_encode"),
+        ("nrpc:codec_decode: trailing", "codec_decode"),
+        ("nrpc:breaker_open: circuit breaker is open", "breaker_open"),
+    ]
+    for msg, kind in cases:
+        assert classify_error(Exception(msg)) == kind, msg
+
+
+def test_classify_error_returns_none_for_non_nrpc_messages() -> None:
+    assert classify_error(Exception("plain runtime error")) is None
+    assert classify_error(Exception("traversal: peer-not-reachable")) is None
+    assert classify_error(Exception("nrpc:")) is None  # no body
+    assert classify_error(Exception("nrpc:bogus_kind: foo")) is None
+
+
+def test_breaker_open_error_carries_canonical_prefix() -> None:
+    """``BreakerOpenError`` participates in the same kind-based
+    dispatch by carrying the canonical ``nrpc:breaker_open:``
+    prefix in its message — pinned because the Node binding's
+    breaker emits the same prefix and a divergence would split
+    cross-binding error handling."""
+    err = BreakerOpenError()
+    assert str(err).startswith("nrpc:breaker_open:")
+    assert classify_error(err) == "breaker_open"
 
 
 # =========================================================================

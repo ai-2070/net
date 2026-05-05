@@ -591,12 +591,31 @@ client_rpc.call_with_retry(target_node_id, "echo", {"hi": 1}, policy)
 
 ### Status codes + error model
 
-Every caller-side failure is a typed exception with a stable
-`nrpc:` prefix in the message. The `classify_error(e)` helper in
-`net.mesh_rpc` maps a raw `nrpc:`-prefixed exception into one of
-the typed subclasses above when discriminating without
-`isinstance` is awkward (e.g. fallback paths where the native
-module wasn't built).
+Every caller-side failure is a typed exception whose message
+carries the canonical `nrpc:<kind>: <detail>` prefix. The set of
+kinds is fixed by the cross-binding contract: `no_route`,
+`timeout`, `server_error`, `transport`, `codec_encode`,
+`codec_decode`, `breaker_open`. The `classify_error(e)` helper
+in `net.mesh_rpc` extracts the kind string from a caught
+exception's message — useful for fallback paths where
+discriminating without `isinstance` is awkward (e.g. when the
+native module wasn't built and every typed alias collapses to
+plain `Exception`):
+
+```python
+from net.mesh_rpc import classify_error
+
+try:
+    rpc.call(target, "echo", body, opts={"deadline_ms": 200})
+except Exception as e:
+    kind = classify_error(e)
+    if kind == "no_route":
+        ...      # capability index didn't surface a target
+    elif kind == "timeout":
+        ...      # caller-side deadline elapsed
+    elif kind == "server_error":
+        ...      # str(e) carries `status=0xNNNN message=...`
+```
 
 | Constant                       | Hex      | Meaning                                          |
 | ------------------------------ | -------- | ------------------------------------------------ |

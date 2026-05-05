@@ -123,24 +123,33 @@ create_exception!(
 // Helpers — convert inner RpcError to the matching Python exception.
 // ============================================================================
 
+/// Stable error-message prefix shared with every other binding.
+/// JS / Go / Python all emit `nrpc:<kind>: <detail>` so cross-
+/// binding consumers can match on a single regex. See
+/// `bindings/node/src/mesh_rpc.rs::ERR_NRPC_PREFIX` and
+/// `tests/cross_lang_nrpc/golden_vectors.json` for the contract.
+pub(crate) const ERR_NRPC_PREFIX: &str = "nrpc:";
+
 fn rpc_error_to_pyerr(err: InnerRpcError) -> PyErr {
     match err {
-        InnerRpcError::NoRoute { target, reason } => {
-            RpcNoRouteError::new_err(format!("no route to target 0x{target:x}: {reason}"))
+        InnerRpcError::NoRoute { target, reason } => RpcNoRouteError::new_err(format!(
+            "{ERR_NRPC_PREFIX}no_route: target=0x{target:x} reason={reason}"
+        )),
+        InnerRpcError::Timeout { elapsed_ms } => RpcTimeoutError::new_err(format!(
+            "{ERR_NRPC_PREFIX}timeout: elapsed_ms={elapsed_ms}"
+        )),
+        InnerRpcError::ServerError { status, message } => RpcServerError::new_err(format!(
+            "{ERR_NRPC_PREFIX}server_error: status=0x{status:04x} message={message}"
+        )),
+        InnerRpcError::Transport(e) => {
+            RpcTransportError::new_err(format!("{ERR_NRPC_PREFIX}transport: {e}"))
         }
-        InnerRpcError::Timeout { elapsed_ms } => {
-            RpcTimeoutError::new_err(format!("rpc timeout after {elapsed_ms}ms"))
-        }
-        InnerRpcError::ServerError { status, message } => {
-            RpcServerError::new_err(format!("server returned status 0x{status:04x}: {message}"))
-        }
-        InnerRpcError::Transport(e) => RpcTransportError::new_err(format!("transport: {e}")),
         InnerRpcError::Codec { direction, message } => {
-            let dir = match direction {
-                ::net::adapter::net::mesh_rpc::CodecDirection::Encode => "encode",
-                ::net::adapter::net::mesh_rpc::CodecDirection::Decode => "decode",
+            let kind = match direction {
+                ::net::adapter::net::mesh_rpc::CodecDirection::Encode => "codec_encode",
+                ::net::adapter::net::mesh_rpc::CodecDirection::Decode => "codec_decode",
             };
-            RpcCodecError::new_err(format!("codec {dir}: {message}"))
+            RpcCodecError::new_err(format!("{ERR_NRPC_PREFIX}{kind}: {message}"))
         }
     }
 }
@@ -543,29 +552,30 @@ mod tests {
     /// actually construct the `PyErr` outside the Python runtime
     /// (its Drop calls Python-extension symbols), so we test the
     /// pre-PyErr message-format helper inline.
+    ///
+    /// Format MUST match the Node binding's `nrpc_err_from_inner`
+    /// (`bindings/node/src/mesh_rpc.rs`) so the cross-language
+    /// `classify_error` parsers stay symmetrical.
     #[test]
     fn rpc_error_message_formats_are_stable() {
-        // Re-derive the per-variant format strings the same way
-        // `rpc_error_to_pyerr` does. Pinned because user code's
-        // `str(rpc_err)` reads these directly.
         let format = |err: InnerRpcError| -> String {
             match err {
                 InnerRpcError::NoRoute { target, reason } => {
-                    format!("no route to target 0x{target:x}: {reason}")
+                    format!("nrpc:no_route: target=0x{target:x} reason={reason}")
                 }
                 InnerRpcError::Timeout { elapsed_ms } => {
-                    format!("rpc timeout after {elapsed_ms}ms")
+                    format!("nrpc:timeout: elapsed_ms={elapsed_ms}")
                 }
                 InnerRpcError::ServerError { status, message } => {
-                    format!("server returned status 0x{status:04x}: {message}")
+                    format!("nrpc:server_error: status=0x{status:04x} message={message}")
                 }
-                InnerRpcError::Transport(e) => format!("transport: {e}"),
+                InnerRpcError::Transport(e) => format!("nrpc:transport: {e}"),
                 InnerRpcError::Codec { direction, message } => {
-                    let dir = match direction {
-                        CodecDirection::Encode => "encode",
-                        CodecDirection::Decode => "decode",
+                    let kind = match direction {
+                        CodecDirection::Encode => "codec_encode",
+                        CodecDirection::Decode => "codec_decode",
                     };
-                    format!("codec {dir}: {message}")
+                    format!("nrpc:{kind}: {message}")
                 }
             }
         };
@@ -575,38 +585,65 @@ mod tests {
                 target: 0xDEAD_BEEF,
                 reason: "no session".into(),
             }),
-            "no route to target 0xdeadbeef: no session"
+            "nrpc:no_route: target=0xdeadbeef reason=no session"
         );
         assert_eq!(
             format(InnerRpcError::Timeout { elapsed_ms: 200 }),
-            "rpc timeout after 200ms"
+            "nrpc:timeout: elapsed_ms=200"
         );
         assert_eq!(
             format(InnerRpcError::ServerError {
                 status: 0x8001,
                 message: "app error".into(),
             }),
-            "server returned status 0x8001: app error"
+            "nrpc:server_error: status=0x8001 message=app error"
         );
         assert_eq!(
             format(InnerRpcError::Transport(AdapterError::Connection(
                 "boom".into()
             ))),
-            "transport: connection error: boom"
+            "nrpc:transport: connection error: boom"
         );
         assert_eq!(
             format(InnerRpcError::Codec {
                 direction: CodecDirection::Encode,
                 message: "bad json".into(),
             }),
-            "codec encode: bad json"
+            "nrpc:codec_encode: bad json"
         );
         assert_eq!(
             format(InnerRpcError::Codec {
                 direction: CodecDirection::Decode,
                 message: "trailing".into(),
             }),
-            "codec decode: trailing"
+            "nrpc:codec_decode: trailing"
         );
+
+        // Every kind starts with the canonical prefix so the JS
+        // and Python `classify_error` parsers can match a single
+        // anchor. A regression to the legacy "no route to ..."
+        // format would silently fail every cross-binding compat
+        // test that asserts `nrpc:` is present.
+        for variant in [
+            InnerRpcError::NoRoute {
+                target: 1,
+                reason: "x".into(),
+            },
+            InnerRpcError::Timeout { elapsed_ms: 1 },
+            InnerRpcError::ServerError {
+                status: 0,
+                message: "x".into(),
+            },
+            InnerRpcError::Transport(AdapterError::Connection("x".into())),
+            InnerRpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: "x".into(),
+            },
+        ] {
+            assert!(
+                format(variant).starts_with("nrpc:"),
+                "every variant must carry the canonical nrpc: prefix"
+            );
+        }
     }
 }

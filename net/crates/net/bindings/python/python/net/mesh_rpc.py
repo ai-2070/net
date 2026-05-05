@@ -327,13 +327,73 @@ _STATUS_BACKPRESSURE = 0x0004
 _STATUS_TIMEOUT = 0x0003
 
 
+# Tolerates both ``status=0x...`` (the canonical Rust binding form
+# emitted by ``rpc_error_to_pyerr``) and the legacy ``status 0x...``
+# / ``status0x...`` shapes a future formatter change might produce.
+# Matched in the cross-binding compat suite — see
+# ``tests/test_cross_lang_compat.py::_parse_status``.
+_STATUS_PATTERN = "status\\s*=?\\s*0x([0-9a-fA-F]+)"
+
+
 def _parse_status_from_message(msg: str) -> Optional[int]:
     """Best-effort parse of ``status=0xNNNN`` from an
     ``RpcServerError`` message. Returns ``None`` if no match."""
     import re
 
-    m = re.search(r"status\s*0x([0-9a-fA-F]+)", msg)
+    m = re.search(_STATUS_PATTERN, msg)
     return int(m.group(1), 16) if m else None
+
+
+# Stable nRPC error-message prefix shared with the Node and Go
+# bindings: every error message produced by the Rust binding starts
+# with ``nrpc:<kind>:`` (see ``bindings/python/src/mesh_rpc.rs::
+# rpc_error_to_pyerr``). The set of kinds is fixed by the cross-
+# binding contract.
+_NRPC_PREFIX = "nrpc:"
+_NRPC_KINDS = frozenset({
+    "no_route",
+    "timeout",
+    "server_error",
+    "transport",
+    "codec_encode",
+    "codec_decode",
+    "breaker_open",
+})
+
+
+def classify_error(exc: BaseException) -> Optional[str]:
+    """Extract the nRPC error kind from a caught exception's message.
+
+    Returns one of the canonical kind strings (``"no_route"``,
+    ``"timeout"``, ``"server_error"``, ``"transport"``,
+    ``"codec_encode"``, ``"codec_decode"``, ``"breaker_open"``) or
+    ``None`` when the message doesn't carry an ``nrpc:`` prefix.
+
+    Useful for fallback paths where ``isinstance`` discrimination
+    is awkward — e.g. when the native module wasn't built and every
+    typed exception alias collapses to plain ``Exception``::
+
+        try:
+            rpc.call(...)
+        except Exception as e:
+            kind = classify_error(e)
+            if kind == "no_route":
+                ...
+            elif kind == "timeout":
+                ...
+
+    Mirrors the Node binding's ``classifyError`` in
+    ``bindings/node/errors.js``.
+    """
+    msg = str(exc)
+    if not msg.startswith(_NRPC_PREFIX):
+        return None
+    body = msg[len(_NRPC_PREFIX) :]
+    colon = body.find(":")
+    if colon == -1:
+        return None
+    kind = body[:colon].strip()
+    return kind if kind in _NRPC_KINDS else None
 
 
 def default_retryable(err: BaseException) -> bool:
@@ -518,10 +578,15 @@ def run_hedge(
 
 
 class BreakerOpenError(Exception):
-    """Raised by :meth:`CircuitBreaker.call` when state is Open."""
+    """Raised by :meth:`CircuitBreaker.call` when state is Open.
+
+    Message carries the canonical ``nrpc:breaker_open:`` prefix so
+    ``classify_error`` can dispatch on it the same way it does for
+    binding-side errors.
+    """
 
     def __init__(self) -> None:
-        super().__init__("circuit breaker is open")
+        super().__init__("nrpc:breaker_open: circuit breaker is open")
 
 
 _STATE_CLOSED = "closed"
@@ -650,6 +715,7 @@ __all__ = [
     "RetryPolicy",
     "TypedMeshRpc",
     "TypedRpcStream",
+    "classify_error",
     "default_breaker_failure",
     "default_retryable",
     "run_hedge",
