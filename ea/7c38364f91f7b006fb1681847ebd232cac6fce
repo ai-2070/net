@@ -1,0 +1,29 @@
+net/crates/net/bindings/go/rpc-ffi/Cargo.toml
+  cfca4517ad394ef2 1-40
+net/crates/net/bindings/go/net/mesh_rpc.go
+  cfca4517ad394ef2 1-621
+net/crates/net/Cargo.toml
+  cfca4517ad394ef2 8
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  cfca4517ad394ef2 1-779
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "ea7c38364f91f7b006fb1681847ebd232cac6fce",
+  "prompts": {
+    "cfca4517ad394ef2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c8c8999-2a05-4bfc-a843-35946dde9df4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1441,
+      "total_deletions": 1692,
+      "accepted_lines": 1538,
+      "overriden_lines": 0
+    }
+  }
+}
