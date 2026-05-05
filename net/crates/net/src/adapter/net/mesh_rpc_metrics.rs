@@ -388,7 +388,11 @@ impl RpcMetricsSnapshot {
             );
         }
 
-        // in_flight (gauge)
+        // in_flight (gauge). Clamp at 0 — the underlying counter
+        // can momentarily read negative under racing
+        // increment/decrement (documented in
+        // ServiceMetricsAtomic), and Prometheus rejects negative
+        // gauge values for samples typed as `gauge`.
         out.push_str("# HELP nrpc_in_flight_calls Currently-in-flight nRPC calls.\n");
         out.push_str("# TYPE nrpc_in_flight_calls gauge\n");
         for s in &self.services {
@@ -396,7 +400,7 @@ impl RpcMetricsSnapshot {
                 out,
                 "nrpc_in_flight_calls{{service=\"{}\"}} {}",
                 escape_label(&s.service),
-                s.in_flight
+                s.in_flight.max(0),
             );
         }
 
@@ -459,7 +463,8 @@ impl RpcMetricsSnapshot {
             );
         }
 
-        // handler_in_flight (gauge)
+        // handler_in_flight (gauge). Same clamp-at-0 rationale
+        // as nrpc_in_flight_calls.
         out.push_str(
             "# HELP nrpc_handler_in_flight Currently-running handler tasks for this service.\n",
         );
@@ -469,7 +474,7 @@ impl RpcMetricsSnapshot {
                 out,
                 "nrpc_handler_in_flight{{service=\"{}\"}} {}",
                 escape_label(&s.service),
-                s.handler_in_flight
+                s.handler_in_flight.max(0),
             );
         }
 
@@ -523,7 +528,11 @@ impl RpcMetricsSnapshot {
 }
 
 /// Escape a label value per Prometheus exposition format:
-/// backslash, double-quote, and newline get backslash-escaped.
+/// backslash, double-quote, newline, and carriage-return get
+/// backslash-escaped. The spec requires `\n` and `\\` and `\"`;
+/// we additionally escape `\r` to avoid CRLF/parser-version
+/// inconsistencies — some scrapers tolerate raw CR, others reject
+/// it as a malformed line terminator.
 fn escape_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -531,6 +540,7 @@ fn escape_label(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
             other => out.push(other),
         }
     }
@@ -688,6 +698,40 @@ mod tests {
         assert_eq!(escape_label("simple"), "simple");
         assert_eq!(escape_label(r#"has"quote"#), r#"has\"quote"#);
         assert_eq!(escape_label("has\\bs"), "has\\\\bs");
+        // CR + LF both get escaped — some Prometheus parsers
+        // tolerate raw CR but stricter scrapers reject it as a
+        // malformed line terminator.
+        assert_eq!(escape_label("line1\nline2"), "line1\\nline2");
+        assert_eq!(escape_label("dos\r\nstyle"), "dos\\r\\nstyle");
+    }
+
+    /// Regression: the in_flight gauge can momentarily read
+    /// negative under racing increment/decrement (a Drop runs
+    /// before its matching new(), or a snapshot interleaves with
+    /// a Drop). Prometheus rejects negative values for samples
+    /// typed as `gauge`, so the formatter must clamp at 0.
+    #[test]
+    fn prometheus_text_clamps_negative_gauge() {
+        let r = RpcMetricsRegistry::new();
+        let m = r.for_service("clamp");
+        // Force the gauge negative to simulate the racing-Drop case.
+        m.in_flight.store(-3, Ordering::Relaxed);
+        m.handler_in_flight.store(-7, Ordering::Relaxed);
+        let snap = r.snapshot();
+        let txt = snap.prometheus_text();
+        assert!(
+            txt.contains("nrpc_in_flight_calls{service=\"clamp\"} 0"),
+            "must clamp negative caller-side gauge to 0; got:\n{txt}",
+        );
+        assert!(
+            txt.contains("nrpc_handler_in_flight{service=\"clamp\"} 0"),
+            "must clamp negative server-side gauge to 0; got:\n{txt}",
+        );
+        // Sanity: a positive value is emitted as-is.
+        m.in_flight.store(5, Ordering::Relaxed);
+        let snap = r.snapshot();
+        let txt = snap.prometheus_text();
+        assert!(txt.contains("nrpc_in_flight_calls{service=\"clamp\"} 5"));
     }
 
     #[test]
