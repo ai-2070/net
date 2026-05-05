@@ -1105,6 +1105,10 @@ impl RedexFold<()> for RpcServerFold {
                     None
                 };
                 let metrics = self.metrics.clone();
+                // Keep a probe handle so the spawned task can detect
+                // a CANCEL that fired during handler execution and
+                // override its response with `RpcStatus::Cancelled`.
+                let cancel_probe = cancellation.clone();
                 tokio::spawn(async move {
                     // Server-side metrics: count this invocation;
                     // bump in_flight; time the handler; tally
@@ -1146,36 +1150,56 @@ impl RedexFold<()> for RpcServerFold {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    let resp = match outcome {
-                        Ok(Ok(payload)) => payload,
-                        Ok(Err(RpcHandlerError::Application { code, message })) => {
-                            RpcResponsePayload {
-                                status: RpcStatus::Application(code),
-                                headers: vec![],
-                                body: message.into_bytes(),
-                            }
-                        }
-                        Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
-                            status: RpcStatus::Internal,
+                    // CANCEL-wins ordering: if the cancellation
+                    // token fired at any point during handler
+                    // execution, override the handler's outcome
+                    // with `RpcStatus::Cancelled` so the caller
+                    // (or hedge primary, retry layer, etc.) sees
+                    // the documented `Cancelled` status code rather
+                    // than whatever the handler happened to return
+                    // before / despite cancellation. A cooperative
+                    // handler that observes the token and bails
+                    // early gets the same Cancelled framing as a
+                    // handler that ignored cancellation and ran to
+                    // completion — the caller's view is uniform.
+                    let resp = if cancel_probe.is_cancelled() {
+                        RpcResponsePayload {
+                            status: RpcStatus::Cancelled,
                             headers: vec![],
-                            body: message.into_bytes(),
-                        },
-                        Err(panic) => {
-                            let panic_msg = panic
-                                .downcast_ref::<&'static str>()
-                                .map(|s| s.to_string())
-                                .or_else(|| panic.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "<non-string panic>".into());
-                            tracing::error!(
-                                caller_origin = format!("{:#x}", caller_origin),
-                                call_id,
-                                panic = %panic_msg,
-                                "rpc server handler panicked",
-                            );
-                            RpcResponsePayload {
+                            body: b"server observed CANCEL during handler execution".to_vec(),
+                        }
+                    } else {
+                        match outcome {
+                            Ok(Ok(payload)) => payload,
+                            Ok(Err(RpcHandlerError::Application { code, message })) => {
+                                RpcResponsePayload {
+                                    status: RpcStatus::Application(code),
+                                    headers: vec![],
+                                    body: message.into_bytes(),
+                                }
+                            }
+                            Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
                                 status: RpcStatus::Internal,
                                 headers: vec![],
-                                body: format!("handler panicked: {panic_msg}").into_bytes(),
+                                body: message.into_bytes(),
+                            },
+                            Err(panic) => {
+                                let panic_msg = panic
+                                    .downcast_ref::<&'static str>()
+                                    .map(|s| s.to_string())
+                                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "<non-string panic>".into());
+                                tracing::error!(
+                                    caller_origin = format!("{:#x}", caller_origin),
+                                    call_id,
+                                    panic = %panic_msg,
+                                    "rpc server handler panicked",
+                                );
+                                RpcResponsePayload {
+                                    status: RpcStatus::Internal,
+                                    headers: vec![],
+                                    body: format!("handler panicked: {panic_msg}").into_bytes(),
+                                }
                             }
                         }
                     };
@@ -1189,7 +1213,12 @@ impl RedexFold<()> for RpcServerFold {
                 }
                 // Idempotent — CANCEL for an unknown call_id (e.g.
                 // a CANCEL that races the handler's completion) is
-                // a no-op rather than an error.
+                // a no-op rather than an error. The spawned handler
+                // task observes `cancel_probe.is_cancelled()` after
+                // its future resolves and overrides the response
+                // with `RpcStatus::Cancelled` so the caller sees a
+                // documented status code rather than the handler's
+                // accidental Ok / Internal payload.
             }
             // RESPONSE / DEADLINE_EXCEEDED are server-emitted; if
             // the server's own fold sees them (e.g. from a replay)
@@ -1396,6 +1425,11 @@ impl RedexFold<()> for RpcServerStreamingFold {
                     None
                 };
                 let metrics = self.metrics.clone();
+                // See unary fold for rationale — clone the
+                // cancellation handle so the spawned task can probe
+                // it after the handler returns and override the
+                // terminal frame with `RpcStatus::Cancelled`.
+                let cancel_probe = cancellation.clone();
                 tokio::spawn(async move {
                     if let Some(m) = metrics.as_ref() {
                         m.handler_invocations_total
@@ -1487,44 +1521,56 @@ impl RedexFold<()> for RpcServerStreamingFold {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    // Emit the terminal frame.
-                    let terminal = match outcome {
-                        Ok(Ok(())) => RpcResponsePayload {
-                            status: RpcStatus::Ok,
-                            headers: vec![(
-                                HEADER_NRPC_STREAMING.to_string(),
-                                HEADER_NRPC_STREAMING_END.to_vec(),
-                            )],
-                            body: vec![],
-                        },
-                        Ok(Err(RpcHandlerError::Application { code, message })) => {
-                            RpcResponsePayload {
-                                status: RpcStatus::Application(code),
-                                headers: vec![],
-                                body: message.into_bytes(),
-                            }
-                        }
-                        Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
-                            status: RpcStatus::Internal,
+                    // Emit the terminal frame. CANCEL-wins ordering
+                    // matches the unary fold: if the cancellation
+                    // token fired during execution, override the
+                    // handler's terminal with `RpcStatus::Cancelled`.
+                    let terminal = if cancel_probe.is_cancelled() {
+                        RpcResponsePayload {
+                            status: RpcStatus::Cancelled,
                             headers: vec![],
-                            body: message.into_bytes(),
-                        },
-                        Err(panic) => {
-                            let panic_msg = panic
-                                .downcast_ref::<&'static str>()
-                                .map(|s| s.to_string())
-                                .or_else(|| panic.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "<non-string panic>".into());
-                            tracing::error!(
-                                caller_origin = format!("{:#x}", caller_origin),
-                                call_id,
-                                panic = %panic_msg,
-                                "rpc streaming server handler panicked",
-                            );
-                            RpcResponsePayload {
+                            body: b"server observed CANCEL during streaming handler execution"
+                                .to_vec(),
+                        }
+                    } else {
+                        match outcome {
+                            Ok(Ok(())) => RpcResponsePayload {
+                                status: RpcStatus::Ok,
+                                headers: vec![(
+                                    HEADER_NRPC_STREAMING.to_string(),
+                                    HEADER_NRPC_STREAMING_END.to_vec(),
+                                )],
+                                body: vec![],
+                            },
+                            Ok(Err(RpcHandlerError::Application { code, message })) => {
+                                RpcResponsePayload {
+                                    status: RpcStatus::Application(code),
+                                    headers: vec![],
+                                    body: message.into_bytes(),
+                                }
+                            }
+                            Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
                                 status: RpcStatus::Internal,
                                 headers: vec![],
-                                body: format!("handler panicked: {panic_msg}").into_bytes(),
+                                body: message.into_bytes(),
+                            },
+                            Err(panic) => {
+                                let panic_msg = panic
+                                    .downcast_ref::<&'static str>()
+                                    .map(|s| s.to_string())
+                                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "<non-string panic>".into());
+                                tracing::error!(
+                                    caller_origin = format!("{:#x}", caller_origin),
+                                    call_id,
+                                    panic = %panic_msg,
+                                    "rpc streaming server handler panicked",
+                                );
+                                RpcResponsePayload {
+                                    status: RpcStatus::Internal,
+                                    headers: vec![],
+                                    body: format!("handler panicked: {panic_msg}").into_bytes(),
+                                }
                             }
                         }
                     };
@@ -2402,9 +2448,12 @@ mod tests {
             .await
         );
         fold.apply(&rpc_cancel_event(1, 42), &mut ()).unwrap();
-        // The cancellation is observed by the handler; it returns
-        // `Internal("cancelled by caller")` which the fold encodes
-        // as RpcStatus::Internal in the response.
+        // The cancellation is observed by the handler. Even though
+        // the handler returns `Internal("cancelled by caller")`,
+        // the fold's CANCEL-wins ordering overrides the response
+        // with `RpcStatus::Cancelled` so the caller sees the
+        // documented status code rather than the handler's
+        // accidental Internal payload.
         assert!(
             wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
             "handler should observe cancellation and emit response"
@@ -2415,8 +2464,72 @@ mod tests {
         );
         let captured = captured.lock();
         assert_eq!(captured.len(), 1);
+        let (_, _, resp) = &captured[0];
+        assert_eq!(
+            resp.status,
+            RpcStatus::Cancelled,
+            "CANCEL must override handler outcome with RpcStatus::Cancelled"
+        );
         // CANCEL also removes the in-flight entry directly.
         // Handler completion removes it again (idempotent).
+        assert!(fold.in_flight_keys().is_empty());
+    }
+
+    /// Regression: a CANCEL that fires while the handler is mid-
+    /// flight must override the handler's outcome with
+    /// `RpcStatus::Cancelled` even when the handler ignores
+    /// cancellation and returns `Ok(...)`. Without this, a caller
+    /// who cancelled would see the handler's accidental success
+    /// payload and could not tell whether their CANCEL won.
+    #[tokio::test]
+    async fn server_fold_cancel_overrides_handler_ok_with_cancelled_status() {
+        struct IgnoresCancellation;
+        #[async_trait::async_trait]
+        impl RpcHandler for IgnoresCancellation {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                // Sleep long enough for the test to send CANCEL,
+                // then return Ok regardless. This models a handler
+                // that doesn't `select!` on `ctx.cancellation`.
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: b"finished despite cancellation".to_vec(),
+                })
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(Arc::new(IgnoresCancellation), emit);
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(7, 11, req), &mut ()).unwrap();
+        // Wait until the handler is parked, then send CANCEL well
+        // before the handler's sleep elapses.
+        assert!(
+            wait_until(
+                || fold.in_flight_keys().contains(&(7, 11)),
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        fold.apply(&rpc_cancel_event(7, 11), &mut ()).unwrap();
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "handler should complete and emit response"
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1);
+        let (_, _, resp) = &captured[0];
+        assert_eq!(
+            resp.status,
+            RpcStatus::Cancelled,
+            "handler that returned Ok despite CANCEL must surface as Cancelled"
+        );
         assert!(fold.in_flight_keys().is_empty());
     }
 

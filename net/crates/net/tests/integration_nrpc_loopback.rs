@@ -336,12 +336,11 @@ async fn nrpc_loopback_cancellation_flows_to_handler() {
         .expect("call must complete after cancel within 5s")
         .expect("task must not panic")
         .expect("oneshot delivers");
-    assert_eq!(resp.status, RpcStatus::Internal);
-    assert!(
-        String::from_utf8_lossy(&resp.body).contains("cancelled by caller"),
-        "expected cancel diagnostic, got {:?}",
-        String::from_utf8_lossy(&resp.body),
-    );
+    // CANCEL-wins: even though the handler returns
+    // `Internal("cancelled by caller")`, the server fold overrides
+    // the response with `RpcStatus::Cancelled` so the caller sees
+    // the documented status code.
+    assert_eq!(resp.status, RpcStatus::Cancelled);
 }
 
 /// Application errors surface end-to-end. Handler returns
