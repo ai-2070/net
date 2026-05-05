@@ -15,7 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
@@ -115,22 +115,26 @@ func CallWithRetry(ctx context.Context, call CallFn, policy RetryPolicy) ([]byte
 }
 
 // jitter applies a `[1 - frac, 1 + frac]` multiplier to `d`. Clamps
-// to a non-negative duration.
+// to a non-negative duration. Uses `math/rand/v2` (goroutine-safe,
+// not deprecated) — jitter is not security-relevant.
 func jitter(d time.Duration, frac float64) time.Duration {
 	if frac <= 0 {
 		return d
 	}
 	span := 2 * frac
-	mult := 1 - frac + rand.Float64()*span //nolint:gosec // jitter, not crypto
+	mult := 1 - frac + rand.Float64()*span
 	if mult < 0 {
 		mult = 0
 	}
 	return time.Duration(float64(d) * mult)
 }
 
-// nextBackoff returns `min(prev * mult, cap)`, clamping in case of
-// overflow. `cap == 0` disables the cap.
-func nextBackoff(prev time.Duration, mult float64, cap time.Duration) time.Duration {
+// nextBackoff returns `min(prev * mult, maxCap)`, clamping in case
+// of overflow. `maxCap == 0` disables the cap.
+//
+// Parameter named `maxCap` rather than `cap` to avoid shadowing the
+// `cap` builtin — readers expecting the builtin would misread.
+func nextBackoff(prev time.Duration, mult float64, maxCap time.Duration) time.Duration {
 	if mult <= 0 {
 		return prev
 	}
@@ -139,8 +143,8 @@ func nextBackoff(prev time.Duration, mult float64, cap time.Duration) time.Durat
 		// overflow protection
 		next = math.MaxInt64
 	}
-	if cap > 0 && next > cap {
-		return cap
+	if maxCap > 0 && next > maxCap {
+		return maxCap
 	}
 	return next
 }
@@ -185,6 +189,18 @@ func DefaultHedgePolicy() HedgePolicy {
 func CallWithHedge(ctx context.Context, call CallFn, policy HedgePolicy) ([]byte, error) {
 	if policy.MaxParallel < 1 {
 		return nil, fmt.Errorf("HedgePolicy.MaxParallel must be >= 1, got %d", policy.MaxParallel)
+	}
+	if policy.HedgeDelay <= 0 && policy.MaxParallel > 1 {
+		// `HedgeDelay == 0` collapses the wait between hedges into
+		// a `time.Timer(0)` that fires synchronously, busy-firing
+		// the next hedge until `MaxParallel` is hit. Reject
+		// upfront — the user wanted "fire all in parallel" or
+		// they wanted a cadence; either way `0` is a misuse, and
+		// the Python wrapper validates the same way.
+		return nil, fmt.Errorf(
+			"HedgePolicy.HedgeDelay must be > 0 when MaxParallel > 1, got %s",
+			policy.HedgeDelay,
+		)
 	}
 	type result struct {
 		resp []byte
