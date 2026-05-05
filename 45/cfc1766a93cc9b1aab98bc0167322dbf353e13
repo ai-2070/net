@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  cfca4517ad394ef2 1088-1113,1426-1465,2227,2557-2632
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "45cfc1766a93cc9b1aab98bc0167322dbf353e13",
+  "prompts": {
+    "cfca4517ad394ef2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c8c8999-2a05-4bfc-a843-35946dde9df4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3232,
+      "total_deletions": 0,
+      "accepted_lines": 143,
+      "overriden_lines": 0
+    }
+  }
+}
