@@ -1,0 +1,27 @@
+net/crates/net/docs/misc/NRPC_DESIGN.md
+  cdf934b360f502d7 76-82
+net/crates/net/sdk/tests/mesh_rpc_hedge.rs
+  cdf934b360f502d7 1-211
+net/crates/net/sdk/src/mesh_rpc_resilience.rs
+  cdf934b360f502d7 9-12,289-544
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "7ba6c8340e22dde27604c83e597f9e2b333d02b7",
+  "prompts": {
+    "cdf934b360f502d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77cc21a0-5efc-4af5-a723-5fce6c81e36f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 499,
+      "total_deletions": 21,
+      "accepted_lines": 478,
+      "overriden_lines": 0
+    }
+  }
+}
