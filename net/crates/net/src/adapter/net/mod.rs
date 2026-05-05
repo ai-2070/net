@@ -43,6 +43,7 @@ mod crypto;
 mod failure;
 pub mod identity;
 mod mesh;
+pub mod mesh_rpc;
 #[cfg(feature = "netdb")]
 pub mod netdb;
 mod pool;

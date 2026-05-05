@@ -1061,6 +1061,22 @@ pub struct MeshNode {
     /// branch entirely.
     rpc_inbound_dispatchers:
         Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
+    /// Pending oneshots for in-flight `Mesh::call` invocations.
+    /// Shared with the per-Mesh `RpcClientFold` so RESPONSE events
+    /// arriving on reply channels complete the right call's
+    /// awaiting future.
+    rpc_client_pending:
+        Arc<crate::adapter::net::cortex::RpcClientPending>,
+    /// Per-caller monotonic call id allocator. Used as the
+    /// `EventMeta::seq_or_ts` correlation id on outgoing REQUEST
+    /// events.
+    rpc_next_call_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Tracks `(target_node_id, service)` pairs we've already
+    /// established a reply-channel subscription for. `Mesh::call`
+    /// consults this to skip the round-trip subscribe on
+    /// subsequent calls to the same (target, service).
+    rpc_reply_subscriptions:
+        Arc<parking_lot::Mutex<Vec<(u64, String)>>>,
     /// Optional migration subprotocol handler — same `ArcSwapOption`
     /// surface as on `MeshNode`, propagated into the dispatch
     /// context so the packet-receive loop stays lock-free.
@@ -1492,6 +1508,11 @@ impl MeshNode {
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
             rpc_inbound_dispatchers: Arc::new(DashMap::new()),
+            rpc_client_pending: Arc::new(
+                crate::adapter::net::cortex::RpcClientPending::new(),
+            ),
+            rpc_next_call_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            rpc_reply_subscriptions: Arc::new(parking_lot::Mutex::new(Vec::new())),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             pending_direct_initiators,
@@ -4033,6 +4054,38 @@ impl MeshNode {
             .map(|(_, v)| v)
     }
 
+    /// Per-Mesh shared `RpcClientPending` — accessor for the
+    /// `mesh_rpc::Mesh::call` glue. Pending oneshots awaiting
+    /// RESPONSE events live here.
+    pub(super) fn rpc_client_pending_arc(
+        &self,
+    ) -> Arc<crate::adapter::net::cortex::RpcClientPending> {
+        self.rpc_client_pending.clone()
+    }
+
+    /// Per-Mesh monotonic call-id allocator. Accessor for
+    /// `mesh_rpc::Mesh::call`.
+    pub(super) fn rpc_next_call_id_arc(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.rpc_next_call_id.clone()
+    }
+
+    /// Tracks already-established (target, service) reply
+    /// subscriptions. Accessor for `mesh_rpc::Mesh::call`'s
+    /// lazy-subscribe path.
+    pub(super) fn rpc_reply_subscriptions_arc(
+        &self,
+    ) -> Arc<parking_lot::Mutex<Vec<(u64, String)>>> {
+        self.rpc_reply_subscriptions.clone()
+    }
+
+    /// This node's `origin_hash` (8-byte BLAKE2s of the entity
+    /// public key). Accessor for `mesh_rpc::Mesh::serve_rpc` /
+    /// `Mesh::call` to stamp on outgoing REQUEST / RESPONSE meta
+    /// headers.
+    pub(super) fn public_key_origin_hash(&self) -> u64 {
+        self.identity.entity_id().origin_hash()
+    }
+
     /// Install a `ChannelConfigRegistry` whose `can_subscribe` /
     /// `can_publish` rules are consulted for incoming Subscribe
     /// messages.
@@ -5530,7 +5583,7 @@ impl MeshNode {
     /// ordering holds within a session. Hash collisions between channels
     /// are possible but harmless here — streams are opaque u64 to the
     /// transport and have no ACL meaning.
-    fn publish_stream_id(channel: &ChannelId) -> u64 {
+    pub(super) fn publish_stream_id(channel: &ChannelId) -> u64 {
         // Place channel hash in the low 16 bits; the upper bits stay zero
         // so that channel-keyed publisher streams don't alias the common
         // subprotocol range (0x0400..0x0A00).
@@ -5540,7 +5593,12 @@ impl MeshNode {
     /// Send one per-peer leg of a publish. Reuses the same packet-build
     /// path as `send_on_stream`, with an explicit stream opened per
     /// `(peer, channel)` pair.
-    async fn publish_to_peer(
+    /// Direct unicast publish of `events` to `peer_node_id` on the
+    /// channel identified by `channel_hash`. Used by `Mesh::publish`
+    /// (which routes via the subscriber roster) and by the
+    /// `mesh_rpc` glue (which knows the target directly and bypasses
+    /// the roster).
+    pub(super) async fn publish_to_peer(
         &self,
         peer_node_id: u64,
         channel_hash: u16,
