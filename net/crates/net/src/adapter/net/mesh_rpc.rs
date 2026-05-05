@@ -462,11 +462,13 @@ impl MeshNode {
 
         // Build the server fold and wrap it in an Arc<Mutex<...>>
         // so the bridge task can drive it (the trait takes
-        // `&mut self`).
-        let fold = Arc::new(Mutex::new(RpcServerFold::new(
-            handler as Arc<dyn RpcHandler>,
-            emit,
-        )));
+        // `&mut self`). Attach the per-service metrics handle so
+        // the spawned handler tasks bump server-side counters.
+        let metrics_handle = self.rpc_metrics_arc().for_service(service);
+        let fold = Arc::new(Mutex::new(
+            RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit)
+                .with_metrics(metrics_handle),
+        ));
 
         // Register the inbound dispatcher. Push into the mpsc;
         // the bridge task does the actual fold work.
@@ -572,10 +574,14 @@ impl MeshNode {
                 })
             });
 
-        let fold = Arc::new(Mutex::new(RpcServerStreamingFold::new(
-            handler as Arc<dyn RpcStreamingHandler>,
-            emit,
-        )));
+        // Attach per-service metrics so the spawned handler tasks
+        // + pump task bump server-side counters (including the
+        // streaming-only `streaming_chunks_emitted_total`).
+        let metrics_handle = self.rpc_metrics_arc().for_service(service);
+        let fold = Arc::new(Mutex::new(
+            RpcServerStreamingFold::new(handler as Arc<dyn RpcStreamingHandler>, emit)
+                .with_metrics(metrics_handle),
+        ));
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });

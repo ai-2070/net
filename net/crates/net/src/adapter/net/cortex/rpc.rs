@@ -894,6 +894,14 @@ pub struct RpcServerFold {
     /// remove their own entries without going back through the
     /// fold.
     in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    /// Optional per-service metrics handle. When `Some`, the
+    /// spawned handler task bumps `handler_invocations_total` /
+    /// `handler_in_flight` / `handler_panics_total` and records
+    /// per-task wall-clock durations. `None` → no metrics
+    /// (test-only path; production `Mesh::serve_rpc` always
+    /// supplies one).
+    metrics:
+        Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
     /// Optional clock override for tests. `None` → real wall-clock
     /// `unix_nanos`. `Some(...)` → fixed value, lets tests pin
     /// deadline-already-passed behavior without sleeping.
@@ -906,14 +914,30 @@ impl RpcServerFold {
     /// callback that publishes RESPONSE events to the caller's
     /// reply channel — `Mesh::serve_rpc` wires this to the
     /// publisher for `<service>.replies.<caller_origin>`.
+    /// Constructed without a metrics handle; production callers
+    /// chain `.with_metrics(...)` to opt into per-service
+    /// counters.
     pub fn new(handler: Arc<dyn RpcHandler>, emit: RpcResponseEmitter) -> Self {
         Self {
             handler,
             emit,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            metrics: None,
             #[cfg(test)]
             test_now_ns: None,
         }
+    }
+
+    /// Attach a per-service metrics handle. Hooks the spawned
+    /// handler task to bump `handler_invocations_total`, balance
+    /// `handler_in_flight`, count panics, and record handler
+    /// duration into the histogram.
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Test-only: pin the clock the fold uses for deadline
@@ -1019,7 +1043,20 @@ impl RedexFold<()> for RpcServerFold {
                 } else {
                     None
                 };
+                let metrics = self.metrics.clone();
                 tokio::spawn(async move {
+                    // Server-side metrics: count this invocation;
+                    // bump in_flight; time the handler; tally
+                    // panics. Only fires when a metrics handle was
+                    // attached via `with_metrics(...)` — test-only
+                    // folds construct without one.
+                    if let Some(m) = metrics.as_ref() {
+                        m.handler_invocations_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        m.handler_in_flight
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let handler_started = std::time::Instant::now();
                     let ctx = RpcContext {
                         caller_origin,
                         call_id,
@@ -1035,11 +1072,20 @@ impl RedexFold<()> for RpcServerFold {
                     // accept the assertion because the handler's
                     // state is untouched on panic (we just don't
                     // observe its in-progress mutations).
-                    let resp = match futures::FutureExt::catch_unwind(
+                    let outcome = futures::FutureExt::catch_unwind(
                         std::panic::AssertUnwindSafe(handler.call(ctx)),
                     )
-                    .await
-                    {
+                    .await;
+                    if let Some(m) = metrics.as_ref() {
+                        m.handler_in_flight
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        m.record_handler_duration(handler_started.elapsed());
+                        if outcome.is_err() {
+                            m.handler_panics_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    let resp = match outcome {
                         Ok(Ok(payload)) => payload,
                         Ok(Err(RpcHandlerError::Application { code, message })) => {
                             RpcResponsePayload {
@@ -1159,6 +1205,12 @@ pub struct RpcServerStreamingFold {
     handler: Arc<dyn RpcStreamingHandler>,
     emit: RpcAsyncResponseEmitter,
     in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    /// Optional per-service metrics handle. Same shape as
+    /// `RpcServerFold::metrics`; the streaming fold ALSO bumps
+    /// `streaming_chunks_emitted_total` from the pump task on
+    /// every chunk.
+    metrics:
+        Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
 }
 
 impl RpcServerStreamingFold {
@@ -1176,7 +1228,21 @@ impl RpcServerStreamingFold {
             handler,
             emit,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            metrics: None,
         }
+    }
+
+    /// Attach a per-service metrics handle. Hooks the spawned
+    /// handler task to bump `handler_invocations_total` /
+    /// `handler_in_flight` / `handler_panics_total` /
+    /// `handler_duration_*`, and the pump task to bump
+    /// `streaming_chunks_emitted_total` per emitted chunk.
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Test-only: snapshot of the in-flight call set.
@@ -1246,7 +1312,15 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 } else {
                     None
                 };
+                let metrics = self.metrics.clone();
                 tokio::spawn(async move {
+                    if let Some(m) = metrics.as_ref() {
+                        m.handler_invocations_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        m.handler_in_flight
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let handler_started = std::time::Instant::now();
                     let ctx = RpcContext {
                         caller_origin,
                         call_id,
@@ -1261,8 +1335,13 @@ impl RedexFold<()> for RpcServerStreamingFold {
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
                     let sink = RpcResponseSink { inner: tx };
                     let pump_emit = emit.clone();
+                    let pump_metrics = metrics.clone();
                     let pump = tokio::spawn(async move {
                         while let Some(chunk) = rx.recv().await {
+                            if let Some(m) = pump_metrics.as_ref() {
+                                m.streaming_chunks_emitted_total
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             let resp = RpcResponsePayload {
                                 status: RpcStatus::Ok,
                                 headers: vec![(
@@ -1293,6 +1372,15 @@ impl RedexFold<()> for RpcServerStreamingFold {
                     // catch_unwind). Wait for the pump to drain
                     // any final in-flight chunks.
                     let _ = pump.await;
+                    if let Some(m) = metrics.as_ref() {
+                        m.handler_in_flight
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        m.record_handler_duration(handler_started.elapsed());
+                        if outcome.is_err() {
+                            m.handler_panics_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     // Emit the terminal frame.
                     let terminal = match outcome {
                         Ok(Ok(())) => RpcResponsePayload {

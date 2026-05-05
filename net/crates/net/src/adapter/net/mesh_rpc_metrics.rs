@@ -35,24 +35,62 @@ pub const DEFAULT_LATENCY_BUCKETS_SECS: &[f64] = &[
 const N_BUCKETS: usize = 12; // = DEFAULT_LATENCY_BUCKETS_SECS.len() + 1
 
 /// Atomic per-service counters. Held by [`RpcMetricsRegistry`] in
-/// an `Arc` per active service.
-pub(super) struct ServiceMetricsAtomic {
+/// an `Arc` per active service. Covers BOTH the caller-side path
+/// (call_*, errors_*, in_flight, latency_*) and the server-side
+/// path (handler_*, streaming_chunks_*) so a node that both calls
+/// and serves a service has complete observability for that
+/// service in one record.
+pub struct ServiceMetricsAtomic {
+    // ------------- Caller side -------------
+    /// Total calls that resolved (success + any error).
     pub calls_total: AtomicU64,
+    /// Calls that returned `RpcError::NoRoute`.
     pub errors_no_route: AtomicU64,
+    /// Calls that returned `RpcError::Timeout`.
     pub errors_timeout: AtomicU64,
+    /// Calls that returned `RpcError::ServerError`.
     pub errors_server: AtomicU64,
+    /// Calls that returned `RpcError::Transport`.
     pub errors_transport: AtomicU64,
     /// Currently-in-flight calls. Balanced by an RAII guard that
     /// `+1`s on call entry and `-1`s on Drop. Can briefly observe
     /// negative values under racy reads but converges.
     pub in_flight: AtomicI64,
+    /// Sum of resolved-call latencies in nanoseconds.
     pub latency_sum_ns: AtomicU64,
+    /// Number of latency observations recorded.
     pub latency_count: AtomicU64,
     /// Cumulative bucket counts: `latency_buckets[i]` = number of
     /// observations with latency `<= DEFAULT_LATENCY_BUCKETS_SECS[i]`.
     /// Last entry (`[N_BUCKETS-1]`) is the `+Inf` bucket — equal to
     /// `latency_count` by Prometheus convention.
     pub latency_buckets: [AtomicU64; N_BUCKETS],
+
+    // ------------- Server side -------------
+    /// Total handler invocations (every spawned task, regardless
+    /// of outcome). Incremented at the start of the spawned
+    /// handler task in `RpcServerFold` / `RpcServerStreamingFold`.
+    pub handler_invocations_total: AtomicU64,
+    /// Handler panics caught by the fold's `catch_unwind`. Useful
+    /// alerting signal — should be ~0 in healthy steady state.
+    pub handler_panics_total: AtomicU64,
+    /// Currently-in-flight handler tasks. Balanced by `+1` at
+    /// task spawn and `-1` after the handler returns / panics.
+    pub handler_in_flight: AtomicI64,
+    /// Sum of handler durations in nanoseconds — the per-task
+    /// wall-clock time from spawn to handler return (excludes
+    /// network round-trip).
+    pub handler_duration_sum_ns: AtomicU64,
+    /// Number of handler observations (success + error + panic)
+    /// included in `handler_duration_*`.
+    pub handler_duration_count: AtomicU64,
+    /// Cumulative bucket counts for `handler_duration_seconds`.
+    /// Same shape / semantics as the caller-side `latency_buckets`.
+    pub handler_duration_buckets: [AtomicU64; N_BUCKETS],
+    /// Streaming-only: total chunks emitted by all streaming
+    /// handlers for this service. Bumped per `sink.send(...)` in
+    /// the streaming fold's pump task.
+    pub streaming_chunks_emitted_total: AtomicU64,
 }
 
 impl ServiceMetricsAtomic {
@@ -67,26 +105,57 @@ impl ServiceMetricsAtomic {
             latency_sum_ns: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             latency_buckets: Default::default(),
+            handler_invocations_total: AtomicU64::new(0),
+            handler_panics_total: AtomicU64::new(0),
+            handler_in_flight: AtomicI64::new(0),
+            handler_duration_sum_ns: AtomicU64::new(0),
+            handler_duration_count: AtomicU64::new(0),
+            handler_duration_buckets: Default::default(),
+            streaming_chunks_emitted_total: AtomicU64::new(0),
         }
     }
 
-    /// Record one observation. Bumps `latency_count`,
-    /// `latency_sum_ns`, and every cumulative bucket whose upper
-    /// bound the observation satisfies.
+    /// Record one caller-side latency observation.
     pub(super) fn record_latency(&self, elapsed: Duration) {
-        let ns = elapsed.as_nanos() as u64;
-        self.latency_sum_ns.fetch_add(ns, Ordering::Relaxed);
-        self.latency_count.fetch_add(1, Ordering::Relaxed);
-        let secs = ns as f64 / 1.0e9_f64;
-        for (i, le) in DEFAULT_LATENCY_BUCKETS_SECS.iter().enumerate() {
-            if secs <= *le {
-                self.latency_buckets[i].fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        // +Inf bucket counts every observation (Prometheus
-        // requires the terminal bucket to equal `_count`).
-        self.latency_buckets[N_BUCKETS - 1].fetch_add(1, Ordering::Relaxed);
+        record_into_histogram(
+            elapsed,
+            &self.latency_sum_ns,
+            &self.latency_count,
+            &self.latency_buckets,
+        );
     }
+
+    /// Record one server-side handler-duration observation.
+    /// Called by the spawned handler task after the handler
+    /// returns (or panics).
+    pub fn record_handler_duration(&self, elapsed: Duration) {
+        record_into_histogram(
+            elapsed,
+            &self.handler_duration_sum_ns,
+            &self.handler_duration_count,
+            &self.handler_duration_buckets,
+        );
+    }
+}
+
+/// Internal: bump `sum_ns`, `count`, and every cumulative bucket
+/// the observation satisfies, plus the `+Inf` terminal bucket.
+fn record_into_histogram(
+    elapsed: Duration,
+    sum_ns: &AtomicU64,
+    count: &AtomicU64,
+    buckets: &[AtomicU64; N_BUCKETS],
+) {
+    let ns = elapsed.as_nanos() as u64;
+    sum_ns.fetch_add(ns, Ordering::Relaxed);
+    count.fetch_add(1, Ordering::Relaxed);
+    let secs = ns as f64 / 1.0e9_f64;
+    for (i, le) in DEFAULT_LATENCY_BUCKETS_SECS.iter().enumerate() {
+        if secs <= *le {
+            buckets[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    buckets[N_BUCKETS - 1].fetch_add(1, Ordering::Relaxed);
 }
 
 /// What outcome to record on call exit. Drives which error
@@ -124,7 +193,12 @@ impl RpcMetricsRegistry {
     /// Get-or-create the per-service counter set. Cheap on the
     /// hot path (single DashMap get); falls back to an entry-API
     /// insert on first access for a service.
-    pub(super) fn for_service(&self, service: &str) -> Arc<ServiceMetricsAtomic> {
+    ///
+    /// `pub(crate)` so the cortex-side server folds (in
+    /// `adapter/net/cortex/rpc.rs`) can grab a per-service
+    /// counter handle at construction time and bump it from the
+    /// spawned handler task.
+    pub(crate) fn for_service(&self, service: &str) -> Arc<ServiceMetricsAtomic> {
         if let Some(m) = self.services.get(service) {
             return m.clone();
         }
@@ -145,6 +219,10 @@ impl RpcMetricsRegistry {
             for b in &m.latency_buckets {
                 buckets.push(b.load(Ordering::Relaxed));
             }
+            let mut handler_buckets = Vec::with_capacity(N_BUCKETS);
+            for b in &m.handler_duration_buckets {
+                handler_buckets.push(b.load(Ordering::Relaxed));
+            }
             services.push(ServiceMetrics {
                 service: entry.key().clone(),
                 calls_total: m.calls_total.load(Ordering::Relaxed),
@@ -156,6 +234,19 @@ impl RpcMetricsRegistry {
                 latency_sum_ns: m.latency_sum_ns.load(Ordering::Relaxed),
                 latency_count: m.latency_count.load(Ordering::Relaxed),
                 latency_buckets: buckets,
+                handler_invocations_total: m
+                    .handler_invocations_total
+                    .load(Ordering::Relaxed),
+                handler_panics_total: m.handler_panics_total.load(Ordering::Relaxed),
+                handler_in_flight: m.handler_in_flight.load(Ordering::Relaxed),
+                handler_duration_sum_ns: m
+                    .handler_duration_sum_ns
+                    .load(Ordering::Relaxed),
+                handler_duration_count: m.handler_duration_count.load(Ordering::Relaxed),
+                handler_duration_buckets: handler_buckets,
+                streaming_chunks_emitted_total: m
+                    .streaming_chunks_emitted_total
+                    .load(Ordering::Relaxed),
             });
         }
         services.sort_by(|a, b| a.service.cmp(&b.service));
@@ -179,6 +270,8 @@ pub struct RpcMetricsSnapshot {
 pub struct ServiceMetrics {
     /// Service name (e.g. `"echo"`, `"my.svc.lookup"`).
     pub service: String,
+
+    // ------------- Caller side -------------
     /// Total calls that *resolved* (success + any error). Calls
     /// that were dropped before resolving are NOT counted.
     pub calls_total: u64,
@@ -207,6 +300,35 @@ pub struct ServiceMetrics {
     /// last entry is the `+Inf` bucket and equals
     /// `latency_count`.
     pub latency_buckets: Vec<u64>,
+
+    // ------------- Server side -------------
+    /// Total handler invocations on this node for `service`.
+    /// Bumped at the start of each spawned handler task.
+    pub handler_invocations_total: u64,
+    /// Handler panics caught by the fold's `catch_unwind`.
+    /// Bumped from the spawned task's panic-catch arm. Should be
+    /// near-zero in healthy steady state.
+    pub handler_panics_total: u64,
+    /// Currently-running handler tasks for this service on this
+    /// node. Useful for server-side concurrency budgeting.
+    pub handler_in_flight: i64,
+    /// Sum of handler durations in nanoseconds — wall-clock
+    /// from spawn to handler return / panic. Excludes network
+    /// round-trip; pair with caller-side `latency_*` for
+    /// network overhead.
+    pub handler_duration_sum_ns: u64,
+    /// Number of handler observations included in
+    /// `handler_duration_sum_ns` and `handler_duration_buckets`.
+    pub handler_duration_count: u64,
+    /// Cumulative bucket counts for handler duration; index `i`
+    /// = observations `<= DEFAULT_LATENCY_BUCKETS_SECS[i]`. Last
+    /// entry is the `+Inf` bucket and equals
+    /// `handler_duration_count`.
+    pub handler_duration_buckets: Vec<u64>,
+    /// Total streaming chunks emitted by all handler invocations
+    /// of this service via `RpcResponseSink::send`. Zero for
+    /// services that only register unary handlers.
+    pub streaming_chunks_emitted_total: u64,
 }
 
 impl RpcMetricsSnapshot {
@@ -307,6 +429,95 @@ impl RpcMetricsSnapshot {
                 out,
                 "nrpc_call_latency_seconds_count{{service=\"{svc}\"}} {}",
                 s.latency_count
+            );
+        }
+
+        // ------------- Server side -------------
+
+        // handler_invocations_total
+        out.push_str(
+            "# HELP nrpc_handler_invocations_total Total nRPC handler invocations on this node.\n",
+        );
+        out.push_str("# TYPE nrpc_handler_invocations_total counter\n");
+        for s in &self.services {
+            let _ = writeln!(
+                out,
+                "nrpc_handler_invocations_total{{service=\"{}\"}} {}",
+                escape_label(&s.service),
+                s.handler_invocations_total
+            );
+        }
+
+        // handler_panics_total
+        out.push_str(
+            "# HELP nrpc_handler_panics_total Handler panics caught by the fold's catch_unwind.\n",
+        );
+        out.push_str("# TYPE nrpc_handler_panics_total counter\n");
+        for s in &self.services {
+            let _ = writeln!(
+                out,
+                "nrpc_handler_panics_total{{service=\"{}\"}} {}",
+                escape_label(&s.service),
+                s.handler_panics_total
+            );
+        }
+
+        // handler_in_flight (gauge)
+        out.push_str(
+            "# HELP nrpc_handler_in_flight Currently-running handler tasks for this service.\n",
+        );
+        out.push_str("# TYPE nrpc_handler_in_flight gauge\n");
+        for s in &self.services {
+            let _ = writeln!(
+                out,
+                "nrpc_handler_in_flight{{service=\"{}\"}} {}",
+                escape_label(&s.service),
+                s.handler_in_flight
+            );
+        }
+
+        // handler_duration_seconds histogram
+        out.push_str(
+            "# HELP nrpc_handler_duration_seconds Server-side handler wall-clock duration (excludes network).\n",
+        );
+        out.push_str("# TYPE nrpc_handler_duration_seconds histogram\n");
+        for s in &self.services {
+            let svc = escape_label(&s.service);
+            for (i, le) in DEFAULT_LATENCY_BUCKETS_SECS.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "nrpc_handler_duration_seconds_bucket{{service=\"{svc}\",le=\"{le}\"}} {}",
+                    s.handler_duration_buckets.get(i).copied().unwrap_or(0)
+                );
+            }
+            let _ = writeln!(
+                out,
+                "nrpc_handler_duration_seconds_bucket{{service=\"{svc}\",le=\"+Inf\"}} {}",
+                s.handler_duration_buckets.last().copied().unwrap_or(0)
+            );
+            let _ = writeln!(
+                out,
+                "nrpc_handler_duration_seconds_sum{{service=\"{svc}\"}} {}",
+                s.handler_duration_sum_ns as f64 / 1.0e9_f64
+            );
+            let _ = writeln!(
+                out,
+                "nrpc_handler_duration_seconds_count{{service=\"{svc}\"}} {}",
+                s.handler_duration_count
+            );
+        }
+
+        // streaming_chunks_emitted_total
+        out.push_str(
+            "# HELP nrpc_streaming_chunks_emitted_total Total chunks emitted by streaming handlers via sink.send().\n",
+        );
+        out.push_str("# TYPE nrpc_streaming_chunks_emitted_total counter\n");
+        for s in &self.services {
+            let _ = writeln!(
+                out,
+                "nrpc_streaming_chunks_emitted_total{{service=\"{}\"}} {}",
+                escape_label(&s.service),
+                s.streaming_chunks_emitted_total
             );
         }
 
@@ -443,14 +654,42 @@ mod tests {
         let m = r.for_service("echo");
         m.calls_total.fetch_add(1, Ordering::Relaxed);
         m.record_latency(Duration::from_millis(5));
+        m.handler_invocations_total.fetch_add(2, Ordering::Relaxed);
+        m.record_handler_duration(Duration::from_millis(3));
         let text = r.snapshot().prometheus_text();
+        // Caller side
         assert!(text.contains("nrpc_calls_total"));
         assert!(text.contains("nrpc_errors_total"));
         assert!(text.contains("nrpc_in_flight_calls"));
         assert!(text.contains("nrpc_call_latency_seconds_bucket"));
         assert!(text.contains("nrpc_call_latency_seconds_sum"));
         assert!(text.contains("nrpc_call_latency_seconds_count"));
+        // Server side
+        assert!(text.contains("nrpc_handler_invocations_total"));
+        assert!(text.contains("nrpc_handler_panics_total"));
+        assert!(text.contains("nrpc_handler_in_flight"));
+        assert!(text.contains("nrpc_handler_duration_seconds_bucket"));
+        assert!(text.contains("nrpc_streaming_chunks_emitted_total"));
         assert!(text.contains("le=\"+Inf\""));
+    }
+
+    #[test]
+    fn record_handler_duration_lands_in_buckets() {
+        let r = RpcMetricsRegistry::new();
+        let m = r.for_service("svc");
+        m.record_handler_duration(Duration::from_millis(7));
+        m.record_handler_duration(Duration::from_secs(3));
+        let snap = r.snapshot();
+        let s = &snap.services[0];
+        assert_eq!(s.handler_duration_count, 2);
+        assert_eq!(
+            *s.handler_duration_buckets.last().unwrap(),
+            2,
+            "+Inf bucket equals count",
+        );
+        // 7ms ≤ 10ms bucket (index 1), 3s ≤ 5s bucket (index 9).
+        assert_eq!(s.handler_duration_buckets[1], 1, "7ms ≤ 10ms");
+        assert_eq!(s.handler_duration_buckets[9], 2, "7ms + 3s both ≤ 5s");
     }
 
     #[test]

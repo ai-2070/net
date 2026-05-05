@@ -154,6 +154,171 @@ async fn metrics_snapshot_reflects_mixed_outcomes() {
     assert!(echo.latency_sum_ns > 0, "latency_sum should accumulate");
 }
 
+/// Server-side metrics: serve a unary RPC + a streaming RPC,
+/// drive each from a caller, and confirm the SERVER's snapshot
+/// shows handler_invocations_total, handler_duration_*,
+/// streaming_chunks_emitted_total. Pinned: server-side observable
+/// matches what the handler actually did, independent of the
+/// caller-side counters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_side_metrics_increment_for_unary_and_streaming() {
+    use async_trait::async_trait;
+    use net_sdk::mesh_rpc::{
+        RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink, RpcStatus,
+        RpcStreamingHandler,
+    };
+
+    struct Echo;
+    #[async_trait]
+    impl RpcHandler for Echo {
+        async fn call(
+            &self,
+            ctx: RpcContext,
+        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            // Add a small sleep so the handler-duration histogram
+            // has a non-zero observation that lands in a known
+            // bucket window.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: ctx.payload.body,
+            })
+        }
+    }
+
+    struct Counter;
+    #[async_trait]
+    impl RpcStreamingHandler for Counter {
+        async fn call(
+            &self,
+            _ctx: RpcContext,
+            sink: RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            for i in 0..3u32 {
+                sink.send(format!("c-{i}").into_bytes());
+            }
+            Ok(())
+        }
+    }
+
+    let psk = [0x42u8; 32];
+    let (caller, server, addr_server) = two_meshes(&psk).await;
+    handshake(&caller, &server, addr_server).await;
+
+    let _serve_unary = server
+        .serve_rpc("server_metric_echo", Arc::new(Echo))
+        .expect("serve_rpc");
+    let _serve_stream = server
+        .serve_rpc_streaming("server_metric_stream", Arc::new(Counter))
+        .expect("serve_rpc_streaming");
+
+    let target = server.inner().node_id();
+    // 4 unary calls.
+    for _ in 0..4 {
+        caller
+            .call(
+                target,
+                "server_metric_echo",
+                bytes::Bytes::from_static(b"x"),
+                CallOptions::default(),
+            )
+            .await
+            .expect("ok");
+    }
+    // 1 streaming call (drains 3 chunks + terminal).
+    use futures::StreamExt;
+    let mut stream = caller
+        .call_streaming(
+            target,
+            "server_metric_stream",
+            bytes::Bytes::from_static(b""),
+            CallOptions::default(),
+        )
+        .await
+        .expect("call_streaming");
+    while let Some(item) = stream.next().await {
+        let _ = item.expect("ok chunk");
+    }
+
+    // Allow handler_in_flight to drain (decrement happens AFTER
+    // the response is emitted on a tokio task; the caller may
+    // observe the response slightly before that arithmetic
+    // settles). Spin up to a short bound.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let snap = server.rpc_metrics_snapshot();
+        let echo = snap.services.iter().find(|s| s.service == "server_metric_echo");
+        let stream_svc = snap
+            .services
+            .iter()
+            .find(|s| s.service == "server_metric_stream");
+        let echo_done = echo.map(|e| e.handler_in_flight == 0 && e.handler_invocations_total >= 4).unwrap_or(false);
+        let stream_done = stream_svc
+            .map(|s| s.handler_in_flight == 0 && s.handler_invocations_total >= 1
+                && s.streaming_chunks_emitted_total >= 3)
+            .unwrap_or(false);
+        if echo_done && stream_done {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "handler counters did not reach expected steady state in time. \
+                 echo: {echo:?}, stream: {stream_svc:?}",
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snap = server.rpc_metrics_snapshot();
+    let echo = snap
+        .services
+        .iter()
+        .find(|s| s.service == "server_metric_echo")
+        .expect("echo service must appear in server snapshot");
+    assert_eq!(echo.handler_invocations_total, 4, "4 unary invocations");
+    assert_eq!(echo.handler_panics_total, 0, "no panics");
+    assert_eq!(echo.handler_in_flight, 0, "all unary handlers settled");
+    assert_eq!(echo.handler_duration_count, 4);
+    assert_eq!(
+        *echo.handler_duration_buckets.last().unwrap(),
+        4,
+        "+Inf bucket equals handler_duration_count",
+    );
+    // 2ms sleep → lands in <= 5ms bucket (index 0).
+    assert!(
+        echo.handler_duration_buckets[0] >= 1,
+        "at least one handler should land in the ≤5ms bucket; got {:?}",
+        echo.handler_duration_buckets,
+    );
+
+    let stream_svc = snap
+        .services
+        .iter()
+        .find(|s| s.service == "server_metric_stream")
+        .expect("stream service must appear");
+    assert_eq!(stream_svc.handler_invocations_total, 1);
+    assert_eq!(stream_svc.handler_in_flight, 0);
+    assert_eq!(
+        stream_svc.streaming_chunks_emitted_total, 3,
+        "3 sink.send() calls → 3 streaming chunks counted",
+    );
+
+    // Caller side has counters too — the SAME mesh instance can
+    // be both caller and server for a service, but in this test
+    // the `caller` mesh holds the caller-side and `server` mesh
+    // holds the server-side. Confirm the caller's snapshot
+    // doesn't have spurious server-side numbers (different mesh).
+    let caller_snap = caller.rpc_metrics_snapshot();
+    for s in &caller_snap.services {
+        assert_eq!(
+            s.handler_invocations_total, 0,
+            "caller-side mesh should have no handler invocations for {}",
+            s.service,
+        );
+    }
+}
+
 /// Prometheus output contains canonical metric names + the
 /// service label with our value. Snapshot format is
 /// `text/plain; version=0.0.4` compatible.
@@ -195,8 +360,8 @@ async fn metrics_prometheus_text_contains_canonical_names() {
             .expect("ok");
     }
 
-    let text = caller.rpc_metrics_snapshot().prometheus_text();
-    // Canonical metric names.
+    let caller_text = caller.rpc_metrics_snapshot().prometheus_text();
+    // Caller-side canonical metric names.
     for name in &[
         "nrpc_calls_total",
         "nrpc_errors_total",
@@ -206,17 +371,39 @@ async fn metrics_prometheus_text_contains_canonical_names() {
         "nrpc_call_latency_seconds_count",
     ] {
         assert!(
-            text.contains(name),
-            "Prometheus text missing metric {name}\n----\n{text}",
+            caller_text.contains(name),
+            "Prometheus text missing metric {name}\n----\n{caller_text}",
         );
     }
-    // Our service label appears.
-    assert!(text.contains("service=\"prom_test\""), "service label missing");
-    // The +Inf bucket terminates the histogram.
-    assert!(text.contains("le=\"+Inf\""), "+Inf bucket missing");
-    // calls_total reflects both calls.
+    // Our service label appears + +Inf bucket present + count is right.
+    assert!(caller_text.contains("service=\"prom_test\""), "service label missing");
+    assert!(caller_text.contains("le=\"+Inf\""), "+Inf bucket missing");
     assert!(
-        text.contains("nrpc_calls_total{service=\"prom_test\"} 2"),
+        caller_text.contains("nrpc_calls_total{service=\"prom_test\"} 2"),
         "calls_total must show 2",
+    );
+
+    // Server-side metric names always present (every snapshot
+    // emits all five families even when the server-side fields
+    // for a given service are zero).
+    let server_text = server.rpc_metrics_snapshot().prometheus_text();
+    for name in &[
+        "nrpc_handler_invocations_total",
+        "nrpc_handler_panics_total",
+        "nrpc_handler_in_flight",
+        "nrpc_handler_duration_seconds_bucket",
+        "nrpc_handler_duration_seconds_sum",
+        "nrpc_handler_duration_seconds_count",
+        "nrpc_streaming_chunks_emitted_total",
+    ] {
+        assert!(
+            server_text.contains(name),
+            "Server Prometheus text missing metric {name}\n----\n{server_text}",
+        );
+    }
+    // Server actually invoked the handler twice.
+    assert!(
+        server_text.contains("nrpc_handler_invocations_total{service=\"prom_test\"} 2"),
+        "server handler_invocations_total must show 2",
     );
 }
