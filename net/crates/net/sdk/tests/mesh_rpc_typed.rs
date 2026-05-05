@@ -15,9 +15,7 @@
 use std::time::Duration;
 
 use net_sdk::mesh::{Mesh, MeshBuilder};
-use net_sdk::mesh_rpc::{
-    CallOptionsTyped, Codec, RoutingPolicy, RpcError,
-};
+use net_sdk::mesh_rpc::{CallOptionsTyped, Codec, RoutingPolicy, RpcError};
 use serde::{Deserialize, Serialize};
 
 async fn two_meshes(psk: &[u8; 32]) -> (Mesh, Mesh, std::net::SocketAddr) {
@@ -140,11 +138,9 @@ async fn typed_call_service_uses_capability_announcements() {
     handshake(&caller, &server, addr_server).await;
 
     let _serve = server
-        .serve_rpc_typed(
-            "multiply",
-            Codec::Json,
-            |req: AddRequest| async move { Ok(AddResponse { sum: req.a * req.b }) },
-        )
+        .serve_rpc_typed("multiply", Codec::Json, |req: AddRequest| async move {
+            Ok(AddResponse { sum: req.a * req.b })
+        })
         .expect("serve_rpc_typed");
 
     server
@@ -196,7 +192,9 @@ fn codec_round_trip() {
 
     // Pretty round-trips identically (same wire format, just
     // formatted differently on encode).
-    let pretty = Codec::JsonPretty.encode(&AddRequest { a: 1, b: 2 }).unwrap();
+    let pretty = Codec::JsonPretty
+        .encode(&AddRequest { a: 1, b: 2 })
+        .unwrap();
     let back: AddRequest = Codec::JsonPretty.decode(&pretty).unwrap();
     assert_eq!(back, AddRequest { a: 1, b: 2 });
 }

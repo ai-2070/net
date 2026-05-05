@@ -39,9 +39,9 @@ use super::cortex::{
     RpcCancellationToken, RpcClientFold, RpcContext, RpcHandler, RpcHandlerError,
     RpcInboundDispatcher, RpcInboundEvent, RpcRequestPayload, RpcResponseEmitter,
     RpcResponsePayload, RpcServerFold, RpcServerStreamingFold, RpcStatus, RpcStreamingHandler,
-    StreamItem, TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
-    DISPATCH_RPC_STREAM_GRANT, EVENT_META_SIZE, FLAG_RPC_PROPAGATE_TRACE,
-    FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_STREAM_WINDOW_INITIAL,
+    StreamItem, TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST, DISPATCH_RPC_STREAM_GRANT,
+    EVENT_META_SIZE, FLAG_RPC_PROPAGATE_TRACE, FLAG_RPC_STREAMING_RESPONSE,
+    HEADER_NRPC_STREAM_WINDOW_INITIAL,
 };
 use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome};
 use crate::error::AdapterError;
@@ -375,10 +375,7 @@ impl futures::Stream for RpcStream {
                 let message = String::from_utf8(resp.body).unwrap_or_else(|e| {
                     format!("<{} bytes of non-utf8 body>", e.into_bytes().len())
                 });
-                std::task::Poll::Ready(Some(Err(RpcError::ServerError {
-                    status,
-                    message,
-                })))
+                std::task::Poll::Ready(Some(Err(RpcError::ServerError { status, message })))
             }
             std::task::Poll::Ready(None) => {
                 self.done = true;
@@ -478,7 +475,6 @@ fn spawn_cancel_publish(
     });
 }
 
-
 // ============================================================================
 // MeshNode extensions.
 // ============================================================================
@@ -555,8 +551,7 @@ impl MeshNode {
                 buf.extend_from_slice(&meta.to_bytes());
                 buf.extend_from_slice(&resp.encode());
 
-                let publisher =
-                    ChannelPublisher::new(reply_channel, PublishConfig::default());
+                let publisher = ChannelPublisher::new(reply_channel, PublishConfig::default());
                 if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
                     tracing::warn!(error = %e, caller_origin = format!("{:#x}", caller_origin),
                         call_id, "rpc serve_rpc: response publish failed");
@@ -570,8 +565,7 @@ impl MeshNode {
         // the spawned handler tasks bump server-side counters.
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
         let fold = Arc::new(Mutex::new(
-            RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit)
-                .with_metrics(metrics_handle),
+            RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit).with_metrics(metrics_handle),
         ));
 
         // Register the inbound dispatcher. Push into the mpsc;
@@ -642,41 +636,38 @@ impl MeshNode {
         let server_origin = self.identity_origin_hash();
         // Async emit so the streaming fold's pump can `.await` each
         // publish — guarantees per-call chunk ordering on the wire.
-        let emit: RpcAsyncResponseEmitter =
-            Arc::new(move |caller_origin, call_id, resp| {
-                let mesh = Arc::clone(&mesh_for_emit);
-                let service = service_for_emit.clone();
-                Box::pin(async move {
-                    let reply_channel_name =
-                        format!("{service}.replies.{caller_origin:016x}");
-                    let reply_channel = match ChannelName::new(&reply_channel_name) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(error = %e, channel = %reply_channel_name,
+        let emit: RpcAsyncResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
+            let mesh = Arc::clone(&mesh_for_emit);
+            let service = service_for_emit.clone();
+            Box::pin(async move {
+                let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
+                let reply_channel = match ChannelName::new(&reply_channel_name) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(error = %e, channel = %reply_channel_name,
                                 "rpc serve_rpc_streaming: invalid reply channel name");
-                            return;
-                        }
-                    };
-                    let meta = EventMeta::new(
-                        super::cortex::DISPATCH_RPC_RESPONSE,
-                        0,
-                        server_origin,
-                        call_id,
-                        0,
-                    );
-                    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
-                    buf.extend_from_slice(&meta.to_bytes());
-                    buf.extend_from_slice(&resp.encode());
-                    let publisher =
-                        ChannelPublisher::new(reply_channel, PublishConfig::default());
-                    if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
-                        tracing::warn!(error = %e,
+                        return;
+                    }
+                };
+                let meta = EventMeta::new(
+                    super::cortex::DISPATCH_RPC_RESPONSE,
+                    0,
+                    server_origin,
+                    call_id,
+                    0,
+                );
+                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
+                buf.extend_from_slice(&meta.to_bytes());
+                buf.extend_from_slice(&resp.encode());
+                let publisher = ChannelPublisher::new(reply_channel, PublishConfig::default());
+                if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
+                    tracing::warn!(error = %e,
                             caller_origin = format!("{:#x}", caller_origin),
                             call_id,
                             "rpc serve_rpc_streaming: chunk publish failed");
-                    }
-                })
-            });
+                }
+            })
+        });
 
         // Attach per-service metrics so the spawned handler tasks
         // + pump task bump server-side counters (including the
@@ -733,19 +724,18 @@ impl MeshNode {
         payload: Bytes,
         opts: CallOptions,
     ) -> Result<RpcStream, RpcError> {
-        let request_channel = ChannelName::new(&format!("{service}.requests"))
-            .map_err(|e| RpcError::NoRoute {
+        let request_channel =
+            ChannelName::new(&format!("{service}.requests")).map_err(|e| RpcError::NoRoute {
                 target: target_node_id,
                 reason: format!("invalid service name: {e}"),
             })?;
         let self_origin = self.identity_origin_hash();
         let reply_channel_name = format!("{service}.replies.{self_origin:016x}");
-        let reply_channel = ChannelName::new(&reply_channel_name).map_err(|e| {
-            RpcError::NoRoute {
+        let reply_channel =
+            ChannelName::new(&reply_channel_name).map_err(|e| RpcError::NoRoute {
                 target: target_node_id,
                 reason: format!("invalid reply channel name: {e}"),
-            }
-        })?;
+            })?;
         let reply_hash = reply_channel.hash();
         self.ensure_reply_subscription(target_node_id, service, reply_channel.clone(), reply_hash)
             .await?;
@@ -773,10 +763,7 @@ impl MeshNode {
         }
         let req = RpcRequestPayload {
             service: service.to_string(),
-            deadline_ns: opts
-                .deadline
-                .map(instant_to_unix_nanos)
-                .unwrap_or(0),
+            deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
             flags,
             headers,
             body: payload.to_vec(),
@@ -983,19 +970,18 @@ impl MeshNode {
         payload: Bytes,
         opts: CallOptions,
     ) -> Result<RpcReply, RpcError> {
-        let request_channel = ChannelName::new(&format!("{service}.requests"))
-            .map_err(|e| RpcError::NoRoute {
+        let request_channel =
+            ChannelName::new(&format!("{service}.requests")).map_err(|e| RpcError::NoRoute {
                 target: target_node_id,
                 reason: format!("invalid service name: {e}"),
             })?;
         let self_origin = self.identity_origin_hash();
         let reply_channel_name = format!("{service}.replies.{self_origin:016x}");
-        let reply_channel = ChannelName::new(&reply_channel_name).map_err(|e| {
-            RpcError::NoRoute {
+        let reply_channel =
+            ChannelName::new(&reply_channel_name).map_err(|e| RpcError::NoRoute {
                 target: target_node_id,
                 reason: format!("invalid reply channel name: {e}"),
-            }
-        })?;
+            })?;
         let reply_hash = reply_channel.hash();
 
         // Caller-side metrics guard. Bumps `in_flight` immediately;
@@ -1006,8 +992,7 @@ impl MeshNode {
         // with `outcome = None` so `in_flight` decrements but no
         // outcome is double-counted.
         let metrics_registry = self.rpc_metrics_arc();
-        let mut metrics_guard =
-            CallMetricsGuard::new(metrics_registry.for_service(service));
+        let mut metrics_guard = CallMetricsGuard::new(metrics_registry.for_service(service));
 
         // Lazy reply-channel subscription. Once per (target, service).
         if let Err(e) = self
@@ -1036,21 +1021,12 @@ impl MeshNode {
         };
         let req = RpcRequestPayload {
             service: service.to_string(),
-            deadline_ns: opts
-                .deadline
-                .map(instant_to_unix_nanos)
-                .unwrap_or(0),
+            deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
             flags,
             headers,
             body: payload.to_vec(),
         };
-        let meta = EventMeta::new(
-            DISPATCH_RPC_REQUEST,
-            0,
-            self_origin,
-            call_id,
-            0,
-        );
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.body.len() + 32);
         buf.extend_from_slice(&meta.to_bytes());
         buf.extend_from_slice(&req.encode());
@@ -1233,12 +1209,9 @@ impl MeshNode {
         }
 
         let _ = reply_hash; // captured into the dispatcher above; surfaced for debug
-        registry
-            .lock()
-            .push((target_node_id, service.to_string()));
+        registry.lock().push((target_node_id, service.to_string()));
         Ok(())
     }
-
 }
 
 // ============================================================================

@@ -482,7 +482,10 @@ pub fn build_trace_headers(ctx: &TraceContext) -> Vec<RpcHeader> {
         ctx.traceparent.clone().into_bytes(),
     ));
     if !ctx.tracestate.is_empty() {
-        headers.push(("tracestate".to_string(), ctx.tracestate.clone().into_bytes()));
+        headers.push((
+            "tracestate".to_string(),
+            ctx.tracestate.clone().into_bytes(),
+        ));
     }
     headers
 }
@@ -915,9 +918,7 @@ pub trait RpcHandler: Send + Sync + 'static {
 /// doesn't depend on the mesh layer directly.
 ///
 /// Arguments: `(caller_origin, call_id, response_payload)`.
-pub type RpcResponseEmitter = Arc<
-    dyn Fn(u64, u64, RpcResponsePayload) + Send + Sync + 'static,
->;
+pub type RpcResponseEmitter = Arc<dyn Fn(u64, u64, RpcResponsePayload) + Send + Sync + 'static>;
 
 /// Async counterpart of [`RpcResponseEmitter`] used by the
 /// streaming fold's pump task to serialize per-call publishes.
@@ -961,8 +962,7 @@ pub struct RpcServerFold {
     /// per-task wall-clock durations. `None` → no metrics
     /// (test-only path; production `Mesh::serve_rpc` always
     /// supplies one).
-    metrics:
-        Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
+    metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
     /// Optional clock override for tests. `None` → real wall-clock
     /// `unix_nanos`. `Some(...)` → fixed value, lets tests pin
     /// deadline-already-passed behavior without sleeping.
@@ -1133,9 +1133,9 @@ impl RedexFold<()> for RpcServerFold {
                     // accept the assertion because the handler's
                     // state is untouched on panic (we just don't
                     // observe its in-progress mutations).
-                    let outcome = futures::FutureExt::catch_unwind(
-                        std::panic::AssertUnwindSafe(handler.call(ctx)),
-                    )
+                    let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                        handler.call(ctx),
+                    ))
                     .await;
                     if let Some(m) = metrics.as_ref() {
                         m.handler_in_flight
@@ -1247,11 +1247,7 @@ impl RpcResponseSink {
 pub trait RpcStreamingHandler: Send + Sync + 'static {
     /// Process one streaming request. Emit chunks via `sink.send(...)`.
     /// Drop the sink (or return) to close the stream.
-    async fn call(
-        &self,
-        ctx: RpcContext,
-        sink: RpcResponseSink,
-    ) -> Result<(), RpcHandlerError>;
+    async fn call(&self, ctx: RpcContext, sink: RpcResponseSink) -> Result<(), RpcHandlerError>;
 }
 
 /// Per-call flow-control map type. Keyed on
@@ -1284,8 +1280,7 @@ pub struct RpcServerStreamingFold {
     /// `RpcServerFold::metrics`; the streaming fold ALSO bumps
     /// `streaming_chunks_emitted_total` from the pump task on
     /// every chunk.
-    metrics:
-        Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
+    metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
 }
 
 impl RpcServerStreamingFold {
@@ -1474,9 +1469,9 @@ impl RedexFold<()> for RpcServerStreamingFold {
                     // Run the handler. Catch panics so a
                     // misbehaving handler can't take down the
                     // runtime — same shape as the unary fold.
-                    let outcome = futures::FutureExt::catch_unwind(
-                        std::panic::AssertUnwindSafe(handler.call(ctx, sink)),
-                    )
+                    let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                        handler.call(ctx, sink),
+                    ))
                     .await;
                     // The handler dropped the sink (either by
                     // returning or by panicking through the
@@ -1688,8 +1683,7 @@ impl RpcClientPending {
         call_id: u64,
     ) -> tokio::sync::mpsc::UnboundedReceiver<StreamItem> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.senders
-            .insert(call_id, PendingEntry::Streaming(tx));
+        self.senders.insert(call_id, PendingEntry::Streaming(tx));
         rx
     }
 
@@ -1743,8 +1737,7 @@ impl RpcClientPending {
                             // chunk if the body is non-empty,
                             // then End.
                             if !resp.body.is_empty() {
-                                let _ = tx
-                                    .send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
+                                let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
                             }
                             StreamItem::End
                         } else {
@@ -1761,8 +1754,7 @@ impl RpcClientPending {
                         // a unary path; treat as terminal end with
                         // body as a single chunk.
                         if !resp.body.is_empty() {
-                            let _ = tx
-                                .send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
+                            let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
                         }
                         let _ = tx.send(StreamItem::End);
                         drop(entry);
@@ -2157,10 +2149,7 @@ mod tests {
     struct EchoHandler;
     #[async_trait::async_trait]
     impl RpcHandler for EchoHandler {
-        async fn call(
-            &self,
-            ctx: RpcContext,
-        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
@@ -2223,10 +2212,7 @@ mod tests {
         struct AppErrHandler;
         #[async_trait::async_trait]
         impl RpcHandler for AppErrHandler {
-            async fn call(
-                &self,
-                _ctx: RpcContext,
-            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
                 Err(RpcHandlerError::Application {
                     code: 0xBEEF,
                     message: "bad input".to_string(),
@@ -2257,10 +2243,7 @@ mod tests {
         struct IntErrHandler;
         #[async_trait::async_trait]
         impl RpcHandler for IntErrHandler {
-            async fn call(
-                &self,
-                _ctx: RpcContext,
-            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
                 Err(RpcHandlerError::Internal("db timeout".to_string()))
             }
         }
@@ -2291,10 +2274,7 @@ mod tests {
         struct PanicHandler;
         #[async_trait::async_trait]
         impl RpcHandler for PanicHandler {
-            async fn call(
-                &self,
-                _ctx: RpcContext,
-            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
                 panic!("kaboom");
             }
         }
@@ -2331,10 +2311,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl RpcHandler for CountingHandler {
-            async fn call(
-                &self,
-                _ctx: RpcContext,
-            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
                 self.invoked.store(true, Ordering::Release);
                 Ok(RpcResponsePayload {
                     status: RpcStatus::Ok,
@@ -2384,10 +2361,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl RpcHandler for CancelObservingHandler {
-            async fn call(
-                &self,
-                ctx: RpcContext,
-            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
                 tokio::select! {
                     _ = ctx.cancellation.cancelled() => {
                         self.resumed.store(true, Ordering::Release);
@@ -2520,8 +2494,7 @@ mod tests {
     #[test]
     fn trace_context_round_trips_through_headers() {
         let tc = TraceContext {
-            traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
-                .to_string(),
+            traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
             tracestate: "vendor1=opaque-value,vendor2=other".to_string(),
         };
         let headers = build_trace_headers(&tc);
@@ -2776,7 +2749,8 @@ mod tests {
             headers: vec![],
             body: vec![],
         };
-        fold.apply(&rpc_response_event(1, 5, resp), &mut ()).unwrap();
+        fold.apply(&rpc_response_event(1, 5, resp), &mut ())
+            .unwrap();
 
         // Receiver was dropped along with the cancel. The previously-
         // returned `rx` errors with `Closed`.
@@ -2811,7 +2785,10 @@ mod tests {
             payload: bytes::Bytes::from(buf),
         };
         let result = fold.apply(&ev, &mut ());
-        assert!(result.is_ok(), "fold must not return Err on malformed response");
+        assert!(
+            result.is_ok(),
+            "fold must not return Err on malformed response"
+        );
         // Pending entry NOT cleared — the caller's cancellation
         // path will eventually clean it up via `cancel(call_id)`.
         assert_eq!(pending.pending_count(), 1);

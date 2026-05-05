@@ -258,8 +258,7 @@ struct DispatchCtx {
     inbound: InboundQueues,
     /// Per-channel-hash dispatch hook for nRPC. See the matching
     /// field on `MeshNode`.
-    rpc_inbound_dispatchers:
-        Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
+    rpc_inbound_dispatchers: Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
     ///
@@ -1059,14 +1058,12 @@ pub struct MeshNode {
     /// the per-shard `inbound` queue. Lookup is one DashMap get
     /// per packet on the hot path; absent registrations skip the
     /// branch entirely.
-    rpc_inbound_dispatchers:
-        Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
+    rpc_inbound_dispatchers: Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
     /// Pending oneshots for in-flight `Mesh::call` invocations.
     /// Shared with the per-Mesh `RpcClientFold` so RESPONSE events
     /// arriving on reply channels complete the right call's
     /// awaiting future.
-    rpc_client_pending:
-        Arc<crate::adapter::net::cortex::RpcClientPending>,
+    rpc_client_pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
     /// Per-caller monotonic call id allocator. Used as the
     /// `EventMeta::seq_or_ts` correlation id on outgoing REQUEST
     /// events.
@@ -1075,8 +1072,7 @@ pub struct MeshNode {
     /// established a reply-channel subscription for. `Mesh::call`
     /// consults this to skip the round-trip subscribe on
     /// subsequent calls to the same (target, service).
-    rpc_reply_subscriptions:
-        Arc<parking_lot::Mutex<Vec<(u64, String)>>>,
+    rpc_reply_subscriptions: Arc<parking_lot::Mutex<Vec<(u64, String)>>>,
     /// nRPC services the local node currently handles (registered
     /// via `Mesh::serve_rpc`, deregistered when the `ServeHandle`
     /// drops). `announce_capabilities` merges these as
@@ -1520,15 +1516,11 @@ impl MeshNode {
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
             rpc_inbound_dispatchers: Arc::new(DashMap::new()),
-            rpc_client_pending: Arc::new(
-                crate::adapter::net::cortex::RpcClientPending::new(),
-            ),
+            rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
             rpc_next_call_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             rpc_reply_subscriptions: Arc::new(parking_lot::Mutex::new(Vec::new())),
             rpc_local_services: Arc::new(dashmap::DashSet::new()),
-            rpc_metrics: Arc::new(
-                crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new(),
-            ),
+            rpc_metrics: Arc::new(crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             pending_direct_initiators,
@@ -4054,7 +4046,8 @@ impl MeshNode {
         channel_hash: u16,
         dispatcher: crate::adapter::net::cortex::RpcInboundDispatcher,
     ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
-        self.rpc_inbound_dispatchers.insert(channel_hash, dispatcher)
+        self.rpc_inbound_dispatchers
+            .insert(channel_hash, dispatcher)
     }
 
     /// Remove the registered dispatcher for `channel_hash`. Returns
@@ -4230,14 +4223,8 @@ impl MeshNode {
         channel: ChannelName,
         queue_group: String,
     ) -> Result<(), AdapterError> {
-        self.send_membership_request(
-            publisher_node_id,
-            channel,
-            true,
-            None,
-            Some(queue_group),
-        )
-        .await
+        self.send_membership_request(publisher_node_id, channel, true, None, Some(queue_group))
+            .await
     }
 
     /// Queue-group subscribe with a pre-issued
@@ -4385,11 +4372,9 @@ impl MeshNode {
                     let id = ChannelId::new(channel);
                     let mode = match queue_group {
                         None => crate::adapter::net::channel::SubscriptionMode::Broadcast,
-                        Some(name) => {
-                            crate::adapter::net::channel::SubscriptionMode::QueueGroup(
-                                crate::adapter::net::channel::QueueGroupName::new(name),
-                            )
-                        }
+                        Some(name) => crate::adapter::net::channel::SubscriptionMode::QueueGroup(
+                            crate::adapter::net::channel::QueueGroupName::new(name),
+                        ),
                     };
                     ctx.roster.add_with_mode(id, from_node, mode);
                     Self::clear_auth_failures(from_node, ctx);

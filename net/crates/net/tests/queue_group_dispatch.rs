@@ -265,10 +265,6 @@ async fn broadcast_subscriber_coexists_with_queue_group_on_same_channel() {
     );
     let wa = wa_count.load(Ordering::Relaxed);
     let wb = wb_count.load(Ordering::Relaxed);
-    assert_eq!(
-        wa + wb,
-        n,
-        "queue-group total must equal published count",
-    );
+    assert_eq!(wa + wb, n, "queue-group total must equal published count",);
     assert!(wa > 0 && wb > 0, "both workers must get some events");
 }

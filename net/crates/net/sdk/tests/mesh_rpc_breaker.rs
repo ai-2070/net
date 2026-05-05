@@ -32,8 +32,16 @@ use net_sdk::mesh_rpc_resilience::{
 use serde::{Deserialize, Serialize};
 
 async fn two_meshes(psk: &[u8; 32]) -> (Mesh, Mesh, std::net::SocketAddr) {
-    let a = MeshBuilder::new("127.0.0.1:0", psk).unwrap().build().await.unwrap();
-    let b = MeshBuilder::new("127.0.0.1:0", psk).unwrap().build().await.unwrap();
+    let a = MeshBuilder::new("127.0.0.1:0", psk)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let b = MeshBuilder::new("127.0.0.1:0", psk)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
     let addr_b = b.inner().local_addr();
     (a, b, addr_b)
 }
@@ -74,13 +82,12 @@ fn make_flaky_server(
     }
     #[async_trait]
     impl RpcHandler for Flaky {
-        async fn call(
-            &self,
-            ctx: RpcContext,
-        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             self.count.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
-                Err(RpcHandlerError::Internal("simulated downstream failure".into()))
+                Err(RpcHandlerError::Internal(
+                    "simulated downstream failure".into(),
+                ))
             } else {
                 Ok(RpcResponsePayload {
                     status: RpcStatus::Ok,
@@ -123,7 +130,12 @@ async fn breaker_full_state_machine_cycle() {
     let target = server.inner().node_id();
     let do_call = || async {
         caller
-            .call(target, "flaky", bytes::Bytes::from_static(b"ping"), Default::default())
+            .call(
+                target,
+                "flaky",
+                bytes::Bytes::from_static(b"ping"),
+                Default::default(),
+            )
             .await
     };
 
@@ -133,18 +145,22 @@ async fn breaker_full_state_machine_cycle() {
             .call(do_call)
             .await
             .expect_err("must surface Internal");
-        assert!(matches!(err, BreakerError::Inner(RpcError::ServerError { .. })));
+        assert!(matches!(
+            err,
+            BreakerError::Inner(RpcError::ServerError { .. })
+        ));
     }
-    assert_eq!(breaker.state(), BreakerState::Open, "must trip after threshold");
+    assert_eq!(
+        breaker.state(),
+        BreakerState::Open,
+        "must trip after threshold"
+    );
 
     // 2) During cooldown, calls short-circuit with Open and the
     // handler is NOT invoked.
     let invocations_before = invocations.load(Ordering::SeqCst);
     for _ in 0..5 {
-        let err = breaker
-            .call(do_call)
-            .await
-            .expect_err("must short-circuit");
+        let err = breaker.call(do_call).await.expect_err("must short-circuit");
         assert!(matches!(err, BreakerError::Open));
     }
     assert_eq!(
@@ -164,7 +180,11 @@ async fn breaker_full_state_machine_cycle() {
         .expect("half-open probe must succeed");
     assert!(matches!(reply, net_sdk::mesh_rpc::RpcReply { .. }));
     assert_eq!(reply.body.as_ref(), b"ping");
-    assert_eq!(breaker.state(), BreakerState::Closed, "probe success closes breaker");
+    assert_eq!(
+        breaker.state(),
+        BreakerState::Closed,
+        "probe success closes breaker"
+    );
 
     // 4) Subsequent calls flow normally (counters reset).
     for _ in 0..3 {
@@ -194,7 +214,12 @@ async fn breaker_failed_half_open_probe_reopens() {
     let target = server.inner().node_id();
     let do_call = || async {
         caller
-            .call(target, "flaky", bytes::Bytes::from_static(b""), Default::default())
+            .call(
+                target,
+                "flaky",
+                bytes::Bytes::from_static(b""),
+                Default::default(),
+            )
             .await
     };
 
@@ -250,12 +275,20 @@ async fn breaker_application_errors_do_not_trip() {
             .call(|| async {
                 let body = serde_json::to_vec(&Ping(i)).unwrap();
                 caller
-                    .call(target, "validate", bytes::Bytes::from(body), Default::default())
+                    .call(
+                        target,
+                        "validate",
+                        bytes::Bytes::from(body),
+                        Default::default(),
+                    )
                     .await
             })
             .await
             .expect_err("validation failure");
-        assert!(matches!(err, BreakerError::Inner(RpcError::ServerError { .. })));
+        assert!(matches!(
+            err,
+            BreakerError::Inner(RpcError::ServerError { .. })
+        ));
     }
     // Breaker stays Closed; counter stays at 0.
     assert_eq!(breaker.state(), BreakerState::Closed);
@@ -274,9 +307,7 @@ fn breaker_reset_clears_state() {
     let body = async move {
         for _ in 0..10 {
             let _ = breaker
-                .call(|| async {
-                    Err::<(), _>(RpcError::Timeout { elapsed_ms: 10 })
-                })
+                .call(|| async { Err::<(), _>(RpcError::Timeout { elapsed_ms: 10 }) })
                 .await;
         }
         assert_eq!(breaker.state(), BreakerState::Open);

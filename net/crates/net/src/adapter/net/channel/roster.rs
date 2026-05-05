@@ -113,7 +113,10 @@ impl ChannelSubscribers {
     /// leaking per-channel entries for ephemeral channels.
     fn is_empty(&self) -> bool {
         self.broadcasters.is_empty()
-            && self.queue_groups.iter().all(|e| e.value().members.is_empty())
+            && self
+                .queue_groups
+                .iter()
+                .all(|e| e.value().members.is_empty())
     }
 
     /// All subscribers regardless of mode. The set-membership view
@@ -268,12 +271,7 @@ impl SubscriberRoster {
     /// subscription would appear in `by_peer` but never in
     /// `members(channel)`, silently breaking fan-out. Keeping the
     /// inner mutation under the entry guard closes that race.
-    pub fn add_with_mode(
-        &self,
-        channel: ChannelId,
-        node_id: u64,
-        mode: SubscriptionMode,
-    ) -> bool {
+    pub fn add_with_mode(&self, channel: ChannelId, node_id: u64, mode: SubscriptionMode) -> bool {
         let inserted = {
             let entry = self
                 .subs
@@ -387,11 +385,7 @@ impl SubscriberRoster {
     /// distinguish broadcast subscribers from queue-group members
     /// (e.g., the membership-change handler that surfaces a
     /// `QueueGroup` event back to the originating peer).
-    pub fn subscriber_mode(
-        &self,
-        node_id: u64,
-        channel: &ChannelId,
-    ) -> Option<SubscriptionMode> {
+    pub fn subscriber_mode(&self, node_id: u64, channel: &ChannelId) -> Option<SubscriptionMode> {
         self.subs.get(channel).and_then(|s| s.mode_of(node_id))
     }
 

@@ -91,7 +91,9 @@ async fn register_and_unregister_round_trip() {
     let dispatcher_b: RpcInboundDispatcher = Arc::new(|_| {});
 
     // Empty slot.
-    assert!(node.register_rpc_inbound(0xABCD, dispatcher_a.clone()).is_none());
+    assert!(node
+        .register_rpc_inbound(0xABCD, dispatcher_a.clone())
+        .is_none());
     // Occupied slot — register returns the prior.
     let prior = node.register_rpc_inbound(0xABCD, dispatcher_b.clone());
     assert!(
@@ -100,7 +102,10 @@ async fn register_and_unregister_round_trip() {
     );
     // Unregister returns the currently-registered (B).
     let removed = node.unregister_rpc_inbound(0xABCD);
-    assert!(removed.is_some(), "unregister of registered slot must return Some");
+    assert!(
+        removed.is_some(),
+        "unregister of registered slot must return Some"
+    );
     // After unregister, slot is empty again.
     assert!(node.unregister_rpc_inbound(0xABCD).is_none());
 }

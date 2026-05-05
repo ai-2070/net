@@ -225,5 +225,8 @@ async fn typed_streaming_chunk_decode_failure_terminates_stream() {
     }
     // Subsequent polls return None — the typed stream marks itself
     // done after a decode failure.
-    assert!(stream.next().await.is_none(), "stream must close after decode error");
+    assert!(
+        stream.next().await.is_none(),
+        "stream must close after decode error"
+    );
 }

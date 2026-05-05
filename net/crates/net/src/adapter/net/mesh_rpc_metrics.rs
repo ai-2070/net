@@ -234,14 +234,10 @@ impl RpcMetricsRegistry {
                 latency_sum_ns: m.latency_sum_ns.load(Ordering::Relaxed),
                 latency_count: m.latency_count.load(Ordering::Relaxed),
                 latency_buckets: buckets,
-                handler_invocations_total: m
-                    .handler_invocations_total
-                    .load(Ordering::Relaxed),
+                handler_invocations_total: m.handler_invocations_total.load(Ordering::Relaxed),
                 handler_panics_total: m.handler_panics_total.load(Ordering::Relaxed),
                 handler_in_flight: m.handler_in_flight.load(Ordering::Relaxed),
-                handler_duration_sum_ns: m
-                    .handler_duration_sum_ns
-                    .load(Ordering::Relaxed),
+                handler_duration_sum_ns: m.handler_duration_sum_ns.load(Ordering::Relaxed),
                 handler_duration_count: m.handler_duration_count.load(Ordering::Relaxed),
                 handler_duration_buckets: handler_buckets,
                 streaming_chunks_emitted_total: m
@@ -351,7 +347,9 @@ impl RpcMetricsSnapshot {
         let mut out = String::with_capacity(2048);
 
         // calls_total
-        out.push_str("# HELP nrpc_calls_total Total nRPC calls that resolved (success or error).\n");
+        out.push_str(
+            "# HELP nrpc_calls_total Total nRPC calls that resolved (success or error).\n",
+        );
         out.push_str("# TYPE nrpc_calls_total counter\n");
         for s in &self.services {
             let _ = writeln!(
@@ -402,9 +400,7 @@ impl RpcMetricsSnapshot {
         }
 
         // latency histogram
-        out.push_str(
-            "# HELP nrpc_call_latency_seconds Wall-clock nRPC call latency in seconds.\n",
-        );
+        out.push_str("# HELP nrpc_call_latency_seconds Wall-clock nRPC call latency in seconds.\n");
         out.push_str("# TYPE nrpc_call_latency_seconds histogram\n");
         for s in &self.services {
             let svc = escape_label(&s.service);
@@ -592,19 +588,13 @@ impl Drop for CallMetricsGuard {
             match outcome {
                 CallOutcome::Ok => {}
                 CallOutcome::NoRoute => {
-                    self.metrics
-                        .errors_no_route
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics.errors_no_route.fetch_add(1, Ordering::Relaxed);
                 }
                 CallOutcome::Timeout => {
-                    self.metrics
-                        .errors_timeout
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics.errors_timeout.fetch_add(1, Ordering::Relaxed);
                 }
                 CallOutcome::ServerError => {
-                    self.metrics
-                        .errors_server
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics.errors_server.fetch_add(1, Ordering::Relaxed);
                 }
                 CallOutcome::Transport => {
                     self.metrics
@@ -723,7 +713,11 @@ mod tests {
             // Drop without record() — simulates hedge loser.
         }
         assert_eq!(m.in_flight.load(Ordering::Relaxed), 0, "in_flight balanced");
-        assert_eq!(m.calls_total.load(Ordering::Relaxed), 0, "no outcome recorded");
+        assert_eq!(
+            m.calls_total.load(Ordering::Relaxed),
+            0,
+            "no outcome recorded"
+        );
         assert_eq!(m.latency_count.load(Ordering::Relaxed), 0);
     }
 }

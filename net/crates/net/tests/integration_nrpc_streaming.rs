@@ -73,11 +73,7 @@ struct CounterStreamHandler {
 
 #[async_trait::async_trait]
 impl RpcStreamingHandler for CounterStreamHandler {
-    async fn call(
-        &self,
-        _ctx: RpcContext,
-        sink: RpcResponseSink,
-    ) -> Result<(), RpcHandlerError> {
+    async fn call(&self, _ctx: RpcContext, sink: RpcResponseSink) -> Result<(), RpcHandlerError> {
         for i in 0..self.count {
             sink.send(format!("chunk-{i}").into_bytes());
         }
@@ -93,11 +89,7 @@ struct ForeverStreamHandler {
 
 #[async_trait::async_trait]
 impl RpcStreamingHandler for ForeverStreamHandler {
-    async fn call(
-        &self,
-        ctx: RpcContext,
-        sink: RpcResponseSink,
-    ) -> Result<(), RpcHandlerError> {
+    async fn call(&self, ctx: RpcContext, sink: RpcResponseSink) -> Result<(), RpcHandlerError> {
         let mut i: u64 = 0;
         loop {
             tokio::select! {
@@ -120,11 +112,7 @@ struct ErrAfterTwoHandler;
 
 #[async_trait::async_trait]
 impl RpcStreamingHandler for ErrAfterTwoHandler {
-    async fn call(
-        &self,
-        _ctx: RpcContext,
-        sink: RpcResponseSink,
-    ) -> Result<(), RpcHandlerError> {
+    async fn call(&self, _ctx: RpcContext, sink: RpcResponseSink) -> Result<(), RpcHandlerError> {
         sink.send(Bytes::from_static(b"first"));
         sink.send(Bytes::from_static(b"second"));
         // Give the pump a beat to drain before returning Err.
@@ -333,7 +321,10 @@ async fn rpc_streaming_auto_grant_drains_full_stream_under_small_window() {
         got.push(String::from_utf8(item.expect("ok").to_vec()).unwrap());
     }
     let want: Vec<String> = (0..25).map(|i| format!("c-{i}")).collect();
-    assert_eq!(got, want, "auto-grant must let the full stream flow through");
+    assert_eq!(
+        got, want,
+        "auto-grant must let the full stream flow through"
+    );
 }
 
 /// Explicit `RpcStream::grant(n)` adds credit on demand. Pin:

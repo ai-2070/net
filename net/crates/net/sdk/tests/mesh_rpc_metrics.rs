@@ -15,8 +15,16 @@ use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::mesh_rpc::CallOptions;
 
 async fn two_meshes(psk: &[u8; 32]) -> (Mesh, Mesh, std::net::SocketAddr) {
-    let a = MeshBuilder::new("127.0.0.1:0", psk).unwrap().build().await.unwrap();
-    let b = MeshBuilder::new("127.0.0.1:0", psk).unwrap().build().await.unwrap();
+    let a = MeshBuilder::new("127.0.0.1:0", psk)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let b = MeshBuilder::new("127.0.0.1:0", psk)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
     let addr_b = b.inner().local_addr();
     (a, b, addr_b)
 }
@@ -55,10 +63,7 @@ async fn metrics_snapshot_reflects_mixed_outcomes() {
     }
     #[async_trait]
     impl RpcHandler for ToggleHandler {
-        async fn call(
-            &self,
-            ctx: RpcContext,
-        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             let n = self
                 .invocation_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -97,13 +102,23 @@ async fn metrics_snapshot_reflects_mixed_outcomes() {
     // 3 successes.
     for _ in 0..3 {
         caller
-            .call(target, "echo_metrics", bytes::Bytes::from_static(b"hi"), CallOptions::default())
+            .call(
+                target,
+                "echo_metrics",
+                bytes::Bytes::from_static(b"hi"),
+                CallOptions::default(),
+            )
             .await
             .expect("ok");
     }
     // 1 server-error.
     let err = caller
-        .call(target, "echo_metrics", bytes::Bytes::from_static(b""), CallOptions::default())
+        .call(
+            target,
+            "echo_metrics",
+            bytes::Bytes::from_static(b""),
+            CallOptions::default(),
+        )
         .await
         .expect_err("must fail");
     match err {
@@ -140,7 +155,10 @@ async fn metrics_snapshot_reflects_mixed_outcomes() {
     assert_eq!(echo.errors_timeout, 1, "exactly one Timeout");
     assert_eq!(echo.errors_no_route, 0);
     assert_eq!(echo.errors_transport, 0);
-    assert_eq!(echo.in_flight, 0, "all calls resolved → in_flight back to 0");
+    assert_eq!(
+        echo.in_flight, 0,
+        "all calls resolved → in_flight back to 0"
+    );
     assert_eq!(
         echo.latency_count, 5,
         "every resolved call records one latency observation",
@@ -171,10 +189,7 @@ async fn server_side_metrics_increment_for_unary_and_streaming() {
     struct Echo;
     #[async_trait]
     impl RpcHandler for Echo {
-        async fn call(
-            &self,
-            ctx: RpcContext,
-        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             // Add a small sleep so the handler-duration histogram
             // has a non-zero observation that lands in a known
             // bucket window.
@@ -248,15 +263,23 @@ async fn server_side_metrics_increment_for_unary_and_streaming() {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         let snap = server.rpc_metrics_snapshot();
-        let echo = snap.services.iter().find(|s| s.service == "server_metric_echo");
+        let echo = snap
+            .services
+            .iter()
+            .find(|s| s.service == "server_metric_echo");
         let stream_svc = snap
             .services
             .iter()
             .find(|s| s.service == "server_metric_stream");
-        let echo_done = echo.map(|e| e.handler_in_flight == 0 && e.handler_invocations_total >= 4).unwrap_or(false);
+        let echo_done = echo
+            .map(|e| e.handler_in_flight == 0 && e.handler_invocations_total >= 4)
+            .unwrap_or(false);
         let stream_done = stream_svc
-            .map(|s| s.handler_in_flight == 0 && s.handler_invocations_total >= 1
-                && s.streaming_chunks_emitted_total >= 3)
+            .map(|s| {
+                s.handler_in_flight == 0
+                    && s.handler_invocations_total >= 1
+                    && s.streaming_chunks_emitted_total >= 3
+            })
             .unwrap_or(false);
         if echo_done && stream_done {
             break;
@@ -332,10 +355,7 @@ async fn metrics_prometheus_text_contains_canonical_names() {
     struct Always;
     #[async_trait]
     impl RpcHandler for Always {
-        async fn call(
-            &self,
-            ctx: RpcContext,
-        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
@@ -355,7 +375,12 @@ async fn metrics_prometheus_text_contains_canonical_names() {
     let target = server.inner().node_id();
     for _ in 0..2 {
         caller
-            .call(target, "prom_test", bytes::Bytes::from_static(b""), CallOptions::default())
+            .call(
+                target,
+                "prom_test",
+                bytes::Bytes::from_static(b""),
+                CallOptions::default(),
+            )
             .await
             .expect("ok");
     }
@@ -376,7 +401,10 @@ async fn metrics_prometheus_text_contains_canonical_names() {
         );
     }
     // Our service label appears + +Inf bucket present + count is right.
-    assert!(caller_text.contains("service=\"prom_test\""), "service label missing");
+    assert!(
+        caller_text.contains("service=\"prom_test\""),
+        "service label missing"
+    );
     assert!(caller_text.contains("le=\"+Inf\""), "+Inf bucket missing");
     assert!(
         caller_text.contains("nrpc_calls_total{service=\"prom_test\"} 2"),

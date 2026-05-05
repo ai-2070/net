@@ -716,7 +716,7 @@ mod tests {
         buf.put_u8(name.len() as u8);
         buf.extend_from_slice(name);
         buf.put_u16_le(0); // no token
-        // Claim a 200-byte queue-group name but only provide 5.
+                           // Claim a 200-byte queue-group name but only provide 5.
         buf.put_u8(200);
         buf.extend_from_slice(b"short");
         let err = decode(&buf).unwrap_err();

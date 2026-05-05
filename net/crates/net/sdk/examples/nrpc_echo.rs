@@ -27,9 +27,7 @@ use std::time::Duration;
 
 use net_sdk::capabilities::CapabilitySet;
 use net_sdk::mesh::MeshBuilder;
-use net_sdk::mesh_rpc::{
-    CallOptions, CallOptionsTyped, Codec, RoutingPolicy, RpcError,
-};
+use net_sdk::mesh_rpc::{CallOptions, CallOptionsTyped, Codec, RoutingPolicy, RpcError};
 use serde::{Deserialize, Serialize};
 
 /// Request type for the `echo` service. Could be any
@@ -80,16 +78,13 @@ async fn main() -> net_sdk::error::Result<()> {
     let server_pub = *server.inner().public_key();
     let server_id = server.inner().node_id();
     let caller_id = caller.inner().node_id();
-    let (accept_res, connect_res) = tokio::join!(
-        server.inner().accept(caller_id),
-        async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            caller
-                .inner()
-                .connect(server_addr, &server_pub, server_id)
-                .await
-        }
-    );
+    let (accept_res, connect_res) = tokio::join!(server.inner().accept(caller_id), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        caller
+            .inner()
+            .connect(server_addr, &server_pub, server_id)
+            .await
+    });
     accept_res.map_err(|e| net_sdk::error::SdkError::Config(format!("accept: {e}")))?;
     connect_res.map_err(|e| net_sdk::error::SdkError::Config(format!("connect: {e}")))?;
     server.inner().start();
@@ -100,13 +95,14 @@ async fn main() -> net_sdk::error::Result<()> {
     // closure takes a typed Req and returns Result<Resp, String>;
     // the SDK auto serde via the JSON codec.
     // ──────────────────────────────────────────────────────────────
-    let _serve_echo = server.serve_rpc_typed("echo", Codec::Json, |req: EchoRequest| async move {
-        Ok(EchoResponse {
-            echoed: req.message,
-            server_label: "primary".to_string(),
+    let _serve_echo = server
+        .serve_rpc_typed("echo", Codec::Json, |req: EchoRequest| async move {
+            Ok(EchoResponse {
+                echoed: req.message,
+                server_label: "primary".to_string(),
+            })
         })
-    })
-    .map_err(|e| net_sdk::error::SdkError::Config(format!("serve echo: {e}")))?;
+        .map_err(|e| net_sdk::error::SdkError::Config(format!("serve echo: {e}")))?;
 
     let _serve_add = server
         .serve_rpc_typed("add", Codec::Json, |req: AddRequest| async move {

@@ -147,10 +147,8 @@ impl Mesh {
         // hash lookups, just carried so the ChannelConfig is
         // structurally well-formed.
         if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
-            self.channel_configs_arc().insert_prefix(
-                prefix,
-                ChannelConfig::new(ChannelId::new(sentinel_name)),
-            );
+            self.channel_configs_arc()
+                .insert_prefix(prefix, ChannelConfig::new(ChannelId::new(sentinel_name)));
         }
     }
 
@@ -163,7 +161,9 @@ impl Mesh {
         payload: Bytes,
         opts: CallOptions,
     ) -> std::result::Result<RpcReply, RpcError> {
-        self.node().call(target_node_id, service, payload, opts).await
+        self.node()
+            .call(target_node_id, service, payload, opts)
+            .await
     }
 
     /// Service-name call. Consults the capability index for nodes
@@ -239,10 +239,13 @@ impl Mesh {
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let body = opts.codec.encode(request).map_err(|e| RpcError::ServerError {
-            status: RpcStatus::Internal.to_wire(),
-            message: format!("client encode: {e}"),
-        })?;
+        let body = opts
+            .codec
+            .encode(request)
+            .map_err(|e| RpcError::ServerError {
+                status: RpcStatus::Internal.to_wire(),
+                message: format!("client encode: {e}"),
+            })?;
         let reply = self
             .call(target_node_id, service, Bytes::from(body), opts.raw)
             .await?;
@@ -266,11 +269,16 @@ impl Mesh {
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let body = opts.codec.encode(request).map_err(|e| RpcError::ServerError {
-            status: RpcStatus::Internal.to_wire(),
-            message: format!("client encode: {e}"),
-        })?;
-        let reply = self.call_service(service, Bytes::from(body), opts.raw).await?;
+        let body = opts
+            .codec
+            .encode(request)
+            .map_err(|e| RpcError::ServerError {
+                status: RpcStatus::Internal.to_wire(),
+                message: format!("client encode: {e}"),
+            })?;
+        let reply = self
+            .call_service(service, Bytes::from(body), opts.raw)
+            .await?;
         opts.codec
             .decode(&reply.body)
             .map_err(|e| RpcError::ServerError {
@@ -360,10 +368,13 @@ impl Mesh {
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let body = opts.codec.encode(request).map_err(|e| RpcError::ServerError {
-            status: RpcStatus::Internal.to_wire(),
-            message: format!("client encode: {e}"),
-        })?;
+        let body = opts
+            .codec
+            .encode(request)
+            .map_err(|e| RpcError::ServerError {
+                status: RpcStatus::Internal.to_wire(),
+                message: format!("client encode: {e}"),
+            })?;
         let inner = self
             .call_streaming(target_node_id, service, Bytes::from(body), opts.raw)
             .await?;
@@ -508,12 +519,12 @@ where
             }
         };
         // Run the user's closure.
-        let resp = (self.inner)(req).await.map_err(|message| {
-            RpcHandlerError::Application {
+        let resp = (self.inner)(req)
+            .await
+            .map_err(|message| RpcHandlerError::Application {
                 code: 0x4001,
                 message,
-            }
-        })?;
+            })?;
         // Encode the response body.
         let body = self
             .codec

@@ -18,8 +18,8 @@ use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus, TraceContext,
 };
 use net::adapter::net::mesh_rpc::{CallOptions, RpcError};
-use parking_lot::Mutex;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use parking_lot::Mutex;
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
@@ -221,7 +221,10 @@ async fn rpc_server_panic_surfaces_as_internal() {
     match err {
         RpcError::ServerError { status, message } => {
             // RpcStatus::Internal = 0x0006.
-            assert_eq!(status, 0x0006, "expected Internal status, got {status:#06x}");
+            assert_eq!(
+                status, 0x0006,
+                "expected Internal status, got {status:#06x}"
+            );
             assert!(
                 message.contains("boom"),
                 "panic message must be in body, got {message:?}"

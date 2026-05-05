@@ -284,11 +284,11 @@ where
     // Loop body always returns on the final iteration; the
     // unreachable here is a safety net for a future refactor that
     // changes the bounds.
-    Err(last_err.unwrap_or_else(|| RpcError::Transport(
-        net::error::AdapterError::Connection(
+    Err(last_err.unwrap_or_else(|| {
+        RpcError::Transport(net::error::AdapterError::Connection(
             "retry_loop: exhausted with no error captured (bug)".into(),
-        ),
-    )))
+        ))
+    }))
 }
 
 // ============================================================================
@@ -462,10 +462,7 @@ impl Mesh {
             })
     }
 
-    fn resolve_hedge_candidates(
-        &self,
-        service: &str,
-    ) -> std::result::Result<Vec<u64>, RpcError> {
+    fn resolve_hedge_candidates(&self, service: &str) -> std::result::Result<Vec<u64>, RpcError> {
         let mut candidates = self.find_service_nodes(service);
         if candidates.is_empty() {
             return Err(RpcError::NoRoute {
@@ -504,7 +501,9 @@ async fn hedge_race(
     // Build one future per target. The first fires immediately; each
     // subsequent one waits `delay * idx` before invoking. Boxed +
     // pinned so they share a `select_all`-compatible type.
-    let mut futures: Vec<futures::future::BoxFuture<'static, std::result::Result<RpcReply, RpcError>>> = targets
+    let mut futures: Vec<
+        futures::future::BoxFuture<'static, std::result::Result<RpcReply, RpcError>>,
+    > = targets
         .iter()
         .copied()
         .enumerate()
@@ -540,11 +539,11 @@ async fn hedge_race(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| RpcError::Transport(
-        net::error::AdapterError::Connection(
+    Err(last_err.unwrap_or_else(|| {
+        RpcError::Transport(net::error::AdapterError::Connection(
             "hedge_race: drained with no error captured (bug)".into(),
-        ),
-    )))
+        ))
+    }))
 }
 
 /// `min(max_backoff, initial * multiplier^(attempt-1))`, optionally
@@ -842,11 +841,8 @@ impl CircuitBreaker {
                 if counts {
                     match admission {
                         Admission::Closed => {
-                            g.consecutive_failures =
-                                g.consecutive_failures.saturating_add(1);
-                            if g.consecutive_failures
-                                >= self.config.failure_threshold.max(1)
-                            {
+                            g.consecutive_failures = g.consecutive_failures.saturating_add(1);
+                            if g.consecutive_failures >= self.config.failure_threshold.max(1) {
                                 g.state = BreakerState::Open;
                                 g.opened_at = Some(std::time::Instant::now());
                                 g.consecutive_successes = 0;
@@ -882,10 +878,7 @@ impl CircuitBreaker {
         match g.state {
             BreakerState::Closed => AdmissionOutcome::Closed,
             BreakerState::Open => {
-                let elapsed = g
-                    .opened_at
-                    .map(|i| i.elapsed())
-                    .unwrap_or(Duration::ZERO);
+                let elapsed = g.opened_at.map(|i| i.elapsed()).unwrap_or(Duration::ZERO);
                 if elapsed >= self.config.reset_after {
                     g.state = BreakerState::HalfOpen;
                     g.consecutive_successes = 0;

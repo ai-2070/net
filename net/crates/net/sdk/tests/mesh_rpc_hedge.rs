@@ -61,10 +61,7 @@ async fn hedge_backup_wins_when_primary_is_slow() {
     }
     #[async_trait]
     impl RpcHandler for DelayHandler {
-        async fn call(
-            &self,
-            _ctx: RpcContext,
-        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
@@ -144,10 +141,7 @@ async fn hedge_zero_degrades_to_single_call() {
     struct EchoHandler;
     #[async_trait]
     impl RpcHandler for EchoHandler {
-        async fn call(
-            &self,
-            ctx: RpcContext,
-        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
@@ -191,10 +185,10 @@ async fn hedge_zero_degrades_to_single_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hedge_loser_handler_observes_cancellation() {
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use net_sdk::mesh_rpc::{
         RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Slow handler that explicitly observes cancellation.
     struct ObserveCancelHandler {
@@ -202,10 +196,7 @@ async fn hedge_loser_handler_observes_cancellation() {
     }
     #[async_trait]
     impl RpcHandler for ObserveCancelHandler {
-        async fn call(
-            &self,
-            _ctx: RpcContext,
-        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             tokio::select! {
                 _ = _ctx.cancellation.cancelled() => {
                     self.cancelled.store(true, Ordering::SeqCst);
@@ -224,10 +215,7 @@ async fn hedge_loser_handler_observes_cancellation() {
     struct InstantHandler;
     #[async_trait]
     impl RpcHandler for InstantHandler {
-        async fn call(
-            &self,
-            _ctx: RpcContext,
-        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],

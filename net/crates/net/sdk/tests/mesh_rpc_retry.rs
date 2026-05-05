@@ -23,8 +23,16 @@ use net_sdk::mesh_rpc_resilience::{default_retryable, RetryPolicy};
 use serde::{Deserialize, Serialize};
 
 async fn two_meshes(psk: &[u8; 32]) -> (Mesh, Mesh, std::net::SocketAddr) {
-    let a = MeshBuilder::new("127.0.0.1:0", psk).unwrap().build().await.unwrap();
-    let b = MeshBuilder::new("127.0.0.1:0", psk).unwrap().build().await.unwrap();
+    let a = MeshBuilder::new("127.0.0.1:0", psk)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let b = MeshBuilder::new("127.0.0.1:0", psk)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
     let addr_b = b.inner().local_addr();
     (a, b, addr_b)
 }
@@ -70,18 +78,17 @@ async fn retry_eventually_succeeds_after_transient_failures() {
     // `RpcStatus::Application(0x4001)`, which is NOT in the default
     // retryable set — so we use the raw `serve_rpc` path with
     // `RpcHandlerError::Internal` to get a retryable error.
-    use net_sdk::mesh_rpc::{RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus};
     use async_trait::async_trait;
+    use net_sdk::mesh_rpc::{
+        RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    };
     struct FailThenOk {
         calls: Arc<AtomicUsize>,
         fail_count: usize,
     }
     #[async_trait]
     impl RpcHandler for FailThenOk {
-        async fn call(
-            &self,
-            ctx: RpcContext,
-        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_count {
                 Err(RpcHandlerError::Internal(format!("transient failure #{n}")))
@@ -154,17 +161,13 @@ async fn retry_does_not_retry_application_errors() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_handler = calls.clone();
     let _serve = server
-        .serve_rpc_typed(
-            "validate",
-            Codec::Json,
-            move |req: PingRequest| {
-                let calls = calls_for_handler.clone();
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Err::<PingResponse, _>(format!("rejected seq {}", req.seq))
-                }
-            },
-        )
+        .serve_rpc_typed("validate", Codec::Json, move |req: PingRequest| {
+            let calls = calls_for_handler.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<PingResponse, _>(format!("rejected seq {}", req.seq))
+            }
+        })
         .expect("serve_rpc_typed");
 
     let policy = RetryPolicy::default();
@@ -204,24 +207,26 @@ async fn retry_exhaustion_surfaces_last_error() {
     let (caller, server, addr_server) = two_meshes(&psk).await;
     handshake(&caller, &server, addr_server).await;
 
-    use net_sdk::mesh_rpc::{RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload};
     use async_trait::async_trait;
+    use net_sdk::mesh_rpc::{RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload};
     struct AlwaysInternal {
         calls: Arc<AtomicUsize>,
     }
     #[async_trait]
     impl RpcHandler for AlwaysInternal {
-        async fn call(
-            &self,
-            _ctx: RpcContext,
-        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(RpcHandlerError::Internal("always".into()))
         }
     }
     let calls = Arc::new(AtomicUsize::new(0));
     let _serve = server
-        .serve_rpc("doomed", Arc::new(AlwaysInternal { calls: calls.clone() }))
+        .serve_rpc(
+            "doomed",
+            Arc::new(AlwaysInternal {
+                calls: calls.clone(),
+            }),
+        )
         .expect("serve_rpc");
 
     let policy = RetryPolicy {
