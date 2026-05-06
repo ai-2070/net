@@ -1,0 +1,23 @@
+net/crates/net/docs/misc/DATAFORTS_FEATURES.md
+  03fa3cc7afe4c832 223,225,227-233,249-257,259-261,263,265-268,270,272,274,277-281,283,285
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "5dce2bb8a351a5168418984e44f0928f547d1094",
+  "prompts": {
+    "03fa3cc7afe4c832": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08ddba21-fadf-4d00-a55b-a3d46774b21e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 38,
+      "total_deletions": 25,
+      "accepted_lines": 38,
+      "overriden_lines": 0
+    }
+  }
+}
