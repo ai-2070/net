@@ -46,7 +46,12 @@ import {
 // — so we can test indirectly by faking the raw napi MeshRpc
 // shape. That gives us coverage of the orchestration code too.
 
-import { TypedMeshRpc } from '../mesh_rpc'
+import {
+  TypedMeshRpc,
+  type CallOptions,
+  type RawMeshRpc,
+  type ServeHandle,
+} from '../mesh_rpc'
 
 // ============================================================================
 // Error classification
@@ -124,6 +129,20 @@ describe('defaultRetryable', () => {
     expect(defaultRetryable(new RpcCodecError('x', 'decode'))).toBe(false)
   })
 
+  // Regression: `RpcCancelledError`'s class docstring states it
+  // is NOT retried by the default policy, but the pre-TS-migration
+  // predicate fell through to the generic `nrpc:` "retry by
+  // default" branch — silently re-issuing cancelled calls and
+  // wasting the backoff budget on a deterministic terminal error.
+  // Pin both the typed-class path and the raw-message-prefix
+  // path so a future refactor can't reintroduce the gap.
+  it('does NOT retry RpcCancelledError (caller-driven terminal)', () => {
+    expect(defaultRetryable(new RpcCancelledError('x'))).toBe(false)
+    expect(
+      defaultRetryable({ message: 'nrpc:cancelled: AbortSignal aborted' }),
+    ).toBe(false)
+  })
+
   it('retries Timeout / Transport unconditionally', () => {
     expect(defaultRetryable(new RpcTimeoutError('elapsed_ms=100'))).toBe(true)
     expect(defaultRetryable(new RpcTransportError('x'))).toBe(true)
@@ -157,6 +176,35 @@ describe('defaultRetryable', () => {
 
   it('does not retry plain Errors (non-RpcError)', () => {
     expect(defaultRetryable(new Error('plain'))).toBe(false)
+  })
+
+  // Regression: the migration nearly tightened the predicate to
+  // `instanceof Error` only, which would silently mark every
+  // duck-typed rejection as non-retryable — masking transient
+  // failures during migration windows or vm-boundary catches.
+  // Pin: rejected values that look like errors (string with the
+  // canonical prefix, or a `{message}` object) classify the same
+  // way real Error instances do.
+  it('classifies plain {message} objects by `nrpc:` prefix', () => {
+    expect(defaultRetryable({ message: 'nrpc:transport: x' })).toBe(true)
+    expect(defaultRetryable({ message: 'nrpc:timeout: x' })).toBe(true)
+    expect(defaultRetryable({ message: 'nrpc:no_route: x' })).toBe(false)
+    expect(defaultRetryable({ message: 'nrpc:codec_encode: x' })).toBe(false)
+    expect(
+      defaultRetryable({ message: 'nrpc:server_error: status=0x0006 x' }),
+    ).toBe(true)
+    expect(
+      defaultRetryable({ message: 'nrpc:server_error: status=0x8001 x' }),
+    ).toBe(false)
+  })
+
+  it('non-object rejections short-circuit to non-retryable', () => {
+    // A string rejection isn't a structured error — the resilience
+    // layer can't reason about it, so it should not retry.
+    expect(defaultRetryable('nrpc:transport: foo')).toBe(false)
+    expect(defaultRetryable(null)).toBe(false)
+    expect(defaultRetryable(undefined)).toBe(false)
+    expect(defaultRetryable(42)).toBe(false)
   })
 
   it('defaultBreakerFailure has the same shape as defaultRetryable', () => {
@@ -360,7 +408,7 @@ describe('RetryPolicy validation', () => {
 //   - the round trip returns a structurally-equal value
 // ============================================================================
 
-class StubRawMeshRpc {
+class StubRawMeshRpc implements RawMeshRpc {
   // Stores the last encoded request bytes for assertion.
   lastRequest: Buffer | null = null
   // What to return as the response body.
@@ -379,11 +427,20 @@ class StubRawMeshRpc {
   async callStreaming(): Promise<never> {
     throw new Error('not implemented in stub')
   }
-  serve(): never {
+  serve(): ServeHandle {
     throw new Error('not implemented in stub')
   }
   findServiceNodes(): bigint[] {
     return []
+  }
+  // Cancellation surface — codec tests don't exercise it, but
+  // RawMeshRpc requires both methods. Both throw so a mistakenly-
+  // wired cancel path fails loudly instead of silently no-op'ing.
+  reserveCancelToken(): bigint {
+    throw new Error('reserveCancelToken not implemented in stub')
+  }
+  cancelCall(_token: bigint): void {
+    throw new Error('cancelCall not implemented in stub')
   }
 }
 
@@ -392,7 +449,7 @@ describe('TypedMeshRpc JSON codec', () => {
     const stub = new StubRawMeshRpc(
       Buffer.from(JSON.stringify({ pong: 42 }), 'utf-8'),
     )
-    const rpc = new TypedMeshRpc(stub as unknown)
+    const rpc = new TypedMeshRpc(stub)
     const reply = await rpc.call(0n, 'echo', { ping: 'hi' })
     expect(reply).toEqual({ pong: 42 })
     expect(stub.lastRequest).toEqual(
@@ -407,7 +464,7 @@ describe('TypedMeshRpc JSON codec', () => {
 
   it('encode failure (BigInt at top level) throws nrpc:codec_encode', async () => {
     const stub = new StubRawMeshRpc(Buffer.from('null'))
-    const rpc = new TypedMeshRpc(stub as unknown)
+    const rpc = new TypedMeshRpc(stub)
     let caught: Error | null = null
     try {
       await rpc.call(0n, 'echo', 1n)
@@ -423,7 +480,7 @@ describe('TypedMeshRpc JSON codec', () => {
 
   it('encode failure on undefined throws nrpc:codec_encode', async () => {
     const stub = new StubRawMeshRpc(Buffer.from('null'))
-    const rpc = new TypedMeshRpc(stub as unknown)
+    const rpc = new TypedMeshRpc(stub)
     let caught: Error | null = null
     try {
       await rpc.call(0n, 'echo', undefined)
@@ -438,7 +495,7 @@ describe('TypedMeshRpc JSON codec', () => {
 
   it('decode failure on malformed response throws nrpc:codec_decode', async () => {
     const stub = new StubRawMeshRpc(Buffer.from('{not json')) // malformed
-    const rpc = new TypedMeshRpc(stub as unknown)
+    const rpc = new TypedMeshRpc(stub)
     let caught: Error | null = null
     try {
       await rpc.call(0n, 'echo', { x: 1 })
@@ -490,11 +547,11 @@ describe('AbortSignal wiring on the typed wrapper', () => {
   // reserveCancelToken / cancelCall. Lets us pin: (a) signal is
   // translated to a non-zero cancelToken on the raw call, (b) abort
   // fires cancelCall(token), (c) signal is detached after the call.
-  class CancelTrackingRaw {
+  class CancelTrackingRaw implements RawMeshRpc {
     public reservations: bigint[] = []
     public capturedTokens: bigint[] = []
     public cancelCalls: bigint[] = []
-    public capturedOpts: unknown = null
+    public capturedOpts: CallOptions | undefined = undefined
     private nextToken = 100n
     private callBlock?: () => Promise<Buffer>
 
@@ -506,7 +563,7 @@ describe('AbortSignal wiring on the typed wrapper', () => {
       _target: bigint,
       _service: string,
       _req: Buffer,
-      opts?: { cancelToken?: bigint } & Record<string, unknown>,
+      opts?: CallOptions,
     ): Promise<Buffer> {
       this.capturedOpts = opts
       if (opts && opts.cancelToken !== undefined) {
@@ -520,14 +577,14 @@ describe('AbortSignal wiring on the typed wrapper', () => {
     async callService(
       _service: string,
       _req: Buffer,
-      _opts?: unknown,
+      _opts?: CallOptions,
     ): Promise<Buffer> {
       return Buffer.from('null', 'utf-8')
     }
     async callStreaming(): Promise<never> {
       throw new Error('not implemented')
     }
-    serve(): never {
+    serve(): ServeHandle {
       throw new Error('not implemented')
     }
     findServiceNodes(): bigint[] {
@@ -545,7 +602,7 @@ describe('AbortSignal wiring on the typed wrapper', () => {
 
   it('strips signal from rawOpts and inserts a cancelToken', async () => {
     const raw = new CancelTrackingRaw()
-    const rpc = new TypedMeshRpc(raw as unknown)
+    const rpc = new TypedMeshRpc(raw)
     const ac = new AbortController()
     await rpc.call(0n, 'echo', { x: 1 }, { signal: ac.signal })
     expect(raw.reservations.length).toBe(1)
@@ -553,14 +610,12 @@ describe('AbortSignal wiring on the typed wrapper', () => {
     expect(raw.capturedTokens[0]).toBe(raw.reservations[0])
     // signal must NOT be passed through to the napi side; it's a
     // JS-only concept the napi struct doesn't understand.
-    expect(
-      (raw.capturedOpts as { signal?: AbortSignal }).signal,
-    ).toBeUndefined()
+    expect(raw.capturedOpts?.signal).toBeUndefined()
   })
 
   it('aborting the signal mid-call invokes raw.cancelCall(token)', async () => {
     const raw = new CancelTrackingRaw()
-    const rpc = new TypedMeshRpc(raw as unknown)
+    const rpc = new TypedMeshRpc(raw)
     const ac = new AbortController()
     let resolveCall: ((b: Buffer) => void) | null = null
     raw.setCallBlock(
@@ -582,7 +637,7 @@ describe('AbortSignal wiring on the typed wrapper', () => {
 
   it('rejects pre-aborted signals without starting the call', async () => {
     const raw = new CancelTrackingRaw()
-    const rpc = new TypedMeshRpc(raw as unknown)
+    const rpc = new TypedMeshRpc(raw)
     const ac = new AbortController()
     ac.abort()
     let caught: Error | null = null

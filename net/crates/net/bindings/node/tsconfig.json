@@ -14,5 +14,7 @@
     "types": ["node", "vitest/globals"]
   },
   "include": ["test/**/*.ts", "vitest.config.ts"],
-  "exclude": ["node_modules"]
+  // `*.bun.ts` benchmarks reference the Bun global; type-check
+  // them only with `@types/bun` installed (a Bun-runtime opt-in).
+  "exclude": ["node_modules", "test/**/*.bun.ts"]
 }

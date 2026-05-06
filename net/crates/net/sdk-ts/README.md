@@ -738,8 +738,13 @@ that nRPC consumes directly):
 
 ```typescript
 import { MeshNode } from '@ai2070/net-sdk'
-import { classifyError, RpcServerError } from '@ai2070/net/errors'
 import {
+  classifyError,
+  RpcCancelledError,
+  RpcServerError,
+} from '@ai2070/net/errors'
+import {
+  appError,
   CircuitBreaker,
   HedgePolicy,
   NRPC_TYPED_BAD_REQUEST,
@@ -790,7 +795,7 @@ await serveHandle.close()
 ```typescript
 const stream = await clientRpc.callStreaming<MyReq, MyChunk>(
   targetNodeId, 'tail', { tail: 'events' },
-  { deadlineMs: 5_000, streamWindow: 8 },  // optional flow control
+  { deadlineMs: 5_000, streamWindowInitial: 8 },  // optional flow control
 )
 for await (const chunk of stream) {
   // chunk is decoded MyChunk
@@ -799,31 +804,87 @@ for await (const chunk of stream) {
 // in-flight chunks are silently discarded.
 // stream.grant(n) issues an explicit credit publish for batched
 // cadence (no-op on streams without flow control).
+// stream.flowControlled() reports whether streamWindowInitial was
+// set on the call — useful for code that conditionally grants.
 ```
+
+### Cancellation (`AbortSignal`)
+
+`call` / `callService` accept an `AbortSignal` via `opts.signal`.
+The wrapper mints a cancel token, attaches a one-shot abort
+listener, and detaches it on settle so the same signal can be
+reused. Aborting publishes CANCEL to the server and rejects with
+`RpcCancelledError` (caller-fixable; **not** retried by the
+default `RetryPolicy` predicate).
+
+```typescript
+const ac = new AbortController()
+setTimeout(() => ac.abort(), 100)
+
+try {
+  await clientRpc.call(targetNodeId, 'slow', {}, { signal: ac.signal })
+} catch (e) {
+  if (classifyError(e) instanceof RpcCancelledError) {
+    // CANCEL fired on the wire; server-side handler observes
+    // its `ctx.cancellation` token.
+  }
+}
+```
+
+Pre-aborted signals fail fast — the call rejects with
+`nrpc:cancelled:` before any tokio spawn / registry overhead.
 
 ### Resilience helpers
 
+Defaults mirror the Rust SDK (`mesh_rpc_resilience`): 3 attempts,
+50ms→1s exponential backoff with full-half jitter, retryable
+predicate skips `RpcCodecError` / `RpcNoRouteError` /
+`RpcCancelledError` and non-transient `RpcServerError` statuses.
+
 ```typescript
+// RetryPolicy. `jitter` is a boolean (full-half jitter on/off);
+// override `retryable` to gate which errors retry.
 const policy = new RetryPolicy({
   maxAttempts: 4,
   initialBackoffMs: 50,
   maxBackoffMs: 1000,
-  jitter: 0.2,
+  jitter: true,
 })
 const reply = await clientRpc.callWithRetry(
-  targetNodeId, 'echo', { hello: 'world' }, policy,
+  targetNodeId, 'echo', { hello: 'world' }, undefined /* opts */, policy,
 )
 
-// HedgePolicy fans out parallel attempts on a delay;
-// first success wins, losers cancelled.
-const hedge = new HedgePolicy({ maxParallel: 3, hedgeDelayMs: 50 })
-await clientRpc.callWithHedgeTo(targetNodeIds, 'echo', { ... }, hedge)
+// HedgePolicy fans out parallel attempts on a delay; primary at
+// t=0, additional hedges at t=delayMs * idx. First reply (Ok or
+// Err) wins; if every hedge fails, the primary's error surfaces
+// deterministically.
+const hedge = new HedgePolicy({ delayMs: 50, hedges: 2 })  // primary + 2 hedges
+await clientRpc.callWithHedgeTo(targetNodeIds, 'echo', { /*...*/ }, undefined, hedge)
 
 // CircuitBreaker — closed → open → half-open with a configurable
 // failure predicate. Open breakers throw `BreakerOpenError` carrying
 // the `nrpc:breaker_open:` prefix.
 const breaker = new CircuitBreaker({ failureThreshold: 5, resetAfterMs: 1000 })
 await breaker.call(() => clientRpc.call(targetNodeId, 'echo', {}))
+```
+
+### Typed handler bad-request
+
+`appError(code, body)` builds an `Error` whose message follows the
+`nrpc:app_error:0x<code>:<body>` contract the napi binding parses
+into `RpcStatus::Application(code)`. Mirrors the Python binding's
+`RpcAppError`:
+
+```typescript
+serverRpc.serve<EchoSumRequest, EchoSumResponse>('echo_sum', (req) => {
+  if (typeof req.text !== 'string') {
+    throw appError(NRPC_TYPED_BAD_REQUEST, JSON.stringify({
+      error: 'invalid_request',
+      detail: 'text must be a string',
+    }))
+  }
+  return { echo: req.text, sum: req.numbers.reduce((a, b) => a + b, 0) }
+})
 ```
 
 ### Errors
@@ -834,15 +895,31 @@ starts with the stable `nrpc:` prefix (the binding throws plain
 dual-module-instance hazard; `classifyError(e)` reconstructs the
 typed subclass at the catch site):
 
-| Kind segment    | Typed class           |
-| --------------- | --------------------- |
-| `no_route`      | `RpcNoRouteError`     |
-| `timeout`       | `RpcTimeoutError`     |
-| `server_error`  | `RpcServerError`      |
-| `transport`     | `RpcTransportError`   |
-| `codec_encode`  | `RpcCodecError`       |
-| `codec_decode`  | `RpcCodecError`       |
-| `breaker_open`  | `BreakerOpenError`    |
+| Kind segment    | Typed class           | Retried by default? |
+| --------------- | --------------------- | ------------------- |
+| `no_route`      | `RpcNoRouteError`     | no                  |
+| `timeout`       | `RpcTimeoutError`     | yes                 |
+| `server_error`  | `RpcServerError`      | only `0x0003` / `0x0004` / `0x0006` |
+| `transport`     | `RpcTransportError`   | yes                 |
+| `codec_encode`  | `RpcCodecError`       | no (caller-fixable) |
+| `codec_decode`  | `RpcCodecError`       | no (caller-fixable) |
+| `cancelled`     | `RpcCancelledError`   | no (caller-driven)  |
+| any other       | `RpcError` (base)     | yes (forward-compat fallback) |
+
+`BreakerOpenError` is thrown directly by `CircuitBreaker.call`
+when the breaker is open — catch it via
+`instanceof BreakerOpenError` (imported from `@ai2070/net/mesh_rpc`).
+It carries the `nrpc:breaker_open:` prefix for log filtering, but
+`classifyError` routes it through the base `RpcError` rather than
+its own subclass. Server-side `appError(code, body)` rejections
+arrive at the caller as `nrpc:server_error: status=0x<code>`, so
+they classify as `RpcServerError` with `err.status === code`
+(check against `NRPC_TYPED_BAD_REQUEST` etc.).
+
+`classifyError` is duck-typed on `.message`: it accepts real
+`Error` instances, plain `{message: string}` objects, and string
+rejections — so top-level catch handlers reconstruct typed
+errors regardless of what the throw site emitted.
 
 Two stable status constants exposed by `@ai2070/net/mesh_rpc`:
 

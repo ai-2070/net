@@ -21,7 +21,14 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { classifyError, CortexError, NetDbError } from '../errors'
+import {
+  classifyError,
+  CortexError,
+  extractMessage,
+  NetDbError,
+  RpcServerError,
+  RpcTimeoutError,
+} from '../errors'
 
 // Cross-binding kind vocabulary for migration failures. Must stay
 // byte-identical to `MigrationErrorKind` in the Go binding and to
@@ -87,6 +94,69 @@ describe('ABI stability: classifyError routes prefixed messages', () => {
     expect(classifyError(undefined)).toBe(undefined)
     const obj = { message: 'cortex: fake' } as Error
     expect(classifyError(obj)).toBeInstanceOf(CortexError)
+  })
+
+  // Regression: the migration to `errors.ts` initially narrowed
+  // `classifyError` to `e instanceof Error ? e.message : ''`, which
+  // silently broke classification for plain `{message}` objects
+  // (the existing test above caught that). These additional cases
+  // pin the broader contract — duck typing on `.message` is the
+  // documented behavior and must not be re-narrowed.
+  it('classifyError accepts arbitrary throw shapes with a `message` field', () => {
+    // Plain object with an `nrpc:` message: must classify even
+    // without inheriting from Error. Mirrors the cortex case.
+    const plain = { message: 'nrpc:no_route: fake' }
+    const classified = classifyError(plain) as Error
+    expect(classified).not.toBe(plain)
+    expect(classified.constructor.name).toBe('RpcNoRouteError')
+
+    // String rejection: extractMessage returns the string itself,
+    // so a `nrpc:`-prefixed string also classifies. (Top-level
+    // catch handlers that receive a thrown string still get useful
+    // routing instead of a fall-through.)
+    const stringThrow = 'netdb: synthetic'
+    expect(classifyError(stringThrow)).toBeInstanceOf(NetDbError)
+
+    // Object whose `message` is non-string falls through unchanged
+    // — we don't try to coerce arbitrary types.
+    const weird = { message: 42 }
+    expect(classifyError(weird)).toBe(weird)
+  })
+
+  it('extractMessage pins the rejected-value contract', () => {
+    expect(extractMessage(null)).toBe('')
+    expect(extractMessage(undefined)).toBe('')
+    expect(extractMessage('boom')).toBe('boom')
+    expect(extractMessage(new Error('hi'))).toBe('hi')
+    expect(extractMessage({ message: 'hi' })).toBe('hi')
+    // Non-string `message` is treated as no message.
+    expect(extractMessage({ message: 42 })).toBe('')
+    expect(extractMessage({})).toBe('')
+    expect(extractMessage(7)).toBe('')
+  })
+
+  // Regression: target ES2022 + `useDefineForClassFields: true`
+  // (the implicit default) emits `defineProperty(this, 'status', {
+  // value: undefined })` for declared fields, which makes
+  // `'status' in err` return `true` even when no status was
+  // parsed. The TS source uses `declare readonly status?:` to
+  // suppress that emit — pin it so a future `declare` removal
+  // doesn't silently change the iteration shape of these errors.
+  it('parsed-field properties are absent until populated', () => {
+    const noStatus = new RpcServerError('rpc server error')
+    expect('status' in noStatus).toBe(false)
+    expect(Object.keys(noStatus)).not.toContain('status')
+
+    const withStatus = new RpcServerError('rpc server error: status=0x8001')
+    expect('status' in withStatus).toBe(true)
+    expect(withStatus.status).toBe(0x8001)
+
+    const noElapsed = new RpcTimeoutError('rpc timeout')
+    expect('elapsedMs' in noElapsed).toBe(false)
+
+    const withElapsed = new RpcTimeoutError('rpc timeout elapsed_ms=42')
+    expect('elapsedMs' in withElapsed).toBe(true)
+    expect(withElapsed.elapsedMs).toBe(42)
   })
 })
 
@@ -163,10 +233,13 @@ describe('ABI stability: prefix-literal pin', () => {
   // `bindings/node/errors.js` to change the constants, this
   // catches the drift immediately.
   it('classifies `cortex:` and `netdb:` by literal prefix', () => {
-    expect(classifyError(new Error('cortex:')).constructor.name).toBe(
+    // classifyError returns `unknown` (it preserves non-matching
+    // throw values verbatim); narrow to Object before reading
+    // `.constructor.name`.
+    expect((classifyError(new Error('cortex:')) as object).constructor.name).toBe(
       'CortexError',
     )
-    expect(classifyError(new Error('netdb:')).constructor.name).toBe(
+    expect((classifyError(new Error('netdb:')) as object).constructor.name).toBe(
       'NetDbError',
     )
   })

@@ -1,0 +1,36 @@
+{
+  // Build config for the hand-written TS sources (`errors.ts`,
+  // `mesh_rpc.ts`). Compiles them in-place to CJS `.js` + `.d.ts`
+  // matching the pre-migration package layout — preserves the
+  // public `require()` shape so existing consumers keep working.
+  //
+  // The base `tsconfig.json` is test-only (vitest) and emits ESNext
+  // into `./dist`; we override the bits that matter for shipping
+  // CJS artifacts next to their TS sources.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "outDir": ".",
+    "rootDir": ".",
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "noEmitOnError": true,
+    "esModuleInterop": true,
+    "isolatedModules": false,
+    "types": ["node"]
+  },
+  // Source files only; tests stay under the base config.
+  "include": ["errors.ts", "mesh_rpc.ts"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "test",
+    "vitest.config.ts",
+    "index.js",
+    "index.d.ts"
+  ]
+}
