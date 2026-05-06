@@ -184,6 +184,8 @@ This is the single most concrete deferred work. Until then, RedEX's existing pay
 
 A node sees streams flow past via the proximity graph + capability index. If it has spare storage capacity, it caches a copy locally. When the cache fills, evict LRU. No coordination, no replica-set membership, no orchestration. Popular data ends up cached widely; unpopular data lives only at origin. BitTorrent-flavored in spirit, but native to the substrate.
 
+Rule: if I have the storage, I have to have the file. A node that sees a file's capability announcement and has spare storage pulls a copy. When storage fills, evict LRU to make room. No passive observation requirement; no policy negotiation. The only threshold is "do I have room."
+
 Why this fits cleanly:
 
 - **Capability + proximity already routes traffic past nodes.** Greedy nodes piggyback on the routing they're already participating in.
