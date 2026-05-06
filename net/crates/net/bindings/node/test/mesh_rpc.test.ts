@@ -129,6 +129,20 @@ describe('defaultRetryable', () => {
     expect(defaultRetryable(new RpcCodecError('x', 'decode'))).toBe(false)
   })
 
+  // Regression: `RpcCancelledError`'s class docstring states it
+  // is NOT retried by the default policy, but the pre-TS-migration
+  // predicate fell through to the generic `nrpc:` "retry by
+  // default" branch — silently re-issuing cancelled calls and
+  // wasting the backoff budget on a deterministic terminal error.
+  // Pin both the typed-class path and the raw-message-prefix
+  // path so a future refactor can't reintroduce the gap.
+  it('does NOT retry RpcCancelledError (caller-driven terminal)', () => {
+    expect(defaultRetryable(new RpcCancelledError('x'))).toBe(false)
+    expect(
+      defaultRetryable({ message: 'nrpc:cancelled: AbortSignal aborted' }),
+    ).toBe(false)
+  })
+
   it('retries Timeout / Transport unconditionally', () => {
     expect(defaultRetryable(new RpcTimeoutError('elapsed_ms=100'))).toBe(true)
     expect(defaultRetryable(new RpcTransportError('x'))).toBe(true)

@@ -904,8 +904,22 @@ typed subclass at the catch site):
 | `codec_encode`  | `RpcCodecError`       | no (caller-fixable) |
 | `codec_decode`  | `RpcCodecError`       | no (caller-fixable) |
 | `cancelled`     | `RpcCancelledError`   | no (caller-driven)  |
-| `breaker_open`  | `BreakerOpenError`    | no                  |
-| `app_error`     | `RpcServerError` (with `status` set) | per `status` |
+| any other       | `RpcError` (base)     | yes (forward-compat fallback) |
+
+`BreakerOpenError` is thrown directly by `CircuitBreaker.call`
+when the breaker is open — catch it via
+`instanceof BreakerOpenError` (imported from `@ai2070/net/mesh_rpc`).
+It carries the `nrpc:breaker_open:` prefix for log filtering, but
+`classifyError` routes it through the base `RpcError` rather than
+its own subclass. Server-side `appError(code, body)` rejections
+arrive at the caller as `nrpc:server_error: status=0x<code>`, so
+they classify as `RpcServerError` with `err.status === code`
+(check against `NRPC_TYPED_BAD_REQUEST` etc.).
+
+`classifyError` is duck-typed on `.message`: it accepts real
+`Error` instances, plain `{message: string}` objects, and string
+rejections — so top-level catch handlers reconstruct typed
+errors regardless of what the throw site emitted.
 
 Two stable status constants exposed by `@ai2070/net/mesh_rpc`:
 
