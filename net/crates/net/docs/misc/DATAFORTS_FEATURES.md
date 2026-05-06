@@ -179,6 +179,32 @@ Updated total for a parallelized "Dataforts v0" (greedy + replicated RedEX + blo
 
 ---
 
+## Query layer: federated reads via the capability index
+
+The same primitive that enables discovery turns the capability index into a **distributed query layer** over chain metadata. The capability tag isn't only for "where is data X" lookups; it makes a small set of richer query shapes first-class without any new mechanism.
+
+New query shapes that become possible:
+
+- **Federated reads.** A query that needs chains A, B, C — the local node looks up the best replica for each in the capability index, dispatches reads in parallel, joins the results. The capability index serves as the query planner's source of truth for routing decisions.
+- **Time-travel.** Advertise `causal:X[start_seq..end_seq]` rather than just `causal:X[:tip_seq]`, and "give me the state of X at seq=12345" routes to a node that holds that historical range — not just the current tip. Useful for replay, debugging, and incident investigation.
+- **Lineage walks.** Walking back through `CausalLink` parents reduces to a capability-tag traversal: find the parent's `origin_hash`, query for nodes holding it, recurse. The full DAG history of a chain is queryable without a central lineage service.
+- **Aggregate queries.** "How many active chains in region X with `model=Y`" reduces to a count over capability-index entries with the existing filter machinery. No materialized view needed.
+- **Cohort and fork queries.** Forks advertise parent linkage as part of their tag; "find all chains forked from parent P" is a tag-match query against the capability index.
+- **Cross-chain joins.** Relational join across multiple chains, with the capability index handling routing for each join input.
+
+CortEX already provides the *local* query layer (folds + NetDB queries against in-memory state). This is the *mesh-level* federation layer above CortEX — the same architectural split as a distributed database layered over single-node engines, but with the routing primitive doing the planning work instead of a central coordinator.
+
+Trade-offs to handle:
+
+- **Tag richness vs. announcement size.** Every additional metadata bit costs announcement size and propagation cost. Aggregate richer metadata into bloom filters or hierarchical summaries; advertise full schema only on demand or via a follow-up RPC after an initial match.
+- **Privacy.** Rich tags leak more metadata. ACL gating and subnet-local advertisement scope are the first lines of defense; encrypted tags for sensitive metadata are possible but add complexity. The general rule: only advertise what's already ACL-permitted to leak.
+- **Staleness.** Tags propagate at heartbeat intervals; query results are eventually consistent over the metadata layer. The standard pattern is re-read on capability-miss; queries should treat capability data as a hint, not a guarantee.
+- **Query language.** Today the capability index is queried via tag filters. Joins, aggregates, and time-travel may want a higher-level query API. This could live in NetDB as an extension, or as a separate `MeshDB` layer over the federated read path. Out of scope for the current Dataforts deferred work; flagged here as the natural next layer.
+
+**Implication for the design space.** With this in hand, Dataforts is no longer just a "data plane" — it becomes a **distributed query substrate that happens to also handle storage**. That is a strictly bigger product than the audit doc previously scoped. The compute-marketplace use case still doesn't need any of it (Postgres handles its queries fine). But workloads where lineage queries, time-travel for incident investigation, and cross-site joins matter genuinely benefit. Like the rest of the deferred work, this is parked until a real workload demands it.
+
+---
+
 ## Genuinely deferred features
 
 The features below are the actual scope of future "Dataforts" work, all clustered around storage-layer replication and data-gravity meta-routing. Each assumes the capability-tag discovery primitive above.
