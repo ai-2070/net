@@ -2,17 +2,11 @@
 
 v0.12 breaks the "Black Diamond" hardening line. After two consecutive releases of pure bug-fix + audit closure (v0.10 / v0.11), Firestarter is the first feature release on the line: it ships a **complete request/response RPC surface (nRPC)** on top of the v0.11 mesh, plus the **four-language binding pipeline** that consumes it (Node, Python, Go, plus the existing Rust SDK), plus a **TypeScript migration of the Node binding's hand-written modules**. The hardening posture is intact — every new surface has the same handle-lifetime, panic-safety, and FFI-soundness guarantees v0.11 established for the existing surfaces — but this release is about adding capability, not just polishing the existing one.
 
-The work is sourced from three plans, all locked before any code landed and all delivered in full:
-
-- **`docs/misc/NRPC_DESIGN.md`** — the request/response convention layer over the existing CortEX folds + channel pub/sub. Phases 1 / 2 / 3 all land here.
-- **`docs/misc/NRPC_BINDINGS_PLAN.md`** — the seven-phase rollout (B1–B7) of nRPC across the Node, Python, and Go bindings + a cross-binding wire-format compat fixture.
-- **`docs/misc/NODE_TS_MIGRATION_PLAN.md`** — collapse `errors.js` + `mesh_rpc.js` and their parallel `.d.ts` declarations into a single TypeScript source of truth.
-
 ---
 
-## Addressed in this release
+## nRPC
 
-### nRPC Phase 1 — folds, codec, mesh glue
+### Folds, Codec, Mesh Glue
 
 The architectural anchor (and the prerequisite for everything else): an RPC server is a CortEX fold over a directed channel pair. There is no new transport, no new subsystem, no new daemon — just a typed `dispatch` enum on `EventMeta`, a channel-naming convention, and small caller-side / server-side helpers.
 
@@ -23,15 +17,15 @@ The architectural anchor (and the prerequisite for everything else): an RPC serv
 - **`Mesh::serve_rpc(service, handler)` / `Mesh::call(target_node_id, service, payload, opts)` glue** (`adapter/net/mesh_rpc.rs`). `serve_rpc` registers an inbound dispatcher for `<service>.requests`'s channel hash; the dispatcher pushes events into a tokio mpsc that drains through the `RpcServerFold`. `call` lazy-subscribes to `<service>.replies.<caller_origin>`, allocates a `call_id`, registers a oneshot in the per-Mesh `RpcClientPending`, **direct-sends** the REQUEST via `publish_to_peer` bypassing the local subscriber roster (RPC's caller-knows-target model doesn't fit the publisher-led pub/sub roster), and awaits the receiver under `opts.deadline`. Returns `RpcReply` on `Ok`, `RpcError` on any failure. **`ServeHandle`** is RAII — the dispatcher unregisters on Drop and in-flight handlers complete (no abort). Per-Mesh state additions on `MeshNode`: `rpc_client_pending`, `rpc_next_call_id`, `rpc_reply_subscriptions` (bounded; refuses hash collisions instead of overwriting).
 - **End-to-end Mesh integration test** (`tests/integration_nrpc_mesh.rs`, 4 tests through real network handshake): round-trip echo, multiple sequential calls reusing the lazy reply subscription with exactly-once handler invocation, server panic surfaces as `Internal`, deadline emits CANCEL and surfaces as `Timeout` to the caller. Deadline-fire CANCEL emission is now pinned by an explicit assertion test (`rpc_deadline_fires_cancel_on_the_wire`).
 
-### nRPC Phase 2 — service discovery + routing policies
+### Service Discovery + Routing Policies
 
 - **Service discovery via capability announcements.** `Mesh::serve_rpc` auto-registers the service in a per-Mesh `rpc_local_services` set; `announce_capabilities[_with]` auto-merges `nrpc:<service>` tags onto the announced `CapabilitySet`, propagating through the existing capability-broadcast machinery. Two new public APIs: `Mesh::find_service_nodes(service) -> Vec<u64>` queries the local capability index for nodes carrying the `nrpc:<service>` tag; `Mesh::call_service(service, payload, opts) -> Result<RpcReply, RpcError>` finds candidates, picks one per `RoutingPolicy`, dispatches via the existing direct-addressed `call(target, ...)`. Returns `RpcError::NoRoute` if no servers advertise the tag. `ServeHandle::Drop` removes the service from the local registry so subsequent announcements stop emitting the tag.
 - **`RoutingPolicy` enum on `CallOptions`** (default `RoundRobin`): `RoundRobin` uses a dedicated per-Mesh cursor with `fetch_add` (no longer collides with the call-id counter); `Random` (xxh3 of `call_id`, modulo); `Sticky { key: u64 }` (xxh3 of key, modulo a sorted candidate list — same key → same target while the candidate set is stable); `LowestLatency` (picks the candidate with smallest `latency_us` per the local `ProximityGraph`; deterministic fallback to the lexicographically-first sorted node id when no proximity data exists).
 - **`filter_unhealthy: bool` on `CallOptions`** (default `true`) — skips candidates whose `ProximityGraph` entry reports `!is_available()`. Pin: candidates with NO proximity entry are KEPT (absence of evidence ≠ evidence of unhealth), so a freshly-announced server isn't falsely filtered just because pingwaves haven't propagated yet.
 - **EntityId ↔ node_id bridge** — `MeshNode::entity_id_for_node(u64) -> Option<[u8; 32]>` accessor consults `peer_entity_ids` to map session-layer node ids to entity-layer keys. The single missing piece that `LowestLatency` and `filter_unhealthy` both flow through.
-- **Phase 2 end-to-end coverage** (`tests/integration_nrpc_service_discovery.rs`, 6 tests): three nodes, two serve "echo", one caller uses `call_service` — both servers exercised by round-robin; `Sticky` pins consistency; `Random` distributes evenly; no-servers returns `NoRoute` with diagnostic; `LowestLatency` falls back deterministically when no proximity data exists; `filter_unhealthy` keeps proximity-less candidates.
+- **End-to-end coverage** (`tests/integration_nrpc_service_discovery.rs`, 6 tests): three nodes, two serve "echo", one caller uses `call_service` — both servers exercised by round-robin; `Sticky` pins consistency; `Random` distributes evenly; no-servers returns `NoRoute` with diagnostic; `LowestLatency` falls back deterministically when no proximity data exists; `filter_unhealthy` keeps proximity-less candidates.
 
-### nRPC Phase 3 — streaming, tracing, resilience, metrics
+### Streaming, Tracing, Resilience, Metrics
 
 The biggest single chunk of new surface in this release.
 
@@ -69,7 +63,7 @@ Cross-cutting decisions enforced by the fixture and the per-binding compat suite
   - **Go**: `ctx.Done()` watcher goroutine wired through `net_rpc_reserve_cancel_token` / `net_rpc_cancel_call` C-ABI exports. Watcher pins to the stream/call's lifetime so it doesn't leak past close. Watcher self-deadlock prevention via `watcherDone` channel closed before `Close()`.
 - **Per-handler timeout configurable everywhere.** Each binding's `serve` accepts an optional handler timeout (defaults to 60s for Go, no default for Rust/Node/Python — the SDK wraps user code with no timeout unless asked). Wedged handlers can't hold the in-flight slot indefinitely.
 
-### Node binding TS migration
+## Node binding TS migration
 
 - **Single source of truth.** `errors.ts` and `mesh_rpc.ts` replace the hand-written `errors.js` / `mesh_rpc.js` + parallel `.d.ts` files. The `.d.ts` was the only guard on the public type contract — and reviews of the nRPC work surfaced several places where the two had quietly diverged (the `RawMeshRpc` shape, the `breaker.armed` dead branch, the `appError` helper signature). Compiling from a single TS source catches that class of drift at build time.
 - **Pipeline.** New `tsconfig.build.json` extends the existing test-only `tsconfig.json`; `target: ES2022`, `module: CommonJS`, `moduleResolution: node`, `strict`, `declaration`, `noEmitOnError`. `outDir`/`rootDir` both `.` so import paths don't change. `package.json` gains `scripts.build:ts`, `scripts.typecheck`, and a `prepublishOnly` that runs the TS build before `napi prepublish -t npm`. Build artifacts (`errors.{js,d.ts}` + `mesh_rpc.{js,d.ts}`) are gitignored — regenerated on publish.
@@ -77,21 +71,7 @@ Cross-cutting decisions enforced by the fixture and the per-binding compat suite
 - **Test-stub conformance enforced.** Turning `RawMeshRpc` from documentation into a real type forced `StubRawMeshRpc`, `LoopbackHandlerRpc`, and `CancelTrackingRaw` to drop their `as unknown` escape hatches and grow the missing methods. The compile error IS the win — the parallel `.d.ts` couldn't catch this.
 - **Outcome.** -210 LOC of duplicated `.js`/`.d.ts` content collapsed into single TS sources. 53/53 vitest tests pass against both source state (TS) and built state (compiled `.js`).
 
-### Code-review pass before merge — the M-fixes
-
-A multi-agent code review of the nRPC branch ran before merge (`docs/misc/CODE_REVIEW_2026_05_05_NRPC.md`). 30+ items addressed across 24 commits; every fix has a regression test where the call site permits one. The notable ones with their own dedicated commits:
-
-- **M19** — bounded `rpc_reply_subscriptions` registry + refuse hash collisions (`e4f4d9a1`). A pathological caller cycling through service names could grow the per-Mesh `rpc_reply_subscriptions` map unbounded.
-- **M21** — `extract_trace_context` is case-insensitive on header names, matching W3C and HTTP conventions (`88f4b2a7`). The previous implementation used `name.as_str() == "traceparent"` and silently dropped any non-lowercase variant.
-- **M22** — `classify_publish_no_session` matches both `"no session for subscriber"` (publish_to_peer) AND `"no session to publisher"` (the underlying mesh send path) (`88f4b2a7`). The classifier was missing the second pattern; service-discovery `call_service` would surface `Transport` instead of `NoRoute` when the target peer's session expired between discovery and dispatch. The regression test caught the actual bug.
-- **M25** — de-flake metrics, hedge, and streaming-flow-control tests (`c6463b74`). No backward-compat deferred; the tests now wait deterministically on observable state (e.g. `streaming_chunks_emitted_total` reaching N) instead of sleeping a wall-clock.
-- **`RpcError::Codec` variant** (`55135a1a`). Previously codec failures masqueraded as `ServerError` or `Internal`. The retry + breaker default predicates now skip `Codec` (caller-fixable bugs aren't transient).
-- **Membership encode omits the qg byte when `queue_group: None`** (`69b56d6a`). Pre-fix the encoder always wrote the `u8` length byte even on `None`; the decoder treated the resulting zero byte as "empty queue group string" rather than "broadcast subscription," silently turning every Broadcast subscribe into a phantom QueueGroup of name `""`.
-- **`ChannelConfigRegistry` longest-prefix-match** (`68b5d688`). The prefix walk now iterates by descending prefix length so `<service>.replies.<caller_origin>` correctly matches the most-specific prefix when nested registrations exist.
-- **Cancelled status emitted when CANCEL fires** (`2e9d5dc3`). The server-side fold now emits a terminal `RpcStatus::Cancelled` chunk when CANCEL is observed mid-handler rather than letting the caller's deadline bury the signal.
-- **`nRPC ServeHandle` doesn't abort the bridge task on Drop** (`2a623cb5`). The previous `JoinHandle::abort` killed the inbound dispatcher mid-publish for any in-flight RESPONSE; the bridge task now drains naturally as its mpsc closes.
-
-### Test hygiene
+## Test hygiene
 
 - **Cross-binding compat fixture** — single source of truth for the canonical service contract. Every binding's compat test loads `golden_vectors.json` and asserts the same matrix. Fixture is versioned via `abi_version_expected` mirroring `NET_RPC_ABI_VERSION`; bumping the ABI invalidates the fixture and forces every binding's compat test to update.
 - **Streaming flow-control coverage** (`tests/integration_nrpc_streaming.rs`, 6 tests through real network): collects-all-chunks, drop-cancels-handler, terminal-error-after-partial-stream, plus the three flow-control tests (`window_throttles_pump_until_grants` asserts the server's `streaming_chunks_emitted_total` metric is exactly the initial window after 300ms; `auto_grant_drains_full_stream`; `explicit_grant_unblocks_pump`).
