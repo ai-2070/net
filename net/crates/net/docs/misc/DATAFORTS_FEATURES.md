@@ -220,14 +220,17 @@ When this ships, it covers:
 
 The design will likely ride on `ChannelPublisher` / `SubscriberRoster` / the causal-chain machinery already in core. Estimated effort when activated: 6-12 weeks of focused work, additive to RedEX rather than a redesign.
 
-### Data gravity (migrate data toward frequent reads) — feature 19
+### Data gravity (emergent from greedy + heat counters) — feature 19
 
-The substrate routes capability-aware via the proximity graph, but it does not *dynamically migrate stored data toward read patterns*. That is a meta-layer requiring:
-- Read-pattern telemetry per `(ChannelName, byte-range)`
-- A migration decision policy (when to move, where to, in what increments)
-- Consistency machinery for the migration window
+Earlier framing of this as a separate engineered system (read-pattern telemetry + migration decision policy + consistency machinery for the migration window) was over-engineered. The simpler reality:
 
-This is premature optimization until we have real read-pattern data from production deployments. Park; revisit when the telemetry justifies it.
+**Data gravity = proximity graph + heat counters annotated on capability tags.**
+
+Each chain's capability tag carries a heat counter — reads-per-window, propagated via the existing capability announcement machinery. Greedy dataforts (see below) within proximity see high-heat in-scope chains and pull them. More replicas in the high-heat zone → reads served locally → reads stop crossing zones → chain "gravitates" toward the zone where it's actually consumed.
+
+**Gravity is emergent behavior of greedy + heatmap, not a separate system.** No migration engine, no consistency machinery, no decision policy. Two primitives composing into the desired property.
+
+Effort estimate when activated: ~1-2 weeks (just adding heat counter annotations to existing capability tags + a small TTL/decay function on the counter). Not a separate engineering project.
 
 ### Read-your-writes guarantees — feature 22
 
@@ -243,33 +246,43 @@ For workloads where individual chunks are large, the streaming-log + INLINE+heap
 
 This is the single most concrete deferred work. Until then, RedEX's existing payload model is sufficient.
 
-### Greedy dataforts (opportunistic LRU caching) — feature 21
+### Greedy dataforts (scope-bounded, proximity-bounded, LRU caching) — feature 21
 
-A node sees streams flow past via the proximity graph + capability index. If it has spare storage capacity, it caches a copy locally. When the cache fills, evict LRU. No coordination, no replica-set membership, no orchestration. Popular data ends up cached widely; unpopular data lives only at origin. BitTorrent-flavored in spirit, but native to the substrate.
+A datafort pulls a chain when **all three** conditions hold:
 
-Rule: if I have the storage, I have to have the file. A node that sees a file's capability announcement and has spare storage pulls a copy. When storage fills, evict LRU to make room. No passive observation requirement; no policy negotiation. The only threshold is "do I have room."
+1. **Scope match.** The chain's capability tag includes a `scope:X` label that matches one of the datafort's configured scopes (e.g., `scope:industrial-telemetry`, `scope:webcam-streams`, `scope:settlement`). Operators run focused fleets by configuring scope sets per node.
+2. **Proximity bound.** The chain is within the datafort's configured proximity threshold (e.g., < 200 ms RTT) per the existing proximity graph. Nothing distant gets pulled.
+3. **Storage available.** Local node decision; LRU eviction when storage fills.
 
-Why this fits cleanly:
+That's the full spec. Three conditions, AND'd together, all from existing primitives:
 
-- **Capability + proximity already routes traffic past nodes.** Greedy nodes piggyback on the routing they're already participating in.
-- **AuthGuard gates which nodes can cache what.** Only nodes with `subscribe_caps` for a channel can decrypt and cache its events. Encrypted relay means nodes that lack caps can't cache even if they wanted to. ACL compliance falls out for free.
-- **Causal-chain verification is local.** Any node receiving cached data verifies the chain itself; no trust required of the caching node.
-- **No new wire protocol needed.** Greedy nodes use the existing tail/read primitives; the only addition is the local "cache LRU on observed events" decision logic.
+- **Scope tag** — capability tags already extensible; just adds a `scope:` field.
+- **Proximity threshold** — proximity graph already measures it.
+- **Storage check + LRU** — local node decision, no coordination.
 
-Trade-offs vs. the orchestrated replication work:
+What this produces:
 
-| Property | Greedy LRU | Orchestrated replicas |
+- **Specialized fleets emerge organically.** Industrial-telemetry dataforts cluster around sensor sources; webcam dataforts cluster around streaming hubs; settlement dataforts cluster around marketplace coordinators. Each fleet has scope coherence + proximity locality without central coordination.
+- **Bounded storage growth.** A datafort's storage usage is bounded by its proximity zone × scope filter — never unbounded global hoarding.
+- **Bandwidth efficiency.** Only pulls chains it can usefully serve.
+- **ACL falls out for free.** Only nodes with `subscribe_caps` can decrypt advertisements; only matching scopes can pull. AuthGuard gates without additional logic.
+
+When combined with **heat counters annotated on capability tags** (see "Data gravity" above), the system also produces emergent gravity: high-heat in-scope chains attract more in-zone replicas; reads stop crossing zones; chains "gravitate" to where they're consumed.
+
+Trade-offs vs. orchestrated replication:
+
+| Property | Greedy (scope + proximity + LRU) | Orchestrated replicas |
 |---|---|---|
 | Coordination | None | Replica-set membership, leader/follower |
-| Durability guarantee | Probabilistic (depends on cache popularity) | Strong (configurable replication factor) |
-| Bandwidth | Only what flows past | Push to all replicas regardless of demand |
-| Where data lands | Wherever LRU + proximity put it | Configured/policy-driven |
-| Storage cost | Self-limiting (LRU evicts) | Bounded by replica factor |
-| Best for | Read-heavy popular data | Durability-critical write paths |
+| Durability guarantee | Probabilistic (depends on scope + proximity coverage) | Strong (configurable replication factor) |
+| Bandwidth | Only chains in-scope and in-proximity | Push to all replicas regardless of demand |
+| Where data lands | Wherever scope + proximity + LRU put it | Configured/policy-driven |
+| Storage cost | Self-limiting (LRU evicts within scope×proximity bound) | Bounded by replica factor |
+| Best for | Read-heavy in-scope data with locality | Durability-critical write paths |
 
-The two are complementary, not redundant. Greedy LRU handles "make popular data fast and resilient cheaply"; orchestrated replication handles "guarantee this critical data survives N node failures." A real Dataforts deployment would likely want both eventually.
+Complementary, not redundant. Greedy + heat-counters cover ~98% of "make data fast and locally available" use cases automatically. Orchestrated replication covers the durability-critical 2% that need stronger guarantees.
 
-Effort estimate when activated: ~2-4 weeks. Simpler than orchestrated replication because there's no coordination protocol; could ship first as a partial answer to durability/data-gravity concerns.
+Effort estimate when activated: ~1-2 weeks. The scope filter and proximity gate are config knobs over the existing capability index; the LRU cache is a local data structure; no coordination protocol needed.
 
 ---
 
