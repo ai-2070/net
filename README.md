@@ -1,4 +1,4 @@
-# Net
+# Net — *nRPC Out Now!*
 
 **Network Event Transport** — a latency-first encrypted mesh protocol.
 
