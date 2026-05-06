@@ -40,6 +40,7 @@ The Rust crate, npm scope, and PyPI dist all publish under `ai2070-net*` / `@ai2
 - [State, not connections](#state-not-connections)
 - [Capabilities](#capabilities)
 - [Channels](#channels)
+- [nRPC](#nrpc)
 - [Subnets](#subnets)
 - [Security surface](#security-surface)
 - [Daemons](#daemons)
@@ -198,6 +199,16 @@ Kafka, NATS, Pulsar, Redis Streams — every serious pub/sub is centralized. You
 Channels in Net are not a thing you connect to. They are a *name you match on*. A publisher registers `sensors/temperature` with a policy; subscribers ask to join by name; the mesh routes the semantic. A subscriber on a NAT'd laptop, a publisher in a datacenter, and a relay on a jump host all participate in the same channel without anyone connecting to a broker — because there is no broker. The roster is held by the publisher, fan-out is N per-peer unicasts over the existing encrypted sessions, and nothing about "the channel" exists as a standalone process.
 
 This means channels cost nothing when nobody is listening. No queue builds up at a broker. No retention policy has to be configured at a central service. Publish-without-subscribers is literally a no-op — the roster is empty, the fan-out loop runs zero times. Channels with thousands of subscribers work too; they just fan out more packets. The broker was a bottleneck in the first place because it existed. Removing it removes the bottleneck.
+
+## nRPC
+
+gRPC, Twirp, Connect, Thrift — every serious request/response framework is a separate transport. You define a service in an IDL, generate stubs in each language, run a server that speaks HTTP/2, run a client that speaks HTTP/2, and probably run a sidecar (Envoy, Linkerd) to handle retries, deadlines, mTLS, and load balancing. The RPC layer is its own substrate, parallel to whatever pub/sub or messaging system you're already running. Two transports, two failure modes, two sets of metrics, two sets of certs.
+
+nRPC is request/response *on the bus*. There is no second transport. A service is a fold over a directed channel pair (`<service>.requests` / `<service>.replies.<caller_origin>`); the call is two events, correlated by a `call_id` in the event metadata. The same encrypted mesh sessions that carry pub/sub carry RPC. The same identity that signs capability announcements signs the calls. The same `CapabilityIndex` that drives every other routing decision drives service discovery — `nrpc:<service>` is just a tag, and `call_service("echo", req)` resolves against the same index that answers "find me a node with a GPU." There is no service mesh because the mesh is the service mesh.
+
+Same niche as gRPC; different shape. No HTTP/2, no protobuf IDL, no codegen step. The wire format is JSON over the existing encrypted UDP transport; the schema is whatever typed serializer both sides agree on (serde, TypeScript interfaces, Pydantic, Go structs). Deadlines, retries, hedging, circuit breakers, and end-to-end cancellation come from the SDK, not a sidecar — `call_with_retry`, `call_with_hedge_to([primary, backup])`, `breaker.call(|| mesh.call(...))` are library calls that work the same way across Rust, TypeScript, Python, and Go. A handler that wants to stream chunks back returns an `RpcStream`; flow-control credits are a subprotocol on the same wire. Drop the future and the server's handler observes `ctx.cancellation` on the next yield — CANCEL fires automatically, no separate cleanup path.
+
+The implication is that an RPC server costs what a subscriber costs. There is no broker to provision, no service mesh to operate, no certificate rotation to coordinate. Spin up a handler with `serve_rpc("echo", echo_handler)` and the service is announced on the mesh; spin up another, and queue-group dispatch load-balances calls between them; let one die and the failure detector evicts it from the roster within a heartbeat. The "RPC infrastructure" is the mesh, and the mesh is already running.
 
 ## Subnets
 
