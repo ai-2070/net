@@ -1,0 +1,27 @@
+net/crates/net/sdk-ts/README.md
+  8a9502d446b523c5 907-922
+net/crates/net/bindings/node/mesh_rpc.ts
+  8a9502d446b523c5 505-510,536
+net/crates/net/bindings/node/test/mesh_rpc.test.ts
+  8a9502d446b523c5 132-145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "47c23968f35e957a072083a32e099ed7d97e1341",
+  "prompts": {
+    "8a9502d446b523c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e53b93b3-431f-48f2-bbcc-6a17e6cedd90",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 37,
+      "total_deletions": 2,
+      "accepted_lines": 37,
+      "overriden_lines": 0
+    }
+  }
+}
