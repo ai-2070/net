@@ -23,6 +23,8 @@ import {
 import {
   NRPC_TYPED_BAD_REQUEST,
   TypedMeshRpc,
+  type RawMeshRpc,
+  type ServeHandle,
 } from '../mesh_rpc'
 
 // ---------------------------------------------------------------
@@ -100,7 +102,7 @@ function handleEchoSum(req: EchoSumRequest): EchoSumResponse {
 // RpcStatus::Application(NRPC_TYPED_BAD_REQUEST).
 // ---------------------------------------------------------------
 
-class LoopbackHandlerRpc {
+class LoopbackHandlerRpc implements RawMeshRpc {
   async call(_target: bigint, service: string, req: Buffer): Promise<Buffer> {
     return this.dispatch(service, req)
   }
@@ -110,11 +112,17 @@ class LoopbackHandlerRpc {
   async callStreaming(): Promise<never> {
     throw new Error('streaming not exercised by cross-lang compat')
   }
-  serve(): never {
+  serve(): ServeHandle {
     throw new Error('serve not exercised by cross-lang compat')
   }
   findServiceNodes(): bigint[] {
     return []
+  }
+  reserveCancelToken(): bigint {
+    throw new Error('cancellation not exercised by cross-lang compat')
+  }
+  cancelCall(_token: bigint): void {
+    throw new Error('cancellation not exercised by cross-lang compat')
   }
   private dispatch(service: string, reqBytes: Buffer): Buffer {
     if (service !== fixture.service) {
@@ -163,7 +171,7 @@ describe('Cross-language nRPC wire-format compat (Node side)', () => {
   })
 
   it('all ok cases round-trip via TypedMeshRpc.call', async () => {
-    const rpc = new TypedMeshRpc(new LoopbackHandlerRpc() as unknown)
+    const rpc = new TypedMeshRpc(new LoopbackHandlerRpc())
     for (const oc of fixture.ok_cases) {
       const reply = await rpc.call(0n, fixture.service, oc.request_json)
       expect(reply, `ok-case '${oc.name}'`).toEqual(oc.expected_response_json)
@@ -171,7 +179,7 @@ describe('Cross-language nRPC wire-format compat (Node side)', () => {
   })
 
   it('all ok cases also round-trip via TypedMeshRpc.callService', async () => {
-    const rpc = new TypedMeshRpc(new LoopbackHandlerRpc() as unknown)
+    const rpc = new TypedMeshRpc(new LoopbackHandlerRpc())
     for (const oc of fixture.ok_cases) {
       const reply = await rpc.callService(fixture.service, oc.request_json)
       expect(reply, `ok-case '${oc.name}' via callService`).toEqual(
@@ -181,7 +189,7 @@ describe('Cross-language nRPC wire-format compat (Node side)', () => {
   })
 
   it('error cases surface as nrpc:server_error with the documented status', async () => {
-    const rpc = new TypedMeshRpc(new LoopbackHandlerRpc() as unknown)
+    const rpc = new TypedMeshRpc(new LoopbackHandlerRpc())
     for (const ec of fixture.error_cases) {
       let caught: Error | null = null
       try {

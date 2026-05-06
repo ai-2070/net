@@ -72,8 +72,13 @@ export class RpcNoRouteError extends RpcError {
 }
 
 export class RpcTimeoutError extends RpcError {
+  // `declare` so tsc emits no field-init for the property: matches
+  // the JS version's "set only when matched" semantics, so
+  // `'elapsedMs' in err` stays false on a no-match instance instead
+  // of becoming true with `undefined` (the useDefineForClassFields
+  // default at target ES2022+).
   /** Caller-side elapsed time, parsed out of `elapsed_ms=N` in the message. */
-  readonly elapsedMs?: number
+  declare readonly elapsedMs?: number
   constructor(detail?: string) {
     super(detail ?? 'rpc timeout')
     this.name = 'RpcTimeoutError'
@@ -81,13 +86,14 @@ export class RpcTimeoutError extends RpcError {
     // Best-effort parse of `elapsed_ms=N` so callers can read
     // `err.elapsedMs` without re-parsing the message.
     const m = /elapsed_ms=(\d+)/.exec(detail ?? '')
-    if (m) this.elapsedMs = Number(m[1])
+    if (m) (this as { elapsedMs?: number }).elapsedMs = Number(m[1])
   }
 }
 
 export class RpcServerError extends RpcError {
+  // See `declare` rationale on `RpcTimeoutError.elapsedMs`.
   /** Wire-level RpcStatus parsed out of `status=0xNNNN` in the message. */
-  readonly status?: number
+  declare readonly status?: number
   constructor(detail?: string) {
     super(detail ?? 'rpc server error')
     this.name = 'RpcServerError'
@@ -96,7 +102,7 @@ export class RpcServerError extends RpcError {
     // status code (e.g. err.status === 0x8001 → typed-handler
     // application error).
     const m = /status=0x([0-9a-fA-F]+)/.exec(detail ?? '')
-    if (m) this.status = parseInt(m[1], 16)
+    if (m) (this as { status?: number }).status = parseInt(m[1], 16)
   }
 }
 
@@ -114,6 +120,9 @@ export class RpcCodecError extends RpcError {
   constructor(detail?: string, direction?: 'encode' | 'decode') {
     super(detail ?? 'rpc codec error')
     this.name = 'RpcCodecError'
+    // `direction` is always passed through, so it's a regular
+    // assignment (no `declare`-dance needed — `'direction' in err`
+    // is `true` regardless of whether a specific value was provided).
     this.direction = direction
     Object.setPrototypeOf(this, RpcCodecError.prototype)
   }
@@ -139,9 +148,17 @@ export class RpcCancelledError extends RpcError {
  * Inspect an error's message prefix and return a typed error if it
  * matches the napi binding's contract. Non-matching errors are
  * returned unchanged — caller can `throw` the result unconditionally.
+ *
+ * Duck-typed on `e.message`: napi rejections are real Error
+ * instances, but top-level catch handlers may also see arbitrary
+ * non-Error values (a thrown string, a plain `{message}` object).
+ * We mirror the JS contract — accept anything with a string
+ * `message` field — so cross-runtime catch sites don't lose
+ * classification just because the throw happened in a context
+ * where `instanceof Error` is unreliable (vm boundaries, polyfills).
  */
 export function classifyError(e: unknown): unknown {
-  const msg = (e instanceof Error ? e.message : '') || ''
+  const msg = extractMessage(e)
   if (msg.startsWith(ERR_CORTEX_PREFIX)) {
     return new CortexError(msg)
   }
@@ -152,6 +169,20 @@ export function classifyError(e: unknown): unknown {
     return classifyRpcError(msg)
   }
   return e
+}
+
+/**
+ * Pull a `message` field off any value, with the same permissive
+ * semantics as `(e && e.message) || ''` from the JS source. Used
+ * by `classifyError` and by `defaultRetryable` in
+ * `@ai2070/net/mesh_rpc` to keep the catch-site contract uniform.
+ */
+export function extractMessage(e: unknown): string {
+  if (e === null || e === undefined) return ''
+  if (typeof e === 'string') return e
+  if (typeof e !== 'object') return ''
+  const msg = (e as { message?: unknown }).message
+  return typeof msg === 'string' ? msg : ''
 }
 
 function classifyRpcError(msg: string): RpcError {

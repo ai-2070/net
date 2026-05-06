@@ -141,6 +141,13 @@ interface NativeBindings {
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const native = require('./index') as NativeBindings
 
+// Duck-typed message extractor — keeps the "any rejected value
+// with a string `message`" contract uniform across the two
+// modules. The TS source compiles this `import` to a `require`
+// of the sibling `./errors.js`, which `prepublishOnly` emits
+// alongside `mesh_rpc.js`.
+import { extractMessage } from './errors'
+
 // ============================================================================
 // JSON codec.
 //
@@ -159,8 +166,7 @@ function jsonEncode(value: unknown): Buffer {
   try {
     json = JSON.stringify(value)
   } catch (e) {
-    const detail = e instanceof Error ? e.message : String(e)
-    throw new Error(`nrpc:codec_encode: ${detail}`)
+    throw new Error(`nrpc:codec_encode: ${extractMessage(e) || String(e)}`)
   }
   if (json === undefined) {
     // JSON.stringify(undefined) === undefined. nRPC expects bytes.
@@ -175,8 +181,7 @@ function jsonDecode(buf: Buffer): unknown {
   try {
     return JSON.parse(utf8d.decode(buf))
   } catch (e) {
-    const detail = e instanceof Error ? e.message : String(e)
-    throw new Error(`nrpc:codec_decode: ${detail}`)
+    throw new Error(`nrpc:codec_decode: ${extractMessage(e) || String(e)}`)
   }
 }
 
@@ -246,10 +251,9 @@ export class TypedMeshRpc {
       try {
         req = jsonDecode(reqBuf) as Req
       } catch (e) {
-        const detail = e instanceof Error ? e.message : String(e)
         const body = JSON.stringify({
           error: 'invalid_request',
-          detail,
+          detail: extractMessage(e) || String(e),
         })
         throw appError(0x8000, body)
       }
@@ -488,7 +492,11 @@ export function defaultRetryable(err: unknown): boolean {
   // Detection strategy: try `err.name` first (a runtime string,
   // dual-module-safe), then fall back to message-prefix matching
   // for raw napi errors that haven't been classified yet.
-  if (!err || typeof err !== 'object') return false
+  // String / null / undefined rejections short-circuit to "not
+  // retryable" — the predicate only fires for object-shaped errors.
+  if (err === null || err === undefined || typeof err !== 'object') {
+    return false
+  }
   const errAny = err as { name?: string; status?: number; message?: string }
   const name = errAny.name ?? ''
   switch (name) {
@@ -504,7 +512,7 @@ export function defaultRetryable(err: unknown): boolean {
       const status =
         typeof errAny.status === 'number'
           ? errAny.status
-          : parseStatusFromMessage(errAny.message)
+          : parseStatusFromMessage(extractMessage(err))
       return (
         status === STATUS_INTERNAL ||
         status === STATUS_BACKPRESSURE ||
@@ -512,8 +520,10 @@ export function defaultRetryable(err: unknown): boolean {
       )
     }
   }
-  // Fall back to message prefix.
-  const msg = errAny.message ?? ''
+  // Fall back to message prefix. Use the same duck-typed
+  // extractor as classifyError so plain-object rejections with a
+  // `message` field classify the same way real Errors do.
+  const msg = extractMessage(err)
   if (!msg.startsWith('nrpc:')) return false
   if (msg.startsWith('nrpc:no_route:')) return false
   if (msg.startsWith('nrpc:codec_')) return false
