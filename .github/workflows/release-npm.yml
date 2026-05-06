@@ -4,7 +4,7 @@ name: Release NPM
 # pure-TypeScript SDK `@ai2070/net-sdk` ships via
 # `release-npm-sdk.yml`.
 #
-# Tag schema: `node-v<semver>` (e.g. `node-v0.11.0`).
+# Tag schema: `node-v<semver>` (e.g. `node-v0.12.0`).
 #
 # Required repository secret: `NPM_TOKEN`
 #   `Automation` token type so 2FA doesn't block CI publishes.
