@@ -11,6 +11,8 @@ Of the 28 original wishlist items:
 
 **Dataforts is not a separate product to build.** It is mostly *naming and packaging* what already exists, plus a focused storage-replication addition that is parked until a real workload requires it.
 
+One design move collapses much of the deferred work: **causal chains advertised as capability tags**. A node holding (or willing to serve) a chain emits a `causal:origin_hash[:tip_seq]` capability tag, and every existing primitive (proximity graph, AuthGuard, capability index, hierarchical summarization) handles propagation, ACL gating, and lookup with no new wire protocol. Discovery for replication, greedy caching, data gravity, and blob CAS reduces to a capability-index query. See "Discovery primitive: causal chains as capability tags" below.
+
 ## The primitives that cover most of the wishlist
 
 The audit below repeatedly refers back to these existing primitives. Each is shipping today.
@@ -142,9 +144,44 @@ Per-node and per-peer rate limits are enforced by device autonomy rules. Each ne
 
 ---
 
+## Discovery primitive: causal chains as capability tags
+
+Before the per-feature deferred work, one design move collapses much of the discovery layer the deferred features would otherwise need: **causal chains advertised as capability tags**.
+
+A node that holds (or has cached, or is willing to serve) a chain advertises a tag of the form `causal:origin_hash[:tip_seq]` — or a bloom-filter aggregate for many chains at once. The existing capability-announcement machinery handles everything else:
+
+- **Identity is cryptographic, not naming-coupled.** The advertisement is keyed on `origin_hash` (the daemon's ed25519 public-key fingerprint), not on `ChannelName`. Renames, migrations, and channel-name reorganizations don't invalidate advertisements; identity lives in the hash. Same model as the rest of Net's identity invariants.
+- **Granularity is the chain root.** 32 bytes for `origin_hash` + 8 bytes for `tip_seq` = 40 bytes per chain raw, much less under bloom-filter compression. A node holding 10,000 chains fits a full advertisement set in roughly 400 KB raw, far less compressed.
+- **AuthGuard gates announcements.** Only nodes with `subscribe_caps` for the channel can decrypt and use the advertisement. ACL compliance falls out for free. Encrypted relay means nodes that lack caps can't even read advertisements not meant for them.
+- **Proximity graph propagates them** at ~374 ns per announcement on M1 Max. Same hierarchical summarization that handles general capability summaries handles chain advertisements.
+- **Capability index handles local lookup.** "Find nearest node holding chain X" is the same query shape as "find nearest GPU node." Routing decisions for reads use existing match-by-capability machinery.
+- **No new wire protocol.** Reuses existing primitives end to end.
+
+Update frequency is the one operational concern: do not re-announce on every event, or announcement traffic explodes. Advertise tip ranges at intervals or thresholds (e.g. every 10 s or every 1 K events). The chain self-verifies on actual read, so the advertisement is a discovery hint, not a security primitive.
+
+What this enables, all using the same primitive:
+
+- **Greedy dataforts:** node pulls chain, advertises `causal:X`. Other nodes route reads to it. Node evicts under storage pressure, withdraws the tag. No coordination protocol.
+- **Replication discovery:** "find replicas of channel C" reduces to a capability-index query for nodes with `causal:origin_hash_of_C`. No separate replica-set membership protocol.
+- **Data gravity:** track which chains your node gets queried for; pull popular ones; start advertising them. Migration decisions become local.
+- **Blob CAS:** blobs identified by content hash advertised as `blob:hash:size` capability tags using the same pattern.
+- **Lightweight read-your-writes:** publisher knows its tip; reader queries for nodes advertising `causal:X@>=tip_seq`.
+
+**Implication for deferred-work effort estimates.** With discovery free, the deferred features shrink:
+
+- Greedy LRU: ~1-2 weeks (was 2-4)
+- Replicated RedEX: ~4-9 weeks (was 6-12; only the pull/repair/conflict mechanics need building)
+- Data gravity: ~3-6 weeks (was 4-8; decisions become local)
+- Blob CAS: roughly unchanged (~6-12 weeks; the blob format and manifest-pointer integration is the work)
+- Read-your-writes: ~2-4 weeks unchanged
+
+Updated total for a parallelized "Dataforts v0" (greedy + replicated RedEX + blob CAS): roughly **2-3 months of focused parallel work**, down from ~3-5 months. A meaningful collapse driven entirely by leaning on the existing capability-announcement primitive instead of inventing a parallel discovery layer.
+
+---
+
 ## Genuinely deferred features
 
-The four features below are the actual scope of future "Dataforts" work, all clustered around storage-layer replication and data-gravity meta-routing.
+The features below are the actual scope of future "Dataforts" work, all clustered around storage-layer replication and data-gravity meta-routing. Each assumes the capability-tag discovery primitive above.
 
 ### Raw RedEX log-segment replication across nodes (covers items 9, 10, 17 narrow cases)
 
