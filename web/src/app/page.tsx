@@ -2537,7 +2537,7 @@ function Footer() {
           <span className="text-accent">▸</span> mesh status:{" "}
           <span className="text-accent">ONLINE</span> · 14,872 nodes observable
         </span>
-        <span>// the train just stops, the network doesn&apos;t</span>
+        <span>// AI 2070</span>
       </div>
     </footer>
   );
