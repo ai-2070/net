@@ -13,8 +13,8 @@
   --color-warn: #ff5e3d;
   --color-cyan: #3df0ff;
 
-  --font-mono: var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, Menlo,
-    monospace;
+  --font-mono:
+    var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
   --font-display: var(--font-major-mono-display), "JetBrains Mono", monospace;
   --font-head: var(--font-major-mono-display), "JetBrains Mono", monospace;
 

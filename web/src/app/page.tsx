@@ -313,7 +313,10 @@ function MeshViz() {
         })
         .join(" ");
       motion.setAttribute("path", d);
-      motion.setAttribute("dur", (0.4 + (path.length - 1) * 0.55).toFixed(2) + "s");
+      motion.setAttribute(
+        "dur",
+        (0.4 + (path.length - 1) * 0.55).toFixed(2) + "s",
+      );
       motion.beginElement?.();
     };
 
@@ -337,22 +340,102 @@ function MeshViz() {
         preserveAspectRatio="xMidYMid meet"
       >
         <defs>
-          <pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse">
-            <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#1a1f1a" strokeWidth="0.3" />
+          <pattern
+            id="grid"
+            width="20"
+            height="20"
+            patternUnits="userSpaceOnUse"
+          >
+            <path
+              d="M 20 0 L 0 0 0 20"
+              fill="none"
+              stroke="#1a1f1a"
+              strokeWidth="0.3"
+            />
           </pattern>
         </defs>
         <rect width="320" height="220" fill="url(#grid)" />
         <g ref={linksRef}>
-          <line className="link" data-edge="A-G" x1="60" y1="40" x2="160" y2="80" />
-          <line className="link" data-edge="G-R1" x1="160" y1="80" x2="260" y2="50" />
-          <line className="link" data-edge="G-R2" x1="160" y1="80" x2="100" y2="160" />
-          <line className="link" data-edge="G-B" x1="160" y1="80" x2="220" y2="170" />
-          <line className="link" data-edge="R2-B" x1="100" y1="160" x2="220" y2="170" />
-          <line className="link" data-edge="A-R2" x1="60" y1="40" x2="100" y2="160" />
-          <line className="link" data-edge="R1-R3" x1="260" y1="50" x2="290" y2="130" />
-          <line className="link" data-edge="R3-B" x1="290" y1="130" x2="220" y2="170" />
-          <line className="link" data-edge="R4-R2" x1="40" y1="110" x2="100" y2="160" />
-          <line className="link" data-edge="R4-A" x1="40" y1="110" x2="60" y2="40" />
+          <line
+            className="link"
+            data-edge="A-G"
+            x1="60"
+            y1="40"
+            x2="160"
+            y2="80"
+          />
+          <line
+            className="link"
+            data-edge="G-R1"
+            x1="160"
+            y1="80"
+            x2="260"
+            y2="50"
+          />
+          <line
+            className="link"
+            data-edge="G-R2"
+            x1="160"
+            y1="80"
+            x2="100"
+            y2="160"
+          />
+          <line
+            className="link"
+            data-edge="G-B"
+            x1="160"
+            y1="80"
+            x2="220"
+            y2="170"
+          />
+          <line
+            className="link"
+            data-edge="R2-B"
+            x1="100"
+            y1="160"
+            x2="220"
+            y2="170"
+          />
+          <line
+            className="link"
+            data-edge="A-R2"
+            x1="60"
+            y1="40"
+            x2="100"
+            y2="160"
+          />
+          <line
+            className="link"
+            data-edge="R1-R3"
+            x1="260"
+            y1="50"
+            x2="290"
+            y2="130"
+          />
+          <line
+            className="link"
+            data-edge="R3-B"
+            x1="290"
+            y1="130"
+            x2="220"
+            y2="170"
+          />
+          <line
+            className="link"
+            data-edge="R4-R2"
+            x1="40"
+            y1="110"
+            x2="100"
+            y2="160"
+          />
+          <line
+            className="link"
+            data-edge="R4-A"
+            x1="40"
+            y1="110"
+            x2="60"
+            y2="40"
+          />
         </g>
         <g>
           <circle className="node" cx="60" cy="40" r="4" />
@@ -363,7 +446,12 @@ function MeshViz() {
           <circle className="node" cx="290" cy="130" r="4" />
           <circle className="node" cx="40" cy="110" r="4" />
         </g>
-        <g ref={labelsRef} fontFamily="JetBrains Mono" fontSize="6" fill="#6b7568">
+        <g
+          ref={labelsRef}
+          fontFamily="JetBrains Mono"
+          fontSize="6"
+          fill="#6b7568"
+        >
           <text x="68" y="36" />
           <text x="168" y="76" />
           <text x="266" y="46" />
@@ -403,7 +491,9 @@ function MeshStat({
 }) {
   return (
     <div className="text-[10px]">
-      <div className="text-ink-dim tracking-[0.1em] uppercase mb-1">{label}</div>
+      <div className="text-ink-dim tracking-[0.1em] uppercase mb-1">
+        {label}
+      </div>
       <div className="text-accent text-[18px] font-semibold font-mono">
         {value}
         <span className="text-ink-dim text-[10px] ml-[3px]">{unit}</span>
@@ -559,15 +649,16 @@ function HeroSection() {
           <p className="text-[18px] text-ink mt-8 max-w-[580px] leading-[1.5] font-light">
             A latency-first encrypted mesh where every device is a first-class
             node. Existing networks operate in milliseconds{" "}
-            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻³)</em>.
-            Net operates in nanoseconds{" "}
-            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻⁹)</em>.
+            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻³)</em>
+            . Net operates in nanoseconds{" "}
+            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻⁹)</em>
+            .
           </p>
 
           <p className="text-[13px] text-ink-dim mt-[18px] max-w-[580px] leading-[1.65]">
             No clients. No servers. No coordinators. The mesh propagates state,
-            not connections. Loosely inspired by the Net from Cyberpunk 2077 — an
-            engineering take on the concept.
+            not connections. Loosely inspired by the Net from Cyberpunk 2077 —
+            an engineering take on the concept.
           </p>
 
           <div className="mt-11 flex gap-3 flex-wrap items-center">
@@ -621,8 +712,8 @@ function WhyNotBestEffortSection() {
               That was the right design for 1969.
             </strong>{" "}
             It&apos;s the wrong design now. Sensors don&apos;t pause. Token
-            streams don&apos;t wait. Market feeds don&apos;t care that your queue
-            is full. The firehose doesn&apos;t have a pause button.
+            streams don&apos;t wait. Market feeds don&apos;t care that your
+            queue is full. The firehose doesn&apos;t have a pause button.
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
             In a world of abundance, guaranteeing delivery is a threat —
@@ -734,7 +825,9 @@ function TopologyClassesSection() {
             >
               {c.title}
             </div>
-            <div className="text-ink-dim text-[12px] leading-[1.6]">{c.body}</div>
+            <div className="text-ink-dim text-[12px] leading-[1.6]">
+              {c.body}
+            </div>
             <div className="mt-4 text-[11px] text-ink-dim border-t border-dashed border-ink-faint pt-3">
               latency floor:{" "}
               <b
@@ -1021,7 +1114,8 @@ function BenchmarksSection() {
             <br />
             <b className="text-ink font-medium">► date</b> 2026-04-27
             <br />
-            <b className="text-ink font-medium">► profile</b> release + LTO + CG=1
+            <b className="text-ink font-medium">► profile</b> release + LTO +
+            CG=1
           </p>
         </div>
       </div>
@@ -1109,8 +1203,8 @@ function MikoshiSection() {
               In Cyberpunk, Mikoshi is Arasaka&apos;s construct for storing
               engrams
             </strong>{" "}
-            — consciousness held in digital space, minds persisting outside their
-            original hardware.
+            — consciousness held in digital space, minds persisting outside
+            their original hardware.
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
             Mikoshi in Net is how daemons move between machines. A running
@@ -1211,7 +1305,8 @@ const GROUP_CARDS: readonly GroupCard[] = [
     ascii: (
       <>
         members 0..N{"\n"}
-        {"   ▶ "}<span className="text-accent">all active</span>
+        {"   ▶ "}
+        <span className="text-accent">all active</span>
         {"\n"}
         {"   ▶ deterministic identity\n   ▶ stateless work\n"}
         load balancer fans out{"\n"}
@@ -1242,11 +1337,14 @@ const GROUP_CARDS: readonly GroupCard[] = [
     ascii: (
       <>
         parent @ seq=42{"\n"}
-        {"   ├─▶ fork.A "}<span className="text-accent">(sentinel)</span>
+        {"   ├─▶ fork.A "}
+        <span className="text-accent">(sentinel)</span>
         {"\n"}
-        {"   ├─▶ fork.B "}<span className="text-accent">(sentinel)</span>
+        {"   ├─▶ fork.B "}
+        <span className="text-accent">(sentinel)</span>
         {"\n"}
-        {"   └─▶ fork.C "}<span className="text-accent">(sentinel)</span>
+        {"   └─▶ fork.C "}
+        <span className="text-accent">(sentinel)</span>
         {"\n"}
         each chain diverges{"\n"}
         verifiable lineage to parent
@@ -1282,7 +1380,9 @@ const GROUP_CARDS: readonly GroupCard[] = [
         standby{"  "}
         <span className="text-ink-faint">○</span> synced_through=101{"\n\n"}
         active fails → promote(member 1){"\n"}
-        {"   replays buffered events → seq=103\n   member 1 is now authoritative"}
+        {
+          "   replays buffered events → seq=103\n   member 1 is now authoritative"
+        }
       </>
     ),
     body: (
@@ -1329,9 +1429,7 @@ function ComputeRuntimeSection() {
           NEW
         </span>
         <span>
-          <b className="text-ink font-medium">
-            The compute runtime is live.
-          </b>{" "}
+          <b className="text-ink font-medium">The compute runtime is live.</b>{" "}
           Stateful programs that live on the mesh, not on a machine. They have
           cryptographic identity, a verifiable history, and they move between
           nodes mid-execution without anyone noticing.
@@ -1357,8 +1455,8 @@ function ComputeRuntimeSection() {
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12 -mt-8">
         A program on Net is called a{" "}
-        <em className="not-italic text-accent bg-accent/[0.08] px-1">daemon</em>.
-        Its identity is a public key — an{" "}
+        <em className="not-italic text-accent bg-accent/[0.08] px-1">daemon</em>
+        . Its identity is a public key — an{" "}
         <code className="text-accent bg-accent/[0.06] px-1.5 py-0.5 font-mono">
           origin_hash
         </code>{" "}
@@ -1409,12 +1507,12 @@ function DaemonCaseBlock() {
           </span>
           {"\n"}
           <span className="kw">let</span> daemon = Daemon::
-          <span className="fn">new</span>(<span className="ty">TraderConfig</span>{" "}
-          {"{"}
+          <span className="fn">new</span>(
+          <span className="ty">TraderConfig</span> {"{"}
           {"\n    "}
           <span className="fn">requirements</span>:{" "}
-          <span className="kw">vec</span>![{" "}
-          <span className="ty">Cap</span>::<span className="fn">Latency</span>(
+          <span className="kw">vec</span>![ <span className="ty">Cap</span>::
+          <span className="fn">Latency</span>(
           <span className="st">&quot;&lt;200μs to NYSE&quot;</span>) ],
           {"\n    "}
           <span className="fn">snapshot_interval</span>:{" "}
@@ -1423,7 +1521,8 @@ function DaemonCaseBlock() {
           {"\n"}
           {"});"}
           {"\n\n"}
-          <span className="kw">match</span> daemon.<span className="fn">tick</span>
+          <span className="kw">match</span> daemon.
+          <span className="fn">tick</span>
           (event).<span className="kw">await</span>? {"{"}
           {"\n    "}
           <span className="ty">Outcome</span>::
@@ -1575,46 +1674,164 @@ function SuperpositionViz() {
             </pattern>
           </defs>
 
-          <rect x="60" y="40" width="520" height="120" fill="url(#superGrid)" opacity="0.6" />
+          <rect
+            x="60"
+            y="40"
+            width="520"
+            height="120"
+            fill="url(#superGrid)"
+            opacity="0.6"
+          />
 
-          <rect x="60" y="55" width="520" height="22" fill="#0e120e" opacity="0.6" />
-          <rect x="60" y="123" width="520" height="22" fill="#0e120e" opacity="0.6" />
+          <rect
+            x="60"
+            y="55"
+            width="520"
+            height="22"
+            fill="#0e120e"
+            opacity="0.6"
+          />
+          <rect
+            x="60"
+            y="123"
+            width="520"
+            height="22"
+            fill="#0e120e"
+            opacity="0.6"
+          />
 
-          <text x="54" y="69" textAnchor="end" fontFamily="JetBrains Mono" fontSize="9" fill="#c4ff3d" fontWeight="600">
+          <text
+            x="54"
+            y="69"
+            textAnchor="end"
+            fontFamily="JetBrains Mono"
+            fontSize="9"
+            fill="#c4ff3d"
+            fontWeight="600"
+          >
             node.A
           </text>
-          <text x="54" y="79" textAnchor="end" fontFamily="JetBrains Mono" fontSize="7" fill="#4a5249">
+          <text
+            x="54"
+            y="79"
+            textAnchor="end"
+            fontFamily="JetBrains Mono"
+            fontSize="7"
+            fill="#4a5249"
+          >
             0x7af3
           </text>
-          <text x="54" y="138" textAnchor="end" fontFamily="JetBrains Mono" fontSize="9" fill="#c4ff3d" fontWeight="600">
+          <text
+            x="54"
+            y="138"
+            textAnchor="end"
+            fontFamily="JetBrains Mono"
+            fontSize="9"
+            fill="#c4ff3d"
+            fontWeight="600"
+          >
             node.B
           </text>
-          <text x="54" y="148" textAnchor="end" fontFamily="JetBrains Mono" fontSize="7" fill="#4a5249">
+          <text
+            x="54"
+            y="148"
+            textAnchor="end"
+            fontFamily="JetBrains Mono"
+            fontSize="7"
+            fill="#4a5249"
+          >
             0x2c91
           </text>
 
-          <line x1="60" y1="40" x2="60" y2="160" stroke="#2d352c" strokeWidth="0.6" />
+          <line
+            x1="60"
+            y1="40"
+            x2="60"
+            y2="160"
+            stroke="#2d352c"
+            strokeWidth="0.6"
+          />
 
-          <line x1="60" y1="66" x2="580" y2="66" stroke="#1a1f1a" strokeWidth="1" />
-          <line x1="60" y1="66" x2="400" y2="66" stroke="url(#superGrad)" strokeWidth="2.5" strokeLinecap="round" />
+          <line
+            x1="60"
+            y1="66"
+            x2="580"
+            y2="66"
+            stroke="#1a1f1a"
+            strokeWidth="1"
+          />
+          <line
+            x1="60"
+            y1="66"
+            x2="400"
+            y2="66"
+            stroke="url(#superGrad)"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+          />
           <circle cx="60" cy="66" r="4" fill="#c4ff3d" />
-          <circle cx="60" cy="66" r="7" fill="none" stroke="#c4ff3d" strokeOpacity="0.3" />
+          <circle
+            cx="60"
+            cy="66"
+            r="7"
+            fill="none"
+            stroke="#c4ff3d"
+            strokeOpacity="0.3"
+          />
           <g fontFamily="JetBrains Mono" fontSize="7" fill="#6b7568">
-            <text x="80" y="62">▸ exec</text>
-            <text x="140" y="62">heap.alloc</text>
-            <text x="220" y="62">cap.read</text>
-            <text x="300" y="62">snap.encode</text>
+            <text x="80" y="62">
+              ▸ exec
+            </text>
+            <text x="140" y="62">
+              heap.alloc
+            </text>
+            <text x="220" y="62">
+              cap.read
+            </text>
+            <text x="300" y="62">
+              snap.encode
+            </text>
           </g>
 
-          <line x1="60" y1="134" x2="580" y2="134" stroke="#1a1f1a" strokeWidth="1" />
-          <line x1="240" y1="134" x2="580" y2="134" stroke="url(#superGrad2)" strokeWidth="2.5" strokeLinecap="round" />
+          <line
+            x1="60"
+            y1="134"
+            x2="580"
+            y2="134"
+            stroke="#1a1f1a"
+            strokeWidth="1"
+          />
+          <line
+            x1="240"
+            y1="134"
+            x2="580"
+            y2="134"
+            stroke="url(#superGrad2)"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+          />
           <circle cx="580" cy="134" r="4" fill="#c4ff3d" />
-          <circle cx="580" cy="134" r="7" fill="none" stroke="#c4ff3d" strokeOpacity="0.3" />
+          <circle
+            cx="580"
+            cy="134"
+            r="7"
+            fill="none"
+            stroke="#c4ff3d"
+            strokeOpacity="0.3"
+          />
           <g fontFamily="JetBrains Mono" fontSize="7" fill="#6b7568">
-            <text x="260" y="148">unpack</text>
-            <text x="320" y="148">replay</text>
-            <text x="390" y="148">▸ exec</text>
-            <text x="470" y="148">cap.write</text>
+            <text x="260" y="148">
+              unpack
+            </text>
+            <text x="320" y="148">
+              replay
+            </text>
+            <text x="390" y="148">
+              ▸ exec
+            </text>
+            <text x="470" y="148">
+              cap.write
+            </text>
           </g>
 
           <rect
@@ -1628,10 +1845,38 @@ function SuperpositionViz() {
             strokeDasharray="3 3"
             strokeWidth="0.8"
           />
-          <line x1="240" y1="36" x2="240" y2="40" stroke="#c4ff3d" strokeWidth="1" />
-          <line x1="420" y1="36" x2="420" y2="40" stroke="#c4ff3d" strokeWidth="1" />
-          <line x1="240" y1="160" x2="240" y2="164" stroke="#c4ff3d" strokeWidth="1" />
-          <line x1="420" y1="160" x2="420" y2="164" stroke="#c4ff3d" strokeWidth="1" />
+          <line
+            x1="240"
+            y1="36"
+            x2="240"
+            y2="40"
+            stroke="#c4ff3d"
+            strokeWidth="1"
+          />
+          <line
+            x1="420"
+            y1="36"
+            x2="420"
+            y2="40"
+            stroke="#c4ff3d"
+            strokeWidth="1"
+          />
+          <line
+            x1="240"
+            y1="160"
+            x2="240"
+            y2="164"
+            stroke="#c4ff3d"
+            strokeWidth="1"
+          />
+          <line
+            x1="420"
+            y1="160"
+            x2="420"
+            y2="164"
+            stroke="#c4ff3d"
+            strokeWidth="1"
+          />
 
           <text
             x="330"
@@ -1656,39 +1901,130 @@ function SuperpositionViz() {
             both nodes hold authority
           </text>
 
-          <line x1="330" y1="40" x2="330" y2="160" stroke="#c4ff3d" strokeWidth="0.6" strokeDasharray="1 3" opacity="0.45" />
+          <line
+            x1="330"
+            y1="40"
+            x2="330"
+            y2="160"
+            stroke="#c4ff3d"
+            strokeWidth="0.6"
+            strokeDasharray="1 3"
+            opacity="0.45"
+          />
 
-          <line x1="60" y1="180" x2="580" y2="180" stroke="#2d352c" strokeWidth="0.6" />
+          <line
+            x1="60"
+            y1="180"
+            x2="580"
+            y2="180"
+            stroke="#2d352c"
+            strokeWidth="0.6"
+          />
           <g fontFamily="JetBrains Mono" fontSize="7" fill="#4a5249">
-            <line x1="60" y1="176" x2="60" y2="184" stroke="#4a5249" strokeWidth="0.6" />
+            <line
+              x1="60"
+              y1="176"
+              x2="60"
+              y2="184"
+              stroke="#4a5249"
+              strokeWidth="0.6"
+            />
             <text x="60" y="196" textAnchor="middle">
               0ns
             </text>
-            <line x1="150" y1="178" x2="150" y2="182" stroke="#3a423a" strokeWidth="0.4" />
-            <line x1="240" y1="174" x2="240" y2="186" stroke="#c4ff3d" strokeWidth="1" />
-            <text x="240" y="196" textAnchor="middle" fill="#c4ff3d" fontWeight="600">
+            <line
+              x1="150"
+              y1="178"
+              x2="150"
+              y2="182"
+              stroke="#3a423a"
+              strokeWidth="0.4"
+            />
+            <line
+              x1="240"
+              y1="174"
+              x2="240"
+              y2="186"
+              stroke="#c4ff3d"
+              strokeWidth="1"
+            />
+            <text
+              x="240"
+              y="196"
+              textAnchor="middle"
+              fill="#c4ff3d"
+              fontWeight="600"
+            >
               12ns
             </text>
-            <line x1="330" y1="178" x2="330" y2="182" stroke="#3a423a" strokeWidth="0.4" />
-            <line x1="420" y1="174" x2="420" y2="186" stroke="#c4ff3d" strokeWidth="1" />
-            <text x="420" y="196" textAnchor="middle" fill="#c4ff3d" fontWeight="600">
+            <line
+              x1="330"
+              y1="178"
+              x2="330"
+              y2="182"
+              stroke="#3a423a"
+              strokeWidth="0.4"
+            />
+            <line
+              x1="420"
+              y1="174"
+              x2="420"
+              y2="186"
+              stroke="#c4ff3d"
+              strokeWidth="1"
+            />
+            <text
+              x="420"
+              y="196"
+              textAnchor="middle"
+              fill="#c4ff3d"
+              fontWeight="600"
+            >
               50ns
             </text>
-            <line x1="500" y1="178" x2="500" y2="182" stroke="#3a423a" strokeWidth="0.4" />
-            <line x1="580" y1="176" x2="580" y2="184" stroke="#4a5249" strokeWidth="0.6" />
+            <line
+              x1="500"
+              y1="178"
+              x2="500"
+              y2="182"
+              stroke="#3a423a"
+              strokeWidth="0.4"
+            />
+            <line
+              x1="580"
+              y1="176"
+              x2="580"
+              y2="184"
+              stroke="#4a5249"
+              strokeWidth="0.6"
+            />
             <text x="580" y="196" textAnchor="middle">
               ~1µs
             </text>
           </g>
 
-          <circle className="superpose-pkt-a" cx="60" cy="66" r="3.5" fill="#c4ff3d" />
-          <circle className="superpose-pkt-b" cx="60" cy="134" r="3.5" fill="#c4ff3d" />
+          <circle
+            className="superpose-pkt-a"
+            cx="60"
+            cy="66"
+            r="3.5"
+            fill="#c4ff3d"
+          />
+          <circle
+            className="superpose-pkt-b"
+            cx="60"
+            cy="134"
+            r="3.5"
+            fill="#c4ff3d"
+          />
         </svg>
 
         <div className="grid grid-cols-3 gap-px bg-line border border-line mt-4 text-[10px]">
           <div className="bg-bg-2 px-3.5 py-3">
             <div className="flex items-baseline justify-between gap-2 mb-1">
-              <span className="text-ink-dim tracking-[0.14em] uppercase">T₀</span>
+              <span className="text-ink-dim tracking-[0.14em] uppercase">
+                T₀
+              </span>
               <span className="font-mono text-ink-faint">0–12ns</span>
             </div>
             <div className="text-ink mb-1">source running</div>
@@ -1711,7 +2047,9 @@ function SuperpositionViz() {
           </div>
           <div className="bg-bg-2 px-3.5 py-3">
             <div className="flex items-baseline justify-between gap-2 mb-1">
-              <span className="text-ink-dim tracking-[0.14em] uppercase">T₁</span>
+              <span className="text-ink-dim tracking-[0.14em] uppercase">
+                T₁
+              </span>
               <span className="font-mono text-ink-faint">50ns+</span>
             </div>
             <div className="text-ink mb-1">target authoritative</div>
@@ -1745,7 +2083,9 @@ function GroupCards() {
           <pre className="font-mono text-[10px] text-ink-dim leading-[1.5] bg-bg-2 p-3.5 border-l-2 border-accent mb-4 whitespace-pre overflow-x-auto">
             {g.ascii}
           </pre>
-          <p className="text-[12px] text-ink-dim leading-[1.6] mb-4">{g.body}</p>
+          <p className="text-[12px] text-ink-dim leading-[1.6] mb-4">
+            {g.body}
+          </p>
           <div className="border-t border-line pt-3.5 grid grid-cols-2 gap-2.5 text-[10px]">
             {g.spec.map(([k, v]) => (
               <span key={k} className="contents">
@@ -1857,10 +2197,7 @@ const INSTALL_CARDS: readonly InstallCard[] = [
 
 function InstallSection() {
   return (
-    <section
-      id="install"
-      className="bg-bg-2 border-b border-line px-6 py-20"
-    >
+    <section id="install" className="bg-bg-2 border-b border-line px-6 py-20">
       <SectionLabel>§07 / install</SectionLabel>
       <DisplayHeading>
         five languages.
@@ -2029,10 +2366,7 @@ const BLACKWALL_ITEMS: readonly BlackwallItem[] = [
 
 function BlackwallSection() {
   return (
-    <section
-      id="wall"
-      className="blackwall-bg border-b border-line px-6 py-20"
-    >
+    <section id="wall" className="blackwall-bg border-b border-line px-6 py-20">
       <SectionLabel>§09 / the blackwall</SectionLabel>
       <DisplayHeading>
         safety isn&apos;t declared.
@@ -2059,7 +2393,9 @@ function BlackwallSection() {
             <h4 className="text-[11px] text-accent uppercase tracking-[0.15em] mb-2.5">
               {item.tag}
             </h4>
-            <p className="text-ink-dim text-[12px] leading-[1.6]">{item.body}</p>
+            <p className="text-ink-dim text-[12px] leading-[1.6]">
+              {item.body}
+            </p>
           </div>
         ))}
       </div>
@@ -2188,8 +2524,6 @@ function Footer() {
           </div>
           <p className="text-ink-dim text-[12px] leading-[1.6] max-w-[380px]">
             Network Event Transport. A latency-first encrypted mesh protocol.
-            Loosely inspired by Cyberpunk 2077. Not affiliated with CD Projekt
-            Red or R. Talsorian Games.
           </p>
         </div>
         <FooterColumn title="Spec" items={FOOTER_SPEC} />
