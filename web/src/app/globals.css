@@ -408,3 +408,154 @@
   backdrop-filter: saturate(160%) blur(14px);
   -webkit-backdrop-filter: saturate(160%) blur(14px);
 }
+
+/* ─── Blackwall visual layers ─── */
+@utility blackwall-stripes-thick {
+  background-image: repeating-linear-gradient(
+    90deg,
+    transparent 0px,
+    transparent 6px,
+    rgba(196, 255, 61, 0.55) 7px,
+    rgba(196, 255, 61, 0.18) 8px,
+    transparent 9px,
+    transparent 14px
+  );
+  -webkit-mask-image: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0.25),
+    rgba(0, 0, 0, 0.85) 60%,
+    rgba(0, 0, 0, 1) 100%
+  );
+  mask-image: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0.25),
+    rgba(0, 0, 0, 0.85) 60%,
+    rgba(0, 0, 0, 1) 100%
+  );
+  animation: blackwall-shimmer 6s ease-in-out infinite;
+}
+
+@utility blackwall-stripes-thin {
+  background-image: repeating-linear-gradient(
+    90deg,
+    transparent 0px,
+    transparent 2px,
+    rgba(196, 255, 61, 0.18) 3px,
+    transparent 4px,
+    transparent 5px
+  );
+  -webkit-mask-image: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0.4),
+    rgba(0, 0, 0, 0.9) 70%,
+    rgba(0, 0, 0, 1)
+  );
+  mask-image: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0.4),
+    rgba(0, 0, 0, 0.9) 70%,
+    rgba(0, 0, 0, 1)
+  );
+  animation: blackwall-drift 12s linear infinite;
+}
+
+@utility blackwall-stripes-cyan {
+  background-image: repeating-linear-gradient(
+    90deg,
+    transparent 0px,
+    transparent 6px,
+    rgba(61, 240, 255, 0.22) 8px,
+    transparent 9px,
+    transparent 14px
+  );
+  animation: blackwall-aberrate 3.5s ease-in-out infinite;
+  mix-blend-mode: screen;
+}
+
+@utility blackwall-burst {
+  background:
+    radial-gradient(
+      ellipse 60% 90% at 100% 50%,
+      rgba(196, 255, 61, 0.65) 0%,
+      rgba(196, 255, 61, 0.22) 30%,
+      transparent 70%
+    ),
+    radial-gradient(
+      ellipse 40% 70% at 100% 50%,
+      rgba(61, 240, 255, 0.4) 0%,
+      transparent 60%
+    );
+  filter: blur(0.5px);
+  animation: blackwall-pulse 4s ease-in-out infinite;
+}
+
+@utility blackwall-scan {
+  background: repeating-linear-gradient(
+    0deg,
+    transparent 0px,
+    transparent 2px,
+    rgba(0, 0, 0, 0.35) 3px,
+    transparent 4px
+  );
+  mix-blend-mode: multiply;
+}
+
+@keyframes blackwall-shimmer {
+  0%,
+  100% {
+    opacity: 0.85;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes blackwall-drift {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(40px);
+  }
+}
+
+@keyframes blackwall-aberrate {
+  0%,
+  100% {
+    transform: translateX(2px);
+    opacity: 0.6;
+  }
+  25% {
+    transform: translateX(-1px);
+    opacity: 0.3;
+  }
+  50% {
+    transform: translateX(3px);
+    opacity: 0.85;
+  }
+  75% {
+    transform: translateX(0);
+    opacity: 0.4;
+  }
+}
+
+@keyframes blackwall-pulse {
+  0%,
+  100% {
+    opacity: 0.7;
+    transform: scaleX(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scaleX(1.05);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .blackwall-stripes-thick,
+  .blackwall-stripes-thin,
+  .blackwall-stripes-cyan,
+  .blackwall-burst {
+    animation: none !important;
+  }
+}
