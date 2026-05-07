@@ -2,8 +2,6 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { US_STATES } from "./us-map";
-
 type NodeId = "A" | "G" | "R1" | "R2" | "B" | "R3" | "R4";
 
 const NODE_POS: Record<NodeId, readonly [number, number]> = {
@@ -751,18 +749,6 @@ function ArpanetMapBg() {
       viewBox="0 0 1000 589"
       preserveAspectRatio="xMidYMid meet"
     >
-      <g
-        fill="none"
-        stroke="#c4ff3d"
-        strokeWidth="0.72"
-        strokeOpacity="1"
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      >
-        {US_STATES.map((s) => (
-          <path key={s.id} d={s.d} />
-        ))}
-      </g>
       {ARPANET_EDGES.map(([a, b]) => {
         const na = ARPANET_NODES[a];
         const nb = ARPANET_NODES[b];
@@ -778,6 +764,35 @@ function ArpanetMapBg() {
             strokeWidth="0.7"
             strokeOpacity="0.5"
           />
+        );
+      })}
+      {ARPANET_EDGES.map(([a, b], i) => {
+        const na = ARPANET_NODES[a];
+        const nb = ARPANET_NODES[b];
+        if (!na || !nb) return null;
+        const dist = Math.hypot(nb.x - na.x, nb.y - na.y);
+        const dur = Math.max(1.4, dist / 90).toFixed(2) + "s";
+        const begin = (i * 0.31).toFixed(2) + "s";
+        const reverse = i % 2 === 0;
+        const path = reverse
+          ? `M ${nb.x} ${nb.y} L ${na.x} ${na.y}`
+          : `M ${na.x} ${na.y} L ${nb.x} ${nb.y}`;
+        return (
+          <circle
+            key={`pkt-${a}-${b}`}
+            r="1.6"
+            fill="#c4ff3d"
+            opacity="0.9"
+            style={{ filter: "drop-shadow(0 0 3px #c4ff3d)" }}
+          >
+            <animateMotion
+              dur={dur}
+              begin={begin}
+              repeatCount="indefinite"
+              path={path}
+              rotate="auto"
+            />
+          </circle>
         );
       })}
       {Object.entries(ARPANET_NODES).map(([id, n]) => (
