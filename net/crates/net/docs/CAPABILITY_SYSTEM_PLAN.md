@@ -580,12 +580,26 @@ Eight phases in dependency order:
 ### Performance
 
 - **Tag-parse path.** Per-tag parse ≤ 100 ns (existing tag-parse benchmark, regression-pinned).
-- **Capability-announcement budget — pinned test.** Total announcement bytes ≤ 2× the pre-Warriors baseline at saturating capability emission. The existing announcement-budget regression test is extended to include the new `metadata` field's contribution to the wire format. Adding metadata to a `CapabilitySet` does NOT silently double the propagation cost — the test fails fast on regression. Specifically:
-  - Test workload: a 16-node mesh with each node emitting `CapabilitySet` advertisements at the saturating throttle rate (1024-event burst then 10s steady-state, repeated for 60s).
+- **Capability-announcement budget — three-layer enforcement.** Wire-budget control is enforced at three layers: a hard test pin in CI, a soft per-node budget that logs a warning in production, and a hard runtime cap that refuses to emit beyond the limit.
+
+  **Layer 1 — Hard test pin (CI):** total announcement bytes ≤ 2× the pre-Warriors baseline at saturating capability emission. The existing announcement-budget regression test is extended to include the new `metadata` field's contribution to the wire format. Adding metadata to a `CapabilitySet` does NOT silently double the propagation cost — the test fails fast on regression. Specifically:
+  - Test workload: a 16-node mesh with each node emitting `CapabilitySet` advertisements at the saturating throttle rate (1024-event burst then 10 s steady-state, repeated for 60 s).
   - Baseline measurement (pre-Warriors): bytes/sec across all relay paths under that workload, no metadata field.
   - Warriors-aware measurement: same workload with metadata at the soft cap (4 KB per CapabilitySet).
   - Pin: Warriors-aware ≤ 2× baseline. Bloom-filter aggregation MUST kick in at the 256-tag threshold to keep the bound; without it, ratio exceeds 2× at high tag counts and the test fails.
-  - Surface as `dataforts_announcement_bytes_per_sec` metric so the bound is operator-visible in production.
+
+  **Layer 2 — Soft per-node budget (production warning):** each node measures its own outbound announcement bytes/sec. When the rate crosses the soft threshold (default 75% of the hard limit), the node emits a structured warning log:
+  ```
+  WARN dataforts.announcement_budget node=<id> bytes_per_sec=<n> soft_threshold=<m> reason=<bloom_inactive | metadata_growth | tag_burst | unknown>
+  ```
+  - Hysteresis: the warning fires at most once per 60 s per node to avoid log spam.
+  - Reason is best-effort — the budget enforcer reports likely culprits (bloom filter inactive when tag count > 256; metadata field exceeding 50% of total announcement size; sustained tag-burst above the throttle).
+  - Configurable via `MeshConfig::announcement_soft_budget_fraction` (default `0.75`); operators can tighten for sensitive deployments or loosen during known burst windows.
+  - Counter metric: `dataforts_announcement_budget_warn_total{reason}`. Track in alerts.
+
+  **Layer 3 — Hard runtime cap (production limit):** announcements that would exceed the hard per-node limit (default 2× baseline equivalent) are rejected at emit time with `CapabilityError::AnnouncementBudgetExceeded`. Protects neighboring nodes from a misbehaving local emitter. Defaults configured to be unreachable under normal operation; tripping this is operator-actionable as a hard incident.
+
+  **Visibility surface:** `dataforts_announcement_bytes_per_sec` metric (gauge, per-node) shows current rate; `dataforts_announcement_budget_warn_total{reason}` (counter, per-node) shows soft-budget crossings; `dataforts_announcement_budget_exceeded_total` (counter, per-node) shows hard-cap rejections. All three are part of the standard operator dashboard.
 - **Query-operator latency.** Local-only `match_axis` query ≤ 1 μs at 10K nodes in index. `nearest` ≤ 10 μs at the same scale.
 - **`PlacementFilter` scoring.** Single-node score ≤ 5 μs across 100 candidate nodes for an artifact with all 5 axes active.
 
