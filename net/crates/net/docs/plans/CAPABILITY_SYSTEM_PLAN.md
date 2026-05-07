@@ -400,6 +400,61 @@ impl IntentRegistry {
 
 Applications can register custom intents via `IntentRegistry::register()`.
 
+### 7a. Scope-based latency attraction
+
+The `StandardPlacement` proximity axis already supports "must be within RTT X" as a hard threshold. A small extension turns this into **positive latency concentration toward flagship nodes** — daemons attract themselves toward physical / topological locations marked by scope tags.
+
+**Use cases:** NYSE / CME / LSE / Eurex trading floors (microsecond-class RTT to matching engines), Equinix datacenter peering points (NY4, LD4, FR2, TY3), TSMC fab inspection-image clusters, oil & gas drilling-site clusters, autonomous-vehicle metro-edge POPs, live-event venue networks, anywhere physical proximity to a specific location dominates placement value.
+
+**Mechanism (reuses existing primitives — no new abstractions).**
+
+A flagship node (or set of nodes) at the target location carries a scope tag — e.g., `scope:nyse-trading-floor`. Multiple machines in the NYSE rack space all carry the same tag. The proximity graph already measures RTT between any two nodes; the capability index already routes by tag.
+
+A daemon that needs concentration toward that location declares:
+
+```
+metadata.attract-to-scope:nyse-trading-floor
+metadata.attract-budget:100us             # max acceptable RTT to the flagship
+metadata.attract-fallback-scopes:equinix-ny4,us-east-region   # optional ladder
+```
+
+The placement-filter extension scores candidate nodes:
+
+```rust
+fn attract_score(candidate: &NodeId, target_scope: &ScopeLabel, budget: Duration) -> f32 {
+    if candidate carries target_scope:
+        return 1.0;  // co-located, perfect concentration
+    let rtt = proximity_graph.nearest_rtt(candidate, |n| n.tags.contains(target_scope));
+    if rtt > budget:
+        return 0.0;  // out of budget
+    1.0 - (rtt.as_nanos() as f32 / budget.as_nanos() as f32)
+}
+```
+
+This becomes another input to `StandardPlacement::placement_score`, multiplied with the other axes. A daemon that requires GPU + scope:prod + intent:trading-engine + attract-to-scope:nyse-trading-floor + ≥ 80 GB free VRAM lands on the highest-scoring intersection of all five constraints.
+
+**Why this is genuinely simple:**
+
+- No new tag vocabulary — `scope:` already exists; flagship nodes just carry the appropriate scope.
+- No new abstraction layer — no "anchor tags," no parallel concept; reuses what's already in the substrate.
+- No new placement-filter axis — extends the existing proximity axis from "hard threshold" to "soft scoring against scope-tagged anchors."
+- Multiple flagships per location (multiple nodes carrying the same scope) handled automatically — `nearest_rtt` picks whichever NYSE-scoped node is closest.
+- Hierarchical fallback (`metadata.attract-fallback-scopes`) lets the daemon express "ideally Wall Street, acceptable Manhattan, fallback NYC" using the same primitive.
+
+**Implementation cost.**
+
+A few hundred lines on top of the existing `StandardPlacement`:
+
+- Read `metadata.attract-to-scope` and `metadata.attract-budget` from the artifact's metadata.
+- Use the existing capability-index lookup to find nodes carrying the target scope.
+- Use the existing proximity graph to compute the nearest-RTT.
+- Compute the score (~10 lines of math).
+- Combine with the existing axes via the existing multiplicative composition.
+
+Test surface adds: scoping correctness (candidate carrying target scope scores 1.0); budget cutoff (out-of-budget scores 0); fallback ladder (next scope used when primary unavailable); composition with other axes (a daemon requiring GPU AND attract-to-NYSE picks NYSE-scoped GPU nodes when available, falls back gracefully when not).
+
+**Effort:** ~1-2 days of focused work added to Phase F. Most of the work is testing — the actual logic is small because all the substrate's primitives are already in place.
+
 ### 8. Mikoshi integration
 
 Mikoshi today selects migration targets via single-node logic (capability match only, no scope / proximity / intent / colocation filtering). After this phase, Mikoshi consults `PlacementFilter` for migration target selection.
