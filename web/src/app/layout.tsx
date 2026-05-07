@@ -30,7 +30,7 @@ export default function RootLayout({
       lang="en"
       className={`${jetbrainsMono.variable} ${majorMonoDisplay.variable} h-full antialiased`}
     >
-      <body className="crt-scanlines bg-bg text-ink overflow-x-hidden font-mono min-h-full flex flex-col">
+      <body className="crt-scanlines bg-bg text-ink overflow-x-hidden font-mono min-h-full">
         {children}
       </body>
     </html>
