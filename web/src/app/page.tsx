@@ -326,7 +326,7 @@ function MeshViz() {
   }, []);
 
   return (
-    <div className="border border-line bg-bg-2 p-4 self-start">
+    <div className="hidden lg:block border border-line bg-bg-2 p-4 self-start">
       <div className="flex justify-between items-center border-b border-line pb-2 mb-3.5 text-[10px] tracking-[0.12em] text-ink-dim uppercase">
         <span>
           <span className="text-accent">▸</span> mesh.proximity
@@ -335,7 +335,7 @@ function MeshViz() {
       </div>
 
       <svg
-        className="mesh-svg w-full h-[320px] block"
+        className="mesh-svg w-full aspect-[320/220] block"
         viewBox="0 0 320 220"
         preserveAspectRatio="xMidYMid meet"
       >
