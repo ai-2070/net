@@ -696,20 +696,20 @@ interface ArpanetNode {
 }
 
 const ARPANET_NODES: Record<string, ArpanetNode> = {
-  UCLA: { x: 215, y: 360, label: "UCLA" },
-  SRI: { x: 175, y: 280, label: "SRI" },
-  UCSB: { x: 200, y: 345 },
-  RAND: { x: 222, y: 365 },
-  UTAH: { x: 330, y: 260, label: "UTAH" },
-  ILL: { x: 685, y: 245, label: "UIUC" },
-  CASE: { x: 790, y: 215 },
-  CMU: { x: 820, y: 230, label: "CMU" },
-  MITRE: { x: 880, y: 260, label: "MITRE" },
-  BBN: { x: 945, y: 160, label: "BBN" },
-  MIT: { x: 940, y: 165 },
-  HVD: { x: 948, y: 152 },
-  LINC: { x: 952, y: 158 },
-  BURR: { x: 935, y: 170 },
+  UCLA: { x: 165, y: 380, label: "UCLA" },
+  SRI: { x: 110, y: 270, label: "SRI" },
+  UCSB: { x: 140, y: 410, label: "UCSB" },
+  RAND: { x: 220, y: 360, label: "RAND" },
+  UTAH: { x: 320, y: 245, label: "UTAH" },
+  ILL: { x: 640, y: 230, label: "UIUC" },
+  CASE: { x: 790, y: 195, label: "CASE" },
+  CMU: { x: 820, y: 245, label: "CMU" },
+  MITRE: { x: 870, y: 275, label: "MITRE" },
+  BBN: { x: 880, y: 160, label: "BBN" },
+  MIT: { x: 920, y: 130, label: "MIT" },
+  HVD: { x: 945, y: 105, label: "HVD" },
+  LINC: { x: 920, y: 200, label: "LINC" },
+  BURR: { x: 850, y: 105, label: "BURR" },
 };
 
 const ARPANET_EDGES: ReadonlyArray<readonly [string, string]> = [
@@ -749,6 +749,184 @@ function ArpanetMapBg() {
       viewBox="0 0 1000 589"
       preserveAspectRatio="xMidYMid meet"
     >
+      <defs>
+        <pattern
+          id="arpanet-grid"
+          width="40"
+          height="40"
+          patternUnits="userSpaceOnUse"
+        >
+          <path
+            d="M 40 0 L 0 0 0 40"
+            fill="none"
+            stroke="#c4ff3d"
+            strokeWidth="0.3"
+            strokeOpacity="0.18"
+          />
+        </pattern>
+      </defs>
+      <rect x="40" y="60" width="920" height="490" fill="url(#arpanet-grid)" />
+
+      {/* corner registration brackets */}
+      <g
+        fill="none"
+        stroke="#c4ff3d"
+        strokeOpacity="0.55"
+        strokeWidth="0.8"
+      >
+        <path d="M 40 80 L 40 60 L 60 60" />
+        <path d="M 940 60 L 960 60 L 960 80" />
+        <path d="M 960 530 L 960 550 L 940 550" />
+        <path d="M 60 550 L 40 550 L 40 530" />
+      </g>
+
+      {/* latitude tick marks (left edge) */}
+      <g fontFamily="JetBrains Mono" fontSize="7" fill="#c4ff3d" fillOpacity="0.5">
+        {[
+          { y: 120, lat: "50°N" },
+          { y: 220, lat: "45°N" },
+          { y: 320, lat: "40°N" },
+          { y: 420, lat: "35°N" },
+          { y: 510, lat: "30°N" },
+        ].map((t) => (
+          <g key={t.lat}>
+            <line
+              x1="40"
+              y1={t.y}
+              x2="50"
+              y2={t.y}
+              stroke="#c4ff3d"
+              strokeOpacity="0.5"
+              strokeWidth="0.6"
+            />
+            <text x="14" y={t.y + 2.5} letterSpacing="0.5">
+              {t.lat}
+            </text>
+          </g>
+        ))}
+      </g>
+
+      {/* longitude tick marks (bottom edge) */}
+      <g fontFamily="JetBrains Mono" fontSize="7" fill="#c4ff3d" fillOpacity="0.5">
+        {[
+          { x: 130, lon: "120°W" },
+          { x: 320, lon: "110°W" },
+          { x: 510, lon: "100°W" },
+          { x: 700, lon: "90°W" },
+          { x: 890, lon: "80°W" },
+        ].map((t) => (
+          <g key={t.lon}>
+            <line
+              x1={t.x}
+              y1="550"
+              x2={t.x}
+              y2="540"
+              stroke="#c4ff3d"
+              strokeOpacity="0.5"
+              strokeWidth="0.6"
+            />
+            <text
+              x={t.x}
+              y="565"
+              letterSpacing="0.5"
+              textAnchor="middle"
+            >
+              {t.lon}
+            </text>
+          </g>
+        ))}
+      </g>
+
+      {/* compass — top right */}
+      <g transform="translate(905,100)">
+        <circle
+          cx="0"
+          cy="0"
+          r="16"
+          fill="none"
+          stroke="#c4ff3d"
+          strokeOpacity="0.45"
+          strokeWidth="0.6"
+        />
+        <line
+          x1="0"
+          y1="-16"
+          x2="0"
+          y2="-22"
+          stroke="#c4ff3d"
+          strokeOpacity="0.7"
+          strokeWidth="0.8"
+        />
+        <text
+          x="0"
+          y="-26"
+          fontFamily="JetBrains Mono"
+          fontSize="8"
+          fill="#c4ff3d"
+          fillOpacity="0.75"
+          textAnchor="middle"
+          fontWeight="600"
+        >
+          N
+        </text>
+        <line
+          x1="0"
+          y1="-12"
+          x2="0"
+          y2="12"
+          stroke="#c4ff3d"
+          strokeOpacity="0.55"
+          strokeWidth="0.5"
+        />
+        <line
+          x1="-12"
+          y1="0"
+          x2="12"
+          y2="0"
+          stroke="#c4ff3d"
+          strokeOpacity="0.55"
+          strokeWidth="0.5"
+        />
+      </g>
+
+      {/* scale bar — bottom right */}
+      <g transform="translate(820,500)">
+        <line
+          x1="0"
+          y1="0"
+          x2="120"
+          y2="0"
+          stroke="#c4ff3d"
+          strokeOpacity="0.55"
+          strokeWidth="0.7"
+        />
+        <line x1="0" y1="-3" x2="0" y2="3" stroke="#c4ff3d" strokeOpacity="0.55" strokeWidth="0.7" />
+        <line x1="60" y1="-2" x2="60" y2="2" stroke="#c4ff3d" strokeOpacity="0.55" strokeWidth="0.6" />
+        <line x1="120" y1="-3" x2="120" y2="3" stroke="#c4ff3d" strokeOpacity="0.55" strokeWidth="0.7" />
+        <text x="0" y="14" fontFamily="JetBrains Mono" fontSize="7" fill="#c4ff3d" fillOpacity="0.55">
+          0
+        </text>
+        <text x="60" y="14" fontFamily="JetBrains Mono" fontSize="7" fill="#c4ff3d" fillOpacity="0.55" textAnchor="middle">
+          500 MI
+        </text>
+        <text x="120" y="14" fontFamily="JetBrains Mono" fontSize="7" fill="#c4ff3d" fillOpacity="0.55" textAnchor="end">
+          1000
+        </text>
+      </g>
+
+      {/* topology stats — top left */}
+      <g
+        fontFamily="JetBrains Mono"
+        fontSize="8"
+        fill="#c4ff3d"
+        fillOpacity="0.6"
+        letterSpacing="1.2"
+      >
+        <text x="60" y="86">RFC-1 · IMP TOPOLOGY</text>
+        <text x="60" y="100" fillOpacity="0.4">NODES: 14 · LINKS: 17</text>
+        <text x="60" y="114" fillOpacity="0.4">PROTO: NCP · 50 KBPS LINES</text>
+      </g>
+
       {ARPANET_EDGES.map(([a, b]) => {
         const na = ARPANET_NODES[a];
         const nb = ARPANET_NODES[b];
