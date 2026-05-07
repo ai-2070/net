@@ -71,7 +71,7 @@ The unlock. The features doc identifies `causal:origin_hash[:tip_seq]` capabilit
 
 ### Scope
 
-**Tag shapes.** Parsed forms, all encoded as opaque `Tag` values inside the existing `CapabilitySet.tags` set, organized under the Warriors-shipped four-axis taxonomy (`hardware`, `software`, `devices`, `dataforts`):
+**Tag shapes (set-membership, fast filter).** Parsed forms, all encoded as opaque `Tag` values inside the existing `CapabilitySet.tags` set, organized under the Warriors-shipped four-axis taxonomy (`hardware`, `software`, `devices`, `dataforts`):
 
 | Shape | Axis | Meaning |
 |---|---|---|
@@ -79,16 +79,29 @@ The unlock. The features doc identifies `causal:origin_hash[:tip_seq]` capabilit
 | `causal:<hex>:<tip_seq>` | `dataforts` | "I hold this chain at least through `tip_seq`" |
 | `causal:<hex>[<start>..<end>]` | `dataforts` | "I hold this chain across the `[start, end]` seq range" — for time-travel queries (Phase 6) |
 | `fork-of:<parent_hex>` | `dataforts` | "This chain forked from `parent_hex` — for lineage/cohort queries" |
-| `intent:<label>` | chain-side | "This chain is for X kind of work" — e.g. `intent:ml-training`, `intent:sensor-telemetry`, `intent:billing-settlement`. Drives capability-preference matching in Phase 1's greedy filter. |
-| `colocate-with:<other_origin_hash>` | chain-side | "Place me on the same node as that chain (soft preference)." Drives causal-affinity placement in Phase 1's greedy filter. |
-| `colocate-with-strict:<other_origin_hash>` | chain-side | Hard variant — refuses placement if target unavailable. |
 
-Three non-shape extensions, all reserved keys on capability tags:
+Two non-shape extensions, both reserved keys on capability tags:
 
 - `heat:<chain_hex>=<reads_per_window>` — heat counter for Phase 4. Annotated optionally; absence means "not advertising heat."
-- `scope:<label>` — the existing scoped-capability tag (see `SCOPED_CAPABILITIES_PLAN.md`); reused by Phase 1's greedy filter.
+- `scope:<label>` — the existing scoped-capability tag (see `SCOPED_CAPABILITIES_PLAN.md`); reused by Phase 1's greedy filter for fast set-membership filtering.
 
 (The blob CAS storage tag `blob:<hex>:<size>` referenced in earlier drafts is removed — Phase 3 ships as a `BlobAdapter` hook trait carrying URI + hash + size in event payloads, not as a substrate-owned blob tag.)
+
+**Metadata field (key-value, richer per-artifact annotations).** Distinct from the tag set; serves a different purpose. Adds a new field `CapabilitySet::metadata: BTreeMap<String, String>` carrying arbitrary application-defined key-value pairs. The substrate doesn't interpret metadata values; applications and the placement filter do. The Kubernetes parallel: tags = labels (set-membership, fast scheduler filtering); metadata = annotations (key-value, freeform per-artifact context).
+
+**Reserved metadata keys** that the placement filter consults (Phase 7) and that applications can set on chains/replicas/daemons:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `metadata.intent` | `String` | "What kind of work is this artifact for" — e.g. `ml-training`, `sensor-telemetry`, `billing-settlement`. Drives capability-preference matching. |
+| `metadata.colocate-with` | `String` (origin_hash hex) | "Place me near the node holding this chain (soft preference)" |
+| `metadata.colocate-with-strict` | `String` (origin_hash hex) | "Refuse placement if target unavailable (hard)" |
+| `metadata.priority` | `String` | Optional — application-defined priority hint |
+| `metadata.owner` | `String` | Optional — owning team / project |
+
+Application-defined keys (anything not under the `metadata.` reserved-prefix list above) propagate through the substrate as opaque key-value pairs. The placement filter ignores them; queries can match against them via the federated query layer.
+
+**Why the split.** Tags stay fast because they're set-membership over a bounded namespace (the bloom filter handles 10K+ chains in 500 KB). Metadata can be richer because it's not on the routing hot path; lookups happen during placement decisions, not per-routing-hop. Applications can put arbitrary keys in metadata without polluting the tag namespace (which is shared across the substrate).
 
 **Bloom-filter aggregation.** A node holding many chains advertises a bloom filter rather than enumerating each tag. Target: 10K chains in ≤ 500 KB; propagation cost ≤ 2× current capability-announcement budget. Adds a new optional field `CapabilitySet::chain_bloom: Option<BloomFilter>`. Nodes that match the bloom probe with a follow-up `causal:<hex>` precise lookup before issuing a real read.
 
@@ -163,11 +176,11 @@ A node observes streams flowing past via the existing tail subscription path. If
   }
   ```
 - Cache substrate: a per-channel RedEX file with a size cap. Caches are normal RedEX files, just owned by the cache layer instead of the application. Reuse v1 retention machinery (`Retention::Bytes`) for the size cap.
-- **Pull condition is a quintuple AND** (per features-doc spec, extended with Rebel Yell's capability-preference and colocation dimensions):
-  1. **Scope match** — the chain advertises a `scope:` tag matching one of the local node's configured scopes.
+- **Pull condition is a quintuple AND** (per features-doc spec, extended with Rebel Yell's capability-preference and colocation dimensions). The first uses the fast tag set; the next two read from the artifact's `metadata` field; the last two are local-node decisions:
+  1. **Scope match** — the chain advertises a `scope:` tag (set-membership, fast bloom check) matching one of the local node's configured scopes.
   2. **Proximity bound** — the chain's home is within `proximity_max_rtt` per the existing proximity graph.
-  3. **Capability-preference match (intent-tagged replication)** — the chain advertises an `intent:` tag (e.g. `intent:ml-training`, `intent:sensor-telemetry`, `intent:billing-settlement`); the local node's advertised capability set (`hardware`, `software`, `devices` axes from The Warriors taxonomy) must include capabilities that *fulfill* that intent. Defaults: a GPU-rich node fulfills `intent:ml-training`; an edge node with sensor `devices` tags fulfills `intent:sensor-telemetry`; a stable datacenter node fulfills `intent:billing-settlement`. Concrete intent-to-capability mappings live in a small lookup table (`adapter::net::dataforts::intent`); applications may register custom intents. **This is the dimension that produces emergent specialization** — different node fleets become specialized for different workloads automatically because their capability sets fulfill different intents.
-  4. **Colocation preference (causal-chain affinity)** — if the chain advertises a `colocate-with:<other_origin_hash>` tag and the local node already holds (or already replicates) the target chain, the chain prefers to land here. **Default behavior is a soft scoring boost**, not a hard gate — colocation tilts placement toward affinity but doesn't override capacity constraints. A strict variant `colocate-with-strict:<hash>` is available for hard requirements (refuses placement if target is unavailable). Use cases: chained processing pipelines (`A → B → C` colocated on one node minimizes hops); fork chains colocated with parents for fast lineage walks; cohort chains for multi-channel correlation analytics.
+  3. **Capability-preference match (intent-tagged replication)** — the chain's `metadata.intent` value (e.g. `"ml-training"`, `"sensor-telemetry"`, `"billing-settlement"`) is consulted; the local node's advertised capability set (`hardware`, `software`, `devices` axes from The Warriors taxonomy) must include capabilities that *fulfill* that intent. Defaults: a GPU-rich node fulfills `intent: "ml-training"`; an edge node with sensor `devices` tags fulfills `intent: "sensor-telemetry"`; a stable datacenter node fulfills `intent: "billing-settlement"`. Concrete intent-to-capability mappings live in a small lookup table (`adapter::net::placement::intent`); applications may register custom intents. **This is the dimension that produces emergent specialization** — different node fleets become specialized for different workloads automatically because their capability sets fulfill different intents.
+  4. **Colocation preference (causal-chain affinity)** — if the chain's `metadata.colocate-with` value is an origin_hash (hex string) and the local node already holds (or already replicates) the target chain, the chain prefers to land here. **Default behavior is a soft scoring boost**, not a hard gate — colocation tilts placement toward affinity but doesn't override capacity constraints. The `metadata.colocate-with-strict` variant refuses placement if target is unavailable. Use cases: chained processing pipelines (`A → B → C` colocated on one node minimizes hops); fork chains colocated with parents for fast lineage walks; cohort chains for multi-channel correlation analytics.
   5. **Storage available** — local node decision; LRU eviction when the total cap is hit.
 - ACL gating falls through automatically — only chains with valid `subscribe_caps` reach the inbound observe path; the cache layer just inherits.
 - Per-chain advertisement on first cache, withdrawal on full eviction. Phase 0 carries the announcements.
@@ -224,8 +237,8 @@ pub trait PlacementFilter: Send + Sync {
 }
 
 pub enum Artifact<'a> {
-    Chain { origin_hash: [u8; 32], tags: &'a CapabilitySet },
-    Replica { channel: &'a ChannelName, tags: &'a CapabilitySet },
+    Chain { origin_hash: [u8; 32], capabilities: &'a CapabilitySet },
+    Replica { channel: &'a ChannelName, capabilities: &'a CapabilitySet },
     Daemon { daemon_id: [u8; 32], required: &'a CapabilitySet, optional: &'a CapabilitySet },
 }
 
@@ -235,17 +248,20 @@ pub struct StandardPlacement {
     pub intent_match: IntentMatchPolicy,
     pub colocation_policy: ColocationPolicy,
     pub resource_axis: ResourceAxis,        // Storage | Compute | Both
+    /// Configurable metadata key names. Defaults: `"intent"`, `"colocate-with"`, `"colocate-with-strict"`.
+    /// Applications can override to use their own metadata key conventions.
+    pub metadata_keys: PlacementMetadataKeys,
 }
 ```
 
-The reference implementation `StandardPlacement` evaluates all 5 axes:
+The reference implementation `StandardPlacement` evaluates all 5 axes, reading from both the artifact's tag set (set-membership filtering) and its metadata field (key-value annotations):
 
-1. **Scope** — `scope:` tag match between artifact and target node.
+1. **Scope** — `scope:` tag set-membership match between artifact and target node (fast bloom-filter check).
 2. **Proximity** — RTT bound via the existing proximity graph.
-3. **Capability-preference** — `intent:` tag on artifact mapped to required capabilities (`hardware`, `software`, `devices`); target must include all required.
-4. **Colocation** — `colocate-with:` / `colocate-with-strict:` tags on artifact resolved against target's local holdings or already-replicated chains.
+3. **Capability-preference** — `metadata.intent` value on artifact (configured key; default `"intent"`) mapped via the `intent → required capabilities` lookup table to required capabilities (`hardware`, `software`, `devices`); target must include all required.
+4. **Colocation** — `metadata.colocate-with` / `metadata.colocate-with-strict` values on artifact resolved against target's local holdings or already-replicated chains.
 5. **Resource-availability** — varies by artifact:
-   - Chain / Replica → free storage capacity (advertised via `dataforts.free_storage:` tag)
+   - Chain / Replica → free storage capacity (advertised via `dataforts.free_storage:<bytes>` tag)
    - Daemon → free compute capacity (CPU cores, available RAM, GPU/VRAM if required)
    - Choose via `ResourceAxis::Storage | ResourceAxis::Compute | ResourceAxis::Both`
 
