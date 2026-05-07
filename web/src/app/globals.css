@@ -133,14 +133,14 @@
     inset: 0;
     background: repeating-linear-gradient(
       0deg,
-      rgba(196, 255, 61, 0.012) 0px,
-      rgba(196, 255, 61, 0.012) 1px,
+      rgba(0, 0, 0, 0.32) 0px,
+      rgba(0, 0, 0, 0.32) 1px,
       transparent 1px,
       transparent 3px
     );
     pointer-events: none;
     z-index: 1000;
-    mix-blend-mode: overlay;
+    mix-blend-mode: multiply;
   }
   &::after {
     content: "";
@@ -150,6 +150,42 @@
     pointer-events: none;
     z-index: 999;
     opacity: 0.4;
+  }
+}
+
+/* localized denser scanlines for the ARPANET map */
+@utility crt-scanlines-dense {
+  position: relative;
+
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      rgba(0, 0, 0, 0.3) 0px,
+      rgba(0, 0, 0, 0.3) 2px,
+      transparent 2px,
+      transparent 5px
+    );
+    animation: crt-scan-drift 1.1s linear infinite;
+    pointer-events: none;
+    mix-blend-mode: multiply;
+  }
+}
+
+@keyframes crt-scan-drift {
+  0% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: 0 -5px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .crt-scanlines-dense::after {
+    animation: none !important;
   }
 }
 

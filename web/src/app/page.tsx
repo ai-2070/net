@@ -736,10 +736,8 @@ const ARPANET_EDGES: ReadonlyArray<readonly [string, string]> = [
 
 function ArpanetMapBg() {
   return (
-    <svg
-      className="absolute right-0 top-12 w-full max-w-[820px] aspect-[1000/589] pointer-events-none opacity-[0.22]"
-      viewBox="0 0 1000 589"
-      preserveAspectRatio="xMidYMid meet"
+    <div
+      className="crt-scanlines-dense absolute right-0 top-8 w-full max-w-[1100px] aspect-[1000/589] pointer-events-none"
       aria-hidden
       style={{
         WebkitMaskImage:
@@ -748,10 +746,15 @@ function ArpanetMapBg() {
           "radial-gradient(ellipse 80% 80% at 60% 50%, #000 30%, transparent 95%)",
       }}
     >
+    <svg
+      className="w-full h-full opacity-[0.22]"
+      viewBox="0 0 1000 589"
+      preserveAspectRatio="xMidYMid meet"
+    >
       <g
         fill="none"
         stroke="#c4ff3d"
-        strokeWidth="0.6"
+        strokeWidth="1"
         strokeOpacity="1"
         strokeLinejoin="round"
         strokeLinecap="round"
@@ -815,6 +818,7 @@ function ArpanetMapBg() {
         ARPANET · IMP BACKBONE · DEC 1971
       </text>
     </svg>
+    </div>
   );
 }
 
