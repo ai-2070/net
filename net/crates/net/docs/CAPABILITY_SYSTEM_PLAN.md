@@ -580,7 +580,12 @@ Eight phases in dependency order:
 ### Performance
 
 - **Tag-parse path.** Per-tag parse ≤ 100 ns (existing tag-parse benchmark, regression-pinned).
-- **Capability-announcement budget.** ≤ 2× current under saturating tag growth; existing announcement-budget regression test extended.
+- **Capability-announcement budget — pinned test.** Total announcement bytes ≤ 2× the pre-Warriors baseline at saturating capability emission. The existing announcement-budget regression test is extended to include the new `metadata` field's contribution to the wire format. Adding metadata to a `CapabilitySet` does NOT silently double the propagation cost — the test fails fast on regression. Specifically:
+  - Test workload: a 16-node mesh with each node emitting `CapabilitySet` advertisements at the saturating throttle rate (1024-event burst then 10s steady-state, repeated for 60s).
+  - Baseline measurement (pre-Warriors): bytes/sec across all relay paths under that workload, no metadata field.
+  - Warriors-aware measurement: same workload with metadata at the soft cap (4 KB per CapabilitySet).
+  - Pin: Warriors-aware ≤ 2× baseline. Bloom-filter aggregation MUST kick in at the 256-tag threshold to keep the bound; without it, ratio exceeds 2× at high tag counts and the test fails.
+  - Surface as `dataforts_announcement_bytes_per_sec` metric so the bound is operator-visible in production.
 - **Query-operator latency.** Local-only `match_axis` query ≤ 1 μs at 10K nodes in index. `nearest` ≤ 10 μs at the same scale.
 - **`PlacementFilter` scoring.** Single-node score ≤ 5 μs across 100 candidate nodes for an artifact with all 5 axes active.
 
