@@ -1639,7 +1639,7 @@ function SuperpositionViz() {
 
       <div className="px-5 pt-6 pb-5">
         <svg
-          className="w-full aspect-[600/210] block"
+          className="w-full max-w-[600px] mx-auto aspect-[600/210] block"
           viewBox="0 0 600 210"
           preserveAspectRatio="xMidYMid meet"
         >
