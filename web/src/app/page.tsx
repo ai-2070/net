@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { US_STATES } from "./us-map";
+
 type NodeId = "A" | "G" | "R1" | "R2" | "B" | "R3" | "R4";
 
 const NODE_POS: Record<NodeId, readonly [number, number]> = {
@@ -689,68 +691,203 @@ function HeroSection() {
   );
 }
 
+interface ArpanetNode {
+  x: number;
+  y: number;
+  label?: string;
+}
+
+const ARPANET_NODES: Record<string, ArpanetNode> = {
+  UCLA: { x: 215, y: 360, label: "UCLA" },
+  SRI: { x: 175, y: 280, label: "SRI" },
+  UCSB: { x: 200, y: 345 },
+  RAND: { x: 222, y: 365 },
+  UTAH: { x: 330, y: 260, label: "UTAH" },
+  ILL: { x: 685, y: 245, label: "UIUC" },
+  CASE: { x: 790, y: 215 },
+  CMU: { x: 820, y: 230, label: "CMU" },
+  MITRE: { x: 880, y: 260, label: "MITRE" },
+  BBN: { x: 945, y: 160, label: "BBN" },
+  MIT: { x: 940, y: 165 },
+  HVD: { x: 948, y: 152 },
+  LINC: { x: 952, y: 158 },
+  BURR: { x: 935, y: 170 },
+};
+
+const ARPANET_EDGES: ReadonlyArray<readonly [string, string]> = [
+  ["UCLA", "SRI"],
+  ["UCLA", "UCSB"],
+  ["UCLA", "RAND"],
+  ["UCSB", "SRI"],
+  ["SRI", "UTAH"],
+  ["UTAH", "ILL"],
+  ["UTAH", "CASE"],
+  ["CASE", "CMU"],
+  ["CASE", "MIT"],
+  ["CMU", "HVD"],
+  ["MIT", "BBN"],
+  ["BBN", "HVD"],
+  ["HVD", "LINC"],
+  ["LINC", "BURR"],
+  ["ILL", "MITRE"],
+  ["MITRE", "BBN"],
+  ["RAND", "BBN"],
+];
+
+function ArpanetMapBg() {
+  return (
+    <svg
+      className="absolute right-0 top-12 w-full max-w-[820px] aspect-[1000/589] pointer-events-none opacity-[0.22]"
+      viewBox="0 0 1000 589"
+      preserveAspectRatio="xMidYMid meet"
+      aria-hidden
+      style={{
+        WebkitMaskImage:
+          "radial-gradient(ellipse 80% 80% at 60% 50%, #000 30%, transparent 95%)",
+        maskImage:
+          "radial-gradient(ellipse 80% 80% at 60% 50%, #000 30%, transparent 95%)",
+      }}
+    >
+      <g
+        fill="none"
+        stroke="#c4ff3d"
+        strokeWidth="0.6"
+        strokeOpacity="1"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      >
+        {US_STATES.map((s) => (
+          <path key={s.id} d={s.d} />
+        ))}
+      </g>
+      {ARPANET_EDGES.map(([a, b]) => {
+        const na = ARPANET_NODES[a];
+        const nb = ARPANET_NODES[b];
+        if (!na || !nb) return null;
+        return (
+          <line
+            key={`${a}-${b}`}
+            x1={na.x}
+            y1={na.y}
+            x2={nb.x}
+            y2={nb.y}
+            stroke="#c4ff3d"
+            strokeWidth="0.7"
+            strokeOpacity="0.5"
+          />
+        );
+      })}
+      {Object.entries(ARPANET_NODES).map(([id, n]) => (
+        <g key={id}>
+          <circle
+            cx={n.x}
+            cy={n.y}
+            r="6"
+            fill="none"
+            stroke="#c4ff3d"
+            strokeOpacity="0.35"
+          />
+          <circle cx={n.x} cy={n.y} r="2.5" fill="#c4ff3d" />
+          {n.label ? (
+            <text
+              x={n.x + 9}
+              y={n.y + 3}
+              fontFamily="JetBrains Mono"
+              fontSize="9"
+              fill="#c4ff3d"
+              fillOpacity="0.7"
+              letterSpacing="0.5"
+            >
+              {n.label}
+            </text>
+          ) : null}
+        </g>
+      ))}
+      <text
+        x="80"
+        y="540"
+        fontFamily="JetBrains Mono"
+        fontSize="10"
+        fill="#c4ff3d"
+        fillOpacity="0.55"
+        letterSpacing="2"
+      >
+        ARPANET · IMP BACKBONE · DEC 1971
+      </text>
+    </svg>
+  );
+}
+
 function WhyNotBestEffortSection() {
   return (
-    <section id="what" className="border-b border-line px-6 py-20">
-      <SectionLabel>§01 / why not best-effort</SectionLabel>
-      <DisplayHeading>
-        arpanet assumed scarcity.
-        <br />
-        net assumes abundance.
-      </DisplayHeading>
+    <section
+      id="what"
+      className="relative overflow-hidden border-b border-line px-6 py-20"
+    >
+      <ArpanetMapBg />
+      <div className="relative">
+        <SectionLabel>§01 / why not best-effort</SectionLabel>
+        <DisplayHeading>
+          arpanet assumed scarcity.
+          <br />
+          net assumes abundance.
+        </DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
-        TCP was designed when nuclear war was a real possibility. Packets were
-        precious. Bandwidth was scarce. Routes were scarce. The network had to
-        guarantee delivery because the next packet might not get through.
-      </p>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mt-6">
-        <div>
-          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
-            <strong className="text-ink font-medium">
-              That was the right design for 1969.
-            </strong>{" "}
-            It&apos;s the wrong design now. Sensors don&apos;t pause. Token
-            streams don&apos;t wait. Market feeds don&apos;t care that your
-            queue is full. The firehose doesn&apos;t have a pause button.
-          </p>
-          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
-            In a world of abundance, guaranteeing delivery is a threat —
-            you&apos;re promising to deliver data that will bury the receiver.
-            The bottleneck isn&apos;t delivery. It&apos;s processing. Arrival
-            doesn&apos;t equal usefulness.
-          </p>
-        </div>
-        <div>
-          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
-            <strong className="text-ink font-medium">
-              Net inverts the default.
-            </strong>{" "}
-            TCP starts with trust and detects abuse. Net starts with zero
-            assumptions and lets trust emerge from consistent behavior.
-          </p>
-          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
-            Nodes reject work they can&apos;t process within a time window.
-            Dropping a packet and re-requesting from a faster node costs
-            nanoseconds. Waiting for a congested node&apos;s guaranteed response
-            costs milliseconds.{" "}
-            <strong className="text-ink font-medium">
-              When dropping is cheaper than waiting, delivery guarantees become
-              overhead.
-            </strong>
-          </p>
-        </div>
-      </div>
-
-      <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
-        <p className="text-[18px] text-ink leading-[1.5] font-light">
-          The benchmark numbers aren&apos;t performance metrics. They&apos;re{" "}
-          <strong className="text-accent font-medium">existence proofs</strong>.
-          They demonstrate that the software layer is no longer the bottleneck.
-          The remaining latency is physics: NIC, wire, speed of light. The
-          software got out of the way.
+        <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+          TCP was designed when nuclear war was a real possibility. Packets were
+          precious. Bandwidth was scarce. Routes were scarce. The network had to
+          guarantee delivery because the next packet might not get through.
         </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mt-6">
+          <div>
+            <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+              <strong className="text-ink font-medium">
+                That was the right design for 1969.
+              </strong>{" "}
+              It&apos;s the wrong design now. Sensors don&apos;t pause. Token
+              streams don&apos;t wait. Market feeds don&apos;t care that your
+              queue is full. The firehose doesn&apos;t have a pause button.
+            </p>
+            <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+              In a world of abundance, guaranteeing delivery is a threat —
+              you&apos;re promising to deliver data that will bury the receiver.
+              The bottleneck isn&apos;t delivery. It&apos;s processing. Arrival
+              doesn&apos;t equal usefulness.
+            </p>
+          </div>
+          <div>
+            <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+              <strong className="text-ink font-medium">
+                Net inverts the default.
+              </strong>{" "}
+              TCP starts with trust and detects abuse. Net starts with zero
+              assumptions and lets trust emerge from consistent behavior.
+            </p>
+            <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+              Nodes reject work they can&apos;t process within a time window.
+              Dropping a packet and re-requesting from a faster node costs
+              nanoseconds. Waiting for a congested node&apos;s guaranteed
+              response costs milliseconds.{" "}
+              <strong className="text-ink font-medium">
+                When dropping is cheaper than waiting, delivery guarantees
+                become overhead.
+              </strong>
+            </p>
+          </div>
+        </div>
+
+        <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
+          <p className="text-[18px] text-ink leading-[1.5] font-light">
+            The benchmark numbers aren&apos;t performance metrics. They&apos;re{" "}
+            <strong className="text-accent font-medium">
+              existence proofs
+            </strong>
+            . They demonstrate that the software layer is no longer the
+            bottleneck. The remaining latency is physics: NIC, wire, speed of
+            light. The software got out of the way.
+          </p>
+        </div>
       </div>
     </section>
   );
@@ -2213,10 +2350,9 @@ const COMPONENTS: readonly ComponentSpec[] = [
         Request/response semantics built from a pair of streams. A server
         registers a handler with{" "}
         <code className="font-mono text-accent">serve_rpc</code>; clients
-        dispatch with{" "}
-        <code className="font-mono text-accent">call_typed</code>. The streams
-        stay primitive — nRPC just wraps them in a typed handle and completes
-        when the response lands.
+        dispatch with <code className="font-mono text-accent">call_typed</code>.
+        The streams stay primitive — nRPC just wraps them in a typed handle and
+        completes when the response lands.
       </>
     ),
     stats: "TypedMeshRpc · paired streams · zero new wire",
@@ -2242,10 +2378,12 @@ const COMPONENTS: readonly ComponentSpec[] = [
     body: (
       <>
         A reactive, queryable projection of the log, updated event-by-event.
-        Your &quot;database&quot; isn&apos;t a process you connect to — it&apos;s
-        a{" "}
+        Your &quot;database&quot; isn&apos;t a process you connect to —
+        it&apos;s a{" "}
         <code className="font-mono text-accent">Vec&lt;Task&gt;</code> or{" "}
-        <code className="font-mono text-accent">HashMap&lt;Uuid, Memory&gt;</code>{" "}
+        <code className="font-mono text-accent">
+          HashMap&lt;Uuid, Memory&gt;
+        </code>{" "}
         in your code, updating as events fold in. Queries are direct memory
         access.
       </>
@@ -2261,9 +2399,8 @@ const COMPONENTS: readonly ComponentSpec[] = [
         One handle bundling typed collections under{" "}
         <code className="font-mono text-accent">db.tasks</code>,{" "}
         <code className="font-mono text-accent">db.memories</code>, and friends.
-        Prisma-style{" "}
-        <code className="font-mono text-accent">find_unique</code> /{" "}
-        <code className="font-mono text-accent">find_many</code> across Rust,
+        Prisma-style <code className="font-mono text-accent">find_unique</code>{" "}
+        / <code className="font-mono text-accent">find_many</code> across Rust,
         TypeScript, and Python — whole-database snapshots round-trip between
         languages.
       </>
@@ -2274,10 +2411,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
 
 function ComponentsSection() {
   return (
-    <section
-      id="components"
-      className="border-b border-line px-6 py-20"
-    >
+    <section id="components" className="border-b border-line px-6 py-20">
       <SectionLabel>§07 / components on the mesh</SectionLabel>
       <DisplayHeading>
         four primitives.
