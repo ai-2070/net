@@ -1,1301 +1,2262 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-const NAV_LINKS = [
-  { href: "#why", label: "Why" },
-  { href: "#stack", label: "Stack" },
-  { href: "#benchmarks", label: "Benchmarks" },
-  { href: "#daemons", label: "Daemons" },
-  { href: "#data", label: "Local data" },
-  { href: "#applications", label: "Applications" },
-  { href: "#install", label: "Install" },
-];
+type NodeId = "A" | "G" | "R1" | "R2" | "B" | "R3" | "R4";
 
-const HERO_STATS = [
-  { num: "1.98 ns", label: "Header serialize" },
-  { num: "53 ns", label: "Per-hop forward" },
-  { num: "288 ns", label: "Fail + recover cycle" },
-  { num: "1.92 MB", label: "Deployed binary" },
-];
-
-const INVERT_LEFT = [
-  "Queues at every hop absorb bursts",
-  "Connections as the primary object",
-  "Brokers (Kafka, Pulsar) hold plaintext at fixed addresses",
-  "Cooperative — assumes goodwill",
-  "TCP backpressure measured in round trips",
-  "Millisecond budgets at the software layer",
-];
-
-const INVERT_RIGHT: React.ReactNode[] = [
-  <>
-    Bounded ring buffers; queues are <em>failure</em>
-  </>,
-  <>State propagates; connections are ephemeral</>,
-  <>
-    Bus has no location — it <em>is</em> the mesh
-  </>,
-  <>Trust derived from observed behavior</>,
-  <>Backpressure is silence; reroute is the response</>,
-  <>Nanosecond scheduling on commodity HW</>,
-];
-
-const PROPS = [
-  {
-    title: "Latency-first",
-    body: "Sub-2 ns header serialize. Per-hop forwarding in nanoseconds. The floor is low enough that scheduling operates at function-call timescales.",
-  },
-  {
-    title: "Streaming-first",
-    body: "Data is a continuous flow, not documents. Sharded ring buffers and adaptive batching assume incremental production and consumption. No requests, no responses — streams.",
-  },
-  {
-    title: "Zero-copy",
-    body: "Ring buffers, no GC, native Rust. Forwarding doesn't allocate or copy payload data. This is what makes per-hop numbers possible.",
-  },
-  {
-    title: "Encrypted end-to-end",
-    body: "Noise NK handshakes for key exchange. ChaCha20-Poly1305 with counter nonces. Every packet is encrypted between source and destination. Intermediate nodes never see plaintext.",
-  },
-  {
-    title: "Untrusted relay",
-    body: "Nodes forward packets without decrypting payloads. The mesh can route through infrastructure you don't trust — the network grows through adversarial nodes.",
-  },
-  {
-    title: "Schema-agnostic",
-    body: "The transport moves bytes, not structures. The protocol never inspects content. Two nodes can negotiate typed streams while the rest of the mesh passes opaque bytes.",
-  },
-  {
-    title: "Optionally ordered",
-    body: "Ordering is per-stream, per-entity — not global. The unordered path is the fast path. Causal ordering is available when streams need it.",
-  },
-  {
-    title: "Native backpressure",
-    body: "Nodes drop packets without reply. The proximity graph makes silence a signal, not an error. Neighbors notice within a heartbeat interval.",
-  },
-];
-
-const ARCH_ROWS = [
-  {
-    name: "Transport",
-    desc: "Encrypted UDP, zero-alloc packet pools, multi-hop forwarding, adaptive batching, fair scheduling, failure detection, pingwave swarm discovery",
-    mech: "ChaCha20-Poly1305 / Noise NK",
-  },
-  {
-    name: "Identity",
-    desc: "ed25519 entity identity, origin binding on every packet, permission tokens with delegation chains",
-    mech: "ed25519 + BLAKE2s origin hashes",
-  },
-  {
-    name: "Channels",
-    desc: "Named hierarchical channels, capability-based access control, bloom-filter authorization at ~20 ns per packet",
-    mech: "AuthGuard bloom + verified cache",
-  },
-  {
-    name: "Behavior plane",
-    desc: "Capability announcements, capability diffs, API schema registry, device autonomy rules, distributed tracing, load balancing, proximity graph",
-    mech: "CapabilityIndex + RuleEngine",
-  },
-  {
-    name: "Subnets",
-    desc: "4-level (region/fleet/vehicle/subsystem) hierarchy, label-based assignment, gateway visibility enforcement",
-    mech: "8/8/8/8 SubnetId encoding",
-  },
-  {
-    name: "Distributed state",
-    desc: "24-byte causal links, compressed observed horizons, append-only entity logs, state snapshots for migration",
-    mech: "Per-entity causal chain",
-  },
-  {
-    name: "Compute runtime",
-    desc: "MeshDaemon trait, capability-based placement, 6-phase migration with snapshot chunking, replica + fork + standby groups",
-    mech: "DaemonHost + PlacementScheduler",
-  },
-  {
-    name: "Subprotocols",
-    desc: "Formal protocol registry, version negotiation, capability-aware routing via tags, opaque forwarding guarantee",
-    mech: "16-bit subprotocol_id space",
-  },
-  {
-    name: "Continuity",
-    desc: "Causal cones, 36-byte continuity proofs, honest discontinuity with deterministic forking, superposition during migration",
-    mech: "Fork records, lineage sentinels",
-  },
-  {
-    name: "Contested envs",
-    desc: "Correlated failure detection, subnet-aware partition classification, partition healing with log reconciliation",
-    mech: "Longest chain + deterministic tiebreak",
-  },
-  {
-    name: "Local data",
-    desc: "RedEX append-only log, CortEX folded state, NetDB query façade. Local, per-node, and entirely optional",
-    mech: "redex / cortex / netdb features",
-  },
-];
-
-const WIRE_ROWS = [
-  { off: "0x00", name: "MAGIC (0x4E45), VERSION, FLAGS", size: "4 B" },
-  { off: "0x04", name: "PRIORITY, HOP_TTL, HOP_COUNT, FRAG", size: "4 B" },
-  { off: "0x08", name: "SUBPROTOCOL_ID, CHANNEL_HASH", size: "4 B" },
-  { off: "0x0C", name: "NONCE", size: "12 B" },
-  { off: "0x18", name: "SESSION_ID", size: "8 B" },
-  { off: "0x20", name: "STREAM_ID", size: "8 B" },
-  { off: "0x28", name: "SEQUENCE", size: "8 B" },
-  { off: "0x30", name: "SUBNET_ID, ORIGIN_HASH", size: "8 B" },
-  { off: "0x38", name: "FRAGMENT_ID, FRAGMENT_OFFSET", size: "4 B" },
-  { off: "0x3C", name: "PAYLOAD_LEN, EVENT_COUNT", size: "4 B" },
-];
-
-const BENCH = [
-  {
-    num: "505",
-    unit: "M ops/s",
-    label: "Header serialize",
-    meta: "1.98 ns · M1 Max — 762 M/s on i9",
-  },
-  {
-    num: "5.06",
-    unit: "G ops/s",
-    label: "Routing header forward",
-    meta: "0.20 ns on i9-14900K",
-  },
-  {
-    num: "3.21",
-    unit: "G ops/s",
-    label: "GPU capability check",
-    meta: "0.31 ns — inline per-packet",
-  },
-  {
-    num: "53",
-    unit: "ns",
-    label: "Per-hop forwarding",
-    meta: "i9 1-hop — linear to 5+ hops",
-  },
-  {
-    num: "288",
-    unit: "ns",
-    label: "Full fail + recover cycle",
-    meta: "Mark, evaluate, reroute — M1 Max",
-  },
-  {
-    num: "10",
-    unit: "M+ evt/s",
-    label: "Sustained event ingestion",
-    meta: "< 1 μs p99 through the EventBus",
-  },
-  {
-    num: "6.97",
-    unit: "M evt/s",
-    label: "Python batch ingestion",
-    meta: "PyO3 binding releases the GIL on FFI",
-  },
-  {
-    num: "6.31",
-    unit: "M evt/s",
-    label: "Go raw ingestion",
-    meta: "158 ns/event · zero allocations",
-  },
-  {
-    num: "1.07",
-    unit: "G ops/s",
-    label: "Pingwave roundtrip",
-    meta: "0.93 ns swarm-discovery primitive",
-  },
-];
-
-const APPS = [
-  {
-    icon: "AI",
-    title: "AI runtime",
-    body: "Token streams, tool-call results, guardrail decisions, and consensus votes flowing across heterogeneous GPU nodes. Compute-heavy inference routes to whichever node has capacity. The mesh is the runtime.",
-  },
-  {
-    icon: "VS",
-    title: "Vehicular sensor mesh",
-    body: "Cars sharing LIDAR, radar, camera. Vehicles sync intent — braking, turning, route changes — nanoseconds before the brake pads touch the rotor.",
-  },
-  {
-    icon: "RB",
-    title: "Robotics & factory floors",
-    body: "Mesh routes through whatever's reachable — a robot behind a steel column relays through one that isn't. Sub-microsecond reroute on node failure. No central controller, no SPOF.",
-  },
-  {
-    icon: "DR",
-    title: "Disaster response",
-    body: "Phones, drones, portable radios forming a mesh with no surviving infrastructure. Each device contributes what it has. The mesh forms from whatever is present.",
-  },
-  {
-    icon: "RS",
-    title: "Remote surgery",
-    body: "Control signals and haptic feedback routed across the mesh. If the primary compute node lags, the mesh reroutes mid-operation. The surgeon doesn't notice. The scalpel doesn't stop.",
-  },
-  {
-    icon: "DS",
-    title: "Drone swarms",
-    body: "Coordinated flight without a ground controller. A drone that loses a motor broadcasts the failure; the swarm adjusts formation before the drone has begun to fall.",
-  },
-  {
-    icon: "LP",
-    title: "Live performance",
-    body: "Lighting, audio, video, pyrotechnics synced across hundreds of nodes on a stage rig. A DMX controller dies, another node picks up the cue list. No show stop.",
-  },
-  {
-    icon: "AG",
-    title: "Precision agriculture",
-    body: "Tractors, drones, soil sensors, weather stations forming a field mesh. A tractor that detects a soil condition shares it; every other tractor adjusts seeding without round-tripping to a cloud.",
-  },
-  {
-    icon: "MP",
-    title: "Multiplayer gaming",
-    body: "State propagates peer-to-peer with causal ordering. Capability-aware routing means physics and world state route toward the gaming PC, not the phone. Ping is meaningless — there's no fixed server.",
-  },
-];
-
-const STATUS_CARDS = [
-  { v: "~1,573", l: "Rust unit tests" },
-  { v: "~469", l: "Integration + SDK tests" },
-  { v: "62 + 190", l: "Node + Python SDK smoke" },
-  { v: "1.92 MB", l: "Core cdylib (release LTO)" },
-];
-
-type TabKey = "rust" | "ts" | "py" | "go" | "c";
-
-const INSTALL_TABS: { key: TabKey; label: string }[] = [
-  { key: "rust", label: "Rust" },
-  { key: "ts", label: "TypeScript" },
-  { key: "py", label: "Python" },
-  { key: "go", label: "Go" },
-  { key: "c", label: "C" },
-];
-
-const INSTALL_PANES: Record<TabKey, React.ReactNode> = {
-  rust: (
-    <>
-      <span className="text-dim"># Rust SDK</span>
-      {"\n"}cargo add <span className="text-accent2">ai2070-net-sdk</span>
-      {"\n\n"}
-      <span className="text-dim"># Lower-level core (skip SDK ergonomics)</span>
-      {"\n"}cargo add <span className="text-accent2">ai2070-net</span>
-    </>
-  ),
-  ts: (
-    <>
-      <span className="text-dim"># TypeScript / Node SDK</span>
-      {"\n"}npm install <span className="text-accent2">@ai2070/net-sdk</span>{" "}
-      <span className="text-accent2">@ai2070/net</span>
-      {"\n\n"}
-      <span className="text-dim"># Lower-level NAPI binding</span>
-      {"\n"}npm install <span className="text-accent2">@ai2070/net</span>
-    </>
-  ),
-  py: (
-    <>
-      <span className="text-dim"># Python SDK</span>
-      {"\n"}pip install <span className="text-accent2">ai2070-net-sdk</span>
-      {"\n\n"}
-      <span className="text-dim"># Lower-level PyO3 binding</span>
-      {"\n"}pip install <span className="text-accent2">ai2070-net</span>
-    </>
-  ),
-  go: (
-    <>
-      <span className="text-dim"># Go binding</span>
-      {"\n"}go get{" "}
-      <span className="text-accent2">github.com/ai-2070/net/go</span>
-    </>
-  ),
-  c: (
-    <>
-      <span className="text-dim"># C SDK — build cdylib + bundled header</span>
-      {"\n"}cargo build --release --features ffi,net
-      {"\n\n"}
-      <span className="text-dim"># Result: libnet.dylib + include/net.h</span>
-    </>
-  ),
+const NODE_POS: Record<NodeId, readonly [number, number]> = {
+  A: [60, 40],
+  G: [160, 80],
+  R1: [260, 50],
+  R2: [100, 160],
+  B: [220, 170],
+  R3: [290, 130],
+  R4: [40, 110],
 };
 
-const BLACKWALL = [
-  {
-    tag: "No plaintext on relays",
-    title: "Nothing to sniff.",
-    body: "Zero-copy forwarding means relay nodes pass encrypted bytes through without decrypting. There is no moment where the payload is readable in memory on an untrusted node. Compromise of a relay leaks encrypted bytes with no key material — session keys are between source and destination.",
-  },
-  {
-    tag: "No clock dependency",
-    title: "Causal, not temporal.",
-    body: "Net has no dependency on wall clocks, NTP, or synchronized time. Event ordering is causal — parent hashes, sequence numbers, vector clocks. An attacker who poisons NTP, spoofs GPS, or skews clocks across a subnet cannot disrupt ordering. A captured tower broadcasting adversarial timestamps disrupts clock-dependent protocols. Net is unaffected.",
-  },
-  {
-    tag: "No connection state to hijack",
-    title: "Defense in depth at the protocol.",
-    body: "No TCP session to take over, no cookie to steal, no sequence number to predict. Backpressure, bounded queues, fanout limits, deduplication, TTL, and rate limiting compose. Any single mechanism can be overwhelmed; their composition forms the wall. There is no single point to breach because the wall is the mesh.",
-  },
+const NODE_ADJ: Record<NodeId, readonly NodeId[]> = {
+  A: ["G", "R2", "R4"],
+  G: ["A", "R1", "R2", "B"],
+  R1: ["G", "R3"],
+  R2: ["G", "A", "B", "R4"],
+  B: ["G", "R2", "R3"],
+  R3: ["R1", "B"],
+  R4: ["R2", "A"],
+};
+
+const EDGE_ALIAS: Record<string, string> = {
+  "A-G": "A-G",
+  "G-R1": "G-R1",
+  "G-R2": "G-R2",
+  "B-G": "G-B",
+  "B-R2": "R2-B",
+  "A-R2": "A-R2",
+  "R1-R3": "R1-R3",
+  "B-R3": "R3-B",
+  "R2-R4": "R4-R2",
+  "A-R4": "R4-A",
+};
+
+const NODE_LABEL_ORDER: readonly NodeId[] = [
+  "A",
+  "G",
+  "R1",
+  "R2",
+  "B",
+  "R3",
+  "R4",
 ];
 
-function Eyebrow({ children }: { children: React.ReactNode }) {
+const ENDPOINT_PAIRS: ReadonlyArray<readonly [NodeId, NodeId]> = [
+  ["A", "B"],
+  ["B", "A"],
+  ["A", "R3"],
+  ["R4", "B"],
+  ["A", "R1"],
+];
+
+function edgeKey(a: NodeId, b: NodeId): string {
+  return [a, b].sort().join("-");
+}
+
+function shortestPath(from: NodeId, to: NodeId): NodeId[] {
+  const queue: NodeId[][] = [[from]];
+  const seen = new Set<NodeId>([from]);
+  while (queue.length > 0) {
+    const path = queue.shift();
+    if (!path) break;
+    const last = path[path.length - 1];
+    if (last === to) return path;
+    for (const n of NODE_ADJ[last]) {
+      if (!seen.has(n)) {
+        seen.add(n);
+        queue.push([...path, n]);
+      }
+    }
+  }
+  return [from, to];
+}
+
+const PACKET_RAIN_TOKENS: readonly string[] = [
+  "node.0x2c",
+  "node.0x7a",
+  "node.0xff",
+  "node.0x4e",
+  "node.0x91",
+  "→ relay.04",
+  "→ relay.0a",
+  "→ relay.1f",
+  "→ gw.00",
+  "pingwave",
+  "mycelia",
+  "engram",
+  "mikoshi",
+  "superpose",
+  "0xc4ff3d",
+  "0x4e4554",
+  "0x7af301",
+  "0xdeadbe",
+  "0xfeedfa",
+  "rt:hit",
+  "rt:miss",
+  "hb.ack",
+  "hb.syn",
+  "fwd.0",
+  "fwd.1",
+  "fwd.2",
+  "cap.read",
+  "cap.write",
+  "cap.exec",
+  "route()",
+  "forward()",
+  "38ns",
+  "57ns",
+  "113ns",
+  "288ns",
+  "0.93ns",
+  "▸▸▸",
+  "◀◀◀",
+  "── ──",
+  "·· ··",
+  "01001110",
+  "01000101",
+  "01010100",
+  "A→B",
+  "B→G",
+  "G→R1",
+  "R2→B",
+  "ACK",
+  "SYN",
+  "FIN",
+  "NAK",
+  "OK",
+  "ERR",
+];
+
+interface RainColumn {
+  x: number;
+  y: number;
+  speed: number;
+  gap: number;
+  len: number;
+  tokens: string[];
+  tick: number;
+}
+
+function pickToken(): string {
+  const idx = Math.floor(Math.random() * PACKET_RAIN_TOKENS.length);
+  return PACKET_RAIN_TOKENS[idx] ?? "";
+}
+
+function PacketRain() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const FONT_PX = 11;
+    const COL_W = 90;
+    let W = 0;
+    let H = 0;
+    let cols: RainColumn[] = [];
+    let rafId = 0;
+
+    const resize = (): void => {
+      const rect = canvas.getBoundingClientRect();
+      W = rect.width;
+      H = rect.height;
+      canvas.width = Math.max(1, Math.floor(W * dpr));
+      canvas.height = Math.max(1, Math.floor(H * dpr));
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(dpr, dpr);
+      ctx.font = `${FONT_PX}px "JetBrains Mono", ui-monospace, monospace`;
+      ctx.textBaseline = "top";
+
+      const colCount = Math.max(6, Math.ceil(W / COL_W));
+      cols = Array.from({ length: colCount }, (_, i) => ({
+        x: (i + 0.5) * (W / colCount) + (Math.random() - 0.5) * 20,
+        y: -Math.random() * H,
+        speed: 0.5 + Math.random() * 1.4,
+        gap: 16 + Math.random() * 10,
+        len: 8 + Math.floor(Math.random() * 14),
+        tokens: Array.from({ length: 22 }, pickToken),
+        tick: 0,
+      }));
+    };
+
+    const frame = (): void => {
+      ctx.fillStyle = "rgba(11, 13, 11, 0.18)";
+      ctx.fillRect(0, 0, W, H);
+
+      for (const c of cols) {
+        c.y += c.speed;
+        c.tick++;
+        if (c.tick % 7 === 0) {
+          c.tokens[Math.floor(Math.random() * c.tokens.length)] = pickToken();
+        }
+
+        for (let i = 0; i < c.len; i++) {
+          const drawY = c.y - i * c.gap;
+          if (drawY < -FONT_PX || drawY > H) continue;
+
+          const headIdx = Math.floor(c.y / c.gap);
+          const idx = headIdx - i;
+          if (idx < 0) continue;
+          const tok = c.tokens[idx % c.tokens.length] ?? "";
+
+          if (i === 0) {
+            ctx.fillStyle = "rgba(220, 255, 200, 0.95)";
+          } else {
+            const a = Math.max(0, 1 - i / c.len);
+            ctx.fillStyle = `rgba(196, 255, 61, ${a * 0.55})`;
+          }
+          ctx.fillText(tok, c.x, drawY);
+        }
+
+        if (c.y - c.len * c.gap > H + 40) {
+          c.y = -Math.random() * H * 0.5;
+          c.speed = 0.5 + Math.random() * 1.4;
+          c.gap = 16 + Math.random() * 10;
+          c.len = 8 + Math.floor(Math.random() * 14);
+          c.tokens = c.tokens.map(() => pickToken());
+        }
+      }
+      rafId = requestAnimationFrame(frame);
+    };
+
+    const onResize = (): void => {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      resize();
+      ctx.fillStyle = "#0b0d0b";
+      ctx.fillRect(0, 0, W, H);
+    };
+
+    resize();
+    ctx.fillStyle = "#0b0d0b";
+    ctx.fillRect(0, 0, W, H);
+    rafId = requestAnimationFrame(frame);
+    window.addEventListener("resize", onResize);
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      window.removeEventListener("resize", onResize);
+    };
+  }, []);
+
   return (
-    <span className="font-mono text-xs tracking-[0.14em] uppercase text-accent inline-flex items-center gap-2 before:content-[''] before:w-1.5 before:h-1.5 before:rounded-full before:bg-accent before:shadow-[0_0_12px_var(--color-accent)]">
-      {children}
-    </span>
+    <canvas
+      ref={canvasRef}
+      className="packet-rain absolute inset-0 w-full h-full pointer-events-none"
+      aria-hidden
+    />
   );
 }
 
-function SectionHead({
-  eyebrow,
-  title,
-  right,
+function MeshViz() {
+  const linksRef = useRef<SVGGElement | null>(null);
+  const motionRef = useRef<SVGAnimateMotionElement | null>(null);
+  const labelsRef = useRef<SVGGElement | null>(null);
+
+  useEffect(() => {
+    const linksGroup = linksRef.current;
+    const motion = motionRef.current;
+    const labelsGroup = labelsRef.current;
+    if (!linksGroup || !motion) return;
+
+    const hex = (): string =>
+      Math.floor(Math.random() * 256)
+        .toString(16)
+        .padStart(2, "0");
+
+    const ids = {} as Record<NodeId, string>;
+    for (const k of NODE_LABEL_ORDER) {
+      ids[k] = "node.0x" + hex() + hex();
+    }
+
+    if (labelsGroup) {
+      const texts = labelsGroup.querySelectorAll("text");
+      texts.forEach((t, i) => {
+        const id = NODE_LABEL_ORDER[i];
+        if (id) t.textContent = ids[id];
+      });
+    }
+
+    const tick = (): void => {
+      const pair =
+        ENDPOINT_PAIRS[Math.floor(Math.random() * ENDPOINT_PAIRS.length)];
+      if (!pair) return;
+      const [src, dst] = pair;
+      const path = shortestPath(src, dst);
+
+      linksGroup
+        .querySelectorAll("line")
+        .forEach((l) => l.setAttribute("class", "link"));
+
+      for (let i = 0; i < path.length - 1; i++) {
+        const a = path[i];
+        const b = path[i + 1];
+        if (!a || !b) continue;
+        const key = edgeKey(a, b);
+        const alias = EDGE_ALIAS[key] ?? key;
+        const edge = linksGroup.querySelector(`[data-edge="${alias}"]`);
+        if (edge) edge.setAttribute("class", "link link-active");
+      }
+
+      const d = path
+        .map((n, i) => {
+          const [x, y] = NODE_POS[n];
+          return (i === 0 ? "M " : "L ") + x + " " + y;
+        })
+        .join(" ");
+      motion.setAttribute("path", d);
+      motion.setAttribute("dur", (0.4 + (path.length - 1) * 0.55).toFixed(2) + "s");
+      motion.beginElement?.();
+    };
+
+    tick();
+    const id = window.setInterval(tick, 2600);
+    return () => window.clearInterval(id);
+  }, []);
+
+  return (
+    <div className="border border-line bg-bg-2 p-4 self-start">
+      <div className="flex justify-between items-center border-b border-line pb-2 mb-3.5 text-[10px] tracking-[0.12em] text-ink-dim uppercase">
+        <span>
+          <span className="text-accent">▸</span> mesh.proximity
+        </span>
+        <span>OBSERVABLE</span>
+      </div>
+
+      <svg
+        className="mesh-svg w-full h-[320px] block"
+        viewBox="0 0 320 220"
+        preserveAspectRatio="xMidYMid meet"
+      >
+        <defs>
+          <pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse">
+            <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#1a1f1a" strokeWidth="0.3" />
+          </pattern>
+        </defs>
+        <rect width="320" height="220" fill="url(#grid)" />
+        <g ref={linksRef}>
+          <line className="link" data-edge="A-G" x1="60" y1="40" x2="160" y2="80" />
+          <line className="link" data-edge="G-R1" x1="160" y1="80" x2="260" y2="50" />
+          <line className="link" data-edge="G-R2" x1="160" y1="80" x2="100" y2="160" />
+          <line className="link" data-edge="G-B" x1="160" y1="80" x2="220" y2="170" />
+          <line className="link" data-edge="R2-B" x1="100" y1="160" x2="220" y2="170" />
+          <line className="link" data-edge="A-R2" x1="60" y1="40" x2="100" y2="160" />
+          <line className="link" data-edge="R1-R3" x1="260" y1="50" x2="290" y2="130" />
+          <line className="link" data-edge="R3-B" x1="290" y1="130" x2="220" y2="170" />
+          <line className="link" data-edge="R4-R2" x1="40" y1="110" x2="100" y2="160" />
+          <line className="link" data-edge="R4-A" x1="40" y1="110" x2="60" y2="40" />
+        </g>
+        <g>
+          <circle className="node" cx="60" cy="40" r="4" />
+          <circle className="node" cx="160" cy="80" r="4" />
+          <circle className="node" cx="260" cy="50" r="4" />
+          <circle className="node" cx="100" cy="160" r="4" />
+          <circle className="node" cx="220" cy="170" r="4" />
+          <circle className="node" cx="290" cy="130" r="4" />
+          <circle className="node" cx="40" cy="110" r="4" />
+        </g>
+        <g ref={labelsRef} fontFamily="JetBrains Mono" fontSize="6" fill="#6b7568">
+          <text x="68" y="36" />
+          <text x="168" y="76" />
+          <text x="266" y="46" />
+          <text x="106" y="158" />
+          <text x="226" y="166" />
+          <text x="296" y="128" />
+          <text x="6" y="106" />
+        </g>
+        <circle r="2" fill="#c4ff3d">
+          <animateMotion
+            ref={motionRef}
+            dur="2s"
+            repeatCount="indefinite"
+            path="M 60 40 L 160 80 L 220 170"
+          />
+        </circle>
+      </svg>
+
+      <div className="grid grid-cols-2 gap-3 mt-3.5 pt-3.5 border-t border-line">
+        <MeshStat label="forward / hop" value="0.57" unit="ns" />
+        <MeshStat label="recovery cycle" value="288" unit="ns" />
+        <MeshStat label="cdylib size" value="1.92" unit="mb" />
+        <MeshStat label="throughput" value="26.7" unit="M ops/s" />
+      </div>
+    </div>
+  );
+}
+
+function MeshStat({
+  label,
+  value,
+  unit,
 }: {
-  eyebrow: React.ReactNode;
-  title: React.ReactNode;
-  right: React.ReactNode;
+  label: string;
+  value: string;
+  unit: string;
 }) {
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 lg:gap-16 lg:items-end">
-      <div>
-        <Eyebrow>{eyebrow}</Eyebrow>
-        <h2 className="text-[clamp(30px,3.6vw,46px)] leading-[1.08] tracking-[-0.02em] font-semibold mt-5">
-          {title}
-        </h2>
+    <div className="text-[10px]">
+      <div className="text-ink-dim tracking-[0.1em] uppercase mb-1">{label}</div>
+      <div className="text-accent text-[18px] font-semibold font-mono">
+        {value}
+        <span className="text-ink-dim text-[10px] ml-[3px]">{unit}</span>
       </div>
-      <div className="text-muted text-base">{right}</div>
+    </div>
+  );
+}
+
+function TopStatusBar() {
+  const [evt, setEvt] = useState<string>("8.4M");
+  const [p50, setP50] = useState<string>("38ns");
+
+  useEffect(() => {
+    const evtId = window.setInterval(() => {
+      const base = 8_400_000;
+      const jitter = Math.floor((Math.random() - 0.5) * 200_000);
+      const n = base + jitter;
+      setEvt((n / 1_000_000).toFixed(1) + "M");
+    }, 2000);
+
+    const p50Id = window.setInterval(() => {
+      const base = 38;
+      const j = Math.floor((Math.random() - 0.5) * 6);
+      setP50(base + j + "ns");
+    }, 2400);
+
+    return () => {
+      window.clearInterval(evtId);
+      window.clearInterval(p50Id);
+    };
+  }, []);
+
+  return (
+    <div className="fixed top-0 left-0 right-0 h-7 bg-bg border-b border-line flex items-center px-4 text-[10px] text-ink-dim z-[100] tracking-[0.05em]">
+      <span className="live-dot inline-flex items-center gap-1.5 text-accent">
+        MESH ONLINE
+      </span>
+      <span className="text-ink-faint mx-3">│</span>
+      <span>
+        NODES: <b className="text-ink font-semibold">14,872</b>
+      </span>
+      <span className="text-ink-faint mx-3">│</span>
+      <span>
+        EVT/SEC: <b className="text-ink font-semibold">{evt}</b>
+      </span>
+      <span className="text-ink-faint mx-3">│</span>
+      <span>
+        P50: <b className="text-ink font-semibold">{p50}</b>
+      </span>
+      <div className="ml-auto hidden md:flex gap-4">
+        <span>v0.9.4-rc1</span>
+        <span>BUILD: 2026.04.27</span>
+        <span>
+          SHA: <span className="text-accent">a7f9c2e</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
+const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
+  { href: "#what", label: "SPEC" },
+  { href: "#bench", label: "BENCH" },
+  { href: "#runtime", label: "RUNTIME" },
+  { href: "#apps", label: "APPS" },
+  { href: "#install", label: "SDKS" },
+  { href: "#wall", label: "BLACKWALL" },
+];
+
+function NavBar() {
+  return (
+    <nav className="fixed top-7 left-0 right-0 h-[52px] nav-glass border-b border-line flex items-center px-6 z-[99]">
+      <div className="logo-mark font-display text-[22px] text-ink tracking-[0.1em] flex items-baseline gap-2.5">
+        net{" "}
+        <span className="font-mono text-[9px] text-accent tracking-[0.15em] font-semibold">
+          // NET 2070
+        </span>
+      </div>
+      <ul className="hidden lg:flex list-none gap-7 ml-auto items-center">
+        {NAV_LINKS.map((l) => (
+          <li key={l.href}>
+            <a
+              href={l.href}
+              className="text-ink-dim text-[11px] tracking-[0.08em] uppercase hover:text-accent transition-colors"
+            >
+              {l.label}
+            </a>
+          </li>
+        ))}
+        <li>
+          <a
+            href="#install"
+            className="install-btn bg-accent text-bg border border-accent px-3.5 py-1.5 text-[11px] tracking-[0.08em] uppercase font-semibold transition-colors"
+          >
+            ↓ INSTALL
+          </a>
+        </li>
+      </ul>
+      <a
+        href="#install"
+        className="lg:hidden ml-auto install-btn bg-accent text-bg border border-accent px-3.5 py-1.5 text-[11px] tracking-[0.08em] uppercase font-semibold transition-colors"
+      >
+        ↓ INSTALL
+      </a>
+    </nav>
+  );
+}
+
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="sec-label text-[10px] tracking-[0.2em] text-accent uppercase mb-3 flex items-center">
+      {children}
+    </div>
+  );
+}
+
+function DisplayHeading({ children }: { children: React.ReactNode }) {
+  return (
+    <h2
+      className="font-display leading-none tracking-[-0.01em] text-ink mb-8 max-w-[900px]"
+      style={{ fontSize: "clamp(36px, 5vw, 60px)" }}
+    >
+      {children}
+    </h2>
+  );
+}
+
+function HeroSection() {
+  return (
+    <section className="hero relative overflow-hidden border-b border-line px-6 pt-[60px] pb-20">
+      <PacketRain />
+      <div className="relative grid grid-cols-1 lg:grid-cols-[1fr_520px] gap-12">
+        <div>
+          <div className="text-[10px] text-ink-dim tracking-[0.15em] mb-7 flex flex-wrap gap-[18px] items-center">
+            <span className="text-accent border border-accent-dim px-2 py-[3px]">
+              RFC-NET-001
+            </span>
+            <span className="text-ink-faint font-mono">PROTOCOL.0x4E45·54</span>
+            <span className="text-ink-dim">REV 04 / Q2 2026</span>
+          </div>
+
+          <h1
+            className="font-display leading-[0.88] tracking-[-0.02em] text-ink mb-5"
+            style={{ fontSize: "clamp(56px, 10vw, 144px)" }}
+          >
+            net.
+            <br />
+            <span className="text-accent">moves</span>
+            <br />
+            at light.
+          </h1>
+
+          <p className="text-[18px] text-ink mt-8 max-w-[580px] leading-[1.5] font-light">
+            A latency-first encrypted mesh where every device is a first-class
+            node. Existing networks operate in milliseconds{" "}
+            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻³)</em>.
+            Net operates in nanoseconds{" "}
+            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻⁹)</em>.
+          </p>
+
+          <p className="text-[13px] text-ink-dim mt-[18px] max-w-[580px] leading-[1.65]">
+            No clients. No servers. No coordinators. The mesh propagates state,
+            not connections. Loosely inspired by the Net from Cyberpunk 2077 — an
+            engineering take on the concept.
+          </p>
+
+          <div className="mt-11 flex gap-3 flex-wrap items-center">
+            <a
+              href="#install"
+              className="btn-primary inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all"
+            >
+              ↓ Install Net <span className="text-sm">→</span>
+            </a>
+            <a
+              href="#bench"
+              className="btn-ghost inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-ink-faint text-ink transition-all"
+            >
+              Read benchmarks
+            </a>
+            <a
+              href="#what"
+              className="btn-ghost inline-flex items-center gap-2.5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline text-ink transition-all"
+            >
+              // view spec ↘
+            </a>
+          </div>
+        </div>
+
+        <MeshViz />
+      </div>
+    </section>
+  );
+}
+
+function WhyNotBestEffortSection() {
+  return (
+    <section id="what" className="border-b border-line px-6 py-20">
+      <SectionLabel>§01 / why not best-effort</SectionLabel>
+      <DisplayHeading>
+        arpanet assumed scarcity.
+        <br />
+        net assumes abundance.
+      </DisplayHeading>
+
+      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+        TCP was designed when nuclear war was a real possibility. Packets were
+        precious. Bandwidth was scarce. Routes were scarce. The network had to
+        guarantee delivery because the next packet might not get through.
+      </p>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mt-6">
+        <div>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            <strong className="text-ink font-medium">
+              That was the right design for 1969.
+            </strong>{" "}
+            It&apos;s the wrong design now. Sensors don&apos;t pause. Token
+            streams don&apos;t wait. Market feeds don&apos;t care that your queue
+            is full. The firehose doesn&apos;t have a pause button.
+          </p>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            In a world of abundance, guaranteeing delivery is a threat —
+            you&apos;re promising to deliver data that will bury the receiver.
+            The bottleneck isn&apos;t delivery. It&apos;s processing. Arrival
+            doesn&apos;t equal usefulness.
+          </p>
+        </div>
+        <div>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            <strong className="text-ink font-medium">
+              Net inverts the default.
+            </strong>{" "}
+            TCP starts with trust and detects abuse. Net starts with zero
+            assumptions and lets trust emerge from consistent behavior.
+          </p>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            Nodes reject work they can&apos;t process within a time window.
+            Dropping a packet and re-requesting from a faster node costs
+            nanoseconds. Waiting for a congested node&apos;s guaranteed response
+            costs milliseconds.{" "}
+            <strong className="text-ink font-medium">
+              When dropping is cheaper than waiting, delivery guarantees become
+              overhead.
+            </strong>
+          </p>
+        </div>
+      </div>
+
+      <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
+        <p className="text-[18px] text-ink leading-[1.5] font-light">
+          The benchmark numbers aren&apos;t performance metrics. They&apos;re{" "}
+          <strong className="text-accent font-medium">existence proofs</strong>.
+          They demonstrate that the software layer is no longer the bottleneck.
+          The remaining latency is physics: NIC, wire, speed of light. The
+          software got out of the way.
+        </p>
+      </div>
+    </section>
+  );
+}
+
+interface TopologyClass {
+  header: string;
+  headerColor: "ink-dim" | "accent";
+  title: string;
+  titleColor: "ink" | "accent";
+  body: string;
+  floor: string;
+  floorColor: "ink" | "accent";
+}
+
+const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
+  {
+    header: "// best-effort",
+    headerColor: "ink-dim",
+    title: "TCP / IP / HTTP / gRPC",
+    titleColor: "ink",
+    body: "Optimized for delivery. Queues absorb bursts. Backpressure negotiated. Connections stateful. Trust assumed. Sender slows down when receiver can't keep up.",
+    floor: "milliseconds",
+    floorColor: "ink",
+  },
+  {
+    header: "// real-time",
+    headerColor: "ink-dim",
+    title: "CAN / EtherCAT / TSN",
+    titleColor: "ink",
+    body: "Optimized for deterministic timing. Fixed topologies. Dedicated hardware. Time-slotted access. Guarantees only because you own the wire.",
+    floor: "microseconds*",
+    floorColor: "ink",
+  },
+  {
+    header: "// net",
+    headerColor: "accent",
+    title: "NET → mesh transport",
+    titleColor: "accent",
+    body: "Real-time latencies on commodity hardware over commodity networks. Drop instead of queue. Route around instead of wait. Observe instead of coordinate. Derive instead of query.",
+    floor: "nanoseconds",
+    floorColor: "accent",
+  },
+];
+
+function TopologyClassesSection() {
+  return (
+    <section className="border-b border-line px-6 py-20">
+      <SectionLabel>§02 / topology classes</SectionLabel>
+      <DisplayHeading>a new class of system.</DisplayHeading>
+
+      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+        Existing networking falls into two categories. Net is neither.
+      </p>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 border border-line border-b-0">
+        {TOPOLOGY_CLASSES.map((c, i) => (
+          <div
+            key={c.title}
+            className={`bg-bg-2 ${c.headerColor === "accent" ? "text-accent" : "text-ink-dim"} text-[10px] tracking-[0.18em] uppercase px-6 py-3 border-b border-line ${i < 2 ? "lg:border-r" : ""}`}
+          >
+            {c.header}
+          </div>
+        ))}
+        {TOPOLOGY_CLASSES.map((c, i) => (
+          <div
+            key={c.title + "-body"}
+            className={`px-6 py-7 border-b border-line ${i < 2 ? "lg:border-r" : ""}`}
+          >
+            <div
+              className={`font-head text-[18px] leading-tight ${c.titleColor === "accent" ? "text-accent" : "text-ink"} mb-3.5 tracking-[0.04em] lowercase`}
+            >
+              {c.title}
+            </div>
+            <div className="text-ink-dim text-[12px] leading-[1.6]">{c.body}</div>
+            <div className="mt-4 text-[11px] text-ink-dim border-t border-dashed border-ink-faint pt-3">
+              latency floor:{" "}
+              <b
+                className={`${c.floorColor === "accent" ? "text-accent" : "text-ink"} font-semibold`}
+              >
+                {c.floor}
+              </b>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+interface AxiomCard {
+  id: string;
+  title: string;
+  body: string;
+  ascii: string;
+}
+
+const AXIOMS: readonly AxiomCard[] = [
+  {
+    id: "P.01",
+    title: "Latency-first",
+    body: "Sub-nanosecond header serialization. Nanosecond heartbeats, hops, recovery. Packet scheduling at timescales reserved for local function calls.",
+    ascii: "┌─────┐\n│ 1ns │ → forward\n└─────┘",
+  },
+  {
+    id: "P.02",
+    title: "Streaming-first",
+    body: "Data is continuous flow, not documents. Sharded ring buffers, adaptive batching. No requests and responses — there are streams.",
+    ascii: "▶▶▶▶▶▶▶▶▶▶▶▶▶▶\n░░░░░░░░░░░░░░",
+  },
+  {
+    id: "P.03",
+    title: "Zero-copy",
+    body: "Ring buffers, no garbage collector, native Rust. Forwarding doesn't allocate or copy payload data. Design principle, not optimization.",
+    ascii: "[mem]──refs──▶[wire]\n   no alloc",
+  },
+  {
+    id: "P.04",
+    title: "Encrypted E2E",
+    body: "Noise protocol handshakes. ChaCha20-Poly1305 AEAD with counter nonces. Every packet encrypted source→dest. Intermediate nodes never see plaintext.",
+    ascii: "A ─ChaCha20──▶ B\n    relay sees ░░░",
+  },
+  {
+    id: "P.05",
+    title: "Untrusted relay",
+    body: "Nodes forward packets without decrypting payloads. The mesh routes through infrastructure you don't trust. Networks grow through adversarial nodes.",
+    ascii: "trust := observation\nnot assumption",
+  },
+  {
+    id: "P.06",
+    title: "Schema-agnostic",
+    body: "Transport moves bytes, not structures. Raw event = payload + hash. Protocol never inspects content. Structure emerges where participants agree.",
+    ascii: "[hdr][hash][░░░░░]\nopaque payload",
+  },
+  {
+    id: "P.07",
+    title: "Optionally ordered",
+    body: "Ordering is per-stream, not global. Unordered path is the fast path. Causal ordering available where streams need it. Cost paid only by streams that require it.",
+    ascii: "e₁ → e₂ → e₃\nchain.verify()",
+  },
+  {
+    id: "P.08",
+    title: "Optionally typed",
+    body: "The protocol doesn't care what's in the payload. Behavior plane can. Typing is a local agreement between nodes, not a network requirement.",
+    ascii: "type ∈ peer-pair\nnot network",
+  },
+  {
+    id: "P.09",
+    title: "Native backpressure",
+    body: "Nodes drop without reply. Not a failure mode — the design. The proximity graph makes silence a signal. Neighbors know within a heartbeat interval.",
+    ascii: "silent → suspect\nsuspect → reroute",
+  },
+];
+
+function PropertiesSection() {
+  return (
+    <section className="border-b border-line px-6 py-20">
+      <SectionLabel>§03 / protocol properties</SectionLabel>
+      <DisplayHeading>
+        nine axioms.
+        <br />
+        one runtime.
+      </DisplayHeading>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-px bg-line border border-line">
+        {AXIOMS.map((p) => (
+          <div key={p.id} className="bg-bg p-7 transition-colors hover:bg-bg-2">
+            <div className="text-[10px] text-accent tracking-[0.15em] mb-4">
+              {p.id}
+            </div>
+            <h3 className="font-mono text-[14px] font-semibold tracking-[0.05em] text-ink mb-3 uppercase">
+              {p.title}
+            </h3>
+            <p className="text-ink-dim text-[12px] leading-[1.65]">{p.body}</p>
+            <pre className="text-accent-dim text-[10px] mt-4 leading-[1.2] whitespace-pre opacity-70">
+              {p.ascii}
+            </pre>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+interface BenchRow {
+  op: string;
+  m1: { ns: string; rate: string };
+  i9: { ns: string; rate: string };
+}
+
+interface BenchGroup {
+  group: string;
+  rows: readonly BenchRow[];
+}
+
+const BENCH_GROUPS: readonly BenchGroup[] = [
+  {
+    group: "▸ routing",
+    rows: [
+      {
+        op: "routing header forward",
+        m1: { ns: "0.57 ns", rate: "1.75G/s" },
+        i9: { ns: "0.20 ns", rate: "5.06G/s" },
+      },
+      {
+        op: "header serialize",
+        m1: { ns: "1.98 ns", rate: "505M/s" },
+        i9: { ns: "1.31 ns", rate: "762M/s" },
+      },
+      {
+        op: "routing lookup (hit)",
+        m1: { ns: "38 ns", rate: "26.3M/s" },
+        i9: { ns: "38 ns", rate: "26.7M/s" },
+      },
+    ],
+  },
+  {
+    group: "▸ multi-hop forwarding",
+    rows: [
+      {
+        op: "1 hop",
+        m1: { ns: "59 ns", rate: "16.9M/s" },
+        i9: { ns: "53 ns", rate: "18.7M/s" },
+      },
+      {
+        op: "3 hops",
+        m1: { ns: "163 ns", rate: "6.13M/s" },
+        i9: { ns: "121 ns", rate: "8.29M/s" },
+      },
+      {
+        op: "5 hops",
+        m1: { ns: "274 ns", rate: "3.66M/s" },
+        i9: { ns: "190 ns", rate: "5.27M/s" },
+      },
+    ],
+  },
+  {
+    group: "▸ failure detection & recovery",
+    rows: [
+      {
+        op: "heartbeat",
+        m1: { ns: "29 ns", rate: "34.5M/s" },
+        i9: { ns: "35 ns", rate: "28.4M/s" },
+      },
+      {
+        op: "circuit breaker check",
+        m1: { ns: "13 ns", rate: "74.4M/s" },
+        i9: { ns: "10 ns", rate: "98.4M/s" },
+      },
+      {
+        op: "full fail + recover",
+        m1: { ns: "288 ns", rate: "3.47M/s" },
+        i9: { ns: "255 ns", rate: "3.92M/s" },
+      },
+    ],
+  },
+  {
+    group: "▸ swarm / discovery",
+    rows: [
+      {
+        op: "pingwave roundtrip",
+        m1: { ns: "0.93 ns", rate: "1.07G/s" },
+        i9: { ns: "0.65 ns", rate: "1.55G/s" },
+      },
+      {
+        op: "new peer discovery",
+        m1: { ns: "113 ns", rate: "8.83M/s" },
+        i9: { ns: "152 ns", rate: "6.59M/s" },
+      },
+    ],
+  },
+  {
+    group: "▸ capability system",
+    rows: [
+      {
+        op: "filter (require GPU)",
+        m1: { ns: "4.05 ns", rate: "247M/s" },
+        i9: { ns: "1.78 ns", rate: "561M/s" },
+      },
+      {
+        op: "GPU check",
+        m1: { ns: "0.31 ns", rate: "3.21G/s" },
+        i9: { ns: "0.20 ns", rate: "5.01G/s" },
+      },
+    ],
+  },
+];
+
+function BenchmarksSection() {
+  return (
+    <section id="bench" className="border-b border-line px-6 py-20">
+      <SectionLabel>§04 / measured numbers</SectionLabel>
+      <DisplayHeading>existence proofs.</DisplayHeading>
+
+      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+        All numbers measure packet scheduling — the time to process, route,
+        encrypt, and queue a packet for transmission. They do not include NIC
+        transfer or wire latency. The software layer is what these benchmarks
+        prove is no longer the bottleneck.
+      </p>
+
+      <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 items-start">
+        <div className="border border-line bg-bg-2">
+          <table className="w-full border-collapse text-[12px]">
+            <thead>
+              <tr>
+                <th className="text-left px-4 py-3 bg-bg text-ink-dim text-[10px] tracking-[0.12em] uppercase font-medium border-b border-line">
+                  operation
+                </th>
+                <th className="text-right px-4 py-3 bg-bg text-ink-dim text-[10px] tracking-[0.12em] uppercase font-medium border-b border-line">
+                  M1 Max
+                </th>
+                <th className="text-right px-4 py-3 bg-bg text-ink-dim text-[10px] tracking-[0.12em] uppercase font-medium border-b border-line">
+                  i9-14900K
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {BENCH_GROUPS.map((g, gi) => (
+                <BenchTableGroup
+                  key={g.group}
+                  group={g}
+                  isLastGroup={gi === BENCH_GROUPS.length - 1}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="border border-line p-6 bg-bg-2">
+          <BenchKpi
+            label="// scheduling floor"
+            value="0.20"
+            unit="ns"
+            note="Routing header forward on i9-14900K. Per-packet overhead. Software is not the bottleneck — physics is."
+          />
+          <hr className="border-0 border-t border-line my-5" />
+          <BenchKpi
+            label="// hot path"
+            value="5.06"
+            unit="G/s"
+            note="Operations per second on a single core for the forward path. Five billion. Per second. Per core."
+          />
+          <hr className="border-0 border-t border-line my-5" />
+          <BenchKpi
+            label="// SDK ingest"
+            value="6.97"
+            unit="M/s"
+            note='Python via PyO3 batch ingest. The "slow" binding language hits seven million events per second.'
+          />
+          <hr className="border-0 border-t border-line my-5" />
+          <h4 className="text-[10px] tracking-[0.15em] text-ink-dim uppercase mb-4 font-medium">
+            // test systems
+          </h4>
+          <p className="text-[10px] text-ink-dim leading-[1.8] tracking-[0.05em]">
+            <b className="text-ink font-medium">► M1 Max</b> macOS, aarch64
+            <br />
+            <b className="text-ink font-medium">► i9-14900K</b> @5GHz, Win11
+            <br />
+            <b className="text-ink font-medium">► date</b> 2026-04-27
+            <br />
+            <b className="text-ink font-medium">► profile</b> release + LTO + CG=1
+          </p>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function BenchTableGroup({
+  group,
+  isLastGroup,
+}: {
+  group: BenchGroup;
+  isLastGroup: boolean;
+}) {
+  return (
+    <>
+      <tr>
+        <td
+          colSpan={3}
+          className="bg-bg text-accent text-[10px] tracking-[0.15em] uppercase px-4 py-2.5 font-semibold"
+        >
+          {group.group}
+        </td>
+      </tr>
+      {group.rows.map((r, i) => {
+        const isLastRow = isLastGroup && i === group.rows.length - 1;
+        const borderClass = isLastRow ? "" : "border-b border-line";
+        return (
+          <tr key={r.op} className="hover:bg-accent/[0.03]">
+            <td className={`px-4 py-3.5 ${borderClass} text-ink`}>{r.op}</td>
+            <td className={`px-4 py-3.5 ${borderClass} text-right`}>
+              <span className="text-ink-dim mr-2">{r.m1.ns}</span>
+              <span className="text-accent font-semibold">{r.m1.rate}</span>
+            </td>
+            <td className={`px-4 py-3.5 ${borderClass} text-right`}>
+              <span className="text-ink-dim mr-2">{r.i9.ns}</span>
+              <span className="text-accent font-semibold">{r.i9.rate}</span>
+            </td>
+          </tr>
+        );
+      })}
+    </>
+  );
+}
+
+function BenchKpi({
+  label,
+  value,
+  unit,
+  note,
+}: {
+  label: string;
+  value: string;
+  unit: string;
+  note: string;
+}) {
+  return (
+    <>
+      <h4 className="text-[10px] tracking-[0.15em] text-ink-dim uppercase mb-4 font-medium">
+        {label}
+      </h4>
+      <div className="font-display text-[56px] text-accent leading-none mb-1.5">
+        {value}
+        <span className="text-[22px] text-ink-dim">{unit}</span>
+      </div>
+      <p className="text-ink-dim text-[11px] leading-[1.6] mt-3 mb-6">{note}</p>
+    </>
+  );
+}
+
+function MikoshiSection() {
+  return (
+    <section className="border-b border-line px-6 py-20">
+      <SectionLabel>§05 / mikoshi // engram transit</SectionLabel>
+      <DisplayHeading>
+        state moves.
+        <br />
+        connections don&apos;t.
+      </DisplayHeading>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mt-6">
+        <div>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            <strong className="text-ink font-medium">
+              In Cyberpunk, Mikoshi is Arasaka&apos;s construct for storing
+              engrams
+            </strong>{" "}
+            — consciousness held in digital space, minds persisting outside their
+            original hardware.
+          </p>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            Mikoshi in Net is how daemons move between machines. A running
+            program on one node becomes a running program on another without
+            losing its history, its pending work, or its place in the
+            conversation. The source packages its state, the target unpacks it,
+            and for a brief moment the entity exists on both nodes at once —
+            spreading, superposed, then collapsed onto the target as routing
+            cuts over.
+          </p>
+        </div>
+        <div>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            <strong className="text-ink font-medium">
+              The daemon doesn&apos;t know it moved.
+            </strong>{" "}
+            Neither does anything talking to it. Observer nodes watching the
+            stream see the same causal chain continue uninterrupted, the same
+            sequence numbers, the same entity speaking. The hardware underneath
+            shifted. The stream didn&apos;t notice.
+          </p>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            A factory controller hops from a dying edge box to a healthy one
+            mid-shift. An inference daemon follows its user from laptop to
+            desktop. A trading agent migrates to a node closer to the exchange{" "}
+            <strong className="text-ink font-medium">
+              without dropping a single tick
+            </strong>
+            .
+          </p>
+        </div>
+      </div>
+
+      <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
+        <p className="text-[18px] text-ink leading-[1.5] font-light">
+          What moved wasn&apos;t a copy.{" "}
+          <strong className="text-accent font-medium">
+            It was the thing itself
+          </strong>
+          , carried across.
+        </p>
+      </div>
+    </section>
+  );
+}
+
+const MIGRATION_PHASES: ReadonlyArray<{
+  num: string;
+  name: string;
+  body: string;
+}> = [
+  {
+    num: "01",
+    name: "snapshot",
+    body: "source serializes daemon state into transferable bytes.",
+  },
+  {
+    num: "02",
+    name: "transfer",
+    body: "snapshot moves source → target over subprotocol 0x0500.",
+  },
+  {
+    num: "03",
+    name: "restore",
+    body: "target reconstructs daemon, identity preserved.",
+  },
+  {
+    num: "04",
+    name: "replay",
+    body: "target catches up on events between snapshot and now.",
+  },
+  {
+    num: "05",
+    name: "cutover",
+    body: "routing table updates atomically. next packet → target.",
+  },
+  {
+    num: "06",
+    name: "complete",
+    body: "source releases daemon. target is sole authority.",
+  },
+];
+
+interface GroupCard {
+  id: string;
+  name: string;
+  meta: string;
+  ascii: React.ReactNode;
+  body: React.ReactNode;
+  spec: ReadonlyArray<readonly [string, string]>;
+}
+
+const GROUP_CARDS: readonly GroupCard[] = [
+  {
+    id: "▸ GRP.01",
+    name: "replica",
+    meta: "N interchangeable copies · load-balanced",
+    ascii: (
+      <>
+        members 0..N{"\n"}
+        {"   ▶ "}<span className="text-accent">all active</span>
+        {"\n"}
+        {"   ▶ deterministic identity\n   ▶ stateless work\n"}
+        load balancer fans out{"\n"}
+        event → any member → result
+      </>
+    ),
+    body: (
+      <>
+        For horizontal scale on stateless workloads.{" "}
+        <b className="text-ink font-medium">
+          Each replica has its own causal chain
+        </b>{" "}
+        derived from a deterministic seed — fail one, spawn another with the
+        same identity. No state to transfer.
+      </>
+    ),
+    spec: [
+      ["identity", "deterministic from seed"],
+      ["routing", "round-robin"],
+      ["state", "stateless"],
+      ["recovery", "respawn"],
+    ],
+  },
+  {
+    id: "▸ GRP.02",
+    name: "fork",
+    meta: "independent siblings · documented lineage",
+    ascii: (
+      <>
+        parent @ seq=42{"\n"}
+        {"   ├─▶ fork.A "}<span className="text-accent">(sentinel)</span>
+        {"\n"}
+        {"   ├─▶ fork.B "}<span className="text-accent">(sentinel)</span>
+        {"\n"}
+        {"   └─▶ fork.C "}<span className="text-accent">(sentinel)</span>
+        {"\n"}
+        each chain diverges{"\n"}
+        verifiable lineage to parent
+      </>
+    ),
+    body: (
+      <>
+        For experiments, A/B testing, scenario branching.{" "}
+        <b className="text-ink font-medium">
+          Each fork carries a cryptographic sentinel
+        </b>{" "}
+        linking back to the parent at the fork point. Forks share a past but not
+        a future.
+      </>
+    ),
+    spec: [
+      ["identity", "divergent from sentinel"],
+      ["routing", "per-fork"],
+      ["state", "independent"],
+      ["recovery", "resnapshot from origin"],
+    ],
+  },
+  {
+    id: "▸ GRP.03",
+    name: "standby",
+    meta: "1 active · N-1 warm · zero duplicate compute",
+    ascii: (
+      <>
+        active{"   "}
+        <span className="text-accent">●</span> processing seq=102{"\n"}
+        standby{"  "}
+        <span className="text-ink-faint">○</span> synced_through=98{"\n"}
+        standby{"  "}
+        <span className="text-ink-faint">○</span> synced_through=101{"\n\n"}
+        active fails → promote(member 1){"\n"}
+        {"   replays buffered events → seq=103\n   member 1 is now authoritative"}
+      </>
+    ),
+    body: (
+      <>
+        For stateful daemons that need fault tolerance without paying for
+        duplicate compute.{" "}
+        <b className="text-ink font-medium">Only the active processes events</b>{" "}
+        — standbys are warm, not hot. Periodic snapshots track{" "}
+        <code className="font-mono">synced_through</code> for each standby. On
+        active failure, the standby with the highest sync point promotes and
+        replays the gap using{" "}
+        <b className="text-ink font-medium">
+          the same replay machinery migration uses
+        </b>
+        .
+      </>
+    ),
+    spec: [
+      ["identity", "deterministic from seed"],
+      ["routing", "active only"],
+      ["state", "stateful, synced"],
+      ["recovery", "promote + replay gap"],
+    ],
+  },
+];
+
+function ComputeRuntimeSection() {
+  return (
+    <section
+      id="runtime"
+      className="compute-bg border-b border-line px-6 py-20"
+    >
+      <SectionLabel>§06 / compute runtime // new</SectionLabel>
+      <DisplayHeading>
+        programs whose
+        <br />
+        identity survives
+        <br />
+        their hardware.
+      </DisplayHeading>
+
+      <div className="border border-accent-dim bg-accent/[0.03] px-5 py-4 mb-10 flex items-center gap-[18px] text-[11px] text-ink-dim tracking-[0.05em] flex-wrap">
+        <span className="bg-accent text-bg px-2.5 py-1 font-bold tracking-[0.18em] text-[10px]">
+          NEW
+        </span>
+        <span>
+          <b className="text-ink font-medium">
+            The compute runtime is live.
+          </b>{" "}
+          Stateful programs that live on the mesh, not on a machine. They have
+          cryptographic identity, a verifiable history, and they move between
+          nodes mid-execution without anyone noticing.
+        </span>
+        <span className="ml-auto">
+          subprotocol{" "}
+          <code className="text-accent bg-accent/[0.06] px-1.5 py-0.5 font-mono">
+            0x0500
+          </code>
+        </span>
+      </div>
+
+      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+        Every existing runtime binds programs to hardware. AWS Lambda is
+        stateless because state binds you to a database. Temporal is stateful,
+        but the workflow lives inside the cluster you bought. Erlang actors are
+        addressable, but only inside one VM.{" "}
+        <strong className="text-ink font-medium">
+          &quot;Move this program to a different cluster&quot; is not a
+          primitive any of them expose.
+        </strong>
+      </p>
+
+      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12 -mt-8">
+        A program on Net is called a{" "}
+        <em className="not-italic text-accent bg-accent/[0.08] px-1">daemon</em>.
+        Its identity is a public key — an{" "}
+        <code className="text-accent bg-accent/[0.06] px-1.5 py-0.5 font-mono">
+          origin_hash
+        </code>{" "}
+        derived from ed25519, which doesn&apos;t change when the daemon moves.
+        Its history is a causal chain — every event it produces is signed and
+        links to the previous one, verifiable by any node. Its location is
+        wherever in the mesh has the capabilities it asked for.{" "}
+        <strong className="text-ink font-medium">
+          When that location goes away, the daemon doesn&apos;t.
+        </strong>
+      </p>
+
+      <DaemonCaseBlock />
+      <MigrationPipeline />
+      <SuperpositionViz />
+      <GroupCards />
+      <SpecStrip />
+
+      <p className="mt-8 text-[11px] text-ink-dim text-center tracking-[0.05em]">
+        // see <span className="text-accent">compute/daemon.rs</span> ·{" "}
+        <span className="text-accent">compute/orchestrator.rs</span> ·{" "}
+        <span className="text-accent">
+          compute/{"{replica,fork,standby}"}_group.rs
+        </span>
+      </p>
+    </section>
+  );
+}
+
+function DaemonCaseBlock() {
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_0.9fr] gap-8 my-12 items-start">
+      <div className="border border-line bg-bg-2 overflow-hidden">
+        <div className="bg-bg border-b border-line px-3.5 py-2 text-[10px] text-ink-dim tracking-[0.12em] uppercase flex justify-between items-center">
+          <span>
+            <span className="text-accent font-semibold">CASE</span> · trading
+            agent · NYSE colo
+          </span>
+          <span className="inline-flex gap-1">
+            <span className="frame-dot-r w-[7px] h-[7px] rounded-full" />
+            <span className="frame-dot-y w-[7px] h-[7px] rounded-full" />
+            <span className="frame-dot-g w-[7px] h-[7px] rounded-full" />
+          </span>
+        </div>
+        <pre className="px-5 py-4 text-[12px] leading-[1.7] text-ink overflow-x-auto font-mono">
+          <span className="cm">
+            // node A is failing — daemon migrates to node B
+          </span>
+          {"\n"}
+          <span className="kw">let</span> daemon = Daemon::
+          <span className="fn">new</span>(<span className="ty">TraderConfig</span>{" "}
+          {"{"}
+          {"\n    "}
+          <span className="fn">requirements</span>:{" "}
+          <span className="kw">vec</span>![{" "}
+          <span className="ty">Cap</span>::<span className="fn">Latency</span>(
+          <span className="st">&quot;&lt;200μs to NYSE&quot;</span>) ],
+          {"\n    "}
+          <span className="fn">snapshot_interval</span>:{" "}
+          <span className="ty">Duration</span>::
+          <span className="fn">millis</span>(<span className="st">100</span>),
+          {"\n"}
+          {"});"}
+          {"\n\n"}
+          <span className="kw">match</span> daemon.<span className="fn">tick</span>
+          (event).<span className="kw">await</span>? {"{"}
+          {"\n    "}
+          <span className="ty">Outcome</span>::
+          <span className="fn">Order</span>(o) =&gt; bus.
+          <span className="fn">publish</span>(o).
+          <span className="kw">await</span>?,
+          {"\n    "}
+          <span className="ty">Outcome</span>::
+          <span className="fn">Migrate</span>(target) =&gt;{" "}
+          <span className="cm">// state moves with us</span>
+          {"\n"}
+          {"}"}
+          {"\n\n"}
+          <span className="cm">
+            // origin_hash unchanged. subscribers don&apos;t notice.
+          </span>
+        </pre>
+      </div>
+
+      <div>
+        <h3 className="text-accent font-mono text-[14px] font-semibold tracking-[0.05em] uppercase mb-3.5">
+          // what is a daemon
+        </h3>
+        <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+          A daemon is a stateful event processor whose identity is a keypair. It
+          holds working state, snapshots periodically, and exposes five trait
+          methods. Everything else — placement, migration, durability — is the
+          runtime.
+        </p>
+        <ul className="daemon-list list-none mt-4">
+          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[12px] leading-[1.5] relative">
+            <b className="text-ink font-medium">cryptographic identity</b> —
+            origin_hash from ed25519. survives moves.
+          </li>
+          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[12px] leading-[1.5] relative">
+            <b className="text-ink font-medium">causal chain</b> — every event
+            signed, links to parent. self-authenticating.
+          </li>
+          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[12px] leading-[1.5] relative">
+            <b className="text-ink font-medium">capability requirements</b> —
+            daemon declares needs. mesh finds matching node.
+          </li>
+          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[12px] leading-[1.5] relative">
+            <b className="text-ink font-medium">snapshot + replay</b> — state
+            captured periodically. gap replayed on restore.
+          </li>
+          <li className="py-2.5 pl-5 text-ink-dim text-[12px] leading-[1.5] relative">
+            <b className="text-ink font-medium">opaque to mesh</b> — what the
+            daemon does is its business. mesh just hosts.
+          </li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+function MigrationPipeline() {
+  return (
+    <div className="my-12">
+      <div className="flex justify-between items-baseline mb-6 border-b border-line pb-3">
+        <h3 className="font-head text-[22px] leading-tight text-ink tracking-[0.04em] lowercase">
+          migration · 6 phases
+        </h3>
+        <span className="text-[10px] text-ink-dim tracking-[0.12em] uppercase">
+          strict order · <b className="text-accent">~280ns total</b>
+        </span>
+      </div>
+
+      <div className="phase-track-md grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-0 border border-line bg-bg-2">
+        {MIGRATION_PHASES.map((p, i) => (
+          <div
+            key={p.num}
+            className={`phase-arrow relative px-4 py-5 ${i < 5 ? "border-r border-line" : ""} transition-colors hover:bg-accent/[0.04]`}
+          >
+            <div className="font-display text-[28px] text-accent leading-none mb-2">
+              {p.num}
+            </div>
+            <div className="text-[11px] text-ink uppercase tracking-[0.1em] mb-2.5 font-semibold">
+              {p.name}
+            </div>
+            <div className="text-[10px] text-ink-dim leading-[1.55]">
+              {p.body}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SuperpositionViz() {
+  return (
+    <div className="mt-7 border border-line bg-bg-2">
+      <div className="flex items-center justify-between border-b border-line px-5 py-2.5 text-[10px] tracking-[0.14em] text-ink-dim uppercase">
+        <div className="flex items-center gap-3">
+          <span className="text-accent">▸</span>
+          <span>identity transfer · timeline</span>
+        </div>
+        <div className="flex items-center gap-4 font-mono normal-case tracking-normal">
+          <span>
+            <span className="text-ink-faint">window</span>{" "}
+            <span className="text-accent">≈ 38ns</span>
+          </span>
+          <span>
+            <span className="text-ink-faint">drop</span>{" "}
+            <span className="text-accent">0</span>
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block animate-pulse-dot" />
+            <span className="uppercase tracking-[0.12em]">live</span>
+          </span>
+        </div>
+      </div>
+
+      <div className="px-5 pt-6 pb-5">
+        <svg
+          className="w-full h-[210px] block"
+          viewBox="0 0 600 210"
+          preserveAspectRatio="none"
+        >
+          <defs>
+            <linearGradient id="superGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stopColor="#c4ff3d" stopOpacity="1" />
+              <stop offset="65%" stopColor="#c4ff3d" stopOpacity="0.55" />
+              <stop offset="100%" stopColor="#c4ff3d" stopOpacity="0.1" />
+            </linearGradient>
+            <linearGradient id="superGrad2" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stopColor="#c4ff3d" stopOpacity="0.1" />
+              <stop offset="35%" stopColor="#c4ff3d" stopOpacity="0.55" />
+              <stop offset="100%" stopColor="#c4ff3d" stopOpacity="1" />
+            </linearGradient>
+            <linearGradient id="zoneFill" x1="0%" y1="0%" x2="0%" y2="100%">
+              <stop offset="0%" stopColor="#c4ff3d" stopOpacity="0.03" />
+              <stop offset="50%" stopColor="#c4ff3d" stopOpacity="0.09" />
+              <stop offset="100%" stopColor="#c4ff3d" stopOpacity="0.03" />
+            </linearGradient>
+            <pattern
+              id="superGrid"
+              width="60"
+              height="20"
+              patternUnits="userSpaceOnUse"
+            >
+              <path
+                d="M 60 0 L 0 0 0 20"
+                fill="none"
+                stroke="#1a1f1a"
+                strokeWidth="0.4"
+              />
+            </pattern>
+          </defs>
+
+          <rect x="60" y="40" width="520" height="120" fill="url(#superGrid)" opacity="0.6" />
+
+          <rect x="60" y="55" width="520" height="22" fill="#0e120e" opacity="0.6" />
+          <rect x="60" y="123" width="520" height="22" fill="#0e120e" opacity="0.6" />
+
+          <text x="54" y="69" textAnchor="end" fontFamily="JetBrains Mono" fontSize="9" fill="#c4ff3d" fontWeight="600">
+            node.A
+          </text>
+          <text x="54" y="79" textAnchor="end" fontFamily="JetBrains Mono" fontSize="7" fill="#4a5249">
+            0x7af3
+          </text>
+          <text x="54" y="138" textAnchor="end" fontFamily="JetBrains Mono" fontSize="9" fill="#c4ff3d" fontWeight="600">
+            node.B
+          </text>
+          <text x="54" y="148" textAnchor="end" fontFamily="JetBrains Mono" fontSize="7" fill="#4a5249">
+            0x2c91
+          </text>
+
+          <line x1="60" y1="40" x2="60" y2="160" stroke="#2d352c" strokeWidth="0.6" />
+
+          <line x1="60" y1="66" x2="580" y2="66" stroke="#1a1f1a" strokeWidth="1" />
+          <line x1="60" y1="66" x2="400" y2="66" stroke="url(#superGrad)" strokeWidth="2.5" strokeLinecap="round" />
+          <circle cx="60" cy="66" r="4" fill="#c4ff3d" />
+          <circle cx="60" cy="66" r="7" fill="none" stroke="#c4ff3d" strokeOpacity="0.3" />
+          <g fontFamily="JetBrains Mono" fontSize="7" fill="#6b7568">
+            <text x="80" y="62">▸ exec</text>
+            <text x="140" y="62">heap.alloc</text>
+            <text x="220" y="62">cap.read</text>
+            <text x="300" y="62">snap.encode</text>
+          </g>
+
+          <line x1="60" y1="134" x2="580" y2="134" stroke="#1a1f1a" strokeWidth="1" />
+          <line x1="240" y1="134" x2="580" y2="134" stroke="url(#superGrad2)" strokeWidth="2.5" strokeLinecap="round" />
+          <circle cx="580" cy="134" r="4" fill="#c4ff3d" />
+          <circle cx="580" cy="134" r="7" fill="none" stroke="#c4ff3d" strokeOpacity="0.3" />
+          <g fontFamily="JetBrains Mono" fontSize="7" fill="#6b7568">
+            <text x="260" y="148">unpack</text>
+            <text x="320" y="148">replay</text>
+            <text x="390" y="148">▸ exec</text>
+            <text x="470" y="148">cap.write</text>
+          </g>
+
+          <rect
+            className="superpose-zone"
+            x="240"
+            y="40"
+            width="180"
+            height="120"
+            fill="url(#zoneFill)"
+            stroke="#6b8a1e"
+            strokeDasharray="3 3"
+            strokeWidth="0.8"
+          />
+          <line x1="240" y1="36" x2="240" y2="40" stroke="#c4ff3d" strokeWidth="1" />
+          <line x1="420" y1="36" x2="420" y2="40" stroke="#c4ff3d" strokeWidth="1" />
+          <line x1="240" y1="160" x2="240" y2="164" stroke="#c4ff3d" strokeWidth="1" />
+          <line x1="420" y1="160" x2="420" y2="164" stroke="#c4ff3d" strokeWidth="1" />
+
+          <text
+            x="330"
+            y="100"
+            fontFamily="Major Mono Display"
+            fontSize="13"
+            fill="#c4ff3d"
+            textAnchor="middle"
+            letterSpacing="2"
+          >
+            superposed
+          </text>
+          <text
+            x="330"
+            y="113"
+            fontFamily="JetBrains Mono"
+            fontSize="7"
+            fill="#8a9482"
+            textAnchor="middle"
+            letterSpacing="1"
+          >
+            both nodes hold authority
+          </text>
+
+          <line x1="330" y1="40" x2="330" y2="160" stroke="#c4ff3d" strokeWidth="0.6" strokeDasharray="1 3" opacity="0.45" />
+
+          <line x1="60" y1="180" x2="580" y2="180" stroke="#2d352c" strokeWidth="0.6" />
+          <g fontFamily="JetBrains Mono" fontSize="7" fill="#4a5249">
+            <line x1="60" y1="176" x2="60" y2="184" stroke="#4a5249" strokeWidth="0.6" />
+            <text x="60" y="196" textAnchor="middle">
+              0ns
+            </text>
+            <line x1="150" y1="178" x2="150" y2="182" stroke="#3a423a" strokeWidth="0.4" />
+            <line x1="240" y1="174" x2="240" y2="186" stroke="#c4ff3d" strokeWidth="1" />
+            <text x="240" y="196" textAnchor="middle" fill="#c4ff3d" fontWeight="600">
+              12ns
+            </text>
+            <line x1="330" y1="178" x2="330" y2="182" stroke="#3a423a" strokeWidth="0.4" />
+            <line x1="420" y1="174" x2="420" y2="186" stroke="#c4ff3d" strokeWidth="1" />
+            <text x="420" y="196" textAnchor="middle" fill="#c4ff3d" fontWeight="600">
+              50ns
+            </text>
+            <line x1="500" y1="178" x2="500" y2="182" stroke="#3a423a" strokeWidth="0.4" />
+            <line x1="580" y1="176" x2="580" y2="184" stroke="#4a5249" strokeWidth="0.6" />
+            <text x="580" y="196" textAnchor="middle">
+              ~1µs
+            </text>
+          </g>
+
+          <circle className="superpose-pkt-a" cx="60" cy="66" r="3.5" fill="#c4ff3d" />
+          <circle className="superpose-pkt-b" cx="60" cy="134" r="3.5" fill="#c4ff3d" />
+        </svg>
+
+        <div className="grid grid-cols-3 gap-px bg-line border border-line mt-4 text-[10px]">
+          <div className="bg-bg-2 px-3.5 py-3">
+            <div className="flex items-baseline justify-between gap-2 mb-1">
+              <span className="text-ink-dim tracking-[0.14em] uppercase">T₀</span>
+              <span className="font-mono text-ink-faint">0–12ns</span>
+            </div>
+            <div className="text-ink mb-1">source running</div>
+            <div className="text-ink-faint leading-[1.45]">
+              A is sole authority. B is dark.
+            </div>
+          </div>
+          <div className="bg-bg-2 px-3.5 py-3 relative">
+            <div className="absolute inset-0 bg-accent/[0.05] pointer-events-none" />
+            <div className="relative flex items-baseline justify-between gap-2 mb-1">
+              <span className="text-accent tracking-[0.14em] uppercase font-semibold">
+                T_super
+              </span>
+              <span className="font-mono text-accent">12–50ns</span>
+            </div>
+            <div className="relative text-ink mb-1">superposition</div>
+            <div className="relative text-ink-faint leading-[1.45]">
+              both A and B execute. routing flips.
+            </div>
+          </div>
+          <div className="bg-bg-2 px-3.5 py-3">
+            <div className="flex items-baseline justify-between gap-2 mb-1">
+              <span className="text-ink-dim tracking-[0.14em] uppercase">T₁</span>
+              <span className="font-mono text-ink-faint">50ns+</span>
+            </div>
+            <div className="text-ink mb-1">target authoritative</div>
+            <div className="text-ink-faint leading-[1.45]">
+              A releases. B holds identity.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GroupCards() {
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-accent-dim mt-8 border border-accent-dim">
+      {GROUP_CARDS.map((g) => (
+        <div
+          key={g.id}
+          className="bg-bg p-7 transition-colors hover:bg-bg-2 relative"
+        >
+          <div className="text-[10px] text-accent tracking-[0.18em] mb-1.5">
+            {g.id}
+          </div>
+          <h3 className="font-head text-[22px] leading-tight text-ink mb-1.5 tracking-[0.04em] lowercase">
+            {g.name}
+          </h3>
+          <div className="text-[10px] text-ink-dim mb-4 tracking-[0.05em]">
+            {g.meta}
+          </div>
+          <pre className="font-mono text-[10px] text-ink-dim leading-[1.5] bg-bg-2 p-3.5 border-l-2 border-accent mb-4 whitespace-pre overflow-x-auto">
+            {g.ascii}
+          </pre>
+          <p className="text-[12px] text-ink-dim leading-[1.6] mb-4">{g.body}</p>
+          <div className="border-t border-line pt-3.5 grid grid-cols-2 gap-2.5 text-[10px]">
+            {g.spec.map(([k, v]) => (
+              <span key={k} className="contents">
+                <span className="text-ink-dim uppercase tracking-[0.1em]">
+                  {k}
+                </span>
+                <span className="text-ink">{v}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const SPEC_STRIP: ReadonlyArray<{
+  label: string;
+  value: string;
+  unit: string;
+  body: React.ReactNode;
+}> = [
+  {
+    label: "// trait surface",
+    value: "5",
+    unit: "methods",
+    body: "name · requirements · process · snapshot · restore",
+  },
+  {
+    label: "// migration phases",
+    value: "6",
+    unit: "strict",
+    body: "snapshot → transfer → restore → replay → cutover → complete",
+  },
+  {
+    label: "// wire messages",
+    value: "10",
+    unit: "types",
+    body: (
+      <>
+        orchestrator + source + target over{" "}
+        <code className="text-accent">0x0500</code>
+      </>
+    ),
+  },
+  {
+    label: "// cycle time",
+    value: "~280",
+    unit: "ns",
+    body: "full snapshot → activate, faster than a context switch",
+  },
+];
+
+function SpecStrip() {
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 border border-line mt-10">
+      {SPEC_STRIP.map((s, i) => (
+        <div
+          key={s.label}
+          className={`px-6 py-5 bg-bg-2 ${i < SPEC_STRIP.length - 1 ? "border-b lg:border-b-0 lg:border-r border-line" : ""}`}
+        >
+          <div className="text-[10px] text-ink-dim tracking-[0.12em] uppercase mb-2">
+            {s.label}
+          </div>
+          <div className="font-display text-[22px] text-accent leading-[1.1] mb-1">
+            {s.value}
+            <span className="text-[13px] text-ink-dim ml-1">{s.unit}</span>
+          </div>
+          <div className="text-[10px] text-ink-dim leading-[1.4]">{s.body}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+interface InstallCard {
+  lang: string;
+  ext: string;
+  cmd: string;
+  meta: string;
+}
+
+const INSTALL_CARDS: readonly InstallCard[] = [
+  {
+    lang: "Rust",
+    ext: ".rs",
+    cmd: "$ cargo add ai2070-net-sdk",
+    meta: "crate: ai2070-net-sdk",
+  },
+  {
+    lang: "TypeScript",
+    ext: ".ts",
+    cmd: "$ npm i @ai2070/net-sdk\n       @ai2070/net",
+    meta: "scope: @ai2070",
+  },
+  {
+    lang: "Python",
+    ext: ".py",
+    cmd: "$ pip install ai2070-net-sdk",
+    meta: "dist: ai2070-net-sdk",
+  },
+  {
+    lang: "Go",
+    ext: ".go",
+    cmd: "$ go get github.com/\n  ai-2070/net/go",
+    meta: "module: ai-2070/net/go",
+  },
+];
+
+function InstallSection() {
+  return (
+    <section
+      id="install"
+      className="bg-bg-2 border-b border-line px-6 py-20"
+    >
+      <SectionLabel>§07 / install</SectionLabel>
+      <DisplayHeading>
+        five languages.
+        <br />
+        one engine.
+      </DisplayHeading>
+
+      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+        All SDKs wrap the same Rust core. The SDK is the developer experience,
+        the engine is Rust.
+      </p>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-5">
+        {INSTALL_CARDS.map((c) => (
+          <div
+            key={c.lang}
+            className="border border-line p-5 bg-bg transition-colors hover:border-accent-dim cursor-pointer"
+          >
+            <div className="flex items-center justify-between mb-4">
+              <span className="text-[11px] text-ink tracking-[0.15em] uppercase font-semibold">
+                {c.lang}
+              </span>
+              <span className="text-[10px] text-accent border border-accent-dim px-1.5 py-0.5">
+                {c.ext}
+              </span>
+            </div>
+            <pre className="bg-bg-2 p-3 text-[11px] text-accent border-l-2 border-accent overflow-x-auto font-mono leading-[1.5]">
+              {c.cmd}
+            </pre>
+            <div className="text-ink-dim text-[10px] mt-2.5">{c.meta}</div>
+          </div>
+        ))}
+      </div>
+
+      <p className="mt-7 text-[11px] text-ink-dim">
+        // C bindings via <span className="text-accent">net.h</span> — build
+        cdylib with{" "}
+        <span className="text-accent">
+          cargo build --release --features ffi,net
+        </span>
+        . Lower-level bindings (skip SDK ergonomics, talk directly to the
+        engine): <span className="text-accent">ai2070-net</span>,{" "}
+        <span className="text-accent">@ai2070/net</span>,{" "}
+        <span className="text-accent">ai2070-net</span> (PyPI binding).
+      </p>
+    </section>
+  );
+}
+
+interface AppCard {
+  tag: string;
+  title: string;
+  body: string;
+}
+
+const APPS: readonly AppCard[] = [
+  {
+    tag: "▸ 0x01 ─ ai runtime",
+    title: "AI Runtime",
+    body: "The original use case. Token streams, tool-call results, guardrail decisions, and consensus votes flowing across heterogeneous GPU nodes. The mesh is the runtime.",
+  },
+  {
+    tag: "▸ 0x02 ─ vehicular mesh",
+    title: "Vehicular Sensor Mesh",
+    body: "Cars sharing LIDAR, radar, camera. Vehicles sync intent — braking, turning, route changes. The car behind doesn't react to braking. It knows about the braking before the brake pads touch the rotor.",
+  },
+  {
+    tag: "▸ 0x03 ─ factory floor",
+    title: "Robotics Factory Floor",
+    body: "Robots don't need line-of-sight for networking. The mesh routes through whatever nodes are reachable. Reroute scheduled in sub-microsecond time. The assembly line doesn't stop.",
+  },
+  {
+    tag: "▸ 0x04 ─ disaster response",
+    title: "Disaster Response",
+    body: "Phones, drones, portable radios forming a mesh with no surviving infrastructure. The mesh forms from whatever is present and routes around whatever is gone.",
+  },
+  {
+    tag: "▸ 0x05 ─ remote surgery",
+    title: "Remote Surgery",
+    body: "Control signals and haptic feedback routed across the mesh. If the primary compute node lags, the mesh reroutes mid-operation. The surgeon doesn't notice. The patient doesn't notice. The scalpel doesn't stop.",
+  },
+  {
+    tag: "▸ 0x06 ─ drone swarms",
+    title: "Drone Swarms",
+    body: "Coordinated flight without a ground controller. A drone that loses a motor broadcasts the failure; the swarm adjusts formation before the drone has begun to fall.",
+  },
+  {
+    tag: "▸ 0x07 ─ live performance",
+    title: "Live Performance",
+    body: "Lighting, audio, video, pyro synchronized across hundreds of nodes. A DMX controller dies, another node picks up the cue list. Audio sync tighter than the speed of sound across the venue.",
+  },
+  {
+    tag: "▸ 0x08 ─ precision ag",
+    title: "Precision Agriculture",
+    body: "Tractors, drones, soil sensors, weather stations forming a field mesh. The field is the network. No cloud round-trip required.",
+  },
+];
+
+function ApplicationsSection() {
+  return (
+    <section id="apps" className="border-b border-line px-6 py-20">
+      <SectionLabel>§08 / target applications</SectionLabel>
+      <DisplayHeading>
+        everything that
+        <br />
+        can&apos;t wait.
+      </DisplayHeading>
+
+      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+        Anywhere coordination latency matters. Anywhere the cloud round-trip is
+        too slow. Anywhere there&apos;s no central infrastructure to route
+        through.
+      </p>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 border-t border-l border-line">
+        {APPS.map((a) => (
+          <div
+            key={a.title}
+            className="border-r border-b border-line p-7 transition-colors hover:bg-bg-2 relative"
+          >
+            <div className="text-accent text-[10px] tracking-[0.15em] mb-2">
+              {a.tag}
+            </div>
+            <h3 className="font-head text-[18px] leading-tight mb-2.5 tracking-[0.04em] text-ink lowercase">
+              {a.title}
+            </h3>
+            <p className="text-ink-dim text-[12px] leading-[1.6]">{a.body}</p>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+interface BlackwallItem {
+  tag: string;
+  body: string;
+}
+
+const BLACKWALL_ITEMS: readonly BlackwallItem[] = [
+  {
+    tag: "▸ Backpressure",
+    body: "Nodes limit in-flight events, prevent overload, and apply pushback by going silent. No node can be forced to accept more than it can process.",
+  },
+  {
+    tag: "▸ Bounded queues",
+    body: "No infinite buffers. Ring buffers have explicit capacity limits. A flood fills a buffer and gets evicted, it doesn't grow the buffer.",
+  },
+  {
+    tag: "▸ Fanout limits",
+    body: "Events don't propagate to everyone. Dissemination is controlled by the proximity graph and routing table. Prevents O(n²) explosion.",
+  },
+  {
+    tag: "▸ Deduplication",
+    body: "The same event doesn't explode repeatedly. Idempotency at the event level protects against loops and amplification.",
+  },
+  {
+    tag: "▸ TTL limits",
+    body: "Events expire. Pingwaves have a hop radius. A misbehaving node's traffic dies at the boundary of its TTL, not the edge of the mesh.",
+  },
+  {
+    tag: "▸ Rate limits",
+    body: "Per-node, per-peer limits. One node cannot flood the mesh. Its neighbors enforce their own limits independently through device autonomy rules.",
+  },
+];
+
+function BlackwallSection() {
+  return (
+    <section
+      id="wall"
+      className="blackwall-bg border-b border-line px-6 py-20"
+    >
+      <SectionLabel>§09 / the blackwall</SectionLabel>
+      <DisplayHeading>
+        safety isn&apos;t declared.
+        <br />
+        it&apos;s <span className="text-accent">derived.</span>
+      </DisplayHeading>
+
+      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+        In Cyberpunk, the Blackwall isn&apos;t a wall around the threats —
+        it&apos;s a wall around the safe zone. Net works the same way. The
+        &quot;safe mesh&quot; is the part you can observe: nodes that respond
+        within heartbeat intervals, honor their capability announcements,
+        don&apos;t flood, respect TTL.
+      </p>
+
+      <p className="text-[16px] text-accent max-w-[740px] leading-[1.6] font-light -mt-8 mb-12">
+        The wall isn&apos;t one mechanism. It&apos;s the emergent effect of
+        every constraint working together.
+      </p>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mt-10">
+        {BLACKWALL_ITEMS.map((item) => (
+          <div key={item.tag} className="border-t border-accent-dim pt-4">
+            <h4 className="text-[11px] text-accent uppercase tracking-[0.15em] mb-2.5">
+              {item.tag}
+            </h4>
+            <p className="text-ink-dim text-[12px] leading-[1.6]">{item.body}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-16 max-w-[900px]">
+        <p className="text-[18px] text-ink leading-[1.5] font-light">
+          Any single mechanism can be overwhelmed. All of them together form the
+          wall.{" "}
+          <strong className="text-accent font-medium">
+            There is no single point to breach because the wall is the mesh
+            itself.
+          </strong>
+        </p>
+      </div>
+    </section>
+  );
+}
+
+function ClosingSection() {
+  return (
+    <section className="border-b border-line px-6 py-20">
+      <SectionLabel>§10 / post-cloud</SectionLabel>
+      <DisplayHeading>
+        not anti-cloud.
+        <br />
+        post-cloud.
+      </DisplayHeading>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mt-6">
+        <div>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            Cloud infrastructure solves the wrong problem. It moves compute
+            closer to a central provider.{" "}
+            <strong className="text-ink font-medium">
+              Net moves compute closer to the data and the work.
+            </strong>
+          </p>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            Cloud adds a trusted intermediary by definition. Net has no
+            intermediaries. Relay nodes forward encrypted bytes they cannot
+            read. There is no Cloudflare, no AWS, no Azure in the path because
+            the path is yours.
+          </p>
+        </div>
+        <div>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            <strong className="text-ink font-medium">
+              Cloud was the right answer when compute was scarce and hardware
+              was expensive.
+            </strong>{" "}
+            Compute is abundant. Hardware is cheap. The coordination layer
+            should reflect that.
+          </p>
+          <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            A manufacturing plant running on Net doesn&apos;t route sensor data
+            to AWS us-east-1 and back. The sensor talks directly to the decision
+            system on the factory floor.{" "}
+            <strong className="text-ink font-medium">
+              The latency is physics, not geography plus cloud overhead.
+            </strong>
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-16 text-center py-16 border-t border-b border-accent-dim bg-accent/[0.02]">
+        <div
+          className="font-display text-ink leading-[1.1] mb-5"
+          style={{ fontSize: "clamp(28px, 4vw, 48px)" }}
+        >
+          the mesh is <span className="text-accent">already</span>
+          <br />
+          running.
+        </div>
+        <a
+          href="#install"
+          className="btn-primary inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all mt-5"
+        >
+          ↓ Join the Net <span className="text-sm">→</span>
+        </a>
+      </div>
+    </section>
+  );
+}
+
+function FooterDivider() {
+  return (
+    <div className="text-ink-faint text-[10px] leading-none whitespace-pre text-center py-10 overflow-hidden">
+      ░░░░▒▒▒▒▓▓▓▓████████▓▓▓▓▒▒▒▒░░░░ ░░░░▒▒▒▒▓▓▓▓████████▓▓▓▓▒▒▒▒░░░░
+      ░░░░▒▒▒▒▓▓▓▓████████▓▓▓▓▒▒▒▒░░░░
+    </div>
+  );
+}
+
+const FOOTER_SPEC: ReadonlyArray<{ href: string; label: string }> = [
+  { href: "#what", label: "Why not best-effort" },
+  { href: "#bench", label: "Benchmarks" },
+  { href: "#wall", label: "The Blackwall" },
+  { href: "#install", label: "SDKs" },
+];
+
+const FOOTER_COMPONENTS: ReadonlyArray<{ href: string; label: string }> = [
+  { href: "#", label: "RedEX // log" },
+  { href: "#", label: "CortEX // fold" },
+  { href: "#", label: "NetDB // façade" },
+  { href: "#", label: "Mikoshi // migration" },
+  { href: "#", label: "nRPC // request/response" },
+];
+
+const FOOTER_RESOURCES: ReadonlyArray<{ href: string; label: string }> = [
+  { href: "#", label: "Crate README" },
+  { href: "#", label: "BENCHMARKS.md" },
+  { href: "#", label: "RFC archive" },
+  { href: "#", label: "Source (GitHub)" },
+];
+
+function Footer() {
+  return (
+    <footer className="px-6 pt-16 pb-7 border-t border-accent-dim">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-[2fr_1fr_1fr_1fr] gap-8 mb-12">
+        <div>
+          <div className="logo-mark font-display text-[22px] text-ink tracking-[0.1em] flex items-baseline gap-2.5 mb-4">
+            net{" "}
+            <span className="font-mono text-[9px] text-accent tracking-[0.15em] font-semibold">
+              // NET 2070
+            </span>
+          </div>
+          <p className="text-ink-dim text-[12px] leading-[1.6] max-w-[380px]">
+            Network Event Transport. A latency-first encrypted mesh protocol.
+            Loosely inspired by Cyberpunk 2077. Not affiliated with CD Projekt
+            Red or R. Talsorian Games.
+          </p>
+        </div>
+        <FooterColumn title="Spec" items={FOOTER_SPEC} />
+        <FooterColumn title="Components" items={FOOTER_COMPONENTS} />
+        <FooterColumn title="Resources" items={FOOTER_RESOURCES} />
+      </div>
+
+      <div className="border-t border-line pt-6 flex justify-between text-[10px] text-ink-dim tracking-[0.1em] flex-wrap gap-4">
+        <span>© 2026 — NET // PROTOCOL.0x4E45·54</span>
+        <span>
+          <span className="text-accent">▸</span> mesh status:{" "}
+          <span className="text-accent">ONLINE</span> · 14,872 nodes observable
+        </span>
+        <span>// the train just stops, the network doesn&apos;t</span>
+      </div>
+    </footer>
+  );
+}
+
+function FooterColumn({
+  title,
+  items,
+}: {
+  title: string;
+  items: ReadonlyArray<{ href: string; label: string }>;
+}) {
+  return (
+    <div>
+      <h5 className="text-[10px] tracking-[0.18em] text-ink-dim uppercase mb-4 font-medium">
+        {title}
+      </h5>
+      <ul className="list-none space-y-2">
+        {items.map((it) => (
+          <li key={it.label}>
+            <a
+              href={it.href}
+              className="text-ink no-underline text-[12px] hover:text-accent transition-colors"
+            >
+              {it.label}
+            </a>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
 
 export default function Home() {
-  const [tab, setTab] = useState<TabKey>("rust");
-
   return (
-    <div className="bg-deep text-ink">
-      {/* NAV */}
-      <nav className="sticky top-0 z-50 nav-glass border-b border-line">
-        <div className="max-w-[1200px] mx-auto px-7 flex items-center justify-between h-16">
-          <a className="inline-flex items-center gap-2.5 font-semibold tracking-[-0.01em]" href="#">
-            <span className="logo-mark" />
-            <span>Net</span>
-          </a>
-          <div className="hidden lg:flex gap-7 text-sm text-muted">
-            {NAV_LINKS.map((l) => (
-              <a key={l.href} href={l.href} className="hover:text-ink transition-colors">
-                {l.label}
-              </a>
-            ))}
-          </div>
-          <a
-            href="#install"
-            className="font-mono text-xs px-3.5 py-2 border border-line2 rounded-full text-ink transition-all hover:border-accent hover:text-accent"
-          >
-            Get started →
-          </a>
-        </div>
-      </nav>
-
-      {/* HERO */}
-      <header className="relative overflow-hidden hero-bg pt-[140px] pb-[120px]">
-        <div className="hero-grid-bg" />
-        <div className="relative max-w-[1200px] mx-auto px-7">
-          <div className="inline-flex gap-2 items-center mb-5 font-mono text-[11px] text-dim tracking-[0.06em]">
-            <span className="w-1.5 h-1.5 rounded-full bg-accent2 shadow-[0_0_8px_var(--color-accent2)] animate-pulse-soft" />
-            <span>NETWORK EVENT TRANSPORT</span>
-            <span className="text-dim">·</span>
-            <span>v0 · working protocol</span>
-          </div>
-          <Eyebrow>
-            Existing networks operate in 10⁻³.{" "}
-            <span className="text-muted">Net operates in 10⁻⁹.</span>
-          </Eyebrow>
-          <h1 className="text-[clamp(40px,6.4vw,84px)] leading-[1.02] tracking-[-0.03em] font-semibold mt-6">
-            The internet was built
-            <br />
-            for scarcity. <span className="grad-text">Net</span>
-            <br />
-            is built for abundance.
-          </h1>
-          <p className="text-[clamp(17px,1.5vw,20px)] leading-[1.55] text-muted max-w-[64ch] mt-[22px]">
-            A latency-first encrypted mesh. Every computer, device, and application is an
-            equal node on a flat topology — no clients, no servers, no coordinators. The
-            mesh propagates state, not connections. Real-time scheduling latencies on
-            commodity hardware over commodity networks.
-          </p>
-          <div className="mt-10 inline-flex gap-3 flex-wrap">
-            <a
-              href="#install"
-              className="group inline-flex items-center gap-2 px-5 py-3 rounded-[10px] font-mono text-[13px] font-medium border bg-ink text-deep border-ink transition-all hover:bg-accent hover:border-accent hover:-translate-y-px"
-            >
-              Install{" "}
-              <span className="transition-transform group-hover:translate-x-[3px]">→</span>
-            </a>
-            <a
-              href="#benchmarks"
-              className="inline-flex items-center gap-2 px-5 py-3 rounded-[10px] font-mono text-[13px] font-medium border border-line2 transition-all hover:border-ink"
-            >
-              See the benchmarks
-            </a>
-          </div>
-
-          <div className="mt-20 grid grid-cols-2 lg:grid-cols-4 border-t border-b border-line">
-            {HERO_STATS.map((s, i) => (
-              <div
-                key={s.label}
-                className={`py-7 ${
-                  i % 2 === 0
-                    ? "pr-6 border-r border-line lg:border-r"
-                    : "pl-6 lg:pl-0 lg:pr-6 lg:border-r lg:border-line"
-                } ${i === 1 ? "lg:pl-0" : ""} ${
-                  i === HERO_STATS.length - 1 ? "lg:border-r-0" : ""
-                } ${i === 0 ? "lg:pl-0" : ""}`}
-              >
-                <div className="font-mono text-[28px] tracking-[-0.02em] text-ink font-medium">
-                  {s.num}
-                </div>
-                <div className="text-xs text-dim mt-1.5 font-mono tracking-[0.04em]">
-                  {s.label}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </header>
-
-      {/* WHY */}
-      <section id="why" className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <SectionHead
-            eyebrow="Why not best-effort"
-            title={
-              <>
-                ARPANET assumed scarcity.
-                <br />
-                Net assumes abundance.
-              </>
-            }
-            right={
-              <>
-                TCP guarantees delivery to a buffer. It does not guarantee the receiver can
-                act on it in time. In a world of abundant data, abundant nodes, abundant
-                bandwidth, and continuous external pressure, a delivery guarantee becomes a
-                liability — you're promising to deliver data that will bury the receiver.
-                The bottleneck isn't delivery. It's processing.
-              </>
-            }
-          />
-
-          <div className="mt-14 grid grid-cols-1 md:grid-cols-2 border border-line rounded-[14px] overflow-hidden bg-panel">
-            <div className="p-8 md:p-9 border-b md:border-b-0 md:border-r border-line">
-              <h3 className="text-dim font-mono text-xs tracking-[0.14em] uppercase font-medium mb-5">
-                Best-effort networks (TCP/IP, HTTP, gRPC)
-              </h3>
-              <ul className="list-none m-0 p-0">
-                {INVERT_LEFT.map((line, i) => (
-                  <li
-                    key={i}
-                    className={`py-3 flex items-start gap-2.5 text-[15px] text-dim ${
-                      i === 0 ? "pt-0" : "border-t border-dashed border-line"
-                    }`}
-                  >
-                    <span className="text-[#ff6b7a]">×</span> {line}
-                  </li>
-                ))}
-              </ul>
-            </div>
-            <div className="p-8 md:p-9">
-              <h3 className="text-dim font-mono text-xs tracking-[0.14em] uppercase font-medium mb-5">
-                Net
-              </h3>
-              <ul className="list-none m-0 p-0">
-                {INVERT_RIGHT.map((row, i) => (
-                  <li
-                    key={i}
-                    className={`py-3 flex items-start gap-2.5 text-[15px] ${
-                      i === 0 ? "pt-0" : "border-t border-dashed border-line"
-                    }`}
-                  >
-                    <span className="text-accent">→</span> <span>{row}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* PROPERTIES */}
-      <section className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <SectionHead
-            eyebrow="Properties"
-            title={
-              <>
-                Latency-first.
-                <br />
-                Streaming-first.
-                <br />
-                Zero-copy.
-              </>
-            }
-            right={
-              <>
-                Net composes pieces that exist as solved problems — event sourcing, process
-                migration, causal ordering, capability scheduling, self-healing mesh — into
-                one runtime at nanosecond speeds. Nobody composed them before because
-                nobody had a transport fast enough.
-              </>
-            }
-          />
-
-          <div className="mt-16 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-px bg-line border border-line rounded-[14px] overflow-hidden">
-            {PROPS.map((p) => (
-              <div key={p.title} className="bg-panel p-7">
-                <div className="text-base font-semibold mb-2 tracking-[-0.01em]">
-                  {p.title}
-                </div>
-                <div className="text-muted text-sm leading-[1.55]">{p.body}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* STACK */}
-      <section id="stack" className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <SectionHead
-            eyebrow="Stack"
-            title={
-              <>
-                One process. One header.
-                <br />
-                Eleven concerns.
-              </>
-            }
-            right={
-              <>
-                A 64-byte cache-line-aligned wire format. Forwarding nodes read one cache
-                line, decide a route, and forward without touching the payload. Every layer
-                above transport adds a distinct concern at sub-microsecond cost.
-              </>
-            }
-          />
-
-          <div className="mt-14 border border-line rounded-[14px] arch-fade overflow-hidden">
-            <div className="hidden xl:grid grid-cols-[220px_1fr_280px] bg-raised font-mono text-[11px] tracking-[0.12em] uppercase text-dim py-3.5">
-              <div className="px-6">Layer</div>
-              <div className="px-6">What it does</div>
-              <div className="px-6">Key mechanism</div>
-            </div>
-            {ARCH_ROWS.map((r, i) => (
-              <div
-                key={r.name}
-                className={`grid grid-cols-1 xl:grid-cols-[220px_1fr_280px] xl:items-center ${
-                  i === 0 ? "border-t-0 xl:border-t border-line" : "border-t border-line"
-                } hover:bg-[rgba(124,245,192,0.03)] transition-colors`}
-              >
-                <div className="px-6 pt-4 xl:py-4 font-mono text-[13px] text-accent font-medium tracking-[-0.01em]">
-                  {r.name}
-                </div>
-                <div className="px-6 py-1.5 xl:py-4 text-muted text-sm">{r.desc}</div>
-                <div className="px-6 pb-4 xl:py-4 font-mono text-xs text-dim">{r.mech}</div>
-              </div>
-            ))}
-          </div>
-
-          <div className="mt-14 grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
-            <div className="text-muted text-[15px]">
-              <h3 className="text-[18px] tracking-[-0.01em] font-semibold mb-4 text-ink">
-                A 64-byte header you can read in one cache line.
-              </h3>
-              <p>
-                Every Net packet begins with a header aligned to a single CPU cache line. A
-                forwarding node reads one cache line, decides a route, and forwards without
-                touching the payload. Routed (multi-hop) packets prepend an 18-byte routing
-                header; direct packets use the Net header alone.
-              </p>
-              <p className="mt-3.5">
-                Headers are never encrypted — only payloads. ChaCha20-Poly1305 with counter
-                nonces eliminates nonce-reuse risk. Every field is read by at least one
-                layer.
-              </p>
-            </div>
-            <div className="border border-line rounded-xl bg-panel overflow-hidden font-mono text-xs">
-              <div className="bg-raised px-4 py-3 text-dim tracking-[0.08em] border-b border-line flex justify-between">
-                <span>NET HEADER</span>
-                <span>64 BYTES · 1 CACHE LINE</span>
-              </div>
-              {WIRE_ROWS.map((r, i) => (
-                <div
-                  key={i}
-                  className={`grid grid-cols-[60px_1fr_60px] px-4 py-2.5 text-muted ${
-                    i === 0 ? "" : "border-t border-dashed border-line"
-                  }`}
-                >
-                  <span>{r.off}</span>
-                  <span className="text-ink">{r.name}</span>
-                  <span className="text-accent text-right">{r.size}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* BENCHMARKS */}
-      <section id="benchmarks" className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <SectionHead
-            eyebrow="Benchmarks · M1 Max / i9-14900K @5GHz · 2026-04-27"
-            title={
-              <>
-                The software is no longer
-                <br />
-                the bottleneck.
-              </>
-            }
-            right={
-              <>
-                Every number measures packet scheduling: process, route, encrypt, queue.
-                Not NIC transfer, not wire latency, not the speed of light. At 5 hops,
-                total scheduling overhead is under 300 ns — well inside the budget for
-                edge-to-edge coordination on a campus network where the physics floor is
-                ~33 μs.
-              </>
-            }
-          />
-
-          <div className="mt-14 grid grid-cols-1 lg:grid-cols-3 gap-4">
-            {BENCH.map((b) => (
-              <div
-                key={b.label}
-                className="bg-panel border border-line rounded-xl p-7 transition-all hover:border-line2 hover:-translate-y-0.5"
-              >
-                <div className="font-mono text-[36px] tracking-[-0.02em] grad-text font-medium leading-[1.1]">
-                  {b.num}
-                  <span className="font-mono text-dim text-sm ml-0.5">{b.unit}</span>
-                </div>
-                <div className="text-ink mt-3.5 font-medium">{b.label}</div>
-                <div className="text-dim font-mono text-xs mt-2">{b.meta}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* DAEMONS / MIKOSHI / CHANNELS */}
-      <section id="daemons" className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <SectionHead
-            eyebrow="Capabilities · Daemons · Channels"
-            title={<>The mesh is the runtime.</>}
-            right={
-              <>
-                The deployment topology is a runtime decision, not a code change. Code that
-                runs on a single node runs unmodified across a multi-hop encrypted mesh.
-                The mesh resolves routing, decryption, and chain validation before your
-                daemon sees the event.
-              </>
-            }
-          />
-
-          <div className="mt-14 grid grid-cols-1 xl:grid-cols-3 gap-4">
-            <FeatureCard tag="Capabilities" title="No registry. The nodes are the control plane.">
-              <p>
-                A node announces what it is — cores, memory, GPU, loaded models, installed
-                tools, operator tags — and every peer indexes that announcement locally.
-                Capability diffs propagate multi-hop. A node four subnets away learns the
-                same fingerprint as a direct peer, without anyone in the middle being a
-                directory.
-              </p>
-              <p className="mt-4 pl-3.5 border-l-2 border-accent text-ink italic text-sm">
-                You ask <em>any peer with an NVIDIA GPU and 40 GB of VRAM, advertising the
-                prod tag</em> — you get an answer in microseconds.
-              </p>
-            </FeatureCard>
-
-            <FeatureCard tag="Mikoshi · daemon migration" title="The thing itself, carried across.">
-              <p>
-                A daemon's identity is cryptographic; its location is the mesh. Address it
-                by{" "}
-                <code className="font-mono text-[13px] text-accent">origin_hash</code>, a
-                fingerprint of an ed25519 public key that doesn't change when the daemon
-                moves.
-              </p>
-              <p className="mt-3">
-                Six-phase migration: snapshot → transfer → restore → replay → cutover →
-                cleanup. Subscribers don't notice it moved. The same machinery composes
-                into replica groups, fork groups with verifiable lineage, and
-                active-passive standby.
-              </p>
-            </FeatureCard>
-
-            <FeatureCard tag="Channels" title="A name you match on, not a thing you connect to.">
-              <p>
-                A publisher registers{" "}
-                <code className="font-mono text-[13px] text-accent">
-                  sensors/temperature
-                </code>{" "}
-                with a policy; subscribers ask to join by name; the mesh routes the
-                semantic. There is no broker. Publish-without-subscribers is literally a
-                no-op — the roster is empty, the fan-out loop runs zero times.
-              </p>
-              <p className="mt-3">
-                A subscriber that loses their token stops receiving events on the
-                publisher's next packet — not on the next cluster reconciliation, not when
-                the service mesh pushes an ACL.
-              </p>
-            </FeatureCard>
-          </div>
-        </div>
-      </section>
-
-      {/* LATENCY GAP */}
-      <section className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <SectionHead
-            eyebrow="The industrial latency gap"
-            title={
-              <>
-                33 μs is the floor.
-                <br />
-                Cloud is 1500× above it.
-              </>
-            }
-            right={
-              <>
-                Most industrial coordination is hyper-local: factory floor, facility
-                campus, vehicle fleet. Light in fiber across 5 km is around 33 μs round
-                trip. That's the hard limit. No protocol can beat it. Cloud-routed PLCs,
-                centralized SCADA, remote monitoring — they add 10–50 ms on top of physics.
-              </>
-            }
-          />
-
-          <div className="mt-14 border border-line rounded-[14px] gap-fade p-8 lg:p-12 grid grid-cols-1 lg:grid-cols-[1.1fr_1fr] gap-8 lg:gap-12 items-center">
-            <div className="flex flex-col gap-4">
-              <BarRow label="Cloud round trip" value="~50 ms" valueColor="text-dim">
-                <span className="block h-full rounded bar-track" style={{ width: "100%" }} />
-              </BarRow>
-              <BarRow label="Local-area TCP" value="~5 ms" valueColor="text-dim">
-                <span className="block h-full rounded bar-track" style={{ width: "10%" }} />
-              </BarRow>
-              <BarRow label="Physics floor (5 km fiber RTT)" value="~33 μs" valueColor="text-warn">
-                <span
-                  className="block h-full rounded bar-physics"
-                  style={{ width: "0.066%", minWidth: 4 }}
-                />
-              </BarRow>
-              <BarRow label="Net — 5-hop scheduling overhead" value="274 ns" valueColor="text-accent">
-                <span
-                  className="block h-full rounded bar-net"
-                  style={{ width: "0.0005%", minWidth: 4 }}
-                />
-              </BarRow>
-            </div>
-            <div className="text-muted text-[15px]">
-              <h3 className="text-2xl tracking-[-0.02em] mb-4 text-ink font-semibold">
-                A category change, not a marginal improvement.
-              </h3>
-              <p>
-                When coordination latency drops from 50 ms to 33 μs, things that were
-                impossible become trivial. Closed-loop control across a mesh of autonomous
-                devices. Real-time consensus between robots on an assembly line. Swarm
-                coordination where the mesh reacts faster than any individual node's
-                control loop.
-              </p>
-              <p className="mt-3.5">
-                Net doesn't replace the data center. It separates what must be fast from
-                what must be smart. The 10 kHz torque feedback loop stays on the floor
-                between sensor and actuator. The vibration pattern that predicts bearing
-                failure next week travels to a model with 100 GB of training data.
-              </p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* LOCAL DATA */}
-      <section id="data" className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <SectionHead
-            eyebrow="Optional · per-node · local-first"
-            title={
-              <>
-                RedEX. CortEX. NetDB.
-                <br />
-                The stream is the state.
-              </>
-            }
-            right={
-              <>
-                The hot path never touches disk. Storage is a choice, not an architectural
-                requirement. When a node needs durability, queries, or replay, three
-                feature-flagged layers stack on top of Net — all local, all per-node, all
-                unbundled from any cluster.
-              </>
-            }
-          />
-
-          <div className="mt-14 grid grid-cols-1 lg:grid-cols-3 border border-line rounded-[14px] overflow-hidden">
-            <StackCard
-              title="RedEX"
-              name="Append-only event log"
-              meta="21.3 M append/s inline · 138 ns tail latency"
-              border
-            >
-              The append-only log unbundled and local. 20-byte index records, optional
-              disk persistence per channel, atomic backfill-then-live tailing. A Pi keeps
-              a tiny log of its own readings; a server keeps a huge log of whatever it
-              cares about. No cluster consensus protocol — the log is local, replay is
-              local, retention is local.
-            </StackCard>
-            <StackCard
-              title="CortEX"
-              name="RedEX, folded"
-              meta="8.98 ns find_unique · 8.87 M ingest/s"
-              border
-            >
-              A reactive, queryable projection of the log, updated event-by-event. The
-              "database" isn't a process you connect to — it's a{" "}
-              <code className="font-mono text-[13px] text-accent">
-                Vec&lt;Task&gt;
-              </code>{" "}
-              or{" "}
-              <code className="font-mono text-[13px] text-accent">
-                HashMap&lt;Uuid, Memory&gt;
-              </code>{" "}
-              in your Rust, TypeScript, or Python code, updating as events fold in. Queries
-              are direct memory access.
-            </StackCard>
-            <StackCard
-              title="NetDB"
-              name="Unified query façade"
-              meta="6.30 μs open · 1 K-row bundle 48 KB"
-            >
-              One handle bundling tasks + memories under{" "}
-              <code className="font-mono text-[13px] text-accent">db.tasks</code> and{" "}
-              <code className="font-mono text-[13px] text-accent">db.memories</code>.
-              Prisma-style{" "}
-              <code className="font-mono text-[13px] text-accent">find_unique</code> /{" "}
-              <code className="font-mono text-[13px] text-accent">find_many</code> across
-              Rust, TypeScript, and Python — whole-database snapshots round-trip between
-              languages.
-            </StackCard>
-          </div>
-        </div>
-      </section>
-
-      {/* APPLICATIONS */}
-      <section id="applications" className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <SectionHead
-            eyebrow="Applications"
-            title={<>Coordination at hardware timescales.</>}
-            right={
-              <>
-                Anywhere the bottleneck is processing time, not delivery. Anywhere the
-                topology is dynamic, heterogeneous, or partially adversarial. Net sits
-                underneath; the applications above don't change.
-              </>
-            }
-          />
-
-          <div className="mt-14 grid grid-cols-1 lg:grid-cols-3 gap-4">
-            {APPS.map((a) => (
-              <div
-                key={a.title}
-                className="bg-panel border border-line rounded-xl p-7 min-h-[200px] relative overflow-hidden transition-all hover:border-accent"
-              >
-                <div className="w-9 h-9 rounded-lg bg-accent/10 border border-accent/25 grid place-items-center text-accent font-mono text-sm mb-4">
-                  {a.icon}
-                </div>
-                <h3 className="text-[17px] font-semibold tracking-[-0.01em]">{a.title}</h3>
-                <p className="text-muted text-sm mt-2">{a.body}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* INSTALL */}
-      <section id="install" className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <SectionHead
-            eyebrow="Install"
-            title={
-              <>
-                One core. Five SDKs.
-                <br />
-                Same engine.
-              </>
-            }
-            right={
-              <>
-                All SDKs wrap the same Rust core. The SDK is the developer experience; the
-                engine is Rust. Lower-level bindings skip the SDK ergonomics and talk
-                directly to the engine.
-              </>
-            }
-          />
-
-          <div className="mt-14 grid grid-cols-1 md:grid-cols-[240px_1fr] border border-line rounded-[14px] overflow-hidden bg-panel">
-            <div
-              role="tablist"
-              className="flex flex-row md:flex-col flex-wrap p-4 bg-raised border-b md:border-b-0 md:border-r border-line"
-            >
-              {INSTALL_TABS.map((t) => (
-                <button
-                  key={t.key}
-                  role="tab"
-                  onClick={() => setTab(t.key)}
-                  className={`text-left bg-transparent border-0 px-3.5 py-3 rounded-lg font-mono text-[13px] cursor-pointer transition-all ${
-                    tab === t.key
-                      ? "bg-accent/10 text-accent"
-                      : "text-muted hover:text-ink"
-                  }`}
-                >
-                  {t.label}
-                </button>
-              ))}
-            </div>
-            <div className="px-8 py-7 font-mono text-sm overflow-x-auto">
-              <pre className="m-0 whitespace-pre text-ink">{INSTALL_PANES[tab]}</pre>
-            </div>
-          </div>
-
-          <div className="mt-6 border border-line rounded-xl bg-panel overflow-hidden">
-            <div className="px-4 py-2.5 bg-raised font-mono text-[11px] text-dim tracking-[0.1em] border-b border-line flex justify-between">
-              <span>main.rs · minimum-viable mesh node</span>
-              <span>RUST</span>
-            </div>
-            <pre className="m-0 px-5 py-5 font-mono text-[13px] text-ink overflow-x-auto">
-              <code>
-                <span className="text-accent">use</span>{" "}
-                {`net_sdk::{MeshNode, MeshNodeConfig, ChannelName};`}
-                {"\n\n"}
-                <span className="text-dim">
-                  {`// One key, one policy surface, one revocation primitive.`}
-                </span>
-                {"\n"}
-                <span className="text-dim">
-                  {`// The same ed25519 seed signs the node id, capability ads, and tokens.`}
-                </span>
-                {"\n"}
-                {`#[tokio::main]`}
-                {"\n"}
-                <span className="text-accent">async fn</span>{" "}
-                <span className="text-[#c4a4f5]">main</span>
-                {`() -> `}
-                <span className="text-accent">anyhow</span>
-                {`::Result<()> {`}
-                {"\n    "}
-                <span className="text-accent">let</span>
-                {` node = MeshNode::`}
-                <span className="text-[#c4a4f5]">spawn</span>
-                {`(`}
-                {"\n        "}
-                {`MeshNodeConfig::`}
-                <span className="text-[#c4a4f5]">builder</span>
-                {`()`}
-                {"\n            "}
-                {`.`}
-                <span className="text-[#c4a4f5]">bind</span>
-                {`(`}
-                <span className="text-accent2">{`"0.0.0.0:0"`}</span>
-                {`)`}
-                {"\n            "}
-                {`.`}
-                <span className="text-[#c4a4f5]">capabilities</span>
-                {`([`}
-                <span className="text-accent2">{`"gpu:rtx-4090"`}</span>
-                {`, `}
-                <span className="text-accent2">{`"vram:24gb"`}</span>
-                {`, `}
-                <span className="text-accent2">{`"region:eu-west"`}</span>
-                {`])`}
-                {"\n            "}
-                {`.`}
-                <span className="text-[#c4a4f5]">with_try_port_mapping</span>
-                {`(`}
-                <span className="text-accent">true</span>
-                {`)`}
-                {"\n            "}
-                {`.`}
-                <span className="text-[#c4a4f5]">build</span>
-                {`(),`}
-                {"\n    "}
-                {`).`}
-                <span className="text-accent">await</span>
-                {`?;`}
-                {"\n\n    "}
-                <span className="text-accent">let</span>
-                {` sensors = ChannelName::`}
-                <span className="text-[#c4a4f5]">parse</span>
-                {`(`}
-                <span className="text-accent2">{`"sensors/temperature"`}</span>
-                {`)?;`}
-                {"\n    "}
-                <span className="text-accent">let mut</span>
-                {` stream = node.`}
-                <span className="text-[#c4a4f5]">subscribe</span>
-                {`(&sensors).`}
-                <span className="text-accent">await</span>
-                {`?;`}
-                {"\n\n    "}
-                <span className="text-accent">while let</span>{" "}
-                <span className="text-accent">Some</span>
-                {`(event) = stream.`}
-                <span className="text-[#c4a4f5]">next</span>
-                {`().`}
-                <span className="text-accent">await</span>
-                {` {`}
-                {"\n        "}
-                <span className="text-dim">{`// Same call signature as a local function.`}</span>
-                {"\n        "}
-                <span className="text-dim">
-                  {`// Mesh resolved routing, decryption, and chain validation.`}
-                </span>
-                {"\n        "}
-                <span className="text-[#c4a4f5]">handle</span>
-                {`(event).`}
-                <span className="text-accent">await</span>
-                {`;`}
-                {"\n    "}
-                {`}`}
-                {"\n    "}
-                <span className="text-accent">Ok</span>
-                {`(())`}
-                {"\n"}
-                {`}`}
-              </code>
-            </pre>
-          </div>
-        </div>
-      </section>
-
-      {/* BLACKWALL */}
-      <section className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <SectionHead
-            eyebrow="The Blackwall"
-            title={<>The wall is the mesh itself.</>}
-            right={
-              <>
-                Encryption isn't a layer on top of Net — it's a consequence of how
-                forwarding works. Containment isn't one mechanism — it's the emergent
-                effect of every constraint working together.
-              </>
-            }
-          />
-
-          <div className="mt-14 grid grid-cols-1 xl:grid-cols-3 gap-4">
-            {BLACKWALL.map((b) => (
-              <FeatureCard key={b.tag} tag={b.tag} title={b.title}>
-                <p>{b.body}</p>
-              </FeatureCard>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* STATUS */}
-      <section className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <SectionHead
-            eyebrow="Status"
-            title={
-              <>
-                A working protocol,
-                <br />
-                not a paper design.
-              </>
-            }
-            right={
-              <>
-                Encrypted point-to-point transport, multi-peer mesh runtime, relay
-                forwarding without decryption, pingwave-driven distance-vector routing,
-                stream multiplexing with byte-credit backpressure, full 6-phase migration,
-                partition simulation and healing, RedEX disk durability, and CortEX +
-                NetDB across Rust, Node, and Python — all shipping today.
-              </>
-            }
-          />
-
-          <div className="mt-14 grid grid-cols-2 lg:grid-cols-4 border border-line rounded-[14px] overflow-hidden bg-panel">
-            {STATUS_CARDS.map((s, i) => (
-              <div
-                key={s.l}
-                className={`px-7 py-6 ${
-                  i % 2 === 0 ? "border-r border-line" : "lg:border-r lg:border-line"
-                } ${i < 2 ? "border-b border-line lg:border-b-0" : ""} ${
-                  i === STATUS_CARDS.length - 1 ? "lg:border-r-0" : ""
-                }`}
-              >
-                <div className="font-mono text-[22px] text-ink font-medium">{s.v}</div>
-                <div className="text-xs text-dim mt-1 font-mono tracking-[0.06em]">
-                  {s.l}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* CTA */}
-      <section className="py-[120px] border-t border-line">
-        <div className="max-w-[1200px] mx-auto px-7">
-          <div className="border border-line rounded-[18px] cta-fade p-10 lg:p-16 text-center relative overflow-hidden">
-            <div className="absolute inset-0 cta-grid-bg pointer-events-none" />
-            <div className="relative">
-              <span className="font-mono text-xs tracking-[0.14em] uppercase text-accent inline-flex items-center gap-2 before:content-[''] before:w-1.5 before:h-1.5 before:rounded-full before:bg-accent before:shadow-[0_0_12px_var(--color-accent)] animate-pulse-soft">
-                v0 · working protocol
-              </span>
-              <h2 className="text-[clamp(30px,3.6vw,46px)] leading-[1.08] tracking-[-0.02em] font-semibold mx-auto mt-[18px] max-w-[22ch]">
-                Build on a network
-                <br />
-                that doesn't flinch.
-              </h2>
-              <p className="text-[clamp(17px,1.5vw,20px)] leading-[1.55] text-muted mx-auto mt-[22px] max-w-[56ch]">
-                The transport, encryption, and routing are fixed. Everything above them —
-                subprotocols, channels, daemons, models — is a feature space, not a
-                feature list. Deploy incrementally. The mesh already supports your
-                protocol. It just doesn't know what it means yet.
-              </p>
-              <div className="mt-10 inline-flex gap-3 flex-wrap justify-center">
-                <a
-                  href="#install"
-                  className="group inline-flex items-center gap-2 px-5 py-3 rounded-[10px] font-mono text-[13px] font-medium border bg-ink text-deep border-ink transition-all hover:bg-accent hover:border-accent hover:-translate-y-px"
-                >
-                  Install Net{" "}
-                  <span className="transition-transform group-hover:translate-x-[3px]">
-                    →
-                  </span>
-                </a>
-                <a
-                  href="PAPER.md"
-                  className="inline-flex items-center gap-2 px-5 py-3 rounded-[10px] font-mono text-[13px] font-medium border border-line2 transition-all hover:border-ink"
-                >
-                  Read the paper
-                </a>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* FOOTER */}
-      <footer className="border-t border-line py-12 text-dim text-[13px]">
-        <div className="max-w-[1200px] mx-auto px-7 flex justify-between items-start gap-6 flex-wrap">
-          <div>
-            <div className="flex items-center gap-2.5 mb-3.5">
-              <span className="inline-flex items-center gap-2.5 font-semibold tracking-[-0.01em]">
-                <span className="logo-mark" />
-                <span>Net</span>
-              </span>
-            </div>
-            <div className="max-w-[60ch] leading-[1.6]">
-              Loosely inspired by the Net from Cyberpunk 2077. Not affiliated with CD
-              Projekt Red or R. Talsorian Games. This is an engineering take on the
-              concept, not a licensed adaptation. © 2026.
-            </div>
-          </div>
-          <div className="flex gap-6 flex-wrap">
-            <a href="#stack" className="hover:text-ink transition-colors">
-              Stack
-            </a>
-            <a href="#benchmarks" className="hover:text-ink transition-colors">
-              Benchmarks
-            </a>
-            <a href="#daemons" className="hover:text-ink transition-colors">
-              Daemons
-            </a>
-            <a href="#data" className="hover:text-ink transition-colors">
-              Local data
-            </a>
-            <a href="#install" className="hover:text-ink transition-colors">
-              Install
-            </a>
-            <a href="PAPER.md" className="hover:text-ink transition-colors">
-              Paper
-            </a>
-          </div>
-        </div>
-      </footer>
-    </div>
-  );
-}
-
-function FeatureCard({
-  tag,
-  title,
-  children,
-}: {
-  tag: string;
-  title: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="bg-panel border border-line rounded-[14px] p-8 transition-colors hover:border-line2 text-muted text-[14.5px] leading-[1.55]">
-      <span className="font-mono text-[11px] tracking-[0.14em] uppercase text-dim">
-        {tag}
-      </span>
-      <h3 className="text-[22px] tracking-[-0.02em] font-semibold mt-3 mb-3 text-ink">
-        {title}
-      </h3>
-      {children}
-    </div>
-  );
-}
-
-function StackCard({
-  title,
-  name,
-  meta,
-  border,
-  children,
-}: {
-  title: string;
-  name: string;
-  meta: string;
-  border?: boolean;
-  children: React.ReactNode;
-}) {
-  return (
-    <div
-      className={`bg-panel p-9 relative ${
-        border ? "border-b lg:border-b-0 lg:border-r border-line" : ""
-      }`}
-    >
-      <h3 className="font-mono text-sm text-accent tracking-[0.04em] mb-3.5 font-semibold">
-        {title}
-      </h3>
-      <div className="text-2xl tracking-[-0.02em] font-semibold mb-3 text-ink">
-        {name}
-      </div>
-      <p className="text-muted text-sm">{children}</p>
-      <div className="mt-4 font-mono text-[11px] text-dim tracking-[0.04em] pt-3.5 border-t border-dashed border-line">
-        {meta}
-      </div>
-    </div>
-  );
-}
-
-function BarRow({
-  label,
-  value,
-  valueColor,
-  children,
-}: {
-  label: string;
-  value: string;
-  valueColor: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div>
-      <div className="flex justify-between font-mono text-xs text-muted mb-2 tracking-[0.04em]">
-        <span>{label}</span>
-        <span className={valueColor}>{value}</span>
-      </div>
-      <div className="h-3.5 rounded bg-raised overflow-hidden relative">{children}</div>
-    </div>
+    <>
+      <TopStatusBar />
+      <NavBar />
+      <main className="pt-20 max-w-[1440px] mx-auto">
+        <HeroSection />
+        <WhyNotBestEffortSection />
+        <TopologyClassesSection />
+        <PropertiesSection />
+        <BenchmarksSection />
+        <MikoshiSection />
+        <ComputeRuntimeSection />
+        <InstallSection />
+        <ApplicationsSection />
+        <BlackwallSection />
+        <ClosingSection />
+        <FooterDivider />
+        <Footer />
+      </main>
+    </>
   );
 }
