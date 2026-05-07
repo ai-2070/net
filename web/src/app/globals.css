@@ -168,7 +168,7 @@
 }
 
 /* logo diamond */
-@utility logo-mark {
+/*@utility logo-mark {
   &::before {
     content: "◆";
     color: #c4ff3d;
@@ -176,7 +176,7 @@
     transform: translateY(-2px);
     margin-right: 10px;
   }
-}
+}*/
 
 /* section label dash */
 @utility sec-label {
