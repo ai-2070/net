@@ -1,36 +1,67 @@
 # Dataforts — Implementation Plan
 
-> Companion to [`misc/DATAFORTS_FEATURES.md`](misc/DATAFORTS_FEATURES.md). The features doc is the audit: which 25-of-28 wishlist items already ship and which 4-or-so are genuinely new work. **This doc sequences the new work** — phase order, gate criteria, scope boundaries, design decisions to lock, test strategy, risks, and effort. The frame: every phase **stays parked until its activation gate fires**. This is a "we know what to build when we have to" plan, not a build-everything roadmap.
+> Companion to [`misc/DATAFORTS_FEATURES.md`](misc/DATAFORTS_FEATURES.md). The features doc is the audit: which 25-of-28 wishlist items already ship and which are genuinely new work. **This doc sequences the new work across two coordinated releases** — phase order, gate criteria, scope boundaries, design decisions to lock, test strategy, risks, and effort. The frame: every phase **stays parked until its activation gate fires**. This is a "we know what to build when we have to" plan, not a build-everything roadmap.
 
 ## Status
 
-Design only. Nothing in this plan is in flight. Phases 0 + 1 are cheap enough to ship speculatively if we want every later phase to slot in fast; everything else waits for a workload to demand it.
+Design only. Nothing in this plan is in flight. The release split below ensures Rebel Yell (Dataforts) is a *thin compositional layer* on top of The Warriors (substrate foundations) rather than a separate engineering project. Phases inside The Warriors are the precondition for Rebel Yell to land cleanly.
 
-## Why this exists
+## Release plan: The Warriors → Rebel Yell
 
-Three reasons this needs to be a written plan and not just "we'll figure it out":
+The seven phases ship across two coordinated releases:
 
-1. **Most of the wishlist already ships.** It is easy to redo work that already exists if we don't have the audit + sequence in one place. The features doc handles the audit; this doc handles the sequence.
-2. **Phase ordering matters.** Phase 0 (capability-tag discovery) collapses the coordination problem in every later phase — building it first is meaningfully cheaper than retrofitting it phase-by-phase.
-3. **DST is the gating concern, not LoC.** Phase 2 (replication) and Phase 3 (blob CAS GC) are gated by deterministic-simulation-test depth, per [`REDEX_PLAN.md`](REDEX_PLAN.md)'s explicit "needs a clear DST story" condition. Acknowledging that up front avoids surprise when the actual implementation hits the testing wall.
+### The Warriors (precursor) — substrate foundations
+
+Three pieces of work that turn the substrate's primitives into a structured foundation Dataforts can compose against:
+
+1. **Capability taxonomy reorganization.** The flat capability-tag namespace becomes a typed three-axis ontology:
+   - **`hardware`** — what the node *can do* compute-wise (CPU cores, GPU, RAM, NIC, storage). Objective, measurable.
+   - **`software`** — what the node *currently runs* (models loaded, daemons installed, tools available). Configurable.
+   - **`devices`** — custom semantic tags / role identifiers (e.g. `printer`, `temperature-sensor`, `brake-controller`, `LIDAR`, `pump`, `valve`). World-facing roles.
+2. **Capability-tag discovery primitive (Phase 0).** Adds the `causal:`, `blob:`, `heat:`, `fork-of:` tag shapes plus bloom-filter aggregation. The discovery layer that collapses every later phase's coordination problem.
+3. **Federated query primitives (Phase 6, restricted scope).** Query operators over the capability index — filter, match, traverse, aggregate. Not a full MeshDB; just the primitives Rebel Yell composes against. Full MeshDB stays parked until a workload demands it.
+4. **RedEX V2 — raw log-segment replication (Phase 2).** The wire protocol (`SUBPROTOCOL_REDEX`) that v1 explicitly defers. Strong durability beyond single-node. Lands in The Warriors so Rebel Yell can rely on it.
+
+### Rebel Yell (Dataforts) — thin compositional layer on top of The Warriors
+
+After The Warriors, Dataforts is **just a 4th capability category** alongside hardware/software/devices — storage capacity + hosted causal chains advertised via the same tag namespace as compute capabilities. The remaining phases compose against the foundations:
+
+5. **Greedy-LRU dataforts (Phase 1).** Now with three orthogonal filters: **scope label + proximity threshold + capability-preference** (intent-tagged replication — chains advertise `intent:ml-training` / `intent:sensor-telemetry` / etc.; greedy nodes pull chains whose intent matches their advertised capability set).
+6. **Data gravity (Phase 4).** Heat-counter annotations on capability tags; gravity emerges from greedy + heat + capability-preference automatically. No separate migration engine.
+7. **Content-addressable blob storage (Phase 3).** Independent track; can ship parallel with Warriors.
+8. **Read-your-writes (Phase 5).** Optional, post-replication.
+
+Post-Rebel-Yell capability ontology: **four orthogonal axes** (`hardware`, `software`, `devices`, `dataforts`) all queryable via the same federated query primitives. A user can issue a single composable query like `hardware.gpu AND software.model:llama-3-70b AND dataforts.has_chain:Y AND proximity < 50ms` — that is the visible product win Rebel Yell delivers.
+
+## Why the split exists
+
+Three reasons this needs to be sequenced as Warriors → Rebel Yell rather than shipped as one body of work:
+
+1. **Foundation discipline.** Without the taxonomy reorganization and replication primitive in place, Rebel Yell would have to bolt them on per-phase, multiplying coordination cost. Building Warriors first is meaningfully cheaper than retrofitting.
+2. **Most of the wishlist already ships.** The features doc audits 25-of-28 items as already-shipping or free-via-existing-primitives. Warriors prepares the few primitives that genuinely needed building; Rebel Yell composes against them.
+3. **DST is the gating concern, not LoC.** Phase 2 (replication, in Warriors) and Phase 3 (blob CAS GC, in Rebel Yell) are gated by deterministic-simulation-test depth, per [`REDEX_PLAN.md`](REDEX_PLAN.md)'s explicit "needs a clear DST story" condition. Acknowledging that up front avoids surprise when the actual implementation hits the testing wall.
 
 ## TL;DR
 
-Seven phases, sequenced by dependency:
+Seven phases across two releases, sequenced by dependency:
 
-| # | Phase | Effort (focused) | Activation gate | Depends on |
-|---|---|---|---|---|
-| 0 | Capability-tag discovery primitive | 1–2 weeks | First time any later phase activates (cheap; ship speculatively) | — |
-| 1 | Greedy-LRU dataforts | 1–2 weeks | Pilot wants cheap durability / data-locality wins | 0 |
-| 2 | Raw RedEX log-segment replication | 4–9 weeks | Workload needs durability beyond single node | 0 |
-| 3 | Content-addressable blob store | 6–12 weeks | Payloads systematically exceed segment-friendly size | 0 (independent of 1, 2) |
-| 4 | Data gravity (heat-counter migration) | 1–2 weeks | Production telemetry shows access skew Phase 1 doesn't absorb | 0, 1 |
-| 5 | Read-your-writes guarantees | 2–4 weeks | App ergonomics request session-bounded consistency | — |
-| 6 | Federated query layer (MeshDB) | research-grade; multiple months | Workload that single-node CortEX/NetDB can't satisfy | 0, 2 |
+| # | Phase | Release | Effort (focused) | Activation gate | Depends on |
+|---|---|---|---|---|---|
+| 0 | Capability-tag discovery + taxonomy reorganization | **Warriors** | 2–3 weeks | First time Warriors lands (foundation; unconditional within Warriors) | — |
+| 6 | Federated query primitives | **Warriors** | 2–4 weeks (primitives only) | Foundation for Rebel Yell's cross-axis queries | 0 |
+| 7 | Generalized 5-axis `PlacementFilter` + Mikoshi integration | **Warriors** | 1–2 weeks | Foundation for placement decisions across substrate (data + compute) | 0, 6 |
+| 2 | RedEX V2 — raw log-segment replication | **Warriors** | 4–9 weeks | Workload needs durability beyond single node | 0, 7 |
+| 1 | Greedy-LRU dataforts (composes `PlacementFilter`) | **Rebel Yell** | 1–2 weeks | Rebel Yell ships | 0, 7 |
+| 4 | Data gravity (heat-counter migration) | **Rebel Yell** | 1–2 weeks | Production telemetry shows access skew Phase 1 doesn't absorb | 0, 1 |
+| 3 | BlobRef + BlobAdapter hook trait | **Rebel Yell** (parallel-shippable with Warriors) | 1–2 weeks | Payloads systematically exceed inline threshold (default 1 MB) | 0 (independent of 1, 2) |
+| 5 | Read-your-writes guarantees | **Rebel Yell** | 2–4 weeks | App ergonomics request session-bounded consistency | — |
 
-Phase 0 is the only phase that earns proactive shipping — every other phase consumes it, so it's cheaper to land it once than to bolt it onto each. Phases 1–6 are demand-driven. Phase 4 collapsed from "3–6 weeks" to "1–2 weeks" once we accepted the features-doc framing of gravity as **emergent behavior of greedy + heat counters**, not a separate migration engine.
+Phase 4 collapsed from "3–6 weeks" to "1–2 weeks" once we accepted the features-doc framing of gravity as **emergent behavior of greedy + heat counters + capability-preference + colocation**, not a separate migration engine. Phase 6 collapsed from "research-grade; multiple months" to "2–4 weeks" once we restricted Warriors-scope to *primitives* (filter, match, traverse, aggregate operators over the capability index) — full MeshDB with time-travel, lineage walks, and cross-chain joins stays parked as a research-grade extension. Phase 3 collapsed from 6–12 weeks (full substrate-owned blob CAS) to 1–2 weeks (BlobRef + BlobAdapter hook trait) once we accepted the architectural separation: streaming + coordination is the substrate's job, blob storage is the customer's existing system's job (S3, IPFS, Ceph, etc.). Net carries the reference, never owns the bytes.
 
-Total focused effort if everything activates: **~4–6 months parallelized**, **~7–9 months sequential**. Don't read this as a budget commitment — read it as the worst-case shape of the design space.
+**Total focused effort:**
+- **The Warriors:** ~8–16 weeks (capability work + replication + query primitives, parallel where possible)
+- **Rebel Yell:** ~5–10 weeks if all phases activate (greedy + gravity + blob hook + RYW; mostly parallel-shippable)
+- **Worst case:** ~4–6 months parallelised across both releases. **Likely real case:** Warriors only, with Rebel Yell phases activated reactively as workloads demand them.
 
 ---
 
@@ -40,20 +71,24 @@ The unlock. The features doc identifies `causal:origin_hash[:tip_seq]` capabilit
 
 ### Scope
 
-**Tag shapes.** Four parsed forms, all encoded as opaque `Tag` values inside the existing `CapabilitySet.tags` set:
+**Tag shapes.** Parsed forms, all encoded as opaque `Tag` values inside the existing `CapabilitySet.tags` set, organized under the Warriors-shipped four-axis taxonomy (`hardware`, `software`, `devices`, `dataforts`):
 
-| Shape | Meaning |
-|---|---|
-| `causal:<32-byte hex of origin_hash>` | "I hold (or will serve) this chain — current tip unknown / not advertised" |
-| `causal:<hex>:<tip_seq>` | "I hold this chain at least through `tip_seq`" |
-| `causal:<hex>[<start>..<end>]` | "I hold this chain across the `[start, end]` seq range" — for time-travel queries (Phase 6) |
-| `fork-of:<parent_hex>` | "This chain forked from `parent_hex` — for lineage/cohort queries" |
-| `blob:<32-byte hex>:<size>` | "I hold this blob in my CAS pool" — used by Phase 3 |
+| Shape | Axis | Meaning |
+|---|---|---|
+| `causal:<32-byte hex of origin_hash>` | `dataforts` | "I hold (or will serve) this chain — current tip unknown / not advertised" |
+| `causal:<hex>:<tip_seq>` | `dataforts` | "I hold this chain at least through `tip_seq`" |
+| `causal:<hex>[<start>..<end>]` | `dataforts` | "I hold this chain across the `[start, end]` seq range" — for time-travel queries (Phase 6) |
+| `fork-of:<parent_hex>` | `dataforts` | "This chain forked from `parent_hex` — for lineage/cohort queries" |
+| `intent:<label>` | chain-side | "This chain is for X kind of work" — e.g. `intent:ml-training`, `intent:sensor-telemetry`, `intent:billing-settlement`. Drives capability-preference matching in Phase 1's greedy filter. |
+| `colocate-with:<other_origin_hash>` | chain-side | "Place me on the same node as that chain (soft preference)." Drives causal-affinity placement in Phase 1's greedy filter. |
+| `colocate-with-strict:<other_origin_hash>` | chain-side | Hard variant — refuses placement if target unavailable. |
 
-Two non-shape extensions, both reserved keys on capability tags:
+Three non-shape extensions, all reserved keys on capability tags:
 
 - `heat:<chain_hex>=<reads_per_window>` — heat counter for Phase 4. Annotated optionally; absence means "not advertising heat."
 - `scope:<label>` — the existing scoped-capability tag (see `SCOPED_CAPABILITIES_PLAN.md`); reused by Phase 1's greedy filter.
+
+(The blob CAS storage tag `blob:<hex>:<size>` referenced in earlier drafts is removed — Phase 3 ships as a `BlobAdapter` hook trait carrying URI + hash + size in event payloads, not as a substrate-owned blob tag.)
 
 **Bloom-filter aggregation.** A node holding many chains advertises a bloom filter rather than enumerating each tag. Target: 10K chains in ≤ 500 KB; propagation cost ≤ 2× current capability-announcement budget. Adds a new optional field `CapabilitySet::chain_bloom: Option<BloomFilter>`. Nodes that match the bloom probe with a follow-up `causal:<hex>` precise lookup before issuing a real read.
 
@@ -102,9 +137,9 @@ Land the first time any of Phases 1–4, 6 activates. Cheap enough that we shoul
 
 ---
 
-## Phase 1 — Greedy-LRU dataforts
+## Phase 1 — Greedy-LRU dataforts (Rebel Yell)
 
-A node observes streams flowing past via the existing tail subscription path. If it has spare disk, ACL access, and a scope match, it caches a copy. When disk fills, LRU evicts. Withdraws the capability tag on eviction so reads route elsewhere. **No coordination protocol.** Smallest deferred phase; ships fastest; covers 60–80% of the perceived-durability story without orchestrated replication.
+A node observes streams flowing past via the existing tail subscription path. If it has spare disk, ACL access, a scope match, AND its capability set matches the chain's intent, it caches a copy. When disk fills, LRU evicts. Withdraws the capability tag on eviction so reads route elsewhere. **No coordination protocol.** Smallest Rebel Yell phase; ships fastest; covers 60–80% of the perceived-durability story without orchestrated replication.
 
 ### Scope
 
@@ -112,20 +147,32 @@ A node observes streams flowing past via the existing tail subscription path. If
 - Configurable via `GreedyConfig`:
   ```rust
   pub struct GreedyConfig {
-      pub scopes: Vec<ScopeLabel>,            // e.g. ["scope:industrial-telemetry"]
-      pub proximity_max_rtt: Duration,         // e.g. 200ms
-      pub per_channel_cap_bytes: u64,          // default 100 MB
-      pub total_cap_bytes: u64,                // default 10 GB
-      pub bandwidth_budget_fraction: f32,      // default 0.25 of measured NIC peak
+      pub scopes: Vec<ScopeLabel>,                // e.g. ["scope:industrial-telemetry"]
+      pub proximity_max_rtt: Duration,             // e.g. 200ms
+      pub per_channel_cap_bytes: u64,              // default 100 MB
+      pub total_cap_bytes: u64,                    // default 10 GB
+      pub bandwidth_budget_fraction: f32,          // default 0.25 of measured NIC peak
+      pub intent_match: IntentMatchPolicy,         // default ::AnyOfLocalCapabilities
+      pub colocation_policy: ColocationPolicy,     // default ::SoftPreference (boost score on match)
+  }
+
+  pub enum ColocationPolicy {
+      Ignore,             // colocate-with: tags ignored
+      SoftPreference,     // boost placement scoring on affinity match (default)
+      StrictRequired,     // refuse placement unless target chain is local
   }
   ```
 - Cache substrate: a per-channel RedEX file with a size cap. Caches are normal RedEX files, just owned by the cache layer instead of the application. Reuse v1 retention machinery (`Retention::Bytes`) for the size cap.
-- **Pull condition is a triple AND** (per features-doc spec):
-  1. Scope match — the chain advertises a `scope:` tag matching one of the local node's configured scopes.
-  2. Proximity bound — the chain's home is within `proximity_max_rtt` per the existing proximity graph.
-  3. Storage available — local node decision; LRU eviction when the total cap is hit.
+- **Pull condition is a quintuple AND** (per features-doc spec, extended with Rebel Yell's capability-preference and colocation dimensions):
+  1. **Scope match** — the chain advertises a `scope:` tag matching one of the local node's configured scopes.
+  2. **Proximity bound** — the chain's home is within `proximity_max_rtt` per the existing proximity graph.
+  3. **Capability-preference match (intent-tagged replication)** — the chain advertises an `intent:` tag (e.g. `intent:ml-training`, `intent:sensor-telemetry`, `intent:billing-settlement`); the local node's advertised capability set (`hardware`, `software`, `devices` axes from The Warriors taxonomy) must include capabilities that *fulfill* that intent. Defaults: a GPU-rich node fulfills `intent:ml-training`; an edge node with sensor `devices` tags fulfills `intent:sensor-telemetry`; a stable datacenter node fulfills `intent:billing-settlement`. Concrete intent-to-capability mappings live in a small lookup table (`adapter::net::dataforts::intent`); applications may register custom intents. **This is the dimension that produces emergent specialization** — different node fleets become specialized for different workloads automatically because their capability sets fulfill different intents.
+  4. **Colocation preference (causal-chain affinity)** — if the chain advertises a `colocate-with:<other_origin_hash>` tag and the local node already holds (or already replicates) the target chain, the chain prefers to land here. **Default behavior is a soft scoring boost**, not a hard gate — colocation tilts placement toward affinity but doesn't override capacity constraints. A strict variant `colocate-with-strict:<hash>` is available for hard requirements (refuses placement if target is unavailable). Use cases: chained processing pipelines (`A → B → C` colocated on one node minimizes hops); fork chains colocated with parents for fast lineage walks; cohort chains for multi-channel correlation analytics.
+  5. **Storage available** — local node decision; LRU eviction when the total cap is hit.
 - ACL gating falls through automatically — only chains with valid `subscribe_caps` reach the inbound observe path; the cache layer just inherits.
 - Per-chain advertisement on first cache, withdrawal on full eviction. Phase 0 carries the announcements.
+
+**What this produces:** replication routed by *purpose* AND *affinity*, not just by past usage. Training data gravitates toward GPU nodes regardless of historical read patterns. Sensor data gravitates toward edge nodes regardless of where historical analytics ran. Causally-related chains stay colocated, minimizing cross-node hops for chained processing. Different node fleets become specialized for different workloads automatically; chains that should be processed together stay together automatically.
 
 ### Concrete tasks
 
@@ -160,11 +207,110 @@ Pilot deployment requests "make popular data fast without standing up replica gr
 
 ---
 
-## Phase 2 — Raw RedEX log-segment replication
+## Phase 7 — Generalized 5-axis `PlacementFilter` primitive + Mikoshi integration (The Warriors)
+
+**Placement is a substrate primitive, not a per-feature decision.** The 5-axis filter (scope + proximity + capability-preference + colocation + resource-availability) generalizes from "data placement" to "compute placement" — the same primitive applies to chains (caching), replicas, daemons (Mikoshi migrations), and replica/fork/standby group members. Build it once in The Warriors; everything Rebel Yell composes inherits it; future features (scheduler, mesh-wide load balancing, etc.) reuse it.
+
+### Scope
+
+A trait surface in `behavior::placement` plus integration into Mikoshi's existing migration logic.
+
+```rust
+pub trait PlacementFilter: Send + Sync {
+    /// Score a candidate node for placement of an artifact.
+    /// Returns `None` if the node is ineligible (hard constraint failed);
+    /// returns `Some(score)` where higher = better fit.
+    fn placement_score(&self, target: &NodeId, artifact: &Artifact) -> Option<f32>;
+}
+
+pub enum Artifact<'a> {
+    Chain { origin_hash: [u8; 32], tags: &'a CapabilitySet },
+    Replica { channel: &'a ChannelName, tags: &'a CapabilitySet },
+    Daemon { daemon_id: [u8; 32], required: &'a CapabilitySet, optional: &'a CapabilitySet },
+}
+
+pub struct StandardPlacement {
+    pub scope_filter: Option<Vec<ScopeLabel>>,
+    pub proximity_max_rtt: Option<Duration>,
+    pub intent_match: IntentMatchPolicy,
+    pub colocation_policy: ColocationPolicy,
+    pub resource_axis: ResourceAxis,        // Storage | Compute | Both
+}
+```
+
+The reference implementation `StandardPlacement` evaluates all 5 axes:
+
+1. **Scope** — `scope:` tag match between artifact and target node.
+2. **Proximity** — RTT bound via the existing proximity graph.
+3. **Capability-preference** — `intent:` tag on artifact mapped to required capabilities (`hardware`, `software`, `devices`); target must include all required.
+4. **Colocation** — `colocate-with:` / `colocate-with-strict:` tags on artifact resolved against target's local holdings or already-replicated chains.
+5. **Resource-availability** — varies by artifact:
+   - Chain / Replica → free storage capacity (advertised via `dataforts.free_storage:` tag)
+   - Daemon → free compute capacity (CPU cores, available RAM, GPU/VRAM if required)
+   - Choose via `ResourceAxis::Storage | ResourceAxis::Compute | ResourceAxis::Both`
+
+### Mikoshi integration
+
+Mikoshi today selects migration targets ad-hoc / single-node. After this phase, Mikoshi consults `PlacementFilter` to rank candidate targets:
+
+```rust
+impl Mikoshi {
+    fn select_migration_target(&self, daemon: &Daemon, filter: &dyn PlacementFilter) -> Option<NodeId> {
+        self.candidate_nodes()
+            .filter_map(|node| {
+                filter.placement_score(&node, &Artifact::Daemon {
+                    daemon_id: daemon.id,
+                    required: &daemon.required_capabilities,
+                    optional: &daemon.optional_capabilities,
+                }).map(|score| (node, score))
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Equal))
+            .map(|(node, _)| node)
+    }
+}
+```
+
+Same filter, same scoring, applied to compute placement instead of data placement. Replica/fork/standby groups inherit the same logic for their member-placement decisions.
+
+### Concrete tasks
+
+1. New module `behavior::placement` with `PlacementFilter` trait + `Artifact` enum + `StandardPlacement` reference impl.
+2. `IntentMatchPolicy` + `ColocationPolicy` definitions (used by both Phase 1 in Rebel Yell and this phase in Warriors; declared here, consumed in both).
+3. Intent → required-capabilities lookup table (`adapter::net::placement::intent`), application-extensible.
+4. Mikoshi extended: `Mikoshi::select_migration_target` consults `PlacementFilter`; legacy ad-hoc selection becomes a `LegacyPlacement` impl preserved for backward compatibility under a feature flag.
+5. Replica/fork/standby groups extended to use `PlacementFilter` for member placement.
+6. Bindings: `PlacementFilter`, `StandardPlacement`, `IntentMatchPolicy`, `ColocationPolicy` callable in Node + Python + Go + C bindings. Application-implemented filters cross binding boundary via callback interface (same shape as `BlobAdapter`).
+
+### Test strategy
+
+- **Unit.** `StandardPlacement` returns expected scores for each of the 5 axes independently (turn off the others, vary one). Composability — multi-axis evaluation matches the product of single-axis evaluations.
+- **Mikoshi integration.** Daemon with `required: hardware.gpu` migrates to a GPU node; daemon with `intent:sensor-telemetry` migrates to a node with sensor `devices` tags; daemon with `colocate-with:<chain_X>` migrates to the node holding chain X.
+- **Group placement.** Replica group of size 3 spreads across nodes per `StandardPlacement` scoring; standby group's promote-on-failure picks the highest-scoring surviving member.
+- **Cross-axis composition.** A daemon with `intent:ml-training` AND `scope:experiment-cluster-A` AND `colocate-with:<dataset_chain>` lands on a node satisfying all three, even when individual axes alone would route elsewhere.
+
+### Risks
+
+- **Score function tuning.** The 5-axis weights interact non-trivially. Mitigation: ship sane defaults; expose tunables; add `placement_score_distribution` metrics so operators can see how scores distribute in production.
+- **Backwards compatibility.** Existing Mikoshi migrations must not regress in single-node deployments. Mitigation: legacy fallback under feature flag; migrate-by-default to the new path with an opt-out for one minor version.
+- **Capacity advertisement freshness.** Daemons placed based on `compute_free` tags only as fresh as the announcement throttle. Mitigation: tighter throttle for capacity tags (default 1s) than for chain tags; document the freshness floor.
+
+### Effort
+
+1–2 focused weeks. ~600 LoC core (trait + impl + intent table + Mikoshi integration) + ~600 LoC tests + ~3 days per binding.
+
+### Activation gate
+
+Ships unconditionally with The Warriors. The trait + reference impl + Mikoshi integration are all foundation work — they enable everything Rebel Yell composes on top, plus all current and future placement decisions across the substrate.
+
+---
+
+## Phase 2 — Raw RedEX log-segment replication (RedEX V2, The Warriors)
 
 Orchestrated replication. N replicas of a channel's RedEX file maintained explicitly; configurable replication factor; pull/repair on divergence; documented conflict policy (none expected because RedEX is append-only and seq-ordered, but the protocol must say so explicitly). Strong durability guarantee, in contrast to Phase 1's probabilistic one.
 
-This phase is the heaviest one in the plan because it lands the wire protocol (`SUBPROTOCOL_REDEX`) that v1 explicitly defers and because DST coverage for partition / failover / rejoin is non-negotiable.
+This phase is the heaviest one in the plan because it lands the wire protocol (`SUBPROTOCOL_REDEX`) that v1 explicitly defers and because DST coverage for partition / failover / rejoin is non-negotiable. **It ships in The Warriors release** as a foundation for everything Rebel Yell composes on top — Rebel Yell's gravity, capability-preference replication, and federated reads all assume RedEX V2 is in place.
+
+**Capability-preference integration with Rebel Yell.** When Rebel Yell ships, replica placement uses the same dimensions as Phase 1's greedy filter — scope + proximity + capability-preference (intent matching) + heat. The placement strategy `PlacementStrategy::IntentWeighted` (added in Rebel Yell, not Warriors) routes replicas toward nodes whose capability sets fulfill the chain's `intent:` tag. The Warriors-shipped replication primitive simply needs to expose a placement-policy hook; the intent-matching logic plugs in when Rebel Yell activates.
 
 ### Scope
 
@@ -233,66 +379,85 @@ Workload requesting durability guarantees beyond single-node, where Phase 1's pr
 
 ---
 
-## Phase 3 — Content-addressable blob storage
+## Phase 3 — BlobRef + BlobAdapter hook trait (Rebel Yell)
 
-Independent track from Phases 1–2. Addresses payloads where the streaming-log + INLINE+heap pattern is wrong-shaped — large blobs (≥ MB-class) where chunk-as-event is operationally awkward. Manifest-pointer indirection: RedEX events carry blob hashes, not bytes; blob bytes live in a separate CAS pool.
+**Decision: do not build a substrate-owned blob CAS layer.** The substrate is streaming + coordination + metadata + lineage. Blob storage is a fundamentally different data shape (object PUT/GET, byte-range reads, immutable artifacts). Forcing blob CAS into a streaming substrate creates impedance mismatch.
 
-[`misc/REDEX_MANIFEST_POINTER_DESIGN.md`](misc/REDEX_MANIFEST_POINTER_DESIGN.md) already specifies the on-disk layout. This phase implements it across the mesh.
+**The 2 TB constraint as the design boundary.** Modern server memory ranges from 256 GB (mid-tier) to 8 TB (Epyc 9684X with 12 DIMMs). If a single payload exceeds memory, you're in object-storage territory, not streaming territory. **Net should not transfer what cannot fit in server memory.** For payloads beyond that, integration with the customer's existing object storage (S3, R2, B2, Ceph, IPFS, on-prem ceph cluster, NetApp, Isilon) is the right answer.
+
+This phase delivers integration *hooks*, not a storage system. The substrate carries a content-addressed *reference* through events; bytes live wherever the customer already stores them.
 
 ### Scope
 
-- **Local CAS pool.** Content-addressed by `blake2s-256(blob_bytes)`. Pool sits alongside RedEX segments; per-pool size cap.
-- **Manifest pointer.** `(blob_hash: [u8; 32], blob_size: u64)` embedded in RedEX events instead of inline payload. New `RedexFlags::MANIFEST_POINTER` flag bit. The 40-byte payload region is `[hash..32, size_be..8]`.
-- **Read path.** On event read, if `MANIFEST_POINTER` set → resolve pointer → CAS lookup → return bytes (or stream if `blob_size > stream_threshold`, default 8 MB).
-- **GC.** Blobs ref-counted via the events that point to them; when retention drops the last-referencing event, blob is eligible for eviction. Periodic sweep + per-CAS-pool refcount table.
-- **Mesh-level discovery.** Blobs advertised via `blob:<hash>:<size>` capability tag (Phase 0 variant); fetches route to the nearest holder via the existing capability index.
-- **Optional dedup.** Identical blobs across channels share one CAS entry. Free win since hashes match — but ACL-gated, see open question.
+- **`BlobRef` reference type.** Carried inline in RedEX events when payloads exceed an inline threshold (default 1 MB):
+  ```rust
+  pub struct BlobRef {
+      pub uri: String,    // s3://bucket/key, ceph://cluster/object, file:///path, ipfs://CID, custom
+      pub hash: [u8; 32], // BLAKE3 for content verification on fetch
+      pub size: u64,
+  }
+  ```
+- **`BlobAdapter` trait.** Customer-implemented integration with their preferred storage backend:
+  ```rust
+  pub trait BlobAdapter: Send + Sync {
+      fn store(&self, blob: &[u8]) -> Result<BlobRef>;
+      fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>>;
+      fn fetch_range(&self, blob_ref: &BlobRef, range: Range<u64>) -> Result<Vec<u8>>;
+      fn exists(&self, blob_ref: &BlobRef) -> bool;
+  }
+  ```
+- **Hash verification on fetch.** When a `BlobAdapter::fetch` returns bytes, the substrate verifies the BLAKE3 hash before delivering to the application. Tampering / corruption / wrong-blob-returned all surface as `BlobError::HashMismatch`.
+- **Read path integration.** RedEX events with a `BlobRef` payload route through the adapter on read; events with inline payloads use the existing path. No new RedEX flag required if `BlobRef` is encoded as an event-level type discriminator.
+- **No GC, no refcount, no CAS pool, no blob discovery via capability tags.** All of those are the customer's storage system's responsibility (S3 lifecycle policies, IPFS pinning, Ceph PG management). The substrate stays out of it.
+- **Size threshold.** Configurable per-channel via `ChannelConfig::blob_threshold: u64` (default 1 MB). Below threshold: inline payload as today. Above threshold: caller responsible for storing via `BlobAdapter::store` and emitting an event with the returned `BlobRef`.
+- **Reference adapters provided in the SDK.** Out of the box: `S3Adapter`, `FileSystemAdapter`, `IpfsAdapter`, `NoopAdapter` (for testing). Customers can implement their own for proprietary backends.
 
 ### Concrete tasks
 
-1. New module `adapter::net::redex::blob` with `BlobPool` struct.
-2. Wire `RedexFlags::MANIFEST_POINTER`; encode `(hash, size)` into the existing payload region.
-3. CAS write API: `BlobPool::put(bytes) -> Result<(BlobHash, u64), BlobError>`. Hash + write + advertise.
-4. CAS read API: `BlobPool::get(hash) -> Result<Bytes, BlobError>` (small) and `BlobPool::get_stream(hash) -> impl Stream<Item = Bytes>` (large). Local-first; cap-mesh-fetch on miss.
-5. Mesh fetch: capability-tag query → reliable-stream pull from nearest holder. New `BlobFetch` subprotocol (~200 LoC, 2 dispatch codes: `BLOB_REQUEST`, `BLOB_RESPONSE`).
-6. GC: per-CAS-pool refcount table, decremented on event retention drop. Periodic sweep — gated by `BlobPool::gc_interval` (default 60 s).
-7. RedEX read path: on `MANIFEST_POINTER` flag, resolve via `BlobPool::get` instead of returning inline payload. Existing readers MUST handle the flag transparently — otherwise they corrupt downstream.
-8. Bindings: `BlobPool::put` / `get` / `get_stream` exposed in Node + Python + Go + C bindings. Stream variant in async languages; sync chunked-iterator equivalent in C.
+1. New module `adapter::net::dataforts::blob` with `BlobRef` and `BlobAdapter` definitions.
+2. Encode `BlobRef` as a typed event payload — discriminator byte + serde-encoded URI/hash/size.
+3. Read path: when an event payload deserializes as `BlobRef`, dispatch to the configured `BlobAdapter` for resolution.
+4. Hash verification — `BLAKE3` of the fetched bytes must match the `BlobRef::hash`; return `BlobError::HashMismatch` on divergence.
+5. Reference adapters: `S3Adapter` (uses `aws-sdk-s3`), `FileSystemAdapter` (paths only; opt-in for trusted-host scenarios), `IpfsAdapter` (uses local IPFS daemon HTTP API), `NoopAdapter` (testing).
+6. Bindings: `BlobRef`, `BlobAdapter` callable in Node + Python + Go + C bindings. Customer-implemented adapters cross the binding boundary via callback interfaces.
 
 ### Open design questions
 
-- **Manifest-pointer back-compat.** Existing RedEX files don't have the flag; readers must handle absence cleanly. Already covered by v1 RedEX flag-bit design (unknown flags ignored), but **pin in test**: a pre-Phase-3 reader on a Phase-3-written file produces correct (if uninterpreted) output. A Phase-3 reader on a pre-Phase-3 file produces correct (inline-payload) output.
-- **Dedup vs. ACL.** If two channels have different ACLs but the same blob hash, serving channel A's reader from channel B's deduped blob is a cap-leak risk. **Recommendation:** per-blob ACL pinning — first-writer's `subscribe_caps` is recorded with the blob; subsequent dedupers must match. If they don't, store separately. Cost: dedup hit rate drops in mixed-ACL scenarios; correctness preserved.
-- **Streaming reads of giant blobs.** A 1 GB blob shouldn't materialise in memory. `BlobPool::get_stream` is the answer. Threshold for stream-vs-buffer: default 8 MB, configurable per-pool.
-- **CAS pool size cap interaction with refcount.** Hard cap means evicting a still-referenced blob is forbidden; soft cap admits over-cap with eviction pressure on next sweep. **Recommendation:** hard cap; surface backpressure to writers via `BlobError::PoolFull`.
-- **Hash collision.** Operationally impossible with blake2s-256, but pin assumption with `debug_assert!` on collision-detected-different-bytes.
+- **Range fetch encoding.** Should `BlobAdapter::fetch_range` be in the trait, or should range fetches require multiple full fetches? **Recommendation:** in the trait — most modern blob backends support byte-range natively (S3 GET with Range header, IPFS HTTP, file `seek`); not exposing it leaves performance on the table for video / imagery use cases.
+- **Async vs sync trait.** Customer adapters may need to be async for proper backend integration. **Recommendation:** trait is async (`async fn`); sync adapters wrap with `tokio::task::block_in_place`.
+- **Encryption at rest.** Do we encrypt blob bytes before sending to the adapter, or trust the adapter's own encryption? **Recommendation:** trust the adapter — substrate-level encryption would defeat dedup at the adapter layer (S3 server-side encryption, IPFS encryption-at-rest, etc.). Caller's choice if they need substrate-level on top.
 
 ### Test strategy
 
-- **Unit.** Hash determinism, refcount lifecycle, GC sweeps, evict-while-referenced rejection, pool-full backpressure.
-- **Integration.** 3-node mesh, 1 publisher writes 100 blobs of 10 MB each. Reader on a 4th node fetches all 100; assert routing to the nearest holder; assert no double-fetch (capability tag → single source per fetch).
-- **Stream variant.** 1 GB blob written, streamed read. Memory ceiling stays bounded (< 64 MB for the entire fetch path).
-- **Cross-channel dedup.** Two channels, identical bytes. Assert single CAS entry; ACL-divergent case stores separately.
-- **Failure recovery.** Source holder partitioned mid-fetch; assert reader retries via capability index to a different holder. No partial-blob materialisation.
-- **GC under churn.** Continuous publish + retention-drop loop. Assert refcount converges; no orphaned blobs after sweep; no premature eviction of still-referenced.
+- **Unit.** `BlobRef` round-trip; hash verification fail-fast on tampered bytes; size threshold gating; inline-vs-blob dispatch correctness.
+- **Adapter conformance.** All four reference adapters pass the same conformance test (store → fetch → exists → fetch_range correctness). Customers implementing their own adapters use this suite.
+- **Integration.** 3-node mesh, publisher emits 10 events with 10 MB `BlobRef` payloads to S3-backed `BlobAdapter`. Subscriber on 4th node receives events, resolves `BlobRef`s via local `S3Adapter`, verifies hashes, delivers to app.
+- **Hash mismatch.** Inject corrupted bytes from the adapter; assert `BlobError::HashMismatch` returned, no app delivery.
+- **Backend independence.** Same test suite runs against `S3Adapter`, `FileSystemAdapter`, `IpfsAdapter` — adapter is interchangeable.
 
 ### Risks
 
-- **Blob pool corruption (manifest-pointer points to nothing).** Crash recovery: pool fsck on mesh node startup; orphan blobs purged or quarantined depending on operator policy. Document the recovery semantics.
-- **Refcount drift over time** (rare but theoretically possible under concurrent retention drop). Mitigation: periodic full reconcile pass; quarantine + log on mismatch. Surface as `dataforts_blob_refcount_drift_total` metric.
-- **GC sweep latency.** A 1 TB pool with 10M blobs at 60 s sweep is a real CPU cost. Mitigation: incremental sweep — partition the refcount table; sweep one partition per interval. Defer until pool size telemetry justifies it.
+- **Customer's storage backend becomes a mesh dependency.** If their S3 bucket is misconfigured / their IPFS daemon dies, blob fetches fail. Mitigation: surface adapter health via metrics; document that BlobRef resolution is *not* mesh-resilient — it's the customer's storage layer's responsibility.
+- **URI scheme drift.** Different backends use different URI schemes; standardising is non-goal. Mitigation: `BlobAdapter` is a per-channel-or-per-node config; mismatched URIs surface as `BlobError::UnsupportedScheme`. Caller picks one adapter per deployment.
+- **Hash algorithm churn.** BLAKE3 is the choice today; if it gets superseded, `BlobRef` versioning is needed. Mitigation: reserve a version byte in the encoded form; ignore today, parse on next algorithm.
 
 ### Effort
 
-6–12 focused weeks. ~2500 LoC core + ~2500 LoC tests + significant DST harness work for the GC sweep (~2 weeks). Bindings ~1 week each (stream APIs make this slightly heavier than Phase 0/1).
+**1–2 focused weeks.** ~400 LoC core (trait + ref type + dispatch + hash verify) + ~600 LoC tests + ~400 LoC reference adapters. Bindings ~3 days each (the callback interface for customer-implemented adapters is the only non-trivial cross-binding work).
+
+Down from 6–12 weeks for a full substrate-owned blob CAS. The savings come from not building: the local CAS pool, refcount tracking, GC, blob-discovery wire protocol, dedup logic, ACL-aware blob sharing, and the DST coverage all of those would require.
 
 ### Activation gate
 
-Workload with payloads ≥ MB-class where the inline+heap RedEX pattern is operationally awkward. Concrete triggers: user-uploaded media, model artefacts, large batch-inference outputs.
+Workload with payloads ≥ MB-class. Realistic triggers: customers integrating media / imagery / model-artefact pipelines via the substrate.
 
 ### Independence
 
-Doesn't depend on Phases 1, 2, or 4. Can run in parallel with Phase 2 if the team has bandwidth.
+Doesn't depend on Phases 1, 2, or 4. Can run in parallel with The Warriors if the team has bandwidth.
+
+### Deferred-but-named: full substrate-owned blob CAS
+
+If a customer specifically cannot use any existing blob backend (extreme isolation, novel content-addressed storage requirements, etc.), a full mesh-owned CAS layer remains theoretically possible as a research-grade extension. The original 6–12 week plan for that work is preserved in the doc history. **Not in either Warriors or Rebel Yell.** Activates only if a workload genuinely requires it, which is unlikely.
 
 ---
 
@@ -386,11 +551,35 @@ Application that reads-its-own-writes immediately and finds the eventual-consist
 
 ---
 
-## Phase 6 — Federated query layer (MeshDB)
+## Phase 6 — Federated query primitives (The Warriors) + MeshDB extension (deferred)
 
-Above all storage layers. The capability-tag discovery primitive (Phase 0) makes mesh-level federated reads tractable. This phase formalises them: time-travel, lineage walks, cross-chain joins, aggregate queries — a distributed query substrate sitting above CortEX/NetDB's local query layer.
+This phase splits into two scopes:
 
-**Scope is open-ended.** Park until a workload demands it. Documenting here so the design space is named, the dependency on Phases 0 + 2 is explicit, and the interface seam between local NetDB and mesh-level MeshDB is reserved.
+**Warriors-scope (ships in The Warriors): query primitives over the capability index.**
+
+A small set of composable operators that turn the capability index into a queryable surface. Not a full distributed query language; just the primitives Rebel Yell composes against and any future MeshDB extension would build on. These are the "primitives to build on" that justify The Warriors precursor release.
+
+Concrete operator set (~2–4 weeks of focused work):
+
+- `filter(predicate)` — scan the capability index for tags matching a predicate; uses existing index machinery
+- `match(taxonomy_axis, value)` — type-aware match against `hardware:` / `software:` / `devices:` / `dataforts:` taxonomy
+- `traverse(start_tag, edge)` — walk capability-tag edges (e.g. `fork-of:` parent links) recursively
+- `aggregate(filter, agg)` — counts and aggregations over filter results (no fold required for capability-level aggregates)
+- `nearest(predicate, n)` — top-N by proximity weighting
+
+These compose into the user-facing query language Rebel Yell ships. Example query the Warriors primitives must support:
+
+```
+hardware.gpu AND software.model:llama-3-70b AND dataforts.has_chain:Y AND proximity < 50ms
+```
+
+That is a `match`-then-`filter`-then-`nearest` composition. Operators are composable; there is no SQL surface, just the primitives.
+
+**Rebel Yell extensions on top:** the dual-axis cross-axis query (find by file AND find by hardware in one query) is a use of the Warriors primitives; no new operators needed.
+
+**Deferred-MeshDB scope (parked, not in either release): time-travel, lineage walks, cross-chain joins.**
+
+Above the Warriors primitives sits a more research-grade extension: time-travel queries against historical chain ranges, full lineage-walk traversals via the `fork-of:` and `CausalLink` graph, cross-chain joins with bounded result streaming. Park until a workload genuinely needs it (incident-investigation tooling that needs cross-site joins; replay debugging on retained chain history; aggregate analytics over a fleet). The Warriors primitives reserve the seam; the extension can be designed and shipped without touching the Warriors-scope code.
 
 ### What this would be, sketched
 
@@ -465,43 +654,57 @@ Every phase emits per-channel metrics into the existing `RpcMetricsRegistry` sha
 
 ## Sequencing recommendations
 
-### Reactive shipping (default)
+### The Warriors (precursor release)
 
 ```
-Phase 0 [first activation gate fires]
-  ↓
-Phase 1 ─→ Phase 4 (telemetry-driven)
-  ↓
-Phase 2 ─→ Phase 6 (parked unless query workload)
-  ↓
-Phase 3 (parallel with 2 if bandwidth)
-  ↓
-Phase 5 (slot anywhere — independent)
+Phase 0 — Capability discovery + taxonomy reorganization (2–3 weeks) ┐
+                                                                     ├─→ Warriors release ships
+Phase 6 — Federated query primitives (2–4 weeks)                     │
+                                                                     │
+Phase 2 — RedEX V2 / replication (4–9 weeks; DST gates the timeline) ┘
 ```
 
-### Proactive "Dataforts v0" release
+Wall-clock for The Warriors: **~2–3 months parallelised** with one engineer focused on Phase 2's DST work and another on Phase 0 + 6 in parallel. **~4–5 months serialised** if a single engineer is sequencing all three.
 
-If the team wants to land the cluster as a single product release rather than reactively:
+The Warriors is the *foundation* release. It ships once and earns its place by making everything Rebel Yell composes on top dramatically cheaper. Trying to ship Rebel Yell without first landing Warriors means retrofitting the taxonomy + replication + query primitives per Rebel Yell phase, which multiplies the coordination cost.
+
+### Rebel Yell (Dataforts release)
 
 ```
-Phase 0 (1–2 weeks)                      [unconditional]
-  ↓ parallel
-Phase 1 (1–2 weeks)  ┐
-Phase 2 (4–9 weeks)  ├─→ Phase 4 once Phase 1 ships (1–2 weeks)
-Phase 3 (6–12 weeks) ┘
-  ↓
-Phase 5 (2–4 weeks, anywhere)
+[Warriors must be shipped or partially landed before this starts]
+
+Phase 1 — Greedy-LRU dataforts (1–2 weeks)  ┐
+                                            ├─→ Phase 4 once Phase 1 ships (1–2 weeks)
+Phase 3 — Blob CAS (6–12 weeks; can shift   │   [emergent gravity]
+          parallel with Warriors if         │
+          bandwidth allows)                 │
+                                            │
+Phase 5 — Read-your-writes (2–4 weeks; slot anywhere — independent of replication once Warriors lands)
 ```
 
-Wall-clock for v0: **~2–3 months parallelised** with one engineer per track, **~6–9 months serialised**. The features doc's "2–3 months" estimate matches the parallel-track scenario.
+Wall-clock for Rebel Yell: **~2–3 months parallelised** assuming The Warriors is in place. The headline product win — Dataforts as a 4th capability category, intent-tagged replication, native cross-axis queries — falls out of composing Phase 1 + 4 + Warriors-built primitives.
+
+### Reactive shipping (default — recommended)
+
+**The Warriors should ship reactively but proactively-within-itself.** When a workload activates *any* Warriors phase, ship the whole Warriors release at once because the three phases compose tightly and are foundation-grade. Don't ship Phase 0 alone, Phase 2 alone, or Phase 6-primitives alone — they earn their effort together.
+
+**Rebel Yell ships reactively and phase-by-phase.** Only when a specific Rebel Yell phase has an activation gate firing does the corresponding work happen. Most likely first trigger is Phase 1 (greedy LRU); next likely is Phase 4 (gravity, once Phase 1 telemetry shows skew); Phase 3 (blob CAS) and Phase 5 (RYW) are workload-specific and may never activate.
+
+### Proactive shipping path (only if a pilot demands it)
+
+```
+The Warriors (Q3 2026) ──→ Rebel Yell v0.1 (Q4 2026 / Q1 2027)
+   ↓ unconditional once             ↓ Phase 1 + 4 minimum;
+   any phase activates              Phases 3 + 5 by demand
+```
+
+Wall-clock for the full proactive path: **~5–7 months parallelised** across both releases. **Don't take this path without a concrete pilot.** Speculative replication, speculative blob-CAS, speculative RYW are exactly the kind of premature engineering this plan is structured to avoid.
 
 ### Default recommendation
 
-**Ship reactively.** None of these has a real activation gate today (the compute-marketplace use case explicitly does not need any of it — Postgres handles its queries fine). Build Phase 0 once we have a concrete consumer for any of 1–6, then sequence by demand. Most likely first trigger is Phase 1 (greedy LRU, smallest cost, broadest applicability).
+**Ship Warriors reactively (when any activation gate fires inside it). Ship Rebel Yell phase-by-phase as workloads demand each piece.** The compute-marketplace use case explicitly does not need any of it — Postgres handles its queries fine. The most likely first trigger for Warriors is a pilot wanting durability beyond single-node (Phase 2's gate) or a query workload that needs Phase 6's primitives. The most likely first trigger for Rebel Yell is a pilot wanting cheap data-locality wins (Phase 1's gate).
 
-The temptation to ship Phase 0 + 1 speculatively *is* defensible — they are cheap (~3 weeks combined), they unlock most of the perceived-durability story, and they make every later phase substantially cheaper. If a pilot is on the horizon and Dataforts is plausibly part of it, that's the case for paying the speculative cost.
-
-Anything beyond Phase 0 + 1 should not be built without an active workload requiring it. Speculative replication or blob-CAS is exactly the kind of premature engineering this plan is structured to avoid.
+Anything built without an active workload requiring it is patronage-network discipline failing — exactly the failure mode the substrate's operating philosophy is designed to avoid. The plan exists so that *when* the workload demands the work, the path is clear; until then, none of this gets built.
 
 ---
 
