@@ -19,7 +19,9 @@ Foundation work shipped together:
    - **`hardware`** — what the node *can do* compute-wise (CPU cores, GPU, RAM, NIC, storage)
    - **`software`** — what the node *currently runs* (models loaded, daemons installed, tools available)
    - **`devices`** — semantic role tags (e.g. `printer`, `temperature-sensor`, `brake-controller`, `LIDAR`, `pump`, `valve`)
-2. **Capability-tag discovery primitive.** The `causal:`, `heat:`, `intent:`, `colocate-with:`, `fork-of:` tag shapes plus bloom-filter aggregation. The discovery layer that collapses every later phase's coordination problem.
+2. **Capability-tag discovery primitive + metadata field.** Two parallel mechanisms with distinct purposes:
+   - **Tag set (set-membership, fast):** `causal:`, `heat:`, `scope:`, `fork-of:` tag shapes plus bloom-filter aggregation. The discovery layer that collapses every later phase's coordination problem; queries against tags use the existing capability index at sub-microsecond latency.
+   - **Metadata field (key-value, richer):** new `CapabilitySet::metadata: BTreeMap<String, String>` carrying arbitrary application-defined key-value pairs. Reserved keys consulted by the placement filter: `metadata.intent`, `metadata.colocate-with`, `metadata.colocate-with-strict`, `metadata.priority`, `metadata.owner`. Application-defined keys propagate as opaque pairs. The Kubernetes parallel: tags = labels (set-membership, scheduler-relevant); metadata = annotations (key-value, freeform).
 3. **Federated query primitives.** Composable operators over the capability index — `filter`, `match`, `traverse`, `aggregate`, `nearest`. Not a full MeshDB; just the primitives Rebel Yell composes against.
 4. **Generalized 5-axis `PlacementFilter` primitive + Mikoshi integration.** Placement becomes a substrate primitive applied uniformly to data and compute — same trait scores chain caching, replica placement, and daemon migration. Mikoshi's existing daemon-migration logic gains 5-axis target selection (scope + proximity + capability-preference + colocation + compute-capacity). Replica/fork/standby groups inherit the same primitive for member placement.
 5. **RedEX V2 — raw log-segment replication.** The wire protocol (`SUBPROTOCOL_REDEX`) that v1 explicitly defers. Strong durability beyond single-node. Replica placement uses the `PlacementFilter` primitive shipped above.
@@ -302,20 +304,20 @@ Effort estimate when activated: **1-2 weeks** for the trait + ref type + verific
 
 ### Greedy dataforts (five-axis filter) — feature 21, ships in Rebel Yell
 
-A datafort pulls a chain when **all five** conditions hold:
+A datafort pulls a chain when **all five** conditions hold (the first reads from the fast tag set; the next two read from the chain's metadata field; the last two are local-node decisions):
 
-1. **Scope match.** The chain advertises a `scope:X` label that matches one of the datafort's configured scopes (e.g., `scope:industrial-telemetry`, `scope:webcam-streams`, `scope:settlement`). Operators run focused fleets by configuring scope sets per node.
+1. **Scope match.** The chain advertises a `scope:X` tag (set-membership, fast bloom-filter check) that matches one of the datafort's configured scopes (e.g., `scope:industrial-telemetry`, `scope:webcam-streams`, `scope:settlement`). Operators run focused fleets by configuring scope sets per node.
 2. **Proximity bound.** The chain is within the datafort's configured proximity threshold (e.g., < 200 ms RTT) per the existing proximity graph. Nothing distant gets pulled.
-3. **Capability-preference (intent-tagged replication).** The chain advertises an `intent:` tag (e.g. `intent:ml-training`, `intent:sensor-telemetry`, `intent:billing-settlement`); the local node's advertised capability set (`hardware`, `software`, `devices` from The Warriors taxonomy) must include capabilities that *fulfill* that intent. Defaults: a GPU-rich node fulfills `intent:ml-training`; an edge node with sensor `devices` tags fulfills `intent:sensor-telemetry`; a stable datacenter node fulfills `intent:billing-settlement`.
-4. **Colocation preference (causal-chain affinity).** If the chain advertises a `colocate-with:<other_origin_hash>` tag and the local node already holds that other chain (or its capability tag points here), the chain prefers to land on this node. Causal-chain affinity is a *soft* preference by default — it boosts placement scoring rather than gating outright; a strict variant `colocate-with-strict:<hash>` is available for hard requirements.
+3. **Capability-preference (intent-tagged replication).** The chain's `metadata.intent` value (e.g. `"ml-training"`, `"sensor-telemetry"`, `"billing-settlement"`) is consulted; the local node's advertised capability set (`hardware`, `software`, `devices` from The Warriors taxonomy) must include capabilities that *fulfill* that intent. Defaults: a GPU-rich node fulfills `intent: "ml-training"`; an edge node with sensor `devices` tags fulfills `intent: "sensor-telemetry"`; a stable datacenter node fulfills `intent: "billing-settlement"`.
+4. **Colocation preference (causal-chain affinity).** If the chain's `metadata.colocate-with` value is an origin_hash and the local node already holds that other chain (or replicates it), the chain prefers to land on this node. Causal-chain affinity is a *soft* preference by default — it boosts placement scoring rather than gating outright; the `metadata.colocate-with-strict` variant is available for hard requirements.
 5. **Storage available.** Local node decision; LRU eviction when storage fills.
 
 All five derive from existing primitives:
 
-- **Scope tag, intent tag, colocate-with tag** — capability tags already extensible; new fields under the typed taxonomy.
+- **Scope tag** — capability tag for fast set-membership filtering (existing primitive, no change).
 - **Proximity threshold** — proximity graph already measures it.
-- **Capability fulfillment of intent** — looked up via a small `intent → required capabilities` table in `adapter::net::dataforts::intent`; applications may register custom intents.
-- **Colocation preference** — local capability index already knows which chains the node holds; matching `colocate-with:<hash>` to local presence is a tag lookup, not new infrastructure.
+- **Intent matching** — `metadata.intent` looked up in the `adapter::net::placement::intent` table that maps each intent value to its required capabilities; applications may register custom intents.
+- **Colocation preference** — `metadata.colocate-with` resolved against the local capability index (which chains this node already holds).
 - **Storage check + LRU** — local node decision, no coordination.
 
 What this produces:
