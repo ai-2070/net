@@ -1,0 +1,30 @@
+net/crates/net/docs/misc/DATAFORTS_PLAN.md
+  s_03fa3cc7afe4c8::t_0a78a229314169 554-560,562,564-582
+  s_03fa3cc7afe4c8::t_b6f9a179f233d6 166,170-171,175
+  s_03fa3cc7afe4c8::t_d4ce9a385fd57e 140,142,167-169
+  s_03fa3cc7afe4c8::t_704c37a5143761 52-54
+  s_03fa3cc7afe4c8::t_242f51bb005c66 3,7,9,11,13-42,46,48-51,55,57,61-62
+  s_03fa3cc7afe4c8::t_b3d4b319abf3fb 307,311-313
+  s_03fa3cc7afe4c8::t_1c9e3103fc38d9 56,59,63-64
+  s_03fa3cc7afe4c8::t_6c34e2a4bdddad 210-306
+  s_03fa3cc7afe4c8::t_f3bf5692371860 150-162
+  s_03fa3cc7afe4c8::t_7ec1cc79a34ba1 382,384,386-388,392-413,417-422,426-428,432-436,440-442,446-448,452,456-460
+  s_03fa3cc7afe4c8::t_10dfd6efb4cb3b 74,76-84,86,91
+  s_03fa3cc7afe4c8::t_f4962e0e036643 657-671,674-682,685,687-693,696-698,701,705,707
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "76ff22fdb1bd65696fa2861181218b3654abf0b6",
+  "prompts": {},
+  "sessions": {
+    "s_03fa3cc7afe4c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08ddba21-fadf-4d00-a55b-a3d46774b21e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
