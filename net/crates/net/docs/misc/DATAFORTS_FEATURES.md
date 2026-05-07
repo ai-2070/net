@@ -13,15 +13,16 @@ Of the 28 original wishlist items:
 
 ### The Warriors (precursor) — substrate foundations
 
-Three pieces of foundation work shipped together:
+Foundation work shipped together:
 
 1. **Capability taxonomy reorganization.** The flat capability-tag namespace becomes a typed three-axis ontology:
    - **`hardware`** — what the node *can do* compute-wise (CPU cores, GPU, RAM, NIC, storage)
    - **`software`** — what the node *currently runs* (models loaded, daemons installed, tools available)
    - **`devices`** — semantic role tags (e.g. `printer`, `temperature-sensor`, `brake-controller`, `LIDAR`, `pump`, `valve`)
-2. **Capability-tag discovery primitive.** The `causal:`, `blob:`, `heat:`, `intent:`, `colocate-with:`, `fork-of:` tag shapes plus bloom-filter aggregation. The discovery layer that collapses every later phase's coordination problem.
+2. **Capability-tag discovery primitive.** The `causal:`, `heat:`, `intent:`, `colocate-with:`, `fork-of:` tag shapes plus bloom-filter aggregation. The discovery layer that collapses every later phase's coordination problem.
 3. **Federated query primitives.** Composable operators over the capability index — `filter`, `match`, `traverse`, `aggregate`, `nearest`. Not a full MeshDB; just the primitives Rebel Yell composes against.
-4. **RedEX V2 — raw log-segment replication.** The wire protocol (`SUBPROTOCOL_REDEX`) that v1 explicitly defers. Strong durability beyond single-node.
+4. **Generalized 5-axis `PlacementFilter` primitive + Mikoshi integration.** Placement becomes a substrate primitive applied uniformly to data and compute — same trait scores chain caching, replica placement, and daemon migration. Mikoshi's existing daemon-migration logic gains 5-axis target selection (scope + proximity + capability-preference + colocation + compute-capacity). Replica/fork/standby groups inherit the same primitive for member placement.
+5. **RedEX V2 — raw log-segment replication.** The wire protocol (`SUBPROTOCOL_REDEX`) that v1 explicitly defers. Strong durability beyond single-node. Replica placement uses the `PlacementFilter` primitive shipped above.
 
 ### Rebel Yell (Dataforts) — thin compositional layer
 
