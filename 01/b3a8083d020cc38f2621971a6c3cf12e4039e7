@@ -1,0 +1,19 @@
+net/crates/net/docs/CAPABILITY_SYSTEM_PLAN.md
+  s_03fa3cc7afe4c8::t_fb10de52910ba3 109,111,113-195
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "01b3a8083d020cc38f2621971a6c3cf12e4039e7",
+  "prompts": {},
+  "sessions": {
+    "s_03fa3cc7afe4c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08ddba21-fadf-4d00-a55b-a3d46774b21e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
