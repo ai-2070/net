@@ -478,6 +478,63 @@ Backward compat: daemons that don't override `required_capabilities` / `optional
 
 ---
 
+## Parked extensions
+
+### Negative-point migration (drain signals)
+
+**Concept.** A first-class signal that a section of the proximity map, a metadata key, or a specific node-set is being *evacuated* — daemons hosted there must migrate off; new placements refuse to land. The substrate today expresses placement preferences as positive scores ("score this candidate higher"); negative-point migration adds the explicit negative signal ("score this candidate as `-∞` and migrate anything currently here").
+
+**Use cases (industrial / logistics):**
+
+- **Factory section shutdown.** A line goes down for maintenance; all daemons running on its proximity zone need to migrate before the shutdown window. Operator marks the zone as draining; substrate triggers migrations of every affected daemon to non-draining nodes, completes within the maintenance lead time, and refuses new placements during the window.
+- **Ship leaving port after loading.** Cargo loading complete; the ship's operational context shifts from shore-side infrastructure to onboard. Daemons running on dockside nodes that were attached to this ship's load-out get drained; daemons that need to follow the ship to sea migrate onto onboard nodes (or vice versa, depending on which side initiated the relationship).
+- **Car departing the factory.** A vehicle finishes assembly. Daemons running on factory infrastructure for that car either complete (work is done), migrate to vehicle infrastructure (continued telemetry on the road), or shut down. The "departing" signal triggers the right action per daemon based on its `metadata.evacuate_action` policy.
+- **Server maintenance window.** Operator marks specific nodes as draining; existing daemons migrate; new placements refuse the drained nodes; window completes; nodes un-mark; placements resume.
+- **Spot-instance pre-emption.** Cloud spot-instance reclaim notice triggers a drain signal on that node; daemons migrate before reclaim; the substrate handles it as a graceful drain rather than an unexpected failure.
+- **Disaster scenarios.** A region marked as compromised triggers evacuation of all daemons to non-compromised regions. Manual or automated based on operator-configured thresholds.
+
+**Implementation sketch (when activated, not before):**
+
+Two negative-signal shapes ride on the existing capability-tag and metadata machinery:
+
+1. **Negative proximity.** A proximity-zone tag carries a `draining` annotation:
+   ```
+   scope:factory-floor-A
+   metadata.scope.factory-floor-A.draining = "true"
+   metadata.scope.factory-floor-A.drain_deadline = "2026-06-15T18:00:00Z"
+   ```
+   The placement filter sees the draining annotation and returns `None` (ineligible) for any candidate node within that zone. Existing daemons in the zone get notified via a new `MeshDaemon::on_drain_signal()` callback; they have until `drain_deadline` to gracefully migrate or complete.
+
+2. **Negative metadata.** A daemon's metadata can carry an evacuation flag:
+   ```
+   metadata.evacuate = "true"
+   metadata.evacuate_reason = "vessel-departing"
+   metadata.evacuate_target = "compute.onboard.*"  // optional placement hint
+   metadata.evacuate_deadline = "2026-06-12T08:00:00Z"
+   metadata.evacuate_action = "migrate" | "complete" | "shutdown"
+   ```
+   The Mikoshi placement scheduler watches for evacuation flags and triggers migration, completion, or shutdown per the `evacuate_action` value, with the optional `evacuate_target` as a placement hint passed to `PlacementFilter`.
+
+**`DrainCoordinator` daemon (parked design).** Substrate-level coordinator that:
+
+- Listens for `draining` annotations on scope tags and `evacuate` metadata flags
+- Enumerates affected daemons via the capability index
+- Triggers Mikoshi migrations in batches (rate-limited so the source zone doesn't melt during evacuation)
+- Reports drain progress via metrics (`dataforts_drain_in_flight`, `dataforts_drain_completed_total`, `dataforts_drain_deadline_missed_total`)
+- Surfaces operator-visible status: "12 daemons drained, 3 in flight, deadline T-30s"
+
+**Why this is parked:**
+
+1. **Current substrate workloads don't need it yet.** The compute marketplace doesn't have planned-drain semantics; Rebel Yell's greedy filter handles graceful unavailability via the standard withdrawal path.
+2. **Mikoshi v2 territory.** Negative-point migration composes cleanly with delta-based migration, placement re-evaluation under capacity drift, and other Mikoshi v2 features. Lands together in Atomic Playboys (per `RELEASE_ROADMAP.md`'s candidates) rather than spread across releases.
+3. **Real industrial pilots will define the operator semantics.** What does "drain deadline missed" mean operationally — alert? force-migrate to any node? abandon and let the daemon die? These are policy questions that need real-world workloads (factory floors, port operations, fleet management) to answer correctly. Designing in advance produces strawman-grade abstractions; designing alongside a pilot produces real ones.
+
+**Activation gate:** an industrial-telemetry pilot or operations-mature deployment requesting planned-drain semantics. Likely candidates: TSMC-tier semiconductor fab floors (line-shutdown windows), midstream pipeline operators (geographic evacuation during disasters), AV / robotics fleets (vehicle handoff between infrastructure zones).
+
+When activated, ships in the same release as Mikoshi v2 (`PlacementFilter` re-evaluation under capacity drift) — they're complementary signals into the same coordinator.
+
+---
+
 ## Phasing
 
 Eight phases in dependency order:
