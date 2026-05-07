@@ -754,7 +754,7 @@ function ArpanetMapBg() {
       <g
         fill="none"
         stroke="#c4ff3d"
-        strokeWidth="1"
+        strokeWidth="0.72"
         strokeOpacity="1"
         strokeLinejoin="round"
         strokeLinecap="round"
