@@ -7,11 +7,34 @@
 Of the 28 original wishlist items:
 
 - **~25 ship today or fall out of existing primitives** — RedEX, CortEX, NetDB, capability announcements, proximity graph, daemon replica/standby/fork groups + Mikoshi, causal chains, AuthGuard.
-- **4 are genuinely deferred** — all clustered around raw RedEX storage-layer replication and data-gravity meta-routing.
+- **The remainder ships across two coordinated releases:** **The Warriors** (precursor — substrate foundations) and **Rebel Yell** (Dataforts — thin compositional layer on top of The Warriors).
 
-**Dataforts is not a separate product to build.** It is mostly *naming and packaging* what already exists, plus a focused storage-replication addition that is parked until a real workload requires it.
+**Dataforts is not a separate product to build.** It is mostly *naming and packaging* what already exists, plus targeted foundation work in The Warriors and a thin compositional layer in Rebel Yell. After The Warriors lands, Dataforts becomes **just a 4th capability category** (alongside `hardware`, `software`, `devices`) rather than a separate architectural component.
 
-One design move collapses much of the deferred work: **causal chains advertised as capability tags**. A node holding (or willing to serve) a chain emits a `causal:origin_hash[:tip_seq]` capability tag, and every existing primitive (proximity graph, AuthGuard, capability index, hierarchical summarization) handles propagation, ACL gating, and lookup with no new wire protocol. Discovery for replication, greedy caching, data gravity, and blob CAS reduces to a capability-index query. See "Discovery primitive: causal chains as capability tags" below.
+### The Warriors (precursor) — substrate foundations
+
+Three pieces of foundation work shipped together:
+
+1. **Capability taxonomy reorganization.** The flat capability-tag namespace becomes a typed three-axis ontology:
+   - **`hardware`** — what the node *can do* compute-wise (CPU cores, GPU, RAM, NIC, storage)
+   - **`software`** — what the node *currently runs* (models loaded, daemons installed, tools available)
+   - **`devices`** — semantic role tags (e.g. `printer`, `temperature-sensor`, `brake-controller`, `LIDAR`, `pump`, `valve`)
+2. **Capability-tag discovery primitive.** The `causal:`, `blob:`, `heat:`, `intent:`, `colocate-with:`, `fork-of:` tag shapes plus bloom-filter aggregation. The discovery layer that collapses every later phase's coordination problem.
+3. **Federated query primitives.** Composable operators over the capability index — `filter`, `match`, `traverse`, `aggregate`, `nearest`. Not a full MeshDB; just the primitives Rebel Yell composes against.
+4. **RedEX V2 — raw log-segment replication.** The wire protocol (`SUBPROTOCOL_REDEX`) that v1 explicitly defers. Strong durability beyond single-node.
+
+### Rebel Yell (Dataforts) — thin compositional layer
+
+After The Warriors, Dataforts is just a 4th capability category. Storage capacity + hosted causal chains are advertised via the same tag namespace as compute capabilities. The remaining phases compose against the foundations:
+
+- **Greedy-LRU dataforts** — five-axis filter (scope + proximity + capability-preference + colocation + storage); intent-tagged replication; specialized fleets emerge organically
+- **Data gravity** — heat-counter annotations on capability tags; gravity emerges from greedy + heat + capability-preference automatically
+- **BlobRef hook trait** — substrate carries a content-addressed *reference* through events; bytes live in the customer's existing storage layer (S3, Ceph, IPFS, on-prem); no built-in blob CAS to operate
+- **Read-your-writes** — optional, post-replication, session-bounded consistency
+
+Post-Rebel-Yell capability ontology: **four orthogonal axes** (`hardware`, `software`, `devices`, `dataforts`) all queryable via the same federated query primitives. A user can issue a single composable query like `hardware.gpu AND software.model:llama-3-70b AND dataforts.has_chain:Y AND proximity < 50ms` — that's the visible product win.
+
+One design move collapses much of the deferred work: **causal chains advertised as capability tags**. A node holding (or willing to serve) a chain emits a `causal:origin_hash[:tip_seq]` capability tag, and every existing primitive (proximity graph, AuthGuard, capability index, hierarchical summarization) handles propagation, ACL gating, and lookup with no new wire protocol. Discovery for replication, greedy caching, data gravity, and blob references all reduces to a capability-index query. See "Discovery primitive: causal chains as capability tags" below.
 
 ## The primitives that cover most of the wishlist
 
@@ -209,16 +232,16 @@ Trade-offs to handle:
 
 The features below are the actual scope of future "Dataforts" work, all clustered around storage-layer replication and data-gravity meta-routing. Each assumes the capability-tag discovery primitive above.
 
-### Raw RedEX log-segment replication across nodes (covers items 9, 10, 17 narrow cases)
+### Raw RedEX log-segment replication across nodes — RedEX V2 (ships in The Warriors)
 
-`REDEX_PLAN.md` v1 explicitly defers replication. The plan: "Replication (distributed RedEX) — not planned yet. Needs real single-node usage, a clear DST story, and concrete requirements from pilots before we design it."
+`REDEX_PLAN.md` v1 explicitly defers replication. The plan: "Replication (distributed RedEX) — not planned yet. Needs real single-node usage, a clear DST story, and concrete requirements from pilots before we design it." **The Warriors release is where this lands** as the foundation Rebel Yell composes against.
 
 When this ships, it covers:
 - Auto-replicating storage segments to peers for durability beyond the local node
 - Overflow of storage to mesh peers when local disk fills
 - Recovery from node failure at the *storage* layer (the daemon layer is already covered)
 
-The design will likely ride on `ChannelPublisher` / `SubscriberRoster` / the causal-chain machinery already in core. Estimated effort when activated: 6-12 weeks of focused work, additive to RedEX rather than a redesign.
+The design rides on `ChannelPublisher` / `SubscriberRoster` / the causal-chain machinery already in core, plus a new `SUBPROTOCOL_REDEX` for replication wire messages. Estimated effort when activated: 4-9 focused weeks (DST harness work gates the timeline). The placement strategy hook surface is built into Warriors; the intent-matching and colocation-preference logic plug in when Rebel Yell activates.
 
 ### Data gravity (emergent from greedy + heat counters) — feature 19
 
@@ -240,49 +263,85 @@ RYW would require:
 - Read path that waits for `seq >= last_write_seq` before returning
 - Trade-off documentation (latency vs. RYW guarantee)
 
-### Content-addressable blob storage layer (covers items 12 and 16 large-payload cases)
+### BlobRef + BlobAdapter hook trait (covers items 12 and 16 large-payload cases) — ships in Rebel Yell
 
-For workloads where individual chunks are large, the streaming-log + INLINE+heap pattern is wrong-shaped. A separate blob store with manifest-pointer indirection from RedEX events is the design — see `REDEX_MANIFEST_POINTER_DESIGN.md`.
+**Decision: do not build a substrate-owned blob CAS layer.** The substrate is streaming + coordination + metadata + lineage. Blob storage is a fundamentally different data shape (object PUT/GET, byte-range reads, immutable artifacts). Forcing blob CAS into a streaming substrate creates impedance mismatch.
 
-This is the single most concrete deferred work. Until then, RedEX's existing payload model is sufficient.
+**The 2 TB constraint as design boundary.** Modern server memory ranges from 256 GB (mid-tier) to 8 TB (Epyc 9684X). If a single payload exceeds memory, you're in object-storage territory, not streaming territory. Net should not transfer what cannot fit in server memory.
 
-### Greedy dataforts (scope-bounded, proximity-bounded, LRU caching) — feature 21
+**The architectural separation:**
 
-A datafort pulls a chain when **all three** conditions hold:
+- **Streaming + coordination + metadata + lineage** → the substrate's job
+- **Blob storage + bandwidth + replication of large objects** → the customer's existing storage layer (S3, R2, B2, IPFS, Ceph, NetApp, Isilon, on-prem)
 
-1. **Scope match.** The chain's capability tag includes a `scope:X` label that matches one of the datafort's configured scopes (e.g., `scope:industrial-telemetry`, `scope:webcam-streams`, `scope:settlement`). Operators run focused fleets by configuring scope sets per node.
+Net carries a content-addressed *reference* (URI + hash + size) through events; bytes live in the customer's existing system. Verification happens at fetch time via the hash.
+
+**The hook design:**
+
+```rust
+pub trait BlobAdapter: Send + Sync {
+    fn store(&self, blob: &[u8]) -> Result<BlobRef>;
+    fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>>;
+    fn fetch_range(&self, blob_ref: &BlobRef, range: Range<u64>) -> Result<Vec<u8>>;
+    fn exists(&self, blob_ref: &BlobRef) -> bool;
+}
+
+pub struct BlobRef {
+    pub uri: String,    // s3://, ceph://, file://, ipfs://, custom
+    pub hash: [u8; 32], // BLAKE3 for content verification on fetch
+    pub size: u64,
+}
+```
+
+Customer implements `BlobAdapter` against their preferred backend. Net carries the `BlobRef` through events; never touches bytes; never owns the storage. The semi-imagery / seismic / lidar / video use cases are still served — just via hooks to existing storage rather than a substrate-owned blob pool.
+
+Effort estimate when activated: **1-2 weeks** for the trait + ref type + verification helpers + tests + bindings. Down from 6-12 weeks for a full blob CAS implementation.
+
+(A full blob CAS layer remains theoretically possible as a research-grade extension if a customer specifically can't use any existing blob backend. Unlikely, and explicitly not in either Warriors or Rebel Yell.)
+
+### Greedy dataforts (five-axis filter) — feature 21, ships in Rebel Yell
+
+A datafort pulls a chain when **all five** conditions hold:
+
+1. **Scope match.** The chain advertises a `scope:X` label that matches one of the datafort's configured scopes (e.g., `scope:industrial-telemetry`, `scope:webcam-streams`, `scope:settlement`). Operators run focused fleets by configuring scope sets per node.
 2. **Proximity bound.** The chain is within the datafort's configured proximity threshold (e.g., < 200 ms RTT) per the existing proximity graph. Nothing distant gets pulled.
-3. **Storage available.** Local node decision; LRU eviction when storage fills.
+3. **Capability-preference (intent-tagged replication).** The chain advertises an `intent:` tag (e.g. `intent:ml-training`, `intent:sensor-telemetry`, `intent:billing-settlement`); the local node's advertised capability set (`hardware`, `software`, `devices` from The Warriors taxonomy) must include capabilities that *fulfill* that intent. Defaults: a GPU-rich node fulfills `intent:ml-training`; an edge node with sensor `devices` tags fulfills `intent:sensor-telemetry`; a stable datacenter node fulfills `intent:billing-settlement`.
+4. **Colocation preference (causal-chain affinity).** If the chain advertises a `colocate-with:<other_origin_hash>` tag and the local node already holds that other chain (or its capability tag points here), the chain prefers to land on this node. Causal-chain affinity is a *soft* preference by default — it boosts placement scoring rather than gating outright; a strict variant `colocate-with-strict:<hash>` is available for hard requirements.
+5. **Storage available.** Local node decision; LRU eviction when storage fills.
 
-That's the full spec. Three conditions, AND'd together, all from existing primitives:
+All five derive from existing primitives:
 
-- **Scope tag** — capability tags already extensible; just adds a `scope:` field.
+- **Scope tag, intent tag, colocate-with tag** — capability tags already extensible; new fields under the typed taxonomy.
 - **Proximity threshold** — proximity graph already measures it.
+- **Capability fulfillment of intent** — looked up via a small `intent → required capabilities` table in `adapter::net::dataforts::intent`; applications may register custom intents.
+- **Colocation preference** — local capability index already knows which chains the node holds; matching `colocate-with:<hash>` to local presence is a tag lookup, not new infrastructure.
 - **Storage check + LRU** — local node decision, no coordination.
 
 What this produces:
 
-- **Specialized fleets emerge organically.** Industrial-telemetry dataforts cluster around sensor sources; webcam dataforts cluster around streaming hubs; settlement dataforts cluster around marketplace coordinators. Each fleet has scope coherence + proximity locality without central coordination.
-- **Bounded storage growth.** A datafort's storage usage is bounded by its proximity zone × scope filter — never unbounded global hoarding.
+- **Specialized fleets emerge organically.** GPU-rich nodes cluster around `intent:ml-training` chains; edge nodes cluster around `intent:sensor-telemetry`; stable datacenter nodes cluster around `intent:billing-settlement`. Each fleet has scope coherence + intent fit + proximity locality without central coordination.
+- **Causal-chain neighborhoods stay local.** A daemon transforming chain A → chain B → chain C, with `colocate-with:` annotations on B and C pointing to A, ends up running its full pipeline on one node. Cross-node hops minimized for related work.
+- **Replication routes by purpose, not just past usage.** Training data gravitates toward GPU nodes regardless of historical reads. Sensor data gravitates toward edge nodes regardless of historical analytics. The substrate self-organizes around utility.
+- **Bounded storage growth.** A datafort's storage usage is bounded by `scope ∩ proximity ∩ intent-fit` — never unbounded global hoarding.
 - **Bandwidth efficiency.** Only pulls chains it can usefully serve.
-- **ACL falls out for free.** Only nodes with `subscribe_caps` can decrypt advertisements; only matching scopes can pull. AuthGuard gates without additional logic.
+- **ACL falls out for free.** Only nodes with `subscribe_caps` can decrypt advertisements; only matching scopes + intent fits can pull. AuthGuard gates without additional logic.
 
-When combined with **heat counters annotated on capability tags** (see "Data gravity" above), the system also produces emergent gravity: high-heat in-scope chains attract more in-zone replicas; reads stop crossing zones; chains "gravitate" to where they're consumed.
+When combined with **heat counters annotated on capability tags** (see "Data gravity" above), the system also produces emergent gravity: high-heat in-scope, in-intent chains attract more in-zone replicas; reads stop crossing zones; chains gravitate to where they're consumed AND where the work the data enables actually happens.
 
 Trade-offs vs. orchestrated replication:
 
-| Property | Greedy (scope + proximity + LRU) | Orchestrated replicas |
+| Property | Greedy (5-axis) | Orchestrated replicas |
 |---|---|---|
 | Coordination | None | Replica-set membership, leader/follower |
-| Durability guarantee | Probabilistic (depends on scope + proximity coverage) | Strong (configurable replication factor) |
-| Bandwidth | Only chains in-scope and in-proximity | Push to all replicas regardless of demand |
-| Where data lands | Wherever scope + proximity + LRU put it | Configured/policy-driven |
-| Storage cost | Self-limiting (LRU evicts within scope×proximity bound) | Bounded by replica factor |
-| Best for | Read-heavy in-scope data with locality | Durability-critical write paths |
+| Durability guarantee | Probabilistic (depends on coverage of all five axes) | Strong (configurable replication factor) |
+| Bandwidth | Only chains matching all five filters | Push to all replicas regardless of demand |
+| Where data lands | Wherever scope ∩ proximity ∩ intent ∩ colocation puts it | Configured/policy-driven |
+| Storage cost | Self-limiting (LRU evicts within filter intersection) | Bounded by replica factor |
+| Best for | Read-heavy purpose-aware data with locality | Durability-critical write paths |
 
-Complementary, not redundant. Greedy + heat-counters cover ~98% of "make data fast and locally available" use cases automatically. Orchestrated replication covers the durability-critical 2% that need stronger guarantees.
+Complementary, not redundant. Greedy + heat-counters cover ~98% of "make data fast and locally available where it'll be used" use cases automatically. Orchestrated replication covers the durability-critical 2% that need stronger guarantees.
 
-Effort estimate when activated: ~1-2 weeks. The scope filter and proximity gate are config knobs over the existing capability index; the LRU cache is a local data structure; no coordination protocol needed.
+Effort estimate when activated: ~1-2 weeks. All five filters are config knobs over the existing capability index; the LRU cache is a local data structure; no coordination protocol needed. The intent → capabilities lookup table is application-extensible.
 
 ---
 
