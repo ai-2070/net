@@ -28,15 +28,14 @@ Four load-bearing reasons:
 
 ## What ships
 
-Seven interlocking pieces:
+Six interlocking pieces:
 
 1. **Typed taxonomy reorganization** — flat tag namespace becomes the four-axis ontology (`hardware`, `software`, `devices`, `dataforts`).
-2. **Tag shapes for the discovery primitive** — `causal:`, `causal:tip_seq`, `causal:[range]`, `fork-of:`, `heat:` plus the existing `scope:`.
-3. **Capability folds (`CapabilityFold` trait)** — substrate primitive that subsumes bloom-filter aggregation, gateway hierarchical summarization, prefix-based "folder" grouping, and custom application aggregations into one composable trait. Mirror of the CortEX fold pattern applied to capability announcements. Built-in folds: `AxisFold`, `PrefixFold`, `PatternFold`, `ChainFold`, `ProximityFold`, `AggregateCounterFold`.
-4. **Metadata field on `CapabilitySet`** — new `BTreeMap<String, String>` for richer key-value annotations. Reserved keys (`intent`, `colocate-with`, `colocate-with-strict`, `priority`, `owner`); application-defined keys propagate as opaque pairs.
-5. **Federated query primitives** — five operators (`filter`, `match`, `traverse`, `aggregate`, `nearest`) that compose into the user-facing query language Rebel Yell ships, plus the predicate language (numeric / semver / string / metadata predicates with boolean composition).
-6. **`PlacementFilter` trait + `StandardPlacement` reference implementation** — substrate-level placement primitive that scores candidate nodes for any artifact using the 5-axis filter.
-7. **Mikoshi integration** — `Mikoshi::select_migration_target` consults `PlacementFilter`. Legacy ad-hoc selection preserved as `LegacyPlacement` under a feature flag for one minor version.
+2. **Tag shapes for the discovery primitive** — `causal:`, `causal:tip_seq`, `causal:[range]`, `fork-of:`, `heat:` plus the existing `scope:`. Bloom-filter aggregation for nodes holding many tags.
+3. **Metadata field on `CapabilitySet`** — new `BTreeMap<String, String>` for richer key-value annotations. Reserved keys (`intent`, `colocate-with`, `colocate-with-strict`, `priority`, `owner`); application-defined keys propagate as opaque pairs.
+4. **Federated query primitives** — five operators (`filter`, `match`, `traverse`, `aggregate`, `nearest`) that compose into the user-facing query language Rebel Yell ships, plus the predicate language (numeric / semver / string / metadata predicates with boolean composition).
+5. **`PlacementFilter` trait + `StandardPlacement` reference implementation** — substrate-level placement primitive that scores candidate nodes for any artifact using the 5-axis filter.
+6. **Mikoshi integration** — `Mikoshi::select_migration_target` consults `PlacementFilter`. Legacy ad-hoc selection preserved as `LegacyPlacement` under a feature flag for one minor version.
 
 What this doc does NOT ship (deferred):
 
@@ -107,93 +106,18 @@ Application-defined keys propagate through the substrate as opaque pairs. The pl
 
 **Why split tags vs. metadata.** Tags stay fast because they're set-membership over a bounded namespace (the bloom filter handles 10K+ chains in 500 KB). Metadata can be richer because it's not on the routing hot path; lookups happen during placement decisions, not per-routing-hop. Applications can put arbitrary keys in metadata without polluting the tag namespace shared across the substrate.
 
-### 4. Capability folds (`CapabilityFold` trait)
+### 4. Bloom-filter aggregation
 
-Aggregation across the capability layer — bloom-filter compression, hierarchical summarization at gateways, prefix-based "folder" grouping, custom application-defined aggregations — collapses into one substrate primitive: **`CapabilityFold`**, applying the same fold pattern CortEX uses for RedEX events to capability announcements.
+For nodes holding many `causal:` advertisements (and other reserved-prefix tags), enumeration becomes expensive. Add an optional `chain_bloom: Option<BloomFilter>` field on `CapabilitySet`.
 
-**Why fold.** Without this, the substrate has three separate aggregation mechanisms (bloom filter, gateway summarization, ad-hoc per-feature aggregation) that each invent their own propagation logic. With one trait, all aggregation becomes composable, application-extensible, and recursive. The fold pattern also reinforces the architectural symmetry with CortEX (`CortexFold` over RedEX events ↔ `CapabilityFold` over capability announcements).
+- **Threshold.** Default 256 tags before switching to bloom-filter mode. Configurable via `CapabilityAnnouncementPolicy`.
+- **Target sizing.** 10K chains in ≤ 500 KB at ≤ 1% false-positive rate.
+- **Probe pattern.** Nodes that match the bloom probe with a follow-up precise `causal:<hex>` lookup before issuing a real read; false positives become recoverable misses, not correctness bugs.
+- **Propagation cost.** ≤ 2× current capability-announcement budget under saturating tag growth. Pin via the existing announcement-budget regression test (the three-layer enforcement detailed in the Test strategy section).
 
-**Trait surface.** Lives in `behavior::capability::fold`.
+**Hierarchical summarization at gateways** stays a separate, well-understood mechanism (per the README's "Scale" invariant): gateway nodes aggregate health, compress capability summaries, and propagate state for their subnet. A distant node observes the gateway and derives the rest. The bloom filter handles per-node many-tag aggregation; gateway summarization handles cross-subnet aggregation. Two clear mechanisms, both familiar to operators.
 
-```rust
-pub trait CapabilityFold: Send + Sync {
-    type State: Default + Send + Sync;
-    type Summary: Send + Sync + Clone;
-
-    /// Apply an incoming announcement to the local state.
-    fn apply(&self, state: &mut Self::State, source: NodeId, ann: &CapabilityAnnouncement);
-
-    /// Produce a propagatable summary from the current state.
-    fn summarize(&self, state: &Self::State) -> Self::Summary;
-
-    /// Merge two summaries. MUST be associative (required for fold-of-folds at gateways).
-    fn merge(&self, a: Self::Summary, b: Self::Summary) -> Self::Summary;
-
-    /// Optional: probe a summary for membership / drill-down.
-    /// Default impl returns `false` (summaries are opaque); rich folds override.
-    fn probe(&self, _summary: &Self::Summary, _query: &ProbeQuery) -> bool { false }
-}
-```
-
-**Built-in folds (ship with The Warriors):**
-
-| Fold | Purpose | Summary type |
-|---|---|---|
-| `AxisFold` | Group by taxonomy axis (`hardware:*`, `software:*`, `devices:*`, `dataforts:*`). Default fold — every node runs it. | Per-axis bloom filter + count + last-seen |
-| `PrefixFold<P>` | "Folder" semantics — group all tags under prefix `P` (`hardware.gpu.*`, `software.daemon:vllm.*`, etc.). | Bloom filter scoped to prefix + aggregate stats |
-| `PatternFold<G>` | Glob-pattern variant of PrefixFold (`devices.*.sensor.*`). | Same as PrefixFold |
-| `ChainFold` | Aggregate `causal:*` advertisements. Subsumes the bloom-filter-aggregation logic — `ChainFold`'s implementation IS the bloom filter at 256-tag threshold. | Chain bloom filter (10K chains in ≤ 500 KB at ≤ 1% FPR) |
-| `ProximityFold<R>` | Only fold tags from nodes within RTT R. A gateway summarizes its subnet without including distant peers. | Same as wrapped fold; restricted scope |
-| `AggregateCounterFold<K>` | Sum / average / max / min of numeric tag values within a fold scope. Useful for "total free storage advertised in this subnet" or "total compute capacity by intent." | Numeric aggregate + count + percentile sketch |
-
-**Custom application folds.** Applications register their own via `Mesh::register_capability_fold`. Same shape as registering a CortEX fold against a RedEX file. Lets workloads define domain-specific aggregations without modifying the substrate.
-
-**Folder analogy made literal.** "Folders" in the user-facing sense map to `PrefixFold` / `PatternFold`:
-
-```rust
-// "Folder: /hardware/gpu/*"
-let gpu_fold = PrefixFold::new("hardware.gpu");
-
-// "Folder: /software/daemon/*"
-let daemon_fold = PrefixFold::new("software.daemon");
-
-// "Nested folder: /devices/*/sensor/*"
-let sensor_fold = PatternFold::new("devices.*.sensor.*");
-
-// "Aggregate counter: total free storage in this subnet"
-let storage_fold = AggregateCounterFold::new("dataforts.free_storage_gb", AggOp::Sum);
-```
-
-Each "folder" is a fold with its own state and summary. Querying the folder returns the summary; drilling down via `Mesh::probe_summary` returns the underlying tags.
-
-**Propagation behavior:**
-
-- A node folds incoming announcements into local state per registered fold.
-- Periodically (or on threshold), it emits its **summary** instead of (or in addition to) raw tags.
-- A gateway folds the summaries from its subnet into a higher-level summary — fold-of-folds, associative via the `merge` operator.
-- Distant nodes see the gateway's summary; if they need details, they drill down via a follow-up precise query (`Mesh::probe_summary` returns underlying tags or routes the probe to the gateway that originally summarized).
-
-**Specific behaviors that fall out of the fold framework:**
-
-- **Bloom-filter aggregation** for chain advertisements is now `ChainFold`'s implementation. The 256-tag threshold, 10K-chains-in-500KB target, ≤ 1% FPR — all properties of `ChainFold`, not of the substrate as a whole. Other folds may use bloom filters too (e.g., `PrefixFold` does for member sets), but the choice is per-fold, not global.
-- **Hierarchical summarization at gateways** is a `ProximityFold` wrapping an `AxisFold` (or any other fold), registered by the gateway. The gateway aggregates per-subnet; distant nodes see the aggregated view. No special-cased gateway code; just a fold composition.
-- **Probe-then-precise lookup** is the `probe` method on the trait. A bloom filter answers "this chain might exist here"; the precise lookup follows up with a full read.
-- **Propagation cost bound** — Layer 1 of the announcement-budget enforcement (the pinned CI test) covers all folds collectively; the test runs with the default fold set registered (AxisFold + ChainFold), and any custom fold added later must keep total summary size ≤ 2× the pre-Warriors baseline at saturation.
-
-**Where folds run.**
-
-- **All nodes** run `AxisFold` by default — every node maintains the four taxonomy-axis summaries of its peers.
-- **Gateway nodes** run `ProximityFold` wrapping the standard set, summarizing their subnet for distant peers.
-- **Application-specific nodes** run custom folds registered via `Mesh::register_capability_fold`.
-- A node that doesn't run a particular fold simply forwards announcements raw; the fold runs wherever it's registered.
-
-**Implications for downstream work:**
-
-- The `ChainFold` summary IS what Phase 1 of Rebel Yell (greedy LRU dataforts) consumes when querying for chain holders within proximity. The fold structure means Rebel Yell doesn't see "raw tag list vs bloom filter" as two different code paths; it queries the fold's `probe` method and gets a uniform answer.
-- Future MeshDB extension (Atomic Playboys candidate) builds on the same fold primitive — its time-travel and lineage-walk operators are themselves expressible as custom folds (one for chain seq-ranges, one for `fork-of:` graph traversal).
-- The federated mesh-wide scheduler (also Atomic Playboys) folds compute-availability summaries for its rebalancing decisions — same primitive.
-
-The fold trait pays for itself across the substrate's roadmap. Building it now in The Warriors collapses three deferred design decisions into one primitive, plus reinforces the architectural identity (CortEX folds events; CapabilityFold folds capability announcements; one pattern, two surfaces).
+**Future extension (parked).** A more general `CapabilityFold` trait — applying the CortEX fold pattern to capability announcements — would unify bloom-filter aggregation, gateway summarization, prefix-based grouping, and custom application aggregations into one composable primitive. Worth doing if/when a second aggregation type emerges (likely candidates: MeshDB extension's time-travel/lineage folds, the federated mesh-wide scheduler's compute-availability folds — both Atomic Playboys territory). Until then, bloom filter + gateway summarization is concrete enough; defer the abstraction.
 
 ### 5. Re-announcement throttle + withdrawal
 
@@ -582,21 +506,13 @@ Eight phases in dependency order:
 - Reserved-key enforcement on the standard set (`intent`, `colocate-with`, etc.); warning-then-reject for unrecognized reserved-prefix keys.
 - Bindings: `CapabilitySet::metadata` round-trips through Node, Python, Go, C bindings (mostly serde plumbing).
 
-### Phase D — `CapabilityFold` trait + built-in folds (2 weeks)
+### Phase D — Bloom-filter aggregation (1 week)
 
-- New module `behavior::capability::fold` with the `CapabilityFold` trait + `ProbeQuery` type.
-- `BloomFilter` type and serialization (used internally by `ChainFold` and `PrefixFold`).
-- Built-in folds:
-  - `AxisFold` — default, runs on every node; per-axis summary for each of the four taxonomy axes.
-  - `PrefixFold<P>` — folder semantics over a prefix.
-  - `PatternFold<G>` — glob-pattern variant (`devices.*.sensor.*`).
-  - `ChainFold` — bloom-filter aggregation for `causal:*`. Threshold default 256 chains; target 10K chains in ≤ 500 KB at ≤ 1% FPR.
-  - `ProximityFold<R>` — wraps another fold; restricts source nodes to within RTT R. Used by gateways for subnet summarization.
-  - `AggregateCounterFold<K>` — sum / avg / max / min over numeric tag values within a fold scope.
-- `Mesh::register_capability_fold` — application registration entry point.
-- Probe pattern: `Mesh::probe_summary` → underlying tags or routes the probe to the gateway that emitted the summary.
-- Propagation budget regression test (the three-layer enforcement detailed in the Test strategy section); runs with default fold set registered.
-- Fold-of-folds correctness: `ProximityFold` wrapping `AxisFold` produces a summary that, when merged with a peer's summary of the same shape, yields the same result regardless of merge order (associativity test).
+- `BloomFilter` type and serialization.
+- `CapabilitySet::chain_bloom: Option<BloomFilter>` field.
+- Threshold logic: switch to bloom-mode at 256 tags; revert below.
+- Probe pattern in lookup paths: `Mesh::find_chain_holders` does precise lookup after bloom probe.
+- Propagation budget regression test (the three-layer enforcement detailed in the Test strategy section).
 
 ### Phase E — Federated query primitives (2 weeks)
 
@@ -634,7 +550,7 @@ Eight phases in dependency order:
 - `PlacementFilter` callable from bindings (application-implemented filters cross binding boundary via callback interface — same pattern as `BlobAdapter`).
 - `IntentRegistry::register` exposed for custom-intent registration.
 
-**Total: 6–8 focused weeks parallelised.** Phases A–D sequence (D extended from 1 to 2 weeks for the fold trait + built-in folds); E builds on D; F builds on A–C; G builds on F; H parallelises with C–H. Single engineer can serialise to ~8 weeks; with parallelism, drops to ~6 weeks. The +1 week vs the prior estimate is the cost of folds-as-primitive instead of bloom-aggregation-as-bespoke-mechanism — paid back across Rebel Yell and later releases that compose against the trait rather than inventing their own aggregation.
+**Total: 5–7 focused weeks.** Phases A–D sequence; E builds on D; F builds on A–C; G builds on F; H parallelises with C-H. Single engineer can serialise to ~7 weeks; with parallelism, drops to ~5 weeks.
 
 ---
 
@@ -723,14 +639,12 @@ Eight phases in dependency order:
 
 ## Effort
 
-**6–8 focused weeks parallelised.**
+**5–7 focused weeks parallelised.**
 
-- ~3500 LoC core (taxonomy + tag shapes + metadata + `CapabilityFold` trait + 6 built-in folds + query operators + predicate language + PlacementFilter + StandardPlacement + IntentRegistry + Mikoshi integration)
-- ~4000 LoC tests (unit + integration + property + performance + fold associativity + announcement-budget three-layer enforcement)
-- ~1 week bindings (parallelisable across four bindings — adds `CapabilityFold` callback interface alongside `PlacementFilter`'s)
-- ~3 days documentation (`CAPABILITIES.md` extension, `MIKOSHI.md` extension, `FOLDS.md` operator-facing fold registration guide, config docs)
-
-The +1 week vs the prior estimate buys: folds-as-primitive instead of bloom-aggregation-as-bespoke-mechanism. Pays back when Rebel Yell composes against the fold trait, when MeshDB extension expresses time-travel and lineage as custom folds, and when the federated mesh-wide scheduler (Atomic Playboys) folds compute-availability summaries for rebalancing.
+- ~3000 LoC core (taxonomy + tag shapes + metadata + bloom-filter aggregation + query operators + predicate language + PlacementFilter + StandardPlacement + IntentRegistry + Mikoshi integration)
+- ~3500 LoC tests (unit + integration + property + performance + announcement-budget three-layer enforcement)
+- ~1 week bindings (parallelisable across four bindings)
+- ~3 days documentation (`CAPABILITIES.md` extension, `MIKOSHI.md` extension, operator-facing config docs)
 
 Bindings are the only piece fully parallelisable; everything else has dependencies as sequenced in Phases A–H.
 
