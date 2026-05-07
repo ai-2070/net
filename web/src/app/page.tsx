@@ -1639,9 +1639,9 @@ function SuperpositionViz() {
 
       <div className="px-5 pt-6 pb-5">
         <svg
-          className="w-full h-[210px] block"
+          className="w-full aspect-[600/210] block"
           viewBox="0 0 600 210"
-          preserveAspectRatio="none"
+          preserveAspectRatio="xMidYMid meet"
         >
           <defs>
             <linearGradient id="superGrad" x1="0%" y1="0%" x2="100%" y2="0%">
