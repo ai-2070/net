@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/DATAFORTS_FEATURES.md
+  s_03fa3cc7afe4c8::t_9b3ab449b728c3 16,22,24-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "67a74f3ab8da1ed456d3617f831f26715bd63d3c",
+  "prompts": {},
+  "sessions": {
+    "s_03fa3cc7afe4c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08ddba21-fadf-4d00-a55b-a3d46774b21e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
