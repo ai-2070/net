@@ -527,7 +527,7 @@ function TopStatusBar() {
   }, []);
 
   return (
-    <div className="hidden lg:block fixed top-0 left-0 right-0 h-7 bg-bg border-b border-line flex items-center px-4 text-[10px] text-ink-dim z-[100] tracking-[0.05em]">
+    <div className="fixed top-0 left-0 right-0 h-7 bg-bg border-b border-line flex items-center px-4 text-[10px] text-ink-dim z-[100] tracking-[0.05em]">
       <span className="live-dot inline-flex items-center gap-1.5 text-accent">
         MESH ONLINE
       </span>
@@ -565,7 +565,7 @@ const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
 
 function NavBar() {
   return (
-    <nav className="fixed top-0 lg:top-7 left-0 right-0 h-[52px] nav-glass border-b border-line flex items-center px-6 z-[99]">
+    <nav className="fixed top-7 left-0 right-0 h-[52px] nav-glass border-b border-line flex items-center px-6 z-[99]">
       <div className="logo-mark font-display text-[22px] text-ink tracking-[0.1em] flex items-baseline gap-2.5">
         net{" "}
         <span className="font-mono text-[9px] text-accent tracking-[0.15em] font-semibold">
