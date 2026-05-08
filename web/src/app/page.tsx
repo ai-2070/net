@@ -648,7 +648,7 @@ function HeroSection() {
 
           <h1
             className="font-display leading-[0.88] tracking-[-0.02em] text-ink mb-5"
-            style={{ fontSize: "clamp(56px, 10vw, 144px)" }}
+            style={{ fontSize: "clamp(56px, 10vw, 128px)" }}
           >
             net.
             <br />
