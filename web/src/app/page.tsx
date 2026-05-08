@@ -1061,15 +1061,19 @@ const ARPANET_EDGES: ReadonlyArray<readonly [string, string]> = [
 function ArpanetMapBg() {
   return (
     <div
-      className="crt-scanlines-dense absolute right-0 top-8 w-full max-w-[1100px] aspect-[1000/589] pointer-events-none"
+      className="crt-scanlines-dense absolute inset-0 pointer-events-none"
       aria-hidden
       style={{
         WebkitMaskImage:
-          "radial-gradient(ellipse 80% 80% at 60% 50%, #000 30%, transparent 95%)",
+          "radial-gradient(ellipse 90% 80% at 50% 50%, #000 35%, transparent 95%)",
         maskImage:
-          "radial-gradient(ellipse 80% 80% at 60% 50%, #000 30%, transparent 95%)",
+          "radial-gradient(ellipse 90% 80% at 50% 50%, #000 35%, transparent 95%)",
       }}
     >
+      <span className="absolute top-4 left-4 w-3 h-3 border-t border-l border-accent/55" />
+      <span className="absolute top-4 right-4 w-3 h-3 border-t border-r border-accent/55" />
+      <span className="absolute bottom-4 left-4 w-3 h-3 border-b border-l border-accent/55" />
+      <span className="absolute bottom-4 right-4 w-3 h-3 border-b border-r border-accent/55" />
       <svg
         className="w-full h-full opacity-[0.4]"
         viewBox="0 0 1000 589"
@@ -1098,14 +1102,6 @@ function ArpanetMapBg() {
           height="490"
           fill="url(#arpanet-grid)"
         />
-
-        {/* corner registration brackets */}
-        <g fill="none" stroke="#c4ff3d" strokeOpacity="0.55" strokeWidth="0.8">
-          <path d="M 40 80 L 40 60 L 60 60" />
-          <path d="M 940 60 L 960 60 L 960 80" />
-          <path d="M 960 530 L 960 550 L 940 550" />
-          <path d="M 60 550 L 40 550 L 40 530" />
-        </g>
 
         {/* latitude tick marks (left edge) */}
         <g
