@@ -1202,7 +1202,7 @@ const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
 
 function TopologyClassesSection() {
   return (
-    <section className="border-b border-line px-6 py-20">
+    <section id="topology" className="border-b border-line px-6 py-20">
       <SectionLabel>§02 / topology classes</SectionLabel>
       <DisplayHeading>a new class of system.</DisplayHeading>
 
@@ -1313,7 +1313,7 @@ const AXIOMS: readonly AxiomCard[] = [
 
 function PropertiesSection() {
   return (
-    <section className="border-b border-line px-6 py-20">
+    <section id="properties" className="border-b border-line px-6 py-20">
       <SectionLabel>§03 / protocol properties</SectionLabel>
       <DisplayHeading>
         nine axioms.
@@ -1592,7 +1592,7 @@ function BenchKpi({
 
 function MikoshiSection() {
   return (
-    <section className="border-b border-line px-6 py-20">
+    <section id="mikoshi" className="border-b border-line px-6 py-20">
       <SectionLabel>§05 / mikoshi // engram transit</SectionLabel>
       <DisplayHeading>
         state moves.
@@ -3442,7 +3442,7 @@ function BlackwallSection() {
 
 function ClosingSection() {
   return (
-    <section className="border-b border-line px-6 py-20">
+    <section id="post-cloud" className="border-b border-line px-6 py-20">
       <SectionLabel>§11 / post-cloud</SectionLabel>
       <DisplayHeading>
         not anti-cloud.
@@ -3516,10 +3516,12 @@ function FooterDivider() {
 }
 
 const FOOTER_SPEC: ReadonlyArray<{ href: string; label: string }> = [
-  { href: "#what", label: "Why not best-effort" },
-  { href: "#bench", label: "Benchmarks" },
+  { href: "#topology", label: "Topology classes" },
+  { href: "#properties", label: "Protocol properties" },
+  { href: "#mikoshi", label: "Mikoshi" },
+  { href: "#runtime", label: "Compute runtime" },
+  { href: "#apps", label: "Applications" },
   { href: "#wall", label: "The Blackwall" },
-  { href: "#install", label: "SDKs" },
 ];
 
 const FOOTER_DOCS: ReadonlyArray<{ href: string; label: string }> = [
