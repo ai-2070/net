@@ -3322,7 +3322,7 @@ function ApplicationsSection() {
             <div className="text-accent text-[10px] tracking-[0.15em] mb-2">
               {a.tag}
             </div>
-            <h3 className="font-head text-[18px] leading-tight mb-2.5 tracking-[0.04em] text-ink lowercase">
+            <h3 className="font-head text-[20px] leading-tight mb-2.5 tracking-[0.04em] text-ink lowercase">
               {a.title}
             </h3>
             <p className="text-ink-dim text-[12px] leading-[1.6]">{a.body}</p>
