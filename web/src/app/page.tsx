@@ -3261,9 +3261,9 @@ interface AppCard {
 
 const APPS: readonly AppCard[] = [
   {
-    tag: "▸ 0x01 ─ ai runtime",
-    title: "AI Runtime",
-    body: "The original use case. Token streams, tool-call results, guardrail decisions, and consensus votes flowing across heterogeneous GPU nodes. The mesh is the runtime.",
+    tag: "▸ 0x01 ─ ai agents",
+    title: "AI Agents",
+    body: "Tool calls, state, and memory transfer between heterogeneous GPU nodes. Token streams flow through the mesh; an agent's working memory follows it from node to node mid-conversation. The mesh is the runtime.",
   },
   {
     tag: "▸ 0x02 ─ vehicular mesh",
@@ -3296,9 +3296,9 @@ const APPS: readonly AppCard[] = [
     body: "Lighting, audio, video, pyro synchronized across hundreds of nodes. A DMX controller dies, another node picks up the cue list. Audio sync tighter than the speed of sound across the venue.",
   },
   {
-    tag: "▸ 0x08 ─ precision ag",
-    title: "Precision Agriculture",
-    body: "Tractors, drones, soil sensors, weather stations forming a field mesh. The field is the network. No cloud round-trip required.",
+    tag: "▸ 0x08 ─ medical nanorobotics",
+    title: "Medical Nanorobotics",
+    body: "Swarms of nanoscale machines coordinating in vivo — drug-delivery vectors, targeted ablation, vascular monitoring. Sub-microsecond reroute when a node leaves the swarm. No cloud round-trip; the patient is the network.",
   },
 ];
 
