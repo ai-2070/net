@@ -1,0 +1,28 @@
+web/src/app/page.tsx
+  s_55265e6795d7b9::t_d618243feebe40 1800-1854
+  s_55265e6795d7b9::t_a94e2cb4a68f88 2020
+  s_55265e6795d7b9::t_ae2a216d29f964 2026
+  s_55265e6795d7b9::t_cbaa2689cf9535 1869,1871-1872,1875-1876,1879-1880,1885-1976
+  s_55265e6795d7b9::t_55e9b443ae2b87 1984
+  s_55265e6795d7b9::t_9243a85cc2fd46 2032
+  s_55265e6795d7b9::t_7496a1b087d1fa 2014
+  s_55265e6795d7b9::t_390e7435b8e809 1990
+  s_55265e6795d7b9::t_b3df5c53e76cc4 1857-1868,1870,1873-1874,1877-1878,1881-1884
+  s_55265e6795d7b9::t_a3a1051adca881 2008
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "463301d2633badbb54525f60668edf19b29de5a2",
+  "prompts": {},
+  "sessions": {
+    "s_55265e6795d7b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6bac1322-4c47-4293-a1fb-66a38b5f162f",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
