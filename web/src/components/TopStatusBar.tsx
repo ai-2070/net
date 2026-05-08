@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 
 import type { RepoInfo } from "@/lib/repo-info";
 
-export function TopStatusBar({ version, buildDate, sha }: RepoInfo) {
+export function TopStatusBar({ version, codename, buildDate, sha }: RepoInfo) {
   const [evt, setEvt] = useState<string>("8.4M");
   const [p50, setP50] = useState<string>("38ns");
 
@@ -35,7 +35,8 @@ export function TopStatusBar({ version, buildDate, sha }: RepoInfo) {
       </span>
       <span className="text-ink-faint mx-3">│</span>
       <span>
-        NODES: <b className="text-ink font-semibold">14,872</b>
+        CODENAME:{" "}
+        <b className="text-accent font-semibold uppercase">{codename}</b>
       </span>
       <span className="text-ink-faint mx-3">│</span>
       <span>

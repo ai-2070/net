@@ -2,6 +2,7 @@ import "server-only";
 
 export interface RepoInfo {
   version: string;
+  codename: string;
   buildDate: string;
   sha: string;
 }
@@ -10,6 +11,7 @@ const REPO = "ai-2070/net";
 
 const FALLBACK: RepoInfo = {
   version: "v0.0.0",
+  codename: "—",
   buildDate: "—",
   sha: "0000000",
 };
@@ -21,6 +23,13 @@ interface GhCommit {
 
 interface GhRelease {
   tag_name?: string;
+  name?: string;
+}
+
+function extractCodename(title: string | undefined | null): string | null {
+  if (!title) return null;
+  const m = title.match(/["“”]([^"“”]+)["“”]/);
+  return m && m[1] ? m[1] : null;
 }
 
 function ghHeaders(): HeadersInit {
@@ -38,7 +47,10 @@ function formatDate(iso: string): string {
   return iso.slice(0, 10).replace(/-/g, ".");
 }
 
-async function fetchLatestRelease(): Promise<string | null> {
+async function fetchLatestRelease(): Promise<{
+  tag: string;
+  codename: string | null;
+} | null> {
   try {
     const res = await fetch(
       `https://api.github.com/repos/${REPO}/releases/latest`,
@@ -46,7 +58,11 @@ async function fetchLatestRelease(): Promise<string | null> {
     );
     if (!res.ok) return null;
     const data = (await res.json()) as GhRelease;
-    return data.tag_name ?? null;
+    if (!data.tag_name) return null;
+    return {
+      tag: data.tag_name,
+      codename: extractCodename(data.name),
+    };
   } catch {
     return null;
   }
@@ -73,12 +89,13 @@ async function fetchHeadCommit(): Promise<{
 }
 
 export async function getRepoInfo(): Promise<RepoInfo> {
-  const [tag, head] = await Promise.all([
+  const [release, head] = await Promise.all([
     fetchLatestRelease(),
     fetchHeadCommit(),
   ]);
   return {
-    version: tag ?? FALLBACK.version,
+    version: release?.tag ?? FALLBACK.version,
+    codename: release?.codename ?? FALLBACK.codename,
     buildDate: head ? formatDate(head.date) : FALLBACK.buildDate,
     sha: head ? head.sha : FALLBACK.sha,
   };
