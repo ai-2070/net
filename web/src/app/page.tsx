@@ -3857,7 +3857,7 @@ function ReleasesSection() {
             </header>
             {r.bodyHtml ? (
               <div
-                className="prose prose-invert prose-sm max-w-none prose-headings:text-ink prose-headings:font-semibold prose-headings:tracking-tight prose-h1:text-[18px] prose-h2:text-[15px] prose-h3:text-[13px] prose-p:text-ink-dim prose-strong:text-ink prose-strong:font-medium prose-a:text-accent prose-a:no-underline hover:prose-a:underline prose-code:text-accent prose-code:font-mono prose-code:before:content-none prose-code:after:content-none prose-code:bg-bg prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-bg prose-pre:border prose-pre:border-line prose-li:text-ink-dim prose-hr:border-line"
+                className="prose prose-invert prose-sm max-w-none prose-headings:text-ink prose-headings:font-semibold prose-headings:tracking-tight prose-h1:text-[18px] prose-h2:text-[15px] prose-h3:text-[13px] prose-p:text-ink-dim prose-strong:text-ink prose-strong:font-medium prose-a:text-accent prose-a:no-underline hover:prose-a:underline prose-code:text-accent prose-code:font-mono prose-code:before:content-none prose-code:after:content-none prose-code:bg-bg prose-code:px-1 prose-code:py-0.5 prose-pre:bg-bg prose-pre:border prose-pre:border-line prose-ul:list-[square] prose-li:text-ink-dim prose-ul:marker:text-line prose-ol:text-ink-dim prose-hr:border-line prose-code:rounded-none"
                 // Trusted: bodies come from repo maintainers' release notes via GitHub API.
                 dangerouslySetInnerHTML={{ __html: r.bodyHtml }}
               />
