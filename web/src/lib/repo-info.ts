@@ -4,7 +4,7 @@ import { marked } from "marked";
 
 marked.setOptions({ async: false, gfm: true, breaks: false });
 
-function renderMarkdown(text: string): string {
+export function renderMarkdown(text: string): string {
   if (!text) return "";
   try {
     const html = marked.parse(text);
@@ -32,9 +32,9 @@ export interface RepoInfo {
   releases: ReadonlyArray<Release>;
 }
 
-const REPO = "ai-2070/net";
+export const REPO = "ai-2070/net";
 
-const FALLBACK: RepoInfo = {
+export const FALLBACK: RepoInfo = {
   version: "v0.0.0",
   codename: "—",
   buildDate: "—",
@@ -42,12 +42,12 @@ const FALLBACK: RepoInfo = {
   releases: [],
 };
 
-interface GhCommit {
+export interface GhCommit {
   sha?: string;
   commit?: { committer?: { date?: string } };
 }
 
-interface GhRelease {
+export interface GhRelease {
   tag_name?: string;
   name?: string | null;
   body?: string | null;
@@ -56,13 +56,15 @@ interface GhRelease {
   prerelease?: boolean;
 }
 
-function extractCodename(title: string | undefined | null): string | null {
+export function extractCodename(
+  title: string | undefined | null,
+): string | null {
   if (!title) return null;
   const m = title.match(/["“”]([^"“”]+)["“”]/);
   return m && m[1] ? m[1] : null;
 }
 
-function ghHeaders(): HeadersInit {
+export function ghHeaders(): HeadersInit {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
@@ -73,11 +75,11 @@ function ghHeaders(): HeadersInit {
   return headers;
 }
 
-function formatDate(iso: string): string {
+export function formatDate(iso: string): string {
   return iso.slice(0, 10).replace(/-/g, ".");
 }
 
-async function fetchLatestRelease(): Promise<{
+export async function fetchLatestRelease(): Promise<{
   tag: string;
   codename: string | null;
 } | null> {
@@ -98,7 +100,7 @@ async function fetchLatestRelease(): Promise<{
   }
 }
 
-async function fetchHeadCommit(): Promise<{
+export async function fetchHeadCommit(): Promise<{
   sha: string;
   date: string;
 } | null> {
@@ -118,7 +120,7 @@ async function fetchHeadCommit(): Promise<{
   }
 }
 
-async function fetchAllReleases(): Promise<ReadonlyArray<Release>> {
+export async function fetchAllReleases(): Promise<ReadonlyArray<Release>> {
   try {
     const res = await fetch(
       `https://api.github.com/repos/${REPO}/releases?per_page=100`,
