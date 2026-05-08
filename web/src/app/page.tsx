@@ -686,7 +686,7 @@ function HeroSection() {
               Read benchmarks
             </a>
             <a
-              href="#what"
+              href="#properties"
               className="btn-ghost inline-flex items-center gap-2.5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline text-ink transition-all"
             >
               // view spec ↘
