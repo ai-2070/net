@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 type NodeId = "A" | "G" | "R1" | "R2" | "B" | "R3" | "R4";
@@ -514,12 +515,15 @@ const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
 function NavBar() {
   return (
     <nav className="fixed top-7 left-0 right-0 h-[52px] nav-glass border-b border-line flex items-center px-6 z-[99]">
-      <div className="logo-mark font-display text-[22px] text-ink tracking-[0.1em] flex items-baseline gap-2.5">
+      <Link
+        href="/"
+        className="logo-mark font-display text-[22px] text-ink tracking-[0.1em] flex items-baseline gap-2.5"
+      >
         net{" "}
         <span className="font-mono text-[9px] text-accent tracking-[0.15em] font-semibold">
           // NET 2070
         </span>
-      </div>
+      </Link>
       <ul className="hidden lg:flex list-none gap-7 ml-auto items-center">
         {NAV_LINKS.map((l) => (
           <li key={l.href}>
