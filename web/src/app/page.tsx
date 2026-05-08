@@ -1521,6 +1521,16 @@ function BenchmarksSection() {
             <b className="text-ink font-medium">► profile</b> release + LTO +
             CG=1
           </p>
+          <hr className="border-0 border-t border-line my-5" />
+          <a
+            href="https://github.com/ai-2070/net/blob/master/net/crates/net/BENCHMARKS.md"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 text-[11px] font-mono text-accent tracking-[0.05em] hover:text-ink transition-colors"
+          >
+            ▸ BENCHMARKS.md
+            <span className="text-ink-faint">↗</span>
+          </a>
         </div>
       </div>
     </section>
