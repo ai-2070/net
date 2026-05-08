@@ -3567,7 +3567,7 @@ const FOOTER_RESOURCES: ReadonlyArray<{ href: string; label: string }> = [
   },
   {
     href: "https://github.com/ai-2070/net/tree/master/net/crates/net/include",
-    label: "C // module",
+    label: "C // SDK",
   },
   { href: "https://github.com/ai-2070/net", label: "Source // GitHub" },
 ];
