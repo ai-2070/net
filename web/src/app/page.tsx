@@ -2159,7 +2159,6 @@ function DaemonCaseBlock() {
   const caseIdxRef = useRef(0);
   const charIdxRef = useRef(0);
   const dwellRef = useRef(0);
-  const pausedRef = useRef(false);
   const [, forceUpdate] = useState(0);
 
   const caseTokens = useMemo(
@@ -2173,25 +2172,22 @@ function DaemonCaseBlock() {
     const loop = (now: number): void => {
       const dt = (now - last) / 1000;
       last = now;
-      if (!pausedRef.current) {
-        const tokens = caseTokens[caseIdxRef.current] ?? [];
-        const total = totalChars(tokens);
-        if (charIdxRef.current < total) {
-          charIdxRef.current = Math.min(
-            total,
-            charIdxRef.current + dt * TYPING_CPS,
-          );
-        } else {
-          dwellRef.current += dt;
-          if (dwellRef.current >= DWELL_SECONDS) {
-            dwellRef.current = 0;
-            caseIdxRef.current =
-              (caseIdxRef.current + 1) % DAEMON_CASES.length;
-            charIdxRef.current = 0;
-          }
+      const tokens = caseTokens[caseIdxRef.current] ?? [];
+      const total = totalChars(tokens);
+      if (charIdxRef.current < total) {
+        charIdxRef.current = Math.min(
+          total,
+          charIdxRef.current + dt * TYPING_CPS,
+        );
+      } else {
+        dwellRef.current += dt;
+        if (dwellRef.current >= DWELL_SECONDS) {
+          dwellRef.current = 0;
+          caseIdxRef.current = (caseIdxRef.current + 1) % DAEMON_CASES.length;
+          charIdxRef.current = 0;
         }
-        forceUpdate((n) => n + 1);
       }
+      forceUpdate((n) => n + 1);
       rafId = requestAnimationFrame(loop);
     };
     rafId = requestAnimationFrame(loop);
@@ -2207,15 +2203,7 @@ function DaemonCaseBlock() {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_0.9fr] gap-8 my-12 items-start">
-      <div
-        className="border border-line bg-bg-2 overflow-hidden"
-        onMouseEnter={() => {
-          pausedRef.current = true;
-        }}
-        onMouseLeave={() => {
-          pausedRef.current = false;
-        }}
-      >
+      <div className="border border-line bg-bg-2 overflow-hidden">
         <div className="bg-bg border-b border-line px-3.5 py-2 text-[10px] text-ink-dim tracking-[0.12em] uppercase flex justify-between items-center">
           <span key={`title-${idx}`} className="daemon-fade">
             <span className="text-accent font-semibold">CASE</span> ·{" "}
