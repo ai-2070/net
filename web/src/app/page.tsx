@@ -756,7 +756,7 @@ function ArpanetMapBg() {
       }}
     >
       <svg
-        className="w-full h-full opacity-[0.22]"
+        className="w-full h-full opacity-[0.36]"
         viewBox="0 0 1000 589"
         preserveAspectRatio="xMidYMid meet"
       >
