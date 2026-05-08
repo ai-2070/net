@@ -2510,6 +2510,7 @@ interface InstallCard {
   lang: string;
   ext: string;
   cmd: string;
+  copy: string;
   meta: string;
 }
 
@@ -2518,24 +2519,28 @@ const INSTALL_CARDS: readonly InstallCard[] = [
     lang: "Rust",
     ext: ".rs",
     cmd: "$ cargo add ai2070-net-sdk",
+    copy: "cargo add ai2070-net-sdk",
     meta: "crate: ai2070-net-sdk",
   },
   {
     lang: "TypeScript",
     ext: ".ts",
     cmd: "$ npm i @ai2070/net-sdk\n       @ai2070/net",
+    copy: "npm i @ai2070/net-sdk @ai2070/net",
     meta: "scope: @ai2070",
   },
   {
     lang: "Python",
     ext: ".py",
     cmd: "$ pip install ai2070-net-sdk",
+    copy: "pip install ai2070-net-sdk",
     meta: "dist: ai2070-net-sdk",
   },
   {
     lang: "Go",
     ext: ".go",
     cmd: "$ go get github.com/\n  ai-2070/net/go",
+    copy: "go get github.com/ai-2070/net/go",
     meta: "module: ai-2070/net/go",
   },
 ];
@@ -2662,6 +2667,20 @@ function ComponentsSection() {
 }
 
 function InstallSection() {
+  const [copied, setCopied] = useState<string | null>(null);
+
+  const handleCopy = async (lang: string, text: string): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(lang);
+      window.setTimeout(() => {
+        setCopied((current) => (current === lang ? null : current));
+      }, 1800);
+    } catch {
+      // clipboard API can fail in insecure contexts; ignore silently
+    }
+  };
+
   return (
     <section id="install" className="bg-bg-2 border-b border-line px-6 py-20">
       <SectionLabel>§08 / install</SectionLabel>
@@ -2677,25 +2696,37 @@ function InstallSection() {
       </p>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-5">
-        {INSTALL_CARDS.map((c) => (
-          <div
-            key={c.lang}
-            className="border border-line p-5 bg-bg transition-colors hover:border-accent-dim cursor-pointer"
-          >
-            <div className="flex items-center justify-between mb-4">
-              <span className="text-[11px] text-ink tracking-[0.15em] uppercase font-semibold">
-                {c.lang}
-              </span>
-              <span className="text-[10px] text-accent border border-accent-dim px-1.5 py-0.5">
-                {c.ext}
-              </span>
-            </div>
-            <pre className="bg-bg-2 p-3 text-[11px] text-accent border-l-2 border-accent overflow-x-auto font-mono leading-[1.5]">
-              {c.cmd}
-            </pre>
-            <div className="text-ink-dim text-[10px] mt-2.5">{c.meta}</div>
-          </div>
-        ))}
+        {INSTALL_CARDS.map((c) => {
+          const isCopied = copied === c.lang;
+          return (
+            <button
+              key={c.lang}
+              type="button"
+              onClick={() => handleCopy(c.lang, c.copy)}
+              aria-label={`Copy ${c.lang} install command`}
+              className="text-left border border-line p-5 bg-bg transition-colors hover:border-accent-dim cursor-pointer focus:outline-none focus:border-accent"
+            >
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-[11px] text-ink tracking-[0.15em] uppercase font-semibold">
+                  {c.lang}
+                </span>
+                <span
+                  className={`text-[10px] px-1.5 py-0.5 transition-colors ${
+                    isCopied
+                      ? "text-bg bg-accent border border-accent font-semibold"
+                      : "text-accent border border-accent-dim"
+                  }`}
+                >
+                  {isCopied ? "✓ COPIED" : c.ext}
+                </span>
+              </div>
+              <pre className="bg-bg-2 p-3 text-[11px] text-accent border-l-2 border-accent overflow-x-auto font-mono leading-[1.5]">
+                {c.cmd}
+              </pre>
+              <div className="text-ink-dim text-[10px] mt-2.5">{c.meta}</div>
+            </button>
+          );
+        })}
       </div>
 
       <p className="mt-7 text-[11px] text-ink-dim">
