@@ -3086,10 +3086,11 @@ const FOOTER_COMPONENTS: ReadonlyArray<{ href: string; label: string }> = [
 ];
 
 const FOOTER_RESOURCES: ReadonlyArray<{ href: string; label: string }> = [
-  { href: "#", label: "Crate README" },
-  { href: "#", label: "BENCHMARKS.md" },
-  { href: "#", label: "RFC archive" },
-  { href: "#", label: "Source (GitHub)" },
+  { href: "https://crates.io/crates/ai2070-net-sdk", label: "Rust // crates.io" },
+  { href: "https://www.npmjs.com/package/@ai2070/net-sdk", label: "TypeScript // npm" },
+  { href: "https://pypi.org/project/ai2070-net-sdk/", label: "Python // PyPI" },
+  { href: "https://github.com/ai-2070/net/tree/main/go", label: "Go // module" },
+  { href: "https://github.com/ai-2070/net", label: "Source // GitHub" },
 ];
 
 const ET_YEAR = new Date().toLocaleString("en-US", {
@@ -3142,16 +3143,22 @@ function FooterColumn({
         {title}
       </h5>
       <ul className="list-none space-y-2">
-        {items.map((it) => (
-          <li key={it.label}>
-            <a
-              href={it.href}
-              className="text-ink no-underline text-[12px] hover:text-accent transition-colors"
-            >
-              {it.label}
-            </a>
-          </li>
-        ))}
+        {items.map((it) => {
+          const external = /^https?:\/\//i.test(it.href);
+          return (
+            <li key={it.label}>
+              <a
+                href={it.href}
+                {...(external
+                  ? { target: "_blank", rel: "noopener noreferrer" }
+                  : {})}
+                className="text-ink no-underline text-[12px] hover:text-accent transition-colors"
+              >
+                {it.label}
+              </a>
+            </li>
+          );
+        })}
       </ul>
     </div>
   );
