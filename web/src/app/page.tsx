@@ -3237,12 +3237,33 @@ function InstallSection() {
         <a
           href="https://github.com/ai-2070/net/tree/master/net/crates/net/include"
           target="_blank"
+          className="hover:text-white"
         >
           // C bindings via <span className="text-accent">net.h</span>
         </a>{" "}
         — build cdylib with{" "}
-        <span className="text-accent">
-          cargo build --release --features ffi,net
+        <span className="relative inline-block">
+          <button
+            type="button"
+            onClick={() =>
+              handleCopy(
+                "ffi-build",
+                "cargo build --release --features ffi,net",
+              )
+            }
+            aria-label="Copy cargo build command"
+            className="text-accent font-mono cursor-pointer transition-colors hover:text-ink focus:outline-none focus:text-ink"
+          >
+            cargo build --release --features ffi,net
+          </button>
+          {copied === "ffi-build" ? (
+            <span
+              aria-hidden
+              className="slide-up-fade absolute left-0 -top-1 text-[10px] text-accent font-mono whitespace-nowrap"
+            >
+              ✓ copied
+            </span>
+          ) : null}
         </span>
         . Lower-level bindings (skip SDK ergonomics, talk directly to the
         engine): <span className="text-accent">ai2070-net</span>,{" "}

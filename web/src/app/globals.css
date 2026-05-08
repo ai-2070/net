@@ -189,6 +189,33 @@
   }
 }
 
+/* slide-up + fade for copy feedback toasts */
+@utility slide-up-fade {
+  animation: slide-up-fade 1.4s ease-out forwards;
+  pointer-events: none;
+}
+
+@keyframes slide-up-fade {
+  0% {
+    opacity: 0;
+    transform: translateY(0);
+  }
+  15% {
+    opacity: 1;
+    transform: translateY(-4px);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-22px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .slide-up-fade {
+    animation: none !important;
+  }
+}
+
 /* fade-in for cycling daemon case studies */
 @utility daemon-fade {
   animation: daemon-fade 0.45s ease-out;
