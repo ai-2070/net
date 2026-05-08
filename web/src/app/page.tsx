@@ -3553,17 +3553,21 @@ const FOOTER_DOCS: ReadonlyArray<{ href: string; label: string }> = [
 
 const FOOTER_RESOURCES: ReadonlyArray<{ href: string; label: string }> = [
   {
-    href: "https://crates.io/crates/ai2070-net-sdk",
+    href: "https://crates.io/crates/ai2070-net",
     label: "Rust // crates.io",
   },
   {
-    href: "https://www.npmjs.com/package/@ai2070/net-sdk",
+    href: "https://www.npmjs.com/package/@ai2070/net",
     label: "TypeScript // npm",
   },
-  { href: "https://pypi.org/project/ai2070-net-sdk/", label: "Python // PyPI" },
+  { href: "https://pypi.org/project/ai2070-net/", label: "Python // PyPI" },
   {
-    href: "https://github.com/ai-2070/net/tree/main/go",
+    href: "https://github.com/ai-2070/net/tree/master/go",
     label: "Go // module",
+  },
+  {
+    href: "https://github.com/ai-2070/net/tree/master/net/crates/net/include",
+    label: "C // module",
   },
   { href: "https://github.com/ai-2070/net", label: "Source // GitHub" },
 ];
