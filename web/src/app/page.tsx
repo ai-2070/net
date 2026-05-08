@@ -3516,10 +3516,6 @@ function FooterDivider() {
 }
 
 const FOOTER_SPEC: ReadonlyArray<{ href: string; label: string }> = [
-  {
-    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/README.md",
-    label: "Technical README.md",
-  },
   { href: "#what", label: "Why not best-effort" },
   { href: "#bench", label: "Benchmarks" },
   { href: "#wall", label: "The Blackwall" },
@@ -3528,24 +3524,28 @@ const FOOTER_SPEC: ReadonlyArray<{ href: string; label: string }> = [
 
 const FOOTER_DOCS: ReadonlyArray<{ href: string; label: string }> = [
   {
+    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/README.md",
+    label: "README.md // GitHub",
+  },
+  {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/COMPUTE.md",
-    label: "COMPUTE.md",
+    label: "COMPUTE.md // GitHub",
   },
   {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/CHANNELS.md",
-    label: "CHANNELS.md",
+    label: "CHANNELS.md // GitHub",
   },
   {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/SUBNETS.md",
-    label: "SUBNETS.md",
+    label: "SUBNETS.md // GitHub",
   },
   {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/SUBPROTOCOLS.md",
-    label: "SUBPROTOCOLS.md",
+    label: "SUBPROTOCOLS.md // GitHub",
   },
   {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/BENCHMARKS.md",
-    label: "BENCHMARKS.md",
+    label: "BENCHMARKS.md // GitHub",
   },
 ];
 
