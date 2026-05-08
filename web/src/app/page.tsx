@@ -3237,7 +3237,8 @@ function InstallSection() {
         <a
           href="https://github.com/ai-2070/net/tree/master/net/crates/net/include"
           target="_blank"
-          className="hover:text-white"
+          rel="noopener noreferrer"
+          className="hover:text-ink transition-colors"
         >
           // C bindings via <span className="text-accent">net.h</span>
         </a>{" "}
