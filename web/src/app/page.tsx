@@ -3071,25 +3071,53 @@ function FooterDivider() {
 }
 
 const FOOTER_SPEC: ReadonlyArray<{ href: string; label: string }> = [
+  {
+    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/README.md",
+    label: "Technical README.md",
+  },
   { href: "#what", label: "Why not best-effort" },
   { href: "#bench", label: "Benchmarks" },
   { href: "#wall", label: "The Blackwall" },
   { href: "#install", label: "SDKs" },
 ];
 
-const FOOTER_COMPONENTS: ReadonlyArray<{ href: string; label: string }> = [
-  { href: "#components", label: "nRPC // request/response" },
-  { href: "#components", label: "RedEX // log" },
-  { href: "#components", label: "CortEX // fold" },
-  { href: "#components", label: "NetDB // façade" },
-  { href: "#runtime", label: "Mikoshi // migration" },
+const FOOTER_DOCS: ReadonlyArray<{ href: string; label: string }> = [
+  {
+    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/COMPUTE.md",
+    label: "COMPUTE.md",
+  },
+  {
+    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/CHANNELS.md",
+    label: "CHANNELS.md",
+  },
+  {
+    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/SUBNETS.md",
+    label: "SUBNETS.md",
+  },
+  {
+    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/SUBPROTOCOLS.md",
+    label: "SUBPROTOCOLS.md",
+  },
+  {
+    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/BENCHMARKS.md",
+    label: "BENCHMARKS.md",
+  },
 ];
 
 const FOOTER_RESOURCES: ReadonlyArray<{ href: string; label: string }> = [
-  { href: "https://crates.io/crates/ai2070-net-sdk", label: "Rust // crates.io" },
-  { href: "https://www.npmjs.com/package/@ai2070/net-sdk", label: "TypeScript // npm" },
+  {
+    href: "https://crates.io/crates/ai2070-net-sdk",
+    label: "Rust // crates.io",
+  },
+  {
+    href: "https://www.npmjs.com/package/@ai2070/net-sdk",
+    label: "TypeScript // npm",
+  },
   { href: "https://pypi.org/project/ai2070-net-sdk/", label: "Python // PyPI" },
-  { href: "https://github.com/ai-2070/net/tree/main/go", label: "Go // module" },
+  {
+    href: "https://github.com/ai-2070/net/tree/main/go",
+    label: "Go // module",
+  },
   { href: "https://github.com/ai-2070/net", label: "Source // GitHub" },
 ];
 
@@ -3114,7 +3142,7 @@ function Footer() {
           </p>
         </div>
         <FooterColumn title="Spec" items={FOOTER_SPEC} />
-        <FooterColumn title="Components" items={FOOTER_COMPONENTS} />
+        <FooterColumn title="Docs" items={FOOTER_DOCS} />
         <FooterColumn title="Resources" items={FOOTER_RESOURCES} />
       </div>
 
