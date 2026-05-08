@@ -1629,7 +1629,7 @@ const SPECTRUM_MARKERS: ReadonlyArray<SpectrumMarker> = [
 
 function LatencySpectrum() {
   return (
-    <div className="mt-10 border border-line bg-bg-2 px-6 py-7">
+    <div className="mt-10 border border-line bg-bg-2 px-6 py-7 hidden md:block">
       <div className="text-[10px] tracking-[0.18em] uppercase text-ink-dim mb-4 flex items-center justify-between flex-wrap gap-2">
         <span>// latency spectrum · log scale</span>
         <span className="text-ink-faint">10⁻⁹ → 10⁻³</span>
