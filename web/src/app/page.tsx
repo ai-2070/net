@@ -1833,16 +1833,13 @@ const FORK_PHASES: ReadonlyArray<AsciiPhase> = [
   {
     rows: [
       <>
-        {"   ├─▶ "}fork.A{" "}
-        <span className="text-accent">(sentinel)</span>
+        {"   ├─▶ "}fork.A <span className="text-accent">(sentinel)</span>
       </>,
       <>
-        {"   ├─▶ "}fork.B{" "}
-        <span className="text-accent">(sentinel)</span>
+        {"   ├─▶ "}fork.B <span className="text-accent">(sentinel)</span>
       </>,
       <>
-        {"   └─▶ "}fork.C{" "}
-        <span className="text-accent">(sentinel)</span>
+        {"   └─▶ "}fork.C <span className="text-accent">(sentinel)</span>
       </>,
     ],
     caption: <>forking · sentinels written from seq=42</>,
@@ -2062,8 +2059,8 @@ const DAEMON_CASES: readonly DaemonCase[] = [
         </span>
         {"\n"}
         <span className="kw">let</span> daemon = Daemon::
-        <span className="fn">new</span>(
-        <span className="ty">TraderConfig</span> {"{"}
+        <span className="fn">new</span>(<span className="ty">TraderConfig</span>{" "}
+        {"{"}
         {"\n    "}
         <span className="fn">requirements</span>:{" "}
         <span className="kw">vec</span>![ <span className="ty">Cap</span>::
@@ -2110,8 +2107,8 @@ const DAEMON_CASES: readonly DaemonCase[] = [
         <span className="ty">InferenceConfig</span> {"{"}
         {"\n    "}
         <span className="fn">requirements</span>:{" "}
-        <span className="kw">vec</span>![{" "}
-        <span className="ty">Cap</span>::<span className="fn">Gpu</span>(
+        <span className="kw">vec</span>![ <span className="ty">Cap</span>::
+        <span className="fn">Gpu</span>(
         <span className="st">&quot;vram&gt;=24gb&quot;</span>),{" "}
         <span className="ty">Cap</span>::<span className="fn">Tag</span>(
         <span className="st">&quot;user:7af3&quot;</span>) ],
@@ -2156,8 +2153,7 @@ const DAEMON_CASES: readonly DaemonCase[] = [
         {"{"}
         {"\n    "}
         <span className="fn">requirements</span>:{" "}
-        <span className="kw">vec</span>![{" "}
-        <span className="ty">Cap</span>::
+        <span className="kw">vec</span>![ <span className="ty">Cap</span>::
         <span className="fn">Latency</span>(
         <span className="st">&quot;&lt;5ms to actuator&quot;</span>),{" "}
         <span className="ty">Cap</span>::<span className="fn">Tag</span>(
@@ -2199,12 +2195,11 @@ const DAEMON_CASES: readonly DaemonCase[] = [
         </span>
         {"\n"}
         <span className="kw">let</span> daemon = Daemon::
-        <span className="fn">new</span>(
-        <span className="ty">FusionConfig</span> {"{"}
+        <span className="fn">new</span>(<span className="ty">FusionConfig</span>{" "}
+        {"{"}
         {"\n    "}
         <span className="fn">requirements</span>:{" "}
-        <span className="kw">vec</span>![{" "}
-        <span className="ty">Cap</span>::
+        <span className="kw">vec</span>![ <span className="ty">Cap</span>::
         <span className="fn">Latency</span>(
         <span className="st">&quot;&lt;1ms&quot;</span>),{" "}
         <span className="ty">Cap</span>::<span className="fn">Tag</span>(
@@ -3276,9 +3271,9 @@ const APPS: readonly AppCard[] = [
     body: "Robots don't need line-of-sight for networking. The mesh routes through whatever nodes are reachable. Reroute scheduled in sub-microsecond time. The assembly line doesn't stop.",
   },
   {
-    tag: "▸ 0x04 ─ disaster response",
-    title: "Disaster Response",
-    body: "Phones, drones, portable radios forming a mesh with no surviving infrastructure. The mesh forms from whatever is present and routes around whatever is gone.",
+    tag: "▸ 0x04 ─ energy & extraction",
+    title: "Energy Gids & Extraction",
+    body: "Substations, oil and gas pipelines, drilling rigs, mine haul trucks, distributed solar — coordinating in real time across geographies that fiber doesn't reach. Protective relays trip in single-digit milliseconds; the mesh isolates faults before they cascade. Routes through whatever radios and edge boxes survive.",
   },
   {
     tag: "▸ 0x05 ─ remote surgery",
