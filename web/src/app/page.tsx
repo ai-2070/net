@@ -1541,14 +1541,14 @@ function TopologyClassesSection() {
         {TOPOLOGY_CLASSES.map((c, i) => (
           <div
             key={c.title + "-body"}
-            className={`px-6 py-7 border-b border-line ${i < 2 ? "lg:border-r" : ""}`}
+            className={`flex flex-col px-6 py-7 border-b border-line ${i < 2 ? "lg:border-r" : ""}`}
           >
             <div
               className={`font-head text-[18px] leading-tight ${c.titleColor === "accent" ? "text-accent" : "text-ink"} mb-3.5 tracking-[0.04em] lowercase`}
             >
               {c.title}
             </div>
-            <div className="text-ink-dim text-[12px] leading-[1.6]">
+            <div className="text-ink-dim text-[12px] leading-[1.6] flex-1">
               {c.body}
             </div>
             <div className="mt-4 text-[11px] text-ink-dim border-t border-dashed border-ink-faint pt-3 space-y-1">
@@ -1607,7 +1607,7 @@ interface SpectrumMarker {
 const SPECTRUM_MARKERS: ReadonlyArray<SpectrumMarker> = [
   {
     x: 80,
-    label: "NET",
+    label: "NET*",
     sub: "mesh transport",
     color: "#c4ff3d",
     faint: "#6b8a1e",
@@ -1615,7 +1615,7 @@ const SPECTRUM_MARKERS: ReadonlyArray<SpectrumMarker> = [
   },
   {
     x: 687,
-    label: "REAL-TIME*",
+    label: "REAL-TIME†",
     sub: "CAN · EtherCAT · TSN",
     color: "#d4dcd0",
     faint: "#6b7568",
@@ -1788,7 +1788,10 @@ function LatencySpectrum() {
       </div>
 
       <p className="text-[10px] text-ink-faint mt-4 leading-[1.6] tracking-[0.04em]">
-        * real-time guarantees only on dedicated hardware. Net hits the
+        * 1 ns is the user-facing floor; hot-path primitives (forward,
+        capability check, pingwave) drop into single-digit and sub-nanosecond
+        territory.
+        <br />† real-time guarantees only on dedicated hardware. Net hits the
         nanosecond range on commodity wire.
       </p>
     </div>
