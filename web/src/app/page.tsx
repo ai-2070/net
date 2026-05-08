@@ -3002,6 +3002,11 @@ const FOOTER_RESOURCES: ReadonlyArray<{ href: string; label: string }> = [
   { href: "#", label: "Source (GitHub)" },
 ];
 
+const ET_YEAR = new Date().toLocaleString("en-US", {
+  timeZone: "America/New_York",
+  year: "numeric",
+});
+
 function Footer() {
   return (
     <footer className="px-6 pt-16 pb-7 border-t border-accent-dim">
@@ -3023,7 +3028,7 @@ function Footer() {
       </div>
 
       <div className="border-t border-line pt-6 flex justify-between text-[10px] text-ink-dim tracking-[0.1em] flex-wrap gap-4">
-        <span>© 2026 — NET // PROTOCOL.0x4E45·54</span>
+        <span>© {ET_YEAR} — NET // PROTOCOL.0x4E45·54</span>
         <span>
           <span className="text-accent">▸</span> Net status:{" "}
           <span className="text-accent">ONLINE</span>
