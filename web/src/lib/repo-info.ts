@@ -1,10 +1,35 @@
 import "server-only";
 
+import { marked } from "marked";
+
+marked.setOptions({ async: false, gfm: true, breaks: false });
+
+function renderMarkdown(text: string): string {
+  if (!text) return "";
+  try {
+    const html = marked.parse(text);
+    return typeof html === "string" ? html : "";
+  } catch {
+    return "";
+  }
+}
+
+export interface Release {
+  tag: string;
+  title: string;
+  codename: string | null;
+  bodyHtml: string;
+  publishedAt: string;
+  htmlUrl: string;
+  prerelease: boolean;
+}
+
 export interface RepoInfo {
   version: string;
   codename: string;
   buildDate: string;
   sha: string;
+  releases: ReadonlyArray<Release>;
 }
 
 const REPO = "ai-2070/net";
@@ -14,6 +39,7 @@ const FALLBACK: RepoInfo = {
   codename: "—",
   buildDate: "—",
   sha: "0000000",
+  releases: [],
 };
 
 interface GhCommit {
@@ -23,7 +49,11 @@ interface GhCommit {
 
 interface GhRelease {
   tag_name?: string;
-  name?: string;
+  name?: string | null;
+  body?: string | null;
+  published_at?: string | null;
+  html_url?: string;
+  prerelease?: boolean;
 }
 
 function extractCodename(title: string | undefined | null): string | null {
@@ -88,15 +118,47 @@ async function fetchHeadCommit(): Promise<{
   }
 }
 
+async function fetchAllReleases(): Promise<ReadonlyArray<Release>> {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${REPO}/releases?per_page=100`,
+      { headers: ghHeaders(), next: { revalidate: 3600 } },
+    );
+    if (!res.ok) return [];
+    const data = (await res.json()) as ReadonlyArray<GhRelease>;
+    return data.flatMap<Release>((r) => {
+      if (!r.tag_name) return [];
+      const md = (r.body ?? "").replace(/\r\n/g, "\n").trim();
+      return [
+        {
+          tag: r.tag_name,
+          title: r.name ?? r.tag_name,
+          codename: extractCodename(r.name),
+          bodyHtml: renderMarkdown(md),
+          publishedAt: r.published_at ?? "",
+          htmlUrl:
+            r.html_url ??
+            `https://github.com/${REPO}/releases/tag/${r.tag_name}`,
+          prerelease: r.prerelease ?? false,
+        },
+      ];
+    });
+  } catch {
+    return [];
+  }
+}
+
 export async function getRepoInfo(): Promise<RepoInfo> {
-  const [release, head] = await Promise.all([
+  const [release, head, releases] = await Promise.all([
     fetchLatestRelease(),
     fetchHeadCommit(),
+    fetchAllReleases(),
   ]);
   return {
     version: release?.tag ?? FALLBACK.version,
     codename: release?.codename ?? FALLBACK.codename,
     buildDate: head ? formatDate(head.date) : FALLBACK.buildDate,
     sha: head ? head.sha : FALLBACK.sha,
+    releases,
   };
 }
