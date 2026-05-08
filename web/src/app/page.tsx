@@ -3805,7 +3805,7 @@ function ReleasesSection() {
   return (
     <section id="releases" className="border-b border-line px-6 py-20">
       <SectionLabel>§11 / releases</SectionLabel>
-      <DisplayHeading>a working ledger.</DisplayHeading>
+      <DisplayHeading>latest releases.</DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
         Every tagged release pulled directly from{" "}
