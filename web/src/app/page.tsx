@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 
 interface Node3D {
   x: number;
@@ -2082,21 +2082,128 @@ const DAEMON_CASES: readonly DaemonCase[] = [
   },
 ];
 
+type CodeTokenCls = "kw" | "ty" | "fn" | "cm" | "st";
+
+interface CodeToken {
+  text: string;
+  cls?: CodeTokenCls;
+}
+
+const CODE_TOKEN_CLASSES = new Set<string>(["kw", "ty", "fn", "cm", "st"]);
+
+function isCodeTokenCls(s: unknown): s is CodeTokenCls {
+  return typeof s === "string" && CODE_TOKEN_CLASSES.has(s);
+}
+
+function flattenCodeJsx(node: React.ReactNode): CodeToken[] {
+  const out: CodeToken[] = [];
+  const walk = (n: React.ReactNode, cls?: CodeTokenCls): void => {
+    if (n == null || typeof n === "boolean") return;
+    if (typeof n === "string" || typeof n === "number") {
+      out.push({ text: String(n), cls });
+      return;
+    }
+    if (Array.isArray(n)) {
+      for (const child of n) walk(child, cls);
+      return;
+    }
+    if (typeof n === "object" && "props" in n) {
+      const elem = n as React.ReactElement<{
+        children?: React.ReactNode;
+        className?: string;
+      }>;
+      const cn = elem.props.className;
+      const newCls = isCodeTokenCls(cn) ? cn : cls;
+      walk(elem.props.children, newCls);
+    }
+  };
+  walk(node);
+  return out;
+}
+
+function totalChars(tokens: readonly CodeToken[]): number {
+  let n = 0;
+  for (const t of tokens) n += t.text.length;
+  return n;
+}
+
+function renderTypedTokens(
+  tokens: readonly CodeToken[],
+  charLimit: number,
+): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  let remaining = charLimit;
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (!t || remaining <= 0) break;
+    const slice =
+      t.text.length <= remaining ? t.text : t.text.slice(0, remaining);
+    if (t.cls) {
+      out.push(
+        <span key={i} className={t.cls}>
+          {slice}
+        </span>,
+      );
+    } else {
+      out.push(<Fragment key={i}>{slice}</Fragment>);
+    }
+    remaining -= slice.length;
+  }
+  return out;
+}
+
+const TYPING_CPS = 95;
+const DWELL_SECONDS = 1.4;
+
 function DaemonCaseBlock() {
-  const [idx, setIdx] = useState(0);
+  const caseIdxRef = useRef(0);
+  const charIdxRef = useRef(0);
+  const dwellRef = useRef(0);
   const pausedRef = useRef(false);
+  const [, forceUpdate] = useState(0);
+
+  const caseTokens = useMemo(
+    () => DAEMON_CASES.map((c) => flattenCodeJsx(c.code)),
+    [],
+  );
 
   useEffect(() => {
-    const id = window.setInterval(() => {
+    let rafId = 0;
+    let last = performance.now();
+    const loop = (now: number): void => {
+      const dt = (now - last) / 1000;
+      last = now;
       if (!pausedRef.current) {
-        setIdx((i) => (i + 1) % DAEMON_CASES.length);
+        const tokens = caseTokens[caseIdxRef.current] ?? [];
+        const total = totalChars(tokens);
+        if (charIdxRef.current < total) {
+          charIdxRef.current = Math.min(
+            total,
+            charIdxRef.current + dt * TYPING_CPS,
+          );
+        } else {
+          dwellRef.current += dt;
+          if (dwellRef.current >= DWELL_SECONDS) {
+            dwellRef.current = 0;
+            caseIdxRef.current =
+              (caseIdxRef.current + 1) % DAEMON_CASES.length;
+            charIdxRef.current = 0;
+          }
+        }
+        forceUpdate((n) => n + 1);
       }
-    }, 6500);
-    return () => window.clearInterval(id);
-  }, []);
+      rafId = requestAnimationFrame(loop);
+    };
+    rafId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafId);
+  }, [caseTokens]);
 
+  const idx = caseIdxRef.current;
   const current = DAEMON_CASES[idx];
+  const tokens = caseTokens[idx] ?? [];
   if (!current) return null;
+  const limit = Math.floor(charIdxRef.current);
+  const isTyping = limit < totalChars(tokens);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_0.9fr] gap-8 my-12 items-start">
@@ -2120,7 +2227,12 @@ function DaemonCaseBlock() {
                 key={i}
                 type="button"
                 aria-label={`Show case ${i + 1}`}
-                onClick={() => setIdx(i)}
+                onClick={() => {
+                  caseIdxRef.current = i;
+                  charIdxRef.current = 0;
+                  dwellRef.current = 0;
+                  forceUpdate((n) => n + 1);
+                }}
                 className={`w-1.5 h-1.5 rounded-full transition-colors cursor-pointer ${
                   i === idx ? "bg-accent" : "bg-ink-faint hover:bg-ink-dim"
                 }`}
@@ -2128,11 +2240,14 @@ function DaemonCaseBlock() {
             ))}
           </span>
         </div>
-        <pre
-          key={`code-${idx}`}
-          className="daemon-fade px-5 py-4 text-[12px] leading-[1.7] text-ink overflow-x-auto font-mono"
-        >
-          {current.code}
+        <pre className="px-5 py-4 text-[12px] leading-[1.7] text-ink overflow-x-auto font-mono min-h-[260px]">
+          {renderTypedTokens(tokens, limit)}
+          <span
+            className={isTyping ? "text-accent" : "cursor-blink"}
+            aria-hidden
+          >
+            ▋
+          </span>
         </pre>
       </div>
 

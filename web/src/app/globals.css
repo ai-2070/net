@@ -205,8 +205,27 @@
   }
 }
 
+/* blinking cursor for the typing daemon code block */
+@utility cursor-blink {
+  display: inline-block;
+  color: #c4ff3d;
+  animation: cursor-blink 0.85s step-end infinite;
+}
+
+@keyframes cursor-blink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  51%,
+  100% {
+    opacity: 0;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .daemon-fade {
+  .daemon-fade,
+  .cursor-blink {
     animation: none !important;
   }
 }
