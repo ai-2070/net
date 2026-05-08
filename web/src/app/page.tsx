@@ -3249,13 +3249,14 @@ function InstallSection() {
             onClick={() =>
               handleCopy(
                 "ffi-build",
-                "cargo build --release --features ffi,net",
+                "cargo build --release --features net,ffi,redex,cortex,netdb,redis,jetstream",
               )
             }
             aria-label="Copy cargo build command"
             className="text-accent font-mono cursor-pointer transition-colors hover:text-ink focus:outline-none focus:text-ink"
           >
-            cargo build --release --features ffi,net
+            cargo build --release --features
+            net,ffi,redex,cortex,netdb,redis,jetstream
           </button>
           {copied === "ffi-build" ? (
             <span
