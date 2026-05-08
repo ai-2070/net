@@ -1,0 +1,25 @@
+web/src/app/page.tsx
+  s_55265e6795d7b9::t_6b27f5a6f32e9b 6-7
+  s_55265e6795d7b9::t_f9c6782dfac999 933-942,944-947,958
+web/src/app/layout.tsx
+  s_55265e6795d7b9::t_02d3d1f1343564 40-43
+  s_55265e6795d7b9::t_4cbbbe1951b45e 5
+web/src/components/RepoInfoProvider.tsx
+  s_55265e6795d7b9::t_c546f62464485d 1-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "c531b2793663318038c51cdf4b8d6fc254f569b7",
+  "prompts": {},
+  "sessions": {
+    "s_55265e6795d7b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6bac1322-4c47-4293-a1fb-66a38b5f162f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
