@@ -3525,27 +3525,27 @@ const FOOTER_SPEC: ReadonlyArray<{ href: string; label: string }> = [
 const FOOTER_DOCS: ReadonlyArray<{ href: string; label: string }> = [
   {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/README.md",
-    label: "README.md // GitHub",
+    label: "README.md",
   },
   {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/COMPUTE.md",
-    label: "COMPUTE.md // GitHub",
+    label: "COMPUTE.md",
   },
   {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/CHANNELS.md",
-    label: "CHANNELS.md // GitHub",
+    label: "CHANNELS.md",
   },
   {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/SUBNETS.md",
-    label: "SUBNETS.md // GitHub",
+    label: "SUBNETS.md",
   },
   {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/SUBPROTOCOLS.md",
-    label: "SUBPROTOCOLS.md // GitHub",
+    label: "SUBPROTOCOLS.md",
   },
   {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/BENCHMARKS.md",
-    label: "BENCHMARKS.md // GitHub",
+    label: "BENCHMARKS.md",
   },
 ];
 
