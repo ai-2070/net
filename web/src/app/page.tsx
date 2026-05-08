@@ -1787,10 +1787,9 @@ function LatencySpectrum() {
         </svg>
       </div>
 
-      <p className="text-[10px] text-ink-faint mt-4 leading-[1.6] tracking-[0.04em]">
-        * 1 ns is the user-facing floor; hot-path primitives (forward,
-        capability check, pingwave) drop into single-digit and sub-nanosecond
-        territory.
+      <p className="text-[10px] text-ink-faint mt-4 leading-[1.6] tracking-[0.04em] font-mono">
+        * forward 0.20 ns · cap check 1.78 ns · pingwave 0.65 ns · header
+        serialize 1.31 ns (i9-14900K)
         <br />† real-time guarantees only on dedicated hardware. Net hits the
         nanosecond range on commodity wire.
       </p>
