@@ -189,6 +189,28 @@
   }
 }
 
+/* slide-up for new event log lines */
+@utility event-line-in {
+  animation: event-line-in 0.32s ease-out;
+}
+
+@keyframes event-line-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .event-line-in {
+    animation: none !important;
+  }
+}
+
 /* slide-up + fade for copy feedback toasts */
 @utility slide-up-fade {
   animation: slide-up-fade 1.4s ease-out forwards;

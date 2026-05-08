@@ -408,7 +408,7 @@ function MeshViz() {
 
   return (
     <div
-      className="hidden lg:block border border-line bg-bg-2 p-4 self-start"
+      className="border border-line bg-bg-2 p-4"
       onMouseEnter={() => {
         pausedRef.current = true;
       }}
@@ -562,6 +562,175 @@ function MeshStat({
   );
 }
 
+interface LiveEvent {
+  id: number;
+  ts: string;
+  type: string;
+  typeColor: string;
+  body: string;
+  metric: string;
+  metricColor: string;
+}
+
+let liveEventCounter = 0;
+
+function liveTs(): string {
+  const d = new Date();
+  const m = String(d.getMinutes()).padStart(2, "0");
+  const s = String(d.getSeconds()).padStart(2, "0");
+  const ms = String(d.getMilliseconds()).padStart(3, "0");
+  return `${m}:${s}.${ms}`;
+}
+
+function hex4(): string {
+  return Math.floor(Math.random() * 0x10000)
+    .toString(16)
+    .padStart(4, "0");
+}
+
+function randInt(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+const CAP_TAGS: ReadonlyArray<string> = [
+  "gpu:rtx-4090",
+  "vram:24gb",
+  "region:eu-west",
+  "tag:floor-A",
+  "lat:<200μs",
+];
+
+const EVENT_TEMPLATES: ReadonlyArray<() => Omit<LiveEvent, "id" | "ts">> = [
+  () => ({
+    type: "hb.ack",
+    typeColor: "text-accent-dim",
+    body: `0x${hex4()} ← 0x${hex4()}`,
+    metric: `${randInt(20, 60)}ns`,
+    metricColor: "text-ink",
+  }),
+  () => ({
+    type: "fwd.0",
+    typeColor: "text-accent",
+    body: `0x${hex4()} → 0x${hex4()}`,
+    metric: `${randInt(45, 80)}ns`,
+    metricColor: "text-accent",
+  }),
+  () => ({
+    type: "fwd.2",
+    typeColor: "text-accent",
+    body: `0x${hex4()} → 0x${hex4()}`,
+    metric: `${randInt(120, 280)}ns`,
+    metricColor: "text-accent",
+  }),
+  () => ({
+    type: "cap.read",
+    typeColor: "text-cyan",
+    body: CAP_TAGS[randInt(0, CAP_TAGS.length - 1)] ?? "gpu:rtx-4090",
+    metric: `${randInt(2, 8)}ns`,
+    metricColor: "text-ink-dim",
+  }),
+  () => ({
+    type: "route",
+    typeColor: "text-ink-dim",
+    body: `seq=${randInt(80000, 99999)} hops=${randInt(1, 4)}`,
+    metric: "—",
+    metricColor: "text-ink-faint",
+  }),
+  () => ({
+    type: "pingwave",
+    typeColor: "text-accent",
+    body: `swarm radius=${randInt(2, 5)}`,
+    metric: `${(0.6 + Math.random() * 0.5).toFixed(2)}ns`,
+    metricColor: "text-accent",
+  }),
+  () => ({
+    type: "rt.hit",
+    typeColor: "text-ink-dim",
+    body: `0x${hex4()}`,
+    metric: `${randInt(35, 42)}ns`,
+    metricColor: "text-ink",
+  }),
+  () => ({
+    type: "drop",
+    typeColor: "text-warn",
+    body: `0x${hex4()} buffer full`,
+    metric: "evicted",
+    metricColor: "text-warn",
+  }),
+];
+
+function makeLiveEvent(): LiveEvent {
+  const tpl = EVENT_TEMPLATES[randInt(0, EVENT_TEMPLATES.length - 1)];
+  const base: Omit<LiveEvent, "id" | "ts"> = tpl
+    ? tpl()
+    : {
+        type: "hb.ack",
+        typeColor: "text-accent-dim",
+        body: "",
+        metric: "—",
+        metricColor: "text-ink-faint",
+      };
+  return {
+    id: liveEventCounter++,
+    ts: liveTs(),
+    ...base,
+  };
+}
+
+const EVENT_LOG_LINES = 7;
+
+function MeshEventLog() {
+  const [events, setEvents] = useState<readonly LiveEvent[]>([]);
+
+  useEffect(() => {
+    setEvents(
+      Array.from({ length: EVENT_LOG_LINES }, () => makeLiveEvent()),
+    );
+    const id = window.setInterval(() => {
+      setEvents((prev) => [
+        ...prev.slice(-(EVENT_LOG_LINES - 1)),
+        makeLiveEvent(),
+      ]);
+    }, 600);
+    return () => window.clearInterval(id);
+  }, []);
+
+  return (
+    <div className="border border-line bg-bg-2 p-4">
+      <div className="flex justify-between items-center border-b border-line pb-2 mb-3.5 text-[10px] tracking-[0.12em] text-ink-dim uppercase">
+        <span>
+          <span className="text-accent">▸</span> event.tail
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block animate-pulse-dot" />
+          STREAMING
+        </span>
+      </div>
+      <div className="font-mono text-[10px] leading-[1.55] overflow-hidden min-h-[126px]">
+        {events.map((e) => (
+          <div
+            key={e.id}
+            className="event-line-in flex items-baseline gap-2 whitespace-nowrap overflow-hidden"
+          >
+            <span className="text-ink-faint shrink-0" style={{ minWidth: "9ch" }}>
+              {e.ts}
+            </span>
+            <span
+              className={`${e.typeColor} shrink-0`}
+              style={{ minWidth: "9ch" }}
+            >
+              {e.type}
+            </span>
+            <span className="text-ink-faint shrink-0">▸</span>
+            <span className="text-ink-dim flex-1 truncate">{e.body}</span>
+            <span className={`${e.metricColor} shrink-0`}>{e.metric}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
   { href: "#what", label: "SPEC" },
   { href: "#bench", label: "BENCH" },
@@ -694,7 +863,10 @@ function HeroSection() {
           </div>
         </div>
 
-        <MeshViz />
+        <div className="hidden lg:flex flex-col gap-4 self-start">
+          <MeshViz />
+          <MeshEventLog />
+        </div>
       </div>
     </section>
   );
