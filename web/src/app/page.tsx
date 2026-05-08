@@ -1483,6 +1483,7 @@ interface TopologyClass {
   body: string;
   floor: string;
   floorColor: "ink" | "accent";
+  throughput: string;
 }
 
 const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
@@ -1494,6 +1495,7 @@ const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
     body: "Optimized for delivery. Queues absorb bursts. Backpressure negotiated. Connections stateful. Trust assumed. Sender slows down when receiver can't keep up.",
     floor: "milliseconds",
     floorColor: "ink",
+    throughput: "~10K req/s · per connection",
   },
   {
     header: "// real-time",
@@ -1503,6 +1505,7 @@ const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
     body: "Optimized for deterministic timing. Fixed topologies. Dedicated hardware. Time-slotted access. Guarantees only because you own the wire.",
     floor: "microseconds*",
     floorColor: "ink",
+    throughput: "~100K updates/s · dedicated bus",
   },
   {
     header: "// net",
@@ -1512,6 +1515,7 @@ const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
     body: "Real-time latencies on commodity hardware over commodity networks. Drop instead of queue. Route around instead of wait. Observe instead of coordinate. Derive instead of query.",
     floor: "nanoseconds",
     floorColor: "accent",
+    throughput: "~20M events/s · per core",
   },
 ];
 
@@ -1547,13 +1551,23 @@ function TopologyClassesSection() {
             <div className="text-ink-dim text-[12px] leading-[1.6]">
               {c.body}
             </div>
-            <div className="mt-4 text-[11px] text-ink-dim border-t border-dashed border-ink-faint pt-3">
-              latency floor:{" "}
-              <b
-                className={`${c.floorColor === "accent" ? "text-accent" : "text-ink"} font-semibold`}
-              >
-                {c.floor}
-              </b>
+            <div className="mt-4 text-[11px] text-ink-dim border-t border-dashed border-ink-faint pt-3 space-y-1">
+              <div>
+                latency floor:{" "}
+                <b
+                  className={`${c.floorColor === "accent" ? "text-accent" : "text-ink"} font-semibold`}
+                >
+                  {c.floor}
+                </b>
+              </div>
+              <div>
+                throughput:{" "}
+                <b
+                  className={`${c.floorColor === "accent" ? "text-accent" : "text-ink"} font-semibold`}
+                >
+                  {c.throughput}
+                </b>
+              </div>
             </div>
           </div>
         ))}
@@ -1587,6 +1601,7 @@ interface SpectrumMarker {
   color: string;
   faint: string;
   glow?: boolean;
+  slower?: string;
 }
 
 const SPECTRUM_MARKERS: ReadonlyArray<SpectrumMarker> = [
@@ -1604,6 +1619,7 @@ const SPECTRUM_MARKERS: ReadonlyArray<SpectrumMarker> = [
     sub: "CAN · EtherCAT · TSN",
     color: "#d4dcd0",
     faint: "#6b7568",
+    slower: "~1,000× slower",
   },
   {
     x: 1120,
@@ -1611,6 +1627,7 @@ const SPECTRUM_MARKERS: ReadonlyArray<SpectrumMarker> = [
     sub: "cloud · TCP · gRPC",
     color: "#6b7568",
     faint: "#4a5249",
+    slower: "~1,000,000× slower",
   },
 ];
 
@@ -1624,7 +1641,7 @@ function LatencySpectrum() {
 
       <div className="overflow-x-auto">
         <svg
-          viewBox="0 0 1200 100"
+          viewBox="0 0 1200 108"
           className="w-full"
           style={{ minWidth: 720 }}
           preserveAspectRatio="xMidYMid meet"
@@ -1643,9 +1660,33 @@ function LatencySpectrum() {
               >
                 {m.label}
               </text>
+              {m.slower ? (
+                <>
+                  <rect
+                    x={m.x - (m.slower.length * 5.5) / 2 - 6}
+                    y={18}
+                    width={m.slower.length * 5.5 + 12}
+                    height={13}
+                    fill="#0a0c0a"
+                    rx="2"
+                  />
+                  <text
+                    x={m.x}
+                    y="28"
+                    fontFamily="JetBrains Mono"
+                    fontSize="9"
+                    fill={m.color}
+                    textAnchor="middle"
+                    letterSpacing="0.4"
+                    fontStyle="italic"
+                  >
+                    {m.slower}
+                  </text>
+                </>
+              ) : null}
               <text
                 x={m.x}
-                y="26"
+                y="38"
                 fontFamily="JetBrains Mono"
                 fontSize="8"
                 fill={m.faint}
@@ -1656,16 +1697,16 @@ function LatencySpectrum() {
               </text>
               <line
                 x1={m.x}
-                y1="32"
+                y1="44"
                 x2={m.x}
-                y2="52"
+                y2="62"
                 stroke={m.color}
                 strokeWidth="0.7"
                 strokeOpacity="0.55"
                 strokeDasharray="2 2"
               />
               <polygon
-                points={`${m.x - 4},48 ${m.x + 4},48 ${m.x},54`}
+                points={`${m.x - 4},58 ${m.x + 4},58 ${m.x},64`}
                 fill={m.color}
                 opacity="0.85"
               />
@@ -1674,9 +1715,9 @@ function LatencySpectrum() {
 
           <line
             x1="80"
-            y1="60"
+            y1="70"
             x2="1120"
-            y2="60"
+            y2="70"
             stroke="#2d352c"
             strokeWidth="1"
           />
@@ -1685,15 +1726,15 @@ function LatencySpectrum() {
             <g key={t.exp}>
               <line
                 x1={t.x}
-                y1="56"
+                y1="66"
                 x2={t.x}
-                y2="64"
+                y2="74"
                 stroke="#6b7568"
                 strokeWidth="0.7"
               />
               <text
                 x={t.x}
-                y="78"
+                y="86"
                 fontFamily="JetBrains Mono"
                 fontSize="10"
                 fill="#6b7568"
@@ -1706,7 +1747,7 @@ function LatencySpectrum() {
               </text>
               <text
                 x={t.x}
-                y="92"
+                y="100"
                 fontFamily="JetBrains Mono"
                 fontSize="8"
                 fill="#4a5249"
@@ -1723,7 +1764,7 @@ function LatencySpectrum() {
               {m.glow ? (
                 <circle
                   cx={m.x}
-                  cy="60"
+                  cy="70"
                   r="9"
                   fill="none"
                   stroke={m.color}
@@ -1732,7 +1773,7 @@ function LatencySpectrum() {
               ) : null}
               <circle
                 cx={m.x}
-                cy="60"
+                cy="70"
                 r={m.glow ? 5 : 4}
                 fill={m.color}
                 style={
