@@ -3133,8 +3133,8 @@ function Footer() {
         <div>
           <div className="logo-mark font-display text-[22px] text-ink tracking-[0.1em] flex items-baseline gap-2.5 mb-4">
             net{" "}
-            <span className="font-mono text-[9px] text-accent tracking-[0.15em] font-semibold">
-              // NET 2070
+            <span className="font-mono text-[9px] tracking-[0.15em] font-semibold">
+              // AI 2070
             </span>
           </div>
           <p className="text-ink-dim text-[12px] leading-[1.6] max-w-[380px]">
@@ -3152,7 +3152,7 @@ function Footer() {
           <span className="text-accent">▸</span> Net status:{" "}
           <span className="text-accent">ONLINE</span>
         </span>
-        <span>// AI 2070</span>
+        <span className="shimmer-2070">// AI 2070</span>
       </div>
     </footer>
   );

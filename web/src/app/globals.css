@@ -189,6 +189,39 @@
   }
 }
 
+/* shimmer for the // AI 2070 footer badge */
+@utility shimmer-2070 {
+  background: linear-gradient(
+    110deg,
+    #c4ff3d 32%,
+    #ecffaa 48%,
+    #ffffff 50%,
+    #ecffaa 52%,
+    #c4ff3d 68%
+  );
+  background-size: 220% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: shimmer-2070 3.6s linear infinite;
+}
+
+@keyframes shimmer-2070 {
+  0% {
+    background-position: 220% 0;
+  }
+  100% {
+    background-position: -120% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shimmer-2070 {
+    animation: none !important;
+  }
+}
+
 /* live status dot */
 @utility live-dot {
   &::before {
