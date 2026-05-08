@@ -1701,12 +1701,12 @@ interface GroupCard {
   spec: ReadonlyArray<readonly [string, string]>;
 }
 
-interface StandbyPhase {
+interface AsciiPhase {
   rows: ReadonlyArray<React.ReactNode>;
   caption: React.ReactNode;
 }
 
-const STANDBY_PHASES: ReadonlyArray<StandbyPhase> = [
+const STANDBY_PHASES: ReadonlyArray<AsciiPhase> = [
   {
     rows: [
       <>
@@ -1761,17 +1761,125 @@ const STANDBY_PHASES: ReadonlyArray<StandbyPhase> = [
   },
 ];
 
-function StandbyAsciiCycle() {
+const REPLICA_PHASES: ReadonlyArray<AsciiPhase> = [
+  {
+    rows: [
+      <>
+        member 0{"  "}
+        <span className="text-accent">●</span> event #58 → result
+      </>,
+      <>
+        member 1{"  "}
+        <span className="text-ink-faint">○</span> idle
+      </>,
+      <>
+        member 2{"  "}
+        <span className="text-ink-faint">○</span> idle
+      </>,
+    ],
+    caption: <>round-robin · seq=58</>,
+  },
+  {
+    rows: [
+      <>
+        member 0{"  "}
+        <span className="text-ink-faint">○</span> idle
+      </>,
+      <>
+        member 1{"  "}
+        <span className="text-accent">●</span> event #59 → result
+      </>,
+      <>
+        member 2{"  "}
+        <span className="text-ink-faint">○</span> idle
+      </>,
+    ],
+    caption: <>round-robin · seq=59</>,
+  },
+  {
+    rows: [
+      <>
+        member 0{"  "}
+        <span className="text-ink-faint">○</span> idle
+      </>,
+      <>
+        member 1{"  "}
+        <span className="text-ink-faint">○</span> idle
+      </>,
+      <>
+        member 2{"  "}
+        <span className="text-accent">●</span> event #60 → result
+      </>,
+    ],
+    caption: <>round-robin · seq=60</>,
+  },
+];
+
+const FORK_PHASES: ReadonlyArray<AsciiPhase> = [
+  {
+    rows: [
+      <>parent @ seq=42</>,
+      <>
+        {"   "}
+        <span className="text-ink-faint">·</span> single chain, no divergence
+      </>,
+      <>
+        {"   "}
+        <span className="text-ink-faint">·</span> awaiting fork directive
+      </>,
+    ],
+    caption: <>pre-fork · monitoring</>,
+  },
+  {
+    rows: [
+      <>
+        {"   ├─▶ "}fork.A{" "}
+        <span className="text-accent">(sentinel)</span>
+      </>,
+      <>
+        {"   ├─▶ "}fork.B{" "}
+        <span className="text-accent">(sentinel)</span>
+      </>,
+      <>
+        {"   └─▶ "}fork.C{" "}
+        <span className="text-accent">(sentinel)</span>
+      </>,
+    ],
+    caption: <>forking · sentinels written from seq=42</>,
+  },
+  {
+    rows: [
+      <>
+        fork.A @ seq=58 <span className="text-ink-faint">─ diverged</span>
+      </>,
+      <>
+        fork.B @ seq=53 <span className="text-ink-faint">─ diverged</span>
+      </>,
+      <>
+        fork.C @ seq=61 <span className="text-ink-faint">─ diverged</span>
+      </>,
+    ],
+    caption: <>verifiable lineage → parent @ 42</>,
+  },
+];
+
+function AsciiCycle({
+  phases,
+  intervalMs = 3500,
+}: {
+  phases: ReadonlyArray<AsciiPhase>;
+  intervalMs?: number;
+}) {
   const [phase, setPhase] = useState(0);
 
   useEffect(() => {
     const id = window.setInterval(() => {
-      setPhase((p) => (p + 1) % STANDBY_PHASES.length);
-    }, 3500);
+      setPhase((p) => (p + 1) % phases.length);
+    }, intervalMs);
     return () => window.clearInterval(id);
-  }, []);
+  }, [phases.length, intervalMs]);
 
-  const current = STANDBY_PHASES[phase];
+  const current = phases[phase];
   if (!current) return null;
 
   return (
@@ -1793,17 +1901,7 @@ const GROUP_CARDS: readonly GroupCard[] = [
     id: "▸ GRP.01",
     name: "replica",
     meta: "N interchangeable copies · load-balanced",
-    ascii: (
-      <>
-        members 0..N{"\n"}
-        {"   ▶ "}
-        <span className="text-accent">all active</span>
-        {"\n"}
-        {"   ▶ deterministic identity\n   ▶ stateless work\n"}
-        load balancer fans out{"\n"}
-        event → any member → result
-      </>
-    ),
+    ascii: <AsciiCycle phases={REPLICA_PHASES} intervalMs={2200} />,
     body: (
       <>
         For horizontal scale on stateless workloads.{" "}
@@ -1825,22 +1923,7 @@ const GROUP_CARDS: readonly GroupCard[] = [
     id: "▸ GRP.02",
     name: "fork",
     meta: "independent siblings · documented lineage",
-    ascii: (
-      <>
-        parent @ seq=42{"\n"}
-        {"   ├─▶ fork.A "}
-        <span className="text-accent">(sentinel)</span>
-        {"\n"}
-        {"   ├─▶ fork.B "}
-        <span className="text-accent">(sentinel)</span>
-        {"\n"}
-        {"   └─▶ fork.C "}
-        <span className="text-accent">(sentinel)</span>
-        {"\n"}
-        each chain diverges{"\n"}
-        verifiable lineage to parent
-      </>
-    ),
+    ascii: <AsciiCycle phases={FORK_PHASES} intervalMs={3500} />,
     body: (
       <>
         For experiments, A/B testing, scenario branching.{" "}
@@ -1862,7 +1945,7 @@ const GROUP_CARDS: readonly GroupCard[] = [
     id: "▸ GRP.03",
     name: "standby",
     meta: "1 active · N-1 warm · zero duplicate compute",
-    ascii: <StandbyAsciiCycle />,
+    ascii: <AsciiCycle phases={STANDBY_PHASES} intervalMs={3500} />,
     body: (
       <>
         For stateful daemons that need fault tolerance without paying for
