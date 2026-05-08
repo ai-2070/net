@@ -562,6 +562,8 @@ function MeshStat({
   );
 }
 
+type EventHighlight = "accent" | "warn" | "cyan";
+
 interface LiveEvent {
   id: number;
   ts: string;
@@ -570,6 +572,12 @@ interface LiveEvent {
   body: string;
   metric: string;
   metricColor: string;
+  highlight?: EventHighlight;
+}
+
+interface EventTemplate {
+  weight: number;
+  gen: () => Omit<LiveEvent, "id" | "ts">;
 }
 
 let liveEventCounter = 0;
@@ -592,88 +600,191 @@ function randInt(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+function pick<T>(arr: ReadonlyArray<T>, fallback: T): T {
+  return arr[randInt(0, arr.length - 1)] ?? fallback;
+}
+
 const CAP_TAGS: ReadonlyArray<string> = [
   "gpu:rtx-4090",
   "vram:24gb",
   "region:eu-west",
   "tag:floor-A",
   "lat:<200μs",
+  "tag:nyse-colo",
 ];
 
-const EVENT_TEMPLATES: ReadonlyArray<() => Omit<LiveEvent, "id" | "ts">> = [
-  () => ({
-    type: "hb.ack",
-    typeColor: "text-accent-dim",
-    body: `0x${hex4()} ← 0x${hex4()}`,
-    metric: `${randInt(20, 60)}ns`,
-    metricColor: "text-ink",
-  }),
-  () => ({
-    type: "fwd.0",
-    typeColor: "text-accent",
-    body: `0x${hex4()} → 0x${hex4()}`,
-    metric: `${randInt(45, 80)}ns`,
-    metricColor: "text-accent",
-  }),
-  () => ({
-    type: "fwd.2",
-    typeColor: "text-accent",
-    body: `0x${hex4()} → 0x${hex4()}`,
-    metric: `${randInt(120, 280)}ns`,
-    metricColor: "text-accent",
-  }),
-  () => ({
-    type: "cap.read",
-    typeColor: "text-cyan",
-    body: CAP_TAGS[randInt(0, CAP_TAGS.length - 1)] ?? "gpu:rtx-4090",
-    metric: `${randInt(2, 8)}ns`,
-    metricColor: "text-ink-dim",
-  }),
-  () => ({
-    type: "route",
-    typeColor: "text-ink-dim",
-    body: `seq=${randInt(80000, 99999)} hops=${randInt(1, 4)}`,
-    metric: "—",
-    metricColor: "text-ink-faint",
-  }),
-  () => ({
-    type: "pingwave",
-    typeColor: "text-accent",
-    body: `swarm radius=${randInt(2, 5)}`,
-    metric: `${(0.6 + Math.random() * 0.5).toFixed(2)}ns`,
-    metricColor: "text-accent",
-  }),
-  () => ({
-    type: "rt.hit",
-    typeColor: "text-ink-dim",
-    body: `0x${hex4()}`,
-    metric: `${randInt(35, 42)}ns`,
-    metricColor: "text-ink",
-  }),
-  () => ({
-    type: "drop",
-    typeColor: "text-warn",
-    body: `0x${hex4()} buffer full`,
-    metric: "evicted",
-    metricColor: "text-warn",
-  }),
+const DAEMON_NAMES: ReadonlyArray<string> = [
+  "trader",
+  "fusion",
+  "infer",
+  "plc",
+  "agent",
+  "router",
 ];
 
-function makeLiveEvent(): LiveEvent {
-  const tpl = EVENT_TEMPLATES[randInt(0, EVENT_TEMPLATES.length - 1)];
-  const base: Omit<LiveEvent, "id" | "ts"> = tpl
-    ? tpl()
-    : {
+const WALL_REASONS: ReadonlyArray<string> = [
+  "cap-mismatch",
+  "ttl-expired",
+  "rate-limit",
+  "unsigned",
+  "loop-detected",
+];
+
+const EVENT_TEMPLATES: ReadonlyArray<EventTemplate> = [
+  {
+    weight: 6,
+    gen: () => ({
+      type: "hb.ack",
+      typeColor: "text-accent-dim",
+      body: `0x${hex4()} ← 0x${hex4()}`,
+      metric: `${randInt(28, 60)}ns`,
+      metricColor: "text-ink",
+    }),
+  },
+  {
+    weight: 5,
+    gen: () => ({
+      type: "fwd.0",
+      typeColor: "text-accent",
+      body: `0x${hex4()} → 0x${hex4()}`,
+      metric: `${randInt(45, 80)}ns`,
+      metricColor: "text-accent",
+    }),
+  },
+  {
+    weight: 3,
+    gen: () => ({
+      type: "fwd.path",
+      typeColor: "text-accent",
+      body: `0x${hex4()} → 0x${hex4()} → 0x${hex4()}`,
+      metric: `${randInt(120, 280)}ns`,
+      metricColor: "text-accent",
+    }),
+  },
+  {
+    weight: 3,
+    gen: () => ({
+      type: "rt.hit",
+      typeColor: "text-ink-dim",
+      body: `0x${hex4()} cached`,
+      metric: `${randInt(35, 42)}ns`,
+      metricColor: "text-ink",
+    }),
+  },
+  {
+    weight: 3,
+    gen: () => ({
+      type: "cap.read",
+      typeColor: "text-cyan",
+      body: pick(CAP_TAGS, "gpu:rtx-4090"),
+      metric: `${randInt(28, 48)}ns`,
+      metricColor: "text-ink-dim",
+    }),
+  },
+  {
+    weight: 2,
+    gen: () => ({
+      type: "route",
+      typeColor: "text-ink-dim",
+      body: `seq=${randInt(80000, 99999)} hops=${randInt(1, 4)}`,
+      metric: "—",
+      metricColor: "text-ink-faint",
+    }),
+  },
+  {
+    weight: 2,
+    gen: () => ({
+      type: "pingwave",
+      typeColor: "text-accent",
+      body: `swarm radius=${randInt(2, 5)}`,
+      metric: `${randInt(32, 58)}ns`,
+      metricColor: "text-accent",
+    }),
+  },
+  {
+    weight: 1,
+    gen: () => ({
+      type: "peer.new",
+      typeColor: "text-cyan",
+      body: `0x${hex4()} ↑ joined subnet`,
+      metric: `${randInt(95, 150)}ns`,
+      metricColor: "text-cyan",
+      highlight: "cyan",
+    }),
+  },
+  {
+    weight: 1,
+    gen: () => ({
+      type: "mikoshi",
+      typeColor: "text-accent",
+      body: `${pick(DAEMON_NAMES, "trader")}-${hex4()} ↗ node.0x${hex4()}`,
+      metric: `${randInt(220, 320)}ns`,
+      metricColor: "text-accent",
+      highlight: "accent",
+    }),
+  },
+  {
+    weight: 1,
+    gen: () => ({
+      type: "superpose",
+      typeColor: "text-accent",
+      body: `0x${hex4()} dual-active 12–50ns`,
+      metric: `${randInt(35, 42)}ns`,
+      metricColor: "text-accent",
+      highlight: "accent",
+    }),
+  },
+  {
+    weight: 1,
+    gen: () => ({
+      type: "wall.drop",
+      typeColor: "text-warn",
+      body: `0x${hex4()} ${pick(WALL_REASONS, "cap-mismatch")}`,
+      metric: "blocked",
+      metricColor: "text-warn",
+      highlight: "warn",
+    }),
+  },
+  {
+    weight: 1,
+    gen: () => ({
+      type: "drop",
+      typeColor: "text-warn",
+      body: `0x${hex4()} buffer full`,
+      metric: "evicted",
+      metricColor: "text-warn",
+    }),
+  },
+];
+
+const TOTAL_EVENT_WEIGHT = EVENT_TEMPLATES.reduce((s, t) => s + t.weight, 0);
+
+function pickEventTemplate(): EventTemplate {
+  let r = Math.random() * TOTAL_EVENT_WEIGHT;
+  for (const t of EVENT_TEMPLATES) {
+    r -= t.weight;
+    if (r <= 0) return t;
+  }
+  return (
+    EVENT_TEMPLATES[0] ?? {
+      weight: 1,
+      gen: () => ({
         type: "hb.ack",
         typeColor: "text-accent-dim",
         body: "",
         metric: "—",
         metricColor: "text-ink-faint",
-      };
+      }),
+    }
+  );
+}
+
+function makeLiveEvent(): LiveEvent {
+  const tpl = pickEventTemplate();
   return {
     id: liveEventCounter++,
     ts: liveTs(),
-    ...base,
+    ...tpl.gen(),
   };
 }
 
@@ -683,15 +794,15 @@ function MeshEventLog() {
   const [events, setEvents] = useState<readonly LiveEvent[]>([]);
 
   useEffect(() => {
-    setEvents(
-      Array.from({ length: EVENT_LOG_LINES }, () => makeLiveEvent()),
-    );
+    setEvents(Array.from({ length: EVENT_LOG_LINES }, () => makeLiveEvent()));
+
     const id = window.setInterval(() => {
-      setEvents((prev) => [
-        ...prev.slice(-(EVENT_LOG_LINES - 1)),
-        makeLiveEvent(),
-      ]);
-    }, 600);
+      const r = Math.random();
+      const burst = r < 0.05 ? 3 : r < 0.18 ? 2 : 1;
+      const fresh = Array.from({ length: burst }, () => makeLiveEvent());
+      setEvents((prev) => [...prev, ...fresh].slice(-EVENT_LOG_LINES));
+    }, 450);
+
     return () => window.clearInterval(id);
   }, []);
 
@@ -703,29 +814,45 @@ function MeshEventLog() {
         </span>
         <span className="flex items-center gap-1.5">
           <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block animate-pulse-dot" />
-          STREAMING
+          SIMULATED
         </span>
       </div>
-      <div className="font-mono text-[10px] leading-[1.55] overflow-hidden min-h-[126px]">
-        {events.map((e) => (
-          <div
-            key={e.id}
-            className="event-line-in flex items-baseline gap-2 whitespace-nowrap overflow-hidden"
-          >
-            <span className="text-ink-faint shrink-0" style={{ minWidth: "9ch" }}>
-              {e.ts}
-            </span>
-            <span
-              className={`${e.typeColor} shrink-0`}
-              style={{ minWidth: "9ch" }}
+      <div className="font-mono text-[10px] leading-[1.55] overflow-hidden min-h-[126px] -mx-4">
+        {events.map((e) => {
+          const bg =
+            e.highlight === "accent"
+              ? "bg-accent/[0.08]"
+              : e.highlight === "warn"
+                ? "bg-warn/[0.08]"
+                : e.highlight === "cyan"
+                  ? "bg-cyan/[0.08]"
+                  : "";
+          return (
+            <div
+              key={e.id}
+              className={`event-line-in flex items-baseline gap-2 whitespace-nowrap overflow-hidden px-4 ${bg}`}
             >
-              {e.type}
-            </span>
-            <span className="text-ink-faint shrink-0">▸</span>
-            <span className="text-ink-dim flex-1 truncate">{e.body}</span>
-            <span className={`${e.metricColor} shrink-0`}>{e.metric}</span>
-          </div>
-        ))}
+              <span
+                className="text-ink-faint shrink-0"
+                style={{ minWidth: "9ch" }}
+              >
+                {e.ts}
+              </span>
+              <span
+                className={`${e.typeColor} shrink-0`}
+                style={{ minWidth: "9ch" }}
+              >
+                {e.type}
+              </span>
+              <span className="text-ink-faint shrink-0">▸</span>
+              <span className="text-ink-dim flex-1 truncate">{e.body}</span>
+              <span className={`${e.metricColor} shrink-0`}>{e.metric}</span>
+            </div>
+          );
+        })}
+      </div>
+      <div className="border-t border-line mt-3 pt-2 flex justify-between text-[9px] text-ink-faint tracking-[0.1em] uppercase font-mono">
+        <span>● 450ms tick</span>
       </div>
     </div>
   );
