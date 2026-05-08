@@ -1701,6 +1701,93 @@ interface GroupCard {
   spec: ReadonlyArray<readonly [string, string]>;
 }
 
+interface StandbyPhase {
+  rows: ReadonlyArray<React.ReactNode>;
+  caption: React.ReactNode;
+}
+
+const STANDBY_PHASES: ReadonlyArray<StandbyPhase> = [
+  {
+    rows: [
+      <>
+        active{"   "}
+        <span className="text-accent">●</span> processing seq=102
+      </>,
+      <>
+        standby{"  "}
+        <span className="text-ink-faint">○</span> synced_through=98
+      </>,
+      <>
+        standby{"  "}
+        <span className="text-ink-faint">○</span> synced_through=101
+      </>,
+    ],
+    caption: <>all healthy · 3 nodes online</>,
+  },
+  {
+    rows: [
+      <>
+        active{"   "}
+        <span className="text-warn">×</span> failed @ seq=102
+      </>,
+      <>
+        standby{"  "}
+        <span className="text-accent">↑</span> promoting (sync=101)
+      </>,
+      <>
+        standby{"  "}
+        <span className="text-ink-faint">○</span> synced_through=101
+      </>,
+    ],
+    caption: <>replaying buffered events ▸ seq=103</>,
+  },
+  {
+    rows: [
+      <>
+        active{"   "}
+        <span className="text-accent">●</span> processing seq=104{"  "}
+        <span className="text-ink-faint">(was member 1)</span>
+      </>,
+      <>
+        standby{"  "}
+        <span className="text-ink-faint">○</span> synced_through=104
+      </>,
+      <>
+        standby{"  "}
+        <span className="text-ink-faint">○</span> synced_through=104
+      </>,
+    ],
+    caption: <>continuity preserved · 0 events lost</>,
+  },
+];
+
+function StandbyAsciiCycle() {
+  const [phase, setPhase] = useState(0);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setPhase((p) => (p + 1) % STANDBY_PHASES.length);
+    }, 3500);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const current = STANDBY_PHASES[phase];
+  if (!current) return null;
+
+  return (
+    <>
+      {current.rows.map((row, i) => (
+        <Fragment key={i}>
+          {row}
+          {"\n"}
+        </Fragment>
+      ))}
+      {"\n"}
+      {current.caption}
+    </>
+  );
+}
+
 const GROUP_CARDS: readonly GroupCard[] = [
   {
     id: "▸ GRP.01",
@@ -1775,20 +1862,7 @@ const GROUP_CARDS: readonly GroupCard[] = [
     id: "▸ GRP.03",
     name: "standby",
     meta: "1 active · N-1 warm · zero duplicate compute",
-    ascii: (
-      <>
-        active{"   "}
-        <span className="text-accent">●</span> processing seq=102{"\n"}
-        standby{"  "}
-        <span className="text-ink-faint">○</span> synced_through=98{"\n"}
-        standby{"  "}
-        <span className="text-ink-faint">○</span> synced_through=101{"\n\n"}
-        active fails → promote(member 1){"\n"}
-        {
-          "   replays buffered events → seq=103\n   member 1 is now authoritative"
-        }
-      </>
-    ),
+    ascii: <StandbyAsciiCycle />,
     body: (
       <>
         For stateful daemons that need fault tolerance without paying for
