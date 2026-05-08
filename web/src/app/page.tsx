@@ -803,7 +803,7 @@ function MeshEventLog() {
       const burst = r < 0.05 ? 3 : r < 0.18 ? 2 : 1;
       const fresh = Array.from({ length: burst }, () => makeLiveEvent());
       setEvents((prev) => [...prev, ...fresh].slice(-EVENT_LOG_LINES));
-    }, 450);
+    }, 3000);
 
     return () => window.clearInterval(id);
   }, []);
