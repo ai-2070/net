@@ -3273,7 +3273,7 @@ const APPS: readonly AppCard[] = [
   {
     tag: "▸ 0x04 ─ energy grids & extraction",
     title: "Energy Grids & Extraction",
-    body: "Substations, oil and gas pipelines, drilling rigs, mine haul trucks, distributed solar — coordinating in real time across geographies that fiber doesn't reach. Protective relays trip in single-digit milliseconds; the mesh isolates faults before they cascade. Routes through whatever radios and edge boxes survive.",
+    body: "Electrical substations, oil and gas pipelines, drilling rigs, mine haul trucks, distributed solar — coordinating in real time across geographies that fiber doesn't reach. Protective relays trip in single-digit milliseconds; the mesh isolates faults before they cascade. Routes through whatever radios and edge boxes survive.",
   },
   {
     tag: "▸ 0x05 ─ remote surgery",
