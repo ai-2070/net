@@ -3271,8 +3271,8 @@ const APPS: readonly AppCard[] = [
     body: "Robots don't need line-of-sight for networking. The mesh routes through whatever nodes are reachable. Reroute scheduled in sub-microsecond time. The assembly line doesn't stop.",
   },
   {
-    tag: "▸ 0x04 ─ energy & extraction",
-    title: "Energy Gids & Extraction",
+    tag: "▸ 0x04 ─ energy grids & extraction",
+    title: "Energy Grids & Extraction",
     body: "Substations, oil and gas pipelines, drilling rigs, mine haul trucks, distributed solar — coordinating in real time across geographies that fiber doesn't reach. Protective relays trip in single-digit milliseconds; the mesh isolates faults before they cascade. Routes through whatever radios and edge boxes survive.",
   },
   {
