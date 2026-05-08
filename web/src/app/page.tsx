@@ -1,74 +1,87 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-type NodeId = "A" | "G" | "R1" | "R2" | "B" | "R3" | "R4";
-
-const NODE_POS: Record<NodeId, readonly [number, number]> = {
-  A: [60, 40],
-  G: [160, 80],
-  R1: [260, 50],
-  R2: [100, 160],
-  B: [220, 170],
-  R3: [290, 130],
-  R4: [40, 110],
-};
-
-const NODE_ADJ: Record<NodeId, readonly NodeId[]> = {
-  A: ["G", "R2", "R4"],
-  G: ["A", "R1", "R2", "B"],
-  R1: ["G", "R3"],
-  R2: ["G", "A", "B", "R4"],
-  B: ["G", "R2", "R3"],
-  R3: ["R1", "B"],
-  R4: ["R2", "A"],
-};
-
-const EDGE_ALIAS: Record<string, string> = {
-  "A-G": "A-G",
-  "G-R1": "G-R1",
-  "G-R2": "G-R2",
-  "B-G": "G-B",
-  "B-R2": "R2-B",
-  "A-R2": "A-R2",
-  "R1-R3": "R1-R3",
-  "B-R3": "R3-B",
-  "R2-R4": "R4-R2",
-  "A-R4": "R4-A",
-};
-
-const NODE_LABEL_ORDER: readonly NodeId[] = [
-  "A",
-  "G",
-  "R1",
-  "R2",
-  "B",
-  "R3",
-  "R4",
-];
-
-const ENDPOINT_PAIRS: ReadonlyArray<readonly [NodeId, NodeId]> = [
-  ["A", "B"],
-  ["B", "A"],
-  ["A", "R3"],
-  ["R4", "B"],
-  ["A", "R1"],
-];
-
-function edgeKey(a: NodeId, b: NodeId): string {
-  return [a, b].sort().join("-");
+interface Node3D {
+  x: number;
+  y: number;
+  z: number;
+  hasLabel?: boolean;
 }
 
-function shortestPath(from: NodeId, to: NodeId): NodeId[] {
-  const queue: NodeId[][] = [[from]];
-  const seen = new Set<NodeId>([from]);
+const NODES_3D: Record<string, Node3D> = {
+  N0: { x: -0.85, y: -0.18, z: 0.3, hasLabel: true },
+  N1: { x: -0.55, y: 0.4, z: -0.25, hasLabel: true },
+  N2: { x: -0.15, y: -0.55, z: 0.55 },
+  N3: { x: 0.05, y: -0.05, z: 0.1, hasLabel: true },
+  N4: { x: 0.2, y: 0.55, z: -0.4 },
+  N5: { x: 0.5, y: -0.3, z: 0.6, hasLabel: true },
+  N6: { x: 0.85, y: 0.2, z: 0.15, hasLabel: true },
+  N7: { x: 0.7, y: -0.55, z: -0.3 },
+  N8: { x: -0.4, y: -0.65, z: -0.2 },
+  N9: { x: -0.05, y: 0.65, z: 0.4, hasLabel: true },
+  N10: { x: 0.5, y: 0.55, z: 0.2 },
+  N11: { x: -0.75, y: 0.1, z: -0.55, hasLabel: true },
+};
+
+const NODE_IDS_3D: ReadonlyArray<string> = Object.keys(NODES_3D);
+
+const ADJ_3D: Record<string, ReadonlyArray<string>> = {
+  N0: ["N1", "N2", "N11"],
+  N1: ["N0", "N3", "N9", "N11"],
+  N2: ["N0", "N3", "N5", "N8"],
+  N3: ["N1", "N2", "N4", "N6", "N9"],
+  N4: ["N3", "N9", "N10"],
+  N5: ["N2", "N6", "N7"],
+  N6: ["N3", "N5", "N7", "N10"],
+  N7: ["N5", "N6", "N8", "N11"],
+  N8: ["N2", "N7", "N11"],
+  N9: ["N1", "N3", "N4"],
+  N10: ["N4", "N6"],
+  N11: ["N0", "N1", "N7", "N8"],
+};
+
+function edgeKey3D(a: string, b: string): string {
+  return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+const EDGES_3D: ReadonlyArray<readonly [string, string]> = (() => {
+  const seen = new Set<string>();
+  const out: Array<readonly [string, string]> = [];
+  for (const [a, neighbors] of Object.entries(ADJ_3D)) {
+    for (const b of neighbors) {
+      const key = edgeKey3D(a, b);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push([a, b] as const);
+    }
+  }
+  return out;
+})();
+
+const ENDPOINT_POOL_3D: ReadonlyArray<string> = [
+  "N0",
+  "N5",
+  "N6",
+  "N7",
+  "N9",
+  "N10",
+  "N11",
+];
+
+function shortestPath3D(from: string, to: string): string[] {
+  const queue: string[][] = [[from]];
+  const seen = new Set<string>([from]);
   while (queue.length > 0) {
     const path = queue.shift();
     if (!path) break;
     const last = path[path.length - 1];
+    if (!last) continue;
     if (last === to) return path;
-    for (const n of NODE_ADJ[last]) {
+    const adj = ADJ_3D[last];
+    if (!adj) continue;
+    for (const n of adj) {
       if (!seen.has(n)) {
         seen.add(n);
         queue.push([...path, n]);
@@ -76,6 +89,42 @@ function shortestPath(from: NodeId, to: NodeId): NodeId[] {
     }
   }
   return [from, to];
+}
+
+interface Projected {
+  sx: number;
+  sy: number;
+  depth: number;
+}
+
+const VIEW_W = 320;
+const VIEW_H = 220;
+const CENTER_X = VIEW_W / 2;
+const CENTER_Y = VIEW_H / 2;
+const CAMERA_DIST = 2.1;
+const PROJECT_SCALE = 280;
+const TILT = 0.18;
+
+function project3D(n: Node3D, angle: number): Projected {
+  const cosA = Math.cos(angle);
+  const sinA = Math.sin(angle);
+  let x = n.x * cosA + n.z * sinA;
+  let z = -n.x * sinA + n.z * cosA;
+  let y = n.y;
+
+  const cosT = Math.cos(TILT);
+  const sinT = Math.sin(TILT);
+  const yT = y * cosT - z * sinT;
+  const zT = y * sinT + z * cosT;
+  y = yT;
+  z = zT;
+
+  const persp = 1 / (CAMERA_DIST + z);
+  return {
+    sx: CENTER_X + x * persp * PROJECT_SCALE,
+    sy: CENTER_Y + y * persp * PROJECT_SCALE,
+    depth: z,
+  };
 }
 
 const PACKET_RAIN_TOKENS: readonly string[] = [
@@ -258,76 +307,115 @@ function PacketRain() {
 }
 
 function MeshViz() {
-  const linksRef = useRef<SVGGElement | null>(null);
-  const motionRef = useRef<SVGAnimateMotionElement | null>(null);
-  const labelsRef = useRef<SVGGElement | null>(null);
+  const [angle, setAngle] = useState(0);
+  const [packetT, setPacketT] = useState(0);
+  const [activePath, setActivePath] = useState<string[]>(["N0", "N6"]);
+  const [labels, setLabels] = useState<Record<string, string>>({});
+  const pausedRef = useRef(false);
 
   useEffect(() => {
-    const linksGroup = linksRef.current;
-    const motion = motionRef.current;
-    const labelsGroup = labelsRef.current;
-    if (!linksGroup || !motion) return;
-
     const hex = (): string =>
       Math.floor(Math.random() * 256)
         .toString(16)
         .padStart(2, "0");
-
-    const ids = {} as Record<NodeId, string>;
-    for (const k of NODE_LABEL_ORDER) {
-      ids[k] = "node.0x" + hex() + hex();
+    const map: Record<string, string> = {};
+    for (const id of NODE_IDS_3D) {
+      map[id] = "node.0x" + hex() + hex();
     }
+    setLabels(map);
+  }, []);
 
-    if (labelsGroup) {
-      const texts = labelsGroup.querySelectorAll("text");
-      texts.forEach((t, i) => {
-        const id = NODE_LABEL_ORDER[i];
-        if (id) t.textContent = ids[id];
-      });
-    }
-
-    const tick = (): void => {
-      const pair =
-        ENDPOINT_PAIRS[Math.floor(Math.random() * ENDPOINT_PAIRS.length)];
-      if (!pair) return;
-      const [src, dst] = pair;
-      const path = shortestPath(src, dst);
-
-      linksGroup
-        .querySelectorAll("line")
-        .forEach((l) => l.setAttribute("class", "link"));
-
-      for (let i = 0; i < path.length - 1; i++) {
-        const a = path[i];
-        const b = path[i + 1];
-        if (!a || !b) continue;
-        const key = edgeKey(a, b);
-        const alias = EDGE_ALIAS[key] ?? key;
-        const edge = linksGroup.querySelector(`[data-edge="${alias}"]`);
-        if (edge) edge.setAttribute("class", "link link-active");
+  useEffect(() => {
+    let rafId = 0;
+    let last = performance.now();
+    const loop = (now: number): void => {
+      const dt = (now - last) / 1000;
+      last = now;
+      if (!pausedRef.current) {
+        setAngle((a) => a + dt * 0.08);
+        setPacketT((t) => {
+          const next = t + dt * 0.45;
+          return next >= 1 ? next - 1 : next;
+        });
       }
-
-      const d = path
-        .map((n, i) => {
-          const [x, y] = NODE_POS[n];
-          return (i === 0 ? "M " : "L ") + x + " " + y;
-        })
-        .join(" ");
-      motion.setAttribute("path", d);
-      motion.setAttribute(
-        "dur",
-        (0.4 + (path.length - 1) * 0.55).toFixed(2) + "s",
-      );
-      motion.beginElement?.();
+      rafId = requestAnimationFrame(loop);
     };
+    rafId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafId);
+  }, []);
 
-    tick();
-    const id = window.setInterval(tick, 2600);
+  useEffect(() => {
+    const pickPath = (): void => {
+      const i = Math.floor(Math.random() * ENDPOINT_POOL_3D.length);
+      let j = Math.floor(Math.random() * ENDPOINT_POOL_3D.length);
+      while (j === i) {
+        j = Math.floor(Math.random() * ENDPOINT_POOL_3D.length);
+      }
+      const src = ENDPOINT_POOL_3D[i];
+      const dst = ENDPOINT_POOL_3D[j];
+      if (!src || !dst) return;
+      setActivePath(shortestPath3D(src, dst));
+      setPacketT(0);
+    };
+    pickPath();
+    const id = window.setInterval(pickPath, 2800);
     return () => window.clearInterval(id);
   }, []);
 
+  const projected = useMemo(() => {
+    const map: Record<string, Projected> = {};
+    for (const id of NODE_IDS_3D) {
+      const n = NODES_3D[id];
+      if (!n) continue;
+      map[id] = project3D(n, angle);
+    }
+    return map;
+  }, [angle]);
+
+  const activeEdgeSet = useMemo(() => {
+    const s = new Set<string>();
+    for (let i = 0; i < activePath.length - 1; i++) {
+      const a = activePath[i];
+      const b = activePath[i + 1];
+      if (!a || !b) continue;
+      s.add(edgeKey3D(a, b));
+    }
+    return s;
+  }, [activePath]);
+
+  const packetPos = useMemo(() => {
+    const path = activePath;
+    if (path.length < 2) return { sx: CENTER_X, sy: CENTER_Y };
+    const segCount = path.length - 1;
+    const segIdx = Math.min(Math.floor(packetT * segCount), segCount - 1);
+    const segT = packetT * segCount - segIdx;
+    const a = projected[path[segIdx] ?? ""];
+    const b = projected[path[segIdx + 1] ?? ""];
+    if (!a || !b) return { sx: CENTER_X, sy: CENTER_Y };
+    return {
+      sx: a.sx + (b.sx - a.sx) * segT,
+      sy: a.sy + (b.sy - a.sy) * segT,
+    };
+  }, [packetT, activePath, projected]);
+
+  const orderedNodes = useMemo(() => {
+    return [...NODE_IDS_3D].sort((a, b) => {
+      const da = projected[a]?.depth ?? 0;
+      const db = projected[b]?.depth ?? 0;
+      return db - da;
+    });
+  }, [projected]);
+
   return (
-    <div className="hidden lg:block border border-line bg-bg-2 p-4 self-start">
+    <div
+      className="hidden lg:block border border-line bg-bg-2 p-4 self-start"
+      onMouseEnter={() => {
+        pausedRef.current = true;
+      }}
+      onMouseLeave={() => {
+        pausedRef.current = false;
+      }}
+    >
       <div className="flex justify-between items-center border-b border-line pb-2 mb-3.5 text-[10px] tracking-[0.12em] text-ink-dim uppercase">
         <span>
           <span className="text-accent">▸</span> mesh.proximity
@@ -355,120 +443,91 @@ function MeshViz() {
             />
           </pattern>
         </defs>
-        <rect width="320" height="220" fill="url(#grid)" />
-        <g ref={linksRef}>
-          <line
-            className="link"
-            data-edge="A-G"
-            x1="60"
-            y1="40"
-            x2="160"
-            y2="80"
-          />
-          <line
-            className="link"
-            data-edge="G-R1"
-            x1="160"
-            y1="80"
-            x2="260"
-            y2="50"
-          />
-          <line
-            className="link"
-            data-edge="G-R2"
-            x1="160"
-            y1="80"
-            x2="100"
-            y2="160"
-          />
-          <line
-            className="link"
-            data-edge="G-B"
-            x1="160"
-            y1="80"
-            x2="220"
-            y2="170"
-          />
-          <line
-            className="link"
-            data-edge="R2-B"
-            x1="100"
-            y1="160"
-            x2="220"
-            y2="170"
-          />
-          <line
-            className="link"
-            data-edge="A-R2"
-            x1="60"
-            y1="40"
-            x2="100"
-            y2="160"
-          />
-          <line
-            className="link"
-            data-edge="R1-R3"
-            x1="260"
-            y1="50"
-            x2="290"
-            y2="130"
-          />
-          <line
-            className="link"
-            data-edge="R3-B"
-            x1="290"
-            y1="130"
-            x2="220"
-            y2="170"
-          />
-          <line
-            className="link"
-            data-edge="R4-R2"
-            x1="40"
-            y1="110"
-            x2="100"
-            y2="160"
-          />
-          <line
-            className="link"
-            data-edge="R4-A"
-            x1="40"
-            y1="110"
-            x2="60"
-            y2="40"
-          />
-        </g>
-        <g>
-          <circle className="node" cx="60" cy="40" r="4" />
-          <circle className="node" cx="160" cy="80" r="4" />
-          <circle className="node" cx="260" cy="50" r="4" />
-          <circle className="node" cx="100" cy="160" r="4" />
-          <circle className="node" cx="220" cy="170" r="4" />
-          <circle className="node" cx="290" cy="130" r="4" />
-          <circle className="node" cx="40" cy="110" r="4" />
-        </g>
-        <g
-          ref={labelsRef}
-          fontFamily="JetBrains Mono"
-          fontSize="6"
-          fill="#6b7568"
-        >
-          <text x="68" y="36" />
-          <text x="168" y="76" />
-          <text x="266" y="46" />
-          <text x="106" y="158" />
-          <text x="226" y="166" />
-          <text x="296" y="128" />
-          <text x="6" y="106" />
-        </g>
-        <circle r="2" fill="#c4ff3d">
-          <animateMotion
-            ref={motionRef}
-            dur="2s"
-            repeatCount="indefinite"
-            path="M 60 40 L 160 80 L 220 170"
-          />
-        </circle>
+        <rect width={VIEW_W} height={VIEW_H} fill="url(#grid)" />
+
+        {EDGES_3D.map(([a, b]) => {
+          const pa = projected[a];
+          const pb = projected[b];
+          if (!pa || !pb) return null;
+          const key = edgeKey3D(a, b);
+          const isActive = activeEdgeSet.has(key);
+          if (isActive) {
+            return (
+              <line
+                key={key}
+                className="link link-active"
+                x1={pa.sx}
+                y1={pa.sy}
+                x2={pb.sx}
+                y2={pb.sy}
+              />
+            );
+          }
+          const avgDepth = (pa.depth + pb.depth) / 2;
+          const fade = Math.max(0, Math.min(1, (1 - avgDepth) / 2));
+          return (
+            <line
+              key={key}
+              x1={pa.sx}
+              y1={pa.sy}
+              x2={pb.sx}
+              y2={pb.sy}
+              stroke="#c4ff3d"
+              strokeOpacity={0.08 + fade * 0.18}
+              strokeWidth={0.4 + fade * 0.4}
+            />
+          );
+        })}
+
+        {orderedNodes.map((id) => {
+          const p = projected[id];
+          if (!p) return null;
+          const fade = Math.max(0.2, Math.min(1, (1 - p.depth) / 2));
+          const r = 2.4 + fade * 3.2;
+          const showLabel = NODES_3D[id]?.hasLabel === true;
+          const labelText = labels[id] ?? "";
+          return (
+            <g key={id}>
+              <circle
+                cx={p.sx}
+                cy={p.sy}
+                r={r * 1.9}
+                fill="none"
+                stroke="#c4ff3d"
+                strokeOpacity={0.08 + fade * 0.15}
+                strokeWidth="0.4"
+              />
+              <circle
+                cx={p.sx}
+                cy={p.sy}
+                r={r}
+                fill="#c4ff3d"
+                fillOpacity={0.4 + fade * 0.55}
+              />
+              {showLabel && labelText ? (
+                <text
+                  x={p.sx + r + 3}
+                  y={p.sy + 2}
+                  fontFamily="JetBrains Mono"
+                  fontSize="5.5"
+                  fill="#c4ff3d"
+                  fillOpacity={0.35 + fade * 0.4}
+                  letterSpacing="0.2"
+                >
+                  {labelText}
+                </text>
+              ) : null}
+            </g>
+          );
+        })}
+
+        <circle
+          cx={packetPos.sx}
+          cy={packetPos.sy}
+          r="2.6"
+          fill="#c4ff3d"
+          opacity="0.95"
+        />
       </svg>
 
       <div className="grid grid-cols-2 gap-3 mt-3.5 pt-3.5 border-t border-line">
