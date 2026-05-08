@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { JetBrains_Mono, Major_Mono_Display } from "next/font/google";
 import "./globals.css";
 
+import { RepoInfoProvider } from "@/components/RepoInfoProvider";
 import { TopStatusBar } from "@/components/TopStatusBar";
 import { getRepoInfo } from "@/lib/repo-info";
 
@@ -36,8 +37,10 @@ export default async function RootLayout({
       className={`${jetbrainsMono.variable} ${majorMonoDisplay.variable} h-full antialiased`}
     >
       <body className="bg-bg text-ink overflow-x-hidden font-mono min-h-full">
-        <TopStatusBar {...repoInfo} />
-        {children}
+        <RepoInfoProvider value={repoInfo}>
+          <TopStatusBar {...repoInfo} />
+          {children}
+        </RepoInfoProvider>
       </body>
     </html>
   );

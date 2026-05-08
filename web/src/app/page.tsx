@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 
+import { useRepoInfo } from "@/components/RepoInfoProvider";
+
 interface Node3D {
   x: number;
   y: number;
@@ -928,7 +930,21 @@ function DisplayHeading({ children }: { children: React.ReactNode }) {
   );
 }
 
+function buildQuarter(buildDate: string): string {
+  const parts = buildDate.split(".");
+  const year = parts[0];
+  const monthStr = parts[1];
+  if (!year || !monthStr) return buildDate;
+  const month = Number.parseInt(monthStr, 10);
+  if (Number.isNaN(month) || month < 1 || month > 12) return year;
+  return `Q${Math.ceil(month / 3)} ${year}`;
+}
+
 function HeroSection() {
+  const { version, buildDate } = useRepoInfo();
+  const rev =
+    buildDate === "—" ? version : `${version} / ${buildQuarter(buildDate)}`;
+
   return (
     <section className="hero relative overflow-hidden border-b border-line px-6 pt-[60px] pb-20">
       <PacketRain />
@@ -939,7 +955,7 @@ function HeroSection() {
               RFC-NET-001
             </span>
             <span className="text-ink-faint font-mono">PROTOCOL.0x4E45·54</span>
-            <span className="text-ink-dim">REV 04 / Q2 2026</span>
+            <span className="text-ink-dim">REV {rev}</span>
           </div>
 
           <h1
@@ -1055,7 +1071,7 @@ function ArpanetMapBg() {
       }}
     >
       <svg
-        className="w-full h-full opacity-[0.36]"
+        className="w-full h-full opacity-[0.4]"
         viewBox="0 0 1000 589"
         preserveAspectRatio="xMidYMid meet"
       >
@@ -1296,7 +1312,7 @@ function ArpanetMapBg() {
           </text>
         </g>
 
-        {ARPANET_EDGES.map(([a, b]) => {
+        {/*{ARPANET_EDGES.map(([a, b]) => {
           const na = ARPANET_NODES[a];
           const nb = ARPANET_NODES[b];
           if (!na || !nb) return null;
@@ -1367,7 +1383,7 @@ function ArpanetMapBg() {
               </text>
             ) : null}
           </g>
-        ))}
+        ))}*/}
         <text
           x="80"
           y="540"
