@@ -3826,7 +3826,7 @@ function ReleasesSection() {
           <article
             key={r.tag}
             className={
-              i === 0 ? "px-6 py-6" : "px-6 py-6 border-t border-line bg-black"
+              i % 2 ? "px-6 py-6 border-t border-line bg-black" : "px-6 py-6"
             }
           >
             <header className="flex items-baseline justify-between gap-4 mb-3 flex-wrap">
