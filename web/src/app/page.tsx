@@ -1890,59 +1890,249 @@ function ComputeRuntimeSection() {
   );
 }
 
+interface DaemonCase {
+  subtitle: string;
+  code: React.ReactNode;
+}
+
+const DAEMON_CASES: readonly DaemonCase[] = [
+  {
+    subtitle: "trading agent · NYSE colo",
+    code: (
+      <>
+        <span className="cm">
+          // node A is failing — daemon migrates to node B
+        </span>
+        {"\n"}
+        <span className="kw">let</span> daemon = Daemon::
+        <span className="fn">new</span>(
+        <span className="ty">TraderConfig</span> {"{"}
+        {"\n    "}
+        <span className="fn">requirements</span>:{" "}
+        <span className="kw">vec</span>![ <span className="ty">Cap</span>::
+        <span className="fn">Latency</span>(
+        <span className="st">&quot;&lt;200μs to NYSE&quot;</span>) ],
+        {"\n    "}
+        <span className="fn">snapshot_interval</span>:{" "}
+        <span className="ty">Duration</span>::
+        <span className="fn">millis</span>(<span className="st">100</span>),
+        {"\n"}
+        {"});"}
+        {"\n\n"}
+        <span className="kw">match</span> daemon.
+        <span className="fn">tick</span>
+        (event).<span className="kw">await</span>? {"{"}
+        {"\n    "}
+        <span className="ty">Outcome</span>::
+        <span className="fn">Order</span>(o) =&gt; bus.
+        <span className="fn">publish</span>(o).
+        <span className="kw">await</span>?,
+        {"\n    "}
+        <span className="ty">Outcome</span>::
+        <span className="fn">Migrate</span>(target) =&gt;{" "}
+        <span className="cm">// state moves with us</span>
+        {"\n"}
+        {"}"}
+        {"\n\n"}
+        <span className="cm">
+          // origin_hash unchanged. subscribers don&apos;t notice.
+        </span>
+      </>
+    ),
+  },
+  {
+    subtitle: "inference daemon · follows user",
+    code: (
+      <>
+        <span className="cm">
+          // user moves laptop → desktop. session continues.
+        </span>
+        {"\n"}
+        <span className="kw">let</span> daemon = Daemon::
+        <span className="fn">new</span>(
+        <span className="ty">InferenceConfig</span> {"{"}
+        {"\n    "}
+        <span className="fn">requirements</span>:{" "}
+        <span className="kw">vec</span>![{" "}
+        <span className="ty">Cap</span>::<span className="fn">Gpu</span>(
+        <span className="st">&quot;vram&gt;=24gb&quot;</span>),{" "}
+        <span className="ty">Cap</span>::<span className="fn">Tag</span>(
+        <span className="st">&quot;user:7af3&quot;</span>) ],
+        {"\n    "}
+        <span className="fn">snapshot_interval</span>:{" "}
+        <span className="ty">Duration</span>::
+        <span className="fn">millis</span>(<span className="st">250</span>),
+        {"\n"}
+        {"});"}
+        {"\n\n"}
+        <span className="kw">match</span> daemon.
+        <span className="fn">tick</span>
+        (event).<span className="kw">await</span>? {"{"}
+        {"\n    "}
+        <span className="ty">Outcome</span>::
+        <span className="fn">Token</span>(t) =&gt; stream.
+        <span className="fn">push</span>(t).
+        <span className="kw">await</span>?,
+        {"\n    "}
+        <span className="ty">Outcome</span>::
+        <span className="fn">Migrate</span>(target) =&gt;{" "}
+        <span className="cm">// kv cache moves with us</span>
+        {"\n"}
+        {"}"}
+        {"\n\n"}
+        <span className="cm">
+          // conversation context preserved across hardware change.
+        </span>
+      </>
+    ),
+  },
+  {
+    subtitle: "factory controller · plant-04",
+    code: (
+      <>
+        <span className="cm">
+          // edge box thermal alarm → migrate to standby
+        </span>
+        {"\n"}
+        <span className="kw">let</span> daemon = Daemon::
+        <span className="fn">new</span>(<span className="ty">PlcConfig</span>{" "}
+        {"{"}
+        {"\n    "}
+        <span className="fn">requirements</span>:{" "}
+        <span className="kw">vec</span>![{" "}
+        <span className="ty">Cap</span>::
+        <span className="fn">Latency</span>(
+        <span className="st">&quot;&lt;5ms to actuator&quot;</span>),{" "}
+        <span className="ty">Cap</span>::<span className="fn">Tag</span>(
+        <span className="st">&quot;floor-A&quot;</span>) ],
+        {"\n    "}
+        <span className="fn">snapshot_interval</span>:{" "}
+        <span className="ty">Duration</span>::
+        <span className="fn">millis</span>(<span className="st">50</span>),
+        {"\n"}
+        {"});"}
+        {"\n\n"}
+        <span className="kw">match</span> daemon.
+        <span className="fn">tick</span>
+        (event).<span className="kw">await</span>? {"{"}
+        {"\n    "}
+        <span className="ty">Outcome</span>::
+        <span className="fn">Command</span>(c) =&gt; actuator.
+        <span className="fn">send</span>(c).
+        <span className="kw">await</span>?,
+        {"\n    "}
+        <span className="ty">Outcome</span>::
+        <span className="fn">Migrate</span>(target) =&gt;{" "}
+        <span className="cm">// control loop unaffected</span>
+        {"\n"}
+        {"}"}
+        {"\n\n"}
+        <span className="cm">
+          // torque feedback never breaks. assembly line keeps moving.
+        </span>
+      </>
+    ),
+  },
+  {
+    subtitle: "sensor fusion · vehicle-07",
+    code: (
+      <>
+        <span className="cm">
+          // LIDAR + radar + camera, mesh-routed perception
+        </span>
+        {"\n"}
+        <span className="kw">let</span> daemon = Daemon::
+        <span className="fn">new</span>(
+        <span className="ty">FusionConfig</span> {"{"}
+        {"\n    "}
+        <span className="fn">requirements</span>:{" "}
+        <span className="kw">vec</span>![{" "}
+        <span className="ty">Cap</span>::
+        <span className="fn">Latency</span>(
+        <span className="st">&quot;&lt;1ms&quot;</span>),{" "}
+        <span className="ty">Cap</span>::<span className="fn">Tag</span>(
+        <span className="st">&quot;vehicle-07&quot;</span>) ],
+        {"\n    "}
+        <span className="fn">snapshot_interval</span>:{" "}
+        <span className="ty">Duration</span>::
+        <span className="fn">millis</span>(<span className="st">20</span>),
+        {"\n"}
+        {"});"}
+        {"\n\n"}
+        <span className="kw">match</span> daemon.
+        <span className="fn">tick</span>
+        (event).<span className="kw">await</span>? {"{"}
+        {"\n    "}
+        <span className="ty">Outcome</span>::
+        <span className="fn">Detection</span>(d) =&gt; bus.
+        <span className="fn">publish</span>(d).
+        <span className="kw">await</span>?,
+        {"\n    "}
+        <span className="ty">Outcome</span>::
+        <span className="fn">Migrate</span>(target) =&gt;{" "}
+        <span className="cm">// perception state moves</span>
+        {"\n"}
+        {"}"}
+        {"\n\n"}
+        <span className="cm">
+          // neighboring vehicles see continuous track.
+        </span>
+      </>
+    ),
+  },
+];
+
 function DaemonCaseBlock() {
+  const [idx, setIdx] = useState(0);
+  const pausedRef = useRef(false);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (!pausedRef.current) {
+        setIdx((i) => (i + 1) % DAEMON_CASES.length);
+      }
+    }, 6500);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const current = DAEMON_CASES[idx];
+  if (!current) return null;
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_0.9fr] gap-8 my-12 items-start">
-      <div className="border border-line bg-bg-2 overflow-hidden">
+      <div
+        className="border border-line bg-bg-2 overflow-hidden"
+        onMouseEnter={() => {
+          pausedRef.current = true;
+        }}
+        onMouseLeave={() => {
+          pausedRef.current = false;
+        }}
+      >
         <div className="bg-bg border-b border-line px-3.5 py-2 text-[10px] text-ink-dim tracking-[0.12em] uppercase flex justify-between items-center">
-          <span>
-            <span className="text-accent font-semibold">CASE</span> · trading
-            agent · NYSE colo
+          <span key={`title-${idx}`} className="daemon-fade">
+            <span className="text-accent font-semibold">CASE</span> ·{" "}
+            {current.subtitle}
           </span>
-          <span className="inline-flex gap-1">
-            <span className="frame-dot-r w-[7px] h-[7px] rounded-full" />
-            <span className="frame-dot-y w-[7px] h-[7px] rounded-full" />
-            <span className="frame-dot-g w-[7px] h-[7px] rounded-full" />
+          <span className="inline-flex gap-1.5 items-center">
+            {DAEMON_CASES.map((_, i) => (
+              <button
+                key={i}
+                type="button"
+                aria-label={`Show case ${i + 1}`}
+                onClick={() => setIdx(i)}
+                className={`w-1.5 h-1.5 rounded-full transition-colors cursor-pointer ${
+                  i === idx ? "bg-accent" : "bg-ink-faint hover:bg-ink-dim"
+                }`}
+              />
+            ))}
           </span>
         </div>
-        <pre className="px-5 py-4 text-[12px] leading-[1.7] text-ink overflow-x-auto font-mono">
-          <span className="cm">
-            // node A is failing — daemon migrates to node B
-          </span>
-          {"\n"}
-          <span className="kw">let</span> daemon = Daemon::
-          <span className="fn">new</span>(
-          <span className="ty">TraderConfig</span> {"{"}
-          {"\n    "}
-          <span className="fn">requirements</span>:{" "}
-          <span className="kw">vec</span>![ <span className="ty">Cap</span>::
-          <span className="fn">Latency</span>(
-          <span className="st">&quot;&lt;200μs to NYSE&quot;</span>) ],
-          {"\n    "}
-          <span className="fn">snapshot_interval</span>:{" "}
-          <span className="ty">Duration</span>::
-          <span className="fn">millis</span>(<span className="st">100</span>),
-          {"\n"}
-          {"});"}
-          {"\n\n"}
-          <span className="kw">match</span> daemon.
-          <span className="fn">tick</span>
-          (event).<span className="kw">await</span>? {"{"}
-          {"\n    "}
-          <span className="ty">Outcome</span>::
-          <span className="fn">Order</span>(o) =&gt; bus.
-          <span className="fn">publish</span>(o).
-          <span className="kw">await</span>?,
-          {"\n    "}
-          <span className="ty">Outcome</span>::
-          <span className="fn">Migrate</span>(target) =&gt;{" "}
-          <span className="cm">// state moves with us</span>
-          {"\n"}
-          {"}"}
-          {"\n\n"}
-          <span className="cm">
-            // origin_hash unchanged. subscribers don&apos;t notice.
-          </span>
+        <pre
+          key={`code-${idx}`}
+          className="daemon-fade px-5 py-4 text-[12px] leading-[1.7] text-ink overflow-x-auto font-mono"
+        >
+          {current.code}
         </pre>
       </div>
 

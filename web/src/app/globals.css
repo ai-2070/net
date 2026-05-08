@@ -189,6 +189,28 @@
   }
 }
 
+/* fade-in for cycling daemon case studies */
+@utility daemon-fade {
+  animation: daemon-fade 0.45s ease-out;
+}
+
+@keyframes daemon-fade {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .daemon-fade {
+    animation: none !important;
+  }
+}
+
 /* shimmer for the // AI 2070 footer badge */
 @utility shimmer-2070 {
   background: linear-gradient(
