@@ -38,8 +38,8 @@ export function TopStatusBar({ version, codename, buildDate, sha }: RepoInfo) {
         CODENAME:{" "}
         <b className="text-accent font-semibold uppercase">{codename}</b>
       </span>
-      <span className="text-ink-faint mx-3">│</span>
-      <span>
+      <span className="hidden md:flex text-ink-faint mx-3">│</span>
+      <span className="hidden md:flex">
         EVT/SEC: <b className="text-ink font-semibold">{evt}</b>
       </span>
       <span className="text-ink-faint mx-3">│</span>
