@@ -24,6 +24,7 @@ pub mod required_capability;
 pub mod rules;
 pub mod safety;
 pub mod tag;
+pub mod tag_codec;
 
 pub use broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 
@@ -45,6 +46,8 @@ pub use tag::{
 pub use predicate::{EvalContext, Predicate};
 
 pub use required_capability::{RequireParseError, RequiredCapability};
+
+pub use tag_codec::{hardware_from_tags, hardware_to_tags};
 
 pub use diff::{CapabilityDiff, DiffEngine, DiffError, DiffOp};
 
