@@ -312,6 +312,129 @@
   }
 }
 
+/* glitch effect for the seed-round announcement banner */
+@utility glitch-banner {
+  animation: glitch-banner 6s infinite;
+}
+
+@keyframes glitch-banner {
+  0%,
+  90%,
+  100% {
+    transform: translate(0, 0);
+    filter: none;
+  }
+  91% {
+    transform: translate(-1px, 0);
+    filter: hue-rotate(-30deg);
+  }
+  91.5% {
+    transform: translate(2px, 0);
+    filter: hue-rotate(20deg);
+  }
+  92% {
+    transform: translate(-1px, 1px);
+  }
+  92.5% {
+    transform: translate(0, 0);
+    filter: none;
+  }
+  94.5% {
+    transform: translate(1px, -1px);
+  }
+  95% {
+    transform: translate(-2px, 0);
+    filter: hue-rotate(-10deg);
+  }
+  95.5% {
+    transform: translate(0, 0);
+    filter: none;
+  }
+}
+
+@utility glitch-mark {
+  position: relative;
+  display: inline-block;
+
+  &::before,
+  &::after {
+    content: attr(data-text);
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    opacity: 0;
+  }
+
+  &::before {
+    color: #3df0ff;
+    animation: glitch-mark-cyan 6s infinite;
+  }
+
+  &::after {
+    color: #ff5e3d;
+    animation: glitch-mark-warn 6s infinite;
+  }
+}
+
+@keyframes glitch-mark-cyan {
+  0%,
+  90%,
+  100% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+  91% {
+    opacity: 0.7;
+    transform: translate(-2px, 0);
+  }
+  92% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+  95% {
+    opacity: 0.55;
+    transform: translate(-1px, 1px);
+  }
+  96% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+}
+
+@keyframes glitch-mark-warn {
+  0%,
+  90%,
+  100% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+  91.3% {
+    opacity: 0.55;
+    transform: translate(2px, 0);
+  }
+  92% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+  95.3% {
+    opacity: 0.45;
+    transform: translate(1px, -1px);
+  }
+  96% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .glitch-banner,
+  .glitch-mark::before,
+  .glitch-mark::after {
+    animation: none !important;
+  }
+}
+
 /* live status dot */
 @utility live-dot {
   &::before {

@@ -9,7 +9,8 @@ const globals = {
         | "preview"
         | "development"),
   isClient: typeof window !== "undefined",
-  defaultTtl: 2 * 60 * 1000, // 2 minutes
+  defaultTtl: 2 * 60 * 1000, // 2 minutes,
+  email: "makerseven7@gmail.com",
 };
 
 export default globals;

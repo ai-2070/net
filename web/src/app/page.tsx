@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { Fragment, useEffect, useMemo, useRef, useState, JSX } from "react";
-
+import globals from "@/lib/globals";
 import { useRepoInfo } from "@/components/RepoInfoProvider";
 import { cn } from "@/lib/cn";
 
@@ -4412,7 +4412,7 @@ const FOOTER_RESOURCES: ReadonlyArray<{
   },
   { href: "https://github.com/ai-2070/net", label: "Source // GitHub" },
   {
-    href: "mailto:makerseven7@gmail.com",
+    href: `mailto:${globals.email}`,
     label: "▸ Contact",
     class: "text-accent",
   },
@@ -4496,16 +4496,18 @@ function FooterColumn({
 function SeedBanner() {
   return (
     <a
-      href="mailto:hello@ai2070.com"
-      className="group block border-b border-line bg-accent/[0.06] hover:bg-accent/[0.12] transition-colors"
+      href={`mailto:${globals.email}`}
+      className="group block border-b border-line bg-accent/[0.06] hover:bg-accent/[0.12] transition-colors overflow-hidden"
     >
-      <div className="px-6 py-3 flex items-center justify-center gap-3 text-[11px] font-mono tracking-[0.08em] flex-wrap">
+      <div className="glitch-banner px-6 py-3 flex items-center justify-center gap-3 text-[11px] font-mono tracking-[0.08em] flex-wrap">
         <span className="bg-accent text-bg px-2 py-0.5 font-bold tracking-[0.18em] text-[10px]">
           SEED ROUND
         </span>
         <span className="text-ink">
-          <b className="text-accent">AI 2070</b> is raising seed funding to
-          build post-cloud nanoscale infra.
+          <b className="text-accent glitch-mark" data-text="AI 2070">
+            AI 2070
+          </b>{" "}
+          is raising seed funding to build post-cloud nanoscale infra.
         </span>
         <span className="text-accent inline-flex items-center gap-1">
           get in touch
