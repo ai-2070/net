@@ -243,6 +243,7 @@ The earlier draft inconsistently named 3 states in some places and 4 in others. 
 - Serve `SYNC_REQUEST` and emit `SYNC_HEARTBEAT` (when in `Leader`)
 - On heartbeat-ack mismatch, issue `SYNC_REQUEST` to leader; apply the `SYNC_RESPONSE` events in seq order
 - On leader-loss detection (3 consecutive missed heartbeats with hysteresis), enter `Candidate`, run the deterministic `elect()` function from §4, then transition to `Leader` (if self is the winner) or `Replica` (if a peer is the winner)
+- On a leadership transition (own `elect()` result changed from the previously believed leader, or saw a `role=Leader` heartbeat from a peer other than the current believed leader), emit `Mesh::withdraw_chain(channel_id, by_node = previous_leader)` as a witness — see §4 "Witness withdrawal" for rationale. Idempotent across the N witnessing replicas; the capability layer dedups.
 - On graceful shutdown, transition to `Idle` and withdraw the replica's `causal:` capability tag via Capability Phase B's `Mesh::withdraw_chain`
 
 **Construction:**
@@ -285,6 +286,8 @@ Triggers:
 **`StandbyGroup` provides membership + failure detection; RedEX provides the selection function.** The pluggable hook is "elect leader given current healthy set" — RedEX supplies the deterministic nearest-RTT function above; `StandbyGroup` invokes it on leader-loss and uses its own promotion broadcast to announce the winner. `StandbyGroup::promote()`'s default "highest synced_through" behavior is preserved for daemon migration; only RedEX channels override the selection function.
 
 **Convergence and split-brain.** Because the selection function is pure and deterministic, every replica computes the same winner from the same RTT matrix + membership set within a single partition. Two partitions with disjoint views can briefly compute different winners; both leaders accept appends until partition heals. This is the same dual-leader-during-partition risk every leader-elected system has — RedEX's mitigation is operator-controlled placement (don't span replica sets across partition boundaries you can't tolerate). The `causal:` capability tag's higher-epoch supersession on partition heal converges routing back to a single leader; divergent appends made during the partition are flagged for operator review via the `dataforts_replication_skip_ahead_total` metric. Pin in DST.
+
+**Witness withdrawal (the herald pattern).** The new leader announces itself via `Mesh::announce_chain` — that's the squire riding to the towns. But the deposed leader's stale `causal:` tag would normally only get reaped when the network observes its disconnect, which can lag (especially in the partition-heal case where the deposed leader is still nominally alive on its own side). Faster reaping comes from the **witnesses** — every peer replica that observes a leadership transition (own `elect()` result changed, or saw a `role=Leader` heartbeat from a non-believed-leader peer) also issues `Mesh::withdraw_chain(channel_id, by_node = previous_leader)`. The withdraw is idempotent across the N witnessing peers; the capability layer dedups. This is free robustness: the peers were already going to observe the transition (they're computing `elect()` in lockstep on the same membership set); we're just letting them speak the fact that the king is dead instead of waiting for the disconnect-observer subsystem to catch up. Pin in DST under the partition-heal scenario — the witness path should reap the stale tag strictly faster than the disconnect-observer path.
 
 ### 5. Pull-based catch-up
 
@@ -339,7 +342,7 @@ Leader fails (proximity graph reports `Unhealthy` OR 3 consecutive heartbeats mi
 1. Each surviving replica transitions `Replica → Candidate` and runs `elect(replica_set, self)` (§4) — pure function, ~microseconds.
 2. The winner transitions `Candidate → Leader`; losers transition `Candidate → Replica`. No broadcast, no wait, no quorum: every healthy replica converges to the same winner from the same RTT matrix + membership set.
 3. The new leader resumes appends from its local `tail_seq`; the old leader's gap (if any) is replayed when it rejoins via the standard rejoin path (§8).
-4. The new leader emits `causal:` capability-tag updates via `Mesh::announce_chain`; `StandbyGroup`'s existing promotion broadcast announces the new leader to the rest of the mesh. The channel's routing tag now points to the new leader.
+4. The new leader emits `causal:` capability-tag updates via `Mesh::announce_chain`; `StandbyGroup`'s existing promotion broadcast announces the new leader to the rest of the mesh. The channel's routing tag now points to the new leader. The deposed leader's `causal:` tag is reaped by **two paths in parallel**: (a) the standard withdrawal on observed disconnect, and (b) **witness withdrawals** — every peer replica that observes the transition issues `Mesh::withdraw_chain(channel_id, by_node = previous_leader)`. The peers saw the king die; they speak the fact. Idempotent across N witnesses; the capability layer dedups. Witness withdrawal closes the partition-heal stale-tag window faster than waiting on disconnect observation alone.
 5. Cutover is atomic from the routing layer's perspective — the next publish on the channel goes to the new leader; in-flight reads against the old leader fall through to the new one via `Mesh::find_chain_holders` re-lookup.
 
 **Critical safety property:** no two nodes can be leader for the same channel at the same time *within a single partition*.
@@ -400,6 +403,7 @@ Per-channel metrics on the existing `RpcMetricsRegistry` shape (recently extende
 | `dataforts_replication_under_capacity_total{channel}` | Counter | Times the channel hit `UnderCapacity` policy |
 | `dataforts_replication_skip_ahead_total{channel}` | Counter | Times a replica skipped instead of replaying a large gap |
 | `dataforts_replication_election_thrash_total{channel}` | Counter | Elections triggered within 30 s of the previous one (saturation indicator) |
+| `dataforts_replication_witness_withdrawals_total{channel}` | Counter | Times a peer replica issued a witness `Mesh::withdraw_chain` for a deposed leader's tag (per witnessing replica) |
 
 ### 12. Observability + operator ergonomics
 
@@ -456,7 +460,8 @@ Implementable in isolation; does not depend on Capability B/F.
 - `ReplicationCoordinator` consumes `StandbyGroup` events for membership + failure detection only.
 - Implement the deterministic `elect()` selection function from [§4](#4-replica-selection-vs-leader-election); register it as `StandbyGroup`'s leader-selection hook for replicated channels (this is the one new `groups::standby` integration point — a pluggable selection-fn slot, NOT a replacement of the daemon-migration default).
 - Hysteresis: 3-missed-heartbeats threshold; tunable.
-- Capability-tag updates on leader change via `Mesh::announce_chain`; `StandbyGroup`'s existing promotion broadcast announces the winner. Old leader's tag is reaped on the next observed disconnect.
+- Capability-tag updates on leader change via `Mesh::announce_chain` (new leader self-announces); `StandbyGroup`'s existing promotion broadcast announces the winner.
+- Witness withdrawal: every peer replica that observes a leadership transition issues `Mesh::withdraw_chain(channel_id, by_node = previous_leader)` in parallel with its own state transition. Idempotent across N witnesses. Closes the stale-tag window in the partition-heal scenario faster than disconnect-observation reaping.
 - Pin the no-two-leaders-within-a-partition invariant in unit tests AND DST (Phase F). Cross-partition split-brain is documented as out-of-scope (operator concern).
 
 ### Phase F — DST harness extension (1.5–3 weeks; widest variance)
@@ -471,6 +476,7 @@ This is the gating phase. Plan generously and treat regressions as test failures
 - Divergence-freedom: no two replicas declare different `tail_seq` for the same `seq` (stronger than convergence — pin in DST).
 - Election determinism: given the same RTT matrix + healthy set + NodeId set, every replica computes the same winner. Pin against the asymmetric-RTT scenario — RTT measurements should converge across replicas under the proximity graph's existing smoothing, but transient divergence must not produce dual-leader windows.
 - Election-correctness within a partition: at any point, exactly one node believes it is leader for a channel within any single partition. Cross-partition split-brain is explicitly NOT asserted (it's out-of-scope per [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak)); instead pin that on partition heal, the divergent appends are flagged via `dataforts_replication_skip_ahead_total`.
+- Witness-withdrawal timing: under the partition-heal-with-stale-leader scenario, the deposed leader's `causal:` tag is reaped within 1 heartbeat via the witness path (`dataforts_replication_witness_withdrawals_total` increments) — strictly faster than the disconnect-observer reaping path. Pin both paths fire and that the witness path is the first to clear the tag from at least one observer's view.
 - Performance budget: replication overhead ≤ 30% of single-node append throughput at steady state.
 
 ### Phase G — Disk pressure + `UnderCapacity` (3 days)
