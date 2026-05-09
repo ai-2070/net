@@ -832,20 +832,14 @@ impl ToolFields {
 /// substrate plan §1 pins is set-membership; deterministic ordering
 /// is the encoder's responsibility (per-struct codecs already emit
 /// in stable declaration order).
+///
+/// Phase A.5.N.3: with the typed-struct fields removed,
+/// `CapabilitySet::tags` IS the canonical tag set; this function
+/// collapses to a clone. Kept as a public API for symmetry with
+/// `capability_set_from_tag_set` and so callers don't need to
+/// know the storage shape.
 pub fn capability_set_to_tag_set(caps: &CapabilitySet) -> HashSet<Tag> {
-    let mut all = HashSet::new();
-    all.extend(hardware_to_tags(&caps.hardware));
-    all.extend(software_to_tags(&caps.software));
-    all.extend(models_to_tags(&caps.models));
-    all.extend(tools_to_tags(&caps.tools));
-    all.extend(resource_limits_to_tags(&caps.limits));
-    // Phase A.5.N.2: caps.tags is now `HashSet<Tag>` (no parse
-    // step needed). Reserved tags (`scope:*`, `causal:*`) and
-    // legacy untyped tags ride through as-is. Axis-prefixed tags
-    // that the per-struct encoders also produce dedupe via
-    // HashSet::insert.
-    all.extend(caps.tags.iter().cloned());
-    all
+    caps.tags.clone()
 }
 
 /// Decode a `CapabilitySet` from a typed-tag set. Inverse of
@@ -871,94 +865,27 @@ pub fn capability_set_to_tag_set(caps: &CapabilitySet) -> HashSet<Tag> {
 /// A.5.1 will use it as the deserialization path when
 /// `CapabilitySet`'s wire format becomes the typed-tag set.
 pub fn capability_set_from_tag_set(tags: &HashSet<Tag>) -> CapabilitySet {
-    // Per-struct decoders work on slices, so collect once. Sort by
-    // wire form to give the decoders a deterministic input order
-    // — `runtimes` / `frameworks` / `drivers` Vecs preserve
-    // insertion order, and HashSet iteration is unspecified, so
-    // without sorting the decoded order would drift between runs.
-    // The wire-form sort is stable and cheap (~tens of tags per
-    // capability set in practice).
-    let mut tag_vec: Vec<Tag> = tags.iter().cloned().collect();
-    tag_vec.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
-
-    let hardware = hardware_from_tags(&tag_vec);
-    let software = software_from_tags(&tag_vec);
-    let models = models_from_tags(&tag_vec);
-    let tools = tools_from_tags(&tag_vec);
-    let limits = resource_limits_from_tags(&tag_vec);
-
-    // Reconstruct the residual tag set: every tag the per-struct
-    // decoders don't claim. Reserved-prefix tags (`scope:*`,
-    // `causal:*`) and unknown axis-prefixed tags ride through here
-    // so reserved-prefix consumers (e.g. the scope resolver) keep
-    // working.
-    //
-    // Phase A.5.N.2: `CapabilitySet::tags` is `HashSet<Tag>`, so
-    // we keep the typed values directly rather than rendering to
-    // strings.
-    let leftover_tags: HashSet<Tag> = tags
-        .iter()
-        .filter(|t| !is_struct_owned_tag(t))
-        .cloned()
-        .collect();
-
+    // Phase A.5.N.3: tags ARE the canonical storage; the
+    // per-struct decoders are now exercised by `CapabilitySet::views()`
+    // / the `From` impls, on demand. This function simply hands
+    // the tag set across into a fresh `CapabilitySet` with empty
+    // metadata. Tool schemas (which would have lived in metadata)
+    // can't be reconstructed from a bare tag set — callers that
+    // need schemas should use the `with_metadata` builder or
+    // `set_tools` to seed them.
     CapabilitySet {
-        hardware,
-        software,
-        models,
-        tools,
-        tags: leftover_tags,
-        limits,
-        // tag_set bijection doesn't touch metadata — that's a
-        // separate field carrying schemas / intent / colocation
-        // hints. Phase A.5.N.3 will fold tools' schemas back in
-        // when typed fields are removed.
+        tags: tags.clone(),
         metadata: BTreeMap::new(),
     }
 }
 
-/// True if `tag` is owned by one of the per-struct decoders
-/// (hardware / software / models / tools / resource_limits).
-/// Used by [`capability_set_from_tag_set`] to route un-owned tags
-/// into the legacy `tags: Vec<String>` carrier so they don't
-/// disappear across the round-trip.
-fn is_struct_owned_tag(tag: &Tag) -> bool {
-    let Some(key) = tag.axis_key() else {
-        // Reserved + Legacy tags are never struct-owned.
-        return false;
-    };
-    match key.axis {
-        TaxonomyAxis::Hardware => is_hardware_struct_key(&key.key),
-        TaxonomyAxis::Software => is_software_struct_key(&key.key),
-        TaxonomyAxis::Devices | TaxonomyAxis::Dataforts => {
-            // No per-struct decoder claims these axes today; they
-            // ride through as-is via the legacy carrier.
-            false
-        }
-    }
-}
-
-fn is_hardware_struct_key(key: &str) -> bool {
-    matches!(
-        key,
-        "cpu_cores"
-            | "cpu_threads"
-            | "memory_mb"
-            | "storage_mb"
-            | "network_mbps"
-            | "gpu"
-    ) || key.starts_with("gpu.")
-        || key.starts_with("limits.")
-}
-
-fn is_software_struct_key(key: &str) -> bool {
-    matches!(key, "os" | "os_version" | "cuda_version")
-        || key.starts_with("runtime.")
-        || key.starts_with("framework.")
-        || key.starts_with("driver.")
-        || key.starts_with("model.")
-        || key.starts_with("tool.")
-}
+// Phase A.5.N.3 dropped the previous `is_struct_owned_tag` /
+// `is_hardware_struct_key` / `is_software_struct_key` helpers —
+// they routed un-owned tags into a legacy `Vec<String>` carrier
+// that no longer exists. The post-A.5.N.3 boundary is named by
+// the public `is_*_owned_tag` predicates below, which the
+// `set_*` mutators use to clear axis-relevant tags before
+// re-encoding.
 
 // =============================================================================
 // Phase A.5.N.3 — axis-owned tag predicates for in-place re-encoding.
@@ -1710,37 +1637,42 @@ mod tests {
         let tag_set = capability_set_to_tag_set(&caps);
         let caps2 = capability_set_from_tag_set(&tag_set);
 
-        // Hardware / models / tools / limits round-trip
-        // byte-for-byte (no order-non-preservation issues).
-        assert_eq!(caps.hardware, caps2.hardware);
-        assert_eq!(caps.models, caps2.models);
-        assert_eq!(caps.tools, caps2.tools);
-        assert_eq!(caps.limits, caps2.limits);
+        // Phase A.5.N.3: round-trip via the canonical tag set.
+        // Compare projections through `views()`. Hardware / models
+        // / tools / limits decode byte-for-byte from the indexed
+        // encoding.
+        let v1 = caps.views();
+        let v2 = caps2.views();
+        assert_eq!(v1.hardware, v2.hardware);
+        assert_eq!(v1.models, v2.models);
+        assert_eq!(v1.resource_limits, v2.resource_limits);
+        // Tools' non-schema fields round-trip cleanly; schemas live
+        // in metadata, which `from_tag_set` doesn't reconstruct.
+        assert_eq!(v1.tools.len(), v2.tools.len());
+        for (a, b) in v1.tools.iter().zip(v2.tools.iter()) {
+            assert_eq!(a.tool_id, b.tool_id);
+            assert_eq!(a.name, b.name);
+        }
 
         // SoftwareCapabilities: runtimes / frameworks / drivers
         // are encoded non-indexed and so come out in lex order
-        // rather than insertion order. Compare as sets to ignore
-        // ordering. Other Software fields (os / cuda / etc.) are
-        // single-valued and round-trip cleanly.
-        assert_eq!(caps.software.os, caps2.software.os);
-        assert_eq!(caps.software.os_version, caps2.software.os_version);
-        assert_eq!(caps.software.cuda_version, caps2.software.cuda_version);
+        // rather than insertion order. Compare as sets.
+        assert_eq!(v1.software.os, v2.software.os);
+        assert_eq!(v1.software.os_version, v2.software.os_version);
+        assert_eq!(v1.software.cuda_version, v2.software.cuda_version);
         let lhs_runtimes: std::collections::HashSet<_> =
-            caps.software.runtimes.iter().cloned().collect();
+            v1.software.runtimes.iter().cloned().collect();
         let rhs_runtimes: std::collections::HashSet<_> =
-            caps2.software.runtimes.iter().cloned().collect();
+            v2.software.runtimes.iter().cloned().collect();
         assert_eq!(lhs_runtimes, rhs_runtimes);
         let lhs_fw: std::collections::HashSet<_> =
-            caps.software.frameworks.iter().cloned().collect();
+            v1.software.frameworks.iter().cloned().collect();
         let rhs_fw: std::collections::HashSet<_> =
-            caps2.software.frameworks.iter().cloned().collect();
+            v2.software.frameworks.iter().cloned().collect();
         assert_eq!(lhs_fw, rhs_fw);
 
-        // Legacy tags: round-trip as a HashSet equality check
-        // (sorted-Vec is fine; just compare via sets).
-        let lhs: std::collections::HashSet<_> = caps.tags.iter().cloned().collect();
-        let rhs: std::collections::HashSet<_> = caps2.tags.iter().cloned().collect();
-        assert_eq!(lhs, rhs);
+        // Tag sets: round-trip is identity.
+        assert_eq!(caps.tags, caps2.tags);
     }
 
     #[test]
@@ -1762,16 +1694,11 @@ mod tests {
         let caps2 = capability_set_from_tag_set(&tag_set);
         // Decoded order is lex-sorted by tag wire form, which puts
         // runtime names in alphabetical order.
-        let names: Vec<_> = caps2
-            .software
-            .runtimes
-            .iter()
-            .map(|(n, _)| n.as_str())
-            .collect();
+        let sw = caps2.views().software;
+        let names: Vec<_> = sw.runtimes.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["node", "python", "rust"]);
         // The (name, version) pairs are still preserved per pair.
-        let by_name: std::collections::HashMap<_, _> =
-            caps2.software.runtimes.iter().cloned().collect();
+        let by_name: std::collections::HashMap<_, _> = sw.runtimes.iter().cloned().collect();
         assert_eq!(by_name.get("python"), Some(&"3.11".to_string()));
         assert_eq!(by_name.get("node"), Some(&"20".to_string()));
         assert_eq!(by_name.get("rust"), Some(&"1.78".to_string()));
@@ -1785,11 +1712,14 @@ mod tests {
         // tags; the resulting tag set is empty.
         assert!(tag_set.is_empty());
         let caps2 = capability_set_from_tag_set(&tag_set);
-        assert_eq!(caps2.hardware, HardwareCapabilities::default());
-        assert_eq!(caps2.software, SoftwareCapabilities::default());
-        assert!(caps2.models.is_empty());
-        assert!(caps2.tools.is_empty());
-        assert_eq!(caps2.limits, ResourceLimits::default());
+        // Phase A.5.N.3: assert through `views()` since typed
+        // fields are gone.
+        let v = caps2.views();
+        assert_eq!(v.hardware, HardwareCapabilities::default());
+        assert_eq!(v.software, SoftwareCapabilities::default());
+        assert!(v.models.is_empty());
+        assert!(v.tools.is_empty());
+        assert_eq!(v.resource_limits, ResourceLimits::default());
         assert!(caps2.tags.is_empty());
     }
 
@@ -1843,11 +1773,15 @@ mod tests {
             .add_tag("inference"); // legacy untyped
         let tag_set = capability_set_to_tag_set(&caps);
         let caps2 = capability_set_from_tag_set(&tag_set);
-        // Hardware fields preserved.
-        assert_eq!(caps2.hardware.cpu_cores, 8);
-        // Legacy carrier holds only the untyped tag.
-        let leftover: Vec<String> = caps2.tags.iter().map(|t| t.to_string()).collect();
-        assert_eq!(leftover, vec!["inference".to_string()]);
+        // Hardware fields preserved (read via projection).
+        assert_eq!(caps2.views().hardware.cpu_cores, 8);
+        // Tag set holds the legacy untyped tag *and* the typed
+        // hardware tags from the with_hardware encoding (Phase
+        // A.5.N.3 — the canonical tag set IS the storage).
+        let strs: std::collections::HashSet<String> =
+            caps2.tags.iter().map(|t| t.to_string()).collect();
+        assert!(strs.contains("inference"));
+        assert!(strs.contains("hardware.cpu_cores=8"));
     }
 
     #[test]

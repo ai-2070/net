@@ -478,23 +478,43 @@ impl DiffEngine {
 
     /// Diff tags between old and new.
     ///
-    /// Phase A.5.N.2: signature operates on `&HashSet<Tag>`. The
-    /// wire-form difference is computed by rendering each tag to
-    /// its canonical string (`Tag::to_string`); diff ops are still
-    /// `String`-typed so older diff payloads decode unchanged on
-    /// the receiving side.
+    /// Phase A.5.N.3: diffs only the *residual* tag set — tags not
+    /// claimed by the per-struct decoders. Axis-owned tags
+    /// (`hardware.*`, `software.*`, `software.model.*`,
+    /// `software.tool.*`, `hardware.limits.*`) are diffed via the
+    /// typed `UpdateHardware` / `UpdateSoftware` / `UpdateModel` /
+    /// `UpdateMemory` / etc. ops; emitting per-tag AddTag/RemoveTag
+    /// for them as well would double-count every change.
+    ///
+    /// Reserved-prefix tags (`scope:*`, `causal:*`) and legacy
+    /// untyped tags pass through here as AddTag/RemoveTag, since
+    /// no typed op carries them.
     fn diff_tags(
         old: &HashSet<crate::adapter::net::behavior::tag::Tag>,
         new: &HashSet<crate::adapter::net::behavior::tag::Tag>,
         ops: &mut Vec<DiffOp>,
     ) {
-        // Removed tags
-        for tag in old.difference(new) {
+        use crate::adapter::net::behavior::tag_codec::{
+            is_hardware_owned_tag, is_models_owned_tag, is_resource_limits_owned_tag,
+            is_software_owned_tag, is_tools_owned_tag,
+        };
+        let is_axis_owned = |t: &crate::adapter::net::behavior::tag::Tag| {
+            is_hardware_owned_tag(t)
+                || is_resource_limits_owned_tag(t)
+                || is_software_owned_tag(t)
+                || is_models_owned_tag(t)
+                || is_tools_owned_tag(t)
+        };
+
+        let old_residual: HashSet<&crate::adapter::net::behavior::tag::Tag> =
+            old.iter().filter(|t| !is_axis_owned(t)).collect();
+        let new_residual: HashSet<&crate::adapter::net::behavior::tag::Tag> =
+            new.iter().filter(|t| !is_axis_owned(t)).collect();
+
+        for tag in old_residual.difference(&new_residual) {
             ops.push(DiffOp::RemoveTag(tag.to_string()));
         }
-
-        // Added tags
-        for tag in new.difference(old) {
+        for tag in new_residual.difference(&old_residual) {
             ops.push(DiffOp::AddTag(tag.to_string()));
         }
     }
@@ -1123,8 +1143,11 @@ mod tests {
     #[test]
     fn test_diff_update_model_loaded() {
         let old = sample_capability_set();
+        // Phase A.5.N.3: read models via views(), mutate, set_models.
+        let mut models = old.views().models;
+        models[0].loaded = false;
         let mut new = old.clone();
-        new.models[0].loaded = false;
+        new.set_models(models);
 
         let ops = DiffEngine::diff(&old, &new);
         assert_eq!(ops.len(), 1);
@@ -1137,8 +1160,7 @@ mod tests {
     #[test]
     fn test_diff_add_model() {
         let old = sample_capability_set();
-        let mut new = old.clone();
-        new.models.push(
+        let new = old.clone().add_model(
             ModelCapability::new("mistral-7b", "mistral")
                 .with_parameters(7.0)
                 .add_modality(Modality::Text),
@@ -1153,7 +1175,9 @@ mod tests {
     fn test_diff_update_memory() {
         let old = sample_capability_set();
         let mut new = old.clone();
-        new.hardware.memory_mb = 131072;
+        let mut hw = new.views().hardware;
+        hw.memory_mb = 131072;
+        new.set_hardware(hw);
 
         let ops = DiffEngine::diff(&old, &new);
         assert_eq!(ops.len(), 1);
@@ -1177,7 +1201,7 @@ mod tests {
         let new = DiffEngine::apply(&old, &diff, true).unwrap();
 
         assert!(new.has_tag("training"));
-        assert_eq!(new.hardware.memory_mb, 131072);
+        assert_eq!(new.views().hardware.memory_mb, 131072);
     }
 
     #[test]
@@ -1240,16 +1264,26 @@ mod tests {
         let old = sample_capability_set();
         let mut new = old.clone();
 
-        // Make several changes. Phase A.5.N.2: tags is HashSet<Tag>;
-        // use add_tag to add, parse+remove to remove.
+        // Make several changes. Phase A.5.N.3: every write goes
+        // through the typed setters / add_*; reads through views().
         new = new.add_tag("training");
         let inference = crate::adapter::net::behavior::tag::Tag::parse("inference")
             .expect("legacy tag parse");
         new.tags.remove(&inference);
-        new.models[0].loaded = false;
-        new.models[0].tokens_per_sec = 100;
-        new.hardware.memory_mb = 131072;
-        new.models.push(
+
+        // Tweak the first existing model: loaded=false + new throughput.
+        let mut models = new.views().models;
+        models[0].loaded = false;
+        models[0].tokens_per_sec = 100;
+        new.set_models(models);
+
+        // Bump memory.
+        let mut hw = new.views().hardware;
+        hw.memory_mb = 131072;
+        new.set_hardware(hw);
+
+        // Add a second model.
+        new = new.add_model(
             ModelCapability::new("mistral-7b", "mistral")
                 .with_parameters(7.0)
                 .add_modality(Modality::Text),
@@ -1265,11 +1299,11 @@ mod tests {
         // Verify
         assert!(applied.has_tag("training"));
         assert!(!applied.has_tag("inference"));
-        assert_eq!(applied.hardware.memory_mb, 131072);
-        assert_eq!(applied.models.len(), 2);
+        let v = applied.views();
+        assert_eq!(v.hardware.memory_mb, 131072);
+        assert_eq!(v.models.len(), 2);
         assert!(
-            !applied
-                .models
+            !v.models
                 .iter()
                 .find(|m| m.model_id == "llama-3.1-70b")
                 .unwrap()
@@ -1526,7 +1560,7 @@ mod tests {
             .expect("non-strict apply preserves the historic no-op");
         // No mutation expected — caps unchanged.
         assert_eq!(result.tags, caps.tags);
-        assert_eq!(result.hardware, caps.hardware);
+        assert_eq!(result.views().hardware, caps.views().hardware);
     }
 
     // ========================================================================

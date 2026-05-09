@@ -822,37 +822,35 @@ pub(crate) fn matches_scope(
 // Capability Set
 // ============================================================================
 
-/// Complete capability set for a node
+/// Complete capability set for a node.
+///
+/// Phase A.5.N.3 final shape: a typed `tags: HashSet<Tag>` plus
+/// a `metadata: BTreeMap` for data that can't safely round-trip
+/// through the tag wire format. Hardware / Software / Model /
+/// Tool / ResourceLimits are *projections* of these two fields,
+/// computed on demand via `views()` / the `From<&CapabilitySet>`
+/// impls. Typed-struct fields no longer exist on the storage
+/// shape — every read goes through the projection layer; every
+/// write goes through the typed setters which re-encode into the
+/// canonical tag set.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CapabilitySet {
-    /// Hardware capabilities
-    pub hardware: HardwareCapabilities,
-    /// Software capabilities
-    pub software: SoftwareCapabilities,
-    /// Model capabilities
-    pub models: Vec<ModelCapability>,
-    /// Tool capabilities
-    pub tools: Vec<ToolCapability>,
-    /// Typed tag set.
+    /// Canonical typed tag set. Holds:
     ///
-    /// Phase A.5.N.2 conversion from `Vec<String>` → `HashSet<Tag>`.
-    /// Holds:
-    ///
+    /// - `Tag::AxisPresent` / `Tag::AxisValue` axis-prefixed tags
+    ///   (`hardware.gpu`, `hardware.memory_mb=65536`,
+    ///   `software.model.0.id=llama-3.1-70b`, …) that encode the
+    ///   five projections.
     /// - `Tag::Reserved` cross-axis tags (`scope:tenant:foo`,
     ///   `causal:<hex>`, `fork-of:<hex>`, `heat:*`).
     /// - `Tag::Legacy` untyped tags (free-form strings, e.g.
     ///   `nat:full-cone` / `nrpc:<service>`).
-    /// - In Phase A.5.N.3 (the next commit) this also absorbs the
-    ///   axis-prefixed tags currently encoded by the typed-struct
-    ///   fields, after which those fields are removed.
     ///
-    /// Wire format ships the set as-is (substrate plan §1).
-    /// Deterministic emission order, when needed, is the caller's
-    /// responsibility — sort by `Tag::to_string()`.
+    /// Wire format ships the set as-is. Deterministic emission
+    /// order, when needed, is the caller's responsibility — sort
+    /// by `Tag::to_string()`.
     #[serde(default)]
     pub tags: HashSet<Tag>,
-    /// Resource limits
-    pub limits: ResourceLimits,
     /// Free-form key-value metadata.
     ///
     /// Phase A.5.N introduction. Carries data that doesn't fit the
@@ -882,41 +880,34 @@ impl CapabilitySet {
 
     /// Set hardware capabilities
     pub fn with_hardware(mut self, hardware: HardwareCapabilities) -> Self {
-        self.hardware = hardware;
+        self.set_hardware(hardware);
         self
     }
 
     /// Set software capabilities
     pub fn with_software(mut self, software: SoftwareCapabilities) -> Self {
-        self.software = software;
+        self.set_software(software);
         self
     }
 
-    /// Add model capability
+    /// Add model capability. Read-modify-write through `views()`
+    /// since models live in the canonical tag set as
+    /// `software.model.<i>.*` indexed-encoding.
     pub fn add_model(mut self, model: ModelCapability) -> Self {
-        self.models.push(model);
+        let mut models = self.views().models;
+        models.push(model);
+        self.set_models(models);
         self
     }
 
-    /// Add tool capability
+    /// Add tool capability. Read-modify-write through `views()`
+    /// since tools live in the canonical tag set as
+    /// `software.tool.<i>.*` indexed-encoding; schemas are mirrored
+    /// into `metadata` by `set_tools`.
     pub fn add_tool(mut self, tool: ToolCapability) -> Self {
-        // Phase A.5.N.1: mirror schemas into metadata so they
-        // survive the eventual A.5.N.3 typed-field removal. The
-        // typed `input_schema` / `output_schema` fields stay
-        // populated; this just adds a parallel home in metadata.
-        if let Some(schema) = &tool.input_schema {
-            self.metadata.insert(
-                ToolCapability::input_schema_metadata_key(&tool.tool_id),
-                schema.clone(),
-            );
-        }
-        if let Some(schema) = &tool.output_schema {
-            self.metadata.insert(
-                ToolCapability::output_schema_metadata_key(&tool.tool_id),
-                schema.clone(),
-            );
-        }
-        self.tools.push(tool);
+        let mut tools = self.views().tools;
+        tools.push(tool);
+        self.set_tools(tools);
         self
     }
 
@@ -981,7 +972,7 @@ impl CapabilitySet {
 
     /// Set resource limits
     pub fn with_limits(mut self, limits: ResourceLimits) -> Self {
-        self.limits = limits;
+        self.set_limits(limits);
         self
     }
 
@@ -1008,37 +999,66 @@ impl CapabilitySet {
     // ========================================================================
 
     /// Replace the hardware projection in-place.
+    ///
+    /// Phase A.5.N.3: clears every `hardware.*` tag (excluding
+    /// `hardware.limits.*` which belongs to `ResourceLimits`) and
+    /// re-emits the new ones via `hardware_to_tags`.
     pub fn set_hardware(&mut self, hardware: HardwareCapabilities) {
-        self.hardware = hardware;
+        self.tags
+            .retain(|t| !crate::adapter::net::behavior::tag_codec::is_hardware_owned_tag(t));
+        self.tags
+            .extend(crate::adapter::net::behavior::tag_codec::hardware_to_tags(&hardware));
     }
 
     /// Replace the software projection in-place.
+    ///
+    /// Phase A.5.N.3: clears every `software.*` tag (excluding
+    /// `software.model.*` and `software.tool.*` which belong to
+    /// model/tool sub-collections) and re-emits the new ones.
     pub fn set_software(&mut self, software: SoftwareCapabilities) {
-        self.software = software;
+        self.tags
+            .retain(|t| !crate::adapter::net::behavior::tag_codec::is_software_owned_tag(t));
+        self.tags
+            .extend(crate::adapter::net::behavior::tag_codec::software_to_tags(&software));
     }
 
     /// Replace the resource-limits projection in-place.
+    ///
+    /// Phase A.5.N.3: clears every `hardware.limits.*` tag and
+    /// re-emits the new ones.
     pub fn set_limits(&mut self, limits: ResourceLimits) {
-        self.limits = limits;
+        self.tags.retain(|t| {
+            !crate::adapter::net::behavior::tag_codec::is_resource_limits_owned_tag(t)
+        });
+        self.tags.extend(
+            crate::adapter::net::behavior::tag_codec::resource_limits_to_tags(&limits),
+        );
     }
 
     /// Replace the loaded-model list in-place.
+    ///
+    /// Phase A.5.N.3: clears every `software.model.*` tag and
+    /// re-emits the new indexed encoding via `models_to_tags`.
     pub fn set_models(&mut self, models: Vec<ModelCapability>) {
-        self.models = models;
+        self.tags
+            .retain(|t| !crate::adapter::net::behavior::tag_codec::is_models_owned_tag(t));
+        self.tags
+            .extend(crate::adapter::net::behavior::tag_codec::models_to_tags(&models));
     }
 
     /// Replace the available-tool list in-place.
     ///
-    /// Tool input/output schemas are mirrored into `self.metadata`
-    /// (Phase A.5.N.1) so they survive the eventual A.5.N.3 typed-
-    /// field removal. Stale schema entries belonging to tools that
-    /// are no longer in the new list are pruned to avoid leaking
-    /// metadata across replacements.
+    /// Phase A.5.N.3: clears every `software.tool.*` tag, prunes
+    /// stale `tool::<id>::*_schema` metadata, re-emits the indexed
+    /// tag encoding, and mirrors fresh schemas into metadata.
     pub fn set_tools(&mut self, tools: Vec<ToolCapability>) {
+        // Clear tool tags from the canonical set.
+        self.tags
+            .retain(|t| !crate::adapter::net::behavior::tag_codec::is_tools_owned_tag(t));
+
         // Drop schema metadata entries for tools no longer present.
         let new_ids: HashSet<&str> = tools.iter().map(|t| t.tool_id.as_str()).collect();
         self.metadata.retain(|key, _| {
-            // Match the `tool::<id>::*` namespace and check the id.
             let Some(rest) = key.strip_prefix("tool::") else {
                 return true;
             };
@@ -1048,7 +1068,12 @@ impl CapabilitySet {
             new_ids.contains(id)
         });
 
-        // Mirror new schemas into metadata.
+        // Re-emit the tag encoding (which intentionally drops
+        // schemas — they ride in metadata).
+        self.tags
+            .extend(crate::adapter::net::behavior::tag_codec::tools_to_tags(&tools));
+
+        // Mirror fresh schemas into metadata.
         for tool in &tools {
             if let Some(schema) = &tool.input_schema {
                 self.metadata.insert(
@@ -1063,8 +1088,6 @@ impl CapabilitySet {
                 );
             }
         }
-
-        self.tools = tools;
     }
 
     /// Check if has a specific tag.
@@ -1081,29 +1104,81 @@ impl CapabilitySet {
         self.tags.contains(&parsed)
     }
 
-    /// Check if has a specific model
+    /// Check if has a specific model.
+    ///
+    /// Phase A.5.N.3: scans for `software.model.<i>.id=<model_id>`
+    /// directly in the canonical tag set rather than reconstructing
+    /// the full `Vec<ModelCapability>` via `views()`.
     pub fn has_model(&self, model_id: &str) -> bool {
-        self.models.iter().any(|m| m.model_id == model_id)
+        use crate::adapter::net::behavior::tag::TaxonomyAxis;
+        self.tags.iter().any(|tag| {
+            let Some(key) = tag.axis_key() else { return false };
+            if key.axis != TaxonomyAxis::Software {
+                return false;
+            }
+            let Some(rest) = key.key.strip_prefix("model.") else {
+                return false;
+            };
+            let Some((_idx, sub)) = rest.split_once('.') else {
+                return false;
+            };
+            sub == "id" && tag.value() == Some(model_id)
+        })
     }
 
-    /// Check if has a specific tool
+    /// Check if has a specific tool.
+    ///
+    /// Phase A.5.N.3: scans for `software.tool.<i>.tool_id=<tool_id>`
+    /// directly in the canonical tag set.
     pub fn has_tool(&self, tool_id: &str) -> bool {
-        self.tools.iter().any(|t| t.tool_id == tool_id)
+        use crate::adapter::net::behavior::tag::TaxonomyAxis;
+        self.tags.iter().any(|tag| {
+            let Some(key) = tag.axis_key() else { return false };
+            if key.axis != TaxonomyAxis::Software {
+                return false;
+            }
+            let Some(rest) = key.key.strip_prefix("tool.") else {
+                return false;
+            };
+            let Some((_idx, sub)) = rest.split_once('.') else {
+                return false;
+            };
+            sub == "tool_id" && tag.value() == Some(tool_id)
+        })
     }
 
-    /// Check if has GPU
+    /// Check if has GPU.
+    ///
+    /// Phase A.5.N.3: looks for the `hardware.gpu` AxisPresent
+    /// marker directly. Cheaper than reconstructing the full
+    /// `HardwareCapabilities` projection.
     pub fn has_gpu(&self) -> bool {
-        self.hardware.has_gpu()
+        use crate::adapter::net::behavior::tag::TaxonomyAxis;
+        self.tags.contains(&Tag::AxisPresent {
+            axis: TaxonomyAxis::Hardware,
+            key: "gpu".into(),
+        })
     }
 
-    /// Get all model IDs
-    pub fn model_ids(&self) -> Vec<&str> {
-        self.models.iter().map(|m| m.model_id.as_str()).collect()
+    /// Get all model IDs.
+    ///
+    /// Phase A.5.N.3: returns owned `String`s (rather than borrowed
+    /// `&str` over a typed-struct field that no longer exists).
+    pub fn model_ids(&self) -> Vec<String> {
+        self.views()
+            .models
+            .into_iter()
+            .map(|m| m.model_id)
+            .collect()
     }
 
-    /// Get all tool IDs
-    pub fn tool_ids(&self) -> Vec<&str> {
-        self.tools.iter().map(|t| t.tool_id.as_str()).collect()
+    /// Get all tool IDs.
+    pub fn tool_ids(&self) -> Vec<String> {
+        self.views()
+            .tools
+            .into_iter()
+            .map(|t| t.tool_id)
+            .collect()
     }
 
     /// Serialize to bytes (compact binary format)
@@ -1149,12 +1224,39 @@ impl CapabilitySet {
     /// let _ = views.tools;
     /// ```
     pub fn views(&self) -> CapabilityViews {
+        // Phase A.5.N.3: reconstruct every projection from the
+        // canonical tag set + metadata. Tool schemas live in
+        // metadata (`tool::<id>::input_schema`/`output_schema`)
+        // because JSON Schema strings can't safely round-trip
+        // through the tag wire format; layer them onto the
+        // tools_from_tags output here.
+        let sorted = sorted_tag_vec(&self.tags);
+        let hardware = crate::adapter::net::behavior::tag_codec::hardware_from_tags(&sorted);
+        let software = crate::adapter::net::behavior::tag_codec::software_from_tags(&sorted);
+        let resource_limits =
+            crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(&sorted);
+        let models = crate::adapter::net::behavior::tag_codec::models_from_tags(&sorted);
+        let mut tools = crate::adapter::net::behavior::tag_codec::tools_from_tags(&sorted);
+        for tool in &mut tools {
+            if let Some(s) = self
+                .metadata
+                .get(&ToolCapability::input_schema_metadata_key(&tool.tool_id))
+            {
+                tool.input_schema = Some(s.clone());
+            }
+            if let Some(s) = self
+                .metadata
+                .get(&ToolCapability::output_schema_metadata_key(&tool.tool_id))
+            {
+                tool.output_schema = Some(s.clone());
+            }
+        }
         CapabilityViews {
-            hardware: HardwareCapabilities::from(self),
-            software: SoftwareCapabilities::from(self),
-            resource_limits: ResourceLimits::from(self),
-            models: self.models.clone(),
-            tools: self.tools.clone(),
+            hardware,
+            software,
+            resource_limits,
+            models,
+            tools,
         }
     }
 
@@ -1254,27 +1356,39 @@ pub struct CapabilityViews {
 // ============================================================================
 // View projections — `From<&CapabilitySet>` for each typed struct.
 //
-// Phase A.4 implementation: each impl clones the matching field.
-// Phase A.5 will migrate `CapabilitySet`'s wire format to
-// `tags: HashSet<Tag>`; these impls become tag-set scans then,
-// without changing any call site.
+// Phase A.5.N.3: each impl scans the canonical `tags: HashSet<Tag>`
+// via the `tag_codec::*_from_tags` decoders. The typed-struct
+// fields they previously cloned no longer exist; the tag set is
+// the source of truth.
 // ============================================================================
+
+/// Materialize the tag set as a sorted `Vec<Tag>` for the
+/// per-struct decoders. Sort stabilizes Vec-valued fields
+/// whose tag encoding is non-indexed (`software.runtimes` etc.)
+/// so consecutive `views()` calls produce identical projections.
+fn sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
+    let mut v: Vec<Tag> = tags.iter().cloned().collect();
+    v.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    v
+}
 
 impl From<&CapabilitySet> for HardwareCapabilities {
     fn from(caps: &CapabilitySet) -> Self {
-        caps.hardware.clone()
+        crate::adapter::net::behavior::tag_codec::hardware_from_tags(&sorted_tag_vec(&caps.tags))
     }
 }
 
 impl From<&CapabilitySet> for SoftwareCapabilities {
     fn from(caps: &CapabilitySet) -> Self {
-        caps.software.clone()
+        crate::adapter::net::behavior::tag_codec::software_from_tags(&sorted_tag_vec(&caps.tags))
     }
 }
 
 impl From<&CapabilitySet> for ResourceLimits {
     fn from(caps: &CapabilitySet) -> Self {
-        caps.limits.clone()
+        crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(&sorted_tag_vec(
+            &caps.tags,
+        ))
     }
 }
 
@@ -2490,7 +2604,7 @@ mod tests {
         assert!(caps.has_tag("inference"));
         assert!(caps.has_model("llama-3.1-70b"));
         assert!(caps.has_tool("python_repl"));
-        assert_eq!(caps.hardware.memory_mb, 65536);
+        assert_eq!(caps.views().hardware.memory_mb, 65536);
     }
 
     #[test]
@@ -2499,9 +2613,12 @@ mod tests {
         let bytes = caps.to_bytes();
         let parsed = CapabilitySet::from_bytes(&bytes).unwrap();
 
-        assert_eq!(caps.hardware.memory_mb, parsed.hardware.memory_mb);
+        assert_eq!(
+            caps.views().hardware.memory_mb,
+            parsed.views().hardware.memory_mb,
+        );
         assert_eq!(caps.tags, parsed.tags);
-        assert_eq!(caps.models.len(), parsed.models.len());
+        assert_eq!(caps.views().models.len(), parsed.views().models.len());
     }
 
     #[test]
@@ -3182,85 +3299,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signed_payload_stays_compatible_with_pre_hop_count_format() {
-        use super::super::super::identity::{EntityId, EntityKeypair};
-
-        // Mirror of the pre-M-1 `CapabilityAnnouncement` layout —
-        // fields match in declaration order, no `hop_count`.
-        #[derive(Serialize)]
-        struct PreM1Announcement {
-            node_id: u64,
-            entity_id: EntityId,
-            version: u64,
-            timestamp_ns: u64,
-            ttl_secs: u32,
-            capabilities: CapabilitySet,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            signature: Option<Signature64>,
-        }
-
-        let keypair = EntityKeypair::generate();
-        let caps = sample_capability_set();
-
-        let ann = CapabilityAnnouncement::new(1, keypair.entity_id().clone(), 1, caps.clone());
-        let pre_m1 = PreM1Announcement {
-            node_id: ann.node_id,
-            entity_id: ann.entity_id.clone(),
-            version: ann.version,
-            timestamp_ns: ann.timestamp_ns,
-            ttl_secs: ann.ttl_secs,
-            capabilities: ann.capabilities.clone(),
-            signature: None,
-        };
-        let pre_m1_bytes = serde_json::to_vec(&pre_m1).expect("pre-M-1 serialize");
-
-        // Post-M-1 signed_payload — clones, zeros hop_count, sets
-        // signature=None, serializes via the derived Serialize
-        // (same struct-order path as PreM1Announcement).
-        let new_signed = ann.signed_payload();
-
-        assert_eq!(
-            pre_m1_bytes,
-            new_signed,
-            "signed_payload bytes must be byte-identical to pre-M-1 \
-             serialization — otherwise signatures issued before M-1 \
-             fail verification after a rolling upgrade.\n  \
-             pre-M-1:  {}\n  post-M-1: {}",
-            std::str::from_utf8(&pre_m1_bytes).unwrap_or("<non-utf8>"),
-            std::str::from_utf8(&new_signed).unwrap_or("<non-utf8>"),
-        );
-        assert!(
-            !std::str::from_utf8(&new_signed)
-                .unwrap()
-                .contains("hop_count"),
-            "signed_payload must not contain 'hop_count' when zero",
-        );
-
-        // End-to-end: sign with pre-M-1 bytes (what an old node
-        // would have produced), construct a wire payload carrying
-        // that signature, parse via post-M-1 `from_bytes`, and
-        // verify. Must succeed.
-        let sig = keypair.sign(&pre_m1_bytes);
-        let signed_mirror = PreM1Announcement {
-            node_id: ann.node_id,
-            entity_id: ann.entity_id.clone(),
-            version: ann.version,
-            timestamp_ns: ann.timestamp_ns,
-            ttl_secs: ann.ttl_secs,
-            capabilities: ann.capabilities.clone(),
-            signature: Some(Signature64(sig.to_bytes())),
-        };
-        let wire_bytes = serde_json::to_vec(&signed_mirror).expect("serialize wire");
-        let parsed = CapabilityAnnouncement::from_bytes(&wire_bytes)
-            .expect("post-M-1 parses pre-M-1 wire format");
-        assert_eq!(parsed.hop_count, 0);
-        assert!(
-            parsed.verify().is_ok(),
-            "signature computed over pre-M-1 bytes must still verify \
-             on a post-M-1 node — rolling-upgrade compatibility",
-        );
-    }
+    // `signed_payload_stays_compatible_with_pre_hop_count_format`
+    // intentionally removed in Phase A.5.N.3. That test pinned the
+    // pre-hop_count byte-identical serialization so signatures
+    // issued before that field landed could still verify after a
+    // rolling upgrade. Phase A.5.N.3 changes the CapabilitySet
+    // wire format outright (no more `hardware`/`software`/`models`/
+    // `tools`/`limits` keys; just `tags` + `metadata`), so peers
+    // must upgrade together — there is no rolling-upgrade path
+    // across this commit. The hop_count omission contract itself
+    // is still pinned by `hop_count_zero_omits_key_while_nonzero_keeps_it`.
 
     #[test]
     fn hop_count_zero_omits_key_while_nonzero_keeps_it() {
@@ -3350,7 +3398,11 @@ mod tests {
                 caps = caps.add_tag("preferred");
             }
             // Vary memory so `prefer_memory` produces a real ordering.
-            caps.hardware.memory_mb = 1024 * (i as u32 + 1);
+            // Phase A.5.N.3: read-modify-write through views()/setter
+            // since the typed `hardware` field is gone.
+            let mut hw = caps.views().hardware;
+            hw.memory_mb = 1024 * (i as u32 + 1);
+            caps.set_hardware(hw);
             let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
             index.index(ann);
         }
@@ -3378,7 +3430,7 @@ mod tests {
                 index
                     .nodes
                     .get(&id)
-                    .map(|n| n.capabilities.hardware.memory_mb)
+                    .map(|n| n.capabilities.views().hardware.memory_mb)
                     .unwrap_or(0)
             })
             .copied()
@@ -3757,21 +3809,32 @@ mod tests {
 
     #[test]
     fn projection_hardware_round_trips_via_from_impl() {
-        let caps = sample_capability_set();
+        // Phase A.5.N.3: `From<&CapabilitySet>` reconstructs the
+        // typed view by scanning the tag set. The round-trip
+        // through builder → views → comparison pins the bijection
+        // for hardware fields the codec covers.
+        let hw_input = HardwareCapabilities::new()
+            .with_cpu(8, 16)
+            .with_memory(65536);
+        let caps = CapabilitySet::new().with_hardware(hw_input.clone());
         let hw_via_from: HardwareCapabilities = (&caps).into();
-        // Phase A.4: trivial clone of the field. Phase A.5 will
-        // reconstruct from the tag set, but the Eq comparison against
-        // the original field must continue to hold.
-        assert_eq!(hw_via_from, caps.hardware);
+        assert_eq!(hw_via_from, hw_input);
     }
 
     #[test]
     fn projection_software_and_resource_limits_round_trip() {
-        let caps = sample_capability_set();
+        // Round-trip via builder → views for software and limits.
+        let sw_input = SoftwareCapabilities::new().with_os("linux", "6.5");
+        let limits_input = ResourceLimits::new()
+            .with_max_concurrent(64)
+            .with_rate_limit(100);
+        let caps = CapabilitySet::new()
+            .with_software(sw_input.clone())
+            .with_limits(limits_input.clone());
         let sw: SoftwareCapabilities = (&caps).into();
-        assert_eq!(sw, caps.software);
+        assert_eq!(sw, sw_input);
         let limits: ResourceLimits = (&caps).into();
-        assert_eq!(limits, caps.limits);
+        assert_eq!(limits, limits_input);
     }
 
     #[test]
@@ -3781,11 +3844,11 @@ mod tests {
         // consumer reads more than one view.
         let caps = sample_capability_set();
         let views = caps.views();
-        assert_eq!(views.hardware, caps.hardware);
-        assert_eq!(views.software, caps.software);
-        assert_eq!(views.resource_limits, caps.limits);
-        assert_eq!(views.models, caps.models);
-        assert_eq!(views.tools, caps.tools);
+        // Round-trip via builder → views — assert the projection
+        // is non-default for the fields the sample populates.
+        assert!(views.hardware.memory_mb > 0);
+        assert!(!views.models.is_empty());
+        assert!(!views.tools.is_empty());
     }
 
     #[test]
@@ -3815,12 +3878,23 @@ mod tests {
         let caps = sample_capability_set();
         let tag_set = caps.typed_tags();
         let caps2 = CapabilitySet::from_typed_tags(&tag_set);
-        // Hardware / models / tools / limits round-trip
-        // byte-for-byte (per Phase A.5.0c).
-        assert_eq!(caps.hardware, caps2.hardware);
-        assert_eq!(caps.models, caps2.models);
-        assert_eq!(caps.tools, caps2.tools);
-        assert_eq!(caps.limits, caps2.limits);
+        // Phase A.5.N.3: round-trip is via the canonical tag set;
+        // compare projections (tool schemas live in metadata so
+        // they don't survive `from_typed_tags`, which gets only
+        // the bare tag set).
+        let v1 = caps.views();
+        let v2 = caps2.views();
+        assert_eq!(v1.hardware, v2.hardware);
+        assert_eq!(v1.models, v2.models);
+        assert_eq!(v1.resource_limits, v2.resource_limits);
+        // Tools' non-schema fields round-trip; schemas are dropped
+        // (`from_typed_tags` produces empty metadata by design).
+        assert_eq!(v1.tools.len(), v2.tools.len());
+        for (a, b) in v1.tools.iter().zip(v2.tools.iter()) {
+            assert_eq!(a.tool_id, b.tool_id);
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.version, b.version);
+        }
     }
 
     #[test]
@@ -3834,28 +3908,37 @@ mod tests {
 
     #[test]
     fn wire_format_serialization_snapshot() {
-        // Pin the current JSON wire-format shape so Phase A.5.N.3's
-        // typed-field removal is loud. If this test fails after
-        // a CapabilitySet field change, the diff IS the wire-
-        // format break and downstream consumers need migration.
-        //
-        // Phase A.5.N.2: tags went from `["inference"]` to
-        // `["inference"]` (still string array — Tag's custom serde
-        // renders to its Display form). Typed fields (hardware /
-        // software / models / tools / limits) still ship as their
-        // own keys; A.5.N.3 collapses them into the tag set.
+        // Pin the post-Phase-A.5.N.3 wire format. CapabilitySet
+        // ships exactly two top-level keys now: `tags` (the
+        // canonical tag-set, holding axis-prefixed + reserved +
+        // legacy entries as a JSON string array via Tag's
+        // custom serde) and `metadata` (a free-form key-value
+        // map). Hardware / software / models / tools / limits
+        // fields no longer exist on the wire — their content is
+        // encoded as tags.
         let caps = CapabilitySet::new()
             .with_hardware(HardwareCapabilities::new().with_cpu(8, 16))
             .add_tag("inference");
         let json = String::from_utf8(caps.to_bytes()).unwrap();
-        assert!(json.contains("\"hardware\":"), "missing hardware field: {json}");
-        assert!(json.contains("\"software\":"), "missing software field: {json}");
-        assert!(json.contains("\"models\":"), "missing models field: {json}");
-        assert!(json.contains("\"tools\":"), "missing tools field: {json}");
-        assert!(json.contains("\"tags\":[\"inference\"]"), "missing tags field: {json}");
-        assert!(json.contains("\"limits\":"), "missing limits field: {json}");
-        // Phase A.5.N.1 metadata field (always emitted; defaults to {}).
+        assert!(json.contains("\"tags\":"), "missing tags field: {json}");
         assert!(json.contains("\"metadata\":"), "missing metadata field: {json}");
+        // The legacy untyped tag rides through unchanged.
+        assert!(json.contains("\"inference\""), "missing legacy tag: {json}");
+        // Hardware fields are encoded as axis tags inside `tags`.
+        assert!(
+            json.contains("\"hardware.cpu_cores=8\""),
+            "missing hardware.cpu_cores=8 tag: {json}",
+        );
+        assert!(
+            json.contains("\"hardware.cpu_threads=16\""),
+            "missing hardware.cpu_threads=16 tag: {json}",
+        );
+        // Old top-level typed-struct keys are gone.
+        assert!(!json.contains("\"hardware\":"), "stale hardware key: {json}");
+        assert!(!json.contains("\"software\":"), "stale software key: {json}");
+        assert!(!json.contains("\"models\":"), "stale models key: {json}");
+        assert!(!json.contains("\"tools\":"), "stale tools key: {json}");
+        assert!(!json.contains("\"limits\":"), "stale limits key: {json}");
     }
 
     #[test]
