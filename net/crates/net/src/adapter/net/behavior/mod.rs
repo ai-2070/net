@@ -20,6 +20,7 @@ pub mod loadbalance;
 pub mod metadata;
 pub mod predicate;
 pub mod proximity;
+pub mod required_capability;
 pub mod rules;
 pub mod safety;
 pub mod tag;
@@ -42,6 +43,8 @@ pub use tag::{
 };
 
 pub use predicate::{EvalContext, Predicate};
+
+pub use required_capability::{RequireParseError, RequiredCapability};
 
 pub use diff::{CapabilityDiff, DiffEngine, DiffError, DiffOp};
 
