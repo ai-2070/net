@@ -1,0 +1,21 @@
+web/src/app/globals.css
+  s_55265e6795d7b9::t_bead128136797f 315,317,322,325,327-328,331,333,335,339-341,343-344,348,350-351,356
+web/src/app/page.tsx
+  s_55265e6795d7b9::t_b1597a9af67d53 4496-4553,4562,4565-4566
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "c66f2b5d3dc7062837d3e50a9201be54620f3971",
+  "prompts": {},
+  "sessions": {
+    "s_55265e6795d7b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6bac1322-4c47-4293-a1fb-66a38b5f162f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
