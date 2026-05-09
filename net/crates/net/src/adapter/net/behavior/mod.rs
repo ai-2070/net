@@ -23,6 +23,7 @@ pub mod proximity;
 pub mod required_capability;
 pub mod rules;
 pub mod safety;
+pub mod schema;
 pub mod tag;
 pub mod tag_codec;
 
@@ -56,6 +57,12 @@ pub use tag_codec::{
 };
 
 pub use diff::{CapabilityDiff, DiffEngine, DiffError, DiffOp};
+
+pub use schema::{
+    AXIS_SCHEMA, AxisEntry, AxisSchema, KeyEntry, KeyShape, KeyShapeKind,
+    METADATA_SOFT_CAP_BYTES, SchemaError, ValidationReport, ValidationWarning, ValueType,
+    validate_capabilities, validate_capabilities_against,
+};
 
 pub use metadata::{
     LocationInfo, MetadataError, MetadataQuery, MetadataStore, MetadataStoreStats, NatType,
