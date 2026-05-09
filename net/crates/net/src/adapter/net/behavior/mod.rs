@@ -48,8 +48,9 @@ pub use predicate::{EvalContext, Predicate};
 pub use required_capability::{RequireParseError, RequiredCapability};
 
 pub use tag_codec::{
-    hardware_from_tags, hardware_to_tags, resource_limits_from_tags, resource_limits_to_tags,
-    software_from_tags, software_to_tags,
+    hardware_from_tags, hardware_to_tags, models_from_tags, models_to_tags,
+    resource_limits_from_tags, resource_limits_to_tags, software_from_tags, software_to_tags,
+    tools_from_tags, tools_to_tags,
 };
 
 pub use diff::{CapabilityDiff, DiffEngine, DiffError, DiffOp};

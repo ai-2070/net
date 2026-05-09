@@ -21,8 +21,6 @@
 //! Pure function; reuses [`Predicate::evaluate`] for the predicate
 //! variant and a tag-set scan for the others.
 
-use std::collections::BTreeMap;
-
 use crate::adapter::net::behavior::predicate::{EvalContext, Predicate};
 use crate::adapter::net::behavior::tag::{
     CapabilityTagError, Tag, TagKey, TaxonomyAxis,
@@ -233,15 +231,6 @@ fn parse_tag_key(s: &str) -> Result<TagKey, RequireParseError> {
     Ok(TagKey::new(axis, key.to_string()))
 }
 
-// Suppress an unused-import warning when this module is compiled
-// without the metadata field's BTreeMap usage in the current
-// commit (Phase C adds the field; for now `metadata` flows through
-// the predicate evaluator only).
-#[allow(dead_code)]
-fn _empty_meta_for_doc_completeness() -> BTreeMap<String, String> {
-    BTreeMap::new()
-}
-
 // =============================================================================
 // Macros
 // =============================================================================
@@ -330,6 +319,8 @@ macro_rules! require_axis_value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::adapter::net::behavior::tag::{AxisSeparator, Tag, TaxonomyAxis};
 

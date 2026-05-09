@@ -57,8 +57,11 @@
 //! is documented in tests as a "lossy round-trip drops
 //! additional_gpus / accelerators" so a future regression is loud.
 
+use std::collections::BTreeMap;
+
 use crate::adapter::net::behavior::capability::{
-    GpuInfo, GpuVendor, HardwareCapabilities, ResourceLimits, SoftwareCapabilities,
+    GpuInfo, GpuVendor, HardwareCapabilities, Modality, ModelCapability, ResourceLimits,
+    SoftwareCapabilities, ToolCapability,
 };
 use crate::adapter::net::behavior::tag::{AxisSeparator, Tag, TaxonomyAxis};
 
@@ -485,6 +488,326 @@ fn limits_value(key: &str, value: &str) -> Tag {
         key: format!("limits.{key}"),
         value: value.to_string(),
         separator: AxisSeparator::Eq,
+    }
+}
+
+// =============================================================================
+// ModelCapability list ↔ tags
+// =============================================================================
+
+/// Encode a `&[ModelCapability]` into the canonical axis-prefixed
+/// tag list. Each model gets a numeric index so the round-trip
+/// preserves order:
+///
+/// ```text
+/// software.model.0.id=llama-3.1-70b
+/// software.model.0.family=llama
+/// software.model.0.parameters_b_x10=700
+/// software.model.0.context_length=128000
+/// software.model.0.quantization=fp16
+/// software.model.0.modalities=text,code
+/// software.model.0.tokens_per_sec=50
+/// software.model.0.loaded=true
+/// software.model.1.id=mistral-7b
+/// software.model.1.family=mistral
+/// ...
+/// ```
+///
+/// Numeric indexing matches the multi-GPU encoding scheme noted as
+/// a TODO in the hardware codec — same pattern, applied here for
+/// the Vec<ModelCapability> case.
+pub fn models_to_tags(models: &[ModelCapability]) -> Vec<Tag> {
+    let mut tags = Vec::new();
+    for (i, model) in models.iter().enumerate() {
+        let prefix = format!("model.{i}");
+        if !model.model_id.is_empty() {
+            tags.push(software_value(&format!("{prefix}.id"), &model.model_id));
+        }
+        if !model.family.is_empty() {
+            tags.push(software_value(&format!("{prefix}.family"), &model.family));
+        }
+        if model.parameters_b_x10 > 0 {
+            tags.push(software_value(
+                &format!("{prefix}.parameters_b_x10"),
+                &model.parameters_b_x10.to_string(),
+            ));
+        }
+        if model.context_length > 0 {
+            tags.push(software_value(
+                &format!("{prefix}.context_length"),
+                &model.context_length.to_string(),
+            ));
+        }
+        if let Some(q) = &model.quantization {
+            tags.push(software_value(&format!("{prefix}.quantization"), q));
+        }
+        if !model.modalities.is_empty() {
+            let csv = model
+                .modalities
+                .iter()
+                .map(|m| modality_str(*m))
+                .collect::<Vec<_>>()
+                .join(",");
+            tags.push(software_value(&format!("{prefix}.modalities"), &csv));
+        }
+        if model.tokens_per_sec > 0 {
+            tags.push(software_value(
+                &format!("{prefix}.tokens_per_sec"),
+                &model.tokens_per_sec.to_string(),
+            ));
+        }
+        if model.loaded {
+            tags.push(software_value(&format!("{prefix}.loaded"), "true"));
+        }
+    }
+    tags
+}
+
+/// Decode a `Vec<ModelCapability>` from a tag list. Models are
+/// indexed by their numeric position in the encoding; output Vec
+/// is sorted by index so round-trip ordering matches input.
+pub fn models_from_tags(tags: &[Tag]) -> Vec<ModelCapability> {
+    // Group sub-tags by model index so we can reconstruct the
+    // ModelCapability at each index in one pass.
+    let mut by_index: BTreeMap<u32, ModelFields> = BTreeMap::new();
+    for tag in tags {
+        let Some(key) = tag.axis_key() else { continue };
+        if key.axis != TaxonomyAxis::Software {
+            continue;
+        }
+        let Some(rest) = key.key.strip_prefix("model.") else {
+            continue;
+        };
+        let Some((idx_str, sub)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(idx) = idx_str.parse::<u32>() else {
+            continue;
+        };
+        let value = tag.value().unwrap_or("");
+        let entry = by_index.entry(idx).or_default();
+        match sub {
+            "id" => entry.model_id = Some(value.to_string()),
+            "family" => entry.family = Some(value.to_string()),
+            "parameters_b_x10" => {
+                entry.parameters_b_x10 = value.parse().ok();
+            }
+            "context_length" => {
+                entry.context_length = value.parse().ok();
+            }
+            "quantization" => entry.quantization = Some(value.to_string()),
+            "modalities" => {
+                entry.modalities =
+                    value.split(',').map(modality_from_str).collect::<Vec<_>>();
+            }
+            "tokens_per_sec" => {
+                entry.tokens_per_sec = value.parse().ok();
+            }
+            "loaded" => {
+                entry.loaded = Some(value == "true");
+            }
+            _ => {}
+        }
+    }
+    by_index
+        .into_values()
+        .map(|f| f.into_model_capability())
+        .collect()
+}
+
+/// Intermediate accumulator for a single `ModelCapability` during
+/// decode. Each Option tracks "did we see this sub-tag?" so the
+/// final `into_model_capability` knows which substrate-default
+/// values to fall back to.
+#[derive(Default)]
+struct ModelFields {
+    model_id: Option<String>,
+    family: Option<String>,
+    parameters_b_x10: Option<u32>,
+    context_length: Option<u32>,
+    quantization: Option<String>,
+    modalities: Vec<Modality>,
+    tokens_per_sec: Option<u32>,
+    loaded: Option<bool>,
+}
+
+impl ModelFields {
+    fn into_model_capability(self) -> ModelCapability {
+        ModelCapability {
+            model_id: self.model_id.unwrap_or_default(),
+            family: self.family.unwrap_or_default(),
+            parameters_b_x10: self.parameters_b_x10.unwrap_or(0),
+            context_length: self.context_length.unwrap_or(0),
+            quantization: self.quantization,
+            // Empty modalities list is meaningful — applications
+            // build a model with explicit modalities, never
+            // implicitly defaulting to text. Match that here:
+            // if no modalities tag was emitted, the decoded list
+            // is empty (matches the substrate field being empty).
+            modalities: self.modalities,
+            tokens_per_sec: self.tokens_per_sec.unwrap_or(0),
+            loaded: self.loaded.unwrap_or(false),
+        }
+    }
+}
+
+/// Lowercase string form of a `Modality`. Inverse of
+/// [`modality_from_str`].
+fn modality_str(m: Modality) -> &'static str {
+    match m {
+        Modality::Text => "text",
+        Modality::Image => "image",
+        Modality::Audio => "audio",
+        Modality::Video => "video",
+        Modality::Code => "code",
+        Modality::Embedding => "embedding",
+        Modality::ToolUse => "tool_use",
+    }
+}
+
+/// Inverse of [`modality_str`]. Unknown spellings fall back to
+/// `Modality::Text` (forward compat: a peer's new modality string
+/// shouldn't fault our parser).
+fn modality_from_str(s: &str) -> Modality {
+    match s {
+        "text" => Modality::Text,
+        "image" => Modality::Image,
+        "audio" => Modality::Audio,
+        "video" => Modality::Video,
+        "code" => Modality::Code,
+        "embedding" => Modality::Embedding,
+        "tool_use" => Modality::ToolUse,
+        _ => Modality::Text,
+    }
+}
+
+// =============================================================================
+// ToolCapability list ↔ tags
+// =============================================================================
+
+/// Encode a `&[ToolCapability]` into the canonical axis-prefixed
+/// tag list. Same indexed-key pattern as models:
+///
+/// ```text
+/// software.tool.0.tool_id=python_repl
+/// software.tool.0.name=Python REPL
+/// software.tool.0.version=1.0.0
+/// software.tool.0.estimated_time_ms=100
+/// software.tool.0.stateless=true
+/// software.tool.0.requires=python:3.11,sqlite
+/// ```
+///
+/// **Lossiness**: `input_schema` / `output_schema` (JSON Schema
+/// strings) are NOT encoded — they contain `=`, `:`, `,`, etc.
+/// that can't safely round-trip through the tag wire format.
+/// Phase C's metadata field is the natural carrier for those
+/// (key-value blobs); the codec defers to it.
+pub fn tools_to_tags(tools: &[ToolCapability]) -> Vec<Tag> {
+    let mut tags = Vec::new();
+    for (i, tool) in tools.iter().enumerate() {
+        let prefix = format!("tool.{i}");
+        if !tool.tool_id.is_empty() {
+            tags.push(software_value(&format!("{prefix}.tool_id"), &tool.tool_id));
+        }
+        if !tool.name.is_empty() {
+            tags.push(software_value(&format!("{prefix}.name"), &tool.name));
+        }
+        if !tool.version.is_empty() {
+            tags.push(software_value(&format!("{prefix}.version"), &tool.version));
+        }
+        // input_schema / output_schema deferred — see fn doc.
+        if !tool.requires.is_empty() {
+            let csv = tool.requires.join(",");
+            tags.push(software_value(&format!("{prefix}.requires"), &csv));
+        }
+        if tool.estimated_time_ms > 0 {
+            tags.push(software_value(
+                &format!("{prefix}.estimated_time_ms"),
+                &tool.estimated_time_ms.to_string(),
+            ));
+        }
+        // `stateless` always emitted because the substrate's
+        // ToolCapability::new defaults it to true; round-trip
+        // needs to preserve the bool faithfully.
+        tags.push(software_value(
+            &format!("{prefix}.stateless"),
+            if tool.stateless { "true" } else { "false" },
+        ));
+    }
+    tags
+}
+
+/// Decode a `Vec<ToolCapability>` from a tag list. Same indexed-
+/// reconstruction pattern as models.
+pub fn tools_from_tags(tags: &[Tag]) -> Vec<ToolCapability> {
+    let mut by_index: BTreeMap<u32, ToolFields> = BTreeMap::new();
+    for tag in tags {
+        let Some(key) = tag.axis_key() else { continue };
+        if key.axis != TaxonomyAxis::Software {
+            continue;
+        }
+        let Some(rest) = key.key.strip_prefix("tool.") else {
+            continue;
+        };
+        let Some((idx_str, sub)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(idx) = idx_str.parse::<u32>() else {
+            continue;
+        };
+        let value = tag.value().unwrap_or("");
+        let entry = by_index.entry(idx).or_default();
+        match sub {
+            "tool_id" => entry.tool_id = Some(value.to_string()),
+            "name" => entry.name = Some(value.to_string()),
+            "version" => entry.version = Some(value.to_string()),
+            "requires" => {
+                if !value.is_empty() {
+                    entry.requires =
+                        value.split(',').map(|s| s.to_string()).collect::<Vec<_>>();
+                }
+            }
+            "estimated_time_ms" => {
+                entry.estimated_time_ms = value.parse().ok();
+            }
+            "stateless" => {
+                entry.stateless = Some(value == "true");
+            }
+            _ => {}
+        }
+    }
+    by_index
+        .into_values()
+        .map(|f| f.into_tool_capability())
+        .collect()
+}
+
+#[derive(Default)]
+struct ToolFields {
+    tool_id: Option<String>,
+    name: Option<String>,
+    version: Option<String>,
+    requires: Vec<String>,
+    estimated_time_ms: Option<u32>,
+    stateless: Option<bool>,
+}
+
+impl ToolFields {
+    fn into_tool_capability(self) -> ToolCapability {
+        ToolCapability {
+            tool_id: self.tool_id.unwrap_or_default(),
+            name: self.name.unwrap_or_default(),
+            // ToolCapability::new sets version to "1.0.0" by default,
+            // not "" — preserve the substrate convention so a
+            // tool created via `ToolCapability::new` round-trips
+            // unchanged when the user didn't override it.
+            version: self.version.unwrap_or_else(|| "1.0.0".to_string()),
+            input_schema: None, // deferred (Phase C metadata carrier)
+            output_schema: None,
+            requires: self.requires,
+            estimated_time_ms: self.estimated_time_ms.unwrap_or(0),
+            stateless: self.stateless.unwrap_or(true),
+        }
     }
 }
 
@@ -920,5 +1243,233 @@ mod tests {
         assert_eq!(hw.cpu_cores, 8);
         // No hardware-struct field should have been touched by the
         // `hardware.limits.*` tag.
+    }
+
+    // ====================================================================
+    // ModelCapability list ↔ tags
+    // ====================================================================
+
+    fn full_models() -> Vec<ModelCapability> {
+        vec![
+            ModelCapability::new("llama-3.1-70b", "llama")
+                .with_parameters(70.0)
+                .with_context_length(128_000)
+                .with_quantization("fp16")
+                .add_modality(Modality::Code)
+                .with_tokens_per_sec(50)
+                .with_loaded(true),
+            ModelCapability::new("mistral-7b", "mistral")
+                .with_parameters(7.0)
+                .with_context_length(32_000),
+        ]
+    }
+
+    #[test]
+    fn empty_models_emits_no_tags() {
+        assert!(models_to_tags(&[]).is_empty());
+    }
+
+    #[test]
+    fn full_models_emits_canonical_tag_set() {
+        let models = full_models();
+        let strs: Vec<String> = models_to_tags(&models)
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        // First model has all fields populated (loaded=true);
+        // second has only id / family / parameters / context.
+        // ModelCapability::new defaults modalities=[Text]; the
+        // first model adds Code, so the modalities tag is "text,code".
+        assert_eq!(
+            strs,
+            vec![
+                "software.model.0.id=llama-3.1-70b",
+                "software.model.0.family=llama",
+                "software.model.0.parameters_b_x10=700",
+                "software.model.0.context_length=128000",
+                "software.model.0.quantization=fp16",
+                "software.model.0.modalities=text,code",
+                "software.model.0.tokens_per_sec=50",
+                "software.model.0.loaded=true",
+                "software.model.1.id=mistral-7b",
+                "software.model.1.family=mistral",
+                "software.model.1.parameters_b_x10=70",
+                "software.model.1.context_length=32000",
+                "software.model.1.modalities=text",
+            ]
+        );
+    }
+
+    #[test]
+    fn round_trip_full_models() {
+        let models = full_models();
+        let tags = models_to_tags(&models);
+        let models2 = models_from_tags(&tags);
+        assert_eq!(models, models2);
+    }
+
+    #[test]
+    fn round_trip_empty_models() {
+        assert_eq!(models_from_tags(&models_to_tags(&[])), Vec::<ModelCapability>::new());
+    }
+
+    #[test]
+    fn models_index_order_preserved() {
+        // Pinned: models are reconstructed in numeric-index
+        // order via BTreeMap, so the input Vec order is
+        // preserved across the round-trip even when the encoder
+        // emits multiple sub-tags per model and they interleave
+        // arbitrarily on the wire.
+        let m1 = ModelCapability::new("a", "fam");
+        let m2 = ModelCapability::new("b", "fam");
+        let m3 = ModelCapability::new("c", "fam");
+        let original = vec![m1, m2, m3];
+        let tags = models_to_tags(&original);
+        let decoded = models_from_tags(&tags);
+        let ids: Vec<_> = decoded.iter().map(|m| m.model_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn models_decode_skips_non_software_axis() {
+        // Cross-axis tags shouldn't pollute the model decoder.
+        let tags = [
+            Tag::parse("hardware.cpu_cores=8").unwrap(),
+            Tag::parse("software.model.0.id=llama").unwrap(),
+            Tag::parse("software.model.0.family=llama").unwrap(),
+        ];
+        let models = models_from_tags(&tags);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_id, "llama");
+    }
+
+    #[test]
+    fn models_decode_handles_unknown_modality_gracefully() {
+        // Forward compat: a peer's new modality string falls back
+        // to Text rather than panicking.
+        let tags = [
+            Tag::parse("software.model.0.id=foo").unwrap(),
+            Tag::parse("software.model.0.family=bar").unwrap(),
+            Tag::parse("software.model.0.modalities=text,quantum,code").unwrap(),
+        ];
+        let models = models_from_tags(&tags);
+        assert_eq!(models.len(), 1);
+        // "quantum" → fallback Text; result is [Text, Text, Code].
+        assert_eq!(
+            models[0].modalities,
+            vec![Modality::Text, Modality::Text, Modality::Code]
+        );
+    }
+
+    #[test]
+    fn models_decode_skips_malformed_index() {
+        // `software.model.bogus.id=foo` — index isn't numeric, drop.
+        let tags = [
+            Tag::parse("software.model.bogus.id=foo").unwrap(),
+            Tag::parse("software.model.0.id=real").unwrap(),
+            Tag::parse("software.model.0.family=fam").unwrap(),
+        ];
+        let models = models_from_tags(&tags);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_id, "real");
+    }
+
+    // ====================================================================
+    // ToolCapability list ↔ tags
+    // ====================================================================
+
+    fn full_tools() -> Vec<ToolCapability> {
+        vec![
+            ToolCapability::new("python_repl", "Python REPL")
+                .with_version("1.0.0")
+                .with_estimated_time(100)
+                .requires("python:3.11"),
+            ToolCapability::new("ffmpeg", "FFmpeg").with_version("7.0"),
+        ]
+    }
+
+    #[test]
+    fn empty_tools_emits_no_tags() {
+        assert!(tools_to_tags(&[]).is_empty());
+    }
+
+    #[test]
+    fn full_tools_emits_canonical_tag_set() {
+        let tools = full_tools();
+        let strs: Vec<String> = tools_to_tags(&tools)
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        assert_eq!(
+            strs,
+            vec![
+                "software.tool.0.tool_id=python_repl",
+                "software.tool.0.name=Python REPL",
+                "software.tool.0.version=1.0.0",
+                "software.tool.0.requires=python:3.11",
+                "software.tool.0.estimated_time_ms=100",
+                "software.tool.0.stateless=true",
+                "software.tool.1.tool_id=ffmpeg",
+                "software.tool.1.name=FFmpeg",
+                "software.tool.1.version=7.0",
+                "software.tool.1.stateless=true",
+            ]
+        );
+    }
+
+    #[test]
+    fn round_trip_full_tools() {
+        let tools = full_tools();
+        let tools2 = tools_from_tags(&tools_to_tags(&tools));
+        assert_eq!(tools, tools2);
+    }
+
+    #[test]
+    fn round_trip_empty_tools() {
+        assert_eq!(tools_from_tags(&tools_to_tags(&[])), Vec::<ToolCapability>::new());
+    }
+
+    #[test]
+    fn tools_input_output_schemas_dropped_until_phase_c() {
+        // Pinned: JSON Schema strings can't safely round-trip
+        // through the tag wire format. The codec drops them; a
+        // future Phase C metadata-field carrier will restore them.
+        let tool = ToolCapability::new("validator", "JSON Validator")
+            .with_input_schema(r#"{"type":"object"}"#)
+            .with_output_schema(r#"{"type":"boolean"}"#);
+        let decoded = tools_from_tags(&tools_to_tags(&[tool.clone()]));
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].input_schema, None);
+        assert_eq!(decoded[0].output_schema, None);
+        // Other fields preserved.
+        assert_eq!(decoded[0].tool_id, "validator");
+        assert_eq!(decoded[0].name, "JSON Validator");
+    }
+
+    #[test]
+    fn tools_decode_default_version_when_missing() {
+        // Pinned: ToolCapability::new defaults version to "1.0.0".
+        // A decoder reconstructing a ToolCapability with no version
+        // tag should fall back to that same default — preserves
+        // the substrate's "version is always populated" invariant.
+        let tags = [
+            Tag::parse("software.tool.0.tool_id=foo").unwrap(),
+            Tag::parse("software.tool.0.name=Foo").unwrap(),
+            Tag::parse("software.tool.0.stateless=true").unwrap(),
+        ];
+        let tools = tools_from_tags(&tags);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].version, "1.0.0");
+    }
+
+    #[test]
+    fn tools_stateless_round_trips_explicit_false() {
+        // ToolCapability::new defaults stateless=true. A tool with
+        // stateless=false must round-trip that explicit value, not
+        // collapse back to the default.
+        let tool = ToolCapability::new("coffee_pot", "Stateful Coffee Pot")
+            .with_stateless(false);
+        let decoded = tools_from_tags(&tools_to_tags(&[tool.clone()]));
+        assert_eq!(decoded[0].stateless, false);
     }
 }
