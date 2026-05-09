@@ -87,7 +87,8 @@ impl PrimaryCapabilities {
         // working post-Phase-A.5.N (when the typed-struct fields
         // are removed and the projection becomes a tag-set scan).
         let views = caps.views();
-        let memory_tier = match views.hardware.memory_mb {
+        let hw = views.hardware();
+        let memory_tier = match hw.memory_mb {
             0..=1024 => 0,
             1025..=4096 => 1,
             4097..=8192 => 2,
@@ -99,8 +100,8 @@ impl PrimaryCapabilities {
         };
 
         Self {
-            gpu: views.hardware.gpu.is_some(),
-            model_slots: views.models.len() as u8,
+            gpu: hw.gpu.is_some(),
+            model_slots: views.models().len() as u8,
             memory_tier,
             tools_bitmap: 0, // Could map common tools to bits
             flags: 0,
@@ -986,28 +987,29 @@ fn hash_capabilities(caps: &CapabilitySet) -> u64 {
     // graph; an accidental hash-shape change would invalidate
     // every node's cached neighbor metadata.
     let views = caps.views();
+    let hw = views.hardware();
 
     // Simple FNV-1a hash of key capability fields
     let mut hash: u64 = 0xcbf29ce484222325;
 
     // Hash hardware memory
-    hash ^= views.hardware.memory_mb as u64;
+    hash ^= hw.memory_mb as u64;
     hash = hash.wrapping_mul(0x100000001b3);
 
     // Hash GPU presence
-    hash ^= if views.hardware.gpu.is_some() { 1 } else { 0 };
+    hash ^= if hw.gpu.is_some() { 1 } else { 0 };
     hash = hash.wrapping_mul(0x100000001b3);
 
     // Hash accelerator count
-    hash ^= views.hardware.accelerators.len() as u64;
+    hash ^= hw.accelerators.len() as u64;
     hash = hash.wrapping_mul(0x100000001b3);
 
     // Hash tool count
-    hash ^= views.tools.len() as u64;
+    hash ^= views.tools().len() as u64;
     hash = hash.wrapping_mul(0x100000001b3);
 
     // Hash model count
-    hash ^= views.models.len() as u64;
+    hash ^= views.models().len() as u64;
     hash = hash.wrapping_mul(0x100000001b3);
 
     // Hash tag count

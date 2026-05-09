@@ -14,6 +14,7 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashSet};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -894,7 +895,7 @@ impl CapabilitySet {
     /// since models live in the canonical tag set as
     /// `software.model.<i>.*` indexed-encoding.
     pub fn add_model(mut self, model: ModelCapability) -> Self {
-        let mut models = self.views().models;
+        let mut models = self.views().models().clone();
         models.push(model);
         self.set_models(models);
         self
@@ -905,7 +906,7 @@ impl CapabilitySet {
     /// `software.tool.<i>.*` indexed-encoding; schemas are mirrored
     /// into `metadata` by `set_tools`.
     pub fn add_tool(mut self, tool: ToolCapability) -> Self {
-        let mut tools = self.views().tools;
+        let mut tools = self.views().tools().clone();
         tools.push(tool);
         self.set_tools(tools);
         self
@@ -1166,18 +1167,18 @@ impl CapabilitySet {
     /// `&str` over a typed-struct field that no longer exists).
     pub fn model_ids(&self) -> Vec<String> {
         self.views()
-            .models
-            .into_iter()
-            .map(|m| m.model_id)
+            .models()
+            .iter()
+            .map(|m| m.model_id.clone())
             .collect()
     }
 
     /// Get all tool IDs.
     pub fn tool_ids(&self) -> Vec<String> {
         self.views()
-            .tools
-            .into_iter()
-            .map(|t| t.tool_id)
+            .tools()
+            .iter()
+            .map(|t| t.tool_id.clone())
             .collect()
     }
 
@@ -1190,6 +1191,97 @@ impl CapabilitySet {
     /// Deserialize from bytes
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         serde_json::from_slice(data).ok()
+    }
+
+    /// Compute the structural change from `prev` to `self`.
+    ///
+    /// Phase 1 of `CAPABILITY_ENHANCEMENTS_PLAN.md`: a cheap
+    /// before/after change detector that returns the raw set/map
+    /// difference — added tags, removed tags, and per-key
+    /// metadata changes (Added / Removed / Updated). Powers
+    /// event-driven placement updates, capability-aware dashboards,
+    /// and delta-based metadata propagation.
+    ///
+    /// Cost: `O(|tags| + |metadata|)`. Two `HashSet::difference`
+    /// scans + a `BTreeMap` walk; no allocation beyond the output
+    /// collections.
+    ///
+    /// **Composes with [`crate::adapter::net::behavior::diff::DiffEngine`]**:
+    /// `DiffEngine::diff` produces structural `DiffOp`s (used by
+    /// the propagation path); this method returns the raw set/map
+    /// diff (better for change-event consumers). Same input data;
+    /// pick the surface that matches the consumer's shape.
+    pub fn diff(&self, prev: &CapabilitySet) -> CapabilitySetDiff {
+        // Tag diff: HashSet difference both ways.
+        let added_tags: HashSet<Tag> = self
+            .tags
+            .difference(&prev.tags)
+            .cloned()
+            .collect();
+        let removed_tags: HashSet<Tag> = prev
+            .tags
+            .difference(&self.tags)
+            .cloned()
+            .collect();
+
+        // Metadata diff: walk both maps simultaneously. Both are
+        // `BTreeMap` so we can rely on ordered iteration; merge
+        // by key.
+        let mut changed_metadata = Vec::new();
+        let mut prev_iter = prev.metadata.iter().peekable();
+        let mut curr_iter = self.metadata.iter().peekable();
+        loop {
+            match (prev_iter.peek(), curr_iter.peek()) {
+                (Some((pk, pv)), Some((ck, cv))) => match pk.cmp(ck) {
+                    std::cmp::Ordering::Less => {
+                        changed_metadata.push(MetadataChange::Removed {
+                            key: (*pk).clone(),
+                            prev_value: (*pv).clone(),
+                        });
+                        prev_iter.next();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        changed_metadata.push(MetadataChange::Added {
+                            key: (*ck).clone(),
+                            value: (*cv).clone(),
+                        });
+                        curr_iter.next();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if pv != cv {
+                            changed_metadata.push(MetadataChange::Updated {
+                                key: (*pk).clone(),
+                                prev_value: (*pv).clone(),
+                                new_value: (*cv).clone(),
+                            });
+                        }
+                        prev_iter.next();
+                        curr_iter.next();
+                    }
+                },
+                (Some((pk, pv)), None) => {
+                    changed_metadata.push(MetadataChange::Removed {
+                        key: (*pk).clone(),
+                        prev_value: (*pv).clone(),
+                    });
+                    prev_iter.next();
+                }
+                (None, Some((ck, cv))) => {
+                    changed_metadata.push(MetadataChange::Added {
+                        key: (*ck).clone(),
+                        value: (*cv).clone(),
+                    });
+                    curr_iter.next();
+                }
+                (None, None) => break,
+            }
+        }
+
+        CapabilitySetDiff {
+            added_tags,
+            removed_tags,
+            changed_metadata,
+        }
     }
 
     // ========================================================================
@@ -1214,49 +1306,38 @@ impl CapabilitySet {
     /// individually when the consumer reads more than one of them.
     ///
     /// ```
-    /// # use ai2070_net::adapter::net::behavior::capability::CapabilitySet;
+    /// # use net::adapter::net::behavior::capability::CapabilitySet;
     /// let caps = CapabilitySet::new();
     /// let views = caps.views();
-    /// let _ = views.hardware;
-    /// let _ = views.software;
-    /// let _ = views.resource_limits;
-    /// let _ = views.models;
-    /// let _ = views.tools;
+    /// let _ = views.hardware();
+    /// let _ = views.software();
+    /// let _ = views.resource_limits();
+    /// let _ = views.models();
+    /// let _ = views.tools();
     /// ```
-    pub fn views(&self) -> CapabilityViews {
-        // Phase A.5.N.3: reconstruct every projection from the
-        // canonical tag set + metadata. Tool schemas live in
-        // metadata (`tool::<id>::input_schema`/`output_schema`)
-        // because JSON Schema strings can't safely round-trip
-        // through the tag wire format; layer them onto the
-        // tools_from_tags output here.
-        let sorted = sorted_tag_vec(&self.tags);
-        let hardware = crate::adapter::net::behavior::tag_codec::hardware_from_tags(&sorted);
-        let software = crate::adapter::net::behavior::tag_codec::software_from_tags(&sorted);
-        let resource_limits =
-            crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(&sorted);
-        let models = crate::adapter::net::behavior::tag_codec::models_from_tags(&sorted);
-        let mut tools = crate::adapter::net::behavior::tag_codec::tools_from_tags(&sorted);
-        for tool in &mut tools {
-            if let Some(s) = self
-                .metadata
-                .get(&ToolCapability::input_schema_metadata_key(&tool.tool_id))
-            {
-                tool.input_schema = Some(s.clone());
-            }
-            if let Some(s) = self
-                .metadata
-                .get(&ToolCapability::output_schema_metadata_key(&tool.tool_id))
-            {
-                tool.output_schema = Some(s.clone());
-            }
-        }
+    /// Borrowing handle exposing the five typed projections
+    /// ([`HardwareCapabilities`], [`SoftwareCapabilities`],
+    /// [`ResourceLimits`], `Vec<ModelCapability>`,
+    /// `Vec<ToolCapability>`).
+    ///
+    /// Phase A.5.N.3 + Phase 1 of `CAPABILITY_ENHANCEMENTS_PLAN.md`:
+    /// each projection is decoded from the canonical tag set
+    /// (+ metadata, for tool schemas) on first access and cached
+    /// for the lifetime of the handle. Repeated reads of the same
+    /// projection hit the cache; reads of unrelated projections
+    /// don't force the full set of decoders.
+    ///
+    /// The handle borrows `self`. Mutations to `self` invalidate
+    /// the handle (compiler-enforced through the lifetime).
+    pub fn views(&self) -> CapabilityViews<'_> {
         CapabilityViews {
-            hardware,
-            software,
-            resource_limits,
-            models,
-            tools,
+            caps: self,
+            sorted_tags: OnceCell::new(),
+            hardware: OnceCell::new(),
+            software: OnceCell::new(),
+            resource_limits: OnceCell::new(),
+            models: OnceCell::new(),
+            tools: OnceCell::new(),
         }
     }
 
@@ -1283,8 +1364,8 @@ impl CapabilitySet {
     //
     // // After (read via the projection — canonical):
     // let views = caps.views();
-    // if views.hardware.gpu.is_some() { ... }
-    // for model in &views.models { ... }
+    // if views.hardware().gpu.is_some() { ... }
+    // for model in views.models() { ... }
     //
     // // Or directly through the `From` impl when only one field is needed:
     // if HardwareCapabilities::from(&caps).gpu.is_some() { ... }
@@ -1335,22 +1416,111 @@ impl CapabilitySet {
     }
 }
 
-/// All five typed-view projections of a [`CapabilitySet`].
-/// Returned by [`CapabilitySet::views`]; consumers destructure the
-/// fields they care about. Same shape across Rust / Node / Python /
-/// Go bindings per the SDK plan's view-projection design decision.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CapabilityViews {
-    /// Hardware projection.
-    pub hardware: HardwareCapabilities,
-    /// Software projection.
-    pub software: SoftwareCapabilities,
-    /// Resource-limits projection.
-    pub resource_limits: ResourceLimits,
-    /// Loaded-model projection (`Vec<ModelCapability>` cloned).
-    pub models: Vec<ModelCapability>,
-    /// Available-tool projection (`Vec<ToolCapability>` cloned).
-    pub tools: Vec<ToolCapability>,
+/// Lazy borrowing handle exposing the five typed projections of a
+/// [`CapabilitySet`].
+///
+/// Returned by [`CapabilitySet::views`]. Each projection is decoded
+/// from the canonical tag set on first access and cached for the
+/// lifetime of the handle:
+///
+/// ```ignore
+/// let caps = CapabilitySet::default();
+/// let v = caps.views();
+/// let _ = v.hardware();   // first read: decodes hardware tags
+/// let _ = v.hardware();   // cached; no re-decode
+/// let _ = v.models();     // separate cache; decodes model tags
+/// ```
+///
+/// Phase 1 of `CAPABILITY_ENHANCEMENTS_PLAN.md`: callers that
+/// previously read `views.hardware` (field) now call
+/// `views.hardware()` (accessor). Hot-path post-cache cost is a
+/// single pointer load (`OnceCell::get`); pre-cache cost is one
+/// invocation of the underlying `*_from_tags` decoder.
+#[derive(Debug)]
+pub struct CapabilityViews<'a> {
+    caps: &'a CapabilitySet,
+    sorted_tags: OnceCell<Vec<Tag>>,
+    hardware: OnceCell<HardwareCapabilities>,
+    software: OnceCell<SoftwareCapabilities>,
+    resource_limits: OnceCell<ResourceLimits>,
+    models: OnceCell<Vec<ModelCapability>>,
+    tools: OnceCell<Vec<ToolCapability>>,
+}
+
+impl<'a> CapabilityViews<'a> {
+    /// Sorted tag vector — shared scratch for the per-axis
+    /// decoders. Sort stabilizes Vec-valued fields whose tag
+    /// encoding is non-indexed (`software.runtimes` etc.) so
+    /// repeated reads produce identical projections.
+    fn sorted_tags(&self) -> &Vec<Tag> {
+        self.sorted_tags
+            .get_or_init(|| sorted_tag_vec(&self.caps.tags))
+    }
+
+    /// Hardware projection. Decodes the `hardware.*` axis tags
+    /// (excluding `hardware.limits.*`) on first call; subsequent
+    /// calls return the cached projection.
+    pub fn hardware(&self) -> &HardwareCapabilities {
+        self.hardware.get_or_init(|| {
+            crate::adapter::net::behavior::tag_codec::hardware_from_tags(self.sorted_tags())
+        })
+    }
+
+    /// Software projection. Decodes the `software.*` axis tags
+    /// (excluding `software.model.*` and `software.tool.*`) on
+    /// first call.
+    pub fn software(&self) -> &SoftwareCapabilities {
+        self.software.get_or_init(|| {
+            crate::adapter::net::behavior::tag_codec::software_from_tags(self.sorted_tags())
+        })
+    }
+
+    /// Resource-limits projection. Decodes the `hardware.limits.*`
+    /// tags on first call.
+    pub fn resource_limits(&self) -> &ResourceLimits {
+        self.resource_limits.get_or_init(|| {
+            crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(
+                self.sorted_tags(),
+            )
+        })
+    }
+
+    /// Loaded-model projection. Decodes the `software.model.<i>.*`
+    /// indexed tags on first call.
+    pub fn models(&self) -> &Vec<ModelCapability> {
+        self.models.get_or_init(|| {
+            crate::adapter::net::behavior::tag_codec::models_from_tags(self.sorted_tags())
+        })
+    }
+
+    /// Available-tool projection. Decodes the `software.tool.<i>.*`
+    /// indexed tags on first call AND layers tool input/output JSON
+    /// Schemas back from `caps.metadata` (key shape:
+    /// `tool::<id>::input_schema` / `tool::<id>::output_schema`).
+    pub fn tools(&self) -> &Vec<ToolCapability> {
+        self.tools.get_or_init(|| {
+            let mut tools = crate::adapter::net::behavior::tag_codec::tools_from_tags(
+                self.sorted_tags(),
+            );
+            for tool in &mut tools {
+                if let Some(s) = self
+                    .caps
+                    .metadata
+                    .get(&ToolCapability::input_schema_metadata_key(&tool.tool_id))
+                {
+                    tool.input_schema = Some(s.clone());
+                }
+                if let Some(s) = self
+                    .caps
+                    .metadata
+                    .get(&ToolCapability::output_schema_metadata_key(&tool.tool_id))
+                {
+                    tool.output_schema = Some(s.clone());
+                }
+            }
+            tools
+        })
+    }
 }
 
 // ============================================================================
@@ -1390,6 +1560,76 @@ impl From<&CapabilitySet> for ResourceLimits {
             &caps.tags,
         ))
     }
+}
+
+// ============================================================================
+// CapabilitySet diff (Phase 1 of CAPABILITY_ENHANCEMENTS_PLAN.md)
+// ============================================================================
+
+/// Structural difference between two [`CapabilitySet`] values.
+///
+/// Returned by [`CapabilitySet::diff`]. Carries:
+///
+/// - `added_tags`: tags in `self` that aren't in `prev`.
+/// - `removed_tags`: tags in `prev` that aren't in `self`.
+/// - `changed_metadata`: per-key metadata changes (Added /
+///   Removed / Updated). Key renames surface as Removed + Added,
+///   not as Updated, since the key identity changed.
+///
+/// The diff is the input shape for event-driven placement
+/// updates, capability-change dashboards, and delta-based
+/// metadata propagation. For the structural ops shape consumed
+/// by the propagation path, use
+/// [`crate::adapter::net::behavior::diff::DiffEngine::diff`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapabilitySetDiff {
+    /// Tags newly present in `self`.
+    pub added_tags: HashSet<Tag>,
+    /// Tags that were in `prev` but are no longer in `self`.
+    pub removed_tags: HashSet<Tag>,
+    /// Per-key metadata changes, in key order.
+    pub changed_metadata: Vec<MetadataChange>,
+}
+
+impl CapabilitySetDiff {
+    /// True if no tags or metadata entries differ.
+    pub fn is_empty(&self) -> bool {
+        self.added_tags.is_empty()
+            && self.removed_tags.is_empty()
+            && self.changed_metadata.is_empty()
+    }
+}
+
+/// One metadata-key change between two [`CapabilitySet`]s.
+///
+/// Renamed keys surface as `Removed { old_key } + Added { new_key }`,
+/// not `Updated`, because key identity changes are semantically
+/// distinct from value changes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataChange {
+    /// Key was not present in `prev`; now has `value`.
+    Added {
+        /// Metadata key.
+        key: String,
+        /// New value.
+        value: String,
+    },
+    /// Key was present in `prev` with `prev_value`; no longer in `self`.
+    Removed {
+        /// Metadata key.
+        key: String,
+        /// Value held in the previous state.
+        prev_value: String,
+    },
+    /// Key present in both; value changed.
+    Updated {
+        /// Metadata key.
+        key: String,
+        /// Value held in the previous state.
+        prev_value: String,
+        /// New value.
+        new_value: String,
+    },
 }
 
 // ============================================================================
@@ -1774,13 +2014,16 @@ impl CapabilityFilter {
             }
         }
 
-        // Read projections once; reuse for hardware + models below.
-        // Cheap today (field clones), tag-set scan post-Phase A.5.N.
+        // Phase 1 (lazy): each `views.X()` decodes only the
+        // projection it needs. `views.hardware()` does NOT force
+        // the model decoder; `views.models()` does NOT force
+        // hardware. Predicates that early-return on a hardware
+        // check pay zero cost for unused axes.
         let views = caps.views();
 
         // Check memory
         if let Some(min_mem) = self.min_memory_mb {
-            if views.hardware.memory_mb < min_mem {
+            if views.hardware().memory_mb < min_mem {
                 return false;
             }
         }
@@ -1792,14 +2035,14 @@ impl CapabilityFilter {
 
         // Check GPU vendor
         if let Some(vendor) = self.gpu_vendor {
-            if views.hardware.gpu_vendor() != Some(vendor) {
+            if views.hardware().gpu_vendor() != Some(vendor) {
                 return false;
             }
         }
 
         // Check VRAM
         if let Some(min_vram) = self.min_vram_mb {
-            if views.hardware.total_vram_mb() < min_vram {
+            if views.hardware().total_vram_mb() < min_vram {
                 return false;
             }
         }
@@ -1807,7 +2050,7 @@ impl CapabilityFilter {
         // Check context length
         if let Some(min_ctx) = self.min_context_length {
             let has_sufficient =
-                views.models.iter().any(|m| m.context_length >= min_ctx);
+                views.models().iter().any(|m| m.context_length >= min_ctx);
             if !has_sufficient {
                 return false;
             }
@@ -1815,8 +2058,10 @@ impl CapabilityFilter {
 
         // Check modalities
         for modality in &self.require_modalities {
-            let has_modality =
-                views.models.iter().any(|m| m.modalities.contains(modality));
+            let has_modality = views
+                .models()
+                .iter()
+                .any(|m| m.modalities.contains(modality));
             if !has_modality {
                 return false;
             }
@@ -1893,20 +2138,20 @@ impl CapabilityRequirement {
 
         // Memory score (normalized to 256GB)
         if self.prefer_more_memory > 0.0 {
-            let mem_score = (views.hardware.memory_mb as f32 / 262144.0).min(1.0);
+            let mem_score = (views.hardware().memory_mb as f32 / 262144.0).min(1.0);
             score += self.prefer_more_memory * mem_score;
         }
 
         // VRAM score (normalized to 80GB)
         if self.prefer_more_vram > 0.0 {
-            let vram_score = (views.hardware.total_vram_mb() as f32 / 81920.0).min(1.0);
+            let vram_score = (views.hardware().total_vram_mb() as f32 / 81920.0).min(1.0);
             score += self.prefer_more_vram * vram_score;
         }
 
         // Inference speed score (normalized to 1000 tok/s)
         if self.prefer_faster_inference > 0.0 {
             let max_tps: u32 = views
-                .models
+                .models()
                 .iter()
                 .map(|m| m.tokens_per_sec)
                 .max()
@@ -1917,11 +2162,12 @@ impl CapabilityRequirement {
 
         // Loaded model score
         if self.prefer_loaded_models > 0.0 {
-            let loaded_count = views.models.iter().filter(|m| m.loaded).count();
-            let loaded_ratio = if views.models.is_empty() {
+            let models = views.models();
+            let loaded_count = models.iter().filter(|m| m.loaded).count();
+            let loaded_ratio = if models.is_empty() {
                 0.0
             } else {
-                loaded_count as f32 / views.models.len() as f32
+                loaded_count as f32 / models.len() as f32
             };
             score += self.prefer_loaded_models * loaded_ratio;
         }
@@ -2133,7 +2379,7 @@ impl CapabilityIndex {
         }
 
         // Models
-        for model in &views.models {
+        for model in views.models() {
             if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
                 set.insert(node_id);
             } else {
@@ -2145,7 +2391,7 @@ impl CapabilityIndex {
         }
 
         // Tools
-        for tool in &views.tools {
+        for tool in views.tools() {
             if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
                 set.insert(node_id);
             } else {
@@ -2157,10 +2403,10 @@ impl CapabilityIndex {
         }
 
         // GPU. Key is `bool`, no allocation either way.
-        let has_gpu = views.hardware.has_gpu();
+        let has_gpu = views.hardware().has_gpu();
         self.gpu_nodes.entry(has_gpu).or_default().insert(node_id);
 
-        if let Some(vendor) = views.hardware.gpu_vendor() {
+        if let Some(vendor) = views.hardware().gpu_vendor() {
             // Vendor key is `Copy` (small enum), so the entry-only
             // form is already allocation-free.
             self.by_gpu_vendor
@@ -2192,7 +2438,7 @@ impl CapabilityIndex {
         }
 
         // Models
-        for model in &views.models {
+        for model in views.models() {
             if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
                 set.remove(&node_id);
             }
@@ -2201,7 +2447,7 @@ impl CapabilityIndex {
         }
 
         // Tools
-        for tool in &views.tools {
+        for tool in views.tools() {
             if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
                 set.remove(&node_id);
             }
@@ -2211,12 +2457,12 @@ impl CapabilityIndex {
 
         // GPU (two-value bucket; entries are intentionally permanent
         // because lookups for both `true` and `false` are expected).
-        let has_gpu = views.hardware.has_gpu();
+        let has_gpu = views.hardware().has_gpu();
         if let Some(mut set) = self.gpu_nodes.get_mut(&has_gpu) {
             set.remove(&node_id);
         }
 
-        if let Some(vendor) = views.hardware.gpu_vendor() {
+        if let Some(vendor) = views.hardware().gpu_vendor() {
             if let Some(mut set) = self.by_gpu_vendor.get_mut(&vendor) {
                 set.remove(&node_id);
             }
@@ -2604,7 +2850,7 @@ mod tests {
         assert!(caps.has_tag("inference"));
         assert!(caps.has_model("llama-3.1-70b"));
         assert!(caps.has_tool("python_repl"));
-        assert_eq!(caps.views().hardware.memory_mb, 65536);
+        assert_eq!(caps.views().hardware().memory_mb, 65536);
     }
 
     #[test]
@@ -2614,11 +2860,11 @@ mod tests {
         let parsed = CapabilitySet::from_bytes(&bytes).unwrap();
 
         assert_eq!(
-            caps.views().hardware.memory_mb,
-            parsed.views().hardware.memory_mb,
+            caps.views().hardware().memory_mb,
+            parsed.views().hardware().memory_mb,
         );
         assert_eq!(caps.tags, parsed.tags);
-        assert_eq!(caps.views().models.len(), parsed.views().models.len());
+        assert_eq!(caps.views().models().len(), parsed.views().models().len());
     }
 
     #[test]
@@ -3400,7 +3646,7 @@ mod tests {
             // Vary memory so `prefer_memory` produces a real ordering.
             // Phase A.5.N.3: read-modify-write through views()/setter
             // since the typed `hardware` field is gone.
-            let mut hw = caps.views().hardware;
+            let mut hw = caps.views().hardware().clone();
             hw.memory_mb = 1024 * (i as u32 + 1);
             caps.set_hardware(hw);
             let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
@@ -3430,7 +3676,7 @@ mod tests {
                 index
                     .nodes
                     .get(&id)
-                    .map(|n| n.capabilities.views().hardware.memory_mb)
+                    .map(|n| n.capabilities.views().hardware().memory_mb)
                     .unwrap_or(0)
             })
             .copied()
@@ -3839,30 +4085,36 @@ mod tests {
 
     #[test]
     fn views_struct_returns_all_five_projections() {
-        // Pin: `views()` returns the five typed projections together.
-        // Cheaper than calling each From impl individually when a
-        // consumer reads more than one view.
+        // Pin: `views()` returns the five typed projections together,
+        // each lazily decoded on first access. Cheaper than reaching
+        // for the From impls when the consumer reads more than one
+        // axis (the OnceCell cache hits subsequent reads).
         let caps = sample_capability_set();
         let views = caps.views();
         // Round-trip via builder → views — assert the projection
         // is non-default for the fields the sample populates.
-        assert!(views.hardware.memory_mb > 0);
-        assert!(!views.models.is_empty());
-        assert!(!views.tools.is_empty());
+        assert!(views.hardware().memory_mb > 0);
+        assert!(!views.models().is_empty());
+        assert!(!views.tools().is_empty());
     }
 
     #[test]
-    fn views_clone_is_independent_of_caps() {
-        // Pin: dropping the original `caps` after `views()` doesn't
-        // dangle the views — they're owned clones, not references.
-        let views = {
-            let caps = sample_capability_set();
-            caps.views()
-        };
-        // If `views` held references into `caps`, this would be a
-        // dangling-reference compile error. The test passes by
-        // virtue of compiling; the assert is just to use `views`.
-        assert!(views.hardware.cpu_cores > 0);
+    fn lazy_view_handle_caches_per_projection() {
+        // Phase 1 of `CAPABILITY_ENHANCEMENTS_PLAN.md`: each
+        // projection is decoded at most once per handle. A second
+        // read of the same projection returns the cached value
+        // (proven via pointer-equality on the borrowed reference).
+        let caps = sample_capability_set();
+        let views = caps.views();
+        let hw_ptr_1 = views.hardware() as *const _;
+        let hw_ptr_2 = views.hardware() as *const _;
+        assert_eq!(hw_ptr_1, hw_ptr_2, "hardware projection must be cached");
+        let models_ptr_1 = views.models() as *const _;
+        let models_ptr_2 = views.models() as *const _;
+        assert_eq!(
+            models_ptr_1, models_ptr_2,
+            "models projection must be cached",
+        );
     }
 
     // ========================================================================
@@ -3884,13 +4136,15 @@ mod tests {
         // the bare tag set).
         let v1 = caps.views();
         let v2 = caps2.views();
-        assert_eq!(v1.hardware, v2.hardware);
-        assert_eq!(v1.models, v2.models);
-        assert_eq!(v1.resource_limits, v2.resource_limits);
+        assert_eq!(v1.hardware(), v2.hardware());
+        assert_eq!(v1.models(), v2.models());
+        assert_eq!(v1.resource_limits(), v2.resource_limits());
         // Tools' non-schema fields round-trip; schemas are dropped
         // (`from_typed_tags` produces empty metadata by design).
-        assert_eq!(v1.tools.len(), v2.tools.len());
-        for (a, b) in v1.tools.iter().zip(v2.tools.iter()) {
+        let v1_tools = v1.tools();
+        let v2_tools = v2.tools();
+        assert_eq!(v1_tools.len(), v2_tools.len());
+        for (a, b) in v1_tools.iter().zip(v2_tools.iter()) {
             assert_eq!(a.tool_id, b.tool_id);
             assert_eq!(a.name, b.name);
             assert_eq!(a.version, b.version);
@@ -3904,6 +4158,160 @@ mod tests {
         // empty-tag-set sets from the wire) depends on this.
         let caps = CapabilitySet::default();
         assert!(caps.typed_tags().is_empty());
+    }
+
+    // ========================================================================
+    // CapabilitySet::diff tests (Phase 1 of CAPABILITY_ENHANCEMENTS_PLAN.md).
+    // ========================================================================
+
+    #[test]
+    fn diff_empty_vs_empty_is_empty() {
+        let prev = CapabilitySet::default();
+        let curr = CapabilitySet::default();
+        let diff = curr.diff(&prev);
+        assert!(diff.is_empty());
+        assert!(diff.added_tags.is_empty());
+        assert!(diff.removed_tags.is_empty());
+        assert!(diff.changed_metadata.is_empty());
+    }
+
+    #[test]
+    fn diff_against_empty_reports_full_added() {
+        let prev = CapabilitySet::default();
+        let curr = CapabilitySet::new()
+            .add_tag("inference")
+            .with_metadata("intent", "ml-training");
+        let diff = curr.diff(&prev);
+        assert!(!diff.is_empty());
+        assert_eq!(diff.added_tags.len(), 1);
+        let inference_tag = Tag::parse("inference").unwrap();
+        assert!(diff.added_tags.contains(&inference_tag));
+        assert!(diff.removed_tags.is_empty());
+        assert_eq!(diff.changed_metadata.len(), 1);
+        assert!(matches!(
+            &diff.changed_metadata[0],
+            MetadataChange::Added { key, value }
+                if key == "intent" && value == "ml-training"
+        ));
+    }
+
+    #[test]
+    fn diff_added_and_removed_tags_are_separated() {
+        // Distinct sets: prev has {a, b}, curr has {b, c}.
+        // Diff must show added={c}, removed={a}; b is unchanged.
+        let prev = CapabilitySet::new().add_tag("a").add_tag("b");
+        let curr = CapabilitySet::new().add_tag("b").add_tag("c");
+        let diff = curr.diff(&prev);
+        let added: Vec<_> = diff.added_tags.iter().map(|t| t.to_string()).collect();
+        let removed: Vec<_> = diff.removed_tags.iter().map(|t| t.to_string()).collect();
+        assert_eq!(added, vec!["c".to_string()]);
+        assert_eq!(removed, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn diff_metadata_updated_for_value_change() {
+        let prev = CapabilitySet::new().with_metadata("intent", "ml-training");
+        let curr = CapabilitySet::new().with_metadata("intent", "embedding");
+        let diff = curr.diff(&prev);
+        assert!(diff.added_tags.is_empty());
+        assert!(diff.removed_tags.is_empty());
+        assert_eq!(diff.changed_metadata.len(), 1);
+        match &diff.changed_metadata[0] {
+            MetadataChange::Updated {
+                key,
+                prev_value,
+                new_value,
+            } => {
+                assert_eq!(key, "intent");
+                assert_eq!(prev_value, "ml-training");
+                assert_eq!(new_value, "embedding");
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_metadata_key_rename_is_remove_plus_add_not_update() {
+        // Pinned: a key rename surfaces as Removed + Added, NOT
+        // as Updated. Key identity changes are semantically
+        // distinct from value-of-same-key changes.
+        let prev = CapabilitySet::new().with_metadata("old-key", "v");
+        let curr = CapabilitySet::new().with_metadata("new-key", "v");
+        let diff = curr.diff(&prev);
+        assert_eq!(diff.changed_metadata.len(), 2);
+        // BTreeMap iteration is sorted, so "new-key" comes before "old-key".
+        let kinds: Vec<_> = diff
+            .changed_metadata
+            .iter()
+            .map(|c| match c {
+                MetadataChange::Added { key, .. } => format!("added:{key}"),
+                MetadataChange::Removed { key, .. } => format!("removed:{key}"),
+                MetadataChange::Updated { key, .. } => format!("updated:{key}"),
+            })
+            .collect();
+        assert!(
+            kinds.contains(&"added:new-key".to_string())
+                && kinds.contains(&"removed:old-key".to_string()),
+            "expected Added(new-key) + Removed(old-key); got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn diff_changed_metadata_preserves_btreemap_ordering() {
+        // BTreeMap iteration order is stable + sorted. The diff
+        // walk emits changes in key order so consumers can rely
+        // on deterministic output.
+        let prev = CapabilitySet::default();
+        let curr = CapabilitySet::new()
+            .with_metadata("zebra", "z")
+            .with_metadata("alpha", "a")
+            .with_metadata("middle", "m");
+        let diff = curr.diff(&prev);
+        let keys: Vec<_> = diff
+            .changed_metadata
+            .iter()
+            .map(|c| match c {
+                MetadataChange::Added { key, .. }
+                | MetadataChange::Removed { key, .. }
+                | MetadataChange::Updated { key, .. } => key.clone(),
+            })
+            .collect();
+        assert_eq!(keys, vec!["alpha", "middle", "zebra"]);
+    }
+
+    #[test]
+    fn diff_round_trips_via_apply_diff_on_canonical_diff_engine() {
+        // Property-style: applying the structural DiffEngine ops
+        // computed from `prev → curr` produces a CapabilitySet
+        // whose tags + metadata match `curr`. The two diff surfaces
+        // (this method's set/map diff, DiffEngine's structural ops)
+        // are different shapes of the same change information; this
+        // test pins they agree on the underlying state transition.
+        use crate::adapter::net::behavior::diff::{CapabilityDiff, DiffEngine};
+
+        let prev = CapabilitySet::new()
+            .add_tag("inference")
+            .with_metadata("intent", "old");
+        let curr = prev
+            .clone()
+            .add_tag("training")
+            .with_metadata("intent", "new")
+            .with_metadata("colocate-with", "chain-a");
+        // DiffEngine produces structural ops; apply them to prev
+        // and assert tags + metadata match curr (state convergence).
+        let ops = DiffEngine::diff(&prev, &curr);
+        let applied =
+            DiffEngine::apply_with_version(&prev, 1, &CapabilityDiff::new(1, 1, 2, ops), true)
+                .unwrap();
+        assert_eq!(applied.tags, curr.tags);
+        // DiffEngine doesn't emit metadata ops yet; metadata diff
+        // ships separately and is consumed by event-driven listeners,
+        // not by the diff-apply propagation path. Pin the contract
+        // here so a future DiffEngine extension that adds metadata
+        // ops doesn't accidentally regress this surface.
+        let cset_diff = curr.diff(&prev);
+        assert!(!cset_diff.is_empty());
+        assert_eq!(cset_diff.changed_metadata.len(), 2);
     }
 
     #[test]

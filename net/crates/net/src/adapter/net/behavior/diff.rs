@@ -411,65 +411,64 @@ impl DiffEngine {
         Self::diff_tags(&old.tags, &new.tags, &mut ops);
 
         // Diff models
-        Self::diff_models(&old_views.models, &new_views.models, &mut ops);
+        Self::diff_models(old_views.models(), new_views.models(), &mut ops);
 
         // Diff tools
-        Self::diff_tools(&old_views.tools, &new_views.tools, &mut ops);
+        Self::diff_tools(old_views.tools(), new_views.tools(), &mut ops);
 
-        // Diff hardware (only if changed)
-        if old_views.hardware != new_views.hardware {
+        // Diff hardware (only if changed). Cache the projections
+        // since we read them repeatedly in the partial-update sentinels.
+        let old_hw = old_views.hardware();
+        let new_hw = new_views.hardware();
+        if old_hw != new_hw {
             // Check for partial updates
-            if old_views.hardware.memory_mb != new_views.hardware.memory_mb
-                && old_views.hardware.cpu_cores == new_views.hardware.cpu_cores
-                && old_views.hardware.gpu == new_views.hardware.gpu
-                && old_views.hardware.storage_mb == new_views.hardware.storage_mb
-                && old_views.hardware.network_mbps == new_views.hardware.network_mbps
+            if old_hw.memory_mb != new_hw.memory_mb
+                && old_hw.cpu_cores == new_hw.cpu_cores
+                && old_hw.gpu == new_hw.gpu
+                && old_hw.storage_mb == new_hw.storage_mb
+                && old_hw.network_mbps == new_hw.network_mbps
             {
-                ops.push(DiffOp::UpdateMemory(new_views.hardware.memory_mb));
-            } else if old_views.hardware.network_mbps != new_views.hardware.network_mbps
-                && old_views.hardware.cpu_cores == new_views.hardware.cpu_cores
-                && old_views.hardware.gpu == new_views.hardware.gpu
-                && old_views.hardware.memory_mb == new_views.hardware.memory_mb
-                && old_views.hardware.storage_mb == new_views.hardware.storage_mb
+                ops.push(DiffOp::UpdateMemory(new_hw.memory_mb));
+            } else if old_hw.network_mbps != new_hw.network_mbps
+                && old_hw.cpu_cores == new_hw.cpu_cores
+                && old_hw.gpu == new_hw.gpu
+                && old_hw.memory_mb == new_hw.memory_mb
+                && old_hw.storage_mb == new_hw.storage_mb
             {
-                ops.push(DiffOp::UpdateNetwork(new_views.hardware.network_mbps));
+                ops.push(DiffOp::UpdateNetwork(new_hw.network_mbps));
             } else {
-                ops.push(DiffOp::UpdateHardware(new_views.hardware.clone()));
+                ops.push(DiffOp::UpdateHardware(new_hw.clone()));
             }
         }
 
         // Diff software
-        if old_views.software != new_views.software {
-            Self::diff_software(&old_views.software, &new_views.software, &mut ops);
+        let old_sw = old_views.software();
+        let new_sw = new_views.software();
+        if old_sw != new_sw {
+            Self::diff_software(old_sw, new_sw, &mut ops);
         }
 
         // Diff limits (only if changed)
-        if old_views.resource_limits != new_views.resource_limits {
+        let old_limits = old_views.resource_limits();
+        let new_limits = new_views.resource_limits();
+        if old_limits != new_limits {
             // Check for partial updates
-            if old_views.resource_limits.max_concurrent_requests
-                != new_views.resource_limits.max_concurrent_requests
-                && old_views.resource_limits.max_tokens_per_request
-                    == new_views.resource_limits.max_tokens_per_request
-                && old_views.resource_limits.rate_limit_rpm
-                    == new_views.resource_limits.rate_limit_rpm
-                && old_views.resource_limits.max_batch_size
-                    == new_views.resource_limits.max_batch_size
+            if old_limits.max_concurrent_requests != new_limits.max_concurrent_requests
+                && old_limits.max_tokens_per_request == new_limits.max_tokens_per_request
+                && old_limits.rate_limit_rpm == new_limits.rate_limit_rpm
+                && old_limits.max_batch_size == new_limits.max_batch_size
             {
                 ops.push(DiffOp::UpdateMaxConcurrent(
-                    new_views.resource_limits.max_concurrent_requests,
+                    new_limits.max_concurrent_requests,
                 ));
-            } else if old_views.resource_limits.rate_limit_rpm
-                != new_views.resource_limits.rate_limit_rpm
-                && old_views.resource_limits.max_concurrent_requests
-                    == new_views.resource_limits.max_concurrent_requests
-                && old_views.resource_limits.max_tokens_per_request
-                    == new_views.resource_limits.max_tokens_per_request
-                && old_views.resource_limits.max_batch_size
-                    == new_views.resource_limits.max_batch_size
+            } else if old_limits.rate_limit_rpm != new_limits.rate_limit_rpm
+                && old_limits.max_concurrent_requests == new_limits.max_concurrent_requests
+                && old_limits.max_tokens_per_request == new_limits.max_tokens_per_request
+                && old_limits.max_batch_size == new_limits.max_batch_size
             {
-                ops.push(DiffOp::UpdateRateLimit(new_views.resource_limits.rate_limit_rpm));
+                ops.push(DiffOp::UpdateRateLimit(new_limits.rate_limit_rpm));
             } else {
-                ops.push(DiffOp::UpdateLimits(new_views.resource_limits.clone()));
+                ops.push(DiffOp::UpdateLimits(new_limits.clone()));
             }
         }
 
@@ -815,13 +814,13 @@ impl DiffEngine {
             }
             DiffOp::AddModel(model) => {
                 // Remove existing model with same ID if present
-                let mut models = caps.views().models;
+                let mut models = caps.views().models().clone();
                 models.retain(|m| m.model_id != model.model_id);
                 models.push(model.clone());
                 caps.set_models(models);
             }
             DiffOp::RemoveModel(model_id) => {
-                let mut models = caps.views().models;
+                let mut models = caps.views().models().clone();
                 let before = models.len();
                 models.retain(|m| m.model_id != *model_id);
                 if models.len() == before {
@@ -838,7 +837,7 @@ impl DiffEngine {
                 tokens_per_sec,
                 loaded,
             } => {
-                let mut models = caps.views().models;
+                let mut models = caps.views().models().clone();
                 if let Some(model) = models.iter_mut().find(|m| m.model_id == *model_id) {
                     if let Some(tps) = tokens_per_sec {
                         model.tokens_per_sec = *tps;
@@ -852,13 +851,13 @@ impl DiffEngine {
                 }
             }
             DiffOp::AddTool(tool) => {
-                let mut tools = caps.views().tools;
+                let mut tools = caps.views().tools().clone();
                 tools.retain(|t| t.tool_id != tool.tool_id);
                 tools.push(tool.clone());
                 caps.set_tools(tools);
             }
             DiffOp::RemoveTool(tool_id) => {
-                let mut tools = caps.views().tools;
+                let mut tools = caps.views().tools().clone();
                 let before = tools.len();
                 tools.retain(|t| t.tool_id != *tool_id);
                 if tools.len() == before {
@@ -873,12 +872,12 @@ impl DiffEngine {
                 caps.set_hardware(hw.clone());
             }
             DiffOp::UpdateMemory(mem) => {
-                let mut hw = caps.views().hardware;
+                let mut hw = caps.views().hardware().clone();
                 hw.memory_mb = *mem;
                 caps.set_hardware(hw);
             }
             DiffOp::UpdateNetwork(net) => {
-                let mut hw = caps.views().hardware;
+                let mut hw = caps.views().hardware().clone();
                 hw.network_mbps = *net;
                 caps.set_hardware(hw);
             }
@@ -886,13 +885,13 @@ impl DiffEngine {
                 caps.set_software(sw.clone());
             }
             DiffOp::AddRuntime { name, version } => {
-                let mut sw = caps.views().software;
+                let mut sw = caps.views().software().clone();
                 sw.runtimes.retain(|(n, _)| n != name);
                 sw.runtimes.push((name.clone(), version.clone()));
                 caps.set_software(sw);
             }
             DiffOp::RemoveRuntime(name) => {
-                let mut sw = caps.views().software;
+                let mut sw = caps.views().software().clone();
                 let before = sw.runtimes.len();
                 sw.runtimes.retain(|(n, _)| n != name);
                 if sw.runtimes.len() == before {
@@ -904,13 +903,13 @@ impl DiffEngine {
                 }
             }
             DiffOp::AddFramework { name, version } => {
-                let mut sw = caps.views().software;
+                let mut sw = caps.views().software().clone();
                 sw.frameworks.retain(|(n, _)| n != name);
                 sw.frameworks.push((name.clone(), version.clone()));
                 caps.set_software(sw);
             }
             DiffOp::RemoveFramework(name) => {
-                let mut sw = caps.views().software;
+                let mut sw = caps.views().software().clone();
                 let before = sw.frameworks.len();
                 sw.frameworks.retain(|(n, _)| n != name);
                 if sw.frameworks.len() == before {
@@ -925,12 +924,12 @@ impl DiffEngine {
                 caps.set_limits(limits.clone());
             }
             DiffOp::UpdateMaxConcurrent(max) => {
-                let mut limits = caps.views().resource_limits;
+                let mut limits = caps.views().resource_limits().clone();
                 limits.max_concurrent_requests = *max;
                 caps.set_limits(limits);
             }
             DiffOp::UpdateRateLimit(rpm) => {
-                let mut limits = caps.views().resource_limits;
+                let mut limits = caps.views().resource_limits().clone();
                 limits.rate_limit_rpm = *rpm;
                 caps.set_limits(limits);
             }
@@ -1144,7 +1143,7 @@ mod tests {
     fn test_diff_update_model_loaded() {
         let old = sample_capability_set();
         // Phase A.5.N.3: read models via views(), mutate, set_models.
-        let mut models = old.views().models;
+        let mut models = old.views().models().clone();
         models[0].loaded = false;
         let mut new = old.clone();
         new.set_models(models);
@@ -1175,7 +1174,7 @@ mod tests {
     fn test_diff_update_memory() {
         let old = sample_capability_set();
         let mut new = old.clone();
-        let mut hw = new.views().hardware;
+        let mut hw = new.views().hardware().clone();
         hw.memory_mb = 131072;
         new.set_hardware(hw);
 
@@ -1201,7 +1200,7 @@ mod tests {
         let new = DiffEngine::apply(&old, &diff, true).unwrap();
 
         assert!(new.has_tag("training"));
-        assert_eq!(new.views().hardware.memory_mb, 131072);
+        assert_eq!(new.views().hardware().memory_mb, 131072);
     }
 
     #[test]
@@ -1272,13 +1271,13 @@ mod tests {
         new.tags.remove(&inference);
 
         // Tweak the first existing model: loaded=false + new throughput.
-        let mut models = new.views().models;
+        let mut models = new.views().models().clone();
         models[0].loaded = false;
         models[0].tokens_per_sec = 100;
         new.set_models(models);
 
         // Bump memory.
-        let mut hw = new.views().hardware;
+        let mut hw = new.views().hardware().clone();
         hw.memory_mb = 131072;
         new.set_hardware(hw);
 
@@ -1300,10 +1299,10 @@ mod tests {
         assert!(applied.has_tag("training"));
         assert!(!applied.has_tag("inference"));
         let v = applied.views();
-        assert_eq!(v.hardware.memory_mb, 131072);
-        assert_eq!(v.models.len(), 2);
+        assert_eq!(v.hardware().memory_mb, 131072);
+        assert_eq!(v.models().len(), 2);
         assert!(
-            !v.models
+            !v.models()
                 .iter()
                 .find(|m| m.model_id == "llama-3.1-70b")
                 .unwrap()
@@ -1560,7 +1559,7 @@ mod tests {
             .expect("non-strict apply preserves the historic no-op");
         // No mutation expected — caps unchanged.
         assert_eq!(result.tags, caps.tags);
-        assert_eq!(result.views().hardware, caps.views().hardware);
+        assert_eq!(result.views().hardware(), caps.views().hardware());
     }
 
     // ========================================================================

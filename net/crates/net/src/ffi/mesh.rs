@@ -4111,12 +4111,12 @@ mod nat_traversal_stub_tests {
         // post-Phase-A.5.N when typed-struct fields are removed.
         let views = caps.views();
         assert_eq!(
-            views.hardware.gpu_vendor(),
+            views.hardware().gpu_vendor(),
             Some(super::GpuVendor::Nvidia),
             "vendor lost in conversion"
         );
-        assert_eq!(views.hardware.memory_mb, 65536);
-        assert_eq!(views.hardware.total_vram_mb(), 81920);
+        assert_eq!(views.hardware().memory_mb, 65536);
+        assert_eq!(views.hardware().total_vram_mb(), 81920);
         assert!(caps.has_tag("gpu"));
     }
 

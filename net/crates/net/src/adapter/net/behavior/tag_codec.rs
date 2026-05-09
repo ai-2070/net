@@ -1643,13 +1643,15 @@ mod tests {
         // encoding.
         let v1 = caps.views();
         let v2 = caps2.views();
-        assert_eq!(v1.hardware, v2.hardware);
-        assert_eq!(v1.models, v2.models);
-        assert_eq!(v1.resource_limits, v2.resource_limits);
+        assert_eq!(v1.hardware(), v2.hardware());
+        assert_eq!(v1.models(), v2.models());
+        assert_eq!(v1.resource_limits(), v2.resource_limits());
         // Tools' non-schema fields round-trip cleanly; schemas live
         // in metadata, which `from_tag_set` doesn't reconstruct.
-        assert_eq!(v1.tools.len(), v2.tools.len());
-        for (a, b) in v1.tools.iter().zip(v2.tools.iter()) {
+        let v1_tools = v1.tools();
+        let v2_tools = v2.tools();
+        assert_eq!(v1_tools.len(), v2_tools.len());
+        for (a, b) in v1_tools.iter().zip(v2_tools.iter()) {
             assert_eq!(a.tool_id, b.tool_id);
             assert_eq!(a.name, b.name);
         }
@@ -1657,18 +1659,20 @@ mod tests {
         // SoftwareCapabilities: runtimes / frameworks / drivers
         // are encoded non-indexed and so come out in lex order
         // rather than insertion order. Compare as sets.
-        assert_eq!(v1.software.os, v2.software.os);
-        assert_eq!(v1.software.os_version, v2.software.os_version);
-        assert_eq!(v1.software.cuda_version, v2.software.cuda_version);
+        let v1_sw = v1.software();
+        let v2_sw = v2.software();
+        assert_eq!(v1_sw.os, v2_sw.os);
+        assert_eq!(v1_sw.os_version, v2_sw.os_version);
+        assert_eq!(v1_sw.cuda_version, v2_sw.cuda_version);
         let lhs_runtimes: std::collections::HashSet<_> =
-            v1.software.runtimes.iter().cloned().collect();
+            v1_sw.runtimes.iter().cloned().collect();
         let rhs_runtimes: std::collections::HashSet<_> =
-            v2.software.runtimes.iter().cloned().collect();
+            v2_sw.runtimes.iter().cloned().collect();
         assert_eq!(lhs_runtimes, rhs_runtimes);
         let lhs_fw: std::collections::HashSet<_> =
-            v1.software.frameworks.iter().cloned().collect();
+            v1_sw.frameworks.iter().cloned().collect();
         let rhs_fw: std::collections::HashSet<_> =
-            v2.software.frameworks.iter().cloned().collect();
+            v2_sw.frameworks.iter().cloned().collect();
         assert_eq!(lhs_fw, rhs_fw);
 
         // Tag sets: round-trip is identity.
@@ -1694,7 +1698,8 @@ mod tests {
         let caps2 = capability_set_from_tag_set(&tag_set);
         // Decoded order is lex-sorted by tag wire form, which puts
         // runtime names in alphabetical order.
-        let sw = caps2.views().software;
+        let views = caps2.views();
+        let sw = views.software();
         let names: Vec<_> = sw.runtimes.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["node", "python", "rust"]);
         // The (name, version) pairs are still preserved per pair.
@@ -1715,11 +1720,11 @@ mod tests {
         // Phase A.5.N.3: assert through `views()` since typed
         // fields are gone.
         let v = caps2.views();
-        assert_eq!(v.hardware, HardwareCapabilities::default());
-        assert_eq!(v.software, SoftwareCapabilities::default());
-        assert!(v.models.is_empty());
-        assert!(v.tools.is_empty());
-        assert_eq!(v.resource_limits, ResourceLimits::default());
+        assert_eq!(*v.hardware(), HardwareCapabilities::default());
+        assert_eq!(*v.software(), SoftwareCapabilities::default());
+        assert!(v.models().is_empty());
+        assert!(v.tools().is_empty());
+        assert_eq!(*v.resource_limits(), ResourceLimits::default());
         assert!(caps2.tags.is_empty());
     }
 
@@ -1774,7 +1779,7 @@ mod tests {
         let tag_set = capability_set_to_tag_set(&caps);
         let caps2 = capability_set_from_tag_set(&tag_set);
         // Hardware fields preserved (read via projection).
-        assert_eq!(caps2.views().hardware.cpu_cores, 8);
+        assert_eq!(caps2.views().hardware().cpu_cores, 8);
         // Tag set holds the legacy untyped tag *and* the typed
         // hardware tags from the with_hardware encoding (Phase
         // A.5.N.3 — the canonical tag set IS the storage).
