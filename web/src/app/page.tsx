@@ -4493,11 +4493,37 @@ function FooterColumn({
   );
 }
 
+function SeedBanner() {
+  return (
+    <a
+      href="mailto:hello@ai2070.com"
+      className="group block border-b border-line bg-accent/[0.06] hover:bg-accent/[0.12] transition-colors"
+    >
+      <div className="px-6 py-3 flex items-center justify-center gap-3 text-[11px] font-mono tracking-[0.08em] flex-wrap">
+        <span className="bg-accent text-bg px-2 py-0.5 font-bold tracking-[0.18em] text-[10px]">
+          SEED ROUND
+        </span>
+        <span className="text-ink">
+          <b className="text-accent">AI 2070</b> is raising seed funding to
+          build post-cloud nanoscale infra.
+        </span>
+        <span className="text-accent inline-flex items-center gap-1">
+          get in touch
+          <span className="transition-transform group-hover:translate-x-0.5">
+            →
+          </span>
+        </span>
+      </div>
+    </a>
+  );
+}
+
 export default function Home(): JSX.Element {
   return (
     <>
       <NavBar />
       <main className="pt-20 max-w-[1440px] mx-auto">
+        <SeedBanner />
         <HeroSection />
         <WhyNotBestEffortSection />
         <TopologyClassesSection />
