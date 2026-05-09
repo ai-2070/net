@@ -1,0 +1,19 @@
+net/crates/net/src/ffi/mesh.rs
+  s_d1b11a1287c170::t_5381f594efbce9 4109-4112,4114,4118-4119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "77db2b9dec944d16c066887c8df26356da8c02c9",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
