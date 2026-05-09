@@ -977,6 +977,69 @@ impl CapabilitySet {
             tools: self.tools.clone(),
         }
     }
+
+    // ========================================================================
+    // Typed-tag-set access — Phase A.5.1 ergonomic accessors.
+    //
+    // These methods give downstream code the future access pattern
+    // for capability data. Downstream code SHOULD adopt these now
+    // so Phase A.5.2+ (when typed-struct fields are removed from
+    // `CapabilitySet`) is invisible at the consumer level.
+    //
+    // Uses the bijection helpers from `behavior::tag_codec`. Today
+    // computed on demand (no field change); Phase A.5.2 may
+    // introduce internal `tag_set: HashSet<Tag>` storage as a
+    // performance optimization. Either way, the surface stays
+    // stable.
+    //
+    // Migration path for downstream code:
+    //
+    // ```text
+    // // Before (typed-struct field access):
+    // if caps.hardware.gpu.is_some() { ... }
+    // for tag in &caps.tags { ... }
+    //
+    // // After (typed-tag access):
+    // if HardwareCapabilities::from(&caps).gpu.is_some() { ... }
+    //   //                                  -- via Phase A.4 helpers
+    // for tag in caps.typed_tags() { ... }
+    //   //         -- via this method (Phase A.5.1)
+    // ```
+    //
+    // Application code that needs to compose with federated query
+    // primitives (Phase E) will use `typed_tags()` to feed the
+    // tag set into `Predicate::evaluate`'s `EvalContext`.
+    // ========================================================================
+
+    /// All capability data as a typed-tag set, including the
+    /// hardware / software / models / tools / limits structs
+    /// re-encoded as axis-prefixed tags AND the legacy `tags`
+    /// `Vec<String>` parsed via [`Tag::parse`]. The future wire
+    /// format (Phase A.5.2+) is exactly this `HashSet<Tag>`.
+    ///
+    /// Round-trip-stable: `Self::from_typed_tags(&caps.typed_tags())`
+    /// produces a `CapabilitySet` semantically equal to `caps`,
+    /// modulo the documented order non-preservation for non-indexed
+    /// `Vec` fields (runtimes / frameworks / drivers).
+    ///
+    /// Cost: linear in tag count. Currently computed on every
+    /// call; downstream callers that read in a hot loop should
+    /// cache the result.
+    pub fn typed_tags(&self) -> std::collections::HashSet<crate::adapter::net::behavior::tag::Tag> {
+        crate::adapter::net::behavior::tag_codec::capability_set_to_tag_set(self)
+    }
+
+    /// Build a `CapabilitySet` from a typed-tag set. Inverse of
+    /// [`Self::typed_tags`]; uses the per-struct decoders to
+    /// reconstruct the typed fields plus a legacy-carrier scan for
+    /// reserved-prefix tags + unknown axis tags.
+    ///
+    /// See [`Self::typed_tags`] for the round-trip contract.
+    pub fn from_typed_tags(
+        tags: &std::collections::HashSet<crate::adapter::net::behavior::tag::Tag>,
+    ) -> Self {
+        crate::adapter::net::behavior::tag_codec::capability_set_from_tag_set(tags)
+    }
 }
 
 /// All five typed-view projections of a [`CapabilitySet`].
@@ -3496,5 +3559,101 @@ mod tests {
         // dangling-reference compile error. The test passes by
         // virtue of compiling; the assert is just to use `views`.
         assert!(views.hardware.cpu_cores > 0);
+    }
+
+    // ========================================================================
+    // Phase A.5.1: typed-tag access methods + wire-format snapshots.
+    // ========================================================================
+
+    #[test]
+    fn typed_tags_method_round_trips() {
+        // `CapabilitySet::typed_tags()` and `from_typed_tags()`
+        // are the future access pattern; pin the round-trip
+        // contract here as inherent-method tests, mirroring the
+        // standalone-function pin in `tag_codec`.
+        let caps = sample_capability_set();
+        let tag_set = caps.typed_tags();
+        let caps2 = CapabilitySet::from_typed_tags(&tag_set);
+        // Hardware / models / tools / limits round-trip
+        // byte-for-byte (per Phase A.5.0c).
+        assert_eq!(caps.hardware, caps2.hardware);
+        assert_eq!(caps.models, caps2.models);
+        assert_eq!(caps.tools, caps2.tools);
+        assert_eq!(caps.limits, caps2.limits);
+    }
+
+    #[test]
+    fn typed_tags_default_capability_set_is_empty() {
+        // Pinned: a default CapabilitySet's typed-tag set is empty.
+        // Future Phase A.5.2's wire-format change (omitting
+        // empty-tag-set sets from the wire) depends on this.
+        let caps = CapabilitySet::default();
+        assert!(caps.typed_tags().is_empty());
+    }
+
+    #[test]
+    fn wire_format_serialization_snapshot() {
+        // Pin the current JSON wire-format shape so Phase A.5.2's
+        // field-set migration is loud. If this test fails after
+        // a CapabilitySet field change, the diff IS the wire-
+        // format break and downstream consumers need migration.
+        //
+        // Snapshot a minimal CapabilitySet (one tag, one cpu
+        // count) so the snapshot is short + readable. Full-set
+        // snapshots would be brittle (every model/tool field
+        // bumping the snapshot for cosmetic reasons).
+        let caps = CapabilitySet::new()
+            .with_hardware(HardwareCapabilities::new().with_cpu(8, 16))
+            .add_tag("inference");
+        let json = String::from_utf8(caps.to_bytes()).unwrap();
+        // Pin the exact field-list shape. The current wire format
+        // is `{ "hardware": {...}, "software": {...}, "models":
+        // [...], "tools": [...], "tags": [...], "limits": {...} }`.
+        // After Phase A.5.2 the shape becomes `{ "tags": [...],
+        // "metadata": {...} }` (Phase C adds metadata). This test
+        // failing after that change IS the migration signal —
+        // downstream readers need to be updated in lockstep.
+        assert!(json.contains("\"hardware\":"), "missing hardware field: {json}");
+        assert!(json.contains("\"software\":"), "missing software field: {json}");
+        assert!(json.contains("\"models\":"), "missing models field: {json}");
+        assert!(json.contains("\"tools\":"), "missing tools field: {json}");
+        assert!(json.contains("\"tags\":[\"inference\"]"), "missing tags field: {json}");
+        assert!(json.contains("\"limits\":"), "missing limits field: {json}");
+    }
+
+    #[test]
+    fn wire_format_round_trips_through_json() {
+        // Pinned: a CapabilitySet round-trips through `to_bytes` →
+        // `from_bytes`. Phase A.5.2's wire format change must
+        // preserve this property — a CapabilitySet built via the
+        // typed builder methods then serialized then deserialized
+        // produces an equal value. Test against a non-trivial
+        // capability set to exercise every field.
+        let caps = sample_capability_set();
+        let bytes = caps.to_bytes();
+        let caps2 = CapabilitySet::from_bytes(&bytes).expect("round-trip parses");
+        assert_eq!(caps, caps2);
+    }
+
+    #[test]
+    fn typed_tags_includes_legacy_string_tags() {
+        // Pinned: legacy `Vec<String>` tags appear in the typed-
+        // tag set as `Tag::Legacy` / `Tag::Reserved` / parsed
+        // axis tags. Downstream code reading via `typed_tags()`
+        // sees them all uniformly.
+        use crate::adapter::net::behavior::tag::Tag as TagT;
+        let caps = CapabilitySet::new()
+            .add_tag("inference")
+            .with_tenant_scope("acme");
+        let tag_set = caps.typed_tags();
+        // "inference" → Legacy
+        assert!(tag_set
+            .iter()
+            .any(|t| matches!(t, TagT::Legacy(s) if s == "inference")));
+        // "scope:tenant:acme" → Reserved
+        assert!(tag_set
+            .iter()
+            .any(|t| matches!(t, TagT::Reserved { prefix, body }
+                if prefix == "scope:" && body == "tenant:acme")));
     }
 }
