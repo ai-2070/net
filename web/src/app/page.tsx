@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { Fragment, useEffect, useMemo, useRef, useState, JSX } from "react";
-
+import globals from "@/lib/globals";
 import { useRepoInfo } from "@/components/RepoInfoProvider";
 import { cn } from "@/lib/cn";
 
@@ -4412,7 +4412,7 @@ const FOOTER_RESOURCES: ReadonlyArray<{
   },
   { href: "https://github.com/ai-2070/net", label: "Source // GitHub" },
   {
-    href: "mailto:makerseven7@gmail.com",
+    href: `mailto:${globals.email}`,
     label: "▸ Contact",
     class: "text-accent",
   },
@@ -4493,11 +4493,97 @@ function FooterColumn({
   );
 }
 
+const GLITCH_CHARS = "█▓▒░@#$%&*+=<>{}[]|/\\01";
+
+function scrambleText(text: string, intensity: number): string {
+  return text
+    .split("")
+    .map((c) => {
+      if (c === " ") return " ";
+      if (Math.random() > intensity) return c;
+      const i = Math.floor(Math.random() * GLITCH_CHARS.length);
+      return GLITCH_CHARS[i] ?? c;
+    })
+    .join("");
+}
+
+function GlitchText({
+  text,
+  intervalMs = 4500,
+  offsetMs = 0,
+}: {
+  text: string;
+  intervalMs?: number;
+  offsetMs?: number;
+}) {
+  const [chars, setChars] = useState(text);
+
+  useEffect(() => {
+    const timeouts: number[] = [];
+
+    const cycle = (): void => {
+      setChars(scrambleText(text, 0.7));
+      timeouts.push(
+        window.setTimeout(() => {
+          setChars(scrambleText(text, 0.4));
+        }, 70),
+      );
+      timeouts.push(
+        window.setTimeout(() => {
+          setChars(text);
+        }, 160),
+      );
+    };
+
+    let intervalId = 0;
+    const startId = window.setTimeout(() => {
+      cycle();
+      intervalId = window.setInterval(cycle, intervalMs);
+    }, offsetMs);
+
+    return () => {
+      window.clearTimeout(startId);
+      if (intervalId) window.clearInterval(intervalId);
+      for (const t of timeouts) window.clearTimeout(t);
+    };
+  }, [text, intervalMs, offsetMs]);
+
+  return <>{chars}</>;
+}
+
+function SeedBanner() {
+  return (
+    <a
+      href={`mailto:${globals.email}`}
+      className="group block border-b border-line bg-accent/[0.06] hover:bg-accent/[0.12] transition-colors overflow-hidden"
+    >
+      <div className="glitch-banner px-6 py-3 flex items-center justify-center gap-3 text-[11px] font-mono tracking-[0.08em] flex-wrap">
+        <span className="bg-accent text-bg px-2 py-0.5 font-bold tracking-[0.18em] text-[10px]">
+          <GlitchText text="SEED ROUND" intervalMs={5400} offsetMs={2700} />
+        </span>
+        <span className="text-ink">
+          <b className="text-accent">
+            <GlitchText text="AI 2070" intervalMs={5400} />
+          </b>{" "}
+          is raising seed funding to build post-cloud infrastructure.
+        </span>
+        <span className="text-accent inline-flex items-center gap-1">
+          get in touch
+          <span className="transition-transform group-hover:translate-x-0.5">
+            →
+          </span>
+        </span>
+      </div>
+    </a>
+  );
+}
+
 export default function Home(): JSX.Element {
   return (
     <>
       <NavBar />
       <main className="pt-20 max-w-[1440px] mx-auto">
+        <SeedBanner />
         <HeroSection />
         <WhyNotBestEffortSection />
         <TopologyClassesSection />
