@@ -4,7 +4,13 @@
 
 ## Status
 
-**Design locked; blocked on Capability Phases B + F.** All open design questions are ratified — see [Locked decisions](#locked-decisions). Hard prerequisites: Capability System Plan's Phase B (tag-discovery primitives `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders`) and Phase F (`PlacementFilter` + `IntentRegistry` + anti-affinity + `ProximityGraph::nearest_rtt`). RedEX Phases C/D/E cannot start until both land. Phases A, B (this plan's), G, H, I can proceed in isolation as scaffolding.
+**Design locked; blocked on Capability Phase B (and partially F).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
+
+Hard prerequisites:
+- **Capability Phase B** (tag-discovery primitives `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders`) — RedEX Phases C/D/E cannot start until this lands.
+- **Capability Phase F** (`PlacementFilter` + `IntentRegistry` + anti-affinity) — needed for *replica placement* in Phase C, but **not** for leader election. Election is decentralized and deterministic (nearest-RTT + NodeId tiebreak); see [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak).
+
+Phase A (wire protocol scaffold), Phase B (this plan's `ReplicationConfig` opt-in), Phases G–I can proceed in isolation as scaffolding.
 
 Activation gate (when Warriors as a whole ships) is unchanged: a workload requesting durability guarantees beyond single-node. Realistic triggers: payment-tier customer, compliance-bound data class, pilot whose RTO is "< 5 s on node failure."
 
@@ -24,10 +30,10 @@ Three load-bearing reasons:
 
 Five things, in dependency order:
 
-1. **Wire protocol** — `SUBPROTOCOL_REDEX` with `DISPATCH_REPLICA_SYNC` codes; full byte-level layouts pinned in [§2 Wire protocol](#2-wire-protocol--subprotocol_redex).
+1. **Wire protocol** — `SUBPROTOCOL_REDEX` with `DISPATCH_REPLICA_SYNC` codes; full byte-level layouts pinned in [§2 Wire protocol](#2-wire-protocol--subprotocol_redex). Four dispatch codes total — election needs **no wire protocol** because it's a pure deterministic function over local state.
 2. **`ReplicationConfig` in `ChannelConfig`** — opt-in per channel; defaults to `None` (single-node) for backward compatibility.
-3. **`ReplicationCoordinator` daemon** — per replicated channel; spawned per replica; consumes `PlacementFilter` for placement decisions; runs the RedEX-local placement-scored election.
-4. **Failover via RedEX-local placement-scored election** — `ReplicationCoordinator` performs the leader choice using `PlacementFilter::placement_score` for `Artifact::Replica`. Membership + failure detection delegate to `groups::standby`; the leader-choice itself is RedEX's, because `StandbyGroup::promote()` picks "most up-to-date snapshot" (per `COMPUTE.md:268`) which is the wrong axis for an append-only log replicated across topology-aware placement scores. See [Locked decision 3](#3-election-strategy--redex-local-placement-scored).
+3. **`ReplicationCoordinator` daemon** — per replicated channel; spawned per replica; consumes `PlacementFilter` (Capability F) for *replica placement* (which N nodes become replicas) at construction time only. Election is independent of `PlacementFilter`.
+4. **Failover via deterministic nearest-RTT election** — `StandbyGroup` provides membership + failure detection; the *selection function* it invokes on leader loss is RedEX's: pick the healthy replica with the lowest RTT to self, tie-break by lexicographic NodeId. Pure function; every node computes the same winner from the same inputs. No new election protocol; no broadcast/epoch/collection-window machinery. See [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak).
 5. **DST harness extension** — adds replication scenarios (partition, leader flap, replica rejoin) to the existing `loom_models.rs` infrastructure.
 
 What this doc does NOT ship (deferred):
@@ -98,7 +104,7 @@ pub enum UnderCapacity {
 
 ### 2. Wire protocol — `SUBPROTOCOL_REDEX`
 
-New subprotocol ID claim. Subprotocol header is the standard `subprotocol_id: u16 LE` + `dispatch_code: u8` = **3-byte prefix** on every message; payload follows. Reserves `DISPATCH_REPLICA_SYNC = 0x20..0x2F` (16 codes; v1 uses 5):
+New subprotocol ID claim. Subprotocol header is the standard `subprotocol_id: u16 LE` + `dispatch_code: u8` = **3-byte prefix** on every message; payload follows. Reserves `DISPATCH_REPLICA_SYNC = 0x20..0x2F` (16 codes; v1 uses 4):
 
 | Dispatch code | Direction | Purpose |
 |---|---|---|
@@ -106,9 +112,10 @@ New subprotocol ID claim. Subprotocol header is the standard `subprotocol_id: u1
 | `SYNC_RESPONSE = 0x21` | leader → replica | Leader returns a bounded `read_range`-style stream |
 | `SYNC_HEARTBEAT = 0x22` | bidirectional | Leader heartbeats `tail_seq`; replicas heartbeat their own `tail_seq` |
 | `SYNC_NACK = 0x23` | leader → replica | Structured rejection (NotLeader / BadRange / Backpressure / ChannelClosed) |
-| `LEADER_ELECTION = 0x24` | broadcast within replica set | Triggered by leader-loss detection; carries the RedEX-local placement score |
 
-Reserved codes `0x25..0x2F` for future variants (range-bounded sync, parallel-stream sync, etc.). Document each new code in `SUBPROTOCOLS.md` as it lands.
+Reserved codes `0x24..0x2F` for future variants (range-bounded sync, parallel-stream sync, etc.). Document each new code in `SUBPROTOCOLS.md` as it lands.
+
+**No `LEADER_ELECTION` on the wire.** Election is a pure deterministic function over each node's already-known state (proximity-graph RTT matrix + replica-set membership + NodeId ordering); every node computes the same winner independently. `StandbyGroup`'s existing promotion broadcast announces the result; no RedEX-specific election message is needed. See [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak).
 
 **Encoding conventions (LOCKED).** All multi-byte integers are **little-endian**, fixed-width (matching `redex-disk`'s existing `to_bytes` convention). No varints — DST modeling is simpler with fixed sizes, and the per-message payloads are bounded enough that the wire-cost difference is negligible. `ChannelId` is the channel name's 32-byte BLAKE2s hash (matches the existing `ChannelName::hash()` convention). Strings are length-prefixed `(u16 LE len, [len] utf-8 bytes)`.
 
@@ -178,29 +185,6 @@ error with retry policy keyed on `error_code`:
   - 2 BadRange    → trim local tail; retry from leader's first_seq
   - 3 Backpressure → exponential backoff; same SYNC_REQUEST
   - 4 ChannelClosed → withdraw replica role; emit metric
-
-LEADER_ELECTION (broadcast within replica set)
-┌──────────────────────────────────────────────────────────────┐
-│ subprotocol_id   u16 LE      = SUBPROTOCOL_REDEX             │
-│ dispatch_code    u8          = 0x24                          │
-│ channel_id       [u8; 32]                                    │
-│ candidate_id     u64 LE      proposer's NodeId               │
-│ proposed_score   f32 LE      candidate's PlacementFilter     │
-│                              ::placement_score for itself    │
-│                              as Artifact::Replica            │
-│ epoch            u64 LE      monotonic election counter      │
-│                              (prevents stale-vote replay)    │
-└──────────────────────────────────────────────────────────────┘
-fixed size: 3 + 32 + 8 + 4 + 8 = 55 bytes
-
-Election protocol summary:
-- On leader-loss detection, every surviving replica computes its own
-  placement_score and broadcasts LEADER_ELECTION at epoch+1.
-- After a 2 × heartbeat_ms collection window, the highest-scored
-  candidate (with the locked tie-breaker from Capability §7) wins.
-- All replicas update their local view to point to the winner.
-- The winner's first heartbeat carries role=Leader; that doubles as
-  the election commit signal.
 ```
 
 **Range encoding** (used by future `0x25..0x2F` variants and by `read_range` parameters within RedEX itself): `(start_seq: u64 LE, end_seq: u64 LE)` pairs. Half-open `[start, end)` per the existing `RedexFile::read_range` convention. No varints; explicit u64 endpoints.
@@ -222,11 +206,14 @@ pub enum ReplicaState {
     /// Catching up via SYNC_REQUEST or steady-state lagging by ≤ 1
     /// heartbeat. Heartbeats own `tail_seq` to the leader.
     Replica,
-    /// Election in flight. Coordinator has detected leader-loss
-    /// (3 consecutive missed heartbeats) and is participating in
-    /// the placement-scored election (LEADER_ELECTION broadcast +
-    /// 2 × heartbeat_ms collection window). Refuses both append
-    /// and serve until election commits.
+    /// Brief transient state: 3 consecutive heartbeats missed, the
+    /// coordinator is computing the deterministic election winner
+    /// (nearest-RTT in the healthy replica set, NodeId tiebreak —
+    /// see §4) and committing the transition. Refuses both append
+    /// and serve until the transition resolves to Leader or
+    /// Replica. Duration is the elect() function's compute time
+    /// (microseconds), NOT a broadcast wait — there is no election
+    /// protocol on the wire.
     Candidate,
     /// Node carries the channel's storage but has no replica role
     /// for it (e.g. former replica that withdrew under disk
@@ -255,7 +242,7 @@ The earlier draft inconsistently named 3 states in some places and 4 in others. 
 - Heartbeat to the leader at `heartbeat_ms` cadence (when in `Replica`)
 - Serve `SYNC_REQUEST` and emit `SYNC_HEARTBEAT` (when in `Leader`)
 - On heartbeat-ack mismatch, issue `SYNC_REQUEST` to leader; apply the `SYNC_RESPONSE` events in seq order
-- On leader-loss detection (3 consecutive missed heartbeats with hysteresis), enter `Candidate` and broadcast `LEADER_ELECTION`
+- On leader-loss detection (3 consecutive missed heartbeats with hysteresis), enter `Candidate`, run the deterministic `elect()` function from §4, then transition to `Leader` (if self is the winner) or `Replica` (if a peer is the winner)
 - On graceful shutdown, transition to `Idle` and withdraw the replica's `causal:` capability tag via Capability Phase B's `Mesh::withdraw_chain`
 
 **Construction:**
@@ -264,27 +251,40 @@ The earlier draft inconsistently named 3 states in some places and 4 in others. 
 - If yes, spawn a `ReplicationCoordinator` daemon initialized in `Replica` state. The daemon registers itself with the channel's `StandbyGroup` (membership + failure detection only — see §7).
 - If no, the channel opens as a regular non-replicated channel locally; reads route to the nearest replica via `Mesh::find_chain_holders`.
 
-### 4. Replica election
+### 4. Replica selection vs. leader election
 
-N nodes from the capability-advertising set, selected via `PlacementFilter::placement_score` for `Artifact::Replica`. The top-N by score become replicas. The locked tie-breaking from Capability §7 (RTT → free-resource → lexicographic NodeId) applies on equal scores.
+Two distinct concerns. Keeping them separate is the load-bearing simplification.
 
-**Triggers:**
+**Replica selection (Phase C — placement).** N nodes from the capability-advertising set, selected via `PlacementFilter::placement_score` for `Artifact::Replica`. The top-N by score become replicas. The locked Capability §7 tie-breaking (RTT → free-resource → lexicographic NodeId) applies on equal scores. Anti-affinity at 30% leadership-concentration threshold (`AntiAffinityConfig`) prevents central nodes from accumulating too much replica membership across channels.
 
+Triggers:
 - First publish on a newly-replicated channel
 - Roster change (replica withdraws / new node advertises matching capabilities)
-- Leader-loss detection by any surviving replica
+- Disk-pressure withdrawal by an existing replica
 
-**Election mechanism (RedEX-local, NOT delegated to `StandbyGroup::promote`).** See [Locked decision 3](#3-election-strategy--redex-local-placement-scored) for the rationale. Concretely:
+**Leader election (Phase E — deterministic, no `PlacementFilter` dependency).** Pure function over locally-known state. Every node computes the same winner.
 
-1. On leader-loss detection, every surviving `Replica` transitions to `Candidate` and broadcasts `LEADER_ELECTION` carrying its own `placement_score` for itself as `Artifact::Replica`, plus a monotonic `epoch` (last-seen-epoch + 1).
-2. Each candidate collects peers' broadcasts for `2 × heartbeat_ms` (the election window).
-3. The candidate with the highest score at the highest epoch wins. Tie-break per Capability §7. All candidates compute the winner deterministically from the same broadcast set (no separate "vote" round needed — the score IS the vote).
-4. The winner transitions `Candidate → Leader`; its first `SYNC_HEARTBEAT` with `role=Leader` is the commit signal. Losers transition `Candidate → Replica` and follow the winner.
-5. If the election window expires with no quorum (e.g. partition splits the replica set evenly), candidates re-broadcast at `epoch + 1`; the higher-epoch broadcast supersedes lower-epoch state on every replica. Convergence is bounded by partition healing.
+```
+elect(replica_set, self) -> NodeId:
+    R = { r ∈ replica_set : r is healthy in self's local view }
+    if R is empty: return None       // partition isolated us; no leader
+    sorted = R sorted by (rtt_to(self, r), r.node_id_lex)
+                                     // primary: lower RTT wins
+                                     // tie-break: lexicographic NodeId
+    return sorted[0]                 // self if RTT(self,self)=0 wins
+```
 
-**`StandbyGroup` provides membership + failure detection, not leader choice.** The standby-group machinery already tracks "which replicas are alive" and surfaces failure events. RedEX consumes those events as election triggers but performs the leader choice itself via the placement-scored protocol above.
+This is exactly Cassandra/Scylla coordinator selection, Consul LAN-segment fallback, Dynamo-style preferred replica — a time-tested decentralized pattern. RedEX's invariants (single writer + append-only + monotonic seq) make leadership a centrality concern, not a placement-quality concern: any healthy replica is a valid leader, so picking the most network-central one is enough.
 
-**Anti-affinity (default):** the placement score includes a penalty for nodes already leading > 30% of channels in the local view, to spread leadership naturally across nodes. Configurable via the `AntiAffinityConfig` from Capability §7.
+**Why not consult `PlacementFilter` for election:** placement is "which N nodes should be replicas" (a topology + capability + intent question). Election is "which of those existing replicas should be sole appender right now" (a centrality + liveness question). Folding placement scoring into election would re-litigate the placement question on every leader loss, with no benefit — the replicas were already chosen with the right scoring at Phase C.
+
+Triggers:
+- Leader-loss detection by any surviving replica (3 consecutive missed heartbeats — the existing hysteresis)
+- `StandbyGroup` failure-detection event (membership view shrinks)
+
+**`StandbyGroup` provides membership + failure detection; RedEX provides the selection function.** The pluggable hook is "elect leader given current healthy set" — RedEX supplies the deterministic nearest-RTT function above; `StandbyGroup` invokes it on leader-loss and uses its own promotion broadcast to announce the winner. `StandbyGroup::promote()`'s default "highest synced_through" behavior is preserved for daemon migration; only RedEX channels override the selection function.
+
+**Convergence and split-brain.** Because the selection function is pure and deterministic, every replica computes the same winner from the same RTT matrix + membership set within a single partition. Two partitions with disjoint views can briefly compute different winners; both leaders accept appends until partition heals. This is the same dual-leader-during-partition risk every leader-elected system has — RedEX's mitigation is operator-controlled placement (don't span replica sets across partition boundaries you can't tolerate). The `causal:` capability tag's higher-epoch supersession on partition heal converges routing back to a single leader; divergent appends made during the partition are flagged for operator review via the `dataforts_replication_skip_ahead_total` metric. Pin in DST.
 
 ### 5. Pull-based catch-up
 
@@ -334,24 +334,23 @@ if replica misses 3 consecutive leader heartbeats:
 
 ### 7. Failover
 
-Leader fails (proximity graph reports `Unhealthy` OR 3 consecutive heartbeats missed by all surviving replicas):
+Leader fails (proximity graph reports `Unhealthy` OR 3 consecutive heartbeats missed):
 
-1. Each surviving replica transitions `Replica → Candidate` and broadcasts `LEADER_ELECTION` per [§4](#4-replica-election).
-2. After the `2 × heartbeat_ms` collection window, the highest-scored candidate transitions `Candidate → Leader`. The first `SYNC_HEARTBEAT` from the new leader is the commit signal.
+1. Each surviving replica transitions `Replica → Candidate` and runs `elect(replica_set, self)` (§4) — pure function, ~microseconds.
+2. The winner transitions `Candidate → Leader`; losers transition `Candidate → Replica`. No broadcast, no wait, no quorum: every healthy replica converges to the same winner from the same RTT matrix + membership set.
 3. The new leader resumes appends from its local `tail_seq`; the old leader's gap (if any) is replayed when it rejoins via the standard rejoin path (§8).
-4. The new leader emits `causal:` capability-tag updates via `Mesh::announce_chain`; the channel's routing tag now points to the new leader. The old leader's `causal:` tag is reaped by the standard withdrawal path on its next observed disconnect.
+4. The new leader emits `causal:` capability-tag updates via `Mesh::announce_chain`; `StandbyGroup`'s existing promotion broadcast announces the new leader to the rest of the mesh. The channel's routing tag now points to the new leader.
 5. Cutover is atomic from the routing layer's perspective — the next publish on the channel goes to the new leader; in-flight reads against the old leader fall through to the new one via `Mesh::find_chain_holders` re-lookup.
 
-**Critical safety property:** no two nodes can be leader for the same channel at the same time.
+**Critical safety property:** no two nodes can be leader for the same channel at the same time *within a single partition*.
 
-The election protocol guarantees this in three ways:
-- The score-and-epoch broadcast is deterministic — every candidate sees the same broadcast set and computes the same winner.
-- A higher-epoch `LEADER_ELECTION` always supersedes a lower-epoch one on every replica, so a stale leader from a partition-healed split is demoted as soon as it observes the higher epoch.
-- The reliable-stream layer guarantees in-order delivery of `SYNC_HEARTBEAT` within a session, so a node can never observe the new leader's `role=Leader` heartbeat before its own `Candidate → Replica` transition.
+The deterministic election guarantees this in two ways:
+- Every replica computes `elect()` over the same locally-known healthy set, so within a partition all replicas pick the same winner. There's no broadcast race because there's no broadcast.
+- Membership view convergence is `StandbyGroup`'s job: when a replica's view of "who's healthy" changes, it re-runs `elect()` and either retains its role (still winner) or transitions out (peer is now winner). The transitions are monotonic relative to view changes.
 
-Pin all three in DST scenarios (Phase F).
+**Cross-partition split-brain.** Two partitions with disjoint views of "who's healthy" will compute different winners. Both leaders accept appends until partition heals; the divergent appends are flagged via `dataforts_replication_skip_ahead_total` and surface to operator review. This risk is intrinsic to leader-elected systems without quorum; RedEX is not solving it here. Operator mitigation: don't span replica sets across partition boundaries you can't tolerate. Pin both the partition-healing convergence behavior and the divergence-flagging metric in DST (Phase F).
 
-**Membership + failure detection delegate to `StandbyGroup`.** RedEX uses standby-group machinery to learn "this replica is alive" and "this replica just disconnected"; it does NOT use `StandbyGroup::promote()` because that primitive picks "most up-to-date snapshot" (per `COMPUTE.md:268`) which is the wrong axis for an append-only log replicated across topology-aware placement scores. See [Locked decision 3](#3-election-strategy--redex-local-placement-scored).
+**Membership + failure detection delegate to `StandbyGroup`.** RedEX uses standby-group machinery to learn "this replica is alive" and "this replica just disconnected." `StandbyGroup` invokes RedEX's deterministic selection function on leader loss — see [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak).
 
 ### 8. Replica rejoin
 
@@ -421,7 +420,7 @@ The 4-9 week range comes from DST depth. Sequence:
 Implementable in isolation; does not depend on Capability B/F.
 
 - Add `SUBPROTOCOL_REDEX` ID claim in `SUBPROTOCOLS.md` and `behavior::subprotocol`.
-- Add the five `DISPATCH_REPLICA_SYNC` codes (0x20..0x24) per [§2](#2-wire-protocol--subprotocol_redex). Encode/decode each message at the byte layouts pinned there.
+- Add the four `DISPATCH_REPLICA_SYNC` codes (0x20..0x23) per [§2](#2-wire-protocol--subprotocol_redex). Encode/decode each message at the byte layouts pinned there.
 - Round-trip tests for each message shape; pin the exact byte layout (fixed-size messages assert byte-count constants; variable-size messages assert layout under a property test).
 
 ### Phase B — `ReplicationConfig` + opt-in (3 days)
@@ -450,16 +449,15 @@ Implementable in isolation; does not depend on Capability B/F.
 - Skip-ahead path for gaps > `skip_threshold`.
 - Bandwidth-budget enforcer respecting `replication_budget_fraction`.
 
-### Phase E — Failover via RedEX-local placement-scored election (1 week)
+### Phase E — Failover via deterministic nearest-RTT election (1 week)
 
-**Hard prerequisite: Capability Phase F (`PlacementFilter`).**
+**Hard prerequisite: Phase C of this plan (which transitively requires Capability B). Does NOT depend on Capability F** — election is wire-free and `PlacementFilter`-free.
 
-- `ReplicationCoordinator` consumes `StandbyGroup` events for membership + failure detection only. Does NOT call `StandbyGroup::promote()`. See [Locked decision 3](#3-election-strategy--redex-local-placement-scored).
-- `LEADER_ELECTION` broadcast on leader-loss; 2 × heartbeat_ms collection window; deterministic winner from highest-(score, epoch) pair with the locked tie-breaker (RTT → free-resource → lexicographic NodeId).
+- `ReplicationCoordinator` consumes `StandbyGroup` events for membership + failure detection only.
+- Implement the deterministic `elect()` selection function from [§4](#4-replica-selection-vs-leader-election); register it as `StandbyGroup`'s leader-selection hook for replicated channels (this is the one new `groups::standby` integration point — a pluggable selection-fn slot, NOT a replacement of the daemon-migration default).
 - Hysteresis: 3-missed-heartbeats threshold; tunable.
-- Anti-affinity at 30% leadership-concentration threshold via `AntiAffinityConfig` (Capability §7); penalty multiplies into the placement score per the locked multiplicative composition rule.
-- Capability-tag updates on leader change via `Mesh::announce_chain`; routing follows. Old leader's tag is reaped on the next observed disconnect.
-- Pin the no-two-leaders invariant in unit tests AND DST (Phase F).
+- Capability-tag updates on leader change via `Mesh::announce_chain`; `StandbyGroup`'s existing promotion broadcast announces the winner. Old leader's tag is reaped on the next observed disconnect.
+- Pin the no-two-leaders-within-a-partition invariant in unit tests AND DST (Phase F). Cross-partition split-brain is documented as out-of-scope (operator concern).
 
 ### Phase F — DST harness extension (1.5–3 weeks; widest variance)
 
@@ -468,10 +466,11 @@ Implementable in isolation; does not depend on Capability B/F.
 This is the gating phase. Plan generously and treat regressions as test failures:
 
 - Extend `loom_models.rs` to model the 4-state replication state machine (`Leader` / `Replica` / `Candidate` / `Idle`) with the locked transitions from [§3](#3-replicationcoordinator).
-- Failure-injection scenarios: random partition, leader crash, replica crash, partial-network (one replica isolated), restart-during-sync, election-window-collision (two simultaneous candidates), partition-heal-with-stale-leader.
+- Failure-injection scenarios: random partition, leader crash, replica crash, partial-network (one replica isolated), restart-during-sync, partition-heal-with-stale-leader, asymmetric-RTT (two replicas disagree on which peer is "nearest" because their RTT measurements diverged transiently).
 - Convergence assertion: all surviving replicas converge to leader's `tail_seq` after recovery.
 - Divergence-freedom: no two replicas declare different `tail_seq` for the same `seq` (stronger than convergence — pin in DST).
-- Election-correctness: at any point, exactly one node believes it is leader for a channel, OR an election is in flight (no dual-leader windows). Pin against the partition-heal-with-stale-leader scenario specifically — the higher-epoch supersession rule from §4 is the load-bearing invariant.
+- Election determinism: given the same RTT matrix + healthy set + NodeId set, every replica computes the same winner. Pin against the asymmetric-RTT scenario — RTT measurements should converge across replicas under the proximity graph's existing smoothing, but transient divergence must not produce dual-leader windows.
+- Election-correctness within a partition: at any point, exactly one node believes it is leader for a channel within any single partition. Cross-partition split-brain is explicitly NOT asserted (it's out-of-scope per [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak)); instead pin that on partition heal, the divergent appends are flagged via `dataforts_replication_skip_ahead_total`.
 - Performance budget: replication overhead ≤ 30% of single-node append throughput at steady state.
 
 ### Phase G — Disk pressure + `UnderCapacity` (3 days)
@@ -546,31 +545,53 @@ RedEX Distributed depends on three primitives that **do not exist** in `net/crat
 
 These ship in **Capability System Plan Phase B** (see `CAPABILITY_SYSTEM_PLAN.md`'s phasing). RedEX Phases C/D/E/F (coordinator, catch-up, failover, DST) **cannot start** until Phase B lands. RedEX Phases A, B (this plan), G, H, I can scaffold in isolation.
 
-#### 2. Capability Phase F (`PlacementFilter`) is a hard prerequisite
+#### 2. Capability Phase F (`PlacementFilter`) is a hard prerequisite for *replica placement* (Phase C only)
 
-RedEX leader concentration prevention, replica placement, fallback placement, and the placement-scored election ALL consume:
+Used by:
+- `PlacementFilter::placement_score(target, &Artifact::Replica { ... })` — top-N replica selection at Phase C.
+- `IntentRegistry` (consumed via `metadata.intent`) — placement-time intent matching.
+- `AntiAffinityConfig` (the leadership-concentration penalty) — applied at placement time so central nodes don't accumulate replica membership across too many channels.
 
-- `PlacementFilter::placement_score(target, &Artifact::Replica { ... })`
-- `IntentRegistry` (consumed via `metadata.intent`)
-- `AntiAffinityConfig` (the leadership-concentration penalty)
-- `ProximityGraph::nearest_rtt(candidate, predicate)` (locked in Capability §7a)
-
-None of these exist in code today. They ship in **Capability System Plan Phase F**. RedEX Phases C and E **cannot start** until Phase F lands. The composite gate is therefore "Capability B AND F" before RedEX C/D/E.
+**NOT used by election.** The earlier draft made Phase E depend on Capability F too, via a placement-scored election. Decision 3 below replaces that with a deterministic nearest-RTT election that consumes only the existing proximity graph + NodeId ordering — no `PlacementFilter` dependency. The Phase E gate drops to "Capability B + Phase C of this plan." The composite gate becomes "Capability B before C/D/E; Capability F before C." (Phase E only needs Phase C, transitively, plus Capability B.)
 
 ### Election strategy
 
-#### 3. Election strategy — RedEX-local placement-scored
+#### 3. Election strategy — deterministic nearest-RTT with NodeId tiebreak
 
-RedEX runs its own placement-scored election; `StandbyGroup` provides membership + failure detection only.
+RedEX supplies the selection function `StandbyGroup` invokes on leader loss; the function is a pure deterministic computation over each node's already-known state.
 
-**Why not extend `StandbyGroup::promote()`** (Option A in the audit): `StandbyGroup` promotes "the standby with the highest `synced_through`" (per `COMPUTE.md:268`) — a snapshot-currency axis that's correct for stateful daemons but **wrong for an append-only log replicated across topology-aware placement scores**. Replicas all converge to the same `tail_seq` under normal operation; the meaningful axis at election time is "which replica is best-placed for the channel," and that's exactly what `PlacementFilter::placement_score` already answers.
+```
+elect(replica_set, self) -> NodeId:
+    R = { r ∈ replica_set : r is healthy in self's local view }
+    if R is empty: return None
+    sorted = R sorted by (rtt_to(self, r), r.node_id_lex)  // primary RTT, tiebreak NodeId
+    return sorted[0]                                        // self at RTT 0 wins ties of self vs others
+```
 
-**Why RedEX-local is clean:**
-- `StandbyGroup` keeps its existing promotion semantics for daemon migration; nothing changes there.
-- RedEX's election doesn't need a new primitive — it composes `PlacementFilter` (Capability F) + `LEADER_ELECTION` broadcast (this plan's wire protocol) + the score-and-epoch convergence rule (§4 of this plan).
-- Separation of concerns: the standby-group machinery handles "is this replica alive," the placement filter handles "is this replica well-placed," and the RedEX coordinator composes both.
+Every healthy node computes the same winner from the same inputs (RTT matrix + membership set + NodeId ordering). No broadcast, no epoch, no collection window, no `PlacementFilter` consultation.
 
-**Mechanism**: §4 above; `LEADER_ELECTION` byte layout in §2.
+**Why this works for RedEX specifically.** RedEX is single-writer, append-only, and monotonic-seq. Replicas all converge to the same `tail_seq` under normal operation, so any healthy replica is a valid leader. The meaningful axis at election time is *centrality* (which surviving replica is closest to the rest), not *quality* (placement-quality was already settled at Phase C when these N nodes were chosen as the replica set). Folding placement scoring into election would re-litigate the placement question on every leader loss with no benefit.
+
+**Why this is safe.** Centrality, not placement quality, is the right axis because:
+- The replica set was already chosen with anti-affinity at Phase C; central nodes can't dominate replica membership across too many channels.
+- Any healthy replica has the data to lead (single-writer + monotonic seq guarantees state-equivalence at convergence).
+- A central node lowers RTT for the rest of the replica set, minimizing replication-sync round-trip in steady state.
+
+**Why not extend `StandbyGroup::promote()` directly** (Option A in the audit): `StandbyGroup`'s default behavior promotes "the standby with the highest `synced_through`" (per `COMPUTE.md:268`) — a snapshot-currency axis correct for stateful daemons but wrong for an append-only log where all replicas converge. RedEX needs to override the *selection function* without replacing the membership / failure-detection / promotion-broadcast machinery. The pluggable hook is "given current healthy set, pick a leader" — RedEX supplies the nearest-RTT function above; `StandbyGroup` keeps its existing promotion-broadcast behavior to announce the result.
+
+**Real-world precedent.** This pattern is exactly:
+- Cassandra/Scylla: replica coordinator selection by network-topology proximity
+- Consul: LAN-segment leader fallback
+- Dynamo-inspired systems: preferred-replica selection
+
+**Properties this gives us:**
+- **Deterministic:** every node computes the same winner; no nondeterministic tie-break races.
+- **No election storms:** no broadcast = nothing to thrash.
+- **No cross-node disagreement within a partition:** same inputs → same output.
+- **O(N) where N = replica-set size** (typically 3-5).
+- **Zero new wire protocol:** the existing proximity graph, membership view, RTT matrix, and NodeId ordering are all the inputs needed.
+
+**Cross-partition split-brain** is an unavoidable risk for any leader-elected system without quorum; mitigation is operator-controlled placement (see §7).
 
 ### Wire protocol
 
@@ -578,8 +599,8 @@ RedEX runs its own placement-scored election; `StandbyGroup` provides membership
 
 §2 above defines:
 - 3-byte subprotocol header (`subprotocol_id u16 LE` + `dispatch_code u8`) on every message
-- Five dispatch codes: `SYNC_REQUEST` (0x20), `SYNC_RESPONSE` (0x21), `SYNC_HEARTBEAT` (0x22), `SYNC_NACK` (0x23), `LEADER_ELECTION` (0x24)
-- Reserved range `0x25..0x2F` for future variants
+- Four dispatch codes: `SYNC_REQUEST` (0x20), `SYNC_RESPONSE` (0x21), `SYNC_HEARTBEAT` (0x22), `SYNC_NACK` (0x23). **No `LEADER_ELECTION` code** — election is wire-free per Decision 3.
+- Reserved range `0x24..0x2F` for future variants
 - All multi-byte integers are little-endian fixed-width (no varints)
 - 32-byte BLAKE2s `ChannelId` (matches existing `ChannelName::hash()` convention)
 - Length-prefixed strings: `(u16 LE len, [len] utf-8 bytes)`
@@ -592,7 +613,9 @@ Round-trip tests for each message land in Phase A.
 
 #### 5. 4-state machine pinned
 
-`ReplicaState::{Leader, Replica, Candidate, Idle}` per §3. Transitions enumerated. The earlier draft inconsistently named 3 states in some places and 4 in others; the 4-state model is the single source of truth. DST scenarios (Phase F) model exactly these four states with the listed transitions.
+`ReplicaState::{Leader, Replica, Candidate, Idle}` per §3. Transitions enumerated. The earlier draft inconsistently named 3 states in some places and 4 in others; the 4-state model is the single source of truth.
+
+`Candidate` is now a brief transient state — the duration of the deterministic `elect()` function (microseconds), NOT a broadcast wait. Kept in the state machine for observability / DST modeling clarity (the "I detected leader loss, computing winner, transitioning" moment is a meaningful sequence point even if it's near-instant). DST scenarios (Phase F) model exactly these four states with the listed transitions.
 
 ### Operational decisions (recommendations from the prior open-questions list, ratified)
 
@@ -606,7 +629,7 @@ Round-trip tests for each message land in Phase A.
 
 10. **Bandwidth budget — 50% of measured NIC peak by default.** Cap replication-sync I/O at `replication_budget_fraction × NIC peak`. Backpressure-aware via reliable-stream's existing flow control. NIC peak is measured via the existing per-link throughput counters surfaced by the proximity graph; sampling window is 60 s rolling.
 
-11. **Leader concentration prevention — anti-affinity at 30% threshold.** Configured via `AntiAffinityConfig::leadership_concentration_threshold` (default 0.30) + `AntiAffinityConfig::leadership_concentration_penalty` (default 0.4) — both from Capability §7. The penalty multiplies the candidate's score per the locked multiplicative composition rule, so a node already leading > 30% of channels gets its election score cut by 60%.
+11. **Leader concentration prevention — anti-affinity at 30% threshold, applied at *placement* time.** Configured via `AntiAffinityConfig::leadership_concentration_threshold` (default 0.30) + `AntiAffinityConfig::leadership_concentration_penalty` (default 0.4) — both from Capability §7. The penalty multiplies the candidate's score per the locked multiplicative composition rule, so a node already leading > 30% of channels has its *replica-set membership* score cut by 60% — making it less likely to be chosen as a replica in the first place. Election itself doesn't apply anti-affinity (it picks the most-central among already-chosen replicas); the concentration prevention is upstream at Phase C placement.
 
 ---
 
@@ -653,14 +676,14 @@ When any of these activate, ship as part of The Warriors release alongside the o
 This phase consumes (hard prerequisites — see [Locked decisions §1, §2](#hard-prerequisites-must-ship-before-phase-c)):
 
 - **Capability Phase B (tag-discovery primitives).** `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders` for replica advertisement, graceful retraction, and leader resolution. RedEX Phases C/D/E cannot start until this lands.
-- **Capability Phase F (`PlacementFilter`).** `placement_score` for `Artifact::Replica`, `IntentRegistry`, `AntiAffinityConfig`, `ProximityGraph::nearest_rtt`. Consumed by RedEX's placement-scored election, top-N replica selection, and leader-concentration anti-affinity. RedEX Phases C and E cannot start until this lands.
+- **Capability Phase F (`PlacementFilter`).** `placement_score` for `Artifact::Replica`, `IntentRegistry`, `AntiAffinityConfig`. Consumed by RedEX's *replica placement* (Phase C) only — top-N replica selection at construction time. Election (Phase E) is `PlacementFilter`-free; uses only the proximity graph + NodeId ordering.
 - **Capability Phase E (federated query primitives).** Used internally for operator-facing introspection ("which replicas hold this chain across the mesh"). Not on the critical path; useful for ops dashboards.
 
 This phase produces:
 
 - A `causal:` capability-tag emitter / withdrawer lifecycle that other Warriors phases consume (Phase 1 greedy reads from the same tag advertisements).
-- A `MeshDaemon`-shaped daemon that demonstrates `PlacementFilter` consumption (template for future placement-driven daemons).
-- A reference for "RedEX-local election composing on top of `StandbyGroup` membership/failure-detection," documenting the Option-B separation-of-concerns that `groups::standby` doesn't subsume.
+- A `MeshDaemon`-shaped daemon that demonstrates `PlacementFilter` consumption at placement time (template for future placement-driven daemons).
+- A reference for "deterministic decentralised election composing on top of `StandbyGroup` membership/failure-detection" — the pluggable selection-fn pattern for RedEX-style append-only-log replication, distinct from the daemon-migration "highest synced_through" default.
 - DST scenarios that other Warriors phases can extend (partition + restart sequences applicable to the discovery primitive's announcement traffic, the placement filter's scoring under churn, etc.).
 
 ---
