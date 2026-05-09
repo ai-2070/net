@@ -1028,10 +1028,10 @@ impl CapabilitySet {
     // `CapabilitySet`) is invisible at the consumer level.
     //
     // Uses the bijection helpers from `behavior::tag_codec`. Today
-    // computed on demand (no field change); Phase A.5.2 may
-    // introduce internal `tag_set: HashSet<Tag>` storage as a
-    // performance optimization. Either way, the surface stays
-    // stable.
+    // computed on demand (no field change); Phase A.5.N introduces
+    // internal `tag_set: HashSet<Tag>` storage as the source of truth
+    // and removes the typed-struct fields. Either way, the surface
+    // below stays stable.
     //
     // Migration path for downstream code:
     //
@@ -1040,11 +1040,22 @@ impl CapabilitySet {
     // if caps.hardware.gpu.is_some() { ... }
     // for tag in &caps.tags { ... }
     //
-    // // After (typed-tag access):
+    // // After (read via the projection — canonical):
+    // let views = caps.views();
+    // if views.hardware.gpu.is_some() { ... }
+    // for model in &views.models { ... }
+    //
+    // // Or directly through the `From` impl when only one field is needed:
     // if HardwareCapabilities::from(&caps).gpu.is_some() { ... }
-    //   //                                  -- via Phase A.4 helpers
+    //
+    // // Tags survive Phase A.5.N as a top-level field; iterate as before:
+    // for tag in &caps.tags { ... }
+    //
+    // // Or read the typed-tag set (Phase A.5.1):
     // for tag in caps.typed_tags() { ... }
-    //   //         -- via this method (Phase A.5.1)
+    //
+    // // Writes go through the typed setters (Phase A.5.6):
+    // caps.set_hardware(new_hw);
     // ```
     //
     // Application code that needs to compose with federated query
