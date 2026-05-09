@@ -323,6 +323,7 @@
 @keyframes glitch-banner {
   0%,
   88.9% {
+    --color-accent: #c4ff3d;
     transform: translate(0, 0);
   }
   89%,
@@ -332,6 +333,7 @@
   }
   89.9%,
   92.9% {
+    --color-accent: #c4ff3d;
     transform: translate(0, 0);
   }
   93%,
@@ -341,6 +343,7 @@
   }
   93.4%,
   95.9% {
+    --color-accent: #c4ff3d;
     transform: translate(0, 0);
   }
   96%,
@@ -350,6 +353,7 @@
   }
   96.3%,
   100% {
+    --color-accent: #c4ff3d;
     transform: translate(0, 0);
   }
 }
