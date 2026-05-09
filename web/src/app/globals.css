@@ -312,43 +312,45 @@
   }
 }
 
-/* terminal-style glitch effect for the seed-round announcement banner */
+/* terminal-style glitch effect for the seed-round announcement banner —
+   redefines --color-accent to cyberpunk red so all `text-accent` / `bg-accent`
+   children flip to red during glitch frames, with snap timing via adjacent
+   keyframes (no smooth interpolation between glitch and base). */
 @utility glitch-banner {
   animation: glitch-banner 5.4s infinite;
 }
 
 @keyframes glitch-banner {
   0%,
-  88%,
-  100% {
-    filter: none;
+  88.9% {
     transform: translate(0, 0);
   }
-  89% {
-    filter: invert(0.92);
+  89%,
+  89.8% {
+    --color-accent: #ff003c;
     transform: translate(-1px, 0);
   }
-  89.4% {
-    filter: none;
-    transform: translate(2px, 0);
-  }
-  89.8% {
-    filter: none;
+  89.9%,
+  92.9% {
     transform: translate(0, 0);
   }
-  93% {
-    filter: invert(0.85);
+  93%,
+  93.3% {
+    --color-accent: #ff003c;
     transform: translate(1px, 0);
   }
-  93.3% {
-    filter: none;
+  93.4%,
+  95.9% {
     transform: translate(0, 0);
   }
-  96% {
-    filter: invert(0.75);
-  }
+  96%,
   96.2% {
-    filter: none;
+    --color-accent: #ff003c;
+    transform: translate(0, 0);
+  }
+  96.3%,
+  100% {
+    transform: translate(0, 0);
   }
 }
 
