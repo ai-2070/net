@@ -176,13 +176,15 @@ impl fmt::Display for TagKey {
 /// Parsed capability tag.
 ///
 /// Internal representation; the wire format is the canonical string
-/// returned by [`Tag::display`] / [`fmt::Display`]. Parser is
-/// permissive — see module docs for the
+/// returned by [`fmt::Display`]. Custom `Serialize` / `Deserialize`
+/// impls below render Tag → string and parse string → Tag, so a
+/// `HashSet<Tag>` rides over the wire as a JSON string array
+/// (`["hardware.gpu", "scope:tenant:foo", ...]`). The internal
+/// enum shape is an implementation detail callers don't see.
+///
+/// Parser is permissive — see module docs for the
 /// `parse` (internal) vs. `parse_user` (application) split.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Tag {
     /// Axis-prefixed presence tag with no value.
     /// Wire form: `<axis>.<key>` (e.g. `hardware.gpu`).
@@ -402,6 +404,35 @@ impl fmt::Display for Tag {
             Self::Reserved { prefix, body } => write!(f, "{prefix}{body}"),
             Self::Legacy(s) => f.write_str(s),
         }
+    }
+}
+
+// =============================================================================
+// Serde — wire format is the canonical Display string.
+//
+// Phase A.5.N.2: a `HashSet<Tag>` rides over the wire as a JSON
+// string array (`["hardware.gpu", "scope:tenant:foo", "myteam-tag"]`).
+// The internal enum shape is an implementation detail; the wire
+// shape is the same byte-for-byte string the substrate's tag wire
+// format already pins.
+//
+// `serde(tag = "kind")` (the previous derive form) couldn't handle
+// `Tag::Legacy(String)` because internally-tagged enums require
+// every variant to be a struct or unit variant. The canonical-string
+// representation sidesteps that and matches the wire form callers
+// already expect via `Tag::to_string()` / `Tag::parse()`.
+// =============================================================================
+
+impl Serialize for Tag {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Tag {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 

@@ -476,19 +476,26 @@ impl DiffEngine {
         ops
     }
 
-    /// Diff tags between old and new
-    fn diff_tags(old: &[String], new: &[String], ops: &mut Vec<DiffOp>) {
-        let old_set: HashSet<&str> = old.iter().map(|s| s.as_str()).collect();
-        let new_set: HashSet<&str> = new.iter().map(|s| s.as_str()).collect();
-
+    /// Diff tags between old and new.
+    ///
+    /// Phase A.5.N.2: signature operates on `&HashSet<Tag>`. The
+    /// wire-form difference is computed by rendering each tag to
+    /// its canonical string (`Tag::to_string`); diff ops are still
+    /// `String`-typed so older diff payloads decode unchanged on
+    /// the receiving side.
+    fn diff_tags(
+        old: &HashSet<crate::adapter::net::behavior::tag::Tag>,
+        new: &HashSet<crate::adapter::net::behavior::tag::Tag>,
+        ops: &mut Vec<DiffOp>,
+    ) {
         // Removed tags
-        for tag in old_set.difference(&new_set) {
-            ops.push(DiffOp::RemoveTag((*tag).to_string()));
+        for tag in old.difference(new) {
+            ops.push(DiffOp::RemoveTag(tag.to_string()));
         }
 
         // Added tags
-        for tag in new_set.difference(&old_set) {
-            ops.push(DiffOp::AddTag((*tag).to_string()));
+        for tag in new.difference(old) {
+            ops.push(DiffOp::AddTag(tag.to_string()));
         }
     }
 
@@ -760,19 +767,29 @@ impl DiffEngine {
         // are gone), the setter bodies re-encode into the underlying
         // tag set; this function does not need to change again.
         //
-        // `caps.tags` stays as direct `Vec<String>` access — tags
-        // are a top-level field on `CapabilitySet` and survive
-        // Phase A.5.N unchanged.
+        // `caps.tags` is a `HashSet<Tag>` (post Phase A.5.N.2);
+        // AddTag/RemoveTag wire payloads are still String, so we
+        // parse each one through `Tag::parse` (permissive — wire
+        // payloads come from peer nodes that are authoritative for
+        // the value). A malformed tag string is treated as "no-op"
+        // for AddTag and "not found" for RemoveTag.
         match op {
             DiffOp::AddTag(tag) => {
-                if !caps.tags.contains(tag) {
-                    caps.tags.push(tag.clone());
+                if let Ok(parsed) = crate::adapter::net::behavior::tag::Tag::parse(tag) {
+                    caps.tags.insert(parsed);
                 }
             }
             DiffOp::RemoveTag(tag) => {
-                if let Some(pos) = caps.tags.iter().position(|t| t == tag) {
-                    caps.tags.remove(pos);
-                } else if strict {
+                let parsed = match crate::adapter::net::behavior::tag::Tag::parse(tag) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        if strict {
+                            return Err(DiffError::TagNotFound(tag.clone()));
+                        }
+                        return Ok(());
+                    }
+                };
+                if !caps.tags.remove(&parsed) && strict {
                     return Err(DiffError::TagNotFound(tag.clone()));
                 }
             }
@@ -1081,7 +1098,7 @@ mod tests {
     fn test_diff_add_tag() {
         let old = sample_capability_set();
         let mut new = old.clone();
-        new.tags.push("training".into());
+        new = new.add_tag("training");
 
         let ops = DiffEngine::diff(&old, &new);
         assert_eq!(ops.len(), 1);
@@ -1092,7 +1109,11 @@ mod tests {
     fn test_diff_remove_tag() {
         let old = sample_capability_set();
         let mut new = old.clone();
-        new.tags.retain(|t| t != "inference");
+        // Phase A.5.N.2: tags is HashSet<Tag>. Remove the legacy
+        // "inference" tag by re-parsing it and calling HashSet::remove.
+        let inference = crate::adapter::net::behavior::tag::Tag::parse("inference")
+            .expect("legacy tag parse");
+        new.tags.remove(&inference);
 
         let ops = DiffEngine::diff(&old, &new);
         assert_eq!(ops.len(), 1);
@@ -1219,9 +1240,12 @@ mod tests {
         let old = sample_capability_set();
         let mut new = old.clone();
 
-        // Make several changes
-        new.tags.push("training".into());
-        new.tags.retain(|t| t != "inference");
+        // Make several changes. Phase A.5.N.2: tags is HashSet<Tag>;
+        // use add_tag to add, parse+remove to remove.
+        new = new.add_tag("training");
+        let inference = crate::adapter::net::behavior::tag::Tag::parse("inference")
+            .expect("legacy tag parse");
+        new.tags.remove(&inference);
         new.models[0].loaded = false;
         new.models[0].tokens_per_sec = 100;
         new.hardware.memory_mb = 131072;

@@ -98,9 +98,16 @@ impl SubnetPolicy {
     pub fn assign(&self, caps: &CapabilitySet) -> SubnetId {
         let mut levels = [0u8; 4];
 
+        // Phase A.5.N.2: caps.tags is HashSet<Tag>; render each tag
+        // to its wire-form string AND sort lexicographically so
+        // the first-match-wins resolution is deterministic across
+        // runs (HashSet iteration order is unspecified).
+        let mut tag_strings: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+        tag_strings.sort();
+
         for rule in &self.rules {
-            for tag in &caps.tags {
-                if let Some(value) = tag.strip_prefix(&rule.tag_prefix) {
+            for s in &tag_strings {
+                if let Some(value) = s.strip_prefix(&rule.tag_prefix) {
                     if let Some(&level_value) = rule.values.get(value) {
                         levels[rule.level as usize] = level_value;
                         break; // first match wins for this rule
@@ -361,30 +368,31 @@ mod tests {
 
     /// First matching tag wins *within* a single rule — a second
     /// tag for the same rule is ignored (the `break` in `assign`).
-    /// Combined with rule order, this fully determines which value
-    /// lands in the level slot.
+    /// Phase A.5.N.2: tags are now `HashSet<Tag>` (unordered);
+    /// `assign()` sorts tag strings lexicographically before the
+    /// first-match scan, so the result is deterministic regardless
+    /// of insertion order.
     #[test]
     fn first_tag_wins_within_a_single_rule() {
         let policy =
             SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 1).map("eu", 2));
 
-        // Tag order on the capability set is iterated in insertion
-        // order (CapabilitySet uses a Vec). Whichever tag hits the
-        // values map first wins — pinning declaration/insertion
-        // order is the contract.
+        // Both insertions converge on the same answer — the
+        // lexicographically-first matching tag wins. `region:eu`
+        // sorts before `region:us`, so 2 (eu's level value) wins
+        // regardless of which tag was inserted first.
         let caps = caps_with_tags(&["region:us", "region:eu"]);
         assert_eq!(
             policy.assign(&caps),
-            SubnetId::new(&[1]),
-            "first matching tag wins for a rule; subsequent matches are ignored",
+            SubnetId::new(&[2]),
+            "lexicographically-first matching tag wins (`region:eu` < `region:us`)",
         );
 
         let caps = caps_with_tags(&["region:eu", "region:us"]);
         assert_eq!(
             policy.assign(&caps),
             SubnetId::new(&[2]),
-            "swapping tag order swaps which one wins — first-wins is \
-             insensitive to values-map ordering, only to tag iteration order",
+            "insertion order is irrelevant — the same tag still wins",
         );
     }
 

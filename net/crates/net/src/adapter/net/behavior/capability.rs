@@ -19,6 +19,8 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::adapter::net::behavior::tag::Tag;
+
 // ============================================================================
 // Hardware Capabilities
 // ============================================================================
@@ -669,24 +671,35 @@ pub(crate) enum CapabilityScope {
     },
 }
 
-/// Resolve a list of `CapabilitySet::tags` into the
-/// announcer's effective [`CapabilityScope`]. Empty tenant /
-/// region values (`scope:tenant:` with no id) are silently dropped
-/// — defensive, since reading them as the empty string would let
-/// a peer match any tenant query that also had an empty id.
-pub(crate) fn scope_from_tags(tags: &[String]) -> CapabilityScope {
+/// Resolve a `CapabilitySet::tags` set into the announcer's
+/// effective [`CapabilityScope`]. Empty tenant / region values
+/// (`scope:tenant:` with no id) are silently dropped — defensive,
+/// since reading them as the empty string would let a peer match
+/// any tenant query that also had an empty id.
+///
+/// Phase A.5.N.2: signature now takes `&HashSet<Tag>`. Inspects
+/// `Tag::Reserved` variants where prefix is `scope:`. The body
+/// of those reserved tags is the post-`scope:` substring, e.g.
+/// `tenant:foo` / `region:eu-west` / `subnet-local`.
+pub(crate) fn scope_from_tags(tags: &HashSet<Tag>) -> CapabilityScope {
     let mut tenants = Vec::new();
     let mut regions = Vec::new();
     let mut subnet_local = false;
 
-    for t in tags {
-        if t == TAG_SCOPE_SUBNET_LOCAL {
+    for tag in tags {
+        let Tag::Reserved { prefix, body } = tag else {
+            continue;
+        };
+        if prefix.as_str() != "scope:" {
+            continue;
+        }
+        if body == "subnet-local" {
             subnet_local = true;
-        } else if let Some(id) = t.strip_prefix(TAG_SCOPE_TENANT_PREFIX) {
+        } else if let Some(id) = body.strip_prefix("tenant:") {
             if !id.is_empty() {
                 tenants.push(id.to_string());
             }
-        } else if let Some(name) = t.strip_prefix(TAG_SCOPE_REGION_PREFIX) {
+        } else if let Some(name) = body.strip_prefix("region:") {
             if !name.is_empty() {
                 regions.push(name.to_string());
             }
@@ -820,8 +833,24 @@ pub struct CapabilitySet {
     pub models: Vec<ModelCapability>,
     /// Tool capabilities
     pub tools: Vec<ToolCapability>,
-    /// Custom tags for filtering
-    pub tags: Vec<String>,
+    /// Typed tag set.
+    ///
+    /// Phase A.5.N.2 conversion from `Vec<String>` → `HashSet<Tag>`.
+    /// Holds:
+    ///
+    /// - `Tag::Reserved` cross-axis tags (`scope:tenant:foo`,
+    ///   `causal:<hex>`, `fork-of:<hex>`, `heat:*`).
+    /// - `Tag::Legacy` untyped tags (free-form strings, e.g.
+    ///   `nat:full-cone` / `nrpc:<service>`).
+    /// - In Phase A.5.N.3 (the next commit) this also absorbs the
+    ///   axis-prefixed tags currently encoded by the typed-struct
+    ///   fields, after which those fields are removed.
+    ///
+    /// Wire format ships the set as-is (substrate plan §1).
+    /// Deterministic emission order, when needed, is the caller's
+    /// responsibility — sort by `Tag::to_string()`.
+    #[serde(default)]
+    pub tags: HashSet<Tag>,
     /// Resource limits
     pub limits: ResourceLimits,
     /// Free-form key-value metadata.
@@ -891,9 +920,18 @@ impl CapabilitySet {
         self
     }
 
-    /// Add tag
+    /// Add a tag (parsed via the application-facing parser, which
+    /// rejects reserved cross-axis prefixes — use the dedicated
+    /// scope helpers for those). Untyped strings parse as
+    /// `Tag::Legacy`; axis-prefixed strings (`hardware.gpu`,
+    /// `software.os=linux`) parse as `AxisPresent` / `AxisValue`.
+    /// Empty tags and reserved-prefix tags are silently dropped
+    /// (the parser returns `Err` and we ignore it).
     pub fn add_tag(mut self, tag: impl Into<String>) -> Self {
-        self.tags.push(tag.into());
+        let s: String = tag.into();
+        if let Ok(t) = Tag::parse_user(&s) {
+            self.tags.insert(t);
+        }
         self
     }
 
@@ -908,8 +946,8 @@ impl CapabilitySet {
             return self;
         }
         let tag = format!("{TAG_SCOPE_TENANT_PREFIX}{id}");
-        if !self.tags.iter().any(|t| t == &tag) {
-            self.tags.push(tag);
+        if let Ok(t) = Tag::parse(&tag) {
+            self.tags.insert(t);
         }
         self
     }
@@ -923,8 +961,8 @@ impl CapabilitySet {
             return self;
         }
         let tag = format!("{TAG_SCOPE_REGION_PREFIX}{name}");
-        if !self.tags.iter().any(|t| t == &tag) {
-            self.tags.push(tag);
+        if let Ok(t) = Tag::parse(&tag) {
+            self.tags.insert(t);
         }
         self
     }
@@ -935,8 +973,8 @@ impl CapabilitySet {
     /// set are ignored by the scope resolver while
     /// `scope:subnet-local` is set. Idempotent.
     pub fn with_subnet_local_scope(mut self) -> Self {
-        if !self.tags.iter().any(|t| t == TAG_SCOPE_SUBNET_LOCAL) {
-            self.tags.push(TAG_SCOPE_SUBNET_LOCAL.to_string());
+        if let Ok(t) = Tag::parse(TAG_SCOPE_SUBNET_LOCAL) {
+            self.tags.insert(t);
         }
         self
     }
@@ -1029,9 +1067,18 @@ impl CapabilitySet {
         self.tools = tools;
     }
 
-    /// Check if has a specific tag
+    /// Check if has a specific tag.
+    ///
+    /// The query string is parsed via the permissive parser
+    /// ([`Tag::parse`]) so reserved-prefix queries (`scope:tenant:foo`)
+    /// resolve correctly. Set membership is exact: a query for
+    /// `hardware.gpu` matches the AxisPresent tag, not an
+    /// AxisValue with a different value.
     pub fn has_tag(&self, tag: &str) -> bool {
-        self.tags.iter().any(|t| t == tag)
+        let Ok(parsed) = Tag::parse(tag) else {
+            return false;
+        };
+        self.tags.contains(&parsed)
     }
 
     /// Check if has a specific model
@@ -1958,12 +2005,16 @@ impl CapabilityIndex {
         // independently and survive Phase A.5.N).
         let views = caps.views();
 
-        // Tags
+        // Tags. `by_tag` is keyed by `String` (the wire-form
+        // rendering) so query() can look up tags by their string
+        // representation regardless of which Tag variant they
+        // round-trip through. Phase A.5.N.2: render Tag → wire string.
         for tag in &caps.tags {
-            if let Some(mut set) = self.by_tag.get_mut(tag) {
+            let key = tag.to_string();
+            if let Some(mut set) = self.by_tag.get_mut(&key) {
                 set.insert(node_id);
             } else {
-                self.by_tag.entry(tag.clone()).or_default().insert(node_id);
+                self.by_tag.entry(key).or_default().insert(node_id);
             }
         }
 
@@ -2019,10 +2070,11 @@ impl CapabilityIndex {
 
         // Tags
         for tag in &caps.tags {
-            if let Some(mut set) = self.by_tag.get_mut(tag) {
+            let key = tag.to_string();
+            if let Some(mut set) = self.by_tag.get_mut(&key) {
                 set.remove(&node_id);
             }
-            self.by_tag.remove_if(tag, |_, set| set.is_empty());
+            self.by_tag.remove_if(&key, |_, set| set.is_empty());
         }
 
         // Models
@@ -2496,10 +2548,10 @@ mod tests {
         for i in 0..100 {
             let mut caps = sample_capability_set();
             if i % 2 == 0 {
-                caps.tags.push("even".into());
+                caps = caps.add_tag("even");
             }
             if i % 3 == 0 {
-                caps.tags.push("divisible_by_3".into());
+                caps = caps.add_tag("divisible_by_3");
             }
 
             let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
@@ -3253,10 +3305,10 @@ mod tests {
             // sample_capability_set already has tag "inference" + "gpu"; vary
             // additional tags so filters discriminate.
             if i % 2 == 0 {
-                caps.tags.push("even".into());
+                caps = caps.add_tag("even");
             }
             if i % 3 == 0 {
-                caps.tags.push("triple".into());
+                caps = caps.add_tag("triple");
             }
             let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
             index.index(ann);
@@ -3295,7 +3347,7 @@ mod tests {
             let mut caps = sample_capability_set();
             // Discriminator tag.
             if i % 4 == 0 {
-                caps.tags.push("preferred".into());
+                caps = caps.add_tag("preferred");
             }
             // Vary memory so `prefer_memory` produces a real ordering.
             caps.hardware.memory_mb = 1024 * (i as u32 + 1);
@@ -3421,16 +3473,26 @@ mod tests {
     // Scope helpers (`scope_from_tags` + `matches_scope`)
     // ========================================================================
 
+    /// Phase A.5.N.2: scope tests now exercise `&HashSet<Tag>`.
+    /// Helper parses each input string through the permissive
+    /// `Tag::parse` so reserved-prefix tags (`scope:tenant:foo`)
+    /// land as `Tag::Reserved`, mirroring real wire-form decoding.
+    fn tags_from(strs: &[&str]) -> HashSet<Tag> {
+        strs.iter()
+            .filter_map(|s| Tag::parse(s).ok())
+            .collect()
+    }
+
     #[test]
     fn scope_from_tags_no_scope_tag_is_global() {
-        assert!(matches!(scope_from_tags(&[]), CapabilityScope::Global));
+        assert!(matches!(scope_from_tags(&tags_from(&[])), CapabilityScope::Global));
         assert!(matches!(
-            scope_from_tags(&["gpu".to_string(), "model:llama3".to_string()]),
+            scope_from_tags(&tags_from(&["gpu", "model:llama3"])),
             CapabilityScope::Global
         ));
         // Explicit `scope:global` resolves the same as no tag.
         assert!(matches!(
-            scope_from_tags(&[TAG_SCOPE_GLOBAL.to_string()]),
+            scope_from_tags(&tags_from(&[TAG_SCOPE_GLOBAL])),
             CapabilityScope::Global
         ));
     }
@@ -3439,33 +3501,35 @@ mod tests {
     fn scope_from_tags_subnet_local_wins() {
         // Even with tenants and regions present, `subnet-local` is
         // the strictest form and dominates.
-        let tags = vec![
-            TAG_SCOPE_SUBNET_LOCAL.to_string(),
-            format!("{TAG_SCOPE_TENANT_PREFIX}foo"),
-            format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
-        ];
+        let tags = tags_from(&[
+            TAG_SCOPE_SUBNET_LOCAL,
+            &format!("{TAG_SCOPE_TENANT_PREFIX}foo"),
+            &format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
+        ]);
         assert_eq!(scope_from_tags(&tags), CapabilityScope::SubnetLocal);
     }
 
     #[test]
     fn scope_from_tags_multiple_tenants() {
-        let tags = vec![
-            format!("{TAG_SCOPE_TENANT_PREFIX}a"),
-            format!("{TAG_SCOPE_TENANT_PREFIX}b"),
-            "gpu".to_string(),
-        ];
+        let tags = tags_from(&[
+            &format!("{TAG_SCOPE_TENANT_PREFIX}a"),
+            &format!("{TAG_SCOPE_TENANT_PREFIX}b"),
+            "gpu",
+        ]);
         match scope_from_tags(&tags) {
-            CapabilityScope::Tenants(ts) => {
+            CapabilityScope::Tenants(mut ts) => {
+                // HashSet iteration is unordered; sort for stable comparison.
+                ts.sort();
                 assert_eq!(ts, vec!["a".to_string(), "b".to_string()]);
             }
             other => panic!("expected Tenants, got {other:?}"),
         }
 
         // Empty tenant id is silently dropped.
-        let tags = vec![
-            format!("{TAG_SCOPE_TENANT_PREFIX}"),
-            format!("{TAG_SCOPE_TENANT_PREFIX}real"),
-        ];
+        let tags = tags_from(&[
+            &format!("{TAG_SCOPE_TENANT_PREFIX}"),
+            &format!("{TAG_SCOPE_TENANT_PREFIX}real"),
+        ]);
         match scope_from_tags(&tags) {
             CapabilityScope::Tenants(ts) => assert_eq!(ts, vec!["real".to_string()]),
             other => panic!("expected Tenants, got {other:?}"),
@@ -3474,10 +3538,10 @@ mod tests {
 
     #[test]
     fn scope_from_tags_tenants_and_regions() {
-        let tags = vec![
-            format!("{TAG_SCOPE_TENANT_PREFIX}oem-123"),
-            format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
-        ];
+        let tags = tags_from(&[
+            &format!("{TAG_SCOPE_TENANT_PREFIX}oem-123"),
+            &format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
+        ]);
         match scope_from_tags(&tags) {
             CapabilityScope::TenantsAndRegions { tenants, regions } => {
                 assert_eq!(tenants, vec!["oem-123".to_string()]);
@@ -3575,10 +3639,13 @@ mod tests {
             .with_tenant_scope("oem-123")
             .with_tenant_scope("oem-123") // duplicate
             .with_tenant_scope(""); // empty — silently dropped
-        let tenant_tags: Vec<&String> = caps
+        // Phase A.5.N.2: tags are typed; render to wire form
+        // for prefix-string filtering.
+        let tenant_tags: Vec<String> = caps
             .tags
             .iter()
-            .filter(|t| t.starts_with(TAG_SCOPE_TENANT_PREFIX))
+            .map(|t| t.to_string())
+            .filter(|s| s.starts_with(TAG_SCOPE_TENANT_PREFIX))
             .collect();
         assert_eq!(
             tenant_tags.len(),
@@ -3612,10 +3679,11 @@ mod tests {
             .with_tenant_scope("oem-123")
             .with_subnet_local_scope()
             .with_subnet_local_scope(); // idempotent
-        let local_tags: Vec<&String> = caps_local
+        let local_tags: Vec<String> = caps_local
             .tags
             .iter()
-            .filter(|t| t.as_str() == TAG_SCOPE_SUBNET_LOCAL)
+            .map(|t| t.to_string())
+            .filter(|s| s.as_str() == TAG_SCOPE_SUBNET_LOCAL)
             .collect();
         assert_eq!(local_tags.len(), 1);
         assert_eq!(
@@ -3766,38 +3834,34 @@ mod tests {
 
     #[test]
     fn wire_format_serialization_snapshot() {
-        // Pin the current JSON wire-format shape so Phase A.5.2's
-        // field-set migration is loud. If this test fails after
+        // Pin the current JSON wire-format shape so Phase A.5.N.3's
+        // typed-field removal is loud. If this test fails after
         // a CapabilitySet field change, the diff IS the wire-
         // format break and downstream consumers need migration.
         //
-        // Snapshot a minimal CapabilitySet (one tag, one cpu
-        // count) so the snapshot is short + readable. Full-set
-        // snapshots would be brittle (every model/tool field
-        // bumping the snapshot for cosmetic reasons).
+        // Phase A.5.N.2: tags went from `["inference"]` to
+        // `["inference"]` (still string array — Tag's custom serde
+        // renders to its Display form). Typed fields (hardware /
+        // software / models / tools / limits) still ship as their
+        // own keys; A.5.N.3 collapses them into the tag set.
         let caps = CapabilitySet::new()
             .with_hardware(HardwareCapabilities::new().with_cpu(8, 16))
             .add_tag("inference");
         let json = String::from_utf8(caps.to_bytes()).unwrap();
-        // Pin the exact field-list shape. The current wire format
-        // is `{ "hardware": {...}, "software": {...}, "models":
-        // [...], "tools": [...], "tags": [...], "limits": {...} }`.
-        // After Phase A.5.2 the shape becomes `{ "tags": [...],
-        // "metadata": {...} }` (Phase C adds metadata). This test
-        // failing after that change IS the migration signal —
-        // downstream readers need to be updated in lockstep.
         assert!(json.contains("\"hardware\":"), "missing hardware field: {json}");
         assert!(json.contains("\"software\":"), "missing software field: {json}");
         assert!(json.contains("\"models\":"), "missing models field: {json}");
         assert!(json.contains("\"tools\":"), "missing tools field: {json}");
         assert!(json.contains("\"tags\":[\"inference\"]"), "missing tags field: {json}");
         assert!(json.contains("\"limits\":"), "missing limits field: {json}");
+        // Phase A.5.N.1 metadata field (always emitted; defaults to {}).
+        assert!(json.contains("\"metadata\":"), "missing metadata field: {json}");
     }
 
     #[test]
     fn wire_format_round_trips_through_json() {
         // Pinned: a CapabilitySet round-trips through `to_bytes` →
-        // `from_bytes`. Phase A.5.2's wire format change must
+        // `from_bytes`. Phase A.5.N.2's wire format change must
         // preserve this property — a CapabilitySet built via the
         // typed builder methods then serialized then deserialized
         // produces an equal value. Test against a non-trivial

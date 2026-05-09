@@ -839,18 +839,12 @@ pub fn capability_set_to_tag_set(caps: &CapabilitySet) -> HashSet<Tag> {
     all.extend(models_to_tags(&caps.models));
     all.extend(tools_to_tags(&caps.tools));
     all.extend(resource_limits_to_tags(&caps.limits));
-    // Legacy `Vec<String>` carrier. Tags that already conform to
-    // axis-prefixed shapes parse cleanly; reserved-prefix tags
-    // (`scope:tenant:foo`, `causal:<hex>`) parse as
-    // `Tag::Reserved` and ride through; truly untyped strings
-    // become `Tag::Legacy` which the deprecation window allows.
-    for s in &caps.tags {
-        if let Ok(tag) = Tag::parse(s) {
-            all.insert(tag);
-        }
-        // Empty tag strings parse as `CapabilityTagError::Empty`
-        // and are silently dropped — no point keeping them.
-    }
+    // Phase A.5.N.2: caps.tags is now `HashSet<Tag>` (no parse
+    // step needed). Reserved tags (`scope:*`, `causal:*`) and
+    // legacy untyped tags ride through as-is. Axis-prefixed tags
+    // that the per-struct encoders also produce dedupe via
+    // HashSet::insert.
+    all.extend(caps.tags.iter().cloned());
     all
 }
 
@@ -893,31 +887,27 @@ pub fn capability_set_from_tag_set(tags: &HashSet<Tag>) -> CapabilitySet {
     let tools = tools_from_tags(&tag_vec);
     let limits = resource_limits_from_tags(&tag_vec);
 
-    // Reconstruct the legacy `tags: Vec<String>` carrier from tags
-    // that the per-struct decoders don't claim. Reserved-prefix
-    // tags (`scope:*`, `causal:*`) and unknown axis-prefixed tags
-    // are preserved here so reserved-prefix consumers (e.g. the
-    // scope resolver) keep working through Phase A.5.0c.
+    // Reconstruct the residual tag set: every tag the per-struct
+    // decoders don't claim. Reserved-prefix tags (`scope:*`,
+    // `causal:*`) and unknown axis-prefixed tags ride through here
+    // so reserved-prefix consumers (e.g. the scope resolver) keep
+    // working.
     //
-    // What goes in: every Reserved tag, every Legacy tag, and any
-    // AxisPresent / AxisValue tag whose key isn't recognized by
-    // any of the per-struct decoders above.
-    let mut legacy_tags: Vec<String> = tags
+    // Phase A.5.N.2: `CapabilitySet::tags` is `HashSet<Tag>`, so
+    // we keep the typed values directly rather than rendering to
+    // strings.
+    let leftover_tags: HashSet<Tag> = tags
         .iter()
         .filter(|t| !is_struct_owned_tag(t))
-        .map(|t| t.to_string())
+        .cloned()
         .collect();
-    // Stable ordering for the legacy carrier — HashSet iteration
-    // order is undefined; deterministic output makes round-trip
-    // tests reproducible. Sort by wire form.
-    legacy_tags.sort();
 
     CapabilitySet {
         hardware,
         software,
         models,
         tools,
-        tags: legacy_tags,
+        tags: leftover_tags,
         limits,
         // tag_set bijection doesn't touch metadata — that's a
         // separate field carrying schemas / intent / colocation
@@ -1856,7 +1846,8 @@ mod tests {
         // Hardware fields preserved.
         assert_eq!(caps2.hardware.cpu_cores, 8);
         // Legacy carrier holds only the untyped tag.
-        assert_eq!(caps2.tags, vec!["inference".to_string()]);
+        let leftover: Vec<String> = caps2.tags.iter().map(|t| t.to_string()).collect();
+        assert_eq!(leftover, vec!["inference".to_string()]);
     }
 
     #[test]
@@ -1870,7 +1861,8 @@ mod tests {
         // Only the non-empty tag survives.
         assert_eq!(tag_set.len(), 1);
         let caps2 = capability_set_from_tag_set(&tag_set);
-        assert_eq!(caps2.tags, vec!["real-tag".to_string()]);
+        let leftover: Vec<String> = caps2.tags.iter().map(|t| t.to_string()).collect();
+        assert_eq!(leftover, vec!["real-tag".to_string()]);
     }
 
     #[test]
