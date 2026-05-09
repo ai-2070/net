@@ -34,6 +34,7 @@ net/crates/net/bindings/python/python/**/__pycache__/
 
 # Lockfiles
 package-lock.json
+!web/package-lock.json
 
 # Copies of libraries
 memex/
