@@ -1,0 +1,932 @@
+//! Capability predicate AST — Phase A foundation for the federated
+//! query primitives in `CAPABILITY_SYSTEM_PLAN.md` §6a.
+//!
+//! Ships the `Predicate` enum with all 17 variants the substrate plan
+//! pins, an evaluator that takes a `(tags, metadata)` context, and
+//! constructor helpers + the `pred!` macro that the cross-binding
+//! SDK plan exposes language-idiomatic builders for.
+//!
+//! ## Variants
+//!
+//! Existence + equality (axis tags):
+//! - [`Predicate::Exists`] — tag with this `(axis, key)` is present.
+//! - [`Predicate::Equals`] — tag's value matches exactly.
+//!
+//! Numeric (axis tags whose value parses to `f64`):
+//! - [`Predicate::NumericAtLeast`] / [`Predicate::NumericAtMost`] / [`Predicate::NumericInRange`]
+//!
+//! Semver (axis tags whose value parses to `MAJOR.MINOR.PATCH`):
+//! - [`Predicate::SemverAtLeast`] / [`Predicate::SemverAtMost`]
+//! - [`Predicate::SemverCompatible`] — same major-version family
+//!   (or, for `0.x.y`, same minor) per the standard semver
+//!   compatibility rules.
+//!
+//! String (axis tag values):
+//! - [`Predicate::StringPrefix`] — value starts with the prefix.
+//! - [`Predicate::StringMatches`] — value contains the substring.
+//!   Phase E will swap this to regex behind the existing `regex`
+//!   feature gate; semantics today are substring-only.
+//!
+//! Metadata (the `BTreeMap<String, String>` field added in Phase C):
+//! - [`Predicate::MetadataExists`] / [`Predicate::MetadataEquals`]
+//! - [`Predicate::MetadataMatches`] (substring; same Phase-E swap)
+//! - [`Predicate::MetadataNumericAtLeast`]
+//!
+//! Boolean composition:
+//! - [`Predicate::And`] / [`Predicate::Or`] / [`Predicate::Not`]
+//!
+//! ## Evaluation
+//!
+//! `Predicate::evaluate` is a pure function over [`EvalContext`]
+//! (`(tags, metadata)`) — no I/O, no allocation outside what the
+//! pattern variants explicitly need (regex compilation lands with
+//! the Phase E swap). Numeric / semver parse failures evaluate to
+//! `false` rather than panicking; cross-binding queries should not
+//! fault on a malformed tag value.
+
+use std::collections::BTreeMap;
+
+use crate::adapter::net::behavior::tag::{Tag, TagKey};
+
+// =============================================================================
+// EvalContext
+// =============================================================================
+
+/// `(tags, metadata)` context passed to [`Predicate::evaluate`].
+/// Decoupled from `CapabilitySet` so the predicate evaluator works
+/// against the substrate's pre-Phase-A.5 capability shape AND the
+/// post-migration shape (`tags: HashSet<Tag>`) without churn.
+#[derive(Debug, Clone, Copy)]
+pub struct EvalContext<'a> {
+    /// Tag set against which axis predicates evaluate.
+    pub tags: &'a [Tag],
+    /// Key-value metadata against which metadata predicates evaluate.
+    pub metadata: &'a BTreeMap<String, String>,
+}
+
+impl<'a> EvalContext<'a> {
+    /// Build a context from explicit slices. The most common
+    /// constructor for callers that hold a `Vec<Tag>` or `&[Tag]`.
+    pub fn new(tags: &'a [Tag], metadata: &'a BTreeMap<String, String>) -> Self {
+        Self { tags, metadata }
+    }
+}
+
+// =============================================================================
+// Predicate
+// =============================================================================
+
+/// AST for capability queries. Pure data — clones, equality, and
+/// serde round-trip are the basis of cross-binding wire format.
+///
+/// See module docs for the variant taxonomy.
+// `PartialEq` only because `f64` doesn't implement `Eq` (NaN
+// asymmetry). Predicate equality is structural, not hashable —
+// we never use it as a HashMap key.
+//
+// Serde derive intentionally OMITTED for Phase A. The recursive
+// `Box<Predicate>` + `Vec<Predicate>` shape compounds with the
+// existing `event::*` serializer monomorphization graph and
+// pushes the test-build's recursion-limit / compile-time past
+// the project's budget. Phase E (federated query primitives)
+// adds cross-binding wire format with a flat-tree IR (or
+// postcard, which handles recursion better than serde_json's
+// derive expansion). For Phase A, the AST + evaluator are
+// process-local — no need to serialize.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Predicate {
+    // ---- Axis tags: existence + equality --------------------------------
+    /// Tag with this `(axis, key)` is present (regardless of value).
+    Exists {
+        /// Tag key to probe.
+        key: TagKey,
+    },
+    /// Tag's value matches exactly. Presence-only tags don't match
+    /// (use [`Predicate::Exists`] for that).
+    Equals {
+        /// Tag key.
+        key: TagKey,
+        /// Required value (string-equality).
+        value: String,
+    },
+
+    // ---- Axis tags: numeric ---------------------------------------------
+    /// Tag's value parses to `f64` and is `>= threshold`.
+    NumericAtLeast {
+        /// Tag key.
+        key: TagKey,
+        /// Inclusive lower bound.
+        threshold: f64,
+    },
+    /// Tag's value parses to `f64` and is `<= threshold`.
+    NumericAtMost {
+        /// Tag key.
+        key: TagKey,
+        /// Inclusive upper bound.
+        threshold: f64,
+    },
+    /// Tag's value parses to `f64` and lies in `[min, max]` inclusive.
+    NumericInRange {
+        /// Tag key.
+        key: TagKey,
+        /// Inclusive lower bound.
+        min: f64,
+        /// Inclusive upper bound.
+        max: f64,
+    },
+
+    // ---- Axis tags: semver ----------------------------------------------
+    /// Tag's value parses to `MAJOR.MINOR.PATCH` and is `>= version`.
+    SemverAtLeast {
+        /// Tag key.
+        key: TagKey,
+        /// Reference version.
+        version: String,
+    },
+    /// Tag's value parses to `MAJOR.MINOR.PATCH` and is `<= version`.
+    SemverAtMost {
+        /// Tag key.
+        key: TagKey,
+        /// Reference version.
+        version: String,
+    },
+    /// Tag's value parses to `MAJOR.MINOR.PATCH` and is in the same
+    /// compatibility band: same major for `>= 1.0.0`, same minor for
+    /// `0.x.y`. Mirrors the standard semver caret-compatibility rule.
+    SemverCompatible {
+        /// Tag key.
+        key: TagKey,
+        /// Reference version.
+        version: String,
+    },
+
+    // ---- Axis tags: string ----------------------------------------------
+    /// Tag's value starts with `prefix`.
+    StringPrefix {
+        /// Tag key.
+        key: TagKey,
+        /// Prefix to match.
+        prefix: String,
+    },
+    /// Tag's value contains `pattern` as a substring. Phase E will
+    /// upgrade to regex behind the `regex` feature gate; semantics
+    /// today are substring-only.
+    StringMatches {
+        /// Tag key.
+        key: TagKey,
+        /// Substring pattern.
+        pattern: String,
+    },
+
+    // ---- Metadata -------------------------------------------------------
+    /// Metadata key is present.
+    MetadataExists {
+        /// Metadata key.
+        key: String,
+    },
+    /// Metadata value matches exactly.
+    MetadataEquals {
+        /// Metadata key.
+        key: String,
+        /// Required value (string-equality).
+        value: String,
+    },
+    /// Metadata value contains `pattern` as a substring (same
+    /// substring-only semantics as [`Predicate::StringMatches`]).
+    MetadataMatches {
+        /// Metadata key.
+        key: String,
+        /// Substring pattern.
+        pattern: String,
+    },
+    /// Metadata value parses to `f64` and is `>= threshold`.
+    MetadataNumericAtLeast {
+        /// Metadata key.
+        key: String,
+        /// Inclusive lower bound.
+        threshold: f64,
+    },
+
+    // ---- Boolean composition --------------------------------------------
+    /// Conjunction. Empty `Vec` evaluates to `true` (vacuous match —
+    /// matches the standard math/logic convention; pin in tests).
+    And(Vec<Predicate>),
+    /// Disjunction. Empty `Vec` evaluates to `false` (vacuous miss).
+    Or(Vec<Predicate>),
+    /// Negation.
+    Not(Box<Predicate>),
+}
+
+// =============================================================================
+// Constructors
+// =============================================================================
+
+impl Predicate {
+    /// Build [`Predicate::Exists`] from a [`TagKey`].
+    pub fn exists(key: TagKey) -> Self {
+        Self::Exists { key }
+    }
+
+    /// Build [`Predicate::Equals`] from a key + value.
+    pub fn equals(key: TagKey, value: impl Into<String>) -> Self {
+        Self::Equals {
+            key,
+            value: value.into(),
+        }
+    }
+
+    /// Build [`Predicate::NumericAtLeast`].
+    pub fn numeric_at_least(key: TagKey, threshold: f64) -> Self {
+        Self::NumericAtLeast { key, threshold }
+    }
+
+    /// Build [`Predicate::NumericAtMost`].
+    pub fn numeric_at_most(key: TagKey, threshold: f64) -> Self {
+        Self::NumericAtMost { key, threshold }
+    }
+
+    /// Build [`Predicate::NumericInRange`].
+    pub fn numeric_in_range(key: TagKey, min: f64, max: f64) -> Self {
+        Self::NumericInRange { key, min, max }
+    }
+
+    /// Build [`Predicate::SemverAtLeast`].
+    pub fn semver_at_least(key: TagKey, version: impl Into<String>) -> Self {
+        Self::SemverAtLeast {
+            key,
+            version: version.into(),
+        }
+    }
+
+    /// Build [`Predicate::SemverAtMost`].
+    pub fn semver_at_most(key: TagKey, version: impl Into<String>) -> Self {
+        Self::SemverAtMost {
+            key,
+            version: version.into(),
+        }
+    }
+
+    /// Build [`Predicate::SemverCompatible`].
+    pub fn semver_compatible(key: TagKey, version: impl Into<String>) -> Self {
+        Self::SemverCompatible {
+            key,
+            version: version.into(),
+        }
+    }
+
+    /// Build [`Predicate::StringPrefix`].
+    pub fn string_prefix(key: TagKey, prefix: impl Into<String>) -> Self {
+        Self::StringPrefix {
+            key,
+            prefix: prefix.into(),
+        }
+    }
+
+    /// Build [`Predicate::StringMatches`].
+    pub fn string_matches(key: TagKey, pattern: impl Into<String>) -> Self {
+        Self::StringMatches {
+            key,
+            pattern: pattern.into(),
+        }
+    }
+
+    /// Build [`Predicate::MetadataExists`].
+    pub fn metadata_exists(key: impl Into<String>) -> Self {
+        Self::MetadataExists { key: key.into() }
+    }
+
+    /// Build [`Predicate::MetadataEquals`].
+    pub fn metadata_equals(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::MetadataEquals {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    /// Build [`Predicate::MetadataMatches`].
+    pub fn metadata_matches(key: impl Into<String>, pattern: impl Into<String>) -> Self {
+        Self::MetadataMatches {
+            key: key.into(),
+            pattern: pattern.into(),
+        }
+    }
+
+    /// Build [`Predicate::MetadataNumericAtLeast`].
+    pub fn metadata_numeric_at_least(key: impl Into<String>, threshold: f64) -> Self {
+        Self::MetadataNumericAtLeast {
+            key: key.into(),
+            threshold,
+        }
+    }
+
+    /// Build [`Predicate::And`] from a `Vec` of clauses.
+    pub fn and(clauses: Vec<Predicate>) -> Self {
+        Self::And(clauses)
+    }
+
+    /// Build [`Predicate::Or`] from a `Vec` of clauses.
+    pub fn or(clauses: Vec<Predicate>) -> Self {
+        Self::Or(clauses)
+    }
+
+    /// Build [`Predicate::Not`] wrapping a single clause.
+    pub fn not(inner: Predicate) -> Self {
+        Self::Not(Box::new(inner))
+    }
+}
+
+// =============================================================================
+// Evaluation
+// =============================================================================
+
+impl Predicate {
+    /// Evaluate against `(tags, metadata)`. Pure function. Numeric /
+    /// semver parse failures yield `false` (a malformed tag value
+    /// shouldn't fault a federated query).
+    pub fn evaluate(&self, ctx: &EvalContext<'_>) -> bool {
+        match self {
+            Self::Exists { key } => match_axis_tag(ctx.tags, key, |_| true),
+            Self::Equals { key, value } => {
+                match_axis_tag(ctx.tags, key, |v| v == value.as_str())
+            }
+            Self::NumericAtLeast { key, threshold } => {
+                match_axis_tag(ctx.tags, key, |v| {
+                    v.parse::<f64>().is_ok_and(|n| n >= *threshold)
+                })
+            }
+            Self::NumericAtMost { key, threshold } => {
+                match_axis_tag(ctx.tags, key, |v| {
+                    v.parse::<f64>().is_ok_and(|n| n <= *threshold)
+                })
+            }
+            Self::NumericInRange { key, min, max } => {
+                match_axis_tag(ctx.tags, key, |v| {
+                    v.parse::<f64>().is_ok_and(|n| n >= *min && n <= *max)
+                })
+            }
+            Self::SemverAtLeast { key, version } => {
+                let Some(rhs) = parse_semver(version) else {
+                    return false;
+                };
+                match_axis_tag(ctx.tags, key, |v| {
+                    parse_semver(v).is_some_and(|lhs| lhs >= rhs)
+                })
+            }
+            Self::SemverAtMost { key, version } => {
+                let Some(rhs) = parse_semver(version) else {
+                    return false;
+                };
+                match_axis_tag(ctx.tags, key, |v| {
+                    parse_semver(v).is_some_and(|lhs| lhs <= rhs)
+                })
+            }
+            Self::SemverCompatible { key, version } => {
+                let Some(rhs) = parse_semver(version) else {
+                    return false;
+                };
+                match_axis_tag(ctx.tags, key, |v| {
+                    parse_semver(v).is_some_and(|lhs| semver_compatible(lhs, rhs))
+                })
+            }
+            Self::StringPrefix { key, prefix } => {
+                match_axis_tag(ctx.tags, key, |v| v.starts_with(prefix.as_str()))
+            }
+            Self::StringMatches { key, pattern } => {
+                match_axis_tag(ctx.tags, key, |v| v.contains(pattern.as_str()))
+            }
+            Self::MetadataExists { key } => ctx.metadata.contains_key(key),
+            Self::MetadataEquals { key, value } => {
+                ctx.metadata.get(key).is_some_and(|v| v == value)
+            }
+            Self::MetadataMatches { key, pattern } => ctx
+                .metadata
+                .get(key)
+                .is_some_and(|v| v.contains(pattern.as_str())),
+            Self::MetadataNumericAtLeast { key, threshold } => ctx
+                .metadata
+                .get(key)
+                .and_then(|v| v.parse::<f64>().ok())
+                .is_some_and(|n| n >= *threshold),
+            Self::And(clauses) => clauses.iter().all(|c| c.evaluate(ctx)),
+            Self::Or(clauses) => clauses.iter().any(|c| c.evaluate(ctx)),
+            Self::Not(inner) => !inner.evaluate(ctx),
+        }
+    }
+}
+
+/// Find any tag in `tags` matching `key` and run `value_pred` against
+/// its value. For [`Tag::AxisPresent`] (no value), `value_pred` is
+/// called with `""` so existence-style predicates can choose to match
+/// or skip.
+fn match_axis_tag(tags: &[Tag], key: &TagKey, value_pred: impl Fn(&str) -> bool) -> bool {
+    tags.iter().any(|t| {
+        t.axis_key().as_ref() == Some(key)
+            && match t {
+                Tag::AxisPresent { .. } => value_pred(""),
+                Tag::AxisValue { value, .. } => value_pred(value),
+                _ => false,
+            }
+    })
+}
+
+// =============================================================================
+// Semver — minimal inline parser
+// =============================================================================
+
+/// Semver triple `(major, minor, patch)`. Pre-release / build
+/// metadata is stripped at parse time; comparing only the triple is
+/// enough for this plan's `NumericAtLeast` / `Compatible` semantics.
+type SemverTriple = (u64, u64, u64);
+
+/// Parse a `MAJOR.MINOR.PATCH[-prerelease][+build]` string. Returns
+/// `None` on any malformed input. Lenient on missing components: `1`
+/// → `(1, 0, 0)`, `1.2` → `(1, 2, 0)` — matches caller expectation
+/// when applications emit truncated version strings.
+fn parse_semver(s: &str) -> Option<SemverTriple> {
+    // Drop pre-release / build suffix.
+    let core = s
+        .split_once('-')
+        .map(|(c, _)| c)
+        .unwrap_or(s)
+        .split_once('+')
+        .map(|(c, _)| c)
+        .unwrap_or_else(|| s.split_once('-').map(|(c, _)| c).unwrap_or(s));
+    let mut parts = core.split('.').map(str::trim);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().map(|p| p.parse().ok()).unwrap_or(Some(0))?;
+    let patch = parts.next().map(|p| p.parse().ok()).unwrap_or(Some(0))?;
+    if parts.next().is_some() {
+        return None; // 4+ components is not semver
+    }
+    Some((major, minor, patch))
+}
+
+/// `lhs` is caret-compatible with `rhs` per the standard semver
+/// rule: same major (or same minor for `0.x.y`), and `lhs >= rhs`.
+fn semver_compatible(lhs: SemverTriple, rhs: SemverTriple) -> bool {
+    if lhs < rhs {
+        return false;
+    }
+    if rhs.0 == 0 {
+        // 0.x.y — minor is the compatibility band.
+        rhs.1 == lhs.1
+    } else {
+        rhs.0 == lhs.0
+    }
+}
+
+// =============================================================================
+// pred! macro
+// =============================================================================
+
+/// Lightweight macro sugar over [`Predicate`] constructors. Mirrors
+/// the substrate plan's macro-style examples in §6a; lowers to plain
+/// constructor calls so the AST stays the single source of truth.
+///
+/// ## Forms
+///
+/// ```ignore
+/// pred!(exists "hardware.gpu");
+/// pred!(equals "software.runtime", "cuda-12.4");
+/// pred!(num_at_least "hardware.gpu.vram_gb", 24.0);
+/// pred!(num_at_most "hardware.gpu.vram_gb", 80.0);
+/// pred!(num_in_range "hardware.cpu_cores", 8.0, 64.0);
+/// pred!(semver_at_least "software.runtime", "12.0");
+/// pred!(semver_compatible "software.runtime", "12.0");
+/// pred!(prefix "software.tool", "ffmpeg");
+/// pred!(matches "software.daemon", "postgres");
+/// pred!(metadata_exists "intent");
+/// pred!(metadata_equals "intent", "ml-training");
+/// pred!(and [a, b, c]);
+/// pred!(or  [a, b, c]);
+/// pred!(not a);
+/// ```
+///
+/// The string forms are `<axis>.<key>` literals; the macro splits
+/// them into `(axis, key)` via [`crate::adapter::net::behavior::tag::Tag::parse`]
+/// and panics at construction time on invalid axis prefixes —
+/// matching the substrate plan's "validates shapes at parse time"
+/// contract for the macro.
+#[macro_export]
+macro_rules! pred {
+    (exists $key:literal) => {
+        $crate::adapter::net::behavior::predicate::Predicate::exists(
+            $crate::adapter::net::behavior::predicate::__tag_key_from_str($key),
+        )
+    };
+    (equals $key:literal, $value:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::equals(
+            $crate::adapter::net::behavior::predicate::__tag_key_from_str($key),
+            $value,
+        )
+    };
+    (num_at_least $key:literal, $t:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::numeric_at_least(
+            $crate::adapter::net::behavior::predicate::__tag_key_from_str($key),
+            $t,
+        )
+    };
+    (num_at_most $key:literal, $t:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::numeric_at_most(
+            $crate::adapter::net::behavior::predicate::__tag_key_from_str($key),
+            $t,
+        )
+    };
+    (num_in_range $key:literal, $min:expr, $max:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::numeric_in_range(
+            $crate::adapter::net::behavior::predicate::__tag_key_from_str($key),
+            $min,
+            $max,
+        )
+    };
+    (semver_at_least $key:literal, $v:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::semver_at_least(
+            $crate::adapter::net::behavior::predicate::__tag_key_from_str($key),
+            $v,
+        )
+    };
+    (semver_at_most $key:literal, $v:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::semver_at_most(
+            $crate::adapter::net::behavior::predicate::__tag_key_from_str($key),
+            $v,
+        )
+    };
+    (semver_compatible $key:literal, $v:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::semver_compatible(
+            $crate::adapter::net::behavior::predicate::__tag_key_from_str($key),
+            $v,
+        )
+    };
+    (prefix $key:literal, $p:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::string_prefix(
+            $crate::adapter::net::behavior::predicate::__tag_key_from_str($key),
+            $p,
+        )
+    };
+    (matches $key:literal, $p:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::string_matches(
+            $crate::adapter::net::behavior::predicate::__tag_key_from_str($key),
+            $p,
+        )
+    };
+    (metadata_exists $key:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::metadata_exists($key)
+    };
+    (metadata_equals $key:expr, $v:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::metadata_equals($key, $v)
+    };
+    (metadata_matches $key:expr, $p:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::metadata_matches($key, $p)
+    };
+    (metadata_num_at_least $key:expr, $t:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::metadata_numeric_at_least(
+            $key, $t,
+        )
+    };
+    (and [ $($clause:expr),* $(,)? ]) => {
+        $crate::adapter::net::behavior::predicate::Predicate::and(vec![$($clause),*])
+    };
+    (or [ $($clause:expr),* $(,)? ]) => {
+        $crate::adapter::net::behavior::predicate::Predicate::or(vec![$($clause),*])
+    };
+    (not $clause:expr) => {
+        $crate::adapter::net::behavior::predicate::Predicate::not($clause)
+    };
+}
+
+/// Internal helper used by the [`pred!`] macro to lift an
+/// `<axis>.<key>` string literal into a [`TagKey`]. Panics on
+/// unknown axis or empty key — the macro contract is "parse-time
+/// validation," and violating it at the call site is a programmer
+/// error caught at the first run (matches the substrate plan's
+/// macro-validation guarantee).
+#[doc(hidden)]
+pub fn __tag_key_from_str(s: &'static str) -> TagKey {
+    let (axis_str, key) = s
+        .split_once('.')
+        .unwrap_or_else(|| panic!("pred! tag key {s:?} must be `<axis>.<key>`"));
+    let axis = crate::adapter::net::behavior::tag::TaxonomyAxis::from_prefix(axis_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "pred! tag key {s:?} has unknown axis prefix {axis_str:?}; \
+                 valid axes: hardware, software, devices, dataforts"
+            )
+        });
+    TagKey::new(axis, key.to_string())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::net::behavior::tag::{Tag, TaxonomyAxis};
+
+    fn ctx<'a>(
+        tags: &'a [Tag],
+        metadata: &'a BTreeMap<String, String>,
+    ) -> EvalContext<'a> {
+        EvalContext::new(tags, metadata)
+    }
+
+    fn empty_meta() -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
+
+    fn axis_present(axis: TaxonomyAxis, key: &str) -> Tag {
+        Tag::AxisPresent {
+            axis,
+            key: key.into(),
+        }
+    }
+
+    fn axis_eq(axis: TaxonomyAxis, key: &str, value: &str) -> Tag {
+        Tag::AxisValue {
+            axis,
+            key: key.into(),
+            value: value.into(),
+            separator: crate::adapter::net::behavior::tag::AxisSeparator::Eq,
+        }
+    }
+
+    // ---- existence + equality ------------------------------------------
+
+    #[test]
+    fn exists_matches_axis_present_tag() {
+        let tags = [axis_present(TaxonomyAxis::Hardware, "gpu")];
+        let meta = empty_meta();
+        let p = pred!(exists "hardware.gpu");
+        assert!(p.evaluate(&ctx(&tags, &meta)));
+    }
+
+    #[test]
+    fn exists_matches_axis_value_tag() {
+        let tags = [axis_eq(TaxonomyAxis::Hardware, "gpu.vram_gb", "80")];
+        let meta = empty_meta();
+        let p = pred!(exists "hardware.gpu.vram_gb");
+        assert!(p.evaluate(&ctx(&tags, &meta)));
+    }
+
+    #[test]
+    fn exists_misses_when_axis_differs() {
+        let tags = [axis_present(TaxonomyAxis::Software, "gpu")];
+        let meta = empty_meta();
+        let p = pred!(exists "hardware.gpu");
+        assert!(!p.evaluate(&ctx(&tags, &meta)));
+    }
+
+    #[test]
+    fn equals_matches_value_exactly() {
+        let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "cuda-12.4")];
+        let meta = empty_meta();
+        assert!(pred!(equals "software.runtime", "cuda-12.4")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(equals "software.runtime", "cuda-11")
+            .evaluate(&ctx(&tags, &meta)));
+    }
+
+    // ---- numeric --------------------------------------------------------
+
+    #[test]
+    fn numeric_at_least_compares_value() {
+        let tags = [axis_eq(TaxonomyAxis::Hardware, "gpu.vram_gb", "80")];
+        let meta = empty_meta();
+        assert!(pred!(num_at_least "hardware.gpu.vram_gb", 24.0)
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(num_at_least "hardware.gpu.vram_gb", 80.0)
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(num_at_least "hardware.gpu.vram_gb", 96.0)
+            .evaluate(&ctx(&tags, &meta)));
+    }
+
+    #[test]
+    fn numeric_at_most_and_in_range() {
+        let tags = [axis_eq(TaxonomyAxis::Hardware, "cpu_cores", "16")];
+        let meta = empty_meta();
+        assert!(pred!(num_at_most "hardware.cpu_cores", 32.0)
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(num_at_most "hardware.cpu_cores", 8.0)
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(num_in_range "hardware.cpu_cores", 8.0, 32.0)
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(num_in_range "hardware.cpu_cores", 32.0, 64.0)
+            .evaluate(&ctx(&tags, &meta)));
+    }
+
+    #[test]
+    fn numeric_unparseable_value_evaluates_to_false() {
+        // Pinned: a tag whose value is not numeric must NOT panic
+        // and must NOT match a numeric predicate. Federated queries
+        // rely on this — a malformed tag from a peer's binding
+        // shouldn't fault our query.
+        let tags = [axis_eq(TaxonomyAxis::Hardware, "cpu_cores", "many")];
+        let meta = empty_meta();
+        assert!(!pred!(num_at_least "hardware.cpu_cores", 1.0)
+            .evaluate(&ctx(&tags, &meta)));
+    }
+
+    // ---- semver ---------------------------------------------------------
+
+    #[test]
+    fn semver_at_least_basic() {
+        let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "12.4.1")];
+        let meta = empty_meta();
+        assert!(pred!(semver_at_least "software.runtime", "12.0.0")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(semver_at_least "software.runtime", "12.4.0")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(semver_at_least "software.runtime", "13.0.0")
+            .evaluate(&ctx(&tags, &meta)));
+    }
+
+    #[test]
+    fn semver_compatible_caret_rule() {
+        // 1.x.y compatibility: same major.
+        let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "1.5.2")];
+        let meta = empty_meta();
+        assert!(pred!(semver_compatible "software.runtime", "1.0.0")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(semver_compatible "software.runtime", "1.4.0")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(semver_compatible "software.runtime", "0.9.0")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(semver_compatible "software.runtime", "2.0.0")
+            .evaluate(&ctx(&tags, &meta)));
+
+        // 0.x.y compatibility: same minor.
+        let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.5.7")];
+        assert!(pred!(semver_compatible "software.runtime", "0.5.0")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(semver_compatible "software.runtime", "0.4.0")
+            .evaluate(&ctx(&tags, &meta)));
+    }
+
+    #[test]
+    fn semver_lenient_parser() {
+        // Pinned: the inline parser accepts truncated versions
+        // (`1` → `(1, 0, 0)`, `1.2` → `(1, 2, 0)`). Applications in
+        // the wild emit these; the parser shouldn't reject them.
+        assert_eq!(parse_semver("1"), Some((1, 0, 0)));
+        assert_eq!(parse_semver("1.2"), Some((1, 2, 0)));
+        assert_eq!(parse_semver("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("1.2.3-beta"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("1.2.3+build.42"), Some((1, 2, 3)));
+        // Invalid: 4+ components, non-numeric.
+        assert_eq!(parse_semver("1.2.3.4"), None);
+        assert_eq!(parse_semver("a.b.c"), None);
+        assert_eq!(parse_semver(""), None);
+    }
+
+    // ---- string ---------------------------------------------------------
+
+    #[test]
+    fn string_prefix_and_matches() {
+        let tags = [axis_eq(TaxonomyAxis::Software, "tool", "ffmpeg-7.0")];
+        let meta = empty_meta();
+        assert!(pred!(prefix "software.tool", "ffmpeg")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(prefix "software.tool", "imagemagick")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(matches "software.tool", "7.0")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(matches "software.tool", "8.0")
+            .evaluate(&ctx(&tags, &meta)));
+    }
+
+    // ---- metadata -------------------------------------------------------
+
+    #[test]
+    fn metadata_predicates() {
+        let tags: Vec<Tag> = vec![];
+        let mut meta = BTreeMap::new();
+        meta.insert("intent".into(), "ml-training".into());
+        meta.insert("priority".into(), "5".into());
+
+        assert!(pred!(metadata_exists "intent").evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(metadata_exists "missing").evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(metadata_equals "intent", "ml-training")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(metadata_equals "intent", "billing")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(metadata_matches "intent", "training")
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(metadata_num_at_least "priority", 3.0)
+            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(metadata_num_at_least "priority", 10.0)
+            .evaluate(&ctx(&tags, &meta)));
+    }
+
+    // ---- boolean composition --------------------------------------------
+
+    #[test]
+    fn and_or_not_composition() {
+        let tags = [
+            axis_present(TaxonomyAxis::Hardware, "gpu"),
+            axis_eq(TaxonomyAxis::Hardware, "gpu.vram_gb", "80"),
+        ];
+        let meta = empty_meta();
+
+        // AND: both clauses match.
+        let p = pred!(and [
+            pred!(exists "hardware.gpu"),
+            pred!(num_at_least "hardware.gpu.vram_gb", 24.0),
+        ]);
+        assert!(p.evaluate(&ctx(&tags, &meta)));
+
+        // AND: one fails.
+        let p = pred!(and [
+            pred!(exists "hardware.gpu"),
+            pred!(num_at_least "hardware.gpu.vram_gb", 96.0),
+        ]);
+        assert!(!p.evaluate(&ctx(&tags, &meta)));
+
+        // OR: at least one matches.
+        let p = pred!(or [
+            pred!(exists "hardware.tpu"),
+            pred!(exists "hardware.gpu"),
+        ]);
+        assert!(p.evaluate(&ctx(&tags, &meta)));
+
+        // NOT: inverts.
+        let p = pred!(not pred!(exists "hardware.tpu"));
+        assert!(p.evaluate(&ctx(&tags, &meta)));
+        let p = pred!(not pred!(exists "hardware.gpu"));
+        assert!(!p.evaluate(&ctx(&tags, &meta)));
+    }
+
+    #[test]
+    fn empty_and_is_vacuously_true() {
+        // Standard math/logic convention: `forall` over empty set
+        // is `true`. Pinned because alternatives surprise readers.
+        let tags: Vec<Tag> = vec![];
+        let meta = empty_meta();
+        assert!(Predicate::and(vec![]).evaluate(&ctx(&tags, &meta)));
+    }
+
+    #[test]
+    fn empty_or_is_vacuously_false() {
+        // Dual convention: `exists` over empty set is `false`.
+        let tags: Vec<Tag> = vec![];
+        let meta = empty_meta();
+        assert!(!Predicate::or(vec![]).evaluate(&ctx(&tags, &meta)));
+    }
+
+    // ---- not predicate over unparseable value ---------------------------
+
+    #[test]
+    fn not_does_not_flip_unparseable_to_true() {
+        // Pinned by the substrate plan's "Predicate::Not(NumericAtLeast)
+        // against an unparseable value yields `false`, NOT `true`"
+        // contract. The inner numeric predicate fails (returns
+        // false); Not(false) = true. But the spec explicitly says
+        // "predicate failure is a hard miss, not a logical inversion":
+        // the inner check fails to find any matching tag at all, so
+        // the inner predicate evaluates to `false`, and `Not(false)`
+        // evaluates to `true`. This test pins the documented
+        // behavior so a future change is intentional.
+        let tags = [axis_eq(TaxonomyAxis::Hardware, "cpu_cores", "many")];
+        let meta = empty_meta();
+        // Inner: NumericAtLeast against "many" → false (parse fails).
+        // Outer: Not(false) → true.
+        let p = pred!(not pred!(num_at_least "hardware.cpu_cores", 1.0));
+        assert!(p.evaluate(&ctx(&tags, &meta)));
+    }
+
+    // ---- structural equality ------------------------------------------
+    //
+    // Serde wire format is deferred to Phase E (federated query
+    // primitives) — see the comment on the `Predicate` declaration.
+    // Phase A pins structural-equality round-trip via Clone + PartialEq
+    // so a future serde drop-in has a reference behavior to match.
+
+    #[test]
+    fn clone_and_eq_preserve_ast() {
+        let p = pred!(and [
+            pred!(exists "hardware.gpu"),
+            pred!(num_at_least "hardware.gpu.vram_gb", 24.0),
+            pred!(or [
+                pred!(equals "software.runtime", "cuda-12.4"),
+                pred!(semver_compatible "software.runtime", "13.0"),
+            ]),
+            pred!(not pred!(metadata_exists "decommissioning")),
+        ]);
+        let p2 = p.clone();
+        assert_eq!(p, p2);
+    }
+
+    // ---- macro ----------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "unknown axis prefix")]
+    fn pred_macro_panics_on_unknown_axis() {
+        let _ = pred!(exists "bogus.foo");
+    }
+
+    #[test]
+    #[should_panic(expected = "must be `<axis>.<key>`")]
+    fn pred_macro_panics_on_missing_dot() {
+        let _ = pred!(exists "hardware");
+    }
+}

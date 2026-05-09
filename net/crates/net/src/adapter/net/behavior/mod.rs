@@ -18,6 +18,7 @@ pub mod context;
 pub mod diff;
 pub mod loadbalance;
 pub mod metadata;
+pub mod predicate;
 pub mod proximity;
 pub mod rules;
 pub mod safety;
@@ -39,6 +40,8 @@ pub use capability::{
 pub use tag::{
     AxisSeparator, CapabilityTagError, RESERVED_PREFIXES, Tag, TagKey, TaxonomyAxis,
 };
+
+pub use predicate::{EvalContext, Predicate};
 
 pub use diff::{CapabilityDiff, DiffEngine, DiffError, DiffOp};
 
