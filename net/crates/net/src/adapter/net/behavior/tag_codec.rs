@@ -58,7 +58,7 @@
 //! additional_gpus / accelerators" so a future regression is loud.
 
 use crate::adapter::net::behavior::capability::{
-    GpuInfo, GpuVendor, HardwareCapabilities,
+    GpuInfo, GpuVendor, HardwareCapabilities, ResourceLimits, SoftwareCapabilities,
 };
 use crate::adapter::net::behavior::tag::{AxisSeparator, Tag, TaxonomyAxis};
 
@@ -267,6 +267,224 @@ fn decode_gpu_field(gpu: &mut GpuInfo, sub_key: &str, value: &str) {
             gpu.fp16_tflops_x10 = value.parse().unwrap_or(0);
         }
         _ => {}
+    }
+}
+
+// =============================================================================
+// SoftwareCapabilities ↔ tags
+// =============================================================================
+
+/// Encode a `SoftwareCapabilities` into the canonical axis-prefixed
+/// tag list. Order is stable: `os` / `os_version` / `runtimes` (in
+/// emission order) / `frameworks` (in emission order) / `cuda_version`
+/// / `drivers` (in emission order). Empty / `None` fields are
+/// omitted so a default `SoftwareCapabilities` produces an empty
+/// tag list.
+///
+/// Encoding scheme:
+///
+/// ```text
+/// software.os=linux
+/// software.os_version=6.1
+/// software.runtime.python=3.11             ← one tag per (name, version) tuple
+/// software.runtime.node=20
+/// software.framework.pytorch=2.1
+/// software.framework.tensorflow=2.15
+/// software.cuda_version=12.1
+/// software.driver.nvidia=535.86.10
+/// ```
+pub fn software_to_tags(sw: &SoftwareCapabilities) -> Vec<Tag> {
+    let mut tags = Vec::new();
+
+    if !sw.os.is_empty() {
+        tags.push(software_value("os", &sw.os));
+    }
+    if !sw.os_version.is_empty() {
+        tags.push(software_value("os_version", &sw.os_version));
+    }
+    for (name, version) in &sw.runtimes {
+        tags.push(software_value(&format!("runtime.{name}"), version));
+    }
+    for (name, version) in &sw.frameworks {
+        tags.push(software_value(&format!("framework.{name}"), version));
+    }
+    if let Some(cuda) = &sw.cuda_version {
+        tags.push(software_value("cuda_version", cuda));
+    }
+    for (name, version) in &sw.drivers {
+        tags.push(software_value(&format!("driver.{name}"), version));
+    }
+
+    tags
+}
+
+/// Decode a `SoftwareCapabilities` from a tag list. Tags whose
+/// axis isn't `software` are ignored; unrecognized `software.*`
+/// keys are also ignored (forward compat). Runtime / framework /
+/// driver order is preserved across the round-trip via `Vec`
+/// insertion order.
+pub fn software_from_tags(tags: &[Tag]) -> SoftwareCapabilities {
+    let mut sw = SoftwareCapabilities::new();
+
+    for tag in tags {
+        let Some(key) = tag.axis_key() else { continue };
+        if key.axis != TaxonomyAxis::Software {
+            continue;
+        }
+        let value = tag.value().unwrap_or("");
+        match key.key.as_str() {
+            "os" => sw.os = value.to_string(),
+            "os_version" => sw.os_version = value.to_string(),
+            "cuda_version" => sw.cuda_version = Some(value.to_string()),
+            other if other.starts_with("runtime.") => {
+                let name = &other["runtime.".len()..];
+                if !name.is_empty() {
+                    sw.runtimes.push((name.to_string(), value.to_string()));
+                }
+            }
+            other if other.starts_with("framework.") => {
+                let name = &other["framework.".len()..];
+                if !name.is_empty() {
+                    sw.frameworks.push((name.to_string(), value.to_string()));
+                }
+            }
+            other if other.starts_with("driver.") => {
+                let name = &other["driver.".len()..];
+                if !name.is_empty() {
+                    sw.drivers.push((name.to_string(), value.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    sw
+}
+
+/// Build a `software.<key>=<value>` tag. Sub-key separators inside
+/// `<key>` (e.g. `runtime.python`) are part of the key itself.
+fn software_value(key: &str, value: &str) -> Tag {
+    Tag::AxisValue {
+        axis: TaxonomyAxis::Software,
+        key: key.to_string(),
+        value: value.to_string(),
+        separator: AxisSeparator::Eq,
+    }
+}
+
+// =============================================================================
+// ResourceLimits ↔ tags
+// =============================================================================
+
+/// Encode `ResourceLimits` into the canonical axis-prefixed tag
+/// list. Resource limits sit under the `hardware.limits.*` sub-key
+/// (operational caps tied to the node's compute capacity); zero-
+/// valued fields are omitted.
+///
+/// Encoding scheme:
+///
+/// ```text
+/// hardware.limits.max_concurrent_requests=10
+/// hardware.limits.max_tokens_per_request=4096
+/// hardware.limits.rate_limit_rpm=600
+/// hardware.limits.max_batch_size=32
+/// hardware.limits.max_input_bytes=1048576
+/// hardware.limits.max_output_bytes=1048576
+/// ```
+pub fn resource_limits_to_tags(limits: &ResourceLimits) -> Vec<Tag> {
+    let mut tags = Vec::new();
+
+    if limits.max_concurrent_requests > 0 {
+        tags.push(limits_value(
+            "max_concurrent_requests",
+            &limits.max_concurrent_requests.to_string(),
+        ));
+    }
+    if limits.max_tokens_per_request > 0 {
+        tags.push(limits_value(
+            "max_tokens_per_request",
+            &limits.max_tokens_per_request.to_string(),
+        ));
+    }
+    if limits.rate_limit_rpm > 0 {
+        tags.push(limits_value(
+            "rate_limit_rpm",
+            &limits.rate_limit_rpm.to_string(),
+        ));
+    }
+    if limits.max_batch_size > 0 {
+        tags.push(limits_value(
+            "max_batch_size",
+            &limits.max_batch_size.to_string(),
+        ));
+    }
+    if limits.max_input_bytes > 0 {
+        tags.push(limits_value(
+            "max_input_bytes",
+            &limits.max_input_bytes.to_string(),
+        ));
+    }
+    if limits.max_output_bytes > 0 {
+        tags.push(limits_value(
+            "max_output_bytes",
+            &limits.max_output_bytes.to_string(),
+        ));
+    }
+
+    tags
+}
+
+/// Decode `ResourceLimits` from a tag list. Tags outside the
+/// `hardware.limits.*` namespace are ignored; malformed numerics
+/// fall back to defaults.
+pub fn resource_limits_from_tags(tags: &[Tag]) -> ResourceLimits {
+    let mut limits = ResourceLimits::new();
+
+    for tag in tags {
+        let Some(key) = tag.axis_key() else { continue };
+        if key.axis != TaxonomyAxis::Hardware {
+            continue;
+        }
+        let Some(sub) = key.key.strip_prefix("limits.") else {
+            continue;
+        };
+        let value = tag.value().unwrap_or("");
+        match sub {
+            "max_concurrent_requests" => {
+                limits.max_concurrent_requests = value.parse().unwrap_or(0);
+            }
+            "max_tokens_per_request" => {
+                limits.max_tokens_per_request = value.parse().unwrap_or(0);
+            }
+            "rate_limit_rpm" => {
+                limits.rate_limit_rpm = value.parse().unwrap_or(0);
+            }
+            "max_batch_size" => {
+                limits.max_batch_size = value.parse().unwrap_or(0);
+            }
+            "max_input_bytes" => {
+                limits.max_input_bytes = value.parse().unwrap_or(0);
+            }
+            "max_output_bytes" => {
+                limits.max_output_bytes = value.parse().unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+
+    limits
+}
+
+/// Build a `hardware.limits.<key>=<value>` tag. The `limits.` sub-
+/// prefix is part of the key, not a separate axis — `ResourceLimits`
+/// are operational caps on the hardware, so they live under the
+/// hardware axis namespace.
+fn limits_value(key: &str, value: &str) -> Tag {
+    Tag::AxisValue {
+        axis: TaxonomyAxis::Hardware,
+        key: format!("limits.{key}"),
+        value: value.to_string(),
+        separator: AxisSeparator::Eq,
     }
 }
 
@@ -504,5 +722,203 @@ mod tests {
             .push(AcceleratorInfo::new(AcceleratorType::Tpu, "Google TPU v4"));
         let hw2 = hardware_from_tags(&hardware_to_tags(&hw));
         assert!(hw2.accelerators.is_empty());
+    }
+
+    // ====================================================================
+    // SoftwareCapabilities ↔ tags
+    // ====================================================================
+
+    fn full_software() -> SoftwareCapabilities {
+        SoftwareCapabilities::new()
+            .with_os("linux", "6.1")
+            .add_runtime("python", "3.11")
+            .add_runtime("node", "20")
+            .add_framework("pytorch", "2.1")
+            .add_framework("tensorflow", "2.15")
+            .with_cuda("12.1")
+    }
+
+    #[test]
+    fn empty_software_emits_no_tags() {
+        let sw = SoftwareCapabilities::default();
+        assert!(software_to_tags(&sw).is_empty());
+    }
+
+    #[test]
+    fn full_software_emits_canonical_tag_set() {
+        let sw = full_software();
+        let strs: Vec<String> = software_to_tags(&sw)
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        assert_eq!(
+            strs,
+            vec![
+                "software.os=linux",
+                "software.os_version=6.1",
+                "software.runtime.python=3.11",
+                "software.runtime.node=20",
+                "software.framework.pytorch=2.1",
+                "software.framework.tensorflow=2.15",
+                "software.cuda_version=12.1",
+            ]
+        );
+    }
+
+    #[test]
+    fn round_trip_full_software() {
+        let sw = full_software();
+        let tags = software_to_tags(&sw);
+        let sw2 = software_from_tags(&tags);
+        assert_eq!(sw, sw2);
+    }
+
+    #[test]
+    fn round_trip_default_software() {
+        let sw = SoftwareCapabilities::default();
+        assert_eq!(software_from_tags(&software_to_tags(&sw)), sw);
+    }
+
+    #[test]
+    fn software_runtime_order_preserved_round_trip() {
+        // Pinned: runtimes Vec order is preserved across the round
+        // trip via insertion order on the encode side and Vec append
+        // on the decode side. A `Vec<(String, String)>` carrier
+        // post-Phase-A.5.1 would have the same property.
+        let sw = SoftwareCapabilities::new()
+            .add_runtime("a", "1")
+            .add_runtime("b", "2")
+            .add_runtime("c", "3");
+        let sw2 = software_from_tags(&software_to_tags(&sw));
+        assert_eq!(sw2.runtimes, sw.runtimes);
+    }
+
+    #[test]
+    fn software_unknown_axis_tags_ignored() {
+        let tags = [
+            Tag::parse("hardware.cpu_cores=8").unwrap(),
+            Tag::parse("software.os=linux").unwrap(),
+        ];
+        let sw = software_from_tags(&tags);
+        assert_eq!(sw.os, "linux");
+    }
+
+    #[test]
+    fn software_unknown_subkey_ignored() {
+        // Forward compat: a peer's `software.future_thing=foo`
+        // doesn't fault.
+        let tags = [
+            Tag::parse("software.future_thing=foo").unwrap(),
+            Tag::parse("software.os=linux").unwrap(),
+        ];
+        let sw = software_from_tags(&tags);
+        assert_eq!(sw.os, "linux");
+    }
+
+    #[test]
+    fn software_runtime_with_empty_name_skipped() {
+        // Pinned: a malformed `software.runtime.=1.0` (empty name
+        // after the prefix) is dropped, not emitted as
+        // `("", "1.0")`. Cross-binding peers shouldn't see synthetic
+        // empty-name runtimes.
+        let tags = [Tag::parse("software.runtime.=1.0").unwrap()];
+        let sw = software_from_tags(&tags);
+        assert!(sw.runtimes.is_empty());
+    }
+
+    // ====================================================================
+    // ResourceLimits ↔ tags
+    // ====================================================================
+
+    fn full_limits() -> ResourceLimits {
+        ResourceLimits::new()
+            .with_max_concurrent(10)
+            .with_max_tokens(4096)
+            .with_rate_limit(600)
+            .with_max_batch(32)
+    }
+
+    #[test]
+    fn empty_limits_emits_no_tags() {
+        let l = ResourceLimits::default();
+        assert!(resource_limits_to_tags(&l).is_empty());
+    }
+
+    #[test]
+    fn full_limits_emits_canonical_tag_set() {
+        let l = full_limits();
+        let strs: Vec<String> = resource_limits_to_tags(&l)
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        assert_eq!(
+            strs,
+            vec![
+                "hardware.limits.max_concurrent_requests=10",
+                "hardware.limits.max_tokens_per_request=4096",
+                "hardware.limits.rate_limit_rpm=600",
+                "hardware.limits.max_batch_size=32",
+            ]
+        );
+    }
+
+    #[test]
+    fn round_trip_full_limits() {
+        let l = full_limits();
+        assert_eq!(
+            resource_limits_from_tags(&resource_limits_to_tags(&l)),
+            l
+        );
+    }
+
+    #[test]
+    fn round_trip_default_limits() {
+        let l = ResourceLimits::default();
+        assert_eq!(
+            resource_limits_from_tags(&resource_limits_to_tags(&l)),
+            l
+        );
+    }
+
+    #[test]
+    fn limits_top_level_hardware_keys_ignored() {
+        // Pinned: a `hardware.cpu_cores=8` tag does NOT decode into
+        // `ResourceLimits`. Only `hardware.limits.*` sub-keys
+        // contribute. Phase A.5.1's combined `CapabilitySet`
+        // decoder routes hardware vs. limits via this prefix.
+        let tags = [
+            Tag::parse("hardware.cpu_cores=8").unwrap(),
+            Tag::parse("hardware.limits.rate_limit_rpm=120").unwrap(),
+        ];
+        let l = resource_limits_from_tags(&tags);
+        assert_eq!(l.rate_limit_rpm, 120);
+        assert_eq!(l.max_concurrent_requests, 0);
+    }
+
+    #[test]
+    fn limits_unknown_subkey_ignored() {
+        let tags = [
+            Tag::parse("hardware.limits.future_field=999").unwrap(),
+            Tag::parse("hardware.limits.rate_limit_rpm=120").unwrap(),
+        ];
+        let l = resource_limits_from_tags(&tags);
+        assert_eq!(l.rate_limit_rpm, 120);
+    }
+
+    #[test]
+    fn hardware_decode_skips_limits_subkeys() {
+        // Pinned: the hardware decoder MUST skip `hardware.limits.*`
+        // tags so they don't pollute the typed-struct fields.
+        // Phase A.5.1 will rely on this clean separation when
+        // `CapabilitySet` decodes into both HardwareCapabilities
+        // and ResourceLimits from the same tag set.
+        let tags = [
+            Tag::parse("hardware.cpu_cores=8").unwrap(),
+            Tag::parse("hardware.limits.rate_limit_rpm=120").unwrap(),
+        ];
+        let hw = hardware_from_tags(&tags);
+        assert_eq!(hw.cpu_cores, 8);
+        // No hardware-struct field should have been touched by the
+        // `hardware.limits.*` tag.
     }
 }
