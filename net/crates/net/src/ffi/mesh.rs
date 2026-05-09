@@ -4106,13 +4106,17 @@ mod nat_traversal_stub_tests {
         let json = r#"{"hardware":{"cpu_cores":16,"memory_mb":65536,"gpu":{"vendor":"nvidia","model":"h100","vram_mb":81920}},"tags":["gpu"]}"#;
         let parsed: CapabilitySetJson = serde_json::from_str(json).expect("JSON should parse");
         let caps = capability_set_from_json(parsed);
+        // Phase A.5.5: read through views() so the test asserts
+        // the projection — the same surface every consumer sees
+        // post-Phase-A.5.N when typed-struct fields are removed.
+        let views = caps.views();
         assert_eq!(
-            caps.hardware.gpu_vendor(),
+            views.hardware.gpu_vendor(),
             Some(super::GpuVendor::Nvidia),
             "vendor lost in conversion"
         );
-        assert_eq!(caps.hardware.memory_mb, 65536);
-        assert_eq!(caps.hardware.total_vram_mb(), 81920);
+        assert_eq!(views.hardware.memory_mb, 65536);
+        assert_eq!(views.hardware.total_vram_mb(), 81920);
         assert!(caps.has_tag("gpu"));
     }
 
