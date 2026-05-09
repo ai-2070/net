@@ -1507,9 +1507,9 @@ const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
   {
     header: "// net",
     headerColor: "accent",
-    title: "NET → mesh transport",
+    title: "NET → latency-first",
     titleColor: "accent",
-    body: "Real-time latencies on commodity hardware over commodity networks. Drop instead of queue. Route around instead of wait. Observe instead of coordinate. Derive instead of query. Latency-first.",
+    body: "Real-time latencies on commodity hardware over commodity networks. Drop instead of queue. Route around instead of wait. Observe instead of coordinate. Derive instead of query. Mesh transport.",
     floor: "nanoseconds",
     floorColor: "accent",
     throughput: "~20M events/s · per core",
