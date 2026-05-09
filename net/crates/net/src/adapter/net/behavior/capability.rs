@@ -14,7 +14,7 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -488,6 +488,22 @@ pub struct ToolCapability {
 }
 
 impl ToolCapability {
+    /// Metadata key carrying this tool's input JSON Schema.
+    ///
+    /// Phase A.5.N convention: tool input/output schemas live in
+    /// `CapabilitySet::metadata` rather than the tag wire format
+    /// (JSON contains `=`/`:`/`,` which can't round-trip through
+    /// tags). Format: `tool::<tool_id>::input_schema`.
+    pub fn input_schema_metadata_key(tool_id: &str) -> String {
+        format!("tool::{tool_id}::input_schema")
+    }
+
+    /// Metadata key carrying this tool's output JSON Schema.
+    /// See [`Self::input_schema_metadata_key`].
+    pub fn output_schema_metadata_key(tool_id: &str) -> String {
+        format!("tool::{tool_id}::output_schema")
+    }
+
     /// Create new tool capability
     pub fn new(tool_id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
@@ -808,6 +824,25 @@ pub struct CapabilitySet {
     pub tags: Vec<String>,
     /// Resource limits
     pub limits: ResourceLimits,
+    /// Free-form key-value metadata.
+    ///
+    /// Phase A.5.N introduction. Carries data that doesn't fit the
+    /// typed-tag taxonomy:
+    ///
+    /// - **Tool schemas**: `tool::<tool_id>::input_schema` and
+    ///   `tool::<tool_id>::output_schema` keys hold JSON Schema
+    ///   strings (the `=`/`:`/`,` characters in JSON make these
+    ///   unsafe to round-trip through the tag wire format).
+    /// - **Intent**: `intent` key carries the application-defined
+    ///   placement intent (Phase F).
+    /// - **Colocation hints**: `colocate-with` key carries a chain
+    ///   origin hash for chain-aware placement.
+    /// - Application-defined keys (subject to the metadata size cap
+    ///   in Phase C: 4 KB soft / 16 KB hard).
+    ///
+    /// `BTreeMap` for deterministic iteration order over the wire.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl CapabilitySet {
@@ -836,6 +871,22 @@ impl CapabilitySet {
 
     /// Add tool capability
     pub fn add_tool(mut self, tool: ToolCapability) -> Self {
+        // Phase A.5.N.1: mirror schemas into metadata so they
+        // survive the eventual A.5.N.3 typed-field removal. The
+        // typed `input_schema` / `output_schema` fields stay
+        // populated; this just adds a parallel home in metadata.
+        if let Some(schema) = &tool.input_schema {
+            self.metadata.insert(
+                ToolCapability::input_schema_metadata_key(&tool.tool_id),
+                schema.clone(),
+            );
+        }
+        if let Some(schema) = &tool.output_schema {
+            self.metadata.insert(
+                ToolCapability::output_schema_metadata_key(&tool.tool_id),
+                schema.clone(),
+            );
+        }
         self.tools.push(tool);
         self
     }
@@ -896,6 +947,12 @@ impl CapabilitySet {
         self
     }
 
+    /// Set or overwrite a metadata key-value entry.
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
     // ========================================================================
     // Mutable setters — Phase A.5.6 write-path seam.
     //
@@ -933,7 +990,42 @@ impl CapabilitySet {
     }
 
     /// Replace the available-tool list in-place.
+    ///
+    /// Tool input/output schemas are mirrored into `self.metadata`
+    /// (Phase A.5.N.1) so they survive the eventual A.5.N.3 typed-
+    /// field removal. Stale schema entries belonging to tools that
+    /// are no longer in the new list are pruned to avoid leaking
+    /// metadata across replacements.
     pub fn set_tools(&mut self, tools: Vec<ToolCapability>) {
+        // Drop schema metadata entries for tools no longer present.
+        let new_ids: HashSet<&str> = tools.iter().map(|t| t.tool_id.as_str()).collect();
+        self.metadata.retain(|key, _| {
+            // Match the `tool::<id>::*` namespace and check the id.
+            let Some(rest) = key.strip_prefix("tool::") else {
+                return true;
+            };
+            let Some((id, _suffix)) = rest.split_once("::") else {
+                return true;
+            };
+            new_ids.contains(id)
+        });
+
+        // Mirror new schemas into metadata.
+        for tool in &tools {
+            if let Some(schema) = &tool.input_schema {
+                self.metadata.insert(
+                    ToolCapability::input_schema_metadata_key(&tool.tool_id),
+                    schema.clone(),
+                );
+            }
+            if let Some(schema) = &tool.output_schema {
+                self.metadata.insert(
+                    ToolCapability::output_schema_metadata_key(&tool.tool_id),
+                    schema.clone(),
+                );
+            }
+        }
+
         self.tools = tools;
     }
 

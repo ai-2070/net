@@ -919,6 +919,11 @@ pub fn capability_set_from_tag_set(tags: &HashSet<Tag>) -> CapabilitySet {
         tools,
         tags: legacy_tags,
         limits,
+        // tag_set bijection doesn't touch metadata — that's a
+        // separate field carrying schemas / intent / colocation
+        // hints. Phase A.5.N.3 will fold tools' schemas back in
+        // when typed fields are removed.
+        metadata: BTreeMap::new(),
     }
 }
 
