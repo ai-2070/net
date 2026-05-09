@@ -1,0 +1,45 @@
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_03fa3cc7afe4c8::t_37bafe42c30659 636-638
+  s_03fa3cc7afe4c8::t_ec53cd96fd4464 264-265,268-270,272-278,280,282,284,286-288,290,292-297
+  s_03fa3cc7afe4c8::t_9083b6975d7063 108,114,117
+  s_03fa3cc7afe4c8::t_9b8ee13586567a 159-165,170
+  s_03fa3cc7afe4c8::t_0ce3660d38ceff 681-682
+  s_03fa3cc7afe4c8::t_442ac050ab4c12 340-344,347
+  s_03fa3cc7afe4c8::t_d1036e78fb0fd0 455
+  s_03fa3cc7afe4c8::t_b65c48d71df448 258-259
+  s_03fa3cc7afe4c8::t_1804a2b36bcee6 487-488,490-491
+  s_03fa3cc7afe4c8::t_be34eee5574202 522
+  s_03fa3cc7afe4c8::t_f2f94b63600fdf 469,471,473-475,477,479
+  s_03fa3cc7afe4c8::t_37da9dfadbde8c 627
+  s_03fa3cc7afe4c8::t_c54cd2737a210f 644,646
+  s_03fa3cc7afe4c8::t_369575e0a5b596 617
+  s_03fa3cc7afe4c8::t_5f7015a6696f99 218,222-225,234,240-241,243-246,250
+  s_03fa3cc7afe4c8::t_371229aa695d12 539-541
+  s_03fa3cc7afe4c8::t_f4aa080269845d 13-17
+  s_03fa3cc7afe4c8::t_76a9c6c4d048ee 31,33-35
+  s_03fa3cc7afe4c8::t_eacd5ab44a76de 193-207
+  s_03fa3cc7afe4c8::t_99417571effa16 353-354,359,361-363,365,367-369
+  s_03fa3cc7afe4c8::t_d6fe28b877fa8f 415,418-419
+  s_03fa3cc7afe4c8::t_fb50e0204f5da3 531
+  s_03fa3cc7afe4c8::t_7a4b6284391904 569
+  s_03fa3cc7afe4c8::t_269d908f4172dd 578-580,582,584,586,588,590
+  s_03fa3cc7afe4c8::t_359bd67509aae6 66-69
+  s_03fa3cc7afe4c8::t_df88740ddfac6f 598-600,611,613
+  s_03fa3cc7afe4c8::t_4f047f59c3c481 675
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "00eca5973539ce9b1b22cf02b9b7069d1f76ae91",
+  "prompts": {},
+  "sessions": {
+    "s_03fa3cc7afe4c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08ddba21-fadf-4d00-a55b-a3d46774b21e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
