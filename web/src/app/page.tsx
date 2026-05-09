@@ -2761,7 +2761,7 @@ function ComputeRuntimeSection() {
 
       <DaemonCaseBlock />
       <MigrationPipeline />
-      <SuperpositionViz />
+      {/*<SuperpositionViz />*/}
       <GroupCards />
       <SpecStrip />
 
@@ -3165,7 +3165,7 @@ function MigrationPipeline() {
     <div className="my-12">
       <div className="flex justify-between items-baseline mb-6 border-b border-line pb-3">
         <h3 className="font-head text-[22px] leading-tight text-ink tracking-[0.04em] lowercase">
-          migration · 6 phases
+          Mikoshi migration · 6 phases
         </h3>
         <span className="text-[10px] text-ink-dim tracking-[0.12em] uppercase">
           strict order · <b className="text-accent">~280ns total</b>
