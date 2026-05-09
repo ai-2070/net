@@ -3168,7 +3168,7 @@ function MigrationPipeline() {
           Mikoshi migration · 6 phases
         </h3>
         <span className="text-[10px] text-ink-dim tracking-[0.12em] uppercase">
-          strict order · <b className="text-accent">~280ns total</b>
+          zero-downtime cutover · <b className="text-accent">~280ns total</b>
         </span>
       </div>
 
