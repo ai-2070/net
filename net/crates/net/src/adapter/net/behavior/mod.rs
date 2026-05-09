@@ -21,6 +21,7 @@ pub mod metadata;
 pub mod proximity;
 pub mod rules;
 pub mod safety;
+pub mod tag;
 
 pub use broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 
@@ -29,6 +30,14 @@ pub use capability::{
     CapabilityIndexStats, CapabilityRequirement, CapabilitySet, GpuInfo, GpuVendor,
     HardwareCapabilities, IndexedNode, Modality, ModelCapability, ResourceLimits, Signature64,
     SoftwareCapabilities, ToolCapability,
+};
+
+// Capability System Plan Phase A foundations — the new typed-tag
+// taxonomy. Re-exported from the behavior plane root so downstream
+// callers reach `Tag` / `TagKey` / `TaxonomyAxis` via the same path
+// they already use for `CapabilitySet`.
+pub use tag::{
+    AxisSeparator, CapabilityTagError, RESERVED_PREFIXES, Tag, TagKey, TaxonomyAxis,
 };
 
 pub use diff::{CapabilityDiff, DiffEngine, DiffError, DiffOp};
