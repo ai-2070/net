@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  s_d1b11a1287c170::t_8f072f0712ab5e 982-989,994,998,1002,1006,1010
+  s_d1b11a1287c170::t_1fe182a463852d 86-90,102-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "2cc8104adf318c14430a0e9caf8261ddf6d5c0cc",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
