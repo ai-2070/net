@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, JSX } from "react";
 
 import { useRepoInfo } from "@/components/RepoInfoProvider";
+import { cn } from "@/lib/cn";
 
 interface Node3D {
   x: number;
@@ -4342,7 +4343,11 @@ function FooterDivider() {
   );
 }
 
-const FOOTER_SPEC: ReadonlyArray<{ href: string; label: string }> = [
+const FOOTER_SPEC: ReadonlyArray<{
+  href: string;
+  label: string;
+  class?: string;
+}> = [
   { href: "#topology", label: "Topology classes" },
   { href: "#properties", label: "Protocol properties" },
   { href: "#mikoshi", label: "Mikoshi" },
@@ -4352,7 +4357,11 @@ const FOOTER_SPEC: ReadonlyArray<{ href: string; label: string }> = [
   { href: "#releases", label: "Releases" },
 ];
 
-const FOOTER_DOCS: ReadonlyArray<{ href: string; label: string }> = [
+const FOOTER_DOCS: ReadonlyArray<{
+  href: string;
+  label: string;
+  class?: string;
+}> = [
   {
     href: "https://github.com/ai-2070/net/blob/master/net/crates/net/README.md",
     label: "README.md",
@@ -4379,7 +4388,11 @@ const FOOTER_DOCS: ReadonlyArray<{ href: string; label: string }> = [
   },
 ];
 
-const FOOTER_RESOURCES: ReadonlyArray<{ href: string; label: string }> = [
+const FOOTER_RESOURCES: ReadonlyArray<{
+  href: string;
+  label: string;
+  class?: string;
+}> = [
   {
     href: "https://crates.io/crates/ai2070-net",
     label: "Rust // crates.io",
@@ -4398,6 +4411,11 @@ const FOOTER_RESOURCES: ReadonlyArray<{ href: string; label: string }> = [
     label: "C // SDK",
   },
   { href: "https://github.com/ai-2070/net", label: "Source // GitHub" },
+  {
+    href: "mailto:makerseven7@gmail.com",
+    label: "▸ Contact",
+    class: "text-accent",
+  },
 ];
 
 const ET_YEAR = new Date().toLocaleString("en-US", {
@@ -4443,7 +4461,7 @@ function FooterColumn({
   items,
 }: {
   title: string;
-  items: ReadonlyArray<{ href: string; label: string }>;
+  items: ReadonlyArray<{ href: string; label: string; class?: string }>;
 }) {
   return (
     <div>
@@ -4460,7 +4478,10 @@ function FooterColumn({
                 {...(external
                   ? { target: "_blank", rel: "noopener noreferrer" }
                   : {})}
-                className="text-ink no-underline text-[12px] hover:text-accent transition-colors"
+                className={cn(
+                  "text-ink no-underline text-[12px] hover:text-accent transition-colors",
+                  it.class,
+                )}
               >
                 {it.label}
               </a>
@@ -4472,7 +4493,7 @@ function FooterColumn({
   );
 }
 
-export default function Home() {
+export default function Home(): JSX.Element {
   return (
     <>
       <NavBar />
