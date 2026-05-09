@@ -4493,6 +4493,64 @@ function FooterColumn({
   );
 }
 
+const GLITCH_CHARS = "█▓▒░@#$%&*+=<>{}[]|/\\01";
+
+function scrambleText(text: string, intensity: number): string {
+  return text
+    .split("")
+    .map((c) => {
+      if (c === " ") return " ";
+      if (Math.random() > intensity) return c;
+      const i = Math.floor(Math.random() * GLITCH_CHARS.length);
+      return GLITCH_CHARS[i] ?? c;
+    })
+    .join("");
+}
+
+function GlitchText({
+  text,
+  intervalMs = 4500,
+  offsetMs = 0,
+}: {
+  text: string;
+  intervalMs?: number;
+  offsetMs?: number;
+}) {
+  const [chars, setChars] = useState(text);
+
+  useEffect(() => {
+    const timeouts: number[] = [];
+
+    const cycle = (): void => {
+      setChars(scrambleText(text, 0.7));
+      timeouts.push(
+        window.setTimeout(() => {
+          setChars(scrambleText(text, 0.4));
+        }, 70),
+      );
+      timeouts.push(
+        window.setTimeout(() => {
+          setChars(text);
+        }, 160),
+      );
+    };
+
+    let intervalId = 0;
+    const startId = window.setTimeout(() => {
+      cycle();
+      intervalId = window.setInterval(cycle, intervalMs);
+    }, offsetMs);
+
+    return () => {
+      window.clearTimeout(startId);
+      if (intervalId) window.clearInterval(intervalId);
+      for (const t of timeouts) window.clearTimeout(t);
+    };
+  }, [text, intervalMs, offsetMs]);
+
+  return <>{chars}</>;
+}
+
 function SeedBanner() {
   return (
     <a
@@ -4501,13 +4559,13 @@ function SeedBanner() {
     >
       <div className="glitch-banner px-6 py-3 flex items-center justify-center gap-3 text-[11px] font-mono tracking-[0.08em] flex-wrap">
         <span className="bg-accent text-bg px-2 py-0.5 font-bold tracking-[0.18em] text-[10px]">
-          SEED ROUND
+          <GlitchText text="SEED ROUND" intervalMs={5400} offsetMs={2700} />
         </span>
         <span className="text-ink">
-          <b className="text-accent glitch-mark" data-text="AI 2070">
-            AI 2070
+          <b className="text-accent">
+            <GlitchText text="AI 2070" intervalMs={5400} />
           </b>{" "}
-          is raising seed funding to build post-cloud nanoscale infra.
+          is raising seed funding to build post-cloud ns-scale infra.
         </span>
         <span className="text-accent inline-flex items-center gap-1">
           get in touch
