@@ -896,6 +896,47 @@ impl CapabilitySet {
         self
     }
 
+    // ========================================================================
+    // Mutable setters — Phase A.5.6 write-path seam.
+    //
+    // These are the *only* places that should write to typed-struct
+    // state on a `CapabilitySet`. The diff engine, the FFI layer
+    // (when applying a remote update), and any other write path go
+    // through these methods, so Phase A.5.N can rewrite the bodies
+    // (e.g. to re-encode into a `tag_set: HashSet<Tag>`) without
+    // touching call sites.
+    //
+    // Each setter takes ownership of the new value to make the
+    // replacement obvious (no ambiguity about whether the caller
+    // retains a partial view) and to give the eventual tag-set
+    // reencoder a single owned input to consume.
+    // ========================================================================
+
+    /// Replace the hardware projection in-place.
+    pub fn set_hardware(&mut self, hardware: HardwareCapabilities) {
+        self.hardware = hardware;
+    }
+
+    /// Replace the software projection in-place.
+    pub fn set_software(&mut self, software: SoftwareCapabilities) {
+        self.software = software;
+    }
+
+    /// Replace the resource-limits projection in-place.
+    pub fn set_limits(&mut self, limits: ResourceLimits) {
+        self.limits = limits;
+    }
+
+    /// Replace the loaded-model list in-place.
+    pub fn set_models(&mut self, models: Vec<ModelCapability>) {
+        self.models = models;
+    }
+
+    /// Replace the available-tool list in-place.
+    pub fn set_tools(&mut self, tools: Vec<ToolCapability>) {
+        self.tools = tools;
+    }
+
     /// Check if has a specific tag
     pub fn has_tag(&self, tag: &str) -> bool {
         self.tags.iter().any(|t| t == tag)

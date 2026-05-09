@@ -750,6 +750,19 @@ impl DiffEngine {
 
     /// Apply a single diff operation
     fn apply_op(caps: &mut CapabilitySet, op: &DiffOp, strict: bool) -> Result<(), DiffError> {
+        // Phase A.5.6: every write goes through CapabilitySet's
+        // typed setters (`set_hardware` / `set_software` / `set_limits`
+        // / `set_models` / `set_tools`) instead of touching the typed
+        // struct fields directly. Partial-field updates use the
+        // read-modify-write idiom: pull the projection via `views()`,
+        // mutate the owned clone, then hand the whole thing back via
+        // the matching setter. Post-Phase-A.5.N (when typed fields
+        // are gone), the setter bodies re-encode into the underlying
+        // tag set; this function does not need to change again.
+        //
+        // `caps.tags` stays as direct `Vec<String>` access — tags
+        // are a top-level field on `CapabilitySet` and survive
+        // Phase A.5.N unchanged.
         match op {
             DiffOp::AddTag(tag) => {
                 if !caps.tags.contains(tag) {
@@ -765,14 +778,22 @@ impl DiffEngine {
             }
             DiffOp::AddModel(model) => {
                 // Remove existing model with same ID if present
-                caps.models.retain(|m| m.model_id != model.model_id);
-                caps.models.push(model.clone());
+                let mut models = caps.views().models;
+                models.retain(|m| m.model_id != model.model_id);
+                models.push(model.clone());
+                caps.set_models(models);
             }
             DiffOp::RemoveModel(model_id) => {
-                let before = caps.models.len();
-                caps.models.retain(|m| m.model_id != *model_id);
-                if strict && caps.models.len() == before {
-                    return Err(DiffError::ModelNotFound(model_id.clone()));
+                let mut models = caps.views().models;
+                let before = models.len();
+                models.retain(|m| m.model_id != *model_id);
+                if models.len() == before {
+                    if strict {
+                        return Err(DiffError::ModelNotFound(model_id.clone()));
+                    }
+                    // No-op; skip the redundant set_models clone.
+                } else {
+                    caps.set_models(models);
                 }
             }
             DiffOp::UpdateModel {
@@ -780,75 +801,101 @@ impl DiffEngine {
                 tokens_per_sec,
                 loaded,
             } => {
-                if let Some(model) = caps.models.iter_mut().find(|m| m.model_id == *model_id) {
+                let mut models = caps.views().models;
+                if let Some(model) = models.iter_mut().find(|m| m.model_id == *model_id) {
                     if let Some(tps) = tokens_per_sec {
                         model.tokens_per_sec = *tps;
                     }
                     if let Some(l) = loaded {
                         model.loaded = *l;
                     }
+                    caps.set_models(models);
                 } else if strict {
                     return Err(DiffError::ModelNotFound(model_id.clone()));
                 }
             }
             DiffOp::AddTool(tool) => {
-                // Remove existing tool with same ID if present
-                caps.tools.retain(|t| t.tool_id != tool.tool_id);
-                caps.tools.push(tool.clone());
+                let mut tools = caps.views().tools;
+                tools.retain(|t| t.tool_id != tool.tool_id);
+                tools.push(tool.clone());
+                caps.set_tools(tools);
             }
             DiffOp::RemoveTool(tool_id) => {
-                let before = caps.tools.len();
-                caps.tools.retain(|t| t.tool_id != *tool_id);
-                if strict && caps.tools.len() == before {
-                    return Err(DiffError::ToolNotFound(tool_id.clone()));
+                let mut tools = caps.views().tools;
+                let before = tools.len();
+                tools.retain(|t| t.tool_id != *tool_id);
+                if tools.len() == before {
+                    if strict {
+                        return Err(DiffError::ToolNotFound(tool_id.clone()));
+                    }
+                } else {
+                    caps.set_tools(tools);
                 }
             }
             DiffOp::UpdateHardware(hw) => {
-                caps.hardware = hw.clone();
+                caps.set_hardware(hw.clone());
             }
             DiffOp::UpdateMemory(mem) => {
-                caps.hardware.memory_mb = *mem;
+                let mut hw = caps.views().hardware;
+                hw.memory_mb = *mem;
+                caps.set_hardware(hw);
             }
             DiffOp::UpdateNetwork(net) => {
-                caps.hardware.network_mbps = *net;
+                let mut hw = caps.views().hardware;
+                hw.network_mbps = *net;
+                caps.set_hardware(hw);
             }
             DiffOp::UpdateSoftware(sw) => {
-                caps.software = sw.clone();
+                caps.set_software(sw.clone());
             }
             DiffOp::AddRuntime { name, version } => {
-                // Remove existing runtime with same name
-                caps.software.runtimes.retain(|(n, _)| n != name);
-                caps.software.runtimes.push((name.clone(), version.clone()));
+                let mut sw = caps.views().software;
+                sw.runtimes.retain(|(n, _)| n != name);
+                sw.runtimes.push((name.clone(), version.clone()));
+                caps.set_software(sw);
             }
             DiffOp::RemoveRuntime(name) => {
-                let before = caps.software.runtimes.len();
-                caps.software.runtimes.retain(|(n, _)| n != name);
-                if strict && caps.software.runtimes.len() == before {
-                    return Err(DiffError::RuntimeNotFound(name.clone()));
+                let mut sw = caps.views().software;
+                let before = sw.runtimes.len();
+                sw.runtimes.retain(|(n, _)| n != name);
+                if sw.runtimes.len() == before {
+                    if strict {
+                        return Err(DiffError::RuntimeNotFound(name.clone()));
+                    }
+                } else {
+                    caps.set_software(sw);
                 }
             }
             DiffOp::AddFramework { name, version } => {
-                // Remove existing framework with same name
-                caps.software.frameworks.retain(|(n, _)| n != name);
-                caps.software
-                    .frameworks
-                    .push((name.clone(), version.clone()));
+                let mut sw = caps.views().software;
+                sw.frameworks.retain(|(n, _)| n != name);
+                sw.frameworks.push((name.clone(), version.clone()));
+                caps.set_software(sw);
             }
             DiffOp::RemoveFramework(name) => {
-                let before = caps.software.frameworks.len();
-                caps.software.frameworks.retain(|(n, _)| n != name);
-                if strict && caps.software.frameworks.len() == before {
-                    return Err(DiffError::FrameworkNotFound(name.clone()));
+                let mut sw = caps.views().software;
+                let before = sw.frameworks.len();
+                sw.frameworks.retain(|(n, _)| n != name);
+                if sw.frameworks.len() == before {
+                    if strict {
+                        return Err(DiffError::FrameworkNotFound(name.clone()));
+                    }
+                } else {
+                    caps.set_software(sw);
                 }
             }
             DiffOp::UpdateLimits(limits) => {
-                caps.limits = limits.clone();
+                caps.set_limits(limits.clone());
             }
             DiffOp::UpdateMaxConcurrent(max) => {
-                caps.limits.max_concurrent_requests = *max;
+                let mut limits = caps.views().resource_limits;
+                limits.max_concurrent_requests = *max;
+                caps.set_limits(limits);
             }
             DiffOp::UpdateRateLimit(rpm) => {
-                caps.limits.rate_limit_rpm = *rpm;
+                let mut limits = caps.views().resource_limits;
+                limits.rate_limit_rpm = *rpm;
+                caps.set_limits(limits);
             }
             DiffOp::SetField { path, .. } | DiffOp::UnsetField { path } => {
                 // SetField/UnsetField are unimplemented — the
