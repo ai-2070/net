@@ -1,0 +1,24 @@
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_03fa3cc7afe4c8::t_075866e3607bad 482-483
+  s_03fa3cc7afe4c8::t_7f88a8d252aa56 260
+  s_03fa3cc7afe4c8::t_19bee63383df7f 295-296
+  s_03fa3cc7afe4c8::t_e65cf59065cf7a 423
+  s_03fa3cc7afe4c8::t_38f1c542eca3a6 359
+  s_03fa3cc7afe4c8::t_a4e1c50d0d3b33 545
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "e34aafa2261c157b1ffb8956c9c840577239d475",
+  "prompts": {},
+  "sessions": {
+    "s_03fa3cc7afe4c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08ddba21-fadf-4d00-a55b-a3d46774b21e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
