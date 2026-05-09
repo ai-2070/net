@@ -401,61 +401,75 @@ impl DiffEngine {
     pub fn diff(old: &CapabilitySet, new: &CapabilitySet) -> Vec<DiffOp> {
         let mut ops = Vec::new();
 
+        // Phase A.5.4: read both sides through views() once. Post
+        // Phase A.5.N (when the typed-struct fields are removed),
+        // this is the only seam this function will need to touch.
+        let old_views = old.views();
+        let new_views = new.views();
+
         // Diff tags
         Self::diff_tags(&old.tags, &new.tags, &mut ops);
 
         // Diff models
-        Self::diff_models(&old.models, &new.models, &mut ops);
+        Self::diff_models(&old_views.models, &new_views.models, &mut ops);
 
         // Diff tools
-        Self::diff_tools(&old.tools, &new.tools, &mut ops);
+        Self::diff_tools(&old_views.tools, &new_views.tools, &mut ops);
 
         // Diff hardware (only if changed)
-        if old.hardware != new.hardware {
+        if old_views.hardware != new_views.hardware {
             // Check for partial updates
-            if old.hardware.memory_mb != new.hardware.memory_mb
-                && old.hardware.cpu_cores == new.hardware.cpu_cores
-                && old.hardware.gpu == new.hardware.gpu
-                && old.hardware.storage_mb == new.hardware.storage_mb
-                && old.hardware.network_mbps == new.hardware.network_mbps
+            if old_views.hardware.memory_mb != new_views.hardware.memory_mb
+                && old_views.hardware.cpu_cores == new_views.hardware.cpu_cores
+                && old_views.hardware.gpu == new_views.hardware.gpu
+                && old_views.hardware.storage_mb == new_views.hardware.storage_mb
+                && old_views.hardware.network_mbps == new_views.hardware.network_mbps
             {
-                ops.push(DiffOp::UpdateMemory(new.hardware.memory_mb));
-            } else if old.hardware.network_mbps != new.hardware.network_mbps
-                && old.hardware.cpu_cores == new.hardware.cpu_cores
-                && old.hardware.gpu == new.hardware.gpu
-                && old.hardware.memory_mb == new.hardware.memory_mb
-                && old.hardware.storage_mb == new.hardware.storage_mb
+                ops.push(DiffOp::UpdateMemory(new_views.hardware.memory_mb));
+            } else if old_views.hardware.network_mbps != new_views.hardware.network_mbps
+                && old_views.hardware.cpu_cores == new_views.hardware.cpu_cores
+                && old_views.hardware.gpu == new_views.hardware.gpu
+                && old_views.hardware.memory_mb == new_views.hardware.memory_mb
+                && old_views.hardware.storage_mb == new_views.hardware.storage_mb
             {
-                ops.push(DiffOp::UpdateNetwork(new.hardware.network_mbps));
+                ops.push(DiffOp::UpdateNetwork(new_views.hardware.network_mbps));
             } else {
-                ops.push(DiffOp::UpdateHardware(new.hardware.clone()));
+                ops.push(DiffOp::UpdateHardware(new_views.hardware.clone()));
             }
         }
 
         // Diff software
-        if old.software != new.software {
-            Self::diff_software(&old.software, &new.software, &mut ops);
+        if old_views.software != new_views.software {
+            Self::diff_software(&old_views.software, &new_views.software, &mut ops);
         }
 
         // Diff limits (only if changed)
-        if old.limits != new.limits {
+        if old_views.resource_limits != new_views.resource_limits {
             // Check for partial updates
-            if old.limits.max_concurrent_requests != new.limits.max_concurrent_requests
-                && old.limits.max_tokens_per_request == new.limits.max_tokens_per_request
-                && old.limits.rate_limit_rpm == new.limits.rate_limit_rpm
-                && old.limits.max_batch_size == new.limits.max_batch_size
+            if old_views.resource_limits.max_concurrent_requests
+                != new_views.resource_limits.max_concurrent_requests
+                && old_views.resource_limits.max_tokens_per_request
+                    == new_views.resource_limits.max_tokens_per_request
+                && old_views.resource_limits.rate_limit_rpm
+                    == new_views.resource_limits.rate_limit_rpm
+                && old_views.resource_limits.max_batch_size
+                    == new_views.resource_limits.max_batch_size
             {
                 ops.push(DiffOp::UpdateMaxConcurrent(
-                    new.limits.max_concurrent_requests,
+                    new_views.resource_limits.max_concurrent_requests,
                 ));
-            } else if old.limits.rate_limit_rpm != new.limits.rate_limit_rpm
-                && old.limits.max_concurrent_requests == new.limits.max_concurrent_requests
-                && old.limits.max_tokens_per_request == new.limits.max_tokens_per_request
-                && old.limits.max_batch_size == new.limits.max_batch_size
+            } else if old_views.resource_limits.rate_limit_rpm
+                != new_views.resource_limits.rate_limit_rpm
+                && old_views.resource_limits.max_concurrent_requests
+                    == new_views.resource_limits.max_concurrent_requests
+                && old_views.resource_limits.max_tokens_per_request
+                    == new_views.resource_limits.max_tokens_per_request
+                && old_views.resource_limits.max_batch_size
+                    == new_views.resource_limits.max_batch_size
             {
-                ops.push(DiffOp::UpdateRateLimit(new.limits.rate_limit_rpm));
+                ops.push(DiffOp::UpdateRateLimit(new_views.resource_limits.rate_limit_rpm));
             } else {
-                ops.push(DiffOp::UpdateLimits(new.limits.clone()));
+                ops.push(DiffOp::UpdateLimits(new_views.resource_limits.clone()));
             }
         }
 
