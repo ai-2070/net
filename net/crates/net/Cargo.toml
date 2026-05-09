@@ -136,7 +136,7 @@ igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"
 redis = { version = "1.2", features = ["tokio-comp", "connection-manager"], optional = true }
 
 # JetStream adapter (optional)
-async-nats = { version = "0.47", optional = true }
+async-nats = { version = "0.48", optional = true }
 
 # RedEX adapter (optional)
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
