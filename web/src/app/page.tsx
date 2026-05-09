@@ -4176,9 +4176,9 @@ function BlackwallSection() {
       <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-16 max-w-[900px]">
         <p className="text-[18px] text-ink leading-[1.5] font-light">
           Any single mechanism can be overwhelmed. All of them together form the
-          Blackwall.{" "}
+          wall.{" "}
           <strong className="text-accent font-medium">
-            No single point to breach because the wall is the mesh itself.
+            No single point to breach because the Blackwall is the mesh itself.
           </strong>
         </p>
       </div>
