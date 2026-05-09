@@ -971,6 +971,68 @@ fn is_software_struct_key(key: &str) -> bool {
 }
 
 // =============================================================================
+// Phase A.5.N.3 — axis-owned tag predicates for in-place re-encoding.
+//
+// `set_*` / `with_*` mutators on `CapabilitySet` clear the tags
+// owned by one struct before re-emitting the new ones. These
+// predicates name the boundaries.
+// =============================================================================
+
+/// True if `tag` is a `hardware.*` tag owned by `HardwareCapabilities`
+/// (cpu / memory / gpu / storage / network / accelerators), excluding
+/// `hardware.limits.*` which is owned by `ResourceLimits`.
+pub fn is_hardware_owned_tag(tag: &Tag) -> bool {
+    let Some(key) = tag.axis_key() else {
+        return false;
+    };
+    if key.axis != TaxonomyAxis::Hardware {
+        return false;
+    }
+    !key.key.starts_with("limits.")
+}
+
+/// True if `tag` is a `hardware.limits.*` tag owned by
+/// `ResourceLimits`.
+pub fn is_resource_limits_owned_tag(tag: &Tag) -> bool {
+    let Some(key) = tag.axis_key() else {
+        return false;
+    };
+    key.axis == TaxonomyAxis::Hardware && key.key.starts_with("limits.")
+}
+
+/// True if `tag` is a `software.*` tag owned by `SoftwareCapabilities`
+/// (os / cuda / runtimes / frameworks / drivers), excluding the
+/// `software.model.*` and `software.tool.*` indexed sub-keys owned
+/// by `Vec<ModelCapability>` and `Vec<ToolCapability>`.
+pub fn is_software_owned_tag(tag: &Tag) -> bool {
+    let Some(key) = tag.axis_key() else {
+        return false;
+    };
+    if key.axis != TaxonomyAxis::Software {
+        return false;
+    }
+    !key.key.starts_with("model.") && !key.key.starts_with("tool.")
+}
+
+/// True if `tag` is a `software.model.*` tag owned by
+/// `Vec<ModelCapability>`.
+pub fn is_models_owned_tag(tag: &Tag) -> bool {
+    let Some(key) = tag.axis_key() else {
+        return false;
+    };
+    key.axis == TaxonomyAxis::Software && key.key.starts_with("model.")
+}
+
+/// True if `tag` is a `software.tool.*` tag owned by
+/// `Vec<ToolCapability>`.
+pub fn is_tools_owned_tag(tag: &Tag) -> bool {
+    let Some(key) = tag.axis_key() else {
+        return false;
+    };
+    key.axis == TaxonomyAxis::Software && key.key.starts_with("tool.")
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 

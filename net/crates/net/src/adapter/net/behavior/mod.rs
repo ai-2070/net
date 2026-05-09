@@ -49,9 +49,10 @@ pub use required_capability::{RequireParseError, RequiredCapability};
 
 pub use tag_codec::{
     capability_set_from_tag_set, capability_set_to_tag_set, hardware_from_tags,
-    hardware_to_tags, models_from_tags, models_to_tags, resource_limits_from_tags,
-    resource_limits_to_tags, software_from_tags, software_to_tags, tools_from_tags,
-    tools_to_tags,
+    hardware_to_tags, is_hardware_owned_tag, is_models_owned_tag, is_resource_limits_owned_tag,
+    is_software_owned_tag, is_tools_owned_tag, models_from_tags, models_to_tags,
+    resource_limits_from_tags, resource_limits_to_tags, software_from_tags, software_to_tags,
+    tools_from_tags, tools_to_tags,
 };
 
 pub use diff::{CapabilityDiff, DiffEngine, DiffError, DiffOp};
