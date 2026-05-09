@@ -4,7 +4,7 @@
 
 ## Status
 
-Design only. Activation gate: any one of the Warriors phases needs to land. The pieces here ship together because they compose against each other; shipping only some breaks the architectural symmetry the release depends on.
+**Ready for implementation.** The migration rule, the missing-primitives surface, the six open questions, and the Phase F detail gaps are all locked below — see [Locked decisions](#locked-decisions). Activation gate (when Warriors as a whole ships) is unchanged: any one of the Warriors phases needs to land. The pieces here ship together because they compose against each other; shipping only some breaks the architectural symmetry the release depends on.
 
 ## Frame
 
@@ -64,6 +64,32 @@ The four axes:
 **Migration from flat tags.** Existing tags without an axis prefix continue to work for one minor version (parsed as untyped legacy tags). New code emits with axis prefixes. After deprecation window, untyped tags log a warning. Hard-removal in the next major.
 
 **Reserved prefixes.** `causal:`, `heat:`, `fork-of:`, `scope:` — plus the four axis prefixes — are reserved. Application code emitting tags with reserved prefixes is rejected via `CapabilityError::ReservedPrefix`. Pin in tests.
+
+**Typed structs become local view projections (LOCKED).** Today `CapabilitySet` carries five typed structs alongside the tag set: `HardwareCapabilities`, `SoftwareCapabilities`, `ModelCapability`, `ToolCapability`, `ResourceLimits`. They live in Rust, Node, Python, and Go bindings. After Warriors:
+
+- **Wire format propagates only `tags` + `metadata`.** The typed structs leave the `CapabilitySet` struct entirely; they are not serialized, not stored on the type, not relayed across the substrate.
+- **Each binding keeps its typed struct as a *view*.** The struct is reconstructed from the tag set via `From<&CapabilitySet>` lookup helpers — the same pattern Kubernetes uses for typed constraint helpers over labels.
+- **Bindings expose the helpers, not the storage.** Code that today reads `caps.hardware.gpu.vram_mb` reads it through `HardwareCapabilities::from(&caps).gpu.vram_mb` after Warriors. The taxonomy guarantees the round-trip: every typed-struct field maps to a deterministic axis-prefixed tag (`hardware.gpu.vram_gb=<n>`, etc.); the helper enumerates the tag set and rebuilds the struct.
+
+Concretely:
+
+```rust
+pub struct CapabilitySet {
+    pub tags: HashSet<Tag>,
+    pub metadata: BTreeMap<String, String>,
+}
+
+// Local projections — derived, not stored.
+impl From<&CapabilitySet> for HardwareCapabilities { /* ... */ }
+impl From<&CapabilitySet> for SoftwareCapabilities { /* ... */ }
+impl From<&CapabilitySet> for ResourceLimits       { /* ... */ }
+// `ModelCapability` and `ToolCapability` already live in Vec<_> form;
+// they re-emerge from `software.model:*` / `software.tool:*` tags.
+```
+
+This avoids breaking the world: no field has to be removed from the bindings' public surface, only relocated from "data on the struct" to "view derived from the tag set." Application code that reads `.hardware.gpu` keeps working with one-line site changes (the helper call); cross-binding propagation is purely tags + metadata.
+
+The plan's Phase A (typed taxonomy migration) implements this: every typed-struct field gets an axis-prefixed tag emitter, and the binding-side `From<&CapabilitySet>` helpers ship alongside.
 
 ### 2. Tag shapes — discovery primitive
 
@@ -311,8 +337,17 @@ Substrate-level placement primitive. Lives in `behavior::placement`.
 ```rust
 pub trait PlacementFilter: Send + Sync {
     /// Score a candidate node for placement of an artifact.
-    /// Returns `None` if the node is ineligible (hard constraint failed);
-    /// returns `Some(score)` where higher = better fit. Score range conventionally [0.0, 1.0].
+    ///
+    /// Contract:
+    /// - Returns `None` if the node is ineligible (hard constraint failed) — equivalent to
+    ///   `Some(0.0)` for ranking purposes; `None` is preferred so the scheduler can short-
+    ///   circuit candidate enumeration.
+    /// - Returns `Some(score)` with `score ∈ [0.0, 1.0]`. Higher = better fit.
+    /// - Composes multiplicatively across axes inside `StandardPlacement`; a `0.0` on any
+    ///   axis zeroes the final score. Custom impls SHOULD preserve this invariant.
+    /// - Implementations MUST be `Send + Sync` (the trait bound enforces it; pin in tests).
+    /// - Tie-breaking when two candidates score equal is the scheduler's responsibility,
+    ///   not the filter's — see the "Tie-breaking" decision in this section.
     fn placement_score(&self, target: &NodeId, artifact: &Artifact<'_>) -> Option<f32>;
 }
 
@@ -376,6 +411,16 @@ pub enum ColocationPolicy {
 
 Plus an anti-affinity term that penalizes nodes already leading > 30% of channels (prevents leadership concentration; reused by `REDEX_DISTRIBUTED_PLAN.md`'s replica election).
 
+**Score composition (LOCKED).** All axes — including the anti-affinity term — combine *multiplicatively* in `[0.0, 1.0]`. A `0.0` on any axis (hard-constraint failure or out-of-budget proximity) zeroes the final score; this is the load-bearing invariant `Option<f32>::None` and `Some(0.0)` both express. The earlier draft described anti-affinity as "additive"; that's wrong because additive composition can rescue a node that another axis already vetoed. Multiplicative composition keeps every axis a true veto.
+
+**Tie-breaking (LOCKED).** When `placement_score` returns equal `f32` values across multiple candidates, the scheduler resolves with a deterministic three-step ordering:
+
+1. **Lower RTT wins.** Use the proximity graph's measured RTT to the candidate; deterministic per local view.
+2. **Higher free resource wins.** For `ResourceAxis::Compute` use free RAM (or VRAM if the artifact required GPU); for `Storage` use `dataforts.free_storage_gb`; for `Both` use the same weighted axis the score used.
+3. **Lexicographic `NodeId` fallback.** Final deterministic tie-breaker; eliminates the `partial_cmp(...).unwrap_or(Ordering::Equal)` non-determinism that the existing `compute/scheduler.rs` exhibits today.
+
+Pin all three steps in tests; the scheduler's existing `find_migration_targets` and the new `select_member_node` / `select_promotion_target` paths use the same comparator.
+
 **Intent registry.** A small lookup table `adapter::net::placement::intent::IntentRegistry`:
 
 ```rust
@@ -418,20 +463,40 @@ metadata.attract-budget:100us             # max acceptable RTT to the flagship
 metadata.attract-fallback-scopes:equinix-ny4,us-east-region   # optional ladder
 ```
 
+**New proximity API (LOCKED).** Phase F adds one method to the existing `behavior::proximity` module:
+
+```rust
+impl ProximityGraph {
+    /// Find the lowest-RTT node from `candidate`'s local view that satisfies `predicate`.
+    /// `None` if no node in the local view matches the predicate.
+    ///
+    /// Used by `StandardPlacement` for scope-attraction scoring (this section) and by
+    /// `REDEX_DISTRIBUTED_PLAN.md`'s replica selection. The proximity graph already
+    /// tracks pairwise RTT; this helper is a small lookup over the existing data.
+    pub fn nearest_rtt(
+        &self,
+        candidate: NodeId,
+        predicate: impl Fn(NodeId) -> bool,
+    ) -> Option<Duration>;
+}
+```
+
+This is the only new proximity-graph method the plan requires. Anything richer (k-nearest, weighted distance, multi-hop pathing) parks for a future plan.
+
 The placement-filter extension scores candidate nodes:
 
 ```rust
 fn attract_score(candidate: &NodeId, target_scope: &ScopeLabel, budget: Duration) -> f32 {
     if candidate carries target_scope:
         return 1.0;  // co-located, perfect concentration
-    let rtt = proximity_graph.nearest_rtt(candidate, |n| n.tags.contains(target_scope));
+    let rtt = proximity_graph.nearest_rtt(*candidate, |n| n_carries_scope(n, target_scope));
     if rtt > budget:
         return 0.0;  // out of budget
     1.0 - (rtt.as_nanos() as f32 / budget.as_nanos() as f32)
 }
 ```
 
-This becomes another input to `StandardPlacement::placement_score`, multiplied with the other axes. A daemon that requires GPU + scope:prod + intent:trading-engine + attract-to-scope:nyse-trading-floor + ≥ 80 GB free VRAM lands on the highest-scoring intersection of all five constraints.
+This becomes another input to `StandardPlacement::placement_score`, **multiplied** with the other axes per the locked composition rule (a `0.0` here zeroes the candidate). A daemon that requires GPU + scope:prod + intent:trading-engine + attract-to-scope:nyse-trading-floor + ≥ 80 GB free VRAM lands on the highest-scoring intersection of all five constraints.
 
 **Why this is genuinely simple:**
 
@@ -539,10 +604,15 @@ Eight phases in dependency order:
 
 ### Phase A — Typed taxonomy migration (1 week)
 
+Preconditions (locked above): typed-struct migration story (view-projection rule), missing-primitives surface (`Tag`, `TagKey`, `RequiredCapability`, `Aggregator`, `Predicate`, `pred!` / `require*!` macros).
+
 - Add `TaxonomyAxis` enum (`Hardware`, `Software`, `Devices`, `Dataforts`).
+- Land the missing primitives listed in [Locked decisions § Missing primitives](#missing-primitives-phase-a-precondition). Mechanical; ~600 LoC across `behavior::capability::tag` + `behavior::capability::predicate` + `behavior::placement::intent`.
 - Tag parser recognizes axis-prefixed shapes; legacy untyped tags parse with deprecation warning.
 - Existing capability-emitting code paths emit with axis prefixes.
-- Documentation update — `CAPABILITIES.md` adds the four-axis model.
+- **`From<&CapabilitySet>` view helpers** ship for `HardwareCapabilities`, `SoftwareCapabilities`, `ResourceLimits` in Rust core. Bindings (Phase H) re-export the same projection.
+- **Remove the typed structs from `CapabilitySet`'s field set** in the same change. Application sites that read `caps.hardware.gpu` migrate to `HardwareCapabilities::from(&caps).gpu` — codemod-friendly; the helper preserves the same nested-struct shape.
+- Documentation update — `CAPABILITIES.md` adds the four-axis model + the view-projection rule.
 
 ### Phase B — Tag shapes for discovery (3 days)
 
@@ -579,24 +649,29 @@ Eight phases in dependency order:
 
 ### Phase F — `PlacementFilter` trait + `StandardPlacement` (1 week)
 
-- New module `behavior::placement` with the `PlacementFilter` trait + `Artifact` enum + `StandardPlacement` reference impl.
+- New module `behavior::placement` with the `PlacementFilter` trait + `Artifact` enum + `StandardPlacement` reference impl. Trait contract per [Locked decisions § Phase F](#phase-f-detail-decisions): score range `[0.0, 1.0]`, multiplicative composition across axes (anti-affinity included).
 - `IntentRegistry` with default mappings + extensibility.
 - `IntentMatchPolicy` and `ColocationPolicy` definitions.
 - `AntiAffinityConfig` with the leadership-concentration penalty (consumed by `REDEX_DISTRIBUTED_PLAN.md`).
-- Reference test suite: each axis individually scored; cross-axis composition matches the product of single-axis scores.
+- **Tie-breaking comparator** in the scheduler (`compute/scheduler.rs`): replaces the existing `partial_cmp(...).unwrap_or(Ordering::Equal)` with the locked three-step RTT → free-resource → lexicographic-NodeId ordering. Same comparator used by `find_migration_targets`, `select_member_node`, `select_promotion_target`.
+- **`ProximityGraph::nearest_rtt`** API in `behavior::proximity`. Small lookup over the existing pairwise-RTT data.
+- Reference test suite: each axis individually scored; cross-axis multiplicative composition; `0.0 anywhere → 0.0 final` invariant pinned; tie-breaking is deterministic across runs.
 
 ### Phase G — Mikoshi integration (1 week)
 
-- `Mikoshi::select_migration_target` consults `PlacementFilter`.
-- Legacy fallback as `Mikoshi::select_migration_target_legacy` + `LegacyPlacement` filter.
-- Feature flag `mikoshi-placement-v2` (on-by-default).
-- `MeshDaemon` trait extended with `required_capabilities()` / `optional_capabilities()` (empty defaults for backward compat).
-- Replica/fork/standby groups extended to use `PlacementFilter` for placement.
+"Mikoshi" is the colloquial name for the existing 6-phase migration stack — `compute/{migration,orchestrator,migration_source,migration_target,scheduler}.rs` plus `MigrationOrchestrator` and `Scheduler`. See [`COMPUTE.md`](../COMPUTE.md) for the full surface. This phase upgrades target selection inside that existing stack to consult `PlacementFilter`; the migration mechanism (snapshot → transfer → restore → replay → cutover → complete) is unchanged per [Locked decision 6](#six-previously-open-questions).
+
+- `Scheduler::find_migration_targets` (and the existing `place_migration`) consult `PlacementFilter` for scoring + the locked three-step tie-breaker.
+- A wrapping `Scheduler::select_migration_target(daemon, &dyn PlacementFilter) -> Option<NodeId>` returns the highest-scoring candidate; legacy capability-match-only behavior preserved as `LegacyPlacement` impl of `PlacementFilter` for one minor version.
+- Feature flag `mikoshi-placement-v2` (on-by-default in `ai2070-net`); operators with custom legacy placement get one minor version of compatibility window.
+- `MeshDaemon` trait (`compute/daemon.rs`) extended with `required_capabilities()` / `optional_capabilities()` returning `CapabilitySet`. Empty defaults for backward compat (any node accepts placement).
+- Replica/fork/standby groups (`compute/{replica_group,fork_group,standby_group}.rs`) extended to use `PlacementFilter` for placement via `select_member_node` / `select_promotion_target`. Same tie-breaker.
 - Tests:
   - Daemon with `hardware.gpu` requirement migrates only to GPU nodes.
   - Daemon with `metadata.intent: "sensor-telemetry"` migrates to nodes with `devices.*` tags.
   - Daemon with `metadata.colocate-with: <chain>` migrates to the node holding that chain.
   - Cross-axis: daemon with multiple constraints lands at the intersection.
+  - Tie-breaking determinism: two equally-scored candidates always pick the same one across runs (RTT → free-resource → lexicographic).
 
 ### Phase H — Bindings (1 week, parallelisable)
 
@@ -664,19 +739,49 @@ Eight phases in dependency order:
 
 ---
 
-## Open design questions to lock before implementation
+## Locked decisions
 
-1. **Legacy tag deprecation window.** One minor version (default), or longer? **Recommendation:** one minor version with hard-removal in the next major. Survey current tag usage in the repo first; if heavy untyped-tag use exists, extend the window.
+The plan's previously-open questions are ratified below. Each is treated as binding for Phase A onward; reverting any of these is a plan-revision concern, not a per-phase implementation concern.
 
-2. **Metadata size cap.** What's the per-CapabilitySet metadata budget? **Recommendation:** soft cap at 4 KB (most uses are sub-1KB; cap surfaces accidental abuse); hard cap at 16 KB with `CapabilityError::MetadataTooLarge`. Configurable per-channel via `ChannelConfig::metadata_cap_bytes`.
+### Migration story (Phase A precondition)
 
-3. **Federated query default.** Local-only by default (recommended) or federated by default? **Recommendation:** local-only. Federated execution can have surprising latency and bandwidth costs; opting in via `Federated` wrapper makes the cost explicit. Pin in test.
+**Typed structs become local view projections, not stored data.** See the "Typed structs become local view projections (LOCKED)" block in §1. Wire format propagates only `tags` + `metadata`; each binding's `HardwareCapabilities` / `SoftwareCapabilities` / `ResourceLimits` (and the `Vec<ModelCapability>` / `Vec<ToolCapability>` collections) re-emerge via `From<&CapabilitySet>` lookup helpers. Public binding surfaces don't lose fields — they relocate from "stored on the struct" to "derived from the tag set."
 
-4. **Anti-affinity scope.** Is the anti-affinity penalty applied only at placement-decision time, or continuously revisited? **Recommendation:** placement-decision time only for The Warriors. Continuous rebalancing is Atomic Playboys territory (federated mesh-wide scheduler).
+### Missing primitives (Phase A precondition)
 
-5. **`PlacementFilter` thread-safety.** Trait is `Send + Sync`; impls must be thread-safe. The `Custom(Box<dyn Fn>)` variant of `IntentMatchPolicy` carries the same constraint. Pin in tests; document.
+The following Rust items must land before Phase A's first commit. Shapes are exactly as specified in §2 (`Tag`), §6 (`Predicate`, `TagKey`, `Aggregator`), and §7 (`RequiredCapability`, `IntentRegistry`); they are accepted verbatim. Mechanical to define and uncontroversial:
 
-6. **Mikoshi v2 boundary.** This plan integrates Mikoshi with `PlacementFilter` but does not change the migration mechanism (snapshot/replay still happens). Live migration without snapshot, delta-based migration, and continuous placement re-evaluation are explicitly Atomic Playboys territory. Document the boundary in `CAPABILITIES.md` and Mikoshi's narrative doc.
+- `Tag` — opaque parsed-tag value with axis-prefix dispatch (§1, §2). Parser rejects reserved prefixes via `CapabilityError::ReservedPrefix`. Implements `From<&str>` (returns `Result`), `Display`, `Hash`, `Eq`.
+- `TagKey { axis: TaxonomyAxis, key: String }` — key half of a `Tag` (§6, line 220-225). Used by `Predicate` variants that match the *key* without the value.
+- `RequiredCapability` — element type of the `IntentRegistry` value vector (§7). One-of-three shape: `Tag(Tag)`, `AxisPresent(TaxonomyAxis)`, `AxisKeyValue(TaxonomyAxis, String)` — produced by the `require!` / `require_axis!` / `require_axis_value!` macros respectively.
+- `Aggregator` trait — used by §6's `aggregate` operator. Single method `fn fold(&self, acc: &mut Self::Output, candidate: &CapabilitySet)`; associated type `Output: Default + Send`. Concrete impls: `CountAggregator`, `SumAggregator { tag_key: TagKey }`, `MaxAggregator { tag_key: TagKey }`. Custom impls plug in via the trait.
+- `Predicate` enum — exactly the 13 variants in §6a (`Exists`, `Equals`, `NumericAtLeast/AtMost/InRange`, `SemverAtLeast/AtMost/Compatible`, `StringPrefix`, `StringMatches`, `MetadataExists/Equals/Matches/NumericAtLeast`, `And`, `Or`, `Not`). `Not(Predicate::NumericAtLeast(...))` evaluating against an unparseable tag value yields `false` (the inner `false` does NOT flip to `true`) — predicate failure is a hard miss, not a logical inversion. Pin in tests.
+- `pred!` macro — parse-time DSL → `Predicate` AST (§6a, lines 263-291). Validates shapes at parse time; runtime evaluation is purely the parsed AST.
+- `require!` / `require_axis!` / `require_axis_value!` macros — sugar producing `RequiredCapability` values for use in `IntentRegistry::defaults()` (§7, lines 387-395).
+
+The plan does NOT add: macro-defined predicates beyond `pred!` (no `match!`, no `traverse!` — the operators consume already-parsed `Predicate` ASTs); a custom-aggregator-via-macro shorthand (impls go through the trait); an `Artifact::*` constructor macro (the enum is constructed directly).
+
+### Six previously-open questions
+
+1. **Legacy tag deprecation window — one minor version.** Untyped tags continue parsing for one minor version with deprecation warnings; hard-removal in the next major. Survey current repo tag usage in the Phase A pre-flight (~1 hour of grepping) and extend the window only if a heavy untyped-tag emission path shows up.
+
+2. **Metadata size cap — 4 KB soft / 16 KB hard.** Per-`CapabilitySet` budget. Soft cap (4 KB) emits a structured warning + `dataforts_metadata_oversize_total` counter; hard cap (16 KB) returns `CapabilityError::MetadataTooLarge` at emit time. Configurable per-channel via `ChannelConfig::metadata_cap_bytes`.
+
+3. **Federated query default — local-only; federation opt-in via `Federated` wrapper.** Cross-node execution carries surprising latency + bandwidth costs; making the cost explicit at the type level keeps it intentional. Pin in tests (Phase E coverage).
+
+4. **Anti-affinity scope — placement-decision time only.** The 30%-leadership penalty is applied when the scheduler scores a candidate, not continuously. Continuous rebalancing is explicitly Atomic Playboys territory (federated mesh-wide scheduler).
+
+5. **`PlacementFilter` thread-safety — `Send + Sync` required.** Enforced by the trait bound. The `Custom(Box<dyn Fn(&str, &CapabilitySet) -> bool + Send + Sync>)` variant of `IntentMatchPolicy` carries the same constraint. Pin a `static_assertions::assert_impl_all!` in the trait module + an integration test that scores from multiple threads concurrently.
+
+6. **Mikoshi v2 boundary — migration mechanism unchanged in Warriors.** This plan integrates Mikoshi (`compute/{migration,orchestrator,migration_source,migration_target,scheduler}.rs`) with `PlacementFilter` for *target selection*. The 6-phase migration mechanism (snapshot → transfer → restore → replay → cutover → complete) is untouched. Live migration without snapshot, delta-based migration, and continuous placement re-evaluation are explicitly Atomic Playboys territory. Document the boundary in `COMPUTE.md` and `CAPABILITIES.md`.
+
+### Phase F detail decisions
+
+Locked above in §7 and §7a; surfaced here for traceability:
+
+- **Score composition is multiplicative** across all axes including anti-affinity. Preserves the invariant `0.0 anywhere → 0.0 final`. (§7, "Score composition (LOCKED)")
+- **Tie-breaking is RTT → free-resource → lexicographic-NodeId**. Deterministic three-step ordering used by every scheduler call site (`find_migration_targets`, `select_member_node`, `select_promotion_target`). (§7, "Tie-breaking (LOCKED)")
+- **`ProximityGraph::nearest_rtt(candidate, predicate)` is the one new proximity API.** Used by scope-attraction scoring and Phase E of `REDEX_DISTRIBUTED_PLAN.md`. (§7a, "New proximity API (LOCKED)")
 
 ---
 
