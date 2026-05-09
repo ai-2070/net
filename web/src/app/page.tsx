@@ -970,8 +970,8 @@ function HeroSection() {
           </h1>
 
           <p className="text-[18px] text-ink mt-8 max-w-[580px] leading-[1.5] font-light">
-            A latency-first encrypted mesh where every device is a first-class
-            node. Existing networks operate in milliseconds{" "}
+            A latency-first encrypted mesh where every computer, app and device
+            is a first-class node. Existing networks operate in milliseconds{" "}
             <em className="not-italic text-accent bg-accent/10 px-1">(10⁻³)</em>
             . Net operates in nanoseconds{" "}
             <em className="not-italic text-accent bg-accent/10 px-1">(10⁻⁹)</em>
@@ -1508,7 +1508,7 @@ const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
     headerColor: "accent",
     title: "NET → mesh transport",
     titleColor: "accent",
-    body: "Real-time latencies on commodity hardware over commodity networks. Drop instead of queue. Route around instead of wait. Observe instead of coordinate. Derive instead of query.",
+    body: "Real-time latencies on commodity hardware over commodity networks. Drop instead of queue. Route around instead of wait. Observe instead of coordinate. Derive instead of query. Latency-first.",
     floor: "nanoseconds",
     floorColor: "accent",
     throughput: "~20M events/s · per core",
@@ -1986,13 +1986,13 @@ const AXIOMS: readonly AxiomCard[] = [
   {
     id: "P.02",
     title: "Streaming-first",
-    body: "Data is continuous flow, not documents. Sharded ring buffers, adaptive batching. No requests and responses — there are streams.",
+    body: "Data is continuous flow, not documents. Sharded ring buffers, adaptive batching. No requests and responses — everything is a stream.",
     ascii: <MarchingArrows />,
   },
   {
     id: "P.03",
     title: "Zero-copy",
-    body: "Ring buffers, no garbage collector, native Rust. Forwarding doesn't allocate or copy payload data. Design principle, not optimization.",
+    body: "Ring buffers, no garbage collector, native Rust. No unsafe. Forwarding doesn't allocate or copy payload data. Design principle, not optimization.",
     ascii: "[mem]──refs──▶[wire]\n   no alloc",
   },
   {
@@ -2028,7 +2028,7 @@ const AXIOMS: readonly AxiomCard[] = [
   {
     id: "P.09",
     title: "Native backpressure",
-    body: "Nodes drop without reply. Not a failure mode — the design. The proximity graph makes silence a signal. Neighbors know within a heartbeat interval.",
+    body: "Nodes drop without reply. Not a failure mode — the design. The proximity graph makes silence a signal. Automatic rerouting.",
     ascii: <BackpressureFlow />,
   },
 ];
@@ -2176,8 +2176,7 @@ function BenchmarksSection() {
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
         All numbers measure packet scheduling — the time to process, route,
         encrypt, and queue a packet for transmission. They do not include NIC
-        transfer or wire latency. The software layer is what these benchmarks
-        prove is no longer the bottleneck.
+        transfer or wire latency.
       </p>
 
       <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 items-start">
@@ -2376,11 +2375,10 @@ function MikoshiSection() {
 
       <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
         <p className="text-[18px] text-ink leading-[1.5] font-light">
-          What moved wasn&apos;t a copy.{" "}
+          It doesn&apos;t move a copy.{" "}
           <strong className="text-accent font-medium">
-            It was the thing itself
+            Mikoshi carries the thing itself across.
           </strong>
-          , carried across.
         </p>
       </div>
     </section>
@@ -2707,9 +2705,9 @@ function ComputeRuntimeSection() {
     >
       <SectionLabel>§06 / compute runtime // new</SectionLabel>
       <DisplayHeading>
-        programs whose
+        programs
         <br />
-        identity survives
+        not tied to
         <br />
         their hardware.
       </DisplayHeading>
@@ -2719,10 +2717,11 @@ function ComputeRuntimeSection() {
           NEW
         </span>
         <span>
-          <b className="text-ink font-medium">The compute runtime is live.</b>{" "}
-          Stateful programs that live on the mesh, not on a machine. They have
-          cryptographic identity, a verifiable history, and they move between
-          nodes mid-execution without anyone noticing.
+          <b className="text-ink font-medium">
+            Stateful programs that live on the mesh, not on a machine.
+          </b>{" "}
+          They have cryptographic identity, a verifiable history, and they move
+          between nodes mid-execution without anyone noticing.
         </span>
         <span className="ml-auto">
           subprotocol{" "}
@@ -2733,17 +2732,6 @@ function ComputeRuntimeSection() {
       </div>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
-        Every existing runtime binds programs to hardware. AWS Lambda is
-        stateless because state binds you to a database. Temporal is stateful,
-        but the workflow lives inside the cluster you bought. Erlang actors are
-        addressable, but only inside one VM.{" "}
-        <strong className="text-ink font-medium">
-          &quot;Move this program to a different cluster&quot; is not a
-          primitive any of them expose.
-        </strong>
-      </p>
-
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12 -mt-8">
         A program on Net is called a{" "}
         <em className="not-italic text-accent bg-accent/[0.08] px-1">daemon</em>
         . Its identity is a public key — an{" "}
@@ -4068,9 +4056,8 @@ function ApplicationsSection() {
       </DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
-        Anywhere coordination latency matters. Anywhere the cloud round-trip is
-        too slow. Anywhere there&apos;s no central infrastructure to route
-        through.
+        Anywhere latency matters. Anywhere the cloud round-trip is too slow.
+        Anywhere there&apos;s no central infrastructure to route through.
       </p>
 
       <div className="grid grid-cols-1 md:grid-cols-2 border-t border-l border-line">
@@ -4189,10 +4176,9 @@ function BlackwallSection() {
       <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-16 max-w-[900px]">
         <p className="text-[18px] text-ink leading-[1.5] font-light">
           Any single mechanism can be overwhelmed. All of them together form the
-          wall.{" "}
+          Blackwall.{" "}
           <strong className="text-accent font-medium">
-            There is no single point to breach because the wall is the mesh
-            itself.
+            No single point to breach because the wall is the mesh itself.
           </strong>
         </p>
       </div>
@@ -4224,8 +4210,7 @@ function ReleasesSection() {
         >
           ai-2070/net
         </a>
-        . Codename, date, full notes — straight from the repo, scrolling
-        backward in time.
+        .
       </p>
 
       <div className="border border-line bg-bg-2 max-h-[640px] overflow-y-auto">
@@ -4296,14 +4281,16 @@ function ClosingSection() {
             Cloud infrastructure solves the wrong problem. It moves compute
             closer to a central provider.{" "}
             <strong className="text-ink font-medium">
-              Net moves compute closer to the data and the work.
+              Net decouples compute from location.
             </strong>
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
-            Cloud adds a trusted intermediary by definition. Net has no
-            intermediaries. Relay nodes forward encrypted bytes they cannot
-            read. There is no Cloudflare, no AWS, no Azure in the path because
-            the path is yours.
+            Cloud adds a trusted intermediary by definition.{" "}
+            <strong className="text-ink font-medium">
+              Net has no intermediaries.
+            </strong>{" "}
+            Relay nodes forward encrypted bytes they cannot read. There is no
+            Cloudflare, no AWS, no Azure in the path because the path is yours.
           </p>
         </div>
         <div>
@@ -4430,7 +4417,8 @@ function Footer() {
             </span>
           </div>
           <p className="text-ink-dim text-[12px] leading-[1.6] max-w-[380px]">
-            Network Event Transport. A latency-first encrypted mesh protocol.
+            Network Event Transport. A latency-first encrypted protocol for
+            compute.
           </p>
         </div>
         <FooterColumn title="Spec" items={FOOTER_SPEC} />
