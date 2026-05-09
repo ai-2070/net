@@ -1,0 +1,19 @@
+web/src/app/globals.css
+  s_55265e6795d7b9::t_a082003cb366dc 326,336,346,356
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "ce2da496c5534093d66b6e63ff11016b6dcbf381",
+  "prompts": {},
+  "sessions": {
+    "s_55265e6795d7b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6bac1322-4c47-4293-a1fb-66a38b5f162f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
