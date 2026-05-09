@@ -1,0 +1,27 @@
+net/crates/net/docs/plans/CAPABILITY_SYSTEM_PLAN.md
+  s_d1b11a1287c170::t_997c2b79dee0c6 414-423
+  s_d1b11a1287c170::t_850b2650e33d0b 742-770,772,774,776,778,780,782-784
+  s_d1b11a1287c170::t_692edc2b571c36 607-608,610,613-615
+  s_d1b11a1287c170::t_d32e0dd045ab8e 652,656-658
+  s_d1b11a1287c170::t_1179030d7f6769 7
+  s_d1b11a1287c170::t_c2aa261c121296 662-668,674
+  s_d1b11a1287c170::t_ed24aeed9367ed 466-485,492,499
+  s_d1b11a1287c170::t_1d919f3a539d67 68-93
+  s_d1b11a1287c170::t_f04c20c9a4ccf7 340-350
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "579eeee9b2e5b87c9e88112bf1ac482a9aeaddf2",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
