@@ -2704,7 +2704,7 @@ function ComputeRuntimeSection() {
       id="runtime"
       className="compute-bg border-b border-line px-6 py-20"
     >
-      <SectionLabel>§06 / compute runtime // new</SectionLabel>
+      <SectionLabel>§06 / daemon runtime // new</SectionLabel>
       <DisplayHeading>
         compute that
         <br />
