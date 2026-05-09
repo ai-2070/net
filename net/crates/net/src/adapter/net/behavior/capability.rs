@@ -1579,23 +1579,28 @@ impl CapabilityRequirement {
             return 0.0;
         }
 
+        // Phase A.5.5: read through views() once. Same projection
+        // pattern Phase A.5.2/A.5.3/A.5.4 applied to filter / proximity
+        // / diff — survives Phase A.5.N field removal unchanged.
+        let views = caps.views();
+
         let mut score = 1.0;
 
         // Memory score (normalized to 256GB)
         if self.prefer_more_memory > 0.0 {
-            let mem_score = (caps.hardware.memory_mb as f32 / 262144.0).min(1.0);
+            let mem_score = (views.hardware.memory_mb as f32 / 262144.0).min(1.0);
             score += self.prefer_more_memory * mem_score;
         }
 
         // VRAM score (normalized to 80GB)
         if self.prefer_more_vram > 0.0 {
-            let vram_score = (caps.hardware.total_vram_mb() as f32 / 81920.0).min(1.0);
+            let vram_score = (views.hardware.total_vram_mb() as f32 / 81920.0).min(1.0);
             score += self.prefer_more_vram * vram_score;
         }
 
         // Inference speed score (normalized to 1000 tok/s)
         if self.prefer_faster_inference > 0.0 {
-            let max_tps: u32 = caps
+            let max_tps: u32 = views
                 .models
                 .iter()
                 .map(|m| m.tokens_per_sec)
@@ -1607,11 +1612,11 @@ impl CapabilityRequirement {
 
         // Loaded model score
         if self.prefer_loaded_models > 0.0 {
-            let loaded_count = caps.models.iter().filter(|m| m.loaded).count();
-            let loaded_ratio = if caps.models.is_empty() {
+            let loaded_count = views.models.iter().filter(|m| m.loaded).count();
+            let loaded_ratio = if views.models.is_empty() {
                 0.0
             } else {
-                loaded_count as f32 / caps.models.len() as f32
+                loaded_count as f32 / views.models.len() as f32
             };
             score += self.prefer_loaded_models * loaded_ratio;
         }
@@ -1803,6 +1808,12 @@ impl CapabilityIndex {
     /// (the loser pays a redundant clone, which is the original
     /// cost; correctness is unchanged).
     fn add_to_indexes(&self, node_id: u64, caps: &CapabilitySet) {
+        // Phase A.5.5: read through views() once. `caps.tags` stays
+        // direct because tags are not part of the typed-struct
+        // projection (they're carried through `CapabilitySet::tags`
+        // independently and survive Phase A.5.N).
+        let views = caps.views();
+
         // Tags
         for tag in &caps.tags {
             if let Some(mut set) = self.by_tag.get_mut(tag) {
@@ -1813,7 +1824,7 @@ impl CapabilityIndex {
         }
 
         // Models
-        for model in &caps.models {
+        for model in &views.models {
             if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
                 set.insert(node_id);
             } else {
@@ -1825,7 +1836,7 @@ impl CapabilityIndex {
         }
 
         // Tools
-        for tool in &caps.tools {
+        for tool in &views.tools {
             if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
                 set.insert(node_id);
             } else {
@@ -1837,10 +1848,10 @@ impl CapabilityIndex {
         }
 
         // GPU. Key is `bool`, no allocation either way.
-        let has_gpu = caps.has_gpu();
+        let has_gpu = views.hardware.has_gpu();
         self.gpu_nodes.entry(has_gpu).or_default().insert(node_id);
 
-        if let Some(vendor) = caps.hardware.gpu_vendor() {
+        if let Some(vendor) = views.hardware.gpu_vendor() {
             // Vendor key is `Copy` (small enum), so the entry-only
             // form is already allocation-free.
             self.by_gpu_vendor
@@ -1858,6 +1869,10 @@ impl CapabilityIndex {
     /// `HashSet` shells in the outer `DashMap`s — a slow unbounded
     /// leak over long-running deployments with high peer churn.
     fn remove_from_indexes(&self, node_id: u64, caps: &CapabilitySet) {
+        // Phase A.5.5: read through views() once — mirrors
+        // `add_to_indexes` so add/remove see the same projection.
+        let views = caps.views();
+
         // Tags
         for tag in &caps.tags {
             if let Some(mut set) = self.by_tag.get_mut(tag) {
@@ -1867,7 +1882,7 @@ impl CapabilityIndex {
         }
 
         // Models
-        for model in &caps.models {
+        for model in &views.models {
             if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
                 set.remove(&node_id);
             }
@@ -1876,7 +1891,7 @@ impl CapabilityIndex {
         }
 
         // Tools
-        for tool in &caps.tools {
+        for tool in &views.tools {
             if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
                 set.remove(&node_id);
             }
@@ -1886,12 +1901,12 @@ impl CapabilityIndex {
 
         // GPU (two-value bucket; entries are intentionally permanent
         // because lookups for both `true` and `false` are expected).
-        let has_gpu = caps.has_gpu();
+        let has_gpu = views.hardware.has_gpu();
         if let Some(mut set) = self.gpu_nodes.get_mut(&has_gpu) {
             set.remove(&node_id);
         }
 
-        if let Some(vendor) = caps.hardware.gpu_vendor() {
+        if let Some(vendor) = views.hardware.gpu_vendor() {
             if let Some(mut set) = self.by_gpu_vendor.get_mut(&vendor) {
                 set.remove(&node_id);
             }
