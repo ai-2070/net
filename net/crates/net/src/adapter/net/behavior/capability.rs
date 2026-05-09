@@ -936,6 +936,92 @@ impl CapabilitySet {
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         serde_json::from_slice(data).ok()
     }
+
+    // ========================================================================
+    // View projections — Capability System Plan §1, Phase A.4.
+    //
+    // Today these are simple field clones because `CapabilitySet`
+    // still carries the typed structs as fields. Phase A.5 removes
+    // the typed-struct fields and migrates wire format to
+    // `tags: HashSet<Tag>`; the same `From<&CapabilitySet>` impls
+    // then reconstruct the typed view by scanning the tag set.
+    //
+    // Downstream code SHOULD adopt the projection accessors NOW
+    // (`caps.views().hardware`, `HardwareCapabilities::from(&caps)`)
+    // so the migration in A.5 doesn't ripple through every call
+    // site. The legacy direct-field access (`caps.hardware`)
+    // continues to work in this commit but is documented as
+    // deprecated in `CAPABILITY_SYSTEM_PLAN.md` Locked decision 1.
+    // ========================================================================
+
+    /// All five view projections rolled into one struct, computed
+    /// once per call. Cheaper than calling each `From<&CapabilitySet>`
+    /// individually when the consumer reads more than one of them.
+    ///
+    /// ```
+    /// # use ai2070_net::adapter::net::behavior::capability::CapabilitySet;
+    /// let caps = CapabilitySet::new();
+    /// let views = caps.views();
+    /// let _ = views.hardware;
+    /// let _ = views.software;
+    /// let _ = views.resource_limits;
+    /// let _ = views.models;
+    /// let _ = views.tools;
+    /// ```
+    pub fn views(&self) -> CapabilityViews {
+        CapabilityViews {
+            hardware: HardwareCapabilities::from(self),
+            software: SoftwareCapabilities::from(self),
+            resource_limits: ResourceLimits::from(self),
+            models: self.models.clone(),
+            tools: self.tools.clone(),
+        }
+    }
+}
+
+/// All five typed-view projections of a [`CapabilitySet`].
+/// Returned by [`CapabilitySet::views`]; consumers destructure the
+/// fields they care about. Same shape across Rust / Node / Python /
+/// Go bindings per the SDK plan's view-projection design decision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapabilityViews {
+    /// Hardware projection.
+    pub hardware: HardwareCapabilities,
+    /// Software projection.
+    pub software: SoftwareCapabilities,
+    /// Resource-limits projection.
+    pub resource_limits: ResourceLimits,
+    /// Loaded-model projection (`Vec<ModelCapability>` cloned).
+    pub models: Vec<ModelCapability>,
+    /// Available-tool projection (`Vec<ToolCapability>` cloned).
+    pub tools: Vec<ToolCapability>,
+}
+
+// ============================================================================
+// View projections — `From<&CapabilitySet>` for each typed struct.
+//
+// Phase A.4 implementation: each impl clones the matching field.
+// Phase A.5 will migrate `CapabilitySet`'s wire format to
+// `tags: HashSet<Tag>`; these impls become tag-set scans then,
+// without changing any call site.
+// ============================================================================
+
+impl From<&CapabilitySet> for HardwareCapabilities {
+    fn from(caps: &CapabilitySet) -> Self {
+        caps.hardware.clone()
+    }
+}
+
+impl From<&CapabilitySet> for SoftwareCapabilities {
+    fn from(caps: &CapabilitySet) -> Self {
+        caps.software.clone()
+    }
+}
+
+impl From<&CapabilitySet> for ResourceLimits {
+    fn from(caps: &CapabilitySet) -> Self {
+        caps.limits.clone()
+    }
 }
 
 // ============================================================================
@@ -3357,5 +3443,58 @@ mod tests {
             .with_min_memory(32_768);
         let hits = index.query(&filter);
         assert!(hits.contains(&42u64), "self-match expected, got {:?}", hits);
+    }
+
+    // ========================================================================
+    // View projections — `From<&CapabilitySet>` + `CapabilitySet::views`.
+    // Phase A.4: pin the contract so Phase A.5's wire-format migration
+    // doesn't drift the projection semantics.
+    // ========================================================================
+
+    #[test]
+    fn projection_hardware_round_trips_via_from_impl() {
+        let caps = sample_capability_set();
+        let hw_via_from: HardwareCapabilities = (&caps).into();
+        // Phase A.4: trivial clone of the field. Phase A.5 will
+        // reconstruct from the tag set, but the Eq comparison against
+        // the original field must continue to hold.
+        assert_eq!(hw_via_from, caps.hardware);
+    }
+
+    #[test]
+    fn projection_software_and_resource_limits_round_trip() {
+        let caps = sample_capability_set();
+        let sw: SoftwareCapabilities = (&caps).into();
+        assert_eq!(sw, caps.software);
+        let limits: ResourceLimits = (&caps).into();
+        assert_eq!(limits, caps.limits);
+    }
+
+    #[test]
+    fn views_struct_returns_all_five_projections() {
+        // Pin: `views()` returns the five typed projections together.
+        // Cheaper than calling each From impl individually when a
+        // consumer reads more than one view.
+        let caps = sample_capability_set();
+        let views = caps.views();
+        assert_eq!(views.hardware, caps.hardware);
+        assert_eq!(views.software, caps.software);
+        assert_eq!(views.resource_limits, caps.limits);
+        assert_eq!(views.models, caps.models);
+        assert_eq!(views.tools, caps.tools);
+    }
+
+    #[test]
+    fn views_clone_is_independent_of_caps() {
+        // Pin: dropping the original `caps` after `views()` doesn't
+        // dangle the views — they're owned clones, not references.
+        let views = {
+            let caps = sample_capability_set();
+            caps.views()
+        };
+        // If `views` held references into `caps`, this would be a
+        // dangling-reference compile error. The test passes by
+        // virtue of compiling; the assert is just to use `views`.
+        assert!(views.hardware.cpu_cores > 0);
     }
 }
