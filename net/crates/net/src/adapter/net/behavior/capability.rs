@@ -971,6 +971,127 @@ impl CapabilitySet {
         self
     }
 
+    // ========================================================================
+    // Chain composition helpers — Phase 3 of CAPABILITY_ENHANCEMENTS_PLAN.md.
+    //
+    // Pure syntactic sugar over the underlying `causal:` / `fork-of:` /
+    // `heat:` reserved-prefix tags documented in CAPABILITY_SYSTEM_PLAN.md
+    // §2 + CAPABILITIES_SCHEMA.md "Reserved cross-axis prefixes".
+    // Each helper is a single-line wrapper around `Tag::parse(...)` plus
+    // `tags.insert(...)` — the substrate gains no new primitives, just
+    // ergonomic emission paths so call sites read cleanly.
+    //
+    // Empty / blank chain hashes are silently dropped (matches the
+    // scope-helper convention so a builder fed an empty value doesn't
+    // produce a malformed tag).
+    // ========================================================================
+
+    /// Declare this node holds the chain identified by `chain_hash`.
+    ///
+    /// Emits the `causal:<chain_hash>` reserved tag. Idempotent —
+    /// repeated calls with the same hash do not duplicate.
+    pub fn require_chain(mut self, chain_hash: impl AsRef<str>) -> Self {
+        let hash = chain_hash.as_ref();
+        if hash.is_empty() {
+            return self;
+        }
+        if let Ok(t) = Tag::parse(&format!("causal:{hash}")) {
+            self.tags.insert(t);
+        }
+        self
+    }
+
+    /// Declare this node holds the chain `<chain_hash>` up to the
+    /// named `tip_seq`.
+    ///
+    /// Emits `causal:<chain_hash>:<tip_seq>`. Per
+    /// `CAPABILITY_SYSTEM_PLAN.md` §2: receivers downsample chains
+    /// shorter than they need, so a peer announcing a tip_seq is
+    /// implicitly also a holder for every prefix of that chain.
+    pub fn require_chain_tip(mut self, chain_hash: impl AsRef<str>, tip_seq: u64) -> Self {
+        let hash = chain_hash.as_ref();
+        if hash.is_empty() {
+            return self;
+        }
+        if let Ok(t) = Tag::parse(&format!("causal:{hash}:{tip_seq}")) {
+            self.tags.insert(t);
+        }
+        self
+    }
+
+    /// Declare this node holds the half-open range `[start_seq..end_seq)`
+    /// of the chain `<chain_hash>`.
+    ///
+    /// Emits `causal:<chain_hash>[<start>..<end>]`. The validator
+    /// enforces `start_seq < end_seq`; equal or inverted ranges are
+    /// silently dropped.
+    pub fn require_chain_range(
+        mut self,
+        chain_hash: impl AsRef<str>,
+        start_seq: u64,
+        end_seq: u64,
+    ) -> Self {
+        let hash = chain_hash.as_ref();
+        if hash.is_empty() || start_seq >= end_seq {
+            return self;
+        }
+        if let Ok(t) = Tag::parse(&format!("causal:{hash}[{start_seq}..{end_seq}]")) {
+            self.tags.insert(t);
+        }
+        self
+    }
+
+    /// Declare this node holds any of the named chains. One
+    /// `causal:<hash>` reserved tag emitted per non-empty hash.
+    /// Empty / blank hashes in the iterator are silently skipped.
+    pub fn require_any_chain<I, S>(mut self, chain_hashes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for hash in chain_hashes {
+            self = self.require_chain(hash);
+        }
+        self
+    }
+
+    /// Declare this chain forks from `parent_chain_hash`.
+    ///
+    /// Emits the `fork-of:<parent_chain_hash>` reserved tag, used
+    /// by the chain-discovery layer for lineage walks.
+    pub fn from_fork(mut self, parent_chain_hash: impl AsRef<str>) -> Self {
+        let hash = parent_chain_hash.as_ref();
+        if hash.is_empty() {
+            return self;
+        }
+        if let Ok(t) = Tag::parse(&format!("fork-of:{hash}")) {
+            self.tags.insert(t);
+        }
+        self
+    }
+
+    /// Declare this node's heat (read-rate / activity score) for
+    /// the named chain.
+    ///
+    /// `rate` is clamped to `[0.0, 1.0]` and emitted with two-decimal
+    /// precision (`heat:<chain_hash>=0.85`). Heat is per-chain, not
+    /// per-node; one call per chain.
+    pub fn heat_level(mut self, chain_hash: impl AsRef<str>, rate: f64) -> Self {
+        let hash = chain_hash.as_ref();
+        if hash.is_empty() {
+            return self;
+        }
+        let clamped = if rate.is_finite() {
+            rate.clamp(0.0, 1.0)
+        } else {
+            return self;
+        };
+        if let Ok(t) = Tag::parse(&format!("heat:{hash}={clamped:.2}")) {
+            self.tags.insert(t);
+        }
+        self
+    }
+
     /// Set resource limits
     pub fn with_limits(mut self, limits: ResourceLimits) -> Self {
         self.set_limits(limits);
@@ -3988,6 +4109,130 @@ mod tests {
             scope_from_tags(&caps_local.tags),
             CapabilityScope::SubnetLocal
         );
+    }
+
+    // ========================================================================
+    // Chain composition helpers — Phase 3 of CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    fn reserved_tag(prefix: &str, body: &str) -> Tag {
+        Tag::Reserved {
+            prefix: prefix.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn require_chain_emits_causal_reserved_tag() {
+        let caps = CapabilitySet::new().require_chain("abc123");
+        assert!(caps.tags.contains(&reserved_tag("causal:", "abc123")));
+    }
+
+    #[test]
+    fn require_chain_is_idempotent() {
+        let caps = CapabilitySet::new()
+            .require_chain("abc123")
+            .require_chain("abc123");
+        let causal_count = caps
+            .tags
+            .iter()
+            .filter(|t| matches!(t, Tag::Reserved { prefix, .. } if prefix == "causal:"))
+            .count();
+        assert_eq!(causal_count, 1);
+    }
+
+    #[test]
+    fn require_chain_drops_empty_hash() {
+        let caps = CapabilitySet::new().require_chain("");
+        assert!(caps.tags.is_empty());
+    }
+
+    #[test]
+    fn require_chain_tip_emits_with_seq_separator() {
+        let caps = CapabilitySet::new().require_chain_tip("abc", 100);
+        assert!(caps.tags.contains(&reserved_tag("causal:", "abc:100")));
+    }
+
+    #[test]
+    fn require_chain_range_emits_bracket_form() {
+        let caps = CapabilitySet::new().require_chain_range("abc", 100, 200);
+        assert!(caps.tags.contains(&reserved_tag("causal:", "abc[100..200]")));
+    }
+
+    #[test]
+    fn require_chain_range_drops_inverted_or_equal_range() {
+        // Equal range: silently dropped (zero-length range is meaningless).
+        let caps = CapabilitySet::new().require_chain_range("abc", 100, 100);
+        assert!(caps.tags.is_empty());
+        // Inverted range: silently dropped.
+        let caps = CapabilitySet::new().require_chain_range("abc", 200, 100);
+        assert!(caps.tags.is_empty());
+    }
+
+    #[test]
+    fn require_any_chain_emits_one_tag_per_hash() {
+        let caps = CapabilitySet::new().require_any_chain(["abc", "def", "ghi"]);
+        assert!(caps.tags.contains(&reserved_tag("causal:", "abc")));
+        assert!(caps.tags.contains(&reserved_tag("causal:", "def")));
+        assert!(caps.tags.contains(&reserved_tag("causal:", "ghi")));
+        assert_eq!(caps.tags.len(), 3);
+    }
+
+    #[test]
+    fn require_any_chain_skips_empty_hashes() {
+        let caps = CapabilitySet::new().require_any_chain(["abc", "", "def"]);
+        assert_eq!(caps.tags.len(), 2);
+    }
+
+    #[test]
+    fn from_fork_emits_fork_of_reserved_tag() {
+        let caps = CapabilitySet::new().from_fork("parent_hash");
+        assert!(caps.tags.contains(&reserved_tag("fork-of:", "parent_hash")));
+    }
+
+    #[test]
+    fn heat_level_emits_chain_hash_equals_rate_with_two_decimals() {
+        let caps = CapabilitySet::new().heat_level("abc", 0.85);
+        assert!(caps.tags.contains(&reserved_tag("heat:", "abc=0.85")));
+    }
+
+    #[test]
+    fn heat_level_clamps_out_of_range_rate() {
+        // Above 1.0 clamps to 1.00.
+        let caps = CapabilitySet::new().heat_level("abc", 1.5);
+        assert!(caps.tags.contains(&reserved_tag("heat:", "abc=1.00")));
+        // Below 0.0 clamps to 0.00.
+        let caps = CapabilitySet::new().heat_level("abc", -0.3);
+        assert!(caps.tags.contains(&reserved_tag("heat:", "abc=0.00")));
+    }
+
+    #[test]
+    fn heat_level_drops_non_finite_rate() {
+        let caps = CapabilitySet::new().heat_level("abc", f64::NAN);
+        assert!(caps.tags.is_empty());
+        let caps = CapabilitySet::new().heat_level("abc", f64::INFINITY);
+        assert!(caps.tags.is_empty());
+    }
+
+    #[test]
+    fn chain_helpers_compose_naturally_in_a_builder_chain() {
+        // Pinned: helpers chain ergonomically without intermediate
+        // bindings or `.clone()`s. This is the contract that makes
+        // the surface readable in operator code.
+        let caps = CapabilitySet::new()
+            .require_chain("origin-hash")
+            .require_chain_tip("chain-with-tip", 1024)
+            .require_chain_range("range-chain", 100, 500)
+            .require_any_chain(["alt-1", "alt-2"])
+            .from_fork("parent")
+            .heat_level("origin-hash", 0.5);
+        // Six emissions: 1 + 1 + 1 + 2 + 1 + 1 = 7 reserved tags.
+        let reserved_count = caps
+            .tags
+            .iter()
+            .filter(|t| matches!(t, Tag::Reserved { .. }))
+            .count();
+        assert_eq!(reserved_count, 7, "tags: {:?}", caps.tags);
     }
 
     /// Repro for the failing Go `TestHardwareAndGpuFilter_Matches`:
