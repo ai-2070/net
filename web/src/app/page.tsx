@@ -1409,7 +1409,7 @@ function WhyNotBestEffortSection() {
         <DisplayHeading>
           arpanet assumed scarcity.
           <br />
-          net assumes abundance.
+          <span className="text-accent">net assumes abundance.</span>
         </DisplayHeading>
 
         <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
@@ -2706,11 +2706,11 @@ function ComputeRuntimeSection() {
     >
       <SectionLabel>§06 / compute runtime // new</SectionLabel>
       <DisplayHeading>
-        programs
+        compute that
         <br />
-        not tied to
+        lives on
         <br />
-        their hardware.
+        the wire.
       </DisplayHeading>
 
       <div className="border border-accent-dim bg-accent/[0.03] px-5 py-4 mb-10 flex items-center gap-[18px] text-[11px] text-ink-dim tracking-[0.05em] flex-wrap">
@@ -3854,7 +3854,7 @@ function ComponentsSection() {
       <DisplayHeading>
         four primitives.
         <br />
-        one wire.
+        one mesh.
       </DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
