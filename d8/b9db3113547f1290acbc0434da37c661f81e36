@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/tag_codec.rs
+  s_d1b11a1287c170::t_7df7ce18c00612 974-1034
+net/crates/net/src/adapter/net/behavior/mod.rs
+  s_d1b11a1287c170::t_9afa56c497079f 52-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "d8b9db3113547f1290acbc0434da37c661f81e36",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
