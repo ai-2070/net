@@ -1436,7 +1436,15 @@ impl CapabilityFilter {
         self
     }
 
-    /// Check if a capability set matches this filter
+    /// Check if a capability set matches this filter.
+    ///
+    /// Phase A.5.2: reads through `caps.views()` for the
+    /// hardware / models / tools projections. Methods that already
+    /// abstract field access (`has_tag` / `has_gpu` / `has_model`
+    /// / `has_tool`) keep working unchanged. Once Phase A.5.N
+    /// removes the typed-struct fields from `CapabilitySet`, the
+    /// `views()` body becomes a tag-set scan and this matcher
+    /// keeps working without further changes.
     pub fn matches(&self, caps: &CapabilitySet) -> bool {
         // Check tags (all required tags must be present)
         for tag in &self.require_tags {
@@ -1461,9 +1469,13 @@ impl CapabilityFilter {
             }
         }
 
+        // Read projections once; reuse for hardware + models below.
+        // Cheap today (field clones), tag-set scan post-Phase A.5.N.
+        let views = caps.views();
+
         // Check memory
         if let Some(min_mem) = self.min_memory_mb {
-            if caps.hardware.memory_mb < min_mem {
+            if views.hardware.memory_mb < min_mem {
                 return false;
             }
         }
@@ -1475,21 +1487,22 @@ impl CapabilityFilter {
 
         // Check GPU vendor
         if let Some(vendor) = self.gpu_vendor {
-            if caps.hardware.gpu_vendor() != Some(vendor) {
+            if views.hardware.gpu_vendor() != Some(vendor) {
                 return false;
             }
         }
 
         // Check VRAM
         if let Some(min_vram) = self.min_vram_mb {
-            if caps.hardware.total_vram_mb() < min_vram {
+            if views.hardware.total_vram_mb() < min_vram {
                 return false;
             }
         }
 
         // Check context length
         if let Some(min_ctx) = self.min_context_length {
-            let has_sufficient = caps.models.iter().any(|m| m.context_length >= min_ctx);
+            let has_sufficient =
+                views.models.iter().any(|m| m.context_length >= min_ctx);
             if !has_sufficient {
                 return false;
             }
@@ -1497,7 +1510,8 @@ impl CapabilityFilter {
 
         // Check modalities
         for modality in &self.require_modalities {
-            let has_modality = caps.models.iter().any(|m| m.modalities.contains(modality));
+            let has_modality =
+                views.models.iter().any(|m| m.modalities.contains(modality));
             if !has_modality {
                 return false;
             }
