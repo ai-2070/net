@@ -347,6 +347,65 @@ describe('p.* fluent predicate builder', () => {
   });
 });
 
+// P2-F: semverCompatible 0.0.x exact-only.
+//
+// Cargo's caret rule (`^0.0.x`) treats every 0.0 patch as a
+// breaking-change boundary. Pre-fix the TS helper applied the
+// 0.x.y minor-band rule even when the major was 0 AND the minor
+// was 0, so 0.0.4 satisfied 0.0.3 (it shouldn't). Mirrors the
+// Rust + Python fixes (CR / P1-D).
+describe('semverCompatible 0.0.x exact-only', () => {
+  it('rejects different patch in the 0.0.x band', () => {
+    // Stored 0.0.4 against required 0.0.3: should miss (every
+    // patch in the 0.0.x band is a breaking change).
+    const tags = ['software.runtime.python=0.0.4'];
+    const meta = {};
+    expect(
+      evaluatePredicate(
+        p.semverCompatible(tagKey('software', 'runtime.python'), '0.0.3'),
+        tags,
+        meta,
+      ),
+    ).toBe(false);
+  });
+
+  it('matches exact tuple in the 0.0.x band', () => {
+    const tags = ['software.runtime.python=0.0.3'];
+    const meta = {};
+    expect(
+      evaluatePredicate(
+        p.semverCompatible(tagKey('software', 'runtime.python'), '0.0.3'),
+        tags,
+        meta,
+      ),
+    ).toBe(true);
+  });
+
+  it('still applies minor-band rule for 0.x.y where x > 0', () => {
+    const tags = ['software.runtime.python=0.2.5'];
+    const meta = {};
+    expect(
+      evaluatePredicate(
+        p.semverCompatible(tagKey('software', 'runtime.python'), '0.2.3'),
+        tags,
+        meta,
+      ),
+    ).toBe(true);
+  });
+
+  it('still applies major-band rule for x.y.z where x > 0', () => {
+    const tags = ['software.runtime.python=1.4.5'];
+    const meta = {};
+    expect(
+      evaluatePredicate(
+        p.semverCompatible(tagKey('software', 'runtime.python'), '1.2.3'),
+        tags,
+        meta,
+      ),
+    ).toBe(true);
+  });
+});
+
 describe('StandardPlacement builder', () => {
   it('compiles tag/metadata constraints + predicate into a config object', () => {
     const cfg = standardPlacement()

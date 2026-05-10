@@ -1015,6 +1015,16 @@ function semverCmp(a: SemverTriple, b: SemverTriple): number {
 function semverCompatible(lhs: SemverTriple, rhs: SemverTriple): boolean {
   if (semverCmp(lhs, rhs) < 0) return false;
   if (rhs[0] === 0) {
+    if (rhs[1] === 0) {
+      // P2-F: 0.0.x — patch is the compatibility band; anything
+      // other than the exact tuple is a breaking change. Combined
+      // with the `lhs >= rhs` guard above this collapses to
+      // `lhs === rhs`. Pre-fix this fell through to the 0.x.y
+      // minor-band rule, letting any 0.0.lhs satisfy 0.0.rhs
+      // whenever `lhs >= rhs` — diverged from Cargo + Rust
+      // substrate.
+      return lhs[0] === rhs[0] && lhs[1] === rhs[1] && lhs[2] === rhs[2];
+    }
     // 0.x.y — minor is the compatibility band.
     return rhs[1] === lhs[1];
   }
