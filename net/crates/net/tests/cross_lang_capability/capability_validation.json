@@ -1,0 +1,235 @@
+{
+  "description": "Cross-binding pin for `validate_capabilities(caps)`. Each case carries a wire-format `caps` (tags + metadata) and the expected `errors` + `warnings` arrays a conformant validator emits. Bindings sort their output by canonical-JSON form (errors first, then warnings; each list sorted by JSON-stringified entry) before comparing; the fixture's `expected_*` arrays are already in that canonical sort order. See README.md.",
+  "abi_version_expected": 1,
+  "schema_metadata_soft_cap_bytes": 4096,
+  "cases": [
+    {
+      "name": "empty_caps_is_clean",
+      "summary": "Default `CapabilitySet` produces a clean report (no errors, no warnings).",
+      "caps": { "tags": [], "metadata": {} },
+      "expected_errors": [],
+      "expected_warnings": []
+    },
+    {
+      "name": "well_formed_hardware_axis_tags",
+      "summary": "Every key under `hardware.*` matches its declared `ValueType`.",
+      "caps": {
+        "tags": [
+          "hardware.cpu_cores=16",
+          "hardware.cpu_threads=32",
+          "hardware.memory_mb=65536",
+          "hardware.gpu",
+          "hardware.gpu.vendor=nvidia",
+          "hardware.gpu.model=h100",
+          "hardware.gpu.vram_mb=81920",
+          "hardware.storage_mb=1024000",
+          "hardware.network_mbps=10000"
+        ],
+        "metadata": {}
+      },
+      "expected_errors": [],
+      "expected_warnings": []
+    },
+    {
+      "name": "well_formed_software_indexed_and_keyed_collections",
+      "summary": "`software.runtime.<n>` (KeyedMap), `software.framework.<n>`, `software.driver.<n>`, plus `software.model.<i>.<sub>` (IndexedCollection) round-trip clean.",
+      "caps": {
+        "tags": [
+          "software.os=linux",
+          "software.os_version=6.6.0",
+          "software.runtime.python=3.11.5",
+          "software.framework.pytorch=2.1.0",
+          "software.driver.nvidia=535.86.10",
+          "software.model.0.id=llama-3.1-70b",
+          "software.model.0.family=llama",
+          "software.model.0.parameters_b_x10=700",
+          "software.model.0.context_length=131072",
+          "software.model.0.modalities=text,code",
+          "software.model.0.loaded=true"
+        ],
+        "metadata": {}
+      },
+      "expected_errors": [],
+      "expected_warnings": []
+    },
+    {
+      "name": "type_mismatch_number_with_non_numeric_value",
+      "summary": "`hardware.memory_mb` declared as Number; the value `lots` doesn't parse → TypeMismatch error.",
+      "caps": {
+        "tags": ["hardware.memory_mb=lots"],
+        "metadata": {}
+      },
+      "expected_errors": [
+        {
+          "kind": "type_mismatch",
+          "axis": "hardware",
+          "key": "memory_mb",
+          "expected": "number",
+          "actual": "lots"
+        }
+      ],
+      "expected_warnings": []
+    },
+    {
+      "name": "type_mismatch_presence_key_with_value",
+      "summary": "`hardware.gpu` is a Presence key — emitting it as `hardware.gpu=true` is a TypeMismatch (the Presence type forbids a value).",
+      "caps": {
+        "tags": ["hardware.gpu=true"],
+        "metadata": {}
+      },
+      "expected_errors": [
+        {
+          "kind": "type_mismatch",
+          "axis": "hardware",
+          "key": "gpu",
+          "expected": "presence",
+          "actual": "true"
+        }
+      ],
+      "expected_warnings": []
+    },
+    {
+      "name": "type_mismatch_number_key_with_no_value",
+      "summary": "`hardware.memory_mb` is a Number key — emitting it as a bare `hardware.memory_mb` (no value) is a TypeMismatch with `actual: <no value>`.",
+      "caps": {
+        "tags": ["hardware.memory_mb"],
+        "metadata": {}
+      },
+      "expected_errors": [
+        {
+          "kind": "type_mismatch",
+          "axis": "hardware",
+          "key": "memory_mb",
+          "expected": "number",
+          "actual": "<no value>"
+        }
+      ],
+      "expected_warnings": []
+    },
+    {
+      "name": "type_mismatch_bool_key_with_non_bool_value",
+      "summary": "`software.model.<i>.loaded` is a Bool key — only `true` / `false` parse.",
+      "caps": {
+        "tags": ["software.model.0.loaded=maybe"],
+        "metadata": {}
+      },
+      "expected_errors": [
+        {
+          "kind": "type_mismatch",
+          "axis": "software",
+          "key": "loaded",
+          "expected": "bool",
+          "actual": "maybe"
+        }
+      ],
+      "expected_warnings": []
+    },
+    {
+      "name": "index_malformed_non_numeric_index",
+      "summary": "`software.model.<i>.<sub>` requires `<i>` to parse as `u32`; `bogus` doesn't → IndexMalformed.",
+      "caps": {
+        "tags": ["software.model.bogus.id=foo"],
+        "metadata": {}
+      },
+      "expected_errors": [
+        {
+          "kind": "index_malformed",
+          "axis": "software",
+          "prefix": "model.",
+          "index": "bogus",
+          "tag": "software.model.bogus.id=foo"
+        }
+      ],
+      "expected_warnings": []
+    },
+    {
+      "name": "unknown_key_under_known_axis_is_warning",
+      "summary": "Forward-compat: a key the schema doesn't enumerate (`hardware.experimental_field`) produces an UnknownKey warning, not an error.",
+      "caps": {
+        "tags": ["hardware.experimental_field=42"],
+        "metadata": {}
+      },
+      "expected_errors": [],
+      "expected_warnings": [
+        {
+          "kind": "unknown_key",
+          "axis": "hardware",
+          "key": "experimental_field"
+        }
+      ]
+    },
+    {
+      "name": "unknown_sub_key_under_known_indexed_shape_is_warning",
+      "summary": "Forward-compat: a known `software.model.<i>.*` shape with an unknown sub-key produces UnknownKey on the FULL key path (`model.0.extra_field`) — pinned so consumers can correlate the warning back to the exact tag.",
+      "caps": {
+        "tags": ["software.model.0.extra_field=value"],
+        "metadata": {}
+      },
+      "expected_errors": [],
+      "expected_warnings": [
+        {
+          "kind": "unknown_key",
+          "axis": "software",
+          "key": "model.0.extra_field"
+        }
+      ]
+    },
+    {
+      "name": "legacy_tag_emits_warning",
+      "summary": "Untyped tags (no axis prefix, no reserved prefix) parse as `Tag::Legacy` and produce a LegacyTag warning.",
+      "caps": {
+        "tags": ["myteam-tag"],
+        "metadata": {}
+      },
+      "expected_errors": [],
+      "expected_warnings": [
+        { "kind": "legacy_tag", "tag": "myteam-tag" }
+      ]
+    },
+    {
+      "name": "reserved_prefix_tag_passes_unchecked",
+      "summary": "Reserved-prefix tags (`scope:`, `causal:`, `fork-of:`, `heat:`) pass validation without errors or warnings — their body shape is application-defined.",
+      "caps": {
+        "tags": [
+          "scope:tenant:foo",
+          "causal:abc123",
+          "fork-of:def456",
+          "heat:hot"
+        ],
+        "metadata": {}
+      },
+      "expected_errors": [],
+      "expected_warnings": []
+    },
+    {
+      "name": "combined_errors_and_warnings_sort_canonically",
+      "summary": "Multiple violations across types — pinned to verify each binding's canonical sort order.",
+      "caps": {
+        "tags": [
+          "hardware.gpu",
+          "hardware.memory_mb=lots",
+          "hardware.experimental_field=42",
+          "myteam-tag"
+        ],
+        "metadata": {}
+      },
+      "expected_errors": [
+        {
+          "kind": "type_mismatch",
+          "axis": "hardware",
+          "key": "memory_mb",
+          "expected": "number",
+          "actual": "lots"
+        }
+      ],
+      "expected_warnings": [
+        { "kind": "legacy_tag", "tag": "myteam-tag" },
+        {
+          "kind": "unknown_key",
+          "axis": "hardware",
+          "key": "experimental_field"
+        }
+      ]
+    }
+  ]
+}

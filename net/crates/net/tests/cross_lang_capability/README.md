@@ -36,6 +36,16 @@ Each binding loads the fixture, decodes the predicate, runs its host-language ev
 
 Phase 9c of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`. SDKs that expose a host-language `evaluatePredicate(pred, tags, metadata)` consume this fixture in their per-binding test suites.
 
+### `capability_validation.json`
+
+Pins `validate_capabilities(caps)` output for representative `caps` payloads. Phase 9a of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+
+- Each case carries a wire-format `caps` (`{ "tags": [...], "metadata": {...} }`) plus the `expected_errors` + `expected_warnings` arrays a conformant validator emits.
+- Bindings sort their output canonically (each list sorted by `JSON.stringify` / equivalent of each entry) before comparing.
+- Coverage spans every `SchemaError` kind that fires today (`type_mismatch` for numeric / presence / bool; `index_malformed`) plus every `ValidationWarning` kind (`unknown_key`, `legacy_tag`). Reserved-prefix tags pass through unchecked. The `metadata_oversize` warning is exercised by per-binding unit tests rather than the fixture (a 5 KB padded metadata value is awkward to embed in JSON).
+
+The fixture's top-level `schema_metadata_soft_cap_bytes` field pins the substrate's `METADATA_SOFT_CAP_BYTES` constant (`4096`) — bindings assert their soft-cap constant matches.
+
 ### `capability_set_diff.json`
 
 Pins the `CapabilitySet::diff(prev)` output for representative `(prev, curr)` pairs:

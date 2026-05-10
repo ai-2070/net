@@ -167,6 +167,28 @@ export {
   evaluatePredicate,
 } from './capability-enhancements';
 
+// Capability axis schema + validator — Phase 9a.
+export type {
+  AxisEntry,
+  AxisSchema,
+  KeyEntry,
+  KeyShape,
+  KeyShapeKind,
+  SchemaError,
+  ValidationReport,
+  ValidationWarning,
+  ValueType,
+} from './capability-schema';
+export {
+  AXIS_SCHEMA,
+  METADATA_RESERVED_KEYS,
+  METADATA_RESERVED_PREFIXES,
+  METADATA_SOFT_CAP_BYTES,
+  isReportClean,
+  isReportValid,
+  validateCapabilities,
+} from './capability-schema';
+
 // Subnets (visibility enforcement).
 export { subnetId, GLOBAL_SUBNET } from './subnets';
 export type { SubnetId, SubnetRule, SubnetPolicy } from './subnets';

@@ -17,7 +17,8 @@
 use std::collections::BTreeMap;
 
 use net::adapter::net::behavior::{
-    CapabilitySet, EvalContext, MetadataChange, Predicate, PredicateWire, RPC_WHERE_HEADER, Tag,
+    CapabilitySet, EvalContext, MetadataChange, Predicate, PredicateWire, RPC_WHERE_HEADER,
+    SchemaError, Tag, ValidationWarning, ValueType, validate_capabilities,
 };
 use serde_json::Value;
 
@@ -389,6 +390,138 @@ fn predicate_eval_fixture_matches_substrate() {
         assert_eq!(
             got_planned, expected,
             "case[{i}] {name}: planned evaluate diverged from expected (planner-equivalence regression)",
+        );
+    }
+}
+
+// =============================================================================
+// capability_validation.json — Phase 9a contract.
+//
+// Per case: parse the wire-format `caps`, run `validate_capabilities`,
+// project the resulting `ValidationReport` onto the canonical wire
+// shape (lowercase `kind` discriminator, axis as lowercase string,
+// ValueType as lowercase string), sort each list canonically by
+// JSON-string comparison, and assert it matches the fixture's
+// `expected_errors` + `expected_warnings`.
+//
+// Bindings consume the same fixture and assert their own validators
+// produce the same canonical output.
+// =============================================================================
+
+fn value_type_to_wire(t: ValueType) -> &'static str {
+    match t {
+        ValueType::Presence => "presence",
+        ValueType::Number => "number",
+        ValueType::String => "string",
+        ValueType::Enumeration => "enumeration",
+        ValueType::Bool => "bool",
+        ValueType::Csv => "csv",
+    }
+}
+
+fn schema_error_to_wire(e: &SchemaError) -> Value {
+    match e {
+        SchemaError::UnknownAxis { axis_prefix, tag } => serde_json::json!({
+            "kind": "unknown_axis",
+            "axis_prefix": axis_prefix,
+            "tag": tag,
+        }),
+        SchemaError::TypeMismatch {
+            axis,
+            key,
+            expected,
+            actual,
+        } => serde_json::json!({
+            "kind": "type_mismatch",
+            "axis": axis.as_str(),
+            "key": key,
+            "expected": value_type_to_wire(*expected),
+            "actual": actual,
+        }),
+        SchemaError::IndexMalformed {
+            axis,
+            prefix,
+            index,
+            tag,
+        } => serde_json::json!({
+            "kind": "index_malformed",
+            "axis": axis.as_str(),
+            "prefix": prefix,
+            "index": index,
+            "tag": tag,
+        }),
+    }
+}
+
+fn validation_warning_to_wire(w: &ValidationWarning) -> Value {
+    match w {
+        ValidationWarning::UnknownKey { axis, key } => serde_json::json!({
+            "kind": "unknown_key",
+            "axis": axis.as_str(),
+            "key": key,
+        }),
+        ValidationWarning::MetadataOversize {
+            soft_cap_bytes,
+            actual_bytes,
+        } => serde_json::json!({
+            "kind": "metadata_oversize",
+            "soft_cap_bytes": soft_cap_bytes,
+            "actual_bytes": actual_bytes,
+        }),
+        ValidationWarning::LegacyTag { tag } => serde_json::json!({
+            "kind": "legacy_tag",
+            "tag": tag,
+        }),
+    }
+}
+
+fn canonical_sort(v: &mut Vec<Value>) {
+    v.sort_by_key(|x| x.to_string());
+}
+
+#[test]
+fn capability_validation_fixture_matches_substrate() {
+    let raw = read_fixture("capability_validation.json");
+    let v: Value = serde_json::from_str(&raw).expect("parse fixture");
+    let cases = v["cases"].as_array().expect("cases is array");
+    assert!(!cases.is_empty(), "fixture has zero cases");
+
+    for (i, case) in cases.iter().enumerate() {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+
+        let caps: CapabilitySet = serde_json::from_value(case["caps"].clone())
+            .unwrap_or_else(|e| panic!("case[{i}] {name}: parse caps: {e}"));
+
+        let report = validate_capabilities(&caps);
+
+        let mut got_errors: Vec<Value> =
+            report.errors.iter().map(schema_error_to_wire).collect();
+        let mut got_warnings: Vec<Value> = report
+            .warnings
+            .iter()
+            .map(validation_warning_to_wire)
+            .collect();
+        canonical_sort(&mut got_errors);
+        canonical_sort(&mut got_warnings);
+
+        let mut expected_errors = case["expected_errors"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut expected_warnings = case["expected_warnings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        canonical_sort(&mut expected_errors);
+        canonical_sort(&mut expected_warnings);
+
+        assert_eq!(
+            got_errors, expected_errors,
+            "case[{i}] {name}: errors diverged\n  got:      {got_errors:#?}\n  expected: {expected_errors:#?}",
+        );
+        assert_eq!(
+            got_warnings, expected_warnings,
+            "case[{i}] {name}: warnings diverged\n  got:      {got_warnings:#?}\n  expected: {expected_warnings:#?}",
         );
     }
 }
