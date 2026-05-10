@@ -500,48 +500,55 @@ pub fn compose_axis_scores(scores: impl IntoIterator<Item = f32>) -> f32 {
 
 impl<'a> PlacementFilter for StandardPlacement<'a> {
     fn placement_score(&self, target: &NodeId, artifact: &Artifact<'_>) -> Option<f32> {
-        // Look up the candidate's announced caps. An unindexed target
-        // is a hard veto — we cannot reason about it.
-        let target_caps = self.index.get(*target)?;
+        // Look up the candidate's announced caps via the non-
+        // cloning path. The closure holds the index's per-shard
+        // read lock for the scoring call; saves the
+        // `CapabilitySet` clone (HashSet + BTreeMap allocations)
+        // that dominated the per-candidate hot path in benches.
+        // Outer `Option<Option<f32>>` flattens: outer `None` =
+        // unindexed target (hard veto, cannot reason about);
+        // inner `None` = filter / hard-constraint veto.
+        self.index
+            .with_caps(*target, |target_caps| -> Option<f32> {
+                // Hard-constraint check: artifact's `required` caps
+                // must be a subset of the target's tag set. `Chain`
+                // and `Replica` variants don't carry required caps
+                // directly; they pass through this check (slice 5
+                // may extend with per-variant checks).
+                if let Artifact::Daemon { required, .. } = artifact {
+                    if !required.tags.iter().all(|t| target_caps.tags.contains(t)) {
+                        return None;
+                    }
+                }
 
-        // Hard-constraint check: artifact's `required` caps must be
-        // a subset of the target's tag set. `Chain` and `Replica`
-        // variants don't carry required caps directly; they pass
-        // through this check (slice 5 may extend with per-variant
-        // checks).
-        if let Artifact::Daemon { required, .. } = artifact {
-            if !required.tags.iter().all(|t| target_caps.tags.contains(t)) {
-                return None;
-            }
-        }
+                // SDK Phase 7 slice 5 — custom-filter axis. Resolved
+                // here (BEFORE the in-tree axes) because a custom
+                // filter may hard-veto the candidate, and there's no
+                // point computing the in-tree axes if the custom
+                // filter is going to drop the candidate anyway. The
+                // score is composed in below.
+                let custom = self.score_custom_filter_axis(target, artifact)?;
 
-        // SDK Phase 7 slice 5 — custom-filter axis. Resolved here
-        // (BEFORE the in-tree axes) because a custom filter may
-        // hard-veto the candidate, and there's no point computing
-        // the in-tree axes if the custom filter is going to drop
-        // the candidate anyway. The score is composed in below.
-        let custom = match self.score_custom_filter_axis(target, artifact) {
-            Some(s) => s,
-            None => return None,
-        };
+                // Per-axis scoring (slice 5 of Phase F filled these
+                // in). Each takes the borrowed `&CapabilitySet`.
+                let scope = self.score_scope_axis(target_caps);
+                let proximity = self.score_proximity_axis(target);
+                let intent = self.score_intent_axis(target_caps, artifact);
+                let colocation = self.score_colocation_axis(target_caps, artifact);
+                let resource = self.score_resource_axis(target_caps, artifact);
+                let anti_affinity = self.score_anti_affinity_axis(target);
 
-        // Per-axis scoring (slice 5 of Phase F filled these in).
-        let scope = self.score_scope_axis(&target_caps);
-        let proximity = self.score_proximity_axis(target);
-        let intent = self.score_intent_axis(&target_caps, artifact);
-        let colocation = self.score_colocation_axis(&target_caps, artifact);
-        let resource = self.score_resource_axis(&target_caps, artifact);
-        let anti_affinity = self.score_anti_affinity_axis(target);
-
-        Some(compose_axis_scores([
-            scope,
-            proximity,
-            intent,
-            colocation,
-            resource,
-            anti_affinity,
-            custom,
-        ]))
+                Some(compose_axis_scores([
+                    scope,
+                    proximity,
+                    intent,
+                    colocation,
+                    resource,
+                    anti_affinity,
+                    custom,
+                ]))
+            })
+            .flatten()
     }
 }
 

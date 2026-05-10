@@ -3035,6 +3035,27 @@ impl CapabilityIndex {
         self.nodes.get(&node_id).map(|n| n.capabilities.clone())
     }
 
+    /// Run `f` against the node's `CapabilitySet` without cloning.
+    ///
+    /// Holds the `DashMap` shard's read lock for the duration of
+    /// the closure — `f` MUST NOT acquire any other index locks
+    /// (e.g. via `find_nodes` / `query`), or it'll deadlock
+    /// against a concurrent insert. Use [`Self::get`] when the
+    /// result needs to outlive the scoring call.
+    ///
+    /// Hot-path use: `StandardPlacement::placement_score` calls
+    /// this once per scoring decision, dispatching the in-tree
+    /// axes against the borrowed caps. Saves the `CapabilitySet`
+    /// clone per scoring call (a HashSet + BTreeMap allocation
+    /// pair), which dominates the per-candidate cost in benches.
+    pub fn with_caps<R>(
+        &self,
+        node_id: u64,
+        f: impl FnOnce(&CapabilitySet) -> R,
+    ) -> Option<R> {
+        self.nodes.get(&node_id).map(|n| f(&n.capabilities))
+    }
+
     /// Get the peer's last-advertised reflex address from the
     /// index. Returns `None` when the peer hasn't indexed, or
     /// indexed a version with no `reflex_addr` attached. Consumed
