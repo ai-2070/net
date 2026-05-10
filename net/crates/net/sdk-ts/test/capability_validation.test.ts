@@ -201,6 +201,50 @@ describe('default schema usage', () => {
   });
 });
 
+// P2-H: mirror substrate CR-14 reserved-metadata warnings.
+// The schema declares `metadataReserved` (exact-match) and
+// `metadataReservedPrefixes` (prefix-match) but pre-fix the TS
+// validator never consulted them, so a user's
+// `with_metadata("intent", …)` smuggling onto a scheduler-reserved
+// key emitted no warning.
+describe('regression: reserved metadata keys + prefixes', () => {
+  it('warns on exact-match reserved metadata keys', () => {
+    const caps: CapabilitySetWire = {
+      tags: [],
+      metadata: { intent: 'ml-training', benign: 'ok' },
+    };
+    const report = validateCapabilities(caps);
+    const reserved = report.warnings.find(
+      (w) =>
+        w.kind === 'metadata_reserved_key' &&
+        (w as { key: string }).key === 'intent',
+    );
+    expect(reserved).toBeDefined();
+    // Benign key produces no warning.
+    expect(
+      report.warnings.find(
+        (w) =>
+          w.kind === 'metadata_reserved_key' &&
+          (w as { key: string }).key === 'benign',
+      ),
+    ).toBeUndefined();
+  });
+
+  it('warns on reserved-prefix metadata keys', () => {
+    const caps: CapabilitySetWire = {
+      tags: [],
+      metadata: { 'tool::evil::input_schema': 'spoof' },
+    };
+    const report = validateCapabilities(caps);
+    const w = report.warnings.find(
+      (w) => w.kind === 'metadata_reserved_prefix',
+    ) as { key: string; prefix: string } | undefined;
+    expect(w).toBeDefined();
+    expect(w?.key).toBe('tool::evil::input_schema');
+    expect(w?.prefix).toBe('tool::');
+  });
+});
+
 // P1-B: substrate `Number` is unsigned (u64-only) — see CR-15 +
 // `schema.rs::ValueType::Number`. Negative values surface as
 // TypeMismatch errors in the substrate validator; the TS validator

@@ -207,6 +207,18 @@ export type ValidationWarning =
   | {
       kind: 'legacy_tag';
       tag: string;
+    }
+  // P2-H: mirror the substrate's CR-14 reserved-metadata warnings
+  // (`schema.rs::ValidationWarning::MetadataReservedKey` /
+  // `MetadataReservedPrefix`). Cross-binding parity restored.
+  | {
+      kind: 'metadata_reserved_key';
+      key: string;
+    }
+  | {
+      kind: 'metadata_reserved_prefix';
+      key: string;
+      prefix: string;
     };
 
 export interface ValidationReport {
@@ -394,6 +406,25 @@ export function validateCapabilities(
       case 'legacy':
         warnings.push({ kind: 'legacy_tag', tag: tag.raw });
         break;
+    }
+  }
+
+  // P2-H: metadata-key reservation check. The schema declares
+  // `metadataReserved` (exact-match) and `metadataReservedPrefixes`
+  // (prefix-match) but pre-fix the validator never consulted them
+  // — a user's `with_metadata("intent", …)` smuggling onto a
+  // scheduler-reserved key emitted no warning. Mirrors the
+  // substrate's CR-14 fix.
+  for (const key of Object.keys(caps.metadata)) {
+    if (schema.metadataReserved.includes(key)) {
+      warnings.push({ kind: 'metadata_reserved_key', key });
+      continue;
+    }
+    const prefix = schema.metadataReservedPrefixes.find((p) =>
+      key.startsWith(p),
+    );
+    if (prefix !== undefined) {
+      warnings.push({ kind: 'metadata_reserved_prefix', key, prefix });
     }
   }
 
