@@ -30,7 +30,14 @@
  *   LD_LIBRARY_PATH=target/release ./capability
  */
 
-#include "../include/net.h"
+/* `net.go.h` is the broader Go-binding superset that already
+ * declares every symbol this example uses (capability + predicate
+ * helpers PLUS `net_free_string`). The canonical `net.h` shares
+ * the same `NET_SDK_H` include guard, so including both in one
+ * TU silently skips the second. CR-5: drop the redundant include
+ * — it produced implicit-declaration errors on GCC 14+/Clang 16+
+ * for every `net_validate_capabilities` / `net_predicate_*`
+ * symbol the example calls. */
 #include "../include/net.go.h"
 #include <stdio.h>
 #include <stdlib.h>
