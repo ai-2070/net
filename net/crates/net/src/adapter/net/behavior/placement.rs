@@ -969,6 +969,17 @@ fn artifact_intent<'a>(artifact: &'a Artifact<'_>, intent_key: &str) -> Option<&
 ///
 /// Used by the resource axis (slice 5) to read numeric capacity
 /// declarations off the target's `CapabilitySet`.
+///
+/// N-12: range-check the parsed f64 against a sane sentinel
+/// (`[0.0, MAX_RESOURCE_VALUE]`) before passing it back. A
+/// malformed peer announcement like `hardware.cpu_cores=1e308`
+/// parses as a finite f64 but, when downcast to f32 in the resource
+/// axis, saturates to `f32::INFINITY` — the CR-9 NaN/inf guard
+/// then clamps it to 0.0 and the candidate is silently downscored
+/// to "looks like a bad fit" when the tag was simply absurd. By
+/// returning `None` for out-of-range values we treat the tag as
+/// "no data" and fall through to the permissive identity path,
+/// which is what an operator would expect for a malformed input.
 fn target_axis_value_numeric(caps: &CapabilitySet, axis: TaxonomyAxis, key: &str) -> Option<f64> {
     caps.tags.iter().find_map(|t| match t {
         Tag::AxisValue {
@@ -976,10 +987,23 @@ fn target_axis_value_numeric(caps: &CapabilitySet, axis: TaxonomyAxis, key: &str
             key: k,
             value,
             ..
-        } if *a == axis && k == key => value.parse::<f64>().ok(),
+        } if *a == axis && k == key => {
+            let v = value.parse::<f64>().ok()?;
+            if !(0.0..=MAX_RESOURCE_VALUE).contains(&v) || !v.is_finite() {
+                return None;
+            }
+            Some(v)
+        }
         _ => None,
     })
 }
+
+/// N-12: largest sane resource-axis numeric value (1e15). Higher
+/// values are below the f64 → f32 overflow threshold but well above
+/// any plausible real-world capacity: 1 PB of memory, 1 ZB of
+/// storage. A peer announcing past this bound is malformed; we
+/// drop the value rather than letting it poison the score.
+const MAX_RESOURCE_VALUE: f64 = 1e15;
 
 /// Soft-saturating score: `value / (value + reference)`.
 /// Bounded in `[0.0, 1.0]`; half at `value == reference`;
@@ -2694,6 +2718,40 @@ mod tests {
         // Neither axis has data — still permissive 1.0 identity.
         let target_caps = empty_caps();
         assert_eq!(placement.score_resource_axis(&target_caps, &artifact), 1.0);
+    }
+
+    /// N-12 regression: a `hardware.cpu_cores=1e308` announcement
+    /// parses as a finite f64 (≈1.8e308 < f64::MAX) but, when cast
+    /// to f32 in the downstream score path, saturates to
+    /// `f32::INFINITY`. The CR-9 guard then clamps the score to
+    /// 0.0 — silently down-scoring the candidate to "bad fit"
+    /// when the tag was absurd. Post-fix: `target_axis_value_numeric`
+    /// range-checks against `MAX_RESOURCE_VALUE` and returns
+    /// `None` (treated as "no data" by the score helper).
+    #[test]
+    fn resource_axis_overflow_value_treated_as_no_data() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Compute);
+        // Absurd `hardware.cpu_cores=1e308`: a finite f64, but
+        // saturates to f32::INFINITY when downcast. Treated as
+        // no-data → axis returns permissive 1.0.
+        let target_caps = empty_caps().add_tag("hardware.cpu_cores=1e308");
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        let score = placement.score_resource_axis(&target_caps, &artifact);
+        assert_eq!(
+            score, 1.0,
+            "overflow value should be treated as no-data, not as 0.0; got {score}",
+        );
+
+        // Sanity: a sane value in the same axis still scores correctly.
+        let target_caps = empty_caps().add_tag("hardware.cpu_cores=8");
+        let score = placement.score_resource_axis(&target_caps, &artifact);
+        assert!(
+            (score - 0.5).abs() < 1e-6,
+            "sane value still scores normally; got {score}",
+        );
     }
 
     /// Defensive: a malformed numeric tag (non-parseable value)
