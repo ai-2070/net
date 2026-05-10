@@ -652,15 +652,45 @@ export function diffCapabilities(
   prev: CapabilitySetWire,
   curr: CapabilitySetWire,
 ): CapabilitySetDiff {
-  const prevTagSet = new Set(prev.tags);
-  const currTagSet = new Set(curr.tags);
+  // N-3: compare semantically rather than over raw wire strings.
+  // Two `AxisValue` tags differing only in separator form
+  // (`hardware.k=v` vs `hardware.k:v`) carry identical semantics;
+  // the substrate's `CapabilitySet::diff` uses
+  // `Tag::semantic_eq` for exactly this reason (CR-3 fix at
+  // `capability.rs:1395-1414`). A raw set-difference over wire
+  // strings emits phantom Removed+Added pairs whenever a peer
+  // normalizes separator form between announcements.
+  //
+  // Build a semantic key per parsed tag and compare on that. Keep
+  // the original wire string (current side first, falling back to
+  // prev) so the emitted op preserves what the caller actually
+  // sent.
+  const tagSemanticKey = (s: string): string => {
+    const t = tagFromString(s);
+    switch (t.kind) {
+      case 'axisValue':
+        // Drop separator from the key — `=` and `:` are
+        // semantically identical at the wire layer.
+        return `axisValue:${t.axis}.${t.key}=${t.value}`;
+      case 'axisPresent':
+        return `axisPresent:${t.axis}.${t.key}`;
+      case 'reserved':
+        return `reserved:${t.prefix}${t.body}`;
+      case 'legacy':
+        return `legacy:${t.raw}`;
+    }
+  };
+  const prevByKey = new Map<string, string>();
+  for (const t of prev.tags) prevByKey.set(tagSemanticKey(t), t);
+  const currByKey = new Map<string, string>();
+  for (const t of curr.tags) currByKey.set(tagSemanticKey(t), t);
   const added_tags: string[] = [];
   const removed_tags: string[] = [];
-  for (const t of currTagSet) {
-    if (!prevTagSet.has(t)) added_tags.push(t);
+  for (const [k, wire] of currByKey) {
+    if (!prevByKey.has(k)) added_tags.push(wire);
   }
-  for (const t of prevTagSet) {
-    if (!currTagSet.has(t)) removed_tags.push(t);
+  for (const [k, wire] of prevByKey) {
+    if (!currByKey.has(k)) removed_tags.push(wire);
   }
   added_tags.sort();
   removed_tags.sort();

@@ -167,6 +167,42 @@ describe('CapabilitySet.diff (cross-binding fixture)', () => {
   }
 });
 
+// N-3 regression: diff must compare semantically, ignoring separator
+// form on AxisValue tags. Two announcements emitting `hardware.k=v`
+// vs `hardware.k:v` carry identical semantics — the substrate's
+// `CapabilitySet::diff` was patched in CR-3 to match on
+// `(axis, key, value)` and the TS rewrite must follow.
+describe('diffCapabilities ignores AxisValue separator form (N-3 regression)', () => {
+  it('treats hardware.k=v and hardware.k:v as identical', () => {
+    const prev: CapabilitySetWire = {
+      tags: ['hardware.gpu=nvidia-h100', 'software.os=linux'],
+      metadata: {},
+    };
+    const curr: CapabilitySetWire = {
+      tags: ['hardware.gpu:nvidia-h100', 'software.os:linux'],
+      metadata: {},
+    };
+    const got = diffCapabilities(prev, curr);
+    expect(got.added_tags).toEqual([]);
+    expect(got.removed_tags).toEqual([]);
+    expect(got.metadata_changes).toEqual([]);
+  });
+
+  it('still detects a real value change separately from a separator change', () => {
+    const prev: CapabilitySetWire = {
+      tags: ['hardware.gpu=nvidia-h100', 'software.os=linux'],
+      metadata: {},
+    };
+    const curr: CapabilitySetWire = {
+      tags: ['hardware.gpu:nvidia-h200', 'software.os:linux'],
+      metadata: {},
+    };
+    const got = diffCapabilities(prev, curr);
+    expect(got.added_tags).toEqual(['hardware.gpu:nvidia-h200']);
+    expect(got.removed_tags).toEqual(['hardware.gpu=nvidia-h100']);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Local unit tests — typed taxonomy, reserved-prefix enforcement,
 // chain helpers, StandardPlacement builder, predicate fluent API.
