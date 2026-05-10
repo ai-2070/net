@@ -34,6 +34,28 @@
 // bounded by per-node metadata cardinality, acceptable for the
 // placement hot path. Node + Python bindings marshal natively
 // because their FFIs already speak structured types; cgo doesn't.
+//
+// # Cross-binding compat contract
+//
+// Downstream Go test trees are expected to mirror the Rust /
+// TS / Python cross-binding compat tests:
+//
+//   - Rust:   `tests/cross_lang_capability_fixtures.rs`,
+//             test `predicate_eval_fixture_matches_via_placement_filter_callback`
+//   - TS:     `sdk-ts/test/capability_enhancements.test.ts`,
+//             describe `placementFilterFromFn (cross-binding fixture)`
+//   - Python: `sdk-py/tests/test_capability_enhancements.py`,
+//             test `test_predicate_eval_fixture_via_placement_filter_callback`
+//
+// Each test loads `tests/cross_lang_capability/predicate_eval.json`,
+// wraps each case's predicate as a `PlacementFilterFn` callback,
+// and asserts the wrapped-callback boolean output equals direct
+// `Predicate::evaluate_unplanned` (the fixture's `expected` field).
+// The Go equivalent — using `PlacementFilterFromFn` and
+// `EvaluatePredicate(pred, candidate.Tags, candidate.Metadata)` —
+// is mechanical and lives in the downstream Go binding tree's
+// `capability_test.go`. Failures across bindings show up as a
+// fixture-driven CI failure on the drifting binding.
 package net
 
 /*

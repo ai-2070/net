@@ -339,3 +339,39 @@ def test_placement_filter_from_fn_auto_id() -> None:
 def test_placement_filter_from_fn_explicit_id() -> None:
     f = placement_filter_from_fn(lambda c: True, "my-filter")
     assert f.id == "my-filter"
+
+
+# =====================================================================
+# SDK Phase 7 cross-binding compat — wrap a predicate as a
+# placement-filter callback and run it against the same
+# `predicate_eval.json` fixture every binding consumes. Pins that
+# the Python SDK's `placement_filter_from_fn` correctly delivers
+# each candidate's `(tags, metadata)` to the user closure such
+# that direct `evaluate_predicate(pred, tags, metadata)` and the
+# wrapped-callback path produce identical booleans.
+#
+# Mirror of the Rust-side
+# `predicate_eval_fixture_matches_via_placement_filter_callback`
+# test in `tests/cross_lang_capability_fixtures.rs`. Failures here
+# vs there indicate cross-binding drift in either the predicate
+# evaluator or the placement-filter helper.
+# =====================================================================
+
+
+@pytest.mark.parametrize("case", _eval_cases(), ids=lambda c: c["name"])
+def test_predicate_eval_fixture_via_placement_filter_callback(
+    case: Dict[str, Any],
+) -> None:
+    pred = predicate_from_wire(case["wire"])
+    # Wrap the predicate evaluator as a `PlacementFilterFn`. The
+    # candidate carries the case's `(tags, metadata)`; node_id is
+    # arbitrary because the predicate doesn't read it.
+    filt = placement_filter_from_fn(
+        lambda cand: evaluate_predicate(pred, cand.tags, cand.metadata)
+    )
+    candidate = PlacementCandidate(
+        node_id=0x1234_5678,
+        tags=tuple(case["tags"]),
+        metadata=dict(case["metadata"]),
+    )
+    assert filt.fn(candidate) is case["expected"]

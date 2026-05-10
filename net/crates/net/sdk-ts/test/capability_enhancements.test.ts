@@ -395,3 +395,41 @@ describe('placementFilterFromFn', () => {
     expect(f.id).toBe('my-filter');
   });
 });
+
+// =====================================================================
+// SDK Phase 7 cross-binding compat — wrap a predicate as a
+// placement-filter callback and run it against the same
+// `predicate_eval.json` fixture every binding consumes. Pins that
+// the TS SDK's `placementFilterFromFn` correctly delivers each
+// candidate's `(tags, metadata)` to the user closure such that
+// direct `evaluatePredicate(pred, tags, metadata)` and the wrapped-
+// callback path produce identical booleans.
+//
+// Mirror of the Rust-side
+// `predicate_eval_fixture_matches_via_placement_filter_callback`
+// test in `tests/cross_lang_capability_fixtures.rs`. Failures here
+// vs there indicate cross-binding drift in either the predicate
+// evaluator or the placement-filter helper.
+// =====================================================================
+
+describe('placementFilterFromFn (cross-binding fixture)', () => {
+  const fx = loadJson<EvalFixture>(EVAL_FIXTURE, 'predicate eval (placement filter)');
+
+  for (const c of fx.cases) {
+    it(`matches direct predicate evaluation for ${c.name}`, () => {
+      const pred = predicateFromWire(c.wire);
+      // Wrap the predicate evaluator as a `PlacementFilterFn`. The
+      // candidate carries the case's `(tags, metadata)`; node_id is
+      // arbitrary because the predicate doesn't read it.
+      const filter = placementFilterFromFn((cand) =>
+        evaluatePredicate(pred, cand.tags, cand.metadata),
+      );
+      const candidate = {
+        nodeId: 0x1234_5678n,
+        tags: c.tags,
+        metadata: c.metadata,
+      };
+      expect(filter.fn(candidate)).toBe(c.expected);
+    });
+  }
+});
