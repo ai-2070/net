@@ -1353,9 +1353,25 @@ impl CapabilitySet {
     /// diff (better for change-event consumers). Same input data;
     /// pick the surface that matches the consumer's shape.
     pub fn diff(&self, prev: &CapabilitySet) -> CapabilitySetDiff {
-        // Tag diff: HashSet difference both ways.
-        let added_tags: HashSet<Tag> = self.tags.difference(&prev.tags).cloned().collect();
-        let removed_tags: HashSet<Tag> = prev.tags.difference(&self.tags).cloned().collect();
+        // Tag diff: separator-agnostic. Plain `HashSet::difference`
+        // would compare via `Tag::PartialEq`, which distinguishes
+        // `=` vs `:` on `AxisValue` — two semantically-identical
+        // tags would land as both Added and Removed. The structural
+        // `DiffEngine::diff` was patched for this in 38612b61; this
+        // companion API was not. See CR-3 in
+        // `CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md`.
+        let added_tags: HashSet<Tag> = self
+            .tags
+            .iter()
+            .filter(|t| !prev.tags.iter().any(|p| p.semantic_eq(t)))
+            .cloned()
+            .collect();
+        let removed_tags: HashSet<Tag> = prev
+            .tags
+            .iter()
+            .filter(|t| !self.tags.iter().any(|c| c.semantic_eq(t)))
+            .cloned()
+            .collect();
 
         // Metadata diff: walk both maps simultaneously. Both are
         // `BTreeMap` so we can rely on ordered iteration; merge
@@ -5512,6 +5528,41 @@ mod tests {
         let removed: Vec<_> = diff.removed_tags.iter().map(|t| t.to_string()).collect();
         assert_eq!(added, vec!["c".to_string()]);
         assert_eq!(removed, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn diff_ignores_separator_form_on_axis_value_tags() {
+        // Regression for CR-3: `Tag::AxisValue` PartialEq distinguishes
+        // `=` vs `:`. A naive `HashSet::difference` would land two
+        // semantically-identical tags as both Added and Removed.
+        // The structural `DiffEngine::diff` was patched in 38612b61;
+        // the companion `CapabilitySet::diff` API was not.
+        use crate::adapter::net::behavior::tag::{AxisSeparator, Tag, TaxonomyAxis};
+        let mut prev = CapabilitySet::new();
+        prev.tags.insert(Tag::AxisValue {
+            axis: TaxonomyAxis::Software,
+            key: "os".to_string(),
+            value: "linux".to_string(),
+            separator: AxisSeparator::Eq,
+        });
+        let mut curr = CapabilitySet::new();
+        curr.tags.insert(Tag::AxisValue {
+            axis: TaxonomyAxis::Software,
+            key: "os".to_string(),
+            value: "linux".to_string(),
+            separator: AxisSeparator::Colon,
+        });
+        let diff = curr.diff(&prev);
+        assert!(
+            diff.added_tags.is_empty(),
+            "added tags should be empty for separator-only difference, got {:?}",
+            diff.added_tags
+        );
+        assert!(
+            diff.removed_tags.is_empty(),
+            "removed tags should be empty for separator-only difference, got {:?}",
+            diff.removed_tags
+        );
     }
 
     #[test]
