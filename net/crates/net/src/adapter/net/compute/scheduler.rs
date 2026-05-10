@@ -377,9 +377,21 @@ impl Scheduler {
         placement: &dyn PlacementFilter,
         tie_break: &TieBreakContext<'_>,
     ) -> Option<u64> {
+        // CR-6: drop NaN scores at the boundary. `StandardPlacement`
+        // clamps NaN in `compose_axis_scores`, but FFI-registered
+        // filters resolved via `placement_registry` are free to
+        // return raw `Some(f32::NAN)` (JS `NaN` round-trips
+        // trivially through napi; Python f64 NaN through pyo3).
+        // A NaN candidate compares `Equal` to everything, so
+        // `Vec::sort_by` over a non-total ordering produces
+        // *undefined* placement order — different runs would pick
+        // different winners. Treat NaN as a hard veto (drop the
+        // candidate) so the contract is enforceable at the
+        // boundary, matching the StandardPlacement clamp behavior.
         let mut scored: Vec<(u64, f32)> = candidates
             .into_iter()
             .filter_map(|n| placement.placement_score(&n, artifact).map(|s| (n, s)))
+            .filter(|(_, s)| s.is_finite())
             .collect();
 
         if scored.is_empty() {
@@ -387,9 +399,9 @@ impl Scheduler {
         }
 
         // Highest score first; ties broken via the locked
-        // three-step ordering. `partial_cmp` returns `None` only
-        // for NaN — the placement filter contract bans NaN, so
-        // treat as `Equal` defensively.
+        // three-step ordering. NaN is no longer reachable here
+        // (filtered above), so `partial_cmp.unwrap_or(Equal)` is
+        // a safety belt only — a strict total order is now in force.
         scored.sort_by(|(a, sa), (b, sb)| {
             sb.partial_cmp(sa)
                 .unwrap_or(Ordering::Equal)
@@ -1186,6 +1198,59 @@ mod tests {
             .expect("0x1111 is the only filter-passing candidate");
         assert_eq!(decision.node_id, 0x1111);
         assert_eq!(decision.reason, PlacementReason::BestScore);
+    }
+
+    /// CR-6: NaN scores from custom `PlacementFilter` impls (e.g.
+    /// FFI-registered Python/JS predicates) must not poison the
+    /// placement sort. `Vec::sort_by` over a non-total ordering is
+    /// undefined; `pick_best_candidate` must drop NaN candidates at
+    /// the boundary so the surviving sort is a strict total order.
+    #[test]
+    fn pick_best_candidate_drops_nan_scores() {
+        use crate::adapter::net::behavior::placement::{
+            Artifact, NodeId, PlacementFilter, ResourceAxis, TieBreakContext,
+        };
+
+        struct NaNFilter;
+        impl PlacementFilter for NaNFilter {
+            fn placement_score(&self, target: &NodeId, _: &Artifact<'_>) -> Option<f32> {
+                // Node 0x2222 — NaN score (must be dropped).
+                // All others — finite score 1.0 (eligible).
+                if *target == 0x2222 {
+                    Some(f32::NAN)
+                } else {
+                    Some(1.0)
+                }
+            }
+        }
+
+        let required = CapabilitySet::new();
+        let optional = CapabilitySet::new();
+        let artifact = Artifact::Daemon {
+            daemon_id: [0u8; 32],
+            required: &required,
+            optional: &optional,
+        };
+        let index = CapabilityIndex::new();
+        let tie_break = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        // 64 runs to make any ordering randomness extremely
+        // unlikely to mask the bug if the filter regresses.
+        for run in 0..64 {
+            let pick = Scheduler::pick_best_candidate(
+                vec![0x1111u64, 0x2222u64, 0x3333u64],
+                &artifact,
+                &NaNFilter,
+                &tie_break,
+            );
+            // 0x2222 (NaN) must NEVER win; 0x1111 wins by lex
+            // tie-break against 0x3333 (both score 1.0).
+            assert_eq!(pick, Some(0x1111), "run {run}: NaN candidate must be dropped");
+        }
     }
 
     /// `place_migration` (v1) is still available and unchanged.
