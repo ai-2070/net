@@ -191,6 +191,29 @@ pub struct CallOptions {
     /// surface (cheaper fast path; no tokio spawn / registry
     /// overhead).
     pub cancel_token: Option<BigInt>,
+    /// Caller-supplied request headers, appended to the wire
+    /// `RpcRequestPayload.headers` after any auto-generated
+    /// headers (trace, stream-window). Used for application-level
+    /// metadata the server needs at dispatch-time — most notably
+    /// the `cyberdeck-where` predicate header for Phase 9b
+    /// predicate-pushdown filtering.
+    ///
+    /// JS callers pass `[{ name: "cyberdeck-where", value: Buffer.from(jsonBytes) }, ...]`.
+    /// `undefined` (default) → no extra headers.
+    pub request_headers: Option<Vec<RpcRequestHeader>>,
+}
+
+/// A single `(name, value)` request-header entry. Names follow the
+/// lowercase `cyberdeck-*` / `nrpc-*` convention; the substrate
+/// doesn't validate names beyond the `MAX_RPC_HEADER_NAME_LEN` cap.
+#[napi(object)]
+pub struct RpcRequestHeader {
+    /// Header name (e.g. `cyberdeck-where`).
+    pub name: String,
+    /// Header value bytes. For text-like headers (predicates,
+    /// trace-context), the contents are UTF-8 strings encoded as
+    /// `Buffer.from(str)`.
+    pub value: Buffer,
 }
 
 impl CallOptions {
@@ -205,6 +228,12 @@ impl CallOptions {
         }
         opts.stream_window_initial = self.stream_window_initial;
         opts.routing_policy = InnerRoutingPolicy::default();
+        if let Some(headers) = self.request_headers {
+            opts.request_headers = headers
+                .into_iter()
+                .map(|h| (h.name, h.value.to_vec()))
+                .collect();
+        }
         let token = self
             .cancel_token
             .map(crate::common::bigint_u64)
@@ -802,14 +831,52 @@ mod tests {
             deadline_ms: Some(500),
             stream_window_initial: Some(8),
             cancel_token: None,
+            request_headers: None,
         };
         let inner = opts.into_inner();
         assert!(inner.deadline.is_some(), "deadline must be Some when set");
         assert_eq!(inner.stream_window_initial, Some(8));
+        assert!(
+            inner.request_headers.is_empty(),
+            "no headers expected when None"
+        );
 
         let empty = CallOptions::default().into_inner();
         assert!(empty.deadline.is_none());
         assert!(empty.stream_window_initial.is_none());
+        assert!(empty.request_headers.is_empty());
+    }
+
+    /// Phase 9b: `request_headers` plumb through to the substrate's
+    /// `InnerCallOptions::request_headers`. The dispatch path (in
+    /// substrate) appends these to the `RpcRequestPayload.headers`
+    /// vector — pinned by the substrate's mesh_rpc_where end-to-end
+    /// test. This unit test pins the binding-side encode contract:
+    /// JS `[{ name, value: Buffer }, ...]` → Rust `Vec<(String,
+    /// Vec<u8>)>` byte-equal.
+    #[test]
+    fn call_options_request_headers_plumb_through() {
+        let opts = CallOptions {
+            deadline_ms: None,
+            stream_window_initial: None,
+            cancel_token: None,
+            request_headers: Some(vec![
+                RpcRequestHeader {
+                    name: "cyberdeck-where".into(),
+                    value: Buffer::from(b"json".as_slice()),
+                },
+                RpcRequestHeader {
+                    name: "cyberdeck-x-tenant".into(),
+                    value: Buffer::from(b"acme".as_slice()),
+                },
+            ]),
+        };
+        let inner = opts.into_inner();
+        assert_eq!(inner.request_headers.len(), 2);
+        assert_eq!(inner.request_headers[0].0, "cyberdeck-where");
+        assert_eq!(inner.request_headers[0].1, b"json");
+        assert_eq!(inner.request_headers[1].0, "cyberdeck-x-tenant");
+        assert_eq!(inner.request_headers[1].1, b"acme");
     }
 
     /// `parse_js_app_error` parses canonical

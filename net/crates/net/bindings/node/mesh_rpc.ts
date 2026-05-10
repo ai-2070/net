@@ -78,6 +78,30 @@ export interface CallOptions {
    * instead.
    */
   cancelToken?: bigint
+  /**
+   * Caller-supplied request headers, appended to the wire
+   * `RpcRequestPayload.headers`. Used for application-level metadata
+   * the server needs at dispatch-time — most notably the
+   * `cyberdeck-where:` predicate header for Phase 9b
+   * predicate-pushdown filtering.
+   *
+   * Convenience: build entries via `whereHeader(pred)` from
+   * `@ai2070/net-sdk` for predicate-pushdown.
+   */
+  requestHeaders?: RpcRequestHeader[]
+}
+
+/**
+ * Single request-header entry. Names follow the lowercase
+ * `cyberdeck-*` / `nrpc-*` convention.
+ */
+export interface RpcRequestHeader {
+  name: string
+  /**
+   * Header value bytes. For text-like headers (predicates,
+   * trace-context), encode with `Buffer.from(str)`.
+   */
+  value: Buffer
 }
 
 /**

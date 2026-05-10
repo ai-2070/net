@@ -560,6 +560,33 @@ export function predicateFromRpcHeader(value: string): Predicate {
   return predicateFromWire(wire);
 }
 
+/**
+ * Build the `cyberdeck-where:` request-header entry for a
+ * Phase 9b predicate-pushdown call. Drops straight into a
+ * `MeshRpc.call` `CallOptions.requestHeaders` array.
+ *
+ * @example
+ * ```ts
+ * import { p, tagKey, whereHeader } from '@ai2070/net-sdk';
+ * const pred = p.exists(tagKey('hardware', 'gpu'));
+ * await rpc.call(targetNodeId, 'filter-svc', body, {
+ *   requestHeaders: [whereHeader(pred)],
+ * });
+ * ```
+ *
+ * The header value is the canonical JSON-encoded `PredicateWire`
+ * pinned by `predicate_nrpc_envelope.json`.
+ */
+export function whereHeader(pred: Predicate): {
+  name: string;
+  value: Buffer;
+} {
+  return {
+    name: RPC_WHERE_HEADER,
+    value: Buffer.from(predicateToRpcHeader(pred), 'utf-8'),
+  };
+}
+
 // ============================================================================
 // CapabilitySet diff — mirrors `CapabilitySet::diff` and the
 // cross-binding `capability_set_diff.json` fixture.

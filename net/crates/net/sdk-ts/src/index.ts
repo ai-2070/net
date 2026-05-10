@@ -156,6 +156,7 @@ export {
   predicateFromWire,
   predicateToRpcHeader,
   predicateFromRpcHeader,
+  whereHeader,
   diffCapabilities,
   emptyCapabilities,
   requireTag,

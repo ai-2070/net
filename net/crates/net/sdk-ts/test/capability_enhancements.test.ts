@@ -332,6 +332,19 @@ describe('p.* fluent predicate builder', () => {
       root_idx: 0,
     });
   });
+
+  it('whereHeader builds a Buffer-valued cyberdeck-where entry', async () => {
+    const { whereHeader, RPC_WHERE_HEADER } = await import(
+      '../src/capability-enhancements'
+    );
+    const pred = p.exists(tagKey('hardware', 'gpu'));
+    const entry = whereHeader(pred);
+    expect(entry.name).toBe(RPC_WHERE_HEADER);
+    // Buffer holds the same bytes as the JSON string from
+    // predicateToRpcHeader.
+    expect(Buffer.isBuffer(entry.value)).toBe(true);
+    expect(entry.value.toString('utf-8')).toBe(predicateToRpcHeader(pred));
+  });
 });
 
 describe('StandardPlacement builder', () => {
