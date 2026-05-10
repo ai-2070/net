@@ -818,9 +818,25 @@ impl<'a> StandardPlacement<'a> {
             ResourceAxis::Compute => score_compute_axis(target_caps),
             ResourceAxis::Storage => score_storage_axis(target_caps),
             ResourceAxis::Both => {
-                let c = score_compute_axis(target_caps);
-                let s = score_storage_axis(target_caps);
-                (c + s) / 2.0
+                // N-11: track per-axis "had-data" so a no-data
+                // candidate doesn't average two `1.0` placeholders
+                // into a `1.0` final that ties a maxed-out
+                // candidate. Pre-fix the average `(1.0 + 1.0) /
+                // 2.0` let the lex-NodeId tie-breaker bias placement
+                // toward (often misconfigured) lower-id peers under
+                // the `Both` axis. Post-fix:
+                //   - neither had data → 1.0 (still permissive)
+                //   - exactly one had data → that axis's score
+                //     alone (don't dilute against a permissive
+                //     placeholder)
+                //   - both had data → average
+                let c = score_compute_axis_with_data(target_caps);
+                let s = score_storage_axis_with_data(target_caps);
+                match (c, s) {
+                    (None, None) => 1.0,
+                    (Some(score), None) | (None, Some(score)) => score,
+                    (Some(cs), Some(ss)) => (cs + ss) / 2.0,
+                }
             }
         }
     }
@@ -1022,6 +1038,39 @@ fn score_storage_axis(caps: &CapabilitySet) -> f32 {
     } else {
         1.0
     }
+}
+
+/// N-11: variant of [`score_compute_axis`] that reports whether the
+/// target carried ANY of the compute-axis tags. `None` ↔ "no data,
+/// don't dilute the resource composition"; `Some(score)` ↔ at least
+/// one tag was found and contributed. Used by `score_resource_axis`'s
+/// `Both` branch so a no-data candidate doesn't tie a maxed-out one
+/// by averaging two permissive `1.0` placeholders.
+fn score_compute_axis_with_data(caps: &CapabilitySet) -> Option<f32> {
+    let mut sum = 0.0_f32;
+    let mut count = 0u32;
+    if let Some(c) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "cpu_cores") {
+        sum += saturating_score(c as f32, 8.0);
+        count += 1;
+    }
+    if let Some(m) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "memory_mb") {
+        sum += saturating_score(m as f32, 16_384.0);
+        count += 1;
+    }
+    if let Some(v) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "gpu.vram_mb") {
+        sum += saturating_score(v as f32, 16_384.0);
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(sum / count as f32)
+}
+
+/// N-11: storage-axis sibling of [`score_compute_axis_with_data`].
+fn score_storage_axis_with_data(caps: &CapabilitySet) -> Option<f32> {
+    let s = target_axis_value_numeric(caps, TaxonomyAxis::Dataforts, "capacity_mb")?;
+    Some(saturating_score(s as f32, 1_000_000.0))
 }
 
 /// Does the target host the named chain? Walks the target's
@@ -2598,23 +2647,53 @@ mod tests {
         assert_eq!(placement.score_resource_axis(&target_caps, &artifact), 1.0);
     }
 
-    /// `Both` axis: equal-weighted mean of compute + storage
-    /// scores. Pin against synthetic inputs that produce
-    /// known scores: compute at half (8 cores) + storage no-data
-    /// (1.0) → mean (0.5 + 1.0) / 2 = 0.75.
+    /// N-11: `Both` axis no longer dilutes against a no-data axis.
+    /// Compute at half (8 cores) + storage no-data → returns the
+    /// compute score alone (0.5), NOT the pre-fix average
+    /// `(0.5 + 1.0) / 2 = 0.75` which incorrectly inflated the
+    /// candidate's resource fit. The pre-fix shape let a no-data
+    /// candidate tie a maxed-out one, biasing placement toward
+    /// often-misconfigured lower-NodeId peers via the lex tie-break.
     #[test]
-    fn resource_axis_both_averages_compute_and_storage() {
+    fn resource_axis_both_uses_only_axes_with_data() {
         let index = index_with(&[]);
         let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Both);
+
+        // Compute has data (cpu_cores=8 → 0.5), storage does not.
         let target_caps = empty_caps().add_tag("hardware.cpu_cores=8");
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
         let score = placement.score_resource_axis(&target_caps, &artifact);
         assert!(
-            (score - 0.75).abs() < 1e-6,
-            "Both: (compute 0.5 + storage 1.0) / 2 = 0.75; got {score}"
+            (score - 0.5).abs() < 1e-6,
+            "Both with only compute data should return compute score; got {score}"
         );
+
+        // Storage has data (capacity_mb=500_000 → 0.333), compute
+        // does not. Should return the storage score alone.
+        let target_caps = empty_caps().add_tag("dataforts.capacity_mb=500000");
+        let score = placement.score_resource_axis(&target_caps, &artifact);
+        let expected = saturating_score(500_000.0, 1_000_000.0);
+        assert!(
+            (score - expected).abs() < 1e-6,
+            "Both with only storage data should return storage score; got {score}"
+        );
+
+        // Both axes have data — average is computed.
+        let target_caps = empty_caps()
+            .add_tag("hardware.cpu_cores=8")
+            .add_tag("dataforts.capacity_mb=500000");
+        let score = placement.score_resource_axis(&target_caps, &artifact);
+        let expected = (0.5 + saturating_score(500_000.0, 1_000_000.0)) / 2.0;
+        assert!(
+            (score - expected).abs() < 1e-6,
+            "Both with both axes' data averages; got {score}, expected {expected}"
+        );
+
+        // Neither axis has data — still permissive 1.0 identity.
+        let target_caps = empty_caps();
+        assert_eq!(placement.score_resource_axis(&target_caps, &artifact), 1.0);
     }
 
     /// Defensive: a malformed numeric tag (non-parseable value)
