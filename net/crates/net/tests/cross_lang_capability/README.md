@@ -88,6 +88,19 @@ Pins `validate_capabilities(caps)` output for representative `caps` payloads. Ph
 
 The fixture's top-level `schema_metadata_soft_cap_bytes` field pins the substrate's `METADATA_SOFT_CAP_BYTES` constant (`4096`) — bindings assert their soft-cap constant matches.
 
+### `placement_score.json`
+
+Pins `StandardPlacement::placement_score(target, artifact)` for representative `(config, candidate, artifact)` triples — the substrate's multi-axis composition matrix. Phase 7 / locked-decisions fixture from `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+
+- `config` is a subset of `StandardPlacement` settings. Currently the schema covers the deterministic axes:
+  - `scope_filter`: array of scope-label strings (e.g. `"scope:tenant:foo"` or the body-only form `"tenant:foo"`); omit the field to disable the axis.
+  - Other axes (`proximity`, `anti_affinity`) are excluded — their config requires runtime closures (`RttLookup` / `LeadershipStatsLookup`) that aren't serializable.
+- `candidate` is the wire-format `{node_id, tags, metadata}` for a single placement candidate. Tags are inserted via the privileged `Tag::parse` path so reserved-prefix tags (`scope:`, `causal:`, etc.) survive — `add_tag` would reject them.
+- `artifact` is `{kind: "daemon", required: {...}, optional: {...}}` where `required` and `optional` are wire-format `CapabilitySet`s. The substrate's hard-constraint check vetoes if any `required.tags` entry is absent from the candidate's tags.
+- `expected_score` is the float the substrate returns from `placement_score`, OR `null` for a hard veto (`None`). Bindings consume this fixture (when they ship local `StandardPlacement` reimplementations) and assert their score matches Rust's reference output to within `1e-6`.
+
+Coverage: default-config baseline (1.0); hard-required check (veto + pass); scope-axis match / mismatch / no-scope-tags / disabled; resource-axis permissive-no-data path. Intent / colocation cases are reserved for follow-up — the registry / metadata wiring is non-trivial.
+
 ### `capability_set_diff.json`
 
 Pins the `CapabilitySet::diff(prev)` output for representative `(prev, curr)` pairs:

@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use net::adapter::net::behavior::{
     Artifact, CapabilityAnnouncement, CapabilityIndex, CapabilitySet, ClauseTrace, EvalContext,
     MetadataChange, PlacementFilter, PlacementNodeId, Predicate, PredicateDebugReport,
-    PredicateWire, RPC_WHERE_HEADER, SchemaError, StandardPlacement, Tag, ValidationWarning,
-    ValueType, global_placement_filter_registry, validate_capabilities,
+    PredicateWire, RPC_WHERE_HEADER, ScopeLabel, SchemaError, StandardPlacement, Tag,
+    ValidationWarning, ValueType, global_placement_filter_registry, validate_capabilities,
 };
 use net::adapter::net::identity::EntityId;
 use std::sync::Arc;
@@ -857,6 +857,177 @@ fn predicate_eval_fixture_matches_via_placement_filter_callback() {
             assert!(
                 s > 0.0 && s <= 1.0,
                 "case[{i}] {name}: kept candidate score must be in (0.0, 1.0], got {s}",
+            );
+        }
+    }
+}
+
+// =============================================================================
+// placement_score.json — `StandardPlacement` scoring matrix.
+//
+// Per case: parse the config / candidate / artifact, build a
+// `StandardPlacement` against an index containing the candidate,
+// score, and assert the result matches `expected_score` to within
+// 1e-6 (or that both are veto / `null`).
+//
+// Locks the in-tree axis composition matrix so any drift in the
+// scope / hard-required / resource-permissive paths trips the
+// fixture's assertion. Bindings that ship local
+// `StandardPlacement` reimplementations consume the same fixture
+// and assert byte-identical results.
+//
+// Limitations:
+//
+// - `proximity` axis is excluded — requires a runtime `RttLookup`
+//   closure that's not serializable. Cases configure `scope` /
+//   resource axes only.
+// - `anti_affinity` axis is excluded — requires a runtime
+//   `LeadershipStatsLookup` closure. Same reason.
+// - `intent` / `colocation` axes — left for follow-up cases as
+//   the registry / metadata wiring is non-trivial; the current
+//   fixture covers scope + hard-required + default-permissive
+//   axes.
+// =============================================================================
+
+const PLACEMENT_SCORE_TOLERANCE: f32 = 1e-6;
+
+/// Parse a `"0xN"` hex string into `u64`. Used for the candidate
+/// `node_id` field in fixture cases.
+fn parse_hex_node_id(raw: &str, ctx: &str) -> u64 {
+    let stripped = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    u64::from_str_radix(stripped, 16)
+        .unwrap_or_else(|e| panic!("{ctx}: parse node_id {raw:?} as u64 hex: {e}"))
+}
+
+/// Convert a fixture-format `CapabilitySet` (`{tags: [...],
+/// metadata: {...}}`) into the substrate type. Used for both the
+/// candidate's caps and the artifact's required / optional sets.
+///
+/// Tags are inserted via `Tag::parse` (privileged) rather than
+/// `add_tag` / `parse_user` so reserved-prefix tags like
+/// `scope:tenant:foo` survive — fixture cases for the scope axis
+/// require this; the wire format already permits reserved tags
+/// even when the user-builder API rejects them.
+fn caps_from_fixture_obj(v: &Value, ctx: &str) -> CapabilitySet {
+    let mut caps = CapabilitySet::default();
+    if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
+        for tag in tags {
+            let s = tag
+                .as_str()
+                .unwrap_or_else(|| panic!("{ctx}: tag is not a string: {tag}"));
+            let parsed = Tag::parse(s)
+                .unwrap_or_else(|e| panic!("{ctx}: parse tag {s:?}: {e}"));
+            caps.tags.insert(parsed);
+        }
+    }
+    if let Some(meta) = v.get("metadata").and_then(|m| m.as_object()) {
+        for (k, val) in meta {
+            let s = val
+                .as_str()
+                .unwrap_or_else(|| panic!("{ctx}: metadata value for {k:?} is not a string"));
+            caps = caps.with_metadata(k.clone(), s.to_string());
+        }
+    }
+    caps
+}
+
+#[test]
+fn placement_score_fixture_matches_substrate() {
+    let raw = read_fixture("placement_score.json");
+    let v: Value = serde_json::from_str(&raw).expect("parse placement_score.json");
+    let cases = v["cases"]
+        .as_array()
+        .expect("placement_score.json: cases is array");
+    assert!(
+        !cases.is_empty(),
+        "placement_score.json fixture has zero cases — useless as a contract",
+    );
+
+    for (i, case) in cases.iter().enumerate() {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+
+        // Build the candidate's caps and stage them in a fresh
+        // CapabilityIndex (single node per case keeps the
+        // index minimal and the scoring deterministic).
+        let cand = &case["candidate"];
+        let node_id = parse_hex_node_id(
+            cand["node_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case[{i}] {name}: candidate.node_id missing")),
+            &format!("case[{i}] {name}"),
+        );
+        let cand_caps = caps_from_fixture_obj(cand, &format!("case[{i}] {name} candidate"));
+
+        let index = Arc::new(CapabilityIndex::new());
+        let eid = EntityId::from_bytes([0u8; 32]);
+        index.index(CapabilityAnnouncement::new(node_id, eid, 1, cand_caps));
+
+        // Build the StandardPlacement from the case's config
+        // subset. Only the fields that exist in the case JSON
+        // are applied; missing fields stay at the default (axis
+        // disabled / identity).
+        let mut placement = StandardPlacement::new(&index);
+        let cfg = &case["config"];
+        if let Some(scope_filter) = cfg.get("scope_filter").and_then(|s| s.as_array()) {
+            let labels: Vec<ScopeLabel> = scope_filter
+                .iter()
+                .map(|l| {
+                    let s = l.as_str().unwrap_or_else(|| {
+                        panic!("case[{i}] {name}: scope_filter entry not a string")
+                    });
+                    ScopeLabel::new(s.to_string())
+                })
+                .collect();
+            placement = placement.with_scope_filter(labels);
+        }
+
+        // Build the artifact (currently only `daemon` kind is
+        // supported in the fixture; `chain` / `replica` are
+        // reserved for future cases).
+        let art = &case["artifact"];
+        let art_kind = art["kind"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case[{i}] {name}: artifact.kind missing"));
+        let req_caps =
+            caps_from_fixture_obj(&art["required"], &format!("case[{i}] {name} artifact.required"));
+        let opt_caps =
+            caps_from_fixture_obj(&art["optional"], &format!("case[{i}] {name} artifact.optional"));
+        let artifact = match art_kind {
+            "daemon" => Artifact::Daemon {
+                daemon_id: [0u8; 32],
+                required: &req_caps,
+                optional: &opt_caps,
+            },
+            other => panic!(
+                "case[{i}] {name}: unsupported artifact.kind {other:?}; only `daemon` is wired today",
+            ),
+        };
+
+        let got = placement.placement_score(&node_id, &artifact);
+
+        // `expected_score: null` → veto. Numeric expected_score →
+        // score must be Some(_) within tolerance.
+        let expected_raw = &case["expected_score"];
+        if expected_raw.is_null() {
+            assert!(
+                got.is_none(),
+                "case[{i}] {name}: expected veto (null), got {got:?}",
+            );
+        } else {
+            let expected = expected_raw.as_f64().unwrap_or_else(|| {
+                panic!("case[{i}] {name}: expected_score must be null or a number, got {expected_raw}")
+            }) as f32;
+            let actual = got.unwrap_or_else(|| {
+                panic!(
+                    "case[{i}] {name}: expected score {expected}, got veto (None)",
+                )
+            });
+            assert!(
+                (actual - expected).abs() <= PLACEMENT_SCORE_TOLERANCE,
+                "case[{i}] {name}: score mismatch — expected {expected}, got {actual} (tolerance {PLACEMENT_SCORE_TOLERANCE})",
             );
         }
     }
