@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/diff.rs
+  s_e3c24456981f5d::t_a384547aa14024 731-732,737
+  s_e3c24456981f5d::t_bda4144270381a 704-706,711
+  s_e3c24456981f5d::t_b3de042234dcf5 1190-1214,1216-1242
+  s_e3c24456981f5d::t_44c01ed76cde22 1215
+  s_e3c24456981f5d::t_2dcc1c7de97ba1 597-602,604
+  s_e3c24456981f5d::t_a897921e22abf6 660-661,663
+  s_e3c24456981f5d::t_d1e4d9f777506e 571-588,590-591
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "fe481d1a33e022080c94dce68105c89786fe6555",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
