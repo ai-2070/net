@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/compute/scheduler.rs
+  s_d1b11a1287c170::t_2823da8123e7f5 27-30
+net/crates/net/src/adapter/net/compute/group_coord.rs
+  s_d1b11a1287c170::t_27d957b5be2c34 14,16-18
+  s_d1b11a1287c170::t_8ef8a28386e1d7 334-617
+  s_d1b11a1287c170::t_dab6e5f552aaed 262,271,273,282-322
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "5ee04d4d850bbc129c8d2d0055197df2a2dca5ce",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
