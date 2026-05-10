@@ -12,6 +12,7 @@ Latest release: [v0.10 — "Killing Moon" Phase III](../docs/RELEASE_v0.10_KILLI
 - `net.go.h` — broader mesh + compute surface (sessions, channels, capabilities, NAT, daemon dispatch, custom placement filters, daemon caps, predicate helpers, capability validation, predicate debug session). In-crate mirror of [`go/net.h`](../../../../go/net.h) at the repo root.
 - `net_rpc.h` — nRPC C SDK (request/response surface for the separate `libnet_rpc` cdylib). Independent header guard (`NET_RPC_H`) so it composes cleanly with the others in a single TU.
 - Libraries: `libnet.{so,dylib,dll}` (main) + `libnet_compute.{so,dylib,dll}` (compute) + `libnet_rpc.{so,dylib,dll}` (nRPC). Build with `cargo build --release --features ffi,net` for `libnet`; `-p net-compute-ffi` and `-p net-rpc-ffi` for the others.
+- Examples: `examples/basic.c` (event-bus quickstart) + `examples/capability.c` (stateless capability / predicate / where-header helpers).
 
 ## Build
 
