@@ -680,11 +680,17 @@ impl<'a> StandardPlacement<'a> {
                 evaluate_required_caps(target_caps, reqs)
             }
             IntentMatchPolicy::AnyOfLocalCapabilities => {
-                // Empty registry: no intent satisfiable → 0.0.
-                // (Matches the policy's intent: "node must be
-                // useful for *something* in the registry.")
+                // CR-22: empty registry → axis-disabled (1.0), not
+                // a hard veto. Pre-CR-22 this returned 0.0, which
+                // multiplicatively wedged the entire cluster's
+                // placement decisions for any operator who
+                // selected the policy without populating
+                // `intent_registry`. Operators expect "no
+                // constraint expressible = pass-through" (the
+                // shape every other axis here uses for the
+                // empty-config case).
                 if self.intent_registry.is_empty() {
-                    return 0.0;
+                    return 1.0;
                 }
                 let any_satisfied = self
                     .intent_registry
@@ -1975,10 +1981,15 @@ mod tests {
         assert_eq!(score, 0.0);
     }
 
-    /// `AnyOfLocalCapabilities` + empty registry → 0.0 (no intent
-    /// satisfiable).
+    /// CR-22: `AnyOfLocalCapabilities` + empty registry → 1.0
+    /// (axis-disabled identity), NOT 0.0. Pre-CR-22 this returned
+    /// 0.0, multiplicatively wedging cluster-wide placement for
+    /// any operator who selected the policy without populating
+    /// `intent_registry`. Other axes use 1.0 for the empty-config
+    /// case (proximity, anti-affinity, custom-filter); this one
+    /// is now consistent.
     #[test]
-    fn intent_axis_any_of_with_empty_registry_returns_zero() {
+    fn intent_axis_any_of_with_empty_registry_is_pass_through() {
         let required = empty_caps();
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
@@ -1991,7 +2002,11 @@ mod tests {
             .add_tag("hardware.gpu")
             .add_tag("hardware.gpu.vram_mb=32768");
         let score = placement.score_intent_axis(&target_caps, &artifact);
-        assert_eq!(score, 0.0);
+        assert_eq!(
+            score, 1.0,
+            "empty registry must pass through (axis-disabled identity), \
+             not hard-veto every candidate cluster-wide"
+        );
     }
 
     /// `AnyOfLocalCapabilities` + target satisfies one intent → 1.0.
