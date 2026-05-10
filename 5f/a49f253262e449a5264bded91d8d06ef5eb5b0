@@ -1,0 +1,69 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md
+  s_9163f300668f8b::t_3de739a49909b2 48
+go/net.h
+  s_9163f300668f8b::t_710ee5ed8ec633 1258
+  s_9163f300668f8b::t_6b34db2a3a5ce2 307
+  s_9163f300668f8b::t_a01bface37600d 1073
+  s_9163f300668f8b::t_2785e2a23b2bd2 1463
+  s_9163f300668f8b::t_6c9814f14f6dae 574
+  s_9163f300668f8b::t_88caa8396eb208 1274,1282-1283
+  s_9163f300668f8b::t_4bce352ef04c77 1382,1388
+  s_9163f300668f8b::t_1ab3db67b9986a 1521
+  s_9163f300668f8b::t_4c2966dbc43ff9 281
+  s_9163f300668f8b::t_a621de461a95a6 1305
+  s_9163f300668f8b::t_ec8ee2a555290a 1346,1361
+  s_9163f300668f8b::t_1acbd5dac06cb4 1531
+  s_9163f300668f8b::t_f809ce7b1352d0 1481,1493
+go/compute.go
+  s_9163f300668f8b::t_94e3bf3cc76dfe 476,612
+  s_9163f300668f8b::t_3a9bea042a42ae 507,515
+  s_9163f300668f8b::t_1a17d415e3506e 489,496
+  s_9163f300668f8b::t_19b2c1a7ac1ed4 626,642-643
+  s_9163f300668f8b::t_0b941e72a19b4c 344,346-349,352,357-358
+go/migration.go
+  s_9163f300668f8b::t_a107d8328a247e 334,345,365,379
+  s_9163f300668f8b::t_9dc68b3c0995d4 392,416
+  s_9163f300668f8b::t_2f6e38ecc6e9a6 479,485
+  s_9163f300668f8b::t_ab7c1d3b05c50c 177,183-184
+go/README.md
+  s_9163f300668f8b::t_d7550967ed29e6 490-491
+go/compute_dispatch.go
+  s_9163f300668f8b::t_b7f4a308ea3a42 29
+  s_9163f300668f8b::t_165d29a11883bb 77-78
+  s_9163f300668f8b::t_3ddcde44ab2380 241,256
+go/identity.go
+  s_9163f300668f8b::t_f82bb01b28adfa 185-192,198
+go/groups.go
+  s_9163f300668f8b::t_506ec222386a84 232
+  s_9163f300668f8b::t_58a7c3d55f48af 759,765,771
+  s_9163f300668f8b::t_62ca06e9b56ba2 705,711
+  s_9163f300668f8b::t_9fcbb3468f0df2 479,495
+  s_9163f300668f8b::t_95452c74951d7d 259-260
+  s_9163f300668f8b::t_d908f5027581d1 542,548
+  s_9163f300668f8b::t_fd60dc812a9715 147,156-157
+  s_9163f300668f8b::t_95f99721efd6eb 406,413,420
+go/cortex.go
+  s_9163f300668f8b::t_09fa72aa5e9426 426,439
+  s_9163f300668f8b::t_02ca3618a0d9fb 704,715
+go/groups_test.go
+  s_9163f300668f8b::t_0d90276325b5dc 281
+  s_9163f300668f8b::t_97bc944e0267ab 120
+go/compute_dispatch_bridge.c
+  s_9163f300668f8b::t_b83359f99aa343 22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "5fa49f253262e449a5264bded91d8d06ef5eb5b0",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
