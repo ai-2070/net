@@ -123,10 +123,7 @@ impl PlacementFilter for TsfnPlacementFilter {
         // tags + metadata); treat as veto rather than feeding an
         // empty candidate that the JS layer can't distinguish from
         // a real never-tagged node.
-        let caps = match self.capability_index.get(*target) {
-            Some(c) => c,
-            None => return None,
-        };
+        let caps = self.capability_index.get(*target)?;
 
         // Materialize the candidate's tags as strings — the
         // substrate's `Tag` type renders to its on-wire string
