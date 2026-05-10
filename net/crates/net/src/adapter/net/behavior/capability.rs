@@ -1122,7 +1122,7 @@ impl CapabilitySet {
     /// warning so misconfiguration is visible without being fatal.
     ///
     /// Substrate-internal callers that need to emit `tool::*` keys
-    /// use [`Self::with_metadata_unchecked`].
+    /// use the `with_metadata_unchecked` sibling (crate-private).
     pub fn with_metadata(self, key: impl Into<String>, value: impl Into<String>) -> Self {
         let key: String = key.into();
         if super::schema::AXIS_SCHEMA
