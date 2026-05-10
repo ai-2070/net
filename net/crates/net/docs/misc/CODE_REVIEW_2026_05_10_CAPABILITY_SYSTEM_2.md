@@ -8,36 +8,40 @@ Each item is tagged `[P1 | P2 | P3]`. P1 are merge-blockers (correctness / data-
 
 ## Status
 
+**All 28 items fixed on this branch.** 1872 unit tests passing
+(up from 1860 pre-fixes — 12 new regression tests added).
+Bindings (Node, Python, Go cgo) all build cleanly.
+
 | ID | Pri | Area | Title | Status |
 |----|-----|------|-------|--------|
-| CR-1 | P1 | capability | `has_tag` separator-form mismatch | ⏳ |
-| CR-2 | P1 | capability | `RequiredCapability::Tag` separator-form mismatch | ⏳ |
-| CR-3 | P1 | capability | `CapabilitySet::diff` separator-form mismatch | ⏳ |
-| CR-4 | P1 | capability | Diff op order non-determinism (`HashMap`/`HashSet`) | ⏳ |
-| CR-5 | P1 | C SDK | `examples/capability.c` header-guard collision (build break) | ⏳ |
-| CR-6 | P1 | placement | NaN scores from custom `PlacementFilter` poison sort | ⏳ |
-| CR-7 | P2 | predicate | `query::traverse` lacks visited-set / cycle detection | ⏳ |
-| CR-8 | P2 | predicate | Trace labels leak raw metadata values | ⏳ |
-| CR-9 | P2 | placement | `saturating_score` propagates NaN through resource axis | ⏳ |
-| CR-10 | P2 | placement | Anti-affinity `<= threshold` admits NaN as over-threshold | ⏳ |
-| CR-11 | P2 | bindings | compute-ffi snapshot leak when (non-NULL ptr, len=0) | ⏳ |
-| CR-12 | P2 | bindings | Python `announce_capabilities` holds GIL across blocking call | ⏳ |
-| CR-13 | P2 | bindings | rpc-ffi `run_cancellable` register-after-spawn TOCTOU | ⏳ |
-| CR-14 | P2 | capability | Schema validator skips `metadata_reserved` / prefixes | ⏳ |
-| CR-15 | P2 | capability | Schema `Number` accepts negative integers | ⏳ |
-| CR-16 | P2 | capability | `with_metadata` has no reserved-prefix gate | ⏳ |
-| CR-17 | P2 | C SDK | `net_predicate_to_where_header` partial-write leak | ⏳ |
-| CR-18 | P3 | predicate | `eval_any_in_cost_order` uses And-mode cost on Or | ⏳ |
-| CR-19 | P3 | predicate | `redact_label` splits on first `=` (loses keys with `=`) | ⏳ |
-| CR-20 | P3 | placement | `placement_registry` invocation-counter precreate race | ⏳ |
-| CR-21 | P3 | placement | Phase-G v2 migration silently drops `LocalPreferred` | ⏳ |
-| CR-22 | P3 | placement | `IntentMatchPolicy::AnyOfLocalCapabilities` empty registry vetoes | ⏳ |
-| CR-23 | P3 | capability | Bloom filter `h2` even degrades when bit count is power-of-2 | ⏳ |
-| CR-24 | P3 | capability | `tag_codec` software runtime/framework names with `=`/`.`/`:` ambiguous | ⏳ |
-| CR-25 | P3 | bindings | Node + Python `fp16_tflops_x10` round-trips through f32 | ⏳ |
-| CR-26 | P3 | bindings | Go `Register/UnregisterPlacementFilter` race | ⏳ |
-| CR-27 | P3 | bindings | Go `tagKeyFromWire` swallows type-assert failures | ⏳ |
-| CR-28 | P3 | C SDK | `include/README.md` claims `net.h` + `net.go.h` compose (they don't) | ⏳ |
+| CR-1 | P1 | capability | `has_tag` separator-form mismatch | ✅ |
+| CR-2 | P1 | capability | `RequiredCapability::Tag` separator-form mismatch | ✅ |
+| CR-3 | P1 | capability | `CapabilitySet::diff` separator-form mismatch | ✅ |
+| CR-4 | P1 | capability | Diff op order non-determinism (`HashMap`/`HashSet`) | ✅ |
+| CR-5 | P1 | C SDK | `examples/capability.c` header-guard collision (build break) | ✅ |
+| CR-6 | P1 | placement | NaN scores from custom `PlacementFilter` poison sort | ✅ |
+| CR-7 | P2 | predicate | `query::traverse` lacks visited-set / cycle detection | ✅ |
+| CR-8 | P2 | predicate | Trace labels leak raw metadata values | ✅ |
+| CR-9 | P2 | placement | `saturating_score` propagates NaN through resource axis | ✅ |
+| CR-10 | P2 | placement | Anti-affinity `<= threshold` admits NaN as over-threshold | ✅ |
+| CR-11 | P2 | bindings | compute-ffi snapshot leak when (non-NULL ptr, len=0) | ✅ |
+| CR-12 | P2 | bindings | Python `announce_capabilities` holds GIL across blocking call | ✅ |
+| CR-13 | P2 | bindings | rpc-ffi `run_cancellable` register-after-spawn TOCTOU | ✅ |
+| CR-14 | P2 | capability | Schema validator skips `metadata_reserved` / prefixes | ✅ |
+| CR-15 | P2 | capability | Schema `Number` accepts negative integers | ✅ |
+| CR-16 | P2 | capability | `with_metadata` has no reserved-prefix gate | ✅ |
+| CR-17 | P2 | C SDK | `net_predicate_to_where_header` partial-write leak | ✅ |
+| CR-18 | P3 | predicate | `eval_any_in_cost_order` uses And-mode cost on Or | ✅ |
+| CR-19 | P3 | predicate | `redact_label` splits on first `=` (loses keys with `=`) | ✅ |
+| CR-20 | P3 | placement | `placement_registry` invocation-counter precreate race | ✅ |
+| CR-21 | P3 | placement | Phase-G v2 migration silently drops `LocalPreferred` | ✅ |
+| CR-22 | P3 | placement | `IntentMatchPolicy::AnyOfLocalCapabilities` empty registry vetoes | ✅ |
+| CR-23 | P3 | capability | Bloom filter `h2` even degrades when bit count is power-of-2 | ✅ |
+| CR-24 | P3 | capability | `tag_codec` software runtime/framework names with `=`/`.`/`:` ambiguous | ✅ |
+| CR-25 | P3 | bindings | Node + Python `fp16_tflops_x10` round-trips through f32 | ✅ |
+| CR-26 | P3 | bindings | Go `Register/UnregisterPlacementFilter` race | ✅ |
+| CR-27 | P3 | bindings | Go `tagKeyFromWire` swallows type-assert failures | ✅ |
+| CR-28 | P3 | C SDK | `include/README.md` claims `net.h` + `net.go.h` compose (they don't) | ✅ |
 
 Out of scope (pre-existing on `master`, not introduced by this branch):
 
