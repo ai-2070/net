@@ -239,10 +239,73 @@ impl Scheduler {
         tie_break: &TieBreakContext<'_>,
     ) -> Option<u64> {
         let candidates = self.find_migration_targets(daemon_filter, source_node);
+        Self::pick_best_candidate(candidates, artifact, placement, tie_break)
+    }
 
-        // Score every candidate; drop the ones the placement filter
-        // vetoes via `None`. Collect (node_id, score) pairs so we
-        // can sort.
+    /// Phase G slice 3 of `CAPABILITY_SYSTEM_PLAN.md`. Select the
+    /// best node for placing a new group member (replica / fork /
+    /// standby), scored via `&dyn PlacementFilter` with the same
+    /// §7-LOCKED tie-breaker as
+    /// [`Self::select_migration_target`].
+    ///
+    /// `requirements` filters the candidate pool via the legacy
+    /// `CapabilityFilter` path (matches today's
+    /// `Scheduler::query_candidates` behavior); `exclude` is a
+    /// set of NodeIds to skip — used by replica groups for
+    /// best-effort spread (don't pick a node already running a
+    /// member). `placement` scores the survivors; ties broken by
+    /// `tie_break`.
+    ///
+    /// Returns `None` when every candidate is excluded or vetoed.
+    pub fn select_member_node(
+        &self,
+        artifact: &Artifact<'_>,
+        requirements: &CapabilityFilter,
+        exclude: &std::collections::HashSet<u64>,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+    ) -> Option<u64> {
+        let candidates = self
+            .query_candidates(requirements)
+            .into_iter()
+            .filter(|n| !exclude.contains(n));
+        Self::pick_best_candidate(candidates, artifact, placement, tie_break)
+    }
+
+    /// Phase G slice 3. Select the standby member that should be
+    /// promoted to active. Same shape as
+    /// [`Self::select_member_node`] without the exclusion-set
+    /// concept (promotion is over the existing standby pool, not
+    /// a fresh placement decision).
+    ///
+    /// `candidates` is the standby roster — typically the live
+    /// `StandbyGroup`'s `members` projected to `Vec<u64>`.
+    pub fn select_promotion_target(
+        &self,
+        candidates: Vec<u64>,
+        artifact: &Artifact<'_>,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+    ) -> Option<u64> {
+        Self::pick_best_candidate(candidates, artifact, placement, tie_break)
+    }
+
+    /// Shared scoring + tie-breaking core. Used by
+    /// [`Self::select_migration_target`],
+    /// [`Self::select_member_node`], and
+    /// [`Self::select_promotion_target`].
+    ///
+    /// Filter-vetoed (`None`-scoring) candidates are dropped;
+    /// survivors sort highest-score-first with the §7-LOCKED
+    /// tie-breaker resolving equal scores. Returns the best
+    /// candidate's NodeId, or `None` when every candidate vetoes /
+    /// the input is empty.
+    fn pick_best_candidate<I: IntoIterator<Item = u64>>(
+        candidates: I,
+        artifact: &Artifact<'_>,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+    ) -> Option<u64> {
         let mut scored: Vec<(u64, f32)> = candidates
             .into_iter()
             .filter_map(|n| placement.placement_score(&n, artifact).map(|s| (n, s)))
@@ -741,5 +804,246 @@ mod tests {
             &tb,
         );
         assert_eq!(target, Some(0x1111));
+    }
+
+    // ==================================================================
+    // Phase G slice 3: select_member_node + select_promotion_target
+    // ==================================================================
+
+    use std::collections::HashSet;
+
+    /// `select_member_node` with empty exclusion set — picks the
+    /// best-scoring candidate from the entire filter pool.
+    /// Tie-breaker resolves equal scores via lex NodeId.
+    #[test]
+    fn select_member_node_picks_best_with_empty_exclusion() {
+        let index = make_index_with_nodes(vec![
+            (0x3333, caps_no_gpu()),
+            (0x1111, caps_no_gpu()),
+            (0x2222, caps_no_gpu()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = FixedScore { score: 0.5, veto: vec![] };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        let exclude = HashSet::new();
+
+        let target = scheduler.select_member_node(
+            &artifact,
+            &CapabilityFilter::default(),
+            &exclude,
+            &placement,
+            &tb,
+        );
+        // All three score 0.5; lex tie-breaker picks the lowest.
+        assert_eq!(target, Some(0x1111));
+    }
+
+    /// `select_member_node` honors the exclusion set — already-
+    /// placed members aren't re-picked. Pin the spread-aware
+    /// behavior replica groups depend on.
+    #[test]
+    fn select_member_node_excludes_already_placed_members() {
+        let index = make_index_with_nodes(vec![
+            (0x1111, caps_no_gpu()),
+            (0x2222, caps_no_gpu()),
+            (0x3333, caps_no_gpu()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = FixedScore { score: 0.5, veto: vec![] };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        // 0x1111 is already a member; spread should pick the next-
+        // lowest by lex order.
+        let mut exclude = HashSet::new();
+        exclude.insert(0x1111u64);
+
+        let target = scheduler.select_member_node(
+            &artifact,
+            &CapabilityFilter::default(),
+            &exclude,
+            &placement,
+            &tb,
+        );
+        assert_eq!(target, Some(0x2222));
+    }
+
+    /// `select_member_node`: exclusion set covers every candidate
+    /// → `None`.
+    #[test]
+    fn select_member_node_returns_none_when_all_excluded() {
+        let index = make_index_with_nodes(vec![
+            (0x1111, caps_no_gpu()),
+            (0x2222, caps_no_gpu()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = FixedScore { score: 0.5, veto: vec![] };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let mut exclude = HashSet::new();
+        exclude.insert(0x1111u64);
+        exclude.insert(0x2222u64);
+
+        let target = scheduler.select_member_node(
+            &artifact,
+            &CapabilityFilter::default(),
+            &exclude,
+            &placement,
+            &tb,
+        );
+        assert_eq!(target, None);
+    }
+
+    /// `select_member_node` honors the placement filter veto —
+    /// excluded set + filter-vetoed candidates both drop out.
+    #[test]
+    fn select_member_node_combines_exclusion_with_filter_veto() {
+        let index = make_index_with_nodes(vec![
+            (0x1111, caps_no_gpu()),
+            (0x2222, caps_no_gpu()),
+            (0x3333, caps_no_gpu()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        // Filter vetoes 0x2222.
+        let placement = FixedScore { score: 1.0, veto: vec![0x2222] };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        // Exclude 0x1111; with 0x2222 vetoed, only 0x3333 remains.
+        let mut exclude = HashSet::new();
+        exclude.insert(0x1111u64);
+
+        let target = scheduler.select_member_node(
+            &artifact,
+            &CapabilityFilter::default(),
+            &exclude,
+            &placement,
+            &tb,
+        );
+        assert_eq!(target, Some(0x3333));
+    }
+
+    /// `select_promotion_target` over a pre-computed roster
+    /// (standby members) — picks the best by score + tie-break.
+    #[test]
+    fn select_promotion_target_picks_highest_scoring_standby() {
+        let index = make_index_with_nodes(vec![
+            (0x1111, caps_no_gpu()),
+            (0x2222, caps_no_gpu()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+
+        // Synthetic filter: 0x1111 → 0.3, 0x2222 → 0.9.
+        struct ScoredFilter;
+        impl PlacementFilter for ScoredFilter {
+            fn placement_score(
+                &self,
+                t: &PlacementNodeId,
+                _: &Artifact<'_>,
+            ) -> Option<f32> {
+                Some(match *t {
+                    0x1111 => 0.3,
+                    0x2222 => 0.9,
+                    _ => 0.0,
+                })
+            }
+        }
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let standbys = vec![0x1111u64, 0x2222u64];
+        let target = scheduler.select_promotion_target(
+            standbys,
+            &artifact,
+            &ScoredFilter,
+            &tb,
+        );
+        assert_eq!(target, Some(0x2222));
+    }
+
+    /// `select_promotion_target` over an empty roster → `None`.
+    #[test]
+    fn select_promotion_target_empty_roster_returns_none() {
+        let index = make_index_with_nodes(vec![]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = FixedScore { score: 1.0, veto: vec![] };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let target = scheduler.select_promotion_target(
+            vec![],
+            &artifact,
+            &placement,
+            &tb,
+        );
+        assert_eq!(target, None);
+    }
+
+    /// `select_promotion_target` propagates filter vetoes — every
+    /// candidate vetoed → `None`.
+    #[test]
+    fn select_promotion_target_returns_none_when_all_vetoed() {
+        let index = make_index_with_nodes(vec![
+            (0x1111, caps_no_gpu()),
+            (0x2222, caps_no_gpu()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = FixedScore {
+            score: 1.0,
+            veto: vec![0x1111, 0x2222],
+        };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let target = scheduler.select_promotion_target(
+            vec![0x1111u64, 0x2222u64],
+            &artifact,
+            &placement,
+            &tb,
+        );
+        assert_eq!(target, None);
     }
 }
