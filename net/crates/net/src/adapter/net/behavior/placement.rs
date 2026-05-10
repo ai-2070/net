@@ -22,9 +22,14 @@
 //!   from two candidates is resolved via the locked
 //!   RTT → free-resource → lexicographic-NodeId chain.
 
+use std::collections::BTreeMap;
+
 use crate::adapter::net::behavior::capability::{
     CapabilityFilter, CapabilitySet, CapabilityIndex,
 };
+use crate::adapter::net::behavior::predicate::Predicate;
+use crate::adapter::net::behavior::required_capability::RequiredCapability;
+use crate::adapter::net::behavior::tag::{Tag, TagKey, TaxonomyAxis};
 use crate::adapter::net::channel::ChannelName;
 
 /// Identifier of a candidate node — the substrate's `u64` `node_id`.
@@ -492,6 +497,144 @@ impl<'a> StandardPlacement<'a> {
     }
 }
 
+// =============================================================================
+// IntentRegistry (slice 3) — `intent` metadata key → required-caps lookup.
+//
+// Phase F slice 3 of `CAPABILITY_SYSTEM_PLAN.md`. Drives the intent
+// axis (axis #3) of `StandardPlacement` once slice 5 wires it up:
+// look up `metadata.intent` value → list of `RequiredCapability` →
+// evaluate each against the candidate's `(tags, metadata)` →
+// boolean satisfies-all.
+//
+// `BTreeMap` for deterministic iteration order. O(log n) lookup
+// keeps the placement hot path bounded; benchmark target is ≤ 10 µs
+// scoring overhead at 1000 registered intents (pinned in F.5 perf
+// tests).
+// =============================================================================
+
+/// Intent → required-capabilities lookup. Built via
+/// [`IntentRegistry::defaults`] for the substrate-shipped baseline
+/// or [`IntentRegistry::new`] for an empty registry; extended via
+/// [`IntentRegistry::register`].
+///
+/// Lookups via [`IntentRegistry::lookup`] return a borrowed slice;
+/// callers iterate and evaluate each `RequiredCapability` against
+/// the candidate's `EvalContext`.
+#[derive(Debug, Clone, Default)]
+pub struct IntentRegistry {
+    map: BTreeMap<String, Vec<RequiredCapability>>,
+}
+
+impl IntentRegistry {
+    /// Empty registry. Use [`Self::register`] to add intents.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Substrate-shipped baseline mappings. Adapted to the current
+    /// `CAPABILITIES_SCHEMA.md`-validated key set; future schema
+    /// extensions land additional intents here.
+    ///
+    /// Defaults:
+    ///
+    /// - `ml-training` — `hardware.gpu` present + `hardware.gpu.vram_mb >= 24576`.
+    /// - `inference` — `hardware.gpu` present + any `software.model.*` tag
+    ///   (axis-key match — version / quantization independent).
+    /// - `cpu-bound` — `hardware.cpu_cores >= 4`.
+    /// - `sensor-telemetry` — any `devices.*` tag (axis-any match).
+    pub fn defaults() -> Self {
+        let mut map: BTreeMap<String, Vec<RequiredCapability>> = BTreeMap::new();
+
+        // ml-training: GPU present + at least 24 GB VRAM.
+        map.insert(
+            "ml-training".to_string(),
+            vec![
+                RequiredCapability::Tag(Tag::AxisPresent {
+                    axis: TaxonomyAxis::Hardware,
+                    key: "gpu".to_string(),
+                }),
+                RequiredCapability::Predicate(Predicate::numeric_at_least(
+                    TagKey::new(TaxonomyAxis::Hardware, "gpu.vram_mb"),
+                    24_576.0,
+                )),
+            ],
+        );
+
+        // inference: GPU present + any software.model.* tag
+        // (caller doesn't care about specific model — version /
+        // quant orthogonal to the placement decision).
+        map.insert(
+            "inference".to_string(),
+            vec![
+                RequiredCapability::Tag(Tag::AxisPresent {
+                    axis: TaxonomyAxis::Hardware,
+                    key: "gpu".to_string(),
+                }),
+                RequiredCapability::AxisKey(TagKey::new(
+                    TaxonomyAxis::Software,
+                    "model".to_string(),
+                )),
+            ],
+        );
+
+        // cpu-bound: at least 4 CPU cores.
+        map.insert(
+            "cpu-bound".to_string(),
+            vec![RequiredCapability::Predicate(Predicate::numeric_at_least(
+                TagKey::new(TaxonomyAxis::Hardware, "cpu_cores"),
+                4.0,
+            ))],
+        );
+
+        // sensor-telemetry: any devices.* tag (devices axis empty in
+        // schema today; once the schema enumerates concrete devices
+        // keys, tighten to specific tags).
+        map.insert(
+            "sensor-telemetry".to_string(),
+            vec![RequiredCapability::AxisAny(TaxonomyAxis::Devices)],
+        );
+
+        Self { map }
+    }
+
+    /// Register (or replace) an intent's required-capability list.
+    /// Returns the previous mapping, if any — useful for migrations
+    /// where applications layer their own intents on top of the
+    /// substrate defaults.
+    pub fn register(
+        &mut self,
+        intent: impl Into<String>,
+        requirements: Vec<RequiredCapability>,
+    ) -> Option<Vec<RequiredCapability>> {
+        self.map.insert(intent.into(), requirements)
+    }
+
+    /// Borrow the requirements list for `intent`. Returns `None`
+    /// for intents the registry doesn't recognize (caller chooses
+    /// `Disabled` / `AnyOfLocalCapabilities` / `Strict` reaction
+    /// per [`IntentMatchPolicy`]).
+    pub fn lookup(&self, intent: &str) -> Option<&[RequiredCapability]> {
+        self.map.get(intent).map(|v| v.as_slice())
+    }
+
+    /// Iterate `(intent, requirements)` pairs in lex order. Used by
+    /// the `IntentMatchPolicy::AnyOfLocalCapabilities` evaluator
+    /// (slice 5) to pick whichever intent the candidate satisfies.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[RequiredCapability])> {
+        self.map.iter().map(|(k, v)| (k.as_str(), v.as_slice()))
+    }
+
+    /// Number of registered intents.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// True iff zero intents are registered.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,6 +892,137 @@ mod tests {
         assert!(placement.proximity_max_rtt.is_none());
         assert!(matches!(placement.intent_match, IntentMatchPolicy::Disabled));
         assert_eq!(placement.colocation_policy, ColocationPolicy::Ignore);
+    }
+
+    // ====================================================================
+    // Phase F slice 3: IntentRegistry
+    // ====================================================================
+
+    /// Substrate-shipped defaults must include the four documented
+    /// intents — pin so adding / removing one fails CI rather than
+    /// silently changing the baseline.
+    #[test]
+    fn intent_registry_defaults_include_all_baseline_intents() {
+        let r = IntentRegistry::defaults();
+        assert!(r.lookup("ml-training").is_some());
+        assert!(r.lookup("inference").is_some());
+        assert!(r.lookup("cpu-bound").is_some());
+        assert!(r.lookup("sensor-telemetry").is_some());
+        assert_eq!(r.len(), 4);
+    }
+
+    /// `defaults()` for `ml-training` requires both GPU presence
+    /// and the 24 GB VRAM threshold — pinning the *minimum* shape
+    /// downstream callers can rely on.
+    #[test]
+    fn intent_registry_defaults_ml_training_requires_gpu_plus_vram_threshold() {
+        let r = IntentRegistry::defaults();
+        let reqs = r.lookup("ml-training").expect("ml-training present");
+        assert_eq!(reqs.len(), 2, "ml-training requires gpu + vram threshold");
+
+        let has_gpu_tag = reqs.iter().any(|rc| {
+            matches!(
+                rc,
+                RequiredCapability::Tag(Tag::AxisPresent { axis, key })
+                    if *axis == TaxonomyAxis::Hardware && key == "gpu"
+            )
+        });
+        assert!(has_gpu_tag, "ml-training must include hardware.gpu tag");
+
+        let has_vram_predicate = reqs.iter().any(|rc| {
+            matches!(rc, RequiredCapability::Predicate(_))
+        });
+        assert!(has_vram_predicate, "ml-training must include vram numeric predicate");
+    }
+
+    /// `register` adds a new intent; subsequent `lookup` returns it.
+    #[test]
+    fn intent_registry_register_adds_lookup() {
+        let mut r = IntentRegistry::new();
+        assert!(r.is_empty());
+        let prev = r.register(
+            "custom-intent",
+            vec![RequiredCapability::AxisAny(TaxonomyAxis::Hardware)],
+        );
+        assert!(prev.is_none());
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            r.lookup("custom-intent")
+                .expect("just registered")
+                .len(),
+            1
+        );
+    }
+
+    /// `register` of an existing intent returns the old mapping —
+    /// useful for application-side overrides of substrate defaults.
+    #[test]
+    fn intent_registry_register_replaces_returns_previous() {
+        let mut r = IntentRegistry::defaults();
+        let prev = r.register(
+            "ml-training",
+            vec![RequiredCapability::AxisAny(TaxonomyAxis::Software)],
+        );
+        assert!(prev.is_some(), "previous mapping returned");
+        assert_eq!(prev.unwrap().len(), 2, "old ml-training had 2 requirements");
+        // After replace, the new mapping is in place.
+        assert_eq!(
+            r.lookup("ml-training").expect("re-registered").len(),
+            1
+        );
+    }
+
+    /// Unknown intent → `None`.
+    #[test]
+    fn intent_registry_lookup_unknown_returns_none() {
+        let r = IntentRegistry::defaults();
+        assert!(r.lookup("nonexistent-intent").is_none());
+    }
+
+    /// `iter` returns intents in lex order (BTreeMap iteration
+    /// semantics) — pinned so dependent code (`AnyOfLocalCapabilities`
+    /// evaluator in slice 5) gets a deterministic match order.
+    #[test]
+    fn intent_registry_iter_is_lex_ordered() {
+        let mut r = IntentRegistry::new();
+        r.register("zebra", vec![]);
+        r.register("alpha", vec![]);
+        r.register("middle", vec![]);
+        let names: Vec<&str> = r.iter().map(|(k, _)| k).collect();
+        assert_eq!(names, vec!["alpha", "middle", "zebra"]);
+    }
+
+    /// `defaults` evaluation contract: `ml-training`'s requirements
+    /// are satisfied by a candidate carrying gpu + 32 GB VRAM but
+    /// not by one with just gpu (no VRAM threshold tag).
+    #[test]
+    fn intent_registry_defaults_evaluation_round_trip() {
+        use crate::adapter::net::behavior::predicate::EvalContext;
+        let r = IntentRegistry::defaults();
+        let reqs = r.lookup("ml-training").unwrap();
+
+        // Candidate A: GPU + 32 GB VRAM — satisfies all.
+        let satisfying_caps = empty_caps()
+            .add_tag("hardware.gpu")
+            .add_tag("hardware.gpu.vram_mb=32768");
+        let tags_a: Vec<Tag> = satisfying_caps.tags.iter().cloned().collect();
+        let meta_a = satisfying_caps.metadata.clone();
+        let ctx_a = EvalContext::new(&tags_a, &meta_a);
+        assert!(
+            reqs.iter().all(|rc| rc.evaluate(&ctx_a)),
+            "candidate with gpu + 32GB vram satisfies ml-training"
+        );
+
+        // Candidate B: just GPU, no VRAM tag — VRAM predicate fails
+        // because the tag is absent.
+        let partial_caps = empty_caps().add_tag("hardware.gpu");
+        let tags_b: Vec<Tag> = partial_caps.tags.iter().cloned().collect();
+        let meta_b = partial_caps.metadata.clone();
+        let ctx_b = EvalContext::new(&tags_b, &meta_b);
+        assert!(
+            !reqs.iter().all(|rc| rc.evaluate(&ctx_b)),
+            "candidate without vram threshold doesn't satisfy ml-training"
+        );
     }
 
     /// `Chain` and `Replica` artifacts pass through hard-constraint

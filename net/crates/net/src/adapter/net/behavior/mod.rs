@@ -55,9 +55,9 @@ pub use predicate::{
 };
 
 pub use placement::{
-    AntiAffinityConfig, Artifact, ColocationPolicy, IntentMatchPolicy, LegacyPlacement,
-    NodeId as PlacementNodeId, PlacementFilter, PlacementMetadataKeys, ResourceAxis, ScopeLabel,
-    StandardPlacement, compose_axis_scores,
+    AntiAffinityConfig, Artifact, ColocationPolicy, IntentMatchPolicy, IntentRegistry,
+    LegacyPlacement, NodeId as PlacementNodeId, PlacementFilter, PlacementMetadataKeys,
+    ResourceAxis, ScopeLabel, StandardPlacement, compose_axis_scores,
 };
 
 pub use required_capability::{RequireParseError, RequiredCapability};
