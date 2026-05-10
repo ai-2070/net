@@ -524,6 +524,7 @@ service discovery) plus B6 (streaming + ABI version stamp).
 | Cancellation | `net_rpc_reserve_cancel_token`, `net_rpc_cancel_call` |
 | Handler dispatcher | `net_rpc_set_handler_dispatcher`, `net_rpc_reserve_handler_id`, `RpcHandlerFn` typedef |
 | Unary calls | `net_rpc_call`, `net_rpc_call_service` |
+| Header-bearing calls | `net_rpc_call_with_headers`, `net_rpc_call_service_with_headers`, `net_rpc_call_streaming_with_headers` (Phase 9b end-to-end — accept a `net_rpc_header_t[]`; pair with `net_predicate_to_where_header`) |
 | Service discovery | `net_rpc_find_service_nodes` |
 | Serve | `net_rpc_serve`, `net_rpc_serve_handle_id`, `net_rpc_serve_handle_close`, `net_rpc_serve_handle_free` |
 | Streaming | `net_rpc_call_streaming`, `net_rpc_stream_next`, `net_rpc_stream_grant`, `net_rpc_stream_call_id`, `net_rpc_stream_close`, `net_rpc_stream_free` |

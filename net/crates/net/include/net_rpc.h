@@ -261,6 +261,76 @@ int net_rpc_call_service(
     uint8_t** out_resp_ptr, size_t* out_resp_len,
     char** out_err);
 
+/* =========================================================================
+ * Header-bearing call variants (Phase 9b end-to-end)
+ *
+ * The legacy net_rpc_call / _call_service / _call_streaming
+ * don't take request headers. These three additive variants
+ * accept a (headers, count) pair and forward it to the inner
+ * `CallOptions::request_headers`. Predicate-pushdown via the
+ * `cyberdeck-where:` header (built by `net_predicate_to_where_header`
+ * in net.go.h) traverses the FFI through these variants.
+ *
+ * Header buffers are referenced for the call's duration only —
+ * Rust copies into owned (String, Vec<u8>) before dispatching,
+ * so the C consumer can release / reuse the memory once the
+ * function returns. NULL headers_ptr with header_count=0 is
+ * equivalent to the legacy variant.
+ *
+ * Header NAMES must be valid UTF-8 (the substrate uses lowercase
+ * `cyberdeck-*` / `nrpc-*` convention but doesn't enforce a
+ * format beyond the MAX_RPC_HEADER_NAME_LEN cap). VALUES are
+ * opaque bytes — any encoding the receiving handler agrees on.
+ * ========================================================================= */
+
+/* FFI-side request-header descriptor. Consumer allocates an
+ * array of these, fills each entry with slices it owns, and
+ * passes (array, count) to a `_with_headers` variant. */
+typedef struct {
+    const char* name_ptr;
+    size_t      name_len;
+    const uint8_t* value_ptr;
+    size_t      value_len;
+} net_rpc_header_t;
+
+/* `net_rpc_call` plus request headers. */
+int net_rpc_call_with_headers(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms,
+    uint64_t cancel_token,
+    const net_rpc_header_t* headers_ptr,
+    size_t header_count,
+    uint8_t** out_resp_ptr, size_t* out_resp_len,
+    char** out_err);
+
+/* `net_rpc_call_service` plus request headers. */
+int net_rpc_call_service_with_headers(
+    MeshRpcHandle* handle,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms,
+    uint64_t cancel_token,
+    const net_rpc_header_t* headers_ptr,
+    size_t header_count,
+    uint8_t** out_resp_ptr, size_t* out_resp_len,
+    char** out_err);
+
+/* `net_rpc_call_streaming` plus request headers. */
+int net_rpc_call_streaming_with_headers(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms,
+    uint32_t stream_window,
+    const net_rpc_header_t* headers_ptr,
+    size_t header_count,
+    RpcStreamHandleC** out_stream,
+    char** out_err);
+
 /* All node ids advertising `nrpc:<service>` in the local
  * capability index. On success writes a heap-allocated `u64`
  * array of length `*out_count` to `*out_ptr`; caller frees via

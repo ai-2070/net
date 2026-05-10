@@ -497,6 +497,58 @@ fn build_call_options(deadline_ms: u64) -> InnerCallOptions {
     inner
 }
 
+/// FFI-side request-header descriptor. The C ABI consumer
+/// allocates a `net_rpc_header_t[]`, fills each entry with
+/// `(name_ptr, name_len, value_ptr, value_len)` slices it owns,
+/// and passes the array + count to a `_with_headers` call. The
+/// header name MUST be valid UTF-8; the value is opaque bytes
+/// (Phase 9b's `cyberdeck-where:` value is JSON, but the
+/// substrate doesn't enforce a value-side encoding).
+///
+/// Buffers are referenced for the duration of the call only —
+/// the Rust side copies into owned `(String, Vec<u8>)` pairs
+/// before dispatching, so the C consumer's lifetime concern is
+/// "stays valid until the function returns."
+#[repr(C)]
+pub struct NetRpcHeader {
+    pub name_ptr: *const c_char,
+    pub name_len: usize,
+    pub value_ptr: *const u8,
+    pub value_len: usize,
+}
+
+/// Convert a C `(headers_ptr, header_count)` array into the
+/// substrate's `Vec<(String, Vec<u8>)>` shape. Returns `None` if
+/// any header name fails UTF-8 validation; caller should write a
+/// typed error.
+unsafe fn collect_headers(
+    headers_ptr: *const NetRpcHeader,
+    header_count: usize,
+) -> Option<Vec<(String, Vec<u8>)>> {
+    if header_count == 0 || headers_ptr.is_null() {
+        return Some(Vec::new());
+    }
+    let slice = unsafe { std::slice::from_raw_parts(headers_ptr, header_count) };
+    let mut out = Vec::with_capacity(header_count);
+    for h in slice {
+        if h.name_ptr.is_null() {
+            return None;
+        }
+        let name_bytes = unsafe { std::slice::from_raw_parts(h.name_ptr as *const u8, h.name_len) };
+        let name = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => return None,
+        };
+        let value = if h.value_ptr.is_null() || h.value_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(h.value_ptr, h.value_len).to_vec() }
+        };
+        out.push((name, value));
+    }
+    Some(out)
+}
+
 // =========================================================================
 // Calls.
 // =========================================================================
@@ -1097,6 +1149,217 @@ pub extern "C" fn net_rpc_stream_free(stream: *mut RpcStreamHandleC) {
 }
 
 // =========================================================================
+// Header-bearing call variants (Phase 9b end-to-end).
+//
+// The legacy `net_rpc_call` / `_call_service` / `_call_streaming`
+// don't take request headers — predicate-pushdown via the
+// `cyberdeck-where:` header (built by
+// `net_predicate_to_where_header` in the main `libnet` cdylib)
+// had nowhere to go on the C ABI side. These three additive
+// variants accept a `(headers, count)` pair and forward it to
+// `InnerCallOptions::request_headers`. Legacy variants are
+// untouched — non-9b callers compile + run as before.
+// =========================================================================
+
+/// `net_rpc_call` with arbitrary request headers attached.
+/// Ergonomically identical to the legacy variant plus the
+/// `(headers_ptr, header_count)` parameters.
+///
+/// Header buffers are read for the duration of the call only —
+/// Rust copies into owned `(String, Vec<u8>)` before dispatching,
+/// so the consumer can release / reuse the memory once the call
+/// returns. NULL `headers_ptr` with `header_count == 0` is
+/// equivalent to the legacy variant.
+///
+/// Header name MUST be valid UTF-8; non-UTF-8 names return
+/// [`NET_RPC_ERR_INVALID_UTF8`] with a descriptive `out_err`
+/// message and never reach the wire.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_with_headers(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    cancel_token: u64,
+    headers_ptr: *const NetRpcHeader,
+    header_count: usize,
+    out_resp_ptr: *mut *mut u8,
+    out_resp_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+        write_err(out_err, "request header name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    opts.request_headers = headers;
+    let node = h.node.clone();
+
+    let result = run_cancellable(cancel_token, async move {
+        node.call(target_node_id, &service, req_bytes, opts).await
+    });
+
+    match result {
+        Ok(Ok(reply)) => {
+            write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(out_err, "cancelled: call cancelled by caller".into());
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// `net_rpc_call_service` with arbitrary request headers attached.
+/// Same shape as [`net_rpc_call_with_headers`] but resolves
+/// `service` against the local capability index instead of taking
+/// an explicit target.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_service_with_headers(
+    handle: *mut MeshRpcHandle,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    cancel_token: u64,
+    headers_ptr: *const NetRpcHeader,
+    header_count: usize,
+    out_resp_ptr: *mut *mut u8,
+    out_resp_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+        write_err(out_err, "request header name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    opts.request_headers = headers;
+    let node = h.node.clone();
+
+    let result = run_cancellable(cancel_token, async move {
+        node.call_service(&service, req_bytes, opts).await
+    });
+
+    match result {
+        Ok(Ok(reply)) => {
+            write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(out_err, "cancelled: call cancelled by caller".into());
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// `net_rpc_call_streaming` with arbitrary request headers
+/// attached. Same shape as
+/// [`net_rpc_call_streaming`](self::net_rpc_call_streaming) plus the
+/// `(headers_ptr, header_count)` pair.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_streaming_with_headers(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    stream_window: u32,
+    headers_ptr: *const NetRpcHeader,
+    header_count: usize,
+    out_stream: *mut *mut RpcStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+        write_err(out_err, "request header name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    opts.request_headers = headers;
+    let node = h.node.clone();
+
+    let result = runtime().block_on(async move {
+        node.call_streaming(target_node_id, &service, req_bytes, opts)
+            .await
+    });
+
+    match result {
+        Ok(stream) => {
+            let call_id = stream.call_id();
+            let boxed = Box::new(RpcStreamHandleC {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_stream = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+// =========================================================================
 // Tests for pure-logic helpers.
 // =========================================================================
 
@@ -1376,5 +1639,83 @@ mod tests {
             net_rpc_free_cstring(err);
             assert!(!msg.is_empty(), "error message must be present");
         }
+    }
+
+    /// `collect_headers` round-trips a (name, value) array.
+    /// Pin the FFI buffer-shape contract: name is UTF-8 by length,
+    /// value is opaque bytes by length, both copied into owned
+    /// Rust types.
+    #[test]
+    fn collect_headers_round_trips_name_and_value() {
+        let name1 = b"cyberdeck-where";
+        let value1 = b"{\"nodes\":[],\"root_idx\":0}";
+        let name2 = b"x-trace-id";
+        let value2: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
+
+        let arr = [
+            NetRpcHeader {
+                name_ptr: name1.as_ptr() as *const c_char,
+                name_len: name1.len(),
+                value_ptr: value1.as_ptr(),
+                value_len: value1.len(),
+            },
+            NetRpcHeader {
+                name_ptr: name2.as_ptr() as *const c_char,
+                name_len: name2.len(),
+                value_ptr: value2.as_ptr(),
+                value_len: value2.len(),
+            },
+        ];
+        let collected = unsafe { collect_headers(arr.as_ptr(), arr.len()) }
+            .expect("UTF-8 names must collect cleanly");
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected[0].0, "cyberdeck-where");
+        assert_eq!(collected[0].1, value1.to_vec());
+        assert_eq!(collected[1].0, "x-trace-id");
+        assert_eq!(collected[1].1, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    /// Empty `(NULL, 0)` collects to an empty `Vec`. Matches the
+    /// "no headers" path the `_with_headers` variants accept.
+    #[test]
+    fn collect_headers_empty_input_returns_empty_vec() {
+        let collected = unsafe { collect_headers(std::ptr::null(), 0) }
+            .expect("empty input is OK");
+        assert!(collected.is_empty());
+    }
+
+    /// Non-UTF-8 header name returns `None` so the caller can
+    /// surface `NET_RPC_ERR_INVALID_UTF8` to the consumer.
+    #[test]
+    fn collect_headers_non_utf8_name_returns_none() {
+        let bad_name: &[u8] = &[0xff, 0xfe, 0xfd]; // invalid UTF-8 sequence
+        let value = b"v";
+        let arr = [NetRpcHeader {
+            name_ptr: bad_name.as_ptr() as *const c_char,
+            name_len: bad_name.len(),
+            value_ptr: value.as_ptr(),
+            value_len: value.len(),
+        }];
+        let collected = unsafe { collect_headers(arr.as_ptr(), arr.len()) };
+        assert!(collected.is_none());
+    }
+
+    /// Empty value (NULL ptr or zero length) is preserved as
+    /// empty bytes — the substrate's `request_headers` accepts
+    /// zero-length values.
+    #[test]
+    fn collect_headers_null_or_zero_value_yields_empty_bytes() {
+        let name = b"x-empty";
+        let arr = [
+            NetRpcHeader {
+                name_ptr: name.as_ptr() as *const c_char,
+                name_len: name.len(),
+                value_ptr: std::ptr::null(),
+                value_len: 0,
+            },
+        ];
+        let collected = unsafe { collect_headers(arr.as_ptr(), arr.len()) }.unwrap();
+        assert_eq!(collected[0].0, "x-empty");
+        assert!(collected[0].1.is_empty());
     }
 }

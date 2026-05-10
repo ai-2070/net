@@ -812,12 +812,11 @@ int      net_predicate_evaluate(const char* predicate_json,
  * CAPABILITY_SYSTEM_SDK_PLAN.md). Mirror of the Go SDK's
  * `WhereHeader` helper.
  *
- * The returned `(name, value)` pair drops into a future
- * `request_headers`-shaped option list once a header-bearing
- * call variant ships in `libnet_rpc`. Today's `net_rpc_call` /
- * `net_rpc_call_service` (in `net_rpc.h`) don't accept request
- * headers yet; this helper is the canonical encoder for the
- * value when downstream wires it through.
+ * The returned `(name, value)` pair drops into the
+ * `(headers_ptr, header_count)` argument of
+ * `net_rpc_call_with_headers` / `_call_service_with_headers` /
+ * `_call_streaming_with_headers` (declared in `net_rpc.h`) for
+ * end-to-end predicate pushdown.
  *
  * Input (NUL-terminated UTF-8 JSON):
  *   - predicate_json — wire-format `PredicateWire`. Same shape
