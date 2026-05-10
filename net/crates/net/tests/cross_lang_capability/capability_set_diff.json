@@ -1,0 +1,166 @@
+{
+  "description": "Cross-binding pin for `CapabilitySet::diff(prev)` output. Each binding parses prev + curr, computes curr.diff(prev), normalizes added_tags / removed_tags as sorted-by-wire-form arrays and metadata changes as a sorted-by-key array, and asserts the output matches the expected_* fields. See README.md.",
+  "abi_version_expected": 1,
+  "cases": [
+    {
+      "name": "empty_vs_empty_is_empty_diff",
+      "summary": "No tags, no metadata on either side → no changes.",
+      "prev": { "tags": [], "metadata": {} },
+      "curr": { "tags": [], "metadata": {} },
+      "expected_added_tags": [],
+      "expected_removed_tags": [],
+      "expected_metadata_changes": []
+    },
+    {
+      "name": "tag_added_only",
+      "summary": "Single tag appears in curr; no metadata change.",
+      "prev": { "tags": [], "metadata": {} },
+      "curr": { "tags": ["hardware.gpu"], "metadata": {} },
+      "expected_added_tags": ["hardware.gpu"],
+      "expected_removed_tags": [],
+      "expected_metadata_changes": []
+    },
+    {
+      "name": "tag_removed_only",
+      "summary": "Single tag disappears from curr.",
+      "prev": { "tags": ["software.os=linux"], "metadata": {} },
+      "curr": { "tags": [], "metadata": {} },
+      "expected_added_tags": [],
+      "expected_removed_tags": ["software.os=linux"],
+      "expected_metadata_changes": []
+    },
+    {
+      "name": "tag_added_and_removed_disjoint",
+      "summary": "Different tags added vs removed; intersect is empty.",
+      "prev": {
+        "tags": ["hardware.cpu_cores=8", "scope:tenant:foo"],
+        "metadata": {}
+      },
+      "curr": {
+        "tags": ["hardware.cpu_cores=16", "scope:tenant:bar"],
+        "metadata": {}
+      },
+      "expected_added_tags": ["hardware.cpu_cores=16", "scope:tenant:bar"],
+      "expected_removed_tags": ["hardware.cpu_cores=8", "scope:tenant:foo"],
+      "expected_metadata_changes": []
+    },
+    {
+      "name": "metadata_added_only",
+      "summary": "Single metadata entry added.",
+      "prev": { "tags": [], "metadata": {} },
+      "curr": { "tags": [], "metadata": { "intent": "ml-training" } },
+      "expected_added_tags": [],
+      "expected_removed_tags": [],
+      "expected_metadata_changes": [
+        { "kind": "added", "key": "intent", "value": "ml-training" }
+      ]
+    },
+    {
+      "name": "metadata_removed_only",
+      "summary": "Single metadata entry removed.",
+      "prev": {
+        "tags": [],
+        "metadata": { "owner": "alice@anthropic" }
+      },
+      "curr": { "tags": [], "metadata": {} },
+      "expected_added_tags": [],
+      "expected_removed_tags": [],
+      "expected_metadata_changes": [
+        {
+          "kind": "removed",
+          "key": "owner",
+          "prev_value": "alice@anthropic"
+        }
+      ]
+    },
+    {
+      "name": "metadata_value_updated_for_same_key",
+      "summary": "Same metadata key, different value → Updated (NOT Removed+Added).",
+      "prev": { "tags": [], "metadata": { "intent": "embedding-cache" } },
+      "curr": { "tags": [], "metadata": { "intent": "ml-training" } },
+      "expected_added_tags": [],
+      "expected_removed_tags": [],
+      "expected_metadata_changes": [
+        {
+          "kind": "updated",
+          "key": "intent",
+          "prev_value": "embedding-cache",
+          "new_value": "ml-training"
+        }
+      ]
+    },
+    {
+      "name": "metadata_key_rename_is_remove_plus_add_not_update",
+      "summary": "Pinned: a key rename surfaces as Removed + Added, NOT Updated. Key identity changes are semantically distinct from value changes.",
+      "prev": { "tags": [], "metadata": { "old-key": "v" } },
+      "curr": { "tags": [], "metadata": { "new-key": "v" } },
+      "expected_added_tags": [],
+      "expected_removed_tags": [],
+      "expected_metadata_changes": [
+        { "kind": "added", "key": "new-key", "value": "v" },
+        { "kind": "removed", "key": "old-key", "prev_value": "v" }
+      ]
+    },
+    {
+      "name": "combined_tag_and_metadata_changes",
+      "summary": "Mixed: tag added + metadata updated + metadata added.",
+      "prev": {
+        "tags": ["software.os=linux"],
+        "metadata": { "intent": "embedding-cache" }
+      },
+      "curr": {
+        "tags": ["software.os=linux", "hardware.gpu"],
+        "metadata": {
+          "intent": "ml-training",
+          "owner": "alice"
+        }
+      },
+      "expected_added_tags": ["hardware.gpu"],
+      "expected_removed_tags": [],
+      "expected_metadata_changes": [
+        {
+          "kind": "updated",
+          "key": "intent",
+          "prev_value": "embedding-cache",
+          "new_value": "ml-training"
+        },
+        { "kind": "added", "key": "owner", "value": "alice" }
+      ]
+    },
+    {
+      "name": "reserved_prefix_tags_diff_correctly",
+      "summary": "Reserved-prefix tags (`scope:`, `causal:`) are first-class; diff treats them like any other tag.",
+      "prev": {
+        "tags": ["scope:tenant:foo", "causal:abc123"],
+        "metadata": {}
+      },
+      "curr": {
+        "tags": ["scope:tenant:foo", "causal:def456", "fork-of:abc123"],
+        "metadata": {}
+      },
+      "expected_added_tags": ["causal:def456", "fork-of:abc123"],
+      "expected_removed_tags": ["causal:abc123"],
+      "expected_metadata_changes": []
+    },
+    {
+      "name": "btreemap_iteration_order_for_metadata_changes",
+      "summary": "Multiple metadata changes return in sorted-by-key order (BTreeMap semantics). Pinned so consumers can rely on deterministic output.",
+      "prev": { "tags": [], "metadata": {} },
+      "curr": {
+        "tags": [],
+        "metadata": {
+          "zebra": "z",
+          "alpha": "a",
+          "middle": "m"
+        }
+      },
+      "expected_added_tags": [],
+      "expected_removed_tags": [],
+      "expected_metadata_changes": [
+        { "kind": "added", "key": "alpha", "value": "a" },
+        { "kind": "added", "key": "middle", "value": "m" },
+        { "kind": "added", "key": "zebra", "value": "z" }
+      ]
+    }
+  ]
+}
