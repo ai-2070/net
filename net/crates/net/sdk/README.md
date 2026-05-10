@@ -525,9 +525,9 @@ let _report = PredicateDebugReport::from_evaluations(&p, corpus);
 ```
 
 For host-side placement-filter callbacks, implement
-[`PlacementFilter`](https://docs.rs/net-sdk/latest/net_sdk/capabilities/trait.PlacementFilter.html)
+[`PlacementFilter`](https://docs.rs/ai2070-net-sdk/latest/net_sdk/capabilities/trait.PlacementFilter.html)
 directly and register the impl with
-[`global_placement_filter_registry()`](https://docs.rs/net-sdk/latest/net_sdk/capabilities/fn.global_placement_filter_registry.html);
+[`global_placement_filter_registry()`](https://docs.rs/ai2070-net-sdk/latest/net_sdk/capabilities/fn.global_placement_filter_registry.html);
 the TS / Python / Go bindings auto-wrap closures via
 `placement_filter_from_fn` for the same registry.
 
