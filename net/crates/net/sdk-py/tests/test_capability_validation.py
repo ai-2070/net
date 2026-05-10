@@ -231,6 +231,35 @@ def test_number_value_accepts_unsigned() -> None:
     assert report.errors == ()
 
 
+def test_number_value_rejects_unicode_digits() -> None:
+    """R4: Rust's ``u64::from_str`` only accepts ASCII digits.
+    Python's ``str.isdigit()`` accepts Unicode digits like
+    ``"١٢"`` (Arabic-Indic 1, 2), so pre-fix the validator passed
+    payloads the Rust parser rejected.
+    """
+    arabic_indic_one = "١"
+    caps = {"tags": [f"hardware.memory_mb={arabic_indic_one}"], "metadata": {}}
+    report = validate_capabilities(caps)
+    mismatch = [
+        e for e in report.errors if e.to_wire()["kind"] == "type_mismatch"
+    ]
+    assert len(mismatch) == 1, (
+        "Unicode digit '١' must be rejected as TypeMismatch to match Rust"
+    )
+
+
+def test_number_value_accepts_plus_prefix() -> None:
+    """R4: Rust's ``u64::from_str`` accepts an optional leading
+    ``+``: ``"+1".parse::<u64>() → Ok(1)``. Python's
+    ``str.isdigit()`` rejected it, so pre-fix the validator
+    flagged a payload Rust would happily parse — the opposite
+    divergence direction from the Unicode-digit case.
+    """
+    caps = {"tags": ["hardware.memory_mb=+65536"], "metadata": {}}
+    report = validate_capabilities(caps)
+    assert report.errors == ()
+
+
 def test_number_value_rejects_above_u64_max() -> None:
     """Q4: substrate `Number` is u64. Pre-fix the Python validator
     only ran ``isdigit()`` which admits arbitrarily long digit

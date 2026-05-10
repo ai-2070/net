@@ -12,6 +12,7 @@ cross-binding fixture
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
@@ -317,6 +318,20 @@ def _axis_entry(schema: AxisSchema, axis: TaxonomyAxis) -> AxisEntry:
     raise ValueError(f"unknown axis: {axis!r}")
 
 
+# R4: ASCII-only digits + optional leading `+`. Mirrors Rust's
+# `u64::from_str` accepted-set:
+#
+#   * Rust accepts ``"42"`` and ``"+42"`` (one optional leading
+#     ``+``); rejects ``"-1"`` (covered separately by P1-C),
+#     leading whitespace, and non-ASCII digits like ``"١٢"``
+#     (Arabic-Indic 1, 2).
+#   * Python's ``str.isdigit()`` accepts the Unicode digits and
+#     rejects the leading ``+``, so the two diverge in opposite
+#     directions if we rely on it. The regex locks the accepted
+#     set to exactly what Rust parses.
+_U64_LITERAL = re.compile(r"^\+?[0-9]+$")
+
+
 def _check_value(
     entry: KeyEntry,
     observed_type: ValueType,
@@ -358,7 +373,16 @@ def _check_value(
         # only ruled out negatives + non-digits, but admitted
         # values like "18446744073709551616" (u64::MAX + 1) which
         # the Rust `value.parse::<u64>()` rejects.
-        if observed_value and observed_value.isdigit():
+        #
+        # R4: `str.isdigit()` diverged from Rust's `u64::from_str`
+        # in two opposite directions:
+        #   - Python rejects "+1" (the `+` isn't a digit) while
+        #     Rust accepts an optional leading `+`.
+        #   - Python accepts Unicode digits like "١٢" (Arabic-
+        #     Indic) which Rust rejects (ASCII-only).
+        # Use an ASCII-digit + optional-`+` regex to lock the
+        # accepted-set to exactly what Rust parses.
+        if observed_value and _U64_LITERAL.match(observed_value):
             try:
                 parsed = int(observed_value)
                 parses = 0 <= parsed <= 0xFFFF_FFFF_FFFF_FFFF
