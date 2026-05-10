@@ -241,31 +241,14 @@ impl Scheduler {
         daemon_filter: &CapabilityFilter,
         source_node: u64,
     ) -> Result<PlacementDecision, SchedulerError> {
-        // CR-21: preserve v1's LocalPreferred fast-path. With
-        // `LegacyPlacement::permissive` every eligible scores 1.0
-        // and ties fall through to step-3 (lex NodeId), so the
-        // smallest-NodeId remote always beats a higher-NodeId
-        // local even when local is fine — migrations newly hop
-        // the network. Slice-8 made v2 the default migration path,
-        // so this regression bit every operator using the
-        // out-of-the-box configuration.
-        //
-        // Apply the v1 short-circuit before scoring: if local is
-        // eligible AND not the source, route there with a
-        // `LocalPreferred` reason — saves the network hop and
-        // keeps downstream telemetry that distinguishes
-        // local-vs-remote placement decisions accurate.
-        let candidates = self.find_migration_targets(daemon_filter, source_node);
-        if candidates.is_empty() {
-            return Err(SchedulerError::NoCandidate);
-        }
-        if self.local_node_id != source_node && candidates.contains(&self.local_node_id) {
-            return Ok(PlacementDecision {
-                node_id: self.local_node_id,
-                reason: PlacementReason::LocalPreferred,
-            });
-        }
-
+        // CR-21 + N-7: the LocalPreferred fast-path now lives inside
+        // `select_migration_target` so callers feeding their own
+        // `TieBreakContext` (the doc-comment directs RTT-aware
+        // operators at that entry point) get the same fix.
+        // `place_migration_v2` becomes a thin wrapper that derives
+        // the proper `PlacementReason` from whether the chosen node
+        // is the local one — keeping the v1 telemetry distinction
+        // alive.
         let placement = LegacyPlacement::permissive(&self.capability_index);
         let tie_break = TieBreakContext {
             rtt_lookup: None,
@@ -295,10 +278,12 @@ impl Scheduler {
                 &tie_break,
             )
             .ok_or(SchedulerError::NoCandidate)?;
-        Ok(PlacementDecision {
-            node_id,
-            reason: PlacementReason::BestScore,
-        })
+        let reason = if node_id == self.local_node_id && self.local_node_id != source_node {
+            PlacementReason::LocalPreferred
+        } else {
+            PlacementReason::BestScore
+        };
+        Ok(PlacementDecision { node_id, reason })
     }
 
     /// Phase G slice 1 of `CAPABILITY_SYSTEM_PLAN.md`. Select the
@@ -318,14 +303,17 @@ impl Scheduler {
     /// `TieBreakContext { rtt_lookup: None, ... }` to fall through
     /// to step 3 (lex NodeId) when no proximity data is available.
     ///
+    /// LocalPreferred fast-path: when the scheduler's
+    /// `local_node_id` is in the eligible-candidate pool AND isn't
+    /// the migration source, the local node is returned without
+    /// scoring. CR-21 introduced this for `place_migration_v2`;
+    /// N-7 extended it here so RTT-aware operators (the
+    /// doc-recommended callers of this entry point) get the same
+    /// network-hop avoidance.
+    ///
     /// Returns the highest-scoring candidate's node id, or `None`
     /// when every candidate is vetoed (or the candidate list was
     /// empty to begin with).
-    ///
-    /// Additive — does NOT change `place_migration`'s observable
-    /// behavior. Operators opt in by calling this method directly;
-    /// a future slice gates the default migration path behind the
-    /// `mikoshi-placement-v2` feature flag.
     pub fn select_migration_target(
         &self,
         artifact: &Artifact<'_>,
@@ -335,6 +323,20 @@ impl Scheduler {
         tie_break: &TieBreakContext<'_>,
     ) -> Option<u64> {
         let candidates = self.find_migration_targets(daemon_filter, source_node);
+        if candidates.is_empty() {
+            return None;
+        }
+        // N-7: LocalPreferred fast-path. CR-21 inlined this into
+        // `place_migration_v2`, but the doc-comment explicitly
+        // directs RTT-aware operators to call this method directly
+        // — pre-fix they silently lost the fast-path and the
+        // smallest-NodeId remote would beat the local on
+        // `LegacyPlacement::permissive` tie-breaks. Apply the
+        // short-circuit here so both entry points behave
+        // identically.
+        if self.local_node_id != source_node && candidates.contains(&self.local_node_id) {
+            return Some(self.local_node_id);
+        }
         Self::pick_best_candidate(candidates, artifact, placement, tie_break)
     }
 
@@ -834,6 +836,104 @@ mod tests {
             &tb,
         );
         assert_eq!(target, None);
+    }
+
+    /// N-7 regression: `select_migration_target` applies the
+    /// LocalPreferred fast-path. When the scheduler's local node is
+    /// in the eligible-candidate pool (and isn't the source),
+    /// migration stays local without consulting the placement
+    /// scorer — even when the scorer would rank a remote higher.
+    /// Pre-fix the fast-path lived inline in `place_migration_v2`;
+    /// RTT-aware callers consuming `select_migration_target`
+    /// directly silently lost it.
+    #[test]
+    fn select_migration_target_local_preferred_fast_path() {
+        let index = make_index_with_nodes(vec![
+            (0x1111, caps_with_migration_tag()), // local
+            (0x2222, caps_with_migration_tag()),
+            (0x3333, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0x1111, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+
+        // Synthetic placement: a remote scores higher than local.
+        // The fast-path must prefer local anyway because the
+        // CR-21 cost-of-network-hop argument outranks marginal
+        // score differences.
+        struct LocalLow;
+        impl PlacementFilter for LocalLow {
+            fn placement_score(&self, t: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
+                Some(match *t {
+                    0x1111 => 0.2,
+                    0x2222 => 0.9,
+                    0x3333 => 0.5,
+                    _ => 0.0,
+                })
+            }
+        }
+
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        // Source = 0x9999 (not in pool). Local 0x1111 is eligible
+        // → fast-path returns local.
+        let target = scheduler.select_migration_target(
+            &artifact,
+            &CapabilityFilter::default(),
+            0x9999,
+            &LocalLow,
+            &tb,
+        );
+        assert_eq!(target, Some(0x1111), "local must win even when scoring lower");
+    }
+
+    /// N-7 sibling: when the migration source IS the local node,
+    /// LocalPreferred cannot trigger (the source is excluded from
+    /// candidates anyway). The fast-path must check
+    /// `source != local` before short-circuiting.
+    #[test]
+    fn select_migration_target_local_preferred_inactive_when_source_is_local() {
+        let index = make_index_with_nodes(vec![
+            (0x1111, caps_with_migration_tag()), // local + source
+            (0x2222, caps_with_migration_tag()),
+            (0x3333, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0x1111, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+
+        struct RemoteScores;
+        impl PlacementFilter for RemoteScores {
+            fn placement_score(&self, t: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
+                Some(match *t {
+                    0x2222 => 0.9,
+                    0x3333 => 0.5,
+                    _ => 0.0,
+                })
+            }
+        }
+
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        // Source = 0x1111 (local). Fast-path inactive; scorer picks 0x2222.
+        let target = scheduler.select_migration_target(
+            &artifact,
+            &CapabilityFilter::default(),
+            0x1111,
+            &RemoteScores,
+            &tb,
+        );
+        assert_eq!(target, Some(0x2222), "scorer picks highest when local is source");
     }
 
     /// Source node is excluded from candidates (already pinned by
