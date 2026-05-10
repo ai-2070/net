@@ -354,6 +354,28 @@ pub struct StandardPlacement<'a> {
     /// integrations supply a closure that consults the local
     /// view of `causal:*` chain holdings per peer.
     pub leadership_stats: Option<&'a dyn LeadershipStatsLookup>,
+    /// SDK Phase 7 slice 5 — custom placement-filter id.
+    ///
+    /// Set to the `id` returned by `placementFilterFromFn` /
+    /// `placement_filter_from_fn` / `PlacementFilterFromFn` (TS /
+    /// Python / Go SDKs), AFTER calling
+    /// `mesh.registerPlacementFilter(id, fn)` to wire the closure
+    /// across the FFI. During scoring, the substrate looks up `id`
+    /// in [`global_placement_filter_registry`](super::placement_registry::global_placement_filter_registry)
+    /// and treats the registered filter as an additional axis:
+    ///
+    /// - registered, returns `Some(score)` — multiplied into the
+    ///   composition (LOCKED §7 multiplicative invariant).
+    /// - registered, returns `None` — hard veto, candidate
+    ///   excluded (no score is composed; `placement_score` returns
+    ///   `None`).
+    /// - id NOT registered — hard veto + log via `eprintln!`.
+    ///   Operators who want a permissive default for missing
+    ///   registrations should leave `custom_filter_id` as `None`
+    ///   instead of referencing an unset id.
+    ///
+    /// `None` (the default) disables the custom-filter axis.
+    pub custom_filter_id: Option<String>,
 }
 
 impl<'a> StandardPlacement<'a> {
@@ -374,6 +396,7 @@ impl<'a> StandardPlacement<'a> {
             metadata_keys: PlacementMetadataKeys::default(),
             anti_affinity: AntiAffinityConfig::default(),
             leadership_stats: None,
+            custom_filter_id: None,
         }
     }
 
@@ -431,6 +454,18 @@ impl<'a> StandardPlacement<'a> {
         self.resource_axis = axis;
         self
     }
+
+    /// SDK Phase 7 slice 5 — set the custom placement-filter id.
+    ///
+    /// `id` MUST match the id returned by an SDK
+    /// `placementFilterFromFn` call AND have been previously
+    /// registered via `mesh.registerPlacementFilter(id, fn)` over
+    /// the FFI. See the [`Self::custom_filter_id`] field docs for
+    /// veto semantics on missing registrations.
+    pub fn with_custom_filter_id(mut self, id: impl Into<String>) -> Self {
+        self.custom_filter_id = Some(id.into());
+        self
+    }
 }
 
 /// Multiplicative-composition fold. Pinned by plan §7 LOCKED:
@@ -480,7 +515,17 @@ impl<'a> PlacementFilter for StandardPlacement<'a> {
             }
         }
 
-        // Per-axis scoring stubs (slice 5 fills these in).
+        // SDK Phase 7 slice 5 — custom-filter axis. Resolved here
+        // (BEFORE the in-tree axes) because a custom filter may
+        // hard-veto the candidate, and there's no point computing
+        // the in-tree axes if the custom filter is going to drop
+        // the candidate anyway. The score is composed in below.
+        let custom = match self.score_custom_filter_axis(target, artifact) {
+            Some(s) => s,
+            None => return None,
+        };
+
+        // Per-axis scoring (slice 5 of Phase F filled these in).
         let scope = self.score_scope_axis(&target_caps);
         let proximity = self.score_proximity_axis(target);
         let intent = self.score_intent_axis(&target_caps, artifact);
@@ -495,6 +540,7 @@ impl<'a> PlacementFilter for StandardPlacement<'a> {
             colocation,
             resource,
             anti_affinity,
+            custom,
         ]))
     }
 }
@@ -798,6 +844,51 @@ impl<'a> StandardPlacement<'a> {
                 p.clamp(0.0, 1.0)
             }
         }
+    }
+
+    /// SDK Phase 7 slice 5 — custom-filter axis. Resolves
+    /// [`Self::custom_filter_id`] against
+    /// [`global_placement_filter_registry`](super::placement_registry::global_placement_filter_registry),
+    /// invokes the registered filter, and translates its
+    /// `Option<f32>` into the same shape as the in-tree axes:
+    ///
+    /// - `custom_filter_id: None` → `Some(1.0)` (axis disabled,
+    ///   identity for the multiplicative composition).
+    /// - id registered, filter returns `Some(score)` → `Some(score)`.
+    /// - id registered, filter returns `None` → `None` (hard veto
+    ///   propagates up).
+    /// - id NOT registered → `None` + log via `eprintln!`. Operators
+    ///   shouldn't reference an unset id; veto-with-log surfaces the
+    ///   misconfiguration loudly rather than silently routing to
+    ///   the wrong node.
+    ///
+    /// Returns `Option<f32>` rather than the in-tree axes' bare `f32`
+    /// because a custom filter MAY hard-veto, and we want the veto to
+    /// short-circuit the rest of the composition (no point computing
+    /// scope / proximity / etc. when the candidate is going to be
+    /// dropped). The caller in [`Self::placement_score`] does the
+    /// short-circuit explicitly.
+    fn score_custom_filter_axis(
+        &self,
+        target: &NodeId,
+        artifact: &Artifact<'_>,
+    ) -> Option<f32> {
+        let Some(id) = self.custom_filter_id.as_deref() else {
+            return Some(1.0);
+        };
+        let registry = super::placement_registry::global_placement_filter_registry();
+        let Some(filter) = registry.get(id) else {
+            eprintln!(
+                "StandardPlacement: custom_filter_id {id:?} not registered in \
+                 global_placement_filter_registry; vetoing target {target:#x}. \
+                 Did the SDK call mesh.registerPlacementFilter before placement?",
+            );
+            return None;
+        };
+        // Delegate. The registered filter's `None` cascades up
+        // through this `Option<f32>` and onward to
+        // `placement_score`'s early return.
+        filter.placement_score(target, artifact)
     }
 }
 
@@ -2764,5 +2855,197 @@ mod tests {
             capabilities: &replica_caps,
         };
         assert_eq!(placement.placement_score(&0x1111, &replica), Some(1.0));
+    }
+
+    // =====================================================================
+    // SDK Phase 7 slice 5 — `StandardPlacement.custom_filter_id` consumption
+    //
+    // Pins five guarantees:
+    //   1. `custom_filter_id: None` (default) → axis disabled
+    //      (always 1.0 contribution).
+    //   2. Registered filter returning `Some(1.0)` → composes
+    //      multiplicatively (no observable change vs. no filter).
+    //   3. Registered filter returning `Some(score)` → score is
+    //      composed in (multiplied with other axes).
+    //   4. Registered filter returning `None` → hard veto
+    //      propagates up; the candidate is dropped.
+    //   5. id NOT registered → hard veto + log; pin the misconfig
+    //      contract.
+    // =====================================================================
+
+    use crate::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+
+    /// Test filter that returns a fixed `Option<f32>` regardless of
+    /// candidate. Combined with a unique id per test case so the
+    /// global singleton doesn't leak state between tests.
+    struct FixedScoreFilter(Option<f32>);
+
+    impl PlacementFilter for FixedScoreFilter {
+        fn placement_score(&self, _: &NodeId, _: &Artifact<'_>) -> Option<f32> {
+            self.0
+        }
+    }
+
+    /// RAII-style registration cleanup so a panicking test doesn't
+    /// leak the registration into other tests' singleton state.
+    struct FilterGuard {
+        id: String,
+    }
+
+    impl Drop for FilterGuard {
+        fn drop(&mut self) {
+            global_placement_filter_registry().unregister(&self.id);
+        }
+    }
+
+    /// Helper: register, run a closure with the registered id, then
+    /// always unregister via the RAII guard's `Drop`.
+    fn with_registered_filter<F: FnOnce(&str)>(
+        id: &str,
+        filter: Arc<dyn PlacementFilter>,
+        body: F,
+    ) {
+        let reg = global_placement_filter_registry();
+        let _ = reg.unregister(id); // cleanup from a possibly-failed prior run
+        assert!(reg.register(id.to_string(), filter), "register {id}");
+        let _guard = FilterGuard { id: id.to_string() };
+        body(id);
+    }
+
+    /// `custom_filter_id: None` (default) leaves the axis at 1.0.
+    /// Composes identically to a default `StandardPlacement` with
+    /// no filter configured — pin the back-compat default.
+    #[test]
+    fn standard_placement_no_custom_filter_acts_as_identity_axis() {
+        let index = index_with(&[(0x1111, empty_caps())]);
+        let placement = StandardPlacement::new(&index);
+        assert!(placement.custom_filter_id.is_none());
+
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        assert_eq!(placement.placement_score(&0x1111, &artifact), Some(1.0));
+    }
+
+    /// Registered filter returning `Some(1.0)` is identity for the
+    /// composition; other axes' scores pass through unchanged. With
+    /// every other axis disabled (default config), the final score
+    /// stays 1.0.
+    #[test]
+    fn standard_placement_custom_filter_one_is_identity() {
+        let index = index_with(&[(0x2222, empty_caps())]);
+        let id = "pf-test-slice5-identity";
+        with_registered_filter(
+            id,
+            Arc::new(FixedScoreFilter(Some(1.0))),
+            |id| {
+                let placement = StandardPlacement::new(&index)
+                    .with_custom_filter_id(id);
+                let req = empty_caps();
+                let opt = empty_caps();
+                let artifact = daemon_artifact(&req, &opt);
+                assert_eq!(
+                    placement.placement_score(&0x2222, &artifact),
+                    Some(1.0),
+                    "Some(1.0) custom score should compose identically",
+                );
+            },
+        );
+    }
+
+    /// Registered filter returning a fractional score is composed
+    /// multiplicatively. With other axes disabled, the final score
+    /// equals the custom score.
+    #[test]
+    fn standard_placement_custom_filter_score_composes_multiplicatively() {
+        let index = index_with(&[(0x3333, empty_caps())]);
+        let id = "pf-test-slice5-multiply";
+        with_registered_filter(
+            id,
+            Arc::new(FixedScoreFilter(Some(0.5))),
+            |id| {
+                let placement = StandardPlacement::new(&index)
+                    .with_custom_filter_id(id);
+                let req = empty_caps();
+                let opt = empty_caps();
+                let artifact = daemon_artifact(&req, &opt);
+                let score = placement.placement_score(&0x3333, &artifact);
+                assert_eq!(score, Some(0.5));
+            },
+        );
+    }
+
+    /// Registered filter returning `None` propagates as a hard veto.
+    /// Pin LOCKED §7: a None on the custom-filter axis drops the
+    /// candidate entirely — no other axis can rescue it.
+    #[test]
+    fn standard_placement_custom_filter_none_is_hard_veto() {
+        let index = index_with(&[(0x4444, empty_caps())]);
+        let id = "pf-test-slice5-veto";
+        with_registered_filter(
+            id,
+            Arc::new(FixedScoreFilter(None)),
+            |id| {
+                let placement = StandardPlacement::new(&index)
+                    .with_custom_filter_id(id);
+                let req = empty_caps();
+                let opt = empty_caps();
+                let artifact = daemon_artifact(&req, &opt);
+                assert_eq!(
+                    placement.placement_score(&0x4444, &artifact),
+                    None,
+                    "None from custom filter must veto the candidate",
+                );
+            },
+        );
+    }
+
+    /// `custom_filter_id` references an unregistered id → hard veto.
+    /// Pin the misconfiguration contract: operators see a logged
+    /// veto rather than silent permissive routing.
+    #[test]
+    fn standard_placement_unregistered_custom_filter_id_vetoes() {
+        let index = index_with(&[(0x5555, empty_caps())]);
+        // Use a uniquely-prefixed id we never register so concurrent
+        // test runs don't collide on the global singleton.
+        let placement = StandardPlacement::new(&index)
+            .with_custom_filter_id("pf-test-slice5-NEVER-REGISTERED-xyz");
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        assert_eq!(
+            placement.placement_score(&0x5555, &artifact),
+            None,
+            "unregistered custom_filter_id must veto",
+        );
+    }
+
+    /// Custom filter composes alongside in-tree axes. Configure the
+    /// scope axis to score 0.0 (filter mismatch) → final score is
+    /// 0.0 even if custom filter says 1.0. Pin the multiplicative
+    /// invariant: a 0.0 from any axis (including the new one) wins.
+    #[test]
+    fn standard_placement_custom_filter_composes_with_in_tree_axes() {
+        let index = index_with(&[(0x6666, empty_caps())]);
+        let id = "pf-test-slice5-compose";
+        with_registered_filter(
+            id,
+            Arc::new(FixedScoreFilter(Some(1.0))),
+            |id| {
+                // Scope filter requires a specific tag; target has
+                // no scope tags, so scope axis returns 0.0.
+                let placement = StandardPlacement::new(&index)
+                    .with_custom_filter_id(id)
+                    .with_scope_filter(vec![ScopeLabel::new("scope:tenant:foo")]);
+                let req = empty_caps();
+                let opt = empty_caps();
+                let artifact = daemon_artifact(&req, &opt);
+                assert_eq!(
+                    placement.placement_score(&0x6666, &artifact),
+                    Some(0.0),
+                    "scope-axis 0.0 zeroes the composition even when custom = 1.0",
+                );
+            },
+        );
     }
 }
