@@ -1104,7 +1104,47 @@ impl CapabilitySet {
     }
 
     /// Set or overwrite a metadata key-value entry.
-    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    ///
+    /// CR-16: silently drops writes whose key matches a
+    /// substrate-reserved *prefix* (`tool::`). Those keys are
+    /// authored by the substrate's own codecs (the tool codec
+    /// emits `tool::<id>::input_schema` etc.) and user code
+    /// must not collide with them — same shape as `Tag::parse_user`
+    /// rejecting reserved tag prefixes.
+    ///
+    /// Note: the schema's `metadata_reserved` *exact-match* list
+    /// (`intent`, `colocate-with`, `priority`, `owner`) is
+    /// intentionally NOT gated — those are well-known *user-facing*
+    /// scheduler hints; the substrate reads them to make placement
+    /// decisions, but user code is expected to *set* them. The
+    /// validator (`validate_capabilities`) does flag user writes
+    /// onto exact-match reserved keys as a `MetadataReservedKey`
+    /// warning so misconfiguration is visible without being fatal.
+    ///
+    /// Substrate-internal callers that need to emit `tool::*` keys
+    /// use [`Self::with_metadata_unchecked`].
+    pub fn with_metadata(self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        let key: String = key.into();
+        if super::schema::AXIS_SCHEMA
+            .metadata_reserved_prefixes
+            .iter()
+            .any(|p| key.starts_with(*p))
+        {
+            return self;
+        }
+        self.with_metadata_unchecked(key, value)
+    }
+
+    /// Internal counterpart to [`Self::with_metadata`] that bypasses
+    /// the reserved-prefix gate. Substrate-side code that authors
+    /// reserved metadata (`tool::<id>::input_schema` from the tool
+    /// codec) goes through this; user code MUST use the gated
+    /// [`Self::with_metadata`].
+    pub(crate) fn with_metadata_unchecked(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
     }
@@ -3409,6 +3449,33 @@ mod tests {
         );
         assert_eq!(caps.tags, parsed.tags);
         assert_eq!(caps.views().models().len(), parsed.views().models().len());
+    }
+
+    /// CR-16: `with_metadata` silently drops writes whose key
+    /// starts with a reserved prefix (`tool::`). Same shape as
+    /// `add_tag`'s rejection of reserved tag prefixes via
+    /// `Tag::parse_user`. Exact-match reserved keys (`intent`,
+    /// `owner`, …) are NOT gated — those are well-known
+    /// user-facing scheduler hints.
+    #[test]
+    fn with_metadata_drops_reserved_prefix_keys() {
+        // `tool::*` writes silently dropped.
+        let caps = CapabilitySet::new()
+            .with_metadata("tool::evil::input_schema", "spoof")
+            .with_metadata("region", "us-east");
+        assert!(
+            !caps.metadata.contains_key("tool::evil::input_schema"),
+            "with_metadata must drop reserved-prefix keys: {:?}",
+            caps.metadata
+        );
+        // Non-reserved key passes through.
+        assert_eq!(caps.metadata.get("region").map(|s| s.as_str()), Some("us-east"));
+
+        // Exact-match reserved keys (NOT gated) — these are
+        // user-facing scheduler hints, the substrate reads them
+        // and user code is expected to set them.
+        let caps = CapabilitySet::new().with_metadata("intent", "ml-training");
+        assert_eq!(caps.metadata.get("intent").map(|s| s.as_str()), Some("ml-training"));
     }
 
     #[test]
