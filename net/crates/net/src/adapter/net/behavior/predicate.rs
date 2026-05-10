@@ -716,6 +716,17 @@ pub enum PredicateRpcDecodeError {
     /// empty table).
     #[error("predicate wire malformed: {0}")]
     Wire(#[from] PredicateWireError),
+    /// Header value bytes exceeded the negotiated cap
+    /// (`MAX_PREDICATE_RPC_HEADER_VALUE_LEN`). Mirrors the encode
+    /// side's `TooLarge`; rejects parse-bombs before serde walks
+    /// the payload.
+    #[error("predicate wire payload {actual} bytes exceeds header cap {limit}")]
+    Oversize {
+        /// Observed payload size in bytes.
+        actual: usize,
+        /// Maximum permitted (`MAX_PREDICATE_RPC_HEADER_VALUE_LEN`).
+        limit: usize,
+    },
 }
 
 /// Encode a [`Predicate`] for transport in an nRPC request header.
@@ -771,6 +782,20 @@ where
         .iter()
         .find(|h| h.name() == RPC_WHERE_HEADER)?
         .value();
+    // N-2 second pass: enforce the cap symmetrically with the encode
+    // side. The encode path rejects oversize payloads at line 735;
+    // pre-fix the decode path had no length check, so a peer that
+    // submitted an attacker-shaped JSON of arbitrary size let
+    // `serde_json::from_slice` plus `rebuild_predicate` walk a
+    // payload whose recursion depth was bounded only by the input
+    // size — a cheap parse-bomb DoS shape if a transport cap were
+    // ever relaxed for unrelated reasons.
+    if value.len() > MAX_PREDICATE_RPC_HEADER_VALUE_LEN {
+        return Some(Err(PredicateRpcDecodeError::Oversize {
+            actual: value.len(),
+            limit: MAX_PREDICATE_RPC_HEADER_VALUE_LEN,
+        }));
+    }
     let result = serde_json::from_slice::<PredicateWire>(value)
         .map_err(PredicateRpcDecodeError::Json)
         .and_then(|wire| wire.into_predicate().map_err(PredicateRpcDecodeError::Wire));
@@ -3047,6 +3072,29 @@ mod tests {
         assert!(
             matches!(result, Err(PredicateRpcDecodeError::Json(_))),
             "expected JSON decode error; got {result:?}",
+        );
+    }
+
+    #[test]
+    fn rpc_header_oversize_payload_returns_decode_error() {
+        // N-6 regression: decode path enforces the
+        // `MAX_PREDICATE_RPC_HEADER_VALUE_LEN` cap symmetrically with
+        // the encode path. Pre-fix `predicate_from_rpc_headers` had
+        // no length check, so an oversize JSON blob walked through
+        // `serde_json::from_slice` + `rebuild_predicate` with depth
+        // bounded only by input size — a cheap parse-bomb DoS shape
+        // if a transport cap was ever relaxed.
+        let oversize = vec![b' '; MAX_PREDICATE_RPC_HEADER_VALUE_LEN + 1];
+        let headers = vec![(RPC_WHERE_HEADER.to_string(), oversize)];
+        let result = predicate_from_rpc_headers(&headers).unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(PredicateRpcDecodeError::Oversize { actual, limit })
+                    if actual == MAX_PREDICATE_RPC_HEADER_VALUE_LEN + 1
+                       && limit == MAX_PREDICATE_RPC_HEADER_VALUE_LEN
+            ),
+            "expected Oversize decode error; got {result:?}",
         );
     }
 
