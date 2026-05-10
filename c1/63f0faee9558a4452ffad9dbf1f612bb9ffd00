@@ -1,0 +1,21 @@
+net/crates/net/bindings/go/net/placement.go
+  s_e3c24456981f5d::t_e09df3f538f13c 171-178
+net/crates/net/bindings/go/net/capability.go
+  s_e3c24456981f5d::t_e9fdc45e409eca 1032-1040,1042-1044
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "c163f0faee9558a4452ffad9dbf1f612bb9ffd00",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
