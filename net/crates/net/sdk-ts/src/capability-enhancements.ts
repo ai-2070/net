@@ -1083,6 +1083,43 @@ function axisTagValue(
 }
 
 /**
+ * Parse a string the way Rust's `f64::from_str` does: accepts
+ * decimal forms (`1`, `1.5`, `.5`, `1.`), scientific notation
+ * (`1e10`, `1.5e-3`), an optional leading `+` or `-`, and the
+ * special-case literals `inf` / `infinity` / `nan` (all
+ * case-insensitive). Rejects empty / whitespace-padded inputs
+ * (Rust's `f64::from_str` is whitespace-strict). Returns `undefined`
+ * when Rust would also reject — letting callers funnel the result
+ * through IEEE comparison so `Inf >= threshold` and
+ * `NaN >= threshold` agree across bindings (matches R1's reasoning
+ * for the Go path).
+ *
+ * N-2: prior shape applied a `/^-?\d+(\.\d+)?$/` regex pre-filter
+ * that rejected scientific notation, leading `+`, `inf`, and `NaN`
+ * — all of which Rust's `f64::from_str` accepts. A tag value
+ * `software.model.context_length=1e6` evaluated `>= 1000000` as
+ * `true` in Rust and `false` in TS pre-fix.
+ */
+function parseRustF64(s: string): number | undefined {
+  if (s.length === 0) return undefined;
+  if (s !== s.trim()) return undefined;
+  const lower = s.toLowerCase();
+  const stripped =
+    lower.startsWith('+') || lower.startsWith('-') ? lower.slice(1) : lower;
+  if (stripped === 'inf' || stripped === 'infinity') {
+    return lower.startsWith('-') ? -Infinity : Infinity;
+  }
+  if (stripped === 'nan') return Number.NaN;
+  // `Number()` accepts the rest of f64::from_str's grammar (decimal,
+  // scientific, leading `+`/`-`, `.5`, `1.`). It also accepts `""`
+  // and whitespace-only as `0` — both already rejected above. Any
+  // other input that Rust's parse rejects falls through to NaN here
+  // (e.g. `"abc"`, `"1abc"`, `"0x1p3"`).
+  const n = Number(s);
+  return Number.isNaN(n) ? undefined : n;
+}
+
+/**
  * Test whether the wire-format tag list carries any tag for `key` —
  * either an `AxisValue` (`<axis>.<key>=<value>`) or an `AxisPresent`
  * (`<axis>.<key>`). Mirrors the substrate's `Predicate::Exists` leaf,
@@ -1117,25 +1154,20 @@ function evalLeaf(
     case 'numericAtLeast': {
       const v = axisTagValue(tags, pred.key);
       if (v === undefined) return false;
-      const n = Number.parseFloat(v);
-      return Number.isFinite(n) && /^-?\d+(\.\d+)?$/.test(v) && n >= pred.threshold;
+      const n = parseRustF64(v);
+      return n !== undefined && n >= pred.threshold;
     }
     case 'numericAtMost': {
       const v = axisTagValue(tags, pred.key);
       if (v === undefined) return false;
-      const n = Number.parseFloat(v);
-      return Number.isFinite(n) && /^-?\d+(\.\d+)?$/.test(v) && n <= pred.threshold;
+      const n = parseRustF64(v);
+      return n !== undefined && n <= pred.threshold;
     }
     case 'numericInRange': {
       const v = axisTagValue(tags, pred.key);
       if (v === undefined) return false;
-      const n = Number.parseFloat(v);
-      return (
-        Number.isFinite(n) &&
-        /^-?\d+(\.\d+)?$/.test(v) &&
-        n >= pred.min &&
-        n <= pred.max
-      );
+      const n = parseRustF64(v);
+      return n !== undefined && n >= pred.min && n <= pred.max;
     }
     case 'semverAtLeast': {
       const rhs = parseSemver(pred.version);
@@ -1194,8 +1226,8 @@ function evalLeaf(
       if (!Object.prototype.hasOwnProperty.call(metadata, pred.key)) return false;
       const v = metadata[pred.key];
       if (v === undefined) return false;
-      const n = Number.parseFloat(v);
-      return Number.isFinite(n) && /^-?\d+(\.\d+)?$/.test(v) && n >= pred.threshold;
+      const n = parseRustF64(v);
+      return n !== undefined && n >= pred.threshold;
     }
     case 'and':
     case 'or':

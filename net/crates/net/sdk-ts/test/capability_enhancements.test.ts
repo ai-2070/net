@@ -590,6 +590,129 @@ describe('metadata predicates ignore prototype-chain properties (regression)', (
   });
 });
 
+// N-2 regression: numeric leaf predicates must accept every value
+// shape Rust's `f64::from_str` accepts — scientific notation
+// (`1e6`), leading `+`, decimal forms (`.5`, `1.`), and the
+// special-case literals `inf` / `infinity` / `NaN`. Pre-fix the TS
+// path applied a `/^-?\d+(\.\d+)?$/` regex pre-filter that rejected
+// all of these, diverging from Rust on every cross-binding fixture
+// row that exercises scientific notation. Mirrors R1's reasoning
+// for the Go path (commit bab01616).
+describe('numeric leaf parses match Rust f64::from_str (N-2 regression)', () => {
+  const key = tagKey('software', 'context_length');
+  const metadata: Record<string, string> = {};
+
+  it('numericAtLeast accepts scientific notation', () => {
+    expect(
+      evaluatePredicate(
+        p.numericAtLeast(key, 1_000_000),
+        ['software.context_length=1e6'],
+        metadata,
+      ),
+    ).toBe(true);
+    expect(
+      evaluatePredicate(
+        p.numericAtLeast(key, 2_000_000),
+        ['software.context_length=1.5e6'],
+        metadata,
+      ),
+    ).toBe(false);
+  });
+
+  it('numericAtLeast accepts leading +', () => {
+    expect(
+      evaluatePredicate(
+        p.numericAtLeast(key, 1500),
+        ['software.context_length=+1500'],
+        metadata,
+      ),
+    ).toBe(true);
+  });
+
+  it('numericInRange accepts decimal-leading dot and trailing dot', () => {
+    expect(
+      evaluatePredicate(
+        p.numericInRange(key, 0, 1),
+        ['software.context_length=.5'],
+        metadata,
+      ),
+    ).toBe(true);
+    expect(
+      evaluatePredicate(
+        p.numericInRange(key, 0, 2),
+        ['software.context_length=1.'],
+        metadata,
+      ),
+    ).toBe(true);
+  });
+
+  it('numericAtLeast forwards inf through IEEE comparison', () => {
+    expect(
+      evaluatePredicate(
+        p.numericAtLeast(key, 1e308),
+        ['software.context_length=inf'],
+        metadata,
+      ),
+    ).toBe(true);
+    expect(
+      evaluatePredicate(
+        p.numericAtLeast(key, 0),
+        ['software.context_length=-inf'],
+        metadata,
+      ),
+    ).toBe(false);
+  });
+
+  it('numericAtMost forwards NaN as never-matching (IEEE)', () => {
+    // `NaN >= threshold` and `NaN <= threshold` are both false in
+    // IEEE 754, so a NaN-valued tag never satisfies any numeric
+    // predicate. Rust's path agrees.
+    expect(
+      evaluatePredicate(
+        p.numericAtMost(key, Number.MAX_VALUE),
+        ['software.context_length=NaN'],
+        metadata,
+      ),
+    ).toBe(false);
+  });
+
+  it('still rejects values Rust f64::from_str rejects', () => {
+    // Hex floats, digit-separator underscores, trailing junk, and
+    // whitespace-padded strings all fail Rust's parse. Confirm parity.
+    expect(
+      evaluatePredicate(
+        p.numericAtLeast(key, 1),
+        ['software.context_length=0x1p3'],
+        metadata,
+      ),
+    ).toBe(false);
+    expect(
+      evaluatePredicate(
+        p.numericAtLeast(key, 1),
+        ['software.context_length=1_000'],
+        metadata,
+      ),
+    ).toBe(false);
+    expect(
+      evaluatePredicate(
+        p.numericAtLeast(key, 1),
+        ['software.context_length= 5 '],
+        metadata,
+      ),
+    ).toBe(false);
+  });
+
+  it('metadataNumericAtLeast uses the same parser as the tag path', () => {
+    expect(
+      evaluatePredicate(
+        p.metadataNumericAtLeast('rate_limit', 1000),
+        [],
+        { rate_limit: '1.5e3' },
+      ),
+    ).toBe(true);
+  });
+});
+
 // N-1 regression: AxisPresent tags ("hardware.gpu" with no separator)
 // must satisfy `Exists` but must NOT satisfy any value predicate
 // (Equals / StringPrefix / StringMatches), even when the predicate's
