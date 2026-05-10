@@ -45,8 +45,10 @@ pub use tag::{
 };
 
 pub use predicate::{
-    ClauseStats, ClauseTrace, EvalContext, Predicate, PredicateDebugReport, PredicateNodeWire,
-    PredicateWire, PredicateWireError,
+    AsRpcHeader, ClauseStats, ClauseTrace, EvalContext, MAX_PREDICATE_RPC_HEADER_VALUE_LEN,
+    Predicate, PredicateDebugReport, PredicateNodeWire, PredicateRpcDecodeError,
+    PredicateRpcEncodeError, PredicateWire, PredicateWireError, RPC_WHERE_HEADER,
+    predicate_from_rpc_headers, predicate_to_rpc_header,
 };
 
 pub use required_capability::{RequireParseError, RequiredCapability};

@@ -650,6 +650,168 @@ fn check_children_below(
 }
 
 // =============================================================================
+// nRPC envelope integration — Phase 5.B of CAPABILITY_ENHANCEMENTS_PLAN.md.
+//
+// The cleanest place to attach a `where:` filter to an nRPC call
+// is the existing request-headers slot. Headers already carry
+// out-of-band metadata (trace context, idempotency keys,
+// content-type) and are typed as `(String, Vec<u8>)` — binary-safe,
+// per-header capped at `MAX_RPC_HEADER_VALUE_LEN` (4 KB), passed
+// through opaquely by the substrate.
+//
+// Predicate-handling code uses two helpers:
+//
+//   `predicate_to_rpc_header(&pred)` — JSON-encodes a `PredicateWire`
+//                                      into the canonical
+//                                      `cyberdeck-where` header.
+//   `predicate_from_rpc_headers(headers)` — locates the header in
+//                                           a request's headers,
+//                                           decodes back to
+//                                           `Predicate`.
+//
+// Service handlers that opt in look for the header; services that
+// don't ignore it. The substrate (cortex/rpc) itself never
+// inspects the header — `eternal-rule §4: no semantic growth at
+// the substrate`. Per-binding API exposure lives in the SDK layer
+// (Phase 9b of `CAPABILITY_SYSTEM_SDK_PLAN.md`).
+//
+// JSON wire format (vs. postcard) trades ~2-3× size for human
+// readability + diff-able cross-binding fixtures. Predicates that
+// fit a typical service filter are ~200-500 bytes JSON, well
+// under the header cap.
+// =============================================================================
+
+/// Canonical header name for a predicate-pushdown filter on an
+/// nRPC request. Lowercase per HTTP-style convention; the substrate
+/// `cortex/rpc` codec passes header names through unchanged, but
+/// this constant is the one downstream callers must agree on.
+pub const RPC_WHERE_HEADER: &str = "cyberdeck-where";
+
+/// Maximum size of the JSON-encoded `PredicateWire` header value.
+/// Mirrors `cortex::rpc::MAX_RPC_HEADER_VALUE_LEN`; redeclared here
+/// so the predicate helper can reject oversize encodings without
+/// pulling in the `cortex` feature gate.
+pub const MAX_PREDICATE_RPC_HEADER_VALUE_LEN: usize = 4096;
+
+/// Errors raised by [`predicate_to_rpc_header`].
+#[derive(Debug, thiserror::Error)]
+pub enum PredicateRpcEncodeError {
+    /// `serde_json::to_vec` failed on the wire-form predicate.
+    #[error("predicate wire encode failed: {0}")]
+    Encode(#[from] serde_json::Error),
+    /// The encoded payload exceeds the header-value cap.
+    #[error(
+        "predicate wire encoding {actual} bytes exceeds header cap {limit}"
+    )]
+    TooLarge {
+        /// Encoded byte length.
+        actual: usize,
+        /// Maximum permitted (`MAX_PREDICATE_RPC_HEADER_VALUE_LEN`).
+        limit: usize,
+    },
+}
+
+/// Errors raised by [`predicate_from_rpc_headers`].
+#[derive(Debug, thiserror::Error)]
+pub enum PredicateRpcDecodeError {
+    /// JSON parse failed on the header value.
+    #[error("predicate wire decode failed: {0}")]
+    Json(#[from] serde_json::Error),
+    /// Wire payload was structurally malformed (cycle, OOB index,
+    /// empty table).
+    #[error("predicate wire malformed: {0}")]
+    Wire(#[from] PredicateWireError),
+}
+
+/// Encode a [`Predicate`] for transport in an nRPC request header.
+///
+/// Returns the canonical header tuple `(name, json_bytes)`. The
+/// service handler reading the request looks up the header by
+/// name (`RPC_WHERE_HEADER`) and decodes via
+/// [`predicate_from_rpc_headers`].
+///
+/// Phase 5.B of `CAPABILITY_ENHANCEMENTS_PLAN.md`. Round-trip
+/// pinned in `predicate_rpc_header_round_trip_*` tests.
+pub fn predicate_to_rpc_header(
+    pred: &Predicate,
+) -> Result<(String, Vec<u8>), PredicateRpcEncodeError> {
+    let wire = pred.to_wire();
+    let bytes = serde_json::to_vec(&wire)?;
+    if bytes.len() > MAX_PREDICATE_RPC_HEADER_VALUE_LEN {
+        return Err(PredicateRpcEncodeError::TooLarge {
+            actual: bytes.len(),
+            limit: MAX_PREDICATE_RPC_HEADER_VALUE_LEN,
+        });
+    }
+    Ok((RPC_WHERE_HEADER.to_string(), bytes))
+}
+
+/// Extract and decode a [`Predicate`] from a request's headers,
+/// if a `cyberdeck-where` header is present.
+///
+/// Returns:
+///
+/// - `None` — no `cyberdeck-where` header. Service should default
+///   to "no filter" (return all rows).
+/// - `Some(Ok(pred))` — header present, decoded cleanly. Service
+///   filters its result stream against `pred`.
+/// - `Some(Err(_))` — header present but malformed JSON or
+///   structurally invalid wire payload. Service should reject the
+///   request with a typed error rather than silently ignoring;
+///   silent skip would let a misencoded filter return more rows
+///   than the caller expected, which is a confidentiality concern
+///   in some workloads.
+///
+/// The first matching header wins — duplicate headers under the
+/// same name are not coalesced.
+///
+/// Phase 5.B of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+pub fn predicate_from_rpc_headers<H>(
+    headers: &[H],
+) -> Option<Result<Predicate, PredicateRpcDecodeError>>
+where
+    H: AsRpcHeader,
+{
+    let value = headers
+        .iter()
+        .find(|h| h.name() == RPC_WHERE_HEADER)?
+        .value();
+    let result = serde_json::from_slice::<PredicateWire>(value)
+        .map_err(PredicateRpcDecodeError::Json)
+        .and_then(|wire| wire.into_predicate().map_err(PredicateRpcDecodeError::Wire));
+    Some(result)
+}
+
+/// Adapter trait letting [`predicate_from_rpc_headers`] consume any
+/// shape that exposes a `(name, value)` view. Generic over both
+/// `(String, Vec<u8>)` (the substrate's `RpcHeader` alias) and
+/// any binding-side wrapper that exposes name + value accessors.
+pub trait AsRpcHeader {
+    /// Header name (case-sensitive match against `RPC_WHERE_HEADER`).
+    fn name(&self) -> &str;
+    /// Header value bytes.
+    fn value(&self) -> &[u8];
+}
+
+impl AsRpcHeader for (String, Vec<u8>) {
+    fn name(&self) -> &str {
+        &self.0
+    }
+    fn value(&self) -> &[u8] {
+        &self.1
+    }
+}
+
+impl AsRpcHeader for &(String, Vec<u8>) {
+    fn name(&self) -> &str {
+        &self.0
+    }
+    fn value(&self) -> &[u8] {
+        &self.1
+    }
+}
+
+// =============================================================================
 // Constructors
 // =============================================================================
 
@@ -2410,5 +2572,189 @@ mod tests {
         assert_eq!(orig_planned, orig_unplanned);
         assert_eq!(rebuilt_planned, rebuilt_unplanned);
         assert_eq!(orig_planned, rebuilt_planned);
+    }
+
+    // ========================================================================
+    // nRPC envelope helpers — Phase 5.B of CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    #[test]
+    fn rpc_header_round_trip_preserves_predicate() {
+        // Pin the canonical happy path: predicate → header → headers
+        // table on the server side → decoded predicate. Service
+        // handlers will use exactly this flow.
+        let original = sample_complex_predicate();
+        let header = predicate_to_rpc_header(&original).expect("encode");
+        assert_eq!(header.0, RPC_WHERE_HEADER);
+
+        // Receiver: a Vec<RpcHeader>-shaped surface, with our
+        // `where:` header alongside others (trace context, etc.).
+        let headers = vec![
+            ("trace-id".to_string(), b"abc123".to_vec()),
+            header,
+            ("idempotency-key".to_string(), b"def456".to_vec()),
+        ];
+        let decoded = predicate_from_rpc_headers(&headers)
+            .expect("header present")
+            .expect("decode succeeds");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn rpc_header_missing_returns_none() {
+        // Service that doesn't see a `cyberdeck-where` header
+        // should treat the request as unfiltered. `None` is the
+        // signal; service defaults to "match all".
+        let headers = vec![
+            ("trace-id".to_string(), b"abc123".to_vec()),
+            ("idempotency-key".to_string(), b"def456".to_vec()),
+        ];
+        assert!(predicate_from_rpc_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn rpc_header_empty_returns_none() {
+        let headers: Vec<(String, Vec<u8>)> = Vec::new();
+        assert!(predicate_from_rpc_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn rpc_header_malformed_json_returns_decode_error() {
+        // Service receiving a `cyberdeck-where` header with garbage
+        // bytes should reject the request, not silently default to
+        // unfiltered. Silent fallback would let an attacker / bug
+        // return more rows than the caller intended.
+        let headers = vec![(RPC_WHERE_HEADER.to_string(), b"not-json".to_vec())];
+        let result = predicate_from_rpc_headers(&headers).unwrap();
+        assert!(
+            matches!(result, Err(PredicateRpcDecodeError::Json(_))),
+            "expected JSON decode error; got {result:?}",
+        );
+    }
+
+    #[test]
+    fn rpc_header_cycle_in_payload_returns_decode_error() {
+        // Defensive: a wire payload with a child-index cycle
+        // (legal JSON but structurally invalid) is rejected.
+        let bad_wire = PredicateWire {
+            nodes: vec![PredicateNodeWire::Not { child: 0 }],
+            root_idx: 0,
+        };
+        let bad_bytes = serde_json::to_vec(&bad_wire).unwrap();
+        let headers = vec![(RPC_WHERE_HEADER.to_string(), bad_bytes)];
+        let result = predicate_from_rpc_headers(&headers).unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(PredicateRpcDecodeError::Wire(
+                    PredicateWireError::CycleDetected { .. }
+                ))
+            ),
+            "expected wire cycle error; got {result:?}",
+        );
+    }
+
+    #[test]
+    fn rpc_header_first_match_wins_on_duplicate_headers() {
+        // Per the helper's documented contract: duplicate headers
+        // under `cyberdeck-where` are not coalesced; the first
+        // match wins. Pin so a future "merge duplicates" change
+        // is loud.
+        let pred_a = Predicate::Exists {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+        };
+        let pred_b = Predicate::MetadataEquals {
+            key: "intent".into(),
+            value: "ml-training".into(),
+        };
+        let header_a = predicate_to_rpc_header(&pred_a).unwrap();
+        let header_b = predicate_to_rpc_header(&pred_b).unwrap();
+        let headers = vec![header_a, header_b];
+        let decoded = predicate_from_rpc_headers(&headers).unwrap().unwrap();
+        assert_eq!(decoded, pred_a);
+    }
+
+    #[test]
+    fn rpc_header_oversize_predicate_rejected_at_encode() {
+        // A predicate that would exceed the header-value cap is
+        // rejected by `predicate_to_rpc_header` rather than being
+        // truncated / silently dropped. Caller decides how to
+        // surface this (split the predicate, simplify, or fail).
+        // Build a many-clause Or that overflows the 4 KB cap.
+        let mut clauses = Vec::new();
+        // ~30 chars of metadata key per clause; 200 clauses ≈ 6 KB JSON.
+        for i in 0..200 {
+            clauses.push(Predicate::MetadataEquals {
+                key: format!("very-long-metadata-key-{i:04}"),
+                value: format!("very-long-metadata-value-{i:04}"),
+            });
+        }
+        let huge = Predicate::Or(clauses);
+        let result = predicate_to_rpc_header(&huge);
+        assert!(
+            matches!(result, Err(PredicateRpcEncodeError::TooLarge { actual, limit })
+                if actual > limit && limit == MAX_PREDICATE_RPC_HEADER_VALUE_LEN),
+            "expected TooLarge; got {result:?}",
+        );
+    }
+
+    #[test]
+    fn rpc_header_typical_predicate_fits_well_under_cap() {
+        // Sanity bound: a representative predicate (5 leaves +
+        // some boolean composition) should encode well under
+        // the 4 KB cap. This is the load-bearing case for
+        // production use.
+        let pred = sample_complex_predicate();
+        let header = predicate_to_rpc_header(&pred).expect("encode");
+        // Should be well under the cap. Loose upper bound: 1 KB.
+        assert!(
+            header.1.len() < 1024,
+            "encoded predicate is {} bytes, expected < 1024",
+            header.1.len(),
+        );
+    }
+
+    #[test]
+    fn rpc_header_can_be_decoded_via_borrow_or_owned_tuple() {
+        // Pin: the `AsRpcHeader` trait accepts both `&(String, Vec<u8>)`
+        // and `(String, Vec<u8>)` so service handlers can iterate
+        // either an owned vec or a borrowed slice.
+        let pred = Predicate::Exists {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+        };
+        let header = predicate_to_rpc_header(&pred).unwrap();
+        let headers = vec![header];
+
+        // Owned slice.
+        let decoded_owned = predicate_from_rpc_headers(&headers).unwrap().unwrap();
+        assert_eq!(decoded_owned, pred);
+
+        // Borrow-collected slice.
+        let by_ref: Vec<&(String, Vec<u8>)> = headers.iter().collect();
+        let decoded_borrow = predicate_from_rpc_headers(&by_ref).unwrap().unwrap();
+        assert_eq!(decoded_borrow, pred);
+    }
+
+    #[test]
+    fn rpc_header_json_format_is_human_readable() {
+        // Pin the wire format as JSON (not postcard) so cross-
+        // binding fixtures and tcpdump captures are diff-able.
+        // Phase 9b of CAPABILITY_SYSTEM_SDK_PLAN.md uses this same
+        // shape for the `predicate_nrpc_envelope.json` fixture.
+        let pred = Predicate::MetadataEquals {
+            key: "intent".into(),
+            value: "ml-training".into(),
+        };
+        let header = predicate_to_rpc_header(&pred).unwrap();
+        let json = std::str::from_utf8(&header.1).expect("JSON is UTF-8");
+        assert!(
+            json.contains("\"kind\":\"metadata_equals\""),
+            "unexpected JSON shape: {json}",
+        );
+        assert!(json.contains("\"key\":\"intent\""), "missing key: {json}");
+        assert!(
+            json.contains("\"value\":\"ml-training\""),
+            "missing value: {json}",
+        );
     }
 }
