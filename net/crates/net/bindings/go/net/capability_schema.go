@@ -396,6 +396,15 @@ func ValidateCapabilitiesAgainst(
 	caps CapabilitySetWire,
 	schema *AxisSchema,
 ) ValidationReport {
+	// R3: nil schema → fall back to the canonical schema. The
+	// validateAxisKey / metadata-reservation walks below all
+	// dereference `schema`; passing nil would panic. Coercing
+	// to the canonical schema matches what `ValidateCapabilities`
+	// (the public entry point with no schema arg) does and gives
+	// callers who pass nil the same shape as the no-arg variant.
+	if schema == nil {
+		schema = &AxisSchemaCanonical
+	}
 	errors := []SchemaError{}
 	warnings := []ValidationWarning{}
 
