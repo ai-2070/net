@@ -756,6 +756,29 @@ impl ProximityGraph {
         })
     }
 
+    /// Lowest-RTT node that satisfies `predicate`, returned as a
+    /// [`Duration`]. Phase F slice 4 of `CAPABILITY_SYSTEM_PLAN.md`
+    /// §7a — used by `StandardPlacement`'s scope-attraction scoring
+    /// (slice 5) and by Phase E of `REDEX_DISTRIBUTED_PLAN.md`.
+    ///
+    /// Scans every node, picks the one with the lowest
+    /// `latency_us` field where `predicate(node)` returns true.
+    /// Returns `None` when no node matches the predicate.
+    /// Available + non-available nodes are both considered — the
+    /// caller's predicate decides which subset matters.
+    ///
+    /// Direct lookup variant: pass `|n| n.node_id == target` to
+    /// fetch the RTT to a specific candidate (used by the
+    /// placement tie-breaker).
+    pub fn nearest_rtt(&self, predicate: impl Fn(&ProximityNode) -> bool) -> Option<Duration> {
+        self.nodes
+            .iter()
+            .filter(|r| predicate(r.value()))
+            .map(|r| r.latency_us)
+            .min()
+            .map(Duration::from_micros)
+    }
+
     /// Find k best nodes for a capability filter
     pub fn find_k_best(&self, filter: &CapabilityFilter, k: usize) -> Vec<ProximityNode> {
         let mut matching = self.find_matching(filter);

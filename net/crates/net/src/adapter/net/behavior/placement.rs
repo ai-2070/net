@@ -22,6 +22,7 @@
 //!   from two candidates is resolved via the locked
 //!   RTT → free-resource → lexicographic-NodeId chain.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::adapter::net::behavior::capability::{
@@ -635,6 +636,119 @@ impl IntentRegistry {
     }
 }
 
+// =============================================================================
+// Tie-breaker (slice 4) — `CAPABILITY_SYSTEM_PLAN.md` §7 LOCKED
+// three-step ordering: RTT → free-resource → lexicographic NodeId.
+//
+// `tie_break_compare(a, b, ctx)` is the resolver. Used by the
+// scheduler (Phase G slice 1) when `placement_score` returns equal
+// `f32` values across multiple candidates; ALSO usable as a primary
+// comparator after dropping the score axis (e.g. when
+// `LegacyPlacement` returns `Some(1.0)` for everyone).
+//
+// Pinned property: deterministic across runs. Replaces the legacy
+// `partial_cmp(...).unwrap_or(Ordering::Equal)` non-determinism in
+// `compute/scheduler.rs` once Phase G slice 1 swaps call sites.
+// =============================================================================
+
+/// Closure-based RTT lookup. Returns microsecond-resolution RTT for
+/// a given candidate, or `None` if not measured. Decouples the
+/// placement module from the proximity graph's internal node-id
+/// representation (`[u8; 32]`) — scheduler call sites that have
+/// the bridge available wire a `|u64| -> Option<u64>` closure that
+/// translates and consults the graph.
+///
+/// Trait alias rather than free Fn so the context struct can hold
+/// a `&dyn` to it without dragging Fn lifetimes through.
+pub trait RttLookup: Fn(NodeId) -> Option<u64> + Sync {}
+impl<F: Fn(NodeId) -> Option<u64> + Sync> RttLookup for F {}
+
+/// Inputs the tie-breaker reads.
+///
+/// `rtt_lookup` is optional: scheduler call sites without proximity
+/// data (e.g. early bootstrap, tests) pass `None` and step 1 falls
+/// through. `index` is required for step 2 — free-resource lookup
+/// (slice 5 fills in; slice 4 stubs to 0 so step 2 always falls
+/// through to step 3).
+pub struct TieBreakContext<'a> {
+    /// Optional callback that resolves a `NodeId` to its
+    /// microsecond-RTT estimate. Scheduler integrations wire this
+    /// with their proximity-graph bridge; `None` skips step 1.
+    pub rtt_lookup: Option<&'a dyn RttLookup>,
+    /// Capability index for the free-resource step (slice 5 reads
+    /// `hardware.memory_mb` / `dataforts.free_storage_gb` etc.
+    /// off the indexed caps).
+    pub index: &'a CapabilityIndex,
+    /// Which resource pool the free-resource step scores. Mirrors
+    /// `StandardPlacement::resource_axis`.
+    pub resource_axis: ResourceAxis,
+}
+
+/// Three-step tie-break comparator. LOCKED ordering per
+/// `CAPABILITY_SYSTEM_PLAN.md` §7 "Tie-breaking":
+///
+/// 1. **Lower RTT wins.** Looked up via `ProximityGraph` if
+///    available. A candidate with no RTT entry sorts AFTER one
+///    that has data (data > no-data).
+/// 2. **Higher free resource wins.** Slice 4 stubs both candidates
+///    to `0` so step 2 falls through; slice 5 fills in based on
+///    `ctx.resource_axis`.
+/// 3. **Lexicographic `NodeId`.** Final deterministic fallback;
+///    eliminates the non-determinism the legacy
+///    `partial_cmp(...).unwrap_or(Ordering::Equal)` exhibited.
+///
+/// Returns `Ordering::Less` when `a` is *better* than `b` — sort
+/// the candidates with `Vec::sort_by` and the best lands first.
+/// Comparing `a` against itself returns `Ordering::Equal`.
+pub fn tie_break_compare(a: NodeId, b: NodeId, ctx: &TieBreakContext<'_>) -> Ordering {
+    if a == b {
+        return Ordering::Equal;
+    }
+
+    // Step 1: RTT — lower wins. Lookup is delegated to the
+    // caller-provided closure so the placement module stays
+    // decoupled from the proximity graph's internal node-id shape;
+    // missing entries sort after present entries (so an unreached
+    // candidate doesn't accidentally win on a 0 fallback).
+    if let Some(lookup) = ctx.rtt_lookup {
+        let a_rtt = lookup(a);
+        let b_rtt = lookup(b);
+        match (a_rtt, b_rtt) {
+            (Some(ar), Some(br)) if ar != br => return ar.cmp(&br),
+            (Some(_), None) => return Ordering::Less,
+            (None, Some(_)) => return Ordering::Greater,
+            _ => {} // both Some-equal or both None → fall through.
+        }
+    }
+
+    // Step 2: free resource — higher wins. Slice 4 stub returns 0
+    // for both; slice 5 wires per-axis lookups. Note: descending
+    // order, so `b_free.cmp(&a_free)`.
+    let a_free = free_resource_for(a, ctx);
+    let b_free = free_resource_for(b, ctx);
+    if a_free != b_free {
+        return b_free.cmp(&a_free);
+    }
+
+    // Step 3: lex NodeId fallback. Always produces a strict ordering
+    // for distinct NodeIds.
+    a.cmp(&b)
+}
+
+/// Free-resource lookup. Slice 4 stub returns 0 for every candidate
+/// — step 2 of `tie_break_compare` falls through to step 3 in this
+/// state. Slice 5 reads the actual free-resource tags off the
+/// candidate's `CapabilitySet`:
+///
+/// - `ResourceAxis::Compute` → free RAM (or VRAM if the artifact
+///   required GPU; threaded via the artifact, not via this
+///   helper).
+/// - `ResourceAxis::Storage` → `dataforts.free_storage_gb`.
+/// - `ResourceAxis::Both` → weighted average (axis-side decision).
+fn free_resource_for(_node: NodeId, _ctx: &TieBreakContext<'_>) -> u64 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,6 +1137,174 @@ mod tests {
             !reqs.iter().all(|rc| rc.evaluate(&ctx_b)),
             "candidate without vram threshold doesn't satisfy ml-training"
         );
+    }
+
+    // ====================================================================
+    // Phase F slice 4: tie-breaker
+    // ====================================================================
+
+    /// Helper: synthetic RTT lookup with a static map. Decouples
+    /// tie-breaker tests from the proximity graph; substrate
+    /// scheduler integrations supply a real closure that consults
+    /// `ProximityGraph` (post-Phase-G when the u64↔[u8;32] bridge
+    /// is wired).
+    fn rtt_map(entries: &'static [(NodeId, u64)]) -> impl Fn(NodeId) -> Option<u64> + Sync {
+        |id: NodeId| entries.iter().find(|(n, _)| *n == id).map(|(_, rtt)| *rtt)
+    }
+
+    /// Step 1 — RTT: lower wins. With both candidates having RTT
+    /// data, the comparator picks the lower-latency one as `Less`
+    /// (i.e. better, sorts first).
+    #[test]
+    fn tie_break_step_1_rtt_lower_wins() {
+        let index = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let lookup = rtt_map(&[(0x1111, 5_000), (0x2222, 50_000)]);
+        let ctx = TieBreakContext {
+            rtt_lookup: Some(&lookup),
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        assert_eq!(tie_break_compare(0x1111, 0x2222, &ctx), Ordering::Less);
+        assert_eq!(tie_break_compare(0x2222, 0x1111, &ctx), Ordering::Greater);
+    }
+
+    /// Step 1 short-circuit: a candidate with RTT data sorts before
+    /// one without. Pin so an unreached peer doesn't win on a 0
+    /// fallback.
+    #[test]
+    fn tie_break_step_1_present_rtt_beats_missing() {
+        let index = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let lookup = rtt_map(&[(0x1111, 10_000)]);
+        let ctx = TieBreakContext {
+            rtt_lookup: Some(&lookup),
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        assert_eq!(
+            tie_break_compare(0x1111, 0x2222, &ctx),
+            Ordering::Less,
+            "candidate with RTT data must sort before one without",
+        );
+        assert_eq!(
+            tie_break_compare(0x2222, 0x1111, &ctx),
+            Ordering::Greater,
+        );
+    }
+
+    /// `rtt_lookup = None` skips step 1 — falls through to step 2
+    /// (slice 4 stub) → step 3 (lex NodeId fallback).
+    #[test]
+    fn tie_break_falls_through_to_lex_node_id_when_no_rtt_lookup() {
+        let index = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let ctx = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        // 0x1111 < 0x2222 lexicographically → 0x1111 wins.
+        assert_eq!(tie_break_compare(0x1111, 0x2222, &ctx), Ordering::Less);
+        assert_eq!(tie_break_compare(0x2222, 0x1111, &ctx), Ordering::Greater);
+    }
+
+    /// Identity: comparing a candidate to itself returns Equal.
+    #[test]
+    fn tie_break_self_compare_is_equal() {
+        let index = index_with(&[(0x1111, empty_caps())]);
+        let ctx = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        assert_eq!(tie_break_compare(0x1111, 0x1111, &ctx), Ordering::Equal);
+    }
+
+    /// Determinism: comparing the same pair twice produces the same
+    /// answer. Pin so a future free-resource impl that uses
+    /// non-deterministic data (e.g. random sample) must snapshot.
+    #[test]
+    fn tie_break_is_deterministic_across_repeated_calls() {
+        let index = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let lookup = rtt_map(&[(0x1111, 5_000), (0x2222, 50_000)]);
+        let ctx = TieBreakContext {
+            rtt_lookup: Some(&lookup),
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        let first = tie_break_compare(0x1111, 0x2222, &ctx);
+        for _ in 0..16 {
+            assert_eq!(tie_break_compare(0x1111, 0x2222, &ctx), first);
+        }
+    }
+
+    /// Step 2 stub returns 0 for both candidates → step 3 (lex
+    /// NodeId) resolves equal-RTT pairs. Pin via a lookup that
+    /// reports identical RTT for two distinct candidates.
+    #[test]
+    fn tie_break_equal_rtt_falls_through_to_lex_node_id() {
+        let index = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let lookup = rtt_map(&[(0x1111, 10_000), (0x2222, 10_000)]);
+        let ctx = TieBreakContext {
+            rtt_lookup: Some(&lookup),
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        assert_eq!(tie_break_compare(0x1111, 0x2222, &ctx), Ordering::Less);
+    }
+
+    /// `ProximityGraph::nearest_rtt` returns the lowest-RTT node
+    /// matching the predicate. Pin the proximity-API contract
+    /// slice 5's scope-attraction scoring depends on. Uses the
+    /// proximity graph directly (the API lives there, separate
+    /// from the placement tie-breaker).
+    #[test]
+    fn nearest_rtt_returns_lowest_matching_peer() {
+        use crate::adapter::net::behavior::proximity::{
+            EnhancedPingwave, ProximityConfig, ProximityGraph,
+        };
+        use std::net::SocketAddr;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fn now_us() -> u64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64
+        }
+        fn nid(n: u8) -> [u8; 32] {
+            let mut id = [0u8; 32];
+            id[0] = n;
+            id
+        }
+
+        let my = nid(0xFF);
+        let graph = ProximityGraph::new(my, ProximityConfig::default());
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let now = now_us();
+
+        let mut pw_a = EnhancedPingwave::new(nid(1), 1, 3);
+        pw_a.origin_timestamp_us = now.saturating_sub(5_000);
+        graph.on_pingwave(pw_a, addr);
+
+        let mut pw_b = EnhancedPingwave::new(nid(2), 1, 3);
+        pw_b.origin_timestamp_us = now.saturating_sub(50_000);
+        graph.on_pingwave(pw_b, addr);
+
+        // Match all peers — should return the lower latency
+        // (~5 ms — but skewed by wall-clock; allow a generous
+        // window below the slower peer's 50 ms).
+        let nearest = graph.nearest_rtt(|_| true).expect("at least one peer");
+        assert!(
+            nearest.as_micros() < 30_000,
+            "expected the lower-latency peer (~5 ms), got {nearest:?}",
+        );
+
+        // Predicate-restricted lookup. Only 0x02 candidate.
+        let only_b = graph.nearest_rtt(|n| n.node_id == nid(2));
+        assert!(only_b.is_some());
+
+        // No matching predicate → None.
+        let none = graph.nearest_rtt(|_| false);
+        assert!(none.is_none());
     }
 
     /// `Chain` and `Replica` artifacts pass through hard-constraint
