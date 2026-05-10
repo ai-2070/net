@@ -122,23 +122,28 @@ impl PlacementFilterRegistry {
         binding: impl Into<String>,
     ) -> bool {
         let binding = binding.into();
-        // CR-20: Pre-create the per-binding counter so reads from
-        // `invocations_by_binding` see `0` for newly-registered
-        // bindings rather than missing keys.
-        //
-        // Use `entry().or_insert_with()` instead of contains+insert
-        // so concurrent registers of the same new binding don't
-        // race: the previous shape had T1 and T2 both pass the
-        // `contains_key == false` check, both `insert` a fresh
-        // `AtomicU64::new(0)`, and the second insert overwrite
-        // whatever count the first had already accumulated via
-        // interleaved `get()` calls. Single atomic op now.
-        self.invocations
-            .entry(binding.clone())
-            .or_insert_with(|| AtomicU64::new(0));
         match self.filters.entry(id) {
             Entry::Occupied(_) => false,
             Entry::Vacant(slot) => {
+                // N-10: pre-create the per-binding counter ONLY on
+                // the success path. CR-20 originally moved this
+                // before the entry-check so concurrent registers
+                // of a new binding wouldn't race (T1 and T2 both
+                // pass `contains_key == false`, both insert a
+                // fresh `AtomicU64::new(0)`, second insert
+                // overwrites). The fix kept the race protection
+                // but ran the precreate unconditionally — including
+                // when the filter id collided with an existing
+                // entry — leaving a phantom binding-counter behind
+                // a registration that never succeeded.
+                //
+                // `entry().or_insert_with()` is still race-free
+                // (single atomic shard op); just gate it behind the
+                // `Vacant` arm so it only fires when we actually
+                // installed a filter under `binding`.
+                self.invocations
+                    .entry(binding.clone())
+                    .or_insert_with(|| AtomicU64::new(0));
                 slot.insert(RegisteredEntry { filter, binding });
                 true
             }
@@ -311,6 +316,36 @@ mod tests {
         };
         let got = reg.get("pf-1").unwrap();
         assert_eq!(got.placement_score(&0x1234, &artifact), Some(0.5));
+    }
+
+    /// N-10 regression: when `register` fails (id collision), the
+    /// per-binding invocation counter must NOT be pre-created.
+    /// Pre-fix the counter precreate ran unconditionally before the
+    /// id-occupancy check, leaving a phantom `binding=challenger`
+    /// label behind a registration that never succeeded.
+    #[test]
+    fn register_collision_does_not_pre_create_counter_for_failed_binding() {
+        let reg = PlacementFilterRegistry::new();
+        let original: Arc<dyn PlacementFilter> = Arc::new(FixedFilter(0.5));
+        let challenger: Arc<dyn PlacementFilter> = Arc::new(FixedFilter(0.9));
+
+        // First register succeeds under `binding=alpha`; counter
+        // for `alpha` gets pre-created.
+        assert!(reg.register("pf-1".into(), original, "alpha"));
+
+        // Second register collides on the same id but under a
+        // different binding label. Must return false AND must not
+        // leak a `beta` counter.
+        assert!(!reg.register("pf-1".into(), challenger, "beta"));
+
+        let invocations = reg.invocations_by_binding();
+        assert!(
+            !invocations.contains_key("beta"),
+            "failed register must not create a phantom binding counter; got {invocations:?}",
+        );
+        // The successful binding's counter exists at the expected
+        // zero baseline.
+        assert_eq!(invocations.get("alpha").copied(), Some(0));
     }
 
     /// `unregister` removes the entry and returns `true`; a
