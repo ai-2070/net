@@ -117,6 +117,103 @@ pub struct CallOptionsTyped {
 }
 
 // ============================================================================
+// Phase 9b — predicate-pushdown convenience.
+//
+// `with_where(p)` encodes a `Predicate` to JSON via the substrate's
+// `predicate_to_rpc_header` and pushes it into `CallOptions::request_headers`
+// under the `cyberdeck-where` header name. Servers that opt in read
+// it back via `RpcContextExt::where_predicate()`.
+// ============================================================================
+
+/// Extension methods for [`CallOptions`] adding caller-side
+/// predicate-pushdown helpers (Phase 9b of
+/// `CAPABILITY_SYSTEM_SDK_PLAN.md`).
+pub trait CallOptionsExt: Sized {
+    /// Append a raw `(name, value_bytes)` request header. Names
+    /// follow the lowercase `cyberdeck-*` / `nrpc-*` convention.
+    fn with_request_header(self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self;
+
+    /// Attach a [`Predicate`] as the `cyberdeck-where` request
+    /// header. The predicate rides as JSON-encoded `PredicateWire`
+    /// bytes per the substrate's `predicate_to_rpc_header` contract;
+    /// services opting into predicate-pushdown decode via
+    /// [`RpcContextExt::where_predicate`].
+    ///
+    /// Returns `Err` only on encode-budget overflow
+    /// (predicate JSON exceeds `MAX_PREDICATE_RPC_HEADER_VALUE_LEN`,
+    /// currently 64 KiB). Predicates from typical `pred!` macro use
+    /// are orders of magnitude smaller than the cap, so callers who
+    /// know their input is bounded can safely `.unwrap()`.
+    fn with_where(
+        self,
+        pred: &net::adapter::net::behavior::Predicate,
+    ) -> std::result::Result<Self, net::adapter::net::behavior::PredicateRpcEncodeError>;
+}
+
+impl CallOptionsExt for CallOptions {
+    fn with_request_header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+        self.request_headers.push((name.into(), value.into()));
+        self
+    }
+
+    fn with_where(
+        mut self,
+        pred: &net::adapter::net::behavior::Predicate,
+    ) -> std::result::Result<Self, net::adapter::net::behavior::PredicateRpcEncodeError> {
+        let (name, bytes) = net::adapter::net::behavior::predicate_to_rpc_header(pred)?;
+        self.request_headers.push((name, bytes));
+        Ok(self)
+    }
+}
+
+impl CallOptionsExt for CallOptionsTyped {
+    fn with_request_header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+        self.raw = self.raw.with_request_header(name, value);
+        self
+    }
+
+    fn with_where(
+        mut self,
+        pred: &net::adapter::net::behavior::Predicate,
+    ) -> std::result::Result<Self, net::adapter::net::behavior::PredicateRpcEncodeError> {
+        self.raw = self.raw.with_where(pred)?;
+        Ok(self)
+    }
+}
+
+/// Extension methods for [`RpcContext`] adding server-side
+/// predicate-pushdown helpers (Phase 9b of
+/// `CAPABILITY_SYSTEM_SDK_PLAN.md`).
+pub trait RpcContextExt {
+    /// Decode the caller's [`Predicate`] from the
+    /// `cyberdeck-where` request header, if present. Returns `None`
+    /// when the header is absent (the common case for callers that
+    /// don't issue predicate-pushdown queries) or `Some(Err(_))` if
+    /// the header is malformed.
+    fn where_predicate(
+        &self,
+    ) -> Option<
+        std::result::Result<
+            net::adapter::net::behavior::Predicate,
+            net::adapter::net::behavior::PredicateRpcDecodeError,
+        >,
+    >;
+}
+
+impl RpcContextExt for RpcContext {
+    fn where_predicate(
+        &self,
+    ) -> Option<
+        std::result::Result<
+            net::adapter::net::behavior::Predicate,
+            net::adapter::net::behavior::PredicateRpcDecodeError,
+        >,
+    > {
+        net::adapter::net::behavior::predicate_from_rpc_headers(&self.payload.headers)
+    }
+}
+
+// ============================================================================
 // Mesh SDK extensions — raw + typed nRPC surface.
 // ============================================================================
 

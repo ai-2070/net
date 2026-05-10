@@ -278,6 +278,36 @@ pinned by `predicate_nrpc_envelope.json`. A predicate authored in TS
 and passed to a Go service via nRPC headers decodes losslessly on the
 other end.
 
+#### Predicate-pushdown via `mesh.call`
+
+The Rust SDK ships an end-to-end predicate-pushdown path on top of
+nRPC (Phase 9b):
+
+```rust
+use net_sdk::mesh_rpc::{CallOptions, CallOptionsExt, RpcContext, RpcContextExt};
+
+// Caller side: attach the predicate as a `cyberdeck-where:` request
+// header. `with_where` returns `Result` because the predicate's
+// JSON encoding is bounded by `MAX_PREDICATE_RPC_HEADER_VALUE_LEN`.
+let opts = CallOptions::default()
+    .with_where(&pred)
+    .expect("predicate fits");
+
+// Server side: read the predicate from the request context.
+async fn handle(ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+    let pred = ctx.where_predicate()
+        .map(|r| r.expect("decode")) // None when absent; Err(_) on malformed wire
+        .unwrap_or_else(|| /* default: no filter */ Predicate::and(vec![]));
+    // ...filter result set against `pred`...
+}
+```
+
+The substrate's `CallOptions::request_headers` field carries
+arbitrary `(name, value)` pairs alongside the standard nRPC envelope;
+`with_where` is sugar over `with_request_header(RPC_WHERE_HEADER,
+predicate_to_rpc_header(p)?)`. Per-binding wrappers in TS / Python /
+Go expose the same `cyberdeck-where:` header convention.
+
 ### 6. New surface: validation
 
 `validate_capabilities(caps)` returns a `ValidationReport` flagging

@@ -132,6 +132,21 @@ pub struct CallOptions {
     /// (back-compat / pre-flow-control behavior). Ignored by
     /// non-streaming `call` / `call_service`.
     pub stream_window_initial: Option<u32>,
+    /// Caller-supplied request headers. Appended to the wire
+    /// `RpcRequestPayload::headers` after any auto-generated
+    /// headers (trace context, stream-window). Useful for
+    /// application-level metadata the server needs at
+    /// dispatch-time — e.g., the `cyberdeck-where` predicate
+    /// header (Phase 9b of `CAPABILITY_SYSTEM_SDK_PLAN.md`) that
+    /// services consult for predicate-pushdown filtering.
+    ///
+    /// Each entry is `(name, value_bytes)`. Names use the lowercase
+    /// `cyberdeck-*` / `nrpc-*` convention; the substrate doesn't
+    /// validate names beyond the `MAX_RPC_HEADER_NAME_LEN` cap
+    /// enforced at encode time.
+    ///
+    /// Default: empty.
+    pub request_headers: Vec<(String, Vec<u8>)>,
 }
 
 impl Default for CallOptions {
@@ -143,6 +158,7 @@ impl Default for CallOptions {
             trace_context: None,
             max_in_flight_per_target: 64,
             stream_window_initial: None,
+            request_headers: Vec::new(),
         }
     }
 }
@@ -802,6 +818,9 @@ impl MeshNode {
                 window.to_string().into_bytes(),
             ));
         }
+        // Append caller-supplied request headers (Phase 9b — same
+        // semantics as the unary `call` path).
+        headers.extend(opts.request_headers.iter().cloned());
         let req = RpcRequestPayload {
             service: service.to_string(),
             deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
@@ -1063,10 +1082,17 @@ impl MeshNode {
         // emit `traceparent` / `tracestate` headers and signal
         // via `FLAG_RPC_PROPAGATE_TRACE` so the server's fold
         // populates `RpcContext::trace_context`.
-        let (flags, headers) = match opts.trace_context.as_ref() {
+        let (flags, mut headers) = match opts.trace_context.as_ref() {
             Some(tc) => (FLAG_RPC_PROPAGATE_TRACE, build_trace_headers(tc)),
             None => (0u16, Vec::new()),
         };
+        // Append caller-supplied request headers (e.g. the
+        // `cyberdeck-where` predicate header for Phase 9b
+        // predicate-pushdown). Auto-generated headers come first
+        // so name collisions resolve to caller-overrides via the
+        // server-side `predicate_from_rpc_headers` first-match
+        // semantics.
+        headers.extend(opts.request_headers.iter().cloned());
         let req = RpcRequestPayload {
             service: service.to_string(),
             deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
