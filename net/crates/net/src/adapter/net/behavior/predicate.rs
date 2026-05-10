@@ -812,6 +812,113 @@ impl AsRpcHeader for &(String, Vec<u8>) {
 }
 
 // =============================================================================
+// Service-side row filter ergonomics — Phase 5.B follow-on of
+// CAPABILITY_ENHANCEMENTS_PLAN.md.
+//
+// The Phase 5.B helpers (`predicate_to_rpc_header` /
+// `predicate_from_rpc_headers`) move predicates across the wire,
+// but service handlers still have to manually construct an
+// `EvalContext` per row and dispatch through `Predicate::evaluate`.
+// These helpers close that gap:
+//
+//   - `Predicate::matches_capability_set(caps)` — single-row match
+//     against a `CapabilitySet`.
+//   - `RpcPredicateContext` trait — application rows expose tags +
+//     metadata for predicate evaluation.
+//   - `filter_by_predicate(rows, pred)` — iterator combinator that
+//     skips rows the predicate filters out.
+//
+// All three handle the `Option<&Predicate>` shape returned by
+// `predicate_from_rpc_headers` ergonomically — `None` means "no
+// filter, all rows match".
+// =============================================================================
+
+impl Predicate {
+    /// True if this predicate evaluates to true against the
+    /// given [`CapabilitySet`]'s tags + metadata.
+    ///
+    /// Materializes `caps.tags` (a `HashSet<Tag>`) as a `Vec<Tag>`
+    /// for the slice-based `EvalContext`. The cost is a single
+    /// allocation per call; for hot loops over many capability
+    /// sets, callers may prefer to materialize tags once and
+    /// invoke [`Self::evaluate`] directly.
+    pub fn matches_capability_set(
+        &self,
+        caps: &crate::adapter::net::behavior::CapabilitySet,
+    ) -> bool {
+        let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
+        let ctx = EvalContext::new(&tags, &caps.metadata);
+        self.evaluate(&ctx)
+    }
+}
+
+/// Application-row adapter for predicate evaluation.
+///
+/// Service handlers that filter custom row types (training jobs,
+/// documents, sensor readings, …) implement this trait on their
+/// row to expose tags + metadata to the predicate. The
+/// [`filter_by_predicate`] helper then provides a one-line
+/// filter pattern over any iterator of `RpcPredicateContext` rows.
+///
+/// Phase 5.B follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+///
+/// ```ignore
+/// struct TrainingJob {
+///     tags: Vec<Tag>,
+///     metadata: BTreeMap<String, String>,
+///     payload: ...,
+/// }
+///
+/// impl RpcPredicateContext for TrainingJob {
+///     fn rpc_predicate_tags(&self) -> &[Tag] { &self.tags }
+///     fn rpc_predicate_metadata(&self) -> &BTreeMap<String, String> {
+///         &self.metadata
+///     }
+/// }
+/// ```
+pub trait RpcPredicateContext {
+    /// Tags the predicate's axis-keyed clauses match against.
+    fn rpc_predicate_tags(&self) -> &[Tag];
+    /// Metadata the predicate's metadata-keyed clauses match against.
+    fn rpc_predicate_metadata(&self) -> &BTreeMap<String, String>;
+}
+
+/// Filter `rows` by an optional predicate.
+///
+/// `pred = None` returns all rows (the no-filter case — the
+/// caller's request didn't include a `cyberdeck-where` header).
+/// `pred = Some(p)` returns only rows where `p` evaluates to true
+/// against the row's tags + metadata.
+///
+/// Service handler usage:
+///
+/// ```ignore
+/// let pred_opt = predicate_from_rpc_headers(&request.headers).transpose()?;
+/// let matched: Vec<TrainingJob> =
+///     filter_by_predicate(jobs, pred_opt.as_ref()).collect();
+/// ```
+///
+/// Phase 5.B follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+pub fn filter_by_predicate<R, I>(
+    rows: I,
+    pred: Option<&Predicate>,
+) -> impl Iterator<Item = R> + '_
+where
+    R: RpcPredicateContext,
+    I: IntoIterator<Item = R>,
+    I::IntoIter: 'static,
+{
+    rows.into_iter().filter(move |row| match pred {
+        None => true,
+        Some(p) => {
+            let ctx =
+                EvalContext::new(row.rpc_predicate_tags(), row.rpc_predicate_metadata());
+            p.evaluate(&ctx)
+        }
+    })
+}
+
+// =============================================================================
 // Constructors
 // =============================================================================
 
@@ -3074,6 +3181,246 @@ mod tests {
         let cx = ctx(&tags, &meta);
 
         assert_eq!(pred.evaluate_with_index(&cx, &index), pred.evaluate(&cx));
+    }
+
+    // ========================================================================
+    // Service-side row filter ergonomics — Phase 5.B follow-on of
+    // CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    #[test]
+    fn matches_capability_set_evaluates_against_caps_tags_and_metadata() {
+        // Pin: `Predicate::matches_capability_set` is a one-line
+        // entry point for "does this CapabilitySet match this
+        // predicate?". Internally materializes caps.tags as a Vec
+        // for the slice-based EvalContext.
+        let pred = Predicate::And(vec![
+            Predicate::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+            },
+            Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+        ]);
+
+        // Match: caps has both tag and metadata.
+        let caps_match = CapabilitySet::new()
+            .with_hardware(
+                HardwareCapabilities::new()
+                    .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
+            )
+            .with_metadata("intent", "ml-training");
+        assert!(pred.matches_capability_set(&caps_match));
+
+        // Miss on the metadata side.
+        let caps_miss_meta = CapabilitySet::new().with_hardware(
+            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
+        );
+        assert!(!pred.matches_capability_set(&caps_miss_meta));
+
+        // Miss on the tag side.
+        let caps_miss_tag = CapabilitySet::new().with_metadata("intent", "ml-training");
+        assert!(!pred.matches_capability_set(&caps_miss_tag));
+
+        // Empty caps don't match.
+        assert!(!pred.matches_capability_set(&CapabilitySet::default()));
+    }
+
+    /// Application row type used to exercise `RpcPredicateContext`
+    /// + `filter_by_predicate`. Mirrors what a service handler's
+    /// row would look like.
+    struct TestJob {
+        id: u64,
+        tags: Vec<Tag>,
+        metadata: BTreeMap<String, String>,
+    }
+
+    impl RpcPredicateContext for TestJob {
+        fn rpc_predicate_tags(&self) -> &[Tag] {
+            &self.tags
+        }
+        fn rpc_predicate_metadata(&self) -> &BTreeMap<String, String> {
+            &self.metadata
+        }
+    }
+
+    #[test]
+    fn filter_by_predicate_returns_all_rows_when_predicate_is_none() {
+        // Pin: `pred = None` is the no-filter case (request didn't
+        // include `cyberdeck-where`). Every row passes through.
+        let jobs = vec![
+            TestJob {
+                id: 1,
+                tags: vec![],
+                metadata: BTreeMap::new(),
+            },
+            TestJob {
+                id: 2,
+                tags: vec![axis_present(TaxonomyAxis::Hardware, "gpu")],
+                metadata: BTreeMap::new(),
+            },
+        ];
+        let filtered: Vec<u64> =
+            filter_by_predicate(jobs, None).map(|j| j.id).collect();
+        assert_eq!(filtered, vec![1, 2]);
+    }
+
+    #[test]
+    fn filter_by_predicate_keeps_only_matching_rows() {
+        // Pin: with a predicate set, only rows whose tags +
+        // metadata satisfy it survive the filter.
+        let pred = Predicate::Exists {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+        };
+        let jobs = vec![
+            TestJob {
+                id: 1,
+                tags: vec![],
+                metadata: BTreeMap::new(),
+            },
+            TestJob {
+                id: 2,
+                tags: vec![axis_present(TaxonomyAxis::Hardware, "gpu")],
+                metadata: BTreeMap::new(),
+            },
+            TestJob {
+                id: 3,
+                tags: vec![axis_eq(TaxonomyAxis::Hardware, "gpu.vendor", "nvidia")],
+                metadata: BTreeMap::new(),
+            },
+            TestJob {
+                id: 4,
+                tags: vec![
+                    axis_present(TaxonomyAxis::Hardware, "gpu"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "65536"),
+                ],
+                metadata: BTreeMap::new(),
+            },
+        ];
+        let filtered: Vec<u64> = filter_by_predicate(jobs, Some(&pred))
+            .map(|j| j.id)
+            .collect();
+        // Only ids 2 and 4 have the gpu presence tag.
+        assert_eq!(filtered, vec![2, 4]);
+    }
+
+    #[test]
+    fn filter_by_predicate_combined_axis_and_metadata_clauses() {
+        // Pin: predicates with both axis-tag AND metadata clauses
+        // work end-to-end through the filter helper. Mirrors the
+        // canonical "where: gpu AND intent = ml-training" use case.
+        let pred = Predicate::And(vec![
+            Predicate::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+            },
+            Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+        ]);
+        let jobs = vec![
+            TestJob {
+                id: 1,
+                tags: vec![axis_present(TaxonomyAxis::Hardware, "gpu")],
+                metadata: meta_with(&[("intent", "embedding-cache")]),
+            },
+            TestJob {
+                id: 2,
+                tags: vec![axis_present(TaxonomyAxis::Hardware, "gpu")],
+                metadata: meta_with(&[("intent", "ml-training")]),
+            },
+            TestJob {
+                id: 3,
+                tags: vec![],
+                metadata: meta_with(&[("intent", "ml-training")]),
+            },
+        ];
+        let filtered: Vec<u64> = filter_by_predicate(jobs, Some(&pred))
+            .map(|j| j.id)
+            .collect();
+        // Only id 2 has both gpu AND intent=ml-training.
+        assert_eq!(filtered, vec![2]);
+    }
+
+    #[test]
+    fn filter_by_predicate_empty_input_yields_empty_iterator() {
+        let pred = Predicate::Exists {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+        };
+        let jobs: Vec<TestJob> = Vec::new();
+        let filtered: Vec<u64> = filter_by_predicate(jobs, Some(&pred))
+            .map(|j| j.id)
+            .collect();
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn end_to_end_predicate_pushdown_flow() {
+        // Pin the canonical Phase 5.B usage: client builds a
+        // predicate, encodes to an RPC header, server decodes and
+        // filters its row stream. This is the load-bearing
+        // workflow Phase 5.B exists for.
+
+        // Client side: build predicate, encode.
+        let pred = Predicate::And(vec![
+            Predicate::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+            },
+            Predicate::NumericAtLeast {
+                key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+                threshold: 32768.0,
+            },
+        ]);
+        let encoded = predicate_to_rpc_header(&pred).expect("encode");
+
+        // Server side: receive request with this header alongside
+        // standard tracing/idempotency keys. Decode the predicate.
+        let request_headers = vec![
+            ("trace-id".to_string(), b"abc123".to_vec()),
+            encoded,
+            ("idempotency-key".to_string(), b"def456".to_vec()),
+        ];
+        let decoded_pred = predicate_from_rpc_headers(&request_headers)
+            .expect("header present")
+            .expect("decode");
+
+        // Server side: filter the row stream.
+        let jobs = vec![
+            TestJob {
+                id: 1, // No GPU.
+                tags: vec![axis_eq(TaxonomyAxis::Hardware, "memory_mb", "65536")],
+                metadata: BTreeMap::new(),
+            },
+            TestJob {
+                id: 2, // GPU + 32 GB → matches.
+                tags: vec![
+                    axis_present(TaxonomyAxis::Hardware, "gpu"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "32768"),
+                ],
+                metadata: BTreeMap::new(),
+            },
+            TestJob {
+                id: 3, // GPU + 16 GB → too little memory.
+                tags: vec![
+                    axis_present(TaxonomyAxis::Hardware, "gpu"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "16384"),
+                ],
+                metadata: BTreeMap::new(),
+            },
+            TestJob {
+                id: 4, // GPU + 65 GB → matches.
+                tags: vec![
+                    axis_present(TaxonomyAxis::Hardware, "gpu"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "65536"),
+                ],
+                metadata: BTreeMap::new(),
+            },
+        ];
+        let matched: Vec<u64> = filter_by_predicate(jobs, Some(&decoded_pred))
+            .map(|j| j.id)
+            .collect();
+        assert_eq!(matched, vec![2, 4]);
     }
 
     #[test]
