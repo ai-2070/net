@@ -201,6 +201,39 @@ describe('default schema usage', () => {
   });
 });
 
+// Q10: indexed-collection index must fit in u32. The substrate
+// parses `<axis>.<prefix><i>.<sub>` with `<i>` as `u32`; values
+// above `u32::MAX` (4294967295) get rejected as IndexMalformed.
+// Pre-fix the TS regex `/^\d+$/` admitted any digit string,
+// silently passing payloads the substrate would later reject.
+describe('regression: indexed collection index must fit u32', () => {
+  it('rejects an index above u32::MAX as IndexMalformed', () => {
+    // u32::MAX + 1 = 4294967296.
+    const caps: CapabilitySetWire = {
+      tags: ['software.model.4294967296.id=foo'],
+      metadata: {},
+    };
+    const report = validateCapabilities(caps);
+    const malformed = report.errors.find(
+      (e) =>
+        e.kind === 'index_malformed' &&
+        (e as { index: string }).index === '4294967296',
+    );
+    expect(malformed).toBeDefined();
+  });
+
+  it('accepts u32::MAX itself', () => {
+    const caps: CapabilitySetWire = {
+      tags: ['software.model.4294967295.id=ok'],
+      metadata: {},
+    };
+    const report = validateCapabilities(caps);
+    expect(
+      report.errors.find((e) => e.kind === 'index_malformed'),
+    ).toBeUndefined();
+  });
+});
+
 // P2-H: mirror substrate CR-14 reserved-metadata warnings.
 // The schema declares `metadataReserved` (exact-match) and
 // `metadataReservedPrefixes` (prefix-match) but pre-fix the TS

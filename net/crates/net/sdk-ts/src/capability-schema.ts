@@ -327,7 +327,18 @@ function validateAxisKey(
       if (dot < 0) continue;
       const idx = rest.slice(0, dot);
       const sub = rest.slice(dot + 1);
-      if (!/^\d+$/.test(idx)) {
+      // Q10: substrate parses the index as `u32`; strings of digits
+      // longer than `u32::MAX` (e.g. `"4294967296"`, 2^32) are
+      // accepted by the TS regex but rejected by the substrate as
+      // `IndexMalformed`. Mirror the u32 range so client-side
+      // validation doesn't silently pass payloads the substrate
+      // would later reject.
+      const idxNum = Number(idx);
+      if (
+        !/^\d+$/.test(idx) ||
+        !Number.isInteger(idxNum) ||
+        idxNum > 0xffff_ffff
+      ) {
         errors.push({
           kind: 'index_malformed',
           axis,
