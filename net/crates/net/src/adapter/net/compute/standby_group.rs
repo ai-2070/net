@@ -22,6 +22,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::adapter::net::behavior::metadata::NodeId;
+use crate::adapter::net::behavior::placement::{Artifact, PlacementFilter, TieBreakContext};
 use crate::adapter::net::compute::daemon::{DaemonHostConfig, MeshDaemon};
 use crate::adapter::net::compute::group_coord::{
     GroupCoordinator, GroupError, GroupHealth, MemberInfo,
@@ -457,6 +458,316 @@ impl StandbyGroup {
             self.members[index as usize].synced_through = 0;
             self.members[index as usize].last_sync = None;
             exclude.insert(placement.node_id);
+        }
+
+        Ok(new_active)
+    }
+
+    /// Phase G slice 7 — `spawn` with score-based placement. Routes
+    /// every member's placement decision through
+    /// [`GroupCoordinator::place_member`].
+    ///
+    /// Member 0 is still the initial active; remaining members are
+    /// standbys. Spread invariant preserved (each member on a
+    /// distinct node).
+    pub fn spawn_with_placement<F>(
+        config: StandbyGroupConfig,
+        daemon_factory: F,
+        scheduler: &Scheduler,
+        registry: &DaemonRegistry,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+    ) -> Result<Self, GroupError>
+    where
+        F: Fn() -> Box<dyn MeshDaemon>,
+    {
+        if config.member_count < 2 {
+            return Err(GroupError::InvalidConfig(
+                "standby group requires at least 2 members".into(),
+            ));
+        }
+
+        let group_id = {
+            use xxhash_rust::xxh3::xxh3_64;
+            xxh3_64(&config.group_seed) as u32
+        };
+
+        let mut coord = GroupCoordinator::new(Strategy::RoundRobin);
+        let mut members = Vec::with_capacity(config.member_count as usize);
+        let mut used_nodes: HashSet<u64> = HashSet::new();
+
+        // Capture the daemon's capability surface once.
+        let prototype = daemon_factory();
+        let requirements = prototype.requirements();
+        let required = prototype.required_capabilities();
+        let optional = prototype.optional_capabilities();
+        drop(prototype);
+
+        for index in 0..config.member_count {
+            let keypair = super::replica_group::derive_replica_keypair(&config.group_seed, index);
+            let origin_hash = keypair.origin_hash();
+            let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
+            let keypair_secret = *keypair.secret_bytes();
+
+            let artifact = Artifact::Daemon {
+                daemon_id: entity_id_bytes,
+                required: &required,
+                optional: &optional,
+            };
+
+            let decision = GroupCoordinator::place_member(
+                scheduler,
+                &artifact,
+                &requirements,
+                &used_nodes,
+                placement,
+                tie_break,
+            )?;
+            let node_id = decision.node_id;
+            used_nodes.insert(node_id);
+
+            let daemon = daemon_factory();
+            let host = DaemonHost::new(daemon, keypair, config.host_config.clone());
+            registry.register(host)?;
+
+            coord.add_member(MemberInfo {
+                index,
+                origin_hash,
+                node_id,
+                entity_id_bytes,
+                healthy: true,
+            });
+
+            let role = if index == 0 {
+                MemberRole::Active
+            } else {
+                MemberRole::Standby
+            };
+
+            members.push(StandbyInfo {
+                index,
+                role,
+                synced_through: 0,
+                last_sync: None,
+                keypair_secret,
+            });
+        }
+
+        Ok(Self {
+            group_id,
+            config,
+            active_index: 0,
+            members,
+            buffered_since_sync: Vec::new(),
+            coord,
+        })
+    }
+
+    /// Phase G slice 7 — `promote` with score-based standby
+    /// selection.
+    ///
+    /// Preserves v1's recovery-correctness contract: standbys with
+    /// the most recent sync (`last_sync.is_some()` AND highest
+    /// `synced_through`) are still preferred. The placement filter
+    /// + LOCKED §7 tie-breaker break ties AMONG equivalently-fresh
+    /// standbys — they do NOT override data freshness, because
+    /// promoting a less-fresh standby would mean replaying the
+    /// `buffered_since_sync` window over a stale base and silently
+    /// losing pre-buffer state.
+    ///
+    /// Falls back to all healthy standbys (placement-scored) when
+    /// no candidate has ever synced (legitimate during the first
+    /// promote-before-sync window — `buffered_since_sync` covers
+    /// every event since spawn in that case).
+    ///
+    /// Returns the new active's origin_hash, same as
+    /// [`Self::promote`].
+    pub fn promote_with_placement<F>(
+        &mut self,
+        daemon_factory: F,
+        registry: &DaemonRegistry,
+        scheduler: &Scheduler,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+    ) -> Result<u64, GroupError>
+    where
+        F: Fn() -> Box<dyn MeshDaemon>,
+    {
+        let old_active = self.active_index;
+
+        // Search runs FIRST; only on success do we mutate state —
+        // same half-mutation safety as v1 `promote`.
+        let healthy_standbys: Vec<u8> = self
+            .members
+            .iter()
+            .filter(|m| m.role == MemberRole::Standby && m.index != old_active)
+            .filter(|m| self.coord.members()[m.index as usize].healthy)
+            .map(|m| m.index)
+            .collect();
+
+        if healthy_standbys.is_empty() {
+            return Err(GroupError::NoHealthyMember);
+        }
+
+        // Synced_through pre-filter: among synced standbys, keep
+        // those at the maximum `synced_through`. Fall back to all
+        // healthy standbys when no candidate has ever synced.
+        let max_synced = healthy_standbys
+            .iter()
+            .filter(|&&idx| self.members[idx as usize].last_sync.is_some())
+            .map(|&idx| self.members[idx as usize].synced_through)
+            .max();
+
+        let roster: Vec<u8> = match max_synced {
+            Some(max) => healthy_standbys
+                .iter()
+                .copied()
+                .filter(|&idx| {
+                    self.members[idx as usize].last_sync.is_some()
+                        && self.members[idx as usize].synced_through == max
+                })
+                .collect(),
+            None => healthy_standbys.clone(),
+        };
+
+        // Score the roster via placement filter; LOCKED §7 breaks
+        // ties (RTT → free-resource → lex-NodeId).
+        let prototype = daemon_factory();
+        let required = prototype.required_capabilities();
+        let optional = prototype.optional_capabilities();
+        drop(prototype);
+
+        let artifact = Artifact::Daemon {
+            daemon_id: [0u8; 32],
+            required: &required,
+            optional: &optional,
+        };
+
+        let candidate_node_ids: Vec<u64> = roster
+            .iter()
+            .map(|&idx| self.coord.members()[idx as usize].node_id)
+            .collect();
+
+        let chosen_node = scheduler
+            .select_promotion_target(candidate_node_ids, &artifact, placement, tie_break)
+            .ok_or(GroupError::NoHealthyMember)?;
+
+        // Map node_id back to member index — spread invariant
+        // guarantees uniqueness, but use `find` defensively.
+        let best_standby = roster
+            .iter()
+            .copied()
+            .find(|&idx| self.coord.members()[idx as usize].node_id == chosen_node)
+            .ok_or(GroupError::NoHealthyMember)?;
+
+        // Mutation flow mirrors v1.
+        self.coord.mark_unhealthy(old_active);
+        self.members[old_active as usize].role = MemberRole::Standby;
+
+        self.active_index = best_standby;
+        self.members[best_standby as usize].role = MemberRole::Active;
+
+        let new_active_origin = self.coord.members()[best_standby as usize].origin_hash;
+
+        for event in &self.buffered_since_sync {
+            let _ = registry.deliver(new_active_origin, event);
+        }
+        self.buffered_since_sync.clear();
+
+        if let Ok(Some(snapshot)) = registry.snapshot(new_active_origin) {
+            self.members[best_standby as usize].synced_through = snapshot.through_seq;
+        }
+
+        Ok(new_active_origin)
+    }
+
+    /// Phase G slice 7 — `on_node_failure` with score-based
+    /// placement. Active failure triggers
+    /// [`Self::promote_with_placement`]; standby re-placement
+    /// routes through [`GroupCoordinator::place_member`].
+    pub fn on_node_failure_with_placement<F>(
+        &mut self,
+        failed_node_id: u64,
+        daemon_factory: F,
+        scheduler: &Scheduler,
+        registry: &DaemonRegistry,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+    ) -> Result<Option<u64>, GroupError>
+    where
+        F: Fn() -> Box<dyn MeshDaemon>,
+    {
+        let affected = self.coord.members_on_node(failed_node_id);
+        let active_failed = affected.contains(&self.active_index);
+
+        for &index in &affected {
+            self.coord.mark_unhealthy(index);
+        }
+
+        let new_active = if active_failed {
+            Some(self.promote_with_placement(
+                &daemon_factory,
+                registry,
+                scheduler,
+                placement,
+                tie_break,
+            )?)
+        } else {
+            None
+        };
+
+        let prototype = daemon_factory();
+        let requirements = prototype.requirements();
+        let required = prototype.required_capabilities();
+        let optional = prototype.optional_capabilities();
+        drop(prototype);
+
+        let mut exclude: HashSet<u64> = HashSet::new();
+        exclude.insert(failed_node_id);
+
+        for &index in &affected {
+            if index == self.active_index {
+                continue;
+            }
+
+            let keypair = EntityKeypair::from_bytes(self.members[index as usize].keypair_secret);
+            let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
+
+            let artifact = Artifact::Daemon {
+                daemon_id: entity_id_bytes,
+                required: &required,
+                optional: &optional,
+            };
+
+            let decision = match GroupCoordinator::place_member(
+                scheduler,
+                &artifact,
+                &requirements,
+                &exclude,
+                placement,
+                tie_break,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        index,
+                        error = %e,
+                        "StandbyGroup::on_node_failure_with_placement: place_member failed; \
+                         slot left registered for later recovery"
+                    );
+                    continue;
+                }
+            };
+
+            let daemon = daemon_factory();
+            let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
+            registry.replace(host);
+
+            self.coord
+                .update_member_placement(index, decision.node_id, entity_id_bytes);
+            self.members[index as usize].synced_through = 0;
+            self.members[index as usize].last_sync = None;
+            exclude.insert(decision.node_id);
         }
 
         Ok(new_active)
@@ -1218,5 +1529,378 @@ mod tests {
             "promoted active must hold sync-state (5) + buffered events (3) = 8; \
              pre-fix this would be 3 because the standby's pre-sync state was 0"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Phase G slice 7 — `*_with_placement` v2 wiring tests for
+    // StandbyGroup. Mirror slice 5 / 6 coverage plus the
+    // promote-specific contract: data freshness still wins over
+    // placement score (recovery correctness preserved).
+    // ──────────────────────────────────────────────────────────────────
+
+    use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
+
+    fn make_scheduler_and_index(node_ids: &[u64]) -> (Scheduler, Arc<CapabilityIndex>) {
+        let index = Arc::new(CapabilityIndex::new());
+        let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+        for &id in node_ids {
+            index.index(CapabilityAnnouncement::new(
+                id,
+                eid.clone(),
+                1,
+                CapabilitySet::new(),
+            ));
+        }
+        // Use a local_node_id NOT in the index so placement spreads
+        // across indexed nodes instead of always picking local.
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, CapabilitySet::new());
+        (scheduler, index)
+    }
+
+    /// Permissive placement filter — every candidate scores 1.0.
+    struct AllowAll;
+    impl PlacementFilter for AllowAll {
+        fn placement_score(
+            &self,
+            _: &PlacementNodeId,
+            _: &Artifact<'_>,
+        ) -> Option<f32> {
+            Some(1.0)
+        }
+    }
+
+    /// `spawn_with_placement` produces N members across distinct
+    /// nodes when placement is permissive.
+    #[test]
+    fn spawn_with_placement_spreads_across_nodes() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let group = StandbyGroup::spawn_with_placement(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+            &AllowAll,
+            &tb,
+        )
+        .expect("spawn_with_placement should succeed with 3 candidate nodes");
+
+        assert_eq!(group.member_count(), 3);
+        assert_eq!(group.standby_count(), 2);
+        assert_eq!(group.active_index(), 0);
+        assert_eq!(group.health(), GroupHealth::Healthy);
+        let node_ids: HashSet<u64> = group
+            .coord
+            .members()
+            .iter()
+            .map(|m| m.node_id)
+            .collect();
+        assert_eq!(
+            node_ids.len(),
+            3,
+            "spread invariant: all 3 members on distinct nodes"
+        );
+    }
+
+    /// `spawn_with_placement` rejects vetoed-everywhere filter.
+    #[test]
+    fn spawn_with_placement_returns_placement_failed_when_all_vetoed() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        struct VetoAll;
+        impl PlacementFilter for VetoAll {
+            fn placement_score(
+                &self,
+                _: &PlacementNodeId,
+                _: &Artifact<'_>,
+            ) -> Option<f32> {
+                None
+            }
+        }
+
+        let err = StandbyGroup::spawn_with_placement(
+            test_config(2),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+            &VetoAll,
+            &tb,
+        )
+        .expect_err("VetoAll filter should make placement fail");
+
+        assert!(matches!(err, GroupError::PlacementFailed(_)));
+    }
+
+    /// `promote_with_placement` STILL prefers the most-synced
+    /// standby — placement score does NOT override data freshness.
+    /// Pin the recovery-correctness invariant: even with a filter
+    /// that pegs the LESS-synced standby's node to 1.0 and the
+    /// most-synced standby's node to 0.0, promote_with_placement
+    /// MUST pick the most-synced standby.
+    #[test]
+    fn promote_with_placement_prefers_synced_standby_over_higher_score() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let mut group = StandbyGroup::spawn_with_placement(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+            &AllowAll,
+            &tb,
+        )
+        .unwrap();
+
+        // Sync standbys so synced_through > 0 for all.
+        group
+            .sync_standbys(&reg)
+            .expect("sync standbys before promote");
+
+        // Manually mark only standby index 1 as freshly synced;
+        // standby index 2 is reset to "never synced" — so the
+        // promote roster is just standby 1.
+        group.members[2].last_sync = None;
+        group.members[2].synced_through = 0;
+
+        let standby_1_node = group.coord.members()[1].node_id;
+        let standby_2_node = group.coord.members()[2].node_id;
+
+        // Filter prefers standby 2's node (the never-synced one).
+        // Even so, promote_with_placement MUST pick standby 1 —
+        // the synced one — because data freshness is the primary
+        // signal, not placement score.
+        struct PreferUnsynced {
+            preferred_node: u64,
+        }
+        impl PlacementFilter for PreferUnsynced {
+            fn placement_score(
+                &self,
+                t: &PlacementNodeId,
+                _: &Artifact<'_>,
+            ) -> Option<f32> {
+                Some(if *t == self.preferred_node { 1.0 } else { 0.1 })
+            }
+        }
+        let filter = PreferUnsynced {
+            preferred_node: standby_2_node,
+        };
+
+        let new_active_origin = group
+            .promote_with_placement(
+                || Box::new(StatefulDaemon::new()),
+                &reg,
+                &sched,
+                &filter,
+                &tb,
+            )
+            .unwrap();
+
+        // Standby 1 (synced) is now the active.
+        assert_eq!(group.active_index(), 1);
+        assert_eq!(group.member_role(1), Some(MemberRole::Active));
+        let new_active_node = group.coord.members()[1].node_id;
+        assert_eq!(
+            new_active_node, standby_1_node,
+            "synced standby on node {standby_1_node:#x} promoted, NOT unsynced standby on node {standby_2_node:#x}"
+        );
+        assert_eq!(new_active_origin, group.coord.members()[1].origin_hash);
+    }
+
+    /// `promote_with_placement` uses the placement filter to break
+    /// ties AMONG equivalently-synced standbys. With two standbys
+    /// at the same synced_through, the placement filter picks the
+    /// higher-scoring one.
+    #[test]
+    fn promote_with_placement_breaks_ties_by_score_among_equivalently_synced() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let mut group = StandbyGroup::spawn_with_placement(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+            &AllowAll,
+            &tb,
+        )
+        .unwrap();
+
+        // Sync all standbys → both standbys (idx 1, 2) at the
+        // same synced_through.
+        group.sync_standbys(&reg).expect("sync standbys");
+
+        let standby_1_node = group.coord.members()[1].node_id;
+        let standby_2_node = group.coord.members()[2].node_id;
+        assert_ne!(standby_1_node, standby_2_node);
+
+        // Filter prefers standby 2's node — should be picked
+        // because the two standbys are equivalently fresh, so
+        // placement score is the deciding signal.
+        struct PreferNode {
+            preferred_node: u64,
+        }
+        impl PlacementFilter for PreferNode {
+            fn placement_score(
+                &self,
+                t: &PlacementNodeId,
+                _: &Artifact<'_>,
+            ) -> Option<f32> {
+                Some(if *t == self.preferred_node { 1.0 } else { 0.1 })
+            }
+        }
+        let filter = PreferNode {
+            preferred_node: standby_2_node,
+        };
+
+        group
+            .promote_with_placement(
+                || Box::new(StatefulDaemon::new()),
+                &reg,
+                &sched,
+                &filter,
+                &tb,
+            )
+            .unwrap();
+
+        assert_eq!(group.active_index(), 2);
+        let new_active_node = group.coord.members()[2].node_id;
+        assert_eq!(
+            new_active_node, standby_2_node,
+            "when standbys are equivalently fresh, placement filter picks the highest scorer"
+        );
+    }
+
+    /// `promote_with_placement` returns `NoHealthyMember` when no
+    /// healthy standby exists, and DOES NOT mutate the group's
+    /// active state — same half-mutation safety as v1 promote.
+    #[test]
+    fn promote_with_placement_does_not_half_mutate_on_no_healthy_member() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let mut group = StandbyGroup::spawn_with_placement(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+            &AllowAll,
+            &tb,
+        )
+        .unwrap();
+
+        let active_origin_pre = group.active_origin();
+        let active_index_pre = group.active_index();
+
+        // Mark every standby unhealthy.
+        for idx in 1..group.member_count() {
+            group.coord.mark_unhealthy(idx);
+        }
+
+        let err = group
+            .promote_with_placement(
+                || Box::new(StatefulDaemon::new()),
+                &reg,
+                &sched,
+                &AllowAll,
+                &tb,
+            )
+            .expect_err("no healthy standby → NoHealthyMember");
+        assert_eq!(err, GroupError::NoHealthyMember);
+
+        assert_eq!(
+            group.active_origin(),
+            active_origin_pre,
+            "active_origin must be unchanged when promote_with_placement fails"
+        );
+        assert_eq!(
+            group.active_index(),
+            active_index_pre,
+            "active_index must be unchanged when promote_with_placement fails"
+        );
+        assert_eq!(group.member_role(active_index_pre), Some(MemberRole::Active));
+    }
+
+    /// `on_node_failure_with_placement` triggers
+    /// `promote_with_placement` on active failure and re-places
+    /// failed standbys via `place_member`.
+    #[test]
+    fn on_node_failure_with_placement_promotes_active_and_replaces_standby() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let mut group = StandbyGroup::spawn_with_placement(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+            &AllowAll,
+            &tb,
+        )
+        .unwrap();
+        let active_node = group.coord.members()[group.active_index() as usize].node_id;
+
+        let new_active = group
+            .on_node_failure_with_placement(
+                active_node,
+                || Box::new(StatefulDaemon::new()),
+                &sched,
+                &reg,
+                &AllowAll,
+                &tb,
+            )
+            .unwrap();
+
+        assert!(new_active.is_some(), "active failure → promote returns Some");
+        assert_ne!(group.active_index(), 0, "active is no longer index 0");
+    }
+
+    /// `spawn` (v1) is unchanged after the v2 surface lands.
+    #[test]
+    fn spawn_v1_path_unchanged_after_v2_added() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+        let group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(group.member_count(), 3);
+        assert_eq!(group.active_index(), 0);
+        assert_eq!(group.health(), GroupHealth::Healthy);
     }
 }
