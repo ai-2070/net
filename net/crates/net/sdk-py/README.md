@@ -625,7 +625,7 @@ Cross-SDK contract + rationale:
 
 The SDK exposes a caller-local enhancement layer on top of
 `announce_capabilities` / `find_nodes`. The wire format is
-byte-identical across all four bindings (Rust / TS / Python / Go) —
+byte-identical across all five bindings (Rust / TS / Python / Go / C) —
 pinned by JSON fixtures under `tests/cross_lang_capability/`.
 
 ```python
