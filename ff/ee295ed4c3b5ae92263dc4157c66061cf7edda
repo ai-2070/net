@@ -1,0 +1,29 @@
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  s_d1b11a1287c170::t_1fd8f7da95c8c1 1124,1308
+  s_d1b11a1287c170::t_0f2f8dfd1ac065 650-804
+  s_d1b11a1287c170::t_f580b4dbe96603 517
+  s_d1b11a1287c170::t_0ff1fb7c6c882d 881-887,892-909,929-941
+go/net.h
+  s_d1b11a1287c170::t_901e7fed89d12a 930-970
+net/crates/net/include/README.md
+  s_d1b11a1287c170::t_25ad7a5e8d4016 303
+  s_d1b11a1287c170::t_cb540708312536 358-403
+net/crates/net/include/net.go.h
+  s_d1b11a1287c170::t_558da68b994399 932-972
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "ffee295ed4c3b5ae92263dc4157c66061cf7edda",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
