@@ -231,6 +231,33 @@ def test_number_value_accepts_unsigned() -> None:
     assert report.errors == ()
 
 
+def test_number_value_rejects_above_u64_max() -> None:
+    """Q4: substrate `Number` is u64. Pre-fix the Python validator
+    only ran ``isdigit()`` which admits arbitrarily long digit
+    strings (e.g. ``"18446744073709551616"`` = u64::MAX + 1) that
+    the Rust ``value.parse::<u64>()`` rejects.
+    """
+    above_max = str(0xFFFF_FFFF_FFFF_FFFF + 1)  # u64::MAX + 1
+    caps = {"tags": [f"hardware.memory_mb={above_max}"], "metadata": {}}
+    report = validate_capabilities(caps)
+    mismatch = [
+        e
+        for e in report.errors
+        if e.to_wire()["kind"] == "type_mismatch"
+        and e.to_wire()["key"] == "memory_mb"
+    ]
+    assert len(mismatch) == 1
+    assert mismatch[0].to_wire()["actual"] == above_max
+
+
+def test_number_value_accepts_u64_max() -> None:
+    """Boundary check: u64::MAX itself is valid."""
+    at_max = str(0xFFFF_FFFF_FFFF_FFFF)
+    caps = {"tags": [f"hardware.memory_mb={at_max}"], "metadata": {}}
+    report = validate_capabilities(caps)
+    assert report.errors == ()
+
+
 def test_report_is_clean_helpers() -> None:
     clean = ValidationReport()
     assert clean.is_clean()

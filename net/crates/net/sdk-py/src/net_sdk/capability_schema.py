@@ -347,13 +347,23 @@ def _check_value(
         return
     parses = False
     if entry.value_type == "number":
-        # Substrate `Number` is unsigned (u64-only) — see CR-15 in
-        # the capability-system-2 review and `schema.rs::ValueType::Number`.
-        # Negative values surface as TypeMismatch errors on the
-        # substrate side; mirror that here so client-side validation
-        # doesn't pass a CapabilitySet the substrate would later
-        # reject.
-        parses = bool(observed_value) and observed_value.isdigit()
+        # Substrate `Number` is unsigned u64 — see CR-15 in the
+        # capability-system-2 review and `schema.rs::ValueType::Number`.
+        # Negative values AND values that exceed u64::MAX surface
+        # as TypeMismatch on the substrate side; mirror both
+        # conditions here so client-side validation doesn't pass
+        # a CapabilitySet the substrate would later reject.
+        #
+        # Q4: pre-fix `bool(observed_value) and observed_value.isdigit()`
+        # only ruled out negatives + non-digits, but admitted
+        # values like "18446744073709551616" (u64::MAX + 1) which
+        # the Rust `value.parse::<u64>()` rejects.
+        if observed_value and observed_value.isdigit():
+            try:
+                parsed = int(observed_value)
+                parses = 0 <= parsed <= 0xFFFF_FFFF_FFFF_FFFF
+            except ValueError:
+                parses = False
     elif entry.value_type in ("string", "enumeration", "csv"):
         parses = bool(observed_value)
     elif entry.value_type == "bool":
