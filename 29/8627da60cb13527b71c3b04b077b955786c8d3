@@ -1,0 +1,43 @@
+net/crates/net/tests/cross_lang_capability/capability_validation.json
+  s_d1b11a1287c170::t_65b2e3594d7b69 2,163,179,206
+  s_d1b11a1287c170::t_ff3cb4495e8f46 32-107
+  s_d1b11a1287c170::t_917b0efae86c3f 108-162,164-178,180-204
+  s_d1b11a1287c170::t_ded3ef76e1f5d7 205,207-232
+  s_d1b11a1287c170::t_5c0afdef27abeb 1,3-31,233-235
+net/crates/net/sdk-ts/src/index.ts
+  s_d1b11a1287c170::t_5c97ef8b76d4dc 170-191
+net/crates/net/tests/cross_lang_capability/README.md
+  s_d1b11a1287c170::t_593dbbc6d23e07 39-48
+net/crates/net/sdk-py/tests/test_capability_validation.py
+  s_d1b11a1287c170::t_f288d0c45f86cc 1-131
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_d1b11a1287c170::t_fc76fbe2c855c0 145-167
+  s_d1b11a1287c170::t_c93ed72b618060 56-79
+net/crates/net/sdk-ts/test/capability_validation.test.ts
+  s_d1b11a1287c170::t_65c8fadb04613b 1-202
+net/crates/net/sdk-ts/src/capability-schema.ts
+  s_d1b11a1287c170::t_e13818347727ef 1-421
+net/crates/net/sdk-py/src/net_sdk/capability_schema.py
+  s_d1b11a1287c170::t_69098cdcdd4240 1-460
+net/crates/net/bindings/go/net/capability_schema.go
+  s_d1b11a1287c170::t_09d7ef7edc6e74 1-435
+net/crates/net/tests/cross_lang_capability_fixtures.rs
+  s_d1b11a1287c170::t_69dcdeca13c428 20-21
+  s_d1b11a1287c170::t_0e2131f0904697 396-527
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "298627da60cb13527b71c3b04b077b955786c8d3",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
