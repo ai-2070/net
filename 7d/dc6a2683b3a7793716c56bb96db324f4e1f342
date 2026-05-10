@@ -1,0 +1,24 @@
+net/crates/net/include/net.go.h
+  s_d1b11a1287c170::t_2b97b60dec69d8 932-1009
+net/crates/net/include/README.md
+  s_d1b11a1287c170::t_0619cc919e0f47 303
+  s_d1b11a1287c170::t_dcc9526216b83c 357-412
+go/net.h
+  s_d1b11a1287c170::t_8d46d794ce2181 930-1007
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "7ddc6a2683b3a7793716c56bb96db324f4e1f342",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
