@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  s_d1b11a1287c170::t_7a807f567bb137 1235-1241,1243
+net/crates/net/src/adapter/net/compute/scheduler.rs
+  s_d1b11a1287c170::t_614486ac5c58ce 12
+  s_d1b11a1287c170::t_283725b11c282d 1120-1238
+  s_d1b11a1287c170::t_8b2a9e98fcb9ea 212-219,221-228,231,237-238
+  s_d1b11a1287c170::t_242665afc164ed 220,229-230,232-236,239-278
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "59ab5abcc2f905bddf7702fa6a5ea22051b3ab9b",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
