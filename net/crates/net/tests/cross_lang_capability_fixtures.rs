@@ -17,8 +17,9 @@
 use std::collections::BTreeMap;
 
 use net::adapter::net::behavior::{
-    CapabilitySet, ClauseTrace, EvalContext, MetadataChange, Predicate, PredicateWire,
-    RPC_WHERE_HEADER, SchemaError, Tag, ValidationWarning, ValueType, validate_capabilities,
+    CapabilitySet, ClauseTrace, EvalContext, MetadataChange, Predicate, PredicateDebugReport,
+    PredicateWire, RPC_WHERE_HEADER, SchemaError, Tag, ValidationWarning, ValueType,
+    validate_capabilities,
 };
 use serde_json::Value;
 
@@ -598,6 +599,99 @@ fn predicate_trace_fixture_matches_substrate() {
         assert_eq!(
             got_wire, expected_wire,
             "case[{i}] {name}: trace diverged\n  got:      {got_wire:#}\n  expected: {expected_wire:#}",
+        );
+    }
+}
+
+// =============================================================================
+// predicate_debug_report.json — Phase 9d full contract.
+//
+// Per case: decode wire → Predicate, build N EvalContexts from the
+// fixture's `contexts` array, run `PredicateDebugReport::from_evaluations`,
+// project the report onto the canonical wire shape and assert it
+// matches `expected_*`.
+//
+// `clause_stats` is a BTreeMap → array sorted by label. The fixture's
+// `expected_clause_stats` is already in that order.
+// =============================================================================
+
+#[test]
+fn predicate_debug_report_fixture_matches_substrate() {
+    let raw = read_fixture("predicate_debug_report.json");
+    let v: Value = serde_json::from_str(&raw).expect("parse fixture");
+    let cases = v["cases"].as_array().expect("cases is array");
+    assert!(!cases.is_empty(), "fixture has zero cases");
+
+    for (i, case) in cases.iter().enumerate() {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+
+        let wire: PredicateWire = serde_json::from_value(case["wire"].clone())
+            .unwrap_or_else(|e| panic!("case[{i}] {name}: deserialize wire: {e}"));
+        let pred: Predicate = wire
+            .into_predicate()
+            .unwrap_or_else(|e| panic!("case[{i}] {name}: into_predicate: {e}"));
+
+        // Collect the corpus into owned (tags, metadata) pairs first
+        // so `EvalContext::new` can borrow them. The substrate's
+        // `EvalContext` borrows `&[Tag]` and `&BTreeMap`, so each
+        // context's owned data must outlive the iteration.
+        let owned: Vec<(Vec<Tag>, BTreeMap<String, String>)> = case["contexts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let tags: Vec<Tag> = c["tags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| Tag::parse(t.as_str().unwrap()).expect("parse tag"))
+                    .collect();
+                let metadata: BTreeMap<String, String> = c["metadata"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+                    .collect();
+                (tags, metadata)
+            })
+            .collect();
+
+        let report = PredicateDebugReport::from_evaluations(
+            &pred,
+            owned.iter().map(|(tags, meta)| EvalContext::new(tags, meta)),
+        );
+
+        let expected_total = case["expected_total_candidates"].as_u64().unwrap() as usize;
+        let expected_matched = case["expected_matched"].as_u64().unwrap() as usize;
+        assert_eq!(
+            report.total_candidates, expected_total,
+            "case[{i}] {name}: total_candidates",
+        );
+        assert_eq!(
+            report.matched, expected_matched,
+            "case[{i}] {name}: matched",
+        );
+
+        // BTreeMap iter() is in label order — same as the fixture's
+        // expected_clause_stats array.
+        let got_stats: Vec<Value> = report
+            .clause_stats
+            .values()
+            .map(|s| {
+                serde_json::json!({
+                    "label": s.label,
+                    "evaluated": s.evaluated,
+                    "matched": s.matched,
+                })
+            })
+            .collect();
+        let expected_stats = case["expected_clause_stats"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            got_stats, expected_stats,
+            "case[{i}] {name}: clause_stats diverged\n  got:      {got_stats:#?}\n  expected: {expected_stats:#?}",
         );
     }
 }

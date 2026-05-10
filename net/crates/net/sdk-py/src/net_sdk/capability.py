@@ -1270,6 +1270,114 @@ def evaluate_predicate_with_trace(
     return r, ClauseTrace(label=label, result=r, children=())
 
 
+# ============================================================================
+# PredicateDebugReport — aggregate per-clause stats over a corpus.
+#
+# Mirrors the substrate's ``PredicateDebugReport::from_evaluations``.
+# Pinned across bindings by ``predicate_debug_report.json``.
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class ClauseStats:
+    """Per-clause aggregated stats. Mirrors the substrate."""
+
+    label: str
+    evaluated: int
+    matched: int
+
+    def to_wire(self) -> Dict[str, Any]:
+        return {
+            "label": self.label,
+            "evaluated": self.evaluated,
+            "matched": self.matched,
+        }
+
+
+@dataclass(frozen=True)
+class PredicateDebugReport:
+    """Aggregate report from running a predicate across a corpus."""
+
+    total_candidates: int = 0
+    matched: int = 0
+    clause_stats: Tuple[ClauseStats, ...] = ()
+
+    def to_wire(self) -> Dict[str, Any]:
+        return {
+            "total_candidates": self.total_candidates,
+            "matched": self.matched,
+            "clause_stats": [s.to_wire() for s in self.clause_stats],
+        }
+
+    def render(self) -> str:
+        """One-line-per-clause text summary suitable for CLI output."""
+        def pct(num: int, denom: int) -> str:
+            if denom == 0:
+                return "0.0%"
+            return f"{(100 * num / denom):.1f}%"
+
+        lines: List[str] = []
+        lines.append("Predicate evaluation report")
+        lines.append("─────────────────────────────────────────")
+        lines.append(f"Total candidates: {self.total_candidates}")
+        lines.append(
+            f"Matched:          {self.matched} ({pct(self.matched, self.total_candidates)})"
+        )
+        lines.append("")
+        lines.append("Per-clause stats (alphabetical):")
+        for s in self.clause_stats:
+            lines.append(
+                f"  {s.label:<60} evaluated {s.evaluated:>5}, "
+                f"matched {s.matched:>5} ({pct(s.matched, s.evaluated)})"
+            )
+        return "\n".join(lines) + "\n"
+
+
+def _accumulate_trace(
+    trace: ClauseTrace, acc: Dict[str, List[int]]
+) -> None:
+    """Walk trace post-order, updating acc[label] = [evaluated, matched]."""
+    entry = acc.setdefault(trace.label, [0, 0])
+    entry[0] += 1
+    if trace.result:
+        entry[1] += 1
+    for child in trace.children:
+        _accumulate_trace(child, acc)
+
+
+def predicate_debug_report(
+    pred: Predicate,
+    contexts: Sequence[Mapping[str, Any]],
+) -> PredicateDebugReport:
+    """Run ``pred`` against each context in ``contexts``, accumulating
+    per-clause hit / miss stats. Mirrors the substrate's
+    ``PredicateDebugReport::from_evaluations``.
+
+    Each context is a mapping with ``tags`` (sequence of wire strings)
+    and ``metadata`` (str → str map). Returns a :class:`PredicateDebugReport`
+    with ``clause_stats`` sorted by label (BTreeMap semantics)."""
+    acc: Dict[str, List[int]] = {}
+    matched = 0
+    for ctx in contexts:
+        tags = list(ctx.get("tags", ()))
+        metadata = dict(ctx.get("metadata", {}))
+        r, trace = evaluate_predicate_with_trace(pred, tags, metadata)
+        if r:
+            matched += 1
+        _accumulate_trace(trace, acc)
+
+    sorted_labels = sorted(acc.keys())
+    stats = tuple(
+        ClauseStats(label=lbl, evaluated=acc[lbl][0], matched=acc[lbl][1])
+        for lbl in sorted_labels
+    )
+    return PredicateDebugReport(
+        total_candidates=len(contexts),
+        matched=matched,
+        clause_stats=stats,
+    )
+
+
 __all__ = [
     "TaxonomyAxis",
     "TAXONOMY_AXES",
@@ -1314,4 +1422,7 @@ __all__ = [
     "evaluate_predicate",
     "ClauseTrace",
     "evaluate_predicate_with_trace",
+    "ClauseStats",
+    "PredicateDebugReport",
+    "predicate_debug_report",
 ]

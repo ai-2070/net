@@ -49,6 +49,18 @@ Coverage spans every composite shape: leaf hit / miss; And short-circuit (siblin
 
 The fixture also pins the planner's stable cost-sort: in the `and_runs_all_when_no_short_circuit` case, both children are true but `MetadataExists` (cost 10) appears before `Exists` (cost 20) in the trace, even though the AST declared them in the reverse order. Implementations must use a stable sort by `static_cost` to match.
 
+### `predicate_debug_report.json`
+
+Pins `PredicateDebugReport::from_evaluations(pred, contexts)` output for representative `(predicate, corpus)` pairs — the per-clause aggregator that operators reach for to answer "how often did each clause fire / match across this candidate set". Phase 9d full of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+
+- `wire` is the canonical `PredicateWire`.
+- `contexts` is an array of `{tags, metadata}` evaluation contexts (the corpus).
+- `expected_total_candidates` is `len(contexts)`.
+- `expected_matched` is the count of contexts the predicate returned `true` for.
+- `expected_clause_stats` is an array of `{label, evaluated, matched}` records sorted by `label` (the substrate uses `BTreeMap` so iteration is in label order); each binding sorts the same way before comparing.
+
+Coverage: empty corpus → zero everything; single-leaf corpus with a mix of hits/misses; And short-circuit (cheap leaf evaluated every time, expensive only when cheap matches); Or short-circuit (cheap evaluated every time, expensive only when cheap fails); structurally-equal clauses across different AST positions merging into one label entry; Not inversion (post-negation match count on the Not node, pre-negation on the inner clause).
+
 ### `capability_validation.json`
 
 Pins `validate_capabilities(caps)` output for representative `caps` payloads. Phase 9a of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.

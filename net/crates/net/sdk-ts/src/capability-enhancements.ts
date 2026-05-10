@@ -1333,3 +1333,116 @@ export function evaluatePredicateWithTrace(
   const r = evalLeaf(pred, tags, metadata);
   return { result: r, trace: { label, result: r, children: [] } };
 }
+
+// ============================================================================
+// PredicateDebugReport — aggregate per-clause stats over a corpus.
+//
+// Mirrors the substrate's `PredicateDebugReport::from_evaluations`:
+// each candidate is evaluated via `evaluatePredicateWithTrace`; the
+// returned trace is walked post-order to update per-label
+// ClauseStats. Stats keyed by label so structurally-identical
+// clauses across different positions in the AST collapse to one
+// entry.
+//
+// Pinned across bindings by `predicate_debug_report.json`.
+// ============================================================================
+
+/**
+ * Per-clause aggregated stats. Mirrors the substrate's `ClauseStats`.
+ */
+export interface ClauseStats {
+  /** Clause label — same string as `ClauseTrace.label`. */
+  label: string;
+  /** Number of candidates that reached this clause (not short-circuited). */
+  evaluated: number;
+  /** Number of those evaluations that returned `true`. */
+  matched: number;
+}
+
+/**
+ * Wire-format debug report. The `clause_stats` array is sorted by
+ * label (BTreeMap semantics in the substrate); bindings produce that
+ * canonical order.
+ */
+export interface PredicateDebugReport {
+  total_candidates: number;
+  matched: number;
+  clause_stats: ClauseStats[];
+}
+
+/** Wire-format evaluation context — what `evaluate*` consumes. */
+export interface EvalContextWire {
+  tags: string[];
+  metadata: Record<string, string>;
+}
+
+function accumulateTrace(
+  trace: ClauseTrace,
+  stats: Map<string, ClauseStats>,
+): void {
+  const entry = stats.get(trace.label) ?? {
+    label: trace.label,
+    evaluated: 0,
+    matched: 0,
+  };
+  entry.evaluated += 1;
+  if (trace.result) entry.matched += 1;
+  stats.set(trace.label, entry);
+  for (const child of trace.children) {
+    accumulateTrace(child, stats);
+  }
+}
+
+/**
+ * Run `pred` against each context in `contexts`, accumulating
+ * per-clause hit / miss stats. Mirrors the substrate's
+ * `PredicateDebugReport::from_evaluations`.
+ *
+ * The returned report's `clause_stats` is sorted by label
+ * (BTreeMap semantics) so bindings produce byte-identical output
+ * for the same input corpus.
+ */
+export function predicateDebugReport(
+  pred: Predicate,
+  contexts: readonly EvalContextWire[],
+): PredicateDebugReport {
+  const stats = new Map<string, ClauseStats>();
+  let matched = 0;
+  for (const ctx of contexts) {
+    const { result, trace } = evaluatePredicateWithTrace(
+      pred,
+      ctx.tags,
+      ctx.metadata,
+    );
+    if (result) matched += 1;
+    accumulateTrace(trace, stats);
+  }
+  const sortedLabels = Array.from(stats.keys()).sort();
+  return {
+    total_candidates: contexts.length,
+    matched,
+    clause_stats: sortedLabels.map((l) => stats.get(l)!),
+  };
+}
+
+/** Render a one-line-per-clause text summary suitable for CLI output. */
+export function renderDebugReport(report: PredicateDebugReport): string {
+  const pct = (num: number, denom: number): string =>
+    denom === 0 ? '0.0%' : `${((100 * num) / denom).toFixed(1)}%`;
+  const lines: string[] = [];
+  lines.push('Predicate evaluation report');
+  lines.push('─────────────────────────────────────────');
+  lines.push(`Total candidates: ${report.total_candidates}`);
+  lines.push(
+    `Matched:          ${report.matched} (${pct(report.matched, report.total_candidates)})`,
+  );
+  lines.push('');
+  lines.push('Per-clause stats (alphabetical):');
+  for (const s of report.clause_stats) {
+    lines.push(
+      `  ${s.label.padEnd(60)} evaluated ${String(s.evaluated).padStart(5)}, ` +
+        `matched ${String(s.matched).padStart(5)} (${pct(s.matched, s.evaluated)})`,
+    );
+  }
+  return lines.join('\n') + '\n';
+}

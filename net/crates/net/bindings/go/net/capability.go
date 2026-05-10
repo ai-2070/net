@@ -1440,3 +1440,100 @@ func EvaluatePredicateWithTrace(
 	r := evalLeaf(p, tags, metadata)
 	return r, ClauseTrace{Label: label, Result: r, Children: []ClauseTrace{}}
 }
+
+// ============================================================================
+// PredicateDebugReport — aggregator. Mirrors the substrate's
+// `PredicateDebugReport::from_evaluations`. Pinned across bindings
+// by `predicate_debug_report.json`.
+// ============================================================================
+
+// ClauseStats is the wire-format per-clause aggregated stats record.
+type ClauseStats struct {
+	Label     string `json:"label"`
+	Evaluated int    `json:"evaluated"`
+	Matched   int    `json:"matched"`
+}
+
+// PredicateDebugReport is the aggregate report from running a
+// predicate across a corpus of evaluation contexts.
+type PredicateDebugReport struct {
+	TotalCandidates int           `json:"total_candidates"`
+	Matched         int           `json:"matched"`
+	ClauseStats     []ClauseStats `json:"clause_stats"`
+}
+
+// EvalContextWire is the wire-format input to the aggregator — what
+// `evaluate*` consumes.
+type EvalContextWire struct {
+	Tags     []string          `json:"tags"`
+	Metadata map[string]string `json:"metadata"`
+}
+
+func accumulateTraceGo(trace ClauseTrace, acc map[string]*ClauseStats) {
+	entry, ok := acc[trace.Label]
+	if !ok {
+		entry = &ClauseStats{Label: trace.Label}
+		acc[trace.Label] = entry
+	}
+	entry.Evaluated++
+	if trace.Result {
+		entry.Matched++
+	}
+	for _, c := range trace.Children {
+		accumulateTraceGo(c, acc)
+	}
+}
+
+// PredicateDebugReportFromEvaluations runs `pred` against each
+// context in `contexts`, accumulating per-clause hit / miss stats.
+// Mirrors the substrate's `PredicateDebugReport::from_evaluations`.
+//
+// `ClauseStats` are sorted by label (BTreeMap semantics).
+func PredicateDebugReportFromEvaluations(
+	pred *Predicate, contexts []EvalContextWire,
+) PredicateDebugReport {
+	acc := make(map[string]*ClauseStats)
+	matched := 0
+	for _, ctx := range contexts {
+		r, trace := EvaluatePredicateWithTrace(pred, ctx.Tags, ctx.Metadata)
+		if r {
+			matched++
+		}
+		accumulateTraceGo(trace, acc)
+	}
+	labels := make([]string, 0, len(acc))
+	for l := range acc {
+		labels = append(labels, l)
+	}
+	sort.Strings(labels)
+	stats := make([]ClauseStats, len(labels))
+	for i, l := range labels {
+		stats[i] = *acc[l]
+	}
+	return PredicateDebugReport{
+		TotalCandidates: len(contexts),
+		Matched:         matched,
+		ClauseStats:     stats,
+	}
+}
+
+// Render formats a one-line-per-clause summary suitable for CLI output.
+func (r PredicateDebugReport) Render() string {
+	pct := func(num, denom int) string {
+		if denom == 0 {
+			return "0.0%"
+		}
+		return fmt.Sprintf("%.1f%%", 100.0*float64(num)/float64(denom))
+	}
+	var b strings.Builder
+	b.WriteString("Predicate evaluation report\n")
+	b.WriteString("─────────────────────────────────────────\n")
+	fmt.Fprintf(&b, "Total candidates: %d\n", r.TotalCandidates)
+	fmt.Fprintf(&b, "Matched:          %d (%s)\n\n", r.Matched, pct(r.Matched, r.TotalCandidates))
+	b.WriteString("Per-clause stats (alphabetical):\n")
+	for _, s := range r.ClauseStats {
+		fmt.Fprintf(&b, "  %-60s evaluated %5d, matched %5d (%s)\n",
+			s.Label, s.Evaluated, s.Matched, pct(s.Matched, s.Evaluated))
+	}
+	return b.String()
+}
