@@ -511,6 +511,300 @@ impl Predicate {
     }
 }
 
+// =============================================================================
+// Debug session — Phase 6 of CAPABILITY_ENHANCEMENTS_PLAN.md.
+//
+// `Predicate::evaluate_with_trace` instruments a single evaluation,
+// producing a tree of clause traces showing which clauses ran and
+// what they returned. `PredicateDebugReport` aggregates traces over
+// a candidate corpus into per-clause hit/miss stats plus a printable
+// summary.
+//
+// Opt-in only — production hot paths use `evaluate()`, never this
+// path. The instrumentation overhead is dominated by the per-clause
+// label allocation (`format!`); production-grade ~5% overhead is
+// achievable but the current implementation favors simplicity.
+// =============================================================================
+
+/// Tree-shaped trace from one debug evaluation against a single
+/// `EvalContext`. Mirrors the AST of the predicate that was
+/// evaluated, except `And` / `Or` short-circuits drop unevaluated
+/// siblings — the trace only carries clauses that actually ran.
+///
+/// Phase 6 of `CAPABILITY_ENHANCEMENTS_PLAN.md`. Returned by
+/// [`Predicate::evaluate_with_trace`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClauseTrace {
+    /// One-line summary of the clause (`"Exists(hardware.gpu)"`,
+    /// `"And(3 clauses)"`, `"MetadataEquals(intent=ml-training)"`).
+    /// Aggregated stats merge by label, so two structurally-equal
+    /// leaf clauses share one entry in the report.
+    pub label: String,
+    /// Final result of evaluating this clause.
+    pub result: bool,
+    /// Children traces in evaluation order. For `And` / `Or` this is
+    /// the planner-ordered (cost-ascending) sequence of children
+    /// that actually ran (short-circuited siblings are absent).
+    /// `Not` has exactly one child. Leaves have an empty children
+    /// list.
+    pub children: Vec<ClauseTrace>,
+}
+
+impl Predicate {
+    /// Evaluate against `ctx`, also producing a tree of per-clause
+    /// traces.
+    ///
+    /// The result equals `self.evaluate(ctx)`; this entry point adds
+    /// the [`ClauseTrace`] tree as a side channel for debug
+    /// inspection. Composite clauses retain the planner's
+    /// short-circuit behavior — descendants that didn't run aren't
+    /// in the trace.
+    ///
+    /// Phase 6 of `CAPABILITY_ENHANCEMENTS_PLAN.md`. Opt-in only;
+    /// production callers use [`Predicate::evaluate`].
+    pub fn evaluate_with_trace(&self, ctx: &EvalContext<'_>) -> (bool, ClauseTrace) {
+        let label = self.debug_label();
+        match self {
+            Self::And(children) => {
+                let mut order: Vec<usize> = (0..children.len()).collect();
+                order.sort_by_key(|&i| children[i].static_cost());
+                let mut traces = Vec::with_capacity(order.len());
+                let mut result = true;
+                for i in order {
+                    let (r, t) = children[i].evaluate_with_trace(ctx);
+                    traces.push(t);
+                    if !r {
+                        result = false;
+                        break;
+                    }
+                }
+                (
+                    result,
+                    ClauseTrace {
+                        label,
+                        result,
+                        children: traces,
+                    },
+                )
+            }
+            Self::Or(children) => {
+                let mut order: Vec<usize> = (0..children.len()).collect();
+                order.sort_by_key(|&i| children[i].static_cost());
+                let mut traces = Vec::with_capacity(order.len());
+                let mut result = false;
+                for i in order {
+                    let (r, t) = children[i].evaluate_with_trace(ctx);
+                    traces.push(t);
+                    if r {
+                        result = true;
+                        break;
+                    }
+                }
+                (
+                    result,
+                    ClauseTrace {
+                        label,
+                        result,
+                        children: traces,
+                    },
+                )
+            }
+            Self::Not(inner) => {
+                let (r, t) = inner.evaluate_with_trace(ctx);
+                (
+                    !r,
+                    ClauseTrace {
+                        label,
+                        result: !r,
+                        children: vec![t],
+                    },
+                )
+            }
+            leaf => {
+                let result = leaf.evaluate_leaf(ctx);
+                (
+                    result,
+                    ClauseTrace {
+                        label,
+                        result,
+                        children: Vec::new(),
+                    },
+                )
+            }
+        }
+    }
+
+    /// One-line debug label for this clause. Used by
+    /// [`ClauseTrace`] and [`PredicateDebugReport`] to identify
+    /// clauses in human-readable output.
+    fn debug_label(&self) -> String {
+        match self {
+            Self::Exists { key } => format!("Exists({key})"),
+            Self::Equals { key, value } => format!("Equals({key}={value})"),
+            Self::NumericAtLeast { key, threshold } => {
+                format!("NumericAtLeast({key} >= {threshold})")
+            }
+            Self::NumericAtMost { key, threshold } => {
+                format!("NumericAtMost({key} <= {threshold})")
+            }
+            Self::NumericInRange { key, min, max } => {
+                format!("NumericInRange({key} in [{min}, {max}])")
+            }
+            Self::SemverAtLeast { key, version } => {
+                format!("SemverAtLeast({key} >= {version})")
+            }
+            Self::SemverAtMost { key, version } => {
+                format!("SemverAtMost({key} <= {version})")
+            }
+            Self::SemverCompatible { key, version } => {
+                format!("SemverCompatible({key} ~= {version})")
+            }
+            Self::StringPrefix { key, prefix } => {
+                format!("StringPrefix({key} starts with {prefix:?})")
+            }
+            Self::StringMatches { key, pattern } => {
+                format!("StringMatches({key} contains {pattern:?})")
+            }
+            Self::MetadataExists { key } => format!("MetadataExists({key})"),
+            Self::MetadataEquals { key, value } => {
+                format!("MetadataEquals({key}={value})")
+            }
+            Self::MetadataMatches { key, pattern } => {
+                format!("MetadataMatches({key} contains {pattern:?})")
+            }
+            Self::MetadataNumericAtLeast { key, threshold } => {
+                format!("MetadataNumericAtLeast({key} >= {threshold})")
+            }
+            Self::And(c) => format!("And({} clauses)", c.len()),
+            Self::Or(c) => format!("Or({} clauses)", c.len()),
+            Self::Not(_) => "Not".to_string(),
+        }
+    }
+}
+
+/// Per-clause aggregated stats across a candidate corpus.
+///
+/// Merged by `label`: two structurally-equal clauses (same variant,
+/// same key, same value) share one [`ClauseStats`] entry. This is
+/// generally what an operator wants — "how often does
+/// `MetadataEquals(intent=ml-training)` succeed?" doesn't depend on
+/// where in the AST that clause sits.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClauseStats {
+    /// Clause label (matches the `label` field on [`ClauseTrace`]).
+    pub label: String,
+    /// Number of candidates whose evaluation reached this clause
+    /// (i.e. wasn't short-circuited away by an earlier sibling).
+    pub evaluated: usize,
+    /// Number of those evaluations that returned `true`.
+    pub matched: usize,
+}
+
+/// Aggregate report from running a [`Predicate`] across a corpus
+/// of candidate evaluation contexts.
+///
+/// Phase 6 of `CAPABILITY_ENHANCEMENTS_PLAN.md`. Built by
+/// [`PredicateDebugReport::from_evaluations`].
+///
+/// The report answers: "given this predicate and these candidates,
+/// how many matched, and how often did each clause filter?". A
+/// clause with 1042 evaluations and 12 matches has 1.2% positive
+/// selectivity — operators use that to spot mismatches between
+/// their mental model of the data and the actual data.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PredicateDebugReport {
+    /// Number of candidates the predicate was evaluated against.
+    pub total_candidates: usize,
+    /// Number of candidates the predicate matched (returned `true`).
+    pub matched: usize,
+    /// Per-clause aggregated stats, keyed by the clause's debug
+    /// label. `BTreeMap` for deterministic iteration order in
+    /// printed output.
+    pub clause_stats: std::collections::BTreeMap<String, ClauseStats>,
+}
+
+impl PredicateDebugReport {
+    /// Run `pred` against each context in `contexts`, accumulating
+    /// per-clause hit / miss stats.
+    ///
+    /// Each context contributes one trace; the trace tree is walked
+    /// post-order to update the per-label `ClauseStats`. Composite
+    /// clauses (And / Or / Not) get their own labels too, so an
+    /// operator can see "the And short-circuited 730/1042 times" at
+    /// a glance.
+    pub fn from_evaluations<'a, I>(pred: &Predicate, contexts: I) -> Self
+    where
+        I: IntoIterator<Item = EvalContext<'a>>,
+    {
+        let mut report = Self::default();
+        for ctx in contexts {
+            report.total_candidates += 1;
+            let (matched, trace) = pred.evaluate_with_trace(&ctx);
+            if matched {
+                report.matched += 1;
+            }
+            accumulate_trace(&trace, &mut report.clause_stats);
+        }
+        report
+    }
+
+    /// Format a human-readable summary suitable for terminal output.
+    ///
+    /// Returned as a `String` rather than printed directly so tests
+    /// can pin the format and callers can route to their own logger.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        let pct = |num: usize, denom: usize| -> f64 {
+            if denom == 0 {
+                0.0
+            } else {
+                100.0 * (num as f64) / (denom as f64)
+            }
+        };
+        out.push_str("Predicate evaluation report\n");
+        out.push_str("─────────────────────────────────────────\n");
+        out.push_str(&format!(
+            "Total candidates: {}\nMatched:          {} ({:.1}%)\n\n",
+            self.total_candidates,
+            self.matched,
+            pct(self.matched, self.total_candidates),
+        ));
+        out.push_str("Per-clause stats (alphabetical):\n");
+        for stats in self.clause_stats.values() {
+            out.push_str(&format!(
+                "  {:<60} evaluated {:>5}, matched {:>5} ({:>5.1}%)\n",
+                stats.label,
+                stats.evaluated,
+                stats.matched,
+                pct(stats.matched, stats.evaluated),
+            ));
+        }
+        out
+    }
+}
+
+/// Walk a [`ClauseTrace`] tree post-order, updating per-label
+/// stats in `acc`.
+fn accumulate_trace(
+    trace: &ClauseTrace,
+    acc: &mut std::collections::BTreeMap<String, ClauseStats>,
+) {
+    let entry = acc
+        .entry(trace.label.clone())
+        .or_insert_with(|| ClauseStats {
+            label: trace.label.clone(),
+            evaluated: 0,
+            matched: 0,
+        });
+    entry.evaluated += 1;
+    if trace.result {
+        entry.matched += 1;
+    }
+    for child in &trace.children {
+        accumulate_trace(child, acc);
+    }
+}
+
 /// Find any tag in `tags` matching `key` and run `value_pred` against
 /// its value. For [`Tag::AxisPresent`] (no value), `value_pred` is
 /// called with `""` so existence-style predicates can choose to match
@@ -1266,5 +1560,207 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========================================================================
+    // Predicate debug session — Phase 6 of CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    #[test]
+    fn evaluate_with_trace_returns_same_result_as_evaluate() {
+        // Pin: the trace-instrumented evaluation produces the
+        // same boolean result as `evaluate()`. Trace is a side
+        // channel; the predicate semantic is unchanged.
+        let ast = worst_case_and();
+        let tags: Vec<Tag> = vec![axis_eq(TaxonomyAxis::Hardware, "memory_mb", "32768")];
+        let meta = empty_meta();
+        let cx = ctx(&tags, &meta);
+        let plain_result = ast.evaluate(&cx);
+        let (traced_result, _trace) = ast.evaluate_with_trace(&cx);
+        assert_eq!(plain_result, traced_result);
+    }
+
+    #[test]
+    fn evaluate_with_trace_short_circuits_drop_unevaluated_siblings() {
+        // Pin: when an `And` short-circuits on a false child, the
+        // trace for the And node only carries the children that
+        // actually ran. Lets operators see "the metadata clause
+        // failed; we never got to the GPU check."
+        let ast = Predicate::And(vec![
+            // Cheap leaf, false → short-circuit
+            Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+            // Heavier leaf — should not be evaluated
+            Predicate::SemverCompatible {
+                key: TagKey::new(TaxonomyAxis::Software, "runtime.python"),
+                version: "3.11".into(),
+            },
+        ]);
+        let meta = empty_meta();
+        let cx = ctx(&[], &meta); // no metadata → first clause false
+        let (result, trace) = ast.evaluate_with_trace(&cx);
+        assert!(!result);
+        // And's children: only one entry (the metadata clause that
+        // returned false and short-circuited the rest).
+        assert_eq!(
+            trace.children.len(),
+            1,
+            "And trace should drop unevaluated siblings; got {trace:?}"
+        );
+        assert!(trace.children[0].label.starts_with("MetadataEquals"));
+        assert!(!trace.children[0].result);
+    }
+
+    #[test]
+    fn evaluate_with_trace_captures_full_evaluation_when_no_short_circuit() {
+        // Pin: when no clause short-circuits (all true in an And,
+        // all false in an Or), the trace covers every child.
+        let ast = Predicate::And(vec![
+            Predicate::MetadataExists { key: "intent".into() },
+            Predicate::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+            },
+        ]);
+        let tags: Vec<Tag> = vec![axis_present(TaxonomyAxis::Hardware, "gpu")];
+        let meta = meta_with(&[("intent", "ml-training")]);
+        let cx = ctx(&tags, &meta);
+        let (result, trace) = ast.evaluate_with_trace(&cx);
+        assert!(result);
+        assert_eq!(trace.children.len(), 2);
+        for child in &trace.children {
+            assert!(child.result, "all children must have matched: {child:?}");
+        }
+    }
+
+    #[test]
+    fn evaluate_with_trace_records_not_inversion() {
+        // Pin: Not's trace child carries the inner result (pre-
+        // negation); the Not node carries the post-negation result.
+        let ast = Predicate::Not(Box::new(Predicate::Exists {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+        }));
+        let meta = empty_meta();
+        let cx = ctx(&[], &meta); // gpu absent → inner false → Not true
+        let (result, trace) = ast.evaluate_with_trace(&cx);
+        assert!(result, "Not(absent) should be true");
+        assert_eq!(trace.label, "Not");
+        assert!(trace.result);
+        assert_eq!(trace.children.len(), 1);
+        assert!(!trace.children[0].result, "inner Exists should be false");
+    }
+
+    #[test]
+    fn debug_report_aggregates_match_counts() {
+        // 3 candidates, 1 matches.
+        let pred = Predicate::Exists {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+        };
+        let no_gpu_tags: Vec<Tag> = vec![];
+        let gpu_tags: Vec<Tag> = vec![axis_present(TaxonomyAxis::Hardware, "gpu")];
+        let meta = empty_meta();
+
+        let contexts = vec![
+            ctx(&no_gpu_tags, &meta),
+            ctx(&gpu_tags, &meta),
+            ctx(&no_gpu_tags, &meta),
+        ];
+        let report = PredicateDebugReport::from_evaluations(&pred, contexts);
+        assert_eq!(report.total_candidates, 3);
+        assert_eq!(report.matched, 1);
+        // One leaf clause.
+        assert_eq!(report.clause_stats.len(), 1);
+        let stats = report.clause_stats.values().next().unwrap();
+        assert_eq!(stats.evaluated, 3);
+        assert_eq!(stats.matched, 1);
+    }
+
+    #[test]
+    fn debug_report_separates_per_clause_stats_in_composite() {
+        // For an And of two clauses, the report should carry stats
+        // for the And node + each leaf. Short-circuited clauses
+        // get fewer evaluations.
+        let pred = Predicate::And(vec![
+            Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            }, // cheap, often false
+            Predicate::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+            }, // moderate
+        ]);
+
+        // 4 candidates: only one has the right intent + GPU.
+        let no_meta = empty_meta();
+        let intent_meta = meta_with(&[("intent", "ml-training")]);
+        let no_gpu: Vec<Tag> = vec![];
+        let gpu: Vec<Tag> = vec![axis_present(TaxonomyAxis::Hardware, "gpu")];
+
+        let contexts = vec![
+            ctx(&no_gpu, &no_meta),    // both fail; short-circuit on metadata
+            ctx(&gpu, &no_meta),       // both fail; short-circuit on metadata
+            ctx(&no_gpu, &intent_meta), // metadata true, gpu fail
+            ctx(&gpu, &intent_meta),    // both true → match
+        ];
+        let report = PredicateDebugReport::from_evaluations(&pred, contexts);
+
+        assert_eq!(report.total_candidates, 4);
+        assert_eq!(report.matched, 1);
+
+        // 3 entries: And node + MetadataEquals leaf + Exists leaf.
+        assert_eq!(report.clause_stats.len(), 3);
+
+        let metadata_stats = report
+            .clause_stats
+            .values()
+            .find(|s| s.label.starts_with("MetadataEquals"))
+            .expect("MetadataEquals stats present");
+        assert_eq!(metadata_stats.evaluated, 4, "metadata clause runs every time");
+        assert_eq!(metadata_stats.matched, 2, "intent matches in 2 of 4");
+
+        let exists_stats = report
+            .clause_stats
+            .values()
+            .find(|s| s.label.starts_with("Exists"))
+            .expect("Exists stats present");
+        // Only the 2 candidates with intent_meta got past the
+        // short-circuit; gpu check ran twice.
+        assert_eq!(exists_stats.evaluated, 2, "gpu clause only runs after metadata passes");
+        assert_eq!(exists_stats.matched, 1);
+    }
+
+    #[test]
+    fn debug_report_render_includes_summary_and_clauses() {
+        let pred = Predicate::Exists {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+        };
+        let report = PredicateDebugReport::from_evaluations(
+            &pred,
+            vec![ctx(&[], &empty_meta())],
+        );
+        let rendered = report.render();
+        // Pin the load-bearing parts of the format. Operators read
+        // the report by these markers; CI fails loudly if they drift.
+        assert!(rendered.contains("Predicate evaluation report"));
+        assert!(rendered.contains("Total candidates: 1"));
+        assert!(rendered.contains("Matched:          0"));
+        assert!(rendered.contains("Per-clause stats"));
+        assert!(rendered.contains("Exists(hardware.gpu)"));
+    }
+
+    #[test]
+    fn debug_report_handles_empty_corpus() {
+        let pred = Predicate::Exists {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+        };
+        let report =
+            PredicateDebugReport::from_evaluations(&pred, Vec::<EvalContext>::new());
+        assert_eq!(report.total_candidates, 0);
+        assert_eq!(report.matched, 0);
+        assert!(report.clause_stats.is_empty());
+        // Render must not panic on empty.
+        let rendered = report.render();
+        assert!(rendered.contains("Total candidates: 0"));
     }
 }
