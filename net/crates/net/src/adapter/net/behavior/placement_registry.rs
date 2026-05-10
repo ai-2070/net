@@ -122,12 +122,20 @@ impl PlacementFilterRegistry {
         binding: impl Into<String>,
     ) -> bool {
         let binding = binding.into();
-        // Pre-create the per-binding counter so reads from
+        // CR-20: Pre-create the per-binding counter so reads from
         // `invocations_by_binding` see `0` for newly-registered
         // bindings rather than missing keys.
-        if !self.invocations.contains_key(&binding) {
-            self.invocations.insert(binding.clone(), AtomicU64::new(0));
-        }
+        //
+        // Use `entry().or_insert_with()` instead of contains+insert
+        // so concurrent registers of the same new binding don't
+        // race: the previous shape had T1 and T2 both pass the
+        // `contains_key == false` check, both `insert` a fresh
+        // `AtomicU64::new(0)`, and the second insert overwrite
+        // whatever count the first had already accumulated via
+        // interleaved `get()` calls. Single atomic op now.
+        self.invocations
+            .entry(binding.clone())
+            .or_insert_with(|| AtomicU64::new(0));
         match self.filters.entry(id) {
             Entry::Occupied(_) => false,
             Entry::Vacant(slot) => {
