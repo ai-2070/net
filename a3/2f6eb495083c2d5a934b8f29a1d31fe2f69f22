@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/tag.rs
+  s_e3c24456981f5d::t_ec50c1a7db086d 356-400
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_e3c24456981f5d::t_5e59c50e24b411 1237-1242
+  s_e3c24456981f5d::t_fe2c29f25cb297 3399-3433
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "a32f6eb495083c2d5a934b8f29a1d31fe2f69f22",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
