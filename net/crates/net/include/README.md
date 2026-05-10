@@ -300,6 +300,7 @@ net_mesh_shutdown(mesh);
 | Streams | `net_mesh_open_stream`, `net_mesh_send`, `net_mesh_send_with_retry`, `net_mesh_send_blocking`, `net_mesh_stream_stats`, `net_mesh_recv_shard` | Per-peer ordered byte streams. |
 | Channels | `net_mesh_register_channel`, `net_mesh_subscribe_channel`, `net_mesh_subscribe_channel_with_token`, `net_mesh_unsubscribe_channel`, `net_mesh_publish` | Topic-based pub/sub over the mesh. |
 | Capabilities | `net_mesh_announce_capabilities`, `net_mesh_find_nodes`, `net_mesh_find_nodes_scoped`, `net_mesh_find_best_node`, `net_mesh_find_best_node_scoped` | Capability discovery + scored placement. |
+| Custom placement filters | `net_compute_set_placement_filter_dispatcher`, `net_compute_register_placement_filter`, `net_compute_unregister_placement_filter`, `net_compute_has_placement_filter` | Plug a host-language predicate into `StandardPlacement.custom_filter_id` — substrate calls back per candidate. See "Custom placement-filter callback (Phase 7)" below. |
 | NAT traversal | `net_mesh_nat_type`, `net_mesh_reflex_addr`, `net_mesh_peer_nat_type`, `net_mesh_probe_reflex`, `net_mesh_reclassify_nat`, `net_mesh_traversal_stats`, `net_mesh_set_reflex_override`, `net_mesh_clear_reflex_override` | Optional optimization — routed-handshake fallback always works. |
 
 ### Scoped capability discovery
@@ -352,6 +353,62 @@ disambiguates from `node_id == 0`, which is a valid id.
 
 Full design + cross-SDK rationale:
 [`docs/SCOPED_CAPABILITIES_PLAN.md`](../docs/SCOPED_CAPABILITIES_PLAN.md).
+
+### Custom placement-filter callback (Phase 7)
+
+Path A (`StandardPlacement` config-driven scoring) is the default; this is the **escape hatch** when the in-tree axes don't capture the placement decision the operator needs. The substrate calls back into the consumer (C / language X) once per candidate when scoring; the consumer returns keep / drop. Phase 7 of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md` — full prose lives in the plan.
+
+Symbols are in `libnet_compute` (separate cdylib), declared in `net.go.h` next to the existing daemon dispatcher.
+
+**Lifecycle:**
+
+```c
+/* 1. At process init: install the trampoline ONCE. First-call-wins;
+ *    subsequent calls are no-ops. */
+static int my_placement_filter(
+    const char* filter_id_ptr, size_t filter_id_len,
+    uint64_t node_id,
+    const char* candidate_json_ptr, size_t candidate_json_len);
+
+net_compute_set_placement_filter_dispatcher(my_placement_filter);
+
+/* 2. After the mesh node is live, register a filter id. The id must
+ *    match what the daemon spec / `StandardPlacement.custom_filter_id`
+ *    references on the substrate side. The mesh_arc is NOT consumed. */
+const char* id = "pf-gpu-must-be-loaded";
+int rc = net_compute_register_placement_filter(
+    mesh_arc,            /* from net_mesh_arc_clone — caller still owns */
+    id, strlen(id));
+if (rc != NET_COMPUTE_OK) { /* handle error — see net.go.h for codes */ }
+
+/* 3. Scoring fires the trampoline per candidate. Return:
+ *      1 — keep candidate (placement-score 1.0 in Rust)
+ *      0 — drop candidate (placement_score returns None)
+ *      negative — error; treated as veto. Log the detail yourself.
+ *
+ *    Wire shape: candidate_json_ptr is a JSON string of length
+ *    candidate_json_len:
+ *      {"node_id": uint64, "tags": [string], "metadata": {key:value}}
+ *    Buffers are owned by Rust for the call's duration; copy if needed.
+ */
+static int my_placement_filter(
+    const char* filter_id_ptr, size_t filter_id_len,
+    uint64_t node_id,
+    const char* candidate_json_ptr, size_t candidate_json_len)
+{
+    /* parse candidate_json_ptr with your JSON library of choice
+     * (cjson, jansson, RapidJSON, etc.) and apply your predicate */
+    return /* 1 | 0 | negative */;
+}
+
+/* 4. On shutdown: drop the registration. Existing in-flight scoring
+ *    calls already holding the Arc complete normally. */
+net_compute_unregister_placement_filter(id, strlen(id));
+```
+
+**Counter:** every successful trampoline invocation increments `dataforts_placement_callback_invocations_total{binding}` on the substrate side, where `binding` is set per-language-SDK at register-time. C consumers see `binding="<your-binding-label>"` if you register through a language-specific SDK; raw C consumers calling `net_compute_register_placement_filter` directly inherit the default.
+
+**Same JSON wire shape across all bindings.** The Node TSFN bridge marshals candidates natively; the Python `Py<PyAny>` bridge does the same; the Go cgo bridge uses this exact JSON. Cross-binding compat fixture: `tests/cross_lang_capability/predicate_eval.json` (each binding wraps the predicate as a placement filter and asserts the kept/vetoed verdict matches direct evaluation).
 
 ### Mesh types
 

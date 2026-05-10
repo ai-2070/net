@@ -927,6 +927,84 @@ int                     net_compute_outputs_push(
  * invoke this directly. */
 void                    net_compute_snapshot_bytes_free(uint8_t* ptr, size_t len);
 
+/* --- Custom PlacementFilter callback (Phase 7 of
+ * CAPABILITY_SYSTEM_SDK_PLAN.md) ---
+ *
+ * Custom predicate hook for `StandardPlacement.custom_filter_id`.
+ * The substrate calls back into the consumer (Go / language X)
+ * once per candidate when scoring a placement decision. Return
+ * `1` keeps the candidate, `0` drops it, negative is treated as
+ * veto + the consumer is responsible for logging detail.
+ *
+ * Wire shape: substrate marshals each candidate as JSON
+ * `{"node_id": uint64, "tags": [string], "metadata": map}`
+ * — keeps the C ABI tight (one byte buffer per call) at the
+ * cost of a per-call serde roundtrip on the consumer side. The
+ * Go binding's reference impl (`bindings/go/net/placement.go`)
+ * decodes inside the trampoline before invoking the user
+ * predicate; non-Go consumers parse the JSON the same way. The
+ * filter id and JSON buffers are owned by Rust for the call's
+ * duration only — copy them on the consumer side if needed.
+ *
+ * Lifecycle: call `_set_placement_filter_dispatcher` ONCE at
+ * process init (first-call-wins; subsequent calls are no-ops).
+ * Then `_register_placement_filter(mesh_arc, id_ptr, id_len)`
+ * for each filter; daemons spec'd with the matching id route
+ * scoring through the dispatcher. Counter
+ * `dataforts_placement_callback_invocations_total{binding}`
+ * increments per scoring call (binding label set by the consumer
+ * SDK at register-time on the Rust side).
+ *
+ * Compatible with `_set_dispatcher` above — the placement filter
+ * dispatcher is independent. */
+
+typedef int (*net_compute_placement_filter_fn)(
+    const char* filter_id_ptr, size_t filter_id_len,
+    uint64_t node_id,
+    const char* candidate_json_ptr, size_t candidate_json_len);
+
+/* Install the consumer-side placement-filter trampoline. Idempotent
+ * after first success (matches `_set_dispatcher` semantics).
+ * Returns NET_COMPUTE_OK on success, NET_COMPUTE_ERR_NULL on NULL
+ * pointer. */
+int                     net_compute_set_placement_filter_dispatcher(
+    net_compute_placement_filter_fn dispatcher);
+
+/* Register a placement-filter id under `mesh_arc`. The Rust side
+ * looks up `*Arc<MeshNode>` so the filter can resolve the
+ * candidate's `CapabilitySet` from the local index when scoring.
+ * `mesh_arc` is NOT consumed — caller still owns it.
+ *
+ * Returns:
+ *   NET_COMPUTE_OK              — registered.
+ *   NET_COMPUTE_ERR_NULL        — `mesh_arc` or `id_ptr` NULL.
+ *   NET_COMPUTE_ERR_DUPLICATE_KIND — `id` already registered
+ *                                    (no-overwrite contract; SDKs
+ *                                    generate unique ids).
+ *   -4                          — dispatcher not yet installed
+ *                                  (call `_set_placement_filter_dispatcher`).
+ *   -5                          — `id_ptr` is not valid UTF-8.
+ *
+ * Existing `Arc<dyn PlacementFilter>` clones held by in-flight
+ * scoring calls keep the predicate alive until those calls
+ * finish; `_unregister` is safe to call concurrently. */
+int                     net_compute_register_placement_filter(
+    void* mesh_arc,
+    const char* id_ptr, size_t id_len);
+
+/* Drop the placement-filter registration under `id`.
+ *
+ * Returns 1 if `id` was registered, 0 otherwise.
+ * NET_COMPUTE_ERR_NULL on NULL / non-UTF-8 `id_ptr`. */
+int                     net_compute_unregister_placement_filter(
+    const char* id_ptr, size_t id_len);
+
+/* Whether `id` is currently registered. Diagnostic helper.
+ * Returns 1 if registered, 0 otherwise. NET_COMPUTE_ERR_NULL on
+ * NULL / non-UTF-8 `id_ptr`. */
+int                     net_compute_has_placement_filter(
+    const char* id_ptr, size_t id_len);
+
 /* --- Spawn / stop / deliver --- */
 
 /* Spawn a daemon. `daemon_id` is the Go-side registry key
