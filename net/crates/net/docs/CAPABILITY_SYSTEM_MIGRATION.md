@@ -55,7 +55,7 @@ let caps = CapabilitySet::new()
 **New (chain helpers + tag-set wire format)**
 
 ```rust
-use net_sdk::capabilities::{require_axis_value, with_metadata, /* ... */};
+use net_sdk::capabilities::{CapabilitySet, HardwareCapabilities, SoftwareCapabilities, GpuInfo, GpuVendor};
 
 // The typed-struct constructors still exist on the substrate's
 // `HardwareCapabilities` / `SoftwareCapabilities` types — they're now
@@ -69,10 +69,12 @@ let caps = CapabilitySet::new()
         .with_os("linux", "6.6")
         .add_runtime("python", "3.11"));
 
-// Or use the chain-composition helpers directly on the wire shape:
+// Or use the wire-shape builders directly via `add_tag` (which
+// parses through `Tag::parse_user`, gating reserved prefixes) and
+// the metadata setter:
 let caps = CapabilitySet::new()
-    .add_axis_value(TaxonomyAxis::Hardware, "gpu", "h100", AxisSeparator::Eq)
-    .add_axis_value(TaxonomyAxis::Hardware, "memory_mb", "65536", AxisSeparator::Eq)
+    .add_tag("hardware.gpu=h100")
+    .add_tag("hardware.memory_mb=65536")
     .with_metadata("intent", "ml-training");
 ```
 
