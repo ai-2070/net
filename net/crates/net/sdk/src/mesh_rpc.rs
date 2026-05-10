@@ -140,11 +140,22 @@ pub trait CallOptionsExt: Sized {
     /// services opting into predicate-pushdown decode via
     /// [`RpcContextExt::where_predicate`].
     ///
-    /// Returns `Err` only on encode-budget overflow
-    /// (predicate JSON exceeds `MAX_PREDICATE_RPC_HEADER_VALUE_LEN`,
-    /// currently 64 KiB). Predicates from typical `pred!` macro use
-    /// are orders of magnitude smaller than the cap, so callers who
-    /// know their input is bounded can safely `.unwrap()`.
+    /// Returns `Err` if either:
+    ///
+    ///   - the predicate's JSON encoding fails
+    ///     (`PredicateRpcEncodeError::Encode`) — should not happen
+    ///     for predicates built via the `pred!` macro / `Predicate`
+    ///     constructors, but is exposed defensively for forward-
+    ///     compat in case a future variant carries non-finite
+    ///     numerics or other serde-incompatible fields, OR
+    ///   - the encoded payload exceeds
+    ///     `MAX_PREDICATE_RPC_HEADER_VALUE_LEN` (currently
+    ///     **4 KiB**) — `PredicateRpcEncodeError::TooLarge`.
+    ///
+    /// Don't blindly `.unwrap()` the result; even predicates built
+    /// from typical `pred!` macro use can exceed 4 KiB once they
+    /// fan out (e.g. an Or-of-many StringPrefix clauses, an
+    /// And of large StringMatches patterns).
     fn with_where(
         self,
         pred: &net::adapter::net::behavior::Predicate,
