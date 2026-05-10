@@ -623,6 +623,23 @@
       "expected": true
     },
     {
+      "name": "semver_strips_build_metadata_with_embedded_dash",
+      "summary": "N-15: a build-metadata suffix containing `-` (e.g. `+build-1`) must not confuse the prefix-strip. Rust splits `+` first then `-`; the TS `Math.min(dash, plus)` and Python `min(dash, plus)` shapes both arrive at the same core because the `+` always comes first. Pin so any future refactor that flips the strip order is caught.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "semver_at_least",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "1.2.3"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["software.runtime.python=1.2.3+build-1"],
+      "metadata": {},
+      "expected": true
+    },
+    {
       "name": "numeric_rejects_hex_float_literal",
       "summary": "N-14: Rust `f64::from_str` rejects hex-float literals (`0x1p3`). Go's `strconv.ParseFloat` accepts them (returns 8.0); pre-fix the Go binding diverged. Cross-binding evaluation must agree that an `0x1p3` tag does NOT satisfy `numericAtLeast >= 1`.",
       "wire": {

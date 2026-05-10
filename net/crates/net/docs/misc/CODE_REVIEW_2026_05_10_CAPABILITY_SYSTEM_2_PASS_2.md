@@ -28,7 +28,7 @@ Tagged `[N1 | N2 | N3]`:
 | N-12 | N3 | placement   | `target_axis_value_numeric` lacks finite-range guard before f32 cast        | ✅ |
 | N-13 | N2 | Py binding  | `_parse_semver` admits Unicode digits, rejects `+1`                         | ✅ |
 | N-14 | N2 | Go binding  | `parseFloat` accepts hex floats and digit-separator underscores              | ✅ |
-| N-15 | N2 | TS binding  | `parseSemver` mishandles `1.2.3+build-1`                                    | ✅ |
+| N-15 | N2 | TS binding  | `parseSemver` mishandles `1.2.3+build-1`                                    | ⚪ |
 | N-16 | N3 | Go binding  | Streaming RPC construction is not cancellable                               | ✅ |
 
 ---
@@ -278,10 +278,14 @@ rejects the `+1` Rust accepts.
 
 **Location:** `capability-enhancements.ts:993-1023`
 
-Slicing on `Math.min(dash, plus)` cuts inside the `+build` segment for any
-version whose build-metadata contains a `-`; Rust splits `+` then `-`.
-
-**Fix:** strip `+build` first, then `-prerelease`, mirror Rust's order.
+⚪ **No fix needed.** On closer inspection the agent's original claim was
+wrong: `Math.min(dash, plus)` picks the *earlier* separator index, and in
+`1.2.3+build-1` the `+` at index 5 comes before the `-` at index 11, so the
+TS implementation correctly slices `core = "1.2.3"`. Rust's
+`split_once('+').then split_once('-')` reaches the same answer. No reachable
+input shape produces a divergence. Cross-binding fixture
+`semver_strips_build_metadata_with_embedded_dash` pins the agreement so any
+future refactor that flips the strip order surfaces immediately.
 
 ### N-16: Streaming RPC construction is not cancellable
 
