@@ -122,6 +122,50 @@ export {
   withSubnetLocalScope,
 } from './capabilities';
 
+// Capability-System Enhancements — typed taxonomy + predicate IR +
+// diff + chain helpers + StandardPlacement. Mirrors the substrate's
+// `adapter::net::behavior` surface; cross-binding-pinned by the
+// fixtures under `tests/cross_lang_capability/`.
+export type {
+  TaxonomyAxis,
+  TagKey,
+  AxisSeparator,
+  Tag,
+  PredicateNode,
+  PredicateWire,
+  Predicate,
+  CapabilitySetWire,
+  MetadataChange,
+  CapabilitySetDiff,
+  StandardPlacement,
+  PlacementCandidate,
+  PlacementFilterFn,
+  RegisteredPlacementFilter,
+} from './capability-enhancements';
+export {
+  TAXONOMY_AXES,
+  RESERVED_PREFIXES,
+  RPC_WHERE_HEADER,
+  tagKey,
+  tagToString,
+  tagFromString,
+  tagFromUserString,
+  startsWithReservedPrefix,
+  p,
+  predicateToWire,
+  predicateFromWire,
+  predicateToRpcHeader,
+  predicateFromRpcHeader,
+  diffCapabilities,
+  emptyCapabilities,
+  requireTag,
+  requireAxisValue,
+  withMetadata,
+  StandardPlacementBuilder,
+  standardPlacement,
+  placementFilterFromFn,
+} from './capability-enhancements';
+
 // Subnets (visibility enforcement).
 export { subnetId, GLOBAL_SUBNET } from './subnets';
 export type { SubnetId, SubnetRule, SubnetPolicy } from './subnets';
