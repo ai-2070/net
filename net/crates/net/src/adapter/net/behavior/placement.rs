@@ -268,9 +268,10 @@ impl Default for AntiAffinityConfig {
 }
 
 /// How the intent-match axis decides eligibility.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum IntentMatchPolicy {
     /// Disabled — intent axis always returns `1.0`. Default.
+    #[default]
     Disabled,
     /// Node fulfills any intent it has capability for. Slice 5
     /// wires the actual lookup against `IntentRegistry` (slice 3).
@@ -280,28 +281,17 @@ pub enum IntentMatchPolicy {
     Strict,
 }
 
-impl Default for IntentMatchPolicy {
-    fn default() -> Self {
-        IntentMatchPolicy::Disabled
-    }
-}
-
 /// How the colocation axis weights `metadata.colocate-with` matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColocationPolicy {
     /// Ignore colocation hints entirely (axis returns `1.0`). Default.
+    #[default]
     Ignore,
     /// Boost score when target hosts the colocation chain.
     SoftPreference,
     /// Refuse placement (return `None`) unless target hosts the
     /// colocation chain. Triggered by `colocate-with-strict`.
     StrictRequired,
-}
-
-impl Default for ColocationPolicy {
-    fn default() -> Self {
-        ColocationPolicy::Ignore
-    }
 }
 
 /// Reference `PlacementFilter` impl. Five-axis multi-criteria
@@ -602,7 +592,7 @@ impl<'a> StandardPlacement<'a> {
             // both `"scope:tenant:foo"` and `"tenant:foo"` compare
             // equal against the target's body field.
             let body = raw.strip_prefix("scope:").unwrap_or(raw);
-            target_scope_bodies.iter().any(|tb| *tb == body)
+            target_scope_bodies.contains(&body)
         });
 
         if any_match {
@@ -1015,9 +1005,7 @@ fn target_holds_chain(target_caps: &CapabilitySet, chain_hash: &str) -> bool {
             // Body is `<hash>` / `<hash>:<tip>` / `<hash>[<range>]`.
             // The hash extends until the first `:` or `[`; before
             // that boundary it's the chain id.
-            let hash_end = body
-                .find(|c: char| c == ':' || c == '[')
-                .unwrap_or(body.len());
+            let hash_end = body.find([':', '[']).unwrap_or(body.len());
             &body[..hash_end] == chain_hash
         }
         _ => false,

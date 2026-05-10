@@ -542,10 +542,8 @@ fn axis_match(
             Tag::AxisPresent {
                 axis: tag_axis,
                 key: tag_key,
-            } => {
-                if *tag_axis == axis && tag_key == key && value.is_none() {
-                    return true;
-                }
+            } if *tag_axis == axis && tag_key == key && value.is_none() => {
+                return true;
             }
             Tag::AxisValue {
                 axis: tag_axis,
@@ -884,9 +882,9 @@ mod tests {
         let i = idx();
         let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "memory_mb".to_string()));
         let rtts = |_: u64| Some(Duration::from_millis(1));
-        assert!(i.nearest(&pred, &rtts, 0).is_empty());
+        assert!(i.nearest(&pred, rtts, 0).is_empty());
         // Larger-than-corpus n returns all 3 memory_mb-bearing nodes.
-        let all = i.nearest(&pred, &rtts, 100);
+        let all = i.nearest(&pred, rtts, 100);
         assert_eq!(all.len(), 3);
     }
 

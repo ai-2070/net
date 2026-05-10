@@ -569,11 +569,11 @@ impl StandbyGroup {
     /// Preserves v1's recovery-correctness contract: standbys with
     /// the most recent sync (`last_sync.is_some()` AND highest
     /// `synced_through`) are still preferred. The placement filter
-    /// + LOCKED §7 tie-breaker break ties AMONG equivalently-fresh
-    /// standbys — they do NOT override data freshness, because
-    /// promoting a less-fresh standby would mean replaying the
-    /// `buffered_since_sync` window over a stale base and silently
-    /// losing pre-buffer state.
+    /// (with the LOCKED §7 tie-breaker) breaks ties AMONG
+    /// equivalently-fresh standbys — does NOT override data
+    /// freshness, because promoting a less-fresh standby would
+    /// mean replaying the `buffered_since_sync` window over a
+    /// stale base and silently losing pre-buffer state.
     ///
     /// Falls back to all healthy standbys (placement-scored) when
     /// no candidate has ever synced (legitimate during the first

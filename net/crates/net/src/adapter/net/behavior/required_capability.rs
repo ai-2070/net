@@ -599,7 +599,7 @@ mod tests {
         // Mirror the substrate plan's IntentRegistry::defaults() entry
         // for "ml-training": [hardware.gpu, hardware.gpu.vram_gb >= 24].
         // A node with both tags satisfies; one tag alone does not.
-        let reqs = vec![
+        let reqs = [
             require!("hardware.gpu"),
             require!("hardware.gpu.vram_gb >= 24"),
         ];

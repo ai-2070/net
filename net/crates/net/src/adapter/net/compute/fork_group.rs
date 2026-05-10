@@ -366,6 +366,13 @@ impl ForkGroup {
     /// from the daemon's `required_capabilities()` /
     /// `optional_capabilities()` plus the per-fork entity-id (used
     /// as `daemon_id` for stable ordering).
+    ///
+    /// Args mirror `Self::fork` plus the `(placement, tie_break)`
+    /// pair the v2 path needs. Bundling them into a single
+    /// `PlacementContext` struct just to dodge clippy's arg-count
+    /// lint would obscure the actual surface — every arg is
+    /// load-bearing per the LOCKED §7 placement contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn fork_with_placement<F>(
         parent_origin: u64,
         fork_seq: u64,

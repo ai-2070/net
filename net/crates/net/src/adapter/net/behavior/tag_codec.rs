@@ -760,10 +760,8 @@ pub fn tools_from_tags(tags: &[Tag]) -> Vec<ToolCapability> {
             "tool_id" => entry.tool_id = Some(value.to_string()),
             "name" => entry.name = Some(value.to_string()),
             "version" => entry.version = Some(value.to_string()),
-            "requires" => {
-                if !value.is_empty() {
-                    entry.requires = value.split(',').map(|s| s.to_string()).collect::<Vec<_>>();
-                }
+            "requires" if !value.is_empty() => {
+                entry.requires = value.split(',').map(|s| s.to_string()).collect::<Vec<_>>();
             }
             "estimated_time_ms" => {
                 entry.estimated_time_ms = value.parse().ok();
@@ -1575,7 +1573,7 @@ mod tests {
         let tool = ToolCapability::new("validator", "JSON Validator")
             .with_input_schema(r#"{"type":"object"}"#)
             .with_output_schema(r#"{"type":"boolean"}"#);
-        let decoded = tools_from_tags(&tools_to_tags(&[tool.clone()]));
+        let decoded = tools_from_tags(&tools_to_tags(std::slice::from_ref(&tool)));
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].input_schema, None);
         assert_eq!(decoded[0].output_schema, None);
@@ -1606,8 +1604,8 @@ mod tests {
         // stateless=false must round-trip that explicit value, not
         // collapse back to the default.
         let tool = ToolCapability::new("coffee_pot", "Stateful Coffee Pot").with_stateless(false);
-        let decoded = tools_from_tags(&tools_to_tags(&[tool.clone()]));
-        assert_eq!(decoded[0].stateless, false);
+        let decoded = tools_from_tags(&tools_to_tags(std::slice::from_ref(&tool)));
+        assert!(!decoded[0].stateless);
     }
 
     // ====================================================================

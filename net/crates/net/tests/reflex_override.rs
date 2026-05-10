@@ -382,7 +382,10 @@ async fn override_set_clear_is_atomic_with_announce_read() {
                 .capabilities
                 .tags
                 .iter()
-                .find_map(|t| NatClass::from_tag(t))
+                // Post-Phase-A.5.N.3: tags are typed (`Tag`) not
+                // strings; render to wire form for the legacy
+                // `NatClass::from_tag(&str)` API.
+                .find_map(|t| NatClass::from_tag(&t.to_string()))
                 .unwrap_or(NatClass::Unknown);
             let reflex = ann.reflex_addr;
             // Steady states:
@@ -473,7 +476,10 @@ async fn set_reflex_override_resets_rate_limit_for_next_announce() {
     let mut propagated = false;
     for _ in 0..40 {
         if let Some(caps) = b.capability_index().get(a_id) {
-            let has_post = caps.tags.iter().any(|t| t == "post");
+            // Post-Phase-A.5.N.3: tags are typed; compare via
+            // wire-string form. The synthetic announcement
+            // injects "post" as a legacy tag.
+            let has_post = caps.tags.iter().any(|t| t.to_string() == "post");
             let reflex = b.capability_index().reflex_addr(a_id);
             if has_post && reflex == Some(external) {
                 propagated = true;

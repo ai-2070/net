@@ -1022,6 +1022,14 @@ impl Predicate {
     }
 
     /// Build [`Predicate::Not`] wrapping a single clause.
+    ///
+    /// Named `not` to match `and` / `or` as a constructor —
+    /// not an `Op<Output = Predicate>` impl. Implementing
+    /// `std::ops::Not` would force callers to depend on
+    /// `Predicate: Not` for the `!` operator, which requires
+    /// `Predicate: Sized + Not<Output = ?>` boilerplate without
+    /// any expressivity gain over the explicit constructor.
+    #[allow(clippy::should_implement_trait)]
     pub fn not(inner: Predicate) -> Self {
         Self::Not(Box::new(inner))
     }
@@ -3587,8 +3595,8 @@ mod tests {
     }
 
     /// Application row type used to exercise `RpcPredicateContext`
-    /// + `filter_by_predicate`. Mirrors what a service handler's
-    /// row would look like.
+    /// and `filter_by_predicate`. Mirrors what a service
+    /// handler's row would look like.
     struct TestJob {
         id: u64,
         tags: Vec<Tag>,

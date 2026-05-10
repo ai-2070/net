@@ -211,7 +211,7 @@ fn validation_warning_to_wire(w: &ValidationWarning) -> Value {
     }
 }
 
-fn canonical_sort(v: &mut Vec<Value>) {
+fn canonical_sort(v: &mut [Value]) {
     v.sort_by_key(|x| x.to_string());
 }
 

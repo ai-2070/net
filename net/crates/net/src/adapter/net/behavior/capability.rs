@@ -1658,7 +1658,7 @@ impl<'a> CapabilityViews<'a> {
 /// so consecutive `views()` calls produce identical projections.
 fn sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
     let mut v: Vec<Tag> = tags.iter().cloned().collect();
-    v.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    v.sort_by_key(|a| a.to_string());
     v
 }
 
@@ -2537,10 +2537,7 @@ impl CapabilityIndex {
                 ),
                 _ => continue,
             };
-            let inner = self
-                .by_axis_key
-                .entry(axis_key)
-                .or_insert_with(DashMap::new);
+            let inner = self.by_axis_key.entry(axis_key).or_default();
             inner.entry(value).or_default().insert(node_id);
         }
 
@@ -2586,10 +2583,7 @@ impl CapabilityIndex {
         // leaves. Mirrors `by_tag` for the metadata side.
         for (k, v) in &caps.metadata {
             // Outer entry: key. Inner entry: value → node IDs.
-            let inner = self
-                .by_metadata
-                .entry(k.clone())
-                .or_insert_with(DashMap::new);
+            let inner = self.by_metadata.entry(k.clone()).or_default();
             inner.entry(v.clone()).or_default().insert(node_id);
         }
     }
@@ -4948,7 +4942,7 @@ mod tests {
 
         // Empty tenant id is silently dropped.
         let tags = tags_from(&[
-            &format!("{TAG_SCOPE_TENANT_PREFIX}"),
+            TAG_SCOPE_TENANT_PREFIX,
             &format!("{TAG_SCOPE_TENANT_PREFIX}real"),
         ]);
         match scope_from_tags(&tags) {

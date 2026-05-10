@@ -143,16 +143,14 @@ pub extern "C" fn net_predicate_evaluate(
 ///     SDK-layer `predicateToWire` produce.
 ///
 /// Outputs:
-///   - `*out_header_name`  — owned `char*` containing `"cyberdeck-where"`.
-///                          Free via `net_free_string`.
+///   - `*out_header_name` — owned `char*` containing
+///     `"cyberdeck-where"`. Free via `net_free_string`.
 ///   - `*out_header_name_len` — strlen of the header name.
-///   - `*out_value_ptr`    — owned `uint8_t*` containing the
-///                          canonical JSON bytes. Free via
-///                          `net_free_string` (the buffer was
-///                          allocated as a `CString::into_raw`,
-///                          same release path as other string-
-///                          out helpers in this module).
-///   - `*out_value_len`    — byte length of the value buffer.
+///   - `*out_value_ptr` — owned `uint8_t*` containing the
+///     canonical JSON bytes. Free via `net_free_string` (the
+///     buffer was allocated as a `CString::into_raw`, same
+///     release path as other string-out helpers in this module).
+///   - `*out_value_len` — byte length of the value buffer.
 ///
 /// Returns:
 ///   - `0` on success.
