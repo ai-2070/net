@@ -1,0 +1,48 @@
+net/crates/net/src/adapter/net/behavior/placement.rs
+  s_d1b11a1287c170::t_7df4dab31eb7af 274,288,595,1008
+net/crates/net/src/ffi/predicate.rs
+  s_d1b11a1287c170::t_ca9e4cfc2b8d0e 146-147,149-153
+net/crates/net/src/adapter/net/behavior/query.rs
+  s_d1b11a1287c170::t_1c690afe78d212 885,887
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_d1b11a1287c170::t_7df4dab31eb7af 1661,2540,2586
+  s_d1b11a1287c170::t_338e8f2ba70c83 4945
+net/crates/net/src/adapter/net/behavior/tag_codec.rs
+  s_d1b11a1287c170::t_9aa36acf51b742 1576,1607
+  s_d1b11a1287c170::t_7df4dab31eb7af 763
+  s_d1b11a1287c170::t_1c690afe78d212 1608
+net/crates/net/src/adapter/net/compute/fork_group.rs
+  s_d1b11a1287c170::t_e4cd8fc5c63e97 369-375
+net/crates/net/src/adapter/net/behavior/required_capability.rs
+  s_d1b11a1287c170::t_1c690afe78d212 602
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  s_d1b11a1287c170::t_c14952baf49d0b 572-576
+net/crates/net/src/ffi/schema.rs
+  s_d1b11a1287c170::t_0a52d07cb8b8f4 214
+net/crates/net/src/adapter/net/behavior/predicate.rs
+  s_d1b11a1287c170::t_4cc6a10d654491 3598-3599
+  s_d1b11a1287c170::t_8cec115c517e61 1025-1032
+net/crates/net/tests/cross_lang_capability_fixtures.rs
+  s_d1b11a1287c170::t_97db2a21a7606c 481
+net/crates/net/tests/reflex_override.rs
+  s_d1b11a1287c170::t_c50f06ce346579 479-482
+  s_d1b11a1287c170::t_714ba7d39c7a99 385-388
+net/crates/net/benches/net.rs
+  s_d1b11a1287c170::t_783ec4f9514c52 31,33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "1d7cb164b63bbbd05511fa5763864c3a8eba3aa6",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
