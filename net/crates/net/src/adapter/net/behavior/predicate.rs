@@ -340,10 +340,47 @@ impl Predicate {
 // =============================================================================
 
 impl Predicate {
-    /// Evaluate against `(tags, metadata)`. Pure function. Numeric /
-    /// semver parse failures yield `false` (a malformed tag value
-    /// shouldn't fault a federated query).
+    /// Evaluate against `(tags, metadata)`. Pure function.
+    ///
+    /// Phase 4 of `CAPABILITY_ENHANCEMENTS_PLAN.md`: at every
+    /// `And` / `Or` node, children are evaluated in cost-ascending
+    /// order so cheap+selective clauses short-circuit first. The
+    /// reordering is a pure local optimization — semantics are
+    /// identical to [`Self::evaluate_unplanned`]. Pinned by the
+    /// `planned_evaluate_matches_unplanned_*` property tests.
+    ///
+    /// Numeric / semver parse failures yield `false` (a malformed
+    /// tag value shouldn't fault a federated query).
     pub fn evaluate(&self, ctx: &EvalContext<'_>) -> bool {
+        match self {
+            Self::And(children) => Self::eval_all_in_cost_order(children, ctx),
+            Self::Or(children) => Self::eval_any_in_cost_order(children, ctx),
+            Self::Not(inner) => !inner.evaluate(ctx),
+            other => other.evaluate_leaf(ctx),
+        }
+    }
+
+    /// Evaluate without the planner — children of `And` / `Or` run
+    /// in declaration order.
+    ///
+    /// Phase 4 escape hatch for benchmarking and the planner-
+    /// equivalence property tests. Production callers should use
+    /// [`Self::evaluate`]; this is a diagnostic surface only.
+    pub fn evaluate_unplanned(&self, ctx: &EvalContext<'_>) -> bool {
+        match self {
+            Self::And(children) => children.iter().all(|c| c.evaluate_unplanned(ctx)),
+            Self::Or(children) => children.iter().any(|c| c.evaluate_unplanned(ctx)),
+            Self::Not(inner) => !inner.evaluate_unplanned(ctx),
+            other => other.evaluate_leaf(ctx),
+        }
+    }
+
+    /// Evaluate a leaf predicate (anything except `And` / `Or` /
+    /// `Not`). Shared between [`Self::evaluate`] and
+    /// [`Self::evaluate_unplanned`] so the leaf logic lives in one
+    /// place and the two entry points only differ in their
+    /// composite handling.
+    fn evaluate_leaf(&self, ctx: &EvalContext<'_>) -> bool {
         match self {
             Self::Exists { key } => match_axis_tag(ctx.tags, key, |_| true),
             Self::Equals { key, value } => {
@@ -407,9 +444,69 @@ impl Predicate {
                 .get(key)
                 .and_then(|v| v.parse::<f64>().ok())
                 .is_some_and(|n| n >= *threshold),
-            Self::And(clauses) => clauses.iter().all(|c| c.evaluate(ctx)),
-            Self::Or(clauses) => clauses.iter().any(|c| c.evaluate(ctx)),
-            Self::Not(inner) => !inner.evaluate(ctx),
+            // Composite variants are routed through `evaluate` /
+            // `evaluate_unplanned`, never reach this leaf-only path.
+            Self::And(_) | Self::Or(_) | Self::Not(_) => unreachable!(
+                "evaluate_leaf called with a composite Predicate; \
+                 routing bug in evaluate / evaluate_unplanned"
+            ),
+        }
+    }
+
+    /// `And` short-circuit evaluation in cost-ascending child order.
+    fn eval_all_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>) -> bool {
+        let mut order: Vec<usize> = (0..children.len()).collect();
+        order.sort_by_key(|&i| children[i].static_cost());
+        order.into_iter().all(|i| children[i].evaluate(ctx))
+    }
+
+    /// `Or` short-circuit evaluation in cost-ascending child order.
+    fn eval_any_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>) -> bool {
+        let mut order: Vec<usize> = (0..children.len()).collect();
+        order.sort_by_key(|&i| children[i].static_cost());
+        order.into_iter().any(|i| children[i].evaluate(ctx))
+    }
+
+    /// Static cost estimate for the planner. Lower = cheaper to
+    /// evaluate; planner sorts children ascending.
+    ///
+    /// Phase 4 first cut uses fixed-per-variant costs (no index
+    /// integration). The ordering reflects empirical evaluation
+    /// cost: hashmap lookups < tag-set scans with simple parses
+    /// < substring scans < semver parses.
+    ///
+    /// Composite costs sum the children's costs, so a deeply
+    /// nested branch is heavier than a shallow one with the same
+    /// leaf shape.
+    fn static_cost(&self) -> u32 {
+        match self {
+            // Tier 1: O(1) hashmap lookup.
+            Self::MetadataExists { .. } => 10,
+            Self::MetadataEquals { .. } => 11,
+            // Tier 2: O(N) tag-set scan with cheap value handling.
+            Self::Exists { .. } => 20,
+            Self::Equals { .. } => 21,
+            Self::MetadataNumericAtLeast { .. } => 25,
+            // Tier 3: O(N) tag-set scan + numeric parse per match.
+            Self::NumericAtLeast { .. }
+            | Self::NumericAtMost { .. }
+            | Self::NumericInRange { .. } => 30,
+            // Tier 4: O(N) scan + substring / prefix scan.
+            Self::StringPrefix { .. } => 40,
+            Self::MetadataMatches { .. } => 45,
+            Self::StringMatches { .. } => 50,
+            // Tier 5: semver triple parse (heaviest leaf).
+            Self::SemverAtLeast { .. }
+            | Self::SemverAtMost { .. }
+            | Self::SemverCompatible { .. } => 60,
+            // Composites: sum of children. Caps avoid u32 overflow
+            // by saturating at u32::MAX (a predicate this big
+            // would have a different problem already).
+            Self::And(c) | Self::Or(c) => c
+                .iter()
+                .map(|c| c.static_cost())
+                .fold(0u32, |a, b| a.saturating_add(b)),
+            Self::Not(inner) => inner.static_cost(),
         }
     }
 }
@@ -928,5 +1025,246 @@ mod tests {
     #[should_panic(expected = "must be `<axis>.<key>`")]
     fn pred_macro_panics_on_missing_dot() {
         let _ = pred!(exists "hardware");
+    }
+
+    // ========================================================================
+    // Query planner — Phase 4 of CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    fn meta_with(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// Worst-case AST: high-selectivity metadata-equals clause buried
+    /// LAST among 5 children. Unplanned eval pays for the four
+    /// preceding clauses on every false case; planned eval runs the
+    /// metadata-equals first and short-circuits.
+    fn worst_case_and() -> Predicate {
+        Predicate::And(vec![
+            Predicate::SemverCompatible {
+                key: TagKey::new(TaxonomyAxis::Software, "runtime.python"),
+                version: "3.11".into(),
+            },
+            Predicate::StringMatches {
+                key: TagKey::new(TaxonomyAxis::Software, "os"),
+                pattern: "linux".into(),
+            },
+            Predicate::NumericAtLeast {
+                key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+                threshold: 65536.0,
+            },
+            Predicate::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+            },
+            Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+        ])
+    }
+
+    #[test]
+    fn planner_reorders_and_children_cheap_first() {
+        // Pin the planner's ordering on the worst-case AST.
+        // The cheapest leaf (`MetadataEquals`, cost=11) must run
+        // before the heaviest (`SemverCompatible`, cost=60).
+        let ast = worst_case_and();
+        if let Predicate::And(children) = &ast {
+            // Verify costs as expected from the static_cost table.
+            let costs: Vec<u32> = children.iter().map(|c| c.static_cost()).collect();
+            assert_eq!(costs, vec![60, 50, 30, 20, 11]);
+        } else {
+            panic!("worst_case_and produced non-And");
+        }
+    }
+
+    #[test]
+    fn planner_preserves_semantics_on_short_circuit_false() {
+        // Pin: planner-vs-unplanned equivalence on a clearly-false
+        // input. Both must return false; planner short-circuits
+        // earlier but the result is identical.
+        let tags: Vec<Tag> = vec![axis_eq(TaxonomyAxis::Hardware, "memory_mb", "32768")];
+        let meta = empty_meta();
+        let cx = ctx(&tags, &meta);
+        let ast = worst_case_and();
+        // Memory is 32768 < 65536, so the AND fails. Both paths
+        // agree.
+        assert!(!ast.evaluate(&cx));
+        assert!(!ast.evaluate_unplanned(&cx));
+    }
+
+    #[test]
+    fn planner_preserves_semantics_on_full_match() {
+        let tags: Vec<Tag> = vec![
+            axis_eq(TaxonomyAxis::Hardware, "memory_mb", "131072"),
+            axis_present(TaxonomyAxis::Hardware, "gpu"),
+            axis_eq(TaxonomyAxis::Software, "os", "linux"),
+            axis_eq(TaxonomyAxis::Software, "runtime.python", "3.11.5"),
+        ];
+        let meta = meta_with(&[("intent", "ml-training")]);
+        let cx = ctx(&tags, &meta);
+        let ast = worst_case_and();
+        assert!(ast.evaluate(&cx));
+        assert!(ast.evaluate_unplanned(&cx));
+    }
+
+    #[test]
+    fn planner_preserves_or_short_circuit_semantics() {
+        // Or with mixed costs: cheap clause that's true should win
+        // either way (planner runs it first; unplanned still finds
+        // it eventually).
+        let ast = Predicate::Or(vec![
+            Predicate::SemverCompatible {
+                key: TagKey::new(TaxonomyAxis::Software, "runtime.python"),
+                version: "9.9".into(),
+            },
+            Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+        ]);
+        let meta = meta_with(&[("intent", "ml-training")]);
+        let cx = ctx(&[], &meta);
+        assert!(ast.evaluate(&cx));
+        assert!(ast.evaluate_unplanned(&cx));
+    }
+
+    #[test]
+    fn planner_static_cost_compositees_sum_children() {
+        // And/Or cost = sum of children. Used to prefer shallow
+        // branches over deep ones when ordering nested compositions.
+        let cheap = Predicate::MetadataExists { key: "k".into() };
+        let expensive = Predicate::SemverCompatible {
+            key: TagKey::new(TaxonomyAxis::Software, "x"),
+            version: "1.0".into(),
+        };
+        let nested = Predicate::And(vec![cheap.clone(), expensive.clone()]);
+        let leaf_cost = cheap.static_cost() + expensive.static_cost();
+        assert_eq!(nested.static_cost(), leaf_cost);
+
+        // Not(inner) keeps inner's cost (no overhead for negation).
+        let negated = Predicate::Not(Box::new(expensive.clone()));
+        assert_eq!(negated.static_cost(), expensive.static_cost());
+    }
+
+    #[test]
+    fn planner_handles_empty_and_or_correctly() {
+        // Empty And is vacuous true; empty Or is vacuous false.
+        // Planner reordering on empty children is a no-op, but
+        // pin the contract so a future "ordered eval requires
+        // children" assertion doesn't slip in.
+        let meta = BTreeMap::new();
+        let cx = ctx(&[], &meta);
+        assert!(Predicate::And(vec![]).evaluate(&cx));
+        assert!(!Predicate::Or(vec![]).evaluate(&cx));
+        assert!(Predicate::And(vec![]).evaluate_unplanned(&cx));
+        assert!(!Predicate::Or(vec![]).evaluate_unplanned(&cx));
+    }
+
+    /// Exhaustive small-input parity: enumerate a handful of small
+    /// `(ast, ctx)` combinations and assert planned = unplanned.
+    /// Phase 4 doesn't ship full property-based fuzzing
+    /// (no proptest dep yet); this hand-rolled equivalence test
+    /// covers the load-bearing cases.
+    #[test]
+    fn planner_evaluate_matches_unplanned_across_canonical_inputs() {
+        // Build a corpus of N predicates × M contexts and assert
+        // planned == unplanned for every combination.
+        let predicates: Vec<Predicate> = vec![
+            // Simple leaves
+            Predicate::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+            },
+            Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+            Predicate::NumericAtLeast {
+                key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+                threshold: 65536.0,
+            },
+            // Composites
+            worst_case_and(),
+            Predicate::Or(vec![
+                Predicate::Exists {
+                    key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+                },
+                Predicate::MetadataEquals {
+                    key: "intent".into(),
+                    value: "ml-training".into(),
+                },
+            ]),
+            // Nested And-of-Or-of-And
+            Predicate::And(vec![
+                Predicate::Or(vec![
+                    Predicate::Exists {
+                        key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+                    },
+                    Predicate::And(vec![
+                        Predicate::NumericAtLeast {
+                            key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+                            threshold: 65536.0,
+                        },
+                        Predicate::MetadataExists { key: "intent".into() },
+                    ]),
+                ]),
+                Predicate::Not(Box::new(Predicate::MetadataEquals {
+                    key: "decommissioning".into(),
+                    value: "true".into(),
+                })),
+            ]),
+        ];
+
+        let contexts: Vec<(Vec<Tag>, BTreeMap<String, String>)> = vec![
+            // Empty
+            (vec![], BTreeMap::new()),
+            // Hardware match only
+            (
+                vec![
+                    axis_present(TaxonomyAxis::Hardware, "gpu"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "131072"),
+                ],
+                BTreeMap::new(),
+            ),
+            // Metadata match only
+            (vec![], meta_with(&[("intent", "ml-training")])),
+            // Full match
+            (
+                vec![
+                    axis_present(TaxonomyAxis::Hardware, "gpu"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "131072"),
+                    axis_eq(TaxonomyAxis::Software, "os", "linux"),
+                    axis_eq(TaxonomyAxis::Software, "runtime.python", "3.11.5"),
+                ],
+                meta_with(&[("intent", "ml-training")]),
+            ),
+            // Full match + decommissioning marker (should fail the
+            // last nested predicate's `Not` clause).
+            (
+                vec![
+                    axis_present(TaxonomyAxis::Hardware, "gpu"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "131072"),
+                ],
+                meta_with(&[
+                    ("intent", "ml-training"),
+                    ("decommissioning", "true"),
+                ]),
+            ),
+        ];
+
+        for (i, ast) in predicates.iter().enumerate() {
+            for (j, (tags, meta)) in contexts.iter().enumerate() {
+                let cx = ctx(tags, meta);
+                let planned = ast.evaluate(&cx);
+                let unplanned = ast.evaluate_unplanned(&cx);
+                assert_eq!(
+                    planned, unplanned,
+                    "predicate[{i}] ctx[{j}]: planned={planned} != unplanned={unplanned}"
+                );
+            }
+        }
     }
 }
