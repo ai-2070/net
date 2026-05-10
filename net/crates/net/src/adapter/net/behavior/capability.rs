@@ -2676,6 +2676,51 @@ impl CapabilityIndex {
         candidates
     }
 
+    /// Find indexed nodes whose capabilities match `predicate`.
+    ///
+    /// Linear scan over the indexed-node table; each node's
+    /// capabilities are evaluated against `predicate` via the
+    /// cardinality-aware planner ([`Predicate::evaluate_with_index`]).
+    /// `Self` provides the cardinality data — the same index that
+    /// holds the candidates also informs the planner's clause
+    /// ordering, so high-cardinality discriminating clauses run
+    /// first.
+    ///
+    /// Phase 5.B follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+    /// Bridges the substrate's `CapabilityIndex` with the
+    /// `Predicate` AST so applications can do predicate-based
+    /// discovery without building a `CapabilityFilter`.
+    ///
+    /// Cost: O(N) where N is the number of indexed nodes. Each
+    /// per-node check materializes the node's tags as a Vec for
+    /// the slice-based `EvalContext` — for hot loops over many
+    /// predicates against the same index, callers may prefer to
+    /// pre-extract a `Vec<(u64, Vec<Tag>, BTreeMap)>` once and
+    /// reuse it.
+    ///
+    /// Returns matching node IDs in unspecified order. Callers
+    /// that need a deterministic order should sort.
+    pub fn find_nodes_matching(
+        &self,
+        predicate: &crate::adapter::net::behavior::Predicate,
+    ) -> Vec<u64> {
+        let mut matched = Vec::new();
+        for entry in self.nodes.iter() {
+            let node_id = *entry.key();
+            let caps = &entry.value().capabilities;
+            // Materialize tags for the slice-based EvalContext.
+            let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
+            let ctx = crate::adapter::net::behavior::EvalContext::new(
+                &tags,
+                &caps.metadata,
+            );
+            if predicate.evaluate_with_index(&ctx, self) {
+                matched.push(node_id);
+            }
+        }
+        matched
+    }
+
     /// Distinct-value cardinality for an axis tag key.
     ///
     /// Returns the number of distinct values seen for the given
@@ -3269,6 +3314,187 @@ mod tests {
             "memory_mb",
         );
         assert_eq!(index.axis_cardinality(&key), 100);
+    }
+
+    // ========================================================================
+    // CapabilityIndex::find_nodes_matching — Phase 5.B follow-on of
+    // CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    #[test]
+    fn find_nodes_matching_simple_predicate() {
+        // 4 nodes: 2 with GPUs, 2 without. Predicate selects GPU nodes.
+        let index = CapabilityIndex::new();
+        index_with_node(
+            &index,
+            1,
+            CapabilitySet::new().with_hardware(
+                HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 1024)),
+            ),
+        );
+        index_with_node(
+            &index,
+            2,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(65536)),
+        );
+        index_with_node(
+            &index,
+            3,
+            CapabilitySet::new().with_hardware(
+                HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Amd, "x", 1024)),
+            ),
+        );
+        index_with_node(
+            &index,
+            4,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_cpu(8, 16)),
+        );
+
+        let pred = crate::adapter::net::behavior::Predicate::Exists {
+            key: crate::adapter::net::behavior::tag::TagKey::new(
+                crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                "gpu",
+            ),
+        };
+        let mut matched = index.find_nodes_matching(&pred);
+        matched.sort();
+        assert_eq!(matched, vec![1, 3]);
+    }
+
+    #[test]
+    fn find_nodes_matching_composite_predicate() {
+        // 4 nodes; the predicate selects nodes with GPU AND
+        // intent=ml-training metadata. Pin the And + metadata
+        // composition path.
+        let index = CapabilityIndex::new();
+        // GPU + ml-training → match
+        index_with_node(
+            &index,
+            10,
+            CapabilitySet::new()
+                .with_hardware(
+                    HardwareCapabilities::new()
+                        .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
+                )
+                .with_metadata("intent", "ml-training"),
+        );
+        // GPU but wrong intent → miss
+        index_with_node(
+            &index,
+            11,
+            CapabilitySet::new()
+                .with_hardware(
+                    HardwareCapabilities::new()
+                        .with_gpu(GpuInfo::new(GpuVendor::Amd, "x", 1024)),
+                )
+                .with_metadata("intent", "embedding-cache"),
+        );
+        // ml-training but no GPU → miss
+        index_with_node(
+            &index,
+            12,
+            CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_memory(65536))
+                .with_metadata("intent", "ml-training"),
+        );
+        // Neither → miss
+        index_with_node(
+            &index,
+            13,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_cpu(4, 8)),
+        );
+
+        let pred = crate::adapter::net::behavior::Predicate::And(vec![
+            crate::adapter::net::behavior::Predicate::Exists {
+                key: crate::adapter::net::behavior::tag::TagKey::new(
+                    crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                    "gpu",
+                ),
+            },
+            crate::adapter::net::behavior::Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+        ]);
+        let matched = index.find_nodes_matching(&pred);
+        assert_eq!(matched, vec![10]);
+    }
+
+    #[test]
+    fn find_nodes_matching_no_match_returns_empty() {
+        let index = CapabilityIndex::new();
+        index_with_node(
+            &index,
+            1,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1024)),
+        );
+        let pred = crate::adapter::net::behavior::Predicate::Exists {
+            key: crate::adapter::net::behavior::tag::TagKey::new(
+                crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                "gpu",
+            ),
+        };
+        let matched = index.find_nodes_matching(&pred);
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn find_nodes_matching_empty_index_returns_empty() {
+        let index = CapabilityIndex::new();
+        let pred = crate::adapter::net::behavior::Predicate::Exists {
+            key: crate::adapter::net::behavior::tag::TagKey::new(
+                crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                "gpu",
+            ),
+        };
+        let matched = index.find_nodes_matching(&pred);
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn find_nodes_matching_uses_cardinality_aware_planner() {
+        // Build an index where one node matches a high-cardinality
+        // discriminator AND a low-cardinality clause; a different
+        // node matches only the low-cardinality clause. The
+        // cardinality-aware planner runs the high-cardinality
+        // (more selective) clause first → fewer evaluations of the
+        // low-cardinality clause. Result is the same; this test
+        // pins the *result*, not the ordering (which is internal).
+        let index = CapabilityIndex::new();
+        // Many distinct memory values → high cardinality of memory_mb
+        for i in 0..20u64 {
+            let mut caps = CapabilitySet::new().with_hardware(
+                HardwareCapabilities::new()
+                    .with_memory(1024 + i as u32)
+                    .with_gpu(GpuInfo::new(
+                        if i % 2 == 0 { GpuVendor::Nvidia } else { GpuVendor::Amd },
+                        "x",
+                        1024,
+                    )),
+            );
+            if i == 5 {
+                caps = caps.with_metadata("intent", "ml-training");
+            }
+            index_with_node(&index, i, caps);
+        }
+
+        // Predicate: intent=ml-training (low-card metadata) AND memory=1029 (high-card axis)
+        let pred = crate::adapter::net::behavior::Predicate::And(vec![
+            crate::adapter::net::behavior::Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+            crate::adapter::net::behavior::Predicate::Equals {
+                key: crate::adapter::net::behavior::tag::TagKey::new(
+                    crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                    "memory_mb",
+                ),
+                value: "1029".into(),
+            },
+        ]);
+        // Only node 5 matches both clauses.
+        let matched = index.find_nodes_matching(&pred);
+        assert_eq!(matched, vec![5]);
     }
 
     #[test]
