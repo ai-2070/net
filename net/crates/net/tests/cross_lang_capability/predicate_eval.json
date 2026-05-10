@@ -621,6 +621,40 @@
       ],
       "metadata": { "intent": "embedding-cache" },
       "expected": true
+    },
+    {
+      "name": "numeric_rejects_hex_float_literal",
+      "summary": "N-14: Rust `f64::from_str` rejects hex-float literals (`0x1p3`). Go's `strconv.ParseFloat` accepts them (returns 8.0); pre-fix the Go binding diverged. Cross-binding evaluation must agree that an `0x1p3` tag does NOT satisfy `numericAtLeast >= 1`.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "cpu_cores" },
+            "threshold": 1.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.cpu_cores=0x1p3"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "numeric_rejects_digit_separator_underscore",
+      "summary": "N-14: Rust `f64::from_str` rejects digit-separator underscores (`1_000`). Go's `strconv.ParseFloat` accepts them (returns 1000.0); pre-fix the Go binding diverged. Cross-binding evaluation must agree that `1_000` does NOT satisfy a numeric predicate.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "cpu_cores" },
+            "threshold": 1.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.cpu_cores=1_000"],
+      "metadata": {},
+      "expected": false
     }
   ]
 }

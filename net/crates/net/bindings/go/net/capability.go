@@ -1246,6 +1246,18 @@ func parseFloat(s string) (float64, bool) {
 	if s == "" {
 		return 0, false
 	}
+	// N-14: pre-screen for forms Rust's `f64::from_str` rejects but
+	// Go's `strconv.ParseFloat` accepts:
+	//   - hex floats (`0x1p3` → 8.0, `0X1.8p10` → 1536.0).
+	//   - digit-separator underscores (`1_000` → 1000.0).
+	// Rust's `f64::from_str` parses neither (it's strict decimal /
+	// scientific). Without this gate a peer announcing
+	// `hardware.cpu_cores=0x1p3` evaluated `NumericAtLeast >= 8` as
+	// true in Go and false in Rust. R1 fixed the ±inf divergence;
+	// hex / `_` are the remaining gaps in the Go-vs-Rust accepted-set.
+	if strings.ContainsAny(s, "_xX") {
+		return 0, false
+	}
 	n, err := strconv.ParseFloat(s, 64)
 	if err != nil {
 		return 0, false

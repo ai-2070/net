@@ -1008,6 +1008,14 @@ def _try_parse_float(s: str) -> Optional[float]:
     if s != s.strip():
         # Rust f64 parse rejects whitespace; mirror that here.
         return None
+    # N-14: Python's ``float()`` accepts digit-separator underscores
+    # (``float("1_000") == 1000.0``); Rust's ``f64::from_str``
+    # rejects them. A peer announcing ``hardware.cpu_cores=1_000``
+    # then evaluated NumericAtLeast differently across bindings.
+    # Hex floats aren't a Python concern (``float("0x1p3")`` already
+    # raises ValueError) but underscores need the explicit gate.
+    if "_" in s:
+        return None
     try:
         return float(s)
     except (ValueError, OverflowError):
