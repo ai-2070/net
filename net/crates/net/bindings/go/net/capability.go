@@ -1154,11 +1154,24 @@ func semverCmp(a, b semverTriple) int {
 }
 
 func semverCompatibleGo(lhs, rhs semverTriple) bool {
+	// Mirrors Cargo's `^` operator semantics — kept in lockstep
+	// with the Rust `semver_compatible` helper in `predicate.rs`.
 	if semverCmp(lhs, rhs) < 0 {
 		return false
 	}
 	if rhs[0] == 0 {
-		return rhs[1] == lhs[1]
+		if rhs[1] == 0 {
+			// P1-D / Q1: 0.0.x — patch is the compatibility band;
+			// anything other than the exact tuple is a breaking
+			// change. Combined with the lhs >= rhs guard above
+			// this collapses to lhs == rhs.
+			return lhs[0] == rhs[0] && lhs[1] == rhs[1] && lhs[2] == rhs[2]
+		}
+		// Q1: 0.x.y — minor is the compatibility band, AND the
+		// major must also be 0. Pre-fix `rhs[1] == lhs[1]` alone
+		// admitted `lhs = (1, 2, 5)` against `rhs = (0, 2, 3)`
+		// — 1.x.y is a major-version regression against ^0.2.3.
+		return lhs[0] == 0 && rhs[1] == lhs[1]
 	}
 	return rhs[0] == lhs[0]
 }
