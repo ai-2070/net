@@ -458,8 +458,12 @@ use net_sdk::capabilities::{
     CapabilitySet, CapabilityViews,
     // Diff
     CapabilitySetDiff, MetadataChange,
-    // Predicates (substrate AST + nRPC envelope)
-    predicate::{Predicate, EvalContext, predicate_to_rpc_header, RPC_WHERE_HEADER},
+    // Predicates (substrate AST + nRPC envelope + trace)
+    predicate::{
+        Predicate, EvalContext, PredicateDebugReport,
+        predicate_to_rpc_header, predicate_from_rpc_headers,
+        RPC_WHERE_HEADER,
+    },
     pred,
     // Validation
     schema::{validate_capabilities, ValidationReport, SchemaError},
@@ -486,9 +490,18 @@ let p = pred!(and [
 let ctx = EvalContext::new(&tags, &metadata);
 let _matched = p.evaluate(&ctx);
 
-// Wire form for nRPC `cyberdeck-where:` headers.
-let _header_value = predicate_to_rpc_header(&p);
+// Single-evaluation trace — every clause's verdict + skipped
+// children for short-circuit AND/OR.
+let (_result, _trace) = p.evaluate_with_trace(&ctx);
+
+// Wire form for nRPC `cyberdeck-where:` headers — pair with the
+// substrate's `*_with_headers` calls so server-side filtering
+// shortcircuits without re-running the predicate per hop.
+let (_name, _value): (String, Vec<u8>) = predicate_to_rpc_header(&p)?;
 let _ = RPC_WHERE_HEADER;
+// Reverse direction: parse a peer-supplied header back into the AST.
+# let header_pairs: Vec<(String, Vec<u8>)> = Vec::new();
+let _decoded = predicate_from_rpc_headers(&header_pairs)?;
 
 // Validate against the canonical schema.
 let report = validate_capabilities(&caps);
@@ -499,16 +512,29 @@ if !report.is_valid() {
 // Detect what changed between two snapshots — drives placement
 // re-evaluation when a daemon's CapabilitySet updates.
 let _diff = caps.diff(&prev);
+
+// Profile a predicate across a corpus — per-clause hit/miss
+// stats with short-circuit accounting. Bindings (TS / Python /
+// Go) wrap this with a `redact_metadata_keys` helper for safe
+// persistence; Rust callers compose redaction at the application
+// layer.
+# let corpus = std::iter::empty::<EvalContext<'_>>();
+let _report = PredicateDebugReport::from_evaluations(&p, corpus);
 # Ok(())
 # }
 ```
 
-The wire format is byte-identical across all four bindings (Rust /
-TS / Python / Go) — pinned by the JSON fixtures under
-`tests/cross_lang_capability/`. Migration from the legacy
-field-access API:
-[`CAPABILITY_SYSTEM_MIGRATION.md`](../docs/CAPABILITY_SYSTEM_MIGRATION.md).
-A worked-examples guide for each enhancement API is at
+For host-side placement-filter callbacks, implement
+[`PlacementFilter`](https://docs.rs/net-sdk/latest/net_sdk/capabilities/trait.PlacementFilter.html)
+directly and register the impl with
+[`global_placement_filter_registry()`](https://docs.rs/net-sdk/latest/net_sdk/capabilities/fn.global_placement_filter_registry.html);
+the TS / Python / Go bindings auto-wrap closures via
+`placement_filter_from_fn` for the same registry.
+
+The wire format is byte-identical across all five bindings (Rust /
+TS / Python / Go / C) — pinned by the JSON fixtures under
+`tests/cross_lang_capability/`. A worked-examples guide for each
+enhancement API:
 [`CAPABILITY_ENHANCEMENTS_USAGE.md`](../docs/CAPABILITY_ENHANCEMENTS_USAGE.md).
 
 ### Subnets (visibility partitioning)

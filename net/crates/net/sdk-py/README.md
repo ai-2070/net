@@ -635,14 +635,18 @@ from net_sdk import (
     # Chain helpers
     empty_capabilities, require_tag, require_axis_value, with_metadata,
     # Predicates
-    p, evaluate_predicate, predicate_to_rpc_header, RPC_WHERE_HEADER,
+    p, evaluate_predicate,
+    predicate_to_rpc_header, predicate_from_rpc_header, RPC_WHERE_HEADER,
     tag_key,
+    # Predicate trace + debug
+    evaluate_predicate_with_trace,
+    predicate_debug_report, redact_metadata_keys,
     # Validation
     validate_capabilities,
     # Diff
     diff_capabilities,
-    # Debug
-    predicate_debug_report, redact_metadata_keys,
+    # Placement filters
+    standard_placement, placement_filter_from_fn,
 )
 
 # Build a capability set in the wire shape `{ tags, metadata }`.
@@ -661,8 +665,12 @@ pred = p.and_(
 # Local evaluation (no mesh round-trip).
 matched = evaluate_predicate(pred, caps.tags, caps.metadata)
 
-# Wire form for nRPC `cyberdeck-where:` headers.
+# Wire form for nRPC `cyberdeck-where:` headers — pair with the
+# header-bearing call variants so server-side filtering picks
+# the right candidate without re-running the predicate per hop.
 header_value = predicate_to_rpc_header(pred)
+# Reverse direction: parse a peer-supplied header back to AST.
+decoded = predicate_from_rpc_header(header_value)
 
 # Validate against the canonical schema.
 report = validate_capabilities(caps)
@@ -672,14 +680,27 @@ if not report.is_valid():
 # Detect what changed between two snapshots.
 delta = diff_capabilities(prev_caps, caps)
 
+# Single-evaluation trace — every clause's verdict + skipped
+# children for short-circuit AND/OR.
+result, trace = evaluate_predicate_with_trace(pred, tags, metadata)
+
 # Profile a predicate across a corpus + render a per-clause report.
 debug = predicate_debug_report(pred, contexts)
 safe = redact_metadata_keys(debug, ["intent"])  # scrub before persisting
 print(safe.render())
+
+# Wrap a predicate as a placement-filter callback the substrate
+# invokes per candidate. Pair with `standard_placement` to
+# install a custom scoring axis driven by the Python predicate.
+pf = placement_filter_from_fn(
+    lambda cand: evaluate_predicate(pred, cand.tags, cand.metadata),
+)
+placement = standard_placement(custom_filter_id=pf.id)
 ```
 
-Migration from the legacy field-access API:
-[`CAPABILITY_SYSTEM_MIGRATION.md`](../docs/CAPABILITY_SYSTEM_MIGRATION.md).
+The wire format is byte-identical across all five bindings (Rust /
+TS / Python / Go / C) — pinned by JSON fixtures under
+`tests/cross_lang_capability/`.
 
 ## API
 
