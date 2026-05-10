@@ -1,0 +1,22 @@
+net/crates/net/tests/cross_lang_capability/predicate_eval.json
+  s_9163f300668f8b::t_2d3ab95ea5f96f 626-641
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2_PASS_2.md
+  s_9163f300668f8b::t_71b98a1dfdff68 281-288
+  s_9163f300668f8b::t_9e196fb7b97005 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "65628d62fe60f0485d2a0e427cc57a174aad097d",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
