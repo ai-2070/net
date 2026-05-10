@@ -1803,8 +1803,14 @@ fn semver_compatible(lhs: SemverTriple, rhs: SemverTriple) -> bool {
             // collapses to lhs == rhs.
             lhs == rhs
         } else {
-            // 0.x.y — minor is the compatibility band.
-            rhs.1 == lhs.1
+            // 0.x.y — minor is the compatibility band, AND the
+            // major must also be 0. Pre-fix `rhs.1 == lhs.1`
+            // alone admitted `lhs = 1.2.5` as compatible with
+            // `rhs = 0.2.3` (the lhs >= rhs guard passes since
+            // 1 > 0, then minors match). 1.2.5 is not `^0.2.3`-
+            // compatible per Cargo: 0.x.y treats minor as the
+            // band IFF the band itself is 0.x.y.
+            lhs.0 == 0 && rhs.1 == lhs.1
         }
     } else {
         rhs.0 == lhs.0
@@ -2101,6 +2107,31 @@ mod tests {
         // Cross-band (different minor) still fails.
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.1.0")];
         assert!(!pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta)));
+    }
+
+    /// Q1: a non-zero major `lhs` is NOT compatible with a 0.x.y
+    /// `rhs` — Cargo's caret rule treats 0.x.y as the band only
+    /// when the major is also 0. Pre-fix, `rhs.1 == lhs.1` alone
+    /// passed for `lhs = 1.2.5` against `rhs = 0.2.3` (lhs >= rhs
+    /// passes since 1 > 0; minors match). 1.x.y running against
+    /// `^0.2.3` is a major-version regression that should fail
+    /// the compatibility check.
+    #[test]
+    fn semver_compatible_zero_x_band_requires_lhs_major_zero() {
+        let meta = empty_meta();
+
+        // 0.2.x band: same-major-zero, same-minor matches.
+        let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.2.5")];
+        assert!(pred!(semver_compatible "software.runtime", "0.2.3").evaluate(&ctx(&tags, &meta)));
+
+        // 0.2.x band: lhs major != 0 must NOT match (was admitted
+        // pre-fix).
+        let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "1.2.5")];
+        assert!(!pred!(semver_compatible "software.runtime", "0.2.3").evaluate(&ctx(&tags, &meta)));
+
+        // Sanity: 2.2.5 vs 0.2.3 also fails.
+        let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "2.2.5")];
+        assert!(!pred!(semver_compatible "software.runtime", "0.2.3").evaluate(&ctx(&tags, &meta)));
     }
 
     /// Regression: presence-only tags (`Tag::AxisPresent`) must not
