@@ -597,8 +597,7 @@ pub fn models_from_tags(tags: &[Tag]) -> Vec<ModelCapability> {
             }
             "quantization" => entry.quantization = Some(value.to_string()),
             "modalities" => {
-                entry.modalities =
-                    value.split(',').map(modality_from_str).collect::<Vec<_>>();
+                entry.modalities = value.split(',').map(modality_from_str).collect::<Vec<_>>();
             }
             "tokens_per_sec" => {
                 entry.tokens_per_sec = value.parse().ok();
@@ -763,8 +762,7 @@ pub fn tools_from_tags(tags: &[Tag]) -> Vec<ToolCapability> {
             "version" => entry.version = Some(value.to_string()),
             "requires" => {
                 if !value.is_empty() {
-                    entry.requires =
-                        value.split(',').map(|s| s.to_string()).collect::<Vec<_>>();
+                    entry.requires = value.split(',').map(|s| s.to_string()).collect::<Vec<_>>();
                 }
             }
             "estimated_time_ms" => {
@@ -1020,7 +1018,10 @@ mod tests {
             .iter()
             .map(|t| t.to_string())
             .collect();
-        assert_eq!(strs, vec!["hardware.cpu_cores=8", "hardware.cpu_threads=16"]);
+        assert_eq!(
+            strs,
+            vec!["hardware.cpu_cores=8", "hardware.cpu_threads=16"]
+        );
     }
 
     #[test]
@@ -1148,8 +1149,7 @@ mod tests {
         let hw = full_hardware();
         let tags = hardware_to_tags(&hw);
         let wire_strs: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
-        let reparsed: Vec<Tag> =
-            wire_strs.iter().map(|s| Tag::parse(s).unwrap()).collect();
+        let reparsed: Vec<Tag> = wire_strs.iter().map(|s| Tag::parse(s).unwrap()).collect();
         assert_eq!(reparsed, tags);
         let hw2 = hardware_from_tags(&reparsed);
         assert_eq!(hw, hw2);
@@ -1326,19 +1326,13 @@ mod tests {
     #[test]
     fn round_trip_full_limits() {
         let l = full_limits();
-        assert_eq!(
-            resource_limits_from_tags(&resource_limits_to_tags(&l)),
-            l
-        );
+        assert_eq!(resource_limits_from_tags(&resource_limits_to_tags(&l)), l);
     }
 
     #[test]
     fn round_trip_default_limits() {
         let l = ResourceLimits::default();
-        assert_eq!(
-            resource_limits_from_tags(&resource_limits_to_tags(&l)),
-            l
-        );
+        assert_eq!(resource_limits_from_tags(&resource_limits_to_tags(&l)), l);
     }
 
     #[test]
@@ -1448,7 +1442,10 @@ mod tests {
 
     #[test]
     fn round_trip_empty_models() {
-        assert_eq!(models_from_tags(&models_to_tags(&[])), Vec::<ModelCapability>::new());
+        assert_eq!(
+            models_from_tags(&models_to_tags(&[])),
+            Vec::<ModelCapability>::new()
+        );
     }
 
     #[test]
@@ -1564,7 +1561,10 @@ mod tests {
 
     #[test]
     fn round_trip_empty_tools() {
-        assert_eq!(tools_from_tags(&tools_to_tags(&[])), Vec::<ToolCapability>::new());
+        assert_eq!(
+            tools_from_tags(&tools_to_tags(&[])),
+            Vec::<ToolCapability>::new()
+        );
     }
 
     #[test]
@@ -1605,8 +1605,7 @@ mod tests {
         // ToolCapability::new defaults stateless=true. A tool with
         // stateless=false must round-trip that explicit value, not
         // collapse back to the default.
-        let tool = ToolCapability::new("coffee_pot", "Stateful Coffee Pot")
-            .with_stateless(false);
+        let tool = ToolCapability::new("coffee_pot", "Stateful Coffee Pot").with_stateless(false);
         let decoded = tools_from_tags(&tools_to_tags(&[tool.clone()]));
         assert_eq!(decoded[0].stateless, false);
     }
@@ -1664,15 +1663,11 @@ mod tests {
         assert_eq!(v1_sw.os, v2_sw.os);
         assert_eq!(v1_sw.os_version, v2_sw.os_version);
         assert_eq!(v1_sw.cuda_version, v2_sw.cuda_version);
-        let lhs_runtimes: std::collections::HashSet<_> =
-            v1_sw.runtimes.iter().cloned().collect();
-        let rhs_runtimes: std::collections::HashSet<_> =
-            v2_sw.runtimes.iter().cloned().collect();
+        let lhs_runtimes: std::collections::HashSet<_> = v1_sw.runtimes.iter().cloned().collect();
+        let rhs_runtimes: std::collections::HashSet<_> = v2_sw.runtimes.iter().cloned().collect();
         assert_eq!(lhs_runtimes, rhs_runtimes);
-        let lhs_fw: std::collections::HashSet<_> =
-            v1_sw.frameworks.iter().cloned().collect();
-        let rhs_fw: std::collections::HashSet<_> =
-            v2_sw.frameworks.iter().cloned().collect();
+        let lhs_fw: std::collections::HashSet<_> = v1_sw.frameworks.iter().cloned().collect();
+        let rhs_fw: std::collections::HashSet<_> = v2_sw.frameworks.iter().cloned().collect();
         assert_eq!(lhs_fw, rhs_fw);
 
         // Tag sets: round-trip is identity.
@@ -1741,10 +1736,8 @@ mod tests {
             .with_subnet_local_scope();
         let tag_set = capability_set_to_tag_set(&caps);
         let caps2 = capability_set_from_tag_set(&tag_set);
-        let original_set: std::collections::HashSet<_> =
-            caps.tags.iter().cloned().collect();
-        let round_tripped_set: std::collections::HashSet<_> =
-            caps2.tags.iter().cloned().collect();
+        let original_set: std::collections::HashSet<_> = caps.tags.iter().cloned().collect();
+        let round_tripped_set: std::collections::HashSet<_> = caps2.tags.iter().cloned().collect();
         assert_eq!(original_set, round_tripped_set);
     }
 
@@ -1758,10 +1751,8 @@ mod tests {
             .add_tag("dataforts.tier:hot");
         let tag_set = capability_set_to_tag_set(&caps);
         let caps2 = capability_set_from_tag_set(&tag_set);
-        let original_set: std::collections::HashSet<_> =
-            caps.tags.iter().cloned().collect();
-        let round_tripped_set: std::collections::HashSet<_> =
-            caps2.tags.iter().cloned().collect();
+        let original_set: std::collections::HashSet<_> = caps.tags.iter().cloned().collect();
+        let round_tripped_set: std::collections::HashSet<_> = caps2.tags.iter().cloned().collect();
         assert_eq!(original_set, round_tripped_set);
     }
 
@@ -1809,8 +1800,7 @@ mod tests {
         // Sanity: a sparsely populated CapabilitySet doesn't blow
         // up to a huge tag set. Pinned to catch a future
         // accidental "emit every field even when default" change.
-        let caps = CapabilitySet::new()
-            .with_hardware(HardwareCapabilities::new().with_cpu(4, 8));
+        let caps = CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_cpu(4, 8));
         let tag_set = capability_set_to_tag_set(&caps);
         // Two tags: cpu_cores=4 and cpu_threads=8.
         assert_eq!(tag_set.len(), 2);

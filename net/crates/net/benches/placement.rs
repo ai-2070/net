@@ -34,9 +34,9 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use std::hint::black_box;
 
 use net::adapter::net::behavior::{
-    Artifact, CapabilityAnnouncement, CapabilityIndex, CapabilitySet, EvalContext, PlacementFilter,
-    PlacementNodeId, Predicate, StandardPlacement, Tag, TagKey, TaxonomyAxis,
-    global_placement_filter_registry,
+    global_placement_filter_registry, Artifact, CapabilityAnnouncement, CapabilityIndex,
+    CapabilitySet, EvalContext, PlacementFilter, PlacementNodeId, Predicate, StandardPlacement,
+    Tag, TagKey, TaxonomyAxis,
 };
 use net::adapter::net::identity::EntityId;
 
@@ -199,17 +199,14 @@ fn bench_placement_score(c: &mut Criterion) {
 
         let placement = StandardPlacement::new(&index).with_custom_filter_id(id);
 
-        group.bench_function(
-            BenchmarkId::new("with_custom_filter_predicate", 100),
-            |b| {
-                b.iter(|| {
-                    for i in 0..100u64 {
-                        let node = 0x1000 + i;
-                        let _ = black_box(placement.placement_score(&node, &artifact));
-                    }
-                });
-            },
-        );
+        group.bench_function(BenchmarkId::new("with_custom_filter_predicate", 100), |b| {
+            b.iter(|| {
+                for i in 0..100u64 {
+                    let node = 0x1000 + i;
+                    let _ = black_box(placement.placement_score(&node, &artifact));
+                }
+            });
+        });
 
         registry.unregister(id);
     }

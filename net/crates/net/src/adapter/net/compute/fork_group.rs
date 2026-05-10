@@ -1063,11 +1063,7 @@ mod tests {
     /// Permissive placement filter — every candidate scores 1.0.
     struct AllowAll;
     impl PlacementFilter for AllowAll {
-        fn placement_score(
-            &self,
-            _: &PlacementNodeId,
-            _: &Artifact<'_>,
-        ) -> Option<f32> {
+        fn placement_score(&self, _: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
             Some(1.0)
         }
     }
@@ -1122,11 +1118,7 @@ mod tests {
 
         struct PreferHighest;
         impl PlacementFilter for PreferHighest {
-            fn placement_score(
-                &self,
-                t: &PlacementNodeId,
-                _: &Artifact<'_>,
-            ) -> Option<f32> {
+            fn placement_score(&self, t: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
                 Some(if *t == 0x4444 { 1.0 } else { 0.1 })
             }
         }
@@ -1160,11 +1152,7 @@ mod tests {
 
         struct VetoAll;
         impl PlacementFilter for VetoAll {
-            fn placement_score(
-                &self,
-                _: &PlacementNodeId,
-                _: &Artifact<'_>,
-            ) -> Option<f32> {
+            fn placement_score(&self, _: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
                 None
             }
         }
@@ -1210,14 +1198,7 @@ mod tests {
         .unwrap();
 
         group
-            .scale_to_with_placement(
-                4,
-                || Box::new(NoopDaemon),
-                &sched,
-                &reg,
-                &AllowAll,
-                &tb,
-            )
+            .scale_to_with_placement(4, || Box::new(NoopDaemon), &sched, &reg, &AllowAll, &tb)
             .expect("scale_to_with_placement should succeed with 4 nodes");
 
         let node_ids: HashSet<u64> = group.members().iter().map(|m| m.node_id).collect();
@@ -1257,24 +1238,13 @@ mod tests {
 
         struct VetoAll;
         impl PlacementFilter for VetoAll {
-            fn placement_score(
-                &self,
-                _: &PlacementNodeId,
-                _: &Artifact<'_>,
-            ) -> Option<f32> {
+            fn placement_score(&self, _: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
                 None
             }
         }
 
         group
-            .scale_to_with_placement(
-                1,
-                || Box::new(NoopDaemon),
-                &sched,
-                &reg,
-                &VetoAll,
-                &tb,
-            )
+            .scale_to_with_placement(1, || Box::new(NoopDaemon), &sched, &reg, &VetoAll, &tb)
             .expect("scale-down does not invoke the filter");
 
         assert_eq!(group.fork_count(), 1);

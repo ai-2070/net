@@ -17,19 +17,18 @@
 use std::collections::BTreeMap;
 
 use net::adapter::net::behavior::{
-    Artifact, CapabilityAnnouncement, CapabilityIndex, CapabilitySet, ClauseTrace, EvalContext,
-    MetadataChange, PlacementFilter, PlacementNodeId, Predicate, PredicateDebugReport,
-    PredicateWire, RPC_WHERE_HEADER, ScopeLabel, SchemaError, StandardPlacement, Tag,
-    ValidationWarning, ValueType, global_placement_filter_registry, validate_capabilities,
+    global_placement_filter_registry, validate_capabilities, Artifact, CapabilityAnnouncement,
+    CapabilityIndex, CapabilitySet, ClauseTrace, EvalContext, MetadataChange, PlacementFilter,
+    PlacementNodeId, Predicate, PredicateDebugReport, PredicateWire, SchemaError, ScopeLabel,
+    StandardPlacement, Tag, ValidationWarning, ValueType, RPC_WHERE_HEADER,
 };
 use net::adapter::net::identity::EntityId;
-use std::sync::Arc;
 use serde_json::Value;
+use std::sync::Arc;
 
 fn read_fixture(name: &str) -> String {
     let path = format!("tests/cross_lang_capability/{name}");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {path}: {e}"))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
 }
 
 // =============================================================================
@@ -55,9 +54,7 @@ fn predicate_nrpc_envelope_fixture_round_trips() {
         "fixture header_name diverged from RPC_WHERE_HEADER constant"
     );
 
-    let cases = v["cases"]
-        .as_array()
-        .expect("cases is array");
+    let cases = v["cases"].as_array().expect("cases is array");
     assert!(
         !cases.is_empty(),
         "fixture has zero cases — useless as a contract"
@@ -70,10 +67,9 @@ fn predicate_nrpc_envelope_fixture_round_trips() {
         let wire_json = &case["wire"];
 
         // Deserialize into PredicateWire (the structural form).
-        let wire: PredicateWire =
-            serde_json::from_value(wire_json.clone()).unwrap_or_else(|e| {
-                panic!("case[{i}] {name}: deserialize wire: {e}\nfixture wire: {wire_json:#}",)
-            });
+        let wire: PredicateWire = serde_json::from_value(wire_json.clone()).unwrap_or_else(|e| {
+            panic!("case[{i}] {name}: deserialize wire: {e}\nfixture wire: {wire_json:#}",)
+        });
 
         // Convert to Predicate AST. Catches structural integrity
         // bugs (cycles, OOB indices) — the fixture must be a
@@ -183,11 +179,17 @@ fn capability_set_diff_fixture_matches_rust_implementation() {
 
         let prev: CapabilitySet =
             serde_json::from_value(case["prev"].clone()).unwrap_or_else(|e| {
-                panic!("case[{i}] {name}: parse prev: {e}\nprev: {:#}", case["prev"])
+                panic!(
+                    "case[{i}] {name}: parse prev: {e}\nprev: {:#}",
+                    case["prev"]
+                )
             });
         let curr: CapabilitySet =
             serde_json::from_value(case["curr"].clone()).unwrap_or_else(|e| {
-                panic!("case[{i}] {name}: parse curr: {e}\ncurr: {:#}", case["curr"])
+                panic!(
+                    "case[{i}] {name}: parse curr: {e}\ncurr: {:#}",
+                    case["curr"]
+                )
             });
 
         let diff = curr.diff(&prev);
@@ -195,8 +197,7 @@ fn capability_set_diff_fixture_matches_rust_implementation() {
         // Normalize added_tags / removed_tags to sorted-by-wire-form arrays.
         let mut added: Vec<String> = diff.added_tags.iter().map(|t| t.to_string()).collect();
         added.sort();
-        let mut removed: Vec<String> =
-            diff.removed_tags.iter().map(|t| t.to_string()).collect();
+        let mut removed: Vec<String> = diff.removed_tags.iter().map(|t| t.to_string()).collect();
         removed.sort();
 
         let expected_added: Vec<String> = case["expected_added_tags"]
@@ -359,9 +360,7 @@ fn predicate_eval_fixture_matches_substrate() {
         let tags: Vec<Tag> = tag_strings
             .iter()
             .map(|s| {
-                Tag::parse(s).unwrap_or_else(|e| {
-                    panic!("case[{i}] {name}: parse tag {s:?}: {e}")
-                })
+                Tag::parse(s).unwrap_or_else(|e| panic!("case[{i}] {name}: parse tag {s:?}: {e}"))
             })
             .collect();
 
@@ -498,8 +497,7 @@ fn capability_validation_fixture_matches_substrate() {
 
         let report = validate_capabilities(&caps);
 
-        let mut got_errors: Vec<Value> =
-            report.errors.iter().map(schema_error_to_wire).collect();
+        let mut got_errors: Vec<Value> = report.errors.iter().map(schema_error_to_wire).collect();
         let mut got_warnings: Vec<Value> = report
             .warnings
             .iter()
@@ -575,7 +573,9 @@ fn predicate_trace_fixture_matches_substrate() {
             .collect();
         let tags: Vec<Tag> = tag_strings
             .iter()
-            .map(|s| Tag::parse(s).unwrap_or_else(|e| panic!("case[{i}] {name}: parse tag {s:?}: {e}")))
+            .map(|s| {
+                Tag::parse(s).unwrap_or_else(|e| panic!("case[{i}] {name}: parse tag {s:?}: {e}"))
+            })
             .collect();
 
         let metadata: BTreeMap<String, String> = case["metadata"]
@@ -661,7 +661,9 @@ fn predicate_debug_report_fixture_matches_substrate() {
 
         let report = PredicateDebugReport::from_evaluations(
             &pred,
-            owned.iter().map(|(tags, meta)| EvalContext::new(tags, meta)),
+            owned
+                .iter()
+                .map(|(tags, meta)| EvalContext::new(tags, meta)),
         );
 
         let expected_total = case["expected_total_candidates"].as_u64().unwrap() as usize;
@@ -730,11 +732,7 @@ struct PredicatePlacementFilter {
 }
 
 impl PlacementFilter for PredicatePlacementFilter {
-    fn placement_score(
-        &self,
-        target: &PlacementNodeId,
-        _artifact: &Artifact<'_>,
-    ) -> Option<f32> {
+    fn placement_score(&self, target: &PlacementNodeId, _artifact: &Artifact<'_>) -> Option<f32> {
         // Use the non-cloning `with_caps` path. Holds the DashMap
         // shard's read lock for the closure's duration; safe here
         // because `Predicate::evaluate_unplanned` only reads
@@ -918,8 +916,7 @@ fn caps_from_fixture_obj(v: &Value, ctx: &str) -> CapabilitySet {
             let s = tag
                 .as_str()
                 .unwrap_or_else(|| panic!("{ctx}: tag is not a string: {tag}"));
-            let parsed = Tag::parse(s)
-                .unwrap_or_else(|e| panic!("{ctx}: parse tag {s:?}: {e}"));
+            let parsed = Tag::parse(s).unwrap_or_else(|e| panic!("{ctx}: parse tag {s:?}: {e}"));
             caps.tags.insert(parsed);
         }
     }
@@ -991,10 +988,14 @@ fn placement_score_fixture_matches_substrate() {
         let art_kind = art["kind"]
             .as_str()
             .unwrap_or_else(|| panic!("case[{i}] {name}: artifact.kind missing"));
-        let req_caps =
-            caps_from_fixture_obj(&art["required"], &format!("case[{i}] {name} artifact.required"));
-        let opt_caps =
-            caps_from_fixture_obj(&art["optional"], &format!("case[{i}] {name} artifact.optional"));
+        let req_caps = caps_from_fixture_obj(
+            &art["required"],
+            &format!("case[{i}] {name} artifact.required"),
+        );
+        let opt_caps = caps_from_fixture_obj(
+            &art["optional"],
+            &format!("case[{i}] {name} artifact.optional"),
+        );
         let artifact = match art_kind {
             "daemon" => Artifact::Daemon {
                 daemon_id: [0u8; 32],
@@ -1018,12 +1019,12 @@ fn placement_score_fixture_matches_substrate() {
             );
         } else {
             let expected = expected_raw.as_f64().unwrap_or_else(|| {
-                panic!("case[{i}] {name}: expected_score must be null or a number, got {expected_raw}")
+                panic!(
+                    "case[{i}] {name}: expected_score must be null or a number, got {expected_raw}"
+                )
             }) as f32;
             let actual = got.unwrap_or_else(|| {
-                panic!(
-                    "case[{i}] {name}: expected score {expected}, got veto (None)",
-                )
+                panic!("case[{i}] {name}: expected score {expected}, got veto (None)",)
             });
             assert!(
                 (actual - expected).abs() <= PLACEMENT_SCORE_TOLERANCE,

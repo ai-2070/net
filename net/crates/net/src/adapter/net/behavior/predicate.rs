@@ -402,9 +402,7 @@ pub enum PredicateWireError {
     },
     /// A composite node referenced a child index that was out of
     /// bounds.
-    #[error(
-        "predicate wire child index {child} out of bounds for nodes len {len}"
-    )]
+    #[error("predicate wire child index {child} out of bounds for nodes len {len}")]
     ChildOutOfBounds {
         /// The malformed child index.
         child: u32,
@@ -414,9 +412,7 @@ pub enum PredicateWireError {
     /// A composite node referenced a child index that was greater
     /// than or equal to its own. Catches index cycles introduced
     /// by malformed / malicious wire payloads.
-    #[error(
-        "predicate wire child index {child} >= parent index {parent} (cycle)"
-    )]
+    #[error("predicate wire child index {child} >= parent index {parent} (cycle)")]
     CycleDetected {
         /// Parent node index.
         parent: u32,
@@ -482,9 +478,7 @@ impl Predicate {
                 key: key.clone(),
                 pattern: pattern.clone(),
             },
-            Self::MetadataExists { key } => PredicateNodeWire::MetadataExists {
-                key: key.clone(),
-            },
+            Self::MetadataExists { key } => PredicateNodeWire::MetadataExists { key: key.clone() },
             Self::MetadataEquals { key, value } => PredicateNodeWire::MetadataEquals {
                 key: key.clone(),
                 value: value.clone(),
@@ -502,12 +496,16 @@ impl Predicate {
             Self::And(children) => {
                 let child_idxs: Vec<u32> =
                     children.iter().map(|c| c.append_to_wire(nodes)).collect();
-                PredicateNodeWire::And { children: child_idxs }
+                PredicateNodeWire::And {
+                    children: child_idxs,
+                }
             }
             Self::Or(children) => {
                 let child_idxs: Vec<u32> =
                     children.iter().map(|c| c.append_to_wire(nodes)).collect();
-                PredicateNodeWire::Or { children: child_idxs }
+                PredicateNodeWire::Or {
+                    children: child_idxs,
+                }
             }
             Self::Not(inner) => {
                 let child_idx = inner.append_to_wire(nodes);
@@ -592,9 +590,7 @@ fn rebuild_predicate(
             key: key.clone(),
             pattern: pattern.clone(),
         },
-        PredicateNodeWire::MetadataExists { key } => Predicate::MetadataExists {
-            key: key.clone(),
-        },
+        PredicateNodeWire::MetadataExists { key } => Predicate::MetadataExists { key: key.clone() },
         PredicateNodeWire::MetadataEquals { key, value } => Predicate::MetadataEquals {
             key: key.clone(),
             value: value.clone(),
@@ -611,14 +607,18 @@ fn rebuild_predicate(
         }
         PredicateNodeWire::And { children } => {
             check_children_below(children, idx)?;
-            let kids: Result<Vec<_>, _> =
-                children.iter().map(|&c| rebuild_predicate(nodes, c)).collect();
+            let kids: Result<Vec<_>, _> = children
+                .iter()
+                .map(|&c| rebuild_predicate(nodes, c))
+                .collect();
             Predicate::And(kids?)
         }
         PredicateNodeWire::Or { children } => {
             check_children_below(children, idx)?;
-            let kids: Result<Vec<_>, _> =
-                children.iter().map(|&c| rebuild_predicate(nodes, c)).collect();
+            let kids: Result<Vec<_>, _> = children
+                .iter()
+                .map(|&c| rebuild_predicate(nodes, c))
+                .collect();
             Predicate::Or(kids?)
         }
         PredicateNodeWire::Not { child } => {
@@ -637,10 +637,7 @@ fn rebuild_predicate(
 /// Validate that every child index in `children` is strictly less
 /// than `parent`. Catches cycles introduced by malformed wire
 /// payloads.
-fn check_children_below(
-    children: &[u32],
-    parent: u32,
-) -> Result<(), PredicateWireError> {
+fn check_children_below(children: &[u32], parent: u32) -> Result<(), PredicateWireError> {
     for &child in children {
         if child >= parent {
             return Err(PredicateWireError::CycleDetected { parent, child });
@@ -700,9 +697,7 @@ pub enum PredicateRpcEncodeError {
     #[error("predicate wire encode failed: {0}")]
     Encode(#[from] serde_json::Error),
     /// The encoded payload exceeds the header-value cap.
-    #[error(
-        "predicate wire encoding {actual} bytes exceeds header cap {limit}"
-    )]
+    #[error("predicate wire encoding {actual} bytes exceeds header cap {limit}")]
     TooLarge {
         /// Encoded byte length.
         actual: usize,
@@ -899,10 +894,7 @@ pub trait RpcPredicateContext {
 /// ```
 ///
 /// Phase 5.B follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
-pub fn filter_by_predicate<R, I>(
-    rows: I,
-    pred: Option<&Predicate>,
-) -> impl Iterator<Item = R> + '_
+pub fn filter_by_predicate<R, I>(rows: I, pred: Option<&Predicate>) -> impl Iterator<Item = R> + '_
 where
     R: RpcPredicateContext,
     I: IntoIterator<Item = R>,
@@ -911,8 +903,7 @@ where
     rows.into_iter().filter(move |row| match pred {
         None => true,
         Some(p) => {
-            let ctx =
-                EvalContext::new(row.rpc_predicate_tags(), row.rpc_predicate_metadata());
+            let ctx = EvalContext::new(row.rpc_predicate_tags(), row.rpc_predicate_metadata());
             p.evaluate(&ctx)
         }
     })
@@ -1084,24 +1075,16 @@ impl Predicate {
     fn evaluate_leaf(&self, ctx: &EvalContext<'_>) -> bool {
         match self {
             Self::Exists { key } => match_axis_tag(ctx.tags, key, |_| true),
-            Self::Equals { key, value } => {
-                match_axis_tag(ctx.tags, key, |v| v == value.as_str())
-            }
-            Self::NumericAtLeast { key, threshold } => {
-                match_axis_tag(ctx.tags, key, |v| {
-                    v.parse::<f64>().is_ok_and(|n| n >= *threshold)
-                })
-            }
-            Self::NumericAtMost { key, threshold } => {
-                match_axis_tag(ctx.tags, key, |v| {
-                    v.parse::<f64>().is_ok_and(|n| n <= *threshold)
-                })
-            }
-            Self::NumericInRange { key, min, max } => {
-                match_axis_tag(ctx.tags, key, |v| {
-                    v.parse::<f64>().is_ok_and(|n| n >= *min && n <= *max)
-                })
-            }
+            Self::Equals { key, value } => match_axis_tag(ctx.tags, key, |v| v == value.as_str()),
+            Self::NumericAtLeast { key, threshold } => match_axis_tag(ctx.tags, key, |v| {
+                v.parse::<f64>().is_ok_and(|n| n >= *threshold)
+            }),
+            Self::NumericAtMost { key, threshold } => match_axis_tag(ctx.tags, key, |v| {
+                v.parse::<f64>().is_ok_and(|n| n <= *threshold)
+            }),
+            Self::NumericInRange { key, min, max } => match_axis_tag(ctx.tags, key, |v| {
+                v.parse::<f64>().is_ok_and(|n| n >= *min && n <= *max)
+            }),
             Self::SemverAtLeast { key, version } => {
                 let Some(rhs) = parse_semver(version) else {
                     return false;
@@ -1941,10 +1924,7 @@ mod tests {
     use super::*;
     use crate::adapter::net::behavior::tag::{Tag, TaxonomyAxis};
 
-    fn ctx<'a>(
-        tags: &'a [Tag],
-        metadata: &'a BTreeMap<String, String>,
-    ) -> EvalContext<'a> {
+    fn ctx<'a>(tags: &'a [Tag], metadata: &'a BTreeMap<String, String>) -> EvalContext<'a> {
         EvalContext::new(tags, metadata)
     }
 
@@ -1998,10 +1978,8 @@ mod tests {
     fn equals_matches_value_exactly() {
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "cuda-12.4")];
         let meta = empty_meta();
-        assert!(pred!(equals "software.runtime", "cuda-12.4")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(equals "software.runtime", "cuda-11")
-            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(equals "software.runtime", "cuda-12.4").evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(equals "software.runtime", "cuda-11").evaluate(&ctx(&tags, &meta)));
     }
 
     // ---- numeric --------------------------------------------------------
@@ -2010,26 +1988,19 @@ mod tests {
     fn numeric_at_least_compares_value() {
         let tags = [axis_eq(TaxonomyAxis::Hardware, "gpu.vram_gb", "80")];
         let meta = empty_meta();
-        assert!(pred!(num_at_least "hardware.gpu.vram_gb", 24.0)
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(pred!(num_at_least "hardware.gpu.vram_gb", 80.0)
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(num_at_least "hardware.gpu.vram_gb", 96.0)
-            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(num_at_least "hardware.gpu.vram_gb", 24.0).evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(num_at_least "hardware.gpu.vram_gb", 80.0).evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(num_at_least "hardware.gpu.vram_gb", 96.0).evaluate(&ctx(&tags, &meta)));
     }
 
     #[test]
     fn numeric_at_most_and_in_range() {
         let tags = [axis_eq(TaxonomyAxis::Hardware, "cpu_cores", "16")];
         let meta = empty_meta();
-        assert!(pred!(num_at_most "hardware.cpu_cores", 32.0)
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(num_at_most "hardware.cpu_cores", 8.0)
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(pred!(num_in_range "hardware.cpu_cores", 8.0, 32.0)
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(num_in_range "hardware.cpu_cores", 32.0, 64.0)
-            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(num_at_most "hardware.cpu_cores", 32.0).evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(num_at_most "hardware.cpu_cores", 8.0).evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(num_in_range "hardware.cpu_cores", 8.0, 32.0).evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(num_in_range "hardware.cpu_cores", 32.0, 64.0).evaluate(&ctx(&tags, &meta)));
     }
 
     #[test]
@@ -2040,8 +2011,7 @@ mod tests {
         // shouldn't fault our query.
         let tags = [axis_eq(TaxonomyAxis::Hardware, "cpu_cores", "many")];
         let meta = empty_meta();
-        assert!(!pred!(num_at_least "hardware.cpu_cores", 1.0)
-            .evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(num_at_least "hardware.cpu_cores", 1.0).evaluate(&ctx(&tags, &meta)));
     }
 
     // ---- semver ---------------------------------------------------------
@@ -2050,12 +2020,9 @@ mod tests {
     fn semver_at_least_basic() {
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "12.4.1")];
         let meta = empty_meta();
-        assert!(pred!(semver_at_least "software.runtime", "12.0.0")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(pred!(semver_at_least "software.runtime", "12.4.0")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(semver_at_least "software.runtime", "13.0.0")
-            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(semver_at_least "software.runtime", "12.0.0").evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(semver_at_least "software.runtime", "12.4.0").evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(semver_at_least "software.runtime", "13.0.0").evaluate(&ctx(&tags, &meta)));
     }
 
     #[test]
@@ -2063,21 +2030,15 @@ mod tests {
         // 1.x.y compatibility: same major.
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "1.5.2")];
         let meta = empty_meta();
-        assert!(pred!(semver_compatible "software.runtime", "1.0.0")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(pred!(semver_compatible "software.runtime", "1.4.0")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(semver_compatible "software.runtime", "0.9.0")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(semver_compatible "software.runtime", "2.0.0")
-            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(semver_compatible "software.runtime", "1.0.0").evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(semver_compatible "software.runtime", "1.4.0").evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(semver_compatible "software.runtime", "0.9.0").evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(semver_compatible "software.runtime", "2.0.0").evaluate(&ctx(&tags, &meta)));
 
         // 0.x.y compatibility: same minor.
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.5.7")];
-        assert!(pred!(semver_compatible "software.runtime", "0.5.0")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(semver_compatible "software.runtime", "0.4.0")
-            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(semver_compatible "software.runtime", "0.5.0").evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(semver_compatible "software.runtime", "0.4.0").evaluate(&ctx(&tags, &meta)));
     }
 
     #[test]
@@ -2102,14 +2063,10 @@ mod tests {
     fn string_prefix_and_matches() {
         let tags = [axis_eq(TaxonomyAxis::Software, "tool", "ffmpeg-7.0")];
         let meta = empty_meta();
-        assert!(pred!(prefix "software.tool", "ffmpeg")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(prefix "software.tool", "imagemagick")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(pred!(matches "software.tool", "7.0")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(matches "software.tool", "8.0")
-            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(prefix "software.tool", "ffmpeg").evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(prefix "software.tool", "imagemagick").evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(matches "software.tool", "7.0").evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(matches "software.tool", "8.0").evaluate(&ctx(&tags, &meta)));
     }
 
     // ---- metadata -------------------------------------------------------
@@ -2123,16 +2080,11 @@ mod tests {
 
         assert!(pred!(metadata_exists "intent").evaluate(&ctx(&tags, &meta)));
         assert!(!pred!(metadata_exists "missing").evaluate(&ctx(&tags, &meta)));
-        assert!(pred!(metadata_equals "intent", "ml-training")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(metadata_equals "intent", "billing")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(pred!(metadata_matches "intent", "training")
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(pred!(metadata_num_at_least "priority", 3.0)
-            .evaluate(&ctx(&tags, &meta)));
-        assert!(!pred!(metadata_num_at_least "priority", 10.0)
-            .evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(metadata_equals "intent", "ml-training").evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(metadata_equals "intent", "billing").evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(metadata_matches "intent", "training").evaluate(&ctx(&tags, &meta)));
+        assert!(pred!(metadata_num_at_least "priority", 3.0).evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(metadata_num_at_least "priority", 10.0).evaluate(&ctx(&tags, &meta)));
     }
 
     // ---- boolean composition --------------------------------------------
@@ -2428,7 +2380,9 @@ mod tests {
                             key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
                             threshold: 65536.0,
                         },
-                        Predicate::MetadataExists { key: "intent".into() },
+                        Predicate::MetadataExists {
+                            key: "intent".into(),
+                        },
                     ]),
                 ]),
                 Predicate::Not(Box::new(Predicate::MetadataEquals {
@@ -2468,10 +2422,7 @@ mod tests {
                     axis_present(TaxonomyAxis::Hardware, "gpu"),
                     axis_eq(TaxonomyAxis::Hardware, "memory_mb", "131072"),
                 ],
-                meta_with(&[
-                    ("intent", "ml-training"),
-                    ("decommissioning", "true"),
-                ]),
+                meta_with(&[("intent", "ml-training"), ("decommissioning", "true")]),
             ),
         ];
 
@@ -2544,7 +2495,9 @@ mod tests {
         // Pin: when no clause short-circuits (all true in an And,
         // all false in an Or), the trace covers every child.
         let ast = Predicate::And(vec![
-            Predicate::MetadataExists { key: "intent".into() },
+            Predicate::MetadataExists {
+                key: "intent".into(),
+            },
             Predicate::Exists {
                 key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
             },
@@ -2624,8 +2577,8 @@ mod tests {
         let gpu: Vec<Tag> = vec![axis_present(TaxonomyAxis::Hardware, "gpu")];
 
         let contexts = vec![
-            ctx(&no_gpu, &no_meta),    // both fail; short-circuit on metadata
-            ctx(&gpu, &no_meta),       // both fail; short-circuit on metadata
+            ctx(&no_gpu, &no_meta),     // both fail; short-circuit on metadata
+            ctx(&gpu, &no_meta),        // both fail; short-circuit on metadata
             ctx(&no_gpu, &intent_meta), // metadata true, gpu fail
             ctx(&gpu, &intent_meta),    // both true → match
         ];
@@ -2642,7 +2595,10 @@ mod tests {
             .values()
             .find(|s| s.label.starts_with("MetadataEquals"))
             .expect("MetadataEquals stats present");
-        assert_eq!(metadata_stats.evaluated, 4, "metadata clause runs every time");
+        assert_eq!(
+            metadata_stats.evaluated, 4,
+            "metadata clause runs every time"
+        );
         assert_eq!(metadata_stats.matched, 2, "intent matches in 2 of 4");
 
         let exists_stats = report
@@ -2652,7 +2608,10 @@ mod tests {
             .expect("Exists stats present");
         // Only the 2 candidates with intent_meta got past the
         // short-circuit; gpu check ran twice.
-        assert_eq!(exists_stats.evaluated, 2, "gpu clause only runs after metadata passes");
+        assert_eq!(
+            exists_stats.evaluated, 2,
+            "gpu clause only runs after metadata passes"
+        );
         assert_eq!(exists_stats.matched, 1);
     }
 
@@ -2661,10 +2620,7 @@ mod tests {
         let pred = Predicate::Exists {
             key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
         };
-        let report = PredicateDebugReport::from_evaluations(
-            &pred,
-            vec![ctx(&[], &empty_meta())],
-        );
+        let report = PredicateDebugReport::from_evaluations(&pred, vec![ctx(&[], &empty_meta())]);
         let rendered = report.render();
         // Pin the load-bearing parts of the format. Operators read
         // the report by these markers; CI fails loudly if they drift.
@@ -2680,8 +2636,7 @@ mod tests {
         let pred = Predicate::Exists {
             key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
         };
-        let report =
-            PredicateDebugReport::from_evaluations(&pred, Vec::<EvalContext>::new());
+        let report = PredicateDebugReport::from_evaluations(&pred, Vec::<EvalContext>::new());
         assert_eq!(report.total_candidates, 0);
         assert_eq!(report.matched, 0);
         assert!(report.clause_stats.is_empty());
@@ -2780,10 +2735,8 @@ mod tests {
 
         let no_meta = empty_meta();
         let intent_meta = meta_with(&[("intent", "ml-training")]);
-        let decommission_meta = meta_with(&[
-            ("intent", "ml-training"),
-            ("decommissioning", "true"),
-        ]);
+        let decommission_meta =
+            meta_with(&[("intent", "ml-training"), ("decommissioning", "true")]);
         let no_gpu: Vec<Tag> = vec![];
         let gpu: Vec<Tag> = vec![axis_present(TaxonomyAxis::Hardware, "gpu")];
         let gpu_with_runtime: Vec<Tag> = vec![
@@ -2846,7 +2799,13 @@ mod tests {
         };
         let err = wire.into_predicate().unwrap_err();
         assert!(
-            matches!(err, PredicateWireError::CycleDetected { parent: 0, child: 1 }),
+            matches!(
+                err,
+                PredicateWireError::CycleDetected {
+                    parent: 0,
+                    child: 1
+                }
+            ),
             "expected CycleDetected; got {err:?}",
         );
     }
@@ -2860,7 +2819,13 @@ mod tests {
         };
         let err = wire.into_predicate().unwrap_err();
         assert!(
-            matches!(err, PredicateWireError::CycleDetected { parent: 0, child: 0 }),
+            matches!(
+                err,
+                PredicateWireError::CycleDetected {
+                    parent: 0,
+                    child: 0
+                }
+            ),
             "expected CycleDetected; got {err:?}",
         );
     }
@@ -3173,7 +3138,10 @@ mod tests {
         };
         // Devices.qpu doesn't exist in the index → cardinality 0
         // → fallback to static_cost. Equals is tier-2 cost = 21.
-        assert_eq!(unknown_clause.dynamic_cost(&index), unknown_clause.static_cost());
+        assert_eq!(
+            unknown_clause.dynamic_cost(&index),
+            unknown_clause.static_cost()
+        );
     }
 
     #[test]
@@ -3209,12 +3177,8 @@ mod tests {
             let caps = crate::adapter::net::behavior::CapabilitySet::new()
                 .with_metadata("intent", intents[i as usize % 2])
                 .with_metadata("owner", format!("alice-{}", i)); // 20 distinct owners
-            let ann = crate::adapter::net::behavior::CapabilityAnnouncement::new(
-                i,
-                entity(),
-                1,
-                caps,
-            );
+            let ann =
+                crate::adapter::net::behavior::CapabilityAnnouncement::new(i, entity(), 1, caps);
             index.index(ann);
         }
         index
@@ -3312,11 +3276,11 @@ mod tests {
         let index = index_with_metadata_intents();
 
         let intent_clause = Predicate::MetadataEquals {
-            key: "intent".into(),    // low-card (2 values)
+            key: "intent".into(), // low-card (2 values)
             value: "ml-training".into(),
         };
         let owner_clause = Predicate::MetadataEquals {
-            key: "owner".into(),     // high-card (20 values)
+            key: "owner".into(), // high-card (20 values)
             value: "alice-5".into(),
         };
 
@@ -3600,10 +3564,11 @@ mod tests {
 
         // Match: caps has both tag and metadata.
         let caps_match = CapabilitySet::new()
-            .with_hardware(
-                HardwareCapabilities::new()
-                    .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
-            )
+            .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
+                GpuVendor::Nvidia,
+                "h100",
+                81920,
+            )))
             .with_metadata("intent", "ml-training");
         assert!(pred.matches_capability_set(&caps_match));
 
@@ -3655,8 +3620,7 @@ mod tests {
                 metadata: BTreeMap::new(),
             },
         ];
-        let filtered: Vec<u64> =
-            filter_by_predicate(jobs, None).map(|j| j.id).collect();
+        let filtered: Vec<u64> = filter_by_predicate(jobs, None).map(|j| j.id).collect();
         assert_eq!(filtered, vec![1, 2]);
     }
 

@@ -22,9 +22,7 @@
 //! variant and a tag-set scan for the others.
 
 use crate::adapter::net::behavior::predicate::{EvalContext, Predicate};
-use crate::adapter::net::behavior::tag::{
-    CapabilityTagError, Tag, TagKey, TaxonomyAxis,
-};
+use crate::adapter::net::behavior::tag::{CapabilityTagError, Tag, TagKey, TaxonomyAxis};
 
 // =============================================================================
 // RequiredCapability
@@ -65,10 +63,7 @@ impl RequiredCapability {
             Self::Tag(required) => ctx.tags.iter().any(|t| t == required),
             Self::Predicate(p) => p.evaluate(ctx),
             Self::AxisAny(axis) => ctx.tags.iter().any(|t| t.axis() == Some(*axis)),
-            Self::AxisKey(key) => ctx
-                .tags
-                .iter()
-                .any(|t| t.axis_key().as_ref() == Some(key)),
+            Self::AxisKey(key) => ctx.tags.iter().any(|t| t.axis_key().as_ref() == Some(key)),
         }
     }
 }
@@ -156,12 +151,10 @@ pub fn __require_parse(s: &str) -> Result<RequiredCapability, RequireParseError>
             let lhs = lhs.trim();
             let rhs = rhs.trim();
             let key = parse_tag_key(lhs)?;
-            let n: f64 =
-                rhs.parse()
-                    .map_err(|_| RequireParseError::NumericParse {
-                        key: lhs.to_string(),
-                        value: rhs.to_string(),
-                    })?;
+            let n: f64 = rhs.parse().map_err(|_| RequireParseError::NumericParse {
+                key: lhs.to_string(),
+                value: rhs.to_string(),
+            })?;
             return Ok(RequiredCapability::Predicate(build(key, n)));
         }
     }
@@ -192,20 +185,14 @@ pub fn __require_axis_parse(s: &str) -> Result<TaxonomyAxis, RequireParseError> 
 /// Parse `"<axis>"` + `"<key>"` into a [`TagKey`] for the
 /// [`require_axis_value!`] macro.
 #[doc(hidden)]
-pub fn __require_axis_value_parse(
-    axis: &str,
-    key: &str,
-) -> Result<TagKey, RequireParseError> {
-    let axis = TaxonomyAxis::from_prefix(axis.trim()).ok_or_else(|| {
-        RequireParseError::InvalidAxis {
+pub fn __require_axis_value_parse(axis: &str, key: &str) -> Result<TagKey, RequireParseError> {
+    let axis =
+        TaxonomyAxis::from_prefix(axis.trim()).ok_or_else(|| RequireParseError::InvalidAxis {
             axis: axis.to_string(),
-        }
-    })?;
+        })?;
     let key = key.trim();
     if key.is_empty() {
-        return Err(RequireParseError::InvalidKey {
-            key: String::new(),
-        });
+        return Err(RequireParseError::InvalidKey { key: String::new() });
     }
     Ok(TagKey::new(axis, key))
 }
@@ -213,20 +200,13 @@ pub fn __require_axis_value_parse(
 /// Parse `"<axis>.<key>"` into a [`TagKey`]. Used by the comparison-
 /// operator branches of [`__require_parse`].
 fn parse_tag_key(s: &str) -> Result<TagKey, RequireParseError> {
-    let (axis_str, key) =
-        s.split_once('.')
-            .ok_or_else(|| RequireParseError::InvalidKey {
-                key: s.to_string(),
-            })?;
-    let axis = TaxonomyAxis::from_prefix(axis_str).ok_or_else(|| {
-        RequireParseError::InvalidKey {
-            key: s.to_string(),
-        }
-    })?;
+    let (axis_str, key) = s
+        .split_once('.')
+        .ok_or_else(|| RequireParseError::InvalidKey { key: s.to_string() })?;
+    let axis = TaxonomyAxis::from_prefix(axis_str)
+        .ok_or_else(|| RequireParseError::InvalidKey { key: s.to_string() })?;
     if key.is_empty() {
-        return Err(RequireParseError::InvalidKey {
-            key: s.to_string(),
-        });
+        return Err(RequireParseError::InvalidKey { key: s.to_string() });
     }
     Ok(TagKey::new(axis, key.to_string()))
 }
@@ -278,10 +258,8 @@ macro_rules! require {
 macro_rules! require_axis {
     ($axis:literal) => {
         $crate::adapter::net::behavior::required_capability::RequiredCapability::AxisAny(
-            $crate::adapter::net::behavior::required_capability::__require_axis_parse(
-                $axis,
-            )
-            .unwrap_or_else(|e| panic!("require_axis!({:?}) failed: {}", $axis, e)),
+            $crate::adapter::net::behavior::required_capability::__require_axis_parse($axis)
+                .unwrap_or_else(|e| panic!("require_axis!({:?}) failed: {}", $axis, e)),
         )
     };
 }
@@ -404,10 +382,7 @@ mod tests {
     fn require_numeric_at_least() {
         let r = require!("hardware.gpu.vram_gb >= 24");
         match r {
-            RequiredCapability::Predicate(Predicate::NumericAtLeast {
-                key,
-                threshold,
-            }) => {
+            RequiredCapability::Predicate(Predicate::NumericAtLeast { key, threshold }) => {
                 assert_eq!(key.axis, TaxonomyAxis::Hardware);
                 assert_eq!(key.key, "gpu.vram_gb");
                 assert!((threshold - 24.0).abs() < f64::EPSILON);
@@ -420,10 +395,7 @@ mod tests {
     fn require_numeric_at_most() {
         let r = require!("hardware.cpu_cores <= 64");
         match r {
-            RequiredCapability::Predicate(Predicate::NumericAtMost {
-                key,
-                threshold,
-            }) => {
+            RequiredCapability::Predicate(Predicate::NumericAtMost { key, threshold }) => {
                 assert_eq!(key.key, "cpu_cores");
                 assert!((threshold - 64.0).abs() < f64::EPSILON);
             }
@@ -437,9 +409,7 @@ mod tests {
         // budgets in milliseconds) parse as f64.
         let r = require!("hardware.cpu_cores >= 1.5");
         match r {
-            RequiredCapability::Predicate(Predicate::NumericAtLeast {
-                threshold, ..
-            }) => {
+            RequiredCapability::Predicate(Predicate::NumericAtLeast { threshold, .. }) => {
                 assert!((threshold - 1.5).abs() < f64::EPSILON);
             }
             other => panic!("expected NumericAtLeast, got {other:?}"),
@@ -585,10 +555,7 @@ mod tests {
     #[test]
     fn require_rejects_reserved_prefix() {
         match __require_parse("scope:prod") {
-            Err(RequireParseError::Tag(CapabilityTagError::ReservedPrefix {
-                prefix,
-                ..
-            })) => {
+            Err(RequireParseError::Tag(CapabilityTagError::ReservedPrefix { prefix, .. })) => {
                 assert_eq!(prefix, "scope:");
             }
             other => panic!("expected ReservedPrefix, got {other:?}"),

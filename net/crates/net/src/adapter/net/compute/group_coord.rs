@@ -528,11 +528,7 @@ mod tests {
         // Synthetic score: 0x1111 → 0.1, 0x2222 → 0.9, 0x3333 → 0.5.
         struct ScoredFilter;
         impl PlacementFilter for ScoredFilter {
-            fn placement_score(
-                &self,
-                target: &PlacementNodeId,
-                _: &Artifact<'_>,
-            ) -> Option<f32> {
+            fn placement_score(&self, target: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
                 Some(match *target {
                     0x1111 => 0.1,
                     0x2222 => 0.9,
@@ -604,12 +600,9 @@ mod tests {
     fn place_with_spread_unchanged_after_place_member_added() {
         let (sched, _index) = make_scheduler(&[0x1111, 0x2222, 0x3333]);
         let exclude = HashSet::new();
-        let decision = GroupCoordinator::place_with_spread(
-            &sched,
-            &CapabilityFilter::default(),
-            &exclude,
-        )
-        .expect("legacy path still works");
+        let decision =
+            GroupCoordinator::place_with_spread(&sched, &CapabilityFilter::default(), &exclude)
+                .expect("legacy path still works");
         // Local node (first in list) preferred.
         assert_eq!(decision.node_id, 0x1111);
         assert_eq!(decision.reason, PlacementReason::LocalPreferred);

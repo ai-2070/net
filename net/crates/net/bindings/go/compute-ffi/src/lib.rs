@@ -719,9 +719,7 @@ static DAEMON_CAPS_DISPATCHER: OnceLock<DaemonCapsFn> = OnceLock::new();
 /// of the process, and MUST follow the [`DaemonCapsFn`] contract.
 /// Passing NULL returns `NET_COMPUTE_ERR_NULL`.
 #[no_mangle]
-pub extern "C" fn net_compute_set_daemon_caps_dispatcher(
-    f: Option<DaemonCapsFn>,
-) -> c_int {
+pub extern "C" fn net_compute_set_daemon_caps_dispatcher(f: Option<DaemonCapsFn>) -> c_int {
     let Some(f) = f else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -738,7 +736,9 @@ pub extern "C" fn net_compute_set_daemon_caps_dispatcher(
 /// Parses the consumer's JSON via `serde_json` against the
 /// substrate's `CapabilitySet` wire shape (`{tags, metadata}`).
 /// Parse failures log + fall back to empty.
-fn fetch_daemon_caps(daemon_id: u64) -> (
+fn fetch_daemon_caps(
+    daemon_id: u64,
+) -> (
     ::net::adapter::net::behavior::capability::CapabilitySet,
     ::net::adapter::net::behavior::capability::CapabilitySet,
 ) {
@@ -928,16 +928,12 @@ impl MeshDaemon for GoBridge {
 
     /// Phase 6 — declared via the optional caps dispatcher; empty
     /// default when no dispatcher is installed.
-    fn required_capabilities(
-        &self,
-    ) -> ::net::adapter::net::behavior::capability::CapabilitySet {
+    fn required_capabilities(&self) -> ::net::adapter::net::behavior::capability::CapabilitySet {
         self.required_capabilities.clone()
     }
 
     /// Phase 6 — same shape as `required_capabilities`.
-    fn optional_capabilities(
-        &self,
-    ) -> ::net::adapter::net::behavior::capability::CapabilitySet {
+    fn optional_capabilities(&self) -> ::net::adapter::net::behavior::capability::CapabilitySet {
         self.optional_capabilities.clone()
     }
 
@@ -2920,10 +2916,7 @@ pub extern "C" fn net_compute_unregister_placement_filter(
 /// Same buffer-lifetime contract as
 /// [`net_compute_register_placement_filter`].
 #[no_mangle]
-pub extern "C" fn net_compute_has_placement_filter(
-    id_ptr: *const c_char,
-    id_len: usize,
-) -> c_int {
+pub extern "C" fn net_compute_has_placement_filter(id_ptr: *const c_char, id_len: usize) -> c_int {
     use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
     if id_ptr.is_null() {
         return NET_COMPUTE_ERR_NULL;

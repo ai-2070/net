@@ -294,10 +294,7 @@ mod tests {
             bf.insert(&i.to_le_bytes());
         }
         for i in 0..1000u32 {
-            assert!(
-                bf.contains(&i.to_le_bytes()),
-                "false negative on key {i}"
-            );
+            assert!(bf.contains(&i.to_le_bytes()), "false negative on key {i}");
         }
     }
 

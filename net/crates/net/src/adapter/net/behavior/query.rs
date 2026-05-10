@@ -126,11 +126,7 @@ pub struct Count(usize);
 
 impl Aggregator for Count {
     type Output = usize;
-    fn observe(
-        &mut self,
-        _: u64,
-        _: &crate::adapter::net::behavior::capability::CapabilitySet,
-    ) {
+    fn observe(&mut self, _: u64, _: &crate::adapter::net::behavior::capability::CapabilitySet) {
         self.0 += 1;
     }
     fn finalize(self) -> usize {
@@ -164,13 +160,12 @@ impl UniqueAxisValues {
 impl Aggregator for UniqueAxisValues {
     type Output = Vec<String>;
 
-    fn observe(
-        &mut self,
-        _: u64,
-        caps: &crate::adapter::net::behavior::capability::CapabilitySet,
-    ) {
+    fn observe(&mut self, _: u64, caps: &crate::adapter::net::behavior::capability::CapabilitySet) {
         for tag in &caps.tags {
-            if let Tag::AxisValue { axis, key, value, .. } = tag {
+            if let Tag::AxisValue {
+                axis, key, value, ..
+            } = tag
+            {
                 if *axis == self.axis && key == &self.key {
                     self.seen.insert(value.clone());
                 }
@@ -207,11 +202,7 @@ impl MaxNumericMetadata {
 impl Aggregator for MaxNumericMetadata {
     type Output = Option<f64>;
 
-    fn observe(
-        &mut self,
-        _: u64,
-        caps: &crate::adapter::net::behavior::capability::CapabilitySet,
-    ) {
+    fn observe(&mut self, _: u64, caps: &crate::adapter::net::behavior::capability::CapabilitySet) {
         let Some(raw) = caps.metadata.get(&self.key) else {
             return;
         };
@@ -248,7 +239,10 @@ pub trait CapabilityQuery {
     fn filter(
         &self,
         predicate: &Predicate,
-    ) -> Vec<(u64, crate::adapter::net::behavior::capability::CapabilitySet)>;
+    ) -> Vec<(
+        u64,
+        crate::adapter::net::behavior::capability::CapabilitySet,
+    )>;
 
     /// Type-aware match against a single axis-key. `value =
     /// None` matches any candidate carrying the axis-key (in
@@ -264,7 +258,10 @@ pub trait CapabilityQuery {
         axis: TaxonomyAxis,
         key: &str,
         value: Option<&str>,
-    ) -> Vec<(u64, crate::adapter::net::behavior::capability::CapabilitySet)>;
+    ) -> Vec<(
+        u64,
+        crate::adapter::net::behavior::capability::CapabilitySet,
+    )>;
 
     /// Run `agg` across every candidate satisfying `predicate`.
     /// Streaming: each match's caps are observed in turn; no
@@ -342,23 +339,26 @@ impl CapabilityQuery for CapabilityIndex {
     fn filter(
         &self,
         predicate: &Predicate,
-    ) -> Vec<(u64, crate::adapter::net::behavior::capability::CapabilitySet)> {
+    ) -> Vec<(
+        u64,
+        crate::adapter::net::behavior::capability::CapabilitySet,
+    )> {
         let mut out = Vec::new();
         for node_id in self.all_nodes() {
             // `with_caps` keeps the read-lock scope tight — we
             // build the EvalContext under the lock, run the
             // predicate, and only clone the caps if it matches.
-            let matched: Option<
-                crate::adapter::net::behavior::capability::CapabilitySet,
-            > = self.with_caps(node_id, |caps| {
-                let owned_tags: Vec<Tag> = caps.tags.iter().cloned().collect();
-                let ctx = EvalContext::new(&owned_tags, &caps.metadata);
-                if predicate.evaluate_unplanned(&ctx) {
-                    Some(caps.clone())
-                } else {
-                    None
-                }
-            }).flatten();
+            let matched: Option<crate::adapter::net::behavior::capability::CapabilitySet> = self
+                .with_caps(node_id, |caps| {
+                    let owned_tags: Vec<Tag> = caps.tags.iter().cloned().collect();
+                    let ctx = EvalContext::new(&owned_tags, &caps.metadata);
+                    if predicate.evaluate_unplanned(&ctx) {
+                        Some(caps.clone())
+                    } else {
+                        None
+                    }
+                })
+                .flatten();
             if let Some(caps) = matched {
                 out.push((node_id, caps));
             }
@@ -371,18 +371,21 @@ impl CapabilityQuery for CapabilityIndex {
         axis: TaxonomyAxis,
         key: &str,
         value: Option<&str>,
-    ) -> Vec<(u64, crate::adapter::net::behavior::capability::CapabilitySet)> {
+    ) -> Vec<(
+        u64,
+        crate::adapter::net::behavior::capability::CapabilitySet,
+    )> {
         let mut out = Vec::new();
         for node_id in self.all_nodes() {
-            let matched: Option<
-                crate::adapter::net::behavior::capability::CapabilitySet,
-            > = self.with_caps(node_id, |caps| {
-                if axis_match(caps, axis, key, value) {
-                    Some(caps.clone())
-                } else {
-                    None
-                }
-            }).flatten();
+            let matched: Option<crate::adapter::net::behavior::capability::CapabilitySet> = self
+                .with_caps(node_id, |caps| {
+                    if axis_match(caps, axis, key, value) {
+                        Some(caps.clone())
+                    } else {
+                        None
+                    }
+                })
+                .flatten();
             if let Some(caps) = matched {
                 out.push((node_id, caps));
             }
@@ -444,9 +447,7 @@ impl CapabilityQuery for CapabilityIndex {
             let next_edge: Option<Tag> = self
                 .with_caps(parent_node, |caps| {
                     caps.tags.iter().find_map(|t| match t {
-                        Tag::Reserved { prefix, .. } if prefix == edge.prefix() => {
-                            Some(t.clone())
-                        }
+                        Tag::Reserved { prefix, .. } if prefix == edge.prefix() => Some(t.clone()),
                         _ => None,
                     })
                 })
@@ -538,17 +539,25 @@ fn axis_match(
 ) -> bool {
     for tag in &caps.tags {
         match tag {
-            Tag::AxisPresent { axis: tag_axis, key: tag_key } => {
+            Tag::AxisPresent {
+                axis: tag_axis,
+                key: tag_key,
+            } => {
                 if *tag_axis == axis && tag_key == key && value.is_none() {
                     return true;
                 }
             }
-            Tag::AxisValue { axis: tag_axis, key: tag_key, value: tag_value, .. } => {
+            Tag::AxisValue {
+                axis: tag_axis,
+                key: tag_key,
+                value: tag_value,
+                ..
+            } => {
                 if *tag_axis != axis || tag_key != key {
                     continue;
                 }
                 match value {
-                    None => return true,                  // any value satisfies presence
+                    None => return true, // any value satisfies presence
                     Some(target) if tag_value == target => return true,
                     _ => {}
                 }
@@ -667,10 +676,7 @@ mod tests {
     #[test]
     fn aggregate_count_matches_filter_len() {
         let i = idx();
-        let pred = Predicate::exists(TagKey::new(
-            TaxonomyAxis::Hardware,
-            "gpu".to_string(),
-        ));
+        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "gpu".to_string()));
         let count = i.aggregate(&pred, Count::default());
         assert_eq!(count, 2);
     }
@@ -680,10 +686,7 @@ mod tests {
     #[test]
     fn aggregate_unique_axis_values_collects_distinct() {
         let i = idx();
-        let pred = Predicate::exists(TagKey::new(
-            TaxonomyAxis::Hardware,
-            "gpu".to_string(),
-        ));
+        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "gpu".to_string()));
         let agg = UniqueAxisValues::new(TaxonomyAxis::Hardware, "memory_mb");
         let mut got = i.aggregate(&pred, agg);
         got.sort();
@@ -702,10 +705,7 @@ mod tests {
                 .with_metadata("priority_weight", weight);
             i.index(CapabilityAnnouncement::new(id, eid.clone(), 1, caps));
         }
-        let pred = Predicate::exists(TagKey::new(
-            TaxonomyAxis::Hardware,
-            "gpu".to_string(),
-        ));
+        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "gpu".to_string()));
         let agg = MaxNumericMetadata::new("priority_weight");
         let max = i.aggregate(&pred, agg);
         assert_eq!(max, Some(0.9));
@@ -734,7 +734,10 @@ mod tests {
         let us_east_gpu: Vec<u64> = gpu_nodes
             .into_iter()
             .filter(|(_, caps)| {
-                caps.metadata.get("region").map(|r| r == "us-east").unwrap_or(false)
+                caps.metadata
+                    .get("region")
+                    .map(|r| r == "us-east")
+                    .unwrap_or(false)
             })
             .map(|(n, _)| n)
             .collect();
@@ -858,10 +861,7 @@ mod tests {
     #[test]
     fn nearest_ranks_by_rtt_ascending() {
         let i = idx();
-        let pred = Predicate::exists(TagKey::new(
-            TaxonomyAxis::Hardware,
-            "memory_mb".to_string(),
-        ));
+        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "memory_mb".to_string()));
         // 0x1111: 5 ms, 0x2222: 50 ms, 0x3333: 1 ms, 0x4444: 100 ms
         let rtts = |id: u64| -> Option<Duration> {
             match id {
@@ -882,10 +882,7 @@ mod tests {
     #[test]
     fn nearest_truncates_at_n() {
         let i = idx();
-        let pred = Predicate::exists(TagKey::new(
-            TaxonomyAxis::Hardware,
-            "memory_mb".to_string(),
-        ));
+        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "memory_mb".to_string()));
         let rtts = |_: u64| Some(Duration::from_millis(1));
         assert!(i.nearest(&pred, &rtts, 0).is_empty());
         // Larger-than-corpus n returns all 3 memory_mb-bearing nodes.
@@ -898,10 +895,7 @@ mod tests {
     #[test]
     fn nearest_unmeasured_candidates_sort_last() {
         let i = idx();
-        let pred = Predicate::exists(TagKey::new(
-            TaxonomyAxis::Hardware,
-            "memory_mb".to_string(),
-        ));
+        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "memory_mb".to_string()));
         // Only 0x2222 has RTT data.
         let rtts = |id: u64| -> Option<Duration> {
             if id == 0x2222 {

@@ -144,7 +144,7 @@ pub use net::adapter::net::behavior::capability::{
 // =============================================================================
 
 pub use net::adapter::net::behavior::tag::{
-    AxisSeparator, CapabilityTagError, RESERVED_PREFIXES, Tag, TagKey, TaxonomyAxis,
+    AxisSeparator, CapabilityTagError, Tag, TagKey, TaxonomyAxis, RESERVED_PREFIXES,
 };
 
 pub use net::adapter::net::behavior::tag_codec::{
@@ -199,10 +199,10 @@ pub use net::adapter::net::behavior::capability::{CardinalityCache, CardinalityP
 // =============================================================================
 
 pub use net::adapter::net::behavior::placement::{
-    AntiAffinityConfig, Artifact, ColocationPolicy, IntentMatchPolicy, IntentRegistry,
-    LeadershipStatsLookup, LegacyPlacement, NodeId as PlacementNodeId, PlacementFilter,
-    PlacementMetadataKeys, ResourceAxis, RttLookup, ScopeLabel, StandardPlacement,
-    TieBreakContext, compose_axis_scores, tie_break_compare,
+    compose_axis_scores, tie_break_compare, AntiAffinityConfig, Artifact, ColocationPolicy,
+    IntentMatchPolicy, IntentRegistry, LeadershipStatsLookup, LegacyPlacement,
+    NodeId as PlacementNodeId, PlacementFilter, PlacementMetadataKeys, ResourceAxis, RttLookup,
+    ScopeLabel, StandardPlacement, TieBreakContext,
 };
 
 // Phase 7 of the SDK plan — registry mapping SDK-generated IDs
@@ -212,7 +212,7 @@ pub use net::adapter::net::behavior::placement::{
 // code resolves an SDK ID to an impl before passing
 // `&dyn PlacementFilter` to the scheduler.
 pub use net::adapter::net::behavior::placement_registry::{
-    PlacementFilterRegistry, global_placement_filter_registry,
+    global_placement_filter_registry, PlacementFilterRegistry,
 };
 
 // =============================================================================
@@ -221,9 +221,7 @@ pub use net::adapter::net::behavior::placement_registry::{
 // to declare per-intent placement requirements.
 // =============================================================================
 
-pub use net::adapter::net::behavior::required_capability::{
-    RequireParseError, RequiredCapability,
-};
+pub use net::adapter::net::behavior::required_capability::{RequireParseError, RequiredCapability};
 
 // Re-export the require! / require_axis! / require_axis_value! macros
 // so callers can build `RequiredCapability` values without naming the
@@ -279,11 +277,10 @@ pub use net::{require, require_axis, require_axis_value};
 /// ```
 pub mod predicate {
     pub use net::adapter::net::behavior::predicate::{
-        AsRpcHeader, ClauseStats, ClauseTrace, EvalContext, MAX_PREDICATE_RPC_HEADER_VALUE_LEN,
-        Predicate, PredicateDebugReport, PredicateNodeWire, PredicateRpcDecodeError,
-        PredicateRpcEncodeError, PredicateWire, PredicateWireError, RPC_WHERE_HEADER,
-        RpcPredicateContext, filter_by_predicate, predicate_from_rpc_headers,
-        predicate_to_rpc_header,
+        filter_by_predicate, predicate_from_rpc_headers, predicate_to_rpc_header, AsRpcHeader,
+        ClauseStats, ClauseTrace, EvalContext, Predicate, PredicateDebugReport, PredicateNodeWire,
+        PredicateRpcDecodeError, PredicateRpcEncodeError, PredicateWire, PredicateWireError,
+        RpcPredicateContext, MAX_PREDICATE_RPC_HEADER_VALUE_LEN, RPC_WHERE_HEADER,
     };
 
     /// Re-export of the substrate's `pred!` macro.
@@ -337,9 +334,9 @@ pub use net::pred;
 /// ```
 pub mod schema {
     pub use net::adapter::net::behavior::schema::{
-        AXIS_SCHEMA, AxisEntry, AxisSchema, KeyEntry, KeyShape, KeyShapeKind,
-        METADATA_SOFT_CAP_BYTES, SchemaError, ValidationReport, ValidationWarning, ValueType,
-        validate_capabilities, validate_capabilities_against,
+        validate_capabilities, validate_capabilities_against, AxisEntry, AxisSchema, KeyEntry,
+        KeyShape, KeyShapeKind, SchemaError, ValidationReport, ValidationWarning, ValueType,
+        AXIS_SCHEMA, METADATA_SOFT_CAP_BYTES,
     };
 }
 

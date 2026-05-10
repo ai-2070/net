@@ -1978,9 +1978,9 @@ mod mesh_bindings {
             use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
 
             let guard = self.load_node()?;
-            let node = guard.as_ref().ok_or_else(|| {
-                Error::from_reason("MeshNode has been shut down")
-            })?;
+            let node = guard
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("MeshNode has been shut down"))?;
             let capability_index = node.capability_index().clone();
 
             // Build the TSFN inside the Node main thread; the

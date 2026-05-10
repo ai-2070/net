@@ -25,9 +25,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use crate::adapter::net::behavior::capability::{
-    CapabilityFilter, CapabilitySet, CapabilityIndex,
-};
+use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilityIndex, CapabilitySet};
 use crate::adapter::net::behavior::predicate::Predicate;
 use crate::adapter::net::behavior::required_capability::RequiredCapability;
 use crate::adapter::net::behavior::tag::{Tag, TagKey, TaxonomyAxis};
@@ -483,11 +481,7 @@ impl<'a> StandardPlacement<'a> {
 pub fn compose_axis_scores(scores: impl IntoIterator<Item = f32>) -> f32 {
     let mut product: f32 = 1.0;
     for s in scores {
-        let clamped = if s.is_nan() {
-            0.0
-        } else {
-            s.clamp(0.0, 1.0)
-        };
+        let clamped = if s.is_nan() { 0.0 } else { s.clamp(0.0, 1.0) };
         product *= clamped;
         // Short-circuit on a 0.0 — preserves the "0.0 anywhere → 0.0
         // final" invariant without iterating the remaining axes.
@@ -611,7 +605,11 @@ impl<'a> StandardPlacement<'a> {
             target_scope_bodies.iter().any(|tb| *tb == body)
         });
 
-        if any_match { 1.0 } else { 0.0 }
+        if any_match {
+            1.0
+        } else {
+            0.0
+        }
     }
 
     /// Phase F slice 5 proximity axis. Hard-bound RTT check:
@@ -646,7 +644,11 @@ impl<'a> StandardPlacement<'a> {
         // avoid overflow on a misbehaving lookup; in practice
         // lookups return wall-clock-bounded values.
         let target_rtt = Duration::from_micros(rtt_us);
-        if target_rtt <= max_rtt { 1.0 } else { 0.0 }
+        if target_rtt <= max_rtt {
+            1.0
+        } else {
+            0.0
+        }
     }
 
     /// Phase F slice 5 intent axis. Reads the artifact's
@@ -675,8 +677,7 @@ impl<'a> StandardPlacement<'a> {
                 // metadata. For Daemon artifacts that's
                 // `required.metadata`; for Chain / Replica
                 // artifacts it's the `capabilities.metadata` map.
-                let Some(intent) = artifact_intent(artifact, &self.metadata_keys.intent)
-                else {
+                let Some(intent) = artifact_intent(artifact, &self.metadata_keys.intent) else {
                     return 1.0; // No intent declared — no constraint.
                 };
 
@@ -695,10 +696,15 @@ impl<'a> StandardPlacement<'a> {
                 if self.intent_registry.is_empty() {
                     return 0.0;
                 }
-                let any_satisfied = self.intent_registry.iter().any(|(_, reqs)| {
-                    evaluate_required_caps(target_caps, reqs) >= 1.0
-                });
-                if any_satisfied { 1.0 } else { 0.0 }
+                let any_satisfied = self
+                    .intent_registry
+                    .iter()
+                    .any(|(_, reqs)| evaluate_required_caps(target_caps, reqs) >= 1.0);
+                if any_satisfied {
+                    1.0
+                } else {
+                    0.0
+                }
             }
         }
     }
@@ -875,11 +881,7 @@ impl<'a> StandardPlacement<'a> {
     /// scope / proximity / etc. when the candidate is going to be
     /// dropped). The caller in [`Self::placement_score`] does the
     /// short-circuit explicitly.
-    fn score_custom_filter_axis(
-        &self,
-        target: &NodeId,
-        artifact: &Artifact<'_>,
-    ) -> Option<f32> {
+    fn score_custom_filter_axis(&self, target: &NodeId, artifact: &Artifact<'_>) -> Option<f32> {
         let Some(id) = self.custom_filter_id.as_deref() else {
             return Some(1.0);
         };
@@ -910,15 +912,12 @@ impl<'a> StandardPlacement<'a> {
 ///   case where the value is treated as a soft hint.
 /// - `Chain { capabilities, .. }` → checks `capabilities.metadata`.
 /// - `Replica { capabilities, .. }` → same as `Chain`.
-fn artifact_metadata<'a>(
-    artifact: &'a Artifact<'_>,
-    key: &str,
-) -> Option<&'a str> {
-    let try_caps = |caps: &'a CapabilitySet| {
-        caps.metadata.get(key).map(|s| s.as_str())
-    };
+fn artifact_metadata<'a>(artifact: &'a Artifact<'_>, key: &str) -> Option<&'a str> {
+    let try_caps = |caps: &'a CapabilitySet| caps.metadata.get(key).map(|s| s.as_str());
     match artifact {
-        Artifact::Daemon { required, optional, .. } => try_caps(required).or_else(|| try_caps(optional)),
+        Artifact::Daemon {
+            required, optional, ..
+        } => try_caps(required).or_else(|| try_caps(optional)),
         Artifact::Chain { capabilities, .. } => try_caps(capabilities),
         Artifact::Replica { capabilities, .. } => try_caps(capabilities),
     }
@@ -928,10 +927,7 @@ fn artifact_metadata<'a>(
 /// name; slice 5 generalized it to `artifact_metadata` so the
 /// colocation axis can reuse the same lookup. Kept to minimize
 /// the slice 5 intent-axis diff churn.
-fn artifact_intent<'a>(
-    artifact: &'a Artifact<'_>,
-    intent_key: &str,
-) -> Option<&'a str> {
+fn artifact_intent<'a>(artifact: &'a Artifact<'_>, intent_key: &str) -> Option<&'a str> {
     artifact_metadata(artifact, intent_key)
 }
 
@@ -941,11 +937,7 @@ fn artifact_intent<'a>(
 ///
 /// Used by the resource axis (slice 5) to read numeric capacity
 /// declarations off the target's `CapabilitySet`.
-fn target_axis_value_numeric(
-    caps: &CapabilitySet,
-    axis: TaxonomyAxis,
-    key: &str,
-) -> Option<f64> {
+fn target_axis_value_numeric(caps: &CapabilitySet, axis: TaxonomyAxis, key: &str) -> Option<f64> {
     caps.tags.iter().find_map(|t| match t {
         Tag::AxisValue {
             axis: a,
@@ -1042,10 +1034,8 @@ fn evaluate_required_caps(target_caps: &CapabilitySet, reqs: &[RequiredCapabilit
     }
     // Materialize tags into a Vec so EvalContext can borrow a slice.
     let tags: Vec<Tag> = target_caps.tags.iter().cloned().collect();
-    let ctx = crate::adapter::net::behavior::predicate::EvalContext::new(
-        &tags,
-        &target_caps.metadata,
-    );
+    let ctx =
+        crate::adapter::net::behavior::predicate::EvalContext::new(&tags, &target_caps.metadata);
     if reqs.iter().all(|r| r.evaluate(&ctx)) {
         1.0
     } else {
@@ -1323,9 +1313,7 @@ fn free_resource_for(_node: NodeId, _ctx: &TieBreakContext<'_>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::net::behavior::capability::{
-        CapabilityAnnouncement, CapabilitySet,
-    };
+    use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
     use crate::adapter::net::identity::EntityId;
     use std::sync::Arc;
 
@@ -1343,7 +1331,10 @@ mod tests {
         CapabilitySet::default()
     }
 
-    fn daemon_artifact<'a>(required: &'a CapabilitySet, optional: &'a CapabilitySet) -> Artifact<'a> {
+    fn daemon_artifact<'a>(
+        required: &'a CapabilitySet,
+        optional: &'a CapabilitySet,
+    ) -> Artifact<'a> {
         Artifact::Daemon {
             daemon_id: [0u8; 32],
             required,
@@ -1356,10 +1347,7 @@ mod tests {
     /// CapabilityFilter::default() is eligible" contract.
     #[test]
     fn legacy_permissive_scores_all_indexed_nodes() {
-        let index = index_with(&[
-            (0x1111, empty_caps()),
-            (0x2222, empty_caps()),
-        ]);
+        let index = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
         let filter = LegacyPlacement::permissive(&index);
         let req = empty_caps();
         let opt = empty_caps();
@@ -1391,10 +1379,7 @@ mod tests {
     #[test]
     fn legacy_filter_vetoes_non_matching_candidates() {
         let caps_with_tag = empty_caps().add_tag("hardware.gpu");
-        let index = index_with(&[
-            (0x1111, caps_with_tag),
-            (0x2222, empty_caps()),
-        ]);
+        let index = index_with(&[(0x1111, caps_with_tag), (0x2222, empty_caps())]);
 
         let required = CapabilityFilter::default().require_tag("hardware.gpu".to_string());
 
@@ -1515,10 +1500,7 @@ mod tests {
     #[test]
     fn standard_vetoes_candidates_missing_required_caps() {
         let caps_with_gpu = empty_caps().add_tag("hardware.gpu");
-        let index = index_with(&[
-            (0x1111, caps_with_gpu),
-            (0x2222, empty_caps()),
-        ]);
+        let index = index_with(&[(0x1111, caps_with_gpu), (0x2222, empty_caps())]);
         let placement = StandardPlacement::new(&index);
 
         let required = empty_caps().add_tag("hardware.gpu");
@@ -1551,14 +1533,8 @@ mod tests {
             placement.scope_filter.as_ref().unwrap()[0].as_str(),
             "scope:tenant:foo"
         );
-        assert_eq!(
-            placement.proximity_max_rtt,
-            Some(Duration::from_millis(50))
-        );
-        assert!(matches!(
-            placement.intent_match,
-            IntentMatchPolicy::Strict
-        ));
+        assert_eq!(placement.proximity_max_rtt, Some(Duration::from_millis(50)));
+        assert!(matches!(placement.intent_match, IntentMatchPolicy::Strict));
         assert_eq!(
             placement.colocation_policy,
             ColocationPolicy::SoftPreference
@@ -1575,7 +1551,10 @@ mod tests {
         let placement = StandardPlacement::new(&index);
         assert!(placement.scope_filter.is_none());
         assert!(placement.proximity_max_rtt.is_none());
-        assert!(matches!(placement.intent_match, IntentMatchPolicy::Disabled));
+        assert!(matches!(
+            placement.intent_match,
+            IntentMatchPolicy::Disabled
+        ));
         assert_eq!(placement.colocation_policy, ColocationPolicy::Ignore);
     }
 
@@ -1614,10 +1593,13 @@ mod tests {
         });
         assert!(has_gpu_tag, "ml-training must include hardware.gpu tag");
 
-        let has_vram_predicate = reqs.iter().any(|rc| {
-            matches!(rc, RequiredCapability::Predicate(_))
-        });
-        assert!(has_vram_predicate, "ml-training must include vram numeric predicate");
+        let has_vram_predicate = reqs
+            .iter()
+            .any(|rc| matches!(rc, RequiredCapability::Predicate(_)));
+        assert!(
+            has_vram_predicate,
+            "ml-training must include vram numeric predicate"
+        );
     }
 
     /// `register` adds a new intent; subsequent `lookup` returns it.
@@ -1631,12 +1613,7 @@ mod tests {
         );
         assert!(prev.is_none());
         assert_eq!(r.len(), 1);
-        assert_eq!(
-            r.lookup("custom-intent")
-                .expect("just registered")
-                .len(),
-            1
-        );
+        assert_eq!(r.lookup("custom-intent").expect("just registered").len(), 1);
     }
 
     /// `register` of an existing intent returns the old mapping —
@@ -1651,10 +1628,7 @@ mod tests {
         assert!(prev.is_some(), "previous mapping returned");
         assert_eq!(prev.unwrap().len(), 2, "old ml-training had 2 requirements");
         // After replace, the new mapping is in place.
-        assert_eq!(
-            r.lookup("ml-training").expect("re-registered").len(),
-            1
-        );
+        assert_eq!(r.lookup("ml-training").expect("re-registered").len(), 1);
     }
 
     /// Unknown intent → `None`.
@@ -1756,10 +1730,7 @@ mod tests {
             Ordering::Less,
             "candidate with RTT data must sort before one without",
         );
-        assert_eq!(
-            tie_break_compare(0x2222, 0x1111, &ctx),
-            Ordering::Greater,
-        );
+        assert_eq!(tie_break_compare(0x2222, 0x1111, &ctx), Ordering::Greater,);
     }
 
     /// `rtt_lookup = None` skips step 1 — falls through to step 2
@@ -2134,8 +2105,8 @@ mod tests {
     #[test]
     fn scope_axis_matches_body_form() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
+        let placement =
+            StandardPlacement::new(&index).with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
         let target_caps = empty_caps().with_tenant_scope("foo");
         assert_eq!(
             placement.score_scope_axis(&target_caps),
@@ -2149,8 +2120,8 @@ mod tests {
     #[test]
     fn scope_axis_unscoped_target_returns_zero() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
+        let placement =
+            StandardPlacement::new(&index).with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
         let target_caps = empty_caps().add_tag("hardware.gpu");
         assert_eq!(placement.score_scope_axis(&target_caps), 0.0);
     }
@@ -2174,8 +2145,8 @@ mod tests {
     #[test]
     fn scope_axis_no_match_returns_zero() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
+        let placement =
+            StandardPlacement::new(&index).with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
         // Target tagged with a different tenant.
         let target_caps = empty_caps().with_tenant_scope("bar");
         assert_eq!(placement.score_scope_axis(&target_caps), 0.0);
@@ -2199,8 +2170,8 @@ mod tests {
     #[test]
     fn proximity_axis_threshold_without_lookup_returns_one() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_proximity_max_rtt(Duration::from_millis(50));
+        let placement =
+            StandardPlacement::new(&index).with_proximity_max_rtt(Duration::from_millis(50));
         assert_eq!(placement.score_proximity_axis(&0x1111), 1.0);
     }
 
@@ -2310,14 +2281,17 @@ mod tests {
     #[test]
     fn colocation_axis_ignore_returns_one() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_colocation_policy(ColocationPolicy::Ignore);
+        let placement =
+            StandardPlacement::new(&index).with_colocation_policy(ColocationPolicy::Ignore);
         let mut required = empty_caps();
         required = with_metadata_pair(required, "colocate-with", "abc123");
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
         let target_caps = empty_caps();
-        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 1.0);
+        assert_eq!(
+            placement.score_colocation_axis(&target_caps, &artifact),
+            1.0
+        );
     }
 
     /// SoftPreference + no colocate metadata declared → 1.0
@@ -2325,27 +2299,33 @@ mod tests {
     #[test]
     fn colocation_axis_soft_no_metadata_returns_one() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let placement =
+            StandardPlacement::new(&index).with_colocation_policy(ColocationPolicy::SoftPreference);
         let required = empty_caps();
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
         let target_caps = empty_caps();
-        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 1.0);
+        assert_eq!(
+            placement.score_colocation_axis(&target_caps, &artifact),
+            1.0
+        );
     }
 
     /// SoftPreference + soft-key declared + target hosts → 1.0.
     #[test]
     fn colocation_axis_soft_target_hosts_returns_one() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let placement =
+            StandardPlacement::new(&index).with_colocation_policy(ColocationPolicy::SoftPreference);
         let mut required = empty_caps();
         required = with_metadata_pair(required, "colocate-with", "abc123");
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
         let target_caps = empty_caps().require_chain("abc123");
-        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 1.0);
+        assert_eq!(
+            placement.score_colocation_axis(&target_caps, &artifact),
+            1.0
+        );
     }
 
     /// SoftPreference + soft-key declared + target doesn't host
@@ -2353,8 +2333,8 @@ mod tests {
     #[test]
     fn colocation_axis_soft_target_misses_returns_penalty() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let placement =
+            StandardPlacement::new(&index).with_colocation_policy(ColocationPolicy::SoftPreference);
         let mut required = empty_caps();
         required = with_metadata_pair(required, "colocate-with", "abc123");
         let optional = empty_caps();
@@ -2373,8 +2353,8 @@ mod tests {
     #[test]
     fn colocation_axis_strict_key_vetoes_under_soft_policy() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let placement =
+            StandardPlacement::new(&index).with_colocation_policy(ColocationPolicy::SoftPreference);
         let mut required = empty_caps();
         required = with_metadata_pair(required, "colocate-with-strict", "abc123");
         let optional = empty_caps();
@@ -2394,28 +2374,34 @@ mod tests {
     #[test]
     fn colocation_axis_strict_policy_upgrades_soft_key_to_veto() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_colocation_policy(ColocationPolicy::StrictRequired);
+        let placement =
+            StandardPlacement::new(&index).with_colocation_policy(ColocationPolicy::StrictRequired);
         let mut required = empty_caps();
         required = with_metadata_pair(required, "colocate-with", "abc123");
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
         let target_caps = empty_caps();
-        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 0.0);
+        assert_eq!(
+            placement.score_colocation_axis(&target_caps, &artifact),
+            0.0
+        );
     }
 
     /// StrictRequired + soft-key declared + target hosts → 1.0.
     #[test]
     fn colocation_axis_strict_policy_target_hosts_returns_one() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_colocation_policy(ColocationPolicy::StrictRequired);
+        let placement =
+            StandardPlacement::new(&index).with_colocation_policy(ColocationPolicy::StrictRequired);
         let mut required = empty_caps();
         required = with_metadata_pair(required, "colocate-with", "abc123");
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
         let target_caps = empty_caps().require_chain("abc123");
-        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 1.0);
+        assert_eq!(
+            placement.score_colocation_axis(&target_caps, &artifact),
+            1.0
+        );
     }
 
     /// Tip-form `causal:<hash>:<tip_seq>` satisfies the colocation
@@ -2423,15 +2409,18 @@ mod tests {
     #[test]
     fn colocation_axis_tip_form_satisfies_match() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let placement =
+            StandardPlacement::new(&index).with_colocation_policy(ColocationPolicy::SoftPreference);
         let mut required = empty_caps();
         required = with_metadata_pair(required, "colocate-with", "abc123");
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
         // Target announces a tip-form chain.
         let target_caps = empty_caps().require_chain_tip("abc123", 42);
-        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 1.0);
+        assert_eq!(
+            placement.score_colocation_axis(&target_caps, &artifact),
+            1.0
+        );
     }
 
     /// End-to-end: a strict colocation veto zeros the final score
@@ -2446,8 +2435,8 @@ mod tests {
             i.index(ad);
             i
         };
-        let placement = StandardPlacement::new(&index)
-            .with_colocation_policy(ColocationPolicy::StrictRequired);
+        let placement =
+            StandardPlacement::new(&index).with_colocation_policy(ColocationPolicy::StrictRequired);
 
         let mut required = empty_caps();
         required = with_metadata_pair(required, "colocate-with", "abc123");
@@ -2471,8 +2460,7 @@ mod tests {
     #[test]
     fn resource_axis_compute_no_data_returns_one() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_resource_axis(ResourceAxis::Compute);
+        let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Compute);
         let target_caps = empty_caps();
         let req = empty_caps();
         let opt = empty_caps();
@@ -2485,10 +2473,8 @@ mod tests {
     #[test]
     fn resource_axis_compute_cpu_at_reference_scores_half() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_resource_axis(ResourceAxis::Compute);
-        let target_caps = empty_caps()
-            .add_tag("hardware.cpu_cores=8");
+        let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Compute);
+        let target_caps = empty_caps().add_tag("hardware.cpu_cores=8");
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
@@ -2504,16 +2490,13 @@ mod tests {
     #[test]
     fn resource_axis_compute_monotonic_in_capacity() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_resource_axis(ResourceAxis::Compute);
+        let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Compute);
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
 
-        let small = empty_caps()
-            .add_tag("hardware.cpu_cores=4");
-        let large = empty_caps()
-            .add_tag("hardware.cpu_cores=64");
+        let small = empty_caps().add_tag("hardware.cpu_cores=4");
+        let large = empty_caps().add_tag("hardware.cpu_cores=64");
 
         let small_score = placement.score_resource_axis(&small, &artifact);
         let large_score = placement.score_resource_axis(&large, &artifact);
@@ -2530,8 +2513,7 @@ mod tests {
     #[test]
     fn resource_axis_compute_averages_present_components() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_resource_axis(ResourceAxis::Compute);
+        let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Compute);
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
@@ -2543,11 +2525,13 @@ mod tests {
             .add_tag("hardware.memory_mb=16384")
             .add_tag("hardware.gpu.vram_mb=16384");
         let s_three = placement.score_resource_axis(&three_components, &artifact);
-        assert!((s_three - 0.5).abs() < 1e-6, "3-comp avg got {s_three}, want 0.5");
+        assert!(
+            (s_three - 0.5).abs() < 1e-6,
+            "3-comp avg got {s_three}, want 0.5"
+        );
 
         // CPU only at the reference: avg = 0.5.
-        let cpu_only = empty_caps()
-            .add_tag("hardware.cpu_cores=8");
+        let cpu_only = empty_caps().add_tag("hardware.cpu_cores=8");
         let s_one = placement.score_resource_axis(&cpu_only, &artifact);
         assert!((s_one - 0.5).abs() < 1e-6, "1-comp got {s_one}, want 0.5");
     }
@@ -2557,8 +2541,7 @@ mod tests {
     #[test]
     fn resource_axis_storage_at_reference_scores_half() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_resource_axis(ResourceAxis::Storage);
+        let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Storage);
         let target_caps = empty_caps().add_tag("dataforts.capacity_mb=1000000");
         let req = empty_caps();
         let opt = empty_caps();
@@ -2575,8 +2558,7 @@ mod tests {
     #[test]
     fn resource_axis_storage_no_data_returns_one() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_resource_axis(ResourceAxis::Storage);
+        let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Storage);
         let target_caps = empty_caps();
         let req = empty_caps();
         let opt = empty_caps();
@@ -2591,10 +2573,8 @@ mod tests {
     #[test]
     fn resource_axis_both_averages_compute_and_storage() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_resource_axis(ResourceAxis::Both);
-        let target_caps = empty_caps()
-            .add_tag("hardware.cpu_cores=8");
+        let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Both);
+        let target_caps = empty_caps().add_tag("hardware.cpu_cores=8");
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
@@ -2611,10 +2591,8 @@ mod tests {
     #[test]
     fn resource_axis_compute_malformed_value_treated_as_no_data() {
         let index = index_with(&[]);
-        let placement = StandardPlacement::new(&index)
-            .with_resource_axis(ResourceAxis::Compute);
-        let target_caps = empty_caps()
-            .add_tag("hardware.cpu_cores=lots");
+        let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Compute);
+        let target_caps = empty_caps().add_tag("hardware.cpu_cores=lots");
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
@@ -2641,8 +2619,7 @@ mod tests {
     fn anti_affinity_target_without_data_returns_one() {
         let index = index_with(&[]);
         let stats = |_id: NodeId| -> Option<f32> { None };
-        let placement = StandardPlacement::new(&index)
-            .with_leadership_stats(&stats);
+        let placement = StandardPlacement::new(&index).with_leadership_stats(&stats);
         assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
     }
 
@@ -2652,8 +2629,7 @@ mod tests {
     fn anti_affinity_under_threshold_returns_one() {
         let index = index_with(&[]);
         let stats = |_id: NodeId| -> Option<f32> { Some(0.20) };
-        let placement = StandardPlacement::new(&index)
-            .with_leadership_stats(&stats);
+        let placement = StandardPlacement::new(&index).with_leadership_stats(&stats);
         assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
     }
 
@@ -2662,8 +2638,7 @@ mod tests {
     fn anti_affinity_at_threshold_returns_one_inclusive() {
         let index = index_with(&[]);
         let stats = |_id: NodeId| -> Option<f32> { Some(0.30) };
-        let placement = StandardPlacement::new(&index)
-            .with_leadership_stats(&stats);
+        let placement = StandardPlacement::new(&index).with_leadership_stats(&stats);
         assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
     }
 
@@ -2673,8 +2648,7 @@ mod tests {
     fn anti_affinity_over_threshold_returns_penalty() {
         let index = index_with(&[]);
         let stats = |_id: NodeId| -> Option<f32> { Some(0.50) };
-        let placement = StandardPlacement::new(&index)
-            .with_leadership_stats(&stats);
+        let placement = StandardPlacement::new(&index).with_leadership_stats(&stats);
         let score = placement.score_anti_affinity_axis(&0x1111);
         assert!(
             (score - 0.4).abs() < 1e-6,
@@ -2695,8 +2669,7 @@ mod tests {
                 _ => None,
             }
         };
-        let placement = StandardPlacement::new(&index)
-            .with_leadership_stats(&stats);
+        let placement = StandardPlacement::new(&index).with_leadership_stats(&stats);
         assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
         assert!((placement.score_anti_affinity_axis(&0x2222) - 0.4).abs() < 1e-6);
     }
@@ -2709,8 +2682,7 @@ mod tests {
         let stats = |_id: NodeId| -> Option<f32> { Some(0.50) };
 
         // NaN → 0.0.
-        let mut placement = StandardPlacement::new(&index)
-            .with_leadership_stats(&stats);
+        let mut placement = StandardPlacement::new(&index).with_leadership_stats(&stats);
         placement.anti_affinity.leadership_concentration_penalty = f32::NAN;
         assert_eq!(placement.score_anti_affinity_axis(&0x1111), 0.0);
 
@@ -2737,8 +2709,7 @@ mod tests {
             i
         };
         let stats = |_id: NodeId| -> Option<f32> { Some(0.50) };
-        let placement = StandardPlacement::new(&index)
-            .with_leadership_stats(&stats);
+        let placement = StandardPlacement::new(&index).with_leadership_stats(&stats);
 
         let req = empty_caps();
         let opt = empty_caps();
@@ -2758,8 +2729,7 @@ mod tests {
     /// near 0.2 (other axes all 1.0).
     #[test]
     fn resource_axis_low_score_multiplies_through_composition() {
-        let target_caps = empty_caps()
-            .add_tag("hardware.cpu_cores=2");
+        let target_caps = empty_caps().add_tag("hardware.cpu_cores=2");
         let index = {
             let i = CapabilityIndex::new();
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
@@ -2767,8 +2737,7 @@ mod tests {
             i.index(ad);
             i
         };
-        let placement = StandardPlacement::new(&index)
-            .with_resource_axis(ResourceAxis::Compute);
+        let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Compute);
 
         let req = empty_caps();
         let opt = empty_caps();
@@ -2798,8 +2767,8 @@ mod tests {
             i.index(ad);
             i
         };
-        let placement = StandardPlacement::new(&index)
-            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let placement =
+            StandardPlacement::new(&index).with_colocation_policy(ColocationPolicy::SoftPreference);
 
         let mut required = empty_caps();
         required = with_metadata_pair(required, "colocate-with", "abc123");
@@ -2827,8 +2796,8 @@ mod tests {
             i.index(ad);
             i
         };
-        let placement = StandardPlacement::new(&index)
-            .with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
+        let placement =
+            StandardPlacement::new(&index).with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
 
         let req = empty_caps();
         let opt = empty_caps();
@@ -2914,7 +2883,10 @@ mod tests {
     ) {
         let reg = global_placement_filter_registry();
         let _ = reg.unregister(id); // cleanup from a possibly-failed prior run
-        assert!(reg.register(id.to_string(), filter, "test"), "register {id}");
+        assert!(
+            reg.register(id.to_string(), filter, "test"),
+            "register {id}"
+        );
         let _guard = FilterGuard { id: id.to_string() };
         body(id);
     }
@@ -2942,22 +2914,17 @@ mod tests {
     fn standard_placement_custom_filter_one_is_identity() {
         let index = index_with(&[(0x2222, empty_caps())]);
         let id = "pf-test-slice5-identity";
-        with_registered_filter(
-            id,
-            Arc::new(FixedScoreFilter(Some(1.0))),
-            |id| {
-                let placement = StandardPlacement::new(&index)
-                    .with_custom_filter_id(id);
-                let req = empty_caps();
-                let opt = empty_caps();
-                let artifact = daemon_artifact(&req, &opt);
-                assert_eq!(
-                    placement.placement_score(&0x2222, &artifact),
-                    Some(1.0),
-                    "Some(1.0) custom score should compose identically",
-                );
-            },
-        );
+        with_registered_filter(id, Arc::new(FixedScoreFilter(Some(1.0))), |id| {
+            let placement = StandardPlacement::new(&index).with_custom_filter_id(id);
+            let req = empty_caps();
+            let opt = empty_caps();
+            let artifact = daemon_artifact(&req, &opt);
+            assert_eq!(
+                placement.placement_score(&0x2222, &artifact),
+                Some(1.0),
+                "Some(1.0) custom score should compose identically",
+            );
+        });
     }
 
     /// Registered filter returning a fractional score is composed
@@ -2967,19 +2934,14 @@ mod tests {
     fn standard_placement_custom_filter_score_composes_multiplicatively() {
         let index = index_with(&[(0x3333, empty_caps())]);
         let id = "pf-test-slice5-multiply";
-        with_registered_filter(
-            id,
-            Arc::new(FixedScoreFilter(Some(0.5))),
-            |id| {
-                let placement = StandardPlacement::new(&index)
-                    .with_custom_filter_id(id);
-                let req = empty_caps();
-                let opt = empty_caps();
-                let artifact = daemon_artifact(&req, &opt);
-                let score = placement.placement_score(&0x3333, &artifact);
-                assert_eq!(score, Some(0.5));
-            },
-        );
+        with_registered_filter(id, Arc::new(FixedScoreFilter(Some(0.5))), |id| {
+            let placement = StandardPlacement::new(&index).with_custom_filter_id(id);
+            let req = empty_caps();
+            let opt = empty_caps();
+            let artifact = daemon_artifact(&req, &opt);
+            let score = placement.placement_score(&0x3333, &artifact);
+            assert_eq!(score, Some(0.5));
+        });
     }
 
     /// Registered filter returning `None` propagates as a hard veto.
@@ -2989,22 +2951,17 @@ mod tests {
     fn standard_placement_custom_filter_none_is_hard_veto() {
         let index = index_with(&[(0x4444, empty_caps())]);
         let id = "pf-test-slice5-veto";
-        with_registered_filter(
-            id,
-            Arc::new(FixedScoreFilter(None)),
-            |id| {
-                let placement = StandardPlacement::new(&index)
-                    .with_custom_filter_id(id);
-                let req = empty_caps();
-                let opt = empty_caps();
-                let artifact = daemon_artifact(&req, &opt);
-                assert_eq!(
-                    placement.placement_score(&0x4444, &artifact),
-                    None,
-                    "None from custom filter must veto the candidate",
-                );
-            },
-        );
+        with_registered_filter(id, Arc::new(FixedScoreFilter(None)), |id| {
+            let placement = StandardPlacement::new(&index).with_custom_filter_id(id);
+            let req = empty_caps();
+            let opt = empty_caps();
+            let artifact = daemon_artifact(&req, &opt);
+            assert_eq!(
+                placement.placement_score(&0x4444, &artifact),
+                None,
+                "None from custom filter must veto the candidate",
+            );
+        });
     }
 
     /// `custom_filter_id` references an unregistered id → hard veto.
@@ -3035,24 +2992,20 @@ mod tests {
     fn standard_placement_custom_filter_composes_with_in_tree_axes() {
         let index = index_with(&[(0x6666, empty_caps())]);
         let id = "pf-test-slice5-compose";
-        with_registered_filter(
-            id,
-            Arc::new(FixedScoreFilter(Some(1.0))),
-            |id| {
-                // Scope filter requires a specific tag; target has
-                // no scope tags, so scope axis returns 0.0.
-                let placement = StandardPlacement::new(&index)
-                    .with_custom_filter_id(id)
-                    .with_scope_filter(vec![ScopeLabel::new("scope:tenant:foo")]);
-                let req = empty_caps();
-                let opt = empty_caps();
-                let artifact = daemon_artifact(&req, &opt);
-                assert_eq!(
-                    placement.placement_score(&0x6666, &artifact),
-                    Some(0.0),
-                    "scope-axis 0.0 zeroes the composition even when custom = 1.0",
-                );
-            },
-        );
+        with_registered_filter(id, Arc::new(FixedScoreFilter(Some(1.0))), |id| {
+            // Scope filter requires a specific tag; target has
+            // no scope tags, so scope axis returns 0.0.
+            let placement = StandardPlacement::new(&index)
+                .with_custom_filter_id(id)
+                .with_scope_filter(vec![ScopeLabel::new("scope:tenant:foo")]);
+            let req = empty_caps();
+            let opt = empty_caps();
+            let artifact = daemon_artifact(&req, &opt);
+            assert_eq!(
+                placement.placement_score(&0x6666, &artifact),
+                Some(0.0),
+                "scope-axis 0.0 zeroes the composition even when custom = 1.0",
+            );
+        });
     }
 }

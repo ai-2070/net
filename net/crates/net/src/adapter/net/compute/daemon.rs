@@ -226,10 +226,7 @@ mod tests {
         fn requirements(&self) -> CapabilityFilter {
             CapabilityFilter::default()
         }
-        fn process(
-            &mut self,
-            _event: &CausalEvent,
-        ) -> Result<Vec<Bytes>, DaemonError> {
+        fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
             Ok(Vec::new())
         }
     }
@@ -251,10 +248,7 @@ mod tests {
         fn optional_capabilities(&self) -> CapabilitySet {
             CapabilitySet::new().add_tag("hardware.gpu.vram_mb=81920")
         }
-        fn process(
-            &mut self,
-            _event: &CausalEvent,
-        ) -> Result<Vec<Bytes>, DaemonError> {
+        fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
             Ok(Vec::new())
         }
     }
@@ -288,10 +282,7 @@ mod tests {
         let req = d.required_capabilities();
         let opt = d.optional_capabilities();
         assert_eq!(req.tags.len(), 1);
-        assert!(req
-            .tags
-            .iter()
-            .any(|t| t.to_string() == "hardware.gpu"));
+        assert!(req.tags.iter().any(|t| t.to_string() == "hardware.gpu"));
         assert_eq!(opt.tags.len(), 1);
         assert!(opt
             .tags

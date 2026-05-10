@@ -31,8 +31,8 @@ use std::os::raw::c_int;
 
 use super::NetError;
 use crate::adapter::net::behavior::{
-    EvalContext, MAX_PREDICATE_RPC_HEADER_VALUE_LEN, PredicateWire, RPC_WHERE_HEADER, Tag,
-    predicate_to_rpc_header,
+    predicate_to_rpc_header, EvalContext, PredicateWire, Tag, MAX_PREDICATE_RPC_HEADER_VALUE_LEN,
+    RPC_WHERE_HEADER,
 };
 
 /// Evaluate a wire-format `Predicate` against a `(tags, metadata)`

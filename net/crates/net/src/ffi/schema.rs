@@ -45,7 +45,7 @@ use serde_json::{json, Value};
 
 use super::NetError;
 use crate::adapter::net::behavior::{
-    SchemaError, ValidationWarning, ValueType, validate_capabilities, CapabilitySet,
+    validate_capabilities, CapabilitySet, SchemaError, ValidationWarning, ValueType,
 };
 
 /// Validate a wire-format `CapabilitySet` and write the
@@ -116,8 +116,7 @@ pub extern "C" fn net_validate_capabilities(
     // entry so the cross-binding fixture comparison is order-
     // independent (matches the test renderer in
     // `tests/cross_lang_capability_fixtures.rs`).
-    let mut errors: Vec<Value> =
-        report.errors.iter().map(schema_error_to_wire).collect();
+    let mut errors: Vec<Value> = report.errors.iter().map(schema_error_to_wire).collect();
     let mut warnings: Vec<Value> = report
         .warnings
         .iter()

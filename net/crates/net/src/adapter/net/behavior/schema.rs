@@ -143,76 +143,187 @@ pub struct AxisSchema {
 
 /// Hardware axis fixed keys.
 const HARDWARE_KEYS: &[KeyEntry] = &[
-    KeyEntry { key: "cpu_cores", value_type: ValueType::Number },
-    KeyEntry { key: "cpu_threads", value_type: ValueType::Number },
-    KeyEntry { key: "memory_mb", value_type: ValueType::Number },
-    KeyEntry { key: "gpu", value_type: ValueType::Presence },
-    KeyEntry { key: "gpu.vendor", value_type: ValueType::Enumeration },
-    KeyEntry { key: "gpu.model", value_type: ValueType::String },
-    KeyEntry { key: "gpu.vram_mb", value_type: ValueType::Number },
-    KeyEntry { key: "gpu.compute_units", value_type: ValueType::Number },
-    KeyEntry { key: "gpu.tensor_cores", value_type: ValueType::Number },
-    KeyEntry { key: "gpu.fp16_tflops_x10", value_type: ValueType::Number },
-    KeyEntry { key: "storage_mb", value_type: ValueType::Number },
-    KeyEntry { key: "network_mbps", value_type: ValueType::Number },
-    KeyEntry { key: "limits.max_concurrent_requests", value_type: ValueType::Number },
-    KeyEntry { key: "limits.max_tokens_per_request", value_type: ValueType::Number },
-    KeyEntry { key: "limits.rate_limit_rpm", value_type: ValueType::Number },
-    KeyEntry { key: "limits.max_batch_size", value_type: ValueType::Number },
-    KeyEntry { key: "limits.max_input_bytes", value_type: ValueType::Number },
-    KeyEntry { key: "limits.max_output_bytes", value_type: ValueType::Number },
+    KeyEntry {
+        key: "cpu_cores",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "cpu_threads",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "memory_mb",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "gpu",
+        value_type: ValueType::Presence,
+    },
+    KeyEntry {
+        key: "gpu.vendor",
+        value_type: ValueType::Enumeration,
+    },
+    KeyEntry {
+        key: "gpu.model",
+        value_type: ValueType::String,
+    },
+    KeyEntry {
+        key: "gpu.vram_mb",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "gpu.compute_units",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "gpu.tensor_cores",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "gpu.fp16_tflops_x10",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "storage_mb",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "network_mbps",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "limits.max_concurrent_requests",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "limits.max_tokens_per_request",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "limits.rate_limit_rpm",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "limits.max_batch_size",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "limits.max_input_bytes",
+        value_type: ValueType::Number,
+    },
+    KeyEntry {
+        key: "limits.max_output_bytes",
+        value_type: ValueType::Number,
+    },
 ];
 
 /// Software axis fixed keys (excluding the indexed `model.<i>.*` /
 /// `tool.<i>.*` and keyed `runtime.<n>` / `framework.<n>` /
 /// `driver.<n>` collections — those live in [`SOFTWARE_SHAPES`]).
 const SOFTWARE_KEYS: &[KeyEntry] = &[
-    KeyEntry { key: "os", value_type: ValueType::String },
-    KeyEntry { key: "os_version", value_type: ValueType::String },
-    KeyEntry { key: "cuda_version", value_type: ValueType::String },
+    KeyEntry {
+        key: "os",
+        value_type: ValueType::String,
+    },
+    KeyEntry {
+        key: "os_version",
+        value_type: ValueType::String,
+    },
+    KeyEntry {
+        key: "cuda_version",
+        value_type: ValueType::String,
+    },
 ];
 
 /// Software axis indexed / keyed sub-namespaces.
 const SOFTWARE_SHAPES: &[KeyShape] = &[
     KeyShape {
         prefix: "runtime.",
-        kind: KeyShapeKind::KeyedMap { value_type: ValueType::String },
+        kind: KeyShapeKind::KeyedMap {
+            value_type: ValueType::String,
+        },
         sub_keys: &[],
     },
     KeyShape {
         prefix: "framework.",
-        kind: KeyShapeKind::KeyedMap { value_type: ValueType::String },
+        kind: KeyShapeKind::KeyedMap {
+            value_type: ValueType::String,
+        },
         sub_keys: &[],
     },
     KeyShape {
         prefix: "driver.",
-        kind: KeyShapeKind::KeyedMap { value_type: ValueType::String },
+        kind: KeyShapeKind::KeyedMap {
+            value_type: ValueType::String,
+        },
         sub_keys: &[],
     },
     KeyShape {
         prefix: "model.",
         kind: KeyShapeKind::IndexedCollection,
         sub_keys: &[
-            KeyEntry { key: "id", value_type: ValueType::String },
-            KeyEntry { key: "family", value_type: ValueType::String },
-            KeyEntry { key: "parameters_b_x10", value_type: ValueType::Number },
-            KeyEntry { key: "context_length", value_type: ValueType::Number },
-            KeyEntry { key: "quantization", value_type: ValueType::String },
-            KeyEntry { key: "modalities", value_type: ValueType::Csv },
-            KeyEntry { key: "tokens_per_sec", value_type: ValueType::Number },
-            KeyEntry { key: "loaded", value_type: ValueType::Bool },
+            KeyEntry {
+                key: "id",
+                value_type: ValueType::String,
+            },
+            KeyEntry {
+                key: "family",
+                value_type: ValueType::String,
+            },
+            KeyEntry {
+                key: "parameters_b_x10",
+                value_type: ValueType::Number,
+            },
+            KeyEntry {
+                key: "context_length",
+                value_type: ValueType::Number,
+            },
+            KeyEntry {
+                key: "quantization",
+                value_type: ValueType::String,
+            },
+            KeyEntry {
+                key: "modalities",
+                value_type: ValueType::Csv,
+            },
+            KeyEntry {
+                key: "tokens_per_sec",
+                value_type: ValueType::Number,
+            },
+            KeyEntry {
+                key: "loaded",
+                value_type: ValueType::Bool,
+            },
         ],
     },
     KeyShape {
         prefix: "tool.",
         kind: KeyShapeKind::IndexedCollection,
         sub_keys: &[
-            KeyEntry { key: "tool_id", value_type: ValueType::String },
-            KeyEntry { key: "name", value_type: ValueType::String },
-            KeyEntry { key: "version", value_type: ValueType::String },
-            KeyEntry { key: "requires", value_type: ValueType::Csv },
-            KeyEntry { key: "estimated_time_ms", value_type: ValueType::Number },
-            KeyEntry { key: "stateless", value_type: ValueType::Bool },
+            KeyEntry {
+                key: "tool_id",
+                value_type: ValueType::String,
+            },
+            KeyEntry {
+                key: "name",
+                value_type: ValueType::String,
+            },
+            KeyEntry {
+                key: "version",
+                value_type: ValueType::String,
+            },
+            KeyEntry {
+                key: "requires",
+                value_type: ValueType::Csv,
+            },
+            KeyEntry {
+                key: "estimated_time_ms",
+                value_type: ValueType::Number,
+            },
+            KeyEntry {
+                key: "stateless",
+                value_type: ValueType::Bool,
+            },
         ],
     },
 ];
@@ -383,11 +494,7 @@ pub fn validate_capabilities_against(
 
     // Metadata size cap (soft only here; hard cap belongs to the
     // emit path, not this diagnostic validator).
-    let metadata_bytes: usize = caps
-        .metadata
-        .iter()
-        .map(|(k, v)| k.len() + v.len())
-        .sum();
+    let metadata_bytes: usize = caps.metadata.iter().map(|(k, v)| k.len() + v.len()).sum();
     if metadata_bytes > METADATA_SOFT_CAP_BYTES {
         report.warnings.push(ValidationWarning::MetadataOversize {
             soft_cap_bytes: METADATA_SOFT_CAP_BYTES,
@@ -404,11 +511,21 @@ fn validate_tag(tag: &Tag, schema: &AxisSchema, report: &mut ValidationReport) {
         Tag::AxisPresent { axis, key } => {
             validate_axis_key(*axis, key, ValueType::Presence, None, schema, report, tag);
         }
-        Tag::AxisValue { axis, key, value, .. } => {
+        Tag::AxisValue {
+            axis, key, value, ..
+        } => {
             // Values aren't typed in `Tag::AxisValue` — they're string
             // payloads. We pass the value through to the type-mismatch
             // check below.
-            validate_axis_key(*axis, key, ValueType::String, Some(value), schema, report, tag);
+            validate_axis_key(
+                *axis,
+                key,
+                ValueType::String,
+                Some(value),
+                schema,
+                report,
+                tag,
+            );
         }
         Tag::Reserved { .. } => {
             // Reserved-prefix tags pass through unchecked; their
@@ -416,9 +533,9 @@ fn validate_tag(tag: &Tag, schema: &AxisSchema, report: &mut ValidationReport) {
             // doesn't constrain it beyond the prefix recognition.
         }
         Tag::Legacy(s) => {
-            report.warnings.push(ValidationWarning::LegacyTag {
-                tag: s.clone(),
-            });
+            report
+                .warnings
+                .push(ValidationWarning::LegacyTag { tag: s.clone() });
         }
     }
 }
@@ -570,7 +687,7 @@ fn detect_unknown_axis_typo(_legacy: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::{
-        GpuInfo, GpuVendor, HardwareCapabilities, ModelCapability, Modality, SoftwareCapabilities,
+        GpuInfo, GpuVendor, HardwareCapabilities, Modality, ModelCapability, SoftwareCapabilities,
     };
     use std::collections::HashSet;
 
@@ -608,10 +725,9 @@ mod tests {
     #[test]
     fn axis_schema_const_covers_every_documented_software_shape() {
         let prefixes: HashSet<&str> = SOFTWARE_SHAPES.iter().map(|s| s.prefix).collect();
-        let expected: HashSet<&str> =
-            ["runtime.", "framework.", "driver.", "model.", "tool."]
-                .into_iter()
-                .collect();
+        let expected: HashSet<&str> = ["runtime.", "framework.", "driver.", "model.", "tool."]
+            .into_iter()
+            .collect();
         assert_eq!(prefixes, expected);
     }
 
@@ -751,9 +867,9 @@ mod tests {
     #[test]
     fn validate_report_is_valid_allows_warnings() {
         let mut report = ValidationReport::default();
-        report.warnings.push(ValidationWarning::LegacyTag {
-            tag: "x".into(),
-        });
+        report
+            .warnings
+            .push(ValidationWarning::LegacyTag { tag: "x".into() });
         assert!(report.is_valid());
         assert!(!report.is_clean());
     }
@@ -775,10 +891,15 @@ mod tests {
         // "Metadata reserved keys" appears in
         // `METADATA_RESERVED_KEYS`. Drift detector.
         let pinned: HashSet<&str> = METADATA_RESERVED_KEYS.iter().copied().collect();
-        let expected: HashSet<&str> =
-            ["intent", "colocate-with", "colocate-with-strict", "priority", "owner"]
-                .into_iter()
-                .collect();
+        let expected: HashSet<&str> = [
+            "intent",
+            "colocate-with",
+            "colocate-with-strict",
+            "priority",
+            "owner",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(pinned, expected);
     }
 

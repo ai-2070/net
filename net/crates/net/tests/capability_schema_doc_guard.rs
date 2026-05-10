@@ -24,12 +24,11 @@
 
 use std::collections::HashSet;
 
-use net::adapter::net::behavior::{AXIS_SCHEMA, AxisEntry, KeyShapeKind};
+use net::adapter::net::behavior::{AxisEntry, KeyShapeKind, AXIS_SCHEMA};
 
 fn read_schema_doc() -> String {
     let path = "docs/CAPABILITIES_SCHEMA.md";
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {path}: {e}"))
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"))
 }
 
 /// Extract every `axis.key` mention from a markdown table row of the
@@ -92,10 +91,7 @@ fn substrate_axis_keys(axis: &str, entry: &AxisEntry) -> HashSet<(String, String
             KeyShapeKind::IndexedCollection => {
                 for sub in shape.sub_keys {
                     // `model.` + `id` → `model.<i>.id`
-                    out.insert((
-                        axis.to_string(),
-                        format!("{}<i>.{}", shape.prefix, sub.key),
-                    ));
+                    out.insert((axis.to_string(), format!("{}<i>.{}", shape.prefix, sub.key)));
                 }
             }
         }

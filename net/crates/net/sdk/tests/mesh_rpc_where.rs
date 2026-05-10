@@ -29,7 +29,7 @@ use bytes::Bytes;
 
 use net::adapter::net::behavior::{
     predicate::{
-        AsRpcHeader, predicate_from_rpc_headers, predicate_to_rpc_header, RPC_WHERE_HEADER,
+        predicate_from_rpc_headers, predicate_to_rpc_header, AsRpcHeader, RPC_WHERE_HEADER,
     },
     Predicate, TagKey, TaxonomyAxis,
 };
@@ -75,10 +75,7 @@ async fn handshake(a: &Mesh, b: &Mesh, addr_b: std::net::SocketAddr) {
 fn sample_predicate() -> Predicate {
     Predicate::and(vec![
         Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "gpu")),
-        Predicate::numeric_at_least(
-            TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-            65536.0,
-        ),
+        Predicate::numeric_at_least(TagKey::new(TaxonomyAxis::Hardware, "memory_mb"), 65536.0),
         Predicate::metadata_equals("intent", "ml-training"),
     ])
 }
@@ -190,9 +187,7 @@ async fn end_to_end_where_predicate_round_trip() {
     let handler = Arc::new(PredicateEchoHandler {
         captured: captured.clone(),
     });
-    let _serve = server
-        .serve_rpc("filter-svc", handler)
-        .expect("serve_rpc");
+    let _serve = server.serve_rpc("filter-svc", handler).expect("serve_rpc");
 
     let pred = sample_predicate();
     let opts = CallOptions::default()
@@ -232,9 +227,7 @@ async fn end_to_end_missing_where_predicate_returns_none() {
     let handler = Arc::new(PredicateEchoHandler {
         captured: captured.clone(),
     });
-    let _serve = server
-        .serve_rpc("filter-svc", handler)
-        .expect("serve_rpc");
+    let _serve = server.serve_rpc("filter-svc", handler).expect("serve_rpc");
 
     // Default opts — no with_where.
     let reply = caller

@@ -62,11 +62,7 @@ pub struct PyPlacementFilter {
 impl PyPlacementFilter {
     /// Construct a wrapper. `predicate` is a Python callable; the
     /// GIL is acquired internally around every invocation.
-    pub fn new(
-        id: String,
-        predicate: Py<PyAny>,
-        capability_index: Arc<CapabilityIndex>,
-    ) -> Self {
+    pub fn new(id: String, predicate: Py<PyAny>, capability_index: Arc<CapabilityIndex>) -> Self {
         Self {
             predicate,
             capability_index,
@@ -76,11 +72,7 @@ impl PyPlacementFilter {
 }
 
 impl PlacementFilter for PyPlacementFilter {
-    fn placement_score(
-        &self,
-        target: &PlacementNodeId,
-        _artifact: &Artifact<'_>,
-    ) -> Option<f32> {
+    fn placement_score(&self, target: &PlacementNodeId, _artifact: &Artifact<'_>) -> Option<f32> {
         // Look up the candidate's caps. Same semantics as the
         // Node TSFN bridge: missing-from-index → vetoed (no
         // Python visibility into a never-indexed node, so we

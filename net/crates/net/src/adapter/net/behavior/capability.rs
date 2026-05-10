@@ -1129,7 +1129,9 @@ impl CapabilitySet {
         self.tags
             .retain(|t| !crate::adapter::net::behavior::tag_codec::is_hardware_owned_tag(t));
         self.tags
-            .extend(crate::adapter::net::behavior::tag_codec::hardware_to_tags(&hardware));
+            .extend(crate::adapter::net::behavior::tag_codec::hardware_to_tags(
+                &hardware,
+            ));
     }
 
     /// Replace the software projection in-place.
@@ -1141,7 +1143,9 @@ impl CapabilitySet {
         self.tags
             .retain(|t| !crate::adapter::net::behavior::tag_codec::is_software_owned_tag(t));
         self.tags
-            .extend(crate::adapter::net::behavior::tag_codec::software_to_tags(&software));
+            .extend(crate::adapter::net::behavior::tag_codec::software_to_tags(
+                &software,
+            ));
     }
 
     /// Replace the resource-limits projection in-place.
@@ -1149,12 +1153,10 @@ impl CapabilitySet {
     /// Phase A.5.N.3: clears every `hardware.limits.*` tag and
     /// re-emits the new ones.
     pub fn set_limits(&mut self, limits: ResourceLimits) {
-        self.tags.retain(|t| {
-            !crate::adapter::net::behavior::tag_codec::is_resource_limits_owned_tag(t)
-        });
-        self.tags.extend(
-            crate::adapter::net::behavior::tag_codec::resource_limits_to_tags(&limits),
-        );
+        self.tags
+            .retain(|t| !crate::adapter::net::behavior::tag_codec::is_resource_limits_owned_tag(t));
+        self.tags
+            .extend(crate::adapter::net::behavior::tag_codec::resource_limits_to_tags(&limits));
     }
 
     /// Replace the loaded-model list in-place.
@@ -1165,7 +1167,9 @@ impl CapabilitySet {
         self.tags
             .retain(|t| !crate::adapter::net::behavior::tag_codec::is_models_owned_tag(t));
         self.tags
-            .extend(crate::adapter::net::behavior::tag_codec::models_to_tags(&models));
+            .extend(crate::adapter::net::behavior::tag_codec::models_to_tags(
+                &models,
+            ));
     }
 
     /// Replace the available-tool list in-place.
@@ -1193,7 +1197,9 @@ impl CapabilitySet {
         // Re-emit the tag encoding (which intentionally drops
         // schemas — they ride in metadata).
         self.tags
-            .extend(crate::adapter::net::behavior::tag_codec::tools_to_tags(&tools));
+            .extend(crate::adapter::net::behavior::tag_codec::tools_to_tags(
+                &tools,
+            ));
 
         // Mirror fresh schemas into metadata.
         for tool in &tools {
@@ -1234,7 +1240,9 @@ impl CapabilitySet {
     pub fn has_model(&self, model_id: &str) -> bool {
         use crate::adapter::net::behavior::tag::TaxonomyAxis;
         self.tags.iter().any(|tag| {
-            let Some(key) = tag.axis_key() else { return false };
+            let Some(key) = tag.axis_key() else {
+                return false;
+            };
             if key.axis != TaxonomyAxis::Software {
                 return false;
             }
@@ -1255,7 +1263,9 @@ impl CapabilitySet {
     pub fn has_tool(&self, tool_id: &str) -> bool {
         use crate::adapter::net::behavior::tag::TaxonomyAxis;
         self.tags.iter().any(|tag| {
-            let Some(key) = tag.axis_key() else { return false };
+            let Some(key) = tag.axis_key() else {
+                return false;
+            };
             if key.axis != TaxonomyAxis::Software {
                 return false;
             }
@@ -1334,16 +1344,8 @@ impl CapabilitySet {
     /// pick the surface that matches the consumer's shape.
     pub fn diff(&self, prev: &CapabilitySet) -> CapabilitySetDiff {
         // Tag diff: HashSet difference both ways.
-        let added_tags: HashSet<Tag> = self
-            .tags
-            .difference(&prev.tags)
-            .cloned()
-            .collect();
-        let removed_tags: HashSet<Tag> = prev
-            .tags
-            .difference(&self.tags)
-            .cloned()
-            .collect();
+        let added_tags: HashSet<Tag> = self.tags.difference(&prev.tags).cloned().collect();
+        let removed_tags: HashSet<Tag> = prev.tags.difference(&self.tags).cloned().collect();
 
         // Metadata diff: walk both maps simultaneously. Both are
         // `BTreeMap` so we can rely on ordered iteration; merge
@@ -1600,9 +1602,7 @@ impl<'a> CapabilityViews<'a> {
     /// tags on first call.
     pub fn resource_limits(&self) -> &ResourceLimits {
         self.resource_limits.get_or_init(|| {
-            crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(
-                self.sorted_tags(),
-            )
+            crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(self.sorted_tags())
         })
     }
 
@@ -1620,9 +1620,8 @@ impl<'a> CapabilityViews<'a> {
     /// `tool::<id>::input_schema` / `tool::<id>::output_schema`).
     pub fn tools(&self) -> &Vec<ToolCapability> {
         self.tools.get_or_init(|| {
-            let mut tools = crate::adapter::net::behavior::tag_codec::tools_from_tags(
-                self.sorted_tags(),
-            );
+            let mut tools =
+                crate::adapter::net::behavior::tag_codec::tools_from_tags(self.sorted_tags());
             for tool in &mut tools {
                 if let Some(s) = self
                     .caps
@@ -2170,8 +2169,7 @@ impl CapabilityFilter {
 
         // Check context length
         if let Some(min_ctx) = self.min_context_length {
-            let has_sufficient =
-                views.models().iter().any(|m| m.context_length >= min_ctx);
+            let has_sufficient = views.models().iter().any(|m| m.context_length >= min_ctx);
             if !has_sufficient {
                 return false;
             }
@@ -2531,7 +2529,9 @@ impl CapabilityIndex {
                     crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
                     String::new(),
                 ),
-                TagEnum::AxisValue { axis, key, value, .. } => (
+                TagEnum::AxisValue {
+                    axis, key, value, ..
+                } => (
                     crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
                     value.clone(),
                 ),
@@ -2621,7 +2621,9 @@ impl CapabilityIndex {
                     crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
                     String::new(),
                 ),
-                TagEnum::AxisValue { axis, key, value, .. } => (
+                TagEnum::AxisValue {
+                    axis, key, value, ..
+                } => (
                     crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
                     value.clone(),
                 ),
@@ -2811,10 +2813,7 @@ impl CapabilityIndex {
             let caps = &entry.value().capabilities;
             // Materialize tags for the slice-based EvalContext.
             let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
-            let ctx = crate::adapter::net::behavior::EvalContext::new(
-                &tags,
-                &caps.metadata,
-            );
+            let ctx = crate::adapter::net::behavior::EvalContext::new(&tags, &caps.metadata);
             if predicate.evaluate_with_index(&ctx, self) {
                 matched.push(node_id);
             }
@@ -2875,10 +2874,7 @@ impl CapabilityIndex {
     /// Reserved-prefix tags (`scope:*`, `causal:*`, etc.) and
     /// legacy untyped tags don't fit the axis taxonomy; this
     /// primitive doesn't surface them.
-    pub fn axis_cardinality(
-        &self,
-        key: &crate::adapter::net::behavior::tag::TagKey,
-    ) -> usize {
+    pub fn axis_cardinality(&self, key: &crate::adapter::net::behavior::tag::TagKey) -> usize {
         self.by_axis_key
             .get(key)
             .map(|inner| inner.len())
@@ -3048,11 +3044,7 @@ impl CapabilityIndex {
     /// axes against the borrowed caps. Saves the `CapabilitySet`
     /// clone per scoring call (a HashSet + BTreeMap allocation
     /// pair), which dominates the per-candidate cost in benches.
-    pub fn with_caps<R>(
-        &self,
-        node_id: u64,
-        f: impl FnOnce(&CapabilitySet) -> R,
-    ) -> Option<R> {
+    pub fn with_caps<R>(&self, node_id: u64, f: impl FnOnce(&CapabilitySet) -> R) -> Option<R> {
         self.nodes.get(&node_id).map(|n| f(&n.capabilities))
     }
 
@@ -3486,8 +3478,8 @@ mod tests {
         // for `hardware.memory_mb` should be 3.
         let index = CapabilityIndex::new();
         for (i, mb) in [16384u32, 32768, 65536].iter().enumerate() {
-            let caps = CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_memory(*mb));
+            let caps =
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(*mb));
             index_with_node(&index, i as u64, caps);
         }
         let key = crate::adapter::net::behavior::tag::TagKey::new(
@@ -3509,9 +3501,8 @@ mod tests {
             GpuVendor::Amd,
         ];
         for (i, v) in vendors.iter().enumerate() {
-            let caps = CapabilitySet::new().with_hardware(
-                HardwareCapabilities::new().with_gpu(GpuInfo::new(*v, "x", 1024)),
-            );
+            let caps = CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(*v, "x", 1024)));
             index_with_node(&index, i as u64, caps);
         }
         let key = crate::adapter::net::behavior::tag::TagKey::new(
@@ -3540,8 +3531,8 @@ mod tests {
     #[test]
     fn axis_cardinality_returns_zero_for_unknown_keys() {
         let index = CapabilityIndex::new();
-        let caps = CapabilitySet::new()
-            .with_hardware(HardwareCapabilities::new().with_memory(65536));
+        let caps =
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(65536));
         index_with_node(&index, 1, caps);
 
         let unknown_key = crate::adapter::net::behavior::tag::TagKey::new(
@@ -3595,9 +3586,8 @@ mod tests {
         // correctly (was an O(N) scan in the previous implementation).
         let index = CapabilityIndex::new();
         for i in 0..100u32 {
-            let caps = CapabilitySet::new().with_hardware(
-                HardwareCapabilities::new().with_memory(1024 + i),
-            );
+            let caps = CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_memory(1024 + i));
             index_with_node(&index, i as u64, caps);
         }
         let key = crate::adapter::net::behavior::tag::TagKey::new(
@@ -3652,9 +3642,11 @@ mod tests {
         index_with_node(
             &index,
             1,
-            CapabilitySet::new().with_hardware(
-                HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 1024)),
-            ),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
+                GpuVendor::Nvidia,
+                "h100",
+                1024,
+            ))),
         );
         index_with_node(
             &index,
@@ -3664,9 +3656,11 @@ mod tests {
         index_with_node(
             &index,
             3,
-            CapabilitySet::new().with_hardware(
-                HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Amd, "x", 1024)),
-            ),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
+                GpuVendor::Amd,
+                "x",
+                1024,
+            ))),
         );
         index_with_node(
             &index,
@@ -3696,10 +3690,11 @@ mod tests {
             &index,
             10,
             CapabilitySet::new()
-                .with_hardware(
-                    HardwareCapabilities::new()
-                        .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
-                )
+                .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
+                    GpuVendor::Nvidia,
+                    "h100",
+                    81920,
+                )))
                 .with_metadata("intent", "ml-training"),
         );
         // GPU but wrong intent → miss
@@ -3707,10 +3702,11 @@ mod tests {
             &index,
             11,
             CapabilitySet::new()
-                .with_hardware(
-                    HardwareCapabilities::new()
-                        .with_gpu(GpuInfo::new(GpuVendor::Amd, "x", 1024)),
-                )
+                .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
+                    GpuVendor::Amd,
+                    "x",
+                    1024,
+                )))
                 .with_metadata("intent", "embedding-cache"),
         );
         // ml-training but no GPU → miss
@@ -3918,12 +3914,14 @@ mod tests {
         index_with_node(
             &index,
             999,
-            CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_memory(99999)),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(99999)),
         );
 
         let second = cache.axis_cardinality(&memory_key);
-        assert_eq!(second, first, "cached value should not reflect post-cache mutation");
+        assert_eq!(
+            second, first,
+            "cached value should not reflect post-cache mutation"
+        );
     }
 
     #[test]
@@ -3943,13 +3941,16 @@ mod tests {
         index_with_node(
             &index,
             999,
-            CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_memory(99999)),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(99999)),
         );
         cache.refresh();
 
         let after_refresh = cache.axis_cardinality(&memory_key);
-        assert_eq!(after_refresh, first + 1, "post-refresh read should see the new node");
+        assert_eq!(
+            after_refresh,
+            first + 1,
+            "post-refresh read should see the new node"
+        );
     }
 
     #[test]
@@ -3969,8 +3970,7 @@ mod tests {
         index_with_node(
             &index,
             999,
-            CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_memory(99999)),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(99999)),
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
 
@@ -4020,10 +4020,7 @@ mod tests {
             .with_metadata("intent", "ml-training");
         let tags: Vec<crate::adapter::net::behavior::Tag> =
             candidate_caps.tags.iter().cloned().collect();
-        let ctx = crate::adapter::net::behavior::EvalContext::new(
-            &tags,
-            &candidate_caps.metadata,
-        );
+        let ctx = crate::adapter::net::behavior::EvalContext::new(&tags, &candidate_caps.metadata);
         assert_eq!(
             pred.evaluate_with_index(&ctx, &cache),
             pred.evaluate_with_index(&ctx, &index),
@@ -4046,7 +4043,11 @@ mod tests {
                 HardwareCapabilities::new()
                     .with_memory(1024 + i as u32)
                     .with_gpu(GpuInfo::new(
-                        if i % 2 == 0 { GpuVendor::Nvidia } else { GpuVendor::Amd },
+                        if i % 2 == 0 {
+                            GpuVendor::Nvidia
+                        } else {
+                            GpuVendor::Amd
+                        },
                         "x",
                         1024,
                     )),
@@ -4897,14 +4898,15 @@ mod tests {
     /// `Tag::parse` so reserved-prefix tags (`scope:tenant:foo`)
     /// land as `Tag::Reserved`, mirroring real wire-form decoding.
     fn tags_from(strs: &[&str]) -> HashSet<Tag> {
-        strs.iter()
-            .filter_map(|s| Tag::parse(s).ok())
-            .collect()
+        strs.iter().filter_map(|s| Tag::parse(s).ok()).collect()
     }
 
     #[test]
     fn scope_from_tags_no_scope_tag_is_global() {
-        assert!(matches!(scope_from_tags(&tags_from(&[])), CapabilityScope::Global));
+        assert!(matches!(
+            scope_from_tags(&tags_from(&[])),
+            CapabilityScope::Global
+        ));
         assert!(matches!(
             scope_from_tags(&tags_from(&["gpu", "model:llama3"])),
             CapabilityScope::Global
@@ -5058,8 +5060,8 @@ mod tests {
             .with_tenant_scope("oem-123")
             .with_tenant_scope("oem-123") // duplicate
             .with_tenant_scope(""); // empty — silently dropped
-        // Phase A.5.N.2: tags are typed; render to wire form
-        // for prefix-string filtering.
+                                    // Phase A.5.N.2: tags are typed; render to wire form
+                                    // for prefix-string filtering.
         let tenant_tags: Vec<String> = caps
             .tags
             .iter()
@@ -5156,7 +5158,9 @@ mod tests {
     #[test]
     fn require_chain_range_emits_bracket_form() {
         let caps = CapabilitySet::new().require_chain_range("abc", 100, 200);
-        assert!(caps.tags.contains(&reserved_tag("causal:", "abc[100..200]")));
+        assert!(caps
+            .tags
+            .contains(&reserved_tag("causal:", "abc[100..200]")));
     }
 
     #[test]
@@ -5574,7 +5578,10 @@ mod tests {
             .add_tag("inference");
         let json = String::from_utf8(caps.to_bytes()).unwrap();
         assert!(json.contains("\"tags\":"), "missing tags field: {json}");
-        assert!(json.contains("\"metadata\":"), "missing metadata field: {json}");
+        assert!(
+            json.contains("\"metadata\":"),
+            "missing metadata field: {json}"
+        );
         // The legacy untyped tag rides through unchanged.
         assert!(json.contains("\"inference\""), "missing legacy tag: {json}");
         // Hardware fields are encoded as axis tags inside `tags`.
@@ -5587,8 +5594,14 @@ mod tests {
             "missing hardware.cpu_threads=16 tag: {json}",
         );
         // Old top-level typed-struct keys are gone.
-        assert!(!json.contains("\"hardware\":"), "stale hardware key: {json}");
-        assert!(!json.contains("\"software\":"), "stale software key: {json}");
+        assert!(
+            !json.contains("\"hardware\":"),
+            "stale hardware key: {json}"
+        );
+        assert!(
+            !json.contains("\"software\":"),
+            "stale software key: {json}"
+        );
         assert!(!json.contains("\"models\":"), "stale models key: {json}");
         assert!(!json.contains("\"tools\":"), "stale tools key: {json}");
         assert!(!json.contains("\"limits\":"), "stale limits key: {json}");

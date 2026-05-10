@@ -303,13 +303,13 @@ impl napi::bindgen_prelude::FromNapiValue for DaemonBridgeTsfns {
         // FFI roundtrip.
         let required_caps_js: Option<crate::capabilities::CapabilitySetJs> =
             obj.get_named_property("requiredCapabilities")?;
-        let required_capabilities = required_caps_js
-            .map(crate::capabilities::capability_set_from_js);
+        let required_capabilities =
+            required_caps_js.map(crate::capabilities::capability_set_from_js);
 
         let optional_caps_js: Option<crate::capabilities::CapabilitySetJs> =
             obj.get_named_property("optionalCapabilities")?;
-        let optional_capabilities = optional_caps_js
-            .map(crate::capabilities::capability_set_from_js);
+        let optional_capabilities =
+            optional_caps_js.map(crate::capabilities::capability_set_from_js);
 
         Ok(DaemonBridgeTsfns {
             process,
@@ -1672,12 +1672,8 @@ fn build_bridge_from_tsfn(factory: Arc<FactoryTsfn>, kind: String) -> Box<dyn Me
             // Phase 6 SDK plan: capabilities declared by the JS
             // factory flow through. None → empty default (run
             // anywhere); Some → use the converted set.
-            required_capabilities: tsfns
-                .required_capabilities
-                .unwrap_or_default(),
-            optional_capabilities: tsfns
-                .optional_capabilities
-                .unwrap_or_default(),
+            required_capabilities: tsfns.required_capabilities.unwrap_or_default(),
+            optional_capabilities: tsfns.optional_capabilities.unwrap_or_default(),
         }),
         Ok(Err(e)) => {
             let reason = format!("JS factory threw: {e}");

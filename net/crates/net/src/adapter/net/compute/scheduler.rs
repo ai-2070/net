@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilityIndex, CapabilitySet};
 use crate::adapter::net::behavior::placement::{
-    Artifact, LegacyPlacement, PlacementFilter, ResourceAxis, TieBreakContext, tie_break_compare,
+    tie_break_compare, Artifact, LegacyPlacement, PlacementFilter, ResourceAxis, TieBreakContext,
 };
 use crate::adapter::net::subprotocol::SubprotocolRegistry;
 
@@ -642,9 +642,7 @@ mod tests {
     /// returns it.
     #[test]
     fn select_migration_target_returns_only_candidate() {
-        let index = make_index_with_nodes(vec![
-            (0x2222, caps_with_migration_tag()),
-        ]);
+        let index = make_index_with_nodes(vec![(0x2222, caps_with_migration_tag())]);
         let scheduler = Scheduler::new(index.clone(), 0x1111, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
@@ -682,11 +680,7 @@ mod tests {
         // Synthetic filter: 0x1111 → 0.3, 0x2222 → 0.9, 0x3333 → 0.5.
         struct ScoredFilter;
         impl PlacementFilter for ScoredFilter {
-            fn placement_score(
-                &self,
-                t: &PlacementNodeId,
-                _: &Artifact<'_>,
-            ) -> Option<f32> {
+            fn placement_score(&self, t: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
                 Some(match *t {
                     0x1111 => 0.3,
                     0x2222 => 0.9,
@@ -845,10 +839,7 @@ mod tests {
     #[test]
     fn select_migration_target_honors_daemon_filter() {
         let index = make_index_with_nodes(vec![
-            (
-                0x1111,
-                caps_with_migration_tag().add_tag("hardware.gpu"),
-            ),
+            (0x1111, caps_with_migration_tag().add_tag("hardware.gpu")),
             (0x2222, caps_with_migration_tag()),
         ]);
         let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
@@ -867,13 +858,7 @@ mod tests {
 
         // Filter: must have hardware.gpu — narrows to 0x1111 only.
         let filter = CapabilityFilter::default().require_tag("hardware.gpu".to_string());
-        let target = scheduler.select_migration_target(
-            &artifact,
-            &filter,
-            0xFFFF,
-            &placement,
-            &tb,
-        );
+        let target = scheduler.select_migration_target(&artifact, &filter, 0xFFFF, &placement, &tb);
         assert_eq!(target, Some(0x1111));
     }
 
@@ -897,7 +882,10 @@ mod tests {
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
-        let placement = FixedScore { score: 0.5, veto: vec![] };
+        let placement = FixedScore {
+            score: 0.5,
+            veto: vec![],
+        };
         let tb = TieBreakContext {
             rtt_lookup: None,
             index: &index,
@@ -930,7 +918,10 @@ mod tests {
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
-        let placement = FixedScore { score: 0.5, veto: vec![] };
+        let placement = FixedScore {
+            score: 0.5,
+            veto: vec![],
+        };
         let tb = TieBreakContext {
             rtt_lookup: None,
             index: &index,
@@ -956,15 +947,15 @@ mod tests {
     /// → `None`.
     #[test]
     fn select_member_node_returns_none_when_all_excluded() {
-        let index = make_index_with_nodes(vec![
-            (0x1111, caps_no_gpu()),
-            (0x2222, caps_no_gpu()),
-        ]);
+        let index = make_index_with_nodes(vec![(0x1111, caps_no_gpu()), (0x2222, caps_no_gpu())]);
         let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
-        let placement = FixedScore { score: 0.5, veto: vec![] };
+        let placement = FixedScore {
+            score: 0.5,
+            veto: vec![],
+        };
         let tb = TieBreakContext {
             rtt_lookup: None,
             index: &index,
@@ -999,7 +990,10 @@ mod tests {
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
         // Filter vetoes 0x2222.
-        let placement = FixedScore { score: 1.0, veto: vec![0x2222] };
+        let placement = FixedScore {
+            score: 1.0,
+            veto: vec![0x2222],
+        };
         let tb = TieBreakContext {
             rtt_lookup: None,
             index: &index,
@@ -1023,10 +1017,7 @@ mod tests {
     /// (standby members) — picks the best by score + tie-break.
     #[test]
     fn select_promotion_target_picks_highest_scoring_standby() {
-        let index = make_index_with_nodes(vec![
-            (0x1111, caps_no_gpu()),
-            (0x2222, caps_no_gpu()),
-        ]);
+        let index = make_index_with_nodes(vec![(0x1111, caps_no_gpu()), (0x2222, caps_no_gpu())]);
         let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
@@ -1035,11 +1026,7 @@ mod tests {
         // Synthetic filter: 0x1111 → 0.3, 0x2222 → 0.9.
         struct ScoredFilter;
         impl PlacementFilter for ScoredFilter {
-            fn placement_score(
-                &self,
-                t: &PlacementNodeId,
-                _: &Artifact<'_>,
-            ) -> Option<f32> {
+            fn placement_score(&self, t: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
                 Some(match *t {
                     0x1111 => 0.3,
                     0x2222 => 0.9,
@@ -1054,12 +1041,7 @@ mod tests {
         };
 
         let standbys = vec![0x1111u64, 0x2222u64];
-        let target = scheduler.select_promotion_target(
-            standbys,
-            &artifact,
-            &ScoredFilter,
-            &tb,
-        );
+        let target = scheduler.select_promotion_target(standbys, &artifact, &ScoredFilter, &tb);
         assert_eq!(target, Some(0x2222));
     }
 
@@ -1071,19 +1053,17 @@ mod tests {
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
-        let placement = FixedScore { score: 1.0, veto: vec![] };
+        let placement = FixedScore {
+            score: 1.0,
+            veto: vec![],
+        };
         let tb = TieBreakContext {
             rtt_lookup: None,
             index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
-        let target = scheduler.select_promotion_target(
-            vec![],
-            &artifact,
-            &placement,
-            &tb,
-        );
+        let target = scheduler.select_promotion_target(vec![], &artifact, &placement, &tb);
         assert_eq!(target, None);
     }
 
@@ -1091,10 +1071,7 @@ mod tests {
     /// candidate vetoed → `None`.
     #[test]
     fn select_promotion_target_returns_none_when_all_vetoed() {
-        let index = make_index_with_nodes(vec![
-            (0x1111, caps_no_gpu()),
-            (0x2222, caps_no_gpu()),
-        ]);
+        let index = make_index_with_nodes(vec![(0x1111, caps_no_gpu()), (0x2222, caps_no_gpu())]);
         let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
@@ -1196,10 +1173,7 @@ mod tests {
     #[test]
     fn place_migration_v2_honors_daemon_filter() {
         let index = make_index_with_nodes(vec![
-            (
-                0x1111,
-                caps_with_migration_tag().add_tag("hardware.gpu"),
-            ),
+            (0x1111, caps_with_migration_tag().add_tag("hardware.gpu")),
             (0x2222, caps_with_migration_tag()),
         ]);
         let scheduler = Scheduler::new(index, 0xFFFF, caps_no_gpu());

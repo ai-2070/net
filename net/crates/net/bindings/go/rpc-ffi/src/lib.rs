@@ -1679,8 +1679,7 @@ mod tests {
     /// "no headers" path the `_with_headers` variants accept.
     #[test]
     fn collect_headers_empty_input_returns_empty_vec() {
-        let collected = unsafe { collect_headers(std::ptr::null(), 0) }
-            .expect("empty input is OK");
+        let collected = unsafe { collect_headers(std::ptr::null(), 0) }.expect("empty input is OK");
         assert!(collected.is_empty());
     }
 
@@ -1706,14 +1705,12 @@ mod tests {
     #[test]
     fn collect_headers_null_or_zero_value_yields_empty_bytes() {
         let name = b"x-empty";
-        let arr = [
-            NetRpcHeader {
-                name_ptr: name.as_ptr() as *const c_char,
-                name_len: name.len(),
-                value_ptr: std::ptr::null(),
-                value_len: 0,
-            },
-        ];
+        let arr = [NetRpcHeader {
+            name_ptr: name.as_ptr() as *const c_char,
+            name_len: name.len(),
+            value_ptr: std::ptr::null(),
+            value_len: 0,
+        }];
         let collected = unsafe { collect_headers(arr.as_ptr(), arr.len()) }.unwrap();
         assert_eq!(collected[0].0, "x-empty");
         assert!(collected[0].1.is_empty());

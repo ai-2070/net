@@ -1560,11 +1560,7 @@ mod tests {
     /// Permissive placement filter — every candidate scores 1.0.
     struct AllowAll;
     impl PlacementFilter for AllowAll {
-        fn placement_score(
-            &self,
-            _: &PlacementNodeId,
-            _: &Artifact<'_>,
-        ) -> Option<f32> {
+        fn placement_score(&self, _: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
             Some(1.0)
         }
     }
@@ -1595,12 +1591,7 @@ mod tests {
         assert_eq!(group.standby_count(), 2);
         assert_eq!(group.active_index(), 0);
         assert_eq!(group.health(), GroupHealth::Healthy);
-        let node_ids: HashSet<u64> = group
-            .coord
-            .members()
-            .iter()
-            .map(|m| m.node_id)
-            .collect();
+        let node_ids: HashSet<u64> = group.coord.members().iter().map(|m| m.node_id).collect();
         assert_eq!(
             node_ids.len(),
             3,
@@ -1621,11 +1612,7 @@ mod tests {
 
         struct VetoAll;
         impl PlacementFilter for VetoAll {
-            fn placement_score(
-                &self,
-                _: &PlacementNodeId,
-                _: &Artifact<'_>,
-            ) -> Option<f32> {
+            fn placement_score(&self, _: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
                 None
             }
         }
@@ -1691,11 +1678,7 @@ mod tests {
             preferred_node: u64,
         }
         impl PlacementFilter for PreferUnsynced {
-            fn placement_score(
-                &self,
-                t: &PlacementNodeId,
-                _: &Artifact<'_>,
-            ) -> Option<f32> {
+            fn placement_score(&self, t: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
                 Some(if *t == self.preferred_node { 1.0 } else { 0.1 })
             }
         }
@@ -1763,11 +1746,7 @@ mod tests {
             preferred_node: u64,
         }
         impl PlacementFilter for PreferNode {
-            fn placement_score(
-                &self,
-                t: &PlacementNodeId,
-                _: &Artifact<'_>,
-            ) -> Option<f32> {
+            fn placement_score(&self, t: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
                 Some(if *t == self.preferred_node { 1.0 } else { 0.1 })
             }
         }
@@ -1845,7 +1824,10 @@ mod tests {
             active_index_pre,
             "active_index must be unchanged when promote_with_placement fails"
         );
-        assert_eq!(group.member_role(active_index_pre), Some(MemberRole::Active));
+        assert_eq!(
+            group.member_role(active_index_pre),
+            Some(MemberRole::Active)
+        );
     }
 
     /// `on_node_failure_with_placement` triggers
@@ -1883,7 +1865,10 @@ mod tests {
             )
             .unwrap();
 
-        assert!(new_active.is_some(), "active failure → promote returns Some");
+        assert!(
+            new_active.is_some(),
+            "active failure → promote returns Some"
+        );
         assert_ne!(group.active_index(), 0, "active is no longer index 0");
     }
 

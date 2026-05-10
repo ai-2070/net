@@ -117,11 +117,7 @@ impl TsfnPlacementFilter {
 }
 
 impl PlacementFilter for TsfnPlacementFilter {
-    fn placement_score(
-        &self,
-        target: &PlacementNodeId,
-        _artifact: &Artifact<'_>,
-    ) -> Option<f32> {
+    fn placement_score(&self, target: &PlacementNodeId, _artifact: &Artifact<'_>) -> Option<f32> {
         // Look up the candidate's caps. A candidate not in the
         // index is invisible to the JS predicate (which expects
         // tags + metadata); treat as veto rather than feeding an

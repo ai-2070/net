@@ -85,7 +85,11 @@ fn report_to_wire(report: &PredicateDebugReport) -> Value {
 /// failure.
 fn parse_tag_array(tags_json_str: &str) -> Option<Vec<Tag>> {
     let strings: Vec<String> = serde_json::from_str(tags_json_str).ok()?;
-    strings.iter().map(|s| Tag::parse(s)).collect::<Result<_, _>>().ok()
+    strings
+        .iter()
+        .map(|s| Tag::parse(s))
+        .collect::<Result<_, _>>()
+        .ok()
 }
 
 /// Parse a `BTreeMap<String, String>` from JSON.
@@ -288,7 +292,9 @@ pub extern "C" fn net_predicate_aggregate_debug_report(
 
     let report = PredicateDebugReport::from_evaluations(
         &predicate,
-        owned.iter().map(|(tags, meta)| EvalContext::new(tags, meta)),
+        owned
+            .iter()
+            .map(|(tags, meta)| EvalContext::new(tags, meta)),
     );
 
     let payload = report_to_wire(&report);
@@ -445,10 +451,7 @@ pub extern "C" fn net_predicate_redact_metadata_keys(
             Some(l) => l.to_string(),
             None => return NetError::InvalidJson.into(),
         };
-        let evaluated = entry
-            .get("evaluated")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0);
+        let evaluated = entry.get("evaluated").and_then(|n| n.as_u64()).unwrap_or(0);
         let matched = entry.get("matched").and_then(|n| n.as_u64()).unwrap_or(0);
         let new_label = redact_label(&label, &keys);
         let slot = merged.entry(new_label).or_insert((0, 0));
@@ -646,12 +649,7 @@ mod tests {
         let pass1_cs = CString::new(pass1.clone()).unwrap();
         let mut out2: *mut c_char = std::ptr::null_mut();
         let mut len2: usize = 0;
-        net_predicate_redact_metadata_keys(
-            pass1_cs.as_ptr(),
-            keys.as_ptr(),
-            &mut out2,
-            &mut len2,
-        );
+        net_predicate_redact_metadata_keys(pass1_cs.as_ptr(), keys.as_ptr(), &mut out2, &mut len2);
         let pass2 = read_and_free(out2);
 
         assert_eq!(pass1, pass2, "redaction must be idempotent");
@@ -664,10 +662,8 @@ mod tests {
         let tags = CString::new(r#"[]"#).unwrap();
         let meta = CString::new(r#"{}"#).unwrap();
         let ctxs = CString::new(r#"[]"#).unwrap();
-        let report = CString::new(
-            r#"{"total_candidates":0,"matched":0,"clause_stats":[]}"#,
-        )
-        .unwrap();
+        let report =
+            CString::new(r#"{"total_candidates":0,"matched":0,"clause_stats":[]}"#).unwrap();
         let keys = CString::new(r#"[]"#).unwrap();
 
         let mut result: c_int = 0;

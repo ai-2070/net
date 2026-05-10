@@ -53,9 +53,7 @@ use thiserror::Error;
 /// | `software`  | What the node *currently runs*. Configurable. |
 /// | `devices`   | Custom semantic role tags. World-facing roles. |
 /// | `dataforts` | Storage capacity + hosted causal chains. |
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaxonomyAxis {
     /// Compute capabilities of the node — CPU / RAM / GPU / accelerators.
@@ -96,7 +94,12 @@ impl TaxonomyAxis {
     /// All four axes in declaration order. Useful for iteration
     /// (e.g. enumerate-and-match against an unknown prefix).
     pub const fn all() -> [Self; 4] {
-        [Self::Hardware, Self::Software, Self::Devices, Self::Dataforts]
+        [
+            Self::Hardware,
+            Self::Software,
+            Self::Devices,
+            Self::Dataforts,
+        ]
     }
 }
 
@@ -141,9 +144,7 @@ fn starts_with_reserved_prefix(s: &str) -> Option<&'static str> {
 /// Display form is the same as the axis-presence tag:
 /// `<axis>.<key>` (e.g. `hardware.gpu` for
 /// `TagKey { axis: Hardware, key: "gpu" }`).
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TagKey {
     /// Taxonomy axis the key belongs to.
     pub axis: TaxonomyAxis,
@@ -225,9 +226,7 @@ pub enum Tag {
 
 /// Separator between an axis-tag's key and value — `=` is the
 /// general convention; `:` is the dataforts pre-typed convention.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AxisSeparator {
     /// `=` separator — `hardware.gpu.vram_gb=80`.
@@ -595,10 +594,7 @@ mod tests {
 
     #[test]
     fn parse_user_rejects_empty_same_as_internal() {
-        assert_eq!(
-            Tag::parse_user("").unwrap_err(),
-            CapabilityTagError::Empty
-        );
+        assert_eq!(Tag::parse_user("").unwrap_err(), CapabilityTagError::Empty);
     }
 
     #[test]

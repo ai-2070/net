@@ -1838,21 +1838,14 @@ mod mesh_bindings {
         /// counter, so collisions are an SDK-side concern. Use
         /// `unregister_placement_filter` first if you need to swap
         /// the predicate behind a stable id.
-        fn register_placement_filter(
-            &self,
-            id: String,
-            predicate: Py<PyAny>,
-        ) -> PyResult<bool> {
+        fn register_placement_filter(&self, id: String, predicate: Py<PyAny>) -> PyResult<bool> {
             use net::adapter::net::behavior::placement::PlacementFilter;
             use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
 
             let node = self.get_node()?;
             let capability_index = node.capability_index().clone();
-            let wrapper = super::placement::PyPlacementFilter::new(
-                id.clone(),
-                predicate,
-                capability_index,
-            );
+            let wrapper =
+                super::placement::PyPlacementFilter::new(id.clone(), predicate, capability_index);
             let arc: std::sync::Arc<dyn PlacementFilter> = std::sync::Arc::new(wrapper);
             // SDK Phase 7 polish: `"python"` binding label drives the
             // `dataforts_placement_callback_invocations_total{binding="python"}`

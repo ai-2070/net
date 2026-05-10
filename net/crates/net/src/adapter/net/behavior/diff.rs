@@ -1130,8 +1130,8 @@ mod tests {
         let mut new = old.clone();
         // Phase A.5.N.2: tags is HashSet<Tag>. Remove the legacy
         // "inference" tag by re-parsing it and calling HashSet::remove.
-        let inference = crate::adapter::net::behavior::tag::Tag::parse("inference")
-            .expect("legacy tag parse");
+        let inference =
+            crate::adapter::net::behavior::tag::Tag::parse("inference").expect("legacy tag parse");
         new.tags.remove(&inference);
 
         let ops = DiffEngine::diff(&old, &new);
@@ -1266,8 +1266,8 @@ mod tests {
         // Make several changes. Phase A.5.N.3: every write goes
         // through the typed setters / add_*; reads through views().
         new = new.add_tag("training");
-        let inference = crate::adapter::net::behavior::tag::Tag::parse("inference")
-            .expect("legacy tag parse");
+        let inference =
+            crate::adapter::net::behavior::tag::Tag::parse("inference").expect("legacy tag parse");
         new.tags.remove(&inference);
 
         // Tweak the first existing model: loaded=false + new throughput.

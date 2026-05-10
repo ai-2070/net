@@ -34,8 +34,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 
 use super::placement::PlacementFilter;
 
@@ -126,8 +126,7 @@ impl PlacementFilterRegistry {
         // `invocations_by_binding` see `0` for newly-registered
         // bindings rather than missing keys.
         if !self.invocations.contains_key(&binding) {
-            self.invocations
-                .insert(binding.clone(), AtomicU64::new(0));
+            self.invocations.insert(binding.clone(), AtomicU64::new(0));
         }
         match self.filters.entry(id) {
             Entry::Occupied(_) => false,
@@ -265,7 +264,9 @@ mod tests {
         assert_eq!(reg.len(), 1);
         assert!(reg.contains("pf-1"));
 
-        let got = reg.get("pf-1").expect("registered filter must be retrievable");
+        let got = reg
+            .get("pf-1")
+            .expect("registered filter must be retrievable");
         // Score the retrieved filter to confirm it's the same impl.
         let req = crate::adapter::net::behavior::capability::CapabilitySet::default();
         let opt = crate::adapter::net::behavior::capability::CapabilitySet::default();

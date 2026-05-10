@@ -1169,9 +1169,11 @@ fn extract_optional_caps(
         return Ok(CapabilitySet::default());
     }
     let bound = v.into_bound(py);
-    let dict = bound
-        .cast_into::<PyDict>()
-        .map_err(|_| daemon_err(format!("daemon `{attr}` must be a dict (CapabilitySet shape)")))?;
+    let dict = bound.cast_into::<PyDict>().map_err(|_| {
+        daemon_err(format!(
+            "daemon `{attr}` must be a dict (CapabilitySet shape)"
+        ))
+    })?;
     crate::capabilities::capability_set_from_py(&dict)
 }
 
@@ -1224,22 +1226,24 @@ fn build_bridge_from_factory(
         // (non-dict attribute values, conversion errors) fall back
         // to `ReconstructionErrorBridge` rather than empty defaults
         // so misconfiguration is loud, not silent.
-        let required_capabilities = match extract_optional_caps(py, &instance, "required_capabilities") {
-            Ok(c) => c,
-            Err(e) => {
-                let reason = format!("`required_capabilities` extraction failed: {e}");
-                eprintln!("build_bridge_from_factory: kind '{kind}': {reason}");
-                return Box::new(ReconstructionErrorBridge::new(kind.to_string(), reason));
-            }
-        };
-        let optional_capabilities = match extract_optional_caps(py, &instance, "optional_capabilities") {
-            Ok(c) => c,
-            Err(e) => {
-                let reason = format!("`optional_capabilities` extraction failed: {e}");
-                eprintln!("build_bridge_from_factory: kind '{kind}': {reason}");
-                return Box::new(ReconstructionErrorBridge::new(kind.to_string(), reason));
-            }
-        };
+        let required_capabilities =
+            match extract_optional_caps(py, &instance, "required_capabilities") {
+                Ok(c) => c,
+                Err(e) => {
+                    let reason = format!("`required_capabilities` extraction failed: {e}");
+                    eprintln!("build_bridge_from_factory: kind '{kind}': {reason}");
+                    return Box::new(ReconstructionErrorBridge::new(kind.to_string(), reason));
+                }
+            };
+        let optional_capabilities =
+            match extract_optional_caps(py, &instance, "optional_capabilities") {
+                Ok(c) => c,
+                Err(e) => {
+                    let reason = format!("`optional_capabilities` extraction failed: {e}");
+                    eprintln!("build_bridge_from_factory: kind '{kind}': {reason}");
+                    return Box::new(ReconstructionErrorBridge::new(kind.to_string(), reason));
+                }
+            };
         Box::new(PyDaemonBridge {
             name: kind.to_string(),
             process,
