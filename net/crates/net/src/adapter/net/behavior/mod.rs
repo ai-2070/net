@@ -22,6 +22,7 @@ pub mod metadata;
 pub mod placement;
 pub mod placement_registry;
 pub mod predicate;
+pub mod query;
 pub mod proximity;
 pub mod required_capability;
 pub mod rules;
@@ -31,6 +32,8 @@ pub mod tag;
 pub mod tag_codec;
 
 pub use bloom::BloomFilter;
+
+pub use query::{Aggregator, CapabilityQuery, Count, MaxNumericMetadata, UniqueAxisValues};
 
 pub use broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 
