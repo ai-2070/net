@@ -1,0 +1,25 @@
+net/crates/net/bindings/node/src/placement.rs
+  s_d1b11a1287c170::t_0206f22bd583ee 1-66,68-108,113-139,149-204
+  s_d1b11a1287c170::t_a5ab9198776398 109-112
+  s_d1b11a1287c170::t_b63019e52653d5 140-148
+  s_d1b11a1287c170::t_a3940b1bb0b076 67
+net/crates/net/bindings/node/src/lib.rs
+  s_d1b11a1287c170::t_58741b418b8293 25-26
+  s_d1b11a1287c170::t_bf029be09b053f 1938-2017
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "e90921dc5be29526c164c0fd0ba8f54afed450a6",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
