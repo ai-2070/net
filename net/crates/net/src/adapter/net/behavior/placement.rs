@@ -325,6 +325,14 @@ pub struct StandardPlacement<'a> {
     /// Hard ceiling on the proximity-graph RTT to the candidate.
     /// `None` disables the proximity axis.
     pub proximity_max_rtt: Option<Duration>,
+    /// Closure-based RTT lookup. Returns microsecond-resolution
+    /// RTT for a candidate, or `None` if not measured. Decouples
+    /// the placement module from the proximity graph's internal
+    /// node-id shape (see [`RttLookup`]); scheduler integrations
+    /// supply a bridge closure when wiring through. `None` (the
+    /// default) skips the proximity axis regardless of
+    /// `proximity_max_rtt`.
+    pub rtt_lookup: Option<&'a dyn RttLookup>,
     /// Intent-match strategy. `Disabled` skips the axis.
     pub intent_match: IntentMatchPolicy,
     /// Intent → required-caps registry consumed when
@@ -353,6 +361,7 @@ impl<'a> StandardPlacement<'a> {
             index,
             scope_filter: None,
             proximity_max_rtt: None,
+            rtt_lookup: None,
             intent_match: IntentMatchPolicy::default(),
             intent_registry: IntentRegistry::default(),
             colocation_policy: ColocationPolicy::default(),
@@ -371,6 +380,15 @@ impl<'a> StandardPlacement<'a> {
     /// Replace the proximity max-RTT bound.
     pub fn with_proximity_max_rtt(mut self, max: Duration) -> Self {
         self.proximity_max_rtt = Some(max);
+        self
+    }
+
+    /// Replace the RTT lookup closure. Pair with
+    /// `with_proximity_max_rtt` for the proximity axis to score
+    /// (both must be `Some` — either alone leaves the axis at
+    /// 1.0 / disabled).
+    pub fn with_rtt_lookup(mut self, lookup: &'a dyn RttLookup) -> Self {
+        self.rtt_lookup = Some(lookup);
         self
     }
 
@@ -529,11 +547,39 @@ impl<'a> StandardPlacement<'a> {
         if any_match { 1.0 } else { 0.0 }
     }
 
-    fn score_proximity_axis(&self, _target: &NodeId) -> f32 {
-        // Stub: proximity axis always satisfied. Slice 4 wires
-        // `ProximityGraph::nearest_rtt`; slice 5 thresholds against
-        // `proximity_max_rtt`.
-        1.0
+    /// Phase F slice 5 proximity axis. Hard-bound RTT check:
+    ///
+    /// - `proximity_max_rtt: None` → 1.0 (axis disabled).
+    /// - `rtt_lookup: None` → 1.0 (no measurement source; can't
+    ///   enforce, default permissive — operators who care wire
+    ///   the lookup explicitly).
+    /// - RTT lookup returns `None` for the target → 1.0 (no data
+    ///   for this candidate; default permissive — scoring an
+    ///   unreached peer at 0.0 would flip the placement-decision
+    ///   semantics for fresh-mesh / disconnected-peer scenarios).
+    /// - RTT lookup returns `Some(rtt) <= max_rtt` → 1.0.
+    /// - RTT lookup returns `Some(rtt) > max_rtt` → 0.0 (hard
+    ///   veto).
+    ///
+    /// Asymmetry vs. tie-breaker step 1 is intentional: the
+    /// tie-breaker needs strict ordering ("present beats missing"),
+    /// the scoring axis just enforces the bound when measurement
+    /// is available.
+    fn score_proximity_axis(&self, target: &NodeId) -> f32 {
+        let Some(max_rtt) = self.proximity_max_rtt else {
+            return 1.0;
+        };
+        let Some(lookup) = self.rtt_lookup else {
+            return 1.0;
+        };
+        let Some(rtt_us) = lookup(*target) else {
+            return 1.0;
+        };
+        // u64 microseconds → Duration. Saturate at u64::MAX to
+        // avoid overflow on a misbehaving lookup; in practice
+        // lookups return wall-clock-bounded values.
+        let target_rtt = Duration::from_micros(rtt_us);
+        if target_rtt <= max_rtt { 1.0 } else { 0.0 }
     }
 
     /// Phase F slice 5 intent axis. Reads the artifact's
@@ -1769,8 +1815,129 @@ mod tests {
         assert_eq!(placement.score_scope_axis(&target_caps), 0.0);
     }
 
-    /// End-to-end: a scope-filter mismatch zeros the final score
-    /// via multiplicative composition.
+    // ====================================================================
+    // Phase F slice 5 — proximity axis
+    // ====================================================================
+
+    /// `proximity_max_rtt: None` → 1.0 (axis disabled). Default.
+    #[test]
+    fn proximity_axis_no_threshold_returns_one() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index);
+        assert_eq!(placement.score_proximity_axis(&0x1111), 1.0);
+    }
+
+    /// Threshold set + `rtt_lookup: None` → 1.0 (no measurement
+    /// source; can't enforce). Pin the "default permissive when
+    /// no data" contract.
+    #[test]
+    fn proximity_axis_threshold_without_lookup_returns_one() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_proximity_max_rtt(Duration::from_millis(50));
+        assert_eq!(placement.score_proximity_axis(&0x1111), 1.0);
+    }
+
+    /// Threshold + lookup, target absent from lookup → 1.0.
+    /// Asymmetric to tie-breaker step 1 which sorts present-RTT
+    /// before missing — scoring axis defaults permissive on
+    /// missing data.
+    #[test]
+    fn proximity_axis_unmeasured_target_returns_one() {
+        let index = index_with(&[]);
+        let lookup = |_id: NodeId| -> Option<u64> { None };
+        let placement = StandardPlacement::new(&index)
+            .with_proximity_max_rtt(Duration::from_millis(50))
+            .with_rtt_lookup(&lookup);
+        assert_eq!(placement.score_proximity_axis(&0x1111), 1.0);
+    }
+
+    /// RTT under the threshold → 1.0.
+    #[test]
+    fn proximity_axis_rtt_under_threshold_returns_one() {
+        let index = index_with(&[]);
+        let lookup = |_id: NodeId| -> Option<u64> { Some(10_000) }; // 10 ms
+        let placement = StandardPlacement::new(&index)
+            .with_proximity_max_rtt(Duration::from_millis(50))
+            .with_rtt_lookup(&lookup);
+        assert_eq!(placement.score_proximity_axis(&0x1111), 1.0);
+    }
+
+    /// RTT exactly at the threshold → 1.0 (inclusive bound).
+    #[test]
+    fn proximity_axis_rtt_at_threshold_returns_one_inclusive() {
+        let index = index_with(&[]);
+        let lookup = |_id: NodeId| -> Option<u64> { Some(50_000) }; // exactly 50 ms
+        let placement = StandardPlacement::new(&index)
+            .with_proximity_max_rtt(Duration::from_millis(50))
+            .with_rtt_lookup(&lookup);
+        assert_eq!(
+            placement.score_proximity_axis(&0x1111),
+            1.0,
+            "threshold is inclusive (≤)",
+        );
+    }
+
+    /// RTT over the threshold → 0.0 (hard veto).
+    #[test]
+    fn proximity_axis_rtt_over_threshold_returns_zero() {
+        let index = index_with(&[]);
+        let lookup = |_id: NodeId| -> Option<u64> { Some(100_000) }; // 100 ms
+        let placement = StandardPlacement::new(&index)
+            .with_proximity_max_rtt(Duration::from_millis(50))
+            .with_rtt_lookup(&lookup);
+        assert_eq!(placement.score_proximity_axis(&0x1111), 0.0);
+    }
+
+    /// Per-candidate RTT discrimination: the lookup distinguishes
+    /// candidates by their NodeId. Pin: an over-threshold candidate
+    /// vetoes while an under-threshold one passes.
+    #[test]
+    fn proximity_axis_per_candidate_via_lookup() {
+        let index = index_with(&[]);
+        let lookup = |id: NodeId| -> Option<u64> {
+            match id {
+                0x1111 => Some(10_000), // 10 ms — under
+                0x2222 => Some(80_000), // 80 ms — over
+                _ => None,
+            }
+        };
+        let placement = StandardPlacement::new(&index)
+            .with_proximity_max_rtt(Duration::from_millis(50))
+            .with_rtt_lookup(&lookup);
+        assert_eq!(placement.score_proximity_axis(&0x1111), 1.0);
+        assert_eq!(placement.score_proximity_axis(&0x2222), 0.0);
+    }
+
+    /// End-to-end: a proximity over-threshold zeros the final
+    /// score via multiplicative composition.
+    #[test]
+    fn proximity_axis_zero_zeros_final_score() {
+        let target_caps = empty_caps();
+        let index = {
+            let i = CapabilityIndex::new();
+            let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+            let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
+            i.index(ad);
+            i
+        };
+        let lookup = |_id: NodeId| -> Option<u64> { Some(200_000) }; // 200 ms
+        let placement = StandardPlacement::new(&index)
+            .with_proximity_max_rtt(Duration::from_millis(50))
+            .with_rtt_lookup(&lookup);
+
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+
+        let score = placement
+            .placement_score(&0x1111, &artifact)
+            .expect("hard-constraint check passes");
+        assert_eq!(score, 0.0, "proximity axis vetoes — final score 0.0");
+    }
+
+    /// End-to-end: a proximity over-threshold zeros the final
+    /// score via multiplicative composition.
     #[test]
     fn scope_axis_zero_zeros_final_score() {
         let target_caps = empty_caps().add_tag("hardware.gpu");
