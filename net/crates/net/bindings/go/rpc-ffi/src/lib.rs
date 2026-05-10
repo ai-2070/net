@@ -166,11 +166,9 @@ struct CancelEntry {
 /// cleans up; in pathological never-dispatched paths the entry
 /// is bounded by the number of unique tokens reserved, which is
 /// negligible.
-fn cancel_registry(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>> {
-    static REG: OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>>,
-    > = OnceLock::new();
+fn cancel_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>> {
+    static REG: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>>> =
+        OnceLock::new();
     REG.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -1708,7 +1706,10 @@ mod tests {
         );
         // Registry entry should be cleaned up after run_cancellable.
         let lingering = cancel_registry().lock().contains_key(&token);
-        assert!(!lingering, "registry entry must be removed after run_cancellable");
+        assert!(
+            !lingering,
+            "registry entry must be removed after run_cancellable"
+        );
     }
 
     /// `run_cancellable` with token=0 short-circuits to plain

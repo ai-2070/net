@@ -1757,11 +1757,7 @@ mod mesh_bindings {
         /// `py.detach` every other Python thread blocks for the
         /// network round-trip. Sibling sync paths (`call`,
         /// `find_service_nodes`) already follow this pattern.
-        fn announce_capabilities(
-            &self,
-            py: Python<'_>,
-            caps: &Bound<'_, PyDict>,
-        ) -> PyResult<()> {
+        fn announce_capabilities(&self, py: Python<'_>, caps: &Bound<'_, PyDict>) -> PyResult<()> {
             let node = self.get_node()?;
             // capability_set_from_py touches Python objects; must
             // run while we still hold the GIL.

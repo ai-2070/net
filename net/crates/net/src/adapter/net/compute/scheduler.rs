@@ -1307,7 +1307,11 @@ mod tests {
             );
             // 0x2222 (NaN) must NEVER win; 0x1111 wins by lex
             // tie-break against 0x3333 (both score 1.0).
-            assert_eq!(pick, Some(0x1111), "run {run}: NaN candidate must be dropped");
+            assert_eq!(
+                pick,
+                Some(0x1111),
+                "run {run}: NaN candidate must be dropped"
+            );
         }
     }
 

@@ -3469,13 +3469,19 @@ mod tests {
             caps.metadata
         );
         // Non-reserved key passes through.
-        assert_eq!(caps.metadata.get("region").map(|s| s.as_str()), Some("us-east"));
+        assert_eq!(
+            caps.metadata.get("region").map(|s| s.as_str()),
+            Some("us-east")
+        );
 
         // Exact-match reserved keys (NOT gated) — these are
         // user-facing scheduler hints, the substrate reads them
         // and user code is expected to set them.
         let caps = CapabilitySet::new().with_metadata("intent", "ml-training");
-        assert_eq!(caps.metadata.get("intent").map(|s| s.as_str()), Some("ml-training"));
+        assert_eq!(
+            caps.metadata.get("intent").map(|s| s.as_str()),
+            Some("ml-training")
+        );
     }
 
     #[test]

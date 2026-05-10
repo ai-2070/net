@@ -915,8 +915,7 @@ mod tests {
         let mut caps = CapabilitySet::new();
         caps.metadata
             .insert("intent".to_string(), "scheduler-hint".to_string());
-        caps.metadata
-            .insert("benign".to_string(), "ok".to_string());
+        caps.metadata.insert("benign".to_string(), "ok".to_string());
         let report = validate_capabilities(&caps);
         assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
         assert!(
