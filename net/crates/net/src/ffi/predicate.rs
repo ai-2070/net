@@ -218,7 +218,27 @@ pub extern "C" fn net_predicate_to_where_header(
     }
     // SAFETY: serde_json output is guaranteed valid UTF-8.
     let value_string = unsafe { String::from_utf8_unchecked(value_bytes) };
-    super::mesh::write_string_out(value_string, out_value_ptr, out_value_len)
+    let value_rc = super::mesh::write_string_out(value_string, out_value_ptr, out_value_len);
+    if value_rc != 0 {
+        // CR-17: defensive cleanup. If the value-side write fails
+        // after the name-side already published a CString into
+        // `*out_header_name`, the caller's contract is "free only
+        // on success" — they won't free it, and the heap leaks.
+        // serde_json output never contains NULs in practice, so
+        // `CString::new` inside the value-side write is unreachable;
+        // this guard is for forward-compat against helper-shape
+        // changes. Recover the orphaned name allocation, NULL the
+        // out-pointer, zero the length, then return the error.
+        unsafe {
+            if !(*out_header_name).is_null() {
+                let _ = std::ffi::CString::from_raw(*out_header_name);
+                *out_header_name = std::ptr::null_mut();
+                *out_header_name_len = 0;
+            }
+        }
+        return value_rc;
+    }
+    0
 }
 
 #[cfg(test)]
