@@ -2681,7 +2681,10 @@ pub extern "C" fn net_compute_register_placement_filter(
     };
     let arc_filter: Arc<dyn PlacementFilter> = Arc::new(wrapper);
 
-    if global_placement_filter_registry().register(id, arc_filter) {
+    // SDK Phase 7 polish: `"go"` binding label drives the
+    // `dataforts_placement_callback_invocations_total{binding="go"}`
+    // counter on the substrate registry.
+    if global_placement_filter_registry().register(id, arc_filter, "go") {
         NET_COMPUTE_OK
     } else {
         NET_COMPUTE_ERR_DUPLICATE_KIND

@@ -1854,7 +1854,10 @@ mod mesh_bindings {
                 capability_index,
             );
             let arc: std::sync::Arc<dyn PlacementFilter> = std::sync::Arc::new(wrapper);
-            Ok(global_placement_filter_registry().register(id, arc))
+            // SDK Phase 7 polish: `"python"` binding label drives the
+            // `dataforts_placement_callback_invocations_total{binding="python"}`
+            // counter on the substrate registry.
+            Ok(global_placement_filter_registry().register(id, arc, "python"))
         }
 
         /// Drop the placement-filter registration under `id`.

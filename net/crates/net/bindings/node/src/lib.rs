@@ -1992,7 +1992,10 @@ mod mesh_bindings {
                 crate::placement::TsfnPlacementFilter::new(id.clone(), tsfn, capability_index);
             let arc: std::sync::Arc<dyn PlacementFilter> = std::sync::Arc::new(wrapper);
 
-            Ok(global_placement_filter_registry().register(id, arc))
+            // SDK Phase 7 polish: `"node"` binding label drives the
+            // `dataforts_placement_callback_invocations_total{binding="node"}`
+            // counter on the substrate registry.
+            Ok(global_placement_filter_registry().register(id, arc, "node"))
         }
 
         /// Drop the placement-filter registration under `id`.

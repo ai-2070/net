@@ -2907,7 +2907,7 @@ mod tests {
     ) {
         let reg = global_placement_filter_registry();
         let _ = reg.unregister(id); // cleanup from a possibly-failed prior run
-        assert!(reg.register(id.to_string(), filter), "register {id}");
+        assert!(reg.register(id.to_string(), filter, "test"), "register {id}");
         let _guard = FilterGuard { id: id.to_string() };
         body(id);
     }
