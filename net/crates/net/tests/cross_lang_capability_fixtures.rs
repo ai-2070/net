@@ -17,10 +17,13 @@
 use std::collections::BTreeMap;
 
 use net::adapter::net::behavior::{
-    CapabilitySet, ClauseTrace, EvalContext, MetadataChange, Predicate, PredicateDebugReport,
-    PredicateWire, RPC_WHERE_HEADER, SchemaError, Tag, ValidationWarning, ValueType,
-    validate_capabilities,
+    Artifact, CapabilityAnnouncement, CapabilityIndex, CapabilitySet, ClauseTrace, EvalContext,
+    MetadataChange, PlacementFilter, PlacementNodeId, Predicate, PredicateDebugReport,
+    PredicateWire, RPC_WHERE_HEADER, SchemaError, StandardPlacement, Tag, ValidationWarning,
+    ValueType, global_placement_filter_registry, validate_capabilities,
 };
+use net::adapter::net::identity::EntityId;
+use std::sync::Arc;
 use serde_json::Value;
 
 fn read_fixture(name: &str) -> String {
@@ -693,5 +696,161 @@ fn predicate_debug_report_fixture_matches_substrate() {
             got_stats, expected_stats,
             "case[{i}] {name}: clause_stats diverged\n  got:      {got_stats:#?}\n  expected: {expected_stats:#?}",
         );
+    }
+}
+
+// =============================================================================
+// SDK Phase 7 cross-binding compat — wrap a predicate as a custom
+// `PlacementFilter` and route it through the full Phase 7 path:
+//
+//   global_placement_filter_registry().register(id, wrapper, "test")
+//   StandardPlacement::new(&index).with_custom_filter_id(id)
+//   placement.placement_score(target, artifact)
+//
+// `predicate_eval.json` is the same fixture every binding's predicate
+// evaluator consumes (Rust SDK + Node + Python + Go). This test pins
+// that the custom-filter callback path produces booleans IDENTICAL to
+// direct `Predicate::evaluate_unplanned`. Each binding ships an
+// equivalent test (replace "test" with the binding label) — divergence
+// across bindings shows up as a fixture-driven CI failure on the
+// drifting binding.
+//
+// Together with `predicate_eval_fixture_matches_substrate` (above),
+// this proves: every fixture case passes through both the direct
+// IR path AND the registered-callback path with byte-identical
+// behavior, in every binding.
+// =============================================================================
+
+/// Wraps a `Predicate` + `Arc<CapabilityIndex>` as a `PlacementFilter`.
+/// Fixture-driven test impl — production bindings (Node TSFN, Python
+/// PyAny, Go cgo) all reach the same place via different mechanics.
+struct PredicatePlacementFilter {
+    pred: Predicate,
+    index: Arc<CapabilityIndex>,
+}
+
+impl PlacementFilter for PredicatePlacementFilter {
+    fn placement_score(
+        &self,
+        target: &PlacementNodeId,
+        _artifact: &Artifact<'_>,
+    ) -> Option<f32> {
+        let caps = self.index.get(*target)?;
+        // `EvalContext::new` takes a `&[Tag]` slice; `caps.tags` is a
+        // `HashSet<Tag>`, so collect into a Vec for the borrow.
+        let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
+        let ctx = EvalContext::new(&tags, &caps.metadata);
+        if self.pred.evaluate_unplanned(&ctx) {
+            Some(1.0)
+        } else {
+            None
+        }
+    }
+}
+
+#[test]
+fn predicate_eval_fixture_matches_via_placement_filter_callback() {
+    let raw = read_fixture("predicate_eval.json");
+    let v: Value = serde_json::from_str(&raw).expect("parse fixture");
+    let cases = v["cases"].as_array().expect("cases is array");
+    assert!(!cases.is_empty(), "fixture has zero cases");
+
+    for (i, case) in cases.iter().enumerate() {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+
+        // Decode the predicate from its wire form.
+        let wire: PredicateWire = serde_json::from_value(case["wire"].clone())
+            .unwrap_or_else(|e| panic!("case[{i}] {name}: deserialize wire: {e}"));
+        let pred: Predicate = wire
+            .into_predicate()
+            .unwrap_or_else(|e| panic!("case[{i}] {name}: into_predicate: {e}"));
+
+        // Build the candidate's CapabilitySet from the fixture.
+        let tag_strings: Vec<String> = case["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect();
+        let mut caps = CapabilitySet::default();
+        for s in &tag_strings {
+            caps = caps.add_tag(s.clone());
+        }
+        for (k, v) in case["metadata"].as_object().unwrap().iter() {
+            caps = caps.with_metadata(k, v.as_str().unwrap());
+        }
+
+        let expected = case["expected"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("case[{i}] {name}: `expected` not a bool"));
+
+        // Index a single candidate node carrying the case's caps.
+        let target_node: PlacementNodeId = 0x1234_5678_DEAD_BEEF;
+        let index = Arc::new(CapabilityIndex::new());
+        let eid = EntityId::from_bytes([0u8; 32]);
+        index.index(CapabilityAnnouncement::new(
+            target_node,
+            eid,
+            1,
+            caps.clone(),
+        ));
+
+        // Register the predicate-backed filter under a fixture-scoped
+        // id; binding label `"test"` so concurrent fixture runs don't
+        // collide with production bindings' counters.
+        let id = format!("pf-fixture-eval-{i}-{name}");
+        let registry = global_placement_filter_registry();
+        // Defensive cleanup from any prior aborted run.
+        let _ = registry.unregister(&id);
+        let wrapper: Arc<dyn PlacementFilter> = Arc::new(PredicatePlacementFilter {
+            pred,
+            index: index.clone(),
+        });
+        assert!(
+            registry.register(id.clone(), wrapper, "test"),
+            "case[{i}] {name}: registry.register failed",
+        );
+
+        // Configure StandardPlacement to consume the registered filter
+        // via the full Phase 7 path.
+        let placement = StandardPlacement::new(&index).with_custom_filter_id(&id);
+
+        // Empty Daemon artifact — the predicate evaluates against the
+        // candidate's caps, not the artifact's required/optional sets.
+        let req = CapabilitySet::default();
+        let opt = CapabilitySet::default();
+        let artifact = Artifact::Daemon {
+            daemon_id: [0u8; 32],
+            required: &req,
+            optional: &opt,
+        };
+
+        let score = placement.placement_score(&target_node, &artifact);
+
+        // Must always cleanup BEFORE asserting so a failure doesn't
+        // leak the registration into subsequent cases.
+        let kept = score.is_some();
+        registry.unregister(&id);
+
+        assert_eq!(
+            kept, expected,
+            "case[{i}] {name}: custom-filter-callback path diverged from direct evaluation\n  \
+             tags: {tag_strings:?}\n  expected: {expected}, score: {score:?}",
+        );
+
+        // When kept, score is in (0.0, 1.0]. We don't pin Some(1.0)
+        // strictly — the in-tree resource axis (always-on; default
+        // config) may produce a sub-1.0 score for tags like
+        // `hardware.memory_mb=65536`. The boolean outcome (kept vs
+        // vetoed) is what the cross-binding fixture pins; absolute
+        // score values are an in-tree-axes concern that lives in
+        // the placement.rs unit tests.
+        if expected {
+            let s = score.expect("kept must be Some");
+            assert!(
+                s > 0.0 && s <= 1.0,
+                "case[{i}] {name}: kept candidate score must be in (0.0, 1.0], got {s}",
+            );
+        }
     }
 }
