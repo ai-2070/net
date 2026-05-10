@@ -1,0 +1,25 @@
+net/crates/net/tests/cross_lang_capability/placement_score.json
+  s_d1b11a1287c170::t_096c07a92e0d1e 1-140
+net/crates/net/tests/cross_lang_capability_fixtures.rs
+  s_d1b11a1287c170::t_9422f78fe21fdb 22-23
+  s_d1b11a1287c170::t_3b2395ef7fe07b 864-907,914-920,924-1034
+  s_d1b11a1287c170::t_acec53202091a6 908-913,921-923
+net/crates/net/tests/cross_lang_capability/README.md
+  s_d1b11a1287c170::t_e1acddf781bd70 91-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "d3786e664c35dadf5db00f34e1313d43d2581313",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
