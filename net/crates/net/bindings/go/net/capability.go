@@ -1029,10 +1029,19 @@ func (b *StandardPlacementBuilder) Build() StandardPlacement {
 
 // PlacementCandidate is the per-candidate context passed to a
 // custom placement filter.
+//
+// JSON tags lock the wire shape to the substrate's
+// `{ "node_id", "tags", "metadata" }` envelope (see
+// `placement.go::go_net_placement_filter_trampoline` and the
+// Rust `PlacementCandidateWire` shape). Pre-fix the fields
+// were untagged, so Go's case-insensitive-but-no-underscore
+// matcher silently dropped `node_id` into a zero `NodeID` —
+// every user predicate saw `candidate.NodeID == 0` regardless
+// of which target was being scored.
 type PlacementCandidate struct {
-	NodeID   uint64
-	Tags     []string
-	Metadata map[string]string
+	NodeID   uint64            `json:"node_id"`
+	Tags     []string          `json:"tags"`
+	Metadata map[string]string `json:"metadata"`
 }
 
 // PlacementFilterFn is a synchronous predicate: true to keep, false

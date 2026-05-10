@@ -168,6 +168,14 @@ func go_net_placement_filter_trampoline(
 		)
 		return -2
 	}
+	// P2-P: belt-and-suspenders. JSON unmarshaling now populates
+	// NodeID from the wire's `node_id` field (with the JSON tag
+	// added in capability.go), but the C-side `nodeID` parameter
+	// is the authoritative source the dispatcher already has at
+	// hand — overwrite from the parameter so a malformed /
+	// missing JSON `node_id` field doesn't silently route every
+	// candidate to NodeID=0.
+	candidate.NodeID = uint64(nodeID)
 
 	// Recover from user panics — a buggy predicate must not crash
 	// the whole process. Mirrors `safeCallHandler` in mesh_rpc.go.
