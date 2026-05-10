@@ -1,0 +1,19 @@
+net/crates/net/sdk-py/README.md
+  s_e3c24456981f5d::t_825cbc619312d8 628
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "e47ad3700a862ea3c549139d3167b8c22ce8ac5e",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
