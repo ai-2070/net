@@ -65,7 +65,7 @@ When the built-in axes don't fit a placement rule, plug a host-language predicat
 
 - **Rust SDK**: `placement_filter_from_fn(...)` returns a `PlacementFilter` you wire into `StandardPlacement::with_custom_filter_id(id)`.
 - **TS / Python / Go**: `placementFilterFromFn` / `placement_filter_from_fn` / `PlacementFilterFromFn` — same surface, host closure receives the candidate's `(tags, metadata)` and returns a boolean.
-- **C ABI**: `net_compute_set_placement_filter_dispatcher(fn)` installs the dispatcher (one-shot, after-which `_register_placement_filter(mesh_arc, id_ptr, id_len)` registers per-id callbacks).
+- **C ABI**: `net_compute_set_placement_filter_dispatcher(fn)` installs the dispatcher (one-shot, after-which `net_compute_register_placement_filter(mesh_arc, id_ptr, id_len)` registers per-id callbacks).
 
 Predicates authored via the substrate's `Predicate` AST evaluate identically in every binding, so a `placement_filter_from_fn` closure that wraps `evaluate_predicate(pred, cand.tags, cand.metadata)` produces the same result whether the daemon factory ships in TS, Python, Go, or Rust.
 
