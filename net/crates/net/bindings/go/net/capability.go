@@ -18,8 +18,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -1196,40 +1198,25 @@ func axisTagValue(tags []string, key TagKey) (string, bool) {
 	return "", false
 }
 
-func isNumericLiteral(s string) bool {
-	if s == "" {
-		return false
-	}
-	i := 0
-	if s[0] == '-' {
-		i = 1
-		if len(s) == 1 {
-			return false
-		}
-	}
-	seenDot := false
-	digit := false
-	for ; i < len(s); i++ {
-		c := s[i]
-		if c >= '0' && c <= '9' {
-			digit = true
-			continue
-		}
-		if c == '.' && !seenDot {
-			seenDot = true
-			continue
-		}
-		return false
-	}
-	return digit
-}
+// Q13: numeric predicates parse via Go's `strconv.ParseFloat`,
+// matching Rust's `f64::parse::<f64>()` semantics: accepts decimal,
+// scientific notation (`1e10`, `1.5e-3`), and ±inf, +/- prefix.
+// Pre-fix this file had a hand-rolled `isNumericLiteral` allowing
+// only digits + one optional `.` + one optional leading `-`,
+// which rejected scientific notation that the Rust substrate
+// would happily evaluate. A predicate against
+// `software.gpu.fp16_tflops_x10=1.5e3` would silently fail in Go
+// while passing in Rust — diverged numeric-evaluation semantics.
 
 func parseFloat(s string) (float64, bool) {
-	if !isNumericLiteral(s) {
+	if s == "" {
 		return 0, false
 	}
-	var n float64
-	if _, err := fmt.Sscanf(s, "%f", &n); err != nil {
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+		// Rust's `parse::<f64>()` rejects NaN literals (only
+		// numeric strings), and Inf is not a meaningful tag
+		// value for any of the numeric predicate variants.
 		return 0, false
 	}
 	return n, true

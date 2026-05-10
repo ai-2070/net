@@ -317,6 +317,36 @@ def test_semver_compatible_zero_zero_patch_is_exact_only() -> None:
     assert _semver_compatible((2, 0, 0), (1, 9, 9)) is False
 
 
+def test_numeric_predicate_accepts_scientific_notation() -> None:
+    """Q15: Rust's `value.parse::<f64>()` accepts scientific
+    notation (`1e10`, `1.5e-3`); pre-fix the Python regex
+    `r"^-?\\d+(\\.\\d+)?$"` rejected them, diverging numeric-
+    evaluation semantics. A predicate against a tag value of
+    `"1.5e3"` (= 1500) silently failed in Python while passing
+    in Rust.
+    """
+    metadata: Dict[str, str] = {}
+    # NumericAtLeast against 1.5e3 (= 1500) tag value.
+    tags = ["software.runtime.python=1.5e3"]
+    assert evaluate_predicate(
+        p.numeric_at_least(tag_key("software", "runtime.python"), 1500.0),
+        tags,
+        metadata,
+    ) is True
+    assert evaluate_predicate(
+        p.numeric_at_least(tag_key("software", "runtime.python"), 1501.0),
+        tags,
+        metadata,
+    ) is False
+    # NumericInRange with scientific notation.
+    tags = ["hardware.memory_mb=2.5e4"]  # 25000
+    assert evaluate_predicate(
+        p.numeric_in_range(tag_key("hardware", "memory_mb"), 20000.0, 30000.0),
+        tags,
+        metadata,
+    ) is True
+
+
 def test_axis_present_tag_does_not_match_value_predicates() -> None:
     """Q2: ``Tag::AxisPresent`` (e.g. ``hardware.gpu``) must NOT
     match value-bearing predicates like ``Equals``, ``StringPrefix``,

@@ -981,6 +981,33 @@ def placement_filter_from_fn(
 _NUMERIC_RE = __import__("re").compile(r"^-?\d+(\.\d+)?$")
 
 
+def _try_parse_float(s: str) -> Optional[float]:
+    """Parse a tag/metadata value as f64, matching Rust's
+    ``value.parse::<f64>()`` semantics. Accepts decimal,
+    scientific notation (``1e10`` / ``1.5e-3``), and the canonical
+    ``inf`` / ``-inf`` literals — but rejects ``nan`` (which Rust
+    parses but is not a meaningful numeric tag value for any of
+    the predicate variants).
+
+    Q15: pre-fix the numeric branches matched against ``_NUMERIC_RE``
+    (decimal-only) before calling ``float()``. That regex rejected
+    scientific notation that Rust accepts, so a predicate against
+    ``software.gpu.fp16_tflops_x10=1.5e3`` silently failed in Python
+    while passing in Rust.
+    """
+    if not s:
+        return None
+    try:
+        n = float(s)
+    except (ValueError, OverflowError):
+        return None
+    # Rust's parse::<f64>() rejects "NaN" literals via case sensitivity;
+    # Python's float("nan") accepts them. Drop NaN regardless.
+    if n != n:
+        return None
+    return n
+
+
 def _parse_semver(s: str) -> Optional[Tuple[int, int, int]]:
     """Drop pre-release / build suffix; parse 1-3 dot-separated ints."""
     dash = s.find("-")
@@ -1092,20 +1119,22 @@ def _eval_leaf(
         return v is not None and v == pred.value
     if isinstance(pred, _PredNumericAtLeast):
         v = _axis_tag_value(tags, pred.key)
-        if v is None or not _NUMERIC_RE.match(v):
+        if v is None:
             return False
-        return float(v) >= pred.threshold
+        n = _try_parse_float(v)
+        return n is not None and n >= pred.threshold
     if isinstance(pred, _PredNumericAtMost):
         v = _axis_tag_value(tags, pred.key)
-        if v is None or not _NUMERIC_RE.match(v):
+        if v is None:
             return False
-        return float(v) <= pred.threshold
+        n = _try_parse_float(v)
+        return n is not None and n <= pred.threshold
     if isinstance(pred, _PredNumericInRange):
         v = _axis_tag_value(tags, pred.key)
-        if v is None or not _NUMERIC_RE.match(v):
+        if v is None:
             return False
-        n = float(v)
-        return pred.min <= n <= pred.max
+        n = _try_parse_float(v)
+        return n is not None and pred.min <= n <= pred.max
     if isinstance(pred, _PredSemverAtLeast):
         rhs = _parse_semver(pred.version)
         if rhs is None:
@@ -1148,9 +1177,10 @@ def _eval_leaf(
         return v is not None and pred.pattern in v
     if isinstance(pred, _PredMetadataNumericAtLeast):
         v = metadata.get(pred.key)
-        if v is None or not _NUMERIC_RE.match(v):
+        if v is None:
             return False
-        return float(v) >= pred.threshold
+        n = _try_parse_float(v)
+        return n is not None and n >= pred.threshold
     raise TypeError(f"_eval_leaf: composite predicate {type(pred).__name__} routed through leaf evaluator")
 
 
