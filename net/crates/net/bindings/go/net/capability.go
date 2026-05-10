@@ -469,6 +469,15 @@ func nodeFromWire(n PredicateNode, prior []*Predicate, selfIdx int) (*Predicate,
 		return prior[idx], nil
 	}
 	tagKeyFromWire := func(v any) (TagKey, error) {
+		// In-memory round-trip path: `PredicateToWire` stamps
+		// `Key: p.key` directly with a `TagKey` struct. Callers
+		// that immediately feed the wire back into
+		// `PredicateFromWire` (without going through JSON) hit
+		// this branch — required for the documented "inverse of
+		// PredicateToWire" contract.
+		if tk, ok := v.(TagKey); ok {
+			return tk, nil
+		}
 		// JSON-decoded TagKey arrives as map[string]any.
 		m, ok := v.(map[string]any)
 		if !ok {
