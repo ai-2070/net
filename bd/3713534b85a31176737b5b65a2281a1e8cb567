@@ -1,0 +1,21 @@
+net/crates/net/examples/capability.c
+  s_e3c24456981f5d::t_912b6fe785e288 33-40
+net/crates/net/src/ffi/mod.rs
+  s_e3c24456981f5d::t_466b1d1fde6136 2146-2174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "bd3713534b85a31176737b5b65a2281a1e8cb567",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
