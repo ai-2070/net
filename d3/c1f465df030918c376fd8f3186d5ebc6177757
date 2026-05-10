@@ -1,0 +1,21 @@
+net/crates/net/sdk-ts/test/capability_validation.test.ts
+  s_e3c24456981f5d::t_cb8130fef4f233 204-236
+net/crates/net/sdk-ts/src/capability-schema.ts
+  s_e3c24456981f5d::t_9a5bfe9f2c8589 330-341
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "d3c1f465df030918c376fd8f3186d5ebc6177757",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
