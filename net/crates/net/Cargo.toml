@@ -240,6 +240,27 @@ name = "integration_nrpc_cross_lang"
 path = "tests/integration_nrpc_cross_lang.rs"
 required-features = ["cortex"]
 
+[[test]]
+# End-to-end: predicate → `cyberdeck-where:` request header
+# (Phase 9b) → server-side `predicate_from_rpc_headers` decode +
+# stateless evaluator (Phase 9c) over a real two-node mesh.
+# Composes the two SDK surfaces that ship the predicate envelope
+# and the predicate evaluator; per-piece unit tests cover them in
+# isolation but the full nRPC round-trip lives here.
+name = "integration_nrpc_predicate_header"
+path = "tests/integration_nrpc_predicate_header.rs"
+required-features = ["cortex"]
+
+[[test]]
+# End-to-end: register a custom `PlacementFilter` via the
+# process-global registry, score across a populated
+# `CapabilityIndex` with `StandardPlacement::with_custom_filter_id`,
+# verify the filter's verdict reaches the composed score and that
+# unregister-mid-flight collapses to a hard veto.
+name = "integration_placement_filter_callback"
+path = "tests/integration_placement_filter_callback.rs"
+required-features = ["net"]
+
 [profile.release]
 lto = true
 codegen-units = 1
