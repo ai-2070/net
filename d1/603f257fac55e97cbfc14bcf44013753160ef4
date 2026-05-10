@@ -1,0 +1,21 @@
+net/crates/net/include/README.md
+  s_d1b11a1287c170::t_0256ae601e91e6 15
+net/crates/net/examples/capability.c
+  s_d1b11a1287c170::t_b37ec30a9ca61c 1-207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "d1603f257fac55e97cbfc14bcf44013753160ef4",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
