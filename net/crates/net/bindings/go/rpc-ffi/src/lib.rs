@@ -150,22 +150,43 @@ static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// gap between `reserve_cancel_token` and the post-spawn
 /// `insert` (or even in the gap between `spawn` and `insert`)
 /// found no entry and dropped on the floor.
-#[derive(Default)]
+///
+/// Q18: `marked_at` records when an orphan entry (no handle yet)
+/// was created by `cancel_call`. The opportunistic GC in
+/// `cancel_call` evicts orphans older than `ORPHAN_TTL` so a
+/// `reserve_token` + `cancel_call` flow whose `rpc_call` never
+/// runs doesn't leak a registry entry forever.
 struct CancelEntry {
     cancelled: bool,
     handle: Option<tokio::task::AbortHandle>,
+    marked_at: Option<std::time::Instant>,
 }
+
+impl Default for CancelEntry {
+    fn default() -> Self {
+        Self {
+            cancelled: false,
+            handle: None,
+            marked_at: None,
+        }
+    }
+}
+
+/// How long an orphaned (cancel-only, no live handle) registry
+/// entry stays before opportunistic GC evicts it. Chosen long
+/// enough that a legitimate `reserve_cancel_token` followed by
+/// a slow dispatch (network jitter, queue contention) still
+/// finds the cancellation flag, but short enough that
+/// pathological callers — `reserve_token` then `cancel_call`
+/// without ever issuing the call — don't accumulate state.
+const ORPHAN_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Process-global registry of in-flight call cancel state.
 /// Populated by `net_rpc_call*` when the caller passes a non-NULL
 /// `out_cancel_token` out-param; queried by `net_rpc_cancel_call`.
 /// Entry removal happens by `run_cancellable` once the call
-/// returns (success or abort path). A cancel issued for a never-
-/// dispatched token leaves a `cancelled: true` entry behind that
-/// the eventual `run_cancellable` (or `unregister_cancel_token`)
-/// cleans up; in pathological never-dispatched paths the entry
-/// is bounded by the number of unique tokens reserved, which is
-/// negligible.
+/// returns (success or abort path), OR by the opportunistic
+/// `ORPHAN_TTL`-based GC inside `net_rpc_cancel_call` (Q18).
 fn cancel_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>> {
     static REG: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>>> =
         OnceLock::new();
@@ -204,8 +225,28 @@ pub extern "C" fn net_rpc_cancel_call(token: u64) {
         return;
     }
     let mut reg = cancel_registry().lock();
+
+    // Q18: opportunistic GC of orphaned cancel-only entries
+    // older than `ORPHAN_TTL`. Without this, a Go caller that
+    // does `reserve_cancel_token` + `cancel_call` for a token
+    // whose `rpc_call` never actually runs (e.g. context
+    // already done; a deadline-elapsed pre-check) leaves a
+    // `{cancelled: true, handle: None}` entry that nothing
+    // cleans up — unbounded memory growth proportional to the
+    // number of such never-dispatched cancels.
+    let now = std::time::Instant::now();
+    reg.retain(|_, entry| {
+        entry.handle.is_some()
+            || entry
+                .marked_at
+                .is_none_or(|t| now.duration_since(t) < ORPHAN_TTL)
+    });
+
     let entry = reg.entry(token).or_default();
     entry.cancelled = true;
+    if entry.marked_at.is_none() {
+        entry.marked_at = Some(now);
+    }
     if let Some(handle) = entry.handle.take() {
         // Drop the lock before invoking abort; abort is cheap
         // but we don't want to hold the registry lock across
@@ -1719,6 +1760,46 @@ mod tests {
     fn run_cancellable_token_zero_runs_to_completion() {
         let result = run_cancellable(0, async move { 42_u32 });
         assert_eq!(result.unwrap(), 42);
+    }
+
+    /// Q18: a cancel issued for a token whose `rpc_call` never
+    /// runs leaves a `{cancelled, no handle}` orphan entry.
+    /// Pre-fix nothing cleaned those up, so a caller that did
+    /// `reserve_token` + `cancel_call` repeatedly without any
+    /// dispatch accumulated registry state without bound. The
+    /// opportunistic GC inside `net_rpc_cancel_call` evicts
+    /// orphans older than `ORPHAN_TTL`; we exercise that by
+    /// stamping a fake-old `marked_at` directly into the entry
+    /// and then issuing a cancel for an unrelated token.
+    #[test]
+    fn cancel_call_evicts_stale_orphan_entries() {
+        let stale_token = net_rpc_reserve_cancel_token();
+        let fresh_token = net_rpc_reserve_cancel_token();
+
+        // Stamp the stale token's entry as old enough to evict.
+        // Same shape `cancel_call` produces, but with a
+        // marked_at predating ORPHAN_TTL.
+        {
+            let mut reg = cancel_registry().lock();
+            let entry = reg.entry(stale_token).or_default();
+            entry.cancelled = true;
+            entry.marked_at = Some(std::time::Instant::now() - (ORPHAN_TTL * 2));
+        }
+
+        // Issue a cancel for an unrelated token. The opportunistic
+        // GC should evict the stale entry while inserting the
+        // fresh one.
+        net_rpc_cancel_call(fresh_token);
+
+        let reg = cancel_registry().lock();
+        assert!(
+            !reg.contains_key(&stale_token),
+            "stale orphan entry should have been evicted"
+        );
+        // Fresh entry is present (it's an orphan with current
+        // marked_at). Its eventual cleanup is its own next-call
+        // GC pass; that's the bounded behavior we want.
+        assert!(reg.contains_key(&fresh_token));
     }
 
     /// `net_rpc_serve` rejects `handler_id == 0` with a clear
