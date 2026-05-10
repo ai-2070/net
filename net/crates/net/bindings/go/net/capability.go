@@ -643,6 +643,29 @@ func PredicateFromRPCHeader(value string) (*Predicate, error) {
 	return PredicateFromWire(w)
 }
 
+// DaemonCapabilities groups the two capability declarations a
+// Phase 6 (`CAPABILITY_SYSTEM_SDK_PLAN.md`) Go daemon factory
+// returns alongside its `process` / `snapshot` / `restore`
+// callbacks. `Required` is the hard constraint — placement vetoes
+// any candidate node missing a tag from this set. `Optional` is
+// the soft preference — its tags factor into per-axis scoring
+// without vetoing.
+//
+// Until the `compute-ffi` C ABI extends to accept capability
+// declarations (downstream Go binding work), this struct is the
+// canonical Go-side encoding shape: marshal each field via
+// `json.Marshal(caps)` to produce wire JSON the Rust side can
+// decode via the substrate's `CapabilitySet` serde impl.
+//
+// Phase 6 of `CAPABILITY_SYSTEM_SDK_PLAN.md`. The substrate's
+// `MeshDaemon::required_capabilities` / `optional_capabilities`
+// trait methods (Phase G slice 2 of `CAPABILITY_SYSTEM_PLAN.md`)
+// are the integration target.
+type DaemonCapabilities struct {
+	Required CapabilitySetWire `json:"required"`
+	Optional CapabilitySetWire `json:"optional"`
+}
+
 // WhereHeader builds the canonical `cyberdeck-where:` request-header
 // entry for Phase 9b predicate-pushdown calls.
 //
