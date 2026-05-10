@@ -1,0 +1,30 @@
+net/crates/net/src/ffi/mod.rs
+  s_d1b11a1287c170::t_c06ffa44ae346f 139-146
+net/crates/net/src/ffi/mesh.rs
+  s_d1b11a1287c170::t_5f07c2a625d496 271
+net/crates/net/src/ffi/schema.rs
+  s_d1b11a1287c170::t_5136c0f5ae3000 258-266,268,271-275
+  s_d1b11a1287c170::t_09f96cd3f286e1 1-257,267,269-270,276-316
+go/net.h
+  s_d1b11a1287c170::t_76cbfc4857946d 810-841
+net/crates/net/include/net.go.h
+  s_d1b11a1287c170::t_cef9e24b08d1fe 812-843
+net/crates/net/include/README.md
+  s_d1b11a1287c170::t_c26a4eb86576a3 304
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "6a85b444199806de30116651224780428d709fb2",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
