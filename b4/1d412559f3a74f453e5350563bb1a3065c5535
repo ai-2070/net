@@ -1,0 +1,23 @@
+net/crates/net/sdk-ts/src/capability-enhancements.ts
+  s_d1b11a1287c170::t_c613d9c8f75b76 1-934
+net/crates/net/sdk-ts/src/index.ts
+  s_d1b11a1287c170::t_2d1340137beead 125-168
+net/crates/net/sdk-ts/test/capability_enhancements.test.ts
+  s_d1b11a1287c170::t_e046d5bab9b2e4 1-347
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "b41d412559f3a74f453e5350563bb1a3065c5535",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
