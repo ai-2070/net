@@ -1,0 +1,21 @@
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_e3c24456981f5d::t_db1a5b9f0c4eec 153-158,162-172,175-183,188-189
+  s_e3c24456981f5d::t_ddacdab65c5031 228-244,247-249
+  s_e3c24456981f5d::t_3187641c2d444a 1765-1804
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "5c2e7bad071a81e092d13c5ebdec0df12c2d7fd3",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
