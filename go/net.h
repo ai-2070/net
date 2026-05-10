@@ -807,6 +807,38 @@ int      net_predicate_evaluate(const char* predicate_json,
                                 const char* tags_json,
                                 const char* metadata_json);
 
+/* Validate a wire-format `CapabilitySet` against the canonical
+ * `AXIS_SCHEMA` (Phase 9a of CAPABILITY_SYSTEM_SDK_PLAN.md).
+ * Mirrors the SDK-layer `validate_capabilities` surface every
+ * binding ships, exposed at the C ABI for raw consumers
+ * (C / C++ / Zig / Swift / Java JNI / etc.).
+ *
+ * Input is a NUL-terminated UTF-8 JSON `CapabilitySet`:
+ *   {"tags": [...], "metadata": {...}}
+ *
+ * On success writes a JSON `ValidationReport` to `*out_report_json`
+ * / `*out_report_len`, free with `net_free_string`. Wire shape:
+ *   {
+ *     "errors":   [{"kind": "<unknown_axis|type_mismatch|index_malformed>", ...}, ...],
+ *     "warnings": [{"kind": "<unknown_key|metadata_oversize|legacy_tag>", ...}, ...]
+ *   }
+ *
+ * Both arrays are sorted by JSON-stringified entry so cross-
+ * binding fixture comparisons are order-independent.
+ *
+ * Returns:
+ *   0                       — success; report written.
+ *   NET_ERR_NULL_POINTER    — any pointer is NULL.
+ *   NET_ERR_INVALID_UTF8    — input bytes aren't valid UTF-8.
+ *   NET_ERR_INVALID_JSON    — input failed to parse as a
+ *                             CapabilitySet.
+ *
+ * Stateless. Thread-safe. Cross-binding compat pinned by
+ * `tests/cross_lang_capability/capability_validation.json`. */
+int      net_validate_capabilities(const char* caps_json,
+                                   char** out_report_json,
+                                   size_t* out_report_len);
+
 /* =========================================================================
  * Compute — MeshDaemon + migration. Stage 6 of
  * SDK_COMPUTE_SURFACE_PLAN.md. Symbols live in `libnet_compute`

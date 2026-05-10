@@ -268,7 +268,7 @@ fn write_json_out<T: Serialize>(
     0
 }
 
-fn write_string_out(s: String, out_ptr: *mut *mut c_char, out_len: *mut usize) -> c_int {
+pub(super) fn write_string_out(s: String, out_ptr: *mut *mut c_char, out_len: *mut usize) -> c_int {
     if out_ptr.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }

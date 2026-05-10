@@ -136,6 +136,14 @@ pub mod mesh;
 #[cfg(feature = "net")]
 pub mod predicate;
 
+/// C FFI for stateless capability-set validation (Phase 9a of
+/// `CAPABILITY_SYSTEM_SDK_PLAN.md`). Pure helper — `caps_json`
+/// in, `report_json` out. Mirrors the SDK-layer
+/// `validate_capabilities` surface, exposed at the C ABI for raw
+/// consumers.
+#[cfg(feature = "net")]
+pub mod schema;
+
 /// C FFI for the Redis Streams consumer-side dedup helper. Mirrors
 /// the Rust `net::adapter::RedisStreamDedup` surface for Go / C / Zig
 /// consumers. See `ffi::redis_dedup` module docs for the wire
