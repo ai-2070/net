@@ -847,10 +847,15 @@ pub struct CapabilitySet {
     /// - `Tag::Legacy` untyped tags (free-form strings, e.g.
     ///   `nat:full-cone` / `nrpc:<service>`).
     ///
-    /// Wire format ships the set as-is. Deterministic emission
-    /// order, when needed, is the caller's responsibility — sort
-    /// by `Tag::to_string()`.
-    #[serde(default)]
+    /// Wire format emits tags in sorted `Tag::to_string()` order so
+    /// every serialization is canonical. The `HashSet` keeps O(1)
+    /// membership for in-memory lookups; the `serialize_with` hook
+    /// flattens to a sorted `Vec` on the way out. Two sides of a
+    /// signed-announcement round-trip therefore produce identical
+    /// bytes regardless of `HashSet` iteration order (which is
+    /// process-local random and would otherwise cause spurious
+    /// signature-verification failures across processes).
+    #[serde(default, serialize_with = "serialize_tags_sorted")]
     pub tags: HashSet<Tag>,
     /// Free-form key-value metadata.
     ///
@@ -1660,6 +1665,23 @@ fn sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
     let mut v: Vec<Tag> = tags.iter().cloned().collect();
     v.sort_by_key(|a| a.to_string());
     v
+}
+
+/// Serialize a `HashSet<Tag>` as a sorted JSON array — `Tag::to_string()`
+/// order. The wire format is canonical so two ends of a signed
+/// `CapabilityAnnouncement` round-trip produce identical bytes
+/// regardless of process-local `HashSet` iteration order.
+fn serialize_tags_sorted<S: serde::Serializer>(
+    tags: &HashSet<Tag>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let sorted = sorted_tag_vec(tags);
+    let mut seq = serializer.serialize_seq(Some(sorted.len()))?;
+    for t in &sorted {
+        seq.serialize_element(t)?;
+    }
+    seq.end()
 }
 
 impl From<&CapabilitySet> for HardwareCapabilities {
