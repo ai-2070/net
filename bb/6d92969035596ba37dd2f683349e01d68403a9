@@ -1,0 +1,22 @@
+net/crates/net/benches/placement.rs
+  s_d1b11a1287c170::t_9daace818b5b71 1-168,171-173,175,178-209
+  s_d1b11a1287c170::t_6a6f23f3aeee41 169-170,174,176-177
+net/crates/net/Cargo.toml
+  s_d1b11a1287c170::t_6213e338aedb56 188-192
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "bb6d92969035596ba37dd2f683349e01d68403a9",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
