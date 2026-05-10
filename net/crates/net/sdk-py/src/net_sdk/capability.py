@@ -984,28 +984,33 @@ _NUMERIC_RE = __import__("re").compile(r"^-?\d+(\.\d+)?$")
 def _try_parse_float(s: str) -> Optional[float]:
     """Parse a tag/metadata value as f64, matching Rust's
     ``value.parse::<f64>()`` semantics. Accepts decimal,
-    scientific notation (``1e10`` / ``1.5e-3``), and the canonical
-    ``inf`` / ``-inf`` literals — but rejects ``nan`` (which Rust
-    parses but is not a meaningful numeric tag value for any of
-    the predicate variants).
+    scientific notation (``1e10`` / ``1.5e-3``), the canonical
+    ``inf`` / ``-inf`` literals, and NaN (Rust parses NaN too;
+    IEEE-754 comparisons against NaN always return False, which
+    naturally yields the right predicate result on both sides).
 
     Q15: pre-fix the numeric branches matched against ``_NUMERIC_RE``
     (decimal-only) before calling ``float()``. That regex rejected
     scientific notation that Rust accepts, so a predicate against
     ``software.gpu.fp16_tflops_x10=1.5e3`` silently failed in Python
     while passing in Rust.
+
+    R2: Rust's ``f64::from_str`` rejects leading / trailing
+    whitespace; Python's ``float("  1.5")`` strips it. A tag value
+    like ``"  1.5"`` parsed cleanly in Python and rejected in
+    Rust diverged numeric-evaluation semantics — explicitly
+    reject any input with surrounding whitespace before delegating
+    to ``float()``.
     """
     if not s:
         return None
+    if s != s.strip():
+        # Rust f64 parse rejects whitespace; mirror that here.
+        return None
     try:
-        n = float(s)
+        return float(s)
     except (ValueError, OverflowError):
         return None
-    # Rust's parse::<f64>() rejects "NaN" literals via case sensitivity;
-    # Python's float("nan") accepts them. Drop NaN regardless.
-    if n != n:
-        return None
-    return n
 
 
 def _parse_semver(s: str) -> Optional[Tuple[int, int, int]]:

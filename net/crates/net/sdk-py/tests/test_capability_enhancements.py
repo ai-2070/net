@@ -317,6 +317,37 @@ def test_semver_compatible_zero_zero_patch_is_exact_only() -> None:
     assert _semver_compatible((2, 0, 0), (1, 9, 9)) is False
 
 
+def test_numeric_predicate_rejects_whitespace_padded_values() -> None:
+    """R2: Rust's ``f64::from_str`` rejects leading / trailing
+    whitespace; Python's ``float("  1.5")`` strips it. A value
+    like ``"  1500"`` parsed cleanly in Python (passing the
+    predicate) but failed parse in Rust (predicate returns
+    False). Cross-binding evaluation must agree.
+    """
+    metadata: Dict[str, str] = {}
+    # Leading whitespace.
+    tags = ["software.runtime.python=  1500"]
+    assert evaluate_predicate(
+        p.numeric_at_least(tag_key("software", "runtime.python"), 1000.0),
+        tags,
+        metadata,
+    ) is False
+    # Trailing whitespace.
+    tags = ["software.runtime.python=1500  "]
+    assert evaluate_predicate(
+        p.numeric_at_least(tag_key("software", "runtime.python"), 1000.0),
+        tags,
+        metadata,
+    ) is False
+    # Sanity: clean value still parses.
+    tags = ["software.runtime.python=1500"]
+    assert evaluate_predicate(
+        p.numeric_at_least(tag_key("software", "runtime.python"), 1000.0),
+        tags,
+        metadata,
+    ) is True
+
+
 def test_numeric_predicate_accepts_scientific_notation() -> None:
     """Q15: Rust's `value.parse::<f64>()` accepts scientific
     notation (`1e10`, `1.5e-3`); pre-fix the Python regex
