@@ -263,10 +263,13 @@ function checkValue(
   let parses = false;
   switch (entry.valueType) {
     case 'number':
-      // Substrate accepts u64 OR i64 — i.e. integers (signed or unsigned),
-      // not arbitrary floats. Match by digit-only check with optional
-      // leading minus.
-      parses = /^-?\d+$/.test(observedValue);
+      // Substrate `Number` is unsigned (u64-only) — see CR-15 in the
+      // capability-system-2 review and `schema.rs::ValueType::Number`.
+      // Negative values surface as `TypeMismatch` errors on the
+      // substrate side; mirror that here so client-side validation
+      // doesn't flag a CapabilitySet as valid that the substrate
+      // would later reject.
+      parses = /^\d+$/.test(observedValue);
       break;
     case 'string':
     case 'enumeration':

@@ -200,3 +200,35 @@ describe('default schema usage', () => {
     expect(report.warnings).toEqual([]);
   });
 });
+
+// P1-B: substrate `Number` is unsigned (u64-only) — see CR-15 +
+// `schema.rs::ValueType::Number`. Negative values surface as
+// TypeMismatch errors in the substrate validator; the TS validator
+// must mirror that decision so client-side checks don't pass a
+// CapabilitySet the substrate would later reject.
+describe('regression: number values reject negatives', () => {
+  it('flags `hardware.memory_mb=-1` as a TypeMismatch error', () => {
+    const caps: CapabilitySetWire = {
+      tags: ['hardware.memory_mb=-1'],
+      metadata: {},
+    };
+    const report = validateCapabilities(caps);
+    const mismatch = report.errors.find(
+      (e) =>
+        e.kind === 'type_mismatch' &&
+        e.axis === 'hardware' &&
+        e.key === 'memory_mb',
+    );
+    expect(mismatch).toBeDefined();
+    expect((mismatch as { actual: string }).actual).toBe('-1');
+  });
+
+  it('still accepts unsigned integer values', () => {
+    const caps: CapabilitySetWire = {
+      tags: ['hardware.memory_mb=65536'],
+      metadata: {},
+    };
+    const report = validateCapabilities(caps);
+    expect(report.errors).toEqual([]);
+  });
+});
