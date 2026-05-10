@@ -12,6 +12,7 @@
 //! - Safety envelope enforcement
 
 pub mod api;
+pub mod bloom;
 pub mod broadcast;
 pub mod capability;
 pub mod context;
@@ -28,6 +29,8 @@ pub mod safety;
 pub mod schema;
 pub mod tag;
 pub mod tag_codec;
+
+pub use bloom::BloomFilter;
 
 pub use broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 
