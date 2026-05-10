@@ -176,7 +176,11 @@ fn gpu_info_from_dict(d: &Bound<'_, PyDict>) -> PyResult<GpuInfo> {
         info = info.with_tensor_cores(saturating_u16(tc));
     }
     if let Some(tf) = get_opt_u32(d, "fp16_tflops_x10")? {
-        info = info.with_fp16_tflops(tf as f32 / 10.0);
+        // CR-25: bypass the f32 round-trip in `with_fp16_tflops`.
+        // The substrate field is u32; routing through f32 (24-bit
+        // mantissa) loses precision for values > 16,777,216.
+        // Same shape as the Node binding fix.
+        info.fp16_tflops_x10 = tf;
     }
     Ok(info)
 }
