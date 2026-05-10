@@ -309,8 +309,9 @@ impl Default for ColocationPolicy {
 /// Reference `PlacementFilter` impl. Five-axis multi-criteria
 /// scoring (scope / proximity / intent / colocation / resource) +
 /// anti-affinity penalty, all composing multiplicatively per the
-/// plan §7 LOCKED contract. Slice 2 ships the composition machinery
-/// + hard-constraint check; slice 5 fills in the per-axis scorers.
+/// plan §7 LOCKED contract. Slice 2 shipped the composition
+/// machinery + hard-constraint check; slice 5 fills in the
+/// per-axis scorers incrementally — intent axis lands first.
 ///
 /// Borrows a `&CapabilityIndex` for target-cap lookup (matches the
 /// `LegacyPlacement` borrow shape). Hold a fresh `StandardPlacement`
@@ -326,6 +327,11 @@ pub struct StandardPlacement<'a> {
     pub proximity_max_rtt: Option<Duration>,
     /// Intent-match strategy. `Disabled` skips the axis.
     pub intent_match: IntentMatchPolicy,
+    /// Intent → required-caps registry consumed when
+    /// `intent_match` is `Strict` or `AnyOfLocalCapabilities`.
+    /// Empty default — `Disabled` policy ignores it; non-empty
+    /// registries drive intent-axis scoring.
+    pub intent_registry: IntentRegistry,
     /// Colocation strategy.
     pub colocation_policy: ColocationPolicy,
     /// Which resource pool the resource axis scores. `Compute` is
@@ -348,6 +354,7 @@ impl<'a> StandardPlacement<'a> {
             scope_filter: None,
             proximity_max_rtt: None,
             intent_match: IntentMatchPolicy::default(),
+            intent_registry: IntentRegistry::default(),
             colocation_policy: ColocationPolicy::default(),
             resource_axis: ResourceAxis::Compute,
             metadata_keys: PlacementMetadataKeys::default(),
@@ -370,6 +377,14 @@ impl<'a> StandardPlacement<'a> {
     /// Replace the intent-match policy.
     pub fn with_intent_match(mut self, policy: IntentMatchPolicy) -> Self {
         self.intent_match = policy;
+        self
+    }
+
+    /// Replace the intent registry. Pair with `with_intent_match`
+    /// (a non-`Disabled` policy + non-empty registry are required
+    /// for the intent axis to score below 1.0).
+    pub fn with_intent_registry(mut self, registry: IntentRegistry) -> Self {
+        self.intent_registry = registry;
         self
     }
 
@@ -470,10 +485,58 @@ impl<'a> StandardPlacement<'a> {
         1.0
     }
 
-    fn score_intent_axis(&self, _target_caps: &CapabilitySet, _artifact: &Artifact<'_>) -> f32 {
-        // Stub: intent axis always satisfied. Slice 3 + 5 wire
-        // `IntentRegistry` lookup + `IntentMatchPolicy` evaluation.
-        1.0
+    /// Phase F slice 5 intent axis. Reads the artifact's
+    /// `metadata.<intent_key>` value (default `"intent"`) and
+    /// applies the configured policy:
+    ///
+    /// - `Disabled` → `1.0` (axis skipped).
+    /// - `Strict` → look up `metadata.intent` value in
+    ///   `intent_registry`. If the artifact didn't declare an
+    ///   intent, score `1.0` (no constraint). If declared but
+    ///   unknown to the registry, score `1.0` (forward-compat —
+    ///   future intents from a newer caller don't veto on an
+    ///   older substrate). If declared + known, evaluate the
+    ///   intent's required-caps list against the target's
+    ///   `(tags, metadata)` — `1.0` iff every requirement passes,
+    ///   `0.0` if any fails.
+    /// - `AnyOfLocalCapabilities` → walk every registered intent;
+    ///   score `1.0` iff the target satisfies *any* intent's
+    ///   required-caps list, `0.0` if none. Useful for "is this
+    ///   node generally capable" gating.
+    fn score_intent_axis(&self, target_caps: &CapabilitySet, artifact: &Artifact<'_>) -> f32 {
+        match self.intent_match {
+            IntentMatchPolicy::Disabled => 1.0,
+            IntentMatchPolicy::Strict => {
+                // Pull the intent value from the artifact's
+                // metadata. For Daemon artifacts that's
+                // `required.metadata`; for Chain / Replica
+                // artifacts it's the `capabilities.metadata` map.
+                let Some(intent) = artifact_intent(artifact, &self.metadata_keys.intent)
+                else {
+                    return 1.0; // No intent declared — no constraint.
+                };
+
+                // Look up the intent's required-cap list. Unknown
+                // intents pass through (forward-compat).
+                let Some(reqs) = self.intent_registry.lookup(intent) else {
+                    return 1.0;
+                };
+
+                evaluate_required_caps(target_caps, reqs)
+            }
+            IntentMatchPolicy::AnyOfLocalCapabilities => {
+                // Empty registry: no intent satisfiable → 0.0.
+                // (Matches the policy's intent: "node must be
+                // useful for *something* in the registry.")
+                if self.intent_registry.is_empty() {
+                    return 0.0;
+                }
+                let any_satisfied = self.intent_registry.iter().any(|(_, reqs)| {
+                    evaluate_required_caps(target_caps, reqs) >= 1.0
+                });
+                if any_satisfied { 1.0 } else { 0.0 }
+            }
+        }
     }
 
     fn score_colocation_axis(&self, _target_caps: &CapabilitySet, _artifact: &Artifact<'_>) -> f32 {
@@ -495,6 +558,51 @@ impl<'a> StandardPlacement<'a> {
         // local-view leadership-concentration stats and applies
         // `leadership_concentration_penalty` past the threshold.
         1.0
+    }
+}
+
+/// Pull the artifact's intent metadata value (or any other
+/// metadata key) by walking the variant-specific `CapabilitySet`
+/// references.
+///
+/// - `Daemon { required, optional, .. }` → checks `required.metadata`
+///   first, falling back to `optional.metadata`. Required is the
+///   primary declaration site; optional fallback handles the rare
+///   case where intent is treated as a soft hint.
+/// - `Chain { capabilities, .. }` → checks `capabilities.metadata`.
+/// - `Replica { capabilities, .. }` → same as `Chain`.
+fn artifact_intent<'a>(
+    artifact: &'a Artifact<'_>,
+    intent_key: &str,
+) -> Option<&'a str> {
+    let try_caps = |caps: &'a CapabilitySet| {
+        caps.metadata.get(intent_key).map(|s| s.as_str())
+    };
+    match artifact {
+        Artifact::Daemon { required, optional, .. } => try_caps(required).or_else(|| try_caps(optional)),
+        Artifact::Chain { capabilities, .. } => try_caps(capabilities),
+        Artifact::Replica { capabilities, .. } => try_caps(capabilities),
+    }
+}
+
+/// Evaluate a list of `RequiredCapability` checks against a target's
+/// `(tags, metadata)`. Returns `1.0` iff every requirement passes,
+/// `0.0` if any fails. Used by the intent axis (and reused by
+/// future axes that need the same all-pass-or-fail semantics).
+fn evaluate_required_caps(target_caps: &CapabilitySet, reqs: &[RequiredCapability]) -> f32 {
+    if reqs.is_empty() {
+        return 1.0;
+    }
+    // Materialize tags into a Vec so EvalContext can borrow a slice.
+    let tags: Vec<Tag> = target_caps.tags.iter().cloned().collect();
+    let ctx = crate::adapter::net::behavior::predicate::EvalContext::new(
+        &tags,
+        &target_caps.metadata,
+    );
+    if reqs.iter().all(|r| r.evaluate(&ctx)) {
+        1.0
+    } else {
+        0.0
     }
 }
 
@@ -1305,6 +1413,223 @@ mod tests {
         // No matching predicate → None.
         let none = graph.nearest_rtt(|_| false);
         assert!(none.is_none());
+    }
+
+    // ====================================================================
+    // Phase F slice 5 — intent axis
+    // ====================================================================
+
+    /// Helper: build a Daemon artifact with the artifact's
+    /// `required.metadata` carrying an intent declaration.
+    fn daemon_with_intent<'a>(
+        required: &'a CapabilitySet,
+        optional: &'a CapabilitySet,
+    ) -> Artifact<'a> {
+        Artifact::Daemon {
+            daemon_id: [0u8; 32],
+            required,
+            optional,
+        }
+    }
+
+    /// `IntentMatchPolicy::Disabled` returns 1.0 regardless — pin
+    /// the back-compat behavior with stub-axis behavior. Slice 5
+    /// must not change observable scoring for daemons that don't
+    /// opt in.
+    #[test]
+    fn intent_axis_disabled_always_returns_one() {
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "intent", "ml-training");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+
+        let index = index_with(&[(0x1111, empty_caps())]);
+        let placement = StandardPlacement::new(&index)
+            .with_intent_match(IntentMatchPolicy::Disabled)
+            .with_intent_registry(IntentRegistry::defaults());
+        let target_caps = empty_caps();
+        let score = placement.score_intent_axis(&target_caps, &artifact);
+        assert_eq!(score, 1.0);
+    }
+
+    /// `Strict` policy + no intent in artifact metadata → 1.0
+    /// (no constraint to satisfy).
+    #[test]
+    fn intent_axis_strict_no_intent_metadata_returns_one() {
+        let required = empty_caps();
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+
+        let index = index_with(&[(0x1111, empty_caps())]);
+        let placement = StandardPlacement::new(&index)
+            .with_intent_match(IntentMatchPolicy::Strict)
+            .with_intent_registry(IntentRegistry::defaults());
+        let target_caps = empty_caps();
+        let score = placement.score_intent_axis(&target_caps, &artifact);
+        assert_eq!(score, 1.0, "no intent declared → no constraint");
+    }
+
+    /// `Strict` + intent declared but unknown to registry → 1.0
+    /// (forward-compat — newer intents from a future caller don't
+    /// veto on an older substrate).
+    #[test]
+    fn intent_axis_strict_unknown_intent_returns_one_forward_compat() {
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "intent", "future-intent-not-in-registry");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+
+        let index = index_with(&[(0x1111, empty_caps())]);
+        let placement = StandardPlacement::new(&index)
+            .with_intent_match(IntentMatchPolicy::Strict)
+            .with_intent_registry(IntentRegistry::defaults());
+        let target_caps = empty_caps();
+        let score = placement.score_intent_axis(&target_caps, &artifact);
+        assert_eq!(score, 1.0, "unknown intent passes through");
+    }
+
+    /// `Strict` + known intent + target satisfies all required
+    /// caps → 1.0.
+    #[test]
+    fn intent_axis_strict_satisfied_returns_one() {
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "intent", "ml-training");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+
+        let index = index_with(&[(0x1111, empty_caps())]);
+        let placement = StandardPlacement::new(&index)
+            .with_intent_match(IntentMatchPolicy::Strict)
+            .with_intent_registry(IntentRegistry::defaults());
+
+        // Target with GPU + 32 GB VRAM satisfies ml-training.
+        let target_caps = empty_caps()
+            .add_tag("hardware.gpu")
+            .add_tag("hardware.gpu.vram_mb=32768");
+        let score = placement.score_intent_axis(&target_caps, &artifact);
+        assert_eq!(score, 1.0);
+    }
+
+    /// `Strict` + known intent + target missing a required cap → 0.0.
+    /// Pin the hard-veto behavior the multiplicative composition
+    /// relies on.
+    #[test]
+    fn intent_axis_strict_unsatisfied_returns_zero() {
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "intent", "ml-training");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+
+        let index = index_with(&[(0x1111, empty_caps())]);
+        let placement = StandardPlacement::new(&index)
+            .with_intent_match(IntentMatchPolicy::Strict)
+            .with_intent_registry(IntentRegistry::defaults());
+
+        // Target with GPU but only 8 GB VRAM — fails the
+        // `gpu.vram_mb >= 24576` requirement.
+        let target_caps = empty_caps()
+            .add_tag("hardware.gpu")
+            .add_tag("hardware.gpu.vram_mb=8192");
+        let score = placement.score_intent_axis(&target_caps, &artifact);
+        assert_eq!(score, 0.0);
+    }
+
+    /// `AnyOfLocalCapabilities` + empty registry → 0.0 (no intent
+    /// satisfiable).
+    #[test]
+    fn intent_axis_any_of_with_empty_registry_returns_zero() {
+        let required = empty_caps();
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+
+        let index = index_with(&[(0x1111, empty_caps())]);
+        let placement = StandardPlacement::new(&index)
+            .with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities);
+        // Default empty registry.
+        let target_caps = empty_caps()
+            .add_tag("hardware.gpu")
+            .add_tag("hardware.gpu.vram_mb=32768");
+        let score = placement.score_intent_axis(&target_caps, &artifact);
+        assert_eq!(score, 0.0);
+    }
+
+    /// `AnyOfLocalCapabilities` + target satisfies one intent → 1.0.
+    #[test]
+    fn intent_axis_any_of_satisfies_via_one_intent() {
+        let required = empty_caps();
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+
+        let index = index_with(&[(0x1111, empty_caps())]);
+        let placement = StandardPlacement::new(&index)
+            .with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities)
+            .with_intent_registry(IntentRegistry::defaults());
+
+        // GPU + 32 GB VRAM satisfies ml-training (and inference's
+        // GPU requirement, though inference also needs a software.model.* tag).
+        let target_caps = empty_caps()
+            .add_tag("hardware.gpu")
+            .add_tag("hardware.gpu.vram_mb=32768");
+        let score = placement.score_intent_axis(&target_caps, &artifact);
+        assert_eq!(score, 1.0, "ml-training reqs satisfy → axis passes");
+    }
+
+    /// `AnyOfLocalCapabilities` + target satisfies no intent → 0.0.
+    /// Pin the policy's "useful for *something*" semantic.
+    #[test]
+    fn intent_axis_any_of_target_useful_for_nothing_returns_zero() {
+        let required = empty_caps();
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+
+        let index = index_with(&[(0x1111, empty_caps())]);
+        let placement = StandardPlacement::new(&index)
+            .with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities)
+            .with_intent_registry(IntentRegistry::defaults());
+
+        // 2-core CPU node — fails ml-training (no GPU), inference (no
+        // GPU + no model tag), cpu-bound (cpu_cores < 4), and
+        // sensor-telemetry (no devices tag).
+        let target_caps = empty_caps().add_tag("hardware.cpu_cores=2");
+        let score = placement.score_intent_axis(&target_caps, &artifact);
+        assert_eq!(score, 0.0);
+    }
+
+    /// End-to-end: `placement_score` composes the intent axis
+    /// multiplicatively. A `Strict` veto (intent unsatisfied)
+    /// zeros the final score even though all other axes are
+    /// stubbed at 1.0. Pin the §7-LOCKED "0.0 anywhere → 0.0
+    /// final" invariant flowing through the real intent axis.
+    #[test]
+    fn intent_axis_zero_zeros_final_score_via_composition() {
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "intent", "ml-training");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+
+        // Target lacks the GPU + VRAM requirements.
+        let target_caps = empty_caps();
+        let index = {
+            let i = CapabilityIndex::new();
+            let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+            let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
+            i.index(ad);
+            i
+        };
+        let placement = StandardPlacement::new(&index)
+            .with_intent_match(IntentMatchPolicy::Strict)
+            .with_intent_registry(IntentRegistry::defaults());
+
+        let score = placement
+            .placement_score(&0x1111, &artifact)
+            .expect("hard-constraint check passes (required tag set is empty)");
+        assert_eq!(score, 0.0, "intent axis vetoes — final score 0.0");
+    }
+
+    /// Helper: append a (key, value) metadata pair to a CapabilitySet.
+    fn with_metadata_pair(mut caps: CapabilitySet, key: &str, value: &str) -> CapabilitySet {
+        caps.metadata.insert(key.to_string(), value.to_string());
+        caps
     }
 
     /// `Chain` and `Replica` artifacts pass through hard-constraint
