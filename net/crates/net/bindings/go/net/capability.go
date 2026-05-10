@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1228,25 +1227,27 @@ func axisTagPresent(tags []string, key TagKey) bool {
 	return false
 }
 
-// Q13: numeric predicates parse via Go's `strconv.ParseFloat`,
-// matching Rust's `f64::parse::<f64>()` semantics: accepts decimal,
-// scientific notation (`1e10`, `1.5e-3`), and ±inf, +/- prefix.
-// Pre-fix this file had a hand-rolled `isNumericLiteral` allowing
-// only digits + one optional `.` + one optional leading `-`,
-// which rejected scientific notation that the Rust substrate
-// would happily evaluate. A predicate against
-// `software.gpu.fp16_tflops_x10=1.5e3` would silently fail in Go
-// while passing in Rust — diverged numeric-evaluation semantics.
+// Q13 / R1: numeric predicates parse via Go's `strconv.ParseFloat`,
+// matching Rust's `f64::parse::<f64>()` semantics: decimal,
+// scientific notation (`1e10`, `1.5e-3`), and ±inf are all
+// accepted and pass through to the comparison untouched.
+//
+// Rust accepts "NaN" / "inf" / "-inf" via `f64::from_str`, and
+// the predicate evaluator hands the parsed value to a `>=` /
+// `<=` / range comparison — IEEE 754 then yields the right
+// answer naturally (NaN comparisons are always false; ±inf
+// compares as expected). Pre-Q13 the Go binding rejected
+// scientific notation; the Q13 fix added a NaN/Inf guard that
+// over-corrected and diverged from Rust on legitimate inf
+// inputs. R1: drop the NaN/Inf guard so cross-binding numeric
+// predicate evaluation agrees on every value Rust accepts.
 
 func parseFloat(s string) (float64, bool) {
 	if s == "" {
 		return 0, false
 	}
 	n, err := strconv.ParseFloat(s, 64)
-	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
-		// Rust's `parse::<f64>()` rejects NaN literals (only
-		// numeric strings), and Inf is not a meaningful tag
-		// value for any of the numeric predicate variants.
+	if err != nil {
 		return 0, false
 	}
 	return n, true
