@@ -105,7 +105,11 @@ fn register_filter(id: &str, filter: Arc<dyn PlacementFilter>) -> FilterGuard {
     // Cleanup from a possibly-failed prior run.
     let _ = reg.unregister(id);
     assert!(
-        reg.register(id.to_string(), filter, "integration_placement_filter_callback"),
+        reg.register(
+            id.to_string(),
+            filter,
+            "integration_placement_filter_callback"
+        ),
         "register {id}",
     );
     FilterGuard { id: id.to_string() }
@@ -239,12 +243,7 @@ fn filter_receives_artifact_with_daemon_capabilities() {
     }
 
     let seen = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
-    let _guard = register_filter(
-        id,
-        Arc::new(TapFilter {
-            seen: seen.clone(),
-        }),
-    );
+    let _guard = register_filter(id, Arc::new(TapFilter { seen: seen.clone() }));
 
     // Score against a peer whose announced caps SATISFY the
     // required tags — `StandardPlacement` short-circuits on the

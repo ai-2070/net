@@ -213,8 +213,7 @@ async fn predicate_header_round_trip_filters_corpus() {
         .await
         .expect("call must succeed (Ok status surfaces as Ok(RpcReply))");
 
-    let matches: Vec<u32> =
-        serde_json::from_slice(&reply.body).expect("body decodes as Vec<u32>");
+    let matches: Vec<u32> = serde_json::from_slice(&reply.body).expect("body decodes as Vec<u32>");
     assert_eq!(
         matches,
         vec![0],
@@ -246,7 +245,11 @@ async fn predicate_header_admits_multiple_candidates() {
         .await
         .expect("call");
     let matches: Vec<u32> = serde_json::from_slice(&reply.body).expect("body");
-    assert_eq!(matches, vec![0, 1, 3], "every GPU-bearing candidate matches");
+    assert_eq!(
+        matches,
+        vec![0, 1, 3],
+        "every GPU-bearing candidate matches"
+    );
 }
 
 /// Caller omits the header — server returns empty matches. Pins
