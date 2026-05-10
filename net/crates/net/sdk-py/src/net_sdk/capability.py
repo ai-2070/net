@@ -1437,25 +1437,55 @@ def predicate_debug_report(
 # ============================================================================
 
 
-_META_EQUALS_RE = __import__("re").compile(r"^MetadataEquals\(([^=]+)=(.+)\)$")
-_META_MATCHES_RE = __import__("re").compile(
-    r'^MetadataMatches\((.+) contains "(.*)"\)$'
-)
-_META_NUMERIC_RE = __import__("re").compile(
-    r"^MetadataNumericAtLeast\((.+) >= (.+)\)$"
-)
-
-
 def _redact_label(label: str, keys: frozenset) -> str:
-    m = _META_EQUALS_RE.match(label)
-    if m and m.group(1) in keys:
-        return f"MetadataEquals({m.group(1)}=<redacted>)"
-    m = _META_MATCHES_RE.match(label)
-    if m and m.group(1) in keys:
-        return f'MetadataMatches({m.group(1)} contains "<redacted>")'
-    m = _META_NUMERIC_RE.match(label)
-    if m and m.group(1) in keys:
-        return f"MetadataNumericAtLeast({m.group(1)} >= <redacted>)"
+    """Rewrite a metadata-clause label to hide its value, when
+    the clause's metadata key is in ``keys``.
+
+    P2-O: pre-fix this used regexes like
+    ``r"^MetadataEquals\\(([^=]+)=(.+)\\)$"`` for the
+    ``MetadataEquals`` form. The ``[^=]+`` group explicitly
+    forbids the key from containing ``=``, so a redact-key like
+    ``"k=v"`` or any user-emitted metadata key with a literal
+    ``=`` never matched and the secret stayed in the label.
+    Substrate metadata is ``BTreeMap<String, String>`` and accepts
+    arbitrary keys; the redaction must too. Mirrors the Rust
+    ``redact_label`` fix in CR-19.
+
+    Strategy: try the redact keys longest-first against the label
+    interior. The first key that matches (as the literal prefix
+    before the separator) wins. Keeps the shape of the substrate's
+    ``redact_label`` helper.
+    """
+    if not keys:
+        return label
+    sorted_keys = sorted(keys, key=len, reverse=True)
+
+    for prefix, suffix, sep, replacement in (
+        ("MetadataEquals(", ")", "=", "MetadataEquals({key}=<redacted>)"),
+        (
+            "MetadataMatches(",
+            ")",
+            ' contains "',
+            'MetadataMatches({key} contains "<redacted>")',
+        ),
+        (
+            "MetadataNumericAtLeast(",
+            ")",
+            " >= ",
+            "MetadataNumericAtLeast({key} >= <redacted>)",
+        ),
+    ):
+        if not label.startswith(prefix) or not label.endswith(suffix):
+            continue
+        inner = label[len(prefix) : -len(suffix)]
+        # MetadataMatches's suffix is `")` — the inner piece is
+        # `<key> contains "<pattern>` with the trailing `"` already
+        # absorbed by the suffix, so the key+sep prefix check is
+        # `<key> contains "`. Same shape; nothing special.
+        for key in sorted_keys:
+            if inner.startswith(f"{key}{sep}"):
+                return replacement.format(key=key)
+        return label
     return label
 
 

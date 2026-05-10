@@ -77,6 +77,42 @@ def test_redaction_preserves_total_candidates_and_matched() -> None:
     assert out.matched == 42
 
 
+def test_redaction_handles_keys_containing_separator() -> None:
+    """P2-O: pre-fix the regex ``r"^MetadataEquals\\(([^=]+)=(.+)\\)$"``
+    forbade the metadata key from containing ``=`` (the ``[^=]+``
+    group). Substrate metadata is ``BTreeMap<String, String>`` and
+    accepts arbitrary keys, so a redact-key like ``"weird=key"``
+    silently no-op'd while the secret stayed in the label.
+    Mirrors the Rust ``redact_label`` fix in CR-19.
+    """
+    report = PredicateDebugReport(
+        total_candidates=10,
+        matched=4,
+        clause_stats=(
+            ClauseStats("MetadataEquals(weird=key=sk-secret-1)", 10, 4),
+        ),
+    )
+    redacted = redact_metadata_keys(report, ["weird=key"])
+    label = redacted.clause_stats[0].label
+    assert label == "MetadataEquals(weird=key=<redacted>)"
+    assert "sk-secret-1" not in label
+
+
+def test_redaction_handles_numeric_at_least_keys_containing_separator() -> None:
+    """Same shape for ``MetadataNumericAtLeast``: the key may
+    contain `` >= ``. The longer-key-first scan wins."""
+    report = PredicateDebugReport(
+        total_candidates=5,
+        matched=2,
+        clause_stats=(
+            ClauseStats("MetadataNumericAtLeast(a >= b >= 42)", 5, 2),
+        ),
+    )
+    redacted = redact_metadata_keys(report, ["a >= b"])
+    label = redacted.clause_stats[0].label
+    assert label == "MetadataNumericAtLeast(a >= b >= <redacted>)"
+
+
 def test_predicate_debug_report_from_wire_rejects_missing_fields() -> None:
     with pytest.raises(ValueError):
         predicate_debug_report_from_wire({})
