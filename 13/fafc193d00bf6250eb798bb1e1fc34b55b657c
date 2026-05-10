@@ -1,0 +1,30 @@
+net/crates/net/src/adapter/net/behavior/schema.rs
+  s_e3c24456981f5d::t_bd3e2ce66c90af 518
+net/crates/net/tests/cross_lang_capability_fixtures.rs
+  s_d1b11a1287c170::t_642e26fd316b5b 478
+  s_e3c24456981f5d::t_1bc7c54f446a5d 479-488
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "13fafc193d00bf6250eb798bb1e1fc34b55b657c",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
