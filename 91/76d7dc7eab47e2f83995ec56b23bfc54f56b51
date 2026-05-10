@@ -1,0 +1,19 @@
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  s_e3c24456981f5d::t_f5c1b2cd7ac7e4 767-779
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "9176d7dc7eab47e2f83995ec56b23bfc54f56b51",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
