@@ -186,6 +186,23 @@ pub use net::adapter::net::behavior::capability::{CapabilitySetDiff, MetadataCha
 pub use net::adapter::net::behavior::capability::{CardinalityCache, CardinalityProvider};
 
 // =============================================================================
+// Placement filter — Phase F slice 1 of `CAPABILITY_SYSTEM_PLAN.md`.
+//
+// `PlacementFilter::placement_score(target, artifact) -> Option<f32>`
+// is the substrate's "score a candidate for placing an artifact"
+// primitive. `LegacyPlacement` preserves today's
+// `find_migration_targets` behavior (any node matching the
+// `CapabilityFilter` is eligible at score 1.0) so the scheduler
+// migration window swaps cleanly. `StandardPlacement` (the multi-
+// axis reference impl) lands in slice 2 alongside `IntentRegistry`
+// + the tie-breaking comparator.
+// =============================================================================
+
+pub use net::adapter::net::behavior::placement::{
+    Artifact, LegacyPlacement, NodeId as PlacementNodeId, PlacementFilter,
+};
+
+// =============================================================================
 // Required capability + macros — Phase A.3 of
 // `CAPABILITY_SYSTEM_PLAN.md`. Used by `IntentRegistry` (Phase F)
 // to declare per-intent placement requirements.

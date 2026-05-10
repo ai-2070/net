@@ -18,6 +18,7 @@ pub mod context;
 pub mod diff;
 pub mod loadbalance;
 pub mod metadata;
+pub mod placement;
 pub mod predicate;
 pub mod proximity;
 pub mod required_capability;
@@ -52,6 +53,8 @@ pub use predicate::{
     RpcPredicateContext, filter_by_predicate, predicate_from_rpc_headers,
     predicate_to_rpc_header,
 };
+
+pub use placement::{Artifact, LegacyPlacement, NodeId as PlacementNodeId, PlacementFilter};
 
 pub use required_capability::{RequireParseError, RequiredCapability};
 
