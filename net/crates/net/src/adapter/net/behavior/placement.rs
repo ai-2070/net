@@ -636,10 +636,74 @@ impl<'a> StandardPlacement<'a> {
         }
     }
 
-    fn score_colocation_axis(&self, _target_caps: &CapabilitySet, _artifact: &Artifact<'_>) -> f32 {
-        // Stub: colocation axis always satisfied. Slice 5 evaluates
-        // `metadata.colocate-with` against target's local chain
-        // holdings (`causal:*` tags).
+    /// Phase F slice 5 colocation axis. Reads the artifact's
+    /// `metadata.<colocate_with>` and `metadata.<colocate_with_strict>`
+    /// values (default keys `"colocate-with"` and
+    /// `"colocate-with-strict"`); each value is a chain origin hash.
+    /// Matches against the target's `causal:<hash>` reserved tags.
+    ///
+    /// Strict semantics (`colocate-with-strict` always; OR
+    /// `colocate-with` when policy is `StrictRequired`):
+    /// - Target hosts the chain → 1.0.
+    /// - Target doesn't host the chain → 0.0 (hard veto).
+    ///
+    /// Soft semantics (`colocate-with` under `SoftPreference`):
+    /// - Target hosts the chain → 1.0.
+    /// - Target doesn't host the chain → 0.7 (penalty boost — the
+    ///   non-colocated candidate scores below a colocated one but
+    ///   isn't vetoed; the multiplicative composition factors the
+    ///   penalty into the final score).
+    ///
+    /// Disabled (`Ignore` policy or no metadata key set) → 1.0.
+    ///
+    /// Match logic: a `causal:<chain_hash>` tag matches the
+    /// chain. Prefix-form variants (`causal:<hash>:<tip>` and
+    /// `causal:<hash>[<range>]`) also match the same chain hash —
+    /// per `CAPABILITY_SYSTEM_PLAN.md` §2, a tip / range
+    /// announcement is implicitly a holder of the underlying
+    /// chain.
+    fn score_colocation_axis(&self, target_caps: &CapabilitySet, artifact: &Artifact<'_>) -> f32 {
+        if self.colocation_policy == ColocationPolicy::Ignore {
+            return 1.0;
+        }
+
+        // Pull both metadata values. Strict-key always vetoes;
+        // soft-key's behavior depends on policy.
+        let strict_chain = artifact_metadata(artifact, &self.metadata_keys.colocate_with_strict);
+        let soft_chain = artifact_metadata(artifact, &self.metadata_keys.colocate_with);
+
+        if strict_chain.is_none() && soft_chain.is_none() {
+            return 1.0; // No declaration — nothing to enforce.
+        }
+
+        // Strict-key: hard veto regardless of policy. The
+        // declarer explicitly opted into strict semantics by
+        // using the strict key.
+        if let Some(chain) = strict_chain {
+            if !target_holds_chain(target_caps, chain) {
+                return 0.0;
+            }
+        }
+
+        // Soft-key: behavior depends on policy.
+        if let Some(chain) = soft_chain {
+            let does_host = target_holds_chain(target_caps, chain);
+            match self.colocation_policy {
+                ColocationPolicy::Ignore => unreachable!("handled above"),
+                ColocationPolicy::SoftPreference => {
+                    // Boost: 1.0 with chain, 0.7 without.
+                    return if does_host { 1.0 } else { 0.7 };
+                }
+                ColocationPolicy::StrictRequired => {
+                    // Policy upgrades soft-key declarations to
+                    // strict semantics.
+                    if !does_host {
+                        return 0.0;
+                    }
+                }
+            }
+        }
+
         1.0
     }
 
@@ -658,28 +722,65 @@ impl<'a> StandardPlacement<'a> {
     }
 }
 
-/// Pull the artifact's intent metadata value (or any other
-/// metadata key) by walking the variant-specific `CapabilitySet`
-/// references.
+/// Pull a metadata value off the artifact's variant-specific
+/// `CapabilitySet` references. Used by axes that read declarative
+/// hints (`metadata.intent`, `metadata.colocate-with`,
+/// `metadata.colocate-with-strict`).
 ///
 /// - `Daemon { required, optional, .. }` → checks `required.metadata`
 ///   first, falling back to `optional.metadata`. Required is the
 ///   primary declaration site; optional fallback handles the rare
-///   case where intent is treated as a soft hint.
+///   case where the value is treated as a soft hint.
 /// - `Chain { capabilities, .. }` → checks `capabilities.metadata`.
 /// - `Replica { capabilities, .. }` → same as `Chain`.
-fn artifact_intent<'a>(
+fn artifact_metadata<'a>(
     artifact: &'a Artifact<'_>,
-    intent_key: &str,
+    key: &str,
 ) -> Option<&'a str> {
     let try_caps = |caps: &'a CapabilitySet| {
-        caps.metadata.get(intent_key).map(|s| s.as_str())
+        caps.metadata.get(key).map(|s| s.as_str())
     };
     match artifact {
         Artifact::Daemon { required, optional, .. } => try_caps(required).or_else(|| try_caps(optional)),
         Artifact::Chain { capabilities, .. } => try_caps(capabilities),
         Artifact::Replica { capabilities, .. } => try_caps(capabilities),
     }
+}
+
+/// Backward-compat alias for the intent axis. Pre-slice-5 helper
+/// name; slice 5 generalized it to `artifact_metadata` so the
+/// colocation axis can reuse the same lookup. Kept to minimize
+/// the slice 5 intent-axis diff churn.
+fn artifact_intent<'a>(
+    artifact: &'a Artifact<'_>,
+    intent_key: &str,
+) -> Option<&'a str> {
+    artifact_metadata(artifact, intent_key)
+}
+
+/// Does the target host the named chain? Walks the target's
+/// `causal:*` reserved tags and matches the chain-hash prefix
+/// against `chain_hash`.
+///
+/// Match semantics (per `CAPABILITY_SYSTEM_PLAN.md` §2):
+/// - `causal:<hash>` (presence-form) → exact match on the hash.
+/// - `causal:<hash>:<tip_seq>` (tip-form) → matches; the peer
+///   announcing a tip implicitly holds the chain prefix.
+/// - `causal:<hash>[<range>]` (range-form) → matches; same
+///   reasoning.
+fn target_holds_chain(target_caps: &CapabilitySet, chain_hash: &str) -> bool {
+    target_caps.tags.iter().any(|t| match t {
+        Tag::Reserved { prefix, body } if prefix.as_str() == "causal:" => {
+            // Body is `<hash>` / `<hash>:<tip>` / `<hash>[<range>]`.
+            // The hash extends until the first `:` or `[`; before
+            // that boundary it's the chain id.
+            let hash_end = body
+                .find(|c: char| c == ':' || c == '[')
+                .unwrap_or(body.len());
+            &body[..hash_end] == chain_hash
+        }
+        _ => false,
+    })
 }
 
 /// Evaluate a list of `RequiredCapability` checks against a target's
@@ -1934,6 +2035,194 @@ mod tests {
             .placement_score(&0x1111, &artifact)
             .expect("hard-constraint check passes");
         assert_eq!(score, 0.0, "proximity axis vetoes — final score 0.0");
+    }
+
+    // ====================================================================
+    // Phase F slice 5 — colocation axis
+    // ====================================================================
+
+    /// `ColocationPolicy::Ignore` → 1.0 regardless. Default.
+    #[test]
+    fn colocation_axis_ignore_returns_one() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_colocation_policy(ColocationPolicy::Ignore);
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "colocate-with", "abc123");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+        let target_caps = empty_caps();
+        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 1.0);
+    }
+
+    /// SoftPreference + no colocate metadata declared → 1.0
+    /// (no constraint).
+    #[test]
+    fn colocation_axis_soft_no_metadata_returns_one() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let required = empty_caps();
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+        let target_caps = empty_caps();
+        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 1.0);
+    }
+
+    /// SoftPreference + soft-key declared + target hosts → 1.0.
+    #[test]
+    fn colocation_axis_soft_target_hosts_returns_one() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "colocate-with", "abc123");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+        let target_caps = empty_caps().require_chain("abc123");
+        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 1.0);
+    }
+
+    /// SoftPreference + soft-key declared + target doesn't host
+    /// → 0.7 (soft penalty boost).
+    #[test]
+    fn colocation_axis_soft_target_misses_returns_penalty() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "colocate-with", "abc123");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+        let target_caps = empty_caps();
+        let score = placement.score_colocation_axis(&target_caps, &artifact);
+        assert!(
+            (score - 0.7).abs() < 1e-6,
+            "soft penalty expected ~0.7, got {score}"
+        );
+    }
+
+    /// Strict-key always vetoes regardless of policy. Pin: under
+    /// SoftPreference, declaring `colocate-with-strict` upgrades
+    /// to hard veto.
+    #[test]
+    fn colocation_axis_strict_key_vetoes_under_soft_policy() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "colocate-with-strict", "abc123");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+        // Target doesn't host the chain.
+        let target_caps = empty_caps();
+        assert_eq!(
+            placement.score_colocation_axis(&target_caps, &artifact),
+            0.0,
+            "strict-key vetoes regardless of policy",
+        );
+    }
+
+    /// StrictRequired + soft-key declared + target doesn't host
+    /// → 0.0. The policy upgrades the soft-key declaration to
+    /// strict semantics.
+    #[test]
+    fn colocation_axis_strict_policy_upgrades_soft_key_to_veto() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_colocation_policy(ColocationPolicy::StrictRequired);
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "colocate-with", "abc123");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+        let target_caps = empty_caps();
+        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 0.0);
+    }
+
+    /// StrictRequired + soft-key declared + target hosts → 1.0.
+    #[test]
+    fn colocation_axis_strict_policy_target_hosts_returns_one() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_colocation_policy(ColocationPolicy::StrictRequired);
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "colocate-with", "abc123");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+        let target_caps = empty_caps().require_chain("abc123");
+        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 1.0);
+    }
+
+    /// Tip-form `causal:<hash>:<tip_seq>` satisfies the colocation
+    /// axis — peer announcing a tip implicitly holds the chain.
+    #[test]
+    fn colocation_axis_tip_form_satisfies_match() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "colocate-with", "abc123");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+        // Target announces a tip-form chain.
+        let target_caps = empty_caps().require_chain_tip("abc123", 42);
+        assert_eq!(placement.score_colocation_axis(&target_caps, &artifact), 1.0);
+    }
+
+    /// End-to-end: a strict colocation veto zeros the final score
+    /// via multiplicative composition.
+    #[test]
+    fn colocation_axis_zero_zeros_final_score() {
+        let target_caps = empty_caps();
+        let index = {
+            let i = CapabilityIndex::new();
+            let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+            let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
+            i.index(ad);
+            i
+        };
+        let placement = StandardPlacement::new(&index)
+            .with_colocation_policy(ColocationPolicy::StrictRequired);
+
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "colocate-with", "abc123");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+
+        let score = placement
+            .placement_score(&0x1111, &artifact)
+            .expect("hard-constraint check passes");
+        assert_eq!(score, 0.0);
+    }
+
+    /// End-to-end: a soft-preference penalty multiplies through
+    /// the composition. Target doesn't host the chain → final
+    /// score 0.7 (other axes all stub / pass at 1.0).
+    #[test]
+    fn colocation_axis_soft_penalty_multiplies_through_composition() {
+        let target_caps = empty_caps();
+        let index = {
+            let i = CapabilityIndex::new();
+            let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+            let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
+            i.index(ad);
+            i
+        };
+        let placement = StandardPlacement::new(&index)
+            .with_colocation_policy(ColocationPolicy::SoftPreference);
+
+        let mut required = empty_caps();
+        required = with_metadata_pair(required, "colocate-with", "abc123");
+        let optional = empty_caps();
+        let artifact = daemon_with_intent(&required, &optional);
+
+        let score = placement
+            .placement_score(&0x1111, &artifact)
+            .expect("hard-constraint check passes");
+        assert!(
+            (score - 0.7).abs() < 1e-6,
+            "soft penalty multiplies through (other axes 1.0); got {score}"
+        );
     }
 
     /// End-to-end: a proximity over-threshold zeros the final
