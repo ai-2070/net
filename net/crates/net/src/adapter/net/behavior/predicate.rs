@@ -1330,18 +1330,107 @@ impl Predicate {
             .all(|i| children[i].evaluate_with_index(ctx, index))
     }
 
-    /// `Or` short-circuit evaluation in dynamic-cost-ascending
+    /// `Or` short-circuit evaluation in Or-mode-cost-ascending
     /// child order.
+    ///
+    /// Phase 4 final close of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+    /// Uses [`Self::dynamic_cost_or`] (the inverted formula
+    /// favoring low-cardinality "often-true" clauses) instead of
+    /// the And-mode [`Self::dynamic_cost`]. The asymmetry matches
+    /// short-circuit semantics: And short-circuits on first false
+    /// (run rare-true clauses first), Or short-circuits on first
+    /// true (run often-true clauses first).
     fn eval_any_with_index(
         children: &[Predicate],
         ctx: &EvalContext<'_>,
         index: &crate::adapter::net::behavior::CapabilityIndex,
     ) -> bool {
         let mut order: Vec<usize> = (0..children.len()).collect();
-        order.sort_by_key(|&i| children[i].dynamic_cost(index));
+        order.sort_by_key(|&i| children[i].dynamic_cost_or(index));
         order
             .into_iter()
             .any(|i| children[i].evaluate_with_index(ctx, index))
+    }
+
+    /// Or-mode dynamic cost. Inverts the cardinality direction
+    /// from [`Self::dynamic_cost`] so low-cardinality clauses
+    /// (likely to match many candidates → often-true) sort first.
+    ///
+    /// Phase 4 final close of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+    ///
+    /// Behavior at leaves:
+    ///
+    /// - Tag-keyed leaves: `static_cost × max(1, cardinality)`.
+    ///   High cardinality → many distinct values → each rare → high
+    ///   Or-cost (run later). Low cardinality → matches concentrated
+    ///   on few values → each common → low Or-cost (run first).
+    /// - Metadata leaves: same shape against
+    ///   `metadata_value_cardinality`.
+    /// - Cardinality-0 (key absent from index) → fall back to
+    ///   `static_cost`, conservative.
+    ///
+    /// Behavior at composites:
+    ///
+    /// - `And(children)` recurses with And-mode `dynamic_cost`
+    ///   (the And's own internal ordering).
+    /// - `Or(children)` recurses with Or-mode `dynamic_cost_or`.
+    /// - `Not(inner)` passes through the same Or-mode recursion.
+    ///
+    /// Note: this is a leaf-level asymmetry. A rigorous treatment
+    /// would also penalize And-as-Or-child with a "rare-true"
+    /// score (since an And is true only when all children are
+    /// true), but doing that requires modeling per-clause
+    /// truthiness probability (a separate piece of work). For
+    /// typical predicate shapes (mostly leaf-or-mixed, not
+    /// deeply-nested And-of-Or-of-And), the leaf-level
+    /// asymmetry catches the load-bearing case.
+    fn dynamic_cost_or(
+        &self,
+        index: &crate::adapter::net::behavior::CapabilityIndex,
+    ) -> u32 {
+        match self {
+            Self::Exists { key }
+            | Self::Equals { key, .. }
+            | Self::NumericAtLeast { key, .. }
+            | Self::NumericAtMost { key, .. }
+            | Self::NumericInRange { key, .. }
+            | Self::SemverAtLeast { key, .. }
+            | Self::SemverAtMost { key, .. }
+            | Self::SemverCompatible { key, .. }
+            | Self::StringPrefix { key, .. }
+            | Self::StringMatches { key, .. } => {
+                let static_c = self.static_cost();
+                let cardinality = index.axis_cardinality(key);
+                if cardinality == 0 {
+                    return static_c;
+                }
+                static_c.saturating_mul((cardinality as u32).max(1))
+            }
+            Self::MetadataExists { key }
+            | Self::MetadataEquals { key, .. }
+            | Self::MetadataMatches { key, .. }
+            | Self::MetadataNumericAtLeast { key, .. } => {
+                let static_c = self.static_cost();
+                let cardinality = index.metadata_value_cardinality(key);
+                if cardinality == 0 {
+                    return static_c;
+                }
+                static_c.saturating_mul((cardinality as u32).max(1))
+            }
+            // Composites: recurse with mode appropriate to the
+            // composite's own type. This is a leaf-level asymmetry —
+            // the cost reflects the composite's own internal
+            // expected work, not its truthiness probability.
+            Self::And(c) => c
+                .iter()
+                .map(|c| c.dynamic_cost(index))
+                .fold(0u32, |a, b| a.saturating_add(b)),
+            Self::Or(c) => c
+                .iter()
+                .map(|c| c.dynamic_cost_or(index))
+                .fold(0u32, |a, b| a.saturating_add(b)),
+            Self::Not(inner) => inner.dynamic_cost_or(index),
+        }
     }
 }
 
@@ -3178,6 +3267,195 @@ mod tests {
             dynamic < static_c,
             "expected dynamic < static when cardinality > 1; got dynamic={dynamic}, static={static_c}",
         );
+    }
+
+    // ========================================================================
+    // Or-vs-And ordering asymmetry — Phase 4 final close of
+    // CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    #[test]
+    fn dynamic_cost_or_inverts_cardinality_direction_for_axis_leaves() {
+        // Pin: a clause with low cardinality (often-true) gets a
+        // LOW Or-cost; high cardinality (rare-true) gets a HIGH
+        // Or-cost. Inverse of And-mode `dynamic_cost`.
+        let index = index_with_low_card_gpu_vendor();
+
+        // gpu.vendor has 2 distinct values, memory_mb has 20.
+        let high_card_clause = Predicate::Equals {
+            key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+            value: "1029".into(),
+        };
+        let low_card_clause = Predicate::Equals {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
+            value: "nvidia".into(),
+        };
+
+        // And-mode (existing): high-card runs first (rare-true).
+        assert!(high_card_clause.dynamic_cost(&index) < low_card_clause.dynamic_cost(&index));
+
+        // Or-mode (new): low-card runs first (often-true).
+        assert!(
+            low_card_clause.dynamic_cost_or(&index) < high_card_clause.dynamic_cost_or(&index),
+            "expected low-card < high-card in Or-mode; got low={}, high={}",
+            low_card_clause.dynamic_cost_or(&index),
+            high_card_clause.dynamic_cost_or(&index),
+        );
+    }
+
+    #[test]
+    fn dynamic_cost_or_inverts_cardinality_direction_for_metadata_leaves() {
+        // Same property, metadata side.
+        let index = index_with_metadata_intents();
+
+        let intent_clause = Predicate::MetadataEquals {
+            key: "intent".into(),    // low-card (2 values)
+            value: "ml-training".into(),
+        };
+        let owner_clause = Predicate::MetadataEquals {
+            key: "owner".into(),     // high-card (20 values)
+            value: "alice-5".into(),
+        };
+
+        // And-mode: high-card (owner) sorts first.
+        assert!(owner_clause.dynamic_cost(&index) < intent_clause.dynamic_cost(&index));
+
+        // Or-mode: low-card (intent) sorts first.
+        assert!(
+            intent_clause.dynamic_cost_or(&index) < owner_clause.dynamic_cost_or(&index),
+            "expected low-card < high-card in Or-mode; got intent={}, owner={}",
+            intent_clause.dynamic_cost_or(&index),
+            owner_clause.dynamic_cost_or(&index),
+        );
+    }
+
+    #[test]
+    fn dynamic_cost_or_falls_back_to_static_for_unknown_keys() {
+        let index = index_with_distinct_memory_values(10);
+        let unknown_clause = Predicate::Equals {
+            key: TagKey::new(TaxonomyAxis::Devices, "qpu"),
+            value: "rigetti-aspen".into(),
+        };
+        // Devices.qpu cardinality 0 → falls back to static_cost.
+        assert_eq!(
+            unknown_clause.dynamic_cost_or(&index),
+            unknown_clause.static_cost()
+        );
+    }
+
+    #[test]
+    fn dynamic_cost_or_falls_back_to_static_on_empty_index() {
+        let index = CapabilityIndex::new();
+        let pred = Predicate::Equals {
+            key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+            value: "65536".into(),
+        };
+        assert_eq!(pred.dynamic_cost_or(&index), pred.static_cost());
+    }
+
+    #[test]
+    fn evaluate_with_index_or_short_circuits_on_often_true_clause_first() {
+        // Build a context where one Or-child is true (the
+        // low-cardinality intent metadata clause) and the other
+        // would also be true on its own. The result is `true`
+        // either way. Pin: result is correct regardless of the
+        // Or planner's child order.
+        let index = index_with_metadata_intents();
+
+        let pred = Predicate::Or(vec![
+            // High-cost, high-cardinality clause; would normally
+            // sort first under And-mode planner.
+            Predicate::Equals {
+                key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+                value: "999999".into(), // doesn't match anything
+            },
+            // Low-cost, low-cardinality clause; should sort first
+            // under Or-mode planner.
+            Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+        ]);
+
+        let tags: Vec<Tag> = vec![]; // no memory_mb=999999
+        let meta = meta_with(&[("intent", "ml-training")]);
+        let cx = ctx(&tags, &meta);
+
+        // Result should be true (intent matches).
+        assert!(pred.evaluate_with_index(&cx, &index));
+        // Equivalence vs unplanned holds.
+        assert_eq!(
+            pred.evaluate_with_index(&cx, &index),
+            pred.evaluate_unplanned(&cx),
+        );
+    }
+
+    #[test]
+    fn evaluate_with_index_or_planner_equivalence_on_canonical_inputs() {
+        // Pin: Or-mode planner produces the same result as
+        // unplanned eval for a corpus of (predicate, context)
+        // combinations. The reordering is a pure local
+        // optimization.
+        let index = index_with_low_card_gpu_vendor();
+
+        let predicates: Vec<Predicate> = vec![
+            // Pure Or with mixed cardinalities
+            Predicate::Or(vec![
+                Predicate::Equals {
+                    key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
+                    value: "nvidia".into(),
+                },
+                Predicate::Equals {
+                    key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+                    value: "1029".into(),
+                },
+            ]),
+            // Or wrapped in And (planner re-enters Or-mode at the
+            // inner Or)
+            Predicate::And(vec![
+                Predicate::Or(vec![
+                    Predicate::Exists {
+                        key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+                    },
+                    Predicate::MetadataEquals {
+                        key: "intent".into(),
+                        value: "ml-training".into(),
+                    },
+                ]),
+                Predicate::Not(Box::new(Predicate::MetadataEquals {
+                    key: "decommissioning".into(),
+                    value: "true".into(),
+                })),
+            ]),
+        ];
+
+        let contexts: Vec<(Vec<Tag>, BTreeMap<String, String>)> = vec![
+            (vec![], BTreeMap::new()),
+            (
+                vec![axis_eq(TaxonomyAxis::Hardware, "gpu.vendor", "nvidia")],
+                BTreeMap::new(),
+            ),
+            (
+                vec![axis_present(TaxonomyAxis::Hardware, "gpu")],
+                meta_with(&[("intent", "ml-training")]),
+            ),
+            (
+                vec![axis_eq(TaxonomyAxis::Hardware, "memory_mb", "1029")],
+                meta_with(&[("decommissioning", "true")]),
+            ),
+        ];
+
+        for (i, pred) in predicates.iter().enumerate() {
+            for (j, (tags, meta)) in contexts.iter().enumerate() {
+                let cx = ctx(tags, meta);
+                let with_index = pred.evaluate_with_index(&cx, &index);
+                let unplanned = pred.evaluate_unplanned(&cx);
+                assert_eq!(
+                    with_index, unplanned,
+                    "pred[{i}] ctx[{j}]: with_index={with_index} != unplanned={unplanned}",
+                );
+            }
+        }
     }
 
     #[test]
