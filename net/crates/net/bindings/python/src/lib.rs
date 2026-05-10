@@ -1846,9 +1846,30 @@ mod mesh_bindings {
         /// counter, so collisions are an SDK-side concern. Use
         /// `unregister_placement_filter` first if you need to swap
         /// the predicate behind a stable id.
-        fn register_placement_filter(&self, id: String, predicate: Py<PyAny>) -> PyResult<bool> {
+        fn register_placement_filter(
+            &self,
+            py: Python<'_>,
+            id: String,
+            predicate: Py<PyAny>,
+        ) -> PyResult<bool> {
             use net::adapter::net::behavior::placement::PlacementFilter;
             use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+
+            // P2-K: validate the predicate is callable BEFORE
+            // wrapping + registering. Pre-fix any object — None, a
+            // dict, a non-callable instance — would register
+            // successfully and only surface failure at first
+            // dispatch (where `PyPlacementFilter::placement_score`
+            // raises `TypeError`, the wrapper translates to None,
+            // and every candidate gets vetoed silently). Caller-
+            // side `TypeError` at registration is the right shape
+            // — same contract as `napi`'s
+            // `function-arg-required-but-not-provided` validation.
+            if !predicate.bind(py).is_callable() {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "predicate must be callable as predicate(candidate: dict) -> bool",
+                ));
+            }
 
             let node = self.get_node()?;
             let capability_index = node.capability_index().clone();
