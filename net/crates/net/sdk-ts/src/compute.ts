@@ -313,6 +313,40 @@ export interface MeshDaemon {
   snapshot?(): Buffer | null;
   /** Optional: restore state from a snapshot produced by `snapshot`. */
   restore?(state: Buffer): void;
+
+  /**
+   * Phase 6 of `CAPABILITY_SYSTEM_SDK_PLAN.md` — hard placement
+   * requirements declared at factory time. Drives the substrate's
+   * `MeshDaemon::required_capabilities`; missing tags veto
+   * placement (`StandardPlacement` returns `None` for any
+   * candidate node missing a required tag).
+   *
+   * Static — captured once when the factory returns; not
+   * re-queried per placement decision. Omit for "runs anywhere"
+   * defaults.
+   *
+   * Example:
+   * ```ts
+   * rt.registerFactory('inference', () => ({
+   *   name: 'inference',
+   *   process: (ev) => doWork(ev.payload),
+   *   requiredCapabilities: {
+   *     tags: ['hardware.gpu', 'hardware.gpu.vram_mb=24576'],
+   *   },
+   *   optionalCapabilities: {
+   *     tags: ['hardware.gpu.vram_mb=81920'],
+   *   },
+   * }));
+   * ```
+   */
+  requiredCapabilities?: import('./capabilities').CapabilitySet;
+  /**
+   * Phase 6 of `CAPABILITY_SYSTEM_SDK_PLAN.md` — soft placement
+   * preferences. Factor into per-axis scoring; missing optional
+   * tags don't veto placement (unlike `requiredCapabilities`).
+   * Omit for "no preferences" default.
+   */
+  optionalCapabilities?: import('./capabilities').CapabilitySet;
 }
 
 /** A zero-arg function returning a {@link MeshDaemon} or a Promise of one. */

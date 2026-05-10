@@ -119,6 +119,33 @@ describe('DaemonRuntime (Stage 3 sub-step 1: skeleton + lifecycle)', () => {
     // Second shutdown: no throw.
     await expect(rt.shutdown()).resolves.toBeUndefined();
   });
+
+  // Phase 6 of `CAPABILITY_SYSTEM_SDK_PLAN.md`: factories may
+  // declare `requiredCapabilities` / `optionalCapabilities` —
+  // captured at factory time and forwarded to the substrate's
+  // `MeshDaemon::required_capabilities` / `optional_capabilities`.
+  it('registerFactory accepts requiredCapabilities + optionalCapabilities', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    // Static caps declared at factory time. The new fields are
+    // optional; existing daemons compile unchanged.
+    const inferenceFactory = () => ({
+      name: 'inference',
+      process: (_event: unknown) => [],
+      requiredCapabilities: {
+        tags: ['hardware.gpu'],
+      },
+      optionalCapabilities: {
+        tags: ['hardware.gpu.vram_mb=81920'],
+      },
+    });
+
+    expect(() => rt.registerFactory('inference', inferenceFactory)).not.toThrow();
+  });
 });
 
 // Sub-step 2a: spawn / stop lifecycle. Daemon is a no-op bridge
