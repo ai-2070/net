@@ -1750,11 +1750,23 @@ mod mesh_bindings {
         ///
         /// Multi-hop propagation is deferred — peers more than one
         /// hop away will not see the announcement.
-        fn announce_capabilities(&self, caps: &Bound<'_, PyDict>) -> PyResult<()> {
+        ///
+        /// CR-12: release the GIL across the broadcast. The
+        /// underlying `node.announce_capabilities` issues UDP/QUIC
+        /// frames to every directly-connected peer; without
+        /// `py.detach` every other Python thread blocks for the
+        /// network round-trip. Sibling sync paths (`call`,
+        /// `find_service_nodes`) already follow this pattern.
+        fn announce_capabilities(
+            &self,
+            py: Python<'_>,
+            caps: &Bound<'_, PyDict>,
+        ) -> PyResult<()> {
             let node = self.get_node()?;
+            // capability_set_from_py touches Python objects; must
+            // run while we still hold the GIL.
             let core = super::capabilities::capability_set_from_py(caps)?;
-            self.runtime
-                .block_on(node.announce_capabilities(core))
+            py.detach(|| self.runtime.block_on(node.announce_capabilities(core)))
                 .map_err(|e| PyRuntimeError::new_err(format!("capability: {}", e)))
         }
 
