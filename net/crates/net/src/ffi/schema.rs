@@ -208,6 +208,16 @@ fn validation_warning_to_wire(w: &ValidationWarning) -> Value {
             "kind": "legacy_tag",
             "tag": tag,
         }),
+        // CR-14: metadata-key reservation warnings.
+        ValidationWarning::MetadataReservedKey { key } => json!({
+            "kind": "metadata_reserved_key",
+            "key": key,
+        }),
+        ValidationWarning::MetadataReservedPrefix { key, prefix } => json!({
+            "kind": "metadata_reserved_prefix",
+            "key": key,
+            "prefix": prefix,
+        }),
     }
 }
 

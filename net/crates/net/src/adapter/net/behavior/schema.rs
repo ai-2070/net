@@ -462,6 +462,23 @@ pub enum ValidationWarning {
         /// The untyped tag value.
         tag: String,
     },
+    /// CR-14: a metadata key collides with a substrate-reserved key
+    /// (`intent`, `colocate-with`, …). User-emitted writes through
+    /// `with_metadata` should route around these — collision can
+    /// override scheduler-internal hints.
+    MetadataReservedKey {
+        /// The reserved metadata key the user wrote into.
+        key: String,
+    },
+    /// CR-14: a metadata key matches a substrate-reserved prefix
+    /// (`tool::`, …). Same hazard shape as `MetadataReservedKey`
+    /// but matched by prefix rather than exact name.
+    MetadataReservedPrefix {
+        /// The full key (with the reserved prefix).
+        key: String,
+        /// The reserved prefix that matched.
+        prefix: String,
+    },
 }
 
 /// Default soft cap for `CapabilitySet::metadata` total size, per
@@ -490,6 +507,32 @@ pub fn validate_capabilities_against(
 
     for tag in &caps.tags {
         validate_tag(tag, schema, &mut report);
+    }
+
+    // CR-14: metadata-key reservation check. The schema declares
+    // `metadata_reserved` (exact-match) and `metadata_reserved_prefixes`
+    // (prefix-match) but the validator never consulted them — a
+    // user's `with_metadata("intent", …)` smuggling onto a
+    // scheduler-reserved key emitted no warning. Walk both.
+    for key in caps.metadata.keys() {
+        if schema.metadata_reserved.iter().any(|r| *r == key.as_str()) {
+            report
+                .warnings
+                .push(ValidationWarning::MetadataReservedKey { key: key.clone() });
+            continue;
+        }
+        if let Some(prefix) = schema
+            .metadata_reserved_prefixes
+            .iter()
+            .find(|p| key.starts_with(*p))
+        {
+            report
+                .warnings
+                .push(ValidationWarning::MetadataReservedPrefix {
+                    key: key.clone(),
+                    prefix: (*prefix).to_string(),
+                });
+        }
     }
 
     // Metadata size cap (soft only here; hard cap belongs to the
@@ -651,7 +694,14 @@ fn check_value(
     // Type-specific value check.
     let parses = match entry.value_type {
         ValueType::Presence => unreachable!("handled above"),
-        ValueType::Number => value.parse::<u64>().is_ok() || value.parse::<i64>().is_ok(),
+        // CR-15: Number is unsigned. The previous `i64` fallback
+        // admitted negatives for keys like `hardware.memory_mb`,
+        // `gpu.vram_mb`, `cpu_cores`, `limits.max_concurrent_requests`
+        // — none of which can be negative semantically. The schema
+        // doesn't currently model signed numerics; if one is ever
+        // needed, split into `Int` / `UInt` rather than reintroducing
+        // the fallback.
+        ValueType::Number => value.parse::<u64>().is_ok(),
         // Strings, enums, csv all pass any non-empty string. Enum-
         // value validation lives at the codec level (e.g.
         // `GpuVendor::from(...)` falls back to `Unknown`).
@@ -689,6 +739,7 @@ mod tests {
     use crate::adapter::net::behavior::capability::{
         GpuInfo, GpuVendor, HardwareCapabilities, Modality, ModelCapability, SoftwareCapabilities,
     };
+    use crate::adapter::net::behavior::tag::AxisSeparator;
     use std::collections::HashSet;
 
     #[test]
@@ -851,6 +902,81 @@ mod tests {
             )),
             "missing MetadataOversize warning: {:?}",
             report.warnings,
+        );
+    }
+
+    /// CR-14: validator emits MetadataReservedKey for every
+    /// metadata key colliding with a schema-reserved exact name.
+    /// Pre-CR-14 the schema declared the reserved-keys list but
+    /// the validator never checked it — `with_metadata("intent",
+    /// …)` warned on nothing.
+    #[test]
+    fn validate_metadata_reserved_key_is_warning() {
+        let mut caps = CapabilitySet::new();
+        caps.metadata
+            .insert("intent".to_string(), "scheduler-hint".to_string());
+        caps.metadata
+            .insert("benign".to_string(), "ok".to_string());
+        let report = validate_capabilities(&caps);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert!(
+            report.warnings.iter().any(|w| matches!(w,
+                ValidationWarning::MetadataReservedKey { key } if key == "intent"
+            )),
+            "missing MetadataReservedKey warning: {:?}",
+            report.warnings,
+        );
+        // Benign key produces no warning.
+        assert!(
+            !report.warnings.iter().any(|w| matches!(w,
+                ValidationWarning::MetadataReservedKey { key } if key == "benign"
+            )),
+            "benign key wrongly flagged: {:?}",
+            report.warnings,
+        );
+    }
+
+    /// CR-14: prefix-matched reservations (`tool::*`).
+    #[test]
+    fn validate_metadata_reserved_prefix_is_warning() {
+        let mut caps = CapabilitySet::new();
+        caps.metadata
+            .insert("tool::evil::input_schema".to_string(), "spoof".to_string());
+        let report = validate_capabilities(&caps);
+        assert!(report.errors.is_empty());
+        assert!(
+            report.warnings.iter().any(|w| matches!(w,
+                ValidationWarning::MetadataReservedPrefix { key, prefix }
+                    if key == "tool::evil::input_schema" && prefix == "tool::"
+            )),
+            "missing MetadataReservedPrefix warning: {:?}",
+            report.warnings,
+        );
+    }
+
+    /// CR-15: `Number` no longer accepts negative integers. The
+    /// previous `i64` fallback let `-1` slip in for unsigned-only
+    /// keys (`memory_mb`, `vram_mb`, `cpu_cores`, etc.).
+    #[test]
+    fn validate_number_rejects_negative_values() {
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(Tag::AxisValue {
+            axis: TaxonomyAxis::Hardware,
+            key: "memory_mb".to_string(),
+            value: "-1".to_string(),
+            separator: AxisSeparator::Eq,
+        });
+        let report = validate_capabilities(&caps);
+        assert!(
+            report.errors.iter().any(|e| matches!(e,
+                SchemaError::TypeMismatch { axis, key, expected, actual }
+                    if *axis == TaxonomyAxis::Hardware
+                       && key == "memory_mb"
+                       && *expected == ValueType::Number
+                       && actual == "-1"
+            )),
+            "negative value should fail Number validation: {:?}",
+            report.errors,
         );
     }
 
