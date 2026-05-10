@@ -306,19 +306,37 @@ pub fn software_to_tags(sw: &SoftwareCapabilities) -> Vec<Tag> {
         tags.push(software_value("os_version", &sw.os_version));
     }
     for (name, version) in &sw.runtimes {
-        tags.push(software_value(&format!("runtime.{name}"), version));
+        if is_round_trippable_subkey(name) {
+            tags.push(software_value(&format!("runtime.{name}"), version));
+        }
     }
     for (name, version) in &sw.frameworks {
-        tags.push(software_value(&format!("framework.{name}"), version));
+        if is_round_trippable_subkey(name) {
+            tags.push(software_value(&format!("framework.{name}"), version));
+        }
     }
     if let Some(cuda) = &sw.cuda_version {
         tags.push(software_value("cuda_version", cuda));
     }
     for (name, version) in &sw.drivers {
-        tags.push(software_value(&format!("driver.{name}"), version));
+        if is_round_trippable_subkey(name) {
+            tags.push(software_value(&format!("driver.{name}"), version));
+        }
     }
 
     tags
+}
+
+/// CR-24: a `software.runtime.{name}={version}` tag round-trips
+/// via `Tag::parse`, which splits on the first `=` (or `:`).
+/// A name containing `=`, `:`, or `.` smears the split: e.g.
+/// `name="python=foo"` produces `software.runtime.python=foo=3.11`,
+/// which parses back as key=`runtime.python`, value=`foo=3.11`,
+/// silently truncating the name. Skip such names at encode time —
+/// matches the codec's existing forward-compat skip pattern for
+/// unrecognized keys (silent drop, not panic).
+fn is_round_trippable_subkey(name: &str) -> bool {
+    !name.is_empty() && !name.chars().any(|c| matches!(c, '=' | ':' | '.'))
 }
 
 /// Decode a `SoftwareCapabilities` from a tag list. Tags whose
@@ -1283,6 +1301,40 @@ mod tests {
         let tags = [Tag::parse("software.runtime.=1.0").unwrap()];
         let sw = software_from_tags(&tags);
         assert!(sw.runtimes.is_empty());
+    }
+
+    /// CR-24: `software_to_tags` skips runtime / framework / driver
+    /// names that contain `=`, `:`, or `.`. A name like `python=foo`
+    /// would otherwise produce `software.runtime.python=foo=3.11`,
+    /// which `Tag::parse` splits at the first `=` — silently
+    /// truncating the name on the receive side. Defensive skip at
+    /// encode time matches the codec's forward-compat pattern.
+    #[test]
+    fn software_to_tags_skips_subkeys_with_separator_chars() {
+        let sw = SoftwareCapabilities::new()
+            .add_runtime("python=evil", "1.0") // contains '='
+            .add_runtime("good-name", "2.0")
+            .add_framework("a:b", "9.0") // contains ':'
+            .add_framework("normal", "1.1");
+        let tags = software_to_tags(&sw);
+        let strs: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
+        assert!(
+            strs.iter().any(|s| s == "software.runtime.good-name=2.0"),
+            "valid runtime name must be emitted: {strs:?}"
+        );
+        assert!(
+            strs.iter().any(|s| s == "software.framework.normal=1.1"),
+            "valid framework name must be emitted: {strs:?}"
+        );
+        // Bad names dropped — no `python=evil` or `a:b` smearing.
+        assert!(
+            !strs.iter().any(|s| s.contains("python=evil")),
+            "name with '=' must be dropped: {strs:?}"
+        );
+        assert!(
+            !strs.iter().any(|s| s.contains("a:b")),
+            "name with ':' must be dropped: {strs:?}"
+        );
     }
 
     // ====================================================================
