@@ -241,6 +241,31 @@ impl Scheduler {
         daemon_filter: &CapabilityFilter,
         source_node: u64,
     ) -> Result<PlacementDecision, SchedulerError> {
+        // CR-21: preserve v1's LocalPreferred fast-path. With
+        // `LegacyPlacement::permissive` every eligible scores 1.0
+        // and ties fall through to step-3 (lex NodeId), so the
+        // smallest-NodeId remote always beats a higher-NodeId
+        // local even when local is fine — migrations newly hop
+        // the network. Slice-8 made v2 the default migration path,
+        // so this regression bit every operator using the
+        // out-of-the-box configuration.
+        //
+        // Apply the v1 short-circuit before scoring: if local is
+        // eligible AND not the source, route there with a
+        // `LocalPreferred` reason — saves the network hop and
+        // keeps downstream telemetry that distinguishes
+        // local-vs-remote placement decisions accurate.
+        let candidates = self.find_migration_targets(daemon_filter, source_node);
+        if candidates.is_empty() {
+            return Err(SchedulerError::NoCandidate);
+        }
+        if self.local_node_id != source_node && candidates.contains(&self.local_node_id) {
+            return Ok(PlacementDecision {
+                node_id: self.local_node_id,
+                reason: PlacementReason::LocalPreferred,
+            });
+        }
+
         let placement = LegacyPlacement::permissive(&self.capability_index);
         let tie_break = TieBreakContext {
             rtt_lookup: None,
@@ -1177,6 +1202,39 @@ mod tests {
             .place_migration_v2(&CapabilityFilter::default(), 0x1111)
             .unwrap_err();
         assert_eq!(err, SchedulerError::NoCandidate);
+    }
+
+    /// CR-21: `place_migration_v2` prefers local when local is
+    /// eligible (and not the source). Pre-CR-21 v2 routed every
+    /// migration through `select_migration_target` →
+    /// `LegacyPlacement::permissive`, where every eligible
+    /// scored 1.0 and step-3 lex NodeId tie-break made the
+    /// smallest-NodeId *remote* always beat a higher-NodeId
+    /// local — every migration newly hopped the network even
+    /// when local was fine. The fast-path matches v1 behavior
+    /// and saves the round-trip.
+    #[test]
+    fn place_migration_v2_prefers_local() {
+        let local_caps = caps_with_migration_tag();
+        let index = make_index_with_nodes(vec![
+            // Smallest NodeId is the remote, so without the
+            // local-preferred fast-path lex tie-break would
+            // always pick the remote.
+            (0x1111, caps_with_migration_tag()),
+            (0x2222, caps_with_migration_tag()),
+        ]);
+        // Local node = 0x2222 (HIGHER than the remote 0x1111).
+        let scheduler = Scheduler::new(index, 0x2222, local_caps);
+
+        // Source = 0x9999 (some other node), so local 0x2222
+        // is eligible. Pre-CR-21: tie-break picked 0x1111
+        // (smallest NodeId). Post-CR-21: local fast-path picks
+        // 0x2222 with LocalPreferred reason.
+        let decision = scheduler
+            .place_migration_v2(&CapabilityFilter::default(), 0x9999)
+            .unwrap();
+        assert_eq!(decision.node_id, 0x2222, "local must win the fast-path");
+        assert_eq!(decision.reason, PlacementReason::LocalPreferred);
     }
 
     /// `place_migration_v2` honors the daemon_filter — a node
