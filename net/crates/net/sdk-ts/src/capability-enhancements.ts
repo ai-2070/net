@@ -465,7 +465,17 @@ export function predicateFromWire(wire: PredicateWire): Predicate {
     const n = wire.nodes[i];
     built[i] = nodeFromWire(n, built, i);
   }
-  if (wire.root_idx < 0 || wire.root_idx >= built.length) {
+  // Q6: validate root_idx is an integer. Pre-fix only the
+  // numeric range was checked, so a non-integer (e.g. `1.5`,
+  // `NaN`, `Infinity`) would compare against `built.length`,
+  // pass the bounds check, and `built[wire.root_idx]` would
+  // return `undefined` instead of throwing — masking malformed
+  // wire input as a silent missing-root.
+  if (
+    !Number.isInteger(wire.root_idx) ||
+    wire.root_idx < 0 ||
+    wire.root_idx >= built.length
+  ) {
     throw new Error(
       `predicateFromWire: root_idx ${wire.root_idx} out of range [0, ${built.length})`,
     );
@@ -479,7 +489,13 @@ function nodeFromWire(
   selfIdx: number,
 ): Predicate {
   const checkChild = (idx: number): Predicate => {
-    if (idx < 0 || idx >= selfIdx) {
+    // Q5: validate `idx` is an integer. Pre-fix only the
+    // numeric range was checked, so a non-integer index in the
+    // child array (e.g. `1.5`, `NaN`) would index `prior` and
+    // return `undefined` — yielding a malformed AST that
+    // crashes on later evaluation rather than failing here at
+    // decode time.
+    if (!Number.isInteger(idx) || idx < 0 || idx >= selfIdx) {
       throw new Error(
         `predicateFromWire: child index ${idx} not strictly less than self ${selfIdx}`,
       );

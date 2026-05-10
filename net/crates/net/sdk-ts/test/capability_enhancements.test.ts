@@ -324,6 +324,36 @@ describe('p.* fluent predicate builder', () => {
     expect(() => predicateFromWire(bad)).toThrow(/root_idx/);
   });
 
+  // Q6: malformed wire input — non-integer root_idx — must throw
+  // rather than returning `undefined` (the array-index lookup of
+  // `nodes[1.5]` resolves to `undefined`).
+  it('rejects non-integer root_idx', () => {
+    for (const bogus of [1.5, NaN, Infinity, -Infinity]) {
+      const bad: PredicateWire = {
+        nodes: [{ kind: 'metadata_exists', key: 'x' }],
+        root_idx: bogus,
+      };
+      expect(() => predicateFromWire(bad)).toThrow(/root_idx/);
+    }
+  });
+
+  // Q5: same for child indices inside a composite. Pre-fix
+  // a fractional or NaN child index passed the bounds check
+  // (since `1.5 < selfIdx` may be true) and indexed `prior`,
+  // yielding a malformed AST that crashed on later evaluation.
+  it('rejects non-integer child indices', () => {
+    const bad: PredicateWire = {
+      nodes: [
+        { kind: 'metadata_exists', key: 'x' },
+        // Children list contains a fractional index referencing
+        // node 0 — the bounds check `0.5 < 1` was true pre-fix.
+        { kind: 'and', children: [0.5] },
+      ],
+      root_idx: 1,
+    };
+    expect(() => predicateFromWire(bad)).toThrow(/strictly less/);
+  });
+
   it('predicateToRpcHeader emits the canonical JSON', () => {
     const pred = p.exists(tagKey('hardware', 'gpu'));
     const header = predicateToRpcHeader(pred);
