@@ -67,6 +67,18 @@ jobs:
       # the v0.13 capability-system additions both fell off the
       # runner that way).
       #
+      # `--no-fail-fast` runs every test BINARY to completion
+      # regardless of earlier-binary failures. Without it, a flake
+      # in one integration test silently skips every later test
+      # binary in the alphabetic order (e.g. `connect_direct`
+      # failing stops `three_node_integration` from running at
+      # all). The eight-step enumerated shape didn't have this
+      # problem because each step was independent at the GitHub
+      # Actions layer; collapsing to one step requires the cargo-
+      # level equivalent. Within a single test binary, the usual
+      # libtest semantics apply (every `#[test]` in the binary
+      # still runs unless `--fail-fast` is passed under `--`).
+      #
       # `redis` and `jetstream` integration tests compile under
       # `--all-features` but every test fn inside is `#[ignore]`'d
       # ("requires running Redis" / "requires running NATS with
@@ -75,7 +87,7 @@ jobs:
       # REDIS_URL / JETSTREAM_URL env vars pointing at live
       # services) once CI service containers are added.
       - name: Integration tests
-        run: cargo test --all-features --tests
+        run: cargo test --all-features --tests --no-fail-fast
 
   rust-sdk-tests:
     name: Rust SDK tests
