@@ -1,0 +1,49 @@
+net/crates/net/docs/releases/RELEASE_v0.13_CHIPPIN_IN.md
+  s_9163f300668f8b::t_a004cfdb231836 103,105
+  s_9163f300668f8b::t_8f17d54edf3007 302
+  s_9163f300668f8b::t_edb09ba363f5db 119-127,129,131,134-136
+  s_9163f300668f8b::t_cdc66ec35bfbb3 142,144,146,148-151,153,155-159,161,163-166,168,170-179,181,183,185,189-193
+  s_d1b11a1287c170::t_f8f82d4e9f123a 3,11,28
+  s_9163f300668f8b::t_e3cbac3355a088 53
+  s_9163f300668f8b::t_1907d0d595e1ca 107
+  s_9163f300668f8b::t_8fb59ce16ebbd2 97
+  s_9163f300668f8b::t_29fd7100ffd587 199,201
+  s_9163f300668f8b::t_ea1ae0624ee455 65
+  s_9163f300668f8b::t_93ae5701fbca9c 47
+  s_9163f300668f8b::t_5c04b25f089ba0 101
+  s_9163f300668f8b::t_766865ebdc6295 20
+  s_9163f300668f8b::t_120356d1b7cf6c 75
+  s_9163f300668f8b::t_74bfe0fc3484bf 111
+  s_9163f300668f8b::t_ccf9af365f3230 93
+  s_9163f300668f8b::t_b96e99ee3b36a4 253
+  s_9163f300668f8b::t_0a62ea55cadbbf 32
+  s_9163f300668f8b::t_6d76648f48cc0f 258
+  s_9163f300668f8b::t_9b3dbe1896863c 294
+  s_9163f300668f8b::t_a8829fb14c6b71 200
+  s_9163f300668f8b::t_3ef281fd6a3ed8 85
+  s_9163f300668f8b::t_d74388e00f0613 87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "a5209aadaa19d7b8af15e9236c3bedc077043f2c",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
