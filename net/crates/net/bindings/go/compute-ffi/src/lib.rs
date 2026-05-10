@@ -2481,6 +2481,278 @@ pub extern "C" fn net_compute_standby_group_member_role(
 }
 
 // =========================================================================
+// SDK Phase 7 slice 4 — custom PlacementFilter callback bridge.
+//
+// Bridges Go closures to the substrate's `PlacementFilter` trait via
+// a JSON candidate payload + cgo trampoline. Mirror of the Node TSFN
+// (slice 2) and Python `Py<PyAny>` (slice 3) bridges.
+//
+// Wire shape: Rust marshals the candidate as a single JSON string;
+// Go decodes it inside the trampoline before invoking the user's
+// `PlacementFilterFn`. JSON keeps the C ABI tight (one byte buffer
+// per call) at the cost of a per-call serde round-trip — bounded
+// by per-node metadata cardinality, so acceptable for the
+// placement hot path. The Node + Python bridges marshal natively
+// because their FFIs already speak structured types; cgo doesn't.
+// =========================================================================
+
+/// C-ABI: invoke Go's placement-filter trampoline. The Go side
+/// looks up the registered closure by `filter_id`, decodes the
+/// candidate JSON, calls the user predicate, and returns:
+///
+///   - `1` — keep candidate (placement-score 1.0 in Rust trait).
+///   - `0` — drop candidate (returns `None` from `placement_score`).
+///   - any negative value — Go-side error (decode failure, panic
+///     recovery, etc.); treated as `None` (veto) on the Rust side.
+///
+/// `filter_id` and `candidate_json` are non-NUL-terminated byte
+/// buffers; the `_len` parameters give their lengths. Both buffers
+/// live for the duration of the call only — Go MUST copy if it
+/// needs to keep them.
+pub type PlacementFilterFn = unsafe extern "C" fn(
+    filter_id_ptr: *const c_char,
+    filter_id_len: usize,
+    node_id: u64,
+    candidate_json_ptr: *const c_char,
+    candidate_json_len: usize,
+) -> c_int;
+
+static PLACEMENT_FILTER_DISPATCHER: OnceLock<PlacementFilterFn> = OnceLock::new();
+
+/// Register the Go-side placement-filter trampoline. MUST be called
+/// before any [`net_compute_register_placement_filter`].
+///
+/// First-call-wins (`OnceLock` semantics) — same idiom as
+/// [`net_compute_set_dispatcher`]. A second call from any
+/// goroutine is a no-op; the Go binding's `init()` is guarded by
+/// `sync.Once` so this is the expected fast path.
+///
+/// # Safety
+///
+/// `f` MUST have C linkage, MUST live for the remaining lifetime of
+/// the process, and MUST follow the [`PlacementFilterFn`] contract.
+/// Passing NULL is a hard error.
+#[no_mangle]
+pub extern "C" fn net_compute_set_placement_filter_dispatcher(
+    f: Option<PlacementFilterFn>,
+) -> c_int {
+    let Some(f) = f else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let _ = PLACEMENT_FILTER_DISPATCHER.set(f);
+    NET_COMPUTE_OK
+}
+
+/// Bridge wrapper that implements `PlacementFilter` by calling the
+/// Go-side trampoline. Stored in
+/// [`global_placement_filter_registry`] as `Arc<dyn PlacementFilter>`.
+struct CgoPlacementFilter {
+    id: String,
+    capability_index: Arc<::net::adapter::net::behavior::capability::CapabilityIndex>,
+}
+
+impl ::net::adapter::net::behavior::placement::PlacementFilter for CgoPlacementFilter {
+    fn placement_score(
+        &self,
+        target: &::net::adapter::net::behavior::placement::NodeId,
+        _artifact: &::net::adapter::net::behavior::placement::Artifact<'_>,
+    ) -> Option<f32> {
+        // No dispatcher → no Go callback installed → veto. Operators
+        // who never set the dispatcher but call the register fn
+        // would otherwise hit an immediate UB.
+        let dispatcher = *PLACEMENT_FILTER_DISPATCHER.get()?;
+
+        // Look up candidate caps. Same semantics as Node / Python:
+        // a candidate not in the index is invisible to the Go
+        // predicate (which expects tags + metadata); veto rather
+        // than feed an empty candidate.
+        let caps = self.capability_index.get(*target)?;
+
+        // Build the candidate JSON. `Tag::Display` produces the
+        // on-wire string form; `metadata` is BTreeMap<String,String>
+        // which serde_json renders as a stable-keyed object.
+        let tags: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+        let candidate = serde_json::json!({
+            "node_id": *target,
+            "tags": tags,
+            "metadata": caps.metadata,
+        });
+        let json = match serde_json::to_string(&candidate) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "CgoPlacementFilter[{id}]: candidate JSON encode failed for {target:#x}: {e}; vetoing",
+                    id = self.id,
+                );
+                return None;
+            }
+        };
+
+        let id_bytes = self.id.as_bytes();
+        let json_bytes = json.as_bytes();
+        // SAFETY: dispatcher pointer was vetted by
+        // `net_compute_set_placement_filter_dispatcher`; both
+        // buffers are valid &[u8] slices owned by this stack frame
+        // for the duration of the call, matching the Go-side
+        // contract that buffers live only for the trampoline's
+        // duration (Go copies via `C.GoStringN` / `C.GoBytes`).
+        let result = unsafe {
+            dispatcher(
+                id_bytes.as_ptr() as *const c_char,
+                id_bytes.len(),
+                *target,
+                json_bytes.as_ptr() as *const c_char,
+                json_bytes.len(),
+            )
+        };
+        match result {
+            1 => Some(1.0),
+            0 => None,
+            other => {
+                eprintln!(
+                    "CgoPlacementFilter[{id}]: trampoline returned error code {other} for {target:#x}; vetoing",
+                    id = self.id,
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Register a Go placement-filter under `id`. Wraps the per-call
+/// trampoline (registered once via
+/// [`net_compute_set_placement_filter_dispatcher`]) in a
+/// [`CgoPlacementFilter`] and inserts it into
+/// [`global_placement_filter_registry`].
+///
+/// `mesh_arc` is a non-consuming pointer — the registry holds an
+/// `Arc<CapabilityIndex>` clone, not the mesh handle. Caller's
+/// existing `_free` for the mesh handle stays correct.
+///
+/// Returns:
+///
+///   - `0` — registered successfully.
+///   - [`NET_COMPUTE_ERR_NULL`] — `mesh_arc` or `id_ptr` is NULL.
+///   - [`NET_COMPUTE_ERR_DUPLICATE_KIND`] — `id` is already
+///     registered (no-overwrite contract; the Go SDK's
+///     `PlacementFilterFromFn` generates unique IDs by counter).
+///     Reuses the existing duplicate-kind error code so Go callers
+///     don't need a new constant.
+///   - `-4` — the Go-side dispatcher hasn't been installed yet.
+///     Call [`net_compute_set_placement_filter_dispatcher`] from
+///     the Go binding's `init()` first.
+///   - `-5` — `id_ptr` did not decode as valid UTF-8.
+///
+/// # Safety
+///
+/// `mesh_arc` MUST be a pointer returned by `net_mesh_arc_clone`;
+/// it is NOT consumed. `id_ptr` MUST point to `id_len` bytes of
+/// valid UTF-8. Both buffers must live for the duration of the
+/// call.
+#[no_mangle]
+pub extern "C" fn net_compute_register_placement_filter(
+    mesh_arc: *mut Arc<MeshNode>,
+    id_ptr: *const c_char,
+    id_len: usize,
+) -> c_int {
+    use ::net::adapter::net::behavior::placement::PlacementFilter;
+    use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+
+    if mesh_arc.is_null() || id_ptr.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    if PLACEMENT_FILTER_DISPATCHER.get().is_none() {
+        return -4;
+    }
+
+    let id = unsafe {
+        let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => return -5,
+        }
+    };
+
+    let arc = unsafe { &*mesh_arc };
+    let capability_index = arc.capability_index().clone();
+    let wrapper = CgoPlacementFilter {
+        id: id.clone(),
+        capability_index,
+    };
+    let arc_filter: Arc<dyn PlacementFilter> = Arc::new(wrapper);
+
+    if global_placement_filter_registry().register(id, arc_filter) {
+        NET_COMPUTE_OK
+    } else {
+        NET_COMPUTE_ERR_DUPLICATE_KIND
+    }
+}
+
+/// Drop the placement-filter registration under `id`.
+///
+/// Returns `1` if `id` was registered, `0` otherwise.
+/// [`NET_COMPUTE_ERR_NULL`] if `id_ptr` is NULL or the bytes don't
+/// decode as UTF-8.
+///
+/// # Safety
+///
+/// Same buffer-lifetime contract as
+/// [`net_compute_register_placement_filter`].
+#[no_mangle]
+pub extern "C" fn net_compute_unregister_placement_filter(
+    id_ptr: *const c_char,
+    id_len: usize,
+) -> c_int {
+    use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+    if id_ptr.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let id = unsafe {
+        let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return NET_COMPUTE_ERR_NULL,
+        }
+    };
+    if global_placement_filter_registry().unregister(id) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Whether `id` is currently registered. Diagnostic helper.
+/// Returns `1` if registered, `0` otherwise; [`NET_COMPUTE_ERR_NULL`]
+/// on bad input.
+///
+/// # Safety
+///
+/// Same buffer-lifetime contract as
+/// [`net_compute_register_placement_filter`].
+#[no_mangle]
+pub extern "C" fn net_compute_has_placement_filter(
+    id_ptr: *const c_char,
+    id_len: usize,
+) -> c_int {
+    use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+    if id_ptr.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let id = unsafe {
+        let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return NET_COMPUTE_ERR_NULL,
+        }
+    };
+    if global_placement_filter_registry().contains(id) {
+        1
+    } else {
+        0
+    }
+}
+
+// =========================================================================
 // Tests
 // =========================================================================
 
