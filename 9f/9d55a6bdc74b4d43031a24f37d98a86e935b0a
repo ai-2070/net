@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/behavior/bloom.rs
+  s_d1b11a1287c170::t_cf0e592bad2ac6 148-157,168-174
+  s_d1b11a1287c170::t_39cd3b16ff3c16 1-147,158-167,175-216,225-467
+  s_d1b11a1287c170::t_10d89d4cccbce4 217-224
+net/crates/net/src/adapter/net/behavior/mod.rs
+  s_d1b11a1287c170::t_e6e614d36e97a7 33-34
+  s_d1b11a1287c170::t_5d644d3e38e498 15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "9f9d55a6bdc74b4d43031a24f37d98a86e935b0a",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
