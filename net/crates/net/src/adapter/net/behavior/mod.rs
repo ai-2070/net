@@ -33,7 +33,9 @@ pub mod tag_codec;
 
 pub use bloom::BloomFilter;
 
-pub use query::{Aggregator, CapabilityQuery, Count, MaxNumericMetadata, UniqueAxisValues};
+pub use query::{
+    Aggregator, CapabilityQuery, Count, Distance, EdgeKind, MaxNumericMetadata, UniqueAxisValues,
+};
 
 pub use broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 

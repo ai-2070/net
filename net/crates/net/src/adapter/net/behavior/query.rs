@@ -46,11 +46,53 @@
 //! wrapper deliberately.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use crate::adapter::net::behavior::{
     capability::CapabilityIndex, predicate::EvalContext, predicate::Predicate, tag::Tag,
     tag::TagKey, tag::TaxonomyAxis,
 };
+
+/// Reserved-prefix edge kind for [`CapabilityQuery::traverse`].
+/// Identifies which reserved-prefix tag forms a graph edge from a
+/// child entity to its parent.
+///
+/// Today's substrate uses two reserved-prefix shapes that
+/// genuinely encode parent links:
+///
+/// - `fork-of:<parent_origin_hex>` — a forked entity carries a
+///   `fork-of:` tag whose body is the parent's origin hash. The
+///   parent itself may carry its own `fork-of:` tag for the
+///   grand-parent. Walking these chains terminates at a root
+///   (an entity with no `fork-of:` tag).
+///
+/// - `causal:<chain_hex>` is NOT an edge kind in the
+///   parent-pointer sense — it's a chain advertisement. Listed
+///   here so adding it later (e.g., for "find the chain head of
+///   chain X" traversal) is mechanical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeKind {
+    /// Walk `fork-of:<parent>` parent links upward.
+    ForkOfParent,
+}
+
+impl EdgeKind {
+    /// Reserved-prefix string this edge kind walks. Matches the
+    /// `Tag::Reserved::prefix` field for the corresponding tag.
+    pub fn prefix(&self) -> &'static str {
+        match self {
+            EdgeKind::ForkOfParent => "fork-of:",
+        }
+    }
+}
+
+/// Proximity distance for [`CapabilityQuery::nearest`]. Wraps
+/// `Duration` so callers can't accidentally swap it with a wall-
+/// clock duration. RTT "missing" (e.g. no proximity data for a
+/// candidate) is represented as `None` at the lookup boundary;
+/// `nearest` ranks unmeasured candidates at the back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Distance(pub Duration);
 
 /// Aggregator over filtered query results. Implementations
 /// receive each matching `(NodeId, &CapabilitySet)` and update
@@ -231,6 +273,65 @@ pub trait CapabilityQuery {
     fn aggregate<A>(&self, predicate: &Predicate, agg: A) -> A::Output
     where
         A: Aggregator;
+
+    /// Walk capability-tag edges recursively. Starting from
+    /// `start_tag`, follow [`EdgeKind`]-shaped parent links up
+    /// to `max_depth` hops. Returns the chain of
+    /// `(node_id, tag)` pairs visited, in walk order.
+    ///
+    /// For `EdgeKind::ForkOfParent`: `start_tag` is a
+    /// `fork-of:<parent_origin_hex>` tag. The walker:
+    ///
+    ///   1. Records the start node + tag.
+    ///   2. Looks up nodes hosting `causal:<parent_origin_hex>`
+    ///      (the parent chain's holders).
+    ///   3. From each holder, reads any `fork-of:` tag — the
+    ///      grandparent — and recurses.
+    ///   4. Terminates at `max_depth` hops OR when no
+    ///      `fork-of:` tag is found (root reached).
+    ///
+    /// First parent's host wins on ties — the index iteration
+    /// order is implementation-defined; callers needing
+    /// deterministic ordering across runs should snapshot the
+    /// index outside this call.
+    ///
+    /// `max_depth = 0` returns just `(start_node, start_tag)`
+    /// without recursing. `start_node` defaults to `0` if the
+    /// caller doesn't have a node id (the start tag itself is
+    /// what matters for the walk).
+    fn traverse(
+        &self,
+        start_node: u64,
+        start_tag: &Tag,
+        edge: EdgeKind,
+        max_depth: u32,
+    ) -> Vec<(u64, Tag)>;
+
+    /// Top-N candidates by proximity. Filters by `predicate`,
+    /// then ranks survivors by `rtt_lookup(node_id)` (lower
+    /// RTT first). Candidates with no RTT data sort to the
+    /// back; ties broken by lex-NodeId for determinism.
+    ///
+    /// `n = 0` returns empty. The function clones the matching
+    /// `CapabilitySet`s into the result; callers that don't
+    /// need the caps for downstream work can use `filter` +
+    /// their own ranking.
+    ///
+    /// Distance closure decouples `nearest` from the substrate's
+    /// proximity-graph internals (which use a `[u8; 32]`
+    /// node-id shape that this trait would otherwise have to
+    /// know about). Same plumbing convention as Phase F's
+    /// `RttLookup` for placement scoring.
+    fn nearest<F: Fn(u64) -> Option<Duration>>(
+        &self,
+        predicate: &Predicate,
+        rtt_lookup: F,
+        n: usize,
+    ) -> Vec<(
+        u64,
+        crate::adapter::net::behavior::capability::CapabilitySet,
+        Option<Distance>,
+    )>;
 }
 
 // =========================================================================
@@ -303,6 +404,120 @@ impl CapabilityQuery for CapabilityIndex {
             });
         }
         agg.finalize()
+    }
+
+    fn traverse(
+        &self,
+        start_node: u64,
+        start_tag: &Tag,
+        edge: EdgeKind,
+        max_depth: u32,
+    ) -> Vec<(u64, Tag)> {
+        let mut path = vec![(start_node, start_tag.clone())];
+        if max_depth == 0 {
+            return path;
+        }
+
+        let mut current_tag = start_tag.clone();
+        for _ in 0..max_depth {
+            // Extract the `(prefix, body)` of the current edge tag.
+            // ForkOfParent walks `fork-of:<hex>` whose body is the
+            // parent's origin hash; the parent is hosted on nodes
+            // carrying `causal:<hex>`.
+            let body = match &current_tag {
+                Tag::Reserved { prefix, body } if prefix == edge.prefix() => body.clone(),
+                _ => break, // current tag isn't the right edge kind; halt.
+            };
+
+            // Find a node hosting the parent (carries `causal:<body>`).
+            let parent_lookup_tag = Tag::Reserved {
+                prefix: "causal:".to_string(),
+                body: body.clone(),
+            };
+            let parent_host = self.find_first_host(&parent_lookup_tag);
+            let Some(parent_node) = parent_host else {
+                break; // no host of the parent chain known to this index.
+            };
+
+            // Record the parent host, then look at its `fork-of:`
+            // tag (if any) to continue walking up.
+            let next_edge: Option<Tag> = self
+                .with_caps(parent_node, |caps| {
+                    caps.tags.iter().find_map(|t| match t {
+                        Tag::Reserved { prefix, .. } if prefix == edge.prefix() => {
+                            Some(t.clone())
+                        }
+                        _ => None,
+                    })
+                })
+                .flatten();
+
+            path.push((parent_node, parent_lookup_tag));
+            match next_edge {
+                Some(t) => current_tag = t,
+                None => break, // parent has no further parent — root reached.
+            }
+        }
+        path
+    }
+
+    fn nearest<F: Fn(u64) -> Option<Duration>>(
+        &self,
+        predicate: &Predicate,
+        rtt_lookup: F,
+        n: usize,
+    ) -> Vec<(
+        u64,
+        crate::adapter::net::behavior::capability::CapabilitySet,
+        Option<Distance>,
+    )> {
+        if n == 0 {
+            return Vec::new();
+        }
+        // Gather (node_id, caps) survivors.
+        let mut survivors = self.filter(predicate);
+        // Compute RTTs.
+        let mut ranked: Vec<(
+            u64,
+            crate::adapter::net::behavior::capability::CapabilitySet,
+            Option<Distance>,
+        )> = survivors
+            .drain(..)
+            .map(|(id, caps)| {
+                let dist = rtt_lookup(id).map(Distance);
+                (id, caps, dist)
+            })
+            .collect();
+        // Sort: present RTTs ascending, missing RTTs last; ties
+        // broken by lex NodeId for determinism.
+        ranked.sort_by(|a, b| match (a.2, b.2) {
+            (Some(da), Some(db)) => da.cmp(&db).then_with(|| a.0.cmp(&b.0)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.0.cmp(&b.0),
+        });
+        ranked.truncate(n);
+        ranked
+    }
+}
+
+impl CapabilityIndex {
+    /// Find a node hosting `tag` — first match in iteration
+    /// order. Used by `traverse` to resolve `causal:<hex>` →
+    /// hosting node. The "first match" policy means the result
+    /// isn't deterministic across runs unless callers control
+    /// the index population order; the trait doc-comment on
+    /// `traverse` calls this out.
+    fn find_first_host(&self, tag: &Tag) -> Option<u64> {
+        for node_id in self.all_nodes() {
+            let hit = self
+                .with_caps(node_id, |caps| caps.tags.contains(tag))
+                .unwrap_or(false);
+            if hit {
+                return Some(node_id);
+            }
+        }
+        None
     }
 }
 
@@ -524,5 +739,182 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert_eq!(us_east_gpu, vec![0x1111]);
+    }
+
+    // =====================================================================
+    // Phase E slice 2 tests — traverse + nearest.
+    // =====================================================================
+
+    /// Manually add a `Tag::Reserved` to a CapabilitySet via the
+    /// privileged `Tag::parse` path (bypasses the `add_tag` /
+    /// `parse_user` reserved-prefix rejection).
+    fn add_reserved_tag(caps: CapabilitySet, raw: &str) -> CapabilitySet {
+        let mut caps = caps;
+        let parsed = Tag::parse(raw).unwrap();
+        caps.tags.insert(parsed);
+        caps
+    }
+
+    /// `traverse` walks `fork-of:` parent links up to `max_depth`.
+    ///
+    /// Setup: three-generation fork chain.
+    ///   - root chain `R` lives on node 0xA (carries `causal:R`)
+    ///   - fork `F1` of R lives on node 0xB (carries `causal:F1`
+    ///     + `fork-of:R`)
+    ///   - fork `F2` of F1 lives on node 0xC (carries `causal:F2`
+    ///     + `fork-of:F1`)
+    ///
+    /// Starting from `fork-of:F1` on 0xC, `traverse` should walk
+    /// to 0xB (parent F1 host) then 0xA (root R host).
+    #[test]
+    fn traverse_fork_of_walks_chain() {
+        let i = Arc::new(CapabilityIndex::new());
+        let eid = EntityId::from_bytes([0u8; 32]);
+        // root R on 0xA
+        let r_caps = add_reserved_tag(CapabilitySet::default(), "causal:R");
+        i.index(CapabilityAnnouncement::new(0xAu64, eid.clone(), 1, r_caps));
+        // F1 on 0xB
+        let f1_caps = add_reserved_tag(CapabilitySet::default(), "causal:F1");
+        let f1_caps = add_reserved_tag(f1_caps, "fork-of:R");
+        i.index(CapabilityAnnouncement::new(0xBu64, eid.clone(), 1, f1_caps));
+        // F2 on 0xC
+        let f2_caps = add_reserved_tag(CapabilitySet::default(), "causal:F2");
+        let f2_caps = add_reserved_tag(f2_caps, "fork-of:F1");
+        i.index(CapabilityAnnouncement::new(0xCu64, eid.clone(), 1, f2_caps));
+
+        // Start traversal from F2's `fork-of:F1` on 0xC.
+        let start_tag = Tag::parse("fork-of:F1").unwrap();
+        let path = i.traverse(0xCu64, &start_tag, EdgeKind::ForkOfParent, 5);
+
+        // Expected: [(0xC, fork-of:F1), (0xB, causal:F1), (0xA, causal:R)]
+        assert_eq!(path.len(), 3, "path: {path:?}");
+        assert_eq!(path[0].0, 0xC);
+        assert_eq!(path[1].0, 0xB);
+        assert_eq!(path[2].0, 0xA);
+    }
+
+    /// `traverse` honors `max_depth` — capping at 1 means just
+    /// the start tag + first parent-host hop.
+    #[test]
+    fn traverse_honors_max_depth() {
+        let i = Arc::new(CapabilityIndex::new());
+        let eid = EntityId::from_bytes([0u8; 32]);
+        let r_caps = add_reserved_tag(CapabilitySet::default(), "causal:R");
+        i.index(CapabilityAnnouncement::new(0xAu64, eid.clone(), 1, r_caps));
+        let f1_caps = add_reserved_tag(CapabilitySet::default(), "causal:F1");
+        let f1_caps = add_reserved_tag(f1_caps, "fork-of:R");
+        i.index(CapabilityAnnouncement::new(0xBu64, eid.clone(), 1, f1_caps));
+
+        let start = Tag::parse("fork-of:R").unwrap();
+        let path = i.traverse(0xBu64, &start, EdgeKind::ForkOfParent, 0);
+        // max_depth = 0: only start.
+        assert_eq!(path.len(), 1);
+        assert_eq!(path[0].0, 0xB);
+
+        let path = i.traverse(0xBu64, &start, EdgeKind::ForkOfParent, 1);
+        // max_depth = 1: start + parent host.
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[1].0, 0xA);
+    }
+
+    /// `traverse` terminates at root when no further `fork-of:`
+    /// tag exists. Root chain has no parent link.
+    #[test]
+    fn traverse_terminates_at_root() {
+        let i = Arc::new(CapabilityIndex::new());
+        let eid = EntityId::from_bytes([0u8; 32]);
+        let r_caps = add_reserved_tag(CapabilitySet::default(), "causal:R");
+        i.index(CapabilityAnnouncement::new(0xAu64, eid.clone(), 1, r_caps));
+        let f1_caps = add_reserved_tag(CapabilitySet::default(), "causal:F1");
+        let f1_caps = add_reserved_tag(f1_caps, "fork-of:R");
+        i.index(CapabilityAnnouncement::new(0xBu64, eid.clone(), 1, f1_caps));
+
+        let start = Tag::parse("fork-of:R").unwrap();
+        let path = i.traverse(0xBu64, &start, EdgeKind::ForkOfParent, 100);
+        // Root has no fork-of, so walk halts at R's host.
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[1].0, 0xA);
+    }
+
+    /// `traverse` halts when the parent chain isn't hosted by
+    /// any indexed node — the index doesn't know who has
+    /// `causal:<unknown>`.
+    #[test]
+    fn traverse_halts_when_parent_chain_unknown() {
+        let i = Arc::new(CapabilityIndex::new());
+        let eid = EntityId::from_bytes([0u8; 32]);
+        let f1_caps = add_reserved_tag(CapabilitySet::default(), "causal:F1");
+        let f1_caps = add_reserved_tag(f1_caps, "fork-of:UNKNOWN_PARENT");
+        i.index(CapabilityAnnouncement::new(0xBu64, eid.clone(), 1, f1_caps));
+
+        let start = Tag::parse("fork-of:UNKNOWN_PARENT").unwrap();
+        let path = i.traverse(0xBu64, &start, EdgeKind::ForkOfParent, 5);
+        // Just the start — parent chain has no holder.
+        assert_eq!(path.len(), 1);
+    }
+
+    /// `nearest` ranks survivors by RTT, ascending. Candidates
+    /// with no RTT data sort to the back.
+    #[test]
+    fn nearest_ranks_by_rtt_ascending() {
+        let i = idx();
+        let pred = Predicate::exists(TagKey::new(
+            TaxonomyAxis::Hardware,
+            "memory_mb".to_string(),
+        ));
+        // 0x1111: 5 ms, 0x2222: 50 ms, 0x3333: 1 ms, 0x4444: 100 ms
+        let rtts = |id: u64| -> Option<Duration> {
+            match id {
+                0x1111 => Some(Duration::from_millis(5)),
+                0x2222 => Some(Duration::from_millis(50)),
+                0x3333 => Some(Duration::from_millis(1)),
+                0x4444 => Some(Duration::from_millis(100)),
+                _ => None,
+            }
+        };
+        let top = i.nearest(&pred, rtts, 3);
+        let ids: Vec<u64> = top.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(ids, vec![0x3333, 0x1111, 0x2222]);
+    }
+
+    /// `nearest` truncates at `n`. Pin the `n=0` case + larger-
+    /// than-corpus case.
+    #[test]
+    fn nearest_truncates_at_n() {
+        let i = idx();
+        let pred = Predicate::exists(TagKey::new(
+            TaxonomyAxis::Hardware,
+            "memory_mb".to_string(),
+        ));
+        let rtts = |_: u64| Some(Duration::from_millis(1));
+        assert!(i.nearest(&pred, &rtts, 0).is_empty());
+        // Larger-than-corpus n returns all 3 memory_mb-bearing nodes.
+        let all = i.nearest(&pred, &rtts, 100);
+        assert_eq!(all.len(), 3);
+    }
+
+    /// `nearest` candidates with no RTT data sort to the back;
+    /// ties broken by lex NodeId.
+    #[test]
+    fn nearest_unmeasured_candidates_sort_last() {
+        let i = idx();
+        let pred = Predicate::exists(TagKey::new(
+            TaxonomyAxis::Hardware,
+            "memory_mb".to_string(),
+        ));
+        // Only 0x2222 has RTT data.
+        let rtts = |id: u64| -> Option<Duration> {
+            if id == 0x2222 {
+                Some(Duration::from_millis(10))
+            } else {
+                None
+            }
+        };
+        let ranked = i.nearest(&pred, rtts, 100);
+        let ids: Vec<u64> = ranked.iter().map(|(n, _, _)| *n).collect();
+        // 0x2222 first (has RTT); rest in lex order.
+        assert_eq!(ids[0], 0x2222);
+        // Rest sorted lex.
+        assert!(ids[1] <= ids[2]);
     }
 }
