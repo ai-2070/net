@@ -929,6 +929,47 @@ int                     net_compute_outputs_push(
  * invoke this directly. */
 void                    net_compute_snapshot_bytes_free(uint8_t* ptr, size_t len);
 
+/* --- Daemon capability authoring (Phase 6 of
+ * CAPABILITY_SYSTEM_SDK_PLAN.md) ---
+ *
+ * Optional per-daemon capability declaration. Wires the
+ * substrate's `MeshDaemon::required_capabilities` /
+ * `optional_capabilities` (Phase G slice 2) through the C ABI.
+ *
+ * If the consumer never installs this dispatcher, daemons get
+ * empty cap sets — `StandardPlacement` treats them as "runs
+ * anywhere" and capability-driven placement decisions don't
+ * select for them. Consumers that DO install it can declare
+ * per-daemon caps so the in-tree axes (resource, intent,
+ * scope) and the hard-required check have something to work
+ * against.
+ *
+ * Wire shape: substrate calls back per `GoBridge` construction
+ * (both initial spawn AND migration-target reconstruction),
+ * passing the `daemon_id`. Consumer writes JSON-encoded
+ * `CapabilitySet`s ({tags: [...], metadata: {k:v}}) to the
+ * out-params. NULL out-pointer / zero len means "no caps
+ * declared for this side"; either side may be omitted
+ * independently. Buffers MUST be allocated via `C.malloc` /
+ * `libc::malloc` so Rust can release them via `libc::free`
+ * after parsing.
+ *
+ * Idempotent: invoked once per bridge construction, parsed once
+ * into a `CapabilitySet`, stored on the bridge for the daemon's
+ * lifetime. No re-call on event processing.
+ */
+
+typedef int (*net_compute_daemon_caps_fn)(
+    uint64_t daemon_id,
+    char** out_required_json, size_t* out_required_len,
+    char** out_optional_json, size_t* out_optional_len);
+
+/* Install the optional daemon-caps dispatcher. First-call-wins
+ * (matches `_set_dispatcher` semantics). Returns NET_COMPUTE_OK
+ * on success, NET_COMPUTE_ERR_NULL on NULL pointer. */
+int                     net_compute_set_daemon_caps_dispatcher(
+    net_compute_daemon_caps_fn dispatcher);
+
 /* --- Custom PlacementFilter callback (Phase 7 of
  * CAPABILITY_SYSTEM_SDK_PLAN.md) ---
  *

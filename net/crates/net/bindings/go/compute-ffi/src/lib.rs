@@ -514,10 +514,7 @@ pub extern "C" fn net_compute_register_factory_with_func(
                 reason,
             ));
         }
-        Box::new(GoBridge {
-            name: kind_for_closure.clone(),
-            daemon_id,
-        })
+        Box::new(GoBridge::build(kind_for_closure.clone(), daemon_id))
     };
 
     if let Err(e) = h.inner.register_factory(&kind, closure) {
@@ -650,6 +647,162 @@ pub extern "C" fn net_compute_set_dispatcher(
 }
 
 // =========================================================================
+// SDK Phase 6 — daemon capability authoring (optional dispatcher)
+//
+// Wires the substrate's `MeshDaemon::required_capabilities` /
+// `optional_capabilities` (Phase G slice 2) through the C ABI.
+// Optional — if the consumer never installs this dispatcher,
+// daemons get the trait's default empty `CapabilitySet`s and
+// `StandardPlacement` treats them as "runs anywhere" (current
+// behavior). Consumers that DO install it can declare per-
+// daemon capabilities for capability-driven placement.
+//
+// Wire shape: substrate calls back per `GoBridge` construction
+// (both initial spawn AND migration-target reconstruction),
+// passing the `daemon_id`. Consumer writes JSON-encoded
+// `CapabilitySet`s ({tags: [...], metadata: {k:v}}) to the out-
+// params. NULL out-pointer / zero len means "no caps declared
+// for this side"; either side may be omitted independently.
+// Buffers MUST be allocated via `C.malloc` / `libc::malloc` so
+// Rust can release them via `libc::free` after parsing.
+//
+// Idempotent: the dispatcher is invoked once per bridge
+// construction, parsed once into a `CapabilitySet`, stored on
+// the bridge for the daemon's lifetime. No re-call on event
+// processing.
+// =========================================================================
+
+/// C-ABI: the consumer side declares the per-daemon capability
+/// sets. Called once per `GoBridge` construction; the bridge
+/// stores the parsed sets and uses them to override
+/// `MeshDaemon::required_capabilities` /
+/// `optional_capabilities` for the daemon's lifetime.
+///
+/// Out-params:
+///
+///   - `out_required_json` / `out_required_len`: `*out_required_json`
+///     points at a heap-allocated UTF-8 buffer of length
+///     `*out_required_len` carrying the JSON-encoded `CapabilitySet`,
+///     OR is left NULL with `*out_required_len == 0` for "no
+///     required caps declared".
+///   - `out_optional_json` / `out_optional_len`: same shape for
+///     the optional cap set.
+///
+/// Allocation contract: the consumer allocates via `C.malloc` /
+/// `libc::malloc`; Rust calls `libc::free` after parsing. Returning
+/// stack-allocated or static buffers is undefined behavior.
+///
+/// Return code: `0` on success, non-zero is logged and treated as
+/// "no caps declared" (back-compat with consumers that don't yet
+/// implement the dispatcher).
+pub type DaemonCapsFn = unsafe extern "C" fn(
+    daemon_id: u64,
+    out_required_json: *mut *mut c_char,
+    out_required_len: *mut usize,
+    out_optional_json: *mut *mut c_char,
+    out_optional_len: *mut usize,
+) -> c_int;
+
+static DAEMON_CAPS_DISPATCHER: OnceLock<DaemonCapsFn> = OnceLock::new();
+
+/// Install the optional daemon-caps dispatcher. If unset, all
+/// `GoBridge` daemons advertise empty cap sets (back-compat with
+/// pre-Phase-6 consumers).
+///
+/// First-call-wins (`OnceLock` semantics) — same idiom as
+/// `net_compute_set_dispatcher` and
+/// `net_compute_set_placement_filter_dispatcher`.
+///
+/// # Safety
+///
+/// `f` MUST have C linkage, MUST live for the remaining lifetime
+/// of the process, and MUST follow the [`DaemonCapsFn`] contract.
+/// Passing NULL returns `NET_COMPUTE_ERR_NULL`.
+#[no_mangle]
+pub extern "C" fn net_compute_set_daemon_caps_dispatcher(
+    f: Option<DaemonCapsFn>,
+) -> c_int {
+    let Some(f) = f else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let _ = DAEMON_CAPS_DISPATCHER.set(f);
+    NET_COMPUTE_OK
+}
+
+/// Internal helper: fetch the per-daemon cap sets via the
+/// installed dispatcher. Returns `(required, optional)` — both
+/// default-empty when no dispatcher is installed, when the
+/// dispatcher returns a non-zero code, or when either side
+/// returns a NULL pointer / zero length.
+///
+/// Parses the consumer's JSON via `serde_json` against the
+/// substrate's `CapabilitySet` wire shape (`{tags, metadata}`).
+/// Parse failures log + fall back to empty.
+fn fetch_daemon_caps(daemon_id: u64) -> (
+    ::net::adapter::net::behavior::capability::CapabilitySet,
+    ::net::adapter::net::behavior::capability::CapabilitySet,
+) {
+    use ::net::adapter::net::behavior::capability::CapabilitySet;
+    let empty_pair = || (CapabilitySet::default(), CapabilitySet::default());
+
+    let Some(dispatcher) = DAEMON_CAPS_DISPATCHER.get() else {
+        return empty_pair();
+    };
+
+    let mut req_ptr: *mut c_char = std::ptr::null_mut();
+    let mut req_len: usize = 0;
+    let mut opt_ptr: *mut c_char = std::ptr::null_mut();
+    let mut opt_len: usize = 0;
+    let code = unsafe {
+        (dispatcher)(
+            daemon_id,
+            &mut req_ptr,
+            &mut req_len,
+            &mut opt_ptr,
+            &mut opt_len,
+        )
+    };
+    if code != NET_COMPUTE_OK {
+        eprintln!(
+            "net-compute-ffi: daemon-caps dispatcher returned {code} for daemon_id {daemon_id:#x}; using empty caps"
+        );
+        return empty_pair();
+    }
+
+    // Parse a single side. NULL pointer / zero length → empty
+    // (no caps declared). On parse failure, log + fall back.
+    let parse_side = |label: &str, ptr: *mut c_char, len: usize| -> CapabilitySet {
+        if ptr.is_null() || len == 0 {
+            return CapabilitySet::default();
+        }
+        // SAFETY: the consumer's contract says `ptr` points at
+        // `len` bytes of UTF-8 JSON it allocated via
+        // `C.malloc` / `libc::malloc`. We free via `libc::free`
+        // after parsing.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        let parsed = match std::str::from_utf8(bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str::<CapabilitySet>(s).map_err(|e| e.to_string()))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "net-compute-ffi: daemon-caps {label} JSON parse failed for daemon_id {daemon_id:#x}: {e}; using empty",
+                );
+                CapabilitySet::default()
+            }
+        };
+        // Free the consumer's malloc'd buffer.
+        unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+        parsed
+    };
+
+    let required = parse_side("required", req_ptr, req_len);
+    let optional = parse_side("optional", opt_ptr, opt_len);
+    (required, optional)
+}
+
+// =========================================================================
 // OutputsVec — growable container for `Vec<Bytes>` populated by Go
 // =========================================================================
 
@@ -725,10 +878,35 @@ pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, len: usize) {
 /// and the kind name for debug. `MeshDaemon` impls invoke the
 /// registered dispatcher trampolines with this ID.
 ///
+/// Phase 6 of `CAPABILITY_SYSTEM_SDK_PLAN.md`: holds the
+/// `required_capabilities` / `optional_capabilities`
+/// `CapabilitySet`s declared by the consumer at bridge
+/// construction (via [`DaemonCapsFn`]). Empty defaults when no
+/// dispatcher is installed; back-compat with pre-Phase-6
+/// consumers.
+///
 /// Drop triggers [`FreeFn`] so the Go side can release its entry.
 struct GoBridge {
     name: String,
     daemon_id: u64,
+    required_capabilities: ::net::adapter::net::behavior::capability::CapabilitySet,
+    optional_capabilities: ::net::adapter::net::behavior::capability::CapabilitySet,
+}
+
+impl GoBridge {
+    /// Construct a bridge by querying the optional Phase 6 caps
+    /// dispatcher. Used at both the spawn path and the
+    /// migration-target factory closure so the same caps shape
+    /// applies on reconstruction.
+    fn build(name: String, daemon_id: u64) -> Self {
+        let (required, optional) = fetch_daemon_caps(daemon_id);
+        Self {
+            name,
+            daemon_id,
+            required_capabilities: required,
+            optional_capabilities: optional,
+        }
+    }
 }
 
 impl Drop for GoBridge {
@@ -746,6 +924,21 @@ impl MeshDaemon for GoBridge {
 
     fn requirements(&self) -> CapabilityFilter {
         CapabilityFilter::default()
+    }
+
+    /// Phase 6 — declared via the optional caps dispatcher; empty
+    /// default when no dispatcher is installed.
+    fn required_capabilities(
+        &self,
+    ) -> ::net::adapter::net::behavior::capability::CapabilitySet {
+        self.required_capabilities.clone()
+    }
+
+    /// Phase 6 — same shape as `required_capabilities`.
+    fn optional_capabilities(
+        &self,
+    ) -> ::net::adapter::net::behavior::capability::CapabilitySet {
+        self.optional_capabilities.clone()
     }
 
     fn process(&mut self, event: &CausalEvent) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
@@ -928,10 +1121,7 @@ pub extern "C" fn net_compute_spawn(
         cfg.max_log_entries = max_log_entries;
     }
 
-    let bridge = Box::new(GoBridge {
-        name: kind.clone(),
-        daemon_id,
-    });
+    let bridge = Box::new(GoBridge::build(kind.clone(), daemon_id));
     // kind_factory for migration-target reconstruction. Uses a
     // loud-failure bridge: if a migration lands here before the
     // caller has also installed `RegisterFactoryFunc` for this
@@ -1115,10 +1305,7 @@ pub extern "C" fn net_compute_spawn_from_snapshot(
         cfg.max_log_entries = max_log_entries;
     }
 
-    let bridge = Box::new(GoBridge {
-        name: kind.clone(),
-        daemon_id,
-    });
+    let bridge = Box::new(GoBridge::build(kind.clone(), daemon_id));
     // Same loud-failure fallback rationale as the plain-spawn
     // path above — see the comment there.
     let kind_for_fallback = kind.clone();
