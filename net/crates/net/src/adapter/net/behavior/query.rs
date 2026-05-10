@@ -421,6 +421,16 @@ impl CapabilityQuery for CapabilityIndex {
             return path;
         }
 
+        // CR-7: cycle detection. A malformed (or malicious)
+        // capability set can produce `fork-of:` tags that loop
+        // (`A → B → A`); without a visited set we'd oscillate up
+        // to `max_depth` hops and emit duplicate `(node_id, tag)`
+        // entries that misrepresent the lineage. Tracking visited
+        // nodes is enough — each node hosts at most one parent
+        // edge of a given kind, so a repeated node is the cycle.
+        let mut visited: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        visited.insert(start_node);
+
         let mut current_tag = start_tag.clone();
         for _ in 0..max_depth {
             // Extract the `(prefix, body)` of the current edge tag.
@@ -441,6 +451,13 @@ impl CapabilityQuery for CapabilityIndex {
             let Some(parent_node) = parent_host else {
                 break; // no host of the parent chain known to this index.
             };
+
+            // Cycle: re-entered a node we've already recorded. Stop
+            // walking before duplicating the entry. The lineage we
+            // emit so far is well-formed; the cycle is silent.
+            if !visited.insert(parent_node) {
+                break;
+            }
 
             // Record the parent host, then look at its `fork-of:`
             // tag (if any) to continue walking up.
@@ -835,6 +852,48 @@ mod tests {
         // Root has no fork-of, so walk halts at R's host.
         assert_eq!(path.len(), 2);
         assert_eq!(path[1].0, 0xA);
+    }
+
+    /// CR-7: `traverse` halts on cycles instead of oscillating up
+    /// to `max_depth` hops. A malformed (or malicious) capability
+    /// set where two nodes' `fork-of:` tags point at each other's
+    /// chains used to flip back and forth between them, emitting
+    /// a path of `max_depth + 1` duplicate `(node_id, tag)` entries
+    /// that misrepresent the lineage.
+    #[test]
+    fn traverse_halts_on_fork_of_cycle() {
+        let i = Arc::new(CapabilityIndex::new());
+        let eid = EntityId::from_bytes([0u8; 32]);
+        // Mutual fork: node A hosts chain CA but claims fork-of:CB;
+        // node B hosts chain CB but claims fork-of:CA. Walk starts
+        // at A's fork-of:CB → finds CB on B → reads B's fork-of:CA
+        // → finds CA on A → BUG: re-enters A. Fix: detect on
+        // re-entry and stop.
+        let a_caps = add_reserved_tag(CapabilitySet::default(), "causal:CA");
+        let a_caps = add_reserved_tag(a_caps, "fork-of:CB");
+        i.index(CapabilityAnnouncement::new(0xAu64, eid.clone(), 1, a_caps));
+        let b_caps = add_reserved_tag(CapabilitySet::default(), "causal:CB");
+        let b_caps = add_reserved_tag(b_caps, "fork-of:CA");
+        i.index(CapabilityAnnouncement::new(0xBu64, eid.clone(), 1, b_caps));
+
+        let start = Tag::parse("fork-of:CB").unwrap();
+        let path = i.traverse(0xAu64, &start, EdgeKind::ForkOfParent, 64);
+        // With cycle detection: start on A, walk to B, would
+        // re-enter A → halt. Three entries max.
+        assert!(
+            path.len() <= 3,
+            "cycle did not terminate; path has {} entries: {:?}",
+            path.len(),
+            path
+        );
+        // No duplicate node ids.
+        let mut seen = std::collections::BTreeSet::new();
+        for (id, _) in &path {
+            assert!(
+                seen.insert(*id),
+                "node 0x{id:X} visited twice in path: {path:?}"
+            );
+        }
     }
 
     /// `traverse` halts when the parent chain isn't hosted by
