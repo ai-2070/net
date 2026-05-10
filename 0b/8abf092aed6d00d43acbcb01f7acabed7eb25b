@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/behavior/placement.rs
+  s_9163f300668f8b::t_c5d462e8989977 3084-3139
+  s_9163f300668f8b::t_3f9bcd15ba6ecb 487-504
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "0b8abf092aed6d00d43acbcb01f7acabed7eb25b",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
