@@ -707,11 +707,43 @@ impl<'a> StandardPlacement<'a> {
         1.0
     }
 
-    fn score_resource_axis(&self, _target_caps: &CapabilitySet, _artifact: &Artifact<'_>) -> f32 {
-        // Stub: resource axis always satisfied. Slice 5 reads
-        // `hardware.*` (Compute) / `dataforts.free_storage_gb`
-        // (Storage) tags from target caps and computes a fit score.
-        1.0
+    /// Phase F slice 5 resource axis. Graded fit scoring (unlike
+    /// the binary axes shipped earlier) — a node with more
+    /// resources scores higher than one with less. The score is
+    /// soft-saturating per `value / (value + reference)`: bounded
+    /// in `[0.0, 1.0]`, half at the reference value, asymptoting
+    /// to 1.0 as resource grows.
+    ///
+    /// Branches on `resource_axis`:
+    ///
+    /// - `Compute` — averages per-component scores for
+    ///   `hardware.cpu_cores` (reference 8 cores),
+    ///   `hardware.memory_mb` (reference 16 GB),
+    ///   `hardware.gpu.vram_mb` (reference 16 GB VRAM). Components
+    ///   that the target doesn't advertise are skipped, and the
+    ///   average is over the components that DO have data.
+    /// - `Storage` — single-component score from
+    ///   `dataforts.capacity_mb` (reference 1 TB).
+    /// - `Both` — equal-weighted mean of `Compute` + `Storage`
+    ///   scores (each computed independently).
+    ///
+    /// **Permissive when no data.** If the target advertises none
+    /// of the relevant numeric tags, the axis returns `1.0` —
+    /// "can't measure, default permissive" semantics matching the
+    /// proximity axis. Operators who want strict resource enforcement
+    /// declare specific minimums via the daemon's required caps
+    /// (which the hard-constraint check at the top of
+    /// `placement_score` enforces).
+    fn score_resource_axis(&self, target_caps: &CapabilitySet, _artifact: &Artifact<'_>) -> f32 {
+        match self.resource_axis {
+            ResourceAxis::Compute => score_compute_axis(target_caps),
+            ResourceAxis::Storage => score_storage_axis(target_caps),
+            ResourceAxis::Both => {
+                let c = score_compute_axis(target_caps);
+                let s = score_storage_axis(target_caps);
+                (c + s) / 2.0
+            }
+        }
     }
 
     fn score_anti_affinity_axis(&self, _target: &NodeId) -> f32 {
@@ -756,6 +788,78 @@ fn artifact_intent<'a>(
     intent_key: &str,
 ) -> Option<&'a str> {
     artifact_metadata(artifact, intent_key)
+}
+
+/// Find an `<axis>.<key>=<value>` tag on the target and parse its
+/// value as `f64`. Returns `None` if the tag is absent, the tag
+/// has no value (presence-form), or the value doesn't parse.
+///
+/// Used by the resource axis (slice 5) to read numeric capacity
+/// declarations off the target's `CapabilitySet`.
+fn target_axis_value_numeric(
+    caps: &CapabilitySet,
+    axis: TaxonomyAxis,
+    key: &str,
+) -> Option<f64> {
+    caps.tags.iter().find_map(|t| match t {
+        Tag::AxisValue {
+            axis: a,
+            key: k,
+            value,
+            ..
+        } if *a == axis && k == key => value.parse::<f64>().ok(),
+        _ => None,
+    })
+}
+
+/// Soft-saturating score: `value / (value + reference)`.
+/// Bounded in `[0.0, 1.0]`; half at `value == reference`;
+/// asymptotes to 1.0 as value grows. Returns 0.0 for non-positive
+/// inputs (defensive against malformed numeric tags).
+fn saturating_score(value: f32, reference: f32) -> f32 {
+    if value <= 0.0 || reference <= 0.0 {
+        return 0.0;
+    }
+    value / (value + reference)
+}
+
+/// Compute the Compute resource score: averages saturating
+/// per-component scores for the three core compute resources.
+/// Returns 1.0 if the target advertises none of them
+/// ("permissive when no data").
+fn score_compute_axis(caps: &CapabilitySet) -> f32 {
+    let mut sum = 0.0_f32;
+    let mut count = 0u32;
+    if let Some(c) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "cpu_cores") {
+        // Reference: 8 cores — half at 8, → 1 as cores grow.
+        sum += saturating_score(c as f32, 8.0);
+        count += 1;
+    }
+    if let Some(m) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "memory_mb") {
+        // Reference: 16 GB.
+        sum += saturating_score(m as f32, 16_384.0);
+        count += 1;
+    }
+    if let Some(v) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "gpu.vram_mb") {
+        // Reference: 16 GB VRAM.
+        sum += saturating_score(v as f32, 16_384.0);
+        count += 1;
+    }
+    if count == 0 {
+        return 1.0;
+    }
+    sum / count as f32
+}
+
+/// Compute the Storage resource score: saturating score on
+/// `dataforts.capacity_mb`. Returns 1.0 if the tag is absent.
+fn score_storage_axis(caps: &CapabilitySet) -> f32 {
+    if let Some(s) = target_axis_value_numeric(caps, TaxonomyAxis::Dataforts, "capacity_mb") {
+        // Reference: 1 TB.
+        saturating_score(s as f32, 1_000_000.0)
+    } else {
+        1.0
+    }
 }
 
 /// Does the target host the named chain? Walks the target's
@@ -2193,6 +2297,201 @@ mod tests {
             .placement_score(&0x1111, &artifact)
             .expect("hard-constraint check passes");
         assert_eq!(score, 0.0);
+    }
+
+    // ====================================================================
+    // Phase F slice 5 — resource axis
+    // ====================================================================
+
+    /// Target with no relevant tags → 1.0 (axis can't measure;
+    /// permissive default). Pin: pre-slice-5 default config /
+    /// empty-target combination scores 1.0 — backward-compat with
+    /// the stub.
+    #[test]
+    fn resource_axis_compute_no_data_returns_one() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_resource_axis(ResourceAxis::Compute);
+        let target_caps = empty_caps();
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        assert_eq!(placement.score_resource_axis(&target_caps, &artifact), 1.0);
+    }
+
+    /// `Compute` axis with cpu_cores at the reference (8) →
+    /// score 0.5 (saturating function half at the reference).
+    #[test]
+    fn resource_axis_compute_cpu_at_reference_scores_half() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_resource_axis(ResourceAxis::Compute);
+        let target_caps = empty_caps()
+            .add_tag("hardware.cpu_cores=8");
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        let score = placement.score_resource_axis(&target_caps, &artifact);
+        assert!(
+            (score - 0.5).abs() < 1e-6,
+            "8 cores at 8-reference scores 0.5; got {score}"
+        );
+    }
+
+    /// More resources score higher than fewer. Pin the monotonic
+    /// property the axis exists to provide.
+    #[test]
+    fn resource_axis_compute_monotonic_in_capacity() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_resource_axis(ResourceAxis::Compute);
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+
+        let small = empty_caps()
+            .add_tag("hardware.cpu_cores=4");
+        let large = empty_caps()
+            .add_tag("hardware.cpu_cores=64");
+
+        let small_score = placement.score_resource_axis(&small, &artifact);
+        let large_score = placement.score_resource_axis(&large, &artifact);
+        assert!(
+            large_score > small_score,
+            "64-core node ({large_score}) must score higher than 4-core ({small_score})"
+        );
+    }
+
+    /// Axis averages over the components that have data, ignores
+    /// missing components. Pin: a node with cpu + memory + vram
+    /// declared scores against all three; a node with only cpu
+    /// scores against just cpu.
+    #[test]
+    fn resource_axis_compute_averages_present_components() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_resource_axis(ResourceAxis::Compute);
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+
+        // All three: cpu_cores=8 (→ 0.5), memory_mb=16384 (→ 0.5),
+        // vram_mb=16384 (→ 0.5). Average: 0.5.
+        let three_components = empty_caps()
+            .add_tag("hardware.cpu_cores=8")
+            .add_tag("hardware.memory_mb=16384")
+            .add_tag("hardware.gpu.vram_mb=16384");
+        let s_three = placement.score_resource_axis(&three_components, &artifact);
+        assert!((s_three - 0.5).abs() < 1e-6, "3-comp avg got {s_three}, want 0.5");
+
+        // CPU only at the reference: avg = 0.5.
+        let cpu_only = empty_caps()
+            .add_tag("hardware.cpu_cores=8");
+        let s_one = placement.score_resource_axis(&cpu_only, &artifact);
+        assert!((s_one - 0.5).abs() < 1e-6, "1-comp got {s_one}, want 0.5");
+    }
+
+    /// `Storage` axis: `dataforts.capacity_mb` at the reference
+    /// (1 TB) → 0.5.
+    #[test]
+    fn resource_axis_storage_at_reference_scores_half() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_resource_axis(ResourceAxis::Storage);
+        let target_caps = empty_caps().add_tag("dataforts.capacity_mb=1000000");
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        let score = placement.score_resource_axis(&target_caps, &artifact);
+        assert!(
+            (score - 0.5).abs() < 1e-6,
+            "1 TB at 1 TB reference scores 0.5; got {score}"
+        );
+    }
+
+    /// `Storage` axis: target without `capacity_mb` tag → 1.0
+    /// (permissive when no data).
+    #[test]
+    fn resource_axis_storage_no_data_returns_one() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_resource_axis(ResourceAxis::Storage);
+        let target_caps = empty_caps();
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        assert_eq!(placement.score_resource_axis(&target_caps, &artifact), 1.0);
+    }
+
+    /// `Both` axis: equal-weighted mean of compute + storage
+    /// scores. Pin against synthetic inputs that produce
+    /// known scores: compute at half (8 cores) + storage no-data
+    /// (1.0) → mean (0.5 + 1.0) / 2 = 0.75.
+    #[test]
+    fn resource_axis_both_averages_compute_and_storage() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_resource_axis(ResourceAxis::Both);
+        let target_caps = empty_caps()
+            .add_tag("hardware.cpu_cores=8");
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        let score = placement.score_resource_axis(&target_caps, &artifact);
+        assert!(
+            (score - 0.75).abs() < 1e-6,
+            "Both: (compute 0.5 + storage 1.0) / 2 = 0.75; got {score}"
+        );
+    }
+
+    /// Defensive: a malformed numeric tag (non-parseable value)
+    /// is silently treated as "no data" — doesn't blow up the
+    /// score with NaN.
+    #[test]
+    fn resource_axis_compute_malformed_value_treated_as_no_data() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_resource_axis(ResourceAxis::Compute);
+        let target_caps = empty_caps()
+            .add_tag("hardware.cpu_cores=lots");
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        let score = placement.score_resource_axis(&target_caps, &artifact);
+        // No parseable component → 1.0.
+        assert_eq!(score, 1.0);
+    }
+
+    /// End-to-end: low resource score multiplies through
+    /// the composition. Target with cpu=2 (~0.2) → final score
+    /// near 0.2 (other axes all 1.0).
+    #[test]
+    fn resource_axis_low_score_multiplies_through_composition() {
+        let target_caps = empty_caps()
+            .add_tag("hardware.cpu_cores=2");
+        let index = {
+            let i = CapabilityIndex::new();
+            let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+            let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
+            i.index(ad);
+            i
+        };
+        let placement = StandardPlacement::new(&index)
+            .with_resource_axis(ResourceAxis::Compute);
+
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+
+        let score = placement
+            .placement_score(&0x1111, &artifact)
+            .expect("hard-constraint check passes");
+        // 2 / (2 + 8) = 0.2 — exactly the resource axis score, no
+        // other axes contribute (all 1.0).
+        assert!(
+            (score - 0.2).abs() < 1e-6,
+            "2-core compute score 0.2 multiplies to final; got {score}"
+        );
     }
 
     /// End-to-end: a soft-preference penalty multiplies through
