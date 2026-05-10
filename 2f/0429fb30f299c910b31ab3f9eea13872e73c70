@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/behavior/predicate.rs
+  s_d1b11a1287c170::t_ba718204d41d8e 3097-3101,3110-3208
+  s_d1b11a1287c170::t_74eadb68bed8fd 1262-1276
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_d1b11a1287c170::t_549beaff2b15c6 2614-2631
+  s_d1b11a1287c170::t_f02e7230b00cc8 2763-2783
+  s_d1b11a1287c170::t_4445fa3bc2b4e1 3514-3598
+  s_d1b11a1287c170::t_31c054ca949337 2547-2558
+  s_d1b11a1287c170::t_489bc185da4bc9 2341-2348,2366
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "2f0429fb30f299c910b31ab3f9eea13872e73c70",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
