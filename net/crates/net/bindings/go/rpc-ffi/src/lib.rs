@@ -1117,6 +1117,82 @@ pub extern "C" fn net_rpc_call_streaming(
     }
 }
 
+/// N-16: cancellable variant of [`net_rpc_call_streaming`].
+/// Identical contract; adds a `cancel_token` parameter so the
+/// construction `block_on` (which awaits the peer's initial-frame
+/// ACK) can be aborted by [`net_rpc_cancel_call`] from another
+/// thread. The unary [`net_rpc_call_cancellable`] path got this
+/// discipline as CR-13; the streaming variant lost the cancel hook
+/// because [`net_rpc_stream_close`] only takes effect AFTER the
+/// stream handle is constructed — a Go consumer's `ctx.Done()`
+/// watcher has nothing to call into during the construction
+/// window. `cancel_token == 0` short-circuits to the original
+/// non-cancellable path (no registry overhead).
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_streaming_cancellable(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    stream_window: u32,
+    cancel_token: u64,
+    out_stream: *mut *mut RpcStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    let node = h.node.clone();
+
+    let result = run_cancellable(cancel_token, async move {
+        node.call_streaming(target_node_id, &service, req_bytes, opts)
+            .await
+    });
+
+    match result {
+        Ok(Ok(stream)) => {
+            let call_id = stream.call_id();
+            let boxed = Box::new(RpcStreamHandleC {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_stream = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(
+                out_err,
+                "cancelled: streaming call cancelled by caller before construction".into(),
+            );
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
 /// Block until the next chunk arrives, OR the stream terminates,
 /// OR a mid-stream error fires.
 ///
@@ -1454,6 +1530,83 @@ pub extern "C" fn net_rpc_call_streaming_with_headers(
         }
         Err(e) => {
             write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// N-16: cancellable variant of
+/// [`net_rpc_call_streaming_with_headers`]. Same cancellation
+/// contract as [`net_rpc_call_streaming_cancellable`]: routes the
+/// construction `block_on` through [`run_cancellable`] so an
+/// in-flight [`net_rpc_cancel_call`] aborts mid-construction.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    stream_window: u32,
+    cancel_token: u64,
+    headers_ptr: *const NetRpcHeader,
+    header_count: usize,
+    out_stream: *mut *mut RpcStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+        write_err(out_err, "request header name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    opts.request_headers = headers;
+    let node = h.node.clone();
+
+    let result = run_cancellable(cancel_token, async move {
+        node.call_streaming(target_node_id, &service, req_bytes, opts)
+            .await
+    });
+
+    match result {
+        Ok(Ok(stream)) => {
+            let call_id = stream.call_id();
+            let boxed = Box::new(RpcStreamHandleC {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_stream = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(
+                out_err,
+                "cancelled: streaming call cancelled by caller before construction".into(),
+            );
             NET_RPC_ERR_CALL_FAILED
         }
     }

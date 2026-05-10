@@ -331,6 +331,40 @@ int net_rpc_call_streaming_with_headers(
     RpcStreamHandleC** out_stream,
     char** out_err);
 
+/* N-16: cancellable variant of net_rpc_call_streaming. The
+ * construction block_on (awaiting the peer's initial-frame ACK)
+ * runs under a cancel_token-keyed AbortHandle, so a parallel
+ * net_rpc_cancel_call(cancel_token) aborts mid-construction
+ * rather than waiting for the stream handle to materialize. The
+ * unary path got this discipline as CR-13; this is the streaming
+ * sibling. cancel_token == 0 short-circuits to the original
+ * non-cancellable path. */
+int net_rpc_call_streaming_cancellable(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms,
+    uint32_t stream_window,
+    uint64_t cancel_token,
+    RpcStreamHandleC** out_stream,
+    char** out_err);
+
+/* N-16: cancellable variant of net_rpc_call_streaming_with_headers.
+ * Same cancellation contract as net_rpc_call_streaming_cancellable. */
+int net_rpc_call_streaming_with_headers_cancellable(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms,
+    uint32_t stream_window,
+    uint64_t cancel_token,
+    const net_rpc_header_t* headers_ptr,
+    size_t header_count,
+    RpcStreamHandleC** out_stream,
+    char** out_err);
+
 /* All node ids advertising `nrpc:<service>` in the local
  * capability index. On success writes a heap-allocated `u64`
  * array of length `*out_count` to `*out_ptr`; caller frees via
