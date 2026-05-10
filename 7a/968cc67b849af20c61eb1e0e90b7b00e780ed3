@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/behavior/placement.rs
+  s_e3c24456981f5d::t_52680eae6e9352 683-691,693
+  s_e3c24456981f5d::t_5f01d175b801af 1984-1990,1992,2005-2009
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "7a968cc67b849af20c61eb1e0e90b7b00e780ed3",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
