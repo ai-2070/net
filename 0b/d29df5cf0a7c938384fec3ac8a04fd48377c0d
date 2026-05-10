@@ -1,0 +1,25 @@
+net/crates/net/sdk/README.md
+  s_d1b11a1287c170::t_0febaa37d31c44 446-513
+net/crates/net/docs/CAPABILITY_SYSTEM_MIGRATION.md
+  s_d1b11a1287c170::t_da392570b8b264 1-402
+net/crates/net/sdk-py/README.md
+  s_d1b11a1287c170::t_6c628a7a11eb08 624-683
+net/crates/net/sdk-ts/README.md
+  s_d1b11a1287c170::t_dc048eee789927 438-502
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "0bd29df5cf0a7c938384fec3ac8a04fd48377c0d",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
