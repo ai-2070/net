@@ -26,7 +26,7 @@ package net
 // params) that the dispatcher typedef expects; they thunk into
 // the `//export`ed Go functions below which cgo generates with
 // non-const pointer params.
-extern int bridgeProcess(uint64_t daemon_id, uint32_t origin_hash, uint64_t sequence,
+extern int bridgeProcess(uint64_t daemon_id, uint64_t origin_hash, uint64_t sequence,
                          const uint8_t* payload, size_t payload_len,
                          net_compute_outputs_t* outputs);
 extern int bridgeSnapshot(uint64_t daemon_id, uint8_t** out_ptr, size_t* out_len);
@@ -74,8 +74,8 @@ type DaemonRestorer interface {
 
 // CausalEvent is the event delivered to a daemon's `Process`.
 type CausalEvent struct {
-	// OriginHash is the 32-bit hash of the emitting entity.
-	OriginHash uint32
+	// OriginHash is the 64-bit hash of the emitting entity.
+	OriginHash uint64
 	// Sequence is the emitter's causal-chain sequence number.
 	Sequence uint64
 	// Payload is the opaque event body. Treat as borrowed — copy
@@ -238,7 +238,7 @@ func unregisterDaemon(id uint64) {
 // -------------------------------------------------------------------------
 
 //export goComputeProcess
-func goComputeProcess(daemonID C.uint64_t, originHash C.uint32_t, sequence C.uint64_t,
+func goComputeProcess(daemonID C.uint64_t, originHash C.uint64_t, sequence C.uint64_t,
 	payloadPtr *C.uint8_t, payloadLen C.size_t, outputs *C.net_compute_outputs_t,
 ) C.int {
 	d := lookupDaemon(uint64(daemonID))
@@ -253,7 +253,7 @@ func goComputeProcess(daemonID C.uint64_t, originHash C.uint32_t, sequence C.uin
 		payload = C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen))
 	}
 	outs, err := d.Process(CausalEvent{
-		OriginHash: uint32(originHash),
+		OriginHash: uint64(originHash),
 		Sequence:   uint64(sequence),
 		Payload:    payload,
 	})

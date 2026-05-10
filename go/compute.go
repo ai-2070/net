@@ -341,17 +341,21 @@ func (rt *DaemonRuntime) Close() {
 }
 
 // DaemonHandle is returned by Spawn. Identifies a running daemon
-// by its 32-bit origin_hash. Cloning the Go struct shares the
+// by its 64-bit origin_hash. Cloning the Go struct shares the
 // native pointer — the finalizer runs on the last reference.
+//
+// Pre-2026-05-11 the origin_hash was uint32, truncating the upper
+// 32 bits of the canonical u64 value the substrate emits. The Go
+// header was widened to match.
 type DaemonHandle struct {
 	handle     *C.net_compute_daemon_handle_t
-	originHash uint32
+	originHash uint64
 	entityID   [32]byte
 	mu         sync.RWMutex
 }
 
-// OriginHash returns the daemon's stable 32-bit origin_hash.
-func (h *DaemonHandle) OriginHash() uint32 {
+// OriginHash returns the daemon's stable 64-bit origin_hash.
+func (h *DaemonHandle) OriginHash() uint64 {
 	return h.originHash
 }
 
@@ -469,7 +473,7 @@ func (rt *DaemonRuntime) Spawn(
 
 	var entityID [32]byte
 	_ = C.net_compute_daemon_handle_entity_id(nativeHandle, (*C.uint8_t)(unsafe.Pointer(&entityID[0])))
-	originHash := uint32(C.net_compute_daemon_handle_origin_hash(nativeHandle))
+	originHash := uint64(C.net_compute_daemon_handle_origin_hash(nativeHandle))
 
 	h := &DaemonHandle{
 		handle:     nativeHandle,
@@ -482,14 +486,14 @@ func (rt *DaemonRuntime) Spawn(
 
 // Stop removes the daemon identified by originHash from the
 // runtime's registry. Idempotent during ShuttingDown.
-func (rt *DaemonRuntime) Stop(originHash uint32) error {
+func (rt *DaemonRuntime) Stop(originHash uint64) error {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	if rt.handle == nil {
 		return ErrRuntimeShutDown
 	}
 	var errOut *C.char
-	code := C.net_compute_runtime_stop(rt.handle, C.uint32_t(originHash), &errOut)
+	code := C.net_compute_runtime_stop(rt.handle, C.uint64_t(originHash), &errOut)
 	return computeErr(code, errOut)
 }
 
@@ -500,7 +504,7 @@ func (rt *DaemonRuntime) Stop(originHash uint32) error {
 //
 // The returned bytes round-trip through SpawnFromSnapshot; callers
 // treat the slice as opaque.
-func (rt *DaemonRuntime) Snapshot(originHash uint32) ([]byte, error) {
+func (rt *DaemonRuntime) Snapshot(originHash uint64) ([]byte, error) {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	if rt.handle == nil {
@@ -508,7 +512,7 @@ func (rt *DaemonRuntime) Snapshot(originHash uint32) ([]byte, error) {
 	}
 	var outputs *C.net_compute_outputs_t
 	var errOut *C.char
-	code := C.net_compute_runtime_snapshot(rt.handle, C.uint32_t(originHash), &outputs, &errOut)
+	code := C.net_compute_runtime_snapshot(rt.handle, C.uint64_t(originHash), &outputs, &errOut)
 	if code != C.NET_COMPUTE_OK {
 		return nil, computeErr(code, errOut)
 	}
@@ -605,7 +609,7 @@ func (rt *DaemonRuntime) SpawnFromSnapshot(
 
 	var entityID [32]byte
 	_ = C.net_compute_daemon_handle_entity_id(nativeHandle, (*C.uint8_t)(unsafe.Pointer(&entityID[0])))
-	originHash := uint32(C.net_compute_daemon_handle_origin_hash(nativeHandle))
+	originHash := uint64(C.net_compute_daemon_handle_origin_hash(nativeHandle))
 
 	h := &DaemonHandle{
 		handle:     nativeHandle,
@@ -619,7 +623,7 @@ func (rt *DaemonRuntime) SpawnFromSnapshot(
 // Deliver drives one causal event through the daemon at
 // originHash. Returns the daemon's output payloads (each a fresh
 // []byte).
-func (rt *DaemonRuntime) Deliver(originHash uint32, event CausalEvent) ([][]byte, error) {
+func (rt *DaemonRuntime) Deliver(originHash uint64, event CausalEvent) ([][]byte, error) {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	if rt.handle == nil {
@@ -635,8 +639,8 @@ func (rt *DaemonRuntime) Deliver(originHash uint32, event CausalEvent) ([][]byte
 	var errOut *C.char
 	code := C.net_compute_runtime_deliver(
 		rt.handle,
-		C.uint32_t(originHash),
-		C.uint32_t(event.OriginHash),
+		C.uint64_t(originHash),
+		C.uint64_t(event.OriginHash),
 		C.uint64_t(event.Sequence),
 		payloadPtr,
 		C.size_t(len(event.Payload)),

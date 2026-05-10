@@ -144,7 +144,7 @@ type GroupHealth struct {
 // GroupMemberInfo is one member's metadata within a group.
 type GroupMemberInfo struct {
 	Index      uint8
-	OriginHash uint32
+	OriginHash uint64
 	NodeID     uint64
 	EntityID   []byte
 	Healthy    bool
@@ -153,8 +153,8 @@ type GroupMemberInfo struct {
 // GroupForkRecord is one fork's lineage record. See the core
 // `ForkRecord` for semantics.
 type GroupForkRecord struct {
-	OriginalOrigin  uint32
-	ForkedOrigin    uint32
+	OriginalOrigin  uint64
+	ForkedOrigin    uint64
 	ForkSeq         uint64
 	FromSnapshotSeq *uint64
 }
@@ -229,7 +229,7 @@ func parseMembersJSON(jsonStr string) []GroupMemberInfo {
 	// and stores entity_id as a hex string.
 	var raw []struct {
 		Index      uint8  `json:"index"`
-		OriginHash uint32 `json:"origin_hash"`
+		OriginHash uint64 `json:"origin_hash"`
 		NodeID     uint64 `json:"node_id"`
 		EntityID   string `json:"entity_id"`
 		Healthy    bool   `json:"healthy"`
@@ -256,8 +256,8 @@ func parseForkRecordsJSON(jsonStr string) []GroupForkRecord {
 		return nil
 	}
 	var raw []struct {
-		OriginalOrigin  uint32  `json:"original_origin"`
-		ForkedOrigin    uint32  `json:"forked_origin"`
+		OriginalOrigin  uint64  `json:"original_origin"`
+		ForkedOrigin    uint64  `json:"forked_origin"`
 		ForkSeq         uint64  `json:"fork_seq"`
 		FromSnapshotSeq *uint64 `json:"from_snapshot_seq"`
 	}
@@ -403,21 +403,21 @@ func (g *ReplicaGroup) Health() GroupHealth {
 // RouteEvent routes to the best healthy replica and returns its
 // `origin_hash`. `routingKey` is consistent-hashed for stickiness
 // (pass "" to let the LB strategy pick without a key).
-func (g *ReplicaGroup) RouteEvent(routingKey string) (uint32, error) {
+func (g *ReplicaGroup) RouteEvent(routingKey string) (uint64, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.handle == nil {
 		return 0, ErrRuntimeShutDown
 	}
 	kb, kp, kl := cKindBytes(routingKey)
-	var origin C.uint32_t
+	var origin C.uint64_t
 	var errOut *C.char
 	code := C.net_compute_replica_group_route_event(g.handle, kp, kl, &origin, &errOut)
 	runtime.KeepAlive(kb)
 	if code != C.NET_COMPUTE_OK {
 		return 0, groupErr(code, errOut)
 	}
-	return uint32(origin), nil
+	return uint64(origin), nil
 }
 
 // ScaleTo resizes the group to `n` replicas. Growing calls the
@@ -476,7 +476,7 @@ type ForkGroup struct {
 func NewForkGroup(
 	rt *DaemonRuntime,
 	kind string,
-	parentOrigin uint32,
+	parentOrigin uint64,
 	forkSeq uint64,
 	cfg ForkGroupConfig,
 ) (*ForkGroup, error) {
@@ -492,7 +492,7 @@ func NewForkGroup(
 	code := C.net_compute_fork_group_spawn(
 		rt.handle,
 		kindPtr, kindLen,
-		C.uint32_t(parentOrigin),
+		C.uint64_t(parentOrigin),
 		C.uint64_t(forkSeq),
 		C.uint32_t(cfg.ForkCount),
 		lbPtr, lbLen,
@@ -539,13 +539,13 @@ func (g *ForkGroup) HealthyCount() int {
 	return int(C.net_compute_fork_group_healthy_count(g.handle))
 }
 
-func (g *ForkGroup) ParentOrigin() uint32 {
+func (g *ForkGroup) ParentOrigin() uint64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.handle == nil {
 		return 0
 	}
-	return uint32(C.net_compute_fork_group_parent_origin(g.handle))
+	return uint64(C.net_compute_fork_group_parent_origin(g.handle))
 }
 
 func (g *ForkGroup) ForkSeq() uint64 {
@@ -702,13 +702,13 @@ func (g *StandbyGroup) ActiveIndex() int {
 	return int(C.net_compute_standby_group_active_index(g.handle))
 }
 
-func (g *StandbyGroup) ActiveOrigin() uint32 {
+func (g *StandbyGroup) ActiveOrigin() uint64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.handle == nil {
 		return 0
 	}
-	return uint32(C.net_compute_standby_group_active_origin(g.handle))
+	return uint64(C.net_compute_standby_group_active_origin(g.handle))
 }
 
 func (g *StandbyGroup) ActiveHealthy() bool {
@@ -756,19 +756,19 @@ func (g *StandbyGroup) SyncStandbys() (uint64, error) {
 }
 
 // Promote promotes the most-synced standby to active.
-func (g *StandbyGroup) Promote() (uint32, error) {
+func (g *StandbyGroup) Promote() (uint64, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.handle == nil {
 		return 0, ErrRuntimeShutDown
 	}
-	var out C.uint32_t
+	var out C.uint64_t
 	var errOut *C.char
 	code := C.net_compute_standby_group_promote(g.handle, &out, &errOut)
 	if code != C.NET_COMPUTE_OK {
 		return 0, groupErr(code, errOut)
 	}
-	return uint32(out), nil
+	return uint64(out), nil
 }
 
 func (g *StandbyGroup) OnNodeRecovery(nodeID uint64) {

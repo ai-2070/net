@@ -278,7 +278,7 @@ int  net_redex_tail_next(net_redex_tail_t* cursor, uint32_t timeout_ms,
 void net_redex_tail_free(net_redex_tail_t* cursor);
 
 /* ---- Tasks adapter ---- */
-int  net_tasks_adapter_open(net_redex_t* redex, uint32_t origin_hash,
+int  net_tasks_adapter_open(net_redex_t* redex, uint64_t origin_hash,
                             int persistent, net_tasks_adapter_t** out_handle);
 int  net_tasks_adapter_close(net_tasks_adapter_t* handle);
 void net_tasks_adapter_free(net_tasks_adapter_t* handle);
@@ -304,7 +304,7 @@ int  net_tasks_watch_next(net_tasks_watch_t* cursor, uint32_t timeout_ms,
 void net_tasks_watch_free(net_tasks_watch_t* cursor);
 
 /* ---- Memories adapter ---- */
-int  net_memories_adapter_open(net_redex_t* redex, uint32_t origin_hash,
+int  net_memories_adapter_open(net_redex_t* redex, uint64_t origin_hash,
                                int persistent, net_memories_adapter_t** out_handle);
 int  net_memories_adapter_close(net_memories_adapter_t* handle);
 void net_memories_adapter_free(net_memories_adapter_t* handle);
@@ -571,7 +571,7 @@ int      net_identity_to_seed(net_identity_t* handle, uint8_t* out);
 int      net_identity_entity_id(net_identity_t* handle, uint8_t* out);
 
 uint64_t net_identity_node_id(net_identity_t* handle);
-uint32_t net_identity_origin_hash(net_identity_t* handle);
+uint64_t net_identity_origin_hash(net_identity_t* handle);
 
 /* Signs `msg[len]`; writes a 64-byte ed25519 signature into `out_sig[64]`. */
 int      net_identity_sign(net_identity_t* handle,
@@ -1070,7 +1070,7 @@ typedef struct net_compute_daemon_handle_s net_compute_daemon_handle_t;
 
 typedef int (*net_compute_process_fn)(
     uint64_t daemon_id,
-    uint32_t origin_hash,
+    uint64_t origin_hash,
     uint64_t sequence,
     const uint8_t* payload_ptr,
     size_t payload_len,
@@ -1255,7 +1255,7 @@ int                     net_compute_spawn(
     char** err_out);
 
 /* Read the origin_hash from a daemon handle. Returns 0 on NULL. */
-uint32_t                net_compute_daemon_handle_origin_hash(
+uint64_t                net_compute_daemon_handle_origin_hash(
     const net_compute_daemon_handle_t* handle);
 
 /* Copy the 32-byte entity_id from a daemon handle into `out`. */
@@ -1271,7 +1271,7 @@ void                    net_compute_daemon_handle_free(
 /* Stop a daemon by origin_hash. */
 int                     net_compute_runtime_stop(
     net_compute_runtime_t* runtime,
-    uint32_t origin_hash,
+    uint64_t origin_hash,
     char** err_out);
 
 /* Deliver one event. Writes a heap-allocated outputs vec to
@@ -1279,8 +1279,8 @@ int                     net_compute_runtime_stop(
  * and frees via `net_compute_outputs_free`. */
 int                     net_compute_runtime_deliver(
     net_compute_runtime_t* runtime,
-    uint32_t origin_hash,
-    uint32_t event_origin_hash,
+    uint64_t origin_hash,
+    uint64_t event_origin_hash,
     uint64_t event_sequence,
     const uint8_t* event_payload,
     size_t event_payload_len,
@@ -1302,7 +1302,7 @@ void                    net_compute_outputs_free(net_compute_outputs_t* vec);
  * outputs vec, or an empty vec for stateless daemons. */
 int                     net_compute_runtime_snapshot(
     net_compute_runtime_t* runtime,
-    uint32_t origin_hash,
+    uint64_t origin_hash,
     net_compute_outputs_t** out_outputs,
     char** err_out);
 
@@ -1343,7 +1343,7 @@ typedef struct net_compute_migration_handle_s net_compute_migration_handle_t;
  * backs off + re-initiates on `NotReady` up to this budget. */
 int                     net_compute_start_migration(
     net_compute_runtime_t* runtime,
-    uint32_t origin_hash,
+    uint64_t origin_hash,
     uint64_t source_node,
     uint64_t target_node,
     uint8_t transport_identity,
@@ -1358,7 +1358,7 @@ int                     net_compute_expect_migration(
     net_compute_runtime_t* runtime,
     const char* kind_ptr,
     size_t kind_len,
-    uint32_t origin_hash,
+    uint64_t origin_hash,
     uint64_t auto_snapshot_interval,
     uint32_t max_log_entries,
     char** err_out);
@@ -1379,13 +1379,13 @@ int                     net_compute_register_migration_target_identity(
  * the caller frees with `net_compute_free_cstring`. */
 char*                   net_compute_migration_phase(
     net_compute_runtime_t* runtime,
-    uint32_t origin_hash);
+    uint64_t origin_hash);
 
 /* Free a migration handle. Does NOT cancel the migration. */
 void                    net_compute_migration_handle_free(
     net_compute_migration_handle_t* handle);
 
-uint32_t                net_compute_migration_handle_origin_hash(
+uint64_t                net_compute_migration_handle_origin_hash(
     const net_compute_migration_handle_t* handle);
 uint64_t                net_compute_migration_handle_source_node(
     const net_compute_migration_handle_t* handle);
@@ -1460,7 +1460,7 @@ int  net_compute_replica_group_health(
 int  net_compute_replica_group_route_event(
     const net_compute_replica_group_t* h,
     const char* routing_key_ptr, size_t routing_key_len,
-    uint32_t* out_origin, char** err_out);
+    uint64_t* out_origin, char** err_out);
 
 int  net_compute_replica_group_scale_to(
     const net_compute_replica_group_t* h,
@@ -1478,7 +1478,7 @@ char* net_compute_replica_group_members_json(
 int  net_compute_fork_group_spawn(
     net_compute_runtime_t* runtime,
     const char* kind_ptr, size_t kind_len,
-    uint32_t parent_origin,
+    uint64_t parent_origin,
     uint64_t fork_seq,
     uint32_t fork_count,
     const char* lb_strategy_ptr, size_t lb_strategy_len,
@@ -1490,7 +1490,7 @@ int  net_compute_fork_group_spawn(
 void net_compute_fork_group_free(net_compute_fork_group_t* h);
 int  net_compute_fork_group_fork_count(const net_compute_fork_group_t* h);
 int  net_compute_fork_group_healthy_count(const net_compute_fork_group_t* h);
-uint32_t net_compute_fork_group_parent_origin(const net_compute_fork_group_t* h);
+uint64_t net_compute_fork_group_parent_origin(const net_compute_fork_group_t* h);
 uint64_t net_compute_fork_group_fork_seq(const net_compute_fork_group_t* h);
 /* Returns 1 if every fork's lineage verifies, 0 otherwise. */
 int  net_compute_fork_group_verify_lineage(const net_compute_fork_group_t* h);
@@ -1518,7 +1518,7 @@ void net_compute_standby_group_free(net_compute_standby_group_t* h);
 int  net_compute_standby_group_member_count(const net_compute_standby_group_t* h);
 int  net_compute_standby_group_standby_count(const net_compute_standby_group_t* h);
 int  net_compute_standby_group_active_index(const net_compute_standby_group_t* h);
-uint32_t net_compute_standby_group_active_origin(const net_compute_standby_group_t* h);
+uint64_t net_compute_standby_group_active_origin(const net_compute_standby_group_t* h);
 int  net_compute_standby_group_active_healthy(const net_compute_standby_group_t* h);
 uint32_t net_compute_standby_group_group_id(const net_compute_standby_group_t* h);
 int  net_compute_standby_group_buffered_event_count(const net_compute_standby_group_t* h);
@@ -1528,7 +1528,7 @@ int  net_compute_standby_group_sync_standbys(
     uint64_t* out_through, char** err_out);
 int  net_compute_standby_group_promote(
     const net_compute_standby_group_t* h,
-    uint32_t* out_origin, char** err_out);
+    uint64_t* out_origin, char** err_out);
 void net_compute_standby_group_on_node_recovery(
     const net_compute_standby_group_t* h, uint64_t node_id);
 
