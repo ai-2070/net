@@ -200,6 +200,14 @@ func safeCallPlacementFilter(fn PlacementFilterFn, candidate PlacementCandidate)
 // they no longer need the mesh handle.
 type MeshArcPtr unsafe.Pointer
 
+// CR-26: serializes Register/Unregister for the same id to close
+// a race where a concurrent unregister between the Go-map insert
+// and the Rust register call deleted the Go entry just as Rust
+// took ownership — the substrate ended up with a registration
+// pointing at no Go callable. Register/unregister are config-
+// time operations; a single global mutex is sufficient.
+var placementRegisterMutex sync.Mutex
+
 // PlacementFilterError categorizes register-side failures.
 type PlacementFilterError struct {
 	Code int
@@ -234,6 +242,13 @@ func RegisterPlacementFilter(meshHandle MeshArcPtr, f RegisteredPlacementFilter)
 	if f.Fn == nil {
 		return &PlacementFilterError{Code: -1, Msg: "nil filter function"}
 	}
+
+	// CR-26: serialize against UnregisterPlacementFilter for the
+	// same id to close the gap where a concurrent unregister
+	// between the Go-map LoadOrStore and the Rust register call
+	// would delete the Go entry just before Rust took ownership.
+	placementRegisterMutex.Lock()
+	defer placementRegisterMutex.Unlock()
 
 	registerPlacementDispatcher()
 
@@ -287,6 +302,10 @@ func UnregisterPlacementFilter(id string) bool {
 		// stays consistent with substrate state.
 		return false
 	}
+	// CR-26: serialize against RegisterPlacementFilter for the
+	// same id (see comment on `placementRegisterMutex`).
+	placementRegisterMutex.Lock()
+	defer placementRegisterMutex.Unlock()
 	cID := C.CString(id)
 	defer C.free(unsafe.Pointer(cID))
 	rc := C.net_compute_unregister_placement_filter(cID, C.size_t(len(id)))
