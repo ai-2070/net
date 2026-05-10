@@ -1,0 +1,35 @@
+net/crates/net/sdk-ts/test/compute.test.ts
+  s_e3c24456981f5d::t_bf7564ef721030 1000-1009,1013,1025-1029
+net/crates/net/sdk/src/capabilities.rs
+  s_e3c24456981f5d::t_97e205313c26f7 324
+net/crates/net/bindings/node/src/lib.rs
+  s_e3c24456981f5d::t_b1e5744bb8cc98 1849-1851
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  s_e3c24456981f5d::t_329bcb82a746f2 2832-2834
+  s_e3c24456981f5d::t_25f724522a454f 1681-1682
+  s_e3c24456981f5d::t_fad37329929a85 1189-1190
+  s_e3c24456981f5d::t_d5d12b0f51230b 288-289
+  s_e3c24456981f5d::t_c53a8e19cfc1d0 2754-2755
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_e3c24456981f5d::t_e9e4f18564a484 436-440
+  s_e3c24456981f5d::t_b5f453c25db446 1355
+net/crates/net/sdk/src/mesh_rpc.rs
+  s_e3c24456981f5d::t_081ba32ee10a7b 136-139
+  s_e3c24456981f5d::t_2bb7791715d7a3 189-193
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "8888b96b44e44e373621486363e43680948f34bc",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
