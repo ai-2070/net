@@ -1,0 +1,68 @@
+net/crates/net/bindings/python/src/compute.rs
+  s_d1b11a1287c170::t_5c31e54d2a9011 1164-1168,1171-1174
+net/crates/net/docs/CAPABILITY_SYSTEM_MIGRATION.md
+  s_d1b11a1287c170::t_d3eee12c5528f8 195-199
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_d1b11a1287c170::t_6daa22c447f897 522-525,530-532,535-539
+  s_d1b11a1287c170::t_682a71b4f214c9 1418-1452
+go/net.h
+  s_d1b11a1287c170::t_53ec1f8f2a6696 981-988
+  s_d1b11a1287c170::t_a4445cd514a1b7 1210-1211,1215,1217
+  s_d1b11a1287c170::t_3899404f9a3859 1223
+net/crates/net/sdk-ts/test/predicate_trace.test.ts
+  s_d1b11a1287c170::t_a741c99e6657bf 53-61,65-71
+net/crates/net/sdk-py/src/net_sdk/capability.py
+  s_d1b11a1287c170::t_edda0e9cc630b7 1188-1200
+net/crates/net/sdk-py/tests/test_capability_validation.py
+  s_d1b11a1287c170::t_855c0a778c3629 114-140
+net/crates/net/include/README.md
+  s_d1b11a1287c170::t_fd98d6f7e8329b 307
+net/crates/net/bindings/go/net/placement.go
+  s_d1b11a1287c170::t_8bbae82a6f3046 273-283,286-287,293-302
+  s_d1b11a1287c170::t_e9c3132145fe78 79
+net/crates/net/src/adapter/net/behavior/diff.rs
+  s_d1b11a1287c170::t_6e00cec5c9ccd7 532-548,553-554
+  s_d1b11a1287c170::t_a9292c1c66d9a9 549-552,555-561,564,568,1226-1227,1251-1252,1284-1285,1287-1288
+  s_d1b11a1287c170::t_140c49cd4faf19 1307
+  s_d1b11a1287c170::t_3c6fba8a5f6458 1263-1283,1286,1289-1306,1308-1316
+net/crates/net/sdk-ts/test/capability_enhancements.test.ts
+  s_d1b11a1287c170::t_8acc6232e7e618 415-470
+net/crates/net/sdk-py/src/net_sdk/capability_schema.py
+  s_d1b11a1287c170::t_652fb8c3d9e5c5 425-432
+net/crates/net/include/net.go.h
+  s_d1b11a1287c170::t_f25c5caef794f4 983-990
+  s_d1b11a1287c170::t_c2fdf574921896 1212-1213,1217,1219,1225
+net/crates/net/bindings/python/tests/test_compute.py
+  s_d1b11a1287c170::t_0a19b637219f92 206-244
+net/crates/net/src/adapter/net/behavior/predicate.rs
+  s_d1b11a1287c170::t_a9292c1c66d9a9 1090,2080,2084,2088,2092
+net/crates/net/src/adapter/net/behavior/bloom.rs
+  s_d1b11a1287c170::t_a8021a729fde7a 134-140
+  s_d1b11a1287c170::t_371f1f28fee572 416-422,428-429
+  s_d1b11a1287c170::t_f2b9c647fc5fb2 153
+  s_d1b11a1287c170::t_a9292c1c66d9a9 427
+  s_d1b11a1287c170::t_d0bfdf2efc4d38 101-112
+  s_d1b11a1287c170::t_a463d87eb41581 408-415,423-426
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  s_d1b11a1287c170::t_b69810ba1a60f5 775-785
+net/crates/net/sdk-py/tests/test_predicate_debug_report.py
+  s_d1b11a1287c170::t_d49102cdacaf07 100-123
+net/crates/net/sdk-ts/src/capability-enhancements.ts
+  s_d1b11a1287c170::t_ac673f72577cd3 1132-1138,1143-1144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "38612b61521ca7cb8070a77251ec03a81955d4f8",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
