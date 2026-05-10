@@ -404,6 +404,39 @@ describe('semverCompatible 0.0.x exact-only', () => {
       ),
     ).toBe(true);
   });
+
+  // Q1: a non-zero major lhs is NOT compatible with a 0.x.y rhs.
+  // Pre-fix the TS helper checked only `rhs[1] === lhs[1]` for
+  // the 0.x.y branch, so 1.2.5 satisfied ^0.2.3 (lhs >= rhs
+  // passes since 1 > 0, then minors match) — diverged from Cargo
+  // semantics and the Rust substrate.
+  it('rejects non-zero-major lhs against 0.x.y rhs', () => {
+    const meta = {};
+    // 1.2.5 against ^0.2.3 must fail.
+    expect(
+      evaluatePredicate(
+        p.semverCompatible(tagKey('software', 'runtime.python'), '0.2.3'),
+        ['software.runtime.python=1.2.5'],
+        meta,
+      ),
+    ).toBe(false);
+    // 2.2.5 against ^0.2.3 must also fail.
+    expect(
+      evaluatePredicate(
+        p.semverCompatible(tagKey('software', 'runtime.python'), '0.2.3'),
+        ['software.runtime.python=2.2.5'],
+        meta,
+      ),
+    ).toBe(false);
+    // Sanity: 0.2.5 against ^0.2.3 still passes.
+    expect(
+      evaluatePredicate(
+        p.semverCompatible(tagKey('software', 'runtime.python'), '0.2.3'),
+        ['software.runtime.python=0.2.5'],
+        meta,
+      ),
+    ).toBe(true);
+  });
 });
 
 describe('StandardPlacement builder', () => {

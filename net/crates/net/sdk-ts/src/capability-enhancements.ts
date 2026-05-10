@@ -1019,14 +1019,16 @@ function semverCompatible(lhs: SemverTriple, rhs: SemverTriple): boolean {
       // P2-F: 0.0.x — patch is the compatibility band; anything
       // other than the exact tuple is a breaking change. Combined
       // with the `lhs >= rhs` guard above this collapses to
-      // `lhs === rhs`. Pre-fix this fell through to the 0.x.y
-      // minor-band rule, letting any 0.0.lhs satisfy 0.0.rhs
-      // whenever `lhs >= rhs` — diverged from Cargo + Rust
-      // substrate.
+      // `lhs === rhs`.
       return lhs[0] === rhs[0] && lhs[1] === rhs[1] && lhs[2] === rhs[2];
     }
-    // 0.x.y — minor is the compatibility band.
-    return rhs[1] === lhs[1];
+    // Q1: 0.x.y — minor is the compatibility band, AND the major
+    // must also be 0. Pre-fix `rhs[1] === lhs[1]` alone admitted
+    // `lhs = 1.2.5` as compatible with `rhs = 0.2.3` (the
+    // `lhs >= rhs` guard passes since 1 > 0, then minors match).
+    // 1.x.y is NOT `^0.2.3`-compatible per Cargo: 0.x.y treats
+    // minor as the band IFF the band itself is 0.x.y.
+    return lhs[0] === 0 && rhs[1] === lhs[1];
   }
   return rhs[0] === lhs[0];
 }
