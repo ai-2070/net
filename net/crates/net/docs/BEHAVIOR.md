@@ -48,7 +48,7 @@ let p = pred!(and [
 let ok = p.evaluate(&EvalContext::new(&tags, &metadata));
 ```
 
-Predicates encode losslessly to a `cyberdeck-where:` nRPC header pair (`predicate_to_rpc_header` / `predicate_from_rpc_header`) so server-side filtering picks the right candidate without re-running the predicate per hop. Trace and per-corpus debug-report variants (`evaluate_with_trace`, `predicate_debug_report`) record each clause's verdict count and short-circuit decisions; `redact_metadata_keys` scrubs metadata-equality / -matches values before persisting the report.
+Predicates encode losslessly to a `cyberdeck-where:` nRPC header pair (`predicate_to_rpc_header` / `predicate_from_rpc_headers`) so server-side filtering picks the right candidate without re-running the predicate per hop. Trace and per-corpus debug-report variants (`evaluate_with_trace`, `predicate_debug_report`) record each clause's verdict count and short-circuit decisions; `redact_metadata_keys` scrubs metadata-equality / -matches values before persisting the report.
 
 ### Capability validation
 
