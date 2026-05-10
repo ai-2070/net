@@ -764,6 +764,19 @@ fn fetch_daemon_caps(
         )
     };
     if code != NET_COMPUTE_OK {
+        // P2-E: a dispatcher that fails partway through the
+        // (required, optional) write may still have allocated and
+        // populated one or both buffers before bailing. The
+        // contract docs the consumer's `_free` only on the success
+        // path, so we'd leak whatever the dispatcher already wrote.
+        // Free both sides defensively before returning the empty
+        // fallback.
+        if !req_ptr.is_null() {
+            unsafe { libc::free(req_ptr as *mut std::ffi::c_void) };
+        }
+        if !opt_ptr.is_null() {
+            unsafe { libc::free(opt_ptr as *mut std::ffi::c_void) };
+        }
         eprintln!(
             "net-compute-ffi: daemon-caps dispatcher returned {code} for daemon_id {daemon_id:#x}; using empty caps"
         );
