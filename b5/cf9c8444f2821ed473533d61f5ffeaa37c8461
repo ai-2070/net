@@ -1,0 +1,26 @@
+net/crates/net/bindings/go/net/capability.go
+  s_e3c24456981f5d::t_3fdb0d1780533b 21,24
+  s_e3c24456981f5d::t_a87bee28d836b3 1201-1209,1212,1215-1219
+net/crates/net/sdk-py/src/net_sdk/capability.py
+  s_e3c24456981f5d::t_99f3b23f7d196f 1122,1124-1125,1128,1130-1131,1134,1136-1137
+  s_e3c24456981f5d::t_eb767a74ad84f9 984-1010
+  s_e3c24456981f5d::t_b7eb910be83399 1180,1182-1183
+net/crates/net/sdk-py/tests/test_capability_enhancements.py
+  s_e3c24456981f5d::t_f2add4cb2faed6 320-349
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "b5cf9c8444f2821ed473533d61f5ffeaa37c8461",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
