@@ -234,7 +234,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 /// Caller must ensure `p` is null or points to a NUL-terminated C
 /// string valid at least until this function returns.
 #[inline]
-unsafe fn c_str_to_string(p: *const c_char) -> Option<String> {
+pub(super) unsafe fn c_str_to_string(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }

@@ -778,6 +778,35 @@ int      net_mesh_find_best_node_scoped(net_meshnode_t* handle,
 int      net_normalize_gpu_vendor(const char* raw,
                                   char** out, size_t* out_len);
 
+/* Stateless predicate evaluation (Phase 9c of
+ * CAPABILITY_SYSTEM_SDK_PLAN.md). Mirrors the SDK-layer
+ * `evaluate_predicate(pred, tags, metadata)` surface every
+ * binding ships, exposed at the C ABI for raw consumers
+ * (C / C++ / Zig / Swift / Java JNI / etc.) so they can filter
+ * candidates locally without going through nRPC.
+ *
+ * Inputs are NUL-terminated UTF-8 JSON strings:
+ *   - predicate_json — wire-format `PredicateWire`.
+ *     Cross-binding compat pinned by
+ *     `tests/cross_lang_capability/predicate_eval.json`.
+ *   - tags_json      — `["hardware.gpu", "scope:tenant:foo"]`.
+ *     Reserved-prefix tags accepted (privileged Tag::parse).
+ *   - metadata_json  — `{"key":"value"}`.
+ *
+ * Returns:
+ *   1 — predicate evaluated to true.
+ *   0 — predicate evaluated to false.
+ *   NET_ERR_NULL_POINTER  — any input pointer is NULL.
+ *   NET_ERR_INVALID_UTF8  — input bytes aren't valid UTF-8.
+ *   NET_ERR_INVALID_JSON  — predicate / tags / metadata failed to
+ *                           parse, OR a tag string was malformed.
+ *
+ * Stateless. Thread-safe. Pure helper — no handle, no allocation
+ * out-params; the caller's buffers aren't retained. */
+int      net_predicate_evaluate(const char* predicate_json,
+                                const char* tags_json,
+                                const char* metadata_json);
+
 /* =========================================================================
  * Compute — MeshDaemon + migration. Stage 6 of
  * SDK_COMPUTE_SURFACE_PLAN.md. Symbols live in `libnet_compute`

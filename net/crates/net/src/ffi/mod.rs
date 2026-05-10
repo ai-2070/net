@@ -128,6 +128,14 @@ pub mod cortex;
 #[allow(missing_docs)]
 pub mod mesh;
 
+/// C FFI for stateless predicate evaluation (Phase 9c of
+/// `CAPABILITY_SYSTEM_SDK_PLAN.md`). Pure helpers — no handles,
+/// no state. Mirrors the SDK-layer `evaluatePredicate` /
+/// `evaluate_predicate` surface every binding ships, exposed at
+/// the C ABI for raw consumers (C / C++ / Zig / Swift / etc.).
+#[cfg(feature = "net")]
+pub mod predicate;
+
 /// C FFI for the Redis Streams consumer-side dedup helper. Mirrors
 /// the Rust `net::adapter::RedisStreamDedup` surface for Go / C / Zig
 /// consumers. See `ffi::redis_dedup` module docs for the wire
