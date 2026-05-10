@@ -1,0 +1,40 @@
+net/crates/net/tests/cross_lang_capability_fixtures.rs
+  s_d1b11a1287c170::t_151774cb16e3ca 20-22
+  s_d1b11a1287c170::t_57b73842fc5eba 605-697
+net/crates/net/tests/cross_lang_capability/README.md
+  s_d1b11a1287c170::t_f23ecaf6c3c226 52-63
+net/crates/net/sdk-ts/src/index.ts
+  s_d1b11a1287c170::t_f3db257e6ca0c5 169-176
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_d1b11a1287c170::t_08023200ea452f 152-154
+  s_d1b11a1287c170::t_45caecbc2653a9 37,39,45
+net/crates/net/sdk-ts/src/capability-enhancements.ts
+  s_d1b11a1287c170::t_2d77bf6ee672dc 1336-1448
+net/crates/net/sdk-ts/test/predicate_debug_report.test.ts
+  s_d1b11a1287c170::t_003468191b6737 1-121
+net/crates/net/sdk-py/tests/test_predicate_debug_report.py
+  s_d1b11a1287c170::t_baabd79d32e9e7 1-99
+net/crates/net/sdk-py/src/net_sdk/capability.py
+  s_d1b11a1287c170::t_aa5050d3cd6a22 1425-1427
+  s_d1b11a1287c170::t_647ed318676e7f 1273-1380
+net/crates/net/tests/cross_lang_capability/predicate_debug_report.json
+  s_d1b11a1287c170::t_dadae43f014153 1-152
+net/crates/net/bindings/go/net/capability.go
+  s_d1b11a1287c170::t_1ede01a644b86f 1443-1539
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "9db36eaad9941631b19866444c98961093b73070",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
