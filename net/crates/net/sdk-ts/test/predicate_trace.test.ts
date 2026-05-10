@@ -50,8 +50,25 @@ function loadFixture(): TraceFixture {
   return JSON.parse(readFileSync(TRACE_FIXTURE, 'utf-8')) as TraceFixture;
 }
 
+// The wire-format version this TS binding implements. Bump in
+// lockstep with the substrate any time a `PredicateWire` /
+// `ClauseTrace` shape changes. The fixture carries the same
+// number — mismatch means either the fixture was regenerated
+// against a newer substrate without bumping the binding, or vice
+// versa, and continuing to iterate the cases would produce
+// false-greens against an incompatible wire.
+const PREDICATE_TRACE_ABI_VERSION = 1;
+
 describe('predicate trace evaluator (cross-binding fixture)', () => {
   const fx = loadFixture();
+
+  // Pin the fixture's declared ABI version BEFORE iterating
+  // cases. Without this, a wire-format bump that lands in the
+  // fixture without a matching binding bump would silently flow
+  // past the test as just one or two case-level mismatches.
+  it('binding implements the fixture ABI version', () => {
+    expect(fx.abi_version_expected).toBe(PREDICATE_TRACE_ABI_VERSION);
+  });
 
   for (const c of fx.cases) {
     it(`matches ${c.name}`, () => {

@@ -111,6 +111,33 @@ def test_metadata_oversize_does_not_fire_at_cap() -> None:
     assert report.warnings == ()
 
 
+def test_validate_handles_non_string_metadata_without_crashing() -> None:
+    """Regression: the metadata size accounting used to call
+    ``len(v)`` directly. Non-string values (``int`` / ``bool`` /
+    ``None``) raised ``TypeError`` before any report could ship —
+    a malformed-input case escalated from a warning to an
+    uncaught exception. Coerce both halves to ``str`` so the
+    oversize check stays robust against whatever Python type
+    smuggles through an untyped ``dict``.
+    """
+    # Mix of types that all need ``str()`` to survive ``len()``.
+    caps = {
+        "tags": [],
+        "metadata": {
+            "int_value": 42,        # type: ignore[dict-item]
+            "bool_value": True,     # type: ignore[dict-item]
+            "none_value": None,     # type: ignore[dict-item]
+            "str_value": "hello",
+        },
+    }
+    # The substrate's contract is that this returns a report; it
+    # must NOT raise. Pre-fix this raised
+    # ``TypeError: object of type 'int' has no len()``.
+    report = validate_capabilities(caps)
+    # No oversize warning at this size, regardless of types.
+    assert all(w.to_wire()["kind"] != "metadata_oversize" for w in report.warnings)
+
+
 def test_report_is_clean_helpers() -> None:
     clean = ValidationReport()
     assert clean.is_clean()

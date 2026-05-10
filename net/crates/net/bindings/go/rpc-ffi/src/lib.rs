@@ -519,14 +519,24 @@ pub struct NetRpcHeader {
 
 /// Convert a C `(headers_ptr, header_count)` array into the
 /// substrate's `Vec<(String, Vec<u8>)>` shape. Returns `None` if
-/// any header name fails UTF-8 validation; caller should write a
-/// typed error.
+/// any header name fails UTF-8 validation OR the caller passed
+/// `header_count > 0` with a NULL `headers_ptr` (a contract
+/// violation — the caller claims to ship N headers but didn't
+/// supply the array). Caller maps `None` to a typed error.
 unsafe fn collect_headers(
     headers_ptr: *const NetRpcHeader,
     header_count: usize,
 ) -> Option<Vec<(String, Vec<u8>)>> {
-    if header_count == 0 || headers_ptr.is_null() {
+    if header_count == 0 {
+        // Zero headers — the pointer is allowed to be NULL or
+        // dangling because we never dereference it.
         return Some(Vec::new());
+    }
+    if headers_ptr.is_null() {
+        // Caller said N>0 but didn't actually pass an array.
+        // Surface as invalid input instead of silently dropping
+        // every header.
+        return None;
     }
     let slice = unsafe { std::slice::from_raw_parts(headers_ptr, header_count) };
     let mut out = Vec::with_capacity(header_count);
@@ -1403,6 +1413,41 @@ mod tests {
             message: "x".into(),
         })
         .starts_with("codec_decode:"));
+    }
+
+    /// Regression: `collect_headers` rejects `headers_ptr == NULL`
+    /// when the caller claims `header_count > 0`. The pre-fix
+    /// `if header_count == 0 || headers_ptr.is_null()` short-circuit
+    /// silently returned an empty Vec for that combo, dropping
+    /// every header the caller intended to ship.
+    #[test]
+    fn collect_headers_rejects_null_pointer_with_nonzero_count() {
+        // NULL + count > 0 → invalid FFI input → None (caller
+        // surfaces a typed error).
+        let out = unsafe { collect_headers(std::ptr::null(), 3) };
+        assert!(
+            out.is_none(),
+            "headers_ptr=NULL with count>0 must surface as invalid input, not as empty headers",
+        );
+
+        // count == 0 stays permissive: the pointer is never read,
+        // so NULL / dangling is fine.
+        let out = unsafe { collect_headers(std::ptr::null(), 0) };
+        assert_eq!(out.as_deref().map(|v| v.len()), Some(0));
+
+        // Negative control: a real array round-trips.
+        let name = b"x-trace";
+        let value = b"abc";
+        let h = NetRpcHeader {
+            name_ptr: name.as_ptr() as *const c_char,
+            name_len: name.len(),
+            value_ptr: value.as_ptr(),
+            value_len: value.len(),
+        };
+        let out = unsafe { collect_headers(&h, 1) }.expect("valid header");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "x-trace");
+        assert_eq!(out[0].1, b"abc");
     }
 
     /// `cstr_to_string` rejects NULL and invalid UTF-8.

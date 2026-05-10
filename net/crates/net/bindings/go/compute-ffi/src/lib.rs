@@ -772,7 +772,17 @@ fn fetch_daemon_caps(
     // Parse a single side. NULL pointer / zero length → empty
     // (no caps declared). On parse failure, log + fall back.
     let parse_side = |label: &str, ptr: *mut c_char, len: usize| -> CapabilitySet {
-        if ptr.is_null() || len == 0 {
+        if ptr.is_null() {
+            return CapabilitySet::default();
+        }
+        if len == 0 {
+            // Non-NULL pointer but zero-length: caller still
+            // owes us a free. Releasing here closes the leak that
+            // the previous combined `is_null() || len == 0` guard
+            // produced — the early return above only fires when
+            // there's nothing to free. Same `libc::free` path the
+            // success branch below takes.
+            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
             return CapabilitySet::default();
         }
         // SAFETY: the consumer's contract says `ptr` points at

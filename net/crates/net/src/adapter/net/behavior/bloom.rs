@@ -98,6 +98,18 @@ impl fmt::Debug for BloomFilter {
     }
 }
 
+/// Round `n` up to the nearest multiple of 64, saturating at
+/// `usize::MAX`. Used by [`BloomFilter::new`] /
+/// [`BloomFilter::with_params`] to align filter sizes to whole
+/// 64-bit words. Saturating arithmetic avoids a debug-build panic
+/// (or release-build wrap) when the unrounded value is within
+/// 63 of `usize::MAX` — a pathological combination of large
+/// `expected_items` and tiny `false_positive_rate` can produce
+/// such values via the optimum-`m` formula.
+fn round_up_to_64(n: usize) -> usize {
+    n.saturating_add(63) & !63
+}
+
 impl BloomFilter {
     /// Build a filter sized for `expected_items` insertions at the
     /// target `false_positive_rate` (e.g. `0.01` for 1%).
@@ -119,7 +131,13 @@ impl BloomFilter {
             MIN_LEN_BITS
         };
         // Round UP to a multiple of 64 + apply the floor.
-        let len_bits = ((m_raw + 63) & !63).max(MIN_LEN_BITS);
+        // `m_raw + 63` saturates at `usize::MAX` so a pathological
+        // `m_float` (e.g. from a `false_positive_rate` clamped to
+        // `1e-9` paired with an enormous `expected_items`) can't
+        // panic in debug or wrap in release. Ceiling to the
+        // nearest multiple of 64 is a no-op when the value is
+        // already aligned.
+        let len_bits = round_up_to_64(m_raw).max(MIN_LEN_BITS);
         // Optimal k: k = (m / n) * ln 2
         let k_float = ((len_bits as f64 / n) * ln2).round();
         let k = (k_float as u32).clamp(1, MAX_K);
@@ -132,7 +150,7 @@ impl BloomFilter {
     /// by deserialization; exposed for callers that want
     /// reproducible filter shapes (cross-binding fixtures, etc.).
     pub fn with_params(len_bits: usize, k: u32) -> Self {
-        let len_bits = ((len_bits + 63) & !63).max(MIN_LEN_BITS);
+        let len_bits = round_up_to_64(len_bits).max(MIN_LEN_BITS);
         let k = k.clamp(1, MAX_K);
         let words = len_bits / 64;
         Self {
@@ -385,6 +403,28 @@ mod tests {
         // Crazy-loose FPR: clamped to 0.5; small filter.
         let bf_loose = BloomFilter::new(100, 0.99);
         assert!(bf_loose.len_bits() >= MIN_LEN_BITS);
+    }
+
+    /// Regression: the bit-size rounding step used to compute
+    /// `(n + 63) & !63`. For values within 63 of `usize::MAX`,
+    /// that overflowed — a debug-build panic, a release-build
+    /// wrap to a tiny aligned value. Saturating the addition
+    /// keeps the rounding well-defined at the upper boundary.
+    /// (Constructing the filter with a near-MAX size would still
+    /// fail the `Vec::with_capacity` allocation; the regression
+    /// here is the rounding helper itself.)
+    #[test]
+    fn round_up_to_64_saturates_at_usize_max() {
+        assert_eq!(round_up_to_64(0), 0);
+        assert_eq!(round_up_to_64(1), 64);
+        assert_eq!(round_up_to_64(64), 64);
+        assert_eq!(round_up_to_64(65), 128);
+        // Saturation regime — pre-fix this overflowed.
+        assert_eq!(round_up_to_64(usize::MAX), usize::MAX & !63);
+        assert_eq!(round_up_to_64(usize::MAX - 62), usize::MAX & !63);
+        // The largest representable already-aligned value passes
+        // through unchanged.
+        assert_eq!(round_up_to_64(usize::MAX & !63), usize::MAX & !63,);
     }
 
     /// Round-trip via serde — write to JSON, read back, verify

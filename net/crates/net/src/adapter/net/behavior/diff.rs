@@ -529,13 +529,43 @@ impl DiffEngine {
         let old_owned = owned(old);
         let new_owned = owned(new);
 
+        // Membership-by-axis-key, not exact `Tag` equality.
+        // `Tag::AxisValue` carries its `=` / `:` separator in the
+        // struct, and `Eq` compares it. The typed encoders emit
+        // canonical separators, so an input tag of
+        // `software.os:linux` (Colon) re-encodes to
+        // `software.os=linux` (Eq) — exact `HashSet::contains`
+        // misses, the colon form lands in the residual, and a
+        // `RemoveTag` ships without a compensating
+        // `UpdateSoftware` (the typed projections compare equal,
+        // since both decode to `os = "linux"`). Apply on the
+        // receiver then drops the tag entirely.
+        //
+        // Reduce to `(axis, key)` for the consumed check so the
+        // separator becomes irrelevant. Forward-compat tags keep
+        // working: their axis_key isn't in `*_owned_keys` (the
+        // encoders never emitted it), so they fall through to the
+        // residual diff exactly as before.
+        let consumed_axis_keys =
+            |owned: &HashSet<Tag>| -> HashSet<crate::adapter::net::behavior::tag::TagKey> {
+                owned.iter().filter_map(|t| t.axis_key()).collect()
+            };
+        let old_consumed = consumed_axis_keys(&old_owned);
+        let new_consumed = consumed_axis_keys(&new_owned);
+        let is_residual =
+            |t: &Tag, consumed: &HashSet<crate::adapter::net::behavior::tag::TagKey>| -> bool {
+                // Reserved/Legacy tags never have an axis_key; always
+                // residual. Axis-prefixed tags are residual iff their
+                // (axis, key) wasn't claimed by any typed encoder.
+                t.axis_key().is_none_or(|k| !consumed.contains(&k))
+            };
         let old_residual: HashSet<&Tag> = old
             .iter()
-            .filter(|t| !old_owned.contains(*t))
+            .filter(|t| is_residual(t, &old_consumed))
             .collect();
         let new_residual: HashSet<&Tag> = new
             .iter()
-            .filter(|t| !new_owned.contains(*t))
+            .filter(|t| is_residual(t, &new_consumed))
             .collect();
 
         for tag in old_residual.difference(&new_residual) {
@@ -1193,7 +1223,8 @@ mod tests {
 
         let ops = DiffEngine::diff(&old, &new);
         assert!(
-            ops.iter().any(|op| matches!(op, DiffOp::AddTag(t) if t == "hardware.future_field=v2")),
+            ops.iter()
+                .any(|op| matches!(op, DiffOp::AddTag(t) if t == "hardware.future_field=v2")),
             "expected AddTag(hardware.future_field=v2) for forward-compat axis tag, got {:?}",
             ops,
         );
@@ -1217,7 +1248,8 @@ mod tests {
         // not through AddTag. The fix doesn't double-emit.
         let old = CapabilitySet::new();
         let new = CapabilitySet::new().with_hardware(
-            crate::adapter::net::behavior::capability::HardwareCapabilities::new().with_memory(65_536),
+            crate::adapter::net::behavior::capability::HardwareCapabilities::new()
+                .with_memory(65_536),
         );
         let ops = DiffEngine::diff(&old, &new);
         assert!(
@@ -1225,6 +1257,60 @@ mod tests {
                 .any(|op| matches!(op, DiffOp::AddTag(t) if t.starts_with("hardware.memory_mb"))),
             "known hardware keys must not double-emit as AddTag — got {:?}",
             ops,
+        );
+    }
+
+    /// Regression: an axis tag whose separator differs from the
+    /// canonical form emitted by the typed encoder (e.g. an input
+    /// `software.os:linux` with `:` separator vs. the encoder's
+    /// `software.os=linux` with `=`) used to be missed by exact
+    /// `HashSet::contains` membership. Result: the colon-form
+    /// landed in the residual and shipped as `RemoveTag` even
+    /// though the typed projections (`SoftwareCapabilities`)
+    /// compared equal — so no compensating `UpdateSoftware` op
+    /// rode along. Apply on the receiver dropped the tag entirely.
+    /// The fix tests membership by `(axis, key)` so the separator
+    /// is irrelevant.
+    #[test]
+    fn diff_does_not_remove_axis_tag_when_only_separator_differs() {
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        use crate::adapter::net::behavior::tag::Tag;
+
+        // Both sides decode to `SoftwareCapabilities { os: "linux", … }`.
+        // The only on-wire difference is the separator. No typed
+        // change → no `UpdateSoftware`; no residual change should
+        // ship either.
+        let mut old = CapabilitySet::new();
+        old.tags
+            .insert(Tag::parse("software.os:linux").expect("parse colon form"));
+        let mut new = CapabilitySet::new();
+        new.tags
+            .insert(Tag::parse("software.os=linux").expect("parse eq form"));
+
+        let ops = DiffEngine::diff(&old, &new);
+        assert!(
+            !ops.iter().any(|op| matches!(op, DiffOp::RemoveTag(_))),
+            "no `RemoveTag` should be emitted for canonical-separator-only differences — got {:?}",
+            ops,
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, DiffOp::AddTag(_))),
+            "no `AddTag` either — the typed `UpdateSoftware` path owns the change — got {:?}",
+            ops,
+        );
+
+        // End-to-end safety: applying the diff to `old` must NOT
+        // strip the `os=linux` data. Round-trip through the typed
+        // projection.
+        let mut applied = old.clone();
+        for op in &ops {
+            DiffEngine::apply_op(&mut applied, op, false).expect("apply succeeds");
+        }
+        let applied_sw =
+            crate::adapter::net::behavior::capability::SoftwareCapabilities::from(&applied);
+        assert_eq!(
+            applied_sw.os, "linux",
+            "`os=linux` data must survive a separator-only diff round-trip — applied caps = {applied:?}",
         );
     }
 

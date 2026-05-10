@@ -978,6 +978,14 @@ typedef struct net_compute_cc_arc_s       net_compute_cc_arc_t;
 #define NET_COMPUTE_ERR_NULL            -1
 #define NET_COMPUTE_ERR_CALL_FAILED     -2
 #define NET_COMPUTE_ERR_DUPLICATE_KIND  -3
+/* `_register_placement_filter`-only — surfaces when the dispatcher
+ * hasn't been installed yet via
+ * `net_compute_set_placement_filter_dispatcher`. Documented at the
+ * call site below. */
+#define NET_COMPUTE_ERR_NO_DISPATCHER   -4
+/* `_register_placement_filter`-only — `id_ptr` bytes don't decode
+ * as UTF-8. Documented at the call site below. */
+#define NET_COMPUTE_ERR_INVALID_UTF8    -5
 
 /* --- Arc<MeshNode> / Arc<ChannelConfigRegistry> accessors ---
  *
@@ -1199,20 +1207,20 @@ int                     net_compute_set_placement_filter_dispatcher(
  * `mesh_arc` is NOT consumed — caller still owns it.
  *
  * Returns:
- *   NET_COMPUTE_OK              — registered.
- *   NET_COMPUTE_ERR_NULL        — `mesh_arc` or `id_ptr` NULL.
+ *   NET_COMPUTE_OK                — registered.
+ *   NET_COMPUTE_ERR_NULL          — `mesh_arc` or `id_ptr` NULL.
  *   NET_COMPUTE_ERR_DUPLICATE_KIND — `id` already registered
  *                                    (no-overwrite contract; SDKs
  *                                    generate unique ids).
- *   -4                          — dispatcher not yet installed
+ *   NET_COMPUTE_ERR_NO_DISPATCHER — dispatcher not yet installed
  *                                  (call `_set_placement_filter_dispatcher`).
- *   -5                          — `id_ptr` is not valid UTF-8.
+ *   NET_COMPUTE_ERR_INVALID_UTF8  — `id_ptr` is not valid UTF-8.
  *
  * Existing `Arc<dyn PlacementFilter>` clones held by in-flight
  * scoring calls keep the predicate alive until those calls
  * finish; `_unregister` is safe to call concurrently. */
 int                     net_compute_register_placement_filter(
-    void* mesh_arc,
+    net_compute_mesh_arc_t* mesh_arc,
     const char* id_ptr, size_t id_len);
 
 /* Drop the placement-filter registration under `id`.

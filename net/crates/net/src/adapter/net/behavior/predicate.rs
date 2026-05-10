@@ -1087,10 +1087,7 @@ impl Predicate {
             // `match_axis_tag` because that helper now skips
             // `AxisPresent` (presence-only tags carry no value;
             // value predicates would otherwise see `""`).
-            Self::Exists { key } => ctx
-                .tags
-                .iter()
-                .any(|t| t.axis_key().as_ref() == Some(key)),
+            Self::Exists { key } => ctx.tags.iter().any(|t| t.axis_key().as_ref() == Some(key)),
             Self::Equals { key, value } => match_axis_tag(ctx.tags, key, |v| v == value.as_str()),
             Self::NumericAtLeast { key, threshold } => match_axis_tag(ctx.tags, key, |v| {
                 v.parse::<f64>().is_ok_and(|n| n >= *threshold)
@@ -2080,27 +2077,19 @@ mod tests {
 
         // Exact match passes.
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.0.3")];
-        assert!(
-            pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta))
-        );
+        assert!(pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta)));
 
         // Higher patch must NOT match (was admitted pre-fix).
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.0.4")];
-        assert!(
-            !pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta))
-        );
+        assert!(!pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta)));
 
         // Lower patch fails (already covered by the lhs >= rhs guard).
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.0.2")];
-        assert!(
-            !pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta))
-        );
+        assert!(!pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta)));
 
         // Cross-band (different minor) still fails.
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.1.0")];
-        assert!(
-            !pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta))
-        );
+        assert!(!pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta)));
     }
 
     /// Regression: presence-only tags (`Tag::AxisPresent`) must not

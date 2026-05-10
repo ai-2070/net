@@ -192,7 +192,11 @@ caps.tags.contains(&"gpu".to_string())
 caps.tags.iter().any(|t| t.to_string() == "hardware.gpu")
 // or use the predicate evaluator (preferred):
 let pred = pred!(exists "hardware.gpu");
-let ctx = EvalContext::new(&caps.tags.iter().cloned().collect::<Vec<_>>(), &caps.metadata);
+// Materialize the tag slice into a local first — `EvalContext::new`
+// borrows it, and a temporary `.collect::<Vec<_>>()` chained inline
+// would be dropped before `evaluate_unplanned` runs.
+let tag_vec: Vec<Tag> = caps.tags.iter().cloned().collect();
+let ctx = EvalContext::new(&tag_vec, &caps.metadata);
 pred.evaluate_unplanned(&ctx)
 ```
 

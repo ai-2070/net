@@ -1129,10 +1129,19 @@ function evalLeaf(
       );
     }
     case 'metadataMatches': {
+      // `hasOwnProperty` parity with `metadataExists` /
+      // `metadataEquals`. Direct `metadata[pred.key]` access reads
+      // through the prototype chain — a metadata object inheriting
+      // an `Object.prototype` member named the same as `pred.key`
+      // could spuriously match here while `metadataExists` reports
+      // `false`. The two predicates must stay in lockstep.
+      if (!Object.prototype.hasOwnProperty.call(metadata, pred.key)) return false;
       const v = metadata[pred.key];
       return v !== undefined && v.includes(pred.pattern);
     }
     case 'metadataNumericAtLeast': {
+      // Same `hasOwnProperty` parity reasoning as `metadataMatches`.
+      if (!Object.prototype.hasOwnProperty.call(metadata, pred.key)) return false;
       const v = metadata[pred.key];
       if (v === undefined) return false;
       const n = Number.parseFloat(v);

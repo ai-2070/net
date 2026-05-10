@@ -1185,8 +1185,19 @@ def _pred_static_cost(p: Predicate) -> int:
 
 def _format_float(n: float) -> str:
     """Match Rust's ``{}`` Display for f64: integers print without
-    decimal, fractional values include their digits."""
-    if n == int(n) and abs(n) < 1e16:
+    decimal, fractional values include their digits.
+
+    Magnitude check runs FIRST. ``int(n)`` raises ``ValueError`` on
+    NaN and ``OverflowError`` on infinity; the original
+    ``n == int(n) and abs(n) < 1e16`` short-circuited in the wrong
+    order (Python's ``and`` evaluates left to right), so a NaN
+    threshold reached the predicate-debug-report path as a
+    runtime exception rather than just falling through to ``repr``.
+    """
+    import math
+    if not math.isfinite(n) or abs(n) >= 1e16:
+        return repr(n)
+    if n == int(n):
         return str(int(n))
     return repr(n)
 

@@ -422,7 +422,14 @@ def validate_capabilities(
         elif isinstance(tag, TagLegacy):
             warnings.append(WarningLegacyTag(tag=tag.raw))
 
-    metadata_bytes = sum(len(k) + len(v) for k, v in metadata.items())
+    # The wire shape says metadata is `{str: str}`, but Python's
+    # untyped dicts let callers smuggle through `int` / `bool` /
+    # `None` etc. Coerce both halves to `str` for the size
+    # accounting so an oversize report ships instead of a `TypeError`
+    # inside `len()`. The stringified form is what would actually
+    # land on the wire after JSON-encoding, so this is also the
+    # correct bound for the `METADATA_SOFT_CAP_BYTES` check.
+    metadata_bytes = sum(len(str(k)) + len(str(v)) for k, v in metadata.items())
     if metadata_bytes > METADATA_SOFT_CAP_BYTES:
         warnings.append(
             WarningMetadataOversize(

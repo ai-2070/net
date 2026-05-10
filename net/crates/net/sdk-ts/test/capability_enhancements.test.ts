@@ -412,6 +412,62 @@ describe('placementFilterFromFn', () => {
 // evaluator or the placement-filter helper.
 // =====================================================================
 
+// Regression: `metadataMatches` and `metadataNumericAtLeast` used
+// to read metadata via direct property access (`metadata[key]`),
+// which traverses the prototype chain. A metadata object that
+// inherited e.g. `toString` from `Object.prototype` would have
+// `metadataMatches('toString', ...)` return true while the
+// adjacent `metadataExists('toString')` (which uses
+// `hasOwnProperty`) returned false — the two predicates were out
+// of lockstep. Pin parity by constructing a metadata object whose
+// prototype carries an inherited string and asserting all four
+// metadata predicates ignore it.
+describe('metadata predicates ignore prototype-chain properties (regression)', () => {
+  // Fabricate a metadata-like object with an inherited `inherited`
+  // key whose value is a string. Direct access reads through the
+  // prototype and returns "from-proto"; `hasOwnProperty` returns
+  // false. The fix in evaluatePredicate routes every metadata
+  // predicate through the latter so the inherited entry is
+  // invisible regardless of which predicate is asked.
+  const proto = { inherited: 'from-proto-1234' };
+  const metadata: Record<string, string> = Object.create(proto) as Record<string, string>;
+  // Sanity: own-property direct access matches what we configured.
+  metadata.real = 'real-value';
+
+  const tags: string[] = [];
+
+  it('metadataExists returns false for inherited keys', () => {
+    expect(evaluatePredicate(p.metadataExists('inherited'), tags, metadata)).toBe(false);
+    expect(evaluatePredicate(p.metadataExists('real'), tags, metadata)).toBe(true);
+  });
+
+  it('metadataEquals returns false for inherited keys', () => {
+    expect(
+      evaluatePredicate(p.metadataEquals('inherited', 'from-proto-1234'), tags, metadata),
+    ).toBe(false);
+    expect(evaluatePredicate(p.metadataEquals('real', 'real-value'), tags, metadata)).toBe(true);
+  });
+
+  it('metadataMatches returns false for inherited keys', () => {
+    // Pre-fix: this returned `true` because direct access read
+    // through the prototype.
+    expect(evaluatePredicate(p.metadataMatches('inherited', 'proto'), tags, metadata)).toBe(
+      false,
+    );
+    expect(evaluatePredicate(p.metadataMatches('real', 'real'), tags, metadata)).toBe(true);
+  });
+
+  it('metadataNumericAtLeast returns false for inherited keys', () => {
+    // Numeric variant has the same parity issue. Inject an
+    // inherited numeric-string and assert it doesn't match.
+    const numProto = { inherited_num: '42' };
+    const numMeta: Record<string, string> = Object.create(numProto) as Record<string, string>;
+    expect(
+      evaluatePredicate(p.metadataNumericAtLeast('inherited_num', 1), tags, numMeta),
+    ).toBe(false);
+  });
+});
+
 describe('placementFilterFromFn (cross-binding fixture)', () => {
   const fx = loadJson<EvalFixture>(EVAL_FIXTURE, 'predicate eval (placement filter)');
 

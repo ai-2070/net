@@ -97,3 +97,27 @@ def test_empty_corpus_yields_zeros() -> None:
     assert report.total_candidates == 0
     assert report.matched == 0
     assert report.clause_stats == ()
+
+
+def test_debug_label_handles_nan_and_infinity_thresholds() -> None:
+    """Regression: ``_format_float`` used to call ``int(n)`` before
+    the ``abs(n) < 1e16`` magnitude guard. ``int(NaN)`` raises
+    ``ValueError`` and ``int(inf)`` raises ``OverflowError``, so a
+    predicate with a non-finite numeric threshold made the
+    debug-report path crash on label generation. The fix runs the
+    finiteness/magnitude check first; non-finite or huge values
+    fall through to ``repr``.
+    """
+    import math
+
+    # NaN threshold — pre-fix: ``int(nan)`` → ``ValueError``.
+    pred = p.numeric_at_least(tag_key("hardware", "vram_gb"), float("nan"))
+    report = predicate_debug_report(pred, [{"tags": [], "metadata": {}}])
+    assert len(report.clause_stats) == 1
+    assert "nan" in report.clause_stats[0].label.lower()
+
+    # Positive infinity — pre-fix: ``int(inf)`` → ``OverflowError``.
+    pred = p.numeric_at_most(tag_key("hardware", "vram_gb"), math.inf)
+    report = predicate_debug_report(pred, [{"tags": [], "metadata": {}}])
+    assert len(report.clause_stats) == 1
+    assert "inf" in report.clause_stats[0].label.lower()

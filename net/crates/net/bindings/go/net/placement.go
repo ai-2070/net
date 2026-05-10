@@ -76,7 +76,7 @@ typedef int (*PlacementFilterFn)(
 // Imported FFI surface from `net-compute-ffi`.
 extern int net_compute_set_placement_filter_dispatcher(PlacementFilterFn dispatcher);
 extern int net_compute_register_placement_filter(
-    void* mesh_arc,
+    net_compute_mesh_arc_t* mesh_arc,
     const char* id_ptr, size_t id_len
 );
 extern int net_compute_unregister_placement_filter(
@@ -270,14 +270,36 @@ func RegisterPlacementFilter(meshHandle MeshArcPtr, f RegisteredPlacementFilter)
 // in-flight scheduler call holding an `Arc<dyn PlacementFilter>`
 // clone keeps the predicate alive until that call completes — see
 // the substrate registry docs.
+//
+// Substrate-first ordering. Pre-fix this deleted the Go-side
+// callback BEFORE the Rust unregister call returned, opening a
+// race window: a concurrent dispatcher invocation that had
+// already resolved the substrate handle but hadn't reached the
+// Go trampoline would find the callback missing and a defensive
+// "not registered" veto would ship in place of the real
+// predicate result. Unregister substrate-side first — the
+// substrate registry's own ref-counting keeps in-flight callers
+// alive on the Rust side until their `Arc<dyn PlacementFilter>`
+// clones drop — and only then drop the Go callback.
 func UnregisterPlacementFilter(id string) bool {
-	placementFilters.Delete(id)
 	if id == "" {
+		// Match the registry's empty-id rejection so Go state
+		// stays consistent with substrate state.
 		return false
 	}
 	cID := C.CString(id)
 	defer C.free(unsafe.Pointer(cID))
 	rc := C.net_compute_unregister_placement_filter(cID, C.size_t(len(id)))
+	// Drop the Go-side callback only after the substrate has
+	// dropped its registry entry. Any in-flight dispatch that
+	// already resolved the substrate handle was holding a
+	// lock-free clone; substrate's drop semantics keep the
+	// predicate alive until that clone is released, but the Go
+	// trampoline only reads `placementFilters` synchronously
+	// from the dispatcher entry point — so deleting after the
+	// substrate-side drop is the moment no new dispatches can
+	// race in.
+	placementFilters.Delete(id)
 	return rc == 1
 }
 

@@ -1161,9 +1161,17 @@ fn extract_optional_caps(
     instance: &Py<PyAny>,
     attr: &str,
 ) -> PyResult<CapabilitySet> {
+    // Treat `AttributeError` as "attribute not declared" (the
+    // documented optional case). Every other exception — most
+    // commonly a `@property` getter raising — must propagate so
+    // operators see the real failure instead of silently
+    // collapsing the daemon's declared caps to empty.
     let v = match instance.getattr(py, attr) {
         Ok(v) => v,
-        Err(_) => return Ok(CapabilitySet::default()),
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
+            return Ok(CapabilitySet::default());
+        }
+        Err(e) => return Err(e),
     };
     if v.is_none(py) {
         return Ok(CapabilitySet::default());
