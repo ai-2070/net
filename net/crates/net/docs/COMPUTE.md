@@ -57,7 +57,7 @@ The scheduler queries the `CapabilityIndex` from the behavior plane to find node
 
 ### Daemon capability authoring
 
-Each `MeshDaemon` declares its required + optional `CapabilitySet` via the trait's `requirements()` method. The runtime publishes both sets as part of the daemon's identity-bound announcement so the placement scheduler — and any custom filter — can consult them. Bindings expose the same hook through their daemon-caps dispatcher (`net_compute_set_daemon_caps_dispatcher` at the C ABI; the equivalent Python / TS / Go callback during factory registration).
+Each `MeshDaemon` exposes legacy placement requirements via `requirements() -> CapabilityFilter`, and v2 placement capabilities via `required_capabilities()` / `optional_capabilities()` (both `CapabilitySet`). The runtime publishes the required + optional sets as part of the daemon's identity-bound announcement so the placement scheduler — and any custom filter — can consult them. Bindings expose the same hook through their daemon-caps dispatcher (`net_compute_set_daemon_caps_dispatcher` at the C ABI; the equivalent Python / TS / Go callback during factory registration).
 
 ### Custom placement-filter callbacks
 
