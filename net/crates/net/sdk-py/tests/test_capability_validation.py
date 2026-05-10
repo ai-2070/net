@@ -111,6 +111,34 @@ def test_metadata_oversize_does_not_fire_at_cap() -> None:
     assert report.warnings == ()
 
 
+def test_metadata_oversize_uses_utf8_bytes_not_code_points() -> None:
+    """Q3: the substrate's METADATA_SOFT_CAP_BYTES is a byte
+    budget; metadata travels as JSON-encoded UTF-8. Pre-fix the
+    Python validator counted code points (`len(str)`) instead of
+    bytes, undercounting non-ASCII content. A CJK character
+    encodes as 3 UTF-8 bytes but ``len()`` reports 1, so a
+    payload that actually busts the cap would silently pass.
+    """
+    # CJK char: '中' = 3 UTF-8 bytes per char.
+    chars_to_overflow = METADATA_SOFT_CAP_BYTES // 3 + 1
+    value = "中" * chars_to_overflow
+    caps = {"tags": [], "metadata": {"k": value}}
+    report = validate_capabilities(caps)
+    # In code-point counts, len("中" * N) == N which is below the
+    # cap; in UTF-8 bytes, 3*N exceeds the cap. The fix should
+    # report oversize.
+    matching = [
+        w for w in report.warnings if w.to_wire()["kind"] == "metadata_oversize"
+    ]
+    assert len(matching) == 1, (
+        "non-ASCII metadata exceeding the byte budget must surface as "
+        "metadata_oversize; pre-fix it was undercounted via len(str)"
+    )
+    actual = matching[0].to_wire()["actual_bytes"]
+    expected = len("k".encode("utf-8")) + len(value.encode("utf-8"))
+    assert actual == expected, f"actual_bytes should be UTF-8 byte length, got {actual}"
+
+
 def test_validate_handles_non_string_metadata_without_crashing() -> None:
     """Regression: the metadata size accounting used to call
     ``len(v)`` directly. Non-string values (``int`` / ``bool`` /

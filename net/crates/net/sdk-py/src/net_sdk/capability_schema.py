@@ -474,7 +474,17 @@ def validate_capabilities(
     # inside `len()`. The stringified form is what would actually
     # land on the wire after JSON-encoding, so this is also the
     # correct bound for the `METADATA_SOFT_CAP_BYTES` check.
-    metadata_bytes = sum(len(str(k)) + len(str(v)) for k, v in metadata.items())
+    #
+    # Q3: count UTF-8 bytes, not Python characters. Pre-fix
+    # `len(str(k))` returned the code-point count, which under-
+    # counts non-ASCII content (e.g. CJK characters take 3 UTF-8
+    # bytes each but `len()` returns 1). The substrate's
+    # `METADATA_SOFT_CAP_BYTES` is a byte budget; the wire format
+    # is JSON-encoded UTF-8, so the right comparison is byte length.
+    metadata_bytes = sum(
+        len(str(k).encode("utf-8")) + len(str(v).encode("utf-8"))
+        for k, v in metadata.items()
+    )
     if metadata_bytes > METADATA_SOFT_CAP_BYTES:
         warnings.append(
             WarningMetadataOversize(
