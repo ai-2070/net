@@ -1,0 +1,22 @@
+net/crates/net/bindings/python/src/lib.rs
+  s_d1b11a1287c170::t_0aa825e49fc607 24-25
+  s_d1b11a1287c170::t_ce7a0e0607f919 1820-1876
+net/crates/net/bindings/python/src/placement.rs
+  s_d1b11a1287c170::t_c175e5a955d158 1-173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "402725d44c09f10967aa787f8008da6d54778f8e",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
