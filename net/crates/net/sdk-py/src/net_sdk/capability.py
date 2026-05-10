@@ -1012,9 +1012,25 @@ def _parse_semver(s: str) -> Optional[Tuple[int, int, int]]:
 
 
 def _semver_compatible(lhs: Tuple[int, int, int], rhs: Tuple[int, int, int]) -> bool:
+    """``lhs`` is caret-compatible with ``rhs`` per the standard
+    semver rule: same major (or same minor for ``0.x.y``, exact for
+    ``0.0.x``), and ``lhs >= rhs``. Mirrors cargo's ``^`` operator
+    semantics — kept in lockstep with the Rust ``semver_compatible``
+    helper in ``predicate.rs``.
+    """
     if lhs < rhs:
         return False
     if rhs[0] == 0:
+        if rhs[1] == 0:
+            # P1-D: 0.0.x — patch is the compatibility band; anything
+            # other than the exact tuple is a breaking change.
+            # Combined with the lhs >= rhs guard above this collapses
+            # to lhs == rhs. Pre-fix this branch returned
+            # `rhs[1] == lhs[1]` (always true at 0), letting any
+            # 0.0.lhs satisfy 0.0.rhs whenever lhs >= rhs — diverged
+            # from Cargo + Rust substrate.
+            return lhs == rhs
+        # 0.x.y — minor is the compatibility band.
         return rhs[1] == lhs[1]
     return rhs[0] == lhs[0]
 

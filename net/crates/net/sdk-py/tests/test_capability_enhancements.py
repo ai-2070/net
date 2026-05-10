@@ -291,6 +291,33 @@ def test_where_header_builds_canonical_entry() -> None:
 
 
 # ---------------------------------------------------------------------------
+# P1-D: semver_compatible 0.0.x exact-only.
+#
+# Cargo's caret rule treats `^0.0.x` as exact-only — every patch
+# is a breaking-change boundary. Pre-fix the Python helper applied
+# the 0.x.y minor-band rule even when the major was 0 AND the
+# minor was 0, so 0.0.4 satisfied a 0.0.3 requirement (it
+# shouldn't). Mirrors the Rust CR pinned in
+# `predicate.rs::semver_compatible_zero_zero_patch_is_exact_only`.
+# ---------------------------------------------------------------------------
+
+
+def test_semver_compatible_zero_zero_patch_is_exact_only() -> None:
+    from net_sdk.capability import _semver_compatible
+
+    # 0.0.x band: every patch is a breaking change.
+    assert _semver_compatible((0, 0, 3), (0, 0, 3)) is True
+    assert _semver_compatible((0, 0, 4), (0, 0, 3)) is False
+    assert _semver_compatible((0, 0, 2), (0, 0, 3)) is False
+    # 0.x.y (x > 0) band: minor is the compatibility band.
+    assert _semver_compatible((0, 2, 5), (0, 2, 3)) is True
+    assert _semver_compatible((0, 2, 3), (0, 3, 0)) is False
+    # x.y.z (x > 0) band: major is the compatibility band.
+    assert _semver_compatible((1, 4, 5), (1, 2, 3)) is True
+    assert _semver_compatible((2, 0, 0), (1, 9, 9)) is False
+
+
+# ---------------------------------------------------------------------------
 # StandardPlacement builder + custom placement filter
 # ---------------------------------------------------------------------------
 
