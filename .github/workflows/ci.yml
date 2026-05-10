@@ -57,26 +57,25 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
 
-      # redis and jetstream integration tests are intentionally skipped:
-      # `required-features = ["redis" | "jetstream"]` in Cargo.toml excludes
-      # them from compilation under this feature set. Wire them in separately
-      # once CI service containers are added.
-      - name: Net integration
-        run: cargo test --test integration_net --features net
-      - name: Migration integration
-        run: cargo test --test migration_integration --features net
-      - name: Three-node integration
-        run: cargo test --test three_node_integration --features net
-      - name: RedEX integration
-        run: cargo test --test integration_redex --features redex
-      - name: CortEX adapter integration
-        run: cargo test --test integration_cortex_adapter --features cortex
-      - name: CortEX tasks integration
-        run: cargo test --test integration_cortex_tasks --features cortex
-      - name: CortEX memories integration
-        run: cargo test --test integration_cortex_memories --features cortex
-      - name: NetDB integration
-        run: cargo test --test integration_netdb --features netdb
+      # Single `--all-features --tests` run picks up every
+      # `tests/*.rs` file regardless of per-test `required-features`
+      # gating. New integration tests landing under any feature
+      # combo get CI coverage automatically — no per-test
+      # enumeration to keep in sync. The previous shape spawned a
+      # `cargo test --test <name>` per file and silently dropped
+      # every test the enumeration didn't name (the nRPC family +
+      # the v0.13 capability-system additions both fell off the
+      # runner that way).
+      #
+      # `redis` and `jetstream` integration tests compile under
+      # `--all-features` but every test fn inside is `#[ignore]`'d
+      # ("requires running Redis" / "requires running NATS with
+      # JetStream"), so `cargo test` skips them by default. Wire
+      # them in via `cargo test -- --ignored` (with the
+      # REDIS_URL / JETSTREAM_URL env vars pointing at live
+      # services) once CI service containers are added.
+      - name: Integration tests
+        run: cargo test --all-features --tests
 
   rust-sdk-tests:
     name: Rust SDK tests
