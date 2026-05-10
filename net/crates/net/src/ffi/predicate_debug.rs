@@ -335,26 +335,52 @@ fn strip_label<'a>(label: &'a str, prefix: &str, suffix: &str) -> Option<&'a str
         .and_then(|rest| rest.strip_suffix(suffix))
 }
 
+/// Try each occurrence of `separator` in `inner` from earliest to
+/// latest. Return the first split position whose left half is in
+/// `keys`. CR-19: a metadata key may legitimately contain `=`,
+/// ` contains "`, or ` >= ` (substrate's `BTreeMap<String,String>`
+/// metadata accepts arbitrary keys), so the previous "split at
+/// first separator" heuristic silently no-op'd redaction when the
+/// key embedded the separator. Try every split position and keep
+/// the first one that resolves to a redact-set key.
+fn find_redactable_key_split(
+    inner: &str,
+    separator: &str,
+    keys: &BTreeSet<String>,
+) -> Option<usize> {
+    let mut search_start = 0usize;
+    while let Some(rel) = inner[search_start..].find(separator) {
+        let abs = search_start + rel;
+        if keys.contains(&inner[..abs]) {
+            return Some(abs);
+        }
+        search_start = abs + separator.len();
+        if search_start > inner.len() {
+            break;
+        }
+    }
+    None
+}
+
 /// Redact a single label per the rules above. Returns the
 /// rewritten label (owned `String`); falls through for non-
 /// metadata or non-targeted-key labels.
 fn redact_label(label: &str, keys: &BTreeSet<String>) -> String {
     // MetadataEquals(<key>=<value>)
     if let Some(inner) = strip_label(label, "MetadataEquals(", ")") {
-        if let Some(eq_idx) = inner.find('=') {
-            let (key, _value) = inner.split_at(eq_idx);
-            if keys.contains(key) {
-                return format!("MetadataEquals({key}=<redacted>)");
-            }
+        if let Some(eq_idx) = find_redactable_key_split(inner, "=", keys) {
+            let key = &inner[..eq_idx];
+            return format!("MetadataEquals({key}=<redacted>)");
         }
         return label.to_string();
     }
     // MetadataMatches(<key> contains "<pattern>")
     if let Some(inner) = strip_label(label, "MetadataMatches(", ")") {
         let needle = " contains \"";
-        if let Some(at) = inner.find(needle) {
-            let (key, rest) = inner.split_at(at);
-            if rest.ends_with('"') && keys.contains(key) {
+        if let Some(at) = find_redactable_key_split(inner, needle, keys) {
+            // `inner` ends with `"` (closing of the pattern literal).
+            if inner.ends_with('"') {
+                let key = &inner[..at];
                 return format!("MetadataMatches({key} contains \"<redacted>\")");
             }
         }
@@ -363,11 +389,9 @@ fn redact_label(label: &str, keys: &BTreeSet<String>) -> String {
     // MetadataNumericAtLeast(<key> >= <threshold>)
     if let Some(inner) = strip_label(label, "MetadataNumericAtLeast(", ")") {
         let needle = " >= ";
-        if let Some(at) = inner.find(needle) {
-            let (key, _rest) = inner.split_at(at);
-            if keys.contains(key) {
-                return format!("MetadataNumericAtLeast({key} >= <redacted>)");
-            }
+        if let Some(at) = find_redactable_key_split(inner, needle, keys) {
+            let key = &inner[..at];
+            return format!("MetadataNumericAtLeast({key} >= <redacted>)");
         }
         return label.to_string();
     }
@@ -756,6 +780,40 @@ mod tests {
         let pass2 = read_and_free(out2);
 
         assert_eq!(pass1, pass2, "redaction must be idempotent");
+    }
+
+    /// CR-19: redaction works when the metadata key itself contains
+    /// the separator character. Pre-CR-19 `redact_label` split at
+    /// the *first* `=` (or first ` contains "` / ` >= `), so a key
+    /// like `k=v` would split as `k` / `v=actual-secret`, find `k`
+    /// not in the redact set, and silently no-op — leaving the
+    /// secret in the label.
+    #[test]
+    fn redact_label_handles_keys_containing_separator() {
+        let mut keys = BTreeSet::new();
+        keys.insert("weird=key".to_string());
+
+        // First `=` splits at position 5 ("weird"); position 9
+        // ("weird=key") is the right one.
+        let label = "MetadataEquals(weird=key=sk-secret)";
+        let redacted = redact_label(label, &keys);
+        assert_eq!(redacted, "MetadataEquals(weird=key=<redacted>)");
+        assert!(
+            !redacted.contains("sk-secret"),
+            "secret leaked through label-parser heuristic: {redacted}"
+        );
+
+        // Same shape for MetadataNumericAtLeast.
+        let mut keys = BTreeSet::new();
+        keys.insert("a >= b".to_string());
+        let label = "MetadataNumericAtLeast(a >= b >= 42)";
+        let redacted = redact_label(label, &keys);
+        assert_eq!(redacted, "MetadataNumericAtLeast(a >= b >= <redacted>)");
+
+        // Non-targeted keys still pass through unchanged.
+        let label = "MetadataEquals(region=us-east)";
+        let redacted = redact_label(label, &keys);
+        assert_eq!(redacted, label);
     }
 
     /// CR-8: `redact_trace_metadata_keys` rewrites metadata-clause
