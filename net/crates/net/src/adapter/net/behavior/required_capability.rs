@@ -60,7 +60,12 @@ impl RequiredCapability {
     /// `Predicate` variant.
     pub fn evaluate(&self, ctx: &EvalContext<'_>) -> bool {
         match self {
-            Self::Tag(required) => ctx.tags.iter().any(|t| t == required),
+            // Separator-agnostic match: a `require!("software.os:linux")`
+            // must hit a stored `software.os=linux` (and vice versa).
+            // `Tag::PartialEq` distinguishes the two via its `separator`
+            // field; that's a wire-form detail, not part of identity.
+            // See CR-2 in `CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md`.
+            Self::Tag(required) => ctx.tags.iter().any(|t| t.semantic_eq(required)),
             Self::Predicate(p) => p.evaluate(ctx),
             Self::AxisAny(axis) => ctx.tags.iter().any(|t| t.axis() == Some(*axis)),
             Self::AxisKey(key) => ctx.tags.iter().any(|t| t.axis_key().as_ref() == Some(key)),
@@ -545,6 +550,32 @@ mod tests {
         assert!(r.evaluate(&ctx));
         // Different value — no match (Tag variant is exact).
         let r = require!("hardware.gpu.vram_gb=24");
+        assert!(!r.evaluate(&ctx));
+    }
+
+    #[test]
+    fn tag_variant_evaluates_across_separator_forms() {
+        // Regression for CR-2: `Tag::AxisValue` PartialEq distinguishes
+        // `=` vs `:`, but a `require!("software.os:linux")` placed
+        // against a node whose canonical tag is `software.os=linux`
+        // (or vice versa) must still match — the separator is a
+        // wire-form detail, not part of identity.
+        let m = meta();
+
+        // Stored colon, required equals — must match.
+        let tags = [axis_colon(TaxonomyAxis::Software, "os", "linux")];
+        let ctx = EvalContext::new(&tags, &m);
+        let r = require!("software.os=linux");
+        assert!(r.evaluate(&ctx));
+
+        // Stored equals, required colon — must match.
+        let tags = [axis_eq(TaxonomyAxis::Software, "os", "linux")];
+        let ctx = EvalContext::new(&tags, &m);
+        let r = require!("software.os:linux");
+        assert!(r.evaluate(&ctx));
+
+        // Different value still misses (sanity).
+        let r = require!("software.os:darwin");
         assert!(!r.evaluate(&ctx));
     }
 
