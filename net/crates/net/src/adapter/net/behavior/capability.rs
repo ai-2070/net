@@ -2346,6 +2346,16 @@ pub struct CapabilityIndex {
     /// related leaf clauses with distinct-value counts (otherwise
     /// they'd fall back to plain `static_cost`).
     by_metadata: DashMap<String, DashMap<String, HashSet<u64>>>,
+    /// Inverted index: axis tag key -> { value -> set of node IDs }.
+    ///
+    /// Phase 4 follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+    /// Lets [`Self::axis_cardinality`] return O(1) instead of
+    /// O(N) over the full `by_tag` table — the planner reads it
+    /// once per leaf-clause-per-candidate, so the linear scan
+    /// would dominate hot-path evaluation. Presence-only axis
+    /// tags (`hardware.gpu` with no value) use the sentinel
+    /// empty string `""` as the inner key.
+    by_axis_key: DashMap<crate::adapter::net::behavior::tag::TagKey, DashMap<String, HashSet<u64>>>,
     /// Version tracking
     versions: DashMap<u64, u64>,
     /// Stats
@@ -2364,6 +2374,7 @@ impl CapabilityIndex {
             by_gpu_vendor: DashMap::new(),
             gpu_nodes: DashMap::new(),
             by_metadata: DashMap::new(),
+            by_axis_key: DashMap::new(),
             versions: DashMap::new(),
             index_count: AtomicU64::new(0),
             query_count: AtomicU64::new(0),
@@ -2499,6 +2510,9 @@ impl CapabilityIndex {
         // rendering) so query() can look up tags by their string
         // representation regardless of which Tag variant they
         // round-trip through. Phase A.5.N.2: render Tag → wire string.
+        //
+        // Phase 4 follow-on: also populate `by_axis_key` for axis-
+        // shaped tags so axis_cardinality is O(1).
         for tag in &caps.tags {
             let key = tag.to_string();
             if let Some(mut set) = self.by_tag.get_mut(&key) {
@@ -2506,6 +2520,28 @@ impl CapabilityIndex {
             } else {
                 self.by_tag.entry(key).or_default().insert(node_id);
             }
+
+            // Mirror axis-shaped tags into `by_axis_key`.
+            // AxisPresent: value sentinel `""`. AxisValue: the
+            // actual value. Reserved / Legacy variants don't
+            // surface here (no axis_key).
+            use crate::adapter::net::behavior::tag::Tag as TagEnum;
+            let (axis_key, value) = match tag {
+                TagEnum::AxisPresent { axis, key } => (
+                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
+                    String::new(),
+                ),
+                TagEnum::AxisValue { axis, key, value, .. } => (
+                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
+                    value.clone(),
+                ),
+                _ => continue,
+            };
+            let inner = self
+                .by_axis_key
+                .entry(axis_key)
+                .or_insert_with(DashMap::new);
+            inner.entry(value).or_default().insert(node_id);
         }
 
         // Models
@@ -2577,6 +2613,32 @@ impl CapabilityIndex {
                 set.remove(&node_id);
             }
             self.by_tag.remove_if(&key, |_, set| set.is_empty());
+
+            // Mirror prune in by_axis_key for axis-shaped tags.
+            use crate::adapter::net::behavior::tag::Tag as TagEnum;
+            let (axis_key, value) = match tag {
+                TagEnum::AxisPresent { axis, key } => (
+                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
+                    String::new(),
+                ),
+                TagEnum::AxisValue { axis, key, value, .. } => (
+                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
+                    value.clone(),
+                ),
+                _ => continue,
+            };
+            let mut inner_now_empty = false;
+            if let Some(inner) = self.by_axis_key.get(&axis_key) {
+                if let Some(mut set) = inner.get_mut(&value) {
+                    set.remove(&node_id);
+                }
+                inner.remove_if(&value, |_, set| set.is_empty());
+                inner_now_empty = inner.is_empty();
+            }
+            if inner_now_empty {
+                self.by_axis_key
+                    .remove_if(&axis_key, |_, inner| inner.is_empty());
+            }
         }
 
         // Models
@@ -2791,17 +2853,21 @@ impl CapabilityIndex {
     /// predicate matching one of them is likely to filter most
     /// candidates — run such clauses first in `And`.
     ///
-    /// Cost: O(N) over the inverted-tag-index where N is the
-    /// number of distinct tag wire forms. Typical sizes (10K nodes
-    /// × ~10 tags each → 100K entries) yield microsecond-range
-    /// scans; cache the result at the planner level if a hot
-    /// loop reads it.
+    /// Cost: O(1) — looks up the inner DashMap size in the
+    /// dedicated `by_axis_key` index, maintained incrementally
+    /// during `add_to_indexes` / `remove_from_indexes`. Phase 4
+    /// follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md` replaced an
+    /// earlier O(N) scan over `by_tag` because the planner reads
+    /// this once per leaf-clause-per-candidate; the linear scan
+    /// dominated hot-path evaluation.
     ///
     /// Returns:
     ///
     /// - For value-bearing keys (`hardware.cpu_cores=...`,
     ///   `hardware.gpu.vendor=...`): the count of distinct
-    ///   value strings seen.
+    ///   value strings seen. Presence-form (no value) entries
+    ///   under the same key, if any, count as one of those
+    ///   distinct values via the empty-string sentinel.
     /// - For presence-only keys (`hardware.gpu`): `1` if any node
     ///   has the marker, `0` otherwise.
     /// - For unrecognized keys: `0`.
@@ -2813,31 +2879,10 @@ impl CapabilityIndex {
         &self,
         key: &crate::adapter::net::behavior::tag::TagKey,
     ) -> usize {
-        let prefix_eq = format!("{}.{}=", key.axis.as_str(), key.key);
-        let prefix_colon = format!("{}.{}:", key.axis.as_str(), key.key);
-        let presence_form = format!("{}.{}", key.axis.as_str(), key.key);
-
-        let mut distinct: HashSet<String> = HashSet::new();
-        let mut presence_seen = false;
-        for entry in self.by_tag.iter() {
-            let tag = entry.key();
-            if let Some(rest) = tag.strip_prefix(&prefix_eq) {
-                distinct.insert(rest.to_string());
-            } else if let Some(rest) = tag.strip_prefix(&prefix_colon) {
-                distinct.insert(rest.to_string());
-            } else if tag.as_str() == presence_form {
-                presence_seen = true;
-            }
-        }
-        // For value-bearing keys: count of distinct values.
-        // For presence-only keys: 1 if any node has the marker.
-        if !distinct.is_empty() {
-            distinct.len()
-        } else if presence_seen {
-            1
-        } else {
-            0
-        }
+        self.by_axis_key
+            .get(key)
+            .map(|inner| inner.len())
+            .unwrap_or(0)
     }
 
     /// Query nodes by filter
@@ -3361,7 +3406,8 @@ mod tests {
     #[test]
     fn axis_cardinality_handles_high_cardinality_keys() {
         // 100 nodes with distinct memory values → cardinality 100.
-        // Pin: the linear scan handles modest sizes correctly.
+        // Pin: the O(1) by_axis_key lookup handles modest sizes
+        // correctly (was an O(N) scan in the previous implementation).
         let index = CapabilityIndex::new();
         for i in 0..100u32 {
             let caps = CapabilitySet::new().with_hardware(
@@ -3374,6 +3420,39 @@ mod tests {
             "memory_mb",
         );
         assert_eq!(index.axis_cardinality(&key), 100);
+    }
+
+    #[test]
+    fn axis_cardinality_decrements_on_node_removal() {
+        // Pin: removing a node updates `by_axis_key` — its values
+        // are pruned if no other node carries them. Mirrors the
+        // metadata_value_cardinality lifecycle test.
+        let index = CapabilityIndex::new();
+        // Node 1: memory_mb=1024
+        index_with_node(
+            &index,
+            1,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1024)),
+        );
+        // Node 2: memory_mb=2048
+        index_with_node(
+            &index,
+            2,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(2048)),
+        );
+        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        assert_eq!(index.axis_cardinality(&memory_key), 2);
+
+        // Remove node 1; only memory_mb=2048 left → cardinality 1.
+        index.remove(1);
+        assert_eq!(index.axis_cardinality(&memory_key), 1);
+
+        // Remove node 2; both memory values pruned → cardinality 0.
+        index.remove(2);
+        assert_eq!(index.axis_cardinality(&memory_key), 0);
     }
 
     // ========================================================================
