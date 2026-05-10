@@ -835,6 +835,16 @@ impl<'a> StandardPlacement<'a> {
         let Some(concentration) = lookup(*target) else {
             return 1.0;
         };
+        // CR-10: symmetric NaN guard. The file already clamps a
+        // NaN *penalty* below; without this guard a NaN
+        // *concentration* would slip through `<=` (NaN compares
+        // false against everything), fall into the else branch,
+        // and apply the penalty even though the threshold check
+        // is meaningless. Treat NaN concentration as "no data" —
+        // the same shape as `lookup` returning `None`.
+        if !concentration.is_finite() {
+            return 1.0;
+        }
         if concentration <= self.anti_affinity.leadership_concentration_threshold {
             1.0
         } else {
@@ -942,9 +952,18 @@ fn target_axis_value_numeric(caps: &CapabilitySet, axis: TaxonomyAxis, key: &str
 /// Soft-saturating score: `value / (value + reference)`.
 /// Bounded in `[0.0, 1.0]`; half at `value == reference`;
 /// asymptotes to 1.0 as value grows. Returns 0.0 for non-positive
-/// inputs (defensive against malformed numeric tags).
+/// or non-finite inputs (defensive against malformed numeric tags).
+///
+/// CR-9: `f64::from_str` parses `"NaN"` / `"+inf"` / `"-inf"`
+/// successfully, and `Tag::AxisValue` stores the raw string. A
+/// single `hardware.cpu_cores=NaN` would otherwise pass the
+/// `value <= 0.0` check (NaN is not <= anything), producing
+/// `value / (value + ref) = NaN` that propagates through
+/// `score_compute_axis`'s sum and gets clamped to 0.0 by
+/// `compose_axis_scores` — silently vetoing the candidate. Add
+/// the `is_finite()` guard so the NaN never enters the chain.
 fn saturating_score(value: f32, reference: f32) -> f32 {
-    if value <= 0.0 || reference <= 0.0 {
+    if value <= 0.0 || reference <= 0.0 || !value.is_finite() || !reference.is_finite() {
         return 0.0;
     }
     value / (value + reference)
@@ -2660,6 +2679,47 @@ mod tests {
         let placement = StandardPlacement::new(&index).with_leadership_stats(&stats);
         assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
         assert!((placement.score_anti_affinity_axis(&0x2222) - 0.4).abs() < 1e-6);
+    }
+
+    /// CR-10: NaN concentration is treated as "no data" (returns
+    /// 1.0). Pre-CR-10, `concentration <= threshold` was `false`
+    /// for NaN, so the else branch fired and applied the penalty
+    /// even though the threshold check is meaningless. This was
+    /// asymmetric with the existing penalty-side NaN guard.
+    #[test]
+    fn anti_affinity_treats_nan_concentration_as_no_data() {
+        let index = index_with(&[]);
+        let stats = |_id: NodeId| -> Option<f32> { Some(f32::NAN) };
+        let placement = StandardPlacement::new(&index).with_leadership_stats(&stats);
+        assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
+
+        // Infinity has the same shape — non-finite means
+        // unusable, fall back to permissive 1.0.
+        let stats_inf = |_id: NodeId| -> Option<f32> { Some(f32::INFINITY) };
+        let placement = StandardPlacement::new(&index).with_leadership_stats(&stats_inf);
+        assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
+    }
+
+    /// CR-9: `saturating_score` rejects non-finite inputs (NaN,
+    /// ±inf). `Tag::AxisValue` stores raw strings and
+    /// `f64::from_str("NaN")` parses successfully, so a single
+    /// `hardware.cpu_cores=NaN` would otherwise produce
+    /// `value/(value+ref) = NaN` that cascades into the resource
+    /// axis sum and silently vetoes the candidate via
+    /// `compose_axis_scores`'s NaN clamp.
+    #[test]
+    fn saturating_score_rejects_non_finite_inputs() {
+        // NaN value → 0.0 (no negative score; no NaN propagation).
+        assert_eq!(saturating_score(f32::NAN, 8.0), 0.0);
+        // NaN reference → 0.0.
+        assert_eq!(saturating_score(8.0, f32::NAN), 0.0);
+        // +inf value → 0.0.
+        assert_eq!(saturating_score(f32::INFINITY, 8.0), 0.0);
+        // -inf value → 0.0 (also caught by `<= 0.0`).
+        assert_eq!(saturating_score(f32::NEG_INFINITY, 8.0), 0.0);
+        // Sanity: regular path still works.
+        let s = saturating_score(8.0, 8.0);
+        assert!((s - 0.5).abs() < 1e-6);
     }
 
     /// Defensive clamp: a misconfigured penalty (NaN, negative,
