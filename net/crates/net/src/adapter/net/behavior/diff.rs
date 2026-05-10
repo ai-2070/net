@@ -493,22 +493,50 @@ impl DiffEngine {
         new: &HashSet<crate::adapter::net::behavior::tag::Tag>,
         ops: &mut Vec<DiffOp>,
     ) {
+        use crate::adapter::net::behavior::tag::Tag;
         use crate::adapter::net::behavior::tag_codec::{
-            is_hardware_owned_tag, is_models_owned_tag, is_resource_limits_owned_tag,
-            is_software_owned_tag, is_tools_owned_tag,
-        };
-        let is_axis_owned = |t: &crate::adapter::net::behavior::tag::Tag| {
-            is_hardware_owned_tag(t)
-                || is_resource_limits_owned_tag(t)
-                || is_software_owned_tag(t)
-                || is_models_owned_tag(t)
-                || is_tools_owned_tag(t)
+            hardware_from_tags, hardware_to_tags, models_from_tags, models_to_tags,
+            resource_limits_from_tags, resource_limits_to_tags, software_from_tags,
+            software_to_tags, tools_from_tags, tools_to_tags,
         };
 
-        let old_residual: HashSet<&crate::adapter::net::behavior::tag::Tag> =
-            old.iter().filter(|t| !is_axis_owned(t)).collect();
-        let new_residual: HashSet<&crate::adapter::net::behavior::tag::Tag> =
-            new.iter().filter(|t| !is_axis_owned(t)).collect();
+        // The set of tags the typed encoders ACTUALLY produce for
+        // a given input. Filter on this rather than the broader
+        // `is_*_owned_tag` predicates: those return true for every
+        // `hardware.*` / `software.*` tag including forward-compat
+        // unknowns (e.g. a peer-emitted `hardware.future_field` or
+        // `software.experimental_runtime=v1`) that the typed
+        // decoders silently drop. Without round-tripping, those
+        // unknowns get filtered out of the residual set yet aren't
+        // captured by any typed `Update*` op either — real changes
+        // disappear.
+        //
+        // The round-trip closure mirrors `set_*` mutators: a tag
+        // is "owned" iff re-encoding the decoded struct emits it
+        // again. Forward-compat tags (which the decoder ignores)
+        // therefore fall through to the residual diff and surface
+        // as `AddTag` / `RemoveTag` ops.
+        let owned = |tags: &HashSet<Tag>| -> HashSet<Tag> {
+            let v: Vec<Tag> = tags.iter().cloned().collect();
+            let mut out: HashSet<Tag> = HashSet::new();
+            out.extend(hardware_to_tags(&hardware_from_tags(&v)));
+            out.extend(software_to_tags(&software_from_tags(&v)));
+            out.extend(models_to_tags(&models_from_tags(&v)));
+            out.extend(tools_to_tags(&tools_from_tags(&v)));
+            out.extend(resource_limits_to_tags(&resource_limits_from_tags(&v)));
+            out
+        };
+        let old_owned = owned(old);
+        let new_owned = owned(new);
+
+        let old_residual: HashSet<&Tag> = old
+            .iter()
+            .filter(|t| !old_owned.contains(*t))
+            .collect();
+        let new_residual: HashSet<&Tag> = new
+            .iter()
+            .filter(|t| !new_owned.contains(*t))
+            .collect();
 
         for tag in old_residual.difference(&new_residual) {
             ops.push(DiffOp::RemoveTag(tag.to_string()));
@@ -1137,6 +1165,67 @@ mod tests {
         let ops = DiffEngine::diff(&old, &new);
         assert_eq!(ops.len(), 1);
         assert!(matches!(&ops[0], DiffOp::RemoveTag(t) if t == "inference"));
+    }
+
+    /// Regression: forward-compatible axis-prefixed tags that the
+    /// typed decoders silently ignore (e.g. a peer-emitted
+    /// `hardware.future_field=v2`) used to be filtered as
+    /// "axis-owned" by `is_*_owned_tag`, removed from the residual
+    /// diff, AND ignored by every typed `Update*` op — real
+    /// changes disappeared. The fix uses the round-trip closure
+    /// (`*_to_tags(&*_from_tags(...))`) to identify what's
+    /// actually consumed by the typed encoders, so unknowns fall
+    /// through to AddTag / RemoveTag.
+    #[test]
+    fn diff_emits_addtag_removetag_for_forward_compat_axis_tags() {
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        use crate::adapter::net::behavior::tag::Tag;
+
+        let make = |raw: &str| Tag::parse(raw).expect("tag parses");
+
+        // Forward-compat axis tag added across the diff. Neither
+        // side carries any other axis-relevant content, so the
+        // typed encoders produce empty closures and the residual
+        // diff sees the tag exactly once.
+        let old = CapabilitySet::new();
+        let mut new = CapabilitySet::new();
+        new.tags.insert(make("hardware.future_field=v2"));
+
+        let ops = DiffEngine::diff(&old, &new);
+        assert!(
+            ops.iter().any(|op| matches!(op, DiffOp::AddTag(t) if t == "hardware.future_field=v2")),
+            "expected AddTag(hardware.future_field=v2) for forward-compat axis tag, got {:?}",
+            ops,
+        );
+
+        // Symmetric: forward-compat tag removed.
+        let mut old = CapabilitySet::new();
+        old.tags.insert(make("software.experimental_runtime=v1"));
+        let new = CapabilitySet::new();
+
+        let ops = DiffEngine::diff(&old, &new);
+        assert!(
+            ops.iter().any(
+                |op| matches!(op, DiffOp::RemoveTag(t) if t == "software.experimental_runtime=v1")
+            ),
+            "expected RemoveTag(software.experimental_runtime=v1), got {:?}",
+            ops,
+        );
+
+        // Negative control: a known hardware key (encoded by
+        // `hardware_to_tags`) still routes through `UpdateHardware`,
+        // not through AddTag. The fix doesn't double-emit.
+        let old = CapabilitySet::new();
+        let new = CapabilitySet::new().with_hardware(
+            crate::adapter::net::behavior::capability::HardwareCapabilities::new().with_memory(65_536),
+        );
+        let ops = DiffEngine::diff(&old, &new);
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, DiffOp::AddTag(t) if t.starts_with("hardware.memory_mb"))),
+            "known hardware keys must not double-emit as AddTag — got {:?}",
+            ops,
+        );
     }
 
     #[test]

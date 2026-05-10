@@ -1082,7 +1082,15 @@ impl Predicate {
     /// composite handling.
     fn evaluate_leaf(&self, ctx: &EvalContext<'_>) -> bool {
         match self {
-            Self::Exists { key } => match_axis_tag(ctx.tags, key, |_| true),
+            // Presence check: matches both `AxisPresent` and
+            // `AxisValue` for `key`. Cannot route through
+            // `match_axis_tag` because that helper now skips
+            // `AxisPresent` (presence-only tags carry no value;
+            // value predicates would otherwise see `""`).
+            Self::Exists { key } => ctx
+                .tags
+                .iter()
+                .any(|t| t.axis_key().as_ref() == Some(key)),
             Self::Equals { key, value } => match_axis_tag(ctx.tags, key, |v| v == value.as_str()),
             Self::NumericAtLeast { key, threshold } => match_axis_tag(ctx.tags, key, |v| {
                 v.parse::<f64>().is_ok_and(|n| n >= *threshold)
@@ -1722,15 +1730,18 @@ fn accumulate_trace(
     }
 }
 
-/// Find any tag in `tags` matching `key` and run `value_pred` against
-/// its value. For [`Tag::AxisPresent`] (no value), `value_pred` is
-/// called with `""` so existence-style predicates can choose to match
-/// or skip.
+/// Find any value-bearing tag in `tags` matching `key` and run
+/// `value_pred` against its value. [`Tag::AxisPresent`] tags carry
+/// no value and are skipped — feeding `""` through `value_pred`
+/// would let an empty-string `Equals` / `StringPrefix` /
+/// `StringMatches` predicate spuriously match a presence-only tag.
+/// Use [`Predicate::Exists`] (which goes through a separate
+/// presence-aware path in `evaluate_leaf`) when key-presence
+/// without a value is the intended check.
 fn match_axis_tag(tags: &[Tag], key: &TagKey, value_pred: impl Fn(&str) -> bool) -> bool {
     tags.iter().any(|t| {
         t.axis_key().as_ref() == Some(key)
             && match t {
-                Tag::AxisPresent { .. } => value_pred(""),
                 Tag::AxisValue { value, .. } => value_pred(value),
                 _ => false,
             }
@@ -1770,14 +1781,23 @@ fn parse_semver(s: &str) -> Option<SemverTriple> {
 }
 
 /// `lhs` is caret-compatible with `rhs` per the standard semver
-/// rule: same major (or same minor for `0.x.y`), and `lhs >= rhs`.
+/// rule: same major (or same minor for `0.x.y`, exact for `0.0.x`),
+/// and `lhs >= rhs`. Mirrors cargo's `^` operator semantics.
 fn semver_compatible(lhs: SemverTriple, rhs: SemverTriple) -> bool {
     if lhs < rhs {
         return false;
     }
     if rhs.0 == 0 {
-        // 0.x.y — minor is the compatibility band.
-        rhs.1 == lhs.1
+        if rhs.1 == 0 {
+            // 0.0.x — patch is the compatibility band; anything
+            // other than the exact tuple is a breaking change.
+            // Combined with the `lhs >= rhs` guard above this
+            // collapses to lhs == rhs.
+            lhs == rhs
+        } else {
+            // 0.x.y — minor is the compatibility band.
+            rhs.1 == lhs.1
+        }
     } else {
         rhs.0 == lhs.0
     }
@@ -2047,6 +2067,68 @@ mod tests {
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.5.7")];
         assert!(pred!(semver_compatible "software.runtime", "0.5.0").evaluate(&ctx(&tags, &meta)));
         assert!(!pred!(semver_compatible "software.runtime", "0.4.0").evaluate(&ctx(&tags, &meta)));
+    }
+
+    /// Regression: `0.0.x` is exact-only under cargo's caret rule.
+    /// The pre-fix `rhs.0 == 0 → rhs.1 == lhs.1` branch ignored the
+    /// patch component and admitted any `0.0.y >= 0.0.x` as
+    /// compatible — concretely, `^0.0.1` would match a peer running
+    /// `0.0.2`, which is a breaking-change boundary.
+    #[test]
+    fn semver_compatible_zero_zero_patch_is_exact_only() {
+        let meta = empty_meta();
+
+        // Exact match passes.
+        let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.0.3")];
+        assert!(
+            pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta))
+        );
+
+        // Higher patch must NOT match (was admitted pre-fix).
+        let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.0.4")];
+        assert!(
+            !pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta))
+        );
+
+        // Lower patch fails (already covered by the lhs >= rhs guard).
+        let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.0.2")];
+        assert!(
+            !pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta))
+        );
+
+        // Cross-band (different minor) still fails.
+        let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.1.0")];
+        assert!(
+            !pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta))
+        );
+    }
+
+    /// Regression: presence-only tags (`Tag::AxisPresent`) must not
+    /// match value-bearing predicates. Pre-fix, `match_axis_tag` fed
+    /// `""` through `value_pred`, which let `Equals(_, "")` /
+    /// `StringPrefix(_, "")` / `StringMatches(_, "")` accept any
+    /// presence tag. Use `Exists` for key-presence checks.
+    #[test]
+    fn axis_present_does_not_satisfy_value_predicates() {
+        let tags = [axis_present(TaxonomyAxis::Hardware, "gpu")];
+        let meta = empty_meta();
+
+        // Equality with empty string was the worst offender — every
+        // presence tag matched it pre-fix.
+        assert!(!pred!(equals "hardware.gpu", "").evaluate(&ctx(&tags, &meta)));
+        // Equality with any non-empty value also doesn't match a
+        // presence tag (no value to compare against).
+        assert!(!pred!(equals "hardware.gpu", "nvidia").evaluate(&ctx(&tags, &meta)));
+        // String predicates anchored at the empty string used to
+        // permissively accept presence tags.
+        assert!(!pred!(prefix "hardware.gpu", "").evaluate(&ctx(&tags, &meta)));
+        assert!(!pred!(matches "hardware.gpu", "").evaluate(&ctx(&tags, &meta)));
+
+        // `Exists` is the correct check for key presence — it still
+        // matches both `AxisPresent` and `AxisValue` shapes.
+        assert!(pred!(exists "hardware.gpu").evaluate(&ctx(&tags, &meta)));
+        let tags = [axis_eq(TaxonomyAxis::Hardware, "gpu", "nvidia")];
+        assert!(pred!(exists "hardware.gpu").evaluate(&ctx(&tags, &meta)));
     }
 
     #[test]

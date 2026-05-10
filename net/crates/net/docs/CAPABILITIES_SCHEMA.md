@@ -215,16 +215,17 @@ Each binding's per-language schema generator reads this doc as its input. The ge
 | Key | Type | [Range] | Notes |
 ```
 
-CI guard:
+CI guard (illustrative; the substrate-side generator examples below are not yet implemented — see `plans/CAPABILITY_SYSTEM_SDK_PLAN.md` Phase 9a):
 
 ```bash
-# Regenerate each binding's schema; fail if it differs from the committed copy.
+# After Phase 9a generators land — regenerate each binding's schema
+# and fail if it differs from the committed copy.
 cargo run --example gen_schema_rust > /tmp/rust_schema.rs.gen
 diff -u net/crates/net/src/adapter/net/behavior/schema_generated.rs /tmp/rust_schema.rs.gen
 # Same for TS / Python / Go.
 ```
 
-Bindings whose generators haven't landed yet (Phase 9a per `plans/CAPABILITY_SYSTEM_SDK_PLAN.md`) are exempted from the guard.
+The `examples/gen_schema_*` binaries do not exist in the substrate today; running the snippet above will fail with `no example target named ...`. Until Phase 9a lands, the guard runs as a no-op — bindings whose generators haven't shipped yet are exempted.
 
 ---
 

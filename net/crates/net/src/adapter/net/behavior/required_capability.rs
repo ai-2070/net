@@ -134,7 +134,24 @@ pub fn __require_parse(s: &str) -> Result<RequiredCapability, RequireParseError>
         return Err(RequireParseError::Empty);
     }
 
-    // 1. Comparison operators (longer-first to avoid `=` matching `>=`).
+    // 1a. Equality (==) is checked first so `>=` / `<=` substrings
+    //     inside the value half don't get claimed by the numeric
+    //     comparator branch below. Without this ordering,
+    //     `software.id == v>=1.0` (a perfectly valid equals against
+    //     a value that happens to contain `>=`) would split at the
+    //     `>=` instead, producing a nonsensical `numeric_at_least`
+    //     predicate or a `NumericParse` error.
+    if let Some((lhs, rhs)) = s.split_once("==") {
+        let lhs = lhs.trim();
+        let rhs = rhs.trim().trim_matches('"');
+        let key = parse_tag_key(lhs)?;
+        return Ok(RequiredCapability::Predicate(Predicate::equals(
+            key,
+            rhs.to_string(),
+        )));
+    }
+
+    // 1b. Numeric comparators (longer-first to avoid `=` matching `>=`).
     for (op, build) in [
         (
             ">=",
@@ -157,15 +174,6 @@ pub fn __require_parse(s: &str) -> Result<RequiredCapability, RequireParseError>
             })?;
             return Ok(RequiredCapability::Predicate(build(key, n)));
         }
-    }
-    if let Some((lhs, rhs)) = s.split_once("==") {
-        let lhs = lhs.trim();
-        let rhs = rhs.trim().trim_matches('"');
-        let key = parse_tag_key(lhs)?;
-        return Ok(RequiredCapability::Predicate(Predicate::equals(
-            key,
-            rhs.to_string(),
-        )));
     }
 
     // 2 + 3. Plain tag (presence or value form).
@@ -199,10 +207,19 @@ pub fn __require_axis_value_parse(axis: &str, key: &str) -> Result<TagKey, Requi
 
 /// Parse `"<axis>.<key>"` into a [`TagKey`]. Used by the comparison-
 /// operator branches of [`__require_parse`].
+///
+/// Both halves are trimmed: callers split at an operator and pass
+/// the lhs through here, so leading / trailing whitespace around
+/// the `.` is benign syntax noise. Without trimming, the
+/// constructed `TagKey` would carry the spaces in the key (e.g.
+/// `"hardware. gpu == nvidia"` → `TagKey::new(Hardware, " gpu")`),
+/// silently failing every match against the real `"gpu"` tags.
 fn parse_tag_key(s: &str) -> Result<TagKey, RequireParseError> {
     let (axis_str, key) = s
         .split_once('.')
         .ok_or_else(|| RequireParseError::InvalidKey { key: s.to_string() })?;
+    let axis_str = axis_str.trim();
+    let key = key.trim();
     let axis = TaxonomyAxis::from_prefix(axis_str)
         .ok_or_else(|| RequireParseError::InvalidKey { key: s.to_string() })?;
     if key.is_empty() {
@@ -426,6 +443,56 @@ mod tests {
                 assert_eq!(value, "cuda-12.4");
             }
             other => panic!("expected Equals, got {other:?}"),
+        }
+    }
+
+    /// Regression: `==` is checked before `>=` / `<=`, so a value
+    /// half that legitimately contains `>=` (e.g. a semver-range
+    /// string `"v>=1.0"` used as an equality target) doesn't get
+    /// claimed by the numeric comparator branch and routed through
+    /// `parse_tag_key` / `f64::parse` with a nonsensical split.
+    #[test]
+    fn require_equality_value_containing_ge_is_not_claimed_by_numeric_branch() {
+        let r = require!("software.id == v>=1.0");
+        match r {
+            RequiredCapability::Predicate(Predicate::Equals { key, value }) => {
+                assert_eq!(key.axis, TaxonomyAxis::Software);
+                assert_eq!(key.key, "id");
+                assert_eq!(value, "v>=1.0");
+            }
+            other => panic!(
+                "expected Equals(software.id, v>=1.0), got {other:?} \
+                 — `==` should bind tighter than `>=`"
+            ),
+        }
+    }
+
+    /// Regression: `parse_tag_key` trims both halves of the split.
+    /// Pre-fix, `"hardware. gpu == nvidia"` produced
+    /// `TagKey::new(Hardware, " gpu")` (note the leading space) —
+    /// indistinguishable from `gpu` to a human, but every match
+    /// against real `Tag::AxisValue { key: "gpu", … }` failed
+    /// silently because `" gpu" != "gpu"`.
+    #[test]
+    fn require_parse_tag_key_trims_whitespace_around_dot() {
+        let r = require!("hardware. gpu == nvidia");
+        match r {
+            RequiredCapability::Predicate(Predicate::Equals { key, value }) => {
+                assert_eq!(key.axis, TaxonomyAxis::Hardware);
+                assert_eq!(key.key, "gpu", "key must not carry leading whitespace");
+                assert_eq!(value, "nvidia");
+            }
+            other => panic!("expected Equals(hardware.gpu, nvidia), got {other:?}"),
+        }
+
+        // Same for axis_str-side whitespace.
+        let r = require!(" hardware .gpu == nvidia");
+        match r {
+            RequiredCapability::Predicate(Predicate::Equals { key, value: _ }) => {
+                assert_eq!(key.axis, TaxonomyAxis::Hardware);
+                assert_eq!(key.key, "gpu");
+            }
+            other => panic!("expected Equals on hardware axis, got {other:?}"),
         }
     }
 
