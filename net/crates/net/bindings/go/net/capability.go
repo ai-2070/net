@@ -474,8 +474,21 @@ func nodeFromWire(n PredicateNode, prior []*Predicate, selfIdx int) (*Predicate,
 		if !ok {
 			return TagKey{}, fmt.Errorf("expected TagKey object, got %T", v)
 		}
-		axis, _ := m["axis"].(string)
-		key, _ := m["key"].(string)
+		// CR-27: assert the underlying types instead of silently
+		// dropping mismatches to empty strings. A malformed wire
+		// payload like `{"axis": 5, "key": ["x"]}` used to produce
+		// `TagKey{Axis: "", Key: ""}` — every consumer sees an
+		// empty TagKey, downstream lookups silently miss, and the
+		// cross-binding contract (Rust returns a serde error)
+		// breaks asymmetrically.
+		axis, ok := m["axis"].(string)
+		if !ok {
+			return TagKey{}, fmt.Errorf("expected TagKey.axis as string, got %T", m["axis"])
+		}
+		key, ok := m["key"].(string)
+		if !ok {
+			return TagKey{}, fmt.Errorf("expected TagKey.key as string, got %T", m["key"])
+		}
 		return TagKey{Axis: TaxonomyAxis(axis), Key: key}, nil
 	}
 	mdKeyFromWire := func(v any) (string, error) {
