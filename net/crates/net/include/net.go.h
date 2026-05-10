@@ -962,6 +962,25 @@ int      net_predicate_redact_metadata_keys(const char* report_json,
                                             char** out_redacted_json,
                                             size_t* out_redacted_len);
 
+/* CR-8: same redaction over a wire-format trace tree (output of
+ * net_predicate_evaluate_with_trace). Walks the tree and rewrites
+ * every `label` matching the metadata-clause shapes; preserves
+ * children order and `result` fields.
+ *
+ * Inputs (NUL-terminated UTF-8 JSON):
+ *   - trace_json — wire-format ClauseTrace (`{"label", "result",
+ *     "children": [...]}` recursively).
+ *   - keys_json  — `["api_key", "secret_token"]`.
+ *
+ * Output: *out_redacted_json/_len — same wire shape, free with
+ * `net_free_string`. Idempotent.
+ *
+ * Returns 0 on success, NET_ERR_* (negative) otherwise. */
+int      net_predicate_redact_trace_metadata_keys(const char* trace_json,
+                                                  const char* keys_json,
+                                                  char** out_redacted_json,
+                                                  size_t* out_redacted_len);
+
 /* =========================================================================
  * Compute — MeshDaemon + migration. Stage 6 of
  * SDK_COMPUTE_SURFACE_PLAN.md. Symbols live in `libnet_compute`

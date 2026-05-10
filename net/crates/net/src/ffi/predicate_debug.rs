@@ -489,6 +489,108 @@ pub extern "C" fn net_predicate_redact_metadata_keys(
     )
 }
 
+// =========================================================================
+// CR-8 — redact_trace_metadata_keys
+//
+// `redact_metadata_keys` (above) only scrubs the `clause_stats`
+// of an aggregated `PredicateDebugReport`. The single-eval trace
+// tree produced by `net_predicate_evaluate_with_trace` carries the
+// same kind of metadata-clause labels (`MetadataEquals(api_key=
+// sk-...)`), and consumers persisting traces for offline analysis
+// have no way to scrub them today. This entry point applies the
+// same `redact_label` rewrite recursively across the trace.
+// =========================================================================
+
+/// Walk a trace-tree `Value` and redact every `label` that matches
+/// the metadata-clause shapes. Children are rewritten in place; the
+/// `result` field is preserved.
+fn redact_trace_value(node: &Value, keys: &BTreeSet<String>) -> Value {
+    let label = node
+        .get("label")
+        .and_then(|l| l.as_str())
+        .unwrap_or_default();
+    let result = node.get("result").cloned().unwrap_or(Value::Null);
+    let children: Vec<Value> = node
+        .get("children")
+        .and_then(|c| c.as_array())
+        .map(|arr| arr.iter().map(|c| redact_trace_value(c, keys)).collect())
+        .unwrap_or_default();
+    json!({
+        "label": redact_label(label, keys),
+        "result": result,
+        "children": children,
+    })
+}
+
+/// Apply the `redact_label` rewrite across a wire-format trace
+/// tree (the JSON output of [`net_predicate_evaluate_with_trace`]).
+///
+/// Inputs (NUL-terminated UTF-8 JSON):
+///
+///   - `trace_json` — wire-format `ClauseTrace` shape
+///     (`{"label", "result", "children": [...]}` recursively).
+///   - `keys_json`  — JSON array of metadata key names whose
+///     values should be scrubbed: `["api_key", "secret_token"]`.
+///
+/// Outputs:
+///
+///   - `out_redacted_json` / `out_redacted_len` — the redacted
+///     trace JSON. Free with `net_free_string`. Same wire shape as
+///     the input. Children order is preserved.
+///
+/// Returns `0` on success, `NetError::*` (negative) on parse /
+/// null-pointer failure.
+///
+/// Idempotent: redacting an already-redacted trace with the same
+/// keys is a no-op.
+///
+/// # Safety
+///
+/// All input pointers MUST point at NUL-terminated UTF-8 strings.
+/// On success the caller owns the redacted-trace buffer and frees
+/// it via `net_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_predicate_redact_trace_metadata_keys(
+    trace_json: *const c_char,
+    keys_json: *const c_char,
+    out_redacted_json: *mut *mut c_char,
+    out_redacted_len: *mut usize,
+) -> c_int {
+    if trace_json.is_null()
+        || keys_json.is_null()
+        || out_redacted_json.is_null()
+        || out_redacted_len.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+
+    let trace_s = match unsafe { super::mesh::c_str_to_string(trace_json) } {
+        Some(s) => s,
+        None => return NetError::InvalidUtf8.into(),
+    };
+    let keys_s = match unsafe { super::mesh::c_str_to_string(keys_json) } {
+        Some(s) => s,
+        None => return NetError::InvalidUtf8.into(),
+    };
+
+    let trace: Value = match serde_json::from_str(&trace_s) {
+        Ok(v) => v,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let keys_vec: Vec<String> = match serde_json::from_str(&keys_s) {
+        Ok(v) => v,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let keys: BTreeSet<String> = keys_vec.into_iter().collect();
+
+    let redacted = redact_trace_value(&trace, &keys);
+    super::mesh::write_string_out(
+        serde_json::to_string(&redacted).unwrap_or_else(|_| "{}".to_string()),
+        out_redacted_json,
+        out_redacted_len,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +756,97 @@ mod tests {
         let pass2 = read_and_free(out2);
 
         assert_eq!(pass1, pass2, "redaction must be idempotent");
+    }
+
+    /// CR-8: `redact_trace_metadata_keys` rewrites metadata-clause
+    /// labels in a trace tree the same way `redact_metadata_keys`
+    /// rewrites them in an aggregated report. Pre-CR-8 the trace
+    /// surface had no redaction sibling, so consumers persisting
+    /// traces from `evaluate_with_trace` had no way to scrub
+    /// secrets.
+    #[test]
+    fn redact_trace_metadata_keys_rewrites_recursively() {
+        // Two-leaf AND with one targeted MetadataEquals leaf and
+        // one untargeted Exists leaf. Trace shape mirrors
+        // `clause_trace_to_wire` output.
+        let trace = CString::new(
+            r#"{
+                "label": "And(2)",
+                "result": true,
+                "children": [
+                    {"label": "MetadataEquals(api_key=sk-secret-1)", "result": true, "children": []},
+                    {"label": "Exists(hardware.gpu)", "result": true, "children": []}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let keys = CString::new(r#"["api_key"]"#).unwrap();
+
+        let mut out_ptr: *mut c_char = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = net_predicate_redact_trace_metadata_keys(
+            trace.as_ptr(),
+            keys.as_ptr(),
+            &mut out_ptr,
+            &mut out_len,
+        );
+        assert_eq!(rc, 0);
+
+        let redacted = read_and_free(out_ptr);
+        let v: Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(v["label"], "And(2)");
+        assert_eq!(v["result"], true);
+        let children = v["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(
+            children[0]["label"], "MetadataEquals(api_key=<redacted>)",
+            "targeted leaf must be redacted"
+        );
+        assert_eq!(
+            children[1]["label"], "Exists(hardware.gpu)",
+            "non-metadata leaf must pass through"
+        );
+        // Verify the secret literal is gone from the entire output.
+        assert!(
+            !redacted.contains("sk-secret-1"),
+            "secret value still present in redacted trace: {redacted}"
+        );
+    }
+
+    /// Idempotent: redacting an already-redacted trace is a no-op.
+    #[test]
+    fn redact_trace_metadata_keys_is_idempotent() {
+        let trace = CString::new(
+            r#"{
+                "label": "MetadataEquals(secret=foo)",
+                "result": false,
+                "children": []
+            }"#,
+        )
+        .unwrap();
+        let keys = CString::new(r#"["secret"]"#).unwrap();
+
+        let mut out1: *mut c_char = std::ptr::null_mut();
+        let mut len1: usize = 0;
+        net_predicate_redact_trace_metadata_keys(
+            trace.as_ptr(),
+            keys.as_ptr(),
+            &mut out1,
+            &mut len1,
+        );
+        let pass1 = read_and_free(out1);
+        let pass1_cs = CString::new(pass1.clone()).unwrap();
+
+        let mut out2: *mut c_char = std::ptr::null_mut();
+        let mut len2: usize = 0;
+        net_predicate_redact_trace_metadata_keys(
+            pass1_cs.as_ptr(),
+            keys.as_ptr(),
+            &mut out2,
+            &mut len2,
+        );
+        let pass2 = read_and_free(out2);
+        assert_eq!(pass1, pass2);
     }
 
     /// NULL inputs return `NullPointer` from each function.
