@@ -1,0 +1,23 @@
+net/crates/net/sdk-py/src/net_sdk/capability_schema.py
+  s_e3c24456981f5d::t_ddc8b297dddc85 15
+  s_e3c24456981f5d::t_69283fc6c94796 321-334
+  s_e3c24456981f5d::t_e4388350e5fc93 376-385
+net/crates/net/sdk-py/tests/test_capability_validation.py
+  s_e3c24456981f5d::t_58b5aa81d7acf7 234-262
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "b23ef82fc02215870ce02c580e9517967615f8dc",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
