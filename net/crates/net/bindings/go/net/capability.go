@@ -643,6 +643,27 @@ func PredicateFromRPCHeader(value string) (*Predicate, error) {
 	return PredicateFromWire(w)
 }
 
+// WhereHeader builds the canonical `cyberdeck-where:` request-header
+// entry for Phase 9b predicate-pushdown calls.
+//
+// The returned `(name, value)` pair drops into any `request_headers`-
+// shaped option list once `MeshRpc.Call` exposes one. Today the
+// `rpc-ffi` C ABI doesn't accept request headers (deadline + cancel
+// only); downstream Go maintainers extending the FFI surface use
+// this helper as the canonical encoder for the cyberdeck-where
+// header value.
+//
+// The header value is the canonical JSON-encoded `PredicateWire`
+// pinned by `predicate_nrpc_envelope.json`.
+func WhereHeader(p *Predicate) (string, []byte, error) {
+	wire := PredicateToWire(p)
+	bytes, err := json.Marshal(wire)
+	if err != nil {
+		return "", nil, err
+	}
+	return RPCWhereHeader, bytes, nil
+}
+
 // ============================================================================
 // CapabilitySet diff — wire-format input, sorted output.
 // ============================================================================

@@ -605,6 +605,28 @@ def predicate_from_rpc_header(value: str) -> Predicate:
     return predicate_from_wire(json.loads(value))
 
 
+def where_header(pred: Predicate) -> Tuple[str, bytes]:
+    """Build the canonical ``cyberdeck-where:`` request-header entry
+    for Phase 9b predicate-pushdown calls. Drops straight into the
+    ``request_headers`` list of a Python ``MeshRpc.call`` opts dict.
+
+    Example::
+
+        from net_sdk import p, tag_key, where_header
+        pred = p.exists(tag_key("hardware", "gpu"))
+        await mesh_rpc.call(
+            target_node_id,
+            "filter-svc",
+            payload,
+            opts={"request_headers": [where_header(pred)]},
+        )
+
+    The header value is the canonical JSON-encoded ``PredicateWire``
+    pinned by ``predicate_nrpc_envelope.json``.
+    """
+    return (RPC_WHERE_HEADER, predicate_to_rpc_header(pred).encode("utf-8"))
+
+
 # ============================================================================
 # CapabilitySet diff — wire-format input, sorted output.
 # ============================================================================
@@ -1518,6 +1540,7 @@ __all__ = [
     "RPC_WHERE_HEADER",
     "predicate_to_rpc_header",
     "predicate_from_rpc_header",
+    "where_header",
     "CapabilitySetWire",
     "CapabilitySetDiff",
     "MetadataChange",

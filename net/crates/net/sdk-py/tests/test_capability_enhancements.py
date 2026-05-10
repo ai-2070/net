@@ -278,6 +278,18 @@ def test_predicate_to_rpc_header_canonical_json() -> None:
     }
 
 
+def test_where_header_builds_canonical_entry() -> None:
+    """Phase 9b: ``where_header(pred)`` returns ``(name, bytes)``
+    suitable for the ``request_headers`` opts list."""
+    from net_sdk import RPC_WHERE_HEADER, where_header
+
+    pred = p.exists(tag_key("hardware", "gpu"))
+    name, value = where_header(pred)
+    assert name == RPC_WHERE_HEADER
+    assert isinstance(value, bytes)
+    assert value.decode("utf-8") == predicate_to_rpc_header(pred)
+
+
 # ---------------------------------------------------------------------------
 # StandardPlacement builder + custom placement filter
 # ---------------------------------------------------------------------------

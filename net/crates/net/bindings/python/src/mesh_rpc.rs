@@ -297,6 +297,20 @@ fn call_options_from_dict(opts: Option<&Bound<'_, PyDict>>) -> PyResult<InnerCal
         })?;
         inner.stream_window_initial = Some(n);
     }
+    // Phase 9b: caller-supplied request headers. Accepts a
+    // `List[Tuple[str, bytes]]` — each entry's name is a
+    // lowercase `cyberdeck-*` / `nrpc-*` string; value is raw
+    // bytes (UTF-8 for text-like headers). Most notable user is
+    // the `cyberdeck-where:` predicate-pushdown header; build
+    // entries via `net_sdk.where_header(pred)`.
+    if let Some(v) = d.get_item("request_headers")? {
+        let list: Vec<(String, Vec<u8>)> = v.extract().map_err(|e| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "request_headers must be List[Tuple[str, bytes]]: {e}"
+            ))
+        })?;
+        inner.request_headers = list;
+    }
     Ok(inner)
 }
 
