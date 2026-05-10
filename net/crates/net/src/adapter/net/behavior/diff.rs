@@ -568,19 +568,40 @@ impl DiffEngine {
             .filter(|t| is_residual(t, &new_consumed))
             .collect();
 
-        for tag in old_residual.difference(&new_residual) {
-            ops.push(DiffOp::RemoveTag(tag.to_string()));
+        // Deterministic op order: HashSet iteration is randomized,
+        // so two senders with identical inputs would otherwise emit
+        // ops in different orders, breaking signed-envelope hashing
+        // (same class as 3291b2c2 fixed for tag emission). Sort the
+        // residual diffs by canonical wire string. See CR-4 in
+        // `CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md`.
+        let mut removed: Vec<String> = old_residual
+            .difference(&new_residual)
+            .map(|t| t.to_string())
+            .collect();
+        removed.sort();
+        let mut added: Vec<String> = new_residual
+            .difference(&old_residual)
+            .map(|t| t.to_string())
+            .collect();
+        added.sort();
+        for s in removed {
+            ops.push(DiffOp::RemoveTag(s));
         }
-        for tag in new_residual.difference(&old_residual) {
-            ops.push(DiffOp::AddTag(tag.to_string()));
+        for s in added {
+            ops.push(DiffOp::AddTag(s));
         }
     }
 
     /// Diff models between old and new
     fn diff_models(old: &[ModelCapability], new: &[ModelCapability], ops: &mut Vec<DiffOp>) {
-        let old_map: std::collections::HashMap<&str, &ModelCapability> =
+        // BTreeMap (not HashMap) for deterministic op order: the
+        // emitted `Vec<DiffOp>` is hashed/signed by downstream
+        // consumers, and a HashMap iteration order would give
+        // identical inputs different ops sequences across runs.
+        // See CR-4 in `CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md`.
+        let old_map: std::collections::BTreeMap<&str, &ModelCapability> =
             old.iter().map(|m| (m.model_id.as_str(), m)).collect();
-        let new_map: std::collections::HashMap<&str, &ModelCapability> =
+        let new_map: std::collections::BTreeMap<&str, &ModelCapability> =
             new.iter().map(|m| (m.model_id.as_str(), m)).collect();
 
         // Removed models
@@ -636,9 +657,10 @@ impl DiffEngine {
 
     /// Diff tools between old and new
     fn diff_tools(old: &[ToolCapability], new: &[ToolCapability], ops: &mut Vec<DiffOp>) {
-        let old_map: std::collections::HashMap<&str, &ToolCapability> =
+        // BTreeMap for deterministic op order — see CR-4 / diff_models.
+        let old_map: std::collections::BTreeMap<&str, &ToolCapability> =
             old.iter().map(|t| (t.tool_id.as_str(), t)).collect();
-        let new_map: std::collections::HashMap<&str, &ToolCapability> =
+        let new_map: std::collections::BTreeMap<&str, &ToolCapability> =
             new.iter().map(|t| (t.tool_id.as_str(), t)).collect();
 
         // Removed tools
@@ -679,13 +701,14 @@ impl DiffEngine {
             return;
         }
 
-        // Diff runtimes
-        let old_runtimes: std::collections::HashMap<&str, &str> = old
+        // Diff runtimes — BTreeMap for deterministic op order
+        // (see CR-4 / diff_models).
+        let old_runtimes: std::collections::BTreeMap<&str, &str> = old
             .runtimes
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_str()))
             .collect();
-        let new_runtimes: std::collections::HashMap<&str, &str> = new
+        let new_runtimes: std::collections::BTreeMap<&str, &str> = new
             .runtimes
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_str()))
@@ -705,13 +728,13 @@ impl DiffEngine {
             }
         }
 
-        // Diff frameworks
-        let old_frameworks: std::collections::HashMap<&str, &str> = old
+        // Diff frameworks — BTreeMap for deterministic op order.
+        let old_frameworks: std::collections::BTreeMap<&str, &str> = old
             .frameworks
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_str()))
             .collect();
-        let new_frameworks: std::collections::HashMap<&str, &str> = new
+        let new_frameworks: std::collections::BTreeMap<&str, &str> = new
             .frameworks
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_str()))
@@ -1162,6 +1185,59 @@ mod tests {
             .add_tag("inference")
             .add_tag("gpu")
             .with_limits(ResourceLimits::new().with_max_concurrent(10))
+    }
+
+    /// Regression for CR-4: diff op order must be deterministic
+    /// across runs. Previously `diff_tags` iterated `HashSet`
+    /// difference and `diff_models` / `diff_tools` / `diff_software`
+    /// iterated `HashMap`s — both have randomized order, so two
+    /// senders with identical inputs (or one sender retrying) would
+    /// emit ops in different orders, breaking signed-envelope
+    /// hashing. Run the diff multiple times and pin equality.
+    #[test]
+    fn diff_op_order_is_stable_across_runs() {
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        use crate::adapter::net::behavior::tag::Tag;
+
+        // Many residual tags so any HashSet iteration randomness
+        // is overwhelmingly likely to surface across 64 runs.
+        let mut old = CapabilitySet::new();
+        let mut new = CapabilitySet::new();
+        for i in 0..16 {
+            old.tags
+                .insert(Tag::parse(&format!("legacy-old-{i}")).unwrap());
+            new.tags
+                .insert(Tag::parse(&format!("legacy-new-{i}")).unwrap());
+        }
+
+        // Multiple models in both sides exercise diff_models.
+        for i in 0..8 {
+            let m = ModelCapability::new(format!("model-{i}"), "llama").with_tokens_per_sec(50);
+            old = old.add_model(m.clone());
+            // Skip every other model in `new` so removed-models is
+            // exercised; modify the rest so updates are exercised.
+            if i % 2 == 0 {
+                new = new.add_model(m.with_tokens_per_sec(60));
+            }
+        }
+
+        // Multiple tools.
+        for i in 0..8 {
+            let t = ToolCapability::new(format!("tool-{i}"), format!("Tool {i}"));
+            old = old.add_tool(t.clone());
+            if i % 3 != 0 {
+                new = new.add_tool(t);
+            }
+        }
+
+        let baseline = DiffEngine::diff(&old, &new);
+        for run in 0..64 {
+            let next = DiffEngine::diff(&old, &new);
+            assert_eq!(
+                baseline, next,
+                "run {run}: diff op order differed across runs"
+            );
+        }
     }
 
     #[test]
