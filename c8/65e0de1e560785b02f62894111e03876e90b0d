@@ -1,0 +1,19 @@
+net/crates/net/docs/CAPABILITY_ENHANCEMENTS_USAGE.md
+  s_d1b11a1287c170::t_bd378f62ef6423 1-414
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "c865e0de1e560785b02f62894111e03876e90b0d",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
