@@ -1158,6 +1158,17 @@ impl Predicate {
     }
 
     /// `Or` short-circuit evaluation in cost-ascending child order.
+    ///
+    /// CR-18: this uses the same `static_cost` as the And path,
+    /// not a mirrored Or-specific function. The And-vs-Or
+    /// asymmetry (And wants rare-true clauses first to fail
+    /// fast; Or wants often-true clauses first to succeed fast)
+    /// is encoded in the index-aware path via
+    /// [`Self::dynamic_cost`] vs [`Self::dynamic_cost_or`], which
+    /// invert the cardinality direction. Without an index the
+    /// planner has no per-clause trueness signal, so it falls
+    /// back to ordering by raw evaluation work — neutral between
+    /// And and Or, which is the best we can do here.
     fn eval_any_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>) -> bool {
         let mut order: Vec<usize> = (0..children.len()).collect();
         order.sort_by_key(|&i| children[i].static_cost());
