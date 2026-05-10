@@ -56,9 +56,9 @@ pub use predicate::{
 
 pub use placement::{
     AntiAffinityConfig, Artifact, ColocationPolicy, IntentMatchPolicy, IntentRegistry,
-    LegacyPlacement, NodeId as PlacementNodeId, PlacementFilter, PlacementMetadataKeys,
-    ResourceAxis, RttLookup, ScopeLabel, StandardPlacement, TieBreakContext,
-    compose_axis_scores, tie_break_compare,
+    LeadershipStatsLookup, LegacyPlacement, NodeId as PlacementNodeId, PlacementFilter,
+    PlacementMetadataKeys, ResourceAxis, RttLookup, ScopeLabel, StandardPlacement,
+    TieBreakContext, compose_axis_scores, tie_break_compare,
 };
 
 pub use required_capability::{RequireParseError, RequiredCapability};

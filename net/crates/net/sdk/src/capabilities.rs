@@ -200,9 +200,9 @@ pub use net::adapter::net::behavior::capability::{CardinalityCache, CardinalityP
 
 pub use net::adapter::net::behavior::placement::{
     AntiAffinityConfig, Artifact, ColocationPolicy, IntentMatchPolicy, IntentRegistry,
-    LegacyPlacement, NodeId as PlacementNodeId, PlacementFilter, PlacementMetadataKeys,
-    ResourceAxis, RttLookup, ScopeLabel, StandardPlacement, TieBreakContext,
-    compose_axis_scores, tie_break_compare,
+    LeadershipStatsLookup, LegacyPlacement, NodeId as PlacementNodeId, PlacementFilter,
+    PlacementMetadataKeys, ResourceAxis, RttLookup, ScopeLabel, StandardPlacement,
+    TieBreakContext, compose_axis_scores, tie_break_compare,
 };
 
 // =============================================================================

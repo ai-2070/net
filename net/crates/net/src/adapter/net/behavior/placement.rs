@@ -349,6 +349,11 @@ pub struct StandardPlacement<'a> {
     pub metadata_keys: PlacementMetadataKeys,
     /// Anti-affinity penalty configuration.
     pub anti_affinity: AntiAffinityConfig,
+    /// Closure-based leadership-stats lookup. `None` (the
+    /// default) skips the anti-affinity axis. Scheduler
+    /// integrations supply a closure that consults the local
+    /// view of `causal:*` chain holdings per peer.
+    pub leadership_stats: Option<&'a dyn LeadershipStatsLookup>,
 }
 
 impl<'a> StandardPlacement<'a> {
@@ -368,6 +373,7 @@ impl<'a> StandardPlacement<'a> {
             resource_axis: ResourceAxis::Compute,
             metadata_keys: PlacementMetadataKeys::default(),
             anti_affinity: AntiAffinityConfig::default(),
+            leadership_stats: None,
         }
     }
 
@@ -389,6 +395,14 @@ impl<'a> StandardPlacement<'a> {
     /// 1.0 / disabled).
     pub fn with_rtt_lookup(mut self, lookup: &'a dyn RttLookup) -> Self {
         self.rtt_lookup = Some(lookup);
+        self
+    }
+
+    /// Replace the leadership-stats lookup closure. Pair with
+    /// the default `anti_affinity` config (or override via direct
+    /// field write) for the anti-affinity axis to apply.
+    pub fn with_leadership_stats(mut self, lookup: &'a dyn LeadershipStatsLookup) -> Self {
+        self.leadership_stats = Some(lookup);
         self
     }
 
@@ -746,11 +760,44 @@ impl<'a> StandardPlacement<'a> {
         }
     }
 
-    fn score_anti_affinity_axis(&self, _target: &NodeId) -> f32 {
-        // Stub: anti-affinity axis always satisfied. Slice 5 reads
-        // local-view leadership-concentration stats and applies
-        // `leadership_concentration_penalty` past the threshold.
-        1.0
+    /// Phase F slice 5 anti-affinity axis. Penalizes nodes that
+    /// already lead a high fraction of locally-observed channels;
+    /// load-bearing for `REDEX_DISTRIBUTED_PLAN.md`'s
+    /// leader-election where uneven leadership concentration is
+    /// the failure mode worth preventing.
+    ///
+    /// Score:
+    /// - `leadership_stats: None` → 1.0 (axis disabled).
+    /// - Lookup returns `None` for the target → 1.0 (no data;
+    ///   permissive).
+    /// - Lookup returns `Some(c)` with `c <= threshold` → 1.0
+    ///   (under threshold; no penalty).
+    /// - Lookup returns `Some(c)` with `c > threshold` →
+    ///   `leadership_concentration_penalty` (default 0.4) — the
+    ///   over-concentrated candidate is penalized but not vetoed.
+    ///
+    /// Penalty values are clamped to `[0.0, 1.0]` defensively;
+    /// callers that misconfigure the penalty (e.g. NaN or > 1.0)
+    /// can't blow up the multiplicative composition.
+    fn score_anti_affinity_axis(&self, target: &NodeId) -> f32 {
+        let Some(lookup) = self.leadership_stats else {
+            return 1.0;
+        };
+        let Some(concentration) = lookup(*target) else {
+            return 1.0;
+        };
+        if concentration <= self.anti_affinity.leadership_concentration_threshold {
+            1.0
+        } else {
+            // Defensive clamp — a misconfigured penalty (NaN or
+            // out-of-range) shouldn't escape into the composition.
+            let p = self.anti_affinity.leadership_concentration_penalty;
+            if p.is_nan() {
+                0.0
+            } else {
+                p.clamp(0.0, 1.0)
+            }
+        }
     }
 }
 
@@ -1072,6 +1119,22 @@ impl IntentRegistry {
 /// a `&dyn` to it without dragging Fn lifetimes through.
 pub trait RttLookup: Fn(NodeId) -> Option<u64> + Sync {}
 impl<F: Fn(NodeId) -> Option<u64> + Sync> RttLookup for F {}
+
+/// Closure-based leadership-concentration stats lookup. Returns
+/// the candidate's leadership-concentration ratio in `[0.0, 1.0]`
+/// — fraction of locally-observed channels for which the
+/// candidate is currently the leader. The substrate exposes the
+/// raw ratio elsewhere; the placement module stays decoupled via
+/// this closure.
+///
+/// `None` return = "no data for this candidate" (treated as
+/// permissive by the anti-affinity axis); `Some(0.0)` = "leads
+/// nothing"; `Some(1.0)` = "leads every observed channel."
+///
+/// Trait alias mirroring `RttLookup` so both lookups have parallel
+/// builder + storage shape.
+pub trait LeadershipStatsLookup: Fn(NodeId) -> Option<f32> + Sync {}
+impl<F: Fn(NodeId) -> Option<f32> + Sync> LeadershipStatsLookup for F {}
 
 /// Inputs the tie-breaker reads.
 ///
@@ -2460,6 +2523,136 @@ mod tests {
         let score = placement.score_resource_axis(&target_caps, &artifact);
         // No parseable component → 1.0.
         assert_eq!(score, 1.0);
+    }
+
+    // ====================================================================
+    // Phase F slice 5 — anti-affinity axis
+    // ====================================================================
+
+    /// `leadership_stats: None` → 1.0 (axis disabled). Default.
+    #[test]
+    fn anti_affinity_no_stats_returns_one() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index);
+        assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
+    }
+
+    /// Stats configured + target has no data → 1.0 (permissive on
+    /// missing data, parallel to proximity).
+    #[test]
+    fn anti_affinity_target_without_data_returns_one() {
+        let index = index_with(&[]);
+        let stats = |_id: NodeId| -> Option<f32> { None };
+        let placement = StandardPlacement::new(&index)
+            .with_leadership_stats(&stats);
+        assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
+    }
+
+    /// Concentration under the threshold → 1.0 (no penalty).
+    /// Default threshold is 0.30.
+    #[test]
+    fn anti_affinity_under_threshold_returns_one() {
+        let index = index_with(&[]);
+        let stats = |_id: NodeId| -> Option<f32> { Some(0.20) };
+        let placement = StandardPlacement::new(&index)
+            .with_leadership_stats(&stats);
+        assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
+    }
+
+    /// Concentration exactly at the threshold → 1.0 (inclusive).
+    #[test]
+    fn anti_affinity_at_threshold_returns_one_inclusive() {
+        let index = index_with(&[]);
+        let stats = |_id: NodeId| -> Option<f32> { Some(0.30) };
+        let placement = StandardPlacement::new(&index)
+            .with_leadership_stats(&stats);
+        assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
+    }
+
+    /// Concentration over the threshold → penalty value.
+    /// Default penalty is 0.4.
+    #[test]
+    fn anti_affinity_over_threshold_returns_penalty() {
+        let index = index_with(&[]);
+        let stats = |_id: NodeId| -> Option<f32> { Some(0.50) };
+        let placement = StandardPlacement::new(&index)
+            .with_leadership_stats(&stats);
+        let score = placement.score_anti_affinity_axis(&0x1111);
+        assert!(
+            (score - 0.4).abs() < 1e-6,
+            "default penalty 0.4; got {score}"
+        );
+    }
+
+    /// Per-candidate discrimination: stats lookup distinguishes
+    /// candidates by NodeId. Under-threshold one passes; over-
+    /// threshold one is penalized.
+    #[test]
+    fn anti_affinity_per_candidate_via_stats() {
+        let index = index_with(&[]);
+        let stats = |id: NodeId| -> Option<f32> {
+            match id {
+                0x1111 => Some(0.10), // light leader
+                0x2222 => Some(0.50), // heavy leader
+                _ => None,
+            }
+        };
+        let placement = StandardPlacement::new(&index)
+            .with_leadership_stats(&stats);
+        assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
+        assert!((placement.score_anti_affinity_axis(&0x2222) - 0.4).abs() < 1e-6);
+    }
+
+    /// Defensive clamp: a misconfigured penalty (NaN, negative,
+    /// > 1.0) doesn't blow up the multiplicative composition.
+    #[test]
+    fn anti_affinity_defensive_clamps_misconfigured_penalty() {
+        let index = index_with(&[]);
+        let stats = |_id: NodeId| -> Option<f32> { Some(0.50) };
+
+        // NaN → 0.0.
+        let mut placement = StandardPlacement::new(&index)
+            .with_leadership_stats(&stats);
+        placement.anti_affinity.leadership_concentration_penalty = f32::NAN;
+        assert_eq!(placement.score_anti_affinity_axis(&0x1111), 0.0);
+
+        // > 1.0 → clamped to 1.0.
+        placement.anti_affinity.leadership_concentration_penalty = 2.0;
+        assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
+
+        // < 0.0 → clamped to 0.0.
+        placement.anti_affinity.leadership_concentration_penalty = -0.5;
+        assert_eq!(placement.score_anti_affinity_axis(&0x1111), 0.0);
+    }
+
+    /// End-to-end: an over-threshold candidate's penalty
+    /// multiplies through the composition. Other axes 1.0 →
+    /// final score = 0.4.
+    #[test]
+    fn anti_affinity_penalty_multiplies_through_composition() {
+        let target_caps = empty_caps();
+        let index = {
+            let i = CapabilityIndex::new();
+            let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+            let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
+            i.index(ad);
+            i
+        };
+        let stats = |_id: NodeId| -> Option<f32> { Some(0.50) };
+        let placement = StandardPlacement::new(&index)
+            .with_leadership_stats(&stats);
+
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+
+        let score = placement
+            .placement_score(&0x1111, &artifact)
+            .expect("hard-constraint check passes");
+        assert!(
+            (score - 0.4).abs() < 1e-6,
+            "anti-affinity penalty (0.4) is the only non-1.0 axis; got {score}"
+        );
     }
 
     /// End-to-end: low resource score multiplies through
