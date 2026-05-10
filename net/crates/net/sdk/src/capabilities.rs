@@ -205,6 +205,16 @@ pub use net::adapter::net::behavior::placement::{
     TieBreakContext, compose_axis_scores, tie_break_compare,
 };
 
+// Phase 7 of the SDK plan — registry mapping SDK-generated IDs
+// (`pf-N` from `placementFilterFromFn` in TS/Python/Go) to
+// `Arc<dyn PlacementFilter>`. Bindings register their language-
+// specific `PlacementFilter` wrappers here; scheduler-invoking
+// code resolves an SDK ID to an impl before passing
+// `&dyn PlacementFilter` to the scheduler.
+pub use net::adapter::net::behavior::placement_registry::{
+    PlacementFilterRegistry, global_placement_filter_registry,
+};
+
 // =============================================================================
 // Required capability + macros — Phase A.3 of
 // `CAPABILITY_SYSTEM_PLAN.md`. Used by `IntentRegistry` (Phase F)

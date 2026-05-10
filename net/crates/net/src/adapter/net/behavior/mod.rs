@@ -19,6 +19,7 @@ pub mod diff;
 pub mod loadbalance;
 pub mod metadata;
 pub mod placement;
+pub mod placement_registry;
 pub mod predicate;
 pub mod proximity;
 pub mod required_capability;
@@ -60,6 +61,8 @@ pub use placement::{
     PlacementMetadataKeys, ResourceAxis, RttLookup, ScopeLabel, StandardPlacement,
     TieBreakContext, compose_axis_scores, tie_break_compare,
 };
+
+pub use placement_registry::{PlacementFilterRegistry, global_placement_filter_registry};
 
 pub use required_capability::{RequireParseError, RequiredCapability};
 
