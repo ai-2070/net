@@ -1,0 +1,23 @@
+net/crates/net/docs/releases/RELEASE_v0.13_CHIPPIN_IN.md
+  s_9163f300668f8b::t_7e93b39a74c9c9 178-223
+  s_9163f300668f8b::t_5a394209b42426 326-327,331
+  s_9163f300668f8b::t_84f1dd5f29d699 285-286
+  s_9163f300668f8b::t_cabf626e5edf17 229-230
+  s_9163f300668f8b::t_0fcce0c9210b29 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "a4ac92c8ea6aa4efe7b7bdb034e86b8547b7cc8d",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
