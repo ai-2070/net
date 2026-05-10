@@ -273,7 +273,10 @@ pub use net::{require, require_axis, require_axis_value};
 /// let mut metadata = BTreeMap::new();
 /// metadata.insert("intent".into(), "ml-training".into());
 /// let _ctx = EvalContext::new(&tags, &metadata);
-/// // pred.evaluate(&_ctx) → true (gpu present, intent matches; memory clause fails since not in tags)
+/// // pred.evaluate(&_ctx) → false: an `And` is true only when ALL
+/// // clauses are true. The candidate has gpu and intent=ml-training,
+/// // but no `hardware.memory_mb` tag, so the NumericAtLeast clause
+/// // fails and short-circuits the And to false.
 /// ```
 pub mod predicate {
     pub use net::adapter::net::behavior::predicate::{
