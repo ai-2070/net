@@ -182,14 +182,20 @@ func (id *Identity) NodeID() uint64 {
 	return uint64(C.net_identity_node_id(id.handle))
 }
 
-// OriginHash returns the 32-bit origin hash used in packet headers.
-func (id *Identity) OriginHash() uint32 {
+// OriginHash returns the 64-bit origin hash used in packet headers.
+//
+// Pre-2026-05-11 this returned uint32, truncating the upper 32 bits
+// of the canonical u64 origin_hash the Rust substrate emits. The Go
+// header was widened to match the canonical FFI signature; callers
+// that previously read the truncated low 32 bits will now see the
+// full 64-bit value.
+func (id *Identity) OriginHash() uint64 {
 	id.mu.RLock()
 	defer id.mu.RUnlock()
 	if id.handle == nil {
 		return 0
 	}
-	return uint32(C.net_identity_origin_hash(id.handle))
+	return uint64(C.net_identity_origin_hash(id.handle))
 }
 
 // Sign signs `msg` with the identity's ed25519 secret key.

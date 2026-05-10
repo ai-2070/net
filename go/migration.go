@@ -174,14 +174,14 @@ func DefaultMigrationOptions() MigrationOptions {
 // driving it to completion. Call Close when done.
 type MigrationHandle struct {
 	handle     *C.net_compute_migration_handle_t
-	originHash uint32
+	originHash uint64
 	sourceNode uint64
 	targetNode uint64
 	mu         sync.RWMutex
 }
 
-// OriginHash returns the 32-bit origin_hash of the migrating daemon.
-func (h *MigrationHandle) OriginHash() uint32 { return h.originHash }
+// OriginHash returns the 64-bit origin_hash of the migrating daemon.
+func (h *MigrationHandle) OriginHash() uint64 { return h.originHash }
 
 // SourceNode returns the source node ID.
 func (h *MigrationHandle) SourceNode() uint64 { return h.sourceNode }
@@ -331,7 +331,7 @@ func (h *MigrationHandle) Close() {
 // options (identity transport on, 30 s NotReady retry). Returns
 // a *MigrationHandle whose `Wait()` resolves on terminal state.
 func (rt *DaemonRuntime) StartMigration(
-	originHash uint32,
+	originHash uint64,
 	sourceNode uint64,
 	targetNode uint64,
 ) (*MigrationHandle, error) {
@@ -342,7 +342,7 @@ func (rt *DaemonRuntime) StartMigration(
 // `opts.TransportIdentity = false` for identity-envelope-free
 // migrations, or tune `opts.RetryNotReadyMs`.
 func (rt *DaemonRuntime) StartMigrationWith(
-	originHash uint32,
+	originHash uint64,
 	sourceNode uint64,
 	targetNode uint64,
 	opts MigrationOptions,
@@ -362,7 +362,7 @@ func (rt *DaemonRuntime) StartMigrationWith(
 	var errOut *C.char
 	code := C.net_compute_start_migration(
 		rt.handle,
-		C.uint32_t(originHash),
+		C.uint64_t(originHash),
 		C.uint64_t(sourceNode),
 		C.uint64_t(targetNode),
 		transport,
@@ -376,7 +376,7 @@ func (rt *DaemonRuntime) StartMigrationWith(
 
 	h := &MigrationHandle{
 		handle:     nativeHandle,
-		originHash: uint32(C.net_compute_migration_handle_origin_hash(nativeHandle)),
+		originHash: uint64(C.net_compute_migration_handle_origin_hash(nativeHandle)),
 		sourceNode: uint64(C.net_compute_migration_handle_source_node(nativeHandle)),
 		targetNode: uint64(C.net_compute_migration_handle_target_node(nativeHandle)),
 	}
@@ -389,7 +389,7 @@ func (rt *DaemonRuntime) StartMigrationWith(
 // factory; identity comes from the snapshot's envelope.
 func (rt *DaemonRuntime) ExpectMigration(
 	kind string,
-	originHash uint32,
+	originHash uint64,
 	cfg *DaemonHostConfig,
 ) error {
 	rt.mu.RLock()
@@ -413,7 +413,7 @@ func (rt *DaemonRuntime) ExpectMigration(
 		rt.handle,
 		kindPtr,
 		C.size_t(len(kindBytes)),
-		C.uint32_t(originHash),
+		C.uint64_t(originHash),
 		autoSnap,
 		maxLog,
 		&errOut,
@@ -476,13 +476,13 @@ func (rt *DaemonRuntime) RegisterMigrationTargetIdentity(
 
 // MigrationPhase queries the orchestrator's current migration
 // phase for `originHash`. Returns "" if no migration is in flight.
-func (rt *DaemonRuntime) MigrationPhase(originHash uint32) string {
+func (rt *DaemonRuntime) MigrationPhase(originHash uint64) string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	if rt.handle == nil {
 		return ""
 	}
-	cstr := C.net_compute_migration_phase(rt.handle, C.uint32_t(originHash))
+	cstr := C.net_compute_migration_phase(rt.handle, C.uint64_t(originHash))
 	if cstr == nil {
 		return ""
 	}

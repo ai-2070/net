@@ -487,8 +487,8 @@ for {
 
 - `NewRedex(persistentDir string) *Redex`
 - `(*Redex).OpenFile(name string, config *RedexFileConfig) (*RedexFile, error)`
-- `OpenTasks(redex *Redex, originHash uint32, persistent bool) (*TasksAdapter, error)`
-- `OpenMemories(redex *Redex, originHash uint32, persistent bool) (*MemoriesAdapter, error)`
+- `OpenTasks(redex *Redex, originHash uint64, persistent bool) (*TasksAdapter, error)`
+- `OpenMemories(redex *Redex, originHash uint64, persistent bool) (*MemoriesAdapter, error)`
 - `(*TasksAdapter).Create / Rename / Complete / Delete / WaitForSeq / List / SnapshotAndWatch`
 - `(*MemoriesAdapter).Store / Retag / Pin / Unpin / Delete / WaitForSeq / List / SnapshotAndWatch`
 - `(*RedexFile).Append / ReadRange / Tail / Len / Sync / Close`

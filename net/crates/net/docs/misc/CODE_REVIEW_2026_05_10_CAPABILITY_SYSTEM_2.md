@@ -45,7 +45,7 @@ Bindings (Node, Python, Go cgo) all build cleanly.
 
 Out of scope (pre-existing on `master`, not introduced by this branch):
 
-- `go/net.h` declares all `origin_hash` parameters/returns as `uint32_t` while the canonical `net.go.h` and the Rust `extern "C"` signatures use `uint64_t`/`u64`. Filed as follow-up; this branch widens the surface area touching `origin_hash` (more cgo entry points) so the gap will become more painful in production.
+- ~~`go/net.h` declares all `origin_hash` parameters/returns as `uint32_t` while the canonical `net.go.h` and the Rust `extern "C"` signatures use `uint64_t`/`u64`. Filed as follow-up; this branch widens the surface area touching `origin_hash` (more cgo entry points) so the gap will become more painful in production.~~ ✅ **Fixed 2026-05-11.** `go/net.h` widened across all `origin_hash` parameters and return types (including `out_origin`, `parent_origin`, `fork_group_parent_origin`, `standby_group_active_origin`). Production Go binding (`go/*.go`) updated to `uint64`; public API surface (`DaemonHandle.OriginHash() uint64`, `MigrationHandle.OriginHash() uint64`, `ReplicaGroup.RouteEvent() uint64`, `ForkGroup.ParentOrigin() uint64`, `StandbyGroup.ActiveOrigin() uint64`, `StandbyGroup.Promote() uint64`, `Identity.OriginHash() uint64`, `OpenTasks` / `OpenMemories` parameter, `DaemonRuntime.Stop/Snapshot/Deliver/StartMigration/ExpectMigration/MigrationPhase` parameter, `CausalEvent.OriginHash uint64`, `GroupMemberInfo.OriginHash uint64`, `GroupForkRecord.{OriginalOrigin,ForkedOrigin} uint64`). Breaking API change for downstream Go consumers; documented in identity.go and compute.go doc-comments.
 
 ---
 
