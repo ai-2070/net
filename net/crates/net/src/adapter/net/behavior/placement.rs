@@ -3236,20 +3236,14 @@ mod tests {
             index: Arc<CapabilityIndex>,
         }
         impl PlacementFilter for ReentrantFilter {
-            fn placement_score(
-                &self,
-                target: &NodeId,
-                _artifact: &Artifact<'_>,
-            ) -> Option<f32> {
+            fn placement_score(&self, target: &NodeId, _artifact: &Artifact<'_>) -> Option<f32> {
                 // Touch the index from inside the callback. Pre-fix
                 // this was running under the outer `with_caps` shard
                 // read lock and would deadlock against a concurrent
                 // writer; post-fix the custom filter runs BEFORE
                 // `with_caps` so re-entry is safe.
                 let _ = self.index.query(&CapabilityFilter::default());
-                let _ = self
-                    .index
-                    .with_caps(*target, |caps| caps.tags.len());
+                let _ = self.index.with_caps(*target, |caps| caps.tags.len());
                 Some(0.75)
             }
         }

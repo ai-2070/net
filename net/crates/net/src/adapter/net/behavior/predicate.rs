@@ -3335,10 +3335,7 @@ mod tests {
     fn dynamic_cost_saturates_huge_cardinality_to_u32_max() {
         struct HugeCardinality;
         impl crate::adapter::net::behavior::CardinalityProvider for HugeCardinality {
-            fn axis_cardinality(
-                &self,
-                _key: &crate::adapter::net::behavior::tag::TagKey,
-            ) -> usize {
+            fn axis_cardinality(&self, _key: &crate::adapter::net::behavior::tag::TagKey) -> usize {
                 // > u32::MAX. On 64-bit hosts this wraps if cast
                 // via `as u32`; the fix uses `u32::try_from(...)`
                 // with a saturating fallback.

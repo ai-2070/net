@@ -889,7 +889,11 @@ mod tests {
             &LocalLow,
             &tb,
         );
-        assert_eq!(target, Some(0x1111), "local must win even when scoring lower");
+        assert_eq!(
+            target,
+            Some(0x1111),
+            "local must win even when scoring lower"
+        );
     }
 
     /// N-7 sibling: when the migration source IS the local node,
@@ -933,7 +937,11 @@ mod tests {
             &RemoteScores,
             &tb,
         );
-        assert_eq!(target, Some(0x2222), "scorer picks highest when local is source");
+        assert_eq!(
+            target,
+            Some(0x2222),
+            "scorer picks highest when local is source"
+        );
     }
 
     /// Source node is excluded from candidates (already pinned by
