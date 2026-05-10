@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/predicate.rs
+  s_9163f300668f8b::t_b59d558f5da4ba 3079-3097
+  s_9163f300668f8b::t_1ddd6c0895dd4f 719-729
+  s_9163f300668f8b::t_ad77248d0088e4 785-798
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "473e61e7e86230dee17e98778cb541ce8c6ad105",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
