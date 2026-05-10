@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/compute/replica_group.rs
+  s_d1b11a1287c170::t_85b5ba132d6292 915-1275
+  s_d1b11a1287c170::t_bd193cf001b562 295-540
+  s_d1b11a1287c170::t_0ca2b9bbda55b0 18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "a35d62d203ff9a8ebe0e506635ba17b6259b6b94",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
