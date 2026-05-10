@@ -168,7 +168,14 @@ impl BloomFilter {
         // shared `&self` borrow `bit_indices` would imply.
         let h128 = xxh3_128_with_seed(key, BLOOM_HASH_SEED);
         let h1 = (h128 >> 64) as u64;
-        let h2 = h128 as u64;
+        // CR-23: force h2 odd. `len_bits` rounds up to a multiple
+        // of 64 (= 2^6 × something), so the modulus `m` shares
+        // factor 2 with any even h2; the probe cycle length
+        // halves, ≈50% of keys hit fewer distinct bits than `k`
+        // claims, and the false-positive rate drifts above the
+        // configured target. Coprime-via-`|= 1` is the standard
+        // double-hashing remedy.
+        let h2 = (h128 as u64) | 1;
         let m = self.len_bits as u64;
         for i in 0..self.k {
             let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
@@ -185,7 +192,9 @@ impl BloomFilter {
     pub fn contains(&self, key: &[u8]) -> bool {
         let h128 = xxh3_128_with_seed(key, BLOOM_HASH_SEED);
         let h1 = (h128 >> 64) as u64;
-        let h2 = h128 as u64;
+        // CR-23: must mirror `insert`'s h2-odd coercion or
+        // round-trip membership breaks.
+        let h2 = (h128 as u64) | 1;
         let m = self.len_bits as u64;
         for i in 0..self.k {
             let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
