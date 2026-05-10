@@ -21,6 +21,8 @@ mod identity;
 // handler support lands as a follow-up phase.
 #[cfg(feature = "cortex")]
 mod mesh_rpc;
+#[cfg(feature = "net")]
+mod placement;
 #[cfg(feature = "redis")]
 mod redis_dedup;
 #[cfg(feature = "net")]
@@ -1813,6 +1815,63 @@ mod mesh_bindings {
             Ok(super::capabilities::with_scope_filter(&owned, |sf| {
                 node.find_nodes_by_filter_scoped(&core, sf)
             }))
+        }
+
+        // ── SDK Phase 7 slice 3 — custom PlacementFilter callbacks ──
+        //
+        // Python contract: `predicate(candidate: dict) -> bool` where
+        // `candidate = { "node_id": int, "tags": list[str],
+        // "metadata": dict[str, str] }`. Returning `True` keeps the
+        // candidate (placement-score 1.0); `False` / exception /
+        // non-bool vetoes it. The predicate runs per candidate per
+        // placement decision under the GIL — keep it tight.
+        //
+        // Bridge wrapper lives in `super::placement::PyPlacementFilter`;
+        // registration goes through the substrate's
+        // `global_placement_filter_registry` singleton.
+
+        /// Register a Python placement-filter predicate under `id`.
+        ///
+        /// Returns `True` if registration succeeded; `False` if `id`
+        /// is already registered. The SDK's
+        /// `placement_filter_from_fn` generates unique IDs by
+        /// counter, so collisions are an SDK-side concern. Use
+        /// `unregister_placement_filter` first if you need to swap
+        /// the predicate behind a stable id.
+        fn register_placement_filter(
+            &self,
+            id: String,
+            predicate: Py<PyAny>,
+        ) -> PyResult<bool> {
+            use net::adapter::net::behavior::placement::PlacementFilter;
+            use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+
+            let node = self.get_node()?;
+            let capability_index = node.capability_index().clone();
+            let wrapper = super::placement::PyPlacementFilter::new(
+                id.clone(),
+                predicate,
+                capability_index,
+            );
+            let arc: std::sync::Arc<dyn PlacementFilter> = std::sync::Arc::new(wrapper);
+            Ok(global_placement_filter_registry().register(id, arc))
+        }
+
+        /// Drop the placement-filter registration under `id`.
+        ///
+        /// Returns `True` if `id` was registered. Existing
+        /// `Arc<dyn PlacementFilter>` clones held by in-flight
+        /// scheduler calls keep the predicate alive until those
+        /// calls finish — see the registry docs.
+        fn unregister_placement_filter(&self, id: String) -> bool {
+            use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+            global_placement_filter_registry().unregister(&id)
+        }
+
+        /// Whether `id` is currently registered. Mainly for tests.
+        fn has_placement_filter(&self, id: String) -> bool {
+            use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+            global_placement_filter_registry().contains(&id)
         }
 
         // ── NAT traversal ──────────────────────────────────────
