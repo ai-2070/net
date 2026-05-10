@@ -1286,7 +1286,7 @@ impl Predicate {
                 let static_c = self.static_cost();
                 let cardinality = index.axis_cardinality(key);
                 if cardinality > 0 {
-                    static_c.saturating_div((cardinality as u32).max(1))
+                    static_c.saturating_div(u32::try_from(cardinality).unwrap_or(u32::MAX).max(1))
                 } else {
                     // Key absent from the index — could be a brand-new
                     // tag the substrate hasn't observed yet. Conservatively
@@ -1303,7 +1303,7 @@ impl Predicate {
                 let static_c = self.static_cost();
                 let cardinality = index.metadata_value_cardinality(key);
                 if cardinality > 0 {
-                    static_c.saturating_div((cardinality as u32).max(1))
+                    static_c.saturating_div(u32::try_from(cardinality).unwrap_or(u32::MAX).max(1))
                 } else {
                     // Key absent from index → fall back to static cost.
                     static_c
@@ -1439,7 +1439,7 @@ impl Predicate {
                 if cardinality == 0 {
                     return static_c;
                 }
-                static_c.saturating_mul((cardinality as u32).max(1))
+                static_c.saturating_mul(u32::try_from(cardinality).unwrap_or(u32::MAX).max(1))
             }
             Self::MetadataExists { key }
             | Self::MetadataEquals { key, .. }
@@ -1450,7 +1450,7 @@ impl Predicate {
                 if cardinality == 0 {
                     return static_c;
                 }
-                static_c.saturating_mul((cardinality as u32).max(1))
+                static_c.saturating_mul(u32::try_from(cardinality).unwrap_or(u32::MAX).max(1))
             }
             // Composites: recurse with mode appropriate to the
             // composite's own type. This is a leaf-level asymmetry —
@@ -3320,6 +3320,59 @@ mod tests {
         // Every leaf hits cardinality=0 (empty index), so dynamic
         // cost equals static cost recursively.
         assert_eq!(pred.dynamic_cost(&index), pred.static_cost());
+    }
+
+    /// N-9 regression: `dynamic_cost` and `dynamic_cost_or` must
+    /// saturate `usize` cardinalities to `u32::MAX` rather than
+    /// wrapping. Pre-fix the `(cardinality as u32)` cast wrapped
+    /// modulo `2³²`, so a cardinality of `u32::MAX + 1` divided
+    /// `static_cost / 0.max(1) = static_cost`, while
+    /// `u32::MAX + 2` divided by `1`, treating the most-selective
+    /// key as if it had only 1 distinct value. Real-world trigger:
+    /// long-running fleets with unbounded-cardinality metadata
+    /// keys (session id, request id, anything per-call).
+    #[test]
+    fn dynamic_cost_saturates_huge_cardinality_to_u32_max() {
+        struct HugeCardinality;
+        impl crate::adapter::net::behavior::CardinalityProvider for HugeCardinality {
+            fn axis_cardinality(
+                &self,
+                _key: &crate::adapter::net::behavior::tag::TagKey,
+            ) -> usize {
+                // > u32::MAX. On 64-bit hosts this wraps if cast
+                // via `as u32`; the fix uses `u32::try_from(...)`
+                // with a saturating fallback.
+                (u32::MAX as usize).wrapping_add(2)
+            }
+            fn metadata_value_cardinality(&self, _key: &str) -> usize {
+                (u32::MAX as usize).wrapping_add(2)
+            }
+        }
+
+        let clause = Predicate::Equals {
+            key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+            value: "1024".into(),
+        };
+        let dyn_cost = clause.dynamic_cost(&HugeCardinality);
+        let static_c = clause.static_cost();
+        // With saturation, cardinality clamps to u32::MAX so
+        // `static_c / u32::MAX == 0` (since static_c < u32::MAX).
+        // Pre-fix the cast wrapped to 1, giving `static_c / 1 ==
+        // static_c` — the bug shape.
+        assert!(
+            dyn_cost < static_c,
+            "dynamic_cost must reflect saturation (got {dyn_cost}, static={static_c})",
+        );
+
+        // Same pin for the Or-side: `static_c.saturating_mul(u32::MAX)`
+        // saturates to u32::MAX rather than wrapping back to a
+        // tiny number.
+        let or_cost = clause.dynamic_cost_or(&HugeCardinality);
+        assert_eq!(
+            or_cost,
+            u32::MAX,
+            "dynamic_cost_or must saturate to u32::MAX on huge cardinality",
+        );
     }
 
     #[test]
