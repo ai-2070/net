@@ -1,0 +1,22 @@
+net/crates/net/tests/cross_lang_capability_fixtures.rs
+  s_d1b11a1287c170::t_eaad225b87e56e 739-742
+  s_d1b11a1287c170::t_447fcfe23a0ff3 20-23,25-26
+  s_d1b11a1287c170::t_d636f62d43e6ab 701-738,743-840,848,853-856
+  s_d1b11a1287c170::t_e565e13e909153 841-847,849-852
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "f8b92b4ac6c623874695996994b4ebbb4fa31970",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
