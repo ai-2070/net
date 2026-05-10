@@ -44,7 +44,10 @@ pub use tag::{
     AxisSeparator, CapabilityTagError, RESERVED_PREFIXES, Tag, TagKey, TaxonomyAxis,
 };
 
-pub use predicate::{ClauseStats, ClauseTrace, EvalContext, Predicate, PredicateDebugReport};
+pub use predicate::{
+    ClauseStats, ClauseTrace, EvalContext, Predicate, PredicateDebugReport, PredicateNodeWire,
+    PredicateWire, PredicateWireError,
+};
 
 pub use required_capability::{RequireParseError, RequiredCapability};
 

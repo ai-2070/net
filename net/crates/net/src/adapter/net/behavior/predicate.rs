@@ -218,6 +218,438 @@ pub enum Predicate {
 }
 
 // =============================================================================
+// Wire format — Phase 5 of CAPABILITY_ENHANCEMENTS_PLAN.md.
+//
+// The recursive `Box<Predicate>` + `Vec<Predicate>` shape compounds
+// with the existing `event::*` serializer monomorphization graph
+// and pushes test-build recursion-limit / compile-time past the
+// project's budget (per the comment at the head of this module).
+//
+// The flat-tree IR below sidesteps that: nodes live in a single
+// `Vec<PredicateNodeWire>`; And/Or/Not reference children via
+// `u32` indices into that table. No variant of `PredicateNodeWire`
+// transitively references `PredicateWire` itself, so serde derive
+// expansion stays bounded.
+//
+// Round-trip:
+//
+//   Predicate::to_wire()        →  PredicateWire
+//   PredicateWire::into_predicate() →  Result<Predicate, _>
+//
+// Pinned in `wire_round_trip_*` tests below.
+// =============================================================================
+
+/// One node in the flat predicate wire format. `And`/`Or`/`Not`
+/// reference their children via `u32` indices into the parent
+/// [`PredicateWire`]'s `nodes` table.
+///
+/// Node ordering invariant: children always appear at lower
+/// indices than their parent (post-order serialization). The
+/// rebuild path enforces this to catch malformed wire payloads
+/// that attempt index cycles.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PredicateNodeWire {
+    /// Leaf: tag with this `(axis, key)` is present.
+    Exists {
+        /// Tag key.
+        key: TagKey,
+    },
+    /// Leaf: tag's value matches exactly.
+    Equals {
+        /// Tag key.
+        key: TagKey,
+        /// Required value.
+        value: String,
+    },
+    /// Leaf: tag's value parses to `f64` and is `>= threshold`.
+    NumericAtLeast {
+        /// Tag key.
+        key: TagKey,
+        /// Inclusive lower bound.
+        threshold: f64,
+    },
+    /// Leaf: tag's value parses to `f64` and is `<= threshold`.
+    NumericAtMost {
+        /// Tag key.
+        key: TagKey,
+        /// Inclusive upper bound.
+        threshold: f64,
+    },
+    /// Leaf: tag's value parses to `f64` and lies in `[min, max]`.
+    NumericInRange {
+        /// Tag key.
+        key: TagKey,
+        /// Inclusive lower bound.
+        min: f64,
+        /// Inclusive upper bound.
+        max: f64,
+    },
+    /// Leaf: tag's value parses to a semver triple and is `>= version`.
+    SemverAtLeast {
+        /// Tag key.
+        key: TagKey,
+        /// Reference version.
+        version: String,
+    },
+    /// Leaf: tag's value parses to a semver triple and is `<= version`.
+    SemverAtMost {
+        /// Tag key.
+        key: TagKey,
+        /// Reference version.
+        version: String,
+    },
+    /// Leaf: tag's value parses to a semver triple and is in the
+    /// same compatibility band as `version`.
+    SemverCompatible {
+        /// Tag key.
+        key: TagKey,
+        /// Reference version.
+        version: String,
+    },
+    /// Leaf: tag's value starts with `prefix`.
+    StringPrefix {
+        /// Tag key.
+        key: TagKey,
+        /// Prefix to match.
+        prefix: String,
+    },
+    /// Leaf: tag's value contains `pattern` as a substring.
+    StringMatches {
+        /// Tag key.
+        key: TagKey,
+        /// Substring pattern.
+        pattern: String,
+    },
+    /// Leaf: metadata key is present.
+    MetadataExists {
+        /// Metadata key.
+        key: String,
+    },
+    /// Leaf: metadata value matches exactly.
+    MetadataEquals {
+        /// Metadata key.
+        key: String,
+        /// Required value.
+        value: String,
+    },
+    /// Leaf: metadata value contains `pattern` as a substring.
+    MetadataMatches {
+        /// Metadata key.
+        key: String,
+        /// Substring pattern.
+        pattern: String,
+    },
+    /// Leaf: metadata value parses to `f64` and is `>= threshold`.
+    MetadataNumericAtLeast {
+        /// Metadata key.
+        key: String,
+        /// Inclusive lower bound.
+        threshold: f64,
+    },
+    /// Composite: conjunction of children at the named indices.
+    And {
+        /// Child indices into the parent `PredicateWire::nodes`.
+        children: Vec<u32>,
+    },
+    /// Composite: disjunction of children at the named indices.
+    Or {
+        /// Child indices into the parent `PredicateWire::nodes`.
+        children: Vec<u32>,
+    },
+    /// Composite: negation of the child at the named index.
+    Not {
+        /// Child index into the parent `PredicateWire::nodes`.
+        child: u32,
+    },
+}
+
+/// Wire format for [`Predicate`]. Flat node table with index
+/// references for `And`/`Or`/`Not` children.
+///
+/// Phase 5 of `CAPABILITY_ENHANCEMENTS_PLAN.md`. Crosses the
+/// nRPC envelope as serde-encoded bytes (postcard for cross-binding,
+/// JSON for debug fixtures); the substrate's capability
+/// announcement path is unchanged.
+///
+/// Build via [`Predicate::to_wire`]; rebuild via
+/// [`PredicateWire::into_predicate`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PredicateWire {
+    /// Flat node table. Children always live at lower indices
+    /// than their parents.
+    pub nodes: Vec<PredicateNodeWire>,
+    /// Index of the root node within `nodes`. Always
+    /// `nodes.len() - 1` for a freshly-emitted `to_wire()` output;
+    /// callers receiving an externally-built wire payload should
+    /// not assume that.
+    pub root_idx: u32,
+}
+
+/// Errors raised by [`PredicateWire::into_predicate`].
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum PredicateWireError {
+    /// Wire payload had an empty `nodes` table.
+    #[error("predicate wire has empty nodes table")]
+    Empty,
+    /// `root_idx` was out of bounds for the `nodes` table.
+    #[error("predicate wire root_idx {root_idx} >= nodes len {len}")]
+    RootOutOfBounds {
+        /// The provided `root_idx`.
+        root_idx: u32,
+        /// Length of the `nodes` table.
+        len: usize,
+    },
+    /// A composite node referenced a child index that was out of
+    /// bounds.
+    #[error(
+        "predicate wire child index {child} out of bounds for nodes len {len}"
+    )]
+    ChildOutOfBounds {
+        /// The malformed child index.
+        child: u32,
+        /// Length of the `nodes` table.
+        len: usize,
+    },
+    /// A composite node referenced a child index that was greater
+    /// than or equal to its own. Catches index cycles introduced
+    /// by malformed / malicious wire payloads.
+    #[error(
+        "predicate wire child index {child} >= parent index {parent} (cycle)"
+    )]
+    CycleDetected {
+        /// Parent node index.
+        parent: u32,
+        /// Offending child index.
+        child: u32,
+    },
+}
+
+impl Predicate {
+    /// Convert to the flat wire format. Post-order serialization:
+    /// leaves land first, the root has the highest index.
+    ///
+    /// Output is byte-stable across calls — two `to_wire()`s on
+    /// equal predicates produce identical `PredicateWire` values
+    /// (and identical bytes through any serde encoder).
+    pub fn to_wire(&self) -> PredicateWire {
+        let mut nodes = Vec::new();
+        let root_idx = self.append_to_wire(&mut nodes);
+        PredicateWire { nodes, root_idx }
+    }
+
+    /// Recursive helper: append `self` (and any sub-tree) into
+    /// `nodes`, returning the index of the root of the sub-tree.
+    /// Post-order: children push first, then the parent referring
+    /// to them by index.
+    fn append_to_wire(&self, nodes: &mut Vec<PredicateNodeWire>) -> u32 {
+        let node = match self {
+            Self::Exists { key } => PredicateNodeWire::Exists { key: key.clone() },
+            Self::Equals { key, value } => PredicateNodeWire::Equals {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Self::NumericAtLeast { key, threshold } => PredicateNodeWire::NumericAtLeast {
+                key: key.clone(),
+                threshold: *threshold,
+            },
+            Self::NumericAtMost { key, threshold } => PredicateNodeWire::NumericAtMost {
+                key: key.clone(),
+                threshold: *threshold,
+            },
+            Self::NumericInRange { key, min, max } => PredicateNodeWire::NumericInRange {
+                key: key.clone(),
+                min: *min,
+                max: *max,
+            },
+            Self::SemverAtLeast { key, version } => PredicateNodeWire::SemverAtLeast {
+                key: key.clone(),
+                version: version.clone(),
+            },
+            Self::SemverAtMost { key, version } => PredicateNodeWire::SemverAtMost {
+                key: key.clone(),
+                version: version.clone(),
+            },
+            Self::SemverCompatible { key, version } => PredicateNodeWire::SemverCompatible {
+                key: key.clone(),
+                version: version.clone(),
+            },
+            Self::StringPrefix { key, prefix } => PredicateNodeWire::StringPrefix {
+                key: key.clone(),
+                prefix: prefix.clone(),
+            },
+            Self::StringMatches { key, pattern } => PredicateNodeWire::StringMatches {
+                key: key.clone(),
+                pattern: pattern.clone(),
+            },
+            Self::MetadataExists { key } => PredicateNodeWire::MetadataExists {
+                key: key.clone(),
+            },
+            Self::MetadataEquals { key, value } => PredicateNodeWire::MetadataEquals {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Self::MetadataMatches { key, pattern } => PredicateNodeWire::MetadataMatches {
+                key: key.clone(),
+                pattern: pattern.clone(),
+            },
+            Self::MetadataNumericAtLeast { key, threshold } => {
+                PredicateNodeWire::MetadataNumericAtLeast {
+                    key: key.clone(),
+                    threshold: *threshold,
+                }
+            }
+            Self::And(children) => {
+                let child_idxs: Vec<u32> =
+                    children.iter().map(|c| c.append_to_wire(nodes)).collect();
+                PredicateNodeWire::And { children: child_idxs }
+            }
+            Self::Or(children) => {
+                let child_idxs: Vec<u32> =
+                    children.iter().map(|c| c.append_to_wire(nodes)).collect();
+                PredicateNodeWire::Or { children: child_idxs }
+            }
+            Self::Not(inner) => {
+                let child_idx = inner.append_to_wire(nodes);
+                PredicateNodeWire::Not { child: child_idx }
+            }
+        };
+        let idx = nodes.len() as u32;
+        nodes.push(node);
+        idx
+    }
+}
+
+impl PredicateWire {
+    /// Rebuild a [`Predicate`] AST from the flat wire format.
+    ///
+    /// Validates structural integrity: empty tables, out-of-bounds
+    /// indices, and child-index cycles are surfaced as typed
+    /// [`PredicateWireError`] rather than panicking. A successful
+    /// rebuild is byte-equal to the input of the matching
+    /// [`Predicate::to_wire`] call.
+    pub fn into_predicate(self) -> Result<Predicate, PredicateWireError> {
+        if self.nodes.is_empty() {
+            return Err(PredicateWireError::Empty);
+        }
+        let len = self.nodes.len();
+        if (self.root_idx as usize) >= len {
+            return Err(PredicateWireError::RootOutOfBounds {
+                root_idx: self.root_idx,
+                len,
+            });
+        }
+        rebuild_predicate(&self.nodes, self.root_idx)
+    }
+}
+
+/// Recursive rebuild helper. Walks the flat node table from `idx`,
+/// validating child indices and cycles as it goes.
+fn rebuild_predicate(
+    nodes: &[PredicateNodeWire],
+    idx: u32,
+) -> Result<Predicate, PredicateWireError> {
+    let len = nodes.len();
+    let node = nodes
+        .get(idx as usize)
+        .ok_or(PredicateWireError::ChildOutOfBounds { child: idx, len })?;
+    let result = match node {
+        PredicateNodeWire::Exists { key } => Predicate::Exists { key: key.clone() },
+        PredicateNodeWire::Equals { key, value } => Predicate::Equals {
+            key: key.clone(),
+            value: value.clone(),
+        },
+        PredicateNodeWire::NumericAtLeast { key, threshold } => Predicate::NumericAtLeast {
+            key: key.clone(),
+            threshold: *threshold,
+        },
+        PredicateNodeWire::NumericAtMost { key, threshold } => Predicate::NumericAtMost {
+            key: key.clone(),
+            threshold: *threshold,
+        },
+        PredicateNodeWire::NumericInRange { key, min, max } => Predicate::NumericInRange {
+            key: key.clone(),
+            min: *min,
+            max: *max,
+        },
+        PredicateNodeWire::SemverAtLeast { key, version } => Predicate::SemverAtLeast {
+            key: key.clone(),
+            version: version.clone(),
+        },
+        PredicateNodeWire::SemverAtMost { key, version } => Predicate::SemverAtMost {
+            key: key.clone(),
+            version: version.clone(),
+        },
+        PredicateNodeWire::SemverCompatible { key, version } => Predicate::SemverCompatible {
+            key: key.clone(),
+            version: version.clone(),
+        },
+        PredicateNodeWire::StringPrefix { key, prefix } => Predicate::StringPrefix {
+            key: key.clone(),
+            prefix: prefix.clone(),
+        },
+        PredicateNodeWire::StringMatches { key, pattern } => Predicate::StringMatches {
+            key: key.clone(),
+            pattern: pattern.clone(),
+        },
+        PredicateNodeWire::MetadataExists { key } => Predicate::MetadataExists {
+            key: key.clone(),
+        },
+        PredicateNodeWire::MetadataEquals { key, value } => Predicate::MetadataEquals {
+            key: key.clone(),
+            value: value.clone(),
+        },
+        PredicateNodeWire::MetadataMatches { key, pattern } => Predicate::MetadataMatches {
+            key: key.clone(),
+            pattern: pattern.clone(),
+        },
+        PredicateNodeWire::MetadataNumericAtLeast { key, threshold } => {
+            Predicate::MetadataNumericAtLeast {
+                key: key.clone(),
+                threshold: *threshold,
+            }
+        }
+        PredicateNodeWire::And { children } => {
+            check_children_below(children, idx)?;
+            let kids: Result<Vec<_>, _> =
+                children.iter().map(|&c| rebuild_predicate(nodes, c)).collect();
+            Predicate::And(kids?)
+        }
+        PredicateNodeWire::Or { children } => {
+            check_children_below(children, idx)?;
+            let kids: Result<Vec<_>, _> =
+                children.iter().map(|&c| rebuild_predicate(nodes, c)).collect();
+            Predicate::Or(kids?)
+        }
+        PredicateNodeWire::Not { child } => {
+            if *child >= idx {
+                return Err(PredicateWireError::CycleDetected {
+                    parent: idx,
+                    child: *child,
+                });
+            }
+            Predicate::Not(Box::new(rebuild_predicate(nodes, *child)?))
+        }
+    };
+    Ok(result)
+}
+
+/// Validate that every child index in `children` is strictly less
+/// than `parent`. Catches cycles introduced by malformed wire
+/// payloads.
+fn check_children_below(
+    children: &[u32],
+    parent: u32,
+) -> Result<(), PredicateWireError> {
+    for &child in children {
+        if child >= parent {
+            return Err(PredicateWireError::CycleDetected { parent, child });
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================
 // Constructors
 // =============================================================================
 
@@ -1762,5 +2194,221 @@ mod tests {
         // Render must not panic on empty.
         let rendered = report.render();
         assert!(rendered.contains("Total candidates: 0"));
+    }
+
+    // ========================================================================
+    // PredicateWire (flat-tree IR) — Phase 5 of CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    fn sample_complex_predicate() -> Predicate {
+        // And-of-Or-of-And + Not — exercises every composite variant
+        // and a sampling of leaf variants.
+        Predicate::And(vec![
+            Predicate::Or(vec![
+                Predicate::Exists {
+                    key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+                },
+                Predicate::And(vec![
+                    Predicate::NumericAtLeast {
+                        key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+                        threshold: 65536.0,
+                    },
+                    Predicate::MetadataExists {
+                        key: "intent".into(),
+                    },
+                ]),
+            ]),
+            Predicate::Not(Box::new(Predicate::MetadataEquals {
+                key: "decommissioning".into(),
+                value: "true".into(),
+            })),
+            Predicate::SemverCompatible {
+                key: TagKey::new(TaxonomyAxis::Software, "runtime.python"),
+                version: "3.11".into(),
+            },
+        ])
+    }
+
+    #[test]
+    fn wire_round_trip_preserves_complex_predicate() {
+        // Pin: `Predicate → PredicateWire → Predicate` is identity.
+        let original = sample_complex_predicate();
+        let wire = original.to_wire();
+        let rebuilt = wire.into_predicate().expect("rebuild");
+        assert_eq!(original, rebuilt);
+    }
+
+    #[test]
+    fn wire_round_trip_through_serde_json() {
+        // Pin: the wire format serializes through serde_json
+        // cleanly (no recursion-limit blowup like raw Predicate).
+        let original = sample_complex_predicate();
+        let wire = original.to_wire();
+        let json = serde_json::to_string(&wire).expect("serialize wire");
+        let parsed: PredicateWire = serde_json::from_str(&json).expect("deserialize wire");
+        let rebuilt = parsed.into_predicate().expect("rebuild");
+        assert_eq!(original, rebuilt);
+    }
+
+    #[test]
+    fn wire_root_is_at_highest_index_in_post_order_emission() {
+        // Pin: `to_wire` emits children before parents, so the
+        // root always sits at `nodes.len() - 1` for a freshly-
+        // emitted wire payload. The substrate's invariant
+        // (children at lower indices) leans on this.
+        let pred = sample_complex_predicate();
+        let wire = pred.to_wire();
+        assert_eq!(wire.root_idx as usize, wire.nodes.len() - 1);
+    }
+
+    #[test]
+    fn wire_round_trip_byte_stable_across_calls() {
+        // Pin: two `to_wire()` calls on equal predicates produce
+        // identical wire bytes. Required for cross-binding fixture
+        // pinning.
+        let pred = sample_complex_predicate();
+        let wire_a = pred.to_wire();
+        let wire_b = pred.to_wire();
+        assert_eq!(wire_a, wire_b);
+        let json_a = serde_json::to_string(&wire_a).unwrap();
+        let json_b = serde_json::to_string(&wire_b).unwrap();
+        assert_eq!(json_a, json_b);
+    }
+
+    #[test]
+    fn wire_round_trip_preserves_evaluation_semantics() {
+        // Pin: a rebuilt predicate produces identical evaluation
+        // results to the original on a fixed corpus. The serde
+        // round-trip is semantically transparent.
+        let original = sample_complex_predicate();
+        let wire = original.to_wire();
+        let rebuilt = wire.into_predicate().unwrap();
+
+        let no_meta = empty_meta();
+        let intent_meta = meta_with(&[("intent", "ml-training")]);
+        let decommission_meta = meta_with(&[
+            ("intent", "ml-training"),
+            ("decommissioning", "true"),
+        ]);
+        let no_gpu: Vec<Tag> = vec![];
+        let gpu: Vec<Tag> = vec![axis_present(TaxonomyAxis::Hardware, "gpu")];
+        let gpu_with_runtime: Vec<Tag> = vec![
+            axis_present(TaxonomyAxis::Hardware, "gpu"),
+            axis_eq(TaxonomyAxis::Software, "runtime.python", "3.11.5"),
+        ];
+
+        let cases: Vec<(&[Tag], &BTreeMap<String, String>)> = vec![
+            (&no_gpu, &no_meta),
+            (&gpu, &no_meta),
+            (&gpu, &intent_meta),
+            (&gpu_with_runtime, &intent_meta),
+            (&gpu_with_runtime, &decommission_meta),
+        ];
+
+        for (i, (tags, meta)) in cases.iter().enumerate() {
+            let cx = ctx(tags, meta);
+            assert_eq!(
+                original.evaluate(&cx),
+                rebuilt.evaluate(&cx),
+                "case {i}: original vs rebuilt diverged on evaluation",
+            );
+        }
+    }
+
+    #[test]
+    fn wire_from_empty_nodes_table_errors_gracefully() {
+        let wire = PredicateWire {
+            nodes: Vec::new(),
+            root_idx: 0,
+        };
+        assert_eq!(wire.into_predicate(), Err(PredicateWireError::Empty));
+    }
+
+    #[test]
+    fn wire_from_out_of_bounds_root_errors_gracefully() {
+        let wire = PredicateWire {
+            nodes: vec![PredicateNodeWire::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+            }],
+            root_idx: 5,
+        };
+        assert_eq!(
+            wire.into_predicate(),
+            Err(PredicateWireError::RootOutOfBounds {
+                root_idx: 5,
+                len: 1,
+            }),
+        );
+    }
+
+    #[test]
+    fn wire_from_cycle_in_and_children_errors_gracefully() {
+        // Malformed: the `And` at index 0 references child index
+        // 1, which doesn't exist yet (post-order requires
+        // child < parent). Catches index cycles.
+        let wire = PredicateWire {
+            nodes: vec![PredicateNodeWire::And { children: vec![1] }],
+            root_idx: 0,
+        };
+        let err = wire.into_predicate().unwrap_err();
+        assert!(
+            matches!(err, PredicateWireError::CycleDetected { parent: 0, child: 1 }),
+            "expected CycleDetected; got {err:?}",
+        );
+    }
+
+    #[test]
+    fn wire_from_self_referencing_not_errors_gracefully() {
+        // `Not` referencing its own index is the simplest cycle.
+        let wire = PredicateWire {
+            nodes: vec![PredicateNodeWire::Not { child: 0 }],
+            root_idx: 0,
+        };
+        let err = wire.into_predicate().unwrap_err();
+        assert!(
+            matches!(err, PredicateWireError::CycleDetected { parent: 0, child: 0 }),
+            "expected CycleDetected; got {err:?}",
+        );
+    }
+
+    #[test]
+    fn wire_simple_leaf_round_trips() {
+        // Smallest case: a single leaf predicate. nodes has one
+        // entry; root_idx is 0.
+        let pred = Predicate::Exists {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+        };
+        let wire = pred.to_wire();
+        assert_eq!(wire.nodes.len(), 1);
+        assert_eq!(wire.root_idx, 0);
+        assert_eq!(wire.into_predicate().unwrap(), pred);
+    }
+
+    #[test]
+    fn wire_rebuilt_predicate_matches_planner_evaluation() {
+        // Pin: planner-aware evaluation continues to work after
+        // round-trip. The flat IR doesn't lose the AST shape;
+        // `evaluate()` still finds And/Or to reorder.
+        let original = sample_complex_predicate();
+        let wire = original.to_wire();
+        let rebuilt = wire.into_predicate().unwrap();
+
+        let tags: Vec<Tag> = vec![
+            axis_present(TaxonomyAxis::Hardware, "gpu"),
+            axis_eq(TaxonomyAxis::Software, "runtime.python", "3.11.5"),
+        ];
+        let meta = meta_with(&[("intent", "ml-training")]);
+        let cx = ctx(&tags, &meta);
+
+        // Both planned and unplanned must agree, AND match between
+        // original and rebuilt.
+        let orig_planned = original.evaluate(&cx);
+        let orig_unplanned = original.evaluate_unplanned(&cx);
+        let rebuilt_planned = rebuilt.evaluate(&cx);
+        let rebuilt_unplanned = rebuilt.evaluate_unplanned(&cx);
+
+        assert_eq!(orig_planned, orig_unplanned);
+        assert_eq!(rebuilt_planned, rebuilt_unplanned);
+        assert_eq!(orig_planned, rebuilt_planned);
     }
 }
