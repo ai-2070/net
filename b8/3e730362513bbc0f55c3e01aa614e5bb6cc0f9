@@ -1,0 +1,37 @@
+.claude/skills/net-event-bus/capabilities.md
+  s_d1b11a1287c170::t_28571dd1e2ca48 95-141
+  s_d1b11a1287c170::t_bac7b37f0235cb 13,17-18,22,24-27,29-39
+net/crates/net/sdk/README.md
+  s_d1b11a1287c170::t_cec641dfa2deea 461-466,493-496,502,504,515-522,527-532
+  s_d1b11a1287c170::t_d71198c908c1ff 500,503
+net/crates/net/docs/COMPUTE.md
+  s_d1b11a1287c170::t_945a571defe9aa 56-70
+net/crates/net/README.md
+  s_d1b11a1287c170::t_93068a7caebafa 296
+  s_d1b11a1287c170::t_06267b14147a70 298
+  s_d1b11a1287c170::t_e8252a1c893d00 297,299
+net/crates/net/docs/BEHAVIOR.md
+  s_d1b11a1287c170::t_190181adc18a1e 7,10-12,14-16,18-23,27-31,37-63
+  s_d1b11a1287c170::t_593740d73bca18 281-288,295
+net/crates/net/sdk-py/README.md
+  s_d1b11a1287c170::t_87d3c406962176 703
+  s_d1b11a1287c170::t_a36961f4b6ff30 638-639,641-643,648-649,668-670,672-673,683-686,691-698,701-702
+net/crates/net/sdk-ts/README.md
+  s_d1b11a1287c170::t_ae7cbc53ae3e06 450-454,459-460,479-482,484-485,498-501,506-513,516-517
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "b83e730362513bbc0f55c3e01aa614e5bb6cc0f9",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
