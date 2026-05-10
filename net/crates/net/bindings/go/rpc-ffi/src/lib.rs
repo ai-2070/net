@@ -142,16 +142,34 @@ static NEXT_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 /// 1 so `0` is reserved as "no token" sentinel.
 static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// Process-global registry of in-flight call abort handles.
+/// Per-token state. CR-13: split into `cancelled` (boolean
+/// observed by `run_cancellable` after registering its handle)
+/// and `handle` (the abort handle, populated by
+/// `run_cancellable` post-spawn). Pre-CR-13 the registry was
+/// `HashMap<u64, AbortHandle>`, so a cancel arriving in the
+/// gap between `reserve_cancel_token` and the post-spawn
+/// `insert` (or even in the gap between `spawn` and `insert`)
+/// found no entry and dropped on the floor.
+#[derive(Default)]
+struct CancelEntry {
+    cancelled: bool,
+    handle: Option<tokio::task::AbortHandle>,
+}
+
+/// Process-global registry of in-flight call cancel state.
 /// Populated by `net_rpc_call*` when the caller passes a non-NULL
 /// `out_cancel_token` out-param; queried by `net_rpc_cancel_call`.
-/// Entry removal happens either by the awaiting task (on
-/// completion) or by `net_rpc_cancel_call` (on user-driven
-/// cancellation) — whichever runs first wins.
+/// Entry removal happens by `run_cancellable` once the call
+/// returns (success or abort path). A cancel issued for a never-
+/// dispatched token leaves a `cancelled: true` entry behind that
+/// the eventual `run_cancellable` (or `unregister_cancel_token`)
+/// cleans up; in pathological never-dispatched paths the entry
+/// is bounded by the number of unique tokens reserved, which is
+/// negligible.
 fn cancel_registry(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>> {
+) -> &'static parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>> {
     static REG: OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>>,
+        parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>>,
     > = OnceLock::new();
     REG.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
@@ -173,12 +191,28 @@ pub extern "C" fn net_rpc_reserve_cancel_token() -> u64 {
 /// `UnaryCallGuard::Drop` to publish CANCEL to the server. The
 /// caller-side `net_rpc_call` returns `NET_RPC_ERR_CALL_FAILED`
 /// with `out_err = "nrpc:cancelled: call cancelled by caller"`.
+///
+/// CR-13: a cancel that arrives BEFORE `run_cancellable` has
+/// registered its abort handle (the gap between
+/// `reserve_cancel_token` and the actual `rpc_call`, or between
+/// `spawn` and `insert` inside `run_cancellable`) used to drop
+/// on the floor — the call would run to completion. Now we
+/// either abort an existing handle, or insert/mark the entry
+/// with `cancelled = true` so `run_cancellable` aborts on
+/// register.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_cancel_call(token: u64) {
     if token == 0 {
         return;
     }
-    if let Some(handle) = cancel_registry().lock().remove(&token) {
+    let mut reg = cancel_registry().lock();
+    let entry = reg.entry(token).or_default();
+    entry.cancelled = true;
+    if let Some(handle) = entry.handle.take() {
+        // Drop the lock before invoking abort; abort is cheap
+        // but we don't want to hold the registry lock across
+        // arbitrary tokio internals.
+        drop(reg);
         handle.abort();
     }
 }
@@ -661,11 +695,27 @@ where
     }
     let task = runtime().spawn(fut);
     let abort_handle = task.abort_handle();
-    cancel_registry().lock().insert(cancel_token, abort_handle);
+    // CR-13: register-or-observe-prior-cancel. If
+    // `net_rpc_cancel_call` already fired between the caller's
+    // `reserve_cancel_token` and this register, the entry is
+    // present with `cancelled=true` — abort right away. Else
+    // store the abort handle so a future cancel finds it.
+    let was_already_cancelled = {
+        let mut reg = cancel_registry().lock();
+        let entry = reg.entry(cancel_token).or_default();
+        if entry.cancelled {
+            true
+        } else {
+            entry.handle = Some(abort_handle.clone());
+            false
+        }
+    };
+    if was_already_cancelled {
+        abort_handle.abort();
+    }
     let result = runtime().block_on(task);
-    // Best-effort registry cleanup. The user-driven cancel path
-    // already removes — both removals racing is fine because the
-    // map's remove is a no-op when the key is gone.
+    // Cleanup: drop the entry whether we registered, observed
+    // a prior cancel, or observed a successful completion.
     cancel_registry().lock().remove(&cancel_token);
     match result {
         Ok(value) => Ok(value),
@@ -1628,6 +1678,37 @@ mod tests {
         });
         assert!(result.is_err(), "cancel must abort the future");
         canceller.join().unwrap();
+    }
+
+    /// CR-13: `run_cancellable` honors a cancel that arrived
+    /// BEFORE the call even started. Pre-CR-13 the registry
+    /// didn't carry a `cancelled` flag — a cancel issued
+    /// against a reserved token whose call hadn't yet inserted
+    /// the abort handle would silently drop on the floor, and
+    /// the subsequent call would run to completion despite the
+    /// caller's cancel signal.
+    #[test]
+    fn run_cancellable_honors_cancel_issued_before_register() {
+        let token = net_rpc_reserve_cancel_token();
+        // Fire cancel against the reserved token BEFORE
+        // run_cancellable runs. With CR-13 the registry now
+        // carries `cancelled=true` for this token; without
+        // CR-13 the cancel would no-op.
+        net_rpc_cancel_call(token);
+        let result = run_cancellable(token, async move {
+            // Long-running future. If the pre-cancel didn't take
+            // effect, this sleep would eventually return Ok and
+            // the test wedges (caught by cargo's per-test timeout).
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            "should never reach here"
+        });
+        assert!(
+            result.is_err(),
+            "pre-issued cancel must abort the future immediately"
+        );
+        // Registry entry should be cleaned up after run_cancellable.
+        let lingering = cancel_registry().lock().contains_key(&token);
+        assert!(!lingering, "registry entry must be removed after run_cancellable");
     }
 
     /// `run_cancellable` with token=0 short-circuits to plain
