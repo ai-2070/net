@@ -258,10 +258,12 @@ let p = pred!(and [
 let ctx = EvalContext::new(&tags, &metadata);
 let matched = p.evaluate(&ctx);
 
-// Or push the predicate over nRPC:
+// Or push the predicate over nRPC. `predicate_to_rpc_header`
+// returns a `Result<(name, value), _>` pair — destructure both
+// halves; the name is the canonical `RPC_WHERE_HEADER` constant.
 use net_sdk::capabilities::predicate::predicate_to_rpc_header;
-let header_value = predicate_to_rpc_header(&p);
-// ...attach to call headers under RPC_WHERE_HEADER ("cyberdeck-where").
+let (name, value) = predicate_to_rpc_header(&p)?;
+// ...attach `(name, value)` as a request header.
 ```
 
 In TS:
@@ -310,9 +312,16 @@ async fn handle(ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> 
 
 The substrate's `CallOptions::request_headers` field carries
 arbitrary `(name, value)` pairs alongside the standard nRPC envelope;
-`with_where` is sugar over `with_request_header(RPC_WHERE_HEADER,
-predicate_to_rpc_header(p)?)`. Per-binding wrappers in TS / Python /
-Go expose the same `cyberdeck-where:` header convention.
+`with_where` is sugar over destructuring the encoder's tuple and
+forwarding to `with_request_header`:
+
+```rust
+let (name, value) = predicate_to_rpc_header(&pred)?;
+options.with_request_header(name, value)
+```
+
+Per-binding wrappers in TS / Python / Go expose the same
+`cyberdeck-where:` header convention.
 
 ### 6. New surface: validation
 
