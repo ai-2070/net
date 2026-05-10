@@ -16,6 +16,7 @@
 package net
 
 import (
+	"strconv"
 	"strings"
 )
 
@@ -251,14 +252,53 @@ func isAllDigits(s string) bool {
 	return true
 }
 
-func isIntegerLiteral(s string) bool {
+// N-5: substrate `ValueType::Number` is unsigned u64. Rust uses
+// `value.parse::<u64>()` (schema.rs:704), which accepts `+1` and
+// rejects negatives, non-ASCII digits, and values exceeding
+// `u64::MAX`. Python locks the same accepted-set via the
+// `_U64_LITERAL = re.compile(r"^\+?[0-9]+$")` regex plus an
+// explicit ceiling check (R4 / capability_schema.py:332,385).
+//
+// The pre-fix Go shape used `isIntegerLiteral`, which admitted a
+// leading `-` AND any number of digits — `software.model.0.context_length=-1`
+// or `=18446744073709551616` would validate clean in Go and error
+// in Rust/Python. Mirror Python: ASCII digits with optional leading
+// `+`, then `strconv.ParseUint` for the range check.
+func isU64Literal(s string) bool {
 	if s == "" {
 		return false
 	}
-	if s[0] == '-' {
-		return isAllDigits(s[1:])
+	body := s
+	if body[0] == '+' {
+		body = body[1:]
 	}
-	return isAllDigits(s)
+	if !isAllDigits(body) {
+		return false
+	}
+	if _, err := strconv.ParseUint(body, 10, 64); err != nil {
+		return false
+	}
+	return true
+}
+
+// N-5: substrate `schema.rs:616` parses the indexed-collection
+// position as `idx.parse::<u32>()`. Pre-fix `isAllDigits` admitted
+// `99999999999999` which overflows u32. Mirror Rust strictly.
+func isU32Literal(s string) bool {
+	if s == "" {
+		return false
+	}
+	body := s
+	if body[0] == '+' {
+		body = body[1:]
+	}
+	if !isAllDigits(body) {
+		return false
+	}
+	if _, err := strconv.ParseUint(body, 10, 32); err != nil {
+		return false
+	}
+	return true
 }
 
 func checkValue(
@@ -298,7 +338,7 @@ func checkValue(
 	parses := false
 	switch entry.ValueType {
 	case ValueTypeNumber:
-		parses = isIntegerLiteral(v)
+		parses = isU64Literal(v)
 	case ValueTypeString, ValueTypeEnumeration, ValueTypeCsv:
 		parses = v != ""
 	case ValueTypeBool:
@@ -348,7 +388,7 @@ func validateAxisKey(
 			}
 			idx := rest[:dot]
 			sub := rest[dot+1:]
-			if !isAllDigits(idx) {
+			if !isU32Literal(idx) {
 				*errors = append(*errors, SchemaError{
 					Kind:   "index_malformed",
 					Axis:   string(axis),

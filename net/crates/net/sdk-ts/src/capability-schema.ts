@@ -275,13 +275,21 @@ function checkValue(
   let parses = false;
   switch (entry.valueType) {
     case 'number':
-      // Substrate `Number` is unsigned (u64-only) — see CR-15 in the
-      // capability-system-2 review and `schema.rs::ValueType::Number`.
-      // Negative values surface as `TypeMismatch` errors on the
-      // substrate side; mirror that here so client-side validation
-      // doesn't flag a CapabilitySet as valid that the substrate
-      // would later reject.
-      parses = /^\d+$/.test(observedValue);
+      // Substrate `Number` is unsigned (u64-only) — Rust uses
+      // `value.parse::<u64>()` (schema.rs:704). The accepted-set is
+      // ASCII digits with an optional leading `+`, bounded by
+      // `u64::MAX` (18446744073709551615). N-5: the pre-fix regex
+      // `^\d+$` admitted values exceeding u64::MAX (e.g.
+      // `18446744073709551616`) that the substrate rejects; mirror
+      // the Python `_U64_LITERAL` + `int(...) <= u64::MAX` shape so
+      // cross-binding fixture rows agree.
+      if (/^\+?[0-9]+$/.test(observedValue)) {
+        try {
+          parses = BigInt(observedValue) <= 0xffff_ffff_ffff_ffffn;
+        } catch {
+          parses = false;
+        }
+      }
       break;
     case 'string':
     case 'enumeration':

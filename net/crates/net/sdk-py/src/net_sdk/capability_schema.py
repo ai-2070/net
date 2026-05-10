@@ -428,7 +428,12 @@ def _validate_axis_key(
                 continue
             idx = rest[:dot]
             sub = rest[dot + 1:]
-            if not idx.isdigit():
+            # N-5: substrate parses the index as `u32` (schema.rs:616).
+            # `str.isdigit()` accepts Unicode digits and unbounded
+            # digit runs; both diverge from Rust. Mirror the
+            # `_U64_LITERAL`-style accepted-set with an explicit
+            # `u32::MAX` ceiling so cross-binding fixture rows agree.
+            if not _U64_LITERAL.match(idx) or int(idx) > 0xFFFF_FFFF:
                 errors.append(
                     SchemaErrorIndexMalformed(
                         axis=axis, prefix=shape.prefix, index=idx, tag=tag_wire

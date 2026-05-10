@@ -143,6 +143,60 @@
       "expected_warnings": []
     },
     {
+      "name": "index_malformed_overflows_u32",
+      "summary": "N-5 regression: `software.model.<i>.<sub>` requires `<i>` to fit in `u32` (Rust `idx.parse::<u32>()`). `99999999999999` is all digits but overflows u32 → IndexMalformed. Pre-fix the Go reference impl accepted unbounded digit runs.",
+      "caps": {
+        "tags": ["software.model.99999999999999.id=foo"],
+        "metadata": {}
+      },
+      "expected_errors": [
+        {
+          "kind": "index_malformed",
+          "axis": "software",
+          "prefix": "model.",
+          "index": "99999999999999",
+          "tag": "software.model.99999999999999.id=foo"
+        }
+      ],
+      "expected_warnings": []
+    },
+    {
+      "name": "type_mismatch_number_negative",
+      "summary": "N-5 regression: substrate `ValueType::Number` is unsigned u64 (Rust `value.parse::<u64>()`, CR-15). Negative values surface as TypeMismatch. Pre-fix the Go reference impl admitted leading `-` via an `isIntegerLiteral` helper.",
+      "caps": {
+        "tags": ["hardware.memory_mb=-1"],
+        "metadata": {}
+      },
+      "expected_errors": [
+        {
+          "kind": "type_mismatch",
+          "axis": "hardware",
+          "key": "memory_mb",
+          "expected": "number",
+          "actual": "-1"
+        }
+      ],
+      "expected_warnings": []
+    },
+    {
+      "name": "type_mismatch_number_exceeds_u64_max",
+      "summary": "N-5 regression: u64::MAX is 18446744073709551615; one more (`18446744073709551616`) is all digits but overflows. Rust `value.parse::<u64>()` rejects → TypeMismatch. Pre-fix the Go reference impl admitted unbounded digit runs.",
+      "caps": {
+        "tags": ["hardware.memory_mb=18446744073709551616"],
+        "metadata": {}
+      },
+      "expected_errors": [
+        {
+          "kind": "type_mismatch",
+          "axis": "hardware",
+          "key": "memory_mb",
+          "expected": "number",
+          "actual": "18446744073709551616"
+        }
+      ],
+      "expected_warnings": []
+    },
+    {
       "name": "unknown_key_under_known_axis_is_warning",
       "summary": "Forward-compat: a key the schema doesn't enumerate (`hardware.experimental_field`) produces an UnknownKey warning, not an error.",
       "caps": {
