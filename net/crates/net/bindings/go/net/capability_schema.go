@@ -190,12 +190,19 @@ type SchemaError struct {
 // ValidationWarning is the wire-format forward-compat / hygiene
 // record.
 type ValidationWarning struct {
-	Kind          string `json:"kind"`
-	Axis          string `json:"axis,omitempty"`
-	Key           string `json:"key,omitempty"`
-	SoftCapBytes  int    `json:"soft_cap_bytes,omitempty"`
-	ActualBytes   int    `json:"actual_bytes,omitempty"`
-	Tag           string `json:"tag,omitempty"`
+	Kind         string `json:"kind"`
+	Axis         string `json:"axis,omitempty"`
+	Key          string `json:"key,omitempty"`
+	SoftCapBytes int    `json:"soft_cap_bytes,omitempty"`
+	ActualBytes  int    `json:"actual_bytes,omitempty"`
+	Tag          string `json:"tag,omitempty"`
+	// Q11: mirror substrate CR-14 reserved-metadata warnings.
+	// Wire shape matches `src/ffi/schema.rs::validation_warning_to_wire`
+	// — `metadata_reserved_prefix` carries both `key` (full key
+	// the user wrote) AND `prefix` (the reserved prefix that
+	// matched). The `key` field is reused; `Prefix` is the new
+	// JSON-tagged field below.
+	Prefix string `json:"prefix,omitempty"`
 }
 
 // ValidationReport is the validator's output.
@@ -416,6 +423,40 @@ func ValidateCapabilitiesAgainst(
 				Kind: "legacy_tag",
 				Tag:  tag.Raw,
 			})
+		}
+	}
+
+	// Q11: metadata-key reservation check. Mirror substrate CR-14
+	// (and TS P2-H, Py P2-L). The schema declares
+	// `MetadataReserved` (exact-match) and `MetadataReservedPrefixes`
+	// (prefix-match) but pre-fix the Go validator never consulted
+	// either list — a user's `WithMetadata("intent", …)` smuggling
+	// onto a scheduler-reserved key emitted no warning client-side
+	// even though Rust / TS / Python now flag it.
+	for k := range caps.Metadata {
+		matched := false
+		for _, reserved := range schema.MetadataReserved {
+			if k == reserved {
+				warnings = append(warnings, ValidationWarning{
+					Kind: "metadata_reserved_key",
+					Key:  k,
+				})
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+		for _, prefix := range schema.MetadataReservedPrefixes {
+			if strings.HasPrefix(k, prefix) {
+				warnings = append(warnings, ValidationWarning{
+					Kind:   "metadata_reserved_prefix",
+					Key:    k,
+					Prefix: prefix,
+				})
+				break
+			}
 		}
 	}
 
