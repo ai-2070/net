@@ -1,0 +1,20 @@
+net/crates/net/docs/CAPABILITY_SYSTEM_MIGRATION.md
+  s_e3c24456981f5d::t_41b371289635c4 261-263,265-266
+  s_e3c24456981f5d::t_3c1086f21e1b27 315-324
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "208a506722c7be43a8222fbb7b375163e892dbcb",
+  "prompts": {},
+  "sessions": {
+    "s_e3c24456981f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7dee77e1-eff1-417b-b6ef-9d02ffaee4ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
