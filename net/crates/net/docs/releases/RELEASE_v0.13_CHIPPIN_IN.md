@@ -1,5 +1,7 @@
 # Net v0.13 — "Chippin' In"
 
+*Named after the two "Chippin' In" tracks: Samurai's original (the in-universe band fronted by Johnny Silverhand) and the Cyberpunk 2077 soundtrack rendition by Damian Ukeje, P.T. Adamczyk, and Kerry Eurodyne.*
+
 v0.13 lands the **capability system** end-to-end across the substrate and all five bindings. v0.12 ("Firestarter") shipped nRPC; v0.13 makes capability the load-bearing layer underneath. The `Tag` placeholder in v0.10 / v0.11, and the untyped `Vec<String>` shape v0.12 still carried, both go away — `CapabilitySet` is now a `{ tags: HashSet<Tag>, metadata: BTreeMap }` typed-taxonomy wire shape, every binding ships the same `Predicate` AST + evaluator + validator + diff + trace + debug-report aggregator, and predicates ride nRPC request headers (`cyberdeck-where:`) so server-side filtering picks the right candidate without re-running the predicate per hop.
 
 The hardening posture from the Black Diamond line is intact — every new surface ships with handle-lifetime, panic-safety, and FFI-soundness guarantees consistent with v0.11 / v0.12 — but this release is about replacing the placeholder with the real thing.
