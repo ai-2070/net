@@ -1,0 +1,23 @@
+net/crates/net/include/README.md
+  s_d1b11a1287c170::t_77da844d6f9b3e 516-533
+  s_d1b11a1287c170::t_39c84a0a70b4a1 488-490,496-508
+  s_d1b11a1287c170::t_971327e2d13dfb 11-14
+net/crates/net/include/net_rpc.h
+  s_d1b11a1287c170::t_a14057f12846a2 1-394
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "f1b6843a5cf2c7d3795e1645bf82dd67614db5db",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
