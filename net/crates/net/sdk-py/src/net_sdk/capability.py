@@ -1105,6 +1105,171 @@ def evaluate_predicate(
     return _eval_leaf(pred, tags, metadata)
 
 
+# ============================================================================
+# Predicate trace evaluator — Phase 9d slice. Mirrors the substrate's
+# ``Predicate::evaluate_with_trace``: children of ``and`` / ``or``
+# evaluate in cost-ascending order; short-circuited siblings dropped
+# from the trace. Pinned across bindings by ``predicate_trace.json``.
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class ClauseTrace:
+    """Per-clause trace entry. Mirrors the substrate's ``ClauseTrace``."""
+
+    label: str
+    result: bool
+    children: Tuple["ClauseTrace", ...] = ()
+
+    def to_wire(self) -> Dict[str, Any]:
+        return {
+            "label": self.label,
+            "result": self.result,
+            "children": [c.to_wire() for c in self.children],
+        }
+
+
+def _pred_static_cost(p: Predicate) -> int:
+    if isinstance(p, _PredMetadataExists):
+        return 10
+    if isinstance(p, _PredMetadataEquals):
+        return 11
+    if isinstance(p, _PredExists):
+        return 20
+    if isinstance(p, _PredEquals):
+        return 21
+    if isinstance(p, _PredMetadataNumericAtLeast):
+        return 25
+    if isinstance(p, (_PredNumericAtLeast, _PredNumericAtMost, _PredNumericInRange)):
+        return 30
+    if isinstance(p, _PredStringPrefix):
+        return 40
+    if isinstance(p, _PredMetadataMatches):
+        return 45
+    if isinstance(p, _PredStringMatches):
+        return 50
+    if isinstance(p, (_PredSemverAtLeast, _PredSemverAtMost, _PredSemverCompatible)):
+        return 60
+    if isinstance(p, (_PredAnd, _PredOr)):
+        # Saturating sum at 0xFFFFFFFF mirrors the substrate.
+        s = 0
+        for c in p.children:
+            s = min(s + _pred_static_cost(c), 0xFFFFFFFF)
+        return s
+    if isinstance(p, _PredNot):
+        return _pred_static_cost(p.child)
+    raise TypeError(f"_pred_static_cost: unknown variant {type(p).__name__}")
+
+
+def _format_float(n: float) -> str:
+    """Match Rust's ``{}`` Display for f64: integers print without
+    decimal, fractional values include their digits."""
+    if n == int(n) and abs(n) < 1e16:
+        return str(int(n))
+    return repr(n)
+
+
+def _rust_dbg_string(s: str) -> str:
+    """Match Rust's ``{:?}`` debug-format for &str: double-quoted with
+    standard escape sequences (matches ``json.dumps`` for plain
+    strings)."""
+    return __import__("json").dumps(s)
+
+
+def _pred_debug_label(p: Predicate) -> str:
+    def tk(k: TagKey) -> str:
+        return f"{k[0]}.{k[1]}"
+
+    if isinstance(p, _PredExists):
+        return f"Exists({tk(p.key)})"
+    if isinstance(p, _PredEquals):
+        return f"Equals({tk(p.key)}={p.value})"
+    if isinstance(p, _PredNumericAtLeast):
+        return f"NumericAtLeast({tk(p.key)} >= {_format_float(p.threshold)})"
+    if isinstance(p, _PredNumericAtMost):
+        return f"NumericAtMost({tk(p.key)} <= {_format_float(p.threshold)})"
+    if isinstance(p, _PredNumericInRange):
+        return (
+            f"NumericInRange({tk(p.key)} in "
+            f"[{_format_float(p.min)}, {_format_float(p.max)}])"
+        )
+    if isinstance(p, _PredSemverAtLeast):
+        return f"SemverAtLeast({tk(p.key)} >= {p.version})"
+    if isinstance(p, _PredSemverAtMost):
+        return f"SemverAtMost({tk(p.key)} <= {p.version})"
+    if isinstance(p, _PredSemverCompatible):
+        return f"SemverCompatible({tk(p.key)} ~= {p.version})"
+    if isinstance(p, _PredStringPrefix):
+        return f"StringPrefix({tk(p.key)} starts with {_rust_dbg_string(p.prefix)})"
+    if isinstance(p, _PredStringMatches):
+        return f"StringMatches({tk(p.key)} contains {_rust_dbg_string(p.pattern)})"
+    if isinstance(p, _PredMetadataExists):
+        return f"MetadataExists({p.key})"
+    if isinstance(p, _PredMetadataEquals):
+        return f"MetadataEquals({p.key}={p.value})"
+    if isinstance(p, _PredMetadataMatches):
+        return f"MetadataMatches({p.key} contains {_rust_dbg_string(p.pattern)})"
+    if isinstance(p, _PredMetadataNumericAtLeast):
+        return (
+            f"MetadataNumericAtLeast({p.key} >= {_format_float(p.threshold)})"
+        )
+    if isinstance(p, _PredAnd):
+        return f"And({len(p.children)} clauses)"
+    if isinstance(p, _PredOr):
+        return f"Or({len(p.children)} clauses)"
+    if isinstance(p, _PredNot):
+        return "Not"
+    raise TypeError(f"_pred_debug_label: unknown variant {type(p).__name__}")
+
+
+def _plan_children(children: Sequence[Predicate]) -> List[Predicate]:
+    """Stable sort by static_cost ascending."""
+    indexed = list(enumerate(children))
+    # Python's sort is stable; sorting by cost preserves declaration
+    # order for ties (matches Rust's `sort_by_key`).
+    indexed.sort(key=lambda it: _pred_static_cost(it[1]))
+    return [c for _i, c in indexed]
+
+
+def evaluate_predicate_with_trace(
+    pred: Predicate,
+    tags: Sequence[str],
+    metadata: Mapping[str, str],
+) -> Tuple[bool, ClauseTrace]:
+    """Evaluate + produce a trace tree. Mirrors the substrate's
+    ``Predicate::evaluate_with_trace``: cost-ordered, short-circuiting,
+    drops siblings that didn't run from the trace. Pinned across
+    bindings by ``predicate_trace.json``."""
+    label = _pred_debug_label(pred)
+    if isinstance(pred, _PredAnd):
+        ordered = _plan_children(pred.children)
+        traces: List[ClauseTrace] = []
+        result = True
+        for c in ordered:
+            r, t = evaluate_predicate_with_trace(c, tags, metadata)
+            traces.append(t)
+            if not r:
+                result = False
+                break
+        return result, ClauseTrace(label=label, result=result, children=tuple(traces))
+    if isinstance(pred, _PredOr):
+        ordered = _plan_children(pred.children)
+        traces = []
+        result = False
+        for c in ordered:
+            r, t = evaluate_predicate_with_trace(c, tags, metadata)
+            traces.append(t)
+            if r:
+                result = True
+                break
+        return result, ClauseTrace(label=label, result=result, children=tuple(traces))
+    if isinstance(pred, _PredNot):
+        r, t = evaluate_predicate_with_trace(pred.child, tags, metadata)
+        return not r, ClauseTrace(label=label, result=not r, children=(t,))
+    r = _eval_leaf(pred, tags, metadata)
+    return r, ClauseTrace(label=label, result=r, children=())
+
+
 __all__ = [
     "TaxonomyAxis",
     "TAXONOMY_AXES",
@@ -1147,4 +1312,6 @@ __all__ = [
     "RegisteredPlacementFilter",
     "placement_filter_from_fn",
     "evaluate_predicate",
+    "ClauseTrace",
+    "evaluate_predicate_with_trace",
 ]

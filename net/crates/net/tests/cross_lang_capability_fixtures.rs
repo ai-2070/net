@@ -17,8 +17,8 @@
 use std::collections::BTreeMap;
 
 use net::adapter::net::behavior::{
-    CapabilitySet, EvalContext, MetadataChange, Predicate, PredicateWire, RPC_WHERE_HEADER,
-    SchemaError, Tag, ValidationWarning, ValueType, validate_capabilities,
+    CapabilitySet, ClauseTrace, EvalContext, MetadataChange, Predicate, PredicateWire,
+    RPC_WHERE_HEADER, SchemaError, Tag, ValidationWarning, ValueType, validate_capabilities,
 };
 use serde_json::Value;
 
@@ -522,6 +522,82 @@ fn capability_validation_fixture_matches_substrate() {
         assert_eq!(
             got_warnings, expected_warnings,
             "case[{i}] {name}: warnings diverged\n  got:      {got_warnings:#?}\n  expected: {expected_warnings:#?}",
+        );
+    }
+}
+
+// =============================================================================
+// predicate_trace.json — Phase 9d slice contract.
+//
+// Per case: decode wire → Predicate, build EvalContext from tags +
+// metadata, run `evaluate_with_trace`, project the resulting
+// `ClauseTrace` tree onto the canonical wire shape (`{label, result,
+// children}`), assert it matches the case's `expected_trace`. Also
+// asserts the boolean result matches `expected_result`.
+//
+// This pins the substrate's `evaluate_with_trace` output as the
+// ground truth that bindings re-implement and verify against.
+// =============================================================================
+
+fn clause_trace_to_wire(t: &ClauseTrace) -> Value {
+    serde_json::json!({
+        "label": t.label,
+        "result": t.result,
+        "children": t.children.iter().map(clause_trace_to_wire).collect::<Vec<_>>(),
+    })
+}
+
+#[test]
+fn predicate_trace_fixture_matches_substrate() {
+    let raw = read_fixture("predicate_trace.json");
+    let v: Value = serde_json::from_str(&raw).expect("parse fixture");
+    let cases = v["cases"].as_array().expect("cases is array");
+    assert!(!cases.is_empty(), "fixture has zero cases");
+
+    for (i, case) in cases.iter().enumerate() {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+
+        let wire: PredicateWire = serde_json::from_value(case["wire"].clone())
+            .unwrap_or_else(|e| panic!("case[{i}] {name}: deserialize wire: {e}"));
+        let pred: Predicate = wire
+            .into_predicate()
+            .unwrap_or_else(|e| panic!("case[{i}] {name}: into_predicate: {e}"));
+
+        let tag_strings: Vec<String> = case["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect();
+        let tags: Vec<Tag> = tag_strings
+            .iter()
+            .map(|s| Tag::parse(s).unwrap_or_else(|e| panic!("case[{i}] {name}: parse tag {s:?}: {e}")))
+            .collect();
+
+        let metadata: BTreeMap<String, String> = case["metadata"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+            .collect();
+
+        let ctx = EvalContext::new(&tags, &metadata);
+
+        let (got_result, got_trace) = pred.evaluate_with_trace(&ctx);
+
+        let expected_result = case["expected_result"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("case[{i}] {name}: `expected_result` not bool"));
+        assert_eq!(
+            got_result, expected_result,
+            "case[{i}] {name}: result diverged",
+        );
+
+        let got_wire = clause_trace_to_wire(&got_trace);
+        let expected_wire = case["expected_trace"].clone();
+        assert_eq!(
+            got_wire, expected_wire,
+            "case[{i}] {name}: trace diverged\n  got:      {got_wire:#}\n  expected: {expected_wire:#}",
         );
     }
 }

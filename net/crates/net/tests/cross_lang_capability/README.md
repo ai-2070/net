@@ -36,6 +36,19 @@ Each binding loads the fixture, decodes the predicate, runs its host-language ev
 
 Phase 9c of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`. SDKs that expose a host-language `evaluatePredicate(pred, tags, metadata)` consume this fixture in their per-binding test suites.
 
+### `predicate_trace.json`
+
+Pins `Predicate::evaluate_with_trace(ctx)` output for representative `(predicate, tags, metadata)` triples — the cost-ordered, short-circuiting trace evaluator. Phase 9d slice of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+
+- `wire` is the canonical `PredicateWire`.
+- `tags` + `metadata` form the evaluation context.
+- `expected_result` is the boolean the substrate returns.
+- `expected_trace` is a `{label, result, children}` tree mirroring `ClauseTrace`. Each leaf carries a one-line `label` per the substrate's `debug_label` (e.g. `Exists(hardware.gpu)`, `MetadataEquals(intent=ml-training)`, `StringPrefix(software.os starts with "linux")`); composites carry the planner-ordered subset of children that actually ran.
+
+Coverage spans every composite shape: leaf hit / miss; And short-circuit (sibling dropped from trace); And full-evaluation (no short-circuit); Or short-circuit; Or all-false (every child in trace); Not inversion (single child carrying pre-negation result).
+
+The fixture also pins the planner's stable cost-sort: in the `and_runs_all_when_no_short_circuit` case, both children are true but `MetadataExists` (cost 10) appears before `Exists` (cost 20) in the trace, even though the AST declared them in the reverse order. Implementations must use a stable sort by `static_cost` to match.
+
 ### `capability_validation.json`
 
 Pins `validate_capabilities(caps)` output for representative `caps` payloads. Phase 9a of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.

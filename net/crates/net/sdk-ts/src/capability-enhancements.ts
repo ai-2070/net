@@ -1147,3 +1147,189 @@ export function evaluatePredicate(
       return evalLeaf(pred, tags, metadata);
   }
 }
+
+// ============================================================================
+// Predicate trace evaluator — Phase 9d slice. Mirrors the substrate's
+// `Predicate::evaluate_with_trace`: children of `and` / `or` evaluate
+// in cost-ascending order (planner reorders); short-circuited
+// siblings are dropped from the trace. Pinned across bindings by
+// `predicate_trace.json`.
+// ============================================================================
+
+/**
+ * Per-clause trace entry. Mirrors the substrate's `ClauseTrace`:
+ * each leaf carries a one-line `label` + the boolean `result`;
+ * composites carry the planner-ordered subset of children that
+ * actually ran.
+ */
+export interface ClauseTrace {
+  label: string;
+  result: boolean;
+  children: ClauseTrace[];
+}
+
+/**
+ * Static per-variant cost — matches the substrate's `static_cost`.
+ * Lower = cheaper; planner sorts children ascending. Composites sum
+ * their children's costs.
+ */
+function predStaticCost(p: Predicate): number {
+  switch (p.type) {
+    case 'metadataExists':
+      return 10;
+    case 'metadataEquals':
+      return 11;
+    case 'exists':
+      return 20;
+    case 'equals':
+      return 21;
+    case 'metadataNumericAtLeast':
+      return 25;
+    case 'numericAtLeast':
+    case 'numericAtMost':
+    case 'numericInRange':
+      return 30;
+    case 'stringPrefix':
+      return 40;
+    case 'metadataMatches':
+      return 45;
+    case 'stringMatches':
+      return 50;
+    case 'semverAtLeast':
+    case 'semverAtMost':
+    case 'semverCompatible':
+      return 60;
+    case 'and':
+    case 'or':
+      return p.children.reduce(
+        (acc, c) => Math.min(acc + predStaticCost(c), 0xffffffff),
+        0,
+      );
+    case 'not':
+      return predStaticCost(p.child);
+  }
+}
+
+function predDebugLabel(p: Predicate): string {
+  // Rust's `{:?}` on a string adds quotes + escapes. We match that
+  // for string-bearing leaves so labels round-trip with the
+  // substrate's `debug_label`.
+  const dbg = (s: string): string => JSON.stringify(s);
+  const tk = (k: TagKey): string => `${k.axis}.${k.key}`;
+  switch (p.type) {
+    case 'exists':
+      return `Exists(${tk(p.key)})`;
+    case 'equals':
+      return `Equals(${tk(p.key)}=${p.value})`;
+    case 'numericAtLeast':
+      return `NumericAtLeast(${tk(p.key)} >= ${p.threshold})`;
+    case 'numericAtMost':
+      return `NumericAtMost(${tk(p.key)} <= ${p.threshold})`;
+    case 'numericInRange':
+      return `NumericInRange(${tk(p.key)} in [${p.min}, ${p.max}])`;
+    case 'semverAtLeast':
+      return `SemverAtLeast(${tk(p.key)} >= ${p.version})`;
+    case 'semverAtMost':
+      return `SemverAtMost(${tk(p.key)} <= ${p.version})`;
+    case 'semverCompatible':
+      return `SemverCompatible(${tk(p.key)} ~= ${p.version})`;
+    case 'stringPrefix':
+      return `StringPrefix(${tk(p.key)} starts with ${dbg(p.prefix)})`;
+    case 'stringMatches':
+      return `StringMatches(${tk(p.key)} contains ${dbg(p.pattern)})`;
+    case 'metadataExists':
+      return `MetadataExists(${p.key})`;
+    case 'metadataEquals':
+      return `MetadataEquals(${p.key}=${p.value})`;
+    case 'metadataMatches':
+      return `MetadataMatches(${p.key} contains ${dbg(p.pattern)})`;
+    case 'metadataNumericAtLeast':
+      return `MetadataNumericAtLeast(${p.key} >= ${p.threshold})`;
+    case 'and':
+      return `And(${p.children.length} clauses)`;
+    case 'or':
+      return `Or(${p.children.length} clauses)`;
+    case 'not':
+      return 'Not';
+  }
+}
+
+/**
+ * Stable sort by `static_cost` ascending. Mirrors Rust's
+ * `sort_by_key` (stable). Children with equal cost preserve their
+ * declaration order.
+ */
+function planChildren(children: Predicate[]): Predicate[] {
+  const indexed = children.map((c, i) => ({
+    child: c,
+    cost: predStaticCost(c),
+    i,
+  }));
+  indexed.sort((a, b) => a.cost - b.cost || a.i - b.i);
+  return indexed.map((x) => x.child);
+}
+
+/**
+ * Evaluate a predicate against `(tags, metadata)` and produce a
+ * trace tree.
+ *
+ * Mirrors the substrate's `Predicate::evaluate_with_trace`:
+ * - `And` / `Or` children evaluated in cost-ascending order.
+ * - Short-circuited siblings DON'T appear in the trace — operators
+ *   see "the metadata clause failed; we never got to the GPU
+ *   check."
+ * - `Not`'s child carries the pre-negation result; `Not`'s own node
+ *   carries the post-negation result.
+ *
+ * Pinned across bindings by `predicate_trace.json`. Useful for
+ * client-side debugging of why a candidate did / didn't match
+ * before hitting the wire.
+ */
+export function evaluatePredicateWithTrace(
+  pred: Predicate,
+  tags: readonly string[],
+  metadata: Readonly<Record<string, string>>,
+): { result: boolean; trace: ClauseTrace } {
+  const label = predDebugLabel(pred);
+  if (pred.type === 'and') {
+    const ordered = planChildren(pred.children);
+    const traces: ClauseTrace[] = [];
+    let result = true;
+    for (const c of ordered) {
+      const { result: r, trace } = evaluatePredicateWithTrace(c, tags, metadata);
+      traces.push(trace);
+      if (!r) {
+        result = false;
+        break;
+      }
+    }
+    return { result, trace: { label, result, children: traces } };
+  }
+  if (pred.type === 'or') {
+    const ordered = planChildren(pred.children);
+    const traces: ClauseTrace[] = [];
+    let result = false;
+    for (const c of ordered) {
+      const { result: r, trace } = evaluatePredicateWithTrace(c, tags, metadata);
+      traces.push(trace);
+      if (r) {
+        result = true;
+        break;
+      }
+    }
+    return { result, trace: { label, result, children: traces } };
+  }
+  if (pred.type === 'not') {
+    const { result: r, trace } = evaluatePredicateWithTrace(
+      pred.child,
+      tags,
+      metadata,
+    );
+    return {
+      result: !r,
+      trace: { label, result: !r, children: [trace] },
+    };
+  }
+  const r = evalLeaf(pred, tags, metadata);
+  return { result: r, trace: { label, result: r, children: [] } };
+}

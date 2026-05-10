@@ -1262,3 +1262,181 @@ func EvaluatePredicate(p *Predicate, tags []string, metadata map[string]string) 
 		return evalLeaf(p, tags, metadata)
 	}
 }
+
+// ============================================================================
+// Predicate trace evaluator — Phase 9d slice. Mirrors the substrate's
+// `Predicate::evaluate_with_trace`: cost-ordered, short-circuiting,
+// drops siblings that didn't run from the trace. Pinned across
+// bindings by `predicate_trace.json`.
+// ============================================================================
+
+// ClauseTrace is the wire-format trace tree. Mirrors the substrate's
+// `ClauseTrace`. JSON tags pin `label` / `result` / `children` so the
+// shape round-trips with the cross-binding fixture.
+type ClauseTrace struct {
+	Label    string        `json:"label"`
+	Result   bool          `json:"result"`
+	Children []ClauseTrace `json:"children"`
+}
+
+func predStaticCost(p *Predicate) uint32 {
+	switch p.kind {
+	case pkMetadataExists:
+		return 10
+	case pkMetadataEquals:
+		return 11
+	case pkExists:
+		return 20
+	case pkEquals:
+		return 21
+	case pkMetadataNumericAtLeast:
+		return 25
+	case pkNumericAtLeast, pkNumericAtMost, pkNumericInRange:
+		return 30
+	case pkStringPrefix:
+		return 40
+	case pkMetadataMatches:
+		return 45
+	case pkStringMatches:
+		return 50
+	case pkSemverAtLeast, pkSemverAtMost, pkSemverCompatible:
+		return 60
+	case pkAnd, pkOr:
+		var s uint64
+		for _, c := range p.children {
+			s += uint64(predStaticCost(c))
+			if s > 0xFFFFFFFF {
+				return 0xFFFFFFFF
+			}
+		}
+		return uint32(s)
+	case pkNot:
+		return predStaticCost(p.child)
+	}
+	return 0
+}
+
+func formatFloat(n float64) string {
+	// Match Rust's `{}` Display: integers print without decimals.
+	if n == float64(int64(n)) && n >= -1e16 && n <= 1e16 {
+		return fmt.Sprintf("%d", int64(n))
+	}
+	return fmt.Sprintf("%g", n)
+}
+
+func rustDbgString(s string) string {
+	// Match Rust's `{:?}` debug-format for &str: encoded JSON string
+	// is byte-equal for plain ASCII strings.
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func tagKeyDisplay(k TagKey) string {
+	return string(k.Axis) + "." + k.Key
+}
+
+func predDebugLabel(p *Predicate) string {
+	switch p.kind {
+	case pkExists:
+		return "Exists(" + tagKeyDisplay(p.key) + ")"
+	case pkEquals:
+		return "Equals(" + tagKeyDisplay(p.key) + "=" + p.value + ")"
+	case pkNumericAtLeast:
+		return "NumericAtLeast(" + tagKeyDisplay(p.key) + " >= " + formatFloat(p.threshold) + ")"
+	case pkNumericAtMost:
+		return "NumericAtMost(" + tagKeyDisplay(p.key) + " <= " + formatFloat(p.threshold) + ")"
+	case pkNumericInRange:
+		return "NumericInRange(" + tagKeyDisplay(p.key) + " in [" +
+			formatFloat(p.min) + ", " + formatFloat(p.max) + "])"
+	case pkSemverAtLeast:
+		return "SemverAtLeast(" + tagKeyDisplay(p.key) + " >= " + p.version + ")"
+	case pkSemverAtMost:
+		return "SemverAtMost(" + tagKeyDisplay(p.key) + " <= " + p.version + ")"
+	case pkSemverCompatible:
+		return "SemverCompatible(" + tagKeyDisplay(p.key) + " ~= " + p.version + ")"
+	case pkStringPrefix:
+		return "StringPrefix(" + tagKeyDisplay(p.key) + " starts with " + rustDbgString(p.prefix) + ")"
+	case pkStringMatches:
+		return "StringMatches(" + tagKeyDisplay(p.key) + " contains " + rustDbgString(p.pattern) + ")"
+	case pkMetadataExists:
+		return "MetadataExists(" + p.mdKey + ")"
+	case pkMetadataEquals:
+		return "MetadataEquals(" + p.mdKey + "=" + p.value + ")"
+	case pkMetadataMatches:
+		return "MetadataMatches(" + p.mdKey + " contains " + rustDbgString(p.pattern) + ")"
+	case pkMetadataNumericAtLeast:
+		return "MetadataNumericAtLeast(" + p.mdKey + " >= " + formatFloat(p.threshold) + ")"
+	case pkAnd:
+		return fmt.Sprintf("And(%d clauses)", len(p.children))
+	case pkOr:
+		return fmt.Sprintf("Or(%d clauses)", len(p.children))
+	case pkNot:
+		return "Not"
+	}
+	return ""
+}
+
+// planChildren returns the children sorted by static cost (ascending),
+// preserving declaration order for ties (stable sort).
+func planChildren(children []*Predicate) []*Predicate {
+	type indexed struct {
+		c    *Predicate
+		i    int
+		cost uint32
+	}
+	idx := make([]indexed, len(children))
+	for i, c := range children {
+		idx[i] = indexed{c: c, i: i, cost: predStaticCost(c)}
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		return idx[a].cost < idx[b].cost
+	})
+	out := make([]*Predicate, len(idx))
+	for i, x := range idx {
+		out[i] = x.c
+	}
+	return out
+}
+
+// EvaluatePredicateWithTrace evaluates a predicate against (tags,
+// metadata) and produces a trace tree. Mirrors the substrate's
+// `Predicate::evaluate_with_trace`: cost-ordered, short-circuiting,
+// drops siblings that didn't run.
+func EvaluatePredicateWithTrace(
+	p *Predicate, tags []string, metadata map[string]string,
+) (bool, ClauseTrace) {
+	label := predDebugLabel(p)
+	switch p.kind {
+	case pkAnd:
+		ordered := planChildren(p.children)
+		traces := make([]ClauseTrace, 0, len(ordered))
+		result := true
+		for _, c := range ordered {
+			r, t := EvaluatePredicateWithTrace(c, tags, metadata)
+			traces = append(traces, t)
+			if !r {
+				result = false
+				break
+			}
+		}
+		return result, ClauseTrace{Label: label, Result: result, Children: traces}
+	case pkOr:
+		ordered := planChildren(p.children)
+		traces := make([]ClauseTrace, 0, len(ordered))
+		result := false
+		for _, c := range ordered {
+			r, t := EvaluatePredicateWithTrace(c, tags, metadata)
+			traces = append(traces, t)
+			if r {
+				result = true
+				break
+			}
+		}
+		return result, ClauseTrace{Label: label, Result: result, Children: traces}
+	case pkNot:
+		r, t := EvaluatePredicateWithTrace(p.child, tags, metadata)
+		return !r, ClauseTrace{Label: label, Result: !r, Children: []ClauseTrace{t}}
+	}
+	r := evalLeaf(p, tags, metadata)
+	return r, ClauseTrace{Label: label, Result: r, Children: []ClauseTrace{}}
+}

@@ -165,7 +165,9 @@ export {
   standardPlacement,
   placementFilterFromFn,
   evaluatePredicate,
+  evaluatePredicateWithTrace,
 } from './capability-enhancements';
+export type { ClauseTrace } from './capability-enhancements';
 
 // Capability axis schema + validator — Phase 9a.
 export type {
