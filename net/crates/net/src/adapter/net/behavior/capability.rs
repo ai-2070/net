@@ -1234,7 +1234,12 @@ impl CapabilitySet {
         let Ok(parsed) = Tag::parse(tag) else {
             return false;
         };
-        self.tags.contains(&parsed)
+        // Separator-agnostic membership: a stored `software.os=linux`
+        // matches a query `software.os:linux` (and vice versa). Plain
+        // `HashSet::contains` would distinguish them via PartialEq's
+        // separator field — see CR-1 in
+        // `CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md`.
+        self.tags.iter().any(|t| t.semantic_eq(&parsed))
     }
 
     /// Check if has a specific model.
@@ -3388,6 +3393,42 @@ mod tests {
         );
         assert_eq!(caps.tags, parsed.tags);
         assert_eq!(caps.views().models().len(), parsed.views().models().len());
+    }
+
+    #[test]
+    fn has_tag_matches_across_separator_forms() {
+        // Regression for CR-1: `Tag::AxisValue` derives `PartialEq`
+        // including the `=` vs `:` separator. A capability set built
+        // by inserting one wire form must still be findable when the
+        // caller queries the other — the separator is a serialization
+        // detail, not part of identity. Mirrors the prior diff-engine
+        // fix in commit 38612b61 but for the public membership API.
+        use crate::adapter::net::behavior::tag::{AxisSeparator, Tag, TaxonomyAxis};
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(Tag::AxisValue {
+            axis: TaxonomyAxis::Software,
+            key: "os".to_string(),
+            value: "linux".to_string(),
+            separator: AxisSeparator::Colon,
+        });
+        // Stored colon, queried equals — must hit.
+        assert!(caps.has_tag("software.os=linux"));
+        // Stored colon, queried colon — must hit.
+        assert!(caps.has_tag("software.os:linux"));
+        // Different value — must miss.
+        assert!(!caps.has_tag("software.os=darwin"));
+
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(Tag::AxisValue {
+            axis: TaxonomyAxis::Hardware,
+            key: "gpu.vram_gb".to_string(),
+            value: "80".to_string(),
+            separator: AxisSeparator::Eq,
+        });
+        // Stored equals, queried colon — must hit.
+        assert!(caps.has_tag("hardware.gpu.vram_gb:80"));
+        // Stored equals, queried equals — must hit.
+        assert!(caps.has_tag("hardware.gpu.vram_gb=80"));
     }
 
     #[test]

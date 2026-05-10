@@ -353,6 +353,51 @@ impl Tag {
     pub fn to_wire(&self) -> String {
         self.to_string()
     }
+
+    /// Semantic equality — like `PartialEq` but ignores the
+    /// `=` vs `:` separator on `AxisValue`. Two tags that only
+    /// differ in their wire-form separator describe the same
+    /// `(axis, key, value)` and should compare equal for
+    /// membership / require / diff purposes.
+    ///
+    /// `PartialEq` itself stays separator-aware so the wire
+    /// form round-trips byte-for-byte; callers comparing for
+    /// *meaning* (rather than for *bytes*) should prefer this
+    /// method. See `CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md`
+    /// CR-1..CR-3 for the bug class this guards against.
+    pub fn semantic_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::AxisPresent { axis: a1, key: k1 }, Self::AxisPresent { axis: a2, key: k2 }) => {
+                a1 == a2 && k1 == k2
+            }
+            (
+                Self::AxisValue {
+                    axis: a1,
+                    key: k1,
+                    value: v1,
+                    ..
+                },
+                Self::AxisValue {
+                    axis: a2,
+                    key: k2,
+                    value: v2,
+                    ..
+                },
+            ) => a1 == a2 && k1 == k2 && v1 == v2,
+            (
+                Self::Reserved {
+                    prefix: p1,
+                    body: b1,
+                },
+                Self::Reserved {
+                    prefix: p2,
+                    body: b2,
+                },
+            ) => p1 == p2 && b1 == b2,
+            (Self::Legacy(a), Self::Legacy(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Parse the body of an axis-prefixed tag (everything after the
