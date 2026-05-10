@@ -4,9 +4,13 @@
 //! to decide where to run a daemon. Prefers local placement, falls back
 //! to the least-loaded candidate.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilityIndex, CapabilitySet};
+use crate::adapter::net::behavior::placement::{
+    Artifact, PlacementFilter, TieBreakContext, tie_break_compare,
+};
 use crate::adapter::net::subprotocol::SubprotocolRegistry;
 
 /// Why a particular node was chosen for placement.
@@ -200,6 +204,66 @@ impl Scheduler {
             reason: PlacementReason::FirstMatch,
         })
     }
+
+    /// Phase G slice 1 of `CAPABILITY_SYSTEM_PLAN.md`. Select the
+    /// best migration target for `artifact` from the candidates
+    /// returned by [`Self::find_migration_targets`], scored via
+    /// `&dyn PlacementFilter` with ties broken by the §7-LOCKED
+    /// three-step ordering (RTT → free-resource → lex NodeId).
+    ///
+    /// `daemon_filter` narrows the candidate pool BEFORE scoring —
+    /// it's the legacy `CapabilityFilter` plumbed through
+    /// `find_migration_targets` so existing callsites keep
+    /// working. `placement` runs against each surviving candidate;
+    /// any candidate scoring `None` is excluded (hard veto).
+    ///
+    /// `tie_break` carries the inputs the comparator reads (RTT
+    /// closure + capability index + resource axis). Pass a
+    /// `TieBreakContext { rtt_lookup: None, ... }` to fall through
+    /// to step 3 (lex NodeId) when no proximity data is available.
+    ///
+    /// Returns the highest-scoring candidate's node id, or `None`
+    /// when every candidate is vetoed (or the candidate list was
+    /// empty to begin with).
+    ///
+    /// Additive — does NOT change `place_migration`'s observable
+    /// behavior. Operators opt in by calling this method directly;
+    /// a future slice gates the default migration path behind the
+    /// `mikoshi-placement-v2` feature flag.
+    pub fn select_migration_target(
+        &self,
+        artifact: &Artifact<'_>,
+        daemon_filter: &CapabilityFilter,
+        source_node: u64,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+    ) -> Option<u64> {
+        let candidates = self.find_migration_targets(daemon_filter, source_node);
+
+        // Score every candidate; drop the ones the placement filter
+        // vetoes via `None`. Collect (node_id, score) pairs so we
+        // can sort.
+        let mut scored: Vec<(u64, f32)> = candidates
+            .into_iter()
+            .filter_map(|n| placement.placement_score(&n, artifact).map(|s| (n, s)))
+            .collect();
+
+        if scored.is_empty() {
+            return None;
+        }
+
+        // Highest score first; ties broken via the locked
+        // three-step ordering. `partial_cmp` returns `None` only
+        // for NaN — the placement filter contract bans NaN, so
+        // treat as `Equal` defensively.
+        scored.sort_by(|(a, sa), (b, sb)| {
+            sb.partial_cmp(sa)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| tie_break_compare(*a, *b, tie_break))
+        });
+
+        scored.first().map(|(n, _)| *n)
+    }
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -390,5 +454,292 @@ mod tests {
         let migration_nodes = scheduler.find_subprotocol_nodes(0x0500);
         assert_eq!(migration_nodes.len(), 1);
         assert_eq!(migration_nodes[0], 0x3333);
+    }
+
+    // ==================================================================
+    // Phase G slice 1: select_migration_target via &dyn PlacementFilter
+    // ==================================================================
+
+    use crate::adapter::net::behavior::placement::{
+        Artifact, LegacyPlacement, NodeId as PlacementNodeId, PlacementFilter, ResourceAxis,
+        TieBreakContext,
+    };
+
+    /// Empty capability set — placeholder for Daemon artifact's
+    /// `required` / `optional` slots.
+    fn empty_caps_pf() -> CapabilitySet {
+        CapabilitySet::default()
+    }
+
+    /// Synthetic placement filter that returns a fixed score for
+    /// every candidate, optionally vetoing specific node ids via
+    /// `None`.
+    struct FixedScore {
+        score: f32,
+        veto: Vec<u64>,
+    }
+
+    impl PlacementFilter for FixedScore {
+        fn placement_score(
+            &self,
+            target: &PlacementNodeId,
+            _artifact: &Artifact<'_>,
+        ) -> Option<f32> {
+            if self.veto.contains(target) {
+                None
+            } else {
+                Some(self.score)
+            }
+        }
+    }
+
+    fn daemon_artifact_pf<'a>(
+        required: &'a CapabilitySet,
+        optional: &'a CapabilitySet,
+    ) -> Artifact<'a> {
+        Artifact::Daemon {
+            daemon_id: [0u8; 32],
+            required,
+            optional,
+        }
+    }
+
+    /// Single eligible candidate → `select_migration_target`
+    /// returns it.
+    #[test]
+    fn select_migration_target_returns_only_candidate() {
+        let index = make_index_with_nodes(vec![
+            (0x2222, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0x1111, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = LegacyPlacement::permissive(&index);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let target = scheduler.select_migration_target(
+            &artifact,
+            &CapabilityFilter::default(),
+            0x1111,
+            &placement,
+            &tb,
+        );
+        assert_eq!(target, Some(0x2222));
+    }
+
+    /// Multiple candidates with different scores → highest wins.
+    #[test]
+    fn select_migration_target_picks_highest_scoring() {
+        let index = make_index_with_nodes(vec![
+            (0x1111, caps_with_migration_tag()),
+            (0x2222, caps_with_migration_tag()),
+            (0x3333, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+
+        // Synthetic filter: 0x1111 → 0.3, 0x2222 → 0.9, 0x3333 → 0.5.
+        struct ScoredFilter;
+        impl PlacementFilter for ScoredFilter {
+            fn placement_score(
+                &self,
+                t: &PlacementNodeId,
+                _: &Artifact<'_>,
+            ) -> Option<f32> {
+                Some(match *t {
+                    0x1111 => 0.3,
+                    0x2222 => 0.9,
+                    0x3333 => 0.5,
+                    _ => 0.0,
+                })
+            }
+        }
+
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let target = scheduler.select_migration_target(
+            &artifact,
+            &CapabilityFilter::default(),
+            0xFFFF,
+            &ScoredFilter,
+            &tb,
+        );
+        assert_eq!(target, Some(0x2222), "highest scorer wins");
+    }
+
+    /// Tied scores → tie-breaker resolves via lex NodeId fallback.
+    #[test]
+    fn select_migration_target_ties_resolved_by_lex_node_id() {
+        let index = make_index_with_nodes(vec![
+            (0x3333, caps_with_migration_tag()),
+            (0x1111, caps_with_migration_tag()),
+            (0x2222, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = FixedScore {
+            score: 0.5,
+            veto: vec![],
+        };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let target = scheduler.select_migration_target(
+            &artifact,
+            &CapabilityFilter::default(),
+            0xFFFF,
+            &placement,
+            &tb,
+        );
+        // All three score 0.5; tie-breaker step 3 (lex NodeId)
+        // picks the lowest.
+        assert_eq!(target, Some(0x1111));
+    }
+
+    /// Filter vetoes everyone → `None`.
+    #[test]
+    fn select_migration_target_returns_none_when_all_vetoed() {
+        let index = make_index_with_nodes(vec![
+            (0x2222, caps_with_migration_tag()),
+            (0x3333, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = FixedScore {
+            score: 1.0,
+            veto: vec![0x2222, 0x3333],
+        };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let target = scheduler.select_migration_target(
+            &artifact,
+            &CapabilityFilter::default(),
+            0xFFFF,
+            &placement,
+            &tb,
+        );
+        assert_eq!(target, None);
+    }
+
+    /// Empty candidate list (no migration-tagged nodes) → `None`.
+    #[test]
+    fn select_migration_target_returns_none_for_empty_candidates() {
+        let index = make_index_with_nodes(vec![]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = FixedScore {
+            score: 1.0,
+            veto: vec![],
+        };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let target = scheduler.select_migration_target(
+            &artifact,
+            &CapabilityFilter::default(),
+            0xFFFF,
+            &placement,
+            &tb,
+        );
+        assert_eq!(target, None);
+    }
+
+    /// Source node is excluded from candidates (already pinned by
+    /// `find_migration_targets`; pin again at the
+    /// `select_migration_target` level).
+    #[test]
+    fn select_migration_target_excludes_source_node() {
+        let index = make_index_with_nodes(vec![
+            (0x1111, caps_with_migration_tag()),
+            (0x2222, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = FixedScore {
+            score: 1.0,
+            veto: vec![],
+        };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        // Source = 0x1111; target list excludes it. Only 0x2222 remains.
+        let target = scheduler.select_migration_target(
+            &artifact,
+            &CapabilityFilter::default(),
+            0x1111,
+            &placement,
+            &tb,
+        );
+        assert_eq!(target, Some(0x2222));
+    }
+
+    /// `daemon_filter` narrows candidates BEFORE scoring. A node
+    /// without the required tag is excluded by
+    /// `find_migration_targets`, so the placement filter never sees it.
+    #[test]
+    fn select_migration_target_honors_daemon_filter() {
+        let index = make_index_with_nodes(vec![
+            (
+                0x1111,
+                caps_with_migration_tag().add_tag("hardware.gpu"),
+            ),
+            (0x2222, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index.clone(), 0xFFFF, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = FixedScore {
+            score: 1.0,
+            veto: vec![],
+        };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        // Filter: must have hardware.gpu — narrows to 0x1111 only.
+        let filter = CapabilityFilter::default().require_tag("hardware.gpu".to_string());
+        let target = scheduler.select_migration_target(
+            &artifact,
+            &filter,
+            0xFFFF,
+            &placement,
+            &tb,
+        );
+        assert_eq!(target, Some(0x1111));
     }
 }
