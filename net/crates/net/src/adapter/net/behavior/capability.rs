@@ -2783,7 +2783,7 @@ impl CapabilityIndex {
     ///
     /// Linear scan over the indexed-node table; each node's
     /// capabilities are evaluated against `predicate` via the
-    /// cardinality-aware planner ([`Predicate::evaluate_with_index`]).
+    /// cardinality-aware planner ([`super::predicate::Predicate::evaluate_with_index`]).
     /// `Self` provides the cardinality data — the same index that
     /// holds the candidates also informs the planner's clause
     /// ordering, so high-cardinality discriminating clauses run

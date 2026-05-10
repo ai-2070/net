@@ -218,7 +218,7 @@ impl Scheduler {
     /// [`Self::select_migration_target`] and the LOCKED §7
     /// tie-breaker.
     ///
-    /// **Default migration path.** [`Self::start_migration_auto`]
+    /// **Default migration path.** `Orchestrator::start_migration_auto`
     /// (in `orchestrator.rs`) calls this method, so any auto-target
     /// migration in the substrate runs through v2 plumbing. The
     /// legacy [`Self::place_migration`] is kept around for callers

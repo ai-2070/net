@@ -830,7 +830,7 @@ impl AsRpcHeader for &(String, Vec<u8>) {
 
 impl Predicate {
     /// True if this predicate evaluates to true against the
-    /// given [`CapabilitySet`]'s tags + metadata.
+    /// given [`super::capability::CapabilitySet`]'s tags + metadata.
     ///
     /// Materializes `caps.tags` (a `HashSet<Tag>`) as a `Vec<Tag>`
     /// for the slice-based `EvalContext`. The cost is a single

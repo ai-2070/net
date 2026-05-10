@@ -4,12 +4,12 @@
 //! Three pure helpers — no handles, no state — exposing what
 //! every other binding ships at the SDK layer:
 //!
-//!   - [`net_predicate_evaluate_with_trace`] — single-evaluation
+//!   - `net_predicate_evaluate_with_trace` — single-evaluation
 //!     trace tree (per-clause `label` / `result` / `children`).
-//!   - [`net_predicate_aggregate_debug_report`] — corpus-wide
+//!   - `net_predicate_aggregate_debug_report` — corpus-wide
 //!     aggregator: total / matched / per-clause `(evaluated,
 //!     matched)` rollup keyed by debug label.
-//!   - [`net_predicate_redact_metadata_keys`] — host-side scrubber
+//!   - `net_predicate_redact_metadata_keys` — host-side scrubber
 //!     that rewrites metadata-clause labels before persistence.
 //!     The substrate doesn't ship a redaction implementation
 //!     (Phase 6 of `CAPABILITY_ENHANCEMENTS_PLAN.md` defined the
@@ -376,8 +376,9 @@ fn redact_label(label: &str, keys: &BTreeSet<String>) -> String {
     label.to_string()
 }
 
-/// Apply [`redact_label`] across a wire-format report and write
-/// the redacted report to the out-param.
+/// Apply the `redact_label` rewrite (private helper above)
+/// across a wire-format report and write the redacted report
+/// to the out-param.
 ///
 /// Inputs (NUL-terminated UTF-8 JSON):
 ///

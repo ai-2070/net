@@ -515,7 +515,7 @@ fn limits_value(key: &str, value: &str) -> Tag {
 ///
 /// Numeric indexing matches the multi-GPU encoding scheme noted as
 /// a TODO in the hardware codec — same pattern, applied here for
-/// the Vec<ModelCapability> case.
+/// the `Vec<ModelCapability>` case.
 pub fn models_to_tags(models: &[ModelCapability]) -> Vec<Tag> {
     let mut tags = Vec::new();
     for (i, model) in models.iter().enumerate() {

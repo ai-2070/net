@@ -120,7 +120,7 @@ impl fmt::Display for TaxonomyAxis {
 /// Application code attempting to emit a tag with any of these
 /// prefixes via [`Tag::parse_user`] is rejected with
 /// [`CapabilityTagError::ReservedPrefix`]. The substrate itself emits
-/// these via privileged paths (e.g. [`Mesh::announce_chain`] for
+/// these via privileged paths (e.g. `Mesh::announce_chain` for
 /// `causal:`, the fork-coordination layer for `fork-of:`, the
 /// existing scope helpers for `scope:`).
 pub const RESERVED_PREFIXES: &[&str] = &["causal:", "fork-of:", "heat:", "scope:"];
