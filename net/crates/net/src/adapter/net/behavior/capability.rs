@@ -2338,6 +2338,14 @@ pub struct CapabilityIndex {
     by_gpu_vendor: DashMap<GpuVendor, HashSet<u64>>,
     /// Inverted index: has GPU -> set of node IDs
     gpu_nodes: DashMap<bool, HashSet<u64>>,
+    /// Inverted index: metadata key -> { value -> set of node IDs }.
+    ///
+    /// Phase 5.B follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+    /// Mirrors `by_tag` for the metadata side; lets the cardinality-
+    /// aware planner refine `MetadataEquals` / `MetadataExists` /
+    /// related leaf clauses with distinct-value counts (otherwise
+    /// they'd fall back to plain `static_cost`).
+    by_metadata: DashMap<String, DashMap<String, HashSet<u64>>>,
     /// Version tracking
     versions: DashMap<u64, u64>,
     /// Stats
@@ -2355,6 +2363,7 @@ impl CapabilityIndex {
             by_tool: DashMap::new(),
             by_gpu_vendor: DashMap::new(),
             gpu_nodes: DashMap::new(),
+            by_metadata: DashMap::new(),
             versions: DashMap::new(),
             index_count: AtomicU64::new(0),
             query_count: AtomicU64::new(0),
@@ -2535,6 +2544,18 @@ impl CapabilityIndex {
                 .or_default()
                 .insert(node_id);
         }
+
+        // Metadata: track per-key distinct values so the cardinality-
+        // aware planner can score MetadataEquals / MetadataExists
+        // leaves. Mirrors `by_tag` for the metadata side.
+        for (k, v) in &caps.metadata {
+            // Outer entry: key. Inner entry: value → node IDs.
+            let inner = self
+                .by_metadata
+                .entry(k.clone())
+                .or_insert_with(DashMap::new);
+            inner.entry(v.clone()).or_default().insert(node_id);
+        }
     }
 
     /// Remove node from inverted indexes.
@@ -2589,6 +2610,24 @@ impl CapabilityIndex {
             }
             self.by_gpu_vendor
                 .remove_if(&vendor, |_, set| set.is_empty());
+        }
+
+        // Metadata: drop this node's contribution from each
+        // (key, value) entry; prune empty inner / outer entries
+        // so the by_metadata index doesn't accumulate empty
+        // shells across high-churn deployments.
+        for (k, v) in &caps.metadata {
+            let mut inner_now_empty = false;
+            if let Some(inner) = self.by_metadata.get(k) {
+                if let Some(mut set) = inner.get_mut(v) {
+                    set.remove(&node_id);
+                }
+                inner.remove_if(v, |_, set| set.is_empty());
+                inner_now_empty = inner.is_empty();
+            }
+            if inner_now_empty {
+                self.by_metadata.remove_if(k, |_, inner| inner.is_empty());
+            }
         }
     }
 
@@ -2719,6 +2758,27 @@ impl CapabilityIndex {
             }
         }
         matched
+    }
+
+    /// Distinct-value cardinality for a metadata key.
+    ///
+    /// Returns the count of distinct values seen for `key` across
+    /// all currently-indexed nodes. The cardinality-aware planner
+    /// uses this as a selectivity proxy for `MetadataEquals` /
+    /// `MetadataExists` / similar leaves, parallel to
+    /// [`Self::axis_cardinality`] for axis tags.
+    ///
+    /// Cost: O(1) — looks up the inner DashMap size; no scan.
+    /// `by_metadata` maintains distinct-value tracking incrementally
+    /// during `add_to_indexes` / `remove_from_indexes`.
+    ///
+    /// Returns 0 when the key is absent from the index. The
+    /// planner falls back to `static_cost` in that case.
+    pub fn metadata_value_cardinality(&self, key: &str) -> usize {
+        self.by_metadata
+            .get(key)
+            .map(|inner| inner.len())
+            .unwrap_or(0)
     }
 
     /// Distinct-value cardinality for an axis tag key.
@@ -3449,6 +3509,91 @@ mod tests {
         };
         let matched = index.find_nodes_matching(&pred);
         assert!(matched.is_empty());
+    }
+
+    // ========================================================================
+    // CapabilityIndex::metadata_value_cardinality — Phase 5.B follow-on of
+    // CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    #[test]
+    fn metadata_value_cardinality_counts_distinct_values() {
+        let index = CapabilityIndex::new();
+        // 5 nodes with 3 distinct intent values.
+        let intents = [
+            "ml-training",
+            "ml-training",
+            "embedding-cache",
+            "ml-training",
+            "scratchpad",
+        ];
+        for (i, v) in intents.iter().enumerate() {
+            let caps = CapabilitySet::new().with_metadata("intent", *v);
+            index_with_node(&index, i as u64, caps);
+        }
+        assert_eq!(index.metadata_value_cardinality("intent"), 3);
+    }
+
+    #[test]
+    fn metadata_value_cardinality_returns_zero_for_unknown_key() {
+        let index = CapabilityIndex::new();
+        let caps = CapabilitySet::new().with_metadata("intent", "ml-training");
+        index_with_node(&index, 1, caps);
+        assert_eq!(index.metadata_value_cardinality("nonexistent"), 0);
+    }
+
+    #[test]
+    fn metadata_value_cardinality_empty_index() {
+        let index = CapabilityIndex::new();
+        assert_eq!(index.metadata_value_cardinality("intent"), 0);
+    }
+
+    #[test]
+    fn metadata_value_cardinality_dedupes_repeated_values() {
+        let index = CapabilityIndex::new();
+        // 10 nodes all with the same intent → cardinality = 1.
+        for i in 0..10u64 {
+            let caps = CapabilitySet::new().with_metadata("intent", "ml-training");
+            index_with_node(&index, i, caps);
+        }
+        assert_eq!(index.metadata_value_cardinality("intent"), 1);
+    }
+
+    #[test]
+    fn metadata_value_cardinality_decrements_on_node_removal() {
+        // Pin: removing a node updates the metadata index — its
+        // values are pruned if no other node carries them.
+        let index = CapabilityIndex::new();
+        // Node 1: intent=A, owner=alice
+        index_with_node(
+            &index,
+            1,
+            CapabilitySet::new()
+                .with_metadata("intent", "A")
+                .with_metadata("owner", "alice"),
+        );
+        // Node 2: intent=B, owner=alice (same owner, different intent)
+        index_with_node(
+            &index,
+            2,
+            CapabilitySet::new()
+                .with_metadata("intent", "B")
+                .with_metadata("owner", "alice"),
+        );
+        assert_eq!(index.metadata_value_cardinality("intent"), 2);
+        assert_eq!(index.metadata_value_cardinality("owner"), 1);
+
+        // Remove node 1; intent A's only node is gone, so
+        // intent's cardinality drops to 1. Owner alice still has
+        // node 2, so owner's cardinality stays 1.
+        index.remove(1);
+        assert_eq!(index.metadata_value_cardinality("intent"), 1);
+        assert_eq!(index.metadata_value_cardinality("owner"), 1);
+
+        // Remove node 2; both intent and owner are now empty.
+        index.remove(2);
+        assert_eq!(index.metadata_value_cardinality("intent"), 0);
+        assert_eq!(index.metadata_value_cardinality("owner"), 0);
     }
 
     #[test]

@@ -1259,11 +1259,21 @@ impl Predicate {
                     static_c
                 }
             }
-            // Metadata leaves: no cardinality data available.
-            Self::MetadataExists { .. }
-            | Self::MetadataEquals { .. }
-            | Self::MetadataMatches { .. }
-            | Self::MetadataNumericAtLeast { .. } => self.static_cost(),
+            // Metadata leaves: refine via the index's metadata
+            // cardinality tracking (mirrors the axis-tag side).
+            Self::MetadataExists { key }
+            | Self::MetadataEquals { key, .. }
+            | Self::MetadataMatches { key, .. }
+            | Self::MetadataNumericAtLeast { key, .. } => {
+                let static_c = self.static_cost();
+                let cardinality = index.metadata_value_cardinality(key);
+                if cardinality > 0 {
+                    static_c.saturating_div((cardinality as u32).max(1))
+                } else {
+                    // Key absent from index → fall back to static cost.
+                    static_c
+                }
+            }
             // Composites: sum of children's dynamic costs.
             Self::And(c) | Self::Or(c) => c
                 .iter()
@@ -3084,15 +3094,118 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_cost_for_metadata_leaves_uses_static_cost() {
-        // The CapabilityIndex doesn't track metadata cardinality
-        // today; metadata leaves should retain their static cost.
+    fn dynamic_cost_for_metadata_leaves_uses_static_cost_when_key_absent() {
+        // Metadata key not present in the index → planner falls
+        // back to static_cost. This is the path that fires when
+        // the index hasn't yet seen any node carrying that
+        // metadata key, e.g. on a fresh-spun mesh.
         let index = index_with_distinct_memory_values(100);
         let pred = Predicate::MetadataEquals {
             key: "intent".into(),
             value: "ml-training".into(),
         };
         assert_eq!(pred.dynamic_cost(&index), pred.static_cost());
+    }
+
+    /// Build an index with N distinct nodes carrying a metadata
+    /// key + 2 distinct metadata values for that key. Used to
+    /// pin metadata-cardinality-refined cost ordering.
+    fn index_with_metadata_intents() -> crate::adapter::net::behavior::CapabilityIndex {
+        let index = crate::adapter::net::behavior::CapabilityIndex::new();
+        let intents = ["ml-training", "embedding-cache"];
+        for i in 0..20u64 {
+            let caps = crate::adapter::net::behavior::CapabilitySet::new()
+                .with_metadata("intent", intents[i as usize % 2])
+                .with_metadata("owner", format!("alice-{}", i)); // 20 distinct owners
+            let ann = crate::adapter::net::behavior::CapabilityAnnouncement::new(
+                i,
+                entity(),
+                1,
+                caps,
+            );
+            index.index(ann);
+        }
+        index
+    }
+
+    #[test]
+    fn dynamic_cost_for_metadata_leaves_lowers_for_high_cardinality() {
+        // Index has 20 distinct `owner` values and 2 distinct
+        // `intent` values. A `MetadataEquals(owner, ...)` clause
+        // is more selective (rare-true) than `MetadataEquals(intent, ...)`,
+        // so its dynamic cost should be lower.
+        let index = index_with_metadata_intents();
+        assert_eq!(
+            index.metadata_value_cardinality("intent"),
+            2,
+            "fixture sanity"
+        );
+        assert_eq!(
+            index.metadata_value_cardinality("owner"),
+            20,
+            "fixture sanity"
+        );
+
+        let intent_clause = Predicate::MetadataEquals {
+            key: "intent".into(),
+            value: "ml-training".into(),
+        };
+        let owner_clause = Predicate::MetadataEquals {
+            key: "owner".into(),
+            value: "alice-5".into(),
+        };
+
+        let intent_cost = intent_clause.dynamic_cost(&index);
+        let owner_cost = owner_clause.dynamic_cost(&index);
+        assert!(
+            owner_cost < intent_cost,
+            "expected high-card owner < low-card intent; got owner={owner_cost}, intent={intent_cost}",
+        );
+    }
+
+    #[test]
+    fn dynamic_cost_metadata_exists_uses_cardinality_refinement() {
+        // `MetadataExists` also benefits from the metadata-cardinality
+        // refinement — same key, same cardinality, lower dynamic
+        // cost than static_cost when cardinality > 1.
+        let index = index_with_metadata_intents();
+        let pred = Predicate::MetadataExists {
+            key: "owner".into(),
+        };
+        let dynamic = pred.dynamic_cost(&index);
+        let static_c = pred.static_cost();
+        assert!(
+            dynamic < static_c,
+            "expected dynamic < static when cardinality > 1; got dynamic={dynamic}, static={static_c}",
+        );
+    }
+
+    #[test]
+    fn metadata_cardinality_index_tracks_distinct_values() {
+        // Direct test of `CapabilityIndex::metadata_value_cardinality`.
+        let index = crate::adapter::net::behavior::CapabilityIndex::new();
+        // 5 nodes, 3 distinct intent values.
+        let intents = [
+            "ml-training",
+            "ml-training",
+            "embedding-cache",
+            "ml-training",
+            "scratchpad",
+        ];
+        for (i, intent) in intents.iter().enumerate() {
+            let caps = crate::adapter::net::behavior::CapabilitySet::new()
+                .with_metadata("intent", *intent);
+            let ann = crate::adapter::net::behavior::CapabilityAnnouncement::new(
+                i as u64,
+                entity(),
+                1,
+                caps,
+            );
+            index.index(ann);
+        }
+        assert_eq!(index.metadata_value_cardinality("intent"), 3);
+        // Unknown key → 0.
+        assert_eq!(index.metadata_value_cardinality("nonexistent"), 0);
     }
 
     #[test]
