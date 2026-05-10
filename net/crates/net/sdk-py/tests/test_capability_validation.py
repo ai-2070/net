@@ -138,6 +138,35 @@ def test_validate_handles_non_string_metadata_without_crashing() -> None:
     assert all(w.to_wire()["kind"] != "metadata_oversize" for w in report.warnings)
 
 
+def test_number_value_rejects_negative() -> None:
+    """P1-C: substrate ``Number`` is unsigned (u64-only) — see CR-15
+    and ``schema.rs::ValueType::Number``. Negative values surface
+    as ``TypeMismatch`` errors on the substrate side; the Python
+    validator must mirror that decision so client-side checks
+    don't pass a CapabilitySet the substrate would later reject.
+    """
+    caps = {"tags": ["hardware.memory_mb=-1"], "metadata": {}}
+    report = validate_capabilities(caps)
+    mismatch = [
+        e
+        for e in report.errors
+        if e.to_wire()["kind"] == "type_mismatch"
+        and e.to_wire()["axis"] == "hardware"
+        and e.to_wire()["key"] == "memory_mb"
+    ]
+    assert len(mismatch) == 1
+    assert mismatch[0].to_wire()["actual"] == "-1"
+
+
+def test_number_value_accepts_unsigned() -> None:
+    """Sanity check that the negative-rejection didn't break the
+    happy path — unsigned u64 values still parse cleanly.
+    """
+    caps = {"tags": ["hardware.memory_mb=65536"], "metadata": {}}
+    report = validate_capabilities(caps)
+    assert report.errors == ()
+
+
 def test_report_is_clean_helpers() -> None:
     clean = ValidationReport()
     assert clean.is_clean()

@@ -321,13 +321,13 @@ def _check_value(
         return
     parses = False
     if entry.value_type == "number":
-        # Substrate accepts u64 OR i64 — integers (signed or unsigned),
-        # not floats.
-        if observed_value:
-            s = observed_value
-            if s.startswith("-"):
-                s = s[1:]
-            parses = bool(s) and s.isdigit()
+        # Substrate `Number` is unsigned (u64-only) — see CR-15 in
+        # the capability-system-2 review and `schema.rs::ValueType::Number`.
+        # Negative values surface as TypeMismatch errors on the
+        # substrate side; mirror that here so client-side validation
+        # doesn't pass a CapabilitySet the substrate would later
+        # reject.
+        parses = bool(observed_value) and observed_value.isdigit()
     elif entry.value_type in ("string", "enumeration", "csv"):
         parses = bool(observed_value)
     elif entry.value_type == "bool":
