@@ -24,6 +24,10 @@ pub enum PlacementReason {
     FirstMatch,
     /// Explicitly pinned to a specific node.
     Pinned,
+    /// Highest-scoring candidate from a `&dyn PlacementFilter`,
+    /// ties broken by the §7-LOCKED RTT → free-resource → lex-NodeId
+    /// chain. Stamped by `Scheduler::select_*` callers (Phase G).
+    BestScore,
 }
 
 /// Result of a placement decision.
