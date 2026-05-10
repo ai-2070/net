@@ -17,6 +17,8 @@ from net_sdk.capability import (
     AxisSeparator,
     CapabilitySetDiff,
     CapabilitySetWire,
+    ClauseStats,
+    ClauseTrace,
     MetadataChange,
     MetadataChangeAdded,
     MetadataChangeRemoved,
@@ -24,6 +26,7 @@ from net_sdk.capability import (
     PlacementCandidate,
     PlacementFilterFn,
     Predicate,
+    PredicateDebugReport,
     RegisteredPlacementFilter,
     StandardPlacement,
     StandardPlacementBuilder,
@@ -34,23 +37,19 @@ from net_sdk.capability import (
     TagLegacy,
     TagReserved,
     TaxonomyAxis,
-    ClauseStats,
-    ClauseTrace,
-    PredicateDebugReport,
     diff_capabilities,
     empty_capabilities,
     evaluate_predicate,
     evaluate_predicate_with_trace,
     p,
+    placement_filter_from_fn,
     predicate_debug_report,
     predicate_debug_report_from_wire,
-    placement_filter_from_fn,
-    redact_metadata_keys,
     predicate_from_rpc_header,
     predicate_from_wire,
     predicate_to_rpc_header,
     predicate_to_wire,
-    where_header,
+    redact_metadata_keys,
     require_axis_value,
     require_tag,
     standard_placement,
@@ -59,6 +58,7 @@ from net_sdk.capability import (
     tag_from_user_string,
     tag_key,
     tag_to_string,
+    where_header,
     with_metadata,
 )
 from net_sdk.capability_schema import (
@@ -183,4 +183,4 @@ __all__ = [
     "validate_capabilities",
 ]
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
