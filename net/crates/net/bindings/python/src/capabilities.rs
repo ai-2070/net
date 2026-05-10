@@ -16,6 +16,7 @@ use net::adapter::net::behavior::capability::{
     HardwareCapabilities, Modality, ModelCapability, ResourceLimits, SoftwareCapabilities,
     ToolCapability,
 };
+use net::adapter::net::behavior::Tag;
 
 // =========================================================================
 // Dict helpers
@@ -349,8 +350,16 @@ pub fn capability_set_from_py(d: &Bound<'_, PyDict>) -> PyResult<CapabilitySet> 
             cs = cs.add_tool(tool_from_dict(&sub)?);
         }
     }
+    // SDK consumers may supply reserved-prefix tags (`scope:*`,
+    // `causal:*`, …). `CapabilitySet::add_tag` routes through
+    // `Tag::parse_user`, which silently drops reserved prefixes —
+    // correct for application-facing input, wrong at the binding
+    // boundary where the Python caller is the SDK. Parse via the
+    // unrestricted `Tag::parse` and insert directly.
     for tag in get_opt_str_list(d, "tags")? {
-        cs = cs.add_tag(tag);
+        if let Ok(t) = Tag::parse(&tag) {
+            cs.tags.insert(t);
+        }
     }
     if let Some(l) = get_opt_dict(d, "limits")? {
         cs = cs.with_limits(limits_from_dict(&l)?);

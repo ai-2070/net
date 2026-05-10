@@ -20,6 +20,7 @@ use net::adapter::net::behavior::capability::{
     HardwareCapabilities, Modality, ModelCapability, ResourceLimits, SoftwareCapabilities,
     ToolCapability,
 };
+use net::adapter::net::behavior::Tag;
 
 // =========================================================================
 // POJO types
@@ -388,8 +389,16 @@ pub fn capability_set_from_js(caps: CapabilitySetJs) -> CapabilitySet {
     for t in caps.tools.unwrap_or_default() {
         cs = cs.add_tool(tool_from_js(t));
     }
+    // SDK consumers may supply reserved-prefix tags (`scope:*`,
+    // `causal:*`, …). `CapabilitySet::add_tag` routes through
+    // `Tag::parse_user`, which silently drops reserved prefixes —
+    // correct for application-facing input, wrong at the binding
+    // boundary where the JS caller is the SDK. Parse via the
+    // unrestricted `Tag::parse` and insert directly.
     for tag in caps.tags.unwrap_or_default() {
-        cs = cs.add_tag(tag);
+        if let Ok(t) = Tag::parse(&tag) {
+            cs.tags.insert(t);
+        }
     }
     if let Some(l) = caps.limits {
         cs = cs.with_limits(limits_from_js(l));
