@@ -321,7 +321,7 @@ pub use net::pred;
 /// mirrors the canonical
 /// [`CAPABILITIES_SCHEMA.md`](https://github.com/ai-2070/net/blob/main/net/crates/net/docs/CAPABILITIES_SCHEMA.md);
 /// `validate_capabilities(&caps)` returns a structured
-/// [`ValidationReport`].
+/// [`schema::ValidationReport`].
 ///
 /// ```
 /// use net_sdk::capabilities::CapabilitySet;

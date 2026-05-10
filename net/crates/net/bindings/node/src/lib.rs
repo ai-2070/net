@@ -1846,9 +1846,9 @@ mod mesh_bindings {
         }
 
         /// Scoped variant of [`Self::find_nodes`]. Filters candidates
-        /// through a [`crate::capabilities::ScopeFilterJs`] derived
-        /// from each node's `scope:*` reserved tags. Untagged nodes
-        /// stay visible under most filters by design; nodes tagged
+        /// through a `ScopeFilterJs` (derived from each node's
+        /// `scope:*` reserved tags). Untagged nodes stay visible
+        /// under most filters by design; nodes tagged
         /// `scope:subnet-local` only show up under `sameSubnet`.
         #[napi]
         pub fn find_nodes_scoped(

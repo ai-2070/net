@@ -433,10 +433,11 @@ pub extern "C" fn net_rpc_free_cstring(s: *mut c_char) {
 /// on NULL or zero-length.
 ///
 /// Layout invariant: every site that hands a buffer out via
-/// [`write_response`] does so by `Box::into_raw(Vec::into_boxed_slice)`,
-/// whose memory layout is `(ptr, len)` with `cap == len` baked in —
-/// no `shrink_to_fit` best-effort hazard. The free path
-/// reconstructs the same `Box<[u8]>` and drops it.
+/// `write_response` (private helper) does so by
+/// `Box::into_raw(Vec::into_boxed_slice)`, whose memory layout is
+/// `(ptr, len)` with `cap == len` baked in — no `shrink_to_fit`
+/// best-effort hazard. The free path reconstructs the same
+/// `Box<[u8]>` and drops it.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_response_free(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
@@ -1351,7 +1352,7 @@ pub extern "C" fn net_rpc_call_service_with_headers(
 
 /// `net_rpc_call_streaming` with arbitrary request headers
 /// attached. Same shape as
-/// [`net_rpc_call_streaming`](self::net_rpc_call_streaming) plus the
+/// [`net_rpc_call_streaming`] plus the
 /// `(headers_ptr, header_count)` pair.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]

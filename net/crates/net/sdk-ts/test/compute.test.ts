@@ -997,12 +997,20 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
       b.nodeId(),
       { transportIdentity: false, retryNotReadyMs: 0n },
     );
-    // Don't await cancel — race with wait.
-    const waitPromise = mig.wait();
+    // Don't await cancel — race with wait. Attach the rejection
+    // handler synchronously so vitest's unhandled-rejection
+    // tripwire doesn't fire when wait() rejects in the brief
+    // window before we reach `await waitOutcome` below.
+    const waitOutcome: Promise<
+      { ok: true } | { ok: false; error: unknown }
+    > = mig.wait().then(
+      () => ({ ok: true }),
+      (error: unknown) => ({ ok: false, error }),
+    );
     // `cancel` itself can race against the migration already
     // having terminated (snapshot phase completed past the
     // cancel point, orchestrator record removed, etc.). Either
-    // outcome is acceptable here; the `await waitPromise` below
+    // outcome is acceptable here; the `await waitOutcome` below
     // is what the test is actually probing. Swallow the
     // already-terminated MigrationError from `cancel` so the
     // test stays stable under that ordering.
@@ -1014,12 +1022,11 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
         throw e;
       }
     }
-    try {
-      await waitPromise;
-      // Might resolve if the record raced past cancel; that's OK
-      // too — the contract is "if it rejects, it's a MigrationError".
-    } catch (e) {
-      expect(e).toBeInstanceOf(MigrationError);
+    const outcome = await waitOutcome;
+    // The contract: wait() either resolves (success — record
+    // raced past cancel) or rejects with a MigrationError.
+    if (!outcome.ok) {
+      expect(outcome.error).toBeInstanceOf(MigrationError);
     }
   });
 

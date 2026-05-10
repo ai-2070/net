@@ -133,9 +133,10 @@ pub trait CallOptionsExt: Sized {
     /// follow the lowercase `cyberdeck-*` / `nrpc-*` convention.
     fn with_request_header(self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self;
 
-    /// Attach a [`Predicate`] as the `cyberdeck-where` request
-    /// header. The predicate rides as JSON-encoded `PredicateWire`
-    /// bytes per the substrate's `predicate_to_rpc_header` contract;
+    /// Attach a [`net::adapter::net::behavior::Predicate`] as the
+    /// `cyberdeck-where` request header. The predicate rides as
+    /// JSON-encoded `PredicateWire` bytes per the substrate's
+    /// `predicate_to_rpc_header` contract;
     /// services opting into predicate-pushdown decode via
     /// [`RpcContextExt::where_predicate`].
     ///
@@ -185,11 +186,11 @@ impl CallOptionsExt for CallOptionsTyped {
 /// predicate-pushdown helpers (Phase 9b of
 /// `CAPABILITY_SYSTEM_SDK_PLAN.md`).
 pub trait RpcContextExt {
-    /// Decode the caller's [`Predicate`] from the
-    /// `cyberdeck-where` request header, if present. Returns `None`
-    /// when the header is absent (the common case for callers that
-    /// don't issue predicate-pushdown queries) or `Some(Err(_))` if
-    /// the header is malformed.
+    /// Decode the caller's [`net::adapter::net::behavior::Predicate`]
+    /// from the `cyberdeck-where` request header, if present.
+    /// Returns `None` when the header is absent (the common case
+    /// for callers that don't issue predicate-pushdown queries)
+    /// or `Some(Err(_))` if the header is malformed.
     fn where_predicate(
         &self,
     ) -> Option<

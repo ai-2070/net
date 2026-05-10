@@ -285,7 +285,8 @@ pub extern "C" fn net_compute_runtime_free(handle: *mut DaemonRuntimeHandle) {
 ///
 /// On failure, writes a heap-allocated `char*` error detail to
 /// `*err_out` (caller frees with [`net_compute_free_cstring`]).
-/// Returns [`NET_COMPUTE_OK`] / [`NET_COMPUTE_ERR_*`].
+/// Returns [`NET_COMPUTE_OK`] on success or one of the
+/// `NET_COMPUTE_ERR_*` constants on failure.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_start(
     handle: *mut DaemonRuntimeHandle,
@@ -1185,7 +1186,8 @@ pub extern "C" fn net_compute_spawn(
 }
 
 /// Stop a daemon by `origin_hash`. Idempotent during shutdown.
-/// Returns [`NET_COMPUTE_OK`] / [`NET_COMPUTE_ERR_*`].
+/// Returns [`NET_COMPUTE_OK`] on success or one of the
+/// `NET_COMPUTE_ERR_*` constants on failure.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_stop(
     handle: *mut DaemonRuntimeHandle,
@@ -1676,7 +1678,8 @@ pub extern "C" fn net_compute_migration_phase(
 /// and the caller receives them via `outputs` (must be non-NULL).
 ///
 /// The caller is responsible for reading the outputs before the
-/// next deliver — [`net_compute_outputs_take`] drains them.
+/// next deliver — [`net_compute_outputs_len`] /
+/// [`net_compute_outputs_at`] / [`net_compute_outputs_free`] drain them.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn net_compute_runtime_deliver(
@@ -2748,8 +2751,8 @@ pub extern "C" fn net_compute_set_placement_filter_dispatcher(
 }
 
 /// Bridge wrapper that implements `PlacementFilter` by calling the
-/// Go-side trampoline. Stored in
-/// [`global_placement_filter_registry`] as `Arc<dyn PlacementFilter>`.
+/// Go-side trampoline. Stored in the substrate's
+/// `global_placement_filter_registry` as `Arc<dyn PlacementFilter>`.
 struct CgoPlacementFilter {
     id: String,
     capability_index: Arc<::net::adapter::net::behavior::capability::CapabilityIndex>,
@@ -2826,8 +2829,9 @@ impl ::net::adapter::net::behavior::placement::PlacementFilter for CgoPlacementF
 /// Register a Go placement-filter under `id`. Wraps the per-call
 /// trampoline (registered once via
 /// [`net_compute_set_placement_filter_dispatcher`]) in a
-/// [`CgoPlacementFilter`] and inserts it into
-/// [`global_placement_filter_registry`].
+/// `CgoPlacementFilter` (private bridge type) and inserts it into
+/// the substrate's `global_placement_filter_registry` as
+/// `Arc<dyn PlacementFilter>`.
 ///
 /// `mesh_arc` is a non-consuming pointer — the registry holds an
 /// `Arc<CapabilityIndex>` clone, not the mesh handle. Caller's
