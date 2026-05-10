@@ -982,7 +982,18 @@ impl MeshDaemon for GoBridge {
             eprintln!("GoBridge::snapshot: dispatcher returned {code}; treating as None");
             return None;
         }
-        if ptr.is_null() || len == 0 {
+        // CR-11: same shape as the cubic-ai fix in `parse_side`
+        // (commit 38612b61). The previous combined
+        // `ptr.is_null() || len == 0` early-return leaked the
+        // non-NULL/zero-length case where the Go callback handed
+        // back a valid `C.malloc` pointer with len=0. Split the
+        // guards: NULL → return without freeing; zero-length
+        // non-NULL → free first, then return.
+        if ptr.is_null() {
+            return None;
+        }
+        if len == 0 {
+            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
             return None;
         }
         // Copy the Go-allocated buffer into a Rust `Bytes` and
