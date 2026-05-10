@@ -809,6 +809,45 @@ int      net_predicate_evaluate(const char* predicate_json,
                                 const char* tags_json,
                                 const char* metadata_json);
 
+/* Encode a wire-format Predicate as the canonical
+ * `cyberdeck-where:` request-header pair (Phase 9b of
+ * CAPABILITY_SYSTEM_SDK_PLAN.md). Mirror of the Go SDK's
+ * `WhereHeader` helper.
+ *
+ * The returned `(name, value)` pair drops into a future
+ * `request_headers`-shaped option list once a header-bearing
+ * call variant ships in `libnet_rpc`. Today's `net_rpc_call` /
+ * `net_rpc_call_service` (in `net_rpc.h`) don't accept request
+ * headers yet; this helper is the canonical encoder for the
+ * value when downstream wires it through.
+ *
+ * Input (NUL-terminated UTF-8 JSON):
+ *   - predicate_json — wire-format `PredicateWire`. Same shape
+ *     `net_predicate_evaluate` accepts.
+ *
+ * Outputs:
+ *   - *out_header_name/_len — `"cyberdeck-where"` (always).
+ *     Free with `net_free_string`.
+ *   - *out_value_ptr/_len   — JSON-encoded PredicateWire bytes,
+ *     capped at `MAX_PREDICATE_RPC_HEADER_VALUE_LEN` (4096).
+ *     Free with `net_free_string`.
+ *
+ * Returns:
+ *   0                      — success.
+ *   NET_ERR_NULL_POINTER   — any pointer is NULL.
+ *   NET_ERR_INVALID_UTF8   — input bytes aren't valid UTF-8.
+ *   NET_ERR_INVALID_JSON   — predicate failed to parse OR
+ *                            encoded bytes exceed the 4096-byte
+ *                            header-value cap.
+ *
+ * Cross-binding wire format pinned by
+ * `tests/cross_lang_capability/predicate_nrpc_envelope.json`. */
+int      net_predicate_to_where_header(const char* predicate_json,
+                                       char** out_header_name,
+                                       size_t* out_header_name_len,
+                                       char** out_value_ptr,
+                                       size_t* out_value_len);
+
 /* Validate a wire-format `CapabilitySet` against the canonical
  * `AXIS_SCHEMA` (Phase 9a of CAPABILITY_SYSTEM_SDK_PLAN.md).
  * Mirrors the SDK-layer `validate_capabilities` surface every

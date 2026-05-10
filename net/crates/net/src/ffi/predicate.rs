@@ -30,7 +30,10 @@ use std::ffi::c_char;
 use std::os::raw::c_int;
 
 use super::NetError;
-use crate::adapter::net::behavior::{EvalContext, PredicateWire, Tag};
+use crate::adapter::net::behavior::{
+    EvalContext, MAX_PREDICATE_RPC_HEADER_VALUE_LEN, PredicateWire, RPC_WHERE_HEADER, Tag,
+    predicate_to_rpc_header,
+};
 
 /// Evaluate a wire-format `Predicate` against a `(tags, metadata)`
 /// context. Mirrors `Predicate::evaluate_unplanned(ctx)` from the
@@ -114,6 +117,110 @@ pub extern "C" fn net_predicate_evaluate(
     } else {
         0
     }
+}
+
+// =========================================================================
+// Phase 9b — predicate-pushdown header helper
+//
+// Builds the canonical `cyberdeck-where:` request-header pair for a
+// wire-format predicate. Mirrors the Go SDK's `WhereHeader` helper
+// (`bindings/go/net/capability.go`). The returned `(name, value)`
+// pair drops into any `request_headers`-shaped option list once a
+// header-bearing call variant ships in `libnet_rpc`; today's C
+// ABI in `net_rpc.h` doesn't accept request headers yet, so the
+// helper is documentation + future-proofing.
+//
+// Wire format pinned by
+// `tests/cross_lang_capability/predicate_nrpc_envelope.json`.
+// =========================================================================
+
+/// Encode a wire-format `Predicate` as the canonical
+/// `cyberdeck-where:` request-header value.
+///
+/// Inputs:
+///   - `predicate_json` — NUL-terminated UTF-8 `PredicateWire`
+///     JSON. The same shape `net_predicate_evaluate` and the
+///     SDK-layer `predicateToWire` produce.
+///
+/// Outputs:
+///   - `*out_header_name`  — owned `char*` containing `"cyberdeck-where"`.
+///                          Free via `net_free_string`.
+///   - `*out_header_name_len` — strlen of the header name.
+///   - `*out_value_ptr`    — owned `uint8_t*` containing the
+///                          canonical JSON bytes. Free via
+///                          `net_free_string` (the buffer was
+///                          allocated as a `CString::into_raw`,
+///                          same release path as other string-
+///                          out helpers in this module).
+///   - `*out_value_len`    — byte length of the value buffer.
+///
+/// Returns:
+///   - `0` on success.
+///   - `NetError::NullPointer` (negative) — any pointer NULL.
+///   - `NetError::InvalidUtf8` (negative) — input bytes not UTF-8.
+///   - `NetError::InvalidJson` (negative) — predicate failed to
+///     parse, OR encoded bytes exceed
+///     `MAX_PREDICATE_RPC_HEADER_VALUE_LEN` (4096) per the
+///     substrate's wire-cap rule.
+///
+/// Stateless. Thread-safe.
+///
+/// # Safety
+///
+/// `predicate_json` MUST point at a NUL-terminated UTF-8 string
+/// valid for the duration of the call. Out-pointers must be
+/// writable; on success the caller owns both buffers and frees
+/// them via `net_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_predicate_to_where_header(
+    predicate_json: *const c_char,
+    out_header_name: *mut *mut c_char,
+    out_header_name_len: *mut usize,
+    out_value_ptr: *mut *mut c_char,
+    out_value_len: *mut usize,
+) -> c_int {
+    if predicate_json.is_null()
+        || out_header_name.is_null()
+        || out_header_name_len.is_null()
+        || out_value_ptr.is_null()
+        || out_value_len.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+
+    let pred_s = match unsafe { super::mesh::c_str_to_string(predicate_json) } {
+        Some(s) => s,
+        None => return NetError::InvalidUtf8.into(),
+    };
+
+    let wire: PredicateWire = match serde_json::from_str(&pred_s) {
+        Ok(w) => w,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let predicate = match wire.into_predicate() {
+        Ok(p) => p,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+
+    // Encode via the substrate's wire-cap-respecting helper.
+    let (name, value_bytes) = match predicate_to_rpc_header(&predicate) {
+        Ok(pair) => pair,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    debug_assert_eq!(name, RPC_WHERE_HEADER);
+    debug_assert!(value_bytes.len() <= MAX_PREDICATE_RPC_HEADER_VALUE_LEN);
+
+    // Write header name out via the existing string helper. The
+    // value bytes are JSON (always UTF-8 since serde_json emits
+    // it that way), so we route through the same `write_string_out`
+    // path — caller frees both via `net_free_string`.
+    let name_rc = super::mesh::write_string_out(name, out_header_name, out_header_name_len);
+    if name_rc != 0 {
+        return name_rc;
+    }
+    // SAFETY: serde_json output is guaranteed valid UTF-8.
+    let value_string = unsafe { String::from_utf8_unchecked(value_bytes) };
+    super::mesh::write_string_out(value_string, out_value_ptr, out_value_len)
 }
 
 #[cfg(test)]
@@ -210,5 +317,117 @@ mod tests {
             rc >= 0,
             "reserved-prefix tag must parse via privileged path, got {rc}",
         );
+    }
+
+    /// `net_predicate_to_where_header` emits the canonical
+    /// `cyberdeck-where` header name + a JSON-encoded
+    /// `PredicateWire` value. Round-trip the value through
+    /// `serde_json` and assert it decodes to the same predicate.
+    #[test]
+    fn to_where_header_emits_canonical_name_and_round_trip_value() {
+        use std::ffi::CStr;
+
+        let pred = CString::new(
+            r#"{"nodes":[
+                {"kind":"exists","key":{"axis":"hardware","key":"gpu"}}
+            ],"root_idx":0}"#,
+        )
+        .unwrap();
+
+        let mut out_name: *mut c_char = std::ptr::null_mut();
+        let mut name_len: usize = 0;
+        let mut out_value: *mut c_char = std::ptr::null_mut();
+        let mut value_len: usize = 0;
+
+        let rc = net_predicate_to_where_header(
+            pred.as_ptr(),
+            &mut out_name,
+            &mut name_len,
+            &mut out_value,
+            &mut value_len,
+        );
+        assert_eq!(rc, 0);
+
+        // Header name == "cyberdeck-where".
+        let name = unsafe { CStr::from_ptr(out_name) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(name, "cyberdeck-where");
+        assert_eq!(name_len, "cyberdeck-where".len());
+
+        // Header value parses as PredicateWire and round-trips
+        // back to the same predicate.
+        let value = unsafe { CStr::from_ptr(out_value) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(value_len, value.len());
+        let parsed: PredicateWire = serde_json::from_str(&value).unwrap();
+        let original: PredicateWire = serde_json::from_str(
+            r#"{"nodes":[{"kind":"exists","key":{"axis":"hardware","key":"gpu"}}],"root_idx":0}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.nodes.len(), original.nodes.len());
+        assert_eq!(parsed.root_idx, original.root_idx);
+
+        // Free.
+        unsafe {
+            let _ = CString::from_raw(out_name);
+            let _ = CString::from_raw(out_value);
+        }
+    }
+
+    /// `to_where_header` rejects malformed predicate JSON via
+    /// `InvalidJson`.
+    #[test]
+    fn to_where_header_rejects_malformed_predicate() {
+        let pred = CString::new(r#"{"nodes":[],not-json"#).unwrap();
+        let mut out_name: *mut c_char = std::ptr::null_mut();
+        let mut name_len: usize = 0;
+        let mut out_value: *mut c_char = std::ptr::null_mut();
+        let mut value_len: usize = 0;
+
+        let rc = net_predicate_to_where_header(
+            pred.as_ptr(),
+            &mut out_name,
+            &mut name_len,
+            &mut out_value,
+            &mut value_len,
+        );
+        assert!(rc < 0);
+        // Out-pointers should remain NULL since we returned early.
+        assert!(out_name.is_null());
+        assert!(out_value.is_null());
+    }
+
+    /// NULL inputs return `NullPointer`.
+    #[test]
+    fn to_where_header_null_inputs_return_null_pointer() {
+        let pred = CString::new(r#"{"nodes":[],"root_idx":0}"#).unwrap();
+        let mut out_name: *mut c_char = std::ptr::null_mut();
+        let mut name_len: usize = 0;
+        let mut out_value: *mut c_char = std::ptr::null_mut();
+        let mut value_len: usize = 0;
+
+        // predicate NULL
+        let rc = net_predicate_to_where_header(
+            std::ptr::null(),
+            &mut out_name,
+            &mut name_len,
+            &mut out_value,
+            &mut value_len,
+        );
+        assert!(rc < 0);
+
+        // out_name NULL
+        let rc = net_predicate_to_where_header(
+            pred.as_ptr(),
+            std::ptr::null_mut(),
+            &mut name_len,
+            &mut out_value,
+            &mut value_len,
+        );
+        assert!(rc < 0);
     }
 }
