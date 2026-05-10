@@ -28,15 +28,14 @@ use net::adapter::net::{
     // Phase 4A-4G: Behavior Plane - Capabilities, Diffs, Metadata, APIs, Rules, Context & LoadBalancing
     behavior::{
         Action, AlertSeverity, ApiAnnouncement, ApiEndpoint, ApiMethod, ApiParameter, ApiQuery,
-        ApiRegistry, ApiSchema, ApiVersion, Baggage, CapabilityAnnouncement,
-        CapabilityFilter, CapabilityIndex, CapabilityRequirement, CapabilitySet, CompareOp,
-        Condition, ConditionExpr, Context, ContextStore, Endpoint, GpuInfo,
-        GpuVendor, HardwareCapabilities, HealthStatus, LbRequestContext, LoadBalancer,
-        LoadBalancerConfig, LoadMetrics, LocationInfo, LogLevel, MetadataQuery, MetadataStore,
-        Modality, ModelCapability, NatType, NetworkTier, NodeMetadata, NodeStatus, Priority,
-        PropagationContext, Region, ResourceLimits, Rule, RuleContext, RuleEngine, RuleSet,
-        SamplingStrategy, SchemaType, SoftwareCapabilities, Span, SpanKind, Strategy,
-        ToolCapability, TopologyHints, TraceId,
+        ApiRegistry, ApiSchema, ApiVersion, Baggage, CapabilityAnnouncement, CapabilityFilter,
+        CapabilityIndex, CapabilityRequirement, CapabilitySet, CompareOp, Condition, ConditionExpr,
+        Context, ContextStore, Endpoint, GpuInfo, GpuVendor, HardwareCapabilities, HealthStatus,
+        LbRequestContext, LoadBalancer, LoadBalancerConfig, LoadMetrics, LocationInfo, LogLevel,
+        MetadataQuery, MetadataStore, Modality, ModelCapability, NatType, NetworkTier,
+        NodeMetadata, NodeStatus, Priority, PropagationContext, Region, ResourceLimits, Rule,
+        RuleContext, RuleEngine, RuleSet, SamplingStrategy, SchemaType, SoftwareCapabilities, Span,
+        SpanKind, Strategy, ToolCapability, TopologyHints, TraceId,
     },
     AdaptiveBatcher,
     Capabilities,
@@ -2509,7 +2508,6 @@ criterion_group!(
     bench_capability_index_concurrent,
     bench_capability_index_updates,
 );
-
 
 // =============================================================================
 // Phase 4C: Node Metadata Surface (NODE-META) Benchmarks
