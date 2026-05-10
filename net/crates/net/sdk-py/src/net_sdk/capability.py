@@ -1038,12 +1038,23 @@ def _semver_compatible(lhs: Tuple[int, int, int], rhs: Tuple[int, int, int]) -> 
 
 
 def _axis_tag_value(tags: Sequence[str], key: TagKey) -> Optional[str]:
-    """Return the matched axis-tag value, or empty string for AxisPresent,
-    or ``None`` if no tag matches the (axis, key) pair."""
+    """Return the matched ``AxisValue`` tag's value, or ``None`` if
+    no value-bearing tag matches the (axis, key) pair.
+
+    Q2: pre-fix this also returned ``""`` for ``AxisPresent`` tags,
+    which let value predicates (Equals, NumericAtLeast, StringPrefix,
+    SemverAtLeast, …) match presence-only tags. The Rust substrate
+    requires ``Tag::AxisValue`` for those predicates and never
+    pretends a presence tag has an empty value. Use
+    :func:`_axis_tag_present` for `Exists` semantics.
+
+    A node may carry BOTH an AxisPresent and an AxisValue tag for
+    the same (axis, key); the value scan continues past presence
+    matches so the value form wins. Mirrors the Rust substrate's
+    full-tag-list iteration.
+    """
     prefix = f"{key[0]}.{key[1]}"
     for wire in tags:
-        if wire == prefix:
-            return ""
         if len(wire) <= len(prefix) or not wire.startswith(prefix):
             continue
         sep = wire[len(prefix)]
@@ -1052,13 +1063,30 @@ def _axis_tag_value(tags: Sequence[str], key: TagKey) -> Optional[str]:
     return None
 
 
+def _axis_tag_present(tags: Sequence[str], key: TagKey) -> bool:
+    """True if any ``AxisPresent`` or ``AxisValue`` tag matches the
+    (axis, key) pair. Used by `Exists` predicates which match either
+    form. Q2: split out from ``_axis_tag_value`` so the latter can
+    correctly skip AxisPresent for value predicates.
+    """
+    prefix = f"{key[0]}.{key[1]}"
+    for wire in tags:
+        if wire == prefix:
+            return True
+        if len(wire) > len(prefix) and wire.startswith(prefix):
+            sep = wire[len(prefix)]
+            if sep == "=" or sep == ":":
+                return True
+    return False
+
+
 def _eval_leaf(
     pred: Predicate,
     tags: Sequence[str],
     metadata: Mapping[str, str],
 ) -> bool:
     if isinstance(pred, _PredExists):
-        return _axis_tag_value(tags, pred.key) is not None
+        return _axis_tag_present(tags, pred.key)
     if isinstance(pred, _PredEquals):
         v = _axis_tag_value(tags, pred.key)
         return v is not None and v == pred.value

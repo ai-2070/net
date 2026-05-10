@@ -317,6 +317,57 @@ def test_semver_compatible_zero_zero_patch_is_exact_only() -> None:
     assert _semver_compatible((2, 0, 0), (1, 9, 9)) is False
 
 
+def test_axis_present_tag_does_not_match_value_predicates() -> None:
+    """Q2: ``Tag::AxisPresent`` (e.g. ``hardware.gpu``) must NOT
+    match value-bearing predicates like ``Equals``, ``StringPrefix``,
+    ``NumericAtLeast``. Pre-fix ``_axis_tag_value`` returned ``""``
+    for AxisPresent, so ``Equals(_, "")`` / ``StringPrefix(_, "")``
+    spuriously matched any presence tag — diverged from the Rust
+    substrate which requires `Tag::AxisValue` for those predicates.
+
+    `Exists`, on the other hand, must continue to match AxisPresent.
+    """
+    tags = ["hardware.gpu"]  # AxisPresent
+    metadata: Dict[str, str] = {}
+
+    # Exists matches AxisPresent (sanity).
+    assert evaluate_predicate(
+        p.exists(tag_key("hardware", "gpu")), tags, metadata
+    ) is True
+
+    # Equals against the empty string must NOT match AxisPresent.
+    assert evaluate_predicate(
+        p.equals(tag_key("hardware", "gpu"), ""), tags, metadata
+    ) is False
+
+    # StringPrefix with empty string must NOT match AxisPresent.
+    assert evaluate_predicate(
+        p.string_prefix(tag_key("hardware", "gpu"), ""), tags, metadata
+    ) is False
+
+    # AxisValue still works for value predicates.
+    tags_v = ["hardware.gpu.vram_mb=80000"]
+    assert evaluate_predicate(
+        p.equals(tag_key("hardware", "gpu.vram_mb"), "80000"), tags_v, metadata
+    ) is True
+
+
+def test_axis_value_wins_over_presence_when_both_present() -> None:
+    """Q2: when a node carries both ``hardware.gpu`` (AxisPresent)
+    AND ``hardware.gpu=h100`` (AxisValue), value predicates must
+    consult the AxisValue tag — pre-fix `_axis_tag_value` returned
+    on the first match (the AxisPresent's empty-string), short-
+    circuiting and missing the value tag.
+    """
+    # Both tags present. Predicate looking for value 'h100' should
+    # match the AxisValue tag.
+    tags = ["hardware.gpu", "hardware.gpu=h100"]
+    metadata: Dict[str, str] = {}
+    assert evaluate_predicate(
+        p.equals(tag_key("hardware", "gpu"), "h100"), tags, metadata
+    ) is True
+
+
 def test_semver_compatible_zero_x_band_requires_lhs_major_zero() -> None:
     """Q1: a non-zero major lhs is NOT compatible with a 0.x.y rhs.
     Pre-fix `rhs[1] == lhs[1]` alone passed for `lhs = (1, 2, 5)`
