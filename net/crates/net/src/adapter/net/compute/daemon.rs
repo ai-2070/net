@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 
-use crate::adapter::net::behavior::capability::CapabilityFilter;
+use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use crate::adapter::net::state::causal::CausalEvent;
 
 /// A daemon that runs on the mesh.
@@ -33,6 +33,51 @@ pub trait MeshDaemon: Send + Sync {
     /// The scheduler uses this to find nodes whose `CapabilitySet` matches.
     /// Return `CapabilityFilter::default()` to run anywhere.
     fn requirements(&self) -> CapabilityFilter;
+
+    /// Hard capability requirements for Phase F-aware placement.
+    ///
+    /// Returns the set of tags + metadata the candidate node MUST
+    /// have for the daemon to run there. Tag-set inclusion is the
+    /// hard-constraint check (`StandardPlacement` returns `None`
+    /// when a required tag is absent — see
+    /// [`crate::adapter::net::behavior::placement`]).
+    ///
+    /// Default: empty set. Daemons that care about specific
+    /// hardware / software override:
+    ///
+    /// ```ignore
+    /// fn required_capabilities(&self) -> CapabilitySet {
+    ///     CapabilitySet::new().add_tag("hardware.gpu")
+    /// }
+    /// ```
+    ///
+    /// Phase G slice 2 of `CAPABILITY_SYSTEM_PLAN.md`. Coexists
+    /// with the legacy `requirements()` method until the
+    /// `mikoshi-placement-v2` feature flag flips: `requirements()`
+    /// drives the legacy `CapabilityFilter`-based path; this
+    /// method drives the `Artifact::Daemon { required, .. }`
+    /// payload that `PlacementFilter` impls consume.
+    fn required_capabilities(&self) -> CapabilitySet {
+        CapabilitySet::default()
+    }
+
+    /// Soft capability preferences for Phase F-aware placement.
+    ///
+    /// Returns the set of tags + metadata the daemon prefers but
+    /// does NOT require. The scheduler factors satisfaction of
+    /// these into per-axis scoring; missing optional capabilities
+    /// don't veto placement (unlike `required_capabilities`).
+    ///
+    /// Default: empty set. Daemons with a strict required floor
+    /// but additional preferences (e.g. "must have GPU; prefer
+    /// 80GB+ VRAM") populate this via per-tag adds.
+    ///
+    /// Phase G slice 2 of `CAPABILITY_SYSTEM_PLAN.md`. Slice 5's
+    /// per-axis scorers consume the optional set when scoring
+    /// candidates; slice 2's stub axes return `1.0` regardless.
+    fn optional_capabilities(&self) -> CapabilitySet {
+        CapabilitySet::default()
+    }
 
     /// Process one inbound causal event, returning zero or more output payloads.
     ///
@@ -162,4 +207,114 @@ pub struct DaemonStats {
     pub errors: u64,
     /// Number of snapshots taken.
     pub snapshots_taken: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal daemon that doesn't override the new
+    /// `required_capabilities` / `optional_capabilities` methods.
+    /// Pins backward compatibility: existing daemon impls that
+    /// were written pre-Phase-G compile + run unchanged.
+    struct BareDaemon;
+
+    impl MeshDaemon for BareDaemon {
+        fn name(&self) -> &str {
+            "bare"
+        }
+        fn requirements(&self) -> CapabilityFilter {
+            CapabilityFilter::default()
+        }
+        fn process(
+            &mut self,
+            _event: &CausalEvent,
+        ) -> Result<Vec<Bytes>, DaemonError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Daemon that overrides both new methods. Pins the surface
+    /// daemon authors target when declaring placement requirements.
+    struct GpuDaemon;
+
+    impl MeshDaemon for GpuDaemon {
+        fn name(&self) -> &str {
+            "gpu"
+        }
+        fn requirements(&self) -> CapabilityFilter {
+            CapabilityFilter::default()
+        }
+        fn required_capabilities(&self) -> CapabilitySet {
+            CapabilitySet::new().add_tag("hardware.gpu")
+        }
+        fn optional_capabilities(&self) -> CapabilitySet {
+            CapabilitySet::new().add_tag("hardware.gpu.vram_mb=81920")
+        }
+        fn process(
+            &mut self,
+            _event: &CausalEvent,
+        ) -> Result<Vec<Bytes>, DaemonError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Default `required_capabilities()` returns an empty set —
+    /// daemon runs anywhere. Pin so changing the default to a
+    /// non-empty value (which would break backward-compat for
+    /// existing impls) fails build.
+    #[test]
+    fn required_capabilities_default_is_empty() {
+        let d = BareDaemon;
+        let req = d.required_capabilities();
+        assert!(req.tags.is_empty());
+        assert!(req.metadata.is_empty());
+    }
+
+    /// Same for `optional_capabilities`.
+    #[test]
+    fn optional_capabilities_default_is_empty() {
+        let d = BareDaemon;
+        let opt = d.optional_capabilities();
+        assert!(opt.tags.is_empty());
+        assert!(opt.metadata.is_empty());
+    }
+
+    /// An override populates the returned set as expected — pins
+    /// the daemon-author-facing surface.
+    #[test]
+    fn override_populates_required_and_optional() {
+        let d = GpuDaemon;
+        let req = d.required_capabilities();
+        let opt = d.optional_capabilities();
+        assert_eq!(req.tags.len(), 1);
+        assert!(req
+            .tags
+            .iter()
+            .any(|t| t.to_string() == "hardware.gpu"));
+        assert_eq!(opt.tags.len(), 1);
+        assert!(opt
+            .tags
+            .iter()
+            .any(|t| t.to_string() == "hardware.gpu.vram_mb=81920"));
+    }
+
+    /// The new methods plug into `PlacementFilter` via the
+    /// `Artifact::Daemon { required, optional, .. }` payload.
+    /// Pin the integration shape so a refactor of either side
+    /// surfaces in this test.
+    #[test]
+    fn required_capabilities_drive_artifact_daemon() {
+        use crate::adapter::net::behavior::placement::Artifact;
+        let d = GpuDaemon;
+        let req = d.required_capabilities();
+        let opt = d.optional_capabilities();
+        let _artifact = Artifact::Daemon {
+            daemon_id: [0u8; 32],
+            required: &req,
+            optional: &opt,
+        };
+        // If the artifact type's Daemon variant changes shape,
+        // this construction fails compile.
+    }
 }
