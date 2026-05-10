@@ -32,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
 
@@ -1028,19 +1029,38 @@ def _parse_semver(s: str) -> Optional[Tuple[int, int, int]]:
     parts = [p.strip() for p in core.split(".")]
     if not parts or len(parts) > 3:
         return None
+    # N-13: lock the accepted-set to exactly what Rust's
+    # `parts.next()?.parse::<u64>()` parses (predicate.rs:1782-1784).
+    # `str.isdigit()` accepts Unicode digits like "١٢" (Arabic-Indic)
+    # that Rust rejects, AND rejects the `+1` Rust accepts. Mirror
+    # the same `^\+?[0-9]+$` regex `capability_schema.py:332` uses
+    # for the schema validator (R4) so the predicate-side and
+    # schema-side accepted-sets agree.
+    if not _SEMVER_COMPONENT.match(parts[0]):
+        return None
     try:
-        major = int(parts[0]) if parts[0].isdigit() else None
-        if major is None:
-            return None
-        minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else (0 if len(parts) <= 1 else None)
-        if minor is None:
-            return None
-        patch = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else (0 if len(parts) <= 2 else None)
-        if patch is None:
-            return None
+        major = int(parts[0])
+        if len(parts) > 1:
+            if not _SEMVER_COMPONENT.match(parts[1]):
+                return None
+            minor = int(parts[1])
+        else:
+            minor = 0
+        if len(parts) > 2:
+            if not _SEMVER_COMPONENT.match(parts[2]):
+                return None
+            patch = int(parts[2])
+        else:
+            patch = 0
     except ValueError:
         return None
     return (major, minor, patch)
+
+
+# N-13: same regex shape as `_U64_LITERAL` in `capability_schema.py`.
+# Defined here so the predicate-side parser doesn't pull a
+# circular import from the schema module.
+_SEMVER_COMPONENT = re.compile(r"^\+?[0-9]+$")
 
 
 def _semver_compatible(lhs: Tuple[int, int, int], rhs: Tuple[int, int, int]) -> bool:

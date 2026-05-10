@@ -317,6 +317,35 @@ def test_semver_compatible_zero_zero_patch_is_exact_only() -> None:
     assert _semver_compatible((2, 0, 0), (1, 9, 9)) is False
 
 
+def test_parse_semver_matches_rust_accepted_set() -> None:
+    """N-13: predicate-side semver parser locks the per-component
+    accepted-set to ASCII digits only, matching what Rust's
+    ``u64::from_str`` parses (predicate.rs:1782-1784).
+
+    Pre-fix ``parts[0].isdigit()`` accepted Unicode digits like
+    Arabic-Indic ``"١"`` that Rust rejects: ``int("١") == 1`` in
+    Python but ``"١".parse::<u64>()`` errors. A peer announcing
+    ``software.runtime.python=١.0.0`` then evaluated SemverAtLeast
+    predicates differently across bindings. R4 already locked the
+    schema-side accepted-set via ``_U64_LITERAL``; this pins the
+    predicate-side path too.
+    """
+    from net_sdk.capability import _parse_semver
+
+    # Rust rejects Unicode digits — Python must too.
+    assert _parse_semver("١.2.3") is None       # Arabic-Indic 1
+    assert _parse_semver("1.٢.3") is None       # Arabic-Indic 2
+    assert _parse_semver("1.2.٣") is None       # Arabic-Indic 3
+    assert _parse_semver("１.2.3") is None       # Fullwidth 1
+
+    # Plain ASCII still parses.
+    assert _parse_semver("1.2.3") == (1, 2, 3)
+    assert _parse_semver("1.2") == (1, 2, 0)
+    assert _parse_semver("1") == (1, 0, 0)
+    # Prerelease/build suffix still stripped.
+    assert _parse_semver("1.2.3-rc.1+build.42") == (1, 2, 3)
+
+
 def test_numeric_predicate_rejects_whitespace_padded_values() -> None:
     """R2: Rust's ``f64::from_str`` rejects leading / trailing
     whitespace; Python's ``float("  1.5")`` strips it. A value
