@@ -2676,6 +2676,65 @@ impl CapabilityIndex {
         candidates
     }
 
+    /// Distinct-value cardinality for an axis tag key.
+    ///
+    /// Returns the number of distinct values seen for the given
+    /// `(axis, key)` across all currently-indexed nodes. Used by
+    /// the predicate query planner (Phase 4 of
+    /// `CAPABILITY_ENHANCEMENTS_PLAN.md`) as a selectivity proxy:
+    /// a key with high cardinality has many possible values, so a
+    /// predicate matching one of them is likely to filter most
+    /// candidates — run such clauses first in `And`.
+    ///
+    /// Cost: O(N) over the inverted-tag-index where N is the
+    /// number of distinct tag wire forms. Typical sizes (10K nodes
+    /// × ~10 tags each → 100K entries) yield microsecond-range
+    /// scans; cache the result at the planner level if a hot
+    /// loop reads it.
+    ///
+    /// Returns:
+    ///
+    /// - For value-bearing keys (`hardware.cpu_cores=...`,
+    ///   `hardware.gpu.vendor=...`): the count of distinct
+    ///   value strings seen.
+    /// - For presence-only keys (`hardware.gpu`): `1` if any node
+    ///   has the marker, `0` otherwise.
+    /// - For unrecognized keys: `0`.
+    ///
+    /// Reserved-prefix tags (`scope:*`, `causal:*`, etc.) and
+    /// legacy untyped tags don't fit the axis taxonomy; this
+    /// primitive doesn't surface them.
+    pub fn axis_cardinality(
+        &self,
+        key: &crate::adapter::net::behavior::tag::TagKey,
+    ) -> usize {
+        let prefix_eq = format!("{}.{}=", key.axis.as_str(), key.key);
+        let prefix_colon = format!("{}.{}:", key.axis.as_str(), key.key);
+        let presence_form = format!("{}.{}", key.axis.as_str(), key.key);
+
+        let mut distinct: HashSet<String> = HashSet::new();
+        let mut presence_seen = false;
+        for entry in self.by_tag.iter() {
+            let tag = entry.key();
+            if let Some(rest) = tag.strip_prefix(&prefix_eq) {
+                distinct.insert(rest.to_string());
+            } else if let Some(rest) = tag.strip_prefix(&prefix_colon) {
+                distinct.insert(rest.to_string());
+            } else if tag.as_str() == presence_form {
+                presence_seen = true;
+            }
+        }
+        // For value-bearing keys: count of distinct values.
+        // For presence-only keys: 1 if any node has the marker.
+        if !distinct.is_empty() {
+            distinct.len()
+        } else if presence_seen {
+            1
+        } else {
+            0
+        }
+    }
+
     /// Query nodes by filter
     pub fn query(&self, filter: &CapabilityFilter) -> Vec<u64> {
         self.query_count.fetch_add(1, Ordering::Relaxed);
@@ -3074,6 +3133,142 @@ mod tests {
 
         let score = req.score(&caps);
         assert!(score > 1.0); // Base score + preferences
+    }
+
+    // ========================================================================
+    // CapabilityIndex::axis_cardinality — Phase 4 follow-on of
+    // CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    fn index_with_node(index: &CapabilityIndex, node_id: u64, caps: CapabilitySet) {
+        let ann = CapabilityAnnouncement::new(node_id, test_entity(), 1, caps);
+        index.index(ann);
+    }
+
+    #[test]
+    fn axis_cardinality_counts_distinct_value_tags() {
+        // 3 nodes with different memory_mb values. Cardinality
+        // for `hardware.memory_mb` should be 3.
+        let index = CapabilityIndex::new();
+        for (i, mb) in [16384u32, 32768, 65536].iter().enumerate() {
+            let caps = CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_memory(*mb));
+            index_with_node(&index, i as u64, caps);
+        }
+        let key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        assert_eq!(index.axis_cardinality(&key), 3);
+    }
+
+    #[test]
+    fn axis_cardinality_dedupes_repeated_values() {
+        // 5 nodes, only 2 distinct gpu vendors. Cardinality = 2.
+        let index = CapabilityIndex::new();
+        let vendors = [
+            GpuVendor::Nvidia,
+            GpuVendor::Nvidia,
+            GpuVendor::Amd,
+            GpuVendor::Nvidia,
+            GpuVendor::Amd,
+        ];
+        for (i, v) in vendors.iter().enumerate() {
+            let caps = CapabilitySet::new().with_hardware(
+                HardwareCapabilities::new().with_gpu(GpuInfo::new(*v, "x", 1024)),
+            );
+            index_with_node(&index, i as u64, caps);
+        }
+        let key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "gpu.vendor",
+        );
+        assert_eq!(index.axis_cardinality(&key), 2);
+    }
+
+    #[test]
+    fn axis_cardinality_returns_one_for_presence_keys_with_any_match() {
+        // Presence-only key (`hardware.gpu` marker, no `=value`).
+        // Any node with the marker → cardinality 1.
+        let index = CapabilityIndex::new();
+        let caps = CapabilitySet::new().with_hardware(
+            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
+        );
+        index_with_node(&index, 1, caps);
+        let key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "gpu",
+        );
+        assert_eq!(index.axis_cardinality(&key), 1);
+    }
+
+    #[test]
+    fn axis_cardinality_returns_zero_for_unknown_keys() {
+        let index = CapabilityIndex::new();
+        let caps = CapabilitySet::new()
+            .with_hardware(HardwareCapabilities::new().with_memory(65536));
+        index_with_node(&index, 1, caps);
+
+        let unknown_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Devices,
+            "qpu",
+        );
+        assert_eq!(index.axis_cardinality(&unknown_key), 0);
+    }
+
+    #[test]
+    fn axis_cardinality_returns_zero_on_empty_index() {
+        let index = CapabilityIndex::new();
+        let key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        assert_eq!(index.axis_cardinality(&key), 0);
+    }
+
+    #[test]
+    fn axis_cardinality_excludes_presence_when_value_form_present() {
+        // Edge case: if the key has BOTH presence-form
+        // (`hardware.gpu`) and value-form sub-keys
+        // (`hardware.gpu.vendor=...`), `axis_cardinality(gpu)`
+        // returns 1 (the presence count) — the gpu.vendor sub-key
+        // has its own cardinality measurement under a different
+        // TagKey.
+        let index = CapabilityIndex::new();
+        let caps = CapabilitySet::new().with_hardware(
+            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
+        );
+        index_with_node(&index, 1, caps);
+
+        let gpu_presence = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "gpu",
+        );
+        assert_eq!(index.axis_cardinality(&gpu_presence), 1);
+
+        let gpu_vendor = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "gpu.vendor",
+        );
+        assert_eq!(index.axis_cardinality(&gpu_vendor), 1);
+    }
+
+    #[test]
+    fn axis_cardinality_handles_high_cardinality_keys() {
+        // 100 nodes with distinct memory values → cardinality 100.
+        // Pin: the linear scan handles modest sizes correctly.
+        let index = CapabilityIndex::new();
+        for i in 0..100u32 {
+            let caps = CapabilitySet::new().with_hardware(
+                HardwareCapabilities::new().with_memory(1024 + i),
+            );
+            index_with_node(&index, i as u64, caps);
+        }
+        let key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        assert_eq!(index.axis_cardinality(&key), 100);
     }
 
     #[test]
