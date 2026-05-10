@@ -393,7 +393,7 @@ the data and the actual data. Round-trip via JSON: `report.toWire()`
 
 These surfaces stayed stable:
 
-- `Mesh::announce_capabilities(caps)` — still `Mesh -> CapabilitySet`.
+- `Mesh::announce_capabilities(caps)` — still takes a `CapabilitySet` and returns `Result<()>` (async).
 - `Mesh::find_nodes(filter)` — still takes a `CapabilityFilter` (the
   old query API). For richer queries, use the new predicate AST via
   `find_nodes_matching` (substrate Phase 4 of enhancements).
