@@ -472,10 +472,61 @@ impl<'a> PlacementFilter for StandardPlacement<'a> {
 // means "axis is satisfied / doesn't apply"; `0.0` means
 // "hard veto on this axis."
 impl<'a> StandardPlacement<'a> {
-    fn score_scope_axis(&self, _target_caps: &CapabilitySet) -> f32 {
-        // Stub: scope axis always satisfied. Slice 5 evaluates
-        // `scope_filter` membership against target's reserved-tag set.
-        1.0
+    /// Phase F slice 5 scope axis. Returns:
+    ///
+    /// - `1.0` when `scope_filter` is `None` or empty (axis
+    ///   disabled / no constraint).
+    /// - `1.0` when ANY label in `scope_filter` matches a
+    ///   `scope:*` reserved tag on the target — set-membership
+    ///   "any-of" semantics: the daemon wants to land on a node
+    ///   tagged with at least one of the listed scopes.
+    /// - `0.0` when `scope_filter` is non-empty and no label
+    ///   matches any of the target's `scope:*` tags.
+    ///
+    /// Each [`ScopeLabel`] accepts either the full form
+    /// (`"scope:tenant:foo"`) or the body alone (`"tenant:foo"`)
+    /// — both compare equal against the target's `Tag::Reserved
+    /// { prefix: "scope:", body: "tenant:foo" }`.
+    fn score_scope_axis(&self, target_caps: &CapabilitySet) -> f32 {
+        let Some(filter) = self.scope_filter.as_ref() else {
+            return 1.0;
+        };
+        if filter.is_empty() {
+            return 1.0;
+        }
+        // Collect target's `scope:*` reserved-tag bodies for fast
+        // any-of matching. A non-scope reserved tag (`causal:`,
+        // `fork-of:`, `heat:`) is ignored — only `scope:` matters
+        // here.
+        let target_scope_bodies: Vec<&str> = target_caps
+            .tags
+            .iter()
+            .filter_map(|t| match t {
+                Tag::Reserved { prefix, body } if prefix.as_str() == "scope:" => {
+                    Some(body.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        if target_scope_bodies.is_empty() {
+            // Target has no scope tags. The daemon's filter is non-
+            // empty so this is a miss → 0.0. Operators who want
+            // unscoped peers to satisfy the axis disable the axis
+            // by leaving `scope_filter` as `None`.
+            return 0.0;
+        }
+
+        let any_match = filter.iter().any(|label| {
+            let raw = label.as_str();
+            // Strip the optional `scope:` prefix from the label so
+            // both `"scope:tenant:foo"` and `"tenant:foo"` compare
+            // equal against the target's body field.
+            let body = raw.strip_prefix("scope:").unwrap_or(raw);
+            target_scope_bodies.iter().any(|tb| *tb == body)
+        });
+
+        if any_match { 1.0 } else { 0.0 }
     }
 
     fn score_proximity_axis(&self, _target: &NodeId) -> f32 {
@@ -1630,6 +1681,117 @@ mod tests {
     fn with_metadata_pair(mut caps: CapabilitySet, key: &str, value: &str) -> CapabilitySet {
         caps.metadata.insert(key.to_string(), value.to_string());
         caps
+    }
+
+    // ====================================================================
+    // Phase F slice 5 — scope axis
+    // ====================================================================
+
+    /// `scope_filter: None` → 1.0 regardless of target tags.
+    /// Default config with no scope filter set.
+    #[test]
+    fn scope_axis_none_filter_returns_one() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index);
+        let target_caps = empty_caps().with_tenant_scope("foo");
+        assert_eq!(placement.score_scope_axis(&target_caps), 1.0);
+    }
+
+    /// `scope_filter: Some(empty)` → 1.0 (no-constraint case).
+    #[test]
+    fn scope_axis_empty_filter_returns_one() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index).with_scope_filter(vec![]);
+        let target_caps = empty_caps().with_tenant_scope("foo");
+        assert_eq!(placement.score_scope_axis(&target_caps), 1.0);
+    }
+
+    /// `scope_filter` non-empty + target has matching scope tag
+    /// → 1.0 (any-of match).
+    #[test]
+    fn scope_axis_matches_full_form() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_scope_filter(vec![ScopeLabel::new("scope:tenant:foo")]);
+        let target_caps = empty_caps().with_tenant_scope("foo");
+        assert_eq!(placement.score_scope_axis(&target_caps), 1.0);
+    }
+
+    /// Body-form labels work too: `"tenant:foo"` matches a
+    /// `scope:tenant:foo` target tag.
+    #[test]
+    fn scope_axis_matches_body_form() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
+        let target_caps = empty_caps().with_tenant_scope("foo");
+        assert_eq!(
+            placement.score_scope_axis(&target_caps),
+            1.0,
+            "body-form label must match the full scope tag"
+        );
+    }
+
+    /// Non-empty filter + target has no scope tags → 0.0
+    /// (operator wanted scoped placement; target is unscoped).
+    #[test]
+    fn scope_axis_unscoped_target_returns_zero() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
+        let target_caps = empty_caps().add_tag("hardware.gpu");
+        assert_eq!(placement.score_scope_axis(&target_caps), 0.0);
+    }
+
+    /// Filter with multiple labels, target matches any-of → 1.0.
+    #[test]
+    fn scope_axis_matches_any_of_multiple_labels() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index).with_scope_filter(vec![
+            ScopeLabel::new("tenant:bar"),
+            ScopeLabel::new("region:us-east"),
+            ScopeLabel::new("tenant:foo"),
+        ]);
+        // Target has the third label.
+        let target_caps = empty_caps().with_tenant_scope("foo");
+        assert_eq!(placement.score_scope_axis(&target_caps), 1.0);
+    }
+
+    /// Non-empty filter + non-empty target scope tags + no match
+    /// → 0.0.
+    #[test]
+    fn scope_axis_no_match_returns_zero() {
+        let index = index_with(&[]);
+        let placement = StandardPlacement::new(&index)
+            .with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
+        // Target tagged with a different tenant.
+        let target_caps = empty_caps().with_tenant_scope("bar");
+        assert_eq!(placement.score_scope_axis(&target_caps), 0.0);
+    }
+
+    /// End-to-end: a scope-filter mismatch zeros the final score
+    /// via multiplicative composition.
+    #[test]
+    fn scope_axis_zero_zeros_final_score() {
+        let target_caps = empty_caps().add_tag("hardware.gpu");
+        let index = {
+            let i = CapabilityIndex::new();
+            let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+            let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
+            i.index(ad);
+            i
+        };
+        let placement = StandardPlacement::new(&index)
+            .with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
+
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+
+        let score = placement
+            .placement_score(&0x1111, &artifact)
+            .expect("hard-constraint check passes (empty required tags)");
+        assert_eq!(score, 0.0, "scope axis vetoes — final score 0.0");
     }
 
     /// `Chain` and `Replica` artifacts pass through hard-constraint
