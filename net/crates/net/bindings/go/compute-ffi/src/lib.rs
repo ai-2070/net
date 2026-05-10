@@ -884,8 +884,17 @@ pub extern "C" fn net_compute_outputs_push(
 /// snapshot trampolines must allocate via `C.malloc` and hand us
 /// the pointer; we free via `libc::free`. NULL is a no-op.
 #[no_mangle]
-pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, len: usize) {
-    if ptr.is_null() || len == 0 {
+pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, _len: usize) {
+    // N-8: pre-fix the combined `ptr.is_null() || len == 0` early-
+    // return leaked any allocation a Go trampoline allocated via
+    // `C.malloc(0)` (which on glibc returns a valid free-able
+    // pointer with a zero requested size). CR-11 split the same
+    // guard on the inbound paths (`GoBridge::snapshot` and
+    // `parse_side`); this outbound free helper — declared in
+    // `net.go.h` and callable directly by Go — kept the old
+    // shape. `libc::free` reads its metadata from the malloc
+    // header so the `len` parameter is informational only.
+    if ptr.is_null() {
         return;
     }
     // The Go side allocated via `C.malloc`; `libc::free` matches.
@@ -3049,5 +3058,39 @@ mod tests {
                 "silent-noop regression: ReconstructionErrorBridge::restore must never return Ok",
             ),
         }
+    }
+
+    /// N-8 regression: `net_compute_snapshot_bytes_free` must free
+    /// a non-NULL pointer even when `len == 0`. CR-11 fixed the
+    /// inbound paths; pre-fix this outbound helper kept the
+    /// combined `ptr.is_null() || len == 0` guard, leaking the
+    /// allocation a Go trampoline made via `C.malloc(0)`.
+    ///
+    /// We allocate a small buffer via `libc::malloc`, hand it to
+    /// the free helper with `len = 0`, and rely on the OS / sanitizer
+    /// (or a leak checker, when run under one) to flag a regression.
+    /// At minimum the call must not panic, and a NULL pointer must
+    /// remain a safe no-op.
+    #[test]
+    fn snapshot_bytes_free_non_null_len_zero_does_not_leak() {
+        // NULL is always a safe no-op.
+        net_compute_snapshot_bytes_free(std::ptr::null_mut(), 0);
+        net_compute_snapshot_bytes_free(std::ptr::null_mut(), 16);
+
+        // Non-NULL pointer with len=0 must still free (Go-side
+        // trampoline contract). We use libc::malloc(16) to mirror
+        // the Go-side `C.malloc` allocator; freeing with len=0
+        // exercises the post-fix code path. Running under valgrind
+        // / ASan would surface a regression as a leak; the test
+        // itself just pins the no-panic contract.
+        let p = unsafe { libc::malloc(16) } as *mut u8;
+        assert!(!p.is_null(), "libc::malloc(16) must succeed");
+        net_compute_snapshot_bytes_free(p, 0);
+
+        // Non-NULL pointer with len>0 path — the original case the
+        // function was designed for. Same allocator.
+        let q = unsafe { libc::malloc(16) } as *mut u8;
+        assert!(!q.is_null(), "libc::malloc(16) must succeed");
+        net_compute_snapshot_bytes_free(q, 16);
     }
 }
