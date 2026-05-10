@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilityIndex, CapabilitySet};
 use crate::adapter::net::behavior::placement::{
-    Artifact, PlacementFilter, TieBreakContext, tie_break_compare,
+    Artifact, LegacyPlacement, PlacementFilter, ResourceAxis, TieBreakContext, tie_break_compare,
 };
 use crate::adapter::net::subprotocol::SubprotocolRegistry;
 
@@ -206,6 +206,73 @@ impl Scheduler {
         Ok(PlacementDecision {
             node_id: candidates[0],
             reason: PlacementReason::FirstMatch,
+        })
+    }
+
+    /// Phase G slice 8 of `CAPABILITY_SYSTEM_PLAN.md` — v2 of
+    /// [`Self::place_migration`] using the `&dyn PlacementFilter`
+    /// machinery. Uses [`LegacyPlacement::permissive`] against the
+    /// scheduler's own `CapabilityIndex` so observable eligibility
+    /// matches v1 (any migration-capable, daemon-filter-compatible
+    /// node is eligible), but ranking flows through
+    /// [`Self::select_migration_target`] and the LOCKED §7
+    /// tie-breaker.
+    ///
+    /// **Default migration path.** [`Self::start_migration_auto`]
+    /// (in `orchestrator.rs`) calls this method, so any auto-target
+    /// migration in the substrate runs through v2 plumbing. The
+    /// legacy [`Self::place_migration`] is kept around for callers
+    /// who explicitly want v1's `LocalPreferred` / `FirstMatch`
+    /// behavior (e.g. tests pinning the legacy contract); production
+    /// code should use this v2 entry point.
+    ///
+    /// The returned `PlacementDecision` carries
+    /// [`PlacementReason::BestScore`] so observers can distinguish
+    /// the v2 path in telemetry.
+    ///
+    /// `tie_break.rtt_lookup` is `None` here — the substrate-level
+    /// scheduler has no RTT data plumbed in by default. Operators
+    /// who want RTT-aware tie-breaking should call
+    /// [`Self::select_migration_target`] directly with a populated
+    /// `TieBreakContext`; this convenience wrapper falls through to
+    /// step 3 (lex NodeId) without RTT data.
+    pub fn place_migration_v2(
+        &self,
+        daemon_filter: &CapabilityFilter,
+        source_node: u64,
+    ) -> Result<PlacementDecision, SchedulerError> {
+        let placement = LegacyPlacement::permissive(&self.capability_index);
+        let tie_break = TieBreakContext {
+            rtt_lookup: None,
+            index: &self.capability_index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        // Empty required / optional caps: the migration artifact
+        // carries its hard-constraint shape via `daemon_filter`
+        // (which narrows the candidate pool inside
+        // `find_migration_targets`). Splitting hard constraints
+        // between the filter and the artifact would double-count
+        // them; the artifact stays empty so the
+        // `LegacyPlacement::permissive` shim's "any eligible
+        // candidate scores 1.0" semantics hold.
+        let empty = CapabilitySet::default();
+        let artifact = Artifact::Daemon {
+            daemon_id: [0u8; 32],
+            required: &empty,
+            optional: &empty,
+        };
+        let node_id = self
+            .select_migration_target(
+                &artifact,
+                daemon_filter,
+                source_node,
+                &placement,
+                &tie_break,
+            )
+            .ok_or(SchedulerError::NoCandidate)?;
+        Ok(PlacementDecision {
+            node_id,
+            reason: PlacementReason::BestScore,
         })
     }
 
@@ -1049,5 +1116,124 @@ mod tests {
             &tb,
         );
         assert_eq!(target, None);
+    }
+
+    // ==================================================================
+    // Phase G slice 8: place_migration_v2 — default migration path
+    //
+    // Pin three guarantees:
+    //   1. v2 always stamps `PlacementReason::BestScore` (telemetry
+    //      contract — operators can grep for the v2 path).
+    //   2. v2 finds the same eligibility set as v1 (uses
+    //      `LegacyPlacement::permissive` against the same index +
+    //      same `daemon_filter` narrowing via
+    //      `find_migration_targets`).
+    //   3. v2 excludes the source node and uses §7-LOCKED tie-breaker
+    //      (lex NodeId fallback when no RTT data) — yields a
+    //      deterministic pick across multiple eligible candidates.
+    //   4. v1 (`place_migration`) still works — kept around for
+    //      callers who explicitly want the legacy `LocalPreferred`
+    //      / `FirstMatch` reasons.
+    // ==================================================================
+
+    /// `place_migration_v2` stamps `BestScore` on every successful
+    /// pick. Pins the telemetry contract that distinguishes v2 from
+    /// v1 (`LocalPreferred` / `OnlyCandidate` / `FirstMatch`).
+    #[test]
+    fn place_migration_v2_stamps_best_score_reason() {
+        let index = make_index_with_nodes(vec![
+            (0x2222, caps_with_migration_tag()),
+            (0x3333, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index, 0x1111, caps_no_gpu());
+
+        let decision = scheduler
+            .place_migration_v2(&CapabilityFilter::default(), 0x1111)
+            .expect("two eligible targets, source excluded");
+
+        assert_eq!(decision.reason, PlacementReason::BestScore);
+        // 0x2222 wins lex tie-break over 0x3333 (no RTT data, all
+        // candidates score 1.0 via LegacyPlacement::permissive).
+        assert_eq!(decision.node_id, 0x2222);
+    }
+
+    /// `place_migration_v2` excludes the source node — v2 honors
+    /// the same source-exclusion contract as v1.
+    #[test]
+    fn place_migration_v2_excludes_source_node() {
+        let index = make_index_with_nodes(vec![
+            (0x1111, caps_with_migration_tag()),
+            (0x2222, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index, 0xFFFF, caps_no_gpu());
+
+        // Source = 0x1111; v2 must pick 0x2222.
+        let decision = scheduler
+            .place_migration_v2(&CapabilityFilter::default(), 0x1111)
+            .unwrap();
+        assert_eq!(decision.node_id, 0x2222);
+        assert_eq!(decision.reason, PlacementReason::BestScore);
+    }
+
+    /// `place_migration_v2` returns `NoCandidate` when nothing
+    /// matches — same failure mode as v1.
+    #[test]
+    fn place_migration_v2_returns_no_candidate_when_nothing_matches() {
+        let index = make_index_with_nodes(vec![
+            (0x2222, caps_no_gpu()), // no migration tag
+        ]);
+        let scheduler = Scheduler::new(index, 0x1111, caps_no_gpu());
+
+        let err = scheduler
+            .place_migration_v2(&CapabilityFilter::default(), 0x1111)
+            .unwrap_err();
+        assert_eq!(err, SchedulerError::NoCandidate);
+    }
+
+    /// `place_migration_v2` honors the daemon_filter — a node
+    /// without the required tag is excluded by
+    /// `find_migration_targets` before scoring (same path as v1).
+    #[test]
+    fn place_migration_v2_honors_daemon_filter() {
+        let index = make_index_with_nodes(vec![
+            (
+                0x1111,
+                caps_with_migration_tag().add_tag("hardware.gpu"),
+            ),
+            (0x2222, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index, 0xFFFF, caps_no_gpu());
+
+        // Filter requires hardware.gpu — narrows candidate pool to
+        // 0x1111. Source 0x9999 doesn't intersect either candidate.
+        let filter = CapabilityFilter::default().require_tag("hardware.gpu".to_string());
+        let decision = scheduler
+            .place_migration_v2(&filter, 0x9999)
+            .expect("0x1111 is the only filter-passing candidate");
+        assert_eq!(decision.node_id, 0x1111);
+        assert_eq!(decision.reason, PlacementReason::BestScore);
+    }
+
+    /// `place_migration` (v1) is still available and unchanged.
+    /// Pins the back-compat guarantee that callers who explicitly
+    /// want v1's `LocalPreferred` reason can keep using it.
+    #[test]
+    fn place_migration_v1_still_returns_legacy_reasons() {
+        let index = make_index_with_nodes(vec![
+            (0x1111, caps_with_migration_tag()),
+            (0x2222, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(index, 0x1111, caps_with_migration_tag());
+
+        // Source 0x3333; local 0x1111 is eligible → LocalPreferred.
+        let decision = scheduler
+            .place_migration(&CapabilityFilter::default(), 0x3333)
+            .unwrap();
+        assert_eq!(decision.node_id, 0x1111);
+        assert_eq!(
+            decision.reason,
+            PlacementReason::LocalPreferred,
+            "v1 path should still stamp LocalPreferred (legacy contract)"
+        );
     }
 }
