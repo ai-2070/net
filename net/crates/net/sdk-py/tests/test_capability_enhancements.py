@@ -1,0 +1,314 @@
+"""
+Cross-binding wire-format compat for the Python Capability-System
+Enhancements surface. Drives the same JSON fixtures the Rust + TS
+tests consume (under ``net/crates/net/tests/cross_lang_capability``)
+so all bindings agree byte-for-byte on the predicate envelope and
+``CapabilitySet::diff`` output.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict, List
+
+import pytest
+
+from net_sdk.capability import (
+    RESERVED_PREFIXES,
+    RPC_WHERE_HEADER,
+    PlacementCandidate,
+    diff_capabilities,
+    empty_capabilities,
+    p,
+    placement_filter_from_fn,
+    predicate_from_rpc_header,
+    predicate_from_wire,
+    predicate_to_rpc_header,
+    predicate_to_wire,
+    require_axis_value,
+    require_tag,
+    standard_placement,
+    tag_from_string,
+    tag_from_user_string,
+    tag_key,
+    tag_to_string,
+    with_metadata,
+)
+from net_sdk.capability import (  # noqa: E501 — split for clarity
+    TagAxisPresent,
+    TagAxisValue,
+    TagLegacy,
+    TagReserved,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixture loaders
+# ---------------------------------------------------------------------------
+
+# tests/test_capability_enhancements.py → up 2 levels to the
+# `crates/net/` directory which hosts the cross-binding fixtures.
+_NET_CRATE_ROOT = Path(__file__).resolve().parents[2]
+PREDICATE_FIXTURE = (
+    _NET_CRATE_ROOT / "tests" / "cross_lang_capability" / "predicate_nrpc_envelope.json"
+)
+DIFF_FIXTURE = (
+    _NET_CRATE_ROOT / "tests" / "cross_lang_capability" / "capability_set_diff.json"
+)
+
+
+def _load_json(path: Path, label: str) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{label} fixture missing at {path}; cross-binding tests cannot run"
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Predicate envelope round-trip
+# ---------------------------------------------------------------------------
+
+
+def _predicate_cases() -> List[Dict[str, Any]]:
+    return _load_json(PREDICATE_FIXTURE, "predicate envelope")["cases"]
+
+
+def test_predicate_fixture_header_matches() -> None:
+    fx = _load_json(PREDICATE_FIXTURE, "predicate envelope")
+    assert fx["header_name"] == RPC_WHERE_HEADER
+
+
+@pytest.mark.parametrize("case", _predicate_cases(), ids=lambda c: c["name"])
+def test_predicate_fixture_round_trip(case: Dict[str, Any]) -> None:
+    wire = case["wire"]
+    ast = predicate_from_wire(wire)
+    re_emitted = predicate_to_wire(ast)
+    assert re_emitted == wire
+
+    header_val = json.dumps(wire)
+    from_header = predicate_from_rpc_header(header_val)
+    assert predicate_to_wire(from_header) == wire
+
+
+# ---------------------------------------------------------------------------
+# CapabilitySet diff
+# ---------------------------------------------------------------------------
+
+
+def _diff_cases() -> List[Dict[str, Any]]:
+    return _load_json(DIFF_FIXTURE, "capability-set diff")["cases"]
+
+
+@pytest.mark.parametrize("case", _diff_cases(), ids=lambda c: c["name"])
+def test_capability_set_diff_fixture(case: Dict[str, Any]) -> None:
+    got = diff_capabilities(case["prev"], case["curr"]).to_wire()
+    assert got["added_tags"] == case["expected_added_tags"]
+    assert got["removed_tags"] == case["expected_removed_tags"]
+    assert got["metadata_changes"] == case["expected_metadata_changes"]
+
+
+# ---------------------------------------------------------------------------
+# Typed taxonomy
+# ---------------------------------------------------------------------------
+
+
+def test_axis_present_round_trip() -> None:
+    tag = tag_from_string("hardware.gpu")
+    assert isinstance(tag, TagAxisPresent)
+    assert tag.axis == "hardware"
+    assert tag.key == "gpu"
+    assert tag_to_string(tag) == "hardware.gpu"
+
+
+def test_axis_value_round_trip_eq() -> None:
+    tag = tag_from_string("software.os=linux")
+    assert isinstance(tag, TagAxisValue)
+    assert tag.axis == "software"
+    assert tag.key == "os"
+    assert tag.value == "linux"
+    assert tag.separator == "="
+    assert tag_to_string(tag) == "software.os=linux"
+
+
+def test_axis_value_round_trip_colon() -> None:
+    tag = tag_from_string("dataforts.region:us-east")
+    assert isinstance(tag, TagAxisValue)
+    assert tag.axis == "dataforts"
+    assert tag.separator == ":"
+    assert tag_to_string(tag) == "dataforts.region:us-east"
+
+
+def test_reserved_prefix_routes() -> None:
+    for prefix in RESERVED_PREFIXES:
+        wire = f"{prefix}value"
+        tag = tag_from_string(wire)
+        assert isinstance(tag, TagReserved)
+        assert tag.prefix == prefix
+        assert tag.body == "value"
+        assert tag_to_string(tag) == wire
+
+
+def test_legacy_fallback() -> None:
+    assert isinstance(tag_from_string("myteam-tag"), TagLegacy)
+    assert isinstance(tag_from_string("unknown-axis.key"), TagLegacy)
+
+
+def test_tag_from_user_string_rejects_reserved() -> None:
+    for prefix in RESERVED_PREFIXES:
+        with pytest.raises(ValueError, match="reserved prefix"):
+            tag_from_user_string(f"{prefix}value")
+
+
+def test_tag_key_rejects_empty() -> None:
+    with pytest.raises(ValueError):
+        tag_key("hardware", "")
+
+
+# ---------------------------------------------------------------------------
+# Chain composition
+# ---------------------------------------------------------------------------
+
+
+def test_require_tag_idempotent() -> None:
+    caps = empty_capabilities()
+    caps = require_tag(caps, "hardware", "gpu")
+    caps = require_tag(caps, "hardware", "gpu")
+    assert caps.tags == ("hardware.gpu",)
+
+
+def test_require_axis_value_idempotent() -> None:
+    caps = empty_capabilities()
+    caps = require_axis_value(caps, "software", "os", "linux")
+    caps = require_axis_value(caps, "software", "os", "linux")
+    assert caps.tags == ("software.os=linux",)
+
+
+def test_require_axis_value_colon() -> None:
+    caps = require_axis_value(
+        empty_capabilities(), "dataforts", "region", "us-east", ":"
+    )
+    assert caps.tags == ("dataforts.region:us-east",)
+
+
+def test_with_metadata_does_not_mutate_input() -> None:
+    a = empty_capabilities()
+    b = with_metadata(a, "intent", "ml-training")
+    assert a.metadata == {}
+    assert b.metadata == {"intent": "ml-training"}
+
+
+def test_chain_compose_left_to_right() -> None:
+    caps = with_metadata(
+        require_axis_value(
+            require_tag(empty_capabilities(), "hardware", "gpu"),
+            "software",
+            "os",
+            "linux",
+        ),
+        "intent",
+        "ml-training",
+    )
+    assert sorted(caps.tags) == ["hardware.gpu", "software.os=linux"]
+    assert caps.metadata == {"intent": "ml-training"}
+
+
+# ---------------------------------------------------------------------------
+# Predicate fluent builder
+# ---------------------------------------------------------------------------
+
+
+def test_predicate_complex_round_trip() -> None:
+    pred = p.and_(
+        p.or_(
+            p.exists(tag_key("hardware", "gpu")),
+            p.and_(
+                p.numeric_at_least(tag_key("hardware", "memory_mb"), 65536),
+                p.metadata_exists("intent"),
+            ),
+        ),
+        p.not_(p.metadata_equals("decommissioning", "true")),
+        p.semver_at_least(tag_key("software", "runtime.python"), "3.10.0"),
+    )
+    wire = predicate_to_wire(pred)
+    assert predicate_to_wire(predicate_from_wire(wire)) == wire
+    assert wire["nodes"][wire["root_idx"]]["kind"] == "and"
+
+
+def test_predicate_from_wire_rejects_forward_child() -> None:
+    bad = {
+        "nodes": [
+            {"kind": "and", "children": [1]},
+            {"kind": "metadata_exists", "key": "x"},
+        ],
+        "root_idx": 0,
+    }
+    with pytest.raises(ValueError, match="strictly less"):
+        predicate_from_wire(bad)
+
+
+def test_predicate_from_wire_rejects_out_of_range_root() -> None:
+    bad = {"nodes": [{"kind": "metadata_exists", "key": "x"}], "root_idx": 99}
+    with pytest.raises(ValueError, match="root_idx"):
+        predicate_from_wire(bad)
+
+
+def test_predicate_to_rpc_header_canonical_json() -> None:
+    pred = p.exists(tag_key("hardware", "gpu"))
+    header = predicate_to_rpc_header(pred)
+    assert json.loads(header) == {
+        "nodes": [{"kind": "exists", "key": {"axis": "hardware", "key": "gpu"}}],
+        "root_idx": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# StandardPlacement builder + custom placement filter
+# ---------------------------------------------------------------------------
+
+
+def test_standard_placement_builder() -> None:
+    cfg = (
+        standard_placement()
+        .require_tag("hardware", "gpu")
+        .require_axis_value("software", "os", "linux")
+        .forbid_tag("hardware", "decommissioned")
+        .require_metadata("intent", "ml-training")
+        .with_predicate(p.metadata_exists("owner"))
+        .with_limit(3)
+        .with_custom_filter_id("placement-foo")
+        .build()
+    )
+    assert cfg.require_tags == ("hardware.gpu", "software.os=linux")
+    assert cfg.forbid_tags == ("hardware.decommissioned",)
+    assert cfg.require_metadata == {"intent": "ml-training"}
+    assert cfg.predicate is not None
+    assert cfg.predicate["nodes"][0] == {"kind": "metadata_exists", "key": "owner"}
+    assert cfg.limit == 3
+    assert cfg.custom_filter_id == "placement-foo"
+
+
+def test_standard_placement_rejects_negative_limit() -> None:
+    with pytest.raises(ValueError):
+        standard_placement().with_limit(-1)
+
+
+def test_standard_placement_accepts_pre_built_wire() -> None:
+    wire = predicate_to_wire(p.exists(tag_key("hardware", "gpu")))
+    cfg = standard_placement().with_predicate(wire).build()
+    assert cfg.predicate == wire
+
+
+def test_placement_filter_from_fn_auto_id() -> None:
+    a = placement_filter_from_fn(lambda c: True)
+    b = placement_filter_from_fn(lambda c: False)
+    assert a.id != b.id
+    candidate = PlacementCandidate(node_id=1, tags=(), metadata={})
+    assert a.fn(candidate) is True
+    assert b.fn(candidate) is False
+
+
+def test_placement_filter_from_fn_explicit_id() -> None:
+    f = placement_filter_from_fn(lambda c: True, "my-filter")
+    assert f.id == "my-filter"

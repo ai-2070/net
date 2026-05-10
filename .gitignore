@@ -28,6 +28,10 @@ net/crates/net/bindings/python/python/**/*.so
 net/crates/net/bindings/python/python/**/*.pyd
 net/crates/net/bindings/python/python/**/__pycache__/
 
+# Python editable-install metadata (created by `pip install -e .`).
+net/crates/net/sdk-py/src/*.egg-info/
+net/crates/net/sdk-py/**/__pycache__/
+
 # Env variables
 .env
 .env.*
