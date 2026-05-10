@@ -993,3 +993,272 @@ func PlacementFilterFromFn(fn PlacementFilterFn, explicitID string) RegisteredPl
 	}
 	return RegisteredPlacementFilter{ID: id, Fn: fn}
 }
+
+// ============================================================================
+// Predicate evaluation — pure local evaluator over (tags, metadata).
+//
+// Mirrors the substrate's `Predicate::evaluate_unplanned`: composite
+// recursion in declaration order with short-circuit semantics. The
+// planned variant in the substrate reorders And/Or children by static
+// cost; the boolean answer is invariant. Pinned across bindings by
+// `tests/cross_lang_capability/predicate_eval.json`.
+// ============================================================================
+
+type semverTriple [3]uint64
+
+func parseSemverGo(s string) (semverTriple, bool) {
+	// Drop pre-release / build suffix.
+	dash := strings.IndexByte(s, '-')
+	plus := strings.IndexByte(s, '+')
+	var core string
+	switch {
+	case dash >= 0 && plus >= 0:
+		if dash < plus {
+			core = s[:dash]
+		} else {
+			core = s[:plus]
+		}
+	case dash >= 0:
+		core = s[:dash]
+	case plus >= 0:
+		core = s[:plus]
+	default:
+		core = s
+	}
+	parts := strings.Split(core, ".")
+	if len(parts) == 0 || len(parts) > 3 {
+		return semverTriple{}, false
+	}
+	parsePart := func(p string) (uint64, bool) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return 0, false
+		}
+		var n uint64
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return 0, false
+			}
+			n = n*10 + uint64(c-'0')
+		}
+		return n, true
+	}
+	major, ok := parsePart(parts[0])
+	if !ok {
+		return semverTriple{}, false
+	}
+	var minor, patch uint64
+	if len(parts) > 1 {
+		var ok2 bool
+		minor, ok2 = parsePart(parts[1])
+		if !ok2 {
+			return semverTriple{}, false
+		}
+	}
+	if len(parts) > 2 {
+		var ok3 bool
+		patch, ok3 = parsePart(parts[2])
+		if !ok3 {
+			return semverTriple{}, false
+		}
+	}
+	return semverTriple{major, minor, patch}, true
+}
+
+func semverCmp(a, b semverTriple) int {
+	for i := 0; i < 3; i++ {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+	return 0
+}
+
+func semverCompatibleGo(lhs, rhs semverTriple) bool {
+	if semverCmp(lhs, rhs) < 0 {
+		return false
+	}
+	if rhs[0] == 0 {
+		return rhs[1] == lhs[1]
+	}
+	return rhs[0] == lhs[0]
+}
+
+// axisTagValue returns the matched value for an axis-keyed tag, or
+// the empty string for AxisPresent. Returns ("", false) when no tag
+// matches.
+func axisTagValue(tags []string, key TagKey) (string, bool) {
+	prefix := string(key.Axis) + "." + key.Key
+	for _, wire := range tags {
+		if wire == prefix {
+			return "", true
+		}
+		if len(wire) <= len(prefix) || !strings.HasPrefix(wire, prefix) {
+			continue
+		}
+		sep := wire[len(prefix)]
+		if sep == '=' || sep == ':' {
+			return wire[len(prefix)+1:], true
+		}
+	}
+	return "", false
+}
+
+func isNumericLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[0] == '-' {
+		i = 1
+		if len(s) == 1 {
+			return false
+		}
+	}
+	seenDot := false
+	digit := false
+	for ; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			digit = true
+			continue
+		}
+		if c == '.' && !seenDot {
+			seenDot = true
+			continue
+		}
+		return false
+	}
+	return digit
+}
+
+func parseFloat(s string) (float64, bool) {
+	if !isNumericLiteral(s) {
+		return 0, false
+	}
+	var n float64
+	if _, err := fmt.Sscanf(s, "%f", &n); err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func evalLeaf(p *Predicate, tags []string, metadata map[string]string) bool {
+	switch p.kind {
+	case pkExists:
+		_, ok := axisTagValue(tags, p.key)
+		return ok
+	case pkEquals:
+		v, ok := axisTagValue(tags, p.key)
+		return ok && v == p.value
+	case pkNumericAtLeast:
+		v, ok := axisTagValue(tags, p.key)
+		if !ok {
+			return false
+		}
+		n, ok := parseFloat(v)
+		return ok && n >= p.threshold
+	case pkNumericAtMost:
+		v, ok := axisTagValue(tags, p.key)
+		if !ok {
+			return false
+		}
+		n, ok := parseFloat(v)
+		return ok && n <= p.threshold
+	case pkNumericInRange:
+		v, ok := axisTagValue(tags, p.key)
+		if !ok {
+			return false
+		}
+		n, ok := parseFloat(v)
+		return ok && n >= p.min && n <= p.max
+	case pkSemverAtLeast:
+		rhs, ok := parseSemverGo(p.version)
+		if !ok {
+			return false
+		}
+		v, ok := axisTagValue(tags, p.key)
+		if !ok {
+			return false
+		}
+		lhs, ok := parseSemverGo(v)
+		return ok && semverCmp(lhs, rhs) >= 0
+	case pkSemverAtMost:
+		rhs, ok := parseSemverGo(p.version)
+		if !ok {
+			return false
+		}
+		v, ok := axisTagValue(tags, p.key)
+		if !ok {
+			return false
+		}
+		lhs, ok := parseSemverGo(v)
+		return ok && semverCmp(lhs, rhs) <= 0
+	case pkSemverCompatible:
+		rhs, ok := parseSemverGo(p.version)
+		if !ok {
+			return false
+		}
+		v, ok := axisTagValue(tags, p.key)
+		if !ok {
+			return false
+		}
+		lhs, ok := parseSemverGo(v)
+		return ok && semverCompatibleGo(lhs, rhs)
+	case pkStringPrefix:
+		v, ok := axisTagValue(tags, p.key)
+		return ok && strings.HasPrefix(v, p.prefix)
+	case pkStringMatches:
+		v, ok := axisTagValue(tags, p.key)
+		return ok && strings.Contains(v, p.pattern)
+	case pkMetadataExists:
+		_, ok := metadata[p.mdKey]
+		return ok
+	case pkMetadataEquals:
+		v, ok := metadata[p.mdKey]
+		return ok && v == p.value
+	case pkMetadataMatches:
+		v, ok := metadata[p.mdKey]
+		return ok && strings.Contains(v, p.pattern)
+	case pkMetadataNumericAtLeast:
+		v, ok := metadata[p.mdKey]
+		if !ok {
+			return false
+		}
+		n, ok := parseFloat(v)
+		return ok && n >= p.threshold
+	default:
+		panic(fmt.Sprintf("evalLeaf: composite predicate kind=%d routed through leaf evaluator", p.kind))
+	}
+}
+
+// EvaluatePredicate evaluates a Predicate against a wire-format
+// (tags, metadata) context. Mirrors the substrate's
+// `Predicate::evaluate_unplanned`; children of And / Or evaluate in
+// declaration order with short-circuit semantics. Pinned across
+// bindings by `predicate_eval.json`.
+func EvaluatePredicate(p *Predicate, tags []string, metadata map[string]string) bool {
+	switch p.kind {
+	case pkAnd:
+		for _, c := range p.children {
+			if !EvaluatePredicate(c, tags, metadata) {
+				return false
+			}
+		}
+		return true
+	case pkOr:
+		for _, c := range p.children {
+			if EvaluatePredicate(c, tags, metadata) {
+				return true
+			}
+		}
+		return false
+	case pkNot:
+		return !EvaluatePredicate(p.child, tags, metadata)
+	default:
+		return evalLeaf(p, tags, metadata)
+	}
+}

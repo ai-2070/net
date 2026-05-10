@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
 
 # ============================================================================
 # Typed taxonomy
@@ -948,6 +948,163 @@ def placement_filter_from_fn(
     return RegisteredPlacementFilter(id=id_, fn=fn)
 
 
+# ============================================================================
+# Predicate evaluation — pure local evaluator over (tags, metadata).
+#
+# Mirrors the substrate's ``Predicate::evaluate_unplanned``. Pinned
+# across bindings by ``predicate_eval.json``.
+# ============================================================================
+
+
+_NUMERIC_RE = __import__("re").compile(r"^-?\d+(\.\d+)?$")
+
+
+def _parse_semver(s: str) -> Optional[Tuple[int, int, int]]:
+    """Drop pre-release / build suffix; parse 1-3 dot-separated ints."""
+    dash = s.find("-")
+    plus = s.find("+")
+    if dash >= 0 and plus >= 0:
+        core = s[: min(dash, plus)]
+    elif dash >= 0:
+        core = s[:dash]
+    elif plus >= 0:
+        core = s[:plus]
+    else:
+        core = s
+    parts = [p.strip() for p in core.split(".")]
+    if not parts or len(parts) > 3:
+        return None
+    try:
+        major = int(parts[0]) if parts[0].isdigit() else None
+        if major is None:
+            return None
+        minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else (0 if len(parts) <= 1 else None)
+        if minor is None:
+            return None
+        patch = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else (0 if len(parts) <= 2 else None)
+        if patch is None:
+            return None
+    except ValueError:
+        return None
+    return (major, minor, patch)
+
+
+def _semver_compatible(lhs: Tuple[int, int, int], rhs: Tuple[int, int, int]) -> bool:
+    if lhs < rhs:
+        return False
+    if rhs[0] == 0:
+        return rhs[1] == lhs[1]
+    return rhs[0] == lhs[0]
+
+
+def _axis_tag_value(tags: Sequence[str], key: TagKey) -> Optional[str]:
+    """Return the matched axis-tag value, or empty string for AxisPresent,
+    or ``None`` if no tag matches the (axis, key) pair."""
+    prefix = f"{key[0]}.{key[1]}"
+    for wire in tags:
+        if wire == prefix:
+            return ""
+        if len(wire) <= len(prefix) or not wire.startswith(prefix):
+            continue
+        sep = wire[len(prefix)]
+        if sep == "=" or sep == ":":
+            return wire[len(prefix) + 1:]
+    return None
+
+
+def _eval_leaf(
+    pred: Predicate,
+    tags: Sequence[str],
+    metadata: Mapping[str, str],
+) -> bool:
+    if isinstance(pred, _PredExists):
+        return _axis_tag_value(tags, pred.key) is not None
+    if isinstance(pred, _PredEquals):
+        v = _axis_tag_value(tags, pred.key)
+        return v is not None and v == pred.value
+    if isinstance(pred, _PredNumericAtLeast):
+        v = _axis_tag_value(tags, pred.key)
+        if v is None or not _NUMERIC_RE.match(v):
+            return False
+        return float(v) >= pred.threshold
+    if isinstance(pred, _PredNumericAtMost):
+        v = _axis_tag_value(tags, pred.key)
+        if v is None or not _NUMERIC_RE.match(v):
+            return False
+        return float(v) <= pred.threshold
+    if isinstance(pred, _PredNumericInRange):
+        v = _axis_tag_value(tags, pred.key)
+        if v is None or not _NUMERIC_RE.match(v):
+            return False
+        n = float(v)
+        return pred.min <= n <= pred.max
+    if isinstance(pred, _PredSemverAtLeast):
+        rhs = _parse_semver(pred.version)
+        if rhs is None:
+            return False
+        v = _axis_tag_value(tags, pred.key)
+        if v is None:
+            return False
+        lhs = _parse_semver(v)
+        return lhs is not None and lhs >= rhs
+    if isinstance(pred, _PredSemverAtMost):
+        rhs = _parse_semver(pred.version)
+        if rhs is None:
+            return False
+        v = _axis_tag_value(tags, pred.key)
+        if v is None:
+            return False
+        lhs = _parse_semver(v)
+        return lhs is not None and lhs <= rhs
+    if isinstance(pred, _PredSemverCompatible):
+        rhs = _parse_semver(pred.version)
+        if rhs is None:
+            return False
+        v = _axis_tag_value(tags, pred.key)
+        if v is None:
+            return False
+        lhs = _parse_semver(v)
+        return lhs is not None and _semver_compatible(lhs, rhs)
+    if isinstance(pred, _PredStringPrefix):
+        v = _axis_tag_value(tags, pred.key)
+        return v is not None and v.startswith(pred.prefix)
+    if isinstance(pred, _PredStringMatches):
+        v = _axis_tag_value(tags, pred.key)
+        return v is not None and pred.pattern in v
+    if isinstance(pred, _PredMetadataExists):
+        return pred.key in metadata
+    if isinstance(pred, _PredMetadataEquals):
+        return metadata.get(pred.key) == pred.value
+    if isinstance(pred, _PredMetadataMatches):
+        v = metadata.get(pred.key)
+        return v is not None and pred.pattern in v
+    if isinstance(pred, _PredMetadataNumericAtLeast):
+        v = metadata.get(pred.key)
+        if v is None or not _NUMERIC_RE.match(v):
+            return False
+        return float(v) >= pred.threshold
+    raise TypeError(f"_eval_leaf: composite predicate {type(pred).__name__} routed through leaf evaluator")
+
+
+def evaluate_predicate(
+    pred: Predicate,
+    tags: Sequence[str],
+    metadata: Mapping[str, str],
+) -> bool:
+    """Evaluate a predicate against a wire-format ``(tags, metadata)``
+    context. Mirrors the substrate's ``Predicate::evaluate_unplanned``;
+    children of ``and`` / ``or`` evaluate in declaration order with
+    short-circuit semantics. Pinned across bindings by
+    ``predicate_eval.json``."""
+    if isinstance(pred, _PredAnd):
+        return all(evaluate_predicate(c, tags, metadata) for c in pred.children)
+    if isinstance(pred, _PredOr):
+        return any(evaluate_predicate(c, tags, metadata) for c in pred.children)
+    if isinstance(pred, _PredNot):
+        return not evaluate_predicate(pred.child, tags, metadata)
+    return _eval_leaf(pred, tags, metadata)
+
+
 __all__ = [
     "TaxonomyAxis",
     "TAXONOMY_AXES",
@@ -989,4 +1146,5 @@ __all__ = [
     "PlacementFilterFn",
     "RegisteredPlacementFilter",
     "placement_filter_from_fn",
+    "evaluate_predicate",
 ]

@@ -932,3 +932,218 @@ export function placementFilterFromFn(
   const id = explicitId ?? `pf-${++placementFilterCounter}`;
   return { id, fn };
 }
+
+// ============================================================================
+// Predicate evaluation — pure local evaluator over (tags, metadata).
+//
+// Mirrors the substrate's `Predicate::evaluate_unplanned`: composite
+// recursion in declaration order, leaf semantics matching
+// `evaluate_leaf`. The planned variant in the substrate reorders
+// And / Or children by static cost; the boolean answer is invariant
+// to that reordering, so the SDK-side evaluator skips planning.
+//
+// Pinned across bindings by `tests/cross_lang_capability/predicate_eval.json`.
+// ============================================================================
+
+type SemverTriple = readonly [number, number, number];
+
+function parseSemver(s: string): SemverTriple | undefined {
+  // Drop pre-release / build suffix.
+  const dash = s.indexOf('-');
+  const plus = s.indexOf('+');
+  let core: string;
+  if (dash >= 0 && plus >= 0) {
+    core = s.slice(0, Math.min(dash, plus));
+  } else if (dash >= 0) {
+    core = s.slice(0, dash);
+  } else if (plus >= 0) {
+    core = s.slice(0, plus);
+  } else {
+    core = s;
+  }
+  const parts = core.split('.').map((p) => p.trim());
+  if (parts.length === 0 || parts.length > 3) return undefined;
+  const major = Number.parseInt(parts[0], 10);
+  if (!Number.isFinite(major) || parts[0] === '' || /[^0-9]/.test(parts[0])) {
+    return undefined;
+  }
+  const parsePart = (s: string | undefined): number | undefined => {
+    if (s === undefined) return 0;
+    if (s === '' || /[^0-9]/.test(s)) return undefined;
+    const n = Number.parseInt(s, 10);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const minor = parsePart(parts[1]);
+  const patch = parsePart(parts[2]);
+  if (minor === undefined || patch === undefined) return undefined;
+  return [major, minor, patch];
+}
+
+function semverCmp(a: SemverTriple, b: SemverTriple): number {
+  if (a[0] !== b[0]) return a[0] - b[0];
+  if (a[1] !== b[1]) return a[1] - b[1];
+  return a[2] - b[2];
+}
+
+function semverCompatible(lhs: SemverTriple, rhs: SemverTriple): boolean {
+  if (semverCmp(lhs, rhs) < 0) return false;
+  if (rhs[0] === 0) {
+    // 0.x.y — minor is the compatibility band.
+    return rhs[1] === lhs[1];
+  }
+  return rhs[0] === lhs[0];
+}
+
+/**
+ * Find the value of an axis-keyed tag in the wire-format tag list,
+ * if any. AxisPresent tags ("hardware.gpu") have no value — the
+ * substrate's `match_axis_tag` calls `value_pred("")` for those, so
+ * SDK-side leaf evaluators that need a value (e.g. numeric_at_least)
+ * naturally fail when the tag is AxisPresent.
+ *
+ * Returns the matched value string for AxisValue tags, the empty
+ * string for AxisPresent tags, or `undefined` if no tag matches.
+ */
+function axisTagValue(
+  tags: readonly string[],
+  key: TagKey,
+): string | undefined {
+  const prefix = `${key.axis}.${key.key}`;
+  for (const wire of tags) {
+    if (wire === prefix) return '';
+    // Match `<axis>.<key>=<value>` or `<axis>.<key>:<value>`. Reject
+    // longer key-prefixes (`hardware.gpu` should NOT match
+    // `hardware.gpu.vendor=nvidia` — that's a different key).
+    if (wire.length <= prefix.length) continue;
+    if (!wire.startsWith(prefix)) continue;
+    const sep = wire.charAt(prefix.length);
+    if (sep === '=' || sep === ':') {
+      return wire.slice(prefix.length + 1);
+    }
+  }
+  return undefined;
+}
+
+function evalLeaf(
+  pred: Predicate,
+  tags: readonly string[],
+  metadata: Readonly<Record<string, string>>,
+): boolean {
+  switch (pred.type) {
+    case 'exists': {
+      return axisTagValue(tags, pred.key) !== undefined;
+    }
+    case 'equals': {
+      const v = axisTagValue(tags, pred.key);
+      return v !== undefined && v === pred.value;
+    }
+    case 'numericAtLeast': {
+      const v = axisTagValue(tags, pred.key);
+      if (v === undefined) return false;
+      const n = Number.parseFloat(v);
+      return Number.isFinite(n) && /^-?\d+(\.\d+)?$/.test(v) && n >= pred.threshold;
+    }
+    case 'numericAtMost': {
+      const v = axisTagValue(tags, pred.key);
+      if (v === undefined) return false;
+      const n = Number.parseFloat(v);
+      return Number.isFinite(n) && /^-?\d+(\.\d+)?$/.test(v) && n <= pred.threshold;
+    }
+    case 'numericInRange': {
+      const v = axisTagValue(tags, pred.key);
+      if (v === undefined) return false;
+      const n = Number.parseFloat(v);
+      return (
+        Number.isFinite(n) &&
+        /^-?\d+(\.\d+)?$/.test(v) &&
+        n >= pred.min &&
+        n <= pred.max
+      );
+    }
+    case 'semverAtLeast': {
+      const rhs = parseSemver(pred.version);
+      if (rhs === undefined) return false;
+      const v = axisTagValue(tags, pred.key);
+      if (v === undefined) return false;
+      const lhs = parseSemver(v);
+      return lhs !== undefined && semverCmp(lhs, rhs) >= 0;
+    }
+    case 'semverAtMost': {
+      const rhs = parseSemver(pred.version);
+      if (rhs === undefined) return false;
+      const v = axisTagValue(tags, pred.key);
+      if (v === undefined) return false;
+      const lhs = parseSemver(v);
+      return lhs !== undefined && semverCmp(lhs, rhs) <= 0;
+    }
+    case 'semverCompatible': {
+      const rhs = parseSemver(pred.version);
+      if (rhs === undefined) return false;
+      const v = axisTagValue(tags, pred.key);
+      if (v === undefined) return false;
+      const lhs = parseSemver(v);
+      return lhs !== undefined && semverCompatible(lhs, rhs);
+    }
+    case 'stringPrefix': {
+      const v = axisTagValue(tags, pred.key);
+      return v !== undefined && v.startsWith(pred.prefix);
+    }
+    case 'stringMatches': {
+      const v = axisTagValue(tags, pred.key);
+      return v !== undefined && v.includes(pred.pattern);
+    }
+    case 'metadataExists': {
+      return Object.prototype.hasOwnProperty.call(metadata, pred.key);
+    }
+    case 'metadataEquals': {
+      return (
+        Object.prototype.hasOwnProperty.call(metadata, pred.key) &&
+        metadata[pred.key] === pred.value
+      );
+    }
+    case 'metadataMatches': {
+      const v = metadata[pred.key];
+      return v !== undefined && v.includes(pred.pattern);
+    }
+    case 'metadataNumericAtLeast': {
+      const v = metadata[pred.key];
+      if (v === undefined) return false;
+      const n = Number.parseFloat(v);
+      return Number.isFinite(n) && /^-?\d+(\.\d+)?$/.test(v) && n >= pred.threshold;
+    }
+    case 'and':
+    case 'or':
+    case 'not':
+      throw new Error(
+        `evalLeaf: composite predicate ${pred.type} routed through leaf evaluator (internal bug)`,
+      );
+  }
+}
+
+/**
+ * Evaluate a {@link Predicate} against a wire-format `(tags, metadata)`
+ * context. Mirrors the substrate's `Predicate::evaluate_unplanned`
+ * — children of `and` / `or` evaluate in declaration order with
+ * standard short-circuit semantics.
+ *
+ * Pinned across bindings by `predicate_eval.json`. Use this for local
+ * pre-filtering of result sets before sending an nRPC `where:`
+ * predicate over the wire, or for client-side validation of a
+ * predicate against a known capability set.
+ */
+export function evaluatePredicate(
+  pred: Predicate,
+  tags: readonly string[],
+  metadata: Readonly<Record<string, string>>,
+): boolean {
+  switch (pred.type) {
+    case 'and':
+      return pred.children.every((c) => evaluatePredicate(c, tags, metadata));
+    case 'or':
+      return pred.children.some((c) => evaluatePredicate(c, tags, metadata));
+    case 'not':
+      return !evaluatePredicate(pred.child, tags, metadata);
+    default:
+      return evalLeaf(pred, tags, metadata);
+  }
+}

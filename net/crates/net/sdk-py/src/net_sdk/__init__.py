@@ -36,6 +36,7 @@ from net_sdk.capability import (
     TaxonomyAxis,
     diff_capabilities,
     empty_capabilities,
+    evaluate_predicate,
     p,
     placement_filter_from_fn,
     predicate_from_rpc_header,
@@ -116,6 +117,7 @@ __all__ = [
     "PlacementFilterFn",
     "RegisteredPlacementFilter",
     "placement_filter_from_fn",
+    "evaluate_predicate",
 ]
 
 __version__ = "0.12.0"

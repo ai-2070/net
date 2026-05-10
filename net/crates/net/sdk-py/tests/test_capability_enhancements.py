@@ -20,6 +20,7 @@ from net_sdk.capability import (
     PlacementCandidate,
     diff_capabilities,
     empty_capabilities,
+    evaluate_predicate,
     p,
     placement_filter_from_fn,
     predicate_from_rpc_header,
@@ -55,6 +56,9 @@ PREDICATE_FIXTURE = (
 )
 DIFF_FIXTURE = (
     _NET_CRATE_ROOT / "tests" / "cross_lang_capability" / "capability_set_diff.json"
+)
+EVAL_FIXTURE = (
+    _NET_CRATE_ROOT / "tests" / "cross_lang_capability" / "predicate_eval.json"
 )
 
 
@@ -99,6 +103,17 @@ def test_predicate_fixture_round_trip(case: Dict[str, Any]) -> None:
 
 def _diff_cases() -> List[Dict[str, Any]]:
     return _load_json(DIFF_FIXTURE, "capability-set diff")["cases"]
+
+
+def _eval_cases() -> List[Dict[str, Any]]:
+    return _load_json(EVAL_FIXTURE, "predicate eval")["cases"]
+
+
+@pytest.mark.parametrize("case", _eval_cases(), ids=lambda c: c["name"])
+def test_predicate_eval_fixture(case: Dict[str, Any]) -> None:
+    pred = predicate_from_wire(case["wire"])
+    got = evaluate_predicate(pred, case["tags"], case["metadata"])
+    assert got is case["expected"]
 
 
 @pytest.mark.parametrize("case", _diff_cases(), ids=lambda c: c["name"])

@@ -20,6 +20,22 @@ Pins the `Predicate` → `PredicateWire` → JSON-encoded header value contract:
 
 The covered shapes span the full AST: leaves of every variant, `And` with mixed costs, `Or` short-circuit candidate, `Not` over a leaf, deeply-nested `And-of-Or-of-And + Not`. Adding a new `Predicate` variant requires extending this fixture in the same coordinated commit (per `CAPABILITY_SYSTEM_SDK_PLAN.md` Locked decision § "Predicate AST evolution lands cross-binding").
 
+### `predicate_eval.json`
+
+Pins the `Predicate::evaluate_unplanned(ctx)` boolean output for representative `(predicate, tags, metadata)` triples:
+
+- `wire` is the canonical `PredicateWire` for the predicate.
+- `tags` is a wire-format string array (`hardware.gpu`, `software.os=linux`, …).
+- `metadata` is a `string→string` map.
+- `expected` is the boolean the substrate returns from `evaluate_unplanned(ctx)`. The Rust integration test asserts the planner-equivalence: `evaluate(ctx) == evaluate_unplanned(ctx) == expected`.
+
+Each binding loads the fixture, decodes the predicate, runs its host-language evaluator against the context, and asserts byte-identical boolean output. Pins:
+- Leaf semantics — axis-tag matching across `AxisPresent` / `AxisValue` shapes; numeric coercion (rejects non-numeric values); semver triple parsing + caret-compatibility band; metadata lookup.
+- Composite recursion — short-circuiting `And` / `Or`; `Not` inversion; arbitrary depth.
+- Real-world predicates — `(GPU OR ≥64GB) AND has-intent AND NOT decommissioning AND python≥3.10`, with both passing and failing contexts, including the OR's memory-only branch.
+
+Phase 9c of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`. SDKs that expose a host-language `evaluatePredicate(pred, tags, metadata)` consume this fixture in their per-binding test suites.
+
 ### `capability_set_diff.json`
 
 Pins the `CapabilitySet::diff(prev)` output for representative `(prev, curr)` pairs:

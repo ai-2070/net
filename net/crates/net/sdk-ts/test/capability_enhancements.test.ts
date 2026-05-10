@@ -17,6 +17,7 @@ import {
   RESERVED_PREFIXES,
   diffCapabilities,
   emptyCapabilities,
+  evaluatePredicate,
   p,
   placementFilterFromFn,
   predicateFromRpcHeader,
@@ -45,6 +46,10 @@ const PREDICATE_FIXTURE = resolve(
 const DIFF_FIXTURE = resolve(
   __dirname,
   '../../tests/cross_lang_capability/capability_set_diff.json',
+);
+const EVAL_FIXTURE = resolve(
+  __dirname,
+  '../../tests/cross_lang_capability/predicate_eval.json',
 );
 
 function loadJson<T>(path: string, label: string): T {
@@ -116,6 +121,38 @@ describe('predicate nRPC envelope (cross-binding fixture)', () => {
 // ---------------------------------------------------------------------------
 // Capability-set diff — every fixture case computes byte-equal output.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Predicate evaluation — every fixture case yields the substrate's
+// canonical boolean.
+// ---------------------------------------------------------------------------
+
+interface EvalCase {
+  name: string;
+  summary: string;
+  wire: PredicateWire;
+  tags: string[];
+  metadata: Record<string, string>;
+  expected: boolean;
+}
+
+interface EvalFixture {
+  description: string;
+  abi_version_expected: number;
+  cases: EvalCase[];
+}
+
+describe('predicate evaluation (cross-binding fixture)', () => {
+  const fx = loadJson<EvalFixture>(EVAL_FIXTURE, 'predicate eval');
+
+  for (const c of fx.cases) {
+    it(`evaluates ${c.name}`, () => {
+      const pred = predicateFromWire(c.wire);
+      const got = evaluatePredicate(pred, c.tags, c.metadata);
+      expect(got).toBe(c.expected);
+    });
+  }
+});
 
 describe('CapabilitySet.diff (cross-binding fixture)', () => {
   const fx = loadJson<DiffFixture>(DIFF_FIXTURE, 'capability-set diff');

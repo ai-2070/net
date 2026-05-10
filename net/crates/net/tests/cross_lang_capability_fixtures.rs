@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use net::adapter::net::behavior::{
-    CapabilitySet, MetadataChange, Predicate, PredicateWire, RPC_WHERE_HEADER,
+    CapabilitySet, EvalContext, MetadataChange, Predicate, PredicateWire, RPC_WHERE_HEADER, Tag,
 };
 use serde_json::Value;
 
@@ -308,6 +308,87 @@ fn capability_set_diff_fixture_round_trips_caps_through_serde() {
             normalize(&curr_round_trip),
             normalize(curr_json),
             "case {name}: curr JSON round-trip diverged (after tag-array sort)",
+        );
+    }
+}
+
+// =============================================================================
+// predicate_eval.json — evaluation pins.
+//
+// Per-case input: a `wire` PredicateWire + a `tags` array (wire-format
+// tag strings) + a `metadata` object + an `expected` boolean. The
+// substrate evaluates `Predicate::evaluate_unplanned(ctx)` against the
+// (tags, metadata) context; the result must match `expected`.
+//
+// This fixture is the ground-truth contract for cross-binding predicate
+// evaluators. SDKs that re-implement evaluation in their host language
+// (TS / Python / Go) load the same fixture and assert byte-identical
+// boolean results — pins agreement on leaf semantics (axis matching,
+// semver parsing, numeric coercion) AND composite recursion.
+// =============================================================================
+
+#[test]
+fn predicate_eval_fixture_matches_substrate() {
+    let raw = read_fixture("predicate_eval.json");
+    let v: Value = serde_json::from_str(&raw).expect("parse fixture");
+    let cases = v["cases"].as_array().expect("cases is array");
+    assert!(!cases.is_empty(), "fixture has zero cases");
+
+    for (i, case) in cases.iter().enumerate() {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+
+        // Decode the predicate from its wire form.
+        let wire: PredicateWire = serde_json::from_value(case["wire"].clone())
+            .unwrap_or_else(|e| panic!("case[{i}] {name}: deserialize wire: {e}"));
+        let pred: Predicate = wire
+            .into_predicate()
+            .unwrap_or_else(|e| panic!("case[{i}] {name}: into_predicate: {e}"));
+
+        // Build the evaluation context from the fixture's tags + metadata.
+        let tag_strings: Vec<String> = case["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect();
+        let tags: Vec<Tag> = tag_strings
+            .iter()
+            .map(|s| {
+                Tag::parse(s).unwrap_or_else(|e| {
+                    panic!("case[{i}] {name}: parse tag {s:?}: {e}")
+                })
+            })
+            .collect();
+
+        let metadata: BTreeMap<String, String> = case["metadata"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+            .collect();
+
+        let ctx = EvalContext::new(&tags, &metadata);
+
+        let expected = case["expected"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("case[{i}] {name}: `expected` not a bool"));
+
+        // `evaluate_unplanned` is the canonical SDK-portable path —
+        // declaration-order eval with no planner reordering.
+        let got_unplanned = pred.evaluate_unplanned(&ctx);
+        assert_eq!(
+            got_unplanned, expected,
+            "case[{i}] {name}: evaluate_unplanned diverged from expected\n  \
+             pred: {pred:?}\n  tags: {tag_strings:?}\n  metadata: {metadata:?}",
+        );
+
+        // Sanity: the planned variant must produce the same result.
+        // The planner reorders And / Or children by static cost; the
+        // boolean answer is invariant to reordering.
+        let got_planned = pred.evaluate(&ctx);
+        assert_eq!(
+            got_planned, expected,
+            "case[{i}] {name}: planned evaluate diverged from expected (planner-equivalence regression)",
         );
     }
 }

@@ -164,6 +164,7 @@ export {
   StandardPlacementBuilder,
   standardPlacement,
   placementFilterFromFn,
+  evaluatePredicate,
 } from './capability-enhancements';
 
 // Subnets (visibility enforcement).
