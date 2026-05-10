@@ -32,8 +32,9 @@ pub use broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 pub use capability::{
     AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter, CapabilityIndex,
     CapabilityIndexStats, CapabilityRequirement, CapabilitySet, CapabilitySetDiff,
-    CapabilityViews, GpuInfo, GpuVendor, HardwareCapabilities, IndexedNode, MetadataChange,
-    Modality, ModelCapability, ResourceLimits, Signature64, SoftwareCapabilities, ToolCapability,
+    CapabilityViews, CardinalityCache, CardinalityProvider, GpuInfo, GpuVendor,
+    HardwareCapabilities, IndexedNode, MetadataChange, Modality, ModelCapability,
+    ResourceLimits, Signature64, SoftwareCapabilities, ToolCapability,
 };
 
 // Capability System Plan Phase A foundations — the new typed-tag

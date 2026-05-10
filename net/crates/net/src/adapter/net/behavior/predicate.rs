@@ -1235,7 +1235,10 @@ impl Predicate {
     ///   (Phase D / E may add a metadata index; lands then).
     /// - Composites: sum of child dynamic costs (saturating).
     /// - `Not`: passes through inner cost.
-    fn dynamic_cost(&self, index: &crate::adapter::net::behavior::CapabilityIndex) -> u32 {
+    fn dynamic_cost<P: crate::adapter::net::behavior::CardinalityProvider>(
+        &self,
+        index: &P,
+    ) -> u32 {
         match self {
             // Tag-keyed leaves: static_cost / cardinality.
             Self::Exists { key }
@@ -1303,10 +1306,10 @@ impl Predicate {
     /// When the index is unavailable or unhelpful (zero-cardinality
     /// for every key — empty index), this falls back to behavior
     /// equivalent to [`Self::evaluate`].
-    pub fn evaluate_with_index(
+    pub fn evaluate_with_index<P: crate::adapter::net::behavior::CardinalityProvider>(
         &self,
         ctx: &EvalContext<'_>,
-        index: &crate::adapter::net::behavior::CapabilityIndex,
+        index: &P,
     ) -> bool {
         match self {
             Self::And(children) => Self::eval_all_with_index(children, ctx, index),
@@ -1318,10 +1321,10 @@ impl Predicate {
 
     /// `And` short-circuit evaluation in dynamic-cost-ascending
     /// child order.
-    fn eval_all_with_index(
+    fn eval_all_with_index<P: crate::adapter::net::behavior::CardinalityProvider>(
         children: &[Predicate],
         ctx: &EvalContext<'_>,
-        index: &crate::adapter::net::behavior::CapabilityIndex,
+        index: &P,
     ) -> bool {
         let mut order: Vec<usize> = (0..children.len()).collect();
         order.sort_by_key(|&i| children[i].dynamic_cost(index));
@@ -1340,10 +1343,10 @@ impl Predicate {
     /// short-circuit semantics: And short-circuits on first false
     /// (run rare-true clauses first), Or short-circuits on first
     /// true (run often-true clauses first).
-    fn eval_any_with_index(
+    fn eval_any_with_index<P: crate::adapter::net::behavior::CardinalityProvider>(
         children: &[Predicate],
         ctx: &EvalContext<'_>,
-        index: &crate::adapter::net::behavior::CapabilityIndex,
+        index: &P,
     ) -> bool {
         let mut order: Vec<usize> = (0..children.len()).collect();
         order.sort_by_key(|&i| children[i].dynamic_cost_or(index));
@@ -1384,9 +1387,9 @@ impl Predicate {
     /// typical predicate shapes (mostly leaf-or-mixed, not
     /// deeply-nested And-of-Or-of-And), the leaf-level
     /// asymmetry catches the load-bearing case.
-    fn dynamic_cost_or(
+    fn dynamic_cost_or<P: crate::adapter::net::behavior::CardinalityProvider>(
         &self,
-        index: &crate::adapter::net::behavior::CapabilityIndex,
+        index: &P,
     ) -> u32 {
         match self {
             Self::Exists { key }

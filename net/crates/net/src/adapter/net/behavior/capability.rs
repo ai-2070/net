@@ -3098,6 +3098,170 @@ impl Default for CapabilityIndex {
     }
 }
 
+// =============================================================================
+// CardinalityProvider trait + CardinalityCache — Phase 4 follow-on of
+// CAPABILITY_ENHANCEMENTS_PLAN.md "Cached cardinality estimates".
+//
+// `axis_cardinality` and `metadata_value_cardinality` on
+// `CapabilityIndex` are O(1) but each call hits DashMap — a sharded
+// lookup with atomic ops + per-shard locks. For the predicate
+// planner reading the same key many times in a hot evaluation
+// loop (one read per leaf-clause-per-candidate), the contention
+// cost compounds. `CardinalityCache` snapshots cardinality numbers
+// on first read and serves subsequent reads from a plain `HashMap`,
+// dropping the DashMap traffic.
+//
+// The cache is bound to a TTL — after `ttl` elapses, the next
+// access recomputes from the underlying index. Heartbeat-aligned
+// TTLs are the canonical use case (per-heartbeat planner snapshot).
+// =============================================================================
+
+/// Source of per-key cardinality data for the predicate query
+/// planner. Implemented by [`CapabilityIndex`] (direct, O(1) DashMap
+/// lookups) and [`CardinalityCache`] (TTL-cached, O(1) HashMap
+/// lookups after warmup).
+///
+/// The planner ([`crate::adapter::net::behavior::predicate::Predicate::evaluate_with_index`])
+/// is generic over this trait so callers pick whichever shape
+/// matches their workload — direct for single-shot evaluation,
+/// cache for hot-loop or long-lived service handlers.
+pub trait CardinalityProvider {
+    /// Distinct-value count for the given axis tag key. Returns 0
+    /// when the key is absent — planner treats this as "no data,
+    /// fall back to static cost".
+    fn axis_cardinality(&self, key: &crate::adapter::net::behavior::tag::TagKey) -> usize;
+
+    /// Distinct-value count for the given metadata key.
+    fn metadata_value_cardinality(&self, key: &str) -> usize;
+}
+
+impl CardinalityProvider for CapabilityIndex {
+    fn axis_cardinality(&self, key: &crate::adapter::net::behavior::tag::TagKey) -> usize {
+        // Inherent method (resolved via Rust's preference for
+        // inherent over trait when the receiver is concrete).
+        Self::axis_cardinality(self, key)
+    }
+
+    fn metadata_value_cardinality(&self, key: &str) -> usize {
+        Self::metadata_value_cardinality(self, key)
+    }
+}
+
+/// Per-call TTL cache around a [`CapabilityIndex`] for cardinality
+/// lookups.
+///
+/// Phase 4 follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`. Drops
+/// DashMap shard contention on hot loops over many predicates
+/// against the same index by snapshotting cardinality numbers
+/// into a plain `HashMap` on first access. Subsequent reads of
+/// the same key skip the DashMap entirely.
+///
+/// The cache invalidates after `ttl` elapses — the next lookup
+/// past the deadline triggers a refresh (clear + reset deadline);
+/// fresh lookups go to the index again. Heartbeat-aligned TTLs
+/// are the canonical use case: a service handler builds a cache
+/// at the start of each heartbeat-bounded request batch, evaluates
+/// many predicates against it, then lets it drop.
+///
+/// Concurrent access is safe — internal `parking_lot::Mutex`
+/// guards the HashMap. Two threads racing on the same uncached
+/// key may both compute via the index (the work is idempotent),
+/// but neither will read stale data.
+///
+/// ```ignore
+/// let cache = CardinalityCache::new(&index, Duration::from_secs(5));
+/// for candidate in candidates {
+///     let ctx = build_eval_context(candidate);
+///     if predicate.evaluate_with_index(&ctx, &cache) { /* ... */ }
+/// }
+/// ```
+pub struct CardinalityCache<'a> {
+    index: &'a CapabilityIndex,
+    ttl: Duration,
+    state: parking_lot::Mutex<CardinalityCacheState>,
+}
+
+/// Inner state guarded by the cache's mutex.
+struct CardinalityCacheState {
+    deadline: Instant,
+    axis: std::collections::HashMap<crate::adapter::net::behavior::tag::TagKey, usize>,
+    metadata: std::collections::HashMap<String, usize>,
+}
+
+impl<'a> CardinalityCache<'a> {
+    /// Build a cache bound to `index` with `ttl` lifetime. The
+    /// cache's deadline starts at `Instant::now() + ttl`.
+    pub fn new(index: &'a CapabilityIndex, ttl: Duration) -> Self {
+        Self {
+            index,
+            ttl,
+            state: parking_lot::Mutex::new(CardinalityCacheState {
+                deadline: Instant::now() + ttl,
+                axis: std::collections::HashMap::new(),
+                metadata: std::collections::HashMap::new(),
+            }),
+        }
+    }
+
+    /// True if the cache's TTL has elapsed.
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.state.lock().deadline
+    }
+
+    /// Force-refresh the cache: clear all entries and reset the
+    /// deadline to `now + ttl`. Called automatically when an
+    /// access notices the cache is expired; callers can invoke
+    /// directly to align with their own heartbeat.
+    pub fn refresh(&self) {
+        let mut guard = self.state.lock();
+        guard.deadline = Instant::now() + self.ttl;
+        guard.axis.clear();
+        guard.metadata.clear();
+    }
+}
+
+impl CardinalityProvider for CardinalityCache<'_> {
+    fn axis_cardinality(&self, key: &crate::adapter::net::behavior::tag::TagKey) -> usize {
+        // Acquire the lock once per call; check deadline and
+        // cache under the same critical section to avoid TOCTOU.
+        {
+            let mut guard = self.state.lock();
+            if Instant::now() >= guard.deadline {
+                guard.deadline = Instant::now() + self.ttl;
+                guard.axis.clear();
+                guard.metadata.clear();
+            }
+            if let Some(&v) = guard.axis.get(key) {
+                return v;
+            }
+        }
+        // Cache miss: compute via the underlying index without
+        // holding the cache lock (axis_cardinality acquires the
+        // index's own DashMap shard lock; cross-locking would
+        // serialize unnecessarily).
+        let v = self.index.axis_cardinality(key);
+        self.state.lock().axis.insert(key.clone(), v);
+        v
+    }
+
+    fn metadata_value_cardinality(&self, key: &str) -> usize {
+        {
+            let mut guard = self.state.lock();
+            if Instant::now() >= guard.deadline {
+                guard.deadline = Instant::now() + self.ttl;
+                guard.axis.clear();
+                guard.metadata.clear();
+            }
+            if let Some(&v) = guard.metadata.get(key) {
+                return v;
+            }
+        }
+        let v = self.index.metadata_value_cardinality(key);
+        self.state.lock().metadata.insert(key.to_string(), v);
+        v
+    }
+}
+
 /// Capability index statistics
 #[derive(Debug, Clone, Default)]
 pub struct CapabilityIndexStats {
@@ -3673,6 +3837,176 @@ mod tests {
         index.remove(2);
         assert_eq!(index.metadata_value_cardinality("intent"), 0);
         assert_eq!(index.metadata_value_cardinality("owner"), 0);
+    }
+
+    // ========================================================================
+    // CardinalityCache — Phase 4 follow-on of CAPABILITY_ENHANCEMENTS_PLAN.md
+    // "Cached cardinality estimates".
+    // ========================================================================
+
+    fn small_index_with_metadata() -> CapabilityIndex {
+        let index = CapabilityIndex::new();
+        for i in 0..5u64 {
+            let caps = CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_memory(1024 + i as u32))
+                .with_metadata("intent", "ml-training");
+            index_with_node(&index, i, caps);
+        }
+        index
+    }
+
+    #[test]
+    fn cardinality_cache_returns_same_values_as_index() {
+        // Pin: the cache is a transparent passthrough on first
+        // access — every key returns the same value as direct
+        // index lookup.
+        let index = small_index_with_metadata();
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
+
+        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        assert_eq!(
+            cache.axis_cardinality(&memory_key),
+            index.axis_cardinality(&memory_key),
+        );
+        assert_eq!(
+            cache.metadata_value_cardinality("intent"),
+            index.metadata_value_cardinality("intent"),
+        );
+    }
+
+    #[test]
+    fn cardinality_cache_serves_repeat_reads_from_cache() {
+        // Pin: a second read of the same key returns the cached
+        // value even if the underlying index changes — the cache
+        // hides updates until the TTL elapses or refresh() is
+        // called explicitly.
+        let index = small_index_with_metadata();
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
+
+        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        let first = cache.axis_cardinality(&memory_key);
+
+        // Mutate the underlying index. The cache shouldn't see this
+        // until refresh / TTL elapse.
+        index_with_node(
+            &index,
+            999,
+            CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_memory(99999)),
+        );
+
+        let second = cache.axis_cardinality(&memory_key);
+        assert_eq!(second, first, "cached value should not reflect post-cache mutation");
+    }
+
+    #[test]
+    fn cardinality_cache_refresh_picks_up_new_data() {
+        // Pin: refresh() invalidates the cache; the next access
+        // reads fresh data from the index.
+        let index = small_index_with_metadata();
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
+
+        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        let first = cache.axis_cardinality(&memory_key);
+
+        // Mutate index, then explicitly refresh.
+        index_with_node(
+            &index,
+            999,
+            CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_memory(99999)),
+        );
+        cache.refresh();
+
+        let after_refresh = cache.axis_cardinality(&memory_key);
+        assert_eq!(after_refresh, first + 1, "post-refresh read should see the new node");
+    }
+
+    #[test]
+    fn cardinality_cache_auto_refresh_on_ttl_expiry() {
+        // Pin: the cache auto-refreshes when its TTL elapses.
+        let index = small_index_with_metadata();
+        // 1 ms TTL — guarantees expiry between two ordinary reads.
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_millis(1));
+
+        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        let first = cache.axis_cardinality(&memory_key);
+
+        // Mutate index, then sleep past the TTL.
+        index_with_node(
+            &index,
+            999,
+            CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_memory(99999)),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let after_expiry = cache.axis_cardinality(&memory_key);
+        assert_eq!(
+            after_expiry,
+            first + 1,
+            "post-TTL-expiry read should see the new node",
+        );
+    }
+
+    #[test]
+    fn cardinality_cache_is_expired_reflects_deadline() {
+        let index = CapabilityIndex::new();
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_millis(1));
+        // Fresh cache: not expired.
+        assert!(!cache.is_expired());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(cache.is_expired());
+    }
+
+    #[test]
+    fn cardinality_cache_works_as_planner_provider() {
+        // Pin: the planner accepts &CardinalityCache transparently
+        // (drop-in replacement for &CapabilityIndex).
+        use crate::adapter::net::behavior::Predicate;
+        let index = small_index_with_metadata();
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
+
+        let pred = Predicate::And(vec![
+            Predicate::Exists {
+                key: crate::adapter::net::behavior::tag::TagKey::new(
+                    crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                    "memory_mb",
+                ),
+            },
+            Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+        ]);
+
+        // Use the cache as the planner provider; pin equivalence
+        // with the direct-index path.
+        let candidate_caps = CapabilitySet::new()
+            .with_hardware(HardwareCapabilities::new().with_memory(2048))
+            .with_metadata("intent", "ml-training");
+        let tags: Vec<crate::adapter::net::behavior::Tag> =
+            candidate_caps.tags.iter().cloned().collect();
+        let ctx = crate::adapter::net::behavior::EvalContext::new(
+            &tags,
+            &candidate_caps.metadata,
+        );
+        assert_eq!(
+            pred.evaluate_with_index(&ctx, &cache),
+            pred.evaluate_with_index(&ctx, &index),
+        );
     }
 
     #[test]
