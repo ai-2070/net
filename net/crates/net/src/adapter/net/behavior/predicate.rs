@@ -1103,6 +1103,129 @@ impl Predicate {
             Self::Not(inner) => inner.static_cost(),
         }
     }
+
+    /// Cardinality-aware cost estimate. Refines [`Self::static_cost`]
+    /// with per-key distinct-value counts from a `CapabilityIndex`.
+    ///
+    /// Phase 4 follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`. A
+    /// leaf clause keyed on a high-cardinality tag (many distinct
+    /// values across nodes) is more selective than one keyed on
+    /// a low-cardinality tag — running it first short-circuits
+    /// faster on the common-mismatch case.
+    ///
+    /// The intuition: an `Equals(key, v)` clause has roughly
+    /// `1 / cardinality` chance of matching a uniformly-random
+    /// node, so expected work is `static_cost / cardinality`.
+    ///
+    /// Behavior:
+    ///
+    /// - Tag-keyed leaves (Exists / Equals / Numeric* / Semver* /
+    ///   String*): `static_cost / max(1, cardinality)`. A
+    ///   cardinality of zero (key not yet indexed) falls back to
+    ///   raw `static_cost` — conservative.
+    /// - Metadata leaves: `static_cost` unchanged. The
+    ///   `CapabilityIndex` doesn't track metadata cardinality
+    ///   (Phase D / E may add a metadata index; lands then).
+    /// - Composites: sum of child dynamic costs (saturating).
+    /// - `Not`: passes through inner cost.
+    fn dynamic_cost(&self, index: &crate::adapter::net::behavior::CapabilityIndex) -> u32 {
+        match self {
+            // Tag-keyed leaves: static_cost / cardinality.
+            Self::Exists { key }
+            | Self::Equals { key, .. }
+            | Self::NumericAtLeast { key, .. }
+            | Self::NumericAtMost { key, .. }
+            | Self::NumericInRange { key, .. }
+            | Self::SemverAtLeast { key, .. }
+            | Self::SemverAtMost { key, .. }
+            | Self::SemverCompatible { key, .. }
+            | Self::StringPrefix { key, .. }
+            | Self::StringMatches { key, .. } => {
+                let static_c = self.static_cost();
+                let cardinality = index.axis_cardinality(key);
+                if cardinality > 0 {
+                    static_c.saturating_div((cardinality as u32).max(1))
+                } else {
+                    // Key absent from the index — could be a brand-new
+                    // tag the substrate hasn't observed yet. Conservatively
+                    // keep static_cost so we don't underestimate work.
+                    static_c
+                }
+            }
+            // Metadata leaves: no cardinality data available.
+            Self::MetadataExists { .. }
+            | Self::MetadataEquals { .. }
+            | Self::MetadataMatches { .. }
+            | Self::MetadataNumericAtLeast { .. } => self.static_cost(),
+            // Composites: sum of children's dynamic costs.
+            Self::And(c) | Self::Or(c) => c
+                .iter()
+                .map(|c| c.dynamic_cost(index))
+                .fold(0u32, |a, b| a.saturating_add(b)),
+            Self::Not(inner) => inner.dynamic_cost(index),
+        }
+    }
+
+    /// Evaluate against `ctx`, using `index`'s per-key cardinality
+    /// data to refine the planner's clause ordering at every
+    /// `And` / `Or` node.
+    ///
+    /// Phase 4 follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+    /// Produces the same boolean result as
+    /// [`Self::evaluate_unplanned`] for any `(ast, ctx)`; the index
+    /// only changes execution order, not semantics. Pinned in the
+    /// `index_planner_evaluate_matches_unplanned_*` property tests.
+    ///
+    /// When the index is available, prefer this entry point over
+    /// [`Self::evaluate`] (static-cost planner) — cardinality data
+    /// catches selective clauses the static planner misses (e.g.,
+    /// a `MetadataEquals` happens to be the cheapest leaf
+    /// statically, but a high-cardinality `Equals` on an axis tag
+    /// is even more selective in this index's data).
+    ///
+    /// When the index is unavailable or unhelpful (zero-cardinality
+    /// for every key — empty index), this falls back to behavior
+    /// equivalent to [`Self::evaluate`].
+    pub fn evaluate_with_index(
+        &self,
+        ctx: &EvalContext<'_>,
+        index: &crate::adapter::net::behavior::CapabilityIndex,
+    ) -> bool {
+        match self {
+            Self::And(children) => Self::eval_all_with_index(children, ctx, index),
+            Self::Or(children) => Self::eval_any_with_index(children, ctx, index),
+            Self::Not(inner) => !inner.evaluate_with_index(ctx, index),
+            other => other.evaluate_leaf(ctx),
+        }
+    }
+
+    /// `And` short-circuit evaluation in dynamic-cost-ascending
+    /// child order.
+    fn eval_all_with_index(
+        children: &[Predicate],
+        ctx: &EvalContext<'_>,
+        index: &crate::adapter::net::behavior::CapabilityIndex,
+    ) -> bool {
+        let mut order: Vec<usize> = (0..children.len()).collect();
+        order.sort_by_key(|&i| children[i].dynamic_cost(index));
+        order
+            .into_iter()
+            .all(|i| children[i].evaluate_with_index(ctx, index))
+    }
+
+    /// `Or` short-circuit evaluation in dynamic-cost-ascending
+    /// child order.
+    fn eval_any_with_index(
+        children: &[Predicate],
+        ctx: &EvalContext<'_>,
+        index: &crate::adapter::net::behavior::CapabilityIndex,
+    ) -> bool {
+        let mut order: Vec<usize> = (0..children.len()).collect();
+        order.sort_by_key(|&i| children[i].dynamic_cost(index));
+        order
+            .into_iter()
+            .any(|i| children[i].evaluate_with_index(ctx, index))
+    }
 }
 
 // =============================================================================
@@ -2756,5 +2879,239 @@ mod tests {
             json.contains("\"value\":\"ml-training\""),
             "missing value: {json}",
         );
+    }
+
+    // ========================================================================
+    // Cardinality-aware planner — Phase 4 follow-on of
+    // CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    use crate::adapter::net::behavior::{
+        CapabilityAnnouncement, CapabilityIndex, CapabilitySet, GpuInfo, GpuVendor,
+        HardwareCapabilities,
+    };
+    use crate::adapter::net::identity::EntityId;
+
+    fn entity() -> EntityId {
+        EntityId::from_bytes([0u8; 32])
+    }
+
+    /// Build a CapabilityIndex with `n` distinct memory_mb values.
+    /// Used to give `axis_cardinality(hardware.memory_mb)` a known
+    /// target value.
+    fn index_with_distinct_memory_values(n: u32) -> CapabilityIndex {
+        let index = CapabilityIndex::new();
+        for i in 0..n {
+            let caps = CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_memory(1024 + i));
+            let ann = CapabilityAnnouncement::new(i as u64, entity(), 1, caps);
+            index.index(ann);
+        }
+        index
+    }
+
+    /// Build a CapabilityIndex with low-cardinality gpu.vendor
+    /// (only 2 distinct values across many nodes).
+    fn index_with_low_card_gpu_vendor() -> CapabilityIndex {
+        let index = CapabilityIndex::new();
+        let vendors = [GpuVendor::Nvidia, GpuVendor::Amd];
+        for i in 0..20u64 {
+            let caps = CapabilitySet::new().with_hardware(
+                HardwareCapabilities::new()
+                    .with_memory(1024 + i as u32) // unique memory_mb
+                    .with_gpu(GpuInfo::new(vendors[i as usize % 2], "x", 1024)),
+            );
+            let ann = CapabilityAnnouncement::new(i, entity(), 1, caps);
+            index.index(ann);
+        }
+        index
+    }
+
+    #[test]
+    fn dynamic_cost_lowers_for_high_cardinality_keys() {
+        // Pin the planner's intuition: a key with high cardinality
+        // (memory_mb across 100 distinct values) gets a much
+        // lower dynamic cost than a key with low cardinality
+        // (gpu.vendor with 2 values).
+        let index = index_with_low_card_gpu_vendor();
+
+        let high_card_clause = Predicate::Equals {
+            key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+            value: "1029".into(),
+        };
+        let low_card_clause = Predicate::Equals {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
+            value: "nvidia".into(),
+        };
+
+        let high_dynamic = high_card_clause.dynamic_cost(&index);
+        let low_dynamic = low_card_clause.dynamic_cost(&index);
+        // Both have the same static_cost (Equals → tier-2 cost),
+        // but high-cardinality divides by 20 while low-cardinality
+        // divides by 2 — high-cardinality clause should run first.
+        assert!(
+            high_dynamic < low_dynamic,
+            "expected high-card < low-card; got high={high_dynamic} low={low_dynamic}",
+        );
+    }
+
+    #[test]
+    fn dynamic_cost_falls_back_to_static_for_unknown_keys() {
+        let index = index_with_distinct_memory_values(10);
+        let unknown_clause = Predicate::Equals {
+            key: TagKey::new(TaxonomyAxis::Devices, "qpu"),
+            value: "rigetti-aspen".into(),
+        };
+        // Devices.qpu doesn't exist in the index → cardinality 0
+        // → fallback to static_cost. Equals is tier-2 cost = 21.
+        assert_eq!(unknown_clause.dynamic_cost(&index), unknown_clause.static_cost());
+    }
+
+    #[test]
+    fn dynamic_cost_falls_back_to_static_on_empty_index() {
+        let index = CapabilityIndex::new();
+        let pred = sample_complex_predicate();
+        // Every leaf hits cardinality=0 (empty index), so dynamic
+        // cost equals static cost recursively.
+        assert_eq!(pred.dynamic_cost(&index), pred.static_cost());
+    }
+
+    #[test]
+    fn dynamic_cost_for_metadata_leaves_uses_static_cost() {
+        // The CapabilityIndex doesn't track metadata cardinality
+        // today; metadata leaves should retain their static cost.
+        let index = index_with_distinct_memory_values(100);
+        let pred = Predicate::MetadataEquals {
+            key: "intent".into(),
+            value: "ml-training".into(),
+        };
+        assert_eq!(pred.dynamic_cost(&index), pred.static_cost());
+    }
+
+    #[test]
+    fn evaluate_with_index_matches_evaluate_unplanned_canonical_inputs() {
+        // Pin: cardinality-aware planner produces identical
+        // boolean results as unplanned eval. Reordering is a pure
+        // local optimization.
+        let index = index_with_low_card_gpu_vendor();
+
+        let predicates: Vec<Predicate> = vec![
+            // Single leaf
+            Predicate::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+            },
+            // And of axis tag clauses with mixed cardinalities
+            Predicate::And(vec![
+                Predicate::Equals {
+                    key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
+                    value: "nvidia".into(),
+                },
+                Predicate::NumericAtLeast {
+                    key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+                    threshold: 1024.0,
+                },
+            ]),
+            // Nested with Not
+            Predicate::And(vec![
+                Predicate::Or(vec![
+                    Predicate::Exists {
+                        key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+                    },
+                    Predicate::MetadataEquals {
+                        key: "intent".into(),
+                        value: "ml-training".into(),
+                    },
+                ]),
+                Predicate::Not(Box::new(Predicate::Equals {
+                    key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
+                    value: "intel".into(),
+                })),
+            ]),
+        ];
+
+        let contexts: Vec<(Vec<Tag>, BTreeMap<String, String>)> = vec![
+            (vec![], BTreeMap::new()),
+            (
+                vec![
+                    axis_present(TaxonomyAxis::Hardware, "gpu"),
+                    axis_eq(TaxonomyAxis::Hardware, "gpu.vendor", "nvidia"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "65536"),
+                ],
+                meta_with(&[("intent", "ml-training")]),
+            ),
+            (
+                vec![axis_eq(TaxonomyAxis::Hardware, "gpu.vendor", "amd")],
+                BTreeMap::new(),
+            ),
+        ];
+
+        for (i, pred) in predicates.iter().enumerate() {
+            for (j, (tags, meta)) in contexts.iter().enumerate() {
+                let cx = ctx(tags, meta);
+                let with_index = pred.evaluate_with_index(&cx, &index);
+                let unplanned = pred.evaluate_unplanned(&cx);
+                assert_eq!(
+                    with_index, unplanned,
+                    "pred[{i}] ctx[{j}]: with_index={with_index} != unplanned={unplanned}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_with_index_empty_index_matches_static_planner() {
+        // Empty index → cardinality 0 for every key → fallback to
+        // static cost throughout. Result equals plain evaluate().
+        let index = CapabilityIndex::new();
+        let pred = sample_complex_predicate();
+
+        let tags: Vec<Tag> = vec![
+            axis_present(TaxonomyAxis::Hardware, "gpu"),
+            axis_eq(TaxonomyAxis::Hardware, "memory_mb", "131072"),
+            axis_eq(TaxonomyAxis::Software, "runtime.python", "3.11.5"),
+        ];
+        let meta = meta_with(&[("intent", "ml-training")]);
+        let cx = ctx(&tags, &meta);
+
+        assert_eq!(pred.evaluate_with_index(&cx, &index), pred.evaluate(&cx));
+    }
+
+    #[test]
+    fn evaluate_with_index_handles_deeply_nested_correctly() {
+        // 3-level nest with cardinality data. Pin: result matches
+        // unplanned eval; the planner doesn't get confused by
+        // depth.
+        let index = index_with_low_card_gpu_vendor();
+        let pred = Predicate::And(vec![
+            Predicate::Or(vec![
+                Predicate::And(vec![
+                    Predicate::Equals {
+                        key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
+                        value: "nvidia".into(),
+                    },
+                    Predicate::NumericAtLeast {
+                        key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+                        threshold: 1024.0,
+                    },
+                ]),
+                Predicate::Not(Box::new(Predicate::Exists {
+                    key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+                })),
+            ]),
+            Predicate::MetadataExists {
+                key: "intent".into(),
+            },
+        ]);
+
+        let tags: Vec<Tag> = vec![
+            axis_eq(TaxonomyAxis::Hardware, "gpu.vendor", "nvidia"),
+            axis_eq(TaxonomyAxis::Hardware, "memory_mb", "2048"),
+        ];
+        let meta = meta_with(&[("intent", "ml-training")]);
+        let cx = ctx(&tags, &meta);
+
+        let with_index = pred.evaluate_with_index(&cx, &index);
+        let unplanned = pred.evaluate_unplanned(&cx);
+        assert_eq!(with_index, unplanned);
     }
 }
