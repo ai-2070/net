@@ -8,8 +8,10 @@ Latest release: [v0.10 — "Killing Moon" Phase III](../docs/RELEASE_v0.10_KILLI
 
 ## Files
 
-- `net.h` — the header
-- `libnet.so` (Linux) / `libnet.dylib` (macOS) / `net.dll` (Windows) — the library
+- `net.h` — narrow event-bus surface (init / ingest / poll / stats / shutdown).
+- `net.go.h` — broader mesh + compute surface (sessions, channels, capabilities, NAT, daemon dispatch, custom placement filters, daemon caps, predicate helpers, capability validation, predicate debug session). In-crate mirror of [`go/net.h`](../../../../go/net.h) at the repo root.
+- `net_rpc.h` — nRPC C SDK (request/response surface for the separate `libnet_rpc` cdylib). Independent header guard (`NET_RPC_H`) so it composes cleanly with the others in a single TU.
+- Libraries: `libnet.{so,dylib,dll}` (main) + `libnet_compute.{so,dylib,dll}` (compute) + `libnet_rpc.{so,dylib,dll}` (nRPC). Build with `cargo build --release --features ffi,net` for `libnet`; `-p net-compute-ffi` and `-p net-rpc-ffi` for the others.
 
 ## Build
 
@@ -483,20 +485,27 @@ net_mesh_stream_t   // Opaque per-peer stream handle.
 
 nRPC is the request/response convention layer (deadlines,
 queue-group fan-out, response streaming, end-to-end cancellation)
-riding on top of the pub/sub mesh. The C SDK at `net.h` does
-**not** expose the nRPC surface today; the C ABI lives in a
-separate cdylib at [`bindings/go/rpc-ffi`](../bindings/go/rpc-ffi)
-that's primarily consumed by the Go binding but is callable from
-any C-ABI consumer.
+riding on top of the pub/sub mesh. Lives in a separate cdylib at
+[`bindings/go/rpc-ffi`](../bindings/go/rpc-ffi) — the Go binding
+consumes it, but the ABI is callable from any C-ABI consumer.
 
 **Library:** `libnet_rpc` (cdylib + staticlib). Build:
 
 ```bash
 cargo build --release -p net-rpc-ffi
-# Header: there's no shipped .h for libnet_rpc today — the canonical
-# C signatures live in:
-#   bindings/go/net/mesh_rpc.go   (cgo include block — drop-in template)
-#   bindings/go/rpc-ffi/src/lib.rs (Rust definitions of every export)
+```
+
+**Header:** [`net_rpc.h`](./net_rpc.h) — the canonical C SDK
+header for nRPC. Drop-in for C / C++ / Zig / Swift / Java JNI /
+etc.; identical declarations to the cgo block in
+`bindings/go/net/mesh_rpc.go`. Same one-header-per-translation-
+unit discipline as `net.h` / `net.go.h` (different `#ifndef`
+guard — `NET_RPC_H` — so combining with the mesh headers in one
+TU is fine).
+
+```c
+#include "net_rpc.h"
+gcc -o app app.c -L target/release -lnet_rpc -lpthread -ldl -lm
 ```
 
 **ABI version:** consumers SHOULD call `net_rpc_abi_version() ->
@@ -504,40 +513,24 @@ uint32_t` at process init and refuse to load on mismatch. Version
 `0x0001` covers Phase B5 (lifecycle + unary call + serve +
 service discovery) plus B6 (streaming + ABI version stamp).
 
-**Entry-point families:**
+**Entry-point families** (full per-function doc-comments in
+`net_rpc.h`):
 
-```c
-// Lifecycle.
-extern uint32_t net_rpc_abi_version(void);
-extern void     net_rpc_set_handler_dispatcher(RpcHandlerFn dispatcher);
-extern MeshRpcHandle* net_rpc_new(void* node_arc);  // consumes Arc<MeshNode>
-extern void           net_rpc_free(MeshRpcHandle*);
+| Family | Functions |
+|---|---|
+| Lifecycle | `net_rpc_abi_version`, `net_rpc_new`, `net_rpc_free`, `net_rpc_id` |
+| Free helpers | `net_rpc_free_cstring`, `net_rpc_response_free`, `net_rpc_find_service_nodes_free` |
+| Cancellation | `net_rpc_reserve_cancel_token`, `net_rpc_cancel_call` |
+| Handler dispatcher | `net_rpc_set_handler_dispatcher`, `net_rpc_reserve_handler_id`, `RpcHandlerFn` typedef |
+| Unary calls | `net_rpc_call`, `net_rpc_call_service` |
+| Service discovery | `net_rpc_find_service_nodes` |
+| Serve | `net_rpc_serve`, `net_rpc_serve_handle_id`, `net_rpc_serve_handle_close`, `net_rpc_serve_handle_free` |
+| Streaming | `net_rpc_call_streaming`, `net_rpc_stream_next`, `net_rpc_stream_grant`, `net_rpc_stream_call_id`, `net_rpc_stream_close`, `net_rpc_stream_free` |
 
-// Unary calls — synchronous (block_on under the hood).
-extern int net_rpc_call(MeshRpcHandle*, uint64_t target, ...);
-extern int net_rpc_call_service(MeshRpcHandle*, ...);
-
-// Service discovery.
-extern int net_rpc_find_service_nodes(MeshRpcHandle*, ...);
-
-// Serve — caller registers a handler in its own registry keyed
-// on the returned handler_id, then `net_rpc_set_handler_dispatcher`
-// gets invoked back into the consumer with that id.
-extern ServeHandleC* net_rpc_serve(MeshRpcHandle*, ...);
-extern void          net_rpc_serve_handle_close(ServeHandleC*);
-extern void          net_rpc_serve_handle_free(ServeHandleC*);
-
-// Streaming — opaque RpcStream handle, blocking next, explicit grant.
-extern int  net_rpc_call_streaming(MeshRpcHandle*, ...);
-extern int  net_rpc_stream_next(RpcStreamHandleC*, ...);
-extern int  net_rpc_stream_grant(RpcStreamHandleC*, uint32_t amount);
-extern void net_rpc_stream_close(RpcStreamHandleC*);
-extern void net_rpc_stream_free(RpcStreamHandleC*);
-
-// Ownership: every Vec<u8> / CString returned out-of-band is
-// freed via the matching net_rpc_response_free /
-// net_rpc_find_service_nodes_free / net_rpc_free_cstring.
-```
+Ownership: every `uint8_t*` / `char*` / `uint64_t*` returned
+out-of-band is freed via the matching
+`net_rpc_response_free` / `net_rpc_free_cstring` /
+`net_rpc_find_service_nodes_free`.
 
 **Error codes (`int` return):**
 
