@@ -515,7 +515,7 @@ pub fn validate_capabilities_against(
     // user's `with_metadata("intent", …)` smuggling onto a
     // scheduler-reserved key emitted no warning. Walk both.
     for key in caps.metadata.keys() {
-        if schema.metadata_reserved.iter().any(|r| *r == key.as_str()) {
+        if schema.metadata_reserved.contains(&key.as_str()) {
             report
                 .warnings
                 .push(ValidationWarning::MetadataReservedKey { key: key.clone() });

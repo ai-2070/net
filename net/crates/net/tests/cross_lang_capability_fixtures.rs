@@ -475,6 +475,17 @@ fn validation_warning_to_wire(w: &ValidationWarning) -> Value {
             "kind": "legacy_tag",
             "tag": tag,
         }),
+        // Metadata-key reservation warnings. Wire shape
+        // mirrors `src/ffi/schema.rs`.
+        ValidationWarning::MetadataReservedKey { key } => serde_json::json!({
+            "kind": "metadata_reserved_key",
+            "key": key,
+        }),
+        ValidationWarning::MetadataReservedPrefix { key, prefix } => serde_json::json!({
+            "kind": "metadata_reserved_prefix",
+            "key": key,
+            "prefix": prefix,
+        }),
     }
 }
 
