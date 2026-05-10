@@ -1178,15 +1178,25 @@ func semverCompatibleGo(lhs, rhs semverTriple) bool {
 	return rhs[0] == lhs[0]
 }
 
-// axisTagValue returns the matched value for an axis-keyed tag, or
-// the empty string for AxisPresent. Returns ("", false) when no tag
-// matches.
+// axisTagValue returns the matched ``AxisValue`` tag's value, or
+// ``("", false)`` when no value-bearing tag matches the (axis, key)
+// pair.
+//
+// Q14: pre-fix this returned ``("", true)`` for AxisPresent tags
+// (e.g. ``hardware.gpu`` with no separator), which let value
+// predicates (Equals, NumericAtLeast, StringPrefix, …)
+// spuriously match presence-only tags. The Rust substrate
+// requires ``Tag::AxisValue`` for those predicates and never
+// pretends a presence tag has an empty value. Use
+// ``axisTagPresent`` for ``Exists`` semantics.
+//
+// A node may carry BOTH an AxisPresent and an AxisValue tag for
+// the same (axis, key); the value scan continues past presence
+// matches so the value form wins. Mirrors the Rust substrate's
+// full-tag-list iteration.
 func axisTagValue(tags []string, key TagKey) (string, bool) {
 	prefix := string(key.Axis) + "." + key.Key
 	for _, wire := range tags {
-		if wire == prefix {
-			return "", true
-		}
 		if len(wire) <= len(prefix) || !strings.HasPrefix(wire, prefix) {
 			continue
 		}
@@ -1196,6 +1206,26 @@ func axisTagValue(tags []string, key TagKey) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// axisTagPresent reports whether any AxisPresent or AxisValue tag
+// matches the (axis, key) pair. Used by `Exists` predicates which
+// match either form. Q14: split out from ``axisTagValue`` so the
+// latter can correctly skip AxisPresent for value predicates.
+func axisTagPresent(tags []string, key TagKey) bool {
+	prefix := string(key.Axis) + "." + key.Key
+	for _, wire := range tags {
+		if wire == prefix {
+			return true
+		}
+		if len(wire) > len(prefix) && strings.HasPrefix(wire, prefix) {
+			sep := wire[len(prefix)]
+			if sep == '=' || sep == ':' {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Q13: numeric predicates parse via Go's `strconv.ParseFloat`,
@@ -1225,8 +1255,10 @@ func parseFloat(s string) (float64, bool) {
 func evalLeaf(p *Predicate, tags []string, metadata map[string]string) bool {
 	switch p.kind {
 	case pkExists:
-		_, ok := axisTagValue(tags, p.key)
-		return ok
+		// Q14: Exists matches either AxisPresent or AxisValue;
+		// route through `axisTagPresent` so the AxisPresent
+		// case isn't conflated with an empty-string value.
+		return axisTagPresent(tags, p.key)
 	case pkEquals:
 		v, ok := axisTagValue(tags, p.key)
 		return ok && v == p.value
