@@ -510,7 +510,7 @@ console.log(renderDebugReport(safe));
 const filter = placementFilterFromFn((cand) =>
   evaluatePredicate(pred, cand.tags, cand.metadata),
 );
-const placement = standardPlacement({ customFilterId: filter.id });
+const placement = standardPlacement().withCustomFilterId(filter.id).build();
 ```
 
 The wire format is byte-identical across all five bindings (Rust /
