@@ -1050,14 +1050,17 @@ function semverCompatible(lhs: SemverTriple, rhs: SemverTriple): boolean {
 }
 
 /**
- * Find the value of an axis-keyed tag in the wire-format tag list,
- * if any. AxisPresent tags ("hardware.gpu") have no value — the
- * substrate's `match_axis_tag` calls `value_pred("")` for those, so
- * SDK-side leaf evaluators that need a value (e.g. numeric_at_least)
- * naturally fail when the tag is AxisPresent.
+ * Find the value of an `AxisValue` tag in the wire-format tag list,
+ * if any. Mirrors the substrate's `match_axis_tag`
+ * (`predicate.rs:1749-1757`), which explicitly skips `AxisPresent`
+ * tags for value predicates: feeding `""` through `value_pred` would
+ * let an empty-string `Equals` / `StringPrefix` / `StringMatches`
+ * predicate spuriously match a presence-only tag. Use
+ * {@link axisTagPresent} for the `exists` predicate path.
  *
- * Returns the matched value string for AxisValue tags, the empty
- * string for AxisPresent tags, or `undefined` if no tag matches.
+ * Returns the matched value string for AxisValue tags, or
+ * `undefined` if no AxisValue tag matches (including the case where
+ * only an AxisPresent tag for the same key exists).
  */
 function axisTagValue(
   tags: readonly string[],
@@ -1065,10 +1068,10 @@ function axisTagValue(
 ): string | undefined {
   const prefix = `${key.axis}.${key.key}`;
   for (const wire of tags) {
-    if (wire === prefix) return '';
     // Match `<axis>.<key>=<value>` or `<axis>.<key>:<value>`. Reject
     // longer key-prefixes (`hardware.gpu` should NOT match
-    // `hardware.gpu.vendor=nvidia` — that's a different key).
+    // `hardware.gpu.vendor=nvidia` — that's a different key) and
+    // skip the AxisPresent form (`<axis>.<key>` with no separator).
     if (wire.length <= prefix.length) continue;
     if (!wire.startsWith(prefix)) continue;
     const sep = wire.charAt(prefix.length);
@@ -1079,6 +1082,25 @@ function axisTagValue(
   return undefined;
 }
 
+/**
+ * Test whether the wire-format tag list carries any tag for `key` —
+ * either an `AxisValue` (`<axis>.<key>=<value>`) or an `AxisPresent`
+ * (`<axis>.<key>`). Mirrors the substrate's `Predicate::Exists` leaf,
+ * which routes through `evaluate_leaf`'s presence-aware path and
+ * accepts both forms.
+ */
+function axisTagPresent(tags: readonly string[], key: TagKey): boolean {
+  const prefix = `${key.axis}.${key.key}`;
+  for (const wire of tags) {
+    if (wire === prefix) return true;
+    if (wire.length <= prefix.length) continue;
+    if (!wire.startsWith(prefix)) continue;
+    const sep = wire.charAt(prefix.length);
+    if (sep === '=' || sep === ':') return true;
+  }
+  return false;
+}
+
 function evalLeaf(
   pred: Predicate,
   tags: readonly string[],
@@ -1086,7 +1108,7 @@ function evalLeaf(
 ): boolean {
   switch (pred.type) {
     case 'exists': {
-      return axisTagValue(tags, pred.key) !== undefined;
+      return axisTagPresent(tags, pred.key);
     }
     case 'equals': {
       const v = axisTagValue(tags, pred.key);

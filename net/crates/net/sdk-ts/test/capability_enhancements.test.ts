@@ -590,6 +590,43 @@ describe('metadata predicates ignore prototype-chain properties (regression)', (
   });
 });
 
+// N-1 regression: AxisPresent tags ("hardware.gpu" with no separator)
+// must satisfy `Exists` but must NOT satisfy any value predicate
+// (Equals / StringPrefix / StringMatches), even when the predicate's
+// value/prefix/pattern is the empty string. Mirrors the substrate's
+// `match_axis_tag` (predicate.rs:1749-1757) which explicitly skips
+// `AxisPresent` for value-predicate evaluation. Pre-fix:
+// `axisTagValue` returned "" for an AxisPresent tag, and
+// `equals(_, "")` etc. then matched it.
+describe('AxisPresent tags do not satisfy value predicates (N-1 regression)', () => {
+  const tags = ['hardware.gpu']; // AxisPresent — no separator, no value
+  const metadata: Record<string, string> = {};
+  const key = tagKey('hardware', 'gpu');
+
+  it('exists matches AxisPresent', () => {
+    expect(evaluatePredicate(p.exists(key), tags, metadata)).toBe(true);
+  });
+
+  it('equals(_, "") does NOT match AxisPresent', () => {
+    expect(evaluatePredicate(p.equals(key, ''), tags, metadata)).toBe(false);
+  });
+
+  it('stringPrefix(_, "") does NOT match AxisPresent', () => {
+    expect(evaluatePredicate(p.stringPrefix(key, ''), tags, metadata)).toBe(false);
+  });
+
+  it('stringMatches(_, "") does NOT match AxisPresent', () => {
+    expect(evaluatePredicate(p.stringMatches(key, ''), tags, metadata)).toBe(false);
+  });
+
+  it('AxisValue tag still satisfies value predicates normally', () => {
+    const valueTags = ['hardware.gpu=nvidia-h100'];
+    expect(evaluatePredicate(p.equals(key, 'nvidia-h100'), valueTags, metadata)).toBe(true);
+    expect(evaluatePredicate(p.stringPrefix(key, 'nvidia'), valueTags, metadata)).toBe(true);
+    expect(evaluatePredicate(p.stringMatches(key, 'h100'), valueTags, metadata)).toBe(true);
+  });
+});
+
 describe('placementFilterFromFn (cross-binding fixture)', () => {
   const fx = loadJson<EvalFixture>(EVAL_FIXTURE, 'predicate eval (placement filter)');
 
