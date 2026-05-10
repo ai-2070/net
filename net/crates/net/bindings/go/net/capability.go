@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -1515,6 +1516,119 @@ func PredicateDebugReportFromEvaluations(
 		Matched:         matched,
 		ClauseStats:     stats,
 	}
+}
+
+// ============================================================================
+// Redaction + JSON round-trip — Phase 9d redaction.
+// ============================================================================
+
+// Pre-compiled regexes for the three redactable metadata-clause
+// label shapes.
+var (
+	metaEqualsRe  = regexp.MustCompile(`^MetadataEquals\(([^=]+)=(.+)\)$`)
+	metaMatchesRe = regexp.MustCompile(`^MetadataMatches\((.+) contains "(.*)"\)$`)
+	metaNumericRe = regexp.MustCompile(`^MetadataNumericAtLeast\((.+) >= (.+)\)$`)
+)
+
+// RedactMetadataKeys rewrites metadata-clause values in a debug
+// report to hide sensitive predicate values before persistence.
+//
+// Walks the report's ClauseStats and rewrites any label whose
+// metadata key is in `keys`:
+//
+//   - MetadataEquals(<key>=<value>) -> MetadataEquals(<key>=<redacted>)
+//   - MetadataMatches(<key> contains "<pattern>") -> MetadataMatches(<key> contains "<redacted>")
+//   - MetadataNumericAtLeast(<key> >= <threshold>) -> MetadataNumericAtLeast(<key> >= <redacted>)
+//   - MetadataExists(<key>) — unchanged (no value to redact)
+//   - All non-metadata labels unchanged.
+//
+// After rewriting, stats with the same redacted label are merged
+// (Evaluated and Matched summed). Output is sorted by label.
+//
+// Idempotent: RedactMetadataKeys(RedactMetadataKeys(r, k), k) ==
+// RedactMetadataKeys(r, k).
+func RedactMetadataKeys(report PredicateDebugReport, keys []string) PredicateDebugReport {
+	keySet := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		keySet[k] = struct{}{}
+	}
+	merged := make(map[string]*ClauseStats)
+	for _, stat := range report.ClauseStats {
+		newLabel := redactLabel(stat.Label, keySet)
+		entry, ok := merged[newLabel]
+		if !ok {
+			entry = &ClauseStats{Label: newLabel}
+			merged[newLabel] = entry
+		}
+		entry.Evaluated += stat.Evaluated
+		entry.Matched += stat.Matched
+	}
+	labels := make([]string, 0, len(merged))
+	for l := range merged {
+		labels = append(labels, l)
+	}
+	sort.Strings(labels)
+	stats := make([]ClauseStats, len(labels))
+	for i, l := range labels {
+		stats[i] = *merged[l]
+	}
+	return PredicateDebugReport{
+		TotalCandidates: report.TotalCandidates,
+		Matched:         report.Matched,
+		ClauseStats:     stats,
+	}
+}
+
+func redactLabel(label string, keys map[string]struct{}) string {
+	if m := metaEqualsRe.FindStringSubmatch(label); m != nil {
+		if _, ok := keys[m[1]]; ok {
+			return "MetadataEquals(" + m[1] + "=<redacted>)"
+		}
+	}
+	if m := metaMatchesRe.FindStringSubmatch(label); m != nil {
+		if _, ok := keys[m[1]]; ok {
+			return "MetadataMatches(" + m[1] + ` contains "<redacted>")`
+		}
+	}
+	if m := metaNumericRe.FindStringSubmatch(label); m != nil {
+		if _, ok := keys[m[1]]; ok {
+			return "MetadataNumericAtLeast(" + m[1] + " >= <redacted>)"
+		}
+	}
+	return label
+}
+
+// PredicateDebugReportFromWire reconstructs a PredicateDebugReport
+// from its wire JSON form. Symmetric inverse of
+// `json.Marshal(report)`.
+//
+// Use case: load a previously-saved debug report from disk for
+// inspection or onward-shipping (e.g., after RedactMetadataKeys).
+func PredicateDebugReportFromWire(b []byte) (PredicateDebugReport, error) {
+	var r PredicateDebugReport
+	if err := json.Unmarshal(b, &r); err != nil {
+		return PredicateDebugReport{}, err
+	}
+	if r.ClauseStats == nil {
+		// Distinguish empty-array from missing-field at the JSON
+		// level. Both round-trip to len()==0 in Go but `null` is
+		// suspicious; an unmarshal of `{"total_candidates": 1}`
+		// (missing clause_stats) leaves the field nil. Surface as
+		// an error so callers don't silently pass through malformed
+		// input.
+		var raw map[string]json.RawMessage
+		if jerr := json.Unmarshal(b, &raw); jerr == nil {
+			if _, ok := raw["clause_stats"]; !ok {
+				return PredicateDebugReport{}, errors.New(
+					"PredicateDebugReportFromWire: missing required field clause_stats",
+				)
+			}
+		}
+		// Empty-array case: leave as nil-vs-empty equivalence; both
+		// represent zero clauses.
+		r.ClauseStats = []ClauseStats{}
+	}
+	return r, nil
 }
 
 // Render formats a one-line-per-clause summary suitable for CLI output.

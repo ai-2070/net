@@ -1378,6 +1378,123 @@ def predicate_debug_report(
     )
 
 
+# ============================================================================
+# Redaction + JSON round-trip — Phase 9d redaction.
+#
+# `redact_metadata_keys` rewrites metadata-clause labels to hide
+# sensitive predicate values before persistence. `predicate_debug_report_from_wire`
+# is the symmetric inverse of `report.to_wire()` for save/replay.
+# Pinned across bindings by `predicate_debug_report_redacted.json`.
+# ============================================================================
+
+
+_META_EQUALS_RE = __import__("re").compile(r"^MetadataEquals\(([^=]+)=(.+)\)$")
+_META_MATCHES_RE = __import__("re").compile(
+    r'^MetadataMatches\((.+) contains "(.*)"\)$'
+)
+_META_NUMERIC_RE = __import__("re").compile(
+    r"^MetadataNumericAtLeast\((.+) >= (.+)\)$"
+)
+
+
+def _redact_label(label: str, keys: frozenset) -> str:
+    m = _META_EQUALS_RE.match(label)
+    if m and m.group(1) in keys:
+        return f"MetadataEquals({m.group(1)}=<redacted>)"
+    m = _META_MATCHES_RE.match(label)
+    if m and m.group(1) in keys:
+        return f'MetadataMatches({m.group(1)} contains "<redacted>")'
+    m = _META_NUMERIC_RE.match(label)
+    if m and m.group(1) in keys:
+        return f"MetadataNumericAtLeast({m.group(1)} >= <redacted>)"
+    return label
+
+
+def redact_metadata_keys(
+    report: PredicateDebugReport, keys: Sequence[str]
+) -> PredicateDebugReport:
+    """Rewrite metadata-clause values in a debug report to hide
+    sensitive values before persistence / sharing.
+
+    Walks the report's ``clause_stats`` and rewrites any label whose
+    metadata key is in ``keys``:
+
+    - ``MetadataEquals(<key>=<value>)`` → ``MetadataEquals(<key>=<redacted>)``
+    - ``MetadataMatches(<key> contains "<pattern>")`` → ``MetadataMatches(<key> contains "<redacted>")``
+    - ``MetadataNumericAtLeast(<key> >= <threshold>)`` → ``MetadataNumericAtLeast(<key> >= <redacted>)``
+    - ``MetadataExists(<key>)`` — unchanged (no value to redact).
+    - All non-metadata labels unchanged.
+
+    After rewriting, stats with the same redacted label are merged
+    (``evaluated`` and ``matched`` summed). Output is sorted by label.
+
+    Idempotent: ``redact(redact(r, k), k) == redact(r, k)``."""
+    key_set = frozenset(keys)
+    merged: Dict[str, List[int]] = {}
+    for stat in report.clause_stats:
+        new_label = _redact_label(stat.label, key_set)
+        entry = merged.setdefault(new_label, [0, 0])
+        entry[0] += stat.evaluated
+        entry[1] += stat.matched
+    sorted_labels = sorted(merged.keys())
+    new_stats = tuple(
+        ClauseStats(label=lbl, evaluated=merged[lbl][0], matched=merged[lbl][1])
+        for lbl in sorted_labels
+    )
+    return PredicateDebugReport(
+        total_candidates=report.total_candidates,
+        matched=report.matched,
+        clause_stats=new_stats,
+    )
+
+
+def predicate_debug_report_from_wire(
+    wire: Mapping[str, Any]
+) -> PredicateDebugReport:
+    """Reconstruct a :class:`PredicateDebugReport` from its wire JSON
+    form. Symmetric inverse of ``report.to_wire()``."""
+    if not isinstance(wire, Mapping):
+        raise TypeError(
+            f"predicate_debug_report_from_wire: expected mapping, got {type(wire).__name__}"
+        )
+    if (
+        "total_candidates" not in wire
+        or "matched" not in wire
+        or "clause_stats" not in wire
+    ):
+        raise ValueError(
+            "predicate_debug_report_from_wire: missing required field "
+            "(total_candidates / matched / clause_stats)"
+        )
+    total = int(wire["total_candidates"])
+    matched_n = int(wire["matched"])
+    raw_stats = wire["clause_stats"]
+    if not isinstance(raw_stats, list):
+        raise TypeError("predicate_debug_report_from_wire: clause_stats must be a list")
+    stats: List[ClauseStats] = []
+    for s in raw_stats:
+        if not isinstance(s, Mapping):
+            raise ValueError(
+                f"predicate_debug_report_from_wire: bad clause_stats entry {s!r}"
+            )
+        if "label" not in s or "evaluated" not in s or "matched" not in s:
+            raise ValueError(
+                f"predicate_debug_report_from_wire: missing field in clause_stats entry {dict(s)!r}"
+            )
+        stats.append(
+            ClauseStats(
+                label=str(s["label"]),
+                evaluated=int(s["evaluated"]),
+                matched=int(s["matched"]),
+            )
+        )
+    return PredicateDebugReport(
+        total_candidates=total,
+        matched=matched_n,
+        clause_stats=tuple(stats),
+    )
+
+
 __all__ = [
     "TaxonomyAxis",
     "TAXONOMY_AXES",
@@ -1425,4 +1542,6 @@ __all__ = [
     "ClauseStats",
     "PredicateDebugReport",
     "predicate_debug_report",
+    "redact_metadata_keys",
+    "predicate_debug_report_from_wire",
 ]

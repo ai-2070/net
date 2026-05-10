@@ -167,6 +167,8 @@ export {
   evaluatePredicate,
   evaluatePredicateWithTrace,
   predicateDebugReport,
+  predicateDebugReportFromWire,
+  redactMetadataKeys,
   renderDebugReport,
 } from './capability-enhancements';
 export type {

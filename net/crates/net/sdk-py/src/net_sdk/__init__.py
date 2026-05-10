@@ -43,7 +43,9 @@ from net_sdk.capability import (
     evaluate_predicate_with_trace,
     p,
     predicate_debug_report,
+    predicate_debug_report_from_wire,
     placement_filter_from_fn,
+    redact_metadata_keys,
     predicate_from_rpc_header,
     predicate_from_wire,
     predicate_to_rpc_header,
@@ -152,6 +154,8 @@ __all__ = [
     "ClauseStats",
     "PredicateDebugReport",
     "predicate_debug_report",
+    "redact_metadata_keys",
+    "predicate_debug_report_from_wire",
     # Phase 9a — axis schema + validator.
     "ValueType",
     "KeyEntry",

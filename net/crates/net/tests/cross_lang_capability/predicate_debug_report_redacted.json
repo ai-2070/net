@@ -1,0 +1,261 @@
+{
+  "description": "Cross-binding pin for `redactMetadataKeys(report, keys)` — the SDK-side scrubber that rewrites metadata-clause labels to hide sensitive values before persisting / sharing a debug report. Each case carries a starting `report` (a previously-aggregated `PredicateDebugReport`), a `redact_keys` array, and the expected `redacted_report` after redaction. Bindings re-implement the transformation and assert byte-identical output. See README.md.",
+  "abi_version_expected": 1,
+  "redaction_rules": [
+    "MetadataEquals(<key>=<value>) -> MetadataEquals(<key>=<redacted>) when <key> is in redact_keys",
+    "MetadataMatches(<key> contains \"<pattern>\") -> MetadataMatches(<key> contains \"<redacted>\") when <key> is in redact_keys",
+    "MetadataNumericAtLeast(<key> >= <threshold>) -> MetadataNumericAtLeast(<key> >= <redacted>) when <key> is in redact_keys",
+    "MetadataExists(<key>) -> unchanged (no value to redact)",
+    "Non-metadata clauses (Exists / Equals / numeric on tags / semver / string / And / Or / Not) -> unchanged",
+    "After rewrite, stats with the same redacted label are merged: evaluated += evaluated, matched += matched. Output sorted by label."
+  ],
+  "cases": [
+    {
+      "name": "no_keys_redacted_is_identity",
+      "summary": "Empty redact_keys → report passes through unchanged.",
+      "report": {
+        "total_candidates": 3,
+        "matched": 1,
+        "clause_stats": [
+          { "label": "Exists(hardware.gpu)", "evaluated": 3, "matched": 1 },
+          {
+            "label": "MetadataEquals(intent=ml-training)",
+            "evaluated": 3,
+            "matched": 1
+          }
+        ]
+      },
+      "redact_keys": [],
+      "redacted_report": {
+        "total_candidates": 3,
+        "matched": 1,
+        "clause_stats": [
+          { "label": "Exists(hardware.gpu)", "evaluated": 3, "matched": 1 },
+          {
+            "label": "MetadataEquals(intent=ml-training)",
+            "evaluated": 3,
+            "matched": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "metadata_equals_value_redacted",
+      "summary": "MetadataEquals on a redacted key has its value rewritten to `<redacted>`.",
+      "report": {
+        "total_candidates": 5,
+        "matched": 2,
+        "clause_stats": [
+          {
+            "label": "MetadataEquals(intent=ml-training)",
+            "evaluated": 5,
+            "matched": 2
+          }
+        ]
+      },
+      "redact_keys": ["intent"],
+      "redacted_report": {
+        "total_candidates": 5,
+        "matched": 2,
+        "clause_stats": [
+          {
+            "label": "MetadataEquals(intent=<redacted>)",
+            "evaluated": 5,
+            "matched": 2
+          }
+        ]
+      }
+    },
+    {
+      "name": "metadata_matches_pattern_redacted",
+      "summary": "MetadataMatches on a redacted key has its pattern rewritten.",
+      "report": {
+        "total_candidates": 4,
+        "matched": 1,
+        "clause_stats": [
+          {
+            "label": "MetadataMatches(owner contains \"@anthropic\")",
+            "evaluated": 4,
+            "matched": 1
+          }
+        ]
+      },
+      "redact_keys": ["owner"],
+      "redacted_report": {
+        "total_candidates": 4,
+        "matched": 1,
+        "clause_stats": [
+          {
+            "label": "MetadataMatches(owner contains \"<redacted>\")",
+            "evaluated": 4,
+            "matched": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "metadata_numeric_at_least_threshold_redacted",
+      "summary": "MetadataNumericAtLeast on a redacted key has its threshold rewritten.",
+      "report": {
+        "total_candidates": 6,
+        "matched": 4,
+        "clause_stats": [
+          {
+            "label": "MetadataNumericAtLeast(priority >= 5)",
+            "evaluated": 6,
+            "matched": 4
+          }
+        ]
+      },
+      "redact_keys": ["priority"],
+      "redacted_report": {
+        "total_candidates": 6,
+        "matched": 4,
+        "clause_stats": [
+          {
+            "label": "MetadataNumericAtLeast(priority >= <redacted>)",
+            "evaluated": 6,
+            "matched": 4
+          }
+        ]
+      }
+    },
+    {
+      "name": "metadata_exists_unchanged",
+      "summary": "MetadataExists has no value to redact — label stays as-is even when the key is in `redact_keys`.",
+      "report": {
+        "total_candidates": 3,
+        "matched": 2,
+        "clause_stats": [
+          { "label": "MetadataExists(intent)", "evaluated": 3, "matched": 2 }
+        ]
+      },
+      "redact_keys": ["intent"],
+      "redacted_report": {
+        "total_candidates": 3,
+        "matched": 2,
+        "clause_stats": [
+          { "label": "MetadataExists(intent)", "evaluated": 3, "matched": 2 }
+        ]
+      }
+    },
+    {
+      "name": "non_metadata_clauses_pass_through",
+      "summary": "Tag-clause labels (Exists, NumericAtLeast on hardware, etc.) are unaffected — redaction targets metadata only.",
+      "report": {
+        "total_candidates": 2,
+        "matched": 1,
+        "clause_stats": [
+          { "label": "Exists(hardware.gpu)", "evaluated": 2, "matched": 1 },
+          {
+            "label": "NumericAtLeast(hardware.memory_mb >= 65536)",
+            "evaluated": 2,
+            "matched": 1
+          },
+          {
+            "label": "SemverAtLeast(software.runtime.python >= 3.10.0)",
+            "evaluated": 2,
+            "matched": 1
+          }
+        ]
+      },
+      "redact_keys": ["intent", "memory_mb"],
+      "redacted_report": {
+        "total_candidates": 2,
+        "matched": 1,
+        "clause_stats": [
+          { "label": "Exists(hardware.gpu)", "evaluated": 2, "matched": 1 },
+          {
+            "label": "NumericAtLeast(hardware.memory_mb >= 65536)",
+            "evaluated": 2,
+            "matched": 1
+          },
+          {
+            "label": "SemverAtLeast(software.runtime.python >= 3.10.0)",
+            "evaluated": 2,
+            "matched": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "duplicate_redacted_labels_merge_stats",
+      "summary": "When two original labels redact to the same string (e.g. two MetadataEquals on `intent` with different values), the stats merge — `evaluated` and `matched` summed; output deduplicates.",
+      "report": {
+        "total_candidates": 7,
+        "matched": 3,
+        "clause_stats": [
+          {
+            "label": "MetadataEquals(intent=ml-training)",
+            "evaluated": 4,
+            "matched": 2
+          },
+          {
+            "label": "MetadataEquals(intent=embedding-cache)",
+            "evaluated": 3,
+            "matched": 1
+          }
+        ]
+      },
+      "redact_keys": ["intent"],
+      "redacted_report": {
+        "total_candidates": 7,
+        "matched": 3,
+        "clause_stats": [
+          {
+            "label": "MetadataEquals(intent=<redacted>)",
+            "evaluated": 7,
+            "matched": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "multiple_keys_redacted_together",
+      "summary": "Multiple keys in `redact_keys` are redacted in the same pass; non-listed keys pass through.",
+      "report": {
+        "total_candidates": 4,
+        "matched": 2,
+        "clause_stats": [
+          {
+            "label": "MetadataEquals(intent=ml-training)",
+            "evaluated": 4,
+            "matched": 2
+          },
+          {
+            "label": "MetadataEquals(owner=alice)",
+            "evaluated": 4,
+            "matched": 3
+          },
+          {
+            "label": "MetadataEquals(region=us-east)",
+            "evaluated": 4,
+            "matched": 4
+          }
+        ]
+      },
+      "redact_keys": ["intent", "owner"],
+      "redacted_report": {
+        "total_candidates": 4,
+        "matched": 2,
+        "clause_stats": [
+          {
+            "label": "MetadataEquals(intent=<redacted>)",
+            "evaluated": 4,
+            "matched": 2
+          },
+          {
+            "label": "MetadataEquals(owner=<redacted>)",
+            "evaluated": 4,
+            "matched": 3
+          },
+          {
+            "label": "MetadataEquals(region=us-east)",
+            "evaluated": 4,
+            "matched": 4
+          }
+        ]
+      }
+    }
+  ]
+}

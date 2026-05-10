@@ -49,6 +49,23 @@ Coverage spans every composite shape: leaf hit / miss; And short-circuit (siblin
 
 The fixture also pins the planner's stable cost-sort: in the `and_runs_all_when_no_short_circuit` case, both children are true but `MetadataExists` (cost 10) appears before `Exists` (cost 20) in the trace, even though the AST declared them in the reverse order. Implementations must use a stable sort by `static_cost` to match.
 
+### `predicate_debug_report_redacted.json`
+
+Pins `redactMetadataKeys(report, keys)` — the SDK-side scrubber that rewrites metadata-clause labels to hide sensitive predicate values before persisting / sharing a debug report. Phase 9d redaction of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+
+- `report` is a previously-aggregated `PredicateDebugReport`.
+- `redact_keys` is the array of metadata key names whose values should be scrubbed.
+- `redacted_report` is the expected output: each metadata-clause label whose key matches has its value rewritten to `<redacted>`; structurally-identical redacted labels merge their `evaluated`/`matched` counts. Output sorted by label.
+
+Redaction rules (see `redaction_rules` in the fixture):
+- `MetadataEquals(<key>=<value>)` → `MetadataEquals(<key>=<redacted>)`
+- `MetadataMatches(<key> contains "<pattern>")` → `MetadataMatches(<key> contains "<redacted>")`
+- `MetadataNumericAtLeast(<key> >= <threshold>)` → `MetadataNumericAtLeast(<key> >= <redacted>)`
+- `MetadataExists(<key>)` — unchanged (no value to redact).
+- All non-metadata labels (`Exists`, `Equals`, `NumericAtLeast`, `SemverAtLeast`, `Or`, `And`, `Not`, etc.) — unchanged.
+
+The substrate doesn't ship a redaction implementation (Phase 6 of `CAPABILITY_ENHANCEMENTS_PLAN.md` defined the API but only the trace + aggregator landed); each binding implements redaction host-side.
+
 ### `predicate_debug_report.json`
 
 Pins `PredicateDebugReport::from_evaluations(pred, contexts)` output for representative `(predicate, corpus)` pairs — the per-clause aggregator that operators reach for to answer "how often did each clause fire / match across this candidate set". Phase 9d full of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.

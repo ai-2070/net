@@ -1425,6 +1425,118 @@ export function predicateDebugReport(
   };
 }
 
+/**
+ * Redact metadata-clause values in a {@link PredicateDebugReport}.
+ *
+ * Walks the report's `clause_stats` and rewrites any label whose
+ * metadata key is in the supplied `keys` list:
+ *
+ * - `MetadataEquals(<key>=<value>)` → `MetadataEquals(<key>=<redacted>)`
+ * - `MetadataMatches(<key> contains "<pattern>")` → `MetadataMatches(<key> contains "<redacted>")`
+ * - `MetadataNumericAtLeast(<key> >= <threshold>)` → `MetadataNumericAtLeast(<key> >= <redacted>)`
+ * - `MetadataExists(<key>)` — unchanged (no value to redact)
+ * - All non-metadata labels (Exists, Equals, Numeric*, Semver*,
+ *   String*, And, Or, Not on tags) unchanged.
+ *
+ * After rewriting, stats with the same redacted label are merged
+ * (`evaluated` and `matched` summed). Output is sorted by label.
+ *
+ * Use this before persisting a debug report to disk or sharing with
+ * a teammate when the predicate's authored metadata values are
+ * sensitive (PII, secrets, internal classifications).
+ *
+ * Pinned across bindings by `predicate_debug_report_redacted.json`.
+ */
+export function redactMetadataKeys(
+  report: PredicateDebugReport,
+  keys: readonly string[],
+): PredicateDebugReport {
+  const keySet = new Set(keys);
+  const merged = new Map<string, ClauseStats>();
+  for (const stat of report.clause_stats) {
+    const newLabel = redactLabel(stat.label, keySet);
+    const existing = merged.get(newLabel) ?? {
+      label: newLabel,
+      evaluated: 0,
+      matched: 0,
+    };
+    existing.evaluated += stat.evaluated;
+    existing.matched += stat.matched;
+    merged.set(newLabel, existing);
+  }
+  const sortedLabels = Array.from(merged.keys()).sort();
+  return {
+    total_candidates: report.total_candidates,
+    matched: report.matched,
+    clause_stats: sortedLabels.map((l) => merged.get(l)!),
+  };
+}
+
+/**
+ * Pre-compiled regexes for the three redactable metadata-clause
+ * label shapes. The `^` / `$` anchors prevent accidental matches in
+ * pathological clause values.
+ */
+const META_EQUALS_RE = /^MetadataEquals\(([^=]+)=(.+)\)$/;
+const META_MATCHES_RE = /^MetadataMatches\((.+) contains "(.*)"\)$/;
+const META_NUMERIC_RE = /^MetadataNumericAtLeast\((.+) >= (.+)\)$/;
+
+function redactLabel(label: string, keys: ReadonlySet<string>): string {
+  let m: RegExpMatchArray | null;
+  if ((m = label.match(META_EQUALS_RE))) {
+    if (keys.has(m[1])) return `MetadataEquals(${m[1]}=<redacted>)`;
+  } else if ((m = label.match(META_MATCHES_RE))) {
+    if (keys.has(m[1])) return `MetadataMatches(${m[1]} contains "<redacted>")`;
+  } else if ((m = label.match(META_NUMERIC_RE))) {
+    if (keys.has(m[1])) return `MetadataNumericAtLeast(${m[1]} >= <redacted>)`;
+  }
+  return label;
+}
+
+/**
+ * Reconstruct a {@link PredicateDebugReport} from its wire JSON form
+ * (the shape produced by JSON-stringifying the report). Validates
+ * required fields; on malformed input throws a descriptive error.
+ *
+ * Symmetric inverse of `JSON.stringify(report)` — call
+ * `predicateDebugReportFromWire(JSON.parse(text))` to round-trip a
+ * report through disk.
+ */
+export function predicateDebugReportFromWire(wire: unknown): PredicateDebugReport {
+  if (
+    typeof wire !== 'object' ||
+    wire === null ||
+    typeof (wire as PredicateDebugReport).total_candidates !== 'number' ||
+    typeof (wire as PredicateDebugReport).matched !== 'number' ||
+    !Array.isArray((wire as PredicateDebugReport).clause_stats)
+  ) {
+    throw new Error(
+      'predicateDebugReportFromWire: expected { total_candidates: number, matched: number, clause_stats: array }',
+    );
+  }
+  const w = wire as PredicateDebugReport;
+  for (const s of w.clause_stats) {
+    if (
+      typeof s.label !== 'string' ||
+      typeof s.evaluated !== 'number' ||
+      typeof s.matched !== 'number'
+    ) {
+      throw new Error(
+        `predicateDebugReportFromWire: bad clause_stats entry ${JSON.stringify(s)}`,
+      );
+    }
+  }
+  return {
+    total_candidates: w.total_candidates,
+    matched: w.matched,
+    clause_stats: w.clause_stats.map((s) => ({
+      label: s.label,
+      evaluated: s.evaluated,
+      matched: s.matched,
+    })),
+  };
+}
+
 /** Render a one-line-per-clause text summary suitable for CLI output. */
 export function renderDebugReport(report: PredicateDebugReport): string {
   const pct = (num: number, denom: number): string =>
