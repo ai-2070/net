@@ -317,6 +317,24 @@ def test_semver_compatible_zero_zero_patch_is_exact_only() -> None:
     assert _semver_compatible((2, 0, 0), (1, 9, 9)) is False
 
 
+def test_semver_compatible_zero_x_band_requires_lhs_major_zero() -> None:
+    """Q1: a non-zero major lhs is NOT compatible with a 0.x.y rhs.
+    Pre-fix `rhs[1] == lhs[1]` alone passed for `lhs = (1, 2, 5)`
+    against `rhs = (0, 2, 3)` (lhs >= rhs since 1 > 0; minors
+    match). Cargo's caret rule treats 0.x.y as the band IFF the
+    band itself is 0.x.y — 1.x.y running against ^0.2.3 is a
+    major-version regression.
+    """
+    from net_sdk.capability import _semver_compatible
+
+    # 0.2.x band: same-major-zero, same-minor matches.
+    assert _semver_compatible((0, 2, 5), (0, 2, 3)) is True
+    # 0.2.x band: lhs major == 1 must NOT match (was admitted pre-fix).
+    assert _semver_compatible((1, 2, 5), (0, 2, 3)) is False
+    # Sanity: lhs major == 2 also fails.
+    assert _semver_compatible((2, 2, 5), (0, 2, 3)) is False
+
+
 # ---------------------------------------------------------------------------
 # StandardPlacement builder + custom placement filter
 # ---------------------------------------------------------------------------

@@ -1025,13 +1025,15 @@ def _semver_compatible(lhs: Tuple[int, int, int], rhs: Tuple[int, int, int]) -> 
             # P1-D: 0.0.x — patch is the compatibility band; anything
             # other than the exact tuple is a breaking change.
             # Combined with the lhs >= rhs guard above this collapses
-            # to lhs == rhs. Pre-fix this branch returned
-            # `rhs[1] == lhs[1]` (always true at 0), letting any
-            # 0.0.lhs satisfy 0.0.rhs whenever lhs >= rhs — diverged
-            # from Cargo + Rust substrate.
+            # to lhs == rhs.
             return lhs == rhs
-        # 0.x.y — minor is the compatibility band.
-        return rhs[1] == lhs[1]
+        # Q1: 0.x.y — minor is the compatibility band, AND the
+        # major must also be 0. Pre-fix `rhs[1] == lhs[1]` alone
+        # admitted `lhs = (1, 2, 5)` as compatible with
+        # `rhs = (0, 2, 3)` (the lhs >= rhs guard passes since
+        # 1 > 0, then minors match). 1.x.y against ^0.2.3 is a
+        # major-version regression that should fail.
+        return lhs[0] == 0 and rhs[1] == lhs[1]
     return rhs[0] == lhs[0]
 
 
