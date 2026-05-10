@@ -53,7 +53,21 @@ pub enum PlacementReason {
 }
 ```
 
-The scheduler queries the `CapabilityIndex` from the behavior plane to find nodes matching a daemon's `requirements()`. Placement considers capability match, load, and proximity.
+The scheduler queries the `CapabilityIndex` from the behavior plane to find nodes matching a daemon's `requirements()` and ranks them with `StandardPlacement` — the default scorer combining capability match, load, anti-affinity, resource fit, and proximity.
+
+### Daemon capability authoring
+
+Each `MeshDaemon` exposes legacy placement requirements via `requirements() -> CapabilityFilter`, and v2 placement capabilities via `required_capabilities()` / `optional_capabilities()` (both `CapabilitySet`). The runtime publishes the required + optional sets as part of the daemon's identity-bound announcement so the placement scheduler — and any custom filter — can consult them. Bindings expose the same hook through their daemon-caps dispatcher (`net_compute_set_daemon_caps_dispatcher` at the C ABI; the equivalent Python / TS / Go callback during factory registration).
+
+### Custom placement-filter callbacks
+
+When the built-in axes don't fit a placement rule, plug a host-language predicate into `StandardPlacement.custom_filter_id` — the scheduler calls back per candidate, weighting your verdict alongside its native axes. Same shape across every binding:
+
+- **Rust SDK**: `placement_filter_from_fn(...)` returns a `PlacementFilter` you wire into `StandardPlacement::with_custom_filter_id(id)`.
+- **TS / Python / Go**: `placementFilterFromFn` / `placement_filter_from_fn` / `PlacementFilterFromFn` — same surface, host closure receives the candidate's `(tags, metadata)` and returns a boolean.
+- **C ABI**: `net_compute_set_placement_filter_dispatcher(fn)` installs the dispatcher (one-shot, after-which `net_compute_register_placement_filter(mesh_arc, id_ptr, id_len)` registers per-id callbacks).
+
+Predicates authored via the substrate's `Predicate` AST evaluate identically in every binding, so a `placement_filter_from_fn` closure that wraps `evaluate_predicate(pred, cand.tags, cand.metadata)` produces the same result whether the daemon factory ships in TS, Python, Go, or Rust.
 
 ## 6-Phase Migration
 

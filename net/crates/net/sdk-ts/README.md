@@ -435,6 +435,89 @@ origin's signature verifies at every hop.
 `MeshNode.create`. See
 [`docs/MULTIHOP_CAPABILITY_PLAN.md`](../docs/MULTIHOP_CAPABILITY_PLAN.md).
 
+#### Capability enhancements (typed taxonomy + predicates + validation)
+
+Beyond announce / find-peers, the SDK exposes a caller-local
+enhancement layer mirroring the substrate's `CapabilityEnhancements`:
+
+```typescript
+import {
+  // Typed taxonomy
+  tagFromUserString, RESERVED_PREFIXES,
+  // Chain helpers
+  emptyCapabilities, requireTag, requireAxisValue, withMetadata,
+  // Predicates
+  p, evaluatePredicate, predicateToRpcHeader, predicateFromRpcHeader,
+  RPC_WHERE_HEADER,
+  // Predicate trace + debug
+  evaluatePredicateWithTrace,
+  predicateDebugReport, redactMetadataKeys, renderDebugReport,
+  // Validation
+  validateCapabilities, isReportValid,
+  // Diff
+  diffCapabilities,
+  // Placement filters
+  standardPlacement, placementFilterFromFn,
+} from '@ai2070/net-sdk';
+
+// Build a capability set in the wire shape `{ tags, metadata }`.
+let caps = emptyCapabilities();
+caps = requireTag(caps, 'hardware', 'gpu');
+caps = requireAxisValue(caps, 'software', 'os', 'linux');
+caps = withMetadata(caps, 'intent', 'ml-training');
+
+// Author a predicate.
+const pred = p.and(
+  p.exists({ axis: 'hardware', key: 'gpu' }),
+  p.numericAtLeast({ axis: 'hardware', key: 'memory_mb' }, 65536),
+  p.metadataEquals('intent', 'ml-training'),
+);
+
+// Local evaluation (no mesh round-trip).
+const matched = evaluatePredicate(pred, caps.tags, caps.metadata);
+
+// Wire form for nRPC `cyberdeck-where:` headers — pair with the
+// header-bearing call variants (`callWithHeaders` etc.) so a
+// server-side filter can match candidates without running the
+// predicate over the whole route.
+const headerValue = predicateToRpcHeader(pred);
+// Reverse direction: parse a peer-supplied header back into the AST.
+const decoded = predicateFromRpcHeader(headerValue);
+
+// Validate against the canonical schema (catches typos, type
+// mismatches, oversize metadata, legacy tags).
+const report = validateCapabilities(caps);
+if (!isReportValid(report)) {
+  console.error('schema errors:', report.errors);
+}
+
+// Detect what changed between two snapshots — drives placement
+// re-evaluation when a daemon's CapabilitySet updates.
+const delta = diffCapabilities(prevCaps, caps);
+
+// Single-evaluation trace — every clause's verdict + skipped
+// children for short-circuit AND/OR.
+const { result, trace } = evaluatePredicateWithTrace(pred, tags, metadata);
+
+// Profile a predicate across a corpus + render a per-clause report.
+const debug = predicateDebugReport(pred, contexts);
+const safe = redactMetadataKeys(debug, ['intent']); // scrub before persisting
+console.log(renderDebugReport(safe));
+
+// Wrap a predicate as a placement-filter callback the substrate
+// invokes per candidate. Pair with `standardPlacement` to
+// install a custom scoring axis driven by the JS predicate.
+const filter = placementFilterFromFn((cand) =>
+  evaluatePredicate(pred, cand.tags, cand.metadata),
+);
+const placement = standardPlacement().withCustomFilterId(filter.id).build();
+```
+
+The wire format is byte-identical across all five bindings (Rust /
+TS / Python / Go / C) — pinned by JSON fixtures under
+`tests/cross_lang_capability/`. A predicate authored in TS and
+shipped to a Go service via nRPC headers decodes losslessly.
+
 ### Subnets (visibility partitioning)
 
 `subnet` pins a node to a specific 4-level `SubnetId`; `subnetPolicy`

@@ -15,6 +15,7 @@ use std::collections::HashSet;
 
 use crate::adapter::net::behavior::loadbalance::{RequestContext, Strategy};
 use crate::adapter::net::behavior::metadata::NodeId;
+use crate::adapter::net::behavior::placement::{Artifact, PlacementFilter, TieBreakContext};
 use crate::adapter::net::compute::daemon::{DaemonHostConfig, MeshDaemon};
 use crate::adapter::net::compute::group_coord::{
     GroupCoordinator, GroupError, GroupHealth, MemberInfo,
@@ -285,6 +286,252 @@ impl ReplicaGroup {
             self.coord
                 .update_member_placement(index, placement.node_id, entity_id_bytes);
             exclude.insert(placement.node_id);
+            replaced.push(index);
+        }
+
+        Ok(replaced)
+    }
+
+    /// Phase G slice 5 — `spawn` with score-based placement. Runs
+    /// the same flow as [`Self::spawn`] but routes every per-replica
+    /// placement decision through [`GroupCoordinator::place_member`]
+    /// (i.e. `Scheduler::select_member_node` + LOCKED §7
+    /// tie-breaker), so operators can opt into the v2 path on a
+    /// per-call basis without changing the legacy default.
+    ///
+    /// The artifact passed to `placement` is built per-iteration
+    /// from the daemon's `required_capabilities()` /
+    /// `optional_capabilities()` plus the deterministic per-replica
+    /// entity-id (used as `daemon_id` for stable ordering).
+    pub fn spawn_with_placement<F>(
+        config: ReplicaGroupConfig,
+        daemon_factory: F,
+        scheduler: &Scheduler,
+        registry: &DaemonRegistry,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+    ) -> Result<Self, GroupError>
+    where
+        F: Fn() -> Box<dyn MeshDaemon>,
+    {
+        if config.replica_count == 0 {
+            return Err(GroupError::InvalidConfig(
+                "replica_count must be > 0".into(),
+            ));
+        }
+
+        let group_id = {
+            use xxhash_rust::xxh3::xxh3_64;
+            xxh3_64(&config.group_seed) as u32
+        };
+
+        let mut coord = GroupCoordinator::new(config.lb_strategy);
+        let mut used_nodes: HashSet<u64> = HashSet::new();
+
+        // Capture the daemon's capability surface once — required /
+        // optional are stable across the spawn, so we don't need to
+        // re-derive them per replica. `requirements()` (legacy
+        // `CapabilityFilter`) still narrows the candidate pool inside
+        // `place_member`.
+        let prototype = daemon_factory();
+        let requirements = prototype.requirements();
+        let required = prototype.required_capabilities();
+        let optional = prototype.optional_capabilities();
+        drop(prototype);
+
+        for index in 0..config.replica_count {
+            let keypair = derive_replica_keypair(&config.group_seed, index);
+            let origin_hash = keypair.origin_hash();
+            let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
+
+            let artifact = Artifact::Daemon {
+                daemon_id: entity_id_bytes,
+                required: &required,
+                optional: &optional,
+            };
+
+            let decision = GroupCoordinator::place_member(
+                scheduler,
+                &artifact,
+                &requirements,
+                &used_nodes,
+                placement,
+                tie_break,
+            )?;
+            let node_id = decision.node_id;
+            used_nodes.insert(node_id);
+
+            let daemon = daemon_factory();
+            let host = DaemonHost::new(daemon, keypair, config.host_config.clone());
+            registry.register(host)?;
+
+            coord.add_member(MemberInfo {
+                index,
+                origin_hash,
+                node_id,
+                entity_id_bytes,
+                healthy: true,
+            });
+        }
+
+        Ok(Self {
+            group_id,
+            config,
+            coord,
+        })
+    }
+
+    /// Phase G slice 5 — `scale_to` with score-based placement.
+    /// Routes the additive `current..n` placement loop through
+    /// [`GroupCoordinator::place_member`]. Scale-down is unchanged
+    /// (no placement decision involved).
+    pub fn scale_to_with_placement<F>(
+        &mut self,
+        n: u8,
+        daemon_factory: F,
+        scheduler: &Scheduler,
+        registry: &DaemonRegistry,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+    ) -> Result<(), GroupError>
+    where
+        F: Fn() -> Box<dyn MeshDaemon>,
+    {
+        if n == 0 {
+            return Err(GroupError::InvalidConfig(
+                "replica_count must be > 0".into(),
+            ));
+        }
+
+        let current = self.coord.member_count();
+
+        if n > current {
+            let prototype = daemon_factory();
+            let requirements = prototype.requirements();
+            let required = prototype.required_capabilities();
+            let optional = prototype.optional_capabilities();
+            drop(prototype);
+
+            // `used_nodes` must be `mut` and updated inside the loop —
+            // see the regression note in [`Self::scale_to`].
+            let mut used_nodes: HashSet<u64> =
+                self.coord.members().iter().map(|m| m.node_id).collect();
+
+            for index in current..n {
+                let keypair = derive_replica_keypair(&self.config.group_seed, index);
+                let origin_hash = keypair.origin_hash();
+                let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
+
+                let artifact = Artifact::Daemon {
+                    daemon_id: entity_id_bytes,
+                    required: &required,
+                    optional: &optional,
+                };
+
+                let decision = GroupCoordinator::place_member(
+                    scheduler,
+                    &artifact,
+                    &requirements,
+                    &used_nodes,
+                    placement,
+                    tie_break,
+                )?;
+                used_nodes.insert(decision.node_id);
+
+                let daemon = daemon_factory();
+                let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
+                registry.register(host)?;
+
+                self.coord.add_member(MemberInfo {
+                    index,
+                    origin_hash,
+                    node_id: decision.node_id,
+                    entity_id_bytes,
+                    healthy: true,
+                });
+            }
+        } else if n < current {
+            while self.coord.member_count() > n {
+                if let Some(info) = self.coord.remove_last() {
+                    let _ = registry.unregister(info.origin_hash);
+                }
+            }
+        }
+
+        self.config.replica_count = n;
+        Ok(())
+    }
+
+    /// Phase G slice 5 — `on_node_failure` with score-based
+    /// placement. Replaces affected members via
+    /// [`GroupCoordinator::place_member`]; on placement failure the
+    /// slot is left registered (same recovery-friendly behavior as
+    /// [`Self::on_node_failure`]) so a later recovery / scale_to
+    /// can re-mark it healthy.
+    pub fn on_node_failure_with_placement<F>(
+        &mut self,
+        failed_node_id: u64,
+        daemon_factory: F,
+        scheduler: &Scheduler,
+        registry: &DaemonRegistry,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+    ) -> Result<Vec<u8>, GroupError>
+    where
+        F: Fn() -> Box<dyn MeshDaemon>,
+    {
+        let mut replaced = Vec::new();
+
+        let prototype = daemon_factory();
+        let requirements = prototype.requirements();
+        let required = prototype.required_capabilities();
+        let optional = prototype.optional_capabilities();
+        drop(prototype);
+
+        let mut exclude: HashSet<u64> = HashSet::new();
+        exclude.insert(failed_node_id);
+
+        let affected = self.coord.members_on_node(failed_node_id);
+
+        for index in affected {
+            self.coord.mark_unhealthy(index);
+
+            let keypair = derive_replica_keypair(&self.config.group_seed, index);
+            let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
+
+            let artifact = Artifact::Daemon {
+                daemon_id: entity_id_bytes,
+                required: &required,
+                optional: &optional,
+            };
+
+            let decision = match GroupCoordinator::place_member(
+                scheduler,
+                &artifact,
+                &requirements,
+                &exclude,
+                placement,
+                tie_break,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        index,
+                        error = %e,
+                        "ReplicaGroup::on_node_failure_with_placement: place_member failed; \
+                         slot left registered for later recovery"
+                    );
+                    continue;
+                }
+            };
+
+            let daemon = daemon_factory();
+            let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
+            registry.replace(host);
+
+            self.coord
+                .update_member_placement(index, decision.node_id, entity_id_bytes);
+            exclude.insert(decision.node_id);
             replaced.push(index);
         }
 
@@ -664,5 +911,336 @@ mod tests {
             "after recovery the slot must be healthy again — the pre-fix \
              code left it permanently unhealthy + unregistered"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Phase G slice 5 — `*_with_placement` v2 wiring tests.
+    //
+    // Pin three guarantees:
+    //   1. v2 entry points work end-to-end (spawn / scale_to /
+    //      on_node_failure_with_placement) and exhibit the same
+    //      observable contract as v1 when given a permissive filter.
+    //   2. v2 honors a score-based filter (different selection vs v1).
+    //   3. v2 keeps the spread invariant (no two replicas on one node).
+    // ──────────────────────────────────────────────────────────────────
+
+    use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
+
+    fn make_scheduler_and_index(node_ids: &[u64]) -> (Scheduler, Arc<CapabilityIndex>) {
+        let index = Arc::new(CapabilityIndex::new());
+        let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+        for &id in node_ids {
+            index.index(CapabilityAnnouncement::new(
+                id,
+                eid.clone(),
+                1,
+                CapabilitySet::new(),
+            ));
+        }
+        let local = node_ids.first().copied().unwrap_or(0xFFFF);
+        let scheduler = Scheduler::new(index.clone(), local, CapabilitySet::new());
+        (scheduler, index)
+    }
+
+    /// Permissive placement filter — every candidate scores 1.0.
+    /// Lets us pin "v2 doesn't break observable behavior" against v1.
+    struct AllowAll;
+    impl PlacementFilter for AllowAll {
+        fn placement_score(&self, _: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
+            Some(1.0)
+        }
+    }
+
+    /// `spawn_with_placement` produces N replicas across distinct
+    /// nodes when placement is permissive (parity with `spawn`).
+    #[test]
+    fn spawn_with_placement_spreads_across_nodes() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let group = ReplicaGroup::spawn_with_placement(
+            test_config(3),
+            || Box::new(NoopDaemon),
+            &sched,
+            &reg,
+            &AllowAll,
+            &tb,
+        )
+        .expect("spawn_with_placement should succeed with 4 candidate nodes");
+
+        assert_eq!(group.replica_count(), 3);
+        assert_eq!(group.health(), GroupHealth::Healthy);
+        let node_ids: HashSet<u64> = group.replicas().iter().map(|r| r.node_id).collect();
+        assert_eq!(
+            node_ids.len(),
+            3,
+            "spread invariant: all 3 replicas on distinct nodes"
+        );
+    }
+
+    /// `spawn_with_placement` honors a score-based filter — pins
+    /// that v2 is genuinely score-aware, not just a rename of v1.
+    /// With a filter that pegs 0x4444 to 1.0 and others to 0.1,
+    /// the FIRST replica (lowest exclusion-set score) MUST land on
+    /// 0x4444. v1 (`spawn`) would land on the local node 0x1111.
+    #[test]
+    fn spawn_with_placement_routes_first_replica_to_highest_scorer() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        struct PreferHighest;
+        impl PlacementFilter for PreferHighest {
+            fn placement_score(&self, t: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
+                Some(if *t == 0x4444 { 1.0 } else { 0.1 })
+            }
+        }
+
+        let group = ReplicaGroup::spawn_with_placement(
+            test_config(1),
+            || Box::new(NoopDaemon),
+            &sched,
+            &reg,
+            &PreferHighest,
+            &tb,
+        )
+        .expect("spawn_with_placement with 1 replica should succeed");
+
+        assert_eq!(group.replicas()[0].node_id, 0x4444);
+    }
+
+    /// `spawn_with_placement` propagates a vetoed-everywhere
+    /// filter as `PlacementFailed` — pins the failure mode.
+    #[test]
+    fn spawn_with_placement_returns_placement_failed_when_all_vetoed() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        struct VetoAll;
+        impl PlacementFilter for VetoAll {
+            fn placement_score(&self, _: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
+                None
+            }
+        }
+
+        let err = ReplicaGroup::spawn_with_placement(
+            test_config(1),
+            || Box::new(NoopDaemon),
+            &sched,
+            &reg,
+            &VetoAll,
+            &tb,
+        )
+        .expect_err("VetoAll filter should make placement fail");
+
+        assert!(matches!(err, GroupError::PlacementFailed(_)));
+        assert_eq!(reg.count(), 0, "no host registered when placement fails");
+    }
+
+    /// `scale_to_with_placement` adds replicas under v2 placement
+    /// and respects the spread invariant — same regression coverage
+    /// as `scale_up_does_not_colocate_new_replicas` (v1) but on the
+    /// v2 path.
+    #[test]
+    fn scale_to_with_placement_spreads_new_replicas() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let mut group = ReplicaGroup::spawn_with_placement(
+            test_config(1),
+            || Box::new(NoopDaemon),
+            &sched,
+            &reg,
+            &AllowAll,
+            &tb,
+        )
+        .unwrap();
+
+        group
+            .scale_to_with_placement(4, || Box::new(NoopDaemon), &sched, &reg, &AllowAll, &tb)
+            .expect("scale_to_with_placement should succeed with 4 nodes");
+
+        let node_ids: HashSet<u64> = group.replicas().iter().map(|r| r.node_id).collect();
+        assert_eq!(
+            node_ids.len(),
+            4,
+            "spread invariant under v2: all 4 replicas on distinct nodes"
+        );
+        assert_eq!(reg.count(), 4);
+    }
+
+    /// `scale_to_with_placement` scale-DOWN works without invoking
+    /// the placement filter (unregisters extra members).
+    #[test]
+    fn scale_to_with_placement_scale_down_does_not_invoke_filter() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let mut group = ReplicaGroup::spawn_with_placement(
+            test_config(3),
+            || Box::new(NoopDaemon),
+            &sched,
+            &reg,
+            &AllowAll,
+            &tb,
+        )
+        .unwrap();
+        assert_eq!(reg.count(), 3);
+
+        // Scale down to 1 — even with VetoAll, the scale-down
+        // path should NOT invoke the filter.
+        struct VetoAll;
+        impl PlacementFilter for VetoAll {
+            fn placement_score(&self, _: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
+                None
+            }
+        }
+
+        group
+            .scale_to_with_placement(1, || Box::new(NoopDaemon), &sched, &reg, &VetoAll, &tb)
+            .expect("scale-down does not invoke the filter");
+
+        assert_eq!(group.replica_count(), 1);
+        assert_eq!(reg.count(), 1);
+    }
+
+    /// `on_node_failure_with_placement` re-spawns the affected
+    /// member on a different node when one is available. Mirrors
+    /// the v1 happy-path test on the v2 path.
+    #[test]
+    fn on_node_failure_with_placement_replaces_member_on_spare_node() {
+        let reg = DaemonRegistry::new();
+        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let mut group = ReplicaGroup::spawn_with_placement(
+            test_config(2),
+            || Box::new(NoopDaemon),
+            &sched,
+            &reg,
+            &AllowAll,
+            &tb,
+        )
+        .unwrap();
+
+        let failed_node = group.replicas()[0].node_id;
+        let failed_index = group.replicas()[0].index;
+        let failed_origin = group.replicas()[0].origin_hash;
+
+        let replaced = group
+            .on_node_failure_with_placement(
+                failed_node,
+                || Box::new(NoopDaemon),
+                &sched,
+                &reg,
+                &AllowAll,
+                &tb,
+            )
+            .unwrap();
+
+        assert_eq!(replaced, vec![failed_index]);
+        // Member at `failed_index` now lives on a different node.
+        let new_node = group
+            .replicas()
+            .iter()
+            .find(|r| r.index == failed_index)
+            .unwrap()
+            .node_id;
+        assert_ne!(new_node, failed_node);
+        // Deterministic origin_hash unchanged — replace, not new register.
+        assert!(reg.contains(failed_origin));
+    }
+
+    /// `on_node_failure_with_placement` keeps the slot registered
+    /// when no spare node is available — pins the recovery
+    /// guarantee (#7) for the v2 path.
+    #[test]
+    fn on_node_failure_with_placement_preserves_slot_when_placement_fails() {
+        let reg = DaemonRegistry::new();
+        // Single-node mesh — failure leaves NO spare; placement
+        // MUST fail and the slot MUST stay registered.
+        let (sched, index) = make_scheduler_and_index(&[0x9999]);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let mut group = ReplicaGroup::spawn_with_placement(
+            test_config(1),
+            || Box::new(NoopDaemon),
+            &sched,
+            &reg,
+            &AllowAll,
+            &tb,
+        )
+        .unwrap();
+
+        let failed_node = group.replicas()[0].node_id;
+        let failed_origin = group.replicas()[0].origin_hash;
+        assert_eq!(failed_node, 0x9999);
+
+        let replaced = group
+            .on_node_failure_with_placement(
+                failed_node,
+                || Box::new(NoopDaemon),
+                &sched,
+                &reg,
+                &AllowAll,
+                &tb,
+            )
+            .unwrap();
+
+        assert!(
+            replaced.is_empty(),
+            "no spare → placement must fail and no replacement recorded"
+        );
+        assert!(
+            reg.contains(failed_origin),
+            "slot must remain registered when placement fails (recovery guarantee #7)"
+        );
+
+        group.on_node_recovery(failed_node, &reg);
+        assert_eq!(group.health(), GroupHealth::Healthy);
+    }
+
+    /// `spawn` (v1) is unchanged after the v2 surface lands —
+    /// pins the "additive, no behavior change" guarantee for slice 5.
+    #[test]
+    fn spawn_v1_path_unchanged_after_v2_added() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+        let group =
+            ReplicaGroup::spawn(test_config(3), || Box::new(NoopDaemon), &sched, &reg).unwrap();
+        assert_eq!(group.replica_count(), 3);
+        assert_eq!(group.health(), GroupHealth::Healthy);
     }
 }

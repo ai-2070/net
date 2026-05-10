@@ -133,6 +133,28 @@ extern int net_rpc_call_streaming(
     RpcStreamHandleC** out_stream,
     char** out_err
 );
+/* N-16: cancellable streaming construction. Pass cancel_token != 0
+ * to make a parallel net_rpc_cancel_call abort the construction
+ * block_on before the stream handle materializes; pass 0 to
+ * short-circuit to the non-cancellable path with no registry
+ * overhead.
+ *
+ * The with-headers cancellable variant
+ * (`net_rpc_call_streaming_with_headers_cancellable`) is declared
+ * in `net_rpc.h`; this Go cgo prelude doesn't currently consume
+ * the headers surface, so it's only declared upstream until a
+ * consumer wires it through. */
+extern int net_rpc_call_streaming_cancellable(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms,
+    uint32_t stream_window,
+    uint64_t cancel_token,
+    RpcStreamHandleC** out_stream,
+    char** out_err
+);
 extern int net_rpc_stream_next(
     RpcStreamHandleC* stream,
     uint8_t** out_chunk_ptr, size_t* out_chunk_len,

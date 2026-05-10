@@ -11,8 +11,11 @@ use crate::adapter::net::behavior::loadbalance::{
     Endpoint, HealthStatus, LoadBalancer, RequestContext, Strategy,
 };
 use crate::adapter::net::behavior::metadata::NodeId;
+use crate::adapter::net::behavior::placement::{Artifact, PlacementFilter, TieBreakContext};
 use crate::adapter::net::compute::daemon::DaemonError;
-use crate::adapter::net::compute::scheduler::{Scheduler, SchedulerError};
+use crate::adapter::net::compute::scheduler::{
+    PlacementDecision, PlacementReason, Scheduler, SchedulerError,
+};
 
 // ── Member info ──────────────────────────────────────────────────────────────
 
@@ -256,7 +259,7 @@ impl GroupCoordinator {
         scheduler: &Scheduler,
         requirements: &CapabilityFilter,
         exclude: &HashSet<u64>,
-    ) -> Result<crate::adapter::net::compute::scheduler::PlacementDecision, GroupError> {
+    ) -> Result<PlacementDecision, GroupError> {
         let placement = scheduler.place(requirements)?;
         if !exclude.contains(&placement.node_id) {
             return Ok(placement);
@@ -265,9 +268,9 @@ impl GroupCoordinator {
         let candidates = scheduler.query_candidates(requirements);
         for node_id in candidates {
             if !exclude.contains(&node_id) {
-                return Ok(crate::adapter::net::compute::scheduler::PlacementDecision {
+                return Ok(PlacementDecision {
                     node_id,
-                    reason: crate::adapter::net::compute::scheduler::PlacementReason::FirstMatch,
+                    reason: PlacementReason::FirstMatch,
                 });
             }
         }
@@ -275,6 +278,48 @@ impl GroupCoordinator {
         Err(GroupError::PlacementFailed(
             "all candidate nodes are excluded by spread constraint".into(),
         ))
+    }
+
+    /// Phase G slice 4 — score-based v2 of [`Self::place_with_spread`].
+    /// Delegates to [`Scheduler::select_member_node`] so the same
+    /// scoring + §7-LOCKED tie-breaker that backs migration placement
+    /// also drives replica / fork / standby member placement.
+    ///
+    /// The returned `PlacementDecision` carries
+    /// [`PlacementReason::BestScore`] so observers can distinguish
+    /// the v2 path from the legacy first-match path.
+    ///
+    /// `requirements` narrows the candidate pool via the existing
+    /// `CapabilityFilter`; `placement` scores survivors; `exclude`
+    /// drops already-placed members (for spread); `tie_break`
+    /// resolves equal scores. Returns
+    /// [`GroupError::PlacementFailed`] when every candidate is
+    /// excluded or filter-vetoed — same observable failure mode as
+    /// `place_with_spread`'s "all candidates excluded" branch.
+    ///
+    /// Additive — does not change `place_with_spread`'s behavior.
+    /// Group modules opt in by calling this helper from their
+    /// `*_with_placement` variants in subsequent slices.
+    pub fn place_member(
+        scheduler: &Scheduler,
+        artifact: &Artifact<'_>,
+        requirements: &CapabilityFilter,
+        exclude: &HashSet<u64>,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+    ) -> Result<PlacementDecision, GroupError> {
+        let node_id = scheduler
+            .select_member_node(artifact, requirements, exclude, placement, tie_break)
+            .ok_or_else(|| {
+                GroupError::PlacementFailed(
+                    "no candidate satisfied placement filter (every node excluded or vetoed)"
+                        .into(),
+                )
+            })?;
+        Ok(PlacementDecision {
+            node_id,
+            reason: PlacementReason::BestScore,
+        })
     }
 }
 
@@ -284,5 +329,282 @@ impl std::fmt::Debug for GroupCoordinator {
             .field("members", &self.members.len())
             .field("healthy", &self.healthy_count())
             .finish()
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::net::behavior::capability::{
+        CapabilityAnnouncement, CapabilityIndex, CapabilitySet,
+    };
+    use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
+    use std::sync::Arc;
+
+    fn make_scheduler(node_ids: &[u64]) -> (Scheduler, Arc<CapabilityIndex>) {
+        let index = Arc::new(CapabilityIndex::new());
+        let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+        for &id in node_ids {
+            index.index(CapabilityAnnouncement::new(
+                id,
+                eid.clone(),
+                1,
+                CapabilitySet::new(),
+            ));
+        }
+        // Local node id = first in list (or 0xFFFF if list is empty).
+        let local = node_ids.first().copied().unwrap_or(0xFFFF);
+        let scheduler = Scheduler::new(index.clone(), local, CapabilitySet::new());
+        (scheduler, index)
+    }
+
+    /// Synthetic placement filter — a fixed score for every candidate
+    /// except those listed in `veto`, which return `None` (hard veto).
+    struct FixedScore {
+        score: f32,
+        veto: Vec<u64>,
+    }
+
+    impl PlacementFilter for FixedScore {
+        fn placement_score(
+            &self,
+            target: &PlacementNodeId,
+            _artifact: &Artifact<'_>,
+        ) -> Option<f32> {
+            if self.veto.contains(target) {
+                None
+            } else {
+                Some(self.score)
+            }
+        }
+    }
+
+    fn empty_caps() -> CapabilitySet {
+        CapabilitySet::new()
+    }
+
+    fn daemon_artifact<'a>(
+        required: &'a CapabilitySet,
+        optional: &'a CapabilitySet,
+    ) -> Artifact<'a> {
+        Artifact::Daemon {
+            daemon_id: [0u8; 32],
+            required,
+            optional,
+        }
+    }
+
+    /// `place_member` returns a `PlacementDecision` carrying
+    /// `BestScore` reason for every successful selection — pins the
+    /// observability contract that distinguishes v2 from v1.
+    #[test]
+    fn place_member_stamps_best_score_reason() {
+        let (sched, index) = make_scheduler(&[0x1111, 0x2222, 0x3333]);
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        let placement = FixedScore {
+            score: 0.7,
+            veto: vec![],
+        };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        let exclude = HashSet::new();
+
+        let decision = GroupCoordinator::place_member(
+            &sched,
+            &artifact,
+            &CapabilityFilter::default(),
+            &exclude,
+            &placement,
+            &tb,
+        )
+        .expect("placement should succeed with three eligible candidates");
+
+        assert_eq!(decision.reason, PlacementReason::BestScore);
+        // All three score 0.7; lex-NodeId tie-breaker picks lowest.
+        assert_eq!(decision.node_id, 0x1111);
+    }
+
+    /// `place_member` honors the exclusion set — pins spread-aware
+    /// behavior the replica / fork / standby groups depend on. The
+    /// excluded node is never returned even when its score would be
+    /// the best.
+    #[test]
+    fn place_member_excludes_already_placed_nodes() {
+        let (sched, index) = make_scheduler(&[0x1111, 0x2222, 0x3333]);
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        let placement = FixedScore {
+            score: 0.5,
+            veto: vec![],
+        };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+
+        let mut exclude = HashSet::new();
+        exclude.insert(0x1111u64);
+
+        let decision = GroupCoordinator::place_member(
+            &sched,
+            &artifact,
+            &CapabilityFilter::default(),
+            &exclude,
+            &placement,
+            &tb,
+        )
+        .expect("placement should succeed with two remaining candidates");
+
+        assert_eq!(decision.reason, PlacementReason::BestScore);
+        assert_eq!(decision.node_id, 0x2222);
+    }
+
+    /// Filter veto + exclusion compose: every candidate either
+    /// excluded or vetoed → `PlacementFailed`. Same observable
+    /// failure mode as `place_with_spread`'s "all candidates
+    /// excluded" branch.
+    #[test]
+    fn place_member_returns_placement_failed_when_all_vetoed_or_excluded() {
+        let (sched, index) = make_scheduler(&[0x1111, 0x2222, 0x3333]);
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        // Veto 0x2222; exclude 0x1111 and 0x3333.
+        let placement = FixedScore {
+            score: 1.0,
+            veto: vec![0x2222],
+        };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        let mut exclude = HashSet::new();
+        exclude.insert(0x1111u64);
+        exclude.insert(0x3333u64);
+
+        let err = GroupCoordinator::place_member(
+            &sched,
+            &artifact,
+            &CapabilityFilter::default(),
+            &exclude,
+            &placement,
+            &tb,
+        )
+        .expect_err("every candidate is filtered out");
+
+        match err {
+            GroupError::PlacementFailed(msg) => {
+                assert!(
+                    msg.contains("excluded or vetoed"),
+                    "error message should explain why placement failed: {msg}"
+                );
+            }
+            other => panic!("expected PlacementFailed, got {other:?}"),
+        }
+    }
+
+    /// `place_member` ranks candidates by score: a higher-scoring
+    /// node wins over a lower-scoring one even when lex order would
+    /// pick the lower-scoring node first. Pins the v2 score-based
+    /// contract — v1 (`place_with_spread`) returns the first match
+    /// in index order, which can deviate from the score-best pick.
+    #[test]
+    fn place_member_picks_highest_scoring_over_lex_order() {
+        let (sched, index) = make_scheduler(&[0x1111, 0x2222, 0x3333]);
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+
+        // Synthetic score: 0x1111 → 0.1, 0x2222 → 0.9, 0x3333 → 0.5.
+        struct ScoredFilter;
+        impl PlacementFilter for ScoredFilter {
+            fn placement_score(&self, target: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
+                Some(match *target {
+                    0x1111 => 0.1,
+                    0x2222 => 0.9,
+                    0x3333 => 0.5,
+                    _ => 0.0,
+                })
+            }
+        }
+
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        let exclude = HashSet::new();
+
+        let decision = GroupCoordinator::place_member(
+            &sched,
+            &artifact,
+            &CapabilityFilter::default(),
+            &exclude,
+            &ScoredFilter,
+            &tb,
+        )
+        .expect("placement should succeed");
+
+        assert_eq!(decision.reason, PlacementReason::BestScore);
+        assert_eq!(
+            decision.node_id, 0x2222,
+            "highest scorer wins, NOT the lex-lowest"
+        );
+    }
+
+    /// Empty candidate pool (no nodes in index) → `PlacementFailed`.
+    #[test]
+    fn place_member_returns_placement_failed_for_empty_index() {
+        let (sched, index) = make_scheduler(&[]);
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        let placement = FixedScore {
+            score: 1.0,
+            veto: vec![],
+        };
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            index: &index,
+            resource_axis: ResourceAxis::Compute,
+        };
+        let exclude = HashSet::new();
+
+        let err = GroupCoordinator::place_member(
+            &sched,
+            &artifact,
+            &CapabilityFilter::default(),
+            &exclude,
+            &placement,
+            &tb,
+        )
+        .expect_err("empty index → placement failure");
+
+        assert!(matches!(err, GroupError::PlacementFailed(_)));
+    }
+
+    /// `place_member` is additive — calling `place_with_spread` on
+    /// the same scheduler still works. Covers the "no callers
+    /// changed yet" guarantee for slice 4.
+    #[test]
+    fn place_with_spread_unchanged_after_place_member_added() {
+        let (sched, _index) = make_scheduler(&[0x1111, 0x2222, 0x3333]);
+        let exclude = HashSet::new();
+        let decision =
+            GroupCoordinator::place_with_spread(&sched, &CapabilityFilter::default(), &exclude)
+                .expect("legacy path still works");
+        // Local node (first in list) preferred.
+        assert_eq!(decision.node_id, 0x1111);
+        assert_eq!(decision.reason, PlacementReason::LocalPreferred);
     }
 }

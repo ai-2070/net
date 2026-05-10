@@ -142,17 +142,54 @@ static NEXT_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 /// 1 so `0` is reserved as "no token" sentinel.
 static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// Process-global registry of in-flight call abort handles.
+/// Per-token state. CR-13: split into `cancelled` (boolean
+/// observed by `run_cancellable` after registering its handle)
+/// and `handle` (the abort handle, populated by
+/// `run_cancellable` post-spawn). Pre-CR-13 the registry was
+/// `HashMap<u64, AbortHandle>`, so a cancel arriving in the
+/// gap between `reserve_cancel_token` and the post-spawn
+/// `insert` (or even in the gap between `spawn` and `insert`)
+/// found no entry and dropped on the floor.
+///
+/// Q18: `marked_at` records when an orphan entry (no handle yet)
+/// was created by `cancel_call`. The opportunistic GC in
+/// `cancel_call` evicts orphans older than `ORPHAN_TTL` so a
+/// `reserve_token` + `cancel_call` flow whose `rpc_call` never
+/// runs doesn't leak a registry entry forever.
+struct CancelEntry {
+    cancelled: bool,
+    handle: Option<tokio::task::AbortHandle>,
+    marked_at: Option<std::time::Instant>,
+}
+
+impl Default for CancelEntry {
+    fn default() -> Self {
+        Self {
+            cancelled: false,
+            handle: None,
+            marked_at: None,
+        }
+    }
+}
+
+/// How long an orphaned (cancel-only, no live handle) registry
+/// entry stays before opportunistic GC evicts it. Chosen long
+/// enough that a legitimate `reserve_cancel_token` followed by
+/// a slow dispatch (network jitter, queue contention) still
+/// finds the cancellation flag, but short enough that
+/// pathological callers — `reserve_token` then `cancel_call`
+/// without ever issuing the call — don't accumulate state.
+const ORPHAN_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Process-global registry of in-flight call cancel state.
 /// Populated by `net_rpc_call*` when the caller passes a non-NULL
 /// `out_cancel_token` out-param; queried by `net_rpc_cancel_call`.
-/// Entry removal happens either by the awaiting task (on
-/// completion) or by `net_rpc_cancel_call` (on user-driven
-/// cancellation) — whichever runs first wins.
-fn cancel_registry(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>> {
-    static REG: OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>>,
-    > = OnceLock::new();
+/// Entry removal happens by `run_cancellable` once the call
+/// returns (success or abort path), OR by the opportunistic
+/// `ORPHAN_TTL`-based GC inside `net_rpc_cancel_call` (Q18).
+fn cancel_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>> {
+    static REG: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>>> =
+        OnceLock::new();
     REG.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -173,12 +210,48 @@ pub extern "C" fn net_rpc_reserve_cancel_token() -> u64 {
 /// `UnaryCallGuard::Drop` to publish CANCEL to the server. The
 /// caller-side `net_rpc_call` returns `NET_RPC_ERR_CALL_FAILED`
 /// with `out_err = "nrpc:cancelled: call cancelled by caller"`.
+///
+/// CR-13: a cancel that arrives BEFORE `run_cancellable` has
+/// registered its abort handle (the gap between
+/// `reserve_cancel_token` and the actual `rpc_call`, or between
+/// `spawn` and `insert` inside `run_cancellable`) used to drop
+/// on the floor — the call would run to completion. Now we
+/// either abort an existing handle, or insert/mark the entry
+/// with `cancelled = true` so `run_cancellable` aborts on
+/// register.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_cancel_call(token: u64) {
     if token == 0 {
         return;
     }
-    if let Some(handle) = cancel_registry().lock().remove(&token) {
+    let mut reg = cancel_registry().lock();
+
+    // Q18: opportunistic GC of orphaned cancel-only entries
+    // older than `ORPHAN_TTL`. Without this, a Go caller that
+    // does `reserve_cancel_token` + `cancel_call` for a token
+    // whose `rpc_call` never actually runs (e.g. context
+    // already done; a deadline-elapsed pre-check) leaves a
+    // `{cancelled: true, handle: None}` entry that nothing
+    // cleans up — unbounded memory growth proportional to the
+    // number of such never-dispatched cancels.
+    let now = std::time::Instant::now();
+    reg.retain(|_, entry| {
+        entry.handle.is_some()
+            || entry
+                .marked_at
+                .is_none_or(|t| now.duration_since(t) < ORPHAN_TTL)
+    });
+
+    let entry = reg.entry(token).or_default();
+    entry.cancelled = true;
+    if entry.marked_at.is_none() {
+        entry.marked_at = Some(now);
+    }
+    if let Some(handle) = entry.handle.take() {
+        // Drop the lock before invoking abort; abort is cheap
+        // but we don't want to hold the registry lock across
+        // arbitrary tokio internals.
+        drop(reg);
         handle.abort();
     }
 }
@@ -401,10 +474,11 @@ pub extern "C" fn net_rpc_free_cstring(s: *mut c_char) {
 /// on NULL or zero-length.
 ///
 /// Layout invariant: every site that hands a buffer out via
-/// [`write_response`] does so by `Box::into_raw(Vec::into_boxed_slice)`,
-/// whose memory layout is `(ptr, len)` with `cap == len` baked in —
-/// no `shrink_to_fit` best-effort hazard. The free path
-/// reconstructs the same `Box<[u8]>` and drops it.
+/// `write_response` (private helper) does so by
+/// `Box::into_raw(Vec::into_boxed_slice)`, whose memory layout is
+/// `(ptr, len)` with `cap == len` baked in — no `shrink_to_fit`
+/// best-effort hazard. The free path reconstructs the same
+/// `Box<[u8]>` and drops it.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_response_free(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
@@ -495,6 +569,68 @@ fn build_call_options(deadline_ms: u64) -> InnerCallOptions {
         inner.deadline = Some(Instant::now() + Duration::from_millis(deadline_ms));
     }
     inner
+}
+
+/// FFI-side request-header descriptor. The C ABI consumer
+/// allocates a `net_rpc_header_t[]`, fills each entry with
+/// `(name_ptr, name_len, value_ptr, value_len)` slices it owns,
+/// and passes the array + count to a `_with_headers` call. The
+/// header name MUST be valid UTF-8; the value is opaque bytes
+/// (Phase 9b's `cyberdeck-where:` value is JSON, but the
+/// substrate doesn't enforce a value-side encoding).
+///
+/// Buffers are referenced for the duration of the call only —
+/// the Rust side copies into owned `(String, Vec<u8>)` pairs
+/// before dispatching, so the C consumer's lifetime concern is
+/// "stays valid until the function returns."
+#[repr(C)]
+pub struct NetRpcHeader {
+    pub name_ptr: *const c_char,
+    pub name_len: usize,
+    pub value_ptr: *const u8,
+    pub value_len: usize,
+}
+
+/// Convert a C `(headers_ptr, header_count)` array into the
+/// substrate's `Vec<(String, Vec<u8>)>` shape. Returns `None` if
+/// any header name fails UTF-8 validation OR the caller passed
+/// `header_count > 0` with a NULL `headers_ptr` (a contract
+/// violation — the caller claims to ship N headers but didn't
+/// supply the array). Caller maps `None` to a typed error.
+unsafe fn collect_headers(
+    headers_ptr: *const NetRpcHeader,
+    header_count: usize,
+) -> Option<Vec<(String, Vec<u8>)>> {
+    if header_count == 0 {
+        // Zero headers — the pointer is allowed to be NULL or
+        // dangling because we never dereference it.
+        return Some(Vec::new());
+    }
+    if headers_ptr.is_null() {
+        // Caller said N>0 but didn't actually pass an array.
+        // Surface as invalid input instead of silently dropping
+        // every header.
+        return None;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(headers_ptr, header_count) };
+    let mut out = Vec::with_capacity(header_count);
+    for h in slice {
+        if h.name_ptr.is_null() {
+            return None;
+        }
+        let name_bytes = unsafe { std::slice::from_raw_parts(h.name_ptr as *const u8, h.name_len) };
+        let name = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => return None,
+        };
+        let value = if h.value_ptr.is_null() || h.value_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(h.value_ptr, h.value_len).to_vec() }
+        };
+        out.push((name, value));
+    }
+    Some(out)
 }
 
 // =========================================================================
@@ -599,11 +735,27 @@ where
     }
     let task = runtime().spawn(fut);
     let abort_handle = task.abort_handle();
-    cancel_registry().lock().insert(cancel_token, abort_handle);
+    // CR-13: register-or-observe-prior-cancel. If
+    // `net_rpc_cancel_call` already fired between the caller's
+    // `reserve_cancel_token` and this register, the entry is
+    // present with `cancelled=true` — abort right away. Else
+    // store the abort handle so a future cancel finds it.
+    let was_already_cancelled = {
+        let mut reg = cancel_registry().lock();
+        let entry = reg.entry(cancel_token).or_default();
+        if entry.cancelled {
+            true
+        } else {
+            entry.handle = Some(abort_handle.clone());
+            false
+        }
+    };
+    if was_already_cancelled {
+        abort_handle.abort();
+    }
     let result = runtime().block_on(task);
-    // Best-effort registry cleanup. The user-driven cancel path
-    // already removes — both removals racing is fine because the
-    // map's remove is a no-op when the key is gone.
+    // Cleanup: drop the entry whether we registered, observed
+    // a prior cancel, or observed a successful completion.
     cancel_registry().lock().remove(&cancel_token);
     match result {
         Ok(value) => Ok(value),
@@ -965,6 +1117,82 @@ pub extern "C" fn net_rpc_call_streaming(
     }
 }
 
+/// N-16: cancellable variant of [`net_rpc_call_streaming`].
+/// Identical contract; adds a `cancel_token` parameter so the
+/// construction `block_on` (which awaits the peer's initial-frame
+/// ACK) can be aborted by [`net_rpc_cancel_call`] from another
+/// thread. The unary [`net_rpc_call_cancellable`] path got this
+/// discipline as CR-13; the streaming variant lost the cancel hook
+/// because [`net_rpc_stream_close`] only takes effect AFTER the
+/// stream handle is constructed — a Go consumer's `ctx.Done()`
+/// watcher has nothing to call into during the construction
+/// window. `cancel_token == 0` short-circuits to the original
+/// non-cancellable path (no registry overhead).
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_streaming_cancellable(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    stream_window: u32,
+    cancel_token: u64,
+    out_stream: *mut *mut RpcStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    let node = h.node.clone();
+
+    let result = run_cancellable(cancel_token, async move {
+        node.call_streaming(target_node_id, &service, req_bytes, opts)
+            .await
+    });
+
+    match result {
+        Ok(Ok(stream)) => {
+            let call_id = stream.call_id();
+            let boxed = Box::new(RpcStreamHandleC {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_stream = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(
+                out_err,
+                "cancelled: streaming call cancelled by caller before construction".into(),
+            );
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
 /// Block until the next chunk arrives, OR the stream terminates,
 /// OR a mid-stream error fires.
 ///
@@ -1097,6 +1325,294 @@ pub extern "C" fn net_rpc_stream_free(stream: *mut RpcStreamHandleC) {
 }
 
 // =========================================================================
+// Header-bearing call variants (Phase 9b end-to-end).
+//
+// The legacy `net_rpc_call` / `_call_service` / `_call_streaming`
+// don't take request headers — predicate-pushdown via the
+// `cyberdeck-where:` header (built by
+// `net_predicate_to_where_header` in the main `libnet` cdylib)
+// had nowhere to go on the C ABI side. These three additive
+// variants accept a `(headers, count)` pair and forward it to
+// `InnerCallOptions::request_headers`. Legacy variants are
+// untouched — non-9b callers compile + run as before.
+// =========================================================================
+
+/// `net_rpc_call` with arbitrary request headers attached.
+/// Ergonomically identical to the legacy variant plus the
+/// `(headers_ptr, header_count)` parameters.
+///
+/// Header buffers are read for the duration of the call only —
+/// Rust copies into owned `(String, Vec<u8>)` before dispatching,
+/// so the consumer can release / reuse the memory once the call
+/// returns. NULL `headers_ptr` with `header_count == 0` is
+/// equivalent to the legacy variant.
+///
+/// Header name MUST be valid UTF-8; non-UTF-8 names return
+/// [`NET_RPC_ERR_INVALID_UTF8`] with a descriptive `out_err`
+/// message and never reach the wire.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_with_headers(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    cancel_token: u64,
+    headers_ptr: *const NetRpcHeader,
+    header_count: usize,
+    out_resp_ptr: *mut *mut u8,
+    out_resp_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+        write_err(out_err, "request header name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    opts.request_headers = headers;
+    let node = h.node.clone();
+
+    let result = run_cancellable(cancel_token, async move {
+        node.call(target_node_id, &service, req_bytes, opts).await
+    });
+
+    match result {
+        Ok(Ok(reply)) => {
+            write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(out_err, "cancelled: call cancelled by caller".into());
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// `net_rpc_call_service` with arbitrary request headers attached.
+/// Same shape as [`net_rpc_call_with_headers`] but resolves
+/// `service` against the local capability index instead of taking
+/// an explicit target.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_service_with_headers(
+    handle: *mut MeshRpcHandle,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    cancel_token: u64,
+    headers_ptr: *const NetRpcHeader,
+    header_count: usize,
+    out_resp_ptr: *mut *mut u8,
+    out_resp_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+        write_err(out_err, "request header name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    opts.request_headers = headers;
+    let node = h.node.clone();
+
+    let result = run_cancellable(cancel_token, async move {
+        node.call_service(&service, req_bytes, opts).await
+    });
+
+    match result {
+        Ok(Ok(reply)) => {
+            write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(out_err, "cancelled: call cancelled by caller".into());
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// `net_rpc_call_streaming` with arbitrary request headers
+/// attached. Same shape as
+/// [`net_rpc_call_streaming`] plus the
+/// `(headers_ptr, header_count)` pair.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_streaming_with_headers(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    stream_window: u32,
+    headers_ptr: *const NetRpcHeader,
+    header_count: usize,
+    out_stream: *mut *mut RpcStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+        write_err(out_err, "request header name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    opts.request_headers = headers;
+    let node = h.node.clone();
+
+    let result = runtime().block_on(async move {
+        node.call_streaming(target_node_id, &service, req_bytes, opts)
+            .await
+    });
+
+    match result {
+        Ok(stream) => {
+            let call_id = stream.call_id();
+            let boxed = Box::new(RpcStreamHandleC {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_stream = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// N-16: cancellable variant of
+/// [`net_rpc_call_streaming_with_headers`]. Same cancellation
+/// contract as [`net_rpc_call_streaming_cancellable`]: routes the
+/// construction `block_on` through [`run_cancellable`] so an
+/// in-flight [`net_rpc_cancel_call`] aborts mid-construction.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    stream_window: u32,
+    cancel_token: u64,
+    headers_ptr: *const NetRpcHeader,
+    header_count: usize,
+    out_stream: *mut *mut RpcStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+        write_err(out_err, "request header name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    opts.request_headers = headers;
+    let node = h.node.clone();
+
+    let result = run_cancellable(cancel_token, async move {
+        node.call_streaming(target_node_id, &service, req_bytes, opts)
+            .await
+    });
+
+    match result {
+        Ok(Ok(stream)) => {
+            let call_id = stream.call_id();
+            let boxed = Box::new(RpcStreamHandleC {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_stream = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(
+                out_err,
+                "cancelled: streaming call cancelled by caller before construction".into(),
+            );
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+// =========================================================================
 // Tests for pure-logic helpers.
 // =========================================================================
 
@@ -1140,6 +1656,41 @@ mod tests {
             message: "x".into(),
         })
         .starts_with("codec_decode:"));
+    }
+
+    /// Regression: `collect_headers` rejects `headers_ptr == NULL`
+    /// when the caller claims `header_count > 0`. The pre-fix
+    /// `if header_count == 0 || headers_ptr.is_null()` short-circuit
+    /// silently returned an empty Vec for that combo, dropping
+    /// every header the caller intended to ship.
+    #[test]
+    fn collect_headers_rejects_null_pointer_with_nonzero_count() {
+        // NULL + count > 0 → invalid FFI input → None (caller
+        // surfaces a typed error).
+        let out = unsafe { collect_headers(std::ptr::null(), 3) };
+        assert!(
+            out.is_none(),
+            "headers_ptr=NULL with count>0 must surface as invalid input, not as empty headers",
+        );
+
+        // count == 0 stays permissive: the pointer is never read,
+        // so NULL / dangling is fine.
+        let out = unsafe { collect_headers(std::ptr::null(), 0) };
+        assert_eq!(out.as_deref().map(|v| v.len()), Some(0));
+
+        // Negative control: a real array round-trips.
+        let name = b"x-trace";
+        let value = b"abc";
+        let h = NetRpcHeader {
+            name_ptr: name.as_ptr() as *const c_char,
+            name_len: name.len(),
+            value_ptr: value.as_ptr(),
+            value_len: value.len(),
+        };
+        let out = unsafe { collect_headers(&h, 1) }.expect("valid header");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "x-trace");
+        assert_eq!(out[0].1, b"abc");
     }
 
     /// `cstr_to_string` rejects NULL and invalid UTF-8.
@@ -1322,12 +1873,86 @@ mod tests {
         canceller.join().unwrap();
     }
 
+    /// CR-13: `run_cancellable` honors a cancel that arrived
+    /// BEFORE the call even started. Pre-CR-13 the registry
+    /// didn't carry a `cancelled` flag — a cancel issued
+    /// against a reserved token whose call hadn't yet inserted
+    /// the abort handle would silently drop on the floor, and
+    /// the subsequent call would run to completion despite the
+    /// caller's cancel signal.
+    #[test]
+    fn run_cancellable_honors_cancel_issued_before_register() {
+        let token = net_rpc_reserve_cancel_token();
+        // Fire cancel against the reserved token BEFORE
+        // run_cancellable runs. With CR-13 the registry now
+        // carries `cancelled=true` for this token; without
+        // CR-13 the cancel would no-op.
+        net_rpc_cancel_call(token);
+        let result = run_cancellable(token, async move {
+            // Long-running future. If the pre-cancel didn't take
+            // effect, this sleep would eventually return Ok and
+            // the test wedges (caught by cargo's per-test timeout).
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            "should never reach here"
+        });
+        assert!(
+            result.is_err(),
+            "pre-issued cancel must abort the future immediately"
+        );
+        // Registry entry should be cleaned up after run_cancellable.
+        let lingering = cancel_registry().lock().contains_key(&token);
+        assert!(
+            !lingering,
+            "registry entry must be removed after run_cancellable"
+        );
+    }
+
     /// `run_cancellable` with token=0 short-circuits to plain
     /// block_on — no registry overhead, no abort handle.
     #[test]
     fn run_cancellable_token_zero_runs_to_completion() {
         let result = run_cancellable(0, async move { 42_u32 });
         assert_eq!(result.unwrap(), 42);
+    }
+
+    /// Q18: a cancel issued for a token whose `rpc_call` never
+    /// runs leaves a `{cancelled, no handle}` orphan entry.
+    /// Pre-fix nothing cleaned those up, so a caller that did
+    /// `reserve_token` + `cancel_call` repeatedly without any
+    /// dispatch accumulated registry state without bound. The
+    /// opportunistic GC inside `net_rpc_cancel_call` evicts
+    /// orphans older than `ORPHAN_TTL`; we exercise that by
+    /// stamping a fake-old `marked_at` directly into the entry
+    /// and then issuing a cancel for an unrelated token.
+    #[test]
+    fn cancel_call_evicts_stale_orphan_entries() {
+        let stale_token = net_rpc_reserve_cancel_token();
+        let fresh_token = net_rpc_reserve_cancel_token();
+
+        // Stamp the stale token's entry as old enough to evict.
+        // Same shape `cancel_call` produces, but with a
+        // marked_at predating ORPHAN_TTL.
+        {
+            let mut reg = cancel_registry().lock();
+            let entry = reg.entry(stale_token).or_default();
+            entry.cancelled = true;
+            entry.marked_at = Some(std::time::Instant::now() - (ORPHAN_TTL * 2));
+        }
+
+        // Issue a cancel for an unrelated token. The opportunistic
+        // GC should evict the stale entry while inserting the
+        // fresh one.
+        net_rpc_cancel_call(fresh_token);
+
+        let reg = cancel_registry().lock();
+        assert!(
+            !reg.contains_key(&stale_token),
+            "stale orphan entry should have been evicted"
+        );
+        // Fresh entry is present (it's an orphan with current
+        // marked_at). Its eventual cleanup is its own next-call
+        // GC pass; that's the bounded behavior we want.
+        assert!(reg.contains_key(&fresh_token));
     }
 
     /// `net_rpc_serve` rejects `handler_id == 0` with a clear
@@ -1376,5 +2001,80 @@ mod tests {
             net_rpc_free_cstring(err);
             assert!(!msg.is_empty(), "error message must be present");
         }
+    }
+
+    /// `collect_headers` round-trips a (name, value) array.
+    /// Pin the FFI buffer-shape contract: name is UTF-8 by length,
+    /// value is opaque bytes by length, both copied into owned
+    /// Rust types.
+    #[test]
+    fn collect_headers_round_trips_name_and_value() {
+        let name1 = b"cyberdeck-where";
+        let value1 = b"{\"nodes\":[],\"root_idx\":0}";
+        let name2 = b"x-trace-id";
+        let value2: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
+
+        let arr = [
+            NetRpcHeader {
+                name_ptr: name1.as_ptr() as *const c_char,
+                name_len: name1.len(),
+                value_ptr: value1.as_ptr(),
+                value_len: value1.len(),
+            },
+            NetRpcHeader {
+                name_ptr: name2.as_ptr() as *const c_char,
+                name_len: name2.len(),
+                value_ptr: value2.as_ptr(),
+                value_len: value2.len(),
+            },
+        ];
+        let collected = unsafe { collect_headers(arr.as_ptr(), arr.len()) }
+            .expect("UTF-8 names must collect cleanly");
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected[0].0, "cyberdeck-where");
+        assert_eq!(collected[0].1, value1.to_vec());
+        assert_eq!(collected[1].0, "x-trace-id");
+        assert_eq!(collected[1].1, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    /// Empty `(NULL, 0)` collects to an empty `Vec`. Matches the
+    /// "no headers" path the `_with_headers` variants accept.
+    #[test]
+    fn collect_headers_empty_input_returns_empty_vec() {
+        let collected = unsafe { collect_headers(std::ptr::null(), 0) }.expect("empty input is OK");
+        assert!(collected.is_empty());
+    }
+
+    /// Non-UTF-8 header name returns `None` so the caller can
+    /// surface `NET_RPC_ERR_INVALID_UTF8` to the consumer.
+    #[test]
+    fn collect_headers_non_utf8_name_returns_none() {
+        let bad_name: &[u8] = &[0xff, 0xfe, 0xfd]; // invalid UTF-8 sequence
+        let value = b"v";
+        let arr = [NetRpcHeader {
+            name_ptr: bad_name.as_ptr() as *const c_char,
+            name_len: bad_name.len(),
+            value_ptr: value.as_ptr(),
+            value_len: value.len(),
+        }];
+        let collected = unsafe { collect_headers(arr.as_ptr(), arr.len()) };
+        assert!(collected.is_none());
+    }
+
+    /// Empty value (NULL ptr or zero length) is preserved as
+    /// empty bytes — the substrate's `request_headers` accepts
+    /// zero-length values.
+    #[test]
+    fn collect_headers_null_or_zero_value_yields_empty_bytes() {
+        let name = b"x-empty";
+        let arr = [NetRpcHeader {
+            name_ptr: name.as_ptr() as *const c_char,
+            name_len: name.len(),
+            value_ptr: std::ptr::null(),
+            value_len: 0,
+        }];
+        let collected = unsafe { collect_headers(arr.as_ptr(), arr.len()) }.unwrap();
+        assert_eq!(collected[0].0, "x-empty");
+        assert!(collected[0].1.is_empty());
     }
 }

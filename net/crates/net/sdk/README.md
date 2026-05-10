@@ -443,6 +443,104 @@ narrowing, never out by accident). Full design:
 Wire-level details and the subprotocol layout live in
 [`docs/CAPABILITY_BROADCAST_PLAN.md`](../docs/CAPABILITY_BROADCAST_PLAN.md).
 
+#### Capability enhancements (typed taxonomy + predicates + validation)
+
+The substrate's `CapabilitySet` is a `{ tags, metadata }` wire shape
+post-Phase A.5.N. Beyond `announce_capabilities` / `find_nodes`, the
+SDK exposes the caller-local enhancement layer mirroring
+[`CAPABILITY_ENHANCEMENTS_PLAN.md`](../docs/plans/CAPABILITY_ENHANCEMENTS_PLAN.md):
+
+```rust
+use net_sdk::capabilities::{
+    // Typed taxonomy
+    Tag, TagKey, TaxonomyAxis, RESERVED_PREFIXES,
+    // Lazy view projections
+    CapabilitySet, CapabilityViews,
+    // Diff
+    CapabilitySetDiff, MetadataChange,
+    // Predicates (substrate AST + nRPC envelope + trace)
+    predicate::{
+        Predicate, EvalContext, PredicateDebugReport,
+        predicate_to_rpc_header, predicate_from_rpc_headers,
+        RPC_WHERE_HEADER,
+    },
+    pred,
+    // Validation
+    schema::{validate_capabilities, ValidationReport, SchemaError},
+};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+# let caps = CapabilitySet::default();
+# let prev = CapabilitySet::default();
+# let tags: Vec<Tag> = Vec::new();
+# let metadata = std::collections::BTreeMap::<String, String>::new();
+// Lazy view projections: per-axis OnceCell-cached decode.
+let views = caps.views();
+let _hw = views.hardware();          // Decodes hardware.* tags on first call.
+let _sw = views.software();          // Independent of hardware decode.
+
+// Predicate AST — language-idiomatic builder + macro form.
+let p = pred!(and [
+    pred!(exists "hardware.gpu"),
+    pred!(num_at_least "hardware.memory_mb", 65536.0),
+    pred!(metadata_equals "intent", "ml-training"),
+]);
+
+// Local evaluation against any (tags, metadata) context.
+let ctx = EvalContext::new(&tags, &metadata);
+let _matched = p.evaluate(&ctx);
+
+// Single-evaluation trace — every clause's verdict + skipped
+// children for short-circuit AND/OR.
+let (_result, _trace) = p.evaluate_with_trace(&ctx);
+
+// Wire form for nRPC `cyberdeck-where:` headers — pair with the
+// substrate's `*_with_headers` calls so server-side filtering
+// shortcircuits without re-running the predicate per hop.
+let (_name, _value): (String, Vec<u8>) = predicate_to_rpc_header(&p)?;
+let _ = RPC_WHERE_HEADER;
+// Reverse direction: parse a peer-supplied header back into the AST.
+// `predicate_from_rpc_headers` returns `Option<Result<Predicate, _>>`
+// — `None` when the `cyberdeck-where` header is absent, `Some(Err(_))`
+// on malformed payload. Use `.transpose()?` to flip into
+// `Result<Option<Predicate>, _>` and propagate decode errors.
+# let header_pairs: Vec<(String, Vec<u8>)> = Vec::new();
+let _decoded: Option<_> = predicate_from_rpc_headers(&header_pairs).transpose()?;
+
+// Validate against the canonical schema.
+let report = validate_capabilities(&caps);
+if !report.is_valid() {
+    eprintln!("schema errors: {:?}", report.errors);
+}
+
+// Detect what changed between two snapshots — drives placement
+// re-evaluation when a daemon's CapabilitySet updates.
+let _diff = caps.diff(&prev);
+
+// Profile a predicate across a corpus — per-clause hit/miss
+// stats with short-circuit accounting. Bindings (TS / Python /
+// Go) wrap this with a `redact_metadata_keys` helper for safe
+// persistence; Rust callers compose redaction at the application
+// layer.
+# let corpus = std::iter::empty::<EvalContext<'_>>();
+let _report = PredicateDebugReport::from_evaluations(&p, corpus);
+# Ok(())
+# }
+```
+
+For host-side placement-filter callbacks, implement
+[`PlacementFilter`](https://docs.rs/ai2070-net-sdk/latest/net_sdk/capabilities/trait.PlacementFilter.html)
+directly and register the impl with
+[`global_placement_filter_registry()`](https://docs.rs/ai2070-net-sdk/latest/net_sdk/capabilities/fn.global_placement_filter_registry.html);
+the TS / Python / Go bindings auto-wrap closures via
+`placement_filter_from_fn` for the same registry.
+
+The wire format is byte-identical across all five bindings (Rust /
+TS / Python / Go / C) — pinned by the JSON fixtures under
+`tests/cross_lang_capability/`. A worked-examples guide for each
+enhancement API:
+[`CAPABILITY_ENHANCEMENTS_USAGE.md`](../docs/CAPABILITY_ENHANCEMENTS_USAGE.md).
+
 ### Subnets (visibility partitioning)
 
 `MeshBuilder::subnet(id)` pins a node to one of 2³² possible 4-level

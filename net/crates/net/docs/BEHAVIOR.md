@@ -4,29 +4,63 @@ The semantic layer on top of transport. Nodes declare what they are, what they c
 
 ## Capability Announcements (CAP-ANN)
 
-Nodes announce hardware and software capabilities. The `CapabilityIndex` provides sub-microsecond lookup by capability filter.
+Nodes announce capabilities. Storage shape:
 
 ```rust
-pub struct HardwareCapabilities {
-    pub gpu: Option<GpuInfo>,
-    pub accelerators: Vec<AcceleratorInfo>,
-    pub memory_gb: f32,
-    pub cpu_cores: u16,
-}
-
-pub struct SoftwareCapabilities {
-    pub tools: Vec<ToolCapability>,
-    pub models: Vec<ModelCapability>,
-    pub modalities: Vec<Modality>,
-    pub tags: Vec<String>,
+pub struct CapabilitySet {
+    pub tags: HashSet<Tag>,
+    pub metadata: BTreeMap<String, String>,
 }
 ```
 
-`CapabilityFilter` matches against a `CapabilitySet` -- used by channel authorization, daemon placement, and API routing.
+`Tag` is a typed enum over the four-axis ontology (`Hardware` / `Software` / `Devices` / `Dataforts`):
+
+```rust
+pub enum Tag {
+    AxisPresent { axis: TaxonomyAxis, key: String },
+    AxisValue   { axis: TaxonomyAxis, key: String, value: String, separator: AxisSeparator },
+    Reserved    { prefix: String, body: String },   // scope:* / causal:* / fork-of:* / heat:*
+    Legacy(String),                                  // pre-A.5 untyped strings
+}
+```
+
+`HardwareCapabilities` / `SoftwareCapabilities` / `Vec<ModelCapability>` / `Vec<ToolCapability>` / `ResourceLimits` are *projections* of the tag set, lazily decoded via `caps.views()`. Encoding scheme: `hardware.cpu_cores=N` / `hardware.gpu` / `hardware.gpu.vram_mb=N` / `software.os=linux` / `software.model.0.id=...` / `hardware.limits.max_concurrent_requests=N`. Tool JSON-Schema strings (which can't safely round-trip through the tag wire format) live in `metadata` under `tool::<id>::input_schema` / `tool::<id>::output_schema`.
+
+Wire format emits tags in sorted `Tag::to_string()` order — the `HashSet` keeps O(1) membership for in-memory lookups; the `serialize_with` hook flattens to a sorted `Vec` on the way out. Without this, two ends of a signed announcement round-trip would produce different bytes (HashSet iteration is process-local random) and the verifier would reject as `InvalidSignature`.
+
+`CapabilityFilter` matches against a `CapabilitySet` — used by channel authorization, daemon placement, and API routing.
 
 `CapabilityIndex` stores all known nodes' capabilities in a `DashMap` with secondary indexes for fast GPU/tool/tag queries.
 
 **Benchmark:** Single tag filter in 10.5 ns, GPU check in 0.33 ns.
+
+### Predicate AST + evaluator
+
+For arbitrary boolean queries beyond `CapabilityFilter`, the substrate ships a typed `Predicate` AST in `behavior::predicate`. Variants: `Exists` / `Equals` / `NumericAtLeast` / `NumericAtMost` / `NumericInRange` / `SemverAtLeast` / `SemverAtMost` / `SemverCompatible` / `StringPrefix` / `StringMatches` / `MetadataExists` / `MetadataEquals` / `MetadataMatches` / `MetadataNumericAtLeast` / `And` / `Or` / `Not`. Authored via the `pred!` macro or builder helpers; evaluated against `EvalContext::new(&tags, &metadata)`.
+
+```rust
+let p = pred!(and [
+    pred!(exists "hardware.gpu"),
+    pred!(num_at_least "hardware.memory_mb", 65536.0),
+    pred!(semver_compatible "software.runtime.python", "3.11.0"),
+    pred!(metadata_equals "intent", "ml-training"),
+]);
+let ok = p.evaluate(&EvalContext::new(&tags, &metadata));
+```
+
+Predicates encode losslessly to a `cyberdeck-where:` nRPC header pair (`predicate_to_rpc_header` / `predicate_from_rpc_headers`) so server-side filtering picks the right candidate without re-running the predicate per hop. Trace and per-corpus debug-report variants (`evaluate_with_trace`, `predicate_debug_report`) record each clause's verdict count and short-circuit decisions; `redact_metadata_keys` scrubs metadata-equality / -matches values before persisting the report.
+
+### Capability validation
+
+`validate_capabilities(caps)` returns a `ValidationReport` of `errors` (operator-must-fix: `UnknownAxis`, `TypeMismatch`, `IndexMalformed`) + `warnings` (forward-compat / hygiene: `UnknownKey`, `MetadataOversize`, `LegacyTag`). The validator runs against a canonical `AXIS_SCHEMA` baked in at substrate build time. Both lists are sorted by JSON-stringified entry so cross-binding fixture comparisons stay order-independent. Soft cap on metadata is 4 KB.
+
+### Bloom-filter primitive
+
+`behavior::bloom::BloomFilter` (`{ len_bits, k, bits: Vec<u64> }`) backs compact chain-tag membership probes via xxh3-128 double-hashing. ~1% FPR at 10 K items in ≤ 500 KB. Probe pattern: callers that match the bloom run a follow-up precise lookup (existing `causal:<hex>` tag membership) before issuing real reads — false positives become recoverable misses, false negatives are impossible by construction.
+
+### CapabilityQuery trait
+
+`behavior::query::CapabilityQuery` lifts five composable ops over `CapabilityIndex`: `filter` (predicate-driven candidate set), `match_axis` (axis-shaped tag scan), `aggregate` (per-key cardinality / numeric reductions), `traverse` (graph-style join over peer capability links), `nearest` (combine with proximity to score the top-K best matches). Implementations on `CapabilityIndex` are O(log n) for indexed predicates and O(n) for the residual scan.
 
 ### Scoped discovery (`scope:*` reserved tags)
 
@@ -244,12 +278,20 @@ pub struct SafetyEnvelope {
 
 | File | Purpose |
 |------|---------|
-| `behavior/capability.rs` | `HardwareCapabilities`, `CapabilityIndex`, `CapabilityFilter` |
+| `behavior/capability.rs` | `CapabilitySet`, `HardwareCapabilities`, `CapabilityIndex`, `CapabilityFilter`, `CapabilityViews` |
+| `behavior/tag.rs` | `Tag`, `TagKey`, `TaxonomyAxis`, `AxisSeparator`, `RESERVED_PREFIXES` |
+| `behavior/tag_codec.rs` | Round-trip codecs `*_to_tags` / `*_from_tags` for each axis projection |
+| `behavior/predicate.rs` | `Predicate` AST, `EvalContext`, `pred!` macro, trace + debug-report aggregator |
+| `behavior/required_capability.rs` | `RequiredCapability` + the `require!` / `require_axis!` / `require_axis_value!` macros |
+| `behavior/schema.rs` | `validate_capabilities`, `ValidationReport`, `AXIS_SCHEMA`, `SchemaError`, `ValidationWarning` |
+| `behavior/bloom.rs` | `BloomFilter` primitive (xxh3-128 double-hashing, serde-canonical wire) |
+| `behavior/query.rs` | `CapabilityQuery` trait — `filter` / `match_axis` / `aggregate` / `traverse` / `nearest` |
 | `behavior/diff.rs` | `CapabilityDiff`, `DiffEngine`, `DiffOp` |
 | `behavior/metadata.rs` | `NodeMetadata`, `MetadataStore`, `MetadataQuery` |
 | `behavior/api.rs` | `ApiRegistry`, `ApiSchema`, `ApiEndpoint`, validation |
 | `behavior/rules.rs` | `RuleEngine`, `RuleSet`, `ConditionExpr`, `Action` |
 | `behavior/context.rs` | `Context`, `ContextStore`, `Span`, `Sampler` |
 | `behavior/loadbalance.rs` | `LoadBalancer`, `Strategy`, `Endpoint`, health |
+| `behavior/placement.rs` | `StandardPlacement` scorer, custom-filter callback dispatcher |
 | `behavior/proximity.rs` | `ProximityGraph`, `EnhancedPingwave`, latency edges |
 | `behavior/safety.rs` | `SafetyEnforcer`, `ResourceEnvelope`, `KillSwitchConfig` |

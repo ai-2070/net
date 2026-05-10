@@ -14,10 +14,13 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use crate::adapter::net::behavior::tag::Tag;
 
 // ============================================================================
 // Hardware Capabilities
@@ -488,6 +491,22 @@ pub struct ToolCapability {
 }
 
 impl ToolCapability {
+    /// Metadata key carrying this tool's input JSON Schema.
+    ///
+    /// Phase A.5.N convention: tool input/output schemas live in
+    /// `CapabilitySet::metadata` rather than the tag wire format
+    /// (JSON contains `=`/`:`/`,` which can't round-trip through
+    /// tags). Format: `tool::<tool_id>::input_schema`.
+    pub fn input_schema_metadata_key(tool_id: &str) -> String {
+        format!("tool::{tool_id}::input_schema")
+    }
+
+    /// Metadata key carrying this tool's output JSON Schema.
+    /// See [`Self::input_schema_metadata_key`].
+    pub fn output_schema_metadata_key(tool_id: &str) -> String {
+        format!("tool::{tool_id}::output_schema")
+    }
+
     /// Create new tool capability
     pub fn new(tool_id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
@@ -653,24 +672,35 @@ pub(crate) enum CapabilityScope {
     },
 }
 
-/// Resolve a list of `CapabilitySet::tags` into the
-/// announcer's effective [`CapabilityScope`]. Empty tenant /
-/// region values (`scope:tenant:` with no id) are silently dropped
-/// — defensive, since reading them as the empty string would let
-/// a peer match any tenant query that also had an empty id.
-pub(crate) fn scope_from_tags(tags: &[String]) -> CapabilityScope {
+/// Resolve a `CapabilitySet::tags` set into the announcer's
+/// effective [`CapabilityScope`]. Empty tenant / region values
+/// (`scope:tenant:` with no id) are silently dropped — defensive,
+/// since reading them as the empty string would let a peer match
+/// any tenant query that also had an empty id.
+///
+/// Phase A.5.N.2: signature now takes `&HashSet<Tag>`. Inspects
+/// `Tag::Reserved` variants where prefix is `scope:`. The body
+/// of those reserved tags is the post-`scope:` substring, e.g.
+/// `tenant:foo` / `region:eu-west` / `subnet-local`.
+pub(crate) fn scope_from_tags(tags: &HashSet<Tag>) -> CapabilityScope {
     let mut tenants = Vec::new();
     let mut regions = Vec::new();
     let mut subnet_local = false;
 
-    for t in tags {
-        if t == TAG_SCOPE_SUBNET_LOCAL {
+    for tag in tags {
+        let Tag::Reserved { prefix, body } = tag else {
+            continue;
+        };
+        if prefix.as_str() != "scope:" {
+            continue;
+        }
+        if body == "subnet-local" {
             subnet_local = true;
-        } else if let Some(id) = t.strip_prefix(TAG_SCOPE_TENANT_PREFIX) {
+        } else if let Some(id) = body.strip_prefix("tenant:") {
             if !id.is_empty() {
                 tenants.push(id.to_string());
             }
-        } else if let Some(name) = t.strip_prefix(TAG_SCOPE_REGION_PREFIX) {
+        } else if let Some(name) = body.strip_prefix("region:") {
             if !name.is_empty() {
                 regions.push(name.to_string());
             }
@@ -793,21 +823,59 @@ pub(crate) fn matches_scope(
 // Capability Set
 // ============================================================================
 
-/// Complete capability set for a node
+/// Complete capability set for a node.
+///
+/// Phase A.5.N.3 final shape: a typed `tags: HashSet<Tag>` plus
+/// a `metadata: BTreeMap` for data that can't safely round-trip
+/// through the tag wire format. Hardware / Software / Model /
+/// Tool / ResourceLimits are *projections* of these two fields,
+/// computed on demand via `views()` / the `From<&CapabilitySet>`
+/// impls. Typed-struct fields no longer exist on the storage
+/// shape — every read goes through the projection layer; every
+/// write goes through the typed setters which re-encode into the
+/// canonical tag set.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CapabilitySet {
-    /// Hardware capabilities
-    pub hardware: HardwareCapabilities,
-    /// Software capabilities
-    pub software: SoftwareCapabilities,
-    /// Model capabilities
-    pub models: Vec<ModelCapability>,
-    /// Tool capabilities
-    pub tools: Vec<ToolCapability>,
-    /// Custom tags for filtering
-    pub tags: Vec<String>,
-    /// Resource limits
-    pub limits: ResourceLimits,
+    /// Canonical typed tag set. Holds:
+    ///
+    /// - `Tag::AxisPresent` / `Tag::AxisValue` axis-prefixed tags
+    ///   (`hardware.gpu`, `hardware.memory_mb=65536`,
+    ///   `software.model.0.id=llama-3.1-70b`, …) that encode the
+    ///   five projections.
+    /// - `Tag::Reserved` cross-axis tags (`scope:tenant:foo`,
+    ///   `causal:<hex>`, `fork-of:<hex>`, `heat:*`).
+    /// - `Tag::Legacy` untyped tags (free-form strings, e.g.
+    ///   `nat:full-cone` / `nrpc:<service>`).
+    ///
+    /// Wire format emits tags in sorted `Tag::to_string()` order so
+    /// every serialization is canonical. The `HashSet` keeps O(1)
+    /// membership for in-memory lookups; the `serialize_with` hook
+    /// flattens to a sorted `Vec` on the way out. Two sides of a
+    /// signed-announcement round-trip therefore produce identical
+    /// bytes regardless of `HashSet` iteration order (which is
+    /// process-local random and would otherwise cause spurious
+    /// signature-verification failures across processes).
+    #[serde(default, serialize_with = "serialize_tags_sorted")]
+    pub tags: HashSet<Tag>,
+    /// Free-form key-value metadata.
+    ///
+    /// Phase A.5.N introduction. Carries data that doesn't fit the
+    /// typed-tag taxonomy:
+    ///
+    /// - **Tool schemas**: `tool::<tool_id>::input_schema` and
+    ///   `tool::<tool_id>::output_schema` keys hold JSON Schema
+    ///   strings (the `=`/`:`/`,` characters in JSON make these
+    ///   unsafe to round-trip through the tag wire format).
+    /// - **Intent**: `intent` key carries the application-defined
+    ///   placement intent (Phase F).
+    /// - **Colocation hints**: `colocate-with` key carries a chain
+    ///   origin hash for chain-aware placement.
+    /// - Application-defined keys (subject to the metadata size cap
+    ///   in Phase C: 4 KB soft / 16 KB hard).
+    ///
+    /// `BTreeMap` for deterministic iteration order over the wire.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl CapabilitySet {
@@ -818,31 +886,49 @@ impl CapabilitySet {
 
     /// Set hardware capabilities
     pub fn with_hardware(mut self, hardware: HardwareCapabilities) -> Self {
-        self.hardware = hardware;
+        self.set_hardware(hardware);
         self
     }
 
     /// Set software capabilities
     pub fn with_software(mut self, software: SoftwareCapabilities) -> Self {
-        self.software = software;
+        self.set_software(software);
         self
     }
 
-    /// Add model capability
+    /// Add model capability. Read-modify-write through `views()`
+    /// since models live in the canonical tag set as
+    /// `software.model.<i>.*` indexed-encoding.
     pub fn add_model(mut self, model: ModelCapability) -> Self {
-        self.models.push(model);
+        let mut models = self.views().models().clone();
+        models.push(model);
+        self.set_models(models);
         self
     }
 
-    /// Add tool capability
+    /// Add tool capability. Read-modify-write through `views()`
+    /// since tools live in the canonical tag set as
+    /// `software.tool.<i>.*` indexed-encoding; schemas are mirrored
+    /// into `metadata` by `set_tools`.
     pub fn add_tool(mut self, tool: ToolCapability) -> Self {
-        self.tools.push(tool);
+        let mut tools = self.views().tools().clone();
+        tools.push(tool);
+        self.set_tools(tools);
         self
     }
 
-    /// Add tag
+    /// Add a tag (parsed via the application-facing parser, which
+    /// rejects reserved cross-axis prefixes — use the dedicated
+    /// scope helpers for those). Untyped strings parse as
+    /// `Tag::Legacy`; axis-prefixed strings (`hardware.gpu`,
+    /// `software.os=linux`) parse as `AxisPresent` / `AxisValue`.
+    /// Empty tags and reserved-prefix tags are silently dropped
+    /// (the parser returns `Err` and we ignore it).
     pub fn add_tag(mut self, tag: impl Into<String>) -> Self {
-        self.tags.push(tag.into());
+        let s: String = tag.into();
+        if let Ok(t) = Tag::parse_user(&s) {
+            self.tags.insert(t);
+        }
         self
     }
 
@@ -857,8 +943,8 @@ impl CapabilitySet {
             return self;
         }
         let tag = format!("{TAG_SCOPE_TENANT_PREFIX}{id}");
-        if !self.tags.iter().any(|t| t == &tag) {
-            self.tags.push(tag);
+        if let Ok(t) = Tag::parse(&tag) {
+            self.tags.insert(t);
         }
         self
     }
@@ -872,8 +958,8 @@ impl CapabilitySet {
             return self;
         }
         let tag = format!("{TAG_SCOPE_REGION_PREFIX}{name}");
-        if !self.tags.iter().any(|t| t == &tag) {
-            self.tags.push(tag);
+        if let Ok(t) = Tag::parse(&tag) {
+            self.tags.insert(t);
         }
         self
     }
@@ -884,46 +970,397 @@ impl CapabilitySet {
     /// set are ignored by the scope resolver while
     /// `scope:subnet-local` is set. Idempotent.
     pub fn with_subnet_local_scope(mut self) -> Self {
-        if !self.tags.iter().any(|t| t == TAG_SCOPE_SUBNET_LOCAL) {
-            self.tags.push(TAG_SCOPE_SUBNET_LOCAL.to_string());
+        if let Ok(t) = Tag::parse(TAG_SCOPE_SUBNET_LOCAL) {
+            self.tags.insert(t);
+        }
+        self
+    }
+
+    // ========================================================================
+    // Chain composition helpers — Phase 3 of CAPABILITY_ENHANCEMENTS_PLAN.md.
+    //
+    // Pure syntactic sugar over the underlying `causal:` / `fork-of:` /
+    // `heat:` reserved-prefix tags documented in CAPABILITY_SYSTEM_PLAN.md
+    // §2 + CAPABILITIES_SCHEMA.md "Reserved cross-axis prefixes".
+    // Each helper is a single-line wrapper around `Tag::parse(...)` plus
+    // `tags.insert(...)` — the substrate gains no new primitives, just
+    // ergonomic emission paths so call sites read cleanly.
+    //
+    // Empty / blank chain hashes are silently dropped (matches the
+    // scope-helper convention so a builder fed an empty value doesn't
+    // produce a malformed tag).
+    // ========================================================================
+
+    /// Declare this node holds the chain identified by `chain_hash`.
+    ///
+    /// Emits the `causal:<chain_hash>` reserved tag. Idempotent —
+    /// repeated calls with the same hash do not duplicate.
+    pub fn require_chain(mut self, chain_hash: impl AsRef<str>) -> Self {
+        let hash = chain_hash.as_ref();
+        if hash.is_empty() {
+            return self;
+        }
+        if let Ok(t) = Tag::parse(&format!("causal:{hash}")) {
+            self.tags.insert(t);
+        }
+        self
+    }
+
+    /// Declare this node holds the chain `<chain_hash>` up to the
+    /// named `tip_seq`.
+    ///
+    /// Emits `causal:<chain_hash>:<tip_seq>`. Per
+    /// `CAPABILITY_SYSTEM_PLAN.md` §2: receivers downsample chains
+    /// shorter than they need, so a peer announcing a tip_seq is
+    /// implicitly also a holder for every prefix of that chain.
+    pub fn require_chain_tip(mut self, chain_hash: impl AsRef<str>, tip_seq: u64) -> Self {
+        let hash = chain_hash.as_ref();
+        if hash.is_empty() {
+            return self;
+        }
+        if let Ok(t) = Tag::parse(&format!("causal:{hash}:{tip_seq}")) {
+            self.tags.insert(t);
+        }
+        self
+    }
+
+    /// Declare this node holds the half-open range `[start_seq..end_seq)`
+    /// of the chain `<chain_hash>`.
+    ///
+    /// Emits `causal:<chain_hash>[<start>..<end>]`. The validator
+    /// enforces `start_seq < end_seq`; equal or inverted ranges are
+    /// silently dropped.
+    pub fn require_chain_range(
+        mut self,
+        chain_hash: impl AsRef<str>,
+        start_seq: u64,
+        end_seq: u64,
+    ) -> Self {
+        let hash = chain_hash.as_ref();
+        if hash.is_empty() || start_seq >= end_seq {
+            return self;
+        }
+        if let Ok(t) = Tag::parse(&format!("causal:{hash}[{start_seq}..{end_seq}]")) {
+            self.tags.insert(t);
+        }
+        self
+    }
+
+    /// Declare this node holds any of the named chains. One
+    /// `causal:<hash>` reserved tag emitted per non-empty hash.
+    /// Empty / blank hashes in the iterator are silently skipped.
+    pub fn require_any_chain<I, S>(mut self, chain_hashes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for hash in chain_hashes {
+            self = self.require_chain(hash);
+        }
+        self
+    }
+
+    /// Declare this chain forks from `parent_chain_hash`.
+    ///
+    /// Emits the `fork-of:<parent_chain_hash>` reserved tag, used
+    /// by the chain-discovery layer for lineage walks.
+    pub fn from_fork(mut self, parent_chain_hash: impl AsRef<str>) -> Self {
+        let hash = parent_chain_hash.as_ref();
+        if hash.is_empty() {
+            return self;
+        }
+        if let Ok(t) = Tag::parse(&format!("fork-of:{hash}")) {
+            self.tags.insert(t);
+        }
+        self
+    }
+
+    /// Declare this node's heat (read-rate / activity score) for
+    /// the named chain.
+    ///
+    /// `rate` is clamped to `[0.0, 1.0]` and emitted with two-decimal
+    /// precision (`heat:<chain_hash>=0.85`). Heat is per-chain, not
+    /// per-node; one call per chain.
+    pub fn heat_level(mut self, chain_hash: impl AsRef<str>, rate: f64) -> Self {
+        let hash = chain_hash.as_ref();
+        if hash.is_empty() {
+            return self;
+        }
+        let clamped = if rate.is_finite() {
+            rate.clamp(0.0, 1.0)
+        } else {
+            return self;
+        };
+        if let Ok(t) = Tag::parse(&format!("heat:{hash}={clamped:.2}")) {
+            self.tags.insert(t);
         }
         self
     }
 
     /// Set resource limits
     pub fn with_limits(mut self, limits: ResourceLimits) -> Self {
-        self.limits = limits;
+        self.set_limits(limits);
         self
     }
 
-    /// Check if has a specific tag
+    /// Set or overwrite a metadata key-value entry.
+    ///
+    /// CR-16: silently drops writes whose key matches a
+    /// substrate-reserved *prefix* (`tool::`). Those keys are
+    /// authored by the substrate's own codecs (the tool codec
+    /// emits `tool::<id>::input_schema` etc.) and user code
+    /// must not collide with them — same shape as `Tag::parse_user`
+    /// rejecting reserved tag prefixes.
+    ///
+    /// Note: the schema's `metadata_reserved` *exact-match* list
+    /// (`intent`, `colocate-with`, `priority`, `owner`) is
+    /// intentionally NOT gated — those are well-known *user-facing*
+    /// scheduler hints; the substrate reads them to make placement
+    /// decisions, but user code is expected to *set* them. The
+    /// validator (`validate_capabilities`) does flag user writes
+    /// onto exact-match reserved keys as a `MetadataReservedKey`
+    /// warning so misconfiguration is visible without being fatal.
+    ///
+    /// Substrate-internal callers that need to emit `tool::*` keys
+    /// use the `with_metadata_unchecked` sibling (crate-private).
+    pub fn with_metadata(self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        let key: String = key.into();
+        if super::schema::AXIS_SCHEMA
+            .metadata_reserved_prefixes
+            .iter()
+            .any(|p| key.starts_with(*p))
+        {
+            return self;
+        }
+        self.with_metadata_unchecked(key, value)
+    }
+
+    /// Internal counterpart to [`Self::with_metadata`] that bypasses
+    /// the reserved-prefix gate. Substrate-side code that authors
+    /// reserved metadata (`tool::<id>::input_schema` from the tool
+    /// codec) goes through this; user code MUST use the gated
+    /// [`Self::with_metadata`].
+    pub(crate) fn with_metadata_unchecked(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    // ========================================================================
+    // Mutable setters — Phase A.5.6 write-path seam.
+    //
+    // These are the *only* places that should write to typed-struct
+    // state on a `CapabilitySet`. The diff engine, the FFI layer
+    // (when applying a remote update), and any other write path go
+    // through these methods, so Phase A.5.N can rewrite the bodies
+    // (e.g. to re-encode into a `tag_set: HashSet<Tag>`) without
+    // touching call sites.
+    //
+    // Each setter takes ownership of the new value to make the
+    // replacement obvious (no ambiguity about whether the caller
+    // retains a partial view) and to give the eventual tag-set
+    // reencoder a single owned input to consume.
+    // ========================================================================
+
+    /// Replace the hardware projection in-place.
+    ///
+    /// Phase A.5.N.3: clears every `hardware.*` tag (excluding
+    /// `hardware.limits.*` which belongs to `ResourceLimits`) and
+    /// re-emits the new ones via `hardware_to_tags`.
+    pub fn set_hardware(&mut self, hardware: HardwareCapabilities) {
+        self.tags
+            .retain(|t| !crate::adapter::net::behavior::tag_codec::is_hardware_owned_tag(t));
+        self.tags
+            .extend(crate::adapter::net::behavior::tag_codec::hardware_to_tags(
+                &hardware,
+            ));
+    }
+
+    /// Replace the software projection in-place.
+    ///
+    /// Phase A.5.N.3: clears every `software.*` tag (excluding
+    /// `software.model.*` and `software.tool.*` which belong to
+    /// model/tool sub-collections) and re-emits the new ones.
+    pub fn set_software(&mut self, software: SoftwareCapabilities) {
+        self.tags
+            .retain(|t| !crate::adapter::net::behavior::tag_codec::is_software_owned_tag(t));
+        self.tags
+            .extend(crate::adapter::net::behavior::tag_codec::software_to_tags(
+                &software,
+            ));
+    }
+
+    /// Replace the resource-limits projection in-place.
+    ///
+    /// Phase A.5.N.3: clears every `hardware.limits.*` tag and
+    /// re-emits the new ones.
+    pub fn set_limits(&mut self, limits: ResourceLimits) {
+        self.tags
+            .retain(|t| !crate::adapter::net::behavior::tag_codec::is_resource_limits_owned_tag(t));
+        self.tags
+            .extend(crate::adapter::net::behavior::tag_codec::resource_limits_to_tags(&limits));
+    }
+
+    /// Replace the loaded-model list in-place.
+    ///
+    /// Phase A.5.N.3: clears every `software.model.*` tag and
+    /// re-emits the new indexed encoding via `models_to_tags`.
+    pub fn set_models(&mut self, models: Vec<ModelCapability>) {
+        self.tags
+            .retain(|t| !crate::adapter::net::behavior::tag_codec::is_models_owned_tag(t));
+        self.tags
+            .extend(crate::adapter::net::behavior::tag_codec::models_to_tags(
+                &models,
+            ));
+    }
+
+    /// Replace the available-tool list in-place.
+    ///
+    /// Phase A.5.N.3: clears every `software.tool.*` tag, prunes
+    /// stale `tool::<id>::*_schema` metadata, re-emits the indexed
+    /// tag encoding, and mirrors fresh schemas into metadata.
+    pub fn set_tools(&mut self, tools: Vec<ToolCapability>) {
+        // Clear tool tags from the canonical set.
+        self.tags
+            .retain(|t| !crate::adapter::net::behavior::tag_codec::is_tools_owned_tag(t));
+
+        // Drop schema metadata entries for tools no longer present.
+        let new_ids: HashSet<&str> = tools.iter().map(|t| t.tool_id.as_str()).collect();
+        self.metadata.retain(|key, _| {
+            let Some(rest) = key.strip_prefix("tool::") else {
+                return true;
+            };
+            let Some((id, _suffix)) = rest.split_once("::") else {
+                return true;
+            };
+            new_ids.contains(id)
+        });
+
+        // Re-emit the tag encoding (which intentionally drops
+        // schemas — they ride in metadata).
+        self.tags
+            .extend(crate::adapter::net::behavior::tag_codec::tools_to_tags(
+                &tools,
+            ));
+
+        // Mirror fresh schemas into metadata.
+        for tool in &tools {
+            if let Some(schema) = &tool.input_schema {
+                self.metadata.insert(
+                    ToolCapability::input_schema_metadata_key(&tool.tool_id),
+                    schema.clone(),
+                );
+            }
+            if let Some(schema) = &tool.output_schema {
+                self.metadata.insert(
+                    ToolCapability::output_schema_metadata_key(&tool.tool_id),
+                    schema.clone(),
+                );
+            }
+        }
+    }
+
+    /// Check if has a specific tag.
+    ///
+    /// The query string is parsed via the permissive parser
+    /// ([`Tag::parse`]) so reserved-prefix queries (`scope:tenant:foo`)
+    /// resolve correctly. Set membership is exact: a query for
+    /// `hardware.gpu` matches the AxisPresent tag, not an
+    /// AxisValue with a different value.
     pub fn has_tag(&self, tag: &str) -> bool {
-        self.tags.iter().any(|t| t == tag)
+        let Ok(parsed) = Tag::parse(tag) else {
+            return false;
+        };
+        // Separator-agnostic membership: a stored `software.os=linux`
+        // matches a query `software.os:linux` (and vice versa). Plain
+        // `HashSet::contains` would distinguish them via PartialEq's
+        // separator field — see CR-1 in
+        // `CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md`.
+        self.tags.iter().any(|t| t.semantic_eq(&parsed))
     }
 
-    /// Check if has a specific model
+    /// Check if has a specific model.
+    ///
+    /// Phase A.5.N.3: scans for `software.model.<i>.id=<model_id>`
+    /// directly in the canonical tag set rather than reconstructing
+    /// the full `Vec<ModelCapability>` via `views()`.
     pub fn has_model(&self, model_id: &str) -> bool {
-        self.models.iter().any(|m| m.model_id == model_id)
+        use crate::adapter::net::behavior::tag::TaxonomyAxis;
+        self.tags.iter().any(|tag| {
+            let Some(key) = tag.axis_key() else {
+                return false;
+            };
+            if key.axis != TaxonomyAxis::Software {
+                return false;
+            }
+            let Some(rest) = key.key.strip_prefix("model.") else {
+                return false;
+            };
+            let Some((_idx, sub)) = rest.split_once('.') else {
+                return false;
+            };
+            sub == "id" && tag.value() == Some(model_id)
+        })
     }
 
-    /// Check if has a specific tool
+    /// Check if has a specific tool.
+    ///
+    /// Phase A.5.N.3: scans for `software.tool.<i>.tool_id=<tool_id>`
+    /// directly in the canonical tag set.
     pub fn has_tool(&self, tool_id: &str) -> bool {
-        self.tools.iter().any(|t| t.tool_id == tool_id)
+        use crate::adapter::net::behavior::tag::TaxonomyAxis;
+        self.tags.iter().any(|tag| {
+            let Some(key) = tag.axis_key() else {
+                return false;
+            };
+            if key.axis != TaxonomyAxis::Software {
+                return false;
+            }
+            let Some(rest) = key.key.strip_prefix("tool.") else {
+                return false;
+            };
+            let Some((_idx, sub)) = rest.split_once('.') else {
+                return false;
+            };
+            sub == "tool_id" && tag.value() == Some(tool_id)
+        })
     }
 
-    /// Check if has GPU
+    /// Check if has GPU.
+    ///
+    /// Phase A.5.N.3: looks for the `hardware.gpu` AxisPresent
+    /// marker directly. Cheaper than reconstructing the full
+    /// `HardwareCapabilities` projection.
     pub fn has_gpu(&self) -> bool {
-        self.hardware.has_gpu()
+        use crate::adapter::net::behavior::tag::TaxonomyAxis;
+        self.tags.contains(&Tag::AxisPresent {
+            axis: TaxonomyAxis::Hardware,
+            key: "gpu".into(),
+        })
     }
 
-    /// Get all model IDs
-    pub fn model_ids(&self) -> Vec<&str> {
-        self.models.iter().map(|m| m.model_id.as_str()).collect()
+    /// Get all model IDs.
+    ///
+    /// Phase A.5.N.3: returns owned `String`s (rather than borrowed
+    /// `&str` over a typed-struct field that no longer exists).
+    pub fn model_ids(&self) -> Vec<String> {
+        self.views()
+            .models()
+            .iter()
+            .map(|m| m.model_id.clone())
+            .collect()
     }
 
-    /// Get all tool IDs
-    pub fn tool_ids(&self) -> Vec<&str> {
-        self.tools.iter().map(|t| t.tool_id.as_str()).collect()
+    /// Get all tool IDs.
+    pub fn tool_ids(&self) -> Vec<String> {
+        self.views()
+            .tools()
+            .iter()
+            .map(|t| t.tool_id.clone())
+            .collect()
     }
 
     /// Serialize to bytes (compact binary format)
@@ -936,6 +1373,466 @@ impl CapabilitySet {
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         serde_json::from_slice(data).ok()
     }
+
+    /// Compute the structural change from `prev` to `self`.
+    ///
+    /// Phase 1 of `CAPABILITY_ENHANCEMENTS_PLAN.md`: a cheap
+    /// before/after change detector that returns the raw set/map
+    /// difference — added tags, removed tags, and per-key
+    /// metadata changes (Added / Removed / Updated). Powers
+    /// event-driven placement updates, capability-aware dashboards,
+    /// and delta-based metadata propagation.
+    ///
+    /// Cost: `O(|tags| + |metadata|)`. Two `HashSet::difference`
+    /// scans + a `BTreeMap` walk; no allocation beyond the output
+    /// collections.
+    ///
+    /// **Composes with [`crate::adapter::net::behavior::diff::DiffEngine`]**:
+    /// `DiffEngine::diff` produces structural `DiffOp`s (used by
+    /// the propagation path); this method returns the raw set/map
+    /// diff (better for change-event consumers). Same input data;
+    /// pick the surface that matches the consumer's shape.
+    pub fn diff(&self, prev: &CapabilitySet) -> CapabilitySetDiff {
+        // Tag diff: separator-agnostic. Plain `HashSet::difference`
+        // would compare via `Tag::PartialEq`, which distinguishes
+        // `=` vs `:` on `AxisValue` — two semantically-identical
+        // tags would land as both Added and Removed. The structural
+        // `DiffEngine::diff` was patched for this in 38612b61; this
+        // companion API was not. See CR-3 in
+        // `CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md`.
+        let added_tags: HashSet<Tag> = self
+            .tags
+            .iter()
+            .filter(|t| !prev.tags.iter().any(|p| p.semantic_eq(t)))
+            .cloned()
+            .collect();
+        let removed_tags: HashSet<Tag> = prev
+            .tags
+            .iter()
+            .filter(|t| !self.tags.iter().any(|c| c.semantic_eq(t)))
+            .cloned()
+            .collect();
+
+        // Metadata diff: walk both maps simultaneously. Both are
+        // `BTreeMap` so we can rely on ordered iteration; merge
+        // by key.
+        let mut changed_metadata = Vec::new();
+        let mut prev_iter = prev.metadata.iter().peekable();
+        let mut curr_iter = self.metadata.iter().peekable();
+        loop {
+            match (prev_iter.peek(), curr_iter.peek()) {
+                (Some((pk, pv)), Some((ck, cv))) => match pk.cmp(ck) {
+                    std::cmp::Ordering::Less => {
+                        changed_metadata.push(MetadataChange::Removed {
+                            key: (*pk).clone(),
+                            prev_value: (*pv).clone(),
+                        });
+                        prev_iter.next();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        changed_metadata.push(MetadataChange::Added {
+                            key: (*ck).clone(),
+                            value: (*cv).clone(),
+                        });
+                        curr_iter.next();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if pv != cv {
+                            changed_metadata.push(MetadataChange::Updated {
+                                key: (*pk).clone(),
+                                prev_value: (*pv).clone(),
+                                new_value: (*cv).clone(),
+                            });
+                        }
+                        prev_iter.next();
+                        curr_iter.next();
+                    }
+                },
+                (Some((pk, pv)), None) => {
+                    changed_metadata.push(MetadataChange::Removed {
+                        key: (*pk).clone(),
+                        prev_value: (*pv).clone(),
+                    });
+                    prev_iter.next();
+                }
+                (None, Some((ck, cv))) => {
+                    changed_metadata.push(MetadataChange::Added {
+                        key: (*ck).clone(),
+                        value: (*cv).clone(),
+                    });
+                    curr_iter.next();
+                }
+                (None, None) => break,
+            }
+        }
+
+        CapabilitySetDiff {
+            added_tags,
+            removed_tags,
+            changed_metadata,
+        }
+    }
+
+    // ========================================================================
+    // View projections — Capability System Plan §1, Phase A.4.
+    //
+    // Today these are simple field clones because `CapabilitySet`
+    // still carries the typed structs as fields. Phase A.5 removes
+    // the typed-struct fields and migrates wire format to
+    // `tags: HashSet<Tag>`; the same `From<&CapabilitySet>` impls
+    // then reconstruct the typed view by scanning the tag set.
+    //
+    // Downstream code SHOULD adopt the projection accessors NOW
+    // (`caps.views().hardware`, `HardwareCapabilities::from(&caps)`)
+    // so the migration in A.5 doesn't ripple through every call
+    // site. The legacy direct-field access (`caps.hardware`)
+    // continues to work in this commit but is documented as
+    // deprecated in `CAPABILITY_SYSTEM_PLAN.md` Locked decision 1.
+    // ========================================================================
+
+    /// All five view projections rolled into one struct, computed
+    /// once per call. Cheaper than calling each `From<&CapabilitySet>`
+    /// individually when the consumer reads more than one of them.
+    ///
+    /// ```
+    /// # use net::adapter::net::behavior::capability::CapabilitySet;
+    /// let caps = CapabilitySet::new();
+    /// let views = caps.views();
+    /// let _ = views.hardware();
+    /// let _ = views.software();
+    /// let _ = views.resource_limits();
+    /// let _ = views.models();
+    /// let _ = views.tools();
+    /// ```
+    /// Borrowing handle exposing the five typed projections
+    /// ([`HardwareCapabilities`], [`SoftwareCapabilities`],
+    /// [`ResourceLimits`], `Vec<ModelCapability>`,
+    /// `Vec<ToolCapability>`).
+    ///
+    /// Phase A.5.N.3 + Phase 1 of `CAPABILITY_ENHANCEMENTS_PLAN.md`:
+    /// each projection is decoded from the canonical tag set
+    /// (+ metadata, for tool schemas) on first access and cached
+    /// for the lifetime of the handle. Repeated reads of the same
+    /// projection hit the cache; reads of unrelated projections
+    /// don't force the full set of decoders.
+    ///
+    /// The handle borrows `self`. Mutations to `self` invalidate
+    /// the handle (compiler-enforced through the lifetime).
+    pub fn views(&self) -> CapabilityViews<'_> {
+        CapabilityViews {
+            caps: self,
+            sorted_tags: OnceCell::new(),
+            hardware: OnceCell::new(),
+            software: OnceCell::new(),
+            resource_limits: OnceCell::new(),
+            models: OnceCell::new(),
+            tools: OnceCell::new(),
+        }
+    }
+
+    // ========================================================================
+    // Typed-tag-set access — Phase A.5.1 ergonomic accessors.
+    //
+    // These methods give downstream code the future access pattern
+    // for capability data. Downstream code SHOULD adopt these now
+    // so Phase A.5.2+ (when typed-struct fields are removed from
+    // `CapabilitySet`) is invisible at the consumer level.
+    //
+    // Uses the bijection helpers from `behavior::tag_codec`. Today
+    // computed on demand (no field change); Phase A.5.N introduces
+    // internal `tag_set: HashSet<Tag>` storage as the source of truth
+    // and removes the typed-struct fields. Either way, the surface
+    // below stays stable.
+    //
+    // Migration path for downstream code:
+    //
+    // ```text
+    // // Before (typed-struct field access):
+    // if caps.hardware.gpu.is_some() { ... }
+    // for tag in &caps.tags { ... }
+    //
+    // // After (read via the projection — canonical):
+    // let views = caps.views();
+    // if views.hardware().gpu.is_some() { ... }
+    // for model in views.models() { ... }
+    //
+    // // Or directly through the `From` impl when only one field is needed:
+    // if HardwareCapabilities::from(&caps).gpu.is_some() { ... }
+    //
+    // // Tags survive Phase A.5.N as a top-level field; iterate as before:
+    // for tag in &caps.tags { ... }
+    //
+    // // Or read the typed-tag set (Phase A.5.1):
+    // for tag in caps.typed_tags() { ... }
+    //
+    // // Writes go through the typed setters (Phase A.5.6):
+    // caps.set_hardware(new_hw);
+    // ```
+    //
+    // Application code that needs to compose with federated query
+    // primitives (Phase E) will use `typed_tags()` to feed the
+    // tag set into `Predicate::evaluate`'s `EvalContext`.
+    // ========================================================================
+
+    /// All capability data as a typed-tag set, including the
+    /// hardware / software / models / tools / limits structs
+    /// re-encoded as axis-prefixed tags AND the legacy `tags`
+    /// `Vec<String>` parsed via [`Tag::parse`]. The future wire
+    /// format (Phase A.5.2+) is exactly this `HashSet<Tag>`.
+    ///
+    /// Round-trip-stable: `Self::from_typed_tags(&caps.typed_tags())`
+    /// produces a `CapabilitySet` semantically equal to `caps`,
+    /// modulo the documented order non-preservation for non-indexed
+    /// `Vec` fields (runtimes / frameworks / drivers).
+    ///
+    /// Cost: linear in tag count. Currently computed on every
+    /// call; downstream callers that read in a hot loop should
+    /// cache the result.
+    pub fn typed_tags(&self) -> std::collections::HashSet<crate::adapter::net::behavior::tag::Tag> {
+        crate::adapter::net::behavior::tag_codec::capability_set_to_tag_set(self)
+    }
+
+    /// Build a `CapabilitySet` from a typed-tag set. Inverse of
+    /// [`Self::typed_tags`]; uses the per-struct decoders to
+    /// reconstruct the typed fields plus a legacy-carrier scan for
+    /// reserved-prefix tags + unknown axis tags.
+    ///
+    /// See [`Self::typed_tags`] for the round-trip contract.
+    pub fn from_typed_tags(
+        tags: &std::collections::HashSet<crate::adapter::net::behavior::tag::Tag>,
+    ) -> Self {
+        crate::adapter::net::behavior::tag_codec::capability_set_from_tag_set(tags)
+    }
+}
+
+/// Lazy borrowing handle exposing the five typed projections of a
+/// [`CapabilitySet`].
+///
+/// Returned by [`CapabilitySet::views`]. Each projection is decoded
+/// from the canonical tag set on first access and cached for the
+/// lifetime of the handle:
+///
+/// ```ignore
+/// let caps = CapabilitySet::default();
+/// let v = caps.views();
+/// let _ = v.hardware();   // first read: decodes hardware tags
+/// let _ = v.hardware();   // cached; no re-decode
+/// let _ = v.models();     // separate cache; decodes model tags
+/// ```
+///
+/// Phase 1 of `CAPABILITY_ENHANCEMENTS_PLAN.md`: callers that
+/// previously read `views.hardware` (field) now call
+/// `views.hardware()` (accessor). Hot-path post-cache cost is a
+/// single pointer load (`OnceCell::get`); pre-cache cost is one
+/// invocation of the underlying `*_from_tags` decoder.
+#[derive(Debug)]
+pub struct CapabilityViews<'a> {
+    caps: &'a CapabilitySet,
+    sorted_tags: OnceCell<Vec<Tag>>,
+    hardware: OnceCell<HardwareCapabilities>,
+    software: OnceCell<SoftwareCapabilities>,
+    resource_limits: OnceCell<ResourceLimits>,
+    models: OnceCell<Vec<ModelCapability>>,
+    tools: OnceCell<Vec<ToolCapability>>,
+}
+
+impl<'a> CapabilityViews<'a> {
+    /// Sorted tag vector — shared scratch for the per-axis
+    /// decoders. Sort stabilizes Vec-valued fields whose tag
+    /// encoding is non-indexed (`software.runtimes` etc.) so
+    /// repeated reads produce identical projections.
+    fn sorted_tags(&self) -> &Vec<Tag> {
+        self.sorted_tags
+            .get_or_init(|| sorted_tag_vec(&self.caps.tags))
+    }
+
+    /// Hardware projection. Decodes the `hardware.*` axis tags
+    /// (excluding `hardware.limits.*`) on first call; subsequent
+    /// calls return the cached projection.
+    pub fn hardware(&self) -> &HardwareCapabilities {
+        self.hardware.get_or_init(|| {
+            crate::adapter::net::behavior::tag_codec::hardware_from_tags(self.sorted_tags())
+        })
+    }
+
+    /// Software projection. Decodes the `software.*` axis tags
+    /// (excluding `software.model.*` and `software.tool.*`) on
+    /// first call.
+    pub fn software(&self) -> &SoftwareCapabilities {
+        self.software.get_or_init(|| {
+            crate::adapter::net::behavior::tag_codec::software_from_tags(self.sorted_tags())
+        })
+    }
+
+    /// Resource-limits projection. Decodes the `hardware.limits.*`
+    /// tags on first call.
+    pub fn resource_limits(&self) -> &ResourceLimits {
+        self.resource_limits.get_or_init(|| {
+            crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(self.sorted_tags())
+        })
+    }
+
+    /// Loaded-model projection. Decodes the `software.model.<i>.*`
+    /// indexed tags on first call.
+    pub fn models(&self) -> &Vec<ModelCapability> {
+        self.models.get_or_init(|| {
+            crate::adapter::net::behavior::tag_codec::models_from_tags(self.sorted_tags())
+        })
+    }
+
+    /// Available-tool projection. Decodes the `software.tool.<i>.*`
+    /// indexed tags on first call AND layers tool input/output JSON
+    /// Schemas back from `caps.metadata` (key shape:
+    /// `tool::<id>::input_schema` / `tool::<id>::output_schema`).
+    pub fn tools(&self) -> &Vec<ToolCapability> {
+        self.tools.get_or_init(|| {
+            let mut tools =
+                crate::adapter::net::behavior::tag_codec::tools_from_tags(self.sorted_tags());
+            for tool in &mut tools {
+                if let Some(s) = self
+                    .caps
+                    .metadata
+                    .get(&ToolCapability::input_schema_metadata_key(&tool.tool_id))
+                {
+                    tool.input_schema = Some(s.clone());
+                }
+                if let Some(s) = self
+                    .caps
+                    .metadata
+                    .get(&ToolCapability::output_schema_metadata_key(&tool.tool_id))
+                {
+                    tool.output_schema = Some(s.clone());
+                }
+            }
+            tools
+        })
+    }
+}
+
+// ============================================================================
+// View projections — `From<&CapabilitySet>` for each typed struct.
+//
+// Phase A.5.N.3: each impl scans the canonical `tags: HashSet<Tag>`
+// via the `tag_codec::*_from_tags` decoders. The typed-struct
+// fields they previously cloned no longer exist; the tag set is
+// the source of truth.
+// ============================================================================
+
+/// Materialize the tag set as a sorted `Vec<Tag>` for the
+/// per-struct decoders. Sort stabilizes Vec-valued fields
+/// whose tag encoding is non-indexed (`software.runtimes` etc.)
+/// so consecutive `views()` calls produce identical projections.
+fn sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
+    let mut v: Vec<Tag> = tags.iter().cloned().collect();
+    v.sort_by_key(|a| a.to_string());
+    v
+}
+
+/// Serialize a `HashSet<Tag>` as a sorted JSON array — `Tag::to_string()`
+/// order. The wire format is canonical so two ends of a signed
+/// `CapabilityAnnouncement` round-trip produce identical bytes
+/// regardless of process-local `HashSet` iteration order.
+fn serialize_tags_sorted<S: serde::Serializer>(
+    tags: &HashSet<Tag>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let sorted = sorted_tag_vec(tags);
+    let mut seq = serializer.serialize_seq(Some(sorted.len()))?;
+    for t in &sorted {
+        seq.serialize_element(t)?;
+    }
+    seq.end()
+}
+
+impl From<&CapabilitySet> for HardwareCapabilities {
+    fn from(caps: &CapabilitySet) -> Self {
+        crate::adapter::net::behavior::tag_codec::hardware_from_tags(&sorted_tag_vec(&caps.tags))
+    }
+}
+
+impl From<&CapabilitySet> for SoftwareCapabilities {
+    fn from(caps: &CapabilitySet) -> Self {
+        crate::adapter::net::behavior::tag_codec::software_from_tags(&sorted_tag_vec(&caps.tags))
+    }
+}
+
+impl From<&CapabilitySet> for ResourceLimits {
+    fn from(caps: &CapabilitySet) -> Self {
+        crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(&sorted_tag_vec(
+            &caps.tags,
+        ))
+    }
+}
+
+// ============================================================================
+// CapabilitySet diff (Phase 1 of CAPABILITY_ENHANCEMENTS_PLAN.md)
+// ============================================================================
+
+/// Structural difference between two [`CapabilitySet`] values.
+///
+/// Returned by [`CapabilitySet::diff`]. Carries:
+///
+/// - `added_tags`: tags in `self` that aren't in `prev`.
+/// - `removed_tags`: tags in `prev` that aren't in `self`.
+/// - `changed_metadata`: per-key metadata changes (Added /
+///   Removed / Updated). Key renames surface as Removed + Added,
+///   not as Updated, since the key identity changed.
+///
+/// The diff is the input shape for event-driven placement
+/// updates, capability-change dashboards, and delta-based
+/// metadata propagation. For the structural ops shape consumed
+/// by the propagation path, use
+/// [`crate::adapter::net::behavior::diff::DiffEngine::diff`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapabilitySetDiff {
+    /// Tags newly present in `self`.
+    pub added_tags: HashSet<Tag>,
+    /// Tags that were in `prev` but are no longer in `self`.
+    pub removed_tags: HashSet<Tag>,
+    /// Per-key metadata changes, in key order.
+    pub changed_metadata: Vec<MetadataChange>,
+}
+
+impl CapabilitySetDiff {
+    /// True if no tags or metadata entries differ.
+    pub fn is_empty(&self) -> bool {
+        self.added_tags.is_empty()
+            && self.removed_tags.is_empty()
+            && self.changed_metadata.is_empty()
+    }
+}
+
+/// One metadata-key change between two [`CapabilitySet`]s.
+///
+/// Renamed keys surface as `Removed { old_key } + Added { new_key }`,
+/// not `Updated`, because key identity changes are semantically
+/// distinct from value changes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataChange {
+    /// Key was not present in `prev`; now has `value`.
+    Added {
+        /// Metadata key.
+        key: String,
+        /// New value.
+        value: String,
+    },
+    /// Key was present in `prev` with `prev_value`; no longer in `self`.
+    Removed {
+        /// Metadata key.
+        key: String,
+        /// Value held in the previous state.
+        prev_value: String,
+    },
+    /// Key present in both; value changed.
+    Updated {
+        /// Metadata key.
+        key: String,
+        /// Value held in the previous state.
+        prev_value: String,
+        /// New value.
+        new_value: String,
+    },
 }
 
 // ============================================================================
@@ -1287,7 +2184,15 @@ impl CapabilityFilter {
         self
     }
 
-    /// Check if a capability set matches this filter
+    /// Check if a capability set matches this filter.
+    ///
+    /// Phase A.5.2: reads through `caps.views()` for the
+    /// hardware / models / tools projections. Methods that already
+    /// abstract field access (`has_tag` / `has_gpu` / `has_model`
+    /// / `has_tool`) keep working unchanged. Once Phase A.5.N
+    /// removes the typed-struct fields from `CapabilitySet`, the
+    /// `views()` body becomes a tag-set scan and this matcher
+    /// keeps working without further changes.
     pub fn matches(&self, caps: &CapabilitySet) -> bool {
         // Check tags (all required tags must be present)
         for tag in &self.require_tags {
@@ -1312,9 +2217,16 @@ impl CapabilityFilter {
             }
         }
 
+        // Phase 1 (lazy): each `views.X()` decodes only the
+        // projection it needs. `views.hardware()` does NOT force
+        // the model decoder; `views.models()` does NOT force
+        // hardware. Predicates that early-return on a hardware
+        // check pay zero cost for unused axes.
+        let views = caps.views();
+
         // Check memory
         if let Some(min_mem) = self.min_memory_mb {
-            if caps.hardware.memory_mb < min_mem {
+            if views.hardware().memory_mb < min_mem {
                 return false;
             }
         }
@@ -1326,21 +2238,21 @@ impl CapabilityFilter {
 
         // Check GPU vendor
         if let Some(vendor) = self.gpu_vendor {
-            if caps.hardware.gpu_vendor() != Some(vendor) {
+            if views.hardware().gpu_vendor() != Some(vendor) {
                 return false;
             }
         }
 
         // Check VRAM
         if let Some(min_vram) = self.min_vram_mb {
-            if caps.hardware.total_vram_mb() < min_vram {
+            if views.hardware().total_vram_mb() < min_vram {
                 return false;
             }
         }
 
         // Check context length
         if let Some(min_ctx) = self.min_context_length {
-            let has_sufficient = caps.models.iter().any(|m| m.context_length >= min_ctx);
+            let has_sufficient = views.models().iter().any(|m| m.context_length >= min_ctx);
             if !has_sufficient {
                 return false;
             }
@@ -1348,7 +2260,10 @@ impl CapabilityFilter {
 
         // Check modalities
         for modality in &self.require_modalities {
-            let has_modality = caps.models.iter().any(|m| m.modalities.contains(modality));
+            let has_modality = views
+                .models()
+                .iter()
+                .any(|m| m.modalities.contains(modality));
             if !has_modality {
                 return false;
             }
@@ -1416,24 +2331,29 @@ impl CapabilityRequirement {
             return 0.0;
         }
 
+        // Phase A.5.5: read through views() once. Same projection
+        // pattern Phase A.5.2/A.5.3/A.5.4 applied to filter / proximity
+        // / diff — survives Phase A.5.N field removal unchanged.
+        let views = caps.views();
+
         let mut score = 1.0;
 
         // Memory score (normalized to 256GB)
         if self.prefer_more_memory > 0.0 {
-            let mem_score = (caps.hardware.memory_mb as f32 / 262144.0).min(1.0);
+            let mem_score = (views.hardware().memory_mb as f32 / 262144.0).min(1.0);
             score += self.prefer_more_memory * mem_score;
         }
 
         // VRAM score (normalized to 80GB)
         if self.prefer_more_vram > 0.0 {
-            let vram_score = (caps.hardware.total_vram_mb() as f32 / 81920.0).min(1.0);
+            let vram_score = (views.hardware().total_vram_mb() as f32 / 81920.0).min(1.0);
             score += self.prefer_more_vram * vram_score;
         }
 
         // Inference speed score (normalized to 1000 tok/s)
         if self.prefer_faster_inference > 0.0 {
-            let max_tps: u32 = caps
-                .models
+            let max_tps: u32 = views
+                .models()
                 .iter()
                 .map(|m| m.tokens_per_sec)
                 .max()
@@ -1444,11 +2364,12 @@ impl CapabilityRequirement {
 
         // Loaded model score
         if self.prefer_loaded_models > 0.0 {
-            let loaded_count = caps.models.iter().filter(|m| m.loaded).count();
-            let loaded_ratio = if caps.models.is_empty() {
+            let models = views.models();
+            let loaded_count = models.iter().filter(|m| m.loaded).count();
+            let loaded_ratio = if models.is_empty() {
                 0.0
             } else {
-                loaded_count as f32 / caps.models.len() as f32
+                loaded_count as f32 / models.len() as f32
             };
             score += self.prefer_loaded_models * loaded_ratio;
         }
@@ -1498,6 +2419,24 @@ pub struct CapabilityIndex {
     by_gpu_vendor: DashMap<GpuVendor, HashSet<u64>>,
     /// Inverted index: has GPU -> set of node IDs
     gpu_nodes: DashMap<bool, HashSet<u64>>,
+    /// Inverted index: metadata key -> { value -> set of node IDs }.
+    ///
+    /// Phase 5.B follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+    /// Mirrors `by_tag` for the metadata side; lets the cardinality-
+    /// aware planner refine `MetadataEquals` / `MetadataExists` /
+    /// related leaf clauses with distinct-value counts (otherwise
+    /// they'd fall back to plain `static_cost`).
+    by_metadata: DashMap<String, DashMap<String, HashSet<u64>>>,
+    /// Inverted index: axis tag key -> { value -> set of node IDs }.
+    ///
+    /// Phase 4 follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+    /// Lets [`Self::axis_cardinality`] return O(1) instead of
+    /// O(N) over the full `by_tag` table — the planner reads it
+    /// once per leaf-clause-per-candidate, so the linear scan
+    /// would dominate hot-path evaluation. Presence-only axis
+    /// tags (`hardware.gpu` with no value) use the sentinel
+    /// empty string `""` as the inner key.
+    by_axis_key: DashMap<crate::adapter::net::behavior::tag::TagKey, DashMap<String, HashSet<u64>>>,
     /// Version tracking
     versions: DashMap<u64, u64>,
     /// Stats
@@ -1515,6 +2454,8 @@ impl CapabilityIndex {
             by_tool: DashMap::new(),
             by_gpu_vendor: DashMap::new(),
             gpu_nodes: DashMap::new(),
+            by_metadata: DashMap::new(),
+            by_axis_key: DashMap::new(),
             versions: DashMap::new(),
             index_count: AtomicU64::new(0),
             query_count: AtomicU64::new(0),
@@ -1640,17 +2581,51 @@ impl CapabilityIndex {
     /// (the loser pays a redundant clone, which is the original
     /// cost; correctness is unchanged).
     fn add_to_indexes(&self, node_id: u64, caps: &CapabilitySet) {
-        // Tags
+        // Phase A.5.5: read through views() once. `caps.tags` stays
+        // direct because tags are not part of the typed-struct
+        // projection (they're carried through `CapabilitySet::tags`
+        // independently and survive Phase A.5.N).
+        let views = caps.views();
+
+        // Tags. `by_tag` is keyed by `String` (the wire-form
+        // rendering) so query() can look up tags by their string
+        // representation regardless of which Tag variant they
+        // round-trip through. Phase A.5.N.2: render Tag → wire string.
+        //
+        // Phase 4 follow-on: also populate `by_axis_key` for axis-
+        // shaped tags so axis_cardinality is O(1).
         for tag in &caps.tags {
-            if let Some(mut set) = self.by_tag.get_mut(tag) {
+            let key = tag.to_string();
+            if let Some(mut set) = self.by_tag.get_mut(&key) {
                 set.insert(node_id);
             } else {
-                self.by_tag.entry(tag.clone()).or_default().insert(node_id);
+                self.by_tag.entry(key).or_default().insert(node_id);
             }
+
+            // Mirror axis-shaped tags into `by_axis_key`.
+            // AxisPresent: value sentinel `""`. AxisValue: the
+            // actual value. Reserved / Legacy variants don't
+            // surface here (no axis_key).
+            use crate::adapter::net::behavior::tag::Tag as TagEnum;
+            let (axis_key, value) = match tag {
+                TagEnum::AxisPresent { axis, key } => (
+                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
+                    String::new(),
+                ),
+                TagEnum::AxisValue {
+                    axis, key, value, ..
+                } => (
+                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
+                    value.clone(),
+                ),
+                _ => continue,
+            };
+            let inner = self.by_axis_key.entry(axis_key).or_default();
+            inner.entry(value).or_default().insert(node_id);
         }
 
         // Models
-        for model in &caps.models {
+        for model in views.models() {
             if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
                 set.insert(node_id);
             } else {
@@ -1662,7 +2637,7 @@ impl CapabilityIndex {
         }
 
         // Tools
-        for tool in &caps.tools {
+        for tool in views.tools() {
             if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
                 set.insert(node_id);
             } else {
@@ -1674,16 +2649,25 @@ impl CapabilityIndex {
         }
 
         // GPU. Key is `bool`, no allocation either way.
-        let has_gpu = caps.has_gpu();
+        let has_gpu = views.hardware().has_gpu();
         self.gpu_nodes.entry(has_gpu).or_default().insert(node_id);
 
-        if let Some(vendor) = caps.hardware.gpu_vendor() {
+        if let Some(vendor) = views.hardware().gpu_vendor() {
             // Vendor key is `Copy` (small enum), so the entry-only
             // form is already allocation-free.
             self.by_gpu_vendor
                 .entry(vendor)
                 .or_default()
                 .insert(node_id);
+        }
+
+        // Metadata: track per-key distinct values so the cardinality-
+        // aware planner can score MetadataEquals / MetadataExists
+        // leaves. Mirrors `by_tag` for the metadata side.
+        for (k, v) in &caps.metadata {
+            // Outer entry: key. Inner entry: value → node IDs.
+            let inner = self.by_metadata.entry(k.clone()).or_default();
+            inner.entry(v.clone()).or_default().insert(node_id);
         }
     }
 
@@ -1695,16 +2679,49 @@ impl CapabilityIndex {
     /// `HashSet` shells in the outer `DashMap`s — a slow unbounded
     /// leak over long-running deployments with high peer churn.
     fn remove_from_indexes(&self, node_id: u64, caps: &CapabilitySet) {
+        // Phase A.5.5: read through views() once — mirrors
+        // `add_to_indexes` so add/remove see the same projection.
+        let views = caps.views();
+
         // Tags
         for tag in &caps.tags {
-            if let Some(mut set) = self.by_tag.get_mut(tag) {
+            let key = tag.to_string();
+            if let Some(mut set) = self.by_tag.get_mut(&key) {
                 set.remove(&node_id);
             }
-            self.by_tag.remove_if(tag, |_, set| set.is_empty());
+            self.by_tag.remove_if(&key, |_, set| set.is_empty());
+
+            // Mirror prune in by_axis_key for axis-shaped tags.
+            use crate::adapter::net::behavior::tag::Tag as TagEnum;
+            let (axis_key, value) = match tag {
+                TagEnum::AxisPresent { axis, key } => (
+                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
+                    String::new(),
+                ),
+                TagEnum::AxisValue {
+                    axis, key, value, ..
+                } => (
+                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
+                    value.clone(),
+                ),
+                _ => continue,
+            };
+            let mut inner_now_empty = false;
+            if let Some(inner) = self.by_axis_key.get(&axis_key) {
+                if let Some(mut set) = inner.get_mut(&value) {
+                    set.remove(&node_id);
+                }
+                inner.remove_if(&value, |_, set| set.is_empty());
+                inner_now_empty = inner.is_empty();
+            }
+            if inner_now_empty {
+                self.by_axis_key
+                    .remove_if(&axis_key, |_, inner| inner.is_empty());
+            }
         }
 
         // Models
-        for model in &caps.models {
+        for model in views.models() {
             if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
                 set.remove(&node_id);
             }
@@ -1713,7 +2730,7 @@ impl CapabilityIndex {
         }
 
         // Tools
-        for tool in &caps.tools {
+        for tool in views.tools() {
             if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
                 set.remove(&node_id);
             }
@@ -1723,17 +2740,35 @@ impl CapabilityIndex {
 
         // GPU (two-value bucket; entries are intentionally permanent
         // because lookups for both `true` and `false` are expected).
-        let has_gpu = caps.has_gpu();
+        let has_gpu = views.hardware().has_gpu();
         if let Some(mut set) = self.gpu_nodes.get_mut(&has_gpu) {
             set.remove(&node_id);
         }
 
-        if let Some(vendor) = caps.hardware.gpu_vendor() {
+        if let Some(vendor) = views.hardware().gpu_vendor() {
             if let Some(mut set) = self.by_gpu_vendor.get_mut(&vendor) {
                 set.remove(&node_id);
             }
             self.by_gpu_vendor
                 .remove_if(&vendor, |_, set| set.is_empty());
+        }
+
+        // Metadata: drop this node's contribution from each
+        // (key, value) entry; prune empty inner / outer entries
+        // so the by_metadata index doesn't accumulate empty
+        // shells across high-churn deployments.
+        for (k, v) in &caps.metadata {
+            let mut inner_now_empty = false;
+            if let Some(inner) = self.by_metadata.get(k) {
+                if let Some(mut set) = inner.get_mut(v) {
+                    set.remove(&node_id);
+                }
+                inner.remove_if(v, |_, set| set.is_empty());
+                inner_now_empty = inner.is_empty();
+            }
+            if inner_now_empty {
+                self.by_metadata.remove_if(k, |_, inner| inner.is_empty());
+            }
         }
     }
 
@@ -1819,6 +2854,108 @@ impl CapabilityIndex {
         }
 
         candidates
+    }
+
+    /// Find indexed nodes whose capabilities match `predicate`.
+    ///
+    /// Linear scan over the indexed-node table; each node's
+    /// capabilities are evaluated against `predicate` via the
+    /// cardinality-aware planner ([`super::predicate::Predicate::evaluate_with_index`]).
+    /// `Self` provides the cardinality data — the same index that
+    /// holds the candidates also informs the planner's clause
+    /// ordering, so high-cardinality discriminating clauses run
+    /// first.
+    ///
+    /// Phase 5.B follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
+    /// Bridges the substrate's `CapabilityIndex` with the
+    /// `Predicate` AST so applications can do predicate-based
+    /// discovery without building a `CapabilityFilter`.
+    ///
+    /// Cost: O(N) where N is the number of indexed nodes. Each
+    /// per-node check materializes the node's tags as a Vec for
+    /// the slice-based `EvalContext` — for hot loops over many
+    /// predicates against the same index, callers may prefer to
+    /// pre-extract a `Vec<(u64, Vec<Tag>, BTreeMap)>` once and
+    /// reuse it.
+    ///
+    /// Returns matching node IDs in unspecified order. Callers
+    /// that need a deterministic order should sort.
+    pub fn find_nodes_matching(
+        &self,
+        predicate: &crate::adapter::net::behavior::Predicate,
+    ) -> Vec<u64> {
+        let mut matched = Vec::new();
+        for entry in self.nodes.iter() {
+            let node_id = *entry.key();
+            let caps = &entry.value().capabilities;
+            // Materialize tags for the slice-based EvalContext.
+            let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
+            let ctx = crate::adapter::net::behavior::EvalContext::new(&tags, &caps.metadata);
+            if predicate.evaluate_with_index(&ctx, self) {
+                matched.push(node_id);
+            }
+        }
+        matched
+    }
+
+    /// Distinct-value cardinality for a metadata key.
+    ///
+    /// Returns the count of distinct values seen for `key` across
+    /// all currently-indexed nodes. The cardinality-aware planner
+    /// uses this as a selectivity proxy for `MetadataEquals` /
+    /// `MetadataExists` / similar leaves, parallel to
+    /// [`Self::axis_cardinality`] for axis tags.
+    ///
+    /// Cost: O(1) — looks up the inner DashMap size; no scan.
+    /// `by_metadata` maintains distinct-value tracking incrementally
+    /// during `add_to_indexes` / `remove_from_indexes`.
+    ///
+    /// Returns 0 when the key is absent from the index. The
+    /// planner falls back to `static_cost` in that case.
+    pub fn metadata_value_cardinality(&self, key: &str) -> usize {
+        self.by_metadata
+            .get(key)
+            .map(|inner| inner.len())
+            .unwrap_or(0)
+    }
+
+    /// Distinct-value cardinality for an axis tag key.
+    ///
+    /// Returns the number of distinct values seen for the given
+    /// `(axis, key)` across all currently-indexed nodes. Used by
+    /// the predicate query planner (Phase 4 of
+    /// `CAPABILITY_ENHANCEMENTS_PLAN.md`) as a selectivity proxy:
+    /// a key with high cardinality has many possible values, so a
+    /// predicate matching one of them is likely to filter most
+    /// candidates — run such clauses first in `And`.
+    ///
+    /// Cost: O(1) — looks up the inner DashMap size in the
+    /// dedicated `by_axis_key` index, maintained incrementally
+    /// during `add_to_indexes` / `remove_from_indexes`. Phase 4
+    /// follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md` replaced an
+    /// earlier O(N) scan over `by_tag` because the planner reads
+    /// this once per leaf-clause-per-candidate; the linear scan
+    /// dominated hot-path evaluation.
+    ///
+    /// Returns:
+    ///
+    /// - For value-bearing keys (`hardware.cpu_cores=...`,
+    ///   `hardware.gpu.vendor=...`): the count of distinct
+    ///   value strings seen. Presence-form (no value) entries
+    ///   under the same key, if any, count as one of those
+    ///   distinct values via the empty-string sentinel.
+    /// - For presence-only keys (`hardware.gpu`): `1` if any node
+    ///   has the marker, `0` otherwise.
+    /// - For unrecognized keys: `0`.
+    ///
+    /// Reserved-prefix tags (`scope:*`, `causal:*`, etc.) and
+    /// legacy untyped tags don't fit the axis taxonomy; this
+    /// primitive doesn't surface them.
+    pub fn axis_cardinality(&self, key: &crate::adapter::net::behavior::tag::TagKey) -> usize {
+        self.by_axis_key
+            .get(key)
+            .map(|inner| inner.len())
+            .unwrap_or(0)
     }
 
     /// Query nodes by filter
@@ -1971,6 +3108,23 @@ impl CapabilityIndex {
         self.nodes.get(&node_id).map(|n| n.capabilities.clone())
     }
 
+    /// Run `f` against the node's `CapabilitySet` without cloning.
+    ///
+    /// Holds the `DashMap` shard's read lock for the duration of
+    /// the closure — `f` MUST NOT acquire any other index locks
+    /// (e.g. via `find_nodes` / `query`), or it'll deadlock
+    /// against a concurrent insert. Use [`Self::get`] when the
+    /// result needs to outlive the scoring call.
+    ///
+    /// Hot-path use: `StandardPlacement::placement_score` calls
+    /// this once per scoring decision, dispatching the in-tree
+    /// axes against the borrowed caps. Saves the `CapabilitySet`
+    /// clone per scoring call (a HashSet + BTreeMap allocation
+    /// pair), which dominates the per-candidate cost in benches.
+    pub fn with_caps<R>(&self, node_id: u64, f: impl FnOnce(&CapabilitySet) -> R) -> Option<R> {
+        self.nodes.get(&node_id).map(|n| f(&n.capabilities))
+    }
+
     /// Get the peer's last-advertised reflex address from the
     /// index. Returns `None` when the peer hasn't indexed, or
     /// indexed a version with no `reflex_addr` attached. Consumed
@@ -2031,6 +3185,170 @@ impl CapabilityIndex {
 impl Default for CapabilityIndex {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// =============================================================================
+// CardinalityProvider trait + CardinalityCache — Phase 4 follow-on of
+// CAPABILITY_ENHANCEMENTS_PLAN.md "Cached cardinality estimates".
+//
+// `axis_cardinality` and `metadata_value_cardinality` on
+// `CapabilityIndex` are O(1) but each call hits DashMap — a sharded
+// lookup with atomic ops + per-shard locks. For the predicate
+// planner reading the same key many times in a hot evaluation
+// loop (one read per leaf-clause-per-candidate), the contention
+// cost compounds. `CardinalityCache` snapshots cardinality numbers
+// on first read and serves subsequent reads from a plain `HashMap`,
+// dropping the DashMap traffic.
+//
+// The cache is bound to a TTL — after `ttl` elapses, the next
+// access recomputes from the underlying index. Heartbeat-aligned
+// TTLs are the canonical use case (per-heartbeat planner snapshot).
+// =============================================================================
+
+/// Source of per-key cardinality data for the predicate query
+/// planner. Implemented by [`CapabilityIndex`] (direct, O(1) DashMap
+/// lookups) and [`CardinalityCache`] (TTL-cached, O(1) HashMap
+/// lookups after warmup).
+///
+/// The planner ([`crate::adapter::net::behavior::predicate::Predicate::evaluate_with_index`])
+/// is generic over this trait so callers pick whichever shape
+/// matches their workload — direct for single-shot evaluation,
+/// cache for hot-loop or long-lived service handlers.
+pub trait CardinalityProvider {
+    /// Distinct-value count for the given axis tag key. Returns 0
+    /// when the key is absent — planner treats this as "no data,
+    /// fall back to static cost".
+    fn axis_cardinality(&self, key: &crate::adapter::net::behavior::tag::TagKey) -> usize;
+
+    /// Distinct-value count for the given metadata key.
+    fn metadata_value_cardinality(&self, key: &str) -> usize;
+}
+
+impl CardinalityProvider for CapabilityIndex {
+    fn axis_cardinality(&self, key: &crate::adapter::net::behavior::tag::TagKey) -> usize {
+        // Inherent method (resolved via Rust's preference for
+        // inherent over trait when the receiver is concrete).
+        Self::axis_cardinality(self, key)
+    }
+
+    fn metadata_value_cardinality(&self, key: &str) -> usize {
+        Self::metadata_value_cardinality(self, key)
+    }
+}
+
+/// Per-call TTL cache around a [`CapabilityIndex`] for cardinality
+/// lookups.
+///
+/// Phase 4 follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`. Drops
+/// DashMap shard contention on hot loops over many predicates
+/// against the same index by snapshotting cardinality numbers
+/// into a plain `HashMap` on first access. Subsequent reads of
+/// the same key skip the DashMap entirely.
+///
+/// The cache invalidates after `ttl` elapses — the next lookup
+/// past the deadline triggers a refresh (clear + reset deadline);
+/// fresh lookups go to the index again. Heartbeat-aligned TTLs
+/// are the canonical use case: a service handler builds a cache
+/// at the start of each heartbeat-bounded request batch, evaluates
+/// many predicates against it, then lets it drop.
+///
+/// Concurrent access is safe — internal `parking_lot::Mutex`
+/// guards the HashMap. Two threads racing on the same uncached
+/// key may both compute via the index (the work is idempotent),
+/// but neither will read stale data.
+///
+/// ```ignore
+/// let cache = CardinalityCache::new(&index, Duration::from_secs(5));
+/// for candidate in candidates {
+///     let ctx = build_eval_context(candidate);
+///     if predicate.evaluate_with_index(&ctx, &cache) { /* ... */ }
+/// }
+/// ```
+pub struct CardinalityCache<'a> {
+    index: &'a CapabilityIndex,
+    ttl: Duration,
+    state: parking_lot::Mutex<CardinalityCacheState>,
+}
+
+/// Inner state guarded by the cache's mutex.
+struct CardinalityCacheState {
+    deadline: Instant,
+    axis: std::collections::HashMap<crate::adapter::net::behavior::tag::TagKey, usize>,
+    metadata: std::collections::HashMap<String, usize>,
+}
+
+impl<'a> CardinalityCache<'a> {
+    /// Build a cache bound to `index` with `ttl` lifetime. The
+    /// cache's deadline starts at `Instant::now() + ttl`.
+    pub fn new(index: &'a CapabilityIndex, ttl: Duration) -> Self {
+        Self {
+            index,
+            ttl,
+            state: parking_lot::Mutex::new(CardinalityCacheState {
+                deadline: Instant::now() + ttl,
+                axis: std::collections::HashMap::new(),
+                metadata: std::collections::HashMap::new(),
+            }),
+        }
+    }
+
+    /// True if the cache's TTL has elapsed.
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.state.lock().deadline
+    }
+
+    /// Force-refresh the cache: clear all entries and reset the
+    /// deadline to `now + ttl`. Called automatically when an
+    /// access notices the cache is expired; callers can invoke
+    /// directly to align with their own heartbeat.
+    pub fn refresh(&self) {
+        let mut guard = self.state.lock();
+        guard.deadline = Instant::now() + self.ttl;
+        guard.axis.clear();
+        guard.metadata.clear();
+    }
+}
+
+impl CardinalityProvider for CardinalityCache<'_> {
+    fn axis_cardinality(&self, key: &crate::adapter::net::behavior::tag::TagKey) -> usize {
+        // Acquire the lock once per call; check deadline and
+        // cache under the same critical section to avoid TOCTOU.
+        {
+            let mut guard = self.state.lock();
+            if Instant::now() >= guard.deadline {
+                guard.deadline = Instant::now() + self.ttl;
+                guard.axis.clear();
+                guard.metadata.clear();
+            }
+            if let Some(&v) = guard.axis.get(key) {
+                return v;
+            }
+        }
+        // Cache miss: compute via the underlying index without
+        // holding the cache lock (axis_cardinality acquires the
+        // index's own DashMap shard lock; cross-locking would
+        // serialize unnecessarily).
+        let v = self.index.axis_cardinality(key);
+        self.state.lock().axis.insert(key.clone(), v);
+        v
+    }
+
+    fn metadata_value_cardinality(&self, key: &str) -> usize {
+        {
+            let mut guard = self.state.lock();
+            if Instant::now() >= guard.deadline {
+                guard.deadline = Instant::now() + self.ttl;
+                guard.axis.clear();
+                guard.metadata.clear();
+            }
+            if let Some(&v) = guard.metadata.get(key) {
+                return v;
+            }
+        }
+        let v = self.index.metadata_value_cardinality(key);
+        self.state.lock().metadata.insert(key.to_string(), v);
+        v
     }
 }
 
@@ -2116,7 +3434,7 @@ mod tests {
         assert!(caps.has_tag("inference"));
         assert!(caps.has_model("llama-3.1-70b"));
         assert!(caps.has_tool("python_repl"));
-        assert_eq!(caps.hardware.memory_mb, 65536);
+        assert_eq!(caps.views().hardware().memory_mb, 65536);
     }
 
     #[test]
@@ -2125,9 +3443,81 @@ mod tests {
         let bytes = caps.to_bytes();
         let parsed = CapabilitySet::from_bytes(&bytes).unwrap();
 
-        assert_eq!(caps.hardware.memory_mb, parsed.hardware.memory_mb);
+        assert_eq!(
+            caps.views().hardware().memory_mb,
+            parsed.views().hardware().memory_mb,
+        );
         assert_eq!(caps.tags, parsed.tags);
-        assert_eq!(caps.models.len(), parsed.models.len());
+        assert_eq!(caps.views().models().len(), parsed.views().models().len());
+    }
+
+    /// CR-16: `with_metadata` silently drops writes whose key
+    /// starts with a reserved prefix (`tool::`). Same shape as
+    /// `add_tag`'s rejection of reserved tag prefixes via
+    /// `Tag::parse_user`. Exact-match reserved keys (`intent`,
+    /// `owner`, …) are NOT gated — those are well-known
+    /// user-facing scheduler hints.
+    #[test]
+    fn with_metadata_drops_reserved_prefix_keys() {
+        // `tool::*` writes silently dropped.
+        let caps = CapabilitySet::new()
+            .with_metadata("tool::evil::input_schema", "spoof")
+            .with_metadata("region", "us-east");
+        assert!(
+            !caps.metadata.contains_key("tool::evil::input_schema"),
+            "with_metadata must drop reserved-prefix keys: {:?}",
+            caps.metadata
+        );
+        // Non-reserved key passes through.
+        assert_eq!(
+            caps.metadata.get("region").map(|s| s.as_str()),
+            Some("us-east")
+        );
+
+        // Exact-match reserved keys (NOT gated) — these are
+        // user-facing scheduler hints, the substrate reads them
+        // and user code is expected to set them.
+        let caps = CapabilitySet::new().with_metadata("intent", "ml-training");
+        assert_eq!(
+            caps.metadata.get("intent").map(|s| s.as_str()),
+            Some("ml-training")
+        );
+    }
+
+    #[test]
+    fn has_tag_matches_across_separator_forms() {
+        // Regression for CR-1: `Tag::AxisValue` derives `PartialEq`
+        // including the `=` vs `:` separator. A capability set built
+        // by inserting one wire form must still be findable when the
+        // caller queries the other — the separator is a serialization
+        // detail, not part of identity. Mirrors the prior diff-engine
+        // fix in commit 38612b61 but for the public membership API.
+        use crate::adapter::net::behavior::tag::{AxisSeparator, Tag, TaxonomyAxis};
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(Tag::AxisValue {
+            axis: TaxonomyAxis::Software,
+            key: "os".to_string(),
+            value: "linux".to_string(),
+            separator: AxisSeparator::Colon,
+        });
+        // Stored colon, queried equals — must hit.
+        assert!(caps.has_tag("software.os=linux"));
+        // Stored colon, queried colon — must hit.
+        assert!(caps.has_tag("software.os:linux"));
+        // Different value — must miss.
+        assert!(!caps.has_tag("software.os=darwin"));
+
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(Tag::AxisValue {
+            axis: TaxonomyAxis::Hardware,
+            key: "gpu.vram_gb".to_string(),
+            value: "80".to_string(),
+            separator: AxisSeparator::Eq,
+        });
+        // Stored equals, queried colon — must hit.
+        assert!(caps.has_tag("hardware.gpu.vram_gb:80"));
+        // Stored equals, queried equals — must hit.
+        assert!(caps.has_tag("hardware.gpu.vram_gb=80"));
     }
 
     #[test]
@@ -2174,10 +3564,10 @@ mod tests {
         for i in 0..100 {
             let mut caps = sample_capability_set();
             if i % 2 == 0 {
-                caps.tags.push("even".into());
+                caps = caps.add_tag("even");
             }
             if i % 3 == 0 {
-                caps.tags.push("divisible_by_3".into());
+                caps = caps.add_tag("divisible_by_3");
             }
 
             let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
@@ -2216,6 +3606,621 @@ mod tests {
 
         let score = req.score(&caps);
         assert!(score > 1.0); // Base score + preferences
+    }
+
+    // ========================================================================
+    // CapabilityIndex::axis_cardinality — Phase 4 follow-on of
+    // CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    fn index_with_node(index: &CapabilityIndex, node_id: u64, caps: CapabilitySet) {
+        let ann = CapabilityAnnouncement::new(node_id, test_entity(), 1, caps);
+        index.index(ann);
+    }
+
+    #[test]
+    fn axis_cardinality_counts_distinct_value_tags() {
+        // 3 nodes with different memory_mb values. Cardinality
+        // for `hardware.memory_mb` should be 3.
+        let index = CapabilityIndex::new();
+        for (i, mb) in [16384u32, 32768, 65536].iter().enumerate() {
+            let caps =
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(*mb));
+            index_with_node(&index, i as u64, caps);
+        }
+        let key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        assert_eq!(index.axis_cardinality(&key), 3);
+    }
+
+    #[test]
+    fn axis_cardinality_dedupes_repeated_values() {
+        // 5 nodes, only 2 distinct gpu vendors. Cardinality = 2.
+        let index = CapabilityIndex::new();
+        let vendors = [
+            GpuVendor::Nvidia,
+            GpuVendor::Nvidia,
+            GpuVendor::Amd,
+            GpuVendor::Nvidia,
+            GpuVendor::Amd,
+        ];
+        for (i, v) in vendors.iter().enumerate() {
+            let caps = CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(*v, "x", 1024)));
+            index_with_node(&index, i as u64, caps);
+        }
+        let key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "gpu.vendor",
+        );
+        assert_eq!(index.axis_cardinality(&key), 2);
+    }
+
+    #[test]
+    fn axis_cardinality_returns_one_for_presence_keys_with_any_match() {
+        // Presence-only key (`hardware.gpu` marker, no `=value`).
+        // Any node with the marker → cardinality 1.
+        let index = CapabilityIndex::new();
+        let caps = CapabilitySet::new().with_hardware(
+            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
+        );
+        index_with_node(&index, 1, caps);
+        let key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "gpu",
+        );
+        assert_eq!(index.axis_cardinality(&key), 1);
+    }
+
+    #[test]
+    fn axis_cardinality_returns_zero_for_unknown_keys() {
+        let index = CapabilityIndex::new();
+        let caps =
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(65536));
+        index_with_node(&index, 1, caps);
+
+        let unknown_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Devices,
+            "qpu",
+        );
+        assert_eq!(index.axis_cardinality(&unknown_key), 0);
+    }
+
+    #[test]
+    fn axis_cardinality_returns_zero_on_empty_index() {
+        let index = CapabilityIndex::new();
+        let key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        assert_eq!(index.axis_cardinality(&key), 0);
+    }
+
+    #[test]
+    fn axis_cardinality_excludes_presence_when_value_form_present() {
+        // Edge case: if the key has BOTH presence-form
+        // (`hardware.gpu`) and value-form sub-keys
+        // (`hardware.gpu.vendor=...`), `axis_cardinality(gpu)`
+        // returns 1 (the presence count) — the gpu.vendor sub-key
+        // has its own cardinality measurement under a different
+        // TagKey.
+        let index = CapabilityIndex::new();
+        let caps = CapabilitySet::new().with_hardware(
+            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
+        );
+        index_with_node(&index, 1, caps);
+
+        let gpu_presence = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "gpu",
+        );
+        assert_eq!(index.axis_cardinality(&gpu_presence), 1);
+
+        let gpu_vendor = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "gpu.vendor",
+        );
+        assert_eq!(index.axis_cardinality(&gpu_vendor), 1);
+    }
+
+    #[test]
+    fn axis_cardinality_handles_high_cardinality_keys() {
+        // 100 nodes with distinct memory values → cardinality 100.
+        // Pin: the O(1) by_axis_key lookup handles modest sizes
+        // correctly (was an O(N) scan in the previous implementation).
+        let index = CapabilityIndex::new();
+        for i in 0..100u32 {
+            let caps = CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_memory(1024 + i));
+            index_with_node(&index, i as u64, caps);
+        }
+        let key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        assert_eq!(index.axis_cardinality(&key), 100);
+    }
+
+    #[test]
+    fn axis_cardinality_decrements_on_node_removal() {
+        // Pin: removing a node updates `by_axis_key` — its values
+        // are pruned if no other node carries them. Mirrors the
+        // metadata_value_cardinality lifecycle test.
+        let index = CapabilityIndex::new();
+        // Node 1: memory_mb=1024
+        index_with_node(
+            &index,
+            1,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1024)),
+        );
+        // Node 2: memory_mb=2048
+        index_with_node(
+            &index,
+            2,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(2048)),
+        );
+        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        assert_eq!(index.axis_cardinality(&memory_key), 2);
+
+        // Remove node 1; only memory_mb=2048 left → cardinality 1.
+        index.remove(1);
+        assert_eq!(index.axis_cardinality(&memory_key), 1);
+
+        // Remove node 2; both memory values pruned → cardinality 0.
+        index.remove(2);
+        assert_eq!(index.axis_cardinality(&memory_key), 0);
+    }
+
+    // ========================================================================
+    // CapabilityIndex::find_nodes_matching — Phase 5.B follow-on of
+    // CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    #[test]
+    fn find_nodes_matching_simple_predicate() {
+        // 4 nodes: 2 with GPUs, 2 without. Predicate selects GPU nodes.
+        let index = CapabilityIndex::new();
+        index_with_node(
+            &index,
+            1,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
+                GpuVendor::Nvidia,
+                "h100",
+                1024,
+            ))),
+        );
+        index_with_node(
+            &index,
+            2,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(65536)),
+        );
+        index_with_node(
+            &index,
+            3,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
+                GpuVendor::Amd,
+                "x",
+                1024,
+            ))),
+        );
+        index_with_node(
+            &index,
+            4,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_cpu(8, 16)),
+        );
+
+        let pred = crate::adapter::net::behavior::Predicate::Exists {
+            key: crate::adapter::net::behavior::tag::TagKey::new(
+                crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                "gpu",
+            ),
+        };
+        let mut matched = index.find_nodes_matching(&pred);
+        matched.sort();
+        assert_eq!(matched, vec![1, 3]);
+    }
+
+    #[test]
+    fn find_nodes_matching_composite_predicate() {
+        // 4 nodes; the predicate selects nodes with GPU AND
+        // intent=ml-training metadata. Pin the And + metadata
+        // composition path.
+        let index = CapabilityIndex::new();
+        // GPU + ml-training → match
+        index_with_node(
+            &index,
+            10,
+            CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
+                    GpuVendor::Nvidia,
+                    "h100",
+                    81920,
+                )))
+                .with_metadata("intent", "ml-training"),
+        );
+        // GPU but wrong intent → miss
+        index_with_node(
+            &index,
+            11,
+            CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
+                    GpuVendor::Amd,
+                    "x",
+                    1024,
+                )))
+                .with_metadata("intent", "embedding-cache"),
+        );
+        // ml-training but no GPU → miss
+        index_with_node(
+            &index,
+            12,
+            CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_memory(65536))
+                .with_metadata("intent", "ml-training"),
+        );
+        // Neither → miss
+        index_with_node(
+            &index,
+            13,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_cpu(4, 8)),
+        );
+
+        let pred = crate::adapter::net::behavior::Predicate::And(vec![
+            crate::adapter::net::behavior::Predicate::Exists {
+                key: crate::adapter::net::behavior::tag::TagKey::new(
+                    crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                    "gpu",
+                ),
+            },
+            crate::adapter::net::behavior::Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+        ]);
+        let matched = index.find_nodes_matching(&pred);
+        assert_eq!(matched, vec![10]);
+    }
+
+    #[test]
+    fn find_nodes_matching_no_match_returns_empty() {
+        let index = CapabilityIndex::new();
+        index_with_node(
+            &index,
+            1,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1024)),
+        );
+        let pred = crate::adapter::net::behavior::Predicate::Exists {
+            key: crate::adapter::net::behavior::tag::TagKey::new(
+                crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                "gpu",
+            ),
+        };
+        let matched = index.find_nodes_matching(&pred);
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn find_nodes_matching_empty_index_returns_empty() {
+        let index = CapabilityIndex::new();
+        let pred = crate::adapter::net::behavior::Predicate::Exists {
+            key: crate::adapter::net::behavior::tag::TagKey::new(
+                crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                "gpu",
+            ),
+        };
+        let matched = index.find_nodes_matching(&pred);
+        assert!(matched.is_empty());
+    }
+
+    // ========================================================================
+    // CapabilityIndex::metadata_value_cardinality — Phase 5.B follow-on of
+    // CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    #[test]
+    fn metadata_value_cardinality_counts_distinct_values() {
+        let index = CapabilityIndex::new();
+        // 5 nodes with 3 distinct intent values.
+        let intents = [
+            "ml-training",
+            "ml-training",
+            "embedding-cache",
+            "ml-training",
+            "scratchpad",
+        ];
+        for (i, v) in intents.iter().enumerate() {
+            let caps = CapabilitySet::new().with_metadata("intent", *v);
+            index_with_node(&index, i as u64, caps);
+        }
+        assert_eq!(index.metadata_value_cardinality("intent"), 3);
+    }
+
+    #[test]
+    fn metadata_value_cardinality_returns_zero_for_unknown_key() {
+        let index = CapabilityIndex::new();
+        let caps = CapabilitySet::new().with_metadata("intent", "ml-training");
+        index_with_node(&index, 1, caps);
+        assert_eq!(index.metadata_value_cardinality("nonexistent"), 0);
+    }
+
+    #[test]
+    fn metadata_value_cardinality_empty_index() {
+        let index = CapabilityIndex::new();
+        assert_eq!(index.metadata_value_cardinality("intent"), 0);
+    }
+
+    #[test]
+    fn metadata_value_cardinality_dedupes_repeated_values() {
+        let index = CapabilityIndex::new();
+        // 10 nodes all with the same intent → cardinality = 1.
+        for i in 0..10u64 {
+            let caps = CapabilitySet::new().with_metadata("intent", "ml-training");
+            index_with_node(&index, i, caps);
+        }
+        assert_eq!(index.metadata_value_cardinality("intent"), 1);
+    }
+
+    #[test]
+    fn metadata_value_cardinality_decrements_on_node_removal() {
+        // Pin: removing a node updates the metadata index — its
+        // values are pruned if no other node carries them.
+        let index = CapabilityIndex::new();
+        // Node 1: intent=A, owner=alice
+        index_with_node(
+            &index,
+            1,
+            CapabilitySet::new()
+                .with_metadata("intent", "A")
+                .with_metadata("owner", "alice"),
+        );
+        // Node 2: intent=B, owner=alice (same owner, different intent)
+        index_with_node(
+            &index,
+            2,
+            CapabilitySet::new()
+                .with_metadata("intent", "B")
+                .with_metadata("owner", "alice"),
+        );
+        assert_eq!(index.metadata_value_cardinality("intent"), 2);
+        assert_eq!(index.metadata_value_cardinality("owner"), 1);
+
+        // Remove node 1; intent A's only node is gone, so
+        // intent's cardinality drops to 1. Owner alice still has
+        // node 2, so owner's cardinality stays 1.
+        index.remove(1);
+        assert_eq!(index.metadata_value_cardinality("intent"), 1);
+        assert_eq!(index.metadata_value_cardinality("owner"), 1);
+
+        // Remove node 2; both intent and owner are now empty.
+        index.remove(2);
+        assert_eq!(index.metadata_value_cardinality("intent"), 0);
+        assert_eq!(index.metadata_value_cardinality("owner"), 0);
+    }
+
+    // ========================================================================
+    // CardinalityCache — Phase 4 follow-on of CAPABILITY_ENHANCEMENTS_PLAN.md
+    // "Cached cardinality estimates".
+    // ========================================================================
+
+    fn small_index_with_metadata() -> CapabilityIndex {
+        let index = CapabilityIndex::new();
+        for i in 0..5u64 {
+            let caps = CapabilitySet::new()
+                .with_hardware(HardwareCapabilities::new().with_memory(1024 + i as u32))
+                .with_metadata("intent", "ml-training");
+            index_with_node(&index, i, caps);
+        }
+        index
+    }
+
+    #[test]
+    fn cardinality_cache_returns_same_values_as_index() {
+        // Pin: the cache is a transparent passthrough on first
+        // access — every key returns the same value as direct
+        // index lookup.
+        let index = small_index_with_metadata();
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
+
+        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        assert_eq!(
+            cache.axis_cardinality(&memory_key),
+            index.axis_cardinality(&memory_key),
+        );
+        assert_eq!(
+            cache.metadata_value_cardinality("intent"),
+            index.metadata_value_cardinality("intent"),
+        );
+    }
+
+    #[test]
+    fn cardinality_cache_serves_repeat_reads_from_cache() {
+        // Pin: a second read of the same key returns the cached
+        // value even if the underlying index changes — the cache
+        // hides updates until the TTL elapses or refresh() is
+        // called explicitly.
+        let index = small_index_with_metadata();
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
+
+        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        let first = cache.axis_cardinality(&memory_key);
+
+        // Mutate the underlying index. The cache shouldn't see this
+        // until refresh / TTL elapse.
+        index_with_node(
+            &index,
+            999,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(99999)),
+        );
+
+        let second = cache.axis_cardinality(&memory_key);
+        assert_eq!(
+            second, first,
+            "cached value should not reflect post-cache mutation"
+        );
+    }
+
+    #[test]
+    fn cardinality_cache_refresh_picks_up_new_data() {
+        // Pin: refresh() invalidates the cache; the next access
+        // reads fresh data from the index.
+        let index = small_index_with_metadata();
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
+
+        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        let first = cache.axis_cardinality(&memory_key);
+
+        // Mutate index, then explicitly refresh.
+        index_with_node(
+            &index,
+            999,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(99999)),
+        );
+        cache.refresh();
+
+        let after_refresh = cache.axis_cardinality(&memory_key);
+        assert_eq!(
+            after_refresh,
+            first + 1,
+            "post-refresh read should see the new node"
+        );
+    }
+
+    #[test]
+    fn cardinality_cache_auto_refresh_on_ttl_expiry() {
+        // Pin: the cache auto-refreshes when its TTL elapses.
+        let index = small_index_with_metadata();
+        // 1 ms TTL — guarantees expiry between two ordinary reads.
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_millis(1));
+
+        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
+            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+            "memory_mb",
+        );
+        let first = cache.axis_cardinality(&memory_key);
+
+        // Mutate index, then sleep past the TTL.
+        index_with_node(
+            &index,
+            999,
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(99999)),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let after_expiry = cache.axis_cardinality(&memory_key);
+        assert_eq!(
+            after_expiry,
+            first + 1,
+            "post-TTL-expiry read should see the new node",
+        );
+    }
+
+    #[test]
+    fn cardinality_cache_is_expired_reflects_deadline() {
+        let index = CapabilityIndex::new();
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_millis(1));
+        // Fresh cache: not expired.
+        assert!(!cache.is_expired());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(cache.is_expired());
+    }
+
+    #[test]
+    fn cardinality_cache_works_as_planner_provider() {
+        // Pin: the planner accepts &CardinalityCache transparently
+        // (drop-in replacement for &CapabilityIndex).
+        use crate::adapter::net::behavior::Predicate;
+        let index = small_index_with_metadata();
+        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
+
+        let pred = Predicate::And(vec![
+            Predicate::Exists {
+                key: crate::adapter::net::behavior::tag::TagKey::new(
+                    crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                    "memory_mb",
+                ),
+            },
+            Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+        ]);
+
+        // Use the cache as the planner provider; pin equivalence
+        // with the direct-index path.
+        let candidate_caps = CapabilitySet::new()
+            .with_hardware(HardwareCapabilities::new().with_memory(2048))
+            .with_metadata("intent", "ml-training");
+        let tags: Vec<crate::adapter::net::behavior::Tag> =
+            candidate_caps.tags.iter().cloned().collect();
+        let ctx = crate::adapter::net::behavior::EvalContext::new(&tags, &candidate_caps.metadata);
+        assert_eq!(
+            pred.evaluate_with_index(&ctx, &cache),
+            pred.evaluate_with_index(&ctx, &index),
+        );
+    }
+
+    #[test]
+    fn find_nodes_matching_uses_cardinality_aware_planner() {
+        // Build an index where one node matches a high-cardinality
+        // discriminator AND a low-cardinality clause; a different
+        // node matches only the low-cardinality clause. The
+        // cardinality-aware planner runs the high-cardinality
+        // (more selective) clause first → fewer evaluations of the
+        // low-cardinality clause. Result is the same; this test
+        // pins the *result*, not the ordering (which is internal).
+        let index = CapabilityIndex::new();
+        // Many distinct memory values → high cardinality of memory_mb
+        for i in 0..20u64 {
+            let mut caps = CapabilitySet::new().with_hardware(
+                HardwareCapabilities::new()
+                    .with_memory(1024 + i as u32)
+                    .with_gpu(GpuInfo::new(
+                        if i % 2 == 0 {
+                            GpuVendor::Nvidia
+                        } else {
+                            GpuVendor::Amd
+                        },
+                        "x",
+                        1024,
+                    )),
+            );
+            if i == 5 {
+                caps = caps.with_metadata("intent", "ml-training");
+            }
+            index_with_node(&index, i, caps);
+        }
+
+        // Predicate: intent=ml-training (low-card metadata) AND memory=1029 (high-card axis)
+        let pred = crate::adapter::net::behavior::Predicate::And(vec![
+            crate::adapter::net::behavior::Predicate::MetadataEquals {
+                key: "intent".into(),
+                value: "ml-training".into(),
+            },
+            crate::adapter::net::behavior::Predicate::Equals {
+                key: crate::adapter::net::behavior::tag::TagKey::new(
+                    crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
+                    "memory_mb",
+                ),
+                value: "1029".into(),
+            },
+        ]);
+        // Only node 5 matches both clauses.
+        let matched = index.find_nodes_matching(&pred);
+        assert_eq!(matched, vec![5]);
     }
 
     #[test]
@@ -2808,85 +4813,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signed_payload_stays_compatible_with_pre_hop_count_format() {
-        use super::super::super::identity::{EntityId, EntityKeypair};
-
-        // Mirror of the pre-M-1 `CapabilityAnnouncement` layout —
-        // fields match in declaration order, no `hop_count`.
-        #[derive(Serialize)]
-        struct PreM1Announcement {
-            node_id: u64,
-            entity_id: EntityId,
-            version: u64,
-            timestamp_ns: u64,
-            ttl_secs: u32,
-            capabilities: CapabilitySet,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            signature: Option<Signature64>,
-        }
-
-        let keypair = EntityKeypair::generate();
-        let caps = sample_capability_set();
-
-        let ann = CapabilityAnnouncement::new(1, keypair.entity_id().clone(), 1, caps.clone());
-        let pre_m1 = PreM1Announcement {
-            node_id: ann.node_id,
-            entity_id: ann.entity_id.clone(),
-            version: ann.version,
-            timestamp_ns: ann.timestamp_ns,
-            ttl_secs: ann.ttl_secs,
-            capabilities: ann.capabilities.clone(),
-            signature: None,
-        };
-        let pre_m1_bytes = serde_json::to_vec(&pre_m1).expect("pre-M-1 serialize");
-
-        // Post-M-1 signed_payload — clones, zeros hop_count, sets
-        // signature=None, serializes via the derived Serialize
-        // (same struct-order path as PreM1Announcement).
-        let new_signed = ann.signed_payload();
-
-        assert_eq!(
-            pre_m1_bytes,
-            new_signed,
-            "signed_payload bytes must be byte-identical to pre-M-1 \
-             serialization — otherwise signatures issued before M-1 \
-             fail verification after a rolling upgrade.\n  \
-             pre-M-1:  {}\n  post-M-1: {}",
-            std::str::from_utf8(&pre_m1_bytes).unwrap_or("<non-utf8>"),
-            std::str::from_utf8(&new_signed).unwrap_or("<non-utf8>"),
-        );
-        assert!(
-            !std::str::from_utf8(&new_signed)
-                .unwrap()
-                .contains("hop_count"),
-            "signed_payload must not contain 'hop_count' when zero",
-        );
-
-        // End-to-end: sign with pre-M-1 bytes (what an old node
-        // would have produced), construct a wire payload carrying
-        // that signature, parse via post-M-1 `from_bytes`, and
-        // verify. Must succeed.
-        let sig = keypair.sign(&pre_m1_bytes);
-        let signed_mirror = PreM1Announcement {
-            node_id: ann.node_id,
-            entity_id: ann.entity_id.clone(),
-            version: ann.version,
-            timestamp_ns: ann.timestamp_ns,
-            ttl_secs: ann.ttl_secs,
-            capabilities: ann.capabilities.clone(),
-            signature: Some(Signature64(sig.to_bytes())),
-        };
-        let wire_bytes = serde_json::to_vec(&signed_mirror).expect("serialize wire");
-        let parsed = CapabilityAnnouncement::from_bytes(&wire_bytes)
-            .expect("post-M-1 parses pre-M-1 wire format");
-        assert_eq!(parsed.hop_count, 0);
-        assert!(
-            parsed.verify().is_ok(),
-            "signature computed over pre-M-1 bytes must still verify \
-             on a post-M-1 node — rolling-upgrade compatibility",
-        );
-    }
+    // `signed_payload_stays_compatible_with_pre_hop_count_format`
+    // intentionally removed in Phase A.5.N.3. That test pinned the
+    // pre-hop_count byte-identical serialization so signatures
+    // issued before that field landed could still verify after a
+    // rolling upgrade. Phase A.5.N.3 changes the CapabilitySet
+    // wire format outright (no more `hardware`/`software`/`models`/
+    // `tools`/`limits` keys; just `tags` + `metadata`), so peers
+    // must upgrade together — there is no rolling-upgrade path
+    // across this commit. The hop_count omission contract itself
+    // is still pinned by `hop_count_zero_omits_key_while_nonzero_keeps_it`.
 
     #[test]
     fn hop_count_zero_omits_key_while_nonzero_keeps_it() {
@@ -2931,10 +4867,10 @@ mod tests {
             // sample_capability_set already has tag "inference" + "gpu"; vary
             // additional tags so filters discriminate.
             if i % 2 == 0 {
-                caps.tags.push("even".into());
+                caps = caps.add_tag("even");
             }
             if i % 3 == 0 {
-                caps.tags.push("triple".into());
+                caps = caps.add_tag("triple");
             }
             let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
             index.index(ann);
@@ -2973,10 +4909,14 @@ mod tests {
             let mut caps = sample_capability_set();
             // Discriminator tag.
             if i % 4 == 0 {
-                caps.tags.push("preferred".into());
+                caps = caps.add_tag("preferred");
             }
             // Vary memory so `prefer_memory` produces a real ordering.
-            caps.hardware.memory_mb = 1024 * (i as u32 + 1);
+            // Phase A.5.N.3: read-modify-write through views()/setter
+            // since the typed `hardware` field is gone.
+            let mut hw = caps.views().hardware().clone();
+            hw.memory_mb = 1024 * (i as u32 + 1);
+            caps.set_hardware(hw);
             let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
             index.index(ann);
         }
@@ -3004,7 +4944,7 @@ mod tests {
                 index
                     .nodes
                     .get(&id)
-                    .map(|n| n.capabilities.hardware.memory_mb)
+                    .map(|n| n.capabilities.views().hardware().memory_mb)
                     .unwrap_or(0)
             })
             .copied()
@@ -3099,16 +5039,27 @@ mod tests {
     // Scope helpers (`scope_from_tags` + `matches_scope`)
     // ========================================================================
 
+    /// Phase A.5.N.2: scope tests now exercise `&HashSet<Tag>`.
+    /// Helper parses each input string through the permissive
+    /// `Tag::parse` so reserved-prefix tags (`scope:tenant:foo`)
+    /// land as `Tag::Reserved`, mirroring real wire-form decoding.
+    fn tags_from(strs: &[&str]) -> HashSet<Tag> {
+        strs.iter().filter_map(|s| Tag::parse(s).ok()).collect()
+    }
+
     #[test]
     fn scope_from_tags_no_scope_tag_is_global() {
-        assert!(matches!(scope_from_tags(&[]), CapabilityScope::Global));
         assert!(matches!(
-            scope_from_tags(&["gpu".to_string(), "model:llama3".to_string()]),
+            scope_from_tags(&tags_from(&[])),
+            CapabilityScope::Global
+        ));
+        assert!(matches!(
+            scope_from_tags(&tags_from(&["gpu", "model:llama3"])),
             CapabilityScope::Global
         ));
         // Explicit `scope:global` resolves the same as no tag.
         assert!(matches!(
-            scope_from_tags(&[TAG_SCOPE_GLOBAL.to_string()]),
+            scope_from_tags(&tags_from(&[TAG_SCOPE_GLOBAL])),
             CapabilityScope::Global
         ));
     }
@@ -3117,33 +5068,35 @@ mod tests {
     fn scope_from_tags_subnet_local_wins() {
         // Even with tenants and regions present, `subnet-local` is
         // the strictest form and dominates.
-        let tags = vec![
-            TAG_SCOPE_SUBNET_LOCAL.to_string(),
-            format!("{TAG_SCOPE_TENANT_PREFIX}foo"),
-            format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
-        ];
+        let tags = tags_from(&[
+            TAG_SCOPE_SUBNET_LOCAL,
+            &format!("{TAG_SCOPE_TENANT_PREFIX}foo"),
+            &format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
+        ]);
         assert_eq!(scope_from_tags(&tags), CapabilityScope::SubnetLocal);
     }
 
     #[test]
     fn scope_from_tags_multiple_tenants() {
-        let tags = vec![
-            format!("{TAG_SCOPE_TENANT_PREFIX}a"),
-            format!("{TAG_SCOPE_TENANT_PREFIX}b"),
-            "gpu".to_string(),
-        ];
+        let tags = tags_from(&[
+            &format!("{TAG_SCOPE_TENANT_PREFIX}a"),
+            &format!("{TAG_SCOPE_TENANT_PREFIX}b"),
+            "gpu",
+        ]);
         match scope_from_tags(&tags) {
-            CapabilityScope::Tenants(ts) => {
+            CapabilityScope::Tenants(mut ts) => {
+                // HashSet iteration is unordered; sort for stable comparison.
+                ts.sort();
                 assert_eq!(ts, vec!["a".to_string(), "b".to_string()]);
             }
             other => panic!("expected Tenants, got {other:?}"),
         }
 
         // Empty tenant id is silently dropped.
-        let tags = vec![
-            format!("{TAG_SCOPE_TENANT_PREFIX}"),
-            format!("{TAG_SCOPE_TENANT_PREFIX}real"),
-        ];
+        let tags = tags_from(&[
+            TAG_SCOPE_TENANT_PREFIX,
+            &format!("{TAG_SCOPE_TENANT_PREFIX}real"),
+        ]);
         match scope_from_tags(&tags) {
             CapabilityScope::Tenants(ts) => assert_eq!(ts, vec!["real".to_string()]),
             other => panic!("expected Tenants, got {other:?}"),
@@ -3152,10 +5105,10 @@ mod tests {
 
     #[test]
     fn scope_from_tags_tenants_and_regions() {
-        let tags = vec![
-            format!("{TAG_SCOPE_TENANT_PREFIX}oem-123"),
-            format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
-        ];
+        let tags = tags_from(&[
+            &format!("{TAG_SCOPE_TENANT_PREFIX}oem-123"),
+            &format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
+        ]);
         match scope_from_tags(&tags) {
             CapabilityScope::TenantsAndRegions { tenants, regions } => {
                 assert_eq!(tenants, vec!["oem-123".to_string()]);
@@ -3253,10 +5206,13 @@ mod tests {
             .with_tenant_scope("oem-123")
             .with_tenant_scope("oem-123") // duplicate
             .with_tenant_scope(""); // empty — silently dropped
-        let tenant_tags: Vec<&String> = caps
+                                    // Phase A.5.N.2: tags are typed; render to wire form
+                                    // for prefix-string filtering.
+        let tenant_tags: Vec<String> = caps
             .tags
             .iter()
-            .filter(|t| t.starts_with(TAG_SCOPE_TENANT_PREFIX))
+            .map(|t| t.to_string())
+            .filter(|s| s.starts_with(TAG_SCOPE_TENANT_PREFIX))
             .collect();
         assert_eq!(
             tenant_tags.len(),
@@ -3290,16 +5246,143 @@ mod tests {
             .with_tenant_scope("oem-123")
             .with_subnet_local_scope()
             .with_subnet_local_scope(); // idempotent
-        let local_tags: Vec<&String> = caps_local
+        let local_tags: Vec<String> = caps_local
             .tags
             .iter()
-            .filter(|t| t.as_str() == TAG_SCOPE_SUBNET_LOCAL)
+            .map(|t| t.to_string())
+            .filter(|s| s.as_str() == TAG_SCOPE_SUBNET_LOCAL)
             .collect();
         assert_eq!(local_tags.len(), 1);
         assert_eq!(
             scope_from_tags(&caps_local.tags),
             CapabilityScope::SubnetLocal
         );
+    }
+
+    // ========================================================================
+    // Chain composition helpers — Phase 3 of CAPABILITY_ENHANCEMENTS_PLAN.md.
+    // ========================================================================
+
+    fn reserved_tag(prefix: &str, body: &str) -> Tag {
+        Tag::Reserved {
+            prefix: prefix.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn require_chain_emits_causal_reserved_tag() {
+        let caps = CapabilitySet::new().require_chain("abc123");
+        assert!(caps.tags.contains(&reserved_tag("causal:", "abc123")));
+    }
+
+    #[test]
+    fn require_chain_is_idempotent() {
+        let caps = CapabilitySet::new()
+            .require_chain("abc123")
+            .require_chain("abc123");
+        let causal_count = caps
+            .tags
+            .iter()
+            .filter(|t| matches!(t, Tag::Reserved { prefix, .. } if prefix == "causal:"))
+            .count();
+        assert_eq!(causal_count, 1);
+    }
+
+    #[test]
+    fn require_chain_drops_empty_hash() {
+        let caps = CapabilitySet::new().require_chain("");
+        assert!(caps.tags.is_empty());
+    }
+
+    #[test]
+    fn require_chain_tip_emits_with_seq_separator() {
+        let caps = CapabilitySet::new().require_chain_tip("abc", 100);
+        assert!(caps.tags.contains(&reserved_tag("causal:", "abc:100")));
+    }
+
+    #[test]
+    fn require_chain_range_emits_bracket_form() {
+        let caps = CapabilitySet::new().require_chain_range("abc", 100, 200);
+        assert!(caps
+            .tags
+            .contains(&reserved_tag("causal:", "abc[100..200]")));
+    }
+
+    #[test]
+    fn require_chain_range_drops_inverted_or_equal_range() {
+        // Equal range: silently dropped (zero-length range is meaningless).
+        let caps = CapabilitySet::new().require_chain_range("abc", 100, 100);
+        assert!(caps.tags.is_empty());
+        // Inverted range: silently dropped.
+        let caps = CapabilitySet::new().require_chain_range("abc", 200, 100);
+        assert!(caps.tags.is_empty());
+    }
+
+    #[test]
+    fn require_any_chain_emits_one_tag_per_hash() {
+        let caps = CapabilitySet::new().require_any_chain(["abc", "def", "ghi"]);
+        assert!(caps.tags.contains(&reserved_tag("causal:", "abc")));
+        assert!(caps.tags.contains(&reserved_tag("causal:", "def")));
+        assert!(caps.tags.contains(&reserved_tag("causal:", "ghi")));
+        assert_eq!(caps.tags.len(), 3);
+    }
+
+    #[test]
+    fn require_any_chain_skips_empty_hashes() {
+        let caps = CapabilitySet::new().require_any_chain(["abc", "", "def"]);
+        assert_eq!(caps.tags.len(), 2);
+    }
+
+    #[test]
+    fn from_fork_emits_fork_of_reserved_tag() {
+        let caps = CapabilitySet::new().from_fork("parent_hash");
+        assert!(caps.tags.contains(&reserved_tag("fork-of:", "parent_hash")));
+    }
+
+    #[test]
+    fn heat_level_emits_chain_hash_equals_rate_with_two_decimals() {
+        let caps = CapabilitySet::new().heat_level("abc", 0.85);
+        assert!(caps.tags.contains(&reserved_tag("heat:", "abc=0.85")));
+    }
+
+    #[test]
+    fn heat_level_clamps_out_of_range_rate() {
+        // Above 1.0 clamps to 1.00.
+        let caps = CapabilitySet::new().heat_level("abc", 1.5);
+        assert!(caps.tags.contains(&reserved_tag("heat:", "abc=1.00")));
+        // Below 0.0 clamps to 0.00.
+        let caps = CapabilitySet::new().heat_level("abc", -0.3);
+        assert!(caps.tags.contains(&reserved_tag("heat:", "abc=0.00")));
+    }
+
+    #[test]
+    fn heat_level_drops_non_finite_rate() {
+        let caps = CapabilitySet::new().heat_level("abc", f64::NAN);
+        assert!(caps.tags.is_empty());
+        let caps = CapabilitySet::new().heat_level("abc", f64::INFINITY);
+        assert!(caps.tags.is_empty());
+    }
+
+    #[test]
+    fn chain_helpers_compose_naturally_in_a_builder_chain() {
+        // Pinned: helpers chain ergonomically without intermediate
+        // bindings or `.clone()`s. This is the contract that makes
+        // the surface readable in operator code.
+        let caps = CapabilitySet::new()
+            .require_chain("origin-hash")
+            .require_chain_tip("chain-with-tip", 1024)
+            .require_chain_range("range-chain", 100, 500)
+            .require_any_chain(["alt-1", "alt-2"])
+            .from_fork("parent")
+            .heat_level("origin-hash", 0.5);
+        // Six emissions: 1 + 1 + 1 + 2 + 1 + 1 = 7 reserved tags.
+        let reserved_count = caps
+            .tags
+            .iter()
+            .filter(|t| matches!(t, Tag::Reserved { .. }))
+            .count();
+        assert_eq!(reserved_count, 7, "tags: {:?}", caps.tags);
     }
 
     /// Repro for the failing Go `TestHardwareAndGpuFilter_Matches`:
@@ -3357,5 +5440,387 @@ mod tests {
             .with_min_memory(32_768);
         let hits = index.query(&filter);
         assert!(hits.contains(&42u64), "self-match expected, got {:?}", hits);
+    }
+
+    // ========================================================================
+    // View projections — `From<&CapabilitySet>` + `CapabilitySet::views`.
+    // Phase A.4: pin the contract so Phase A.5's wire-format migration
+    // doesn't drift the projection semantics.
+    // ========================================================================
+
+    #[test]
+    fn projection_hardware_round_trips_via_from_impl() {
+        // Phase A.5.N.3: `From<&CapabilitySet>` reconstructs the
+        // typed view by scanning the tag set. The round-trip
+        // through builder → views → comparison pins the bijection
+        // for hardware fields the codec covers.
+        let hw_input = HardwareCapabilities::new()
+            .with_cpu(8, 16)
+            .with_memory(65536);
+        let caps = CapabilitySet::new().with_hardware(hw_input.clone());
+        let hw_via_from: HardwareCapabilities = (&caps).into();
+        assert_eq!(hw_via_from, hw_input);
+    }
+
+    #[test]
+    fn projection_software_and_resource_limits_round_trip() {
+        // Round-trip via builder → views for software and limits.
+        let sw_input = SoftwareCapabilities::new().with_os("linux", "6.5");
+        let limits_input = ResourceLimits::new()
+            .with_max_concurrent(64)
+            .with_rate_limit(100);
+        let caps = CapabilitySet::new()
+            .with_software(sw_input.clone())
+            .with_limits(limits_input.clone());
+        let sw: SoftwareCapabilities = (&caps).into();
+        assert_eq!(sw, sw_input);
+        let limits: ResourceLimits = (&caps).into();
+        assert_eq!(limits, limits_input);
+    }
+
+    #[test]
+    fn views_struct_returns_all_five_projections() {
+        // Pin: `views()` returns the five typed projections together,
+        // each lazily decoded on first access. Cheaper than reaching
+        // for the From impls when the consumer reads more than one
+        // axis (the OnceCell cache hits subsequent reads).
+        let caps = sample_capability_set();
+        let views = caps.views();
+        // Round-trip via builder → views — assert the projection
+        // is non-default for the fields the sample populates.
+        assert!(views.hardware().memory_mb > 0);
+        assert!(!views.models().is_empty());
+        assert!(!views.tools().is_empty());
+    }
+
+    #[test]
+    fn lazy_view_handle_caches_per_projection() {
+        // Phase 1 of `CAPABILITY_ENHANCEMENTS_PLAN.md`: each
+        // projection is decoded at most once per handle. A second
+        // read of the same projection returns the cached value
+        // (proven via pointer-equality on the borrowed reference).
+        let caps = sample_capability_set();
+        let views = caps.views();
+        let hw_ptr_1 = views.hardware() as *const _;
+        let hw_ptr_2 = views.hardware() as *const _;
+        assert_eq!(hw_ptr_1, hw_ptr_2, "hardware projection must be cached");
+        let models_ptr_1 = views.models() as *const _;
+        let models_ptr_2 = views.models() as *const _;
+        assert_eq!(
+            models_ptr_1, models_ptr_2,
+            "models projection must be cached",
+        );
+    }
+
+    // ========================================================================
+    // Phase A.5.1: typed-tag access methods + wire-format snapshots.
+    // ========================================================================
+
+    #[test]
+    fn typed_tags_method_round_trips() {
+        // `CapabilitySet::typed_tags()` and `from_typed_tags()`
+        // are the future access pattern; pin the round-trip
+        // contract here as inherent-method tests, mirroring the
+        // standalone-function pin in `tag_codec`.
+        let caps = sample_capability_set();
+        let tag_set = caps.typed_tags();
+        let caps2 = CapabilitySet::from_typed_tags(&tag_set);
+        // Phase A.5.N.3: round-trip is via the canonical tag set;
+        // compare projections (tool schemas live in metadata so
+        // they don't survive `from_typed_tags`, which gets only
+        // the bare tag set).
+        let v1 = caps.views();
+        let v2 = caps2.views();
+        assert_eq!(v1.hardware(), v2.hardware());
+        assert_eq!(v1.models(), v2.models());
+        assert_eq!(v1.resource_limits(), v2.resource_limits());
+        // Tools' non-schema fields round-trip; schemas are dropped
+        // (`from_typed_tags` produces empty metadata by design).
+        let v1_tools = v1.tools();
+        let v2_tools = v2.tools();
+        assert_eq!(v1_tools.len(), v2_tools.len());
+        for (a, b) in v1_tools.iter().zip(v2_tools.iter()) {
+            assert_eq!(a.tool_id, b.tool_id);
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.version, b.version);
+        }
+    }
+
+    #[test]
+    fn typed_tags_default_capability_set_is_empty() {
+        // Pinned: a default CapabilitySet's typed-tag set is empty.
+        // Future Phase A.5.2's wire-format change (omitting
+        // empty-tag-set sets from the wire) depends on this.
+        let caps = CapabilitySet::default();
+        assert!(caps.typed_tags().is_empty());
+    }
+
+    // ========================================================================
+    // CapabilitySet::diff tests (Phase 1 of CAPABILITY_ENHANCEMENTS_PLAN.md).
+    // ========================================================================
+
+    #[test]
+    fn diff_empty_vs_empty_is_empty() {
+        let prev = CapabilitySet::default();
+        let curr = CapabilitySet::default();
+        let diff = curr.diff(&prev);
+        assert!(diff.is_empty());
+        assert!(diff.added_tags.is_empty());
+        assert!(diff.removed_tags.is_empty());
+        assert!(diff.changed_metadata.is_empty());
+    }
+
+    #[test]
+    fn diff_against_empty_reports_full_added() {
+        let prev = CapabilitySet::default();
+        let curr = CapabilitySet::new()
+            .add_tag("inference")
+            .with_metadata("intent", "ml-training");
+        let diff = curr.diff(&prev);
+        assert!(!diff.is_empty());
+        assert_eq!(diff.added_tags.len(), 1);
+        let inference_tag = Tag::parse("inference").unwrap();
+        assert!(diff.added_tags.contains(&inference_tag));
+        assert!(diff.removed_tags.is_empty());
+        assert_eq!(diff.changed_metadata.len(), 1);
+        assert!(matches!(
+            &diff.changed_metadata[0],
+            MetadataChange::Added { key, value }
+                if key == "intent" && value == "ml-training"
+        ));
+    }
+
+    #[test]
+    fn diff_added_and_removed_tags_are_separated() {
+        // Distinct sets: prev has {a, b}, curr has {b, c}.
+        // Diff must show added={c}, removed={a}; b is unchanged.
+        let prev = CapabilitySet::new().add_tag("a").add_tag("b");
+        let curr = CapabilitySet::new().add_tag("b").add_tag("c");
+        let diff = curr.diff(&prev);
+        let added: Vec<_> = diff.added_tags.iter().map(|t| t.to_string()).collect();
+        let removed: Vec<_> = diff.removed_tags.iter().map(|t| t.to_string()).collect();
+        assert_eq!(added, vec!["c".to_string()]);
+        assert_eq!(removed, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn diff_ignores_separator_form_on_axis_value_tags() {
+        // Regression for CR-3: `Tag::AxisValue` PartialEq distinguishes
+        // `=` vs `:`. A naive `HashSet::difference` would land two
+        // semantically-identical tags as both Added and Removed.
+        // The structural `DiffEngine::diff` was patched in 38612b61;
+        // the companion `CapabilitySet::diff` API was not.
+        use crate::adapter::net::behavior::tag::{AxisSeparator, Tag, TaxonomyAxis};
+        let mut prev = CapabilitySet::new();
+        prev.tags.insert(Tag::AxisValue {
+            axis: TaxonomyAxis::Software,
+            key: "os".to_string(),
+            value: "linux".to_string(),
+            separator: AxisSeparator::Eq,
+        });
+        let mut curr = CapabilitySet::new();
+        curr.tags.insert(Tag::AxisValue {
+            axis: TaxonomyAxis::Software,
+            key: "os".to_string(),
+            value: "linux".to_string(),
+            separator: AxisSeparator::Colon,
+        });
+        let diff = curr.diff(&prev);
+        assert!(
+            diff.added_tags.is_empty(),
+            "added tags should be empty for separator-only difference, got {:?}",
+            diff.added_tags
+        );
+        assert!(
+            diff.removed_tags.is_empty(),
+            "removed tags should be empty for separator-only difference, got {:?}",
+            diff.removed_tags
+        );
+    }
+
+    #[test]
+    fn diff_metadata_updated_for_value_change() {
+        let prev = CapabilitySet::new().with_metadata("intent", "ml-training");
+        let curr = CapabilitySet::new().with_metadata("intent", "embedding");
+        let diff = curr.diff(&prev);
+        assert!(diff.added_tags.is_empty());
+        assert!(diff.removed_tags.is_empty());
+        assert_eq!(diff.changed_metadata.len(), 1);
+        match &diff.changed_metadata[0] {
+            MetadataChange::Updated {
+                key,
+                prev_value,
+                new_value,
+            } => {
+                assert_eq!(key, "intent");
+                assert_eq!(prev_value, "ml-training");
+                assert_eq!(new_value, "embedding");
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_metadata_key_rename_is_remove_plus_add_not_update() {
+        // Pinned: a key rename surfaces as Removed + Added, NOT
+        // as Updated. Key identity changes are semantically
+        // distinct from value-of-same-key changes.
+        let prev = CapabilitySet::new().with_metadata("old-key", "v");
+        let curr = CapabilitySet::new().with_metadata("new-key", "v");
+        let diff = curr.diff(&prev);
+        assert_eq!(diff.changed_metadata.len(), 2);
+        // BTreeMap iteration is sorted, so "new-key" comes before "old-key".
+        let kinds: Vec<_> = diff
+            .changed_metadata
+            .iter()
+            .map(|c| match c {
+                MetadataChange::Added { key, .. } => format!("added:{key}"),
+                MetadataChange::Removed { key, .. } => format!("removed:{key}"),
+                MetadataChange::Updated { key, .. } => format!("updated:{key}"),
+            })
+            .collect();
+        assert!(
+            kinds.contains(&"added:new-key".to_string())
+                && kinds.contains(&"removed:old-key".to_string()),
+            "expected Added(new-key) + Removed(old-key); got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn diff_changed_metadata_preserves_btreemap_ordering() {
+        // BTreeMap iteration order is stable + sorted. The diff
+        // walk emits changes in key order so consumers can rely
+        // on deterministic output.
+        let prev = CapabilitySet::default();
+        let curr = CapabilitySet::new()
+            .with_metadata("zebra", "z")
+            .with_metadata("alpha", "a")
+            .with_metadata("middle", "m");
+        let diff = curr.diff(&prev);
+        let keys: Vec<_> = diff
+            .changed_metadata
+            .iter()
+            .map(|c| match c {
+                MetadataChange::Added { key, .. }
+                | MetadataChange::Removed { key, .. }
+                | MetadataChange::Updated { key, .. } => key.clone(),
+            })
+            .collect();
+        assert_eq!(keys, vec!["alpha", "middle", "zebra"]);
+    }
+
+    #[test]
+    fn diff_round_trips_via_apply_diff_on_canonical_diff_engine() {
+        // Property-style: applying the structural DiffEngine ops
+        // computed from `prev → curr` produces a CapabilitySet
+        // whose tags + metadata match `curr`. The two diff surfaces
+        // (this method's set/map diff, DiffEngine's structural ops)
+        // are different shapes of the same change information; this
+        // test pins they agree on the underlying state transition.
+        use crate::adapter::net::behavior::diff::{CapabilityDiff, DiffEngine};
+
+        let prev = CapabilitySet::new()
+            .add_tag("inference")
+            .with_metadata("intent", "old");
+        let curr = prev
+            .clone()
+            .add_tag("training")
+            .with_metadata("intent", "new")
+            .with_metadata("colocate-with", "chain-a");
+        // DiffEngine produces structural ops; apply them to prev
+        // and assert tags + metadata match curr (state convergence).
+        let ops = DiffEngine::diff(&prev, &curr);
+        let applied =
+            DiffEngine::apply_with_version(&prev, 1, &CapabilityDiff::new(1, 1, 2, ops), true)
+                .unwrap();
+        assert_eq!(applied.tags, curr.tags);
+        // DiffEngine doesn't emit metadata ops yet; metadata diff
+        // ships separately and is consumed by event-driven listeners,
+        // not by the diff-apply propagation path. Pin the contract
+        // here so a future DiffEngine extension that adds metadata
+        // ops doesn't accidentally regress this surface.
+        let cset_diff = curr.diff(&prev);
+        assert!(!cset_diff.is_empty());
+        assert_eq!(cset_diff.changed_metadata.len(), 2);
+    }
+
+    #[test]
+    fn wire_format_serialization_snapshot() {
+        // Pin the post-Phase-A.5.N.3 wire format. CapabilitySet
+        // ships exactly two top-level keys now: `tags` (the
+        // canonical tag-set, holding axis-prefixed + reserved +
+        // legacy entries as a JSON string array via Tag's
+        // custom serde) and `metadata` (a free-form key-value
+        // map). Hardware / software / models / tools / limits
+        // fields no longer exist on the wire — their content is
+        // encoded as tags.
+        let caps = CapabilitySet::new()
+            .with_hardware(HardwareCapabilities::new().with_cpu(8, 16))
+            .add_tag("inference");
+        let json = String::from_utf8(caps.to_bytes()).unwrap();
+        assert!(json.contains("\"tags\":"), "missing tags field: {json}");
+        assert!(
+            json.contains("\"metadata\":"),
+            "missing metadata field: {json}"
+        );
+        // The legacy untyped tag rides through unchanged.
+        assert!(json.contains("\"inference\""), "missing legacy tag: {json}");
+        // Hardware fields are encoded as axis tags inside `tags`.
+        assert!(
+            json.contains("\"hardware.cpu_cores=8\""),
+            "missing hardware.cpu_cores=8 tag: {json}",
+        );
+        assert!(
+            json.contains("\"hardware.cpu_threads=16\""),
+            "missing hardware.cpu_threads=16 tag: {json}",
+        );
+        // Old top-level typed-struct keys are gone.
+        assert!(
+            !json.contains("\"hardware\":"),
+            "stale hardware key: {json}"
+        );
+        assert!(
+            !json.contains("\"software\":"),
+            "stale software key: {json}"
+        );
+        assert!(!json.contains("\"models\":"), "stale models key: {json}");
+        assert!(!json.contains("\"tools\":"), "stale tools key: {json}");
+        assert!(!json.contains("\"limits\":"), "stale limits key: {json}");
+    }
+
+    #[test]
+    fn wire_format_round_trips_through_json() {
+        // Pinned: a CapabilitySet round-trips through `to_bytes` →
+        // `from_bytes`. Phase A.5.N.2's wire format change must
+        // preserve this property — a CapabilitySet built via the
+        // typed builder methods then serialized then deserialized
+        // produces an equal value. Test against a non-trivial
+        // capability set to exercise every field.
+        let caps = sample_capability_set();
+        let bytes = caps.to_bytes();
+        let caps2 = CapabilitySet::from_bytes(&bytes).expect("round-trip parses");
+        assert_eq!(caps, caps2);
+    }
+
+    #[test]
+    fn typed_tags_includes_legacy_string_tags() {
+        // Pinned: legacy `Vec<String>` tags appear in the typed-
+        // tag set as `Tag::Legacy` / `Tag::Reserved` / parsed
+        // axis tags. Downstream code reading via `typed_tags()`
+        // sees them all uniformly.
+        use crate::adapter::net::behavior::tag::Tag as TagT;
+        let caps = CapabilitySet::new()
+            .add_tag("inference")
+            .with_tenant_scope("acme");
+        let tag_set = caps.typed_tags();
+        // "inference" → Legacy
+        assert!(tag_set
+            .iter()
+            .any(|t| matches!(t, TagT::Legacy(s) if s == "inference")));
+        // "scope:tenant:acme" → Reserved
+        assert!(tag_set
+            .iter()
+            .any(|t| matches!(t, TagT::Reserved { prefix, body }
+                if prefix == "scope:" && body == "tenant:acme")));
     }
 }

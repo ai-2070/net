@@ -53,9 +53,7 @@ use thiserror::Error;
 /// | `software`  | What the node *currently runs*. Configurable. |
 /// | `devices`   | Custom semantic role tags. World-facing roles. |
 /// | `dataforts` | Storage capacity + hosted causal chains. |
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaxonomyAxis {
     /// Compute capabilities of the node — CPU / RAM / GPU / accelerators.
@@ -96,7 +94,12 @@ impl TaxonomyAxis {
     /// All four axes in declaration order. Useful for iteration
     /// (e.g. enumerate-and-match against an unknown prefix).
     pub const fn all() -> [Self; 4] {
-        [Self::Hardware, Self::Software, Self::Devices, Self::Dataforts]
+        [
+            Self::Hardware,
+            Self::Software,
+            Self::Devices,
+            Self::Dataforts,
+        ]
     }
 }
 
@@ -117,7 +120,7 @@ impl fmt::Display for TaxonomyAxis {
 /// Application code attempting to emit a tag with any of these
 /// prefixes via [`Tag::parse_user`] is rejected with
 /// [`CapabilityTagError::ReservedPrefix`]. The substrate itself emits
-/// these via privileged paths (e.g. [`Mesh::announce_chain`] for
+/// these via privileged paths (e.g. `Mesh::announce_chain` for
 /// `causal:`, the fork-coordination layer for `fork-of:`, the
 /// existing scope helpers for `scope:`).
 pub const RESERVED_PREFIXES: &[&str] = &["causal:", "fork-of:", "heat:", "scope:"];
@@ -141,9 +144,7 @@ fn starts_with_reserved_prefix(s: &str) -> Option<&'static str> {
 /// Display form is the same as the axis-presence tag:
 /// `<axis>.<key>` (e.g. `hardware.gpu` for
 /// `TagKey { axis: Hardware, key: "gpu" }`).
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TagKey {
     /// Taxonomy axis the key belongs to.
     pub axis: TaxonomyAxis,
@@ -176,13 +177,15 @@ impl fmt::Display for TagKey {
 /// Parsed capability tag.
 ///
 /// Internal representation; the wire format is the canonical string
-/// returned by [`Tag::display`] / [`fmt::Display`]. Parser is
-/// permissive — see module docs for the
+/// returned by [`fmt::Display`]. Custom `Serialize` / `Deserialize`
+/// impls below render Tag → string and parse string → Tag, so a
+/// `HashSet<Tag>` rides over the wire as a JSON string array
+/// (`["hardware.gpu", "scope:tenant:foo", ...]`). The internal
+/// enum shape is an implementation detail callers don't see.
+///
+/// Parser is permissive — see module docs for the
 /// `parse` (internal) vs. `parse_user` (application) split.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Tag {
     /// Axis-prefixed presence tag with no value.
     /// Wire form: `<axis>.<key>` (e.g. `hardware.gpu`).
@@ -223,9 +226,7 @@ pub enum Tag {
 
 /// Separator between an axis-tag's key and value — `=` is the
 /// general convention; `:` is the dataforts pre-typed convention.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AxisSeparator {
     /// `=` separator — `hardware.gpu.vram_gb=80`.
@@ -352,6 +353,51 @@ impl Tag {
     pub fn to_wire(&self) -> String {
         self.to_string()
     }
+
+    /// Semantic equality — like `PartialEq` but ignores the
+    /// `=` vs `:` separator on `AxisValue`. Two tags that only
+    /// differ in their wire-form separator describe the same
+    /// `(axis, key, value)` and should compare equal for
+    /// membership / require / diff purposes.
+    ///
+    /// `PartialEq` itself stays separator-aware so the wire
+    /// form round-trips byte-for-byte; callers comparing for
+    /// *meaning* (rather than for *bytes*) should prefer this
+    /// method. See `CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md`
+    /// CR-1..CR-3 for the bug class this guards against.
+    pub fn semantic_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::AxisPresent { axis: a1, key: k1 }, Self::AxisPresent { axis: a2, key: k2 }) => {
+                a1 == a2 && k1 == k2
+            }
+            (
+                Self::AxisValue {
+                    axis: a1,
+                    key: k1,
+                    value: v1,
+                    ..
+                },
+                Self::AxisValue {
+                    axis: a2,
+                    key: k2,
+                    value: v2,
+                    ..
+                },
+            ) => a1 == a2 && k1 == k2 && v1 == v2,
+            (
+                Self::Reserved {
+                    prefix: p1,
+                    body: b1,
+                },
+                Self::Reserved {
+                    prefix: p2,
+                    body: b2,
+                },
+            ) => p1 == p2 && b1 == b2,
+            (Self::Legacy(a), Self::Legacy(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Parse the body of an axis-prefixed tag (everything after the
@@ -402,6 +448,35 @@ impl fmt::Display for Tag {
             Self::Reserved { prefix, body } => write!(f, "{prefix}{body}"),
             Self::Legacy(s) => f.write_str(s),
         }
+    }
+}
+
+// =============================================================================
+// Serde — wire format is the canonical Display string.
+//
+// Phase A.5.N.2: a `HashSet<Tag>` rides over the wire as a JSON
+// string array (`["hardware.gpu", "scope:tenant:foo", "myteam-tag"]`).
+// The internal enum shape is an implementation detail; the wire
+// shape is the same byte-for-byte string the substrate's tag wire
+// format already pins.
+//
+// `serde(tag = "kind")` (the previous derive form) couldn't handle
+// `Tag::Legacy(String)` because internally-tagged enums require
+// every variant to be a struct or unit variant. The canonical-string
+// representation sidesteps that and matches the wire form callers
+// already expect via `Tag::to_string()` / `Tag::parse()`.
+// =============================================================================
+
+impl Serialize for Tag {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Tag {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -564,10 +639,7 @@ mod tests {
 
     #[test]
     fn parse_user_rejects_empty_same_as_internal() {
-        assert_eq!(
-            Tag::parse_user("").unwrap_err(),
-            CapabilityTagError::Empty
-        );
+        assert_eq!(Tag::parse_user("").unwrap_err(), CapabilityTagError::Empty);
     }
 
     #[test]

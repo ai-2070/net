@@ -22,6 +22,8 @@ mod groups;
 mod identity;
 #[cfg(feature = "cortex")]
 mod mesh_rpc;
+#[cfg(feature = "net")]
+mod placement;
 #[cfg(feature = "redis")]
 mod redis_dedup;
 #[cfg(feature = "net")]
@@ -1844,9 +1846,9 @@ mod mesh_bindings {
         }
 
         /// Scoped variant of [`Self::find_nodes`]. Filters candidates
-        /// through a [`crate::capabilities::ScopeFilterJs`] derived
-        /// from each node's `scope:*` reserved tags. Untagged nodes
-        /// stay visible under most filters by design; nodes tagged
+        /// through a `ScopeFilterJs` (derived from each node's
+        /// `scope:*` reserved tags). Untagged nodes stay visible
+        /// under most filters by design; nodes tagged
         /// `scope:subnet-local` only show up under `sameSubnet`.
         #[napi]
         pub fn find_nodes_scoped(
@@ -1929,6 +1931,90 @@ mod mesh_bindings {
         #[cfg_attr(all(feature = "cortex", not(feature = "compute")), allow(dead_code))]
         pub(crate) fn channel_configs_arc(&self) -> Arc<net::adapter::net::ChannelConfigRegistry> {
             self.channel_configs.clone()
+        }
+    }
+
+    // =====================================================================
+    // SDK Phase 7 slice 2 — custom `PlacementFilter` callback registry.
+    //
+    // Bindings expose `registerPlacementFilter(id, fn)` and
+    // `unregisterPlacementFilter(id)` so JS code can plug a
+    // `(candidate) => boolean` predicate into the substrate's
+    // `select_*` machinery. The wrapper bridges TSFN ↔ trait
+    // (lives in `placement.rs`); registration goes through the
+    // process-wide singleton `global_placement_filter_registry`.
+    //
+    // Sits in its own `#[napi] impl NetMesh` block — same
+    // expansion-time concern as the NAT traversal block below.
+    // =====================================================================
+
+    #[cfg(feature = "net")]
+    #[napi]
+    impl NetMesh {
+        /// Register a JS placement-filter predicate under `id`.
+        ///
+        /// JS contract: `fn(candidate: PlacementCandidate) =>
+        /// boolean`. Returning `true` keeps the candidate
+        /// (placement-score 1.0); returning `false` (or throwing)
+        /// vetoes it. The predicate runs per candidate per
+        /// placement decision — keep it tight and avoid I/O.
+        ///
+        /// Returns `false` if `id` is already registered (the SDK's
+        /// `placementFilterFromFn` generates unique IDs by counter,
+        /// so collisions are an SDK-side concern). Use
+        /// `unregisterPlacementFilter` first if you intend to swap
+        /// the predicate behind a stable id.
+        #[napi]
+        pub fn register_placement_filter(
+            &self,
+            id: String,
+            predicate: napi::bindgen_prelude::Function<
+                'static,
+                crate::placement::PlacementCandidateJs,
+                bool,
+            >,
+        ) -> Result<bool> {
+            use net::adapter::net::behavior::placement::PlacementFilter;
+            use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+
+            let guard = self.load_node()?;
+            let node = guard
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("MeshNode has been shut down"))?;
+            let capability_index = node.capability_index().clone();
+
+            // Build the TSFN inside the Node main thread; the
+            // resulting handle is `Send + Sync + Clone` and can
+            // cross threads as part of the wrapper.
+            let tsfn: crate::placement::PlacementFilterTsfn =
+                predicate.build_threadsafe_function().build()?;
+            let wrapper =
+                crate::placement::TsfnPlacementFilter::new(id.clone(), tsfn, capability_index);
+            let arc: std::sync::Arc<dyn PlacementFilter> = std::sync::Arc::new(wrapper);
+
+            // SDK Phase 7 polish: `"node"` binding label drives the
+            // `dataforts_placement_callback_invocations_total{binding="node"}`
+            // counter on the substrate registry.
+            Ok(global_placement_filter_registry().register(id, arc, "node"))
+        }
+
+        /// Drop the placement-filter registration under `id`.
+        ///
+        /// Returns `true` if `id` was registered. Existing
+        /// `Arc<dyn PlacementFilter>` clones held by in-flight
+        /// scheduler calls keep the predicate alive until those
+        /// calls finish — see the registry docs.
+        #[napi]
+        pub fn unregister_placement_filter(&self, id: String) -> bool {
+            use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+            global_placement_filter_registry().unregister(&id)
+        }
+
+        /// Whether `id` is currently registered. Mainly for tests.
+        #[napi]
+        pub fn has_placement_filter(&self, id: String) -> bool {
+            use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+            global_placement_filter_registry().contains(&id)
         }
     }
 

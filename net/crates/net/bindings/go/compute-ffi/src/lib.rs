@@ -285,7 +285,8 @@ pub extern "C" fn net_compute_runtime_free(handle: *mut DaemonRuntimeHandle) {
 ///
 /// On failure, writes a heap-allocated `char*` error detail to
 /// `*err_out` (caller frees with [`net_compute_free_cstring`]).
-/// Returns [`NET_COMPUTE_OK`] / [`NET_COMPUTE_ERR_*`].
+/// Returns [`NET_COMPUTE_OK`] on success or one of the
+/// `NET_COMPUTE_ERR_*` constants on failure.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_start(
     handle: *mut DaemonRuntimeHandle,
@@ -514,10 +515,7 @@ pub extern "C" fn net_compute_register_factory_with_func(
                 reason,
             ));
         }
-        Box::new(GoBridge {
-            name: kind_for_closure.clone(),
-            daemon_id,
-        })
+        Box::new(GoBridge::build(kind_for_closure.clone(), daemon_id))
     };
 
     if let Err(e) = h.inner.register_factory(&kind, closure) {
@@ -650,6 +648,185 @@ pub extern "C" fn net_compute_set_dispatcher(
 }
 
 // =========================================================================
+// SDK Phase 6 — daemon capability authoring (optional dispatcher)
+//
+// Wires the substrate's `MeshDaemon::required_capabilities` /
+// `optional_capabilities` (Phase G slice 2) through the C ABI.
+// Optional — if the consumer never installs this dispatcher,
+// daemons get the trait's default empty `CapabilitySet`s and
+// `StandardPlacement` treats them as "runs anywhere" (current
+// behavior). Consumers that DO install it can declare per-
+// daemon capabilities for capability-driven placement.
+//
+// Wire shape: substrate calls back per `GoBridge` construction
+// (both initial spawn AND migration-target reconstruction),
+// passing the `daemon_id`. Consumer writes JSON-encoded
+// `CapabilitySet`s ({tags: [...], metadata: {k:v}}) to the out-
+// params. NULL out-pointer / zero len means "no caps declared
+// for this side"; either side may be omitted independently.
+// Buffers MUST be allocated via `C.malloc` / `libc::malloc` so
+// Rust can release them via `libc::free` after parsing.
+//
+// Idempotent: the dispatcher is invoked once per bridge
+// construction, parsed once into a `CapabilitySet`, stored on
+// the bridge for the daemon's lifetime. No re-call on event
+// processing.
+// =========================================================================
+
+/// C-ABI: the consumer side declares the per-daemon capability
+/// sets. Called once per `GoBridge` construction; the bridge
+/// stores the parsed sets and uses them to override
+/// `MeshDaemon::required_capabilities` /
+/// `optional_capabilities` for the daemon's lifetime.
+///
+/// Out-params:
+///
+///   - `out_required_json` / `out_required_len`: `*out_required_json`
+///     points at a heap-allocated UTF-8 buffer of length
+///     `*out_required_len` carrying the JSON-encoded `CapabilitySet`,
+///     OR is left NULL with `*out_required_len == 0` for "no
+///     required caps declared".
+///   - `out_optional_json` / `out_optional_len`: same shape for
+///     the optional cap set.
+///
+/// Allocation contract: the consumer allocates via `C.malloc` /
+/// `libc::malloc`; Rust calls `libc::free` after parsing. Returning
+/// stack-allocated or static buffers is undefined behavior.
+///
+/// Return code: `0` on success, non-zero is logged and treated as
+/// "no caps declared" (back-compat with consumers that don't yet
+/// implement the dispatcher).
+pub type DaemonCapsFn = unsafe extern "C" fn(
+    daemon_id: u64,
+    out_required_json: *mut *mut c_char,
+    out_required_len: *mut usize,
+    out_optional_json: *mut *mut c_char,
+    out_optional_len: *mut usize,
+) -> c_int;
+
+static DAEMON_CAPS_DISPATCHER: OnceLock<DaemonCapsFn> = OnceLock::new();
+
+/// Install the optional daemon-caps dispatcher. If unset, all
+/// `GoBridge` daemons advertise empty cap sets (back-compat with
+/// pre-Phase-6 consumers).
+///
+/// First-call-wins (`OnceLock` semantics) — same idiom as
+/// `net_compute_set_dispatcher` and
+/// `net_compute_set_placement_filter_dispatcher`.
+///
+/// # Safety
+///
+/// `f` MUST have C linkage, MUST live for the remaining lifetime
+/// of the process, and MUST follow the [`DaemonCapsFn`] contract.
+/// Passing NULL returns `NET_COMPUTE_ERR_NULL`.
+#[no_mangle]
+pub extern "C" fn net_compute_set_daemon_caps_dispatcher(f: Option<DaemonCapsFn>) -> c_int {
+    let Some(f) = f else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let _ = DAEMON_CAPS_DISPATCHER.set(f);
+    NET_COMPUTE_OK
+}
+
+/// Internal helper: fetch the per-daemon cap sets via the
+/// installed dispatcher. Returns `(required, optional)` — both
+/// default-empty when no dispatcher is installed, when the
+/// dispatcher returns a non-zero code, or when either side
+/// returns a NULL pointer / zero length.
+///
+/// Parses the consumer's JSON via `serde_json` against the
+/// substrate's `CapabilitySet` wire shape (`{tags, metadata}`).
+/// Parse failures log + fall back to empty.
+fn fetch_daemon_caps(
+    daemon_id: u64,
+) -> (
+    ::net::adapter::net::behavior::capability::CapabilitySet,
+    ::net::adapter::net::behavior::capability::CapabilitySet,
+) {
+    use ::net::adapter::net::behavior::capability::CapabilitySet;
+    let empty_pair = || (CapabilitySet::default(), CapabilitySet::default());
+
+    let Some(dispatcher) = DAEMON_CAPS_DISPATCHER.get() else {
+        return empty_pair();
+    };
+
+    let mut req_ptr: *mut c_char = std::ptr::null_mut();
+    let mut req_len: usize = 0;
+    let mut opt_ptr: *mut c_char = std::ptr::null_mut();
+    let mut opt_len: usize = 0;
+    let code = unsafe {
+        (dispatcher)(
+            daemon_id,
+            &mut req_ptr,
+            &mut req_len,
+            &mut opt_ptr,
+            &mut opt_len,
+        )
+    };
+    if code != NET_COMPUTE_OK {
+        // P2-E: a dispatcher that fails partway through the
+        // (required, optional) write may still have allocated and
+        // populated one or both buffers before bailing. The
+        // contract docs the consumer's `_free` only on the success
+        // path, so we'd leak whatever the dispatcher already wrote.
+        // Free both sides defensively before returning the empty
+        // fallback.
+        if !req_ptr.is_null() {
+            unsafe { libc::free(req_ptr as *mut std::ffi::c_void) };
+        }
+        if !opt_ptr.is_null() {
+            unsafe { libc::free(opt_ptr as *mut std::ffi::c_void) };
+        }
+        eprintln!(
+            "net-compute-ffi: daemon-caps dispatcher returned {code} for daemon_id {daemon_id:#x}; using empty caps"
+        );
+        return empty_pair();
+    }
+
+    // Parse a single side. NULL pointer / zero length → empty
+    // (no caps declared). On parse failure, log + fall back.
+    let parse_side = |label: &str, ptr: *mut c_char, len: usize| -> CapabilitySet {
+        if ptr.is_null() {
+            return CapabilitySet::default();
+        }
+        if len == 0 {
+            // Non-NULL pointer but zero-length: caller still
+            // owes us a free. Releasing here closes the leak that
+            // the previous combined `is_null() || len == 0` guard
+            // produced — the early return above only fires when
+            // there's nothing to free. Same `libc::free` path the
+            // success branch below takes.
+            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+            return CapabilitySet::default();
+        }
+        // SAFETY: the consumer's contract says `ptr` points at
+        // `len` bytes of UTF-8 JSON it allocated via
+        // `C.malloc` / `libc::malloc`. We free via `libc::free`
+        // after parsing.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        let parsed = match std::str::from_utf8(bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str::<CapabilitySet>(s).map_err(|e| e.to_string()))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "net-compute-ffi: daemon-caps {label} JSON parse failed for daemon_id {daemon_id:#x}: {e}; using empty",
+                );
+                CapabilitySet::default()
+            }
+        };
+        // Free the consumer's malloc'd buffer.
+        unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+        parsed
+    };
+
+    let required = parse_side("required", req_ptr, req_len);
+    let optional = parse_side("optional", opt_ptr, opt_len);
+    (required, optional)
+}
+
+// =========================================================================
 // OutputsVec — growable container for `Vec<Bytes>` populated by Go
 // =========================================================================
 
@@ -707,8 +884,17 @@ pub extern "C" fn net_compute_outputs_push(
 /// snapshot trampolines must allocate via `C.malloc` and hand us
 /// the pointer; we free via `libc::free`. NULL is a no-op.
 #[no_mangle]
-pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, len: usize) {
-    if ptr.is_null() || len == 0 {
+pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, _len: usize) {
+    // N-8: pre-fix the combined `ptr.is_null() || len == 0` early-
+    // return leaked any allocation a Go trampoline allocated via
+    // `C.malloc(0)` (which on glibc returns a valid free-able
+    // pointer with a zero requested size). CR-11 split the same
+    // guard on the inbound paths (`GoBridge::snapshot` and
+    // `parse_side`); this outbound free helper — declared in
+    // `net.go.h` and callable directly by Go — kept the old
+    // shape. `libc::free` reads its metadata from the malloc
+    // header so the `len` parameter is informational only.
+    if ptr.is_null() {
         return;
     }
     // The Go side allocated via `C.malloc`; `libc::free` matches.
@@ -725,10 +911,35 @@ pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, len: usize) {
 /// and the kind name for debug. `MeshDaemon` impls invoke the
 /// registered dispatcher trampolines with this ID.
 ///
+/// Phase 6 of `CAPABILITY_SYSTEM_SDK_PLAN.md`: holds the
+/// `required_capabilities` / `optional_capabilities`
+/// `CapabilitySet`s declared by the consumer at bridge
+/// construction (via [`DaemonCapsFn`]). Empty defaults when no
+/// dispatcher is installed; back-compat with pre-Phase-6
+/// consumers.
+///
 /// Drop triggers [`FreeFn`] so the Go side can release its entry.
 struct GoBridge {
     name: String,
     daemon_id: u64,
+    required_capabilities: ::net::adapter::net::behavior::capability::CapabilitySet,
+    optional_capabilities: ::net::adapter::net::behavior::capability::CapabilitySet,
+}
+
+impl GoBridge {
+    /// Construct a bridge by querying the optional Phase 6 caps
+    /// dispatcher. Used at both the spawn path and the
+    /// migration-target factory closure so the same caps shape
+    /// applies on reconstruction.
+    fn build(name: String, daemon_id: u64) -> Self {
+        let (required, optional) = fetch_daemon_caps(daemon_id);
+        Self {
+            name,
+            daemon_id,
+            required_capabilities: required,
+            optional_capabilities: optional,
+        }
+    }
 }
 
 impl Drop for GoBridge {
@@ -746,6 +957,17 @@ impl MeshDaemon for GoBridge {
 
     fn requirements(&self) -> CapabilityFilter {
         CapabilityFilter::default()
+    }
+
+    /// Phase 6 — declared via the optional caps dispatcher; empty
+    /// default when no dispatcher is installed.
+    fn required_capabilities(&self) -> ::net::adapter::net::behavior::capability::CapabilitySet {
+        self.required_capabilities.clone()
+    }
+
+    /// Phase 6 — same shape as `required_capabilities`.
+    fn optional_capabilities(&self) -> ::net::adapter::net::behavior::capability::CapabilitySet {
+        self.optional_capabilities.clone()
     }
 
     fn process(&mut self, event: &CausalEvent) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
@@ -783,7 +1005,18 @@ impl MeshDaemon for GoBridge {
             eprintln!("GoBridge::snapshot: dispatcher returned {code}; treating as None");
             return None;
         }
-        if ptr.is_null() || len == 0 {
+        // CR-11: same shape as the cubic-ai fix in `parse_side`
+        // (commit 38612b61). The previous combined
+        // `ptr.is_null() || len == 0` early-return leaked the
+        // non-NULL/zero-length case where the Go callback handed
+        // back a valid `C.malloc` pointer with len=0. Split the
+        // guards: NULL → return without freeing; zero-length
+        // non-NULL → free first, then return.
+        if ptr.is_null() {
+            return None;
+        }
+        if len == 0 {
+            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
             return None;
         }
         // Copy the Go-allocated buffer into a Rust `Bytes` and
@@ -928,10 +1161,7 @@ pub extern "C" fn net_compute_spawn(
         cfg.max_log_entries = max_log_entries;
     }
 
-    let bridge = Box::new(GoBridge {
-        name: kind.clone(),
-        daemon_id,
-    });
+    let bridge = Box::new(GoBridge::build(kind.clone(), daemon_id));
     // kind_factory for migration-target reconstruction. Uses a
     // loud-failure bridge: if a migration lands here before the
     // caller has also installed `RegisterFactoryFunc` for this
@@ -978,7 +1208,8 @@ pub extern "C" fn net_compute_spawn(
 }
 
 /// Stop a daemon by `origin_hash`. Idempotent during shutdown.
-/// Returns [`NET_COMPUTE_OK`] / [`NET_COMPUTE_ERR_*`].
+/// Returns [`NET_COMPUTE_OK`] on success or one of the
+/// `NET_COMPUTE_ERR_*` constants on failure.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_stop(
     handle: *mut DaemonRuntimeHandle,
@@ -1115,10 +1346,7 @@ pub extern "C" fn net_compute_spawn_from_snapshot(
         cfg.max_log_entries = max_log_entries;
     }
 
-    let bridge = Box::new(GoBridge {
-        name: kind.clone(),
-        daemon_id,
-    });
+    let bridge = Box::new(GoBridge::build(kind.clone(), daemon_id));
     // Same loud-failure fallback rationale as the plain-spawn
     // path above — see the comment there.
     let kind_for_fallback = kind.clone();
@@ -1472,7 +1700,8 @@ pub extern "C" fn net_compute_migration_phase(
 /// and the caller receives them via `outputs` (must be non-NULL).
 ///
 /// The caller is responsible for reading the outputs before the
-/// next deliver — [`net_compute_outputs_take`] drains them.
+/// next deliver — [`net_compute_outputs_len`] /
+/// [`net_compute_outputs_at`] / [`net_compute_outputs_free`] drain them.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn net_compute_runtime_deliver(
@@ -2481,6 +2710,279 @@ pub extern "C" fn net_compute_standby_group_member_role(
 }
 
 // =========================================================================
+// SDK Phase 7 slice 4 — custom PlacementFilter callback bridge.
+//
+// Bridges Go closures to the substrate's `PlacementFilter` trait via
+// a JSON candidate payload + cgo trampoline. Mirror of the Node TSFN
+// (slice 2) and Python `Py<PyAny>` (slice 3) bridges.
+//
+// Wire shape: Rust marshals the candidate as a single JSON string;
+// Go decodes it inside the trampoline before invoking the user's
+// `PlacementFilterFn`. JSON keeps the C ABI tight (one byte buffer
+// per call) at the cost of a per-call serde round-trip — bounded
+// by per-node metadata cardinality, so acceptable for the
+// placement hot path. The Node + Python bridges marshal natively
+// because their FFIs already speak structured types; cgo doesn't.
+// =========================================================================
+
+/// C-ABI: invoke Go's placement-filter trampoline. The Go side
+/// looks up the registered closure by `filter_id`, decodes the
+/// candidate JSON, calls the user predicate, and returns:
+///
+///   - `1` — keep candidate (placement-score 1.0 in Rust trait).
+///   - `0` — drop candidate (returns `None` from `placement_score`).
+///   - any negative value — Go-side error (decode failure, panic
+///     recovery, etc.); treated as `None` (veto) on the Rust side.
+///
+/// `filter_id` and `candidate_json` are non-NUL-terminated byte
+/// buffers; the `_len` parameters give their lengths. Both buffers
+/// live for the duration of the call only — Go MUST copy if it
+/// needs to keep them.
+pub type PlacementFilterFn = unsafe extern "C" fn(
+    filter_id_ptr: *const c_char,
+    filter_id_len: usize,
+    node_id: u64,
+    candidate_json_ptr: *const c_char,
+    candidate_json_len: usize,
+) -> c_int;
+
+static PLACEMENT_FILTER_DISPATCHER: OnceLock<PlacementFilterFn> = OnceLock::new();
+
+/// Register the Go-side placement-filter trampoline. MUST be called
+/// before any [`net_compute_register_placement_filter`].
+///
+/// First-call-wins (`OnceLock` semantics) — same idiom as
+/// [`net_compute_set_dispatcher`]. A second call from any
+/// goroutine is a no-op; the Go binding's `init()` is guarded by
+/// `sync.Once` so this is the expected fast path.
+///
+/// # Safety
+///
+/// `f` MUST have C linkage, MUST live for the remaining lifetime of
+/// the process, and MUST follow the [`PlacementFilterFn`] contract.
+/// Passing NULL is a hard error.
+#[no_mangle]
+pub extern "C" fn net_compute_set_placement_filter_dispatcher(
+    f: Option<PlacementFilterFn>,
+) -> c_int {
+    let Some(f) = f else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let _ = PLACEMENT_FILTER_DISPATCHER.set(f);
+    NET_COMPUTE_OK
+}
+
+/// Bridge wrapper that implements `PlacementFilter` by calling the
+/// Go-side trampoline. Stored in the substrate's
+/// `global_placement_filter_registry` as `Arc<dyn PlacementFilter>`.
+struct CgoPlacementFilter {
+    id: String,
+    capability_index: Arc<::net::adapter::net::behavior::capability::CapabilityIndex>,
+}
+
+impl ::net::adapter::net::behavior::placement::PlacementFilter for CgoPlacementFilter {
+    fn placement_score(
+        &self,
+        target: &::net::adapter::net::behavior::placement::NodeId,
+        _artifact: &::net::adapter::net::behavior::placement::Artifact<'_>,
+    ) -> Option<f32> {
+        // No dispatcher → no Go callback installed → veto. Operators
+        // who never set the dispatcher but call the register fn
+        // would otherwise hit an immediate UB.
+        let dispatcher = *PLACEMENT_FILTER_DISPATCHER.get()?;
+
+        // Look up candidate caps. Same semantics as Node / Python:
+        // a candidate not in the index is invisible to the Go
+        // predicate (which expects tags + metadata); veto rather
+        // than feed an empty candidate.
+        let caps = self.capability_index.get(*target)?;
+
+        // Build the candidate JSON. `Tag::Display` produces the
+        // on-wire string form; `metadata` is BTreeMap<String,String>
+        // which serde_json renders as a stable-keyed object.
+        let tags: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+        let candidate = serde_json::json!({
+            "node_id": *target,
+            "tags": tags,
+            "metadata": caps.metadata,
+        });
+        let json = match serde_json::to_string(&candidate) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "CgoPlacementFilter[{id}]: candidate JSON encode failed for {target:#x}: {e}; vetoing",
+                    id = self.id,
+                );
+                return None;
+            }
+        };
+
+        let id_bytes = self.id.as_bytes();
+        let json_bytes = json.as_bytes();
+        // SAFETY: dispatcher pointer was vetted by
+        // `net_compute_set_placement_filter_dispatcher`; both
+        // buffers are valid &[u8] slices owned by this stack frame
+        // for the duration of the call, matching the Go-side
+        // contract that buffers live only for the trampoline's
+        // duration (Go copies via `C.GoStringN` / `C.GoBytes`).
+        let result = unsafe {
+            dispatcher(
+                id_bytes.as_ptr() as *const c_char,
+                id_bytes.len(),
+                *target,
+                json_bytes.as_ptr() as *const c_char,
+                json_bytes.len(),
+            )
+        };
+        match result {
+            1 => Some(1.0),
+            0 => None,
+            other => {
+                eprintln!(
+                    "CgoPlacementFilter[{id}]: trampoline returned error code {other} for {target:#x}; vetoing",
+                    id = self.id,
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Register a Go placement-filter under `id`. Wraps the per-call
+/// trampoline (registered once via
+/// [`net_compute_set_placement_filter_dispatcher`]) in a
+/// `CgoPlacementFilter` (private bridge type) and inserts it into
+/// the substrate's `global_placement_filter_registry` as
+/// `Arc<dyn PlacementFilter>`.
+///
+/// `mesh_arc` is a non-consuming pointer — the registry holds an
+/// `Arc<CapabilityIndex>` clone, not the mesh handle. Caller's
+/// existing `_free` for the mesh handle stays correct.
+///
+/// Returns:
+///
+///   - `0` — registered successfully.
+///   - [`NET_COMPUTE_ERR_NULL`] — `mesh_arc` or `id_ptr` is NULL.
+///   - [`NET_COMPUTE_ERR_DUPLICATE_KIND`] — `id` is already
+///     registered (no-overwrite contract; the Go SDK's
+///     `PlacementFilterFromFn` generates unique IDs by counter).
+///     Reuses the existing duplicate-kind error code so Go callers
+///     don't need a new constant.
+///   - `-4` — the Go-side dispatcher hasn't been installed yet.
+///     Call [`net_compute_set_placement_filter_dispatcher`] from
+///     the Go binding's `init()` first.
+///   - `-5` — `id_ptr` did not decode as valid UTF-8.
+///
+/// # Safety
+///
+/// `mesh_arc` MUST be a pointer returned by `net_mesh_arc_clone`;
+/// it is NOT consumed. `id_ptr` MUST point to `id_len` bytes of
+/// valid UTF-8. Both buffers must live for the duration of the
+/// call.
+#[no_mangle]
+pub extern "C" fn net_compute_register_placement_filter(
+    mesh_arc: *mut Arc<MeshNode>,
+    id_ptr: *const c_char,
+    id_len: usize,
+) -> c_int {
+    use ::net::adapter::net::behavior::placement::PlacementFilter;
+    use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+
+    if mesh_arc.is_null() || id_ptr.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    if PLACEMENT_FILTER_DISPATCHER.get().is_none() {
+        return -4;
+    }
+
+    let id = unsafe {
+        let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => return -5,
+        }
+    };
+
+    let arc = unsafe { &*mesh_arc };
+    let capability_index = arc.capability_index().clone();
+    let wrapper = CgoPlacementFilter {
+        id: id.clone(),
+        capability_index,
+    };
+    let arc_filter: Arc<dyn PlacementFilter> = Arc::new(wrapper);
+
+    // SDK Phase 7 polish: `"go"` binding label drives the
+    // `dataforts_placement_callback_invocations_total{binding="go"}`
+    // counter on the substrate registry.
+    if global_placement_filter_registry().register(id, arc_filter, "go") {
+        NET_COMPUTE_OK
+    } else {
+        NET_COMPUTE_ERR_DUPLICATE_KIND
+    }
+}
+
+/// Drop the placement-filter registration under `id`.
+///
+/// Returns `1` if `id` was registered, `0` otherwise.
+/// [`NET_COMPUTE_ERR_NULL`] if `id_ptr` is NULL or the bytes don't
+/// decode as UTF-8.
+///
+/// # Safety
+///
+/// Same buffer-lifetime contract as
+/// [`net_compute_register_placement_filter`].
+#[no_mangle]
+pub extern "C" fn net_compute_unregister_placement_filter(
+    id_ptr: *const c_char,
+    id_len: usize,
+) -> c_int {
+    use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+    if id_ptr.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let id = unsafe {
+        let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return NET_COMPUTE_ERR_NULL,
+        }
+    };
+    if global_placement_filter_registry().unregister(id) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Whether `id` is currently registered. Diagnostic helper.
+/// Returns `1` if registered, `0` otherwise; [`NET_COMPUTE_ERR_NULL`]
+/// on bad input.
+///
+/// # Safety
+///
+/// Same buffer-lifetime contract as
+/// [`net_compute_register_placement_filter`].
+#[no_mangle]
+pub extern "C" fn net_compute_has_placement_filter(id_ptr: *const c_char, id_len: usize) -> c_int {
+    use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+    if id_ptr.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let id = unsafe {
+        let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return NET_COMPUTE_ERR_NULL,
+        }
+    };
+    if global_placement_filter_registry().contains(id) {
+        1
+    } else {
+        0
+    }
+}
+
+// =========================================================================
 // Tests
 // =========================================================================
 
@@ -2556,5 +3058,39 @@ mod tests {
                 "silent-noop regression: ReconstructionErrorBridge::restore must never return Ok",
             ),
         }
+    }
+
+    /// N-8 regression: `net_compute_snapshot_bytes_free` must free
+    /// a non-NULL pointer even when `len == 0`. CR-11 fixed the
+    /// inbound paths; pre-fix this outbound helper kept the
+    /// combined `ptr.is_null() || len == 0` guard, leaking the
+    /// allocation a Go trampoline made via `C.malloc(0)`.
+    ///
+    /// We allocate a small buffer via `libc::malloc`, hand it to
+    /// the free helper with `len = 0`, and rely on the OS / sanitizer
+    /// (or a leak checker, when run under one) to flag a regression.
+    /// At minimum the call must not panic, and a NULL pointer must
+    /// remain a safe no-op.
+    #[test]
+    fn snapshot_bytes_free_non_null_len_zero_does_not_leak() {
+        // NULL is always a safe no-op.
+        net_compute_snapshot_bytes_free(std::ptr::null_mut(), 0);
+        net_compute_snapshot_bytes_free(std::ptr::null_mut(), 16);
+
+        // Non-NULL pointer with len=0 must still free (Go-side
+        // trampoline contract). We use libc::malloc(16) to mirror
+        // the Go-side `C.malloc` allocator; freeing with len=0
+        // exercises the post-fix code path. Running under valgrind
+        // / ASan would surface a regression as a leak; the test
+        // itself just pins the no-panic contract.
+        let p = unsafe { libc::malloc(16) } as *mut u8;
+        assert!(!p.is_null(), "libc::malloc(16) must succeed");
+        net_compute_snapshot_bytes_free(p, 0);
+
+        // Non-NULL pointer with len>0 path — the original case the
+        // function was designed for. Same allocator.
+        let q = unsafe { libc::malloc(16) } as *mut u8;
+        assert!(!q.is_null(), "libc::malloc(16) must succeed");
+        net_compute_snapshot_bytes_free(q, 16);
     }
 }

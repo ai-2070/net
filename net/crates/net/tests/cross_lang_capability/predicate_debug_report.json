@@ -1,0 +1,152 @@
+{
+  "description": "Cross-binding pin for `PredicateDebugReport::from_evaluations(pred, contexts)` — the per-clause aggregator. Each case carries a `wire` predicate plus an array of `contexts` (each `{tags, metadata}`); the expected output is `total_candidates`, `matched`, and `clause_stats` (sorted by label, BTreeMap semantics). Bindings re-implement the aggregator over their `evaluate_with_trace` and assert byte-identical reports. See README.md.",
+  "abi_version_expected": 1,
+  "cases": [
+    {
+      "name": "empty_corpus_zero_stats",
+      "summary": "Aggregator over zero candidates yields zero totals + empty clause_stats.",
+      "wire": {
+        "nodes": [{ "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } }],
+        "root_idx": 0
+      },
+      "contexts": [],
+      "expected_total_candidates": 0,
+      "expected_matched": 0,
+      "expected_clause_stats": []
+    },
+    {
+      "name": "single_leaf_some_match_some_dont",
+      "summary": "Single Exists leaf across 4 candidates; 2 have the tag, 2 don't.",
+      "wire": {
+        "nodes": [{ "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } }],
+        "root_idx": 0
+      },
+      "contexts": [
+        { "tags": ["hardware.gpu"], "metadata": {} },
+        { "tags": [], "metadata": {} },
+        { "tags": ["hardware.gpu", "software.os=linux"], "metadata": {} },
+        { "tags": ["hardware.cpu_cores=8"], "metadata": {} }
+      ],
+      "expected_total_candidates": 4,
+      "expected_matched": 2,
+      "expected_clause_stats": [
+        { "label": "Exists(hardware.gpu)", "evaluated": 4, "matched": 2 }
+      ]
+    },
+    {
+      "name": "and_short_circuit_skips_expensive_sibling",
+      "summary": "And of MetadataEquals (cheap) + SemverCompatible (expensive). Cheap clause runs every time; expensive only runs when cheap matches. Pinned: `evaluated` for the expensive clause < total_candidates.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_equals", "key": "intent", "value": "ml-training" },
+          {
+            "kind": "semver_compatible",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.11.0"
+          },
+          { "kind": "and", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      },
+      "contexts": [
+        {
+          "tags": ["software.runtime.python=3.11.5"],
+          "metadata": { "intent": "ml-training" }
+        },
+        {
+          "tags": ["software.runtime.python=3.10.0"],
+          "metadata": { "intent": "ml-training" }
+        },
+        {
+          "tags": ["software.runtime.python=3.11.0"],
+          "metadata": { "intent": "embedding-cache" }
+        },
+        { "tags": [], "metadata": {} }
+      ],
+      "expected_total_candidates": 4,
+      "expected_matched": 1,
+      "expected_clause_stats": [
+        { "label": "And(2 clauses)", "evaluated": 4, "matched": 1 },
+        {
+          "label": "MetadataEquals(intent=ml-training)",
+          "evaluated": 4,
+          "matched": 2
+        },
+        {
+          "label": "SemverCompatible(software.runtime.python ~= 3.11.0)",
+          "evaluated": 2,
+          "matched": 1
+        }
+      ]
+    },
+    {
+      "name": "or_short_circuit_skips_remaining_when_first_true",
+      "summary": "Or of MetadataExists (cheap) + Exists (more expensive). Cheap runs every time; expensive only runs when cheap fails.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_exists", "key": "intent" },
+          { "kind": "exists", "key": { "axis": "hardware", "key": "tpu" } },
+          { "kind": "or", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      },
+      "contexts": [
+        { "tags": [], "metadata": { "intent": "ml-training" } },
+        { "tags": ["hardware.tpu"], "metadata": {} },
+        { "tags": [], "metadata": {} },
+        { "tags": ["hardware.gpu"], "metadata": { "intent": "embedding" } }
+      ],
+      "expected_total_candidates": 4,
+      "expected_matched": 3,
+      "expected_clause_stats": [
+        { "label": "Exists(hardware.tpu)", "evaluated": 2, "matched": 1 },
+        { "label": "MetadataExists(intent)", "evaluated": 4, "matched": 2 },
+        { "label": "Or(2 clauses)", "evaluated": 4, "matched": 3 }
+      ]
+    },
+    {
+      "name": "structurally_equal_clauses_merge_under_one_label",
+      "summary": "Two AST nodes with structurally-identical leaf shape (e.g. `Exists(hardware.gpu)` reused) collapse to a single label entry — the aggregator merges by debug_label string.",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          { "kind": "or", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      },
+      "contexts": [
+        { "tags": ["hardware.gpu"], "metadata": {} },
+        { "tags": [], "metadata": {} }
+      ],
+      "expected_total_candidates": 2,
+      "expected_matched": 1,
+      "expected_clause_stats": [
+        { "label": "Exists(hardware.gpu)", "evaluated": 3, "matched": 1 },
+        { "label": "Or(2 clauses)", "evaluated": 2, "matched": 1 }
+      ]
+    },
+    {
+      "name": "not_inversion_counts_post_negation_match",
+      "summary": "Not's clause_stats entry counts post-negation matches; the inner clause counts pre-negation. Pinned: total_candidates=3; Not matches when inner doesn't.",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          { "kind": "not", "child": 0 }
+        ],
+        "root_idx": 1
+      },
+      "contexts": [
+        { "tags": ["hardware.gpu"], "metadata": {} },
+        { "tags": [], "metadata": {} },
+        { "tags": ["hardware.gpu", "software.os=linux"], "metadata": {} }
+      ],
+      "expected_total_candidates": 3,
+      "expected_matched": 1,
+      "expected_clause_stats": [
+        { "label": "Exists(hardware.gpu)", "evaluated": 3, "matched": 2 },
+        { "label": "Not", "evaluated": 3, "matched": 1 }
+      ]
+    }
+  ]
+}

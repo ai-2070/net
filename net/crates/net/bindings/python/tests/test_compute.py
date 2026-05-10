@@ -203,6 +203,45 @@ def test_spawn_unregistered_kind_raises() -> None:
         mesh.shutdown()
 
 
+class BrokenCapsDaemon:
+    """Daemon whose `required_capabilities` getter raises. Used to
+    pin the post-fix contract: only `AttributeError` (i.e. "the
+    attribute isn't declared") is silently treated as empty caps;
+    every other exception must propagate so operators see the real
+    failure instead of a daemon spawning with phantom empty caps.
+
+    Pre-fix, `extract_optional_caps` swallowed every `getattr`
+    error and returned `CapabilitySet::default()` — a property
+    getter that raised `RuntimeError` would result in the daemon
+    being indexed with an empty cap set, silently masking
+    placement-plane bugs.
+    """
+
+    @property
+    def required_capabilities(self):  # type: ignore[no-untyped-def]
+        raise RuntimeError("broken caps getter")
+
+    def process(self, event: CausalEvent) -> list[bytes]:
+        return [event.payload]
+
+
+def test_spawn_propagates_property_getter_errors_for_capabilities() -> None:
+    mesh = _mesh()
+    rt = DaemonRuntime(mesh)
+    try:
+        rt.register_factory("broken_caps", BrokenCapsDaemon)
+        rt.start()
+        ident = Identity.generate()
+        # The getter raising RuntimeError must surface during
+        # spawn, not silently collapse into empty caps.
+        with pytest.raises((DaemonError, RuntimeError)) as exc_info:
+            rt.spawn("broken_caps", ident)
+        assert "broken caps getter" in str(exc_info.value)
+    finally:
+        rt.shutdown()
+        mesh.shutdown()
+
+
 def test_spawn_stop_reduces_daemon_count() -> None:
     mesh = _mesh()
     rt = DaemonRuntime(mesh)

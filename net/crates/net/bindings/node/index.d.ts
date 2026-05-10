@@ -407,6 +407,80 @@ export declare class MemoryWatchIter {
 }
 
 /**
+ * nRPC envelope around a [`crate::NetMesh`]. One instance per
+ * live mesh.
+ */
+export declare class MeshRpc {
+  /**
+   * Build a MeshRpc against an existing NetMesh. Cheap
+   * (`Arc::clone` on the inner MeshNode) — call once per
+   * mesh and reuse.
+   */
+  static fromMesh(mesh: NetMesh): MeshRpc
+  /**
+   * Register `handler` on `service`. Returns a [`ServeHandle`]
+   * whose `close()` unregisters; in-flight handlers continue
+   * to completion after close.
+   *
+   * Handler shape: `(req: Buffer) => Promise<Buffer>`. Sync
+   * handlers can `Promise.resolve(buf)` or simply be declared
+   * `async`.
+   *
+   * `handlerTimeoutMs` caps the per-call wait for the JS
+   * handler — defaults to 60 000 (60s). A wedged handler past
+   * the cap surfaces to the caller as `RpcStatus::Internal`
+   * "JS handler did not respond within N ms" so the in-flight
+   * slot doesn't leak. Pass 0 to disable the cap (not
+   * recommended — a stuck handler holds a runtime worker
+   * indefinitely).
+   */
+  serve(service: string, handler: (arg: Buffer) => Promise<Buffer>, handlerTimeoutMs?: number | undefined | null): ServeHandle
+  /**
+   * Reserve a fresh cancel token. Pass on a subsequent call
+   * via `opts.cancelToken`; later, call
+   * [`MeshRpc.cancel_call`] from anywhere to abort the in-
+   * flight task. Tokens are monotonically increasing,
+   * process-global, never reused — an unused reservation is
+   * harmless (no cleanup required).
+   */
+  reserveCancelToken(): bigint
+  /**
+   * Abort the in-flight call associated with `token`.
+   * Idempotent — no-op if the token was never used or the call
+   * already finished. The aborted task drops the SDK future
+   * (which fires CANCEL on the wire); the awaiting `call` /
+   * `callService` rejects with `nrpc:cancelled:`.
+   */
+  cancelCall(token: bigint): void
+  /**
+   * Direct-addressed unary call. Caller specifies
+   * `targetNodeId`; the SDK does NOT consult the capability
+   * index. Returns the response body as a Buffer; throws
+   * `nrpc:*` on error.
+   */
+  call(targetNodeId: bigint, service: string, request: Buffer, opts?: CallOptions | undefined | null): Promise<Buffer>
+  /**
+   * Service-discovery unary call. Resolves `service` against
+   * the local capability index (`nrpc:<service>` tags),
+   * applies the routing policy (default RoundRobin), calls.
+   */
+  callService(service: string, request: Buffer, opts?: CallOptions | undefined | null): Promise<Buffer>
+  /**
+   * Open a streaming-response call. Returns an [`RpcStream`];
+   * drain via `await stream.next()` until it returns `null`.
+   * Drop / `close()` emits CANCEL to the server.
+   */
+  callStreaming(targetNodeId: bigint, service: string, request: Buffer, opts?: CallOptions | undefined | null): Promise<RpcStream>
+  /**
+   * All node ids currently advertising `nrpc:<service>` in the
+   * local capability index. Useful for diagnostics + custom
+   * caller-side routing logic. Returns BigInt array (each
+   * node id is a 64-bit value).
+   */
+  findServiceNodes(service: string): Array<bigint>
+}
+
+/**
  * Handle to an in-flight migration. Created by
  * [`DaemonRuntime::start_migration`] /
  * [`DaemonRuntime::start_migration_with`]; cloneable (shares
@@ -790,6 +864,46 @@ export declare class NetMesh {
   findNodesScoped(filter: CapabilityFilterJs, scope: ScopeFilterJs): Array<bigint>
   /** Shutdown the mesh node. */
   shutdown(): Promise<void>
+  /**
+   * Register a JS placement-filter predicate under `id`.
+   *
+   * JS contract: `fn(candidate: PlacementCandidate) =>
+   * boolean`. Returning `true` keeps the candidate
+   * (placement-score 1.0); returning `false` (or throwing)
+   * vetoes it. The predicate runs per candidate per
+   * placement decision — keep it tight and avoid I/O.
+   *
+   * Returns `false` if `id` is already registered (the SDK's
+   * `placementFilterFromFn` generates unique IDs by counter,
+   * so collisions are an SDK-side concern). Use
+   * `unregisterPlacementFilter` first if you intend to swap
+   * the predicate behind a stable id.
+   */
+  registerPlacementFilter(id: string, predicate: (arg: PlacementCandidateJs) => boolean): boolean
+  /**
+   * Drop the placement-filter registration under `id`.
+   *
+   * Returns `true` if `id` was registered. Existing
+   * `Arc<dyn PlacementFilter>` clones held by in-flight
+   * scheduler calls keep the predicate alive until those
+   * calls finish — see the registry docs.
+   */
+  unregisterPlacementFilter(id: string): boolean
+  /** Whether `id` is currently registered. Mainly for tests. */
+  hasPlacementFilter(id: string): boolean
+  /**
+   * **Test-only** helper for the vitest groups suite.
+   * Injects a synthetic capability announcement directly
+   * into the local capability index, simulating a peer
+   * announcement without going through a real handshake.
+   *
+   * Gated behind the `test-helpers` feature so it is
+   * **not** exported to production JS consumers. Enabling
+   * `groups` alone does not pull this in; vitest builds with
+   * `--features groups,test-helpers` explicitly. Production
+   * code uses the normal `announce_capabilities` path.
+   */
+  testInjectSyntheticPeer(nodeId: bigint): void
 }
 
 /**
@@ -969,6 +1083,75 @@ export declare class ReplicaGroup {
   get replicas(): Array<MemberInfoJs>
   get replicaCount(): number
   get healthyCount(): number
+}
+
+/**
+ * Open streaming RPC call. Yields chunks via `next()` until EOF
+ * (returns `null`). Drop OR explicit `close()` emits CANCEL to
+ * the server (best-effort).
+ */
+export declare class RpcStream {
+  /**
+   * Pull the next chunk. Returns `null` on clean EOF (the
+   * server emitted its terminal frame). Throws on error
+   * (terminal non-Ok status from the server, or the stream
+   * having been closed).
+   */
+  next(): Promise<Buffer | null>
+  /**
+   * Grant `n` additional flow-control credits to the server's
+   * pump. Only meaningful if the call set
+   * `streamWindowInitial`; otherwise a no-op. Use this to
+   * implement custom drain cadence (e.g. grant a half-window
+   * every half-window chunks consumed).
+   *
+   * **Contention note:** this currently serializes against an
+   * in-flight `next()` because the SDK's `RpcStream` doesn't
+   * expose a separable control handle. If you need to grant
+   * while a `next()` is parked, either drain `next()` first or
+   * rely on auto-grant (1 credit per delivered chunk) which
+   * keeps the server's credit at roughly the initial window.
+   */
+  grant(n: number): Promise<void>
+  /**
+   * `true` if the stream was opened with a non-`None`
+   * `streamWindowInitial`. Diagnostic / test helper.
+   *
+   * Lock-free: the underlying flow-control mode is fixed at
+   * stream creation, so the value is captured then and read
+   * without taking the inner mutex.
+   */
+  flowControlled(): Promise<boolean>
+  /**
+   * Close the stream. Emits CANCEL to the server (best-effort)
+   * so the server-side handler observes `ctx.cancellation`.
+   * Idempotent — repeated calls are no-ops.
+   */
+  close(): Promise<void>
+}
+
+/**
+ * Handle returned by [`MeshRpc::serve`]. Calling `close()`
+ * unregisters the service and stops accepting new request
+ * dispatch — in-flight handlers continue to completion.
+ *
+ * Always call `close()` explicitly when done with the service.
+ * V8 GC will eventually drop the napi class (and the inner
+ * ServeHandle) but timing is non-deterministic; relying on it
+ * for production unregister is unsafe.
+ */
+export declare class ServeHandle {
+  /**
+   * Unregister the service. Idempotent — repeated calls are
+   * no-ops. After close, in-flight handlers continue to
+   * completion but no new requests will be dispatched.
+   */
+  close(): void
+  /**
+   * `true` once `close()` has been called (or after V8 GC
+   * finalized the handle). Useful for tests / diagnostics.
+   */
+  isClosed(): boolean
 }
 
 export declare class StandbyGroup {
@@ -1151,6 +1334,51 @@ export interface AcceleratorJs {
   topsX10?: number
 }
 
+/**
+ * Per-call options. All fields are optional; defaults match the
+ * inner [`InnerCallOptions::default()`].
+ */
+export interface CallOptions {
+  /**
+   * Hard deadline, in milliseconds from now. The call's future
+   * races a `tokio::time::sleep`; whichever fires first wins.
+   * On timeout the caller emits CANCEL to the server so the
+   * in-flight handler observes its `ctx.cancellation` token.
+   */
+  deadlineMs?: number
+  /**
+   * Streaming-only: initial credit window for per-streaming-
+   * response flow control. `Some(n)` means "the server pump
+   * awaits one credit per emitted chunk; refill via
+   * `RpcStream::grant`." `None` (the default) → unbounded.
+   * Ignored by non-streaming `call` / `callService`.
+   */
+  streamWindowInitial?: number
+  /**
+   * Caller-side cancel token for AbortSignal integration. Mint
+   * via `MeshRpc.reserveCancelToken()`, pass here, then call
+   * `MeshRpc.cancelCall(token)` from your AbortSignal listener
+   * (or any other cancel trigger) to abort the in-flight call.
+   * On cancel the call rejects with `nrpc:cancelled:` so user
+   * code can match via `classifyError`. Defaults to no cancel
+   * surface (cheaper fast path; no tokio spawn / registry
+   * overhead).
+   */
+  cancelToken?: bigint
+  /**
+   * Caller-supplied request headers, appended to the wire
+   * `RpcRequestPayload.headers` after any auto-generated
+   * headers (trace, stream-window). Used for application-level
+   * metadata the server needs at dispatch-time — most notably
+   * the `cyberdeck-where` predicate header for Phase 9b
+   * predicate-pushdown filtering.
+   *
+   * JS callers pass `[{ name: "cyberdeck-where", value: Buffer.from(jsonBytes) }, ...]`.
+   * `undefined` (default) → no extra headers.
+   */
+  requestHeaders?: Array<RpcRequestHeader>
+}
+
 export interface CapabilityFilterJs {
   requireTags?: Array<string>
   requireModels?: Array<string>
@@ -1270,6 +1498,14 @@ export interface CortexSnapshot {
  * Host configuration for a daemon. Omitted fields fall back to
  * the core defaults (`auto_snapshot_interval: 0`,
  * `max_log_entries: 10_000`).
+ *
+ * Phase G slice 2 + Phase 6 SDK plan: capability declarations
+ * (`requiredCapabilities` / `optionalCapabilities`) live on the
+ * **factory return value** (`DaemonBridgeTsfns`), not here. Local-
+ * spawn daemons constructed via [`DaemonRuntime::spawn`] inherit
+ * empty capability defaults (run anywhere); production daemons
+ * registered via [`DaemonRuntime::register_factory`] declare
+ * capabilities through the factory's returned object.
  */
 export interface DaemonHostConfigJs {
   /**
@@ -1713,6 +1949,20 @@ export declare function normalizeGpuVendor(vendor: string): string
  */
 export declare function parseToken(bytes: Buffer): TokenInfo
 
+/**
+ * Candidate handed to the JS placement-filter predicate.
+ *
+ * Mirrors the SDK's `PlacementCandidate` interface — the
+ * `node_id` matches the substrate's u64 NodeId, projected to
+ * `bigint` on the JS side; `tags` and `metadata` are the live
+ * snapshot from the local `CapabilityIndex` at scoring time.
+ */
+export interface PlacementCandidateJs {
+  nodeId: bigint
+  tags: Array<string>
+  metadata: Record<string, string>
+}
+
 /** Options for polling events. */
 export interface PollOptions {
   /** Maximum number of events to return */
@@ -1854,6 +2104,22 @@ export interface RequestContextJs {
   routingKey?: string
   sessionId?: string
   requestId?: string
+}
+
+/**
+ * A single `(name, value)` request-header entry. Names follow the
+ * lowercase `cyberdeck-*` / `nrpc-*` convention; the substrate
+ * doesn't validate names beyond the `MAX_RPC_HEADER_NAME_LEN` cap.
+ */
+export interface RpcRequestHeader {
+  /** Header name (e.g. `cyberdeck-where`). */
+  name: string
+  /**
+   * Header value bytes. For text-like headers (predicates,
+   * trace-context), the contents are UTF-8 strings encoded as
+   * `Buffer.from(str)`.
+   */
+  value: Buffer
 }
 
 /**

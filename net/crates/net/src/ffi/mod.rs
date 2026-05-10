@@ -128,6 +128,32 @@ pub mod cortex;
 #[allow(missing_docs)]
 pub mod mesh;
 
+/// C FFI for stateless predicate evaluation (Phase 9c of
+/// `CAPABILITY_SYSTEM_SDK_PLAN.md`). Pure helpers — no handles,
+/// no state. Mirrors the SDK-layer `evaluatePredicate` /
+/// `evaluate_predicate` surface every binding ships, exposed at
+/// the C ABI for raw consumers (C / C++ / Zig / Swift / etc.).
+#[cfg(feature = "net")]
+pub mod predicate;
+
+/// C FFI for stateless capability-set validation (Phase 9a of
+/// `CAPABILITY_SYSTEM_SDK_PLAN.md`). Pure helper — `caps_json`
+/// in, `report_json` out. Mirrors the SDK-layer
+/// `validate_capabilities` surface, exposed at the C ABI for raw
+/// consumers.
+#[cfg(feature = "net")]
+pub mod schema;
+
+/// C FFI for predicate debug-session helpers (Phase 9d of
+/// `CAPABILITY_SYSTEM_SDK_PLAN.md`). Pure helpers — single-eval
+/// `evaluate_with_trace`, corpus-wide
+/// `aggregate_debug_report`, and host-side
+/// `redact_metadata_keys`. Mirror what every other binding
+/// ships at the SDK layer; exposed at the C ABI for raw
+/// consumers.
+#[cfg(feature = "net")]
+pub mod predicate_debug;
+
 /// C FFI for the Redis Streams consumer-side dedup helper. Mirrors
 /// the Rust `net::adapter::RedisStreamDedup` surface for Go / C / Zig
 /// consumers. See `ffi::redis_dedup` module docs for the wire
@@ -2115,6 +2141,35 @@ mod tests {
                 v
             );
         }
+    }
+
+    /// CR-5: pin that `examples/capability.c` does not double-include
+    /// `net.h` and `net.go.h`. Both files use the `NET_SDK_H` include
+    /// guard, so when both are included in one TU the second is
+    /// silently skipped — every `net_validate_capabilities` /
+    /// `net_predicate_*` call the example makes becomes an
+    /// implicit-declaration error on GCC 14+/Clang 16+, and a silent
+    /// `int`-return miscompile on older toolchains. The deeper fix
+    /// (renaming one guard so they compose cleanly) is tracked as
+    /// CR-28; this test catches the example-level regression.
+    #[test]
+    fn cr5_example_does_not_double_include_net_headers() {
+        let example = include_str!("../../examples/capability.c");
+        let net_h_included = example.contains("#include \"../include/net.h\"");
+        let net_go_h_included = example.contains("#include \"../include/net.go.h\"");
+        assert!(
+            net_go_h_included,
+            "examples/capability.c must include net.go.h to declare \
+             net_validate_capabilities + net_predicate_* symbols"
+        );
+        assert!(
+            !net_h_included,
+            "examples/capability.c must NOT also include net.h: \
+             both headers share the NET_SDK_H guard, so the second \
+             include is silently skipped, leaving the example's \
+             net_predicate_* calls implicitly declared. Drop the \
+             redundant include — net.go.h is a superset."
+        );
     }
 
     /// `handle_is_valid` rejects null and any pointer not aligned for

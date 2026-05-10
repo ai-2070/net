@@ -1,0 +1,273 @@
+{
+  "description": "Cross-binding wire-format pin for `cyberdeck-where` request headers. Each case's `wire` field is the canonical JSON-encoded PredicateWire that lands in the request-header value (per behavior::predicate::predicate_to_rpc_header). Bindings deserialize, re-serialize, and assert byte-equal. See README.md.",
+  "header_name": "cyberdeck-where",
+  "abi_version_expected": 1,
+  "cases": [
+    {
+      "name": "exists_hardware_gpu",
+      "summary": "Single AxisPresent leaf — the simplest predicate.",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "equals_axis_value",
+      "summary": "Axis-tag value equality.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "equals",
+            "key": { "axis": "hardware", "key": "gpu.vendor" },
+            "value": "nvidia"
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "numeric_at_least",
+      "summary": "Numeric lower bound on an axis-tag value.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "threshold": 65536.0
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "numeric_at_most",
+      "summary": "Numeric upper bound on an axis-tag value.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_at_most",
+            "key": { "axis": "hardware", "key": "limits.rate_limit_rpm" },
+            "threshold": 1000.0
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "numeric_in_range",
+      "summary": "Numeric range on an axis-tag value (inclusive both ends).",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_in_range",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "min": 32768.0,
+            "max": 131072.0
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "semver_at_least",
+      "summary": "Semver lower bound (`>= 3.10.0` etc).",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "semver_at_least",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.10.0"
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "semver_at_most",
+      "summary": "Semver upper bound.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "semver_at_most",
+            "key": { "axis": "software", "key": "cuda_version" },
+            "version": "12.4.0"
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "semver_compatible",
+      "summary": "Caret-compatibility band on a semver value.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "semver_compatible",
+            "key": { "axis": "software", "key": "framework.pytorch" },
+            "version": "2.1.0"
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "string_prefix",
+      "summary": "String-prefix match on an axis-tag value.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "string_prefix",
+            "key": { "axis": "software", "key": "os" },
+            "prefix": "linux"
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "string_matches",
+      "summary": "Substring match on an axis-tag value.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "string_matches",
+            "key": { "axis": "hardware", "key": "gpu.model" },
+            "pattern": "H100"
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "metadata_exists",
+      "summary": "Metadata key presence.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_exists", "key": "intent" }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "metadata_equals",
+      "summary": "Metadata value equality.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "metadata_equals",
+            "key": "intent",
+            "value": "ml-training"
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "metadata_matches",
+      "summary": "Metadata substring match.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "metadata_matches",
+            "key": "owner",
+            "pattern": "@anthropic"
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "metadata_numeric_at_least",
+      "summary": "Metadata numeric lower bound (e.g. priority threshold).",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "metadata_numeric_at_least",
+            "key": "priority",
+            "threshold": 5.0
+          }
+        ],
+        "root_idx": 0
+      }
+    },
+    {
+      "name": "and_two_leaves",
+      "summary": "Conjunction of two leaves. Children at indices 0+1; And at index 2.",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          {
+            "kind": "metadata_equals",
+            "key": "intent",
+            "value": "ml-training"
+          },
+          { "kind": "and", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      }
+    },
+    {
+      "name": "or_short_circuit_pair",
+      "summary": "Disjunction. First child cheaper (metadata_exists) for the planner; second is heavier (semver_compatible).",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_exists", "key": "intent" },
+          {
+            "kind": "semver_compatible",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.11.0"
+          },
+          { "kind": "or", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      }
+    },
+    {
+      "name": "not_over_metadata",
+      "summary": "Negation. Child at index 0; Not at index 1.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "metadata_equals",
+            "key": "decommissioning",
+            "value": "true"
+          },
+          { "kind": "not", "child": 0 }
+        ],
+        "root_idx": 1
+      }
+    },
+    {
+      "name": "complex_and_of_or_of_and_with_not",
+      "summary": "Real-world shape: 'has GPU OR (memory>=64GB AND has intent), AND NOT decommissioning, AND python>=3.10'. Stresses post-order serialization + cycle protection (children always at lower indices than parents).",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "threshold": 65536.0
+          },
+          { "kind": "metadata_exists", "key": "intent" },
+          { "kind": "and", "children": [1, 2] },
+          { "kind": "or", "children": [0, 3] },
+          {
+            "kind": "metadata_equals",
+            "key": "decommissioning",
+            "value": "true"
+          },
+          { "kind": "not", "child": 5 },
+          {
+            "kind": "semver_at_least",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.10.0"
+          },
+          { "kind": "and", "children": [4, 6, 7] }
+        ],
+        "root_idx": 8
+      }
+    }
+  ]
+}

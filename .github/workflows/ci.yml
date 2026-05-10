@@ -35,7 +35,7 @@ jobs:
         run: cargo test --lib --features "net redex cortex netdb"
 
   integration-tests:
-    name: Integration tests (net, 3-node, migration, RedEX, CortEX, NetDB)
+    name: Integration tests (net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -63,10 +63,12 @@ jobs:
       # once CI service containers are added.
       - name: Net integration
         run: cargo test --test integration_net --features net
-      - name: Migration integration
-        run: cargo test --test migration_integration --features net
       - name: Three-node integration
         run: cargo test --test three_node_integration --features net
+      - name: Mikoshi integration
+        run: cargo test --test migration_integration --features net
+      - name: Mikoshi placement-filter callback integration
+        run: cargo test --test integration_placement_filter_callback --features net
       - name: RedEX integration
         run: cargo test --test integration_redex --features redex
       - name: CortEX adapter integration
@@ -77,6 +79,8 @@ jobs:
         run: cargo test --test integration_cortex_memories --features cortex
       - name: NetDB integration
         run: cargo test --test integration_netdb --features netdb
+      - name: nRPC predicate-header integration
+        run: cargo test --test integration_nrpc_predicate_header --features cortex
 
   rust-sdk-tests:
     name: Rust SDK tests

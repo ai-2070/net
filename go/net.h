@@ -278,7 +278,7 @@ int  net_redex_tail_next(net_redex_tail_t* cursor, uint32_t timeout_ms,
 void net_redex_tail_free(net_redex_tail_t* cursor);
 
 /* ---- Tasks adapter ---- */
-int  net_tasks_adapter_open(net_redex_t* redex, uint32_t origin_hash,
+int  net_tasks_adapter_open(net_redex_t* redex, uint64_t origin_hash,
                             int persistent, net_tasks_adapter_t** out_handle);
 int  net_tasks_adapter_close(net_tasks_adapter_t* handle);
 void net_tasks_adapter_free(net_tasks_adapter_t* handle);
@@ -304,7 +304,7 @@ int  net_tasks_watch_next(net_tasks_watch_t* cursor, uint32_t timeout_ms,
 void net_tasks_watch_free(net_tasks_watch_t* cursor);
 
 /* ---- Memories adapter ---- */
-int  net_memories_adapter_open(net_redex_t* redex, uint32_t origin_hash,
+int  net_memories_adapter_open(net_redex_t* redex, uint64_t origin_hash,
                                int persistent, net_memories_adapter_t** out_handle);
 int  net_memories_adapter_close(net_memories_adapter_t* handle);
 void net_memories_adapter_free(net_memories_adapter_t* handle);
@@ -571,7 +571,7 @@ int      net_identity_to_seed(net_identity_t* handle, uint8_t* out);
 int      net_identity_entity_id(net_identity_t* handle, uint8_t* out);
 
 uint64_t net_identity_node_id(net_identity_t* handle);
-uint32_t net_identity_origin_hash(net_identity_t* handle);
+uint64_t net_identity_origin_hash(net_identity_t* handle);
 
 /* Signs `msg[len]`; writes a 64-byte ed25519 signature into `out_sig[64]`. */
 int      net_identity_sign(net_identity_t* handle,
@@ -778,6 +778,188 @@ int      net_mesh_find_best_node_scoped(net_meshnode_t* handle,
 int      net_normalize_gpu_vendor(const char* raw,
                                   char** out, size_t* out_len);
 
+/* Stateless predicate evaluation (Phase 9c of
+ * CAPABILITY_SYSTEM_SDK_PLAN.md). Mirrors the SDK-layer
+ * `evaluate_predicate(pred, tags, metadata)` surface every
+ * binding ships, exposed at the C ABI for raw consumers
+ * (C / C++ / Zig / Swift / Java JNI / etc.) so they can filter
+ * candidates locally without going through nRPC.
+ *
+ * Inputs are NUL-terminated UTF-8 JSON strings:
+ *   - predicate_json — wire-format `PredicateWire`.
+ *     Cross-binding compat pinned by
+ *     `tests/cross_lang_capability/predicate_eval.json`.
+ *   - tags_json      — `["hardware.gpu", "scope:tenant:foo"]`.
+ *     Reserved-prefix tags accepted (privileged Tag::parse).
+ *   - metadata_json  — `{"key":"value"}`.
+ *
+ * Returns:
+ *   1 — predicate evaluated to true.
+ *   0 — predicate evaluated to false.
+ *   NET_ERR_NULL_POINTER  — any input pointer is NULL.
+ *   NET_ERR_INVALID_UTF8  — input bytes aren't valid UTF-8.
+ *   NET_ERR_INVALID_JSON  — predicate / tags / metadata failed to
+ *                           parse, OR a tag string was malformed.
+ *
+ * Stateless. Thread-safe. Pure helper — no handle, no allocation
+ * out-params; the caller's buffers aren't retained. */
+int      net_predicate_evaluate(const char* predicate_json,
+                                const char* tags_json,
+                                const char* metadata_json);
+
+/* Encode a wire-format Predicate as the canonical
+ * `cyberdeck-where:` request-header pair (Phase 9b of
+ * CAPABILITY_SYSTEM_SDK_PLAN.md). Mirror of the Go SDK's
+ * `WhereHeader` helper.
+ *
+ * The returned `(name, value)` pair drops into the
+ * `(headers_ptr, header_count)` argument of
+ * `net_rpc_call_with_headers` / `_call_service_with_headers` /
+ * `_call_streaming_with_headers` (declared in `net_rpc.h`) for
+ * end-to-end predicate pushdown.
+ *
+ * Input (NUL-terminated UTF-8 JSON):
+ *   - predicate_json — wire-format `PredicateWire`. Same shape
+ *     `net_predicate_evaluate` accepts.
+ *
+ * Outputs:
+ *   - *out_header_name/_len — `"cyberdeck-where"` (always).
+ *     Free with `net_free_string`.
+ *   - *out_value_ptr/_len   — JSON-encoded PredicateWire bytes,
+ *     capped at `MAX_PREDICATE_RPC_HEADER_VALUE_LEN` (4096).
+ *     Free with `net_free_string`.
+ *
+ * Returns:
+ *   0                      — success.
+ *   NET_ERR_NULL_POINTER   — any pointer is NULL.
+ *   NET_ERR_INVALID_UTF8   — input bytes aren't valid UTF-8.
+ *   NET_ERR_INVALID_JSON   — predicate failed to parse OR
+ *                            encoded bytes exceed the 4096-byte
+ *                            header-value cap.
+ *
+ * Cross-binding wire format pinned by
+ * `tests/cross_lang_capability/predicate_nrpc_envelope.json`. */
+int      net_predicate_to_where_header(const char* predicate_json,
+                                       char** out_header_name,
+                                       size_t* out_header_name_len,
+                                       char** out_value_ptr,
+                                       size_t* out_value_len);
+
+/* Validate a wire-format `CapabilitySet` against the canonical
+ * `AXIS_SCHEMA` (Phase 9a of CAPABILITY_SYSTEM_SDK_PLAN.md).
+ * Mirrors the SDK-layer `validate_capabilities` surface every
+ * binding ships, exposed at the C ABI for raw consumers
+ * (C / C++ / Zig / Swift / Java JNI / etc.).
+ *
+ * Input is a NUL-terminated UTF-8 JSON `CapabilitySet`:
+ *   {"tags": [...], "metadata": {...}}
+ *
+ * On success writes a JSON `ValidationReport` to `*out_report_json`
+ * / `*out_report_len`, free with `net_free_string`. Wire shape:
+ *   {
+ *     "errors":   [{"kind": "<unknown_axis|type_mismatch|index_malformed>", ...}, ...],
+ *     "warnings": [{"kind": "<unknown_key|metadata_oversize|legacy_tag>", ...}, ...]
+ *   }
+ *
+ * Both arrays are sorted by JSON-stringified entry so cross-
+ * binding fixture comparisons are order-independent.
+ *
+ * Returns:
+ *   0                       — success; report written.
+ *   NET_ERR_NULL_POINTER    — any pointer is NULL.
+ *   NET_ERR_INVALID_UTF8    — input bytes aren't valid UTF-8.
+ *   NET_ERR_INVALID_JSON    — input failed to parse as a
+ *                             CapabilitySet.
+ *
+ * Stateless. Thread-safe. Cross-binding compat pinned by
+ * `tests/cross_lang_capability/capability_validation.json`. */
+int      net_validate_capabilities(const char* caps_json,
+                                   char** out_report_json,
+                                   size_t* out_report_len);
+
+/* Predicate debug-session helpers (Phase 9d of
+ * CAPABILITY_SYSTEM_SDK_PLAN.md). Three pure helpers exposing
+ * what every binding ships at the SDK layer. Cross-binding
+ * contracts pinned by:
+ *   - tests/cross_lang_capability/predicate_trace.json
+ *   - tests/cross_lang_capability/predicate_debug_report.json
+ *   - tests/cross_lang_capability/predicate_debug_report_redacted.json
+ */
+
+/* Evaluate a predicate against (tags, metadata) and produce a
+ * `ClauseTrace` tree mirroring the AST that actually ran (And /
+ * Or short-circuits drop unevaluated siblings).
+ *
+ * Inputs (NUL-terminated UTF-8 JSON):
+ *   - predicate_json — wire-format `PredicateWire`.
+ *   - tags_json      — JSON array of tag strings.
+ *   - metadata_json  — JSON object of `string -> string`.
+ *
+ * Outputs:
+ *   - *out_result    — 1 if predicate matched, 0 otherwise.
+ *   - *out_trace_json/_len — JSON `{label, result, children}`
+ *     tree. Free with `net_free_string`.
+ *
+ * Returns 0 on success, NET_ERR_* (negative) otherwise. */
+int      net_predicate_evaluate_with_trace(const char* predicate_json,
+                                           const char* tags_json,
+                                           const char* metadata_json,
+                                           int* out_result,
+                                           char** out_trace_json,
+                                           size_t* out_trace_len);
+
+/* Run `predicate` against every entry in `contexts_json` and
+ * produce a `PredicateDebugReport` aggregated across the corpus.
+ *
+ * Inputs (NUL-terminated UTF-8 JSON):
+ *   - predicate_json — wire-format `PredicateWire`.
+ *   - contexts_json  — `[{"tags":[...], "metadata":{...}}, ...]`.
+ *
+ * Output: *out_report_json/_len — JSON
+ *   {
+ *     "total_candidates": N,
+ *     "matched": M,
+ *     "clause_stats": [{"label":..., "evaluated":..., "matched":...}, ...]
+ *   }
+ * `clause_stats` sorted by label (BTreeMap iteration order on
+ * the substrate side). Free with `net_free_string`.
+ *
+ * Returns 0 on success, NET_ERR_* (negative) otherwise. */
+int      net_predicate_aggregate_debug_report(const char* predicate_json,
+                                              const char* contexts_json,
+                                              char** out_report_json,
+                                              size_t* out_report_len);
+
+/* Rewrite metadata-clause labels in a `PredicateDebugReport` to
+ * scrub sensitive values before persistence / sharing. Pure
+ * host-side: the substrate doesn't ship a redaction impl; each
+ * binding implements it. This C ABI ports the same logic as TS /
+ * Python / Go.
+ *
+ * Rules:
+ *   MetadataEquals(<key>=<value>)            → MetadataEquals(<key>=<redacted>)
+ *   MetadataMatches(<key> contains "<pat>")  → MetadataMatches(<key> contains "<redacted>")
+ *   MetadataNumericAtLeast(<key> >= <thr>)   → MetadataNumericAtLeast(<key> >= <redacted>)
+ *   MetadataExists(<key>)                    — unchanged (no value)
+ *   non-metadata labels                      — unchanged
+ *
+ * Stats with the same redacted label merge; output is sorted by
+ * label. Idempotent: redact(redact(r,k),k) == redact(r,k).
+ *
+ * Inputs (NUL-terminated UTF-8 JSON):
+ *   - report_json — wire-format `PredicateDebugReport` (output
+ *     of net_predicate_aggregate_debug_report).
+ *   - keys_json   — `["api_key", "secret_token"]`.
+ *
+ * Output: *out_redacted_json/_len — same wire shape, free with
+ * `net_free_string`.
+ *
+ * Returns 0 on success, NET_ERR_* (negative) otherwise. */
+int      net_predicate_redact_metadata_keys(const char* report_json,
+                                            const char* keys_json,
+                                            char** out_redacted_json,
+                                            size_t* out_redacted_len);
+
 /* =========================================================================
  * Compute — MeshDaemon + migration. Stage 6 of
  * SDK_COMPUTE_SURFACE_PLAN.md. Symbols live in `libnet_compute`
@@ -796,6 +978,14 @@ typedef struct net_compute_cc_arc_s       net_compute_cc_arc_t;
 #define NET_COMPUTE_ERR_NULL            -1
 #define NET_COMPUTE_ERR_CALL_FAILED     -2
 #define NET_COMPUTE_ERR_DUPLICATE_KIND  -3
+/* `_register_placement_filter`-only — surfaces when the dispatcher
+ * hasn't been installed yet via
+ * `net_compute_set_placement_filter_dispatcher`. Documented at the
+ * call site below. */
+#define NET_COMPUTE_ERR_NO_DISPATCHER   -4
+/* `_register_placement_filter`-only — `id_ptr` bytes don't decode
+ * as UTF-8. Documented at the call site below. */
+#define NET_COMPUTE_ERR_INVALID_UTF8    -5
 
 /* --- Arc<MeshNode> / Arc<ChannelConfigRegistry> accessors ---
  *
@@ -880,7 +1070,7 @@ typedef struct net_compute_daemon_handle_s net_compute_daemon_handle_t;
 
 typedef int (*net_compute_process_fn)(
     uint64_t daemon_id,
-    uint32_t origin_hash,
+    uint64_t origin_hash,
     uint64_t sequence,
     const uint8_t* payload_ptr,
     size_t payload_len,
@@ -927,6 +1117,125 @@ int                     net_compute_outputs_push(
  * invoke this directly. */
 void                    net_compute_snapshot_bytes_free(uint8_t* ptr, size_t len);
 
+/* --- Daemon capability authoring (Phase 6 of
+ * CAPABILITY_SYSTEM_SDK_PLAN.md) ---
+ *
+ * Optional per-daemon capability declaration. Wires the
+ * substrate's `MeshDaemon::required_capabilities` /
+ * `optional_capabilities` (Phase G slice 2) through the C ABI.
+ *
+ * If the consumer never installs this dispatcher, daemons get
+ * empty cap sets — `StandardPlacement` treats them as "runs
+ * anywhere" and capability-driven placement decisions don't
+ * select for them. Consumers that DO install it can declare
+ * per-daemon caps so the in-tree axes (resource, intent,
+ * scope) and the hard-required check have something to work
+ * against.
+ *
+ * Wire shape: substrate calls back per `GoBridge` construction
+ * (both initial spawn AND migration-target reconstruction),
+ * passing the `daemon_id`. Consumer writes JSON-encoded
+ * `CapabilitySet`s ({tags: [...], metadata: {k:v}}) to the
+ * out-params. NULL out-pointer / zero len means "no caps
+ * declared for this side"; either side may be omitted
+ * independently. Buffers MUST be allocated via `C.malloc` /
+ * `libc::malloc` so Rust can release them via `libc::free`
+ * after parsing.
+ *
+ * Idempotent: invoked once per bridge construction, parsed once
+ * into a `CapabilitySet`, stored on the bridge for the daemon's
+ * lifetime. No re-call on event processing.
+ */
+
+typedef int (*net_compute_daemon_caps_fn)(
+    uint64_t daemon_id,
+    char** out_required_json, size_t* out_required_len,
+    char** out_optional_json, size_t* out_optional_len);
+
+/* Install the optional daemon-caps dispatcher. First-call-wins
+ * (matches `_set_dispatcher` semantics). Returns NET_COMPUTE_OK
+ * on success, NET_COMPUTE_ERR_NULL on NULL pointer. */
+int                     net_compute_set_daemon_caps_dispatcher(
+    net_compute_daemon_caps_fn dispatcher);
+
+/* --- Custom PlacementFilter callback (Phase 7 of
+ * CAPABILITY_SYSTEM_SDK_PLAN.md) ---
+ *
+ * Custom predicate hook for `StandardPlacement.custom_filter_id`.
+ * The substrate calls back into the consumer (Go / language X)
+ * once per candidate when scoring a placement decision. Return
+ * `1` keeps the candidate, `0` drops it, negative is treated as
+ * veto + the consumer is responsible for logging detail.
+ *
+ * Wire shape: substrate marshals each candidate as JSON
+ * `{"node_id": uint64, "tags": [string], "metadata": map}`
+ * — keeps the C ABI tight (one byte buffer per call) at the
+ * cost of a per-call serde roundtrip on the consumer side. The
+ * Go binding's reference impl (`bindings/go/net/placement.go`)
+ * decodes inside the trampoline before invoking the user
+ * predicate; non-Go consumers parse the JSON the same way. The
+ * filter id and JSON buffers are owned by Rust for the call's
+ * duration only — copy them on the consumer side if needed.
+ *
+ * Lifecycle: call `_set_placement_filter_dispatcher` ONCE at
+ * process init (first-call-wins; subsequent calls are no-ops).
+ * Then `_register_placement_filter(mesh_arc, id_ptr, id_len)`
+ * for each filter; daemons spec'd with the matching id route
+ * scoring through the dispatcher. Counter
+ * `dataforts_placement_callback_invocations_total{binding}`
+ * increments per scoring call (binding label set by the consumer
+ * SDK at register-time on the Rust side).
+ *
+ * Compatible with `_set_dispatcher` above — the placement filter
+ * dispatcher is independent. */
+
+typedef int (*net_compute_placement_filter_fn)(
+    const char* filter_id_ptr, size_t filter_id_len,
+    uint64_t node_id,
+    const char* candidate_json_ptr, size_t candidate_json_len);
+
+/* Install the consumer-side placement-filter trampoline. Idempotent
+ * after first success (matches `_set_dispatcher` semantics).
+ * Returns NET_COMPUTE_OK on success, NET_COMPUTE_ERR_NULL on NULL
+ * pointer. */
+int                     net_compute_set_placement_filter_dispatcher(
+    net_compute_placement_filter_fn dispatcher);
+
+/* Register a placement-filter id under `mesh_arc`. The Rust side
+ * looks up `*Arc<MeshNode>` so the filter can resolve the
+ * candidate's `CapabilitySet` from the local index when scoring.
+ * `mesh_arc` is NOT consumed — caller still owns it.
+ *
+ * Returns:
+ *   NET_COMPUTE_OK                — registered.
+ *   NET_COMPUTE_ERR_NULL          — `mesh_arc` or `id_ptr` NULL.
+ *   NET_COMPUTE_ERR_DUPLICATE_KIND — `id` already registered
+ *                                    (no-overwrite contract; SDKs
+ *                                    generate unique ids).
+ *   NET_COMPUTE_ERR_NO_DISPATCHER — dispatcher not yet installed
+ *                                  (call `_set_placement_filter_dispatcher`).
+ *   NET_COMPUTE_ERR_INVALID_UTF8  — `id_ptr` is not valid UTF-8.
+ *
+ * Existing `Arc<dyn PlacementFilter>` clones held by in-flight
+ * scoring calls keep the predicate alive until those calls
+ * finish; `_unregister` is safe to call concurrently. */
+int                     net_compute_register_placement_filter(
+    net_compute_mesh_arc_t* mesh_arc,
+    const char* id_ptr, size_t id_len);
+
+/* Drop the placement-filter registration under `id`.
+ *
+ * Returns 1 if `id` was registered, 0 otherwise.
+ * NET_COMPUTE_ERR_NULL on NULL / non-UTF-8 `id_ptr`. */
+int                     net_compute_unregister_placement_filter(
+    const char* id_ptr, size_t id_len);
+
+/* Whether `id` is currently registered. Diagnostic helper.
+ * Returns 1 if registered, 0 otherwise. NET_COMPUTE_ERR_NULL on
+ * NULL / non-UTF-8 `id_ptr`. */
+int                     net_compute_has_placement_filter(
+    const char* id_ptr, size_t id_len);
+
 /* --- Spawn / stop / deliver --- */
 
 /* Spawn a daemon. `daemon_id` is the Go-side registry key
@@ -946,7 +1255,7 @@ int                     net_compute_spawn(
     char** err_out);
 
 /* Read the origin_hash from a daemon handle. Returns 0 on NULL. */
-uint32_t                net_compute_daemon_handle_origin_hash(
+uint64_t                net_compute_daemon_handle_origin_hash(
     const net_compute_daemon_handle_t* handle);
 
 /* Copy the 32-byte entity_id from a daemon handle into `out`. */
@@ -962,7 +1271,7 @@ void                    net_compute_daemon_handle_free(
 /* Stop a daemon by origin_hash. */
 int                     net_compute_runtime_stop(
     net_compute_runtime_t* runtime,
-    uint32_t origin_hash,
+    uint64_t origin_hash,
     char** err_out);
 
 /* Deliver one event. Writes a heap-allocated outputs vec to
@@ -970,8 +1279,8 @@ int                     net_compute_runtime_stop(
  * and frees via `net_compute_outputs_free`. */
 int                     net_compute_runtime_deliver(
     net_compute_runtime_t* runtime,
-    uint32_t origin_hash,
-    uint32_t event_origin_hash,
+    uint64_t origin_hash,
+    uint64_t event_origin_hash,
     uint64_t event_sequence,
     const uint8_t* event_payload,
     size_t event_payload_len,
@@ -993,7 +1302,7 @@ void                    net_compute_outputs_free(net_compute_outputs_t* vec);
  * outputs vec, or an empty vec for stateless daemons. */
 int                     net_compute_runtime_snapshot(
     net_compute_runtime_t* runtime,
-    uint32_t origin_hash,
+    uint64_t origin_hash,
     net_compute_outputs_t** out_outputs,
     char** err_out);
 
@@ -1034,7 +1343,7 @@ typedef struct net_compute_migration_handle_s net_compute_migration_handle_t;
  * backs off + re-initiates on `NotReady` up to this budget. */
 int                     net_compute_start_migration(
     net_compute_runtime_t* runtime,
-    uint32_t origin_hash,
+    uint64_t origin_hash,
     uint64_t source_node,
     uint64_t target_node,
     uint8_t transport_identity,
@@ -1049,7 +1358,7 @@ int                     net_compute_expect_migration(
     net_compute_runtime_t* runtime,
     const char* kind_ptr,
     size_t kind_len,
-    uint32_t origin_hash,
+    uint64_t origin_hash,
     uint64_t auto_snapshot_interval,
     uint32_t max_log_entries,
     char** err_out);
@@ -1070,13 +1379,13 @@ int                     net_compute_register_migration_target_identity(
  * the caller frees with `net_compute_free_cstring`. */
 char*                   net_compute_migration_phase(
     net_compute_runtime_t* runtime,
-    uint32_t origin_hash);
+    uint64_t origin_hash);
 
 /* Free a migration handle. Does NOT cancel the migration. */
 void                    net_compute_migration_handle_free(
     net_compute_migration_handle_t* handle);
 
-uint32_t                net_compute_migration_handle_origin_hash(
+uint64_t                net_compute_migration_handle_origin_hash(
     const net_compute_migration_handle_t* handle);
 uint64_t                net_compute_migration_handle_source_node(
     const net_compute_migration_handle_t* handle);
@@ -1151,7 +1460,7 @@ int  net_compute_replica_group_health(
 int  net_compute_replica_group_route_event(
     const net_compute_replica_group_t* h,
     const char* routing_key_ptr, size_t routing_key_len,
-    uint32_t* out_origin, char** err_out);
+    uint64_t* out_origin, char** err_out);
 
 int  net_compute_replica_group_scale_to(
     const net_compute_replica_group_t* h,
@@ -1169,7 +1478,7 @@ char* net_compute_replica_group_members_json(
 int  net_compute_fork_group_spawn(
     net_compute_runtime_t* runtime,
     const char* kind_ptr, size_t kind_len,
-    uint32_t parent_origin,
+    uint64_t parent_origin,
     uint64_t fork_seq,
     uint32_t fork_count,
     const char* lb_strategy_ptr, size_t lb_strategy_len,
@@ -1181,7 +1490,7 @@ int  net_compute_fork_group_spawn(
 void net_compute_fork_group_free(net_compute_fork_group_t* h);
 int  net_compute_fork_group_fork_count(const net_compute_fork_group_t* h);
 int  net_compute_fork_group_healthy_count(const net_compute_fork_group_t* h);
-uint32_t net_compute_fork_group_parent_origin(const net_compute_fork_group_t* h);
+uint64_t net_compute_fork_group_parent_origin(const net_compute_fork_group_t* h);
 uint64_t net_compute_fork_group_fork_seq(const net_compute_fork_group_t* h);
 /* Returns 1 if every fork's lineage verifies, 0 otherwise. */
 int  net_compute_fork_group_verify_lineage(const net_compute_fork_group_t* h);
@@ -1209,7 +1518,7 @@ void net_compute_standby_group_free(net_compute_standby_group_t* h);
 int  net_compute_standby_group_member_count(const net_compute_standby_group_t* h);
 int  net_compute_standby_group_standby_count(const net_compute_standby_group_t* h);
 int  net_compute_standby_group_active_index(const net_compute_standby_group_t* h);
-uint32_t net_compute_standby_group_active_origin(const net_compute_standby_group_t* h);
+uint64_t net_compute_standby_group_active_origin(const net_compute_standby_group_t* h);
 int  net_compute_standby_group_active_healthy(const net_compute_standby_group_t* h);
 uint32_t net_compute_standby_group_group_id(const net_compute_standby_group_t* h);
 int  net_compute_standby_group_buffered_event_count(const net_compute_standby_group_t* h);
@@ -1219,7 +1528,7 @@ int  net_compute_standby_group_sync_standbys(
     uint64_t* out_through, char** err_out);
 int  net_compute_standby_group_promote(
     const net_compute_standby_group_t* h,
-    uint32_t* out_origin, char** err_out);
+    uint64_t* out_origin, char** err_out);
 void net_compute_standby_group_on_node_recovery(
     const net_compute_standby_group_t* h, uint64_t node_id);
 

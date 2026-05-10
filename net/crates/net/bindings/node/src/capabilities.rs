@@ -20,6 +20,7 @@ use net::adapter::net::behavior::capability::{
     HardwareCapabilities, Modality, ModelCapability, ResourceLimits, SoftwareCapabilities,
     ToolCapability,
 };
+use net::adapter::net::behavior::Tag;
 
 // =========================================================================
 // POJO types
@@ -231,9 +232,14 @@ fn gpu_info_from_js(g: GpuInfoJs) -> GpuInfo {
         info = info.with_tensor_cores(saturating_u16(tc));
     }
     if let Some(tf) = g.fp16_tflops_x10 {
-        // Core builder takes f32 TFLOPS; we accept the x10 integer to
-        // stay precision-friendly, so divide back when handing off.
-        info = info.with_fp16_tflops(tf as f32 / 10.0);
+        // CR-25: write the integer field directly. The
+        // `with_fp16_tflops(tf as f32 / 10.0)` round-trip used to
+        // re-multiply by 10 inside the builder, and f32's 24-bit
+        // mantissa loses precision for values > 16,777,216:
+        // tf=20_000_005 round-tripped to 20_000_004 or
+        // 20_000_008. Mirrors the model.parameters_b_x10 path
+        // which also writes the field directly.
+        info.fp16_tflops_x10 = tf;
     }
     info
 }
@@ -388,8 +394,16 @@ pub fn capability_set_from_js(caps: CapabilitySetJs) -> CapabilitySet {
     for t in caps.tools.unwrap_or_default() {
         cs = cs.add_tool(tool_from_js(t));
     }
+    // SDK consumers may supply reserved-prefix tags (`scope:*`,
+    // `causal:*`, …). `CapabilitySet::add_tag` routes through
+    // `Tag::parse_user`, which silently drops reserved prefixes —
+    // correct for application-facing input, wrong at the binding
+    // boundary where the JS caller is the SDK. Parse via the
+    // unrestricted `Tag::parse` and insert directly.
     for tag in caps.tags.unwrap_or_default() {
-        cs = cs.add_tag(tag);
+        if let Ok(t) = Tag::parse(&tag) {
+            cs.tags.insert(t);
+        }
     }
     if let Some(l) = caps.limits {
         cs = cs.with_limits(limits_from_js(l));

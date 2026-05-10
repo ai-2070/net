@@ -401,88 +401,207 @@ impl DiffEngine {
     pub fn diff(old: &CapabilitySet, new: &CapabilitySet) -> Vec<DiffOp> {
         let mut ops = Vec::new();
 
+        // Phase A.5.4: read both sides through views() once. Post
+        // Phase A.5.N (when the typed-struct fields are removed),
+        // this is the only seam this function will need to touch.
+        let old_views = old.views();
+        let new_views = new.views();
+
         // Diff tags
         Self::diff_tags(&old.tags, &new.tags, &mut ops);
 
         // Diff models
-        Self::diff_models(&old.models, &new.models, &mut ops);
+        Self::diff_models(old_views.models(), new_views.models(), &mut ops);
 
         // Diff tools
-        Self::diff_tools(&old.tools, &new.tools, &mut ops);
+        Self::diff_tools(old_views.tools(), new_views.tools(), &mut ops);
 
-        // Diff hardware (only if changed)
-        if old.hardware != new.hardware {
+        // Diff hardware (only if changed). Cache the projections
+        // since we read them repeatedly in the partial-update sentinels.
+        let old_hw = old_views.hardware();
+        let new_hw = new_views.hardware();
+        if old_hw != new_hw {
             // Check for partial updates
-            if old.hardware.memory_mb != new.hardware.memory_mb
-                && old.hardware.cpu_cores == new.hardware.cpu_cores
-                && old.hardware.gpu == new.hardware.gpu
-                && old.hardware.storage_mb == new.hardware.storage_mb
-                && old.hardware.network_mbps == new.hardware.network_mbps
+            if old_hw.memory_mb != new_hw.memory_mb
+                && old_hw.cpu_cores == new_hw.cpu_cores
+                && old_hw.gpu == new_hw.gpu
+                && old_hw.storage_mb == new_hw.storage_mb
+                && old_hw.network_mbps == new_hw.network_mbps
             {
-                ops.push(DiffOp::UpdateMemory(new.hardware.memory_mb));
-            } else if old.hardware.network_mbps != new.hardware.network_mbps
-                && old.hardware.cpu_cores == new.hardware.cpu_cores
-                && old.hardware.gpu == new.hardware.gpu
-                && old.hardware.memory_mb == new.hardware.memory_mb
-                && old.hardware.storage_mb == new.hardware.storage_mb
+                ops.push(DiffOp::UpdateMemory(new_hw.memory_mb));
+            } else if old_hw.network_mbps != new_hw.network_mbps
+                && old_hw.cpu_cores == new_hw.cpu_cores
+                && old_hw.gpu == new_hw.gpu
+                && old_hw.memory_mb == new_hw.memory_mb
+                && old_hw.storage_mb == new_hw.storage_mb
             {
-                ops.push(DiffOp::UpdateNetwork(new.hardware.network_mbps));
+                ops.push(DiffOp::UpdateNetwork(new_hw.network_mbps));
             } else {
-                ops.push(DiffOp::UpdateHardware(new.hardware.clone()));
+                ops.push(DiffOp::UpdateHardware(new_hw.clone()));
             }
         }
 
         // Diff software
-        if old.software != new.software {
-            Self::diff_software(&old.software, &new.software, &mut ops);
+        let old_sw = old_views.software();
+        let new_sw = new_views.software();
+        if old_sw != new_sw {
+            Self::diff_software(old_sw, new_sw, &mut ops);
         }
 
         // Diff limits (only if changed)
-        if old.limits != new.limits {
+        let old_limits = old_views.resource_limits();
+        let new_limits = new_views.resource_limits();
+        if old_limits != new_limits {
             // Check for partial updates
-            if old.limits.max_concurrent_requests != new.limits.max_concurrent_requests
-                && old.limits.max_tokens_per_request == new.limits.max_tokens_per_request
-                && old.limits.rate_limit_rpm == new.limits.rate_limit_rpm
-                && old.limits.max_batch_size == new.limits.max_batch_size
+            if old_limits.max_concurrent_requests != new_limits.max_concurrent_requests
+                && old_limits.max_tokens_per_request == new_limits.max_tokens_per_request
+                && old_limits.rate_limit_rpm == new_limits.rate_limit_rpm
+                && old_limits.max_batch_size == new_limits.max_batch_size
             {
                 ops.push(DiffOp::UpdateMaxConcurrent(
-                    new.limits.max_concurrent_requests,
+                    new_limits.max_concurrent_requests,
                 ));
-            } else if old.limits.rate_limit_rpm != new.limits.rate_limit_rpm
-                && old.limits.max_concurrent_requests == new.limits.max_concurrent_requests
-                && old.limits.max_tokens_per_request == new.limits.max_tokens_per_request
-                && old.limits.max_batch_size == new.limits.max_batch_size
+            } else if old_limits.rate_limit_rpm != new_limits.rate_limit_rpm
+                && old_limits.max_concurrent_requests == new_limits.max_concurrent_requests
+                && old_limits.max_tokens_per_request == new_limits.max_tokens_per_request
+                && old_limits.max_batch_size == new_limits.max_batch_size
             {
-                ops.push(DiffOp::UpdateRateLimit(new.limits.rate_limit_rpm));
+                ops.push(DiffOp::UpdateRateLimit(new_limits.rate_limit_rpm));
             } else {
-                ops.push(DiffOp::UpdateLimits(new.limits.clone()));
+                ops.push(DiffOp::UpdateLimits(new_limits.clone()));
             }
         }
 
         ops
     }
 
-    /// Diff tags between old and new
-    fn diff_tags(old: &[String], new: &[String], ops: &mut Vec<DiffOp>) {
-        let old_set: HashSet<&str> = old.iter().map(|s| s.as_str()).collect();
-        let new_set: HashSet<&str> = new.iter().map(|s| s.as_str()).collect();
+    /// Diff tags between old and new.
+    ///
+    /// Phase A.5.N.3: diffs only the *residual* tag set — tags not
+    /// claimed by the per-struct decoders. Axis-owned tags
+    /// (`hardware.*`, `software.*`, `software.model.*`,
+    /// `software.tool.*`, `hardware.limits.*`) are diffed via the
+    /// typed `UpdateHardware` / `UpdateSoftware` / `UpdateModel` /
+    /// `UpdateMemory` / etc. ops; emitting per-tag AddTag/RemoveTag
+    /// for them as well would double-count every change.
+    ///
+    /// Reserved-prefix tags (`scope:*`, `causal:*`) and legacy
+    /// untyped tags pass through here as AddTag/RemoveTag, since
+    /// no typed op carries them.
+    fn diff_tags(
+        old: &HashSet<crate::adapter::net::behavior::tag::Tag>,
+        new: &HashSet<crate::adapter::net::behavior::tag::Tag>,
+        ops: &mut Vec<DiffOp>,
+    ) {
+        use crate::adapter::net::behavior::tag::Tag;
+        use crate::adapter::net::behavior::tag_codec::{
+            hardware_from_tags, hardware_to_tags, models_from_tags, models_to_tags,
+            resource_limits_from_tags, resource_limits_to_tags, software_from_tags,
+            software_to_tags, tools_from_tags, tools_to_tags,
+        };
 
-        // Removed tags
-        for tag in old_set.difference(&new_set) {
-            ops.push(DiffOp::RemoveTag((*tag).to_string()));
+        // The set of tags the typed encoders ACTUALLY produce for
+        // a given input. Filter on this rather than the broader
+        // `is_*_owned_tag` predicates: those return true for every
+        // `hardware.*` / `software.*` tag including forward-compat
+        // unknowns (e.g. a peer-emitted `hardware.future_field` or
+        // `software.experimental_runtime=v1`) that the typed
+        // decoders silently drop. Without round-tripping, those
+        // unknowns get filtered out of the residual set yet aren't
+        // captured by any typed `Update*` op either — real changes
+        // disappear.
+        //
+        // The round-trip closure mirrors `set_*` mutators: a tag
+        // is "owned" iff re-encoding the decoded struct emits it
+        // again. Forward-compat tags (which the decoder ignores)
+        // therefore fall through to the residual diff and surface
+        // as `AddTag` / `RemoveTag` ops.
+        let owned = |tags: &HashSet<Tag>| -> HashSet<Tag> {
+            let v: Vec<Tag> = tags.iter().cloned().collect();
+            let mut out: HashSet<Tag> = HashSet::new();
+            out.extend(hardware_to_tags(&hardware_from_tags(&v)));
+            out.extend(software_to_tags(&software_from_tags(&v)));
+            out.extend(models_to_tags(&models_from_tags(&v)));
+            out.extend(tools_to_tags(&tools_from_tags(&v)));
+            out.extend(resource_limits_to_tags(&resource_limits_from_tags(&v)));
+            out
+        };
+        let old_owned = owned(old);
+        let new_owned = owned(new);
+
+        // Membership-by-axis-key, not exact `Tag` equality.
+        // `Tag::AxisValue` carries its `=` / `:` separator in the
+        // struct, and `Eq` compares it. The typed encoders emit
+        // canonical separators, so an input tag of
+        // `software.os:linux` (Colon) re-encodes to
+        // `software.os=linux` (Eq) — exact `HashSet::contains`
+        // misses, the colon form lands in the residual, and a
+        // `RemoveTag` ships without a compensating
+        // `UpdateSoftware` (the typed projections compare equal,
+        // since both decode to `os = "linux"`). Apply on the
+        // receiver then drops the tag entirely.
+        //
+        // Reduce to `(axis, key)` for the consumed check so the
+        // separator becomes irrelevant. Forward-compat tags keep
+        // working: their axis_key isn't in `*_owned_keys` (the
+        // encoders never emitted it), so they fall through to the
+        // residual diff exactly as before.
+        let consumed_axis_keys =
+            |owned: &HashSet<Tag>| -> HashSet<crate::adapter::net::behavior::tag::TagKey> {
+                owned.iter().filter_map(|t| t.axis_key()).collect()
+            };
+        let old_consumed = consumed_axis_keys(&old_owned);
+        let new_consumed = consumed_axis_keys(&new_owned);
+        let is_residual =
+            |t: &Tag, consumed: &HashSet<crate::adapter::net::behavior::tag::TagKey>| -> bool {
+                // Reserved/Legacy tags never have an axis_key; always
+                // residual. Axis-prefixed tags are residual iff their
+                // (axis, key) wasn't claimed by any typed encoder.
+                t.axis_key().is_none_or(|k| !consumed.contains(&k))
+            };
+        let old_residual: HashSet<&Tag> = old
+            .iter()
+            .filter(|t| is_residual(t, &old_consumed))
+            .collect();
+        let new_residual: HashSet<&Tag> = new
+            .iter()
+            .filter(|t| is_residual(t, &new_consumed))
+            .collect();
+
+        // Deterministic op order: HashSet iteration is randomized,
+        // so two senders with identical inputs would otherwise emit
+        // ops in different orders, breaking signed-envelope hashing
+        // (same class as 3291b2c2 fixed for tag emission). Sort the
+        // residual diffs by canonical wire string. See CR-4 in
+        // `CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md`.
+        let mut removed: Vec<String> = old_residual
+            .difference(&new_residual)
+            .map(|t| t.to_string())
+            .collect();
+        removed.sort();
+        let mut added: Vec<String> = new_residual
+            .difference(&old_residual)
+            .map(|t| t.to_string())
+            .collect();
+        added.sort();
+        for s in removed {
+            ops.push(DiffOp::RemoveTag(s));
         }
-
-        // Added tags
-        for tag in new_set.difference(&old_set) {
-            ops.push(DiffOp::AddTag((*tag).to_string()));
+        for s in added {
+            ops.push(DiffOp::AddTag(s));
         }
     }
 
     /// Diff models between old and new
     fn diff_models(old: &[ModelCapability], new: &[ModelCapability], ops: &mut Vec<DiffOp>) {
-        let old_map: std::collections::HashMap<&str, &ModelCapability> =
+        // BTreeMap (not HashMap) for deterministic op order: the
+        // emitted `Vec<DiffOp>` is hashed/signed by downstream
+        // consumers, and a HashMap iteration order would give
+        // identical inputs different ops sequences across runs.
+        // See CR-4 in `CODE_REVIEW_2026_05_10_CAPABILITY_SYSTEM_2.md`.
+        let old_map: std::collections::BTreeMap<&str, &ModelCapability> =
             old.iter().map(|m| (m.model_id.as_str(), m)).collect();
-        let new_map: std::collections::HashMap<&str, &ModelCapability> =
+        let new_map: std::collections::BTreeMap<&str, &ModelCapability> =
             new.iter().map(|m| (m.model_id.as_str(), m)).collect();
 
         // Removed models
@@ -538,9 +657,10 @@ impl DiffEngine {
 
     /// Diff tools between old and new
     fn diff_tools(old: &[ToolCapability], new: &[ToolCapability], ops: &mut Vec<DiffOp>) {
-        let old_map: std::collections::HashMap<&str, &ToolCapability> =
+        // BTreeMap for deterministic op order — see CR-4 / diff_models.
+        let old_map: std::collections::BTreeMap<&str, &ToolCapability> =
             old.iter().map(|t| (t.tool_id.as_str(), t)).collect();
-        let new_map: std::collections::HashMap<&str, &ToolCapability> =
+        let new_map: std::collections::BTreeMap<&str, &ToolCapability> =
             new.iter().map(|t| (t.tool_id.as_str(), t)).collect();
 
         // Removed tools
@@ -581,13 +701,14 @@ impl DiffEngine {
             return;
         }
 
-        // Diff runtimes
-        let old_runtimes: std::collections::HashMap<&str, &str> = old
+        // Diff runtimes — BTreeMap for deterministic op order
+        // (see CR-4 / diff_models).
+        let old_runtimes: std::collections::BTreeMap<&str, &str> = old
             .runtimes
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_str()))
             .collect();
-        let new_runtimes: std::collections::HashMap<&str, &str> = new
+        let new_runtimes: std::collections::BTreeMap<&str, &str> = new
             .runtimes
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_str()))
@@ -607,13 +728,13 @@ impl DiffEngine {
             }
         }
 
-        // Diff frameworks
-        let old_frameworks: std::collections::HashMap<&str, &str> = old
+        // Diff frameworks — BTreeMap for deterministic op order.
+        let old_frameworks: std::collections::BTreeMap<&str, &str> = old
             .frameworks
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_str()))
             .collect();
-        let new_frameworks: std::collections::HashMap<&str, &str> = new
+        let new_frameworks: std::collections::BTreeMap<&str, &str> = new
             .frameworks
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_str()))
@@ -736,29 +857,60 @@ impl DiffEngine {
 
     /// Apply a single diff operation
     fn apply_op(caps: &mut CapabilitySet, op: &DiffOp, strict: bool) -> Result<(), DiffError> {
+        // Phase A.5.6: every write goes through CapabilitySet's
+        // typed setters (`set_hardware` / `set_software` / `set_limits`
+        // / `set_models` / `set_tools`) instead of touching the typed
+        // struct fields directly. Partial-field updates use the
+        // read-modify-write idiom: pull the projection via `views()`,
+        // mutate the owned clone, then hand the whole thing back via
+        // the matching setter. Post-Phase-A.5.N (when typed fields
+        // are gone), the setter bodies re-encode into the underlying
+        // tag set; this function does not need to change again.
+        //
+        // `caps.tags` is a `HashSet<Tag>` (post Phase A.5.N.2);
+        // AddTag/RemoveTag wire payloads are still String, so we
+        // parse each one through `Tag::parse` (permissive — wire
+        // payloads come from peer nodes that are authoritative for
+        // the value). A malformed tag string is treated as "no-op"
+        // for AddTag and "not found" for RemoveTag.
         match op {
             DiffOp::AddTag(tag) => {
-                if !caps.tags.contains(tag) {
-                    caps.tags.push(tag.clone());
+                if let Ok(parsed) = crate::adapter::net::behavior::tag::Tag::parse(tag) {
+                    caps.tags.insert(parsed);
                 }
             }
             DiffOp::RemoveTag(tag) => {
-                if let Some(pos) = caps.tags.iter().position(|t| t == tag) {
-                    caps.tags.remove(pos);
-                } else if strict {
+                let parsed = match crate::adapter::net::behavior::tag::Tag::parse(tag) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        if strict {
+                            return Err(DiffError::TagNotFound(tag.clone()));
+                        }
+                        return Ok(());
+                    }
+                };
+                if !caps.tags.remove(&parsed) && strict {
                     return Err(DiffError::TagNotFound(tag.clone()));
                 }
             }
             DiffOp::AddModel(model) => {
                 // Remove existing model with same ID if present
-                caps.models.retain(|m| m.model_id != model.model_id);
-                caps.models.push(model.clone());
+                let mut models = caps.views().models().clone();
+                models.retain(|m| m.model_id != model.model_id);
+                models.push(model.clone());
+                caps.set_models(models);
             }
             DiffOp::RemoveModel(model_id) => {
-                let before = caps.models.len();
-                caps.models.retain(|m| m.model_id != *model_id);
-                if strict && caps.models.len() == before {
-                    return Err(DiffError::ModelNotFound(model_id.clone()));
+                let mut models = caps.views().models().clone();
+                let before = models.len();
+                models.retain(|m| m.model_id != *model_id);
+                if models.len() == before {
+                    if strict {
+                        return Err(DiffError::ModelNotFound(model_id.clone()));
+                    }
+                    // No-op; skip the redundant set_models clone.
+                } else {
+                    caps.set_models(models);
                 }
             }
             DiffOp::UpdateModel {
@@ -766,75 +918,101 @@ impl DiffEngine {
                 tokens_per_sec,
                 loaded,
             } => {
-                if let Some(model) = caps.models.iter_mut().find(|m| m.model_id == *model_id) {
+                let mut models = caps.views().models().clone();
+                if let Some(model) = models.iter_mut().find(|m| m.model_id == *model_id) {
                     if let Some(tps) = tokens_per_sec {
                         model.tokens_per_sec = *tps;
                     }
                     if let Some(l) = loaded {
                         model.loaded = *l;
                     }
+                    caps.set_models(models);
                 } else if strict {
                     return Err(DiffError::ModelNotFound(model_id.clone()));
                 }
             }
             DiffOp::AddTool(tool) => {
-                // Remove existing tool with same ID if present
-                caps.tools.retain(|t| t.tool_id != tool.tool_id);
-                caps.tools.push(tool.clone());
+                let mut tools = caps.views().tools().clone();
+                tools.retain(|t| t.tool_id != tool.tool_id);
+                tools.push(tool.clone());
+                caps.set_tools(tools);
             }
             DiffOp::RemoveTool(tool_id) => {
-                let before = caps.tools.len();
-                caps.tools.retain(|t| t.tool_id != *tool_id);
-                if strict && caps.tools.len() == before {
-                    return Err(DiffError::ToolNotFound(tool_id.clone()));
+                let mut tools = caps.views().tools().clone();
+                let before = tools.len();
+                tools.retain(|t| t.tool_id != *tool_id);
+                if tools.len() == before {
+                    if strict {
+                        return Err(DiffError::ToolNotFound(tool_id.clone()));
+                    }
+                } else {
+                    caps.set_tools(tools);
                 }
             }
             DiffOp::UpdateHardware(hw) => {
-                caps.hardware = hw.clone();
+                caps.set_hardware(hw.clone());
             }
             DiffOp::UpdateMemory(mem) => {
-                caps.hardware.memory_mb = *mem;
+                let mut hw = caps.views().hardware().clone();
+                hw.memory_mb = *mem;
+                caps.set_hardware(hw);
             }
             DiffOp::UpdateNetwork(net) => {
-                caps.hardware.network_mbps = *net;
+                let mut hw = caps.views().hardware().clone();
+                hw.network_mbps = *net;
+                caps.set_hardware(hw);
             }
             DiffOp::UpdateSoftware(sw) => {
-                caps.software = sw.clone();
+                caps.set_software(sw.clone());
             }
             DiffOp::AddRuntime { name, version } => {
-                // Remove existing runtime with same name
-                caps.software.runtimes.retain(|(n, _)| n != name);
-                caps.software.runtimes.push((name.clone(), version.clone()));
+                let mut sw = caps.views().software().clone();
+                sw.runtimes.retain(|(n, _)| n != name);
+                sw.runtimes.push((name.clone(), version.clone()));
+                caps.set_software(sw);
             }
             DiffOp::RemoveRuntime(name) => {
-                let before = caps.software.runtimes.len();
-                caps.software.runtimes.retain(|(n, _)| n != name);
-                if strict && caps.software.runtimes.len() == before {
-                    return Err(DiffError::RuntimeNotFound(name.clone()));
+                let mut sw = caps.views().software().clone();
+                let before = sw.runtimes.len();
+                sw.runtimes.retain(|(n, _)| n != name);
+                if sw.runtimes.len() == before {
+                    if strict {
+                        return Err(DiffError::RuntimeNotFound(name.clone()));
+                    }
+                } else {
+                    caps.set_software(sw);
                 }
             }
             DiffOp::AddFramework { name, version } => {
-                // Remove existing framework with same name
-                caps.software.frameworks.retain(|(n, _)| n != name);
-                caps.software
-                    .frameworks
-                    .push((name.clone(), version.clone()));
+                let mut sw = caps.views().software().clone();
+                sw.frameworks.retain(|(n, _)| n != name);
+                sw.frameworks.push((name.clone(), version.clone()));
+                caps.set_software(sw);
             }
             DiffOp::RemoveFramework(name) => {
-                let before = caps.software.frameworks.len();
-                caps.software.frameworks.retain(|(n, _)| n != name);
-                if strict && caps.software.frameworks.len() == before {
-                    return Err(DiffError::FrameworkNotFound(name.clone()));
+                let mut sw = caps.views().software().clone();
+                let before = sw.frameworks.len();
+                sw.frameworks.retain(|(n, _)| n != name);
+                if sw.frameworks.len() == before {
+                    if strict {
+                        return Err(DiffError::FrameworkNotFound(name.clone()));
+                    }
+                } else {
+                    caps.set_software(sw);
                 }
             }
             DiffOp::UpdateLimits(limits) => {
-                caps.limits = limits.clone();
+                caps.set_limits(limits.clone());
             }
             DiffOp::UpdateMaxConcurrent(max) => {
-                caps.limits.max_concurrent_requests = *max;
+                let mut limits = caps.views().resource_limits().clone();
+                limits.max_concurrent_requests = *max;
+                caps.set_limits(limits);
             }
             DiffOp::UpdateRateLimit(rpm) => {
-                caps.limits.rate_limit_rpm = *rpm;
+                let mut limits = caps.views().resource_limits().clone();
+                limits.rate_limit_rpm = *rpm;
+                caps.set_limits(limits);
             }
             DiffOp::SetField { path, .. } | DiffOp::UnsetField { path } => {
                 // SetField/UnsetField are unimplemented — the
@@ -1009,6 +1187,59 @@ mod tests {
             .with_limits(ResourceLimits::new().with_max_concurrent(10))
     }
 
+    /// Regression for CR-4: diff op order must be deterministic
+    /// across runs. Previously `diff_tags` iterated `HashSet`
+    /// difference and `diff_models` / `diff_tools` / `diff_software`
+    /// iterated `HashMap`s — both have randomized order, so two
+    /// senders with identical inputs (or one sender retrying) would
+    /// emit ops in different orders, breaking signed-envelope
+    /// hashing. Run the diff multiple times and pin equality.
+    #[test]
+    fn diff_op_order_is_stable_across_runs() {
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        use crate::adapter::net::behavior::tag::Tag;
+
+        // Many residual tags so any HashSet iteration randomness
+        // is overwhelmingly likely to surface across 64 runs.
+        let mut old = CapabilitySet::new();
+        let mut new = CapabilitySet::new();
+        for i in 0..16 {
+            old.tags
+                .insert(Tag::parse(&format!("legacy-old-{i}")).unwrap());
+            new.tags
+                .insert(Tag::parse(&format!("legacy-new-{i}")).unwrap());
+        }
+
+        // Multiple models in both sides exercise diff_models.
+        for i in 0..8 {
+            let m = ModelCapability::new(format!("model-{i}"), "llama").with_tokens_per_sec(50);
+            old = old.add_model(m.clone());
+            // Skip every other model in `new` so removed-models is
+            // exercised; modify the rest so updates are exercised.
+            if i % 2 == 0 {
+                new = new.add_model(m.with_tokens_per_sec(60));
+            }
+        }
+
+        // Multiple tools.
+        for i in 0..8 {
+            let t = ToolCapability::new(format!("tool-{i}"), format!("Tool {i}"));
+            old = old.add_tool(t.clone());
+            if i % 3 != 0 {
+                new = new.add_tool(t);
+            }
+        }
+
+        let baseline = DiffEngine::diff(&old, &new);
+        for run in 0..64 {
+            let next = DiffEngine::diff(&old, &new);
+            assert_eq!(
+                baseline, next,
+                "run {run}: diff op order differed across runs"
+            );
+        }
+    }
+
     #[test]
     fn test_diff_no_changes() {
         let caps = sample_capability_set();
@@ -1020,7 +1251,7 @@ mod tests {
     fn test_diff_add_tag() {
         let old = sample_capability_set();
         let mut new = old.clone();
-        new.tags.push("training".into());
+        new = new.add_tag("training");
 
         let ops = DiffEngine::diff(&old, &new);
         assert_eq!(ops.len(), 1);
@@ -1031,18 +1262,142 @@ mod tests {
     fn test_diff_remove_tag() {
         let old = sample_capability_set();
         let mut new = old.clone();
-        new.tags.retain(|t| t != "inference");
+        // Phase A.5.N.2: tags is HashSet<Tag>. Remove the legacy
+        // "inference" tag by re-parsing it and calling HashSet::remove.
+        let inference =
+            crate::adapter::net::behavior::tag::Tag::parse("inference").expect("legacy tag parse");
+        new.tags.remove(&inference);
 
         let ops = DiffEngine::diff(&old, &new);
         assert_eq!(ops.len(), 1);
         assert!(matches!(&ops[0], DiffOp::RemoveTag(t) if t == "inference"));
     }
 
+    /// Regression: forward-compatible axis-prefixed tags that the
+    /// typed decoders silently ignore (e.g. a peer-emitted
+    /// `hardware.future_field=v2`) used to be filtered as
+    /// "axis-owned" by `is_*_owned_tag`, removed from the residual
+    /// diff, AND ignored by every typed `Update*` op — real
+    /// changes disappeared. The fix uses the round-trip closure
+    /// (`*_to_tags(&*_from_tags(...))`) to identify what's
+    /// actually consumed by the typed encoders, so unknowns fall
+    /// through to AddTag / RemoveTag.
+    #[test]
+    fn diff_emits_addtag_removetag_for_forward_compat_axis_tags() {
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        use crate::adapter::net::behavior::tag::Tag;
+
+        let make = |raw: &str| Tag::parse(raw).expect("tag parses");
+
+        // Forward-compat axis tag added across the diff. Neither
+        // side carries any other axis-relevant content, so the
+        // typed encoders produce empty closures and the residual
+        // diff sees the tag exactly once.
+        let old = CapabilitySet::new();
+        let mut new = CapabilitySet::new();
+        new.tags.insert(make("hardware.future_field=v2"));
+
+        let ops = DiffEngine::diff(&old, &new);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, DiffOp::AddTag(t) if t == "hardware.future_field=v2")),
+            "expected AddTag(hardware.future_field=v2) for forward-compat axis tag, got {:?}",
+            ops,
+        );
+
+        // Symmetric: forward-compat tag removed.
+        let mut old = CapabilitySet::new();
+        old.tags.insert(make("software.experimental_runtime=v1"));
+        let new = CapabilitySet::new();
+
+        let ops = DiffEngine::diff(&old, &new);
+        assert!(
+            ops.iter().any(
+                |op| matches!(op, DiffOp::RemoveTag(t) if t == "software.experimental_runtime=v1")
+            ),
+            "expected RemoveTag(software.experimental_runtime=v1), got {:?}",
+            ops,
+        );
+
+        // Negative control: a known hardware key (encoded by
+        // `hardware_to_tags`) still routes through `UpdateHardware`,
+        // not through AddTag. The fix doesn't double-emit.
+        let old = CapabilitySet::new();
+        let new = CapabilitySet::new().with_hardware(
+            crate::adapter::net::behavior::capability::HardwareCapabilities::new()
+                .with_memory(65_536),
+        );
+        let ops = DiffEngine::diff(&old, &new);
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, DiffOp::AddTag(t) if t.starts_with("hardware.memory_mb"))),
+            "known hardware keys must not double-emit as AddTag — got {:?}",
+            ops,
+        );
+    }
+
+    /// Regression: an axis tag whose separator differs from the
+    /// canonical form emitted by the typed encoder (e.g. an input
+    /// `software.os:linux` with `:` separator vs. the encoder's
+    /// `software.os=linux` with `=`) used to be missed by exact
+    /// `HashSet::contains` membership. Result: the colon-form
+    /// landed in the residual and shipped as `RemoveTag` even
+    /// though the typed projections (`SoftwareCapabilities`)
+    /// compared equal — so no compensating `UpdateSoftware` op
+    /// rode along. Apply on the receiver dropped the tag entirely.
+    /// The fix tests membership by `(axis, key)` so the separator
+    /// is irrelevant.
+    #[test]
+    fn diff_does_not_remove_axis_tag_when_only_separator_differs() {
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        use crate::adapter::net::behavior::tag::Tag;
+
+        // Both sides decode to `SoftwareCapabilities { os: "linux", … }`.
+        // The only on-wire difference is the separator. No typed
+        // change → no `UpdateSoftware`; no residual change should
+        // ship either.
+        let mut old = CapabilitySet::new();
+        old.tags
+            .insert(Tag::parse("software.os:linux").expect("parse colon form"));
+        let mut new = CapabilitySet::new();
+        new.tags
+            .insert(Tag::parse("software.os=linux").expect("parse eq form"));
+
+        let ops = DiffEngine::diff(&old, &new);
+        assert!(
+            !ops.iter().any(|op| matches!(op, DiffOp::RemoveTag(_))),
+            "no `RemoveTag` should be emitted for canonical-separator-only differences — got {:?}",
+            ops,
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, DiffOp::AddTag(_))),
+            "no `AddTag` either — the typed `UpdateSoftware` path owns the change — got {:?}",
+            ops,
+        );
+
+        // End-to-end safety: applying the diff to `old` must NOT
+        // strip the `os=linux` data. Round-trip through the typed
+        // projection.
+        let mut applied = old.clone();
+        for op in &ops {
+            DiffEngine::apply_op(&mut applied, op, false).expect("apply succeeds");
+        }
+        let applied_sw =
+            crate::adapter::net::behavior::capability::SoftwareCapabilities::from(&applied);
+        assert_eq!(
+            applied_sw.os, "linux",
+            "`os=linux` data must survive a separator-only diff round-trip — applied caps = {applied:?}",
+        );
+    }
+
     #[test]
     fn test_diff_update_model_loaded() {
         let old = sample_capability_set();
+        // Phase A.5.N.3: read models via views(), mutate, set_models.
+        let mut models = old.views().models().clone();
+        models[0].loaded = false;
         let mut new = old.clone();
-        new.models[0].loaded = false;
+        new.set_models(models);
 
         let ops = DiffEngine::diff(&old, &new);
         assert_eq!(ops.len(), 1);
@@ -1055,8 +1410,7 @@ mod tests {
     #[test]
     fn test_diff_add_model() {
         let old = sample_capability_set();
-        let mut new = old.clone();
-        new.models.push(
+        let new = old.clone().add_model(
             ModelCapability::new("mistral-7b", "mistral")
                 .with_parameters(7.0)
                 .add_modality(Modality::Text),
@@ -1071,7 +1425,9 @@ mod tests {
     fn test_diff_update_memory() {
         let old = sample_capability_set();
         let mut new = old.clone();
-        new.hardware.memory_mb = 131072;
+        let mut hw = new.views().hardware().clone();
+        hw.memory_mb = 131072;
+        new.set_hardware(hw);
 
         let ops = DiffEngine::diff(&old, &new);
         assert_eq!(ops.len(), 1);
@@ -1095,7 +1451,7 @@ mod tests {
         let new = DiffEngine::apply(&old, &diff, true).unwrap();
 
         assert!(new.has_tag("training"));
-        assert_eq!(new.hardware.memory_mb, 131072);
+        assert_eq!(new.views().hardware().memory_mb, 131072);
     }
 
     #[test]
@@ -1158,13 +1514,26 @@ mod tests {
         let old = sample_capability_set();
         let mut new = old.clone();
 
-        // Make several changes
-        new.tags.push("training".into());
-        new.tags.retain(|t| t != "inference");
-        new.models[0].loaded = false;
-        new.models[0].tokens_per_sec = 100;
-        new.hardware.memory_mb = 131072;
-        new.models.push(
+        // Make several changes. Phase A.5.N.3: every write goes
+        // through the typed setters / add_*; reads through views().
+        new = new.add_tag("training");
+        let inference =
+            crate::adapter::net::behavior::tag::Tag::parse("inference").expect("legacy tag parse");
+        new.tags.remove(&inference);
+
+        // Tweak the first existing model: loaded=false + new throughput.
+        let mut models = new.views().models().clone();
+        models[0].loaded = false;
+        models[0].tokens_per_sec = 100;
+        new.set_models(models);
+
+        // Bump memory.
+        let mut hw = new.views().hardware().clone();
+        hw.memory_mb = 131072;
+        new.set_hardware(hw);
+
+        // Add a second model.
+        new = new.add_model(
             ModelCapability::new("mistral-7b", "mistral")
                 .with_parameters(7.0)
                 .add_modality(Modality::Text),
@@ -1180,11 +1549,11 @@ mod tests {
         // Verify
         assert!(applied.has_tag("training"));
         assert!(!applied.has_tag("inference"));
-        assert_eq!(applied.hardware.memory_mb, 131072);
-        assert_eq!(applied.models.len(), 2);
+        let v = applied.views();
+        assert_eq!(v.hardware().memory_mb, 131072);
+        assert_eq!(v.models().len(), 2);
         assert!(
-            !applied
-                .models
+            !v.models()
                 .iter()
                 .find(|m| m.model_id == "llama-3.1-70b")
                 .unwrap()
@@ -1441,7 +1810,7 @@ mod tests {
             .expect("non-strict apply preserves the historic no-op");
         // No mutation expected — caps unchanged.
         assert_eq!(result.tags, caps.tags);
-        assert_eq!(result.hardware, caps.hardware);
+        assert_eq!(result.views().hardware(), caps.views().hardware());
     }
 
     // ========================================================================

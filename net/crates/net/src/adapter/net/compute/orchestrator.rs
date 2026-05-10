@@ -1232,8 +1232,15 @@ impl MigrationOrchestrator {
         // "target node 0x0 unavailable" to operators — confusing
         // because no specific node id was ever attempted; the
         // auto-placement found nobody to attempt against.
+        // Phase G slice 8 — auto-target migration runs through v2
+        // placement by default. Ranking flows via
+        // `select_migration_target` + LOCKED §7 tie-breaker;
+        // observable eligibility matches v1 because v2 wraps
+        // `LegacyPlacement::permissive`. The legacy
+        // `Scheduler::place_migration` is still available for
+        // callers who explicitly want the v1 contract.
         let placement = scheduler
-            .place_migration(daemon_filter, source_node)
+            .place_migration_v2(daemon_filter, source_node)
             .map_err(|_| MigrationError::NoTargetAvailable)?;
 
         let target_node = placement.node_id;

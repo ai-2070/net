@@ -1,0 +1,187 @@
+{
+  "description": "Cross-binding pin for `Predicate::evaluate_with_trace(ctx)` — the cost-ordered, short-circuiting trace evaluator. Each case carries a `wire` predicate plus a `tags` + `metadata` evaluation context, the `expected_result` boolean, and the `expected_trace` tree (`{label, result, children}`). Bindings re-implement `evaluate_with_trace` over the wire format and assert byte-identical traces. See README.md.",
+  "abi_version_expected": 1,
+  "cases": [
+    {
+      "name": "exists_leaf_hit",
+      "summary": "Single AxisPresent leaf — tag in set; trace is a leaf with empty children.",
+      "wire": {
+        "nodes": [{ "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } }],
+        "root_idx": 0
+      },
+      "tags": ["hardware.gpu"],
+      "metadata": {},
+      "expected_result": true,
+      "expected_trace": {
+        "label": "Exists(hardware.gpu)",
+        "result": true,
+        "children": []
+      }
+    },
+    {
+      "name": "exists_leaf_miss",
+      "summary": "Single AxisPresent leaf — tag absent; result false, trace label same.",
+      "wire": {
+        "nodes": [{ "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } }],
+        "root_idx": 0
+      },
+      "tags": [],
+      "metadata": {},
+      "expected_result": false,
+      "expected_trace": {
+        "label": "Exists(hardware.gpu)",
+        "result": false,
+        "children": []
+      }
+    },
+    {
+      "name": "metadata_equals_leaf_hit",
+      "summary": "MetadataEquals leaf hit. Label format `MetadataEquals(<key>=<value>)`.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_equals", "key": "intent", "value": "ml-training" }
+        ],
+        "root_idx": 0
+      },
+      "tags": [],
+      "metadata": { "intent": "ml-training" },
+      "expected_result": true,
+      "expected_trace": {
+        "label": "MetadataEquals(intent=ml-training)",
+        "result": true,
+        "children": []
+      }
+    },
+    {
+      "name": "and_short_circuits_on_first_false",
+      "summary": "And with a cheap false leaf followed by an expensive leaf — trace records the failing child only; the expensive sibling never ran.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_equals", "key": "intent", "value": "ml-training" },
+          {
+            "kind": "semver_compatible",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.11.0"
+          },
+          { "kind": "and", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      },
+      "tags": ["software.runtime.python=3.11.5"],
+      "metadata": {},
+      "expected_result": false,
+      "expected_trace": {
+        "label": "And(2 clauses)",
+        "result": false,
+        "children": [
+          {
+            "label": "MetadataEquals(intent=ml-training)",
+            "result": false,
+            "children": []
+          }
+        ]
+      }
+    },
+    {
+      "name": "and_runs_all_when_no_short_circuit",
+      "summary": "And in cost-ascending order (planner reorders); both children true so the trace covers both.",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          { "kind": "metadata_exists", "key": "intent" },
+          { "kind": "and", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      },
+      "tags": ["hardware.gpu"],
+      "metadata": { "intent": "ml-training" },
+      "expected_result": true,
+      "expected_trace": {
+        "label": "And(2 clauses)",
+        "result": true,
+        "children": [
+          {
+            "label": "MetadataExists(intent)",
+            "result": true,
+            "children": []
+          },
+          { "label": "Exists(hardware.gpu)", "result": true, "children": [] }
+        ]
+      }
+    },
+    {
+      "name": "or_short_circuits_on_first_true",
+      "summary": "Or — cheap leaf true, expensive sibling not in trace.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_exists", "key": "intent" },
+          {
+            "kind": "semver_compatible",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.11.0"
+          },
+          { "kind": "or", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      },
+      "tags": [],
+      "metadata": { "intent": "ml-training" },
+      "expected_result": true,
+      "expected_trace": {
+        "label": "Or(2 clauses)",
+        "result": true,
+        "children": [
+          {
+            "label": "MetadataExists(intent)",
+            "result": true,
+            "children": []
+          }
+        ]
+      }
+    },
+    {
+      "name": "or_runs_all_when_no_short_circuit",
+      "summary": "Or with all children false — every child appears in the trace.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_exists", "key": "intent" },
+          { "kind": "exists", "key": { "axis": "hardware", "key": "tpu" } },
+          { "kind": "or", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      },
+      "tags": [],
+      "metadata": {},
+      "expected_result": false,
+      "expected_trace": {
+        "label": "Or(2 clauses)",
+        "result": false,
+        "children": [
+          { "label": "MetadataExists(intent)", "result": false, "children": [] },
+          { "label": "Exists(hardware.tpu)", "result": false, "children": [] }
+        ]
+      }
+    },
+    {
+      "name": "not_inverts_inner",
+      "summary": "Not has a single child carrying the pre-negation result; outer label is `Not` (no parens).",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          { "kind": "not", "child": 0 }
+        ],
+        "root_idx": 1
+      },
+      "tags": [],
+      "metadata": {},
+      "expected_result": true,
+      "expected_trace": {
+        "label": "Not",
+        "result": true,
+        "children": [
+          { "label": "Exists(hardware.gpu)", "result": false, "children": [] }
+        ]
+      }
+    }
+  ]
+}

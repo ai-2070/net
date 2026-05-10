@@ -19,7 +19,7 @@
 // difference is the `const` qualifier on the pointer parameters,
 // which has no ABI impact.
 
-int bridgeProcess(uint64_t daemon_id, uint32_t origin_hash, uint64_t sequence,
+int bridgeProcess(uint64_t daemon_id, uint64_t origin_hash, uint64_t sequence,
                   const uint8_t* payload, size_t payload_len,
                   net_compute_outputs_t* outputs) {
     return goComputeProcess(daemon_id, origin_hash, sequence,

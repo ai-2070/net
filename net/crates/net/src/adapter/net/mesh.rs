@@ -5912,9 +5912,10 @@ impl MeshNode {
             let mut merged = caps;
             for svc in self.rpc_local_services.iter() {
                 let tag = format!("nrpc:{}", svc.as_str());
-                if !merged.tags.iter().any(|t| t == &tag) {
-                    merged.tags.push(tag);
-                }
+                // Phase A.5.N.2: tags is HashSet<Tag>; insert via
+                // builder so the parsed-tag form lands and dedupes
+                // against existing entries.
+                merged = merged.add_tag(tag);
             }
             merged
         };
@@ -5945,9 +5946,12 @@ impl MeshNode {
             let reflex = self.reflex_addr.load_full().map(|arc| *arc);
             // Strip any prior `nat:*` tags before adding the fresh
             // one so a reclassification doesn't leave a stale tag
-            // behind when the class transitions.
+            // behind when the class transitions. Phase A.5.N.2:
+            // `caps.tags` is `HashSet<Tag>` — `nat:*` tags parse
+            // as `Tag::Legacy`, so we render to wire form for
+            // prefix matching.
             let mut next = caps;
-            next.tags.retain(|t| !t.starts_with("nat:"));
+            next.tags.retain(|t| !t.to_string().starts_with("nat:"));
             let next = next.add_tag(class.tag().to_string());
             (next, reflex)
         };
@@ -6096,7 +6100,9 @@ impl MeshNode {
             return NatClass::Unknown;
         };
         for tag in caps.tags.iter() {
-            if let Some(class) = NatClass::from_tag(tag) {
+            // Phase A.5.N.2: tags is HashSet<Tag>; render to wire
+            // form for the string-keyed NAT-class match.
+            if let Some(class) = NatClass::from_tag(&tag.to_string()) {
                 return class;
             }
         }

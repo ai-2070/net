@@ -423,7 +423,7 @@ type TasksAdapter struct {
 
 // OpenTasks opens the tasks adapter against a Redex. `persistent`
 // routes writes through the Redex's persistent directory.
-func OpenTasks(redex *Redex, originHash uint32, persistent bool) (*TasksAdapter, error) {
+func OpenTasks(redex *Redex, originHash uint64, persistent bool) (*TasksAdapter, error) {
 	var p C.int
 	if persistent {
 		p = 1
@@ -436,7 +436,7 @@ func OpenTasks(redex *Redex, originHash uint32, persistent bool) (*TasksAdapter,
 		return nil, ErrShuttingDown
 	}
 	var out *C.net_tasks_adapter_t
-	code := C.net_tasks_adapter_open(redex.handle, C.uint32_t(originHash), p, &out)
+	code := C.net_tasks_adapter_open(redex.handle, C.uint64_t(originHash), p, &out)
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -701,7 +701,7 @@ type MemoriesAdapter struct {
 	handle *C.net_memories_adapter_t
 }
 
-func OpenMemories(redex *Redex, originHash uint32, persistent bool) (*MemoriesAdapter, error) {
+func OpenMemories(redex *Redex, originHash uint64, persistent bool) (*MemoriesAdapter, error) {
 	var p C.int
 	if persistent {
 		p = 1
@@ -712,7 +712,7 @@ func OpenMemories(redex *Redex, originHash uint32, persistent bool) (*MemoriesAd
 		return nil, ErrShuttingDown
 	}
 	var out *C.net_memories_adapter_t
-	code := C.net_memories_adapter_open(redex.handle, C.uint32_t(originHash), p, &out)
+	code := C.net_memories_adapter_open(redex.handle, C.uint64_t(originHash), p, &out)
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}

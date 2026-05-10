@@ -8,8 +8,11 @@ Latest release: [v0.10 — "Killing Moon" Phase III](../docs/RELEASE_v0.10_KILLI
 
 ## Files
 
-- `net.h` — the header
-- `libnet.so` (Linux) / `libnet.dylib` (macOS) / `net.dll` (Windows) — the library
+- `net.h` — narrow event-bus surface (init / ingest / poll / stats / shutdown). Uses the `NET_SDK_H` include guard.
+- `net.go.h` — broader mesh + compute surface (sessions, channels, capabilities, NAT, daemon dispatch, custom placement filters, daemon caps, predicate helpers, capability validation, predicate debug session). In-crate mirror of [`go/net.h`](../../../../go/net.h) at the repo root. Also uses `NET_SDK_H` and overlaps with the event-bus surface from `net.h`, but it is **not** a strict superset (`net_ingest_raw_ex`, `net_poll_ex`, and `net_stats_ex` are still `net.h`-only). Pick **one** of `net.h` or `net.go.h` per translation unit based on the symbols you need; if you need both surfaces in the same program, split across translation units.
+- `net_rpc.h` — nRPC C SDK (request/response surface for the separate `libnet_rpc` cdylib). Independent header guard (`NET_RPC_H`); composes cleanly alongside whichever of `net.h` / `net.go.h` you chose.
+- Libraries: `libnet.{so,dylib,dll}` (main) + `libnet_compute.{so,dylib,dll}` (compute) + `libnet_rpc.{so,dylib,dll}` (nRPC). Build with `cargo build --release --features ffi,net` for `libnet`; `-p net-compute-ffi` and `-p net-rpc-ffi` for the others.
+- Examples: `examples/basic.c` (event-bus quickstart) + `examples/capability.c` (stateless capability / predicate / where-header helpers).
 
 ## Build
 
@@ -300,6 +303,12 @@ net_mesh_shutdown(mesh);
 | Streams | `net_mesh_open_stream`, `net_mesh_send`, `net_mesh_send_with_retry`, `net_mesh_send_blocking`, `net_mesh_stream_stats`, `net_mesh_recv_shard` | Per-peer ordered byte streams. |
 | Channels | `net_mesh_register_channel`, `net_mesh_subscribe_channel`, `net_mesh_subscribe_channel_with_token`, `net_mesh_unsubscribe_channel`, `net_mesh_publish` | Topic-based pub/sub over the mesh. |
 | Capabilities | `net_mesh_announce_capabilities`, `net_mesh_find_nodes`, `net_mesh_find_nodes_scoped`, `net_mesh_find_best_node`, `net_mesh_find_best_node_scoped` | Capability discovery + scored placement. |
+| Predicate evaluation | `net_predicate_evaluate` | Stateless local evaluator (Phase 9c). Returns `1` / `0` for a wire-format predicate against `(tags, metadata)`; same boolean every binding produces. Cross-binding contract pinned by `tests/cross_lang_capability/predicate_eval.json`. |
+| Predicate `where:` header | `net_predicate_to_where_header` | Encode a predicate as the canonical `cyberdeck-where:` request-header pair (Phase 9b). Mirror of the Go SDK's `WhereHeader`; pairs directly with the `*_with_headers` calls in `libnet_rpc` (`net_rpc_call_with_headers` / `net_rpc_call_service_with_headers` / `net_rpc_call_streaming_with_headers` — see the nRPC table below). Wire format pinned by `tests/cross_lang_capability/predicate_nrpc_envelope.json`. |
+| Capability validation | `net_validate_capabilities` | Stateless `CapabilitySet` validator (Phase 9a). Wire-format caps in, JSON `ValidationReport` (`errors` + `warnings`) out; same shape every binding produces. Cross-binding contract pinned by `tests/cross_lang_capability/capability_validation.json`. |
+| Predicate debug session | `net_predicate_evaluate_with_trace`, `net_predicate_aggregate_debug_report`, `net_predicate_redact_metadata_keys` | Stateless debug helpers (Phase 9d). Single-eval clause trace; corpus-wide per-clause aggregation; host-side label redaction. Cross-binding contracts pinned by `tests/cross_lang_capability/predicate_trace.json`, `predicate_debug_report.json`, `predicate_debug_report_redacted.json`. |
+| Daemon capability authoring | `net_compute_set_daemon_caps_dispatcher` | Optional per-daemon `required` / `optional` `CapabilitySet` declaration; without it daemons advertise empty sets (back-compat). See "Daemon capability authoring (Phase 6)" below. |
+| Custom placement filters | `net_compute_set_placement_filter_dispatcher`, `net_compute_register_placement_filter`, `net_compute_unregister_placement_filter`, `net_compute_has_placement_filter` | Plug a host-language predicate into `StandardPlacement.custom_filter_id` — substrate calls back per candidate. See "Custom placement-filter callback (Phase 7)" below. |
 | NAT traversal | `net_mesh_nat_type`, `net_mesh_reflex_addr`, `net_mesh_peer_nat_type`, `net_mesh_probe_reflex`, `net_mesh_reclassify_nat`, `net_mesh_traversal_stats`, `net_mesh_set_reflex_override`, `net_mesh_clear_reflex_override` | Optional optimization — routed-handshake fallback always works. |
 
 ### Scoped capability discovery
@@ -353,6 +362,108 @@ disambiguates from `node_id == 0`, which is a valid id.
 Full design + cross-SDK rationale:
 [`docs/SCOPED_CAPABILITIES_PLAN.md`](../docs/SCOPED_CAPABILITIES_PLAN.md).
 
+### Daemon capability authoring (Phase 6)
+
+Optional per-daemon `requiredCapabilities` / `optionalCapabilities` declaration. Wires the substrate's `MeshDaemon::required_capabilities` / `optional_capabilities` (Phase G slice 2) through the C ABI so daemons spawned via the Go-style factory dispatcher can declare what hardware / region / runtime they need before placement decisions run.
+
+Without this dispatcher installed, daemons advertise empty cap sets and `StandardPlacement` treats them as "runs anywhere" — back-compat with pre-Phase-6 consumers. Phase 6 of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+
+**Lifecycle:**
+
+```c
+/* 1. At process init: install the dispatcher ONCE. First-call-wins. */
+static int my_daemon_caps(
+    uint64_t daemon_id,
+    char** out_required_json, size_t* out_required_len,
+    char** out_optional_json, size_t* out_optional_len)
+{
+    /* Look up your daemon by daemon_id. Allocate UTF-8 JSON
+     * buffers via C.malloc / libc::malloc — Rust frees them via
+     * libc::free after parsing. NULL / zero-length means "no
+     * caps declared for this side" (either side may be omitted
+     * independently).
+     *
+     * Wire shape: {"tags": ["hardware.gpu", ...],
+     *              "metadata": {"intent": "ml-training", ...}} */
+    const char* req = "{\"tags\":[\"hardware.gpu\"],\"metadata\":{}}";
+    size_t req_len = strlen(req);
+    char* req_buf = (char*)malloc(req_len);
+    memcpy(req_buf, req, req_len);
+    *out_required_json = req_buf;
+    *out_required_len = req_len;
+
+    *out_optional_json = NULL;  /* no optional caps declared */
+    *out_optional_len = 0;
+    return NET_COMPUTE_OK;
+}
+
+net_compute_set_daemon_caps_dispatcher(my_daemon_caps);
+
+/* 2. Subsequent net_compute_spawn / migration reconstruction
+ *    queries the dispatcher once per daemon construction; the
+ *    bridge stores the parsed sets for the daemon's lifetime. */
+```
+
+The dispatcher is invoked at BOTH the initial-spawn path and the migration-target reconstruction path — same caps shape applies on every reincarnation. Idempotent: parsed once, stored on the bridge, never re-fetched on event processing.
+
+`StandardPlacement` consumes the declared caps via the in-tree resource / intent / scope axes plus the hard-required check (artifact's required tags must be a subset of the candidate's tags). Combine this with Phase 7's custom-filter callback for full control over placement decisions.
+
+### Custom placement-filter callback (Phase 7)
+
+Path A (`StandardPlacement` config-driven scoring) is the default; this is the **escape hatch** when the in-tree axes don't capture the placement decision the operator needs. The substrate calls back into the consumer (C / language X) once per candidate when scoring; the consumer returns keep / drop. Phase 7 of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md` — full prose lives in the plan.
+
+Symbols are in `libnet_compute` (separate cdylib), declared in `net.go.h` next to the existing daemon dispatcher.
+
+**Lifecycle:**
+
+```c
+/* 1. At process init: install the trampoline ONCE. First-call-wins;
+ *    subsequent calls are no-ops. */
+static int my_placement_filter(
+    const char* filter_id_ptr, size_t filter_id_len,
+    uint64_t node_id,
+    const char* candidate_json_ptr, size_t candidate_json_len);
+
+net_compute_set_placement_filter_dispatcher(my_placement_filter);
+
+/* 2. After the mesh node is live, register a filter id. The id must
+ *    match what the daemon spec / `StandardPlacement.custom_filter_id`
+ *    references on the substrate side. The mesh_arc is NOT consumed. */
+const char* id = "pf-gpu-must-be-loaded";
+int rc = net_compute_register_placement_filter(
+    mesh_arc,            /* from net_mesh_arc_clone — caller still owns */
+    id, strlen(id));
+if (rc != NET_COMPUTE_OK) { /* handle error — see net.go.h for codes */ }
+
+/* 3. Scoring fires the trampoline per candidate. Return:
+ *      1 — keep candidate (placement-score 1.0 in Rust)
+ *      0 — drop candidate (placement_score returns None)
+ *      negative — error; treated as veto. Log the detail yourself.
+ *
+ *    Wire shape: candidate_json_ptr is a JSON string of length
+ *    candidate_json_len:
+ *      {"node_id": uint64, "tags": [string], "metadata": {key:value}}
+ *    Buffers are owned by Rust for the call's duration; copy if needed.
+ */
+static int my_placement_filter(
+    const char* filter_id_ptr, size_t filter_id_len,
+    uint64_t node_id,
+    const char* candidate_json_ptr, size_t candidate_json_len)
+{
+    /* parse candidate_json_ptr with your JSON library of choice
+     * (cjson, jansson, RapidJSON, etc.) and apply your predicate */
+    return /* 1 | 0 | negative */;
+}
+
+/* 4. On shutdown: drop the registration. Existing in-flight scoring
+ *    calls already holding the Arc complete normally. */
+net_compute_unregister_placement_filter(id, strlen(id));
+```
+
+**Counter:** every successful trampoline invocation increments `dataforts_placement_callback_invocations_total{binding}` on the substrate side, where `binding` is set per-language-SDK at register-time. C consumers see `binding="<your-binding-label>"` if you register through a language-specific SDK; raw C consumers calling `net_compute_register_placement_filter` directly inherit the default.
+
+**Same JSON wire shape across all bindings.** The Node TSFN bridge marshals candidates natively; the Python `Py<PyAny>` bridge does the same; the Go cgo bridge uses this exact JSON. Cross-binding compat fixture: `tests/cross_lang_capability/predicate_eval.json` (each binding wraps the predicate as a placement filter and asserts the kept/vetoed verdict matches direct evaluation).
+
 ### Mesh types
 
 ```c
@@ -376,20 +487,27 @@ net_mesh_stream_t   // Opaque per-peer stream handle.
 
 nRPC is the request/response convention layer (deadlines,
 queue-group fan-out, response streaming, end-to-end cancellation)
-riding on top of the pub/sub mesh. The C SDK at `net.h` does
-**not** expose the nRPC surface today; the C ABI lives in a
-separate cdylib at [`bindings/go/rpc-ffi`](../bindings/go/rpc-ffi)
-that's primarily consumed by the Go binding but is callable from
-any C-ABI consumer.
+riding on top of the pub/sub mesh. Lives in a separate cdylib at
+[`bindings/go/rpc-ffi`](../bindings/go/rpc-ffi) — the Go binding
+consumes it, but the ABI is callable from any C-ABI consumer.
 
 **Library:** `libnet_rpc` (cdylib + staticlib). Build:
 
 ```bash
 cargo build --release -p net-rpc-ffi
-# Header: there's no shipped .h for libnet_rpc today — the canonical
-# C signatures live in:
-#   bindings/go/net/mesh_rpc.go   (cgo include block — drop-in template)
-#   bindings/go/rpc-ffi/src/lib.rs (Rust definitions of every export)
+```
+
+**Header:** [`net_rpc.h`](./net_rpc.h) — the canonical C SDK
+header for nRPC. Drop-in for C / C++ / Zig / Swift / Java JNI /
+etc.; identical declarations to the cgo block in
+`bindings/go/net/mesh_rpc.go`. Same one-header-per-translation-
+unit discipline as `net.h` / `net.go.h` (different `#ifndef`
+guard — `NET_RPC_H` — so combining with the mesh headers in one
+TU is fine).
+
+```c
+#include "net_rpc.h"
+gcc -o app app.c -L target/release -lnet_rpc -lpthread -ldl -lm
 ```
 
 **ABI version:** consumers SHOULD call `net_rpc_abi_version() ->
@@ -397,40 +515,25 @@ uint32_t` at process init and refuse to load on mismatch. Version
 `0x0001` covers Phase B5 (lifecycle + unary call + serve +
 service discovery) plus B6 (streaming + ABI version stamp).
 
-**Entry-point families:**
+**Entry-point families** (full per-function doc-comments in
+`net_rpc.h`):
 
-```c
-// Lifecycle.
-extern uint32_t net_rpc_abi_version(void);
-extern void     net_rpc_set_handler_dispatcher(RpcHandlerFn dispatcher);
-extern MeshRpcHandle* net_rpc_new(void* node_arc);  // consumes Arc<MeshNode>
-extern void           net_rpc_free(MeshRpcHandle*);
+| Family | Functions |
+|---|---|
+| Lifecycle | `net_rpc_abi_version`, `net_rpc_new`, `net_rpc_free`, `net_rpc_id` |
+| Free helpers | `net_rpc_free_cstring`, `net_rpc_response_free`, `net_rpc_find_service_nodes_free` |
+| Cancellation | `net_rpc_reserve_cancel_token`, `net_rpc_cancel_call` |
+| Handler dispatcher | `net_rpc_set_handler_dispatcher`, `net_rpc_reserve_handler_id`, `RpcHandlerFn` typedef |
+| Unary calls | `net_rpc_call`, `net_rpc_call_service` |
+| Header-bearing calls | `net_rpc_call_with_headers`, `net_rpc_call_service_with_headers`, `net_rpc_call_streaming_with_headers` (Phase 9b end-to-end — accept a `net_rpc_header_t[]`; pair with `net_predicate_to_where_header`) |
+| Service discovery | `net_rpc_find_service_nodes` |
+| Serve | `net_rpc_serve`, `net_rpc_serve_handle_id`, `net_rpc_serve_handle_close`, `net_rpc_serve_handle_free` |
+| Streaming | `net_rpc_call_streaming`, `net_rpc_stream_next`, `net_rpc_stream_grant`, `net_rpc_stream_call_id`, `net_rpc_stream_close`, `net_rpc_stream_free` |
 
-// Unary calls — synchronous (block_on under the hood).
-extern int net_rpc_call(MeshRpcHandle*, uint64_t target, ...);
-extern int net_rpc_call_service(MeshRpcHandle*, ...);
-
-// Service discovery.
-extern int net_rpc_find_service_nodes(MeshRpcHandle*, ...);
-
-// Serve — caller registers a handler in its own registry keyed
-// on the returned handler_id, then `net_rpc_set_handler_dispatcher`
-// gets invoked back into the consumer with that id.
-extern ServeHandleC* net_rpc_serve(MeshRpcHandle*, ...);
-extern void          net_rpc_serve_handle_close(ServeHandleC*);
-extern void          net_rpc_serve_handle_free(ServeHandleC*);
-
-// Streaming — opaque RpcStream handle, blocking next, explicit grant.
-extern int  net_rpc_call_streaming(MeshRpcHandle*, ...);
-extern int  net_rpc_stream_next(RpcStreamHandleC*, ...);
-extern int  net_rpc_stream_grant(RpcStreamHandleC*, uint32_t amount);
-extern void net_rpc_stream_close(RpcStreamHandleC*);
-extern void net_rpc_stream_free(RpcStreamHandleC*);
-
-// Ownership: every Vec<u8> / CString returned out-of-band is
-// freed via the matching net_rpc_response_free /
-// net_rpc_find_service_nodes_free / net_rpc_free_cstring.
-```
+Ownership: every `uint8_t*` / `char*` / `uint64_t*` returned
+out-of-band is freed via the matching
+`net_rpc_response_free` / `net_rpc_free_cstring` /
+`net_rpc_find_service_nodes_free`.
 
 **Error codes (`int` return):**
 

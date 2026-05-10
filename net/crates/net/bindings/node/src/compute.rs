@@ -47,7 +47,7 @@ use std::time::Duration;
 /// and short enough that a genuine deadlock surfaces promptly.
 const DEFAULT_CALLBACK_TIMEOUT_MS: u32 = 60_000;
 
-use net::adapter::net::behavior::capability::CapabilityFilter;
+use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfig, MeshDaemon};
 use net::adapter::net::state::causal::CausalEvent;
 use net_sdk::compute::{
@@ -229,6 +229,15 @@ pub struct DaemonBridgeTsfns {
     process: ProcessTsfn,
     snapshot: Option<SnapshotTsfn>,
     restore: Option<RestoreTsfn>,
+    /// Phase G slice 2 (`CAPABILITY_SYSTEM_PLAN.md`): hard
+    /// placement requirements declared at factory time. `None` →
+    /// no requirements (daemon runs anywhere). Static — captured
+    /// once at construction; not re-queried per placement
+    /// decision.
+    required_capabilities: Option<CapabilitySet>,
+    /// Soft placement preferences. Same shape + lifetime as
+    /// `required_capabilities`.
+    optional_capabilities: Option<CapabilitySet>,
 }
 
 impl napi::bindgen_prelude::TypeName for DaemonBridgeTsfns {
@@ -284,10 +293,30 @@ impl napi::bindgen_prelude::FromNapiValue for DaemonBridgeTsfns {
             None => None,
         };
 
+        // Phase G slice 2: read optional capability declarations.
+        // Both fields accept the standard `CapabilitySetJs` POJO
+        // shape (the same `tags` / `metadata` payload the rest of
+        // the binding exposes); converted to the substrate's
+        // `CapabilitySet` here once and stored for the lifetime
+        // of the daemon. Static-by-design — placement decisions
+        // are bounded calls into the substrate, not a per-event
+        // FFI roundtrip.
+        let required_caps_js: Option<crate::capabilities::CapabilitySetJs> =
+            obj.get_named_property("requiredCapabilities")?;
+        let required_capabilities =
+            required_caps_js.map(crate::capabilities::capability_set_from_js);
+
+        let optional_caps_js: Option<crate::capabilities::CapabilitySetJs> =
+            obj.get_named_property("optionalCapabilities")?;
+        let optional_capabilities =
+            optional_caps_js.map(crate::capabilities::capability_set_from_js);
+
         Ok(DaemonBridgeTsfns {
             process,
             snapshot,
             restore,
+            required_capabilities,
+            optional_capabilities,
         })
     }
 }
@@ -553,6 +582,10 @@ impl DaemonRuntime {
             snapshot: snapshot_tsfn,
             restore: restore_tsfn,
             callback_timeout,
+            // Local-spawn path: empty caps. Factory-path daemons
+            // pick up declarations from the factory return value.
+            required_capabilities: CapabilitySet::default(),
+            optional_capabilities: CapabilitySet::default(),
         });
 
         // Kind-factory closure for migration-target reconstruction.
@@ -692,6 +725,10 @@ impl DaemonRuntime {
             snapshot: snapshot_tsfn,
             restore: restore_tsfn,
             callback_timeout,
+            // Local-spawn path: empty caps. Factory-path daemons
+            // pick up declarations from the factory return value.
+            required_capabilities: CapabilitySet::default(),
+            optional_capabilities: CapabilitySet::default(),
         });
 
         // Same `ReconstructionErrorBridge` fallback for migration-target
@@ -1146,6 +1183,14 @@ impl From<&CausalEvent> for CausalEventJs {
 /// Host configuration for a daemon. Omitted fields fall back to
 /// the core defaults (`auto_snapshot_interval: 0`,
 /// `max_log_entries: 10_000`).
+///
+/// Phase G slice 2 + Phase 6 SDK plan: capability declarations
+/// (`requiredCapabilities` / `optionalCapabilities`) live on the
+/// **factory return value** (`DaemonBridgeTsfns`), not here. Local-
+/// spawn daemons constructed via [`DaemonRuntime::spawn`] inherit
+/// empty capability defaults (run anywhere); production daemons
+/// registered via [`DaemonRuntime::register_factory`] declare
+/// capabilities through the factory's returned object.
 #[napi(object)]
 pub struct DaemonHostConfigJs {
     /// Auto-snapshot cadence in events processed. `0` or absent =
@@ -1295,6 +1340,11 @@ struct EventDispatchBridge {
     /// Bounded wait applied to every `rx.recv_timeout(...)` below.
     /// See [`DEFAULT_CALLBACK_TIMEOUT_MS`] for why this exists.
     callback_timeout: Duration,
+    /// Phase G slice 2: captured at registration time and
+    /// returned by the `MeshDaemon::required_capabilities` /
+    /// `optional_capabilities` overrides.
+    required_capabilities: CapabilitySet,
+    optional_capabilities: CapabilitySet,
 }
 
 impl MeshDaemon for EventDispatchBridge {
@@ -1304,6 +1354,20 @@ impl MeshDaemon for EventDispatchBridge {
 
     fn requirements(&self) -> CapabilityFilter {
         CapabilityFilter::default()
+    }
+
+    /// Phase G slice 2 + Phase 6 SDK plan. JS daemon authors
+    /// declare hard requirements via the factory's
+    /// `requiredCapabilities` field — captured once at
+    /// registration; this override returns a clone (cheap —
+    /// `CapabilitySet` is shallow + reference-counted on its
+    /// hot fields).
+    fn required_capabilities(&self) -> CapabilitySet {
+        self.required_capabilities.clone()
+    }
+
+    fn optional_capabilities(&self) -> CapabilitySet {
+        self.optional_capabilities.clone()
     }
 
     /// Synchronously dispatch the event to the JS `process`
@@ -1605,6 +1669,11 @@ fn build_bridge_from_tsfn(factory: Arc<FactoryTsfn>, kind: String) -> Box<dyn Me
             snapshot: tsfns.snapshot,
             restore: tsfns.restore,
             callback_timeout: factory_timeout,
+            // Phase 6 SDK plan: capabilities declared by the JS
+            // factory flow through. None → empty default (run
+            // anywhere); Some → use the converted set.
+            required_capabilities: tsfns.required_capabilities.unwrap_or_default(),
+            optional_capabilities: tsfns.optional_capabilities.unwrap_or_default(),
         }),
         Ok(Err(e)) => {
             let reason = format!("JS factory threw: {e}");

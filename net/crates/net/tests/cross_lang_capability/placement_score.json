@@ -1,0 +1,140 @@
+{
+  "description": "Cross-binding pin for `StandardPlacement::placement_score`. Each case carries a `config` (subset of StandardPlacement settings — proximity / anti-affinity axes are skipped because they require runtime closures), a single `candidate` (node_id + tags + metadata), an `artifact` (Daemon with required + optional caps), and an `expected_score`. Bindings — when they ship local StandardPlacement implementations — evaluate and assert the score matches Rust's reference output to within 1e-6 (or `null` for veto). Locks the in-tree axis composition matrix; any regression in scope / intent / colocation / resource / hard-required scoring trips this fixture's assertion. See README.md.",
+  "abi_version_expected": 1,
+  "cases": [
+    {
+      "name": "default_config_returns_one_for_minimal_candidate",
+      "summary": "Default StandardPlacement config + empty-cap candidate → all axes identity → score 1.0.",
+      "config": {},
+      "candidate": {
+        "node_id": "0x1111",
+        "tags": [],
+        "metadata": {}
+      },
+      "artifact": {
+        "kind": "daemon",
+        "required": { "tags": [], "metadata": {} },
+        "optional": { "tags": [], "metadata": {} }
+      },
+      "expected_score": 1.0
+    },
+    {
+      "name": "hard_required_tag_missing_vetoes",
+      "summary": "Daemon's required cap set demands `hardware.gpu`; candidate lacks it → hard veto (`null` score).",
+      "config": {},
+      "candidate": {
+        "node_id": "0x2222",
+        "tags": ["hardware.cpu_cores=8"],
+        "metadata": {}
+      },
+      "artifact": {
+        "kind": "daemon",
+        "required": { "tags": ["hardware.gpu"], "metadata": {} },
+        "optional": { "tags": [], "metadata": {} }
+      },
+      "expected_score": null
+    },
+    {
+      "name": "hard_required_tag_satisfied_passes",
+      "summary": "Same as above but candidate now has `hardware.gpu`. Hard check passes; default config keeps score at 1.0.",
+      "config": {},
+      "candidate": {
+        "node_id": "0x3333",
+        "tags": ["hardware.gpu"],
+        "metadata": {}
+      },
+      "artifact": {
+        "kind": "daemon",
+        "required": { "tags": ["hardware.gpu"], "metadata": {} },
+        "optional": { "tags": [], "metadata": {} }
+      },
+      "expected_score": 1.0
+    },
+    {
+      "name": "scope_filter_match_keeps_one",
+      "summary": "Scope axis with filter `scope:tenant:foo`. Candidate has matching tag → axis returns 1.0 → final 1.0.",
+      "config": {
+        "scope_filter": ["scope:tenant:foo"]
+      },
+      "candidate": {
+        "node_id": "0x4444",
+        "tags": ["scope:tenant:foo"],
+        "metadata": {}
+      },
+      "artifact": {
+        "kind": "daemon",
+        "required": { "tags": [], "metadata": {} },
+        "optional": { "tags": [], "metadata": {} }
+      },
+      "expected_score": 1.0
+    },
+    {
+      "name": "scope_filter_mismatch_zeroes_score",
+      "summary": "Scope axis with filter `scope:tenant:foo`. Candidate has a different scope tag (`scope:tenant:bar`) → axis returns 0.0 → composition zeroes the final score (LOCKED §7).",
+      "config": {
+        "scope_filter": ["scope:tenant:foo"]
+      },
+      "candidate": {
+        "node_id": "0x5555",
+        "tags": ["scope:tenant:bar"],
+        "metadata": {}
+      },
+      "artifact": {
+        "kind": "daemon",
+        "required": { "tags": [], "metadata": {} },
+        "optional": { "tags": [], "metadata": {} }
+      },
+      "expected_score": 0.0
+    },
+    {
+      "name": "scope_filter_no_scope_tags_zeroes_score",
+      "summary": "Scope axis with non-empty filter; candidate has no `scope:*` tags at all. Axis returns 0.0 → final 0.0. Operators who want unscoped peers to satisfy the axis disable it by leaving `scope_filter` as None.",
+      "config": {
+        "scope_filter": ["scope:region:us-east"]
+      },
+      "candidate": {
+        "node_id": "0x6666",
+        "tags": ["hardware.gpu"],
+        "metadata": {}
+      },
+      "artifact": {
+        "kind": "daemon",
+        "required": { "tags": [], "metadata": {} },
+        "optional": { "tags": [], "metadata": {} }
+      },
+      "expected_score": 0.0
+    },
+    {
+      "name": "scope_filter_disabled_passes_unscoped_candidate",
+      "summary": "Scope axis disabled (config omits `scope_filter`). Candidate has no scope tags. Axis returns 1.0 (identity) → final 1.0. Pin the back-compat default for daemons that don't care about scoping.",
+      "config": {},
+      "candidate": {
+        "node_id": "0x7777",
+        "tags": ["hardware.gpu"],
+        "metadata": {}
+      },
+      "artifact": {
+        "kind": "daemon",
+        "required": { "tags": [], "metadata": {} },
+        "optional": { "tags": [], "metadata": {} }
+      },
+      "expected_score": 1.0
+    },
+    {
+      "name": "resource_axis_no_data_is_permissive",
+      "summary": "Resource axis under default `Compute` config. Candidate has no resource tags. Axis returns 1.0 — `can't measure, default permissive` semantics. Operators wanting strict resource enforcement use the daemon's required caps + the hard-constraint check.",
+      "config": {},
+      "candidate": {
+        "node_id": "0x8888",
+        "tags": [],
+        "metadata": {}
+      },
+      "artifact": {
+        "kind": "daemon",
+        "required": { "tags": [], "metadata": {} },
+        "optional": { "tags": [], "metadata": {} }
+      },
+      "expected_score": 1.0
+    }
+  ]
+}

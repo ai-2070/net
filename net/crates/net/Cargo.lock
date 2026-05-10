@@ -1434,6 +1434,7 @@ dependencies = [
  "dashmap",
  "libc",
  "parking_lot",
+ "serde_json",
  "tokio",
 ]
 

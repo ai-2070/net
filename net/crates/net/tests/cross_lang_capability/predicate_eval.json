@@ -1,0 +1,677 @@
+{
+  "description": "Cross-binding pin for `Predicate::evaluate_unplanned(ctx)` — the pure (planner-free) leaf evaluator. Each case carries a `wire` predicate plus a `tags` + `metadata` evaluation context and the expected boolean result. Bindings parse the predicate, evaluate against the context, and assert the result matches `expected`. Pins both the leaf semantics (axis tag matching, semver parsing, metadata lookup) and the composite recursion (And/Or/Not). See README.md.",
+  "abi_version_expected": 1,
+  "cases": [
+    {
+      "name": "exists_axis_tag_present",
+      "summary": "AxisPresent leaf — tag is in the set.",
+      "wire": {
+        "nodes": [{ "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } }],
+        "root_idx": 0
+      },
+      "tags": ["hardware.gpu"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "exists_axis_tag_absent",
+      "summary": "AxisPresent leaf — tag missing.",
+      "wire": {
+        "nodes": [{ "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } }],
+        "root_idx": 0
+      },
+      "tags": ["hardware.cpu_cores=8"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "exists_matches_axis_value_form_too",
+      "summary": "Exists evaluates true on `<axis>.<key>=<value>` since the axis-key matches; the value is irrelevant for Exists.",
+      "wire": {
+        "nodes": [{ "kind": "exists", "key": { "axis": "hardware", "key": "memory_mb" } }],
+        "root_idx": 0
+      },
+      "tags": ["hardware.memory_mb=65536"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "equals_axis_value_match",
+      "summary": "Equals leaf — value equality on a `key=value` tag.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "equals",
+            "key": { "axis": "hardware", "key": "gpu.vendor" },
+            "value": "nvidia"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.gpu.vendor=nvidia"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "equals_axis_value_mismatch",
+      "summary": "Equals leaf — value differs.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "equals",
+            "key": { "axis": "hardware", "key": "gpu.vendor" },
+            "value": "nvidia"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.gpu.vendor=amd"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "numeric_at_least_pass",
+      "summary": "Numeric lower bound — value parses to a number above threshold.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "threshold": 65536.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.memory_mb=131072"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "numeric_at_least_boundary_inclusive",
+      "summary": "Numeric lower bound is inclusive at threshold.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "threshold": 65536.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.memory_mb=65536"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "numeric_at_least_below",
+      "summary": "Numeric lower bound — below threshold returns false.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "threshold": 65536.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.memory_mb=32768"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "numeric_at_least_unparsable_value",
+      "summary": "If the tag's value isn't a number, numeric leaves return false.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "threshold": 65536.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.memory_mb=lots"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "numeric_at_most_pass",
+      "summary": "Numeric upper bound (inclusive).",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_at_most",
+            "key": { "axis": "hardware", "key": "limits.rate_limit_rpm" },
+            "threshold": 1000.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.limits.rate_limit_rpm=500"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "numeric_in_range_pass",
+      "summary": "Numeric range (inclusive both ends).",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_in_range",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "min": 32768.0,
+            "max": 131072.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.memory_mb=65536"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "numeric_in_range_below_min",
+      "summary": "Numeric range — below min fails.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_in_range",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "min": 32768.0,
+            "max": 131072.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.memory_mb=16384"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "semver_at_least_pass",
+      "summary": "Semver triple comparison — `>= 3.10.0` succeeds for `3.11.5`.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "semver_at_least",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.10.0"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["software.runtime.python=3.11.5"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "semver_at_least_boundary_inclusive",
+      "summary": "Semver lower bound — equal triples pass.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "semver_at_least",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.10.0"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["software.runtime.python=3.10.0"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "semver_at_least_below_fails",
+      "summary": "Semver lower bound — `3.9.x` < `3.10.0`.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "semver_at_least",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.10.0"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["software.runtime.python=3.9.18"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "semver_compatible_caret_same_major_pass",
+      "summary": "Caret-compatibility — same major (>= 1.0), `>= rhs`.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "semver_compatible",
+            "key": { "axis": "software", "key": "framework.pytorch" },
+            "version": "2.1.0"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["software.framework.pytorch=2.3.5"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "semver_compatible_caret_different_major_fails",
+      "summary": "Caret-compatibility — major bump (1.x → 2.x) is incompatible.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "semver_compatible",
+            "key": { "axis": "software", "key": "framework.pytorch" },
+            "version": "1.13.0"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["software.framework.pytorch=2.0.0"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "semver_compatible_zero_major_minor_band",
+      "summary": "0.x.y compatibility band: minor must match exactly. `0.5.x` is incompatible with `0.4.0`.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "semver_compatible",
+            "key": { "axis": "software", "key": "framework.exp" },
+            "version": "0.4.0"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["software.framework.exp=0.5.1"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "string_prefix_pass",
+      "summary": "String-prefix match.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "string_prefix",
+            "key": { "axis": "software", "key": "os" },
+            "prefix": "linux"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["software.os=linux-6.6.0"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "string_prefix_fail",
+      "summary": "String-prefix doesn't match.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "string_prefix",
+            "key": { "axis": "software", "key": "os" },
+            "prefix": "linux"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["software.os=darwin"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "string_matches_substring",
+      "summary": "Substring match anywhere in the value.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "string_matches",
+            "key": { "axis": "hardware", "key": "gpu.model" },
+            "pattern": "H100"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.gpu.model=NVIDIA-H100-SXM5"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "metadata_exists_pass",
+      "summary": "Metadata key presence.",
+      "wire": {
+        "nodes": [{ "kind": "metadata_exists", "key": "intent" }],
+        "root_idx": 0
+      },
+      "tags": [],
+      "metadata": { "intent": "ml-training" },
+      "expected": true
+    },
+    {
+      "name": "metadata_exists_absent",
+      "summary": "Metadata key missing.",
+      "wire": {
+        "nodes": [{ "kind": "metadata_exists", "key": "intent" }],
+        "root_idx": 0
+      },
+      "tags": [],
+      "metadata": { "owner": "alice" },
+      "expected": false
+    },
+    {
+      "name": "metadata_equals_match",
+      "summary": "Metadata value equality.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_equals", "key": "intent", "value": "ml-training" }
+        ],
+        "root_idx": 0
+      },
+      "tags": [],
+      "metadata": { "intent": "ml-training" },
+      "expected": true
+    },
+    {
+      "name": "metadata_equals_mismatch",
+      "summary": "Metadata value differs.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_equals", "key": "intent", "value": "ml-training" }
+        ],
+        "root_idx": 0
+      },
+      "tags": [],
+      "metadata": { "intent": "embedding-cache" },
+      "expected": false
+    },
+    {
+      "name": "metadata_matches_substring",
+      "summary": "Metadata substring match.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_matches", "key": "owner", "pattern": "@anthropic" }
+        ],
+        "root_idx": 0
+      },
+      "tags": [],
+      "metadata": { "owner": "alice@anthropic.com" },
+      "expected": true
+    },
+    {
+      "name": "metadata_numeric_at_least_pass",
+      "summary": "Metadata numeric lower bound.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "metadata_numeric_at_least",
+            "key": "priority",
+            "threshold": 5.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": [],
+      "metadata": { "priority": "9" },
+      "expected": true
+    },
+    {
+      "name": "metadata_numeric_at_least_unparseable",
+      "summary": "Metadata numeric — non-numeric value returns false.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "metadata_numeric_at_least",
+            "key": "priority",
+            "threshold": 5.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": [],
+      "metadata": { "priority": "high" },
+      "expected": false
+    },
+    {
+      "name": "and_two_leaves_both_true",
+      "summary": "And of two leaves — both pass.",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          { "kind": "metadata_equals", "key": "intent", "value": "ml-training" },
+          { "kind": "and", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      },
+      "tags": ["hardware.gpu"],
+      "metadata": { "intent": "ml-training" },
+      "expected": true
+    },
+    {
+      "name": "and_two_leaves_one_false",
+      "summary": "And short-circuits to false on first failing leaf.",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          { "kind": "metadata_equals", "key": "intent", "value": "ml-training" },
+          { "kind": "and", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      },
+      "tags": ["hardware.gpu"],
+      "metadata": { "intent": "embedding-cache" },
+      "expected": false
+    },
+    {
+      "name": "or_two_leaves_one_true",
+      "summary": "Or — one true child suffices.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_exists", "key": "intent" },
+          { "kind": "exists", "key": { "axis": "hardware", "key": "tpu" } },
+          { "kind": "or", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      },
+      "tags": ["hardware.gpu"],
+      "metadata": { "intent": "ml-training" },
+      "expected": true
+    },
+    {
+      "name": "or_two_leaves_all_false",
+      "summary": "Or with no true child returns false.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_exists", "key": "intent" },
+          { "kind": "exists", "key": { "axis": "hardware", "key": "tpu" } },
+          { "kind": "or", "children": [0, 1] }
+        ],
+        "root_idx": 2
+      },
+      "tags": ["hardware.gpu"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "not_inverts_true",
+      "summary": "Not over a true leaf returns false.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_equals", "key": "decommissioning", "value": "true" },
+          { "kind": "not", "child": 0 }
+        ],
+        "root_idx": 1
+      },
+      "tags": [],
+      "metadata": { "decommissioning": "true" },
+      "expected": false
+    },
+    {
+      "name": "not_inverts_false",
+      "summary": "Not over a false leaf returns true.",
+      "wire": {
+        "nodes": [
+          { "kind": "metadata_equals", "key": "decommissioning", "value": "true" },
+          { "kind": "not", "child": 0 }
+        ],
+        "root_idx": 1
+      },
+      "tags": [],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "complex_real_world_pass",
+      "summary": "Real-world shape — '(has GPU OR memory>=64GB) AND has intent AND NOT decommissioning AND python>=3.10' — passes for a beefy training node.",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "threshold": 65536.0
+          },
+          { "kind": "or", "children": [0, 1] },
+          { "kind": "metadata_exists", "key": "intent" },
+          { "kind": "metadata_equals", "key": "decommissioning", "value": "true" },
+          { "kind": "not", "child": 4 },
+          {
+            "kind": "semver_at_least",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.10.0"
+          },
+          { "kind": "and", "children": [2, 3, 5, 6] }
+        ],
+        "root_idx": 7
+      },
+      "tags": [
+        "hardware.gpu",
+        "hardware.memory_mb=131072",
+        "software.runtime.python=3.11.5"
+      ],
+      "metadata": { "intent": "ml-training" },
+      "expected": true
+    },
+    {
+      "name": "complex_real_world_blocked_by_decommissioning",
+      "summary": "Same shape — fails because decommissioning is set.",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "threshold": 65536.0
+          },
+          { "kind": "or", "children": [0, 1] },
+          { "kind": "metadata_exists", "key": "intent" },
+          { "kind": "metadata_equals", "key": "decommissioning", "value": "true" },
+          { "kind": "not", "child": 4 },
+          {
+            "kind": "semver_at_least",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.10.0"
+          },
+          { "kind": "and", "children": [2, 3, 5, 6] }
+        ],
+        "root_idx": 7
+      },
+      "tags": [
+        "hardware.gpu",
+        "hardware.memory_mb=131072",
+        "software.runtime.python=3.11.5"
+      ],
+      "metadata": { "intent": "ml-training", "decommissioning": "true" },
+      "expected": false
+    },
+    {
+      "name": "complex_real_world_passes_via_memory_path",
+      "summary": "Same shape — passes via the OR's memory branch (no GPU).",
+      "wire": {
+        "nodes": [
+          { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "memory_mb" },
+            "threshold": 65536.0
+          },
+          { "kind": "or", "children": [0, 1] },
+          { "kind": "metadata_exists", "key": "intent" },
+          { "kind": "metadata_equals", "key": "decommissioning", "value": "true" },
+          { "kind": "not", "child": 4 },
+          {
+            "kind": "semver_at_least",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "3.10.0"
+          },
+          { "kind": "and", "children": [2, 3, 5, 6] }
+        ],
+        "root_idx": 7
+      },
+      "tags": [
+        "hardware.cpu_cores=64",
+        "hardware.memory_mb=262144",
+        "software.runtime.python=3.12.0"
+      ],
+      "metadata": { "intent": "embedding-cache" },
+      "expected": true
+    },
+    {
+      "name": "semver_strips_build_metadata_with_embedded_dash",
+      "summary": "N-15: a build-metadata suffix containing `-` (e.g. `+build-1`) must not confuse the prefix-strip. Rust splits `+` first then `-`; the TS `Math.min(dash, plus)` and Python `min(dash, plus)` shapes both arrive at the same core because the `+` always comes first. Pin so any future refactor that flips the strip order is caught.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "semver_at_least",
+            "key": { "axis": "software", "key": "runtime.python" },
+            "version": "1.2.3"
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["software.runtime.python=1.2.3+build-1"],
+      "metadata": {},
+      "expected": true
+    },
+    {
+      "name": "numeric_rejects_hex_float_literal",
+      "summary": "N-14: Rust `f64::from_str` rejects hex-float literals (`0x1p3`). Go's `strconv.ParseFloat` accepts them (returns 8.0); pre-fix the Go binding diverged. Cross-binding evaluation must agree that an `0x1p3` tag does NOT satisfy `numericAtLeast >= 1`.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "cpu_cores" },
+            "threshold": 1.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.cpu_cores=0x1p3"],
+      "metadata": {},
+      "expected": false
+    },
+    {
+      "name": "numeric_rejects_digit_separator_underscore",
+      "summary": "N-14: Rust `f64::from_str` rejects digit-separator underscores (`1_000`). Go's `strconv.ParseFloat` accepts them (returns 1000.0); pre-fix the Go binding diverged. Cross-binding evaluation must agree that `1_000` does NOT satisfy a numeric predicate.",
+      "wire": {
+        "nodes": [
+          {
+            "kind": "numeric_at_least",
+            "key": { "axis": "hardware", "key": "cpu_cores" },
+            "threshold": 1.0
+          }
+        ],
+        "root_idx": 0
+      },
+      "tags": ["hardware.cpu_cores=1_000"],
+      "metadata": {},
+      "expected": false
+    }
+  ]
+}

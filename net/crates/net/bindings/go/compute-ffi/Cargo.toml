@@ -59,6 +59,10 @@ parking_lot = "0.12"
 # hands us. Go side allocates via `C.malloc`; we release via the
 # matching `free`.
 libc = "0.2"
+# JSON marshaling for the `PlacementFilter` candidate payload (Phase 7
+# slice 4). Bounded per-call cost; same json crate the rest of the
+# tree uses for cap diff / predicate IR.
+serde_json = "1"
 
 [profile.release]
 lto = true

@@ -117,7 +117,7 @@ func TestReplicaGroup_RouteEventReturnsLiveMemberOrigin(t *testing.T) {
 	}
 	defer g.Close()
 
-	live := make(map[uint32]bool)
+	live := make(map[uint64]bool)
 	for _, m := range g.Replicas() {
 		live[m.OriginHash] = true
 	}
@@ -278,7 +278,7 @@ func TestForkGroup_UniqueOriginsAndVerifiableLineage(t *testing.T) {
 		t.Error("VerifyLineage() = false, want true")
 	}
 
-	origins := make(map[uint32]bool)
+	origins := make(map[uint64]bool)
 	for _, m := range g.Members() {
 		origins[m.OriginHash] = true
 	}

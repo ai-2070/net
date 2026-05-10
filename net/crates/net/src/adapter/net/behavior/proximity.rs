@@ -83,7 +83,12 @@ impl PrimaryCapabilities {
 
     /// Create from full capability set
     pub fn from_capability_set(caps: &CapabilitySet) -> Self {
-        let memory_tier = match caps.hardware.memory_mb {
+        // Phase A.5.3: read through views() so this code keeps
+        // working post-Phase-A.5.N (when the typed-struct fields
+        // are removed and the projection becomes a tag-set scan).
+        let views = caps.views();
+        let hw = views.hardware();
+        let memory_tier = match hw.memory_mb {
             0..=1024 => 0,
             1025..=4096 => 1,
             4097..=8192 => 2,
@@ -95,8 +100,8 @@ impl PrimaryCapabilities {
         };
 
         Self {
-            gpu: caps.hardware.gpu.is_some(),
-            model_slots: caps.models.len() as u8,
+            gpu: hw.gpu.is_some(),
+            model_slots: views.models().len() as u8,
             memory_tier,
             tools_bitmap: 0, // Could map common tools to bits
             flags: 0,
@@ -751,6 +756,29 @@ impl ProximityGraph {
         })
     }
 
+    /// Lowest-RTT node that satisfies `predicate`, returned as a
+    /// [`Duration`]. Phase F slice 4 of `CAPABILITY_SYSTEM_PLAN.md`
+    /// §7a — used by `StandardPlacement`'s scope-attraction scoring
+    /// (slice 5) and by Phase E of `REDEX_DISTRIBUTED_PLAN.md`.
+    ///
+    /// Scans every node, picks the one with the lowest
+    /// `latency_us` field where `predicate(node)` returns true.
+    /// Returns `None` when no node matches the predicate.
+    /// Available + non-available nodes are both considered — the
+    /// caller's predicate decides which subset matters.
+    ///
+    /// Direct lookup variant: pass `|n| n.node_id == target` to
+    /// fetch the RTT to a specific candidate (used by the
+    /// placement tie-breaker).
+    pub fn nearest_rtt(&self, predicate: impl Fn(&ProximityNode) -> bool) -> Option<Duration> {
+        self.nodes
+            .iter()
+            .filter(|r| predicate(r.value()))
+            .map(|r| r.latency_us)
+            .min()
+            .map(Duration::from_micros)
+    }
+
     /// Find k best nodes for a capability filter
     pub fn find_k_best(&self, filter: &CapabilityFilter, k: usize) -> Vec<ProximityNode> {
         let mut matching = self.find_matching(filter);
@@ -975,27 +1003,36 @@ fn current_time_us() -> u64 {
 
 /// Hash capabilities for quick comparison
 fn hash_capabilities(caps: &CapabilitySet) -> u64 {
+    // Phase A.5.3: read through views() so the hash function
+    // keeps working unchanged when typed-struct fields go away
+    // (Phase A.5.N). Hash semantics intentionally unchanged —
+    // capability hashes are persistent state in the proximity
+    // graph; an accidental hash-shape change would invalidate
+    // every node's cached neighbor metadata.
+    let views = caps.views();
+    let hw = views.hardware();
+
     // Simple FNV-1a hash of key capability fields
     let mut hash: u64 = 0xcbf29ce484222325;
 
     // Hash hardware memory
-    hash ^= caps.hardware.memory_mb as u64;
+    hash ^= hw.memory_mb as u64;
     hash = hash.wrapping_mul(0x100000001b3);
 
     // Hash GPU presence
-    hash ^= if caps.hardware.gpu.is_some() { 1 } else { 0 };
+    hash ^= if hw.gpu.is_some() { 1 } else { 0 };
     hash = hash.wrapping_mul(0x100000001b3);
 
     // Hash accelerator count
-    hash ^= caps.hardware.accelerators.len() as u64;
+    hash ^= hw.accelerators.len() as u64;
     hash = hash.wrapping_mul(0x100000001b3);
 
     // Hash tool count
-    hash ^= caps.tools.len() as u64;
+    hash ^= views.tools().len() as u64;
     hash = hash.wrapping_mul(0x100000001b3);
 
     // Hash model count
-    hash ^= caps.models.len() as u64;
+    hash ^= views.models().len() as u64;
     hash = hash.wrapping_mul(0x100000001b3);
 
     // Hash tag count

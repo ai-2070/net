@@ -234,7 +234,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 /// Caller must ensure `p` is null or points to a NUL-terminated C
 /// string valid at least until this function returns.
 #[inline]
-unsafe fn c_str_to_string(p: *const c_char) -> Option<String> {
+pub(super) unsafe fn c_str_to_string(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }
@@ -268,7 +268,7 @@ fn write_json_out<T: Serialize>(
     0
 }
 
-fn write_string_out(s: String, out_ptr: *mut *mut c_char, out_len: *mut usize) -> c_int {
+pub(super) fn write_string_out(s: String, out_ptr: *mut *mut c_char, out_len: *mut usize) -> c_int {
     if out_ptr.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
@@ -4106,13 +4106,17 @@ mod nat_traversal_stub_tests {
         let json = r#"{"hardware":{"cpu_cores":16,"memory_mb":65536,"gpu":{"vendor":"nvidia","model":"h100","vram_mb":81920}},"tags":["gpu"]}"#;
         let parsed: CapabilitySetJson = serde_json::from_str(json).expect("JSON should parse");
         let caps = capability_set_from_json(parsed);
+        // Phase A.5.5: read through views() so the test asserts
+        // the projection — the same surface every consumer sees
+        // post-Phase-A.5.N when typed-struct fields are removed.
+        let views = caps.views();
         assert_eq!(
-            caps.hardware.gpu_vendor(),
+            views.hardware().gpu_vendor(),
             Some(super::GpuVendor::Nvidia),
             "vendor lost in conversion"
         );
-        assert_eq!(caps.hardware.memory_mb, 65536);
-        assert_eq!(caps.hardware.total_vram_mb(), 81920);
+        assert_eq!(views.hardware().memory_mb, 65536);
+        assert_eq!(views.hardware().total_vram_mb(), 81920);
         assert!(caps.has_tag("gpu"));
     }
 

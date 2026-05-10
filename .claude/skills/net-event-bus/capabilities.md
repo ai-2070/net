@@ -10,28 +10,33 @@ If the user wants topic-style fan-out, use `apis.md` (named channels) or `patter
 
 ## The capability model
 
-Each node builds a `CapabilitySet` and announces it. Verbatim from `net/crates/net/src/adapter/net/behavior/capability.rs:798`:
+Each node builds a `CapabilitySet` and announces it. Storage shape:
 
 ```rust
 pub struct CapabilitySet {
-    pub hardware: HardwareCapabilities,
-    pub software: SoftwareCapabilities,
-    pub models: Vec<ModelCapability>,
-    pub tools: Vec<ToolCapability>,
-    pub tags: Vec<String>,
-    pub limits: ResourceLimits,
+    pub tags: HashSet<Tag>,
+    pub metadata: BTreeMap<String, String>,
 }
 ```
 
-Field names you'll touch (verbatim from `capability.rs`):
+`Tag` is a four-axis typed enum:
 
-- `HardwareCapabilities` (`:192`): `cpu_cores`, `cpu_threads`, `memory_mb`, `gpu: Option<GpuInfo>`, `additional_gpus`, `storage_mb`, `network_mbps`, `accelerators`.
-- `GpuInfo` (`:60`): `vendor: GpuVendor`, `model`, `vram_mb`, `compute_units`, `tensor_cores`, `fp16_tflops_x10`.
-- `ModelCapability` (`:387`): `model_id`, `family`, `parameters_b_x10`, `context_length`, `quantization`, `modalities: Vec<Modality>`, `tokens_per_sec`, `loaded`.
-- `ToolCapability` (`:471`): `tool_id`, `name`, `version`, `input_schema`, `output_schema`, `requires`, `estimated_time_ms`, `stateless`.
-- `ResourceLimits` (`:548`): `max_concurrent_requests`, `max_tokens_per_request`, `rate_limit_rpm`, `max_batch_size`, `max_input_bytes`, `max_output_bytes`.
+- `Tag::AxisPresent { axis, key }` — boolean axis tag (`hardware.gpu`).
+- `Tag::AxisValue { axis, key, value, separator }` — keyed axis tag (`hardware.gpu.vram_mb=24576`, `software.os:linux`). The substrate accepts `=` or `:` as separator and stores it on the wire; semantic equality ignores the separator (`software.os=linux` and `software.os:linux` match).
+- `Tag::Reserved { prefix, body }` — reserved cross-axis tag (`scope:tenant:foo`, `causal:<hex>`, `fork-of:<hex>`, `heat:warm`). Only substrate code emits these; `Tag::parse_user` rejects reserved prefixes from application input.
+- `Tag::Legacy(String)` — untyped pre-Phase-A free-form (`nat:full-cone`, `nrpc:my-service`).
 
-`GpuVendor` is `Nvidia | Amd | Intel | Apple | Qualcomm | Unknown`. `Modality` is `Text | Image | Audio | Video | Code | Embedding | ToolUse`. `parameters_b_x10` and `fp16_tflops_x10` are integer-encoded (× 10) to dodge float precision loss on the wire. `tags` is the free-form escape hatch (`prod`, `customer:acme`, `gpu-pool-a`).
+Hardware / software / model / tool / resource-limit views are *projections* of the tag set, lazily decoded via `caps.views()`:
+
+- `HardwareCapabilities`: `cpu_cores`, `cpu_threads`, `memory_mb`, `gpu: Option<GpuInfo>`, `additional_gpus`, `storage_mb`, `network_mbps`, `accelerators` — encoded as `hardware.cpu_cores=N` / `hardware.gpu` / `hardware.gpu.vram_mb=N` / etc.
+- `GpuInfo`: `vendor: GpuVendor`, `model`, `vram_mb`, `compute_units`, `tensor_cores`, `fp16_tflops_x10`.
+- `ModelCapability`: `model_id`, `family`, `parameters_b_x10`, `context_length`, `quantization`, `modalities`, `tokens_per_sec`, `loaded` — indexed-encoded as `software.model.0.id=...` / `software.model.0.family=...` / etc.
+- `ToolCapability`: `tool_id`, `name`, `version`, `input_schema`, `output_schema`, `requires`, `estimated_time_ms`, `stateless`. Schemas live in `metadata` under `tool::<id>::input_schema` / `tool::<id>::output_schema` (the JSON-Schema strings can't safely round-trip through the tag wire format).
+- `ResourceLimits`: `max_concurrent_requests`, `max_tokens_per_request`, `rate_limit_rpm`, `max_batch_size`, `max_input_bytes`, `max_output_bytes` — encoded under `hardware.limits.*`.
+
+`GpuVendor` is `Nvidia | Amd | Intel | Apple | Qualcomm | Unknown`. `Modality` is `Text | Image | Audio | Video | Code | Embedding | ToolUse`. `parameters_b_x10` and `fp16_tflops_x10` are integer-encoded (× 10) to dodge float precision loss on the wire. Free-form strings the user wants to ride alongside (`prod`, `customer:acme`, `gpu-pool-a`) parse as `Tag::Legacy` via `add_tag` / `tag_from_user_string`.
+
+The builders haven't changed — `CapabilitySet::new().with_hardware(...).add_model(...).add_tag("prod")` writes through to the canonical tag/metadata shape under the hood. Reads via `caps.views().hardware()` decode on first call and cache.
 
 ---
 
@@ -84,6 +89,53 @@ pub struct CapabilityFilter {
 ```
 
 `require_tags` is AND (every tag must be present). `require_models` and `require_tools` are OR (any one match satisfies).
+
+---
+
+## Predicates — the richer query surface
+
+`CapabilityFilter` is the field-comparison surface; it's deliberately narrow. For arbitrary boolean queries (semver compatibility, regex on values, metadata thresholds, AND/OR/NOT compositions) every binding ships a typed `Predicate` AST. Same wire format across Rust / TS / Python / Go / C — pinned by the JSON fixtures under `tests/cross_lang_capability/`.
+
+```rust
+use net_sdk::capabilities::{
+    p, evaluate_predicate, predicate_to_rpc_header,
+    validate_capabilities, tag_key,
+};
+
+let pred = p.and(&[
+    p.exists(&tag_key("hardware", "gpu")),
+    p.numeric_at_least(&tag_key("hardware", "memory_mb"), 65_536.0),
+    p.semver_compatible(&tag_key("software", "runtime.python"), "3.11.0"),
+    p.metadata_equals("intent", "ml-training"),
+]);
+
+// Local evaluation against any (tags, metadata).
+let matched = evaluate_predicate(&pred, &caps.tags, &caps.metadata);
+
+// Wire form for nRPC `cyberdeck-where:` headers — pair with the
+// header-bearing call variants so the server short-circuits
+// candidates without re-running the predicate per hop.
+let header_value = predicate_to_rpc_header(&pred);
+
+// Validate a CapabilitySet against the canonical schema before
+// announcing — catches typos, type mismatches, oversize metadata,
+// legacy-tag warnings.
+let report = validate_capabilities(&caps);
+if !report.is_valid() { /* report.errors */ }
+
+// Detect what changed between two snapshots.
+let delta = caps.diff(&prev);
+
+// Single-evaluation trace + corpus aggregation with optional
+// metadata-key redaction before persistence.
+let (result, trace) = evaluate_predicate_with_trace(&pred, &tags, &metadata);
+let report = predicate_debug_report(&pred, &corpus);
+let safe = redact_metadata_keys(&report, &["intent"]);
+```
+
+Identical surface in TS (`p.and`, `p.exists`, `evaluatePredicate`, `predicateToRpcHeader` / `predicateFromRpcHeader`, `validateCapabilities`, `diffCapabilities`, `evaluatePredicateWithTrace`, `predicateDebugReport`, `redactMetadataKeys`), Python (`p.and_`, `p.exists`, `evaluate_predicate`, …), Go (`Predicate{}`, `EvaluatePredicate`, `PredicateToWhereHeader`), and C (`net_predicate_evaluate`, `net_validate_capabilities`, `net_predicate_to_where_header`, `net_predicate_evaluate_with_trace`, `net_predicate_aggregate_debug_report`, `net_predicate_redact_metadata_keys`). A predicate authored in TS and shipped to a Go server via the header decodes losslessly.
+
+**Placement-filter callbacks (Phase 7).** When the substrate's built-in scoring axes don't fit your placement rule, plug a host-language predicate in via `placement_filter_from_fn(...)` (Rust SDK / TS / Python / Go) — the substrate calls back per candidate. Pair with `standard_placement(custom_filter_id=...)` so the daemon-placement scheduler weights your callback alongside its native axes. C consumers reach the same dispatcher via `net_compute_set_placement_filter_dispatcher` + `net_compute_register_placement_filter` (`include/net.go.h`).
 
 ---
 

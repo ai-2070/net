@@ -30,7 +30,7 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
-use net::adapter::net::behavior::capability::CapabilityFilter;
+use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfig, MeshDaemon};
 use net::adapter::net::state::causal::{CausalEvent, CausalLink};
 use net_sdk::compute::{
@@ -945,6 +945,14 @@ struct PyDaemonBridge {
     process: Py<PyAny>,
     snapshot: Option<Py<PyAny>>,
     restore: Option<Py<PyAny>>,
+    /// Phase 6 of `CAPABILITY_SYSTEM_SDK_PLAN.md`: hard placement
+    /// requirements declared by the Python daemon's
+    /// `required_capabilities` attribute. Static — captured once at
+    /// factory time; not re-queried per placement decision.
+    required_capabilities: CapabilitySet,
+    /// Soft placement preferences declared via
+    /// `optional_capabilities` attribute.
+    optional_capabilities: CapabilitySet,
 }
 
 impl MeshDaemon for PyDaemonBridge {
@@ -954,6 +962,17 @@ impl MeshDaemon for PyDaemonBridge {
 
     fn requirements(&self) -> CapabilityFilter {
         CapabilityFilter::default()
+    }
+
+    /// Phase G slice 2 + Phase 6 SDK plan. Returns the cap set
+    /// captured from the factory's `required_capabilities`
+    /// attribute (or empty default if absent).
+    fn required_capabilities(&self) -> CapabilitySet {
+        self.required_capabilities.clone()
+    }
+
+    fn optional_capabilities(&self) -> CapabilitySet {
+        self.optional_capabilities.clone()
     }
 
     /// Dispatch the event to the Python `process` callable. The
@@ -1115,12 +1134,55 @@ fn build_bridge_inline(
         Err(_) => None,
     };
 
+    // Phase 6 SDK plan: extract optional capability declarations
+    // from the factory return value. Both attributes are
+    // optional; missing attributes (or `None` values) fall back to
+    // empty defaults (run anywhere). Type errors raise typed
+    // daemon errors so misconfigured factories surface loudly.
+    let required_capabilities = extract_optional_caps(py, &instance, "required_capabilities")?;
+    let optional_capabilities = extract_optional_caps(py, &instance, "optional_capabilities")?;
+
     Ok(Box::new(PyDaemonBridge {
         name: kind.to_string(),
         process,
         snapshot,
         restore,
+        required_capabilities,
+        optional_capabilities,
     }))
+}
+
+/// Read an optional `CapabilitySet`-shaped attribute off a Python
+/// object. Returns the empty set if the attribute is missing or
+/// `None`; rejects non-dict values with a typed daemon error.
+/// Phase 6 SDK plan helper.
+fn extract_optional_caps(
+    py: Python<'_>,
+    instance: &Py<PyAny>,
+    attr: &str,
+) -> PyResult<CapabilitySet> {
+    // Treat `AttributeError` as "attribute not declared" (the
+    // documented optional case). Every other exception — most
+    // commonly a `@property` getter raising — must propagate so
+    // operators see the real failure instead of silently
+    // collapsing the daemon's declared caps to empty.
+    let v = match instance.getattr(py, attr) {
+        Ok(v) => v,
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
+            return Ok(CapabilitySet::default());
+        }
+        Err(e) => return Err(e),
+    };
+    if v.is_none(py) {
+        return Ok(CapabilitySet::default());
+    }
+    let bound = v.into_bound(py);
+    let dict = bound.cast_into::<PyDict>().map_err(|_| {
+        daemon_err(format!(
+            "daemon `{attr}` must be a dict (CapabilitySet shape)"
+        ))
+    })?;
+    crate::capabilities::capability_set_from_py(&dict)
 }
 
 /// Build a `PyDaemonBridge` from a tokio worker (no GIL held on
@@ -1168,11 +1230,35 @@ fn build_bridge_from_factory(
             Ok(v) if !v.is_none(py) => Some(v),
             _ => None,
         };
+        // Phase 6 SDK plan: capability declarations. Failures here
+        // (non-dict attribute values, conversion errors) fall back
+        // to `ReconstructionErrorBridge` rather than empty defaults
+        // so misconfiguration is loud, not silent.
+        let required_capabilities =
+            match extract_optional_caps(py, &instance, "required_capabilities") {
+                Ok(c) => c,
+                Err(e) => {
+                    let reason = format!("`required_capabilities` extraction failed: {e}");
+                    eprintln!("build_bridge_from_factory: kind '{kind}': {reason}");
+                    return Box::new(ReconstructionErrorBridge::new(kind.to_string(), reason));
+                }
+            };
+        let optional_capabilities =
+            match extract_optional_caps(py, &instance, "optional_capabilities") {
+                Ok(c) => c,
+                Err(e) => {
+                    let reason = format!("`optional_capabilities` extraction failed: {e}");
+                    eprintln!("build_bridge_from_factory: kind '{kind}': {reason}");
+                    return Box::new(ReconstructionErrorBridge::new(kind.to_string(), reason));
+                }
+            };
         Box::new(PyDaemonBridge {
             name: kind.to_string(),
             process,
             snapshot,
             restore,
+            required_capabilities,
+            optional_capabilities,
         })
     })
 }
