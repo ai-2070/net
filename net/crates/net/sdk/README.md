@@ -500,8 +500,12 @@ let (_result, _trace) = p.evaluate_with_trace(&ctx);
 let (_name, _value): (String, Vec<u8>) = predicate_to_rpc_header(&p)?;
 let _ = RPC_WHERE_HEADER;
 // Reverse direction: parse a peer-supplied header back into the AST.
+// `predicate_from_rpc_headers` returns `Option<Result<Predicate, _>>`
+// — `None` when the `cyberdeck-where` header is absent, `Some(Err(_))`
+// on malformed payload. Use `.transpose()?` to flip into
+// `Result<Option<Predicate>, _>` and propagate decode errors.
 # let header_pairs: Vec<(String, Vec<u8>)> = Vec::new();
-let _decoded = predicate_from_rpc_headers(&header_pairs)?;
+let _decoded: Option<_> = predicate_from_rpc_headers(&header_pairs).transpose()?;
 
 // Validate against the canonical schema.
 let report = validate_capabilities(&caps);
