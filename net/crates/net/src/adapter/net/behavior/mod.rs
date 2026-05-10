@@ -54,7 +54,11 @@ pub use predicate::{
     predicate_to_rpc_header,
 };
 
-pub use placement::{Artifact, LegacyPlacement, NodeId as PlacementNodeId, PlacementFilter};
+pub use placement::{
+    AntiAffinityConfig, Artifact, ColocationPolicy, IntentMatchPolicy, LegacyPlacement,
+    NodeId as PlacementNodeId, PlacementFilter, PlacementMetadataKeys, ResourceAxis, ScopeLabel,
+    StandardPlacement, compose_axis_scores,
+};
 
 pub use required_capability::{RequireParseError, RequiredCapability};
 

@@ -199,7 +199,9 @@ pub use net::adapter::net::behavior::capability::{CardinalityCache, CardinalityP
 // =============================================================================
 
 pub use net::adapter::net::behavior::placement::{
-    Artifact, LegacyPlacement, NodeId as PlacementNodeId, PlacementFilter,
+    AntiAffinityConfig, Artifact, ColocationPolicy, IntentMatchPolicy, LegacyPlacement,
+    NodeId as PlacementNodeId, PlacementFilter, PlacementMetadataKeys, ResourceAxis, ScopeLabel,
+    StandardPlacement, compose_axis_scores,
 };
 
 // =============================================================================
