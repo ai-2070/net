@@ -138,6 +138,42 @@ def test_validate_handles_non_string_metadata_without_crashing() -> None:
     assert all(w.to_wire()["kind"] != "metadata_oversize" for w in report.warnings)
 
 
+def test_metadata_reserved_exact_match_warns() -> None:
+    """P2-L: mirror substrate CR-14 — schema's
+    ``metadata_reserved`` (exact-match: ``intent``,
+    ``colocate-with``, ``priority``, ``owner``,
+    ``colocate-with-strict``) must be flagged in the report.
+    Pre-fix the validator never consulted the list, so user
+    code shadowing scheduler hints emitted no warning.
+    """
+    from net_sdk.capability_schema import WarningMetadataReservedKey
+
+    caps = {"tags": [], "metadata": {"intent": "ml-training", "benign": "ok"}}
+    report = validate_capabilities(caps)
+    reserved = [
+        w for w in report.warnings if isinstance(w, WarningMetadataReservedKey)
+    ]
+    assert len(reserved) == 1
+    assert reserved[0].key == "intent"
+
+
+def test_metadata_reserved_prefix_warns() -> None:
+    """P2-L: prefix-match reservations (``tool::*``)."""
+    from net_sdk.capability_schema import WarningMetadataReservedPrefix
+
+    caps = {
+        "tags": [],
+        "metadata": {"tool::evil::input_schema": "spoof"},
+    }
+    report = validate_capabilities(caps)
+    matches = [
+        w for w in report.warnings if isinstance(w, WarningMetadataReservedPrefix)
+    ]
+    assert len(matches) == 1
+    assert matches[0].key == "tool::evil::input_schema"
+    assert matches[0].prefix == "tool::"
+
+
 def test_number_value_rejects_negative() -> None:
     """P1-C: substrate ``Number`` is unsigned (u64-only) — see CR-15
     and ``schema.rs::ValueType::Number``. Negative values surface

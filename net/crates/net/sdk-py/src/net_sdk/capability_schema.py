@@ -246,8 +246,34 @@ class WarningLegacyTag:
         return {"kind": "legacy_tag", "tag": self.tag}
 
 
+# P2-L: mirror substrate CR-14 reserved-metadata warnings.
+@dataclass(frozen=True)
+class WarningMetadataReservedKey:
+    key: str
+
+    def to_wire(self) -> Dict[str, Any]:
+        return {"kind": "metadata_reserved_key", "key": self.key}
+
+
+@dataclass(frozen=True)
+class WarningMetadataReservedPrefix:
+    key: str
+    prefix: str
+
+    def to_wire(self) -> Dict[str, Any]:
+        return {
+            "kind": "metadata_reserved_prefix",
+            "key": self.key,
+            "prefix": self.prefix,
+        }
+
+
 ValidationWarning = Union[
-    WarningUnknownKey, WarningMetadataOversize, WarningLegacyTag
+    WarningUnknownKey,
+    WarningMetadataOversize,
+    WarningLegacyTag,
+    WarningMetadataReservedKey,
+    WarningMetadataReservedPrefix,
 ]
 
 
@@ -422,6 +448,25 @@ def validate_capabilities(
         elif isinstance(tag, TagLegacy):
             warnings.append(WarningLegacyTag(tag=tag.raw))
 
+    # P2-L: metadata-key reservation check. The schema declares
+    # `metadata_reserved` (exact-match) and
+    # `metadata_reserved_prefixes` (prefix-match) but pre-fix the
+    # Python validator never consulted them — a user's
+    # `with_metadata("intent", …)` smuggling onto a scheduler-
+    # reserved key emitted no warning. Mirrors the substrate's
+    # CR-14 fix.
+    for key in metadata.keys():
+        key_str = str(key)
+        if key_str in schema.metadata_reserved:
+            warnings.append(WarningMetadataReservedKey(key=key_str))
+            continue
+        for prefix in schema.metadata_reserved_prefixes:
+            if key_str.startswith(prefix):
+                warnings.append(
+                    WarningMetadataReservedPrefix(key=key_str, prefix=prefix)
+                )
+                break
+
     # The wire shape says metadata is `{str: str}`, but Python's
     # untyped dicts let callers smuggle through `int` / `bool` /
     # `None` etc. Coerce both halves to `str` for the size
@@ -462,6 +507,8 @@ __all__ = [
     "WarningUnknownKey",
     "WarningMetadataOversize",
     "WarningLegacyTag",
+    "WarningMetadataReservedKey",
+    "WarningMetadataReservedPrefix",
     "ValidationReport",
     "validate_capabilities",
 ]
