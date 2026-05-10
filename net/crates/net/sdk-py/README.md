@@ -621,6 +621,66 @@ Cross-SDK contract + rationale:
 > **Note.** `net_sdk` does not yet proxy the groups surface; use the
 > native `net` package directly, the same way as the security types.
 
+## Capability enhancements (typed taxonomy + predicates + validation)
+
+The SDK exposes a caller-local enhancement layer on top of
+`announce_capabilities` / `find_nodes`. The wire format is
+byte-identical across all four bindings (Rust / TS / Python / Go) —
+pinned by JSON fixtures under `tests/cross_lang_capability/`.
+
+```python
+from net_sdk import (
+    # Typed taxonomy
+    tag_from_user_string, RESERVED_PREFIXES,
+    # Chain helpers
+    empty_capabilities, require_tag, require_axis_value, with_metadata,
+    # Predicates
+    p, evaluate_predicate, predicate_to_rpc_header, RPC_WHERE_HEADER,
+    tag_key,
+    # Validation
+    validate_capabilities,
+    # Diff
+    diff_capabilities,
+    # Debug
+    predicate_debug_report, redact_metadata_keys,
+)
+
+# Build a capability set in the wire shape `{ tags, metadata }`.
+caps = empty_capabilities()
+caps = require_tag(caps, "hardware", "gpu")
+caps = require_axis_value(caps, "software", "os", "linux")
+caps = with_metadata(caps, "intent", "ml-training")
+
+# Author a predicate.
+pred = p.and_(
+    p.exists(tag_key("hardware", "gpu")),
+    p.numeric_at_least(tag_key("hardware", "memory_mb"), 65536),
+    p.metadata_equals("intent", "ml-training"),
+)
+
+# Local evaluation (no mesh round-trip).
+matched = evaluate_predicate(pred, caps.tags, caps.metadata)
+
+# Wire form for nRPC `cyberdeck-where:` headers.
+header_value = predicate_to_rpc_header(pred)
+
+# Validate against the canonical schema.
+report = validate_capabilities(caps)
+if not report.is_valid():
+    print("schema errors:", report.errors)
+
+# Detect what changed between two snapshots.
+delta = diff_capabilities(prev_caps, caps)
+
+# Profile a predicate across a corpus + render a per-clause report.
+debug = predicate_debug_report(pred, contexts)
+safe = redact_metadata_keys(debug, ["intent"])  # scrub before persisting
+print(safe.render())
+```
+
+Migration from the legacy field-access API:
+[`CAPABILITY_SYSTEM_MIGRATION.md`](../docs/CAPABILITY_SYSTEM_MIGRATION.md).
+
 ## API
 
 | Method | Description |

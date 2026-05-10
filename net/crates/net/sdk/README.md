@@ -443,6 +443,74 @@ narrowing, never out by accident). Full design:
 Wire-level details and the subprotocol layout live in
 [`docs/CAPABILITY_BROADCAST_PLAN.md`](../docs/CAPABILITY_BROADCAST_PLAN.md).
 
+#### Capability enhancements (typed taxonomy + predicates + validation)
+
+The substrate's `CapabilitySet` is a `{ tags, metadata }` wire shape
+post-Phase A.5.N. Beyond `announce_capabilities` / `find_nodes`, the
+SDK exposes the caller-local enhancement layer mirroring
+[`CAPABILITY_ENHANCEMENTS_PLAN.md`](../docs/plans/CAPABILITY_ENHANCEMENTS_PLAN.md):
+
+```rust
+use net_sdk::capabilities::{
+    // Typed taxonomy
+    Tag, TagKey, TaxonomyAxis, RESERVED_PREFIXES,
+    // Lazy view projections
+    CapabilitySet, CapabilityViews,
+    // Diff
+    CapabilitySetDiff, MetadataChange,
+    // Predicates (substrate AST + nRPC envelope)
+    predicate::{Predicate, EvalContext, predicate_to_rpc_header, RPC_WHERE_HEADER},
+    pred,
+    // Validation
+    schema::{validate_capabilities, ValidationReport, SchemaError},
+};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+# let caps = CapabilitySet::default();
+# let prev = CapabilitySet::default();
+# let tags: Vec<Tag> = Vec::new();
+# let metadata = std::collections::BTreeMap::<String, String>::new();
+// Lazy view projections: per-axis OnceCell-cached decode.
+let views = caps.views();
+let _hw = views.hardware();          // Decodes hardware.* tags on first call.
+let _sw = views.software();          // Independent of hardware decode.
+
+// Predicate AST — language-idiomatic builder + macro form.
+let p = pred!(and [
+    pred!(exists "hardware.gpu"),
+    pred!(num_at_least "hardware.memory_mb", 65536.0),
+    pred!(metadata_equals "intent", "ml-training"),
+]);
+
+// Local evaluation against any (tags, metadata) context.
+let ctx = EvalContext::new(&tags, &metadata);
+let _matched = p.evaluate(&ctx);
+
+// Wire form for nRPC `cyberdeck-where:` headers.
+let _header_value = predicate_to_rpc_header(&p);
+let _ = RPC_WHERE_HEADER;
+
+// Validate against the canonical schema.
+let report = validate_capabilities(&caps);
+if !report.is_valid() {
+    eprintln!("schema errors: {:?}", report.errors);
+}
+
+// Detect what changed between two snapshots — drives placement
+// re-evaluation when a daemon's CapabilitySet updates.
+let _diff = caps.diff(&prev);
+# Ok(())
+# }
+```
+
+The wire format is byte-identical across all four bindings (Rust /
+TS / Python / Go) — pinned by the JSON fixtures under
+`tests/cross_lang_capability/`. Migration from the legacy
+field-access API:
+[`CAPABILITY_SYSTEM_MIGRATION.md`](../docs/CAPABILITY_SYSTEM_MIGRATION.md).
+A worked-examples guide for each enhancement API is at
+[`CAPABILITY_ENHANCEMENTS_USAGE.md`](../docs/CAPABILITY_ENHANCEMENTS_USAGE.md).
+
 ### Subnets (visibility partitioning)
 
 `MeshBuilder::subnet(id)` pins a node to one of 2³² possible 4-level
