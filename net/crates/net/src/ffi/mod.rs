@@ -144,6 +144,16 @@ pub mod predicate;
 #[cfg(feature = "net")]
 pub mod schema;
 
+/// C FFI for predicate debug-session helpers (Phase 9d of
+/// `CAPABILITY_SYSTEM_SDK_PLAN.md`). Pure helpers — single-eval
+/// `evaluate_with_trace`, corpus-wide
+/// `aggregate_debug_report`, and host-side
+/// `redact_metadata_keys`. Mirror what every other binding
+/// ships at the SDK layer; exposed at the C ABI for raw
+/// consumers.
+#[cfg(feature = "net")]
+pub mod predicate_debug;
+
 /// C FFI for the Redis Streams consumer-side dedup helper. Mirrors
 /// the Rust `net::adapter::RedisStreamDedup` surface for Go / C / Zig
 /// consumers. See `ffi::redis_dedup` module docs for the wire

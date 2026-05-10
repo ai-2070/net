@@ -841,6 +841,89 @@ int      net_validate_capabilities(const char* caps_json,
                                    char** out_report_json,
                                    size_t* out_report_len);
 
+/* Predicate debug-session helpers (Phase 9d of
+ * CAPABILITY_SYSTEM_SDK_PLAN.md). Three pure helpers exposing
+ * what every binding ships at the SDK layer. Cross-binding
+ * contracts pinned by:
+ *   - tests/cross_lang_capability/predicate_trace.json
+ *   - tests/cross_lang_capability/predicate_debug_report.json
+ *   - tests/cross_lang_capability/predicate_debug_report_redacted.json
+ */
+
+/* Evaluate a predicate against (tags, metadata) and produce a
+ * `ClauseTrace` tree mirroring the AST that actually ran (And /
+ * Or short-circuits drop unevaluated siblings).
+ *
+ * Inputs (NUL-terminated UTF-8 JSON):
+ *   - predicate_json — wire-format `PredicateWire`.
+ *   - tags_json      — JSON array of tag strings.
+ *   - metadata_json  — JSON object of `string -> string`.
+ *
+ * Outputs:
+ *   - *out_result    — 1 if predicate matched, 0 otherwise.
+ *   - *out_trace_json/_len — JSON `{label, result, children}`
+ *     tree. Free with `net_free_string`.
+ *
+ * Returns 0 on success, NET_ERR_* (negative) otherwise. */
+int      net_predicate_evaluate_with_trace(const char* predicate_json,
+                                           const char* tags_json,
+                                           const char* metadata_json,
+                                           int* out_result,
+                                           char** out_trace_json,
+                                           size_t* out_trace_len);
+
+/* Run `predicate` against every entry in `contexts_json` and
+ * produce a `PredicateDebugReport` aggregated across the corpus.
+ *
+ * Inputs (NUL-terminated UTF-8 JSON):
+ *   - predicate_json — wire-format `PredicateWire`.
+ *   - contexts_json  — `[{"tags":[...], "metadata":{...}}, ...]`.
+ *
+ * Output: *out_report_json/_len — JSON
+ *   {
+ *     "total_candidates": N,
+ *     "matched": M,
+ *     "clause_stats": [{"label":..., "evaluated":..., "matched":...}, ...]
+ *   }
+ * `clause_stats` sorted by label (BTreeMap iteration order on
+ * the substrate side). Free with `net_free_string`.
+ *
+ * Returns 0 on success, NET_ERR_* (negative) otherwise. */
+int      net_predicate_aggregate_debug_report(const char* predicate_json,
+                                              const char* contexts_json,
+                                              char** out_report_json,
+                                              size_t* out_report_len);
+
+/* Rewrite metadata-clause labels in a `PredicateDebugReport` to
+ * scrub sensitive values before persistence / sharing. Pure
+ * host-side: the substrate doesn't ship a redaction impl; each
+ * binding implements it. This C ABI ports the same logic as TS /
+ * Python / Go.
+ *
+ * Rules:
+ *   MetadataEquals(<key>=<value>)            → MetadataEquals(<key>=<redacted>)
+ *   MetadataMatches(<key> contains "<pat>")  → MetadataMatches(<key> contains "<redacted>")
+ *   MetadataNumericAtLeast(<key> >= <thr>)   → MetadataNumericAtLeast(<key> >= <redacted>)
+ *   MetadataExists(<key>)                    — unchanged (no value)
+ *   non-metadata labels                      — unchanged
+ *
+ * Stats with the same redacted label merge; output is sorted by
+ * label. Idempotent: redact(redact(r,k),k) == redact(r,k).
+ *
+ * Inputs (NUL-terminated UTF-8 JSON):
+ *   - report_json — wire-format `PredicateDebugReport` (output
+ *     of net_predicate_aggregate_debug_report).
+ *   - keys_json   — `["api_key", "secret_token"]`.
+ *
+ * Output: *out_redacted_json/_len — same wire shape, free with
+ * `net_free_string`.
+ *
+ * Returns 0 on success, NET_ERR_* (negative) otherwise. */
+int      net_predicate_redact_metadata_keys(const char* report_json,
+                                            const char* keys_json,
+                                            char** out_redacted_json,
+                                            size_t* out_redacted_len);
+
 /* =========================================================================
  * Compute — MeshDaemon + migration. Stage 6 of
  * SDK_COMPUTE_SURFACE_PLAN.md. Symbols live in `libnet_compute`
