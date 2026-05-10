@@ -484,6 +484,24 @@ pub fn compose_axis_scores(scores: impl IntoIterator<Item = f32>) -> f32 {
 
 impl<'a> PlacementFilter for StandardPlacement<'a> {
     fn placement_score(&self, target: &NodeId, artifact: &Artifact<'_>) -> Option<f32> {
+        // N-4: resolve the custom-filter axis BEFORE entering
+        // `with_caps`. `with_caps` holds a per-shard read lock; its
+        // doc explicitly warns the closure must not acquire any
+        // other index locks (`capability.rs:3119-3122`).
+        // `score_custom_filter_axis` invokes externally registered
+        // `&dyn PlacementFilter` impls — including FFI filters from
+        // JS / Python / Go (Phase 7 slices 2-4) and Rust-side
+        // `LegacyPlacement` shims that call
+        // `self.index.query(&self.filter)` directly
+        // (`placement.rs:159-172`). Either path under the shard lock
+        // deadlocks against a concurrent `index.index(...)` insert.
+        //
+        // The custom filter only needs `target` + `artifact` — no
+        // dependency on `target_caps` — so lift it out. A `None`
+        // return (the filter vetoed) short-circuits before the
+        // `with_caps` clone path, saving the lookup work.
+        let custom = self.score_custom_filter_axis(target, artifact)?;
+
         // Look up the candidate's announced caps via the non-
         // cloning path. The closure holds the index's per-shard
         // read lock for the scoring call; saves the
@@ -504,14 +522,6 @@ impl<'a> PlacementFilter for StandardPlacement<'a> {
                         return None;
                     }
                 }
-
-                // SDK Phase 7 slice 5 — custom-filter axis. Resolved
-                // here (BEFORE the in-tree axes) because a custom
-                // filter may hard-veto the candidate, and there's no
-                // point computing the in-tree axes if the custom
-                // filter is going to drop the candidate anyway. The
-                // score is composed in below.
-                let custom = self.score_custom_filter_axis(target, artifact)?;
 
                 // Per-axis scoring (slice 5 of Phase F filled these
                 // in). Each takes the borrowed `&CapabilitySet`.
@@ -3068,6 +3078,62 @@ mod tests {
                 placement.placement_score(&0x6666, &artifact),
                 Some(0.0),
                 "scope-axis 0.0 zeroes the composition even when custom = 1.0",
+            );
+        });
+    }
+
+    /// N-4 regression: a custom `PlacementFilter` that re-enters the
+    /// `CapabilityIndex` (via `query` / `find_nodes_matching` /
+    /// `with_caps` on the same target) must NOT deadlock during
+    /// `StandardPlacement::placement_score`. Pre-fix the custom-filter
+    /// axis was invoked inside the outer `with_caps` closure, which
+    /// holds a per-shard read lock — re-entrant index access under
+    /// a concurrent writer deadlocked per the `with_caps` doc warning.
+    ///
+    /// The filter below queries the index from inside its
+    /// `placement_score` callback. If the fix regresses, this test
+    /// hangs (the harness will time it out).
+    #[test]
+    fn standard_placement_custom_filter_can_query_index_without_deadlock() {
+        struct ReentrantFilter {
+            index: Arc<CapabilityIndex>,
+        }
+        impl PlacementFilter for ReentrantFilter {
+            fn placement_score(
+                &self,
+                target: &NodeId,
+                _artifact: &Artifact<'_>,
+            ) -> Option<f32> {
+                // Touch the index from inside the callback. Pre-fix
+                // this was running under the outer `with_caps` shard
+                // read lock and would deadlock against a concurrent
+                // writer; post-fix the custom filter runs BEFORE
+                // `with_caps` so re-entry is safe.
+                let _ = self.index.query(&CapabilityFilter::default());
+                let _ = self
+                    .index
+                    .with_caps(*target, |caps| caps.tags.len());
+                Some(0.75)
+            }
+        }
+
+        let index = index_with(&[(0x7777, empty_caps())]);
+        let id = "pf-test-N4-reentrant";
+        let filter = Arc::new(ReentrantFilter {
+            index: index.clone(),
+        });
+        with_registered_filter(id, filter, |id| {
+            let placement = StandardPlacement::new(&index).with_custom_filter_id(id);
+            let req = empty_caps();
+            let opt = empty_caps();
+            let artifact = daemon_artifact(&req, &opt);
+            // Score composes through: ReentrantFilter returns 0.75,
+            // every in-tree axis is at its default 1.0, so the
+            // product is 0.75.
+            assert_eq!(
+                placement.placement_score(&0x7777, &artifact),
+                Some(0.75),
+                "reentrant custom filter must complete without deadlock",
             );
         });
     }
