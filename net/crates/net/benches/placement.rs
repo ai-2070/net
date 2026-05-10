@@ -77,20 +77,32 @@ impl PlacementFilter for AlwaysOneFilter {
 /// fixture's `PredicatePlacementFilter`. Two-clause predicate
 /// (`exists hardware.gpu AND equals region us-east`); pins the
 /// realistic per-candidate cost.
+///
+/// Uses `CapabilityIndex::with_caps` to avoid the per-call
+/// `CapabilitySet` clone that the legacy `get()` path performs;
+/// the closure runs while the DashMap shard's read lock is held,
+/// which is fine because `Predicate::evaluate_unplanned` only
+/// reads `EvalContext` and doesn't touch the index.
 struct PredicateFilter {
     pred: Predicate,
     index: Arc<CapabilityIndex>,
 }
 impl PlacementFilter for PredicateFilter {
     fn placement_score(&self, target: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
-        let caps = self.index.get(*target)?;
-        let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
-        let ctx = EvalContext::new(&tags, &caps.metadata);
-        if self.pred.evaluate_unplanned(&ctx) {
-            Some(1.0)
-        } else {
-            None
-        }
+        self.index
+            .with_caps(*target, |caps| {
+                // EvalContext::new takes `&[Tag]`. HashSet → Vec
+                // collection is the only allocation per call;
+                // bounded by the candidate's tag cardinality.
+                let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
+                let ctx = EvalContext::new(&tags, &caps.metadata);
+                if self.pred.evaluate_unplanned(&ctx) {
+                    Some(1.0)
+                } else {
+                    None
+                }
+            })
+            .flatten()
     }
 }
 

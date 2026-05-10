@@ -735,16 +735,23 @@ impl PlacementFilter for PredicatePlacementFilter {
         target: &PlacementNodeId,
         _artifact: &Artifact<'_>,
     ) -> Option<f32> {
-        let caps = self.index.get(*target)?;
-        // `EvalContext::new` takes a `&[Tag]` slice; `caps.tags` is a
-        // `HashSet<Tag>`, so collect into a Vec for the borrow.
-        let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
-        let ctx = EvalContext::new(&tags, &caps.metadata);
-        if self.pred.evaluate_unplanned(&ctx) {
-            Some(1.0)
-        } else {
-            None
-        }
+        // Use the non-cloning `with_caps` path. Holds the DashMap
+        // shard's read lock for the closure's duration; safe here
+        // because `Predicate::evaluate_unplanned` only reads
+        // `EvalContext` and doesn't re-enter the index.
+        self.index
+            .with_caps(*target, |caps| {
+                // `EvalContext::new` takes `&[Tag]`; `caps.tags` is a
+                // `HashSet<Tag>`, so collect into a Vec.
+                let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
+                let ctx = EvalContext::new(&tags, &caps.metadata);
+                if self.pred.evaluate_unplanned(&ctx) {
+                    Some(1.0)
+                } else {
+                    None
+                }
+            })
+            .flatten()
     }
 }
 
