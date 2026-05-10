@@ -1,0 +1,30 @@
+net/crates/net/src/adapter/net/behavior/placement.rs
+  s_d1b11a1287c170::t_8d81b49ef3112d 25
+  s_d1b11a1287c170::t_4927985347d4be 639-653,666-667,673,678-707,716-751
+  s_d1b11a1287c170::t_501c83be284b7c 654-665,668-672,674-677
+  s_d1b11a1287c170::t_d8b9dc0006fb9b 708-715
+  s_d1b11a1287c170::t_ab451c929e32e9 1142-1145,1153-1154,1158-1160,1162,1164-1166,1169-1170,1174-1176,1178,1180-1186,1191-1193,1196,1198-1199,1201-1204,1207-1213,1215-1222,1224-1226,1228,1230-1238,1242,1244,1246,1248-1250,1252-1253,1259-1260,1295-1297,1299-1300,1303,1305-1309
+  s_d1b11a1287c170::t_8f010134ee7ee4 1146-1152,1155-1157,1161,1163,1167-1168,1171-1173,1177,1179,1187-1190,1194-1195,1197,1200,1205-1206,1214,1223,1227,1229,1239-1241,1243,1245,1247,1251,1254-1258,1261-1294,1298,1301-1302,1304
+net/crates/net/src/adapter/net/behavior/mod.rs
+  s_d1b11a1287c170::t_8771fc4ae58616 60-61
+net/crates/net/sdk/src/capabilities.rs
+  s_d1b11a1287c170::t_eb99eef00ffbeb 204-205
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  s_d1b11a1287c170::t_eea77db00df5c4 759-781
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "0eea4dc860454803b4c22aebd604ad29550165e6",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
