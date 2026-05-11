@@ -437,11 +437,13 @@ impl Redex {
             policy = policy.with_emit_threshold_ratio(r as f32);
         }
         if let Some(secs) = cfg_js.decay_half_life_secs {
-            policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs as u64));
+            let secs_u64 = bigint_u64(secs)?;
+            policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs_u64));
         }
-        let tick = std::time::Duration::from_millis(
-            cfg_js.tick_interval_ms.map(|v| v as u64).unwrap_or(500),
-        );
+        let tick = match cfg_js.tick_interval_ms {
+            Some(v) => std::time::Duration::from_millis(bigint_u64(v)?),
+            None => std::time::Duration::from_millis(500),
+        };
         let arc = mesh.node_arc_clone()?;
         self.inner
             .enable_gravity_for_greedy(arc, policy, tick)
@@ -590,10 +592,14 @@ pub struct DataGravityConfigJs {
     /// `2.0`.
     pub emit_threshold_ratio: Option<f64>,
     /// Decay half-life in seconds. Default `1800` (30 min).
-    pub decay_half_life_secs: Option<u32>,
+    /// `BigInt` so values match the Python `u64` / Go `uint64`
+    /// shape; u32 here would overflow at ~136 years which is
+    /// silly but the cross-binding parity matters more.
+    pub decay_half_life_secs: Option<BigInt>,
     /// Tick interval for the gravity tick task, in milliseconds.
-    /// Default `500`.
-    pub tick_interval_ms: Option<u32>,
+    /// Default `500`. `BigInt` for parity with Python u64 / Go
+    /// uint64; a u32 ms field overflows at ~49 days.
+    pub tick_interval_ms: Option<BigInt>,
 }
 
 /// JS-side config for `Redex.enableGreedyDataforts`. Locked

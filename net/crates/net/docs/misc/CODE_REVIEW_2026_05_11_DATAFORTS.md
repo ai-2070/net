@@ -60,7 +60,7 @@ Tagged `[B | H | M | L]`:
 | D-26  | M   | greedy       | `entry.bytes` saturating drift under retention trim                        | ⏳ |
 | D-27  | M   | greedy       | `NIC_PEAK_BYTES_PER_S` hard-coded; no override on `GreedyConfig`           | ✅ (folded into D-2) |
 | D-28  | M   | greedy       | 5 separate `cache.lock()` acquisitions per dispatch                        | ⏳ |
-| D-29  | M   | gravity      | `should_emit_heat` `inf`-prone with near-zero `prev`                      | ⏳ |
+| D-29  | M   | gravity      | `should_emit_heat` `inf`-prone with near-zero `prev`                      | ✅ |
 | D-30  | M   | gravity      | Wire-side `(rate/(rate+1))` saturation at top end                          | ⏳ |
 | D-31  | M   | blob fs      | `BlobError::NotFound(uri)` propagates raw attacker URI → log injection     | ✅ |
 | D-32  | M   | blob fs      | Concurrent stores race on shared `<hash>.tmp` filename                     | ✅ (folded into D-12) |
@@ -72,7 +72,7 @@ Tagged `[B | H | M | L]`:
 | D-38  | M   | RYW          | 1024 cap is per-adapter; no process-wide bound                             | ⏳ |
 | D-39  | M   | FFI cortex   | `mesh_arc` drop duplicated per error branch — RAII guard wanted            | ⏳ |
 | D-40  | M   | node blob    | `await_tsfn_promise` applies 30s timeout twice → 60s worst-case           | ⏳ |
-| D-41  | M   | node cortex  | `DataGravityConfigJs.*_secs/_ms` u32 vs Python u64 vs Go uint64           | ⏳ |
+| D-41  | M   | node cortex  | `DataGravityConfigJs.*_secs/_ms` u32 vs Python u64 vs Go uint64           | ✅ |
 | D-42  | M   | python blob  | `Py<PyAny>` adapters can outlive interpreter finalization                  | ⏳ |
 | D-43  | M   | python blob  | `data.to_vec()` happens before GIL is released for large payloads          | ⏳ |
 | D-44  | M   | go binding   | Greedy/gravity numeric fields can't express literal `0` via `omitempty`   | 🚫 won't-fix — substrate rejects 0 for every affected field; `omitempty` is correct |

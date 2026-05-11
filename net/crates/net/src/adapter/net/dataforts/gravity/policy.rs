@@ -185,9 +185,12 @@ pub fn should_emit_heat(
         // rate doubled (current/prev >= ratio) OR
         // rate halved (prev/current >= ratio).
         (Some(prev), r) => {
-            if prev <= 0.0 {
-                // Defensive: a prior emission with non-positive
-                // value shouldn't happen but treat as "emit fresh."
+            // Guard against `inf` / `NaN`: a `prev` near zero (the
+            // counter-side clamp shouldn't allow it, but pure
+            // functions must not rely on caller-side defenses) makes
+            // `r / prev` explode toward +inf. Treat near-zero `prev`
+            // as "no prior emission" so the bootstrap arm runs cleanly.
+            if !prev.is_finite() || !r.is_finite() || prev <= f64::EPSILON {
                 EmissionDecision::Emit { rate: r }
             } else if (r / prev) >= ratio || (prev / r) >= ratio {
                 EmissionDecision::Emit { rate: r }
