@@ -88,10 +88,7 @@ pub(crate) const NET_ERR_PANIC: c_int = -108;
 /// not reachable (no permit is taken). Used by the FFI when the
 /// caller passes timeout_ms == 0 to mean "is the write visible
 /// yet?" without scheduling a Notified future.
-fn tasks_poll_for_token(
-    adapter: &Arc<InnerTasksAdapter>,
-    token: InnerWriteToken,
-) -> c_int {
+fn tasks_poll_for_token(adapter: &Arc<InnerTasksAdapter>, token: InnerWriteToken) -> c_int {
     if token.origin_hash != adapter.origin_hash() {
         return NET_ERR_WRONG_ORIGIN;
     }
@@ -102,10 +99,7 @@ fn tasks_poll_for_token(
     }
 }
 
-fn memories_poll_for_token(
-    adapter: &Arc<InnerMemoriesAdapter>,
-    token: InnerWriteToken,
-) -> c_int {
+fn memories_poll_for_token(adapter: &Arc<InnerMemoriesAdapter>, token: InnerWriteToken) -> c_int {
     if token.origin_hash != adapter.origin_hash() {
         return NET_ERR_WRONG_ORIGIN;
     }

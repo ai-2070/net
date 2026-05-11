@@ -11,7 +11,9 @@ use net::adapter::net::channel::ChannelName;
 use net::adapter::net::cortex::{
     set_global_ryw_inflight_cap, CortexAdapter, CortexAdapterConfig, WaitForTokenError,
 };
-use net::adapter::net::redex::{Redex, RedexError, RedexEvent, RedexFileConfig, RedexFold, WriteToken};
+use net::adapter::net::redex::{
+    Redex, RedexError, RedexEvent, RedexFileConfig, RedexFold, WriteToken,
+};
 
 /// Trivial fold: count event appends. We only need an adapter
 /// that runs the fold task; the test doesn't drive ingest.

@@ -528,21 +528,20 @@ impl<State> CortexAdapter<State> {
         // and a producer whose write hit such a skip must NOT
         // observe Ok(()) (that would let them read state that
         // doesn't reflect their write).
-        let outcome = match tokio::time::timeout(deadline, self.wait_for_applied_seq(token.seq))
-            .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(applied_through_seq)) => Err(WaitForTokenError::FoldStopped {
-                applied_through_seq,
-            }),
-            Err(_) => {
-                self.inner
-                    .ryw_metrics
-                    .timeouts_total
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(WaitForTokenError::Timeout)
-            }
-        };
+        let outcome =
+            match tokio::time::timeout(deadline, self.wait_for_applied_seq(token.seq)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(applied_through_seq)) => Err(WaitForTokenError::FoldStopped {
+                    applied_through_seq,
+                }),
+                Err(_) => {
+                    self.inner
+                        .ryw_metrics
+                        .timeouts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(WaitForTokenError::Timeout)
+                }
+            };
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.inner
             .ryw_metrics

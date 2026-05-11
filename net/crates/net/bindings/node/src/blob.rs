@@ -285,7 +285,14 @@ impl NodeBlobAdapter {
         fetch_range: FetchRangeTsfn,
         exists: ExistsTsfn,
     ) -> Self {
-        Self::new_with_timeout(id, store, fetch, fetch_range, exists, DEFAULT_JS_ADAPTER_TIMEOUT)
+        Self::new_with_timeout(
+            id,
+            store,
+            fetch,
+            fetch_range,
+            exists,
+            DEFAULT_JS_ADAPTER_TIMEOUT,
+        )
     }
 
     pub fn new_with_timeout(
@@ -523,7 +530,14 @@ impl NodeAsyncBlobAdapter {
         fetch_range: FetchRangeAsyncTsfn,
         exists: ExistsAsyncTsfn,
     ) -> Self {
-        Self::new_with_timeout(id, store, fetch, fetch_range, exists, DEFAULT_JS_ADAPTER_TIMEOUT)
+        Self::new_with_timeout(
+            id,
+            store,
+            fetch,
+            fetch_range,
+            exists,
+            DEFAULT_JS_ADAPTER_TIMEOUT,
+        )
     }
 
     pub fn new_with_timeout(

@@ -4981,8 +4981,7 @@ impl MeshNode {
         caps: &mut crate::adapter::net::behavior::capability::CapabilitySet,
     ) {
         // Collect every hex this peer claims via causal: tags.
-        let mut claimed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for tag in &caps.tags {
             if let Tag::Reserved { prefix, body } = tag {
                 if prefix == "causal:" {
@@ -9997,6 +9996,9 @@ mod chain_helper_tests {
             t,
             Tag::Reserved { prefix, .. } if prefix == "scope:"
         )));
-        assert!(caps.tags.iter().any(|t| MeshNode::is_causal_for(t, &owned_hex)));
+        assert!(caps
+            .tags
+            .iter()
+            .any(|t| MeshNode::is_causal_for(t, &owned_hex)));
     }
 }

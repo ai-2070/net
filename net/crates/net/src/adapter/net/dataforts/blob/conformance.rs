@@ -124,7 +124,9 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
     if !tampered.is_empty() && tampered_hash != blob.hash {
         match adapter.store(&blob, &tampered).await {
             Err(BlobError::HashMismatch { .. }) => {}
-            Ok(()) => return Err("store accepted bytes that don't hash to the claimed BlobRef.hash"),
+            Ok(()) => {
+                return Err("store accepted bytes that don't hash to the claimed BlobRef.hash")
+            }
             Err(_) => return Err("store rejected mismatched bytes with the wrong error variant"),
         }
     }
@@ -141,8 +143,8 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
 
     // Cross-blob isolation — a second blob's content must not
     // bleed into the first blob's fetch.
-    let second_payload: Vec<u8> = format!("second-payload-{}-{}", std::process::id(), run_nonce)
-        .into_bytes();
+    let second_payload: Vec<u8> =
+        format!("second-payload-{}-{}", std::process::id(), run_nonce).into_bytes();
     let second_hash: [u8; 32] = blake3::hash(&second_payload).into();
     let second_blob = BlobRef::new(
         format!("conformance://{}/second", adapter.adapter_id()),

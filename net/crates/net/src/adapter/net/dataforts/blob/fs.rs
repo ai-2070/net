@@ -141,7 +141,11 @@ impl BlobAdapter for FileSystemAdapter {
         }
         let path = self.path_for(&blob_ref.hash);
         let bytes = bytes.to_vec();
-        let _permit = self.concurrency.clone().acquire_owned().await
+        let _permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
         tokio::task::spawn_blocking(move || -> Result<(), BlobError> {
             let _permit = _permit; // hold across the blocking work
@@ -210,7 +214,11 @@ impl BlobAdapter for FileSystemAdapter {
     async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
         let path = self.path_for(&blob_ref.hash);
         let uri = sanitize_uri_for_error(&blob_ref.uri);
-        let _permit = self.concurrency.clone().acquire_owned().await
+        let _permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>, BlobError> {
             let _permit = _permit;
@@ -253,7 +261,11 @@ impl BlobAdapter for FileSystemAdapter {
         let path = self.path_for(&blob_ref.hash);
         let uri = sanitize_uri_for_error(&blob_ref.uri);
         let start = range.start;
-        let _permit = self.concurrency.clone().acquire_owned().await
+        let _permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>, BlobError> {
             let _permit = _permit;
@@ -275,14 +287,18 @@ impl BlobAdapter for FileSystemAdapter {
 
     async fn exists(&self, blob_ref: &BlobRef) -> Result<bool, BlobError> {
         let path = self.path_for(&blob_ref.hash);
-        let permit = self.concurrency.clone().acquire_owned().await
+        let permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
         let res = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             Path::new(&path).is_file()
         })
-            .await
-            .map_err(|e| backend(format!("join error: {}", e)))?;
+        .await
+        .map_err(|e| backend(format!("join error: {}", e)))?;
         Ok(res)
     }
 

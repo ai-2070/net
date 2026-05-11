@@ -123,9 +123,7 @@ impl BlobRef {
     /// the payload as inline). Returns `Err` only when the magic
     /// matches but the rest of the frame is malformed.
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>, BlobError> {
-        if bytes.len() < BLOB_REF_MAGIC.len()
-            || bytes[..BLOB_REF_MAGIC.len()] != BLOB_REF_MAGIC
-        {
+        if bytes.len() < BLOB_REF_MAGIC.len() || bytes[..BLOB_REF_MAGIC.len()] != BLOB_REF_MAGIC {
             return Ok(None);
         }
         if bytes.len() < BLOB_REF_HEADER_LEN {

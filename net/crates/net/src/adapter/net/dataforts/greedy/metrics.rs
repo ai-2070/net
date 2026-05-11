@@ -616,9 +616,7 @@ mod tests {
         assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"colocation\"} 0"));
         assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"capacity\"} 0"));
         assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"bandwidth\"} 0"));
-        assert!(text.contains(
-            "dataforts_greedy_observer_dropped_total{reason=\"overloaded\"} 0"
-        ));
+        assert!(text.contains("dataforts_greedy_observer_dropped_total{reason=\"overloaded\"} 0"));
     }
 
     #[test]

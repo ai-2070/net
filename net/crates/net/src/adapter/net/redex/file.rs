@@ -360,11 +360,7 @@ impl RedexFile {
     /// shouldn't call it per-event.
     pub fn retained_bytes(&self) -> u64 {
         let state = self.inner.state.lock();
-        state
-            .index
-            .iter()
-            .map(|e| u64::from(e.payload_len))
-            .sum()
+        state.index.iter().map(|e| u64::from(e.payload_len)).sum()
     }
 
     /// Next sequence to be assigned (== total append count since open,

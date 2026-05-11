@@ -311,11 +311,7 @@ mod tests {
             fn adapter_id(&self) -> &str {
                 &self.id
             }
-            async fn store(
-                &self,
-                _blob_ref: &BlobRef,
-                _bytes: &[u8],
-            ) -> Result<(), BlobError> {
+            async fn store(&self, _blob_ref: &BlobRef, _bytes: &[u8]) -> Result<(), BlobError> {
                 Ok(())
             }
             async fn fetch(&self, _blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {

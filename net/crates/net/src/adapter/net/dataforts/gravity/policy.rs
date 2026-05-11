@@ -141,8 +141,9 @@ impl DataGravityPolicy {
         if !rate.is_finite() || rate <= 0.0 {
             return 0.0;
         }
-        let reference = self.normalization_reference_rate.max(MIN_NORMALIZATION_REFERENCE_RATE)
-            as f64;
+        let reference = self
+            .normalization_reference_rate
+            .max(MIN_NORMALIZATION_REFERENCE_RATE) as f64;
         let denom = reference.ln_1p();
         if denom <= 0.0 {
             return 0.0;

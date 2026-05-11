@@ -207,9 +207,7 @@ impl GreedyCacheRegistry {
         if origin_hash == 0 {
             return false;
         }
-        self.entries
-            .values()
-            .any(|e| e.origin_hash == origin_hash)
+        self.entries.values().any(|e| e.origin_hash == origin_hash)
     }
 
     /// Iterate over cached channel names.
@@ -587,7 +585,11 @@ mod tests {
         let mut reg = GreedyCacheRegistry::new(1_000_000);
         let now = Instant::now();
         let per_channel_cap = 2048u64;
-        reg.upsert(cn("test/a"), open_file(&redex, "test/a", per_channel_cap), now);
+        reg.upsert(
+            cn("test/a"),
+            open_file(&redex, "test/a", per_channel_cap),
+            now,
+        );
 
         // Drive registry past the per-channel cap.
         for _ in 0..20 {
