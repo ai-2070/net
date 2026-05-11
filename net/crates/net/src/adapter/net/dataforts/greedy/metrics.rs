@@ -116,6 +116,13 @@ pub struct GreedyClusterMetricsAtomic {
     /// dashboard this against admit_rejected counters to
     /// distinguish "rejected by policy" from "dropped under load".
     pub observer_dropped_overloaded_total: AtomicU64,
+    /// Cumulative `note_read` calls skipped under gravity because
+    /// the chain's `origin_hash == 0` (the default publisher
+    /// doesn't stamp identity). Per-chain heat would collapse
+    /// into a single bucket if we bumped these, so we skip them
+    /// and surface the count instead. Operators see this rising
+    /// when their publishers aren't configured to stamp origins.
+    pub gravity_heat_unattributed_total: AtomicU64,
 }
 
 impl GreedyClusterMetricsAtomic {
@@ -160,6 +167,12 @@ impl GreedyClusterMetricsAtomic {
     /// Increment the observer-overload drop counter.
     pub fn incr_observer_dropped_overloaded(&self) {
         self.observer_dropped_overloaded_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the gravity unattributed-heat skip counter.
+    pub fn incr_gravity_heat_unattributed(&self) {
+        self.gravity_heat_unattributed_total
             .fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -292,6 +305,10 @@ impl GreedyMetricsRegistry {
                     .cluster
                     .observer_dropped_overloaded_total
                     .load(Ordering::Relaxed),
+                gravity_heat_unattributed_total: self
+                    .cluster
+                    .gravity_heat_unattributed_total
+                    .load(Ordering::Relaxed),
             },
         }
     }
@@ -332,6 +349,9 @@ pub struct GreedyClusterMetrics {
     /// `observe_event` in-flight cap was saturated and the event
     /// was discarded without entering the admission pipeline.
     pub observer_dropped_overloaded_total: u64,
+    /// Cumulative gravity heat bumps skipped because the chain's
+    /// `origin_hash == 0` (publisher didn't stamp identity).
+    pub gravity_heat_unattributed_total: u64,
 }
 
 /// Full snapshot — sorted channel list + cluster-wide counters.
@@ -425,6 +445,22 @@ impl GreedyMetricsSnapshot {
             self.cluster.observer_dropped_overloaded_total,
         );
 
+        // Gravity heat-bumps skipped because the chain origin
+        // wasn't stamped (origin_hash == 0).
+        let _ = writeln!(
+            out,
+            "# HELP dataforts_greedy_gravity_heat_unattributed_total Cumulative gravity note_read bumps skipped because origin_hash was zero (publisher didn't stamp identity)."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE dataforts_greedy_gravity_heat_unattributed_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "dataforts_greedy_gravity_heat_unattributed_total {}",
+            self.cluster.gravity_heat_unattributed_total,
+        );
+
         out
     }
 
@@ -439,6 +475,7 @@ impl GreedyMetricsSnapshot {
             && self.cluster.admit_rejected_bandwidth_total == 0
             && self.cluster.io_budget_used_bytes == 0
             && self.cluster.observer_dropped_overloaded_total == 0
+            && self.cluster.gravity_heat_unattributed_total == 0
     }
 }
 

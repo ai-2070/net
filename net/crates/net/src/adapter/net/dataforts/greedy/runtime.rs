@@ -337,21 +337,25 @@ impl GreedyRuntime {
             let gravity = self.inner.gravity.read();
             if let Some(gravity) = gravity.as_ref() {
                 if let Some(origin_hash) = origin_hash {
-                    // Bump the heat counter unconditionally —
-                    // origin_hash == 0 is a valid bucket (the
-                    // standard publish path leaves the header
-                    // origin_hash at zero unless the publisher
-                    // explicitly stamps its identity, in which
-                    // case all chains observed under that
-                    // publisher share one heat counter). Real
-                    // deployments configure their publishers to
-                    // stamp meaningful origin_hashes so the
-                    // counter is per-chain; tests against the
-                    // default publish path aggregate into the
-                    // zero bucket.
-                    let mut heat = gravity.heat.lock();
-                    heat.entry_mut(origin_hash, gravity.policy.decay_half_life, now)
-                        .bump(now);
+                    // Skip heat tracking when origin_hash == 0
+                    // (publisher hasn't stamped identity). All
+                    // chains on a node with default publishers
+                    // would otherwise collapse into one bucket,
+                    // collapsing per-chain heat into an aggregate
+                    // "global temperature." The skip is counted
+                    // in dataforts_greedy_gravity_heat_unattributed_total
+                    // so operators see the signal and configure
+                    // their publishers to stamp origins.
+                    if origin_hash == 0 {
+                        self.inner
+                            .metrics
+                            .cluster()
+                            .incr_gravity_heat_unattributed();
+                    } else {
+                        let mut heat = gravity.heat.lock();
+                        heat.entry_mut(origin_hash, gravity.policy.decay_half_life, now)
+                            .bump(now);
+                    }
                 }
             }
         }
@@ -958,6 +962,48 @@ mod tests {
             1,
             "second tick must suppress when rate is unchanged"
         );
+    }
+
+    /// note_read with origin_hash == 0 must NOT enter the heat
+    /// registry — otherwise every chain on a node with default
+    /// publishers collapses into one shared heat counter. The
+    /// skip is reflected in
+    /// `gravity_heat_unattributed_total` so operators see the
+    /// signal and configure their publishers to stamp identity.
+    #[tokio::test]
+    async fn gravity_skips_unattributed_origin_zero() {
+        use crate::adapter::net::dataforts::gravity::DataGravityPolicy;
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let redex = Arc::new(Redex::new());
+        let sink = Arc::new(RecorderSink::default());
+        let heat_sink = Arc::new(RecorderHeatSink::default());
+        let rt = GreedyRuntime::new(
+            cfg,
+            redex,
+            sink as Arc<dyn ChainTagSink>,
+            Arc::new(CapabilitySet::default()),
+            IntentRegistry::new(),
+        );
+        rt.set_gravity(
+            DataGravityPolicy::default(),
+            heat_sink.clone() as Arc<dyn crate::adapter::net::dataforts::gravity::HeatSink>,
+        );
+        let chain = CapabilitySet::default();
+        // origin_hash = 0 — default publisher path.
+        rt.dispatch_event(&cn("test/unstamped"), 0, &chain, b"x")
+            .await;
+        rt.note_read(&cn("test/unstamped"));
+        rt.note_read(&cn("test/unstamped"));
+        rt.gravity_tick().await;
+        // Heat sink saw nothing — the bucket was never populated.
+        assert!(
+            heat_sink.announces.lock().is_empty(),
+            "origin_hash=0 must not produce heat emissions"
+        );
+        // Operator-facing signal is the unattributed counter.
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.gravity_heat_unattributed_total, 2);
     }
 
     /// Colocation hints (`metadata.colocate-with-strict`) must be
