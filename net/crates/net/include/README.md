@@ -502,6 +502,8 @@ typedef struct ArcMeshNode ArcMeshNode;
 extern RedexHandle* net_redex_new(const char* persistent_dir);
 extern void net_redex_free(RedexHandle* h);
 
+typedef struct RedexTailHandle RedexTailHandle;
+
 extern int net_redex_open_file(
     RedexHandle* redex,
     const char* name,
@@ -514,9 +516,31 @@ extern int net_redex_file_append(
     size_t payload_len,
     uint64_t* out_seq
 );
+extern int net_redex_file_read_range(
+    RedexFileHandle* file,
+    uint64_t start,
+    uint64_t end,
+    char** out_json,
+    size_t* out_len
+);
+extern int net_redex_file_sync(RedexFileHandle* file);
 extern uint64_t net_redex_file_len(RedexFileHandle* file);
 extern int net_redex_file_close(RedexFileHandle* file);
 extern void net_redex_file_free(RedexFileHandle* file);
+
+/* Tail cursor */
+extern int net_redex_file_tail(
+    RedexFileHandle* file,
+    uint64_t from_seq,
+    RedexTailHandle** out_cursor
+);
+extern int net_redex_tail_next(
+    RedexTailHandle* cursor,
+    uint32_t timeout_ms,
+    char** out_json,
+    size_t* out_len
+);
+extern void net_redex_tail_free(RedexTailHandle* cursor);
 
 /* Replication (require `Arc<MeshNode>` from `net_mesh_arc_clone`) */
 extern int net_redex_enable_replication(
