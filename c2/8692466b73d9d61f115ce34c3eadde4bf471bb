@@ -1,0 +1,44 @@
+net/crates/net/src/adapter/net/dataforts/blob/fs.rs
+  s_3a0a24a47d1a36::t_872f9908afe42b 19,22,28-32
+  s_3a0a24a47d1a36::t_e14125de122809 249-250,252
+  s_3a0a24a47d1a36::t_f8d3f00d8370a4 271-276
+  s_3a0a24a47d1a36::t_351765fb3885e1 40-44,50-52,57,61-65
+  s_3a0a24a47d1a36::t_9b653144ab80b3 206-207,209
+  s_3a0a24a47d1a36::t_576ea04d3d50f6 137-138,140
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_28b82b33adf395 68
+  s_3a0a24a47d1a36::t_67e8df43dacf55 79
+  s_3a0a24a47d1a36::t_9481c39009e331 70
+  s_3a0a24a47d1a36::t_26244b9e52fff8 62
+  s_3a0a24a47d1a36::t_1f8e735450ce58 73
+  s_3a0a24a47d1a36::t_5b718e7fdc8412 76
+  s_3a0a24a47d1a36::t_c34dafaab30959 87-88
+  s_3a0a24a47d1a36::t_c0a72cf73cf87a 64
+  s_3a0a24a47d1a36::t_0eefd7c4fa7e77 72
+  s_3a0a24a47d1a36::t_8ad29b9b6eaa10 71
+  s_3a0a24a47d1a36::t_d7f6674f9ac70d 58-60
+  s_3a0a24a47d1a36::t_c1ec59d12d323f 80-81
+  s_3a0a24a47d1a36::t_66fe88e908c343 74
+  s_3a0a24a47d1a36::t_ca3d232e5ec2bc 69
+  s_3a0a24a47d1a36::t_e1ce645d4a0ae0 77
+net/crates/net/bindings/node/src/blob.rs
+  s_3a0a24a47d1a36::t_d6b9a8624a3e11 544-550,573,580
+net/crates/net/src/ffi/cortex.rs
+  s_3a0a24a47d1a36::t_364e037f473017 78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "c28692466b73d9d61f115ce34c3eadde4bf471bb",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
