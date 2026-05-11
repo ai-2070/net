@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/dataforts/gravity/sink.rs
+  s_3a0a24a47d1a36::t_e80f8e479a1a06 28-48
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_454ec93ee91e8e 70
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_3a0a24a47d1a36::t_8c436ac6486dec 408-413,423,426,430-436
+net/crates/net/src/adapter/net/mesh.rs
+  s_3a0a24a47d1a36::t_9bc137c5a314a3 6534-6576
+  s_3a0a24a47d1a36::t_ec3c55d36fbe73 6589-6595
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "10b088d26f5f73e8e2b746c2bde7d053dcfe970b",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
