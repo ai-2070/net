@@ -35,9 +35,10 @@ use crate::adapter::net::cortex::tasks::{
     OrderBy as TasksOrderBy, Task, TaskStatus, TasksAdapter as InnerTasksAdapter, TasksFilter,
     TasksWatcher,
 };
+use crate::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use crate::adapter::net::redex::{
     FsyncPolicy, Redex as InnerRedex, RedexError, RedexEvent, RedexFile as InnerRedexFile,
-    RedexFileConfig,
+    RedexFileConfig, WriteToken as InnerWriteToken,
 };
 
 use super::handle_guard::{HandleGuard, FFI_HANDLE_FREE_DEADLINE};
@@ -58,6 +59,13 @@ pub(crate) const NET_ERR_NETDB: c_int = -102;
 pub(crate) const NET_ERR_REDEX: c_int = -103;
 pub(crate) const NET_ERR_TIMEOUT: c_int = 1;
 pub(crate) const NET_ERR_STREAM_ENDED: c_int = 2;
+/// Read-your-writes wait rejected because the token belongs to a
+/// different origin than the bound adapter folds. See
+/// `WaitForTokenError::WrongOrigin`.
+pub(crate) const NET_ERR_WRONG_ORIGIN: c_int = -104;
+/// Read-your-writes wait rejected because the per-channel wait
+/// queue is saturated. See `WaitForTokenError::QueueFull`.
+pub(crate) const NET_ERR_QUEUE_FULL: c_int = -105;
 
 // =========================================================================
 // Shared utilities
@@ -1547,6 +1555,38 @@ pub extern "C" fn net_tasks_wait_for_seq(
     })
 }
 
+/// Read-your-writes wait. Returns `0` on success, `NET_ERR_TIMEOUT`
+/// (`1`) on deadline, `NET_ERR_WRONG_ORIGIN` (`-104`) if the token's
+/// origin does not match this adapter, or `NET_ERR_QUEUE_FULL`
+/// (`-105`) if the per-channel wait queue is saturated.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_tasks_wait_for_token(
+    handle: *mut TasksAdapterHandle,
+    origin_hash: u64,
+    seq: u64,
+    timeout_ms: u32,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let adapter: Arc<InnerTasksAdapter> = Arc::clone(&tasks.inner);
+    let token = InnerWriteToken::new(origin_hash, seq);
+    let deadline = std::time::Duration::from_millis(timeout_ms.max(1) as u64);
+    block_on(async move {
+        match adapter.wait_for_token(token, deadline).await {
+            Ok(()) => 0,
+            Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
+            Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+            Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
+        }
+    })
+}
+
 #[derive(Deserialize, Default)]
 struct TasksFilterJson {
     status: Option<String>,
@@ -2149,6 +2189,36 @@ pub extern "C" fn net_memories_wait_for_seq(
                 Ok(_) => 0,
                 Err(_) => NET_ERR_TIMEOUT,
             }
+        }
+    })
+}
+
+/// Read-your-writes wait. See [`net_tasks_wait_for_token`] for the
+/// return-code contract.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_memories_wait_for_token(
+    handle: *mut MemoriesAdapterHandle,
+    origin_hash: u64,
+    seq: u64,
+    timeout_ms: u32,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let adapter: Arc<InnerMemoriesAdapter> = Arc::clone(&mem.inner);
+    let token = InnerWriteToken::new(origin_hash, seq);
+    let deadline = std::time::Duration::from_millis(timeout_ms.max(1) as u64);
+    block_on(async move {
+        match adapter.wait_for_token(token, deadline).await {
+            Ok(()) => 0,
+            Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
+            Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+            Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
         }
     })
 }
