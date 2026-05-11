@@ -4,7 +4,7 @@
 
 ## Status
 
-**The Warriors shipped in v0.14 (2026-05-12).** Phases 0, 2, 6 (primitives only), and 7 are in the codebase. The four remaining phases — all under the **Rebel Yell** release — stay parked until their activation gates fire. See [§ Implementation-ready specs for remaining phases](#implementation-ready-specs-for-remaining-phases) for the locked decisions + actionable work items per remaining phase.
+**The Warriors shipped in v0.14 (2026-05-12).** Phases 0, 2, 6 (primitives only), and 7 are in the codebase. **Phase 1 (Greedy-LRU dataforts) shipped behind the `dataforts-greedy` Cargo feature flag** on the `dataforts-phase-1` branch — operator-facing surface across Rust core + Python + Node + Go + C FFI, with end-to-end mesh integration. Three remaining Rebel Yell phases stay parked until their activation gates fire. See [§ Implementation-ready specs for remaining phases](#implementation-ready-specs-for-remaining-phases) for the locked decisions + actionable work items per remaining phase.
 
 | Phase | Release | Status | Where it lives |
 |---|---|---|---|
@@ -12,7 +12,7 @@
 | 6 — Federated query primitives (Warriors-scope) | Warriors | ✅ shipped v0.13 (primitives only; MeshDB extension still deferred) | `adapter::net::behavior::query::CapabilityQuery` |
 | 7 — 5-axis `PlacementFilter` + Mikoshi integration | Warriors | ✅ shipped v0.13 | `adapter::net::behavior::placement::{PlacementFilter, Artifact, StandardPlacement, IntentRegistry}` |
 | 2 — RedEX cross-node replication (`SUBPROTOCOL_REDEX`) | Warriors | ✅ shipped v0.14 | `adapter::net::redex::replication*` |
-| 1 — Greedy-LRU dataforts | Rebel Yell | ⏳ open | — |
+| 1 — Greedy-LRU dataforts | Rebel Yell | ✅ shipped on `dataforts-phase-1` branch (behind `dataforts-greedy` feature) | `adapter::net::dataforts::greedy::*`, `Redex::enable_greedy_dataforts`, mesh inbound hook, all four bindings |
 | 3 — `BlobRef` + `BlobAdapter` hook | Rebel Yell | ⏳ open (independent — can ship parallel) | — |
 | 4 — Data gravity (heat-counter migration) | Rebel Yell | ⏳ open (depends on Phase 1) | — |
 | 5 — Read-your-writes guarantees | Rebel Yell | ⏳ open (independent) | — |
@@ -63,7 +63,7 @@ Seven phases across two releases, sequenced by dependency:
 | 6 | Federated query primitives | **Warriors** | ✅ v0.13 (primitives) | 2–4 weeks (primitives only) | Foundation for Rebel Yell's cross-axis queries | 0 |
 | 7 | Generalized 5-axis `PlacementFilter` + Mikoshi integration | **Warriors** | ✅ v0.13 | 1–2 weeks | Foundation for placement decisions across substrate (data + compute) | 0, 6 |
 | 2 | RedEX V2 — raw log-segment replication | **Warriors** | ✅ v0.14 | 4–9 weeks | Workload needs durability beyond single node | 0, 7 |
-| 1 | Greedy-LRU dataforts (composes `PlacementFilter`) | **Rebel Yell** | ⏳ open | 1–2 weeks | Rebel Yell ships | 0, 7 |
+| 1 | Greedy-LRU dataforts (composes `PlacementFilter`) | **Rebel Yell** | ✅ shipped (branch `dataforts-phase-1`) | 1–2 weeks | Rebel Yell ships | 0, 7 |
 | 4 | Data gravity (heat-counter migration) | **Rebel Yell** | ⏳ open | 1–2 weeks | Production telemetry shows access skew Phase 1 doesn't absorb | 0, 1 |
 | 3 | BlobRef + BlobAdapter hook trait | **Rebel Yell** (parallel-shippable with Warriors) | ⏳ open | 1–2 weeks | Payloads systematically exceed inline threshold (default 1 MB) | 0 (independent of 1, 2) |
 | 5 | Read-your-writes guarantees | **Rebel Yell** | ⏳ open | 2–4 weeks | App ergonomics request session-bounded consistency | — |
@@ -162,7 +162,7 @@ Land the first time any of Phases 1–4, 6 activates. Cheap enough that we shoul
 
 ---
 
-## Phase 1 — Greedy-LRU dataforts (Rebel Yell) ⏳ open
+## Phase 1 — Greedy-LRU dataforts (Rebel Yell) ✅ shipped on `dataforts-phase-1`
 
 A node observes streams flowing past via the existing tail subscription path. If it has spare disk, ACL access, a scope match, AND its capability set matches the chain's intent, it caches a copy. When disk fills, LRU evicts. Withdraws the capability tag on eviction so reads route elsewhere. **No coordination protocol.** Smallest Rebel Yell phase; ships fastest; covers 60–80% of the perceived-durability story without orchestrated replication.
 
