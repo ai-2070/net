@@ -28,10 +28,10 @@
       "name": "exists_matches_axis_value_form_too",
       "summary": "Exists evaluates true on `<axis>.<key>=<value>` since the axis-key matches; the value is irrelevant for Exists.",
       "wire": {
-        "nodes": [{ "kind": "exists", "key": { "axis": "hardware", "key": "memory_mb" } }],
+        "nodes": [{ "kind": "exists", "key": { "axis": "hardware", "key": "memory_gb" } }],
         "root_idx": 0
       },
-      "tags": ["hardware.memory_mb=65536"],
+      "tags": ["hardware.memory_gb=64"],
       "metadata": {},
       "expected": true
     },
@@ -76,13 +76,13 @@
         "nodes": [
           {
             "kind": "numeric_at_least",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "threshold": 65536.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "threshold": 64.0
           }
         ],
         "root_idx": 0
       },
-      "tags": ["hardware.memory_mb=131072"],
+      "tags": ["hardware.memory_gb=128"],
       "metadata": {},
       "expected": true
     },
@@ -93,13 +93,13 @@
         "nodes": [
           {
             "kind": "numeric_at_least",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "threshold": 65536.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "threshold": 64.0
           }
         ],
         "root_idx": 0
       },
-      "tags": ["hardware.memory_mb=65536"],
+      "tags": ["hardware.memory_gb=64"],
       "metadata": {},
       "expected": true
     },
@@ -110,13 +110,13 @@
         "nodes": [
           {
             "kind": "numeric_at_least",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "threshold": 65536.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "threshold": 64.0
           }
         ],
         "root_idx": 0
       },
-      "tags": ["hardware.memory_mb=32768"],
+      "tags": ["hardware.memory_gb=32"],
       "metadata": {},
       "expected": false
     },
@@ -127,13 +127,13 @@
         "nodes": [
           {
             "kind": "numeric_at_least",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "threshold": 65536.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "threshold": 64.0
           }
         ],
         "root_idx": 0
       },
-      "tags": ["hardware.memory_mb=lots"],
+      "tags": ["hardware.memory_gb=lots"],
       "metadata": {},
       "expected": false
     },
@@ -161,14 +161,14 @@
         "nodes": [
           {
             "kind": "numeric_in_range",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "min": 32768.0,
-            "max": 131072.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "min": 32.0,
+            "max": 128.0
           }
         ],
         "root_idx": 0
       },
-      "tags": ["hardware.memory_mb=65536"],
+      "tags": ["hardware.memory_gb=64"],
       "metadata": {},
       "expected": true
     },
@@ -179,14 +179,14 @@
         "nodes": [
           {
             "kind": "numeric_in_range",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "min": 32768.0,
-            "max": 131072.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "min": 32.0,
+            "max": 128.0
           }
         ],
         "root_idx": 0
       },
-      "tags": ["hardware.memory_mb=16384"],
+      "tags": ["hardware.memory_gb=16"],
       "metadata": {},
       "expected": false
     },
@@ -534,8 +534,8 @@
           { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
           {
             "kind": "numeric_at_least",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "threshold": 65536.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "threshold": 64.0
           },
           { "kind": "or", "children": [0, 1] },
           { "kind": "metadata_exists", "key": "intent" },
@@ -552,7 +552,7 @@
       },
       "tags": [
         "hardware.gpu",
-        "hardware.memory_mb=131072",
+        "hardware.memory_gb=128",
         "software.runtime.python=3.11.5"
       ],
       "metadata": { "intent": "ml-training" },
@@ -566,8 +566,8 @@
           { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
           {
             "kind": "numeric_at_least",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "threshold": 65536.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "threshold": 64.0
           },
           { "kind": "or", "children": [0, 1] },
           { "kind": "metadata_exists", "key": "intent" },
@@ -584,7 +584,7 @@
       },
       "tags": [
         "hardware.gpu",
-        "hardware.memory_mb=131072",
+        "hardware.memory_gb=128",
         "software.runtime.python=3.11.5"
       ],
       "metadata": { "intent": "ml-training", "decommissioning": "true" },
@@ -598,8 +598,8 @@
           { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
           {
             "kind": "numeric_at_least",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "threshold": 65536.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "threshold": 64.0
           },
           { "kind": "or", "children": [0, 1] },
           { "kind": "metadata_exists", "key": "intent" },
@@ -616,7 +616,7 @@
       },
       "tags": [
         "hardware.cpu_cores=64",
-        "hardware.memory_mb=262144",
+        "hardware.memory_gb=256",
         "software.runtime.python=3.12.0"
       ],
       "metadata": { "intent": "embedding-cache" },

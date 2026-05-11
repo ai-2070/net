@@ -140,7 +140,7 @@ describe('DaemonRuntime (Stage 3 sub-step 1: skeleton + lifecycle)', () => {
         tags: ['hardware.gpu'],
       },
       optionalCapabilities: {
-        tags: ['hardware.gpu.vram_mb=81920'],
+        tags: ['hardware.gpu.vram_gb=80'],
       },
     });
 

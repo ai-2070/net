@@ -102,7 +102,7 @@ the NAPI POJO shape:
 
 ```python
 caps: dict = {
-    "hardware": {"cpu_cores": 16, "memory_mb": 65536, "gpu": {...}},
+    "hardware": {"cpu_cores": 16, "memory_gb": 64, "gpu": {...}},
     "software": {"os": "linux", ...},
     "models": [{"model_id": "llama-3.1-70b", ...}],
     "tools": [...],

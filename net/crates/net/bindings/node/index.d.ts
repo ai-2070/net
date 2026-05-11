@@ -1329,7 +1329,7 @@ export interface AcceleratorJs {
   /** `tpu` | `npu` | `fpga` | `asic` | `dsp` | `unknown`. */
   kind: string
   model: string
-  memoryMb?: number
+  memoryGb?: number
   /** TOPS × 10 (matches the core's integer storage). */
   topsX10?: number
 }
@@ -1597,7 +1597,7 @@ export interface GpuInfoJs {
    */
   vendor?: string
   model: string
-  vramMb: number
+  vramGb: number
   computeUnits?: number
   tensorCores?: number
   fp16TflopsX10?: number
@@ -1629,11 +1629,11 @@ export interface GroupHostConfigJs {
 export interface HardwareJs {
   cpuCores?: number
   cpuThreads?: number
-  memoryMb?: number
+  memoryGb?: number
   gpu?: GpuInfoJs
   additionalGpus?: Array<GpuInfoJs>
-  storageMb?: bigint
-  networkMbps?: number
+  storageGb?: bigint
+  networkGbps?: number
   accelerators?: Array<AcceleratorJs>
 }
 

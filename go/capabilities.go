@@ -46,7 +46,7 @@ func capabilityErrorFromCode(code C.int) error {
 type GPUInfo struct {
 	Vendor         string `json:"vendor,omitempty"` // nvidia | amd | intel | apple | qualcomm | unknown
 	Model          string `json:"model,omitempty"`
-	VRAMMB         uint32 `json:"vram_mb,omitempty"`
+	VRAMGB         uint32 `json:"vram_gb,omitempty"`
 	ComputeUnits   uint32 `json:"compute_units,omitempty"`
 	TensorCores    uint32 `json:"tensor_cores,omitempty"`
 	FP16TFLOPSX10  uint32 `json:"fp16_tflops_x10,omitempty"`
@@ -56,7 +56,7 @@ type GPUInfo struct {
 type AcceleratorInfo struct {
 	Kind      string `json:"kind,omitempty"` // tpu | npu | fpga | asic | dsp | unknown
 	Model     string `json:"model,omitempty"`
-	MemoryMB  uint32 `json:"memory_mb,omitempty"`
+	MemoryGB  uint32 `json:"memory_gb,omitempty"`
 	TOPSX10   uint32 `json:"tops_x10,omitempty"`
 }
 
@@ -65,11 +65,11 @@ type AcceleratorInfo struct {
 type HardwareCaps struct {
 	CPUCores       uint32            `json:"cpu_cores,omitempty"`
 	CPUThreads     uint32            `json:"cpu_threads,omitempty"`
-	MemoryMB       uint32            `json:"memory_mb,omitempty"`
+	MemoryGB       uint32            `json:"memory_gb,omitempty"`
 	GPU            *GPUInfo          `json:"gpu,omitempty"`
 	AdditionalGPUs []GPUInfo         `json:"additional_gpus,omitempty"`
-	StorageMB      uint64            `json:"storage_mb,omitempty"`
-	NetworkMbps    uint32            `json:"network_mbps,omitempty"`
+	StorageGB      uint64            `json:"storage_gb,omitempty"`
+	NetworkGbps    uint32            `json:"network_gbps,omitempty"`
 	Accelerators   []AcceleratorInfo `json:"accelerators,omitempty"`
 }
 
@@ -135,10 +135,10 @@ type CapabilityFilter struct {
 	RequireTags       []string `json:"require_tags,omitempty"`
 	RequireModels     []string `json:"require_models,omitempty"`
 	RequireTools      []string `json:"require_tools,omitempty"`
-	MinMemoryMB       uint32   `json:"min_memory_mb,omitempty"`
+	MinMemoryGB       uint32   `json:"min_memory_gb,omitempty"`
 	RequireGPU        bool     `json:"require_gpu,omitempty"`
 	GPUVendor         string   `json:"gpu_vendor,omitempty"`
-	MinVRAMMB         uint32   `json:"min_vram_mb,omitempty"`
+	MinVRAMGB         uint32   `json:"min_vram_gb,omitempty"`
 	MinContextLength  uint32   `json:"min_context_length,omitempty"`
 	RequireModalities []string `json:"require_modalities,omitempty"`
 }

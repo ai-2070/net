@@ -15,10 +15,10 @@
 //! HardwareCapabilities {
 //!     cpu_cores: 16,
 //!     cpu_threads: 32,
-//!     memory_mb: 65536,
-//!     gpu: Some(GpuInfo { vendor: Nvidia, model: "RTX 4090", vram_mb: 24576, ... }),
-//!     storage_mb: 2_000_000,
-//!     network_mbps: 10000,
+//!     memory_gb: 64,
+//!     gpu: Some(GpuInfo { vendor: Nvidia, model: "RTX 4090", vram_gb: 24, ... }),
+//!     storage_gb: 2000,
+//!     network_gbps: 10,
 //!     ..
 //! }
 //! ```
@@ -28,16 +28,16 @@
 //! ```text
 //! hardware.cpu_cores=16
 //! hardware.cpu_threads=32
-//! hardware.memory_mb=65536
+//! hardware.memory_gb=64
 //! hardware.gpu                              ← presence marker
 //! hardware.gpu.vendor=nvidia
 //! hardware.gpu.model=RTX 4090
-//! hardware.gpu.vram_mb=24576
+//! hardware.gpu.vram_gb=24
 //! hardware.gpu.compute_units=128
 //! hardware.gpu.tensor_cores=512
 //! hardware.gpu.fp16_tflops_x10=825
-//! hardware.storage_mb=2000000
-//! hardware.network_mbps=10000
+//! hardware.storage_gb=2000
+//! hardware.network_gbps=10
 //! ```
 //!
 //! Zero-valued / empty / `None` fields are omitted from emission,
@@ -84,8 +84,8 @@ pub fn hardware_to_tags(hw: &HardwareCapabilities) -> Vec<Tag> {
     if hw.cpu_threads > 0 {
         tags.push(axis_value("cpu_threads", &hw.cpu_threads.to_string()));
     }
-    if hw.memory_mb > 0 {
-        tags.push(axis_value("memory_mb", &hw.memory_mb.to_string()));
+    if hw.memory_gb > 0 {
+        tags.push(axis_value("memory_gb", &hw.memory_gb.to_string()));
     }
     if let Some(gpu) = &hw.gpu {
         // Presence marker first so callers can existence-check via
@@ -93,11 +93,11 @@ pub fn hardware_to_tags(hw: &HardwareCapabilities) -> Vec<Tag> {
         tags.push(axis_present("gpu"));
         encode_gpu_into("gpu", gpu, &mut tags);
     }
-    if hw.storage_mb > 0 {
-        tags.push(axis_value("storage_mb", &hw.storage_mb.to_string()));
+    if hw.storage_gb > 0 {
+        tags.push(axis_value("storage_gb", &hw.storage_gb.to_string()));
     }
-    if hw.network_mbps > 0 {
-        tags.push(axis_value("network_mbps", &hw.network_mbps.to_string()));
+    if hw.network_gbps > 0 {
+        tags.push(axis_value("network_gbps", &hw.network_gbps.to_string()));
     }
 
     // additional_gpus + accelerators: deferred to Phase A.5.1.
@@ -119,10 +119,10 @@ fn encode_gpu_into(prefix: &str, gpu: &GpuInfo, tags: &mut Vec<Tag>) {
     if !gpu.model.is_empty() {
         tags.push(axis_value(&format!("{prefix}.model"), &gpu.model));
     }
-    if gpu.vram_mb > 0 {
+    if gpu.vram_gb > 0 {
         tags.push(axis_value(
-            &format!("{prefix}.vram_mb"),
-            &gpu.vram_mb.to_string(),
+            &format!("{prefix}.vram_gb"),
+            &gpu.vram_gb.to_string(),
         ));
     }
     if gpu.compute_units > 0 {
@@ -218,14 +218,14 @@ pub fn hardware_from_tags(tags: &[Tag]) -> HardwareCapabilities {
             "cpu_threads" => {
                 hw.cpu_threads = value.parse().unwrap_or(0);
             }
-            "memory_mb" => {
-                hw.memory_mb = value.parse().unwrap_or(0);
+            "memory_gb" => {
+                hw.memory_gb = value.parse().unwrap_or(0);
             }
-            "storage_mb" => {
-                hw.storage_mb = value.parse().unwrap_or(0);
+            "storage_gb" => {
+                hw.storage_gb = value.parse().unwrap_or(0);
             }
-            "network_mbps" => {
-                hw.network_mbps = value.parse().unwrap_or(0);
+            "network_gbps" => {
+                hw.network_gbps = value.parse().unwrap_or(0);
             }
             "gpu" => {
                 // Presence marker — initialize an empty GpuInfo
@@ -257,8 +257,8 @@ fn decode_gpu_field(gpu: &mut GpuInfo, sub_key: &str, value: &str) {
         "model" => {
             gpu.model = value.to_string();
         }
-        "vram_mb" => {
-            gpu.vram_mb = value.parse().unwrap_or(0);
+        "vram_gb" => {
+            gpu.vram_gb = value.parse().unwrap_or(0);
         }
         "compute_units" => {
             gpu.compute_units = value.parse().unwrap_or(0);
@@ -975,16 +975,16 @@ mod tests {
     };
 
     fn full_hardware() -> HardwareCapabilities {
-        let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24_576)
+        let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24)
             .with_compute_units(128)
             .with_tensor_cores(512)
             .with_fp16_tflops(82.5);
         HardwareCapabilities::new()
             .with_cpu(16, 32)
-            .with_memory(65_536)
+            .with_memory(64)
             .with_gpu(gpu)
-            .with_storage(2_000_000)
-            .with_network(10_000)
+            .with_storage(2000)
+            .with_network(10)
     }
 
     // ---- forward direction: hardware → tags ----------------------------
@@ -1013,16 +1013,16 @@ mod tests {
             vec![
                 "hardware.cpu_cores=16",
                 "hardware.cpu_threads=32",
-                "hardware.memory_mb=65536",
+                "hardware.memory_gb=64",
                 "hardware.gpu",
                 "hardware.gpu.vendor=nvidia",
                 "hardware.gpu.model=RTX 4090",
-                "hardware.gpu.vram_mb=24576",
+                "hardware.gpu.vram_gb=24",
                 "hardware.gpu.compute_units=128",
                 "hardware.gpu.tensor_cores=512",
                 "hardware.gpu.fp16_tflops_x10=825",
-                "hardware.storage_mb=2000000",
-                "hardware.network_mbps=10000",
+                "hardware.storage_gb=2000",
+                "hardware.network_gbps=10",
             ]
         );
     }
@@ -1046,7 +1046,7 @@ mod tests {
         // compute_units / tensor_cores / fp16 zero only emits the
         // first three sub-tags (plus the presence marker). Sparse
         // emission keeps the wire format small.
-        let gpu = GpuInfo::new(GpuVendor::Apple, "M2 Ultra", 64_000);
+        let gpu = GpuInfo::new(GpuVendor::Apple, "M2 Ultra", 64);
         let hw = HardwareCapabilities::new().with_gpu(gpu);
         let strs: Vec<String> = hardware_to_tags(&hw)
             .iter()
@@ -1058,7 +1058,7 @@ mod tests {
                 "hardware.gpu",
                 "hardware.gpu.vendor=apple",
                 "hardware.gpu.model=M2 Ultra",
-                "hardware.gpu.vram_mb=64000",
+                "hardware.gpu.vram_gb=64",
             ]
         );
     }
@@ -1151,7 +1151,7 @@ mod tests {
 
     #[test]
     fn round_trip_gpu_only_no_optional_fields() {
-        let gpu = GpuInfo::new(GpuVendor::Amd, "MI300X", 192_000);
+        let gpu = GpuInfo::new(GpuVendor::Amd, "MI300X", 192);
         let hw = HardwareCapabilities::new().with_gpu(gpu);
         assert_eq!(hardware_from_tags(&hardware_to_tags(&hw)), hw);
     }
@@ -1180,8 +1180,8 @@ mod tests {
         // ONLY the primary GPU preserved; `additional_gpus` is
         // dropped. Phase A.5.1 will land an indexed-key encoding
         // (`hardware.gpu.0.*` / `hardware.gpu.1.*`).
-        let primary = GpuInfo::new(GpuVendor::Nvidia, "H100", 80_000);
-        let secondary = GpuInfo::new(GpuVendor::Nvidia, "A100", 40_000);
+        let primary = GpuInfo::new(GpuVendor::Nvidia, "H100", 80);
+        let secondary = GpuInfo::new(GpuVendor::Nvidia, "A100", 40);
         let mut hw = HardwareCapabilities::new().with_gpu(primary.clone());
         hw.additional_gpus.push(secondary);
         let hw2 = hardware_from_tags(&hardware_to_tags(&hw));

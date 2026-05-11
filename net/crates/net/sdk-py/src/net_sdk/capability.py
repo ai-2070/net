@@ -23,7 +23,7 @@ Usage:
 
     pred = p.and_(
         p.exists(("hardware", "gpu")),
-        p.numeric_at_least(("hardware", "memory_mb"), 65536),
+        p.numeric_at_least(("hardware", "memory_gb"), 64),
         p.metadata_equals("intent", "ml-training"),
     )
     header_value = predicate_to_rpc_header(pred)

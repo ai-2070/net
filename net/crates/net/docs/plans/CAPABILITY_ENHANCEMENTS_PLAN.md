@@ -72,9 +72,9 @@ axis hardware {
         architecture: string
         vendor: string
     }
-    memory_mb: number
-    storage_mb: number
-    network_mbps: number
+    memory_gb: number
+    storage_gb: number
+    network_gbps: number
     limits: {
         max_concurrent_requests: number
         max_tokens_per_request: number
@@ -108,9 +108,9 @@ Each binding's schema agrees on **the same key set + field types** because they'
 What schemas unlock:
 
 - **IDE auto-completion** — `caps.views().hardware.gpu.` suggests `vram_gb`, `architecture`, `vendor`.
-- **Static type-checking** — `caps.views().hardware.memory_mb / 1024` is `number / number` in TS, not `unknown`.
+- **Static type-checking** — `caps.views().hardware.memory_gb + 1` is `number + number` in TS, not `unknown`.
 - **Runtime validation** — `validate_capabilities(caps, schema)` flags out-of-axis keys, type mismatches, value-range violations.
-- **Predicate-builder auto-completion** — `pred.numericAtLeast("hardware.memory_mb", ...)` knows the key path is valid; `pred.numericAtLeast("hardware.does_not_exist", ...)` is a compile-time error in TS / Rust, runtime warning in Python / Go.
+- **Predicate-builder auto-completion** — `pred.numericAtLeast("hardware.memory_gb", ...)` knows the key path is valid; `pred.numericAtLeast("hardware.does_not_exist", ...)` is a compile-time error in TS / Rust, runtime warning in Python / Go.
 - **CLI introspection** — `cyberdeck caps describe hardware.gpu` prints the field list + types from the schema.
 
 What schemas do NOT do:
@@ -210,7 +210,7 @@ What this is NOT:
 The Phase A.2 `Predicate::evaluate` walks the AST in declaration order. For an AST like:
 
 ```text
-And(numeric_at_least("hardware.memory_mb", 65536),  // selectivity ~30%
+And(numeric_at_least("hardware.memory_gb", 64),  // selectivity ~30%
     metadata_equals("intent", "embedding-cache"),    // selectivity ~5%
     exists("hardware.gpu"))                          // selectivity ~80%
 ```
@@ -451,7 +451,7 @@ Debug session over the planner's evaluation engine. Per-clause hit/miss/cost sta
 
 ### Performance
 
-- **Lazy projections.** `caps.views().hardware.memory_mb` repeated 1M times: < 50ns per call after first (vs. ~5µs eager). Pinned via Criterion bench.
+- **Lazy projections.** `caps.views().hardware.memory_gb` repeated 1M times: < 50ns per call after first (vs. ~5µs eager). Pinned via Criterion bench.
 - **Query planner.** Worst-case AST (high-selectivity clause buried last among 5 clauses) speeds up 10x or more over unplanned. Avg-case overhead vs. unplanned: < 5%.
 - **`CapabilitySet::diff`.** O(n) in `|tags| + |metadata|`; < 10µs for 100-tag sets.
 - **Predicate pushdown.** 10K-row scan with 0.1% selectivity: > 100x bandwidth reduction vs. filter-on-receive.

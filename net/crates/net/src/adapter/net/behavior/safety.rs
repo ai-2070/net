@@ -63,7 +63,7 @@ pub struct ResourceEnvelope {
     /// Max tokens per request
     pub max_tokens_per_request: u32,
     /// Max memory per request (MB)
-    pub max_memory_mb: u32,
+    pub max_memory_gb: u32,
     /// Max execution time (ms)
     pub max_time_ms: u32,
     /// Max total cost per hour (in cents)
@@ -75,7 +75,7 @@ impl Default for ResourceEnvelope {
         Self {
             max_concurrent: 1000,
             max_tokens_per_request: 128_000,
-            max_memory_mb: 16_384,
+            max_memory_gb: 16,
             max_time_ms: 300_000,            // 5 minutes
             max_cost_per_hour_cents: 10_000, // $100/hour
         }
@@ -327,8 +327,8 @@ pub struct ResourceClaim {
     pub concurrent_slots: u32,
     /// Estimated tokens
     pub tokens: u32,
-    /// Estimated memory (MB)
-    pub memory_mb: u32,
+    /// Estimated memory (GB)
+    pub memory_gb: u32,
     /// Estimated time (ms)
     pub time_ms: u32,
     /// Estimated cost (cents)
@@ -354,8 +354,8 @@ impl ResourceClaim {
     }
 
     /// Set memory
-    pub fn with_memory_mb(mut self, mb: u32) -> Self {
-        self.memory_mb = mb;
+    pub fn with_memory_gb(mut self, gb: u32) -> Self {
+        self.memory_gb = gb;
         self
     }
 
@@ -832,7 +832,7 @@ impl RateLimiter {
 struct AtomicResourceUsage {
     concurrent: AtomicU32,
     tokens: AtomicU64,
-    memory_mb: AtomicU32,
+    memory_gb: AtomicU32,
     cost_cents_per_hour: AtomicU32,
     hour_start: RwLock<Instant>,
 }
@@ -842,7 +842,7 @@ impl AtomicResourceUsage {
         Self {
             concurrent: AtomicU32::new(0),
             tokens: AtomicU64::new(0),
-            memory_mb: AtomicU32::new(0),
+            memory_gb: AtomicU32::new(0),
             cost_cents_per_hour: AtomicU32::new(0),
             hour_start: RwLock::new(Instant::now()),
         }
@@ -872,7 +872,7 @@ pub struct UsageStats {
     /// Total tokens used (current window)
     pub tokens: u64,
     /// Current memory usage (MB)
-    pub memory_mb: u32,
+    pub memory_gb: u32,
     /// Cost this hour (cents)
     pub cost_cents_per_hour: u32,
     /// Global requests this minute
@@ -1239,23 +1239,23 @@ impl SafetyEnforcer {
         // 2. Memory. On failure, roll back concurrent.
         if enforce {
             if let Err(cur) = try_fetch_add_capped_u32(
-                &self.usage.memory_mb,
-                claim.memory_mb,
-                limits.max_memory_mb,
+                &self.usage.memory_gb,
+                claim.memory_gb,
+                limits.max_memory_gb,
             ) {
                 self.usage
                     .concurrent
                     .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
                 return Err(SafetyViolation::ResourceLimitExceeded {
                     resource: ResourceType::Memory,
-                    requested: claim.memory_mb as u64,
-                    available: limits.max_memory_mb.saturating_sub(cur) as u64,
+                    requested: claim.memory_gb as u64,
+                    available: limits.max_memory_gb.saturating_sub(cur) as u64,
                 });
             }
         } else {
             self.usage
-                .memory_mb
-                .fetch_add(claim.memory_mb, Ordering::Relaxed);
+                .memory_gb
+                .fetch_add(claim.memory_gb, Ordering::Relaxed);
         }
 
         // 3. Hourly cost. On failure, roll back concurrent + memory.
@@ -1269,8 +1269,8 @@ impl SafetyEnforcer {
                     .concurrent
                     .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
                 self.usage
-                    .memory_mb
-                    .fetch_sub(claim.memory_mb, Ordering::Relaxed);
+                    .memory_gb
+                    .fetch_sub(claim.memory_gb, Ordering::Relaxed);
                 return Err(SafetyViolation::ResourceLimitExceeded {
                     resource: ResourceType::Cost,
                     requested: claim.cost_cents as u64,
@@ -1303,8 +1303,8 @@ impl SafetyEnforcer {
                     .concurrent
                     .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
                 self.usage
-                    .memory_mb
-                    .fetch_sub(claim.memory_mb, Ordering::Relaxed);
+                    .memory_gb
+                    .fetch_sub(claim.memory_gb, Ordering::Relaxed);
                 self.usage
                     .cost_cents_per_hour
                     .fetch_sub(claim.cost_cents, Ordering::Relaxed);
@@ -1329,8 +1329,8 @@ impl SafetyEnforcer {
                         .concurrent
                         .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
                     self.usage
-                        .memory_mb
-                        .fetch_sub(claim.memory_mb, Ordering::Relaxed);
+                        .memory_gb
+                        .fetch_sub(claim.memory_gb, Ordering::Relaxed);
                     self.usage
                         .cost_cents_per_hour
                         .fetch_sub(claim.cost_cents, Ordering::Relaxed);
@@ -1358,8 +1358,8 @@ impl SafetyEnforcer {
                     .concurrent
                     .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
                 self.usage
-                    .memory_mb
-                    .fetch_sub(claim.memory_mb, Ordering::Relaxed);
+                    .memory_gb
+                    .fetch_sub(claim.memory_gb, Ordering::Relaxed);
                 self.usage
                     .cost_cents_per_hour
                     .fetch_sub(claim.cost_cents, Ordering::Relaxed);
@@ -1431,7 +1431,7 @@ impl SafetyEnforcer {
     /// Release resources (called by ResourceGuard on drop)
     fn release(&self, claim: &ResourceClaim) {
         // Use `fetch_update` + `saturating_sub` rather than raw
-        // `fetch_sub` on `concurrent` and `memory_mb`. `acquire()`
+        // `fetch_sub` on `concurrent` and `memory_gb`. `acquire()`
         // short-circuits in `EnforcementMode::Disabled` and returns
         // a guard WITHOUT incrementing those counters; a raw
         // `fetch_sub` from a counter at 0 would wrap to ~`u32::MAX`,
@@ -1462,9 +1462,9 @@ impl SafetyEnforcer {
                 });
         let _ = self
             .usage
-            .memory_mb
+            .memory_gb
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(claim.memory_mb))
+                Some(current.saturating_sub(claim.memory_gb))
             });
         // Release tokens and cost that were acquired — without this,
         // both counters grow monotonically, hitting limits prematurely.
@@ -1515,7 +1515,7 @@ impl SafetyEnforcer {
         UsageStats {
             concurrent: self.usage.concurrent.load(Ordering::Relaxed),
             tokens: self.usage.tokens.load(Ordering::Relaxed),
-            memory_mb: self.usage.memory_mb.load(Ordering::Relaxed),
+            memory_gb: self.usage.memory_gb.load(Ordering::Relaxed),
             cost_cents_per_hour: self.usage.cost_cents_per_hour.load(Ordering::Relaxed),
             requests_per_minute: self.rate_limiter.global_requests.load(Ordering::Relaxed),
             tokens_per_minute: self.rate_limiter.global_tokens.load(Ordering::Relaxed),
@@ -1648,14 +1648,14 @@ impl SafetyEnforcer {
         }
 
         // Check memory
-        let current_memory = self.usage.memory_mb.load(Ordering::Relaxed);
-        if current_memory.saturating_add(claim.memory_mb) > limits.max_memory_mb
+        let current_memory = self.usage.memory_gb.load(Ordering::Relaxed);
+        if current_memory.saturating_add(claim.memory_gb) > limits.max_memory_gb
             && envelope.mode == EnforcementMode::Enforce
         {
             return Err(SafetyViolation::ResourceLimitExceeded {
                 resource: ResourceType::Memory,
-                requested: claim.memory_mb as u64,
-                available: limits.max_memory_mb.saturating_sub(current_memory) as u64,
+                requested: claim.memory_gb as u64,
+                available: limits.max_memory_gb.saturating_sub(current_memory) as u64,
             });
         }
 
@@ -2006,14 +2006,14 @@ mod tests {
         let claim = ResourceClaim::new()
             .with_concurrent(5)
             .with_tokens(1000)
-            .with_memory_mb(100);
+            .with_memory_gb(8);
 
         let _guard = enforcer.acquire(&req, claim).unwrap();
 
         let stats = enforcer.usage();
         assert_eq!(stats.concurrent, 5);
         assert_eq!(stats.tokens, 1000);
-        assert_eq!(stats.memory_mb, 100);
+        assert_eq!(stats.memory_gb, 8);
     }
 
     #[test]
@@ -2139,7 +2139,7 @@ mod tests {
 
     /// Regression for BUG_AUDIT_2026_04_30_CORE.md #102: pre-fix
     /// `release()` used raw `fetch_sub` on `concurrent` and
-    /// `memory_mb`. `acquire()` short-circuits in `Disabled`
+    /// `memory_gb`. `acquire()` short-circuits in `Disabled`
     /// mode WITHOUT incrementing those counters; the matching
     /// release would then `fetch_sub` from 0, wrapping `u32` to
     /// ~4 billion. The next `Enforce`-mode `acquire` would see
@@ -2150,7 +2150,7 @@ mod tests {
     /// We pin the fix by:
     ///   1. Building an enforcer in `Disabled` mode.
     ///   2. Acquiring + dropping a guard with non-zero claim.
-    ///   3. Asserting `concurrent` and `memory_mb` are still 0
+    ///   3. Asserting `concurrent` and `memory_gb` are still 0
     ///      (saturating_sub kept them clamped).
     ///   4. Switching to `Enforce` mode and acquiring again to
     ///      confirm the next acquire path doesn't see a wrapped
@@ -2162,7 +2162,7 @@ mod tests {
             ..Default::default()
         }));
         let req = SafetyRequest::new();
-        let claim = ResourceClaim::new().with_concurrent(5).with_memory_mb(100);
+        let claim = ResourceClaim::new().with_concurrent(5).with_memory_gb(100);
 
         // Acquire (no-op in Disabled — counters stay at 0) +
         // drop (release runs, would have wrapped u32 to ~4B
@@ -2177,8 +2177,8 @@ mod tests {
              Disabled mode (pre-fix this wrapped to u32::MAX-4)"
         );
         assert_eq!(
-            stats.memory_mb, 0,
-            "memory_mb must stay clamped at 0 when releasing in \
+            stats.memory_gb, 0,
+            "memory_gb must stay clamped at 0 when releasing in \
              Disabled mode (pre-fix this wrapped to u32::MAX-99)"
         );
 
@@ -2211,7 +2211,7 @@ mod tests {
         let claim = ResourceClaim {
             tokens: 500,
             concurrent_slots: 1,
-            memory_mb: 100,
+            memory_gb: 8,
             time_ms: 0,
             cost_cents: 50,
         };
@@ -2249,7 +2249,7 @@ mod tests {
         let claim = ResourceClaim {
             tokens: 100,
             concurrent_slots: 1,
-            memory_mb: 10,
+            memory_gb: 10,
             time_ms: 0,
             cost_cents: 0,
         };
@@ -2334,7 +2334,7 @@ mod tests {
         let limits = ResourceEnvelope {
             max_concurrent: CAP,
             max_tokens_per_request: 1_000_000,
-            max_memory_mb: 1_000_000,
+            max_memory_gb: 1_000_000,
             max_time_ms: 1_000_000,
             max_cost_per_hour_cents: u32::MAX,
         };
@@ -2356,7 +2356,7 @@ mod tests {
                     let claim = ResourceClaim {
                         concurrent_slots: 1,
                         tokens: 1,
-                        memory_mb: 0,
+                        memory_gb: 0,
                         time_ms: 0,
                         cost_cents: 0,
                     };
@@ -2412,7 +2412,7 @@ mod tests {
             resource_limits: ResourceEnvelope {
                 max_concurrent: u32::MAX,
                 max_tokens_per_request: 1_000_000,
-                max_memory_mb: u32::MAX,
+                max_memory_gb: u32::MAX,
                 max_time_ms: u32::MAX,
                 max_cost_per_hour_cents: u32::MAX,
             },
@@ -2437,7 +2437,7 @@ mod tests {
                     let claim = ResourceClaim {
                         concurrent_slots: 1,
                         tokens: 1,
-                        memory_mb: 0,
+                        memory_gb: 0,
                         time_ms: 0,
                         cost_cents: 0,
                     };

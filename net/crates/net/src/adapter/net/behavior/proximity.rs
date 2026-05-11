@@ -88,14 +88,14 @@ impl PrimaryCapabilities {
         // are removed and the projection becomes a tag-set scan).
         let views = caps.views();
         let hw = views.hardware();
-        let memory_tier = match hw.memory_mb {
-            0..=1024 => 0,
-            1025..=4096 => 1,
-            4097..=8192 => 2,
-            8193..=16384 => 3,
-            16385..=32768 => 4,
-            32769..=65536 => 5,
-            65537..=131072 => 6,
+        let memory_tier = match hw.memory_gb {
+            0..=1 => 0,
+            2..=4 => 1,
+            5..=8 => 2,
+            9..=16 => 3,
+            17..=32 => 4,
+            33..=64 => 5,
+            65..=128 => 6,
             _ => 7,
         };
 
@@ -1016,7 +1016,7 @@ fn hash_capabilities(caps: &CapabilitySet) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
 
     // Hash hardware memory
-    hash ^= hw.memory_mb as u64;
+    hash ^= hw.memory_gb as u64;
     hash = hash.wrapping_mul(0x100000001b3);
 
     // Hash GPU presence

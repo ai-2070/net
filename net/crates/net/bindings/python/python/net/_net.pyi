@@ -802,8 +802,8 @@ class NetMesh:
         (including own when the filter matches this node's own
         announcement) whose latest announcement matches `filter`.
         Filter shape mirrors `CapabilityFilter`: ``require_tags``,
-        ``require_models``, ``require_tools``, ``min_memory_mb``,
-        ``require_gpu``, ``gpu_vendor``, ``min_vram_mb``,
+        ``require_models``, ``require_tools``, ``min_memory_gb``,
+        ``require_gpu``, ``gpu_vendor``, ``min_vram_gb``,
         ``min_context_length``, ``require_modalities``."""
         ...
 

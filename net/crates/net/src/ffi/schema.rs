@@ -19,7 +19,7 @@
 //! {
 //!   "errors": [
 //!     {"kind": "unknown_axis", "axis_prefix": "compute", "tag": "compute.gpu"},
-//!     {"kind": "type_mismatch", "axis": "hardware", "key": "memory_mb",
+//!     {"kind": "type_mismatch", "axis": "hardware", "key": "memory_gb",
 //!      "expected": "number", "actual": "lots"},
 //!     {"kind": "index_malformed", "axis": "software", "prefix": "model.",
 //!      "index": "bogus", "tag": "software.model.bogus.id=foo"}
@@ -288,7 +288,7 @@ mod tests {
     /// error.
     #[test]
     fn numeric_key_with_garbage_value_emits_type_mismatch() {
-        let out = validate(r#"{"tags": ["hardware.memory_mb=lots"], "metadata": {}}"#);
+        let out = validate(r#"{"tags": ["hardware.memory_gb=lots"], "metadata": {}}"#);
         let v: Value = serde_json::from_str(&out).unwrap();
         let errors = v["errors"].as_array().unwrap();
         assert_eq!(errors.len(), 1);

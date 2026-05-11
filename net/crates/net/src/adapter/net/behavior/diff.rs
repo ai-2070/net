@@ -422,20 +422,20 @@ impl DiffEngine {
         let new_hw = new_views.hardware();
         if old_hw != new_hw {
             // Check for partial updates
-            if old_hw.memory_mb != new_hw.memory_mb
+            if old_hw.memory_gb != new_hw.memory_gb
                 && old_hw.cpu_cores == new_hw.cpu_cores
                 && old_hw.gpu == new_hw.gpu
-                && old_hw.storage_mb == new_hw.storage_mb
-                && old_hw.network_mbps == new_hw.network_mbps
+                && old_hw.storage_gb == new_hw.storage_gb
+                && old_hw.network_gbps == new_hw.network_gbps
             {
-                ops.push(DiffOp::UpdateMemory(new_hw.memory_mb));
-            } else if old_hw.network_mbps != new_hw.network_mbps
+                ops.push(DiffOp::UpdateMemory(new_hw.memory_gb));
+            } else if old_hw.network_gbps != new_hw.network_gbps
                 && old_hw.cpu_cores == new_hw.cpu_cores
                 && old_hw.gpu == new_hw.gpu
-                && old_hw.memory_mb == new_hw.memory_mb
-                && old_hw.storage_mb == new_hw.storage_mb
+                && old_hw.memory_gb == new_hw.memory_gb
+                && old_hw.storage_gb == new_hw.storage_gb
             {
-                ops.push(DiffOp::UpdateNetwork(new_hw.network_mbps));
+                ops.push(DiffOp::UpdateNetwork(new_hw.network_gbps));
             } else {
                 ops.push(DiffOp::UpdateHardware(new_hw.clone()));
             }
@@ -954,12 +954,12 @@ impl DiffEngine {
             }
             DiffOp::UpdateMemory(mem) => {
                 let mut hw = caps.views().hardware().clone();
-                hw.memory_mb = *mem;
+                hw.memory_gb = *mem;
                 caps.set_hardware(hw);
             }
             DiffOp::UpdateNetwork(net) => {
                 let mut hw = caps.views().hardware().clone();
-                hw.network_mbps = *net;
+                hw.network_gbps = *net;
                 caps.set_hardware(hw);
             }
             DiffOp::UpdateSoftware(sw) => {
@@ -1157,10 +1157,10 @@ mod tests {
     use crate::adapter::net::behavior::capability::{GpuInfo, GpuVendor, Modality};
 
     fn sample_capability_set() -> CapabilitySet {
-        let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24576);
+        let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24);
         let hardware = HardwareCapabilities::new()
             .with_cpu(16, 32)
-            .with_memory(65536)
+            .with_memory(64)
             .with_gpu(gpu);
 
         let software = SoftwareCapabilities::new()
@@ -1324,13 +1324,12 @@ mod tests {
         // not through AddTag. The fix doesn't double-emit.
         let old = CapabilitySet::new();
         let new = CapabilitySet::new().with_hardware(
-            crate::adapter::net::behavior::capability::HardwareCapabilities::new()
-                .with_memory(65_536),
+            crate::adapter::net::behavior::capability::HardwareCapabilities::new().with_memory(64),
         );
         let ops = DiffEngine::diff(&old, &new);
         assert!(
             !ops.iter()
-                .any(|op| matches!(op, DiffOp::AddTag(t) if t.starts_with("hardware.memory_mb"))),
+                .any(|op| matches!(op, DiffOp::AddTag(t) if t.starts_with("hardware.memory_gb"))),
             "known hardware keys must not double-emit as AddTag — got {:?}",
             ops,
         );
@@ -1426,12 +1425,12 @@ mod tests {
         let old = sample_capability_set();
         let mut new = old.clone();
         let mut hw = new.views().hardware().clone();
-        hw.memory_mb = 131072;
+        hw.memory_gb = 128;
         new.set_hardware(hw);
 
         let ops = DiffEngine::diff(&old, &new);
         assert_eq!(ops.len(), 1);
-        assert!(matches!(&ops[0], DiffOp::UpdateMemory(131072)));
+        assert!(matches!(&ops[0], DiffOp::UpdateMemory(128)));
     }
 
     #[test]
@@ -1442,16 +1441,13 @@ mod tests {
             1,
             1,
             2,
-            vec![
-                DiffOp::AddTag("training".into()),
-                DiffOp::UpdateMemory(131072),
-            ],
+            vec![DiffOp::AddTag("training".into()), DiffOp::UpdateMemory(128)],
         );
 
         let new = DiffEngine::apply(&old, &diff, true).unwrap();
 
         assert!(new.has_tag("training"));
-        assert_eq!(new.views().hardware().memory_mb, 131072);
+        assert_eq!(new.views().hardware().memory_gb, 128);
     }
 
     #[test]
@@ -1487,7 +1483,7 @@ mod tests {
 
         let diff1 = CapabilityDiff::new(1, 1, 2, vec![DiffOp::AddTag("training".into())]);
         let diff2 = CapabilityDiff::new(1, 2, 3, vec![DiffOp::AddTag("distributed".into())]);
-        let diff3 = CapabilityDiff::new(1, 3, 4, vec![DiffOp::UpdateMemory(131072)]);
+        let diff3 = CapabilityDiff::new(1, 3, 4, vec![DiffOp::UpdateMemory(128)]);
 
         let compacted = DiffEngine::compact(&base, &[diff1, diff2, diff3]).unwrap();
 
@@ -1529,7 +1525,7 @@ mod tests {
 
         // Bump memory.
         let mut hw = new.views().hardware().clone();
-        hw.memory_mb = 131072;
+        hw.memory_gb = 128;
         new.set_hardware(hw);
 
         // Add a second model.
@@ -1550,7 +1546,7 @@ mod tests {
         assert!(applied.has_tag("training"));
         assert!(!applied.has_tag("inference"));
         let v = applied.views();
-        assert_eq!(v.hardware().memory_mb, 131072);
+        assert_eq!(v.hardware().memory_gb, 128);
         assert_eq!(v.models().len(), 2);
         assert!(
             !v.models()
@@ -1567,7 +1563,7 @@ mod tests {
             1,
             1,
             2,
-            vec![DiffOp::AddTag("test".into()), DiffOp::UpdateMemory(65536)],
+            vec![DiffOp::AddTag("test".into()), DiffOp::UpdateMemory(64)],
         );
 
         let bytes = diff.try_to_bytes().expect("normal-size diff must encode");
@@ -1950,10 +1946,7 @@ mod tests {
             1,
             1,
             2,
-            vec![
-                DiffOp::AddTag("training".into()),
-                DiffOp::UpdateMemory(65536),
-            ],
+            vec![DiffOp::AddTag("training".into()), DiffOp::UpdateMemory(64)],
         );
         let bytes = diff.try_to_bytes().expect("normal-size diff must succeed");
         assert!(bytes.len() <= MAX_DIFF_BYTES);

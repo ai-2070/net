@@ -56,7 +56,7 @@ def test_register_channel_accepts_subscribe_caps_with_gpu_filter() -> None:
             subscribe_caps={
                 "require_gpu": True,
                 "gpu_vendor": "nvidia",
-                "min_vram_mb": 16_000,
+                "min_vram_gb": 16,
             },
         )
     finally:

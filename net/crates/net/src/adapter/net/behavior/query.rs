@@ -611,7 +611,7 @@ mod tests {
                 0x1111u64,
                 CapabilitySet::default()
                     .add_tag("hardware.gpu")
-                    .add_tag("hardware.memory_mb=65536")
+                    .add_tag("hardware.memory_gb=64")
                     .with_metadata("region", "us-east")
                     .with_metadata("intent", "ml-training"),
             ),
@@ -619,14 +619,14 @@ mod tests {
                 0x2222,
                 CapabilitySet::default()
                     .add_tag("hardware.cpu_cores=64")
-                    .add_tag("hardware.memory_mb=32768")
+                    .add_tag("hardware.memory_gb=32")
                     .with_metadata("region", "us-east"),
             ),
             (
                 0x3333,
                 CapabilitySet::default()
                     .add_tag("hardware.gpu")
-                    .add_tag("hardware.memory_mb=16384")
+                    .add_tag("hardware.memory_gb=16")
                     .with_metadata("region", "us-west")
                     .with_metadata("intent", "ml-training"),
             ),
@@ -663,7 +663,7 @@ mod tests {
     fn match_axis_with_value_matches_only_exact() {
         let i = idx();
         let mut got: Vec<u64> = i
-            .match_axis(TaxonomyAxis::Hardware, "memory_mb", Some("65536"))
+            .match_axis(TaxonomyAxis::Hardware, "memory_gb", Some("64"))
             .into_iter()
             .map(|(n, _)| n)
             .collect();
@@ -697,15 +697,15 @@ mod tests {
     }
 
     /// `aggregate` with `UniqueAxisValues` collects distinct
-    /// memory_mb values across the GPU-tagged nodes.
+    /// memory_gb values across the GPU-tagged nodes.
     #[test]
     fn aggregate_unique_axis_values_collects_distinct() {
         let i = idx();
         let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "gpu".to_string()));
-        let agg = UniqueAxisValues::new(TaxonomyAxis::Hardware, "memory_mb");
+        let agg = UniqueAxisValues::new(TaxonomyAxis::Hardware, "memory_gb");
         let mut got = i.aggregate(&pred, agg);
         got.sort();
-        assert_eq!(got, vec!["16384".to_string(), "65536".to_string()]);
+        assert_eq!(got, vec!["16".to_string(), "64".to_string()]);
     }
 
     /// `aggregate` with `MaxNumericMetadata` over a numeric
@@ -918,7 +918,7 @@ mod tests {
     #[test]
     fn nearest_ranks_by_rtt_ascending() {
         let i = idx();
-        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "memory_mb".to_string()));
+        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "memory_gb".to_string()));
         // 0x1111: 5 ms, 0x2222: 50 ms, 0x3333: 1 ms, 0x4444: 100 ms
         let rtts = |id: u64| -> Option<Duration> {
             match id {
@@ -939,10 +939,10 @@ mod tests {
     #[test]
     fn nearest_truncates_at_n() {
         let i = idx();
-        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "memory_mb".to_string()));
+        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "memory_gb".to_string()));
         let rtts = |_: u64| Some(Duration::from_millis(1));
         assert!(i.nearest(&pred, rtts, 0).is_empty());
-        // Larger-than-corpus n returns all 3 memory_mb-bearing nodes.
+        // Larger-than-corpus n returns all 3 memory_gb-bearing nodes.
         let all = i.nearest(&pred, rtts, 100);
         assert_eq!(all.len(), 3);
     }
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn nearest_unmeasured_candidates_sort_last() {
         let i = idx();
-        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "memory_mb".to_string()));
+        let pred = Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "memory_gb".to_string()));
         // Only 0x2222 has RTT data.
         let rtts = |id: u64| -> Option<Duration> {
             if id == 0x2222 {

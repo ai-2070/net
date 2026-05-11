@@ -75,7 +75,7 @@ async fn handshake(a: &Mesh, b: &Mesh, addr_b: std::net::SocketAddr) {
 fn sample_predicate() -> Predicate {
     Predicate::and(vec![
         Predicate::exists(TagKey::new(TaxonomyAxis::Hardware, "gpu")),
-        Predicate::numeric_at_least(TagKey::new(TaxonomyAxis::Hardware, "memory_mb"), 65536.0),
+        Predicate::numeric_at_least(TagKey::new(TaxonomyAxis::Hardware, "memory_gb"), 64.0),
         Predicate::metadata_equals("intent", "ml-training"),
     ])
 }

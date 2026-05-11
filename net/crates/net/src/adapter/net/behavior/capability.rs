@@ -65,8 +65,8 @@ pub struct GpuInfo {
     pub vendor: GpuVendor,
     /// Model name (e.g., "RTX 4090", "M2 Ultra")
     pub model: String,
-    /// VRAM in MB
-    pub vram_mb: u32,
+    /// VRAM in GB
+    pub vram_gb: u32,
     /// Compute units / SMs
     pub compute_units: u16,
     /// Tensor cores (0 if none)
@@ -86,7 +86,7 @@ impl Default for GpuInfo {
         Self {
             vendor: GpuVendor::Unknown,
             model: String::new(),
-            vram_mb: 0,
+            vram_gb: 0,
             compute_units: 0,
             tensor_cores: 0,
             fp16_tflops_x10: 0,
@@ -96,11 +96,11 @@ impl Default for GpuInfo {
 
 impl GpuInfo {
     /// Create new GPU info
-    pub fn new(vendor: GpuVendor, model: impl Into<String>, vram_mb: u32) -> Self {
+    pub fn new(vendor: GpuVendor, model: impl Into<String>, vram_gb: u32) -> Self {
         Self {
             vendor,
             model: model.into(),
-            vram_mb,
+            vram_gb,
             ..Default::default()
         }
     }
@@ -172,8 +172,8 @@ pub struct AcceleratorInfo {
     pub accel_type: AcceleratorType,
     /// Model/name
     pub model: String,
-    /// Memory in MB (if applicable)
-    pub memory_mb: u32,
+    /// Memory in GB (if applicable)
+    pub memory_gb: u32,
     /// TOPS (tera operations per second, scaled by 10)
     pub tops_x10: u16,
 }
@@ -184,7 +184,7 @@ impl AcceleratorInfo {
         Self {
             accel_type,
             model: model.into(),
-            memory_mb: 0,
+            memory_gb: 0,
             tops_x10: 0,
         }
     }
@@ -197,16 +197,16 @@ pub struct HardwareCapabilities {
     pub cpu_cores: u16,
     /// CPU threads (if different from cores due to SMT)
     pub cpu_threads: u16,
-    /// Total memory in MB
-    pub memory_mb: u32,
+    /// Total memory in GB
+    pub memory_gb: u32,
     /// GPU info (if present)
     pub gpu: Option<GpuInfo>,
     /// Additional GPUs (for multi-GPU setups)
     pub additional_gpus: Vec<GpuInfo>,
-    /// Storage in MB
-    pub storage_mb: u64,
-    /// Network bandwidth in Mbps
-    pub network_mbps: u32,
+    /// Storage in GB
+    pub storage_gb: u64,
+    /// Network bandwidth in Gbps
+    pub network_gbps: u32,
     /// Accelerators (TPU, NPU, etc.)
     pub accelerators: Vec<AcceleratorInfo>,
 }
@@ -225,8 +225,8 @@ impl HardwareCapabilities {
     }
 
     /// Set memory
-    pub fn with_memory(mut self, memory_mb: u32) -> Self {
-        self.memory_mb = memory_mb;
+    pub fn with_memory(mut self, memory_gb: u32) -> Self {
+        self.memory_gb = memory_gb;
         self
     }
 
@@ -243,14 +243,14 @@ impl HardwareCapabilities {
     }
 
     /// Set storage
-    pub fn with_storage(mut self, storage_mb: u64) -> Self {
-        self.storage_mb = storage_mb;
+    pub fn with_storage(mut self, storage_gb: u64) -> Self {
+        self.storage_gb = storage_gb;
         self
     }
 
     /// Set network bandwidth
-    pub fn with_network(mut self, network_mbps: u32) -> Self {
-        self.network_mbps = network_mbps;
+    pub fn with_network(mut self, network_gbps: u32) -> Self {
+        self.network_gbps = network_gbps;
         self
     }
 
@@ -266,9 +266,9 @@ impl HardwareCapabilities {
     }
 
     /// Total VRAM across all GPUs
-    pub fn total_vram_mb(&self) -> u32 {
-        let primary = self.gpu.as_ref().map(|g| g.vram_mb).unwrap_or(0);
-        let additional: u32 = self.additional_gpus.iter().map(|g| g.vram_mb).sum();
+    pub fn total_vram_gb(&self) -> u32 {
+        let primary = self.gpu.as_ref().map(|g| g.vram_gb).unwrap_or(0);
+        let additional: u32 = self.additional_gpus.iter().map(|g| g.vram_gb).sum();
         primary + additional
     }
 
@@ -839,7 +839,7 @@ pub struct CapabilitySet {
     /// Canonical typed tag set. Holds:
     ///
     /// - `Tag::AxisPresent` / `Tag::AxisValue` axis-prefixed tags
-    ///   (`hardware.gpu`, `hardware.memory_mb=65536`,
+    ///   (`hardware.gpu`, `hardware.memory_gb=64`,
     ///   `software.model.0.id=llama-3.1-70b`, …) that encode the
     ///   five projections.
     /// - `Tag::Reserved` cross-axis tags (`scope:tenant:foo`,
@@ -2108,14 +2108,14 @@ pub struct CapabilityFilter {
     pub require_models: Vec<String>,
     /// Require specific tools (any must match)
     pub require_tools: Vec<String>,
-    /// Minimum memory in MB
-    pub min_memory_mb: Option<u32>,
+    /// Minimum memory in GB
+    pub min_memory_gb: Option<u32>,
     /// Require GPU
     pub require_gpu: bool,
     /// Specific GPU vendor
     pub gpu_vendor: Option<GpuVendor>,
-    /// Minimum VRAM in MB
-    pub min_vram_mb: Option<u32>,
+    /// Minimum VRAM in GB
+    pub min_vram_gb: Option<u32>,
     /// Minimum context length
     pub min_context_length: Option<u32>,
     /// Require specific modalities
@@ -2147,8 +2147,8 @@ impl CapabilityFilter {
     }
 
     /// Set minimum memory
-    pub fn with_min_memory(mut self, mb: u32) -> Self {
-        self.min_memory_mb = Some(mb);
+    pub fn with_min_memory(mut self, gb: u32) -> Self {
+        self.min_memory_gb = Some(gb);
         self
     }
 
@@ -2166,8 +2166,8 @@ impl CapabilityFilter {
     }
 
     /// Set minimum VRAM
-    pub fn with_min_vram(mut self, mb: u32) -> Self {
-        self.min_vram_mb = Some(mb);
+    pub fn with_min_vram(mut self, gb: u32) -> Self {
+        self.min_vram_gb = Some(gb);
         self.require_gpu = true;
         self
     }
@@ -2225,8 +2225,8 @@ impl CapabilityFilter {
         let views = caps.views();
 
         // Check memory
-        if let Some(min_mem) = self.min_memory_mb {
-            if views.hardware().memory_mb < min_mem {
+        if let Some(min_mem) = self.min_memory_gb {
+            if views.hardware().memory_gb < min_mem {
                 return false;
             }
         }
@@ -2244,8 +2244,8 @@ impl CapabilityFilter {
         }
 
         // Check VRAM
-        if let Some(min_vram) = self.min_vram_mb {
-            if views.hardware().total_vram_mb() < min_vram {
+        if let Some(min_vram) = self.min_vram_gb {
+            if views.hardware().total_vram_gb() < min_vram {
                 return false;
             }
         }
@@ -2340,13 +2340,13 @@ impl CapabilityRequirement {
 
         // Memory score (normalized to 256GB)
         if self.prefer_more_memory > 0.0 {
-            let mem_score = (views.hardware().memory_mb as f32 / 262144.0).min(1.0);
+            let mem_score = (views.hardware().memory_gb as f32 / 256.0).min(1.0);
             score += self.prefer_more_memory * mem_score;
         }
 
         // VRAM score (normalized to 80GB)
         if self.prefer_more_vram > 0.0 {
-            let vram_score = (views.hardware().total_vram_mb() as f32 / 81920.0).min(1.0);
+            let vram_score = (views.hardware().total_vram_gb() as f32 / 80.0).min(1.0);
             score += self.prefer_more_vram * vram_score;
         }
 
@@ -3386,17 +3386,17 @@ mod tests {
     }
 
     fn sample_capability_set() -> CapabilitySet {
-        let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24576)
+        let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24)
             .with_compute_units(128)
             .with_tensor_cores(512)
             .with_fp16_tflops(82.5);
 
         let hardware = HardwareCapabilities::new()
             .with_cpu(16, 32)
-            .with_memory(65536)
+            .with_memory(64)
             .with_gpu(gpu)
-            .with_storage(2_000_000)
-            .with_network(10000);
+            .with_storage(2000)
+            .with_network(10);
 
         let software = SoftwareCapabilities::new()
             .with_os("linux", "6.1")
@@ -3434,7 +3434,7 @@ mod tests {
         assert!(caps.has_tag("inference"));
         assert!(caps.has_model("llama-3.1-70b"));
         assert!(caps.has_tool("python_repl"));
-        assert_eq!(caps.views().hardware().memory_mb, 65536);
+        assert_eq!(caps.views().hardware().memory_gb, 64);
     }
 
     #[test]
@@ -3444,8 +3444,8 @@ mod tests {
         let parsed = CapabilitySet::from_bytes(&bytes).unwrap();
 
         assert_eq!(
-            caps.views().hardware().memory_mb,
-            parsed.views().hardware().memory_mb,
+            caps.views().hardware().memory_gb,
+            parsed.views().hardware().memory_gb,
         );
         assert_eq!(caps.tags, parsed.tags);
         assert_eq!(caps.views().models().len(), parsed.views().models().len());
@@ -3542,10 +3542,10 @@ mod tests {
         assert!(!filter.matches(&caps));
 
         // Memory filter
-        let filter = CapabilityFilter::new().with_min_memory(32768);
+        let filter = CapabilityFilter::new().with_min_memory(32);
         assert!(filter.matches(&caps));
 
-        let filter = CapabilityFilter::new().with_min_memory(131072);
+        let filter = CapabilityFilter::new().with_min_memory(128);
         assert!(!filter.matches(&caps));
 
         // Model filter
@@ -3620,17 +3620,17 @@ mod tests {
 
     #[test]
     fn axis_cardinality_counts_distinct_value_tags() {
-        // 3 nodes with different memory_mb values. Cardinality
-        // for `hardware.memory_mb` should be 3.
+        // 3 nodes with different memory_gb values. Cardinality
+        // for `hardware.memory_gb` should be 3.
         let index = CapabilityIndex::new();
-        for (i, mb) in [16384u32, 32768, 65536].iter().enumerate() {
+        for (i, gb) in [16u32, 32, 64].iter().enumerate() {
             let caps =
-                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(*mb));
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(*gb));
             index_with_node(&index, i as u64, caps);
         }
         let key = crate::adapter::net::behavior::tag::TagKey::new(
             crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_mb",
+            "memory_gb",
         );
         assert_eq!(index.axis_cardinality(&key), 3);
     }
@@ -3648,7 +3648,7 @@ mod tests {
         ];
         for (i, v) in vendors.iter().enumerate() {
             let caps = CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(*v, "x", 1024)));
+                .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(*v, "x", 1)));
             index_with_node(&index, i as u64, caps);
         }
         let key = crate::adapter::net::behavior::tag::TagKey::new(
@@ -3664,7 +3664,7 @@ mod tests {
         // Any node with the marker → cardinality 1.
         let index = CapabilityIndex::new();
         let caps = CapabilitySet::new().with_hardware(
-            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
+            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 80)),
         );
         index_with_node(&index, 1, caps);
         let key = crate::adapter::net::behavior::tag::TagKey::new(
@@ -3677,8 +3677,7 @@ mod tests {
     #[test]
     fn axis_cardinality_returns_zero_for_unknown_keys() {
         let index = CapabilityIndex::new();
-        let caps =
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(65536));
+        let caps = CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(64));
         index_with_node(&index, 1, caps);
 
         let unknown_key = crate::adapter::net::behavior::tag::TagKey::new(
@@ -3693,7 +3692,7 @@ mod tests {
         let index = CapabilityIndex::new();
         let key = crate::adapter::net::behavior::tag::TagKey::new(
             crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_mb",
+            "memory_gb",
         );
         assert_eq!(index.axis_cardinality(&key), 0);
     }
@@ -3708,7 +3707,7 @@ mod tests {
         // TagKey.
         let index = CapabilityIndex::new();
         let caps = CapabilitySet::new().with_hardware(
-            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
+            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 80)),
         );
         index_with_node(&index, 1, caps);
 
@@ -3732,13 +3731,13 @@ mod tests {
         // correctly (was an O(N) scan in the previous implementation).
         let index = CapabilityIndex::new();
         for i in 0..100u32 {
-            let caps = CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_memory(1024 + i));
+            let caps =
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1 + i));
             index_with_node(&index, i as u64, caps);
         }
         let key = crate::adapter::net::behavior::tag::TagKey::new(
             crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_mb",
+            "memory_gb",
         );
         assert_eq!(index.axis_cardinality(&key), 100);
     }
@@ -3749,25 +3748,25 @@ mod tests {
         // are pruned if no other node carries them. Mirrors the
         // metadata_value_cardinality lifecycle test.
         let index = CapabilityIndex::new();
-        // Node 1: memory_mb=1024
+        // Node 1: memory_gb=1
         index_with_node(
             &index,
             1,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1024)),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1)),
         );
-        // Node 2: memory_mb=2048
+        // Node 2: memory_gb=2
         index_with_node(
             &index,
             2,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(2048)),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(2)),
         );
         let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
             crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_mb",
+            "memory_gb",
         );
         assert_eq!(index.axis_cardinality(&memory_key), 2);
 
-        // Remove node 1; only memory_mb=2048 left → cardinality 1.
+        // Remove node 1; only memory_gb=2 left → cardinality 1.
         index.remove(1);
         assert_eq!(index.axis_cardinality(&memory_key), 1);
 
@@ -3791,13 +3790,13 @@ mod tests {
             CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
                 GpuVendor::Nvidia,
                 "h100",
-                1024,
+                1,
             ))),
         );
         index_with_node(
             &index,
             2,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(65536)),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(64)),
         );
         index_with_node(
             &index,
@@ -3805,7 +3804,7 @@ mod tests {
             CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
                 GpuVendor::Amd,
                 "x",
-                1024,
+                1,
             ))),
         );
         index_with_node(
@@ -3839,7 +3838,7 @@ mod tests {
                 .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
                     GpuVendor::Nvidia,
                     "h100",
-                    81920,
+                    80,
                 )))
                 .with_metadata("intent", "ml-training"),
         );
@@ -3851,7 +3850,7 @@ mod tests {
                 .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
                     GpuVendor::Amd,
                     "x",
-                    1024,
+                    1,
                 )))
                 .with_metadata("intent", "embedding-cache"),
         );
@@ -3860,7 +3859,7 @@ mod tests {
             &index,
             12,
             CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_memory(65536))
+                .with_hardware(HardwareCapabilities::new().with_memory(64))
                 .with_metadata("intent", "ml-training"),
         );
         // Neither → miss
@@ -3892,7 +3891,7 @@ mod tests {
         index_with_node(
             &index,
             1,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1024)),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1)),
         );
         let pred = crate::adapter::net::behavior::Predicate::Exists {
             key: crate::adapter::net::behavior::tag::TagKey::new(
@@ -4011,7 +4010,7 @@ mod tests {
         let index = CapabilityIndex::new();
         for i in 0..5u64 {
             let caps = CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_memory(1024 + i as u32))
+                .with_hardware(HardwareCapabilities::new().with_memory(1 + i as u32))
                 .with_metadata("intent", "ml-training");
             index_with_node(&index, i, caps);
         }
@@ -4028,7 +4027,7 @@ mod tests {
 
         let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
             crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_mb",
+            "memory_gb",
         );
         assert_eq!(
             cache.axis_cardinality(&memory_key),
@@ -4051,7 +4050,7 @@ mod tests {
 
         let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
             crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_mb",
+            "memory_gb",
         );
         let first = cache.axis_cardinality(&memory_key);
 
@@ -4060,7 +4059,7 @@ mod tests {
         index_with_node(
             &index,
             999,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(99999)),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(100)),
         );
 
         let second = cache.axis_cardinality(&memory_key);
@@ -4079,7 +4078,7 @@ mod tests {
 
         let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
             crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_mb",
+            "memory_gb",
         );
         let first = cache.axis_cardinality(&memory_key);
 
@@ -4087,7 +4086,7 @@ mod tests {
         index_with_node(
             &index,
             999,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(99999)),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(100)),
         );
         cache.refresh();
 
@@ -4108,7 +4107,7 @@ mod tests {
 
         let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
             crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_mb",
+            "memory_gb",
         );
         let first = cache.axis_cardinality(&memory_key);
 
@@ -4116,7 +4115,7 @@ mod tests {
         index_with_node(
             &index,
             999,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(99999)),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(100)),
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
 
@@ -4150,7 +4149,7 @@ mod tests {
             Predicate::Exists {
                 key: crate::adapter::net::behavior::tag::TagKey::new(
                     crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-                    "memory_mb",
+                    "memory_gb",
                 ),
             },
             Predicate::MetadataEquals {
@@ -4162,7 +4161,7 @@ mod tests {
         // Use the cache as the planner provider; pin equivalence
         // with the direct-index path.
         let candidate_caps = CapabilitySet::new()
-            .with_hardware(HardwareCapabilities::new().with_memory(2048))
+            .with_hardware(HardwareCapabilities::new().with_memory(2))
             .with_metadata("intent", "ml-training");
         let tags: Vec<crate::adapter::net::behavior::Tag> =
             candidate_caps.tags.iter().cloned().collect();
@@ -4183,11 +4182,11 @@ mod tests {
         // low-cardinality clause. Result is the same; this test
         // pins the *result*, not the ordering (which is internal).
         let index = CapabilityIndex::new();
-        // Many distinct memory values → high cardinality of memory_mb
+        // Many distinct memory values → high cardinality of memory_gb
         for i in 0..20u64 {
             let mut caps = CapabilitySet::new().with_hardware(
                 HardwareCapabilities::new()
-                    .with_memory(1024 + i as u32)
+                    .with_memory(1 + i as u32)
                     .with_gpu(GpuInfo::new(
                         if i % 2 == 0 {
                             GpuVendor::Nvidia
@@ -4195,7 +4194,7 @@ mod tests {
                             GpuVendor::Amd
                         },
                         "x",
-                        1024,
+                        1,
                     )),
             );
             if i == 5 {
@@ -4204,7 +4203,7 @@ mod tests {
             index_with_node(&index, i, caps);
         }
 
-        // Predicate: intent=ml-training (low-card metadata) AND memory=1029 (high-card axis)
+        // Predicate: intent=ml-training (low-card metadata) AND memory=6 (high-card axis)
         let pred = crate::adapter::net::behavior::Predicate::And(vec![
             crate::adapter::net::behavior::Predicate::MetadataEquals {
                 key: "intent".into(),
@@ -4213,9 +4212,9 @@ mod tests {
             crate::adapter::net::behavior::Predicate::Equals {
                 key: crate::adapter::net::behavior::tag::TagKey::new(
                     crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-                    "memory_mb",
+                    "memory_gb",
                 ),
-                value: "1029".into(),
+                value: "6".into(),
             },
         ]);
         // Only node 5 matches both clauses.
@@ -4853,7 +4852,7 @@ mod tests {
 
     /// `query()` re-checks `filter.matches()` per candidate against
     /// the live `nodes` entry, so a filter with an always-true
-    /// non-indexed predicate (e.g., `min_memory_mb = 0`) must produce
+    /// non-indexed predicate (e.g., `min_memory_gb = 0`) must produce
     /// the same result as the equivalent indexed-only filter. This
     /// pins the equivalence under semantically-redundant predicate
     /// expansions and would catch a future regression that special-
@@ -4880,9 +4879,9 @@ mod tests {
             .require_tag("even")
             .require_tag("inference");
         // Same predicates plus an always-true non-indexed predicate.
-        // `memory_mb` is unsigned so `>= 0` is trivially true.
+        // `memory_gb` is unsigned so `>= 0` is trivially true.
         let mut with_non_indexed = indexed_only.clone();
-        with_non_indexed.min_memory_mb = Some(0);
+        with_non_indexed.min_memory_gb = Some(0);
 
         let mut a: Vec<u64> = index.query(&indexed_only);
         let mut b: Vec<u64> = index.query(&with_non_indexed);
@@ -4915,7 +4914,7 @@ mod tests {
             // Phase A.5.N.3: read-modify-write through views()/setter
             // since the typed `hardware` field is gone.
             let mut hw = caps.views().hardware().clone();
-            hw.memory_mb = 1024 * (i as u32 + 1);
+            hw.memory_gb = i as u32 + 1;
             caps.set_hardware(hw);
             let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
             index.index(ann);
@@ -4936,7 +4935,7 @@ mod tests {
             candidates,
         );
 
-        // With `prefer_memory(1.0)` and our memory_mb assignment, the
+        // With `prefer_memory(1.0)` and our memory_gb assignment, the
         // largest-memory candidate must win — pins the score path.
         let expected_winner = candidates
             .iter()
@@ -4944,7 +4943,7 @@ mod tests {
                 index
                     .nodes
                     .get(&id)
-                    .map(|n| n.capabilities.views().hardware().memory_mb)
+                    .map(|n| n.capabilities.views().hardware().memory_gb)
                     .unwrap_or(0)
             })
             .copied()
@@ -5387,14 +5386,14 @@ mod tests {
 
     /// Repro for the failing Go `TestHardwareAndGpuFilter_Matches`:
     /// announce a node with NVIDIA GPU + memory, then query for
-    /// `RequireGPU + GPUVendor=Nvidia + MinVRAMMB + MinMemoryMB`.
+    /// `RequireGPU + GPUVendor=Nvidia + MinVRAMGB + MinMemoryGB`.
     /// Self-match must succeed.
     #[test]
     fn hardware_and_gpu_filter_self_matches() {
-        let gpu = GpuInfo::new(GpuVendor::Nvidia, "h100", 81920);
+        let gpu = GpuInfo::new(GpuVendor::Nvidia, "h100", 80);
         let hw = HardwareCapabilities::new()
             .with_cpu(16, 16)
-            .with_memory(65536)
+            .with_memory(64)
             .with_gpu(gpu);
         let caps = CapabilitySet::new().with_hardware(hw).add_tag("gpu");
 
@@ -5405,8 +5404,8 @@ mod tests {
         let filter = CapabilityFilter::new()
             .require_gpu()
             .with_gpu_vendor(GpuVendor::Nvidia)
-            .with_min_vram(40_000)
-            .with_min_memory(32_768);
+            .with_min_vram(40)
+            .with_min_memory(32);
         let hits = index.query(&filter);
         assert!(hits.contains(&42u64), "self-match expected, got {:?}", hits);
     }
@@ -5420,10 +5419,10 @@ mod tests {
         use super::super::super::identity::EntityKeypair;
         let keypair = EntityKeypair::generate();
 
-        let gpu = GpuInfo::new(GpuVendor::Nvidia, "h100", 81920);
+        let gpu = GpuInfo::new(GpuVendor::Nvidia, "h100", 80);
         let hw = HardwareCapabilities::new()
             .with_cpu(16, 16)
-            .with_memory(65536)
+            .with_memory(64)
             .with_gpu(gpu);
         let caps = CapabilitySet::new().with_hardware(hw).add_tag("gpu");
 
@@ -5436,8 +5435,8 @@ mod tests {
         let filter = CapabilityFilter::new()
             .require_gpu()
             .with_gpu_vendor(GpuVendor::Nvidia)
-            .with_min_vram(40_000)
-            .with_min_memory(32_768);
+            .with_min_vram(40)
+            .with_min_memory(32);
         let hits = index.query(&filter);
         assert!(hits.contains(&42u64), "self-match expected, got {:?}", hits);
     }
@@ -5454,9 +5453,7 @@ mod tests {
         // typed view by scanning the tag set. The round-trip
         // through builder → views → comparison pins the bijection
         // for hardware fields the codec covers.
-        let hw_input = HardwareCapabilities::new()
-            .with_cpu(8, 16)
-            .with_memory(65536);
+        let hw_input = HardwareCapabilities::new().with_cpu(8, 16).with_memory(64);
         let caps = CapabilitySet::new().with_hardware(hw_input.clone());
         let hw_via_from: HardwareCapabilities = (&caps).into();
         assert_eq!(hw_via_from, hw_input);
@@ -5488,7 +5485,7 @@ mod tests {
         let views = caps.views();
         // Round-trip via builder → views — assert the projection
         // is non-default for the fields the sample populates.
-        assert!(views.hardware().memory_mb > 0);
+        assert!(views.hardware().memory_gb > 0);
         assert!(!views.models().is_empty());
         assert!(!views.tools().is_empty());
     }

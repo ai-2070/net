@@ -15,8 +15,8 @@
  * await node.announceCapabilities({
  *   hardware: {
  *     cpuCores: 16,
- *     memoryMb: 65_536,
- *     gpu: { vendor: 'nvidia', model: 'RTX 4090', vramMb: 24_576 },
+ *     memoryGb: 64,
+ *     gpu: { vendor: 'nvidia', model: 'RTX 4090', vramGb: 24 },
  *   },
  *   tags: ['gpu', 'inference'],
  *   models: [{ modelId: 'llama-3.1-70b', family: 'llama' }],
@@ -49,7 +49,7 @@ export type GpuVendor =
 export interface GpuInfo {
   vendor?: GpuVendor;
   model: string;
-  vramMb: number;
+  vramGb: number;
   computeUnits?: number;
   tensorCores?: number;
   /** FP16 TFLOPS × 10 (integer) — e.g. 825 for 82.5 TFLOPS. */
@@ -67,7 +67,7 @@ export type AcceleratorKind =
 export interface Accelerator {
   kind: AcceleratorKind;
   model: string;
-  memoryMb?: number;
+  memoryGb?: number;
   /** TOPS × 10 (integer). */
   topsX10?: number;
 }
@@ -75,12 +75,12 @@ export interface Accelerator {
 export interface Hardware {
   cpuCores?: number;
   cpuThreads?: number;
-  memoryMb?: number;
+  memoryGb?: number;
   gpu?: GpuInfo;
   additionalGpus?: GpuInfo[];
-  /** Storage in MB. BigInt to carry multi-TB values without loss. */
-  storageMb?: bigint;
-  networkMbps?: number;
+  /** Storage in GB. BigInt to carry multi-TB values without loss. */
+  storageGb?: bigint;
+  networkGbps?: number;
   accelerators?: Accelerator[];
 }
 
@@ -188,7 +188,7 @@ export interface CapabilityFilter {
 interface NapiGpuInfo {
   vendor?: string;
   model: string;
-  vramMb: number;
+  vramGb: number;
   computeUnits?: number;
   tensorCores?: number;
   fp16TflopsX10?: number;
@@ -197,18 +197,18 @@ interface NapiGpuInfo {
 interface NapiAccelerator {
   kind: string;
   model: string;
-  memoryMb?: number;
+  memoryGb?: number;
   topsX10?: number;
 }
 
 interface NapiHardware {
   cpuCores?: number;
   cpuThreads?: number;
-  memoryMb?: number;
+  memoryGb?: number;
   gpu?: NapiGpuInfo;
   additionalGpus?: NapiGpuInfo[];
-  storageMb?: bigint;
-  networkMbps?: number;
+  storageGb?: bigint;
+  networkGbps?: number;
   accelerators?: NapiAccelerator[];
 }
 
@@ -279,7 +279,7 @@ function gpuToNapi(g: GpuInfo): NapiGpuInfo {
   return {
     vendor: g.vendor,
     model: g.model,
-    vramMb: g.vramMb,
+    vramGb: g.vramGb,
     computeUnits: g.computeUnits,
     tensorCores: g.tensorCores,
     fp16TflopsX10: g.fp16TflopsX10,
@@ -290,7 +290,7 @@ function acceleratorToNapi(a: Accelerator): NapiAccelerator {
   return {
     kind: a.kind,
     model: a.model,
-    memoryMb: a.memoryMb,
+    memoryGb: a.memoryGb,
     topsX10: a.topsX10,
   };
 }
@@ -299,11 +299,11 @@ function hardwareToNapi(h: Hardware): NapiHardware {
   return {
     cpuCores: h.cpuCores,
     cpuThreads: h.cpuThreads,
-    memoryMb: h.memoryMb,
+    memoryGb: h.memoryGb,
     gpu: h.gpu ? gpuToNapi(h.gpu) : undefined,
     additionalGpus: h.additionalGpus?.map(gpuToNapi),
-    storageMb: h.storageMb,
-    networkMbps: h.networkMbps,
+    storageGb: h.storageGb,
+    networkGbps: h.networkGbps,
     accelerators: h.accelerators?.map(acceleratorToNapi),
   };
 }

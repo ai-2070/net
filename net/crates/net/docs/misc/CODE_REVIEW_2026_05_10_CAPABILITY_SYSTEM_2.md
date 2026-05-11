@@ -208,7 +208,7 @@ Every other Python thread blocks for the duration of the announcement. Sibling s
 
 **Location:** `net/crates/net/src/adapter/net/behavior/schema.rs:654`
 
-`value.parse::<u64>().is_ok() || value.parse::<i64>().is_ok()` admits `-1` for `hardware.memory_mb`, `gpu.vram_mb`, `cpu_cores`, `limits.max_concurrent_requests` — none of which can be negative.
+`value.parse::<u64>().is_ok() || value.parse::<i64>().is_ok()` admits `-1` for `hardware.memory_gb`, `gpu.vram_gb`, `cpu_cores`, `limits.max_concurrent_requests` — none of which can be negative.
 
 **Fix:** drop the `i64` fallback; accept only `u64` (or split into `Int`/`UInt` if signed values are ever needed).
 

@@ -415,8 +415,8 @@ query the local capability index with a filter.
 mesh.announce_capabilities({
     "hardware": {
         "cpu_cores": 16,
-        "memory_mb": 65536,
-        "gpu": {"vendor": "nvidia", "model": "h100", "vram_mb": 81920},
+        "memory_gb": 64,
+        "gpu": {"vendor": "nvidia", "model": "h100", "vram_gb": 80},
     },
     "models": [{"model_id": "llama-3.1-70b", "family": "llama",
                 "context_length": 128_000}],
@@ -426,7 +426,7 @@ mesh.announce_capabilities({
 gpu_peers = mesh.find_nodes({
     "require_gpu": True,
     "gpu_vendor": "nvidia",
-    "min_vram_mb": 40_000,
+    "min_vram_gb": 40,
 })
 ```
 
@@ -501,7 +501,7 @@ optional `token=bytes` kwarg on `subscribe_channel`.
 ```python
 mesh.register_channel(
     "gpu/jobs",
-    subscribe_caps={"require_gpu": True, "min_vram_mb": 16_000},
+    subscribe_caps={"require_gpu": True, "min_vram_gb": 16},
     require_token=True,
 )
 

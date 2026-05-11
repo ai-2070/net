@@ -104,7 +104,7 @@ fn synthetic_corpus() -> Vec<(Vec<Tag>, BTreeMap<String, String>)> {
         (
             vec![
                 tag_present(TaxonomyAxis::Hardware, "gpu"),
-                tag_value(TaxonomyAxis::Hardware, "memory_mb", "65536"),
+                tag_value(TaxonomyAxis::Hardware, "memory_gb", "64"),
             ],
             meta(&[("intent", "ml-training")]),
         ),
@@ -112,20 +112,20 @@ fn synthetic_corpus() -> Vec<(Vec<Tag>, BTreeMap<String, String>)> {
         (
             vec![
                 tag_present(TaxonomyAxis::Hardware, "gpu"),
-                tag_value(TaxonomyAxis::Hardware, "memory_mb", "16384"),
+                tag_value(TaxonomyAxis::Hardware, "memory_gb", "16"),
             ],
             meta(&[("intent", "ml-training")]),
         ),
         // 2: 64GB but no GPU — fails Exists clause.
         (
-            vec![tag_value(TaxonomyAxis::Hardware, "memory_mb", "65536")],
+            vec![tag_value(TaxonomyAxis::Hardware, "memory_gb", "64")],
             meta(&[("intent", "ml-training")]),
         ),
         // 3: GPU + 64GB but wrong intent — fails metadata clause.
         (
             vec![
                 tag_present(TaxonomyAxis::Hardware, "gpu"),
-                tag_value(TaxonomyAxis::Hardware, "memory_mb", "65536"),
+                tag_value(TaxonomyAxis::Hardware, "memory_gb", "64"),
             ],
             meta(&[("intent", "billing")]),
         ),
@@ -198,7 +198,7 @@ async fn predicate_header_round_trip_filters_corpus() {
     // "ml-training". Only candidate 0 satisfies all three.
     let p = pred!(and [
         pred!(exists "hardware.gpu"),
-        pred!(num_at_least "hardware.memory_mb", 32_768.0),
+        pred!(num_at_least "hardware.memory_gb", 32.0),
         pred!(metadata_equals "intent", "ml-training"),
     ]);
     let header = predicate_to_rpc_header(&p).expect("encode");

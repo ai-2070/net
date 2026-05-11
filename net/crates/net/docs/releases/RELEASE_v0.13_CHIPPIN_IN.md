@@ -25,7 +25,7 @@ pub enum Tag {
 
 `Tag::parse(s)` accepts every shape including reserved-prefix tags (the deserializer + substrate-internal callers); `Tag::parse_user(s)` rejects reserved prefixes for application input. `TagKey` (`(axis, key)`) is the half-form `Predicate` matches on. `TaxonomyAxis::all()` enumerates the four axes for iteration.
 
-Axis values accept either `=` or `:` as the separator on the wire (`hardware.gpu.vram_mb=24576` and `hardware.gpu:nvidia` both parse). The `separator` is preserved through `Tag::Eq` for byte-stable round-trips, and `tag.semantic_eq(other)` is the separator-agnostic comparison for tag matching.
+Axis values accept either `=` or `:` as the separator on the wire (`hardware.gpu.vram_gb=24` and `hardware.gpu:nvidia` both parse). The `separator` is preserved through `Tag::Eq` for byte-stable round-trips, and `tag.semantic_eq(other)` is the separator-agnostic comparison for tag matching.
 
 ### Tag shapes for discovery
 
@@ -42,7 +42,7 @@ pub struct CapabilitySet {
 }
 ```
 
-`HardwareCapabilities` / `SoftwareCapabilities` / `Vec<ModelCapability>` / `Vec<ToolCapability>` / `ResourceLimits` are *projections* — derived on demand via `caps.views()`. Encoding scheme: `hardware.cpu_cores=N` / `hardware.gpu` / `hardware.gpu.vram_mb=N` / `software.os=linux` / `software.model.0.id=...` / `hardware.limits.max_concurrent_requests=N`. Tool JSON-Schema strings (which can't safely round-trip through the tag wire format) live in `metadata` under `tool::<id>::input_schema` / `tool::<id>::output_schema`. Application-defined metadata keys propagate as opaque pairs (subject to a 4 KB soft cap with a `MetadataOversize` warning at the validator layer).
+`HardwareCapabilities` / `SoftwareCapabilities` / `Vec<ModelCapability>` / `Vec<ToolCapability>` / `ResourceLimits` are *projections* — derived on demand via `caps.views()`. Encoding scheme: `hardware.cpu_cores=N` / `hardware.gpu` / `hardware.gpu.vram_gb=N` / `software.os=linux` / `software.model.0.id=...` / `hardware.limits.max_concurrent_requests=N`. Tool JSON-Schema strings (which can't safely round-trip through the tag wire format) live in `metadata` under `tool::<id>::input_schema` / `tool::<id>::output_schema`. Application-defined metadata keys propagate as opaque pairs (subject to a 4 KB soft cap with a `MetadataOversize` warning at the validator layer).
 
 Wire format emits tags in sorted `Tag::to_string()` order — the `HashSet` keeps O(1) membership for in-memory lookups; the `serialize_with` hook flattens to a sorted `Vec` on the way out. Without this, two ends of a signed announcement round-trip would produce different bytes (HashSet iteration is process-local random) and the verifier would reject as `InvalidSignature`.
 
@@ -88,7 +88,7 @@ None of these change the wire format — they sit on top of the typed-taxonomy p
 
 ### Lazy view projections + diff
 
-`caps.views()` returns a `CapabilityViews` handle whose per-axis fields decode-and-cache on first access. Hot-path `caps.views().hardware().memory_mb` is < 50 ns post-cache; first call is the per-tag scan. Cache invalidates compiler-enforced via the `&caps` borrow held by `views()`.
+`caps.views()` returns a `CapabilityViews` handle whose per-axis fields decode-and-cache on first access. Hot-path `caps.views().hardware().memory_gb` is < 50 ns post-cache; first call is the per-tag scan. Cache invalidates compiler-enforced via the `&caps` borrow held by `views()`.
 
 `caps.diff(prev)` returns `CapabilitySetDiff { added_tags, removed_tags, changed_metadata }` for cheap before/after change detection. `MetadataChange::{Added, Removed, Updated}` per-key with old/new values. Powers event-driven placement, capability-change dashboards, and delta-based metadata propagation.
 
@@ -261,7 +261,7 @@ The SDK's capability surface is entirely additive over the substrate re-exports 
 
 ### Behavioral fixes that may surface as test breakage
 
-- **`CapabilitySet` field reads now decode lazily through `views()`.** Tests that did `caps.hardware.memory_mb` directly fail to compile; rewrite as `caps.views().hardware().memory_mb`. Same for `software` / `models` / `tools` / `limits`.
+- **`CapabilitySet` field reads now decode lazily through `views()`.** Tests that did `caps.hardware.memory_gb` directly fail to compile; rewrite as `caps.views().hardware().memory_gb`. Same for `software` / `models` / `tools` / `limits`.
 - **`caps.tags.contains(&"gpu".to_string())` no longer compiles.** `tags: HashSet<Tag>` carries typed values; use `caps.has_tag("hardware.gpu")` (which is now separator-agnostic) or `caps.tags.iter().any(|t| t.to_string() == "hardware.gpu")` for the substring-style check.
 - **`add_tag("scope:tenant:foo")` silently drops** at the application layer. Use `caps.with_tenant_scope("foo")`. The binding-side passthrough via `tags: [...]` works because bindings parse via the unrestricted `Tag::parse`.
 - **`CapabilitySet::diff` ops now sort deterministically.** Tests that asserted specific diff-op insertion order under `Vec` semantics will see lexicographic-by-tag ordering instead.

@@ -152,7 +152,7 @@ const HARDWARE_KEYS: &[KeyEntry] = &[
         value_type: ValueType::Number,
     },
     KeyEntry {
-        key: "memory_mb",
+        key: "memory_gb",
         value_type: ValueType::Number,
     },
     KeyEntry {
@@ -168,7 +168,7 @@ const HARDWARE_KEYS: &[KeyEntry] = &[
         value_type: ValueType::String,
     },
     KeyEntry {
-        key: "gpu.vram_mb",
+        key: "gpu.vram_gb",
         value_type: ValueType::Number,
     },
     KeyEntry {
@@ -184,11 +184,11 @@ const HARDWARE_KEYS: &[KeyEntry] = &[
         value_type: ValueType::Number,
     },
     KeyEntry {
-        key: "storage_mb",
+        key: "storage_gb",
         value_type: ValueType::Number,
     },
     KeyEntry {
-        key: "network_mbps",
+        key: "network_gbps",
         value_type: ValueType::Number,
     },
     KeyEntry {
@@ -408,7 +408,7 @@ pub enum SchemaError {
         tag: String,
     },
     /// A known-axis, known-key tag has a value that doesn't parse as
-    /// the expected `ValueType` (e.g. `hardware.memory_mb=lots`).
+    /// the expected `ValueType` (e.g. `hardware.memory_gb=lots`).
     TypeMismatch {
         /// Axis the key belongs to.
         axis: TaxonomyAxis,
@@ -695,8 +695,8 @@ fn check_value(
     let parses = match entry.value_type {
         ValueType::Presence => unreachable!("handled above"),
         // CR-15: Number is unsigned. The previous `i64` fallback
-        // admitted negatives for keys like `hardware.memory_mb`,
-        // `gpu.vram_mb`, `cpu_cores`, `limits.max_concurrent_requests`
+        // admitted negatives for keys like `hardware.memory_gb`,
+        // `gpu.vram_gb`, `cpu_cores`, `limits.max_concurrent_requests`
         // — none of which can be negative semantically. The schema
         // doesn't currently model signed numerics; if one is ever
         // needed, split into `Int` / `UInt` rather than reintroducing
@@ -751,16 +751,16 @@ mod tests {
         let expected: HashSet<&str> = [
             "cpu_cores",
             "cpu_threads",
-            "memory_mb",
+            "memory_gb",
             "gpu",
             "gpu.vendor",
             "gpu.model",
-            "gpu.vram_mb",
+            "gpu.vram_gb",
             "gpu.compute_units",
             "gpu.tensor_cores",
             "gpu.fp16_tflops_x10",
-            "storage_mb",
-            "network_mbps",
+            "storage_gb",
+            "network_gbps",
             "limits.max_concurrent_requests",
             "limits.max_tokens_per_request",
             "limits.rate_limit_rpm",
@@ -791,10 +791,10 @@ mod tests {
 
     #[test]
     fn validate_well_formed_capability_set_is_clean() {
-        let gpu = GpuInfo::new(GpuVendor::Nvidia, "h100", 81920);
+        let gpu = GpuInfo::new(GpuVendor::Nvidia, "h100", 80);
         let hw = HardwareCapabilities::new()
             .with_cpu(16, 32)
-            .with_memory(65536)
+            .with_memory(64)
             .with_gpu(gpu);
         let sw = SoftwareCapabilities::new()
             .with_os("linux", "6.5")
@@ -955,13 +955,13 @@ mod tests {
 
     /// CR-15: `Number` no longer accepts negative integers. The
     /// previous `i64` fallback let `-1` slip in for unsigned-only
-    /// keys (`memory_mb`, `vram_mb`, `cpu_cores`, etc.).
+    /// keys (`memory_gb`, `vram_gb`, `cpu_cores`, etc.).
     #[test]
     fn validate_number_rejects_negative_values() {
         let mut caps = CapabilitySet::new();
         caps.tags.insert(Tag::AxisValue {
             axis: TaxonomyAxis::Hardware,
-            key: "memory_mb".to_string(),
+            key: "memory_gb".to_string(),
             value: "-1".to_string(),
             separator: AxisSeparator::Eq,
         });
@@ -970,7 +970,7 @@ mod tests {
             report.errors.iter().any(|e| matches!(e,
                 SchemaError::TypeMismatch { axis, key, expected, actual }
                     if *axis == TaxonomyAxis::Hardware
-                       && key == "memory_mb"
+                       && key == "memory_gb"
                        && *expected == ValueType::Number
                        && actual == "-1"
             )),

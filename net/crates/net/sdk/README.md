@@ -362,8 +362,8 @@ let mesh = MeshBuilder::new("127.0.0.1:0", &[0x42u8; 32])?
 
 let hw = HardwareCapabilities::new()
     .with_cpu(16, 32)
-    .with_memory(65_536)
-    .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24_576));
+    .with_memory(64)
+    .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24));
 mesh.announce_capabilities(
     CapabilitySet::new().with_hardware(hw).add_tag("gpu"),
 )
@@ -371,7 +371,7 @@ mesh.announce_capabilities(
 
 // Self-match: returns our own node_id.
 let hits = mesh.find_nodes(
-    &CapabilityFilter::new().require_gpu().with_min_vram(16_384),
+    &CapabilityFilter::new().require_gpu().with_min_vram(16),
 );
 assert!(hits.contains(&mesh.node_id()));
 mesh.shutdown().await?;
@@ -482,7 +482,7 @@ let _sw = views.software();          // Independent of hardware decode.
 // Predicate AST — language-idiomatic builder + macro form.
 let p = pred!(and [
     pred!(exists "hardware.gpu"),
-    pred!(num_at_least "hardware.memory_mb", 65536.0),
+    pred!(num_at_least "hardware.memory_gb", 64.0),
     pred!(metadata_equals "intent", "ml-training"),
 ]);
 

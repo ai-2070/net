@@ -40,11 +40,11 @@ pub struct CapabilitySetJs {
 pub struct HardwareJs {
     pub cpu_cores: Option<u32>,
     pub cpu_threads: Option<u32>,
-    pub memory_mb: Option<u32>,
+    pub memory_gb: Option<u32>,
     pub gpu: Option<GpuInfoJs>,
     pub additional_gpus: Option<Vec<GpuInfoJs>>,
-    pub storage_mb: Option<BigInt>,
-    pub network_mbps: Option<u32>,
+    pub storage_gb: Option<BigInt>,
+    pub network_gbps: Option<u32>,
     pub accelerators: Option<Vec<AcceleratorJs>>,
 }
 
@@ -54,7 +54,7 @@ pub struct GpuInfoJs {
     /// `qualcomm` | `unknown`.
     pub vendor: Option<String>,
     pub model: String,
-    pub vram_mb: u32,
+    pub vram_gb: u32,
     pub compute_units: Option<u32>,
     pub tensor_cores: Option<u32>,
     pub fp16_tflops_x10: Option<u32>,
@@ -65,7 +65,7 @@ pub struct AcceleratorJs {
     /// `tpu` | `npu` | `fpga` | `asic` | `dsp` | `unknown`.
     pub kind: String,
     pub model: String,
-    pub memory_mb: Option<u32>,
+    pub memory_gb: Option<u32>,
     /// TOPS × 10 (matches the core's integer storage).
     pub tops_x10: Option<u32>,
 }
@@ -124,11 +124,11 @@ pub struct CapabilityFilterJs {
     pub require_tags: Option<Vec<String>>,
     pub require_models: Option<Vec<String>>,
     pub require_tools: Option<Vec<String>>,
-    pub min_memory_mb: Option<u32>,
+    pub min_memory_gb: Option<u32>,
     pub require_gpu: Option<bool>,
     /// Lowercase vendor name; see `GpuInfoJs::vendor`.
     pub gpu_vendor: Option<String>,
-    pub min_vram_mb: Option<u32>,
+    pub min_vram_gb: Option<u32>,
     pub min_context_length: Option<u32>,
     pub require_modalities: Option<Vec<String>>,
 }
@@ -224,7 +224,7 @@ fn gpu_info_from_js(g: GpuInfoJs) -> GpuInfo {
         .as_deref()
         .map(parse_gpu_vendor)
         .unwrap_or(GpuVendor::Unknown);
-    let mut info = GpuInfo::new(vendor, g.model, g.vram_mb);
+    let mut info = GpuInfo::new(vendor, g.model, g.vram_gb);
     if let Some(cu) = g.compute_units {
         info = info.with_compute_units(saturating_u16(cu));
     }
@@ -248,7 +248,7 @@ fn gpu_info_to_js(g: &GpuInfo) -> GpuInfoJs {
     GpuInfoJs {
         vendor: Some(gpu_vendor_to_string(g.vendor)),
         model: g.model.clone(),
-        vram_mb: g.vram_mb,
+        vram_gb: g.vram_gb,
         compute_units: Some(g.compute_units as u32),
         tensor_cores: Some(g.tensor_cores as u32),
         fp16_tflops_x10: Some(g.fp16_tflops_x10),
@@ -259,7 +259,7 @@ fn accelerator_from_js(a: AcceleratorJs) -> AcceleratorInfo {
     AcceleratorInfo {
         accel_type: parse_accelerator_type(&a.kind),
         model: a.model,
-        memory_mb: a.memory_mb.unwrap_or(0),
+        memory_gb: a.memory_gb.unwrap_or(0),
         tops_x10: a.tops_x10.map(saturating_u16).unwrap_or(0),
     }
 }
@@ -272,7 +272,7 @@ fn hardware_from_js(h: HardwareJs) -> HardwareCapabilities {
         let c = saturating_u16(cores);
         hw = hw.with_cpu(c, c);
     }
-    if let Some(mb) = h.memory_mb {
+    if let Some(mb) = h.memory_gb {
         hw = hw.with_memory(mb);
     }
     if let Some(g) = h.gpu {
@@ -281,11 +281,11 @@ fn hardware_from_js(h: HardwareJs) -> HardwareCapabilities {
     for g in h.additional_gpus.unwrap_or_default() {
         hw = hw.add_gpu(gpu_info_from_js(g));
     }
-    if h.storage_mb.is_some() {
-        hw = hw.with_storage(bigint_to_u64_or_zero(h.storage_mb));
+    if h.storage_gb.is_some() {
+        hw = hw.with_storage(bigint_to_u64_or_zero(h.storage_gb));
     }
-    if let Some(mbps) = h.network_mbps {
-        hw = hw.with_network(mbps);
+    if let Some(gbps) = h.network_gbps {
+        hw = hw.with_network(gbps);
     }
     for a in h.accelerators.unwrap_or_default() {
         hw = hw.add_accelerator(accelerator_from_js(a));
@@ -422,7 +422,7 @@ pub fn capability_filter_from_js(f: CapabilityFilterJs) -> CapabilityFilter {
     for t in f.require_tools.unwrap_or_default() {
         cf = cf.require_tool(t);
     }
-    if let Some(mb) = f.min_memory_mb {
+    if let Some(mb) = f.min_memory_gb {
         cf = cf.with_min_memory(mb);
     }
     if f.require_gpu.unwrap_or(false) {
@@ -431,7 +431,7 @@ pub fn capability_filter_from_js(f: CapabilityFilterJs) -> CapabilityFilter {
     if let Some(v) = f.gpu_vendor {
         cf = cf.with_gpu_vendor(parse_gpu_vendor(&v));
     }
-    if let Some(mb) = f.min_vram_mb {
+    if let Some(mb) = f.min_vram_gb {
         cf = cf.with_min_vram(mb);
     }
     if let Some(n) = f.min_context_length {
@@ -605,11 +605,11 @@ mod tests {
         let h = HardwareJs {
             cpu_cores: Some(70_000),
             cpu_threads: Some(200_000),
-            memory_mb: None,
+            memory_gb: None,
             gpu: None,
             additional_gpus: None,
-            storage_mb: None,
-            network_mbps: None,
+            storage_gb: None,
+            network_gbps: None,
             accelerators: None,
         };
         let hw = hardware_from_js(h);
@@ -622,7 +622,7 @@ mod tests {
         let g = GpuInfoJs {
             vendor: Some("nvidia".into()),
             model: "test".into(),
-            vram_mb: 0,
+            vram_gb: 0,
             compute_units: Some(90_000),
             tensor_cores: Some(u32::MAX),
             fp16_tflops_x10: None,

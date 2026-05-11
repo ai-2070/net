@@ -217,10 +217,10 @@ pub struct TopologyHints {
     pub preferred_peers: Vec<NodeId>,
     /// Network tier classification
     pub tier: NetworkTier,
-    /// Uplink bandwidth in Mbps
-    pub uplink_mbps: Option<u32>,
-    /// Downlink bandwidth in Mbps
-    pub downlink_mbps: Option<u32>,
+    /// Uplink bandwidth in Gbps
+    pub uplink_gbps: Option<u32>,
+    /// Downlink bandwidth in Gbps
+    pub downlink_gbps: Option<u32>,
     /// NAT type
     pub nat_type: NatType,
     /// Whether node can relay traffic
@@ -243,8 +243,8 @@ impl Default for TopologyHints {
         Self {
             preferred_peers: Vec::new(),
             tier: NetworkTier::Consumer,
-            uplink_mbps: None,
-            downlink_mbps: None,
+            uplink_gbps: None,
+            downlink_gbps: None,
             nat_type: NatType::Unknown,
             can_relay: false,
             max_relay_connections: None,
@@ -267,8 +267,8 @@ impl TopologyHints {
 
     /// Set bandwidth
     pub fn with_bandwidth(mut self, uplink: u32, downlink: u32) -> Self {
-        self.uplink_mbps = Some(uplink);
-        self.downlink_mbps = Some(downlink);
+        self.uplink_gbps = Some(uplink);
+        self.downlink_gbps = Some(downlink);
         self
     }
 
@@ -322,7 +322,7 @@ impl TopologyHints {
         }
 
         // Bandwidth (0-0.2)
-        if let Some(uplink) = self.uplink_mbps {
+        if let Some(uplink) = self.uplink_gbps {
             score += (uplink.min(1000) as f64 / 1000.0) * 0.2;
         }
 

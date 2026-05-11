@@ -239,7 +239,7 @@ def test_predicate_complex_round_trip() -> None:
         p.or_(
             p.exists(tag_key("hardware", "gpu")),
             p.and_(
-                p.numeric_at_least(tag_key("hardware", "memory_mb"), 65536),
+                p.numeric_at_least(tag_key("hardware", "memory_gb"), 64),
                 p.metadata_exists("intent"),
             ),
         ),
@@ -399,9 +399,9 @@ def test_numeric_predicate_accepts_scientific_notation() -> None:
         metadata,
     ) is False
     # NumericInRange with scientific notation.
-    tags = ["hardware.memory_mb=2.5e4"]  # 25000
+    tags = ["hardware.memory_gb=2.5e1"]  # 25
     assert evaluate_predicate(
-        p.numeric_in_range(tag_key("hardware", "memory_mb"), 20000.0, 30000.0),
+        p.numeric_in_range(tag_key("hardware", "memory_gb"), 20.0, 30.0),
         tags,
         metadata,
     ) is True
@@ -436,9 +436,9 @@ def test_axis_present_tag_does_not_match_value_predicates() -> None:
     ) is False
 
     # AxisValue still works for value predicates.
-    tags_v = ["hardware.gpu.vram_mb=80000"]
+    tags_v = ["hardware.gpu.vram_gb=80"]
     assert evaluate_predicate(
-        p.equals(tag_key("hardware", "gpu.vram_mb"), "80000"), tags_v, metadata
+        p.equals(tag_key("hardware", "gpu.vram_gb"), "80"), tags_v, metadata
     ) is True
 
 

@@ -148,7 +148,7 @@
         "clause_stats": [
           { "label": "Exists(hardware.gpu)", "evaluated": 2, "matched": 1 },
           {
-            "label": "NumericAtLeast(hardware.memory_mb >= 65536)",
+            "label": "NumericAtLeast(hardware.memory_gb >= 64)",
             "evaluated": 2,
             "matched": 1
           },
@@ -159,14 +159,14 @@
           }
         ]
       },
-      "redact_keys": ["intent", "memory_mb"],
+      "redact_keys": ["intent", "memory_gb"],
       "redacted_report": {
         "total_candidates": 2,
         "matched": 1,
         "clause_stats": [
           { "label": "Exists(hardware.gpu)", "evaluated": 2, "matched": 1 },
           {
-            "label": "NumericAtLeast(hardware.memory_mb >= 65536)",
+            "label": "NumericAtLeast(hardware.memory_gb >= 64)",
             "evaluated": 2,
             "matched": 1
           },

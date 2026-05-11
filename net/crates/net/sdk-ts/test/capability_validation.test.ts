@@ -101,7 +101,7 @@ describe('AXIS_SCHEMA shape', () => {
   it('exposes hardware fixed keys', () => {
     const keys = AXIS_SCHEMA.hardware.keys.map((e) => e.key);
     expect(keys).toContain('cpu_cores');
-    expect(keys).toContain('memory_mb');
+    expect(keys).toContain('memory_gb');
     expect(keys).toContain('gpu');
     expect(keys).toContain('gpu.vendor');
     expect(keys).toContain('limits.max_concurrent_requests');
@@ -182,7 +182,7 @@ describe('helper predicates', () => {
           {
             kind: 'type_mismatch',
             axis: 'hardware',
-            key: 'memory_mb',
+            key: 'memory_gb',
             expected: 'number',
             actual: 'lots',
           },
@@ -284,9 +284,9 @@ describe('regression: reserved metadata keys + prefixes', () => {
 // must mirror that decision so client-side checks don't pass a
 // CapabilitySet the substrate would later reject.
 describe('regression: number values reject negatives', () => {
-  it('flags `hardware.memory_mb=-1` as a TypeMismatch error', () => {
+  it('flags `hardware.memory_gb=-1` as a TypeMismatch error', () => {
     const caps: CapabilitySetWire = {
-      tags: ['hardware.memory_mb=-1'],
+      tags: ['hardware.memory_gb=-1'],
       metadata: {},
     };
     const report = validateCapabilities(caps);
@@ -294,7 +294,7 @@ describe('regression: number values reject negatives', () => {
       (e) =>
         e.kind === 'type_mismatch' &&
         e.axis === 'hardware' &&
-        e.key === 'memory_mb',
+        e.key === 'memory_gb',
     );
     expect(mismatch).toBeDefined();
     expect((mismatch as { actual: string }).actual).toBe('-1');
@@ -302,7 +302,7 @@ describe('regression: number values reject negatives', () => {
 
   it('still accepts unsigned integer values', () => {
     const caps: CapabilitySetWire = {
-      tags: ['hardware.memory_mb=65536'],
+      tags: ['hardware.memory_gb=64'],
       metadata: {},
     };
     const report = validateCapabilities(caps);

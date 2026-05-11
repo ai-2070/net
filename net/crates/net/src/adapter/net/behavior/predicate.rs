@@ -2371,8 +2371,8 @@ mod tests {
                 pattern: "linux".into(),
             },
             Predicate::NumericAtLeast {
-                key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-                threshold: 65536.0,
+                key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+                threshold: 64.0,
             },
             Predicate::Exists {
                 key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
@@ -2404,11 +2404,11 @@ mod tests {
         // Pin: planner-vs-unplanned equivalence on a clearly-false
         // input. Both must return false; planner short-circuits
         // earlier but the result is identical.
-        let tags: Vec<Tag> = vec![axis_eq(TaxonomyAxis::Hardware, "memory_mb", "32768")];
+        let tags: Vec<Tag> = vec![axis_eq(TaxonomyAxis::Hardware, "memory_gb", "32")];
         let meta = empty_meta();
         let cx = ctx(&tags, &meta);
         let ast = worst_case_and();
-        // Memory is 32768 < 65536, so the AND fails. Both paths
+        // Memory is 32 < 64, so the AND fails. Both paths
         // agree.
         assert!(!ast.evaluate(&cx));
         assert!(!ast.evaluate_unplanned(&cx));
@@ -2417,7 +2417,7 @@ mod tests {
     #[test]
     fn planner_preserves_semantics_on_full_match() {
         let tags: Vec<Tag> = vec![
-            axis_eq(TaxonomyAxis::Hardware, "memory_mb", "131072"),
+            axis_eq(TaxonomyAxis::Hardware, "memory_gb", "128"),
             axis_present(TaxonomyAxis::Hardware, "gpu"),
             axis_eq(TaxonomyAxis::Software, "os", "linux"),
             axis_eq(TaxonomyAxis::Software, "runtime.python", "3.11.5"),
@@ -2501,8 +2501,8 @@ mod tests {
                 value: "ml-training".into(),
             },
             Predicate::NumericAtLeast {
-                key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-                threshold: 65536.0,
+                key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+                threshold: 64.0,
             },
             // Composites
             worst_case_and(),
@@ -2523,8 +2523,8 @@ mod tests {
                     },
                     Predicate::And(vec![
                         Predicate::NumericAtLeast {
-                            key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-                            threshold: 65536.0,
+                            key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+                            threshold: 64.0,
                         },
                         Predicate::MetadataExists {
                             key: "intent".into(),
@@ -2545,7 +2545,7 @@ mod tests {
             (
                 vec![
                     axis_present(TaxonomyAxis::Hardware, "gpu"),
-                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "131072"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_gb", "128"),
                 ],
                 BTreeMap::new(),
             ),
@@ -2555,7 +2555,7 @@ mod tests {
             (
                 vec![
                     axis_present(TaxonomyAxis::Hardware, "gpu"),
-                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "131072"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_gb", "128"),
                     axis_eq(TaxonomyAxis::Software, "os", "linux"),
                     axis_eq(TaxonomyAxis::Software, "runtime.python", "3.11.5"),
                 ],
@@ -2566,7 +2566,7 @@ mod tests {
             (
                 vec![
                     axis_present(TaxonomyAxis::Hardware, "gpu"),
-                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "131072"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_gb", "128"),
                 ],
                 meta_with(&[("intent", "ml-training"), ("decommissioning", "true")]),
             ),
@@ -2595,7 +2595,7 @@ mod tests {
         // same boolean result as `evaluate()`. Trace is a side
         // channel; the predicate semantic is unchanged.
         let ast = worst_case_and();
-        let tags: Vec<Tag> = vec![axis_eq(TaxonomyAxis::Hardware, "memory_mb", "32768")];
+        let tags: Vec<Tag> = vec![axis_eq(TaxonomyAxis::Hardware, "memory_gb", "32")];
         let meta = empty_meta();
         let cx = ctx(&tags, &meta);
         let plain_result = ast.evaluate(&cx);
@@ -2805,8 +2805,8 @@ mod tests {
                 },
                 Predicate::And(vec![
                     Predicate::NumericAtLeast {
-                        key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-                        threshold: 65536.0,
+                        key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+                        threshold: 64.0,
                     },
                     Predicate::MetadataExists {
                         key: "intent".into(),
@@ -3239,14 +3239,14 @@ mod tests {
         EntityId::from_bytes([0u8; 32])
     }
 
-    /// Build a CapabilityIndex with `n` distinct memory_mb values.
-    /// Used to give `axis_cardinality(hardware.memory_mb)` a known
+    /// Build a CapabilityIndex with `n` distinct memory_gb values.
+    /// Used to give `axis_cardinality(hardware.memory_gb)` a known
     /// target value.
     fn index_with_distinct_memory_values(n: u32) -> CapabilityIndex {
         let index = CapabilityIndex::new();
         for i in 0..n {
-            let caps = CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_memory(1024 + i));
+            let caps =
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1 + i));
             let ann = CapabilityAnnouncement::new(i as u64, entity(), 1, caps);
             index.index(ann);
         }
@@ -3261,8 +3261,8 @@ mod tests {
         for i in 0..20u64 {
             let caps = CapabilitySet::new().with_hardware(
                 HardwareCapabilities::new()
-                    .with_memory(1024 + i as u32) // unique memory_mb
-                    .with_gpu(GpuInfo::new(vendors[i as usize % 2], "x", 1024)),
+                    .with_memory(1 + i as u32) // unique memory_gb
+                    .with_gpu(GpuInfo::new(vendors[i as usize % 2], "x", 1)),
             );
             let ann = CapabilityAnnouncement::new(i, entity(), 1, caps);
             index.index(ann);
@@ -3273,14 +3273,14 @@ mod tests {
     #[test]
     fn dynamic_cost_lowers_for_high_cardinality_keys() {
         // Pin the planner's intuition: a key with high cardinality
-        // (memory_mb across 100 distinct values) gets a much
+        // (memory_gb across 100 distinct values) gets a much
         // lower dynamic cost than a key with low cardinality
         // (gpu.vendor with 2 values).
         let index = index_with_low_card_gpu_vendor();
 
         let high_card_clause = Predicate::Equals {
-            key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-            value: "1029".into(),
+            key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+            value: "1".into(),
         };
         let low_card_clause = Predicate::Equals {
             key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
@@ -3347,8 +3347,8 @@ mod tests {
         }
 
         let clause = Predicate::Equals {
-            key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-            value: "1024".into(),
+            key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+            value: "1".into(),
         };
         let dyn_cost = clause.dynamic_cost(&HugeCardinality);
         let static_c = clause.static_cost();
@@ -3467,10 +3467,10 @@ mod tests {
         // Or-cost. Inverse of And-mode `dynamic_cost`.
         let index = index_with_low_card_gpu_vendor();
 
-        // gpu.vendor has 2 distinct values, memory_mb has 20.
+        // gpu.vendor has 2 distinct values, memory_gb has 20.
         let high_card_clause = Predicate::Equals {
-            key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-            value: "1029".into(),
+            key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+            value: "1".into(),
         };
         let low_card_clause = Predicate::Equals {
             key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
@@ -3533,8 +3533,8 @@ mod tests {
     fn dynamic_cost_or_falls_back_to_static_on_empty_index() {
         let index = CapabilityIndex::new();
         let pred = Predicate::Equals {
-            key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-            value: "65536".into(),
+            key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+            value: "64".into(),
         };
         assert_eq!(pred.dynamic_cost_or(&index), pred.static_cost());
     }
@@ -3552,8 +3552,8 @@ mod tests {
             // High-cost, high-cardinality clause; would normally
             // sort first under And-mode planner.
             Predicate::Equals {
-                key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-                value: "999999".into(), // doesn't match anything
+                key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+                value: "999".into(), // doesn't match anything
             },
             // Low-cost, low-cardinality clause; should sort first
             // under Or-mode planner.
@@ -3563,7 +3563,7 @@ mod tests {
             },
         ]);
 
-        let tags: Vec<Tag> = vec![]; // no memory_mb=999999
+        let tags: Vec<Tag> = vec![]; // no memory_gb=999
         let meta = meta_with(&[("intent", "ml-training")]);
         let cx = ctx(&tags, &meta);
 
@@ -3592,8 +3592,8 @@ mod tests {
                     value: "nvidia".into(),
                 },
                 Predicate::Equals {
-                    key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-                    value: "1029".into(),
+                    key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+                    value: "1".into(),
                 },
             ]),
             // Or wrapped in And (planner re-enters Or-mode at the
@@ -3626,7 +3626,7 @@ mod tests {
                 meta_with(&[("intent", "ml-training")]),
             ),
             (
-                vec![axis_eq(TaxonomyAxis::Hardware, "memory_mb", "1029")],
+                vec![axis_eq(TaxonomyAxis::Hardware, "memory_gb", "1")],
                 meta_with(&[("decommissioning", "true")]),
             ),
         ];
@@ -3691,7 +3691,7 @@ mod tests {
                     value: "nvidia".into(),
                 },
                 Predicate::NumericAtLeast {
-                    key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+                    key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
                     threshold: 1024.0,
                 },
             ]),
@@ -3719,7 +3719,7 @@ mod tests {
                 vec![
                     axis_present(TaxonomyAxis::Hardware, "gpu"),
                     axis_eq(TaxonomyAxis::Hardware, "gpu.vendor", "nvidia"),
-                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "65536"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_gb", "64"),
                 ],
                 meta_with(&[("intent", "ml-training")]),
             ),
@@ -3751,7 +3751,7 @@ mod tests {
 
         let tags: Vec<Tag> = vec![
             axis_present(TaxonomyAxis::Hardware, "gpu"),
-            axis_eq(TaxonomyAxis::Hardware, "memory_mb", "131072"),
+            axis_eq(TaxonomyAxis::Hardware, "memory_gb", "128"),
             axis_eq(TaxonomyAxis::Software, "runtime.python", "3.11.5"),
         ];
         let meta = meta_with(&[("intent", "ml-training")]);
@@ -3786,14 +3786,14 @@ mod tests {
             .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
                 GpuVendor::Nvidia,
                 "h100",
-                81920,
+                80,
             )))
             .with_metadata("intent", "ml-training");
         assert!(pred.matches_capability_set(&caps_match));
 
         // Miss on the metadata side.
         let caps_miss_meta = CapabilitySet::new().with_hardware(
-            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
+            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 80)),
         );
         assert!(!pred.matches_capability_set(&caps_miss_meta));
 
@@ -3870,7 +3870,7 @@ mod tests {
                 id: 4,
                 tags: vec![
                     axis_present(TaxonomyAxis::Hardware, "gpu"),
-                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "65536"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_gb", "64"),
                 ],
                 metadata: BTreeMap::new(),
             },
@@ -3945,8 +3945,8 @@ mod tests {
                 key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
             },
             Predicate::NumericAtLeast {
-                key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-                threshold: 32768.0,
+                key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+                threshold: 32.0,
             },
         ]);
         let encoded = predicate_to_rpc_header(&pred).expect("encode");
@@ -3966,14 +3966,14 @@ mod tests {
         let jobs = vec![
             TestJob {
                 id: 1, // No GPU.
-                tags: vec![axis_eq(TaxonomyAxis::Hardware, "memory_mb", "65536")],
+                tags: vec![axis_eq(TaxonomyAxis::Hardware, "memory_gb", "64")],
                 metadata: BTreeMap::new(),
             },
             TestJob {
                 id: 2, // GPU + 32 GB → matches.
                 tags: vec![
                     axis_present(TaxonomyAxis::Hardware, "gpu"),
-                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "32768"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_gb", "32"),
                 ],
                 metadata: BTreeMap::new(),
             },
@@ -3981,7 +3981,7 @@ mod tests {
                 id: 3, // GPU + 16 GB → too little memory.
                 tags: vec![
                     axis_present(TaxonomyAxis::Hardware, "gpu"),
-                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "16384"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_gb", "16"),
                 ],
                 metadata: BTreeMap::new(),
             },
@@ -3989,7 +3989,7 @@ mod tests {
                 id: 4, // GPU + 65 GB → matches.
                 tags: vec![
                     axis_present(TaxonomyAxis::Hardware, "gpu"),
-                    axis_eq(TaxonomyAxis::Hardware, "memory_mb", "65536"),
+                    axis_eq(TaxonomyAxis::Hardware, "memory_gb", "64"),
                 ],
                 metadata: BTreeMap::new(),
             },
@@ -4014,7 +4014,7 @@ mod tests {
                         value: "nvidia".into(),
                     },
                     Predicate::NumericAtLeast {
-                        key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+                        key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
                         threshold: 1024.0,
                     },
                 ]),
@@ -4029,7 +4029,7 @@ mod tests {
 
         let tags: Vec<Tag> = vec![
             axis_eq(TaxonomyAxis::Hardware, "gpu.vendor", "nvidia"),
-            axis_eq(TaxonomyAxis::Hardware, "memory_mb", "2048"),
+            axis_eq(TaxonomyAxis::Hardware, "memory_gb", "2"),
         ];
         let meta = meta_with(&[("intent", "ml-training")]);
         let cx = ctx(&tags, &meta);

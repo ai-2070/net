@@ -398,7 +398,7 @@ impl NetMesh {
 
 ```typescript
 export interface CapabilitySet {
-  hardware?: { cpus: number; memoryMb: number; gpus?: Gpu[] };
+  hardware?: { cpus: number; memoryGb: number; gpus?: Gpu[] };
   software?: { os: string; version: string };
   models?: Array<{ name: string; version: string; contextTokens?: number }>;
   tools?: Array<{ name: string; version?: string }>;

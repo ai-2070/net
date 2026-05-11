@@ -115,8 +115,8 @@ impl CapabilityViews<'_> {
 // sdk-ts — accessor properties; first read decodes hardware tags, second hits cache
 const caps = mesh.localCapabilities()
 const v = caps.views()
-console.log(v.hardware.gpu?.vramMb)   // first read: decode hardware tags
-console.log(v.hardware.memoryMb)       // cached; no re-decode
+console.log(v.hardware.gpu?.vramGb)   // first read: decode hardware tags
+console.log(v.hardware.memoryGb)       // cached; no re-decode
 console.log(v.models.length)           // first read: decode model.* tags
 ```
 
@@ -124,8 +124,8 @@ console.log(v.models.length)           // first read: decode model.* tags
 # sdk-py — same lazy-property semantics
 caps = mesh.local_capabilities()
 v = caps.views()
-print(v.hardware.gpu.vram_mb if v.hardware.gpu else None)
-print(v.hardware.memory_mb)            # cached
+print(v.hardware.gpu.vram_gb if v.hardware.gpu else None)
+print(v.hardware.memory_gb)            # cached
 print(len(v.models))                   # first read: decode model.* tags
 ```
 
@@ -143,7 +143,7 @@ One method per binding (`views()`); each projection is decoded at most once per 
 
 ### 2. No backward-compat shim — the substrate broke wire format intentionally
 
-Earlier drafts of this plan called for a per-binding deprecation shim preserving `caps.hardware.gpu.vram_mb` field access for one minor version. That plan assumed the substrate's typed-struct removal would happen in lockstep with a soft binding migration window.
+Earlier drafts of this plan called for a per-binding deprecation shim preserving `caps.hardware.gpu.vram_gb` field access for one minor version. That plan assumed the substrate's typed-struct removal would happen in lockstep with a soft binding migration window.
 
 **Decision:** the substrate's Phase A.5.N.3 removed the typed-struct fields outright (no compat layer; old peers can't decode new announcements). Per `CAPABILITY_ENHANCEMENTS_PLAN.md`'s "eternal rule" and the locked "no backwards compatibility" decision in the substrate plan, this SDK plan ships **no deprecation shim**. The migration is binary:
 

@@ -82,8 +82,8 @@ func TestHardwareAndGpuFilter_Matches(t *testing.T) {
 	err := m.AnnounceCapabilities(CapabilitySet{
 		Hardware: &HardwareCaps{
 			CPUCores: 16,
-			MemoryMB: 65536,
-			GPU:      &GPUInfo{Vendor: "nvidia", Model: "h100", VRAMMB: 81920},
+			MemoryGB: 64,
+			GPU:      &GPUInfo{Vendor: "nvidia", Model: "h100", VRAMGB: 80},
 		},
 		Tags: []string{"gpu"},
 	})
@@ -94,8 +94,8 @@ func TestHardwareAndGpuFilter_Matches(t *testing.T) {
 	peers, err := m.FindNodes(CapabilityFilter{
 		RequireGPU:  true,
 		GPUVendor:   "nvidia",
-		MinVRAMMB:   40000,
-		MinMemoryMB: 32768,
+		MinVRAMGB:   40,
+		MinMemoryGB: 32,
 	})
 	if err != nil {
 		t.Fatalf("find_nodes: %v", err)
@@ -104,7 +104,7 @@ func TestHardwareAndGpuFilter_Matches(t *testing.T) {
 		t.Fatalf("own id missing: %v", peers)
 	}
 
-	strict, err := m.FindNodes(CapabilityFilter{MinVRAMMB: 200_000})
+	strict, err := m.FindNodes(CapabilityFilter{MinVRAMGB: 200})
 	if err != nil {
 		t.Fatalf("find_nodes strict: %v", err)
 	}
@@ -286,8 +286,8 @@ func TestFindBestNode_SelfMatchesOnFilter(t *testing.T) {
 
 	if err := m.AnnounceCapabilities(CapabilitySet{
 		Hardware: &HardwareCaps{
-			MemoryMB: 65_536,
-			GPU:      &GPUInfo{Vendor: "nvidia", Model: "h100", VRAMMB: 81_920},
+			MemoryGB: 64,
+			GPU:      &GPUInfo{Vendor: "nvidia", Model: "h100", VRAMGB: 80},
 		},
 		Tags: []string{"gpu"},
 	}); err != nil {
@@ -296,7 +296,7 @@ func TestFindBestNode_SelfMatchesOnFilter(t *testing.T) {
 	// Filter that matches us; weights aren't load-bearing for a
 	// single-candidate set but exercise the scoring path.
 	req := CapabilityRequirement{
-		Filter:           CapabilityFilter{RequireGPU: true, MinVRAMMB: 40_000},
+		Filter:           CapabilityFilter{RequireGPU: true, MinVRAMGB: 40},
 		PreferMoreVRAM:   1.0,
 		PreferMoreMemory: 0.5,
 	}

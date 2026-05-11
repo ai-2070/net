@@ -37,7 +37,7 @@ If a future change adds a new key under an existing axis: bump this doc, regener
 | Type | Wire form | Examples |
 |---|---|---|
 | `presence` | `<axis>.<key>` (no separator) | `hardware.gpu` |
-| `number` | `<axis>.<key>=<integer>` | `hardware.memory_mb=65536` |
+| `number` | `<axis>.<key>=<integer>` | `hardware.memory_gb=64` |
 | `string` | `<axis>.<key>=<string>` | `hardware.gpu.model=H100` |
 | `enum<T>` | `<axis>.<key>=<value>` where value ∈ T | `hardware.gpu.vendor=nvidia` |
 | `bool` | `<axis>.<key>=true` or `=false` | `software.tool.0.stateless=true` |
@@ -57,16 +57,16 @@ Compute capabilities of the node — CPU, RAM, GPU, accelerators, persistent sto
 |---|---|---|---|
 | `hardware.cpu_cores` | `number` (u16) | `1..=u16::MAX` | Physical cores. Omitted from emission when zero. |
 | `hardware.cpu_threads` | `number` (u16) | `1..=u16::MAX` | Logical threads (SMT-aware). |
-| `hardware.memory_mb` | `number` (u32) | `0..=u32::MAX` | Total RAM in MB. |
+| `hardware.memory_gb` | `number` (u32) | `0..=u32::MAX` | Total RAM in GB. |
 | `hardware.gpu` | `presence` | — | Marker that a primary GPU is present. The `hardware.gpu.*` sub-keys carry its details. |
 | `hardware.gpu.vendor` | `enum<vendor>` | `nvidia` / `amd` / `intel` / `apple` / `qualcomm` / `unknown` | Lowercase. Unknown vendor values forward-compat round-trip as `Unknown`. |
 | `hardware.gpu.model` | `string` | — | Free-form (`RTX 4090`, `H100`, `M2 Ultra`). |
-| `hardware.gpu.vram_mb` | `number` (u32) | `0..=u32::MAX` | VRAM in MB. |
+| `hardware.gpu.vram_gb` | `number` (u32) | `0..=u32::MAX` | VRAM in GB. |
 | `hardware.gpu.compute_units` | `number` (u16) | `0..=u16::MAX` | SM count (NVIDIA) / CU count (AMD). |
 | `hardware.gpu.tensor_cores` | `number` (u16) | `0..=u16::MAX` | Tensor / matrix engine count. |
 | `hardware.gpu.fp16_tflops_x10` | `number` (u32) | `0..=u32::MAX` | FP16 TFLOPS scaled ×10 (so `825` = 82.5 TFLOPS). u32 because aggregated cluster figures overflow u16. |
-| `hardware.storage_mb` | `number` (u64) | `0..=u64::MAX` | Persistent storage in MB. |
-| `hardware.network_mbps` | `number` (u32) | `0..=u32::MAX` | Network bandwidth in Mbps. |
+| `hardware.storage_gb` | `number` (u64) | `0..=u64::MAX` | Persistent storage in GB. |
+| `hardware.network_gbps` | `number` (u32) | `0..=u32::MAX` | Network bandwidth in Gbps. |
 | `hardware.limits.max_concurrent_requests` | `number` (u32) | `0..=u32::MAX` | Per-node concurrency cap. |
 | `hardware.limits.max_tokens_per_request` | `number` (u32) | `0..=u32::MAX` | Per-request token cap. |
 | `hardware.limits.rate_limit_rpm` | `number` (u32) | `0..=u32::MAX` | Requests per minute. |
@@ -134,7 +134,7 @@ Reserved key shapes (informational):
 |---|---|---|
 | `dataforts.tier` | `enum<tier>` | `hot` / `warm` / `cold` |
 | `dataforts.has_chain:<hex>` | `presence` (with `:` separator) | `dataforts.has_chain:abc123` |
-| `dataforts.capacity_mb` | `number` (u64) | `dataforts.capacity_mb=1048576` |
+| `dataforts.capacity_gb` | `number` (u64) | `dataforts.capacity_gb=1024` |
 
 **Validator behavior**: unknown `dataforts.*` keys are forward-compat warnings.
 
@@ -186,7 +186,7 @@ Each binding's `validate_capabilities(caps)` returns a `ValidationReport` with t
 
 1. **Errors** (`SchemaError`) — schema violations the operator should fix:
    - `UnknownAxis(prefix)` — a tag whose axis prefix isn't `hardware` / `software` / `devices` / `dataforts` and isn't one of the reserved prefixes (e.g. `nat:full-cone` is a `Tag::Legacy`, NOT a malformed axis tag — those legitimately ride through as untyped). This error fires only on shapes that look axis-prefixed but use an unknown axis (e.g. `compute.gpu` from a typo).
-   - `TypeMismatch { key, expected, actual }` — a known key with an unparseable value (e.g. `hardware.memory_mb=lots`).
+   - `TypeMismatch { key, expected, actual }` — a known key with an unparseable value (e.g. `hardware.memory_gb=lots`).
    - `ValueOutOfRange { key, value, range }` — a known numeric key whose value violates the documented range.
 
 2. **Warnings** (`ValidationWarning`) — forward-compat or operator hygiene:

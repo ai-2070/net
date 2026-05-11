@@ -24,7 +24,7 @@ pub enum Tag {
 }
 ```
 
-`HardwareCapabilities` / `SoftwareCapabilities` / `Vec<ModelCapability>` / `Vec<ToolCapability>` / `ResourceLimits` are *projections* of the tag set, lazily decoded via `caps.views()`. Encoding scheme: `hardware.cpu_cores=N` / `hardware.gpu` / `hardware.gpu.vram_mb=N` / `software.os=linux` / `software.model.0.id=...` / `hardware.limits.max_concurrent_requests=N`. Tool JSON-Schema strings (which can't safely round-trip through the tag wire format) live in `metadata` under `tool::<id>::input_schema` / `tool::<id>::output_schema`.
+`HardwareCapabilities` / `SoftwareCapabilities` / `Vec<ModelCapability>` / `Vec<ToolCapability>` / `ResourceLimits` are *projections* of the tag set, lazily decoded via `caps.views()`. Encoding scheme: `hardware.cpu_cores=N` / `hardware.gpu` / `hardware.gpu.vram_gb=N` / `software.os=linux` / `software.model.0.id=...` / `hardware.limits.max_concurrent_requests=N`. Tool JSON-Schema strings (which can't safely round-trip through the tag wire format) live in `metadata` under `tool::<id>::input_schema` / `tool::<id>::output_schema`.
 
 Wire format emits tags in sorted `Tag::to_string()` order — the `HashSet` keeps O(1) membership for in-memory lookups; the `serialize_with` hook flattens to a sorted `Vec` on the way out. Without this, two ends of a signed announcement round-trip would produce different bytes (HashSet iteration is process-local random) and the verifier would reject as `InvalidSignature`.
 
@@ -41,7 +41,7 @@ For arbitrary boolean queries beyond `CapabilityFilter`, the substrate ships a t
 ```rust
 let p = pred!(and [
     pred!(exists "hardware.gpu"),
-    pred!(num_at_least "hardware.memory_mb", 65536.0),
+    pred!(num_at_least "hardware.memory_gb", 64.0),
     pred!(semver_compatible "software.runtime.python", "3.11.0"),
     pred!(metadata_equals "intent", "ml-training"),
 ]);
