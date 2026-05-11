@@ -60,10 +60,7 @@ impl BlobAdapterRegistry {
 
     /// Register `adapter` under its `adapter_id()`. Returns
     /// `Err(DuplicateId)` when an entry already exists.
-    pub fn register(
-        &self,
-        adapter: Arc<dyn BlobAdapter>,
-    ) -> Result<(), BlobAdapterRegistryError> {
+    pub fn register(&self, adapter: Arc<dyn BlobAdapter>) -> Result<(), BlobAdapterRegistryError> {
         let id = adapter.adapter_id().to_owned();
         match self.adapters.entry(id.clone()) {
             Entry::Occupied(_) => Err(BlobAdapterRegistryError::DuplicateId(id)),
@@ -121,8 +118,8 @@ pub fn global_blob_adapter_registry() -> &'static BlobAdapterRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::noop::NoopAdapter;
+    use super::*;
 
     #[test]
     fn register_get_unregister_round_trips() {

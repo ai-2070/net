@@ -58,9 +58,7 @@ async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
     let b_addr = b.local_addr();
     let b_clone = b.clone();
     let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
-    a.connect(b_addr, &b_pub, b_id)
-        .await
-        .expect("connect");
+    a.connect(b_addr, &b_pub, b_id).await.expect("connect");
     accept.await.expect("accept task").expect("accept");
     a.start();
     b.start();
@@ -89,8 +87,7 @@ async fn greedy_caches_observed_events_published_from_peer() {
 
     // B configures greedy permissively — empty scopes admit any
     // chain, intent disabled, default colocation.
-    let cfg = GreedyConfig::default()
-        .with_intent_match(IntentMatchPolicy::Disabled);
+    let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled);
     redex_b
         .enable_greedy_dataforts(
             node_b.clone(),
@@ -115,10 +112,7 @@ async fn greedy_caches_observed_events_published_from_peer() {
     const N: u64 = 16;
     for i in 0..N {
         let payload = Bytes::from(format!("event-{i}"));
-        node_a
-            .publish(&publisher, payload)
-            .await
-            .expect("publish");
+        node_a.publish(&publisher, payload).await.expect("publish");
     }
 
     // Poll for B's greedy runtime to absorb the events. The cache
@@ -278,8 +272,7 @@ async fn greedy_read_path_serves_cached_events() {
     handshake(&node_a, &node_b).await;
 
     let redex_b = Arc::new(Redex::new());
-    let cfg = GreedyConfig::default()
-        .with_intent_match(IntentMatchPolicy::Disabled);
+    let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled);
     redex_b
         .enable_greedy_dataforts(
             node_b.clone(),
@@ -333,10 +326,8 @@ async fn greedy_read_path_serves_cached_events() {
     // publish order. Operators needing strict order use
     // replication. Verify every published payload is present —
     // order-agnostic.
-    let observed: std::collections::HashSet<Vec<u8>> = events
-        .iter()
-        .map(|e| e.payload.as_ref().to_vec())
-        .collect();
+    let observed: std::collections::HashSet<Vec<u8>> =
+        events.iter().map(|e| e.payload.as_ref().to_vec()).collect();
     for i in 0..N {
         assert!(
             observed.contains(&format!("payload-{i}").as_bytes().to_vec()),

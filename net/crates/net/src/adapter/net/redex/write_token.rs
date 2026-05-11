@@ -74,8 +74,9 @@ impl FromStr for WriteToken {
     type Err = WriteTokenParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (origin_str, seq_str) =
-            s.split_once(':').ok_or(WriteTokenParseError::MissingSeparator)?;
+        let (origin_str, seq_str) = s
+            .split_once(':')
+            .ok_or(WriteTokenParseError::MissingSeparator)?;
         if origin_str.len() != 16 {
             return Err(WriteTokenParseError::BadOrigin);
         }

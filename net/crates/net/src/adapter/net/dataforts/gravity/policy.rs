@@ -201,9 +201,7 @@ pub fn should_emit_heat(
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum DataGravityPolicyError {
     /// `emit_threshold_ratio` outside `[1.01, 10.0]` or non-finite.
-    #[error(
-        "data-gravity emit_threshold_ratio {got} outside [{min}, {max}] or non-finite"
-    )]
+    #[error("data-gravity emit_threshold_ratio {got} outside [{min}, {max}] or non-finite")]
     EmitThresholdOutOfRange {
         /// Configured value.
         got: f32,
@@ -298,10 +296,7 @@ mod tests {
     #[test]
     fn first_emission_suppressed_with_zero_rate() {
         let p = policy();
-        assert_eq!(
-            should_emit_heat(0.0, None, &p),
-            EmissionDecision::Suppress
-        );
+        assert_eq!(should_emit_heat(0.0, None, &p), EmissionDecision::Suppress);
     }
 
     #[test]

@@ -502,26 +502,14 @@ mod tests {
         cluster.set_io_budget_used_bytes(8192);
 
         let text = r.snapshot().prometheus_text();
-        assert!(text.contains(
-            "dataforts_greedy_cache_hits_total{channel=\"test/a\"} 1"
-        ));
-        assert!(text.contains(
-            "dataforts_greedy_bytes_resident{channel=\"test/a\"} 2048"
-        ));
-        assert!(text.contains(
-            "dataforts_greedy_admit_rejected_total{reason=\"scope\"} 1"
-        ));
+        assert!(text.contains("dataforts_greedy_cache_hits_total{channel=\"test/a\"} 1"));
+        assert!(text.contains("dataforts_greedy_bytes_resident{channel=\"test/a\"} 2048"));
+        assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"scope\"} 1"));
         assert!(text.contains("dataforts_greedy_io_budget_used_bytes 8192"));
         // All four reason labels are emitted even when zero.
-        assert!(text.contains(
-            "dataforts_greedy_admit_rejected_total{reason=\"intent\"} 0"
-        ));
-        assert!(text.contains(
-            "dataforts_greedy_admit_rejected_total{reason=\"colocation\"} 0"
-        ));
-        assert!(text.contains(
-            "dataforts_greedy_admit_rejected_total{reason=\"capacity\"} 0"
-        ));
+        assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"intent\"} 0"));
+        assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"colocation\"} 0"));
+        assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"capacity\"} 0"));
     }
 
     #[test]

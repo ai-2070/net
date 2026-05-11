@@ -135,10 +135,7 @@ pub fn should_admit(inputs: &AdmissionInputs<'_>) -> AdmissionVerdict {
 /// Scope gate. Empty `configured_scopes` admits regardless;
 /// non-empty requires the chain to advertise at least one
 /// `scope:<label>` reserved-prefix tag with a matching label.
-fn passes_scope_gate(
-    chain_caps: &CapabilitySet,
-    configured_scopes: &[super::ScopeLabel],
-) -> bool {
+fn passes_scope_gate(chain_caps: &CapabilitySet, configured_scopes: &[super::ScopeLabel]) -> bool {
     if configured_scopes.is_empty() {
         return true;
     }
@@ -244,7 +241,8 @@ mod tests {
 
     fn caps_with_intent(intent: &str) -> CapabilitySet {
         let mut caps = CapabilitySet::default();
-        caps.metadata.insert("intent".to_string(), intent.to_string());
+        caps.metadata
+            .insert("intent".to_string(), intent.to_string());
         caps
     }
 
@@ -286,8 +284,7 @@ mod tests {
         let local = CapabilitySet::default();
         let registry = IntentRegistry::new();
         let keys = metadata_keys();
-        let cfg = GreedyConfig::default()
-            .with_intent_match(IntentMatchPolicy::Disabled);
+        let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -367,8 +364,7 @@ mod tests {
         let local = caps_with_cpu_only();
         let registry = IntentRegistry::defaults();
         let keys = metadata_keys();
-        let cfg = GreedyConfig::default()
-            .with_intent_match(IntentMatchPolicy::Disabled);
+        let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -386,8 +382,7 @@ mod tests {
         let local = caps_with_gpu_24gb();
         let registry = IntentRegistry::defaults();
         let keys = metadata_keys();
-        let cfg = GreedyConfig::default()
-            .with_intent_match(IntentMatchPolicy::Strict);
+        let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Strict);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -405,8 +400,7 @@ mod tests {
         let local = caps_with_cpu_only();
         let registry = IntentRegistry::defaults();
         let keys = metadata_keys();
-        let cfg = GreedyConfig::default()
-            .with_intent_match(IntentMatchPolicy::Strict);
+        let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Strict);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -426,8 +420,7 @@ mod tests {
         let local = caps_with_cpu_only();
         let registry = IntentRegistry::defaults();
         let keys = metadata_keys();
-        let cfg = GreedyConfig::default()
-            .with_intent_match(IntentMatchPolicy::Strict);
+        let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Strict);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -446,8 +439,7 @@ mod tests {
         let local = caps_with_cpu_only();
         let registry = IntentRegistry::defaults();
         let keys = metadata_keys();
-        let cfg = GreedyConfig::default()
-            .with_intent_match(IntentMatchPolicy::Strict);
+        let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Strict);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -469,8 +461,8 @@ mod tests {
         let local = caps_with_cpu_only();
         let registry = IntentRegistry::defaults();
         let keys = metadata_keys();
-        let cfg = GreedyConfig::default()
-            .with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities);
+        let cfg =
+            GreedyConfig::default().with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -488,8 +480,8 @@ mod tests {
         let local = CapabilitySet::default(); // nothing
         let registry = IntentRegistry::defaults();
         let keys = metadata_keys();
-        let cfg = GreedyConfig::default()
-            .with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities);
+        let cfg =
+            GreedyConfig::default().with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -509,8 +501,8 @@ mod tests {
         let local = CapabilitySet::default();
         let registry = IntentRegistry::new(); // empty
         let keys = metadata_keys();
-        let cfg = GreedyConfig::default()
-            .with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities);
+        let cfg =
+            GreedyConfig::default().with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -542,8 +534,7 @@ mod tests {
         let local = CapabilitySet::default();
         let registry = IntentRegistry::new();
         let keys = metadata_keys();
-        let cfg = ignored_intent_cfg()
-            .with_colocation_policy(ColocationPolicy::Ignore);
+        let cfg = ignored_intent_cfg().with_colocation_policy(ColocationPolicy::Ignore);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -561,8 +552,7 @@ mod tests {
         let local = CapabilitySet::default();
         let registry = IntentRegistry::new();
         let keys = metadata_keys();
-        let cfg = ignored_intent_cfg()
-            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let cfg = ignored_intent_cfg().with_colocation_policy(ColocationPolicy::SoftPreference);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -580,8 +570,7 @@ mod tests {
         let local = CapabilitySet::default();
         let registry = IntentRegistry::new();
         let keys = metadata_keys();
-        let cfg = ignored_intent_cfg()
-            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let cfg = ignored_intent_cfg().with_colocation_policy(ColocationPolicy::SoftPreference);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -601,8 +590,7 @@ mod tests {
         let local = CapabilitySet::default();
         let registry = IntentRegistry::new();
         let keys = metadata_keys();
-        let cfg = ignored_intent_cfg()
-            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let cfg = ignored_intent_cfg().with_colocation_policy(ColocationPolicy::SoftPreference);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -620,8 +608,7 @@ mod tests {
         let local = CapabilitySet::default();
         let registry = IntentRegistry::new();
         let keys = metadata_keys();
-        let cfg = ignored_intent_cfg()
-            .with_colocation_policy(ColocationPolicy::StrictRequired);
+        let cfg = ignored_intent_cfg().with_colocation_policy(ColocationPolicy::StrictRequired);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,
@@ -643,8 +630,7 @@ mod tests {
         let local = CapabilitySet::default();
         let registry = IntentRegistry::new();
         let keys = metadata_keys();
-        let cfg = ignored_intent_cfg()
-            .with_colocation_policy(ColocationPolicy::SoftPreference);
+        let cfg = ignored_intent_cfg().with_colocation_policy(ColocationPolicy::SoftPreference);
         let inputs = AdmissionInputs {
             chain_caps: &chain,
             local_caps: &local,

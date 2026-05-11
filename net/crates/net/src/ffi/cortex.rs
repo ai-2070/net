@@ -443,9 +443,7 @@ struct RedexGreedyConfigJson {
 
 #[cfg(feature = "dataforts")]
 impl RedexGreedyConfigJson {
-    fn into_config(
-        self,
-    ) -> Result<crate::adapter::net::dataforts::GreedyConfig, &'static str> {
+    fn into_config(self) -> Result<crate::adapter::net::dataforts::GreedyConfig, &'static str> {
         use crate::adapter::net::dataforts::{
             ColocationPolicy, GreedyConfig, IntentMatchPolicy, ScopeLabel,
         };
@@ -558,9 +556,7 @@ pub extern "C" fn net_redex_enable_greedy_dataforts(
         }
     };
     let mesh = unsafe { *Box::from_raw(mesh_arc) };
-    let local_caps = Arc::new(
-        crate::adapter::net::behavior::capability::CapabilitySet::default(),
-    );
+    let local_caps = Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default());
     let registry = crate::adapter::net::behavior::placement::IntentRegistry::defaults();
     match redex_ref
         .inner
@@ -590,9 +586,7 @@ pub extern "C" fn net_redex_disable_greedy_dataforts(redex: *mut RedexHandle) ->
 /// when greedy isn't enabled or on a NULL handle.
 #[cfg(feature = "dataforts")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_greedy_cached_channel_count(
-    redex: *const RedexHandle,
-) -> u32 {
+pub extern "C" fn net_redex_greedy_cached_channel_count(redex: *const RedexHandle) -> u32 {
     let Some(h) = (unsafe { redex.as_ref() }) else {
         return 0;
     };
@@ -611,9 +605,7 @@ pub extern "C" fn net_redex_greedy_cached_channel_count(
 /// isn't enabled; NULL on a NULL handle or shutting-down Redex.
 #[cfg(feature = "dataforts")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_greedy_prometheus_text(
-    redex: *const RedexHandle,
-) -> *mut c_char {
+pub extern "C" fn net_redex_greedy_prometheus_text(redex: *const RedexHandle) -> *mut c_char {
     let Some(h) = (unsafe { redex.as_ref() }) else {
         return std::ptr::null_mut();
     };
@@ -667,8 +659,7 @@ impl RedexGravityConfigJson {
         if let Some(secs) = self.decay_half_life_secs {
             policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs));
         }
-        let tick =
-            std::time::Duration::from_millis(self.tick_interval_ms.unwrap_or(500));
+        let tick = std::time::Duration::from_millis(self.tick_interval_ms.unwrap_or(500));
         (policy, tick)
     }
 }
@@ -736,7 +727,10 @@ pub extern "C" fn net_redex_enable_gravity_for_greedy(
     };
     let (policy, tick) = cfg_json.into_policy_and_tick();
     let mesh = unsafe { *Box::from_raw(mesh_arc) };
-    match redex_ref.inner.enable_gravity_for_greedy(mesh, policy, tick) {
+    match redex_ref
+        .inner
+        .enable_gravity_for_greedy(mesh, policy, tick)
+    {
         Ok(()) => 0,
         Err(_) => NET_ERR_REDEX,
     }
@@ -745,9 +739,7 @@ pub extern "C" fn net_redex_enable_gravity_for_greedy(
 /// Uninstall gravity. Idempotent. Greedy stays running.
 #[cfg(feature = "dataforts")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_disable_gravity_for_greedy(
-    redex: *mut RedexHandle,
-) -> c_int {
+pub extern "C" fn net_redex_disable_gravity_for_greedy(redex: *mut RedexHandle) -> c_int {
     let Some(h) = (unsafe { redex.as_ref() }) else {
         return NetError::NullPointer.into();
     };
@@ -3099,11 +3091,7 @@ mod tests {
         let boxed_arc: *mut Arc<MeshNode> = Box::into_raw(Box::new(mesh.clone()));
         assert_eq!(Arc::strong_count(&mesh), pre_count + 1);
 
-        let rc = net_redex_enable_greedy_dataforts(
-            ptr::null_mut(),
-            boxed_arc,
-            ptr::null(),
-        );
+        let rc = net_redex_enable_greedy_dataforts(ptr::null_mut(), boxed_arc, ptr::null());
         let expected: c_int = NetError::NullPointer.into();
         assert_eq!(rc, expected);
         assert_eq!(
@@ -3148,8 +3136,12 @@ mod tests {
         // family header.
         let p = net_redex_greedy_prometheus_text(r);
         assert!(!p.is_null());
-        let text = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned();
-        unsafe { super::super::net_free_string(p); }
+        let text = unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            super::super::net_free_string(p);
+        }
         assert!(
             text.contains("dataforts_greedy_admit_rejected_total"),
             "Prometheus text must include the admit-rejected metric family"

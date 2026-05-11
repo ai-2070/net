@@ -2,10 +2,10 @@
 //!
 //! Provides high-performance event ingestion and consumption for Python.
 
-#[cfg(feature = "cortex")]
-mod cortex;
 #[cfg(feature = "dataforts")]
 mod blob;
+#[cfg(feature = "cortex")]
+mod cortex;
 // Identity / capabilities / subnets ride the `net` feature as a
 // single security unit — they share `adapter::net`'s subprotocol
 // dispatch and are operationally inseparable.

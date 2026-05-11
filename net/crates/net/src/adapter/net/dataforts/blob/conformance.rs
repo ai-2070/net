@@ -38,14 +38,22 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
         payload.len() as u64,
     );
 
-    if adapter.exists(&blob).await.map_err(|_| "exists pre-store")? {
+    if adapter
+        .exists(&blob)
+        .await
+        .map_err(|_| "exists pre-store")?
+    {
         return Err("exists returned true before store");
     }
     adapter
         .store(&blob, payload)
         .await
         .map_err(|_| "store failed")?;
-    if !adapter.exists(&blob).await.map_err(|_| "exists post-store")? {
+    if !adapter
+        .exists(&blob)
+        .await
+        .map_err(|_| "exists post-store")?
+    {
         return Err("exists returned false after store");
     }
     let fetched = adapter
@@ -93,9 +101,9 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::fs::FileSystemAdapter;
     use super::super::noop::NoopAdapter;
+    use super::*;
 
     #[tokio::test]
     async fn fs_adapter_passes_full_conformance_suite() {

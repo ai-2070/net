@@ -104,9 +104,9 @@ pub async fn publish_blob_ref<A: BlobAdapter + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::fs::FileSystemAdapter;
     use super::super::noop::NoopAdapter;
+    use super::*;
 
     fn fixture_blob_ref(payload: &[u8]) -> BlobRef {
         BlobRef::new(
@@ -195,7 +195,10 @@ mod tests {
             .await
             .unwrap();
         // First byte is the discriminator.
-        assert_eq!(encoded[0], crate::adapter::net::dataforts::blob::BLOB_REF_DISCRIMINATOR);
+        assert_eq!(
+            encoded[0],
+            crate::adapter::net::dataforts::blob::BLOB_REF_DISCRIMINATOR
+        );
 
         // resolve_payload turns the encoded form back into the
         // original bytes via fetch + verify.

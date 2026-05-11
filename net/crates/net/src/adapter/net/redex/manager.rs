@@ -252,7 +252,7 @@ impl Redex {
             intent_registry,
         ));
         mesh.set_greedy_observer(Some(
-            runtime.clone() as Arc<dyn super::super::dataforts::GreedyObserver>,
+            runtime.clone() as Arc<dyn super::super::dataforts::GreedyObserver>
         ));
         *slot = Some(Arc::new(GreedyWiring {
             mesh,
@@ -361,10 +361,7 @@ impl Redex {
     /// were doing before greedy (typically the substrate's own
     /// `find_chain_holders` + network fetch).
     #[cfg(feature = "dataforts")]
-    pub fn greedy_cache_for(
-        &self,
-        channel: &ChannelName,
-    ) -> Option<RedexFile> {
+    pub fn greedy_cache_for(&self, channel: &ChannelName) -> Option<RedexFile> {
         let runtime = self.greedy_runtime()?;
         let synth = super::super::dataforts::synthesize_cache_channel_name(channel.hash());
         let file = runtime.cache_file(&synth)?;
@@ -1123,9 +1120,7 @@ mod tests {
     #[cfg(feature = "dataforts")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn enable_gravity_without_greedy_returns_typed_error() {
-        use super::super::super::dataforts::{
-            DataGravityPolicy, DataGravityPolicyError,
-        };
+        use super::super::super::dataforts::{DataGravityPolicy, DataGravityPolicyError};
 
         let mesh = build_mesh_for_test().await;
         let r = Arc::new(Redex::new());
@@ -1153,9 +1148,7 @@ mod tests {
         r.enable_greedy_dataforts(
             mesh.clone(),
             GreedyConfig::default(),
-            Arc::new(
-                crate::adapter::net::behavior::capability::CapabilitySet::default(),
-            ),
+            Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default()),
             crate::adapter::net::behavior::placement::IntentRegistry::defaults(),
         )
         .expect("greedy enable");

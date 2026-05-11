@@ -436,17 +436,16 @@ impl<State> CortexAdapter<State> {
             .waits_total
             .fetch_add(1, Ordering::Relaxed);
         let started = tokio::time::Instant::now();
-        let outcome =
-            match tokio::time::timeout(deadline, self.wait_for_seq(token.seq)).await {
-                Ok(()) => Ok(()),
-                Err(_) => {
-                    self.inner
-                        .ryw_metrics
-                        .timeouts_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    Err(WaitForTokenError::Timeout)
-                }
-            };
+        let outcome = match tokio::time::timeout(deadline, self.wait_for_seq(token.seq)).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.inner
+                    .ryw_metrics
+                    .timeouts_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(WaitForTokenError::Timeout)
+            }
+        };
         let nanos = started.elapsed().as_nanos() as u64;
         self.inner
             .ryw_metrics
@@ -464,9 +463,7 @@ impl<State> CortexAdapter<State> {
             timeouts_total: m.timeouts_total.load(Ordering::Relaxed),
             queue_full_total: m.queue_full_total.load(Ordering::Relaxed),
             wrong_origin_total: m.wrong_origin_total.load(Ordering::Relaxed),
-            wait_duration_nanos_sum: m
-                .wait_duration_nanos_sum
-                .load(Ordering::Relaxed),
+            wait_duration_nanos_sum: m.wait_duration_nanos_sum.load(Ordering::Relaxed),
         }
     }
 
@@ -520,9 +517,7 @@ impl std::fmt::Display for WaitForTokenError {
                 "token origin {:016x} != adapter origin {:016x}",
                 token_origin, adapter_origin
             ),
-            Self::QueueFull => {
-                f.write_str("read-your-writes wait-queue saturated; retry later")
-            }
+            Self::QueueFull => f.write_str("read-your-writes wait-queue saturated; retry later"),
         }
     }
 }
@@ -1092,7 +1087,10 @@ mod tests {
         assert_eq!(token.origin_hash, origin);
         assert_eq!(token.seq, 0);
 
-        adapter.wait_for_token(token, Duration::from_secs(2)).await.unwrap();
+        adapter
+            .wait_for_token(token, Duration::from_secs(2))
+            .await
+            .unwrap();
         assert_eq!(*adapter.state().read(), 1);
     }
 
@@ -1116,13 +1114,9 @@ mod tests {
         // permits until their deadline elapses.
         let token = WriteToken::new(0xABCD_EF01, 999);
         let a = adapter.clone();
-        let h1 = tokio::spawn(async move {
-            a.wait_for_token(token, Duration::from_secs(5)).await
-        });
+        let h1 = tokio::spawn(async move { a.wait_for_token(token, Duration::from_secs(5)).await });
         let a = adapter.clone();
-        let h2 = tokio::spawn(async move {
-            a.wait_for_token(token, Duration::from_secs(5)).await
-        });
+        let h2 = tokio::spawn(async move { a.wait_for_token(token, Duration::from_secs(5)).await });
 
         // Give both tasks a moment to claim their permits.
         tokio::time::sleep(Duration::from_millis(50)).await;

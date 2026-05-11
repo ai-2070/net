@@ -94,9 +94,7 @@ impl BlobAdapter for FileSystemAdapter {
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>, BlobError> {
             match std::fs::read(&path) {
                 Ok(bytes) => Ok(bytes),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(BlobError::NotFound(uri))
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(BlobError::NotFound(uri)),
                 Err(e) => Err(backend(e)),
             }
         })

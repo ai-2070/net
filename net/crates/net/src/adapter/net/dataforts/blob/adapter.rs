@@ -6,8 +6,8 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 
-use super::error::BlobError;
 use super::blob_ref::BlobRef;
+use super::error::BlobError;
 
 /// Storage backend wrapped by the substrate's blob layer. Each
 /// adapter takes a [`BlobRef`]'s URI and serves the bytes it

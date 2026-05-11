@@ -143,8 +143,10 @@ pub fn is_blob_ref(bytes: Buffer) -> bool {
 /// blobs under. Throws if `adapterId` is already in use.
 #[napi]
 pub fn register_filesystem_blob_adapter(adapter_id: String, root: String) -> Result<()> {
-    let adapter: Arc<dyn BlobAdapter> =
-        Arc::new(FileSystemAdapter::new(adapter_id.clone(), PathBuf::from(root)));
+    let adapter: Arc<dyn BlobAdapter> = Arc::new(FileSystemAdapter::new(
+        adapter_id.clone(),
+        PathBuf::from(root),
+    ));
     global_blob_adapter_registry()
         .register(adapter)
         .map_err(|e| blob_err("register", e))
@@ -154,7 +156,9 @@ pub fn register_filesystem_blob_adapter(adapter_id: String, root: String) -> Res
 /// was removed, `false` if no adapter was registered under that id.
 #[napi]
 pub fn unregister_blob_adapter(adapter_id: String) -> bool {
-    global_blob_adapter_registry().unregister(&adapter_id).is_some()
+    global_blob_adapter_registry()
+        .unregister(&adapter_id)
+        .is_some()
 }
 
 /// True if `adapterId` resolves to a registered adapter.
@@ -176,7 +180,12 @@ pub fn blob_adapter_ids() -> Vec<String> {
 pub async fn blob_publish(adapter_id: String, uri: String, data: Buffer) -> Result<Buffer> {
     let adapter = global_blob_adapter_registry()
         .get(&adapter_id)
-        .ok_or_else(|| blob_err("publish", format!("adapter {:?} not registered", adapter_id)))?;
+        .ok_or_else(|| {
+            blob_err(
+                "publish",
+                format!("adapter {:?} not registered", adapter_id),
+            )
+        })?;
     let bytes = publish_blob(adapter.as_ref(), uri, &data)
         .await
         .map_err(map_blob_err)?;
@@ -191,7 +200,12 @@ pub async fn blob_publish(adapter_id: String, uri: String, data: Buffer) -> Resu
 pub async fn blob_resolve(adapter_id: String, payload: Buffer) -> Result<Buffer> {
     let adapter = global_blob_adapter_registry()
         .get(&adapter_id)
-        .ok_or_else(|| blob_err("resolve", format!("adapter {:?} not registered", adapter_id)))?;
+        .ok_or_else(|| {
+            blob_err(
+                "resolve",
+                format!("adapter {:?} not registered", adapter_id),
+            )
+        })?;
     let bytes = resolve_payload(&payload, adapter.as_ref())
         .await
         .map_err(map_blob_err)?;
@@ -236,14 +250,11 @@ pub struct JsBlobFetchRangeArgs {
     pub end: BigInt,
 }
 
-type StoreTsfn =
-    ThreadsafeFunction<JsBlobStoreArgs, (), JsBlobStoreArgs, napi::Status, false>;
-type FetchTsfn =
-    ThreadsafeFunction<JsBlobFetchArgs, Buffer, JsBlobFetchArgs, napi::Status, false>;
+type StoreTsfn = ThreadsafeFunction<JsBlobStoreArgs, (), JsBlobStoreArgs, napi::Status, false>;
+type FetchTsfn = ThreadsafeFunction<JsBlobFetchArgs, Buffer, JsBlobFetchArgs, napi::Status, false>;
 type FetchRangeTsfn =
     ThreadsafeFunction<JsBlobFetchRangeArgs, Buffer, JsBlobFetchRangeArgs, napi::Status, false>;
-type ExistsTsfn =
-    ThreadsafeFunction<JsBlobFetchArgs, bool, JsBlobFetchArgs, napi::Status, false>;
+type ExistsTsfn = ThreadsafeFunction<JsBlobFetchArgs, bool, JsBlobFetchArgs, napi::Status, false>;
 
 /// `BlobAdapter` impl that bridges to JS-side functions via four
 /// TSFNs (one per trait method). Each call posts work onto the
@@ -285,9 +296,7 @@ async fn await_tsfn<T, F>(
 ) -> std::result::Result<T, InnerBlobError>
 where
     T: Send + 'static,
-    F: FnOnce(
-        Box<dyn FnOnce(napi::Result<T>) + Send>,
-    ) -> napi::Status,
+    F: FnOnce(Box<dyn FnOnce(napi::Result<T>) + Send>) -> napi::Status,
 {
     let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<T>>();
     let callback: Box<dyn FnOnce(napi::Result<T>) + Send> = Box::new(move |ret| {
@@ -302,7 +311,10 @@ where
     }
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(Ok(value))) => Ok(value),
-        Ok(Ok(Err(e))) => Err(InnerBlobError::Backend(format!("{}: JS error: {}", label, e))),
+        Ok(Ok(Err(e))) => Err(InnerBlobError::Backend(format!(
+            "{}: JS error: {}",
+            label, e
+        ))),
         Ok(Err(_)) => Err(InnerBlobError::Backend(format!(
             "{}: TSFN callback channel disconnected",
             label
@@ -354,10 +366,7 @@ impl BlobAdapter for NodeBlobAdapter {
         .await
     }
 
-    async fn fetch(
-        &self,
-        blob_ref: &InnerBlobRef,
-    ) -> std::result::Result<Vec<u8>, InnerBlobError> {
+    async fn fetch(&self, blob_ref: &InnerBlobRef) -> std::result::Result<Vec<u8>, InnerBlobError> {
         let (uri, hash, size) = js_blob_ref_parts(blob_ref);
         let args = JsBlobFetchArgs { uri, hash, size };
         let buf = await_tsfn::<Buffer, _>(self.timeout, "fetch", |cb| {
@@ -401,10 +410,7 @@ impl BlobAdapter for NodeBlobAdapter {
         Ok(buf.to_vec())
     }
 
-    async fn exists(
-        &self,
-        blob_ref: &InnerBlobRef,
-    ) -> std::result::Result<bool, InnerBlobError> {
+    async fn exists(&self, blob_ref: &InnerBlobRef) -> std::result::Result<bool, InnerBlobError> {
         let (uri, hash, size) = js_blob_ref_parts(blob_ref);
         let args = JsBlobFetchArgs { uri, hash, size };
         await_tsfn(self.timeout, "exists", |cb| {

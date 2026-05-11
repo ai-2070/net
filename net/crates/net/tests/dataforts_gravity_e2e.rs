@@ -75,8 +75,7 @@ fn cn(s: &str) -> ChannelName {
 fn has_heat_tag(caps: &CapabilitySet, hex: &str) -> bool {
     caps.tags.iter().any(|t| match t {
         Tag::Reserved { prefix, body } if prefix == "heat:" => {
-            body.starts_with(hex)
-                && matches!(body.as_bytes().get(hex.len()), Some(b'='))
+            body.starts_with(hex) && matches!(body.as_bytes().get(hex.len()), Some(b'='))
         }
         _ => false,
     })
@@ -103,8 +102,7 @@ async fn read_hot_chain_emits_heat_tag_into_local_caps() {
     handshake(&node_a, &node_b).await;
 
     let redex_b = Arc::new(Redex::new());
-    let cfg = GreedyConfig::default()
-        .with_intent_match(IntentMatchPolicy::Disabled);
+    let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled);
     redex_b
         .enable_greedy_dataforts(
             node_b.clone(),
@@ -193,9 +191,11 @@ async fn read_hot_chain_emits_heat_tag_into_local_caps() {
         }
         runtime.gravity_tick().await;
         if let Some(b_caps_self) = node_b.capability_index().get(node_b.node_id()) {
-            if b_caps_self.tags.iter().any(|t| {
-                matches!(t, Tag::Reserved { prefix, .. } if prefix == "heat:")
-            }) {
+            if b_caps_self
+                .tags
+                .iter()
+                .any(|t| matches!(t, Tag::Reserved { prefix, .. } if prefix == "heat:"))
+            {
                 observed_heat = true;
                 break;
             }
@@ -265,9 +265,10 @@ async fn greedy_without_gravity_emits_no_heat_tags() {
     // ever appears on B's self-caps.
     tokio::time::sleep(Duration::from_millis(500)).await;
     if let Some(b_caps_self) = node_b.capability_index().get(node_b.node_id()) {
-        let has_heat = b_caps_self.tags.iter().any(|t| {
-            matches!(t, Tag::Reserved { prefix, .. } if prefix == "heat:")
-        });
+        let has_heat = b_caps_self
+            .tags
+            .iter()
+            .any(|t| matches!(t, Tag::Reserved { prefix, .. } if prefix == "heat:"));
         assert!(
             !has_heat,
             "gravity-disabled greedy must not emit any heat: tag"

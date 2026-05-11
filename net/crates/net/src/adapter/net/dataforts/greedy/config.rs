@@ -4,9 +4,7 @@
 
 use std::time::Duration;
 
-use crate::adapter::net::behavior::placement::{
-    ColocationPolicy, IntentMatchPolicy, ScopeLabel,
-};
+use crate::adapter::net::behavior::placement::{ColocationPolicy, IntentMatchPolicy, ScopeLabel};
 
 /// Default per-channel cache cap. 100 MiB — large enough for
 /// typical chain working sets, small enough that a 10 GiB total
@@ -191,9 +189,7 @@ pub enum GreedyConfigError {
     /// `total_cap_bytes < per_channel_cap_bytes`. A total budget
     /// smaller than a single channel's cap can't admit any
     /// channel.
-    #[error(
-        "greedy total_cap_bytes {total} must be ≥ per_channel_cap_bytes {per_channel}"
-    )]
+    #[error("greedy total_cap_bytes {total} must be ≥ per_channel_cap_bytes {per_channel}")]
     TotalCapBelowPerChannel {
         /// Configured total.
         total: u64,
@@ -220,7 +216,9 @@ mod tests {
 
     #[test]
     fn default_is_valid() {
-        GreedyConfig::default().validate().expect("defaults must validate");
+        GreedyConfig::default()
+            .validate()
+            .expect("defaults must validate");
     }
 
     #[test]
@@ -238,7 +236,9 @@ mod tests {
         let cfg = GreedyConfig::default()
             .with_per_channel_cap_bytes(200 * 1024 * 1024)
             .with_total_cap_bytes(100 * 1024 * 1024);
-        let err = cfg.validate().expect_err("total below per-channel must reject");
+        let err = cfg
+            .validate()
+            .expect_err("total below per-channel must reject");
         assert!(matches!(
             err,
             GreedyConfigError::TotalCapBelowPerChannel { .. }
@@ -258,9 +258,7 @@ mod tests {
     #[test]
     fn budget_fraction_above_one_rejected() {
         let cfg = GreedyConfig::default().with_bandwidth_budget_fraction(1.5);
-        let err = cfg
-            .validate()
-            .expect_err("fraction above 1.0 must reject");
+        let err = cfg.validate().expect_err("fraction above 1.0 must reject");
         assert!(matches!(
             err,
             GreedyConfigError::BudgetFractionOutOfRange { .. }
@@ -279,8 +277,7 @@ mod tests {
 
     #[test]
     fn budget_fraction_inf_rejected() {
-        let cfg = GreedyConfig::default()
-            .with_bandwidth_budget_fraction(f32::INFINITY);
+        let cfg = GreedyConfig::default().with_bandwidth_budget_fraction(f32::INFINITY);
         let err = cfg.validate().expect_err("inf fraction must reject");
         assert!(matches!(
             err,

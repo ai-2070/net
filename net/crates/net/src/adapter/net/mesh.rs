@@ -282,8 +282,7 @@ struct DispatchCtx {
     /// standard-event packet; uncontended reads under
     /// `parking_lot::RwLock` are single-digit-nanoseconds.
     #[cfg(feature = "dataforts")]
-    greedy_observer:
-        Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
+    greedy_observer: Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
@@ -1326,8 +1325,7 @@ pub struct MeshNode {
     /// the replication router for the same reason — `dyn Trait` is
     /// `!Sized` and `ArcSwapOption` doesn't accept it.
     #[cfg(feature = "dataforts")]
-    greedy_observer:
-        Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
+    greedy_observer: Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
     /// Monotonic version counter used when stamping our own
     /// announcements. `CapabilityIndex::index` skips older versions,
     /// so this must move forward across restarts if the caller wants
@@ -3771,9 +3769,7 @@ impl MeshNode {
                     .unwrap_or_default(),
             )
         } else {
-            std::sync::Arc::new(
-                crate::adapter::net::behavior::capability::CapabilitySet::default(),
-            )
+            std::sync::Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default())
         };
 
         let queue = inbound.entry(shard_id).or_default();
@@ -6427,18 +6423,12 @@ impl MeshNode {
     /// Rebel Yell Phase 4. See
     /// `docs/misc/DATAFORTS_PLAN.md` § Phase 4.
     #[cfg(feature = "dataforts")]
-    pub async fn announce_heat(
-        &self,
-        origin_hash: u64,
-        rate: f64,
-    ) -> Result<(), AdapterError> {
+    pub async fn announce_heat(&self, origin_hash: u64, rate: f64) -> Result<(), AdapterError> {
         let hex = Self::chain_hex(origin_hash);
         let clamped = if rate.is_finite() {
             rate.clamp(0.0, 1.0)
         } else {
-            return Err(AdapterError::Fatal(
-                "heat rate must be finite".to_string(),
-            ));
+            return Err(AdapterError::Fatal("heat rate must be finite".to_string()));
         };
         let replacement = Tag::parse(&format!("heat:{hex}={clamped:.2}")).ok();
         let mut snapshot = self.user_caps_snapshot();
@@ -6450,10 +6440,7 @@ impl MeshNode {
     /// re-broadcast. Peers drop the heat annotation; the
     /// chain's `causal:` advertisements are untouched.
     #[cfg(feature = "dataforts")]
-    pub async fn withdraw_heat(
-        &self,
-        origin_hash: u64,
-    ) -> Result<(), AdapterError> {
+    pub async fn withdraw_heat(&self, origin_hash: u64) -> Result<(), AdapterError> {
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_heat_tags(&mut snapshot, origin_hash, None);
         self.announce_capabilities(snapshot).await
@@ -6474,7 +6461,6 @@ impl super::dataforts::HeatSink for MeshNode {
 
 #[cfg(feature = "net")]
 impl MeshNode {
-
     /// Install (or replace) the `SUBPROTOCOL_REDEX` inbound
     /// router. Used by `Redex` to register a per-node router
     /// that owns the per-channel runtime registry; the mesh
@@ -6502,10 +6488,7 @@ impl MeshNode {
     /// Idempotent — re-installing replaces the previous handle.
     /// Hot-path cost is unchanged when called with the same Arc.
     #[cfg(feature = "dataforts")]
-    pub fn set_greedy_observer(
-        &self,
-        observer: Option<Arc<dyn super::dataforts::GreedyObserver>>,
-    ) {
+    pub fn set_greedy_observer(&self, observer: Option<Arc<dyn super::dataforts::GreedyObserver>>) {
         *self.greedy_observer.write() = observer;
     }
 

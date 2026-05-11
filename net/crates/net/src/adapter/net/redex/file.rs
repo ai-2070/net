@@ -1074,12 +1074,17 @@ impl RedexFile {
         match classify_payload(&event.payload)? {
             EventPayload::Inline(_) => Ok(Some(event.payload)),
             EventPayload::Blob(blob) => {
-                let adapter_id = self.inner.config.blob_adapter_id.as_deref().ok_or_else(
-                    || BlobError::UnsupportedScheme(format!(
-                        "channel has no blob_adapter_id; URI was {}",
-                        blob.uri
-                    )),
-                )?;
+                let adapter_id = self
+                    .inner
+                    .config
+                    .blob_adapter_id
+                    .as_deref()
+                    .ok_or_else(|| {
+                        BlobError::UnsupportedScheme(format!(
+                            "channel has no blob_adapter_id; URI was {}",
+                            blob.uri
+                        ))
+                    })?;
                 let adapter = global_blob_adapter_registry()
                     .get(adapter_id)
                     .ok_or_else(|| {
@@ -1585,8 +1590,8 @@ mod tests {
             global_blob_adapter_registry, BlobError, BlobRef, FileSystemAdapter, NoopAdapter,
         };
         use super::*;
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
 
         fn unique_id(prefix: &str) -> String {
             static N: AtomicU64 = AtomicU64::new(0);
@@ -1597,10 +1602,7 @@ mod tests {
         #[tokio::test]
         async fn resolve_one_passes_inline_payload_through() {
             let cfg = RedexFileConfig::default();
-            let f = RedexFile::new(
-                ChannelName::new("resolve-inline").unwrap(),
-                cfg,
-            );
+            let f = RedexFile::new(ChannelName::new("resolve-inline").unwrap(), cfg);
             let seq = f.append(b"plain bytes").unwrap();
             let bytes = f.resolve_one(seq).await.unwrap().expect("present");
             assert_eq!(&bytes[..], b"plain bytes");
@@ -1609,10 +1611,7 @@ mod tests {
         #[tokio::test]
         async fn resolve_one_returns_none_for_missing_seq() {
             let cfg = RedexFileConfig::default();
-            let f = RedexFile::new(
-                ChannelName::new("resolve-missing").unwrap(),
-                cfg,
-            );
+            let f = RedexFile::new(ChannelName::new("resolve-missing").unwrap(), cfg);
             assert!(f.resolve_one(123).await.unwrap().is_none());
         }
 
@@ -1621,7 +1620,9 @@ mod tests {
             let id = unique_id("resolve-routing");
             let root = std::env::temp_dir().join(format!("net-resolve-{}", id));
             let adapter = Arc::new(FileSystemAdapter::new(id.clone(), &root));
-            global_blob_adapter_registry().register(adapter.clone()).unwrap();
+            global_blob_adapter_registry()
+                .register(adapter.clone())
+                .unwrap();
 
             // Store some content under a BlobRef + record the ref.
             let payload = b"out-of-band content";
@@ -1634,12 +1635,8 @@ mod tests {
             adapter.store(&blob, payload).await.unwrap();
 
             // Open a channel that points at the registered adapter.
-            let cfg = RedexFileConfig::default()
-                .with_blob_adapter_id(Some(id.clone()));
-            let f = RedexFile::new(
-                ChannelName::new("resolve-routed").unwrap(),
-                cfg,
-            );
+            let cfg = RedexFileConfig::default().with_blob_adapter_id(Some(id.clone()));
+            let f = RedexFile::new(ChannelName::new("resolve-routed").unwrap(), cfg);
             // Append the encoded BlobRef as the event payload.
             let encoded = blob.encode();
             let seq = f.append(&encoded).unwrap();
@@ -1665,10 +1662,7 @@ mod tests {
                 payload.len() as u64,
             );
             let cfg = RedexFileConfig::default(); // blob_adapter_id = None
-            let f = RedexFile::new(
-                ChannelName::new("resolve-orphan").unwrap(),
-                cfg,
-            );
+            let f = RedexFile::new(ChannelName::new("resolve-orphan").unwrap(), cfg);
             let seq = f.append(&blob.encode()).unwrap();
             let err = f.resolve_one(seq).await.unwrap_err();
             assert!(matches!(err, BlobError::UnsupportedScheme(_)));
@@ -1683,12 +1677,9 @@ mod tests {
                 blake3::hash(payload).into(),
                 payload.len() as u64,
             );
-            let cfg = RedexFileConfig::default()
-                .with_blob_adapter_id(Some("ghost-adapter-id".into()));
-            let f = RedexFile::new(
-                ChannelName::new("resolve-ghost").unwrap(),
-                cfg,
-            );
+            let cfg =
+                RedexFileConfig::default().with_blob_adapter_id(Some("ghost-adapter-id".into()));
+            let f = RedexFile::new(ChannelName::new("resolve-ghost").unwrap(), cfg);
             let seq = f.append(&blob.encode()).unwrap();
             let err = f.resolve_one(seq).await.unwrap_err();
             assert!(matches!(err, BlobError::UnsupportedScheme(_)));
@@ -1704,12 +1695,8 @@ mod tests {
             global_blob_adapter_registry().register(adapter).unwrap();
 
             let blob = BlobRef::new("noop://nowhere", [0xAA; 32], 0);
-            let cfg = RedexFileConfig::default()
-                .with_blob_adapter_id(Some(id.clone()));
-            let f = RedexFile::new(
-                ChannelName::new("resolve-noop").unwrap(),
-                cfg,
-            );
+            let cfg = RedexFileConfig::default().with_blob_adapter_id(Some(id.clone()));
+            let f = RedexFile::new(ChannelName::new("resolve-noop").unwrap(), cfg);
             let seq = f.append(&blob.encode()).unwrap();
             let err = f.resolve_one(seq).await.unwrap_err();
             assert!(matches!(err, BlobError::NotFound(_)));

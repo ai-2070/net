@@ -542,11 +542,9 @@ impl PyRedex {
         // defaults respectively. Application code refreshes via
         // `greedy_set_local_caps` and `greedy_register_intent`
         // when fuller surfaces land.
-        let local_caps = std::sync::Arc::new(
-            net::adapter::net::behavior::capability::CapabilitySet::default(),
-        );
-        let registry =
-            net::adapter::net::behavior::placement::IntentRegistry::defaults();
+        let local_caps =
+            std::sync::Arc::new(net::adapter::net::behavior::capability::CapabilitySet::default());
+        let registry = net::adapter::net::behavior::placement::IntentRegistry::defaults();
         self.inner
             .enable_greedy_dataforts(arc, cfg, local_caps, registry)
             .map_err(|e| RedexError::new_err(format!("greedy config invalid: {}", e)))
@@ -1153,10 +1151,7 @@ impl PyTasksAdapter {
         py.detach(|| {
             runtime.block_on(async move {
                 inner
-                    .wait_for_token(
-                        inner_token,
-                        std::time::Duration::from_millis(deadline_ms),
-                    )
+                    .wait_for_token(inner_token, std::time::Duration::from_millis(deadline_ms))
                     .await
             })
         })
@@ -1657,10 +1652,7 @@ impl PyMemoriesAdapter {
         py.detach(|| {
             runtime.block_on(async move {
                 inner
-                    .wait_for_token(
-                        inner_token,
-                        std::time::Duration::from_millis(deadline_ms),
-                    )
+                    .wait_for_token(inner_token, std::time::Duration::from_millis(deadline_ms))
                     .await
             })
         })

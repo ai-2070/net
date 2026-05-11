@@ -205,11 +205,8 @@ impl GreedyRuntime {
         intent_registry: IntentRegistry,
     ) -> Self {
         let now = Instant::now();
-        let budget = BandwidthBudget::new(
-            config.bandwidth_budget_fraction,
-            NIC_PEAK_BYTES_PER_S,
-            now,
-        );
+        let budget =
+            BandwidthBudget::new(config.bandwidth_budget_fraction, NIC_PEAK_BYTES_PER_S, now);
         let cache = GreedyCacheRegistry::new(config.total_cap_bytes);
         Self {
             inner: Arc::new(GreedyRuntimeInner {
@@ -608,11 +605,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChainTagSink for RecorderSink {
-        async fn announce_chain(
-            &self,
-            origin_hash: u64,
-            tip_seq: u64,
-        ) -> Result<(), AdapterError> {
+        async fn announce_chain(&self, origin_hash: u64, tip_seq: u64) -> Result<(), AdapterError> {
             self.announces.lock().push((origin_hash, tip_seq));
             Ok(())
         }
@@ -633,11 +626,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::adapter::net::dataforts::gravity::HeatSink for RecorderHeatSink {
-        async fn announce_heat(
-            &self,
-            origin_hash: u64,
-            rate: f64,
-        ) -> Result<(), AdapterError> {
+        async fn announce_heat(&self, origin_hash: u64, rate: f64) -> Result<(), AdapterError> {
             self.announces.lock().push((origin_hash, rate));
             Ok(())
         }
@@ -677,8 +666,8 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_event_caches_and_announces_chain() {
-        let cfg = GreedyConfig::default()
-            .with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
         let (rt, sink) = build_runtime(cfg);
         let chain = chain_caps_with_scope("any");
         let outcome = rt
@@ -714,13 +703,12 @@ mod tests {
 
     #[tokio::test]
     async fn second_event_does_not_re_announce_chain() {
-        let cfg = GreedyConfig::default()
-            .with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
         let (rt, sink) = build_runtime(cfg);
         let chain = chain_caps_with_scope("any");
         rt.dispatch_event(&cn("test/a"), 1, &chain, b"first").await;
-        rt.dispatch_event(&cn("test/a"), 1, &chain, b"second")
-            .await;
+        rt.dispatch_event(&cn("test/a"), 1, &chain, b"second").await;
         let announces = sink.announces.lock().clone();
         assert_eq!(announces.len(), 1, "announce only on first cache");
     }
@@ -755,8 +743,8 @@ mod tests {
 
     #[tokio::test]
     async fn note_read_bumps_serve_count_metric() {
-        let cfg = GreedyConfig::default()
-            .with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
         let (rt, _sink) = build_runtime(cfg);
         let chain = chain_caps_with_scope("any");
         rt.dispatch_event(&cn("test/a"), 1, &chain, b"x").await;
@@ -779,8 +767,8 @@ mod tests {
         // admission flips to Admit.
         use crate::adapter::net::behavior::tag::TaxonomyAxis;
         let registry = IntentRegistry::defaults();
-        let cfg = GreedyConfig::default()
-            .with_intent_match(super::super::IntentMatchPolicy::Strict);
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Strict);
         let redex = Arc::new(Redex::new());
         let sink = Arc::new(RecorderSink::default());
         let initial_caps = Arc::new(CapabilitySet::default());
@@ -795,9 +783,7 @@ mod tests {
         chain
             .metadata
             .insert("intent".to_string(), "cpu-bound".to_string());
-        let outcome = rt
-            .dispatch_event(&cn("a"), 1, &chain, b"x")
-            .await;
+        let outcome = rt.dispatch_event(&cn("a"), 1, &chain, b"x").await;
         assert_eq!(
             outcome,
             DispatchOutcome::RejectedByAdmission(AdmitRejectReason::Intent)
@@ -812,9 +798,7 @@ mod tests {
             separator: crate::adapter::net::behavior::tag::AxisSeparator::Eq,
         });
         rt.set_local_caps(Arc::new(upgraded));
-        let outcome2 = rt
-            .dispatch_event(&cn("a"), 1, &chain, b"x")
-            .await;
+        let outcome2 = rt.dispatch_event(&cn("a"), 1, &chain, b"x").await;
         assert_eq!(outcome2, DispatchOutcome::Cached);
     }
 
@@ -830,8 +814,8 @@ mod tests {
     async fn gravity_tick_emits_then_suppresses() {
         use crate::adapter::net::dataforts::gravity::DataGravityPolicy;
 
-        let cfg = GreedyConfig::default()
-            .with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
         let redex = Arc::new(Redex::new());
         let sink = Arc::new(RecorderSink::default());
         let heat_sink = Arc::new(RecorderHeatSink::default());
@@ -876,8 +860,8 @@ mod tests {
     /// invariant.
     #[tokio::test]
     async fn note_read_without_gravity_does_not_touch_heat() {
-        let cfg = GreedyConfig::default()
-            .with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
         let (rt, _sink) = build_runtime(cfg);
         assert!(!rt.gravity_enabled());
 

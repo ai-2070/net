@@ -204,11 +204,7 @@ impl HeatRegistry {
         let mut out = Vec::new();
         for (channel, counter) in self.counters.iter_mut() {
             counter.decay_to(now);
-            let decision = super::should_emit_heat(
-                counter.rate,
-                counter.last_emitted,
-                policy,
-            );
+            let decision = super::should_emit_heat(counter.rate, counter.last_emitted, policy);
             let emission = match decision {
                 super::EmissionDecision::Suppress => HeatEmission::Suppress,
                 super::EmissionDecision::Emit { rate } => {
@@ -271,7 +267,11 @@ mod tests {
         c.bump(base);
         // rate ≈ 4.0 at base.
         c.decay_to(base + half);
-        assert!((c.rate() - 2.0).abs() < 1e-6, "rate after half-life ≈ 2.0; got {}", c.rate());
+        assert!(
+            (c.rate() - 2.0).abs() < 1e-6,
+            "rate after half-life ≈ 2.0; got {}",
+            c.rate()
+        );
         c.decay_to(base + half * 2);
         assert!((c.rate() - 1.0).abs() < 1e-6);
         c.decay_to(base + half * 3);

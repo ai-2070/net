@@ -151,8 +151,10 @@ fn hex32(bytes: &[u8; 32]) -> String {
 /// use.
 #[pyfunction]
 pub fn register_filesystem_blob_adapter(adapter_id: String, root: String) -> PyResult<()> {
-    let adapter: Arc<dyn BlobAdapter> =
-        Arc::new(FileSystemAdapter::new(adapter_id.clone(), PathBuf::from(root)));
+    let adapter: Arc<dyn BlobAdapter> = Arc::new(FileSystemAdapter::new(
+        adapter_id.clone(),
+        PathBuf::from(root),
+    ));
     global_blob_adapter_registry()
         .register(adapter)
         .map_err(|e| BlobError::new_err(format!("{}", e)))
@@ -164,7 +166,9 @@ pub fn register_filesystem_blob_adapter(adapter_id: String, root: String) -> PyR
 /// because the registry holds Arc references.
 #[pyfunction]
 pub fn unregister_blob_adapter(adapter_id: &str) -> bool {
-    global_blob_adapter_registry().unregister(adapter_id).is_some()
+    global_blob_adapter_registry()
+        .unregister(adapter_id)
+        .is_some()
 }
 
 /// True if `adapter_id` resolves to a registered adapter.
@@ -205,7 +209,9 @@ pub fn blob_publish<'py>(
 ) -> PyResult<Bound<'py, PyBytes>> {
     let adapter = global_blob_adapter_registry()
         .get(adapter_id)
-        .ok_or_else(|| PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id)))?;
+        .ok_or_else(|| {
+            PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id))
+        })?;
     let rt = shared_runtime()?;
     let data = data.to_vec();
     let bytes = py
@@ -226,7 +232,9 @@ pub fn blob_resolve<'py>(
 ) -> PyResult<Bound<'py, PyBytes>> {
     let adapter = global_blob_adapter_registry()
         .get(adapter_id)
-        .ok_or_else(|| PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id)))?;
+        .ok_or_else(|| {
+            PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id))
+        })?;
     let rt = shared_runtime()?;
     let payload = payload.to_vec();
     let bytes = py
@@ -282,11 +290,7 @@ impl BlobAdapter for PyBlobAdapter {
         &self.id
     }
 
-    async fn store(
-        &self,
-        blob_ref: &InnerBlobRef,
-        bytes: &[u8],
-    ) -> Result<(), InnerBlobError> {
+    async fn store(&self, blob_ref: &InnerBlobRef, bytes: &[u8]) -> Result<(), InnerBlobError> {
         let obj = self.py_obj.clone();
         let blob = blob_ref.clone();
         let data = bytes.to_vec();

@@ -331,11 +331,9 @@ impl Redex {
             cfg = cfg.with_colocation_policy(parsed);
         }
         let arc = mesh.node_arc_clone()?;
-        let local_caps = Arc::new(
-            net::adapter::net::behavior::capability::CapabilitySet::default(),
-        );
-        let registry =
-            net::adapter::net::behavior::placement::IntentRegistry::defaults();
+        let local_caps =
+            Arc::new(net::adapter::net::behavior::capability::CapabilitySet::default());
+        let registry = net::adapter::net::behavior::placement::IntentRegistry::defaults();
         self.inner
             .enable_greedy_dataforts(arc, cfg, local_caps, registry)
             .map_err(|e| redex_err("enable_greedy_dataforts", e))
@@ -404,8 +402,7 @@ impl Redex {
     ) -> Result<()> {
         use net::adapter::net::dataforts::DataGravityPolicy;
         let cfg_js = config.unwrap_or_default();
-        let mut policy = DataGravityPolicy::new()
-            .with_enabled(cfg_js.enabled.unwrap_or(true));
+        let mut policy = DataGravityPolicy::new().with_enabled(cfg_js.enabled.unwrap_or(true));
         if let Some(r) = cfg_js.emit_threshold_ratio {
             policy = policy.with_emit_threshold_ratio(r as f32);
         }
@@ -1241,11 +1238,7 @@ impl TasksAdapter {
     /// 1024) immediately. All three failure variants surface as a
     /// `cortex:` prefixed napi `Error`.
     #[napi]
-    pub async fn wait_for_token(
-        &self,
-        token: &WriteToken,
-        deadline_ms: u32,
-    ) -> Result<()> {
+    pub async fn wait_for_token(&self, token: &WriteToken, deadline_ms: u32) -> Result<()> {
         let inner_token = token.as_inner();
         self.inner
             .wait_for_token(
@@ -1756,11 +1749,7 @@ impl MemoriesAdapter {
     /// Read-your-writes wait. See `TasksAdapter.waitForToken` for
     /// the full contract.
     #[napi]
-    pub async fn wait_for_token(
-        &self,
-        token: &WriteToken,
-        deadline_ms: u32,
-    ) -> Result<()> {
+    pub async fn wait_for_token(&self, token: &WriteToken, deadline_ms: u32) -> Result<()> {
         let inner_token = token.as_inner();
         self.inner
             .wait_for_token(

@@ -6,6 +6,8 @@
 // single security unit — they share `adapter::net`'s subprotocol
 // dispatch and operate together at runtime, so gating each module
 // separately would only enable combinations that aren't meaningful.
+#[cfg(feature = "dataforts")]
+mod blob;
 #[cfg(feature = "net")]
 mod capabilities;
 mod common;
@@ -13,8 +15,6 @@ mod common;
 mod compute;
 #[cfg(feature = "cortex")]
 mod cortex;
-#[cfg(feature = "dataforts")]
-mod blob;
 #[cfg(feature = "groups")]
 mod groups;
 // nRPC binding (B1: raw-bytes serve_rpc / call / call_streaming).
