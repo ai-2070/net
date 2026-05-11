@@ -1,0 +1,20 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_5fa4a13af39ff6 72
+  s_3a0a24a47d1a36::t_d30d972298ce94 79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "39ce4ece454b67e5517f430c8f916f1a2cf0392a",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
