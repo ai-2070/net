@@ -31,7 +31,7 @@ Tagged `[H | M | L]`:
 | R-6   | H   | py binding  | `replication=False` silently drops every other `replication_*` kwarg     | ✅ |
 | R-7   | H   | bindings    | `enable_replication` silently absent without `net` feature                | ✅ |
 | R-8   | H   | FFI         | `net_redex_enable_replication` leaks `Box<Arc<MeshNode>>` on error paths  | ✅ |
-| R-9   | H   | tests       | DST harness `wall_clock_ms` reads real wall-clock time, not step counter  | ⚪ |
+| R-9   | H   | tests       | DST harness `wall_clock_ms` reads real wall-clock time, not step counter  | ✅ |
 | R-10  | M   | runtime     | `current_role` captured before tracker lock; `tick()` runs against stale  | ✅ |
 | R-11  | M   | runtime     | `cancel()` race: `is_stopped()` can return true before task joined        | ⚪ |
 | R-12  | M   | runtime     | Only `Heartbeat` validates `channel_id`; other inbound types don't        | ✅ |

@@ -147,6 +147,14 @@ struct VirtualCluster {
     partitions: HashSet<(NodeId, NodeId)>,
     /// Wall-clock for the tracker's silence-detection logic.
     now: Instant,
+    /// R-9: `self.now` at cluster construction — subtracted from
+    /// the current `self.now` to derive a deterministic
+    /// `wall_clock_ms` for outbound heartbeats. Without this the
+    /// harness was leaking real wall-clock into the test (via
+    /// `Instant::now().duration_since(self.now)`), breaking the
+    /// "explicit clock" claim and making any future logic that
+    /// consumed `wall_clock_ms` non-deterministic.
+    initial_now: Instant,
     /// Outbound messages staged for delivery on the next step.
     /// `(src, dst, payload)` — the payload is converted from the
     /// production `OutboundMessage` shape into an `Inbound` event
@@ -175,12 +183,14 @@ impl VirtualCluster {
                 rtt.insert((a, b), Duration::from_millis(5));
             }
         }
+        let now = Instant::now();
         Self {
             nodes,
             channel_id,
             replica_set: ids.to_vec(),
             partitions: HashSet::new(),
-            now: Instant::now(),
+            now,
+            initial_now: now,
             pending: VecDeque::new(),
             rtt,
         }
@@ -306,7 +316,13 @@ impl VirtualCluster {
                 tail_seq,
                 replica_set: &self.replica_set,
                 tracker: &n.tracker,
-                wall_clock_ms: self.now.elapsed().as_millis() as u64,
+                // R-9: derive wall_clock_ms from the step counter
+                // (via `self.now - self.initial_now`), not from real
+                // wall-clock — so the harness stays deterministic.
+                wall_clock_ms: self
+                    .now
+                    .duration_since(self.initial_now)
+                    .as_millis() as u64,
                 chunk_max_bytes: DST_CHUNK_MAX_BYTES,
                 now: self.now,
             })
