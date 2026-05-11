@@ -568,6 +568,72 @@ impl ReplicationMetricsModel {
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Model 6: RedexFile::close idempotent-shutdown swap
+//
+// Mirrors `src/adapter/net/redex/file.rs:1281` —
+// `if self.inner.closed.swap(true, AcqRel) { return Ok(()); }`.
+// The swap returns the PRIOR value; the first caller observes
+// `false` (and runs the close path), every subsequent caller
+// observes `true` (and short-circuits). Under N concurrent
+// close() calls, EXACTLY ONE caller must run the cleanup path.
+//
+// A regression to `if !closed.load() { closed.store(true); ... }`
+// would let two concurrent callers both see `false`, both run
+// the cleanup, and double-fsync / double-cancel-task / etc.
+// ─────────────────────────────────────────────────────────────
+
+/// First-call-wins flag. Returns `true` if this caller is the
+/// first to flip the bit; `false` if someone already flipped it.
+fn try_first_close(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
+}
+
+#[test]
+fn close_swap_pattern_exactly_one_caller_wins() {
+    loom::model(|| {
+        let closed = Arc::new(AtomicBool::new(false));
+        let winners = Arc::new(AtomicU64::new(0));
+
+        // Two threads race to close. Exactly one must observe the
+        // swap returning `false` (the prior value), advance
+        // `winners`, and run cleanup. The other observes `true`
+        // and short-circuits.
+        let a = {
+            let c = closed.clone();
+            let w = winners.clone();
+            thread::spawn(move || {
+                if try_first_close(&c) {
+                    w.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let b = {
+            let c = closed.clone();
+            let w = winners.clone();
+            thread::spawn(move || {
+                if try_first_close(&c) {
+                    w.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+
+        a.join().unwrap();
+        b.join().unwrap();
+
+        assert_eq!(
+            winners.load(Ordering::Relaxed),
+            1,
+            "exactly one caller wins the swap; a load+store regression \
+             would let both threads observe `false` and both run cleanup",
+        );
+        assert!(
+            closed.load(Ordering::Relaxed),
+            "flag must be true after both joins regardless of who won",
+        );
+    });
+}
+
 #[test]
 fn replication_metrics_counters_atomic_under_concurrent_increments() {
     loom::model(|| {
