@@ -48,7 +48,7 @@ cortex = ["net/netdb", "net/redex-disk", "dep:async-trait"]
 # the Python install path threads through the cortex-gated
 # Redex surface so we activate it transitively for binding-side
 # consistency.
-dataforts-greedy = ["cortex", "net/dataforts-greedy"]
+dataforts-greedy = ["cortex", "net", "net/dataforts-greedy"]
 # Python surface for the `MeshDaemon` / migration runtime.
 # Requires the `net` feature (for `NetMesh`) + the net-sdk
 # compute feature. Forwards `net-sdk/compute` explicitly so the

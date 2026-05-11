@@ -197,6 +197,135 @@ impl Redex {
         self.inner.replication_prometheus_text()
     }
 
+    /// Install greedy-LRU dataforts wiring rooted at `mesh`. The
+    /// runtime opens per-channel cache files against this Redex
+    /// and announces chains via the mesh's `ChainTagSink` impl.
+    ///
+    /// Idempotent — a second call with greedy already enabled is
+    /// a no-op (use `disableGreedyDataforts` to reconfigure).
+    ///
+    /// Locked Phase-1 defaults from `DATAFORTS_PLAN.md`:
+    /// scopes empty (admit any), 200 ms proximity bound,
+    /// 100 MiB per channel, 10 GiB total, 0.25 NIC fraction,
+    /// `any_of_local_capabilities` intent, `soft_preference`
+    /// colocation.
+    ///
+    /// `intentMatch` values: `'disabled'` / `'any_of_local_capabilities'` / `'strict'`.
+    /// `colocationPolicy` values: `'ignore'` / `'soft_preference'` / `'strict_required'`.
+    #[cfg(all(feature = "net", feature = "dataforts-greedy"))]
+    #[napi]
+    pub fn enable_greedy_dataforts(
+        &self,
+        mesh: &crate::NetMesh,
+        config: Option<GreedyConfigJs>,
+    ) -> Result<()> {
+        use net::adapter::net::dataforts::{
+            ColocationPolicy, GreedyConfig, IntentMatchPolicy, ScopeLabel,
+        };
+        let cfg_js = config.unwrap_or_default();
+        let mut cfg = GreedyConfig::new();
+        if let Some(scopes) = cfg_js.scopes {
+            cfg = cfg.with_scopes(scopes.into_iter().map(ScopeLabel::new).collect());
+        }
+        if let Some(ms) = cfg_js.proximity_max_rtt_ms {
+            cfg = cfg.with_proximity_max_rtt(std::time::Duration::from_millis(ms as u64));
+        }
+        if let Some(b) = cfg_js.per_channel_cap_bytes {
+            let bytes = redex_bigint_u64("greedy.per_channel_cap_bytes", b)?;
+            cfg = cfg.with_per_channel_cap_bytes(bytes);
+        }
+        if let Some(b) = cfg_js.total_cap_bytes {
+            let bytes = redex_bigint_u64("greedy.total_cap_bytes", b)?;
+            cfg = cfg.with_total_cap_bytes(bytes);
+        }
+        if let Some(f) = cfg_js.bandwidth_budget_fraction {
+            cfg = cfg.with_bandwidth_budget_fraction(f as f32);
+        }
+        if let Some(policy) = cfg_js.intent_match {
+            let parsed = match policy.as_str() {
+                "disabled" => IntentMatchPolicy::Disabled,
+                "any_of_local_capabilities" => IntentMatchPolicy::AnyOfLocalCapabilities,
+                "strict" => IntentMatchPolicy::Strict,
+                other => {
+                    return Err(redex_err(
+                        "enable_greedy_dataforts",
+                        format!("intentMatch {other:?} unknown"),
+                    ))
+                }
+            };
+            cfg = cfg.with_intent_match(parsed);
+        }
+        if let Some(policy) = cfg_js.colocation_policy {
+            let parsed = match policy.as_str() {
+                "ignore" => ColocationPolicy::Ignore,
+                "soft_preference" => ColocationPolicy::SoftPreference,
+                "strict_required" => ColocationPolicy::StrictRequired,
+                other => {
+                    return Err(redex_err(
+                        "enable_greedy_dataforts",
+                        format!("colocationPolicy {other:?} unknown"),
+                    ))
+                }
+            };
+            cfg = cfg.with_colocation_policy(parsed);
+        }
+        let arc = mesh.node_arc_clone()?;
+        let local_caps = Arc::new(
+            net::adapter::net::behavior::capability::CapabilitySet::default(),
+        );
+        let registry =
+            net::adapter::net::behavior::placement::IntentRegistry::defaults();
+        self.inner
+            .enable_greedy_dataforts(arc, cfg, local_caps, registry)
+            .map_err(|e| redex_err("enable_greedy_dataforts", e))
+    }
+
+    /// Stub for builds without the `dataforts-greedy` feature.
+    /// Surfaces a typed `redex:` error rather than the napi
+    /// `TypeError: ...is not a function`.
+    #[cfg(not(all(feature = "net", feature = "dataforts-greedy")))]
+    #[napi]
+    pub fn enable_greedy_dataforts(
+        &self,
+        _mesh: napi::JsUnknown,
+        _config: napi::JsUnknown,
+    ) -> Result<()> {
+        Err(redex_err(
+            "enable_greedy_dataforts",
+            "binding built without `dataforts-greedy` feature; rebuild with --features dataforts-greedy",
+        ))
+    }
+
+    /// Uninstall greedy wiring. Idempotent — no-op when not
+    /// enabled.
+    #[cfg(feature = "dataforts-greedy")]
+    #[napi]
+    pub fn disable_greedy_dataforts(&self) {
+        self.inner.disable_greedy_dataforts();
+    }
+
+    /// Number of channels currently in the greedy cache. `0` when
+    /// greedy isn't enabled.
+    #[cfg(feature = "dataforts-greedy")]
+    #[napi]
+    pub fn greedy_cached_channel_count(&self) -> u32 {
+        self.inner
+            .greedy_runtime()
+            .map(|r| r.cached_channel_count() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Render the greedy metrics as Prometheus text. Empty string
+    /// when greedy isn't enabled.
+    #[cfg(feature = "dataforts-greedy")]
+    #[napi]
+    pub fn greedy_prometheus_text(&self) -> String {
+        self.inner
+            .greedy_runtime()
+            .map(|r| r.metrics().snapshot().prometheus_text())
+            .unwrap_or_default()
+    }
+
     /// Open (or get) a raw RedEX file bound to `channelName`. Returns
     /// a handle for append / tail / read operations without going
     /// through the CortEX adapter layer.
@@ -295,6 +424,37 @@ pub struct ReplicationConfigJs {
     /// measured NIC peak. Range `(0.0, 1.0]`. Defaults to `0.5`
     /// when omitted.
     pub replication_budget_fraction: Option<f64>,
+}
+
+/// JS-side config for `Redex.enableGreedyDataforts`. Locked
+/// Phase-1 defaults — `DATAFORTS_PLAN.md` § Phase 1. All fields
+/// optional; omit any to keep the substrate default.
+#[cfg(feature = "dataforts-greedy")]
+#[napi(object)]
+#[derive(Default)]
+pub struct GreedyConfigJs {
+    /// Scope filter — chains whose `scope:` tag matches any of
+    /// these admit. Empty / omitted admits regardless of scope.
+    pub scopes: Option<Vec<String>>,
+    /// Maximum acceptable RTT to the chain's home node, in
+    /// milliseconds. Default `200`.
+    pub proximity_max_rtt_ms: Option<u32>,
+    /// Per-channel byte cap on the cache substrate. Default
+    /// `100 * 1024 * 1024` (100 MiB). Floor `1 * 1024 * 1024`.
+    pub per_channel_cap_bytes: Option<BigInt>,
+    /// Total byte cap across every channel. LRU eviction drives
+    /// toward this bound. Default `10 * 1024 * 1024 * 1024` (10
+    /// GiB).
+    pub total_cap_bytes: Option<BigInt>,
+    /// I/O budget as a fraction of measured NIC peak.
+    /// Range `(0.0, 1.0]`. Default `0.25`.
+    pub bandwidth_budget_fraction: Option<f64>,
+    /// Intent-match policy. One of `"disabled"` /
+    /// `"any_of_local_capabilities"` (default) / `"strict"`.
+    pub intent_match: Option<String>,
+    /// Colocation policy. One of `"ignore"` / `"soft_preference"`
+    /// (default) / `"strict_required"`.
+    pub colocation_policy: Option<String>,
 }
 
 fn resolve_placement_strategy(
