@@ -13,6 +13,8 @@ mod common;
 mod compute;
 #[cfg(feature = "cortex")]
 mod cortex;
+#[cfg(feature = "dataforts")]
+mod blob;
 #[cfg(feature = "groups")]
 mod groups;
 // nRPC binding (B1: raw-bytes serve_rpc / call / call_streaming).
