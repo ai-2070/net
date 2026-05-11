@@ -1,0 +1,24 @@
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_9163f300668f8b::t_fd337aea0864de 476
+  s_9163f300668f8b::t_4af0633e853dbf 480-487
+net/crates/net/src/adapter/net/redex/replication_election.rs
+  s_9163f300668f8b::t_3483fa066490a5 412-420,443-444,452,463-467,469-475,484,488,490-491,504,512,514,516,519-522,524,528,535-536
+  s_9163f300668f8b::t_2fc902204ff2f4 421-442,445-451,453-462,468,476-483,485-487,489,499,506-511,513,515,518,523
+  s_9163f300668f8b::t_1ffe14315812fa 492-498,500-503,505,517,525-527,529-534
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "488c1b5e6ac447eb77b98049be2fb68edbe2a0ce",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
