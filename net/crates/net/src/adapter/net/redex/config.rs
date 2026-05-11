@@ -159,6 +159,19 @@ pub struct RedexFileConfig {
     /// `ReplicationConfigError` if the field is `Some(cfg)` with
     /// `cfg.validate().is_err()`.
     pub replication: Option<ReplicationConfig>,
+
+    /// Dataforts Phase 3 — id of the [`BlobAdapter`] this channel's
+    /// events resolve against when an event payload's first byte is
+    /// the `BlobRef` discriminator. `None` (default) means callers
+    /// of `RedexFile::resolve_one` MUST pass an adapter explicitly;
+    /// `Some(id)` lets them route through
+    /// `global_blob_adapter_registry()` automatically. The field is
+    /// advisory metadata at the RedEX layer — substrate reads still
+    /// return raw payload bytes; the resolution decision happens at
+    /// the convenience read helpers.
+    ///
+    /// [`BlobAdapter`]: super::super::dataforts::blob::BlobAdapter
+    pub blob_adapter_id: Option<String>,
 }
 
 impl Default for RedexFileConfig {
@@ -172,6 +185,7 @@ impl Default for RedexFileConfig {
             retention_max_age_ns: None,
             tail_buffer_size: 1024,
             replication: None,
+            blob_adapter_id: None,
         }
     }
 }
@@ -236,6 +250,13 @@ impl RedexFileConfig {
     /// surfaces validation errors typed.
     pub fn with_replication(mut self, replication: Option<ReplicationConfig>) -> Self {
         self.replication = replication;
+        self
+    }
+
+    /// Set the dataforts blob adapter id used by
+    /// [`super::RedexFile::resolve_one`]. Pass `None` to clear.
+    pub fn with_blob_adapter_id(mut self, id: Option<String>) -> Self {
+        self.blob_adapter_id = id;
         self
     }
 }
