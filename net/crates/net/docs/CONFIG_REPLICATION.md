@@ -62,6 +62,42 @@ with `replication: Some(_)` spawn one tokio task per channel. The
 router auto-registers + unregisters at `open_file` / `close_file`
 time.
 
+### Binding-language equivalents
+
+The same surface ships in every language binding. The replication
+opt-in is a nested `replication` field on the channel config; the
+operator surface (`enable_replication`, `replication_prometheus_text`)
+is exposed as methods on the binding's `Redex` handle.
+
+- **Node** (`@ai2070/net`):
+  ```ts
+  redex.enableReplication(mesh);
+  await redex.openFile("my/channel", {
+    replication: { factor: 3, heartbeatMs: 500n, placement: "standard" },
+  });
+  ```
+- **Python** (`net`):
+  ```python
+  redex.enable_replication(mesh)
+  redex.open_file("my/channel",
+                  replication=True, replication_factor=3,
+                  replication_heartbeat_ms=500)
+  ```
+- **Go** (cgo wrapper at `bindings/go/net/redex.go`):
+  ```go
+  redex.EnableReplication(meshArcPtr)
+  redex.OpenFile("my/channel", &net.RedexFileConfig{
+      Replication: &net.ReplicationConfig{
+          Factor: 3, HeartbeatMs: 500, Placement: net.PlacementStandard,
+      },
+  })
+  ```
+- **C/FFI**: the `libnet` cdylib exports `net_redex_*` symbols
+  directly. See `bindings/go/net/redex.go`'s cgo header block for
+  the canonical extern signatures; non-Go consumers wire to the
+  same symbols. Config rides as a JSON string through
+  `net_redex_open_file` to keep the C surface narrow.
+
 ## `ReplicationConfig` fields
 
 ### `factor: u8`

@@ -278,6 +278,106 @@ pub extern "C" fn net_redex_free(handle: *mut RedexHandle) {
 }
 
 // =========================================================================
+// Replication operator surface — Phase I Go binding completion
+// =========================================================================
+//
+// These functions extend the existing `net_redex_*` FFI to expose
+// the operator surface from `Redex::enable_replication`, plus the
+// per-channel metrics view via `replication_prometheus_text`. The
+// Go binding consumes them via `net_redex_enable_replication(mesh)`
+// followed by `net_redex_open_file` with a `RedexFileConfigJson`
+// carrying a populated `replication` field.
+//
+// Cross-link to the Node + Python bindings: the same surface is
+// exposed via `Redex.enableReplication(mesh)` (NAPI) and
+// `Redex.enable_replication(mesh)` (PyO3) in
+// `bindings/{node,python}/src/cortex.rs`. The Go side has its own
+// FFI because there's no shared SDK wrapper — every binding goes
+// straight against the core `Redex` types.
+
+/// Install cross-node replication on this `Redex`. Consumes the
+/// `*mut Arc<MeshNode>` boxed pointer produced by
+/// `net_mesh_arc_clone` — caller MUST NOT free it again.
+/// Idempotent — repeated calls return without disturbing the
+/// existing router.
+///
+/// Returns `0` on success, `NetError::NullPointer` (`-1`) when
+/// either handle is NULL, `NetError::ShuttingDown` when the
+/// `Redex` is in `_free`-quiesce.
+#[cfg(feature = "net")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_enable_replication(
+    redex: *mut RedexHandle,
+    mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
+) -> c_int {
+    if redex.is_null() || mesh_arc.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let redex = unsafe { &*redex };
+    let _op = match redex.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    // SAFETY: `mesh_arc` is documented as produced by
+    // `net_mesh_arc_clone`; consume the Box, take the Arc.
+    let mesh = unsafe { *Box::from_raw(mesh_arc) };
+    redex.inner.enable_replication(mesh);
+    0
+}
+
+/// Count of per-channel replication runtimes registered on this
+/// `Redex`. Returns `0` when replication isn't enabled or on a
+/// NULL handle (defensive — the Go side typically validates the
+/// handle is non-NULL before calling).
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_replication_runtime_count(redex: *const RedexHandle) -> u32 {
+    let Some(h) = (unsafe { redex.as_ref() }) else {
+        return 0;
+    };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return 0,
+    };
+    h.inner.replication_runtime_count() as u32
+}
+
+/// Render the per-channel replication metrics as Prometheus text.
+/// Returns a heap-allocated, NUL-terminated string the caller frees
+/// with [`crate::ffi::net_free_string`]. Returns the empty string
+/// (heap-allocated + NUL-terminated) when replication isn't
+/// enabled — the call site can pipe straight into an HTTP scrape
+/// body without branching. Returns NULL only on a NULL input
+/// handle or when the `Redex` is in `_free`-quiesce.
+///
+/// Covers the seven per-channel shapes from
+/// `docs/CONFIG_REPLICATION.md`: `*_lag_seconds`,
+/// `*_sync_bytes_total`, `*_leader_changes_total`,
+/// `*_under_capacity_total`, `*_skip_ahead_total`,
+/// `*_election_thrash_total`, `*_witness_withdrawals_total`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_replication_prometheus_text(
+    redex: *const RedexHandle,
+) -> *mut c_char {
+    let Some(h) = (unsafe { redex.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return std::ptr::null_mut(),
+    };
+    let text = h.inner.replication_prometheus_text();
+    // CString::new rejects strings with interior NULs. Prometheus
+    // text shouldn't contain any, but use the fallback just in
+    // case (replication channel names with embedded NULs would
+    // have been rejected at `ChannelName::new` long before this
+    // path runs).
+    match CString::new(text) {
+        Ok(c) => c.into_raw(),
+        Err(_) => CString::new("").unwrap().into_raw(),
+    }
+}
+
+// =========================================================================
 // RedexFile
 // =========================================================================
 
@@ -290,6 +390,85 @@ struct RedexFileConfigJson {
     retention_max_events: Option<u64>,
     retention_max_bytes: Option<u64>,
     retention_max_age_ms: Option<u64>,
+    /// Cross-node replication opt-in. `None` (default) keeps the
+    /// channel single-node; `Some(cfg)` opts into replication and
+    /// requires `net_redex_enable_replication` to have been called
+    /// first — otherwise `net_redex_open_file` returns
+    /// `NET_ERR_REDEX` with the typed error from
+    /// `Redex::open_file`.
+    replication: Option<RedexReplicationConfigJson>,
+}
+
+/// Replication-config JSON shape. Mirrors `ReplicationConfig` from
+/// the core. All fields are optional — omitted ones fall back to
+/// the core's defaults (`factor=3`, `heartbeat_ms=500`,
+/// `placement=Standard`, `on_under_capacity=Withdraw`,
+/// `replication_budget_fraction=0.5`).
+///
+/// `placement` rides as a tagged enum so the Go side serializes a
+/// flat JSON object rather than choosing between a nested form and
+/// an enum string per-strategy. `on_under_capacity` is a flat
+/// string.
+#[derive(Deserialize, Default)]
+struct RedexReplicationConfigJson {
+    factor: Option<u8>,
+    heartbeat_ms: Option<u64>,
+    /// `"standard"` (default), `"pinned"`, `"colocation_strict"`.
+    /// With `"pinned"`, `pinned_nodes` is required.
+    placement: Option<String>,
+    pinned_nodes: Option<Vec<u64>>,
+    leader_pinned: Option<u64>,
+    /// `"withdraw"` (default), `"evict_oldest"`.
+    on_under_capacity: Option<String>,
+    replication_budget_fraction: Option<f32>,
+}
+
+impl RedexReplicationConfigJson {
+    fn into_config(
+        self,
+    ) -> Result<crate::adapter::net::redex::ReplicationConfig, &'static str> {
+        use crate::adapter::net::redex::{
+            PlacementStrategy, ReplicationConfig, UnderCapacity,
+        };
+        let mut cfg = ReplicationConfig::new();
+        if let Some(f) = self.factor {
+            cfg = cfg.with_factor(f);
+        }
+        if let Some(hb) = self.heartbeat_ms {
+            cfg = cfg.with_heartbeat_ms(hb);
+        }
+        let placement = match self.placement.as_deref() {
+            None | Some("standard") => PlacementStrategy::Standard,
+            Some("colocation_strict") | Some("colocation-strict") => {
+                PlacementStrategy::ColocationStrict
+            }
+            Some("pinned") => {
+                let nodes = self
+                    .pinned_nodes
+                    .ok_or("pinned placement requires pinned_nodes")?;
+                if nodes.is_empty() {
+                    return Err("pinned placement requires non-empty pinned_nodes");
+                }
+                PlacementStrategy::Pinned(nodes)
+            }
+            Some(_) => return Err("unknown placement strategy"),
+        };
+        cfg = cfg.with_placement(placement);
+        if let Some(leader) = self.leader_pinned {
+            cfg = cfg.with_leader_pinned(Some(leader));
+        }
+        let policy = match self.on_under_capacity.as_deref() {
+            None | Some("withdraw") => UnderCapacity::Withdraw,
+            Some("evict_oldest") | Some("evict-oldest") => UnderCapacity::EvictOldest,
+            Some(_) => return Err("unknown on_under_capacity policy"),
+        };
+        cfg = cfg.with_on_under_capacity(policy);
+        if let Some(fr) = self.replication_budget_fraction {
+            cfg = cfg.with_replication_budget_fraction(fr);
+        }
+        cfg.validate().map_err(|_| "replication config invalid")?;
+        Ok(cfg)
+    }
 }
 
 /// FFI handle wrapping a [`InnerRedexFile`].
@@ -377,6 +556,12 @@ pub extern "C" fn net_redex_open_file(
     cfg.retention_max_bytes = cfg_json.retention_max_bytes;
     if let Some(ms) = cfg_json.retention_max_age_ms {
         cfg.retention_max_age_ns = Some(ms.saturating_mul(1_000_000));
+    }
+    if let Some(rep_json) = cfg_json.replication {
+        match rep_json.into_config() {
+            Ok(rep) => cfg.replication = Some(rep),
+            Err(_) => return NET_ERR_REDEX,
+        }
     }
     match redex.inner.open_file(&channel, cfg) {
         Ok(file) => {
@@ -2261,5 +2446,86 @@ mod tests {
             "concurrent first-callers observed {} distinct runtimes (must be exactly 1)",
             ptrs.len()
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Replication FFI — Phase I Go binding surface
+    // ────────────────────────────────────────────────────────────────
+
+    /// `replication_runtime_count` reads 0 on an empty `Redex` and
+    /// stays 0 when no `enable_replication` was called.
+    #[test]
+    fn replication_runtime_count_zero_when_not_enabled() {
+        let r = redex();
+        assert_eq!(net_redex_replication_runtime_count(r), 0);
+        net_redex_free(r);
+    }
+
+    /// `replication_prometheus_text` returns the empty string
+    /// (heap-allocated + NUL-terminated, NOT NULL) when replication
+    /// isn't enabled — call sites pipe straight into an HTTP body
+    /// without branching.
+    #[test]
+    fn replication_prometheus_text_empty_when_not_enabled() {
+        let r = redex();
+        let p = net_redex_replication_prometheus_text(r);
+        assert!(!p.is_null());
+        let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap();
+        assert_eq!(s, "");
+        crate::ffi::net_free_string(p);
+        net_redex_free(r);
+    }
+
+    /// `replication_prometheus_text` returns NULL on a NULL handle —
+    /// defensive; the Go side typically guards before calling.
+    #[test]
+    fn replication_prometheus_text_null_handle_returns_null() {
+        let p = net_redex_replication_prometheus_text(ptr::null());
+        assert!(p.is_null());
+    }
+
+    /// Opening a channel with `replication: { ... }` BEFORE
+    /// `enable_replication` was called must fail with
+    /// `NET_ERR_REDEX` — the typed error from `Redex::open_file`.
+    #[test]
+    fn open_file_with_replication_without_enable_fails() {
+        let r = redex();
+        let cfg = r#"{"replication":{"factor":3,"heartbeat_ms":500}}"#;
+        let rc = open_file(r, "ffi/repl_unconfigured", Some(cfg));
+        assert_eq!(rc, NET_ERR_REDEX);
+        net_redex_free(r);
+    }
+
+    /// Invalid replication config (factor below MIN, unknown
+    /// placement, etc.) surfaces `NET_ERR_REDEX` without opening
+    /// the file.
+    #[test]
+    fn open_file_with_invalid_replication_config_rejected() {
+        let r = redex();
+        // Unknown placement strategy.
+        let cfg = r#"{"replication":{"placement":"impossible"}}"#;
+        let rc = open_file(r, "ffi/repl_invalid_placement", Some(cfg));
+        assert_eq!(rc, NET_ERR_REDEX);
+
+        // Pinned without pinned_nodes.
+        let cfg = r#"{"replication":{"placement":"pinned"}}"#;
+        let rc = open_file(r, "ffi/repl_pinned_no_nodes", Some(cfg));
+        assert_eq!(rc, NET_ERR_REDEX);
+
+        // Unknown on_under_capacity.
+        let cfg = r#"{"replication":{"on_under_capacity":"impossible"}}"#;
+        let rc = open_file(r, "ffi/repl_invalid_policy", Some(cfg));
+        assert_eq!(rc, NET_ERR_REDEX);
+
+        net_redex_free(r);
+    }
+
+    /// NULL `redex` to the replication functions surfaces 0 /
+    /// NULL respectively (the documented defensive shape).
+    #[test]
+    fn replication_functions_idempotent_on_null_redex() {
+        assert_eq!(net_redex_replication_runtime_count(ptr::null()), 0);
+        let p = net_redex_replication_prometheus_text(ptr::null());
+        assert!(p.is_null());
     }
 }
