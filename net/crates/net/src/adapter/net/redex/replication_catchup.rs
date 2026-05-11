@@ -755,4 +755,73 @@ mod tests {
         assert_eq!(replica.next_seq(), 4);
         assert_eq!(replica.next_seq(), leader.next_seq());
     }
+
+    /// Plan §8 skip-ahead — when the leader's response carries
+    /// `first_seq > local_next` (the leader trimmed past us), the
+    /// replica calls `RedexFile::skip_to(first_seq)` and retries
+    /// the apply. The retry succeeds because the local tail now
+    /// matches the chunk's first_seq.
+    #[test]
+    fn replica_skip_ahead_then_apply_succeeds() {
+        let leader = build_file("redex/skip");
+        let replica = build_file("redex/skip");
+        // Replica has 2 events; leader's retained range starts at
+        // seq=10 (simulating heavy retention that trimmed away
+        // every event the replica still has locally).
+        for _ in 0..2 {
+            replica.append(b"old").unwrap();
+        }
+        // Leader has appended 12 events but retention trimmed
+        // everything below seq=10. Simulate by appending 10
+        // throwaway events to bump next_seq, then sweep retention
+        // doesn't apply here — we just build the response by
+        // hand.
+        for _ in 0..12 {
+            leader.append(b"x").unwrap();
+        }
+        let cid = ChannelId::from_name(&ChannelName::new("redex/skip").unwrap());
+
+        // Craft a response that simulates "leader retained
+        // [10, 12) only" — first_seq=10, events at seqs 10 and 11.
+        let response = SyncResponse {
+            channel_id: cid,
+            first_seq: 10,
+            events: vec![
+                SyncEvent {
+                    event_seq: 10,
+                    payload: vec![b'A'],
+                },
+                SyncEvent {
+                    event_seq: 11,
+                    payload: vec![b'B'],
+                },
+            ],
+        };
+
+        // First apply rejects with GapBeforeChunk.
+        let err = apply_sync_response(&replica, &response, cid).expect_err("must gap");
+        let first_seq = match err {
+            ApplyError::GapBeforeChunk { first_seq, .. } => first_seq,
+            other => panic!("expected GapBeforeChunk, got {other:?}"),
+        };
+        assert_eq!(first_seq, 10);
+
+        // Skip ahead + retry. The replica drops its old [0,2)
+        // events, advances next_seq to 10, then applies the chunk.
+        replica.skip_to(first_seq).unwrap();
+        assert_eq!(replica.len(), 0);
+        assert_eq!(replica.next_seq(), 10);
+
+        let new_tail = apply_sync_response(&replica, &response, cid).unwrap();
+        assert_eq!(new_tail, 12);
+        assert_eq!(replica.next_seq(), 12);
+
+        // Replica now has 2 events, starting at seq=10.
+        let events = replica.read_range(10, 12);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].entry.seq, 10);
+        assert_eq!(events[0].payload.as_ref(), b"A");
+        assert_eq!(events[1].entry.seq, 11);
+        assert_eq!(events[1].payload.as_ref(), b"B");
+    }
 }

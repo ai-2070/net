@@ -239,10 +239,13 @@ Option<Arc<ReplicationCoordinator>>` returns the coordinator handle.
 - **Replication is best-effort under pressure** — the leader's
   replication factor is a hard guarantee, but individual replicas
   fall back to `UnderCapacity` policy when local storage saturates.
-- **Skip-ahead path is partial** — `BadRange` NACKs increment the
-  metric and route correctly, but the replica's local-tail trim
-  is gated on `RedexFile::skip_to(seq)`, which doesn't ship in
-  this version. Affected replicas heal on the next leader cycle.
+- **Skip-ahead is heap-only** — when the leader's `SyncResponse`
+  carries `first_seq` above the replica's local tail (the leader
+  trimmed past the replica's retained range), the replica calls
+  `RedexFile::skip_to(first_seq)` and retries the apply. Persistent
+  files (`redex-disk`) reject `skip_to` with a typed error; affected
+  replicas fall back to NACK BadRange and heartbeat-cycle recovery
+  while the persistent-tier truncate+rebuild path waits for v2.
 - **DST coverage is partial** — pure-logic pieces (state machine,
   election, catch-up helpers, runtime tick) have unit tests; the
   full deterministic-simulation harness for partition + retention-

@@ -667,11 +667,63 @@ async fn on_inbound(
                     // configured `UnderCapacity` policy and react.
                     handle_disk_pressure(coordinator, &inputs.file, &detail, from).await;
                 }
+                Err(super::replication_catchup::ApplyError::GapBeforeChunk {
+                    first_seq,
+                    local_next,
+                }) => {
+                    // Plan §8 skip-ahead — the leader trimmed past
+                    // our local tail; the chunk's first_seq is
+                    // strictly above local_next. Skip the local
+                    // sequence forward to first_seq and retry the
+                    // apply (the chunk's events line up with the
+                    // new tail). On persistent files
+                    // `skip_to` returns an error and we fall back
+                    // to log+drop; the heartbeat-cycle recovery
+                    // path catches us up on the next tick.
+                    coordinator.metrics().incr_skip_ahead();
+                    match inputs.file.skip_to(first_seq) {
+                        Ok(()) => {
+                            tracing::warn!(
+                                from = from,
+                                from_seq = local_next,
+                                to_seq = first_seq,
+                                gap = first_seq - local_next,
+                                "replication: skip-ahead — leader trimmed past local tail"
+                            );
+                            // Retry the apply now that the local
+                            // tail matches first_seq.
+                            match apply_sync_response(&inputs.file, &msg, inputs.channel_id) {
+                                Ok(new_tail) => {
+                                    tracing::trace!(
+                                        from = from,
+                                        new_tail = new_tail,
+                                        "replication: applied chunk after skip-ahead"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        from = from,
+                                        error = ?e,
+                                        "replication: apply after skip-ahead failed"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                from = from,
+                                first_seq = first_seq,
+                                error = %e,
+                                "replication: skip_to rejected; falling back to heartbeat-cycle recovery"
+                            );
+                        }
+                    }
+                }
                 Err(e) => {
                     // Remaining ApplyError variants — channel
                     // mismatch, monotonicity violation, stale
-                    // chunk, gap-before-chunk. Log + drop;
-                    // reliable-stream / heartbeat cycle recovers.
+                    // chunk. Log + drop; reliable-stream /
+                    // heartbeat cycle recovers.
                     tracing::warn!(
                         from = from,
                         error = ?e,
