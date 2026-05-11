@@ -99,6 +99,15 @@ struct VirtualNode {
     /// Has this node been killed (crashed) for this scenario?
     /// Killed nodes neither tick nor accept inbound events.
     killed: bool,
+    /// Mirrors the production coordinator's `election_thrash_total`
+    /// gauge: counts every transition driven by `MissedHeartbeats`.
+    /// The DST harness drives transitions through `force_transition`
+    /// rather than `ReplicationCoordinator::transition_to`, so the
+    /// real Prometheus counter is never bumped; tracking the same
+    /// count locally lets election-storm scenarios pin "the bump
+    /// fires once per round" without rewiring the harness around
+    /// the async coordinator.
+    election_thrash_count: u64,
 }
 
 impl VirtualNode {
@@ -115,6 +124,7 @@ impl VirtualNode {
             file,
             inbox: VecDeque::new(),
             killed: false,
+            election_thrash_count: 0,
         }
     }
 
@@ -130,6 +140,9 @@ impl VirtualNode {
         let _ = StateTransition::apply(self.role, target, signal)
             .expect("DST harness drove an invalid state-machine transition");
         self.role = target;
+        if matches!(signal, TransitionSignal::MissedHeartbeats) {
+            self.election_thrash_count += 1;
+        }
     }
 }
 
@@ -349,6 +362,11 @@ impl VirtualCluster {
             let _ = StateTransition::apply(n.role, pt.target, pt.signal)
                 .expect("tick produced an invalid transition");
             n.role = pt.target;
+            // Mirror the production coordinator's election_thrash
+            // counter so storm scenarios can observe the same gauge.
+            if matches!(pt.signal, TransitionSignal::MissedHeartbeats) {
+                n.election_thrash_count += 1;
+            }
 
             // On Candidate entry, run the election in the same
             // step (mirrors `on_tick` in the runtime). The
@@ -1190,6 +1208,22 @@ fn election_storm_two_rounds_each_converges_within_hysteresis() {
     assert!(
         c_role == ReplicaRole::Leader || d_role == ReplicaRole::Leader,
         "storm r2: at least one survivor is Leader"
+    );
+
+    // The production coordinator increments `election_thrash_total`
+    // on every MissedHeartbeats-driven transition. Each storm round
+    // takes at least one survivor through Replica → Candidate, so
+    // the cluster-wide thrash count must be ≥2 after two rounds.
+    // Higher counts are fine — the dual-leader window in round 2
+    // can drive both C and D through Candidate.
+    let total_thrash: u64 = cluster
+        .nodes
+        .values()
+        .map(|n| n.election_thrash_count)
+        .sum();
+    assert!(
+        total_thrash >= 2,
+        "election_thrash counter must bump on each MissedHeartbeats transition; got {total_thrash}"
     );
 }
 
