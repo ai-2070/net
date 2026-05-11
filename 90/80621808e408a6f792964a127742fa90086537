@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/redex/mod.rs
+  s_9163f300668f8b::t_12274529ec7ed3 71-73
+  s_9163f300668f8b::t_f6fdec3d6c8f7f 36
+net/crates/net/src/adapter/net/redex/replication_step.rs
+  s_9163f300668f8b::t_b858919623d0fc 1-549,556-558,561-627
+  s_9163f300668f8b::t_4737e7b98fc770 550-555,559-560
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_9163f300668f8b::t_4f8b8542cb9ec8 456-458
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "9080621808e408a6f792964a127742fa90086537",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
