@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/redex/replication.rs
+  s_9163f300668f8b::t_ac85fd9888a8a1 186,188,196,198-199,201-202,211,213-216,218-219
+  s_9163f300668f8b::t_24331e308ef8f5 228,230,232-234,249,255
+  s_9163f300668f8b::t_f2b13f55535f8a 117,119,121-122,124
+  s_9163f300668f8b::t_22c5fdf9f4d6c4 269-274,277-280,284-289
+  s_9163f300668f8b::t_0f50920bce54f0 1-116,118,120,123,125-185,187,189-195,197,200,203-210,212,217,220-227,229,231,235-248,250-254,256-268,275-276,281-283,290-884
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_9163f300668f8b::t_0c58f36a2276ca 7,9,13
+  s_9163f300668f8b::t_5b3c5b90c22fa3 422,424,426-431
+net/crates/net/src/adapter/net/redex/mod.rs
+  s_9163f300668f8b::t_a4c52ed5d88d4b 5-7,10-14,27,41-46
+net/crates/net/docs/SUBPROTOCOLS.md
+  s_9163f300668f8b::t_638fcfd7df9b89 137
+  s_9163f300668f8b::t_1f932fc16c2c91 24-29,33-53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "ed1f3b124ae1f652521ec0c71f6325b156859916",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
