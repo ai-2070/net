@@ -313,6 +313,19 @@ impl PyRedex {
     fn replication_runtime_count(&self) -> u32 {
         self.inner.replication_runtime_count() as u32
     }
+
+    /// Render the replication metrics as Prometheus text. Returns
+    /// the empty string when replication isn't enabled — convenient
+    /// for piping into an HTTP scrape endpoint without branching.
+    ///
+    /// Covers the seven per-channel shapes from
+    /// `CONFIG_REPLICATION.md`: `*_lag_seconds{role}`,
+    /// `*_sync_bytes_total`, `*_leader_changes_total`,
+    /// `*_under_capacity_total`, `*_skip_ahead_total`,
+    /// `*_election_thrash_total`, `*_witness_withdrawals_total`.
+    fn replication_prometheus_text(&self) -> String {
+        self.inner.replication_prometheus_text()
+    }
 }
 
 fn build_replication_config(
