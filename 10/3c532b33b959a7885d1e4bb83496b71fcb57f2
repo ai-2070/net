@@ -1,0 +1,39 @@
+net/crates/net/src/ffi/cortex.rs
+  s_3a0a24a47d1a36::t_6e9585be4332f3 611,615-616,620,633,639,641
+  s_3a0a24a47d1a36::t_0c758a416e2c35 355-402,425,429-431,435,437-438
+  s_3a0a24a47d1a36::t_e70ece07ba49c0 772,776-777,781,794,799
+net/crates/net/bindings/python/src/blob.rs
+  s_3a0a24a47d1a36::t_255a0907e9fae7 180-193
+net/crates/net/src/adapter/net/dataforts/greedy/metrics.rs
+  s_3a0a24a47d1a36::t_850738795fe8fc 230-238
+net/crates/net/bindings/node/src/blob.rs
+  s_3a0a24a47d1a36::t_2a10e4c796c8c7 288-297,305
+  s_3a0a24a47d1a36::t_87e174a4cde20a 526-535,543
+  s_3a0a24a47d1a36::t_fe99777af76158 716-719,729,735-745
+  s_3a0a24a47d1a36::t_853067ddb71b94 457-458,469,475-479
+net/crates/net/src/adapter/net/redex/file.rs
+  s_3a0a24a47d1a36::t_605de353ee0d16 1645-1649,1652,1660,1668,1677
+net/crates/net/src/ffi/blob.rs
+  s_3a0a24a47d1a36::t_754c41bf49f0a5 723
+  s_3a0a24a47d1a36::t_ae3fc22ae54118 745,748-749
+net/crates/net/bindings/python/src/lib.rs
+  s_3a0a24a47d1a36::t_c43ac39a18323d 2285-2296
+net/crates/net/bindings/go/net/redex.go
+  s_3a0a24a47d1a36::t_da04c8f1cbd0d1 301-311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "103c532b33b959a7885d1e4bb83496b71fcb57f2",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
