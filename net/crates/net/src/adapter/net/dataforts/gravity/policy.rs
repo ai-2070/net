@@ -43,10 +43,11 @@ pub const MIN_EMIT_THRESHOLD_RATIO: f32 = 1.01;
 pub const MAX_EMIT_THRESHOLD_RATIO: f32 = 10.0;
 
 /// Per-channel configuration for the data-gravity heat-counter
-/// emission cycle. Carried on
-/// [`crate::adapter::net::redex::RedexFileConfig::data_gravity`]
-/// (added in a subsequent slice); `None` keeps the channel
-/// gravity-free (no heat tags emitted, no counter maintained).
+/// emission cycle. Installed at runtime via
+/// [`super::super::super::redex::Redex::enable_gravity_for_greedy`]
+/// against a running mesh — no `RedexFileConfig` field; gravity is
+/// a runtime policy toggle (see `DATAFORTS_PLAN.md` § Runtime
+/// toggles vs. compile-time flags).
 ///
 /// Validation rules (enforced by [`Self::validate`]):
 ///

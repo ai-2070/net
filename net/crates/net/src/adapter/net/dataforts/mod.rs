@@ -4,7 +4,7 @@
 //! Each Dataforts phase ships behind its own Cargo feature flag
 //! and composes against the substrate's tag taxonomy, capability
 //! index, replication runtime, and placement filter. See
-//! [`docs/misc/DATAFORTS_PLAN.md`] for the activation gates per
+//! `docs/misc/DATAFORTS_PLAN.md` for the activation gates per
 //! phase and the locked design decisions per remaining phase.
 //!
 //! Currently exported phases:

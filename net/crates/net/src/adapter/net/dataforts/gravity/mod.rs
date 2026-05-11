@@ -30,5 +30,9 @@ mod policy;
 mod sink;
 
 pub use counter::{HeatCounter, HeatEmission, HeatRegistry};
-pub use policy::{should_emit_heat, DataGravityPolicy, DataGravityPolicyError, EmissionDecision};
+pub use policy::{
+    should_emit_heat, DataGravityPolicy, DataGravityPolicyError, EmissionDecision,
+    DEFAULT_DECAY_HALF_LIFE_SECS, DEFAULT_EMIT_THRESHOLD_RATIO, MAX_EMIT_THRESHOLD_RATIO,
+    MIN_EMIT_THRESHOLD_RATIO,
+};
 pub use sink::HeatSink;

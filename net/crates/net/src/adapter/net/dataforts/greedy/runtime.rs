@@ -311,7 +311,7 @@ impl GreedyRuntime {
     /// chain heat counter. Heat tag emission happens on the
     /// throttled [`Self::gravity_tick`] cycle (the bump itself
     /// is free; emission is rate-limited per
-    /// [`DataGravityPolicy::emit_threshold_ratio`]).
+    /// [`super::super::gravity::DataGravityPolicy::emit_threshold_ratio`]).
     pub fn note_read(&self, channel: &ChannelName) {
         let now = Instant::now();
         let origin_hash = {

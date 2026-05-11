@@ -278,7 +278,8 @@ impl Redex {
     /// restarts the tick task. The heat registry resets on each
     /// re-enable so the new policy starts from a clean slate.
     ///
-    /// `mesh` is consumed for its [`HeatSink`] impl
+    /// `mesh` is consumed for its
+    /// [`super::super::dataforts::HeatSink`] impl
     /// (`announce_heat` / `withdraw_heat`).
     #[cfg(feature = "dataforts")]
     pub fn enable_gravity_for_greedy(
