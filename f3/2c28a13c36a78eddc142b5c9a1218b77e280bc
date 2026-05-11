@@ -1,0 +1,21 @@
+net/crates/net/tests/integration_cortex_tasks.rs
+  s_9163f300668f8b::t_134a4c9c57a456 1030
+net/crates/net/tests/integration_redex.rs
+  s_9163f300668f8b::t_7a99a7e1e288bc 727,759,791,822,867,913,985
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "f32c28a13c36a78eddc142b5c9a1218b77e280bc",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
