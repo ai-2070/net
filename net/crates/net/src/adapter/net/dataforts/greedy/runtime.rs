@@ -36,7 +36,7 @@ use crate::adapter::net::behavior::capability::CapabilitySet;
 use crate::adapter::net::behavior::placement::{IntentRegistry, PlacementMetadataKeys};
 use crate::adapter::net::channel::ChannelName;
 use crate::adapter::net::redex::{
-    BandwidthBudget, ChainTagSink, Redex, RedexFileConfig,
+    BandwidthBudget, ChainTagSink, Redex, RedexFile, RedexFileConfig,
 };
 
 use super::admission::{should_admit, AdmissionInputs, AdmissionVerdict};
@@ -52,6 +52,17 @@ use super::metrics::{AdmitRejectReason, GreedyMetricsRegistry};
 ///
 /// Fire-and-forget: the mesh never inspects the outcome (greedy is
 /// best-effort, parallel to the application's tail).
+///
+/// **Ordering caveat.** The default
+/// [`GreedyRuntime::observe_event`] impl spawns one tokio task per
+/// inbound event so the mesh hot path stays non-blocking; the
+/// per-channel cache file's append calls race concurrently, so
+/// the cache may surface events out of publish order. Operators
+/// needing strict ordering should use replication (`Redex::open_file`
+/// with `RedexFileConfig::replication`) which preserves seq order
+/// via the per-channel runtime + `apply_sync_response` monotonicity
+/// guard. Greedy is positioned as a speculative observability /
+/// data-locality layer, not an ordered-replay primitive.
 pub trait GreedyObserver: Send + Sync {
     /// Observe one inbound channel event. The implementation is
     /// responsible for any async work + backpressure.
@@ -216,6 +227,20 @@ impl GreedyRuntime {
     /// True iff the local cache currently holds `channel`.
     pub fn contains(&self, channel: &ChannelName) -> bool {
         self.inner.cache.lock().contains(channel)
+    }
+
+    /// Borrow the per-channel cache file if greedy is holding
+    /// `channel`. Returns a `RedexFile` clone (Arc-backed; cheap).
+    /// Does NOT bump the read-recency LRU position — pair with
+    /// [`Self::note_read`] when serving from the file so the
+    /// promote-on-read semantic fires.
+    ///
+    /// Operator-facing read-path integration: a caller wanting
+    /// "give me chain X's local cache" passes the synthesized
+    /// channel name (or uses [`Redex::greedy_cache_for`] which
+    /// does the synthesis + read-recency bump in one call).
+    pub fn cache_file(&self, channel: &ChannelName) -> Option<RedexFile> {
+        self.inner.cache.lock().get(channel).map(|e| e.file.clone())
     }
 
     /// Bump the read-path LRU position for `channel`. Wire into

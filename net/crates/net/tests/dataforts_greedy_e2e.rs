@@ -265,6 +265,108 @@ async fn greedy_scope_filter_admits_when_publisher_advertises_matching_scope() {
     redex_b.disable_greedy_dataforts();
 }
 
+/// After B's greedy cache populates from observed events,
+/// `Redex::greedy_cache_for(name)` returns the cache file. Reads
+/// from that file see the cached events, the
+/// `dataforts_greedy_serve_count_total{channel}` metric bumps,
+/// and the read-recency LRU position promotes (a subsequent
+/// cache-pressure scenario would evict another channel first).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn greedy_read_path_serves_cached_events() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    let redex_b = Arc::new(Redex::new());
+    let cfg = GreedyConfig::default()
+        .with_intent_match(IntentMatchPolicy::Disabled);
+    redex_b
+        .enable_greedy_dataforts(
+            node_b.clone(),
+            cfg,
+            Arc::new(CapabilitySet::default()),
+            IntentRegistry::new(),
+        )
+        .expect("enable greedy");
+
+    let name = cn("dataforts/test/read-path");
+    node_b
+        .subscribe_channel(node_a.node_id(), name.clone())
+        .await
+        .expect("subscribe");
+    let publisher = ChannelPublisher::new(name.clone(), PublishConfig::default());
+    const N: u64 = 8;
+    for i in 0..N {
+        node_a
+            .publish(&publisher, Bytes::from(format!("payload-{i}")))
+            .await
+            .expect("publish");
+    }
+
+    // Wait for ALL N events to land in the cache file (events
+    // flow through the spawned-per-event tokio task in the mesh
+    // hook; arrival can be staggered).
+    let runtime = redex_b.greedy_runtime().expect("runtime");
+    let synth = synthesize_cache_channel_name(name.hash());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut cache_file_opt = None;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(f) = runtime.cache_file(&synth) {
+            if f.next_seq() >= N {
+                cache_file_opt = Some(f);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let cache_file = cache_file_opt.expect("all N events must reach the cache");
+
+    let events = cache_file.read_range(0, N);
+    assert_eq!(
+        events.len() as u64,
+        N,
+        "cache file must contain every observed event"
+    );
+    // Greedy spawns one tokio task per inbound event so the
+    // hot path stays non-blocking; appends to the per-channel
+    // cache file race, so ordering at the cache may not match
+    // publish order. Operators needing strict order use
+    // replication. Verify every published payload is present —
+    // order-agnostic.
+    let observed: std::collections::HashSet<Vec<u8>> = events
+        .iter()
+        .map(|e| e.payload.as_ref().to_vec())
+        .collect();
+    for i in 0..N {
+        assert!(
+            observed.contains(&format!("payload-{i}").as_bytes().to_vec()),
+            "cache missing payload-{i}"
+        );
+    }
+
+    // Operator-facing read-path API. Two calls so the
+    // serve_count metric bumps twice.
+    let _first = redex_b.greedy_cache_for(&name).expect("cache hit");
+    let _second = redex_b.greedy_cache_for(&name).expect("cache hit");
+    let snap = runtime.metrics().snapshot();
+    let chan_metrics = snap
+        .channels
+        .iter()
+        .find(|c| c.channel == synth.as_str())
+        .expect("synth channel in snapshot");
+    assert!(
+        chan_metrics.serve_count_total >= 2,
+        "serve_count must bump on each greedy_cache_for hit; got {}",
+        chan_metrics.serve_count_total
+    );
+
+    // Cache miss returns None.
+    let miss = cn("dataforts/test/never-published");
+    assert!(redex_b.greedy_cache_for(&miss).is_none());
+
+    redex_b.disable_greedy_dataforts();
+}
+
 /// B enables greedy with a scope filter that the publisher's
 /// channel won't satisfy. The observer must reject every event,
 /// no cache files open, and the cluster's

@@ -266,6 +266,35 @@ impl Redex {
         // Wiring's Drop calls mesh.set_greedy_observer(None).
     }
 
+    /// Operator-facing read-path lookup: if greedy is holding a
+    /// cached copy of `channel`, return the cache's `RedexFile`
+    /// so the caller can `tail` / `read_range` against it.
+    ///
+    /// The cache file is keyed under a synthesized name
+    /// (`dataforts/greedy/<channel_hash_hex>`) per
+    /// [`super::super::dataforts::synthesize_cache_channel_name`];
+    /// callers pass the *real* channel name and this method does
+    /// the synthesis internally. On a cache hit, this also bumps
+    /// the read-recency LRU position and the
+    /// `dataforts_greedy_serve_count_total` metric — same shape
+    /// as the substrate's "served from cache" accounting.
+    ///
+    /// Returns `None` when greedy isn't enabled OR the channel
+    /// isn't in the cache. Callers fall back to whatever they
+    /// were doing before greedy (typically the substrate's own
+    /// `find_chain_holders` + network fetch).
+    #[cfg(feature = "dataforts-greedy")]
+    pub fn greedy_cache_for(
+        &self,
+        channel: &ChannelName,
+    ) -> Option<RedexFile> {
+        let runtime = self.greedy_runtime()?;
+        let synth = super::super::dataforts::synthesize_cache_channel_name(channel.hash());
+        let file = runtime.cache_file(&synth)?;
+        runtime.note_read(&synth);
+        Some(file)
+    }
+
     /// Cumulative count of per-channel replication runtimes currently
     /// registered on this manager. `0` when replication is not
     /// enabled. Exposed for tests + operator observability.
