@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use parking_lot::RwLock;
@@ -13,7 +14,9 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::super::channel::ChannelName;
-use super::super::redex::{Redex, RedexError, RedexEvent, RedexFile, RedexFileConfig, RedexFold};
+use super::super::redex::{
+    Redex, RedexError, RedexEvent, RedexFile, RedexFileConfig, RedexFold, WriteToken,
+};
 use super::config::{CortexAdapterConfig, FoldErrorPolicy, StartPosition};
 use super::envelope::IntoRedexPayload;
 use super::error::CortexAdapterError;
@@ -328,7 +331,73 @@ impl<State> CortexAdapter<State> {
         buf.extend_from_slice(&tail);
         Ok(self.inner.file.append(&buf)?)
     }
+
+    /// Append an envelope and return a [`WriteToken`] addressing
+    /// the resulting write. The token is the typed handle the
+    /// read-your-writes API consumes via
+    /// [`Self::wait_for_token`]; equivalent to calling [`Self::ingest`]
+    /// and pairing the returned seq with the envelope's
+    /// `meta.origin_hash`, but does both in one shot so the binding
+    /// surface can round-trip a single value.
+    pub fn ingest_with_token<E: IntoRedexPayload>(
+        &self,
+        envelope: E,
+    ) -> Result<WriteToken, CortexAdapterError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(CortexAdapterError::Closed);
+        }
+        let (meta, tail) = envelope.into_redex_payload();
+        let origin_hash = meta.origin_hash;
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + tail.len());
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&tail);
+        let seq = self.inner.file.append(&buf)?;
+        Ok(WriteToken::new(origin_hash, seq))
+    }
+
+    /// Block until the fold task has processed every event up
+    /// through `token.seq`, or `deadline` elapses. Returns
+    /// `Err(WaitForTokenError::Timeout)` on deadline; `Ok(())`
+    /// once the watermark catches up (or the fold task stops —
+    /// see [`Self::wait_for_seq`] for the same caveat).
+    ///
+    /// The token's `origin_hash` is informational at this layer
+    /// — the generic [`CortexAdapter`] folds every event in its
+    /// RedEX file regardless of origin. Origin-bound adapters
+    /// (e.g. [`super::tasks::TasksAdapter`],
+    /// [`super::memories::MemoriesAdapter`]) layer their own
+    /// origin assertion on top.
+    pub async fn wait_for_token(
+        &self,
+        token: WriteToken,
+        deadline: Duration,
+    ) -> Result<(), WaitForTokenError> {
+        match tokio::time::timeout(deadline, self.wait_for_seq(token.seq)).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(WaitForTokenError::Timeout),
+        }
+    }
 }
+
+/// Errors surfaced by [`CortexAdapter::wait_for_token`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum WaitForTokenError {
+    /// Deadline elapsed before the fold watermark advanced to
+    /// the token's seq. The write may still land later; the
+    /// caller can retry with a fresh deadline or accept the
+    /// stale read.
+    Timeout,
+}
+
+impl std::fmt::Display for WaitForTokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("read-your-writes wait timed out"),
+        }
+    }
+}
+
+impl std::error::Error for WaitForTokenError {}
 
 impl<State: Send + Sync + 'static> CortexAdapter<State> {
     /// Open an adapter against a RedEX file.
@@ -862,6 +931,52 @@ mod tests {
         assert_eq!(*adapter.state().read(), 10);
         assert_eq!(adapter.fold_errors(), 0);
         assert!(adapter.is_running());
+    }
+
+    #[tokio::test]
+    async fn ingest_with_token_carries_envelope_origin_and_assigned_seq() {
+        let redex = Redex::new();
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/ryw-token"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+
+        let origin: u64 = 0xCAFE_F00D_DEAD_BEEF;
+        let meta = EventMeta::new(1, 0, origin, 0, 0);
+        let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+        let token = adapter.ingest_with_token(env).unwrap();
+
+        assert_eq!(token.origin_hash, origin);
+        assert_eq!(token.seq, 0);
+
+        adapter.wait_for_token(token, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(*adapter.state().read(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_token_times_out_when_seq_never_lands() {
+        let redex = Redex::new();
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/ryw-timeout"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+
+        let unreachable = WriteToken::new(0xDEAD_BEEF, 999);
+        let err = adapter
+            .wait_for_token(unreachable, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(err, WaitForTokenError::Timeout);
     }
 
     #[tokio::test]

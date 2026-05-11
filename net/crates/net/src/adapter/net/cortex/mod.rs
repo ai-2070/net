@@ -31,7 +31,7 @@ pub mod memories;
 #[cfg(feature = "cortex")]
 pub mod tasks;
 
-pub use adapter::{ChangeEvent, CortexAdapter};
+pub use adapter::{ChangeEvent, CortexAdapter, WaitForTokenError};
 pub use config::{CortexAdapterConfig, FoldErrorPolicy, StartPosition};
 pub use envelope::{EventEnvelope, IntoRedexPayload};
 pub use error::CortexAdapterError;
