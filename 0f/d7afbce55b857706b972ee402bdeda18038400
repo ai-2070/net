@@ -1,0 +1,23 @@
+net/crates/net/bindings/node/src/lib.rs
+  s_4dbb97ea6ebffd::t_d9c8e2147c0d80 16-17
+net/crates/net/bindings/node/src/blob.rs
+  s_4dbb97ea6ebffd::t_b229fc2b7353ab 1-102,107,116-125,137-195
+  s_4dbb97ea6ebffd::t_3aac485624555c 103-106,108-115
+  s_4dbb97ea6ebffd::t_5efa3efe3788ae 126-136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "0fd7afbce55b857706b972ee402bdeda18038400",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
