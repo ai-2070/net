@@ -1,0 +1,25 @@
+net/crates/net/bindings/go/net/tasks.go
+  s_3a0a24a47d1a36::t_19f121bcd3a072 239,248-253
+  s_3a0a24a47d1a36::t_f66181679af662 1-238,240-247,254-672
+net/crates/net/bindings/go/net/memories.go
+  s_3a0a24a47d1a36::t_0bde5db73b6300 1-203,205-212,219-563
+  s_3a0a24a47d1a36::t_96e23672e6cc40 204,213-218
+net/crates/net/bindings/go/net/redex.go
+  s_3a0a24a47d1a36::t_fae53fb284f5d1 196-208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "b904aecf63fceb480738cda78ade1ac73c423a98",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
