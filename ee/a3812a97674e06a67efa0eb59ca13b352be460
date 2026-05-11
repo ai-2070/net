@@ -1,0 +1,28 @@
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  s_4dbb97ea6ebffd::t_eb131a4c7b51b6 208
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  s_4dbb97ea6ebffd::t_2437cd181707e4 134-173
+  s_4dbb97ea6ebffd::t_0c350707c3e09a 1149-1195
+  s_4dbb97ea6ebffd::t_cdb3f05f204fde 638
+  s_4dbb97ea6ebffd::t_0e1581c034af98 425-431,434-469,472-480
+net/crates/net/src/adapter/net/cortex/mod.rs
+  s_4dbb97ea6ebffd::t_ac5711705ef7e1 34
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  s_4dbb97ea6ebffd::t_0f35504630f353 245
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "eea3812a97674e06a67efa0eb59ca13b352be460",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
