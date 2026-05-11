@@ -126,11 +126,11 @@ struct AdapterInner<State> {
     /// fold apply. Subscribers: see [`CortexAdapter::changes`].
     changes_tx: broadcast::Sender<u64>,
     /// Per-adapter cap on concurrent `wait_for_token` callers. `None`
-    /// when `CortexAdapterConfig::ryw_wait_queue_cap == 0` (unbounded).
-    /// Otherwise sized to `ryw_wait_queue_cap` permits; each pending
+    /// when `CortexAdapterConfig::ryw_inflight_cap == 0` (unbounded).
+    /// Otherwise sized to `ryw_inflight_cap` permits; each pending
     /// wait holds one permit for its duration. Exceeding the cap
     /// returns `WaitForTokenError::QueueFull` immediately.
-    ryw_wait_queue: Option<Arc<Semaphore>>,
+    ryw_inflight: Option<Arc<Semaphore>>,
     /// Per-adapter RYW counters. See [`RywMetricsSnapshot`].
     ryw_metrics: RywMetricsAtomic,
 }
@@ -458,7 +458,7 @@ impl<State> CortexAdapter<State> {
         // Try-acquire FIRST so backpressure surfaces before the timer
         // arms — under saturation a `QueueFull` is the correct
         // diagnostic, not a `Timeout` masking it.
-        let _permit = match &self.inner.ryw_wait_queue {
+        let _permit = match &self.inner.ryw_inflight {
             Some(sem) => Some(sem.clone().try_acquire_owned().map_err(|_| {
                 self.inner
                     .ryw_metrics
@@ -546,10 +546,10 @@ pub enum WaitForTokenError {
         /// origin this adapter is bound to.
         adapter_origin: u64,
     },
-    /// Per-channel wait-queue cap is saturated — back-pressure for
+    /// Per-channel in-flight cap is saturated — back-pressure for
     /// callers who can shed load instead of stacking unbounded
     /// pending waits. See
-    /// [`super::config::CortexAdapterConfig::with_ryw_wait_queue_cap`].
+    /// [`super::config::CortexAdapterConfig::with_ryw_inflight_cap`].
     QueueFull,
     /// Fold task stopped before the token's seq was reached.
     /// Under `FoldErrorPolicy::Stop` an unrecoverable fold error
@@ -677,10 +677,10 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             start_seq - 1
         };
         let (changes_tx, _) = broadcast::channel(CHANGES_BROADCAST_CAP);
-        let ryw_wait_queue = if adapter_config.ryw_wait_queue_cap == 0 {
+        let ryw_inflight = if adapter_config.ryw_inflight_cap == 0 {
             None
         } else {
-            Some(Arc::new(Semaphore::new(adapter_config.ryw_wait_queue_cap)))
+            Some(Arc::new(Semaphore::new(adapter_config.ryw_inflight_cap)))
         };
         let inner = Arc::new(AdapterInner {
             file: file.clone(),
@@ -699,7 +699,7 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             notify: Notify::new(),
             shutdown: Notify::new(),
             changes_tx,
-            ryw_wait_queue,
+            ryw_inflight,
             ryw_metrics: RywMetricsAtomic::default(),
         });
 
@@ -852,7 +852,7 @@ where
         let config = CortexAdapterConfig {
             start,
             on_fold_error: adapter_config.on_fold_error,
-            ryw_wait_queue_cap: adapter_config.ryw_wait_queue_cap,
+            ryw_inflight_cap: adapter_config.ryw_inflight_cap,
         };
         // Route through `open_unchecked` so the externally-
         // rehydrated state can skip its event prefix.
@@ -1167,7 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_token_returns_queue_full_above_cap() {
         let redex = Redex::new();
-        let cfg = CortexAdapterConfig::default().with_ryw_wait_queue_cap(2);
+        let cfg = CortexAdapterConfig::default().with_ryw_inflight_cap(2);
         let adapter = Arc::new(
             CortexAdapter::<u64>::open(
                 &redex,
@@ -1212,7 +1212,7 @@ mod tests {
     #[tokio::test]
     async fn ryw_metrics_track_waits_timeouts_and_queue_full() {
         let redex = Redex::new();
-        let cfg = CortexAdapterConfig::default().with_ryw_wait_queue_cap(1);
+        let cfg = CortexAdapterConfig::default().with_ryw_inflight_cap(1);
         let adapter = Arc::new(
             CortexAdapter::<u64>::open(
                 &redex,
@@ -1260,7 +1260,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_token_with_zero_cap_skips_queue_check() {
         let redex = Redex::new();
-        let cfg = CortexAdapterConfig::default().with_ryw_wait_queue_cap(0);
+        let cfg = CortexAdapterConfig::default().with_ryw_inflight_cap(0);
         let adapter = CortexAdapter::<u64>::open(
             &redex,
             &cn("cortex/ryw-uncapped"),

@@ -908,6 +908,20 @@ impl<'a> ThreadLocalPooledBuilder<'a> {
             .set_channel_hash(channel_hash);
     }
 
+    /// Set the origin hash on the underlying builder so the next
+    /// `build*` call stamps it on the outgoing packet header.
+    /// Used by the publish path to thread the publisher's chain
+    /// identity onto the wire — receivers route per-chain logic
+    /// (greedy cache, gravity heat counters) against this value
+    /// rather than the protocol-default zero.
+    #[inline]
+    pub fn set_origin_hash(&mut self, origin_hash: u64) {
+        self.builder
+            .as_mut()
+            .expect("BUG: PooledBuilder used after drop")
+            .set_origin_hash(origin_hash);
+    }
+
     /// Check if events would fit in a single packet
     #[inline]
     pub fn would_fit(&self, events: &[Bytes]) -> bool {

@@ -37,7 +37,17 @@ pub enum FoldErrorPolicy {
 /// wait_for_token callers — exceeding the cap returns
 /// `WaitForTokenError::QueueFull` immediately so the caller can
 /// shed load.
-pub const RYW_WAIT_QUEUE_CAP_DEFAULT: usize = 1024;
+///
+/// **Naming note.** The cap is a *permit count*, not a FIFO queue.
+/// The underlying primitive is a `tokio::sync::Semaphore` with
+/// `try_acquire_owned`: callers compete for permits, and whoever
+/// the runtime schedules first wins. There is no fairness
+/// guarantee; "queue" in the operator-facing config field name
+/// refers to "things in flight," not to FIFO ordering. True
+/// FIFO would require switching to blocking acquire, which
+/// changes `QueueFull` from "rejected" to "blocked indefinitely"
+/// and is out of scope.
+pub const RYW_INFLIGHT_CAP_DEFAULT: usize = 1024;
 
 /// One-shot configuration for a [`super::CortexAdapter`] instance.
 #[derive(Debug, Clone, Copy)]
@@ -46,9 +56,12 @@ pub struct CortexAdapterConfig {
     pub start: StartPosition,
     /// What to do on fold error.
     pub on_fold_error: FoldErrorPolicy,
-    /// Per-channel cap on concurrent `wait_for_token` calls. Defaults
-    /// to [`RYW_WAIT_QUEUE_CAP_DEFAULT`].
-    pub ryw_wait_queue_cap: usize,
+    /// Per-channel cap on concurrent `wait_for_token` permits.
+    /// Defaults to [`RYW_INFLIGHT_CAP_DEFAULT`]. Past this many
+    /// in-flight waits, new callers get
+    /// `WaitForTokenError::QueueFull`. See the type-level docs
+    /// for the naming note: this is a permit count, not a FIFO.
+    pub ryw_inflight_cap: usize,
 }
 
 impl Default for CortexAdapterConfig {
@@ -56,7 +69,7 @@ impl Default for CortexAdapterConfig {
         Self {
             start: StartPosition::FromBeginning,
             on_fold_error: FoldErrorPolicy::Stop,
-            ryw_wait_queue_cap: RYW_WAIT_QUEUE_CAP_DEFAULT,
+            ryw_inflight_cap: RYW_INFLIGHT_CAP_DEFAULT,
         }
     }
 }
@@ -79,11 +92,11 @@ impl CortexAdapterConfig {
         self
     }
 
-    /// Set the per-channel cap on concurrent `wait_for_token` calls.
-    /// Zero disables the cap (unbounded queue — use only when the
-    /// caller already bounds in-flight RYW waits elsewhere).
-    pub fn with_ryw_wait_queue_cap(mut self, cap: usize) -> Self {
-        self.ryw_wait_queue_cap = cap;
+    /// Set the per-channel cap on concurrent `wait_for_token`
+    /// permits. Zero disables the cap (unbounded — use only when
+    /// the caller already bounds in-flight RYW waits elsewhere).
+    pub fn with_ryw_inflight_cap(mut self, cap: usize) -> Self {
+        self.ryw_inflight_cap = cap;
         self
     }
 }

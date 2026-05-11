@@ -3764,12 +3764,24 @@ impl MeshNode {
         > = if greedy.is_some() {
             let origin_hash: u64 = parsed.header.origin_hash.into();
             let hex = Self::chain_hex(origin_hash);
-            // Pick any node that advertises `causal:<hex>` — every
-            // holder has the same chain-level caps. The capability
-            // index doesn't return per-chain caps, only per-node;
-            // we trust holders to have a consistent view of the
-            // chain's tags because the chain's caps are immutable
-            // post-creation.
+            // Preferred path: pick any node that advertises
+            // `causal:<hex>` — every holder of the chain shares the
+            // chain-level caps. This is the traveling-with-chain
+            // signal that's robust under multi-hop relay: the
+            // publisher's announce_chain emits `causal:<hex>` into
+            // its CapabilitySet, and the index carries that across
+            // hops. Without this lookup, a relayed event evaluates
+            // against the relay's last-hop caps, silently inverting
+            // scope/intent admission.
+            //
+            // Fallback: until the publisher has emitted a
+            // `causal:<hex>` announcement (or in deployments that
+            // don't run announce_chain), use the last-hop peer's
+            // caps. For a direct A→B path that IS the publisher;
+            // for a multi-hop path the relay's caps are a
+            // best-effort proxy until the chain announcement
+            // propagates. Final fallback: empty caps (fail-closed
+            // for scope-axis admission).
             let publisher_caps = ctx
                 .capability_index
                 .all_nodes()
@@ -3782,7 +3794,12 @@ impl MeshNode {
                         None
                     }
                 });
-            std::sync::Arc::new(publisher_caps.unwrap_or_default())
+            let chain_caps = publisher_caps.or_else(|| {
+                let peer_addr = session.peer_addr();
+                let from_node = ctx.addr_to_node.get(&peer_addr).map(|r| *r);
+                from_node.and_then(|nid| ctx.capability_index.get(nid))
+            });
+            std::sync::Arc::new(chain_caps.unwrap_or_default())
         } else {
             std::sync::Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default())
         };
@@ -6065,6 +6082,15 @@ impl MeshNode {
         // shard-inbound queue still gets the event when no per-
         // channel dispatcher is registered).
         builder.set_channel_hash(channel_hash);
+        // Stamp our identity's origin_hash so the receiver can
+        // route per-chain logic (greedy cache, gravity heat
+        // counters, RYW tokens) against a real chain identifier
+        // rather than the protocol-level default of zero. The
+        // packet header carries a `u32` view of the `u64` keypair
+        // origin_hash; routing-hash collisions in the lower 32
+        // bits are benign for the chain-routing use case (the
+        // receiver compares full hashes when it matters).
+        builder.set_origin_hash(self.identity.entity_id().origin_hash());
         // Match the rest of the sender call sites
         // (`send_to_peer:3661`, `send_to_peer:3685`, `send_routed:3755`,
         // `send_routed:3785`, `send_on_stream:6110`, `mod.rs:1016, 1063`):
