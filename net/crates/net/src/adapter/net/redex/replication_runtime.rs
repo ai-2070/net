@@ -799,26 +799,50 @@ async fn on_inbound(
             use super::replication::SyncNackError;
             match msg.error_code {
                 SyncNackError::NotLeader => {
+                    // R-4: actually clear the believed leader so
+                    // the next tick re-resolves via the heartbeat
+                    // cycle instead of looping on the stale leader
+                    // belief until 3 missed heartbeats trip.
+                    tracker.lock().clear_believed_leader();
                     tracing::trace!(
                         from = from,
-                        "replication: NACK NotLeader — clearing believed leader"
+                        "replication: NACK NotLeader — cleared believed leader"
                     );
-                    // Heartbeat cycle re-discovers leader on next
-                    // round; we just clear the cached belief.
-                    // (Tracker is owned by the runtime task's
-                    // outer scope; this would clear if we had
-                    // a handle here. Plumb through later slice.)
                 }
                 SyncNackError::BadRange => {
-                    // Skip-ahead path — would advance the local
-                    // tail to the leader's first available. The
-                    // file_provider doesn't yet expose a "skip"
-                    // method; flag the metric and defer.
+                    // R-4: skip-ahead path — the leader's retention
+                    // trimmed past our local tail. The NACK carries
+                    // `since_seq` (what the replica requested) but
+                    // not the leader's actual first retained seq,
+                    // so the cleanest recovery is: clear our local
+                    // tail so the next SyncRequest re-issues from
+                    // 0; the leader's response will then carry
+                    // first_seq > 0 and the replica skips through
+                    // the GapBeforeChunk path. Bump the metric so
+                    // operators can see the retention-skew
+                    // recovery happening.
                     coordinator.metrics().incr_skip_ahead();
-                    tracing::trace!(
-                        from = from,
-                        "replication: NACK BadRange — skip-ahead recorded"
-                    );
+                    // The cleanest "trim local tail" we can do
+                    // without knowing the leader's first available
+                    // seq is `skip_to(msg.since_seq + 1)` — the
+                    // replica had asked for `since_seq` so anything
+                    // <= since_seq is gone on the leader. Bumping
+                    // local next_seq forward forces the next
+                    // SyncRequest to ask above the bad range.
+                    // On persistent files skip_to is unsupported;
+                    // fall back to the heartbeat-cycle retry.
+                    match inputs.file.skip_to(msg.since_seq.saturating_add(1)) {
+                        Ok(()) => tracing::warn!(
+                            from = from,
+                            since_seq = msg.since_seq,
+                            "replication: NACK BadRange — local tail skipped past trimmed range"
+                        ),
+                        Err(e) => tracing::trace!(
+                            from = from,
+                            error = %e,
+                            "replication: NACK BadRange — skip_to rejected, falling back to heartbeat retry"
+                        ),
+                    }
                 }
                 SyncNackError::Backpressure => {
                     tracing::trace!(
@@ -1677,6 +1701,119 @@ mod tests {
         assert!(
             dispatcher.sync_responses.lock().is_empty(),
             "no SyncResponse on wrong-channel"
+        );
+    }
+
+    /// R-4 regression: SyncNack NotLeader must actively clear
+    /// the believed leader so the next tick re-resolves.
+    /// Without the fix the replica loops sending SyncRequests
+    /// to the same stale leader until 3 missed heartbeats trip.
+    #[tokio::test]
+    async fn sync_nack_notleader_clears_believed_leader() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let budget = build_budget();
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        // Seed the tracker with a believed leader heartbeat.
+        tracker.lock().record_heartbeat(
+            0x20,
+            ReplicaRole::Leader,
+            99,
+            Instant::now(),
+        );
+        assert_eq!(tracker.lock().believed_leader(), Some(0x20));
+        // NACK NotLeader from the believed leader.
+        let event = Inbound::SyncNack {
+            from: 0x20,
+            msg: SyncNack {
+                channel_id: cid,
+                since_seq: 0,
+                error_code: super::super::replication::SyncNackError::NotLeader,
+                detail: String::new(),
+            },
+        };
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &tracker,
+            &budget,
+            event,
+        )
+        .await;
+        assert!(
+            tracker.lock().believed_leader().is_none(),
+            "NACK NotLeader must clear the cached believed leader"
+        );
+    }
+
+    /// R-4 regression: SyncNack BadRange skips the local tail
+    /// past the rejected `since_seq` so the next SyncRequest
+    /// re-issues against a range the leader has retained.
+    /// Without the fix the replica re-issues the same range
+    /// indefinitely.
+    #[tokio::test]
+    async fn sync_nack_badrange_skips_local_tail() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let budget = build_budget();
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+
+        // Local file is empty (next_seq = 0). NACK with since_seq=42
+        // means "the leader trimmed up to 42; you asked for 42 but
+        // it's gone." Local tail must advance to 43.
+        let baseline_next = inputs.file.next_seq();
+        let event = Inbound::SyncNack {
+            from: 0x20,
+            msg: SyncNack {
+                channel_id: cid,
+                since_seq: 42,
+                error_code: super::super::replication::SyncNackError::BadRange,
+                detail: String::new(),
+            },
+        };
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &tracker,
+            &budget,
+            event,
+        )
+        .await;
+        // The local file's next_seq advanced past the bad range
+        // (or, on persistent files, fell back to retry). For a
+        // heap-only file in this test, skip_to(43) succeeded.
+        let after = inputs.file.next_seq();
+        assert!(
+            after > baseline_next,
+            "BadRange must advance local next_seq (got {after}, baseline {baseline_next})"
+        );
+        // skip_ahead metric advanced.
+        assert_eq!(
+            coordinator
+                .metrics()
+                .skip_ahead_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
     }
 

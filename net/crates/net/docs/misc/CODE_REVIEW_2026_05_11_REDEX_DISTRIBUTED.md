@@ -26,7 +26,7 @@ Tagged `[H | M | L]`:
 | R-1   | H   | runtime     | Role-flip TOCTOU between `coordinator.role()` check and catchup dispatch  | ✅ |
 | R-2   | H   | runtime     | `clear_believed_leader` runs after failed Candidate transition            | ✅ |
 | R-3   | H   | coordinator | Chain-tag side effects not serialized between concurrent transitions     | ✅ |
-| R-4   | H   | runtime     | NACK `NotLeader` / `BadRange` handlers are placeholder TODOs              | ⚪ |
+| R-4   | H   | runtime     | NACK `NotLeader` / `BadRange` handlers are placeholder TODOs              | ✅ |
 | R-5   | H   | wire        | Replica cannot disambiguate retention-trim from split-brain divergence    | ⚪ |
 | R-6   | H   | py binding  | `replication=False` silently drops every other `replication_*` kwarg     | ⚪ |
 | R-7   | H   | bindings    | `enable_replication` silently absent without `net` feature                | ⚪ |
