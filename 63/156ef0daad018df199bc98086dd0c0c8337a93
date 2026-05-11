@@ -1,0 +1,24 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_REDEX_DISTRIBUTED.md
+  s_d760092f02a89c::t_6543fe251f7b70 70-73
+net/crates/net/tests/redex_replication_dst.rs
+  s_d760092f02a89c::t_9af950cb57af5d 1020-1021,1029-1035,1037,1042,1048-1050,1059,1062-1063,1079-1085,1089,1092-1103
+  s_d760092f02a89c::t_8006b7f25b2f64 1018-1019,1022-1028,1036,1038-1041,1043-1047,1051-1058,1060-1061,1064-1070,1086-1088,1090-1091,1104-1108,1114-1123,1128-1131,1133,1135-1136,1139-1143,1145,1147-1153,1156-1158,1160-1161,1164-1228
+  s_d760092f02a89c::t_e4b96c383db861 1071-1078
+  s_d760092f02a89c::t_b55b9a5b502ee5 1109-1113,1124-1127,1132,1134,1137-1138,1144,1146,1154-1155,1159,1162-1163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "63156ef0daad018df199bc98086dd0c0c8337a93",
+  "prompts": {},
+  "sessions": {
+    "s_d760092f02a89c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ef8b8023-dce0-4b44-bfb8-b07c462d6685",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
