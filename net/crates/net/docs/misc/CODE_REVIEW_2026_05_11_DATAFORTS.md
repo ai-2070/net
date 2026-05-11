@@ -37,7 +37,7 @@ Tagged `[B | H | M | L]`:
 | D-3   | B   | greedy       | `cache.upsert` does not subtract old `bytes` on reopen → `total_bytes` drift | ✅ |
 | D-4   | B   | python blob  | `PyBlobAdapter::drive_if_coroutine` builds a fresh `asyncio.run` event loop  | ✅ |
 | D-5   | H   | greedy       | `chain_caps` resolves last-hop peer, not chain publisher                   | ✅ |
-| D-6   | H   | greedy       | TOCTOU on `is_new_channel` → duplicate file open / announce_chain          | ⏳ |
+| D-6   | H   | greedy       | TOCTOU on `is_new_channel` → duplicate file open / announce_chain          | ✅ |
 | D-7   | H   | greedy       | Unbounded `tokio::spawn` per inbound event                                 | ⏳ |
 | D-8   | H   | greedy       | `colocation_target_held` hard-coded to `None`                              | ⏳ |
 | D-9   | H   | gravity      | Default `origin_hash == 0` collapses per-chain heat into single bucket     | ⏳ |

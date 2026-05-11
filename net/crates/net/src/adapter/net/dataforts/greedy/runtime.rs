@@ -483,12 +483,18 @@ impl GreedyRuntime {
         }
 
         // 3. Lazy admission — open a per-channel cache file if we
-        //    don't have one yet, then append.
-        let is_new_channel = !self.inner.cache.lock().contains(channel);
-        if is_new_channel {
+        //    don't have one yet, then append. Two concurrent
+        //    dispatch_event calls for the same new channel must
+        //    not both `upsert` (the second would orphan the first
+        //    file handle and announce the chain twice). We
+        //    double-check the cache after opening the file: only
+        //    the first caller's `upsert` lands; subsequent callers
+        //    drop their just-opened file on the floor.
+        let is_new_channel_outer = !self.inner.cache.lock().contains(channel);
+        let (file, is_new_channel) = if is_new_channel_outer {
             let cfg = RedexFileConfig::default()
                 .with_retention_max_bytes(self.inner.config.per_channel_cap_bytes);
-            let file = match self.inner.redex.open_file(channel, cfg) {
+            let opened = match self.inner.redex.open_file(channel, cfg) {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::trace!(
@@ -499,20 +505,36 @@ impl GreedyRuntime {
                     return DispatchOutcome::AppendFailed;
                 }
             };
+            // Double-checked insert: another dispatch_event may
+            // have raced past the outer contains() check, opened
+            // its own file, and won. Re-check under the lock and
+            // only upsert if the channel is still absent. The
+            // loser's opened file drops here; harmless (RedexFile
+            // is Arc internally and reopening is idempotent).
             let mut cache = self.inner.cache.lock();
-            cache.upsert(channel.clone(), file, now);
-            cache.set_origin_hash(channel, origin_hash);
-        }
-
-        // Read the file handle out of the registry under the lock,
-        // then drop the lock before the append (which takes the
-        // file's own lock — never hold two locks across an I/O).
-        let file_for_append = {
+            if cache.contains(channel) {
+                let file = cache
+                    .get(channel)
+                    .map(|e| e.file.clone())
+                    .expect("just checked contains");
+                drop(cache);
+                (file, false)
+            } else {
+                cache.upsert(channel.clone(), opened.clone(), now);
+                cache.set_origin_hash(channel, origin_hash);
+                drop(cache);
+                (opened, true)
+            }
+        } else {
+            // Channel present on outer check; read the handle out.
             let cache = self.inner.cache.lock();
-            cache.get(channel).map(|e| e.file.clone())
-        };
-        let Some(file) = file_for_append else {
-            return DispatchOutcome::AppendFailed;
+            let Some(file) = cache.get(channel).map(|e| e.file.clone()) else {
+                // Raced with an evict between outer contains() and
+                // here; treat as a transient miss.
+                return DispatchOutcome::AppendFailed;
+            };
+            drop(cache);
+            (file, false)
         };
 
         if let Err(e) = file.append(payload) {
@@ -893,6 +915,47 @@ mod tests {
             heat_sink.announces.lock().len(),
             1,
             "second tick must suppress when rate is unchanged"
+        );
+    }
+
+    /// Two concurrent dispatch_event calls for the same new
+    /// channel must converge on one announce — without the
+    /// double-checked insert, both callers see is_new_channel=true
+    /// (separate contains() lock acquisitions) and both call
+    /// announce_chain, leaving one orphaned RedexFile in the
+    /// process.
+    #[tokio::test]
+    async fn concurrent_new_channel_dispatch_announces_once() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, sink) = build_runtime(cfg);
+        let chain = chain_caps_with_scope("any");
+        let chain = Arc::new(chain);
+
+        // Fire N concurrent dispatch_event calls against the same
+        // brand-new channel and wait for them all to finish.
+        let n = 8usize;
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let rt = rt.clone();
+            let chain = chain.clone();
+            handles.push(tokio::spawn(async move {
+                let payload = vec![b'x'; 4];
+                rt.dispatch_event(&cn("test/race"), 0xDEAD, &chain, &payload)
+                    .await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Exactly one announce — every concurrent caller after the
+        // first must see the channel already present.
+        let announces = sink.announces.lock().clone();
+        assert_eq!(
+            announces.len(),
+            1,
+            "concurrent dispatch must produce one announce, got {announces:?}"
         );
     }
 
