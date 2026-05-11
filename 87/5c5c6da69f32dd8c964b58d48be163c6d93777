@@ -1,0 +1,28 @@
+net/crates/net/src/adapter/net/redex/file.rs
+  s_3a0a24a47d1a36::t_79ea6655afecf3 354-369
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_5a155ee322bdf2 71
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_3a0a24a47d1a36::t_44e333e33cc39c 297-308
+  s_3a0a24a47d1a36::t_773ce43c0e7126 527-539,544-565,578-582,585-586,588-591
+net/crates/net/src/adapter/net/dataforts/greedy/cache.rs
+  s_3a0a24a47d1a36::t_d12c7e65ed6aca 581-582,586-588,590-591,593-605,610-613,617-622
+  s_3a0a24a47d1a36::t_65663c9abfb60d 583-585,589,592,606-609,614-616
+  s_3a0a24a47d1a36::t_df9c572caa4584 162-184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "875c5c6da69f32dd8c964b58d48be163c6d93777",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
