@@ -109,6 +109,13 @@ impl HeatCounter {
     pub fn half_life(&self) -> Duration {
         self.half_life
     }
+
+    /// Last `Instant` the rate was updated (via `bump` or
+    /// `decay_to`). Used by the registry's LRU eviction to pick
+    /// the least-recently-touched counter under cap pressure.
+    pub fn last_update(&self) -> Instant {
+        self.last_update
+    }
 }
 
 /// Outcome of one runtime tick over a channel's heat counter.
@@ -128,6 +135,13 @@ pub enum HeatEmission {
     Withdraw,
 }
 
+/// Default cap on tracked heat counters. Sized to comfortably
+/// hold a busy node's working set without growing unboundedly
+/// under churn (each counter is ~48 bytes + hashmap overhead,
+/// so 8K entries fit in <1 MiB). Operators with workloads beyond
+/// this raise via [`HeatRegistry::with_cap`].
+pub const DEFAULT_HEAT_REGISTRY_CAP: usize = 8 * 1024;
+
 /// Cluster-wide heat registry. Keyed by `u64` origin_hash — the
 /// same chain identifier the substrate's `causal:<hex>` and
 /// `heat:<hex>=<rate>` reserved tags carry on the wire.
@@ -137,15 +151,49 @@ pub enum HeatEmission {
 /// cost is dominated by the decay arithmetic, which is two
 /// `as_secs_f64` + one `powf`. Acceptable for read paths today;
 /// if telemetry shows contention we can shard by channel-hash.
-#[derive(Debug, Default)]
+///
+/// The registry has an independent **cap + LRU-style replacement**
+/// so the entry count stays bounded even in deployments where
+/// the greedy cache (the usual eviction driver) isn't running, or
+/// is sized so generously that it never evicts. Past the cap, an
+/// `entry_mut` insert evicts the entry with the oldest
+/// `last_update` first. The cap defaults to
+/// [`DEFAULT_HEAT_REGISTRY_CAP`]; operators tune via
+/// [`HeatRegistry::with_cap`].
+#[derive(Debug)]
 pub struct HeatRegistry {
     counters: HashMap<u64, HeatCounter>,
+    cap: usize,
+}
+
+impl Default for HeatRegistry {
+    fn default() -> Self {
+        Self {
+            counters: HashMap::new(),
+            cap: DEFAULT_HEAT_REGISTRY_CAP,
+        }
+    }
 }
 
 impl HeatRegistry {
-    /// Empty registry.
+    /// Empty registry with the default cap.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Empty registry with an explicit cap. `cap == 0` disables
+    /// the bound (use only when an external loop guarantees
+    /// bounded entries — typically the greedy cache wiring).
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            counters: HashMap::new(),
+            cap,
+        }
+    }
+
+    /// Configured cap. `0` means unbounded.
+    pub fn cap(&self) -> usize {
+        self.cap
     }
 
     /// Number of tracked channels.
@@ -161,15 +209,40 @@ impl HeatRegistry {
     /// Get-or-create the counter for `channel`. Returns a
     /// mutable reference so the caller can `bump` / `decay_to`
     /// / `record_emission` in one borrow.
+    ///
+    /// When `len() == cap` and the inserted key is new, the entry
+    /// with the oldest `last_update` is evicted first (LRU-style
+    /// replacement). `cap == 0` disables the bound.
     pub fn entry_mut(
         &mut self,
         channel: u64,
         half_life: Duration,
         now: Instant,
     ) -> &mut HeatCounter {
+        if !self.counters.contains_key(&channel)
+            && self.cap > 0
+            && self.counters.len() >= self.cap
+        {
+            self.evict_lru();
+        }
         self.counters
             .entry(channel)
             .or_insert_with(|| HeatCounter::new(half_life, now))
+    }
+
+    /// Evict the counter whose `last_update` is oldest. O(n) over
+    /// tracked counters; runs at most once per `entry_mut` past
+    /// the cap, so amortized cost stays bounded under steady-state
+    /// churn. No-op when empty.
+    fn evict_lru(&mut self) {
+        let victim = self
+            .counters
+            .iter()
+            .min_by_key(|(_, c)| c.last_update())
+            .map(|(k, _)| *k);
+        if let Some(key) = victim {
+            self.counters.remove(&key);
+        }
     }
 
     /// Read-only access to the counter for `channel`.
@@ -196,6 +269,13 @@ impl HeatRegistry {
     /// Records the emission against the counter for `Emit` /
     /// `Withdraw` decisions before returning, so the next tick
     /// sees the updated `last_emitted` snapshot.
+    ///
+    /// After the per-counter pass, prunes entries whose rate has
+    /// fully decayed to zero AND have already emitted a
+    /// withdrawal — there's no future state transition possible
+    /// (any new bump would re-enter via `entry_mut`), so keeping
+    /// them around just bloats the map and slows subsequent
+    /// ticks.
     pub fn tick(
         &mut self,
         policy: &super::DataGravityPolicy,
@@ -220,6 +300,12 @@ impl HeatRegistry {
                 out.push((*channel, emission));
             }
         }
+        // Prune fully-decayed + already-withdrawn entries. A future
+        // bump for the same origin re-enters the registry via
+        // `entry_mut`; the LRU cap protects against unbounded
+        // re-entries.
+        self.counters
+            .retain(|_, c| !(c.rate == 0.0 && c.last_emitted == Some(0.0)));
         out
     }
 }
@@ -339,6 +425,69 @@ mod tests {
         let _ = r.entry_mut(channel(0xA), half, t0());
         r.remove(&channel(0xA));
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn entry_mut_at_cap_evicts_lru_on_new_insert() {
+        // Cap of 2; insert three distinct chains, each touched at
+        // a strictly-later Instant. The first chain is LRU at the
+        // moment of the third insert and must evict.
+        let base = t0();
+        let mut r = HeatRegistry::with_cap(2);
+        let half = Duration::from_secs(60);
+
+        let _ = r.entry_mut(channel(0xA), half, base);
+        let _ = r.entry_mut(channel(0xB), half, base + Duration::from_secs(1));
+        assert_eq!(r.len(), 2);
+        // Bumping B updates its last_update past A — making A the
+        // LRU. The third insert (C) evicts A.
+        let bumped = r.entry_mut(channel(0xB), half, base + Duration::from_secs(2));
+        bumped.bump(base + Duration::from_secs(2));
+        let _ = r.entry_mut(channel(0xC), half, base + Duration::from_secs(3));
+        assert_eq!(r.len(), 2);
+        assert!(r.get(&channel(0xA)).is_none(), "LRU entry A evicted");
+        assert!(r.get(&channel(0xB)).is_some());
+        assert!(r.get(&channel(0xC)).is_some());
+    }
+
+    #[test]
+    fn entry_mut_cap_zero_is_unbounded() {
+        let base = t0();
+        let mut r = HeatRegistry::with_cap(0);
+        let half = Duration::from_secs(60);
+        for i in 0..100u64 {
+            let _ = r.entry_mut(channel(i), half, base);
+        }
+        assert_eq!(r.len(), 100);
+    }
+
+    #[test]
+    fn tick_prunes_fully_decayed_withdrawn_entries() {
+        // After withdrawal + full decay, the entry is bookkeeping
+        // noise. tick prunes it so subsequent ticks stay O(active
+        // chains), not O(historical chains).
+        let base = t0();
+        let mut r = HeatRegistry::new();
+        let policy = super::super::DataGravityPolicy::default();
+        let half = policy.decay_half_life;
+
+        // Bump once, emit, then let the rate decay to zero and
+        // tick again to emit the withdrawal.
+        let counter = r.entry_mut(channel(0xA), half, base);
+        counter.bump(base);
+        let _ = r.tick(&policy, base);
+        assert_eq!(r.len(), 1);
+
+        // 100 half-lives → rate clamps to zero; next tick emits
+        // a withdrawal AND prunes the now-quiescent entry.
+        let later = base + half * 100;
+        let emissions = r.tick(&policy, later);
+        assert!(emissions
+            .iter()
+            .any(|(_, e)| matches!(e, HeatEmission::Withdraw)));
+        let after = r.tick(&policy, later + Duration::from_secs(1));
+        assert!(after.is_empty(), "no further emissions");
+        assert_eq!(r.len(), 0, "fully-decayed withdrawn entry pruned");
     }
 
     #[test]

@@ -227,9 +227,28 @@ pub fn blob_publish<'py>(
             PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id))
         })?;
     let rt = shared_runtime()?;
-    let data = data.to_vec();
+    // Defer the bytes copy past the GIL drop. Capture the raw
+    // pointer (as `usize` so the closure satisfies pyo3's `Ungil`
+    // bound; raw pointers aren't `Sync`) + length while the GIL
+    // is held (which keeps the caller's PyBytes / bytearray
+    // reference alive for the call); copy inside the detach
+    // scope so a multi-MB payload's memcpy doesn't stall the
+    // interpreter for the duration of the copy. SAFETY: caller's
+    // reference is alive for the entire function call so the
+    // underlying buffer doesn't move or get freed; the substrate's
+    // `publish_blob` takes `&[u8]` by borrow and doesn't smuggle
+    // the slice past its await.
+    let data_addr = data.as_ptr() as usize;
+    let data_len = data.len();
     let bytes = py
-        .detach(|| rt.block_on(async move { publish_blob(adapter.as_ref(), uri, &data).await }))
+        .detach(|| -> Result<Vec<u8>, InnerBlobError> {
+            let data_owned: Vec<u8> = unsafe {
+                std::slice::from_raw_parts(data_addr as *const u8, data_len).to_vec()
+            };
+            rt.block_on(async move {
+                publish_blob(adapter.as_ref(), uri, &data_owned).await
+            })
+        })
         .map_err(map_blob_err)?;
     Ok(PyBytes::new(py, &bytes))
 }
@@ -250,9 +269,22 @@ pub fn blob_resolve<'py>(
             PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id))
         })?;
     let rt = shared_runtime()?;
-    let payload = payload.to_vec();
+    // Same GIL-drop-before-memcpy trick as `blob_publish`. The
+    // payload is usually small (a wire-encoded BlobRef is ~70
+    // bytes for the typical S3-URI case), but inline payloads
+    // can be large, and the resolve path is on the hot read side
+    // of fan-out.
+    let payload_addr = payload.as_ptr() as usize;
+    let payload_len = payload.len();
     let bytes = py
-        .detach(|| rt.block_on(async move { resolve_payload(&payload, adapter.as_ref()).await }))
+        .detach(|| -> Result<Vec<u8>, InnerBlobError> {
+            let payload_owned: Vec<u8> = unsafe {
+                std::slice::from_raw_parts(payload_addr as *const u8, payload_len).to_vec()
+            };
+            rt.block_on(async move {
+                resolve_payload(&payload_owned, adapter.as_ref()).await
+            })
+        })
         .map_err(map_blob_err)?;
     Ok(PyBytes::new(py, &bytes))
 }

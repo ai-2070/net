@@ -140,6 +140,7 @@ impl BlobAdapter for FileSystemAdapter {
             });
         }
         let path = self.path_for(&blob_ref.hash);
+        let root = self.root.clone();
         let bytes = bytes.to_vec();
         let _permit = self
             .concurrency
@@ -151,6 +152,23 @@ impl BlobAdapter for FileSystemAdapter {
             let _permit = _permit; // hold across the blocking work
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(backend)?;
+                // Defend against shard-dir symlinks pointing outside
+                // `root`. Canonicalize both sides (resolves every
+                // symlink in the path) and reject if the parent
+                // isn't contained in the root. Without this check,
+                // an attacker who can pre-create `<root>/<shard>`
+                // as a symlink to `/tmp` (or anywhere) escapes the
+                // adapter's sandbox on every store — D-12's hash-
+                // verify defends *reads* from attacker bytes; this
+                // defends *writes* from escaping the root.
+                let parent_canon = std::fs::canonicalize(parent).map_err(backend)?;
+                let root_canon = std::fs::canonicalize(&root).map_err(backend)?;
+                if !parent_canon.starts_with(&root_canon) {
+                    return Err(BlobError::Backend(format!(
+                        "fs adapter: shard dir escapes root (parent={:?} root={:?})",
+                        parent_canon, root_canon,
+                    )));
+                }
             }
             // Write to a sibling temp then rename so a concurrent
             // fetch never observes a half-written file. The temp
@@ -477,6 +495,60 @@ mod tests {
         // Slot must NOT have been populated.
         assert!(!adapter.exists(&blob).await.unwrap());
         cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_rejects_shard_dir_symlink_escape() {
+        // Pre-create one shard directory as a symlink to a sibling
+        // location outside the adapter's root. Without the
+        // canonicalize-and-prefix-check in store(), the write
+        // would land at the symlink target. With the defense,
+        // store rejects with a Backend error before writing.
+        let root = unique_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = root.parent().unwrap().join(format!(
+            "outside-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Pick a payload whose hash starts with hex `ab` so we know
+        // the shard dir name. Compute hash first, then pre-symlink
+        // the matching shard inside root → outside.
+        let payload = b"escape-test";
+        let hash: [u8; 32] = blake3::hash(payload).into();
+        let shard = format!("{:02x}", hash[0]);
+        let shard_path = root.join(&shard);
+        // Create as a symlink rather than a directory.
+        std::os::unix::fs::symlink(&outside, &shard_path).unwrap();
+
+        let adapter = FileSystemAdapter::new("fs-symlink", &root);
+        let blob = BlobRef::new("file:///escape", hash, payload.len() as u64);
+        let err = adapter.store(&blob, payload).await.unwrap_err();
+        match err {
+            BlobError::Backend(msg) => assert!(
+                msg.contains("escapes root"),
+                "expected escape-root rejection; got {msg}"
+            ),
+            other => panic!("expected Backend(escapes root), got {:?}", other),
+        }
+        // Nothing was written under `outside`.
+        let outside_contents: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            outside_contents.is_empty(),
+            "adapter wrote outside its root: {:?}",
+            outside_contents
+        );
+        cleanup(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[tokio::test]
