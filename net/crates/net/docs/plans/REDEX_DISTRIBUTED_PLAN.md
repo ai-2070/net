@@ -4,13 +4,13 @@
 
 ## Status
 
-**Design locked; blocked on Capability Phase B (and partially F).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
+**Phase A landed; remaining phases blocked on Capability Phase B (and partially F).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
 
-Hard prerequisites:
+Hard prerequisites for the still-blocked phases:
 - **Capability Phase B** (tag-discovery primitives `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders`) — RedEX Phases C/D/E cannot start until this lands.
 - **Capability Phase F** (`PlacementFilter` + `IntentRegistry` + anti-affinity) — needed for *replica placement* in Phase C, but **not** for leader election. Election is decentralized and deterministic (nearest-RTT + NodeId tiebreak); see [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak).
 
-Phase A (wire protocol scaffold), Phase B (this plan's `ReplicationConfig` opt-in), Phases G–I can proceed in isolation as scaffolding.
+Phase A (wire protocol scaffold) ✅ landed. Phase B (this plan's `ReplicationConfig` opt-in), Phases G–I can proceed in isolation as scaffolding.
 
 Activation gate (when Warriors as a whole ships) is unchanged: a workload requesting durability guarantees beyond single-node. Realistic triggers: payment-tier customer, compliance-bound data class, pilot whose RTO is "< 5 s on node failure."
 
@@ -419,13 +419,16 @@ Per-channel metrics on the existing `RpcMetricsRegistry` shape (recently extende
 
 The 4-9 week range comes from DST depth. Sequence:
 
-### Phase A — Wire protocol scaffold (1 week)
+### Phase A — Wire protocol scaffold (1 week) ✅
 
-Implementable in isolation; does not depend on Capability B/F.
+Implementable in isolation; does not depend on Capability B/F. **Landed.**
 
-- Add `SUBPROTOCOL_REDEX` ID claim in `SUBPROTOCOLS.md` and `behavior::subprotocol`.
-- Add the four `DISPATCH_REPLICA_SYNC` codes (0x20..0x23) per [§2](#2-wire-protocol--subprotocol_redex). Encode/decode each message at the byte layouts pinned there.
-- Round-trip tests for each message shape; pin the exact byte layout (fixed-size messages assert byte-count constants; variable-size messages assert layout under a property test).
+- ✅ `SUBPROTOCOL_REDEX = 0x0E00` claimed in `SUBPROTOCOLS.md` and exposed via `adapter::net::redex::replication`.
+- ✅ Four `DISPATCH_REPLICA_SYNC` codes (`0x20` `SyncRequest`, `0x21` `SyncResponse`, `0x22` `SyncHeartbeat`, `0x23` `SyncNack`) implemented per [§2](#2-wire-protocol--subprotocol_redex). Reserved range `0x24..=0x2F` documented.
+- ✅ `ChannelId` newtype — 32-byte BLAKE2s of the channel name with domain-separation label `redex-channel-id-v1`.
+- ✅ Typed `WireError` (truncation, subprotocol mismatch, dispatch mismatch, bad role, bad error_code, invalid utf-8). `SyncNackError` and `ReplicaRole` enums encode/decode round-trip the four pinned variants each.
+- ✅ Round-trip + byte-layout tests (19 tests): per-message round-trip; pinned fixed-size byte counts (47 B `SyncRequest`, 52 B `SyncHeartbeat`); explicit byte-layout assertion for `SyncRequest`; truncation rejection at every prefix length; rejection of wrong subprotocol / wrong dispatch / unknown role / unknown error_code / invalid utf-8; `SyncResponse` round-trip with empty + populated event chunks; `SyncNack` round-trip across all four error variants + oversized-detail truncation.
+- ✅ `cargo clippy --lib --features redex -- -D warnings` clean.
 
 ### Phase B — `ReplicationConfig` + opt-in (3 days)
 
