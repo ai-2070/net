@@ -33,7 +33,16 @@
 
 use std::time::Instant;
 
-use super::replication::{ChannelId, ReplicaRole, SyncHeartbeat};
+use super::replication::{ChannelId, ReplicaRole, SyncHeartbeat, SyncRequest};
+
+/// Default `chunk_max` carried on every replica-issued
+/// [`SyncRequest`] — 256 KiB. Sized so a healthy replica stays
+/// caught up on a single request per heartbeat cycle for a busy
+/// channel (typical event sizes 100B – 4KiB → 60 – 2500 events per
+/// chunk), while keeping the leader's response latency bounded.
+/// The leader's `handle_sync_request` enforces a 64 MiB hard
+/// ceiling regardless; this default sits comfortably below.
+pub const SYNC_REQUEST_CHUNK_MAX_DEFAULT: u32 = 256 * 1024;
 use super::replication_election::{elect, ElectionOutcome};
 use super::replication_heartbeat::HeartbeatTracker;
 use super::replication_state::TransitionSignal;
@@ -51,6 +60,18 @@ pub enum OutboundMessage {
         target: NodeId,
         /// Wire-format heartbeat payload.
         msg: SyncHeartbeat,
+    },
+    /// Replica → leader pull request. Emitted by `tick` when the
+    /// believed leader's last-observed `tail_seq` exceeds the local
+    /// `tail_seq` (i.e., we're behind). One request per lagging
+    /// tick; the leader's `SyncResponse` advances the local tail
+    /// and the next tick re-evaluates lag. Bounded by
+    /// `chunk_max_bytes` from [`TickInputs`].
+    SyncRequest {
+        /// Destination leader node id.
+        target: NodeId,
+        /// Wire-format request payload.
+        msg: SyncRequest,
     },
 }
 
@@ -104,6 +125,11 @@ pub struct TickInputs<'a> {
     /// `SyncHeartbeat::wall_clock_ms` field. Operator-facing
     /// drift detection only; not consumed for ordering.
     pub wall_clock_ms: u64,
+    /// Maximum bytes the replica's `SyncRequest` asks for in the
+    /// leader's matching response. Carried on every replica-side
+    /// catch-up emission; `0` lets the leader pick (subject to
+    /// the catch-up helper's 64 MiB hard ceiling).
+    pub chunk_max_bytes: u32,
     /// Current instant — passed to [`HeartbeatTracker`] for
     /// silence checks.
     pub now: Instant,
@@ -182,6 +208,38 @@ pub fn tick(inputs: TickInputs<'_>) -> StepOutcome {
             target: ReplicaRole::Candidate,
             signal: TransitionSignal::MissedHeartbeats,
         });
+        // Skip the lag-driven SyncRequest emission below — once
+        // we've decided to elect, the believed leader is stale
+        // and the request would race the role transition. The
+        // next tick (post-election) will re-evaluate against
+        // the new leader.
+        return outcome;
+    }
+
+    // Lag detection — when the believed leader's last-observed
+    // tail_seq exceeds our local tail, issue a SyncRequest so the
+    // catch-up helper can advance us. One request per lagging
+    // tick; if a response is already in flight the replica's
+    // `apply_sync_response` will advance the tail and the next
+    // tick re-evaluates. Repeated requests within a flight window
+    // are bounded by the heartbeat cadence — typically 500 ms —
+    // and the leader's bandwidth budget rejects with
+    // `Backpressure` if it can't keep up.
+    if inputs.current_role == ReplicaRole::Replica {
+        if let Some(leader) = inputs.tracker.believed_leader() {
+            if let Some(peer) = inputs.tracker.peer_state(leader) {
+                if peer.tail_seq > inputs.tail_seq {
+                    outcome.outbound.push(OutboundMessage::SyncRequest {
+                        target: leader,
+                        msg: SyncRequest {
+                            channel_id: inputs.channel_id,
+                            since_seq: inputs.tail_seq,
+                            chunk_max: inputs.chunk_max_bytes,
+                        },
+                    });
+                }
+            }
+        }
     }
 
     outcome
@@ -293,6 +351,7 @@ mod tests {
             replica_set: &[0x1, 0x2, 0x3],
             tracker: &tracker,
             wall_clock_ms: 0,
+            chunk_max_bytes: 0,
             now: t0(),
         };
         let outcome = tick(inputs);
@@ -311,6 +370,7 @@ mod tests {
             replica_set: &[0x1, 0x2, 0x3],
             tracker: &tracker,
             wall_clock_ms: 0,
+            chunk_max_bytes: 0,
             now: t0(),
         };
         let outcome = tick(inputs);
@@ -330,12 +390,15 @@ mod tests {
             replica_set: &[0x10, 0x20, 0x30, 0x40],
             tracker: &tracker,
             wall_clock_ms: 1_700_000_000_000,
+            chunk_max_bytes: 0,
             now: t0(),
         };
         let outcome = tick(inputs);
         assert_eq!(outcome.outbound.len(), 3);
         for (i, msg) in outcome.outbound.iter().enumerate() {
-            let OutboundMessage::Heartbeat { target, msg } = msg;
+            let OutboundMessage::Heartbeat { target, msg } = msg else {
+                panic!("expected Heartbeat, got {msg:?}");
+            };
             assert_eq!(*target, [0x20, 0x30, 0x40][i]);
             assert_eq!(msg.channel_id, cid);
             assert_eq!(msg.tail_seq, 42);
@@ -357,6 +420,7 @@ mod tests {
             replica_set: &[0x10, 0x20, 0x30],
             tracker: &tracker,
             wall_clock_ms: 0,
+            chunk_max_bytes: 0,
             now: t0(),
         };
         let outcome = tick(inputs);
@@ -366,6 +430,9 @@ mod tests {
             .iter()
             .map(|m| match m {
                 OutboundMessage::Heartbeat { target, .. } => *target,
+                OutboundMessage::SyncRequest { .. } => {
+                    panic!("expected only heartbeats; got SyncRequest")
+                }
             })
             .collect();
         assert_eq!(targets, vec![0x10, 0x30]);
@@ -385,6 +452,7 @@ mod tests {
             replica_set: &[0x1],
             tracker: &tracker,
             wall_clock_ms: 0,
+            chunk_max_bytes: 0,
             now: t0(),
         };
         let outcome = tick(inputs);
@@ -406,6 +474,7 @@ mod tests {
             replica_set: &[0x10, 0x10, 0x20, 0x10],
             tracker: &tracker,
             wall_clock_ms: 0,
+            chunk_max_bytes: 0,
             now: t0(),
         };
         let outcome = tick(inputs);
@@ -433,6 +502,7 @@ mod tests {
             replica_set: &[0x10, leader_id],
             tracker: &tracker,
             wall_clock_ms: 0,
+            chunk_max_bytes: 0,
             now,
         };
         let outcome = tick(inputs);
@@ -464,6 +534,7 @@ mod tests {
             replica_set: &[0x10, leader_id],
             tracker: &tracker,
             wall_clock_ms: 0,
+            chunk_max_bytes: 0,
             now,
         };
         let outcome = tick(inputs);
@@ -492,6 +563,7 @@ mod tests {
             replica_set: &[0x10, 0x20],
             tracker: &tracker,
             wall_clock_ms: 0,
+            chunk_max_bytes: 0,
             now,
         };
         let outcome = tick(inputs);
@@ -518,6 +590,7 @@ mod tests {
             replica_set: &[0x10, leader_id],
             tracker: &tracker,
             wall_clock_ms: 0,
+            chunk_max_bytes: 0,
             now,
         };
         let outcome = tick(inputs);
@@ -596,6 +669,7 @@ mod tests {
             replica_set: &[0x10, 0x20, 0x30],
             tracker: &tracker,
             wall_clock_ms: 1234,
+            chunk_max_bytes: 0,
             now: t0(),
         };
         let a = tick(mk_inputs());
@@ -618,10 +692,176 @@ mod tests {
             replica_set: &[0x1, 0x2],
             tracker: &tracker,
             wall_clock_ms: 0,
+            chunk_max_bytes: 0,
             now: t0(),
         };
         let outcome = tick(inputs);
-        let OutboundMessage::Heartbeat { msg, .. } = &outcome.outbound[0];
+        let OutboundMessage::Heartbeat { msg, .. } = &outcome.outbound[0] else {
+            panic!("expected Heartbeat at index 0");
+        };
         assert_eq!(msg.tail_seq, u64::MAX - 1);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Lag-driven SyncRequest emission (replica catch-up)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn replica_behind_leader_emits_sync_request() {
+        // Replica's local tail is 10; leader's last-observed
+        // heartbeat carried tail_seq 100. Expect one SyncRequest
+        // to the leader with since_seq=10 and chunk_max=CHUNK_MAX.
+        let leader_id = 0x42;
+        let mut tracker = HeartbeatTracker::new(500);
+        let base = t0();
+        tracker.record_heartbeat(leader_id, ReplicaRole::Leader, 100, base);
+        let inputs = TickInputs {
+            self_node_id: 0x10,
+            current_role: ReplicaRole::Replica,
+            channel_id: channel_id_for("test/lag"),
+            tail_seq: 10,
+            replica_set: &[0x10, leader_id],
+            tracker: &tracker,
+            wall_clock_ms: 0,
+            chunk_max_bytes: 256 * 1024,
+            now: at(base, 100),
+        };
+        let outcome = tick(inputs);
+        // One heartbeat to the leader + one SyncRequest to the
+        // leader. Order: heartbeats first (emitted in replica_set
+        // iteration), then SyncRequest.
+        assert_eq!(outcome.outbound.len(), 2);
+        let sync_req = outcome.outbound.iter().find_map(|m| match m {
+            OutboundMessage::SyncRequest { target, msg } => Some((*target, msg.clone())),
+            _ => None,
+        });
+        let (target, msg) = sync_req.expect("expected one SyncRequest");
+        assert_eq!(target, leader_id);
+        assert_eq!(msg.since_seq, 10);
+        assert_eq!(msg.chunk_max, 256 * 1024);
+        // Verify channel_id matches.
+        assert_eq!(msg.channel_id, channel_id_for("test/lag"));
+        // No transition — fresh leader, no silence.
+        assert!(outcome.transition.is_none());
+    }
+
+    #[test]
+    fn replica_caught_up_emits_no_sync_request() {
+        let leader_id = 0x42;
+        let mut tracker = HeartbeatTracker::new(500);
+        let base = t0();
+        tracker.record_heartbeat(leader_id, ReplicaRole::Leader, 100, base);
+        let inputs = TickInputs {
+            self_node_id: 0x10,
+            current_role: ReplicaRole::Replica,
+            channel_id: channel_id_for("test/caught_up"),
+            tail_seq: 100, // exactly the leader's tail
+            replica_set: &[0x10, leader_id],
+            tracker: &tracker,
+            wall_clock_ms: 0,
+            chunk_max_bytes: 256 * 1024,
+            now: at(base, 100),
+        };
+        let outcome = tick(inputs);
+        // Only the heartbeat — no SyncRequest, no transition.
+        assert_eq!(outcome.outbound.len(), 1);
+        assert!(matches!(
+            outcome.outbound[0],
+            OutboundMessage::Heartbeat { .. }
+        ));
+    }
+
+    #[test]
+    fn replica_with_no_believed_leader_emits_no_sync_request() {
+        // No leader heartbeat ever seen → believed_leader is None.
+        let tracker = empty_tracker();
+        let inputs = TickInputs {
+            self_node_id: 0x10,
+            current_role: ReplicaRole::Replica,
+            channel_id: channel_id_for("test/no_leader"),
+            tail_seq: 0,
+            replica_set: &[0x10, 0x42],
+            tracker: &tracker,
+            wall_clock_ms: 0,
+            chunk_max_bytes: 256 * 1024,
+            now: t0(),
+        };
+        let outcome = tick(inputs);
+        // Heartbeat to peer 0x42, but no SyncRequest (no leader
+        // to ask).
+        assert!(outcome
+            .outbound
+            .iter()
+            .all(|m| matches!(m, OutboundMessage::Heartbeat { .. })));
+    }
+
+    #[test]
+    fn leader_does_not_emit_sync_request_even_if_peer_advertises_higher_tail() {
+        // Defensive: a leader that observes a peer (would-be-
+        // replica) advertising a higher tail than its own does
+        // NOT issue a SyncRequest. The leader is the single
+        // writer; "behind" doesn't apply to it.
+        let peer = 0x20;
+        let mut tracker = HeartbeatTracker::new(500);
+        let base = t0();
+        // A peer announces it has a tail_seq above the leader's.
+        // Pathological but representable on the wire.
+        tracker.record_heartbeat(peer, ReplicaRole::Replica, 999, base);
+        let inputs = TickInputs {
+            self_node_id: 0x10,
+            current_role: ReplicaRole::Leader,
+            channel_id: channel_id_for("test/leader_no_request"),
+            tail_seq: 0,
+            replica_set: &[0x10, peer],
+            tracker: &tracker,
+            wall_clock_ms: 0,
+            chunk_max_bytes: 256 * 1024,
+            now: at(base, 100),
+        };
+        let outcome = tick(inputs);
+        assert!(outcome
+            .outbound
+            .iter()
+            .all(|m| matches!(m, OutboundMessage::Heartbeat { .. })));
+    }
+
+    #[test]
+    fn replica_with_silent_leader_skips_sync_request_when_electing() {
+        // Coverage of the "skip lag emission during election"
+        // path: when tick decides to enter Candidate due to
+        // missed heartbeats, the same tick does NOT emit a
+        // SyncRequest. The believed leader is stale — issuing
+        // would race the election transition.
+        let leader_id = 0x42;
+        let mut tracker = HeartbeatTracker::new(500);
+        let base = t0();
+        tracker.record_heartbeat(leader_id, ReplicaRole::Leader, 100, base);
+        // Advance past the 3 × 500ms silence threshold.
+        let now = at(base, 2_000);
+        let inputs = TickInputs {
+            self_node_id: 0x10,
+            current_role: ReplicaRole::Replica,
+            channel_id: channel_id_for("test/skip_during_election"),
+            tail_seq: 10, // significantly behind
+            replica_set: &[0x10, leader_id],
+            tracker: &tracker,
+            wall_clock_ms: 0,
+            chunk_max_bytes: 256 * 1024,
+            now,
+        };
+        let outcome = tick(inputs);
+        // Heartbeat is still emitted (Replica heartbeats regardless),
+        // but no SyncRequest.
+        assert!(outcome
+            .outbound
+            .iter()
+            .all(|m| matches!(m, OutboundMessage::Heartbeat { .. })));
+        assert_eq!(
+            outcome.transition,
+            Some(PendingTransition {
+                target: ReplicaRole::Candidate,
+                signal: TransitionSignal::MissedHeartbeats,
+            }),
+        );
     }
 }

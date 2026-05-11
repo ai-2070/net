@@ -54,7 +54,9 @@ use super::replication_catchup::{
 };
 use super::replication_coordinator::{ChannelIdentity, ReplicationCoordinator};
 use super::replication_heartbeat::HeartbeatTracker;
-use super::replication_step::{election_outcome, tick, OutboundMessage, TickInputs};
+use super::replication_step::{
+    election_outcome, tick, OutboundMessage, TickInputs, SYNC_REQUEST_CHUNK_MAX_DEFAULT,
+};
 use crate::adapter::net::behavior::placement::NodeId;
 use crate::error::AdapterError;
 use std::time::Duration;
@@ -406,6 +408,7 @@ async fn on_tick(
             replica_set: &inputs.replica_set,
             tracker: &t,
             wall_clock_ms,
+            chunk_max_bytes: SYNC_REQUEST_CHUNK_MAX_DEFAULT,
             now,
         })
     };
@@ -414,6 +417,11 @@ async fn on_tick(
             OutboundMessage::Heartbeat { target, msg } => {
                 if let Err(e) = dispatcher.send_heartbeat(target, msg).await {
                     tracing::trace!(target=?target, error=?e, "replication: heartbeat send failed");
+                }
+            }
+            OutboundMessage::SyncRequest { target, msg } => {
+                if let Err(e) = dispatcher.send_sync_request(target, msg).await {
+                    tracing::trace!(target=?target, error=?e, "replication: sync_request send failed");
                 }
             }
         }
