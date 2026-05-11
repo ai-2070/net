@@ -1,0 +1,35 @@
+net/crates/net/src/adapter/net/dataforts/mod.rs
+  s_3a0a24a47d1a36::t_23bef94e3f96bb 27
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_0f73828da73fc9 35
+net/crates/net/src/adapter/net/dataforts/greedy/mod.rs
+  s_3a0a24a47d1a36::t_acdfa4fb8349e1 27
+net/crates/net/src/adapter/net/dataforts/greedy/cache.rs
+  s_3a0a24a47d1a36::t_707f43bafbe129 475-476
+  s_3a0a24a47d1a36::t_8adabb1f649deb 437-438
+  s_3a0a24a47d1a36::t_b51b96ea6c3c8f 83,85-86
+  s_3a0a24a47d1a36::t_9ebba1891659ae 75-82,84,87-93,97,110-113
+  s_3a0a24a47d1a36::t_19ae71945c66ff 502-503,506-550
+  s_3a0a24a47d1a36::t_296f4118a40761 302,305-308
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_3a0a24a47d1a36::t_2d9ea8a9077fb0 868-873,877-878,881-882,884-900
+  s_3a0a24a47d1a36::t_c78c51df9f4054 536-537
+  s_3a0a24a47d1a36::t_276105ee8c7c20 874-876,879-880,883
+  s_3a0a24a47d1a36::t_4cc03d766f616e 551-555,560,564,566-575
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "2f94890e224669a970e92bc264cb9d687be37612",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
