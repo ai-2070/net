@@ -631,12 +631,20 @@ impl GreedyRuntime {
         if !sweep.is_empty() {
             // Drop any gravity heat counters that the evicted
             // chains owned. Without this the HeatRegistry grows
-            // unboundedly across LRU churn, and tick() walks
-            // stale entries that no longer have a matching cache
-            // entry. Single lock acquisition for the whole sweep
-            // (rather than per-evicted) — gravity is enabled at
-            // process scope, the lock isn't on the hot path for
-            // anything else here.
+            // unboundedly across LRU churn (when gravity is wired
+            // but greedy isn't doing the bounding; D-10 + N-2 fix).
+            //
+            // LOCK-ORDERING INVARIANT: the heat lock + gravity
+            // read guard are taken in a tightly scoped block that
+            // ends BEFORE any `.await` on the chain sink. The
+            // sink call below (`withdraw_chain`) may re-enter the
+            // runtime via the capability-index path; holding the
+            // heat lock across that would create a lock-ordering
+            // hazard the next time the order is exercised. The
+            // explicit inner-block `{}` enforces release; the
+            // explicit `drop(heat)` + `drop(gravity)` make the
+            // release visible to readers of this code so a future
+            // refactor can't quietly flatten the two loops.
             #[cfg(feature = "dataforts")]
             {
                 let gravity = self.inner.gravity.read();
@@ -647,7 +655,9 @@ impl GreedyRuntime {
                             heat.remove(&evicted.origin_hash);
                         }
                     }
+                    drop(heat);
                 }
+                drop(gravity);
             }
 
             for evicted in &sweep.evicted {

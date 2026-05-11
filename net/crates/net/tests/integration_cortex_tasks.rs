@@ -13,10 +13,10 @@ use net::adapter::net::cortex::tasks::{OrderBy, TaskStatus, TasksAdapter, TASKS_
 use net::adapter::net::cortex::{
     compute_checksum, compute_checksum_with_meta, EventMeta, WaitForTokenError, EVENT_META_SIZE,
 };
-use net::adapter::net::redex::WriteToken;
 use net::adapter::net::redex::Redex;
 #[cfg(feature = "redex-disk")]
 use net::adapter::net::redex::RedexFileConfig;
+use net::adapter::net::redex::WriteToken;
 
 const ORIGIN: u64 = 0xABCD_EF01;
 
@@ -1202,7 +1202,9 @@ async fn poll_for_token_synchronous_non_blocking_check() {
 
     // Wait for the fold to apply through `seq` so poll can succeed.
     tasks.wait_for_seq(seq).await;
-    tasks.poll_for_token(token).expect("poll must succeed once seq applied");
+    tasks
+        .poll_for_token(token)
+        .expect("poll must succeed once seq applied");
 
     // Future seq beyond the watermark must surface Timeout, not
     // block, not error otherwise.
