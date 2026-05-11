@@ -1692,6 +1692,7 @@ impl PyNetDb {
         with_memories = false,
     ))]
     fn open(
+        py: Python<'_>,
         origin_hash: u64,
         persistent_dir: Option<String>,
         persistent: bool,
@@ -1710,12 +1711,12 @@ impl PyNetDb {
         };
 
         let tasks = if with_tasks {
-            Some(PyTasksAdapter::open(&redex, origin_hash, persistent)?)
+            Some(PyTasksAdapter::open(py, &redex, origin_hash, persistent)?)
         } else {
             None
         };
         let memories = if with_memories {
-            Some(PyMemoriesAdapter::open(&redex, origin_hash, persistent)?)
+            Some(PyMemoriesAdapter::open(py, &redex, origin_hash, persistent)?)
         } else {
             None
         };
@@ -1737,6 +1738,7 @@ impl PyNetDb {
         with_memories = false,
     ))]
     fn open_from_snapshot(
+        py: Python<'_>,
         bundle: &[u8],
         origin_hash: u64,
         persistent_dir: Option<String>,
@@ -1761,13 +1763,14 @@ impl PyNetDb {
         let tasks = if with_tasks {
             match snapshot.tasks {
                 Some((bytes, last_seq)) => Some(PyTasksAdapter::open_from_snapshot(
+                    py,
                     &redex,
                     origin_hash,
                     &bytes,
                     last_seq,
                     persistent,
                 )?),
-                None => Some(PyTasksAdapter::open(&redex, origin_hash, persistent)?),
+                None => Some(PyTasksAdapter::open(py, &redex, origin_hash, persistent)?),
             }
         } else {
             None
@@ -1776,13 +1779,14 @@ impl PyNetDb {
         let memories = if with_memories {
             match snapshot.memories {
                 Some((bytes, last_seq)) => Some(PyMemoriesAdapter::open_from_snapshot(
+                    py,
                     &redex,
                     origin_hash,
                     &bytes,
                     last_seq,
                     persistent,
                 )?),
-                None => Some(PyMemoriesAdapter::open(&redex, origin_hash, persistent)?),
+                None => Some(PyMemoriesAdapter::open(py, &redex, origin_hash, persistent)?),
             }
         } else {
             None
