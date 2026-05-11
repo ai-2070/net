@@ -1,0 +1,48 @@
+net/crates/net/bindings/python/src/cortex.rs
+  s_4dbb97ea6ebffd::t_2571c2ac343f9b 400,488,496-497,503,510,526,548,583,585,593-594,600
+net/crates/net/Cargo.toml
+  s_4dbb97ea6ebffd::t_1d627e7a1c0d38 59-68
+net/crates/net/docs/misc/DATAFORTS_PLAN.md
+  s_4dbb97ea6ebffd::t_f800068b15e39a 679
+  s_4dbb97ea6ebffd::t_44a0de9b5374f3 7,15,17,21-34
+  s_4dbb97ea6ebffd::t_2f034087361852 767
+  s_4dbb97ea6ebffd::t_993064e952b13a 912
+net/crates/net/src/adapter/net/mod.rs
+  s_4dbb97ea6ebffd::t_2571c2ac343f9b 63
+net/crates/net/src/adapter/net/dataforts/mod.rs
+  s_4dbb97ea6ebffd::t_2571c2ac343f9b 15,18,21,30
+net/crates/net/tests/dataforts_greedy_e2e.rs
+  s_4dbb97ea6ebffd::t_2571c2ac343f9b 12,14
+net/crates/net/bindings/python/Cargo.toml
+  s_4dbb97ea6ebffd::t_d839f93aec0285 45-53
+net/crates/net/bindings/node/Cargo.toml
+  s_4dbb97ea6ebffd::t_871a0e8136279e 52-59
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_4dbb97ea6ebffd::t_2571c2ac343f9b 86,93,97,102,135,151,170,233,260,283,318,333,340,363,1123,1146
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_4dbb97ea6ebffd::t_2571c2ac343f9b 157,163,225,240,256,262,328,351,369
+net/crates/net/bindings/node/src/cortex.rs
+  s_4dbb97ea6ebffd::t_2571c2ac343f9b 215,283,286,295,301,309,320,337,363-364,373,379,488,509
+net/crates/net/tests/dataforts_gravity_e2e.rs
+  s_4dbb97ea6ebffd::t_2571c2ac343f9b 11,13
+net/crates/net/src/ffi/cortex.rs
+  s_4dbb97ea6ebffd::t_2571c2ac343f9b 411,436,495,567,583,604,633,646,681,738,3012,3048
+net/crates/net/src/adapter/net/mesh.rs
+  s_4dbb97ea6ebffd::t_2571c2ac343f9b 284,1328,1656,2443,3749,3762,3782,6326,6345,6429,6452,6463,6504,6515
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "734e35ef1df961a63f233a63aff0d78ed727d1c9",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
