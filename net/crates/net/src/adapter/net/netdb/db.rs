@@ -215,7 +215,7 @@ impl NetDbBuilder {
         let cfg = self.redex_config();
 
         let tasks = if self.want_tasks {
-            Some(TasksAdapter::open_with_config(&self.redex, self.origin_hash, cfg).await?)
+            Some(TasksAdapter::open_with_config(&self.redex, self.origin_hash, cfg.clone()).await?)
         } else {
             None
         };
@@ -259,15 +259,15 @@ impl NetDbBuilder {
                 TasksAdapter::open_from_snapshot_with_config(
                     &self.redex,
                     self.origin_hash,
-                    cfg,
+                    cfg.clone(),
                     bytes,
                     *last_seq,
                 )
                 .await?,
             ),
-            (true, None) => {
-                Some(TasksAdapter::open_with_config(&self.redex, self.origin_hash, cfg).await?)
-            }
+            (true, None) => Some(
+                TasksAdapter::open_with_config(&self.redex, self.origin_hash, cfg.clone()).await?,
+            ),
             (false, _) => None,
         };
 

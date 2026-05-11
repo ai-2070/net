@@ -614,15 +614,17 @@ Preconditions (locked above): typed-struct migration story (view-projection rule
 - **Remove the typed structs from `CapabilitySet`'s field set** in the same change. Application sites that read `caps.hardware.gpu` migrate to `HardwareCapabilities::from(&caps).gpu` — codemod-friendly; the helper preserves the same nested-struct shape.
 - Documentation update — `CAPABILITIES.md` adds the four-axis model + the view-projection rule.
 
-### Phase B — Tag shapes for discovery (3 days)
+### Phase B — Tag shapes for discovery (3 days) ✅
 
-- Extend `Tag` parser to recognize `causal:`, `causal:tip_seq`, `causal:[range]`, `fork-of:`, `heat:` shapes.
-- High-level helpers on `Mesh`:
-  - `Mesh::announce_chain(origin_hash, tip_seq)`
-  - `Mesh::announce_chain_range(origin_hash, start, end)`
-  - `Mesh::withdraw_chain(origin_hash)`
-  - `Mesh::find_chain_holders(origin_hash) -> Vec<NodeId>` — wraps the existing capability-index query, nearest-first by proximity.
-- Reserved-prefix enforcement on user tags (`Tag::reserved_prefix()` check).
+- ✅ `Tag` parser recognizes `causal:`, `causal:<hex>:<tip_seq>`, `causal:<hex>[<start>..<end>]`, `fork-of:`, `heat:` shapes (landed earlier with the v0.13 capability surface).
+- ✅ High-level helpers on `Mesh`:
+  - `Mesh::announce_chain(origin_hash: u64, tip_seq: u64)` — emits `causal:<hex>:<tip_seq>`, replacing every prior variant for the same `origin_hash`. Idempotent on the chain identity.
+  - `Mesh::announce_chain_range(origin_hash: u64, start_seq: u64, end_seq: u64)` — emits `causal:<hex>[<start>..<end>]`. Degenerate range (`start >= end`) is a no-op.
+  - `Mesh::withdraw_chain(origin_hash: u64)` — strips every `causal:<hex>*` variant for the chain. Idempotent.
+  - `Mesh::find_chain_holders(origin_hash: u64) -> Vec<u64>` — scans the capability index for every variant; proximity-sorts the result (self first; unmeasured peers at the back; lex-NodeId tie-break).
+- ✅ Mutations layer on the most recent `announce_capabilities` baseline via a `user_caps: RwLock<Option<CapabilitySet>>` field on `MeshNode`. The nrpc / nat augmentation `announce_capabilities_with` overlays at broadcast time isn't re-applied to itself.
+- ✅ Pure-function helpers (`chain_hex` / `is_causal_for` / `replace_causal_tags`) covered by 10 inline unit tests in `mesh.rs`; integration tests live at `tests/chain_discovery.rs` (11 tests covering idempotency, replace semantics, baseline preservation, hex-prefix false-match guard).
+- ✅ Reserved-prefix enforcement on user tags (`Tag::parse_user` rejects `causal:` / `fork-of:` / `heat:` / `scope:`; landed earlier).
 
 ### Phase C — Metadata field on `CapabilitySet` (3 days)
 

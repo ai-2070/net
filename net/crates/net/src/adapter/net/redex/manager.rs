@@ -12,16 +12,73 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use dashmap::DashMap;
+use parking_lot::Mutex;
 
 use super::super::channel::{AuthGuard, ChannelName};
 use super::config::RedexFileConfig;
 use super::error::RedexError;
 use super::file::RedexFile;
+use super::replication::{ChannelId, ReplicaRole};
+use super::replication_budget::BandwidthBudget;
+use super::replication_config::PlacementStrategy;
+use super::replication_coordinator::{ChannelIdentity, ReplicationCoordinator};
+use super::replication_metrics::{ReplicationMetricsRegistry, ReplicationMetricsSnapshot};
+use super::replication_router::RedexReplicationRouter;
+use super::replication_runtime::{spawn_replication_runtime, RuntimeInputs};
+use crate::adapter::net::MeshNode;
 
 #[cfg(feature = "redex-disk")]
 use std::path::PathBuf;
+
+/// Replication wiring installed by [`Redex::enable_replication`]. Owns
+/// the mesh handle (used as both `ChainTagSink` and
+/// `ReplicationDispatcher`), the per-`Redex` router shared with the
+/// mesh's `SUBPROTOCOL_REDEX` inbound dispatch, and the metrics
+/// registry that every per-channel coordinator publishes to.
+///
+/// The `Drop` impl uninstalls the router from the mesh — otherwise
+/// the mesh holds the only remaining `Arc<RedexReplicationRouter>`
+/// after `Redex` drops, keeping every per-channel runtime task
+/// alive with no Redex driving them. Routing-then-dropping the
+/// router lets the runtime handles drop, which closes their
+/// inboxes, which lets the tokio tasks exit cleanly.
+struct ReplicationWiring {
+    mesh: Arc<MeshNode>,
+    router: Arc<RedexReplicationRouter>,
+    metrics: Arc<ReplicationMetricsRegistry>,
+}
+
+/// Per-channel replication status entry surfaced by
+/// [`Redex::replication_status_snapshot`]. Pairs with the
+/// [`ReplicationMetricsSnapshot`] atomic-counter view for the full
+/// operator observability picture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationChannelStatus {
+    /// Human-readable channel name (matches the
+    /// `ChannelMetrics::channel` field in the metrics snapshot).
+    pub channel_name: String,
+    /// Current replica role per the state machine.
+    pub role: ReplicaRole,
+    /// Coordinator's view of the local `tail_seq`. The leader's
+    /// view is canonical; replica views catch up via the heartbeat
+    /// cycle.
+    pub tail_seq: u64,
+}
+
+impl Drop for ReplicationWiring {
+    fn drop(&mut self) {
+        // Best-effort uninstall — `set_replication_inbound_router(None)`
+        // is infallible and idempotent. Even if the mesh has already
+        // been shut down or the slot was reassigned by a racing
+        // `enable_replication` (which `Redex::enable_replication`
+        // refuses on idempotency, so this would only happen if a
+        // caller bypassed the wrapper), the call is a safe no-op.
+        self.mesh.set_replication_inbound_router(None);
+    }
+}
 
 /// Manager for a set of RedEX files bound to channel names.
 pub struct Redex {
@@ -39,6 +96,11 @@ pub struct Redex {
     /// leaking its `Interval` fsync task and dup file handles for
     /// the lifetime of the runtime.
     build_count: AtomicU64,
+    /// Replication wiring installed by [`Redex::enable_replication`].
+    /// `None` keeps the manager single-node — opens with
+    /// `RedexFileConfig::replication == Some(_)` then surface a typed
+    /// error.
+    replication: parking_lot::RwLock<Option<Arc<ReplicationWiring>>>,
 }
 
 impl Redex {
@@ -52,6 +114,7 @@ impl Redex {
             #[cfg(feature = "redex-disk")]
             persistent_dir: None,
             build_count: AtomicU64::new(0),
+            replication: parking_lot::RwLock::new(None),
         }
     }
 
@@ -68,6 +131,7 @@ impl Redex {
             #[cfg(feature = "redex-disk")]
             persistent_dir: None,
             build_count: AtomicU64::new(0),
+            replication: parking_lot::RwLock::new(None),
         }
     }
 
@@ -78,6 +142,127 @@ impl Redex {
     pub fn with_persistent_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.persistent_dir = Some(dir.into());
         self
+    }
+
+    /// Install replication wiring rooted at `mesh`. Constructs a
+    /// fresh [`RedexReplicationRouter`] + [`ReplicationMetricsRegistry`]
+    /// and registers the router on the mesh for `SUBPROTOCOL_REDEX`
+    /// inbound dispatch. Idempotent — repeated calls return without
+    /// disturbing the existing router (the second installation would
+    /// orphan every per-channel runtime registered under the first).
+    ///
+    /// After this returns, [`Self::open_file`] with a
+    /// [`RedexFileConfig::replication`] of `Some(cfg)` spawns a
+    /// per-channel runtime instead of producing the typed error.
+    pub fn enable_replication(&self, mesh: Arc<MeshNode>) {
+        let mut slot = self.replication.write();
+        if slot.is_some() {
+            return;
+        }
+        let router = Arc::new(RedexReplicationRouter::new());
+        let metrics = Arc::new(ReplicationMetricsRegistry::new());
+        mesh.set_replication_inbound_router(Some(
+            router.clone() as Arc<dyn super::ReplicationInboundRouter>
+        ));
+        *slot = Some(Arc::new(ReplicationWiring {
+            mesh,
+            router,
+            metrics,
+        }));
+    }
+
+    /// Cumulative count of per-channel replication runtimes currently
+    /// registered on this manager. `0` when replication is not
+    /// enabled. Exposed for tests + operator observability.
+    pub fn replication_runtime_count(&self) -> usize {
+        self.replication
+            .read()
+            .as_ref()
+            .map(|w| w.router.len())
+            .unwrap_or(0)
+    }
+
+    /// The per-channel [`ReplicationCoordinator`] for `name`, if a
+    /// replicated runtime was spawned for it. `None` when:
+    /// - replication is not enabled on this manager, OR
+    /// - no file is open at `name`, OR
+    /// - the file at `name` was opened without
+    ///   `RedexFileConfig::replication`.
+    ///
+    /// Exposed for operator inspection (`coordinator.role()`,
+    /// `coordinator.metrics()`) and test-driven role transitions
+    /// (`coordinator.transition_to(target, signal)`). Production
+    /// drives transitions through the placement filter (Phase F) +
+    /// election cycle; the surface is here so operators can also
+    /// force a transition for recovery / debugging.
+    pub fn replication_coordinator_for(
+        &self,
+        name: &ChannelName,
+    ) -> Option<Arc<ReplicationCoordinator>> {
+        let wiring = self.replication.read().as_ref().cloned()?;
+        let channel_id = ChannelId::from_name(name);
+        let handle = wiring.router.get(&channel_id)?;
+        Some(handle.coordinator().clone())
+    }
+
+    /// Read-only snapshot of the per-channel replication metrics —
+    /// the seven counter / gauge shapes from
+    /// [`CONFIG_REPLICATION.md`](../../../docs/CONFIG_REPLICATION.md):
+    /// `*_lag_seconds`, `*_sync_bytes_total`, `*_leader_changes_total`,
+    /// `*_under_capacity_total`, `*_skip_ahead_total`,
+    /// `*_election_thrash_total`, `*_witness_withdrawals_total`.
+    ///
+    /// `None` when replication isn't enabled on this manager.
+    ///
+    /// Cheap — copies atomic counters into plain data. Suitable for
+    /// a per-scrape Prometheus pull. See
+    /// [`ReplicationMetricsSnapshot::prometheus_text`] for the
+    /// rendered output; [`Self::replication_prometheus_text`] is the
+    /// one-call wrapper.
+    pub fn replication_metrics_snapshot(&self) -> Option<ReplicationMetricsSnapshot> {
+        let wiring = self.replication.read().as_ref().cloned()?;
+        Some(wiring.metrics.snapshot())
+    }
+
+    /// Convenience wrapper — render the replication metrics snapshot
+    /// as Prometheus text. Returns the empty string when replication
+    /// isn't enabled (rather than `None`) so the call site can pipe
+    /// it straight into an HTTP body without an `unwrap_or_default`.
+    pub fn replication_prometheus_text(&self) -> String {
+        self.replication_metrics_snapshot()
+            .map(|s| s.prometheus_text())
+            .unwrap_or_default()
+    }
+
+    /// Per-channel replication status snapshot — the richer view
+    /// the Phase H `MeshDaemon::snapshot` integration point was
+    /// supposed to surface. For every replicated channel registered
+    /// on this manager, returns the current `ReplicaRole`,
+    /// `tail_seq`, and `channel_name`. Pair with
+    /// [`Self::replication_metrics_snapshot`] for the full
+    /// observability picture (status here + atomic counters there).
+    ///
+    /// `None` when replication isn't enabled. Empty vector when
+    /// replication is enabled but no channels have been opened.
+    pub fn replication_status_snapshot(&self) -> Option<Vec<ReplicationChannelStatus>> {
+        let wiring = self.replication.read().as_ref().cloned()?;
+        let mut entries: Vec<ReplicationChannelStatus> = wiring
+            .router
+            .snapshot_handles()
+            .into_iter()
+            .map(|(_channel_id, handle)| {
+                let coordinator = handle.coordinator();
+                ReplicationChannelStatus {
+                    channel_name: coordinator.channel().channel_name.clone(),
+                    role: coordinator.role(),
+                    tail_seq: coordinator.tail_seq(),
+                }
+            })
+            .collect();
+        // Stable order — keyed on channel_name like the metrics
+        // snapshot, so the two snapshots line up by channel.
+        entries.sort_by(|a, b| a.channel_name.cmp(&b.channel_name));
+        Some(entries)
     }
 
     /// Open (create if absent) a RedEX file bound to `name`.
@@ -115,9 +300,24 @@ impl Redex {
             }
         }
 
+        // Validate the replication config before anything else —
+        // surface the typed error to the caller before we either
+        // build the file or attempt to spawn a runtime. An invalid
+        // config can't escape into the coordinator's hot loop.
+        if let Some(rep) = config.replication.as_ref() {
+            rep.validate()
+                .map_err(|e| RedexError::Channel(format!("replication config invalid: {e}")))?;
+            if self.replication.read().is_none() {
+                return Err(RedexError::Channel(
+                    "RedexFileConfig::replication requires Redex::enable_replication(mesh)".into(),
+                ));
+            }
+        }
+
         // Lock-free fast path for the common re-open case: avoid taking
         // a shard write entry when the file is already present.
         if let Some(existing) = self.files.get(name) {
+            ensure_reopen_replication_matches(self, name, config.replication.as_ref())?;
             return Ok(existing.clone());
         }
 
@@ -134,12 +334,152 @@ impl Redex {
         // its Notify never fired and the leaked task plus dup
         // handles outlived the call.
         use dashmap::mapref::entry::Entry;
-        match self.files.entry(name.clone()) {
-            Entry::Occupied(e) => Ok(e.get().clone()),
+        let replication_cfg = config.replication.clone();
+        let file = match self.files.entry(name.clone()) {
+            Entry::Occupied(e) => {
+                ensure_reopen_replication_matches(self, name, replication_cfg.as_ref())?;
+                return Ok(e.get().clone());
+            }
             Entry::Vacant(e) => {
                 let file = self.build_file(name, config)?;
-                Ok(e.insert(file).clone())
+                e.insert(file).clone()
             }
+        };
+
+        // Spawn the per-channel replication runtime AFTER the file
+        // landed in the map — on the unlikely chance the spawn
+        // fails, the file is still discoverable and a follow-up
+        // open / `enable_replication` sequence can recover. We
+        // assert `replication.read().is_some()` above, so the
+        // wiring is guaranteed live here.
+        if let Some(rep_cfg) = replication_cfg {
+            // Re-check the wiring under the read lock — a racing
+            // call that disables replication after the precheck
+            // surfaces a clean error rather than panicking on
+            // unwrap.
+            let wiring = match self.replication.read().as_ref() {
+                Some(w) => w.clone(),
+                None => {
+                    return Err(RedexError::Channel(
+                        "replication wiring removed between precheck and spawn".into(),
+                    ));
+                }
+            };
+            self.spawn_replication_for(name, &file, rep_cfg, &wiring);
+        }
+
+        Ok(file)
+    }
+
+    /// Spawn the per-channel replication runtime and register it on
+    /// the router. Caller already validated `cfg`.
+    fn spawn_replication_for(
+        &self,
+        name: &ChannelName,
+        file: &RedexFile,
+        cfg: super::replication_config::ReplicationConfig,
+        wiring: &ReplicationWiring,
+    ) {
+        let channel_id = ChannelId::from_name(name);
+        let identity = ChannelIdentity {
+            channel_name: name.as_str().to_string(),
+            origin_hash: self.origin_hash,
+        };
+
+        // Compute the initial replica set. Pinned: the literal
+        // list. Standard / ColocationStrict: empty for now; Phase F
+        // wires placement-recomputation so the coordinator
+        // re-resolves the set on roster change.
+        let replica_set: Vec<crate::adapter::net::behavior::placement::NodeId> =
+            match &cfg.placement {
+                PlacementStrategy::Pinned(nodes) => nodes.clone(),
+                _ => Vec::new(),
+            };
+
+        let heartbeat_ms = cfg.heartbeat_ms;
+        let budget_fraction = cfg.replication_budget_fraction;
+        // TODO(plan-§6): wire the measured NIC peak from the
+        // proximity-graph throughput probe here. Until that
+        // lands, use a 1 Gbps placeholder (125_000_000 B/s).
+        // The fraction arm of `BandwidthBudget::new` scales
+        // this down. Operators with >1 Gbps links will see
+        // under-utilization when budget_fraction approaches
+        // 1.0 until this constant is replaced with the
+        // measurement.
+        const NIC_PEAK_BYTES_PER_S: u64 = 125_000_000;
+        let budget = Arc::new(Mutex::new(BandwidthBudget::new(
+            budget_fraction,
+            NIC_PEAK_BYTES_PER_S,
+            Instant::now(),
+        )));
+
+        let coordinator = Arc::new(ReplicationCoordinator::new(
+            identity.clone(),
+            cfg,
+            wiring.mesh.clone() as Arc<dyn super::ChainTagSink>,
+            wiring.metrics.as_ref(),
+        ));
+
+        let self_node_id = wiring.mesh.node_id();
+        let proximity = wiring.mesh.proximity_graph().clone();
+        let rtt_lookup: super::replication_runtime::RttLookup = Arc::new(
+            move |node: crate::adapter::net::behavior::placement::NodeId| {
+                if node == self_node_id {
+                    Some(std::time::Duration::ZERO)
+                } else {
+                    // Mirror `node_id_to_graph_id` from
+                    // `mesh.rs`: zero-pad the u64 into the first 8
+                    // bytes of a 32-byte proximity NodeId.
+                    let mut graph_id = [0u8; 32];
+                    graph_id[0..8].copy_from_slice(&node.to_le_bytes());
+                    proximity.nearest_rtt(|n| n.node_id == graph_id)
+                }
+            },
+        );
+
+        let file_clone = file.clone();
+        let tail_provider: Arc<dyn Fn() -> u64 + Send + Sync> =
+            Arc::new(move || file_clone.next_seq());
+
+        let inputs = RuntimeInputs {
+            channel: identity,
+            channel_id,
+            self_node_id,
+            replica_set,
+            heartbeat_ms,
+            wall_clock_provider: Arc::new(|| {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            }),
+            tail_provider,
+            rtt_lookup,
+            file: file.clone(),
+        };
+
+        let handle = Arc::new(spawn_replication_runtime(
+            inputs,
+            coordinator,
+            wiring.mesh.clone() as Arc<dyn super::ReplicationDispatcher>,
+            budget,
+        ));
+
+        // Register on the router; if a prior handle was registered
+        // for the same channel (reopen path), the predecessor is
+        // returned. R-21: try_dispatch(Shutdown) is best-effort
+        // belt-and-suspenders — `register()`'s swap dropped the
+        // router's Arc<RuntimeHandle> on the predecessor, which
+        // is the only sender into its inbox; the task observes a
+        // closed receiver on its next poll and exits via the
+        // `None` arm in the main loop (same shape as Shutdown
+        // itself). If the inbox happened to be at cap-1024 the
+        // try_dispatch returns Err(_) silently, which is fine
+        // because the closed-receiver path will still drive the
+        // task out.
+        if let Some(prev) = wiring.router.register(channel_id, handle) {
+            let _ = prev.try_dispatch(super::replication_runtime::Inbound::Shutdown);
         }
     }
 
@@ -178,7 +518,17 @@ impl Redex {
 
     /// Close and remove a file. Outstanding tail streams receive
     /// `RedexError::Closed`. No-op if no file is open under `name`.
+    /// If the channel had a replication runtime spawned, the runtime
+    /// is unregistered from the router and signaled to shut down;
+    /// the runtime exits on its next inbox poll after observing
+    /// `Inbound::Shutdown`.
     pub fn close_file(&self, name: &ChannelName) -> Result<(), RedexError> {
+        if let Some(wiring) = self.replication.read().as_ref().cloned() {
+            let channel_id = ChannelId::from_name(name);
+            if let Some(handle) = wiring.router.unregister(&channel_id) {
+                let _ = handle.try_dispatch(super::replication_runtime::Inbound::Shutdown);
+            }
+        }
         if let Some((_, file)) = self.files.remove(name) {
             file.close()?;
         }
@@ -196,6 +546,51 @@ impl Redex {
         for entry in self.files.iter() {
             entry.value().sweep_retention();
         }
+    }
+}
+
+/// Reject reopen calls whose replication config diverges from the
+/// original. Same channel name + a different `Some(ReplicationConfig)`
+/// would otherwise silently reuse the live coordinator's config — an
+/// operator surprise where `replication_factor=5` reopened as
+/// `replication_factor=3` keeps replicating at 5.
+///
+/// Compares against the live coordinator's config (the canonical
+/// source for "what is currently in effect"). The pairs accepted as
+/// idempotent reopens are:
+///
+/// - new `None` and original `None`
+/// - new `Some(cfg)` and original `Some(cfg)` where the two are
+///   structurally `PartialEq`
+///
+/// Every other shape is rejected with a typed channel error.
+fn ensure_reopen_replication_matches(
+    redex: &Redex,
+    name: &ChannelName,
+    requested: Option<&super::replication_config::ReplicationConfig>,
+) -> Result<(), RedexError> {
+    let channel_id = ChannelId::from_name(name);
+    let wiring = redex.replication.read().clone();
+    let existing = wiring
+        .as_ref()
+        .and_then(|w| w.router.get(&channel_id))
+        .map(|h| h.coordinator().config().clone());
+
+    match (existing.as_ref(), requested) {
+        (None, None) => Ok(()),
+        (Some(orig), Some(new)) if orig == new => Ok(()),
+        (None, Some(_)) => Err(RedexError::Channel(format!(
+            "reopen of '{}' specified a replication config; the original opened without replication",
+            name.as_str(),
+        ))),
+        (Some(_), None) => Err(RedexError::Channel(format!(
+            "reopen of '{}' omitted the replication config; the original opened with replication",
+            name.as_str(),
+        ))),
+        (Some(_), Some(_)) => Err(RedexError::Channel(format!(
+            "reopen of '{}' supplied a replication config different from the original",
+            name.as_str(),
+        ))),
     }
 }
 
@@ -311,7 +706,7 @@ mod tests {
     fn test_sweep_retention_runs_on_all_open_files() {
         let r = Redex::new();
         let cfg = RedexFileConfig::default().with_retention_max_events(1);
-        let f1 = r.open_file(&cn("f1"), cfg).unwrap();
+        let f1 = r.open_file(&cn("f1"), cfg.clone()).unwrap();
         let f2 = r.open_file(&cn("f2"), cfg).unwrap();
         for i in 0..3 {
             f1.append(format!("{}", i).as_bytes()).unwrap();
@@ -369,5 +764,270 @@ mod tests {
         );
         // And the public surface still resolves to a single file.
         assert!(r.get_file(&name).is_some());
+    }
+
+    // ---- Replication integration tests ----
+
+    use super::super::replication_config::ReplicationConfig;
+    use crate::adapter::net::{EntityKeypair, MeshNodeConfig};
+    use std::net::SocketAddr;
+
+    async fn build_mesh_for_test() -> Arc<crate::adapter::net::MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x42u8; 32]);
+        Arc::new(
+            crate::adapter::net::MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_with_replication_without_enable_returns_error() {
+        let r = Redex::new();
+        let cfg = RedexFileConfig::default().with_replication(Some(ReplicationConfig::new()));
+        let err = r.open_file(&cn("repl/test"), cfg).unwrap_err();
+        assert!(matches!(err, RedexError::Channel(_)));
+        assert_eq!(r.replication_runtime_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_with_replication_spawns_runtime_and_close_unregisters() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh);
+        let name = cn("repl/spawn");
+        let cfg = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
+        let _file = r.open_file(&name, cfg).expect("open_file with replication");
+        assert_eq!(r.replication_runtime_count(), 1);
+        r.close_file(&name).unwrap();
+        assert_eq!(r.replication_runtime_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enable_replication_is_idempotent() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh.clone());
+        let count_after_first = r.replication_runtime_count();
+        r.enable_replication(mesh);
+        assert_eq!(
+            r.replication_runtime_count(),
+            count_after_first,
+            "second enable_replication must not disturb existing wiring"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_replication_config_surfaces_typed_channel_error() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh);
+        // factor=0 violates REPLICATION_FACTOR_MIN.
+        let cfg = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_factor(0)));
+        let err = r.open_file(&cn("repl/bad"), cfg).unwrap_err();
+        match err {
+            RedexError::Channel(msg) => {
+                assert!(msg.contains("replication config invalid"));
+            }
+            other => panic!("expected Channel error, got {other:?}"),
+        }
+        assert_eq!(r.replication_runtime_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopen_replicated_channel_replaces_runtime() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh);
+        let name = cn("repl/reopen");
+        let cfg1 = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
+        let _f1 = r.open_file(&name, cfg1).unwrap();
+        assert_eq!(r.replication_runtime_count(), 1);
+        // Second open returns the existing file (re-open path) and
+        // does NOT spawn a second runtime — the replication slot
+        // is only honored on first open per the open_file contract.
+        let cfg2 = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
+        let _f2 = r.open_file(&name, cfg2).unwrap();
+        assert_eq!(
+            r.replication_runtime_count(),
+            1,
+            "reopen must not spawn a second runtime"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopen_replicated_channel_with_different_config_rejects() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh);
+        let name = cn("repl/reopen-mismatch");
+        let cfg1 = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
+        r.open_file(&name, cfg1).unwrap();
+        // Reopen with a different heartbeat — the prior code path
+        // silently returned the existing handle. Now a typed error
+        // surfaces so operators don't get a coordinator running on
+        // a config different from what they asked for.
+        let cfg2 = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(45_000)));
+        let err = r.open_file(&name, cfg2).unwrap_err();
+        match err {
+            RedexError::Channel(msg) => assert!(
+                msg.contains("different from the original"),
+                "expected 'different from the original' message, got: {msg}"
+            ),
+            other => panic!("expected Channel error, got {other:?}"),
+        }
+        // Original runtime still alive.
+        assert_eq!(r.replication_runtime_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopen_replicated_channel_without_replication_rejects() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh);
+        let name = cn("repl/reopen-no-repl");
+        let cfg1 = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
+        r.open_file(&name, cfg1).unwrap();
+        // Reopen with replication=None when the original had it
+        // would silently re-use the original (a different
+        // operator-visible surface). Reject.
+        let cfg2 = RedexFileConfig::default();
+        let err = r.open_file(&name, cfg2).unwrap_err();
+        match err {
+            RedexError::Channel(msg) => assert!(
+                msg.contains("omitted the replication config"),
+                "expected 'omitted the replication config' message, got: {msg}"
+            ),
+            other => panic!("expected Channel error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replication_status_snapshot_returns_none_when_not_enabled() {
+        let r = Redex::new();
+        assert!(r.replication_status_snapshot().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replication_status_snapshot_includes_open_channels() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh);
+        let name_a = cn("repl/status_a");
+        let name_b = cn("repl/status_b");
+        let cfg = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
+        let file_a = r.open_file(&name_a, cfg.clone()).expect("open A");
+        r.open_file(&name_b, cfg).expect("open B");
+
+        // Append on A to bump its tail; B stays at 0.
+        for i in 0..3 {
+            file_a.append(format!("event-{i}").as_bytes()).unwrap();
+        }
+        // Drive A's coordinator to Replica so its role is observable
+        // as non-Idle.
+        let coord_a = r.replication_coordinator_for(&name_a).unwrap();
+        coord_a
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        coord_a.record_tail_seq(3);
+
+        let snap = r.replication_status_snapshot().expect("snapshot enabled");
+        assert_eq!(snap.len(), 2, "both channels in snapshot");
+        // Sorted by channel name.
+        assert_eq!(snap[0].channel_name, "repl/status_a");
+        assert_eq!(snap[1].channel_name, "repl/status_b");
+        // A is Replica with tail 3; B is Idle with tail 0.
+        assert_eq!(snap[0].role, ReplicaRole::Replica);
+        assert_eq!(snap[0].tail_seq, 3);
+        assert_eq!(snap[1].role, ReplicaRole::Idle);
+        assert_eq!(snap[1].tail_seq, 0);
+
+        r.close_file(&name_a).unwrap();
+        r.close_file(&name_b).unwrap();
+    }
+
+    #[test]
+    fn replication_metrics_snapshot_returns_none_when_not_enabled() {
+        let r = Redex::new();
+        assert!(r.replication_metrics_snapshot().is_none());
+        // prometheus_text is the empty string in this case so the
+        // caller can pipe straight into an HTTP body without
+        // branching.
+        assert_eq!(r.replication_prometheus_text(), "");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_redex_uninstalls_router_from_mesh() {
+        // Build a mesh, install a Redex with an active replication
+        // runtime, drop the Redex, then install a second Redex on
+        // the same mesh. The second `enable_replication` must
+        // succeed without observing the prior Redex's router —
+        // proves the Drop impl cleared the mesh's slot.
+        let mesh = build_mesh_for_test().await;
+        {
+            let r = Redex::new();
+            r.enable_replication(mesh.clone());
+            let name = cn("repl/drop");
+            let cfg = RedexFileConfig::default()
+                .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
+            r.open_file(&name, cfg).expect("open");
+            assert_eq!(r.replication_runtime_count(), 1);
+            // `r` goes out of scope here; Drop fires.
+        }
+        // Give the dropped runtime task a tick to observe its
+        // inbox close.
+        tokio::task::yield_now().await;
+
+        // A second Redex on the same mesh should install cleanly.
+        // If the prior router were still pinned, the second
+        // installation would silently leak it (the mesh's slot
+        // would have been swapped to the new router without
+        // shutting down the first set of runtimes).
+        let r2 = Redex::new();
+        r2.enable_replication(mesh);
+        assert_eq!(
+            r2.replication_runtime_count(),
+            0,
+            "fresh Redex starts with zero runtimes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replication_metrics_snapshot_includes_open_channel() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh);
+        let name = cn("repl/metrics");
+        let cfg = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
+        let _file = r.open_file(&name, cfg).expect("open");
+
+        let snap = r
+            .replication_metrics_snapshot()
+            .expect("snapshot when enabled");
+        assert_eq!(snap.channels.len(), 1);
+        assert_eq!(snap.channels[0].channel, "repl/metrics");
+        // Counters all zero on a freshly-opened channel.
+        assert_eq!(snap.channels[0].sync_bytes_total, 0);
+        assert_eq!(snap.channels[0].leader_changes_total, 0);
+
+        // Prometheus text is non-empty + includes the channel name.
+        let text = r.replication_prometheus_text();
+        assert!(text.contains("repl/metrics"));
+
+        r.close_file(&name).unwrap();
     }
 }

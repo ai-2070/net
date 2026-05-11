@@ -114,7 +114,7 @@ describe('RedexTailIter', () => {
     const first = await iter.next();
     expect(first).not.toBeNull();
 
-    file.close();
+    await file.close();
     // The next `.next()` either resolves null (stream ended cleanly
     // via the Closed error mapping) or unblocks promptly; we bound
     // it so a regression that hangs the tail is visible.

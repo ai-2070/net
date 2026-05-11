@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use super::replication_config::ReplicationConfig;
+
 /// Disk-side fsync policy for persistent `RedexFile`s.
 ///
 /// Governs **only** the append path on the disk mirror. `close()` and
@@ -86,7 +88,13 @@ pub enum FsyncPolicy {
 }
 
 /// Per-file configuration supplied at `Redex::open_file` time.
-#[derive(Debug, Clone, Copy)]
+///
+/// Was `Copy` pre-replication. The `replication` field carries a
+/// `Vec<NodeId>` when [`PlacementStrategy::Pinned`](super::replication_config::PlacementStrategy::Pinned) is in use, so
+/// the type is now `Clone`-only. The struct is small and rarely
+/// passed in hot paths; existing callers add a `.clone()` where they
+/// previously relied on bit-copy semantics.
+#[derive(Debug, Clone)]
 pub struct RedexFileConfig {
     /// Heap-only (`false`) vs heap + simple disk segment (`true`).
     ///
@@ -140,6 +148,17 @@ pub struct RedexFileConfig {
     /// tune down to reclaim memory faster from misbehaving
     /// subscribers. Default: 1024.
     pub tail_buffer_size: usize,
+
+    /// Cross-node replication opt-in per
+    /// `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §1. `None` (default)
+    /// keeps the file single-node; `Some(cfg)` opts the channel
+    /// into the `ReplicationCoordinator` lifecycle Phase C wires.
+    ///
+    /// Validate via `cfg.validate()` before committing to a
+    /// `Redex`; Phase C's `Redex::open_file` will surface a typed
+    /// `ReplicationConfigError` if the field is `Some(cfg)` with
+    /// `cfg.validate().is_err()`.
+    pub replication: Option<ReplicationConfig>,
 }
 
 impl Default for RedexFileConfig {
@@ -152,6 +171,7 @@ impl Default for RedexFileConfig {
             retention_max_bytes: None,
             retention_max_age_ns: None,
             tail_buffer_size: 1024,
+            replication: None,
         }
     }
 }
@@ -206,6 +226,16 @@ impl RedexFileConfig {
     /// See the field doc on [`Self::tail_buffer_size`].
     pub fn with_tail_buffer_size(mut self, size: usize) -> Self {
         self.tail_buffer_size = size;
+        self
+    }
+
+    /// Opt the channel into cross-node replication. Pass `None` to
+    /// restore single-node behavior. The supplied
+    /// [`ReplicationConfig`] should validate cleanly (see
+    /// [`ReplicationConfig::validate`]); Phase C's `Redex::open_file`
+    /// surfaces validation errors typed.
+    pub fn with_replication(mut self, replication: Option<ReplicationConfig>) -> Self {
+        self.replication = replication;
         self
     }
 }

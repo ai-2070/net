@@ -702,6 +702,40 @@ The wire format is byte-identical across all five bindings (Rust /
 TS / Python / Go / C) — pinned by JSON fixtures under
 `tests/cross_lang_capability/`.
 
+## Storage + cross-node RedEX replication
+
+`net_sdk` is the event-bus wrapper; the storage surface (CortEX
+adapters, NetDB, raw `Redex` / `RedexFile`) lives on the underlying
+**`net`** PyO3 package, same as the security and groups surfaces.
+RedEX channels can replicate across the mesh — opt in per channel
+with `replication=True` on `Redex.open_file` after calling
+`Redex.enable_replication(mesh)`:
+
+```python
+from net import NetMesh, Redex
+
+mesh = NetMesh(bind_addr='127.0.0.1:0', psk='...')
+redex = Redex(persistent_dir='/var/lib/net/events')
+redex.enable_replication(mesh)
+
+file = redex.open_file(
+    'orders/audit',
+    replication=True,
+    replication_factor=3,
+    replication_heartbeat_ms=500,
+    replication_placement='standard',
+)
+file.append(b'event payload')
+```
+
+Failover uses a deterministic nearest-RTT election with NodeId
+tie-break — no broadcast / no epoch. `Redex.replication_prometheus_text()`
+renders the seven per-channel metric shapes for an HTTP scrape
+endpoint. See the native `net` package's README for the full
+config surface (`replication_pinned_nodes`, `replication_leader_pinned`,
+`replication_on_under_capacity`, `replication_budget_fraction`) and
+operator semantics.
+
 ## API
 
 | Method | Description |

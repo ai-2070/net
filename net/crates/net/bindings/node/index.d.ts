@@ -856,9 +856,9 @@ export declare class NetMesh {
   findNodes(filter: CapabilityFilterJs): Array<bigint>
   /**
    * Scoped variant of [`Self::find_nodes`]. Filters candidates
-   * through a [`crate::capabilities::ScopeFilterJs`] derived
-   * from each node's `scope:*` reserved tags. Untagged nodes
-   * stay visible under most filters by design; nodes tagged
+   * through a `ScopeFilterJs` (derived from each node's
+   * `scope:*` reserved tags). Untagged nodes stay visible
+   * under most filters by design; nodes tagged
    * `scope:subnet-local` only show up under `sameSubnet`.
    */
   findNodesScoped(filter: CapabilityFilterJs, scope: ScopeFilterJs): Array<bigint>
@@ -891,19 +891,6 @@ export declare class NetMesh {
   unregisterPlacementFilter(id: string): boolean
   /** Whether `id` is currently registered. Mainly for tests. */
   hasPlacementFilter(id: string): boolean
-  /**
-   * **Test-only** helper for the vitest groups suite.
-   * Injects a synthetic capability announcement directly
-   * into the local capability index, simulating a peer
-   * announcement without going through a real handshake.
-   *
-   * Gated behind the `test-helpers` feature so it is
-   * **not** exported to production JS consumers. Enabling
-   * `groups` alone does not pull this in; vitest builds with
-   * `--features groups,test-helpers` explicitly. Production
-   * code uses the normal `announce_capabilities` path.
-   */
-  testInjectSyntheticPeer(nodeId: bigint): void
 }
 
 /**
@@ -931,6 +918,41 @@ export declare class Redex {
    * and replay from those files on reopen. Heap-only when omitted.
    */
   constructor(persistentDir?: string | undefined | null)
+  /**
+   * Install cross-node replication wiring rooted at `mesh`. After
+   * this returns, `openFile` calls with
+   * `config.replication = { ... }` spawn per-channel replication
+   * runtimes. Idempotent — repeated calls leave the existing
+   * wiring in place (the second installation would orphan every
+   * per-channel runtime registered under the first).
+   *
+   * Gated on the `net` feature: replication requires a
+   * `NetMesh`, which only ships when `net` is enabled. Build the
+   * Node binding with both `--features cortex` and `--features
+   * net` (or any superset) to expose this method.
+   *
+   * See `CONFIG_REPLICATION.md` for the full operator surface.
+   */
+  enableReplication(mesh: NetMesh): void
+  /**
+   * Count of per-channel replication runtimes currently registered
+   * on this manager. `0` when replication isn't enabled. Useful
+   * for tests + operator observability.
+   */
+  replicationRuntimeCount(): number
+  /**
+   * Render the replication metrics as Prometheus text. Returns
+   * the empty string when replication isn't enabled —
+   * convenient for piping into an HTTP scrape endpoint without
+   * branching.
+   *
+   * Covers the seven per-channel shapes from
+   * `CONFIG_REPLICATION.md`: `*_lag_seconds{role}`,
+   * `*_sync_bytes_total`, `*_leader_changes_total`,
+   * `*_under_capacity_total`, `*_skip_ahead_total`,
+   * `*_election_thrash_total`, `*_witness_withdrawals_total`.
+   */
+  replicationPrometheusText(): string
   /**
    * Open (or get) a raw RedEX file bound to `channelName`. Returns
    * a handle for append / tail / read operations without going
@@ -992,13 +1014,22 @@ export declare class RedexFile {
   /**
    * Explicit fsync. Always fsyncs regardless of configured
    * `fsyncPolicy`. No-op on heap-only files.
+   *
+   * Declared `async` so the disk flush runs on a napi worker
+   * thread rather than the JavaScript event-loop thread —
+   * without this, a `persistent: true` channel's fsync stalls
+   * every other JS callback until the kernel completes the
+   * write.
    */
-  sync(): void
+  sync(): Promise<void>
   /**
    * Close the file. Outstanding tail iterators resolve with a
    * `redex:` error on their next `.next()` call.
+   *
+   * Declared `async` for the same reason as `sync` — close
+   * flushes pending writes on persistent files.
    */
-  close(): void
+  close(): Promise<void>
 }
 
 /** Async iterator over a live `RedexFile::tail`. */
@@ -1383,11 +1414,11 @@ export interface CapabilityFilterJs {
   requireTags?: Array<string>
   requireModels?: Array<string>
   requireTools?: Array<string>
-  minMemoryMb?: number
+  minMemoryGb?: number
   requireGpu?: boolean
   /** Lowercase vendor name; see `GpuInfoJs::vendor`. */
   gpuVendor?: string
-  minVramMb?: number
+  minVramGb?: number
   minContextLength?: number
   requireModalities?: Array<string>
 }
@@ -2062,6 +2093,14 @@ export interface RedexFileConfigJs {
    * retention sweep.
    */
   retentionMaxAgeMs?: bigint
+  /**
+   * Opt the channel into cross-node replication. When set, the
+   * owning `Redex` must have called `enableReplication(mesh)`
+   * first — otherwise `openFile` rejects with a typed
+   * `redex:` error. Leave unset (or `null`) for single-node
+   * behavior. See `CONFIG_REPLICATION.md` for field semantics.
+   */
+  replication?: ReplicationConfigJs
 }
 
 /** Redis adapter configuration. */
@@ -2092,6 +2131,56 @@ export interface ReplicaGroupConfigJs {
   groupSeed: Buffer
   lbStrategy: StrategyJs
   hostConfig?: GroupHostConfigJs
+}
+
+/**
+ * Opt-in cross-node replication settings for a RedEX channel.
+ * Mirrors `ReplicationConfig` from the core. All fields are
+ * optional — omitted ones fall back to the core's defaults
+ * (`factor=3`, `heartbeat_ms=500`, `placement=Standard`,
+ * `on_under_capacity=Withdraw`, `replication_budget_fraction=0.5`).
+ */
+export interface ReplicationConfigJs {
+  /**
+   * Replication factor (replicas including the leader). Range
+   * `[1, 16]`. Defaults to `3` when omitted.
+   */
+  factor?: number
+  /**
+   * Heartbeat cadence between leader → replicas in milliseconds.
+   * Minimum `100`. Defaults to `500` when omitted.
+   */
+  heartbeatMs?: bigint
+  /**
+   * Placement strategy. One of `"standard"` (default), `"pinned"`,
+   * or `"colocation-strict"`. With `"pinned"` the `pinned_nodes`
+   * field is required and pins the effective replication factor
+   * to the list length.
+   */
+  placement?: string
+  /**
+   * Pinned `NodeId` list, required when `placement = "pinned"`.
+   * Ignored otherwise.
+   */
+  pinnedNodes?: Array<bigint>
+  /**
+   * Pin the leader to a specific `NodeId`. Optional; the
+   * deterministic election picks the lowest-RTT healthy replica
+   * when omitted.
+   */
+  leaderPinned?: bigint
+  /**
+   * Behavior on disk-pressure. `"withdraw"` (default) drops the
+   * replica role; `"evict-oldest"` calls retention sweep and
+   * retries.
+   */
+  onUnderCapacity?: string
+  /**
+   * Bandwidth budget for replication-sync I/O as a fraction of
+   * measured NIC peak. Range `(0.0, 1.0]`. Defaults to `0.5`
+   * when omitted.
+   */
+  replicationBudgetFraction?: number
 }
 
 /**

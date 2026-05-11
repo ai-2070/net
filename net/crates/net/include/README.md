@@ -483,6 +483,130 @@ net_mesh_stream_t   // Opaque per-peer stream handle.
 - [`net/README.md`](../README.md) — architectural overview, NAT
   traversal design, channel visibility model.
 
+## RedEX storage + cross-node replication
+
+The `libnet` cdylib exposes a C ABI for the `Redex` storage
+primitive — `Redex` lifecycle, `RedexFile::open` / `append` /
+`tail` / `read_range`, and the cross-node replication operator
+surface. Symbols live alongside the mesh / capability / nRPC
+families in the same library; no separate `libnet_redex` is shipped.
+
+```c
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct RedexHandle RedexHandle;
+typedef struct RedexFileHandle RedexFileHandle;
+typedef struct ArcMeshNode ArcMeshNode;
+
+extern RedexHandle* net_redex_new(const char* persistent_dir);
+extern void net_redex_free(RedexHandle* h);
+
+typedef struct RedexTailHandle RedexTailHandle;
+
+extern int net_redex_open_file(
+    RedexHandle* redex,
+    const char* name,
+    const char* config_json,
+    RedexFileHandle** out_handle
+);
+extern int net_redex_file_append(
+    RedexFileHandle* file,
+    const uint8_t* payload,
+    size_t payload_len,
+    uint64_t* out_seq
+);
+extern int net_redex_file_read_range(
+    RedexFileHandle* file,
+    uint64_t start,
+    uint64_t end,
+    char** out_json,
+    size_t* out_len
+);
+extern int net_redex_file_sync(RedexFileHandle* file);
+extern uint64_t net_redex_file_len(RedexFileHandle* file);
+extern int net_redex_file_close(RedexFileHandle* file);
+extern void net_redex_file_free(RedexFileHandle* file);
+
+/* Tail cursor */
+extern int net_redex_file_tail(
+    RedexFileHandle* file,
+    uint64_t from_seq,
+    RedexTailHandle** out_cursor
+);
+extern int net_redex_tail_next(
+    RedexTailHandle* cursor,
+    uint32_t timeout_ms,
+    char** out_json,
+    size_t* out_len
+);
+extern void net_redex_tail_free(RedexTailHandle* cursor);
+
+/* Replication (require `Arc<MeshNode>` from `net_mesh_arc_clone`) */
+extern int net_redex_enable_replication(
+    RedexHandle* redex,
+    ArcMeshNode* mesh_arc
+);
+extern uint32_t net_redex_replication_runtime_count(const RedexHandle* redex);
+extern char* net_redex_replication_prometheus_text(const RedexHandle* redex);
+extern void net_free_string(char* s);
+```
+
+**Config wire shape.** `net_redex_open_file` consumes a JSON config
+string. The replication opt-in is a nested `replication` field;
+omit it for single-node behavior. Numeric fields default to the
+core's defaults when omitted (`factor=3`, `heartbeat_ms=500`,
+`replication_budget_fraction=0.5`).
+
+```json
+{
+  "persistent": true,
+  "retention_max_events": 1000000,
+  "replication": {
+    "factor": 3,
+    "heartbeat_ms": 500,
+    "placement": "standard",
+    "on_under_capacity": "withdraw",
+    "replication_budget_fraction": 0.5
+  }
+}
+```
+
+`placement` is `"standard"` (default; `PlacementFilter`-driven),
+`"pinned"` (requires `pinned_nodes: [u64]`), or
+`"colocation_strict"`. `on_under_capacity` is `"withdraw"`
+(default) or `"evict_oldest"` (requires `retention_max_*` caps).
+
+**Replication lifecycle.** Call `net_redex_enable_replication` on
+each `Redex` that participates, passing an `ArcMeshNode*` obtained
+from `net_mesh_arc_clone(mesh_handle)`. The call consumes the
+`Arc<MeshNode>` pointer — DO NOT free it again. Idempotent on
+repeated calls. After this returns, `net_redex_open_file` with a
+populated `replication` field spawns one runtime task per channel;
+single-node `open_file` calls keep their existing zero-wire-traffic
+behavior.
+
+Failover uses a deterministic nearest-RTT election with NodeId
+tie-break — no broadcast, no epoch. Failure-detection window is
+`3 × heartbeat_ms` (three-missed hysteresis); the election runs in
+the same tick that detects silence (microseconds-scale window).
+
+**Prometheus scrape.**
+`net_redex_replication_prometheus_text(redex)` returns a
+heap-allocated NUL-terminated string with the seven per-channel
+metric shapes (`*_lag_seconds`, `*_sync_bytes_total`,
+`*_leader_changes_total`, `*_under_capacity_total`,
+`*_skip_ahead_total`, `*_election_thrash_total`,
+`*_witness_withdrawals_total`). Returns an empty string (still
+heap-allocated, still NUL-terminated) when replication isn't
+enabled — pipe straight into an HTTP scrape body. Free with
+`net_free_string`. Returns NULL only on a NULL `redex` handle.
+
+Error codes: `0` = success, `-1` = NULL pointer, `-103`
+(`NET_ERR_REDEX`) = generic Redex / replication failure (invalid
+config, channel-name validation, `replication: {...}` set without
+`enable_replication` having been called, etc.).
+
 ## nRPC (request / response over the mesh)
 
 nRPC is the request/response convention layer (deadlines,

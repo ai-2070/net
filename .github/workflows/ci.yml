@@ -71,6 +71,18 @@ jobs:
         run: cargo test --test integration_placement_filter_callback --features net
       - name: RedEX integration
         run: cargo test --test integration_redex --features redex
+      - name: RedEX replication e2e (real-wire two/three-node)
+        # Pulls in the `net` feature because the e2e suite uses
+        # `MeshNode` + `MeshNodeConfig` for the real-wire NKpsk0
+        # handshake. The `redex` feature is the actual gate (the
+        # tests are `#![cfg(feature = "redex")]`).
+        run: cargo test --test redex_replication_e2e --features "redex net"
+      - name: RedEX replication DST (deterministic simulation)
+        # Single-threaded harness; doesn't need `net` — runs the
+        # production state machine + election + catch-up + tracker
+        # logic against virtual nodes with explicit clock + message
+        # queue + partition matrix.
+        run: cargo test --test redex_replication_dst --features redex
       - name: CortEX adapter integration
         run: cargo test --test integration_cortex_adapter --features cortex
       - name: CortEX tasks integration
@@ -81,6 +93,45 @@ jobs:
         run: cargo test --test integration_netdb --features netdb
       - name: nRPC predicate-header integration
         run: cargo test --test integration_nrpc_predicate_header --features cortex
+
+  loom-tests:
+    name: Loom concurrency models
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Loom builds need their own cache key — the `--cfg loom`
+      # RUSTFLAGS pulls in a different set of dev-deps (`loom`
+      # itself is `[target.'cfg(loom)'.dev-dependencies]`) and
+      # rebuilds every atomic-touching crate with loom's
+      # substitute primitives. Sharing the cache with non-loom
+      # jobs would just thrash both.
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-loom-${{ hashFiles('**/Cargo.lock') }}
+
+      # Loom tests exhaustively explore thread interleavings; release
+      # mode is mandatory (debug builds are too slow to converge in CI
+      # time budget). No feature flags needed — the models in
+      # `loom_models.rs` use loom's substitute atomics standalone,
+      # not the production types.
+      - name: Run loom models
+        run: cargo test --release --test loom_models
+        env:
+          RUSTFLAGS: --cfg loom
 
   rust-sdk-tests:
     name: Rust SDK tests

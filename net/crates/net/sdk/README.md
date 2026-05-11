@@ -834,11 +834,75 @@ For domain-agnostic persistent logs (no CortEX, no fold, no typed
 state), use the `Redex` manager directly via `Redex::open_file`. This
 unlocks `RedexFile::append` / `tail` for custom event pipelines.
 
-See [`docs/STORAGE_AND_CORTEX.md`](../docs/STORAGE_AND_CORTEX.md) for
-the full narrative and
-[`docs/REDEX_PLAN.md`](../docs/REDEX_PLAN.md) /
-[`docs/CORTEX_ADAPTER_PLAN.md`](../docs/CORTEX_ADAPTER_PLAN.md) for the
-design.
+### Cross-node RedEX replication
+
+RedEX channels can replicate across the mesh. Opt in per channel via
+`RedexFileConfig::with_replication(Some(ReplicationConfig::new()))`;
+the default `None` keeps the channel single-node and adds zero wire
+traffic. Replicated channels carry N copies of the log; the leader is
+the single writer, replicas catch up via pull-based sync. Failover
+uses a deterministic nearest-RTT election with NodeId tie-break — no
+broadcast / no epoch / no collection window; every node computes the
+same winner from the same inputs.
+
+```rust
+use std::sync::Arc;
+use net_sdk::mesh::Mesh;
+use net::adapter::net::redex::{
+    PlacementStrategy, Redex, RedexFileConfig, ReplicationConfig,
+};
+
+async fn example(mesh: Arc<Mesh>) -> Result<(), Box<dyn std::error::Error>> {
+    let redex = Arc::new(Redex::new());
+    // Install the per-Redex replication router on the mesh.
+    // Idempotent — safe to call from multiple paths.
+    redex.enable_replication(mesh.node_arc_clone());
+
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_factor(3)
+            .with_heartbeat_ms(500),
+    ));
+    let name = net::adapter::net::channel::ChannelName::new("orders/audit")?;
+    let file = redex.open_file(&name, cfg)?;
+    file.append(b"event payload")?;
+    Ok(())
+}
+```
+
+`ReplicationConfig` knobs: `factor` (1–16, default 3), `heartbeat_ms`
+(min 100, default 500), `placement` (`Standard` / `Pinned(Vec<NodeId>)` /
+`ColocationStrict`), `leader_pinned: Option<NodeId>`,
+`on_under_capacity` (`Withdraw` drops the replica role on disk
+pressure; `EvictOldest` runs retention sweep and retries — requires
+`retention_max_*` caps), `replication_budget_fraction` (sync I/O cap
+as fraction of measured NIC peak, default 0.5).
+
+Operator surface on `Redex`:
+
+- `enable_replication(mesh)` — install replication wiring. Required
+  before `open_file` with `replication: Some(_)`.
+- `replication_runtime_count() -> usize` — registered per-channel
+  runtimes.
+- `replication_metrics_snapshot() -> Option<ReplicationMetricsSnapshot>`
+  — per-channel atomic counters (lag, sync_bytes, leader_changes,
+  under_capacity, skip_ahead, election_thrash, witness_withdrawals).
+- `replication_status_snapshot() -> Option<Vec<ReplicationChannelStatus>>`
+  — per-channel `{channel_name, role, tail_seq}`.
+- `replication_prometheus_text() -> String` — Prometheus-text render
+  of the metrics snapshot. Returns the empty string when replication
+  isn't enabled; pipe straight into an HTTP scrape body without
+  branching.
+- `replication_coordinator_for(name) -> Option<Arc<ReplicationCoordinator>>`
+  — per-channel handle for inspection or forced transitions during
+  recovery / debugging.
+
+Failover takes one heartbeat-detection window (`3 × heartbeat_ms`)
+plus the election (microseconds). Disk-pressure replicas withdraw
+their `causal:` capability tag so peers re-route to a healthy holder.
+Replication overhead is ~1× of single-node append throughput in
+steady state — the runtime task runs on tokio at the heartbeat
+cadence; per-append work is unchanged.
 
 ## nRPC (request / response over the mesh)
 

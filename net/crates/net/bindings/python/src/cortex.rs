@@ -24,8 +24,10 @@ use ::net::adapter::net::cortex::tasks::{
     TasksAdapter as InnerTasksAdapter,
 };
 use ::net::adapter::net::redex::{
-    FsyncPolicy as InnerFsyncPolicy, Redex as InnerRedex, RedexError as InnerRedexError,
-    RedexEvent as InnerRedexEvent, RedexFile as InnerRedexFile, RedexFileConfig,
+    FsyncPolicy as InnerFsyncPolicy, PlacementStrategy as InnerPlacementStrategy,
+    Redex as InnerRedex, RedexError as InnerRedexError, RedexEvent as InnerRedexEvent,
+    RedexFile as InnerRedexFile, RedexFileConfig, ReplicationConfig as InnerReplicationConfig,
+    UnderCapacity as InnerUnderCapacity,
 };
 use bytes::Bytes;
 
@@ -192,6 +194,14 @@ impl PyRedex {
     /// `fsync_every_n` and `fsync_interval_ms` are mutually exclusive;
     /// leave both unset for the default "never fsync on append"
     /// policy (`close()` and explicit `sync()` still fsync).
+    ///
+    /// Cross-node replication: pass `replication=True` to opt the
+    /// channel in. The remaining `replication_*` kwargs tune the
+    /// replication policy (factor, heartbeat cadence, placement,
+    /// disk-pressure policy, bandwidth budget). The owning `Redex`
+    /// must have called `enable_replication(mesh)` first; otherwise
+    /// the call raises `RedexError`. See `CONFIG_REPLICATION.md`
+    /// for the full operator surface.
     #[pyo3(signature = (
         name,
         *,
@@ -201,6 +211,14 @@ impl PyRedex {
         retention_max_events = None,
         retention_max_bytes = None,
         retention_max_age_ms = None,
+        replication = false,
+        replication_factor = None,
+        replication_heartbeat_ms = None,
+        replication_placement = None,
+        replication_pinned_nodes = None,
+        replication_leader_pinned = None,
+        replication_on_under_capacity = None,
+        replication_budget_fraction = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn open_file(
@@ -212,6 +230,14 @@ impl PyRedex {
         retention_max_events: Option<u64>,
         retention_max_bytes: Option<u64>,
         retention_max_age_ms: Option<u64>,
+        replication: bool,
+        replication_factor: Option<u32>,
+        replication_heartbeat_ms: Option<u64>,
+        replication_placement: Option<String>,
+        replication_pinned_nodes: Option<Vec<u64>>,
+        replication_leader_pinned: Option<u64>,
+        replication_on_under_capacity: Option<String>,
+        replication_budget_fraction: Option<f64>,
     ) -> PyResult<PyRedexFile> {
         let channel = ChannelName::new(name).map_err(|e| RedexError::new_err(format!("{}", e)))?;
         let mut cfg = RedexFileConfig {
@@ -243,6 +269,55 @@ impl PyRedex {
         if let Some(ms) = retention_max_age_ms {
             cfg.retention_max_age_ns = Some(ms.saturating_mul(1_000_000));
         }
+        // R-6: if `replication=False` but any other replication
+        // kwarg is set, fail loud rather than silently opening
+        // a single-node file. Operators who typo'd the boolean
+        // (or forgot it entirely) get a clear error instead of
+        // their carefully-tuned settings being silently ignored.
+        if !replication {
+            let stray = [
+                ("replication_factor", replication_factor.is_some()),
+                (
+                    "replication_heartbeat_ms",
+                    replication_heartbeat_ms.is_some(),
+                ),
+                ("replication_placement", replication_placement.is_some()),
+                (
+                    "replication_pinned_nodes",
+                    replication_pinned_nodes.is_some(),
+                ),
+                (
+                    "replication_leader_pinned",
+                    replication_leader_pinned.is_some(),
+                ),
+                (
+                    "replication_on_under_capacity",
+                    replication_on_under_capacity.is_some(),
+                ),
+                (
+                    "replication_budget_fraction",
+                    replication_budget_fraction.is_some(),
+                ),
+            ];
+            let first_set = stray.iter().find(|(_, set)| *set).map(|(n, _)| *n);
+            if let Some(name) = first_set {
+                return Err(RedexError::new_err(format!(
+                    "replication: {name} specified without replication=True; \
+                     set replication=True to opt the channel in, or remove the kwarg"
+                )));
+            }
+        }
+        if replication {
+            cfg.replication = Some(build_replication_config(
+                replication_factor,
+                replication_heartbeat_ms,
+                replication_placement,
+                replication_pinned_nodes,
+                replication_leader_pinned,
+                replication_on_under_capacity,
+                replication_budget_fraction,
+            )?);
+        }
         let file = self
             .inner
             .open_file(&channel, cfg)
@@ -253,6 +328,137 @@ impl PyRedex {
             runtime,
         })
     }
+
+    /// Install cross-node replication wiring rooted at `mesh`. After
+    /// this returns, `open_file` calls with `replication=True` spawn
+    /// per-channel replication runtimes. Idempotent — repeated calls
+    /// leave the existing wiring in place.
+    ///
+    /// Gated on the `net` feature: replication requires a `NetMesh`,
+    /// which only ships when `net` is enabled.
+    ///
+    /// See `CONFIG_REPLICATION.md` for the full operator surface.
+    #[cfg(feature = "net")]
+    fn enable_replication(&self, mesh: &crate::mesh_bindings::NetMesh) -> PyResult<()> {
+        let arc = mesh.node_arc_clone()?;
+        self.inner.enable_replication(arc);
+        Ok(())
+    }
+
+    /// R-7: when this wheel is built without the `net` feature
+    /// (cortex-only build), surface a typed RedexError naming the
+    /// missing feature instead of an `AttributeError` from PyO3.
+    /// Pyo3 takes the first matching `#[pymethods]` arm; the
+    /// `cfg(not(feature = "net"))` variant only exists in the
+    /// degraded build and accepts a `PyObject` so the call site
+    /// (`r.enable_replication(some_mesh)`) doesn't fail with a
+    /// type error before the typed error fires.
+    #[cfg(not(feature = "net"))]
+    #[pyo3(signature = (_mesh = None))]
+    fn enable_replication(&self, _mesh: Option<Py<PyAny>>) -> PyResult<()> {
+        Err(RedexError::new_err(
+            "redex: enable_replication requires the `net` feature; \
+             rebuild with --features net",
+        ))
+    }
+
+    /// Count of per-channel replication runtimes currently registered
+    /// on this manager. `0` when replication isn't enabled. Useful
+    /// for tests and operator observability.
+    fn replication_runtime_count(&self) -> u32 {
+        self.inner.replication_runtime_count() as u32
+    }
+
+    /// Render the replication metrics as Prometheus text. Returns
+    /// the empty string when replication isn't enabled — convenient
+    /// for piping into an HTTP scrape endpoint without branching.
+    ///
+    /// Covers the seven per-channel shapes from
+    /// `CONFIG_REPLICATION.md`: `*_lag_seconds{role}`,
+    /// `*_sync_bytes_total`, `*_leader_changes_total`,
+    /// `*_under_capacity_total`, `*_skip_ahead_total`,
+    /// `*_election_thrash_total`, `*_witness_withdrawals_total`.
+    fn replication_prometheus_text(&self) -> String {
+        self.inner.replication_prometheus_text()
+    }
+}
+
+fn build_replication_config(
+    factor: Option<u32>,
+    heartbeat_ms: Option<u64>,
+    placement: Option<String>,
+    pinned_nodes: Option<Vec<u64>>,
+    leader_pinned: Option<u64>,
+    on_under_capacity: Option<String>,
+    budget_fraction: Option<f64>,
+) -> PyResult<InnerReplicationConfig> {
+    let mut out = InnerReplicationConfig::new();
+    if let Some(f) = factor {
+        if f > u8::MAX as u32 {
+            return Err(RedexError::new_err(format!(
+                "replication_factor must fit in u8 (got {f})"
+            )));
+        }
+        out = out.with_factor(f as u8);
+    }
+    if let Some(hb) = heartbeat_ms {
+        out = out.with_heartbeat_ms(hb);
+    }
+    // R-26: accept ONLY the snake-case canonical form (Python
+    // convention). The kebab-case form is rejected loudly so
+    // error messages stay unambiguous. Operators on the JS side
+    // use kebab-case via the Node binding; that's the canonical
+    // there.
+    out = out.with_placement(match placement.as_deref() {
+        None | Some("standard") => InnerPlacementStrategy::Standard,
+        Some("colocation_strict") => InnerPlacementStrategy::ColocationStrict,
+        Some("pinned") => {
+            let nodes = pinned_nodes.ok_or_else(|| {
+                RedexError::new_err(
+                    "replication_pinned_nodes required when replication_placement = 'pinned'",
+                )
+            })?;
+            // R-27: reject empty pinned_nodes at the binding
+            // layer for a clearer error.
+            if nodes.is_empty() {
+                return Err(RedexError::new_err(
+                    "replication_pinned_nodes must be non-empty when replication_placement = 'pinned'",
+                ));
+            }
+            // R-28: cross-check leader_pinned membership.
+            if let Some(lp) = leader_pinned {
+                if !nodes.contains(&lp) {
+                    return Err(RedexError::new_err(format!(
+                        "replication_leader_pinned {lp} is not in replication_pinned_nodes"
+                    )));
+                }
+            }
+            InnerPlacementStrategy::Pinned(nodes)
+        }
+        Some(other) => {
+            return Err(RedexError::new_err(format!(
+                "unknown replication_placement {other:?}; expected 'standard', 'pinned', or 'colocation_strict'"
+            )));
+        }
+    });
+    if let Some(leader) = leader_pinned {
+        out = out.with_leader_pinned(Some(leader));
+    }
+    out = out.with_on_under_capacity(match on_under_capacity.as_deref() {
+        None | Some("withdraw") => InnerUnderCapacity::Withdraw,
+        Some("evict_oldest") => InnerUnderCapacity::EvictOldest,
+        Some(other) => {
+            return Err(RedexError::new_err(format!(
+                "unknown replication_on_under_capacity {other:?}; expected 'withdraw' or 'evict_oldest'"
+            )));
+        }
+    });
+    if let Some(fr) = budget_fraction {
+        out = out.with_replication_budget_fraction(fr as f32);
+    }
+    out.validate()
+        .map_err(|e| RedexError::new_err(format!("replication config invalid: {e}")))?;
+    Ok(out)
 }
 
 // =========================================================================
@@ -353,11 +559,12 @@ impl PyRedexFile {
     /// early with `iter.close()` or let the iterator run to
     /// `StopIteration` when the file closes.
     #[pyo3(signature = (from_seq = 0))]
-    fn tail(&self, from_seq: u64) -> PyRedexTailIter {
+    fn tail(&self, py: Python<'_>, from_seq: u64) -> PyRedexTailIter {
         use futures::StreamExt;
         let adapter = self.inner.clone();
         let runtime = self.runtime.clone();
-        let stream = runtime.block_on(async move { adapter.tail(from_seq).boxed() });
+        let stream =
+            py.detach(move || runtime.block_on(async move { adapter.tail(from_seq).boxed() }));
         PyRedexTailIter {
             inner: Arc::new(RedexTailIterInner {
                 stream: TokioMutex::new(Some(stream)),
@@ -534,13 +741,16 @@ impl PyTasksAdapter {
     /// `persistent_dir`; otherwise raises `RuntimeError`.
     #[staticmethod]
     #[pyo3(signature = (redex, origin_hash, persistent = false))]
-    fn open(redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
+    fn open(py: Python<'_>, redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
         let runtime = make_runtime()?;
         let redex_inner = redex.inner.clone();
         let cfg = cfg_from_persistent(persistent);
-        let inner = runtime
-            .block_on(async move {
-                InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+                })
             })
             .map_err(|e| CortexError::new_err(format!("TasksAdapter open failed: {}", e)))?;
         Ok(Self {
@@ -554,6 +764,7 @@ impl PyTasksAdapter {
     #[staticmethod]
     #[pyo3(signature = (redex, origin_hash, state_bytes, last_seq = None, persistent = false))]
     fn open_from_snapshot(
+        py: Python<'_>,
         redex: &PyRedex,
         origin_hash: u64,
         state_bytes: &[u8],
@@ -564,16 +775,19 @@ impl PyTasksAdapter {
         let redex_inner = redex.inner.clone();
         let cfg = cfg_from_persistent(persistent);
         let bytes = state_bytes.to_vec();
-        let inner = runtime
-            .block_on(async move {
-                InnerTasksAdapter::open_from_snapshot_with_config(
-                    &redex_inner,
-                    origin_hash,
-                    cfg,
-                    &bytes,
-                    last_seq,
-                )
-                .await
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerTasksAdapter::open_from_snapshot_with_config(
+                        &redex_inner,
+                        origin_hash,
+                        cfg,
+                        &bytes,
+                        last_seq,
+                    )
+                    .await
+                })
             })
             .map_err(|e| {
                 CortexError::new_err(format!("TasksAdapter open_from_snapshot failed: {}", e))
@@ -718,6 +932,7 @@ impl PyTasksAdapter {
     #[allow(clippy::too_many_arguments)]
     fn watch_tasks(
         &self,
+        py: Python<'_>,
         status: Option<&str>,
         title_contains: Option<String>,
         created_after_ns: Option<u64>,
@@ -742,7 +957,7 @@ impl PyTasksAdapter {
         // forwarding task); run via block_on to install the context.
         let runtime = self.runtime.clone();
         let stream: BoxStream<'static, Vec<InnerTask>> =
-            runtime.block_on(async move { w.stream().boxed() });
+            py.detach(move || runtime.block_on(async move { w.stream().boxed() }));
         Ok(new_task_watch_iter(stream, self.runtime.clone()))
     }
 
@@ -773,6 +988,7 @@ impl PyTasksAdapter {
     #[allow(clippy::too_many_arguments)]
     fn snapshot_and_watch_tasks(
         &self,
+        py: Python<'_>,
         status: Option<&str>,
         title_contains: Option<String>,
         created_after_ns: Option<u64>,
@@ -795,7 +1011,8 @@ impl PyTasksAdapter {
         )?;
         let adapter = self.inner.clone();
         let runtime = self.runtime.clone();
-        let (snapshot, stream) = runtime.block_on(async move { adapter.snapshot_and_watch(w) });
+        let (snapshot, stream) =
+            py.detach(move || runtime.block_on(async move { adapter.snapshot_and_watch(w) }));
         Ok((
             snapshot.into_iter().map(PyTask::from).collect(),
             new_task_watch_iter(stream, self.runtime.clone()),
@@ -996,13 +1213,16 @@ impl PyMemoriesAdapter {
     /// `TasksAdapter.open` for `persistent` semantics.
     #[staticmethod]
     #[pyo3(signature = (redex, origin_hash, persistent = false))]
-    fn open(redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
+    fn open(py: Python<'_>, redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
         let runtime = make_runtime()?;
         let redex_inner = redex.inner.clone();
         let cfg = cfg_from_persistent(persistent);
-        let inner = runtime
-            .block_on(async move {
-                InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+                })
             })
             .map_err(|e| CortexError::new_err(format!("MemoriesAdapter open failed: {}", e)))?;
         Ok(Self {
@@ -1015,6 +1235,7 @@ impl PyMemoriesAdapter {
     #[staticmethod]
     #[pyo3(signature = (redex, origin_hash, state_bytes, last_seq = None, persistent = false))]
     fn open_from_snapshot(
+        py: Python<'_>,
         redex: &PyRedex,
         origin_hash: u64,
         state_bytes: &[u8],
@@ -1025,16 +1246,19 @@ impl PyMemoriesAdapter {
         let redex_inner = redex.inner.clone();
         let cfg = cfg_from_persistent(persistent);
         let bytes = state_bytes.to_vec();
-        let inner = runtime
-            .block_on(async move {
-                InnerMemoriesAdapter::open_from_snapshot_with_config(
-                    &redex_inner,
-                    origin_hash,
-                    cfg,
-                    &bytes,
-                    last_seq,
-                )
-                .await
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerMemoriesAdapter::open_from_snapshot_with_config(
+                        &redex_inner,
+                        origin_hash,
+                        cfg,
+                        &bytes,
+                        last_seq,
+                    )
+                    .await
+                })
             })
             .map_err(|e| {
                 CortexError::new_err(format!("MemoriesAdapter open_from_snapshot failed: {}", e))
@@ -1203,6 +1427,7 @@ impl PyMemoriesAdapter {
     #[allow(clippy::too_many_arguments)]
     fn watch_memories(
         &self,
+        py: Python<'_>,
         source: Option<String>,
         content_contains: Option<String>,
         tag: Option<String>,
@@ -1233,7 +1458,7 @@ impl PyMemoriesAdapter {
         )?;
         let runtime = self.runtime.clone();
         let stream: BoxStream<'static, Vec<InnerMemory>> =
-            runtime.block_on(async move { w.stream().boxed() });
+            py.detach(move || runtime.block_on(async move { w.stream().boxed() }));
         Ok(new_memory_watch_iter(stream, self.runtime.clone()))
     }
 
@@ -1257,6 +1482,7 @@ impl PyMemoriesAdapter {
     #[allow(clippy::too_many_arguments)]
     fn snapshot_and_watch_memories(
         &self,
+        py: Python<'_>,
         source: Option<String>,
         content_contains: Option<String>,
         tag: Option<String>,
@@ -1287,7 +1513,8 @@ impl PyMemoriesAdapter {
         )?;
         let adapter = self.inner.clone();
         let runtime = self.runtime.clone();
-        let (snapshot, stream) = runtime.block_on(async move { adapter.snapshot_and_watch(w) });
+        let (snapshot, stream) =
+            py.detach(move || runtime.block_on(async move { adapter.snapshot_and_watch(w) }));
         Ok((
             snapshot.into_iter().map(PyMemory::from).collect(),
             new_memory_watch_iter(stream, self.runtime.clone()),
@@ -1465,6 +1692,7 @@ impl PyNetDb {
         with_memories = false,
     ))]
     fn open(
+        py: Python<'_>,
         origin_hash: u64,
         persistent_dir: Option<String>,
         persistent: bool,
@@ -1483,12 +1711,17 @@ impl PyNetDb {
         };
 
         let tasks = if with_tasks {
-            Some(PyTasksAdapter::open(&redex, origin_hash, persistent)?)
+            Some(PyTasksAdapter::open(py, &redex, origin_hash, persistent)?)
         } else {
             None
         };
         let memories = if with_memories {
-            Some(PyMemoriesAdapter::open(&redex, origin_hash, persistent)?)
+            Some(PyMemoriesAdapter::open(
+                py,
+                &redex,
+                origin_hash,
+                persistent,
+            )?)
         } else {
             None
         };
@@ -1510,6 +1743,7 @@ impl PyNetDb {
         with_memories = false,
     ))]
     fn open_from_snapshot(
+        py: Python<'_>,
         bundle: &[u8],
         origin_hash: u64,
         persistent_dir: Option<String>,
@@ -1534,13 +1768,14 @@ impl PyNetDb {
         let tasks = if with_tasks {
             match snapshot.tasks {
                 Some((bytes, last_seq)) => Some(PyTasksAdapter::open_from_snapshot(
+                    py,
                     &redex,
                     origin_hash,
                     &bytes,
                     last_seq,
                     persistent,
                 )?),
-                None => Some(PyTasksAdapter::open(&redex, origin_hash, persistent)?),
+                None => Some(PyTasksAdapter::open(py, &redex, origin_hash, persistent)?),
             }
         } else {
             None
@@ -1549,13 +1784,19 @@ impl PyNetDb {
         let memories = if with_memories {
             match snapshot.memories {
                 Some((bytes, last_seq)) => Some(PyMemoriesAdapter::open_from_snapshot(
+                    py,
                     &redex,
                     origin_hash,
                     &bytes,
                     last_seq,
                     persistent,
                 )?),
-                None => Some(PyMemoriesAdapter::open(&redex, origin_hash, persistent)?),
+                None => Some(PyMemoriesAdapter::open(
+                    py,
+                    &redex,
+                    origin_hash,
+                    persistent,
+                )?),
             }
         } else {
             None

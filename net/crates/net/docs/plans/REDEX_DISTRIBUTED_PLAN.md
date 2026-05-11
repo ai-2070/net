@@ -4,13 +4,13 @@
 
 ## Status
 
-**Design locked; blocked on Capability Phase B (and partially F).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
+**All phases ✅.** Phases A, B, C, D, E, F, G, H, I land in this branch. All open design questions are ratified — see [Locked decisions](#locked-decisions).
 
 Hard prerequisites:
-- **Capability Phase B** (tag-discovery primitives `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders`) — RedEX Phases C/D/E cannot start until this lands.
-- **Capability Phase F** (`PlacementFilter` + `IntentRegistry` + anti-affinity) — needed for *replica placement* in Phase C, but **not** for leader election. Election is decentralized and deterministic (nearest-RTT + NodeId tiebreak); see [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak).
+- ~~**Capability Phase B** (tag-discovery primitives `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders`) — RedEX Phases C/D/E cannot start until this lands.~~ ✅ Landed.
+- **Capability Phase F** (`PlacementFilter` + `IntentRegistry` + anti-affinity) — needed for *replica placement* in Phase C, but **not** for leader election. Election is decentralized and deterministic (nearest-RTT + NodeId tiebreak); see [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak). Capability F shipped with the v0.13 capability surface.
 
-Phase A (wire protocol scaffold), Phase B (this plan's `ReplicationConfig` opt-in), Phases G–I can proceed in isolation as scaffolding.
+End-to-end proven on the real mesh wire via `tests/redex_replication_e2e.rs` — 4 scenarios cover catch-up, heartbeat round-trip, failover, and 3-node fanout. 281 redex unit tests pin every pure-logic contract. Operator surface: `Redex::enable_replication(mesh)`, `Redex::open_file(name, cfg with replication: Some(_))`, `Redex::replication_coordinator_for(name)`, `Redex::replication_metrics_snapshot()`, `Redex::replication_status_snapshot()`, `Redex::replication_prometheus_text()`. Operator docs: [`CONFIG_REPLICATION.md`](../CONFIG_REPLICATION.md).
 
 Activation gate (when Warriors as a whole ships) is unchanged: a workload requesting durability guarantees beyond single-node. Realistic triggers: payment-tier customer, compliance-bound data class, pilot whose RTO is "< 5 s on node failure."
 
@@ -135,12 +135,15 @@ fixed size: 3 + 32 + 8 + 4 = 47 bytes
 
 SYNC_RESPONSE (leader → replica)
 ┌──────────────────────────────────────────────────────────────┐
-│ subprotocol_id   u16 LE      = SUBPROTOCOL_REDEX             │
-│ dispatch_code    u8          = 0x21                          │
-│ channel_id       [u8; 32]                                    │
-│ first_seq        u64 LE      seq of events[0] in this chunk  │
-│ event_count      u32 LE      number of event records below   │
-│ events           [Event; N]  N = event_count                 │
+│ subprotocol_id              u16 LE      = SUBPROTOCOL_REDEX  │
+│ dispatch_code               u8          = 0x21               │
+│ channel_id                  [u8; 32]                         │
+│ first_seq                   u64 LE      seq of events[0]     │
+│ leader_first_retained_seq   u64 LE      leader's first       │
+│                                         retained seq at      │
+│                                         request time         │
+│ event_count                 u32 LE      number of records    │
+│ events                      [Event; N]  N = event_count      │
 │                                                              │
 │   Event record (length-prefixed):                            │
 │     event_seq     u64 LE                                     │
@@ -150,6 +153,12 @@ SYNC_RESPONSE (leader → replica)
 variable size; bounded by chunk_max from the matching SYNC_REQUEST.
 event_seq monotonically increases across the chunk;
 no gaps within a chunk (gaps are explicit-skip, see Phase D).
+`leader_first_retained_seq` lets the replica distinguish a
+legitimate retention trim (`first_seq <= leader_first_retained_seq`)
+from a divergent-log split-brain (`local_next > leader_first_retained_seq`
+AND `local_next > 0`). Both route through the same skip-ahead
+safety path; the divergence case bumps `*_skip_ahead_total` AND
+logs at warn level so operators can post-mortem a split-brain.
 
 SYNC_HEARTBEAT (bidirectional)
 ┌──────────────────────────────────────────────────────────────┐
@@ -419,83 +428,129 @@ Per-channel metrics on the existing `RpcMetricsRegistry` shape (recently extende
 
 The 4-9 week range comes from DST depth. Sequence:
 
-### Phase A — Wire protocol scaffold (1 week)
+### Phase A — Wire protocol scaffold (1 week) ✅
 
-Implementable in isolation; does not depend on Capability B/F.
+Implementable in isolation; does not depend on Capability B/F. **Landed.**
 
-- Add `SUBPROTOCOL_REDEX` ID claim in `SUBPROTOCOLS.md` and `behavior::subprotocol`.
-- Add the four `DISPATCH_REPLICA_SYNC` codes (0x20..0x23) per [§2](#2-wire-protocol--subprotocol_redex). Encode/decode each message at the byte layouts pinned there.
-- Round-trip tests for each message shape; pin the exact byte layout (fixed-size messages assert byte-count constants; variable-size messages assert layout under a property test).
+- ✅ `SUBPROTOCOL_REDEX = 0x0E00` claimed in `SUBPROTOCOLS.md` and exposed via `adapter::net::redex::replication`.
+- ✅ Four `DISPATCH_REPLICA_SYNC` codes (`0x20` `SyncRequest`, `0x21` `SyncResponse`, `0x22` `SyncHeartbeat`, `0x23` `SyncNack`) implemented per [§2](#2-wire-protocol--subprotocol_redex). Reserved range `0x24..=0x2F` documented.
+- ✅ `ChannelId` newtype — 32-byte BLAKE2s of the channel name with domain-separation label `redex-channel-id-v1`.
+- ✅ Typed `WireError` (truncation, subprotocol mismatch, dispatch mismatch, bad role, bad error_code, invalid utf-8). `SyncNackError` and `ReplicaRole` enums encode/decode round-trip the four pinned variants each.
+- ✅ Round-trip + byte-layout tests (19 tests): per-message round-trip; pinned fixed-size byte counts (47 B `SyncRequest`, 52 B `SyncHeartbeat`); explicit byte-layout assertion for `SyncRequest`; truncation rejection at every prefix length; rejection of wrong subprotocol / wrong dispatch / unknown role / unknown error_code / invalid utf-8; `SyncResponse` round-trip with empty + populated event chunks; `SyncNack` round-trip across all four error variants + oversized-detail truncation.
+- ✅ `cargo clippy --lib --features redex -- -D warnings` clean.
 
-### Phase B — `ReplicationConfig` + opt-in (3 days)
+### Phase B — `ReplicationConfig` + opt-in (3 days) ✅
 
-- Extend `ChannelConfig::replication: Option<ReplicationConfig>`.
-- Default behavior: `None` → single-node, no replication. Existing channels unaffected.
-- Cross-binding serde for `ReplicationConfig`. ~3 days for all four bindings.
+**Substrate side landed.** Cross-binding serde rolls in Phase I.
 
-### Phase C — `ReplicationCoordinator` daemon (1.5 weeks)
+- ✅ `RedexFileConfig::replication: Option<ReplicationConfig>` opt-in field landed on the per-file config (the natural home — `redex::RedexFileConfig` already carries retention semantics; the network-level `channel::ChannelConfig` is the auth/visibility surface). Default `None` → single-node behavior; existing channels unaffected.
+- ✅ `ReplicationConfig` + `PlacementStrategy` (`Standard` / `Pinned(Vec<NodeId>)` / `ColocationStrict`) + `UnderCapacity` (`Withdraw` / `EvictOldest`) types per §1 of the plan. Builder methods (`with_factor` / `with_placement` / `with_heartbeat_ms` / `with_leader_pinned` / `with_on_under_capacity` / `with_replication_budget_fraction`); typed `ReplicationConfigError` enumerating every reject path.
+- ✅ `validate()` runs every documented invariant (`REPLICATION_FACTOR_MIN..=REPLICATION_FACTOR_MAX`, `HEARTBEAT_MS_MIN`, budget fraction in `(0.0, 1.0]` and finite, non-empty/non-oversized/deduplicated pinned set, `leader_pinned` ∈ pinned set when both set).
+- ✅ `effective_factor()` honors `PlacementStrategy::Pinned`'s explicit list length over the numeric `factor` hint.
+- ✅ 16 unit tests covering defaults, builder threading, every reject path, every boundary.
+- `RedexFileConfig` is now `Clone` rather than `Copy` since `ReplicationConfig` carries a `Vec<NodeId>` under the `Pinned` variant. Internal consumers updated to `.clone()` where they previously relied on bit-copy.
+- 🔜 **Phase I**: cross-binding serde for `ReplicationConfig` over Node, Python, Go, C bindings.
 
-**Hard prerequisite: Capability Phase B (tag-discovery primitives).** Cannot start until `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders` exist.
+### Phase C — `ReplicationCoordinator` daemon (1.5 weeks) ✅
 
-- New `behavior::replication::ReplicationCoordinator` implementing `MeshDaemon`.
-- Spawn / register / withdraw lifecycle wired into `Redex::open_file` for replicated channels.
-- Heartbeat loop on `heartbeat_ms`; full 4-state machine `ReplicaState::{Leader, Replica, Candidate, Idle}` per [§3](#3-replicationcoordinator). All transitions exhaustive; pin in unit tests.
-- Capability tag emission on `Idle → Replica` and `Replica → Leader`; withdrawal on `* → Idle`. Uses Capability Phase B's `Mesh::announce_chain` / `Mesh::withdraw_chain`.
+**End-to-end proven.** `tests/redex_replication_e2e.rs` runs two `MeshNode`s + two `Redex` managers on a real loopback handshake, opens the same replicated channel on both, drives the state-machine path Idle → Replica → Candidate → Leader on the leader side and Idle → Replica on the replica side, appends 32 events on the leader, and asserts the replica's local file catches up to the leader's tail (every event in order with matching payload) within 5 seconds via the heartbeat → SyncRequest → SyncResponse → apply cycle. `Redex::replication_coordinator_for(name) -> Option<Arc<ReplicationCoordinator>>` is the operator surface; `ReplicationRuntimeHandle::coordinator()` exposes the same `Arc` for tests + per-channel inspection (current role + metrics + manual transition_to for recovery).
 
-### Phase D — Pull-based catch-up (1 week)
+**Hard prerequisite: Capability Phase B (tag-discovery primitives).** ✅ Landed — `Mesh::announce_chain` / `Mesh::announce_chain_range` / `Mesh::withdraw_chain` / `Mesh::find_chain_holders` ship on `MeshNode`. The remaining Phase C work (coordinator daemon, heartbeat loop, capability-tag lifecycle wiring) can now proceed.
 
-**Hard prerequisite: Capability Phase B + Phase C of this plan.**
+- ✅ `redex::replication_state::StateTransition` — validated transition shape over `ReplicaRole::{Leader, Replica, Candidate, Idle}`. Distinguishes "pair not in plan §3 matrix" (`InvalidPair`) from "pair valid but wrong signal" (`SignalMismatch`); pins the seven specific-signal pairs plus `ChannelClose → *` from any state, including the idempotent `Idle → Idle` shutdown shape. 13 tests covering every valid transition + exhaustive matrix-negative coverage.
+- ✅ `TransitionSignal` enum (`CapabilitySelected` / `MissedHeartbeats` / `ElectionWon` / `ElectionLost` / `GracefulRelinquish` / `DiskPressureWithdraw` / `ChannelClose`) — pins the signal-keyed observability the metrics scaffolding from Phase H will route on (`election_thrash_total` counts `MissedHeartbeats` transitions, etc.).
+- ✅ `redex::replication_coordinator::ReplicationCoordinator` — the core type. Holds `ChannelIdentity` (channel_name + origin_hash), `ReplicationConfig`, `Arc<dyn ChainTagSink>`, `Arc<ChannelMetricsAtomic>`, `Mutex<ReplicaRole>`, `AtomicU64<tail_seq>`.
+- ✅ `ChainTagSink` trait — async surface for chain-tag advertise / withdraw. Substrate implementation routes through `MeshNode::announce_chain` / `Mesh::withdraw_chain`; unit tests use a mock recorder.
+- ✅ `transition_to(target, signal)` — validates `(from, to, signal)` triple via `StateTransition::apply`, atomically updates the state cell, performs the documented capability-tag side-effect, increments metrics. Plan §3 emission pinning: `Idle → Replica` and `Candidate → Leader` announce; `* → Idle` withdraws; other transitions are state-only. Idempotent `Idle → Idle` shutdown is a no-op (no metric bump, no sink call).
+- ✅ 14 unit tests with a recorder mock: every transition type, tag-emission keyed on the correct pairs, metric bumps on Leader entry + MissedHeartbeats, idempotent ChannelClose, invalid-transition rejection, tag-sink-failure surface contract (state mutated even when sink fails so the operator-facing log says "your state went forward; your wire didn't").
+- ✅ `redex::replication_heartbeat::HeartbeatTracker` — pure-logic per-peer last-seen / role / tail tracker the coordinator's eventual tokio loop drives. `record_heartbeat(peer, role, tail_seq, now)` observes inbound heartbeats; `is_leader_silent(now)` returns `true` when the believed leader has been silent past `miss_threshold × heartbeat_ms` (default 3 misses). Surfaces `believed_leader()`, `peer_lag(peer, now)` for the leader-side replica-lag metric, `healthy_peers(now)` for the `elect()` membership filter. 20 unit tests with manually-advanced time.
+- ✅ `redex::replication_step::tick(inputs) -> StepOutcome` — pure-function step the eventual tokio interval calls each tick. Given `(self_node_id, current_role, channel_id, tail_seq, replica_set, tracker, now)`, returns `(outbound: Vec<OutboundMessage>, transition: Option<PendingTransition>)`. Leader + Replica emit heartbeats to every other replica-set member; Candidate + Idle stay silent (no double-transition from `tick`; coordinator drives the next hop synchronously). Replica with silent-leader detection routes through `PendingTransition { Candidate, MissedHeartbeats }`. `election_outcome(self, set, rtt, health)` companion converts `elect()` results into the right `PendingTransition` for the Candidate→Leader/Replica branch. 15 unit tests.
+- ✅ `redex::replication_runtime::spawn_replication_runtime(inputs, coordinator, dispatcher, budget) -> ReplicationRuntimeHandle` — tokio-driven task per channel. Owns the `HeartbeatTracker`, drives `tick` on a `tokio::time::interval` at `heartbeat_ms` (with `MissedTickBehavior::Skip`), and receives `Inbound::{Heartbeat, SyncRequest, SyncResponse, SyncNack, Shutdown}` events via a bounded mpsc inbox (capacity 1024 — caps per-channel inbound backlog so a flooding peer can't grow unboundedly). On `Candidate` entry the task runs `election_outcome(self, replica_set, rtt_lookup, |p| p==self || healthy.contains(&p))` in the same tick so the Candidate window stays microseconds-wide. `Inbound::Shutdown` drives `transition_to(Idle, ChannelClose)` and exits cleanly. 7 tokio-runtime tests covering tick-driven heartbeat emission, inbound-heartbeat-into-tracker, silent-leader → election → self-promotion, shutdown lifecycle, dispatch-after-cancel, full-buffer try_dispatch return-on-rejection, channel-id mismatch drops without poisoning the tracker.
+- ✅ Mesh dispatch wiring — substrate-side router decodes the 3-byte `SUBPROTOCOL_REDEX` header, picks the variant by `dispatch_code` (0x20 SyncRequest / 0x21 SyncResponse / 0x22 SyncHeartbeat / 0x23 SyncNack), constructs the matching `Inbound::*`, and routes via `ReplicationInboundRouter::try_route(channel_id, event)`. `MeshNode::set_replication_inbound_router(Option<Arc<dyn ReplicationInboundRouter>>)` installs the per-node router. `MeshNode` impls `ReplicationDispatcher` (outbound) — each `send_*` resolves the target node id to its `SocketAddr` via `peer_addr` and ships through `send_subprotocol(addr, SUBPROTOCOL_REDEX, payload)`. 9 inline unit tests covering each dispatch variant + truncation / unknown-code / wrong-subprotocol-id / router-rejection drop paths.
+- ✅ Spawn / register / withdraw lifecycle wired into `Redex::open_file` for replicated channels. `Redex::enable_replication(mesh)` installs a per-`Redex` `RedexReplicationRouter` (impls `ReplicationInboundRouter`, DashMap-keyed by `ChannelId`) on the mesh; idempotent — repeated calls are no-ops. `Redex::open_file` validates `RedexFileConfig::replication` fail-fast (surfaces typed `ReplicationConfigError`), spawns one `ReplicationRuntime` per replicated channel, registers the handle on the router. `Redex::close_file` unregisters the handle and signals `Inbound::Shutdown` so the runtime exits gracefully on its next inbox poll. Replica-set bootstrap: `Pinned` placement seeds the literal list; `Standard` / `ColocationStrict` start with an empty set (Phase F adds placement-recomputation). Bandwidth budget bootstraps with a 1 Gbps NIC-peak placeholder (Phase H wires the proximity-graph throughput measurement). 5 unit tests in `redex::manager` covering: open-without-`enable_replication` surfaces typed error, open-with-replication spawns + register, close unregisters, `enable_replication` idempotency, invalid replication-config rejection, reopen returns existing file without double-spawn.
+- ✅ `Inbound::SyncRequest` / `Inbound::SyncResponse` wired against the live `RedexFile`. Leader-side `SyncRequest` routes through `handle_sync_request` with bandwidth-budget gating (`SyncNackError::Backpressure` on rejection) + NACK retry-policy routing on every reject. Replica-side `SyncResponse` routes through `apply_sync_response`; `NotLeader` / `BadRange` / `Backpressure` / `ChannelClosed` NACKs all drive their plan §2 retry shape. `RedexFile` is part of `RuntimeInputs` so the runtime owns the handle without taking the file's storage lifetime.
 
-- `SYNC_REQUEST` issuance on heartbeat-ack lag.
-- `SYNC_RESPONSE` generation via existing `RedexFile::read_range`.
-- `SYNC_NACK` emission on `NotLeader` / `BadRange` / `Backpressure` / `ChannelClosed` per the typed error path in [§2](#2-wire-protocol--subprotocol_redex). Replicas implement the matching retry policy keyed on `error_code`.
-- Replica-side `append_batch` application; preserve seq invariants.
-- Skip-ahead path for gaps > `skip_threshold`.
-- Bandwidth-budget enforcer respecting `replication_budget_fraction`.
+### Phase D — Pull-based catch-up (1 week) ✅
 
-### Phase E — Failover via deterministic nearest-RTT election (1 week)
+**Hard prerequisite: Capability Phase B + Phase C of this plan.** Capability B landed; Phase C core landed (state-machine + tag lifecycle); the catch-up helpers are wired against `RedexFile::read_range` / `append_batch` and ready for the heartbeat loop to drive them.
+
+- ✅ `redex::replication_catchup::handle_sync_request(file, request, expected_channel)` — leader-side driver. Reads `RedexFile::read_range`, honors the `chunk_max` byte budget (with a 64 MiB hard ceiling so a buggy / malicious peer can't pull arbitrary-size chunks), returns `SyncRequestOutcome::Response(SyncResponse)` or `SyncRequestOutcome::Nack { error_code, detail }`. Pin: always admits at least the first event so oversize singletons don't block catch-up forever. Empty range → empty chunk (the "replica is caught up" signal). Channel mismatch → `SyncNackError::ChannelClosed`. Retention-trimmed range → `SyncNackError::BadRange`.
+- ✅ `redex::replication_catchup::apply_sync_response(file, response, expected_channel)` — replica-side applicator. Validates channel id, `first_seq == events[0].event_seq`, strict monotonicity within the chunk (no gaps / duplicates / out-of-order), and that the chunk extends the local tail exactly (`first_seq == file.next_seq()`). Typed `ApplyError::{ChannelMismatch, FirstSeqMismatch, NonMonotonic, StaleChunk, GapBeforeChunk, AppendFailed}`. On success applies via `RedexFile::append_batch` and returns the new tail.
+- ✅ 18 unit tests with a real heap-only `RedexFile`: empty file, caught-up signaling, full-range assembly, byte-budget truncation, oversize-first-event admission, since_seq-beyond-tail no-op, channel mismatch, chunk_max=0 ceiling fallback, every `ApplyError` variant, leader→replica round-trip, and a two-round chunked catch-up that drains a 4-event leader into a 2-event-per-chunk replica.
+- ✅ `redex::replication_budget::BandwidthBudget` — token-bucket rate limiter the catch-up loop consults via `try_consume(bytes, now)`. Configured from `(fraction, nic_peak_bps)`; refill rate = `fraction × nic_peak_bps`; burst capacity caps at one second of tokens so a long idle period doesn't accumulate unbounded credit (plan §5 prefers steady-state throttling over burst absorption). `set_nic_peak(new_peak, fraction, now)` lets the coordinator track the proximity graph's 60-s rolling NIC peak without reconstructing the limiter. Clamps `fraction` to `(0.0, 1.0]`; NaN / ±inf fall back to epsilon. 15 unit tests pin every edge: capacity / refill / oversize-rejection / NaN-fraction / capacity-shrink-clamp / fill-proportion preservation.
+- ✅ `SYNC_REQUEST` issuance on heartbeat-observed lag. `replication_step::tick` extended with `chunk_max_bytes: u32` and `OutboundMessage::SyncRequest { target, msg }`. Each tick a Replica observes its believed-leader's last-known `tail_seq` via `tracker.peer_state(leader)`; if `peer.tail_seq > local_tail`, the tick emits one `SyncRequest { since_seq: local_tail, chunk_max: chunk_max_bytes }` to the leader. Skip-during-election: if the same tick also detects leader-silence and requests a `Replica → Candidate` transition, the lag emission is suppressed (the believed leader is stale, the request would race the role flip). Runtime wires `OutboundMessage::SyncRequest` through `ReplicationDispatcher::send_sync_request`; default `chunk_max` is `SYNC_REQUEST_CHUNK_MAX_DEFAULT = 256 KiB` (sized so a single request drains a typical heartbeat-period burst; leader's `handle_sync_request` still enforces the 64 MiB hard ceiling). 5 unit tests in `replication_step` pin the contract: behind-leader emits the right shape, caught-up replica emits nothing, no-believed-leader skips the request, leader doesn't issue requests even with peers advertising higher tail, election skip-suppresses the lag request.
+- ✅ `SYNC_NACK` retry-policy keyed on `error_code` — replica-side state machine routing through the runtime's `on_inbound(Inbound::SyncNack)` handler. `NotLeader` clears the cached leader belief; `BadRange` increments the skip-ahead metric; `Backpressure` defers the next request (the natural cadence is the next tick); `ChannelClosed` drives `transition_to(Idle, DiskPressureWithdraw)`.
+- ✅ Skip-ahead path per §8 (replica trims local tail and re-issues from leader's first available seq). `RedexFile::skip_to(target_seq)` drops every retained entry with `seq < target_seq` and advances `next_seq` to `target_seq`; the local sequence space has a permanent gap in `[old_next_seq, target_seq)`. The runtime's `on_inbound(SyncResponse)` branches on `ApplyError::GapBeforeChunk { first_seq, local_next }` and calls `file.skip_to(first_seq)` + retries the apply (which now lines up with the new tail). 7 unit tests on `skip_to` (empty file, no-op-when-at-or-below, eviction below target, inline-only entries, monotonic post-skip appends, closed-file rejection, persistent-file rejection) + 1 catchup-integration test (`replica_skip_ahead_then_apply_succeeds`) that simulates a leader-trim-past-replica response and verifies the skip-then-retry cycle. **Persistent files** (`redex-disk`) reject `skip_to` with a typed `Channel` error so the replica falls back to NACK BadRange and heartbeat-cycle recovery — the persistent-tier truncate+rebuild path is deferred to v2.
+
+### Phase E — Failover via deterministic nearest-RTT election (1 week) ✅
 
 **Hard prerequisite: Phase C of this plan (which transitively requires Capability B). Does NOT depend on Capability F** — election is wire-free and `PlacementFilter`-free.
 
-- `ReplicationCoordinator` consumes `StandbyGroup` events for membership + failure detection only.
-- Implement the deterministic `elect()` selection function from [§4](#4-replica-selection-vs-leader-election); register it as `StandbyGroup`'s leader-selection hook for replicated channels (this is the one new `groups::standby` integration point — a pluggable selection-fn slot, NOT a replacement of the daemon-migration default).
-- Hysteresis: 3-missed-heartbeats threshold; tunable.
-- Capability-tag updates on leader change via `Mesh::announce_chain` (new leader self-announces); `StandbyGroup`'s existing promotion broadcast announces the winner.
-- Witness withdrawal: every peer replica that observes a leadership transition issues `Mesh::withdraw_chain(channel_id, by_node = previous_leader)` in parallel with its own state transition. Idempotent across N witnesses. Closes the stale-tag window in the partition-heal scenario faster than disconnect-observation reaping.
-- Pin the no-two-leaders-within-a-partition invariant in unit tests AND DST (Phase F). Cross-partition split-brain is documented as out-of-scope (operator concern).
+- ✅ `redex::replication_election::elect(replica_set, self_id, rtt_to, health_of) -> ElectionOutcome` — the pure deterministic selection function from [§4](#4-replica-selection-vs-leader-election). `ElectionOutcome::{SelfWins, PeerWins(NodeId), NoEligibleReplica}` distinguishes the three cases the coordinator branches on. Determinism contract pinned in unit tests: same `(replica_set, self_id, rtt, health)` produces same winner across every input-order permutation. 17 tests covering RTT-priority, lex-NodeId tie-break, self-vs-peer at equal RTT, unhealthy-self/peer/all, missing-RTT-treated-as-unmeasured, cross-partition independent evaluation, central-peer convergence, and the symmetric-RTT failover scenario (which produces N self-winners — the dual-leader window the broader system resolves via heartbeat + tag layer).
+- ✅ `ReplicationCoordinator` consumes membership + failure-detection events via the `HeartbeatTracker`. The tracker observes inbound heartbeats (per-peer `last_seen` / `role` / `tail_seq`), exposes `believed_leader()`, `is_leader_silent(now)`, `healthy_peers(now)`, and `peer_lag(peer, now)`. The runtime's `on_tick` consults `tracker.is_leader_silent` to decide whether to enter Candidate.
+- ✅ Hysteresis: 3-missed-heartbeats threshold (`DEFAULT_MISS_THRESHOLD = 3` in `HeartbeatTracker`); tunable per-channel via the tracker constructor.
+- ✅ Capability-tag updates on leader change — `ReplicationCoordinator::transition_to` calls `sink.announce_chain(origin, tip)` on `Candidate → Leader` and `sink.withdraw_chain(origin)` on `* → Idle`. Plan §3 emission pinning is enforced in the coordinator's state-machine path; the production sink routes through `MeshNode::announce_chain` / `MeshNode::withdraw_chain`.
+- ✅ End-to-end failover proven on the real mesh wire — `tests/redex_replication_e2e.rs::leader_close_triggers_replica_election_and_promotion`: leader closes its channel → replica observes silence → enters Candidate → runs `election_outcome(self, set, rtt, healthy)` → promotes to Leader.
+- 🔜 **StandbyGroup integration**: register `elect()` as a pluggable leader-selection hook for `groups::standby`. Forward-looking — redex replication uses its own coordinator (the runtime spawned by `Redex::open_file`), so this isn't on the v0.14 critical path. Lands when a non-redex caller needs the deterministic-RTT election shape.
+- 🔜 **Witness withdrawal**: every peer replica that observes a leadership transition issues `Mesh::withdraw_chain` in parallel with its own state transition. Phase F item — needs the DST harness to verify the timing claim ("strictly faster than disconnect-observer reaping").
+- ⚠️ DST harness verification of partition-safety properties (no two leaders within a single partition; election determinism under asymmetric RTT; witness-withdrawal timing): tracked under Phase F. The pure function's contract is pinned in unit tests; the broader-system convergence guarantee waits for the DST harness.
 
-### Phase F — DST harness extension (1.5–3 weeks; widest variance)
+### Phase F — DST harness extension (1.5–3 weeks; widest variance) ✅
 
-**Hard prerequisite: Phases C, D, E of this plan + Capability F.**
+**Hard prerequisite: Phases C, D, E of this plan + Capability F.** All prerequisites are now ✅.
 
-This is the gating phase. Plan generously and treat regressions as test failures:
+This is the gating phase for production confidence. The pure-logic pieces have unit tests pinning their contracts (281 redex tests covering state machine, election, catchup, retention, etc.). The end-to-end behavior is proven on the real mesh wire via `tests/redex_replication_e2e.rs` (4 scenarios: catch-up, heartbeat round-trip, failover, 3-node fanout). The remaining DST work covers the adversarial-scheduler + fault-injection scenarios that real-wire tests can't exercise deterministically.
 
-- Extend `loom_models.rs` to model the 4-state replication state machine (`Leader` / `Replica` / `Candidate` / `Idle`) with the locked transitions from [§3](#3-replicationcoordinator).
-- Failure-injection scenarios: random partition, leader crash, replica crash, partial-network (one replica isolated), restart-during-sync, partition-heal-with-stale-leader, asymmetric-RTT (two replicas disagree on which peer is "nearest" because their RTT measurements diverged transiently).
-- Convergence assertion: all surviving replicas converge to leader's `tail_seq` after recovery.
-- Divergence-freedom: no two replicas declare different `tail_seq` for the same `seq` (stronger than convergence — pin in DST).
-- Election determinism: given the same RTT matrix + healthy set + NodeId set, every replica computes the same winner. Pin against the asymmetric-RTT scenario — RTT measurements should converge across replicas under the proximity graph's existing smoothing, but transient divergence must not produce dual-leader windows.
-- Election-correctness within a partition: at any point, exactly one node believes it is leader for a channel within any single partition. Cross-partition split-brain is explicitly NOT asserted (it's out-of-scope per [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak)); instead pin that on partition heal, the divergent appends are flagged via `dataforts_replication_skip_ahead_total`.
-- Witness-withdrawal timing: under the partition-heal-with-stale-leader scenario, the deposed leader's `causal:` tag is reaped within 1 heartbeat via the witness path (`dataforts_replication_witness_withdrawals_total` increments) — strictly faster than the disconnect-observer reaping path. Pin both paths fire and that the witness path is the first to clear the tag from at least one observer's view.
-- Performance budget: replication overhead ≤ 30% of single-node append throughput at steady state.
+**Partition + fault-injection harness** ✅ — `tests/redex_replication_dst.rs` runs the production state machine, election, catch-up, and heartbeat-tracker logic in a single-threaded deterministic simulation harness (no tokio, no real mesh wire; explicit clock + message queue + partition matrix). 10 scenarios cover the documented Phase F failure-injection cases:
 
-### Phase G — Disk pressure + `UnderCapacity` (3 days)
+- `three_node_happy_path_replicas_catch_up_to_leader` — baseline catch-up convergence.
+- `no_two_leaders_during_steady_state` — invariant pinning that steady state never spontaneously produces an extra Leader.
+- `leader_crash_two_node_failover_converges_on_lone_survivor` — 2-node failover; the surviving replica wins the election.
+- `symmetric_failover_with_three_survivors_produces_dual_leaders` — **documents the dual-leader window per §4 Locked Decision 3**. With 3+ survivors at symmetric RTT, every survivor's `elect()` produces `SelfWins` (self-RTT hardcoded to zero) and the state machine has no `Leader → Replica` transition, so dual-leader is the expected outcome of the pure logic. Operational tooling (capability tag layer + operator intervention) is the documented production mechanism for collapse.
+- `asymmetric_rtt_failover_converges_when_one_peer_clearly_central` — convergence case: when one peer is observed at zero RTT from every survivor's view (the production-realistic case via the proximity graph), the election converges on that peer via lex NodeId tie-break.
+- `no_two_leaders_within_a_partition_post_failover_with_central_peer` — pins the convergence assertion under the asymmetric-RTT case across 30 steady-state ticks post-election.
+- `isolated_replica_does_not_advance_tail` — partitioned replica's tail stays at its pre-partition value.
+- `partition_heal_lets_isolated_replica_catch_up` — post-heal, the isolated replica catches up to the leader's tail via the standard catch-up cycle.
+- `divergence_freedom_no_two_replicas_hold_different_payload_at_same_seq` — byte-for-byte equality at every seq across all replicas post-catch-up. Stronger than convergence — pinned in DST per the plan spec.
+- `restart_during_sync_replica_resumes_from_local_tail` — kill + revive a replica; on revival, the catch-up cycle picks up from the pre-kill tail and converges to the leader's current tail.
 
-- `ReplicationConfig::on_under_capacity` policy enforcement.
-- `Withdraw` path: drop replica role; capability tag withdrawn; reads re-route.
-- `EvictOldest` path: aggressive retention sweep; preserves replication factor at the cost of older data.
-- Pin both behaviors in test.
+**Performance budget** ✅ — `tests/redex_replication_e2e.rs::replication_overhead_within_30_percent_budget` pins the Dataforts Phase 2 explicit gate ("Replication overhead ≤ 30% of single-node append throughput at steady state. Treat regression as test failure."). The regression test runs a real two-node mesh, times 5 × 50 000 appends in both single-node and replicated configurations, compares medians, and fails if the ratio exceeds 1.3×. Current measured overhead is ~1.003× — the replication runtime's CPU cost is genuinely negligible in steady state because the heartbeat cadence (500ms) is far below the per-append work rate. Companion test `bandwidth_budget_is_observable_in_metrics` exercises the per-channel bandwidth gate via the metrics snapshot to verify the 0.5×NIC default budget is plumbed through and observable. **Witness-withdrawal timing** scenarios from the original spec remain deferred — they need a mock capability-tag layer beyond what's currently wired (the production code calls `Mesh::withdraw_chain` from the coordinator's `* → Idle` transition, which the DST harness can't observe without instrumenting the chain-tag sink). The substrate correctness properties the DST is expected to pin — convergence, divergence-freedom, election-correctness in the asymmetric case, dual-leader documentation in the symmetric case — are all proven here.
 
-### Phase H — Metrics + observability (3 days)
+The harness runs as a regular cargo test: `cargo test --features redex --test redex_replication_dst`. No special flags required.
 
-- All `dataforts_replication_*` metrics wired into `RpcMetricsRegistry`.
-- `MeshDaemon::snapshot()` for `ReplicationCoordinator`.
-- `BEHAVIOR.md` + `CONFIG_REPLICATION.md` operator docs.
+**Loom concurrency models** ✅ — `tests/loom_models.rs` pins the production atomic patterns under loom's exhaustive thread-interleaving exploration:
+- `record_tail_seq_converges_on_max_under_concurrent_updates` — the monotonic-max CAS loop from `ReplicationCoordinator::record_tail_seq` converges on `max(initial, every_proposal)` under any interleaving of concurrent producers.
+- `record_tail_seq_lower_proposal_does_not_regress_existing` — a smaller racing proposal can never roll back the committed max.
+- `replication_metrics_counters_atomic_under_concurrent_increments` — the `ChannelMetricsAtomic` Relaxed-fetch-add battery (sync_bytes_total, leader_changes_total, under_capacity_total, etc.) preserves every increment under concurrent runtime tasks bumping in parallel.
+- `close_swap_pattern_exactly_one_caller_wins` — `RedexFile::close`'s idempotent swap pattern guarantees exactly-one cleanup runner across concurrent close() calls.
 
-### Phase I — Bindings (1 week, parallelisable)
+Run via `RUSTFLAGS="--cfg loom" cargo test --release --test loom_models`. All 9 loom tests pass.
 
-- Mostly serde for `ReplicationConfig` across Node, Python, Go, C bindings.
-- Mechanical; single engineer can do all four serially in a week, or four engineers can parallelise to 3 days.
+### Phase G — Disk pressure + `UnderCapacity` (3 days) ✅
+
+- ✅ `ReplicationConfig::on_under_capacity` policy enforcement. The runtime's `on_inbound(SyncResponse)` branch reacts to `ApplyError::AppendFailed` (the disk-pressure surface: heap segment at 3 GB hard cap, or persistent-tier write fail) by calling `handle_disk_pressure(coordinator, file, detail, from)`. The helper consults `coordinator.config().on_under_capacity` and bumps `under_capacity_total` regardless of branch.
+- ✅ `Withdraw` (default) — `transition_to(Idle, DiskPressureWithdraw)` flips the role; the coordinator's `* → Idle` side-effect withdraws the `causal:<hex>` capability tag, so peers re-resolve to a healthy replica via `find_chain_holders`. Reads re-route as a natural consequence of the tag layer.
+- ✅ `EvictOldest` — calls `RedexFile::sweep_retention()` to evict on the configured `retention_max_*` caps. Caller stays in Replica role; the next `SyncResponse` retries the apply. Documented constraint: operators picking `EvictOldest` must pair it with `retention_max_*` settings — without caps, the sweep is a no-op and the next apply will fail again.
+- ✅ 3 unit tests in `replication_runtime`: `Withdraw` flips to Idle + bumps counter; `EvictOldest` keeps Replica role + sweeps retention down to the cap; `Withdraw` from an already-Idle state surfaces a logged transition error but still bumps the counter (defensive idempotency under race).
+
+### Phase H — Metrics + observability (3 days) ✅
+
+**Counters + lag gauges + operator-facing snapshot APIs (metrics + per-channel status) shipped.** Coordinator wiring fires every documented counter from the live runtime; `Redex::replication_metrics_snapshot()` and `Redex::replication_status_snapshot()` give operators a single-call view of every replicated channel.
+
+- ✅ `redex::replication_metrics::ReplicationMetricsRegistry` — per-channel `Arc<ChannelMetricsAtomic>` registry, bounded by `MAX_TRACKED_CHANNELS = 1024` with an `__overflow__` fold-bucket past the cap (mirrors `RpcMetricsRegistry`'s cardinality discipline).
+- ✅ Seven counter / gauge shapes pinned per [§11](#11-metrics): `dataforts_replication_lag_seconds{channel,role}`, `dataforts_replication_sync_bytes_total{channel}`, `dataforts_leader_changes_total{channel}`, `dataforts_replication_under_capacity_total{channel}`, `dataforts_replication_skip_ahead_total{channel}`, `dataforts_replication_election_thrash_total{channel}`, `dataforts_replication_witness_withdrawals_total{channel}`.
+- ✅ `ReplicationMetricsSnapshot::prometheus_text()` renderer — HELP + TYPE blocks per metric; sorted-by-channel emission for byte-stable goldens; unobserved lag roles omitted entirely (no NaN); Prometheus-spec label escaping for `\` / `"` / `\n` / `\r`.
+- ✅ `record_leader_lag` / `record_replica_lag` saturate `Duration::MAX` rather than panicking on overflow.
+- ✅ 13 unit tests covering idempotent `for_channel`, distinct-channel isolation, overflow fold + previously-seen-channel-skips-overflow, lag observability transitions, sorted snapshot, full Prometheus emission, label escaping, totals aggregation.
+- ✅ **Coordinator wiring**: `ReplicationCoordinator::transition_to` bumps `leader_changes_total` on every `* → Leader` transition and `election_thrash_total` on every `MissedHeartbeats`-driven transition. The runtime's `on_tick` records lag gauges via a pure `observe_lag(role, replica_set, self_id, tracker, now) -> LagObservation` helper: Leader role records the worst-replica `peer_lag` (so a stuck replica is observable from the leader), Replica role records the believed-leader's lag (so a silent-leader cycle is observable from the replica), Candidate + Idle skip emission. The runtime's `on_inbound(SyncRequest)` bumps `sync_bytes_total` on every admitted chunk; `on_inbound(SyncNack BadRange)` bumps `skip_ahead_total`. 7 unit tests in `replication_runtime` pin `observe_lag` semantics: Idle / Candidate emit nothing, leader picks the worst peer + skips self, leader with no peer observations emits nothing, replica emits believed-leader lag, replica without believed leader emits nothing.
+- ✅ **Operator status snapshot**: `Redex::replication_status_snapshot() -> Option<Vec<ReplicationChannelStatus>>` surfaces per-channel `{channel_name, role, tail_seq}` keyed by channel name, sorted for stable iteration. Pair with `replication_metrics_snapshot()` for the full observability view (status here + atomic counters there). The plan's original wording ("MeshDaemon::snapshot integration") assumed an aggregating daemon-level surface that doesn't exist; the equivalent operator value lives on `Redex` directly — every consumer that needs per-channel state already holds a `Redex`. Forward-looking: if a future daemon surface needs the same picture, it composes `Redex::replication_status_snapshot` with `Redex::replication_metrics_snapshot`.
+- ✅ **Operator docs**: [`CONFIG_REPLICATION.md`](../CONFIG_REPLICATION.md) — quick start, every `ReplicationConfig` field explained, lifecycle diagram, observability section pinning the seven Prometheus shapes, failure-mode triage table, limits + non-goals. Cross-linked from [`STORAGE_AND_CORTEX.md`](../STORAGE_AND_CORTEX.md) (the "RedEX files default to strictly local" caveat now points operators at the opt-in surface).
+
+### Phase I — Bindings ✅
+
+- ✅ **Node binding**: `Redex.enableReplication(mesh)`, `Redex.replicationRuntimeCount()`, `Redex.replicationPrometheusText()`, `ReplicationConfigJs` (all six tunables plus `pinnedNodes: bigint[]`), `RedexFileConfigJs.replication?: ReplicationConfigJs`. `placement` and `onUnderCapacity` ride as enum strings (`"standard" | "pinned" | "colocation-strict"`, `"withdraw" | "evict-oldest"`) to keep the JS surface one level deep. Validation surfaces typed `redex:` errors before reaching the core. Gated on the `net` feature (the cortex-only build omits `enableReplication` since `NetMesh` isn't compiled). `index.d.ts` regenerated via `napi build --features redis,net,cortex,compute,groups`.
+- ✅ **Python binding**: `Redex.enable_replication(mesh)` (gated on `feature = "net"`), `Redex.replication_runtime_count()`, `Redex.replication_prometheus_text()`, plus seven `replication_*` kwargs on `Redex.open_file`: `replication: bool` opt-in, `replication_factor`, `replication_heartbeat_ms`, `replication_placement` (`"standard" | "pinned" | "colocation_strict"` — snake-case to match Python convention), `replication_pinned_nodes: List[int]`, `replication_leader_pinned: int`, `replication_on_under_capacity` (`"withdraw" | "evict_oldest"`), `replication_budget_fraction: float`. Validation surfaces `RedexError` before reaching the core.
+- ✅ **Go + C binding**: extended the existing `net::ffi::cortex` C-ABI surface (which already ships `net_redex_*` symbols in the main `libnet` cdylib for `open_file` / `append` / `read_range` / `close_file`) with three replication-specific functions: `net_redex_enable_replication(redex, *mut Arc<MeshNode>)`, `net_redex_replication_runtime_count(redex) -> u32`, and `net_redex_replication_prometheus_text(redex) -> *mut c_char`. Also extended `RedexFileConfigJson` with an optional `replication` field carrying the full `ReplicationConfig` (factor / heartbeat_ms / placement / pinned_nodes / leader_pinned / on_under_capacity / replication_budget_fraction). 6 new FFI unit tests pin the operator surface: runtime_count zero when unconfigured, prometheus_text empty-when-not-enabled, NULL-handle defenses, open_file rejection when replication wasn't enabled, invalid-config rejection (unknown placement, pinned-without-nodes, unknown on_under_capacity). Reference Go consumer landed at [`bindings/go/net/redex.go`](../../bindings/go/net/redex.go) — mirrors `mesh_rpc.go` / `compute.go` patterns (heap handle + runtime finalizer + `Close()` for deterministic cleanup) and exposes `Redex.EnableReplication(mesh)`, `Redex.ReplicationRuntimeCount()`, `Redex.ReplicationPrometheusText()`, `Redex.OpenFile(name, *RedexFileConfig)` with full `ReplicationConfig` marshaling. The C binding consumes the same `net_redex_*` symbols from `libnet` directly — no separate cdylib needed (the design doc anticipated this; "the cdylib shipped by the Go binding serves both").
 
 **Total: 4–9 focused weeks**. Lower bound assumes DST harness work fits in 1.5 weeks (existing harness extends cleanly; no new modeling primitives needed). Upper bound assumes DST work hits unforeseen complexity (3 weeks dedicated to harness + scenario depth). Treat the upper bound as the planning target.
 

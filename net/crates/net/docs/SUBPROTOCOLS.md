@@ -21,8 +21,36 @@ Every Net packet carries a `subprotocol_id: u16` identifying how the payload sho
 | `0x0800` | Partition detection |
 | `0x0801` | Log reconciliation |
 | `0x0900` | Replica group coordination (reserved) |
+| `0x0A00` | Channel membership |
+| `0x0B00` | Stream-window flow control |
+| `0x0C00` | Capability announcement |
+| `0x0D00` | NAT-traversal reflex |
+| `0x0D01` | NAT-traversal rendezvous |
+| `0x0E00` | RedEX Distributed replication |
 | `0x1000..0xEFFF` | Vendor / third-party |
 | `0xF000..0xFFFF` | Experimental / ephemeral |
+
+### `SUBPROTOCOL_REDEX` dispatch codes (`0x0E00`)
+
+The replication subprotocol partitions its payload via a single `dispatch_code: u8` byte immediately after the 2-byte `subprotocol_id`. All multi-byte integers are **little-endian fixed-width** (no varints). `channel_id` is the 32-byte BLAKE2s hash of the channel name with the domain-separation label `"redex-channel-id-v1"`. See `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §2 for full byte layouts.
+
+| Code | Direction | Purpose | Size |
+|------|-----------|---------|------|
+| `0x20` `SYNC_REQUEST` | replica → leader | Replica asks for events `[since_seq, since_seq + chunk_max)` | 47 B (fixed) |
+| `0x21` `SYNC_RESPONSE` | leader → replica | Bounded chunk of in-order events | variable |
+| `0x22` `SYNC_HEARTBEAT` | bidirectional | Liveness + tail-seq exchange | 52 B (fixed) |
+| `0x23` `SYNC_NACK` | leader → replica | Structured rejection (typed `error_code`) | variable |
+| `0x24..0x2F` | reserved | Future variants (range-bounded sync, parallel-stream sync, etc.) | — |
+
+**No `LEADER_ELECTION` code** — election is a pure deterministic function over each node's locally-known state (proximity-graph RTT + replica-set membership + NodeId ordering). The per-channel `ReplicationCoordinator` runtime task runs `elect()` directly when entering `Candidate`; the result drives a `transition_to(Leader | Replica)` call that emits the capability tag via `Mesh::announce_chain` / withdraws via `Mesh::withdraw_chain`. The capability-tag layer is what peers observe; no RedEX-specific election message rides on the wire.
+
+**`SyncNack` error codes** (replica retry-policy key):
+- `1` `NotLeader` → re-resolve leader via `Mesh::find_chain_holders`.
+- `2` `BadRange` → trim local tail; retry from leader's first available `seq`.
+- `3` `Backpressure` → exponential backoff; same `SYNC_REQUEST`.
+- `4` `ChannelClosed` → withdraw replica role; emit metric.
+
+Silent stream close is reserved for transport-level failure only; every application-level rejection MUST surface as `SyncNack`.
 
 ## Descriptors
 
@@ -106,3 +134,4 @@ let targets = capability_index.query(&filter);
 | `subprotocol/registry.rs` | `SubprotocolRegistry`, ID-to-handler mapping, `enrich_capabilities()` |
 | `subprotocol/negotiation.rs` | `SubprotocolManifest`, `NegotiatedSet`, version negotiation |
 | `subprotocol/migration_handler.rs` | `MigrationSubprotocolHandler`, migration message dispatch |
+| `redex/replication.rs` | `SUBPROTOCOL_REDEX` wire codec — `SyncRequest` / `SyncResponse` / `SyncHeartbeat` / `SyncNack` |

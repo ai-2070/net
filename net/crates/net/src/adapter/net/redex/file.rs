@@ -1053,7 +1053,7 @@ impl RedexFile {
     /// performance trade-off so future profilers don't
     /// rediscover it as a "bug".
     pub fn sweep_retention(&self) {
-        let cfg = self.inner.config;
+        let cfg = &self.inner.config;
         if cfg.retention_max_events.is_none()
             && cfg.retention_max_bytes.is_none()
             && cfg.retention_max_age_ns.is_none()
@@ -1062,7 +1062,7 @@ impl RedexFile {
         }
         let now = now_ns();
         let mut state = self.inner.state.lock();
-        let drop = compute_eviction_count(&state.index, &state.timestamps, now, &cfg);
+        let drop = compute_eviction_count(&state.index, &state.timestamps, now, cfg);
         if drop == 0 {
             return;
         }
@@ -1185,6 +1185,100 @@ impl RedexFile {
         // `state` drops at the end of the function — all
         // subsequent appenders see the post-compaction layout.
         std::mem::drop(state);
+    }
+
+    /// Skip-ahead: drop every retained event with `seq < target_seq`
+    /// and advance `next_seq` to `target_seq`. The next `append`
+    /// allocates `target_seq`; the local sequence has a permanent
+    /// gap in `[old_next_seq, target_seq)` (those seqs were never
+    /// assigned on this file).
+    ///
+    /// Used by the replication runtime's `apply_sync_response`
+    /// failure path (`ApplyError::GapBeforeChunk`): when the
+    /// leader's response carries a `first_seq` strictly above the
+    /// replica's local tail (the leader trimmed past the replica's
+    /// retained range), the replica skips ahead instead of
+    /// replaying the missing gap. Plan §8.
+    ///
+    /// Idempotent on `target_seq <= current_next_seq` — returns
+    /// `Ok(())` without mutation.
+    ///
+    /// **Persistent files**: returns
+    /// `RedexError::Channel("skip_to not supported on persistent
+    /// files in v1")`. The persistent-tier skip-ahead path needs a
+    /// disk-segment truncate plus idx/ts rebuild that doesn't ship
+    /// in v1; replicas on persistent files fall back to NACK
+    /// BadRange and heartbeat-cycle recovery (the leader's next
+    /// heartbeat reports the new tail, the replica re-issues a
+    /// request from its old tail, and accepts the gap-before-chunk
+    /// error as a recoverable retry-with-backoff signal).
+    pub fn skip_to(&self, target_seq: u64) -> Result<(), RedexError> {
+        self.check_not_closed()?;
+
+        #[cfg(feature = "redex-disk")]
+        if self.inner.disk.is_some() {
+            return Err(RedexError::Channel(
+                "skip_to not supported on persistent files in v1".into(),
+            ));
+        }
+
+        let mut state = self.inner.state.lock();
+        let current_next = self.inner.next_seq.load(Ordering::Acquire);
+        if target_seq <= current_next {
+            // Already at or past target. No-op.
+            return Ok(());
+        }
+
+        // Drop every retained entry whose seq < target_seq.
+        // Common path: retained index is contiguous below
+        // current_next < target_seq, so this drops everything. We
+        // still iterate defensively in case of stale state.
+        let drop_count = state
+            .index
+            .iter()
+            .take_while(|e| e.seq < target_seq)
+            .count();
+
+        if drop_count > 0 {
+            // Compute the new dat-segment base — the first surviving
+            // heap entry's offset, or "everything is inline / nothing
+            // survives" → segment end. Mirrors sweep_retention's
+            // dat_base computation; same panic-safe build-then-swap.
+            let new_base: Option<u64> = state
+                .index
+                .iter()
+                .skip(drop_count)
+                .find(|e| !e.is_inline())
+                .map(|e| e.payload_offset as u64);
+            let dat_base = match new_base {
+                Some(base) => base,
+                None => state.segment.base_offset() + state.segment.live_bytes() as u64,
+            };
+
+            // R-32: build the new index + timestamps into temp
+            // vectors BEFORE mutating either the segment or the
+            // live state. Then call evict_prefix_to first — if it
+            // panics (it shouldn't; evict_prefix_to is pure
+            // arithmetic), state.index still references the pre-
+            // eviction payload offsets, which match the
+            // un-mutated segment. Only after the segment eviction
+            // succeeds do we swap in the trimmed index. This
+            // ordering reverses the previous (and sweep_retention's)
+            // index-first-segment-second sequence, which left the
+            // index referencing payload offsets the segment no
+            // longer carried on a hypothetical evict panic.
+            let new_index: Vec<RedexEntry> = state.index[drop_count..].to_vec();
+            let new_timestamps: Vec<u64> = state.timestamps[drop_count..].to_vec();
+            state.segment.evict_prefix_to(dat_base);
+            state.index = new_index;
+            state.timestamps = new_timestamps;
+        }
+
+        // Advance next_seq. Subsequent appends assign target_seq +
+        // 0, target_seq + 1, etc. The local sequence space has a
+        // permanent gap in [old_current_next, target_seq).
+        self.inner.next_seq.store(target_seq, Ordering::Release);
+        Ok(())
     }
 
     /// Close the file. Outstanding tail streams receive `RedexError::Closed`.
@@ -3144,5 +3238,119 @@ mod tests {
              state.index in place — that's the pre-fix pattern \
              that left the index half-rebased on mid-loop panic."
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // skip_to — Phase D replica skip-ahead
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn skip_to_advances_next_seq_on_empty_file() {
+        let f = make_file("skip/empty");
+        f.skip_to(100).unwrap();
+        assert_eq!(f.next_seq(), 100);
+        assert_eq!(f.len(), 0);
+        // The next append assigns 100.
+        assert_eq!(f.append(b"x").unwrap(), 100);
+        assert_eq!(f.next_seq(), 101);
+    }
+
+    #[test]
+    fn skip_to_no_op_when_target_at_or_below_current() {
+        let f = make_file("skip/below");
+        f.append(b"a").unwrap();
+        f.append(b"b").unwrap();
+        assert_eq!(f.next_seq(), 2);
+        // target == current → no-op.
+        f.skip_to(2).unwrap();
+        assert_eq!(f.next_seq(), 2);
+        assert_eq!(f.len(), 2);
+        // target < current → no-op.
+        f.skip_to(1).unwrap();
+        assert_eq!(f.next_seq(), 2);
+        assert_eq!(f.len(), 2);
+    }
+
+    #[test]
+    fn skip_to_evicts_retained_entries_below_target() {
+        let f = make_file("skip/evict");
+        for _ in 0..5 {
+            f.append(b"x").unwrap();
+        }
+        assert_eq!(f.len(), 5);
+        assert_eq!(f.next_seq(), 5);
+        f.skip_to(100).unwrap();
+        assert_eq!(f.len(), 0, "retained entries < target_seq evicted");
+        assert_eq!(f.next_seq(), 100);
+        // Post-skip appends continue from target_seq.
+        assert_eq!(f.append(b"new").unwrap(), 100);
+    }
+
+    #[test]
+    fn skip_to_with_inline_entries_advances_cleanly() {
+        // Inline entries (≤ 8 bytes stored in the entry record)
+        // don't consume segment bytes — skip_to's dat_base
+        // computation must handle "all survivors are inline /
+        // nothing survives" cleanly.
+        let f = make_file("skip/inline");
+        f.append_inline(&1u64.to_le_bytes()).unwrap();
+        f.append_inline(&2u64.to_le_bytes()).unwrap();
+        f.skip_to(50).unwrap();
+        assert_eq!(f.next_seq(), 50);
+        assert_eq!(f.len(), 0);
+    }
+
+    #[test]
+    fn skip_to_appends_keep_monotonic_seq_after_skip() {
+        let f = make_file("skip/monotonic");
+        f.append(b"pre-skip").unwrap();
+        f.skip_to(1000).unwrap();
+        let s1 = f.append(b"post-skip-1").unwrap();
+        let s2 = f.append(b"post-skip-2").unwrap();
+        assert_eq!(s1, 1000);
+        assert_eq!(s2, 1001);
+        assert_eq!(f.next_seq(), 1002);
+        // Read-range from the skipped-to seq returns the new
+        // appends; pre-skip seqs are evicted.
+        let events = f.read_range(1000, 1002);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].entry.seq, 1000);
+        assert_eq!(events[1].entry.seq, 1001);
+    }
+
+    #[test]
+    fn skip_to_on_closed_file_errors() {
+        let f = make_file("skip/closed");
+        f.close().unwrap();
+        let err = f.skip_to(100).unwrap_err();
+        assert!(matches!(err, RedexError::Closed));
+    }
+
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn skip_to_on_persistent_file_rejects() {
+        // The v1 persistent-tier skip-ahead path isn't wired —
+        // skip_to returns a Channel error so the replica's runtime
+        // can fall back to heartbeat-cycle recovery.
+        use crate::adapter::net::redex::manager::Redex;
+        let tmp = std::env::temp_dir().join(format!(
+            "redex-skip-to-persistent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let r = Redex::new().with_persistent_dir(&tmp);
+        let cn = ChannelName::new("skip/persistent").unwrap();
+        let cfg = RedexFileConfig::default().with_persistent(true);
+        let f = r.open_file(&cn, cfg).unwrap();
+        let err = f.skip_to(100).unwrap_err();
+        match err {
+            RedexError::Channel(msg) => assert!(msg.contains("not supported on persistent")),
+            other => panic!("expected Channel error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

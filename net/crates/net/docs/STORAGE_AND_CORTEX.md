@@ -219,8 +219,12 @@ On process restart with a persistent RedEX file:
 
 Design choices that matter here:
 
-- RedEX files are strictly local; there's no cross-node fallback if
-  local disk is wiped.
+- RedEX files default to strictly local — there's no cross-node
+  fallback if local disk is wiped. Opt in to cross-node replication
+  per channel via
+  `RedexFileConfig::with_replication(Some(ReplicationConfig::new()))`;
+  see [`CONFIG_REPLICATION.md`](CONFIG_REPLICATION.md) for the full
+  operator surface.
 - Retention evicts head events from memory but (in `redex-disk`
   today) leaves them on disk. v2's mmap tier reconciles the two.
 - Age-based retention (`retention_max_age_ns`) resets on persistent
@@ -249,8 +253,6 @@ helps you structure daemons so adopting them later is straightforward.
   `snapshotAndWatch` on the Node and Python SDKs). The Rust surface
   exists today (`adapter.watch()` / `adapter.snapshot_and_watch(...)`);
   the napi / pyo3 NetDb class wrappers are a focused follow-up.
-- **Cross-node replication** of RedEX. Not designed yet — needs real
-  single-node usage + a DST harness first.
 
 ## FAQ
 

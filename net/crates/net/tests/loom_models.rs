@@ -225,11 +225,14 @@ fn burst_cas_decrement_never_underflows_under_contention() {
 #[test]
 fn burst_cas_decrement_caps_at_initial_count_under_contention() {
     loom::model(|| {
-        // Initial 1, three threads racing — only ONE must win.
-        // The others must see `remaining == 0` and return false
-        // without wrapping the counter. A regression from the
-        // CAS loop to `load; fetch_sub` would let all three
-        // decrement, producing a counter of u64::MAX - 2.
+        // R-39: initial 1, two threads racing — only ONE must
+        // win. The other must see `remaining == 0` and return
+        // false without wrapping the counter. A regression from
+        // the CAS loop to `load; fetch_sub` would let both
+        // decrement, producing a counter of u64::MAX. Two
+        // threads is enough to drive every interleaving loom
+        // explores; the original comment said "three" but the
+        // code always spawned two.
         let counter = Arc::new(AtomicU64::new(1));
         let winners = Arc::new(AtomicU64::new(0));
 
@@ -418,5 +421,279 @@ fn auth_bloom_post_authorize_check_never_denies() {
             verdict, 0,
             "check_fast after a joined authorize must never return Denied",
         );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Model 4: ReplicationCoordinator::record_tail_seq monotonic-max CAS
+//
+// Mirrors `src/adapter/net/redex/replication_coordinator.rs:181-194`
+// — the CAS loop that advances `tail_seq` to the maximum of every
+// proposed value. The catch-up path calls this from the replica
+// runtime task after each successful `apply_sync_response`; under
+// concurrent applies (one chunk completes while the next is
+// already in flight) the loop must:
+//
+// 1. Never regress: the stored value is monotonically non-
+//    decreasing across all observed states.
+// 2. Converge on the max: after every producer joins, the stored
+//    value equals max(initial, every proposed seq).
+// 3. Never tear: no value the loop observes via `load` or
+//    `compare_exchange_weak` is anything other than a value some
+//    producer proposed (or the initial value).
+//
+// A regression from CAS to `if load < seq { store(seq) }` would
+// produce torn updates: thread A's load sees 5, thread B's store
+// commits 10, thread A's store commits 5 — final value is 5,
+// thread B's update lost. The CAS loop's `Err(now)` branch picks
+// up the racing update and reruns the `seq > current` test.
+// ─────────────────────────────────────────────────────────────
+
+/// The production CAS pattern from `ReplicationCoordinator::record_tail_seq`.
+/// Pinned here under loom's atomic substitutes so the contract is
+/// verified across every thread interleaving.
+fn record_tail_seq_monotonic_max(cell: &AtomicU64, seq: u64) {
+    let mut current = cell.load(Ordering::Relaxed);
+    while seq > current {
+        match cell.compare_exchange_weak(current, seq, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(now) => current = now,
+        }
+    }
+}
+
+#[test]
+fn record_tail_seq_converges_on_max_under_concurrent_updates() {
+    loom::model(|| {
+        let tail = Arc::new(AtomicU64::new(0));
+
+        // Two threads race with overlapping proposals.
+        // Thread A proposes 5 then 10.
+        // Thread B proposes 7 then 3.
+        // The CAS loop must converge to max(0, 5, 10, 7, 3) = 10.
+        let a = {
+            let t = tail.clone();
+            thread::spawn(move || {
+                record_tail_seq_monotonic_max(&t, 5);
+                record_tail_seq_monotonic_max(&t, 10);
+            })
+        };
+        let b = {
+            let t = tail.clone();
+            thread::spawn(move || {
+                record_tail_seq_monotonic_max(&t, 7);
+                record_tail_seq_monotonic_max(&t, 3);
+            })
+        };
+
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let final_seq = tail.load(Ordering::Relaxed);
+        // After every producer finishes, the cell must hold the
+        // global max. A torn update (CAS → load+if regression)
+        // could leave it at 5, 7, or 3 — any of those would be a
+        // monotonicity violation.
+        assert_eq!(
+            final_seq, 10,
+            "monotonic-max CAS must converge on max(proposals); \
+             a value below 10 means the loop dropped a proposal",
+        );
+    });
+}
+
+#[test]
+fn record_tail_seq_lower_proposal_does_not_regress_existing() {
+    loom::model(|| {
+        let tail = Arc::new(AtomicU64::new(0));
+
+        // One thread commits the high water mark; another tries
+        // to roll it back to a smaller value. The smaller proposal
+        // must be a no-op even when racing the higher commit.
+        let high = {
+            let t = tail.clone();
+            thread::spawn(move || record_tail_seq_monotonic_max(&t, 100))
+        };
+        let low = {
+            let t = tail.clone();
+            thread::spawn(move || record_tail_seq_monotonic_max(&t, 5))
+        };
+        high.join().unwrap();
+        low.join().unwrap();
+
+        assert_eq!(
+            tail.load(Ordering::Relaxed),
+            100,
+            "lower proposal must never regress the committed max",
+        );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Model 5: ChannelMetricsAtomic counter battery under concurrent transitions
+//
+// Mirrors `src/adapter/net/redex/replication_metrics.rs:140-175`.
+// Multiple counters (sync_bytes_total, leader_changes_total,
+// under_capacity_total, skip_ahead_total, election_thrash_total,
+// witness_withdrawals_total) all use Relaxed fetch_add. Under
+// concurrent runtime tasks driving state transitions on multiple
+// channels, the counters MUST reflect every increment — no lost
+// updates.
+//
+// Same shape as Model 1 (StatsModel) but applied to the
+// replication-specific counters that the runtime + coordinator
+// bump from the hot path.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct ReplicationMetricsModel {
+    sync_bytes_total: AtomicU64,
+    leader_changes_total: AtomicU64,
+    under_capacity_total: AtomicU64,
+}
+
+impl ReplicationMetricsModel {
+    fn incr_sync_bytes(&self, bytes: u64) {
+        self.sync_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+    }
+    fn incr_leader_change(&self) {
+        self.leader_changes_total.fetch_add(1, Ordering::Relaxed);
+    }
+    fn incr_under_capacity(&self) {
+        self.under_capacity_total.fetch_add(1, Ordering::Relaxed);
+    }
+    fn totals(&self) -> (u64, u64, u64) {
+        (
+            self.sync_bytes_total.load(Ordering::Relaxed),
+            self.leader_changes_total.load(Ordering::Relaxed),
+            self.under_capacity_total.load(Ordering::Relaxed),
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Model 6: RedexFile::close idempotent-shutdown swap
+//
+// Mirrors `src/adapter/net/redex/file.rs:1281` —
+// `if self.inner.closed.swap(true, AcqRel) { return Ok(()); }`.
+// The swap returns the PRIOR value; the first caller observes
+// `false` (and runs the close path), every subsequent caller
+// observes `true` (and short-circuits). Under N concurrent
+// close() calls, EXACTLY ONE caller must run the cleanup path.
+//
+// A regression to `if !closed.load() { closed.store(true); ... }`
+// would let two concurrent callers both see `false`, both run
+// the cleanup, and double-fsync / double-cancel-task / etc.
+// ─────────────────────────────────────────────────────────────
+
+/// First-call-wins flag. Returns `true` if this caller is the
+/// first to flip the bit; `false` if someone already flipped it.
+fn try_first_close(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
+}
+
+#[test]
+fn close_swap_pattern_exactly_one_caller_wins() {
+    loom::model(|| {
+        let closed = Arc::new(AtomicBool::new(false));
+        let winners = Arc::new(AtomicU64::new(0));
+
+        // Two threads race to close. Exactly one must observe the
+        // swap returning `false` (the prior value), advance
+        // `winners`, and run cleanup. The other observes `true`
+        // and short-circuits.
+        let a = {
+            let c = closed.clone();
+            let w = winners.clone();
+            thread::spawn(move || {
+                if try_first_close(&c) {
+                    w.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let b = {
+            let c = closed.clone();
+            let w = winners.clone();
+            thread::spawn(move || {
+                if try_first_close(&c) {
+                    w.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+
+        a.join().unwrap();
+        b.join().unwrap();
+
+        assert_eq!(
+            winners.load(Ordering::Relaxed),
+            1,
+            "exactly one caller wins the swap; a load+store regression \
+             would let both threads observe `false` and both run cleanup",
+        );
+        assert!(
+            closed.load(Ordering::Relaxed),
+            "flag must be true after both joins regardless of who won",
+        );
+    });
+}
+
+#[test]
+fn replication_metrics_counters_atomic_under_concurrent_increments() {
+    loom::model(|| {
+        let m = Arc::new(ReplicationMetricsModel::default());
+
+        // Thread A: simulates a leader handling one sync request
+        // (1024 bytes shipped) + one transition into Leader role.
+        let a = {
+            let m = m.clone();
+            thread::spawn(move || {
+                m.incr_sync_bytes(1024);
+                m.incr_leader_change();
+            })
+        };
+        // Thread B: simulates a replica observing a disk-pressure
+        // event (one under_capacity bump) + a leadership transition.
+        // Both threads bump leader_changes — loom explores every
+        // interleaving of the two fetch_add calls and asserts no
+        // lost update lands.
+        let b = {
+            let m = m.clone();
+            thread::spawn(move || {
+                m.incr_under_capacity();
+                m.incr_leader_change();
+            })
+        };
+
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let (bytes, leader_changes, under_cap) = m.totals();
+        // Every increment lands; no lost updates.
+        assert_eq!(bytes, 1024);
+        assert_eq!(leader_changes, 2, "both threads bumped leader_changes");
+        assert_eq!(under_cap, 1);
+    });
+}
+
+/// Same-counter contention only — three concurrent increments to
+/// `leader_changes_total` must always land at 3 regardless of
+/// interleaving. A regression that swapped `fetch_add` for a
+/// `load + add + store` pattern would let loom find a lost-update
+/// schedule and fail this test.
+#[test]
+fn replication_metrics_same_counter_three_way_contention() {
+    loom::model(|| {
+        let m = Arc::new(ReplicationMetricsModel::default());
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let m = m.clone();
+                thread::spawn(move || m.incr_leader_change())
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let (_, leader_changes, _) = m.totals();
+        assert_eq!(leader_changes, 3, "no lost updates under contention");
     });
 }

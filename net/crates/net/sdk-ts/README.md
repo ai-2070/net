@@ -795,6 +795,73 @@ try {
 }
 ```
 
+### Cross-node RedEX replication
+
+RedEX channels can replicate across the mesh. Opt in per channel by
+setting `replication` on the file config. The default — omitting
+`replication` — keeps the channel single-node and adds zero wire
+traffic. Replicated channels carry N copies of the log; the leader is
+the single writer, replicas catch up via pull-based sync. Failover
+uses a deterministic nearest-RTT election with NodeId tie-break.
+
+```typescript
+import { NetMesh, Redex } from '@ai2070/net';
+
+const mesh = await NetMesh.create({
+  bindAddr: '127.0.0.1:0',
+  psk: '...',
+});
+const redex = new Redex({ persistentDir: '/var/lib/net/events' });
+
+// Install the per-Redex replication router on the mesh.
+// Idempotent — safe to call from multiple paths.
+redex.enableReplication(mesh);
+
+const file = redex.openFile('orders/audit', {
+  persistent: true,
+  replication: {
+    factor: 3,                     // 1..16; default 3
+    heartbeatMs: 500n,             // min 100; default 500
+    placement: 'standard',         // 'standard' | 'pinned' | 'colocation-strict'
+    // pinnedNodes: [nodeIdA, nodeIdB, nodeIdC],   // required when placement = 'pinned'
+    // leaderPinned: someNodeId,
+    onUnderCapacity: 'withdraw',   // 'withdraw' (default) | 'evict-oldest'
+    replicationBudgetFraction: 0.5,
+  },
+});
+file.append(Buffer.from('event payload'));
+```
+
+The leader handles every append locally; replicas observe the
+leader's heartbeat `tail_seq`, issue `SYNC_REQUEST` on lag, apply
+chunks via `SYNC_RESPONSE`. When the leader closes (or the replica's
+believed leader goes silent past `3 × heartbeatMs`), the surviving
+replicas run the deterministic election and one becomes the new
+leader within microseconds.
+
+`Redex.replicationPrometheusText()` renders the seven per-channel
+metric shapes — `*_lag_seconds`, `*_sync_bytes_total`,
+`*_leader_changes_total`, `*_under_capacity_total`,
+`*_skip_ahead_total`, `*_election_thrash_total`,
+`*_witness_withdrawals_total` — for an HTTP scrape endpoint. Returns
+the empty string when replication isn't enabled; pipe directly into a
+response body without branching. `replicationRuntimeCount()` returns
+the count of registered per-channel runtimes.
+
+```typescript
+// HTTP scrape handler
+app.get('/metrics', (req, res) => {
+  res.type('text/plain').send(redex.replicationPrometheusText());
+});
+```
+
+Disk-pressure handling: when a replica's local file rejects an
+append (heap-segment cap or disk write-fail), the configured
+`onUnderCapacity` policy fires — `withdraw` drops the replica role
+(capability tag withdrawn; peers re-route to a healthy holder),
+`evict-oldest` runs retention sweep + retries (requires
+`retentionMax*` caps to be set on the same file config).
+
 ### Error classes
 
 CortEX-boundary errors are typed and catchable via `instanceof`:
