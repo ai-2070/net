@@ -35,7 +35,9 @@ pub use metrics::{
     GreedyClusterMetricsAtomic, GreedyMetricsRegistry, GreedyMetricsSnapshot,
     MAX_TRACKED_CHANNELS as MAX_METRIC_TRACKED_CHANNELS, OVERFLOW_CHANNEL_LABEL,
 };
-pub use runtime::{DispatchOutcome, GreedyRuntime};
+pub use runtime::{
+    synthesize_cache_channel_name, DispatchOutcome, GreedyObserver, GreedyRuntime,
+};
 
 // Re-exported from the substrate so callers can compose against a
 // single `dataforts::greedy::` import root rather than reaching

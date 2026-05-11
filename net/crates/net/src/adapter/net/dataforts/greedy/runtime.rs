@@ -29,6 +29,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use parking_lot::Mutex;
 
 use crate::adapter::net::behavior::capability::CapabilitySet;
@@ -42,6 +43,47 @@ use super::admission::{should_admit, AdmissionInputs, AdmissionVerdict};
 use super::cache::GreedyCacheRegistry;
 use super::config::GreedyConfig;
 use super::metrics::{AdmitRejectReason, GreedyMetricsRegistry};
+
+/// Trait the mesh dispatch loop uses to fan inbound events into
+/// the greedy runtime. Stays sync — the mesh's `process_local_packet`
+/// is itself a synchronous fn, so the trait method spawns whatever
+/// async work it needs internally rather than forcing the mesh to
+/// `.await`.
+///
+/// Fire-and-forget: the mesh never inspects the outcome (greedy is
+/// best-effort, parallel to the application's tail).
+pub trait GreedyObserver: Send + Sync {
+    /// Observe one inbound channel event. The implementation is
+    /// responsible for any async work + backpressure.
+    ///
+    /// `channel_hash` is the 16-bit wire-form hash carried in the
+    /// Net header — the mesh strips channel names on ingress, so
+    /// the observer maps `channel_hash` to a cache-side
+    /// [`ChannelName`] via [`synthesize_cache_channel_name`].
+    fn observe_event(
+        &self,
+        channel_hash: u16,
+        origin_hash: u64,
+        chain_caps: Arc<CapabilitySet>,
+        payload: Bytes,
+    );
+}
+
+/// Synthesize a stable cache-side [`ChannelName`] from a 16-bit
+/// channel hash. Hash-collision risk is bounded — different real
+/// channels with the same hash share a cache file, which behaves
+/// as a small mix-up at the cache layer (events from both channels
+/// land in the same per-channel-hash retention bucket). Operators
+/// running greedy across high-churn channel spaces should monitor
+/// hash collisions via the substrate's existing observability.
+///
+/// Naming convention `dataforts/greedy/<hex>` reserves a
+/// channel-namespace prefix that won't collide with application
+/// channels (`/` separators + reserved-prefix discipline).
+pub fn synthesize_cache_channel_name(channel_hash: u16) -> ChannelName {
+    ChannelName::new(&format!("dataforts/greedy/{:04x}", channel_hash))
+        .expect("hex-formatted name with reserved prefix is always valid")
+}
 
 /// 1 Gbps placeholder for the measured NIC peak. The replication
 /// runtime uses the same placeholder until the plan §6 proximity-
@@ -341,6 +383,24 @@ impl GreedyRuntime {
         }
 
         DispatchOutcome::Cached
+    }
+}
+
+impl GreedyObserver for GreedyRuntime {
+    fn observe_event(
+        &self,
+        channel_hash: u16,
+        origin_hash: u64,
+        chain_caps: Arc<CapabilitySet>,
+        payload: Bytes,
+    ) {
+        let runtime = self.clone();
+        let channel = synthesize_cache_channel_name(channel_hash);
+        tokio::spawn(async move {
+            let _ = runtime
+                .dispatch_event(&channel, origin_hash, &chain_caps, &payload)
+                .await;
+        });
     }
 }
 

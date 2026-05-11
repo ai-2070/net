@@ -80,6 +80,22 @@ impl Drop for ReplicationWiring {
     }
 }
 
+/// Wiring kept alive while `Redex::enable_greedy_dataforts` is in
+/// effect. `Drop` un-installs the observer from the mesh so the
+/// hot path falls back to the lock-read-and-skip pattern.
+#[cfg(feature = "dataforts-greedy")]
+struct GreedyWiring {
+    mesh: Arc<MeshNode>,
+    runtime: Arc<super::super::dataforts::GreedyRuntime>,
+}
+
+#[cfg(feature = "dataforts-greedy")]
+impl Drop for GreedyWiring {
+    fn drop(&mut self) {
+        self.mesh.set_greedy_observer(None);
+    }
+}
+
 /// Manager for a set of RedEX files bound to channel names.
 pub struct Redex {
     files: DashMap<ChannelName, RedexFile>,
@@ -101,6 +117,12 @@ pub struct Redex {
     /// `RedexFileConfig::replication == Some(_)` then surface a typed
     /// error.
     replication: parking_lot::RwLock<Option<Arc<ReplicationWiring>>>,
+    /// Greedy-LRU wiring installed by
+    /// [`Redex::enable_greedy_dataforts`]. `None` keeps greedy
+    /// caching disabled — inbound events flow through the mesh's
+    /// hot path with a single `RwLock` read and skip.
+    #[cfg(feature = "dataforts-greedy")]
+    greedy: parking_lot::RwLock<Option<Arc<GreedyWiring>>>,
 }
 
 impl Redex {
@@ -115,6 +137,8 @@ impl Redex {
             persistent_dir: None,
             build_count: AtomicU64::new(0),
             replication: parking_lot::RwLock::new(None),
+            #[cfg(feature = "dataforts-greedy")]
+            greedy: parking_lot::RwLock::new(None),
         }
     }
 
@@ -132,6 +156,8 @@ impl Redex {
             persistent_dir: None,
             build_count: AtomicU64::new(0),
             replication: parking_lot::RwLock::new(None),
+            #[cfg(feature = "dataforts-greedy")]
+            greedy: parking_lot::RwLock::new(None),
         }
     }
 
@@ -169,6 +195,75 @@ impl Redex {
             router,
             metrics,
         }));
+    }
+
+    /// Install greedy-LRU wiring rooted at `mesh`. Validates the
+    /// supplied [`super::super::dataforts::GreedyConfig`], builds
+    /// a [`super::super::dataforts::GreedyRuntime`] that opens
+    /// per-channel cache files against this manager + announces
+    /// chains via the mesh's `ChainTagSink` impl, and installs
+    /// the runtime as the mesh's greedy observer.
+    ///
+    /// Idempotent — a second call with greedy already enabled
+    /// returns `Ok` without rebuilding (caller can layer
+    /// `disable_greedy_dataforts` + `enable_greedy_dataforts` to
+    /// reconfigure).
+    ///
+    /// Returns `Err(GreedyConfigError)` for invalid configs —
+    /// numeric bounds + bandwidth-fraction range. The runtime is
+    /// never installed on an invalid config so operators see the
+    /// typed error before observing any cache writes.
+    ///
+    /// `local_caps` snapshots the node's advertised capability
+    /// set at install time so the intent / colocation admission
+    /// gates have something to evaluate against. Refresh via
+    /// [`Self::greedy_runtime`] + `set_local_caps` after each
+    /// `MeshNode::announce_capabilities`.
+    #[cfg(feature = "dataforts-greedy")]
+    pub fn enable_greedy_dataforts(
+        self: &Arc<Self>,
+        mesh: Arc<MeshNode>,
+        config: super::super::dataforts::GreedyConfig,
+        local_caps: Arc<crate::adapter::net::behavior::capability::CapabilitySet>,
+        intent_registry: crate::adapter::net::behavior::placement::IntentRegistry,
+    ) -> Result<(), super::super::dataforts::GreedyConfigError> {
+        config.validate()?;
+        let mut slot = self.greedy.write();
+        if slot.is_some() {
+            return Ok(());
+        }
+        let sink = mesh.clone() as Arc<dyn super::ChainTagSink>;
+        let runtime = Arc::new(super::super::dataforts::GreedyRuntime::new(
+            config,
+            self.clone(),
+            sink,
+            local_caps,
+            intent_registry,
+        ));
+        mesh.set_greedy_observer(Some(
+            runtime.clone() as Arc<dyn super::super::dataforts::GreedyObserver>,
+        ));
+        *slot = Some(Arc::new(GreedyWiring {
+            mesh,
+            runtime,
+        }));
+        Ok(())
+    }
+
+    /// Borrow the installed greedy runtime, if any. Cheap clone
+    /// of the `Arc` — callers refresh local caps via
+    /// `runtime.set_local_caps` after every announce.
+    #[cfg(feature = "dataforts-greedy")]
+    pub fn greedy_runtime(&self) -> Option<Arc<super::super::dataforts::GreedyRuntime>> {
+        self.greedy.read().as_ref().map(|w| w.runtime.clone())
+    }
+
+    /// Uninstall the greedy wiring. Idempotent — `None` if greedy
+    /// wasn't enabled.
+    #[cfg(feature = "dataforts-greedy")]
+    pub fn disable_greedy_dataforts(&self) {
+        let _wiring = self.greedy.write().take();
+        // Wiring's Drop calls mesh.set_greedy_observer(None).
     }
 
     /// Cumulative count of per-channel replication runtimes currently

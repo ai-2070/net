@@ -277,6 +277,13 @@ struct DispatchCtx {
     #[cfg(feature = "redex")]
     replication_inbound_router:
         Arc<parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>>,
+    /// Optional greedy-LRU observer. See the matching field doc on
+    /// `MeshNode`. The hot path takes a single read lock on every
+    /// standard-event packet; uncontended reads under
+    /// `parking_lot::RwLock` are single-digit-nanoseconds.
+    #[cfg(feature = "dataforts-greedy")]
+    greedy_observer:
+        Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
@@ -1306,6 +1313,21 @@ pub struct MeshNode {
     #[cfg(feature = "redex")]
     replication_inbound_router:
         Arc<parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>>,
+    /// Optional greedy-LRU observer. `Redex` installs one of these
+    /// via [`Self::set_greedy_observer`] when the operator calls
+    /// `Redex::enable_greedy_dataforts(mesh, cfg)`; subsequent
+    /// inbound standard-event packets fan out through the observer
+    /// (in addition to the per-shard queue push the application's
+    /// tail drains from). `None` when greedy is not enabled; in
+    /// that case the hot path takes a single `parking_lot::RwLock`
+    /// read and falls through to the queue push.
+    ///
+    /// Same `parking_lot::RwLock<Option<Arc<dyn ...>>>` shape as
+    /// the replication router for the same reason — `dyn Trait` is
+    /// `!Sized` and `ArcSwapOption` doesn't accept it.
+    #[cfg(feature = "dataforts-greedy")]
+    greedy_observer:
+        Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
     /// Monotonic version counter used when stamping our own
     /// announcements. `CapabilityIndex::index` skips older versions,
     /// so this must move forward across restarts if the caller wants
@@ -1631,6 +1653,8 @@ impl MeshNode {
             user_caps: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "redex")]
             replication_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(feature = "dataforts-greedy")]
+            greedy_observer: Arc::new(parking_lot::RwLock::new(None)),
             capability_version: Arc::new(AtomicU64::new(0)),
             local_subnet,
             local_subnet_policy,
@@ -2416,6 +2440,8 @@ impl MeshNode {
             migration_handler: self.migration_handler.clone(),
             #[cfg(feature = "redex")]
             replication_inbound_router: self.replication_inbound_router.clone(),
+            #[cfg(feature = "dataforts-greedy")]
+            greedy_observer: self.greedy_observer.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
             pending_direct_initiators: self.pending_direct_initiators.clone(),
             static_keypair: self.static_keypair.clone(),
@@ -3707,9 +3733,42 @@ impl MeshNode {
             return;
         }
 
+        // Greedy-LRU observer hook. Non-exclusive (in contrast to
+        // the nRPC dispatcher above): if installed, fans every
+        // event into the greedy runtime in addition to the
+        // application's tail. Greedy is best-effort — failures log
+        // + drop inside the runtime; the queue push below is
+        // never blocked or skipped on the observer's behalf.
+        //
+        // Hot-path cost: one `RwLock` read per packet (single-digit
+        // ns under parking_lot when uncontended) + one `Arc` clone
+        // per event when the observer is installed. The runtime
+        // itself spawns a tokio task per event to absorb the
+        // async dispatch.
+        #[cfg(feature = "dataforts-greedy")]
+        let greedy = ctx.greedy_observer.read().clone();
+
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
+            #[cfg(feature = "dataforts-greedy")]
+            if let Some(observer) = &greedy {
+                // Pass an empty CapabilitySet for now — Phase 1
+                // wiring resolves chain_caps via the capability
+                // index in a follow-up. For the MVP, callers
+                // using greedy with scope/intent filters supply
+                // chain caps via the publish path (which lands
+                // before this hook is reached).
+                // TODO(plan-§Phase-1): resolve from_node via
+                // session_id then `ctx.capability_index.get(...)`.
+                use std::sync::Arc as StdArc;
+                observer.observe_event(
+                    parsed.header.channel_hash,
+                    parsed.header.origin_hash.into(),
+                    StdArc::new(crate::adapter::net::behavior::capability::CapabilitySet::default()),
+                    event_data.clone(),
+                );
+            }
             use std::fmt::Write;
             let mut event_id = String::with_capacity(24);
             let _ = write!(event_id, "{}:{}", seq, i);
@@ -6319,6 +6378,31 @@ impl MeshNode {
         router: Option<Arc<dyn super::redex::ReplicationInboundRouter>>,
     ) {
         *self.replication_inbound_router.write() = router;
+    }
+
+    /// Install (or uninstall) the greedy-LRU observer. `Redex`
+    /// calls this from
+    /// [`Redex::enable_greedy_dataforts`](super::redex::Redex)
+    /// to wire the inbound dispatch fanout. `None` uninstalls;
+    /// subsequent standard-event packets fall through the
+    /// observer hook untouched.
+    ///
+    /// Idempotent — re-installing replaces the previous handle.
+    /// Hot-path cost is unchanged when called with the same Arc.
+    #[cfg(feature = "dataforts-greedy")]
+    pub fn set_greedy_observer(
+        &self,
+        observer: Option<Arc<dyn super::dataforts::GreedyObserver>>,
+    ) {
+        *self.greedy_observer.write() = observer;
+    }
+
+    /// True iff a greedy observer is currently installed. Useful
+    /// for tests and for the operator surface to confirm the
+    /// install landed.
+    #[cfg(feature = "dataforts-greedy")]
+    pub fn has_greedy_observer(&self) -> bool {
+        self.greedy_observer.read().is_some()
     }
 
     /// Return every node currently advertising any `causal:<hex>*`
