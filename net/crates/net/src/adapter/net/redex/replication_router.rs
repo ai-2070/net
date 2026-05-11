@@ -101,6 +101,17 @@ impl RedexReplicationRouter {
     pub fn is_empty(&self) -> bool {
         self.runtimes.is_empty()
     }
+
+    /// Snapshot every registered `(ChannelId, handle)` pair. The
+    /// `Arc` clone is cheap; the caller can iterate without
+    /// holding shard locks. Consumed by `Redex` to build the
+    /// per-channel status snapshot for operator observability.
+    pub fn snapshot_handles(&self) -> Vec<(ChannelId, Arc<ReplicationRuntimeHandle>)> {
+        self.runtimes
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect()
+    }
 }
 
 impl ReplicationInboundRouter for RedexReplicationRouter {

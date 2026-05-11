@@ -47,7 +47,7 @@ pub use event::RedexEvent;
 pub use file::RedexFile;
 pub use fold::RedexFold;
 pub use index::{IndexOp, IndexStart, RedexIndex};
-pub use manager::Redex;
+pub use manager::{Redex, ReplicationChannelStatus};
 pub use ordered::OrderedAppender;
 pub use replication::{
     ChannelId, ReplicaRole, SyncEvent, SyncHeartbeat, SyncNack, SyncNackError, SyncRequest,

@@ -21,7 +21,7 @@ use super::super::channel::{AuthGuard, ChannelName};
 use super::config::RedexFileConfig;
 use super::error::RedexError;
 use super::file::RedexFile;
-use super::replication::ChannelId;
+use super::replication::{ChannelId, ReplicaRole};
 use super::replication_budget::BandwidthBudget;
 use super::replication_config::PlacementStrategy;
 use super::replication_coordinator::{ChannelIdentity, ReplicationCoordinator};
@@ -49,6 +49,23 @@ struct ReplicationWiring {
     mesh: Arc<MeshNode>,
     router: Arc<RedexReplicationRouter>,
     metrics: Arc<ReplicationMetricsRegistry>,
+}
+
+/// Per-channel replication status entry surfaced by
+/// [`Redex::replication_status_snapshot`]. Pairs with the
+/// [`ReplicationMetricsSnapshot`] atomic-counter view for the full
+/// operator observability picture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationChannelStatus {
+    /// Human-readable channel name (matches the
+    /// `ChannelMetrics::channel` field in the metrics snapshot).
+    pub channel_name: String,
+    /// Current replica role per the state machine.
+    pub role: ReplicaRole,
+    /// Coordinator's view of the local `tail_seq`. The leader's
+    /// view is canonical; replica views catch up via the heartbeat
+    /// cycle.
+    pub tail_seq: u64,
 }
 
 impl Drop for ReplicationWiring {
@@ -215,6 +232,37 @@ impl Redex {
         self.replication_metrics_snapshot()
             .map(|s| s.prometheus_text())
             .unwrap_or_default()
+    }
+
+    /// Per-channel replication status snapshot — the richer view
+    /// the Phase H `MeshDaemon::snapshot` integration point was
+    /// supposed to surface. For every replicated channel registered
+    /// on this manager, returns the current `ReplicaRole`,
+    /// `tail_seq`, and `channel_name`. Pair with
+    /// [`Self::replication_metrics_snapshot`] for the full
+    /// observability picture (status here + atomic counters there).
+    ///
+    /// `None` when replication isn't enabled. Empty vector when
+    /// replication is enabled but no channels have been opened.
+    pub fn replication_status_snapshot(&self) -> Option<Vec<ReplicationChannelStatus>> {
+        let wiring = self.replication.read().as_ref().cloned()?;
+        let mut entries: Vec<ReplicationChannelStatus> = wiring
+            .router
+            .snapshot_handles()
+            .into_iter()
+            .map(|(_channel_id, handle)| {
+                let coordinator = handle.coordinator();
+                ReplicationChannelStatus {
+                    channel_name: coordinator.channel().channel_name.clone(),
+                    role: coordinator.role(),
+                    tail_seq: coordinator.tail_seq(),
+                }
+            })
+            .collect();
+        // Stable order — keyed on channel_name like the metrics
+        // snapshot, so the two snapshots line up by channel.
+        entries.sort_by(|a, b| a.channel_name.cmp(&b.channel_name));
+        Some(entries)
     }
 
     /// Open (create if absent) a RedEX file bound to `name`.
@@ -756,6 +804,56 @@ mod tests {
             1,
             "reopen must not spawn a second runtime"
         );
+    }
+
+    #[test]
+    fn replication_status_snapshot_returns_none_when_not_enabled() {
+        let r = Redex::new();
+        assert!(r.replication_status_snapshot().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replication_status_snapshot_includes_open_channels() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh);
+        let name_a = cn("repl/status_a");
+        let name_b = cn("repl/status_b");
+        let cfg = RedexFileConfig::default().with_replication(Some(
+            ReplicationConfig::new().with_heartbeat_ms(60_000),
+        ));
+        let file_a = r.open_file(&name_a, cfg.clone()).expect("open A");
+        r.open_file(&name_b, cfg).expect("open B");
+
+        // Append on A to bump its tail; B stays at 0.
+        for i in 0..3 {
+            file_a.append(format!("event-{i}").as_bytes()).unwrap();
+        }
+        // Drive A's coordinator to Replica so its role is observable
+        // as non-Idle.
+        let coord_a = r.replication_coordinator_for(&name_a).unwrap();
+        coord_a
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        coord_a.record_tail_seq(3);
+
+        let snap = r.replication_status_snapshot().expect("snapshot enabled");
+        assert_eq!(snap.len(), 2, "both channels in snapshot");
+        // Sorted by channel name.
+        assert_eq!(snap[0].channel_name, "repl/status_a");
+        assert_eq!(snap[1].channel_name, "repl/status_b");
+        // A is Replica with tail 3; B is Idle with tail 0.
+        assert_eq!(snap[0].role, ReplicaRole::Replica);
+        assert_eq!(snap[0].tail_seq, 3);
+        assert_eq!(snap[1].role, ReplicaRole::Idle);
+        assert_eq!(snap[1].tail_seq, 0);
+
+        r.close_file(&name_a).unwrap();
+        r.close_file(&name_b).unwrap();
     }
 
     #[test]
