@@ -128,6 +128,15 @@ pub struct ReplicationCoordinator {
     metrics: Arc<ChannelMetricsAtomic>,
     state: Mutex<ReplicaRole>,
     tail_seq: AtomicU64,
+    /// Serializes the entire `transition_to` body — state update +
+    /// metric bumps + chain-tag side effect — so two racing
+    /// transitions can't interleave announce/withdraw against the
+    /// capability layer. Plan §3 pins the announce/withdraw key to
+    /// specific transitions; without this lock T1 could set
+    /// `Replica` + queue `announce_chain` while T2 sets `Idle` +
+    /// completes `withdraw_chain` first, leaving the mesh
+    /// advertising a chain we've already withdrawn locally.
+    transition_lock: tokio::sync::Mutex<()>,
 }
 
 impl ReplicationCoordinator {
@@ -151,6 +160,7 @@ impl ReplicationCoordinator {
             metrics,
             state: Mutex::new(ReplicaRole::Idle),
             tail_seq: AtomicU64::new(0),
+            transition_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -235,6 +245,14 @@ impl ReplicationCoordinator {
         target: ReplicaRole,
         signal: TransitionSignal,
     ) -> Result<Option<StateTransition>, CoordinatorError> {
+        // R-3: hold a single async mutex across the whole
+        // transition (state update + metric bumps + chain-tag
+        // side effect) so two concurrent callers can't interleave
+        // an `announce_chain` from a stale role over a
+        // `withdraw_chain` from a fresher one. The inner state
+        // mutex still serializes the validation + cell flip; the
+        // outer transition_lock serializes the side-effect chain.
+        let _guard = self.transition_lock.lock().await;
         // Acquire the state lock for the validation + cell update.
         // Drop it before the await — the sink call is async and
         // we don't want to hold a sync mutex across an await
@@ -601,6 +619,114 @@ mod tests {
         let snap = registry.snapshot();
         let row = snap.channel("payments/settlements").unwrap();
         assert_eq!(row.leader_changes_total, 2);
+    }
+
+    /// R-3 regression: concurrent `transition_to` calls must
+    /// serialize their chain-tag side effects. A delaying sink
+    /// lets us pin that T1's announce_chain and T2's
+    /// withdraw_chain don't interleave — the observed call
+    /// sequence is exactly one of the two complete orderings
+    /// (announce-then-withdraw or withdraw-then-announce), never
+    /// a torn one.
+    #[tokio::test]
+    async fn concurrent_transitions_serialize_chain_tag_side_effects() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        /// Sink that holds a barrier — every announce/withdraw
+        /// awaits the barrier (so if the coordinator didn't
+        /// serialize calls, both would block at the barrier
+        /// concurrently). Without the transition_lock the test
+        /// would observe `in_flight > 1` at some point; the
+        /// regression assertion catches that.
+        struct BarrierSink {
+            calls: tokio::sync::Mutex<Vec<SinkCall>>,
+            in_flight: AtomicUsize,
+            max_in_flight: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ChainTagSink for BarrierSink {
+            async fn announce_chain(
+                &self,
+                origin_hash: u64,
+                tip_seq: u64,
+            ) -> Result<(), AdapterError> {
+                let n = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(n, AtomicOrdering::SeqCst);
+                // Give other tasks a chance to interleave if the
+                // transition_lock isn't holding them off.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                self.calls.lock().await.push(SinkCall::Announce {
+                    origin_hash,
+                    tip_seq,
+                });
+                self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+                Ok(())
+            }
+            async fn withdraw_chain(&self, origin_hash: u64) -> Result<(), AdapterError> {
+                let n = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(n, AtomicOrdering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                self.calls.lock().await.push(SinkCall::Withdraw { origin_hash });
+                self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let sink = Arc::new(BarrierSink {
+            calls: tokio::sync::Mutex::new(Vec::new()),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        });
+        let registry = ReplicationMetricsRegistry::new();
+        let coord = Arc::new(ReplicationCoordinator::new(
+            ChannelIdentity {
+                channel_name: "concurrent/serialize".to_string(),
+                origin_hash: 0xC0FFEE,
+            },
+            ReplicationConfig::new(),
+            sink.clone() as Arc<dyn ChainTagSink>,
+            &registry,
+        ));
+
+        // Drive concurrent transitions: T1 wants Idle→Replica
+        // (announce); T2 racing on the same coordinator. Since
+        // only one transition is valid at a time, T2 races by
+        // doing Replica→Idle right after T1 announces. The
+        // transition_lock ensures T2's withdraw can't START
+        // before T1's announce COMPLETES.
+        let c1 = coord.clone();
+        let t1 = tokio::spawn(async move {
+            c1.transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+                .await
+        });
+        let c2 = coord.clone();
+        let t2 = tokio::spawn(async move {
+            // Yield then drive the withdraw transition. The lock
+            // serializes: if T1 holds the transition_lock, T2's
+            // state-mutex acquire only happens after T1's full
+            // body (sink call included) finishes.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            c2.transition_to(ReplicaRole::Idle, TransitionSignal::DiskPressureWithdraw)
+                .await
+        });
+        let (r1, r2) = tokio::join!(t1, t2);
+        r1.unwrap().expect("T1 transition succeeds");
+        r2.unwrap().expect("T2 transition succeeds");
+
+        let max_concurrent = sink.max_in_flight.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            max_concurrent, 1,
+            "transition_lock must serialize sink calls (observed max in-flight = {max_concurrent})"
+        );
+
+        // Sanity: both side-effects landed in announce-then-
+        // withdraw order (T1's announce came first because the
+        // lock made T2 wait).
+        let calls = sink.calls.lock().await.clone();
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(calls[0], SinkCall::Announce { .. }));
+        assert!(matches!(calls[1], SinkCall::Withdraw { .. }));
     }
 
     #[tokio::test]
