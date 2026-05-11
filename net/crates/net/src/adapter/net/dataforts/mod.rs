@@ -15,6 +15,9 @@
 #[cfg(feature = "dataforts-greedy")]
 pub mod greedy;
 
+#[cfg(feature = "dataforts-gravity")]
+pub mod gravity;
+
 #[cfg(feature = "dataforts-greedy")]
 pub use greedy::{
     should_admit, synthesize_cache_channel_name, AdmissionInputs, AdmissionVerdict,
@@ -22,4 +25,10 @@ pub use greedy::{
     GreedyCacheRegistry, GreedyChannelMetrics, GreedyChannelMetricsAtomic, GreedyClusterMetrics,
     GreedyClusterMetricsAtomic, GreedyConfig, GreedyConfigError, GreedyMetricsRegistry,
     GreedyMetricsSnapshot, GreedyObserver, GreedyRuntime, IntentMatchPolicy, ScopeLabel,
+};
+
+#[cfg(feature = "dataforts-gravity")]
+pub use gravity::{
+    should_emit_heat, DataGravityPolicy, DataGravityPolicyError, EmissionDecision,
+    HeatCounter, HeatEmission, HeatRegistry,
 };
