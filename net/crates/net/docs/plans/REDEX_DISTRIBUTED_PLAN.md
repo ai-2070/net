@@ -4,11 +4,11 @@
 
 ## Status
 
-**Phases A, B, H (scaffolding), plus the pure-function pieces of C (state-machine validation) and E (`elect()` selection function) landed; remaining substrate work blocked on Capability Phase B (and partially F).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
+**Phases A, B, H (scaffolding), plus the pure-function pieces of C (state-machine validation) and E (`elect()` selection function) landed. Capability Phase B (the gating dependency) also landed — Phase C coordinator daemon work is now unblocked.** All open design questions are ratified — see [Locked decisions](#locked-decisions).
 
-Hard prerequisites for the still-blocked phases:
-- **Capability Phase B** (tag-discovery primitives `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders`) — RedEX Phases C/D/E cannot start until this lands.
-- **Capability Phase F** (`PlacementFilter` + `IntentRegistry` + anti-affinity) — needed for *replica placement* in Phase C, but **not** for leader election. Election is decentralized and deterministic (nearest-RTT + NodeId tiebreak); see [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak).
+Hard prerequisites:
+- ~~**Capability Phase B** (tag-discovery primitives `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders`) — RedEX Phases C/D/E cannot start until this lands.~~ ✅ Landed.
+- **Capability Phase F** (`PlacementFilter` + `IntentRegistry` + anti-affinity) — needed for *replica placement* in Phase C, but **not** for leader election. Election is decentralized and deterministic (nearest-RTT + NodeId tiebreak); see [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak). Capability F shipped with the v0.13 capability surface.
 
 Phase A (wire protocol scaffold) ✅, Phase B (`ReplicationConfig` opt-in) ✅, Phase H (metrics registry scaffolding) ⚠️, Phase C state-machine validation ⚠️, and Phase E `elect()` selection function ⚠️ landed. Phase D needs Phase C's coordinator + Capability B; Phase F (DST) builds on C/D/E; Phase G needs the coordinator; Phase I needs cross-binding plumbing for `RedexFileConfig` that doesn't yet exist.
 
@@ -444,7 +444,7 @@ Implementable in isolation; does not depend on Capability B/F. **Landed.**
 
 ### Phase C — `ReplicationCoordinator` daemon (1.5 weeks) ⚠️ state-machine scaffolding landed
 
-**Hard prerequisite: Capability Phase B (tag-discovery primitives).** Cannot start until `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders` exist.
+**Hard prerequisite: Capability Phase B (tag-discovery primitives).** ✅ Landed — `Mesh::announce_chain` / `Mesh::announce_chain_range` / `Mesh::withdraw_chain` / `Mesh::find_chain_holders` ship on `MeshNode`. The remaining Phase C work (coordinator daemon, heartbeat loop, capability-tag lifecycle wiring) can now proceed.
 
 - ✅ `redex::replication_state::StateTransition` — validated transition shape over `ReplicaRole::{Leader, Replica, Candidate, Idle}`. Distinguishes "pair not in plan §3 matrix" (`InvalidPair`) from "pair valid but wrong signal" (`SignalMismatch`); pins the seven specific-signal pairs plus `ChannelClose → *` from any state, including the idempotent `Idle → Idle` shutdown shape. 13 tests covering every valid transition + exhaustive matrix-negative coverage.
 - ✅ `TransitionSignal` enum (`CapabilitySelected` / `MissedHeartbeats` / `ElectionWon` / `ElectionLost` / `GracefulRelinquish` / `DiskPressureWithdraw` / `ChannelClose`) — pins the signal-keyed observability the metrics scaffolding from Phase H will route on (`election_thrash_total` counts `MissedHeartbeats` transitions, etc.).
