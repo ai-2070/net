@@ -1,0 +1,23 @@
+net/crates/net/bindings/node/src/cortex.rs
+  s_d760092f02a89c::t_82ef2a98b6b0ba 145-159
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_REDEX_DISTRIBUTED.md
+  s_d760092f02a89c::t_663cde98f4cc84 32
+net/crates/net/bindings/python/src/cortex.rs
+  s_d760092f02a89c::t_82ef2a98b6b0ba 345-361
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "8d3bea14dd76d5790b4fcd07d097faae55f3eb1c",
+  "prompts": {},
+  "sessions": {
+    "s_d760092f02a89c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ef8b8023-dce0-4b44-bfb8-b07c462d6685",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
