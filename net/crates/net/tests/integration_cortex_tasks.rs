@@ -1027,7 +1027,7 @@ async fn test_persistent_tasks_recover_across_processes() {
 
     {
         let redex = Redex::new().with_persistent_dir(&base);
-        let tasks = TasksAdapter::open_with_config(&redex, ORIGIN, cfg)
+        let tasks = TasksAdapter::open_with_config(&redex, ORIGIN, cfg.clone())
             .await
             .unwrap();
         tasks.create(1, "durable", 100).unwrap();

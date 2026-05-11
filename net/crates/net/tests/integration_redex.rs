@@ -724,7 +724,7 @@ mod persistent {
 
         {
             let r = Redex::new().with_persistent_dir(&base);
-            let f = r.open_file(&name, cfg).unwrap();
+            let f = r.open_file(&name, cfg.clone()).unwrap();
             for i in 0..50u64 {
                 f.append(format!("d-{}", i).as_bytes()).unwrap();
             }
@@ -756,7 +756,7 @@ mod persistent {
 
         {
             let r = Redex::new().with_persistent_dir(&base);
-            let f = r.open_file(&name, cfg).unwrap();
+            let f = r.open_file(&name, cfg.clone()).unwrap();
             for i in 0..100u64 {
                 f.append_inline(&i.to_le_bytes()).unwrap();
             }
@@ -788,7 +788,7 @@ mod persistent {
 
         {
             let r = Redex::new().with_persistent_dir(&base);
-            let f = r.open_file(&name, cfg).unwrap();
+            let f = r.open_file(&name, cfg.clone()).unwrap();
             for i in 0..25u64 {
                 f.append(format!("c-{}", i).as_bytes()).unwrap();
             }
@@ -819,7 +819,7 @@ mod persistent {
 
         {
             let r = Redex::new().with_persistent_dir(&base);
-            let f = r.open_file(&name, cfg).unwrap();
+            let f = r.open_file(&name, cfg.clone()).unwrap();
             for i in 0..5u64 {
                 f.append(format!("pre-{}", i).as_bytes()).unwrap();
             }
@@ -864,7 +864,7 @@ mod persistent {
 
         {
             let r = Redex::new().with_persistent_dir(&base);
-            let f = r.open_file(&name, cfg).unwrap();
+            let f = r.open_file(&name, cfg.clone()).unwrap();
             f.append_inline(b"inline01").unwrap();
             f.append(b"this-is-heap-1").unwrap();
             f.append_inline(b"inline02").unwrap();
@@ -910,7 +910,7 @@ mod persistent {
 
         {
             let r = Redex::new().with_persistent_dir(&base);
-            let f = r.open_file(&name, cfg).unwrap();
+            let f = r.open_file(&name, cfg.clone()).unwrap();
             f.append(b"clean-event-payload").unwrap();
             r.close_file(&name).unwrap();
         }
@@ -982,7 +982,7 @@ mod persistent {
 
         {
             let r = Redex::new().with_persistent_dir(&base);
-            let f = r.open_file(&name, cfg).unwrap();
+            let f = r.open_file(&name, cfg.clone()).unwrap();
             f.append(b"heap-payload-16b").unwrap(); // 16-byte heap
             f.append_inline(b"inline08").unwrap(); // 8-byte inline
             r.close_file(&name).unwrap();
