@@ -344,7 +344,7 @@ pub const RUNTIME_INBOX_CAPACITY: usize = 1024;
 /// → task → Arc<dyn ReplicationDispatcher = MeshNode>`. This is
 /// a strong reference cycle. It is broken by
 /// `ReplicationWiring::drop` (`manager.rs`): un-installing the
-/// router releases its Arc<RuntimeHandle> references, the
+/// router releases its `Arc<RuntimeHandle>` references, the
 /// runtime task observes the closed inbox receiver, exits, and
 /// drops its dispatcher Arc. Callers that do NOT route through
 /// `Redex` drop (e.g. holding a raw `ReplicationRuntimeHandle`
