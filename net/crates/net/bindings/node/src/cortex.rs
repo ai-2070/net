@@ -222,11 +222,11 @@ impl Redex {
     /// (cortex-only build), surface a typed `redex:` error
     /// naming the missing feature instead of
     /// `TypeError: redex.enableReplication is not a function`.
-    /// Takes `napi::JsUnknown` so a JS call site with any
+    /// Takes `napi::Unknown` so a JS call site with any
     /// arg shape still reaches the typed error.
     #[cfg(not(feature = "net"))]
     #[napi]
-    pub fn enable_replication(&self, _mesh: napi::JsUnknown) -> Result<()> {
+    pub fn enable_replication(&self, _mesh: napi::Unknown) -> Result<()> {
         Err(redex_err(
             "enable_replication",
             "binding built without `net` feature; rebuild with --features net",
@@ -346,8 +346,8 @@ impl Redex {
     #[napi]
     pub fn enable_greedy_dataforts(
         &self,
-        _mesh: napi::JsUnknown,
-        _config: napi::JsUnknown,
+        _mesh: napi::Unknown,
+        _config: napi::Unknown,
     ) -> Result<()> {
         Err(redex_err(
             "enable_greedy_dataforts",
@@ -363,6 +363,12 @@ impl Redex {
         self.inner.disable_greedy_dataforts();
     }
 
+    /// Stub for builds without the `dataforts` feature. No-op so
+    /// JS callers don't get a `TypeError: ...is not a function`.
+    #[cfg(not(feature = "dataforts"))]
+    #[napi]
+    pub fn disable_greedy_dataforts(&self) {}
+
     /// Number of channels currently in the greedy cache. `0` when
     /// greedy isn't enabled.
     #[cfg(feature = "dataforts")]
@@ -374,6 +380,14 @@ impl Redex {
             .unwrap_or(0)
     }
 
+    /// Stub for builds without the `dataforts` feature. Reports
+    /// `0` so dashboards can treat absence as "greedy not enabled".
+    #[cfg(not(feature = "dataforts"))]
+    #[napi]
+    pub fn greedy_cached_channel_count(&self) -> u32 {
+        0
+    }
+
     /// Render the greedy metrics as Prometheus text. Empty string
     /// when greedy isn't enabled.
     #[cfg(feature = "dataforts")]
@@ -383,6 +397,15 @@ impl Redex {
             .greedy_runtime()
             .map(|r| r.metrics().snapshot().prometheus_text())
             .unwrap_or_default()
+    }
+
+    /// Stub for builds without the `dataforts` feature. Returns
+    /// an empty string so a scrape integration sees no greedy
+    /// metrics.
+    #[cfg(not(feature = "dataforts"))]
+    #[napi]
+    pub fn greedy_prometheus_text(&self) -> String {
+        String::new()
     }
 
     /// Install data-gravity heat-counter emission on the
@@ -423,8 +446,8 @@ impl Redex {
     #[napi]
     pub fn enable_gravity_for_greedy(
         &self,
-        _mesh: napi::JsUnknown,
-        _config: napi::JsUnknown,
+        _mesh: napi::Unknown,
+        _config: napi::Unknown,
     ) -> Result<()> {
         Err(redex_err(
             "enable_gravity_for_greedy",
@@ -439,6 +462,11 @@ impl Redex {
     pub fn disable_gravity_for_greedy(&self) {
         self.inner.disable_gravity_for_greedy();
     }
+
+    /// Stub for builds without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    #[napi]
+    pub fn disable_gravity_for_greedy(&self) {}
 
     /// Open (or get) a raw RedEX file bound to `channelName`. Returns
     /// a handle for append / tail / read operations without going
