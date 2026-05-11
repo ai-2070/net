@@ -873,26 +873,26 @@ The single `dataforts` Cargo feature stays defined for opt-in rollout across the
 
 | Decision | Locked value |
 |---|---|
-| Token shape | `WriteToken { origin_hash: [u8; 32], seq: u64 }` — round-trips through every binding as a typed struct |
-| Default deadline | `1 s`; configurable per call via `wait_for_seq(seq, deadline)` |
+| Token shape | `WriteToken { origin_hash: u64, seq: u64 }` — substrate keys causal chains on `u64` throughout (`EntityKeypair::origin_hash() -> u64`); the earlier `[u8; 32]` draft was speculative |
+| Default deadline | caller-supplied per call via `wait_for_token(token, deadline)`; bindings default to `1 s` at the binding surface, not the substrate |
 | Cross-node RYW | supported; the substrate's existing tail-fold-propagation latency is the lower bound |
-| Backpressure | per-channel wait queue cap (default 1024); on overflow surface `RpcError::QueueFull` |
-| Replication composition | RYW is a *visibility* guarantee; replication is a *durability* guarantee. They compose but are documented as orthogonal — `wait_for_seq` does NOT imply "durable on N replicas" |
-| Token issuance points | every `RedexFile::append` returns `WriteToken`; every `MeshNode::publish` returns `WriteToken` |
+| Backpressure | per-channel wait queue cap (default 1024); on overflow surface `WaitForTokenError::QueueFull` |
+| Replication composition | RYW is a *visibility* guarantee; replication is a *durability* guarantee. They compose but are documented as orthogonal — `wait_for_token` does NOT imply "durable on N replicas" |
+| Token issuance points | `CortexAdapter::ingest_with_token` is the canonical issuance point; origin-bound adapters (`TasksAdapter`, `MemoriesAdapter`) thread it through their typed ingest paths |
+| Layering | RYW lives entirely at the **CortEX** layer. `MeshNode::publish` is wire-level fan-out and never appends to a local `RedexFile`, so it cannot issue a `WriteToken`. Callers wanting "publish + RYW" pair `adapter.ingest_with_token(envelope)` for durability and `mesh.publish(publisher, payload)` for fan-out as orthogonal steps |
 
 **Concrete work items:**
 
-1. **`WriteToken` type** — `src/adapter/net/redex/write_token.rs`; serde-roundtripped; `Display` impl renders as `<hex_origin>:<seq>`.
-2. **`RedexFile::append` signature** — returns `WriteToken` directly (additive — the prior return was `u64 seq`; the new shape is `{ origin_hash, seq }` and the prior callsites destructure or call `.seq` for back-compat).
-3. **`MeshNode::publish` signature** — same shape: returns `WriteToken`.
-4. **`CortexAdapter::wait_for_seq(seq, deadline) -> Result<(), RpcError>`** — uses the existing `applied_through_seq` notify primitive that CortEX already tracks. No new locking.
-5. **`MeshNode::publish_with_token` / `MeshNode::read_at_token`** — convenience wrappers. `read_at_token(token, deadline)` resolves the chain via `find_chain_holders` then waits for the local CortEX adapter to apply through `token.seq`.
-6. **Wait-queue cap** — per-channel `Semaphore::new(1024)`; on `try_acquire` failure surface `RpcError::QueueFull`.
-7. **Metrics** — `dataforts_ryw_wait_duration_seconds{channel}` (histogram), `dataforts_ryw_timeouts_total{channel}`, `dataforts_ryw_queue_full_total{channel}`.
-8. **Bindings** — `WriteToken` round-trips through Node / Python / Go / C; `wait_for_seq` is async in every binding (Promise in Node, awaitable in Python, channel-returning in Go, callback in C).
-9. **Tests** — happy path (writer publishes, gets token, reads with token, returns within deadline); stale-fold timeout; cross-node RYW; deadline-tuning histogram check.
+1. **`WriteToken` type** — `src/adapter/net/redex/write_token.rs`; `Display` impl renders as `<hex_origin>:<seq>`; `FromStr` round-trip. Serde wiring lands when a binding needs it. ✅ shipped.
+2. **`CortexAdapter::ingest_with_token`** — additive method that ingests the envelope and returns a `WriteToken` built from `meta.origin_hash` + the assigned seq. ✅ shipped.
+3. **`CortexAdapter::wait_for_token(token, deadline) -> Result<(), WaitForTokenError>`** — uses the existing `folded_through_seq` notify primitive that CortEX already tracks, wrapped in `tokio::time::timeout`. Token origin is informational at this layer — the generic adapter folds every event regardless of origin. ✅ shipped.
+4. **Origin-bound wrappers** — `TasksAdapter::wait_for_token` + `MemoriesAdapter::wait_for_token` reject tokens whose origin does not match the adapter's bound origin via `WaitForTokenError::WrongOrigin`. ✅ shipped.
+5. **Per-channel wait-queue cap** — per-channel `Semaphore::new(1024)`; on `try_acquire` failure surface `WaitForTokenError::QueueFull`. Pending — design site is the bound adapter's wait path so back-pressure surfaces before the timer thread spins.
+6. **Metrics** — `dataforts_ryw_wait_duration_seconds{channel}` (histogram), `dataforts_ryw_timeouts_total{channel}`, `dataforts_ryw_queue_full_total{channel}`. Pending.
+7. **Bindings** — `WriteToken` round-trips through Node / Python / Go / C; `wait_for_token` is async in every binding (Promise in Node, awaitable in Python, channel-returning in Go, callback in C). Pending.
+8. **Tests** — happy path (writer ingests, gets token, reader waits, returns within deadline) ✅ shipped; stale-fold timeout ✅ shipped; cross-origin guard, cross-node RYW, queue-full backpressure, deadline-tuning histogram check — pending.
 
-**Out of scope:** durability composition (explicitly documented as separate), per-token transactional read APIs (single-seq only in v1).
+**Out of scope:** durability composition (explicitly documented as separate), per-token transactional read APIs (single-seq only in v1), mesh-side publish-with-token (does not fit the substrate's fan-out-only publish layer; callers compose explicitly).
 
 ---
 
