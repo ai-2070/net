@@ -2,9 +2,11 @@
 
 1. Update version
 
-2. Draft release note
+2. Merge version branch
 
-3. Run commands
+3. Draft release note
+
+4. Run commands
 
 ```bash
 # Main release

@@ -1,6 +1,6 @@
 [package]
 name = "net-compute-ffi"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "C ABI compute (MeshDaemon + migration) surface for the Go binding of Net"
@@ -45,11 +45,11 @@ test-helpers = []
 # through the wrong layout — a subtle UB that surfaces as garbage in
 # the GPU vendor field on `find_nodes`. Keep these in sync with the
 # Go binding's documented build command.
-net = { package = "ai2070-net", version = "0.13.0", path = "../../..", features = ["net", "netdb", "redex-disk"] }
+net = { package = "ai2070-net", version = "0.14.0", path = "../../..", features = ["net", "netdb", "redex-disk"] }
 # SDK compute surface — `DaemonRuntime`, `DaemonHandle`,
 # `MigrationHandle`, `StateSnapshot`. The Go FFI delegates to this
 # layer so all three language bindings stay behavior-aligned.
-net-sdk = { package = "ai2070-net-sdk", version = "0.13.0", path = "../../../sdk", features = ["net", "compute", "groups"] }
+net-sdk = { package = "ai2070-net-sdk", version = "0.14.0", path = "../../../sdk", features = ["net", "compute", "groups"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 bytes = "1"
 dashmap = "6"
