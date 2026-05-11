@@ -409,4 +409,129 @@ mod tests {
         // exercises this; here we just confirm each side's election
         // is self-consistent.
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Phase F invariants — partition-safety properties
+    //
+    // The DST harness landing in Phase F exercises these under
+    // adversarial scheduler interleavings + fault injection. The
+    // unit-test versions below pin the same invariants on the pure
+    // function so any drift between the production logic and the
+    // documented partition-safety contract surfaces here first.
+    //
+    // **Design note on dual-leader windows.** `elect()` hardcodes
+    // self-RTT to zero (the proximity graph doesn't store
+    // self-entries; tautologically RTT-to-self is 0). With non-zero
+    // pairwise RTTs, every node sees itself at the lowest RTT and
+    // would compute `SelfWins` in a symmetric all-healthy scenario.
+    // The pure function does NOT enforce "one leader per partition"
+    // by itself — that property comes from the broader system:
+    //
+    // 1. Election only fires when the current leader goes silent;
+    //    in steady state nobody runs `elect`.
+    // 2. The health filter excludes the silent leader, leaving only
+    //    survivors as candidates.
+    // 3. Among survivors, each runs `elect` and may produce
+    //    `SelfWins`. Dual-leader windows are expected.
+    // 4. The capability tag layer (`announce_chain` /
+    //    `find_chain_holders`) + heartbeat cycle converges to one
+    //    leader within ~3 heartbeats post-failover.
+    //
+    // The DST harness Phase F exercises the convergence guarantee.
+    // The unit tests below pin the narrower properties the pure
+    // function does enforce.
+    // ────────────────────────────────────────────────────────────────
+
+    /// Phase F invariant: when one peer is observed at zero RTT
+    /// from every other node's view (representing a "central"
+    /// leader with established connections), every node agrees on
+    /// that peer as the winner. This is the convergence case the
+    /// election function does enforce — and the scenario it routes
+    /// for whenever the heartbeat cycle has propagated leader
+    /// identity through the proximity graph.
+    #[test]
+    fn central_peer_at_zero_rtt_wins_across_all_voters() {
+        let set = [0x10, 0x20, 0x30];
+        // 0x10 is the "central" candidate — every node observes
+        // it at RTT 0 (tightest possible measurement). Other peers
+        // sit at positive RTT.
+        let rtt_for = |_: NodeId, to: NodeId| -> Option<Duration> {
+            match to {
+                0x10 => Some(Duration::ZERO),
+                0x20 => Some(Duration::from_millis(10)),
+                0x30 => Some(Duration::from_millis(20)),
+                _ => None,
+            }
+        };
+        let healthy: std::collections::HashSet<NodeId> = set.iter().copied().collect();
+
+        let mut winners: Vec<NodeId> = Vec::new();
+        for &self_id in &set {
+            let outcome = elect(
+                &set,
+                self_id,
+                |peer| rtt_for(self_id, peer),
+                |peer| healthy.contains(&peer),
+            );
+            let winner = match outcome {
+                ElectionOutcome::SelfWins => self_id,
+                ElectionOutcome::PeerWins(w) => w,
+                ElectionOutcome::NoEligibleReplica => {
+                    panic!("expected a winner; healthy partition has eligible replicas");
+                }
+            };
+            winners.push(winner);
+        }
+        assert!(
+            winners.windows(2).all(|w| w[0] == w[1]),
+            "every node converges on the central-zero-RTT winner; got {winners:?}"
+        );
+        assert_eq!(winners[0], 0x10);
+    }
+
+    /// Phase F documentation: in the symmetric-RTT failover
+    /// scenario (dead leader filtered out; survivors each see each
+    /// other at the same RTT), every survivor's local `elect()`
+    /// reports `SelfWins`. The pure function does NOT enforce
+    /// "single leader per partition" in this case — that property
+    /// comes from the broader system (heartbeat cycle + capability
+    /// tag layer demoting all-but-one Leader within ~3 heartbeats).
+    ///
+    /// Pinned as expected behavior. Phase F's DST harness asserts
+    /// the broader-system convergence guarantee; this test pins
+    /// the pure function's contract that produces the dual-leader
+    /// window the convergence mechanism then resolves.
+    #[test]
+    fn symmetric_failover_yields_dual_self_winners_as_expected() {
+        let dead_leader = 0x05;
+        let survivors = [0x10, 0x20, 0x30];
+        let set = [dead_leader, 0x10, 0x20, 0x30];
+        let rtt_for = |from: NodeId, to: NodeId| -> Option<Duration> {
+            if from == to {
+                return Some(Duration::ZERO);
+            }
+            Some(Duration::from_millis(5))
+        };
+        let healthy_for_survivor = |peer: NodeId| peer != dead_leader;
+
+        let mut self_winners = Vec::new();
+        for &self_id in &survivors {
+            let outcome = elect(
+                &set,
+                self_id,
+                |peer| rtt_for(self_id, peer),
+                healthy_for_survivor,
+            );
+            if outcome == ElectionOutcome::SelfWins {
+                self_winners.push(self_id);
+            }
+        }
+        // Every survivor sees self at 0 RTT (tautology) which is
+        // lower than the symmetric 5ms peer RTT, so every survivor
+        // self-wins. Convergence is the broader system's job.
+        assert_eq!(
+            self_winners, survivors,
+            "symmetric-RTT failover produces N self-winners; convergence is broader-system"
+        );
+    }
 }
