@@ -1,0 +1,50 @@
+net/crates/net/src/adapter/net/dataforts/greedy/metrics.rs
+  s_3a0a24a47d1a36::t_21f64ce9bcab97 159-164
+  s_3a0a24a47d1a36::t_3ec0e21465457f 291-294
+  s_3a0a24a47d1a36::t_b8e5a9a4864677 331-334
+  s_3a0a24a47d1a36::t_151ba474c69543 413-427
+  s_3a0a24a47d1a36::t_df1b2e6459eaf3 441
+  s_3a0a24a47d1a36::t_d0845e5330f5c1 113-118
+  s_3a0a24a47d1a36::t_b55a96d3e0e031 581-583
+net/crates/net/src/ffi/cortex.rs
+  s_3a0a24a47d1a36::t_f61f002e13d646 479
+  s_3a0a24a47d1a36::t_56524442efe5ad 478,480
+  s_3a0a24a47d1a36::t_17b078a5c14faf 444
+  s_3a0a24a47d1a36::t_2b83137710c523 442-443
+net/crates/net/bindings/go/net/redex.go
+  s_3a0a24a47d1a36::t_8793b93c37fb33 419-422
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_3a0a24a47d1a36::t_9635f100fd66a2 219,233
+  s_3a0a24a47d1a36::t_653d46217f5edc 948-974
+  s_3a0a24a47d1a36::t_fd89ca1cf2042f 159-166
+  s_3a0a24a47d1a36::t_bd718e1a9c41da 628-643,650
+net/crates/net/src/adapter/net/dataforts/greedy/config.rs
+  s_3a0a24a47d1a36::t_bf6e09dc8a9be3 169-176
+  s_3a0a24a47d1a36::t_eab828a2716c0c 120
+  s_3a0a24a47d1a36::t_65437ef8a91a65 102-106
+  s_3a0a24a47d1a36::t_15a9392ccb283a 43-51
+net/crates/net/bindings/node/src/cortex.rs
+  s_3a0a24a47d1a36::t_19f9bd298a8d40 628-632
+  s_3a0a24a47d1a36::t_77147cb8172c07 309-311
+net/crates/net/bindings/python/src/cortex.rs
+  s_3a0a24a47d1a36::t_acd051228a9d44 481,495
+  s_3a0a24a47d1a36::t_c86fa03fee4427 521-523
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_b3f9f2690e374d 41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "c6b1928ec22e79ac3d53ebaf7734b64aaf9ab733",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
