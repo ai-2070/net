@@ -1,0 +1,22 @@
+net/crates/net/tests/loom_models.rs
+  s_9163f300668f8b::t_99ac9040d090f6 423-604
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_9163f300668f8b::t_afd25e61ec6702 493,495-502
+  s_9163f300668f8b::t_e48ba915bd3344 489
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "f993fff431a9dbf18052ea0cc8b1bd6d390c2f56",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
