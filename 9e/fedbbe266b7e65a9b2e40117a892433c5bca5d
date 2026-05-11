@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_4dbb97ea6ebffd::t_458ff57a98b11b 1-350,352-457,468-469,471-472,475-477,479-548
+  s_4dbb97ea6ebffd::t_897a332eb6ac75 458-467,470,473-474,478
+  s_4dbb97ea6ebffd::t_d42a5ccd64dc97 351
+net/crates/net/src/adapter/net/dataforts/greedy/mod.rs
+  s_4dbb97ea6ebffd::t_7ff4e790fd1237 24,38
+net/crates/net/src/adapter/net/dataforts/mod.rs
+  s_4dbb97ea6ebffd::t_d72777926552ed 21,23-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "9efedbbe266b7e65a9b2e40117a892433c5bca5d",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
