@@ -1,0 +1,21 @@
+net/crates/net/docs/plans/REDEX_GO_FFI_DESIGN.md
+  s_9163f300668f8b::t_da6dd27d713ed0 1-202
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_9163f300668f8b::t_58e76da6a8ac39 539-540
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "505767f1135a41e21da5f1c44275d7f5d40fa561",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
