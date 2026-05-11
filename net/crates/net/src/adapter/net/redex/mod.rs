@@ -25,10 +25,12 @@ mod index;
 mod manager;
 mod ordered;
 pub mod replication;
+mod replication_budget;
 mod replication_catchup;
 mod replication_config;
 mod replication_coordinator;
 mod replication_election;
+mod replication_heartbeat;
 mod replication_metrics;
 mod replication_state;
 mod retention;
@@ -55,6 +57,7 @@ pub use replication_config::{
     HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MIN, REPLICATION_BUDGET_FRACTION_DEFAULT,
     REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX, REPLICATION_FACTOR_MIN,
 };
+pub use replication_budget::BandwidthBudget;
 pub use replication_catchup::{
     apply_sync_response, handle_sync_request, ApplyError, SyncRequestOutcome,
     CHUNK_MAX_HARD_CEILING_BYTES,
@@ -63,6 +66,7 @@ pub use replication_coordinator::{
     ChainTagSink, ChannelIdentity, CoordinatorError, ReplicationCoordinator,
 };
 pub use replication_election::{elect, ElectionOutcome};
+pub use replication_heartbeat::{HeartbeatTracker, PeerState, DEFAULT_MISS_THRESHOLD};
 pub use replication_metrics::{
     ChannelMetrics, ChannelMetricsAtomic, ReplicationMetricsRegistry,
     ReplicationMetricsSnapshot, MAX_TRACKED_CHANNELS, OVERFLOW_CHANNEL_LABEL,
