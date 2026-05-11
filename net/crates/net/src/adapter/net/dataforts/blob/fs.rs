@@ -64,6 +64,10 @@ impl BlobAdapter for FileSystemAdapter {
         &self.id
     }
 
+    fn accepted_schemes(&self) -> &[&str] {
+        &["file"]
+    }
+
     async fn store(&self, blob_ref: &BlobRef, bytes: &[u8]) -> Result<(), BlobError> {
         // Verify the bytes hash to the BlobRef's hash BEFORE writing.
         // Without this an adapter author (or compromised binding) can

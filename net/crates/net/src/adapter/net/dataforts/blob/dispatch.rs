@@ -48,8 +48,18 @@ pub fn classify_payload(bytes: &[u8]) -> Result<EventPayload<'_>, BlobError> {
 }
 
 /// Resolve a payload to its content bytes. Inline payloads return
-/// a `Vec<u8>` copy; blob-ref payloads fetch via `adapter`, verify
-/// against the embedded BLAKE3 hash, and return the verified bytes.
+/// a `Vec<u8>` copy; blob-ref payloads validate the URI scheme
+/// against the adapter's accepted-schemes list, fetch via
+/// `adapter`, verify against the embedded BLAKE3 hash, and return
+/// the verified bytes.
+///
+/// Scheme validation closes the publisher-controls-adapter-input
+/// attack surface: a publisher with append rights on a channel
+/// configured to use a privileged adapter (e.g. an FS adapter
+/// with host-side authority) could otherwise stamp arbitrary
+/// `s3://attacker/key` URIs that the FS adapter would still try
+/// to resolve. The adapter's [`BlobAdapter::accepted_schemes`]
+/// override drives the gate — empty default means "accept any."
 ///
 /// Hash verification runs inside this function rather than inside
 /// the adapter so an adversarial adapter cannot fake-verify by
@@ -61,10 +71,26 @@ pub async fn resolve_payload<A: BlobAdapter + ?Sized>(
     match classify_payload(bytes)? {
         EventPayload::Inline(b) => Ok(b.to_vec()),
         EventPayload::Blob(blob) => {
+            let accepted = adapter.accepted_schemes();
+            if !accepted.is_empty() {
+                let scheme = uri_scheme(&blob.uri);
+                if !accepted.iter().any(|&s| s == scheme) {
+                    return Err(BlobError::UnsupportedScheme(blob.uri.clone()));
+                }
+            }
             let fetched = adapter.fetch(&blob).await?;
             blob.verify(&fetched)?;
             Ok(fetched)
         }
+    }
+}
+
+/// Extract the URI scheme (everything before the first `:`), or
+/// the empty string if no scheme is present.
+fn uri_scheme(uri: &str) -> &str {
+    match uri.find(':') {
+        Some(i) => &uri[..i],
+        None => "",
     }
 }
 
@@ -110,7 +136,7 @@ mod tests {
 
     fn fixture_blob_ref(payload: &[u8]) -> BlobRef {
         BlobRef::new(
-            "test://dispatch",
+            "file:///dispatch",
             blake3::hash(payload).into(),
             payload.len() as u64,
         )
@@ -191,7 +217,7 @@ mod tests {
         let payload = b"write side equivalent of resolve_payload";
 
         // publish_blob returns the encoded BlobRef as bytes.
-        let encoded = publish_blob(&adapter, "fs://published", payload)
+        let encoded = publish_blob(&adapter, "file:///published", payload)
             .await
             .unwrap();
         // First byte is the discriminator.
@@ -221,14 +247,14 @@ mod tests {
         let adapter = FileSystemAdapter::new("publish-ref", &root);
         let payload = b"explicit ref shape";
 
-        let blob = publish_blob_ref(&adapter, "fs://structured", payload)
+        let blob = publish_blob_ref(&adapter, "file:///structured", payload)
             .await
             .unwrap();
         // Hash is BLAKE3 of the payload.
         let expected: [u8; 32] = blake3::hash(payload).into();
         assert_eq!(blob.hash, expected);
         assert_eq!(blob.size, payload.len() as u64);
-        assert_eq!(blob.uri, "fs://structured");
+        assert_eq!(blob.uri, "file:///structured");
 
         // Stored content is fetchable + verifies.
         let fetched = adapter.fetch(&blob).await.unwrap();
@@ -239,72 +265,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_rejects_blob_with_corrupted_content() {
-        // Build a BlobRef whose hash claims one payload, but the
-        // adapter serves a different one. Verification inside
-        // resolve_payload must fail — pins that the substrate-side
-        // check defends against an adversarial adapter.
+    async fn resolve_rejects_uri_with_unaccepted_scheme() {
+        // FileSystemAdapter only accepts `file:` URIs. An event
+        // payload whose BlobRef carries `s3://attacker/key` must
+        // reject with UnsupportedScheme before the adapter is
+        // asked to fetch anything.
         let root = std::env::temp_dir().join(format!(
-            "net-blob-tamper-{}-{}",
+            "net-blob-scheme-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let adapter = FileSystemAdapter::new("tamper-test", &root);
+        let adapter = FileSystemAdapter::new("scheme-test", &root);
+        let payload = b"unused";
+        let blob = BlobRef::new(
+            "s3://attacker/key",
+            blake3::hash(payload).into(),
+            payload.len() as u64,
+        );
+        let encoded = blob.encode();
+        let err = resolve_payload(&encoded, &adapter).await.unwrap_err();
+        assert!(matches!(err, BlobError::UnsupportedScheme(_)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_blob_with_corrupted_content() {
+        // Pin that the substrate-side verify defends against an
+        // adversarial adapter that returns bytes whose hash
+        // doesn't match the advertised BlobRef. Built on a stub
+        // adapter that doesn't verify on store (the production FS
+        // adapter does, so we can't use it to forge mismatched
+        // content).
+        use async_trait::async_trait;
+        use std::ops::Range;
+
+        struct AdversarialAdapter {
+            id: String,
+            bytes: Vec<u8>,
+        }
+        #[async_trait]
+        impl BlobAdapter for AdversarialAdapter {
+            fn adapter_id(&self) -> &str {
+                &self.id
+            }
+            async fn store(
+                &self,
+                _blob_ref: &BlobRef,
+                _bytes: &[u8],
+            ) -> Result<(), BlobError> {
+                Ok(())
+            }
+            async fn fetch(&self, _blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
+                Ok(self.bytes.clone())
+            }
+            async fn fetch_range(
+                &self,
+                _blob_ref: &BlobRef,
+                _range: Range<u64>,
+            ) -> Result<Vec<u8>, BlobError> {
+                Ok(self.bytes.clone())
+            }
+            async fn exists(&self, _blob_ref: &BlobRef) -> Result<bool, BlobError> {
+                Ok(true)
+            }
+        }
+
         let advertised = b"the truth";
-        let actual = b"a different lie";
+        let actual: &[u8] = b"a different lie";
         let blob = BlobRef::new(
             "test://tamper",
             blake3::hash(advertised).into(),
             advertised.len() as u64,
         );
-        // Store mismatching bytes under the BlobRef's hash-derived
-        // path. We can't trick the FS adapter directly, so use
-        // store() against a BlobRef built from `actual`, then call
-        // resolve with an encoded version of the `advertised`
-        // BlobRef pointing at the wrong hash slot.
-        let actual_blob = BlobRef::new(
-            "test://tamper",
-            blake3::hash(actual).into(),
-            actual.len() as u64,
-        );
-        adapter.store(&actual_blob, actual).await.unwrap();
-
-        // Construct an encoded BlobRef that LIES about its hash:
-        // hash points at `actual_blob`'s storage slot but claims
-        // the `advertised` hash. The FS adapter resolves by hash
-        // → returns `actual`, but verify uses the advertised hash
-        // → mismatch.
-        let lying = BlobRef {
-            version: 0x01,
-            uri: "test://tamper".into(),
-            hash: actual_blob.hash, // path to existing storage
-            size: actual.len() as u64,
+        let adapter = AdversarialAdapter {
+            id: "tamper".into(),
+            bytes: actual.to_vec(),
         };
-        // First sanity-pin: lying actually fetches `actual`.
-        let raw = adapter.fetch(&lying).await.unwrap();
-        assert_eq!(raw, actual);
-
-        // Now build the lying BlobRef but with the advertised
-        // (mismatched) hash; the lie surfaces when verify runs.
-        let liar_encoded = {
-            let mut blob = blob.clone();
-            // Keep advertised hash, but point uri at the path the
-            // adapter actually resolves — already done above.
-            blob.uri = "test://tamper".into();
-            // The FS adapter ignores URI for storage and uses hash
-            // alone, so the FS adapter will look for blob.hash on
-            // disk. To force the FS adapter to serve `actual`,
-            // store actual under blob.hash too:
-            adapter.store(&blob, actual).await.unwrap();
-            blob.encode()
-        };
-
-        let err = resolve_payload(&liar_encoded, &adapter).await.unwrap_err();
+        let encoded = blob.encode();
+        let err = resolve_payload(&encoded, &adapter).await.unwrap_err();
         assert!(matches!(err, BlobError::HashMismatch { .. }));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

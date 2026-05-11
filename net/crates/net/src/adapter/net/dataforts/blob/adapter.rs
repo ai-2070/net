@@ -29,6 +29,23 @@ pub trait BlobAdapter: Send + Sync + 'static {
     /// rejects re-registrations with the same id.
     fn adapter_id(&self) -> &str;
 
+    /// URI schemes this adapter accepts on inbound `BlobRef`s.
+    /// The substrate's blob-dispatch layer routes by channel-
+    /// configured `blob_adapter_id`; before invoking the adapter
+    /// it checks the inbound URI's scheme against this list and
+    /// rejects with [`BlobError::UnsupportedScheme`] when the URI
+    /// scheme isn't accepted. Default returns an empty slice,
+    /// which means "accept anything" — adapters in trusted /
+    /// single-tenant deployments may leave this as-is, but
+    /// adapters that have authority over a privileged backend
+    /// (FS adapter, host-side keys, etc.) should override and
+    /// list the schemes they actually serve so a publisher with
+    /// append rights cannot dictate arbitrary URIs the adapter
+    /// then resolves.
+    fn accepted_schemes(&self) -> &[&str] {
+        &[]
+    }
+
     /// Persist `bytes` at the URI carried in `blob_ref`. Most
     /// adapters will derive the URI from `blob_ref.hash` (content-
     /// addressing) and ignore the inbound URI; some (e.g.
