@@ -216,6 +216,11 @@ pub enum DataGravityPolicyError {
     /// instantly and produces a flapping emission cycle.
     #[error("data-gravity decay_half_life must be non-zero")]
     DecayHalfLifeZero,
+    /// `enable_gravity_for_greedy` was called before greedy
+    /// itself was installed. Operators must call
+    /// `enable_greedy_dataforts` first.
+    #[error("data-gravity requires greedy to be enabled first")]
+    GreedyNotEnabled,
 }
 
 #[cfg(test)]

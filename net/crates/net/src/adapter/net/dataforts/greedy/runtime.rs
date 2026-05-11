@@ -146,12 +146,16 @@ struct GreedyRuntimeInner {
     /// install time; refreshable via [`GreedyRuntime::set_local_caps`]
     /// when the node's caps change.
     local_caps: Mutex<Arc<CapabilitySet>>,
-    /// Optional data-gravity state (Phase 4). When present,
-    /// `note_read` bumps the per-chain heat counter and
-    /// `gravity_tick` emits / withdraws heat tags via the sink.
-    /// `None` = gravity disabled; the read path is unchanged.
+    /// Optional data-gravity state (Phase 4). Interior-mutable
+    /// so operators can flip gravity on / off after the greedy
+    /// runtime is already shared via Arc clones (the Arc count
+    /// stays > 1 after `Redex::enable_greedy_dataforts`, so
+    /// `try_unwrap` for a build-then-replace pattern would
+    /// always fail). RwLock chosen over Mutex because reads
+    /// (note_read, gravity_tick) dominate writes (enable /
+    /// disable) once gravity is installed.
     #[cfg(feature = "dataforts-gravity")]
-    gravity: Option<GravityState>,
+    gravity: parking_lot::RwLock<Option<GravityState>>,
 }
 
 /// Per-runtime data-gravity state. Behind the same gate as the
@@ -219,45 +223,45 @@ impl GreedyRuntime {
                 metadata_keys: PlacementMetadataKeys::default(),
                 local_caps: Mutex::new(local_caps),
                 #[cfg(feature = "dataforts-gravity")]
-                gravity: None,
+                gravity: parking_lot::RwLock::new(None),
             }),
         }
     }
 
-    /// Builder for an Arc-newly-built runtime: enable data-gravity
-    /// with the supplied policy + heat sink. Only callable on a
-    /// fresh runtime where the inner `Arc` strong count is 1
-    /// (typical immediately after `new`); subsequent enable
-    /// requests after the runtime is shared would require a
-    /// rebuild.
+    /// Enable data-gravity heat-counter emission on this runtime.
+    /// Callable at any time — flips the gravity slot regardless
+    /// of how many Arc clones exist on the runtime. Operators
+    /// pair this with a periodic [`Self::gravity_tick`] task.
     ///
-    /// `Redex::enable_greedy_dataforts` calls this internally when
-    /// the operator configures gravity at install time.
+    /// Idempotent — replacing an already-installed gravity state
+    /// (e.g. to reconfigure the policy) is permitted; the heat
+    /// registry resets on each call so the new policy starts
+    /// from a clean slate.
     #[cfg(feature = "dataforts-gravity")]
-    pub fn with_gravity(
-        self,
+    pub fn set_gravity(
+        &self,
         policy: super::super::gravity::DataGravityPolicy,
         heat_sink: Arc<dyn super::super::gravity::HeatSink>,
-    ) -> Result<Self, Self> {
-        let mut inner = match Arc::try_unwrap(self.inner) {
-            Ok(inner) => inner,
-            Err(arc) => return Err(Self { inner: arc }),
-        };
-        inner.gravity = Some(GravityState {
+    ) {
+        *self.inner.gravity.write() = Some(GravityState {
             policy,
             heat: Mutex::new(super::super::gravity::HeatRegistry::new()),
             sink: heat_sink,
         });
-        Ok(Self {
-            inner: Arc::new(inner),
-        })
     }
 
-    /// True iff this runtime was configured with data gravity.
-    /// Useful for tests + operator introspection.
+    /// Disable data-gravity. The heat registry drops; subsequent
+    /// `note_read` calls won't touch heat; `gravity_tick` becomes
+    /// a no-op. Idempotent.
+    #[cfg(feature = "dataforts-gravity")]
+    pub fn clear_gravity(&self) {
+        *self.inner.gravity.write() = None;
+    }
+
+    /// True iff this runtime has data gravity installed.
     #[cfg(feature = "dataforts-gravity")]
     pub fn gravity_enabled(&self) -> bool {
-        self.inner.gravity.is_some()
+        self.inner.gravity.read().is_some()
     }
 
     /// Borrow the metrics registry. Cheap clone of the inner Arc.
@@ -322,12 +326,15 @@ impl GreedyRuntime {
         m.incr_serve();
 
         #[cfg(feature = "dataforts-gravity")]
-        if let Some(gravity) = &self.inner.gravity {
-            if let Some(origin_hash) = origin_hash {
-                if origin_hash != 0 {
-                    let mut heat = gravity.heat.lock();
-                    heat.entry_mut(origin_hash, gravity.policy.decay_half_life, now)
-                        .bump(now);
+        {
+            let gravity = self.inner.gravity.read();
+            if let Some(gravity) = gravity.as_ref() {
+                if let Some(origin_hash) = origin_hash {
+                    if origin_hash != 0 {
+                        let mut heat = gravity.heat.lock();
+                        heat.entry_mut(origin_hash, gravity.policy.decay_half_life, now)
+                            .bump(now);
+                    }
                 }
             }
         }
@@ -351,11 +358,20 @@ impl GreedyRuntime {
     /// cadence.
     #[cfg(feature = "dataforts-gravity")]
     pub async fn gravity_tick(&self) {
-        let Some(gravity) = &self.inner.gravity else {
-            return;
+        // Snapshot the sink + emissions list under the read lock,
+        // then drop the lock before awaiting the sink. Holding
+        // the gravity lock across an .await would block any
+        // concurrent set_gravity / clear_gravity for the duration
+        // of the wire emission.
+        let (sink, emissions) = {
+            let gravity = self.inner.gravity.read();
+            let Some(gravity) = gravity.as_ref() else {
+                return;
+            };
+            let now = Instant::now();
+            let emissions = gravity.heat.lock().tick(&gravity.policy, now);
+            (gravity.sink.clone(), emissions)
         };
-        let now = Instant::now();
-        let emissions = gravity.heat.lock().tick(&gravity.policy, now);
         for (origin_hash, emission) in emissions {
             match emission {
                 super::super::gravity::HeatEmission::Suppress => {}
@@ -365,7 +381,7 @@ impl GreedyRuntime {
                     // substrate clamps anyway but normalize here
                     // so the per-tick value is interpretable.
                     let normalized = (rate / (rate + 1.0)).min(1.0);
-                    if let Err(e) = gravity.sink.announce_heat(origin_hash, normalized).await {
+                    if let Err(e) = sink.announce_heat(origin_hash, normalized).await {
                         tracing::trace!(
                             origin_hash = origin_hash,
                             error = ?e,
@@ -374,7 +390,7 @@ impl GreedyRuntime {
                     }
                 }
                 super::super::gravity::HeatEmission::Withdraw => {
-                    if let Err(e) = gravity.sink.withdraw_heat(origin_hash).await {
+                    if let Err(e) = sink.withdraw_heat(origin_hash).await {
                         tracing::trace!(
                             origin_hash = origin_hash,
                             error = ?e,
@@ -815,13 +831,11 @@ mod tests {
             sink as Arc<dyn ChainTagSink>,
             Arc::new(CapabilitySet::default()),
             IntentRegistry::new(),
-        )
-        .with_gravity(
+        );
+        rt.set_gravity(
             DataGravityPolicy::default(),
             heat_sink.clone() as Arc<dyn crate::adapter::net::dataforts::gravity::HeatSink>,
-        )
-        .ok()
-        .expect("with_gravity on fresh runtime");
+        );
         assert!(rt.gravity_enabled());
 
         // Dispatch + read so the cache entry exists with
