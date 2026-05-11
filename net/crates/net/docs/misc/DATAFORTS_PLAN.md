@@ -4,7 +4,19 @@
 
 ## Status
 
-Design only. Nothing in this plan is in flight. The release split below ensures Rebel Yell (Dataforts) is a *thin compositional layer* on top of The Warriors (substrate foundations) rather than a separate engineering project. Phases inside The Warriors are the precondition for Rebel Yell to land cleanly.
+**The Warriors shipped in v0.14 (2026-05-12).** Phases 0, 2, 6 (primitives only), and 7 are in the codebase. The four remaining phases — all under the **Rebel Yell** release — stay parked until their activation gates fire. See [§ Implementation-ready specs for remaining phases](#implementation-ready-specs-for-remaining-phases) for the locked decisions + actionable work items per remaining phase.
+
+| Phase | Release | Status | Where it lives |
+|---|---|---|---|
+| 0 — Capability-tag discovery + taxonomy reorganization | Warriors | ✅ shipped v0.13 | `adapter::net::behavior::{tag, tag_codec, bloom}` + `CapabilitySet::metadata` |
+| 6 — Federated query primitives (Warriors-scope) | Warriors | ✅ shipped v0.13 (primitives only; MeshDB extension still deferred) | `adapter::net::behavior::query::CapabilityQuery` |
+| 7 — 5-axis `PlacementFilter` + Mikoshi integration | Warriors | ✅ shipped v0.13 | `adapter::net::behavior::placement::{PlacementFilter, Artifact, StandardPlacement, IntentRegistry}` |
+| 2 — RedEX cross-node replication (`SUBPROTOCOL_REDEX`) | Warriors | ✅ shipped v0.14 | `adapter::net::redex::replication*` |
+| 1 — Greedy-LRU dataforts | Rebel Yell | ⏳ open | — |
+| 3 — `BlobRef` + `BlobAdapter` hook | Rebel Yell | ⏳ open (independent — can ship parallel) | — |
+| 4 — Data gravity (heat-counter migration) | Rebel Yell | ⏳ open (depends on Phase 1) | — |
+| 5 — Read-your-writes guarantees | Rebel Yell | ⏳ open (independent) | — |
+| 6 — MeshDB extension (time-travel, lineage walks, cross-chain joins) | Deferred | ⏳ research-grade; out of either release | — |
 
 ## Release plan: The Warriors → Rebel Yell
 
@@ -45,16 +57,16 @@ Three reasons this needs to be sequenced as Warriors → Rebel Yell rather than 
 
 Seven phases across two releases, sequenced by dependency:
 
-| # | Phase | Release | Effort (focused) | Activation gate | Depends on |
-|---|---|---|---|---|---|
-| 0 | Capability-tag discovery + taxonomy reorganization | **Warriors** | 2–3 weeks | First time Warriors lands (foundation; unconditional within Warriors) | — |
-| 6 | Federated query primitives | **Warriors** | 2–4 weeks (primitives only) | Foundation for Rebel Yell's cross-axis queries | 0 |
-| 7 | Generalized 5-axis `PlacementFilter` + Mikoshi integration | **Warriors** | 1–2 weeks | Foundation for placement decisions across substrate (data + compute) | 0, 6 |
-| 2 | RedEX V2 — raw log-segment replication | **Warriors** | 4–9 weeks | Workload needs durability beyond single node | 0, 7 |
-| 1 | Greedy-LRU dataforts (composes `PlacementFilter`) | **Rebel Yell** | 1–2 weeks | Rebel Yell ships | 0, 7 |
-| 4 | Data gravity (heat-counter migration) | **Rebel Yell** | 1–2 weeks | Production telemetry shows access skew Phase 1 doesn't absorb | 0, 1 |
-| 3 | BlobRef + BlobAdapter hook trait | **Rebel Yell** (parallel-shippable with Warriors) | 1–2 weeks | Payloads systematically exceed inline threshold (default 1 MB) | 0 (independent of 1, 2) |
-| 5 | Read-your-writes guarantees | **Rebel Yell** | 2–4 weeks | App ergonomics request session-bounded consistency | — |
+| # | Phase | Release | Status | Effort (focused) | Activation gate | Depends on |
+|---|---|---|---|---|---|---|
+| 0 | Capability-tag discovery + taxonomy reorganization | **Warriors** | ✅ v0.13 | 2–3 weeks | First time Warriors lands (foundation; unconditional within Warriors) | — |
+| 6 | Federated query primitives | **Warriors** | ✅ v0.13 (primitives) | 2–4 weeks (primitives only) | Foundation for Rebel Yell's cross-axis queries | 0 |
+| 7 | Generalized 5-axis `PlacementFilter` + Mikoshi integration | **Warriors** | ✅ v0.13 | 1–2 weeks | Foundation for placement decisions across substrate (data + compute) | 0, 6 |
+| 2 | RedEX V2 — raw log-segment replication | **Warriors** | ✅ v0.14 | 4–9 weeks | Workload needs durability beyond single node | 0, 7 |
+| 1 | Greedy-LRU dataforts (composes `PlacementFilter`) | **Rebel Yell** | ⏳ open | 1–2 weeks | Rebel Yell ships | 0, 7 |
+| 4 | Data gravity (heat-counter migration) | **Rebel Yell** | ⏳ open | 1–2 weeks | Production telemetry shows access skew Phase 1 doesn't absorb | 0, 1 |
+| 3 | BlobRef + BlobAdapter hook trait | **Rebel Yell** (parallel-shippable with Warriors) | ⏳ open | 1–2 weeks | Payloads systematically exceed inline threshold (default 1 MB) | 0 (independent of 1, 2) |
+| 5 | Read-your-writes guarantees | **Rebel Yell** | ⏳ open | 2–4 weeks | App ergonomics request session-bounded consistency | — |
 
 Phase 4 collapsed from "3–6 weeks" to "1–2 weeks" once we accepted the features-doc framing of gravity as **emergent behavior of greedy + heat counters + capability-preference + colocation**, not a separate migration engine. Phase 6 collapsed from "research-grade; multiple months" to "2–4 weeks" once we restricted Warriors-scope to *primitives* (filter, match, traverse, aggregate operators over the capability index) — full MeshDB with time-travel, lineage walks, and cross-chain joins stays parked as a research-grade extension. Phase 3 collapsed from 6–12 weeks (full substrate-owned blob CAS) to 1–2 weeks (BlobRef + BlobAdapter hook trait) once we accepted the architectural separation: streaming + coordination is the substrate's job, blob storage is the customer's existing system's job (S3, IPFS, Ceph, etc.). Net carries the reference, never owns the bytes.
 
@@ -65,7 +77,7 @@ Phase 4 collapsed from "3–6 weeks" to "1–2 weeks" once we accepted the featu
 
 ---
 
-## Phase 0 — Capability-tag discovery primitive
+## Phase 0 — Capability-tag discovery primitive ✅ shipped v0.13
 
 The unlock. The features doc identifies `causal:origin_hash[:tip_seq]` capability tags as the discovery layer that collapses every other deferred phase's coordination problem. Build it once; everything else routes through it.
 
@@ -150,7 +162,7 @@ Land the first time any of Phases 1–4, 6 activates. Cheap enough that we shoul
 
 ---
 
-## Phase 1 — Greedy-LRU dataforts (Rebel Yell)
+## Phase 1 — Greedy-LRU dataforts (Rebel Yell) ⏳ open
 
 A node observes streams flowing past via the existing tail subscription path. If it has spare disk, ACL access, a scope match, AND its capability set matches the chain's intent, it caches a copy. When disk fills, LRU evicts. Withdraws the capability tag on eviction so reads route elsewhere. **No coordination protocol.** Smallest Rebel Yell phase; ships fastest; covers 60–80% of the perceived-durability story without orchestrated replication.
 
@@ -220,7 +232,7 @@ Pilot deployment requests "make popular data fast without standing up replica gr
 
 ---
 
-## Phase 7 — Generalized 5-axis `PlacementFilter` primitive + Mikoshi integration (The Warriors)
+## Phase 7 — Generalized 5-axis `PlacementFilter` primitive + Mikoshi integration (The Warriors) ✅ shipped v0.13
 
 **Placement is a substrate primitive, not a per-feature decision.** The 5-axis filter (scope + proximity + capability-preference + colocation + resource-availability) generalizes from "data placement" to "compute placement" — the same primitive applies to chains (caching), replicas, daemons (Mikoshi migrations), and replica/fork/standby group members. Build it once in The Warriors; everything Rebel Yell composes inherits it; future features (scheduler, mesh-wide load balancing, etc.) reuse it.
 
@@ -320,7 +332,7 @@ Ships unconditionally with The Warriors. The trait + reference impl + Mikoshi in
 
 ---
 
-## Phase 2 — Raw RedEX log-segment replication (RedEX V2, The Warriors)
+## Phase 2 — Raw RedEX log-segment replication (RedEX V2, The Warriors) ✅ shipped v0.14
 
 Orchestrated replication. N replicas of a channel's RedEX file maintained explicitly; configurable replication factor; pull/repair on divergence; documented conflict policy (none expected because RedEX is append-only and seq-ordered, but the protocol must say so explicitly). Strong durability guarantee, in contrast to Phase 1's probabilistic one.
 
@@ -395,7 +407,7 @@ Workload requesting durability guarantees beyond single-node, where Phase 1's pr
 
 ---
 
-## Phase 3 — BlobRef + BlobAdapter hook trait (Rebel Yell)
+## Phase 3 — BlobRef + BlobAdapter hook trait (Rebel Yell) ⏳ open
 
 **Decision: do not build a substrate-owned blob CAS layer.** The substrate is streaming + coordination + metadata + lineage. Blob storage is a fundamentally different data shape (object PUT/GET, byte-range reads, immutable artifacts). Forcing blob CAS into a streaming substrate creates impedance mismatch.
 
@@ -477,7 +489,7 @@ If a customer specifically cannot use any existing blob backend (extreme isolati
 
 ---
 
-## Phase 4 — Data gravity (heat-counter migration)
+## Phase 4 — Data gravity (heat-counter migration) ⏳ open
 
 Once Phases 0 + 1 ship, the mesh has the substrate to observe which chains are most-read. Phase 4 closes the loop: nodes pull data toward themselves when read pressure justifies it. The features doc reframed this as **emergent behavior of greedy + heat counters**, not a separate migration engine — which collapses the effort estimate dramatically.
 
@@ -528,7 +540,7 @@ Production telemetry showing access skew Phase 1's purely-greedy LRU doesn't cap
 
 ---
 
-## Phase 5 — Read-your-writes guarantees
+## Phase 5 — Read-your-writes guarantees ⏳ open
 
 Independent of all other phases. Smallest scope. Useful when application semantics require the writer to immediately see its own writes (currently the system is causally consistent with no RYW guarantee — a writer may briefly observe state lagging its own publish).
 
@@ -567,7 +579,7 @@ Application that reads-its-own-writes immediately and finds the eventual-consist
 
 ---
 
-## Phase 6 — Federated query primitives (The Warriors) + MeshDB extension (deferred)
+## Phase 6 — Federated query primitives (The Warriors) ✅ shipped v0.13 + MeshDB extension (deferred)
 
 This phase splits into two scopes:
 
@@ -721,6 +733,170 @@ Wall-clock for the full proactive path: **~5–7 months parallelised** across bo
 **Ship Warriors reactively (when any activation gate fires inside it). Ship Rebel Yell phase-by-phase as workloads demand each piece.** The compute-marketplace use case explicitly does not need any of it — Postgres handles its queries fine. The most likely first trigger for Warriors is a pilot wanting durability beyond single-node (Phase 2's gate) or a query workload that needs Phase 6's primitives. The most likely first trigger for Rebel Yell is a pilot wanting cheap data-locality wins (Phase 1's gate).
 
 Anything built without an active workload requiring it is patronage-network discipline failing — exactly the failure mode the substrate's operating philosophy is designed to avoid. The plan exists so that *when* the workload demands the work, the path is clear; until then, none of this gets built.
+
+---
+
+## Implementation-ready specs for remaining phases
+
+Now that the Warriors precursor has shipped, the four remaining Rebel Yell phases are decoupled compositional work — each builds against substrate primitives that already exist. This section locks every open design decision per phase and lists the concrete work items in implementation order, so an engineer can pick up any phase without having to re-decide the open questions.
+
+**Substrate primitives Rebel Yell composes against (all v0.14 surface):**
+
+- **Tag / metadata.** `Tag`, `TagKey`, `TaxonomyAxis`, `CapabilitySet { tags, metadata }`, `causal:<hex>[:tip_seq][[start..end]]`, `fork-of:<parent>`, `heat:<chain>=<rate>`, `scope:*`. Application metadata keys propagate as opaque pairs.
+- **Bloom-filter chain advertisements.** `CapabilitySet::chain_bloom` field, `BloomFilter` primitive sized for ~10 K chains in 500 KB.
+- **Placement.** `behavior::placement::{PlacementFilter, Artifact, StandardPlacement, IntentRegistry}` with the five axes (scope / proximity / intent / colocation / resource). `global_placement_filter_registry()` carries process-wide custom filters.
+- **Query primitives.** `behavior::query::CapabilityQuery` over `CapabilityIndex` — `filter` / `match_axis` / `aggregate` / `traverse` / `nearest`.
+- **Replication.** `adapter::net::redex::{Redex, ReplicationConfig, ReplicationCoordinator, replicate}`, the runtime + 4-state machine. `SUBPROTOCOL_REDEX = 0x0E00` on the wire.
+- **Chain-tag side-effects.** `MeshNode::{announce_chain, withdraw_chain}` re-emit the `causal:<hex>:<tip_seq>` tag on transitions.
+
+The `dataforts-greedy` / `dataforts-blob` / `dataforts-gravity` / `dataforts-ryw` Cargo features stay defined for opt-in rollout. Bindings stay parallelisable per phase (Node / Python / Go / C / TS-SDK).
+
+---
+
+### Phase 1 — Greedy-LRU dataforts — locked decisions
+
+**Decision log** (recommendations from the phase scope are hereby ratified):
+
+| Decision | Locked value |
+|---|---|
+| `intent_match` default | `AnyOfLocalCapabilities` (any capability fulfilling the chain's `metadata.intent` admits) |
+| `colocation_policy` default | `SoftPreference` (scoring boost on affinity match; not a hard gate) |
+| `bandwidth_budget_fraction` default | `0.25` of measured NIC peak |
+| `per_channel_cap_bytes` default | `100 MiB` |
+| `total_cap_bytes` default | `10 GiB` |
+| `proximity_max_rtt` default | `200 ms` |
+| Cache file substrate | per-channel `RedexFile` (heap-only by default; persistent opt-in) with `Retention::Bytes(per_channel_cap_bytes)` |
+| Read-path serve | the cache file IS the served data; reads route via the substrate-level `find_chain_holders` resolver |
+| Eviction order | LRU on (channel-name, last-read timestamp) across the global cache budget |
+| Chain announcement | reuse Phase 0's `MeshNode::announce_chain` on first cache; `withdraw_chain` on full eviction |
+| Re-announce throttle | inherit `ChannelConfig::chain_announcement` (Phase 0 default 1024 events / 10 s) |
+| Mesh wiring | `MeshNode::enable_greedy_dataforts(GreedyConfig)` mirrors `enable_replication(mesh)`'s idempotent install + per-channel auto-arm |
+| Hot-spot cap | open question parked — wait for telemetry before adding per-scope replica budget |
+
+**Concrete work items (in order):**
+
+1. **Module** — `src/adapter/net/dataforts/greedy/` with `mod.rs`, `config.rs`, `cache.rs`, `runtime.rs`, `metrics.rs`. Re-export `GreedyConfig`, `IntentMatchPolicy`, `ColocationPolicy`, `GreedyDataforts` at `adapter::net::dataforts`.
+2. **`GreedyConfig` + `validate()`** — same shape as the spec block in the Phase 1 scope; pin numeric ceilings (`per_channel_cap_bytes ≥ 1 MiB`, `total_cap_bytes ≥ per_channel_cap_bytes`, `bandwidth_budget_fraction ∈ (0.0, 1.0]`).
+3. **`GreedyCache`** — per-channel inner state `{ file: RedexFile, last_read: Instant, bytes: u64 }`; cluster-wide LRU via a `BTreeMap<Instant, ChannelName>` index.
+4. **Admission decision** — pure function `should_admit(chain_caps: &CapabilitySet, local_caps: &CapabilitySet, scopes: &[ScopeLabel], cfg: &GreedyConfig) -> AdmissionVerdict { Admit, RejectScope, RejectIntent, RejectColocation }`. Unit-tested independently of the runtime.
+5. **`GreedyRuntime` task** — tokio task per `MeshNode::enable_greedy_dataforts` invocation. Owns the LRU index + bandwidth budget (reuse `BandwidthBudget::new`); subscribes to every channel via the existing tail-subscription primitive.
+6. **`dispatch_event` hook** — on inbound event for a channel the runtime considers admittable, write to the per-channel cache file before delivering to the application. Atomic on the file's append path; cache write failure logs + drops (greedy is best-effort).
+7. **Chain announcement** — first append → `mesh.announce_chain(origin_hash, current_tip)`. Full eviction → `mesh.withdraw_chain(origin_hash)`. Throttle inherits Phase 0.
+8. **Read-path serve** — operator-facing surface is `MeshNode::greedy_cache_for(channel)` returning `Option<RedexFile>`; the existing chain-discovery resolver picks the nearest holder and the application reads via that RedEX file's `tail` / `read_range`. No new RPC; greedy cachers advertise via the same `causal:` chain-tag layer.
+9. **Bandwidth budget enforcer** — every cache write calls `budget.try_consume(payload_len, now)`; on backpressure, log + drop the cache write (the application's tail still fires, so the only loss is the speculative cache copy).
+10. **Metrics** — `dataforts_greedy_cache_hits_total{channel}`, `dataforts_greedy_evictions_total{channel}`, `dataforts_greedy_serve_count{channel}`, `dataforts_greedy_io_budget_used_bytes`, `dataforts_greedy_admit_rejected_total{reason="scope|intent|colocation|capacity"}`.
+11. **Cross-binding surface** — Node `Mesh.enableGreedyDataforts(cfg)`; Python `mesh.enable_greedy_dataforts(...)`; Go `Mesh.EnableGreedyDataforts(cfg)`; C `net_mesh_enable_greedy_dataforts(handle, cfg_json)`. `GreedyConfig` round-trips through JSON; rejection paths surface typed errors. Idempotent (mirror `enable_replication`).
+12. **Tests** — every existing `Test strategy` bullet, plus regression for the admission-decision unit (so an admitted-then-evicted chain re-admits on a follow-up scope-matching announce).
+
+**Out of scope (deferred):** randomised admission control, per-scope replica budget, byte-range cache granularity, persistent-tier greedy caches (heap-only in v1).
+
+---
+
+### Phase 3 — `BlobRef` + `BlobAdapter` — locked decisions
+
+| Decision | Locked value |
+|---|---|
+| Range fetch in trait | yes (`fetch_range(blob_ref, range) -> Result<Vec<u8>>`) — most modern backends support byte-range natively; not exposing it leaves perf on the table for media / imagery workloads |
+| Sync vs async trait | `async fn` throughout; sync adapters wrap with `tokio::task::block_in_place` or run on a `spawn_blocking` worker |
+| Substrate-level encryption | no — trust the adapter's own encryption (S3 SSE, IPFS encryption-at-rest, etc.). Caller layers on top if needed |
+| Hash algorithm | BLAKE3 only; reserve a `version: u8` byte in the encoded form for future algorithm churn |
+| Wire encoding | `BlobRef` is a typed event payload with a discriminator byte at offset 0 (`0xB0`); rest is serde-encoded `{ version, uri, hash, size }`. Inline payloads carry no discriminator (back-compat) |
+| Inline threshold | `1 MiB` default; per-channel via `RedexFileConfig::blob_threshold: u64` |
+| Reference adapters in SDK | `S3Adapter` (aws-sdk-s3 dep, feature-gated), `FileSystemAdapter` (opt-in for trusted-host scenarios), `IpfsAdapter` (HTTP API), `NoopAdapter` (testing). Each behind its own feature flag |
+| Hash verification | mandatory on every successful `fetch` / `fetch_range`; `BlobError::HashMismatch` on divergence; no app-side opt-out |
+| GC / refcount | none — the customer's storage backend owns lifecycle (S3 lifecycle policies, IPFS pinning, etc.) |
+| Cross-binding adapter callback shape | mirror `PlacementFilter` callback registry — `BlobAdapter` registered in a process-wide registry (`global_blob_adapter_registry()`) keyed by adapter ID; `RedexFileConfig::blob_adapter_id: Option<String>` picks per channel |
+
+**Concrete work items:**
+
+1. **Module** — `src/adapter/net/dataforts/blob/` with `mod.rs`, `ref.rs`, `adapter.rs`, `registry.rs`, `s3.rs` (feature-gated `dataforts-blob-s3`), `fs.rs`, `ipfs.rs` (feature-gated `dataforts-blob-ipfs`), `noop.rs`, `tests/`. Public re-exports at `adapter::net::dataforts`.
+2. **`BlobRef` type** — exactly the spec shape `{ version: u8, uri: String, hash: [u8; 32], size: u64 }`. `Tag::Reserved { prefix: "blob", body: hex(hash) }` is **not** added (Phase 0 left this out by design — blob storage rides in event payloads, not the tag namespace).
+3. **`BlobAdapter` trait** — `async fn store / fetch / fetch_range / exists` per the spec block; plus `fn adapter_id(&self) -> &str` for registry indexing.
+4. **`global_blob_adapter_registry()`** — process-wide `RwLock<HashMap<String, Arc<dyn BlobAdapter>>>`; same shape as `global_placement_filter_registry()`. `register(id, adapter)` rejects overwrites; `unregister(id)` drops the registration.
+5. **Event payload dispatch** — `RedexEvent::payload_kind() -> PayloadKind { Inline, BlobRef(BlobRef) }`. The discriminator-byte check happens once on every `read_range` / `tail` output; for `Inline` payloads the existing path runs untouched.
+6. **`BlobError`** — typed enum: `HashMismatch { expected, actual }`, `UnsupportedScheme(String)`, `NotFound(String)`, `Backend(String)`, `Cancelled`. `From<adapter-side-error>` impls per reference adapter.
+7. **Hash verification** — `blake3::Hasher::update(bytes).finalize().as_bytes() == &blob_ref.hash`. Verification runs inside the substrate, NOT inside the adapter, so an adversarial adapter can't fake-verify.
+8. **Read-path integration** — `Mesh::read_event(channel, seq)` returns `Result<EventPayload, BlobError>` where `EventPayload::Bytes(_)` for inline + `EventPayload::Bytes(_)` after a successful blob fetch + verify (transparent to callers that don't want to know). A new `Mesh::read_event_ref(channel, seq)` returns `BlobRef` directly for callers that want the URI without fetching.
+9. **Write-path integration** — `Mesh::publish` continues to take `Vec<u8>`. Callers that want blob storage call `adapter.store(bytes).await?` themselves and `Mesh::publish(blob_ref.encode())` — the substrate stays out of the store path so the customer's existing flow keeps owning it. (A convenience `Mesh::publish_blob(bytes, adapter_id)` lands in the SDK as a thin wrapper.)
+10. **Reference adapters** — each implements the trait, ships behind its own feature flag, runs the shared conformance suite (`store → fetch → exists → fetch_range`), surfaces backend errors as `BlobError::Backend`. `IpfsAdapter` reads `IPFS_API` env or accepts a configured URL; `S3Adapter` consumes the existing AWS SDK config chain.
+11. **Bindings** — `BlobRef` round-trips through JSON; `BlobAdapter` callable in Node / Python / Go / C via the registry pattern (the host language registers an adapter and the substrate dispatches via FFI callback, same shape as `PlacementFilter`).
+12. **Tests** — adapter conformance suite per backend; hash-mismatch fault injection; 3-node integration test with `S3Adapter` (using a localstack or moto fake-S3 fixture); inline-vs-blob dispatch correctness; `BlobRef` version-byte forward-compat (unknown version returns `BlobError::Unsupported`).
+
+**Out of scope:** substrate-owned CAS pool, refcount, GC, blob discovery via capability tags (still rejected per the locked decision).
+
+---
+
+### Phase 4 — Data gravity (heat-counter migration) — locked decisions
+
+| Decision | Locked value |
+|---|---|
+| Telemetry granularity | per-chain (not per-(channel, byte-range)); per-range is a future optimisation that can layer in without breaking the tag shape |
+| Anti-thrash | hysteresis ratio: pull threshold ≥ evict threshold × 2 |
+| Mesh-wide vs node-local | **node-local only** — no consensus, no central coordinator. Revisit only if telemetry shows the gap in production. |
+| ACL gating | heat counters increment only after `AuthGuard` accepts the read (already handled — pin in test) |
+| Decay half-life | 30 minutes (rolling-window with exponential decay; configurable per channel) |
+| Emission threshold | `2×` change since last emission, or `0` → withdraw |
+| Wire shape | `heat:<chain_hex>=<reads_per_window>` reserved-prefix tag (already reserved in Phase 0); value parses as `u32` reads per hour |
+| Greedy preference function | `pull_score = heat × scope_match_bool × proximity_rank` — sorted by this in Phase 1's pull-candidate selection |
+
+**Concrete work items:**
+
+1. **Module** — `src/adapter/net/dataforts/gravity/` with `mod.rs`, `counter.rs`, `policy.rs`, `metrics.rs`. Public re-exports at `adapter::net::dataforts`.
+2. **`HeatCounter` per channel** — `{ rate_per_hour: f64, last_emitted: Option<f64>, last_update: Instant }`. Decay function: `rate := rate × 0.5^((now - last_update) / 30min)`. Every read calls `counter.bump(now)`.
+3. **`DataGravityPolicy`** — `RedexFileConfig::data_gravity: Option<DataGravityPolicy>`. Fields: `emit_threshold_ratio: f32` (default 2.0), `decay_half_life: Duration` (default 30min), `enabled: bool`.
+4. **Heat tag emission** — when `(current_rate / last_emitted) ≥ emit_threshold_ratio OR current_rate == 0`, emit a new heat tag via the existing `MeshNode::announce_chain` + heat-extension path. Throttle inherits Phase 0's `chain_announcement` policy.
+5. **Phase 1 greedy preference** — `GreedyRuntime` consults `heat_for(origin_hash)` from inbound capability announcements; sorts pull-candidate chains by `heat × scope_match × proximity_rank`. Cold chains evict first under LRU pressure when capacity tightens.
+6. **Withdrawal** — when heat decays to 0, emit a `heat:<chain>=0` tag (functionally a withdrawal); peers drop the heat annotation.
+7. **Metrics** — `dataforts_chain_heat{chain}`, `dataforts_gravity_pull_total{chain}`, `dataforts_gravity_thrash_total{chain}` (bumps on each cache-then-evict-within-1h cycle).
+8. **Tests** — emergent-gravity scenario (5-node mesh, read-skew → 4th node caches within 2 announcement windows); anti-thrash under uniform-random access; hysteresis (sub-threshold bumps don't re-announce); ACL fault injection (reads rejected by AuthGuard don't increment heat).
+
+**Out of scope:** per-byte-range telemetry, mesh-wide migration consensus, encrypted heat tags.
+
+---
+
+### Phase 5 — Read-your-writes — locked decisions
+
+| Decision | Locked value |
+|---|---|
+| Token shape | `WriteToken { origin_hash: [u8; 32], seq: u64 }` — round-trips through every binding as a typed struct |
+| Default deadline | `1 s`; configurable per call via `wait_for_seq(seq, deadline)` |
+| Cross-node RYW | supported; the substrate's existing tail-fold-propagation latency is the lower bound |
+| Backpressure | per-channel wait queue cap (default 1024); on overflow surface `RpcError::QueueFull` |
+| Replication composition | RYW is a *visibility* guarantee; replication is a *durability* guarantee. They compose but are documented as orthogonal — `wait_for_seq` does NOT imply "durable on N replicas" |
+| Token issuance points | every `RedexFile::append` returns `WriteToken`; every `MeshNode::publish` returns `WriteToken` |
+
+**Concrete work items:**
+
+1. **`WriteToken` type** — `src/adapter/net/redex/write_token.rs`; serde-roundtripped; `Display` impl renders as `<hex_origin>:<seq>`.
+2. **`RedexFile::append` signature** — returns `WriteToken` directly (additive — the prior return was `u64 seq`; the new shape is `{ origin_hash, seq }` and the prior callsites destructure or call `.seq` for back-compat).
+3. **`MeshNode::publish` signature** — same shape: returns `WriteToken`.
+4. **`CortexAdapter::wait_for_seq(seq, deadline) -> Result<(), RpcError>`** — uses the existing `applied_through_seq` notify primitive that CortEX already tracks. No new locking.
+5. **`MeshNode::publish_with_token` / `MeshNode::read_at_token`** — convenience wrappers. `read_at_token(token, deadline)` resolves the chain via `find_chain_holders` then waits for the local CortEX adapter to apply through `token.seq`.
+6. **Wait-queue cap** — per-channel `Semaphore::new(1024)`; on `try_acquire` failure surface `RpcError::QueueFull`.
+7. **Metrics** — `dataforts_ryw_wait_duration_seconds{channel}` (histogram), `dataforts_ryw_timeouts_total{channel}`, `dataforts_ryw_queue_full_total{channel}`.
+8. **Bindings** — `WriteToken` round-trips through Node / Python / Go / C; `wait_for_seq` is async in every binding (Promise in Node, awaitable in Python, channel-returning in Go, callback in C).
+9. **Tests** — happy path (writer publishes, gets token, reads with token, returns within deadline); stale-fold timeout; cross-node RYW; deadline-tuning histogram check.
+
+**Out of scope:** durability composition (explicitly documented as separate), per-token transactional read APIs (single-seq only in v1).
+
+---
+
+### Sequencing for the remaining work
+
+Phase 1 is the natural starting point — it's the smallest, opens the operator surface for greedy caching, and Phase 4 builds directly on top. Phase 3 is independent and can ship in parallel with anything. Phase 5 is independent and can slot in whenever an application asks for it.
+
+```
+Phase 1 (1–2 weeks) ───┐
+                       ├──→ Phase 4 (1–2 weeks; emergent gravity)
+                       │
+Phase 3 (1–2 weeks; parallel with anything)
+                       │
+Phase 5 (2–4 weeks; slot anywhere; depends on no other Rebel Yell phase)
+```
+
+Wall-clock for the full Rebel Yell remainder: **~5–10 weeks parallelised across two engineers**, **~10–14 weeks serialised** for a single engineer. Each phase ships behind its own Cargo feature flag (`dataforts-greedy`, `dataforts-blob`, `dataforts-gravity`, `dataforts-ryw`) and the rollback path is a feature-flag flip without daemon restart.
+
+The activation gates haven't moved: ship reactively per phase when a real workload asks for it. The spec above exists so that *when* the workload asks, the path is clear — not so that we ship speculatively.
 
 ---
 
