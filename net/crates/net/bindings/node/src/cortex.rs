@@ -31,8 +31,10 @@ use ::net::adapter::net::cortex::tasks::{
     TasksAdapter as InnerTasksAdapter,
 };
 use ::net::adapter::net::redex::{
-    FsyncPolicy as InnerFsyncPolicy, Redex as InnerRedex, RedexError as InnerRedexError,
-    RedexEvent as InnerRedexEvent, RedexFile as InnerRedexFile, RedexFileConfig,
+    FsyncPolicy as InnerFsyncPolicy, PlacementStrategy as InnerPlacementStrategy,
+    Redex as InnerRedex, RedexError as InnerRedexError, RedexEvent as InnerRedexEvent,
+    RedexFile as InnerRedexFile, RedexFileConfig, ReplicationConfig as InnerReplicationConfig,
+    UnderCapacity as InnerUnderCapacity,
 };
 use bytes::Bytes;
 
@@ -119,6 +121,37 @@ impl Redex {
         }
     }
 
+    /// Install cross-node replication wiring rooted at `mesh`. After
+    /// this returns, `openFile` calls with
+    /// `config.replication = { ... }` spawn per-channel replication
+    /// runtimes. Idempotent — repeated calls leave the existing
+    /// wiring in place (the second installation would orphan every
+    /// per-channel runtime registered under the first).
+    ///
+    /// Gated on the `net` feature: replication requires a
+    /// `NetMesh`, which only ships when `net` is enabled. Build the
+    /// Node binding with both `--features cortex` and `--features
+    /// net` (or any superset) to expose this method.
+    ///
+    /// See `CONFIG_REPLICATION.md` for the full operator surface.
+    #[cfg(feature = "net")]
+    #[napi]
+    pub fn enable_replication(&self, mesh: &crate::NetMesh) -> Result<()> {
+        let arc = mesh.node_arc_clone()?;
+        self.inner.enable_replication(arc);
+        Ok(())
+    }
+
+    /// Count of per-channel replication runtimes currently registered
+    /// on this manager. `0` when replication isn't enabled. Useful
+    /// for tests + operator observability.
+    #[napi]
+    pub fn replication_runtime_count(&self) -> u32 {
+        // Safe — count is bounded by MAX_TRACKED_CHANNELS (1024)
+        // plus reasonable channel counts in practice.
+        self.inner.replication_runtime_count() as u32
+    }
+
     /// Open (or get) a raw RedEX file bound to `channelName`. Returns
     /// a handle for append / tail / read operations without going
     /// through the CortEX adapter layer.
@@ -176,6 +209,117 @@ pub struct RedexFileConfigJs {
     /// Drop entries older than this many milliseconds at the next
     /// retention sweep.
     pub retention_max_age_ms: Option<BigInt>,
+    /// Opt the channel into cross-node replication. When set, the
+    /// owning `Redex` must have called `enableReplication(mesh)`
+    /// first — otherwise `openFile` rejects with a typed
+    /// `redex:` error. Leave unset (or `null`) for single-node
+    /// behavior. See `CONFIG_REPLICATION.md` for field semantics.
+    pub replication: Option<ReplicationConfigJs>,
+}
+
+/// Opt-in cross-node replication settings for a RedEX channel.
+/// Mirrors `ReplicationConfig` from the core. All fields are
+/// optional — omitted ones fall back to the core's defaults
+/// (`factor=3`, `heartbeat_ms=500`, `placement=Standard`,
+/// `on_under_capacity=Withdraw`, `replication_budget_fraction=0.5`).
+#[napi(object)]
+pub struct ReplicationConfigJs {
+    /// Replication factor (replicas including the leader). Range
+    /// `[1, 16]`. Defaults to `3` when omitted.
+    pub factor: Option<u32>,
+    /// Heartbeat cadence between leader → replicas in milliseconds.
+    /// Minimum `100`. Defaults to `500` when omitted.
+    pub heartbeat_ms: Option<BigInt>,
+    /// Placement strategy. One of `"standard"` (default), `"pinned"`,
+    /// or `"colocation-strict"`. With `"pinned"` the `pinned_nodes`
+    /// field is required and pins the effective replication factor
+    /// to the list length.
+    pub placement: Option<String>,
+    /// Pinned `NodeId` list, required when `placement = "pinned"`.
+    /// Ignored otherwise.
+    pub pinned_nodes: Option<Vec<BigInt>>,
+    /// Pin the leader to a specific `NodeId`. Optional; the
+    /// deterministic election picks the lowest-RTT healthy replica
+    /// when omitted.
+    pub leader_pinned: Option<BigInt>,
+    /// Behavior on disk-pressure. `"withdraw"` (default) drops the
+    /// replica role; `"evict-oldest"` calls retention sweep and
+    /// retries.
+    pub on_under_capacity: Option<String>,
+    /// Bandwidth budget for replication-sync I/O as a fraction of
+    /// measured NIC peak. Range `(0.0, 1.0]`. Defaults to `0.5`
+    /// when omitted.
+    pub replication_budget_fraction: Option<f64>,
+}
+
+fn resolve_placement_strategy(
+    placement: Option<String>,
+    pinned_nodes: Option<Vec<BigInt>>,
+) -> Result<InnerPlacementStrategy> {
+    match placement.as_deref() {
+        None | Some("standard") => Ok(InnerPlacementStrategy::Standard),
+        Some("colocation-strict") => Ok(InnerPlacementStrategy::ColocationStrict),
+        Some("pinned") => {
+            let nodes = pinned_nodes
+                .ok_or_else(|| redex_err("replication.pinned_nodes", "required when placement = 'pinned'"))?;
+            let mut out = Vec::with_capacity(nodes.len());
+            for (i, n) in nodes.into_iter().enumerate() {
+                out.push(redex_bigint_u64(&format!("replication.pinned_nodes[{i}]"), n)?);
+            }
+            Ok(InnerPlacementStrategy::Pinned(out))
+        }
+        Some(other) => Err(redex_err(
+            "replication.placement",
+            format!("unknown strategy {other:?}; expected 'standard', 'pinned', or 'colocation-strict'"),
+        )),
+    }
+}
+
+fn resolve_under_capacity(s: Option<String>) -> Result<InnerUnderCapacity> {
+    match s.as_deref() {
+        None | Some("withdraw") => Ok(InnerUnderCapacity::Withdraw),
+        Some("evict-oldest") => Ok(InnerUnderCapacity::EvictOldest),
+        Some(other) => Err(redex_err(
+            "replication.on_under_capacity",
+            format!("unknown policy {other:?}; expected 'withdraw' or 'evict-oldest'"),
+        )),
+    }
+}
+
+fn resolve_replication_config(cfg: ReplicationConfigJs) -> Result<InnerReplicationConfig> {
+    let mut out = InnerReplicationConfig::new();
+    if let Some(f) = cfg.factor {
+        // `factor` rides as `u32` (BigInt would be overkill for a
+        // u8 range). Reject anything that doesn't fit in u8 here
+        // rather than silently truncating.
+        if f > u8::MAX as u32 {
+            return Err(redex_err(
+                "replication.factor",
+                format!("must fit in u8 (got {f})"),
+            ));
+        }
+        out = out.with_factor(f as u8);
+    }
+    if let Some(hb) = cfg.heartbeat_ms {
+        out = out.with_heartbeat_ms(redex_bigint_u64("replication.heartbeat_ms", hb)?);
+    }
+    out = out.with_placement(resolve_placement_strategy(cfg.placement, cfg.pinned_nodes)?);
+    if let Some(leader) = cfg.leader_pinned {
+        out = out.with_leader_pinned(Some(redex_bigint_u64(
+            "replication.leader_pinned",
+            leader,
+        )?));
+    }
+    out = out.with_on_under_capacity(resolve_under_capacity(cfg.on_under_capacity)?);
+    if let Some(fraction) = cfg.replication_budget_fraction {
+        out = out.with_replication_budget_fraction(fraction as f32);
+    }
+    // Validate fail-fast so a malformed config can't reach
+    // `open_file`. The core revalidates there too, but the
+    // binding-side error gives a cleaner stack trace.
+    out.validate()
+        .map_err(|e| redex_err("replication config invalid", e))?;
+    Ok(out)
 }
 
 /// Validate a `BigInt` config field while preserving the `redex:`
@@ -226,6 +370,9 @@ fn resolve_redex_file_config(cfg: Option<RedexFileConfigJs>) -> Result<RedexFile
     if let Some(ms) = c.retention_max_age_ms {
         let ms = redex_bigint_u64("retention_max_age_ms", ms)?;
         out.retention_max_age_ns = Some(ms.saturating_mul(1_000_000));
+    }
+    if let Some(rep) = c.replication {
+        out.replication = Some(resolve_replication_config(rep)?);
     }
     Ok(out)
 }
@@ -1442,7 +1589,7 @@ impl NetDb {
         let tasks = if config.with_tasks.unwrap_or(false) {
             Some(TasksAdapter {
                 inner: Arc::new(
-                    InnerTasksAdapter::open_with_config(&redex, origin, cfg)
+                    InnerTasksAdapter::open_with_config(&redex, origin, cfg.clone())
                         .await
                         .map_err(|e| cortex_err("NetDb open tasks", e))?,
                 ),
@@ -1478,11 +1625,15 @@ impl NetDb {
         let tasks = if config.with_tasks.unwrap_or(false) {
             let adapter = match snapshot.tasks {
                 Some((bytes, last_seq)) => InnerTasksAdapter::open_from_snapshot_with_config(
-                    &redex, origin, cfg, &bytes, last_seq,
+                    &redex,
+                    origin,
+                    cfg.clone(),
+                    &bytes,
+                    last_seq,
                 )
                 .await
                 .map_err(|e| cortex_err("NetDb restore tasks", e))?,
-                None => InnerTasksAdapter::open_with_config(&redex, origin, cfg)
+                None => InnerTasksAdapter::open_with_config(&redex, origin, cfg.clone())
                     .await
                     .map_err(|e| cortex_err("NetDb open tasks", e))?,
             };
@@ -1496,7 +1647,11 @@ impl NetDb {
         let memories = if config.with_memories.unwrap_or(false) {
             let adapter = match snapshot.memories {
                 Some((bytes, last_seq)) => InnerMemoriesAdapter::open_from_snapshot_with_config(
-                    &redex, origin, cfg, &bytes, last_seq,
+                    &redex,
+                    origin,
+                    cfg.clone(),
+                    &bytes,
+                    last_seq,
                 )
                 .await
                 .map_err(|e| cortex_err("NetDb restore memories", e))?,
