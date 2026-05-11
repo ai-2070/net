@@ -30,11 +30,12 @@ use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
     TasksAdapter as InnerTasksAdapter,
 };
+use ::net::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use ::net::adapter::net::redex::{
     FsyncPolicy as InnerFsyncPolicy, PlacementStrategy as InnerPlacementStrategy,
     Redex as InnerRedex, RedexError as InnerRedexError, RedexEvent as InnerRedexEvent,
     RedexFile as InnerRedexFile, RedexFileConfig, ReplicationConfig as InnerReplicationConfig,
-    UnderCapacity as InnerUnderCapacity,
+    UnderCapacity as InnerUnderCapacity, WriteToken as InnerWriteToken,
 };
 use bytes::Bytes;
 
@@ -95,6 +96,66 @@ fn redex_config_from_persistent(persistent: Option<bool>) -> RedexFileConfig {
     } else {
         RedexFileConfig::default()
     }
+}
+
+// =========================================================================
+// WriteToken — typed handle to a specific write, returned by ingest
+// paths and consumed by read-your-writes wait primitives.
+// =========================================================================
+
+/// Address of a single write. Pair with a typed adapter's
+/// `waitForToken(token, deadlineMs)` to make sure the local fold has
+/// caught up to the write before reading state. `originHash` is the
+/// 64-bit chain identifier; `seq` is the per-chain monotonic
+/// sequence assigned by `RedexFile.append`.
+#[napi]
+#[derive(Clone, Copy)]
+pub struct WriteToken {
+    inner: InnerWriteToken,
+}
+
+#[napi]
+impl WriteToken {
+    #[napi(constructor)]
+    pub fn new(origin_hash: BigInt, seq: BigInt) -> Result<Self> {
+        Ok(Self {
+            inner: InnerWriteToken::new(bigint_u64(origin_hash)?, bigint_u64(seq)?),
+        })
+    }
+
+    #[napi(getter)]
+    pub fn origin_hash(&self) -> BigInt {
+        BigInt::from(self.inner.origin_hash)
+    }
+
+    #[napi(getter)]
+    pub fn seq(&self) -> BigInt {
+        BigInt::from(self.inner.seq)
+    }
+
+    /// Parse a token from its `<16-hex-origin>:<seq>` string form.
+    #[napi(factory)]
+    pub fn from_string(s: String) -> Result<Self> {
+        s.parse::<InnerWriteToken>()
+            .map(|inner| Self { inner })
+            .map_err(|e| Error::from_reason(format!("WriteToken parse: {}", e)))
+    }
+
+    #[napi(js_name = "toString")]
+    #[allow(clippy::inherent_to_string)]
+    pub fn to_string(&self) -> String {
+        self.inner.to_string()
+    }
+}
+
+impl WriteToken {
+    fn as_inner(&self) -> InnerWriteToken {
+        self.inner
+    }
+}
+
+fn wait_for_token_err(e: InnerWaitForTokenError) -> Error {
+    cortex_err("wait_for_token", e)
 }
 
 // =========================================================================
@@ -1174,6 +1235,27 @@ impl TasksAdapter {
         Ok(())
     }
 
+    /// Read-your-writes wait. Blocks until this adapter's fold has
+    /// applied through `token.seq`, or `deadlineMs` elapses. Rejects
+    /// a wrong-origin token or a saturated wait queue (default cap
+    /// 1024) immediately. All three failure variants surface as a
+    /// `cortex:` prefixed napi `Error`.
+    #[napi]
+    pub async fn wait_for_token(
+        &self,
+        token: &WriteToken,
+        deadline_ms: u32,
+    ) -> Result<()> {
+        let inner_token = token.as_inner();
+        self.inner
+            .wait_for_token(
+                inner_token,
+                std::time::Duration::from_millis(deadline_ms as u64),
+            )
+            .await
+            .map_err(wait_for_token_err)
+    }
+
     /// Close the adapter. Idempotent.
     #[napi]
     pub fn close(&self) -> Result<()> {
@@ -1669,6 +1751,24 @@ impl MemoriesAdapter {
     pub async fn wait_for_seq(&self, seq: BigInt) -> Result<()> {
         self.inner.wait_for_seq(bigint_u64(seq)?).await;
         Ok(())
+    }
+
+    /// Read-your-writes wait. See `TasksAdapter.waitForToken` for
+    /// the full contract.
+    #[napi]
+    pub async fn wait_for_token(
+        &self,
+        token: &WriteToken,
+        deadline_ms: u32,
+    ) -> Result<()> {
+        let inner_token = token.as_inner();
+        self.inner
+            .wait_for_token(
+                inner_token,
+                std::time::Duration::from_millis(deadline_ms as u64),
+            )
+            .await
+            .map_err(wait_for_token_err)
     }
 
     /// Close the adapter. Idempotent.
