@@ -4941,7 +4941,52 @@ impl MeshNode {
             Self::forward_capability_announcement(fwd_bytes, ann.node_id, from_node, ctx);
         }
 
+        // Strip unauthorized `heat:<hex>=...` tags before indexing.
+        // A peer can only annotate heat for chains it *also* claims
+        // to hold (i.e. advertises `causal:<hex>` for the same
+        // origin). Otherwise an arbitrary peer could publish
+        // `heat:<any_origin>=0.99` and poison gravity decisions on
+        // every other node. Self-announcements (from this node)
+        // skip the filter — we trust our own emit path.
+        let mut ann = ann;
+        if from_node != ctx.local_node_id {
+            Self::filter_unauthorized_heat_tags(&mut ann.capabilities);
+        }
         ctx.capability_index.index(ann);
+    }
+
+    /// Drop every `heat:<hex>=...` reserved tag from `caps` whose
+    /// `<hex>` is not matched by an accompanying `causal:<hex>*`
+    /// tag in the same set. This enforces "you can only annotate
+    /// heat for chains you advertise as holding," closing the
+    /// inbound-heat-tag forge surface.
+    fn filter_unauthorized_heat_tags(
+        caps: &mut crate::adapter::net::behavior::capability::CapabilitySet,
+    ) {
+        // Collect every hex this peer claims via causal: tags.
+        let mut claimed: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for tag in &caps.tags {
+            if let Tag::Reserved { prefix, body } = tag {
+                if prefix == "causal:" {
+                    // Hex is the prefix of body up to the first ':' / '['.
+                    let hex_end = body
+                        .bytes()
+                        .position(|b| b == b':' || b == b'[')
+                        .unwrap_or(body.len());
+                    claimed.insert(body[..hex_end].to_string());
+                }
+            }
+        }
+        caps.tags.retain(|tag| match tag {
+            Tag::Reserved { prefix, body } if prefix == "heat:" => {
+                // body shape: `<hex>=<rate>`. Hex is everything
+                // before the first `=`.
+                let hex_end = body.bytes().position(|b| b == b'=').unwrap_or(body.len());
+                claimed.contains(&body[..hex_end])
+            }
+            _ => true,
+        });
     }
 
     /// Fan an already-serialized capability announcement out to every
@@ -9833,5 +9878,49 @@ mod chain_helper_tests {
             .collect();
         assert_eq!(variants.len(), 1, "exactly one causal: tag for our hash");
         assert_eq!(variants[0], &replacement);
+    }
+
+    #[test]
+    fn filter_unauthorized_heat_tags_strips_unclaimed_origins() {
+        // A peer can only annotate heat for chains it also
+        // advertises holding. Heat tags whose hex doesn't appear
+        // in any causal: tag in the same set get filtered out.
+        let mut caps = CapabilitySet::default();
+        let owned_hex = MeshNode::chain_hex(0xCAFE);
+        let forged_hex = MeshNode::chain_hex(0xDEAD);
+        caps.tags.insert(causal_tag(&owned_hex));
+        caps.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("{owned_hex}=0.50"),
+        });
+        caps.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("{forged_hex}=0.99"),
+        });
+        // Throw in a non-heat reserved tag — must survive.
+        caps.tags.insert(Tag::Reserved {
+            prefix: "scope:".to_string(),
+            body: "industrial".to_string(),
+        });
+
+        MeshNode::filter_unauthorized_heat_tags(&mut caps);
+
+        // Owned heat tag survives; forged one is gone.
+        let surviving_heat: Vec<_> = caps
+            .tags
+            .iter()
+            .filter_map(|t| match t {
+                Tag::Reserved { prefix, body } if prefix == "heat:" => Some(body.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(surviving_heat.len(), 1);
+        assert!(surviving_heat[0].starts_with(&owned_hex));
+        // Scope tag survived; causal tag survived.
+        assert!(caps.tags.iter().any(|t| matches!(
+            t,
+            Tag::Reserved { prefix, .. } if prefix == "scope:"
+        )));
+        assert!(caps.tags.iter().any(|t| MeshNode::is_causal_for(t, &owned_hex)));
     }
 }
