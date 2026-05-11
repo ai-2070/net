@@ -1096,9 +1096,16 @@ impl RedexFile {
                     .blob_adapter_id
                     .as_deref()
                     .ok_or(BlobError::AdapterNotConfigured)?;
-                let adapter = global_blob_adapter_registry()
-                    .get(adapter_id)
-                    .ok_or_else(|| BlobError::AdapterNotRegistered(adapter_id.to_string()))?;
+                // Resolve through the channel's bound registry when
+                // set; falls back to the process-wide global. The
+                // per-channel registry exists for multi-tenant
+                // binding hosts that want adapter-id scoping per
+                // tenant.
+                let adapter = match self.inner.config.blob_adapter_registry.as_ref() {
+                    Some(reg) => reg.get(adapter_id),
+                    None => global_blob_adapter_registry().get(adapter_id),
+                }
+                .ok_or_else(|| BlobError::AdapterNotRegistered(adapter_id.to_string()))?;
                 let fetched = adapter.fetch(&blob).await?;
                 blob.verify(&fetched)?;
                 Ok(Some(bytes::Bytes::from(fetched)))
@@ -1674,6 +1681,46 @@ mod tests {
             let seq = f.append(&blob.encode()).unwrap();
             let err = f.resolve_one(seq).await.unwrap_err();
             assert!(matches!(err, BlobError::AdapterNotConfigured));
+        }
+
+        #[tokio::test]
+        async fn resolve_one_routes_through_per_channel_registry() {
+            // Per-channel BlobAdapterRegistry isolates adapter ids
+            // for multi-tenant binding hosts. A tenant registers
+            // "s3-primary" into ITS registry; the global stays
+            // free of the id. resolve_one with the per-channel
+            // registry bound looks up successfully without the
+            // global ever seeing the id.
+            use super::super::super::super::dataforts::blob::{
+                BlobAdapter, BlobAdapterRegistry, NoopAdapter,
+            };
+            let tenant_id = unique_id("tenant-s3-primary");
+            let tenant_registry = Arc::new(BlobAdapterRegistry::new());
+            let tenant_adapter: Arc<dyn BlobAdapter> =
+                Arc::new(NoopAdapter::new(tenant_id.clone()));
+            tenant_registry.register(tenant_adapter).unwrap();
+            // The global is intentionally NOT given the id.
+            assert!(global_blob_adapter_registry().get(&tenant_id).is_none());
+
+            let cfg = RedexFileConfig::default()
+                .with_blob_adapter_id(Some(tenant_id.clone()))
+                .with_blob_adapter_registry(Some(tenant_registry.clone()));
+            let f = RedexFile::new(
+                ChannelName::new("resolve-per-channel-registry").unwrap(),
+                cfg,
+            );
+            let payload = b"x";
+            let blob = BlobRef::new(
+                "file:///per-channel",
+                blake3::hash(payload).into(),
+                payload.len() as u64,
+            );
+            let seq = f.append(&blob.encode()).unwrap();
+            // The tenant adapter (NoopAdapter) returns NotFound on
+            // fetch — confirms the routing landed at the tenant
+            // adapter, not at "AdapterNotRegistered" via the global.
+            let err = f.resolve_one(seq).await.unwrap_err();
+            assert!(matches!(err, BlobError::NotFound(_)));
         }
 
         #[tokio::test]

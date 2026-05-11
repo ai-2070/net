@@ -55,13 +55,13 @@ Tagged `[B | H | M | L]`:
 | D-21  | H   | FFI          | Panic across FFI on `net_*_wait_for_token` + blob publish/resolve         | ✅ |
 | D-22  | H   | FFI          | Vtable per-field null-check missing in `net_blob_register_adapter`        | ✅ |
 | D-23  | H   | FFI          | `timeout_ms == 0` silently rewritten to 1 ms in token wait                | ✅ |
-| D-24  | M   | greedy       | Wire `channel_hash` 16-bit → silent cross-chain pollution                  | 🚫 deferred — wire-format change; needs separate slice |
+| D-24  | M   | greedy       | Wire `channel_hash` 16-bit → silent cross-chain pollution                  | 🚫 deferred — `DataPacketHeader::channel_hash` is shared across the whole net stack (auth, routing, pub/sub roster); widening to u32 is a substrate-wide migration, not a dataforts-local fix |
 | D-25  | M   | greedy       | `gravity_tick` emits one full capset rebroadcast per chain                 | ✅ (`HeatSink::announce_heat_batch` + MeshNode impl rewrites caps once per tick) |
 | D-26  | M   | greedy       | `entry.bytes` saturating drift under retention trim                        | ✅ (`RedexFile::retained_bytes` + `GreedyRuntime::resync_cache_bytes`; operator wires the periodic call) |
 | D-27  | M   | greedy       | `NIC_PEAK_BYTES_PER_S` hard-coded; no override on `GreedyConfig`           | ✅ (folded into D-2) |
 | D-28  | M   | greedy       | 5 separate `cache.lock()` acquisitions per dispatch                        | ✅ (steady-state path now takes 1 lock; new-channel path takes 2 with TOCTOU re-check) |
 | D-29  | M   | gravity      | `should_emit_heat` `inf`-prone with near-zero `prev`                      | ✅ |
-| D-30  | M   | gravity      | Wire-side `(rate/(rate+1))` saturation at top end                          | 🚫 deferred — log-scale needs operator-defined SCALE constant + wire bump; gather telemetry first |
+| D-30  | M   | gravity      | Wire-side `(rate/(rate+1))` saturation at top end                          | ✅ (log-scale `ln_1p(rate)/ln_1p(reference)` with configurable reference; wire format unchanged) |
 | D-31  | M   | blob fs      | `BlobError::NotFound(uri)` propagates raw attacker URI → log injection     | ✅ |
 | D-32  | M   | blob fs      | Concurrent stores race on shared `<hash>.tmp` filename                     | ✅ (folded into D-12) |
 | D-33  | M   | blob fs      | No `fsync` of temp file or parent dir before rename — durability gap      | ✅ |
@@ -77,7 +77,7 @@ Tagged `[B | H | M | L]`:
 | D-43  | M   | python blob  | `data.to_vec()` happens before GIL is released for large payloads          | 🚫 not-applicable — no `py.detach` in the current binding; review described a code path that doesn't exist |
 | D-44  | M   | go binding   | Greedy/gravity numeric fields can't express literal `0` via `omitempty`   | 🚫 won't-fix — substrate rejects 0 for every affected field; `omitempty` is correct |
 | D-45  | M   | go binding   | No RYW surface — `wait_for_token` not exposed                              | 🚫 deferred — Go Tasks/Memories surface itself is deferred per the plan; RYW follows |
-| D-46  | L   | greedy       | Heat normalization compression at the top end                              | 🚫 deferred — folded into D-30 (wire-format aware) |
+| D-46  | L   | greedy       | Heat normalization compression at the top end                              | ✅ (folded into D-30 fix) |
 | D-47  | L   | greedy       | `metrics.rs` channel-cap race under contention                             | ✅ (doc note) |
 | D-48  | L   | greedy       | `_force_use_hashmap` dead allow                                            | ✅ |
 | D-49  | L   | blob         | `BlobError` not `#[non_exhaustive]`                                       | ✅ |

@@ -172,6 +172,21 @@ pub struct RedexFileConfig {
     ///
     /// [`BlobAdapter`]: super::super::dataforts::blob::BlobAdapter
     pub blob_adapter_id: Option<String>,
+
+    /// Per-channel override for the blob adapter registry. `None`
+    /// (default) routes through `global_blob_adapter_registry()`;
+    /// `Some(reg)` looks `blob_adapter_id` up in the supplied
+    /// registry instead. Used by multi-tenant binding hosts to
+    /// scope adapter ids per tenant — a tenant's
+    /// `register_blob_adapter("s3-primary", ...)` lands in its own
+    /// registry without colliding with another tenant's same-named
+    /// adapter.
+    ///
+    /// Wrapped in `Arc` so the config is `Clone`-cheap and
+    /// multiple channels can share one registry.
+    #[cfg(feature = "dataforts")]
+    pub blob_adapter_registry:
+        Option<std::sync::Arc<super::super::dataforts::blob::BlobAdapterRegistry>>,
 }
 
 impl Default for RedexFileConfig {
@@ -186,6 +201,8 @@ impl Default for RedexFileConfig {
             tail_buffer_size: 1024,
             replication: None,
             blob_adapter_id: None,
+            #[cfg(feature = "dataforts")]
+            blob_adapter_registry: None,
         }
     }
 }
@@ -257,6 +274,20 @@ impl RedexFileConfig {
     /// [`super::RedexFile::resolve_one`]. Pass `None` to clear.
     pub fn with_blob_adapter_id(mut self, id: Option<String>) -> Self {
         self.blob_adapter_id = id;
+        self
+    }
+
+    /// Bind a specific blob adapter registry for `resolve_one` to
+    /// look up `blob_adapter_id` against. `None` (default) falls
+    /// back to `global_blob_adapter_registry()`. Multi-tenant
+    /// binding hosts construct one registry per tenant and pass
+    /// it here to isolate adapter ids across tenants.
+    #[cfg(feature = "dataforts")]
+    pub fn with_blob_adapter_registry(
+        mut self,
+        registry: Option<std::sync::Arc<super::super::dataforts::blob::BlobAdapterRegistry>>,
+    ) -> Self {
+        self.blob_adapter_registry = registry;
         self
     }
 }
