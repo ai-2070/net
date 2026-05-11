@@ -46,6 +46,12 @@ pub const NET_ERR_BLOB_BACKEND: c_int = -115;
 /// `BlobRef::UnsupportedScheme` — used for both "unknown URI scheme"
 /// and "channel pointing at an unregistered adapter id".
 pub const NET_ERR_BLOB_UNSUPPORTED_SCHEME: c_int = -116;
+/// Panic surfaced from inside a user-installed adapter callback
+/// (or anywhere on the FFI body). The substrate catches it with
+/// `catch_unwind` and reports this code rather than unwinding
+/// across the FFI boundary (which is undefined behaviour for the
+/// C / cgo / Python callers).
+pub const NET_ERR_BLOB_PANIC: c_int = -117;
 
 fn runtime() -> &'static Arc<Runtime> {
     use std::sync::OnceLock;
@@ -214,10 +220,17 @@ pub unsafe extern "C" fn net_blob_publish(
         Some(a) => a,
         None => return NET_ERR_BLOB_NOT_REGISTERED,
     };
-    let bytes = match block_on(async move { publish_blob(adapter.as_ref(), uri, data_slice).await })
-    {
-        Ok(b) => b,
-        Err(e) => return err_to_code(&e),
+    // Wrap the body in catch_unwind so a panic in a user-
+    // installed adapter callback (or anywhere downstream) cannot
+    // unwind across the FFI boundary into the C / cgo / Python
+    // caller — that's undefined behaviour.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(async move { publish_blob(adapter.as_ref(), uri, data_slice).await })
+    }));
+    let bytes = match result {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => return err_to_code(&e),
+        Err(_) => return NET_ERR_BLOB_PANIC,
     };
 
     let boxed = bytes.into_boxed_slice();
@@ -275,11 +288,15 @@ pub unsafe extern "C" fn net_blob_resolve(
         Some(a) => a,
         None => return NET_ERR_BLOB_NOT_REGISTERED,
     };
-    let bytes =
-        match block_on(async move { resolve_payload(payload_slice, adapter.as_ref()).await }) {
-            Ok(b) => b,
-            Err(e) => return err_to_code(&e),
-        };
+    // Same catch_unwind protection as net_blob_publish.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(async move { resolve_payload(payload_slice, adapter.as_ref()).await })
+    }));
+    let bytes = match result {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => return err_to_code(&e),
+        Err(_) => return NET_ERR_BLOB_PANIC,
+    };
 
     let boxed = bytes.into_boxed_slice();
     let len = boxed.len();
@@ -639,6 +656,25 @@ pub unsafe extern "C" fn net_blob_register_callback_adapter(
         Some(s) => s,
         None => return NetError::InvalidUtf8.into(),
     };
+    // Validate every fn-ptr field is non-null BEFORE materialising
+    // the vtable as a value-typed `NetBlobAdapterVtable` — Rust's
+    // `unsafe extern "C" fn` type is non-nullable, so loading a
+    // struct whose C-side caller left any field NULL is immediate
+    // UB. Cast each field through a `*const ()` to read the raw
+    // bits without constructing a non-null fn-pointer value.
+    {
+        let raw = vtable as *const c_void as *const *const c_void;
+        // Five fn-ptr fields (store / fetch / fetch_range /
+        // exists / free_buffer). Reading them as *const c_void
+        // gives the raw address without invoking the fn-ptr type's
+        // non-null invariant.
+        for i in 0..5 {
+            let field = unsafe { *raw.add(i) };
+            if field.is_null() {
+                return NET_ERR_BLOB_BACKEND;
+            }
+        }
+    }
     let vtable = unsafe { *vtable };
     let adapter: Arc<dyn BlobAdapter> = Arc::new(CallbackBlobAdapter {
         id: id.clone(),

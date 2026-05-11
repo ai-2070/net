@@ -7,6 +7,26 @@
 //! of the Dataforts plan speculated a 32-byte origin; the substrate
 //! shape wins because every causal-chain primitive already keys on
 //! `u64`.
+//!
+//! ## Threat model
+//!
+//! `WriteToken` is **plain in-process data**, not a signed
+//! capability. The fields are `pub` so the FFI / binding layer can
+//! marshal them without going through `serde`; in-process callers
+//! can construct any token they want. RYW guarantees are upheld by
+//! the *adapter*: `TasksAdapter::wait_for_token` and
+//! `MemoriesAdapter::wait_for_token` reject tokens whose
+//! `origin_hash` doesn't match the adapter's own bound origin
+//! ([`super::cortex::WaitForTokenError::WrongOrigin`]).
+//!
+//! This means the trust boundary is the adapter handle, not the
+//! token. A caller holding a `TasksAdapter` bound to origin X
+//! cannot use it to learn anything about origin Y by forging a
+//! token — `wait_for_token` will reject and `note_wrong_origin`
+//! will trip the metric. Tokens crossing the wire (e.g. encoded
+//! into another origin's payload) must be treated as untrusted
+//! input; the receiving side validates via the adapter binding
+//! before honoring them.
 
 use std::fmt;
 use std::str::FromStr;
@@ -14,10 +34,11 @@ use std::str::FromStr;
 /// Address of a write — origin (which chain) + seq (which event on
 /// that chain). Round-trips through every binding as a typed value.
 ///
-/// `WriteToken` is opaque to callers: it exists to be passed back
-/// into a wait / read primitive. The fields are public so the FFI
-/// layer can encode/decode without going through this crate's serde,
-/// but bindings are expected to treat them as a single unit.
+/// Treat tokens as **opaque, in-process data**. They are not
+/// signed. The fields are `pub` so FFI / binding layers can
+/// marshal them; application code should not synthesise tokens.
+/// See module-level docs for the trust model — origin-bound
+/// adapters reject mismatched tokens at `wait_for_token`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct WriteToken {
     /// 64-bit hash of the entity whose chain this write landed on
@@ -28,10 +49,14 @@ pub struct WriteToken {
 }
 
 impl WriteToken {
-    /// Construct a token from its components. The caller is
-    /// responsible for ensuring `origin_hash` matches the chain
-    /// `seq` was assigned on; mixing the two yields a token that
-    /// no `wait_for_token` impl will satisfy.
+    /// Construct a token from its components. **Not for application
+    /// use** — the ingest path returns tokens with the right
+    /// `(origin_hash, seq)` already attached. Exposed only so
+    /// FFI / binding layers can marshal tokens across the
+    /// language boundary. Hand-rolled tokens that don't match an
+    /// actually-issued ingest produce waits that will hang until
+    /// the deadline expires or `WrongOrigin` rejects.
+    #[doc(hidden)]
     pub const fn new(origin_hash: u64, seq: u64) -> Self {
         Self { origin_hash, seq }
     }

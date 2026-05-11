@@ -70,6 +70,16 @@ pub(crate) const NET_ERR_QUEUE_FULL: c_int = -105;
 /// before the token's seq was applied. See
 /// `WaitForTokenError::FoldStopped`.
 pub(crate) const NET_ERR_FOLD_STOPPED: c_int = -106;
+/// Feature not built into this `libnet` — the symbol exists for
+/// link-time compatibility but the runtime cannot honor it. Cgo /
+/// dlsym consumers see a stable error rather than a linker
+/// failure when they target a `libnet.so` built without the
+/// `dataforts` feature.
+pub(crate) const NET_ERR_FEATURE_NOT_BUILT: c_int = -107;
+/// Panic surfaced from inside the substrate during a wait_for_token
+/// call. Caught with `catch_unwind` and reported here rather than
+/// unwinding across the FFI boundary (UB for C / cgo / Python).
+pub(crate) const NET_ERR_PANIC: c_int = -108;
 
 /// Non-blocking poll variant of wait_for_token: checks origin
 /// binding and the applied watermark, returns immediately. Maps
@@ -802,6 +812,68 @@ pub extern "C" fn net_redex_disable_gravity_for_greedy(redex: *mut RedexHandle) 
     };
     h.inner.disable_gravity_for_greedy();
     0
+}
+
+// -------------------------------------------------------------------------
+// dataforts feature-OFF stubs. The Rust crate gates the dataforts surface
+// behind `#[cfg(feature = "dataforts")]`, but cgo / dlsym consumers of
+// `libnet.so` link against the symbols unconditionally. Without these
+// stubs a `libnet` built without the feature link-fails at Go program
+// startup with `undefined symbol`. The stubs return
+// `NET_ERR_FEATURE_NOT_BUILT` so consumers can route to a clean error
+// rather than crash.
+//
+// `mesh_arc` is still consumed to match the success-path contract.
+// -------------------------------------------------------------------------
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_enable_greedy_dataforts(
+    _redex: *mut RedexHandle,
+    mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
+    _config_json: *const c_char,
+) -> c_int {
+    if !mesh_arc.is_null() {
+        unsafe { drop(Box::from_raw(mesh_arc)) };
+    }
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_disable_greedy_dataforts(_redex: *mut RedexHandle) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_greedy_cached_channel_count(_redex: *const RedexHandle) -> u32 {
+    0
+}
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_greedy_prometheus_text(_redex: *const RedexHandle) -> *mut c_char {
+    std::ptr::null_mut()
+}
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_enable_gravity_for_greedy(
+    _redex: *mut RedexHandle,
+    mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
+    _config_json: *const c_char,
+) -> c_int {
+    if !mesh_arc.is_null() {
+        unsafe { drop(Box::from_raw(mesh_arc)) };
+    }
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_disable_gravity_for_greedy(_redex: *mut RedexHandle) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
 }
 
 // =========================================================================
@@ -1628,15 +1700,20 @@ pub extern "C" fn net_tasks_wait_for_token(
         return tasks_poll_for_token(&adapter, token);
     }
     let deadline = std::time::Duration::from_millis(timeout_ms as u64);
-    block_on(async move {
-        match adapter.wait_for_token(token, deadline).await {
-            Ok(()) => 0,
-            Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
-            Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
-            Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
-            Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
-        }
-    })
+    // catch_unwind so a panic from the wait future cannot unwind
+    // across the FFI into the C / cgo / Python caller.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(async move {
+            match adapter.wait_for_token(token, deadline).await {
+                Ok(()) => 0,
+                Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
+                Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+                Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
+                Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
+            }
+        })
+    }));
+    result.unwrap_or(NET_ERR_PANIC)
 }
 
 #[derive(Deserialize, Default)]
@@ -2270,15 +2347,18 @@ pub extern "C" fn net_memories_wait_for_token(
         return memories_poll_for_token(&adapter, token);
     }
     let deadline = std::time::Duration::from_millis(timeout_ms as u64);
-    block_on(async move {
-        match adapter.wait_for_token(token, deadline).await {
-            Ok(()) => 0,
-            Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
-            Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
-            Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
-            Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
-        }
-    })
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(async move {
+            match adapter.wait_for_token(token, deadline).await {
+                Ok(()) => 0,
+                Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
+                Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+                Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
+                Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
+            }
+        })
+    }));
+    result.unwrap_or(NET_ERR_PANIC)
 }
 
 #[derive(Deserialize, Default)]
