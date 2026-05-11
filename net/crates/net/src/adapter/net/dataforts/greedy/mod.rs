@@ -18,9 +18,11 @@
 //! § Phase 1 — Greedy-LRU dataforts — locked decisions.
 
 mod admission;
+mod cache;
 mod config;
 
 pub use admission::{should_admit, AdmissionInputs, AdmissionVerdict};
+pub use cache::{EvictionSweep, GreedyCacheEntry, GreedyCacheRegistry};
 pub use config::{
     GreedyConfig, GreedyConfigError, DEFAULT_BANDWIDTH_BUDGET_FRACTION,
     DEFAULT_PER_CHANNEL_CAP_BYTES, DEFAULT_PROXIMITY_MAX_RTT_MS, DEFAULT_TOTAL_CAP_BYTES,
