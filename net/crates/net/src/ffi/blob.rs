@@ -50,22 +50,23 @@ pub const NET_ERR_BLOB_UNSUPPORTED_SCHEME: c_int = -116;
 fn runtime() -> &'static Arc<Runtime> {
     use std::sync::OnceLock;
     static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
-    RT.get_or_init(|| match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-        Ok(rt) => Arc::new(rt),
-        Err(e) => {
-            eprintln!(
-                "FATAL: blob FFI tokio runtime build failure ({e:?}); aborting"
-            );
-            std::process::abort();
+    RT.get_or_init(|| {
+        match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => Arc::new(rt),
+            Err(e) => {
+                eprintln!("FATAL: blob FFI tokio runtime build failure ({e:?}); aborting");
+                std::process::abort();
+            }
         }
     })
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     if tokio::runtime::Handle::try_current().is_ok() {
-        eprintln!(
-            "FATAL: blob FFI called from inside a tokio runtime context; aborting"
-        );
+        eprintln!("FATAL: blob FFI called from inside a tokio runtime context; aborting");
         std::process::abort();
     }
     runtime().block_on(future)
@@ -190,9 +191,8 @@ pub unsafe extern "C" fn net_blob_publish(
         Some(a) => a,
         None => return NET_ERR_BLOB_NOT_REGISTERED,
     };
-    let bytes = match block_on(async move {
-        publish_blob(adapter.as_ref(), uri, data_slice).await
-    }) {
+    let bytes = match block_on(async move { publish_blob(adapter.as_ref(), uri, data_slice).await })
+    {
         Ok(b) => b,
         Err(e) => return err_to_code(&e),
     };
@@ -244,12 +244,11 @@ pub unsafe extern "C" fn net_blob_resolve(
         Some(a) => a,
         None => return NET_ERR_BLOB_NOT_REGISTERED,
     };
-    let bytes = match block_on(async move {
-        resolve_payload(payload_slice, adapter.as_ref()).await
-    }) {
-        Ok(b) => b,
-        Err(e) => return err_to_code(&e),
-    };
+    let bytes =
+        match block_on(async move { resolve_payload(payload_slice, adapter.as_ref()).await }) {
+            Ok(b) => b,
+            Err(e) => return err_to_code(&e),
+        };
 
     let boxed = bytes.into_boxed_slice();
     let len = boxed.len();
@@ -274,6 +273,333 @@ pub unsafe extern "C" fn net_blob_free_buffer(ptr: *mut u8, len: usize) {
 #[allow(dead_code)]
 fn _force_use() -> *mut c_void {
     ptr::null_mut()
+}
+
+// =========================================================================
+// C-side callback adapter — register a function-pointer-table from
+// a cgo / native caller and let the substrate dispatch BlobAdapter
+// calls into it. The substrate wraps the table as a `dyn BlobAdapter`
+// and stores it in the global registry under the supplied id.
+// =========================================================================
+
+use std::ops::Range;
+
+use async_trait::async_trait;
+use std::sync::atomic::{AtomicPtr, Ordering as AtomicOrdering};
+
+/// `store` function pointer. Caller-allocates nothing; returns
+/// `0` on success or a negative `c_int` on failure.
+pub type NetBlobAdapterStoreFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    uri: *const c_char,
+    hash: *const u8, // exactly 32 bytes
+    size: u64,
+    data: *const u8,
+    data_len: usize,
+) -> c_int;
+
+/// `fetch` / `fetch_range` function pointer. Caller-allocates the
+/// return buffer and writes the pointer + length into the
+/// out-params. The substrate releases it via the vtable's
+/// `free_buffer` after consuming the bytes.
+pub type NetBlobAdapterFetchFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    uri: *const c_char,
+    hash: *const u8,
+    size: u64,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int;
+
+/// `fetch_range` function pointer.
+pub type NetBlobAdapterFetchRangeFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    uri: *const c_char,
+    hash: *const u8,
+    size: u64,
+    range_start: u64,
+    range_end: u64,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int;
+
+/// `exists` function pointer. Writes a `0` / `1` boolean into
+/// `out_exists` on success.
+pub type NetBlobAdapterExistsFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    uri: *const c_char,
+    hash: *const u8,
+    size: u64,
+    out_exists: *mut c_int,
+) -> c_int;
+
+/// Frees a buffer that the caller's `fetch` / `fetch_range`
+/// allocated. The substrate calls this after consuming the
+/// returned bytes.
+pub type NetBlobAdapterFreeFn = unsafe extern "C" fn(ctx: *mut c_void, data: *mut u8, len: usize);
+
+/// Function-pointer-table the C-side caller passes to
+/// [`net_blob_register_callback_adapter`]. The struct is `#[repr(C)]`
+/// for cross-ABI stability.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetBlobAdapterVtable {
+    /// `store(ctx, uri, hash, size, data, data_len) -> c_int`
+    pub store: NetBlobAdapterStoreFn,
+    /// `fetch(ctx, uri, hash, size, &out_data, &out_len) -> c_int`
+    pub fetch: NetBlobAdapterFetchFn,
+    /// `fetch_range(ctx, uri, hash, size, start, end, &out_data, &out_len)`
+    pub fetch_range: NetBlobAdapterFetchRangeFn,
+    /// `exists(ctx, uri, hash, size, &out_exists) -> c_int`
+    pub exists: NetBlobAdapterExistsFn,
+    /// `free_buffer(ctx, data, len)` — substrate calls this after
+    /// consuming a buffer the caller returned via `fetch` /
+    /// `fetch_range`.
+    pub free_buffer: NetBlobAdapterFreeFn,
+}
+
+/// Opaque caller-context pointer. The caller is responsible for
+/// thread-safety; the substrate just shuttles it across calls.
+/// `AtomicPtr` provides `Send + Sync` without requiring the
+/// pointee to be either.
+struct OpaqueCtx(AtomicPtr<c_void>);
+
+impl OpaqueCtx {
+    fn new(ptr: *mut c_void) -> Self {
+        Self(AtomicPtr::new(ptr))
+    }
+    fn get(&self) -> *mut c_void {
+        self.0.load(AtomicOrdering::Acquire)
+    }
+}
+
+/// `BlobAdapter` impl that calls into a vtable of C function
+/// pointers. Each trait method translates the args into
+/// `*const c_char` / `*const u8` shapes, dispatches inside
+/// `tokio::task::spawn_blocking` so the tokio worker isn't
+/// blocked on synchronous C-side I/O, and maps the return code
+/// back into a `Result<_, BlobError>`.
+struct CallbackBlobAdapter {
+    id: String,
+    vtable: NetBlobAdapterVtable,
+    ctx: Arc<OpaqueCtx>,
+}
+
+unsafe impl Send for CallbackBlobAdapter {}
+unsafe impl Sync for CallbackBlobAdapter {}
+
+fn code_to_err(code: c_int, label: &str) -> InnerBlobError {
+    match code {
+        NET_ERR_BLOB_NOT_FOUND => InnerBlobError::NotFound(label.into()),
+        NET_ERR_BLOB_HASH_MISMATCH => InnerBlobError::Backend(format!(
+            "{}: substrate hash mismatch (caller returned wrong bytes)",
+            label
+        )),
+        NET_ERR_BLOB_UNSUPPORTED_SCHEME => InnerBlobError::UnsupportedScheme(label.into()),
+        NET_ERR_BLOB_DECODE => InnerBlobError::Decode(label.into()),
+        _ => InnerBlobError::Backend(format!("{}: code {}", label, code)),
+    }
+}
+
+#[async_trait]
+impl BlobAdapter for CallbackBlobAdapter {
+    fn adapter_id(&self) -> &str {
+        &self.id
+    }
+
+    async fn store(
+        &self,
+        blob_ref: &crate::adapter::net::dataforts::BlobRef,
+        bytes: &[u8],
+    ) -> std::result::Result<(), InnerBlobError> {
+        let vtable = self.vtable;
+        let ctx = self.ctx.clone();
+        let uri = match std::ffi::CString::new(blob_ref.uri.clone()) {
+            Ok(c) => c,
+            Err(e) => return Err(InnerBlobError::Backend(format!("uri NUL: {}", e))),
+        };
+        let hash = blob_ref.hash;
+        let size = blob_ref.size;
+        let data = bytes.to_vec();
+        tokio::task::spawn_blocking(move || -> std::result::Result<(), InnerBlobError> {
+            let code = unsafe {
+                (vtable.store)(
+                    ctx.get(),
+                    uri.as_ptr(),
+                    hash.as_ptr(),
+                    size,
+                    data.as_ptr(),
+                    data.len(),
+                )
+            };
+            if code == 0 {
+                Ok(())
+            } else {
+                Err(code_to_err(code, "store"))
+            }
+        })
+        .await
+        .map_err(|e| InnerBlobError::Backend(format!("spawn_blocking join: {}", e)))?
+    }
+
+    async fn fetch(
+        &self,
+        blob_ref: &crate::adapter::net::dataforts::BlobRef,
+    ) -> std::result::Result<Vec<u8>, InnerBlobError> {
+        let vtable = self.vtable;
+        let ctx = self.ctx.clone();
+        let uri = match std::ffi::CString::new(blob_ref.uri.clone()) {
+            Ok(c) => c,
+            Err(e) => return Err(InnerBlobError::Backend(format!("uri NUL: {}", e))),
+        };
+        let hash = blob_ref.hash;
+        let size = blob_ref.size;
+        tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, InnerBlobError> {
+            let mut out_data: *mut u8 = ptr::null_mut();
+            let mut out_len: usize = 0;
+            let code = unsafe {
+                (vtable.fetch)(
+                    ctx.get(),
+                    uri.as_ptr(),
+                    hash.as_ptr(),
+                    size,
+                    &mut out_data,
+                    &mut out_len,
+                )
+            };
+            if code != 0 {
+                return Err(code_to_err(code, "fetch"));
+            }
+            if out_data.is_null() {
+                if out_len == 0 {
+                    return Ok(Vec::new());
+                }
+                return Err(InnerBlobError::Backend(
+                    "fetch: caller returned null pointer with non-zero len".into(),
+                ));
+            }
+            // Copy out before freeing — the caller owns the buffer
+            // and frees it via free_buffer.
+            let buf = unsafe { std::slice::from_raw_parts(out_data, out_len).to_vec() };
+            unsafe { (vtable.free_buffer)(ctx.get(), out_data, out_len) };
+            Ok(buf)
+        })
+        .await
+        .map_err(|e| InnerBlobError::Backend(format!("spawn_blocking join: {}", e)))?
+    }
+
+    async fn fetch_range(
+        &self,
+        blob_ref: &crate::adapter::net::dataforts::BlobRef,
+        range: Range<u64>,
+    ) -> std::result::Result<Vec<u8>, InnerBlobError> {
+        let vtable = self.vtable;
+        let ctx = self.ctx.clone();
+        let uri = match std::ffi::CString::new(blob_ref.uri.clone()) {
+            Ok(c) => c,
+            Err(e) => return Err(InnerBlobError::Backend(format!("uri NUL: {}", e))),
+        };
+        let hash = blob_ref.hash;
+        let size = blob_ref.size;
+        let start = range.start;
+        let end = range.end;
+        tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, InnerBlobError> {
+            let mut out_data: *mut u8 = ptr::null_mut();
+            let mut out_len: usize = 0;
+            let code = unsafe {
+                (vtable.fetch_range)(
+                    ctx.get(),
+                    uri.as_ptr(),
+                    hash.as_ptr(),
+                    size,
+                    start,
+                    end,
+                    &mut out_data,
+                    &mut out_len,
+                )
+            };
+            if code != 0 {
+                return Err(code_to_err(code, "fetch_range"));
+            }
+            if out_data.is_null() {
+                if out_len == 0 {
+                    return Ok(Vec::new());
+                }
+                return Err(InnerBlobError::Backend(
+                    "fetch_range: caller returned null pointer with non-zero len".into(),
+                ));
+            }
+            let buf = unsafe { std::slice::from_raw_parts(out_data, out_len).to_vec() };
+            unsafe { (vtable.free_buffer)(ctx.get(), out_data, out_len) };
+            Ok(buf)
+        })
+        .await
+        .map_err(|e| InnerBlobError::Backend(format!("spawn_blocking join: {}", e)))?
+    }
+
+    async fn exists(
+        &self,
+        blob_ref: &crate::adapter::net::dataforts::BlobRef,
+    ) -> std::result::Result<bool, InnerBlobError> {
+        let vtable = self.vtable;
+        let ctx = self.ctx.clone();
+        let uri = match std::ffi::CString::new(blob_ref.uri.clone()) {
+            Ok(c) => c,
+            Err(e) => return Err(InnerBlobError::Backend(format!("uri NUL: {}", e))),
+        };
+        let hash = blob_ref.hash;
+        let size = blob_ref.size;
+        tokio::task::spawn_blocking(move || -> std::result::Result<bool, InnerBlobError> {
+            let mut out_exists: c_int = 0;
+            let code = unsafe {
+                (vtable.exists)(
+                    ctx.get(),
+                    uri.as_ptr(),
+                    hash.as_ptr(),
+                    size,
+                    &mut out_exists,
+                )
+            };
+            if code != 0 {
+                return Err(code_to_err(code, "exists"));
+            }
+            Ok(out_exists != 0)
+        })
+        .await
+        .map_err(|e| InnerBlobError::Backend(format!("spawn_blocking join: {}", e)))?
+    }
+}
+
+/// Register a C-side BlobAdapter implementation. The vtable is
+/// copied into the adapter; `ctx` is shuttled across every call as
+/// an opaque pointer (caller is responsible for thread-safety).
+///
+/// Returns `0` on success, `NET_ERR_BLOB_DUPLICATE_ID` if `id` is
+/// already registered, or `NetError::InvalidUtf8` / `NullPointer`
+/// for malformed input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_register_callback_adapter(
+    adapter_id: *const c_char,
+    vtable: *const NetBlobAdapterVtable,
+    ctx: *mut c_void,
+) -> c_int {
+    if vtable.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let id = match c_str_to_owned(adapter_id) {
+        Some(s) => s,
+        None => return NetError::InvalidUtf8.into(),
+    };
+    let vtable = unsafe { *vtable };
+    let adapter: Arc<dyn BlobAdapter> = Arc::new(CallbackBlobAdapter {
+        id: id.clone(),
+        vtable,
+        ctx: Arc::new(OpaqueCtx::new(ctx)),
+    });
+    match global_blob_adapter_registry().register(adapter) {
+        Ok(()) => 0,
+        Err(_) => NET_ERR_BLOB_DUPLICATE_ID,
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +690,179 @@ mod tests {
         assert_eq!(rc, NET_ERR_BLOB_NOT_REGISTERED);
         assert!(out_buf.is_null());
         assert_eq!(out_len, 0);
+    }
+
+    /// Round-trip an `net_blob_register_callback_adapter`-registered
+    /// adapter: publish bytes through the vtable, then resolve them
+    /// back. The vtable's `fetch` returns bytes from a static map
+    /// indexed by the BLAKE3 hash; the substrate-side hash check
+    /// validates the round trip.
+    mod callback_adapter_round_trip {
+        use super::*;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        struct CallbackCtx {
+            store: Mutex<HashMap<[u8; 32], Vec<u8>>>,
+        }
+
+        unsafe extern "C" fn cb_store(
+            ctx: *mut c_void,
+            _uri: *const c_char,
+            hash: *const u8,
+            _size: u64,
+            data: *const u8,
+            data_len: usize,
+        ) -> c_int {
+            let ctx = &*(ctx as *const CallbackCtx);
+            let mut h = [0u8; 32];
+            h.copy_from_slice(std::slice::from_raw_parts(hash, 32));
+            let buf = if data_len == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(data, data_len).to_vec()
+            };
+            ctx.store.lock().unwrap().insert(h, buf);
+            0
+        }
+
+        unsafe extern "C" fn cb_fetch(
+            ctx: *mut c_void,
+            _uri: *const c_char,
+            hash: *const u8,
+            _size: u64,
+            out_data: *mut *mut u8,
+            out_len: *mut usize,
+        ) -> c_int {
+            let ctx = &*(ctx as *const CallbackCtx);
+            let mut h = [0u8; 32];
+            h.copy_from_slice(std::slice::from_raw_parts(hash, 32));
+            let store = ctx.store.lock().unwrap();
+            match store.get(&h) {
+                Some(bytes) => {
+                    let boxed = bytes.clone().into_boxed_slice();
+                    let len = boxed.len();
+                    let ptr = Box::into_raw(boxed) as *mut u8;
+                    *out_data = ptr;
+                    *out_len = len;
+                    0
+                }
+                None => NET_ERR_BLOB_NOT_FOUND,
+            }
+        }
+
+        unsafe extern "C" fn cb_fetch_range(
+            ctx: *mut c_void,
+            _uri: *const c_char,
+            hash: *const u8,
+            _size: u64,
+            range_start: u64,
+            range_end: u64,
+            out_data: *mut *mut u8,
+            out_len: *mut usize,
+        ) -> c_int {
+            let ctx = &*(ctx as *const CallbackCtx);
+            let mut h = [0u8; 32];
+            h.copy_from_slice(std::slice::from_raw_parts(hash, 32));
+            let store = ctx.store.lock().unwrap();
+            match store.get(&h) {
+                Some(bytes) => {
+                    let s = range_start as usize;
+                    let e = range_end as usize;
+                    if s > e || e > bytes.len() {
+                        return NET_ERR_BLOB_BACKEND;
+                    }
+                    let slice = bytes[s..e].to_vec().into_boxed_slice();
+                    let len = slice.len();
+                    *out_data = Box::into_raw(slice) as *mut u8;
+                    *out_len = len;
+                    0
+                }
+                None => NET_ERR_BLOB_NOT_FOUND,
+            }
+        }
+
+        unsafe extern "C" fn cb_exists(
+            ctx: *mut c_void,
+            _uri: *const c_char,
+            hash: *const u8,
+            _size: u64,
+            out_exists: *mut c_int,
+        ) -> c_int {
+            let ctx = &*(ctx as *const CallbackCtx);
+            let mut h = [0u8; 32];
+            h.copy_from_slice(std::slice::from_raw_parts(hash, 32));
+            *out_exists = if ctx.store.lock().unwrap().contains_key(&h) {
+                1
+            } else {
+                0
+            };
+            0
+        }
+
+        unsafe extern "C" fn cb_free(_ctx: *mut c_void, data: *mut u8, len: usize) {
+            if data.is_null() {
+                return;
+            }
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(data, len) as *mut [u8]);
+        }
+
+        #[test]
+        fn callback_adapter_publish_resolve_round_trip() {
+            let ctx = Box::new(CallbackCtx {
+                store: Mutex::new(HashMap::new()),
+            });
+            let ctx_ptr = Box::into_raw(ctx) as *mut c_void;
+            let vtable = NetBlobAdapterVtable {
+                store: cb_store,
+                fetch: cb_fetch,
+                fetch_range: cb_fetch_range,
+                exists: cb_exists,
+                free_buffer: cb_free,
+            };
+
+            let id_c = std::ffi::CString::new("ffi-cb-roundtrip").unwrap();
+            let uri_c = std::ffi::CString::new("cb://round-trip").unwrap();
+            unsafe {
+                assert_eq!(
+                    net_blob_register_callback_adapter(id_c.as_ptr(), &vtable, ctx_ptr),
+                    0
+                );
+
+                let payload = b"vtable round-trip payload";
+                let mut out_buf: *mut u8 = std::ptr::null_mut();
+                let mut out_len: usize = 0;
+                let rc = net_blob_publish(
+                    id_c.as_ptr(),
+                    uri_c.as_ptr(),
+                    payload.as_ptr(),
+                    payload.len(),
+                    &mut out_buf,
+                    &mut out_len,
+                );
+                assert_eq!(rc, 0);
+
+                let mut content_buf: *mut u8 = std::ptr::null_mut();
+                let mut content_len: usize = 0;
+                let rc = net_blob_resolve(
+                    id_c.as_ptr(),
+                    out_buf,
+                    out_len,
+                    &mut content_buf,
+                    &mut content_len,
+                );
+                assert_eq!(rc, 0);
+                let resolved = std::slice::from_raw_parts(content_buf, content_len);
+                assert_eq!(resolved, payload);
+
+                net_blob_free_buffer(out_buf, out_len);
+                net_blob_free_buffer(content_buf, content_len);
+                assert_eq!(net_blob_unregister_adapter(id_c.as_ptr()), 1);
+
+                // Reclaim the leaked ctx box.
+                drop(Box::from_raw(ctx_ptr as *mut CallbackCtx));
+            }
+        }
     }
 
     #[test]
