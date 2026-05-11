@@ -43,7 +43,7 @@ Tagged `[B | H | M | L]`:
 | D-9   | H   | gravity      | Default `origin_hash == 0` collapses per-chain heat into single bucket     | ✅ |
 | D-10  | H   | gravity      | `HeatRegistry` unbounded; no eviction wired to greedy LRU                  | ✅ |
 | D-11  | H   | gravity      | No inbound auth / origin / rate-limit on `heat:` tags                      | ✅ (auth via causal: claim; rate-limit deferred) |
-| D-12  | H   | blob         | `FileSystemAdapter::store` never verifies bytes hash to `blob_ref.hash`    | ⏳ |
+| D-12  | H   | blob         | `FileSystemAdapter::store` never verifies bytes hash to `blob_ref.hash`    | ✅ |
 | D-13  | H   | blob         | Adapter selected by channel config, not URI scheme — authority confusion  | ⏳ |
 | D-14  | H   | blob         | `classify_payload` first-byte `0xB0` collides with arbitrary binary payloads | ⏳ |
 | D-15  | H   | blob         | No max-blob-size on resolve / `u64::MAX` size accepted                     | ⏳ |
@@ -63,7 +63,7 @@ Tagged `[B | H | M | L]`:
 | D-29  | M   | gravity      | `should_emit_heat` `inf`-prone with near-zero `prev`                      | ⏳ |
 | D-30  | M   | gravity      | Wire-side `(rate/(rate+1))` saturation at top end                          | ⏳ |
 | D-31  | M   | blob fs      | `BlobError::NotFound(uri)` propagates raw attacker URI → log injection     | ⏳ |
-| D-32  | M   | blob fs      | Concurrent stores race on shared `<hash>.tmp` filename                     | ⏳ |
+| D-32  | M   | blob fs      | Concurrent stores race on shared `<hash>.tmp` filename                     | ✅ (folded into D-12) |
 | D-33  | M   | blob fs      | No `fsync` of temp file or parent dir before rename — durability gap      | ⏳ |
 | D-34  | M   | blob reg     | Process-wide singleton registry; multi-tenant hijack possible              | ⏳ |
 | D-35  | M   | blob adapter | No concurrency bound on `spawn_blocking` calls                             | ⏳ |

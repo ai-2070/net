@@ -65,6 +65,19 @@ impl BlobAdapter for FileSystemAdapter {
     }
 
     async fn store(&self, blob_ref: &BlobRef, bytes: &[u8]) -> Result<(), BlobError> {
+        // Verify the bytes hash to the BlobRef's hash BEFORE writing.
+        // Without this an adapter author (or compromised binding) can
+        // pre-seed an arbitrary hash slot with attacker content; a
+        // later honest BlobRef would then resolve to that content
+        // because the on-disk path is keyed only on the hash. Hash
+        // here and reject mismatches at the trust boundary.
+        let computed: [u8; 32] = blake3::hash(bytes).into();
+        if computed != blob_ref.hash {
+            return Err(BlobError::HashMismatch {
+                expected: blob_ref.hash,
+                actual: computed,
+            });
+        }
         let path = self.path_for(&blob_ref.hash);
         let bytes = bytes.to_vec();
         tokio::task::spawn_blocking(move || -> Result<(), BlobError> {
@@ -72,16 +85,37 @@ impl BlobAdapter for FileSystemAdapter {
                 std::fs::create_dir_all(parent).map_err(backend)?;
             }
             // Write to a sibling temp then rename so a concurrent
-            // fetch never observes a half-written file.
+            // fetch never observes a half-written file. The temp
+            // filename includes pid + a process-local atomic
+            // counter + nanos so two concurrent stores against the
+            // same hash slot (idempotent re-puts) don't race on
+            // the same temp filename.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+            let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             let mut tmp = path.clone();
             let mut name = tmp
                 .file_name()
                 .ok_or_else(|| backend("path has no file name"))?
                 .to_owned();
-            name.push(".tmp");
+            name.push(format!(".{}-{}-{}.tmp", std::process::id(), counter, nanos));
             tmp.set_file_name(name);
             std::fs::write(&tmp, &bytes).map_err(backend)?;
-            std::fs::rename(&tmp, &path).map_err(backend)?;
+            // On Windows rename over an existing file historically
+            // fails; treat that as a benign "another writer beat us"
+            // and clean up the temp (the canonical path already
+            // holds the same content thanks to the hash check).
+            match std::fs::rename(&tmp, &path) {
+                Ok(()) => {}
+                Err(_) if path.is_file() => {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                Err(e) => return Err(backend(e)),
+            }
             Ok(())
         })
         .await
@@ -237,6 +271,31 @@ mod tests {
         let blob = BlobRef::new("file:///r", [0x00; 32], 10);
         let err = adapter.fetch_range(&blob, 5..3).await.unwrap_err();
         assert!(matches!(err, BlobError::Backend(_)));
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn store_rejects_mismatched_bytes_vs_hash() {
+        // Without this guard a caller could pre-seed an arbitrary
+        // hash slot with attacker content.
+        let root = unique_root();
+        let adapter = FileSystemAdapter::new("fs-test", &root);
+        // Build a BlobRef whose hash is the digest of "real" but
+        // try to store "fake" against it.
+        let real = b"real content";
+        let fake = b"fake content";
+        let real_hash: [u8; 32] = blake3::hash(real).into();
+        let blob = BlobRef::new("file:///impostor", real_hash, fake.len() as u64);
+        let err = adapter.store(&blob, fake).await.unwrap_err();
+        match err {
+            BlobError::HashMismatch { expected, actual } => {
+                assert_eq!(expected, real_hash);
+                assert_ne!(actual, real_hash);
+            }
+            other => panic!("expected HashMismatch, got {:?}", other),
+        }
+        // Slot must NOT have been populated.
+        assert!(!adapter.exists(&blob).await.unwrap());
         cleanup(&root);
     }
 
