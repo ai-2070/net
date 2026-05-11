@@ -355,9 +355,7 @@ pub extern "C" fn net_redex_replication_runtime_count(redex: *const RedexHandle)
 /// `*_under_capacity_total`, `*_skip_ahead_total`,
 /// `*_election_thrash_total`, `*_witness_withdrawals_total`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_replication_prometheus_text(
-    redex: *const RedexHandle,
-) -> *mut c_char {
+pub extern "C" fn net_redex_replication_prometheus_text(redex: *const RedexHandle) -> *mut c_char {
     let Some(h) = (unsafe { redex.as_ref() }) else {
         return std::ptr::null_mut();
     };
@@ -424,12 +422,8 @@ struct RedexReplicationConfigJson {
 }
 
 impl RedexReplicationConfigJson {
-    fn into_config(
-        self,
-    ) -> Result<crate::adapter::net::redex::ReplicationConfig, &'static str> {
-        use crate::adapter::net::redex::{
-            PlacementStrategy, ReplicationConfig, UnderCapacity,
-        };
+    fn into_config(self) -> Result<crate::adapter::net::redex::ReplicationConfig, &'static str> {
+        use crate::adapter::net::redex::{PlacementStrategy, ReplicationConfig, UnderCapacity};
         let mut cfg = ReplicationConfig::new();
         if let Some(f) = self.factor {
             cfg = cfg.with_factor(f);

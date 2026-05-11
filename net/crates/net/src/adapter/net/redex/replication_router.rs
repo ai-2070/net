@@ -41,9 +41,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 use super::replication::ChannelId;
-use super::replication_runtime::{
-    Inbound, ReplicationInboundRouter, ReplicationRuntimeHandle,
-};
+use super::replication_runtime::{Inbound, ReplicationInboundRouter, ReplicationRuntimeHandle};
 
 /// Per-`Redex` registry of runtime handles, dispatching by
 /// channel id. Cheap to clone (everything is Arc) so the same
@@ -85,10 +83,7 @@ impl RedexReplicationRouter {
     /// Remove the registration for `channel_id`. Returns the
     /// removed handle, if any, so the caller can cancel + await
     /// its exit deterministically.
-    pub fn unregister(
-        &self,
-        channel_id: &ChannelId,
-    ) -> Option<Arc<ReplicationRuntimeHandle>> {
+    pub fn unregister(&self, channel_id: &ChannelId) -> Option<Arc<ReplicationRuntimeHandle>> {
         self.runtimes.remove(channel_id).map(|(_, v)| v)
     }
 
@@ -289,9 +284,7 @@ mod tests {
 
         let cn = ChannelName::new("test/runtime").unwrap();
         let redex = Redex::new();
-        let file: RedexFile = redex
-            .open_file(&cn, RedexFileConfig::default())
-            .unwrap();
+        let file: RedexFile = redex.open_file(&cn, RedexFileConfig::default()).unwrap();
         let registry = ReplicationMetricsRegistry::new();
         let coordinator = Arc::new(ReplicationCoordinator::new(
             ChannelIdentity {

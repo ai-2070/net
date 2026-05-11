@@ -49,9 +49,7 @@ use super::replication::{
     ChannelId, ReplicaRole, SyncHeartbeat, SyncNack, SyncRequest, SyncResponse,
 };
 use super::replication_budget::BandwidthBudget;
-use super::replication_catchup::{
-    apply_sync_response, handle_sync_request, SyncRequestOutcome,
-};
+use super::replication_catchup::{apply_sync_response, handle_sync_request, SyncRequestOutcome};
 use super::replication_coordinator::{ChannelIdentity, ReplicationCoordinator};
 use super::replication_heartbeat::HeartbeatTracker;
 use super::replication_step::{
@@ -68,17 +66,10 @@ use std::time::Duration;
 #[async_trait::async_trait]
 pub trait ReplicationDispatcher: Send + Sync {
     /// Send a [`SyncHeartbeat`] to `target`.
-    async fn send_heartbeat(
-        &self,
-        target: NodeId,
-        msg: SyncHeartbeat,
-    ) -> Result<(), AdapterError>;
+    async fn send_heartbeat(&self, target: NodeId, msg: SyncHeartbeat) -> Result<(), AdapterError>;
     /// Send a [`SyncRequest`] to `target` (typically a leader).
-    async fn send_sync_request(
-        &self,
-        target: NodeId,
-        msg: SyncRequest,
-    ) -> Result<(), AdapterError>;
+    async fn send_sync_request(&self, target: NodeId, msg: SyncRequest)
+        -> Result<(), AdapterError>;
     /// Send a [`SyncResponse`] to `target` (typically a replica
     /// catching up).
     async fn send_sync_response(
@@ -87,11 +78,7 @@ pub trait ReplicationDispatcher: Send + Sync {
         msg: SyncResponse,
     ) -> Result<(), AdapterError>;
     /// Send a [`SyncNack`] to `target`.
-    async fn send_sync_nack(
-        &self,
-        target: NodeId,
-        msg: SyncNack,
-    ) -> Result<(), AdapterError>;
+    async fn send_sync_nack(&self, target: NodeId, msg: SyncNack) -> Result<(), AdapterError>;
 }
 
 /// RTT-lookup function the election uses. Production routes
@@ -125,11 +112,7 @@ pub trait ReplicationInboundRouter: Send + Sync {
 
 #[async_trait::async_trait]
 impl ReplicationDispatcher for crate::adapter::net::MeshNode {
-    async fn send_heartbeat(
-        &self,
-        target: NodeId,
-        msg: SyncHeartbeat,
-    ) -> Result<(), AdapterError> {
+    async fn send_heartbeat(&self, target: NodeId, msg: SyncHeartbeat) -> Result<(), AdapterError> {
         send_redex_payload(self, target, msg.to_bytes()).await
     }
 
@@ -149,11 +132,7 @@ impl ReplicationDispatcher for crate::adapter::net::MeshNode {
         send_redex_payload(self, target, msg.to_bytes()).await
     }
 
-    async fn send_sync_nack(
-        &self,
-        target: NodeId,
-        msg: SyncNack,
-    ) -> Result<(), AdapterError> {
+    async fn send_sync_nack(&self, target: NodeId, msg: SyncNack) -> Result<(), AdapterError> {
         send_redex_payload(self, target, msg.to_bytes()).await
     }
 }
@@ -312,7 +291,11 @@ impl ReplicationRuntimeHandle {
     /// Returns `true` if the runtime has stopped (task joined).
     /// Useful for tests / observability.
     pub fn is_stopped(&self) -> bool {
-        self.task.lock().as_ref().map(|h| h.is_finished()).unwrap_or(true)
+        self.task
+            .lock()
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(true)
     }
 }
 
@@ -488,7 +471,13 @@ async fn on_tick(
             chunk_max_bytes: SYNC_REQUEST_CHUNK_MAX_DEFAULT,
             now,
         });
-        let lag = observe_lag(current_role, &inputs.replica_set, inputs.self_node_id, &t, now);
+        let lag = observe_lag(
+            current_role,
+            &inputs.replica_set,
+            inputs.self_node_id,
+            &t,
+            now,
+        );
         (outcome, lag)
     };
     // Record lag gauges off the tracker lock.
@@ -745,7 +734,10 @@ async fn on_inbound(
             use super::replication::SyncNackError;
             match msg.error_code {
                 SyncNackError::NotLeader => {
-                    tracing::trace!(from = from, "replication: NACK NotLeader — clearing believed leader");
+                    tracing::trace!(
+                        from = from,
+                        "replication: NACK NotLeader — clearing believed leader"
+                    );
                     // Heartbeat cycle re-discovers leader on next
                     // round; we just clear the cached belief.
                     // (Tracker is owned by the runtime task's
@@ -758,13 +750,22 @@ async fn on_inbound(
                     // file_provider doesn't yet expose a "skip"
                     // method; flag the metric and defer.
                     coordinator.metrics().incr_skip_ahead();
-                    tracing::trace!(from = from, "replication: NACK BadRange — skip-ahead recorded");
+                    tracing::trace!(
+                        from = from,
+                        "replication: NACK BadRange — skip-ahead recorded"
+                    );
                 }
                 SyncNackError::Backpressure => {
-                    tracing::trace!(from = from, "replication: NACK Backpressure — deferring next request");
+                    tracing::trace!(
+                        from = from,
+                        "replication: NACK Backpressure — deferring next request"
+                    );
                 }
                 SyncNackError::ChannelClosed => {
-                    tracing::warn!(from = from, "replication: NACK ChannelClosed — withdrawing replica role");
+                    tracing::warn!(
+                        from = from,
+                        "replication: NACK ChannelClosed — withdrawing replica role"
+                    );
                     // Drive a withdraw via the coordinator's
                     // disk-pressure shape (closest semantic).
                     let _ = coordinator
@@ -918,11 +919,7 @@ mod tests {
             self.sync_responses.lock().push((target, msg));
             Ok(())
         }
-        async fn send_sync_nack(
-            &self,
-            target: NodeId,
-            msg: SyncNack,
-        ) -> Result<(), AdapterError> {
+        async fn send_sync_nack(&self, target: NodeId, msg: SyncNack) -> Result<(), AdapterError> {
             self.sync_nacks.lock().push((target, msg));
             Ok(())
         }
@@ -1086,8 +1083,12 @@ mod tests {
             .await
             .unwrap();
         let dispatcher = Arc::new(RecorderDispatcher::default());
-        let handle =
-            spawn_replication_runtime(inputs, coordinator.clone(), dispatcher.clone(), build_budget());
+        let handle = spawn_replication_runtime(
+            inputs,
+            coordinator.clone(),
+            dispatcher.clone(),
+            build_budget(),
+        );
 
         // Push a single leader heartbeat from 0x20, then let
         // enough time pass for silence detection (3 × 50ms = 150ms).
@@ -1155,8 +1156,7 @@ mod tests {
             .await
             .unwrap();
         let dispatcher = Arc::new(RecorderDispatcher::default());
-        let handle =
-            spawn_replication_runtime(inputs, coordinator, dispatcher, build_budget());
+        let handle = spawn_replication_runtime(inputs, coordinator, dispatcher, build_budget());
 
         let cid = channel_id_for("test/runtime");
         // Fill past capacity.
@@ -1185,8 +1185,7 @@ mod tests {
         let inputs = build_inputs(0x10, vec![0x10, 0x20], 100);
         let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
         let dispatcher = Arc::new(RecorderDispatcher::default());
-        let handle =
-            spawn_replication_runtime(inputs, coordinator, dispatcher, build_budget());
+        let handle = spawn_replication_runtime(inputs, coordinator, dispatcher, build_budget());
 
         handle.cancel().await;
 
@@ -1294,7 +1293,13 @@ mod tests {
         // observed yet → lag has no observation to report.
         let tracker = HeartbeatTracker::new(500);
         let now = Instant::now();
-        match observe_lag(ReplicaRole::Leader, &[0x10, 0x20, 0x30], 0x10, &tracker, now) {
+        match observe_lag(
+            ReplicaRole::Leader,
+            &[0x10, 0x20, 0x30],
+            0x10,
+            &tracker,
+            now,
+        ) {
             LagObservation::None => {}
             other => panic!("expected None when peers have not heartbeated, got {other:?}"),
         }
@@ -1308,9 +1313,20 @@ mod tests {
         // later. After advancing to base+1000ms, peer 0x20 has 1000ms
         // of lag, peer 0x30 has 900ms. Leader gauge picks the worst.
         tracker.record_heartbeat(0x20, ReplicaRole::Replica, 0, base);
-        tracker.record_heartbeat(0x30, ReplicaRole::Replica, 0, base + Duration::from_millis(100));
+        tracker.record_heartbeat(
+            0x30,
+            ReplicaRole::Replica,
+            0,
+            base + Duration::from_millis(100),
+        );
         let now = base + Duration::from_millis(1000);
-        match observe_lag(ReplicaRole::Leader, &[0x10, 0x20, 0x30], 0x10, &tracker, now) {
+        match observe_lag(
+            ReplicaRole::Leader,
+            &[0x10, 0x20, 0x30],
+            0x10,
+            &tracker,
+            now,
+        ) {
             LagObservation::Leader(d) => assert_eq!(d, Duration::from_millis(1000)),
             other => panic!("expected Leader(1000ms), got {other:?}"),
         }
@@ -1361,7 +1377,10 @@ mod tests {
 
     fn build_coordinator_with_policy(
         policy: super::super::replication_config::UnderCapacity,
-    ) -> (Arc<ReplicationCoordinator>, Arc<super::super::replication_metrics::ChannelMetricsAtomic>) {
+    ) -> (
+        Arc<ReplicationCoordinator>,
+        Arc<super::super::replication_metrics::ChannelMetricsAtomic>,
+    ) {
         let registry = ReplicationMetricsRegistry::new();
         let sink: Arc<dyn ChainTagSink> = Arc::new(NoopTagSink);
         let config = ReplicationConfig::new().with_on_under_capacity(policy);
@@ -1382,8 +1401,9 @@ mod tests {
     async fn disk_pressure_withdraw_drives_idle_transition() {
         // Bring the coordinator to Replica role so the
         // DiskPressureWithdraw signal can validate.
-        let (coord, metrics) =
-            build_coordinator_with_policy(super::super::replication_config::UnderCapacity::Withdraw);
+        let (coord, metrics) = build_coordinator_with_policy(
+            super::super::replication_config::UnderCapacity::Withdraw,
+        );
         coord
             .transition_to(
                 ReplicaRole::Replica,
@@ -1459,8 +1479,9 @@ mod tests {
         // ChannelClose` shortcut doesn't apply (this is
         // DiskPressureWithdraw, not ChannelClose). The
         // transition rejects but the counter still bumps.
-        let (coord, metrics) =
-            build_coordinator_with_policy(super::super::replication_config::UnderCapacity::Withdraw);
+        let (coord, metrics) = build_coordinator_with_policy(
+            super::super::replication_config::UnderCapacity::Withdraw,
+        );
         // Coordinator starts in Idle.
         let file = build_file_for_tests();
         handle_disk_pressure(&coord, &file, "test detail", 0x20).await;

@@ -275,17 +275,26 @@ fn resolve_placement_strategy(
         None | Some("standard") => Ok(InnerPlacementStrategy::Standard),
         Some("colocation-strict") => Ok(InnerPlacementStrategy::ColocationStrict),
         Some("pinned") => {
-            let nodes = pinned_nodes
-                .ok_or_else(|| redex_err("replication.pinned_nodes", "required when placement = 'pinned'"))?;
+            let nodes = pinned_nodes.ok_or_else(|| {
+                redex_err(
+                    "replication.pinned_nodes",
+                    "required when placement = 'pinned'",
+                )
+            })?;
             let mut out = Vec::with_capacity(nodes.len());
             for (i, n) in nodes.into_iter().enumerate() {
-                out.push(redex_bigint_u64(&format!("replication.pinned_nodes[{i}]"), n)?);
+                out.push(redex_bigint_u64(
+                    &format!("replication.pinned_nodes[{i}]"),
+                    n,
+                )?);
             }
             Ok(InnerPlacementStrategy::Pinned(out))
         }
         Some(other) => Err(redex_err(
             "replication.placement",
-            format!("unknown strategy {other:?}; expected 'standard', 'pinned', or 'colocation-strict'"),
+            format!(
+                "unknown strategy {other:?}; expected 'standard', 'pinned', or 'colocation-strict'"
+            ),
         )),
     }
 }
@@ -320,10 +329,7 @@ fn resolve_replication_config(cfg: ReplicationConfigJs) -> Result<InnerReplicati
     }
     out = out.with_placement(resolve_placement_strategy(cfg.placement, cfg.pinned_nodes)?);
     if let Some(leader) = cfg.leader_pinned {
-        out = out.with_leader_pinned(Some(redex_bigint_u64(
-            "replication.leader_pinned",
-            leader,
-        )?));
+        out = out.with_leader_pinned(Some(redex_bigint_u64("replication.leader_pinned", leader)?));
     }
     out = out.with_on_under_capacity(resolve_under_capacity(cfg.on_under_capacity)?);
     if let Some(fraction) = cfg.replication_budget_fraction {

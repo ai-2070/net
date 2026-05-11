@@ -32,9 +32,7 @@
 use bytes::Bytes;
 
 use super::file::RedexFile;
-use super::replication::{
-    ChannelId, SyncEvent, SyncNackError, SyncRequest, SyncResponse,
-};
+use super::replication::{ChannelId, SyncEvent, SyncNackError, SyncRequest, SyncResponse};
 
 /// Hard cap on how many bytes a single [`SyncResponse`] chunk can
 /// carry, regardless of `chunk_max` in the request. Pinned here so
@@ -197,10 +195,7 @@ pub fn handle_sync_request(
         // been retention-evicted. Replica must skip ahead.
         return SyncRequestOutcome::Nack {
             error_code: SyncNackError::BadRange,
-            detail: format!(
-                "since_seq {} below first retained event",
-                request.since_seq,
-            ),
+            detail: format!("since_seq {} below first retained event", request.since_seq,),
         };
     }
 
@@ -208,7 +203,10 @@ pub fn handle_sync_request(
     // retention trimmed the start of the range. Set `first_seq`
     // to the actual first event's seq so the replica can detect
     // the trim and skip-ahead if needed.
-    let first_seq = events.first().map(|e| e.entry.seq).unwrap_or(request.since_seq);
+    let first_seq = events
+        .first()
+        .map(|e| e.entry.seq)
+        .unwrap_or(request.since_seq);
 
     // Apply the byte-budget cull. Each `SyncEvent` wire-cost is
     // 8 (event_seq) + 4 (payload_len) + payload.len(). Stop the
@@ -412,8 +410,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 4096,
         };
-        let SyncRequestOutcome::Nack { error_code, .. } =
-            handle_sync_request(&f, &req, expected)
+        let SyncRequestOutcome::Nack { error_code, .. } = handle_sync_request(&f, &req, expected)
         else {
             panic!("expected Nack");
         };
@@ -699,8 +696,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 4096,
         };
-        let SyncRequestOutcome::Response(resp) = handle_sync_request(&leader, &req, cid)
-        else {
+        let SyncRequestOutcome::Response(resp) = handle_sync_request(&leader, &req, cid) else {
             panic!("expected Response");
         };
         let new_tail = apply_sync_response(&replica, &resp, cid).expect("apply");
@@ -733,8 +729,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 60,
         };
-        let SyncRequestOutcome::Response(r1) = handle_sync_request(&leader, &req1, cid)
-        else {
+        let SyncRequestOutcome::Response(r1) = handle_sync_request(&leader, &req1, cid) else {
             panic!();
         };
         assert_eq!(r1.events.len(), 2);
@@ -746,8 +741,7 @@ mod tests {
             since_seq: replica.next_seq(),
             chunk_max: 60,
         };
-        let SyncRequestOutcome::Response(r2) = handle_sync_request(&leader, &req2, cid)
-        else {
+        let SyncRequestOutcome::Response(r2) = handle_sync_request(&leader, &req2, cid) else {
             panic!();
         };
         assert_eq!(r2.events.len(), 2);

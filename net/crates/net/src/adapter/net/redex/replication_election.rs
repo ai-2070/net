@@ -177,24 +177,14 @@ mod tests {
     #[test]
     fn single_eligible_replica_wins() {
         let set = [0x1];
-        let outcome = elect(
-            &set,
-            0x1,
-            rtt_table(&[]),
-            alive_set(&[0x1]),
-        );
+        let outcome = elect(&set, 0x1, rtt_table(&[]), alive_set(&[0x1]));
         assert_eq!(outcome, ElectionOutcome::SelfWins);
     }
 
     #[test]
     fn empty_replica_set_yields_no_eligible() {
         let set: [NodeId; 0] = [];
-        let outcome = elect(
-            &set,
-            0x1,
-            rtt_table(&[]),
-            alive_set(&[0x1]),
-        );
+        let outcome = elect(&set, 0x1, rtt_table(&[]), alive_set(&[0x1]));
         assert_eq!(outcome, ElectionOutcome::NoEligibleReplica);
     }
 
@@ -203,12 +193,7 @@ mod tests {
         // Self is in the replica set but health says no — election
         // routes to the healthy peer.
         let set = [0x1, 0x2];
-        let outcome = elect(
-            &set,
-            0x1,
-            rtt_table(&[(0x2, 50)]),
-            alive_set(&[0x2]),
-        );
+        let outcome = elect(&set, 0x1, rtt_table(&[(0x2, 50)]), alive_set(&[0x2]));
         assert_eq!(outcome, ElectionOutcome::PeerWins(0x2));
     }
 
@@ -227,12 +212,7 @@ mod tests {
     #[test]
     fn all_unhealthy_yields_no_eligible() {
         let set = [0x1, 0x2, 0x3];
-        let outcome = elect(
-            &set,
-            0x1,
-            rtt_table(&[]),
-            alive_set(&[]),
-        );
+        let outcome = elect(&set, 0x1, rtt_table(&[]), alive_set(&[]));
         assert_eq!(outcome, ElectionOutcome::NoEligibleReplica);
     }
 
@@ -337,20 +317,10 @@ mod tests {
         // Edge case: peer's RTT is artificially measured at zero
         // too. Self still wins iff its NodeId is lex-smaller.
         let set = [0x5, 0x10];
-        let outcome_smaller = elect(
-            &set,
-            0x5,
-            rtt_table(&[(0x10, 0)]),
-            alive_set(&[0x5, 0x10]),
-        );
+        let outcome_smaller = elect(&set, 0x5, rtt_table(&[(0x10, 0)]), alive_set(&[0x5, 0x10]));
         assert_eq!(outcome_smaller, ElectionOutcome::SelfWins);
 
-        let outcome_larger = elect(
-            &set,
-            0x10,
-            rtt_table(&[(0x5, 0)]),
-            alive_set(&[0x5, 0x10]),
-        );
+        let outcome_larger = elect(&set, 0x10, rtt_table(&[(0x5, 0)]), alive_set(&[0x5, 0x10]));
         // Self is 0x10, peer is 0x5; both at RTT 0; lex wins for 0x5.
         assert_eq!(outcome_larger, ElectionOutcome::PeerWins(0x5));
     }

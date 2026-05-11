@@ -202,8 +202,7 @@ pub fn tick(inputs: TickInputs<'_>) -> StepOutcome {
     // Replica (we expect leader heartbeats). A Leader watching
     // its own peers' silence is a different concern (the
     // leader-side lag metric) and doesn't trigger a transition.
-    if inputs.current_role == ReplicaRole::Replica && inputs.tracker.is_leader_silent(inputs.now)
-    {
+    if inputs.current_role == ReplicaRole::Replica && inputs.tracker.is_leader_silent(inputs.now) {
         outcome.transition = Some(PendingTransition {
             target: ReplicaRole::Candidate,
             signal: TransitionSignal::MissedHeartbeats,
@@ -645,12 +644,7 @@ mod tests {
     fn election_no_eligible_yields_no_transition() {
         // Every peer marked unhealthy → no winner → coordinator
         // stays in Candidate until next round.
-        let pt = election_outcome(
-            0x10,
-            &[0x10, 0x20, 0x30],
-            |_| None,
-            |_| false,
-        );
+        let pt = election_outcome(0x10, &[0x10, 0x20, 0x30], |_| None, |_| false);
         assert!(pt.is_none());
     }
 

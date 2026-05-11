@@ -52,9 +52,9 @@ use super::behavior::capability::{
     CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilityRequirement,
     CapabilitySet, ScopeFilter, MAX_CAPABILITY_HOPS,
 };
-use super::behavior::tag::Tag;
 use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
+use super::behavior::tag::Tag;
 use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP};
 use super::channel::{
     AckReason, AuthGuard, AuthVerdict, ChannelConfigRegistry, ChannelId, ChannelName,
@@ -275,9 +275,8 @@ struct DispatchCtx {
     /// Optional replication inbound router. See the matching
     /// field doc on `MeshNode`.
     #[cfg(feature = "redex")]
-    replication_inbound_router: Arc<
-        parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>,
-    >,
+    replication_inbound_router:
+        Arc<parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>>,
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
@@ -1305,9 +1304,8 @@ pub struct MeshNode {
     /// every inbound `SUBPROTOCOL_REDEX` frame; reader-favored
     /// + uncontended reads keep this in single-digit-nanoseconds.
     #[cfg(feature = "redex")]
-    replication_inbound_router: Arc<
-        parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>,
-    >,
+    replication_inbound_router:
+        Arc<parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>>,
     /// Monotonic version counter used when stamping our own
     /// announcements. `CapabilityIndex::index` skips older versions,
     /// so this must move forward across restarts if the caller wants
@@ -4579,9 +4577,8 @@ impl MeshNode {
         router: &dyn super::redex::ReplicationInboundRouter,
     ) {
         use super::redex::{
-            Inbound, SyncHeartbeat, SyncNack, SyncRequest, SyncResponse,
-            DISPATCH_SYNC_HEARTBEAT, DISPATCH_SYNC_NACK, DISPATCH_SYNC_REQUEST,
-            DISPATCH_SYNC_RESPONSE,
+            Inbound, SyncHeartbeat, SyncNack, SyncRequest, SyncResponse, DISPATCH_SYNC_HEARTBEAT,
+            DISPATCH_SYNC_NACK, DISPATCH_SYNC_REQUEST, DISPATCH_SYNC_RESPONSE,
         };
         if payload.len() < 3 {
             return;
@@ -6215,10 +6212,10 @@ impl MeshNode {
                     return false;
                 }
                 match body.as_bytes().get(hex.len()) {
-                    None => true,         // exact match (presence-form)
-                    Some(b':') => true,   // tip-form
-                    Some(b'[') => true,   // range-form
-                    _ => false,           // longer hex; not ours
+                    None => true,       // exact match (presence-form)
+                    Some(b':') => true, // tip-form
+                    Some(b'[') => true, // range-form
+                    _ => false,         // longer hex; not ours
                 }
             }
             _ => false,
@@ -6227,11 +6224,7 @@ impl MeshNode {
 
     /// Strip every `causal:<hex>*` tag for `origin_hash` from
     /// `caps` and insert `replacement` in its place.
-    fn replace_causal_tags(
-        caps: &mut CapabilitySet,
-        origin_hash: u64,
-        replacement: Option<Tag>,
-    ) {
+    fn replace_causal_tags(caps: &mut CapabilitySet, origin_hash: u64, replacement: Option<Tag>) {
         let hex = Self::chain_hex(origin_hash);
         caps.tags.retain(|t| !Self::is_causal_for(t, &hex));
         if let Some(t) = replacement {
@@ -6258,11 +6251,7 @@ impl MeshNode {
     ///
     /// Capability Phase B per `CAPABILITY_SYSTEM_PLAN.md` §B and a
     /// hard prerequisite for `REDEX_DISTRIBUTED_PLAN.md` Phase C/D/E.
-    pub async fn announce_chain(
-        &self,
-        origin_hash: u64,
-        tip_seq: u64,
-    ) -> Result<(), AdapterError> {
+    pub async fn announce_chain(&self, origin_hash: u64, tip_seq: u64) -> Result<(), AdapterError> {
         let hex = Self::chain_hex(origin_hash);
         let replacement = Tag::parse(&format!("causal:{hex}:{tip_seq}")).ok();
         let mut snapshot = self.user_caps_snapshot();
@@ -6289,8 +6278,7 @@ impl MeshNode {
             return Ok(());
         }
         let hex = Self::chain_hex(origin_hash);
-        let replacement =
-            Tag::parse(&format!("causal:{hex}[{start_seq}..{end_seq}]")).ok();
+        let replacement = Tag::parse(&format!("causal:{hex}[{start_seq}..{end_seq}]")).ok();
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_causal_tags(&mut snapshot, origin_hash, replacement);
         self.announce_capabilities(snapshot).await
@@ -9305,11 +9293,11 @@ mod replication_dispatch_tests {
     //! the wire-format dispatch routing (header → variant) without
     //! spinning a real `MeshNode`.
     use super::*;
-    use crate::adapter::net::redex::{
-        Inbound, ReplicationInboundRouter, SyncHeartbeat, SyncNack, SyncNackError,
-        SyncRequest, SyncResponse, DISPATCH_SYNC_NACK,
-    };
     use crate::adapter::net::redex::{ChannelId, ReplicaRole};
+    use crate::adapter::net::redex::{
+        Inbound, ReplicationInboundRouter, SyncHeartbeat, SyncNack, SyncNackError, SyncRequest,
+        SyncResponse, DISPATCH_SYNC_NACK,
+    };
     use parking_lot::Mutex as ParkingMutex;
 
     #[derive(Default)]
@@ -9320,11 +9308,7 @@ mod replication_dispatch_tests {
     }
 
     impl ReplicationInboundRouter for RecorderRouter {
-        fn try_route(
-            &self,
-            channel_id: ChannelId,
-            inbound: Inbound,
-        ) -> Result<(), Inbound> {
+        fn try_route(&self, channel_id: ChannelId, inbound: Inbound) -> Result<(), Inbound> {
             if *self.always_reject.lock() {
                 return Err(inbound);
             }
@@ -9356,7 +9340,10 @@ mod replication_dispatch_tests {
         assert_eq!(got_cid, cid);
         assert!(matches!(
             got_inbound,
-            Inbound::Heartbeat { from: 0xDEAD_BEEF, .. }
+            Inbound::Heartbeat {
+                from: 0xDEAD_BEEF,
+                ..
+            }
         ));
     }
 
@@ -9372,7 +9359,10 @@ mod replication_dispatch_tests {
         let router = RecorderRouter::default();
         MeshNode::dispatch_replication_payload(&payload, 0x12, &router);
         let events = router.events.lock();
-        assert!(matches!(events[0].1, Inbound::SyncRequest { from: 0x12, .. }));
+        assert!(matches!(
+            events[0].1,
+            Inbound::SyncRequest { from: 0x12, .. }
+        ));
     }
 
     #[test]
@@ -9387,7 +9377,10 @@ mod replication_dispatch_tests {
         let router = RecorderRouter::default();
         MeshNode::dispatch_replication_payload(&payload, 0x34, &router);
         let events = router.events.lock();
-        assert!(matches!(events[0].1, Inbound::SyncResponse { from: 0x34, .. }));
+        assert!(matches!(
+            events[0].1,
+            Inbound::SyncResponse { from: 0x34, .. }
+        ));
     }
 
     #[test]
@@ -9487,7 +9480,10 @@ mod chain_helper_tests {
     #[test]
     fn chain_hex_is_lowercase_16_chars() {
         assert_eq!(MeshNode::chain_hex(0), "0000000000000000");
-        assert_eq!(MeshNode::chain_hex(0xDEAD_BEEF_CAFE_BABE), "deadbeefcafebabe");
+        assert_eq!(
+            MeshNode::chain_hex(0xDEAD_BEEF_CAFE_BABE),
+            "deadbeefcafebabe"
+        );
         assert_eq!(MeshNode::chain_hex(u64::MAX), "ffffffffffffffff");
         // Pin the 16-char width — wire-format drift would surface
         // here.
@@ -9584,8 +9580,7 @@ mod chain_helper_tests {
         let other_hex = MeshNode::chain_hex(0x43);
         caps.tags.insert(causal_tag(&our_hex));
         caps.tags.insert(causal_tag(format!("{our_hex}:50")));
-        caps.tags
-            .insert(causal_tag(format!("{our_hex}[10..20]")));
+        caps.tags.insert(causal_tag(format!("{our_hex}[10..20]")));
         caps.tags.insert(causal_tag(&other_hex));
         caps.tags.insert(Tag::parse("hardware.gpu").unwrap());
 
@@ -9605,11 +9600,14 @@ mod chain_helper_tests {
             .count();
         assert_eq!(our_count, 0, "every variant for our hash must be stripped");
         assert_eq!(other_count, 1, "other chain's tag must survive");
-        assert!(caps.tags.iter().any(|t| matches!(t,
-            Tag::AxisPresent { axis, key }
-                if axis == &crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware
-                    && key == "gpu"
-        )), "non-causal tag must survive");
+        assert!(
+            caps.tags.iter().any(|t| matches!(t,
+                Tag::AxisPresent { axis, key }
+                    if axis == &crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware
+                        && key == "gpu"
+            )),
+            "non-causal tag must survive"
+        );
     }
 
     #[test]

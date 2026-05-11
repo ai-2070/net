@@ -274,9 +274,7 @@ impl ReplicationConfig {
             // node that won't even run a replica.
             if let Some(leader) = self.leader_pinned {
                 if !nodes.contains(&leader) {
-                    return Err(ReplicationConfigError::LeaderPinnedOutsidePinnedSet {
-                        leader,
-                    });
+                    return Err(ReplicationConfigError::LeaderPinnedOutsidePinnedSet { leader });
                 }
             }
         }
@@ -345,9 +343,7 @@ pub enum ReplicationConfigError {
     /// `leader_pinned` names a node that isn't in the pinned set —
     /// the operator pinned a leader on a node that won't even run a
     /// replica.
-    #[error(
-        "leader_pinned {leader:#x} is not in the PlacementStrategy::Pinned set"
-    )]
+    #[error("leader_pinned {leader:#x} is not in the PlacementStrategy::Pinned set")]
     LeaderPinnedOutsidePinnedSet {
         /// The leader `NodeId` that lies outside the pinned set.
         leader: NodeId,
@@ -494,7 +490,8 @@ mod tests {
         // specific node while replicas spread via the standard
         // filter. Plan §10 calls this out as a supported topology.
         let cfg = ReplicationConfig::new().with_leader_pinned(Some(0x1234_5678));
-        cfg.validate().expect("standard + leader_pinned must validate");
+        cfg.validate()
+            .expect("standard + leader_pinned must validate");
     }
 
     #[test]

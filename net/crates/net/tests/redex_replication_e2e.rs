@@ -17,8 +17,7 @@ use std::time::Duration;
 
 use net::adapter::net::channel::ChannelName;
 use net::adapter::net::redex::{
-    PlacementStrategy, Redex, RedexFileConfig, ReplicaRole, ReplicationConfig,
-    TransitionSignal,
+    PlacementStrategy, Redex, RedexFileConfig, ReplicaRole, ReplicationConfig, TransitionSignal,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
@@ -116,12 +115,8 @@ async fn two_node_replication_catches_replica_up() {
 
     // Drive roles. Coordinator starts in Idle on both sides.
     // A becomes Leader; B becomes Replica.
-    let coord_a = redex_a
-        .replication_coordinator_for(&name)
-        .expect("coord A");
-    let coord_b = redex_b
-        .replication_coordinator_for(&name)
-        .expect("coord B");
+    let coord_a = redex_a.replication_coordinator_for(&name).expect("coord A");
+    let coord_b = redex_b.replication_coordinator_for(&name).expect("coord B");
     // State-machine path Idle → Replica → Candidate → Leader.
     coord_a
         .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
@@ -508,7 +503,11 @@ fn median(mut xs: Vec<Duration>) -> Duration {
 
 /// Append `n` events of `payload_size` bytes; return the elapsed
 /// wall-clock time. Caller decides how to aggregate across trials.
-fn time_appends(file: &net::adapter::net::redex::RedexFile, n: u64, payload_size: usize) -> Duration {
+fn time_appends(
+    file: &net::adapter::net::redex::RedexFile,
+    n: u64,
+    payload_size: usize,
+) -> Duration {
     let payload = vec![0x42u8; payload_size];
     let start = std::time::Instant::now();
     for _ in 0..n {

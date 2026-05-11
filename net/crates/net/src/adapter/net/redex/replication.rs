@@ -392,11 +392,7 @@ impl SyncResponse {
         // is the wire-format width, so we can't honestly encode
         // more than `u32::MAX` events anyway, and on 32-bit hosts
         // the multiplication below would overflow `usize` otherwise.
-        let events_size: usize = self
-            .events
-            .iter()
-            .map(|e| 8 + 4 + e.payload.len())
-            .sum();
+        let events_size: usize = self.events.iter().map(|e| 8 + 4 + e.payload.len()).sum();
         let mut buf = Vec::with_capacity(3 + 32 + 8 + 4 + events_size);
         put_header(&mut buf, DISPATCH_SYNC_RESPONSE);
         buf.put_slice(self.channel_id.as_bytes());
@@ -561,8 +557,9 @@ impl SyncNack {
             });
         }
         let detail_bytes = &cursor[..detail_len];
-        let detail =
-            std::str::from_utf8(detail_bytes).map_err(|_| WireError::InvalidUtf8)?.to_string();
+        let detail = std::str::from_utf8(detail_bytes)
+            .map_err(|_| WireError::InvalidUtf8)?
+            .to_string();
         Ok(Self {
             channel_id,
             since_seq,
@@ -628,7 +625,10 @@ mod tests {
         // 0x0E, 0x00, 0x20 = subprotocol header + dispatch code
         assert_eq!(&bytes[..3], &[0x00, 0x0E, 0x20]);
         assert_eq!(&bytes[3..35], &[0xAB; 32]);
-        assert_eq!(&bytes[35..43], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(
+            &bytes[35..43],
+            &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+        );
         assert_eq!(&bytes[43..47], &[0x44, 0x33, 0x22, 0x11]);
     }
 
@@ -656,7 +656,10 @@ mod tests {
         bytes[0] = 0x00;
         bytes[1] = 0x05; // SUBPROTOCOL_MIGRATION
         let err = SyncRequest::from_bytes(&bytes).expect_err("must reject");
-        assert!(matches!(err, WireError::SubprotocolMismatch { got: 0x0500 }));
+        assert!(matches!(
+            err,
+            WireError::SubprotocolMismatch { got: 0x0500 }
+        ));
     }
 
     #[test]

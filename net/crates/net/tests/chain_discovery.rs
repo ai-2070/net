@@ -208,7 +208,11 @@ async fn find_chain_holders_returns_self_first() {
 
     let holders = n.find_chain_holders(origin_hash);
     assert!(!holders.is_empty());
-    assert_eq!(holders[0], n.node_id(), "self must be first in the holders list");
+    assert_eq!(
+        holders[0],
+        n.node_id(),
+        "self must be first in the holders list"
+    );
 }
 
 #[tokio::test]

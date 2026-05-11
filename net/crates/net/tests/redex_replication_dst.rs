@@ -239,10 +239,7 @@ impl VirtualCluster {
 
     /// Drive `id` to `Replica`.
     fn force_replica(&mut self, id: NodeId) {
-        let n = self
-            .nodes
-            .get_mut(&id)
-            .expect("force_replica: unknown id");
+        let n = self.nodes.get_mut(&id).expect("force_replica: unknown id");
         n.force_transition(ReplicaRole::Replica, TransitionSignal::CapabilitySelected);
     }
 
@@ -320,7 +317,8 @@ impl VirtualCluster {
         for msg in outcome.outbound {
             match msg {
                 OutboundMessage::Heartbeat { target, msg } => {
-                    self.pending.push_back((id, target, Inbound::Heartbeat { from: id, msg }));
+                    self.pending
+                        .push_back((id, target, Inbound::Heartbeat { from: id, msg }));
                 }
                 OutboundMessage::SyncRequest { target, msg } => {
                     self.pending
@@ -429,7 +427,10 @@ impl VirtualCluster {
                         self.pending.push_back((
                             id,
                             from,
-                            Inbound::SyncResponse { from: id, msg: resp },
+                            Inbound::SyncResponse {
+                                from: id,
+                                msg: resp,
+                            },
                         ));
                     }
                     SyncRequestOutcome::Nack { error_code, detail } => {
@@ -439,8 +440,14 @@ impl VirtualCluster {
                             error_code,
                             detail,
                         };
-                        self.pending
-                            .push_back((id, from, Inbound::SyncNack { from: id, msg: nack }));
+                        self.pending.push_back((
+                            id,
+                            from,
+                            Inbound::SyncNack {
+                                from: id,
+                                msg: nack,
+                            },
+                        ));
                     }
                 }
             }
@@ -633,9 +640,7 @@ fn leader_crash_two_node_failover_converges_on_lone_survivor() {
     // B detects A silent → enters Candidate → elects (A is
     // unhealthy, only B in candidate set) → becomes Leader.
     let steps = cluster.run_until(
-        |c| {
-            c.nodes.get(&b).map(|n| n.role).unwrap_or(ReplicaRole::Idle) == ReplicaRole::Leader
-        },
+        |c| c.nodes.get(&b).map(|n| n.role).unwrap_or(ReplicaRole::Idle) == ReplicaRole::Leader,
         "leader_crash_failover_2node",
     );
     assert!(steps < STEP_BUDGET, "failover converged in {steps} steps");
@@ -738,9 +743,7 @@ fn asymmetric_rtt_failover_converges_when_one_peer_clearly_central() {
     // Override the default 5ms symmetric matrix. Make B the
     // "central" surviving peer: C observes B at 0 RTT (clearly
     // closer than any other survivor); B observes C at non-zero.
-    cluster
-        .rtt
-        .insert((b.min(c), b.max(c)), Duration::ZERO);
+    cluster.rtt.insert((b.min(c), b.max(c)), Duration::ZERO);
 
     for _ in 0..5 {
         cluster.step();
@@ -883,9 +886,7 @@ fn divergence_freedom_no_two_replicas_hold_different_payload_at_same_seq() {
             "replica {replica_id:#x} has {} events; leader has 24",
             events.len(),
         );
-        for (i, (leader_ev, replica_ev)) in
-            leader_events.iter().zip(events.iter()).enumerate()
-        {
+        for (i, (leader_ev, replica_ev)) in leader_events.iter().zip(events.iter()).enumerate() {
             assert_eq!(
                 leader_ev.entry.seq, replica_ev.entry.seq,
                 "replica {replica_id:#x} event {i}: seq mismatch"

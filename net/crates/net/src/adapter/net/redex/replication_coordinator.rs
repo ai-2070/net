@@ -56,11 +56,7 @@ pub trait ChainTagSink: Send + Sync {
     /// Advertise this node holds `origin_hash` up to `tip_seq`.
     /// Idempotent — repeated calls with the same `origin_hash`
     /// replace the prior advertisement.
-    async fn announce_chain(
-        &self,
-        origin_hash: u64,
-        tip_seq: u64,
-    ) -> Result<(), AdapterError>;
+    async fn announce_chain(&self, origin_hash: u64, tip_seq: u64) -> Result<(), AdapterError>;
 
     /// Withdraw every advertisement for `origin_hash`.
     /// Idempotent.
@@ -73,11 +69,7 @@ pub trait ChainTagSink: Send + Sync {
 /// wired in.
 #[async_trait::async_trait]
 impl ChainTagSink for MeshNode {
-    async fn announce_chain(
-        &self,
-        origin_hash: u64,
-        tip_seq: u64,
-    ) -> Result<(), AdapterError> {
+    async fn announce_chain(&self, origin_hash: u64, tip_seq: u64) -> Result<(), AdapterError> {
         MeshNode::announce_chain(self, origin_hash, tip_seq).await
     }
 
@@ -341,11 +333,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChainTagSink for RecorderSink {
-        async fn announce_chain(
-            &self,
-            origin_hash: u64,
-            tip_seq: u64,
-        ) -> Result<(), AdapterError> {
+        async fn announce_chain(&self, origin_hash: u64, tip_seq: u64) -> Result<(), AdapterError> {
             if let Some(err) = self.fail_next.lock().take() {
                 return Err(err);
             }
@@ -360,14 +348,16 @@ mod tests {
             if let Some(err) = self.fail_next.lock().take() {
                 return Err(err);
             }
-            self.calls
-                .lock()
-                .push(SinkCall::Withdraw { origin_hash });
+            self.calls.lock().push(SinkCall::Withdraw { origin_hash });
             Ok(())
         }
     }
 
-    fn build_coordinator() -> (Arc<RecorderSink>, ReplicationMetricsRegistry, ReplicationCoordinator) {
+    fn build_coordinator() -> (
+        Arc<RecorderSink>,
+        ReplicationMetricsRegistry,
+        ReplicationCoordinator,
+    ) {
         let sink = Arc::new(RecorderSink::default());
         let registry = ReplicationMetricsRegistry::new();
         let coordinator = ReplicationCoordinator::new(
@@ -425,14 +415,8 @@ mod tests {
         // Leader entry. Candidate is transient — no announce.
         let calls = sink.calls();
         assert_eq!(calls.len(), 2);
-        assert!(matches!(
-            calls[0],
-            SinkCall::Announce { tip_seq: 0, .. }
-        ));
-        assert!(matches!(
-            calls[1],
-            SinkCall::Announce { tip_seq: 999, .. }
-        ));
+        assert!(matches!(calls[0], SinkCall::Announce { tip_seq: 0, .. }));
+        assert!(matches!(calls[1], SinkCall::Announce { tip_seq: 999, .. }));
     }
 
     #[tokio::test]

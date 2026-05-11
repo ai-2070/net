@@ -55,32 +55,32 @@ pub use replication::{
     DISPATCH_SYNC_HEARTBEAT, DISPATCH_SYNC_NACK, DISPATCH_SYNC_REQUEST, DISPATCH_SYNC_RESPONSE,
     SUBPROTOCOL_REDEX, SYNC_HEARTBEAT_SIZE, SYNC_NACK_DETAIL_MAX, SYNC_REQUEST_SIZE,
 };
-pub use replication_config::{
-    PlacementStrategy, ReplicationConfig, ReplicationConfigError, UnderCapacity,
-    HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MIN, REPLICATION_BUDGET_FRACTION_DEFAULT,
-    REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX, REPLICATION_FACTOR_MIN,
-};
 pub use replication_budget::BandwidthBudget;
 pub use replication_catchup::{
     apply_sync_response, handle_sync_request, ApplyError, SyncRequestOutcome,
     CHUNK_MAX_HARD_CEILING_BYTES,
+};
+pub use replication_config::{
+    PlacementStrategy, ReplicationConfig, ReplicationConfigError, UnderCapacity,
+    HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MIN, REPLICATION_BUDGET_FRACTION_DEFAULT,
+    REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX, REPLICATION_FACTOR_MIN,
 };
 pub use replication_coordinator::{
     ChainTagSink, ChannelIdentity, CoordinatorError, ReplicationCoordinator,
 };
 pub use replication_election::{elect, ElectionOutcome};
 pub use replication_heartbeat::{HeartbeatTracker, PeerState, DEFAULT_MISS_THRESHOLD};
+pub use replication_metrics::{
+    ChannelMetrics, ChannelMetricsAtomic, ReplicationMetricsRegistry, ReplicationMetricsSnapshot,
+    MAX_TRACKED_CHANNELS, OVERFLOW_CHANNEL_LABEL,
+};
 pub use replication_router::RedexReplicationRouter;
 pub use replication_runtime::{
     spawn_replication_runtime, Inbound, ReplicationDispatcher, ReplicationInboundRouter,
     ReplicationRuntimeHandle, RttLookup, RuntimeInputs, RUNTIME_INBOX_CAPACITY,
 };
+pub use replication_state::{StateTransition, StateTransitionError, TransitionSignal};
 pub use replication_step::{
     election_outcome, tick, OutboundMessage, PendingTransition, StepOutcome, TickInputs,
 };
-pub use replication_metrics::{
-    ChannelMetrics, ChannelMetricsAtomic, ReplicationMetricsRegistry,
-    ReplicationMetricsSnapshot, MAX_TRACKED_CHANNELS, OVERFLOW_CHANNEL_LABEL,
-};
-pub use replication_state::{StateTransition, StateTransitionError, TransitionSignal};
 pub use typed::TypedRedexFile;

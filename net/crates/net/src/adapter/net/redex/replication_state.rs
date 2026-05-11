@@ -254,9 +254,7 @@ mod tests {
             ReplicaRole::Idle,
         ] {
             StateTransition::apply(from, ReplicaRole::Idle, TransitionSignal::ChannelClose)
-                .unwrap_or_else(|_| {
-                    panic!("ChannelClose must drive {from:?} → Idle")
-                });
+                .unwrap_or_else(|_| panic!("ChannelClose must drive {from:?} → Idle"));
         }
     }
 

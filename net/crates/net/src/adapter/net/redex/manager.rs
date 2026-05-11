@@ -305,13 +305,11 @@ impl Redex {
         // build the file or attempt to spawn a runtime. An invalid
         // config can't escape into the coordinator's hot loop.
         if let Some(rep) = config.replication.as_ref() {
-            rep.validate().map_err(|e| {
-                RedexError::Channel(format!("replication config invalid: {e}"))
-            })?;
+            rep.validate()
+                .map_err(|e| RedexError::Channel(format!("replication config invalid: {e}")))?;
             if self.replication.read().is_none() {
                 return Err(RedexError::Channel(
-                    "RedexFileConfig::replication requires Redex::enable_replication(mesh)"
-                        .into(),
+                    "RedexFileConfig::replication requires Redex::enable_replication(mesh)".into(),
                 ));
             }
         }
@@ -416,8 +414,8 @@ impl Redex {
 
         let self_node_id = wiring.mesh.node_id();
         let proximity = wiring.mesh.proximity_graph().clone();
-        let rtt_lookup: super::replication_runtime::RttLookup =
-            Arc::new(move |node: crate::adapter::net::behavior::placement::NodeId| {
+        let rtt_lookup: super::replication_runtime::RttLookup = Arc::new(
+            move |node: crate::adapter::net::behavior::placement::NodeId| {
                 if node == self_node_id {
                     Some(std::time::Duration::ZERO)
                 } else {
@@ -428,7 +426,8 @@ impl Redex {
                     graph_id[0..8].copy_from_slice(&node.to_le_bytes());
                     proximity.nearest_rtt(|n| n.node_id == graph_id)
                 }
-            });
+            },
+        );
 
         let file_clone = file.clone();
         let tail_provider: Arc<dyn Fn() -> u64 + Send + Sync> =
@@ -511,8 +510,7 @@ impl Redex {
         if let Some(wiring) = self.replication.read().as_ref().cloned() {
             let channel_id = ChannelId::from_name(name);
             if let Some(handle) = wiring.router.unregister(&channel_id) {
-                let _ =
-                    handle.try_dispatch(super::replication_runtime::Inbound::Shutdown);
+                let _ = handle.try_dispatch(super::replication_runtime::Inbound::Shutdown);
             }
         }
         if let Some((_, file)) = self.files.remove(name) {
@@ -726,8 +724,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_with_replication_without_enable_returns_error() {
         let r = Redex::new();
-        let cfg = RedexFileConfig::default()
-            .with_replication(Some(ReplicationConfig::new()));
+        let cfg = RedexFileConfig::default().with_replication(Some(ReplicationConfig::new()));
         let err = r.open_file(&cn("repl/test"), cfg).unwrap_err();
         assert!(matches!(err, RedexError::Channel(_)));
         assert_eq!(r.replication_runtime_count(), 0);
@@ -739,9 +736,8 @@ mod tests {
         let r = Redex::new();
         r.enable_replication(mesh);
         let name = cn("repl/spawn");
-        let cfg = RedexFileConfig::default().with_replication(Some(
-            ReplicationConfig::new().with_heartbeat_ms(60_000),
-        ));
+        let cfg = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
         let _file = r.open_file(&name, cfg).expect("open_file with replication");
         assert_eq!(r.replication_runtime_count(), 1);
         r.close_file(&name).unwrap();
@@ -768,9 +764,8 @@ mod tests {
         let r = Redex::new();
         r.enable_replication(mesh);
         // factor=0 violates REPLICATION_FACTOR_MIN.
-        let cfg = RedexFileConfig::default().with_replication(Some(
-            ReplicationConfig::new().with_factor(0),
-        ));
+        let cfg = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_factor(0)));
         let err = r.open_file(&cn("repl/bad"), cfg).unwrap_err();
         match err {
             RedexError::Channel(msg) => {
@@ -787,17 +782,15 @@ mod tests {
         let r = Redex::new();
         r.enable_replication(mesh);
         let name = cn("repl/reopen");
-        let cfg1 = RedexFileConfig::default().with_replication(Some(
-            ReplicationConfig::new().with_heartbeat_ms(60_000),
-        ));
+        let cfg1 = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
         let _f1 = r.open_file(&name, cfg1).unwrap();
         assert_eq!(r.replication_runtime_count(), 1);
         // Second open returns the existing file (re-open path) and
         // does NOT spawn a second runtime — the replication slot
         // is only honored on first open per the open_file contract.
-        let cfg2 = RedexFileConfig::default().with_replication(Some(
-            ReplicationConfig::new().with_heartbeat_ms(60_000),
-        ));
+        let cfg2 = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
         let _f2 = r.open_file(&name, cfg2).unwrap();
         assert_eq!(
             r.replication_runtime_count(),
@@ -819,9 +812,8 @@ mod tests {
         r.enable_replication(mesh);
         let name_a = cn("repl/status_a");
         let name_b = cn("repl/status_b");
-        let cfg = RedexFileConfig::default().with_replication(Some(
-            ReplicationConfig::new().with_heartbeat_ms(60_000),
-        ));
+        let cfg = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
         let file_a = r.open_file(&name_a, cfg.clone()).expect("open A");
         r.open_file(&name_b, cfg).expect("open B");
 
@@ -878,9 +870,8 @@ mod tests {
             let r = Redex::new();
             r.enable_replication(mesh.clone());
             let name = cn("repl/drop");
-            let cfg = RedexFileConfig::default().with_replication(Some(
-                ReplicationConfig::new().with_heartbeat_ms(60_000),
-            ));
+            let cfg = RedexFileConfig::default()
+                .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
             r.open_file(&name, cfg).expect("open");
             assert_eq!(r.replication_runtime_count(), 1);
             // `r` goes out of scope here; Drop fires.
@@ -909,9 +900,8 @@ mod tests {
         let r = Redex::new();
         r.enable_replication(mesh);
         let name = cn("repl/metrics");
-        let cfg = RedexFileConfig::default().with_replication(Some(
-            ReplicationConfig::new().with_heartbeat_ms(60_000),
-        ));
+        let cfg = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
         let _file = r.open_file(&name, cfg).expect("open");
 
         let snap = r

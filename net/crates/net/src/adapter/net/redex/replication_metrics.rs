@@ -239,9 +239,7 @@ impl ReplicationMetricsRegistry {
                 under_capacity_total: m.under_capacity_total.load(Ordering::Relaxed),
                 skip_ahead_total: m.skip_ahead_total.load(Ordering::Relaxed),
                 election_thrash_total: m.election_thrash_total.load(Ordering::Relaxed),
-                witness_withdrawals_total: m
-                    .witness_withdrawals_total
-                    .load(Ordering::Relaxed),
+                witness_withdrawals_total: m.witness_withdrawals_total.load(Ordering::Relaxed),
             });
         }
         // Stable order — the snapshot's serialized form (and
@@ -594,8 +592,7 @@ mod tests {
     fn previously_seen_channel_skips_overflow_after_cap() {
         let reg = ReplicationMetricsRegistry::new();
         // Pre-seed a channel before filling.
-        reg.for_channel("known")
-            .incr_leader_change();
+        reg.for_channel("known").incr_leader_change();
         for i in 0..MAX_TRACKED_CHANNELS - 1 {
             reg.for_channel(&format!("channel-{i}"));
         }
@@ -643,7 +640,9 @@ mod tests {
         // Channel label is present + value lines match the recorded
         // counters.
         assert!(text.contains("channel=\"payments/settlements\""));
-        assert!(text.contains("dataforts_replication_sync_bytes_total{channel=\"payments/settlements\"} 2048"));
+        assert!(text.contains(
+            "dataforts_replication_sync_bytes_total{channel=\"payments/settlements\"} 2048"
+        ));
         assert!(text.contains("dataforts_leader_changes_total{channel=\"payments/settlements\"} 2"));
 
         // Lag gauge carries both roles when both are observed.
@@ -680,8 +679,10 @@ mod tests {
             .incr_leader_change();
         let text = reg.snapshot().prometheus_text();
         // Both `"` and `\` must be escaped.
-        assert!(text.contains(r#"channel=\"weird/name\\\"with\\\"quotes\\\\and\\\\slashes\""#)
-            || text.contains(r#"channel="weird/name\"with\"quotes\\and\\slashes""#));
+        assert!(
+            text.contains(r#"channel=\"weird/name\\\"with\\\"quotes\\\\and\\\\slashes\""#)
+                || text.contains(r#"channel="weird/name\"with\"quotes\\and\\slashes""#)
+        );
     }
 
     #[test]
