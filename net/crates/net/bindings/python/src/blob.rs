@@ -247,17 +247,27 @@ pub fn blob_resolve<'py>(
 // Python-implemented BlobAdapter wrapper
 // =========================================================================
 
-/// `BlobAdapter` impl that bridges to a Python object holding sync
+/// `BlobAdapter` impl that bridges to a Python object holding
 /// `store` / `fetch` / `fetch_range` / `exists` methods. Each call
 /// crosses the FFI via `spawn_blocking` + `Python::attach` so the
 /// tokio worker thread isn't pinned during Python execution.
 ///
-/// The Python adapter MUST implement:
+/// **Both sync and `async def` Python methods are supported.** The
+/// bridge inspects the return value via `inspect.iscoroutine`:
+/// - non-coroutine return → use as-is.
+/// - coroutine return → drive to completion via `asyncio.run`.
+///
+/// This lets adapters that do real I/O (e.g. boto3 / aiobotocore,
+/// httpx) live as `async def` methods, while in-memory mock
+/// adapters can stay plain sync.
+///
+/// The Python adapter MUST implement (sync OR async — pick one
+/// shape per method, mixing is fine across methods):
 /// ```python
 /// class MyAdapter:
-///     def store(self, blob_ref: BlobRef, data: bytes) -> None: ...
-///     def fetch(self, blob_ref: BlobRef) -> bytes: ...
-///     def fetch_range(self, blob_ref: BlobRef, start: int, end: int) -> bytes: ...
+///     async def store(self, blob_ref: BlobRef, data: bytes) -> None: ...
+///     async def fetch(self, blob_ref: BlobRef) -> bytes: ...
+///     async def fetch_range(self, blob_ref: BlobRef, start: int, end: int) -> bytes: ...
 ///     def exists(self, blob_ref: BlobRef) -> bool: ...
 /// ```
 ///
@@ -284,6 +294,32 @@ fn pyerr_to_backend(label: &str, err: PyErr) -> InnerBlobError {
     InnerBlobError::Backend(format!("{}: {}", label, err))
 }
 
+/// If `value` is an awaitable / coroutine, drive it via
+/// `asyncio.run` and return the resolved value; otherwise return
+/// it unchanged. Caller holds the GIL.
+fn drive_if_coroutine<'py>(
+    py: Python<'py>,
+    value: Bound<'py, PyAny>,
+    label: &str,
+) -> std::result::Result<Bound<'py, PyAny>, InnerBlobError> {
+    let inspect = py
+        .import("inspect")
+        .map_err(|e| pyerr_to_backend(label, e))?;
+    let is_coro: bool = inspect
+        .call_method1("iscoroutine", (&value,))
+        .and_then(|r| r.extract::<bool>())
+        .map_err(|e| pyerr_to_backend(label, e))?;
+    if !is_coro {
+        return Ok(value);
+    }
+    let asyncio = py
+        .import("asyncio")
+        .map_err(|e| pyerr_to_backend(label, e))?;
+    asyncio
+        .call_method1("run", (value,))
+        .map_err(|e| pyerr_to_backend(label, e))
+}
+
 #[async_trait]
 impl BlobAdapter for PyBlobAdapter {
     fn adapter_id(&self) -> &str {
@@ -298,10 +334,12 @@ impl BlobAdapter for PyBlobAdapter {
             Python::attach(|py| {
                 let py_blob = PyBlobRef { inner: blob };
                 let py_data = PyBytes::new(py, &data);
-                obj.bind(py)
+                let ret = obj
+                    .bind(py)
                     .call_method1("store", (py_blob, py_data))
-                    .map(|_| ())
-                    .map_err(|e| pyerr_to_backend("store", e))
+                    .map_err(|e| pyerr_to_backend("store", e))?;
+                let _ = drive_if_coroutine(py, ret, "store")?;
+                Ok(())
             })
         })
         .await
@@ -318,7 +356,8 @@ impl BlobAdapter for PyBlobAdapter {
                     .bind(py)
                     .call_method1("fetch", (py_blob,))
                     .map_err(|e| pyerr_to_backend("fetch", e))?;
-                let bytes: Vec<u8> = ret
+                let resolved = drive_if_coroutine(py, ret, "fetch")?;
+                let bytes: Vec<u8> = resolved
                     .extract()
                     .map_err(|e| pyerr_to_backend("fetch return", e))?;
                 Ok(bytes)
@@ -344,7 +383,8 @@ impl BlobAdapter for PyBlobAdapter {
                     .bind(py)
                     .call_method1("fetch_range", (py_blob, start, end))
                     .map_err(|e| pyerr_to_backend("fetch_range", e))?;
-                let bytes: Vec<u8> = ret
+                let resolved = drive_if_coroutine(py, ret, "fetch_range")?;
+                let bytes: Vec<u8> = resolved
                     .extract()
                     .map_err(|e| pyerr_to_backend("fetch_range return", e))?;
                 Ok(bytes)
@@ -364,7 +404,8 @@ impl BlobAdapter for PyBlobAdapter {
                     .bind(py)
                     .call_method1("exists", (py_blob,))
                     .map_err(|e| pyerr_to_backend("exists", e))?;
-                let flag: bool = ret
+                let resolved = drive_if_coroutine(py, ret, "exists")?;
+                let flag: bool = resolved
                     .extract()
                     .map_err(|e| pyerr_to_backend("exists return", e))?;
                 Ok(flag)
