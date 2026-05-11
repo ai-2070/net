@@ -381,6 +381,155 @@ impl PyRedex {
     fn replication_prometheus_text(&self) -> String {
         self.inner.replication_prometheus_text()
     }
+
+    /// Install greedy-LRU dataforts wiring rooted at `mesh`. The
+    /// runtime opens per-channel cache files against this Redex
+    /// and announces chains via the mesh's `ChainTagSink` impl.
+    ///
+    /// Locked defaults from `DATAFORTS_PLAN.md` § Phase 1: 100 MiB
+    /// per channel, 10 GiB total, 0.25 NIC fraction,
+    /// `AnyOfLocalCapabilities` intent, `SoftPreference`
+    /// colocation, 200 ms proximity. Override via the kwargs.
+    ///
+    /// Idempotent — a second call with greedy already enabled is
+    /// a no-op (use `disable_greedy_dataforts` + re-enable to
+    /// reconfigure).
+    ///
+    /// Raises `RedexError` on invalid config (range violations on
+    /// caps, bandwidth fraction, proximity).
+    #[cfg(all(feature = "net", feature = "dataforts-greedy"))]
+    #[pyo3(signature = (
+        mesh,
+        *,
+        scopes = None,
+        proximity_max_rtt_ms = None,
+        per_channel_cap_bytes = None,
+        total_cap_bytes = None,
+        bandwidth_budget_fraction = None,
+        intent_match = None,
+        colocation_policy = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn enable_greedy_dataforts(
+        &self,
+        mesh: &crate::mesh_bindings::NetMesh,
+        scopes: Option<Vec<String>>,
+        proximity_max_rtt_ms: Option<u64>,
+        per_channel_cap_bytes: Option<u64>,
+        total_cap_bytes: Option<u64>,
+        bandwidth_budget_fraction: Option<f64>,
+        intent_match: Option<String>,
+        colocation_policy: Option<String>,
+    ) -> PyResult<()> {
+        use net::adapter::net::dataforts::{
+            ColocationPolicy, GreedyConfig, IntentMatchPolicy, ScopeLabel,
+        };
+        let mut cfg = GreedyConfig::new();
+        if let Some(s) = scopes {
+            cfg = cfg.with_scopes(s.into_iter().map(ScopeLabel::new).collect());
+        }
+        if let Some(ms) = proximity_max_rtt_ms {
+            cfg = cfg.with_proximity_max_rtt(std::time::Duration::from_millis(ms));
+        }
+        if let Some(bytes) = per_channel_cap_bytes {
+            cfg = cfg.with_per_channel_cap_bytes(bytes);
+        }
+        if let Some(bytes) = total_cap_bytes {
+            cfg = cfg.with_total_cap_bytes(bytes);
+        }
+        if let Some(f) = bandwidth_budget_fraction {
+            cfg = cfg.with_bandwidth_budget_fraction(f as f32);
+        }
+        if let Some(policy) = intent_match {
+            let parsed = match policy.as_str() {
+                "disabled" => IntentMatchPolicy::Disabled,
+                "any_of_local_capabilities" => IntentMatchPolicy::AnyOfLocalCapabilities,
+                "strict" => IntentMatchPolicy::Strict,
+                other => {
+                    return Err(RedexError::new_err(format!(
+                        "greedy intent_match {other:?} unknown (expected disabled, any_of_local_capabilities, strict)"
+                    )))
+                }
+            };
+            cfg = cfg.with_intent_match(parsed);
+        }
+        if let Some(policy) = colocation_policy {
+            let parsed = match policy.as_str() {
+                "ignore" => ColocationPolicy::Ignore,
+                "soft_preference" => ColocationPolicy::SoftPreference,
+                "strict_required" => ColocationPolicy::StrictRequired,
+                other => {
+                    return Err(RedexError::new_err(format!(
+                        "greedy colocation_policy {other:?} unknown (expected ignore, soft_preference, strict_required)"
+                    )))
+                }
+            };
+            cfg = cfg.with_colocation_policy(parsed);
+        }
+        let arc = mesh.node_arc_clone()?;
+        // Local-caps + intent-registry default to empty / substrate
+        // defaults respectively. Application code refreshes via
+        // `greedy_set_local_caps` and `greedy_register_intent`
+        // when fuller surfaces land.
+        let local_caps = std::sync::Arc::new(
+            net::adapter::net::behavior::capability::CapabilitySet::default(),
+        );
+        let registry =
+            net::adapter::net::behavior::placement::IntentRegistry::defaults();
+        self.inner
+            .enable_greedy_dataforts(arc, cfg, local_caps, registry)
+            .map_err(|e| RedexError::new_err(format!("greedy config invalid: {}", e)))
+    }
+
+    /// `cfg(not net)` stub. Mirrors the
+    /// `enable_replication` cross-feature surface so the same
+    /// call site doesn't TypeError before the feature-required
+    /// message surfaces.
+    #[cfg(not(all(feature = "net", feature = "dataforts-greedy")))]
+    #[pyo3(signature = (_mesh = None, **_kwargs))]
+    fn enable_greedy_dataforts(
+        &self,
+        _mesh: Option<Py<PyAny>>,
+        _kwargs: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        Err(RedexError::new_err(
+            "redex: enable_greedy_dataforts requires the `dataforts-greedy` feature; \
+             rebuild with --features dataforts-greedy",
+        ))
+    }
+
+    /// Un-install the greedy wiring. Idempotent — no-op when
+    /// greedy isn't enabled.
+    #[cfg(feature = "dataforts-greedy")]
+    fn disable_greedy_dataforts(&self) {
+        self.inner.disable_greedy_dataforts();
+    }
+
+    /// Number of channels currently in the greedy cache. `0` when
+    /// greedy isn't enabled.
+    #[cfg(feature = "dataforts-greedy")]
+    fn greedy_cached_channel_count(&self) -> u32 {
+        self.inner
+            .greedy_runtime()
+            .map(|r| r.cached_channel_count() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Render the greedy metrics as Prometheus text. Returns the
+    /// empty string when greedy isn't enabled.
+    ///
+    /// Covers per-channel `dataforts_greedy_cache_hits_total`,
+    /// `_serve_count_total`, `_evictions_total`,
+    /// `_bytes_resident`, plus the cluster-wide
+    /// `_admit_rejected_total{reason=...}` and
+    /// `_io_budget_used_bytes`.
+    #[cfg(feature = "dataforts-greedy")]
+    fn greedy_prometheus_text(&self) -> String {
+        self.inner
+            .greedy_runtime()
+            .map(|r| r.metrics().snapshot().prometheus_text())
+            .unwrap_or_default()
+    }
 }
 
 fn build_replication_config(
