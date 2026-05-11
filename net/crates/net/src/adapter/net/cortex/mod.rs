@@ -31,7 +31,7 @@ pub mod memories;
 #[cfg(feature = "cortex")]
 pub mod tasks;
 
-pub use adapter::{ChangeEvent, CortexAdapter, WaitForTokenError};
+pub use adapter::{ChangeEvent, CortexAdapter, RywMetricsSnapshot, WaitForTokenError};
 pub use config::{
     CortexAdapterConfig, FoldErrorPolicy, StartPosition, RYW_WAIT_QUEUE_CAP_DEFAULT,
 };

@@ -205,6 +205,7 @@ impl TasksAdapter {
         deadline: Duration,
     ) -> Result<(), WaitForTokenError> {
         if token.origin_hash != self.origin_hash {
+            self.inner.note_wrong_origin();
             return Err(WaitForTokenError::WrongOrigin {
                 token_origin: token.origin_hash,
                 adapter_origin: self.origin_hash,

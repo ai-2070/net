@@ -131,6 +131,46 @@ struct AdapterInner<State> {
     /// wait holds one permit for its duration. Exceeding the cap
     /// returns `WaitForTokenError::QueueFull` immediately.
     ryw_wait_queue: Option<Arc<Semaphore>>,
+    /// Per-adapter RYW counters. See [`RywMetricsSnapshot`].
+    ryw_metrics: RywMetricsAtomic,
+}
+
+/// Atomic counters backing [`CortexAdapter::ryw_metrics`]. One
+/// instance lives on each adapter (each adapter is per-channel
+/// already, so channel-labeling falls out of the adapter identity).
+#[derive(Debug, Default)]
+struct RywMetricsAtomic {
+    waits_total: AtomicU64,
+    timeouts_total: AtomicU64,
+    queue_full_total: AtomicU64,
+    wrong_origin_total: AtomicU64,
+    wait_duration_nanos_sum: AtomicU64,
+}
+
+/// Snapshot of the RYW counters on a [`CortexAdapter`].
+///
+/// All counters are monotonic; computing a rate is the caller's job
+/// (divide deltas between two snapshots by the sampling interval).
+/// `wait_duration_nanos_sum / waits_total` approximates the mean
+/// wait time without a full histogram.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RywMetricsSnapshot {
+    /// Cumulative `wait_for_token` calls that took a permit (i.e.
+    /// were not rejected up-front with `QueueFull` / `WrongOrigin`).
+    pub waits_total: u64,
+    /// Cumulative waits that returned `Timeout`.
+    pub timeouts_total: u64,
+    /// Cumulative waits rejected with `QueueFull`.
+    pub queue_full_total: u64,
+    /// Cumulative waits rejected with `WrongOrigin` at the bound-
+    /// adapter layer. The generic `CortexAdapter::wait_for_token`
+    /// never increments this; only `TasksAdapter::wait_for_token`
+    /// and `MemoriesAdapter::wait_for_token` do, when their guard
+    /// fires.
+    pub wrong_origin_total: u64,
+    /// Sum of nanoseconds spent inside `wait_for_token` past the
+    /// permit acquisition. Divide by `waits_total` for the mean.
+    pub wait_duration_nanos_sum: u64,
 }
 
 impl<State> CortexAdapter<State> {
@@ -382,17 +422,62 @@ impl<State> CortexAdapter<State> {
         // arms — under saturation a `QueueFull` is the correct
         // diagnostic, not a `Timeout` masking it.
         let _permit = match &self.inner.ryw_wait_queue {
-            Some(sem) => Some(
-                sem.clone()
-                    .try_acquire_owned()
-                    .map_err(|_| WaitForTokenError::QueueFull)?,
-            ),
+            Some(sem) => Some(sem.clone().try_acquire_owned().map_err(|_| {
+                self.inner
+                    .ryw_metrics
+                    .queue_full_total
+                    .fetch_add(1, Ordering::Relaxed);
+                WaitForTokenError::QueueFull
+            })?),
             None => None,
         };
-        match tokio::time::timeout(deadline, self.wait_for_seq(token.seq)).await {
-            Ok(()) => Ok(()),
-            Err(_) => Err(WaitForTokenError::Timeout),
+        self.inner
+            .ryw_metrics
+            .waits_total
+            .fetch_add(1, Ordering::Relaxed);
+        let started = tokio::time::Instant::now();
+        let outcome =
+            match tokio::time::timeout(deadline, self.wait_for_seq(token.seq)).await {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    self.inner
+                        .ryw_metrics
+                        .timeouts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(WaitForTokenError::Timeout)
+                }
+            };
+        let nanos = started.elapsed().as_nanos() as u64;
+        self.inner
+            .ryw_metrics
+            .wait_duration_nanos_sum
+            .fetch_add(nanos, Ordering::Relaxed);
+        outcome
+    }
+
+    /// Snapshot the RYW counters for this adapter. Cheap; reads
+    /// four atomics under `Relaxed`.
+    pub fn ryw_metrics(&self) -> RywMetricsSnapshot {
+        let m = &self.inner.ryw_metrics;
+        RywMetricsSnapshot {
+            waits_total: m.waits_total.load(Ordering::Relaxed),
+            timeouts_total: m.timeouts_total.load(Ordering::Relaxed),
+            queue_full_total: m.queue_full_total.load(Ordering::Relaxed),
+            wrong_origin_total: m.wrong_origin_total.load(Ordering::Relaxed),
+            wait_duration_nanos_sum: m
+                .wait_duration_nanos_sum
+                .load(Ordering::Relaxed),
         }
+    }
+
+    /// Bump the `wrong_origin_total` RYW counter. Called by the
+    /// origin-bound adapter wrappers when their guard fires; not
+    /// part of the generic adapter's own happy path.
+    pub(super) fn note_wrong_origin(&self) {
+        self.inner
+            .ryw_metrics
+            .wrong_origin_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -550,6 +635,7 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             shutdown: Notify::new(),
             changes_tx,
             ryw_wait_queue,
+            ryw_metrics: RywMetricsAtomic::default(),
         });
 
         let policy = adapter_config.on_fold_error;
@@ -1057,6 +1143,54 @@ mod tests {
         // Drop the holders so their tasks finish on their own
         // schedule.
         let _ = (h1, h2);
+    }
+
+    #[tokio::test]
+    async fn ryw_metrics_track_waits_timeouts_and_queue_full() {
+        let redex = Redex::new();
+        let cfg = CortexAdapterConfig::default().with_ryw_wait_queue_cap(1);
+        let adapter = Arc::new(
+            CortexAdapter::<u64>::open(
+                &redex,
+                &cn("cortex/ryw-metrics"),
+                RedexFileConfig::default(),
+                cfg,
+                CountFold,
+                0u64,
+            )
+            .unwrap(),
+        );
+
+        // No waits yet → all zeros.
+        let s0 = adapter.ryw_metrics();
+        assert_eq!(s0, RywMetricsSnapshot::default());
+
+        // Pin a long waiter to hold the only permit, then attempt a
+        // second wait — it must hit QueueFull and bump that counter.
+        let token = WriteToken::new(0xABCD_EF01, 999);
+        let a = adapter.clone();
+        let holder = tokio::spawn(async move {
+            let _ = a.wait_for_token(token, Duration::from_secs(2)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let err = adapter
+            .wait_for_token(token, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err, WaitForTokenError::QueueFull);
+
+        // Wait for the holder to time out, then check the counters.
+        holder.await.unwrap();
+        let s1 = adapter.ryw_metrics();
+        assert_eq!(s1.waits_total, 1, "holder takes one permit + one wait slot");
+        assert_eq!(s1.timeouts_total, 1, "holder's deadline elapsed");
+        assert_eq!(s1.queue_full_total, 1, "saturating attempt was rejected");
+        assert_eq!(s1.wrong_origin_total, 0);
+        assert!(
+            s1.wait_duration_nanos_sum >= 1_000_000_000,
+            "holder waited at least its 2s deadline, observed {}ns",
+            s1.wait_duration_nanos_sum
+        );
     }
 
     #[tokio::test]
