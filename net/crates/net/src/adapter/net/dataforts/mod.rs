@@ -30,5 +30,5 @@ pub use greedy::{
 #[cfg(feature = "dataforts-gravity")]
 pub use gravity::{
     should_emit_heat, DataGravityPolicy, DataGravityPolicyError, EmissionDecision,
-    HeatCounter, HeatEmission, HeatRegistry,
+    HeatCounter, HeatEmission, HeatRegistry, HeatSink,
 };

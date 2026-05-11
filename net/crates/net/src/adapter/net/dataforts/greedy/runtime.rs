@@ -146,6 +146,27 @@ struct GreedyRuntimeInner {
     /// install time; refreshable via [`GreedyRuntime::set_local_caps`]
     /// when the node's caps change.
     local_caps: Mutex<Arc<CapabilitySet>>,
+    /// Optional data-gravity state (Phase 4). When present,
+    /// `note_read` bumps the per-chain heat counter and
+    /// `gravity_tick` emits / withdraws heat tags via the sink.
+    /// `None` = gravity disabled; the read path is unchanged.
+    #[cfg(feature = "dataforts-gravity")]
+    gravity: Option<GravityState>,
+}
+
+/// Per-runtime data-gravity state. Behind the same gate as the
+/// public `with_gravity` builder + `gravity_tick` method.
+#[cfg(feature = "dataforts-gravity")]
+struct GravityState {
+    /// Heat-tag emission policy. Immutable after install;
+    /// reconfigure by re-enabling greedy.
+    policy: super::super::gravity::DataGravityPolicy,
+    /// Per-chain heat registry. Bumped on `note_read`; ticked
+    /// by `gravity_tick`.
+    heat: Mutex<super::super::gravity::HeatRegistry>,
+    /// Wire-side sink for `announce_heat` / `withdraw_heat`.
+    /// In production this is `Arc<MeshNode>`.
+    sink: Arc<dyn super::super::gravity::HeatSink>,
 }
 
 impl std::fmt::Debug for GreedyRuntime {
@@ -197,8 +218,46 @@ impl GreedyRuntime {
                 intent_registry,
                 metadata_keys: PlacementMetadataKeys::default(),
                 local_caps: Mutex::new(local_caps),
+                #[cfg(feature = "dataforts-gravity")]
+                gravity: None,
             }),
         }
+    }
+
+    /// Builder for an Arc-newly-built runtime: enable data-gravity
+    /// with the supplied policy + heat sink. Only callable on a
+    /// fresh runtime where the inner `Arc` strong count is 1
+    /// (typical immediately after `new`); subsequent enable
+    /// requests after the runtime is shared would require a
+    /// rebuild.
+    ///
+    /// `Redex::enable_greedy_dataforts` calls this internally when
+    /// the operator configures gravity at install time.
+    #[cfg(feature = "dataforts-gravity")]
+    pub fn with_gravity(
+        self,
+        policy: super::super::gravity::DataGravityPolicy,
+        heat_sink: Arc<dyn super::super::gravity::HeatSink>,
+    ) -> Result<Self, Self> {
+        let mut inner = match Arc::try_unwrap(self.inner) {
+            Ok(inner) => inner,
+            Err(arc) => return Err(Self { inner: arc }),
+        };
+        inner.gravity = Some(GravityState {
+            policy,
+            heat: Mutex::new(super::super::gravity::HeatRegistry::new()),
+            sink: heat_sink,
+        });
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// True iff this runtime was configured with data gravity.
+    /// Useful for tests + operator introspection.
+    #[cfg(feature = "dataforts-gravity")]
+    pub fn gravity_enabled(&self) -> bool {
+        self.inner.gravity.is_some()
     }
 
     /// Borrow the metrics registry. Cheap clone of the inner Arc.
@@ -246,10 +305,85 @@ impl GreedyRuntime {
     /// Bump the read-path LRU position for `channel`. Wire into
     /// the substrate's read path so reads served from the cache
     /// promote the channel against eviction.
+    ///
+    /// When data gravity is enabled, this also bumps the per-
+    /// chain heat counter. Heat tag emission happens on the
+    /// throttled [`Self::gravity_tick`] cycle (the bump itself
+    /// is free; emission is rate-limited per
+    /// [`DataGravityPolicy::emit_threshold_ratio`]).
     pub fn note_read(&self, channel: &ChannelName) {
-        self.inner.cache.lock().touch(channel, Instant::now());
+        let now = Instant::now();
+        let origin_hash = {
+            let mut cache = self.inner.cache.lock();
+            cache.touch(channel, now);
+            cache.get(channel).map(|e| e.origin_hash)
+        };
         let m = self.inner.metrics.for_channel(channel.as_str());
         m.incr_serve();
+
+        #[cfg(feature = "dataforts-gravity")]
+        if let Some(gravity) = &self.inner.gravity {
+            if let Some(origin_hash) = origin_hash {
+                if origin_hash != 0 {
+                    let mut heat = gravity.heat.lock();
+                    heat.entry_mut(origin_hash, gravity.policy.decay_half_life, now)
+                        .bump(now);
+                }
+            }
+        }
+        #[cfg(not(feature = "dataforts-gravity"))]
+        let _ = origin_hash;
+    }
+
+    /// Apply decay through `now` and emit heat tags for chains
+    /// whose rate has crossed the configured threshold (per
+    /// [`super::super::gravity::should_emit_heat`]). Withdrawals
+    /// for chains that decayed to zero fire on the same call.
+    ///
+    /// Async because the heat sink's `announce_heat` /
+    /// `withdraw_heat` calls hit the mesh transport. Each
+    /// per-chain emission is fire-and-forget — a failed sink
+    /// call logs + drops; the next tick retries.
+    ///
+    /// Operators schedule this via a periodic tokio interval
+    /// (typically `heartbeat_ms`-aligned) so heat propagation
+    /// piggybacks on the existing capability-announcement
+    /// cadence.
+    #[cfg(feature = "dataforts-gravity")]
+    pub async fn gravity_tick(&self) {
+        let Some(gravity) = &self.inner.gravity else {
+            return;
+        };
+        let now = Instant::now();
+        let emissions = gravity.heat.lock().tick(&gravity.policy, now);
+        for (origin_hash, emission) in emissions {
+            match emission {
+                super::super::gravity::HeatEmission::Suppress => {}
+                super::super::gravity::HeatEmission::Emit { rate } => {
+                    // Normalize unbounded rate to [0.0, 1.0] for
+                    // the wire encoding. Saturate above 1.0; the
+                    // substrate clamps anyway but normalize here
+                    // so the per-tick value is interpretable.
+                    let normalized = (rate / (rate + 1.0)).min(1.0);
+                    if let Err(e) = gravity.sink.announce_heat(origin_hash, normalized).await {
+                        tracing::trace!(
+                            origin_hash = origin_hash,
+                            error = ?e,
+                            "gravity: announce_heat failed"
+                        );
+                    }
+                }
+                super::super::gravity::HeatEmission::Withdraw => {
+                    if let Err(e) = gravity.sink.withdraw_heat(origin_hash).await {
+                        tracing::trace!(
+                            origin_hash = origin_hash,
+                            error = ?e,
+                            "gravity: withdraw_heat failed"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Dispatch an inbound channel event through the greedy
@@ -337,7 +471,9 @@ impl GreedyRuntime {
                     return DispatchOutcome::AppendFailed;
                 }
             };
-            self.inner.cache.lock().upsert(channel.clone(), file, now);
+            let mut cache = self.inner.cache.lock();
+            cache.upsert(channel.clone(), file, now);
+            cache.set_origin_hash(channel, origin_hash);
         }
 
         // Read the file handle out of the registry under the lock,
@@ -455,6 +591,31 @@ mod tests {
             Ok(())
         }
         async fn withdraw_chain(&self, origin_hash: u64) -> Result<(), AdapterError> {
+            self.withdraws.lock().push(origin_hash);
+            Ok(())
+        }
+    }
+
+    /// Parallel recorder for the data-gravity heat sink. Lets a
+    /// test pin the heat announce/withdraw sequence without
+    /// going through a real MeshNode.
+    #[derive(Default)]
+    struct RecorderHeatSink {
+        announces: Mutex<Vec<(u64, f64)>>,
+        withdraws: Mutex<Vec<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::adapter::net::dataforts::gravity::HeatSink for RecorderHeatSink {
+        async fn announce_heat(
+            &self,
+            origin_hash: u64,
+            rate: f64,
+        ) -> Result<(), AdapterError> {
+            self.announces.lock().push((origin_hash, rate));
+            Ok(())
+        }
+        async fn withdraw_heat(&self, origin_hash: u64) -> Result<(), AdapterError> {
             self.withdraws.lock().push(origin_hash);
             Ok(())
         }
@@ -629,5 +790,79 @@ mod tests {
             .dispatch_event(&cn("a"), 1, &chain, b"x")
             .await;
         assert_eq!(outcome2, DispatchOutcome::Cached);
+    }
+
+    // ────────────────────────────────────────────────────────
+    // Data-gravity integration (Phase 4)
+    // ────────────────────────────────────────────────────────
+
+    /// `note_read` bumps the heat counter; `gravity_tick` emits
+    /// a `heat:` tag via the sink on first-rate observation.
+    /// A second tick suppresses (rate hasn't moved) — pins the
+    /// emission-throttle path.
+    #[tokio::test]
+    async fn gravity_tick_emits_then_suppresses() {
+        use crate::adapter::net::dataforts::gravity::DataGravityPolicy;
+
+        let cfg = GreedyConfig::default()
+            .with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let redex = Arc::new(Redex::new());
+        let sink = Arc::new(RecorderSink::default());
+        let heat_sink = Arc::new(RecorderHeatSink::default());
+        let rt = GreedyRuntime::new(
+            cfg,
+            redex,
+            sink as Arc<dyn ChainTagSink>,
+            Arc::new(CapabilitySet::default()),
+            IntentRegistry::new(),
+        )
+        .with_gravity(
+            DataGravityPolicy::default(),
+            heat_sink.clone() as Arc<dyn crate::adapter::net::dataforts::gravity::HeatSink>,
+        )
+        .ok()
+        .expect("with_gravity on fresh runtime");
+        assert!(rt.gravity_enabled());
+
+        // Dispatch + read so the cache entry exists with
+        // origin_hash + the heat counter bumps.
+        let chain = CapabilitySet::default();
+        rt.dispatch_event(&cn("test/heat-channel"), 0xCAFE, &chain, b"x")
+            .await;
+        rt.note_read(&cn("test/heat-channel"));
+
+        // First tick — emit (no prior emission).
+        rt.gravity_tick().await;
+        let emissions = heat_sink.announces.lock().clone();
+        assert_eq!(emissions.len(), 1, "first tick must emit");
+        assert_eq!(emissions[0].0, 0xCAFE);
+        assert!(emissions[0].1 > 0.0);
+
+        // Second tick — suppress (rate hasn't moved).
+        rt.gravity_tick().await;
+        assert_eq!(
+            heat_sink.announces.lock().len(),
+            1,
+            "second tick must suppress when rate is unchanged"
+        );
+    }
+
+    /// `note_read` is a no-op for heat when gravity isn't
+    /// enabled — pins the "Phase 1 still works without Phase 4"
+    /// invariant.
+    #[tokio::test]
+    async fn note_read_without_gravity_does_not_touch_heat() {
+        let cfg = GreedyConfig::default()
+            .with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        assert!(!rt.gravity_enabled());
+
+        let chain = CapabilitySet::default();
+        rt.dispatch_event(&cn("test/no-gravity"), 0xBEEF, &chain, b"x")
+            .await;
+        rt.note_read(&cn("test/no-gravity"));
+        // No heat-sink to assert on; the test passes by not
+        // panicking and by leaving gravity_enabled false.
+        assert!(!rt.gravity_enabled());
     }
 }

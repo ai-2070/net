@@ -19,8 +19,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::adapter::net::redex::ChannelId;
-
 /// Per-chain heat counter.
 #[derive(Debug, Clone)]
 pub struct HeatCounter {
@@ -122,14 +120,17 @@ pub enum HeatEmission {
     /// No emission — caller does nothing.
     Suppress,
     /// Emit a `heat:<origin_hash_hex>=<rate>` tag.
-    Emit { rate: f64 },
+    Emit {
+        /// Decayed read-rate to carry on the wire.
+        rate: f64,
+    },
     /// Emit a withdrawal — `heat:<origin_hash_hex>=0`.
     Withdraw,
 }
 
-/// Cluster-wide heat registry. Keyed by [`ChannelId`] (the 32-
-/// byte replication chain identifier), matches the substrate's
-/// `causal:<hex>` tag-key convention.
+/// Cluster-wide heat registry. Keyed by `u64` origin_hash — the
+/// same chain identifier the substrate's `causal:<hex>` and
+/// `heat:<hex>=<rate>` reserved tags carry on the wire.
 ///
 /// Per-channel state is mutated under the registry's outer mutex.
 /// The hot path (`bump` per read) takes the lock briefly; total
@@ -138,7 +139,7 @@ pub enum HeatEmission {
 /// if telemetry shows contention we can shard by channel-hash.
 #[derive(Debug, Default)]
 pub struct HeatRegistry {
-    counters: HashMap<ChannelId, HeatCounter>,
+    counters: HashMap<u64, HeatCounter>,
 }
 
 impl HeatRegistry {
@@ -162,7 +163,7 @@ impl HeatRegistry {
     /// / `record_emission` in one borrow.
     pub fn entry_mut(
         &mut self,
-        channel: ChannelId,
+        channel: u64,
         half_life: Duration,
         now: Instant,
     ) -> &mut HeatCounter {
@@ -172,18 +173,18 @@ impl HeatRegistry {
     }
 
     /// Read-only access to the counter for `channel`.
-    pub fn get(&self, channel: &ChannelId) -> Option<&HeatCounter> {
+    pub fn get(&self, channel: &u64) -> Option<&HeatCounter> {
         self.counters.get(channel)
     }
 
     /// Remove the counter for `channel`. Used on channel close /
     /// cache eviction.
-    pub fn remove(&mut self, channel: &ChannelId) {
+    pub fn remove(&mut self, channel: &u64) {
         self.counters.remove(channel);
     }
 
     /// Iterate `(channel, counter)` pairs. Read-only.
-    pub fn iter(&self) -> impl Iterator<Item = (&ChannelId, &HeatCounter)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &HeatCounter)> {
         self.counters.iter()
     }
 
@@ -199,7 +200,7 @@ impl HeatRegistry {
         &mut self,
         policy: &super::DataGravityPolicy,
         now: Instant,
-    ) -> Vec<(ChannelId, HeatEmission)> {
+    ) -> Vec<(u64, HeatEmission)> {
         let mut out = Vec::new();
         for (channel, counter) in self.counters.iter_mut() {
             counter.decay_to(now);
@@ -230,11 +231,12 @@ impl HeatRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::net::channel::ChannelName;
 
-    fn channel(name: &str) -> ChannelId {
-        let cn = ChannelName::new(name).unwrap();
-        ChannelId::from_name(&cn)
+    fn channel(seed: u64) -> u64 {
+        // Tests just need a stable distinct identifier per
+        // "channel"; the production wire uses the chain's
+        // origin_hash here.
+        0xCAFE_BABE_0000_0000 | seed
     }
 
     fn t0() -> Instant {
@@ -324,7 +326,7 @@ mod tests {
     fn entry_mut_creates_on_first_access() {
         let mut r = HeatRegistry::new();
         let half = Duration::from_secs(60);
-        let counter = r.entry_mut(channel("a"), half, t0());
+        let counter = r.entry_mut(channel(0xA), half, t0());
         counter.bump(t0());
         assert!((counter.rate() - 1.0).abs() < 1e-9);
         assert_eq!(r.len(), 1);
@@ -334,8 +336,8 @@ mod tests {
     fn remove_drops_entry() {
         let mut r = HeatRegistry::new();
         let half = Duration::from_secs(60);
-        let _ = r.entry_mut(channel("a"), half, t0());
-        r.remove(&channel("a"));
+        let _ = r.entry_mut(channel(0xA), half, t0());
+        r.remove(&channel(0xA));
         assert!(r.is_empty());
     }
 
@@ -344,7 +346,7 @@ mod tests {
         let base = t0();
         let mut r = HeatRegistry::new();
         let policy = super::super::DataGravityPolicy::default();
-        let counter = r.entry_mut(channel("a"), policy.decay_half_life, base);
+        let counter = r.entry_mut(channel(0xA), policy.decay_half_life, base);
         counter.bump(base);
         let emissions = r.tick(&policy, base);
         assert_eq!(emissions.len(), 1);
@@ -362,7 +364,7 @@ mod tests {
         let base = t0();
         let mut r = HeatRegistry::new();
         let policy = super::super::DataGravityPolicy::default();
-        let counter = r.entry_mut(channel("a"), policy.decay_half_life, base);
+        let counter = r.entry_mut(channel(0xA), policy.decay_half_life, base);
         counter.bump(base);
         // First tick — emit.
         let _ = r.tick(&policy, base);
@@ -378,14 +380,14 @@ mod tests {
         let base = t0();
         let mut r = HeatRegistry::new();
         let policy = super::super::DataGravityPolicy::default();
-        let counter = r.entry_mut(channel("a"), policy.decay_half_life, base);
+        let counter = r.entry_mut(channel(0xA), policy.decay_half_life, base);
         counter.bump(base);
         // First tick — emit at rate ≈ 1.0.
         let first = r.tick(&policy, base);
         assert_eq!(first.len(), 1);
         // More bumps — rate climbs.
         for _ in 0..3 {
-            r.entry_mut(channel("a"), policy.decay_half_life, base)
+            r.entry_mut(channel(0xA), policy.decay_half_life, base)
                 .bump(base);
         }
         // Tick — rate is now ≈ 4.0 > 2× last emitted 1.0; emit.

@@ -48,6 +48,14 @@ pub struct GreedyCacheEntry {
     /// Bytes appended to this cache file since registration.
     /// Upper bound on retained bytes (retention may evict).
     pub bytes: u64,
+    /// Most-recently-observed `origin_hash` for the chain this
+    /// cache entry holds. Set on first cache-write and refreshed
+    /// on each subsequent observation. Used by the data-gravity
+    /// layer to key heat counters per origin (`heat:<hex>=<rate>`
+    /// matches the chain's `causal:<hex>` advertisement). Zero
+    /// if no event has landed yet (cache file opened but no
+    /// observation).
+    pub origin_hash: u64,
     /// Monotonic LRU position. Higher = more recent. The
     /// registry's `lru` BTreeMap keys on this so two channels
     /// touched in the same `Instant` still order deterministically.
@@ -178,9 +186,20 @@ impl GreedyCacheRegistry {
                 file,
                 last_read: now,
                 bytes: 0,
+                origin_hash: 0,
                 lru_pos: new_pos,
             },
         );
+    }
+
+    /// Record the `origin_hash` for `channel`. Used by the
+    /// data-gravity layer to map cache entries back to the chain
+    /// identifier carried in `heat:<hex>=<rate>` wire tags.
+    /// No-op if the channel isn't registered.
+    pub fn set_origin_hash(&mut self, channel: &ChannelName, origin_hash: u64) {
+        if let Some(entry) = self.entries.get_mut(channel) {
+            entry.origin_hash = origin_hash;
+        }
     }
 
     /// Bump `last_read` for `channel` to `now`. No-op if the

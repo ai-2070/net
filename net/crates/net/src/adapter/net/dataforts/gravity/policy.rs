@@ -131,7 +131,11 @@ pub enum EmissionDecision {
     /// representative.
     Suppress,
     /// Emit a new heat tag with the supplied rate.
-    Emit { rate: f64 },
+    Emit {
+        /// Decayed read-rate to carry on the wire. The substrate
+        /// clamps to `[0.0, 1.0]` at emission time.
+        rate: f64,
+    },
     /// Withdraw — emit `heat:<chain>=0`. Peers drop the
     /// annotation.
     Withdraw,

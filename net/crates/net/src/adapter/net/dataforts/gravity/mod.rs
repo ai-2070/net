@@ -27,6 +27,8 @@
 
 mod counter;
 mod policy;
+mod sink;
 
 pub use counter::{HeatCounter, HeatEmission, HeatRegistry};
 pub use policy::{should_emit_heat, DataGravityPolicy, DataGravityPolicyError, EmissionDecision};
+pub use sink::HeatSink;

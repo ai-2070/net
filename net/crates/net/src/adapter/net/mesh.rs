@@ -6320,6 +6320,37 @@ impl MeshNode {
         }
     }
 
+    /// True iff `tag` is a `heat:<hex>=...` reserved tag for the
+    /// supplied chain-hash. Used by [`Self::replace_heat_tags`]
+    /// to strip stale heat annotations before re-emission.
+    #[cfg(feature = "dataforts-gravity")]
+    fn is_heat_for(tag: &Tag, hex: &str) -> bool {
+        match tag {
+            Tag::Reserved { prefix, body } if prefix == "heat:" => {
+                // Body shape: `<hex>=<rate>`. Match the chain by
+                // prefix-then-`=` so we don't accidentally strip
+                // tags for a hex that begins with the target.
+                if !body.starts_with(hex) {
+                    return false;
+                }
+                matches!(body.as_bytes().get(hex.len()), Some(b'='))
+            }
+            _ => false,
+        }
+    }
+
+    /// Strip every `heat:<hex>=*` tag for `origin_hash` from
+    /// `caps` and insert `replacement` in its place. `None` is
+    /// withdrawal — every heat annotation for the chain drops.
+    #[cfg(feature = "dataforts-gravity")]
+    fn replace_heat_tags(caps: &mut CapabilitySet, origin_hash: u64, replacement: Option<Tag>) {
+        let hex = Self::chain_hex(origin_hash);
+        caps.tags.retain(|t| !Self::is_heat_for(t, &hex));
+        if let Some(t) = replacement {
+            caps.tags.insert(t);
+        }
+    }
+
     /// Read the current user-supplied baseline, defaulting to an
     /// empty `CapabilitySet` when no `announce_capabilities` has
     /// landed yet. Returns an owned snapshot — callers mutate the
@@ -6381,6 +6412,68 @@ impl MeshNode {
         Self::replace_causal_tags(&mut snapshot, origin_hash, None);
         self.announce_capabilities(snapshot).await
     }
+
+    /// Annotate the local capability set with a `heat:<hex>=<rate>`
+    /// reserved tag for `origin_hash` and re-broadcast. Replaces
+    /// any prior heat tag for the same chain — the most recent
+    /// call wins.
+    ///
+    /// `rate` is clamped to `[0.0, 1.0]` by the substrate's
+    /// `CapabilitySet::heat_level` builder; the wire emits the
+    /// clamped value with two decimal places. Data-gravity
+    /// callers normalize their unbounded read-rate to that range
+    /// before calling.
+    ///
+    /// Rebel Yell Phase 4. See
+    /// `docs/misc/DATAFORTS_PLAN.md` § Phase 4.
+    #[cfg(feature = "dataforts-gravity")]
+    pub async fn announce_heat(
+        &self,
+        origin_hash: u64,
+        rate: f64,
+    ) -> Result<(), AdapterError> {
+        let hex = Self::chain_hex(origin_hash);
+        let clamped = if rate.is_finite() {
+            rate.clamp(0.0, 1.0)
+        } else {
+            return Err(AdapterError::Fatal(
+                "heat rate must be finite".to_string(),
+            ));
+        };
+        let replacement = Tag::parse(&format!("heat:{hex}={clamped:.2}")).ok();
+        let mut snapshot = self.user_caps_snapshot();
+        Self::replace_heat_tags(&mut snapshot, origin_hash, replacement);
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// Withdraw every `heat:<hex>=*` tag for `origin_hash` and
+    /// re-broadcast. Peers drop the heat annotation; the
+    /// chain's `causal:` advertisements are untouched.
+    #[cfg(feature = "dataforts-gravity")]
+    pub async fn withdraw_heat(
+        &self,
+        origin_hash: u64,
+    ) -> Result<(), AdapterError> {
+        let mut snapshot = self.user_caps_snapshot();
+        Self::replace_heat_tags(&mut snapshot, origin_hash, None);
+        self.announce_capabilities(snapshot).await
+    }
+}
+
+#[cfg(feature = "dataforts-gravity")]
+#[async_trait::async_trait]
+impl super::dataforts::HeatSink for MeshNode {
+    async fn announce_heat(&self, origin_hash: u64, rate: f64) -> Result<(), AdapterError> {
+        MeshNode::announce_heat(self, origin_hash, rate).await
+    }
+
+    async fn withdraw_heat(&self, origin_hash: u64) -> Result<(), AdapterError> {
+        MeshNode::withdraw_heat(self, origin_hash).await
+    }
+}
+
+#[cfg(feature = "net")]
+impl MeshNode {
 
     /// Install (or replace) the `SUBPROTOCOL_REDEX` inbound
     /// router. Used by `Redex` to register a per-node router
