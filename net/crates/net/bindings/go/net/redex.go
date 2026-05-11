@@ -193,6 +193,19 @@ type Redex struct {
 	handle *C.RedexHandle
 }
 
+// Handle returns the underlying C pointer as `unsafe.Pointer` for
+// cross-file cgo consumers (Tasks / Memories adapters live in
+// separate .go files and each defines its own opaque
+// `RedexHandle` typedef; their cgo blocks treat the pointer-typed
+// parameter via the same C-side struct name, so a Go `*C.RedexHandle`
+// from this file can be passed through `unsafe.Pointer` and the
+// receiving file casts back). Returns `nil` once the Redex is closed.
+func (r *Redex) Handle() unsafe.Pointer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return unsafe.Pointer(r.handle)
+}
+
 // RedexFile wraps the C `*RedexFileHandle` for a single channel.
 //
 // R-31: `mu` is an RWMutex — Append/NextSeq/Read take RLock so
