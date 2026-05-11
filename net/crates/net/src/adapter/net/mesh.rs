@@ -3414,6 +3414,16 @@ impl MeshNode {
                 .find(|e| e.value().session.session_id() == session.session_id())
                 .map(|e| e.value().node_id)
                 .unwrap_or(0);
+            // R-25: reject sentinel-zero from_node — `NodeId == 0`
+            // is a valid id (MeshNodeConfig::new accepts the
+            // [0u8; 32] PSK), so an unknown sender that defaults
+            // to `0` would otherwise be indistinguishable from a
+            // legitimate node-0 peer. Mirrors the reflex
+            // handler's `if from_node == 0 { return; }` guard at
+            // line 3441 below.
+            if from_node == 0 {
+                return;
+            }
             for payload in events {
                 Self::dispatch_replication_payload(&payload, from_node, router.as_ref());
             }

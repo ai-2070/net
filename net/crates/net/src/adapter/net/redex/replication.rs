@@ -646,7 +646,8 @@ mod tests {
             chunk_max: 0x1122_3344,
         };
         let bytes = req.to_bytes();
-        // 0x0E, 0x00, 0x20 = subprotocol header + dispatch code
+        // Subprotocol header is u16 LE = 0x0E00 → bytes [0x00, 0x0E];
+        // followed by dispatch_code 0x20.
         assert_eq!(&bytes[..3], &[0x00, 0x0E, 0x20]);
         assert_eq!(&bytes[3..35], &[0xAB; 32]);
         assert_eq!(

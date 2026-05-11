@@ -45,9 +45,9 @@ Tagged `[H | M | L]`:
 | R-20  | M   | catchup     | `append_batch` error stringified — typed variants erased                  | 🚫 deferred — handle_disk_pressure already uniform |
 | R-21  | M   | manager     | `try_dispatch(Shutdown)` on reopen path is lossy at cap-1024              | 📝 documented belt-and-suspenders (Arc-drop is the canonical exit) |
 | R-22  | M   | manager     | `NIC_PEAK_BYTES_PER_S = 125_000_000` hardcoded without `// TODO` tag      | ✅ |
-| R-23  | M   | wire        | `WireError::Truncated.need` formula reports nonsensical value             | ⚪ |
-| R-24  | M   | mesh        | Replication inbound dispatch is O(peers) per frame                        | ⚪ |
-| R-25  | M   | mesh        | `from_node` falls back to `0`, a valid NodeId sentinel collision          | ⚪ |
+| R-23  | M   | wire        | `WireError::Truncated.need` formula reports nonsensical value             | ✅ (R-5 commit) |
+| R-24  | M   | mesh        | Replication inbound dispatch is O(peers) per frame                        | 🚫 deferred — needs session→node reverse-map across all subprotocols |
+| R-25  | M   | mesh        | `from_node` falls back to `0`, a valid NodeId sentinel collision          | ✅ |
 | R-26  | M   | bindings    | Python silently accepts both `colocation_strict` and `colocation-strict`  | ⚪ |
 | R-27  | M   | bindings    | `Pinned([])` slips past binding to core validate                          | ⚪ |
 | R-28  | M   | bindings    | `leader_pinned` not cross-checked against `pinned_nodes` at binding layer | ⚪ |
@@ -59,8 +59,8 @@ Tagged `[H | M | L]`:
 | R-34  | M   | metrics     | `Duration → micros` saturation may collide with `LAG_NOT_OBSERVED`        | ⚪ |
 | R-35  | L   | election    | `sort_by` claims to use stability for determinism; should be `unstable`   | ⚪ |
 | R-36  | L   | wire codec  | `Vec::with_capacity(event_count.min(4096))` cap is undocumented           | ⚪ |
-| R-37  | L   | wire codec  | `u32::try_from(...).unwrap_or(u32::MAX)` silently corrupts data           | ⚪ |
-| R-38  | L   | wire codec  | Byte-layout test doc-comment reverses LE order vs asserted bytes          | ⚪ |
+| R-37  | L   | wire codec  | `u32::try_from(...).unwrap_or(u32::MAX)` silently corrupts data           | ✅ (R-5 commit) |
+| R-38  | L   | wire codec  | Byte-layout test doc-comment reverses LE order vs asserted bytes          | ✅ |
 | R-39  | L   | loom        | `burst_cas_decrement` comment says "three threads"; code spawns 2         | ⚪ |
 | R-40  | L   | dst         | `_unused_imports_workaround` is cargo-cult silencing                      | ⚪ |
 | R-41  | L   | e2e         | Fixed 500ms `tokio::time::sleep` before leader close — flake risk         | ⚪ |
