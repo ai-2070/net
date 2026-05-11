@@ -297,7 +297,9 @@ pub extern "C" fn net_redex_free(handle: *mut RedexHandle) {
 
 /// Install cross-node replication on this `Redex`. Consumes the
 /// `*mut Arc<MeshNode>` boxed pointer produced by
-/// `net_mesh_arc_clone` — caller MUST NOT free it again.
+/// `net_mesh_arc_clone` — caller MUST NOT free it again
+/// **regardless of return code**: success consumes the Arc into
+/// the new wiring; error returns drop the Arc before returning.
 /// Idempotent — repeated calls return without disturbing the
 /// existing router.
 ///
@@ -310,18 +312,37 @@ pub extern "C" fn net_redex_enable_replication(
     redex: *mut RedexHandle,
     mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
 ) -> c_int {
+    // R-8: free `mesh_arc` on every error path. The Go binding
+    // (and every other C consumer) reads the rc + assumes the
+    // Arc was consumed regardless; without this drop the boxed
+    // Arc leaks on every NullPointer / ShuttingDown return.
     if redex.is_null() || mesh_arc.is_null() {
+        if !mesh_arc.is_null() {
+            // SAFETY: caller documented `mesh_arc` as produced by
+            // `net_mesh_arc_clone`. Drop now to honor the
+            // "consumed regardless" contract.
+            unsafe {
+                drop(Box::from_raw(mesh_arc));
+            }
+        }
         return NetError::NullPointer.into();
     }
-    let redex = unsafe { &*redex };
-    let _op = match redex.guard.try_enter() {
+    let redex_ref = unsafe { &*redex };
+    let _op = match redex_ref.guard.try_enter() {
         Some(op) => op,
-        None => return NetError::ShuttingDown.into(),
+        None => {
+            // SAFETY: as above; drop the Arc the caller already
+            // gave up ownership of.
+            unsafe {
+                drop(Box::from_raw(mesh_arc));
+            }
+            return NetError::ShuttingDown.into();
+        }
     };
     // SAFETY: `mesh_arc` is documented as produced by
     // `net_mesh_arc_clone`; consume the Box, take the Arc.
     let mesh = unsafe { *Box::from_raw(mesh_arc) };
-    redex.inner.enable_replication(mesh);
+    redex_ref.inner.enable_replication(mesh);
     0
 }
 
@@ -2521,5 +2542,46 @@ mod tests {
         assert_eq!(net_redex_replication_runtime_count(ptr::null()), 0);
         let p = net_redex_replication_prometheus_text(ptr::null());
         assert!(p.is_null());
+    }
+
+    /// R-8 regression: `net_redex_enable_replication` must drop
+    /// the boxed `Arc<MeshNode>` regardless of return code so the
+    /// Go binding's "consumed on call" contract holds even on
+    /// NullPointer / ShuttingDown errors. We exercise the NULL-
+    /// redex path with a real (but minimal) MeshNode and verify
+    /// the Arc strong count drops after the FFI call returns.
+    ///
+    /// We use an async-Tokio block to satisfy `MeshNode::new`'s
+    /// async signature without making the test runtime async.
+    #[cfg(feature = "net")]
+    #[test]
+    fn enable_replication_drops_mesh_arc_on_null_redex() {
+        use crate::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mesh = rt.block_on(async {
+            let identity = EntityKeypair::generate();
+            let cfg = MeshNodeConfig::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                [0u8; 32],
+            );
+            Arc::new(MeshNode::new(identity, cfg).await.unwrap())
+        });
+        let pre_count = Arc::strong_count(&mesh);
+        let boxed_arc: *mut Arc<MeshNode> = Box::into_raw(Box::new(mesh.clone()));
+        assert_eq!(Arc::strong_count(&mesh), pre_count + 1);
+
+        // NULL redex, valid mesh_arc — must drop boxed_arc and
+        // surface NullPointer.
+        let rc = net_redex_enable_replication(ptr::null_mut(), boxed_arc);
+        let expected: c_int = NetError::NullPointer.into();
+        assert_eq!(rc, expected);
+        assert_eq!(
+            Arc::strong_count(&mesh),
+            pre_count,
+            "net_redex_enable_replication must drop the boxed Arc on error paths"
+        );
     }
 }
