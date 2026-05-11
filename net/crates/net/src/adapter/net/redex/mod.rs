@@ -33,6 +33,7 @@ mod replication_election;
 mod replication_heartbeat;
 mod replication_metrics;
 mod replication_state;
+mod replication_step;
 mod retention;
 mod segment;
 mod typed;
@@ -67,6 +68,9 @@ pub use replication_coordinator::{
 };
 pub use replication_election::{elect, ElectionOutcome};
 pub use replication_heartbeat::{HeartbeatTracker, PeerState, DEFAULT_MISS_THRESHOLD};
+pub use replication_step::{
+    election_outcome, tick, OutboundMessage, PendingTransition, StepOutcome, TickInputs,
+};
 pub use replication_metrics::{
     ChannelMetrics, ChannelMetricsAtomic, ReplicationMetricsRegistry,
     ReplicationMetricsSnapshot, MAX_TRACKED_CHANNELS, OVERFLOW_CHANNEL_LABEL,
