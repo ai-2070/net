@@ -379,7 +379,8 @@ impl<State> CortexAdapter<State> {
     }
 }
 
-/// Errors surfaced by [`CortexAdapter::wait_for_token`].
+/// Errors surfaced by [`CortexAdapter::wait_for_token`] and the
+/// origin-bound adapters that wrap it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WaitForTokenError {
     /// Deadline elapsed before the fold watermark advanced to
@@ -387,12 +388,31 @@ pub enum WaitForTokenError {
     /// caller can retry with a fresh deadline or accept the
     /// stale read.
     Timeout,
+    /// Token belongs to a different origin than this adapter
+    /// folds. Origin-bound adapters surface this to catch the
+    /// caller-side aliasing where a token from chain A is waited
+    /// on against an adapter bound to chain B — the wait would
+    /// otherwise hang on a seq that can never land here.
+    WrongOrigin {
+        /// origin the token was issued for.
+        token_origin: u64,
+        /// origin this adapter is bound to.
+        adapter_origin: u64,
+    },
 }
 
 impl std::fmt::Display for WaitForTokenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Timeout => f.write_str("read-your-writes wait timed out"),
+            Self::WrongOrigin {
+                token_origin,
+                adapter_origin,
+            } => write!(
+                f,
+                "token origin {:016x} != adapter origin {:016x}",
+                token_origin, adapter_origin
+            ),
         }
     }
 }

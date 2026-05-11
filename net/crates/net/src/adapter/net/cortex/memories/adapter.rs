@@ -3,14 +3,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use super::super::super::channel::ChannelName;
-use super::super::super::redex::{Redex, RedexError, RedexFileConfig};
-use super::super::adapter::CortexAdapter;
+use super::super::super::redex::{Redex, RedexError, RedexFileConfig, WriteToken};
+use super::super::adapter::{CortexAdapter, WaitForTokenError};
 use super::super::config::CortexAdapterConfig;
 use super::super::envelope::EventEnvelope;
 use super::super::error::CortexAdapterError;
@@ -228,6 +229,25 @@ impl MemoriesAdapter {
     /// Block until every event up through `seq` has been folded.
     pub async fn wait_for_seq(&self, seq: u64) {
         self.inner.wait_for_seq(seq).await;
+    }
+
+    /// Block until the fold task has processed every event up
+    /// through `token.seq`, or `deadline` elapses. Read-your-writes
+    /// wait scoped to this adapter's origin — see the matching
+    /// `TasksAdapter::wait_for_token` for the rationale on the
+    /// origin guard.
+    pub async fn wait_for_token(
+        &self,
+        token: WriteToken,
+        deadline: Duration,
+    ) -> Result<(), WaitForTokenError> {
+        if token.origin_hash != self.origin_hash {
+            return Err(WaitForTokenError::WrongOrigin {
+                token_origin: token.origin_hash,
+                adapter_origin: self.origin_hash,
+            });
+        }
+        self.inner.wait_for_token(token, deadline).await
     }
 
     /// Close the adapter. See [`CortexAdapter::close`].
