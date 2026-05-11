@@ -225,7 +225,16 @@ pub fn tick(inputs: TickInputs<'_>) -> StepOutcome {
     // and the leader's bandwidth budget rejects with
     // `Backpressure` if it can't keep up.
     if inputs.current_role == ReplicaRole::Replica {
-        if let Some(leader) = inputs.tracker.believed_leader() {
+        // R-15: filter out a misrouted self-as-leader heartbeat
+        // before emitting a SyncRequest. The tracker normally
+        // doesn't see self heartbeats but a defensive filter
+        // keeps `tick()` from ever emitting a wire frame
+        // addressed to the local node id.
+        if let Some(leader) = inputs
+            .tracker
+            .believed_leader()
+            .filter(|&l| l != inputs.self_node_id)
+        {
             if let Some(peer) = inputs.tracker.peer_state(leader) {
                 if peer.tail_seq > inputs.tail_seq {
                     outcome.outbound.push(OutboundMessage::SyncRequest {
@@ -856,6 +865,40 @@ mod tests {
                 target: ReplicaRole::Candidate,
                 signal: TransitionSignal::MissedHeartbeats,
             }),
+        );
+    }
+
+    /// R-15: a misrouted self-as-leader heartbeat in the tracker
+    /// must NOT produce a SyncRequest addressed to self. The
+    /// production filter at the tick layer drops the case
+    /// defensively even if the tracker is somehow polluted.
+    #[test]
+    fn replica_with_self_as_believed_leader_emits_no_sync_request() {
+        let mut tracker = HeartbeatTracker::new(500);
+        let base = t0();
+        // Pathological setup: record a heartbeat as if self
+        // were the leader (e.g. test loopback misroute).
+        tracker.record_heartbeat(0x10, ReplicaRole::Leader, 99, base);
+        let inputs = TickInputs {
+            self_node_id: 0x10,
+            current_role: ReplicaRole::Replica,
+            channel_id: channel_id_for("test/self_loop"),
+            tail_seq: 0,
+            replica_set: &[0x10, 0x42],
+            tracker: &tracker,
+            wall_clock_ms: 0,
+            chunk_max_bytes: 256 * 1024,
+            now: at(base, 100),
+        };
+        let outcome = tick(inputs);
+        // No SyncRequest addressed to anyone; the believed
+        // leader filter rejected self.
+        assert!(
+            outcome
+                .outbound
+                .iter()
+                .all(|m| !matches!(m, OutboundMessage::SyncRequest { .. })),
+            "self-as-leader must not produce a SyncRequest"
         );
     }
 }
