@@ -302,8 +302,8 @@ mod tests {
         let set = [0xAA, 0xBB];
         let outcome = elect(
             &set,
-            0xFF,             // self not in set
-            rtt_table(&[]),   // no measurements at all
+            0xFF,           // self not in set
+            rtt_table(&[]), // no measurements at all
             alive_set(&[0xAA, 0xBB]),
         );
         assert_eq!(outcome, ElectionOutcome::PeerWins(0xAA));

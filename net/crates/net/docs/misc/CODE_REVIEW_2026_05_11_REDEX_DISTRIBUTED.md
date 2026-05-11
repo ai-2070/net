@@ -71,26 +71,26 @@ Tagged `[H | M | L]`:
 | C-2   | M   | tests       | Divergence-freedom check only runs on happy path, not after fault         | ✅ |
 | C-3   | M   | tests       | `chain_discovery.rs` tests are single-node only                           | 🚫 deferred — multi-peer coverage needs broader test harness |
 | C-4   | L   | tests       | No FFI test exercises `net_redex_enable_replication` success path        | 📝 R-8 regression test covers the error path; success path is e2e-only |
-| R-45  | M   | wire        | `SyncNack::from_bytes` `Truncated.need` formula still wrong (R-23 arm)    | ⏳ |
-| R-46  | M   | tests       | Election-storm DST scenario never references `election_thrash_total`     | ⏳ |
-| R-47  | M   | wire        | `SyncNack::to_bytes` truncates `detail` mid-UTF-8 codepoint               | ⏳ |
-| R-48  | M   | runtime     | Post-election second `transition_to` failure strands coordinator in Candidate | ⏳ |
-| R-49  | M   | runtime     | `cancel()` uses `inbox.send(Shutdown).await` — hangs on full bounded inbox | ⏳ |
-| R-50  | M   | runtime     | `let _ = current_role;` half-applied R-10 fix — dead binding              | ⏳ |
-| R-51  | M   | runtime     | Disk-pressure / channel-closed signals send invalid transitions from Leader / Candidate | ⏳ |
-| R-52  | M   | runtime     | `ReplicationRuntimeHandle` lacks `Drop` — task + dispatcher Arc cycle leaks if handle dropped out-of-band | ⏳ |
-| R-53  | M   | manager     | Reopen with differing replication config silently drops the new config    | ⏳ |
-| R-54  | M   | ffi         | `net_redex_open_file` / `net_redex_file_tail` don't pre-zero out-pointers on error paths | ⏳ |
-| R-55  | M   | py binding  | `runtime.block_on` in open/tail/watch paths holds the GIL across async work | ⏳ |
-| R-56  | M   | node binding| Sync `#[napi]` methods do blocking disk I/O on the JS event-loop thread   | ⏳ |
-| R-57  | L   | heartbeat   | `heartbeat_ms.saturating_mul(miss_threshold)` with bad config disables silence detection | ⏳ |
-| R-58  | L   | docs        | `include/README.md` lists symbols but is missing several `net_redex_*` entries | ⏳ |
-| R-59  | L   | e2e         | `replication_overhead_within_30_percent_budget` is wall-clock perf on shared CI — flake | ⏳ |
-| R-60  | L   | e2e         | `bandwidth_budget_is_observable_in_metrics` proves field plumbing, not that the budget engages | ⏳ |
-| R-61  | L   | loom        | Metrics loom model increments different counters per thread; no contention exercised | ⏳ |
-| R-62  | L   | budget      | `BandwidthBudget::try_consume` for a request larger than `capacity` can never succeed | ⏳ |
-| R-63  | L   | election    | Healthy peers with `rtt_to == None` are silently excluded from candidacy  | ⏳ |
-| R-64  | L   | go binding  | `factor` / `heartbeat_ms` out-of-range route to `ErrReplicationRequiresEnable`, not `ErrInvalidReplicationConfig` | ⏳ |
+| R-45  | M   | wire        | `SyncNack::from_bytes` `Truncated.need` formula still wrong (R-23 arm)    | ✅ |
+| R-46  | M   | tests       | Election-storm DST scenario never references `election_thrash_total`     | ✅ (counter mirrored in harness) |
+| R-47  | M   | wire        | `SyncNack::to_bytes` truncates `detail` mid-UTF-8 codepoint               | ✅ |
+| R-48  | M   | runtime     | Post-election second `transition_to` failure strands coordinator in Candidate | ✅ |
+| R-49  | M   | runtime     | `cancel()` uses `inbox.send(Shutdown).await` — hangs on full bounded inbox | ✅ |
+| R-50  | M   | runtime     | `let _ = current_role;` half-applied R-10 fix — dead binding              | ✅ |
+| R-51  | M   | runtime     | Disk-pressure / channel-closed signals send invalid transitions from Leader / Candidate | ✅ |
+| R-52  | M   | runtime     | `ReplicationRuntimeHandle` lacks `Drop` — task + dispatcher Arc cycle leaks if handle dropped out-of-band | ✅ |
+| R-53  | M   | manager     | Reopen with differing replication config silently drops the new config    | ✅ |
+| R-54  | M   | ffi         | `net_redex_open_file` / `net_redex_file_tail` don't pre-zero out-pointers on error paths | ✅ |
+| R-55  | M   | py binding  | `runtime.block_on` in open/tail/watch paths holds the GIL across async work | ✅ |
+| R-56  | M   | node binding| Sync `#[napi]` methods do blocking disk I/O on the JS event-loop thread   | ✅ (sync + close only; append/read kept sync) |
+| R-57  | L   | heartbeat   | `heartbeat_ms.saturating_mul(miss_threshold)` with bad config disables silence detection | ✅ |
+| R-58  | L   | docs        | `include/README.md` lists symbols but is missing several `net_redex_*` entries | ✅ |
+| R-59  | L   | e2e         | `replication_overhead_within_30_percent_budget` is wall-clock perf on shared CI — flake | ✅ (now `#[ignore]`) |
+| R-60  | L   | e2e         | `bandwidth_budget_is_observable_in_metrics` proves field plumbing, not that the budget engages | ✅ (renamed) |
+| R-61  | L   | loom        | Metrics loom model increments different counters per thread; no contention exercised | ✅ (added 3-way same-counter case; existing test already contended on `leader_changes_total`) |
+| R-62  | L   | budget      | `BandwidthBudget::try_consume` for a request larger than `capacity` can never succeed | ✅ (full-bucket admit-once-and-drain escape hatch) |
+| R-63  | L   | election    | Healthy peers with `rtt_to == None` are silently excluded from candidacy  | ✅ (now ranked at `Duration::MAX`) |
+| R-64  | L   | go binding  | `factor` / `heartbeat_ms` out-of-range route to `ErrReplicationRequiresEnable`, not `ErrInvalidReplicationConfig` | ✅ |
 
 ---
 

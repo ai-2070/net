@@ -563,9 +563,8 @@ impl PyRedexFile {
         use futures::StreamExt;
         let adapter = self.inner.clone();
         let runtime = self.runtime.clone();
-        let stream = py.detach(move || {
-            runtime.block_on(async move { adapter.tail(from_seq).boxed() })
-        });
+        let stream =
+            py.detach(move || runtime.block_on(async move { adapter.tail(from_seq).boxed() }));
         PyRedexTailIter {
             inner: Arc::new(RedexTailIterInner {
                 stream: TokioMutex::new(Some(stream)),
@@ -957,8 +956,8 @@ impl PyTasksAdapter {
         // `stream()` requires an active tokio runtime (it spawns a
         // forwarding task); run via block_on to install the context.
         let runtime = self.runtime.clone();
-        let stream: BoxStream<'static, Vec<InnerTask>> = py
-            .detach(move || runtime.block_on(async move { w.stream().boxed() }));
+        let stream: BoxStream<'static, Vec<InnerTask>> =
+            py.detach(move || runtime.block_on(async move { w.stream().boxed() }));
         Ok(new_task_watch_iter(stream, self.runtime.clone()))
     }
 
@@ -1012,8 +1011,8 @@ impl PyTasksAdapter {
         )?;
         let adapter = self.inner.clone();
         let runtime = self.runtime.clone();
-        let (snapshot, stream) = py
-            .detach(move || runtime.block_on(async move { adapter.snapshot_and_watch(w) }));
+        let (snapshot, stream) =
+            py.detach(move || runtime.block_on(async move { adapter.snapshot_and_watch(w) }));
         Ok((
             snapshot.into_iter().map(PyTask::from).collect(),
             new_task_watch_iter(stream, self.runtime.clone()),
@@ -1458,8 +1457,8 @@ impl PyMemoriesAdapter {
             limit,
         )?;
         let runtime = self.runtime.clone();
-        let stream: BoxStream<'static, Vec<InnerMemory>> = py
-            .detach(move || runtime.block_on(async move { w.stream().boxed() }));
+        let stream: BoxStream<'static, Vec<InnerMemory>> =
+            py.detach(move || runtime.block_on(async move { w.stream().boxed() }));
         Ok(new_memory_watch_iter(stream, self.runtime.clone()))
     }
 
@@ -1514,8 +1513,8 @@ impl PyMemoriesAdapter {
         )?;
         let adapter = self.inner.clone();
         let runtime = self.runtime.clone();
-        let (snapshot, stream) = py
-            .detach(move || runtime.block_on(async move { adapter.snapshot_and_watch(w) }));
+        let (snapshot, stream) =
+            py.detach(move || runtime.block_on(async move { adapter.snapshot_and_watch(w) }));
         Ok((
             snapshot.into_iter().map(PyMemory::from).collect(),
             new_memory_watch_iter(stream, self.runtime.clone()),

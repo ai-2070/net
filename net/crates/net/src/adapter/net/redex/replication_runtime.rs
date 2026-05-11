@@ -1365,7 +1365,9 @@ mod tests {
         ) -> Result<(), AdapterError> {
             let mut r = self.remaining.lock();
             if *r == 0 {
-                return Err(AdapterError::Transient("simulated sink failure".to_string()));
+                return Err(AdapterError::Transient(
+                    "simulated sink failure".to_string(),
+                ));
             }
             *r -= 1;
             Ok(())
