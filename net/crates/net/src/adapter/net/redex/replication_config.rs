@@ -41,6 +41,16 @@ pub const REPLICATION_FACTOR_DEFAULT: u8 = 3;
 /// busy-loop.
 pub const HEARTBEAT_MS_MIN: u64 = 100;
 
+/// Maximum heartbeat cadence. Five minutes is well past the longest
+/// reasonable failover detection window; values above this risk
+/// silently disabling silence detection via the
+/// `heartbeat_ms.saturating_mul(miss_threshold)` arithmetic in the
+/// heartbeat tracker, which saturates to `u64::MAX` and makes
+/// `is_leader_silent` always return `false`. Pin a sane ceiling so
+/// a typo / unit-confusion (passing μs instead of ms) can't disable
+/// the failure detector.
+pub const HEARTBEAT_MS_MAX: u64 = 300_000;
+
 /// Default heartbeat cadence — 500 ms matches the plan §1 default and
 /// the §6 "3 × heartbeat" lag bound; with three-missed hysteresis the
 /// effective failover detection window is ~1.5 s, well under the
@@ -241,6 +251,12 @@ impl ReplicationConfig {
                 min: HEARTBEAT_MS_MIN,
             });
         }
+        if self.heartbeat_ms > HEARTBEAT_MS_MAX {
+            return Err(ReplicationConfigError::HeartbeatTooHigh {
+                got: self.heartbeat_ms,
+                max: HEARTBEAT_MS_MAX,
+            });
+        }
         if !self.replication_budget_fraction.is_finite()
             || self.replication_budget_fraction <= 0.0
             || self.replication_budget_fraction > 1.0
@@ -311,6 +327,17 @@ pub enum ReplicationConfigError {
         got: u64,
         /// Minimum permitted heartbeat cadence.
         min: u64,
+    },
+    /// `heartbeat_ms` is above the [`HEARTBEAT_MS_MAX`] ceiling.
+    /// Pathological values let
+    /// `heartbeat_ms.saturating_mul(miss_threshold)` saturate to
+    /// `u64::MAX`, silently disabling silence detection.
+    #[error("heartbeat_ms {got} above maximum {max} ms")]
+    HeartbeatTooHigh {
+        /// Configured heartbeat cadence.
+        got: u64,
+        /// Maximum permitted heartbeat cadence.
+        max: u64,
     },
     /// `replication_budget_fraction` is outside `(0.0, 1.0]` or
     /// non-finite (NaN / ±inf).
@@ -412,6 +439,32 @@ mod tests {
             err,
             ReplicationConfigError::HeartbeatTooLow { got: 50, min: 100 }
         ));
+    }
+
+    #[test]
+    fn heartbeat_above_max_rejected() {
+        // Pathological config: heartbeat_ms = u64::MAX would let the
+        // tracker's `saturating_mul(heartbeat_ms, miss_threshold)`
+        // saturate to u64::MAX, making `is_leader_silent` always
+        // return false. Pin the ceiling so unit-confusion
+        // (passing microseconds instead of milliseconds) cannot
+        // disable silence detection.
+        let cfg = ReplicationConfig::new().with_heartbeat_ms(HEARTBEAT_MS_MAX + 1);
+        let err = cfg.validate().expect_err("heartbeat above max must fail");
+        match err {
+            ReplicationConfigError::HeartbeatTooHigh { got, max } => {
+                assert_eq!(got, HEARTBEAT_MS_MAX + 1);
+                assert_eq!(max, HEARTBEAT_MS_MAX);
+            }
+            other => panic!("expected HeartbeatTooHigh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn heartbeat_at_max_accepted() {
+        let cfg = ReplicationConfig::new().with_heartbeat_ms(HEARTBEAT_MS_MAX);
+        cfg.validate()
+            .expect("heartbeat at the ceiling is permitted (inclusive)");
     }
 
     #[test]
