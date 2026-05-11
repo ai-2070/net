@@ -70,8 +70,8 @@ pub use replication_coordinator::{
 pub use replication_election::{elect, ElectionOutcome};
 pub use replication_heartbeat::{HeartbeatTracker, PeerState, DEFAULT_MISS_THRESHOLD};
 pub use replication_runtime::{
-    spawn_replication_runtime, Inbound, ReplicationDispatcher, ReplicationRuntimeHandle,
-    RttLookup, RuntimeInputs, RUNTIME_INBOX_CAPACITY,
+    spawn_replication_runtime, Inbound, ReplicationDispatcher, ReplicationInboundRouter,
+    ReplicationRuntimeHandle, RttLookup, RuntimeInputs, RUNTIME_INBOX_CAPACITY,
 };
 pub use replication_step::{
     election_outcome, tick, OutboundMessage, PendingTransition, StepOutcome, TickInputs,

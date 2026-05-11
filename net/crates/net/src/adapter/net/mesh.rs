@@ -272,6 +272,12 @@ struct DispatchCtx {
     /// before user migration traffic lands, which is otherwise
     /// awkward because a started `Mesh` is shared by `Arc`.
     migration_handler: Arc<ArcSwapOption<MigrationSubprotocolHandler>>,
+    /// Optional replication inbound router. See the matching
+    /// field doc on `MeshNode`.
+    #[cfg(feature = "redex")]
+    replication_inbound_router: Arc<
+        parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>,
+    >,
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
@@ -1282,6 +1288,26 @@ pub struct MeshNode {
     /// tags that `announce_capabilities_with` overlays at broadcast
     /// time. `None` until the first `announce_*` call.
     user_caps: Arc<parking_lot::RwLock<Option<CapabilitySet>>>,
+    /// Optional per-node replication inbound router. `Redex`
+    /// installs one of these via [`Self::set_replication_inbound_router`]
+    /// when the first replicated channel opens; subsequent
+    /// `SUBPROTOCOL_REDEX` inbound frames route through it to
+    /// the right per-channel runtime task. `None` when no
+    /// replicated channels exist on this node; in that case
+    /// inbound `SUBPROTOCOL_REDEX` frames are dropped (the
+    /// substrate ignores them rather than spawning per-channel
+    /// state on demand).
+    ///
+    /// `parking_lot::RwLock` (rather than `ArcSwapOption`) — the
+    /// `dyn ReplicationInboundRouter` trait object behind the
+    /// `Arc` is `!Sized`, which `arc_swap`'s `RefCnt` bound
+    /// rejects. The dispatch hot path takes a read lock on
+    /// every inbound `SUBPROTOCOL_REDEX` frame; reader-favored
+    /// + uncontended reads keep this in single-digit-nanoseconds.
+    #[cfg(feature = "redex")]
+    replication_inbound_router: Arc<
+        parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>,
+    >,
     /// Monotonic version counter used when stamping our own
     /// announcements. `CapabilityIndex::index` skips older versions,
     /// so this must move forward across restarts if the caller wants
@@ -1605,6 +1631,8 @@ impl MeshNode {
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
             local_announcement: Arc::new(ArcSwapOption::empty()),
             user_caps: Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(feature = "redex")]
+            replication_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
             capability_version: Arc::new(AtomicU64::new(0)),
             local_subnet,
             local_subnet_policy,
@@ -2388,6 +2416,8 @@ impl MeshNode {
             rpc_inbound_dispatchers: self.rpc_inbound_dispatchers.clone(),
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
+            #[cfg(feature = "redex")]
+            replication_inbound_router: self.replication_inbound_router.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
             pending_direct_initiators: self.pending_direct_initiators.clone(),
             static_keypair: self.static_keypair.clone(),
@@ -3359,6 +3389,35 @@ impl MeshNode {
 
             for payload in events {
                 Self::handle_capability_announcement(&payload, from_node, ctx);
+            }
+            return;
+        }
+
+        // Replication: per-channel runtime tasks own the
+        // per-channel state. The router (installed by `Redex`
+        // via `MeshNode::set_replication_inbound_router`) maps
+        // `ChannelId → ReplicationRuntimeHandle` and dispatches
+        // each decoded `Inbound::*` synchronously. `None` router
+        // = no replicated channels on this node = drop.
+        #[cfg(feature = "redex")]
+        if parsed.header.subprotocol_id == super::redex::SUBPROTOCOL_REDEX {
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            if events.is_empty() {
+                return;
+            }
+            let router_guard = ctx.replication_inbound_router.read();
+            let Some(router) = router_guard.as_ref() else {
+                // No replicated channels — drop silently.
+                return;
+            };
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+            for payload in events {
+                Self::dispatch_replication_payload(&payload, from_node, router.as_ref());
             }
             return;
         }
@@ -4504,6 +4563,86 @@ impl MeshNode {
     /// wire; we pin `node_id → entity_id` on first sight so a
     /// later announcement claiming a different `entity_id` for the
     /// same `node_id` won't silently rebind identity.
+    /// Decode + route a single `SUBPROTOCOL_REDEX` event payload
+    /// to the per-channel runtime via the installed
+    /// [`super::redex::ReplicationInboundRouter`]. The payload's
+    /// 3-byte header (`subprotocol_id u16 LE + dispatch_code u8`)
+    /// keys the [`super::redex::Inbound`] variant constructed from
+    /// the rest. Malformed payloads (bad subprotocol id, unknown
+    /// dispatch code, truncated body) are dropped silently —
+    /// reliable-stream + the peer's heartbeat cycle recovers
+    /// observable state without them.
+    #[cfg(feature = "redex")]
+    fn dispatch_replication_payload(
+        payload: &[u8],
+        from_node: u64,
+        router: &dyn super::redex::ReplicationInboundRouter,
+    ) {
+        use super::redex::{
+            Inbound, SyncHeartbeat, SyncNack, SyncRequest, SyncResponse,
+            DISPATCH_SYNC_HEARTBEAT, DISPATCH_SYNC_NACK, DISPATCH_SYNC_REQUEST,
+            DISPATCH_SYNC_RESPONSE,
+        };
+        if payload.len() < 3 {
+            return;
+        }
+        // dispatch_code lives at byte 2 (after subprotocol_id u16 LE).
+        // Each wire type's `from_bytes` validates the full 3-byte
+        // header internally; we just peek to choose the decoder.
+        let dispatch_code = payload[2];
+        let (channel_id, event) = match dispatch_code {
+            DISPATCH_SYNC_HEARTBEAT => match SyncHeartbeat::from_bytes(payload) {
+                Ok(msg) => (
+                    msg.channel_id,
+                    Inbound::Heartbeat {
+                        from: from_node,
+                        msg,
+                    },
+                ),
+                Err(_) => return,
+            },
+            DISPATCH_SYNC_REQUEST => match SyncRequest::from_bytes(payload) {
+                Ok(msg) => (
+                    msg.channel_id,
+                    Inbound::SyncRequest {
+                        from: from_node,
+                        msg,
+                    },
+                ),
+                Err(_) => return,
+            },
+            DISPATCH_SYNC_RESPONSE => match SyncResponse::from_bytes(payload) {
+                Ok(msg) => (
+                    msg.channel_id,
+                    Inbound::SyncResponse {
+                        from: from_node,
+                        msg,
+                    },
+                ),
+                Err(_) => return,
+            },
+            DISPATCH_SYNC_NACK => match SyncNack::from_bytes(payload) {
+                Ok(msg) => (
+                    msg.channel_id,
+                    Inbound::SyncNack {
+                        from: from_node,
+                        msg,
+                    },
+                ),
+                Err(_) => return,
+            },
+            // Reserved range `0x24..0x2F` lands here when a future
+            // peer uses a code we haven't taught yet — silently
+            // drop per the opaque-forwarding contract from
+            // `SUBPROTOCOLS.md`.
+            _ => return,
+        };
+        // Try to route. Full-buffer rejection / unknown channel
+        // return `Err(event)`; both shapes are "drop silently"
+        // here — reliable-stream / heartbeat cycle recovers.
+        let _ = router.try_route(channel_id, event);
+    }
+
     fn handle_capability_announcement(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
         let Some(ann) = CapabilityAnnouncement::from_bytes(payload) else {
             tracing::trace!(
@@ -6165,6 +6304,23 @@ impl MeshNode {
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_causal_tags(&mut snapshot, origin_hash, None);
         self.announce_capabilities(snapshot).await
+    }
+
+    /// Install (or replace) the `SUBPROTOCOL_REDEX` inbound
+    /// router. Used by `Redex` to register a per-node router
+    /// that owns the per-channel runtime registry; the mesh
+    /// dispatch hot-path consults this router on every inbound
+    /// `SUBPROTOCOL_REDEX` frame.
+    ///
+    /// Passing `None` un-installs the router — every subsequent
+    /// inbound replication frame is dropped silently until a new
+    /// router is installed.
+    #[cfg(feature = "redex")]
+    pub fn set_replication_inbound_router(
+        &self,
+        router: Option<Arc<dyn super::redex::ReplicationInboundRouter>>,
+    ) {
+        *self.replication_inbound_router.write() = router;
     }
 
     /// Return every node currently advertising any `causal:<hex>*`
@@ -9139,6 +9295,182 @@ mod heartbeat_aead_tests {
                 line,
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "redex")]
+mod replication_dispatch_tests {
+    //! Pure-logic tests for `dispatch_replication_payload`. Covers
+    //! the wire-format dispatch routing (header → variant) without
+    //! spinning a real `MeshNode`.
+    use super::*;
+    use crate::adapter::net::redex::{
+        Inbound, ReplicationInboundRouter, SyncHeartbeat, SyncNack, SyncNackError,
+        SyncRequest, SyncResponse, DISPATCH_SYNC_NACK,
+    };
+    use crate::adapter::net::redex::{ChannelId, ReplicaRole};
+    use parking_lot::Mutex as ParkingMutex;
+
+    #[derive(Default)]
+    struct RecorderRouter {
+        events: ParkingMutex<Vec<(ChannelId, Inbound)>>,
+        /// When set, `try_route` returns the event back unrouted.
+        always_reject: ParkingMutex<bool>,
+    }
+
+    impl ReplicationInboundRouter for RecorderRouter {
+        fn try_route(
+            &self,
+            channel_id: ChannelId,
+            inbound: Inbound,
+        ) -> Result<(), Inbound> {
+            if *self.always_reject.lock() {
+                return Err(inbound);
+            }
+            self.events.lock().push((channel_id, inbound));
+            Ok(())
+        }
+    }
+
+    fn cid_for(name: &str) -> ChannelId {
+        let cn = ChannelName::new(name).unwrap();
+        ChannelId::from_name(&cn)
+    }
+
+    #[test]
+    fn heartbeat_dispatches_to_router() {
+        let cid = cid_for("test/heartbeat");
+        let hb = SyncHeartbeat {
+            channel_id: cid,
+            tail_seq: 42,
+            role: ReplicaRole::Leader,
+            wall_clock_ms: 0,
+        };
+        let payload = hb.to_bytes();
+        let router = RecorderRouter::default();
+        MeshNode::dispatch_replication_payload(&payload, 0xDEAD_BEEF, &router);
+        let events = router.events.lock();
+        assert_eq!(events.len(), 1);
+        let (got_cid, ref got_inbound) = events[0];
+        assert_eq!(got_cid, cid);
+        assert!(matches!(
+            got_inbound,
+            Inbound::Heartbeat { from: 0xDEAD_BEEF, .. }
+        ));
+    }
+
+    #[test]
+    fn sync_request_dispatches_to_router() {
+        let cid = cid_for("test/sync_request");
+        let req = SyncRequest {
+            channel_id: cid,
+            since_seq: 100,
+            chunk_max: 4096,
+        };
+        let payload = req.to_bytes();
+        let router = RecorderRouter::default();
+        MeshNode::dispatch_replication_payload(&payload, 0x12, &router);
+        let events = router.events.lock();
+        assert!(matches!(events[0].1, Inbound::SyncRequest { from: 0x12, .. }));
+    }
+
+    #[test]
+    fn sync_response_dispatches_to_router() {
+        let cid = cid_for("test/sync_response");
+        let resp = SyncResponse {
+            channel_id: cid,
+            first_seq: 0,
+            events: vec![],
+        };
+        let payload = resp.to_bytes();
+        let router = RecorderRouter::default();
+        MeshNode::dispatch_replication_payload(&payload, 0x34, &router);
+        let events = router.events.lock();
+        assert!(matches!(events[0].1, Inbound::SyncResponse { from: 0x34, .. }));
+    }
+
+    #[test]
+    fn sync_nack_dispatches_to_router() {
+        let cid = cid_for("test/sync_nack");
+        let nack = SyncNack {
+            channel_id: cid,
+            since_seq: 50,
+            error_code: SyncNackError::NotLeader,
+            detail: "re-resolve leader".to_string(),
+        };
+        let payload = nack.to_bytes();
+        let router = RecorderRouter::default();
+        MeshNode::dispatch_replication_payload(&payload, 0x56, &router);
+        let events = router.events.lock();
+        assert!(matches!(events[0].1, Inbound::SyncNack { from: 0x56, .. }));
+    }
+
+    #[test]
+    fn truncated_payload_dropped_silently() {
+        let router = RecorderRouter::default();
+        // Just the 3-byte header but body is missing.
+        let payload: Vec<u8> = vec![0x00, 0x0E, DISPATCH_SYNC_NACK];
+        MeshNode::dispatch_replication_payload(&payload, 0, &router);
+        assert!(router.events.lock().is_empty());
+    }
+
+    #[test]
+    fn payload_shorter_than_header_dropped() {
+        let router = RecorderRouter::default();
+        let payload: Vec<u8> = vec![0x00, 0x0E]; // missing dispatch byte
+        MeshNode::dispatch_replication_payload(&payload, 0, &router);
+        assert!(router.events.lock().is_empty());
+    }
+
+    #[test]
+    fn unknown_dispatch_code_dropped() {
+        let router = RecorderRouter::default();
+        // Valid subprotocol id, but dispatch code outside
+        // 0x20..=0x23 (the implemented range). 0x2F is in the
+        // reserved-future range.
+        let payload: Vec<u8> = vec![0x00, 0x0E, 0x2F, 0xAA, 0xBB];
+        MeshNode::dispatch_replication_payload(&payload, 0, &router);
+        assert!(router.events.lock().is_empty());
+    }
+
+    #[test]
+    fn wrong_subprotocol_id_in_payload_dropped() {
+        // Payload's leading 2 bytes claim a different
+        // subprotocol id — the per-message decoder rejects it.
+        let cid = cid_for("test/wrong_subprotocol");
+        let hb = SyncHeartbeat {
+            channel_id: cid,
+            tail_seq: 0,
+            role: ReplicaRole::Leader,
+            wall_clock_ms: 0,
+        };
+        let mut payload = hb.to_bytes();
+        payload[0] = 0x00;
+        payload[1] = 0x05; // SUBPROTOCOL_MIGRATION
+        let router = RecorderRouter::default();
+        MeshNode::dispatch_replication_payload(&payload, 0, &router);
+        assert!(router.events.lock().is_empty());
+    }
+
+    #[test]
+    fn router_rejection_swallowed_silently() {
+        // Router returns the event back (full buffer / unknown
+        // channel). Dispatch hot-path must not panic; the event
+        // is simply dropped.
+        let cid = cid_for("test/rejection");
+        let hb = SyncHeartbeat {
+            channel_id: cid,
+            tail_seq: 0,
+            role: ReplicaRole::Leader,
+            wall_clock_ms: 0,
+        };
+        let payload = hb.to_bytes();
+        let router = RecorderRouter::default();
+        *router.always_reject.lock() = true;
+        // Should not panic.
+        MeshNode::dispatch_replication_payload(&payload, 0, &router);
+        assert!(router.events.lock().is_empty());
     }
 }
 

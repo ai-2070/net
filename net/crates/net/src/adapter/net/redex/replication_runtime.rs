@@ -93,6 +93,84 @@ pub trait ReplicationDispatcher: Send + Sync {
 /// graph_id_of(node))`; unit tests pass a static closure.
 pub type RttLookup = Arc<dyn Fn(NodeId) -> Option<Duration> + Send + Sync>;
 
+/// Sync, non-blocking router the mesh's inbound dispatch hot path
+/// calls when a `SUBPROTOCOL_REDEX` payload arrives. Owns the
+/// per-channel registry of [`ReplicationRuntimeHandle`]s and
+/// routes the decoded [`Inbound`] event to the right one.
+///
+/// Returns `Err(Inbound)` (the event, returned) when:
+/// - No runtime is registered for `channel_id` (channel not opened
+///   on this node, or the runtime was canceled and not yet
+///   unregistered).
+/// - The runtime's inbox is full (per-channel backlog at
+///   [`RUNTIME_INBOX_CAPACITY`]).
+///
+/// In both cases the caller (mesh dispatch loop) drops + logs;
+/// the wire layer's reliable-stream may retransmit, or the
+/// peer's heartbeat cycle will recover state without it.
+pub trait ReplicationInboundRouter: Send + Sync {
+    /// Try to route an inbound event to its channel's runtime.
+    /// Sync + non-blocking — must not call into async code, must
+    /// not hold locks across awaits (the mesh dispatch loop is
+    /// the sole caller and runs in a synchronous critical
+    /// section).
+    fn try_route(&self, channel_id: ChannelId, inbound: Inbound) -> Result<(), Inbound>;
+}
+
+#[async_trait::async_trait]
+impl ReplicationDispatcher for crate::adapter::net::MeshNode {
+    async fn send_heartbeat(
+        &self,
+        target: NodeId,
+        msg: SyncHeartbeat,
+    ) -> Result<(), AdapterError> {
+        send_redex_payload(self, target, msg.to_bytes()).await
+    }
+
+    async fn send_sync_request(
+        &self,
+        target: NodeId,
+        msg: SyncRequest,
+    ) -> Result<(), AdapterError> {
+        send_redex_payload(self, target, msg.to_bytes()).await
+    }
+
+    async fn send_sync_response(
+        &self,
+        target: NodeId,
+        msg: SyncResponse,
+    ) -> Result<(), AdapterError> {
+        send_redex_payload(self, target, msg.to_bytes()).await
+    }
+
+    async fn send_sync_nack(
+        &self,
+        target: NodeId,
+        msg: SyncNack,
+    ) -> Result<(), AdapterError> {
+        send_redex_payload(self, target, msg.to_bytes()).await
+    }
+}
+
+/// Resolve a `NodeId` to its peer `SocketAddr` and ship `payload`
+/// via `MeshNode::send_subprotocol` with `SUBPROTOCOL_REDEX`. The
+/// `payload` already carries the 3-byte subprotocol header per
+/// plan §2; the substrate's Net header carries `subprotocol_id`
+/// independently for routing — the redundancy is plan-mandated
+/// (the application-layer header is part of the wire contract,
+/// distinct from the transport-layer Net header).
+async fn send_redex_payload(
+    mesh: &crate::adapter::net::MeshNode,
+    target: NodeId,
+    payload: Vec<u8>,
+) -> Result<(), AdapterError> {
+    let peer_addr = mesh.peer_addr(target).ok_or_else(|| {
+        AdapterError::Connection(format!("replication: peer {target:#x} unknown"))
+    })?;
+    mesh.send_subprotocol(peer_addr, super::replication::SUBPROTOCOL_REDEX, &payload)
+        .await
+}
+
 /// Inbound event the runtime processes. The mesh-side dispatcher
 /// pushes one of these into the runtime's inbox per inbound wire
 /// frame; the runtime's task drains the receiver on every wakeup.
