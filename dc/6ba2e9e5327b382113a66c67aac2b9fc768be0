@@ -1,0 +1,32 @@
+net/crates/net/bindings/go/net/redex.go
+  s_4dbb97ea6ebffd::t_863e04959864cd 508-581
+  s_4dbb97ea6ebffd::t_c029524ccecf16 117-124
+net/crates/net/src/ffi/cortex.rs
+  s_4dbb97ea6ebffd::t_5bd8aa02a82e49 628-754
+net/crates/net/bindings/node/src/cortex.rs
+  s_4dbb97ea6ebffd::t_57f7eb0f1ccf98 352,355
+  s_4dbb97ea6ebffd::t_4be356a68d2c23 485-505
+  s_4dbb97ea6ebffd::t_3fd5dfd6ea811d 329-351,353-354,356-384
+net/crates/net/bindings/python/Cargo.toml
+  s_4dbb97ea6ebffd::t_90f8f5d17d7e4c 52-54
+net/crates/net/bindings/python/src/cortex.rs
+  s_4dbb97ea6ebffd::t_2dfc0415a59d4e 533-603
+net/crates/net/bindings/node/Cargo.toml
+  s_4dbb97ea6ebffd::t_594ebf914976f6 56-57
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "dc6ba2e9e5327b382113a66c67aac2b9fc768be0",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
