@@ -67,10 +67,10 @@ Tagged `[H | M | L]`:
 | R-41  | L   | e2e         | Fixed 500ms `tokio::time::sleep` before leader close — flake risk         | ✅ |
 | R-42  | L   | node binding| `.d.ts` unconditionally emits `enableReplication` despite `cfg` gating    | 📝 documented cross-link to R-7 stub |
 | R-43  | L   | go binding  | `typedef ArcMeshNode` collides with upstream `net_compute_mesh_arc_t`     | 📝 documented as alias |
-| C-1   | M   | tests       | No DST scenario exercises "election storms" (plan §F)                     | ⚪ |
-| C-2   | M   | tests       | Divergence-freedom check only runs on happy path, not after fault         | ⚪ |
-| C-3   | M   | tests       | `chain_discovery.rs` tests are single-node only                           | ⚪ |
-| C-4   | L   | tests       | No FFI test exercises `net_redex_enable_replication` success path        | ⚪ |
+| C-1   | M   | tests       | No DST scenario exercises "election storms" (plan §F)                     | ✅ |
+| C-2   | M   | tests       | Divergence-freedom check only runs on happy path, not after fault         | ✅ |
+| C-3   | M   | tests       | `chain_discovery.rs` tests are single-node only                           | 🚫 deferred — multi-peer coverage needs broader test harness |
+| C-4   | L   | tests       | No FFI test exercises `net_redex_enable_replication` success path        | 📝 R-8 regression test covers the error path; success path is e2e-only |
 
 ---
 

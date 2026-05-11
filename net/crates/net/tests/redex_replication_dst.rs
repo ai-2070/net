@@ -1015,3 +1015,214 @@ fn no_two_leaders_within_a_partition_post_failover_with_central_peer() {
     // The new Leader is B (the central peer).
     assert_eq!(cluster.nodes.get(&b).unwrap().role, ReplicaRole::Leader);
 }
+
+/// C-1 — election-storms scenario: kill the leader, let the
+/// election complete, kill the new leader, repeat. Pin that each
+/// individual election still converges within the hysteresis
+/// budget (3 missed heartbeats × heartbeat_ms).
+///
+/// Per plan §F:
+/// > Election storms — sustained leader-loss detection for various
+/// > reasons (heartbeat loss, proximity-graph false positives);
+/// > assert election thrash is bounded by hysteresis.
+///
+/// The harness's `run_until` panics if any round exceeds
+/// `STEP_BUDGET`, so reaching the end of the test pins the
+/// "bounded by hysteresis" guarantee. Each round drives the
+/// state machine through a complete Replica → Candidate →
+/// Leader transition for the new winner, exercising both
+/// validation (`StateTransition::apply` rejects invalid pairs)
+/// and convergence.
+#[test]
+fn election_storm_two_rounds_each_converges_within_hysteresis() {
+    let a = 0x10u64;
+    let b = 0x20u64;
+    let c = 0x30u64;
+    let d = 0x40u64;
+    let mut cluster = VirtualCluster::new(&[a, b, c, d], "dst/election_storm");
+    cluster.force_leader(a);
+    cluster.force_replica(b);
+    cluster.force_replica(c);
+    cluster.force_replica(d);
+
+    // Asymmetric RTT — B is unambiguously the central peer among
+    // {B, C, D} from C's and D's view. This makes the
+    // post-A-kill election deterministically pick B.
+    cluster.rtt.insert((b, c), Duration::ZERO);
+    cluster.rtt.insert((b, d), Duration::ZERO);
+
+    // Let the initial leader (A) stabilize.
+    for _ in 0..5 {
+        cluster.step();
+    }
+
+    // Storm round 1: kill A. Survivors {B, C, D} elect B.
+    cluster.kill(a);
+    cluster.run_until(
+        |cl| cl.live_leader_count() >= 1,
+        "storm r1: at least one new leader",
+    );
+    assert_eq!(
+        cluster.nodes.get(&b).unwrap().role,
+        ReplicaRole::Leader,
+        "storm r1: B (central peer) must win"
+    );
+
+    // Stabilization steps so B's Leader heartbeats reach C and D
+    // before we kill B (so their trackers update believed_leader
+    // = B; otherwise R-2's post-election clear leaves them with
+    // believed_leader = None, masking silence detection).
+    for _ in 0..5 {
+        cluster.step();
+    }
+
+    // Storm round 2: kill B. Survivors {C, D}. With both peers
+    // at symmetric RTT and self-RTT=0, each surviving node sees
+    // itself as the closest — the dual-leader window per plan §4.
+    // The plan documents this; our pinned invariant here is that
+    // both surviving nodes EVENTUALLY hold valid Leader role
+    // (not stuck in Candidate), proving each round bounded by
+    // hysteresis.
+    cluster.kill(b);
+    cluster.run_until(
+        |cl| cl.live_leader_count() >= 1,
+        "storm r2: at least one new leader",
+    );
+
+    // Final invariant — both C and D have completed their
+    // transitions (no stuck Candidate). At least one is Leader.
+    let c_role = cluster.nodes.get(&c).unwrap().role;
+    let d_role = cluster.nodes.get(&d).unwrap().role;
+    assert!(
+        c_role != ReplicaRole::Candidate && d_role != ReplicaRole::Candidate,
+        "storm r2: no node stuck in Candidate (c={c_role:?}, d={d_role:?})"
+    );
+    assert!(
+        c_role == ReplicaRole::Leader || d_role == ReplicaRole::Leader,
+        "storm r2: at least one survivor is Leader"
+    );
+}
+
+/// C-2 — divergence-freedom after partition heal. The original
+/// `divergence_freedom_no_two_replicas_hold_different_payload_at_same_seq`
+/// test runs the byte-for-byte equality check on the happy path
+/// only. This scenario partitions a replica before any
+/// heartbeats land (so its tracker stays empty and it doesn't
+/// self-elect), lets the leader advance + a non-partitioned
+/// replica converge, heals the partition, lets catch-up
+/// complete, and then runs the same byte-equality check.
+#[test]
+fn divergence_freedom_after_partition_heal() {
+    let a = 0x10u64;
+    let b = 0x20u64;
+    let c = 0x30u64;
+    let mut cluster = VirtualCluster::new(&[a, b, c], "dst/divergence_after_heal");
+    cluster.force_leader(a);
+    cluster.force_replica(b);
+    cluster.force_replica(c);
+
+    // Partition C BEFORE any heartbeats land. With no observed
+    // leader, C's silence-detection never trips, so it stays
+    // Replica and never self-elects. Mirrors the shape of
+    // `partition_heal_lets_isolated_replica_catch_up`.
+    cluster.partition(a, c);
+    cluster.partition(b, c);
+
+    append_on_leader(&cluster, a, 12, "during-partition");
+    // B catches up to 12 while C remains isolated.
+    cluster.run_until(
+        |cl| cl.nodes.get(&b).map(|n| n.tail_seq()).unwrap_or(0) == 12,
+        "B catches up while C is partitioned",
+    );
+    // C remains at 0 — partition prevents catch-up.
+    assert_eq!(cluster.nodes.get(&c).unwrap().tail_seq(), 0);
+
+    // Heal the partition.
+    cluster.heal_partition(a, c);
+    cluster.heal_partition(b, c);
+
+    // C catches up to 12.
+    cluster.run_until(
+        |cl| cl.nodes.get(&c).map(|n| n.tail_seq()).unwrap_or(0) == 12,
+        "C catches up post-heal",
+    );
+
+    // C-2 invariant: every event at every seq on every replica
+    // matches the leader's bytes — under the partition-heal
+    // recovery path, not just happy-path.
+    let leader = cluster.nodes.get(&a).unwrap();
+    let leader_events = leader.file.read_range(0, 12);
+    assert_eq!(leader_events.len(), 12);
+
+    for replica_id in [b, c] {
+        let replica = cluster.nodes.get(&replica_id).unwrap();
+        let events = replica.file.read_range(0, 12);
+        assert_eq!(
+            events.len(),
+            12,
+            "post-heal: replica {replica_id:#x} has {} events; leader has 12",
+            events.len(),
+        );
+        for (i, (le, re)) in leader_events.iter().zip(events.iter()).enumerate() {
+            assert_eq!(
+                le.entry.seq, re.entry.seq,
+                "post-heal: replica {replica_id:#x} event {i} seq mismatch"
+            );
+            assert_eq!(
+                le.payload.as_ref(),
+                re.payload.as_ref(),
+                "post-heal: replica {replica_id:#x} event {i} payload bytes differ"
+            );
+        }
+    }
+}
+
+/// C-2 (companion): divergence-freedom after kill+revive. Same
+/// byte-equality check as the happy-path test, but exercising
+/// the restart-during-sync recovery path.
+#[test]
+fn divergence_freedom_after_replica_revival() {
+    let a = 0x10u64;
+    let b = 0x20u64;
+    let mut cluster = VirtualCluster::new(&[a, b], "dst/divergence_after_revival");
+    cluster.force_leader(a);
+    cluster.force_replica(b);
+
+    append_on_leader(&cluster, a, 5, "pre-kill");
+    cluster.run_until(
+        |cl| cl.nodes.get(&b).map(|n| n.tail_seq()).unwrap_or(0) == 5,
+        "pre-kill convergence",
+    );
+    cluster.kill(b);
+    append_on_leader(&cluster, a, 7, "during-kill");
+
+    // Revive B.
+    {
+        let n = cluster.nodes.get_mut(&b).unwrap();
+        n.killed = false;
+        n.tracker = HeartbeatTracker::new(DST_HEARTBEAT_MS);
+    }
+    cluster.run_until(
+        |cl| cl.nodes.get(&b).map(|n| n.tail_seq()).unwrap_or(0) == 12,
+        "B catches up post-revival",
+    );
+
+    // Byte-equality check on the revived replica.
+    let leader = cluster.nodes.get(&a).unwrap();
+    let leader_events = leader.file.read_range(0, 12);
+    let replica = cluster.nodes.get(&b).unwrap();
+    let replica_events = replica.file.read_range(0, 12);
+    assert_eq!(leader_events.len(), 12);
+    assert_eq!(replica_events.len(), 12);
+    for (i, (le, re)) in leader_events.iter().zip(replica_events.iter()).enumerate() {
+        assert_eq!(
+            le.entry.seq, re.entry.seq,
+            "revival: event {i} seq mismatch"
+        );
+        assert_eq!(
+            le.payload.as_ref(),
+            re.payload.as_ref(),
+            "revival: event {i} payload bytes differ"
+        );
+    }
+}
