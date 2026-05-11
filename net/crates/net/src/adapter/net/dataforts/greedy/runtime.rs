@@ -439,6 +439,21 @@ impl GreedyRuntime {
         let now = Instant::now();
         let local_caps = self.inner.local_caps.lock().clone();
 
+        // Resolve the colocation hint against the local cache so
+        // SoftPreference + StrictRequired both have something to
+        // gate against. The hint values are 16-char hex origin
+        // hashes (`MeshNode::chain_hex`). `None` means "no hint
+        // applies" — the admission code treats that as "target
+        // not held" for fail-closed StrictRequired.
+        let colocation_target_held = {
+            let meta = &chain_caps.metadata;
+            let hex = meta
+                .get(&self.inner.metadata_keys.colocate_with_strict)
+                .or_else(|| meta.get(&self.inner.metadata_keys.colocate_with));
+            hex.and_then(|h| u64::from_str_radix(h, 16).ok())
+                .map(|target| self.inner.cache.lock().contains_origin(target))
+        };
+
         // 1. Admission decision (pure).
         let verdict = should_admit(&AdmissionInputs {
             chain_caps,
@@ -446,7 +461,7 @@ impl GreedyRuntime {
             config: &self.inner.config,
             intent_registry: &self.inner.intent_registry,
             metadata_keys: &self.inner.metadata_keys,
-            colocation_target_held: None,
+            colocation_target_held,
         });
         match verdict {
             AdmissionVerdict::Admit => {}
@@ -942,6 +957,63 @@ mod tests {
             heat_sink.announces.lock().len(),
             1,
             "second tick must suppress when rate is unchanged"
+        );
+    }
+
+    /// Colocation hints (`metadata.colocate-with-strict`) must be
+    /// resolved against the local cache: a chain pointing at an
+    /// already-cached origin admits under StrictRequired, while a
+    /// chain pointing at an origin we don't hold rejects.
+    #[tokio::test]
+    async fn colocation_strict_resolves_against_cache() {
+        use crate::adapter::net::behavior::tag::Tag;
+        let cfg = GreedyConfig::default()
+            .with_intent_match(super::super::IntentMatchPolicy::Disabled)
+            .with_colocation_policy(super::super::ColocationPolicy::StrictRequired);
+        let (rt, _sink) = build_runtime(cfg);
+
+        // First, prime the cache with origin 0xCAFE.
+        let mut anchor = CapabilitySet::default();
+        anchor.tags.insert(Tag::Reserved {
+            prefix: "scope:".to_string(),
+            body: "any".to_string(),
+        });
+        rt.dispatch_event(&cn("test/anchor"), 0xCAFE, &anchor, b"hello")
+            .await;
+        assert!(rt.contains(&cn("test/anchor")));
+
+        // Now a follower chain that hints colocate-with-strict on
+        // 0xCAFE — must admit because the cache holds 0xCAFE.
+        let target_hex = format!("{:016x}", 0xCAFEu64);
+        let mut follower_yes = CapabilitySet::default();
+        follower_yes.tags.insert(Tag::Reserved {
+            prefix: "scope:".to_string(),
+            body: "any".to_string(),
+        });
+        follower_yes
+            .metadata
+            .insert("colocate-with-strict".to_string(), target_hex);
+        let outcome = rt
+            .dispatch_event(&cn("test/follower-yes"), 0xF000, &follower_yes, b"hi")
+            .await;
+        assert_eq!(outcome, DispatchOutcome::Cached);
+
+        // A follower pointing at an origin we don't hold rejects.
+        let unknown_hex = format!("{:016x}", 0xDEAD_BEEFu64);
+        let mut follower_no = CapabilitySet::default();
+        follower_no.tags.insert(Tag::Reserved {
+            prefix: "scope:".to_string(),
+            body: "any".to_string(),
+        });
+        follower_no
+            .metadata
+            .insert("colocate-with-strict".to_string(), unknown_hex);
+        let outcome = rt
+            .dispatch_event(&cn("test/follower-no"), 0xF001, &follower_no, b"hi")
+            .await;
+        assert_eq!(
+            outcome,
+            DispatchOutcome::RejectedByAdmission(AdmitRejectReason::Colocation)
         );
     }
 

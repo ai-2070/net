@@ -174,6 +174,21 @@ impl GreedyCacheRegistry {
         self.entries.get(channel)
     }
 
+    /// True iff any cached entry records `origin_hash` as its
+    /// chain identity. Used by the colocation gate to resolve
+    /// `metadata.colocate-with[-strict]` hints against locally-held
+    /// chains. O(n) over cached channels — colocation hints are
+    /// expected to be sparse, but for very large caches a future
+    /// slice may want a reverse index.
+    pub fn contains_origin(&self, origin_hash: u64) -> bool {
+        if origin_hash == 0 {
+            return false;
+        }
+        self.entries
+            .values()
+            .any(|e| e.origin_hash == origin_hash)
+    }
+
     /// Iterate over cached channel names.
     pub fn channels(&self) -> impl Iterator<Item = &ChannelName> + '_ {
         self.entries.keys()
