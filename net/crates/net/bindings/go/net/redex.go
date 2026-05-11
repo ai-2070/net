@@ -104,6 +104,16 @@ extern int net_redex_enable_replication(RedexHandle* redex, ArcMeshNode* mesh_ar
 extern uint32_t net_redex_replication_runtime_count(const RedexHandle* redex);
 extern char* net_redex_replication_prometheus_text(const RedexHandle* redex);
 
+// Greedy-LRU dataforts operator surface — DATAFORTS_PLAN § Phase 1.
+extern int net_redex_enable_greedy_dataforts(
+    RedexHandle* redex,
+    ArcMeshNode* mesh_arc,
+    const char* config_json
+);
+extern int net_redex_disable_greedy_dataforts(RedexHandle* redex);
+extern uint32_t net_redex_greedy_cached_channel_count(const RedexHandle* redex);
+extern char* net_redex_greedy_prometheus_text(const RedexHandle* redex);
+
 extern int net_redex_open_file(
     RedexHandle* redex,
     const char* name,
@@ -364,6 +374,122 @@ func (r *Redex) ReplicationPrometheusText() string {
 		return ""
 	}
 	c := C.net_redex_replication_prometheus_text(r.handle)
+	if c == nil {
+		return ""
+	}
+	defer C.net_free_string(c)
+	return C.GoString(c)
+}
+
+// GreedyConfig — operator-facing config for greedy-LRU dataforts
+// (Rebel Yell Phase 1). All fields optional; the substrate fills
+// in the locked Phase-1 defaults for any field left at the zero
+// value, with the exception of zero-meaning-no-filter semantics
+// noted per-field.
+//
+// Marshalled to the same JSON shape the Rust core's
+// `RedexGreedyConfigJson` deserializes — field tags pin the
+// wire-form names.
+type GreedyConfig struct {
+	// Scope filter. Empty / nil admits regardless of `scope:` tags.
+	Scopes []string `json:"scopes,omitempty"`
+	// Proximity bound (ms). 0 = use substrate default (200 ms).
+	ProximityMaxRttMs uint64 `json:"proximity_max_rtt_ms,omitempty"`
+	// Per-channel byte cap. 0 = use substrate default (100 MiB).
+	PerChannelCapBytes uint64 `json:"per_channel_cap_bytes,omitempty"`
+	// Total byte cap. 0 = use substrate default (10 GiB).
+	TotalCapBytes uint64 `json:"total_cap_bytes,omitempty"`
+	// I/O budget as a fraction of NIC peak. 0 = use substrate
+	// default (0.25). Range `(0.0, 1.0]`.
+	BandwidthBudgetFraction float32 `json:"bandwidth_budget_fraction,omitempty"`
+	// `"disabled"` / `"any_of_local_capabilities"` (default) /
+	// `"strict"`. Empty = substrate default.
+	IntentMatch string `json:"intent_match,omitempty"`
+	// `"ignore"` / `"soft_preference"` (default) /
+	// `"strict_required"`. Empty = substrate default.
+	ColocationPolicy string `json:"colocation_policy,omitempty"`
+}
+
+// ErrInvalidGreedyConfig is returned when the supplied greedy
+// config fails binding-side or substrate-side validation.
+var ErrInvalidGreedyConfig = fmt.Errorf("%w: greedy config invalid", ErrRedex)
+
+// EnableGreedyDataforts installs greedy-LRU dataforts wiring on
+// this Redex. Same Arc-consumption contract as EnableReplication:
+// `meshArcPtr` is consumed regardless of return code — do NOT
+// free it again.
+//
+// Pass nil for `config` to accept the locked Phase-1 defaults.
+//
+// Idempotent — repeated calls return nil without disturbing the
+// existing wiring.
+func (r *Redex) EnableGreedyDataforts(meshArcPtr unsafe.Pointer, config *GreedyConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return fmt.Errorf("%w: redex handle already closed", ErrRedex)
+	}
+	var cfgPtr *C.char
+	if config != nil {
+		buf, err := json.Marshal(config)
+		if err != nil {
+			return fmt.Errorf("%w: marshal config: %v", ErrInvalidGreedyConfig, err)
+		}
+		c := C.CString(string(buf))
+		defer C.free(unsafe.Pointer(c))
+		cfgPtr = c
+	}
+	rc := C.net_redex_enable_greedy_dataforts(
+		r.handle,
+		(*C.ArcMeshNode)(meshArcPtr),
+		cfgPtr,
+	)
+	if rc != 0 {
+		return fmt.Errorf("%w: enable_greedy_dataforts failed (rc=%d)", ErrRedex, int(rc))
+	}
+	return nil
+}
+
+// DisableGreedyDataforts un-installs the greedy wiring. Idempotent.
+func (r *Redex) DisableGreedyDataforts() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return fmt.Errorf("%w: redex handle already closed", ErrRedex)
+	}
+	rc := C.net_redex_disable_greedy_dataforts(r.handle)
+	if rc != 0 {
+		return fmt.Errorf("%w: disable_greedy_dataforts failed (rc=%d)", ErrRedex, int(rc))
+	}
+	return nil
+}
+
+// GreedyCachedChannelCount returns the number of channels
+// currently in the greedy cache. 0 when greedy isn't enabled.
+func (r *Redex) GreedyCachedChannelCount() uint32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return 0
+	}
+	return uint32(C.net_redex_greedy_cached_channel_count(r.handle))
+}
+
+// GreedyPrometheusText renders the greedy-LRU metrics as a
+// Prometheus-text document. Returns the empty string when greedy
+// isn't enabled.
+//
+// Covers per-channel `dataforts_greedy_cache_hits_total`,
+// `_serve_count_total`, `_evictions_total`, `_bytes_resident`,
+// plus the cluster-wide `_admit_rejected_total{reason=...}` and
+// `_io_budget_used_bytes`.
+func (r *Redex) GreedyPrometheusText() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return ""
+	}
+	c := C.net_redex_greedy_prometheus_text(r.handle)
 	if c == nil {
 		return ""
 	}

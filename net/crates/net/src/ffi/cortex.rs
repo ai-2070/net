@@ -397,6 +397,234 @@ pub extern "C" fn net_redex_replication_prometheus_text(redex: *const RedexHandl
 }
 
 // =========================================================================
+// Greedy-LRU dataforts operator surface (DATAFORTS_PLAN § Phase 1)
+// =========================================================================
+//
+// Same shape as the replication FFI above. The Go binding consumes
+// `net_redex_enable_greedy_dataforts(mesh, config_json)`; the config
+// rides as a JSON-encoded `RedexGreedyConfigJson` so binding-side
+// validation surfaces typed errors before the install lands.
+
+/// JSON shape the Go (and any C-ABI) consumer encodes for
+/// `net_redex_enable_greedy_dataforts`. All fields optional —
+/// missing fields keep the substrate Phase-1 defaults.
+#[cfg(feature = "dataforts-greedy")]
+#[derive(serde::Deserialize, Default)]
+struct RedexGreedyConfigJson {
+    /// Scope filter (`scope:<label>` body matches admit). Empty /
+    /// missing admits regardless.
+    scopes: Option<Vec<String>>,
+    /// Maximum acceptable RTT to the chain's home node, in
+    /// milliseconds. Default `200`.
+    proximity_max_rtt_ms: Option<u64>,
+    /// Per-channel byte cap (floor 1 MiB, default 100 MiB).
+    per_channel_cap_bytes: Option<u64>,
+    /// Cluster-wide byte cap (default 10 GiB; must be ≥
+    /// `per_channel_cap_bytes`).
+    total_cap_bytes: Option<u64>,
+    /// I/O budget as a fraction of measured NIC peak. Range
+    /// `(0.0, 1.0]`. Default `0.25`.
+    bandwidth_budget_fraction: Option<f32>,
+    /// `"disabled"` / `"any_of_local_capabilities"` (default) /
+    /// `"strict"`.
+    intent_match: Option<String>,
+    /// `"ignore"` / `"soft_preference"` (default) /
+    /// `"strict_required"`.
+    colocation_policy: Option<String>,
+}
+
+#[cfg(feature = "dataforts-greedy")]
+impl RedexGreedyConfigJson {
+    fn into_config(
+        self,
+    ) -> Result<crate::adapter::net::dataforts::GreedyConfig, &'static str> {
+        use crate::adapter::net::dataforts::{
+            ColocationPolicy, GreedyConfig, IntentMatchPolicy, ScopeLabel,
+        };
+        let mut cfg = GreedyConfig::new();
+        if let Some(scopes) = self.scopes {
+            cfg = cfg.with_scopes(scopes.into_iter().map(ScopeLabel::new).collect());
+        }
+        if let Some(ms) = self.proximity_max_rtt_ms {
+            cfg = cfg.with_proximity_max_rtt(std::time::Duration::from_millis(ms));
+        }
+        if let Some(b) = self.per_channel_cap_bytes {
+            cfg = cfg.with_per_channel_cap_bytes(b);
+        }
+        if let Some(b) = self.total_cap_bytes {
+            cfg = cfg.with_total_cap_bytes(b);
+        }
+        if let Some(f) = self.bandwidth_budget_fraction {
+            cfg = cfg.with_bandwidth_budget_fraction(f);
+        }
+        if let Some(policy) = self.intent_match {
+            let parsed = match policy.as_str() {
+                "disabled" => IntentMatchPolicy::Disabled,
+                "any_of_local_capabilities" => IntentMatchPolicy::AnyOfLocalCapabilities,
+                "strict" => IntentMatchPolicy::Strict,
+                _ => return Err("unknown intent_match"),
+            };
+            cfg = cfg.with_intent_match(parsed);
+        }
+        if let Some(policy) = self.colocation_policy {
+            let parsed = match policy.as_str() {
+                "ignore" => ColocationPolicy::Ignore,
+                "soft_preference" => ColocationPolicy::SoftPreference,
+                "strict_required" => ColocationPolicy::StrictRequired,
+                _ => return Err("unknown colocation_policy"),
+            };
+            cfg = cfg.with_colocation_policy(parsed);
+        }
+        Ok(cfg)
+    }
+}
+
+/// Install greedy-LRU dataforts wiring on this `Redex`. Same
+/// Arc-consumption contract as `net_redex_enable_replication`:
+/// `mesh_arc` is consumed regardless of return code.
+///
+/// `config_json` is optional — pass NULL or empty to use the
+/// locked Phase-1 defaults. JSON parse errors and validation
+/// errors surface as `NET_ERR_REDEX`.
+///
+/// Returns `0` on success; `NetError::NullPointer` (`-1`) when
+/// either redex or mesh_arc is NULL; `NetError::ShuttingDown`
+/// when the Redex is in `_free`-quiesce;
+/// `NetError::InvalidUtf8` / `NetError::InvalidJson` for malformed
+/// config; `NET_ERR_REDEX` for validation errors.
+#[cfg(all(feature = "net", feature = "dataforts-greedy"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_enable_greedy_dataforts(
+    redex: *mut RedexHandle,
+    mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
+    config_json: *const c_char,
+) -> c_int {
+    if redex.is_null() || mesh_arc.is_null() {
+        if !mesh_arc.is_null() {
+            unsafe {
+                drop(Box::from_raw(mesh_arc));
+            }
+        }
+        return NetError::NullPointer.into();
+    }
+    let redex_ref = unsafe { &*redex };
+    let _op = match redex_ref.guard.try_enter() {
+        Some(op) => op,
+        None => {
+            unsafe {
+                drop(Box::from_raw(mesh_arc));
+            }
+            return NetError::ShuttingDown.into();
+        }
+    };
+    let cfg_json: RedexGreedyConfigJson = if config_json.is_null() {
+        RedexGreedyConfigJson::default()
+    } else {
+        let Some(s) = (unsafe { c_str_to_owned(config_json) }) else {
+            unsafe {
+                drop(Box::from_raw(mesh_arc));
+            }
+            return NetError::InvalidUtf8.into();
+        };
+        if s.is_empty() {
+            RedexGreedyConfigJson::default()
+        } else {
+            match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(_) => {
+                    unsafe {
+                        drop(Box::from_raw(mesh_arc));
+                    }
+                    return NetError::InvalidJson.into();
+                }
+            }
+        }
+    };
+    let cfg = match cfg_json.into_config() {
+        Ok(c) => c,
+        Err(_) => {
+            unsafe {
+                drop(Box::from_raw(mesh_arc));
+            }
+            return NET_ERR_REDEX;
+        }
+    };
+    let mesh = unsafe { *Box::from_raw(mesh_arc) };
+    let local_caps = Arc::new(
+        crate::adapter::net::behavior::capability::CapabilitySet::default(),
+    );
+    let registry = crate::adapter::net::behavior::placement::IntentRegistry::defaults();
+    match redex_ref
+        .inner
+        .enable_greedy_dataforts(mesh, cfg, local_caps, registry)
+    {
+        Ok(()) => 0,
+        Err(_) => NET_ERR_REDEX,
+    }
+}
+
+/// Uninstall greedy wiring. Idempotent.
+#[cfg(feature = "dataforts-greedy")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_disable_greedy_dataforts(redex: *mut RedexHandle) -> c_int {
+    let Some(h) = (unsafe { redex.as_ref() }) else {
+        return NetError::NullPointer.into();
+    };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    h.inner.disable_greedy_dataforts();
+    0
+}
+
+/// Count of channels currently in the greedy cache. Returns `0`
+/// when greedy isn't enabled or on a NULL handle.
+#[cfg(feature = "dataforts-greedy")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_greedy_cached_channel_count(
+    redex: *const RedexHandle,
+) -> u32 {
+    let Some(h) = (unsafe { redex.as_ref() }) else {
+        return 0;
+    };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return 0,
+    };
+    h.inner
+        .greedy_runtime()
+        .map(|r| r.cached_channel_count() as u32)
+        .unwrap_or(0)
+}
+
+/// Render greedy metrics as Prometheus text. Caller frees via
+/// [`crate::ffi::net_free_string`]. Empty string when greedy
+/// isn't enabled; NULL on a NULL handle or shutting-down Redex.
+#[cfg(feature = "dataforts-greedy")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_greedy_prometheus_text(
+    redex: *const RedexHandle,
+) -> *mut c_char {
+    let Some(h) = (unsafe { redex.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return std::ptr::null_mut(),
+    };
+    let text = h
+        .inner
+        .greedy_runtime()
+        .map(|r| r.metrics().snapshot().prometheus_text())
+        .unwrap_or_default();
+    match CString::new(text) {
+        Ok(c) => c.into_raw(),
+        Err(_) => CString::new("").unwrap().into_raw(),
+    }
+}
+
+// =========================================================================
 // RedexFile
 // =========================================================================
 
@@ -2649,5 +2877,102 @@ mod tests {
             pre_count,
             "net_redex_enable_replication must drop the boxed Arc on error paths"
         );
+    }
+
+    /// Parallel coverage for the greedy FFI surface — pin the
+    /// Arc-consumption contract on the NULL-redex error path
+    /// (same shape as the replication test above).
+    #[cfg(all(feature = "net", feature = "dataforts-greedy"))]
+    #[test]
+    fn enable_greedy_drops_mesh_arc_on_null_redex() {
+        use crate::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mesh = rt.block_on(async {
+            let identity = EntityKeypair::generate();
+            let cfg = MeshNodeConfig::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                [0u8; 32],
+            );
+            Arc::new(MeshNode::new(identity, cfg).await.unwrap())
+        });
+        let pre_count = Arc::strong_count(&mesh);
+        let boxed_arc: *mut Arc<MeshNode> = Box::into_raw(Box::new(mesh.clone()));
+        assert_eq!(Arc::strong_count(&mesh), pre_count + 1);
+
+        let rc = net_redex_enable_greedy_dataforts(
+            ptr::null_mut(),
+            boxed_arc,
+            ptr::null(),
+        );
+        let expected: c_int = NetError::NullPointer.into();
+        assert_eq!(rc, expected);
+        assert_eq!(
+            Arc::strong_count(&mesh),
+            pre_count,
+            "net_redex_enable_greedy_dataforts must drop the boxed Arc on error paths"
+        );
+    }
+
+    /// Smoke test: install greedy on a real Redex + mesh, observe
+    /// the channel-count + Prometheus text shape, then uninstall.
+    #[cfg(all(feature = "net", feature = "dataforts-greedy"))]
+    #[test]
+    fn greedy_enable_disable_round_trip() {
+        use crate::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
+        use std::ffi::CString;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mesh = rt.block_on(async {
+            let identity = EntityKeypair::generate();
+            let cfg = MeshNodeConfig::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                [0u8; 32],
+            );
+            Arc::new(MeshNode::new(identity, cfg).await.unwrap())
+        });
+
+        let r = redex();
+        let boxed_arc: *mut Arc<MeshNode> = Box::into_raw(Box::new(mesh.clone()));
+        // Minimal config — just disable intent matching so the
+        // empty-registry path doesn't gate us.
+        let cfg_json = CString::new(r#"{"intent_match":"disabled"}"#).unwrap();
+        let rc = net_redex_enable_greedy_dataforts(r, boxed_arc, cfg_json.as_ptr());
+        assert_eq!(rc, 0, "enable must succeed");
+
+        // No channels yet — count is 0.
+        assert_eq!(net_redex_greedy_cached_channel_count(r), 0);
+
+        // Prometheus text is non-null and contains the metric
+        // family header.
+        let p = net_redex_greedy_prometheus_text(r);
+        assert!(!p.is_null());
+        let text = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned();
+        unsafe { super::super::net_free_string(p); }
+        assert!(
+            text.contains("dataforts_greedy_admit_rejected_total"),
+            "Prometheus text must include the admit-rejected metric family"
+        );
+
+        // Uninstall + verify.
+        assert_eq!(net_redex_disable_greedy_dataforts(r), 0);
+        let p_after = net_redex_greedy_prometheus_text(r);
+        assert!(!p_after.is_null());
+        let after_text = unsafe { std::ffi::CStr::from_ptr(p_after) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            super::super::net_free_string(p_after);
+        }
+        assert!(
+            after_text.is_empty(),
+            "post-disable Prometheus text must be empty; got {after_text:?}"
+        );
+
+        net_redex_free(r);
     }
 }
