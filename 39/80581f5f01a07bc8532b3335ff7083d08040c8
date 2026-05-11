@@ -1,0 +1,23 @@
+net/crates/net/tests/redex_replication_dst.rs
+  s_d760092f02a89c::t_2e86102da2042d 186,192-193
+  s_d760092f02a89c::t_76256209779c84 319-325
+  s_d760092f02a89c::t_0acbdf678f5d1d 150-157
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_REDEX_DISTRIBUTED.md
+  s_d760092f02a89c::t_379e2e93965734 34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "3980581f5f01a07bc8532b3335ff7083d08040c8",
+  "prompts": {},
+  "sessions": {
+    "s_d760092f02a89c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ef8b8023-dce0-4b44-bfb8-b07c462d6685",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
