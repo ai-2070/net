@@ -230,6 +230,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::reversed_empty_ranges)] // intentional — exercises the start>end guard
     async fn fetch_range_reversed_is_error() {
         let root = unique_root();
         let adapter = FileSystemAdapter::new("fs-test", &root);

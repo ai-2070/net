@@ -165,22 +165,14 @@ async fn read_hot_chain_emits_heat_tag_into_local_caps() {
     // u32 widened to u64 — same value that lands on the cache
     // entry. Compute the hex form the substrate emits to the
     // wire: chain_hex pads to 16 lowercase hex chars.
-    let entry_origin_hash = runtime
-        .cache_file(&synth)
-        .and_then(|_| Some(()))
-        .and(Some(()))
-        .map(|_| {
-            // Fetch the origin_hash from the entry via the public
-            // GreedyCacheEntry surface — entry is borrowed via
-            // the cache.get path. Use a snapshot through a
-            // mutex-held read.
-            // The entry's origin_hash was stored in dispatch_event;
-            // we don't have a direct accessor on GreedyRuntime,
-            // so we test for ANY heat tag in A's capability_index
-            // for B (regardless of which chain was hottest).
-            ()
-        });
-    let _ = entry_origin_hash;
+    // Fetch the origin_hash from the entry via the public
+    // GreedyCacheEntry surface — entry is borrowed via the
+    // cache.get path. The entry's origin_hash was stored in
+    // dispatch_event; we don't have a direct accessor on
+    // GreedyRuntime, so the assertion below tests for ANY
+    // heat tag in A's capability_index for B (regardless of
+    // which chain was hottest).
+    let _entry_present = runtime.cache_file(&synth).map(|_| ());
 
     // Drive reads + tick + poll B's self-view for a heat tag.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

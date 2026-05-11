@@ -96,6 +96,12 @@ fn err_to_code(e: &InnerBlobError) -> c_int {
 /// Returns `0` on success, `NET_ERR_BLOB_DUPLICATE_ID` if the id
 /// already exists, or `NetError::InvalidUtf8` / `NullPointer` for
 /// malformed input.
+///
+/// # Safety
+/// `adapter_id` and `root` must each point to a valid null-terminated
+/// UTF-8 byte sequence and remain valid for the duration of this
+/// call. Either may be null, in which case the function returns
+/// `NetError::InvalidUtf8`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_register_fs_adapter(
     adapter_id: *const c_char,
@@ -119,6 +125,11 @@ pub unsafe extern "C" fn net_blob_register_fs_adapter(
 
 /// Remove an adapter registration. Returns `1` if an adapter was
 /// removed, `0` if no adapter was registered under that id.
+///
+/// # Safety
+/// `adapter_id` must point to a valid null-terminated UTF-8 byte
+/// sequence and remain valid for the call. Null returns
+/// `NetError::InvalidUtf8`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_unregister_adapter(adapter_id: *const c_char) -> c_int {
     let id = match c_str_to_owned(adapter_id) {
@@ -134,6 +145,10 @@ pub unsafe extern "C" fn net_blob_unregister_adapter(adapter_id: *const c_char) 
 
 /// Returns `1` if `adapter_id` resolves to a registered adapter,
 /// `0` otherwise.
+///
+/// # Safety
+/// `adapter_id` must point to a valid null-terminated UTF-8 byte
+/// sequence and remain valid for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_adapter_registered(adapter_id: *const c_char) -> c_int {
     let id = match c_str_to_owned(adapter_id) {
@@ -155,6 +170,14 @@ pub unsafe extern "C" fn net_blob_adapter_registered(adapter_id: *const c_char) 
 ///
 /// On error returns a negative code and leaves the out-params at
 /// `(null, 0)`.
+///
+/// # Safety
+/// - `adapter_id` and `uri` must each point to a valid null-
+///   terminated UTF-8 byte sequence.
+/// - `data` must point to a readable region of at least `data_len`
+///   bytes (or be null when `data_len == 0`).
+/// - `out_payload` and `out_payload_len` must each point to writable
+///   `*mut u8` / `usize` storage; the function writes through both.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_publish(
     adapter_id: *const c_char,
@@ -213,6 +236,14 @@ pub unsafe extern "C" fn net_blob_publish(
 /// into `*out_content` / `*out_content_len`. Caller MUST free via
 /// [`net_blob_free_buffer`]. On error returns a negative code and
 /// leaves the out-params at `(null, 0)`.
+///
+/// # Safety
+/// - `adapter_id` must point to a valid null-terminated UTF-8 byte
+///   sequence.
+/// - `payload` must point to a readable region of at least
+///   `payload_len` bytes (or be null when `payload_len == 0`).
+/// - `out_content` and `out_content_len` must each point to writable
+///   `*mut u8` / `usize` storage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_resolve(
     adapter_id: *const c_char,
@@ -260,12 +291,19 @@ pub unsafe extern "C" fn net_blob_resolve(
 
 /// Free a buffer returned by [`net_blob_publish`] or
 /// [`net_blob_resolve`]. Calling with `(null, 0)` is a no-op.
+///
+/// # Safety
+/// `ptr` MUST be a buffer that the substrate previously returned
+/// from `net_blob_publish` or `net_blob_resolve` (or null), and
+/// `len` MUST match the corresponding `*out_*_len` value from
+/// that call. Calling with any other `(ptr, len)` is undefined
+/// behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_free_buffer(ptr: *mut u8, len: usize) {
     if ptr.is_null() {
         return;
     }
-    let _ = Box::from_raw(std::slice::from_raw_parts_mut(ptr, len) as *mut [u8]);
+    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len));
 }
 
 // Ensure the unused-import lint stays quiet under feature gates that
@@ -577,6 +615,17 @@ impl BlobAdapter for CallbackBlobAdapter {
 /// Returns `0` on success, `NET_ERR_BLOB_DUPLICATE_ID` if `id` is
 /// already registered, or `NetError::InvalidUtf8` / `NullPointer`
 /// for malformed input.
+///
+/// # Safety
+/// - `adapter_id` must point to a valid null-terminated UTF-8 byte
+///   sequence.
+/// - `vtable` must point to a fully-initialised `NetBlobAdapterVtable`
+///   whose function pointers remain valid for the lifetime of the
+///   registration (i.e. until `net_blob_unregister_adapter` returns
+///   AND any in-flight calls have completed).
+/// - `ctx` is an opaque pointer the substrate passes through unchanged
+///   to every vtable call; the caller is responsible for keeping the
+///   pointee alive and thread-safe for the same lifetime as `vtable`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_register_callback_adapter(
     adapter_id: *const c_char,
@@ -804,7 +853,7 @@ mod tests {
             if data.is_null() {
                 return;
             }
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(data, len) as *mut [u8]);
+            let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(data, len));
         }
 
         #[test]

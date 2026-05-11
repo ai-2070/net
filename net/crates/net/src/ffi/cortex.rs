@@ -3139,9 +3139,7 @@ mod tests {
         let text = unsafe { std::ffi::CStr::from_ptr(p) }
             .to_string_lossy()
             .into_owned();
-        unsafe {
-            super::super::net_free_string(p);
-        }
+        super::super::net_free_string(p);
         assert!(
             text.contains("dataforts_greedy_admit_rejected_total"),
             "Prometheus text must include the admit-rejected metric family"
@@ -3154,9 +3152,7 @@ mod tests {
         let after_text = unsafe { std::ffi::CStr::from_ptr(p_after) }
             .to_string_lossy()
             .into_owned();
-        unsafe {
-            super::super::net_free_string(p_after);
-        }
+        super::super::net_free_string(p_after);
         assert!(
             after_text.is_empty(),
             "post-disable Prometheus text must be empty; got {after_text:?}"

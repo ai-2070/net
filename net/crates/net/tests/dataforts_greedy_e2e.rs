@@ -330,7 +330,7 @@ async fn greedy_read_path_serves_cached_events() {
         events.iter().map(|e| e.payload.as_ref().to_vec()).collect();
     for i in 0..N {
         assert!(
-            observed.contains(&format!("payload-{i}").as_bytes().to_vec()),
+            observed.contains(format!("payload-{i}").as_bytes()),
             "cache missing payload-{i}"
         );
     }
