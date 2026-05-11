@@ -126,7 +126,7 @@ impl MemoriesAdapter {
         let inner = CortexAdapter::open(
             redex,
             &name,
-            redex_config,
+            redex_config.clone(),
             CortexAdapterConfig::default(),
             fold,
             MemoriesState::new(),
@@ -344,7 +344,7 @@ impl MemoriesAdapter {
         let inner = CortexAdapter::open_from_snapshot(
             redex,
             &name,
-            redex_config,
+            redex_config.clone(),
             CortexAdapterConfig::default(),
             fold,
             &payload.inner,

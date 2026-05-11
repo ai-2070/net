@@ -311,7 +311,7 @@ mod tests {
     fn test_sweep_retention_runs_on_all_open_files() {
         let r = Redex::new();
         let cfg = RedexFileConfig::default().with_retention_max_events(1);
-        let f1 = r.open_file(&cn("f1"), cfg).unwrap();
+        let f1 = r.open_file(&cn("f1"), cfg.clone()).unwrap();
         let f2 = r.open_file(&cn("f2"), cfg).unwrap();
         for i in 0..3 {
             f1.append(format!("{}", i).as_bytes()).unwrap();

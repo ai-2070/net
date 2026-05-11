@@ -1053,7 +1053,7 @@ impl RedexFile {
     /// performance trade-off so future profilers don't
     /// rediscover it as a "bug".
     pub fn sweep_retention(&self) {
-        let cfg = self.inner.config;
+        let cfg = &self.inner.config;
         if cfg.retention_max_events.is_none()
             && cfg.retention_max_bytes.is_none()
             && cfg.retention_max_age_ns.is_none()
@@ -1062,7 +1062,7 @@ impl RedexFile {
         }
         let now = now_ns();
         let mut state = self.inner.state.lock();
-        let drop = compute_eviction_count(&state.index, &state.timestamps, now, &cfg);
+        let drop = compute_eviction_count(&state.index, &state.timestamps, now, cfg);
         if drop == 0 {
             return;
         }

@@ -105,7 +105,7 @@ impl TasksAdapter {
         let inner = CortexAdapter::open(
             redex,
             &name,
-            redex_config,
+            redex_config.clone(),
             CortexAdapterConfig::default(),
             fold,
             TasksState::new(),
@@ -326,7 +326,7 @@ impl TasksAdapter {
         let inner = CortexAdapter::open_from_snapshot(
             redex,
             &name,
-            redex_config,
+            redex_config.clone(),
             CortexAdapterConfig::default(),
             fold,
             &payload.inner,

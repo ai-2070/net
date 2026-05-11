@@ -4,13 +4,13 @@
 
 ## Status
 
-**Phase A landed; remaining phases blocked on Capability Phase B (and partially F).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
+**Phases A + B landed; remaining phases blocked on Capability Phase B (and partially F).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
 
 Hard prerequisites for the still-blocked phases:
 - **Capability Phase B** (tag-discovery primitives `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders`) — RedEX Phases C/D/E cannot start until this lands.
 - **Capability Phase F** (`PlacementFilter` + `IntentRegistry` + anti-affinity) — needed for *replica placement* in Phase C, but **not** for leader election. Election is decentralized and deterministic (nearest-RTT + NodeId tiebreak); see [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak).
 
-Phase A (wire protocol scaffold) ✅ landed. Phase B (this plan's `ReplicationConfig` opt-in), Phases G–I can proceed in isolation as scaffolding.
+Phase A (wire protocol scaffold) ✅ and Phase B (`ReplicationConfig` opt-in) ✅ landed. Phases G–I can proceed in isolation as scaffolding.
 
 Activation gate (when Warriors as a whole ships) is unchanged: a workload requesting durability guarantees beyond single-node. Realistic triggers: payment-tier customer, compliance-bound data class, pilot whose RTO is "< 5 s on node failure."
 
@@ -430,11 +430,17 @@ Implementable in isolation; does not depend on Capability B/F. **Landed.**
 - ✅ Round-trip + byte-layout tests (19 tests): per-message round-trip; pinned fixed-size byte counts (47 B `SyncRequest`, 52 B `SyncHeartbeat`); explicit byte-layout assertion for `SyncRequest`; truncation rejection at every prefix length; rejection of wrong subprotocol / wrong dispatch / unknown role / unknown error_code / invalid utf-8; `SyncResponse` round-trip with empty + populated event chunks; `SyncNack` round-trip across all four error variants + oversized-detail truncation.
 - ✅ `cargo clippy --lib --features redex -- -D warnings` clean.
 
-### Phase B — `ReplicationConfig` + opt-in (3 days)
+### Phase B — `ReplicationConfig` + opt-in (3 days) ✅
 
-- Extend `ChannelConfig::replication: Option<ReplicationConfig>`.
-- Default behavior: `None` → single-node, no replication. Existing channels unaffected.
-- Cross-binding serde for `ReplicationConfig`. ~3 days for all four bindings.
+**Substrate side landed.** Cross-binding serde rolls in Phase I.
+
+- ✅ `RedexFileConfig::replication: Option<ReplicationConfig>` opt-in field landed on the per-file config (the natural home — `redex::RedexFileConfig` already carries retention semantics; the network-level `channel::ChannelConfig` is the auth/visibility surface). Default `None` → single-node behavior; existing channels unaffected.
+- ✅ `ReplicationConfig` + `PlacementStrategy` (`Standard` / `Pinned(Vec<NodeId>)` / `ColocationStrict`) + `UnderCapacity` (`Withdraw` / `EvictOldest`) types per §1 of the plan. Builder methods (`with_factor` / `with_placement` / `with_heartbeat_ms` / `with_leader_pinned` / `with_on_under_capacity` / `with_replication_budget_fraction`); typed `ReplicationConfigError` enumerating every reject path.
+- ✅ `validate()` runs every documented invariant (`REPLICATION_FACTOR_MIN..=REPLICATION_FACTOR_MAX`, `HEARTBEAT_MS_MIN`, budget fraction in `(0.0, 1.0]` and finite, non-empty/non-oversized/deduplicated pinned set, `leader_pinned` ∈ pinned set when both set).
+- ✅ `effective_factor()` honors `PlacementStrategy::Pinned`'s explicit list length over the numeric `factor` hint.
+- ✅ 16 unit tests covering defaults, builder threading, every reject path, every boundary.
+- `RedexFileConfig` is now `Clone` rather than `Copy` since `ReplicationConfig` carries a `Vec<NodeId>` under the `Pinned` variant. Internal consumers updated to `.clone()` where they previously relied on bit-copy.
+- 🔜 **Phase I**: cross-binding serde for `ReplicationConfig` over Node, Python, Go, C bindings.
 
 ### Phase C — `ReplicationCoordinator` daemon (1.5 weeks)
 
