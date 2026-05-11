@@ -25,7 +25,7 @@ use super::replication::ChannelId;
 use super::replication_budget::BandwidthBudget;
 use super::replication_config::PlacementStrategy;
 use super::replication_coordinator::{ChannelIdentity, ReplicationCoordinator};
-use super::replication_metrics::ReplicationMetricsRegistry;
+use super::replication_metrics::{ReplicationMetricsRegistry, ReplicationMetricsSnapshot};
 use super::replication_router::RedexReplicationRouter;
 use super::replication_runtime::{spawn_replication_runtime, RuntimeInputs};
 use crate::adapter::net::MeshNode;
@@ -167,6 +167,35 @@ impl Redex {
         let channel_id = ChannelId::from_name(name);
         let handle = wiring.router.get(&channel_id)?;
         Some(handle.coordinator().clone())
+    }
+
+    /// Read-only snapshot of the per-channel replication metrics —
+    /// the seven counter / gauge shapes from
+    /// [`CONFIG_REPLICATION.md`](../../../docs/CONFIG_REPLICATION.md):
+    /// `*_lag_seconds`, `*_sync_bytes_total`, `*_leader_changes_total`,
+    /// `*_under_capacity_total`, `*_skip_ahead_total`,
+    /// `*_election_thrash_total`, `*_witness_withdrawals_total`.
+    ///
+    /// `None` when replication isn't enabled on this manager.
+    ///
+    /// Cheap — copies atomic counters into plain data. Suitable for
+    /// a per-scrape Prometheus pull. See
+    /// [`ReplicationMetricsSnapshot::prometheus_text`] for the
+    /// rendered output; [`Self::replication_prometheus_text`] is the
+    /// one-call wrapper.
+    pub fn replication_metrics_snapshot(&self) -> Option<ReplicationMetricsSnapshot> {
+        let wiring = self.replication.read().as_ref().cloned()?;
+        Some(wiring.metrics.snapshot())
+    }
+
+    /// Convenience wrapper — render the replication metrics snapshot
+    /// as Prometheus text. Returns the empty string when replication
+    /// isn't enabled (rather than `None`) so the call site can pipe
+    /// it straight into an HTTP body without an `unwrap_or_default`.
+    pub fn replication_prometheus_text(&self) -> String {
+        self.replication_metrics_snapshot()
+            .map(|s| s.prometheus_text())
+            .unwrap_or_default()
     }
 
     /// Open (create if absent) a RedEX file bound to `name`.
@@ -708,5 +737,42 @@ mod tests {
             1,
             "reopen must not spawn a second runtime"
         );
+    }
+
+    #[test]
+    fn replication_metrics_snapshot_returns_none_when_not_enabled() {
+        let r = Redex::new();
+        assert!(r.replication_metrics_snapshot().is_none());
+        // prometheus_text is the empty string in this case so the
+        // caller can pipe straight into an HTTP body without
+        // branching.
+        assert_eq!(r.replication_prometheus_text(), "");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replication_metrics_snapshot_includes_open_channel() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh);
+        let name = cn("repl/metrics");
+        let cfg = RedexFileConfig::default().with_replication(Some(
+            ReplicationConfig::new().with_heartbeat_ms(60_000),
+        ));
+        let _file = r.open_file(&name, cfg).expect("open");
+
+        let snap = r
+            .replication_metrics_snapshot()
+            .expect("snapshot when enabled");
+        assert_eq!(snap.channels.len(), 1);
+        assert_eq!(snap.channels[0].channel, "repl/metrics");
+        // Counters all zero on a freshly-opened channel.
+        assert_eq!(snap.channels[0].sync_bytes_total, 0);
+        assert_eq!(snap.channels[0].leader_changes_total, 0);
+
+        // Prometheus text is non-empty + includes the channel name.
+        let text = r.replication_prometheus_text();
+        assert!(text.contains("repl/metrics"));
+
+        r.close_file(&name).unwrap();
     }
 }
