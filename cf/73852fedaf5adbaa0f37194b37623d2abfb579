@@ -1,0 +1,39 @@
+net/crates/net/bindings/node/src/cortex.rs
+  s_3a0a24a47d1a36::t_247f0538e7307d 606-609
+  s_3a0a24a47d1a36::t_cfc71429396a9a 443-445
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_3a0a24a47d1a36::t_3a8cf93762f395 413-420,426-436
+net/crates/net/src/adapter/net/dataforts/gravity/policy.rs
+  s_3a0a24a47d1a36::t_91b0a21faf4b7d 128-152
+  s_3a0a24a47d1a36::t_6f005b994446b9 170-177
+  s_3a0a24a47d1a36::t_58f0710b35482a 282-291
+  s_3a0a24a47d1a36::t_11040a39214d22 342-380
+  s_3a0a24a47d1a36::t_cb129029d5ed35 99
+  s_3a0a24a47d1a36::t_acfef8d781918a 45-62
+  s_3a0a24a47d1a36::t_434c61732712bd 87-90
+net/crates/net/bindings/python/src/cortex.rs
+  s_3a0a24a47d1a36::t_039ec19c9f518a 635,644,654-655
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_d8d31474470ebb 50
+net/crates/net/bindings/go/net/redex.go
+  s_3a0a24a47d1a36::t_75df5e3f8a4d2d 543-546
+net/crates/net/src/ffi/cortex.rs
+  s_3a0a24a47d1a36::t_e72d415a919ecf 750-752
+  s_3a0a24a47d1a36::t_23828d7277d8af 727-731
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "cf73852fedaf5adbaa0f37194b37623d2abfb579",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
