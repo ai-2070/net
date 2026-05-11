@@ -41,5 +41,5 @@ pub use blob::{
     classify_payload, global_blob_adapter_registry, publish_blob, publish_blob_ref,
     resolve_payload, run_conformance_suite, BlobAdapter, BlobAdapterRegistry,
     BlobAdapterRegistryError, BlobError, BlobRef, EventPayload, FileSystemAdapter, NoopAdapter,
-    BLOB_REF_DISCRIMINATOR, BLOB_REF_VERSION_V1,
+    BLOB_REF_DISCRIMINATOR, BLOB_REF_MAGIC, BLOB_REF_VERSION_V1,
 };

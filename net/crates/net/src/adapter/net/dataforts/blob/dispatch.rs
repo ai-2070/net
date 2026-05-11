@@ -220,10 +220,10 @@ mod tests {
         let encoded = publish_blob(&adapter, "file:///published", payload)
             .await
             .unwrap();
-        // First byte is the discriminator.
+        // First four bytes are the BlobRef magic.
         assert_eq!(
-            encoded[0],
-            crate::adapter::net::dataforts::blob::BLOB_REF_DISCRIMINATOR
+            &encoded[..4],
+            &crate::adapter::net::dataforts::blob::BLOB_REF_MAGIC,
         );
 
         // resolve_payload turns the encoded form back into the

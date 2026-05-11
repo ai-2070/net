@@ -5,26 +5,42 @@
 //!
 //! | Byte | Field |
 //! |---|---|
-//! | `0` | discriminator (`0xB0`) |
-//! | `1` | version (`0x01` for v1) |
-//! | `2..34` | BLAKE3 hash (32 bytes) |
-//! | `34..42` | size (`u64` little-endian) |
-//! | `42..` | URI bytes (UTF-8, length = remaining frame length) |
+//! | `0..4` | magic (`0xB0 0xB1 0xB2 0xB3`) |
+//! | `4` | version (`0x01` for v1) |
+//! | `5..37` | BLAKE3 hash (32 bytes) |
+//! | `37..45` | size (`u64` little-endian) |
+//! | `45..` | URI bytes (UTF-8, length = remaining frame length) |
 //!
 //! No length prefix on the URI — the encoded form lives inside an
 //! event payload whose length is already framed by the substrate.
-//! Inline event payloads carry no discriminator (back-compat); the
-//! substrate distinguishes by peeking at byte 0.
+//! Inline event payloads carry no magic (back-compat); the
+//! substrate distinguishes by peeking at the first four bytes. The
+//! magic is four bytes (rather than one) because a single
+//! discriminator byte (`0xB0`) collides with arbitrary binary
+//! payloads — protobuf wire bytes, MessagePack, compressed data —
+//! and a false match would silently re-interpret an inline payload
+//! as a `BlobRef` whose decoded URI gets fetched against the
+//! channel's adapter. A four-byte magic with three high-bit bytes
+//! is statistically unreachable in valid UTF-8 text and rare
+//! enough in binary that decode-then-verify catches the rest.
 
 use super::error::BlobError;
 
-/// Discriminator byte at offset 0 of an encoded [`BlobRef`].
+/// 4-byte magic at offset 0 of an encoded [`BlobRef`].
 /// Distinguishes blob-ref payloads from inline event payloads on
-/// every `read_range` / `tail` output. Picked to be statistically
-/// rare in user payloads; collisions are not a correctness issue
-/// because the version + hash + size + URI all have to decode
-/// successfully for a `BlobRef` to materialise.
-pub const BLOB_REF_DISCRIMINATOR: u8 = 0xB0;
+/// every `read_range` / `tail` output. Single-byte discriminators
+/// collide too readily with arbitrary binary payloads; four
+/// high-bit bytes are improbable enough that decode-then-verify
+/// handles the residual cases without misinterpreting attacker-
+/// controlled bytes as a `BlobRef`.
+pub const BLOB_REF_MAGIC: [u8; 4] = [0xB0, 0xB1, 0xB2, 0xB3];
+
+/// Backwards-compatible single-byte discriminator alias for code
+/// paths that just need to peek byte 0 (e.g. the bindings'
+/// `EventPayload` classification). Equal to `BLOB_REF_MAGIC[0]`.
+/// The decoder still requires the full four-byte magic, so this
+/// alias is only useful for a cheap "might be a blob" pre-check.
+pub const BLOB_REF_DISCRIMINATOR: u8 = BLOB_REF_MAGIC[0];
 
 /// `BlobRef` wire-encoding version. v1 is the only version this
 /// build encodes; the version byte is reserved so future migrations
@@ -32,9 +48,9 @@ pub const BLOB_REF_DISCRIMINATOR: u8 = 0xB0;
 /// without breaking the decoder.
 pub const BLOB_REF_VERSION_V1: u8 = 0x01;
 
-/// Minimum encoded length: discriminator + version + hash + size.
+/// Minimum encoded length: magic + version + hash + size.
 /// URI may be empty.
-pub const BLOB_REF_HEADER_LEN: usize = 1 + 1 + 32 + 8;
+pub const BLOB_REF_HEADER_LEN: usize = 4 + 1 + 32 + 8;
 
 /// Pointer to content stored out-of-band. Round-trips through
 /// every binding as a typed value via the public fields; the
@@ -83,7 +99,7 @@ impl BlobRef {
     /// byte layout.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.encoded_len());
-        buf.push(BLOB_REF_DISCRIMINATOR);
+        buf.extend_from_slice(&BLOB_REF_MAGIC);
         buf.push(self.version);
         buf.extend_from_slice(&self.hash);
         buf.extend_from_slice(&self.size.to_le_bytes());
@@ -91,12 +107,14 @@ impl BlobRef {
         buf
     }
 
-    /// Decode a wire form. Returns `Ok(None)` when `bytes[0]` is
-    /// not the discriminator (caller should treat the payload as
-    /// inline). Returns `Err` only when the discriminator matches
-    /// but the rest of the frame is malformed.
+    /// Decode a wire form. Returns `Ok(None)` when the first
+    /// four bytes are not [`BLOB_REF_MAGIC`] (caller should treat
+    /// the payload as inline). Returns `Err` only when the magic
+    /// matches but the rest of the frame is malformed.
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>, BlobError> {
-        if bytes.first().copied() != Some(BLOB_REF_DISCRIMINATOR) {
+        if bytes.len() < BLOB_REF_MAGIC.len()
+            || bytes[..BLOB_REF_MAGIC.len()] != BLOB_REF_MAGIC
+        {
             return Ok(None);
         }
         if bytes.len() < BLOB_REF_HEADER_LEN {
@@ -106,16 +124,16 @@ impl BlobRef {
                 BLOB_REF_HEADER_LEN
             )));
         }
-        let version = bytes[1];
+        let version = bytes[4];
         if version != BLOB_REF_VERSION_V1 {
             return Err(BlobError::UnsupportedVersion(version));
         }
         let mut hash = [0u8; 32];
-        hash.copy_from_slice(&bytes[2..34]);
+        hash.copy_from_slice(&bytes[5..37]);
         let mut size_bytes = [0u8; 8];
-        size_bytes.copy_from_slice(&bytes[34..42]);
+        size_bytes.copy_from_slice(&bytes[37..45]);
         let size = u64::from_le_bytes(size_bytes);
-        let uri_bytes = &bytes[42..];
+        let uri_bytes = &bytes[45..];
         let uri = std::str::from_utf8(uri_bytes)
             .map_err(|e| BlobError::Decode(format!("URI not UTF-8: {}", e)))?
             .to_owned();
@@ -161,15 +179,35 @@ mod tests {
     }
 
     #[test]
-    fn decode_returns_none_when_discriminator_missing() {
-        // First byte is not the discriminator → inline payload.
-        let bytes = vec![0x00, 0x01, 0x02];
+    fn decode_returns_none_when_magic_missing() {
+        // First bytes are not the magic → inline payload.
+        let bytes = vec![0x00, 0x01, 0x02, 0x03, 0x04];
+        assert!(BlobRef::decode(&bytes).unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_returns_none_for_payloads_starting_with_old_discriminator_only() {
+        // Inline payloads whose first byte is the old single-byte
+        // discriminator (0xB0) — but NOT followed by the rest of
+        // the four-byte magic — must not be misclassified as
+        // BlobRefs. Pins the central improvement of the
+        // single-byte → 4-byte magic change.
+        let bytes = vec![0xB0, 0x00, 0x00, 0x00];
+        assert!(BlobRef::decode(&bytes).unwrap().is_none());
+        // 0xB0 0xB1 with a different third byte — still inline.
+        let bytes = vec![0xB0, 0xB1, 0x00, 0x00];
+        assert!(BlobRef::decode(&bytes).unwrap().is_none());
+        // 0xB0 0xB1 0xB2 with a different fourth byte — still inline.
+        let bytes = vec![0xB0, 0xB1, 0xB2, 0x00];
         assert!(BlobRef::decode(&bytes).unwrap().is_none());
     }
 
     #[test]
     fn decode_rejects_short_frame() {
-        let bytes = vec![BLOB_REF_DISCRIMINATOR, BLOB_REF_VERSION_V1, 0x00];
+        // Magic present, but the rest of the header is missing.
+        let mut bytes = BLOB_REF_MAGIC.to_vec();
+        bytes.push(BLOB_REF_VERSION_V1);
+        bytes.push(0x00); // truncated mid-hash
         let err = BlobRef::decode(&bytes).unwrap_err();
         assert!(matches!(err, BlobError::Decode(_)));
     }
@@ -178,7 +216,7 @@ mod tests {
     fn decode_rejects_unknown_version() {
         let blob = fixture();
         let mut bytes = blob.encode();
-        bytes[1] = 0xFE;
+        bytes[4] = 0xFE;
         let err = BlobRef::decode(&bytes).unwrap_err();
         assert!(matches!(err, BlobError::UnsupportedVersion(0xFE)));
     }
