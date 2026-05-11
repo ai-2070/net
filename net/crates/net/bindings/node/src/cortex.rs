@@ -572,16 +572,33 @@ impl RedexFile {
 
     /// Explicit fsync. Always fsyncs regardless of configured
     /// `fsyncPolicy`. No-op on heap-only files.
+    ///
+    /// Declared `async` so the disk flush runs on a napi worker
+    /// thread rather than the JavaScript event-loop thread —
+    /// without this, a `persistent: true` channel's fsync stalls
+    /// every other JS callback until the kernel completes the
+    /// write.
     #[napi]
-    pub fn sync(&self) -> Result<()> {
-        self.inner.sync().map_err(|e| redex_err("sync", e))
+    pub async fn sync(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.sync())
+            .await
+            .map_err(|e| napi::Error::from_reason(format!("redex: sync join: {e}")))?
+            .map_err(|e| redex_err("sync", e))
     }
 
     /// Close the file. Outstanding tail iterators resolve with a
     /// `redex:` error on their next `.next()` call.
+    ///
+    /// Declared `async` for the same reason as `sync` — close
+    /// flushes pending writes on persistent files.
     #[napi]
-    pub fn close(&self) -> Result<()> {
-        self.inner.close().map_err(|e| redex_err("close", e))
+    pub async fn close(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.close())
+            .await
+            .map_err(|e| napi::Error::from_reason(format!("redex: close join: {e}")))?
+            .map_err(|e| redex_err("close", e))
     }
 }
 

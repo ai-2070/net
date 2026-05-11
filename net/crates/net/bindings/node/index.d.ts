@@ -1014,13 +1014,22 @@ export declare class RedexFile {
   /**
    * Explicit fsync. Always fsyncs regardless of configured
    * `fsyncPolicy`. No-op on heap-only files.
+   *
+   * Declared `async` so the disk flush runs on a napi worker
+   * thread rather than the JavaScript event-loop thread —
+   * without this, a `persistent: true` channel's fsync stalls
+   * every other JS callback until the kernel completes the
+   * write.
    */
-  sync(): void
+  sync(): Promise<void>
   /**
    * Close the file. Outstanding tail iterators resolve with a
    * `redex:` error on their next `.next()` call.
+   *
+   * Declared `async` for the same reason as `sync` — close
+   * flushes pending writes on persistent files.
    */
-  close(): void
+  close(): Promise<void>
 }
 
 /** Async iterator over a live `RedexFile::tail`. */
