@@ -17,7 +17,9 @@ pub mod greedy;
 
 #[cfg(feature = "dataforts-greedy")]
 pub use greedy::{
-    should_admit, AdmissionInputs, AdmissionVerdict, ColocationPolicy, EvictionSweep,
-    GreedyCacheEntry, GreedyCacheRegistry, GreedyConfig, GreedyConfigError, IntentMatchPolicy,
+    should_admit, AdmissionInputs, AdmissionVerdict, AdmitRejectReason, ColocationPolicy,
+    EvictionSweep, GreedyCacheEntry, GreedyCacheRegistry, GreedyChannelMetrics,
+    GreedyChannelMetricsAtomic, GreedyClusterMetrics, GreedyClusterMetricsAtomic, GreedyConfig,
+    GreedyConfigError, GreedyMetricsRegistry, GreedyMetricsSnapshot, IntentMatchPolicy,
     ScopeLabel,
 };

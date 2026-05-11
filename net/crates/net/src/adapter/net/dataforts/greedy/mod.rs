@@ -20,6 +20,7 @@
 mod admission;
 mod cache;
 mod config;
+mod metrics;
 
 pub use admission::{should_admit, AdmissionInputs, AdmissionVerdict};
 pub use cache::{EvictionSweep, GreedyCacheEntry, GreedyCacheRegistry};
@@ -27,6 +28,11 @@ pub use config::{
     GreedyConfig, GreedyConfigError, DEFAULT_BANDWIDTH_BUDGET_FRACTION,
     DEFAULT_PER_CHANNEL_CAP_BYTES, DEFAULT_PROXIMITY_MAX_RTT_MS, DEFAULT_TOTAL_CAP_BYTES,
     MIN_PER_CHANNEL_CAP_BYTES,
+};
+pub use metrics::{
+    AdmitRejectReason, GreedyChannelMetrics, GreedyChannelMetricsAtomic, GreedyClusterMetrics,
+    GreedyClusterMetricsAtomic, GreedyMetricsRegistry, GreedyMetricsSnapshot,
+    MAX_TRACKED_CHANNELS as MAX_METRIC_TRACKED_CHANNELS, OVERFLOW_CHANNEL_LABEL,
 };
 
 // Re-exported from the substrate so callers can compose against a
