@@ -26,6 +26,7 @@ mod manager;
 mod ordered;
 pub mod replication;
 mod replication_config;
+mod replication_coordinator;
 mod replication_election;
 mod replication_metrics;
 mod replication_state;
@@ -52,6 +53,9 @@ pub use replication_config::{
     PlacementStrategy, ReplicationConfig, ReplicationConfigError, UnderCapacity,
     HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MIN, REPLICATION_BUDGET_FRACTION_DEFAULT,
     REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX, REPLICATION_FACTOR_MIN,
+};
+pub use replication_coordinator::{
+    ChainTagSink, ChannelIdentity, CoordinatorError, ReplicationCoordinator,
 };
 pub use replication_election::{elect, ElectionOutcome};
 pub use replication_metrics::{

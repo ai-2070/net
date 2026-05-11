@@ -442,16 +442,18 @@ Implementable in isolation; does not depend on Capability B/F. **Landed.**
 - `RedexFileConfig` is now `Clone` rather than `Copy` since `ReplicationConfig` carries a `Vec<NodeId>` under the `Pinned` variant. Internal consumers updated to `.clone()` where they previously relied on bit-copy.
 - 🔜 **Phase I**: cross-binding serde for `ReplicationConfig` over Node, Python, Go, C bindings.
 
-### Phase C — `ReplicationCoordinator` daemon (1.5 weeks) ⚠️ state-machine scaffolding landed
+### Phase C — `ReplicationCoordinator` daemon (1.5 weeks) ⚠️ core landed
 
 **Hard prerequisite: Capability Phase B (tag-discovery primitives).** ✅ Landed — `Mesh::announce_chain` / `Mesh::announce_chain_range` / `Mesh::withdraw_chain` / `Mesh::find_chain_holders` ship on `MeshNode`. The remaining Phase C work (coordinator daemon, heartbeat loop, capability-tag lifecycle wiring) can now proceed.
 
 - ✅ `redex::replication_state::StateTransition` — validated transition shape over `ReplicaRole::{Leader, Replica, Candidate, Idle}`. Distinguishes "pair not in plan §3 matrix" (`InvalidPair`) from "pair valid but wrong signal" (`SignalMismatch`); pins the seven specific-signal pairs plus `ChannelClose → *` from any state, including the idempotent `Idle → Idle` shutdown shape. 13 tests covering every valid transition + exhaustive matrix-negative coverage.
 - ✅ `TransitionSignal` enum (`CapabilitySelected` / `MissedHeartbeats` / `ElectionWon` / `ElectionLost` / `GracefulRelinquish` / `DiskPressureWithdraw` / `ChannelClose`) — pins the signal-keyed observability the metrics scaffolding from Phase H will route on (`election_thrash_total` counts `MissedHeartbeats` transitions, etc.).
-- 🔜 `behavior::replication::ReplicationCoordinator` implementing `MeshDaemon` — needs Capability B.
-- 🔜 Spawn / register / withdraw lifecycle wired into `Redex::open_file` for replicated channels — needs Capability B.
-- 🔜 Heartbeat loop on `heartbeat_ms` — needs Capability B + the coordinator daemon.
-- 🔜 Capability tag emission on `Idle → Replica` and `Replica → Leader`; withdrawal on `* → Idle`. Uses Capability Phase B's `Mesh::announce_chain` / `Mesh::withdraw_chain`.
+- ✅ `redex::replication_coordinator::ReplicationCoordinator` — the core type. Holds `ChannelIdentity` (channel_name + origin_hash), `ReplicationConfig`, `Arc<dyn ChainTagSink>`, `Arc<ChannelMetricsAtomic>`, `Mutex<ReplicaRole>`, `AtomicU64<tail_seq>`.
+- ✅ `ChainTagSink` trait — async surface for chain-tag advertise / withdraw. Substrate implementation routes through `MeshNode::announce_chain` / `Mesh::withdraw_chain`; unit tests use a mock recorder.
+- ✅ `transition_to(target, signal)` — validates `(from, to, signal)` triple via `StateTransition::apply`, atomically updates the state cell, performs the documented capability-tag side-effect, increments metrics. Plan §3 emission pinning: `Idle → Replica` and `Candidate → Leader` announce; `* → Idle` withdraws; other transitions are state-only. Idempotent `Idle → Idle` shutdown is a no-op (no metric bump, no sink call).
+- ✅ 14 unit tests with a recorder mock: every transition type, tag-emission keyed on the correct pairs, metric bumps on Leader entry + MissedHeartbeats, idempotent ChannelClose, invalid-transition rejection, tag-sink-failure surface contract (state mutated even when sink fails so the operator-facing log says "your state went forward; your wire didn't").
+- 🔜 Heartbeat loop on `heartbeat_ms` — issues `SyncHeartbeat` to peers; observes peer heartbeats; triggers `transition_to(Candidate, MissedHeartbeats)` on 3 consecutive missed.
+- 🔜 Spawn / register / withdraw lifecycle wired into `Redex::open_file` for replicated channels — when `RedexFileConfig::replication.is_some()`, construct + register a coordinator; cleanup on file close.
 
 ### Phase D — Pull-based catch-up (1 week)
 
