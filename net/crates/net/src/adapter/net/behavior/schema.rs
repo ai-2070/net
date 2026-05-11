@@ -188,7 +188,7 @@ const HARDWARE_KEYS: &[KeyEntry] = &[
         value_type: ValueType::Number,
     },
     KeyEntry {
-        key: "network_mbps",
+        key: "network_gbps",
         value_type: ValueType::Number,
     },
     KeyEntry {
@@ -760,7 +760,7 @@ mod tests {
             "gpu.tensor_cores",
             "gpu.fp16_tflops_x10",
             "storage_gb",
-            "network_mbps",
+            "network_gbps",
             "limits.max_concurrent_requests",
             "limits.max_tokens_per_request",
             "limits.rate_limit_rpm",

@@ -80,7 +80,7 @@ export interface Hardware {
   additionalGpus?: GpuInfo[];
   /** Storage in GB. BigInt to carry multi-TB values without loss. */
   storageGb?: bigint;
-  networkMbps?: number;
+  networkGbps?: number;
   accelerators?: Accelerator[];
 }
 
@@ -208,7 +208,7 @@ interface NapiHardware {
   gpu?: NapiGpuInfo;
   additionalGpus?: NapiGpuInfo[];
   storageGb?: bigint;
-  networkMbps?: number;
+  networkGbps?: number;
   accelerators?: NapiAccelerator[];
 }
 
@@ -303,7 +303,7 @@ function hardwareToNapi(h: Hardware): NapiHardware {
     gpu: h.gpu ? gpuToNapi(h.gpu) : undefined,
     additionalGpus: h.additionalGpus?.map(gpuToNapi),
     storageGb: h.storageGb,
-    networkMbps: h.networkMbps,
+    networkGbps: h.networkGbps,
     accelerators: h.accelerators?.map(acceleratorToNapi),
   };
 }

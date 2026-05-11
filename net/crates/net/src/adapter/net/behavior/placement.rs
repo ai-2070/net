@@ -802,7 +802,7 @@ impl<'a> StandardPlacement<'a> {
     ///   that the target doesn't advertise are skipped, and the
     ///   average is over the components that DO have data.
     /// - `Storage` — single-component score from
-    ///   `dataforts.capacity_mb` (reference 1 TB).
+    ///   `dataforts.capacity_gb` (reference 1 TB).
     /// - `Both` — equal-weighted mean of `Compute` + `Storage`
     ///   scores (each computed independently).
     ///
@@ -1054,9 +1054,9 @@ fn score_compute_axis(caps: &CapabilitySet) -> f32 {
 }
 
 /// Compute the Storage resource score: saturating score on
-/// `dataforts.capacity_mb`. Returns 1.0 if the tag is absent.
+/// `dataforts.capacity_gb`. Returns 1.0 if the tag is absent.
 fn score_storage_axis(caps: &CapabilitySet) -> f32 {
-    if let Some(s) = target_axis_value_numeric(caps, TaxonomyAxis::Dataforts, "capacity_mb") {
+    if let Some(s) = target_axis_value_numeric(caps, TaxonomyAxis::Dataforts, "capacity_gb") {
         // Reference: 1 TB.
         saturating_score(s as f32, 1_000_000.0)
     } else {
@@ -1093,7 +1093,7 @@ fn score_compute_axis_with_data(caps: &CapabilitySet) -> Option<f32> {
 
 /// N-11: storage-axis sibling of [`score_compute_axis_with_data`].
 fn score_storage_axis_with_data(caps: &CapabilitySet) -> Option<f32> {
-    let s = target_axis_value_numeric(caps, TaxonomyAxis::Dataforts, "capacity_mb")?;
+    let s = target_axis_value_numeric(caps, TaxonomyAxis::Dataforts, "capacity_gb")?;
     Some(saturating_score(s as f32, 1_000_000.0))
 }
 
@@ -2641,13 +2641,13 @@ mod tests {
         assert!((s_one - 0.5).abs() < 1e-6, "1-comp got {s_one}, want 0.5");
     }
 
-    /// `Storage` axis: `dataforts.capacity_mb` at the reference
+    /// `Storage` axis: `dataforts.capacity_gb` at the reference
     /// (1 TB) → 0.5.
     #[test]
     fn resource_axis_storage_at_reference_scores_half() {
         let index = index_with(&[]);
         let placement = StandardPlacement::new(&index).with_resource_axis(ResourceAxis::Storage);
-        let target_caps = empty_caps().add_tag("dataforts.capacity_mb=1000000");
+        let target_caps = empty_caps().add_tag("dataforts.capacity_gb=1000");
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
@@ -2658,7 +2658,7 @@ mod tests {
         );
     }
 
-    /// `Storage` axis: target without `capacity_mb` tag → 1.0
+    /// `Storage` axis: target without `capacity_gb` tag → 1.0
     /// (permissive when no data).
     #[test]
     fn resource_axis_storage_no_data_returns_one() {
@@ -2694,9 +2694,9 @@ mod tests {
             "Both with only compute data should return compute score; got {score}"
         );
 
-        // Storage has data (capacity_mb=500_000 → 0.333), compute
+        // Storage has data (capacity_gb=500 → 0.333), compute
         // does not. Should return the storage score alone.
-        let target_caps = empty_caps().add_tag("dataforts.capacity_mb=500000");
+        let target_caps = empty_caps().add_tag("dataforts.capacity_gb=500");
         let score = placement.score_resource_axis(&target_caps, &artifact);
         let expected = saturating_score(500_000.0, 1_000_000.0);
         assert!(
@@ -2707,7 +2707,7 @@ mod tests {
         // Both axes have data — average is computed.
         let target_caps = empty_caps()
             .add_tag("hardware.cpu_cores=8")
-            .add_tag("dataforts.capacity_mb=500000");
+            .add_tag("dataforts.capacity_gb=500");
         let score = placement.score_resource_axis(&target_caps, &artifact);
         let expected = (0.5 + saturating_score(500_000.0, 1_000_000.0)) / 2.0;
         assert!(

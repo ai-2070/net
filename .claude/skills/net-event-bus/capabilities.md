@@ -22,14 +22,14 @@ pub struct CapabilitySet {
 `Tag` is a four-axis typed enum:
 
 - `Tag::AxisPresent { axis, key }` — boolean axis tag (`hardware.gpu`).
-- `Tag::AxisValue { axis, key, value, separator }` — keyed axis tag (`hardware.gpu.vram_mb=24576`, `software.os:linux`). The substrate accepts `=` or `:` as separator and stores it on the wire; semantic equality ignores the separator (`software.os=linux` and `software.os:linux` match).
+- `Tag::AxisValue { axis, key, value, separator }` — keyed axis tag (`hardware.gpu.vram_gb=24`, `software.os:linux`). The substrate accepts `=` or `:` as separator and stores it on the wire; semantic equality ignores the separator (`software.os=linux` and `software.os:linux` match).
 - `Tag::Reserved { prefix, body }` — reserved cross-axis tag (`scope:tenant:foo`, `causal:<hex>`, `fork-of:<hex>`, `heat:warm`). Only substrate code emits these; `Tag::parse_user` rejects reserved prefixes from application input.
 - `Tag::Legacy(String)` — untyped pre-Phase-A free-form (`nat:full-cone`, `nrpc:my-service`).
 
 Hardware / software / model / tool / resource-limit views are *projections* of the tag set, lazily decoded via `caps.views()`:
 
-- `HardwareCapabilities`: `cpu_cores`, `cpu_threads`, `memory_mb`, `gpu: Option<GpuInfo>`, `additional_gpus`, `storage_mb`, `network_mbps`, `accelerators` — encoded as `hardware.cpu_cores=N` / `hardware.gpu` / `hardware.gpu.vram_mb=N` / etc.
-- `GpuInfo`: `vendor: GpuVendor`, `model`, `vram_mb`, `compute_units`, `tensor_cores`, `fp16_tflops_x10`.
+- `HardwareCapabilities`: `cpu_cores`, `cpu_threads`, `memory_gb`, `gpu: Option<GpuInfo>`, `additional_gpus`, `storage_gb`, `network_gbps`, `accelerators` — encoded as `hardware.cpu_cores=N` / `hardware.gpu` / `hardware.gpu.vram_gb=N` / etc.
+- `GpuInfo`: `vendor: GpuVendor`, `model`, `vram_gb`, `compute_units`, `tensor_cores`, `fp16_tflops_x10`.
 - `ModelCapability`: `model_id`, `family`, `parameters_b_x10`, `context_length`, `quantization`, `modalities`, `tokens_per_sec`, `loaded` — indexed-encoded as `software.model.0.id=...` / `software.model.0.family=...` / etc.
 - `ToolCapability`: `tool_id`, `name`, `version`, `input_schema`, `output_schema`, `requires`, `estimated_time_ms`, `stateless`. Schemas live in `metadata` under `tool::<id>::input_schema` / `tool::<id>::output_schema` (the JSON-Schema strings can't safely round-trip through the tag wire format).
 - `ResourceLimits`: `max_concurrent_requests`, `max_tokens_per_request`, `rate_limit_rpm`, `max_batch_size`, `max_input_bytes`, `max_output_bytes` — encoded under `hardware.limits.*`.
@@ -79,10 +79,10 @@ pub struct CapabilityFilter {
     pub require_tags: Vec<String>,
     pub require_models: Vec<String>,
     pub require_tools: Vec<String>,
-    pub min_memory_mb: Option<u32>,
+    pub min_memory_gb: Option<u32>,
     pub require_gpu: bool,
     pub gpu_vendor: Option<GpuVendor>,
-    pub min_vram_mb: Option<u32>,
+    pub min_vram_gb: Option<u32>,
     pub min_context_length: Option<u32>,
     pub require_modalities: Vec<Modality>,
 }
@@ -104,7 +104,7 @@ use net_sdk::capabilities::{
 
 let pred = p.and(&[
     p.exists(&tag_key("hardware", "gpu")),
-    p.numeric_at_least(&tag_key("hardware", "memory_mb"), 65_536.0),
+    p.numeric_at_least(&tag_key("hardware", "memory_gb"), 64.0),
     p.semver_compatible(&tag_key("software", "runtime.python"), "3.11.0"),
     p.metadata_equals("intent", "ml-training"),
 ]);
@@ -153,12 +153,12 @@ use net_sdk::mesh::MeshBuilder;
 let node = MeshBuilder::new("0.0.0.0:0", &psk).build().await?;
 let hw = HardwareCapabilities::new()
     .with_cpu(16, 32)
-    .with_memory(65_536)
-    .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24_576));
+    .with_memory(64)
+    .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24));
 node.announce_capabilities(CapabilitySet::new().with_hardware(hw).add_tag("prod")).await?;
 
 let req = CapabilityRequirement::from_filter(
-    CapabilityFilter::new().with_gpu_vendor(GpuVendor::Nvidia).with_min_vram(16_384),
+    CapabilityFilter::new().with_gpu_vendor(GpuVendor::Nvidia).with_min_vram(16),
 );
 if let Some(node_id) = node.find_best_node(&req) { /* unicast to node_id */ }
 ```
@@ -176,14 +176,14 @@ import { MeshNode, normalizeGpuVendor } from '@ai2070/net-sdk';
 const node = await MeshNode.create({ bindAddr: '0.0.0.0:0', psk });
 await node.announceCapabilities({
   hardware: {
-    cpuCores: 16, memoryMb: 65_536,
-    gpu: { vendor: 'nvidia', model: 'RTX 4090', vramMb: 24_576 },
+    cpuCores: 16, memoryGb: 64,
+    gpu: { vendor: 'nvidia', model: 'RTX 4090', vramGb: 24 },
   },
   tags: ['prod'],
   models: [{ modelId: 'llama-3.1-70b', family: 'llama', loaded: true }],
 });
 const peers: bigint[] = node.findNodes({
-  requireGpu: true, gpuVendor: normalizeGpuVendor('NVIDIA'), minVramMb: 16_384,
+  requireGpu: true, gpuVendor: normalizeGpuVendor('NVIDIA'), minVramGb: 16_384,
 });
 ```
 
@@ -201,13 +201,13 @@ from net import NetMesh, normalize_gpu_vendor  # PyO3 native module
 node = NetMesh("0.0.0.0:0", psk_hex)
 node.start()
 node.announce_capabilities({
-    "hardware": {"cpu_cores": 16, "memory_mb": 65_536,
-        "gpu": {"vendor": "nvidia", "model": "RTX 4090", "vram_mb": 24_576}},
+    "hardware": {"cpu_cores": 16, "memory_gb": 64,
+        "gpu": {"vendor": "nvidia", "model": "RTX 4090", "vram_gb": 24}},
     "tags": ["prod"],
     "models": [{"model_id": "llama-3.1-70b", "family": "llama", "loaded": True}],
 })
 peers = node.find_nodes({
-    "require_gpu": True, "gpu_vendor": normalize_gpu_vendor("NVIDIA"), "min_vram_mb": 16_384,
+    "require_gpu": True, "gpu_vendor": normalize_gpu_vendor("NVIDIA"), "min_vram_gb": 16,
 })
 ```
 
@@ -244,8 +244,8 @@ gpu_node.announce_capabilities(
     CapabilitySet::new()
         .with_hardware(
             HardwareCapabilities::new()
-                .with_memory(131_072)
-                .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "H100", 81_920)),
+                .with_memory(128)
+                .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "H100", 80)),
         )
         .add_model(
             ModelCapability::new("llama-3.1-70b", "llama")
@@ -262,7 +262,7 @@ use net_sdk::capabilities::{CapabilityFilter, CapabilityRequirement};
 let req = CapabilityRequirement {
     filter: CapabilityFilter::new()
         .with_gpu_vendor(GpuVendor::Nvidia)
-        .with_min_vram(16_384)
+        .with_min_vram(16)
         .require_model("llama-3.1-70b")
         .require_tag("prod"),
     prefer_loaded_models: 1.0,

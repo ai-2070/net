@@ -84,7 +84,7 @@ const HARDWARE_KEYS: KeyEntry[] = [
   { key: 'gpu.tensor_cores', valueType: 'number' },
   { key: 'gpu.fp16_tflops_x10', valueType: 'number' },
   { key: 'storage_gb', valueType: 'number' },
-  { key: 'network_mbps', valueType: 'number' },
+  { key: 'network_gbps', valueType: 'number' },
   { key: 'limits.max_concurrent_requests', valueType: 'number' },
   { key: 'limits.max_tokens_per_request', valueType: 'number' },
   { key: 'limits.rate_limit_rpm', valueType: 'number' },

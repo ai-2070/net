@@ -23,7 +23,7 @@
           "hardware.gpu.model=h100",
           "hardware.gpu.vram_gb=80",
           "hardware.storage_gb=1000",
-          "hardware.network_mbps=10000"
+          "hardware.network_gbps=10"
         ],
         "metadata": {}
       },

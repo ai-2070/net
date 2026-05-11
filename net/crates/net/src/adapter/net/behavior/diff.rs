@@ -426,16 +426,16 @@ impl DiffEngine {
                 && old_hw.cpu_cores == new_hw.cpu_cores
                 && old_hw.gpu == new_hw.gpu
                 && old_hw.storage_gb == new_hw.storage_gb
-                && old_hw.network_mbps == new_hw.network_mbps
+                && old_hw.network_gbps == new_hw.network_gbps
             {
                 ops.push(DiffOp::UpdateMemory(new_hw.memory_gb));
-            } else if old_hw.network_mbps != new_hw.network_mbps
+            } else if old_hw.network_gbps != new_hw.network_gbps
                 && old_hw.cpu_cores == new_hw.cpu_cores
                 && old_hw.gpu == new_hw.gpu
                 && old_hw.memory_gb == new_hw.memory_gb
                 && old_hw.storage_gb == new_hw.storage_gb
             {
-                ops.push(DiffOp::UpdateNetwork(new_hw.network_mbps));
+                ops.push(DiffOp::UpdateNetwork(new_hw.network_gbps));
             } else {
                 ops.push(DiffOp::UpdateHardware(new_hw.clone()));
             }
@@ -959,7 +959,7 @@ impl DiffEngine {
             }
             DiffOp::UpdateNetwork(net) => {
                 let mut hw = caps.views().hardware().clone();
-                hw.network_mbps = *net;
+                hw.network_gbps = *net;
                 caps.set_hardware(hw);
             }
             DiffOp::UpdateSoftware(sw) => {

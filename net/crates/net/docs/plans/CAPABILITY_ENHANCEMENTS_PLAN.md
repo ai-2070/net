@@ -74,7 +74,7 @@ axis hardware {
     }
     memory_gb: number
     storage_gb: number
-    network_mbps: number
+    network_gbps: number
     limits: {
         max_concurrent_requests: number
         max_tokens_per_request: number

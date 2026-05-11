@@ -18,7 +18,7 @@
 //!     memory_gb: 64,
 //!     gpu: Some(GpuInfo { vendor: Nvidia, model: "RTX 4090", vram_gb: 24, ... }),
 //!     storage_gb: 2000,
-//!     network_mbps: 10000,
+//!     network_gbps: 10,
 //!     ..
 //! }
 //! ```
@@ -37,7 +37,7 @@
 //! hardware.gpu.tensor_cores=512
 //! hardware.gpu.fp16_tflops_x10=825
 //! hardware.storage_gb=2000
-//! hardware.network_mbps=10000
+//! hardware.network_gbps=10
 //! ```
 //!
 //! Zero-valued / empty / `None` fields are omitted from emission,
@@ -96,8 +96,8 @@ pub fn hardware_to_tags(hw: &HardwareCapabilities) -> Vec<Tag> {
     if hw.storage_gb > 0 {
         tags.push(axis_value("storage_gb", &hw.storage_gb.to_string()));
     }
-    if hw.network_mbps > 0 {
-        tags.push(axis_value("network_mbps", &hw.network_mbps.to_string()));
+    if hw.network_gbps > 0 {
+        tags.push(axis_value("network_gbps", &hw.network_gbps.to_string()));
     }
 
     // additional_gpus + accelerators: deferred to Phase A.5.1.
@@ -224,8 +224,8 @@ pub fn hardware_from_tags(tags: &[Tag]) -> HardwareCapabilities {
             "storage_gb" => {
                 hw.storage_gb = value.parse().unwrap_or(0);
             }
-            "network_mbps" => {
-                hw.network_mbps = value.parse().unwrap_or(0);
+            "network_gbps" => {
+                hw.network_gbps = value.parse().unwrap_or(0);
             }
             "gpu" => {
                 // Presence marker — initialize an empty GpuInfo
@@ -1022,7 +1022,7 @@ mod tests {
                 "hardware.gpu.tensor_cores=512",
                 "hardware.gpu.fp16_tflops_x10=825",
                 "hardware.storage_gb=2000",
-                "hardware.network_mbps=10000",
+                "hardware.network_gbps=10",
             ]
         );
     }

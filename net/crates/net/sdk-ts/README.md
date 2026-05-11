@@ -469,7 +469,7 @@ caps = withMetadata(caps, 'intent', 'ml-training');
 // Author a predicate.
 const pred = p.and(
   p.exists({ axis: 'hardware', key: 'gpu' }),
-  p.numericAtLeast({ axis: 'hardware', key: 'memory_gb' }, 65536),
+  p.numericAtLeast({ axis: 'hardware', key: 'memory_gb' }, 64),
   p.metadataEquals('intent', 'ml-training'),
 );
 

@@ -2648,7 +2648,7 @@ struct HardwareJson {
     #[serde(default)]
     additional_gpus: Vec<GpuJson>,
     storage_gb: Option<u64>,
-    network_mbps: Option<u32>,
+    network_gbps: Option<u32>,
     #[serde(default)]
     accelerators: Vec<AcceleratorJson>,
 }
@@ -2833,7 +2833,7 @@ fn hardware_from_json(h: HardwareJson) -> HardwareCapabilities {
     if let Some(mb) = h.storage_gb {
         hw = hw.with_storage(mb);
     }
-    if let Some(mbps) = h.network_mbps {
+    if let Some(mbps) = h.network_gbps {
         hw = hw.with_network(mbps);
     }
     for a in h.accelerators {
@@ -3993,7 +3993,7 @@ mod tests {
             gpu: None,
             additional_gpus: Vec::new(),
             storage_gb: None,
-            network_mbps: None,
+            network_gbps: None,
             accelerators: Vec::new(),
         };
         let hw = hardware_from_json(h);

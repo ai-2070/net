@@ -44,7 +44,7 @@ pub struct HardwareJs {
     pub gpu: Option<GpuInfoJs>,
     pub additional_gpus: Option<Vec<GpuInfoJs>>,
     pub storage_gb: Option<BigInt>,
-    pub network_mbps: Option<u32>,
+    pub network_gbps: Option<u32>,
     pub accelerators: Option<Vec<AcceleratorJs>>,
 }
 
@@ -284,7 +284,7 @@ fn hardware_from_js(h: HardwareJs) -> HardwareCapabilities {
     if h.storage_gb.is_some() {
         hw = hw.with_storage(bigint_to_u64_or_zero(h.storage_gb));
     }
-    if let Some(mbps) = h.network_mbps {
+    if let Some(mbps) = h.network_gbps {
         hw = hw.with_network(mbps);
     }
     for a in h.accelerators.unwrap_or_default() {
@@ -609,7 +609,7 @@ mod tests {
             gpu: None,
             additional_gpus: None,
             storage_gb: None,
-            network_mbps: None,
+            network_gbps: None,
             accelerators: None,
         };
         let hw = hardware_from_js(h);

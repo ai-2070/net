@@ -206,7 +206,7 @@ pub struct HardwareCapabilities {
     /// Storage in GB
     pub storage_gb: u64,
     /// Network bandwidth in Mbps
-    pub network_mbps: u32,
+    pub network_gbps: u32,
     /// Accelerators (TPU, NPU, etc.)
     pub accelerators: Vec<AcceleratorInfo>,
 }
@@ -249,8 +249,8 @@ impl HardwareCapabilities {
     }
 
     /// Set network bandwidth
-    pub fn with_network(mut self, network_mbps: u32) -> Self {
-        self.network_mbps = network_mbps;
+    pub fn with_network(mut self, network_gbps: u32) -> Self {
+        self.network_gbps = network_gbps;
         self
     }
 

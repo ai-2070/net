@@ -95,7 +95,7 @@ var hardwareKeys = []SchemaKeyEntry{
 	{"gpu.tensor_cores", ValueTypeNumber},
 	{"gpu.fp16_tflops_x10", ValueTypeNumber},
 	{"storage_gb", ValueTypeNumber},
-	{"network_mbps", ValueTypeNumber},
+	{"network_gbps", ValueTypeNumber},
 	{"limits.max_concurrent_requests", ValueTypeNumber},
 	{"limits.max_tokens_per_request", ValueTypeNumber},
 	{"limits.rate_limit_rpm", ValueTypeNumber},

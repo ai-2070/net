@@ -91,7 +91,7 @@ _HARDWARE_KEYS: Tuple[KeyEntry, ...] = (
     KeyEntry("gpu.tensor_cores", "number"),
     KeyEntry("gpu.fp16_tflops_x10", "number"),
     KeyEntry("storage_gb", "number"),
-    KeyEntry("network_mbps", "number"),
+    KeyEntry("network_gbps", "number"),
     KeyEntry("limits.max_concurrent_requests", "number"),
     KeyEntry("limits.max_tokens_per_request", "number"),
     KeyEntry("limits.rate_limit_rpm", "number"),

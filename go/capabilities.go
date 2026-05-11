@@ -69,7 +69,7 @@ type HardwareCaps struct {
 	GPU            *GPUInfo          `json:"gpu,omitempty"`
 	AdditionalGPUs []GPUInfo         `json:"additional_gpus,omitempty"`
 	StorageGB      uint64            `json:"storage_gb,omitempty"`
-	NetworkMbps    uint32            `json:"network_mbps,omitempty"`
+	NetworkGbps    uint32            `json:"network_gbps,omitempty"`
 	Accelerators   []AcceleratorInfo `json:"accelerators,omitempty"`
 }
 

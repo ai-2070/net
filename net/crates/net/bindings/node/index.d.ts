@@ -1633,7 +1633,7 @@ export interface HardwareJs {
   gpu?: GpuInfoJs
   additionalGpus?: Array<GpuInfoJs>
   storageGb?: bigint
-  networkMbps?: number
+  networkGbps?: number
   accelerators?: Array<AcceleratorJs>
 }
 
