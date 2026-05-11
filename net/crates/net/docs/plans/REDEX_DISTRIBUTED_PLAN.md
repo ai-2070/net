@@ -444,6 +444,8 @@ Implementable in isolation; does not depend on Capability B/F. **Landed.**
 
 ### Phase C — `ReplicationCoordinator` daemon (1.5 weeks) ✅
 
+**End-to-end proven.** `tests/redex_replication_e2e.rs` runs two `MeshNode`s + two `Redex` managers on a real loopback handshake, opens the same replicated channel on both, drives the state-machine path Idle → Replica → Candidate → Leader on the leader side and Idle → Replica on the replica side, appends 32 events on the leader, and asserts the replica's local file catches up to the leader's tail (every event in order with matching payload) within 5 seconds via the heartbeat → SyncRequest → SyncResponse → apply cycle. `Redex::replication_coordinator_for(name) -> Option<Arc<ReplicationCoordinator>>` is the operator surface; `ReplicationRuntimeHandle::coordinator()` exposes the same `Arc` for tests + per-channel inspection (current role + metrics + manual transition_to for recovery).
+
 **Hard prerequisite: Capability Phase B (tag-discovery primitives).** ✅ Landed — `Mesh::announce_chain` / `Mesh::announce_chain_range` / `Mesh::withdraw_chain` / `Mesh::find_chain_holders` ship on `MeshNode`. The remaining Phase C work (coordinator daemon, heartbeat loop, capability-tag lifecycle wiring) can now proceed.
 
 - ✅ `redex::replication_state::StateTransition` — validated transition shape over `ReplicaRole::{Leader, Replica, Candidate, Idle}`. Distinguishes "pair not in plan §3 matrix" (`InvalidPair`) from "pair valid but wrong signal" (`SignalMismatch`); pins the seven specific-signal pairs plus `ChannelClose → *` from any state, including the idempotent `Idle → Idle` shutdown shape. 13 tests covering every valid transition + exhaustive matrix-negative coverage.

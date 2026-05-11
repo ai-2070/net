@@ -261,13 +261,27 @@ pub struct RuntimeInputs {
 /// Handle the spawned task produces. Holds the inbox sender so
 /// the mesh dispatcher (and the lifecycle code) can push
 /// [`Inbound`] events. `cancel()` sends `Shutdown` and awaits the
-/// task to exit cleanly.
+/// task to exit cleanly. The owned [`ReplicationCoordinator`] is
+/// exposed via [`Self::coordinator`] so operators (and tests) can
+/// observe the role, drive `transition_to`, and read the channel
+/// metrics without going through the inbox.
 pub struct ReplicationRuntimeHandle {
     inbox: mpsc::Sender<Inbound>,
     task: Mutex<Option<JoinHandle<()>>>,
+    coordinator: Arc<ReplicationCoordinator>,
 }
 
 impl ReplicationRuntimeHandle {
+    /// The per-channel coordinator. Same `Arc` the runtime task
+    /// uses; cloning is cheap. Operators read `coordinator.role()`
+    /// for the current state and `coordinator.metrics()` for the
+    /// per-channel atomic counters; tests can drive
+    /// `coordinator.transition_to(target, signal)` to put the
+    /// channel in a specific role.
+    pub fn coordinator(&self) -> &Arc<ReplicationCoordinator> {
+        &self.coordinator
+    }
+
     /// Push an inbound event into the runtime's inbox. Errors
     /// when the runtime has already exited (drained channel).
     pub async fn dispatch(&self, event: Inbound) -> Result<(), AdapterError> {
@@ -333,10 +347,19 @@ pub fn spawn_replication_runtime(
 ) -> ReplicationRuntimeHandle {
     let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(inputs.heartbeat_ms)));
     let (tx, rx) = mpsc::channel::<Inbound>(RUNTIME_INBOX_CAPACITY);
-    let task = tokio::spawn(run(inputs, coordinator, dispatcher, tracker, budget, rx));
+    let coordinator_for_task = coordinator.clone();
+    let task = tokio::spawn(run(
+        inputs,
+        coordinator_for_task,
+        dispatcher,
+        tracker,
+        budget,
+        rx,
+    ));
     ReplicationRuntimeHandle {
         inbox: tx,
         task: Mutex::new(Some(task)),
+        coordinator,
     }
 }
 

@@ -146,6 +146,29 @@ impl Redex {
             .unwrap_or(0)
     }
 
+    /// The per-channel [`ReplicationCoordinator`] for `name`, if a
+    /// replicated runtime was spawned for it. `None` when:
+    /// - replication is not enabled on this manager, OR
+    /// - no file is open at `name`, OR
+    /// - the file at `name` was opened without
+    ///   `RedexFileConfig::replication`.
+    ///
+    /// Exposed for operator inspection (`coordinator.role()`,
+    /// `coordinator.metrics()`) and test-driven role transitions
+    /// (`coordinator.transition_to(target, signal)`). Production
+    /// drives transitions through the placement filter (Phase F) +
+    /// election cycle; the surface is here so operators can also
+    /// force a transition for recovery / debugging.
+    pub fn replication_coordinator_for(
+        &self,
+        name: &ChannelName,
+    ) -> Option<Arc<ReplicationCoordinator>> {
+        let wiring = self.replication.read().as_ref().cloned()?;
+        let channel_id = ChannelId::from_name(name);
+        let handle = wiring.router.get(&channel_id)?;
+        Some(handle.coordinator().clone())
+    }
+
     /// Open (create if absent) a RedEX file bound to `name`.
     ///
     /// Re-opening an existing name returns the existing handle. The
