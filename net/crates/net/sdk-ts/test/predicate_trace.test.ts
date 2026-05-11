@@ -122,7 +122,7 @@ describe('trace evaluator local properties', () => {
         label: 'Equals(hardware.gpu.vendor=nvidia)',
       },
       {
-        p: p.numericAtLeast(tagKey('hardware', 'memory_gb'), 65536),
+        p: p.numericAtLeast(tagKey('hardware', 'memory_gb'), 64),
         label: 'NumericAtLeast(hardware.memory_gb >= 64)',
       },
       {
