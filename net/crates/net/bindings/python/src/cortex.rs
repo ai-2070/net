@@ -1716,7 +1716,12 @@ impl PyNetDb {
             None
         };
         let memories = if with_memories {
-            Some(PyMemoriesAdapter::open(py, &redex, origin_hash, persistent)?)
+            Some(PyMemoriesAdapter::open(
+                py,
+                &redex,
+                origin_hash,
+                persistent,
+            )?)
         } else {
             None
         };
@@ -1786,7 +1791,12 @@ impl PyNetDb {
                     last_seq,
                     persistent,
                 )?),
-                None => Some(PyMemoriesAdapter::open(py, &redex, origin_hash, persistent)?),
+                None => Some(PyMemoriesAdapter::open(
+                    py,
+                    &redex,
+                    origin_hash,
+                    persistent,
+                )?),
             }
         } else {
             None
