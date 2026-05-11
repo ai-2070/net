@@ -269,6 +269,41 @@ impl PyRedex {
         if let Some(ms) = retention_max_age_ms {
             cfg.retention_max_age_ns = Some(ms.saturating_mul(1_000_000));
         }
+        // R-6: if `replication=False` but any other replication
+        // kwarg is set, fail loud rather than silently opening
+        // a single-node file. Operators who typo'd the boolean
+        // (or forgot it entirely) get a clear error instead of
+        // their carefully-tuned settings being silently ignored.
+        if !replication {
+            let stray = [
+                ("replication_factor", replication_factor.is_some()),
+                ("replication_heartbeat_ms", replication_heartbeat_ms.is_some()),
+                ("replication_placement", replication_placement.is_some()),
+                (
+                    "replication_pinned_nodes",
+                    replication_pinned_nodes.is_some(),
+                ),
+                (
+                    "replication_leader_pinned",
+                    replication_leader_pinned.is_some(),
+                ),
+                (
+                    "replication_on_under_capacity",
+                    replication_on_under_capacity.is_some(),
+                ),
+                (
+                    "replication_budget_fraction",
+                    replication_budget_fraction.is_some(),
+                ),
+            ];
+            let first_set = stray.iter().find(|(_, set)| *set).map(|(n, _)| *n);
+            if let Some(name) = first_set {
+                return Err(RedexError::new_err(format!(
+                    "replication: {name} specified without replication=True; \
+                     set replication=True to opt the channel in, or remove the kwarg"
+                )));
+            }
+        }
         if replication {
             cfg.replication = Some(build_replication_config(
                 replication_factor,
