@@ -427,7 +427,7 @@ fn build_replication_config(
             }
             // R-28: cross-check leader_pinned membership.
             if let Some(lp) = leader_pinned {
-                if !nodes.iter().any(|n| *n == lp) {
+                if !nodes.contains(&lp) {
                     return Err(RedexError::new_err(format!(
                         "replication_leader_pinned {lp} is not in replication_pinned_nodes"
                     )));

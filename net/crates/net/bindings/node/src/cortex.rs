@@ -333,7 +333,7 @@ fn resolve_placement_strategy(
             // core's LeaderPinnedNotInPinnedSet.
             if let Some(lp_big) = leader_pinned {
                 let lp = redex_bigint_u64("replication.leader_pinned", lp_big.clone())?;
-                if !out.iter().any(|n| *n == lp) {
+                if !out.contains(&lp) {
                     return Err(redex_err(
                         "replication.leader_pinned",
                         format!("{lp} is not in replication.pinned_nodes"),
