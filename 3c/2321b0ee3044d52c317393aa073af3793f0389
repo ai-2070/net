@@ -1,0 +1,34 @@
+net/crates/net/src/ffi/cortex.rs
+  s_3a0a24a47d1a36::t_e61bfa14b4fc84 817-878
+  s_3a0a24a47d1a36::t_68ebb4efed9667 73-78
+  s_3a0a24a47d1a36::t_0fbdf86a82c8c1 79-82
+  s_3a0a24a47d1a36::t_e3848034dc674d 1703-1716
+  s_3a0a24a47d1a36::t_0dfc235e2d4eba 2350-2361
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_9d59e3331514b3 53
+  s_3a0a24a47d1a36::t_0fea313e936502 54-56
+net/crates/net/src/ffi/blob.rs
+  s_3a0a24a47d1a36::t_624baffa430f22 49-54
+  s_3a0a24a47d1a36::t_6d84e3176d2641 223-233
+  s_3a0a24a47d1a36::t_59f1b1924e4094 659-677
+  s_3a0a24a47d1a36::t_f32d4d114f5884 291-299
+net/crates/net/src/adapter/net/redex/write_token.rs
+  s_3a0a24a47d1a36::t_497069a00260ee 10-29
+  s_3a0a24a47d1a36::t_859206269c01e2 37-41,52-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "3c2321b0ee3044d52c317393aa073af3793f0389",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
