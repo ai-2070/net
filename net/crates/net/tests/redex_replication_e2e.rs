@@ -329,9 +329,40 @@ async fn leader_close_triggers_replica_election_and_promotion() {
         .await
         .unwrap();
 
-    // Give the leader a few heartbeat cycles to land on B's
-    // tracker so B has a believed_leader to lose.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // R-41: poll until B has observed at least one leader
+    // heartbeat from A, with a hard deadline. Replacing the
+    // previous fixed 500ms sleep removes the CI flake window
+    // where scheduler jitter delayed A's first heartbeat past
+    // the sleep budget.
+    {
+        let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let coord_b_ref = &coord_b;
+        loop {
+            // The replica's role stays Replica while waiting; we
+            // can't read tracker state from outside the runtime,
+            // so we poll a proxy: the replica's metric snapshot
+            // shows a non-zero lag observation once a leader
+            // heartbeat has landed. Until then, lag is sentinel.
+            let snap = redex_b
+                .replication_metrics_snapshot()
+                .expect("metrics snapshot");
+            let observed = snap
+                .channel(name.as_str())
+                .map(|c| c.replica_lag_seconds.is_some())
+                .unwrap_or(false);
+            if observed {
+                break;
+            }
+            if tokio::time::Instant::now() >= poll_deadline {
+                // Fall through; the election test below will
+                // still pass if a heartbeat lands during the kill
+                // detection window, just with less determinism.
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = coord_b_ref; // keep ref alive for the loop
+        }
+    }
 
     // Close A's channel — its runtime exits, no more heartbeats
     // emitted to B.

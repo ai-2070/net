@@ -58,15 +58,15 @@ Tagged `[H | M | L]`:
 | R-32  | M   | file        | `skip_to` swap-order: index assigned before `evict_prefix_to`             | ✅ |
 | R-33  | M   | mod         | `pub mod replication` AND flat re-exports of the same types               | ✅ |
 | R-34  | M   | metrics     | `Duration → micros` saturation may collide with `LAG_NOT_OBSERVED`        | ✅ |
-| R-35  | L   | election    | `sort_by` claims to use stability for determinism; should be `unstable`   | ⚪ |
-| R-36  | L   | wire codec  | `Vec::with_capacity(event_count.min(4096))` cap is undocumented           | ⚪ |
+| R-35  | L   | election    | `sort_by` claims to use stability for determinism; should be `unstable`   | ✅ |
+| R-36  | L   | wire codec  | `Vec::with_capacity(event_count.min(4096))` cap is undocumented           | ✅ |
 | R-37  | L   | wire codec  | `u32::try_from(...).unwrap_or(u32::MAX)` silently corrupts data           | ✅ (R-5 commit) |
 | R-38  | L   | wire codec  | Byte-layout test doc-comment reverses LE order vs asserted bytes          | ✅ |
-| R-39  | L   | loom        | `burst_cas_decrement` comment says "three threads"; code spawns 2         | ⚪ |
-| R-40  | L   | dst         | `_unused_imports_workaround` is cargo-cult silencing                      | ⚪ |
-| R-41  | L   | e2e         | Fixed 500ms `tokio::time::sleep` before leader close — flake risk         | ⚪ |
-| R-42  | L   | node binding| `.d.ts` unconditionally emits `enableReplication` despite `cfg` gating    | ⚪ |
-| R-43  | L   | go binding  | `typedef ArcMeshNode` collides with upstream `net_compute_mesh_arc_t`     | ⚪ |
+| R-39  | L   | loom        | `burst_cas_decrement` comment says "three threads"; code spawns 2         | ✅ |
+| R-40  | L   | dst         | `_unused_imports_workaround` is cargo-cult silencing                      | ✅ |
+| R-41  | L   | e2e         | Fixed 500ms `tokio::time::sleep` before leader close — flake risk         | ✅ |
+| R-42  | L   | node binding| `.d.ts` unconditionally emits `enableReplication` despite `cfg` gating    | 📝 documented cross-link to R-7 stub |
+| R-43  | L   | go binding  | `typedef ArcMeshNode` collides with upstream `net_compute_mesh_arc_t`     | 📝 documented as alias |
 | C-1   | M   | tests       | No DST scenario exercises "election storms" (plan §F)                     | ⚪ |
 | C-2   | M   | tests       | Divergence-freedom check only runs on happy path, not after fault         | ⚪ |
 | C-3   | M   | tests       | `chain_discovery.rs` tests are single-node only                           | ⚪ |

@@ -87,6 +87,12 @@ package net
 #include <stdlib.h>
 
 // Forward-declared opaque handle types from `libnet`.
+// R-43: `ArcMeshNode` is locally declared as the opaque shape of
+// `*mut Arc<MeshNode>` in Rust. The upstream header generated
+// from `net::ffi::mesh` calls the same type `net_compute_mesh_arc_t`
+// — both name the same underlying pointer to a Rust `Arc<MeshNode>`,
+// and any C consumer reading both headers should treat them as
+// interchangeable opaque types.
 typedef struct RedexHandle RedexHandle;
 typedef struct RedexFileHandle RedexFileHandle;
 typedef struct ArcMeshNode ArcMeshNode;

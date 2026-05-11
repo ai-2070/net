@@ -225,11 +225,14 @@ fn burst_cas_decrement_never_underflows_under_contention() {
 #[test]
 fn burst_cas_decrement_caps_at_initial_count_under_contention() {
     loom::model(|| {
-        // Initial 1, three threads racing — only ONE must win.
-        // The others must see `remaining == 0` and return false
-        // without wrapping the counter. A regression from the
-        // CAS loop to `load; fetch_sub` would let all three
-        // decrement, producing a counter of u64::MAX - 2.
+        // R-39: initial 1, two threads racing — only ONE must
+        // win. The other must see `remaining == 0` and return
+        // false without wrapping the counter. A regression from
+        // the CAS loop to `load; fetch_sub` would let both
+        // decrement, producing a counter of u64::MAX. Two
+        // threads is enough to drive every interleaving loom
+        // explores; the original comment said "three" but the
+        // code always spawned two.
         let counter = Arc::new(AtomicU64::new(1));
         let winners = Arc::new(AtomicU64::new(0));
 

@@ -139,10 +139,12 @@ where
         return ElectionOutcome::NoEligibleReplica;
     }
 
-    // Stable sort by (rtt ascending, node_id ascending). Vec::sort
-    // is guaranteed stable in std; this is the deterministic
-    // tie-break the plan pins.
-    candidates.sort_by(|a, b| match a.1.cmp(&b.1) {
+    // R-35: sort by (rtt ascending, node_id ascending) using the
+    // unstable variant. Determinism comes from the total compound
+    // key — two candidates with equal (rtt, node_id) are
+    // impossible in a well-formed replica_set (NodeIds are
+    // unique per peer), so stability is not load-bearing.
+    candidates.sort_unstable_by(|a, b| match a.1.cmp(&b.1) {
         Ordering::Equal => a.0.cmp(&b.0),
         other => other,
     });

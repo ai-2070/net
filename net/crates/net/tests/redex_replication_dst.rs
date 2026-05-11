@@ -50,8 +50,7 @@ use net::adapter::net::channel::ChannelName;
 use net::adapter::net::redex::{
     apply_sync_response, election_outcome, handle_sync_request, tick, ApplyError, ChannelId,
     HeartbeatTracker, Inbound, OutboundMessage, Redex, RedexFile, RedexFileConfig, ReplicaRole,
-    StateTransition, SyncHeartbeat, SyncNack, SyncRequest, SyncRequestOutcome, SyncResponse,
-    TickInputs, TransitionSignal,
+    StateTransition, SyncNack, SyncRequestOutcome, TickInputs, TransitionSignal,
 };
 
 // ────────────────────────────────────────────────────────────────
@@ -1015,12 +1014,4 @@ fn no_two_leaders_within_a_partition_post_failover_with_central_peer() {
     }
     // The new Leader is B (the central peer).
     assert_eq!(cluster.nodes.get(&b).unwrap().role, ReplicaRole::Leader);
-}
-
-// Silence the unused-warning chain on partial-feature builds.
-#[allow(dead_code)]
-fn _unused_imports_workaround() {
-    let _ = std::mem::size_of::<SyncHeartbeat>()
-        + std::mem::size_of::<SyncRequest>()
-        + std::mem::size_of::<SyncResponse>();
 }

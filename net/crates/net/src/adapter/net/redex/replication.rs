@@ -448,6 +448,13 @@ impl SyncResponse {
         let first_seq = cursor.get_u64_le();
         let leader_first_retained_seq = cursor.get_u64_le();
         let event_count = cursor.get_u32_le() as usize;
+        // R-36: cap the pre-allocation at 4096 events to bound a
+        // hostile `event_count` (e.g. peer sending a maximum-u32
+        // count without the matching payload bytes). Legitimate
+        // chunks above 4096 events incur progressive grow-and-
+        // copy, but the byte budget (`chunk_max` ≤ 64 MiB)
+        // means an over-4096-event chunk averages payload <
+        // 16 KiB / event, which is comfortably small.
         let mut events = Vec::with_capacity(event_count.min(4096));
         for _ in 0..event_count {
             if cursor.remaining() < 8 + 4 {
