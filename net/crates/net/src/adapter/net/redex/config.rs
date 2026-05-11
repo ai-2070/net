@@ -90,7 +90,7 @@ pub enum FsyncPolicy {
 /// Per-file configuration supplied at `Redex::open_file` time.
 ///
 /// Was `Copy` pre-replication. The `replication` field carries a
-/// `Vec<NodeId>` when [`PlacementStrategy::Pinned`] is in use, so
+/// `Vec<NodeId>` when [`PlacementStrategy::Pinned`](super::replication_config::PlacementStrategy::Pinned) is in use, so
 /// the type is now `Clone`-only. The struct is small and rarely
 /// passed in hot paths; existing callers add a `.clone()` where they
 /// previously relied on bit-copy semantics.

@@ -32,8 +32,9 @@ use crate::adapter::net::behavior::placement::NodeId;
 pub const DEFAULT_MISS_THRESHOLD: u8 = 3;
 
 /// Per-peer state cell. Captures the most recent
-/// [`SyncHeartbeat`] observation. Public field shape so consumers
-/// can build leader-side lag metrics directly.
+/// [`SyncHeartbeat`](super::replication::SyncHeartbeat) observation.
+/// Public field shape so consumers can build leader-side lag
+/// metrics directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerState {
     /// Most recent inbound heartbeat timestamp from this peer.
@@ -202,9 +203,9 @@ impl HeartbeatTracker {
     /// last-seen within the miss-threshold window. Sorted by
     /// `NodeId` for stable iteration.
     ///
-    /// Consumed by the [`elect()`] selection function from
-    /// `replication_election.rs` to filter the replica set down
-    /// to the healthy subset.
+    /// Consumed by the [`elect`](super::replication_election::elect)
+    /// selection function from `replication_election.rs` to filter
+    /// the replica set down to the healthy subset.
     pub fn healthy_peers(&self, now: Instant) -> Vec<NodeId> {
         let threshold =
             Duration::from_millis(self.heartbeat_ms.saturating_mul(self.miss_threshold as u64));
