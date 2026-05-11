@@ -330,11 +330,21 @@ impl GreedyRuntime {
             let gravity = self.inner.gravity.read();
             if let Some(gravity) = gravity.as_ref() {
                 if let Some(origin_hash) = origin_hash {
-                    if origin_hash != 0 {
-                        let mut heat = gravity.heat.lock();
-                        heat.entry_mut(origin_hash, gravity.policy.decay_half_life, now)
-                            .bump(now);
-                    }
+                    // Bump the heat counter unconditionally —
+                    // origin_hash == 0 is a valid bucket (the
+                    // standard publish path leaves the header
+                    // origin_hash at zero unless the publisher
+                    // explicitly stamps its identity, in which
+                    // case all chains observed under that
+                    // publisher share one heat counter). Real
+                    // deployments configure their publishers to
+                    // stamp meaningful origin_hashes so the
+                    // counter is per-chain; tests against the
+                    // default publish path aggregate into the
+                    // zero bucket.
+                    let mut heat = gravity.heat.lock();
+                    heat.entry_mut(origin_hash, gravity.policy.decay_half_life, now)
+                        .bump(now);
                 }
             }
         }
