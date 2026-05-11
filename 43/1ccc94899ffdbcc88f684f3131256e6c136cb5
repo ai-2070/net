@@ -1,0 +1,28 @@
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_d760092f02a89c::t_f97e42a58e7d26 535-548
+  s_d760092f02a89c::t_c83e3e792a2aef 585-595,634-651,675-683
+  s_d760092f02a89c::t_9987fbd5915e8e 1564-1616,1618-1747
+  s_d760092f02a89c::t_5c8cdf970673b0 727-730,735
+  s_d760092f02a89c::t_501afccaa00547 781-789
+  s_d760092f02a89c::t_424a4e9ebab3ca 457-463,465,484,486-488
+  s_d760092f02a89c::t_05df173e5b7f22 1617
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_REDEX_DISTRIBUTED.md
+  s_d760092f02a89c::t_92f1c6b38f672e 26-27
+  s_d760092f02a89c::t_7532f7b3e2cf8b 35,37-38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "431ccc94899ffdbcc88f684f3131256e6c136cb5",
+  "prompts": {},
+  "sessions": {
+    "s_d760092f02a89c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ef8b8023-dce0-4b44-bfb8-b07c462d6685",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
