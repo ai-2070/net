@@ -24,8 +24,10 @@ use ::net::adapter::net::cortex::tasks::{
     TasksAdapter as InnerTasksAdapter,
 };
 use ::net::adapter::net::redex::{
-    FsyncPolicy as InnerFsyncPolicy, Redex as InnerRedex, RedexError as InnerRedexError,
-    RedexEvent as InnerRedexEvent, RedexFile as InnerRedexFile, RedexFileConfig,
+    FsyncPolicy as InnerFsyncPolicy, PlacementStrategy as InnerPlacementStrategy,
+    Redex as InnerRedex, RedexError as InnerRedexError, RedexEvent as InnerRedexEvent,
+    RedexFile as InnerRedexFile, RedexFileConfig, ReplicationConfig as InnerReplicationConfig,
+    UnderCapacity as InnerUnderCapacity,
 };
 use bytes::Bytes;
 
@@ -192,6 +194,14 @@ impl PyRedex {
     /// `fsync_every_n` and `fsync_interval_ms` are mutually exclusive;
     /// leave both unset for the default "never fsync on append"
     /// policy (`close()` and explicit `sync()` still fsync).
+    ///
+    /// Cross-node replication: pass `replication=True` to opt the
+    /// channel in. The remaining `replication_*` kwargs tune the
+    /// replication policy (factor, heartbeat cadence, placement,
+    /// disk-pressure policy, bandwidth budget). The owning `Redex`
+    /// must have called `enable_replication(mesh)` first; otherwise
+    /// the call raises `RedexError`. See `CONFIG_REPLICATION.md`
+    /// for the full operator surface.
     #[pyo3(signature = (
         name,
         *,
@@ -201,6 +211,14 @@ impl PyRedex {
         retention_max_events = None,
         retention_max_bytes = None,
         retention_max_age_ms = None,
+        replication = false,
+        replication_factor = None,
+        replication_heartbeat_ms = None,
+        replication_placement = None,
+        replication_pinned_nodes = None,
+        replication_leader_pinned = None,
+        replication_on_under_capacity = None,
+        replication_budget_fraction = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn open_file(
@@ -212,6 +230,14 @@ impl PyRedex {
         retention_max_events: Option<u64>,
         retention_max_bytes: Option<u64>,
         retention_max_age_ms: Option<u64>,
+        replication: bool,
+        replication_factor: Option<u32>,
+        replication_heartbeat_ms: Option<u64>,
+        replication_placement: Option<String>,
+        replication_pinned_nodes: Option<Vec<u64>>,
+        replication_leader_pinned: Option<u64>,
+        replication_on_under_capacity: Option<String>,
+        replication_budget_fraction: Option<f64>,
     ) -> PyResult<PyRedexFile> {
         let channel = ChannelName::new(name).map_err(|e| RedexError::new_err(format!("{}", e)))?;
         let mut cfg = RedexFileConfig {
@@ -243,6 +269,17 @@ impl PyRedex {
         if let Some(ms) = retention_max_age_ms {
             cfg.retention_max_age_ns = Some(ms.saturating_mul(1_000_000));
         }
+        if replication {
+            cfg.replication = Some(build_replication_config(
+                replication_factor,
+                replication_heartbeat_ms,
+                replication_placement,
+                replication_pinned_nodes,
+                replication_leader_pinned,
+                replication_on_under_capacity,
+                replication_budget_fraction,
+            )?);
+        }
         let file = self
             .inner
             .open_file(&channel, cfg)
@@ -253,6 +290,89 @@ impl PyRedex {
             runtime,
         })
     }
+
+    /// Install cross-node replication wiring rooted at `mesh`. After
+    /// this returns, `open_file` calls with `replication=True` spawn
+    /// per-channel replication runtimes. Idempotent — repeated calls
+    /// leave the existing wiring in place.
+    ///
+    /// Gated on the `net` feature: replication requires a `NetMesh`,
+    /// which only ships when `net` is enabled.
+    ///
+    /// See `CONFIG_REPLICATION.md` for the full operator surface.
+    #[cfg(feature = "net")]
+    fn enable_replication(&self, mesh: &crate::mesh_bindings::NetMesh) -> PyResult<()> {
+        let arc = mesh.node_arc_clone()?;
+        self.inner.enable_replication(arc);
+        Ok(())
+    }
+
+    /// Count of per-channel replication runtimes currently registered
+    /// on this manager. `0` when replication isn't enabled. Useful
+    /// for tests and operator observability.
+    fn replication_runtime_count(&self) -> u32 {
+        self.inner.replication_runtime_count() as u32
+    }
+}
+
+fn build_replication_config(
+    factor: Option<u32>,
+    heartbeat_ms: Option<u64>,
+    placement: Option<String>,
+    pinned_nodes: Option<Vec<u64>>,
+    leader_pinned: Option<u64>,
+    on_under_capacity: Option<String>,
+    budget_fraction: Option<f64>,
+) -> PyResult<InnerReplicationConfig> {
+    let mut out = InnerReplicationConfig::new();
+    if let Some(f) = factor {
+        if f > u8::MAX as u32 {
+            return Err(RedexError::new_err(format!(
+                "replication_factor must fit in u8 (got {f})"
+            )));
+        }
+        out = out.with_factor(f as u8);
+    }
+    if let Some(hb) = heartbeat_ms {
+        out = out.with_heartbeat_ms(hb);
+    }
+    out = out.with_placement(match placement.as_deref() {
+        None | Some("standard") => InnerPlacementStrategy::Standard,
+        Some("colocation_strict") | Some("colocation-strict") => {
+            InnerPlacementStrategy::ColocationStrict
+        }
+        Some("pinned") => {
+            let nodes = pinned_nodes.ok_or_else(|| {
+                RedexError::new_err(
+                    "replication_pinned_nodes required when replication_placement = 'pinned'",
+                )
+            })?;
+            InnerPlacementStrategy::Pinned(nodes)
+        }
+        Some(other) => {
+            return Err(RedexError::new_err(format!(
+                "unknown replication_placement {other:?}; expected 'standard', 'pinned', or 'colocation_strict'"
+            )));
+        }
+    });
+    if let Some(leader) = leader_pinned {
+        out = out.with_leader_pinned(Some(leader));
+    }
+    out = out.with_on_under_capacity(match on_under_capacity.as_deref() {
+        None | Some("withdraw") => InnerUnderCapacity::Withdraw,
+        Some("evict_oldest") | Some("evict-oldest") => InnerUnderCapacity::EvictOldest,
+        Some(other) => {
+            return Err(RedexError::new_err(format!(
+                "unknown replication_on_under_capacity {other:?}; expected 'withdraw' or 'evict_oldest'"
+            )));
+        }
+    });
+    if let Some(fr) = budget_fraction {
+        out = out.with_replication_budget_fraction(fr as f32);
+    }
+    out.validate()
+        .map_err(|e| RedexError::new_err(format!("replication config invalid: {e}")))?;
+    Ok(out)
 }
 
 // =========================================================================
