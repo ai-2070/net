@@ -56,6 +56,12 @@ redex = ["net", "dep:tokio-stream", "dep:postcard"]
 redex-disk = ["redex"]
 cortex = ["redex"]
 netdb = ["cortex"]
+# Greedy-LRU dataforts (Rebel Yell Phase 1) — per-node speculative
+# caching of in-scope chains observed via the tail-subscription
+# path. Builds on `redex` for the per-channel cache substrate +
+# `BandwidthBudget` for I/O budgeting. See
+# `docs/misc/DATAFORTS_PLAN.md` § Phase 1.
+dataforts-greedy = ["redex"]
 # NAT traversal — reflex probe + classification + rendezvous punch.
 # Stages 1–3 of `docs/NAT_TRAVERSAL_PLAN.md`. No new deps; rides
 # the existing mesh + subprotocol surface. Sits on top of `net`.
