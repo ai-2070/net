@@ -39,5 +39,6 @@ pub use gravity::{
 #[cfg(feature = "dataforts")]
 pub use blob::{
     global_blob_adapter_registry, BlobAdapter, BlobAdapterRegistry, BlobAdapterRegistryError,
-    BlobError, BlobRef, NoopAdapter, BLOB_REF_DISCRIMINATOR, BLOB_REF_VERSION_V1,
+    BlobError, BlobRef, FileSystemAdapter, NoopAdapter, BLOB_REF_DISCRIMINATOR,
+    BLOB_REF_VERSION_V1,
 };

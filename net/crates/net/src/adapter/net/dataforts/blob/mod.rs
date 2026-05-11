@@ -15,11 +15,13 @@
 pub mod adapter;
 pub mod blob_ref;
 pub mod error;
+pub mod fs;
 pub mod noop;
 pub mod registry;
 
 pub use adapter::BlobAdapter;
 pub use blob_ref::{BlobRef, BLOB_REF_DISCRIMINATOR, BLOB_REF_VERSION_V1};
 pub use error::BlobError;
+pub use fs::FileSystemAdapter;
 pub use noop::NoopAdapter;
 pub use registry::{global_blob_adapter_registry, BlobAdapterRegistry, BlobAdapterRegistryError};
