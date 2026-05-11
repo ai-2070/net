@@ -66,6 +66,44 @@ pub(crate) const NET_ERR_WRONG_ORIGIN: c_int = -104;
 /// Read-your-writes wait rejected because the per-channel wait
 /// queue is saturated. See `WaitForTokenError::QueueFull`.
 pub(crate) const NET_ERR_QUEUE_FULL: c_int = -105;
+/// Read-your-writes wait failed because the fold task stopped
+/// before the token's seq was applied. See
+/// `WaitForTokenError::FoldStopped`.
+pub(crate) const NET_ERR_FOLD_STOPPED: c_int = -106;
+
+/// Non-blocking poll variant of wait_for_token: checks origin
+/// binding and the applied watermark, returns immediately. Maps
+/// to the same code set as the full wait, except QueueFull is
+/// not reachable (no permit is taken). Used by the FFI when the
+/// caller passes timeout_ms == 0 to mean "is the write visible
+/// yet?" without scheduling a Notified future.
+fn tasks_poll_for_token(
+    adapter: &Arc<InnerTasksAdapter>,
+    token: InnerWriteToken,
+) -> c_int {
+    if token.origin_hash != adapter.origin_hash() {
+        return NET_ERR_WRONG_ORIGIN;
+    }
+    match adapter.as_cortex().applied_through_seq() {
+        Some(applied) if applied >= token.seq => 0,
+        _ if !adapter.as_cortex().is_running() => NET_ERR_FOLD_STOPPED,
+        _ => NET_ERR_TIMEOUT,
+    }
+}
+
+fn memories_poll_for_token(
+    adapter: &Arc<InnerMemoriesAdapter>,
+    token: InnerWriteToken,
+) -> c_int {
+    if token.origin_hash != adapter.origin_hash() {
+        return NET_ERR_WRONG_ORIGIN;
+    }
+    match adapter.as_cortex().applied_through_seq() {
+        Some(applied) if applied >= token.seq => 0,
+        _ if !adapter.as_cortex().is_running() => NET_ERR_FOLD_STOPPED,
+        _ => NET_ERR_TIMEOUT,
+    }
+}
 
 // =========================================================================
 // Shared utilities
@@ -1583,13 +1621,20 @@ pub extern "C" fn net_tasks_wait_for_token(
     };
     let adapter: Arc<InnerTasksAdapter> = Arc::clone(&tasks.inner);
     let token = InnerWriteToken::new(origin_hash, seq);
-    let deadline = std::time::Duration::from_millis(timeout_ms.max(1) as u64);
+    // timeout_ms == 0 means "poll, don't wait": check the applied
+    // watermark and origin without scheduling a Notified future.
+    // Callers who want a minimum wait must pass at least 1.
+    if timeout_ms == 0 {
+        return tasks_poll_for_token(&adapter, token);
+    }
+    let deadline = std::time::Duration::from_millis(timeout_ms as u64);
     block_on(async move {
         match adapter.wait_for_token(token, deadline).await {
             Ok(()) => 0,
             Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
             Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
             Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
+            Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
         }
     })
 }
@@ -2219,13 +2264,19 @@ pub extern "C" fn net_memories_wait_for_token(
     };
     let adapter: Arc<InnerMemoriesAdapter> = Arc::clone(&mem.inner);
     let token = InnerWriteToken::new(origin_hash, seq);
-    let deadline = std::time::Duration::from_millis(timeout_ms.max(1) as u64);
+    // timeout_ms == 0 means "poll, don't wait" (mirrors the
+    // contract on net_tasks_wait_for_token).
+    if timeout_ms == 0 {
+        return memories_poll_for_token(&adapter, token);
+    }
+    let deadline = std::time::Duration::from_millis(timeout_ms as u64);
     block_on(async move {
         match adapter.wait_for_token(token, deadline).await {
             Ok(()) => 0,
             Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
             Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
             Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
+            Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
         }
     })
 }

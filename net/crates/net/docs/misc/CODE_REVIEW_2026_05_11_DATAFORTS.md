@@ -47,14 +47,14 @@ Tagged `[B | H | M | L]`:
 | D-13  | H   | blob         | Adapter selected by channel config, not URI scheme — authority confusion  | ✅ |
 | D-14  | H   | blob         | `classify_payload` first-byte `0xB0` collides with arbitrary binary payloads | ✅ |
 | D-15  | H   | blob         | No max-blob-size on resolve / `u64::MAX` size accepted                     | ✅ |
-| D-16  | H   | blob         | `BlobAdapter` trait is all-in-memory; no streaming hooks                   | ⏳ |
-| D-17  | H   | RYW          | `wait_for_token` returns `Ok` on fold-watermark including skipped events  | ⏳ |
-| D-18  | H   | RYW          | `wait_for_token` returns `Ok` on `running == false` (fold-task stopped)    | ⏳ |
+| D-16  | H   | blob         | `BlobAdapter` trait is all-in-memory; no streaming hooks                   | 🚫 deferred — trait-shape change, separate slice |
+| D-17  | H   | RYW          | `wait_for_token` returns `Ok` on fold-watermark including skipped events  | ✅ |
+| D-18  | H   | RYW          | `wait_for_token` returns `Ok` on `running == false` (fold-task stopped)    | ✅ |
 | D-19  | H   | RYW          | `WriteToken` is forgeable plain data; `pub` fields + `pub const fn new`    | ⏳ |
 | D-20  | H   | go binding   | cgo externs link-fail without `dataforts` feature in `libnet`             | ⏳ |
 | D-21  | H   | FFI          | Panic across FFI on `net_*_wait_for_token` + blob publish/resolve         | ⏳ |
 | D-22  | H   | FFI          | Vtable per-field null-check missing in `net_blob_register_adapter`        | ⏳ |
-| D-23  | H   | FFI          | `timeout_ms == 0` silently rewritten to 1 ms in token wait                | ⏳ |
+| D-23  | H   | FFI          | `timeout_ms == 0` silently rewritten to 1 ms in token wait                | ✅ |
 | D-24  | M   | greedy       | Wire `channel_hash` 16-bit → silent cross-chain pollution                  | ⏳ |
 | D-25  | M   | greedy       | `gravity_tick` emits one full capset rebroadcast per chain                 | ⏳ |
 | D-26  | M   | greedy       | `entry.bytes` saturating drift under retention trim                        | ⏳ |

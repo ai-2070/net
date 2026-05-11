@@ -303,6 +303,43 @@ impl<State> CortexAdapter<State> {
         }
     }
 
+    /// RYW-strength wait. Resolves when the **applied** watermark
+    /// (events that actually ran through the fold body, not
+    /// recoverable-skipped) catches up to `seq`, OR when the fold
+    /// task stops before reaching `seq`.
+    ///
+    /// Returns `Ok(())` on a real apply-through, `Err(applied)`
+    /// where `applied` is the last successfully-applied seq on
+    /// stop. Differs from [`Self::wait_for_seq`] which resolves
+    /// on the folded watermark (including skipped events). RYW
+    /// requires applied, not folded — otherwise a producer whose
+    /// write hit a recoverable-decode skip would observe
+    /// `Ok(())` and then read state that doesn't reflect the
+    /// write.
+    pub async fn wait_for_applied_seq(&self, seq: u64) -> Result<(), Option<u64>> {
+        if seq < self.inner.start_seq {
+            return Ok(());
+        }
+        loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let watermark = self.inner.applied_through_seq.load(Ordering::Acquire);
+            if watermark != u64::MAX && watermark >= seq {
+                return Ok(());
+            }
+            if !self.inner.running.load(Ordering::Acquire) {
+                // Stopped without ever reaching seq. Surface the
+                // last-applied watermark so the caller can build
+                // a typed error.
+                let applied = self.applied_through_seq();
+                return Err(applied);
+            }
+            notified.await;
+        }
+    }
+
     /// Close the adapter. Stops the fold task (after it finishes any
     /// in-progress apply), leaves the RedEX file open so other
     /// adapters / callers can continue using it, and leaves the
@@ -436,8 +473,19 @@ impl<State> CortexAdapter<State> {
             .waits_total
             .fetch_add(1, Ordering::Relaxed);
         let started = tokio::time::Instant::now();
-        let outcome = match tokio::time::timeout(deadline, self.wait_for_seq(token.seq)).await {
-            Ok(()) => Ok(()),
+        // RYW waits on the *applied* watermark, not the folded
+        // watermark — events skipped via recoverable_decode under
+        // FoldErrorPolicy::Stop advance folded but not applied,
+        // and a producer whose write hit such a skip must NOT
+        // observe Ok(()) (that would let them read state that
+        // doesn't reflect their write).
+        let outcome = match tokio::time::timeout(deadline, self.wait_for_applied_seq(token.seq))
+            .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(applied_through_seq)) => Err(WaitForTokenError::FoldStopped {
+                applied_through_seq,
+            }),
             Err(_) => {
                 self.inner
                     .ryw_metrics
@@ -446,7 +494,7 @@ impl<State> CortexAdapter<State> {
                 Err(WaitForTokenError::Timeout)
             }
         };
-        let nanos = started.elapsed().as_nanos() as u64;
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.inner
             .ryw_metrics
             .wait_duration_nanos_sum
@@ -503,6 +551,18 @@ pub enum WaitForTokenError {
     /// pending waits. See
     /// [`super::config::CortexAdapterConfig::with_ryw_wait_queue_cap`].
     QueueFull,
+    /// Fold task stopped before the token's seq was reached.
+    /// Under `FoldErrorPolicy::Stop` an unrecoverable fold error
+    /// halts the task, and any pending RYW wait observing
+    /// `running == false` surfaces this variant rather than a
+    /// silent `Ok(())` — otherwise a producer cannot distinguish
+    /// "your write is visible" from "the adapter is dead and
+    /// never will reach your write."
+    FoldStopped {
+        /// Last seq the fold task fully applied before stopping.
+        /// `None` if the task stopped before applying any event.
+        applied_through_seq: Option<u64>,
+    },
 }
 
 impl std::fmt::Display for WaitForTokenError {
@@ -518,6 +578,16 @@ impl std::fmt::Display for WaitForTokenError {
                 token_origin, adapter_origin
             ),
             Self::QueueFull => f.write_str("read-your-writes wait-queue saturated; retry later"),
+            Self::FoldStopped {
+                applied_through_seq,
+            } => match applied_through_seq {
+                Some(seq) => write!(
+                    f,
+                    "fold task stopped before reaching token seq (applied through {})",
+                    seq
+                ),
+                None => f.write_str("fold task stopped before applying any event"),
+            },
         }
     }
 }

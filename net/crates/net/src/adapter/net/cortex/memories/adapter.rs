@@ -267,6 +267,13 @@ impl MemoriesAdapter {
         &self.inner
     }
 
+    /// Origin hash this adapter is bound to. Stamped on every
+    /// outgoing `EventMeta`; tokens with a different origin reject
+    /// at `wait_for_token`.
+    pub fn origin_hash(&self) -> u64 {
+        self.origin_hash
+    }
+
     /// Start building a reactive watcher.
     pub fn watch(&self) -> MemoriesWatcher {
         MemoriesWatcher::new(self.inner.state(), self.inner.changes().boxed())
