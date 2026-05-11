@@ -53,6 +53,8 @@ cortex = ["net/netdb", "net/redex-disk", "dep:async-trait"]
 # Python binding — depends on cortex transitively for the Redex
 # surface. Off by default; downstream wheels opt in.
 dataforts-greedy = ["cortex", "net", "net/dataforts-greedy"]
+# Data-gravity heat-counter layer (Rebel Yell Phase 4).
+dataforts-gravity = ["dataforts-greedy", "net/dataforts-gravity"]
 # Compute surface — `DaemonRuntime`, `MeshDaemon`, migration.
 # Depends on `net` (mesh transport is what daemons ride) and
 # brings in `net-sdk` at its `compute` feature for the

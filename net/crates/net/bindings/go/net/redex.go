@@ -114,6 +114,14 @@ extern int net_redex_disable_greedy_dataforts(RedexHandle* redex);
 extern uint32_t net_redex_greedy_cached_channel_count(const RedexHandle* redex);
 extern char* net_redex_greedy_prometheus_text(const RedexHandle* redex);
 
+// Data-gravity heat-counter layer (DATAFORTS_PLAN § Phase 4).
+extern int net_redex_enable_gravity_for_greedy(
+    RedexHandle* redex,
+    ArcMeshNode* mesh_arc,
+    const char* config_json
+);
+extern int net_redex_disable_gravity_for_greedy(RedexHandle* redex);
+
 extern int net_redex_open_file(
     RedexHandle* redex,
     const char* name,
@@ -495,6 +503,80 @@ func (r *Redex) GreedyPrometheusText() string {
 	}
 	defer C.net_free_string(c)
 	return C.GoString(c)
+}
+
+// DataGravityConfig — operator-facing config for the data-gravity
+// heat-counter emission cycle (Rebel Yell Phase 4). All fields
+// optional; zero values keep the substrate defaults.
+type DataGravityConfig struct {
+	// Whether the counter + emission cycle is active. Default
+	// true; set to false to keep the config carried without
+	// emitting.
+	Enabled *bool `json:"enabled,omitempty"`
+	// Re-emission threshold ratio. Range [1.01, 10.0]. Default 2.0.
+	EmitThresholdRatio float32 `json:"emit_threshold_ratio,omitempty"`
+	// Decay half-life in seconds. Default 1800 (30 min).
+	DecayHalfLifeSecs uint64 `json:"decay_half_life_secs,omitempty"`
+	// Tick interval in milliseconds. Default 500.
+	TickIntervalMs uint64 `json:"tick_interval_ms,omitempty"`
+}
+
+// EnableGravityForGreedy installs the data-gravity heat-counter
+// layer on top of an already-installed greedy runtime. Pass nil
+// for `config` to accept the locked Phase-4 defaults.
+//
+// Same Arc-consumption contract as EnableReplication: meshArcPtr
+// is consumed regardless of return code — do NOT free it again.
+//
+// Requires EnableGreedyDataforts to have been called first.
+// Returns a wrapped ErrRedex describing the failure on validation
+// errors or when greedy isn t installed.
+//
+// Idempotent — a second call replaces the prior policy and
+// restarts the tick task.
+func (r *Redex) EnableGravityForGreedy(
+	meshArcPtr unsafe.Pointer,
+	config *DataGravityConfig,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return fmt.Errorf("%w: redex handle already closed", ErrRedex)
+	}
+	var cfgPtr *C.char
+	if config != nil {
+		buf, err := json.Marshal(config)
+		if err != nil {
+			return fmt.Errorf("%w: marshal gravity config: %v", ErrRedex, err)
+		}
+		c := C.CString(string(buf))
+		defer C.free(unsafe.Pointer(c))
+		cfgPtr = c
+	}
+	rc := C.net_redex_enable_gravity_for_greedy(
+		r.handle,
+		(*C.ArcMeshNode)(meshArcPtr),
+		cfgPtr,
+	)
+	if rc != 0 {
+		return fmt.Errorf("%w: enable_gravity_for_greedy failed (rc=%d)", ErrRedex, int(rc))
+	}
+	return nil
+}
+
+// DisableGravityForGreedy un-installs the gravity layer. Greedy
+// stays running. Idempotent — no-op when not enabled.
+func (r *Redex) DisableGravityForGreedy() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return fmt.Errorf("%w: redex handle already closed", ErrRedex)
+	}
+	rc := C.net_redex_disable_gravity_for_greedy(r.handle)
+	if rc != 0 {
+		return fmt.Errorf("%w: disable_gravity_for_greedy failed (rc=%d)", ErrRedex, int(rc))
+	}
+	return nil
 }
 
 // validateReplicationConfig runs the binding-side checks so

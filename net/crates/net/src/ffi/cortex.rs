@@ -625,6 +625,133 @@ pub extern "C" fn net_redex_greedy_prometheus_text(
 }
 
 // =========================================================================
+// Data-gravity operator surface (DATAFORTS_PLAN § Phase 4)
+// =========================================================================
+
+/// JSON shape consumed by `net_redex_enable_gravity_for_greedy`.
+/// Mirrors the Python kwargs / Node `DataGravityConfigJs`.
+#[cfg(feature = "dataforts-gravity")]
+#[derive(serde::Deserialize, Default)]
+struct RedexGravityConfigJson {
+    /// `true` = counter active. Default `true`.
+    enabled: Option<bool>,
+    /// `[1.01, 10.0]`. Default `2.0`.
+    emit_threshold_ratio: Option<f32>,
+    /// Decay half-life in seconds. Default `1800` (30 min).
+    decay_half_life_secs: Option<u64>,
+    /// Tick cadence in milliseconds. Default `500`.
+    tick_interval_ms: Option<u64>,
+}
+
+#[cfg(feature = "dataforts-gravity")]
+impl RedexGravityConfigJson {
+    fn into_policy_and_tick(
+        self,
+    ) -> (
+        crate::adapter::net::dataforts::DataGravityPolicy,
+        std::time::Duration,
+    ) {
+        let mut policy = crate::adapter::net::dataforts::DataGravityPolicy::new()
+            .with_enabled(self.enabled.unwrap_or(true));
+        if let Some(r) = self.emit_threshold_ratio {
+            policy = policy.with_emit_threshold_ratio(r);
+        }
+        if let Some(secs) = self.decay_half_life_secs {
+            policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs));
+        }
+        let tick =
+            std::time::Duration::from_millis(self.tick_interval_ms.unwrap_or(500));
+        (policy, tick)
+    }
+}
+
+/// Install data-gravity heat-counter emission on the already-
+/// installed greedy runtime. Same Arc-consumption contract as
+/// `net_redex_enable_replication`: `mesh_arc` is consumed
+/// regardless of return code.
+///
+/// `config_json` is optional — NULL or empty uses the locked
+/// Phase-4 defaults.
+///
+/// Returns `0` on success; `NetError::NullPointer` on NULL
+/// inputs; `NetError::ShuttingDown` on Redex quiesce;
+/// `NetError::InvalidUtf8` / `NetError::InvalidJson` for
+/// malformed config; `NET_ERR_REDEX` when greedy isn't enabled
+/// first or the policy fails validation.
+#[cfg(all(feature = "net", feature = "dataforts-gravity"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_enable_gravity_for_greedy(
+    redex: *mut RedexHandle,
+    mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
+    config_json: *const c_char,
+) -> c_int {
+    if redex.is_null() || mesh_arc.is_null() {
+        if !mesh_arc.is_null() {
+            unsafe {
+                drop(Box::from_raw(mesh_arc));
+            }
+        }
+        return NetError::NullPointer.into();
+    }
+    let redex_ref = unsafe { &*redex };
+    let _op = match redex_ref.guard.try_enter() {
+        Some(op) => op,
+        None => {
+            unsafe {
+                drop(Box::from_raw(mesh_arc));
+            }
+            return NetError::ShuttingDown.into();
+        }
+    };
+    let cfg_json: RedexGravityConfigJson = if config_json.is_null() {
+        RedexGravityConfigJson::default()
+    } else {
+        let Some(s) = (unsafe { c_str_to_owned(config_json) }) else {
+            unsafe {
+                drop(Box::from_raw(mesh_arc));
+            }
+            return NetError::InvalidUtf8.into();
+        };
+        if s.is_empty() {
+            RedexGravityConfigJson::default()
+        } else {
+            match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(_) => {
+                    unsafe {
+                        drop(Box::from_raw(mesh_arc));
+                    }
+                    return NetError::InvalidJson.into();
+                }
+            }
+        }
+    };
+    let (policy, tick) = cfg_json.into_policy_and_tick();
+    let mesh = unsafe { *Box::from_raw(mesh_arc) };
+    match redex_ref.inner.enable_gravity_for_greedy(mesh, policy, tick) {
+        Ok(()) => 0,
+        Err(_) => NET_ERR_REDEX,
+    }
+}
+
+/// Uninstall gravity. Idempotent. Greedy stays running.
+#[cfg(feature = "dataforts-gravity")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_disable_gravity_for_greedy(
+    redex: *mut RedexHandle,
+) -> c_int {
+    let Some(h) = (unsafe { redex.as_ref() }) else {
+        return NetError::NullPointer.into();
+    };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    h.inner.disable_gravity_for_greedy();
+    0
+}
+
+// =========================================================================
 // RedexFile
 // =========================================================================
 

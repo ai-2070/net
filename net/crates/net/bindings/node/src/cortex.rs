@@ -326,6 +326,62 @@ impl Redex {
             .unwrap_or_default()
     }
 
+    /// Install data-gravity heat-counter emission on the
+    /// already-installed greedy runtime. Validates the policy
+    /// and spawns a tokio task that fires `gravityTick` on
+    /// `tickIntervalMs` cadence. Requires greedy to be enabled
+    /// first; throws a typed `redex:` error otherwise.
+    ///
+    /// Locked Phase-4 defaults from `DATAFORTS_PLAN.md`:
+    /// emitThresholdRatio = 2.0, decayHalfLifeSecs = 1800.
+    #[cfg(all(feature = "net", feature = "dataforts-gravity"))]
+    #[napi]
+    pub fn enable_gravity_for_greedy(
+        &self,
+        mesh: &crate::NetMesh,
+        config: Option<DataGravityConfigJs>,
+    ) -> Result<()> {
+        use net::adapter::net::dataforts::DataGravityPolicy;
+        let cfg_js = config.unwrap_or_default();
+        let mut policy = DataGravityPolicy::new()
+            .with_enabled(cfg_js.enabled.unwrap_or(true));
+        if let Some(r) = cfg_js.emit_threshold_ratio {
+            policy = policy.with_emit_threshold_ratio(r as f32);
+        }
+        if let Some(secs) = cfg_js.decay_half_life_secs {
+            policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs as u64));
+        }
+        let tick = std::time::Duration::from_millis(
+            cfg_js.tick_interval_ms.map(|v| v as u64).unwrap_or(500),
+        );
+        let arc = mesh.node_arc_clone()?;
+        self.inner
+            .enable_gravity_for_greedy(arc, policy, tick)
+            .map_err(|e| redex_err("enable_gravity_for_greedy", e))
+    }
+
+    /// Stub for builds without `dataforts-gravity`.
+    #[cfg(not(all(feature = "net", feature = "dataforts-gravity")))]
+    #[napi]
+    pub fn enable_gravity_for_greedy(
+        &self,
+        _mesh: napi::JsUnknown,
+        _config: napi::JsUnknown,
+    ) -> Result<()> {
+        Err(redex_err(
+            "enable_gravity_for_greedy",
+            "binding built without `dataforts-gravity` feature; rebuild with --features dataforts-gravity",
+        ))
+    }
+
+    /// Uninstall the gravity layer. Greedy stays running.
+    /// Idempotent.
+    #[cfg(feature = "dataforts-gravity")]
+    #[napi]
+    pub fn disable_gravity_for_greedy(&self) {
+        self.inner.disable_gravity_for_greedy();
+    }
+
     /// Open (or get) a raw RedEX file bound to `channelName`. Returns
     /// a handle for append / tail / read operations without going
     /// through the CortEX adapter layer.
@@ -424,6 +480,27 @@ pub struct ReplicationConfigJs {
     /// measured NIC peak. Range `(0.0, 1.0]`. Defaults to `0.5`
     /// when omitted.
     pub replication_budget_fraction: Option<f64>,
+}
+
+/// JS-side config for `Redex.enableGravityForGreedy`. Locked
+/// Phase-4 defaults — `DATAFORTS_PLAN.md` § Phase 4. All fields
+/// optional; omit any to keep the substrate default.
+#[cfg(feature = "dataforts-gravity")]
+#[napi(object)]
+#[derive(Default)]
+pub struct DataGravityConfigJs {
+    /// Whether the counter + emission cycle is active. Default
+    /// `true`; pass `false` to keep the policy carried but
+    /// suppress emissions.
+    pub enabled: Option<bool>,
+    /// Re-emission threshold ratio. Range `[1.01, 10.0]`. Default
+    /// `2.0`.
+    pub emit_threshold_ratio: Option<f64>,
+    /// Decay half-life in seconds. Default `1800` (30 min).
+    pub decay_half_life_secs: Option<u32>,
+    /// Tick interval for the gravity tick task, in milliseconds.
+    /// Default `500`.
+    pub tick_interval_ms: Option<u32>,
 }
 
 /// JS-side config for `Redex.enableGreedyDataforts`. Locked

@@ -530,6 +530,77 @@ impl PyRedex {
             .map(|r| r.metrics().snapshot().prometheus_text())
             .unwrap_or_default()
     }
+
+    /// Install data-gravity heat-counter emission on the
+    /// already-installed greedy runtime. Validates the policy,
+    /// installs it on the runtime, and spawns a tokio task that
+    /// fires `gravity_tick().await` on `tick_interval_ms` cadence.
+    ///
+    /// Requires `enable_greedy_dataforts(mesh)` first — raises
+    /// `RedexError` if greedy isn't installed.
+    ///
+    /// Locked Phase-4 defaults: emit_threshold_ratio = 2.0,
+    /// decay_half_life = 30 min. Override via kwargs.
+    ///
+    /// Idempotent — a second call replaces the prior policy and
+    /// restarts the tick task. The heat registry resets on each
+    /// re-enable.
+    #[cfg(all(feature = "net", feature = "dataforts-gravity"))]
+    #[pyo3(signature = (
+        mesh,
+        *,
+        tick_interval_ms = 500,
+        enabled = true,
+        emit_threshold_ratio = None,
+        decay_half_life_secs = None,
+    ))]
+    fn enable_gravity_for_greedy(
+        &self,
+        mesh: &crate::mesh_bindings::NetMesh,
+        tick_interval_ms: u64,
+        enabled: bool,
+        emit_threshold_ratio: Option<f64>,
+        decay_half_life_secs: Option<u64>,
+    ) -> PyResult<()> {
+        use net::adapter::net::dataforts::DataGravityPolicy;
+        let mut policy = DataGravityPolicy::new().with_enabled(enabled);
+        if let Some(r) = emit_threshold_ratio {
+            policy = policy.with_emit_threshold_ratio(r as f32);
+        }
+        if let Some(secs) = decay_half_life_secs {
+            policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs));
+        }
+        let arc = mesh.node_arc_clone()?;
+        self.inner
+            .enable_gravity_for_greedy(
+                arc,
+                policy,
+                std::time::Duration::from_millis(tick_interval_ms),
+            )
+            .map_err(|e| RedexError::new_err(format!("gravity invalid: {}", e)))
+    }
+
+    /// Stub when `dataforts-gravity` isn't compiled in. Returns a
+    /// typed RedexError naming the missing feature.
+    #[cfg(not(all(feature = "net", feature = "dataforts-gravity")))]
+    #[pyo3(signature = (_mesh = None, **_kwargs))]
+    fn enable_gravity_for_greedy(
+        &self,
+        _mesh: Option<Py<PyAny>>,
+        _kwargs: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        Err(RedexError::new_err(
+            "redex: enable_gravity_for_greedy requires the `dataforts-gravity` feature; \
+             rebuild with --features dataforts-gravity",
+        ))
+    }
+
+    /// Uninstall the gravity layer. Idempotent — no-op when not
+    /// enabled. Greedy itself stays running.
+    #[cfg(feature = "dataforts-gravity")]
+    fn disable_gravity_for_greedy(&self) {
+        self.inner.disable_gravity_for_greedy();
+    }
 }
 
 fn build_replication_config(
