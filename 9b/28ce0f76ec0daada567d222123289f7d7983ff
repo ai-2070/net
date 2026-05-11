@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  s_3a0a24a47d1a36::t_d0f4ec55db9373 270-276
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_2c2008e4d4be3e 57
+  s_3a0a24a47d1a36::t_a88dec5e9839c6 51-52
+  s_3a0a24a47d1a36::t_5c30cfc522b968 50
+net/crates/net/src/ffi/cortex.rs
+  s_3a0a24a47d1a36::t_ca6c8a5fc28b13 1624-1630
+  s_3a0a24a47d1a36::t_203f13c3cb002d 2267-2272
+  s_3a0a24a47d1a36::t_8912433b3db419 74-106
+  s_3a0a24a47d1a36::t_c321ceff61cc78 69-72
+  s_3a0a24a47d1a36::t_02b9eb8bd41352 1637,2279
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  s_3a0a24a47d1a36::t_2de0e782797b0c 306-342
+  s_3a0a24a47d1a36::t_c5dda8e9c8a1d2 554-565
+  s_3a0a24a47d1a36::t_1da084f0d97df0 476-488,497
+  s_3a0a24a47d1a36::t_e237675cab797b 581-590
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  s_3a0a24a47d1a36::t_a313d627a57fc3 233-239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "9b28ce0f76ec0daada567d222123289f7d7983ff",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
