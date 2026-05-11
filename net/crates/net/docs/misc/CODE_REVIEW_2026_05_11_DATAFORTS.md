@@ -41,7 +41,7 @@ Tagged `[B | H | M | L]`:
 | D-7   | H   | greedy       | Unbounded `tokio::spawn` per inbound event                                 | ✅ |
 | D-8   | H   | greedy       | `colocation_target_held` hard-coded to `None`                              | ✅ |
 | D-9   | H   | gravity      | Default `origin_hash == 0` collapses per-chain heat into single bucket     | ✅ |
-| D-10  | H   | gravity      | `HeatRegistry` unbounded; no eviction wired to greedy LRU                  | ⏳ |
+| D-10  | H   | gravity      | `HeatRegistry` unbounded; no eviction wired to greedy LRU                  | ✅ |
 | D-11  | H   | gravity      | No inbound auth / origin / rate-limit on `heat:` tags                      | ⏳ |
 | D-12  | H   | blob         | `FileSystemAdapter::store` never verifies bytes hash to `blob_ref.hash`    | ⏳ |
 | D-13  | H   | blob         | Adapter selected by channel config, not URI scheme — authority confusion  | ⏳ |

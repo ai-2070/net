@@ -610,6 +610,27 @@ impl GreedyRuntime {
         // withdraw when origin_hash == 0 — that means no event
         // landed before eviction, so nothing was announced.
         if !sweep.is_empty() {
+            // Drop any gravity heat counters that the evicted
+            // chains owned. Without this the HeatRegistry grows
+            // unboundedly across LRU churn, and tick() walks
+            // stale entries that no longer have a matching cache
+            // entry. Single lock acquisition for the whole sweep
+            // (rather than per-evicted) — gravity is enabled at
+            // process scope, the lock isn't on the hot path for
+            // anything else here.
+            #[cfg(feature = "dataforts")]
+            {
+                let gravity = self.inner.gravity.read();
+                if let Some(gravity) = gravity.as_ref() {
+                    let mut heat = gravity.heat.lock();
+                    for evicted in &sweep.evicted {
+                        if evicted.origin_hash != 0 {
+                            heat.remove(&evicted.origin_hash);
+                        }
+                    }
+                }
+            }
+
             for evicted in &sweep.evicted {
                 self.inner
                     .metrics
@@ -961,6 +982,50 @@ mod tests {
             heat_sink.announces.lock().len(),
             1,
             "second tick must suppress when rate is unchanged"
+        );
+    }
+
+    /// HeatRegistry must drop entries for evicted chains. Without
+    /// the wire-up, long-running nodes accumulate counters
+    /// forever and tick() walks stale state.
+    #[tokio::test]
+    async fn cluster_cap_eviction_drops_heat_counter() {
+        use crate::adapter::net::dataforts::gravity::DataGravityPolicy;
+        let cfg = GreedyConfig::default()
+            .with_intent_match(super::super::IntentMatchPolicy::Disabled)
+            .with_per_channel_cap_bytes(super::super::config::MIN_PER_CHANNEL_CAP_BYTES)
+            .with_total_cap_bytes(super::super::config::MIN_PER_CHANNEL_CAP_BYTES + 512 * 1024);
+        let redex = Arc::new(Redex::new());
+        let sink = Arc::new(RecorderSink::default());
+        let heat_sink = Arc::new(RecorderHeatSink::default());
+        let rt = GreedyRuntime::new(
+            cfg,
+            redex,
+            sink as Arc<dyn ChainTagSink>,
+            Arc::new(CapabilitySet::default()),
+            IntentRegistry::new(),
+        );
+        rt.set_gravity(
+            DataGravityPolicy::default(),
+            heat_sink as Arc<dyn crate::adapter::net::dataforts::gravity::HeatSink>,
+        );
+
+        let chain = chain_caps_with_scope("any");
+        let big = vec![0u8; 1024 * 1024];
+        // Channel A — drive a heat bump via note_read.
+        rt.dispatch_event(&cn("test/heat-a"), 0xAAAA_1111, &chain, &big)
+            .await;
+        rt.note_read(&cn("test/heat-a"));
+        // Channel B — large enough to evict A by cluster cap.
+        rt.dispatch_event(&cn("test/heat-b"), 0xBBBB_2222, &chain, &big)
+            .await;
+        // The gravity heat registry must no longer hold A.
+        let gravity = rt.inner.gravity.read();
+        let g = gravity.as_ref().unwrap();
+        let heat = g.heat.lock();
+        assert!(
+            heat.get(&0xAAAA_1111).is_none(),
+            "heat counter for evicted chain must be dropped"
         );
     }
 
