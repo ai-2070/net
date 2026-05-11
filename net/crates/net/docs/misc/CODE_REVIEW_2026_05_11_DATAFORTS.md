@@ -69,14 +69,14 @@ Tagged `[B | H | M | L]`:
 | D-35  | M   | blob adapter | No concurrency bound on `spawn_blocking` calls                             | ✅ (FS adapter; pattern available for other impls) |
 | D-36  | M   | blob conf    | Conformance suite shallow (no idempotency / range / mismatch / parallel)   | ✅ (idempotency + hash-mismatch + range past-end + cross-blob isolation + random ghost) |
 | D-37  | M   | RYW          | "Wait queue" is `Semaphore::try_acquire` — not FIFO                        | ✅ (renamed to `ryw_inflight_cap` with non-FIFO doc; true FIFO deferred) |
-| D-38  | M   | RYW          | 1024 cap is per-adapter; no process-wide bound                             | 🚫 deferred — documented; process-wide cap follows the multi-tenant slice |
+| D-38  | M   | RYW          | 1024 cap is per-adapter; no process-wide bound                             | ✅ (`set_global_ryw_inflight_cap` installs a process-wide cap; two-tier acquire on every wait_for_token) |
 | D-39  | M   | FFI cortex   | `mesh_arc` drop duplicated per error branch — RAII guard wanted            | ✅ |
 | D-40  | M   | node blob    | `await_tsfn_promise` applies 30s timeout twice → 60s worst-case           | ✅ |
 | D-41  | M   | node cortex  | `DataGravityConfigJs.*_secs/_ms` u32 vs Python u64 vs Go uint64           | ✅ |
 | D-42  | M   | python blob  | `Py<PyAny>` adapters can outlive interpreter finalization                  | ✅ |
 | D-43  | M   | python blob  | `data.to_vec()` happens before GIL is released for large payloads          | 🚫 not-applicable — no `py.detach` in the current binding; review described a code path that doesn't exist |
 | D-44  | M   | go binding   | Greedy/gravity numeric fields can't express literal `0` via `omitempty`   | 🚫 won't-fix — substrate rejects 0 for every affected field; `omitempty` is correct |
-| D-45  | M   | go binding   | No RYW surface — `wait_for_token` not exposed                              | 🚫 deferred — Go Tasks/Memories surface itself is deferred per the plan; RYW follows |
+| D-45  | M   | go binding   | No RYW surface — `wait_for_token` not exposed                              | 🚫 deferred (blocked) — `net_tasks_wait_for_token` / `net_memories_wait_for_token` require `*TasksAdapterHandle` / `*MemoriesAdapterHandle` which the Go binding has no constructor for; unblocks once Go Tasks/Memories lands per the plan |
 | D-46  | L   | greedy       | Heat normalization compression at the top end                              | ✅ (folded into D-30 fix) |
 | D-47  | L   | greedy       | `metrics.rs` channel-cap race under contention                             | ✅ (doc note) |
 | D-48  | L   | greedy       | `_force_use_hashmap` dead allow                                            | ✅ |
