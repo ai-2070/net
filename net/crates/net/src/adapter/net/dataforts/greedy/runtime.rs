@@ -457,7 +457,7 @@ mod tests {
     fn chain_caps_with_scope(scope: &str) -> CapabilitySet {
         let mut caps = CapabilitySet::default();
         caps.tags.insert(Tag::Reserved {
-            prefix: "scope".to_string(),
+            prefix: "scope:".to_string(),
             body: scope.to_string(),
         });
         caps

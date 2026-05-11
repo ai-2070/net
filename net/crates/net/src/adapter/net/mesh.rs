@@ -3741,31 +3741,50 @@ impl MeshNode {
         // never blocked or skipped on the observer's behalf.
         //
         // Hot-path cost: one `RwLock` read per packet (single-digit
-        // ns under parking_lot when uncontended) + one `Arc` clone
-        // per event when the observer is installed. The runtime
+        // ns under parking_lot when uncontended) + one O(1)
+        // `addr_to_node` lookup + one capability_index lookup per
+        // event when the observer is installed. The runtime
         // itself spawns a tokio task per event to absorb the
         // async dispatch.
         #[cfg(feature = "dataforts-greedy")]
         let greedy = ctx.greedy_observer.read().clone();
+
+        // Resolve the publisher's capability set so the runtime's
+        // scope / intent / colocation gates have something to
+        // evaluate against. `addr_to_node` is O(1); a miss
+        // (subscribe-before-announce race, relay topology with
+        // shared source addr) falls back to empty caps which
+        // makes scope-axis admission fail-closed — same shape
+        // `evaluate_channel_auth` uses at line 5429.
+        //
+        // Snapshotted once per packet rather than per-event; every
+        // event in the same packet shares the same publisher.
+        #[cfg(feature = "dataforts-greedy")]
+        let chain_caps: std::sync::Arc<
+            crate::adapter::net::behavior::capability::CapabilitySet,
+        > = if greedy.is_some() {
+            let peer_addr = session.peer_addr();
+            let from_node = ctx.addr_to_node.get(&peer_addr).map(|r| *r);
+            std::sync::Arc::new(
+                from_node
+                    .and_then(|nid| ctx.capability_index.get(nid))
+                    .unwrap_or_default(),
+            )
+        } else {
+            std::sync::Arc::new(
+                crate::adapter::net::behavior::capability::CapabilitySet::default(),
+            )
+        };
 
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
             #[cfg(feature = "dataforts-greedy")]
             if let Some(observer) = &greedy {
-                // Pass an empty CapabilitySet for now — Phase 1
-                // wiring resolves chain_caps via the capability
-                // index in a follow-up. For the MVP, callers
-                // using greedy with scope/intent filters supply
-                // chain caps via the publish path (which lands
-                // before this hook is reached).
-                // TODO(plan-§Phase-1): resolve from_node via
-                // session_id then `ctx.capability_index.get(...)`.
-                use std::sync::Arc as StdArc;
                 observer.observe_event(
                     parsed.header.channel_hash,
                     parsed.header.origin_hash.into(),
-                    StdArc::new(crate::adapter::net::behavior::capability::CapabilitySet::default()),
+                    chain_caps.clone(),
                     event_data.clone(),
                 );
             }

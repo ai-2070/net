@@ -168,6 +168,103 @@ async fn greedy_caches_observed_events_published_from_peer() {
     );
 }
 
+/// B enables greedy with a scope filter that the publisher (A)
+/// matches via its announced capabilities. Publisher tagged with
+/// `scope:industrial`, observer configured to admit
+/// `scope:industrial`. The chain_caps resolution path looks up
+/// A's CapabilitySet via the capability index, the scope axis
+/// admits, and B's cache populates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn greedy_scope_filter_admits_when_publisher_advertises_matching_scope() {
+    use net::adapter::net::behavior::capability::CapabilitySet;
+    use net::adapter::net::behavior::tag::Tag;
+    use net::adapter::net::dataforts::ScopeLabel;
+
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    // A announces a capability set carrying scope:industrial so
+    // the capability_index lookup B's greedy hook performs
+    // resolves to the matching scope.
+    let mut caps = CapabilitySet::default();
+    caps.tags.insert(Tag::Reserved {
+        prefix: "scope:".to_string(),
+        body: "industrial".to_string(),
+    });
+    node_a
+        .announce_capabilities(caps)
+        .await
+        .expect("announce caps");
+
+    // Give B a moment to receive + index the announcement.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        if node_b
+            .capability_index()
+            .get(node_a.node_id())
+            .map(|c| c.tags.len())
+            .unwrap_or(0)
+            > 0
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let redex_b = Arc::new(Redex::new());
+    let cfg = GreedyConfig::default()
+        .with_scopes(vec![ScopeLabel::new("industrial")])
+        .with_intent_match(IntentMatchPolicy::Disabled);
+    redex_b
+        .enable_greedy_dataforts(
+            node_b.clone(),
+            cfg,
+            Arc::new(CapabilitySet::default()),
+            IntentRegistry::new(),
+        )
+        .expect("enable greedy");
+
+    let name = cn("dataforts/test/scope-match");
+    node_b
+        .subscribe_channel(node_a.node_id(), name.clone())
+        .await
+        .expect("subscribe");
+    let publisher = ChannelPublisher::new(name.clone(), PublishConfig::default());
+    const N: u64 = 4;
+    for i in 0..N {
+        node_a
+            .publish(&publisher, Bytes::from(format!("event-{i}")))
+            .await
+            .expect("publish");
+    }
+
+    let runtime = redex_b.greedy_runtime().expect("runtime installed");
+    let synth = synthesize_cache_channel_name(name.hash());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if runtime.contains(&synth) && runtime.cached_bytes() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snap = runtime.metrics().snapshot();
+    assert!(
+        runtime.contains(&synth),
+        "greedy must admit when publisher's scope tag matches the configured scope filter; \
+         scope_rejects={}, channels={}",
+        snap.cluster.admit_rejected_scope_total,
+        runtime.cached_channel_count(),
+    );
+    assert_eq!(
+        snap.cluster.admit_rejected_scope_total, 0,
+        "no scope rejections expected; got {}",
+        snap.cluster.admit_rejected_scope_total,
+    );
+    redex_b.disable_greedy_dataforts();
+}
+
 /// B enables greedy with a scope filter that the publisher's
 /// channel won't satisfy. The observer must reject every event,
 /// no cache files open, and the cluster's

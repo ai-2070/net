@@ -142,8 +142,12 @@ fn passes_scope_gate(
     if configured_scopes.is_empty() {
         return true;
     }
+    // RESERVED_PREFIXES carries the trailing colon (`"scope:"`).
+    // The reserved tag's `prefix` field stores it verbatim, so the
+    // canonical match is on `"scope:"` not `"scope"`. The tag's
+    // body is the bare label.
     chain_caps.tags.iter().any(|tag| match tag {
-        Tag::Reserved { prefix, body } if prefix == "scope" => {
+        Tag::Reserved { prefix, body } if prefix == "scope:" => {
             configured_scopes.iter().any(|s| s.as_str() == body)
         }
         _ => false,
@@ -232,7 +236,7 @@ mod tests {
     fn caps_with_scope(scope: &str) -> CapabilitySet {
         let mut caps = CapabilitySet::default();
         caps.tags.insert(Tag::Reserved {
-            prefix: "scope".to_string(),
+            prefix: "scope:".to_string(),
             body: scope.to_string(),
         });
         caps
