@@ -1,0 +1,82 @@
+net/crates/net/sdk/tests/mesh_rpc_where.rs
+  s_d1b11a1287c170::t_bb5a167522aa4e 4,92,177
+net/crates/net/tests/cross_lang_capability/README.md
+  s_d1b11a1287c170::t_bb5a167522aa4e 13
+net/crates/net/docs/releases/RELEASE_v0.13_CHIPPIN_IN.md
+  s_d1b11a1287c170::t_bb5a167522aa4e 5,103,128,135,202,293
+net/crates/net/sdk-py/src/net_sdk/capability.py
+  s_d1b11a1287c170::t_bb5a167522aa4e 594,605,610
+net/crates/net/sdk-py/README.md
+  s_d1b11a1287c170::t_bb5a167522aa4e 668
+net/crates/net/sdk/src/mesh_rpc.rs
+  s_d1b11a1287c170::t_bb5a167522aa4e 124,137,201
+net/crates/net/sdk-ts/README.md
+  s_d1b11a1287c170::t_bb5a167522aa4e 479
+net/crates/net/docs/CAPABILITY_SYSTEM_MIGRATION.md
+  s_d1b11a1287c170::t_bb5a167522aa4e 297,324,426
+net/crates/net/README.md
+  s_d1b11a1287c170::t_bb5a167522aa4e 296
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_d1b11a1287c170::t_bb5a167522aa4e 579,1332,2012,2034
+net/crates/net/Cargo.toml
+  s_d1b11a1287c170::t_bb5a167522aa4e 244
+net/crates/net/src/ffi/predicate.rs
+  s_d1b11a1287c170::t_bb5a167522aa4e 125,138,147,341,369,374-375
+net/crates/net/src/adapter/net/behavior/predicate.rs
+  s_d1b11a1287c170::t_bb5a167522aa4e 663,685,756,760,909,3048,3066,3126,3829
+net/crates/net/sdk-ts/src/capability-enhancements.ts
+  s_d1b11a1287c170::t_bb5a167522aa4e 9,245,564,572,580
+go/net.h
+  s_d1b11a1287c170::t_bb5a167522aa4e 811,826
+net/crates/net/bindings/go/net/capability.go
+  s_d1b11a1287c170::t_bb5a167522aa4e 646,659,692,699
+net/crates/net/bindings/node/index.d.ts
+  s_d1b11a1287c170::t_bb5a167522aa4e 1373,1376,2115
+net/crates/net/docs/CAPABILITY_ENHANCEMENTS_USAGE.md
+  s_d1b11a1287c170::t_bb5a167522aa4e 19,308,310,328
+net/crates/net/tests/integration_nrpc_predicate_header.rs
+  s_d1b11a1287c170::t_bb5a167522aa4e 2,73
+net/crates/net/include/README.md
+  s_d1b11a1287c170::t_bb5a167522aa4e 307
+net/crates/net/docs/BEHAVIOR.md
+  s_d1b11a1287c170::t_bb5a167522aa4e 51
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  s_d1b11a1287c170::t_bb5a167522aa4e 198,201,211,865,876
+net/crates/net/include/net.go.h
+  s_d1b11a1287c170::t_bb5a167522aa4e 813,828
+net/crates/net/sdk-ts/test/capability_enhancements.test.ts
+  s_d1b11a1287c170::t_bb5a167522aa4e 101,402
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_d1b11a1287c170::t_bb5a167522aa4e 304
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_d1b11a1287c170::t_bb5a167522aa4e 139,1090
+net/crates/net/bindings/node/mesh_rpc.ts
+  s_d1b11a1287c170::t_bb5a167522aa4e 85
+.claude/skills/net-event-bus/capabilities.md
+  s_d1b11a1287c170::t_bb5a167522aa4e 115
+net/crates/net/include/net_rpc.h
+  s_d1b11a1287c170::t_bb5a167522aa4e 271
+net/crates/net/sdk/README.md
+  s_d1b11a1287c170::t_bb5a167522aa4e 497,504
+net/crates/net/examples/capability.c
+  s_d1b11a1287c170::t_bb5a167522aa4e 17
+net/crates/net/tests/cross_lang_capability/predicate_nrpc_envelope.json
+  s_d1b11a1287c170::t_2b31b1376c3807 4
+  s_d1b11a1287c170::t_bb5a167522aa4e 2-3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "86e927632940c2a6dccd4eb1971b3f313f7af7b7",
+  "prompts": {},
+  "sessions": {
+    "s_d1b11a1287c170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91bc0185-35d0-4423-98af-868a398982a2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
