@@ -559,11 +559,13 @@ impl PyRedexFile {
     /// early with `iter.close()` or let the iterator run to
     /// `StopIteration` when the file closes.
     #[pyo3(signature = (from_seq = 0))]
-    fn tail(&self, from_seq: u64) -> PyRedexTailIter {
+    fn tail(&self, py: Python<'_>, from_seq: u64) -> PyRedexTailIter {
         use futures::StreamExt;
         let adapter = self.inner.clone();
         let runtime = self.runtime.clone();
-        let stream = runtime.block_on(async move { adapter.tail(from_seq).boxed() });
+        let stream = py.detach(move || {
+            runtime.block_on(async move { adapter.tail(from_seq).boxed() })
+        });
         PyRedexTailIter {
             inner: Arc::new(RedexTailIterInner {
                 stream: TokioMutex::new(Some(stream)),
@@ -740,13 +742,16 @@ impl PyTasksAdapter {
     /// `persistent_dir`; otherwise raises `RuntimeError`.
     #[staticmethod]
     #[pyo3(signature = (redex, origin_hash, persistent = false))]
-    fn open(redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
+    fn open(py: Python<'_>, redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
         let runtime = make_runtime()?;
         let redex_inner = redex.inner.clone();
         let cfg = cfg_from_persistent(persistent);
-        let inner = runtime
-            .block_on(async move {
-                InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+                })
             })
             .map_err(|e| CortexError::new_err(format!("TasksAdapter open failed: {}", e)))?;
         Ok(Self {
@@ -760,6 +765,7 @@ impl PyTasksAdapter {
     #[staticmethod]
     #[pyo3(signature = (redex, origin_hash, state_bytes, last_seq = None, persistent = false))]
     fn open_from_snapshot(
+        py: Python<'_>,
         redex: &PyRedex,
         origin_hash: u64,
         state_bytes: &[u8],
@@ -770,16 +776,19 @@ impl PyTasksAdapter {
         let redex_inner = redex.inner.clone();
         let cfg = cfg_from_persistent(persistent);
         let bytes = state_bytes.to_vec();
-        let inner = runtime
-            .block_on(async move {
-                InnerTasksAdapter::open_from_snapshot_with_config(
-                    &redex_inner,
-                    origin_hash,
-                    cfg,
-                    &bytes,
-                    last_seq,
-                )
-                .await
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerTasksAdapter::open_from_snapshot_with_config(
+                        &redex_inner,
+                        origin_hash,
+                        cfg,
+                        &bytes,
+                        last_seq,
+                    )
+                    .await
+                })
             })
             .map_err(|e| {
                 CortexError::new_err(format!("TasksAdapter open_from_snapshot failed: {}", e))
@@ -924,6 +933,7 @@ impl PyTasksAdapter {
     #[allow(clippy::too_many_arguments)]
     fn watch_tasks(
         &self,
+        py: Python<'_>,
         status: Option<&str>,
         title_contains: Option<String>,
         created_after_ns: Option<u64>,
@@ -947,8 +957,8 @@ impl PyTasksAdapter {
         // `stream()` requires an active tokio runtime (it spawns a
         // forwarding task); run via block_on to install the context.
         let runtime = self.runtime.clone();
-        let stream: BoxStream<'static, Vec<InnerTask>> =
-            runtime.block_on(async move { w.stream().boxed() });
+        let stream: BoxStream<'static, Vec<InnerTask>> = py
+            .detach(move || runtime.block_on(async move { w.stream().boxed() }));
         Ok(new_task_watch_iter(stream, self.runtime.clone()))
     }
 
@@ -979,6 +989,7 @@ impl PyTasksAdapter {
     #[allow(clippy::too_many_arguments)]
     fn snapshot_and_watch_tasks(
         &self,
+        py: Python<'_>,
         status: Option<&str>,
         title_contains: Option<String>,
         created_after_ns: Option<u64>,
@@ -1001,7 +1012,8 @@ impl PyTasksAdapter {
         )?;
         let adapter = self.inner.clone();
         let runtime = self.runtime.clone();
-        let (snapshot, stream) = runtime.block_on(async move { adapter.snapshot_and_watch(w) });
+        let (snapshot, stream) = py
+            .detach(move || runtime.block_on(async move { adapter.snapshot_and_watch(w) }));
         Ok((
             snapshot.into_iter().map(PyTask::from).collect(),
             new_task_watch_iter(stream, self.runtime.clone()),
@@ -1202,13 +1214,16 @@ impl PyMemoriesAdapter {
     /// `TasksAdapter.open` for `persistent` semantics.
     #[staticmethod]
     #[pyo3(signature = (redex, origin_hash, persistent = false))]
-    fn open(redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
+    fn open(py: Python<'_>, redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
         let runtime = make_runtime()?;
         let redex_inner = redex.inner.clone();
         let cfg = cfg_from_persistent(persistent);
-        let inner = runtime
-            .block_on(async move {
-                InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+                })
             })
             .map_err(|e| CortexError::new_err(format!("MemoriesAdapter open failed: {}", e)))?;
         Ok(Self {
@@ -1221,6 +1236,7 @@ impl PyMemoriesAdapter {
     #[staticmethod]
     #[pyo3(signature = (redex, origin_hash, state_bytes, last_seq = None, persistent = false))]
     fn open_from_snapshot(
+        py: Python<'_>,
         redex: &PyRedex,
         origin_hash: u64,
         state_bytes: &[u8],
@@ -1231,16 +1247,19 @@ impl PyMemoriesAdapter {
         let redex_inner = redex.inner.clone();
         let cfg = cfg_from_persistent(persistent);
         let bytes = state_bytes.to_vec();
-        let inner = runtime
-            .block_on(async move {
-                InnerMemoriesAdapter::open_from_snapshot_with_config(
-                    &redex_inner,
-                    origin_hash,
-                    cfg,
-                    &bytes,
-                    last_seq,
-                )
-                .await
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerMemoriesAdapter::open_from_snapshot_with_config(
+                        &redex_inner,
+                        origin_hash,
+                        cfg,
+                        &bytes,
+                        last_seq,
+                    )
+                    .await
+                })
             })
             .map_err(|e| {
                 CortexError::new_err(format!("MemoriesAdapter open_from_snapshot failed: {}", e))
@@ -1409,6 +1428,7 @@ impl PyMemoriesAdapter {
     #[allow(clippy::too_many_arguments)]
     fn watch_memories(
         &self,
+        py: Python<'_>,
         source: Option<String>,
         content_contains: Option<String>,
         tag: Option<String>,
@@ -1438,8 +1458,8 @@ impl PyMemoriesAdapter {
             limit,
         )?;
         let runtime = self.runtime.clone();
-        let stream: BoxStream<'static, Vec<InnerMemory>> =
-            runtime.block_on(async move { w.stream().boxed() });
+        let stream: BoxStream<'static, Vec<InnerMemory>> = py
+            .detach(move || runtime.block_on(async move { w.stream().boxed() }));
         Ok(new_memory_watch_iter(stream, self.runtime.clone()))
     }
 
@@ -1463,6 +1483,7 @@ impl PyMemoriesAdapter {
     #[allow(clippy::too_many_arguments)]
     fn snapshot_and_watch_memories(
         &self,
+        py: Python<'_>,
         source: Option<String>,
         content_contains: Option<String>,
         tag: Option<String>,
@@ -1493,7 +1514,8 @@ impl PyMemoriesAdapter {
         )?;
         let adapter = self.inner.clone();
         let runtime = self.runtime.clone();
-        let (snapshot, stream) = runtime.block_on(async move { adapter.snapshot_and_watch(w) });
+        let (snapshot, stream) = py
+            .detach(move || runtime.block_on(async move { adapter.snapshot_and_watch(w) }));
         Ok((
             snapshot.into_iter().map(PyMemory::from).collect(),
             new_memory_watch_iter(stream, self.runtime.clone()),
