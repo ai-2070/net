@@ -3396,7 +3396,7 @@ mod tests {
             .with_memory(64)
             .with_gpu(gpu)
             .with_storage(2000)
-            .with_network(10000);
+            .with_network(10);
 
         let software = SoftwareCapabilities::new()
             .with_os("linux", "6.1")

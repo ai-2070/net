@@ -984,7 +984,7 @@ mod tests {
             .with_memory(64)
             .with_gpu(gpu)
             .with_storage(2000)
-            .with_network(10_000)
+            .with_network(10)
     }
 
     // ---- forward direction: hardware → tags ----------------------------

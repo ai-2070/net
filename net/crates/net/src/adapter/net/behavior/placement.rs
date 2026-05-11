@@ -1058,7 +1058,7 @@ fn score_compute_axis(caps: &CapabilitySet) -> f32 {
 fn score_storage_axis(caps: &CapabilitySet) -> f32 {
     if let Some(s) = target_axis_value_numeric(caps, TaxonomyAxis::Dataforts, "capacity_gb") {
         // Reference: 1 TB.
-        saturating_score(s as f32, 1_000_000.0)
+        saturating_score(s as f32, 1000.0)
     } else {
         1.0
     }
@@ -1094,7 +1094,7 @@ fn score_compute_axis_with_data(caps: &CapabilitySet) -> Option<f32> {
 /// N-11: storage-axis sibling of [`score_compute_axis_with_data`].
 fn score_storage_axis_with_data(caps: &CapabilitySet) -> Option<f32> {
     let s = target_axis_value_numeric(caps, TaxonomyAxis::Dataforts, "capacity_gb")?;
-    Some(saturating_score(s as f32, 1_000_000.0))
+    Some(saturating_score(s as f32, 1000.0))
 }
 
 /// Does the target host the named chain? Walks the target's
@@ -2698,7 +2698,7 @@ mod tests {
         // does not. Should return the storage score alone.
         let target_caps = empty_caps().add_tag("dataforts.capacity_gb=500");
         let score = placement.score_resource_axis(&target_caps, &artifact);
-        let expected = saturating_score(500_000.0, 1_000_000.0);
+        let expected = saturating_score(500.0, 1000.0);
         assert!(
             (score - expected).abs() < 1e-6,
             "Both with only storage data should return storage score; got {score}"
@@ -2709,7 +2709,7 @@ mod tests {
             .add_tag("hardware.cpu_cores=8")
             .add_tag("dataforts.capacity_gb=500");
         let score = placement.score_resource_axis(&target_caps, &artifact);
-        let expected = (0.5 + saturating_score(500_000.0, 1_000_000.0)) / 2.0;
+        let expected = (0.5 + saturating_score(500.0, 1000.0)) / 2.0;
         assert!(
             (score - expected).abs() < 1e-6,
             "Both with both axes' data averages; got {score}, expected {expected}"
