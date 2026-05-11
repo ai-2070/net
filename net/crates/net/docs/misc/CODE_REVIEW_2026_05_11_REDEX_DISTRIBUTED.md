@@ -27,7 +27,7 @@ Tagged `[H | M | L]`:
 | R-2   | H   | runtime     | `clear_believed_leader` runs after failed Candidate transition            | ✅ |
 | R-3   | H   | coordinator | Chain-tag side effects not serialized between concurrent transitions     | ✅ |
 | R-4   | H   | runtime     | NACK `NotLeader` / `BadRange` handlers are placeholder TODOs              | ✅ |
-| R-5   | H   | wire        | Replica cannot disambiguate retention-trim from split-brain divergence    | ⚪ |
+| R-5   | H   | wire        | Replica cannot disambiguate retention-trim from split-brain divergence    | ✅ |
 | R-6   | H   | py binding  | `replication=False` silently drops every other `replication_*` kwarg     | ⚪ |
 | R-7   | H   | bindings    | `enable_replication` silently absent without `net` feature                | ⚪ |
 | R-8   | H   | FFI         | `net_redex_enable_replication` leaks `Box<Arc<MeshNode>>` on error paths  | ⚪ |

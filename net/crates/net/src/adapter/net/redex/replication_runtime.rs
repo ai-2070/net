@@ -711,6 +711,7 @@ async fn on_inbound(
                 Err(super::replication_catchup::ApplyError::GapBeforeChunk {
                     first_seq,
                     local_next,
+                    divergence_suspected,
                 }) => {
                     // Plan §8 skip-ahead — the leader trimmed past
                     // our local tail; the chunk's first_seq is
@@ -728,13 +729,30 @@ async fn on_inbound(
                             // `GapBeforeChunk` invariant; use
                             // saturating_sub for defense-in-depth.
                             debug_assert!(first_seq > local_next);
-                            tracing::warn!(
-                                from = from,
-                                from_seq = local_next,
-                                to_seq = first_seq,
-                                gap = first_seq.saturating_sub(local_next),
-                                "replication: skip-ahead — leader trimmed past local tail"
-                            );
+                            // R-5: when divergence is suspected,
+                            // surface it at warn level with an
+                            // explicit message so operator dashboards
+                            // can see split-brain post-mortems
+                            // separately from routine retention
+                            // trims.
+                            if divergence_suspected {
+                                tracing::warn!(
+                                    from = from,
+                                    from_seq = local_next,
+                                    to_seq = first_seq,
+                                    gap = first_seq.saturating_sub(local_next),
+                                    "replication: skip-ahead crossed leader's retained range — \
+                                     divergent log suspected (split-brain post-mortem)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    from = from,
+                                    from_seq = local_next,
+                                    to_seq = first_seq,
+                                    gap = first_seq.saturating_sub(local_next),
+                                    "replication: skip-ahead — leader trimmed past local tail"
+                                );
+                            }
                             // Retry the apply now that the local
                             // tail matches first_seq.
                             match apply_sync_response(&inputs.file, &msg, inputs.channel_id) {

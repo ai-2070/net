@@ -135,12 +135,15 @@ fixed size: 3 + 32 + 8 + 4 = 47 bytes
 
 SYNC_RESPONSE (leader → replica)
 ┌──────────────────────────────────────────────────────────────┐
-│ subprotocol_id   u16 LE      = SUBPROTOCOL_REDEX             │
-│ dispatch_code    u8          = 0x21                          │
-│ channel_id       [u8; 32]                                    │
-│ first_seq        u64 LE      seq of events[0] in this chunk  │
-│ event_count      u32 LE      number of event records below   │
-│ events           [Event; N]  N = event_count                 │
+│ subprotocol_id              u16 LE      = SUBPROTOCOL_REDEX  │
+│ dispatch_code               u8          = 0x21               │
+│ channel_id                  [u8; 32]                         │
+│ first_seq                   u64 LE      seq of events[0]     │
+│ leader_first_retained_seq   u64 LE      leader's first       │
+│                                         retained seq at      │
+│                                         request time         │
+│ event_count                 u32 LE      number of records    │
+│ events                      [Event; N]  N = event_count      │
 │                                                              │
 │   Event record (length-prefixed):                            │
 │     event_seq     u64 LE                                     │
@@ -150,6 +153,12 @@ SYNC_RESPONSE (leader → replica)
 variable size; bounded by chunk_max from the matching SYNC_REQUEST.
 event_seq monotonically increases across the chunk;
 no gaps within a chunk (gaps are explicit-skip, see Phase D).
+`leader_first_retained_seq` lets the replica distinguish a
+legitimate retention trim (`first_seq <= leader_first_retained_seq`)
+from a divergent-log split-brain (`local_next > leader_first_retained_seq`
+AND `local_next > 0`). Both route through the same skip-ahead
+safety path; the divergence case bumps `*_skip_ahead_total` AND
+logs at warn level so operators can post-mortem a split-brain.
 
 SYNC_HEARTBEAT (bidirectional)
 ┌──────────────────────────────────────────────────────────────┐

@@ -215,6 +215,16 @@ pub struct SyncResponse {
     /// the request's `since_seq` means the leader no longer retains
     /// the requested range).
     pub first_seq: u64,
+    /// **R-5 disambiguation:** leader's first retained seq at the
+    /// time of this response. Lets the replica tell a legitimate
+    /// retention trim (`first_seq == leader_first_retained_seq`) from
+    /// a divergent-log split-brain (`first_seq >
+    /// leader_first_retained_seq` AND replica's local tail had data
+    /// in `[leader_first_retained_seq, first_seq)`). The replica
+    /// still does the skip-ahead in both cases (safety) but
+    /// observability-wise the divergence case is flagged with a
+    /// distinct metric for operator review.
+    pub leader_first_retained_seq: u64,
     /// In-order event records. `event_seq` increases monotonically
     /// across the slice; no gaps within a chunk.
     pub events: Vec<SyncEvent>,
@@ -385,26 +395,34 @@ impl SyncRequest {
 // ============================================================================
 
 impl SyncResponse {
-    /// Serialize to bytes. Variable size: header + 32 + 8 + 4 +
+    /// Serialize to bytes. Variable size: header + 32 + 8 + 8 + 4 +
     /// Σ(8 + 4 + payload.len()) over events.
+    /// (R-5: added 8 bytes for `leader_first_retained_seq`.)
     pub fn to_bytes(&self) -> Vec<u8> {
         // Cap the pre-allocation against `u32::MAX` — `event_count`
         // is the wire-format width, so we can't honestly encode
         // more than `u32::MAX` events anyway, and on 32-bit hosts
         // the multiplication below would overflow `usize` otherwise.
         let events_size: usize = self.events.iter().map(|e| 8 + 4 + e.payload.len()).sum();
-        let mut buf = Vec::with_capacity(3 + 32 + 8 + 4 + events_size);
+        let mut buf = Vec::with_capacity(3 + 32 + 8 + 8 + 4 + events_size);
         put_header(&mut buf, DISPATCH_SYNC_RESPONSE);
         buf.put_slice(self.channel_id.as_bytes());
         buf.put_u64_le(self.first_seq);
+        buf.put_u64_le(self.leader_first_retained_seq);
         // `events.len()` wider than u32::MAX is impossible to
         // represent on the wire — clamp via saturating cast. In
         // practice callers honor `chunk_max` (bounded u32) so the
         // saturation is dead code, but stay safe.
+        debug_assert!(
+            self.events.len() <= u32::MAX as usize,
+            "events.len() {} exceeds u32::MAX",
+            self.events.len()
+        );
         let event_count = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
         buf.put_u32_le(event_count);
         for event in &self.events {
             buf.put_u64_le(event.event_seq);
+            debug_assert!(event.payload.len() <= u32::MAX as usize);
             let payload_len = u32::try_from(event.payload.len()).unwrap_or(u32::MAX);
             buf.put_u32_le(payload_len);
             buf.put_slice(&event.payload);
@@ -418,7 +436,7 @@ impl SyncResponse {
     /// can't trigger a panic.
     pub fn from_bytes(data: &[u8]) -> Result<Self, WireError> {
         let payload = check_header(data, DISPATCH_SYNC_RESPONSE)?;
-        let prefix_needed = 32 + 8 + 4;
+        let prefix_needed = 32 + 8 + 8 + 4;
         if payload.len() < prefix_needed {
             return Err(WireError::Truncated {
                 need: 3 + prefix_needed,
@@ -428,20 +446,25 @@ impl SyncResponse {
         let mut cursor = payload;
         let channel_id = get_channel_id(&mut cursor);
         let first_seq = cursor.get_u64_le();
+        let leader_first_retained_seq = cursor.get_u64_le();
         let event_count = cursor.get_u32_le() as usize;
         let mut events = Vec::with_capacity(event_count.min(4096));
         for _ in 0..event_count {
             if cursor.remaining() < 8 + 4 {
+                // R-23: report total bytes needed correctly —
+                // consumed-so-far + still-needed.
+                let consumed = data.len() - cursor.remaining();
                 return Err(WireError::Truncated {
-                    need: data.len() + (8 + 4 - cursor.remaining()),
+                    need: consumed + (8 + 4),
                     have: data.len(),
                 });
             }
             let event_seq = cursor.get_u64_le();
             let payload_len = cursor.get_u32_le() as usize;
             if cursor.remaining() < payload_len {
+                let consumed = data.len() - cursor.remaining();
                 return Err(WireError::Truncated {
-                    need: data.len() + (payload_len - cursor.remaining()),
+                    need: consumed + payload_len,
                     have: data.len(),
                 });
             }
@@ -455,6 +478,7 @@ impl SyncResponse {
         Ok(Self {
             channel_id,
             first_seq,
+            leader_first_retained_seq,
             events,
         })
     }
@@ -685,6 +709,7 @@ mod tests {
         let original = SyncResponse {
             channel_id: sample_channel_id(),
             first_seq: 42,
+            leader_first_retained_seq: 42,
             events: vec![],
         };
         let bytes = original.to_bytes();
@@ -697,6 +722,7 @@ mod tests {
         let original = SyncResponse {
             channel_id: sample_channel_id(),
             first_seq: 100,
+            leader_first_retained_seq: 50,
             events: vec![
                 SyncEvent {
                     event_seq: 100,
@@ -717,6 +743,27 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    /// R-5 codec pin: the new `leader_first_retained_seq` field
+    /// sits at offset 3 + 32 + 8 = 43 (after subprotocol header,
+    /// channel id, first_seq) and is u64 LE.
+    #[test]
+    fn sync_response_leader_first_retained_seq_byte_offset() {
+        let original = SyncResponse {
+            channel_id: sample_channel_id(),
+            first_seq: 0x0102_0304_0506_0708,
+            leader_first_retained_seq: 0x1112_1314_1516_1718,
+            events: vec![],
+        };
+        let bytes = original.to_bytes();
+        // Header (3) + channel_id (32) = 35; first_seq (8) at 35..43;
+        // leader_first_retained_seq (8) at 43..51.
+        assert_eq!(
+            &bytes[43..51],
+            &0x1112_1314_1516_1718_u64.to_le_bytes(),
+            "leader_first_retained_seq must be at offset 43..51 in LE form"
+        );
+    }
+
     #[test]
     fn sync_response_rejects_truncated_event_record() {
         // Build a valid bytes buffer, then truncate inside the
@@ -725,6 +772,7 @@ mod tests {
         let bytes = SyncResponse {
             channel_id: sample_channel_id(),
             first_seq: 1,
+            leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 1,
                 payload: b"truncated".to_vec(),

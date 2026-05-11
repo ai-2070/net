@@ -9371,6 +9371,7 @@ mod replication_dispatch_tests {
         let resp = SyncResponse {
             channel_id: cid,
             first_seq: 0,
+            leader_first_retained_seq: 0,
             events: vec![],
         };
         let payload = resp.to_bytes();

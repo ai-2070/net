@@ -112,12 +112,22 @@ pub enum ApplyError {
     /// ahead per the §8 rejoin path when the gap exceeds
     /// `skip_threshold`; otherwise the caller re-issues a
     /// `SYNC_REQUEST` for the missing range.
+    ///
+    /// `divergence_suspected` (R-5): the local tail had data in
+    /// `[leader_first_retained_seq, first_seq)`. The replica's
+    /// log diverges from the leader's; safety still routes
+    /// through skip-ahead but operators should review.
     #[error("chunk first_seq {first_seq} leaves a gap above local next_seq {local_next}")]
     GapBeforeChunk {
         /// `first_seq` from the response.
         first_seq: u64,
         /// Local `RedexFile::next_seq()` at apply time.
         local_next: u64,
+        /// R-5 divergence signal: `true` iff `local_next >
+        /// leader_first_retained_seq` AND `local_next > 0` — the
+        /// replica has events in a range the leader has retained,
+        /// meaning the histories diverge.
+        divergence_suspected: bool,
     },
     /// Underlying `append_batch` errored. Wrapped string because
     /// `RedexError` isn't Eq.
@@ -166,11 +176,17 @@ pub fn handle_sync_request(
     }
 
     let local_next = file.next_seq();
+    // R-5: capture leader's first retained seq so the replica can
+    // disambiguate retention-trim from split-brain divergence on
+    // the apply side. `None` means "the leader has no events yet"
+    // → use 0 as the wire value.
+    let leader_first_retained_seq = file.lowest_retained_seq().unwrap_or(0);
     if request.since_seq >= local_next {
         // Replica is caught up. Empty chunk is the signal.
         return SyncRequestOutcome::Response(SyncResponse {
             channel_id: expected_channel,
             first_seq: request.since_seq,
+            leader_first_retained_seq,
             events: Vec::new(),
         });
     }
@@ -235,6 +251,7 @@ pub fn handle_sync_request(
     SyncRequestOutcome::Response(SyncResponse {
         channel_id: expected_channel,
         first_seq,
+        leader_first_retained_seq,
         events: out,
     })
 }
@@ -298,9 +315,19 @@ pub fn apply_sync_response(
         });
     }
     if response.first_seq > local_next {
+        // R-5: distinguish "leader trimmed past replica" (safe
+        // retention skip) from "leader and replica logs diverge"
+        // (split-brain). The replica's local_next has crossed
+        // `leader_first_retained_seq` iff the replica wrote events
+        // in `[leader_first_retained_seq, first_seq)` that the
+        // leader's retained range never carried.
+        let divergence_suspected = local_next > response.leader_first_retained_seq
+            && local_next > 0
+            && response.leader_first_retained_seq < response.first_seq;
         return Err(ApplyError::GapBeforeChunk {
             first_seq: response.first_seq,
             local_next,
+            divergence_suspected,
         });
     }
     // Apply via append_batch. We hand each payload as a `Bytes`
@@ -512,6 +539,7 @@ mod tests {
         let response = SyncResponse {
             channel_id: cid,
             first_seq: 0,
+            leader_first_retained_seq: 0,
             events: vec![
                 SyncEvent {
                     event_seq: 0,
@@ -540,6 +568,7 @@ mod tests {
         let response = SyncResponse {
             channel_id: cid,
             first_seq: 100,
+            leader_first_retained_seq: 0,
             events: vec![],
         };
         let new_tail = apply_sync_response(&dst, &response, cid).expect("apply");
@@ -554,6 +583,7 @@ mod tests {
         let response = SyncResponse {
             channel_id: foreign_cid,
             first_seq: 0,
+            leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 0,
                 payload: b"x".to_vec(),
@@ -570,6 +600,7 @@ mod tests {
         let response = SyncResponse {
             channel_id: cid,
             first_seq: 0,
+            leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 5, // declared 0 but actually 5
                 payload: b"x".to_vec(),
@@ -586,6 +617,7 @@ mod tests {
         let response = SyncResponse {
             channel_id: cid,
             first_seq: 0,
+            leader_first_retained_seq: 0,
             events: vec![
                 SyncEvent {
                     event_seq: 0,
@@ -612,6 +644,7 @@ mod tests {
         let response = SyncResponse {
             channel_id: cid,
             first_seq: 0,
+            leader_first_retained_seq: 0,
             events: vec![
                 SyncEvent {
                     event_seq: 0,
@@ -636,6 +669,7 @@ mod tests {
         let response = SyncResponse {
             channel_id: cid,
             first_seq: 2,
+            leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 2,
                 payload: b"stale".to_vec(),
@@ -657,22 +691,98 @@ mod tests {
         append_n(&dst, 2, "x");
         let cid = channel_id_for("redex/gap");
         // Local tail is 2; chunk starts at 5 — leaves a 2..5 gap.
+        // leader_first_retained_seq=0 means leader hasn't trimmed
+        // — replica has local data in [0,2), leader has events at
+        // [5, ...) — this is the divergence-suspected case.
         let response = SyncResponse {
             channel_id: cid,
             first_seq: 5,
+            leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 5,
                 payload: b"future".to_vec(),
             }],
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
-        assert!(matches!(
-            err,
+        match err {
             ApplyError::GapBeforeChunk {
-                first_seq: 5,
-                local_next: 2,
+                first_seq,
+                local_next,
+                divergence_suspected,
+            } => {
+                assert_eq!(first_seq, 5);
+                assert_eq!(local_next, 2);
+                // local_next (2) > leader_first_retained_seq (0)
+                // AND local_next > 0 → divergence suspected.
+                assert!(divergence_suspected);
             }
-        ));
+            other => panic!("expected GapBeforeChunk, got {other:?}"),
+        }
+    }
+
+    /// R-5: when the leader's retention has trimmed past
+    /// `local_next`, that's a legitimate skip-ahead — NOT
+    /// divergence. `leader_first_retained_seq` must equal or
+    /// exceed `local_next` for this to be the non-divergent
+    /// case.
+    #[test]
+    fn gap_before_chunk_legitimate_retention_trim_not_divergence() {
+        let dst = build_file("redex/legit_trim");
+        append_n(&dst, 2, "x");
+        let cid = channel_id_for("redex/legit_trim");
+        // Replica has tail=2; leader trimmed up to seq=5 (so
+        // `leader_first_retained_seq = 5` and `first_seq = 5`).
+        // local_next (2) < leader_first_retained_seq (5) →
+        // NOT divergence; just a routine retention catch-up.
+        let response = SyncResponse {
+            channel_id: cid,
+            first_seq: 5,
+            leader_first_retained_seq: 5,
+            events: vec![SyncEvent {
+                event_seq: 5,
+                payload: b"future".to_vec(),
+            }],
+        };
+        let err = apply_sync_response(&dst, &response, cid).expect_err("must gap");
+        match err {
+            ApplyError::GapBeforeChunk {
+                divergence_suspected,
+                ..
+            } => assert!(
+                !divergence_suspected,
+                "legitimate retention trim must not flag divergence"
+            ),
+            other => panic!("expected GapBeforeChunk, got {other:?}"),
+        }
+    }
+
+    /// R-5: empty local file (`local_next == 0`) is the initial
+    /// catch-up case — never divergence, even if the leader's
+    /// first retained seq is non-zero.
+    #[test]
+    fn gap_before_chunk_empty_replica_not_divergence() {
+        let dst = build_file("redex/fresh");
+        let cid = channel_id_for("redex/fresh");
+        let response = SyncResponse {
+            channel_id: cid,
+            first_seq: 5,
+            leader_first_retained_seq: 3,
+            events: vec![SyncEvent {
+                event_seq: 5,
+                payload: b"future".to_vec(),
+            }],
+        };
+        let err = apply_sync_response(&dst, &response, cid).expect_err("must gap");
+        match err {
+            ApplyError::GapBeforeChunk {
+                divergence_suspected,
+                ..
+            } => assert!(
+                !divergence_suspected,
+                "empty replica catching up must not flag divergence"
+            ),
+            other => panic!("expected GapBeforeChunk, got {other:?}"),
+        }
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -780,6 +890,7 @@ mod tests {
         let response = SyncResponse {
             channel_id: cid,
             first_seq: 10,
+            leader_first_retained_seq: 10,
             events: vec![
                 SyncEvent {
                     event_seq: 10,
