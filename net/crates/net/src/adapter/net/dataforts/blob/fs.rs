@@ -155,6 +155,17 @@ impl BlobAdapter for FileSystemAdapter {
         if len == 0 {
             return Ok(Vec::new());
         }
+        // Guard against `len as usize` truncation on 32-bit
+        // targets and against OOM-by-design from a maliciously
+        // large range that decoded past the substrate's
+        // BLOB_REF_MAX_SIZE check (e.g. caller constructed the
+        // BlobRef in-process, bypassing decode).
+        if len > usize::MAX as u64 {
+            return Err(backend(format!(
+                "range length {} exceeds usize::MAX on this target",
+                len
+            )));
+        }
         let path = self.path_for(&blob_ref.hash);
         let uri = blob_ref.uri.clone();
         let start = range.start;

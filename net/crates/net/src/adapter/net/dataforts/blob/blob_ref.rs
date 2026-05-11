@@ -52,6 +52,17 @@ pub const BLOB_REF_VERSION_V1: u8 = 0x01;
 /// URI may be empty.
 pub const BLOB_REF_HEADER_LEN: usize = 4 + 1 + 32 + 8;
 
+/// Hard ceiling on the `size` field carried in an inbound
+/// [`BlobRef`]. A malicious or buggy publisher could otherwise
+/// stamp `size = u64::MAX` which then propagates into `vec![0u8;
+/// len as usize]` allocations on the fetch path — OOMs on 64-bit
+/// targets, silent truncation to short reads on 32-bit. 16 GiB is
+/// generous enough for legitimate multi-GB blobs while still
+/// bounded; sites that need higher should validate on construction
+/// and consider streaming (the BlobAdapter trait's streaming hooks
+/// are the right escape valve).
+pub const BLOB_REF_MAX_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Pointer to content stored out-of-band. Round-trips through
 /// every binding as a typed value via the public fields; the
 /// substrate uses [`Self::encode`] / [`Self::decode`] for the wire
@@ -133,6 +144,12 @@ impl BlobRef {
         let mut size_bytes = [0u8; 8];
         size_bytes.copy_from_slice(&bytes[37..45]);
         let size = u64::from_le_bytes(size_bytes);
+        if size > BLOB_REF_MAX_SIZE {
+            return Err(BlobError::Decode(format!(
+                "blob size {} exceeds cap {}",
+                size, BLOB_REF_MAX_SIZE
+            )));
+        }
         let uri_bytes = &bytes[45..];
         let uri = std::str::from_utf8(uri_bytes)
             .map_err(|e| BlobError::Decode(format!("URI not UTF-8: {}", e)))?
@@ -246,6 +263,19 @@ mod tests {
             }
             other => panic!("expected HashMismatch, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn decode_rejects_oversize_size_field() {
+        // Build an encoded form by hand: valid magic + version +
+        // hash + size = u64::MAX → must reject at decode rather
+        // than later at vec![0; size] OOM time.
+        let mut bytes = BLOB_REF_MAGIC.to_vec();
+        bytes.push(BLOB_REF_VERSION_V1);
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        let err = BlobRef::decode(&bytes).unwrap_err();
+        assert!(matches!(err, BlobError::Decode(_)));
     }
 
     #[test]

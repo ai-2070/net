@@ -46,7 +46,7 @@ Tagged `[B | H | M | L]`:
 | D-12  | H   | blob         | `FileSystemAdapter::store` never verifies bytes hash to `blob_ref.hash`    | ✅ |
 | D-13  | H   | blob         | Adapter selected by channel config, not URI scheme — authority confusion  | ✅ |
 | D-14  | H   | blob         | `classify_payload` first-byte `0xB0` collides with arbitrary binary payloads | ✅ |
-| D-15  | H   | blob         | No max-blob-size on resolve / `u64::MAX` size accepted                     | ⏳ |
+| D-15  | H   | blob         | No max-blob-size on resolve / `u64::MAX` size accepted                     | ✅ |
 | D-16  | H   | blob         | `BlobAdapter` trait is all-in-memory; no streaming hooks                   | ⏳ |
 | D-17  | H   | RYW          | `wait_for_token` returns `Ok` on fold-watermark including skipped events  | ⏳ |
 | D-18  | H   | RYW          | `wait_for_token` returns `Ok` on `running == false` (fold-task stopped)    | ⏳ |
