@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/redex/replication_election.rs
+  s_4dbb97ea6ebffd::t_14d8ec4dfec96f 276-280,288-307
+  s_4dbb97ea6ebffd::t_cb6f3edb00810b 125-135
+net/crates/net/bindings/go/net/redex.go
+  s_4dbb97ea6ebffd::t_5be9801eb7c96c 382-394,399-409
+net/crates/net/src/adapter/net/redex/replication_budget.rs
+  s_4dbb97ea6ebffd::t_28ad3eb186bb93 322-338,341-345,347-350
+  s_4dbb97ea6ebffd::t_43a9fdf82f5089 111-122,131,133-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "841289a66bf0f9077ecf09c17c6ce6ade4c726cd",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
