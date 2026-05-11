@@ -122,15 +122,17 @@ where
             // the proximity graph doesn't store a self-entry.
             Duration::ZERO
         } else {
-            // Peer with no RTT measurement is treated as unhealthy
-            // for ranking purposes. The plan §4 doesn't enumerate
-            // this case — but a peer we've never pinged is one we
-            // can't trust to be a useful leader, so excluding it
-            // matches the "healthy in self's local view" filter.
-            match rtt_to(node) {
-                Some(d) => d,
-                None => continue,
-            }
+            // Peer with no RTT measurement is ranked at the worst
+            // possible RTT rather than excluded. Health already
+            // filtered the candidate set; a healthy peer for which
+            // we lack an RTT sample (no ping yet, but recent
+            // heartbeat) is still a valid backup leader — the
+            // tiebreaker on NodeId then makes the choice
+            // deterministic among any equally-RTT-unknown peers.
+            // Excluding the peer here inflated the dual-leader
+            // window during real partitions when one survivor
+            // lacked an RTT sample for another.
+            rtt_to(node).unwrap_or(Duration::MAX)
         };
         candidates.push((node, rtt));
     }
@@ -271,16 +273,38 @@ mod tests {
     }
 
     #[test]
-    fn peer_without_rtt_measurement_excluded() {
-        // The proximity graph hasn't measured RTT to 0xCC; treat
-        // as unmeasured = unhealthy for ranking. The healthy peer
-        // with a measurement wins.
+    fn peer_without_rtt_measurement_ranks_at_worst_rtt() {
+        // The proximity graph hasn't measured RTT to 0xCC; rank
+        // the peer at Duration::MAX rather than excluding it.
+        // Healthy peers with measurements rank ahead but the
+        // unmeasured peer remains a valid backup leader.
         let set = [0xAA, 0xBB, 0xCC];
         let outcome = elect(
             &set,
             0xFF,
             rtt_table(&[(0xAA, 30), (0xBB, 50)]), // no entry for 0xCC
             alive_set(&[0xAA, 0xBB, 0xCC]),       // health says yes to all
+        );
+        // 0xAA at 30ms beats 0xBB at 50ms beats 0xCC at MAX.
+        assert_eq!(outcome, ElectionOutcome::PeerWins(0xAA));
+    }
+
+    #[test]
+    fn only_unmeasured_peers_still_elect_a_leader() {
+        // Pin the new behavior: a cluster where every healthy peer
+        // lacks an RTT sample still elects a leader (the
+        // smallest-NodeId healthy peer, via the tiebreaker), rather
+        // than failing with NoEligibleReplica. The prior code
+        // excluded unmeasured peers and produced
+        // NoEligibleReplica here — inflating the dual-leader
+        // window during real partitions when one survivor lacked
+        // an RTT sample for another.
+        let set = [0xAA, 0xBB];
+        let outcome = elect(
+            &set,
+            0xFF,             // self not in set
+            rtt_table(&[]),   // no measurements at all
+            alive_set(&[0xAA, 0xBB]),
         );
         assert_eq!(outcome, ElectionOutcome::PeerWins(0xAA));
     }

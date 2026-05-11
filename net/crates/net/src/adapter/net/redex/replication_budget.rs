@@ -108,6 +108,18 @@ impl BandwidthBudget {
     /// tick after [`Self::refill`] runs again).
     ///
     /// `bytes == 0` always succeeds without state mutation.
+    ///
+    /// **Oversize request behavior.** Requests larger than
+    /// [`capacity_bytes`] (= one second's worth of refill) can
+    /// never accumulate enough credit on their own — the bucket
+    /// caps at capacity even after infinite refill. The catch-up
+    /// path is responsible for splitting outbound chunks against
+    /// this ceiling; if a single event is itself larger than the
+    /// budget capacity (rare — e.g. a tiny channel with a large
+    /// payload), the call admits it as a one-off, draining the
+    /// bucket fully so subsequent requests defer until refill
+    /// catches up. Without this clamp the channel would deadlock
+    /// trying to send a single event it can never afford.
     pub fn try_consume(&mut self, bytes: u64, now: Instant) -> bool {
         if bytes == 0 {
             return true;
@@ -116,10 +128,22 @@ impl BandwidthBudget {
         let cost = bytes as f64;
         if self.available_bytes >= cost {
             self.available_bytes -= cost;
-            true
-        } else {
-            false
+            return true;
         }
+        // Oversize-event escape hatch: if the request itself is
+        // larger than capacity AND the bucket is at full credit,
+        // admit it once and drain. This prevents a per-channel
+        // deadlock when a single event exceeds one-second's
+        // refill — coordinator-side chunk splitting is preferred,
+        // but the budget should never be the reason an event is
+        // permanently un-shippable.
+        if bytes > self.capacity_bytes as u64
+            && self.available_bytes >= self.capacity_bytes - f64::EPSILON
+        {
+            self.available_bytes = 0.0;
+            return true;
+        }
+        false
     }
 
     /// Current available token count in bytes. Useful for
@@ -295,15 +319,35 @@ mod tests {
     }
 
     #[test]
-    fn try_consume_oversize_fails_without_draining() {
+    fn try_consume_oversize_with_full_bucket_admits_as_one_off() {
         let base = t0();
         let mut bb = BandwidthBudget::new(1.0, 1_000, base);
-        // Single chunk larger than capacity. Catch-up loop must
-        // fall back to splitting the chunk (or defer). Bucket
-        // state is preserved on failure so the caller can retry
-        // with a smaller request.
+        // Full bucket + a single chunk larger than capacity. The
+        // budget can't accumulate enough credit even after
+        // infinite refill (capacity caps at one second's tokens),
+        // so the only choice is admit-once-and-drain. Otherwise
+        // the channel deadlocks trying to ship an event that's
+        // too large for the configured budget.
+        assert!(bb.try_consume(2_000, base));
+        // Bucket fully drained; subsequent normal-sized requests
+        // defer until refill.
+        assert!(!bb.try_consume(1, base));
+    }
+
+    #[test]
+    fn try_consume_oversize_with_partial_bucket_fails() {
+        let base = t0();
+        let mut bb = BandwidthBudget::new(1.0, 1_000, base);
+        // Drain half the bucket via a normal-sized request.
+        assert!(bb.try_consume(500, base));
+        // Oversize chunk now arrives. Bucket isn't at full credit
+        // anymore, so the escape hatch doesn't fire; caller defers
+        // until refill catches up.
         assert!(!bb.try_consume(2_000, base));
-        assert!(bb.available_bytes() >= 1_000 - 1); // slack for f64
+        // State preserved on failure — half the bucket is still
+        // there for the caller to consume with a smaller request.
+        let remaining = bb.available_bytes();
+        assert!((499..=501).contains(&remaining));
     }
 
     #[test]

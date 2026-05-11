@@ -379,9 +379,34 @@ func (r *Redex) ReplicationPrometheusText() string {
 // `ErrInvalidReplicationConfig` instead of conflating them with
 // `ErrReplicationRequiresEnable`. Operators inspecting an invalid
 // factor now see the right sentinel.
+// Numeric bounds mirror the Rust core (`REPLICATION_FACTOR_MIN/MAX`
+// and `HEARTBEAT_MS_MIN/MAX` in `replication_config.rs`). Pinning
+// them on the Go side lets `OpenFile` surface
+// `ErrInvalidReplicationConfig` for out-of-range values rather than
+// the catch-all `ErrReplicationRequiresEnable` the FFI's
+// `NET_ERR_REDEX` code maps to.
+const (
+	replicationFactorMin = uint8(1)
+	replicationFactorMax = uint8(16)
+	heartbeatMsMin       = uint64(100)
+	heartbeatMsMax       = uint64(300_000)
+)
+
 func validateReplicationConfig(cfg *ReplicationConfig) error {
 	if cfg == nil {
 		return nil
+	}
+	if cfg.Factor != 0 && (cfg.Factor < replicationFactorMin || cfg.Factor > replicationFactorMax) {
+		return fmt.Errorf(
+			"%w: Factor %d out of range [%d, %d]",
+			ErrInvalidReplicationConfig, cfg.Factor, replicationFactorMin, replicationFactorMax,
+		)
+	}
+	if cfg.HeartbeatMs != 0 && (cfg.HeartbeatMs < heartbeatMsMin || cfg.HeartbeatMs > heartbeatMsMax) {
+		return fmt.Errorf(
+			"%w: HeartbeatMs %d out of range [%d, %d]",
+			ErrInvalidReplicationConfig, cfg.HeartbeatMs, heartbeatMsMin, heartbeatMsMax,
+		)
 	}
 	switch cfg.Placement {
 	case "", PlacementStandard, PlacementColocationStrict:
