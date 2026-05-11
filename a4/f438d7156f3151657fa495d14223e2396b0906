@@ -1,0 +1,24 @@
+net/crates/net/src/ffi/cortex.rs
+  s_d760092f02a89c::t_cbe60c7622fbfe 2579-2580
+  s_d760092f02a89c::t_ea8fadb36200df 2546-2550,2553,2556-2558,2560-2562,2572-2578,2581-2586
+  s_d760092f02a89c::t_82c0a7bc5532df 300-302,315-318,320-327,330-331,333-340,345
+  s_d760092f02a89c::t_ed409190e85929 2551-2552,2554-2555,2559,2563-2571
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_REDEX_DISTRIBUTED.md
+  s_d760092f02a89c::t_fa2dbbe9bcc8e1 33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "a4f438d7156f3151657fa495d14223e2396b0906",
+  "prompts": {},
+  "sessions": {
+    "s_d760092f02a89c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ef8b8023-dce0-4b44-bfb8-b07c462d6685",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
