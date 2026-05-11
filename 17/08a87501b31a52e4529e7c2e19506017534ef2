@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/redex/replication_budget.rs
+  s_4dbb97ea6ebffd::t_96bc0b5e2771fd 113-115
+net/crates/net/src/adapter/net/redex/mod.rs
+  s_4dbb97ea6ebffd::t_108f250e0cd06a 69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "1708a87501b31a52e4529e7c2e19506017534ef2",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
