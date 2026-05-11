@@ -245,3 +245,85 @@ async fn two_node_heartbeat_records_believed_leader() {
     redex_a.close_file(&name).expect("close A");
     redex_b.close_file(&name).expect("close B");
 }
+
+/// Failover scenario — leader closes its channel mid-flight; the
+/// replica's tracker observes the silence, the replica's tick
+/// decides to enter Candidate via MissedHeartbeats, the
+/// deterministic election promotes the replica to Leader. Pins
+/// the failure-detection → election → promotion cycle end-to-end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leader_close_triggers_replica_election_and_promotion() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    let redex_a = Arc::new(Redex::new());
+    let redex_b = Arc::new(Redex::new());
+    redex_a.enable_replication(node_a.clone());
+    redex_b.enable_replication(node_b.clone());
+
+    // 150ms heartbeat → 450ms failure-detection window
+    // (3 × heartbeat). Tight enough to finish the failover
+    // within the test's deadline.
+    let name = cn("repl/failover");
+    let a_id = node_a.node_id();
+    let b_id = node_b.node_id();
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id])),
+    ));
+    redex_a.open_file(&name, cfg.clone()).expect("open A");
+    redex_b.open_file(&name, cfg).expect("open B");
+
+    let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
+    let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
+
+    // Drive A → Leader, B → Replica.
+    coord_a
+        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+        .await
+        .unwrap();
+    coord_a
+        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
+        .await
+        .unwrap();
+    coord_a
+        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
+        .await
+        .unwrap();
+    coord_b
+        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+        .await
+        .unwrap();
+
+    // Give the leader a few heartbeat cycles to land on B's
+    // tracker so B has a believed_leader to lose.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Close A's channel — its runtime exits, no more heartbeats
+    // emitted to B.
+    redex_a.close_file(&name).expect("close A");
+
+    // Wait for B to detect the silence + run the election. The
+    // detection window is 3 × heartbeat = 450ms; the election
+    // itself runs in the same tick that detects silence, so the
+    // total bound is one heartbeat past the detection window.
+    // Pad to 3s to absorb scheduler jitter on CI boxes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut final_role = coord_b.role();
+    while tokio::time::Instant::now() < deadline {
+        final_role = coord_b.role();
+        if final_role == ReplicaRole::Leader {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        final_role,
+        ReplicaRole::Leader,
+        "replica failed to win election within 3s after leader silence (final role: {final_role:?})"
+    );
+
+    redex_b.close_file(&name).expect("close B");
+}
