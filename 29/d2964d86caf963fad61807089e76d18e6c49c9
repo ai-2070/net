@@ -1,0 +1,23 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_a604424552e21a 62
+  s_3a0a24a47d1a36::t_64fd44586489cb 60
+net/crates/net/src/adapter/net/dataforts/blob/conformance.rs
+  s_3a0a24a47d1a36::t_0ce9c4e00a9f73 123-124
+  s_3a0a24a47d1a36::t_d367ab69285f3e 20,28-40,44-54,69,107-122,125-173,175-176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "29d2964d86caf963fad61807089e76d18e6c49c9",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
