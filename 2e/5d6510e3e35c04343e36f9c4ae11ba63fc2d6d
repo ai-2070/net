@@ -1,0 +1,45 @@
+net/crates/net/src/adapter/net/redex/mod.rs
+  s_9163f300668f8b::t_72bc1d62f7be00 28,48-51
+net/crates/net/src/adapter/net/redex/file.rs
+  s_9163f300668f8b::t_5f0590d6c2c278 1065
+  s_9163f300668f8b::t_76770634114b62 1056
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_9163f300668f8b::t_509b53cabeb399 433,435-443
+  s_9163f300668f8b::t_aba77747774357 7,13
+net/crates/net/src/adapter/net/redex/replication_config.rs
+  s_9163f300668f8b::t_ae5ab7be49c5ac 288-291
+  s_9163f300668f8b::t_3dac1f40092df6 427-431
+  s_9163f300668f8b::t_392cd45a2583ce 1-28,30-69,71-75,77-287,292-426,432-539
+  s_9163f300668f8b::t_b328f040c91d11 70,76
+  s_9163f300668f8b::t_2bb41c07cfb1d7 29
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_9163f300668f8b::t_6b1de3c55c5dae 314
+net/crates/net/src/adapter/net/redex/config.rs
+  s_9163f300668f8b::t_811a4910000672 91-97
+  s_9163f300668f8b::t_2c2ecc1ba09e96 5-6
+  s_9163f300668f8b::t_ee4974b250428d 151-161
+  s_9163f300668f8b::t_bb99500b36331e 174
+  s_9163f300668f8b::t_e9edd38ffd089c 231-240
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  s_9163f300668f8b::t_5c36e1643ff8df 347
+  s_9163f300668f8b::t_b170271e65c231 129
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  s_9163f300668f8b::t_1f8dee9b971594 329
+  s_9163f300668f8b::t_c710d112ee2e14 108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "2e5d6510e3e35c04343e36f9c4ae11ba63fc2d6d",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
