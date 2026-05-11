@@ -13,6 +13,9 @@
 //!   observed via the tail-subscription path. Phase 1.
 
 #[cfg(feature = "dataforts")]
+pub mod blob;
+
+#[cfg(feature = "dataforts")]
 pub mod greedy;
 
 #[cfg(feature = "dataforts")]
@@ -31,4 +34,10 @@ pub use greedy::{
 pub use gravity::{
     should_emit_heat, DataGravityPolicy, DataGravityPolicyError, EmissionDecision,
     HeatCounter, HeatEmission, HeatRegistry, HeatSink,
+};
+
+#[cfg(feature = "dataforts")]
+pub use blob::{
+    global_blob_adapter_registry, BlobAdapter, BlobAdapterRegistry, BlobAdapterRegistryError,
+    BlobError, BlobRef, NoopAdapter, BLOB_REF_DISCRIMINATOR, BLOB_REF_VERSION_V1,
 };
