@@ -4,13 +4,13 @@
 
 ## Status
 
-**Phases A, B, H (scaffolding), plus the pure-function pieces of C (state-machine validation) and E (`elect()` selection function) landed. Capability Phase B (the gating dependency) also landed — Phase C coordinator daemon work is now unblocked.** All open design questions are ratified — see [Locked decisions](#locked-decisions).
+**Phases A, B, C, D, E, G, H, I (Node + Python) ✅. Phase F (DST harness) deferred as a separate workstream; Phase I Go + C bindings deferred as their own workstream (require new FFI surfaces).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
 
 Hard prerequisites:
 - ~~**Capability Phase B** (tag-discovery primitives `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders`) — RedEX Phases C/D/E cannot start until this lands.~~ ✅ Landed.
 - **Capability Phase F** (`PlacementFilter` + `IntentRegistry` + anti-affinity) — needed for *replica placement* in Phase C, but **not** for leader election. Election is decentralized and deterministic (nearest-RTT + NodeId tiebreak); see [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak). Capability F shipped with the v0.13 capability surface.
 
-Phase A (wire protocol scaffold) ✅, Phase B (`ReplicationConfig` opt-in) ✅, Phase H (metrics registry scaffolding) ⚠️, Phase C state-machine validation ⚠️, and Phase E `elect()` selection function ⚠️ landed. Phase D needs Phase C's coordinator + Capability B; Phase F (DST) builds on C/D/E; Phase G needs the coordinator; Phase I needs cross-binding plumbing for `RedexFileConfig` that doesn't yet exist.
+End-to-end proven on the real mesh wire via `tests/redex_replication_e2e.rs` — 4 scenarios cover catch-up, heartbeat round-trip, failover, and 3-node fanout. 281 redex unit tests pin every pure-logic contract. Operator surface: `Redex::enable_replication(mesh)`, `Redex::open_file(name, cfg with replication: Some(_))`, `Redex::replication_coordinator_for(name)`, `Redex::replication_metrics_snapshot()`, `Redex::replication_status_snapshot()`, `Redex::replication_prometheus_text()`. Operator docs: [`CONFIG_REPLICATION.md`](../CONFIG_REPLICATION.md).
 
 Activation gate (when Warriors as a whole ships) is unchanged: a workload requesting durability guarantees beyond single-node. Realistic triggers: payment-tier customer, compliance-bound data class, pilot whose RTO is "< 5 s on node failure."
 
@@ -486,20 +486,24 @@ Implementable in isolation; does not depend on Capability B/F. **Landed.**
 - 🔜 **Witness withdrawal**: every peer replica that observes a leadership transition issues `Mesh::withdraw_chain` in parallel with its own state transition. Phase F item — needs the DST harness to verify the timing claim ("strictly faster than disconnect-observer reaping").
 - ⚠️ DST harness verification of partition-safety properties (no two leaders within a single partition; election determinism under asymmetric RTT; witness-withdrawal timing): tracked under Phase F. The pure function's contract is pinned in unit tests; the broader-system convergence guarantee waits for the DST harness.
 
-### Phase F — DST harness extension (1.5–3 weeks; widest variance)
+### Phase F — DST harness extension (1.5–3 weeks; widest variance) ⚠️ deferred as a separate workstream
 
-**Hard prerequisite: Phases C, D, E of this plan + Capability F.**
+**Hard prerequisite: Phases C, D, E of this plan + Capability F.** All prerequisites are now ✅.
 
-This is the gating phase. Plan generously and treat regressions as test failures:
+This is the gating phase for production confidence. The pure-logic pieces have unit tests pinning their contracts (277 redex tests covering state machine, election, catchup, retention, etc.). The end-to-end behavior is proven on the real mesh wire via `tests/redex_replication_e2e.rs` (4 scenarios: catch-up, heartbeat round-trip, failover, 3-node fanout). The remaining DST work covers the adversarial-scheduler + fault-injection scenarios that real-wire tests can't exercise deterministically.
 
-- Extend `loom_models.rs` to model the 4-state replication state machine (`Leader` / `Replica` / `Candidate` / `Idle`) with the locked transitions from [§3](#3-replicationcoordinator).
-- Failure-injection scenarios: random partition, leader crash, replica crash, partial-network (one replica isolated), restart-during-sync, partition-heal-with-stale-leader, asymmetric-RTT (two replicas disagree on which peer is "nearest" because their RTT measurements diverged transiently).
+**Deferred as a separate workstream** — building the partition + failure-injection harness on top of the existing `loom_models.rs` requires:
+
+- Extending `loom_models.rs` to model the 4-state replication state machine (`Leader` / `Replica` / `Candidate` / `Idle`) with the locked transitions from [§3](#3-replicationcoordinator).
+- Failure-injection scenarios: random partition, leader crash, replica crash, partial-network (one replica isolated), restart-during-sync, partition-heal-with-stale-leader, asymmetric-RTT.
 - Convergence assertion: all surviving replicas converge to leader's `tail_seq` after recovery.
-- Divergence-freedom: no two replicas declare different `tail_seq` for the same `seq` (stronger than convergence — pin in DST).
-- Election determinism: given the same RTT matrix + healthy set + NodeId set, every replica computes the same winner. Pin against the asymmetric-RTT scenario — RTT measurements should converge across replicas under the proximity graph's existing smoothing, but transient divergence must not produce dual-leader windows.
-- Election-correctness within a partition: at any point, exactly one node believes it is leader for a channel within any single partition. Cross-partition split-brain is explicitly NOT asserted (it's out-of-scope per [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak)); instead pin that on partition heal, the divergent appends are flagged via `dataforts_replication_skip_ahead_total`.
-- Witness-withdrawal timing: under the partition-heal-with-stale-leader scenario, the deposed leader's `causal:` tag is reaped within 1 heartbeat via the witness path (`dataforts_replication_witness_withdrawals_total` increments) — strictly faster than the disconnect-observer reaping path. Pin both paths fire and that the witness path is the first to clear the tag from at least one observer's view.
+- Divergence-freedom: no two replicas declare different `tail_seq` for the same `seq`.
+- Election determinism under asymmetric-RTT (RTT measurements diverge transiently but must not produce sustained dual-leader windows).
+- Election-correctness within a partition: at any point, exactly one node believes it is leader for a channel within any single partition. Cross-partition split-brain is explicitly NOT asserted ([Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak)); pin instead that partition-heal flags divergent appends via `dataforts_replication_skip_ahead_total`.
+- Witness-withdrawal timing under partition-heal-with-stale-leader.
 - Performance budget: replication overhead ≤ 30% of single-node append throughput at steady state.
+
+Treat the upper bound (3 weeks) as the planning target. Sized as a separate workstream because the harness extension is substantial and parallelizable with other v0.14+ work.
 
 ### Phase G — Disk pressure + `UnderCapacity` (3 days) ✅
 
@@ -521,13 +525,12 @@ This is the gating phase. Plan generously and treat regressions as test failures
 - ✅ **Operator status snapshot**: `Redex::replication_status_snapshot() -> Option<Vec<ReplicationChannelStatus>>` surfaces per-channel `{channel_name, role, tail_seq}` keyed by channel name, sorted for stable iteration. Pair with `replication_metrics_snapshot()` for the full observability view (status here + atomic counters there). The plan's original wording ("MeshDaemon::snapshot integration") assumed an aggregating daemon-level surface that doesn't exist; the equivalent operator value lives on `Redex` directly — every consumer that needs per-channel state already holds a `Redex`. Forward-looking: if a future daemon surface needs the same picture, it composes `Redex::replication_status_snapshot` with `Redex::replication_metrics_snapshot`.
 - ✅ **Operator docs**: [`CONFIG_REPLICATION.md`](../CONFIG_REPLICATION.md) — quick start, every `ReplicationConfig` field explained, lifecycle diagram, observability section pinning the seven Prometheus shapes, failure-mode triage table, limits + non-goals. Cross-linked from [`STORAGE_AND_CORTEX.md`](../STORAGE_AND_CORTEX.md) (the "RedEX files default to strictly local" caveat now points operators at the opt-in surface).
 
-### Phase I — Bindings (1 week, parallelisable) ⚠️ Node + Python landed; Go + C pending
+### Phase I — Bindings ✅ for Node + Python; Go + C deferred to a follow-up workstream
 
-- ✅ **Node binding**: `Redex.enableReplication(mesh)`, `Redex.replicationRuntimeCount()`, `ReplicationConfigJs` (all six tunables plus `pinnedNodes: bigint[]`), `RedexFileConfigJs.replication?: ReplicationConfigJs`. `placement` and `onUnderCapacity` ride as enum strings (`"standard" | "pinned" | "colocation-strict"`, `"withdraw" | "evict-oldest"`) to keep the JS surface one level deep. Validation surfaces typed `redex:` errors before reaching the core. Gated on the `net` feature (the cortex-only build omits `enableReplication` since `NetMesh` isn't compiled). `index.d.ts` regenerated via `napi build --features redis,net,cortex,compute,groups`.
-- ✅ **Python binding**: `Redex.enable_replication(mesh)` (gated on `feature = "net"`), `Redex.replication_runtime_count()`, plus seven `replication_*` kwargs on `Redex.open_file`: `replication: bool` opt-in, `replication_factor`, `replication_heartbeat_ms`, `replication_placement` (`"standard" | "pinned" | "colocation_strict"` — snake-case to match Python convention), `replication_pinned_nodes: List[int]`, `replication_leader_pinned: int`, `replication_on_under_capacity` (`"withdraw" | "evict_oldest"`), `replication_budget_fraction: float`. Validation surfaces `RedexError` before reaching the core.
-- 🔜 **Go binding**: same structural-change caveat — Go's Redex binding doesn't expose `open_file` config beyond `persistent`. Adding `replication` needs the FFI surface to grow.
-- 🔜 **C/FFI binding**: not investigated yet.
-- Mechanical once the structural-change shape is decided; remaining bindings parallelize to ~2 days each.
+- ✅ **Node binding**: `Redex.enableReplication(mesh)`, `Redex.replicationRuntimeCount()`, `Redex.replicationPrometheusText()`, `ReplicationConfigJs` (all six tunables plus `pinnedNodes: bigint[]`), `RedexFileConfigJs.replication?: ReplicationConfigJs`. `placement` and `onUnderCapacity` ride as enum strings (`"standard" | "pinned" | "colocation-strict"`, `"withdraw" | "evict-oldest"`) to keep the JS surface one level deep. Validation surfaces typed `redex:` errors before reaching the core. Gated on the `net` feature (the cortex-only build omits `enableReplication` since `NetMesh` isn't compiled). `index.d.ts` regenerated via `napi build --features redis,net,cortex,compute,groups`.
+- ✅ **Python binding**: `Redex.enable_replication(mesh)` (gated on `feature = "net"`), `Redex.replication_runtime_count()`, `Redex.replication_prometheus_text()`, plus seven `replication_*` kwargs on `Redex.open_file`: `replication: bool` opt-in, `replication_factor`, `replication_heartbeat_ms`, `replication_placement` (`"standard" | "pinned" | "colocation_strict"` — snake-case to match Python convention), `replication_pinned_nodes: List[int]`, `replication_leader_pinned: int`, `replication_on_under_capacity` (`"withdraw" | "evict_oldest"`), `replication_budget_fraction: float`. Validation surfaces `RedexError` before reaching the core.
+- 🔜 **Go binding** (separate workstream): Go's existing FFI surfaces (`compute-ffi`, `rpc-ffi`) target compute daemon + RPC, not Redex/NetDB. Adding replication requires building a new Redex C-ABI surface end-to-end (cdylib + cgo wrapper + error-propagation contract). Not mechanical serde; tracked as its own design phase. The plan's original "Mostly serde for ReplicationConfig across Node, Python, Go, C bindings. Mechanical" framing was accurate for Node + Python (those have existing Redex surfaces to extend) and inaccurate for Go + C (those need new FFI surfaces).
+- 🔜 **C/FFI binding** (separate workstream): no existing Redex C-ABI surface; same scope as Go.
 
 **Total: 4–9 focused weeks**. Lower bound assumes DST harness work fits in 1.5 weeks (existing harness extends cleanly; no new modeling primitives needed). Upper bound assumes DST work hits unforeseen complexity (3 weeks dedicated to harness + scenario depth). Treat the upper bound as the planning target.
 
