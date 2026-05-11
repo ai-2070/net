@@ -294,9 +294,82 @@ fn pyerr_to_backend(label: &str, err: PyErr) -> InnerBlobError {
     InnerBlobError::Backend(format!("{}: {}", label, err))
 }
 
-/// If `value` is an awaitable / coroutine, drive it via
-/// `asyncio.run` and return the resolved value; otherwise return
-/// it unchanged. Caller holds the GIL.
+/// A binding-owned asyncio loop, created lazily on the first
+/// `async def` adapter call and kept alive on a dedicated
+/// background thread. Coroutines from `PyBlobAdapter` are
+/// submitted to this loop via `asyncio.run_coroutine_threadsafe`,
+/// so every adapter coroutine sees the same loop across calls.
+///
+/// This avoids the `asyncio.run` per-call footgun: `asyncio.run`
+/// builds a fresh loop each invocation and any state the user's
+/// adapter shares with another loop (an open `aiohttp` session, a
+/// SQLAlchemy async engine, an `aiobotocore` client) explodes with
+/// "attached to a different loop" or hangs.
+///
+/// Users who want their adapter to run on their *application*
+/// event loop (e.g. to share state across the rest of their app)
+/// must submit it themselves via `run_coroutine_threadsafe`
+/// against their own loop. The binding-owned loop is the
+/// "no-config" fallback for adapters that don't share state.
+struct BindingAsyncLoop {
+    loop_obj: Py<PyAny>,
+}
+
+impl BindingAsyncLoop {
+    fn get_or_init(py: Python<'_>) -> std::result::Result<&'static Self, InnerBlobError> {
+        use std::sync::OnceLock;
+        static LOOP: OnceLock<BindingAsyncLoop> = OnceLock::new();
+        if let Some(l) = LOOP.get() {
+            return Ok(l);
+        }
+        let initialized = Self::build(py)?;
+        Ok(LOOP.get_or_init(|| initialized))
+    }
+
+    fn build(py: Python<'_>) -> std::result::Result<Self, InnerBlobError> {
+        let asyncio = py
+            .import("asyncio")
+            .map_err(|e| pyerr_to_backend("async-loop init", e))?;
+        let loop_obj = asyncio
+            .call_method0("new_event_loop")
+            .map_err(|e| pyerr_to_backend("async-loop init", e))?;
+        // Spawn a dedicated thread that pins the loop and runs it
+        // forever. The thread holds the GIL only while inside
+        // `loop.run_forever()` — Python yields the GIL on every
+        // tick, so other Rust threads can re-enter Python freely.
+        let threading = py
+            .import("threading")
+            .map_err(|e| pyerr_to_backend("async-loop init", e))?;
+        let run_forever = loop_obj
+            .getattr("run_forever")
+            .map_err(|e| pyerr_to_backend("async-loop init", e))?;
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs
+            .set_item("target", run_forever)
+            .map_err(|e| pyerr_to_backend("async-loop init", e))?;
+        kwargs
+            .set_item("daemon", true)
+            .map_err(|e| pyerr_to_backend("async-loop init", e))?;
+        let thread = threading
+            .call_method("Thread", (), Some(&kwargs))
+            .map_err(|e| pyerr_to_backend("async-loop init", e))?;
+        thread
+            .call_method0("start")
+            .map_err(|e| pyerr_to_backend("async-loop init", e))?;
+        Ok(Self {
+            loop_obj: loop_obj.unbind(),
+        })
+    }
+
+    fn loop_for<'py>(&'_ self, py: Python<'py>) -> Bound<'py, PyAny> {
+        self.loop_obj.bind(py).clone()
+    }
+}
+
+/// If `value` is an awaitable / coroutine, drive it on the
+/// binding-owned loop via `asyncio.run_coroutine_threadsafe` and
+/// return the resolved value; otherwise return it unchanged.
+/// Caller holds the GIL.
 fn drive_if_coroutine<'py>(
     py: Python<'py>,
     value: Bound<'py, PyAny>,
@@ -315,8 +388,19 @@ fn drive_if_coroutine<'py>(
     let asyncio = py
         .import("asyncio")
         .map_err(|e| pyerr_to_backend(label, e))?;
-    asyncio
-        .call_method1("run", (value,))
+    let binding_loop = BindingAsyncLoop::get_or_init(py)?;
+    let future = asyncio
+        .call_method1(
+            "run_coroutine_threadsafe",
+            (value, binding_loop.loop_for(py)),
+        )
+        .map_err(|e| pyerr_to_backend(label, e))?;
+    // `concurrent.futures.Future.result()` blocks until done; it
+    // releases the GIL internally while waiting on the underlying
+    // condition variable, so the binding-owned loop thread can
+    // run unhindered.
+    future
+        .call_method0("result")
         .map_err(|e| pyerr_to_backend(label, e))
 }
 
@@ -423,6 +507,17 @@ impl BlobAdapter for PyBlobAdapter {
 /// `exists(blob_ref) -> bool` methods. Each call is dispatched to
 /// the Python instance via `spawn_blocking` so the substrate's
 /// tokio runtime isn't blocked during Python execution.
+///
+/// Methods may be `async def`. When they are, the returned
+/// coroutine is driven on a binding-owned asyncio loop that runs
+/// on a dedicated background thread for the lifetime of the
+/// process. All adapter coroutines share that loop, so adapter
+/// state can be reused across calls (open `aiohttp` sessions,
+/// connection pools, etc.). Adapter code that needs to share
+/// state with the *application's* own asyncio loop must submit
+/// it through `asyncio.run_coroutine_threadsafe(coro, app_loop)`
+/// from inside the adapter method — the binding does not (and
+/// cannot) know about the application's loop.
 #[pyfunction]
 pub fn register_blob_adapter(adapter_id: String, instance: Py<PyAny>) -> PyResult<()> {
     let adapter: Arc<dyn BlobAdapter> = Arc::new(PyBlobAdapter::new(adapter_id.clone(), instance));
