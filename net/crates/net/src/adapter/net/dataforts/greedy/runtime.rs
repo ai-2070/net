@@ -96,13 +96,14 @@ pub fn synthesize_cache_channel_name(channel_hash: u16) -> ChannelName {
         .expect("hex-formatted name with reserved prefix is always valid")
 }
 
-/// 1 Gbps placeholder for the measured NIC peak. The replication
-/// runtime uses the same placeholder until the plan §6 proximity-
-/// graph throughput probe lands; reuse the same number here so the
-/// `replication_budget_fraction` and `bandwidth_budget_fraction`
-/// configurations share a denominator. Operators with > 1 Gbps
-/// links should set [`GreedyConfig::nic_peak_bytes_per_s`]
-/// explicitly until the measured-NIC-peak probe ships.
+// 1 Gbps placeholder for the measured NIC peak. The replication
+// runtime uses the same placeholder until the plan §6 proximity-
+// graph throughput probe lands; reuse the same number here so the
+// `replication_budget_fraction` and `bandwidth_budget_fraction`
+// configurations share a denominator. Operators with > 1 Gbps
+// links should set [`GreedyConfig::nic_peak_bytes_per_s`]
+// explicitly until the measured-NIC-peak probe ships.
+//
 // TODO(plan-§6): wire the measured-NIC-peak probe through here so
 // the explicit override becomes opt-out rather than opt-in.
 

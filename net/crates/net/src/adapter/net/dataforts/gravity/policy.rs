@@ -247,9 +247,9 @@ pub fn should_emit_heat(
             // functions must not rely on caller-side defenses) makes
             // `r / prev` explode toward +inf. Treat near-zero `prev`
             // as "no prior emission" so the bootstrap arm runs cleanly.
-            if !prev.is_finite() || !r.is_finite() || prev <= f64::EPSILON {
-                EmissionDecision::Emit { rate: r }
-            } else if (r / prev) >= ratio || (prev / r) >= ratio {
+            let bootstrap = !prev.is_finite() || !r.is_finite() || prev <= f64::EPSILON;
+            let crossed_threshold = !bootstrap && ((r / prev) >= ratio || (prev / r) >= ratio);
+            if bootstrap || crossed_threshold {
                 EmissionDecision::Emit { rate: r }
             } else {
                 EmissionDecision::Suppress

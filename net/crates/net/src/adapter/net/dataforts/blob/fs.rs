@@ -110,7 +110,7 @@ fn sanitize_uri_for_error(uri: &str) -> String {
         }
     }
     if uri.len() > MAX_LEN {
-        out.push_str("…");
+        out.push('…');
     }
     out
 }

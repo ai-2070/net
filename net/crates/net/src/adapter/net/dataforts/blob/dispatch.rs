@@ -74,7 +74,7 @@ pub async fn resolve_payload<A: BlobAdapter + ?Sized>(
             let accepted = adapter.accepted_schemes();
             if !accepted.is_empty() {
                 let scheme = uri_scheme(&blob.uri);
-                if !accepted.iter().any(|&s| s == scheme) {
+                if !accepted.contains(&scheme) {
                     return Err(BlobError::UnsupportedScheme(blob.uri.clone()));
                 }
             }
