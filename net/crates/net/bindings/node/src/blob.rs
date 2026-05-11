@@ -16,6 +16,12 @@
 //!   `Send + Future`, so the JS event loop drives resolution back
 //!   across the thread boundary.
 
+// napi-derive registers these items via a generated `extern "C"`
+// table the dead-code lint can't trace; `cargo clippy --tests`
+// otherwise flags every napi function / struct / TSFN type alias
+// as unused under the test profile.
+#![allow(dead_code)]
+
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -142,7 +142,7 @@ impl WriteToken {
     }
 
     #[napi(js_name = "toString")]
-    #[allow(clippy::inherent_to_string)]
+    #[allow(clippy::inherent_to_string, clippy::wrong_self_convention)]
     pub fn to_string(&self) -> String {
         self.inner.to_string()
     }
