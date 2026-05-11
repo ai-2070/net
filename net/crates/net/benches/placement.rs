@@ -54,7 +54,7 @@ fn make_index(count: usize) -> Arc<CapabilityIndex> {
     for i in 0..count {
         let caps = CapabilitySet::default()
             .add_tag("hardware.gpu")
-            .add_tag(format!("hardware.gpu.vram_mb={}", 16384 + i))
+            .add_tag(format!("hardware.gpu.vram_gb={}", 16 + i))
             .with_metadata("intent", "ml-training")
             .with_metadata("region", if i % 2 == 0 { "us-east" } else { "us-west" });
         let ad = CapabilityAnnouncement::new(0x1000 + i as u64, eid.clone(), 1, caps);

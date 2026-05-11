@@ -284,7 +284,7 @@ export type Predicate =
  *
  * const pred = p.and(
  *   p.exists({ axis: 'hardware', key: 'gpu' }),
- *   p.numericAtLeast({ axis: 'hardware', key: 'memory_mb' }, 65536),
+ *   p.numericAtLeast({ axis: 'hardware', key: 'memory_gb' }, 65536),
  *   p.metadataEquals('intent', 'ml-training'),
  * );
  * const wire = predicateToWire(pred);

@@ -1387,7 +1387,7 @@ fn bench_capabilities(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     // Simple capabilities
-    let simple = Capabilities::new().with_gpu(true).with_memory(16384);
+    let simple = Capabilities::new().with_gpu(true).with_memory(16);
 
     group.bench_function("serialize_simple", |b| {
         b.iter(|| simple.to_bytes());
@@ -1401,7 +1401,7 @@ fn bench_capabilities(c: &mut Criterion) {
     // Complex capabilities with tools and tags
     let complex = Capabilities::new()
         .with_gpu(true)
-        .with_memory(32768)
+        .with_memory(32)
         .with_model_slots(8)
         .with_tool("python")
         .with_tool("rust")
@@ -1961,16 +1961,16 @@ criterion_group!(
 
 /// Helper to create a sample capability set for benchmarking
 fn sample_capability_set(node_index: u64) -> CapabilitySet {
-    let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24576)
+    let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24)
         .with_compute_units(128)
         .with_tensor_cores(512)
         .with_fp16_tflops(82.5);
 
     let hardware = HardwareCapabilities::new()
         .with_cpu(16, 32)
-        .with_memory(65536 + (node_index as u32 % 64) * 1024)
+        .with_memory(64 + (node_index as u32 % 64))
         .with_gpu(gpu)
-        .with_storage(2_000_000)
+        .with_storage(2000)
         .with_network(10000);
 
     let software = SoftwareCapabilities::new()
@@ -2114,7 +2114,7 @@ fn bench_capability_filter(c: &mut Criterion) {
         b.iter(|| vendor_filter.matches(&caps));
     });
 
-    let memory_filter = CapabilityFilter::new().with_min_memory(32768);
+    let memory_filter = CapabilityFilter::new().with_min_memory(32);
     group.bench_function("match_min_memory", |b| {
         b.iter(|| memory_filter.matches(&caps));
     });
@@ -2124,8 +2124,8 @@ fn bench_capability_filter(c: &mut Criterion) {
         .require_tag("inference")
         .require_gpu()
         .with_gpu_vendor(GpuVendor::Nvidia)
-        .with_min_memory(32768)
-        .with_min_vram(16384)
+        .with_min_memory(32)
+        .with_min_vram(16)
         .require_modality(Modality::Text);
 
     group.bench_function("match_complex", |b| {
@@ -2205,7 +2205,7 @@ fn bench_capability_index_query(c: &mut Criterion) {
     });
 
     // Memory filter (requires full scan of candidates)
-    let memory_filter = CapabilityFilter::new().with_min_memory(80000);
+    let memory_filter = CapabilityFilter::new().with_min_memory(80);
     group.bench_function("query_min_memory", |b| {
         b.iter(|| index.query(&memory_filter));
     });
@@ -2214,7 +2214,7 @@ fn bench_capability_index_query(c: &mut Criterion) {
     let complex_filter = CapabilityFilter::new()
         .require_tag("inference")
         .require_gpu()
-        .with_min_memory(65536);
+        .with_min_memory(64);
     group.bench_function("query_complex", |b| {
         b.iter(|| index.query(&complex_filter));
     });
@@ -2303,7 +2303,7 @@ fn bench_capability_index_scaling(c: &mut Criterion) {
         let complex_filter = CapabilityFilter::new()
             .require_tag("inference")
             .require_gpu()
-            .with_min_memory(70000);
+            .with_min_memory(70);
 
         group.bench_with_input(
             BenchmarkId::new("query_complex", node_count),
@@ -2384,7 +2384,7 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
                                         0 => CapabilityFilter::new().require_tag("inference"),
                                         1 => CapabilityFilter::new().require_gpu(),
                                         2 => CapabilityFilter::new().require_tool("python_repl"),
-                                        _ => CapabilityFilter::new().with_min_memory(70000),
+                                        _ => CapabilityFilter::new().with_min_memory(70),
                                     };
                                     let _ = idx.query(&filter);
                                 }

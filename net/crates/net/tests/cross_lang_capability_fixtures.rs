@@ -857,7 +857,7 @@ fn predicate_eval_fixture_matches_via_placement_filter_callback() {
         // When kept, score is in (0.0, 1.0]. We don't pin Some(1.0)
         // strictly — the in-tree resource axis (always-on; default
         // config) may produce a sub-1.0 score for tags like
-        // `hardware.memory_mb=65536`. The boolean outcome (kept vs
+        // `hardware.memory_gb=64`. The boolean outcome (kept vs
         // vetoed) is what the cross-binding fixture pins; absolute
         // score values are an in-tree-axes concern that lives in
         // the placement.rs unit tests.

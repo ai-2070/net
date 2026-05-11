@@ -76,7 +76,7 @@ def test_validation_fixture(case: Dict[str, Any]) -> None:
 
 def test_axis_schema_hardware_keys_present() -> None:
     keys = [e.key for e in AXIS_SCHEMA.hardware.keys]
-    for required in ("cpu_cores", "memory_mb", "gpu", "gpu.vendor"):
+    for required in ("cpu_cores", "memory_gb", "gpu", "gpu.vendor"):
         assert required in keys
 
 
@@ -209,14 +209,14 @@ def test_number_value_rejects_negative() -> None:
     validator must mirror that decision so client-side checks
     don't pass a CapabilitySet the substrate would later reject.
     """
-    caps = {"tags": ["hardware.memory_mb=-1"], "metadata": {}}
+    caps = {"tags": ["hardware.memory_gb=-1"], "metadata": {}}
     report = validate_capabilities(caps)
     mismatch = [
         e
         for e in report.errors
         if e.to_wire()["kind"] == "type_mismatch"
         and e.to_wire()["axis"] == "hardware"
-        and e.to_wire()["key"] == "memory_mb"
+        and e.to_wire()["key"] == "memory_gb"
     ]
     assert len(mismatch) == 1
     assert mismatch[0].to_wire()["actual"] == "-1"
@@ -226,7 +226,7 @@ def test_number_value_accepts_unsigned() -> None:
     """Sanity check that the negative-rejection didn't break the
     happy path — unsigned u64 values still parse cleanly.
     """
-    caps = {"tags": ["hardware.memory_mb=65536"], "metadata": {}}
+    caps = {"tags": ["hardware.memory_gb=64"], "metadata": {}}
     report = validate_capabilities(caps)
     assert report.errors == ()
 
@@ -238,7 +238,7 @@ def test_number_value_rejects_unicode_digits() -> None:
     payloads the Rust parser rejected.
     """
     arabic_indic_one = "١"
-    caps = {"tags": [f"hardware.memory_mb={arabic_indic_one}"], "metadata": {}}
+    caps = {"tags": [f"hardware.memory_gb={arabic_indic_one}"], "metadata": {}}
     report = validate_capabilities(caps)
     mismatch = [
         e for e in report.errors if e.to_wire()["kind"] == "type_mismatch"
@@ -255,7 +255,7 @@ def test_number_value_accepts_plus_prefix() -> None:
     flagged a payload Rust would happily parse — the opposite
     divergence direction from the Unicode-digit case.
     """
-    caps = {"tags": ["hardware.memory_mb=+65536"], "metadata": {}}
+    caps = {"tags": ["hardware.memory_gb=+64"], "metadata": {}}
     report = validate_capabilities(caps)
     assert report.errors == ()
 
@@ -267,13 +267,13 @@ def test_number_value_rejects_above_u64_max() -> None:
     the Rust ``value.parse::<u64>()`` rejects.
     """
     above_max = str(0xFFFF_FFFF_FFFF_FFFF + 1)  # u64::MAX + 1
-    caps = {"tags": [f"hardware.memory_mb={above_max}"], "metadata": {}}
+    caps = {"tags": [f"hardware.memory_gb={above_max}"], "metadata": {}}
     report = validate_capabilities(caps)
     mismatch = [
         e
         for e in report.errors
         if e.to_wire()["kind"] == "type_mismatch"
-        and e.to_wire()["key"] == "memory_mb"
+        and e.to_wire()["key"] == "memory_gb"
     ]
     assert len(mismatch) == 1
     assert mismatch[0].to_wire()["actual"] == above_max
@@ -282,7 +282,7 @@ def test_number_value_rejects_above_u64_max() -> None:
 def test_number_value_accepts_u64_max() -> None:
     """Boundary check: u64::MAX itself is valid."""
     at_max = str(0xFFFF_FFFF_FFFF_FFFF)
-    caps = {"tags": [f"hardware.memory_mb={at_max}"], "metadata": {}}
+    caps = {"tags": [f"hardware.memory_gb={at_max}"], "metadata": {}}
     report = validate_capabilities(caps)
     assert report.errors == ()
 
@@ -299,7 +299,7 @@ def test_report_is_clean_helpers() -> None:
     errored = ValidationReport(
         errors=(
             SchemaErrorTypeMismatch(
-                axis="hardware", key="memory_mb", expected="number", actual="lots"
+                axis="hardware", key="memory_gb", expected="number", actual="lots"
             ),
         )
     )

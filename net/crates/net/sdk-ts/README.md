@@ -372,8 +372,8 @@ const mesh = await MeshNode.create({
 await mesh.announceCapabilities({
   hardware: {
     cpuCores: 16,
-    memoryMb: 65_536,
-    gpu: { vendor: 'nvidia', model: 'h100', vramMb: 81_920 },
+    memoryGb: 64,
+    gpu: { vendor: 'nvidia', model: 'h100', vramGb: 80 },
   },
   models: [
     { modelId: 'llama-3.1-70b', family: 'llama', contextLength: 128_000 },
@@ -469,7 +469,7 @@ caps = withMetadata(caps, 'intent', 'ml-training');
 // Author a predicate.
 const pred = p.and(
   p.exists({ axis: 'hardware', key: 'gpu' }),
-  p.numericAtLeast({ axis: 'hardware', key: 'memory_mb' }, 65536),
+  p.numericAtLeast({ axis: 'hardware', key: 'memory_gb' }, 65536),
   p.metadataEquals('intent', 'ml-training'),
 );
 

@@ -47,7 +47,7 @@ func TestRegisterChannel_AcceptsGPUFilterForSubscribe(t *testing.T) {
 		SubscribeCaps: &CapabilityFilter{
 			RequireGPU: true,
 			GPUVendor:  "nvidia",
-			MinVRAMMB:  16_000,
+			MinVRAMGB:  16,
 		},
 	})
 	if err != nil {

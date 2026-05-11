@@ -167,7 +167,7 @@ fn gpu_info_from_dict(d: &Bound<'_, PyDict>) -> PyResult<GpuInfo> {
         .map(parse_gpu_vendor)
         .unwrap_or(GpuVendor::Unknown);
     let model = get_opt_str(d, "model")?.unwrap_or_default();
-    let vram = get_opt_u32(d, "vram_mb")?.unwrap_or(0);
+    let vram = get_opt_u32(d, "vram_gb")?.unwrap_or(0);
     let mut info = GpuInfo::new(vendor, model, vram);
     if let Some(cu) = get_opt_u32(d, "compute_units")? {
         info = info.with_compute_units(saturating_u16(cu));
@@ -190,7 +190,7 @@ fn accelerator_from_dict(d: &Bound<'_, PyDict>) -> PyResult<AcceleratorInfo> {
     Ok(AcceleratorInfo {
         accel_type: parse_accelerator_type(&kind),
         model: get_opt_str(d, "model")?.unwrap_or_default(),
-        memory_mb: get_opt_u32(d, "memory_mb")?.unwrap_or(0),
+        memory_gb: get_opt_u32(d, "memory_gb")?.unwrap_or(0),
         tops_x10: get_opt_u32(d, "tops_x10")?.map(saturating_u16).unwrap_or(0),
     })
 }
@@ -205,7 +205,7 @@ fn hardware_from_dict(d: &Bound<'_, PyDict>) -> PyResult<HardwareCapabilities> {
         let c16 = saturating_u16(c);
         hw = hw.with_cpu(c16, c16);
     }
-    if let Some(mb) = get_opt_u32(d, "memory_mb")? {
+    if let Some(mb) = get_opt_u32(d, "memory_gb")? {
         hw = hw.with_memory(mb);
     }
     if let Some(gpu_dict) = get_opt_dict(d, "gpu")? {
@@ -219,7 +219,7 @@ fn hardware_from_dict(d: &Bound<'_, PyDict>) -> PyResult<HardwareCapabilities> {
             hw = hw.add_gpu(gpu_info_from_dict(&sub)?);
         }
     }
-    if let Some(mb) = get_opt_u64(d, "storage_mb")? {
+    if let Some(mb) = get_opt_u64(d, "storage_gb")? {
         hw = hw.with_storage(mb);
     }
     if let Some(mbps) = get_opt_u32(d, "network_mbps")? {
@@ -382,7 +382,7 @@ pub fn capability_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<CapabilityFi
     for t in get_opt_str_list(d, "require_tools")? {
         cf = cf.require_tool(t);
     }
-    if let Some(mb) = get_opt_u32(d, "min_memory_mb")? {
+    if let Some(mb) = get_opt_u32(d, "min_memory_gb")? {
         cf = cf.with_min_memory(mb);
     }
     if get_opt_bool(d, "require_gpu")?.unwrap_or(false) {
@@ -391,7 +391,7 @@ pub fn capability_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<CapabilityFi
     if let Some(v) = get_opt_str(d, "gpu_vendor")? {
         cf = cf.with_gpu_vendor(parse_gpu_vendor(&v));
     }
-    if let Some(mb) = get_opt_u32(d, "min_vram_mb")? {
+    if let Some(mb) = get_opt_u32(d, "min_vram_gb")? {
         cf = cf.with_min_vram(mb);
     }
     if let Some(n) = get_opt_u32(d, "min_context_length")? {

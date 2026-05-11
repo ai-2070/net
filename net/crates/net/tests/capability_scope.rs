@@ -238,9 +238,8 @@ async fn find_best_node_scoped_picks_higher_scoring_within_tenant() {
     handshake(&d, &b).await;
 
     let hw_24gb =
-        HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24_576));
-    let hw_80gb =
-        HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "H100", 81_920));
+        HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24));
+    let hw_80gb = HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "H100", 80));
 
     a.announce_capabilities(
         CapabilitySet::new()

@@ -644,8 +644,8 @@ query the local capability index with a filter.
 mesh.AnnounceCapabilities(net.CapabilitySet{
     Hardware: &net.HardwareCaps{
         CPUCores: 16,
-        MemoryMB: 65536,
-        GPU: &net.GPUInfo{Vendor: "nvidia", Model: "h100", VRAMMB: 81920},
+        MemoryGB: 64,
+        GPU: &net.GPUInfo{Vendor: "nvidia", Model: "h100", VRAMGB: 80},
     },
     Models: []net.ModelCaps{{
         ModelID: "llama-3.1-70b", Family: "llama", ContextLength: 128_000,
@@ -656,7 +656,7 @@ mesh.AnnounceCapabilities(net.CapabilitySet{
 gpuNodes, _ := mesh.FindNodes(net.CapabilityFilter{
     RequireGPU: true,
     GPUVendor:  "nvidia",
-    MinVRAMMB:  40_000,
+    MinVRAMGB:  40,
 })
 ```
 
@@ -701,7 +701,7 @@ memory / VRAM / faster inference / pre-loaded models.
 req := net.CapabilityRequirement{
     Filter: net.CapabilityFilter{
         RequireGPU: true,
-        MinVRAMMB:  40_000,
+        MinVRAMGB:  40,
     },
     PreferMoreVRAM:        1.0,
     PreferFasterInference: 0.5,
@@ -791,7 +791,7 @@ Publishers set `PublishCaps` / `SubscribeCaps` / `RequireToken` on
 ```go
 mesh.RegisterChannel(net.ChannelConfig{
     Name:          "gpu/jobs",
-    SubscribeCaps: &net.CapabilityFilter{RequireGPU: true, MinVRAMMB: 16_000},
+    SubscribeCaps: &net.CapabilityFilter{RequireGPU: true, MinVRAMGB: 16},
     RequireToken:  true,
 })
 

@@ -468,7 +468,7 @@ mod tests {
         let gpu = GpuInfo {
             vendor: GpuVendor::Nvidia,
             model: "test".into(),
-            vram_mb: 8192,
+            vram_gb: 8,
             compute_units: 0,
             tensor_cores: 0,
             fp16_tflops_x10: 0,

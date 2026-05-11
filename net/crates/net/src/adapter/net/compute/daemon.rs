@@ -246,7 +246,7 @@ mod tests {
             CapabilitySet::new().add_tag("hardware.gpu")
         }
         fn optional_capabilities(&self) -> CapabilitySet {
-            CapabilitySet::new().add_tag("hardware.gpu.vram_mb=81920")
+            CapabilitySet::new().add_tag("hardware.gpu.vram_gb=80")
         }
         fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
             Ok(Vec::new())
@@ -287,7 +287,7 @@ mod tests {
         assert!(opt
             .tags
             .iter()
-            .any(|t| t.to_string() == "hardware.gpu.vram_mb=81920"));
+            .any(|t| t.to_string() == "hardware.gpu.vram_gb=80"));
     }
 
     /// The new methods plug into `PlacementFilter` via the

@@ -66,11 +66,11 @@ def test_hardware_and_gpu_filter_matches() -> None:
             {
                 "hardware": {
                     "cpu_cores": 16,
-                    "memory_mb": 65536,
+                    "memory_gb": 64,
                     "gpu": {
                         "vendor": "nvidia",
                         "model": "h100",
-                        "vram_mb": 81920,
+                        "vram_gb": 80,
                     },
                 },
                 "tags": ["gpu"],
@@ -80,14 +80,14 @@ def test_hardware_and_gpu_filter_matches() -> None:
             {
                 "require_gpu": True,
                 "gpu_vendor": "nvidia",
-                "min_vram_mb": 40000,
-                "min_memory_mb": 32768,
+                "min_vram_gb": 40,
+                "min_memory_gb": 32,
             }
         )
         assert m.node_id in peers
 
         # Too-strict VRAM requirement should reject.
-        peers_strict = m.find_nodes({"min_vram_mb": 200_000})
+        peers_strict = m.find_nodes({"min_vram_gb": 200})
         assert peers_strict == []
     finally:
         m.shutdown()

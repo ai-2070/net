@@ -87,8 +87,8 @@ describe('MeshNode capabilities', () => {
     await a.announceCapabilities({
       hardware: {
         cpuCores: 16,
-        memoryMb: 65_536,
-        gpu: { vendor: 'nvidia', model: 'RTX 4090', vramMb: 24_576 },
+        memoryGb: 64,
+        gpu: { vendor: 'nvidia', model: 'RTX 4090', vramGb: 24 },
       },
       tags: ['gpu', 'inference'],
     });
@@ -127,14 +127,14 @@ describe('MeshNode capabilities', () => {
       hardware: {
         cpuCores: 32,
         cpuThreads: 64,
-        memoryMb: 131_072,
+        memoryGb: 128,
         gpu: {
           vendor: 'nvidia',
           model: 'H100',
-          vramMb: 81_920,
+          vramGb: 80,
           computeUnits: 132,
         },
-        storageMb: 4_000_000n,
+        storageGb: 4000n,
       },
       software: {
         os: 'linux',

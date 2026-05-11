@@ -58,12 +58,12 @@ int main(void) {
      * 1. Validate a CapabilitySet against the canonical
      *    AXIS_SCHEMA. Non-canonical axes (e.g. "compute.gpu"
      *    typo) surface as legacy-tag warnings, not errors;
-     *    type mismatches (e.g. "memory_mb=lots") fire as
+     *    type mismatches (e.g. "memory_gb=lots") fire as
      *    type_mismatch errors.
      * ===================================================== */
     {
         const char* caps =
-            "{\"tags\": [\"hardware.gpu\", \"hardware.memory_mb=lots\","
+            "{\"tags\": [\"hardware.gpu\", \"hardware.memory_gb=lots\","
             " \"compute.gpu\"], \"metadata\": {\"region\": \"us-east\"}}";
         char* report = NULL;
         size_t report_len = 0;

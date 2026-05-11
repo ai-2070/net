@@ -216,8 +216,8 @@ impl ScopeLabel {
 pub enum ResourceAxis {
     /// `dataforts.free_storage_gb` — chain / replica artifacts.
     Storage,
-    /// `hardware.cpu_cores` / `hardware.memory_mb` /
-    /// `hardware.gpu.vram_mb` — daemon artifacts.
+    /// `hardware.cpu_cores` / `hardware.memory_gb` /
+    /// `hardware.gpu.vram_gb` — daemon artifacts.
     Compute,
     /// Weighted average of `Storage` + `Compute` — replicated daemons.
     Both,
@@ -797,8 +797,8 @@ impl<'a> StandardPlacement<'a> {
     ///
     /// - `Compute` — averages per-component scores for
     ///   `hardware.cpu_cores` (reference 8 cores),
-    ///   `hardware.memory_mb` (reference 16 GB),
-    ///   `hardware.gpu.vram_mb` (reference 16 GB VRAM). Components
+    ///   `hardware.memory_gb` (reference 16 GB),
+    ///   `hardware.gpu.vram_gb` (reference 16 GB VRAM). Components
     ///   that the target doesn't advertise are skipped, and the
     ///   average is over the components that DO have data.
     /// - `Storage` — single-component score from
@@ -1037,14 +1037,14 @@ fn score_compute_axis(caps: &CapabilitySet) -> f32 {
         sum += saturating_score(c as f32, 8.0);
         count += 1;
     }
-    if let Some(m) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "memory_mb") {
+    if let Some(m) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "memory_gb") {
         // Reference: 16 GB.
-        sum += saturating_score(m as f32, 16_384.0);
+        sum += saturating_score(m as f32, 16.0);
         count += 1;
     }
-    if let Some(v) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "gpu.vram_mb") {
+    if let Some(v) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "gpu.vram_gb") {
         // Reference: 16 GB VRAM.
-        sum += saturating_score(v as f32, 16_384.0);
+        sum += saturating_score(v as f32, 16.0);
         count += 1;
     }
     if count == 0 {
@@ -1077,12 +1077,12 @@ fn score_compute_axis_with_data(caps: &CapabilitySet) -> Option<f32> {
         sum += saturating_score(c as f32, 8.0);
         count += 1;
     }
-    if let Some(m) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "memory_mb") {
-        sum += saturating_score(m as f32, 16_384.0);
+    if let Some(m) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "memory_gb") {
+        sum += saturating_score(m as f32, 16.0);
         count += 1;
     }
-    if let Some(v) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "gpu.vram_mb") {
-        sum += saturating_score(v as f32, 16_384.0);
+    if let Some(v) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "gpu.vram_gb") {
+        sum += saturating_score(v as f32, 16.0);
         count += 1;
     }
     if count == 0 {
@@ -1179,7 +1179,7 @@ impl IntentRegistry {
     ///
     /// Defaults:
     ///
-    /// - `ml-training` — `hardware.gpu` present + `hardware.gpu.vram_mb >= 24576`.
+    /// - `ml-training` — `hardware.gpu` present + `hardware.gpu.vram_gb >= 24`.
     /// - `inference` — `hardware.gpu` present + any `software.model.*` tag
     ///   (axis-key match — version / quantization independent).
     /// - `cpu-bound` — `hardware.cpu_cores >= 4`.
@@ -1196,8 +1196,8 @@ impl IntentRegistry {
                     key: "gpu".to_string(),
                 }),
                 RequiredCapability::Predicate(Predicate::numeric_at_least(
-                    TagKey::new(TaxonomyAxis::Hardware, "gpu.vram_mb"),
-                    24_576.0,
+                    TagKey::new(TaxonomyAxis::Hardware, "gpu.vram_gb"),
+                    24.0,
                 )),
             ],
         );
@@ -1333,7 +1333,7 @@ pub struct TieBreakContext<'a> {
     /// with their proximity-graph bridge; `None` skips step 1.
     pub rtt_lookup: Option<&'a dyn RttLookup>,
     /// Capability index for the free-resource step (slice 5 reads
-    /// `hardware.memory_mb` / `dataforts.free_storage_gb` etc.
+    /// `hardware.memory_gb` / `dataforts.free_storage_gb` etc.
     /// off the indexed caps).
     pub index: &'a CapabilityIndex,
     /// Which resource pool the free-resource step scores. Mirrors
@@ -1759,7 +1759,7 @@ mod tests {
         // Candidate A: GPU + 32 GB VRAM — satisfies all.
         let satisfying_caps = empty_caps()
             .add_tag("hardware.gpu")
-            .add_tag("hardware.gpu.vram_mb=32768");
+            .add_tag("hardware.gpu.vram_gb=32");
         let tags_a: Vec<Tag> = satisfying_caps.tags.iter().cloned().collect();
         let meta_a = satisfying_caps.metadata.clone();
         let ctx_a = EvalContext::new(&tags_a, &meta_a);
@@ -2035,7 +2035,7 @@ mod tests {
         // Target with GPU + 32 GB VRAM satisfies ml-training.
         let target_caps = empty_caps()
             .add_tag("hardware.gpu")
-            .add_tag("hardware.gpu.vram_mb=32768");
+            .add_tag("hardware.gpu.vram_gb=32");
         let score = placement.score_intent_axis(&target_caps, &artifact);
         assert_eq!(score, 1.0);
     }
@@ -2056,10 +2056,10 @@ mod tests {
             .with_intent_registry(IntentRegistry::defaults());
 
         // Target with GPU but only 8 GB VRAM — fails the
-        // `gpu.vram_mb >= 24576` requirement.
+        // `gpu.vram_gb >= 24` requirement.
         let target_caps = empty_caps()
             .add_tag("hardware.gpu")
-            .add_tag("hardware.gpu.vram_mb=8192");
+            .add_tag("hardware.gpu.vram_gb=8");
         let score = placement.score_intent_axis(&target_caps, &artifact);
         assert_eq!(score, 0.0);
     }
@@ -2083,7 +2083,7 @@ mod tests {
         // Default empty registry.
         let target_caps = empty_caps()
             .add_tag("hardware.gpu")
-            .add_tag("hardware.gpu.vram_mb=32768");
+            .add_tag("hardware.gpu.vram_gb=32");
         let score = placement.score_intent_axis(&target_caps, &artifact);
         assert_eq!(
             score, 1.0,
@@ -2108,7 +2108,7 @@ mod tests {
         // GPU requirement, though inference also needs a software.model.* tag).
         let target_caps = empty_caps()
             .add_tag("hardware.gpu")
-            .add_tag("hardware.gpu.vram_mb=32768");
+            .add_tag("hardware.gpu.vram_gb=32");
         let score = placement.score_intent_axis(&target_caps, &artifact);
         assert_eq!(score, 1.0, "ml-training reqs satisfy → axis passes");
     }
@@ -2623,12 +2623,12 @@ mod tests {
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
 
-        // All three: cpu_cores=8 (→ 0.5), memory_mb=16384 (→ 0.5),
-        // vram_mb=16384 (→ 0.5). Average: 0.5.
+        // All three: cpu_cores=8 (→ 0.5), memory_gb=16 (→ 0.5),
+        // vram_gb=16 (→ 0.5). Average: 0.5.
         let three_components = empty_caps()
             .add_tag("hardware.cpu_cores=8")
-            .add_tag("hardware.memory_mb=16384")
-            .add_tag("hardware.gpu.vram_mb=16384");
+            .add_tag("hardware.memory_gb=16")
+            .add_tag("hardware.gpu.vram_gb=16");
         let s_three = placement.score_resource_axis(&three_components, &artifact);
         assert!(
             (s_three - 0.5).abs() < 1e-6,

@@ -658,7 +658,7 @@ caps = with_metadata(caps, "intent", "ml-training")
 # Author a predicate.
 pred = p.and_(
     p.exists(tag_key("hardware", "gpu")),
-    p.numeric_at_least(tag_key("hardware", "memory_mb"), 65536),
+    p.numeric_at_least(tag_key("hardware", "memory_gb"), 64),
     p.metadata_equals("intent", "ml-training"),
 )
 

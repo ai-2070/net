@@ -331,10 +331,10 @@ export interface MeshDaemon {
    *   name: 'inference',
    *   process: (ev) => doWork(ev.payload),
    *   requiredCapabilities: {
-   *     tags: ['hardware.gpu', 'hardware.gpu.vram_mb=24576'],
+   *     tags: ['hardware.gpu', 'hardware.gpu.vram_gb=24'],
    *   },
    *   optionalCapabilities: {
-   *     tags: ['hardware.gpu.vram_mb=81920'],
+   *     tags: ['hardware.gpu.vram_gb=80'],
    *   },
    * }));
    * ```

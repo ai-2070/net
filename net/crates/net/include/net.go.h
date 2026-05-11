@@ -716,9 +716,9 @@ int      net_channel_hash(const char* channel, uint16_t* out_hash);
  *
  * `filter_json`:
  *   { "require_tags": [...], "require_models": [...],
- *     "require_tools": [...], "min_memory_mb": N,
+ *     "require_tools": [...], "min_memory_gb": N,
  *     "require_gpu": bool, "gpu_vendor": "nvidia",
- *     "min_vram_mb": N, "min_context_length": N,
+ *     "min_vram_gb": N, "min_context_length": N,
  *     "require_modalities": [...] }
  * ========================================================================= */
 int      net_mesh_announce_capabilities(net_meshnode_t* handle,

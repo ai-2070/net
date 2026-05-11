@@ -34,8 +34,8 @@
         "nodes": [
           {
             "kind": "numeric_at_least",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "threshold": 65536.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "threshold": 64.0
           }
         ],
         "root_idx": 0
@@ -62,9 +62,9 @@
         "nodes": [
           {
             "kind": "numeric_in_range",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "min": 32768.0,
-            "max": 131072.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "min": 32.0,
+            "max": 128.0
           }
         ],
         "root_idx": 0
@@ -247,8 +247,8 @@
           { "kind": "exists", "key": { "axis": "hardware", "key": "gpu" } },
           {
             "kind": "numeric_at_least",
-            "key": { "axis": "hardware", "key": "memory_mb" },
-            "threshold": 65536.0
+            "key": { "axis": "hardware", "key": "memory_gb" },
+            "threshold": 64.0
           },
           { "kind": "metadata_exists", "key": "intent" },
           { "kind": "and", "children": [1, 2] },

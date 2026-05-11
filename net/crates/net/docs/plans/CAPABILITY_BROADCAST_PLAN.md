@@ -312,10 +312,10 @@ pub struct CapabilityFilterJs {
     pub require_tags: Vec<String>,
     pub require_models: Vec<String>,
     pub require_tools: Vec<String>,
-    pub min_memory_mb: Option<u32>,
+    pub min_memory_gb: Option<u32>,
     pub require_gpu: bool,
     pub gpu_vendor: Option<String>,    // "nvidia" | "amd" | "intel" | "apple" | "qualcomm"
-    pub min_vram_mb: Option<u32>,
+    pub min_vram_gb: Option<u32>,
     pub min_context_length: Option<u32>,
 }
 

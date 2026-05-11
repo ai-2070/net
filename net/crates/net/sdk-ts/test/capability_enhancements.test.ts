@@ -327,7 +327,7 @@ describe('p.* fluent predicate builder', () => {
       p.or(
         p.exists(tagKey('hardware', 'gpu')),
         p.and(
-          p.numericAtLeast(tagKey('hardware', 'memory_mb'), 65536),
+          p.numericAtLeast(tagKey('hardware', 'memory_gb'), 65536),
           p.metadataExists('intent'),
         ),
       ),

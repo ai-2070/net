@@ -131,8 +131,8 @@ pub struct Capabilities {
     pub gpu: bool,
     /// Available tools/functions
     pub tools: Vec<String>,
-    /// Available memory in MB
-    pub memory_mb: u32,
+    /// Available memory in GB
+    pub memory_gb: u32,
     /// Number of model slots available
     pub model_slots: u8,
     /// Custom tags
@@ -158,8 +158,8 @@ impl Capabilities {
     }
 
     /// Set memory
-    pub fn with_memory(mut self, memory_mb: u32) -> Self {
-        self.memory_mb = memory_mb;
+    pub fn with_memory(mut self, memory_gb: u32) -> Self {
+        self.memory_gb = memory_gb;
         self
     }
 
@@ -194,7 +194,7 @@ impl Capabilities {
         buf.push(flags);
 
         // Memory (4 bytes)
-        buf.extend_from_slice(&self.memory_mb.to_le_bytes());
+        buf.extend_from_slice(&self.memory_gb.to_le_bytes());
 
         // Model slots (1 byte)
         buf.push(self.model_slots);
@@ -231,7 +231,7 @@ impl Capabilities {
         let flags = buf[0];
         let gpu = (flags & 0x01) != 0;
 
-        let memory_mb = u32::from_le_bytes(buf[1..5].try_into().ok()?);
+        let memory_gb = u32::from_le_bytes(buf[1..5].try_into().ok()?);
         let model_slots = buf[5];
         let tool_count = buf[6] as usize;
 
@@ -276,7 +276,7 @@ impl Capabilities {
         Some(Self {
             gpu,
             tools,
-            memory_mb,
+            memory_gb,
             model_slots,
             tags,
         })
@@ -889,7 +889,7 @@ mod tests {
     fn test_capabilities_roundtrip() {
         let caps = Capabilities::new()
             .with_gpu(true)
-            .with_memory(16384)
+            .with_memory(16)
             .with_model_slots(4)
             .with_tool("python")
             .with_tool("rust")
@@ -900,7 +900,7 @@ mod tests {
         let parsed = Capabilities::from_bytes(&bytes).unwrap();
 
         assert_eq!(caps.gpu, parsed.gpu);
-        assert_eq!(caps.memory_mb, parsed.memory_mb);
+        assert_eq!(caps.memory_gb, parsed.memory_gb);
         assert_eq!(caps.model_slots, parsed.model_slots);
         assert_eq!(caps.tools, parsed.tools);
         assert_eq!(caps.tags, parsed.tags);

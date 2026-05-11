@@ -16,12 +16,12 @@
 //! // Declare: "this node has one RTX 4090 + 64 GB RAM, tagged `prod`".
 //! let hw = HardwareCapabilities::new()
 //!     .with_cpu(16, 32)
-//!     .with_memory(65_536)
-//!     .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24_576));
+//!     .with_memory(64)
+//!     .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24));
 //! let caps = CapabilitySet::new().with_hardware(hw).add_tag("prod");
 //!
 //! // Match-ability: does this node satisfy "needs GPU ≥ 16 GB VRAM"?
-//! let filter = CapabilityFilter::new().require_gpu().with_min_vram(16_384);
+//! let filter = CapabilityFilter::new().require_gpu().with_min_vram(16);
 //! assert!(filter.matches(&caps));
 //! ```
 //!
@@ -71,12 +71,12 @@
 //! use net_sdk::capabilities::{CapabilitySet, HardwareCapabilities};
 //!
 //! let caps = CapabilitySet::new()
-//!     .with_hardware(HardwareCapabilities::new().with_memory(65_536))
+//!     .with_hardware(HardwareCapabilities::new().with_memory(64))
 //!     .with_metadata("intent", "ml-training");
 //!
 //! let v = caps.views();
-//! assert_eq!(v.hardware().memory_mb, 65_536);  // first call: decodes hardware tags
-//! assert_eq!(v.hardware().memory_mb, 65_536);  // cached; pointer load only
+//! assert_eq!(v.hardware().memory_gb, 64);  // first call: decodes hardware tags
+//! assert_eq!(v.hardware().memory_gb, 64);  // cached; pointer load only
 //! ```
 //!
 //! Mutations to `caps` invalidate the handle (compiler-enforced via
@@ -252,7 +252,7 @@ pub use net::{require, require_axis, require_axis_value};
 ///         key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
 ///     },
 ///     Predicate::NumericAtLeast {
-///         key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+///         key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
 ///         threshold: 32_768.0,
 ///     },
 ///     Predicate::MetadataEquals {
@@ -275,7 +275,7 @@ pub use net::{require, require_axis, require_axis_value};
 /// let _ctx = EvalContext::new(&tags, &metadata);
 /// // pred.evaluate(&_ctx) → false: an `And` is true only when ALL
 /// // clauses are true. The candidate has gpu and intent=ml-training,
-/// // but no `hardware.memory_mb` tag, so the NumericAtLeast clause
+/// // but no `hardware.memory_gb` tag, so the NumericAtLeast clause
 /// // fails and short-circuits the And to false.
 /// ```
 pub mod predicate {
@@ -296,7 +296,7 @@ pub mod predicate {
     /// use net_sdk::capabilities::pred;
     /// let p = pred!(and [
     ///     pred!(exists "hardware.gpu"),
-    ///     pred!(num_at_least "hardware.memory_mb", 65536.0),
+    ///     pred!(num_at_least "hardware.memory_gb", 64.0),
     ///     pred!(metadata_equals "intent", "ml-training"),
     /// ]);
     /// # let _ = p;

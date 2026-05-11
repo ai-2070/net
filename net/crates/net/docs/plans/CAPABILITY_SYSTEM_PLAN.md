@@ -69,7 +69,7 @@ The four axes:
 
 - **Wire format propagates only `tags` + `metadata`.** The typed structs leave the `CapabilitySet` struct entirely; they are not serialized, not stored on the type, not relayed across the substrate.
 - **Each binding keeps its typed struct as a *view*.** The struct is reconstructed from the tag set via `From<&CapabilitySet>` lookup helpers — the same pattern Kubernetes uses for typed constraint helpers over labels.
-- **Bindings expose the helpers, not the storage.** Code that today reads `caps.hardware.gpu.vram_mb` reads it through `HardwareCapabilities::from(&caps).gpu.vram_mb` after Warriors. The taxonomy guarantees the round-trip: every typed-struct field maps to a deterministic axis-prefixed tag (`hardware.gpu.vram_gb=<n>`, etc.); the helper enumerates the tag set and rebuilds the struct.
+- **Bindings expose the helpers, not the storage.** Code that today reads `caps.hardware.gpu.vram_gb` reads it through `HardwareCapabilities::from(&caps).gpu.vram_gb` after Warriors. The taxonomy guarantees the round-trip: every typed-struct field maps to a deterministic axis-prefixed tag (`hardware.gpu.vram_gb=<n>`, etc.); the helper enumerates the tag set and rebuilds the struct.
 
 Concretely:
 

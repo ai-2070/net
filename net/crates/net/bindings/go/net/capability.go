@@ -304,7 +304,7 @@ const (
 //
 //	pred := net.Pred.And(
 //	    net.Pred.Exists(net.MustTagKey(net.AxisHardware, "gpu")),
-//	    net.Pred.NumericAtLeast(net.MustTagKey(net.AxisHardware, "memory_mb"), 65536),
+//	    net.Pred.NumericAtLeast(net.MustTagKey(net.AxisHardware, "memory_gb"), 64),
 //	    net.Pred.MetadataEquals("intent", "ml-training"),
 //	)
 var Pred = predBuilder{}

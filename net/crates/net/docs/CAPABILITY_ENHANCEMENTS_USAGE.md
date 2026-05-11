@@ -30,13 +30,13 @@ Phase 1 of the enhancement plan made `caps.views()` a borrowing handle with `Onc
 let caps = CapabilitySet::new()
     .with_hardware(
         HardwareCapabilities::new()
-            .with_memory(65536)
-            .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)),
+            .with_memory(64)
+            .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 80)),
     )
     .with_metadata("intent", "ml-training");
 
 let v = caps.views();
-let mem = v.hardware().memory_mb;        // first call: decodes hardware tags
+let mem = v.hardware().memory_gb;        // first call: decodes hardware tags
 let gpu = v.hardware().gpu.is_some();    // cached; pointer load only
 let model_count = v.models().len();      // first call: decodes model.* tags
 ```
@@ -102,7 +102,7 @@ Phase 2. Canonical schema lives at [`CAPABILITIES_SCHEMA.md`](CAPABILITIES_SCHEM
 use net::adapter::net::behavior::{validate_capabilities, ValidationReport};
 
 let caps = CapabilitySet::new()
-    .with_hardware(HardwareCapabilities::new().with_memory(65536))
+    .with_hardware(HardwareCapabilities::new().with_memory(64))
     .with_metadata("intent", "ml-training")
     .add_tag("hardware.future_field=42")     // unknown key: forward-compat warning
     .add_tag("nat:full-cone");                 // legacy: warning
@@ -159,7 +159,7 @@ Phase A foundation; Phase 4/6 of the enhancement plan add the planner and debug 
 ```rust
 let pred = pred!(
     exists "hardware.gpu"
-    && "hardware.memory_mb" >= 65536
+    && "hardware.memory_gb" >= 64
     && metadata "intent" == "ml-training"
 );
 ```
@@ -172,8 +172,8 @@ let pred = Predicate::And(vec![
         key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
     },
     Predicate::NumericAtLeast {
-        key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-        threshold: 65536.0,
+        key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+        threshold: 64.0,
     },
     Predicate::MetadataEquals {
         key: "intent".into(),
@@ -231,7 +231,7 @@ Direct cardinality lookups are also exposed:
 ```rust
 let intent_cardinality = index.metadata_value_cardinality("intent");
 let memory_cardinality = index.axis_cardinality(
-    &TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
+    &TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
 );
 ```
 
@@ -255,7 +255,7 @@ println!("{}", report.render());
 //   And(3 clauses)                                           evaluated  1042, matched    12 ( 1.2%)
 //   Exists(hardware.gpu)                                      evaluated  1042, matched   312 (29.9%)
 //   MetadataEquals(intent=ml-training)                        evaluated   312, matched    12 ( 3.8%)
-//   NumericAtLeast(hardware.memory_mb >= 65536)               evaluated  1042, matched   441 (42.3%)
+//   NumericAtLeast(hardware.memory_gb >= 64)               evaluated  1042, matched   441 (42.3%)
 ```
 
 The aggregator is `BTreeMap`-ordered (deterministic across runs). Each clause's `evaluated` count reflects how many candidates actually reached it — short-circuited candidates aren't included, so an operator can see at a glance "the And cut traffic to 312 by clause 1, then to 12 by clause 2".
@@ -315,8 +315,8 @@ Phase 5.B. Predicates ride as a JSON-encoded `PredicateWire` in the canonical `n
 let pred = Predicate::And(vec![
     Predicate::Exists { key: TagKey::new(TaxonomyAxis::Hardware, "gpu") },
     Predicate::NumericAtLeast {
-        key: TagKey::new(TaxonomyAxis::Hardware, "memory_mb"),
-        threshold: 32768.0,
+        key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
+        threshold: 32.0,
     },
 ]);
 

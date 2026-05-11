@@ -2643,11 +2643,11 @@ struct CapabilitySetJson {
 struct HardwareJson {
     cpu_cores: Option<u32>,
     cpu_threads: Option<u32>,
-    memory_mb: Option<u32>,
+    memory_gb: Option<u32>,
     gpu: Option<GpuJson>,
     #[serde(default)]
     additional_gpus: Vec<GpuJson>,
-    storage_mb: Option<u64>,
+    storage_gb: Option<u64>,
     network_mbps: Option<u32>,
     #[serde(default)]
     accelerators: Vec<AcceleratorJson>,
@@ -2659,7 +2659,7 @@ struct GpuJson {
     #[serde(default)]
     model: String,
     #[serde(default)]
-    vram_mb: u32,
+    vram_gb: u32,
     compute_units: Option<u32>,
     tensor_cores: Option<u32>,
     fp16_tflops_x10: Option<u32>,
@@ -2671,7 +2671,7 @@ struct AcceleratorJson {
     kind: String,
     #[serde(default)]
     model: String,
-    memory_mb: Option<u32>,
+    memory_gb: Option<u32>,
     tops_x10: Option<u32>,
 }
 
@@ -2736,10 +2736,10 @@ struct CapabilityFilterJson {
     require_models: Vec<String>,
     #[serde(default)]
     require_tools: Vec<String>,
-    min_memory_mb: Option<u32>,
+    min_memory_gb: Option<u32>,
     require_gpu: Option<bool>,
     gpu_vendor: Option<String>,
-    min_vram_mb: Option<u32>,
+    min_vram_gb: Option<u32>,
     min_context_length: Option<u32>,
     #[serde(default)]
     require_modalities: Vec<String>,
@@ -2775,7 +2775,7 @@ fn gpu_info_from_json(g: GpuJson) -> GpuInfo {
         .as_deref()
         .map(parse_gpu_vendor_cap)
         .unwrap_or(GpuVendor::Unknown);
-    let mut info = GpuInfo::new(vendor, g.model, g.vram_mb);
+    let mut info = GpuInfo::new(vendor, g.model, g.vram_gb);
     if let Some(cu) = g.compute_units {
         info = info.with_compute_units(saturating_u16_cap(cu));
     }
@@ -2806,7 +2806,7 @@ fn accelerator_from_json(a: AcceleratorJson) -> AcceleratorInfo {
     AcceleratorInfo {
         accel_type: parse_accelerator_type_cap(&a.kind),
         model: a.model,
-        memory_mb: a.memory_mb.unwrap_or(0),
+        memory_gb: a.memory_gb.unwrap_or(0),
         tops_x10: a.tops_x10.map(saturating_u16_cap).unwrap_or(0),
     }
 }
@@ -2821,7 +2821,7 @@ fn hardware_from_json(h: HardwareJson) -> HardwareCapabilities {
         }
         _ => {}
     }
-    if let Some(mb) = h.memory_mb {
+    if let Some(mb) = h.memory_gb {
         hw = hw.with_memory(mb);
     }
     if let Some(g) = h.gpu {
@@ -2830,7 +2830,7 @@ fn hardware_from_json(h: HardwareJson) -> HardwareCapabilities {
     for g in h.additional_gpus {
         hw = hw.add_gpu(gpu_info_from_json(g));
     }
-    if let Some(mb) = h.storage_mb {
+    if let Some(mb) = h.storage_gb {
         hw = hw.with_storage(mb);
     }
     if let Some(mbps) = h.network_mbps {
@@ -2972,7 +2972,7 @@ fn capability_filter_from_json(f: CapabilityFilterJson) -> CapabilityFilter {
     for t in f.require_tools {
         cf = cf.require_tool(t);
     }
-    if let Some(mb) = f.min_memory_mb {
+    if let Some(mb) = f.min_memory_gb {
         cf = cf.with_min_memory(mb);
     }
     if f.require_gpu.unwrap_or(false) {
@@ -2981,7 +2981,7 @@ fn capability_filter_from_json(f: CapabilityFilterJson) -> CapabilityFilter {
     if let Some(v) = f.gpu_vendor {
         cf = cf.with_gpu_vendor(parse_gpu_vendor_cap(&v));
     }
-    if let Some(mb) = f.min_vram_mb {
+    if let Some(mb) = f.min_vram_gb {
         cf = cf.with_min_vram(mb);
     }
     if let Some(n) = f.min_context_length {
@@ -3509,7 +3509,7 @@ mod tests {
         let g = GpuJson {
             vendor: None,
             model: "test".to_string(),
-            vram_mb: 0,
+            vram_gb: 0,
             compute_units: None,
             tensor_cores: None,
             fp16_tflops_x10: Some(1_000_000_000u32),
@@ -3530,7 +3530,7 @@ mod tests {
         let g_small = GpuJson {
             vendor: None,
             model: "test".to_string(),
-            vram_mb: 0,
+            vram_gb: 0,
             compute_units: None,
             tensor_cores: None,
             fp16_tflops_x10: Some(425), // 42.5 TFLOPS
@@ -3989,10 +3989,10 @@ mod tests {
         let h = HardwareJson {
             cpu_cores: Some(70_000),
             cpu_threads: Some(200_000),
-            memory_mb: None,
+            memory_gb: None,
             gpu: None,
             additional_gpus: Vec::new(),
-            storage_mb: None,
+            storage_gb: None,
             network_mbps: None,
             accelerators: Vec::new(),
         };
@@ -4103,7 +4103,7 @@ mod nat_traversal_stub_tests {
     /// the FFI helpers, then verify the GpuVendor lands as Nvidia.
     #[test]
     fn capability_set_from_go_marshal_preserves_gpu_vendor() {
-        let json = r#"{"hardware":{"cpu_cores":16,"memory_mb":65536,"gpu":{"vendor":"nvidia","model":"h100","vram_mb":81920}},"tags":["gpu"]}"#;
+        let json = r#"{"hardware":{"cpu_cores":16,"memory_gb":64,"gpu":{"vendor":"nvidia","model":"h100","vram_gb":80}},"tags":["gpu"]}"#;
         let parsed: CapabilitySetJson = serde_json::from_str(json).expect("JSON should parse");
         let caps = capability_set_from_json(parsed);
         // Phase A.5.5: read through views() so the test asserts
@@ -4115,8 +4115,8 @@ mod nat_traversal_stub_tests {
             Some(super::GpuVendor::Nvidia),
             "vendor lost in conversion"
         );
-        assert_eq!(views.hardware().memory_mb, 65536);
-        assert_eq!(views.hardware().total_vram_mb(), 81920);
+        assert_eq!(views.hardware().memory_gb, 64);
+        assert_eq!(views.hardware().total_vram_gb(), 80);
         assert!(caps.has_tag("gpu"));
     }
 

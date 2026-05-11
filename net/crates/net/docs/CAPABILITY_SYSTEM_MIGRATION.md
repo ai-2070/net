@@ -45,8 +45,8 @@ handle; subsequent reads are < 50 ns.
 let caps = CapabilitySet::new()
     .with_hardware(HardwareCapabilities::new()
         .with_cpu(16, 32)
-        .with_memory(65536)
-        .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)))
+        .with_memory(64)
+        .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 80)))
     .with_software(SoftwareCapabilities::new()
         .with_os("linux", "6.6")
         .add_runtime("python", "3.11"));
@@ -63,8 +63,8 @@ use net_sdk::capabilities::{CapabilitySet, HardwareCapabilities, SoftwareCapabil
 let caps = CapabilitySet::new()
     .with_hardware(HardwareCapabilities::new()
         .with_cpu(16, 32)
-        .with_memory(65536)
-        .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 81920)))
+        .with_memory(64)
+        .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 80)))
     .with_software(SoftwareCapabilities::new()
         .with_os("linux", "6.6")
         .add_runtime("python", "3.11"));
@@ -74,7 +74,7 @@ let caps = CapabilitySet::new()
 // the metadata setter:
 let caps = CapabilitySet::new()
     .add_tag("hardware.gpu=h100")
-    .add_tag("hardware.memory_mb=65536")
+    .add_tag("hardware.memory_gb=64")
     .with_metadata("intent", "ml-training");
 ```
 
@@ -126,7 +126,7 @@ caps, _ = WithMetadata(caps, "intent", "ml-training")
 
 ```rust
 if caps.hardware.gpu.is_some() {
-    let vram = caps.hardware.gpu.as_ref().unwrap().vram_mb;
+    let vram = caps.hardware.gpu.as_ref().unwrap().vram_gb;
     // ...
 }
 let os = &caps.software.os;
@@ -138,7 +138,7 @@ let n_models = caps.models.len();
 ```rust
 let v = caps.views();
 if v.hardware().gpu.is_some() {
-    let vram = v.hardware().gpu.as_ref().unwrap().vram_mb;
+    let vram = v.hardware().gpu.as_ref().unwrap().vram_gb;
 }
 let os = &v.software().os;
 let n_models = v.models().len();
@@ -166,7 +166,7 @@ typed-struct constructors and reads typed fields back through them:
 // announceCapabilities / findNodes accept them and round-trip
 // through the substrate.
 await node.announceCapabilities({
-  hardware: { cpuCores: 16, memoryMb: 65_536, gpu: { vendor: 'nvidia', model: 'h100', vramMb: 81_920 } },
+  hardware: { cpuCores: 16, memoryGb: 64, gpu: { vendor: 'nvidia', model: 'h100', vramGb: 80 } },
   tags: ['inference'],
 });
 ```
@@ -177,7 +177,7 @@ migration path will be:
 ```ts
 // future
 const v = caps.views();
-console.log(v.hardware.gpu?.vramMb);
+console.log(v.hardware.gpu?.vramGb);
 ```
 
 ### 3. Tag round-tripping
@@ -250,7 +250,7 @@ use net_sdk::capabilities::pred;
 
 let p = pred!(and [
     pred!(exists "hardware.gpu"),
-    pred!(num_at_least "hardware.memory_mb", 65536.0),
+    pred!(num_at_least "hardware.memory_gb", 64.0),
     pred!(metadata_equals "intent", "ml-training"),
 ]);
 
@@ -273,7 +273,7 @@ import { p, predicateToRpcHeader, RPC_WHERE_HEADER, evaluatePredicate } from '@a
 
 const pred = p.and(
   p.exists({ axis: 'hardware', key: 'gpu' }),
-  p.numericAtLeast({ axis: 'hardware', key: 'memory_mb' }, 65536),
+  p.numericAtLeast({ axis: 'hardware', key: 'memory_gb' }, 65536),
   p.metadataEquals('intent', 'ml-training'),
 );
 
