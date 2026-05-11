@@ -449,7 +449,7 @@ This is device autonomy in practice. A $5 sensor node sets tight limits — low 
 
 ## RedEX
 
-RedEX is the local append-only log primitive. A `Redex` manager owns a `ChannelName → RedexFile` map; every file is an independent monotonic sequence of 20-byte index records plus a payload segment. v1 is strictly local — no replication, no subprotocol, no multi-node convergence. Higher layers (CortEX, NetDB) build on top; nothing in RedEX knows about them.
+RedEX is the local append-only log primitive. A `Redex` manager owns a `ChannelName → RedexFile` map; every file is an independent monotonic sequence of 20-byte index records plus a payload segment. Default mode is strictly local. Cross-node replication is opt-in per channel — see the **Replication** subsection below. Higher layers (CortEX, NetDB) build on top; nothing in RedEX knows about them.
 
 The 20-byte record is fixed:
 
@@ -489,6 +489,38 @@ Append-path fsyncs are governed by `FsyncPolicy`:
 Batched appends are syscall-coalesced: `append_batch` issues at most three `write_all` calls per batch (one each to `dat`, `idx`, `ts`) instead of three per entry, and the heap segment commits the whole batch with a single `append_many` call. See [`docs/REDEX_DISK_THROUGHPUT_PLAN.md`](docs/REDEX_DISK_THROUGHPUT_PLAN.md) for the full design and shipped invariants.
 
 ACL enforcement happens at `open_file` via the optional `AuthGuard`. The check keys on the canonical `ChannelName` (not the 16-bit wire hash), so two distinct channels can never alias into the same ACL decision — see the Channels section for the two-tier authorization design.
+
+### Replication
+
+Cross-node replication is opt-in per channel via `RedexFileConfig::with_replication(Some(ReplicationConfig::new()))`. The default `None` keeps the channel single-node and adds zero wire traffic. Replicated channels carry N copies of the log across the mesh; reads can resolve against the nearest holder; the leader is the single writer (append-only + monotonic-seq makes single-leader the only sane shape).
+
+The wire protocol rides on `SUBPROTOCOL_REDEX` with four dispatch codes — `SYNC_HEARTBEAT`, `SYNC_REQUEST`, `SYNC_RESPONSE`, `SYNC_NACK`. Failover uses a deterministic nearest-RTT election with NodeId tie-break: every node computes the same winner from the same inputs (proximity graph + healthy-peers filter). No broadcast, no epoch, no collection window. A `ReplicationCoordinator` per channel drives a four-state machine (`Idle → Replica → Candidate → Leader`); the runtime task on tokio handles heartbeat emission, lag detection, pull-based catch-up, NACK retry policy, and capability-tag emission via `Mesh::announce_chain` / `Mesh::withdraw_chain`.
+
+Configuration knobs on `ReplicationConfig`:
+
+- `factor: u8` — replicas including the leader. Range `[1, 16]`. Default `3`.
+- `heartbeat_ms: u64` — leader → replica cadence. Minimum `100`. Default `500`. Failure-detection window = `3 × heartbeat_ms` (three-missed hysteresis).
+- `placement: PlacementStrategy` — `Standard` (default; via `PlacementFilter`), `Pinned(Vec<NodeId>)` (manual), or `ColocationStrict` (chain-coverage required).
+- `leader_pinned: Option<NodeId>` — pin leadership to a specific node; election picks it whenever healthy.
+- `on_under_capacity: UnderCapacity` — disk-pressure policy. `Withdraw` (default; drop replica role, capability tag withdrawn, peers re-route) or `EvictOldest` (sweep retention + keep role, requires `retention_max_*` caps).
+- `replication_budget_fraction: f32` — bandwidth budget for replication-sync I/O as a fraction of measured NIC peak. Default `0.5`. Token-bucket gate in `handle_sync_request`; over-budget responses are rejected with `Backpressure` NACKs.
+
+Operator surface on `Redex`:
+
+- `enable_replication(mesh)` — install the per-Redex router on the mesh's `SUBPROTOCOL_REDEX` inbound dispatch. Idempotent. Required before any `open_file` with `replication: Some(_)`.
+- `replication_runtime_count()` — number of per-channel runtimes currently registered.
+- `replication_metrics_snapshot()` — read-only snapshot of seven per-channel counter / gauge shapes (lag, sync_bytes, leader_changes, under_capacity, skip_ahead, election_thrash, witness_withdrawals).
+- `replication_status_snapshot()` — per-channel `{channel_name, role, tail_seq}` view.
+- `replication_prometheus_text()` — one-call wrapper that renders the metrics snapshot as Prometheus text. Returns the empty string when replication isn't enabled, so the call site can pipe straight into an HTTP scrape endpoint without branching.
+- `replication_coordinator_for(name)` — per-channel handle for inspection or forced transitions during recovery / debugging.
+
+Failure semantics:
+
+- **Leader silence → failover.** Replicas observe `3 × heartbeat_ms` of silence, enter `Candidate`, run the deterministic election in the same tick (microseconds-scale window), transition to `Leader` or `Replica` based on the outcome.
+- **Skip-ahead.** When the leader's retained range trims past a replica's local tail, `apply_sync_response` returns `GapBeforeChunk`; the replica calls `RedexFile::skip_to(first_seq)` and retries the apply. Heap-only in v1; persistent-tier truncate falls back to NACK BadRange + heartbeat-cycle recovery.
+- **Disk pressure.** Replica's `apply_sync_response` rejects with `AppendFailed`; the runtime branches on the configured `UnderCapacity` policy.
+
+Replication overhead at steady state is well under the documented 30% budget — measured ratio is ~1.003× of single-node append throughput because heartbeat cadence is far below the per-append work rate.
 
 ## CortEX
 

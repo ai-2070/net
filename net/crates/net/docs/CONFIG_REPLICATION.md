@@ -1,10 +1,9 @@
 # Configuring RedEX replication
 
-Operator-facing companion to [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md)
-and [`REDEX_DISTRIBUTED_PLAN.md`](plans/REDEX_DISTRIBUTED_PLAN.md). This
-document covers how to turn on cross-node replication for a RedEX
-channel, what each knob does, and what failure modes you'll see in
-production.
+Operator-facing companion to [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md).
+This document covers how to turn on cross-node replication for a
+RedEX channel, what each knob does, and what failure modes you'll
+see in production.
 
 ## When to enable
 
@@ -238,8 +237,7 @@ coordinator.transition_to(Idle, ChannelClose) + router unregisters
 ## Observability
 
 Per-channel atomic counters (`ChannelMetricsAtomic`) exposed via
-the `ReplicationMetricsRegistry`. Prometheus shapes pinned in
-[`REDEX_DISTRIBUTED_PLAN.md §11`](plans/REDEX_DISTRIBUTED_PLAN.md#11-metrics):
+the `ReplicationMetricsRegistry`. Prometheus shapes:
 
 | Metric | Type | Meaning |
 |--------|------|---------|

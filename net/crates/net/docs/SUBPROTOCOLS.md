@@ -42,7 +42,7 @@ The replication subprotocol partitions its payload via a single `dispatch_code: 
 | `0x23` `SYNC_NACK` | leader → replica | Structured rejection (typed `error_code`) | variable |
 | `0x24..0x2F` | reserved | Future variants (range-bounded sync, parallel-stream sync, etc.) | — |
 
-**No `LEADER_ELECTION` code** — election is a pure deterministic function over each node's locally-known state (proximity-graph RTT + replica-set membership + NodeId ordering). `StandbyGroup`'s existing promotion broadcast announces the result; no RedEX-specific election message rides on the wire.
+**No `LEADER_ELECTION` code** — election is a pure deterministic function over each node's locally-known state (proximity-graph RTT + replica-set membership + NodeId ordering). The per-channel `ReplicationCoordinator` runtime task runs `elect()` directly when entering `Candidate`; the result drives a `transition_to(Leader | Replica)` call that emits the capability tag via `Mesh::announce_chain` / withdraws via `Mesh::withdraw_chain`. The capability-tag layer is what peers observe; no RedEX-specific election message rides on the wire.
 
 **`SyncNack` error codes** (replica retry-policy key):
 - `1` `NotLeader` → re-resolve leader via `Mesh::find_chain_holders`.

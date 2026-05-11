@@ -292,6 +292,81 @@ file.close()
 Errors from the RedEX surface raise `RedexError` (invalid channel
 name, bad config, append / tail / sync / close failures).
 
+### Cross-node RedEX replication
+
+RedEX channels can replicate across the mesh. Opt in per channel by
+passing `replication=True` plus tunables on the `open_file` call. The
+default (no `replication` kwarg) keeps the channel single-node and
+adds zero wire traffic. Replicated channels carry N copies of the
+log; the leader is the single writer, replicas catch up via
+pull-based sync. Failover uses a deterministic nearest-RTT election
+with NodeId tie-break.
+
+```python
+from net import NetMesh, Redex
+
+mesh = NetMesh(bind_addr='127.0.0.1:0', psk='...')
+redex = Redex(persistent_dir='/var/lib/net/events')
+
+# Install the per-Redex replication router on the mesh.
+# Idempotent — safe to call from multiple paths.
+redex.enable_replication(mesh)
+
+file = redex.open_file(
+    'orders/audit',
+    persistent=True,
+    replication=True,
+    replication_factor=3,                 # 1..16; default 3
+    replication_heartbeat_ms=500,         # min 100; default 500
+    replication_placement='standard',     # 'standard' | 'pinned' | 'colocation_strict'
+    # replication_pinned_nodes=[node_a, node_b, node_c],   # required when placement='pinned'
+    # replication_leader_pinned=some_node_id,
+    replication_on_under_capacity='withdraw',   # 'withdraw' (default) | 'evict_oldest'
+    replication_budget_fraction=0.5,
+)
+file.append(b'event payload')
+```
+
+The leader handles every append locally; replicas observe the
+leader's heartbeat `tail_seq`, issue `SYNC_REQUEST` on lag, apply
+chunks via `SYNC_RESPONSE`. When the leader closes (or the replica's
+believed leader goes silent past `3 × replication_heartbeat_ms`),
+the surviving replicas run the deterministic election and one
+becomes the new leader within microseconds.
+
+Operator surface on `Redex`:
+
+- `enable_replication(mesh)` — install replication wiring. Required
+  before `open_file(..., replication=True)`.
+- `replication_runtime_count() -> int` — registered per-channel
+  runtimes.
+- `replication_prometheus_text() -> str` — Prometheus-text render of
+  the seven per-channel metric shapes (`*_lag_seconds`,
+  `*_sync_bytes_total`, `*_leader_changes_total`,
+  `*_under_capacity_total`, `*_skip_ahead_total`,
+  `*_election_thrash_total`, `*_witness_withdrawals_total`).
+  Returns the empty string when replication isn't enabled; pipe
+  straight into an HTTP scrape body without branching.
+
+```python
+# HTTP scrape handler (Flask example)
+@app.route('/metrics')
+def metrics():
+    return redex.replication_prometheus_text(), 200, {'Content-Type': 'text/plain'}
+```
+
+Disk-pressure handling: when a replica's local file rejects an
+append (heap-segment cap or disk write-fail), the configured
+`replication_on_under_capacity` policy fires — `'withdraw'` drops
+the replica role (capability tag withdrawn; peers re-route to a
+healthy holder); `'evict_oldest'` runs retention sweep + retries
+(requires `retention_max_*` kwargs to be set on the same call).
+
+Validation surfaces `RedexError` before the call reaches the
+underlying coordinator, so misconfigured `replication_factor` (out
+of `[1, 16]`), `replication_placement='pinned'` without
+`replication_pinned_nodes`, or unknown enum strings fail fast.
+
 ### Why `snapshot_and_watch_*`?
 
 Calling `list_tasks()` then `watch_tasks()` takes two independent

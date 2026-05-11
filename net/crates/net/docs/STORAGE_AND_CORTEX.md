@@ -253,12 +253,6 @@ helps you structure daemons so adopting them later is straightforward.
   `snapshotAndWatch` on the Node and Python SDKs). The Rust surface
   exists today (`adapter.watch()` / `adapter.snapshot_and_watch(...)`);
   the napi / pyo3 NetDb class wrappers are a focused follow-up.
-- **DST harness extension for replication** — pure-logic pieces
-  (state machine, election, catch-up, runtime tick) have unit
-  tests; the full deterministic-simulation harness for partition
-  + retention-drift scenarios is Phase F of
-  [`REDEX_DISTRIBUTED_PLAN.md`](plans/REDEX_DISTRIBUTED_PLAN.md),
-  still pending.
 
 ## FAQ
 
