@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/redex/replication_catchup.rs
+  s_9163f300668f8b::t_9e63ffea4acf65 1-758
+net/crates/net/src/adapter/net/redex/mod.rs
+  s_9163f300668f8b::t_2f892c1ce08fd6 58-61
+  s_9163f300668f8b::t_b8628e009dd0ce 28
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_9163f300668f8b::t_8d4fc8db1175a6 458,460,462-468
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "4be28468781cf30d66c069ee7db39c855c369cfa",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
