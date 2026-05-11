@@ -1,0 +1,30 @@
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  s_3a0a24a47d1a36::t_eef540044f39d4 217-250
+net/crates/net/src/ffi/cortex.rs
+  s_3a0a24a47d1a36::t_9d365bf9fa9224 92-102,107-111
+net/crates/net/bindings/python/src/cortex.rs
+  s_3a0a24a47d1a36::t_22a60e5b837832 1667-1668,1678,1682-1683
+  s_3a0a24a47d1a36::t_b417edccd987a0 1156-1161,1171,1175-1176
+  s_3a0a24a47d1a36::t_1d94e4b7e0a712 1172-1174,1679-1681
+net/crates/net/tests/integration_cortex_tasks.rs
+  s_3a0a24a47d1a36::t_d6e36fd3b53fa7 1186-1217
+  s_3a0a24a47d1a36::t_d78c9c77e7050d 14,16
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  s_3a0a24a47d1a36::t_c577cfe257eab0 254-273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "41b4b53e777390d5d0ec40afbce37f609b400fdc",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
