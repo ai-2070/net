@@ -25,6 +25,7 @@ mod index;
 mod manager;
 mod ordered;
 pub mod replication;
+mod replication_catchup;
 mod replication_config;
 mod replication_coordinator;
 mod replication_election;
@@ -53,6 +54,10 @@ pub use replication_config::{
     PlacementStrategy, ReplicationConfig, ReplicationConfigError, UnderCapacity,
     HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MIN, REPLICATION_BUDGET_FRACTION_DEFAULT,
     REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX, REPLICATION_FACTOR_MIN,
+};
+pub use replication_catchup::{
+    apply_sync_response, handle_sync_request, ApplyError, SyncRequestOutcome,
+    CHUNK_MAX_HARD_CEILING_BYTES,
 };
 pub use replication_coordinator::{
     ChainTagSink, ChannelIdentity, CoordinatorError, ReplicationCoordinator,

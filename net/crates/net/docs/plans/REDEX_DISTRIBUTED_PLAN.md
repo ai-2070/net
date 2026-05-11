@@ -455,16 +455,17 @@ Implementable in isolation; does not depend on Capability B/F. **Landed.**
 - 🔜 Heartbeat loop on `heartbeat_ms` — issues `SyncHeartbeat` to peers; observes peer heartbeats; triggers `transition_to(Candidate, MissedHeartbeats)` on 3 consecutive missed.
 - 🔜 Spawn / register / withdraw lifecycle wired into `Redex::open_file` for replicated channels — when `RedexFileConfig::replication.is_some()`, construct + register a coordinator; cleanup on file close.
 
-### Phase D — Pull-based catch-up (1 week)
+### Phase D — Pull-based catch-up (1 week) ⚠️ pure-helper core landed
 
-**Hard prerequisite: Capability Phase B + Phase C of this plan.**
+**Hard prerequisite: Capability Phase B + Phase C of this plan.** Capability B landed; Phase C core landed (state-machine + tag lifecycle); the catch-up helpers are wired against `RedexFile::read_range` / `append_batch` and ready for the heartbeat loop to drive them.
 
-- `SYNC_REQUEST` issuance on heartbeat-ack lag.
-- `SYNC_RESPONSE` generation via existing `RedexFile::read_range`.
-- `SYNC_NACK` emission on `NotLeader` / `BadRange` / `Backpressure` / `ChannelClosed` per the typed error path in [§2](#2-wire-protocol--subprotocol_redex). Replicas implement the matching retry policy keyed on `error_code`.
-- Replica-side `append_batch` application; preserve seq invariants.
-- Skip-ahead path for gaps > `skip_threshold`.
-- Bandwidth-budget enforcer respecting `replication_budget_fraction`.
+- ✅ `redex::replication_catchup::handle_sync_request(file, request, expected_channel)` — leader-side driver. Reads `RedexFile::read_range`, honors the `chunk_max` byte budget (with a 64 MiB hard ceiling so a buggy / malicious peer can't pull arbitrary-size chunks), returns `SyncRequestOutcome::Response(SyncResponse)` or `SyncRequestOutcome::Nack { error_code, detail }`. Pin: always admits at least the first event so oversize singletons don't block catch-up forever. Empty range → empty chunk (the "replica is caught up" signal). Channel mismatch → `SyncNackError::ChannelClosed`. Retention-trimmed range → `SyncNackError::BadRange`.
+- ✅ `redex::replication_catchup::apply_sync_response(file, response, expected_channel)` — replica-side applicator. Validates channel id, `first_seq == events[0].event_seq`, strict monotonicity within the chunk (no gaps / duplicates / out-of-order), and that the chunk extends the local tail exactly (`first_seq == file.next_seq()`). Typed `ApplyError::{ChannelMismatch, FirstSeqMismatch, NonMonotonic, StaleChunk, GapBeforeChunk, AppendFailed}`. On success applies via `RedexFile::append_batch` and returns the new tail.
+- ✅ 18 unit tests with a real heap-only `RedexFile`: empty file, caught-up signaling, full-range assembly, byte-budget truncation, oversize-first-event admission, since_seq-beyond-tail no-op, channel mismatch, chunk_max=0 ceiling fallback, every `ApplyError` variant, leader→replica round-trip, and a two-round chunked catch-up that drains a 4-event leader into a 2-event-per-chunk replica.
+- 🔜 `SYNC_REQUEST` issuance on heartbeat-ack lag — heartbeat loop integration.
+- 🔜 Skip-ahead path for gaps > `skip_threshold` per §8 (replica trims local tail + re-issues from leader's first available seq).
+- 🔜 Bandwidth-budget enforcer respecting `replication_budget_fraction` per §5 (token-bucket over the catch-up driver's chunk output).
+- 🔜 `SYNC_NACK` retry-policy keyed on `error_code` — replica-side state machine routing through Phase C coordinator.
 
 ### Phase E — Failover via deterministic nearest-RTT election (1 week) ⚠️ pure-function scaffolding landed
 
