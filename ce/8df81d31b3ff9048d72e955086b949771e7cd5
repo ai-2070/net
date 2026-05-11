@@ -1,0 +1,19 @@
+net/crates/net/tests/integration_cortex_tasks.rs
+  s_4dbb97ea6ebffd::t_f9f6ec11a8d28c 519
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "ce8df81d31b3ff9048d72e955086b949771e7cd5",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
