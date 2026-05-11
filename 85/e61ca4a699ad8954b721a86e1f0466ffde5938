@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/dataforts/gravity/policy.rs
+  s_4dbb97ea6ebffd::t_322869d9e58991 46-50
+net/crates/net/src/adapter/net/dataforts/gravity/mod.rs
+  s_4dbb97ea6ebffd::t_4950170f5fec5a 33-37
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_4dbb97ea6ebffd::t_4e0336d7ca745c 314
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_4dbb97ea6ebffd::t_3edf73f4ec624e 281-282
+net/crates/net/src/adapter/net/dataforts/mod.rs
+  s_4dbb97ea6ebffd::t_341a751762274e 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "85e61ca4a699ad8954b721a86e1f0466ffde5938",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
