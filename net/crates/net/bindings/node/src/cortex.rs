@@ -48,6 +48,13 @@ use bytes::Bytes;
 
 pub(crate) const ERR_CORTEX_PREFIX: &str = "cortex:";
 pub(crate) const ERR_NETDB_PREFIX: &str = "netdb:";
+/// R-29: stable prefix on every RedEX-originated error. JS-side
+/// callers should `e.message.startsWith("redex:")` to discriminate
+/// (no dedicated `RedexError` JS class — napi-rs only emits plain
+/// `Error` and the prefix is the contract). The full shape is
+/// `"redex: <context>: <detail>"` where `<context>` is a stable
+/// identifier the SDK can pattern-match on (e.g. `"open_file"`,
+/// `"replication.factor"`, `"enable_replication"`).
 pub(crate) const ERR_REDEX_PREFIX: &str = "redex:";
 
 #[inline]
@@ -285,6 +292,7 @@ pub struct ReplicationConfigJs {
 fn resolve_placement_strategy(
     placement: Option<String>,
     pinned_nodes: Option<Vec<BigInt>>,
+    leader_pinned: Option<&BigInt>,
 ) -> Result<InnerPlacementStrategy> {
     match placement.as_deref() {
         None | Some("standard") => Ok(InnerPlacementStrategy::Standard),
@@ -296,12 +304,33 @@ fn resolve_placement_strategy(
                     "required when placement = 'pinned'",
                 )
             })?;
+            // R-27: reject empty pinned_nodes at the binding
+            // layer for a clearer error than the core
+            // validator's PinnedSetEmpty.
+            if nodes.is_empty() {
+                return Err(redex_err(
+                    "replication.pinned_nodes",
+                    "must be non-empty when placement = 'pinned'",
+                ));
+            }
             let mut out = Vec::with_capacity(nodes.len());
             for (i, n) in nodes.into_iter().enumerate() {
                 out.push(redex_bigint_u64(
                     &format!("replication.pinned_nodes[{i}]"),
                     n,
                 )?);
+            }
+            // R-28: cross-check leader_pinned membership at
+            // the binding layer for a clearer error than the
+            // core's LeaderPinnedNotInPinnedSet.
+            if let Some(lp_big) = leader_pinned {
+                let lp = redex_bigint_u64("replication.leader_pinned", lp_big.clone())?;
+                if !out.iter().any(|n| *n == lp) {
+                    return Err(redex_err(
+                        "replication.leader_pinned",
+                        format!("{lp} is not in replication.pinned_nodes"),
+                    ));
+                }
             }
             Ok(InnerPlacementStrategy::Pinned(out))
         }
@@ -342,7 +371,11 @@ fn resolve_replication_config(cfg: ReplicationConfigJs) -> Result<InnerReplicati
     if let Some(hb) = cfg.heartbeat_ms {
         out = out.with_heartbeat_ms(redex_bigint_u64("replication.heartbeat_ms", hb)?);
     }
-    out = out.with_placement(resolve_placement_strategy(cfg.placement, cfg.pinned_nodes)?);
+    out = out.with_placement(resolve_placement_strategy(
+        cfg.placement,
+        cfg.pinned_nodes,
+        cfg.leader_pinned.as_ref(),
+    )?);
     if let Some(leader) = cfg.leader_pinned {
         out = out.with_leader_pinned(Some(redex_bigint_u64("replication.leader_pinned", leader)?));
     }

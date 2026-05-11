@@ -277,7 +277,10 @@ impl PyRedex {
         if !replication {
             let stray = [
                 ("replication_factor", replication_factor.is_some()),
-                ("replication_heartbeat_ms", replication_heartbeat_ms.is_some()),
+                (
+                    "replication_heartbeat_ms",
+                    replication_heartbeat_ms.is_some(),
+                ),
                 ("replication_placement", replication_placement.is_some()),
                 (
                     "replication_pinned_nodes",
@@ -401,17 +404,35 @@ fn build_replication_config(
     if let Some(hb) = heartbeat_ms {
         out = out.with_heartbeat_ms(hb);
     }
+    // R-26: accept ONLY the snake-case canonical form (Python
+    // convention). The kebab-case form is rejected loudly so
+    // error messages stay unambiguous. Operators on the JS side
+    // use kebab-case via the Node binding; that's the canonical
+    // there.
     out = out.with_placement(match placement.as_deref() {
         None | Some("standard") => InnerPlacementStrategy::Standard,
-        Some("colocation_strict") | Some("colocation-strict") => {
-            InnerPlacementStrategy::ColocationStrict
-        }
+        Some("colocation_strict") => InnerPlacementStrategy::ColocationStrict,
         Some("pinned") => {
             let nodes = pinned_nodes.ok_or_else(|| {
                 RedexError::new_err(
                     "replication_pinned_nodes required when replication_placement = 'pinned'",
                 )
             })?;
+            // R-27: reject empty pinned_nodes at the binding
+            // layer for a clearer error.
+            if nodes.is_empty() {
+                return Err(RedexError::new_err(
+                    "replication_pinned_nodes must be non-empty when replication_placement = 'pinned'",
+                ));
+            }
+            // R-28: cross-check leader_pinned membership.
+            if let Some(lp) = leader_pinned {
+                if !nodes.iter().any(|n| *n == lp) {
+                    return Err(RedexError::new_err(format!(
+                        "replication_leader_pinned {lp} is not in replication_pinned_nodes"
+                    )));
+                }
+            }
             InnerPlacementStrategy::Pinned(nodes)
         }
         Some(other) => {
@@ -425,7 +446,7 @@ fn build_replication_config(
     }
     out = out.with_on_under_capacity(match on_under_capacity.as_deref() {
         None | Some("withdraw") => InnerUnderCapacity::Withdraw,
-        Some("evict_oldest") | Some("evict-oldest") => InnerUnderCapacity::EvictOldest,
+        Some("evict_oldest") => InnerUnderCapacity::EvictOldest,
         Some(other) => {
             return Err(RedexError::new_err(format!(
                 "unknown replication_on_under_capacity {other:?}; expected 'withdraw' or 'evict_oldest'"

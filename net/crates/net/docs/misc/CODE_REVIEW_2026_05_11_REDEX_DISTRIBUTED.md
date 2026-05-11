@@ -48,12 +48,13 @@ Tagged `[H | M | L]`:
 | R-23  | M   | wire        | `WireError::Truncated.need` formula reports nonsensical value             | ✅ (R-5 commit) |
 | R-24  | M   | mesh        | Replication inbound dispatch is O(peers) per frame                        | 🚫 deferred — needs session→node reverse-map across all subprotocols |
 | R-25  | M   | mesh        | `from_node` falls back to `0`, a valid NodeId sentinel collision          | ✅ |
-| R-26  | M   | bindings    | Python silently accepts both `colocation_strict` and `colocation-strict`  | ⚪ |
-| R-27  | M   | bindings    | `Pinned([])` slips past binding to core validate                          | ⚪ |
-| R-28  | M   | bindings    | `leader_pinned` not cross-checked against `pinned_nodes` at binding layer | ⚪ |
-| R-29  | M   | node binding| `redex_err` produces untyped `from_reason`; no `RedexError` class on JS   | ⚪ |
-| R-30  | M   | go binding  | `OpenFile` returns `ErrReplicationRequiresEnable` for any redex error     | ⚪ |
-| R-31  | M   | go binding  | `RedexFile.mu` serializes appends; Rust substrate supports concurrent     | ⚪ |
+| R-26  | M   | bindings    | Python silently accepts both `colocation_strict` and `colocation-strict`  | ✅ |
+| R-27  | M   | bindings    | `Pinned([])` slips past binding to core validate                          | ✅ |
+| R-28  | M   | bindings    | `leader_pinned` not cross-checked against `pinned_nodes` at binding layer | ✅ |
+| R-29  | M   | node binding| `redex_err` produces untyped `from_reason`; no `RedexError` class on JS   | 📝 prefix contract pinned in doc |
+| R-30  | M   | go binding  | `OpenFile` returns `ErrReplicationRequiresEnable` for any redex error     | ✅ |
+| R-31  | M   | go binding  | `RedexFile.mu` serializes appends; Rust substrate supports concurrent     | ✅ |
+| R-44  | L   | go binding  | `ErrInvalidReplicationConfig` is dead code (never returned)               | ✅ (now wired) |
 | R-32  | M   | file        | `skip_to` swap-order: index assigned before `evict_prefix_to`             | ⚪ |
 | R-33  | M   | mod         | `pub mod replication` AND flat re-exports of the same types               | ⚪ |
 | R-34  | M   | metrics     | `Duration → micros` saturation may collide with `LAG_NOT_OBSERVED`        | ⚪ |
@@ -66,7 +67,6 @@ Tagged `[H | M | L]`:
 | R-41  | L   | e2e         | Fixed 500ms `tokio::time::sleep` before leader close — flake risk         | ⚪ |
 | R-42  | L   | node binding| `.d.ts` unconditionally emits `enableReplication` despite `cfg` gating    | ⚪ |
 | R-43  | L   | go binding  | `typedef ArcMeshNode` collides with upstream `net_compute_mesh_arc_t`     | ⚪ |
-| R-44  | L   | go binding  | `ErrInvalidReplicationConfig` is dead code (never returned)               | ⚪ |
 | C-1   | M   | tests       | No DST scenario exercises "election storms" (plan §F)                     | ⚪ |
 | C-2   | M   | tests       | Divergence-freedom check only runs on happy path, not after fault         | ⚪ |
 | C-3   | M   | tests       | `chain_discovery.rs` tests are single-node only                           | ⚪ |

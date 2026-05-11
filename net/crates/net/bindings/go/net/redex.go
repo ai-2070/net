@@ -170,8 +170,15 @@ type Redex struct {
 }
 
 // RedexFile wraps the C `*RedexFileHandle` for a single channel.
+//
+// R-31: `mu` is an RWMutex — Append/NextSeq/Read take RLock so
+// concurrent ops don't serialize on this Go-side mutex (the
+// Rust substrate's HandleGuard is a reader-counter that already
+// permits concurrent ops). Close takes the write Lock so it
+// quiesces against in-flight ops deterministically from the Go
+// caller's POV.
 type RedexFile struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	handle *C.RedexFileHandle
 }
 
@@ -358,6 +365,67 @@ func (r *Redex) ReplicationPrometheusText() string {
 	return C.GoString(c)
 }
 
+// validateReplicationConfig runs the binding-side checks so
+// `OpenFile` can return a clearly-typed error without round-
+// tripping through the FFI. The substrate revalidates regardless.
+//
+// R-30: this routes replication-config shape errors to
+// `ErrInvalidReplicationConfig` instead of conflating them with
+// `ErrReplicationRequiresEnable`. Operators inspecting an invalid
+// factor now see the right sentinel.
+func validateReplicationConfig(cfg *ReplicationConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	switch cfg.Placement {
+	case "", PlacementStandard, PlacementColocationStrict:
+		// OK.
+	case PlacementPinned:
+		if len(cfg.PinnedNodes) == 0 {
+			return fmt.Errorf(
+				"%w: PinnedNodes must be non-empty when Placement is %q",
+				ErrInvalidReplicationConfig, PlacementPinned,
+			)
+		}
+		if cfg.LeaderPinned != nil {
+			found := false
+			for _, n := range cfg.PinnedNodes {
+				if n == *cfg.LeaderPinned {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf(
+					"%w: LeaderPinned %d is not in PinnedNodes",
+					ErrInvalidReplicationConfig, *cfg.LeaderPinned,
+				)
+			}
+		}
+	default:
+		return fmt.Errorf(
+			"%w: unknown Placement %q (expected 'standard', 'pinned', or 'colocation_strict')",
+			ErrInvalidReplicationConfig, cfg.Placement,
+		)
+	}
+	switch cfg.OnUnderCapacity {
+	case "", UnderCapacityWithdraw, UnderCapacityEvictOldest:
+		// OK.
+	default:
+		return fmt.Errorf(
+			"%w: unknown OnUnderCapacity %q (expected 'withdraw' or 'evict_oldest')",
+			ErrInvalidReplicationConfig, cfg.OnUnderCapacity,
+		)
+	}
+	if cfg.ReplicationBudgetFraction < 0 || cfg.ReplicationBudgetFraction > 1 {
+		return fmt.Errorf(
+			"%w: ReplicationBudgetFraction %g out of range (0.0, 1.0]",
+			ErrInvalidReplicationConfig, cfg.ReplicationBudgetFraction,
+		)
+	}
+	return nil
+}
+
 // OpenFile opens (or returns the existing) RedexFile for the
 // channel `name`. The `config` is honored only on first open;
 // subsequent opens return the live handle.
@@ -365,7 +433,22 @@ func (r *Redex) ReplicationPrometheusText() string {
 // With `config.Replication != nil`, the owning Redex must have
 // called `EnableReplication` first; otherwise the call returns
 // `ErrReplicationRequiresEnable` (wrapping `ErrRedex`).
+//
+// R-30: replication-config shape errors (empty PinnedNodes,
+// LeaderPinned not in PinnedNodes, unknown placement / under-
+// capacity strings, budget out of range) surface as
+// `ErrInvalidReplicationConfig`. Other FFI errors after that
+// validation fall through to `ErrReplicationRequiresEnable` (when
+// replication was requested) or a generic wrapped `ErrRedex`.
 func (r *Redex) OpenFile(name string, config *RedexFileConfig) (*RedexFile, error) {
+	// R-30: validate before locking so we don't hold the mutex
+	// across a binding-side rejection.
+	if config != nil {
+		if err := validateReplicationConfig(config.Replication); err != nil {
+			return nil, err
+		}
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.handle == nil {
@@ -389,14 +472,11 @@ func (r *Redex) OpenFile(name string, config *RedexFileConfig) (*RedexFile, erro
 	rc := C.net_redex_open_file(r.handle, cName, cCfg, &out)
 	if rc != 0 {
 		// `NET_ERR_REDEX = -103` is the umbrella code for any
-		// Redex-side failure including replication misconfiguration.
-		// Translate the most-common subcategories to typed errors;
-		// otherwise fall through to a generic wrapped ErrRedex.
+		// Redex-side failure. The binding pre-check above
+		// caught the shape errors; what's left is most often
+		// "enable_replication wasn't called" or a numeric-range
+		// rejection (factor < min, heartbeat below threshold).
 		if config != nil && config.Replication != nil {
-			// Most likely cause: enable_replication wasn't called.
-			// The substrate-side error message says "replication
-			// requires Redex::enable_replication(mesh)" — surface
-			// as the typed Go error so consumers can dispatch on it.
 			return nil, ErrReplicationRequiresEnable
 		}
 		return nil, fmt.Errorf("%w: open_file failed (rc=%d)", ErrRedex, int(rc))
@@ -426,9 +506,14 @@ func (f *RedexFile) Close() error {
 
 // Append writes `payload` to the file and returns the assigned
 // monotonic sequence number.
+//
+// R-31: takes RLock so concurrent Append calls don't serialize
+// at the Go-side mutex. The Rust HandleGuard handles concurrent
+// in-flight ops; Close takes the write Lock above to quiesce
+// them.
 func (f *RedexFile) Append(payload []byte) (uint64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.handle == nil {
 		return 0, fmt.Errorf("%w: file handle already closed", ErrRedex)
 	}
@@ -443,14 +528,19 @@ func (f *RedexFile) Append(payload []byte) (uint64, error) {
 	if rc != 0 {
 		return 0, fmt.Errorf("%w: append failed (rc=%d)", ErrRedex, int(rc))
 	}
+	// R-31: KeepAlive the payload across the cgo call so the
+	// GC can't move it. The local `ptr` reference would
+	// normally satisfy escape analysis, but the explicit
+	// KeepAlive matches the documented cgo pattern.
+	runtime.KeepAlive(payload)
 	return uint64(seq), nil
 }
 
 // NextSeq returns the next sequence number the file will assign
 // (== total append count since open).
 func (f *RedexFile) NextSeq() uint64 {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.handle == nil {
 		return 0
 	}
