@@ -241,7 +241,7 @@ path = "tests/integration_nrpc_cross_lang.rs"
 required-features = ["cortex"]
 
 [[test]]
-# End-to-end: predicate → `cyberdeck-where:` request header
+# End-to-end: predicate → `net-where:` request header
 # (Phase 9b) → server-side `predicate_from_rpc_headers` decode +
 # stateless evaluator (Phase 9c) over a real two-node mesh.
 # Composes the two SDK surfaces that ship the predicate envelope

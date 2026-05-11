@@ -576,7 +576,7 @@ fn build_call_options(deadline_ms: u64) -> InnerCallOptions {
 /// `(name_ptr, name_len, value_ptr, value_len)` slices it owns,
 /// and passes the array + count to a `_with_headers` call. The
 /// header name MUST be valid UTF-8; the value is opaque bytes
-/// (Phase 9b's `cyberdeck-where:` value is JSON, but the
+/// (Phase 9b's `net-where:` value is JSON, but the
 /// substrate doesn't enforce a value-side encoding).
 ///
 /// Buffers are referenced for the duration of the call only —
@@ -1329,7 +1329,7 @@ pub extern "C" fn net_rpc_stream_free(stream: *mut RpcStreamHandleC) {
 //
 // The legacy `net_rpc_call` / `_call_service` / `_call_streaming`
 // don't take request headers — predicate-pushdown via the
-// `cyberdeck-where:` header (built by
+// `net-where:` header (built by
 // `net_predicate_to_where_header` in the main `libnet` cdylib)
 // had nowhere to go on the C ABI side. These three additive
 // variants accept a `(headers, count)` pair and forward it to
@@ -2009,7 +2009,7 @@ mod tests {
     /// Rust types.
     #[test]
     fn collect_headers_round_trips_name_and_value() {
-        let name1 = b"cyberdeck-where";
+        let name1 = b"net-where";
         let value1 = b"{\"nodes\":[],\"root_idx\":0}";
         let name2 = b"x-trace-id";
         let value2: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
@@ -2031,7 +2031,7 @@ mod tests {
         let collected = unsafe { collect_headers(arr.as_ptr(), arr.len()) }
             .expect("UTF-8 names must collect cleanly");
         assert_eq!(collected.len(), 2);
-        assert_eq!(collected[0].0, "cyberdeck-where");
+        assert_eq!(collected[0].0, "net-where");
         assert_eq!(collected[0].1, value1.to_vec());
         assert_eq!(collected[1].0, "x-trace-id");
         assert_eq!(collected[1].1, vec![0xde, 0xad, 0xbe, 0xef]);

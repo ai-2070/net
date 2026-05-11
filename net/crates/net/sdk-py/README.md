@@ -665,7 +665,7 @@ pred = p.and_(
 # Local evaluation (no mesh round-trip).
 matched = evaluate_predicate(pred, caps.tags, caps.metadata)
 
-# Wire form for nRPC `cyberdeck-where:` headers — pair with the
+# Wire form for nRPC `net-where:` headers — pair with the
 # header-bearing call variants so server-side filtering picks
 # the right candidate without re-running the predicate per hop.
 header_value = predicate_to_rpc_header(pred)

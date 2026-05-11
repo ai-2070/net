@@ -494,14 +494,14 @@ let _matched = p.evaluate(&ctx);
 // children for short-circuit AND/OR.
 let (_result, _trace) = p.evaluate_with_trace(&ctx);
 
-// Wire form for nRPC `cyberdeck-where:` headers — pair with the
+// Wire form for nRPC `net-where:` headers — pair with the
 // substrate's `*_with_headers` calls so server-side filtering
 // shortcircuits without re-running the predicate per hop.
 let (_name, _value): (String, Vec<u8>) = predicate_to_rpc_header(&p)?;
 let _ = RPC_WHERE_HEADER;
 // Reverse direction: parse a peer-supplied header back into the AST.
 // `predicate_from_rpc_headers` returns `Option<Result<Predicate, _>>`
-// — `None` when the `cyberdeck-where` header is absent, `Some(Err(_))`
+// — `None` when the `net-where` header is absent, `Some(Err(_))`
 // on malformed payload. Use `.transpose()?` to flip into
 // `Result<Option<Predicate>, _>` and propagate decode errors.
 # let header_pairs: Vec<(String, Vec<u8>)> = Vec::new();

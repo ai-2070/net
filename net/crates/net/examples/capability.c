@@ -14,7 +14,7 @@
  *                                     — corpus-wide aggregator
  *   - net_predicate_redact_metadata_keys
  *                                     — host-side label redaction
- *   - net_predicate_to_where_header   — `cyberdeck-where:` encoder
+ *   - net_predicate_to_where_header   — `net-where:` encoder
  *
  * No mesh or RPC handle required — every helper is pure
  * (JSON in, JSON out). Pair the where-header output with

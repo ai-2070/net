@@ -121,7 +121,7 @@ pub struct CallOptionsTyped {
 //
 // `with_where(p)` encodes a `Predicate` to JSON via the substrate's
 // `predicate_to_rpc_header` and pushes it into `CallOptions::request_headers`
-// under the `cyberdeck-where` header name. Servers that opt in read
+// under the `net-where` header name. Servers that opt in read
 // it back via `RpcContextExt::where_predicate()`.
 // ============================================================================
 
@@ -134,7 +134,7 @@ pub trait CallOptionsExt: Sized {
     fn with_request_header(self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self;
 
     /// Attach a [`net::adapter::net::behavior::Predicate`] as the
-    /// `cyberdeck-where` request header. The predicate rides as
+    /// `net-where` request header. The predicate rides as
     /// JSON-encoded `PredicateWire` bytes per the substrate's
     /// `predicate_to_rpc_header` contract;
     /// services opting into predicate-pushdown decode via
@@ -198,7 +198,7 @@ impl CallOptionsExt for CallOptionsTyped {
 /// `CAPABILITY_SYSTEM_SDK_PLAN.md`).
 pub trait RpcContextExt {
     /// Decode the caller's [`net::adapter::net::behavior::Predicate`]
-    /// from the `cyberdeck-where` request header, if present.
+    /// from the `net-where` request header, if present.
     /// Returns `None` when the header is absent (the common case
     /// for callers that don't issue predicate-pushdown queries)
     /// or `Some(Err(_))` if the header is malformed.

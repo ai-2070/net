@@ -1370,10 +1370,10 @@ export interface CallOptions {
    * `RpcRequestPayload.headers` after any auto-generated
    * headers (trace, stream-window). Used for application-level
    * metadata the server needs at dispatch-time — most notably
-   * the `cyberdeck-where` predicate header for Phase 9b
+   * the `net-where` predicate header for Phase 9b
    * predicate-pushdown filtering.
    *
-   * JS callers pass `[{ name: "cyberdeck-where", value: Buffer.from(jsonBytes) }, ...]`.
+   * JS callers pass `[{ name: "net-where", value: Buffer.from(jsonBytes) }, ...]`.
    * `undefined` (default) → no extra headers.
    */
   requestHeaders?: Array<RpcRequestHeader>
@@ -2112,7 +2112,7 @@ export interface RequestContextJs {
  * doesn't validate names beyond the `MAX_RPC_HEADER_NAME_LEN` cap.
  */
 export interface RpcRequestHeader {
-  /** Header name (e.g. `cyberdeck-where`). */
+  /** Header name (e.g. `net-where`). */
   name: string
   /**
    * Header value bytes. For text-like headers (predicates,

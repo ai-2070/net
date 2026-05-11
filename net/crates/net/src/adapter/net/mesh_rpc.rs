@@ -136,7 +136,7 @@ pub struct CallOptions {
     /// `RpcRequestPayload::headers` after any auto-generated
     /// headers (trace context, stream-window). Useful for
     /// application-level metadata the server needs at
-    /// dispatch-time — e.g., the `cyberdeck-where` predicate
+    /// dispatch-time — e.g., the `net-where` predicate
     /// header (Phase 9b of `CAPABILITY_SYSTEM_SDK_PLAN.md`) that
     /// services consult for predicate-pushdown filtering.
     ///
@@ -1087,7 +1087,7 @@ impl MeshNode {
             None => (0u16, Vec::new()),
         };
         // Append caller-supplied request headers (e.g. the
-        // `cyberdeck-where` predicate header for Phase 9b
+        // `net-where` predicate header for Phase 9b
         // predicate-pushdown). Auto-generated headers come first
         // so name collisions resolve to caller-overrides via the
         // server-side `predicate_from_rpc_headers` first-match

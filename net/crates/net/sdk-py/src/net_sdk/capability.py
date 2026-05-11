@@ -591,7 +591,7 @@ def predicate_from_wire(wire: Mapping[str, Any]) -> Predicate:
 # nRPC envelope — header + helpers ------------------------------------------
 
 #: nRPC header carrying a predicate. Matches ``RPC_WHERE_HEADER``.
-RPC_WHERE_HEADER = "cyberdeck-where"
+RPC_WHERE_HEADER = "net-where"
 
 
 def predicate_to_rpc_header(pred: Predicate) -> str:
@@ -602,12 +602,12 @@ def predicate_to_rpc_header(pred: Predicate) -> str:
 
 
 def predicate_from_rpc_header(value: str) -> Predicate:
-    """Decode a ``cyberdeck-where`` header value into a predicate AST."""
+    """Decode a ``net-where`` header value into a predicate AST."""
     return predicate_from_wire(json.loads(value))
 
 
 def where_header(pred: Predicate) -> Tuple[str, bytes]:
-    """Build the canonical ``cyberdeck-where:`` request-header entry
+    """Build the canonical ``net-where:`` request-header entry
     for Phase 9b predicate-pushdown calls. Drops straight into the
     ``request_headers`` list of a Python ``MeshRpc.call`` opts dict.
 

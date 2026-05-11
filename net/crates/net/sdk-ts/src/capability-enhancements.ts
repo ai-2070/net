@@ -6,7 +6,7 @@
  * - Typed taxonomy ({@link Tag}, {@link TagKey}, {@link TaxonomyAxis})
  *   with reserved-prefix enforcement at construction time.
  * - Fluent {@link Predicate} builder (`p.*`) producing the canonical
- *   wire IR (`PredicateWire`) consumed by `cyberdeck-where` headers.
+ *   wire IR (`PredicateWire`) consumed by `net-where` headers.
  * - {@link diffCapabilities} returning the same `CapabilitySetDiff`
  *   shape the cross-binding fixtures pin.
  * - {@link requireTag} / {@link requireAxisValue} chain helpers
@@ -242,7 +242,7 @@ export type PredicateNode =
 
 /**
  * Wire-format predicate. The exact JSON shape the substrate's
- * `cyberdeck-where` request header carries; pinned by the
+ * `net-where` request header carries; pinned by the
  * `predicate_nrpc_envelope.json` cross-binding fixture.
  */
 export interface PredicateWire {
@@ -561,7 +561,7 @@ function nodeFromWire(
 // ============================================================================
 
 /** Header the substrate uses to carry a predicate over nRPC. */
-export const RPC_WHERE_HEADER = 'cyberdeck-where';
+export const RPC_WHERE_HEADER = 'net-where';
 
 /** Encode a predicate into the request-header value. The substrate
  * pins this as the canonical JSON-encoded {@link PredicateWire}. */
@@ -569,7 +569,7 @@ export function predicateToRpcHeader(pred: Predicate): string {
   return JSON.stringify(predicateToWire(pred));
 }
 
-/** Decode a `cyberdeck-where` header value back into an AST. Throws
+/** Decode a `net-where` header value back into an AST. Throws
  * on malformed JSON or out-of-range indices. */
 export function predicateFromRpcHeader(value: string): Predicate {
   const wire = JSON.parse(value) as PredicateWire;
@@ -577,7 +577,7 @@ export function predicateFromRpcHeader(value: string): Predicate {
 }
 
 /**
- * Build the `cyberdeck-where:` request-header entry for a
+ * Build the `net-where:` request-header entry for a
  * Phase 9b predicate-pushdown call. Drops straight into a
  * `MeshRpc.call` `CallOptions.requestHeaders` array.
  *

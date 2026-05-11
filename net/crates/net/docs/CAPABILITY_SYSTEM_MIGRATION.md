@@ -294,7 +294,7 @@ nRPC (Phase 9b):
 ```rust
 use net_sdk::mesh_rpc::{CallOptions, CallOptionsExt, RpcContext, RpcContextExt};
 
-// Caller side: attach the predicate as a `cyberdeck-where:` request
+// Caller side: attach the predicate as a `net-where:` request
 // header. `with_where` returns `Result` because the predicate's
 // JSON encoding is bounded by `MAX_PREDICATE_RPC_HEADER_VALUE_LEN`.
 let opts = CallOptions::default()
@@ -321,7 +321,7 @@ options.with_request_header(name, value)
 ```
 
 Per-binding wrappers in TS / Python / Go expose the same
-`cyberdeck-where:` header convention.
+`net-where:` header convention.
 
 ### 6. New surface: validation
 
@@ -423,7 +423,7 @@ The shape contracts you can rely on:
 
 | Fixture (`tests/cross_lang_capability/`) | What it pins                       |
 | ---------------------------------------- | ---------------------------------- |
-| `predicate_nrpc_envelope.json`           | `Predicate` ↔ `cyberdeck-where` JSON header |
+| `predicate_nrpc_envelope.json`           | `Predicate` ↔ `net-where` JSON header |
 | `capability_set_diff.json`               | `CapabilitySet::diff(prev)` output  |
 | `predicate_eval.json`                    | `Predicate::evaluate_unplanned(ctx)` boolean |
 | `predicate_trace.json`                   | `Predicate::evaluate_with_trace(ctx)` tree |

@@ -1,7 +1,7 @@
 //! End-to-end SDK test for the Phase 9b predicate-pushdown surface.
 //!
 //! Caller-side: `CallOptions::with_where(&pred)` encodes the predicate
-//! to JSON and pushes it as a `cyberdeck-where` request header.
+//! to JSON and pushes it as a `net-where` request header.
 //! Server-side: `RpcContextExt::where_predicate()` decodes from the
 //! same header. End-to-end: a service can use the caller's predicate
 //! to filter its result set before sending bytes over the wire.
@@ -89,7 +89,7 @@ fn sample_predicate() -> Predicate {
 /// so the per-binding wrappers (Node / Python / Go) implement the
 /// same encode contract.
 #[test]
-fn with_where_pushes_canonical_cyberdeck_where_header() {
+fn with_where_pushes_canonical_net_where_header() {
     let pred = sample_predicate();
     let opts = CallOptions::default()
         .with_where(&pred)
@@ -174,7 +174,7 @@ impl RpcHandler for PredicateEchoHandler {
 }
 
 /// End-to-end: caller's `with_where(p)` reaches the server via the
-/// `cyberdeck-where` header; server's `where_predicate()` returns
+/// `net-where` header; server's `where_predicate()` returns
 /// the same AST.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn end_to_end_where_predicate_round_trip() {
