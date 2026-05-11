@@ -4,7 +4,7 @@
 
 ## Status
 
-**The Warriors shipped in v0.14 (2026-05-12).** Phases 0, 2, 6 (primitives only), and 7 are in the codebase. **Phases 1 (Greedy-LRU) and 4 (Data gravity) shipped behind the single `dataforts` Cargo feature flag** on the `dataforts-phase-1` / `dataforts-phase-4` branches — operator-facing surface across Rust core + Python + Node + Go + C FFI, with end-to-end mesh integration. Greedy and gravity are runtime-toggleable policies (see [§ Runtime toggles vs. compile-time flags](#runtime-toggles-vs-compile-time-flags) below); the Cargo feature only gates whether the dataforts surface compiles at all. Two remaining Rebel Yell phases stay parked until their activation gates fire. See [§ Implementation-ready specs for remaining phases](#implementation-ready-specs-for-remaining-phases) for the locked decisions + actionable work items per remaining phase.
+**The Warriors shipped in v0.14 (2026-05-12).** Phases 0, 2, 6 (primitives only), and 7 are in the codebase. **Phases 1 (Greedy-LRU) and 4 (Data gravity) shipped behind the single `dataforts` Cargo feature flag** on the `dataforts-phase-1` / `dataforts-phase-4` branches — operator-facing surface across Rust core + Python + Node + Go + C FFI, with end-to-end mesh integration. Greedy and gravity are runtime-toggleable policies (see [§ Runtime toggles vs. compile-time flags](#runtime-toggles-vs-compile-time-flags) below); the Cargo feature only gates whether the dataforts surface compiles at all. **Phase 5 (Read-your-writes) shipped on the `dataforts-phase-5` branch** — `WriteToken` + `wait_for_token(token, deadline)` at the CortEX layer, origin-checked at the bound adapters, with a 1024-deep per-channel wait queue and snapshot metrics. Python + Node + C FFI surfaces shipped; Go bindings deferred. **Phase 3 (BlobRef + BlobAdapter)** stays parked until its activation gate fires. See [§ Implementation-ready specs for remaining phases](#implementation-ready-specs-for-remaining-phases) for the locked decisions + actionable work items per remaining phase.
 
 | Phase | Release | Status | Where it lives |
 |---|---|---|---|
@@ -15,7 +15,7 @@
 | 1 — Greedy-LRU dataforts | Rebel Yell | ✅ shipped on `dataforts-phase-1` branch (behind `dataforts` feature) | `adapter::net::dataforts::greedy::*`, `Redex::enable_greedy_dataforts`, mesh inbound hook, all four bindings |
 | 3 — `BlobRef` + `BlobAdapter` hook | Rebel Yell | ⏳ open (independent — can ship parallel) | — |
 | 4 — Data gravity (heat-counter migration) | Rebel Yell | ✅ shipped on `dataforts-phase-4` branch (behind `dataforts` feature) | `adapter::net::dataforts::gravity::*`, `Redex::enable_gravity_for_greedy`, `MeshNode::announce_heat`, all four bindings |
-| 5 — Read-your-writes guarantees | Rebel Yell | ⏳ open (independent) | — |
+| 5 — Read-your-writes guarantees | Rebel Yell | ✅ shipped on `dataforts-phase-5` branch | `redex::WriteToken`, `CortexAdapter::{ingest_with_token, wait_for_token, ryw_metrics}`, origin-bound `Tasks/MemoriesAdapter::wait_for_token`, Python + Node bindings, C FFI (`net_{tasks,memories}_wait_for_token`). Go convenience wrappers deferred until the Tasks/Memories surface lands in Go (separate work). |
 | 6 — MeshDB extension (time-travel, lineage walks, cross-chain joins) | Deferred | ⏳ research-grade; out of either release | — |
 
 ### Runtime toggles vs. compile-time flags
