@@ -420,3 +420,185 @@ fn auth_bloom_post_authorize_check_never_denies() {
         );
     });
 }
+
+// ─────────────────────────────────────────────────────────────
+// Model 4: ReplicationCoordinator::record_tail_seq monotonic-max CAS
+//
+// Mirrors `src/adapter/net/redex/replication_coordinator.rs:181-194`
+// — the CAS loop that advances `tail_seq` to the maximum of every
+// proposed value. The catch-up path calls this from the replica
+// runtime task after each successful `apply_sync_response`; under
+// concurrent applies (one chunk completes while the next is
+// already in flight) the loop must:
+//
+// 1. Never regress: the stored value is monotonically non-
+//    decreasing across all observed states.
+// 2. Converge on the max: after every producer joins, the stored
+//    value equals max(initial, every proposed seq).
+// 3. Never tear: no value the loop observes via `load` or
+//    `compare_exchange_weak` is anything other than a value some
+//    producer proposed (or the initial value).
+//
+// A regression from CAS to `if load < seq { store(seq) }` would
+// produce torn updates: thread A's load sees 5, thread B's store
+// commits 10, thread A's store commits 5 — final value is 5,
+// thread B's update lost. The CAS loop's `Err(now)` branch picks
+// up the racing update and reruns the `seq > current` test.
+// ─────────────────────────────────────────────────────────────
+
+/// The production CAS pattern from `ReplicationCoordinator::record_tail_seq`.
+/// Pinned here under loom's atomic substitutes so the contract is
+/// verified across every thread interleaving.
+fn record_tail_seq_monotonic_max(cell: &AtomicU64, seq: u64) {
+    let mut current = cell.load(Ordering::Relaxed);
+    while seq > current {
+        match cell.compare_exchange_weak(current, seq, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(now) => current = now,
+        }
+    }
+}
+
+#[test]
+fn record_tail_seq_converges_on_max_under_concurrent_updates() {
+    loom::model(|| {
+        let tail = Arc::new(AtomicU64::new(0));
+
+        // Two threads race with overlapping proposals.
+        // Thread A proposes 5 then 10.
+        // Thread B proposes 7 then 3.
+        // The CAS loop must converge to max(0, 5, 10, 7, 3) = 10.
+        let a = {
+            let t = tail.clone();
+            thread::spawn(move || {
+                record_tail_seq_monotonic_max(&t, 5);
+                record_tail_seq_monotonic_max(&t, 10);
+            })
+        };
+        let b = {
+            let t = tail.clone();
+            thread::spawn(move || {
+                record_tail_seq_monotonic_max(&t, 7);
+                record_tail_seq_monotonic_max(&t, 3);
+            })
+        };
+
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let final_seq = tail.load(Ordering::Relaxed);
+        // After every producer finishes, the cell must hold the
+        // global max. A torn update (CAS → load+if regression)
+        // could leave it at 5, 7, or 3 — any of those would be a
+        // monotonicity violation.
+        assert_eq!(
+            final_seq, 10,
+            "monotonic-max CAS must converge on max(proposals); \
+             a value below 10 means the loop dropped a proposal",
+        );
+    });
+}
+
+#[test]
+fn record_tail_seq_lower_proposal_does_not_regress_existing() {
+    loom::model(|| {
+        let tail = Arc::new(AtomicU64::new(0));
+
+        // One thread commits the high water mark; another tries
+        // to roll it back to a smaller value. The smaller proposal
+        // must be a no-op even when racing the higher commit.
+        let high = {
+            let t = tail.clone();
+            thread::spawn(move || record_tail_seq_monotonic_max(&t, 100))
+        };
+        let low = {
+            let t = tail.clone();
+            thread::spawn(move || record_tail_seq_monotonic_max(&t, 5))
+        };
+        high.join().unwrap();
+        low.join().unwrap();
+
+        assert_eq!(
+            tail.load(Ordering::Relaxed),
+            100,
+            "lower proposal must never regress the committed max",
+        );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Model 5: ChannelMetricsAtomic counter battery under concurrent transitions
+//
+// Mirrors `src/adapter/net/redex/replication_metrics.rs:140-175`.
+// Multiple counters (sync_bytes_total, leader_changes_total,
+// under_capacity_total, skip_ahead_total, election_thrash_total,
+// witness_withdrawals_total) all use Relaxed fetch_add. Under
+// concurrent runtime tasks driving state transitions on multiple
+// channels, the counters MUST reflect every increment — no lost
+// updates.
+//
+// Same shape as Model 1 (StatsModel) but applied to the
+// replication-specific counters that the runtime + coordinator
+// bump from the hot path.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct ReplicationMetricsModel {
+    sync_bytes_total: AtomicU64,
+    leader_changes_total: AtomicU64,
+    under_capacity_total: AtomicU64,
+}
+
+impl ReplicationMetricsModel {
+    fn incr_sync_bytes(&self, bytes: u64) {
+        self.sync_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+    }
+    fn incr_leader_change(&self) {
+        self.leader_changes_total.fetch_add(1, Ordering::Relaxed);
+    }
+    fn incr_under_capacity(&self) {
+        self.under_capacity_total.fetch_add(1, Ordering::Relaxed);
+    }
+    fn totals(&self) -> (u64, u64, u64) {
+        (
+            self.sync_bytes_total.load(Ordering::Relaxed),
+            self.leader_changes_total.load(Ordering::Relaxed),
+            self.under_capacity_total.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[test]
+fn replication_metrics_counters_atomic_under_concurrent_increments() {
+    loom::model(|| {
+        let m = Arc::new(ReplicationMetricsModel::default());
+
+        // Thread A: simulates a leader handling one sync request
+        // (1024 bytes shipped) + one transition into Leader role.
+        let a = {
+            let m = m.clone();
+            thread::spawn(move || {
+                m.incr_sync_bytes(1024);
+                m.incr_leader_change();
+            })
+        };
+        // Thread B: simulates a replica observing a disk-pressure
+        // event (one under_capacity bump) + a leadership transition.
+        let b = {
+            let m = m.clone();
+            thread::spawn(move || {
+                m.incr_under_capacity();
+                m.incr_leader_change();
+            })
+        };
+
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let (bytes, leader_changes, under_cap) = m.totals();
+        // Every increment lands; no lost updates.
+        assert_eq!(bytes, 1024);
+        assert_eq!(leader_changes, 2, "both threads bumped leader_changes");
+        assert_eq!(under_cap, 1);
+    });
+}

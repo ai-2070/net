@@ -486,13 +486,20 @@ Implementable in isolation; does not depend on Capability B/F. **Landed.**
 - 🔜 **Witness withdrawal**: every peer replica that observes a leadership transition issues `Mesh::withdraw_chain` in parallel with its own state transition. Phase F item — needs the DST harness to verify the timing claim ("strictly faster than disconnect-observer reaping").
 - ⚠️ DST harness verification of partition-safety properties (no two leaders within a single partition; election determinism under asymmetric RTT; witness-withdrawal timing): tracked under Phase F. The pure function's contract is pinned in unit tests; the broader-system convergence guarantee waits for the DST harness.
 
-### Phase F — DST harness extension (1.5–3 weeks; widest variance) ⚠️ deferred as a separate workstream
+### Phase F — DST harness extension (1.5–3 weeks; widest variance) ⚠️ loom concurrency models landed; partition + fault-injection harness deferred
 
 **Hard prerequisite: Phases C, D, E of this plan + Capability F.** All prerequisites are now ✅.
 
-This is the gating phase for production confidence. The pure-logic pieces have unit tests pinning their contracts (277 redex tests covering state machine, election, catchup, retention, etc.). The end-to-end behavior is proven on the real mesh wire via `tests/redex_replication_e2e.rs` (4 scenarios: catch-up, heartbeat round-trip, failover, 3-node fanout). The remaining DST work covers the adversarial-scheduler + fault-injection scenarios that real-wire tests can't exercise deterministically.
+This is the gating phase for production confidence. The pure-logic pieces have unit tests pinning their contracts (281 redex tests covering state machine, election, catchup, retention, etc.). The end-to-end behavior is proven on the real mesh wire via `tests/redex_replication_e2e.rs` (4 scenarios: catch-up, heartbeat round-trip, failover, 3-node fanout). The remaining DST work covers the adversarial-scheduler + fault-injection scenarios that real-wire tests can't exercise deterministically.
 
-**Deferred as a separate workstream** — building the partition + failure-injection harness on top of the existing `loom_models.rs` requires:
+**Loom concurrency models** ✅ — 3 new models in `tests/loom_models.rs` pin the production atomic patterns under loom's exhaustive thread-interleaving exploration:
+- `record_tail_seq_converges_on_max_under_concurrent_updates` — the monotonic-max CAS loop from `ReplicationCoordinator::record_tail_seq` converges on `max(initial, every_proposal)` under any interleaving of concurrent producers.
+- `record_tail_seq_lower_proposal_does_not_regress_existing` — a smaller racing proposal can never roll back the committed max.
+- `replication_metrics_counters_atomic_under_concurrent_increments` — the `ChannelMetricsAtomic` Relaxed-fetch-add battery (sync_bytes_total, leader_changes_total, under_capacity_total, etc.) preserves every increment under concurrent runtime tasks bumping in parallel.
+
+Run via `RUSTFLAGS="--cfg loom" cargo test --release --test loom_models`. All 8 loom tests (5 pre-existing + 3 new) pass.
+
+**Partition + fault-injection harness still deferred** — building the full DST extension on top of the loom models requires:
 
 - Extending `loom_models.rs` to model the 4-state replication state machine (`Leader` / `Replica` / `Candidate` / `Idle`) with the locked transitions from [§3](#3-replicationcoordinator).
 - Failure-injection scenarios: random partition, leader crash, replica crash, partial-network (one replica isolated), restart-during-sync, partition-heal-with-stale-leader, asymmetric-RTT.
