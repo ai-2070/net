@@ -1,0 +1,25 @@
+.github/workflows/ci.yml
+  s_9163f300668f8b::t_26e793578575ed 74-85
+  s_9163f300668f8b::t_9eb2282479fd17 97-135
+net/crates/net/src/adapter/net/redex/config.rs
+  s_9163f300668f8b::t_f9b97f7b8719f7 93
+net/crates/net/src/adapter/net/redex/replication_heartbeat.rs
+  s_9163f300668f8b::t_615495318a0447 35-37
+  s_9163f300668f8b::t_d1306354523de8 206-208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "b5deb5d2ad5ef9e25a9dca09c7a4d3d10be9008e",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
