@@ -227,6 +227,15 @@ impl GreedyMetricsRegistry {
     /// Get-or-create the per-channel counter set for `channel`.
     /// Channels past [`MAX_TRACKED_CHANNELS`] fold into the
     /// `__overflow__` bucket.
+    ///
+    /// **Soft cap.** The `len() < MAX` check is a separate read
+    /// from the subsequent `entry().or_insert_with(...)`, so two
+    /// threads racing past the boundary can both insert (each
+    /// bumping `len` past `MAX_TRACKED_CHANNELS` by one). DashMap's
+    /// sharded layout bounds the overshoot to a small constant per
+    /// shard; the cap is documented as "approximately MAX," not a
+    /// hard ceiling. Hard-capping would require a global lock and
+    /// is not worth the cost — `for_channel` is on the hot path.
     pub fn for_channel(&self, channel: &str) -> Arc<GreedyChannelMetricsAtomic> {
         if let Some(m) = self.channels.get(channel) {
             return m.clone();

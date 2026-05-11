@@ -177,6 +177,20 @@ pub fn blob_adapter_registered(adapter_id: &str) -> bool {
     global_blob_adapter_registry().get(adapter_id).is_some()
 }
 
+/// Drop every adapter registration. Called from the binding's
+/// `atexit` hook so any `PyBlobAdapter` holding a `Py<PyAny>` is
+/// dropped while the interpreter is still alive and the GIL is
+/// still acquirable. Without this, a `Py<PyAny>` cleanup after
+/// interpreter finalization aborts the process via PyO3's safety
+/// guard. Idempotent.
+#[pyfunction]
+pub fn _drain_blob_adapters() {
+    let registry = global_blob_adapter_registry();
+    for id in registry.ids() {
+        let _ = registry.unregister(&id);
+    }
+}
+
 /// Snapshot of currently-registered adapter ids.
 #[pyfunction]
 pub fn blob_adapter_ids() -> Vec<String> {

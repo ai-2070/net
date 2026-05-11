@@ -298,6 +298,17 @@ type RedexFileConfig struct {
 // =====================================================================
 // Redex lifecycle
 // =====================================================================
+//
+// Both NewRedex constructors install a finalizer that calls Close
+// on GC. The finalizer is a safety net for callers who forget the
+// explicit Close. **Prefer explicit Close**: the substrate's
+// net_redex_free wait_until_quiesced step can block waiting for
+// in-flight operations, and Go runs finalizers on a GC-owned
+// goroutine that should not stall. The same pattern is used by
+// every Go binding handle in this crate (Net, NetStream, Mesh,
+// etc.); it's a known shared footgun, not a dataforts regression.
+// Callers in long-running processes should pair every constructor
+// with a `defer r.Close()` and not rely on the finalizer.
 
 // NewRedex constructs an empty heap-only Redex manager. Never
 // fails; the returned handle is non-nil.

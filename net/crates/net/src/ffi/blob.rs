@@ -720,7 +720,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("net-ffi-blob-{}", id));
         let id_c = CString::new(id.clone()).unwrap();
         let root_c = CString::new(root.to_string_lossy().as_ref()).unwrap();
-        let uri_c = CString::new("ffi://round-trip").unwrap();
+        let uri_c = CString::new("file:///ffi-round-trip").unwrap();
 
         unsafe {
             assert_eq!(
@@ -742,11 +742,11 @@ mod tests {
             );
             assert_eq!(rc, 0);
             assert!(!out_buf.is_null());
-            // First byte is the discriminator.
+            // First bytes are the BlobRef magic.
             let encoded = std::slice::from_raw_parts(out_buf, out_len);
             assert_eq!(
-                encoded[0],
-                crate::adapter::net::dataforts::BLOB_REF_DISCRIMINATOR
+                &encoded[..4],
+                &crate::adapter::net::dataforts::BLOB_REF_MAGIC,
             );
 
             // Resolve back through the same adapter.

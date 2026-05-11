@@ -2282,6 +2282,18 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(blob::blob_publish, m)?)?;
         m.add_function(wrap_pyfunction!(blob::blob_resolve, m)?)?;
         m.add("BlobError", m.py().get_type::<blob::BlobError>())?;
+
+        // Register an atexit hook so the global blob-adapter
+        // registry is drained while the interpreter is still
+        // alive. Python-implemented adapters hold a Py<PyAny>;
+        // dropping one after interpreter finalization aborts the
+        // process via PyO3's safety guard. Draining here on
+        // shutdown frees those refs while the GIL is still
+        // acquirable.
+        let py = m.py();
+        let drain_fn = wrap_pyfunction!(blob::_drain_blob_adapters, m)?;
+        let atexit = py.import("atexit")?;
+        atexit.call_method1("register", (drain_fn,))?;
     }
     #[cfg(feature = "compute")]
     {

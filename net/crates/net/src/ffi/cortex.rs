@@ -352,6 +352,54 @@ pub extern "C" fn net_redex_free(handle: *mut RedexHandle) {
 // FFI because there's no shared SDK wrapper — every binding goes
 // straight against the core `Redex` types.
 
+/// RAII guard around the `*mut Arc<MeshNode>` handle the
+/// `net_redex_enable_*` family of FFI entries receives. The
+/// caller contract is "the Arc is consumed regardless of return
+/// code"; without a guard every error path has to remember to
+/// drop the Box manually. Holding the pointer in a guard and
+/// calling `.take()` only on the success path keeps the drop
+/// branch single-sourced — and a future error variant added to
+/// any of these functions automatically inherits the leak-free
+/// behavior.
+///
+/// Constructed via `MeshArcOwned::new` after the FFI's null-check,
+/// consumed via `.take()` on the success path. The Drop impl
+/// frees the Box on every other exit (including panics, though
+/// these are also caught by `catch_unwind` at the FFI boundary).
+struct MeshArcOwned {
+    ptr: *mut Arc<crate::adapter::net::MeshNode>,
+}
+
+impl MeshArcOwned {
+    /// # Safety
+    /// `ptr` must be a non-null pointer produced by
+    /// `net_mesh_arc_clone` and not yet consumed.
+    unsafe fn new(ptr: *mut Arc<crate::adapter::net::MeshNode>) -> Self {
+        Self { ptr }
+    }
+
+    /// Take the Arc out of the guard, leaving Drop to no-op. Use
+    /// only on the success path.
+    ///
+    /// # Safety
+    /// Same conditions as [`Self::new`].
+    unsafe fn take(mut self) -> Arc<crate::adapter::net::MeshNode> {
+        let ptr = std::mem::replace(&mut self.ptr, std::ptr::null_mut());
+        unsafe { *Box::from_raw(ptr) }
+    }
+}
+
+impl Drop for MeshArcOwned {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: ptr was produced by `Box::into_raw` on the
+            // caller side (`net_mesh_arc_clone`) and is consumed
+            // here at most once because `take()` clears it.
+            unsafe { drop(Box::from_raw(self.ptr)) };
+        }
+    }
+}
+
 /// Install cross-node replication on this `Redex`. Consumes the
 /// `*mut Arc<MeshNode>` boxed pointer produced by
 /// `net_mesh_arc_clone` — caller MUST NOT free it again
@@ -369,36 +417,25 @@ pub extern "C" fn net_redex_enable_replication(
     redex: *mut RedexHandle,
     mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
 ) -> c_int {
-    // R-8: free `mesh_arc` on every error path. The Go binding
-    // (and every other C consumer) reads the rc + assumes the
-    // Arc was consumed regardless; without this drop the boxed
-    // Arc leaks on every NullPointer / ShuttingDown return.
     if redex.is_null() || mesh_arc.is_null() {
         if !mesh_arc.is_null() {
             // SAFETY: caller documented `mesh_arc` as produced by
             // `net_mesh_arc_clone`. Drop now to honor the
             // "consumed regardless" contract.
-            unsafe {
-                drop(Box::from_raw(mesh_arc));
-            }
+            unsafe { drop(Box::from_raw(mesh_arc)) };
         }
         return NetError::NullPointer.into();
     }
+    // SAFETY: caller documented `mesh_arc` as produced by
+    // `net_mesh_arc_clone`; checked non-null just above.
+    let arc_guard = unsafe { MeshArcOwned::new(mesh_arc) };
     let redex_ref = unsafe { &*redex };
     let _op = match redex_ref.guard.try_enter() {
         Some(op) => op,
-        None => {
-            // SAFETY: as above; drop the Arc the caller already
-            // gave up ownership of.
-            unsafe {
-                drop(Box::from_raw(mesh_arc));
-            }
-            return NetError::ShuttingDown.into();
-        }
+        None => return NetError::ShuttingDown.into(),
     };
-    // SAFETY: `mesh_arc` is documented as produced by
-    // `net_mesh_arc_clone`; consume the Box, take the Arc.
-    let mesh = unsafe { *Box::from_raw(mesh_arc) };
+    // SAFETY: take consumes the guard; subsequent exits no-op on Drop.
+    let mesh = unsafe { arc_guard.take() };
     redex_ref.inner.enable_replication(mesh);
     0
 }
@@ -571,29 +608,21 @@ pub extern "C" fn net_redex_enable_greedy_dataforts(
 ) -> c_int {
     if redex.is_null() || mesh_arc.is_null() {
         if !mesh_arc.is_null() {
-            unsafe {
-                drop(Box::from_raw(mesh_arc));
-            }
+            unsafe { drop(Box::from_raw(mesh_arc)) };
         }
         return NetError::NullPointer.into();
     }
+    // SAFETY: just verified non-null; documented as a Box from `net_mesh_arc_clone`.
+    let arc_guard = unsafe { MeshArcOwned::new(mesh_arc) };
     let redex_ref = unsafe { &*redex };
     let _op = match redex_ref.guard.try_enter() {
         Some(op) => op,
-        None => {
-            unsafe {
-                drop(Box::from_raw(mesh_arc));
-            }
-            return NetError::ShuttingDown.into();
-        }
+        None => return NetError::ShuttingDown.into(),
     };
     let cfg_json: RedexGreedyConfigJson = if config_json.is_null() {
         RedexGreedyConfigJson::default()
     } else {
         let Some(s) = (unsafe { c_str_to_owned(config_json) }) else {
-            unsafe {
-                drop(Box::from_raw(mesh_arc));
-            }
             return NetError::InvalidUtf8.into();
         };
         if s.is_empty() {
@@ -601,25 +630,15 @@ pub extern "C" fn net_redex_enable_greedy_dataforts(
         } else {
             match serde_json::from_str(&s) {
                 Ok(v) => v,
-                Err(_) => {
-                    unsafe {
-                        drop(Box::from_raw(mesh_arc));
-                    }
-                    return NetError::InvalidJson.into();
-                }
+                Err(_) => return NetError::InvalidJson.into(),
             }
         }
     };
     let cfg = match cfg_json.into_config() {
         Ok(c) => c,
-        Err(_) => {
-            unsafe {
-                drop(Box::from_raw(mesh_arc));
-            }
-            return NET_ERR_REDEX;
-        }
+        Err(_) => return NET_ERR_REDEX,
     };
-    let mesh = unsafe { *Box::from_raw(mesh_arc) };
+    let mesh = unsafe { arc_guard.take() };
     let local_caps = Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default());
     let registry = crate::adapter::net::behavior::placement::IntentRegistry::defaults();
     match redex_ref
@@ -750,29 +769,21 @@ pub extern "C" fn net_redex_enable_gravity_for_greedy(
 ) -> c_int {
     if redex.is_null() || mesh_arc.is_null() {
         if !mesh_arc.is_null() {
-            unsafe {
-                drop(Box::from_raw(mesh_arc));
-            }
+            unsafe { drop(Box::from_raw(mesh_arc)) };
         }
         return NetError::NullPointer.into();
     }
+    // SAFETY: just verified non-null; documented as a Box from `net_mesh_arc_clone`.
+    let arc_guard = unsafe { MeshArcOwned::new(mesh_arc) };
     let redex_ref = unsafe { &*redex };
     let _op = match redex_ref.guard.try_enter() {
         Some(op) => op,
-        None => {
-            unsafe {
-                drop(Box::from_raw(mesh_arc));
-            }
-            return NetError::ShuttingDown.into();
-        }
+        None => return NetError::ShuttingDown.into(),
     };
     let cfg_json: RedexGravityConfigJson = if config_json.is_null() {
         RedexGravityConfigJson::default()
     } else {
         let Some(s) = (unsafe { c_str_to_owned(config_json) }) else {
-            unsafe {
-                drop(Box::from_raw(mesh_arc));
-            }
             return NetError::InvalidUtf8.into();
         };
         if s.is_empty() {
@@ -780,17 +791,12 @@ pub extern "C" fn net_redex_enable_gravity_for_greedy(
         } else {
             match serde_json::from_str(&s) {
                 Ok(v) => v,
-                Err(_) => {
-                    unsafe {
-                        drop(Box::from_raw(mesh_arc));
-                    }
-                    return NetError::InvalidJson.into();
-                }
+                Err(_) => return NetError::InvalidJson.into(),
             }
         }
     };
     let (policy, tick) = cfg_json.into_policy_and_tick();
-    let mesh = unsafe { *Box::from_raw(mesh_arc) };
+    let mesh = unsafe { arc_guard.take() };
     match redex_ref
         .inner
         .enable_gravity_for_greedy(mesh, policy, tick)

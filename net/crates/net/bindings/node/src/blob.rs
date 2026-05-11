@@ -285,13 +285,24 @@ impl NodeBlobAdapter {
         fetch_range: FetchRangeTsfn,
         exists: ExistsTsfn,
     ) -> Self {
+        Self::new_with_timeout(id, store, fetch, fetch_range, exists, DEFAULT_JS_ADAPTER_TIMEOUT)
+    }
+
+    pub fn new_with_timeout(
+        id: String,
+        store: StoreTsfn,
+        fetch: FetchTsfn,
+        fetch_range: FetchRangeTsfn,
+        exists: ExistsTsfn,
+        timeout: Duration,
+    ) -> Self {
         Self {
             id,
             store,
             fetch,
             fetch_range,
             exists,
-            timeout: DEFAULT_JS_ADAPTER_TIMEOUT,
+            timeout,
         }
     }
 }
@@ -443,8 +454,8 @@ impl BlobAdapter for NodeBlobAdapter {
 /// - `existsFn({ uri, hash, size }) -> boolean`
 ///
 /// JS-thrown errors collapse to `BlobError::Backend(err)`. Per-call
-/// timeout defaults to 30 s; longer-running adapters should be
-/// implemented in Rust.
+/// `timeoutMs` defaults to 30 s; longer-running adapters should be
+/// implemented in Rust. Pass `null` / omit to keep the default.
 ///
 /// For Promise-returning JS methods, use
 /// [`register_async_blob_adapter`] instead.
@@ -455,12 +466,17 @@ pub fn register_blob_adapter(
     fetch_fn: Function<'static, JsBlobFetchArgs, Buffer>,
     fetch_range_fn: Function<'static, JsBlobFetchRangeArgs, Buffer>,
     exists_fn: Function<'static, JsBlobFetchArgs, bool>,
+    timeout_ms: Option<u32>,
 ) -> Result<()> {
     let store: StoreTsfn = store_fn.build_threadsafe_function().build()?;
     let fetch: FetchTsfn = fetch_fn.build_threadsafe_function().build()?;
     let fetch_range: FetchRangeTsfn = fetch_range_fn.build_threadsafe_function().build()?;
     let exists: ExistsTsfn = exists_fn.build_threadsafe_function().build()?;
-    let wrapper = NodeBlobAdapter::new(id.clone(), store, fetch, fetch_range, exists);
+    let timeout = timeout_ms
+        .map(|ms| Duration::from_millis(ms as u64))
+        .unwrap_or(DEFAULT_JS_ADAPTER_TIMEOUT);
+    let wrapper =
+        NodeBlobAdapter::new_with_timeout(id.clone(), store, fetch, fetch_range, exists, timeout);
     let arc: Arc<dyn BlobAdapter> = Arc::new(wrapper);
     global_blob_adapter_registry()
         .register(arc)
@@ -507,13 +523,24 @@ impl NodeAsyncBlobAdapter {
         fetch_range: FetchRangeAsyncTsfn,
         exists: ExistsAsyncTsfn,
     ) -> Self {
+        Self::new_with_timeout(id, store, fetch, fetch_range, exists, DEFAULT_JS_ADAPTER_TIMEOUT)
+    }
+
+    pub fn new_with_timeout(
+        id: String,
+        store: StoreAsyncTsfn,
+        fetch: FetchAsyncTsfn,
+        fetch_range: FetchRangeAsyncTsfn,
+        exists: ExistsAsyncTsfn,
+        timeout: Duration,
+    ) -> Self {
         Self {
             id,
             store,
             fetch,
             fetch_range,
             exists,
-            timeout: DEFAULT_JS_ADAPTER_TIMEOUT,
+            timeout,
         }
     }
 }
@@ -686,9 +713,10 @@ impl BlobAdapter for NodeAsyncBlobAdapter {
 /// - `existsFn({ uri, hash, size }) -> Promise<boolean>`
 ///
 /// The substrate awaits each Promise from a tokio task; the JS
-/// event loop drives resolution. Per-call timeout defaults to 30 s
-/// (the same as the sync bridge) and applies to BOTH stages — JS
-/// returning the Promise, and the Promise resolving.
+/// event loop drives resolution. Per-call `timeoutMs` defaults to
+/// 30 s (the same as the sync bridge) and is the **total budget**
+/// across both stages — JS returning the Promise, and the Promise
+/// resolving. Pass `null` / omit to keep the default.
 ///
 /// Rejected Promises collapse to `BlobError::Backend(reason)`.
 #[napi]
@@ -698,12 +726,23 @@ pub fn register_async_blob_adapter(
     fetch_fn: Function<'static, JsBlobFetchArgs, Promise<Buffer>>,
     fetch_range_fn: Function<'static, JsBlobFetchRangeArgs, Promise<Buffer>>,
     exists_fn: Function<'static, JsBlobFetchArgs, Promise<bool>>,
+    timeout_ms: Option<u32>,
 ) -> Result<()> {
     let store: StoreAsyncTsfn = store_fn.build_threadsafe_function().build()?;
     let fetch: FetchAsyncTsfn = fetch_fn.build_threadsafe_function().build()?;
     let fetch_range: FetchRangeAsyncTsfn = fetch_range_fn.build_threadsafe_function().build()?;
     let exists: ExistsAsyncTsfn = exists_fn.build_threadsafe_function().build()?;
-    let wrapper = NodeAsyncBlobAdapter::new(id.clone(), store, fetch, fetch_range, exists);
+    let timeout = timeout_ms
+        .map(|ms| Duration::from_millis(ms as u64))
+        .unwrap_or(DEFAULT_JS_ADAPTER_TIMEOUT);
+    let wrapper = NodeAsyncBlobAdapter::new_with_timeout(
+        id.clone(),
+        store,
+        fetch,
+        fetch_range,
+        exists,
+        timeout,
+    );
     let arc: Arc<dyn BlobAdapter> = Arc::new(wrapper);
     global_blob_adapter_registry()
         .register(arc)

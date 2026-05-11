@@ -1642,12 +1642,14 @@ mod tests {
         #[tokio::test]
         async fn resolve_one_errors_when_blob_adapter_id_unset() {
             // BlobRef payload but no blob_adapter_id configured on
-            // the channel — surfaces as UnsupportedScheme. The
-            // adapter for `BlobRef.uri` may exist in the registry,
-            // but the channel didn't opt in; refuse to fetch.
+            // the channel — surfaces as AdapterNotConfigured (the
+            // typed variant the substrate exposes since the
+            // dataforts review; previously overloaded onto
+            // UnsupportedScheme, which conflated config issues with
+            // URI-scheme rejection).
             let payload = b"any";
             let blob = BlobRef::new(
-                "fs://orphan",
+                "file:///orphan",
                 blake3::hash(payload).into(),
                 payload.len() as u64,
             );
@@ -1655,7 +1657,7 @@ mod tests {
             let f = RedexFile::new(ChannelName::new("resolve-orphan").unwrap(), cfg);
             let seq = f.append(&blob.encode()).unwrap();
             let err = f.resolve_one(seq).await.unwrap_err();
-            assert!(matches!(err, BlobError::UnsupportedScheme(_)));
+            assert!(matches!(err, BlobError::AdapterNotConfigured));
         }
 
         #[tokio::test]
@@ -1663,7 +1665,7 @@ mod tests {
             // Channel points at adapter id "ghost" which no one registered.
             let payload = b"any";
             let blob = BlobRef::new(
-                "fs://ghost",
+                "file:///ghost",
                 blake3::hash(payload).into(),
                 payload.len() as u64,
             );
@@ -1672,7 +1674,7 @@ mod tests {
             let f = RedexFile::new(ChannelName::new("resolve-ghost").unwrap(), cfg);
             let seq = f.append(&blob.encode()).unwrap();
             let err = f.resolve_one(seq).await.unwrap_err();
-            assert!(matches!(err, BlobError::UnsupportedScheme(_)));
+            assert!(matches!(err, BlobError::AdapterNotRegistered(_)));
         }
 
         #[tokio::test]
