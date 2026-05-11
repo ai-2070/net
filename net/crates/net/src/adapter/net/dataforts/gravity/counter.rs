@@ -219,9 +219,7 @@ impl HeatRegistry {
         half_life: Duration,
         now: Instant,
     ) -> &mut HeatCounter {
-        if !self.counters.contains_key(&channel)
-            && self.cap > 0
-            && self.counters.len() >= self.cap
+        if !self.counters.contains_key(&channel) && self.cap > 0 && self.counters.len() >= self.cap
         {
             self.evict_lru();
         }

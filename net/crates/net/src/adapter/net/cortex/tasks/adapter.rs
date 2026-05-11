@@ -214,6 +214,40 @@ impl TasksAdapter {
         self.inner.wait_for_token(token, deadline).await
     }
 
+    /// Non-blocking RYW poll. Synchronously checks origin binding +
+    /// the applied watermark and returns without scheduling any
+    /// wait. Use for "is my write visible yet?" queries where the
+    /// caller doesn't want to block:
+    ///
+    /// - `Ok(())` — the write is observable; subsequent reads see it.
+    /// - `Err(WaitForTokenError::WrongOrigin {..})` — the token's
+    ///   `origin_hash` doesn't match this adapter's bound origin.
+    /// - `Err(WaitForTokenError::FoldStopped {..})` — the fold task
+    ///   has stopped before reaching the target seq; the write will
+    ///   never become observable.
+    /// - `Err(WaitForTokenError::Timeout)` — not yet (try again later).
+    ///
+    /// Mirrors the FFI's `timeout_ms == 0` shape so every binding
+    /// can expose a "poll, don't wait" entry point with consistent
+    /// semantics. No semaphore permit is taken; `QueueFull` is not
+    /// reachable on this path.
+    pub fn poll_for_token(&self, token: WriteToken) -> Result<(), WaitForTokenError> {
+        if token.origin_hash != self.origin_hash {
+            self.inner.note_wrong_origin();
+            return Err(WaitForTokenError::WrongOrigin {
+                token_origin: token.origin_hash,
+                adapter_origin: self.origin_hash,
+            });
+        }
+        match self.inner.applied_through_seq() {
+            Some(applied) if applied >= token.seq => Ok(()),
+            _ if !self.inner.is_running() => Err(WaitForTokenError::FoldStopped {
+                applied_through_seq: self.inner.applied_through_seq(),
+            }),
+            _ => Err(WaitForTokenError::Timeout),
+        }
+    }
+
     /// Close the adapter. See [`CortexAdapter::close`].
     pub fn close(&self) -> Result<(), CortexAdapterError> {
         self.inner.close()

@@ -242,12 +242,9 @@ pub fn blob_publish<'py>(
     let data_len = data.len();
     let bytes = py
         .detach(|| -> Result<Vec<u8>, InnerBlobError> {
-            let data_owned: Vec<u8> = unsafe {
-                std::slice::from_raw_parts(data_addr as *const u8, data_len).to_vec()
-            };
-            rt.block_on(async move {
-                publish_blob(adapter.as_ref(), uri, &data_owned).await
-            })
+            let data_owned: Vec<u8> =
+                unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len).to_vec() };
+            rt.block_on(async move { publish_blob(adapter.as_ref(), uri, &data_owned).await })
         })
         .map_err(map_blob_err)?;
     Ok(PyBytes::new(py, &bytes))
@@ -281,9 +278,7 @@ pub fn blob_resolve<'py>(
             let payload_owned: Vec<u8> = unsafe {
                 std::slice::from_raw_parts(payload_addr as *const u8, payload_len).to_vec()
             };
-            rt.block_on(async move {
-                resolve_payload(&payload_owned, adapter.as_ref()).await
-            })
+            rt.block_on(async move { resolve_payload(&payload_owned, adapter.as_ref()).await })
         })
         .map_err(map_blob_err)?;
     Ok(PyBytes::new(py, &bytes))

@@ -1153,6 +1153,12 @@ impl PyTasksAdapter {
     /// Raises `CortexError` on timeout, on a wrong-origin token, or
     /// when the per-channel wait queue is saturated. GIL is released
     /// for the wait.
+    ///
+    /// `deadline_ms == 0` is a non-blocking poll: returns
+    /// immediately with success when the watermark already covers
+    /// `token.seq`, or a typed `CortexError` (timeout / wrong-origin
+    /// / fold-stopped) otherwise. Mirrors the FFI / Node / Go
+    /// `timeout_ms == 0` contract so all four bindings agree.
     #[pyo3(signature = (token, deadline_ms = 1000))]
     fn wait_for_token(
         &self,
@@ -1161,8 +1167,13 @@ impl PyTasksAdapter {
         deadline_ms: u64,
     ) -> PyResult<()> {
         let inner = self.inner.clone();
-        let runtime = self.runtime.clone();
         let inner_token = token.as_inner();
+        if deadline_ms == 0 {
+            return inner
+                .poll_for_token(inner_token)
+                .map_err(map_wait_for_token_err);
+        }
+        let runtime = self.runtime.clone();
         py.detach(|| {
             runtime.block_on(async move {
                 inner
@@ -1653,7 +1664,8 @@ impl PyMemoriesAdapter {
 
     /// Read-your-writes wait. Mirrors `TasksAdapter.wait_for_token`
     /// — raises `CortexError` on timeout, wrong-origin, or queue-
-    /// full saturation.
+    /// full saturation. `deadline_ms == 0` is a non-blocking poll
+    /// (same contract as the FFI / Node / Go bindings).
     #[pyo3(signature = (token, deadline_ms = 1000))]
     fn wait_for_token(
         &self,
@@ -1662,8 +1674,13 @@ impl PyMemoriesAdapter {
         deadline_ms: u64,
     ) -> PyResult<()> {
         let inner = self.inner.clone();
-        let runtime = self.runtime.clone();
         let inner_token = token.as_inner();
+        if deadline_ms == 0 {
+            return inner
+                .poll_for_token(inner_token)
+                .map_err(map_wait_for_token_err);
+        }
+        let runtime = self.runtime.clone();
         py.detach(|| {
             runtime.block_on(async move {
                 inner

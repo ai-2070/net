@@ -251,6 +251,26 @@ impl MemoriesAdapter {
         self.inner.wait_for_token(token, deadline).await
     }
 
+    /// Non-blocking RYW poll. See
+    /// [`super::super::tasks::TasksAdapter::poll_for_token`] for the
+    /// full contract — identical shape for Memories.
+    pub fn poll_for_token(&self, token: WriteToken) -> Result<(), WaitForTokenError> {
+        if token.origin_hash != self.origin_hash {
+            self.inner.note_wrong_origin();
+            return Err(WaitForTokenError::WrongOrigin {
+                token_origin: token.origin_hash,
+                adapter_origin: self.origin_hash,
+            });
+        }
+        match self.inner.applied_through_seq() {
+            Some(applied) if applied >= token.seq => Ok(()),
+            _ if !self.inner.is_running() => Err(WaitForTokenError::FoldStopped {
+                applied_through_seq: self.inner.applied_through_seq(),
+            }),
+            _ => Err(WaitForTokenError::Timeout),
+        }
+    }
+
     /// Close the adapter. See [`CortexAdapter::close`].
     pub fn close(&self) -> Result<(), CortexAdapterError> {
         self.inner.close()

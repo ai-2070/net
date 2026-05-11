@@ -89,24 +89,26 @@ pub(crate) const NET_ERR_PANIC: c_int = -108;
 /// caller passes timeout_ms == 0 to mean "is the write visible
 /// yet?" without scheduling a Notified future.
 fn tasks_poll_for_token(adapter: &Arc<InnerTasksAdapter>, token: InnerWriteToken) -> c_int {
-    if token.origin_hash != adapter.origin_hash() {
-        return NET_ERR_WRONG_ORIGIN;
-    }
-    match adapter.as_cortex().applied_through_seq() {
-        Some(applied) if applied >= token.seq => 0,
-        _ if !adapter.as_cortex().is_running() => NET_ERR_FOLD_STOPPED,
-        _ => NET_ERR_TIMEOUT,
+    // Route through the adapter's public poll method so the FFI
+    // and every binding consume the same shape; previously the
+    // FFI had its own copy of the logic which the Python binding
+    // didn't share, producing observable divergence on
+    // `timeout_ms == 0` (now fixed in the Python `wait_for_token`
+    // by special-casing zero through this same call).
+    match adapter.poll_for_token(token) {
+        Ok(()) => 0,
+        Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+        Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
+        Err(_) => NET_ERR_TIMEOUT,
     }
 }
 
 fn memories_poll_for_token(adapter: &Arc<InnerMemoriesAdapter>, token: InnerWriteToken) -> c_int {
-    if token.origin_hash != adapter.origin_hash() {
-        return NET_ERR_WRONG_ORIGIN;
-    }
-    match adapter.as_cortex().applied_through_seq() {
-        Some(applied) if applied >= token.seq => 0,
-        _ if !adapter.as_cortex().is_running() => NET_ERR_FOLD_STOPPED,
-        _ => NET_ERR_TIMEOUT,
+    match adapter.poll_for_token(token) {
+        Ok(()) => 0,
+        Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+        Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
+        Err(_) => NET_ERR_TIMEOUT,
     }
 }
 
