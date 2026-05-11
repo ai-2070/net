@@ -653,6 +653,9 @@ fn replication_metrics_counters_atomic_under_concurrent_increments() {
         };
         // Thread B: simulates a replica observing a disk-pressure
         // event (one under_capacity bump) + a leadership transition.
+        // Both threads bump leader_changes — loom explores every
+        // interleaving of the two fetch_add calls and asserts no
+        // lost update lands.
         let b = {
             let m = m.clone();
             thread::spawn(move || {
@@ -669,5 +672,28 @@ fn replication_metrics_counters_atomic_under_concurrent_increments() {
         assert_eq!(bytes, 1024);
         assert_eq!(leader_changes, 2, "both threads bumped leader_changes");
         assert_eq!(under_cap, 1);
+    });
+}
+
+/// Same-counter contention only — three concurrent increments to
+/// `leader_changes_total` must always land at 3 regardless of
+/// interleaving. A regression that swapped `fetch_add` for a
+/// `load + add + store` pattern would let loom find a lost-update
+/// schedule and fail this test.
+#[test]
+fn replication_metrics_same_counter_three_way_contention() {
+    loom::model(|| {
+        let m = Arc::new(ReplicationMetricsModel::default());
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let m = m.clone();
+                thread::spawn(move || m.incr_leader_change())
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let (_, leader_changes, _) = m.totals();
+        assert_eq!(leader_changes, 3, "no lost updates under contention");
     });
 }

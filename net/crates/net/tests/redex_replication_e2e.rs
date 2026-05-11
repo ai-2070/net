@@ -547,6 +547,12 @@ fn time_appends(
     start.elapsed()
 }
 
+// Marked `#[ignore]` because the ≤1.3× ratio asserts wall-clock
+// performance, which flakes on shared CI runners. Run locally
+// via `cargo test -- --ignored`. CI workflows that want to keep
+// this on-deck should run with `--ignored` on a dedicated bench
+// runner, not the default test matrix.
+#[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replication_overhead_within_30_percent_budget() {
     // Workload parameters chosen so each trial completes in well
@@ -663,11 +669,14 @@ async fn replication_overhead_within_30_percent_budget() {
 /// (matching the spec's "≤50%"); `ReplicationConfig::
 /// with_replication_budget_fraction` overrides per-channel.
 ///
-/// This test pins the budget actually fires under saturating
-/// load — bumps `under_capacity_total` would mean the bandwidth
-/// gate let the leader exceed its allotment.
+/// This test pins the per-channel metrics snapshot exposes
+/// `sync_bytes_total` and `under_capacity_total` fields populated
+/// from the live coordinator under the e2e wire path. It does NOT
+/// engage the budget (the 256-event burst is well within a 0.5×NIC
+/// allowance) — the actual budget-fired path is unit-tested under
+/// `replication_catchup` with synthetic load that exceeds capacity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bandwidth_budget_is_observable_in_metrics() {
+async fn bandwidth_budget_metric_field_is_plumbed() {
     let node_a = build_node().await;
     let node_b = build_node().await;
     handshake(&node_a, &node_b).await;
