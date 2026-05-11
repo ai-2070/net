@@ -516,6 +516,7 @@ async fn test_regression_fold_rejects_checksum_mismatch() {
     let cfg = CortexAdapterConfig {
         start: StartPosition::FromBeginning,
         on_fold_error: FoldErrorPolicy::Stop,
+        ..Default::default()
     };
     let adapter = CortexAdapter::<TasksState>::open(
         &redex,
