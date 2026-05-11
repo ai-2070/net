@@ -1,0 +1,21 @@
+net/crates/net/docs/misc/DATAFORTS_PLAN.md
+  s_4dbb97ea6ebffd::t_d992404c9e84b8 492
+  s_4dbb97ea6ebffd::t_b68fea54a9f6d3 17
+  s_4dbb97ea6ebffd::t_5b4d6fa89b251c 67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "a52a007a0875399b9a552fcb058543aca370be8c",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
