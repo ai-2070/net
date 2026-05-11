@@ -1,0 +1,35 @@
+net/crates/net/src/adapter/net/dataforts/blob/registry.rs
+  s_4dbb97ea6ebffd::t_8422cd55647ea9 1-179
+net/crates/net/src/adapter/net/dataforts/blob/noop.rs
+  s_4dbb97ea6ebffd::t_64256d1393ad20 1-97
+net/crates/net/src/adapter/net/dataforts/blob/adapter.rs
+  s_4dbb97ea6ebffd::t_352950b4935cf6 1-61
+net/crates/net/src/adapter/net/dataforts/blob/error.rs
+  s_4dbb97ea6ebffd::t_7ff75caad084e5 1-95
+net/crates/net/src/adapter/net/dataforts/blob/blob_ref.rs
+  s_4dbb97ea6ebffd::t_b4f074e1b4d825 1-221
+net/crates/net/Cargo.toml
+  s_4dbb97ea6ebffd::t_6f856e73639705 68
+  s_4dbb97ea6ebffd::t_6a3f432232c6a9 128-132
+net/crates/net/src/adapter/net/dataforts/mod.rs
+  s_4dbb97ea6ebffd::t_113f7e42419c88 38-43
+  s_4dbb97ea6ebffd::t_955b1e8c7e6f74 16-17
+net/crates/net/src/adapter/net/dataforts/blob/mod.rs
+  s_4dbb97ea6ebffd::t_749040ba68366e 1-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "13461d09955b5e3f67bd86f379edfcd726c89c8c",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
