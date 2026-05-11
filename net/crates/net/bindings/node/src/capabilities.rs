@@ -284,8 +284,8 @@ fn hardware_from_js(h: HardwareJs) -> HardwareCapabilities {
     if h.storage_gb.is_some() {
         hw = hw.with_storage(bigint_to_u64_or_zero(h.storage_gb));
     }
-    if let Some(mbps) = h.network_gbps {
-        hw = hw.with_network(mbps);
+    if let Some(gbps) = h.network_gbps {
+        hw = hw.with_network(gbps);
     }
     for a in h.accelerators.unwrap_or_default() {
         hw = hw.add_accelerator(accelerator_from_js(a));

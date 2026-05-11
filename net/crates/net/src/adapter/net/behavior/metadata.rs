@@ -217,9 +217,9 @@ pub struct TopologyHints {
     pub preferred_peers: Vec<NodeId>,
     /// Network tier classification
     pub tier: NetworkTier,
-    /// Uplink bandwidth in Mbps
+    /// Uplink bandwidth in Gbps
     pub uplink_gbps: Option<u32>,
-    /// Downlink bandwidth in Mbps
+    /// Downlink bandwidth in Gbps
     pub downlink_gbps: Option<u32>,
     /// NAT type
     pub nat_type: NatType,

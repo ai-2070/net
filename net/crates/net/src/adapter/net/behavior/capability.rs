@@ -205,7 +205,7 @@ pub struct HardwareCapabilities {
     pub additional_gpus: Vec<GpuInfo>,
     /// Storage in GB
     pub storage_gb: u64,
-    /// Network bandwidth in Mbps
+    /// Network bandwidth in Gbps
     pub network_gbps: u32,
     /// Accelerators (TPU, NPU, etc.)
     pub accelerators: Vec<AcceleratorInfo>,

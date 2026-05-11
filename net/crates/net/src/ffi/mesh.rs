@@ -2833,8 +2833,8 @@ fn hardware_from_json(h: HardwareJson) -> HardwareCapabilities {
     if let Some(mb) = h.storage_gb {
         hw = hw.with_storage(mb);
     }
-    if let Some(mbps) = h.network_gbps {
-        hw = hw.with_network(mbps);
+    if let Some(gbps) = h.network_gbps {
+        hw = hw.with_network(gbps);
     }
     for a in h.accelerators {
         hw = hw.add_accelerator(accelerator_from_json(a));

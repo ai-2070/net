@@ -222,8 +222,8 @@ fn hardware_from_dict(d: &Bound<'_, PyDict>) -> PyResult<HardwareCapabilities> {
     if let Some(mb) = get_opt_u64(d, "storage_gb")? {
         hw = hw.with_storage(mb);
     }
-    if let Some(mbps) = get_opt_u32(d, "network_gbps")? {
-        hw = hw.with_network(mbps);
+    if let Some(gbps) = get_opt_u32(d, "network_gbps")? {
+        hw = hw.with_network(gbps);
     }
     if let Some(list) = get_opt_list(d, "accelerators")? {
         for item in list.iter() {

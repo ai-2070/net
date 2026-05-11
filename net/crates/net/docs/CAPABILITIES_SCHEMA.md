@@ -66,7 +66,7 @@ Compute capabilities of the node — CPU, RAM, GPU, accelerators, persistent sto
 | `hardware.gpu.tensor_cores` | `number` (u16) | `0..=u16::MAX` | Tensor / matrix engine count. |
 | `hardware.gpu.fp16_tflops_x10` | `number` (u32) | `0..=u32::MAX` | FP16 TFLOPS scaled ×10 (so `825` = 82.5 TFLOPS). u32 because aggregated cluster figures overflow u16. |
 | `hardware.storage_gb` | `number` (u64) | `0..=u64::MAX` | Persistent storage in GB. |
-| `hardware.network_gbps` | `number` (u32) | `0..=u32::MAX` | Network bandwidth in Mbps. |
+| `hardware.network_gbps` | `number` (u32) | `0..=u32::MAX` | Network bandwidth in Gbps. |
 | `hardware.limits.max_concurrent_requests` | `number` (u32) | `0..=u32::MAX` | Per-node concurrency cap. |
 | `hardware.limits.max_tokens_per_request` | `number` (u32) | `0..=u32::MAX` | Per-request token cap. |
 | `hardware.limits.rate_limit_rpm` | `number` (u32) | `0..=u32::MAX` | Requests per minute. |

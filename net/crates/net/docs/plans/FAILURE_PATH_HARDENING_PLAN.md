@@ -348,7 +348,7 @@ Some of this is already clean (the crate mostly threads `Instant` through); some
 **Chaos.** Linux `tc` on loopback injects:
 
 - Packet loss (0%, 1%, 5%, 20% bands; rotate every hour).
-- Bandwidth caps (unlimited, 10 Mbps, 1 Mbps; rotate every hour).
+- Bandwidth caps (unlimited, 10 Gbps, 1 Gbps; rotate every hour).
 - Latency jitter (0 ms, 10 ms ± 5 ms, 100 ms ± 50 ms; rotate every hour).
 
 **Assertions.** After the 24-hour window:
