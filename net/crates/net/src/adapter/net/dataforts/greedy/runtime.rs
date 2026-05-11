@@ -410,16 +410,30 @@ impl GreedyRuntime {
         // the sink's batch path. The sink's default impl falls
         // back to per-chain calls; the MeshNode impl rewrites the
         // full capability set once and rebroadcasts once.
+        //
+        // Snapshot the policy reference so the normalization
+        // formula uses the operator-configured scale rather than a
+        // hard-coded saturating curve.
+        let policy = {
+            let gravity = self.inner.gravity.read();
+            gravity.as_ref().map(|g| g.policy.clone())
+        };
         let mut batch: Vec<(u64, Option<f64>)> = Vec::new();
         for (origin_hash, emission) in emissions {
             match emission {
                 super::super::gravity::HeatEmission::Suppress => {}
                 super::super::gravity::HeatEmission::Emit { rate } => {
-                    // Normalize unbounded rate to [0.0, 1.0] for
-                    // the wire encoding. Saturate above 1.0; the
-                    // substrate clamps anyway but normalize here
-                    // so the per-tick value is interpretable.
-                    let normalized = (rate / (rate + 1.0)).min(1.0);
+                    // Log-scale normalize unbounded rate to
+                    // [0.0, 1.0] using the policy's reference rate.
+                    // The previous `rate / (rate + 1)` form
+                    // saturated at the top end (every "warm"
+                    // chain looked identical to "blazing"); the
+                    // log form stretches the wire range across
+                    // useful operating rates.
+                    let normalized = policy
+                        .as_ref()
+                        .map(|p| p.normalize_rate_for_wire(rate))
+                        .unwrap_or_else(|| (rate / (rate + 1.0)).min(1.0));
                     batch.push((origin_hash, Some(normalized)));
                 }
                 super::super::gravity::HeatEmission::Withdraw => {

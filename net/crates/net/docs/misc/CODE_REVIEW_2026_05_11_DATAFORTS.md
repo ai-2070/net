@@ -47,7 +47,7 @@ Tagged `[B | H | M | L]`:
 | D-13  | H   | blob         | Adapter selected by channel config, not URI scheme — authority confusion  | ✅ |
 | D-14  | H   | blob         | `classify_payload` first-byte `0xB0` collides with arbitrary binary payloads | ✅ |
 | D-15  | H   | blob         | No max-blob-size on resolve / `u64::MAX` size accepted                     | ✅ |
-| D-16  | H   | blob         | `BlobAdapter` trait is all-in-memory; no streaming hooks                   | 🚫 deferred — trait-shape change, separate slice |
+| D-16  | H   | blob         | `BlobAdapter` trait is all-in-memory; no streaming hooks                   | ✅ (`fetch_stream` + `store_stream` with default-route-through; FS adapter chunks at 256 KiB) |
 | D-17  | H   | RYW          | `wait_for_token` returns `Ok` on fold-watermark including skipped events  | ✅ |
 | D-18  | H   | RYW          | `wait_for_token` returns `Ok` on `running == false` (fold-task stopped)    | ✅ |
 | D-19  | H   | RYW          | `WriteToken` is forgeable plain data; `pub` fields + `pub const fn new`    | ✅ (doc-hidden constructor + threat-model docstring) |

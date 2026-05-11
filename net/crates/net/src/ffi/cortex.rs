@@ -724,6 +724,11 @@ struct RedexGravityConfigJson {
     decay_half_life_secs: Option<u64>,
     /// Tick cadence in milliseconds. Default `500`.
     tick_interval_ms: Option<u64>,
+    /// Wire normalization reference rate. Higher value =
+    /// wider dynamic range on the [0.0, 1.0] wire encoding.
+    /// Default `1000.0`. See
+    /// `DataGravityPolicy::normalize_rate_for_wire`.
+    normalization_reference_rate: Option<f32>,
 }
 
 #[cfg(feature = "dataforts")]
@@ -741,6 +746,9 @@ impl RedexGravityConfigJson {
         }
         if let Some(secs) = self.decay_half_life_secs {
             policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs));
+        }
+        if let Some(reference) = self.normalization_reference_rate {
+            policy = policy.with_normalization_reference_rate(reference);
         }
         let tick = std::time::Duration::from_millis(self.tick_interval_ms.unwrap_or(500));
         (policy, tick)

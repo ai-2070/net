@@ -540,6 +540,10 @@ type DataGravityConfig struct {
 	DecayHalfLifeSecs uint64 `json:"decay_half_life_secs,omitempty"`
 	// Tick interval in milliseconds. Default 500.
 	TickIntervalMs uint64 `json:"tick_interval_ms,omitempty"`
+	// Wire normalization reference rate. Higher value = wider
+	// dynamic range on the [0.0, 1.0] wire encoding for heat
+	// tags. Default 1000.0. 0 (or unset) = substrate default.
+	NormalizationReferenceRate float32 `json:"normalization_reference_rate,omitempty"`
 }
 
 // EnableGravityForGreedy installs the data-gravity heat-counter

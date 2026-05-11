@@ -632,6 +632,7 @@ impl PyRedex {
         enabled = true,
         emit_threshold_ratio = None,
         decay_half_life_secs = None,
+        normalization_reference_rate = None,
     ))]
     fn enable_gravity_for_greedy(
         &self,
@@ -640,6 +641,7 @@ impl PyRedex {
         enabled: bool,
         emit_threshold_ratio: Option<f64>,
         decay_half_life_secs: Option<u64>,
+        normalization_reference_rate: Option<f64>,
     ) -> PyResult<()> {
         use net::adapter::net::dataforts::DataGravityPolicy;
         let mut policy = DataGravityPolicy::new().with_enabled(enabled);
@@ -648,6 +650,9 @@ impl PyRedex {
         }
         if let Some(secs) = decay_half_life_secs {
             policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs));
+        }
+        if let Some(reference) = normalization_reference_rate {
+            policy = policy.with_normalization_reference_rate(reference as f32);
         }
         let arc = mesh.node_arc_clone()?;
         self.inner

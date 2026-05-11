@@ -440,6 +440,9 @@ impl Redex {
             let secs_u64 = bigint_u64(secs)?;
             policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs_u64));
         }
+        if let Some(reference) = cfg_js.normalization_reference_rate {
+            policy = policy.with_normalization_reference_rate(reference as f32);
+        }
         let tick = match cfg_js.tick_interval_ms {
             Some(v) => std::time::Duration::from_millis(bigint_u64(v)?),
             None => std::time::Duration::from_millis(500),
@@ -600,6 +603,10 @@ pub struct DataGravityConfigJs {
     /// Default `500`. `BigInt` for parity with Python u64 / Go
     /// uint64; a u32 ms field overflows at ~49 days.
     pub tick_interval_ms: Option<BigInt>,
+    /// Wire normalization reference rate. Higher value = wider
+    /// dynamic range on the `[0.0, 1.0]` wire encoding for heat
+    /// tags. Default `1000.0`.
+    pub normalization_reference_rate: Option<f64>,
 }
 
 /// JS-side config for `Redex.enableGreedyDataforts`. Locked

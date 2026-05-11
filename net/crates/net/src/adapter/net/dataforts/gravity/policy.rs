@@ -42,6 +42,24 @@ pub const MIN_EMIT_THRESHOLD_RATIO: f32 = 1.01;
 /// to disabling the feature.
 pub const MAX_EMIT_THRESHOLD_RATIO: f32 = 10.0;
 
+/// Default reference rate for wire normalization. The substrate
+/// maps unbounded local read-rate to the wire's `[0.0, 1.0]`
+/// encoding via `ln_1p(rate) / ln_1p(reference)` so the rate
+/// distribution stretches across the wire range instead of
+/// saturating at the top end the way `rate / (rate + 1)` does.
+///
+/// `1000.0` means "rate=1000 maps to 1.0 on the wire." A typical
+/// hot-chain rate (10-100 reads/window) sits at ~0.34-0.67 under
+/// this scale — useful dynamic range — while extremely hot
+/// (10000+) saturates as expected.
+pub const DEFAULT_NORMALIZATION_REFERENCE_RATE: f32 = 1000.0;
+
+/// Floor on the normalization reference rate. Values at or below
+/// 1.0 collapse the log scale (`ln_1p(reference)` would be
+/// near-zero and division blows up). 1.5 is a defensive lower
+/// bound; below this the validator fires at construction.
+pub const MIN_NORMALIZATION_REFERENCE_RATE: f32 = 1.5;
+
 /// Per-channel configuration for the data-gravity heat-counter
 /// emission cycle. Installed at runtime via
 /// [`super::super::super::redex::Redex::enable_gravity_for_greedy`]
@@ -66,6 +84,10 @@ pub struct DataGravityPolicy {
     /// Exponential-decay half-life for the read rate. Default
     /// [`DEFAULT_DECAY_HALF_LIFE_SECS`].
     pub decay_half_life: Duration,
+    /// Reference rate the wire normalization uses to map raw
+    /// read-rate to `[0.0, 1.0]`. See
+    /// [`DEFAULT_NORMALIZATION_REFERENCE_RATE`].
+    pub normalization_reference_rate: f32,
 }
 
 impl Default for DataGravityPolicy {
@@ -74,6 +96,7 @@ impl Default for DataGravityPolicy {
             enabled: true,
             emit_threshold_ratio: DEFAULT_EMIT_THRESHOLD_RATIO,
             decay_half_life: Duration::from_secs(DEFAULT_DECAY_HALF_LIFE_SECS),
+            normalization_reference_rate: DEFAULT_NORMALIZATION_REFERENCE_RATE,
         }
     }
 }
@@ -102,6 +125,31 @@ impl DataGravityPolicy {
         self
     }
 
+    /// Builder: set the wire normalization reference rate. See
+    /// [`DEFAULT_NORMALIZATION_REFERENCE_RATE`] for the meaning
+    /// and rate-to-wire calibration.
+    pub fn with_normalization_reference_rate(mut self, reference: f32) -> Self {
+        self.normalization_reference_rate = reference;
+        self
+    }
+
+    /// Map a raw unbounded read-rate into the wire-side `[0.0, 1.0]`
+    /// range using log-scale normalization against
+    /// [`Self::normalization_reference_rate`]. Saturates at 1.0
+    /// for rates beyond the reference; never returns NaN.
+    pub fn normalize_rate_for_wire(&self, rate: f64) -> f64 {
+        if !rate.is_finite() || rate <= 0.0 {
+            return 0.0;
+        }
+        let reference = self.normalization_reference_rate.max(MIN_NORMALIZATION_REFERENCE_RATE)
+            as f64;
+        let denom = reference.ln_1p();
+        if denom <= 0.0 {
+            return 0.0;
+        }
+        (rate.ln_1p() / denom).clamp(0.0, 1.0)
+    }
+
     /// Validate the locked invariants. Returns a typed error
     /// naming the offending field so binding-layer callers can
     /// surface operator-friendly diagnostics.
@@ -118,6 +166,14 @@ impl DataGravityPolicy {
         }
         if self.decay_half_life.is_zero() {
             return Err(DataGravityPolicyError::DecayHalfLifeZero);
+        }
+        if !self.normalization_reference_rate.is_finite()
+            || self.normalization_reference_rate < MIN_NORMALIZATION_REFERENCE_RATE
+        {
+            return Err(DataGravityPolicyError::NormalizationReferenceTooLow {
+                got: self.normalization_reference_rate,
+                min: MIN_NORMALIZATION_REFERENCE_RATE,
+            });
         }
         Ok(())
     }
@@ -223,6 +279,16 @@ pub enum DataGravityPolicyError {
     /// `enable_greedy_dataforts` first.
     #[error("data-gravity requires greedy to be enabled first")]
     GreedyNotEnabled,
+    /// `normalization_reference_rate` below
+    /// [`MIN_NORMALIZATION_REFERENCE_RATE`] or non-finite.
+    /// Values too close to `1.0` collapse the log scale.
+    #[error("data-gravity normalization_reference_rate {got} below floor {min} or non-finite")]
+    NormalizationReferenceTooLow {
+        /// Configured value.
+        got: f32,
+        /// Minimum permitted value.
+        min: f32,
+    },
 }
 
 #[cfg(test)]
@@ -271,6 +337,45 @@ mod tests {
         let p = DataGravityPolicy::default().with_decay_half_life(Duration::ZERO);
         let err = p.validate().expect_err("zero half-life must reject");
         assert!(matches!(err, DataGravityPolicyError::DecayHalfLifeZero));
+    }
+
+    #[test]
+    fn normalization_reference_too_low_rejected() {
+        let p = DataGravityPolicy::default().with_normalization_reference_rate(1.0);
+        let err = p.validate().expect_err("reference 1.0 must reject");
+        assert!(matches!(
+            err,
+            DataGravityPolicyError::NormalizationReferenceTooLow { .. }
+        ));
+    }
+
+    #[test]
+    fn normalize_rate_for_wire_log_scale_has_dynamic_range() {
+        // The old `rate / (rate + 1)` formula collapses everything
+        // above ~rate=10 into the 0.9x band. Log scale must give
+        // visibly different wire values for rates that differ by
+        // an order of magnitude in the operating range.
+        let p = DataGravityPolicy::default();
+        let v_1 = p.normalize_rate_for_wire(1.0);
+        let v_10 = p.normalize_rate_for_wire(10.0);
+        let v_100 = p.normalize_rate_for_wire(100.0);
+        let v_1000 = p.normalize_rate_for_wire(1000.0);
+
+        // Strictly increasing across orders of magnitude.
+        assert!(v_1 < v_10);
+        assert!(v_10 < v_100);
+        assert!(v_100 < v_1000);
+        // Saturates near 1.0 at the reference rate, not far below it.
+        assert!(v_1000 >= 0.99);
+        // Pin a useful dynamic range: rate=10 vs rate=100 differ
+        // by > 0.2 on the wire (vs ~0.08 under the old formula).
+        assert!(v_100 - v_10 > 0.20);
+        // No NaN / negative for edge inputs.
+        assert_eq!(p.normalize_rate_for_wire(0.0), 0.0);
+        assert_eq!(p.normalize_rate_for_wire(-5.0), 0.0);
+        assert_eq!(p.normalize_rate_for_wire(f64::NAN), 0.0);
+        // Far above the reference saturates at 1.0.
+        assert_eq!(p.normalize_rate_for_wire(1.0e9), 1.0);
     }
 
     // ---- should_emit_heat ----
