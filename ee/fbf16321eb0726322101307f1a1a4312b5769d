@@ -1,0 +1,19 @@
+net/crates/net/docs/releases/RELEASE_v0.14_THE_WARRIORS.md
+  s_4dbb97ea6ebffd::t_1b94f9e1c04a29 1-362
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "eefbf16321eb0726322101307f1a1a4312b5769d",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
