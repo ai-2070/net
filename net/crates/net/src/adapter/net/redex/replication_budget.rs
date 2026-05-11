@@ -110,9 +110,9 @@ impl BandwidthBudget {
     /// `bytes == 0` always succeeds without state mutation.
     ///
     /// **Oversize request behavior.** Requests larger than
-    /// [`capacity_bytes`] (= one second's worth of refill) can
-    /// never accumulate enough credit on their own — the bucket
-    /// caps at capacity even after infinite refill. The catch-up
+    /// [`Self::capacity_bytes`] (= one second's worth of refill)
+    /// can never accumulate enough credit on their own — the
+    /// bucket caps at capacity even after infinite refill. The catch-up
     /// path is responsible for splitting outbound chunks against
     /// this ceiling; if a single event is itself larger than the
     /// budget capacity (rare — e.g. a tiny channel with a large

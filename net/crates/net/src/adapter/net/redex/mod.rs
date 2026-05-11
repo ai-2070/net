@@ -66,7 +66,7 @@ pub use replication_catchup::{
 };
 pub use replication_config::{
     PlacementStrategy, ReplicationConfig, ReplicationConfigError, UnderCapacity,
-    HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MIN, REPLICATION_BUDGET_FRACTION_DEFAULT,
+    HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MAX, HEARTBEAT_MS_MIN, REPLICATION_BUDGET_FRACTION_DEFAULT,
     REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX, REPLICATION_FACTOR_MIN,
 };
 pub use replication_coordinator::{
