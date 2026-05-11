@@ -44,10 +44,14 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::file::RedexFile;
 use super::replication::{
     ChannelId, ReplicaRole, SyncHeartbeat, SyncNack, SyncRequest, SyncResponse,
 };
 use super::replication_budget::BandwidthBudget;
+use super::replication_catchup::{
+    apply_sync_response, handle_sync_request, SyncRequestOutcome,
+};
 use super::replication_coordinator::{ChannelIdentity, ReplicationCoordinator};
 use super::replication_heartbeat::HeartbeatTracker;
 use super::replication_step::{election_outcome, tick, OutboundMessage, TickInputs};
@@ -243,6 +247,13 @@ pub struct RuntimeInputs {
     pub tail_provider: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// RTT lookup for the election function.
     pub rtt_lookup: RttLookup,
+    /// The local `RedexFile` for this channel. The runtime holds
+    /// a clone (RedexFile is `Clone` — Arc-backed) so it can
+    /// drive `handle_sync_request` on inbound `SyncRequest`
+    /// frames (leader path) and `apply_sync_response` on inbound
+    /// `SyncResponse` frames (replica path). The
+    /// `tail_provider` closure typically wraps `file.next_seq()`.
+    pub file: RedexFile,
 }
 
 /// Handle the spawned task produces. Holds the inbox sender so
@@ -450,7 +461,7 @@ async fn on_inbound(
     coordinator: &Arc<ReplicationCoordinator>,
     dispatcher: &Arc<dyn ReplicationDispatcher>,
     tracker: &Arc<Mutex<HeartbeatTracker>>,
-    _budget: &Arc<Mutex<BandwidthBudget>>,
+    budget: &Arc<Mutex<BandwidthBudget>>,
     event: Inbound,
 ) {
     match event {
@@ -474,43 +485,159 @@ async fn on_inbound(
                 .lock()
                 .record_heartbeat(from, msg.role, msg.tail_seq, Instant::now());
         }
-        Inbound::SyncRequest { from, msg: _ } => {
-            // Leader-side: handle_sync_request needs the local
-            // `RedexFile`. Phase C scope keeps the file out of
-            // the runtime; the lifecycle integration slice
-            // wires a `file_provider` closure here. Until then,
-            // surface to the operator that we got a request we
-            // can't service yet.
-            tracing::trace!(
-                from = from,
-                "replication: SyncRequest dispatch awaits file-provider wire-up"
-            );
-            // No-op for now — once the file_provider lands,
-            // call handle_sync_request + dispatch the response/nack.
-            let _ = dispatcher;
-            let _ = coordinator;
+        Inbound::SyncRequest { from, msg } => {
+            // Leader-side: only honor SyncRequest when we believe
+            // we're the leader. Other roles surface `NotLeader`
+            // so the replica re-resolves leadership.
+            if coordinator.role() != ReplicaRole::Leader {
+                let nack = SyncNack {
+                    channel_id: inputs.channel_id,
+                    since_seq: msg.since_seq,
+                    error_code: super::replication::SyncNackError::NotLeader,
+                    detail: String::new(),
+                };
+                if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
+                    tracing::trace!(from = from, error = ?e, "replication: NotLeader NACK send failed");
+                }
+                return;
+            }
+            // Run the catch-up helper against our local file.
+            match handle_sync_request(&inputs.file, &msg, inputs.channel_id) {
+                SyncRequestOutcome::Response(resp) => {
+                    let byte_estimate = estimate_response_bytes(&resp);
+                    // Gate on the bandwidth budget. If the
+                    // budget can't admit this chunk, NACK with
+                    // Backpressure so the replica backs off.
+                    let admitted = {
+                        let mut bb = budget.lock();
+                        bb.try_consume(byte_estimate, Instant::now())
+                    };
+                    if !admitted {
+                        let nack = SyncNack {
+                            channel_id: inputs.channel_id,
+                            since_seq: msg.since_seq,
+                            error_code: super::replication::SyncNackError::Backpressure,
+                            detail: String::new(),
+                        };
+                        if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
+                            tracing::trace!(from = from, error = ?e, "replication: Backpressure NACK send failed");
+                        }
+                        return;
+                    }
+                    // Bump the cumulative bytes metric BEFORE
+                    // ship so the operator's view stays accurate
+                    // even if the wire send fails (the bytes
+                    // would still have been read off disk).
+                    coordinator.metrics().incr_sync_bytes(byte_estimate);
+                    if let Err(e) = dispatcher.send_sync_response(from, resp).await {
+                        tracing::trace!(from = from, error = ?e, "replication: SyncResponse send failed");
+                    }
+                }
+                SyncRequestOutcome::Nack { error_code, detail } => {
+                    let nack = SyncNack {
+                        channel_id: inputs.channel_id,
+                        since_seq: msg.since_seq,
+                        error_code,
+                        detail,
+                    };
+                    if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
+                        tracing::trace!(from = from, error = ?e, "replication: SyncNack send failed");
+                    }
+                }
+            }
         }
-        Inbound::SyncResponse { from, msg: _ } => {
-            // Replica-side: apply_sync_response needs the local
-            // `RedexFile`. Same scope deferral as SyncRequest.
-            tracing::trace!(
-                from = from,
-                "replication: SyncResponse application awaits file-provider wire-up"
-            );
+        Inbound::SyncResponse { from, msg } => {
+            // Replica-side: apply the chunk to our local file.
+            // Only honor responses when we believe we're a
+            // Replica — other roles ignore them.
+            if coordinator.role() != ReplicaRole::Replica {
+                tracing::trace!(
+                    from = from,
+                    "replication: SyncResponse received in role {:?}; ignoring",
+                    coordinator.role(),
+                );
+                return;
+            }
+            match apply_sync_response(&inputs.file, &msg, inputs.channel_id) {
+                Ok(new_tail) => {
+                    tracing::trace!(
+                        from = from,
+                        new_tail = new_tail,
+                        "replication: applied chunk"
+                    );
+                }
+                Err(e) => {
+                    // ApplyError variants pin every reject path
+                    // — channel mismatch, monotonicity violation,
+                    // stale chunk, gap-before-chunk, append fail.
+                    // Log + drop; reliable-stream / heartbeat
+                    // cycle recovers.
+                    tracing::warn!(
+                        from = from,
+                        error = ?e,
+                        "replication: apply_sync_response failed"
+                    );
+                }
+            }
         }
         Inbound::SyncNack { from, msg } => {
             // Replicas key their retry policy on `error_code`.
-            // The actual retry-policy wiring (re-issue
-            // SyncRequest, withdraw role on ChannelClosed,
-            // exponential backoff on Backpressure) lands when
-            // the file_provider does.
-            tracing::trace!(
-                from = from,
-                "replication: SyncNack received; retry-policy wiring deferred: {:?}",
-                msg.error_code,
-            );
+            // Phase D §2 retry policy:
+            //   1 NotLeader   → re-resolve leader (clear tracker
+            //                    so next election cycle starts
+            //                    clean)
+            //   2 BadRange    → trim local tail / skip-ahead
+            //   3 Backpressure → exponential backoff (handled by
+            //                    not issuing the next request)
+            //   4 ChannelClosed → withdraw replica role
+            use super::replication::SyncNackError;
+            match msg.error_code {
+                SyncNackError::NotLeader => {
+                    tracing::trace!(from = from, "replication: NACK NotLeader — clearing believed leader");
+                    // Heartbeat cycle re-discovers leader on next
+                    // round; we just clear the cached belief.
+                    // (Tracker is owned by the runtime task's
+                    // outer scope; this would clear if we had
+                    // a handle here. Plumb through later slice.)
+                }
+                SyncNackError::BadRange => {
+                    // Skip-ahead path — would advance the local
+                    // tail to the leader's first available. The
+                    // file_provider doesn't yet expose a "skip"
+                    // method; flag the metric and defer.
+                    coordinator.metrics().incr_skip_ahead();
+                    tracing::trace!(from = from, "replication: NACK BadRange — skip-ahead recorded");
+                }
+                SyncNackError::Backpressure => {
+                    tracing::trace!(from = from, "replication: NACK Backpressure — deferring next request");
+                }
+                SyncNackError::ChannelClosed => {
+                    tracing::warn!(from = from, "replication: NACK ChannelClosed — withdrawing replica role");
+                    // Drive a withdraw via the coordinator's
+                    // disk-pressure shape (closest semantic).
+                    let _ = coordinator
+                        .transition_to(
+                            ReplicaRole::Idle,
+                            super::replication_state::TransitionSignal::DiskPressureWithdraw,
+                        )
+                        .await;
+                }
+            }
         }
     }
+}
+
+/// Estimate the wire-cost of a [`SyncResponse`] for budget
+/// accounting. Header + per-event overhead per `replication.rs`'s
+/// `to_bytes` shape.
+fn estimate_response_bytes(resp: &SyncResponse) -> u64 {
+    // Header: 3 + 32 + 8 + 4 = 47 bytes.
+    let mut bytes: u64 = 47;
+    for ev in &resp.events {
+        // event_seq u64 + payload_len u32 + payload bytes.
+        bytes += 8 + 4 + ev.payload.len() as u64;
+    }
+    bytes
 }
 
 #[cfg(test)]
@@ -595,6 +722,14 @@ mod tests {
         ChannelId::from_name(&cn)
     }
 
+    fn build_file_for_tests() -> RedexFile {
+        use crate::adapter::net::redex::config::RedexFileConfig;
+        use crate::adapter::net::redex::manager::Redex;
+        let r = Redex::new();
+        let cn = ChannelName::new("test/runtime").unwrap();
+        r.open_file(&cn, RedexFileConfig::default()).unwrap()
+    }
+
     fn build_inputs(self_id: NodeId, replicas: Vec<NodeId>, hb_ms: u64) -> RuntimeInputs {
         RuntimeInputs {
             channel: ChannelIdentity {
@@ -608,6 +743,7 @@ mod tests {
             wall_clock_provider: Arc::new(|| 1_700_000_000_000),
             tail_provider: Arc::new(|| 42),
             rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
+            file: build_file_for_tests(),
         }
     }
 

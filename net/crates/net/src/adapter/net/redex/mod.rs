@@ -32,6 +32,7 @@ mod replication_coordinator;
 mod replication_election;
 mod replication_heartbeat;
 mod replication_metrics;
+mod replication_router;
 mod replication_runtime;
 mod replication_state;
 mod replication_step;
@@ -69,6 +70,7 @@ pub use replication_coordinator::{
 };
 pub use replication_election::{elect, ElectionOutcome};
 pub use replication_heartbeat::{HeartbeatTracker, PeerState, DEFAULT_MISS_THRESHOLD};
+pub use replication_router::RedexReplicationRouter;
 pub use replication_runtime::{
     spawn_replication_runtime, Inbound, ReplicationDispatcher, ReplicationInboundRouter,
     ReplicationRuntimeHandle, RttLookup, RuntimeInputs, RUNTIME_INBOX_CAPACITY,
