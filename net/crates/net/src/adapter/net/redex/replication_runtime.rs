@@ -967,14 +967,20 @@ async fn on_inbound(
                 SyncNackError::ChannelClosed => {
                     tracing::warn!(
                         from = from,
-                        "replication: NACK ChannelClosed — withdrawing replica role"
+                        "replication: NACK ChannelClosed — withdrawing role"
                     );
-                    // Drive a withdraw via the coordinator's
-                    // disk-pressure shape (closest semantic).
+                    // The leader is telling us the channel is gone;
+                    // shut down regardless of our current role.
+                    // ChannelClose is the only signal valid from
+                    // any state (Leader, Candidate, Replica, Idle).
+                    // DiskPressureWithdraw is only valid from
+                    // Replica and would silently fail-and-log if a
+                    // role flip happened between sending the
+                    // SyncRequest and receiving the NACK.
                     let _ = coordinator
                         .transition_to(
                             ReplicaRole::Idle,
-                            super::replication_state::TransitionSignal::DiskPressureWithdraw,
+                            super::replication_state::TransitionSignal::ChannelClose,
                         )
                         .await;
                 }
@@ -1016,15 +1022,32 @@ async fn handle_disk_pressure(
             tracing::warn!(
                 from = from,
                 detail = detail,
-                "replication: disk pressure → withdrawing replica role"
+                "replication: disk pressure → withdrawing role"
             );
-            if let Err(e) = coordinator
-                .transition_to(
-                    ReplicaRole::Idle,
-                    super::replication_state::TransitionSignal::DiskPressureWithdraw,
-                )
-                .await
-            {
+            // The transition matrix only permits
+            // DiskPressureWithdraw on Replica → Idle. If a role
+            // flip landed between the apply attempt and this
+            // withdraw, pick the signal that's actually valid for
+            // the current role so we don't silently log+drop the
+            // transition and keep writing through pressure.
+            let signal = match coordinator.role() {
+                ReplicaRole::Replica => {
+                    super::replication_state::TransitionSignal::DiskPressureWithdraw
+                }
+                ReplicaRole::Idle => {
+                    // Already withdrawn — short-circuit via the
+                    // ChannelClose idempotent path so we don't bump
+                    // counters twice on a benign race.
+                    super::replication_state::TransitionSignal::ChannelClose
+                }
+                ReplicaRole::Leader | ReplicaRole::Candidate => {
+                    // Disk pressure observed from a non-Replica
+                    // role — withdraw via ChannelClose, the only
+                    // signal valid from any state.
+                    super::replication_state::TransitionSignal::ChannelClose
+                }
+            };
+            if let Err(e) = coordinator.transition_to(ReplicaRole::Idle, signal).await {
                 tracing::warn!(
                     error=?e,
                     "replication: disk-pressure withdraw transition failed"
@@ -1849,6 +1872,55 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "EvictOldest also bumps under_capacity_total"
+        );
+    }
+
+    /// Disk pressure observed from a Leader role (or Candidate
+    /// mid-election) must still drive a withdraw to Idle. The
+    /// transition matrix only permits DiskPressureWithdraw on
+    /// Replica → Idle; without role-aware signal selection a Leader
+    /// would silently log+drop the withdraw and keep writing
+    /// through pressure. Pick ChannelClose for the non-Replica case
+    /// so the withdraw lands regardless of current role.
+    #[tokio::test]
+    async fn disk_pressure_withdraw_from_leader_picks_channel_close_signal() {
+        let (coord, _metrics) = build_coordinator_with_policy(
+            super::super::replication_config::UnderCapacity::Withdraw,
+        );
+        // Promote through the full state cycle to Leader.
+        coord
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        coord
+            .transition_to(
+                ReplicaRole::Candidate,
+                super::super::replication_state::TransitionSignal::MissedHeartbeats,
+            )
+            .await
+            .unwrap();
+        coord
+            .transition_to(
+                ReplicaRole::Leader,
+                super::super::replication_state::TransitionSignal::ElectionWon,
+            )
+            .await
+            .unwrap();
+        assert_eq!(coord.role(), ReplicaRole::Leader);
+
+        let file = build_file_for_tests();
+        handle_disk_pressure(&coord, &file, "test detail", 0x20).await;
+
+        // Leader → Idle via ChannelClose must land — the prior code
+        // path used DiskPressureWithdraw which is invalid from
+        // Leader and would silently fail-and-log.
+        assert_eq!(
+            coord.role(),
+            ReplicaRole::Idle,
+            "Leader disk-pressure must withdraw to Idle"
         );
     }
 
