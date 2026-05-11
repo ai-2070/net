@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_9163f300668f8b::t_804af0fdc2cce5 670-721,725-726
+net/crates/net/docs/CONFIG_REPLICATION.md
+  s_9163f300668f8b::t_33a28f6cc9cc6e 242-248
+net/crates/net/src/adapter/net/redex/file.rs
+  s_9163f300668f8b::t_193a1bee6176de 3326-3335,3344
+  s_9163f300668f8b::t_20d38761555657 1190-1208,1215-1273
+  s_9163f300668f8b::t_c0a0f19d3b7504 3232-3325,3336-3343,3345
+  s_9163f300668f8b::t_d64702a796656c 1209-1214
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_9163f300668f8b::t_d8eae10849c024 464
+  s_9163f300668f8b::t_b166ccfb555196 473-474
+net/crates/net/src/adapter/net/redex/replication_catchup.rs
+  s_9163f300668f8b::t_3d9821d782e641 758-826
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "10b05907c2226e154e83bb163a7351950a12c435",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
