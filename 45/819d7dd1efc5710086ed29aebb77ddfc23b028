@@ -1,0 +1,23 @@
+net/crates/net/bindings/python/src/blob.rs
+  s_3a0a24a47d1a36::t_a5db3b44e21e77 398-403
+  s_3a0a24a47d1a36::t_fb14227ce6a7b4 297-372,391-397
+  s_3a0a24a47d1a36::t_5d895d5e1f7d02 510-520
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_60fad7a3a2c82a 38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "45819d7dd1efc5710086ed29aebb77ddfc23b028",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
