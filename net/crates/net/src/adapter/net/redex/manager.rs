@@ -317,6 +317,7 @@ impl Redex {
         // Lock-free fast path for the common re-open case: avoid taking
         // a shard write entry when the file is already present.
         if let Some(existing) = self.files.get(name) {
+            ensure_reopen_replication_matches(self, name, config.replication.as_ref())?;
             return Ok(existing.clone());
         }
 
@@ -335,7 +336,10 @@ impl Redex {
         use dashmap::mapref::entry::Entry;
         let replication_cfg = config.replication.clone();
         let file = match self.files.entry(name.clone()) {
-            Entry::Occupied(e) => return Ok(e.get().clone()),
+            Entry::Occupied(e) => {
+                ensure_reopen_replication_matches(self, name, replication_cfg.as_ref())?;
+                return Ok(e.get().clone());
+            }
             Entry::Vacant(e) => {
                 let file = self.build_file(name, config)?;
                 e.insert(file).clone()
@@ -542,6 +546,51 @@ impl Redex {
         for entry in self.files.iter() {
             entry.value().sweep_retention();
         }
+    }
+}
+
+/// Reject reopen calls whose replication config diverges from the
+/// original. Same channel name + a different `Some(ReplicationConfig)`
+/// would otherwise silently reuse the live coordinator's config — an
+/// operator surprise where `replication_factor=5` reopened as
+/// `replication_factor=3` keeps replicating at 5.
+///
+/// Compares against the live coordinator's config (the canonical
+/// source for "what is currently in effect"). The pairs accepted as
+/// idempotent reopens are:
+///
+/// - new `None` and original `None`
+/// - new `Some(cfg)` and original `Some(cfg)` where the two are
+///   structurally `PartialEq`
+///
+/// Every other shape is rejected with a typed channel error.
+fn ensure_reopen_replication_matches(
+    redex: &Redex,
+    name: &ChannelName,
+    requested: Option<&super::replication_config::ReplicationConfig>,
+) -> Result<(), RedexError> {
+    let channel_id = ChannelId::from_name(name);
+    let wiring = redex.replication.read().clone();
+    let existing = wiring
+        .as_ref()
+        .and_then(|w| w.router.get(&channel_id))
+        .map(|h| h.coordinator().config().clone());
+
+    match (existing.as_ref(), requested) {
+        (None, None) => Ok(()),
+        (Some(orig), Some(new)) if orig == new => Ok(()),
+        (None, Some(_)) => Err(RedexError::Channel(format!(
+            "reopen of '{}' specified a replication config; the original opened without replication",
+            name.as_str(),
+        ))),
+        (Some(_), None) => Err(RedexError::Channel(format!(
+            "reopen of '{}' omitted the replication config; the original opened with replication",
+            name.as_str(),
+        ))),
+        (Some(_), Some(_)) => Err(RedexError::Channel(format!(
+            "reopen of '{}' supplied a replication config different from the original",
+            name.as_str(),
+        ))),
     }
 }
 
@@ -809,6 +858,56 @@ mod tests {
             1,
             "reopen must not spawn a second runtime"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopen_replicated_channel_with_different_config_rejects() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh);
+        let name = cn("repl/reopen-mismatch");
+        let cfg1 = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
+        r.open_file(&name, cfg1).unwrap();
+        // Reopen with a different heartbeat — the prior code path
+        // silently returned the existing handle. Now a typed error
+        // surfaces so operators don't get a coordinator running on
+        // a config different from what they asked for.
+        let cfg2 = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(45_000)));
+        let err = r.open_file(&name, cfg2).unwrap_err();
+        match err {
+            RedexError::Channel(msg) => assert!(
+                msg.contains("different from the original"),
+                "expected 'different from the original' message, got: {msg}"
+            ),
+            other => panic!("expected Channel error, got {other:?}"),
+        }
+        // Original runtime still alive.
+        assert_eq!(r.replication_runtime_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopen_replicated_channel_without_replication_rejects() {
+        let mesh = build_mesh_for_test().await;
+        let r = Redex::new();
+        r.enable_replication(mesh);
+        let name = cn("repl/reopen-no-repl");
+        let cfg1 = RedexFileConfig::default()
+            .with_replication(Some(ReplicationConfig::new().with_heartbeat_ms(60_000)));
+        r.open_file(&name, cfg1).unwrap();
+        // Reopen with replication=None when the original had it
+        // would silently re-use the original (a different
+        // operator-visible surface). Reject.
+        let cfg2 = RedexFileConfig::default();
+        let err = r.open_file(&name, cfg2).unwrap_err();
+        match err {
+            RedexError::Channel(msg) => assert!(
+                msg.contains("omitted the replication config"),
+                "expected 'omitted the replication config' message, got: {msg}"
+            ),
+            other => panic!("expected Channel error, got {other:?}"),
+        }
     }
 
     #[test]
