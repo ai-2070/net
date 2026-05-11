@@ -306,6 +306,9 @@ impl Redex {
             let peak_u64 = redex_bigint_u64("greedy.nic_peak_bytes_per_s", peak)?;
             cfg = cfg.with_nic_peak_bytes_per_s(Some(peak_u64));
         }
+        if let Some(cap) = cfg_js.observer_inflight_cap {
+            cfg = cfg.with_observer_inflight_cap(cap as usize);
+        }
         if let Some(policy) = cfg_js.intent_match {
             let parsed = match policy.as_str() {
                 "disabled" => IntentMatchPolicy::Disabled,
@@ -622,6 +625,11 @@ pub struct GreedyConfigJs {
     /// `bandwidth` reason saturating the admit_rejected counter
     /// under normal load.
     pub nic_peak_bytes_per_s: Option<BigInt>,
+    /// Maximum in-flight `observe_event` tasks. Default `1024`.
+    /// Floor 1. Past this many spawned tasks the observer drops
+    /// events with a metric increment rather than blocking the
+    /// mesh inbound hot path.
+    pub observer_inflight_cap: Option<u32>,
     /// Intent-match policy. One of `"disabled"` /
     /// `"any_of_local_capabilities"` (default) / `"strict"`.
     pub intent_match: Option<String>,

@@ -478,6 +478,7 @@ impl PyRedex {
         total_cap_bytes = None,
         bandwidth_budget_fraction = None,
         nic_peak_bytes_per_s = None,
+        observer_inflight_cap = None,
         intent_match = None,
         colocation_policy = None,
     ))]
@@ -491,6 +492,7 @@ impl PyRedex {
         total_cap_bytes: Option<u64>,
         bandwidth_budget_fraction: Option<f64>,
         nic_peak_bytes_per_s: Option<u64>,
+        observer_inflight_cap: Option<usize>,
         intent_match: Option<String>,
         colocation_policy: Option<String>,
     ) -> PyResult<()> {
@@ -515,6 +517,9 @@ impl PyRedex {
         }
         if let Some(peak) = nic_peak_bytes_per_s {
             cfg = cfg.with_nic_peak_bytes_per_s(Some(peak));
+        }
+        if let Some(cap) = observer_inflight_cap {
+            cfg = cfg.with_observer_inflight_cap(cap);
         }
         if let Some(policy) = intent_match {
             let parsed = match policy.as_str() {

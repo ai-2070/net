@@ -156,6 +156,14 @@ struct GreedyRuntimeInner {
     /// disable) once gravity is installed.
     #[cfg(feature = "dataforts")]
     gravity: parking_lot::RwLock<Option<GravityState>>,
+    /// Bounds the number of in-flight `observe_event` spawn tasks.
+    /// `observe_event` is the mesh hot-path entry; without a bound
+    /// a flooding peer creates one outstanding task per event
+    /// before the per-event admission lock serializes them, and
+    /// the per-task `Bytes` + `Arc<CapabilitySet>` clones pile up.
+    /// `try_acquire_owned`-shaped: on saturation drop the event
+    /// and bump a counter rather than blocking the mesh.
+    observer_inflight: Arc<tokio::sync::Semaphore>,
 }
 
 /// Per-runtime data-gravity state. Behind the same gate as the
@@ -208,6 +216,7 @@ impl GreedyRuntime {
         let nic_peak = config.effective_nic_peak_bytes_per_s();
         let budget = BandwidthBudget::new(config.bandwidth_budget_fraction, nic_peak, now);
         let cache = GreedyCacheRegistry::new(config.total_cap_bytes);
+        let observer_inflight = Arc::new(tokio::sync::Semaphore::new(config.observer_inflight_cap));
         Self {
             inner: Arc::new(GreedyRuntimeInner {
                 config,
@@ -221,6 +230,7 @@ impl GreedyRuntime {
                 local_caps: Mutex::new(local_caps),
                 #[cfg(feature = "dataforts")]
                 gravity: parking_lot::RwLock::new(None),
+                observer_inflight,
             }),
         }
     }
@@ -615,12 +625,29 @@ impl GreedyObserver for GreedyRuntime {
         chain_caps: Arc<CapabilitySet>,
         payload: Bytes,
     ) {
+        // Bound the spawn fan-out: a flooding peer can otherwise
+        // create one outstanding tokio task per event before the
+        // per-event admission lock serializes them. The per-task
+        // payload + cap clones pile up. On saturation drop the
+        // event and bump the metric — the mesh hot path stays
+        // non-blocking either way.
+        let permit = match self.inner.observer_inflight.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                self.inner
+                    .metrics
+                    .cluster()
+                    .incr_observer_dropped_overloaded();
+                return;
+            }
+        };
         let runtime = self.clone();
         let channel = synthesize_cache_channel_name(channel_hash);
         tokio::spawn(async move {
             let _ = runtime
                 .dispatch_event(&channel, origin_hash, &chain_caps, &payload)
                 .await;
+            drop(permit);
         });
     }
 }
@@ -916,6 +943,33 @@ mod tests {
             1,
             "second tick must suppress when rate is unchanged"
         );
+    }
+
+    /// observe_event must bound its spawn fan-out: a flood of
+    /// inbound events with the runtime stuck (admission lock
+    /// held) must drop events past the cap rather than spawning
+    /// unbounded.
+    #[tokio::test]
+    async fn observe_event_drops_under_inflight_cap() {
+        let cfg = GreedyConfig::default()
+            .with_intent_match(super::super::IntentMatchPolicy::Disabled)
+            .with_observer_inflight_cap(2);
+        let (rt, _sink) = build_runtime(cfg);
+        let chain = Arc::new(chain_caps_with_scope("any"));
+
+        // Block dispatch indefinitely by holding the cache lock
+        // (parking_lot::Mutex — synchronous). The first two
+        // observe_event spawns acquire permits and wait on the
+        // lock; everything past the cap drops.
+        let _guard = rt.inner.cache.lock();
+
+        let n = 10u64;
+        for i in 0..n {
+            rt.observe_event(0, i, chain.clone(), Bytes::from_static(b"x"));
+        }
+        // Drop counter must reflect the surplus (n - cap = 8).
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.observer_dropped_overloaded_total, 8);
     }
 
     /// Two concurrent dispatch_event calls for the same new

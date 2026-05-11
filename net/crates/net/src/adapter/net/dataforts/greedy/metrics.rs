@@ -110,6 +110,12 @@ pub struct GreedyClusterMetricsAtomic {
     /// Current I/O budget used — bytes consumed from the token
     /// bucket since the last refill. Gauge.
     pub io_budget_used_bytes: AtomicU64,
+    /// Cumulative inbound events dropped because the
+    /// observe_event in-flight cap was saturated. Surfaces a
+    /// flooding peer or an under-provisioned cap — operators
+    /// dashboard this against admit_rejected counters to
+    /// distinguish "rejected by policy" from "dropped under load".
+    pub observer_dropped_overloaded_total: AtomicU64,
 }
 
 impl GreedyClusterMetricsAtomic {
@@ -149,6 +155,12 @@ impl GreedyClusterMetricsAtomic {
     /// Set the I/O-budget-used gauge.
     pub fn set_io_budget_used_bytes(&self, bytes: u64) {
         self.io_budget_used_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Increment the observer-overload drop counter.
+    pub fn incr_observer_dropped_overloaded(&self) {
+        self.observer_dropped_overloaded_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -276,6 +288,10 @@ impl GreedyMetricsRegistry {
                     .admit_rejected_bandwidth_total
                     .load(Ordering::Relaxed),
                 io_budget_used_bytes: self.cluster.io_budget_used_bytes.load(Ordering::Relaxed),
+                observer_dropped_overloaded_total: self
+                    .cluster
+                    .observer_dropped_overloaded_total
+                    .load(Ordering::Relaxed),
             },
         }
     }
@@ -312,6 +328,10 @@ pub struct GreedyClusterMetrics {
     pub admit_rejected_bandwidth_total: u64,
     /// Current I/O-budget bytes used.
     pub io_budget_used_bytes: u64,
+    /// Cumulative observer-overload event drops — the
+    /// `observe_event` in-flight cap was saturated and the event
+    /// was discarded without entering the admission pipeline.
+    pub observer_dropped_overloaded_total: u64,
 }
 
 /// Full snapshot — sorted channel list + cluster-wide counters.
@@ -390,6 +410,21 @@ impl GreedyMetricsSnapshot {
             self.cluster.io_budget_used_bytes,
         );
 
+        // Observer-overload drops (counter).
+        let _ = writeln!(
+            out,
+            "# HELP dataforts_greedy_observer_dropped_total Cumulative events dropped at the observe_event hot path, split by reason."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE dataforts_greedy_observer_dropped_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "dataforts_greedy_observer_dropped_total{{reason=\"overloaded\"}} {}",
+            self.cluster.observer_dropped_overloaded_total,
+        );
+
         out
     }
 
@@ -403,6 +438,7 @@ impl GreedyMetricsSnapshot {
             && self.cluster.admit_rejected_capacity_total == 0
             && self.cluster.admit_rejected_bandwidth_total == 0
             && self.cluster.io_budget_used_bytes == 0
+            && self.cluster.observer_dropped_overloaded_total == 0
     }
 }
 
@@ -542,6 +578,9 @@ mod tests {
         assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"colocation\"} 0"));
         assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"capacity\"} 0"));
         assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"bandwidth\"} 0"));
+        assert!(text.contains(
+            "dataforts_greedy_observer_dropped_total{reason=\"overloaded\"} 0"
+        ));
     }
 
     #[test]

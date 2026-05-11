@@ -40,6 +40,15 @@ pub const DEFAULT_BANDWIDTH_BUDGET_FRACTION: f32 = 0.25;
 /// under-utilization.
 pub const DEFAULT_NIC_PEAK_BYTES_PER_S: u64 = 125_000_000;
 
+/// Default ceiling on in-flight `observe_event` tasks fanned out
+/// by the mesh inbound dispatch hook. Past this many spawned
+/// tasks the observer drops events and increments
+/// `dataforts_greedy_observer_dropped_total{reason="overloaded"}`
+/// rather than unbounded-spawning. Sized to absorb bursty
+/// publish traffic on a typical edge node while still capping
+/// the worst-case memory footprint at a few MiB of `Bytes` clones.
+pub const DEFAULT_OBSERVER_INFLIGHT_CAP: usize = 1024;
+
 /// Per-node configuration for [`crate::adapter::net::dataforts::greedy`].
 ///
 /// Validation rules (enforced by [`Self::validate`]):
@@ -90,6 +99,11 @@ pub struct GreedyConfig {
     /// default — colocation tilts admission toward affinity but
     /// doesn't override capacity constraints.
     pub colocation_policy: ColocationPolicy,
+    /// Maximum in-flight `observe_event` tasks. Sized to bound
+    /// the worst-case memory footprint of bursty inbound publish
+    /// traffic; observed events past this cap drop with a
+    /// metrics increment. See [`DEFAULT_OBSERVER_INFLIGHT_CAP`].
+    pub observer_inflight_cap: usize,
 }
 
 impl Default for GreedyConfig {
@@ -103,6 +117,7 @@ impl Default for GreedyConfig {
             nic_peak_bytes_per_s: None,
             intent_match: IntentMatchPolicy::AnyOfLocalCapabilities,
             colocation_policy: ColocationPolicy::SoftPreference,
+            observer_inflight_cap: DEFAULT_OBSERVER_INFLIGHT_CAP,
         }
     }
 }
@@ -148,6 +163,14 @@ impl GreedyConfig {
     /// to the [`DEFAULT_NIC_PEAK_BYTES_PER_S`] fallback.
     pub fn with_nic_peak_bytes_per_s(mut self, peak: Option<u64>) -> Self {
         self.nic_peak_bytes_per_s = peak;
+        self
+    }
+
+    /// Builder: set the observer in-flight task cap. Hard floor
+    /// of 1 — a zero cap would mean "drop every event" and is
+    /// almost certainly a config mistake; clamp on the way in.
+    pub fn with_observer_inflight_cap(mut self, cap: usize) -> Self {
+        self.observer_inflight_cap = cap.max(1);
         self
     }
 

@@ -416,6 +416,10 @@ type GreedyConfig struct {
 	// avoid the substrate's bandwidth-axis reject counter
 	// saturating under normal load.
 	NicPeakBytesPerS uint64 `json:"nic_peak_bytes_per_s,omitempty"`
+	// Maximum in-flight observe_event tasks before the observer
+	// drops events under load. 0 = use substrate default (1024).
+	// Floor 1.
+	ObserverInflightCap uint64 `json:"observer_inflight_cap,omitempty"`
 	// `"disabled"` / `"any_of_local_capabilities"` (default) /
 	// `"strict"`. Empty = substrate default.
 	IntentMatch string `json:"intent_match,omitempty"`
