@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/dataforts/blob/fs.rs
+  s_12f9dbe572d1ee::t_9faa49cf4d732e 144-148,217-221,264-268,290-294,300-301
+net/crates/net/src/adapter/net/dataforts/greedy/cache.rs
+  s_12f9dbe572d1ee::t_9faa49cf4d732e 210,588-592
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  s_12f9dbe572d1ee::t_9faa49cf4d732e 531-544
+net/crates/net/bindings/node/src/blob.rs
+  s_12f9dbe572d1ee::t_9faa49cf4d732e 288-295,533-540
+net/crates/net/src/adapter/net/dataforts/blob/blob_ref.rs
+  s_12f9dbe572d1ee::t_9faa49cf4d732e 126
+net/crates/net/src/adapter/net/dataforts/blob/conformance.rs
+  s_12f9dbe572d1ee::t_9faa49cf4d732e 127-129,146-147
+net/crates/net/src/adapter/net/dataforts/blob/dispatch.rs
+  s_12f9dbe572d1ee::t_9faa49cf4d732e 314
+net/crates/net/src/adapter/net/dataforts/gravity/policy.rs
+  s_12f9dbe572d1ee::t_9faa49cf4d732e 144-146
+net/crates/net/src/adapter/net/dataforts/greedy/metrics.rs
+  s_12f9dbe572d1ee::t_9faa49cf4d732e 619
+net/crates/net/src/adapter/net/dataforts/mod.rs
+  s_12f9dbe572d1ee::t_9faa49cf4d732e 27-31
+net/crates/net/src/adapter/net/mesh.rs
+  s_12f9dbe572d1ee::t_9faa49cf4d732e 4984,9999-10002
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "229280762be6c2a57e17e54afe89ad462d386532",
+  "prompts": {},
+  "sessions": {
+    "s_12f9dbe572d1ee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4725331c-d3e2-4665-92b0-19e59efee5c2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
