@@ -15,6 +15,7 @@
 pub mod adapter;
 pub mod blob_ref;
 pub mod conformance;
+pub mod dispatch;
 pub mod error;
 pub mod fs;
 pub mod noop;
@@ -23,6 +24,7 @@ pub mod registry;
 pub use adapter::BlobAdapter;
 pub use blob_ref::{BlobRef, BLOB_REF_DISCRIMINATOR, BLOB_REF_VERSION_V1};
 pub use conformance::run_conformance_suite;
+pub use dispatch::{classify_payload, resolve_payload, EventPayload};
 pub use error::BlobError;
 pub use fs::FileSystemAdapter;
 pub use noop::NoopAdapter;
