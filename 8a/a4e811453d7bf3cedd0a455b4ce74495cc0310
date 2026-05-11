@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/dataforts/mod.rs
+  s_4dbb97ea6ebffd::t_f174d1473440d1 20-23
+net/crates/net/src/adapter/net/dataforts/greedy/metrics.rs
+  s_4dbb97ea6ebffd::t_6fc153513b8e09 1-545
+net/crates/net/src/adapter/net/dataforts/greedy/mod.rs
+  s_4dbb97ea6ebffd::t_8935284876e9b5 23,32-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "8aa4e811453d7bf3cedd0a455b4ce74495cc0310",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
