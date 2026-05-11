@@ -520,6 +520,12 @@ pub extern "C" fn net_redex_open_file(
     if redex.is_null() || name.is_null() || out_handle.is_null() {
         return NetError::NullPointer.into();
     }
+    // Pre-zero the out-pointer so a cgo / C consumer reading the
+    // slot after a non-zero return sees null rather than stale stack
+    // data. The success path overwrites this with the boxed handle.
+    unsafe {
+        *out_handle = std::ptr::null_mut();
+    }
     let redex = unsafe { &*redex };
     let _op = match redex.guard.try_enter() {
         Some(op) => op,
@@ -799,6 +805,11 @@ pub extern "C" fn net_redex_file_tail(
 ) -> c_int {
     if handle.is_null() || out_cursor.is_null() {
         return NetError::NullPointer.into();
+    }
+    // Pre-zero the out-pointer so a non-zero return leaves the
+    // caller with a null cursor rather than stale stack data.
+    unsafe {
+        *out_cursor = std::ptr::null_mut();
     }
     let file = unsafe { &*handle };
     let _op = match file.guard.try_enter() {
@@ -2211,6 +2222,61 @@ mod tests {
             );
         }
 
+        net_redex_free(r);
+    }
+
+    /// `net_redex_open_file` must pre-zero `*out_handle` on entry so
+    /// any non-zero return leaves the caller observing a null
+    /// pointer rather than stale stack data. Cgo / C consumers that
+    /// read `*out_handle` after `rc != 0` would otherwise see a
+    /// random bit pattern from the caller's stack frame and may
+    /// attempt to free it.
+    #[test]
+    fn redex_open_file_zeroes_out_handle_on_error() {
+        let r = redex();
+        let name = CString::new("bad-json").unwrap();
+        let cfg = CString::new("not-json {").unwrap();
+        // Seed the out-pointer with a non-null sentinel that
+        // resembles a leaked handle. A regression would leave this
+        // sentinel in place after the InvalidJson return.
+        let sentinel = 0xDEAD_BEEF_usize as *mut RedexFileHandle;
+        let mut handle: *mut RedexFileHandle = sentinel;
+        let rc = net_redex_open_file(r, name.as_ptr(), cfg.as_ptr(), &mut handle);
+        assert_eq!(rc, NetError::InvalidJson as c_int);
+        assert!(
+            handle.is_null(),
+            "out_handle must be null after rc != 0; got {handle:?}"
+        );
+        net_redex_free(r);
+    }
+
+    /// `net_redex_file_tail` must pre-zero `*out_cursor` on entry
+    /// for the same reason as `net_redex_open_file`. Free the file
+    /// to flip the handle guard into the freeing state so the
+    /// subsequent tail call's `try_enter` bails with ShuttingDown
+    /// after the pre-zero has run.
+    #[test]
+    fn redex_file_tail_zeroes_out_cursor_on_error() {
+        let r = redex();
+        let name = CString::new("tail-zero").unwrap();
+        let mut file: *mut RedexFileHandle = ptr::null_mut();
+        assert_eq!(
+            net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
+            0
+        );
+        // Free the file. begin_free flips freeing=true; the outer
+        // box stays leaked, so subsequent calls go through but
+        // try_enter bails with ShuttingDown.
+        net_redex_file_free(file);
+
+        let sentinel = 0xDEAD_BEEF_usize as *mut RedexTailHandle;
+        let mut cursor: *mut RedexTailHandle = sentinel;
+        let rc = net_redex_file_tail(file, 0, &mut cursor);
+        assert_eq!(rc, NetError::ShuttingDown as c_int);
+        assert!(
+            cursor.is_null(),
+            "out_cursor must be null after rc != 0; got {cursor:?}"
+        );
         net_redex_free(r);
     }
 
