@@ -342,6 +342,23 @@ impl PyRedex {
         Ok(())
     }
 
+    /// R-7: when this wheel is built without the `net` feature
+    /// (cortex-only build), surface a typed RedexError naming the
+    /// missing feature instead of an `AttributeError` from PyO3.
+    /// Pyo3 takes the first matching `#[pymethods]` arm; the
+    /// `cfg(not(feature = "net"))` variant only exists in the
+    /// degraded build and accepts a `PyObject` so the call site
+    /// (`r.enable_replication(some_mesh)`) doesn't fail with a
+    /// type error before the typed error fires.
+    #[cfg(not(feature = "net"))]
+    #[pyo3(signature = (_mesh = None))]
+    fn enable_replication(&self, _mesh: Option<Py<PyAny>>) -> PyResult<()> {
+        Err(RedexError::new_err(
+            "redex: enable_replication requires the `net` feature; \
+             rebuild with --features net",
+        ))
+    }
+
     /// Count of per-channel replication runtimes currently registered
     /// on this manager. `0` when replication isn't enabled. Useful
     /// for tests and operator observability.

@@ -142,6 +142,21 @@ impl Redex {
         Ok(())
     }
 
+    /// R-7: when this binding is built without the `net` feature
+    /// (cortex-only build), surface a typed `redex:` error
+    /// naming the missing feature instead of
+    /// `TypeError: redex.enableReplication is not a function`.
+    /// Takes `napi::JsUnknown` so a JS call site with any
+    /// arg shape still reaches the typed error.
+    #[cfg(not(feature = "net"))]
+    #[napi]
+    pub fn enable_replication(&self, _mesh: napi::JsUnknown) -> Result<()> {
+        Err(redex_err(
+            "enable_replication",
+            "binding built without `net` feature; rebuild with --features net",
+        ))
+    }
+
     /// Count of per-channel replication runtimes currently registered
     /// on this manager. `0` when replication isn't enabled. Useful
     /// for tests + operator observability.
