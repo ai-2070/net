@@ -4,16 +4,17 @@
 //! - `BlobRef` napi class with `uri` / `hash` / `size` / `version`
 //!   getters, `encode()`, `fromEncoded` factory.
 //! - Adapter-registry lifecycle functions for the Rust-backed
-//!   `FileSystemAdapter`.
+//!   `FileSystemAdapter` (`registerFilesystemBlobAdapter`,
+//!   `unregisterBlobAdapter`, ...).
 //! - `blobPublish` / `blobResolve` functions that route through
 //!   the registered adapter.
-//!
-//! Node-implemented BlobAdapters (a JS class with `store`/`fetch`/
-//! `fetchRange`/`exists` methods bridged via TSFN) ship as a
-//! follow-up slice — requires the async/threadsafe-function dance
-//! that the placement-filter bridge already established, but blob
-//! adapters need a separate dispatcher because the trait is `async`
-//! end-to-end (placement is sync).
+//! - `registerBlobAdapter(id, storeFn, fetchFn, fetchRangeFn,
+//!   existsFn)` for JS-implemented adapters bridged via four
+//!   `ThreadsafeFunction`s. JS-side methods are sync (return the
+//!   value directly, not a Promise); async JS adapters returning
+//!   Promises are a follow-up — requires the await-Promise
+//!   dispatcher pattern that the placement-filter bridge did not
+//!   need.
 
 use std::ops::Range;
 use std::path::PathBuf;
