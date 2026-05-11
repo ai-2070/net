@@ -60,7 +60,7 @@ mod protocol;
 mod proxy;
 #[cfg(feature = "redex")]
 pub mod redex;
-#[cfg(feature = "dataforts-greedy")]
+#[cfg(feature = "dataforts")]
 pub mod dataforts;
 mod reliability;
 mod reroute;

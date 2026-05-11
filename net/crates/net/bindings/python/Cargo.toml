@@ -42,16 +42,15 @@ nat-traversal = ["net", "net/nat-traversal"]
 # on `nat-traversal`.
 port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk", "dep:async-trait"]
-# Greedy-LRU dataforts (Rebel Yell Phase 1) — per-node
-# speculative caching of in-scope chains observed via the
-# tail-subscription path. Cortex isn't strictly required, but
-# the Python install path threads through the cortex-gated
-# Redex surface so we activate it transitively for binding-side
-# consistency.
-dataforts-greedy = ["cortex", "net", "net/dataforts-greedy"]
-# Data-gravity heat-counter layer (Rebel Yell Phase 4). Builds on
-# dataforts-greedy. See `docs/misc/DATAFORTS_PLAN.md` § Phase 4.
-dataforts-gravity = ["dataforts-greedy", "net/dataforts-gravity"]
+# Dataforts surface (Rebel Yell) — compile the operator
+# methods that wire greedy-LRU + data-gravity + future phases.
+# Toggling between greedy / gravity / future phases is a
+# runtime decision via `Redex::enable_*` methods, not a Cargo
+# feature choice; see `docs/misc/DATAFORTS_PLAN.md`. Cortex
+# isn't strictly required for the substrate, but the Python
+# install path threads through the cortex-gated Redex surface
+# so we activate it transitively for binding-side consistency.
+dataforts = ["cortex", "net", "net/dataforts"]
 # Python surface for the `MeshDaemon` / migration runtime.
 # Requires the `net` feature (for `NetMesh`) + the net-sdk
 # compute feature. Forwards `net-sdk/compute` explicitly so the

@@ -8,9 +8,9 @@
 //! A's local capability index as `heat:<hex>=<rate>` reserved
 //! tags.
 //!
-//! Run: `cargo test --features dataforts-gravity --test dataforts_gravity_e2e`
+//! Run: `cargo test --features dataforts --test dataforts_gravity_e2e`
 
-#![cfg(feature = "dataforts-gravity")]
+#![cfg(feature = "dataforts")]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

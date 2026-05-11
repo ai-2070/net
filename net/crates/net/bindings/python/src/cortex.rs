@@ -397,7 +397,7 @@ impl PyRedex {
     ///
     /// Raises `RedexError` on invalid config (range violations on
     /// caps, bandwidth fraction, proximity).
-    #[cfg(all(feature = "net", feature = "dataforts-greedy"))]
+    #[cfg(all(feature = "net", feature = "dataforts"))]
     #[pyo3(signature = (
         mesh,
         *,
@@ -485,7 +485,7 @@ impl PyRedex {
     /// `enable_replication` cross-feature surface so the same
     /// call site doesn't TypeError before the feature-required
     /// message surfaces.
-    #[cfg(not(all(feature = "net", feature = "dataforts-greedy")))]
+    #[cfg(not(all(feature = "net", feature = "dataforts")))]
     #[pyo3(signature = (_mesh = None, **_kwargs))]
     fn enable_greedy_dataforts(
         &self,
@@ -493,21 +493,21 @@ impl PyRedex {
         _kwargs: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         Err(RedexError::new_err(
-            "redex: enable_greedy_dataforts requires the `dataforts-greedy` feature; \
-             rebuild with --features dataforts-greedy",
+            "redex: enable_greedy_dataforts requires the `dataforts` feature; \
+             rebuild with --features dataforts",
         ))
     }
 
     /// Un-install the greedy wiring. Idempotent — no-op when
     /// greedy isn't enabled.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     fn disable_greedy_dataforts(&self) {
         self.inner.disable_greedy_dataforts();
     }
 
     /// Number of channels currently in the greedy cache. `0` when
     /// greedy isn't enabled.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     fn greedy_cached_channel_count(&self) -> u32 {
         self.inner
             .greedy_runtime()
@@ -523,7 +523,7 @@ impl PyRedex {
     /// `_bytes_resident`, plus the cluster-wide
     /// `_admit_rejected_total{reason=...}` and
     /// `_io_budget_used_bytes`.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     fn greedy_prometheus_text(&self) -> String {
         self.inner
             .greedy_runtime()
@@ -545,7 +545,7 @@ impl PyRedex {
     /// Idempotent — a second call replaces the prior policy and
     /// restarts the tick task. The heat registry resets on each
     /// re-enable.
-    #[cfg(all(feature = "net", feature = "dataforts-gravity"))]
+    #[cfg(all(feature = "net", feature = "dataforts"))]
     #[pyo3(signature = (
         mesh,
         *,
@@ -580,9 +580,9 @@ impl PyRedex {
             .map_err(|e| RedexError::new_err(format!("gravity invalid: {}", e)))
     }
 
-    /// Stub when `dataforts-gravity` isn't compiled in. Returns a
+    /// Stub when `dataforts` isn't compiled in. Returns a
     /// typed RedexError naming the missing feature.
-    #[cfg(not(all(feature = "net", feature = "dataforts-gravity")))]
+    #[cfg(not(all(feature = "net", feature = "dataforts")))]
     #[pyo3(signature = (_mesh = None, **_kwargs))]
     fn enable_gravity_for_greedy(
         &self,
@@ -590,14 +590,14 @@ impl PyRedex {
         _kwargs: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         Err(RedexError::new_err(
-            "redex: enable_gravity_for_greedy requires the `dataforts-gravity` feature; \
-             rebuild with --features dataforts-gravity",
+            "redex: enable_gravity_for_greedy requires the `dataforts` feature; \
+             rebuild with --features dataforts",
         ))
     }
 
     /// Uninstall the gravity layer. Idempotent — no-op when not
     /// enabled. Greedy itself stays running.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     fn disable_gravity_for_greedy(&self) {
         self.inner.disable_gravity_for_greedy();
     }

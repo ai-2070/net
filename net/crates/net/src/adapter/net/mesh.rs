@@ -281,7 +281,7 @@ struct DispatchCtx {
     /// `MeshNode`. The hot path takes a single read lock on every
     /// standard-event packet; uncontended reads under
     /// `parking_lot::RwLock` are single-digit-nanoseconds.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     greedy_observer:
         Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
     /// In-flight initiator handshakes; dispatch completes them when a
@@ -1325,7 +1325,7 @@ pub struct MeshNode {
     /// Same `parking_lot::RwLock<Option<Arc<dyn ...>>>` shape as
     /// the replication router for the same reason — `dyn Trait` is
     /// `!Sized` and `ArcSwapOption` doesn't accept it.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     greedy_observer:
         Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
     /// Monotonic version counter used when stamping our own
@@ -1653,7 +1653,7 @@ impl MeshNode {
             user_caps: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "redex")]
             replication_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
-            #[cfg(feature = "dataforts-greedy")]
+            #[cfg(feature = "dataforts")]
             greedy_observer: Arc::new(parking_lot::RwLock::new(None)),
             capability_version: Arc::new(AtomicU64::new(0)),
             local_subnet,
@@ -2440,7 +2440,7 @@ impl MeshNode {
             migration_handler: self.migration_handler.clone(),
             #[cfg(feature = "redex")]
             replication_inbound_router: self.replication_inbound_router.clone(),
-            #[cfg(feature = "dataforts-greedy")]
+            #[cfg(feature = "dataforts")]
             greedy_observer: self.greedy_observer.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
             pending_direct_initiators: self.pending_direct_initiators.clone(),
@@ -3746,7 +3746,7 @@ impl MeshNode {
         // event when the observer is installed. The runtime
         // itself spawns a tokio task per event to absorb the
         // async dispatch.
-        #[cfg(feature = "dataforts-greedy")]
+        #[cfg(feature = "dataforts")]
         let greedy = ctx.greedy_observer.read().clone();
 
         // Resolve the publisher's capability set so the runtime's
@@ -3759,7 +3759,7 @@ impl MeshNode {
         //
         // Snapshotted once per packet rather than per-event; every
         // event in the same packet shares the same publisher.
-        #[cfg(feature = "dataforts-greedy")]
+        #[cfg(feature = "dataforts")]
         let chain_caps: std::sync::Arc<
             crate::adapter::net::behavior::capability::CapabilitySet,
         > = if greedy.is_some() {
@@ -3779,7 +3779,7 @@ impl MeshNode {
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
-            #[cfg(feature = "dataforts-greedy")]
+            #[cfg(feature = "dataforts")]
             if let Some(observer) = &greedy {
                 observer.observe_event(
                     parsed.header.channel_hash,
@@ -6323,7 +6323,7 @@ impl MeshNode {
     /// True iff `tag` is a `heat:<hex>=...` reserved tag for the
     /// supplied chain-hash. Used by [`Self::replace_heat_tags`]
     /// to strip stale heat annotations before re-emission.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     fn is_heat_for(tag: &Tag, hex: &str) -> bool {
         match tag {
             Tag::Reserved { prefix, body } if prefix == "heat:" => {
@@ -6342,7 +6342,7 @@ impl MeshNode {
     /// Strip every `heat:<hex>=*` tag for `origin_hash` from
     /// `caps` and insert `replacement` in its place. `None` is
     /// withdrawal — every heat annotation for the chain drops.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     fn replace_heat_tags(caps: &mut CapabilitySet, origin_hash: u64, replacement: Option<Tag>) {
         let hex = Self::chain_hex(origin_hash);
         caps.tags.retain(|t| !Self::is_heat_for(t, &hex));
@@ -6426,7 +6426,7 @@ impl MeshNode {
     ///
     /// Rebel Yell Phase 4. See
     /// `docs/misc/DATAFORTS_PLAN.md` § Phase 4.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     pub async fn announce_heat(
         &self,
         origin_hash: u64,
@@ -6449,7 +6449,7 @@ impl MeshNode {
     /// Withdraw every `heat:<hex>=*` tag for `origin_hash` and
     /// re-broadcast. Peers drop the heat annotation; the
     /// chain's `causal:` advertisements are untouched.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     pub async fn withdraw_heat(
         &self,
         origin_hash: u64,
@@ -6460,7 +6460,7 @@ impl MeshNode {
     }
 }
 
-#[cfg(feature = "dataforts-gravity")]
+#[cfg(feature = "dataforts")]
 #[async_trait::async_trait]
 impl super::dataforts::HeatSink for MeshNode {
     async fn announce_heat(&self, origin_hash: u64, rate: f64) -> Result<(), AdapterError> {
@@ -6501,7 +6501,7 @@ impl MeshNode {
     ///
     /// Idempotent — re-installing replaces the previous handle.
     /// Hot-path cost is unchanged when called with the same Arc.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     pub fn set_greedy_observer(
         &self,
         observer: Option<Arc<dyn super::dataforts::GreedyObserver>>,
@@ -6512,7 +6512,7 @@ impl MeshNode {
     /// True iff a greedy observer is currently installed. Useful
     /// for tests and for the operator surface to confirm the
     /// install landed.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     pub fn has_greedy_observer(&self) -> bool {
         self.greedy_observer.read().is_some()
     }

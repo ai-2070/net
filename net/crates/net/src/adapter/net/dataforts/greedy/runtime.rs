@@ -154,13 +154,13 @@ struct GreedyRuntimeInner {
     /// always fail). RwLock chosen over Mutex because reads
     /// (note_read, gravity_tick) dominate writes (enable /
     /// disable) once gravity is installed.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     gravity: parking_lot::RwLock<Option<GravityState>>,
 }
 
 /// Per-runtime data-gravity state. Behind the same gate as the
 /// public `with_gravity` builder + `gravity_tick` method.
-#[cfg(feature = "dataforts-gravity")]
+#[cfg(feature = "dataforts")]
 struct GravityState {
     /// Heat-tag emission policy. Immutable after install;
     /// reconfigure by re-enabling greedy.
@@ -222,7 +222,7 @@ impl GreedyRuntime {
                 intent_registry,
                 metadata_keys: PlacementMetadataKeys::default(),
                 local_caps: Mutex::new(local_caps),
-                #[cfg(feature = "dataforts-gravity")]
+                #[cfg(feature = "dataforts")]
                 gravity: parking_lot::RwLock::new(None),
             }),
         }
@@ -237,7 +237,7 @@ impl GreedyRuntime {
     /// (e.g. to reconfigure the policy) is permitted; the heat
     /// registry resets on each call so the new policy starts
     /// from a clean slate.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     pub fn set_gravity(
         &self,
         policy: super::super::gravity::DataGravityPolicy,
@@ -253,13 +253,13 @@ impl GreedyRuntime {
     /// Disable data-gravity. The heat registry drops; subsequent
     /// `note_read` calls won't touch heat; `gravity_tick` becomes
     /// a no-op. Idempotent.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     pub fn clear_gravity(&self) {
         *self.inner.gravity.write() = None;
     }
 
     /// True iff this runtime has data gravity installed.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     pub fn gravity_enabled(&self) -> bool {
         self.inner.gravity.read().is_some()
     }
@@ -325,7 +325,7 @@ impl GreedyRuntime {
         let m = self.inner.metrics.for_channel(channel.as_str());
         m.incr_serve();
 
-        #[cfg(feature = "dataforts-gravity")]
+        #[cfg(feature = "dataforts")]
         {
             let gravity = self.inner.gravity.read();
             if let Some(gravity) = gravity.as_ref() {
@@ -348,7 +348,7 @@ impl GreedyRuntime {
                 }
             }
         }
-        #[cfg(not(feature = "dataforts-gravity"))]
+        #[cfg(not(feature = "dataforts"))]
         let _ = origin_hash;
     }
 
@@ -366,7 +366,7 @@ impl GreedyRuntime {
     /// (typically `heartbeat_ms`-aligned) so heat propagation
     /// piggybacks on the existing capability-announcement
     /// cadence.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     pub async fn gravity_tick(&self) {
         // Snapshot the sink + emissions list under the read lock,
         // then drop the lock before awaiting the sink. Holding

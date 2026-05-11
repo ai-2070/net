@@ -408,7 +408,7 @@ pub extern "C" fn net_redex_replication_prometheus_text(redex: *const RedexHandl
 /// JSON shape the Go (and any C-ABI) consumer encodes for
 /// `net_redex_enable_greedy_dataforts`. All fields optional —
 /// missing fields keep the substrate Phase-1 defaults.
-#[cfg(feature = "dataforts-greedy")]
+#[cfg(feature = "dataforts")]
 #[derive(serde::Deserialize, Default)]
 struct RedexGreedyConfigJson {
     /// Scope filter (`scope:<label>` body matches admit). Empty /
@@ -433,7 +433,7 @@ struct RedexGreedyConfigJson {
     colocation_policy: Option<String>,
 }
 
-#[cfg(feature = "dataforts-greedy")]
+#[cfg(feature = "dataforts")]
 impl RedexGreedyConfigJson {
     fn into_config(
         self,
@@ -492,7 +492,7 @@ impl RedexGreedyConfigJson {
 /// when the Redex is in `_free`-quiesce;
 /// `NetError::InvalidUtf8` / `NetError::InvalidJson` for malformed
 /// config; `NET_ERR_REDEX` for validation errors.
-#[cfg(all(feature = "net", feature = "dataforts-greedy"))]
+#[cfg(all(feature = "net", feature = "dataforts"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redex_enable_greedy_dataforts(
     redex: *mut RedexHandle,
@@ -564,7 +564,7 @@ pub extern "C" fn net_redex_enable_greedy_dataforts(
 }
 
 /// Uninstall greedy wiring. Idempotent.
-#[cfg(feature = "dataforts-greedy")]
+#[cfg(feature = "dataforts")]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redex_disable_greedy_dataforts(redex: *mut RedexHandle) -> c_int {
     let Some(h) = (unsafe { redex.as_ref() }) else {
@@ -580,7 +580,7 @@ pub extern "C" fn net_redex_disable_greedy_dataforts(redex: *mut RedexHandle) ->
 
 /// Count of channels currently in the greedy cache. Returns `0`
 /// when greedy isn't enabled or on a NULL handle.
-#[cfg(feature = "dataforts-greedy")]
+#[cfg(feature = "dataforts")]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redex_greedy_cached_channel_count(
     redex: *const RedexHandle,
@@ -601,7 +601,7 @@ pub extern "C" fn net_redex_greedy_cached_channel_count(
 /// Render greedy metrics as Prometheus text. Caller frees via
 /// [`crate::ffi::net_free_string`]. Empty string when greedy
 /// isn't enabled; NULL on a NULL handle or shutting-down Redex.
-#[cfg(feature = "dataforts-greedy")]
+#[cfg(feature = "dataforts")]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redex_greedy_prometheus_text(
     redex: *const RedexHandle,
@@ -630,7 +630,7 @@ pub extern "C" fn net_redex_greedy_prometheus_text(
 
 /// JSON shape consumed by `net_redex_enable_gravity_for_greedy`.
 /// Mirrors the Python kwargs / Node `DataGravityConfigJs`.
-#[cfg(feature = "dataforts-gravity")]
+#[cfg(feature = "dataforts")]
 #[derive(serde::Deserialize, Default)]
 struct RedexGravityConfigJson {
     /// `true` = counter active. Default `true`.
@@ -643,7 +643,7 @@ struct RedexGravityConfigJson {
     tick_interval_ms: Option<u64>,
 }
 
-#[cfg(feature = "dataforts-gravity")]
+#[cfg(feature = "dataforts")]
 impl RedexGravityConfigJson {
     fn into_policy_and_tick(
         self,
@@ -678,7 +678,7 @@ impl RedexGravityConfigJson {
 /// `NetError::InvalidUtf8` / `NetError::InvalidJson` for
 /// malformed config; `NET_ERR_REDEX` when greedy isn't enabled
 /// first or the policy fails validation.
-#[cfg(all(feature = "net", feature = "dataforts-gravity"))]
+#[cfg(all(feature = "net", feature = "dataforts"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redex_enable_gravity_for_greedy(
     redex: *mut RedexHandle,
@@ -735,7 +735,7 @@ pub extern "C" fn net_redex_enable_gravity_for_greedy(
 }
 
 /// Uninstall gravity. Idempotent. Greedy stays running.
-#[cfg(feature = "dataforts-gravity")]
+#[cfg(feature = "dataforts")]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_redex_disable_gravity_for_greedy(
     redex: *mut RedexHandle,
@@ -3009,7 +3009,7 @@ mod tests {
     /// Parallel coverage for the greedy FFI surface — pin the
     /// Arc-consumption contract on the NULL-redex error path
     /// (same shape as the replication test above).
-    #[cfg(all(feature = "net", feature = "dataforts-greedy"))]
+    #[cfg(all(feature = "net", feature = "dataforts"))]
     #[test]
     fn enable_greedy_drops_mesh_arc_on_null_redex() {
         use crate::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
@@ -3045,7 +3045,7 @@ mod tests {
 
     /// Smoke test: install greedy on a real Redex + mesh, observe
     /// the channel-count + Prometheus text shape, then uninstall.
-    #[cfg(all(feature = "net", feature = "dataforts-greedy"))]
+    #[cfg(all(feature = "net", feature = "dataforts"))]
     #[test]
     fn greedy_enable_disable_round_trip() {
         use crate::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};

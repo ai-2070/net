@@ -9,9 +9,9 @@
 //! subscription on B's local channels, just the mesh-level
 //! observation path.
 //!
-//! Run: `cargo test --features dataforts-greedy --test dataforts_greedy_e2e`
+//! Run: `cargo test --features dataforts --test dataforts_greedy_e2e`
 
-#![cfg(feature = "dataforts-greedy")]
+#![cfg(feature = "dataforts")]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

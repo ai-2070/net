@@ -4,7 +4,7 @@
 
 ## Status
 
-**The Warriors shipped in v0.14 (2026-05-12).** Phases 0, 2, 6 (primitives only), and 7 are in the codebase. **Phase 1 (Greedy-LRU dataforts) shipped behind the `dataforts-greedy` Cargo feature flag** on the `dataforts-phase-1` branch — operator-facing surface across Rust core + Python + Node + Go + C FFI, with end-to-end mesh integration. Three remaining Rebel Yell phases stay parked until their activation gates fire. See [§ Implementation-ready specs for remaining phases](#implementation-ready-specs-for-remaining-phases) for the locked decisions + actionable work items per remaining phase.
+**The Warriors shipped in v0.14 (2026-05-12).** Phases 0, 2, 6 (primitives only), and 7 are in the codebase. **Phases 1 (Greedy-LRU) and 4 (Data gravity) shipped behind the single `dataforts` Cargo feature flag** on the `dataforts-phase-1` / `dataforts-phase-4` branches — operator-facing surface across Rust core + Python + Node + Go + C FFI, with end-to-end mesh integration. Greedy and gravity are runtime-toggleable policies (see [§ Runtime toggles vs. compile-time flags](#runtime-toggles-vs-compile-time-flags) below); the Cargo feature only gates whether the dataforts surface compiles at all. Two remaining Rebel Yell phases stay parked until their activation gates fire. See [§ Implementation-ready specs for remaining phases](#implementation-ready-specs-for-remaining-phases) for the locked decisions + actionable work items per remaining phase.
 
 | Phase | Release | Status | Where it lives |
 |---|---|---|---|
@@ -12,11 +12,26 @@
 | 6 — Federated query primitives (Warriors-scope) | Warriors | ✅ shipped v0.13 (primitives only; MeshDB extension still deferred) | `adapter::net::behavior::query::CapabilityQuery` |
 | 7 — 5-axis `PlacementFilter` + Mikoshi integration | Warriors | ✅ shipped v0.13 | `adapter::net::behavior::placement::{PlacementFilter, Artifact, StandardPlacement, IntentRegistry}` |
 | 2 — RedEX cross-node replication (`SUBPROTOCOL_REDEX`) | Warriors | ✅ shipped v0.14 | `adapter::net::redex::replication*` |
-| 1 — Greedy-LRU dataforts | Rebel Yell | ✅ shipped on `dataforts-phase-1` branch (behind `dataforts-greedy` feature) | `adapter::net::dataforts::greedy::*`, `Redex::enable_greedy_dataforts`, mesh inbound hook, all four bindings |
+| 1 — Greedy-LRU dataforts | Rebel Yell | ✅ shipped on `dataforts-phase-1` branch (behind `dataforts` feature) | `adapter::net::dataforts::greedy::*`, `Redex::enable_greedy_dataforts`, mesh inbound hook, all four bindings |
 | 3 — `BlobRef` + `BlobAdapter` hook | Rebel Yell | ⏳ open (independent — can ship parallel) | — |
-| 4 — Data gravity (heat-counter migration) | Rebel Yell | ✅ shipped on `dataforts-phase-4` branch (behind `dataforts-gravity` feature) | `adapter::net::dataforts::gravity::*`, `Redex::enable_gravity_for_greedy`, `MeshNode::announce_heat`, all four bindings |
+| 4 — Data gravity (heat-counter migration) | Rebel Yell | ✅ shipped on `dataforts-phase-4` branch (behind `dataforts` feature) | `adapter::net::dataforts::gravity::*`, `Redex::enable_gravity_for_greedy`, `MeshNode::announce_heat`, all four bindings |
 | 5 — Read-your-writes guarantees | Rebel Yell | ⏳ open (independent) | — |
 | 6 — MeshDB extension (time-travel, lineage walks, cross-chain joins) | Deferred | ⏳ research-grade; out of either release | — |
+
+### Runtime toggles vs. compile-time flags
+
+Greedy (Phase 1) and gravity (Phase 4) are **runtime policies**, not compile-time choices. Operators flip them on or off live via `Redex::enable_greedy_dataforts` / `enable_gravity_for_greedy` / `disable_greedy_dataforts` / `disable_gravity_for_greedy` against an already-running mesh node — no rebuild, no restart, no rollout. The single `dataforts` Cargo feature exists only to determine whether the surface compiles at all (so non-dataforts builds avoid the code-size + transitive-dep cost); the per-phase decision is operational.
+
+The four cluster modes a fleet can express:
+
+| Greedy | Gravity | Behavior | When to run it |
+|---|---|---|---|
+| ON | ON | **Full convergence.** Greedy nodes pull in-scope chains, gravity emits heat, hot chains drift toward their readers. | Default for distributed workloads with read/write locality. |
+| ON | OFF | **Hoard, don't rebalance.** Caches populate but no heat propagates, so no chains migrate. | Stable layout — predetermined placement, no fleet-level migration churn allowed. |
+| OFF | ON | **Drift-only.** No greedy admission, but already-placed chains still emit heat and pull other replicas toward demand. | Pre-seeded replicas + observed-demand reshaping. |
+| OFF | OFF | **Frozen.** Substrate-only routing. Acts like the pre-Rebel-Yell mesh. | Diagnostic / break-glass; A/B baseline; deployment freezes. |
+
+Treating greedy and gravity as Cargo features would force operators to ship a rebuild for each quadrant change — wrong granularity. Treating them as runtime toggles lets the fleet move between quadrants in seconds.
 
 ## Release plan: The Warriors → Rebel Yell
 
@@ -661,7 +676,7 @@ Every phase emits per-channel metrics into the existing `RpcMetricsRegistry` sha
 
 ### Feature flags + rollout
 
-- Each phase ships gated behind a Cargo feature: `dataforts-greedy`, `dataforts-replication`, `dataforts-blob`, `dataforts-gravity`, `dataforts-ryw`, `dataforts-query`. **Phase 0 is unconditional** — it's a general capability-tag enhancement, not Dataforts-specific, and other parts of Net (compute placement, scope filtering) benefit from it for free.
+- The dataforts surface is gated behind a **single** `dataforts` Cargo feature in `ai2070-net` (and forwarded by the binding crates). Greedy (Phase 1) and gravity (Phase 4) — and every future runtime-toggleable phase — live behind this one flag because the per-phase choice is **runtime**, not compile-time (see [§ Runtime toggles vs. compile-time flags](#runtime-toggles-vs-compile-time-flags)). New phases that are themselves a compile-time choice (e.g. Phase 3's `BlobAdapter` if it lands as a separate crate-level surface) get their own flag. **Phase 0 is unconditional** — it's a general capability-tag enhancement, not Dataforts-specific, and other parts of Net (compute placement, scope filtering) benefit from it for free.
 - Off-by-default in `ai2070-net` and `ai2070-net-sdk`. Pilots opt in.
 - Each phase ships a `CONFIG_<phase>.md`-style operational doc explaining tunables, expected resource cost, and rollback path.
 - Rollback path is non-negotiable: every phase must be flippable off in production without restarting the daemon.
@@ -749,7 +764,7 @@ Now that the Warriors precursor has shipped, the four remaining Rebel Yell phase
 - **Replication.** `adapter::net::redex::{Redex, ReplicationConfig, ReplicationCoordinator, replicate}`, the runtime + 4-state machine. `SUBPROTOCOL_REDEX = 0x0E00` on the wire.
 - **Chain-tag side-effects.** `MeshNode::{announce_chain, withdraw_chain}` re-emit the `causal:<hex>:<tip_seq>` tag on transitions.
 
-The `dataforts-greedy` / `dataforts-blob` / `dataforts-gravity` / `dataforts-ryw` Cargo features stay defined for opt-in rollout. Bindings stay parallelisable per phase (Node / Python / Go / C / TS-SDK).
+The single `dataforts` Cargo feature stays defined for opt-in rollout across the runtime-toggleable phases (1, 4, 5). Phase 3 (`BlobAdapter`) — the one remaining phase that is a compile-time choice rather than a runtime policy — gets its own flag when it lands. Bindings stay parallelisable per phase (Node / Python / Go / C / TS-SDK).
 
 ---
 
@@ -894,7 +909,7 @@ Phase 3 (1–2 weeks; parallel with anything)
 Phase 5 (2–4 weeks; slot anywhere; depends on no other Rebel Yell phase)
 ```
 
-Wall-clock for the full Rebel Yell remainder: **~5–10 weeks parallelised across two engineers**, **~10–14 weeks serialised** for a single engineer. Each phase ships behind its own Cargo feature flag (`dataforts-greedy`, `dataforts-blob`, `dataforts-gravity`, `dataforts-ryw`) and the rollback path is a feature-flag flip without daemon restart.
+Wall-clock for the full Rebel Yell remainder: **~5–10 weeks parallelised across two engineers**, **~10–14 weeks serialised** for a single engineer. The dataforts runtime-policy phases (1, 4, 5) ship behind the single `dataforts` Cargo feature; Phase 3 (`BlobAdapter`, the one compile-time-shaped phase) gets its own flag when it lands. Rollback for the runtime policies is a `Redex::disable_*` call — no daemon restart, no rebuild.
 
 The activation gates haven't moved: ship reactively per phase when a real workload asks for it. The spec above exists so that *when* the workload asks, the path is clear — not so that we ship speculatively.
 

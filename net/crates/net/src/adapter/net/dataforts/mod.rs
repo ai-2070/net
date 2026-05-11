@@ -12,13 +12,13 @@
 //! - [`greedy`] — per-node speculative caching of in-scope chains
 //!   observed via the tail-subscription path. Phase 1.
 
-#[cfg(feature = "dataforts-greedy")]
+#[cfg(feature = "dataforts")]
 pub mod greedy;
 
-#[cfg(feature = "dataforts-gravity")]
+#[cfg(feature = "dataforts")]
 pub mod gravity;
 
-#[cfg(feature = "dataforts-greedy")]
+#[cfg(feature = "dataforts")]
 pub use greedy::{
     should_admit, synthesize_cache_channel_name, AdmissionInputs, AdmissionVerdict,
     AdmitRejectReason, ColocationPolicy, DispatchOutcome, EvictionSweep, GreedyCacheEntry,
@@ -27,7 +27,7 @@ pub use greedy::{
     GreedyMetricsSnapshot, GreedyObserver, GreedyRuntime, IntentMatchPolicy, ScopeLabel,
 };
 
-#[cfg(feature = "dataforts-gravity")]
+#[cfg(feature = "dataforts")]
 pub use gravity::{
     should_emit_heat, DataGravityPolicy, DataGravityPolicyError, EmissionDecision,
     HeatCounter, HeatEmission, HeatRegistry, HeatSink,

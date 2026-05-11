@@ -83,23 +83,23 @@ impl Drop for ReplicationWiring {
 /// Wiring kept alive while `Redex::enable_greedy_dataforts` is in
 /// effect. `Drop` un-installs the observer from the mesh so the
 /// hot path falls back to the lock-read-and-skip pattern.
-#[cfg(feature = "dataforts-greedy")]
+#[cfg(feature = "dataforts")]
 struct GreedyWiring {
     mesh: Arc<MeshNode>,
     runtime: Arc<super::super::dataforts::GreedyRuntime>,
     /// Periodic `gravity_tick` driver, spawned by
     /// `Redex::enable_gravity_for_greedy`. `None` when gravity
     /// is not enabled. Aborted on `Drop` to stop the tick loop.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     gravity_tick_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-#[cfg(feature = "dataforts-greedy")]
+#[cfg(feature = "dataforts")]
 impl Drop for GreedyWiring {
     fn drop(&mut self) {
         // Stop the gravity-tick loop first so the runtime drop
         // path doesn't race a tick mid-flight.
-        #[cfg(feature = "dataforts-gravity")]
+        #[cfg(feature = "dataforts")]
         if let Some(task) = self.gravity_tick_task.lock().take() {
             task.abort();
         }
@@ -132,7 +132,7 @@ pub struct Redex {
     /// [`Redex::enable_greedy_dataforts`]. `None` keeps greedy
     /// caching disabled — inbound events flow through the mesh's
     /// hot path with a single `RwLock` read and skip.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     greedy: parking_lot::RwLock<Option<Arc<GreedyWiring>>>,
 }
 
@@ -148,7 +148,7 @@ impl Redex {
             persistent_dir: None,
             build_count: AtomicU64::new(0),
             replication: parking_lot::RwLock::new(None),
-            #[cfg(feature = "dataforts-greedy")]
+            #[cfg(feature = "dataforts")]
             greedy: parking_lot::RwLock::new(None),
         }
     }
@@ -167,7 +167,7 @@ impl Redex {
             persistent_dir: None,
             build_count: AtomicU64::new(0),
             replication: parking_lot::RwLock::new(None),
-            #[cfg(feature = "dataforts-greedy")]
+            #[cfg(feature = "dataforts")]
             greedy: parking_lot::RwLock::new(None),
         }
     }
@@ -230,7 +230,7 @@ impl Redex {
     /// gates have something to evaluate against. Refresh via
     /// [`Self::greedy_runtime`] + `set_local_caps` after each
     /// `MeshNode::announce_capabilities`.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     pub fn enable_greedy_dataforts(
         self: &Arc<Self>,
         mesh: Arc<MeshNode>,
@@ -257,7 +257,7 @@ impl Redex {
         *slot = Some(Arc::new(GreedyWiring {
             mesh,
             runtime,
-            #[cfg(feature = "dataforts-gravity")]
+            #[cfg(feature = "dataforts")]
             gravity_tick_task: parking_lot::Mutex::new(None),
         }));
         Ok(())
@@ -280,7 +280,7 @@ impl Redex {
     ///
     /// `mesh` is consumed for its [`HeatSink`] impl
     /// (`announce_heat` / `withdraw_heat`).
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     pub fn enable_gravity_for_greedy(
         &self,
         mesh: Arc<MeshNode>,
@@ -315,7 +315,7 @@ impl Redex {
     /// Disable data-gravity emission. Stops the tick task,
     /// clears the heat registry, and leaves greedy itself
     /// running. Idempotent — no-op when gravity isn't enabled.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     pub fn disable_gravity_for_greedy(&self) {
         let wiring = self.greedy.read().clone();
         let Some(wiring) = wiring else {
@@ -330,14 +330,14 @@ impl Redex {
     /// Borrow the installed greedy runtime, if any. Cheap clone
     /// of the `Arc` — callers refresh local caps via
     /// `runtime.set_local_caps` after every announce.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     pub fn greedy_runtime(&self) -> Option<Arc<super::super::dataforts::GreedyRuntime>> {
         self.greedy.read().as_ref().map(|w| w.runtime.clone())
     }
 
     /// Uninstall the greedy wiring. Idempotent — `None` if greedy
     /// wasn't enabled.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     pub fn disable_greedy_dataforts(&self) {
         let _wiring = self.greedy.write().take();
         // Wiring's Drop calls mesh.set_greedy_observer(None).
@@ -360,7 +360,7 @@ impl Redex {
     /// isn't in the cache. Callers fall back to whatever they
     /// were doing before greedy (typically the substrate's own
     /// `find_chain_holders` + network fetch).
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     pub fn greedy_cache_for(
         &self,
         channel: &ChannelName,
@@ -1120,7 +1120,7 @@ mod tests {
     /// `enable_gravity_for_greedy` fails when greedy isn't
     /// installed first — surfaces a typed `GreedyNotEnabled`
     /// error rather than panicking or silently no-oping.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn enable_gravity_without_greedy_returns_typed_error() {
         use super::super::super::dataforts::{
@@ -1143,7 +1143,7 @@ mod tests {
     /// Happy path: install greedy, install gravity on top,
     /// disable gravity, disable greedy. Each step is idempotent
     /// and leaves the next-step state consistent.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn enable_disable_gravity_round_trip() {
         use super::super::super::dataforts::{DataGravityPolicy, GreedyConfig};

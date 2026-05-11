@@ -212,7 +212,7 @@ impl Redex {
     ///
     /// `intentMatch` values: `'disabled'` / `'any_of_local_capabilities'` / `'strict'`.
     /// `colocationPolicy` values: `'ignore'` / `'soft_preference'` / `'strict_required'`.
-    #[cfg(all(feature = "net", feature = "dataforts-greedy"))]
+    #[cfg(all(feature = "net", feature = "dataforts"))]
     #[napi]
     pub fn enable_greedy_dataforts(
         &self,
@@ -280,10 +280,10 @@ impl Redex {
             .map_err(|e| redex_err("enable_greedy_dataforts", e))
     }
 
-    /// Stub for builds without the `dataforts-greedy` feature.
+    /// Stub for builds without the `dataforts` feature.
     /// Surfaces a typed `redex:` error rather than the napi
     /// `TypeError: ...is not a function`.
-    #[cfg(not(all(feature = "net", feature = "dataforts-greedy")))]
+    #[cfg(not(all(feature = "net", feature = "dataforts")))]
     #[napi]
     pub fn enable_greedy_dataforts(
         &self,
@@ -292,13 +292,13 @@ impl Redex {
     ) -> Result<()> {
         Err(redex_err(
             "enable_greedy_dataforts",
-            "binding built without `dataforts-greedy` feature; rebuild with --features dataforts-greedy",
+            "binding built without `dataforts` feature; rebuild with --features dataforts",
         ))
     }
 
     /// Uninstall greedy wiring. Idempotent — no-op when not
     /// enabled.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     #[napi]
     pub fn disable_greedy_dataforts(&self) {
         self.inner.disable_greedy_dataforts();
@@ -306,7 +306,7 @@ impl Redex {
 
     /// Number of channels currently in the greedy cache. `0` when
     /// greedy isn't enabled.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     #[napi]
     pub fn greedy_cached_channel_count(&self) -> u32 {
         self.inner
@@ -317,7 +317,7 @@ impl Redex {
 
     /// Render the greedy metrics as Prometheus text. Empty string
     /// when greedy isn't enabled.
-    #[cfg(feature = "dataforts-greedy")]
+    #[cfg(feature = "dataforts")]
     #[napi]
     pub fn greedy_prometheus_text(&self) -> String {
         self.inner
@@ -334,7 +334,7 @@ impl Redex {
     ///
     /// Locked Phase-4 defaults from `DATAFORTS_PLAN.md`:
     /// emitThresholdRatio = 2.0, decayHalfLifeSecs = 1800.
-    #[cfg(all(feature = "net", feature = "dataforts-gravity"))]
+    #[cfg(all(feature = "net", feature = "dataforts"))]
     #[napi]
     pub fn enable_gravity_for_greedy(
         &self,
@@ -360,8 +360,8 @@ impl Redex {
             .map_err(|e| redex_err("enable_gravity_for_greedy", e))
     }
 
-    /// Stub for builds without `dataforts-gravity`.
-    #[cfg(not(all(feature = "net", feature = "dataforts-gravity")))]
+    /// Stub for builds without `dataforts`.
+    #[cfg(not(all(feature = "net", feature = "dataforts")))]
     #[napi]
     pub fn enable_gravity_for_greedy(
         &self,
@@ -370,13 +370,13 @@ impl Redex {
     ) -> Result<()> {
         Err(redex_err(
             "enable_gravity_for_greedy",
-            "binding built without `dataforts-gravity` feature; rebuild with --features dataforts-gravity",
+            "binding built without `dataforts` feature; rebuild with --features dataforts",
         ))
     }
 
     /// Uninstall the gravity layer. Greedy stays running.
     /// Idempotent.
-    #[cfg(feature = "dataforts-gravity")]
+    #[cfg(feature = "dataforts")]
     #[napi]
     pub fn disable_gravity_for_greedy(&self) {
         self.inner.disable_gravity_for_greedy();
@@ -485,7 +485,7 @@ pub struct ReplicationConfigJs {
 /// JS-side config for `Redex.enableGravityForGreedy`. Locked
 /// Phase-4 defaults — `DATAFORTS_PLAN.md` § Phase 4. All fields
 /// optional; omit any to keep the substrate default.
-#[cfg(feature = "dataforts-gravity")]
+#[cfg(feature = "dataforts")]
 #[napi(object)]
 #[derive(Default)]
 pub struct DataGravityConfigJs {
@@ -506,7 +506,7 @@ pub struct DataGravityConfigJs {
 /// JS-side config for `Redex.enableGreedyDataforts`. Locked
 /// Phase-1 defaults — `DATAFORTS_PLAN.md` § Phase 1. All fields
 /// optional; omit any to keep the substrate default.
-#[cfg(feature = "dataforts-greedy")]
+#[cfg(feature = "dataforts")]
 #[napi(object)]
 #[derive(Default)]
 pub struct GreedyConfigJs {
