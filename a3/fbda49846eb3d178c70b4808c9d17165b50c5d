@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/dataforts/greedy/cache.rs
+  s_4dbb97ea6ebffd::t_eed003a70ca9ef 1-6,9-14,21-45,47-50,55-61,63-89,92-94,102-111,113-151,158-159,163,165,167-168,172-173,175-180,182-189,191,199,203-205,209,218-223,225,227,229,231-238,240-252,255-345,348-423,426-427,429,460-461
+  s_4dbb97ea6ebffd::t_c42a9aa7b92335 7-8,15-20,46,51-54,62,90-91,95-101,112,152-157,160-162,164,166,169-171,174,181,190,192-198,200-202,208,230,239,253-254,346-347,424-425,428,430-436,441-443,445-450,452-453,455,457,459
+  s_4dbb97ea6ebffd::t_627362198a8b4b 437-440,444,451,454,456,458
+  s_4dbb97ea6ebffd::t_68b75b0f8a0b4e 206-207,210-217,224,226,228
+net/crates/net/src/adapter/net/dataforts/mod.rs
+  s_4dbb97ea6ebffd::t_85e08de878eee4 20-22
+net/crates/net/src/adapter/net/dataforts/greedy/mod.rs
+  s_4dbb97ea6ebffd::t_7434eac20ca51b 21,25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "a3fbda49846eb3d178c70b4808c9d17165b50c5d",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
