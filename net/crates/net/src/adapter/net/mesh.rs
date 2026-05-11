@@ -3749,11 +3749,12 @@ impl MeshNode {
 
         // Resolve the publisher's capability set so the runtime's
         // scope / intent / colocation gates have something to
-        // evaluate against. `addr_to_node` is O(1); a miss
-        // (subscribe-before-announce race, relay topology with
-        // shared source addr) falls back to empty caps which
-        // makes scope-axis admission fail-closed — same shape
-        // `evaluate_channel_auth` uses at line 5429.
+        // evaluate against. We look up *any holder* of the chain's
+        // origin_hash via the capability index — not the last-hop
+        // peer's caps, which would silently invert scope/intent
+        // admission for relayed events. Falls back to empty caps
+        // (fail-closed for scope-axis admission) if no holder is
+        // indexed yet (subscribe-before-announce race).
         //
         // Snapshotted once per packet rather than per-event; every
         // event in the same packet shares the same publisher.
@@ -3761,13 +3762,27 @@ impl MeshNode {
         let chain_caps: std::sync::Arc<
             crate::adapter::net::behavior::capability::CapabilitySet,
         > = if greedy.is_some() {
-            let peer_addr = session.peer_addr();
-            let from_node = ctx.addr_to_node.get(&peer_addr).map(|r| *r);
-            std::sync::Arc::new(
-                from_node
-                    .and_then(|nid| ctx.capability_index.get(nid))
-                    .unwrap_or_default(),
-            )
+            let origin_hash: u64 = parsed.header.origin_hash.into();
+            let hex = Self::chain_hex(origin_hash);
+            // Pick any node that advertises `causal:<hex>` — every
+            // holder has the same chain-level caps. The capability
+            // index doesn't return per-chain caps, only per-node;
+            // we trust holders to have a consistent view of the
+            // chain's tags because the chain's caps are immutable
+            // post-creation.
+            let publisher_caps = ctx
+                .capability_index
+                .all_nodes()
+                .into_iter()
+                .find_map(|nid| {
+                    let caps = ctx.capability_index.get(nid)?;
+                    if caps.tags.iter().any(|t| Self::is_causal_for(t, &hex)) {
+                        Some(caps)
+                    } else {
+                        None
+                    }
+                });
+            std::sync::Arc::new(publisher_caps.unwrap_or_default())
         } else {
             std::sync::Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default())
         };
