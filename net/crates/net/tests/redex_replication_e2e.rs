@@ -186,6 +186,29 @@ async fn two_node_replication_catches_replica_up() {
         );
     }
 
+    // Metrics sanity: the leader shipped at least one SyncResponse,
+    // so `sync_bytes_total` on its channel must be > 0. The leader
+    // also transitioned into Leader role once, so
+    // `leader_changes_total` must be exactly 1. Pulled via the
+    // operator-facing snapshot surface.
+    let snap_a = redex_a
+        .replication_metrics_snapshot()
+        .expect("snapshot on enabled Redex");
+    let chan_a = snap_a
+        .channels
+        .iter()
+        .find(|c| c.channel == "repl/e2e")
+        .expect("channel in snapshot");
+    assert!(
+        chan_a.sync_bytes_total > 0,
+        "leader's sync_bytes_total should bump on SyncResponse ship; got {}",
+        chan_a.sync_bytes_total
+    );
+    assert_eq!(
+        chan_a.leader_changes_total, 1,
+        "leader changed exactly once (Idle → Replica → Candidate → Leader)"
+    );
+
     // Cleanup: close both channels so the runtimes exit cleanly.
     redex_a.close_file(&name).expect("close A");
     redex_b.close_file(&name).expect("close B");
