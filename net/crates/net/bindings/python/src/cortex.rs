@@ -23,11 +23,12 @@ use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
     TasksAdapter as InnerTasksAdapter,
 };
+use ::net::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use ::net::adapter::net::redex::{
     FsyncPolicy as InnerFsyncPolicy, PlacementStrategy as InnerPlacementStrategy,
     Redex as InnerRedex, RedexError as InnerRedexError, RedexEvent as InnerRedexEvent,
     RedexFile as InnerRedexFile, RedexFileConfig, ReplicationConfig as InnerReplicationConfig,
-    UnderCapacity as InnerUnderCapacity,
+    UnderCapacity as InnerUnderCapacity, WriteToken as InnerWriteToken,
 };
 use bytes::Bytes;
 
@@ -143,6 +144,76 @@ fn parse_memories_order_by(s: &str) -> PyResult<InnerMemoriesOrderBy> {
             other
         ))),
     }
+}
+
+// =========================================================================
+// WriteToken — typed handle to a specific write, returned by ingest
+// paths and consumed by read-your-writes wait primitives.
+// =========================================================================
+
+/// Address of a single write on a specific origin's chain. Pair it
+/// with a typed adapter's `wait_for_token(token, deadline_ms=...)`
+/// to make sure that adapter's fold has caught up to the write
+/// before reading state.
+#[pyclass(name = "WriteToken", frozen, eq, hash, from_py_object)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PyWriteToken {
+    inner: InnerWriteToken,
+}
+
+#[pymethods]
+impl PyWriteToken {
+    #[new]
+    fn new(origin_hash: u64, seq: u64) -> Self {
+        Self {
+            inner: InnerWriteToken::new(origin_hash, seq),
+        }
+    }
+
+    #[getter]
+    fn origin_hash(&self) -> u64 {
+        self.inner.origin_hash
+    }
+
+    #[getter]
+    fn seq(&self) -> u64 {
+        self.inner.seq
+    }
+
+    /// Parse a token from its `<16-hex-origin>:<seq>` string form.
+    #[staticmethod]
+    fn from_string(s: &str) -> PyResult<Self> {
+        s.parse::<InnerWriteToken>()
+            .map(|inner| Self { inner })
+            .map_err(|e| PyValueError::new_err(format!("invalid WriteToken: {}", e)))
+    }
+
+    fn __str__(&self) -> String {
+        self.inner.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "WriteToken(origin_hash=0x{:x}, seq={})",
+            self.inner.origin_hash, self.inner.seq
+        )
+    }
+}
+
+impl PyWriteToken {
+    fn as_inner(&self) -> InnerWriteToken {
+        self.inner
+    }
+}
+
+/// Lift a substrate `WaitForTokenError` to a `CortexError`. The
+/// Python surface intentionally collapses all three variants into
+/// one exception class — distinguishing them in app code requires
+/// inspecting the message — because the failure responses are
+/// usually the same (retry with fresh deadline / shed load /
+/// fix the token).
+fn map_wait_for_token_err(e: InnerWaitForTokenError) -> PyErr {
+    CortexError::new_err(format!("wait_for_token: {}", e))
 }
 
 // =========================================================================
@@ -1064,6 +1135,34 @@ impl PyTasksAdapter {
         });
     }
 
+    /// Read-your-writes wait. Blocks until this adapter's fold has
+    /// applied through `token.seq`, or `deadline_ms` elapses.
+    /// Raises `CortexError` on timeout, on a wrong-origin token, or
+    /// when the per-channel wait queue is saturated. GIL is released
+    /// for the wait.
+    #[pyo3(signature = (token, deadline_ms = 1000))]
+    fn wait_for_token(
+        &self,
+        py: Python<'_>,
+        token: &PyWriteToken,
+        deadline_ms: u64,
+    ) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let runtime = self.runtime.clone();
+        let inner_token = token.as_inner();
+        py.detach(|| {
+            runtime.block_on(async move {
+                inner
+                    .wait_for_token(
+                        inner_token,
+                        std::time::Duration::from_millis(deadline_ms),
+                    )
+                    .await
+            })
+        })
+        .map_err(map_wait_for_token_err)
+    }
+
     /// Close the adapter. Idempotent.
     fn close(&self) -> PyResult<()> {
         self.inner
@@ -1540,6 +1639,32 @@ impl PyMemoriesAdapter {
         py.detach(|| {
             runtime.block_on(async move { inner.wait_for_seq(seq).await });
         });
+    }
+
+    /// Read-your-writes wait. Mirrors `TasksAdapter.wait_for_token`
+    /// — raises `CortexError` on timeout, wrong-origin, or queue-
+    /// full saturation.
+    #[pyo3(signature = (token, deadline_ms = 1000))]
+    fn wait_for_token(
+        &self,
+        py: Python<'_>,
+        token: &PyWriteToken,
+        deadline_ms: u64,
+    ) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let runtime = self.runtime.clone();
+        let inner_token = token.as_inner();
+        py.detach(|| {
+            runtime.block_on(async move {
+                inner
+                    .wait_for_token(
+                        inner_token,
+                        std::time::Duration::from_millis(deadline_ms),
+                    )
+                    .await
+            })
+        })
+        .map_err(map_wait_for_token_err)
     }
 
     fn close(&self) -> PyResult<()> {

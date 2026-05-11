@@ -2224,6 +2224,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<cortex::PyRedexFile>()?;
         m.add_class::<cortex::PyRedexTailIter>()?;
         m.add_class::<cortex::PyRedexEvent>()?;
+        m.add_class::<cortex::PyWriteToken>()?;
         m.add_class::<cortex::PyTask>()?;
         m.add_class::<cortex::PyTasksAdapter>()?;
         m.add_class::<cortex::PyTaskWatchIter>()?;
