@@ -433,6 +433,12 @@ struct RedexGreedyConfigJson {
     /// I/O budget as a fraction of measured NIC peak. Range
     /// `(0.0, 1.0]`. Default `0.25`.
     bandwidth_budget_fraction: Option<f32>,
+    /// Override for the NIC peak (bytes/sec) the bandwidth budget
+    /// computes against. Default falls back to 1 Gbps; deployments
+    /// on faster NICs should set this explicitly to avoid the
+    /// `dataforts_greedy_admit_rejected_total{reason="bandwidth"}`
+    /// counter saturating under normal load.
+    nic_peak_bytes_per_s: Option<u64>,
     /// `"disabled"` / `"any_of_local_capabilities"` (default) /
     /// `"strict"`.
     intent_match: Option<String>,
@@ -462,6 +468,9 @@ impl RedexGreedyConfigJson {
         }
         if let Some(f) = self.bandwidth_budget_fraction {
             cfg = cfg.with_bandwidth_budget_fraction(f);
+        }
+        if let Some(peak) = self.nic_peak_bytes_per_s {
+            cfg = cfg.with_nic_peak_bytes_per_s(Some(peak));
         }
         if let Some(policy) = self.intent_match {
             let parsed = match policy.as_str() {

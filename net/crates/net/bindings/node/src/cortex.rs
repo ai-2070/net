@@ -302,6 +302,10 @@ impl Redex {
         if let Some(f) = cfg_js.bandwidth_budget_fraction {
             cfg = cfg.with_bandwidth_budget_fraction(f as f32);
         }
+        if let Some(peak) = cfg_js.nic_peak_bytes_per_s {
+            let peak_u64 = redex_bigint_u64("greedy.nic_peak_bytes_per_s", peak)?;
+            cfg = cfg.with_nic_peak_bytes_per_s(Some(peak_u64));
+        }
         if let Some(policy) = cfg_js.intent_match {
             let parsed = match policy.as_str() {
                 "disabled" => IntentMatchPolicy::Disabled,
@@ -612,6 +616,12 @@ pub struct GreedyConfigJs {
     /// I/O budget as a fraction of measured NIC peak.
     /// Range `(0.0, 1.0]`. Default `0.25`.
     pub bandwidth_budget_fraction: Option<f64>,
+    /// Override for the NIC peak (bytes/sec) the bandwidth budget
+    /// computes against. Default falls back to 1 Gbps. Deployments
+    /// on faster NICs should set this explicitly to avoid the
+    /// `bandwidth` reason saturating the admit_rejected counter
+    /// under normal load.
+    pub nic_peak_bytes_per_s: Option<BigInt>,
     /// Intent-match policy. One of `"disabled"` /
     /// `"any_of_local_capabilities"` (default) / `"strict"`.
     pub intent_match: Option<String>,

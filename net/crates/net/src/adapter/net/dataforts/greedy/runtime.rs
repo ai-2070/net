@@ -101,10 +101,10 @@ pub fn synthesize_cache_channel_name(channel_hash: u16) -> ChannelName {
 /// graph throughput probe lands; reuse the same number here so the
 /// `replication_budget_fraction` and `bandwidth_budget_fraction`
 /// configurations share a denominator. Operators with > 1 Gbps
-/// links see proportional under-utilization until that probe is
-/// wired up.
-// TODO(plan-§6): wire the measured-NIC-peak probe through here.
-const NIC_PEAK_BYTES_PER_S: u64 = 125_000_000;
+/// links should set [`GreedyConfig::nic_peak_bytes_per_s`]
+/// explicitly until the measured-NIC-peak probe ships.
+// TODO(plan-§6): wire the measured-NIC-peak probe through here so
+// the explicit override becomes opt-out rather than opt-in.
 
 /// Outcome of a single [`GreedyRuntime::dispatch_event`] call.
 /// Returned for testability and operator-trace inspection.
@@ -205,8 +205,8 @@ impl GreedyRuntime {
         intent_registry: IntentRegistry,
     ) -> Self {
         let now = Instant::now();
-        let budget =
-            BandwidthBudget::new(config.bandwidth_budget_fraction, NIC_PEAK_BYTES_PER_S, now);
+        let nic_peak = config.effective_nic_peak_bytes_per_s();
+        let budget = BandwidthBudget::new(config.bandwidth_budget_fraction, nic_peak, now);
         let cache = GreedyCacheRegistry::new(config.total_cap_bytes);
         Self {
             inner: Arc::new(GreedyRuntimeInner {
@@ -463,7 +463,12 @@ impl GreedyRuntime {
             }
         }
 
-        // 2. Bandwidth budget.
+        // 2. Bandwidth budget. Bumps a distinct `bandwidth` axis
+        // on the admit_rejected counter so operators on
+        // faster-than-gigabit NICs can tell bandwidth throttling
+        // apart from real cluster-cap exhaustion (the bandwidth
+        // budget is computed against `nic_peak_bytes_per_s`, which
+        // defaults to 1 Gbps — see `GreedyConfig`).
         let payload_bytes = payload.len() as u64;
         let admitted_by_budget = {
             let mut budget = self.inner.budget.lock();
@@ -473,7 +478,7 @@ impl GreedyRuntime {
             self.inner
                 .metrics
                 .cluster()
-                .incr_admit_rejected(AdmitRejectReason::Capacity);
+                .incr_admit_rejected(AdmitRejectReason::Bandwidth);
             return DispatchOutcome::BandwidthExhausted;
         }
 
@@ -748,7 +753,33 @@ mod tests {
         let second = rt.dispatch_event(&cn("a"), 1, &chain, &big).await;
         assert_eq!(second, DispatchOutcome::BandwidthExhausted);
         let snap = rt.metrics().snapshot();
-        assert_eq!(snap.cluster.admit_rejected_capacity_total, 1);
+        // Bandwidth-throttling is its own axis on admit_rejected_total
+        // so operators can dashboard it apart from real capacity
+        // exhaustion (cluster-cap eviction).
+        assert_eq!(snap.cluster.admit_rejected_bandwidth_total, 1);
+        assert_eq!(snap.cluster.admit_rejected_capacity_total, 0);
+    }
+
+    #[tokio::test]
+    async fn nic_peak_override_widens_bandwidth_budget() {
+        // Same fraction (1e-6) but with a 1000× larger NIC peak →
+        // 1000× larger token bucket. The same 4 KiB payload now
+        // fits twice without exhausting the budget.
+        let cfg = GreedyConfig::default()
+            .with_intent_match(super::super::IntentMatchPolicy::Disabled)
+            .with_bandwidth_budget_fraction(0.000001)
+            .with_nic_peak_bytes_per_s(Some(125_000_000_000));
+        let (rt, _sink) = build_runtime(cfg);
+        let chain = chain_caps_with_scope("any");
+        let big = vec![0u8; 4096];
+        let first = rt.dispatch_event(&cn("a"), 1, &chain, &big).await;
+        assert_eq!(first, DispatchOutcome::Cached);
+        let second = rt.dispatch_event(&cn("a"), 1, &chain, &big).await;
+        assert_eq!(
+            second,
+            DispatchOutcome::Cached,
+            "wider NIC-peak override must keep the second event within budget"
+        );
     }
 
     #[tokio::test]

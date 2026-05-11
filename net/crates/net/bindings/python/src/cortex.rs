@@ -477,6 +477,7 @@ impl PyRedex {
         per_channel_cap_bytes = None,
         total_cap_bytes = None,
         bandwidth_budget_fraction = None,
+        nic_peak_bytes_per_s = None,
         intent_match = None,
         colocation_policy = None,
     ))]
@@ -489,6 +490,7 @@ impl PyRedex {
         per_channel_cap_bytes: Option<u64>,
         total_cap_bytes: Option<u64>,
         bandwidth_budget_fraction: Option<f64>,
+        nic_peak_bytes_per_s: Option<u64>,
         intent_match: Option<String>,
         colocation_policy: Option<String>,
     ) -> PyResult<()> {
@@ -510,6 +512,9 @@ impl PyRedex {
         }
         if let Some(f) = bandwidth_budget_fraction {
             cfg = cfg.with_bandwidth_budget_fraction(f as f32);
+        }
+        if let Some(peak) = nic_peak_bytes_per_s {
+            cfg = cfg.with_nic_peak_bytes_per_s(Some(peak));
         }
         if let Some(policy) = intent_match {
             let parsed = match policy.as_str() {

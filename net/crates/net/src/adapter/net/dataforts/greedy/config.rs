@@ -32,6 +32,14 @@ pub const DEFAULT_PROXIMITY_MAX_RTT_MS: u64 = 200;
 /// traffic.
 pub const DEFAULT_BANDWIDTH_BUDGET_FRACTION: f32 = 0.25;
 
+/// Default NIC peak the bandwidth budget is computed against, when
+/// no override is supplied: 1 Gbps in bytes/sec. A measured probe
+/// is intentionally still deferred (see `DATAFORTS_PLAN.md`
+/// § Phase 1); operators on faster NICs should set
+/// `nic_peak_bytes_per_s` explicitly to avoid proportional
+/// under-utilization.
+pub const DEFAULT_NIC_PEAK_BYTES_PER_S: u64 = 125_000_000;
+
 /// Per-node configuration for [`crate::adapter::net::dataforts::greedy`].
 ///
 /// Validation rules (enforced by [`Self::validate`]):
@@ -66,6 +74,14 @@ pub struct GreedyConfig {
     /// the budget is exhausted so application traffic isn't
     /// crowded out.
     pub bandwidth_budget_fraction: f32,
+    /// Override for the NIC peak (bytes/sec) the bandwidth budget
+    /// computes against. `None` falls back to
+    /// [`DEFAULT_NIC_PEAK_BYTES_PER_S`] (1 Gbps). Set this on
+    /// deployments with > 1 Gbps NICs — otherwise greedy throttles
+    /// at gigabit-class rates and the operator sees what looks
+    /// like an admission-reject storm in
+    /// `dataforts_greedy_admit_rejected_total{reason="bandwidth"}`.
+    pub nic_peak_bytes_per_s: Option<u64>,
     /// Intent-axis admission policy. Reuses the substrate's
     /// `IntentMatchPolicy` so greedy uses the same eligibility
     /// shape as `StandardPlacement`.
@@ -84,6 +100,7 @@ impl Default for GreedyConfig {
             per_channel_cap_bytes: DEFAULT_PER_CHANNEL_CAP_BYTES,
             total_cap_bytes: DEFAULT_TOTAL_CAP_BYTES,
             bandwidth_budget_fraction: DEFAULT_BANDWIDTH_BUDGET_FRACTION,
+            nic_peak_bytes_per_s: None,
             intent_match: IntentMatchPolicy::AnyOfLocalCapabilities,
             colocation_policy: ColocationPolicy::SoftPreference,
         }
@@ -125,6 +142,23 @@ impl GreedyConfig {
     pub fn with_bandwidth_budget_fraction(mut self, fraction: f32) -> Self {
         self.bandwidth_budget_fraction = fraction;
         self
+    }
+
+    /// Builder: override the NIC peak (bytes/sec). `None` reverts
+    /// to the [`DEFAULT_NIC_PEAK_BYTES_PER_S`] fallback.
+    pub fn with_nic_peak_bytes_per_s(mut self, peak: Option<u64>) -> Self {
+        self.nic_peak_bytes_per_s = peak;
+        self
+    }
+
+    /// The effective NIC peak after applying the override-or-default
+    /// rule. Saturates to [`DEFAULT_NIC_PEAK_BYTES_PER_S`] when
+    /// `nic_peak_bytes_per_s` is `None` or `Some(0)`.
+    pub fn effective_nic_peak_bytes_per_s(&self) -> u64 {
+        match self.nic_peak_bytes_per_s {
+            Some(v) if v > 0 => v,
+            _ => DEFAULT_NIC_PEAK_BYTES_PER_S,
+        }
     }
 
     /// Builder: set the intent-match policy.

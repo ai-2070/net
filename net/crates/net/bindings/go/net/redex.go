@@ -410,6 +410,12 @@ type GreedyConfig struct {
 	// I/O budget as a fraction of NIC peak. 0 = use substrate
 	// default (0.25). Range `(0.0, 1.0]`.
 	BandwidthBudgetFraction float32 `json:"bandwidth_budget_fraction,omitempty"`
+	// Override for the NIC peak (bytes/sec) the bandwidth budget
+	// computes against. 0 (or unset) = substrate default (1 Gbps).
+	// Deployments on faster NICs should set this explicitly to
+	// avoid the substrate's bandwidth-axis reject counter
+	// saturating under normal load.
+	NicPeakBytesPerS uint64 `json:"nic_peak_bytes_per_s,omitempty"`
 	// `"disabled"` / `"any_of_local_capabilities"` (default) /
 	// `"strict"`. Empty = substrate default.
 	IntentMatch string `json:"intent_match,omitempty"`

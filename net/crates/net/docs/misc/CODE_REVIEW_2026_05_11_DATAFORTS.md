@@ -33,7 +33,7 @@ Tagged `[B | H | M | L]`:
 | ID    | Pri | Area         | Title                                                                       | Status |
 |-------|-----|--------------|-----------------------------------------------------------------------------|--------|
 | D-1   | B   | greedy       | Cluster-cap eviction never calls `withdraw_chain`                          | ✅ |
-| D-2   | B   | greedy       | Bandwidth-budget rejection silently drops events with no retry             | ⏳ |
+| D-2   | B   | greedy       | Bandwidth-budget rejection silently drops events with no retry             | ✅ |
 | D-3   | B   | greedy       | `cache.upsert` does not subtract old `bytes` on reopen → `total_bytes` drift | ⏳ |
 | D-4   | B   | python blob  | `PyBlobAdapter::drive_if_coroutine` builds a fresh `asyncio.run` event loop  | ⏳ |
 | D-5   | H   | greedy       | `chain_caps` resolves last-hop peer, not chain publisher                   | ⏳ |
@@ -58,7 +58,7 @@ Tagged `[B | H | M | L]`:
 | D-24  | M   | greedy       | Wire `channel_hash` 16-bit → silent cross-chain pollution                  | ⏳ |
 | D-25  | M   | greedy       | `gravity_tick` emits one full capset rebroadcast per chain                 | ⏳ |
 | D-26  | M   | greedy       | `entry.bytes` saturating drift under retention trim                        | ⏳ |
-| D-27  | M   | greedy       | `NIC_PEAK_BYTES_PER_S` hard-coded; no override on `GreedyConfig`           | ⏳ |
+| D-27  | M   | greedy       | `NIC_PEAK_BYTES_PER_S` hard-coded; no override on `GreedyConfig`           | ✅ (folded into D-2) |
 | D-28  | M   | greedy       | 5 separate `cache.lock()` acquisitions per dispatch                        | ⏳ |
 | D-29  | M   | gravity      | `should_emit_heat` `inf`-prone with near-zero `prev`                      | ⏳ |
 | D-30  | M   | gravity      | Wire-side `(rate/(rate+1))` saturation at top end                          | ⏳ |

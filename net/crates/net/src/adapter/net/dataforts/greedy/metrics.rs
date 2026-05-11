@@ -97,8 +97,16 @@ pub struct GreedyClusterMetricsAtomic {
     /// Cumulative colocation-axis admission rejections.
     pub admit_rejected_colocation_total: AtomicU64,
     /// Cumulative capacity rejections — admission would have
-    /// landed but the bandwidth budget refused the write.
+    /// landed but the cluster cap refused the write. Disjoint from
+    /// the `bandwidth` axis (bandwidth-budget throttling is its
+    /// own counter).
     pub admit_rejected_capacity_total: AtomicU64,
+    /// Cumulative bandwidth-throttle rejections — admission and
+    /// the cluster cap were both clear, but the bandwidth budget
+    /// refused the write. Operators on faster-than-gigabit NICs
+    /// who see this counter saturating should set
+    /// `GreedyConfig::nic_peak_bytes_per_s` explicitly.
+    pub admit_rejected_bandwidth_total: AtomicU64,
     /// Current I/O budget used — bytes consumed from the token
     /// bucket since the last refill. Gauge.
     pub io_budget_used_bytes: AtomicU64,
@@ -131,6 +139,10 @@ impl GreedyClusterMetricsAtomic {
                 self.admit_rejected_capacity_total
                     .fetch_add(1, Ordering::Relaxed);
             }
+            AdmitRejectReason::Bandwidth => {
+                self.admit_rejected_bandwidth_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -152,9 +164,16 @@ pub enum AdmitRejectReason {
     Intent,
     /// Colocation-axis rejection from `should_admit`.
     Colocation,
-    /// Runtime-side rejection — admission permits but capacity
-    /// (cluster cap or bandwidth budget) refuses.
+    /// Runtime-side rejection — admission permits but the cluster
+    /// cap or per-channel cap would force an immediate eviction.
+    /// Disjoint from `Bandwidth`.
     Capacity,
+    /// Runtime-side rejection — admission and cluster cap permit
+    /// but the bandwidth budget refuses the write. Operators
+    /// dashboard this separately so faster-than-gigabit NICs
+    /// observed via [`crate::adapter::net::dataforts::greedy::DEFAULT_NIC_PEAK_BYTES_PER_S`]
+    /// surface as a distinct signal from real-capacity exhaustion.
+    Bandwidth,
 }
 
 /// Process-wide registry. One per `MeshNode::enable_greedy_dataforts`
@@ -252,6 +271,10 @@ impl GreedyMetricsRegistry {
                     .cluster
                     .admit_rejected_capacity_total
                     .load(Ordering::Relaxed),
+                admit_rejected_bandwidth_total: self
+                    .cluster
+                    .admit_rejected_bandwidth_total
+                    .load(Ordering::Relaxed),
                 io_budget_used_bytes: self.cluster.io_budget_used_bytes.load(Ordering::Relaxed),
             },
         }
@@ -284,6 +307,9 @@ pub struct GreedyClusterMetrics {
     pub admit_rejected_colocation_total: u64,
     /// Cumulative capacity rejections.
     pub admit_rejected_capacity_total: u64,
+    /// Cumulative bandwidth-budget rejections — admission permits
+    /// and capacity permits, but the bandwidth gate refuses.
+    pub admit_rejected_bandwidth_total: u64,
     /// Current I/O-budget bytes used.
     pub io_budget_used_bytes: u64,
 }
@@ -343,6 +369,7 @@ impl GreedyMetricsSnapshot {
             ("intent", self.cluster.admit_rejected_intent_total),
             ("colocation", self.cluster.admit_rejected_colocation_total),
             ("capacity", self.cluster.admit_rejected_capacity_total),
+            ("bandwidth", self.cluster.admit_rejected_bandwidth_total),
         ] {
             let _ = writeln!(
                 out,
@@ -374,6 +401,7 @@ impl GreedyMetricsSnapshot {
             && self.cluster.admit_rejected_intent_total == 0
             && self.cluster.admit_rejected_colocation_total == 0
             && self.cluster.admit_rejected_capacity_total == 0
+            && self.cluster.admit_rejected_bandwidth_total == 0
             && self.cluster.io_budget_used_bytes == 0
     }
 }
@@ -469,11 +497,14 @@ mod tests {
         cluster.incr_admit_rejected(AdmitRejectReason::Scope);
         cluster.incr_admit_rejected(AdmitRejectReason::Intent);
         cluster.incr_admit_rejected(AdmitRejectReason::Capacity);
+        cluster.incr_admit_rejected(AdmitRejectReason::Bandwidth);
+        cluster.incr_admit_rejected(AdmitRejectReason::Bandwidth);
         let snap = r.snapshot();
         assert_eq!(snap.cluster.admit_rejected_scope_total, 2);
         assert_eq!(snap.cluster.admit_rejected_intent_total, 1);
         assert_eq!(snap.cluster.admit_rejected_colocation_total, 0);
         assert_eq!(snap.cluster.admit_rejected_capacity_total, 1);
+        assert_eq!(snap.cluster.admit_rejected_bandwidth_total, 2);
     }
 
     #[test]
@@ -510,6 +541,7 @@ mod tests {
         assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"intent\"} 0"));
         assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"colocation\"} 0"));
         assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"capacity\"} 0"));
+        assert!(text.contains("dataforts_greedy_admit_rejected_total{reason=\"bandwidth\"} 0"));
     }
 
     #[test]
