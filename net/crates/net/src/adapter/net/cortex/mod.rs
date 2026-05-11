@@ -32,7 +32,9 @@ pub mod memories;
 pub mod tasks;
 
 pub use adapter::{ChangeEvent, CortexAdapter, WaitForTokenError};
-pub use config::{CortexAdapterConfig, FoldErrorPolicy, StartPosition};
+pub use config::{
+    CortexAdapterConfig, FoldErrorPolicy, StartPosition, RYW_WAIT_QUEUE_CAP_DEFAULT,
+};
 pub use envelope::{EventEnvelope, IntoRedexPayload};
 pub use error::CortexAdapterError;
 pub use meta::{

@@ -32,6 +32,13 @@ pub enum FoldErrorPolicy {
     LogAndContinue,
 }
 
+/// Default per-channel cap on concurrent read-your-writes waits.
+/// Defensive bound against a slow-fold scenario stacking unbounded
+/// wait_for_token callers — exceeding the cap returns
+/// `WaitForTokenError::QueueFull` immediately so the caller can
+/// shed load.
+pub const RYW_WAIT_QUEUE_CAP_DEFAULT: usize = 1024;
+
 /// One-shot configuration for a [`super::CortexAdapter`] instance.
 #[derive(Debug, Clone, Copy)]
 pub struct CortexAdapterConfig {
@@ -39,6 +46,9 @@ pub struct CortexAdapterConfig {
     pub start: StartPosition,
     /// What to do on fold error.
     pub on_fold_error: FoldErrorPolicy,
+    /// Per-channel cap on concurrent `wait_for_token` calls. Defaults
+    /// to [`RYW_WAIT_QUEUE_CAP_DEFAULT`].
+    pub ryw_wait_queue_cap: usize,
 }
 
 impl Default for CortexAdapterConfig {
@@ -46,6 +56,7 @@ impl Default for CortexAdapterConfig {
         Self {
             start: StartPosition::FromBeginning,
             on_fold_error: FoldErrorPolicy::Stop,
+            ryw_wait_queue_cap: RYW_WAIT_QUEUE_CAP_DEFAULT,
         }
     }
 }
@@ -65,6 +76,14 @@ impl CortexAdapterConfig {
     /// Set the fold error policy.
     pub fn with_fold_error_policy(mut self, policy: FoldErrorPolicy) -> Self {
         self.on_fold_error = policy;
+        self
+    }
+
+    /// Set the per-channel cap on concurrent `wait_for_token` calls.
+    /// Zero disables the cap (unbounded queue — use only when the
+    /// caller already bounds in-flight RYW waits elsewhere).
+    pub fn with_ryw_wait_queue_cap(mut self, cap: usize) -> Self {
+        self.ryw_wait_queue_cap = cap;
         self
     }
 }

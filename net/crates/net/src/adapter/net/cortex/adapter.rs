@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use parking_lot::RwLock;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, Notify, Semaphore};
 use tokio_stream::wrappers::BroadcastStream;
 
 use serde::de::DeserializeOwned;
@@ -125,6 +125,12 @@ struct AdapterInner<State> {
     /// Broadcast of RedEX seqs after each successful (or LogAndContinue-skipped)
     /// fold apply. Subscribers: see [`CortexAdapter::changes`].
     changes_tx: broadcast::Sender<u64>,
+    /// Per-adapter cap on concurrent `wait_for_token` callers. `None`
+    /// when `CortexAdapterConfig::ryw_wait_queue_cap == 0` (unbounded).
+    /// Otherwise sized to `ryw_wait_queue_cap` permits; each pending
+    /// wait holds one permit for its duration. Exceeding the cap
+    /// returns `WaitForTokenError::QueueFull` immediately.
+    ryw_wait_queue: Option<Arc<Semaphore>>,
 }
 
 impl<State> CortexAdapter<State> {
@@ -372,6 +378,17 @@ impl<State> CortexAdapter<State> {
         token: WriteToken,
         deadline: Duration,
     ) -> Result<(), WaitForTokenError> {
+        // Try-acquire FIRST so backpressure surfaces before the timer
+        // arms — under saturation a `QueueFull` is the correct
+        // diagnostic, not a `Timeout` masking it.
+        let _permit = match &self.inner.ryw_wait_queue {
+            Some(sem) => Some(
+                sem.clone()
+                    .try_acquire_owned()
+                    .map_err(|_| WaitForTokenError::QueueFull)?,
+            ),
+            None => None,
+        };
         match tokio::time::timeout(deadline, self.wait_for_seq(token.seq)).await {
             Ok(()) => Ok(()),
             Err(_) => Err(WaitForTokenError::Timeout),
@@ -399,6 +416,11 @@ pub enum WaitForTokenError {
         /// origin this adapter is bound to.
         adapter_origin: u64,
     },
+    /// Per-channel wait-queue cap is saturated — back-pressure for
+    /// callers who can shed load instead of stacking unbounded
+    /// pending waits. See
+    /// [`super::config::CortexAdapterConfig::with_ryw_wait_queue_cap`].
+    QueueFull,
 }
 
 impl std::fmt::Display for WaitForTokenError {
@@ -413,6 +435,9 @@ impl std::fmt::Display for WaitForTokenError {
                 "token origin {:016x} != adapter origin {:016x}",
                 token_origin, adapter_origin
             ),
+            Self::QueueFull => {
+                f.write_str("read-your-writes wait-queue saturated; retry later")
+            }
         }
     }
 }
@@ -502,6 +527,11 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             start_seq - 1
         };
         let (changes_tx, _) = broadcast::channel(CHANGES_BROADCAST_CAP);
+        let ryw_wait_queue = if adapter_config.ryw_wait_queue_cap == 0 {
+            None
+        } else {
+            Some(Arc::new(Semaphore::new(adapter_config.ryw_wait_queue_cap)))
+        };
         let inner = Arc::new(AdapterInner {
             file: file.clone(),
             state: state.clone(),
@@ -519,6 +549,7 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             notify: Notify::new(),
             shutdown: Notify::new(),
             changes_tx,
+            ryw_wait_queue,
         });
 
         let policy = adapter_config.on_fold_error;
@@ -670,6 +701,7 @@ where
         let config = CortexAdapterConfig {
             start,
             on_fold_error: adapter_config.on_fold_error,
+            ryw_wait_queue_cap: adapter_config.ryw_wait_queue_cap,
         };
         // Route through `open_unchecked` so the externally-
         // rehydrated state can skip its event prefix.
@@ -976,6 +1008,79 @@ mod tests {
 
         adapter.wait_for_token(token, Duration::from_secs(2)).await.unwrap();
         assert_eq!(*adapter.state().read(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_token_returns_queue_full_above_cap() {
+        let redex = Redex::new();
+        let cfg = CortexAdapterConfig::default().with_ryw_wait_queue_cap(2);
+        let adapter = Arc::new(
+            CortexAdapter::<u64>::open(
+                &redex,
+                &cn("cortex/ryw-queue"),
+                RedexFileConfig::default(),
+                cfg,
+                CountFold,
+                0u64,
+            )
+            .unwrap(),
+        );
+
+        // Pin two waiters on a seq that never lands — they hold the
+        // permits until their deadline elapses.
+        let token = WriteToken::new(0xABCD_EF01, 999);
+        let a = adapter.clone();
+        let h1 = tokio::spawn(async move {
+            a.wait_for_token(token, Duration::from_secs(5)).await
+        });
+        let a = adapter.clone();
+        let h2 = tokio::spawn(async move {
+            a.wait_for_token(token, Duration::from_secs(5)).await
+        });
+
+        // Give both tasks a moment to claim their permits.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A third waiter on the same adapter should be rejected
+        // immediately with QueueFull — no wait, no timeout.
+        let started = tokio::time::Instant::now();
+        let err = adapter
+            .wait_for_token(token, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err, WaitForTokenError::QueueFull);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "QueueFull must return immediately, not wait for deadline"
+        );
+
+        // Drop the holders so their tasks finish on their own
+        // schedule.
+        let _ = (h1, h2);
+    }
+
+    #[tokio::test]
+    async fn wait_for_token_with_zero_cap_skips_queue_check() {
+        let redex = Redex::new();
+        let cfg = CortexAdapterConfig::default().with_ryw_wait_queue_cap(0);
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/ryw-uncapped"),
+            RedexFileConfig::default(),
+            cfg,
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+
+        // With cap=0 the semaphore is None; the path goes straight
+        // to the deadline.
+        let token = WriteToken::new(0xABCD_EF01, 999);
+        let err = adapter
+            .wait_for_token(token, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(err, WaitForTokenError::Timeout);
     }
 
     #[tokio::test]
