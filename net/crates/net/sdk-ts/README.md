@@ -476,7 +476,7 @@ const pred = p.and(
 // Local evaluation (no mesh round-trip).
 const matched = evaluatePredicate(pred, caps.tags, caps.metadata);
 
-// Wire form for nRPC `cyberdeck-where:` headers — pair with the
+// Wire form for nRPC `net-where:` headers — pair with the
 // header-bearing call variants (`callWithHeaders` etc.) so a
 // server-side filter can match candidates without running the
 // predicate over the whole route.

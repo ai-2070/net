@@ -98,7 +98,7 @@ interface DiffFixture {
 describe('predicate nRPC envelope (cross-binding fixture)', () => {
   const fx = loadJson<PredicateFixture>(PREDICATE_FIXTURE, 'predicate envelope');
 
-  it('header name pins to cyberdeck-where', () => {
+  it('header name pins to net-where', () => {
     expect(fx.header_name).toBe(RPC_WHERE_HEADER);
   });
 
@@ -399,7 +399,7 @@ describe('p.* fluent predicate builder', () => {
     });
   });
 
-  it('whereHeader builds a Buffer-valued cyberdeck-where entry', async () => {
+  it('whereHeader builds a Buffer-valued net-where entry', async () => {
     const { whereHeader, RPC_WHERE_HEADER } = await import(
       '../src/capability-enhancements'
     );

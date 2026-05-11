@@ -112,7 +112,7 @@ let pred = p.and(&[
 // Local evaluation against any (tags, metadata).
 let matched = evaluate_predicate(&pred, &caps.tags, &caps.metadata);
 
-// Wire form for nRPC `cyberdeck-where:` headers — pair with the
+// Wire form for nRPC `net-where:` headers — pair with the
 // header-bearing call variants so the server short-circuits
 // candidates without re-running the predicate per hop.
 let header_value = predicate_to_rpc_header(&pred);

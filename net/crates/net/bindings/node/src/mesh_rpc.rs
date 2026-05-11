@@ -195,10 +195,10 @@ pub struct CallOptions {
     /// `RpcRequestPayload.headers` after any auto-generated
     /// headers (trace, stream-window). Used for application-level
     /// metadata the server needs at dispatch-time — most notably
-    /// the `cyberdeck-where` predicate header for Phase 9b
+    /// the `net-where` predicate header for Phase 9b
     /// predicate-pushdown filtering.
     ///
-    /// JS callers pass `[{ name: "cyberdeck-where", value: Buffer.from(jsonBytes) }, ...]`.
+    /// JS callers pass `[{ name: "net-where", value: Buffer.from(jsonBytes) }, ...]`.
     /// `undefined` (default) → no extra headers.
     pub request_headers: Option<Vec<RpcRequestHeader>>,
 }
@@ -208,7 +208,7 @@ pub struct CallOptions {
 /// doesn't validate names beyond the `MAX_RPC_HEADER_NAME_LEN` cap.
 #[napi(object)]
 pub struct RpcRequestHeader {
-    /// Header name (e.g. `cyberdeck-where`).
+    /// Header name (e.g. `net-where`).
     pub name: String,
     /// Header value bytes. For text-like headers (predicates,
     /// trace-context), the contents are UTF-8 strings encoded as
@@ -862,7 +862,7 @@ mod tests {
             cancel_token: None,
             request_headers: Some(vec![
                 RpcRequestHeader {
-                    name: "cyberdeck-where".into(),
+                    name: "net-where".into(),
                     value: Buffer::from(b"json".as_slice()),
                 },
                 RpcRequestHeader {
@@ -873,7 +873,7 @@ mod tests {
         };
         let inner = opts.into_inner();
         assert_eq!(inner.request_headers.len(), 2);
-        assert_eq!(inner.request_headers[0].0, "cyberdeck-where");
+        assert_eq!(inner.request_headers[0].0, "net-where");
         assert_eq!(inner.request_headers[0].1, b"json");
         assert_eq!(inner.request_headers[1].0, "cyberdeck-x-tenant");
         assert_eq!(inner.request_headers[1].1, b"acme");

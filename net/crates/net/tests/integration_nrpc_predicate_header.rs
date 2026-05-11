@@ -1,5 +1,5 @@
 //! End-to-end: client encodes a `Predicate` as the canonical
-//! `cyberdeck-where:` request header (Phase 9b), the server-side
+//! `net-where:` request header (Phase 9b), the server-side
 //! handler decodes it and filters a candidate list with the
 //! stateless evaluator (Phase 9c). Pins that the two SDK surfaces
 //! actually compose over a real mesh — fixture-level wire tests
@@ -70,7 +70,7 @@ async fn handshake_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 }
 
 // ============================================================================
-// Server side — `WhereFilterHandler` reads `cyberdeck-where:` and
+// Server side — `WhereFilterHandler` reads `net-where:` and
 // returns the indices of candidates that match.
 // ============================================================================
 

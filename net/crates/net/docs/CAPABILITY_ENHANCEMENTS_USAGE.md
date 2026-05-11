@@ -16,7 +16,7 @@ The recipes assume `use net::adapter::net::behavior::*;` unless noted.
 6. [Cardinality-aware planner](#6-cardinality-aware-planner)
 7. [Predicate debug sessions](#7-predicate-debug-sessions)
 8. [PredicateWire — flat-tree IR for serialization](#8-predicatewire--flat-tree-ir-for-serialization)
-9. [nRPC `cyberdeck-where` request filters](#9-nrpc-cyberdeck-where-request-filters)
+9. [nRPC `net-where` request filters](#9-nrpc-net-where-request-filters)
 10. [Service-side row filtering](#10-service-side-row-filtering)
 11. [Index-driven discovery — `find_nodes_matching`](#11-index-driven-discovery--find_nodes_matching)
 
@@ -305,9 +305,9 @@ Round-trip is byte-stable (post-order serialization; root at the highest index).
 
 ---
 
-## 9. nRPC `cyberdeck-where` request filters
+## 9. nRPC `net-where` request filters
 
-Phase 5.B. Predicates ride as a JSON-encoded `PredicateWire` in the canonical `cyberdeck-where` request header. Substrate (`cortex/rpc`) carries the header opaquely — services that opt in look up the header on receive.
+Phase 5.B. Predicates ride as a JSON-encoded `PredicateWire` in the canonical `net-where` request header. Substrate (`cortex/rpc`) carries the header opaquely — services that opt in look up the header on receive.
 
 ### Client side
 
@@ -325,7 +325,7 @@ let header = predicate_to_rpc_header(&pred)?;
 
 let mut request_headers = vec![
     ("trace-id".to_string(), trace_id_bytes),
-    header,  // cyberdeck-where
+    header,  // net-where
 ];
 mesh.send_rpc(svc, body, request_headers).await?;
 ```

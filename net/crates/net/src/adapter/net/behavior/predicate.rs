@@ -660,7 +660,7 @@ fn check_children_below(children: &[u32], parent: u32) -> Result<(), PredicateWi
 //
 //   `predicate_to_rpc_header(&pred)` — JSON-encodes a `PredicateWire`
 //                                      into the canonical
-//                                      `cyberdeck-where` header.
+//                                      `net-where` header.
 //   `predicate_from_rpc_headers(headers)` — locates the header in
 //                                           a request's headers,
 //                                           decodes back to
@@ -682,7 +682,7 @@ fn check_children_below(children: &[u32], parent: u32) -> Result<(), PredicateWi
 /// nRPC request. Lowercase per HTTP-style convention; the substrate
 /// `cortex/rpc` codec passes header names through unchanged, but
 /// this constant is the one downstream callers must agree on.
-pub const RPC_WHERE_HEADER: &str = "cyberdeck-where";
+pub const RPC_WHERE_HEADER: &str = "net-where";
 
 /// Maximum size of the JSON-encoded `PredicateWire` header value.
 /// Mirrors `cortex::rpc::MAX_RPC_HEADER_VALUE_LEN`; redeclared here
@@ -753,11 +753,11 @@ pub fn predicate_to_rpc_header(
 }
 
 /// Extract and decode a [`Predicate`] from a request's headers,
-/// if a `cyberdeck-where` header is present.
+/// if a `net-where` header is present.
 ///
 /// Returns:
 ///
-/// - `None` — no `cyberdeck-where` header. Service should default
+/// - `None` — no `net-where` header. Service should default
 ///   to "no filter" (return all rows).
 /// - `Some(Ok(pred))` — header present, decoded cleanly. Service
 ///   filters its result stream against `pred`.
@@ -906,7 +906,7 @@ pub trait RpcPredicateContext {
 /// Filter `rows` by an optional predicate.
 ///
 /// `pred = None` returns all rows (the no-filter case — the
-/// caller's request didn't include a `cyberdeck-where` header).
+/// caller's request didn't include a `net-where` header).
 /// `pred = Some(p)` returns only rows where `p` evaluates to true
 /// against the row's tags + metadata.
 ///
@@ -3045,7 +3045,7 @@ mod tests {
 
     #[test]
     fn rpc_header_missing_returns_none() {
-        // Service that doesn't see a `cyberdeck-where` header
+        // Service that doesn't see a `net-where` header
         // should treat the request as unfiltered. `None` is the
         // signal; service defaults to "match all".
         let headers = vec![
@@ -3063,7 +3063,7 @@ mod tests {
 
     #[test]
     fn rpc_header_malformed_json_returns_decode_error() {
-        // Service receiving a `cyberdeck-where` header with garbage
+        // Service receiving a `net-where` header with garbage
         // bytes should reject the request, not silently default to
         // unfiltered. Silent fallback would let an attacker / bug
         // return more rows than the caller intended.
@@ -3123,7 +3123,7 @@ mod tests {
     #[test]
     fn rpc_header_first_match_wins_on_duplicate_headers() {
         // Per the helper's documented contract: duplicate headers
-        // under `cyberdeck-where` are not coalesced; the first
+        // under `net-where` are not coalesced; the first
         // match wins. Pin so a future "merge duplicates" change
         // is loud.
         let pred_a = Predicate::Exists {
@@ -3826,7 +3826,7 @@ mod tests {
     #[test]
     fn filter_by_predicate_returns_all_rows_when_predicate_is_none() {
         // Pin: `pred = None` is the no-filter case (request didn't
-        // include `cyberdeck-where`). Every row passes through.
+        // include `net-where`). Every row passes through.
         let jobs = vec![
             TestJob {
                 id: 1,

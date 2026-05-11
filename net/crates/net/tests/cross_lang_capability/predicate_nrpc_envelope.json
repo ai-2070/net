@@ -1,7 +1,7 @@
 {
-  "description": "Cross-binding wire-format pin for `cyberdeck-where` request headers. Each case's `wire` field is the canonical JSON-encoded PredicateWire that lands in the request-header value (per behavior::predicate::predicate_to_rpc_header). Bindings deserialize, re-serialize, and assert byte-equal. See README.md.",
-  "header_name": "cyberdeck-where",
-  "abi_version_expected": 1,
+  "description": "Cross-binding wire-format pin for `net-where` request headers. Each case's `wire` field is the canonical JSON-encoded PredicateWire that lands in the request-header value (per behavior::predicate::predicate_to_rpc_header). Bindings deserialize, re-serialize, and assert byte-equal. See README.md.",
+  "header_name": "net-where",
+  "abi_version_expected": 2,
   "cases": [
     {
       "name": "exists_hardware_gpu",

@@ -643,7 +643,7 @@ func nodeFromWire(n PredicateNode, prior []*Predicate, selfIdx int) (*Predicate,
 
 // RPCWhereHeader is the header the substrate uses to carry a
 // predicate over nRPC.
-const RPCWhereHeader = "cyberdeck-where"
+const RPCWhereHeader = "net-where"
 
 // PredicateToRPCHeader encodes a predicate to the request-header
 // value (canonical JSON-encoded PredicateWire).
@@ -656,7 +656,7 @@ func PredicateToRPCHeader(p *Predicate) (string, error) {
 	return string(b), nil
 }
 
-// PredicateFromRPCHeader decodes a `cyberdeck-where` header value
+// PredicateFromRPCHeader decodes a `net-where` header value
 // into a predicate AST.
 func PredicateFromRPCHeader(value string) (*Predicate, error) {
 	var w PredicateWire
@@ -689,14 +689,14 @@ type DaemonCapabilities struct {
 	Optional CapabilitySetWire `json:"optional"`
 }
 
-// WhereHeader builds the canonical `cyberdeck-where:` request-header
+// WhereHeader builds the canonical `net-where:` request-header
 // entry for Phase 9b predicate-pushdown calls.
 //
 // The returned `(name, value)` pair drops into any `request_headers`-
 // shaped option list once `MeshRpc.Call` exposes one. Today the
 // `rpc-ffi` C ABI doesn't accept request headers (deadline + cancel
 // only); downstream Go maintainers extending the FFI surface use
-// this helper as the canonical encoder for the cyberdeck-where
+// this helper as the canonical encoder for the net-where
 // header value.
 //
 // The header value is the canonical JSON-encoded `PredicateWire`

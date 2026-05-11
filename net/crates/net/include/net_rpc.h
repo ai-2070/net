@@ -268,7 +268,7 @@ int net_rpc_call_service(
  * don't take request headers. These three additive variants
  * accept a (headers, count) pair and forward it to the inner
  * `CallOptions::request_headers`. Predicate-pushdown via the
- * `cyberdeck-where:` header (built by `net_predicate_to_where_header`
+ * `net-where:` header (built by `net_predicate_to_where_header`
  * in net.go.h) traverses the FFI through these variants.
  *
  * Header buffers are referenced for the call's duration only —

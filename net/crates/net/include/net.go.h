@@ -810,7 +810,7 @@ int      net_predicate_evaluate(const char* predicate_json,
                                 const char* metadata_json);
 
 /* Encode a wire-format Predicate as the canonical
- * `cyberdeck-where:` request-header pair (Phase 9b of
+ * `net-where:` request-header pair (Phase 9b of
  * CAPABILITY_SYSTEM_SDK_PLAN.md). Mirror of the Go SDK's
  * `WhereHeader` helper.
  *
@@ -825,7 +825,7 @@ int      net_predicate_evaluate(const char* predicate_json,
  *     `net_predicate_evaluate` accepts.
  *
  * Outputs:
- *   - *out_header_name/_len — `"cyberdeck-where"` (always).
+ *   - *out_header_name/_len — `"net-where"` (always).
  *     Free with `net_free_string`.
  *   - *out_value_ptr/_len   — JSON-encoded PredicateWire bytes,
  *     capped at `MAX_PREDICATE_RPC_HEADER_VALUE_LEN` (4096).

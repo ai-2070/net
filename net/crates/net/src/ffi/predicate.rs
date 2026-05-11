@@ -122,7 +122,7 @@ pub extern "C" fn net_predicate_evaluate(
 // =========================================================================
 // Phase 9b — predicate-pushdown header helper
 //
-// Builds the canonical `cyberdeck-where:` request-header pair for a
+// Builds the canonical `net-where:` request-header pair for a
 // wire-format predicate. Mirrors the Go SDK's `WhereHeader` helper
 // (`bindings/go/net/capability.go`). The returned `(name, value)`
 // pair drops into any `request_headers`-shaped option list once a
@@ -135,7 +135,7 @@ pub extern "C" fn net_predicate_evaluate(
 // =========================================================================
 
 /// Encode a wire-format `Predicate` as the canonical
-/// `cyberdeck-where:` request-header value.
+/// `net-where:` request-header value.
 ///
 /// Inputs:
 ///   - `predicate_json` — NUL-terminated UTF-8 `PredicateWire`
@@ -144,7 +144,7 @@ pub extern "C" fn net_predicate_evaluate(
 ///
 /// Outputs:
 ///   - `*out_header_name` — owned `char*` containing
-///     `"cyberdeck-where"`. Free via `net_free_string`.
+///     `"net-where"`. Free via `net_free_string`.
 ///   - `*out_header_name_len` — strlen of the header name.
 ///   - `*out_value_ptr` — owned `uint8_t*` containing the
 ///     canonical JSON bytes. Free via `net_free_string` (the
@@ -338,7 +338,7 @@ mod tests {
     }
 
     /// `net_predicate_to_where_header` emits the canonical
-    /// `cyberdeck-where` header name + a JSON-encoded
+    /// `net-where` header name + a JSON-encoded
     /// `PredicateWire` value. Round-trip the value through
     /// `serde_json` and assert it decodes to the same predicate.
     #[test]
@@ -366,13 +366,13 @@ mod tests {
         );
         assert_eq!(rc, 0);
 
-        // Header name == "cyberdeck-where".
+        // Header name == "net-where".
         let name = unsafe { CStr::from_ptr(out_name) }
             .to_str()
             .unwrap()
             .to_string();
-        assert_eq!(name, "cyberdeck-where");
-        assert_eq!(name_len, "cyberdeck-where".len());
+        assert_eq!(name, "net-where");
+        assert_eq!(name_len, "net-where".len());
 
         // Header value parses as PredicateWire and round-trips
         // back to the same predicate.

@@ -10,7 +10,7 @@ Phase 5.B + 1 of `docs/plans/CAPABILITY_ENHANCEMENTS_PLAN.md`. Surfaced through 
 
 Pins the `Predicate` → `PredicateWire` → JSON-encoded header value contract:
 
-- The `wire` field of each case is the canonical JSON-encoded `PredicateWire` that lands in the `cyberdeck-where` request header (per `behavior::predicate::predicate_to_rpc_header`).
+- The `wire` field of each case is the canonical JSON-encoded `PredicateWire` that lands in the `net-where` request header (per `behavior::predicate::predicate_to_rpc_header`).
 - Each binding's compat test:
   1. Loads the fixture entry.
   2. Deserializes the `wire` JSON into its native `PredicateWire` type.
