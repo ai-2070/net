@@ -286,18 +286,36 @@ impl ReplicationRuntimeHandle {
         self.inbox.try_send(event).map_err(|e| e.into_inner())
     }
 
-    /// Send `Shutdown` and await the task to exit. Idempotent
-    /// — subsequent calls are no-ops once the task has joined.
+    /// Send `Shutdown` and await the task to exit. Idempotent —
+    /// subsequent calls are no-ops once the task has joined.
+    ///
+    /// Uses `try_send` first so a wedged task with a full inbox
+    /// can't hang the caller indefinitely. On `Full`, the
+    /// JoinHandle is aborted directly; the task exits without
+    /// running the graceful Idle transition but the channel is
+    /// still safely torn down.
     pub async fn cancel(&self) {
-        let _ = self.inbox.send(Inbound::Shutdown).await;
         let handle = self.task.lock().take();
         if let Some(h) = handle {
-            let _ = h.await;
+            match self.inbox.try_send(Inbound::Shutdown) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Graceful path: the task observes Shutdown (or
+                    // already exited). Await the join.
+                    let _ = h.await;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Task is wedged on a slow await with a saturated
+                    // inbox. Abort directly so cancel() can't block
+                    // the caller waiting on a buffer that the wedged
+                    // task may never drain.
+                    h.abort();
+                    let _ = h.await;
+                }
+            }
         }
-        // R-11: flip the "joined" flag only after the await
-        // returns. Concurrent cancel() racers that lost the
-        // handle take(): poll `stopped` until our await
-        // completes.
+        // Flip the "joined" flag only after the await returns.
+        // Concurrent cancel() racers that lost the handle take():
+        // poll `stopped` until our await completes.
         self.stopped.store(true, AtomicOrdering::Release);
     }
 
@@ -312,6 +330,23 @@ impl ReplicationRuntimeHandle {
     /// finished joining.
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(AtomicOrdering::Acquire)
+    }
+}
+
+impl Drop for ReplicationRuntimeHandle {
+    /// Best-effort cleanup if a handle is dropped without an
+    /// explicit `cancel().await`. Aborts the task synchronously so
+    /// the spawned future stops driving and the dispatcher Arc the
+    /// task held is released — closing the strong-reference cycle
+    /// `MeshNode → router → handle → task → dispatcher` without
+    /// requiring callers to remember the cancel sequence. The
+    /// graceful Idle transition is skipped on this path; callers
+    /// that need the announce/withdraw side-effects to land must
+    /// still `cancel().await` before drop.
+    fn drop(&mut self) {
+        if let Some(h) = self.task.lock().take() {
+            h.abort();
+        }
     }
 }
 
@@ -1445,6 +1480,85 @@ mod tests {
         }
 
         handle.cancel().await;
+    }
+
+    /// A wedged task with a saturated inbox must not hang
+    /// `cancel()`. The cancel path uses `try_send` for the Shutdown
+    /// message; if the buffer is full, the JoinHandle is aborted
+    /// directly so the call returns promptly instead of blocking on
+    /// a queue the wedged task may never drain.
+    #[tokio::test]
+    async fn cancel_with_full_inbox_does_not_hang() {
+        // Slow tick so the task spends most of its time parked.
+        // Fill the inbox without giving the task time to drain.
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let handle = spawn_replication_runtime(inputs, coordinator, dispatcher, build_budget());
+
+        // Saturate the inbox so a buffered `send(Shutdown).await`
+        // would block.
+        let cid = channel_id_for("test/runtime");
+        for _ in 0..RUNTIME_INBOX_CAPACITY {
+            let _ = handle.try_dispatch(Inbound::Heartbeat {
+                from: 0x20,
+                msg: SyncHeartbeat {
+                    channel_id: cid,
+                    tail_seq: 0,
+                    role: ReplicaRole::Replica,
+                    wall_clock_ms: 0,
+                },
+            });
+        }
+
+        // cancel() must complete within a tight bound — a regression
+        // to `send(Shutdown).await` would hang here on the full
+        // buffer.
+        tokio::time::timeout(Duration::from_secs(2), handle.cancel())
+            .await
+            .expect("cancel() must not hang on full inbox");
+        assert!(handle.is_stopped());
+    }
+
+    /// Dropping a handle without `cancel()` aborts the underlying
+    /// task so the spawned future stops driving and any dispatcher
+    /// Arc it held is released. Pins the Arc-cycle invariant:
+    /// `MeshNode → router → handle → task → dispatcher` must close
+    /// when the handle goes out of scope.
+    #[tokio::test]
+    async fn dropping_handle_aborts_task() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let dispatcher_clone: Arc<dyn ReplicationDispatcher> = dispatcher.clone();
+        // The runtime task holds one strong reference to dispatcher
+        // (passed below). Count after spawn = 2.
+        let handle =
+            spawn_replication_runtime(inputs, coordinator, dispatcher_clone, build_budget());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(Arc::strong_count(&dispatcher) >= 2);
+
+        drop(handle);
+
+        // Yield enough for the abort to land + the task's local
+        // state to deallocate (releasing the dispatcher Arc).
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if Arc::strong_count(&dispatcher) == 1 {
+                return;
+            }
+        }
+        panic!(
+            "task did not release dispatcher Arc after handle drop; strong_count = {}",
+            Arc::strong_count(&dispatcher)
+        );
     }
 
     #[tokio::test]
