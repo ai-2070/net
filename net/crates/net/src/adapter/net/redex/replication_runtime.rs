@@ -385,6 +385,60 @@ async fn run(
     }
 }
 
+/// Which lag gauge the tick should update, if any. Leader emits the
+/// worst-replica lag; Replica emits the believed-leader lag.
+/// Candidate + Idle don't emit lag — both are transient or non-
+/// participating roles.
+#[derive(Debug)]
+enum LagObservation {
+    /// Leader-side: max over replica peers of `now - peer.last_seen`.
+    /// Drives `record_leader_lag`. Reflects the staleness of the
+    /// worst-lagging replica.
+    Leader(Duration),
+    /// Replica-side: `now - believed_leader.last_seen`. Drives
+    /// `record_replica_lag`. `None` if no leader heartbeat has been
+    /// observed yet (the gauge stays unobserved).
+    Replica(Duration),
+    /// No lag to record this tick.
+    None,
+}
+
+/// Compute the lag observation for this tick. Pure read over the
+/// tracker; the caller updates the metric off the lock.
+fn observe_lag(
+    role: ReplicaRole,
+    replica_set: &[NodeId],
+    self_node_id: NodeId,
+    tracker: &HeartbeatTracker,
+    now: Instant,
+) -> LagObservation {
+    match role {
+        ReplicaRole::Leader => {
+            // Worst-replica view: max over peers of (now - peer.last_seen).
+            // A peer never seen has no observation — skip it (the
+            // gauge captures observed lag, not "never heard from").
+            let worst = replica_set
+                .iter()
+                .copied()
+                .filter(|&p| p != self_node_id)
+                .filter_map(|p| tracker.peer_lag(p, now))
+                .max();
+            match worst {
+                Some(d) => LagObservation::Leader(d),
+                None => LagObservation::None,
+            }
+        }
+        ReplicaRole::Replica => match tracker.believed_leader() {
+            Some(leader) => match tracker.peer_lag(leader, now) {
+                Some(d) => LagObservation::Replica(d),
+                None => LagObservation::None,
+            },
+            None => LagObservation::None,
+        },
+        ReplicaRole::Candidate | ReplicaRole::Idle => LagObservation::None,
+    }
+}
+
 async fn on_tick(
     inputs: &RuntimeInputs,
     coordinator: &Arc<ReplicationCoordinator>,
@@ -398,9 +452,9 @@ async fn on_tick(
     // Take a tracker snapshot under the lock; release before the
     // async dispatcher calls so the tick doesn't hold the lock
     // across awaits.
-    let outcome = {
+    let (outcome, lag_observation) = {
         let t = tracker.lock();
-        tick(TickInputs {
+        let outcome = tick(TickInputs {
             self_node_id: inputs.self_node_id,
             current_role,
             channel_id: inputs.channel_id,
@@ -410,8 +464,16 @@ async fn on_tick(
             wall_clock_ms,
             chunk_max_bytes: SYNC_REQUEST_CHUNK_MAX_DEFAULT,
             now,
-        })
+        });
+        let lag = observe_lag(current_role, &inputs.replica_set, inputs.self_node_id, &t, now);
+        (outcome, lag)
     };
+    // Record lag gauges off the tracker lock.
+    match lag_observation {
+        LagObservation::Leader(d) => coordinator.metrics().record_leader_lag(d),
+        LagObservation::Replica(d) => coordinator.metrics().record_replica_lag(d),
+        LagObservation::None => {}
+    }
     for msg in outcome.outbound {
         match msg {
             OutboundMessage::Heartbeat { target, msg } => {
@@ -1060,4 +1122,96 @@ mod tests {
 
         handle.cancel().await;
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Lag-observation gauge (Phase H)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn observe_lag_idle_emits_none() {
+        let tracker = HeartbeatTracker::new(500);
+        let now = Instant::now();
+        match observe_lag(ReplicaRole::Idle, &[0x10, 0x20], 0x10, &tracker, now) {
+            LagObservation::None => {}
+            other => panic!("expected None for Idle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observe_lag_candidate_emits_none() {
+        let tracker = HeartbeatTracker::new(500);
+        let now = Instant::now();
+        match observe_lag(ReplicaRole::Candidate, &[0x10, 0x20], 0x10, &tracker, now) {
+            LagObservation::None => {}
+            other => panic!("expected None for Candidate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observe_lag_leader_with_no_peer_observations_emits_none() {
+        // Self is the leader, peers in the set but no heartbeats
+        // observed yet → lag has no observation to report.
+        let tracker = HeartbeatTracker::new(500);
+        let now = Instant::now();
+        match observe_lag(ReplicaRole::Leader, &[0x10, 0x20, 0x30], 0x10, &tracker, now) {
+            LagObservation::None => {}
+            other => panic!("expected None when peers have not heartbeated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observe_lag_leader_picks_worst_replica() {
+        let mut tracker = HeartbeatTracker::new(500);
+        let base = Instant::now();
+        // Peer 0x20 heartbeated at base; peer 0x30 heartbeated 100ms
+        // later. After advancing to base+1000ms, peer 0x20 has 1000ms
+        // of lag, peer 0x30 has 900ms. Leader gauge picks the worst.
+        tracker.record_heartbeat(0x20, ReplicaRole::Replica, 0, base);
+        tracker.record_heartbeat(0x30, ReplicaRole::Replica, 0, base + Duration::from_millis(100));
+        let now = base + Duration::from_millis(1000);
+        match observe_lag(ReplicaRole::Leader, &[0x10, 0x20, 0x30], 0x10, &tracker, now) {
+            LagObservation::Leader(d) => assert_eq!(d, Duration::from_millis(1000)),
+            other => panic!("expected Leader(1000ms), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observe_lag_replica_emits_believed_leader_lag() {
+        let mut tracker = HeartbeatTracker::new(500);
+        let base = Instant::now();
+        tracker.record_heartbeat(0x42, ReplicaRole::Leader, 99, base);
+        let now = base + Duration::from_millis(250);
+        match observe_lag(ReplicaRole::Replica, &[0x10, 0x42], 0x10, &tracker, now) {
+            LagObservation::Replica(d) => assert_eq!(d, Duration::from_millis(250)),
+            other => panic!("expected Replica(250ms), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observe_lag_replica_with_no_believed_leader_emits_none() {
+        // Empty tracker — no leader heartbeat ever observed.
+        let tracker = HeartbeatTracker::new(500);
+        let now = Instant::now();
+        match observe_lag(ReplicaRole::Replica, &[0x10, 0x42], 0x10, &tracker, now) {
+            LagObservation::None => {}
+            other => panic!("expected None for replica with no believed leader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observe_lag_leader_skips_self_in_replica_set() {
+        // Self appears in replica_set (typical — leaders are listed
+        // alongside replicas). The lag picks the worst PEER, never
+        // self's lag (which is meaningless since self is the
+        // writer).
+        let mut tracker = HeartbeatTracker::new(500);
+        let base = Instant::now();
+        tracker.record_heartbeat(0x20, ReplicaRole::Replica, 0, base);
+        let now = base + Duration::from_millis(500);
+        match observe_lag(ReplicaRole::Leader, &[0x10, 0x20], 0x10, &tracker, now) {
+            LagObservation::Leader(d) => assert_eq!(d, Duration::from_millis(500)),
+            other => panic!("expected Leader(500ms), got {other:?}"),
+        }
+    }
+
 }

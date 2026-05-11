@@ -505,18 +505,18 @@ This is the gating phase. Plan generously and treat regressions as test failures
 - `EvictOldest` path: aggressive retention sweep; preserves replication factor at the cost of older data.
 - Pin both behaviors in test.
 
-### Phase H — Metrics + observability (3 days) ⚠️ scaffolding landed
+### Phase H — Metrics + observability (3 days) ⚠️ counters wired; snapshot pending
 
-**Scaffolding side landed.** Coordinator integration + operator docs ship with Phase C.
+**Counters wired.** Lag gauges + `leader_changes_total` + `election_thrash_total` + `sync_bytes_total` + `skip_ahead_total` fire from the live runtime. `MeshDaemon::snapshot` + operator docs pending.
 
 - ✅ `redex::replication_metrics::ReplicationMetricsRegistry` — per-channel `Arc<ChannelMetricsAtomic>` registry, bounded by `MAX_TRACKED_CHANNELS = 1024` with an `__overflow__` fold-bucket past the cap (mirrors `RpcMetricsRegistry`'s cardinality discipline).
 - ✅ Seven counter / gauge shapes pinned per [§11](#11-metrics): `dataforts_replication_lag_seconds{channel,role}`, `dataforts_replication_sync_bytes_total{channel}`, `dataforts_leader_changes_total{channel}`, `dataforts_replication_under_capacity_total{channel}`, `dataforts_replication_skip_ahead_total{channel}`, `dataforts_replication_election_thrash_total{channel}`, `dataforts_replication_witness_withdrawals_total{channel}`.
 - ✅ `ReplicationMetricsSnapshot::prometheus_text()` renderer — HELP + TYPE blocks per metric; sorted-by-channel emission for byte-stable goldens; unobserved lag roles omitted entirely (no NaN); Prometheus-spec label escaping for `\` / `"` / `\n` / `\r`.
 - ✅ `record_leader_lag` / `record_replica_lag` saturate `Duration::MAX` rather than panicking on overflow.
 - ✅ 13 unit tests covering idempotent `for_channel`, distinct-channel isolation, overflow fold + previously-seen-channel-skips-overflow, lag observability transitions, sorted snapshot, full Prometheus emission, label escaping, totals aggregation.
-- 🔜 **Phase C wiring**: `ReplicationCoordinator` increments the counters at its state-transition + heartbeat + sync seams.
-- 🔜 **Phase C**: `MeshDaemon::snapshot()` for `ReplicationCoordinator` surfacing `tail_seq`, `last_sync_at`, `last_heartbeat_at`, current role.
-- 🔜 **Phase C**: `BEHAVIOR.md` + `CONFIG_REPLICATION.md` operator docs (concrete behavior to document doesn't exist yet).
+- ✅ **Coordinator wiring**: `ReplicationCoordinator::transition_to` bumps `leader_changes_total` on every `* → Leader` transition and `election_thrash_total` on every `MissedHeartbeats`-driven transition. The runtime's `on_tick` records lag gauges via a pure `observe_lag(role, replica_set, self_id, tracker, now) -> LagObservation` helper: Leader role records the worst-replica `peer_lag` (so a stuck replica is observable from the leader), Replica role records the believed-leader's lag (so a silent-leader cycle is observable from the replica), Candidate + Idle skip emission. The runtime's `on_inbound(SyncRequest)` bumps `sync_bytes_total` on every admitted chunk; `on_inbound(SyncNack BadRange)` bumps `skip_ahead_total`. 7 unit tests in `replication_runtime` pin `observe_lag` semantics: Idle / Candidate emit nothing, leader picks the worst peer + skips self, leader with no peer observations emits nothing, replica emits believed-leader lag, replica without believed leader emits nothing.
+- 🔜 **MeshDaemon::snapshot() integration**: surface `tail_seq`, `last_sync_at`, `last_heartbeat_at`, current role per channel — needs a `MeshDaemon` surface that doesn't yet exist.
+- 🔜 **Operator docs**: `BEHAVIOR.md` + `CONFIG_REPLICATION.md` (lands with Phase F integration testing once concrete operator-facing behavior stabilizes).
 
 ### Phase I — Bindings (1 week, parallelisable)
 
