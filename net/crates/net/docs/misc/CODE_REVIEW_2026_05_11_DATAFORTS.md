@@ -76,7 +76,7 @@ Tagged `[B | H | M | L]`:
 | D-42  | M   | python blob  | `Py<PyAny>` adapters can outlive interpreter finalization                  | ✅ |
 | D-43  | M   | python blob  | `data.to_vec()` happens before GIL is released for large payloads          | 🚫 not-applicable — no `py.detach` in the current binding; review described a code path that doesn't exist |
 | D-44  | M   | go binding   | Greedy/gravity numeric fields can't express literal `0` via `omitempty`   | 🚫 won't-fix — substrate rejects 0 for every affected field; `omitempty` is correct |
-| D-45  | M   | go binding   | No RYW surface — `wait_for_token` not exposed                              | 🚫 deferred (blocked) — `net_tasks_wait_for_token` / `net_memories_wait_for_token` require `*TasksAdapterHandle` / `*MemoriesAdapterHandle` which the Go binding has no constructor for; unblocks once Go Tasks/Memories lands per the plan |
+| D-45  | M   | go binding   | No RYW surface — `wait_for_token` not exposed                              | ✅ (Go Tasks + Memories adapters land with `WaitForToken` + `PollForToken` + `WaitForTokenContext` non-blocking variant) |
 | D-46  | L   | greedy       | Heat normalization compression at the top end                              | ✅ (folded into D-30 fix) |
 | D-47  | L   | greedy       | `metrics.rs` channel-cap race under contention                             | ✅ (doc note) |
 | D-48  | L   | greedy       | `_force_use_hashmap` dead allow                                            | ✅ |
