@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_9163f300668f8b::t_c203b28aa06943 172-200
+  s_9163f300668f8b::t_ea702136be91b7 741-777
+  s_9163f300668f8b::t_6c511695317132 28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "a837f66ab5964f5a7e0f76a54ee899deec63cae2",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
