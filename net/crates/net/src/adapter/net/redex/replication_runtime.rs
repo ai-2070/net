@@ -51,7 +51,7 @@ use super::replication::{
 };
 use super::replication_budget::BandwidthBudget;
 use super::replication_catchup::{apply_sync_response, handle_sync_request, SyncRequestOutcome};
-use super::replication_coordinator::{ChannelIdentity, ReplicationCoordinator};
+use super::replication_coordinator::{ChannelIdentity, CoordinatorError, ReplicationCoordinator};
 use super::replication_heartbeat::HeartbeatTracker;
 use super::replication_step::{
     election_outcome, tick, OutboundMessage, TickInputs, SYNC_REQUEST_CHUNK_MAX_DEFAULT,
@@ -489,8 +489,15 @@ async fn on_tick(
     // tick(). Reading role here is cheap (a parking_lot mutex
     // load); holding both locks together is safe because role
     // observation never awaits.
-    let (outcome, lag_observation, current_role) = {
+    let (outcome, lag_observation) = {
         let t = tracker.lock();
+        // Capture `current_role` inside the same critical section
+        // that holds the tracker lock so a concurrent transition
+        // can't land between the role read and the tick(). Reading
+        // role here is cheap (a parking_lot mutex load); holding
+        // both locks together is safe because role observation
+        // never awaits. The captured value lives only inside this
+        // closure — `tick()` consumes it via its outcome.
         let current_role = coordinator.role();
         let outcome = tick(TickInputs {
             self_node_id: inputs.self_node_id,
@@ -510,11 +517,8 @@ async fn on_tick(
             &t,
             now,
         );
-        (outcome, lag, current_role)
+        (outcome, lag)
     };
-    // current_role is captured for potential future use; the
-    // tick outcome already encodes what to do.
-    let _ = current_role;
     // Record lag gauges off the tracker lock.
     match lag_observation {
         LagObservation::Leader(d) => coordinator.metrics().record_leader_lag(d),
@@ -563,17 +567,45 @@ async fn on_tick(
             if let Some(pt) = elect {
                 match coordinator.transition_to(pt.target, pt.signal).await {
                     Ok(_) => {
-                        // R-2: only clear the believed leader on
-                        // a successful transition. If the second
+                        // Only clear the believed leader on a
+                        // successful transition. If the second
                         // transition lost a race (e.g. an inbound
-                        // Shutdown drove us to Idle first),
-                        // wiping the believed leader would leave
-                        // the coordinator with no recovery
-                        // signal.
+                        // Shutdown drove us to Idle first), wiping
+                        // the believed leader would leave the
+                        // coordinator with no recovery signal.
                         tracker.lock().clear_believed_leader();
                     }
-                    Err(e) => {
-                        tracing::warn!(error=?e, "replication: post-election transition failed");
+                    Err(CoordinatorError::TagSink(e)) => {
+                        // State moved to the target (Leader /
+                        // Replica); only the chain-tag side-effect
+                        // failed. We are functionally in the new
+                        // role — clear the believed leader so the
+                        // tick path doesn't keep treating an old
+                        // peer as authoritative. Chain discovery
+                        // for this channel stays silent until the
+                        // next successful announce; operators
+                        // observing this counter see the
+                        // divergence.
+                        tracing::warn!(
+                            error = ?e,
+                            target = ?pt.target,
+                            "replication: post-election chain-tag side-effect failed; state advanced"
+                        );
+                        tracker.lock().clear_believed_leader();
+                    }
+                    Err(CoordinatorError::Transition(e)) => {
+                        // State did not move (typically because a
+                        // concurrent ChannelClose drove us to Idle
+                        // first). Recover by clearing the believed
+                        // leader so the next tick re-enters
+                        // discovery from a clean slate rather than
+                        // sitting on a stale belief.
+                        tracing::warn!(
+                            error = ?e,
+                            target = ?pt.target,
+                            "replication: post-election transition rejected; state moved out from under us"
+                        );
+                        tracker.lock().clear_believed_leader();
                     }
                 }
             }
@@ -1251,6 +1283,105 @@ mod tests {
         // the tracker (after the silence threshold, the tracker
         // considers 0x20 stale). Either way, self wins: self has
         // RTT 0; peer is either filtered out or at 5ms.
+        assert_eq!(coordinator.role(), ReplicaRole::Leader);
+
+        handle.cancel().await;
+    }
+
+    /// Chain-tag sink that returns `Ok` for the first `n` calls
+    /// then fails every subsequent call. Lets a test pin the post-
+    /// election sink-failure path: the first call (Idle → Replica
+    /// announce) succeeds, the second (Candidate → Leader announce)
+    /// fails — so the coordinator transitions state but the chain-
+    /// tag side-effect surfaces TagSink.
+    struct FailingAfterNAnnounceSink {
+        remaining: ParkingMutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChainTagSink for FailingAfterNAnnounceSink {
+        async fn announce_chain(
+            &self,
+            _origin_hash: u64,
+            _tip_seq: u64,
+        ) -> Result<(), AdapterError> {
+            let mut r = self.remaining.lock();
+            if *r == 0 {
+                return Err(AdapterError::Transient("simulated sink failure".to_string()));
+            }
+            *r -= 1;
+            Ok(())
+        }
+        async fn withdraw_chain(&self, _origin_hash: u64) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// A failing tag-sink on the post-election Candidate → Leader
+    /// transition must NOT strand the coordinator in Candidate. The
+    /// state machine moves to Leader (the failure is in the side-
+    /// effect only); the runtime must observe the TagSink error
+    /// branch, clear the believed leader, and continue. The
+    /// previous code path logged + dropped, leaving the coordinator
+    /// effectively healthy but stale-state in the tracker.
+    #[tokio::test]
+    async fn post_election_tag_sink_failure_does_not_strand_candidate() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 50);
+        let cid = inputs.channel_id;
+        // Build a coordinator wired to a sink that succeeds on the
+        // first announce (Idle → Replica) and fails on the second
+        // (Candidate → Leader during the post-election transition).
+        let registry = ReplicationMetricsRegistry::new();
+        let sink: Arc<dyn ChainTagSink> = Arc::new(FailingAfterNAnnounceSink {
+            remaining: ParkingMutex::new(1),
+        });
+        let coordinator = Arc::new(ReplicationCoordinator::new(
+            ChannelIdentity {
+                channel_name: "test/runtime".to_string(),
+                origin_hash: 0xCAFE_BABE,
+            },
+            ReplicationConfig::new(),
+            sink,
+            &registry,
+        ));
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let handle = spawn_replication_runtime(
+            inputs,
+            coordinator.clone(),
+            dispatcher.clone(),
+            build_budget(),
+        );
+
+        // Seed a single leader heartbeat then let silence detection
+        // fire so the runtime enters Candidate and runs the
+        // election.
+        handle
+            .dispatch(Inbound::Heartbeat {
+                from: 0x20,
+                msg: SyncHeartbeat {
+                    channel_id: cid,
+                    tail_seq: 99,
+                    role: ReplicaRole::Leader,
+                    wall_clock_ms: 1_700_000_000_000,
+                },
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // State has moved to Leader despite the sink failure — the
+        // coordinator's transition lock applied the state change
+        // before the (failing) side-effect ran. The runtime's
+        // post-election handler observed CoordinatorError::TagSink
+        // and cleared the believed leader, not the prior code path
+        // that silently sat on stale Candidate state.
         assert_eq!(coordinator.role(), ReplicaRole::Leader);
 
         handle.cancel().await;
