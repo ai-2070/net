@@ -38,10 +38,29 @@ use std::path::PathBuf;
 /// `ReplicationDispatcher`), the per-`Redex` router shared with the
 /// mesh's `SUBPROTOCOL_REDEX` inbound dispatch, and the metrics
 /// registry that every per-channel coordinator publishes to.
+///
+/// The `Drop` impl uninstalls the router from the mesh — otherwise
+/// the mesh holds the only remaining `Arc<RedexReplicationRouter>`
+/// after `Redex` drops, keeping every per-channel runtime task
+/// alive with no Redex driving them. Routing-then-dropping the
+/// router lets the runtime handles drop, which closes their
+/// inboxes, which lets the tokio tasks exit cleanly.
 struct ReplicationWiring {
     mesh: Arc<MeshNode>,
     router: Arc<RedexReplicationRouter>,
     metrics: Arc<ReplicationMetricsRegistry>,
+}
+
+impl Drop for ReplicationWiring {
+    fn drop(&mut self) {
+        // Best-effort uninstall — `set_replication_inbound_router(None)`
+        // is infallible and idempotent. Even if the mesh has already
+        // been shut down or the slot was reassigned by a racing
+        // `enable_replication` (which `Redex::enable_replication`
+        // refuses on idempotency, so this would only happen if a
+        // caller bypassed the wrapper), the call is a safe no-op.
+        self.mesh.set_replication_inbound_router(None);
+    }
 }
 
 /// Manager for a set of RedEX files bound to channel names.
@@ -747,6 +766,43 @@ mod tests {
         // caller can pipe straight into an HTTP body without
         // branching.
         assert_eq!(r.replication_prometheus_text(), "");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_redex_uninstalls_router_from_mesh() {
+        // Build a mesh, install a Redex with an active replication
+        // runtime, drop the Redex, then install a second Redex on
+        // the same mesh. The second `enable_replication` must
+        // succeed without observing the prior Redex's router —
+        // proves the Drop impl cleared the mesh's slot.
+        let mesh = build_mesh_for_test().await;
+        {
+            let r = Redex::new();
+            r.enable_replication(mesh.clone());
+            let name = cn("repl/drop");
+            let cfg = RedexFileConfig::default().with_replication(Some(
+                ReplicationConfig::new().with_heartbeat_ms(60_000),
+            ));
+            r.open_file(&name, cfg).expect("open");
+            assert_eq!(r.replication_runtime_count(), 1);
+            // `r` goes out of scope here; Drop fires.
+        }
+        // Give the dropped runtime task a tick to observe its
+        // inbox close.
+        tokio::task::yield_now().await;
+
+        // A second Redex on the same mesh should install cleanly.
+        // If the prior router were still pinned, the second
+        // installation would silently leak it (the mesh's slot
+        // would have been swapped to the new router without
+        // shutting down the first set of runtimes).
+        let r2 = Redex::new();
+        r2.enable_replication(mesh);
+        assert_eq!(
+            r2.replication_runtime_count(),
+            0,
+            "fresh Redex starts with zero runtimes"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
