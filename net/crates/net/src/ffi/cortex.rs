@@ -75,6 +75,7 @@ pub(crate) const NET_ERR_FOLD_STOPPED: c_int = -106;
 /// dlsym consumers see a stable error rather than a linker
 /// failure when they target a `libnet.so` built without the
 /// `dataforts` feature.
+#[allow(dead_code)] // only referenced from `#[cfg(not(feature = "dataforts"))]` stubs
 pub(crate) const NET_ERR_FEATURE_NOT_BUILT: c_int = -107;
 /// Panic surfaced from inside the substrate during a wait_for_token
 /// call. Caught with `catch_unwind` and reported here rather than

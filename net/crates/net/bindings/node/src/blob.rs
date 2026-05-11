@@ -541,7 +541,13 @@ where
             label, status
         )));
     }
-    let promise_step = tokio::time::timeout(timeout, rx).await;
+    // Total-budget the two stages (TSFN-to-Promise + Promise resolve)
+    // against a single deadline so the worst case is `timeout`, not
+    // 2*timeout. Without this an async adapter waiting on a slow
+    // Promise after the TSFN stage already consumed most of the
+    // budget would see effective `2*timeout`.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let promise_step = tokio::time::timeout_at(deadline, rx).await;
     let promise = match promise_step {
         Ok(Ok(Ok(p))) => p,
         Ok(Ok(Err(e))) => {
@@ -564,14 +570,14 @@ where
             )))
         }
     };
-    match tokio::time::timeout(timeout, promise).await {
+    match tokio::time::timeout_at(deadline, promise).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => Err(InnerBlobError::Backend(format!(
             "{}: Promise rejected: {}",
             label, e
         ))),
         Err(_) => Err(InnerBlobError::Backend(format!(
-            "{}: Promise did not resolve within {} ms",
+            "{}: Promise did not resolve within {} ms (total budget)",
             label,
             timeout.as_millis()
         ))),

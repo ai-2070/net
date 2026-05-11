@@ -16,12 +16,20 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::Semaphore;
 
 use super::adapter::BlobAdapter;
 use super::blob_ref::BlobRef;
 use super::error::BlobError;
+
+/// Default cap on concurrent FS adapter spawn_blocking tasks. A
+/// burst of stores against the default tokio blocking pool (512
+/// threads) would otherwise starve other blocking work in the
+/// process (RedEX writes, replication, etc.).
+pub const DEFAULT_FS_ADAPTER_CONCURRENCY: usize = 64;
 
 /// Filesystem-backed blob adapter. Content-addressed by BLAKE3 hash
 /// under a caller-supplied root directory.
@@ -29,17 +37,32 @@ use super::error::BlobError;
 pub struct FileSystemAdapter {
     id: String,
     root: PathBuf,
+    /// Cap on concurrent `spawn_blocking` tasks issued by this
+    /// adapter. Bounds the share of the tokio blocking pool that a
+    /// burst of stores can claim so other blocking work in the
+    /// process (RedEX writes, replication) isn't starved.
+    concurrency: Arc<Semaphore>,
 }
 
 impl FileSystemAdapter {
     /// Construct an adapter rooted at `root`. The directory is
     /// created on the first `store` if absent; `fetch` against an
-    /// unprepared root surfaces `BlobError::NotFound`.
+    /// unprepared root surfaces `BlobError::NotFound`. Concurrency
+    /// defaults to [`DEFAULT_FS_ADAPTER_CONCURRENCY`]; override via
+    /// [`Self::with_concurrency`].
     pub fn new(id: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
             id: id.into(),
             root: root.into(),
+            concurrency: Arc::new(Semaphore::new(DEFAULT_FS_ADAPTER_CONCURRENCY)),
         }
+    }
+
+    /// Override the per-adapter spawn_blocking concurrency cap.
+    /// Floor 1 — zero would deadlock the adapter.
+    pub fn with_concurrency(mut self, cap: usize) -> Self {
+        self.concurrency = Arc::new(Semaphore::new(cap.max(1)));
+        self
     }
 
     /// Compute the on-disk path for a given blob hash.
@@ -111,7 +134,10 @@ impl BlobAdapter for FileSystemAdapter {
         }
         let path = self.path_for(&blob_ref.hash);
         let bytes = bytes.to_vec();
+        let _permit = self.concurrency.clone().acquire_owned().await
+            .map_err(|_| backend("adapter concurrency semaphore closed"))?;
         tokio::task::spawn_blocking(move || -> Result<(), BlobError> {
+            let _permit = _permit; // hold across the blocking work
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(backend)?;
             }
@@ -177,7 +203,10 @@ impl BlobAdapter for FileSystemAdapter {
     async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
         let path = self.path_for(&blob_ref.hash);
         let uri = sanitize_uri_for_error(&blob_ref.uri);
+        let _permit = self.concurrency.clone().acquire_owned().await
+            .map_err(|_| backend("adapter concurrency semaphore closed"))?;
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>, BlobError> {
+            let _permit = _permit;
             match std::fs::read(&path) {
                 Ok(bytes) => Ok(bytes),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(BlobError::NotFound(uri)),
@@ -217,7 +246,10 @@ impl BlobAdapter for FileSystemAdapter {
         let path = self.path_for(&blob_ref.hash);
         let uri = sanitize_uri_for_error(&blob_ref.uri);
         let start = range.start;
+        let _permit = self.concurrency.clone().acquire_owned().await
+            .map_err(|_| backend("adapter concurrency semaphore closed"))?;
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>, BlobError> {
+            let _permit = _permit;
             let mut f = match std::fs::File::open(&path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -236,7 +268,12 @@ impl BlobAdapter for FileSystemAdapter {
 
     async fn exists(&self, blob_ref: &BlobRef) -> Result<bool, BlobError> {
         let path = self.path_for(&blob_ref.hash);
-        let res = tokio::task::spawn_blocking(move || Path::new(&path).is_file())
+        let permit = self.concurrency.clone().acquire_owned().await
+            .map_err(|_| backend("adapter concurrency semaphore closed"))?;
+        let res = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            Path::new(&path).is_file()
+        })
             .await
             .map_err(|e| backend(format!("join error: {}", e)))?;
         Ok(res)

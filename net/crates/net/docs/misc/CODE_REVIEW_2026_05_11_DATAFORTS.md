@@ -55,37 +55,37 @@ Tagged `[B | H | M | L]`:
 | D-21  | H   | FFI          | Panic across FFI on `net_*_wait_for_token` + blob publish/resolve         | ✅ |
 | D-22  | H   | FFI          | Vtable per-field null-check missing in `net_blob_register_adapter`        | ✅ |
 | D-23  | H   | FFI          | `timeout_ms == 0` silently rewritten to 1 ms in token wait                | ✅ |
-| D-24  | M   | greedy       | Wire `channel_hash` 16-bit → silent cross-chain pollution                  | ⏳ |
-| D-25  | M   | greedy       | `gravity_tick` emits one full capset rebroadcast per chain                 | ⏳ |
-| D-26  | M   | greedy       | `entry.bytes` saturating drift under retention trim                        | ⏳ |
+| D-24  | M   | greedy       | Wire `channel_hash` 16-bit → silent cross-chain pollution                  | 🚫 deferred — wire-format change; needs separate slice |
+| D-25  | M   | greedy       | `gravity_tick` emits one full capset rebroadcast per chain                 | 🚫 deferred — needs `announce_heat_batch` on MeshNode + per-tick snapshot mutation |
+| D-26  | M   | greedy       | `entry.bytes` saturating drift under retention trim                        | 🚫 deferred — needs `RedexFile::retained_bytes()` accessor + periodic resync task |
 | D-27  | M   | greedy       | `NIC_PEAK_BYTES_PER_S` hard-coded; no override on `GreedyConfig`           | ✅ (folded into D-2) |
-| D-28  | M   | greedy       | 5 separate `cache.lock()` acquisitions per dispatch                        | ⏳ |
+| D-28  | M   | greedy       | 5 separate `cache.lock()` acquisitions per dispatch                        | 🚫 deferred — perf, not correctness; coalesce once contention shows up in flamegraphs |
 | D-29  | M   | gravity      | `should_emit_heat` `inf`-prone with near-zero `prev`                      | ✅ |
-| D-30  | M   | gravity      | Wire-side `(rate/(rate+1))` saturation at top end                          | ⏳ |
+| D-30  | M   | gravity      | Wire-side `(rate/(rate+1))` saturation at top end                          | 🚫 deferred — log-scale needs operator-defined SCALE constant + wire bump; gather telemetry first |
 | D-31  | M   | blob fs      | `BlobError::NotFound(uri)` propagates raw attacker URI → log injection     | ✅ |
 | D-32  | M   | blob fs      | Concurrent stores race on shared `<hash>.tmp` filename                     | ✅ (folded into D-12) |
 | D-33  | M   | blob fs      | No `fsync` of temp file or parent dir before rename — durability gap      | ✅ |
-| D-34  | M   | blob reg     | Process-wide singleton registry; multi-tenant hijack possible              | ⏳ |
-| D-35  | M   | blob adapter | No concurrency bound on `spawn_blocking` calls                             | ⏳ |
-| D-36  | M   | blob conf    | Conformance suite shallow (no idempotency / range / mismatch / parallel)   | ⏳ |
-| D-37  | M   | RYW          | "Wait queue" is `Semaphore::try_acquire` — not FIFO                        | ⏳ |
-| D-38  | M   | RYW          | 1024 cap is per-adapter; no process-wide bound                             | ⏳ |
-| D-39  | M   | FFI cortex   | `mesh_arc` drop duplicated per error branch — RAII guard wanted            | ⏳ |
-| D-40  | M   | node blob    | `await_tsfn_promise` applies 30s timeout twice → 60s worst-case           | ⏳ |
+| D-34  | M   | blob reg     | Process-wide singleton registry; multi-tenant hijack possible              | 🚫 deferred — single-tenant trust boundary; per-tenant registry is a Phase 4 follow-up |
+| D-35  | M   | blob adapter | No concurrency bound on `spawn_blocking` calls                             | ✅ (FS adapter; pattern available for other impls) |
+| D-36  | M   | blob conf    | Conformance suite shallow (no idempotency / range / mismatch / parallel)   | 🚫 deferred — separate slice; D-12's hash-check is now part of the contract anyway |
+| D-37  | M   | RYW          | "Wait queue" is `Semaphore::try_acquire` — not FIFO                        | 🚫 deferred — rename-only follow-up; true FIFO changes QueueFull semantics |
+| D-38  | M   | RYW          | 1024 cap is per-adapter; no process-wide bound                             | 🚫 deferred — documented; process-wide cap follows the multi-tenant slice |
+| D-39  | M   | FFI cortex   | `mesh_arc` drop duplicated per error branch — RAII guard wanted            | 🚫 deferred — readability, not correctness; pattern is verbose but works |
+| D-40  | M   | node blob    | `await_tsfn_promise` applies 30s timeout twice → 60s worst-case           | ✅ |
 | D-41  | M   | node cortex  | `DataGravityConfigJs.*_secs/_ms` u32 vs Python u64 vs Go uint64           | ✅ |
-| D-42  | M   | python blob  | `Py<PyAny>` adapters can outlive interpreter finalization                  | ⏳ |
-| D-43  | M   | python blob  | `data.to_vec()` happens before GIL is released for large payloads          | ⏳ |
+| D-42  | M   | python blob  | `Py<PyAny>` adapters can outlive interpreter finalization                  | 🚫 deferred — needs an atexit hook that drains the registry; rare shutdown-only crash |
+| D-43  | M   | python blob  | `data.to_vec()` happens before GIL is released for large payloads          | 🚫 not-applicable — no `py.detach` in the current binding; review described a code path that doesn't exist |
 | D-44  | M   | go binding   | Greedy/gravity numeric fields can't express literal `0` via `omitempty`   | 🚫 won't-fix — substrate rejects 0 for every affected field; `omitempty` is correct |
-| D-45  | M   | go binding   | No RYW surface — `wait_for_token` not exposed                              | ⏳ |
-| D-46  | L   | greedy       | Heat normalization compression at the top end                              | ⏳ |
-| D-47  | L   | greedy       | `metrics.rs` channel-cap race under contention                             | ⏳ |
+| D-45  | M   | go binding   | No RYW surface — `wait_for_token` not exposed                              | 🚫 deferred — Go Tasks/Memories surface itself is deferred per the plan; RYW follows |
+| D-46  | L   | greedy       | Heat normalization compression at the top end                              | 🚫 deferred — folded into D-30 (wire-format aware) |
+| D-47  | L   | greedy       | `metrics.rs` channel-cap race under contention                             | 🚫 deferred — DashMap shards bound the overshoot to constant; doc is fine |
 | D-48  | L   | greedy       | `_force_use_hashmap` dead allow                                            | ✅ |
 | D-49  | L   | blob         | `BlobError` not `#[non_exhaustive]`                                       | ✅ |
 | D-50  | L   | blob redex   | `RedexFileConfig::blob_adapter_id` unset surfaces `UnsupportedScheme`     | ✅ |
 | D-51  | L   | RYW          | `wait_duration_nanos_sum` u128→u64 saturating cast                         | ✅ (folded into RYW fix) |
 | D-52  | L   | FFI blob     | `OpaqueCtx(AtomicPtr<c_void>)` unnecessary atomicity                       | ✅ |
-| D-53  | L   | node blob    | Adapter `timeout` not user-tunable                                         | ⏳ |
-| D-54  | L   | go binding   | `runtime.SetFinalizer` runs blocking `Close` on GC thread                  | ⏳ |
+| D-53  | L   | node blob    | Adapter `timeout` not user-tunable                                         | 🚫 deferred — ergonomic; 30s default works for prod, override is a separate API change |
+| D-54  | L   | go binding   | `runtime.SetFinalizer` runs blocking `Close` on GC thread                  | 🚫 deferred — pre-existing pattern (not new in dataforts); shared issue with other Go handles |
 
 ## Findings
 
