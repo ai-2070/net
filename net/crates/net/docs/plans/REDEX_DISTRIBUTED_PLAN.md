@@ -500,12 +500,12 @@ This is the gating phase. Plan generously and treat regressions as test failures
 - Witness-withdrawal timing: under the partition-heal-with-stale-leader scenario, the deposed leader's `causal:` tag is reaped within 1 heartbeat via the witness path (`dataforts_replication_witness_withdrawals_total` increments) — strictly faster than the disconnect-observer reaping path. Pin both paths fire and that the witness path is the first to clear the tag from at least one observer's view.
 - Performance budget: replication overhead ≤ 30% of single-node append throughput at steady state.
 
-### Phase G — Disk pressure + `UnderCapacity` (3 days)
+### Phase G — Disk pressure + `UnderCapacity` (3 days) ✅
 
-- `ReplicationConfig::on_under_capacity` policy enforcement.
-- `Withdraw` path: drop replica role; capability tag withdrawn; reads re-route.
-- `EvictOldest` path: aggressive retention sweep; preserves replication factor at the cost of older data.
-- Pin both behaviors in test.
+- ✅ `ReplicationConfig::on_under_capacity` policy enforcement. The runtime's `on_inbound(SyncResponse)` branch reacts to `ApplyError::AppendFailed` (the disk-pressure surface: heap segment at 3 GB hard cap, or persistent-tier write fail) by calling `handle_disk_pressure(coordinator, file, detail, from)`. The helper consults `coordinator.config().on_under_capacity` and bumps `under_capacity_total` regardless of branch.
+- ✅ `Withdraw` (default) — `transition_to(Idle, DiskPressureWithdraw)` flips the role; the coordinator's `* → Idle` side-effect withdraws the `causal:<hex>` capability tag, so peers re-resolve to a healthy replica via `find_chain_holders`. Reads re-route as a natural consequence of the tag layer.
+- ✅ `EvictOldest` — calls `RedexFile::sweep_retention()` to evict on the configured `retention_max_*` caps. Caller stays in Replica role; the next `SyncResponse` retries the apply. Documented constraint: operators picking `EvictOldest` must pair it with `retention_max_*` settings — without caps, the sweep is a no-op and the next apply will fail again.
+- ✅ 3 unit tests in `replication_runtime`: `Withdraw` flips to Idle + bumps counter; `EvictOldest` keeps Replica role + sweeps retention down to the cap; `Withdraw` from an already-Idle state surfaces a logged transition error but still bumps the counter (defensive idempotency under race).
 
 ### Phase H — Metrics + observability (3 days) ⚠️ counters wired; snapshot pending
 

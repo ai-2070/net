@@ -659,12 +659,19 @@ async fn on_inbound(
                         "replication: applied chunk"
                     );
                 }
+                Err(super::replication_catchup::ApplyError::AppendFailed(detail)) => {
+                    // Disk-pressure surface — per plan §7, the
+                    // local file rejected the append (heap segment
+                    // at the 3 GB hard cap, or a disk write fail
+                    // on the persistent tier). Consult the
+                    // configured `UnderCapacity` policy and react.
+                    handle_disk_pressure(coordinator, &inputs.file, &detail, from).await;
+                }
                 Err(e) => {
-                    // ApplyError variants pin every reject path
-                    // — channel mismatch, monotonicity violation,
-                    // stale chunk, gap-before-chunk, append fail.
-                    // Log + drop; reliable-stream / heartbeat
-                    // cycle recovers.
+                    // Remaining ApplyError variants — channel
+                    // mismatch, monotonicity violation, stale
+                    // chunk, gap-before-chunk. Log + drop;
+                    // reliable-stream / heartbeat cycle recovers.
                     tracing::warn!(
                         from = from,
                         error = ?e,
@@ -716,6 +723,65 @@ async fn on_inbound(
                         .await;
                 }
             }
+        }
+    }
+}
+
+/// React to a disk-pressure signal from `apply_sync_response`. The
+/// local file rejected the append — heap segment at 3 GB hard cap
+/// or a disk-tier write fail. Consult the channel's configured
+/// `UnderCapacity` policy and apply.
+///
+/// Plan §7:
+///
+/// - `Withdraw` (default) — drop the replica role so the leader's
+///   other replicas can take over the redundancy responsibility.
+///   The channel's `causal:<hex>` tag is withdrawn via the
+///   coordinator's `* → Idle` side-effect. Operators see the
+///   `dataforts_replication_under_capacity_total` counter advance
+///   and the role flip to Idle.
+/// - `EvictOldest` — call `RedexFile::sweep_retention()` to evict
+///   on the configured caps + bump the counter. Caller stays in
+///   Replica role; the next `SyncResponse` retries the apply. If
+///   no retention caps are configured the sweep is a no-op and
+///   the next apply will fail again — operators who pick this
+///   policy should pair it with `retention_max_*` settings.
+async fn handle_disk_pressure(
+    coordinator: &Arc<ReplicationCoordinator>,
+    file: &super::file::RedexFile,
+    detail: &str,
+    from: NodeId,
+) {
+    use super::replication_config::UnderCapacity;
+    coordinator.metrics().incr_under_capacity();
+    let policy = coordinator.config().on_under_capacity;
+    match policy {
+        UnderCapacity::Withdraw => {
+            tracing::warn!(
+                from = from,
+                detail = detail,
+                "replication: disk pressure → withdrawing replica role"
+            );
+            if let Err(e) = coordinator
+                .transition_to(
+                    ReplicaRole::Idle,
+                    super::replication_state::TransitionSignal::DiskPressureWithdraw,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error=?e,
+                    "replication: disk-pressure withdraw transition failed"
+                );
+            }
+        }
+        UnderCapacity::EvictOldest => {
+            tracing::warn!(
+                from = from,
+                detail = detail,
+                "replication: disk pressure → sweeping retention"
+            );
+            file.sweep_retention();
         }
     }
 }
@@ -1237,4 +1303,124 @@ mod tests {
         }
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // Disk-pressure handling (Phase G)
+    // ────────────────────────────────────────────────────────────────
+
+    fn build_coordinator_with_policy(
+        policy: super::super::replication_config::UnderCapacity,
+    ) -> (Arc<ReplicationCoordinator>, Arc<super::super::replication_metrics::ChannelMetricsAtomic>) {
+        let registry = ReplicationMetricsRegistry::new();
+        let sink: Arc<dyn ChainTagSink> = Arc::new(NoopTagSink);
+        let config = ReplicationConfig::new().with_on_under_capacity(policy);
+        let coordinator = ReplicationCoordinator::new(
+            ChannelIdentity {
+                channel_name: "test/runtime".to_string(),
+                origin_hash: 0xCAFE_BABE,
+            },
+            config,
+            sink,
+            &registry,
+        );
+        let metrics = registry.for_channel("test/runtime");
+        (Arc::new(coordinator), metrics)
+    }
+
+    #[tokio::test]
+    async fn disk_pressure_withdraw_drives_idle_transition() {
+        // Bring the coordinator to Replica role so the
+        // DiskPressureWithdraw signal can validate.
+        let (coord, metrics) =
+            build_coordinator_with_policy(super::super::replication_config::UnderCapacity::Withdraw);
+        coord
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        assert_eq!(coord.role(), ReplicaRole::Replica);
+
+        let file = build_file_for_tests();
+        handle_disk_pressure(&coord, &file, "test detail", 0x20).await;
+
+        assert_eq!(coord.role(), ReplicaRole::Idle, "Withdraw flips to Idle");
+        assert_eq!(
+            metrics
+                .under_capacity_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Withdraw bumps under_capacity_total"
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_pressure_evict_oldest_keeps_role_and_sweeps() {
+        // EvictOldest: stay in Replica role, retention sweep
+        // fires. Pre-fill the file with N events under a
+        // count-1 retention cap so the sweep observably evicts.
+        let (coord, metrics) = build_coordinator_with_policy(
+            super::super::replication_config::UnderCapacity::EvictOldest,
+        );
+        coord
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        // Build a file with retention cap = 1 so the sweep
+        // observably retains only the newest entry.
+        use crate::adapter::net::redex::config::RedexFileConfig;
+        use crate::adapter::net::redex::manager::Redex;
+        let r = Redex::new();
+        let cn = ChannelName::new("test/runtime").unwrap();
+        let cfg = RedexFileConfig::default().with_retention_max_events(1);
+        let file = r.open_file(&cn, cfg).unwrap();
+        for i in 0..5 {
+            file.append(format!("event-{i}").as_bytes()).unwrap();
+        }
+        assert_eq!(file.len(), 5);
+
+        handle_disk_pressure(&coord, &file, "test detail", 0x20).await;
+
+        assert_eq!(
+            coord.role(),
+            ReplicaRole::Replica,
+            "EvictOldest preserves Replica role"
+        );
+        assert_eq!(file.len(), 1, "retention sweep dropped to cap of 1");
+        assert_eq!(
+            metrics
+                .under_capacity_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "EvictOldest also bumps under_capacity_total"
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_pressure_withdraw_is_idempotent_on_idle_already() {
+        // Defensive: if the coordinator is already Idle when the
+        // DiskPressureWithdraw fires (race with another path),
+        // the transition path's idempotent `Idle → Idle +
+        // ChannelClose` shortcut doesn't apply (this is
+        // DiskPressureWithdraw, not ChannelClose). The
+        // transition rejects but the counter still bumps.
+        let (coord, metrics) =
+            build_coordinator_with_policy(super::super::replication_config::UnderCapacity::Withdraw);
+        // Coordinator starts in Idle.
+        let file = build_file_for_tests();
+        handle_disk_pressure(&coord, &file, "test detail", 0x20).await;
+        // Counter advanced; role is still Idle (the transition_to
+        // call inside handle_disk_pressure surfaces an error that
+        // we log + drop, so role stays Idle).
+        assert_eq!(coord.role(), ReplicaRole::Idle);
+        assert_eq!(
+            metrics
+                .under_capacity_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+        );
+    }
 }
