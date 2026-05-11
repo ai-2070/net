@@ -6,7 +6,12 @@ use std::fmt;
 /// substrate's blob-fetch path. Variants stay byte-stable across
 /// bindings because they appear in error-routing logic on the
 /// JS / Python / Go sides.
+///
+/// `#[non_exhaustive]` so binding-side FFI sites that match
+/// exhaustively get a compile-time nudge when new variants land,
+/// rather than silently routing unknown errors to a default arm.
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[non_exhaustive]
 pub enum BlobError {
     /// Adapter returned bytes whose BLAKE3 hash did not match the
     /// expected hash carried in the [`super::BlobRef`]. The
@@ -40,6 +45,18 @@ pub enum BlobError {
     /// `BlobRef` encoded form failed to decode (truncated /
     /// corrupted bytes, bad postcard frame, etc.).
     Decode(String),
+    /// Channel's `RedexFileConfig` did not specify a
+    /// `blob_adapter_id` — substrate can't route the BlobRef
+    /// resolve. Operator misconfiguration (vs `AdapterNotRegistered`
+    /// which is a deploy-ordering issue).
+    AdapterNotConfigured,
+    /// Channel's configured `blob_adapter_id` is not present in
+    /// the registry — either an adapter that hasn't been
+    /// registered yet (deploy-ordering race) or one that was
+    /// unregistered. Distinct from `AdapterNotConfigured` so
+    /// operators can tell apart "you forgot to set it" from
+    /// "you didn't register the named adapter yet."
+    AdapterNotRegistered(String),
 }
 
 impl fmt::Display for BlobError {
@@ -57,6 +74,12 @@ impl fmt::Display for BlobError {
             Self::Cancelled => f.write_str("blob fetch cancelled"),
             Self::UnsupportedVersion(v) => write!(f, "blob ref version {} not supported", v),
             Self::Decode(msg) => write!(f, "blob ref decode failed: {}", msg),
+            Self::AdapterNotConfigured => f.write_str(
+                "blob adapter not configured: channel's RedexFileConfig has no blob_adapter_id",
+            ),
+            Self::AdapterNotRegistered(id) => {
+                write!(f, "blob adapter \"{}\" not registered", id)
+            }
         }
     }
 }

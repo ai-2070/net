@@ -62,9 +62,9 @@ Tagged `[B | H | M | L]`:
 | D-28  | M   | greedy       | 5 separate `cache.lock()` acquisitions per dispatch                        | ⏳ |
 | D-29  | M   | gravity      | `should_emit_heat` `inf`-prone with near-zero `prev`                      | ⏳ |
 | D-30  | M   | gravity      | Wire-side `(rate/(rate+1))` saturation at top end                          | ⏳ |
-| D-31  | M   | blob fs      | `BlobError::NotFound(uri)` propagates raw attacker URI → log injection     | ⏳ |
+| D-31  | M   | blob fs      | `BlobError::NotFound(uri)` propagates raw attacker URI → log injection     | ✅ |
 | D-32  | M   | blob fs      | Concurrent stores race on shared `<hash>.tmp` filename                     | ✅ (folded into D-12) |
-| D-33  | M   | blob fs      | No `fsync` of temp file or parent dir before rename — durability gap      | ⏳ |
+| D-33  | M   | blob fs      | No `fsync` of temp file or parent dir before rename — durability gap      | ✅ |
 | D-34  | M   | blob reg     | Process-wide singleton registry; multi-tenant hijack possible              | ⏳ |
 | D-35  | M   | blob adapter | No concurrency bound on `spawn_blocking` calls                             | ⏳ |
 | D-36  | M   | blob conf    | Conformance suite shallow (no idempotency / range / mismatch / parallel)   | ⏳ |
@@ -75,15 +75,15 @@ Tagged `[B | H | M | L]`:
 | D-41  | M   | node cortex  | `DataGravityConfigJs.*_secs/_ms` u32 vs Python u64 vs Go uint64           | ⏳ |
 | D-42  | M   | python blob  | `Py<PyAny>` adapters can outlive interpreter finalization                  | ⏳ |
 | D-43  | M   | python blob  | `data.to_vec()` happens before GIL is released for large payloads          | ⏳ |
-| D-44  | M   | go binding   | Greedy/gravity numeric fields can't express literal `0` via `omitempty`   | ⏳ |
+| D-44  | M   | go binding   | Greedy/gravity numeric fields can't express literal `0` via `omitempty`   | 🚫 won't-fix — substrate rejects 0 for every affected field; `omitempty` is correct |
 | D-45  | M   | go binding   | No RYW surface — `wait_for_token` not exposed                              | ⏳ |
 | D-46  | L   | greedy       | Heat normalization compression at the top end                              | ⏳ |
 | D-47  | L   | greedy       | `metrics.rs` channel-cap race under contention                             | ⏳ |
-| D-48  | L   | greedy       | `_force_use_hashmap` dead allow                                            | ⏳ |
-| D-49  | L   | blob         | `BlobError` not `#[non_exhaustive]`                                       | ⏳ |
-| D-50  | L   | blob redex   | `RedexFileConfig::blob_adapter_id` unset surfaces `UnsupportedScheme`     | ⏳ |
-| D-51  | L   | RYW          | `wait_duration_nanos_sum` u128→u64 saturating cast                         | ⏳ |
-| D-52  | L   | FFI blob     | `OpaqueCtx(AtomicPtr<c_void>)` unnecessary atomicity                       | ⏳ |
+| D-48  | L   | greedy       | `_force_use_hashmap` dead allow                                            | ✅ |
+| D-49  | L   | blob         | `BlobError` not `#[non_exhaustive]`                                       | ✅ |
+| D-50  | L   | blob redex   | `RedexFileConfig::blob_adapter_id` unset surfaces `UnsupportedScheme`     | ✅ |
+| D-51  | L   | RYW          | `wait_duration_nanos_sum` u128→u64 saturating cast                         | ✅ (folded into RYW fix) |
+| D-52  | L   | FFI blob     | `OpaqueCtx(AtomicPtr<c_void>)` unnecessary atomicity                       | ✅ |
 | D-53  | L   | node blob    | Adapter `timeout` not user-tunable                                         | ⏳ |
 | D-54  | L   | go binding   | `runtime.SetFinalizer` runs blocking `Close` on GC thread                  | ⏳ |
 

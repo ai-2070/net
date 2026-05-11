@@ -58,6 +58,33 @@ fn backend(e: impl std::fmt::Display) -> BlobError {
     BlobError::Backend(e.to_string())
 }
 
+/// Render a URI for inclusion in a `BlobError::NotFound` string in
+/// a form safe to log. The URI is publisher-controlled bytes — raw
+/// newlines / ANSI escapes / NULs propagated into telemetry sinks
+/// (Splunk, journald, JS console) cause log-line splicing or
+/// terminal-escape injection. Sanitisation: control chars (`< 0x20`
+/// and `0x7F`) escape to `\xNN`, length caps at 256 bytes.
+fn sanitize_uri_for_error(uri: &str) -> String {
+    const MAX_LEN: usize = 256;
+    let trimmed = if uri.len() > MAX_LEN {
+        &uri[..MAX_LEN]
+    } else {
+        uri
+    };
+    let mut out = String::with_capacity(trimmed.len());
+    for c in trimmed.chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\x{:02X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    if uri.len() > MAX_LEN {
+        out.push_str("…");
+    }
+    out
+}
+
 #[async_trait]
 impl BlobAdapter for FileSystemAdapter {
     fn adapter_id(&self) -> &str {
@@ -108,7 +135,17 @@ impl BlobAdapter for FileSystemAdapter {
                 .to_owned();
             name.push(format!(".{}-{}-{}.tmp", std::process::id(), counter, nanos));
             tmp.set_file_name(name);
-            std::fs::write(&tmp, &bytes).map_err(backend)?;
+            // Write + fsync the temp file before renaming so a
+            // power loss between rename and the next OS flush
+            // cannot leave a zero-length canonical file. Caller's
+            // BlobAdapter::store contract implies durability on
+            // successful return.
+            {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&tmp).map_err(backend)?;
+                f.write_all(&bytes).map_err(backend)?;
+                f.sync_all().map_err(backend)?;
+            }
             // On Windows rename over an existing file historically
             // fails; treat that as a benign "another writer beat us"
             // and clean up the temp (the canonical path already
@@ -120,6 +157,17 @@ impl BlobAdapter for FileSystemAdapter {
                 }
                 Err(e) => return Err(backend(e)),
             }
+            // fsync the parent dir so the rename is durable too.
+            // Errors here aren't worth failing the store over — the
+            // bytes are on disk; the dir entry is the only thing
+            // not yet flushed, and the OS will flush on its own
+            // schedule. Log via the Backend variant? No — best-
+            // effort, swallow.
+            if let Some(parent) = path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
             Ok(())
         })
         .await
@@ -128,7 +176,7 @@ impl BlobAdapter for FileSystemAdapter {
 
     async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
         let path = self.path_for(&blob_ref.hash);
-        let uri = blob_ref.uri.clone();
+        let uri = sanitize_uri_for_error(&blob_ref.uri);
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>, BlobError> {
             match std::fs::read(&path) {
                 Ok(bytes) => Ok(bytes),
@@ -167,7 +215,7 @@ impl BlobAdapter for FileSystemAdapter {
             )));
         }
         let path = self.path_for(&blob_ref.hash);
-        let uri = blob_ref.uri.clone();
+        let uri = sanitize_uri_for_error(&blob_ref.uri);
         let start = range.start;
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>, BlobError> {
             let mut f = match std::fs::File::open(&path) {

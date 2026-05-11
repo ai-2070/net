@@ -46,6 +46,10 @@ pub const NET_ERR_BLOB_BACKEND: c_int = -115;
 /// `BlobRef::UnsupportedScheme` — used for both "unknown URI scheme"
 /// and "channel pointing at an unregistered adapter id".
 pub const NET_ERR_BLOB_UNSUPPORTED_SCHEME: c_int = -116;
+/// Channel has no `blob_adapter_id` configured.
+pub const NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED: c_int = -118;
+/// Configured `blob_adapter_id` is not in the registry.
+pub const NET_ERR_BLOB_ADAPTER_NOT_REGISTERED: c_int = -119;
 /// Panic surfaced from inside a user-installed adapter callback
 /// (or anywhere on the FFI body). The substrate catches it with
 /// `catch_unwind` and reports this code rather than unwinding
@@ -94,6 +98,8 @@ fn err_to_code(e: &InnerBlobError) -> c_int {
         InnerBlobError::UnsupportedScheme(_) => NET_ERR_BLOB_UNSUPPORTED_SCHEME,
         InnerBlobError::UnsupportedVersion(_) => NET_ERR_BLOB_DECODE,
         InnerBlobError::Decode(_) => NET_ERR_BLOB_DECODE,
+        InnerBlobError::AdapterNotConfigured => NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED,
+        InnerBlobError::AdapterNotRegistered(_) => NET_ERR_BLOB_ADAPTER_NOT_REGISTERED,
     }
 }
 
@@ -340,7 +346,6 @@ fn _force_use() -> *mut c_void {
 use std::ops::Range;
 
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicPtr, Ordering as AtomicOrdering};
 
 /// `store` function pointer. Caller-allocates nothing; returns
 /// `0` on success or a negative `c_int` on failure.
@@ -413,18 +418,26 @@ pub struct NetBlobAdapterVtable {
     pub free_buffer: NetBlobAdapterFreeFn,
 }
 
-/// Opaque caller-context pointer. The caller is responsible for
-/// thread-safety; the substrate just shuttles it across calls.
-/// `AtomicPtr` provides `Send + Sync` without requiring the
-/// pointee to be either.
-struct OpaqueCtx(AtomicPtr<c_void>);
+/// Opaque caller-context pointer. The pointer is set once at
+/// adapter registration and never mutated; the caller is
+/// responsible for the pointee's thread-safety, the substrate
+/// just shuttles it across calls. `Send + Sync` are asserted
+/// unconditionally — the C-side caller is the trust boundary
+/// for cross-thread access to whatever the pointer references.
+struct OpaqueCtx(*mut c_void);
+
+// SAFETY: opaque-pointer transport. Cross-thread coherence of the
+// pointee is the C-side caller's responsibility; the substrate
+// only reads and forwards the same address verbatim.
+unsafe impl Send for OpaqueCtx {}
+unsafe impl Sync for OpaqueCtx {}
 
 impl OpaqueCtx {
     fn new(ptr: *mut c_void) -> Self {
-        Self(AtomicPtr::new(ptr))
+        Self(ptr)
     }
     fn get(&self) -> *mut c_void {
-        self.0.load(AtomicOrdering::Acquire)
+        self.0
     }
 }
 

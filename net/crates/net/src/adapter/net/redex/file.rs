@@ -1079,20 +1079,10 @@ impl RedexFile {
                     .config
                     .blob_adapter_id
                     .as_deref()
-                    .ok_or_else(|| {
-                        BlobError::UnsupportedScheme(format!(
-                            "channel has no blob_adapter_id; URI was {}",
-                            blob.uri
-                        ))
-                    })?;
+                    .ok_or(BlobError::AdapterNotConfigured)?;
                 let adapter = global_blob_adapter_registry()
                     .get(adapter_id)
-                    .ok_or_else(|| {
-                        BlobError::UnsupportedScheme(format!(
-                            "blob_adapter_id {:?} not registered",
-                            adapter_id
-                        ))
-                    })?;
+                    .ok_or_else(|| BlobError::AdapterNotRegistered(adapter_id.to_string()))?;
                 let fetched = adapter.fetch(&blob).await?;
                 blob.verify(&fetched)?;
                 Ok(Some(bytes::Bytes::from(fetched)))

@@ -23,7 +23,6 @@
 //! | `dataforts_greedy_admit_rejected_total` | counter | `reason` (`scope`/`intent`/`colocation`/`capacity`) |
 //! | `dataforts_greedy_io_budget_used_bytes` | gauge | — |
 
-use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -513,13 +512,6 @@ fn escape_label(s: &str) -> String {
         }
     }
     out
-}
-
-// Suppress unused-import lint when the registry is constructed
-// elsewhere — currently the runtime in slice 4 picks this up.
-#[allow(dead_code)]
-fn _force_use_hashmap() -> HashMap<&'static str, &'static str> {
-    HashMap::new()
 }
 
 #[cfg(test)]
