@@ -15,10 +15,14 @@
 //! adapters need a separate dispatcher because the trait is `async`
 //! end-to-end (placement is sync).
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 
 use ::net::adapter::net::dataforts::{
@@ -192,4 +196,261 @@ pub async fn blob_resolve(adapter_id: String, payload: Buffer) -> Result<Buffer>
         .await
         .map_err(map_blob_err)?;
     Ok(Buffer::from(bytes))
+}
+
+// =========================================================================
+// JS-implemented BlobAdapter — TSFN bridge
+// =========================================================================
+
+/// Per-call timeout for any TSFN method on a JS-implemented blob
+/// adapter. JS work runs on the Node event loop; a slow / blocked
+/// loop should not hang the substrate forever. Operators that
+/// genuinely need longer call budgets can register a
+/// Rust-backed adapter instead.
+const DEFAULT_JS_ADAPTER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Args handed to the JS `store` function.
+#[napi(object)]
+pub struct JsBlobStoreArgs {
+    pub uri: String,
+    pub hash: Buffer,
+    pub size: BigInt,
+    pub data: Buffer,
+}
+
+/// Args handed to the JS `fetch` / `exists` functions.
+#[napi(object)]
+pub struct JsBlobFetchArgs {
+    pub uri: String,
+    pub hash: Buffer,
+    pub size: BigInt,
+}
+
+/// Args handed to the JS `fetchRange` function.
+#[napi(object)]
+pub struct JsBlobFetchRangeArgs {
+    pub uri: String,
+    pub hash: Buffer,
+    pub size: BigInt,
+    pub start: BigInt,
+    pub end: BigInt,
+}
+
+type StoreTsfn =
+    ThreadsafeFunction<JsBlobStoreArgs, (), JsBlobStoreArgs, napi::Status, false>;
+type FetchTsfn =
+    ThreadsafeFunction<JsBlobFetchArgs, Buffer, JsBlobFetchArgs, napi::Status, false>;
+type FetchRangeTsfn =
+    ThreadsafeFunction<JsBlobFetchRangeArgs, Buffer, JsBlobFetchRangeArgs, napi::Status, false>;
+type ExistsTsfn =
+    ThreadsafeFunction<JsBlobFetchArgs, bool, JsBlobFetchArgs, napi::Status, false>;
+
+/// `BlobAdapter` impl that bridges to JS-side functions via four
+/// TSFNs (one per trait method). Each call posts work onto the
+/// Node event loop and awaits its return via a `tokio::oneshot`
+/// channel, so the substrate's tokio worker doesn't block on the
+/// Node thread.
+pub struct NodeBlobAdapter {
+    id: String,
+    store: StoreTsfn,
+    fetch: FetchTsfn,
+    fetch_range: FetchRangeTsfn,
+    exists: ExistsTsfn,
+    timeout: Duration,
+}
+
+impl NodeBlobAdapter {
+    pub fn new(
+        id: String,
+        store: StoreTsfn,
+        fetch: FetchTsfn,
+        fetch_range: FetchRangeTsfn,
+        exists: ExistsTsfn,
+    ) -> Self {
+        Self {
+            id,
+            store,
+            fetch,
+            fetch_range,
+            exists,
+            timeout: DEFAULT_JS_ADAPTER_TIMEOUT,
+        }
+    }
+}
+
+async fn await_tsfn<T, F>(
+    timeout: Duration,
+    label: &'static str,
+    enqueue: F,
+) -> std::result::Result<T, InnerBlobError>
+where
+    T: Send + 'static,
+    F: FnOnce(
+        Box<dyn FnOnce(napi::Result<T>) + Send>,
+    ) -> napi::Status,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<T>>();
+    let callback: Box<dyn FnOnce(napi::Result<T>) + Send> = Box::new(move |ret| {
+        let _ = tx.send(ret);
+    });
+    let status = enqueue(callback);
+    if status != napi::Status::Ok {
+        return Err(InnerBlobError::Backend(format!(
+            "{}: TSFN enqueue status {:?}",
+            label, status
+        )));
+    }
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(e))) => Err(InnerBlobError::Backend(format!("{}: JS error: {}", label, e))),
+        Ok(Err(_)) => Err(InnerBlobError::Backend(format!(
+            "{}: TSFN callback channel disconnected",
+            label
+        ))),
+        Err(_) => Err(InnerBlobError::Backend(format!(
+            "{}: JS did not respond within {} ms",
+            label,
+            timeout.as_millis()
+        ))),
+    }
+}
+
+fn js_blob_ref_parts(blob_ref: &InnerBlobRef) -> (String, Buffer, BigInt) {
+    (
+        blob_ref.uri.clone(),
+        Buffer::from(blob_ref.hash.to_vec()),
+        BigInt::from(blob_ref.size),
+    )
+}
+
+#[async_trait]
+impl BlobAdapter for NodeBlobAdapter {
+    fn adapter_id(&self) -> &str {
+        &self.id
+    }
+
+    async fn store(
+        &self,
+        blob_ref: &InnerBlobRef,
+        bytes: &[u8],
+    ) -> std::result::Result<(), InnerBlobError> {
+        let (uri, hash, size) = js_blob_ref_parts(blob_ref);
+        let args = JsBlobStoreArgs {
+            uri,
+            hash,
+            size,
+            data: Buffer::from(bytes.to_vec()),
+        };
+        await_tsfn(self.timeout, "store", |cb| {
+            self.store.call_with_return_value(
+                args,
+                ThreadsafeFunctionCallMode::NonBlocking,
+                move |ret, _env| {
+                    cb(ret);
+                    Ok(())
+                },
+            )
+        })
+        .await
+    }
+
+    async fn fetch(
+        &self,
+        blob_ref: &InnerBlobRef,
+    ) -> std::result::Result<Vec<u8>, InnerBlobError> {
+        let (uri, hash, size) = js_blob_ref_parts(blob_ref);
+        let args = JsBlobFetchArgs { uri, hash, size };
+        let buf = await_tsfn::<Buffer, _>(self.timeout, "fetch", |cb| {
+            self.fetch.call_with_return_value(
+                args,
+                ThreadsafeFunctionCallMode::NonBlocking,
+                move |ret, _env| {
+                    cb(ret);
+                    Ok(())
+                },
+            )
+        })
+        .await?;
+        Ok(buf.to_vec())
+    }
+
+    async fn fetch_range(
+        &self,
+        blob_ref: &InnerBlobRef,
+        range: Range<u64>,
+    ) -> std::result::Result<Vec<u8>, InnerBlobError> {
+        let (uri, hash, size) = js_blob_ref_parts(blob_ref);
+        let args = JsBlobFetchRangeArgs {
+            uri,
+            hash,
+            size,
+            start: BigInt::from(range.start),
+            end: BigInt::from(range.end),
+        };
+        let buf = await_tsfn::<Buffer, _>(self.timeout, "fetch_range", |cb| {
+            self.fetch_range.call_with_return_value(
+                args,
+                ThreadsafeFunctionCallMode::NonBlocking,
+                move |ret, _env| {
+                    cb(ret);
+                    Ok(())
+                },
+            )
+        })
+        .await?;
+        Ok(buf.to_vec())
+    }
+
+    async fn exists(
+        &self,
+        blob_ref: &InnerBlobRef,
+    ) -> std::result::Result<bool, InnerBlobError> {
+        let (uri, hash, size) = js_blob_ref_parts(blob_ref);
+        let args = JsBlobFetchArgs { uri, hash, size };
+        await_tsfn(self.timeout, "exists", |cb| {
+            self.exists.call_with_return_value(
+                args,
+                ThreadsafeFunctionCallMode::NonBlocking,
+                move |ret, _env| {
+                    cb(ret);
+                    Ok(())
+                },
+            )
+        })
+        .await
+    }
+}
+
+/// Register a JS-implemented BlobAdapter. The four function args
+/// MUST be sync JS functions returning the per-method shape:
+///
+/// - `storeFn({ uri, hash, size, data }) -> void`
+/// - `fetchFn({ uri, hash, size }) -> Buffer`
+/// - `fetchRangeFn({ uri, hash, size, start, end }) -> Buffer`
+/// - `existsFn({ uri, hash, size }) -> boolean`
+///
+/// JS-thrown errors collapse to `BlobError::Backend(err)`. Per-call
+/// timeout defaults to 30 s; longer-running adapters should be
+/// implemented in Rust.
+///
+/// Async JS adapter methods (returning Promises) are a follow-up
+/// slice — requires the TSFN-then-await-Promise dispatcher that
+/// the placement-filter bridge did not need.
+#[napi]
+pub fn register_blob_adapter(
+    id: String,
+    store_fn: Function<'static, JsBlobStoreArgs, ()>,
+    fetch_fn: Function<'static, JsBlobFetchArgs, Buffer>,
+    fetch_range_fn: Function<'static, JsBlobFetchRangeArgs, Buffer>,
+    exists_fn: Function<'static, JsBlobFetchArgs, bool>,
+) -> Result<()> {
+    let store: StoreTsfn = store_fn.build_threadsafe_function().build()?;
+    let fetch: FetchTsfn = fetch_fn.build_threadsafe_function().build()?;
+    let fetch_range: FetchRangeTsfn = fetch_range_fn.build_threadsafe_function().build()?;
+    let exists: ExistsTsfn = exists_fn.build_threadsafe_function().build()?;
+    let wrapper = NodeBlobAdapter::new(id.clone(), store, fetch, fetch_range, exists);
+    let arc: Arc<dyn BlobAdapter> = Arc::new(wrapper);
+    global_blob_adapter_registry()
+        .register(arc)
+        .map_err(|e| blob_err("register_blob_adapter", e))
 }
