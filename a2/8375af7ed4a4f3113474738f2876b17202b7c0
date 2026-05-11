@@ -1,0 +1,40 @@
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  s_3a0a24a47d1a36::t_b0231e9dd99b51 702
+  s_3a0a24a47d1a36::t_56cd271790dbe4 855
+  s_3a0a24a47d1a36::t_aa821d61a5b234 1170,1215,1263
+  s_3a0a24a47d1a36::t_97d82e1c8c01d8 549,552
+  s_3a0a24a47d1a36::t_6e0dcff74e673d 461
+  s_3a0a24a47d1a36::t_e0c801605a30a1 129-130,133
+  s_3a0a24a47d1a36::t_94108256702d95 680,683
+net/crates/net/src/adapter/net/mesh.rs
+  s_3a0a24a47d1a36::t_1a8dad3a2e417e 3767-3784,3797-3802
+  s_3a0a24a47d1a36::t_6bc5600e60bf01 6085-6093
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_0f668d31edfe15 73
+  s_3a0a24a47d1a36::t_054a476c5081da 87
+  s_3a0a24a47d1a36::t_0e3a5d5799204b 81
+  s_3a0a24a47d1a36::t_2865ebf5e3ae91 88
+  s_3a0a24a47d1a36::t_39641f0950cfc1 76
+net/crates/net/src/adapter/net/cortex/config.rs
+  s_3a0a24a47d1a36::t_cc8171da45b9f7 40-50,59-64,72,95-99
+net/crates/net/src/adapter/net/cortex/mod.rs
+  s_3a0a24a47d1a36::t_441fc8f2296431 35
+net/crates/net/src/adapter/net/pool.rs
+  s_3a0a24a47d1a36::t_78dea82a9a558c 911-924
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "a28375af7ed4a4f3113474738f2876b17202b7c0",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
