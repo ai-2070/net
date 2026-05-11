@@ -21,6 +21,7 @@ mod admission;
 mod cache;
 mod config;
 mod metrics;
+mod runtime;
 
 pub use admission::{should_admit, AdmissionInputs, AdmissionVerdict};
 pub use cache::{EvictionSweep, GreedyCacheEntry, GreedyCacheRegistry};
@@ -34,6 +35,7 @@ pub use metrics::{
     GreedyClusterMetricsAtomic, GreedyMetricsRegistry, GreedyMetricsSnapshot,
     MAX_TRACKED_CHANNELS as MAX_METRIC_TRACKED_CHANNELS, OVERFLOW_CHANNEL_LABEL,
 };
+pub use runtime::{DispatchOutcome, GreedyRuntime};
 
 // Re-exported from the substrate so callers can compose against a
 // single `dataforts::greedy::` import root rather than reaching
