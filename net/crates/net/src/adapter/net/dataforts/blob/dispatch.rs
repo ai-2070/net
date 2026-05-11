@@ -68,6 +68,40 @@ pub async fn resolve_payload<A: BlobAdapter + ?Sized>(
     }
 }
 
+/// Write `bytes` to `adapter` and return the encoded [`BlobRef`]
+/// the caller should publish (via `RedexFile::append`,
+/// `MeshNode::publish`, or any path that takes raw event-payload
+/// bytes). The substrate computes the BLAKE3 hash, so the
+/// returned ref is guaranteed to verify against the stored
+/// content when later fetched through [`resolve_payload`].
+///
+/// The returned `Vec<u8>` is the encoded form, ready to use as an
+/// event payload. Callers wanting the structured `BlobRef` can use
+/// [`publish_blob_ref`] instead.
+pub async fn publish_blob<A: BlobAdapter + ?Sized>(
+    adapter: &A,
+    uri: impl Into<String>,
+    bytes: &[u8],
+) -> Result<Vec<u8>, BlobError> {
+    let blob = publish_blob_ref(adapter, uri, bytes).await?;
+    Ok(blob.encode())
+}
+
+/// Same as [`publish_blob`], but returns the structured
+/// [`BlobRef`] instead of the encoded form. Useful when the caller
+/// wants to surface the URI / hash / size separately (e.g. for
+/// telemetry or a side-channel index).
+pub async fn publish_blob_ref<A: BlobAdapter + ?Sized>(
+    adapter: &A,
+    uri: impl Into<String>,
+    bytes: &[u8],
+) -> Result<BlobRef, BlobError> {
+    let hash: [u8; 32] = blake3::hash(bytes).into();
+    let blob = BlobRef::new(uri, hash, bytes.len() as u64);
+    adapter.store(&blob, bytes).await?;
+    Ok(blob)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +173,64 @@ mod tests {
         let encoded = blob.encode();
         let resolved = resolve_payload(&encoded, &adapter).await.unwrap();
         assert_eq!(resolved, payload);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn publish_blob_round_trips_through_resolve_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "net-blob-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let adapter = FileSystemAdapter::new("publish-test", &root);
+        let payload = b"write side equivalent of resolve_payload";
+
+        // publish_blob returns the encoded BlobRef as bytes.
+        let encoded = publish_blob(&adapter, "fs://published", payload)
+            .await
+            .unwrap();
+        // First byte is the discriminator.
+        assert_eq!(encoded[0], crate::adapter::net::dataforts::blob::BLOB_REF_DISCRIMINATOR);
+
+        // resolve_payload turns the encoded form back into the
+        // original bytes via fetch + verify.
+        let resolved = resolve_payload(&encoded, &adapter).await.unwrap();
+        assert_eq!(resolved, payload);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn publish_blob_ref_returns_structured_ref() {
+        let root = std::env::temp_dir().join(format!(
+            "net-blob-publish-ref-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let adapter = FileSystemAdapter::new("publish-ref", &root);
+        let payload = b"explicit ref shape";
+
+        let blob = publish_blob_ref(&adapter, "fs://structured", payload)
+            .await
+            .unwrap();
+        // Hash is BLAKE3 of the payload.
+        let expected: [u8; 32] = blake3::hash(payload).into();
+        assert_eq!(blob.hash, expected);
+        assert_eq!(blob.size, payload.len() as u64);
+        assert_eq!(blob.uri, "fs://structured");
+
+        // Stored content is fetchable + verifies.
+        let fetched = adapter.fetch(&blob).await.unwrap();
+        assert_eq!(fetched, payload);
+        blob.verify(&fetched).unwrap();
 
         let _ = std::fs::remove_dir_all(&root);
     }
