@@ -25,4 +25,25 @@ pub trait HeatSink: Send + Sync {
     /// Idempotent. Peers drop the heat annotation; the chain's
     /// `causal:` advertisements stay.
     async fn withdraw_heat(&self, origin_hash: u64) -> Result<(), AdapterError>;
+
+    /// Apply a batch of `(origin_hash, Option<rate>)` updates in a
+    /// single round-trip. `Some(rate)` is emit/replace; `None` is
+    /// withdraw. The gravity tick uses this to coalesce per-chain
+    /// emissions into one capability rebroadcast — without it the
+    /// per-tick wire cost was O(n_chains × n_tags).
+    ///
+    /// Default impl falls back to the per-chain methods so existing
+    /// `HeatSink` impls keep working; production impls override.
+    async fn announce_heat_batch(
+        &self,
+        updates: &[(u64, Option<f64>)],
+    ) -> Result<(), AdapterError> {
+        for &(origin_hash, rate_opt) in updates {
+            match rate_opt {
+                Some(rate) => self.announce_heat(origin_hash, rate).await?,
+                None => self.withdraw_heat(origin_hash).await?,
+            }
+        }
+        Ok(())
+    }
 }

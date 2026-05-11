@@ -405,6 +405,12 @@ impl GreedyRuntime {
             let emissions = gravity.heat.lock().tick(&gravity.policy, now);
             (gravity.sink.clone(), emissions)
         };
+        // Coalesce the per-chain emissions into one
+        // (origin_hash, Option<rate>) vector and submit through
+        // the sink's batch path. The sink's default impl falls
+        // back to per-chain calls; the MeshNode impl rewrites the
+        // full capability set once and rebroadcasts once.
+        let mut batch: Vec<(u64, Option<f64>)> = Vec::new();
         for (origin_hash, emission) in emissions {
             match emission {
                 super::super::gravity::HeatEmission::Suppress => {}
@@ -414,23 +420,20 @@ impl GreedyRuntime {
                     // substrate clamps anyway but normalize here
                     // so the per-tick value is interpretable.
                     let normalized = (rate / (rate + 1.0)).min(1.0);
-                    if let Err(e) = sink.announce_heat(origin_hash, normalized).await {
-                        tracing::trace!(
-                            origin_hash = origin_hash,
-                            error = ?e,
-                            "gravity: announce_heat failed"
-                        );
-                    }
+                    batch.push((origin_hash, Some(normalized)));
                 }
                 super::super::gravity::HeatEmission::Withdraw => {
-                    if let Err(e) = sink.withdraw_heat(origin_hash).await {
-                        tracing::trace!(
-                            origin_hash = origin_hash,
-                            error = ?e,
-                            "gravity: withdraw_heat failed"
-                        );
-                    }
+                    batch.push((origin_hash, None));
                 }
+            }
+        }
+        if !batch.is_empty() {
+            if let Err(e) = sink.announce_heat_batch(&batch).await {
+                tracing::trace!(
+                    error = ?e,
+                    batch_len = batch.len(),
+                    "gravity: announce_heat_batch failed"
+                );
             }
         }
     }

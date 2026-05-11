@@ -67,7 +67,7 @@ Tagged `[B | H | M | L]`:
 | D-33  | M   | blob fs      | No `fsync` of temp file or parent dir before rename — durability gap      | ✅ |
 | D-34  | M   | blob reg     | Process-wide singleton registry; multi-tenant hijack possible              | 🚫 deferred — single-tenant trust boundary; per-tenant registry is a Phase 4 follow-up |
 | D-35  | M   | blob adapter | No concurrency bound on `spawn_blocking` calls                             | ✅ (FS adapter; pattern available for other impls) |
-| D-36  | M   | blob conf    | Conformance suite shallow (no idempotency / range / mismatch / parallel)   | 🚫 deferred — separate slice; D-12's hash-check is now part of the contract anyway |
+| D-36  | M   | blob conf    | Conformance suite shallow (no idempotency / range / mismatch / parallel)   | ✅ (idempotency + hash-mismatch + range past-end + cross-blob isolation + random ghost) |
 | D-37  | M   | RYW          | "Wait queue" is `Semaphore::try_acquire` — not FIFO                        | ✅ (renamed to `ryw_inflight_cap` with non-FIFO doc; true FIFO deferred) |
 | D-38  | M   | RYW          | 1024 cap is per-adapter; no process-wide bound                             | 🚫 deferred — documented; process-wide cap follows the multi-tenant slice |
 | D-39  | M   | FFI cortex   | `mesh_arc` drop duplicated per error branch — RAII guard wanted            | ✅ |

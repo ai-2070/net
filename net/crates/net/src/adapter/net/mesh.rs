@@ -6531,6 +6531,49 @@ impl MeshNode {
         Self::replace_heat_tags(&mut snapshot, origin_hash, None);
         self.announce_capabilities(snapshot).await
     }
+
+    /// Apply a batch of heat emissions in a single
+    /// `announce_capabilities` round-trip. Each update is one of:
+    /// - `Some(rate)`: replace this chain's `heat:` tag with
+    ///   `heat:<hex>=<clamped rate>`.
+    /// - `None`: withdraw every `heat:` annotation for this chain.
+    ///
+    /// Used by `gravity_tick` to coalesce per-chain emissions. The
+    /// previous single-shot per-chain `announce_heat` loop rebroadcast
+    /// the full capability set N times per tick — O(n_chains² × n_tags)
+    /// wire work on a busy node. This batch path mutates the snapshot
+    /// once and rebroadcasts once.
+    ///
+    /// Non-finite rates skip silently (with a trace log).
+    #[cfg(feature = "dataforts")]
+    pub async fn announce_heat_batch(
+        &self,
+        updates: &[(u64, Option<f64>)],
+    ) -> Result<(), AdapterError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut snapshot = self.user_caps_snapshot();
+        for &(origin_hash, rate_opt) in updates {
+            let replacement = match rate_opt {
+                Some(rate) if rate.is_finite() => {
+                    let hex = Self::chain_hex(origin_hash);
+                    let clamped = rate.clamp(0.0, 1.0);
+                    Tag::parse(&format!("heat:{hex}={clamped:.2}")).ok()
+                }
+                Some(_) => {
+                    tracing::trace!(
+                        origin_hash = origin_hash,
+                        "heat: non-finite rate skipped in batch"
+                    );
+                    continue;
+                }
+                None => None,
+            };
+            Self::replace_heat_tags(&mut snapshot, origin_hash, replacement);
+        }
+        self.announce_capabilities(snapshot).await
+    }
 }
 
 #[cfg(feature = "dataforts")]
@@ -6542,6 +6585,13 @@ impl super::dataforts::HeatSink for MeshNode {
 
     async fn withdraw_heat(&self, origin_hash: u64) -> Result<(), AdapterError> {
         MeshNode::withdraw_heat(self, origin_hash).await
+    }
+
+    async fn announce_heat_batch(
+        &self,
+        updates: &[(u64, Option<f64>)],
+    ) -> Result<(), AdapterError> {
+        MeshNode::announce_heat_batch(self, updates).await
     }
 }
 
