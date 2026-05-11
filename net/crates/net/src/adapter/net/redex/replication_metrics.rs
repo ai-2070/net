@@ -63,6 +63,14 @@ pub const OVERFLOW_CHANNEL_LABEL: &str = "__overflow__";
 /// metric until the first observation.
 const LAG_NOT_OBSERVED: u64 = u64::MAX;
 
+/// R-34: saturating value for `Duration → micros` overflow.
+/// `Duration::as_micros()` is a `u128`; values above `u64::MAX`
+/// micros (~584,554 years) are theoretically representable. We
+/// clamp to one below the sentinel so the saturated case never
+/// collides with `LAG_NOT_OBSERVED`. Named explicitly so tests can
+/// pin the gap-from-sentinel invariant.
+const LAG_SATURATED_MICROS: u64 = LAG_NOT_OBSERVED - 1;
+
 /// Atomic per-channel counter set. All fields use relaxed ordering
 /// — the metrics path is observability-only; lost updates under
 /// extreme contention are acceptable.
@@ -115,9 +123,9 @@ impl ChannelMetricsAtomic {
 
     /// Record the leader's current view of `tail_seq` lag.
     pub fn record_leader_lag(&self, lag: std::time::Duration) {
-        let micros = u64::try_from(lag.as_micros()).unwrap_or(u64::MAX - 1);
+        let micros = u64::try_from(lag.as_micros()).unwrap_or(LAG_SATURATED_MICROS);
         let stored = if micros == LAG_NOT_OBSERVED {
-            LAG_NOT_OBSERVED - 1
+            LAG_SATURATED_MICROS
         } else {
             micros
         };
@@ -126,9 +134,9 @@ impl ChannelMetricsAtomic {
 
     /// Record the replica's current view of `tail_seq` lag.
     pub fn record_replica_lag(&self, lag: std::time::Duration) {
-        let micros = u64::try_from(lag.as_micros()).unwrap_or(u64::MAX - 1);
+        let micros = u64::try_from(lag.as_micros()).unwrap_or(LAG_SATURATED_MICROS);
         let stored = if micros == LAG_NOT_OBSERVED {
-            LAG_NOT_OBSERVED - 1
+            LAG_SATURATED_MICROS
         } else {
             micros
         };
@@ -718,5 +726,28 @@ mod tests {
             c.leader_lag_seconds.is_some(),
             "lag must be Some even at saturation"
         );
+    }
+
+    /// R-34: pin the gap between LAG_SATURATED_MICROS and
+    /// LAG_NOT_OBSERVED so a future change to the saturation
+    /// constant can't accidentally collide with the sentinel.
+    #[test]
+    fn lag_saturated_constant_does_not_collide_with_sentinel() {
+        assert_ne!(LAG_SATURATED_MICROS, LAG_NOT_OBSERVED);
+        assert_eq!(
+            LAG_NOT_OBSERVED - LAG_SATURATED_MICROS,
+            1,
+            "saturation value must be exactly one below the sentinel"
+        );
+        // And a Duration::MAX recording resolves to the saturated
+        // value (which is observable, not the sentinel).
+        let reg = ReplicationMetricsRegistry::new();
+        let m = reg.for_channel("sentinel-gap");
+        m.record_leader_lag(Duration::MAX);
+        let raw = m
+            .leader_lag_micros
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(raw, LAG_SATURATED_MICROS);
+        assert_ne!(raw, LAG_NOT_OBSERVED);
     }
 }

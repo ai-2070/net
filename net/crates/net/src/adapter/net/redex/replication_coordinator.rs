@@ -667,7 +667,10 @@ mod tests {
                 let n = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
                 self.max_in_flight.fetch_max(n, AtomicOrdering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                self.calls.lock().await.push(SinkCall::Withdraw { origin_hash });
+                self.calls
+                    .lock()
+                    .await
+                    .push(SinkCall::Withdraw { origin_hash });
                 self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
                 Ok(())
             }

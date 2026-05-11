@@ -24,7 +24,7 @@ mod fold;
 mod index;
 mod manager;
 mod ordered;
-pub mod replication;
+mod replication;
 mod replication_budget;
 mod replication_catchup;
 mod replication_config;

@@ -1689,7 +1689,15 @@ mod tests {
             )
             .await
             .unwrap();
-        on_inbound(&inputs, &coordinator, &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>), &Arc::new(Mutex::new(HeartbeatTracker::new(100))), &budget, event).await;
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &Arc::new(Mutex::new(HeartbeatTracker::new(100))),
+            &budget,
+            event,
+        )
+        .await;
         let nacks = dispatcher.sync_nacks.lock().clone();
         assert_eq!(nacks.len(), 1, "expected one NotLeader NACK");
         let (target, nack) = &nacks[0];
@@ -1740,7 +1748,15 @@ mod tests {
                 chunk_max: 1024,
             },
         };
-        on_inbound(&inputs, &coordinator, &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>), &Arc::new(Mutex::new(HeartbeatTracker::new(100))), &budget, event).await;
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &Arc::new(Mutex::new(HeartbeatTracker::new(100))),
+            &budget,
+            event,
+        )
+        .await;
         assert!(
             dispatcher.sync_nacks.lock().is_empty(),
             "no NACK on wrong-channel — silently dropped"
@@ -1762,7 +1778,10 @@ mod tests {
         let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
         let dispatcher = Arc::new(RecorderDispatcher::default());
         let handle = spawn_replication_runtime(inputs, coordinator, dispatcher, build_budget());
-        assert!(!handle.is_stopped(), "fresh runtime must report not stopped");
+        assert!(
+            !handle.is_stopped(),
+            "fresh runtime must report not stopped"
+        );
         handle.cancel().await;
         assert!(
             handle.is_stopped(),
@@ -1793,12 +1812,9 @@ mod tests {
         let budget = build_budget();
         let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
         // Seed the tracker with a believed leader heartbeat.
-        tracker.lock().record_heartbeat(
-            0x20,
-            ReplicaRole::Leader,
-            99,
-            Instant::now(),
-        );
+        tracker
+            .lock()
+            .record_heartbeat(0x20, ReplicaRole::Leader, 99, Instant::now());
         assert_eq!(tracker.lock().believed_leader(), Some(0x20));
         // NACK NotLeader from the believed leader.
         let event = Inbound::SyncNack {

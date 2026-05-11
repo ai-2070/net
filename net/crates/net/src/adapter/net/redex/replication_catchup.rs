@@ -242,9 +242,7 @@ pub fn handle_sync_request(
                 error_code: SyncNackError::BadRange,
                 detail: format!(
                     "event at seq {} exceeds hard ceiling ({} bytes > {})",
-                    ev.entry.seq,
-                    cost,
-                    CHUNK_MAX_HARD_CEILING_BYTES,
+                    ev.entry.seq, cost, CHUNK_MAX_HARD_CEILING_BYTES,
                 ),
             };
         }

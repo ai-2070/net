@@ -319,10 +319,7 @@ impl VirtualCluster {
                 // R-9: derive wall_clock_ms from the step counter
                 // (via `self.now - self.initial_now`), not from real
                 // wall-clock — so the harness stays deterministic.
-                wall_clock_ms: self
-                    .now
-                    .duration_since(self.initial_now)
-                    .as_millis() as u64,
+                wall_clock_ms: self.now.duration_since(self.initial_now).as_millis() as u64,
                 chunk_max_bytes: DST_CHUNK_MAX_BYTES,
                 now: self.now,
             })

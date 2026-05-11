@@ -55,9 +55,9 @@ Tagged `[H | M | L]`:
 | R-30  | M   | go binding  | `OpenFile` returns `ErrReplicationRequiresEnable` for any redex error     | ✅ |
 | R-31  | M   | go binding  | `RedexFile.mu` serializes appends; Rust substrate supports concurrent     | ✅ |
 | R-44  | L   | go binding  | `ErrInvalidReplicationConfig` is dead code (never returned)               | ✅ (now wired) |
-| R-32  | M   | file        | `skip_to` swap-order: index assigned before `evict_prefix_to`             | ⚪ |
-| R-33  | M   | mod         | `pub mod replication` AND flat re-exports of the same types               | ⚪ |
-| R-34  | M   | metrics     | `Duration → micros` saturation may collide with `LAG_NOT_OBSERVED`        | ⚪ |
+| R-32  | M   | file        | `skip_to` swap-order: index assigned before `evict_prefix_to`             | ✅ |
+| R-33  | M   | mod         | `pub mod replication` AND flat re-exports of the same types               | ✅ |
+| R-34  | M   | metrics     | `Duration → micros` saturation may collide with `LAG_NOT_OBSERVED`        | ✅ |
 | R-35  | L   | election    | `sort_by` claims to use stability for determinism; should be `unstable`   | ⚪ |
 | R-36  | L   | wire codec  | `Vec::with_capacity(event_count.min(4096))` cap is undocumented           | ⚪ |
 | R-37  | L   | wire codec  | `u32::try_from(...).unwrap_or(u32::MAX)` silently corrupts data           | ✅ (R-5 commit) |

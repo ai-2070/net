@@ -1255,13 +1255,23 @@ impl RedexFile {
                 None => state.segment.base_offset() + state.segment.live_bytes() as u64,
             };
 
-            // Two-phase build-then-swap (see sweep_retention's doc
-            // comment for the panic-safety rationale).
+            // R-32: build the new index + timestamps into temp
+            // vectors BEFORE mutating either the segment or the
+            // live state. Then call evict_prefix_to first — if it
+            // panics (it shouldn't; evict_prefix_to is pure
+            // arithmetic), state.index still references the pre-
+            // eviction payload offsets, which match the
+            // un-mutated segment. Only after the segment eviction
+            // succeeds do we swap in the trimmed index. This
+            // ordering reverses the previous (and sweep_retention's)
+            // index-first-segment-second sequence, which left the
+            // index referencing payload offsets the segment no
+            // longer carried on a hypothetical evict panic.
             let new_index: Vec<RedexEntry> = state.index[drop_count..].to_vec();
             let new_timestamps: Vec<u64> = state.timestamps[drop_count..].to_vec();
+            state.segment.evict_prefix_to(dat_base);
             state.index = new_index;
             state.timestamps = new_timestamps;
-            state.segment.evict_prefix_to(dat_base);
         }
 
         // Advance next_seq. Subsequent appends assign target_seq +
