@@ -27,8 +27,8 @@ pub use admission::{should_admit, AdmissionInputs, AdmissionVerdict};
 pub use cache::{EvictedEntry, EvictionSweep, GreedyCacheEntry, GreedyCacheRegistry};
 pub use config::{
     GreedyConfig, GreedyConfigError, DEFAULT_BANDWIDTH_BUDGET_FRACTION,
-    DEFAULT_PER_CHANNEL_CAP_BYTES, DEFAULT_PROXIMITY_MAX_RTT_MS, DEFAULT_TOTAL_CAP_BYTES,
-    MIN_PER_CHANNEL_CAP_BYTES,
+    DEFAULT_NIC_PEAK_BYTES_PER_S, DEFAULT_OBSERVER_INFLIGHT_CAP, DEFAULT_PER_CHANNEL_CAP_BYTES,
+    DEFAULT_PROXIMITY_MAX_RTT_MS, DEFAULT_TOTAL_CAP_BYTES, MIN_PER_CHANNEL_CAP_BYTES,
 };
 pub use metrics::{
     AdmitRejectReason, GreedyChannelMetrics, GreedyChannelMetricsAtomic, GreedyClusterMetrics,
