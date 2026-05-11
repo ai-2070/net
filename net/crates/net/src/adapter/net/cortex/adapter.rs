@@ -2,7 +2,7 @@
 //! state.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::{Stream, StreamExt};
@@ -21,6 +21,37 @@ use super::config::{CortexAdapterConfig, FoldErrorPolicy, StartPosition};
 use super::envelope::IntoRedexPayload;
 use super::error::CortexAdapterError;
 use super::meta::EVENT_META_SIZE;
+
+/// Process-wide cap on in-flight RYW waits across every
+/// `CortexAdapter` in the process. `CortexAdapterConfig::ryw_inflight_cap`
+/// bounds per-adapter; this caps the total. Operators running
+/// thousands of adapters need the process-wide bound so the
+/// cumulative permit count doesn't dwarf the memory budget.
+///
+/// Default: no global cap. Operators install one at startup via
+/// [`set_global_ryw_inflight_cap`]; the install is one-shot
+/// (`OnceLock`), so subsequent calls return `false` and leave the
+/// previous cap in place.
+static GLOBAL_RYW_CAP: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Install a process-wide cap on concurrent `wait_for_token`
+/// permits across every `CortexAdapter` instance. Call once at
+/// process startup before any RYW traffic. `cap` is clamped to a
+/// minimum of 1.
+///
+/// Returns `true` if the cap was installed by this call, `false`
+/// if a prior call already installed one.
+pub fn set_global_ryw_inflight_cap(cap: usize) -> bool {
+    GLOBAL_RYW_CAP
+        .set(Arc::new(Semaphore::new(cap.max(1))))
+        .is_ok()
+}
+
+/// Lookup the installed global cap; `None` when no cap has been
+/// set (default).
+fn current_global_ryw_semaphore() -> Option<Arc<Semaphore>> {
+    GLOBAL_RYW_CAP.get().cloned()
+}
 
 /// One-file CortEX adapter: projects envelopes into RedEX payloads,
 /// tails the same file, drives a [`RedexFold`] implementation, and
@@ -458,6 +489,24 @@ impl<State> CortexAdapter<State> {
         // Try-acquire FIRST so backpressure surfaces before the timer
         // arms — under saturation a `QueueFull` is the correct
         // diagnostic, not a `Timeout` masking it.
+        //
+        // Two-tier acquire: global cap (process-wide; bounds
+        // cumulative permit count across every adapter) then
+        // per-adapter cap. Both must succeed; if either is
+        // saturated we bump the metric and return QueueFull. The
+        // global permit is dropped at function return; tests that
+        // exercise saturation rely on this being held for the
+        // duration of the wait.
+        let _global_permit = match current_global_ryw_semaphore() {
+            Some(sem) => Some(sem.try_acquire_owned().map_err(|_| {
+                self.inner
+                    .ryw_metrics
+                    .queue_full_total
+                    .fetch_add(1, Ordering::Relaxed);
+                WaitForTokenError::QueueFull
+            })?),
+            None => None,
+        };
         let _permit = match &self.inner.ryw_inflight {
             Some(sem) => Some(sem.clone().try_acquire_owned().map_err(|_| {
                 self.inner

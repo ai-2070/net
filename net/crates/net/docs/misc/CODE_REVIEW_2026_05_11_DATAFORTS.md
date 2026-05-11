@@ -65,7 +65,7 @@ Tagged `[B | H | M | L]`:
 | D-31  | M   | blob fs      | `BlobError::NotFound(uri)` propagates raw attacker URI → log injection     | ✅ |
 | D-32  | M   | blob fs      | Concurrent stores race on shared `<hash>.tmp` filename                     | ✅ (folded into D-12) |
 | D-33  | M   | blob fs      | No `fsync` of temp file or parent dir before rename — durability gap      | ✅ |
-| D-34  | M   | blob reg     | Process-wide singleton registry; multi-tenant hijack possible              | 🚫 deferred — single-tenant trust boundary; per-tenant registry is a Phase 4 follow-up |
+| D-34  | M   | blob reg     | Process-wide singleton registry; multi-tenant hijack possible              | ✅ (`RedexFileConfig::blob_adapter_registry` per-channel override; default-tenant path unchanged) |
 | D-35  | M   | blob adapter | No concurrency bound on `spawn_blocking` calls                             | ✅ (FS adapter; pattern available for other impls) |
 | D-36  | M   | blob conf    | Conformance suite shallow (no idempotency / range / mismatch / parallel)   | ✅ (idempotency + hash-mismatch + range past-end + cross-blob isolation + random ghost) |
 | D-37  | M   | RYW          | "Wait queue" is `Semaphore::try_acquire` — not FIFO                        | ✅ (renamed to `ryw_inflight_cap` with non-FIFO doc; true FIFO deferred) |
