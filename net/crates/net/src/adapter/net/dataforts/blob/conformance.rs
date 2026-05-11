@@ -161,6 +161,28 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
         return Err("second blob's store corrupted first blob's content");
     }
 
+    // fetch_stream returns the same bytes as fetch — adapters
+    // that override stream must keep parity with the all-in-memory
+    // path. Bytes accumulated from the stream must verify against
+    // the BlobRef's hash.
+    {
+        use futures::StreamExt;
+        let mut stream = adapter
+            .fetch_stream(&blob)
+            .await
+            .map_err(|_| "fetch_stream failed")?;
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| "fetch_stream chunk error")?;
+            buf.extend_from_slice(&chunk);
+        }
+        if buf != payload {
+            return Err("fetch_stream bytes != stored bytes");
+        }
+        blob.verify(&buf)
+            .map_err(|_| "BlobRef::verify on fetch_stream bytes failed")?;
+    }
+
     // Missing blob — random hash per run so an adversarial adapter
     // can't hardcode a sentinel response.
     let mut ghost_hash = [0u8; 32];

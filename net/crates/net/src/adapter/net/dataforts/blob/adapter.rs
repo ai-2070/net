@@ -3,11 +3,20 @@
 //! blob path.
 
 use std::ops::Range;
+use std::pin::Pin;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::stream::Stream;
 
 use super::blob_ref::BlobRef;
 use super::error::BlobError;
+
+/// Stream of byte chunks the substrate consumes from `fetch_stream`.
+/// Errors mid-stream surface as `Err(BlobError)`; the consumer
+/// stops on the first error and discards any prior chunks (no
+/// partial-blob verification).
+pub type BlobByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, BlobError>> + Send>>;
 
 /// Storage backend wrapped by the substrate's blob layer. Each
 /// adapter takes a [`BlobRef`]'s URI and serves the bytes it
@@ -75,4 +84,56 @@ pub trait BlobAdapter: Send + Sync + 'static {
     /// answer cheaply may emulate by `fetch` + drop; the trait
     /// makes no efficiency promise.
     async fn exists(&self, blob_ref: &BlobRef) -> Result<bool, BlobError>;
+
+    /// Stream the blob content as a sequence of byte chunks.
+    /// Default impl routes through [`Self::fetch`] and emits the
+    /// whole payload as a single chunk — fine for adapters that
+    /// hold blobs in RAM or pull them in one shot anyway (S3
+    /// GetObject with no Range, IPFS). Adapters with real
+    /// streaming backends (chunked HTTP, mmap'd local files,
+    /// range-fetched S3) should override to yield progressively.
+    ///
+    /// Substrate-side hash verification consumes the stream as it
+    /// arrives: hash the chunks incrementally, accumulate into a
+    /// buffer (or pipe through to the application), and reject
+    /// on completion if the BLAKE3 doesn't match.
+    ///
+    /// Multi-GB blobs that don't fit in a single buffer must use
+    /// this surface; the all-in-memory [`Self::fetch`] is
+    /// preserved for short payloads and ergonomic callers.
+    async fn fetch_stream(&self, blob_ref: &BlobRef) -> Result<BlobByteStream, BlobError> {
+        let bytes = self.fetch(blob_ref).await?;
+        let stream = futures::stream::once(async move { Ok(Bytes::from(bytes)) });
+        Ok(Box::pin(stream))
+    }
+
+    /// Store from a stream of byte chunks. Default impl drains the
+    /// stream into a `Vec<u8>` and forwards to [`Self::store`];
+    /// adapters with real streaming write paths (S3 multipart
+    /// upload, chunked filesystem write) should override.
+    ///
+    /// The implementation MUST verify the produced bytes hash to
+    /// `blob_ref.hash` before considering the store durable. The
+    /// substrate's `store` contract requires this; streaming
+    /// impls compute the hash incrementally as chunks arrive.
+    ///
+    /// `size_hint` is the caller's expected total size; adapters
+    /// may use it for pre-allocation but must not require it to
+    /// match the actual stream length.
+    async fn store_stream(
+        &self,
+        blob_ref: &BlobRef,
+        mut stream: BlobByteStream,
+        size_hint: Option<u64>,
+    ) -> Result<(), BlobError> {
+        use futures::StreamExt;
+        let mut buf: Vec<u8> = match size_hint {
+            Some(n) if (n as usize) <= 16 * 1024 * 1024 => Vec::with_capacity(n as usize),
+            _ => Vec::new(),
+        };
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk?);
+        }
+        self.store(blob_ref, &buf).await
+    }
 }

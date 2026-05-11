@@ -19,11 +19,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use tokio::sync::Semaphore;
 
-use super::adapter::BlobAdapter;
+use super::adapter::{BlobAdapter, BlobByteStream};
 use super::blob_ref::BlobRef;
 use super::error::BlobError;
+
+/// Chunk size for the streaming fetch path. Sized to balance per-
+/// chunk fixed cost (Bytes allocation, channel hop) against memory
+/// pressure on the consumer side. 256 KiB is a typical filesystem
+/// read-ahead window.
+pub const FS_STREAM_CHUNK_BYTES: usize = 256 * 1024;
 
 /// Default cap on concurrent FS adapter spawn_blocking tasks. A
 /// burst of stores against the default tokio blocking pool (512
@@ -278,6 +285,63 @@ impl BlobAdapter for FileSystemAdapter {
             .map_err(|e| backend(format!("join error: {}", e)))?;
         Ok(res)
     }
+
+    async fn fetch_stream(&self, blob_ref: &BlobRef) -> Result<BlobByteStream, BlobError> {
+        // Stream the file in fixed-size chunks via an mpsc channel.
+        // A dedicated `spawn_blocking` task reads each chunk and
+        // forwards through the channel; the returned stream wraps
+        // the receiver. Bounded channel keeps the read-ahead window
+        // tight so a slow consumer doesn't pile up unbounded memory
+        // on the producer side.
+        let path = self.path_for(&blob_ref.hash);
+        let uri = sanitize_uri_for_error(&blob_ref.uri);
+        // Acquire-on-spawn: the streaming task holds the permit for
+        // the duration of the read, mirroring the all-in-memory
+        // path's concurrency bound.
+        let permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| backend("adapter concurrency semaphore closed"))?;
+        // 4-chunk channel — enough to keep the reader busy without
+        // letting it run far ahead of the consumer.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut f = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = tx.blocking_send(Err(BlobError::NotFound(uri)));
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(backend(e)));
+                    return;
+                }
+            };
+            let mut buf = vec![0u8; FS_STREAM_CHUNK_BYTES];
+            loop {
+                let n = match f.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(backend(e)));
+                        return;
+                    }
+                };
+                let chunk = Bytes::copy_from_slice(&buf[..n]);
+                if tx.blocking_send(Ok(chunk)).is_err() {
+                    // Consumer dropped — stop reading.
+                    return;
+                }
+            }
+        });
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        Ok(Box::pin(stream))
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +460,51 @@ mod tests {
         }
         // Slot must NOT have been populated.
         assert!(!adapter.exists(&blob).await.unwrap());
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn fetch_stream_yields_multi_chunk_for_large_blobs() {
+        // Payload bigger than the streaming chunk size so the
+        // override actually emits multiple chunks. Pins that the
+        // FS adapter doesn't fall through to the all-in-memory
+        // default.
+        use futures::StreamExt;
+        let root = unique_root();
+        let adapter = FileSystemAdapter::new("fs-stream", &root);
+        let payload = vec![0xCDu8; FS_STREAM_CHUNK_BYTES * 3 + 17];
+        let blob = make_ref(&payload, "file:///fs-stream");
+        adapter.store(&blob, &payload).await.unwrap();
+
+        let mut stream = adapter.fetch_stream(&blob).await.unwrap();
+        let mut chunks = 0usize;
+        let mut buf = Vec::with_capacity(payload.len());
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            chunks += 1;
+            buf.extend_from_slice(&chunk);
+        }
+        assert!(
+            chunks >= 4,
+            "FS adapter must yield multiple chunks for a multi-chunk payload; got {}",
+            chunks
+        );
+        assert_eq!(buf, payload);
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn fetch_stream_returns_not_found_on_missing_blob() {
+        use futures::StreamExt;
+        let root = unique_root();
+        let adapter = FileSystemAdapter::new("fs-stream-miss", &root);
+        let blob = BlobRef::new("file:///ghost", [0xFF; 32], 0);
+        let mut stream = adapter.fetch_stream(&blob).await.unwrap();
+        let first = stream.next().await.expect("must yield NotFound chunk");
+        match first {
+            Err(BlobError::NotFound(_)) => {}
+            other => panic!("expected NotFound from fetch_stream, got {:?}", other),
+        }
         cleanup(&root);
     }
 

@@ -56,7 +56,7 @@ Tagged `[B | H | M | L]`:
 | D-22  | H   | FFI          | Vtable per-field null-check missing in `net_blob_register_adapter`        | ✅ |
 | D-23  | H   | FFI          | `timeout_ms == 0` silently rewritten to 1 ms in token wait                | ✅ |
 | D-24  | M   | greedy       | Wire `channel_hash` 16-bit → silent cross-chain pollution                  | 🚫 deferred — wire-format change; needs separate slice |
-| D-25  | M   | greedy       | `gravity_tick` emits one full capset rebroadcast per chain                 | 🚫 deferred — needs `announce_heat_batch` on MeshNode + per-tick snapshot mutation |
+| D-25  | M   | greedy       | `gravity_tick` emits one full capset rebroadcast per chain                 | ✅ (`HeatSink::announce_heat_batch` + MeshNode impl rewrites caps once per tick) |
 | D-26  | M   | greedy       | `entry.bytes` saturating drift under retention trim                        | ✅ (`RedexFile::retained_bytes` + `GreedyRuntime::resync_cache_bytes`; operator wires the periodic call) |
 | D-27  | M   | greedy       | `NIC_PEAK_BYTES_PER_S` hard-coded; no override on `GreedyConfig`           | ✅ (folded into D-2) |
 | D-28  | M   | greedy       | 5 separate `cache.lock()` acquisitions per dispatch                        | ✅ (steady-state path now takes 1 lock; new-channel path takes 2 with TOCTOU re-check) |
