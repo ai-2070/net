@@ -37,6 +37,7 @@
 //! `ReplicationDispatcher`) lands in a separate slice — this
 //! commit covers the runtime task itself + the trait.
 
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -248,6 +249,13 @@ pub struct ReplicationRuntimeHandle {
     inbox: mpsc::Sender<Inbound>,
     task: Mutex<Option<JoinHandle<()>>>,
     coordinator: Arc<ReplicationCoordinator>,
+    /// R-11: explicit "task has joined" flag. `is_stopped()`
+    /// consults this rather than the JoinHandle slot — two
+    /// concurrent `cancel()`s race on `task.lock().take()`, so
+    /// the slot-based view can return `true` *before* the
+    /// surviving caller's `.await` returns. The flag is flipped
+    /// only after the join completes.
+    stopped: AtomicBool,
 }
 
 impl ReplicationRuntimeHandle {
@@ -286,16 +294,24 @@ impl ReplicationRuntimeHandle {
         if let Some(h) = handle {
             let _ = h.await;
         }
+        // R-11: flip the "joined" flag only after the await
+        // returns. Concurrent cancel() racers that lost the
+        // handle take(): poll `stopped` until our await
+        // completes.
+        self.stopped.store(true, AtomicOrdering::Release);
     }
 
     /// Returns `true` if the runtime has stopped (task joined).
     /// Useful for tests / observability.
+    ///
+    /// R-11: this consults an explicit flag flipped after
+    /// `cancel()`'s `.await` returns, not the JoinHandle slot.
+    /// Without the flag, two concurrent `cancel()` calls could
+    /// race so the loser observes `task.lock().take() == None`
+    /// and reports `is_stopped == true` before the winner has
+    /// finished joining.
     pub fn is_stopped(&self) -> bool {
-        self.task
-            .lock()
-            .as_ref()
-            .map(|h| h.is_finished())
-            .unwrap_or(true)
+        self.stopped.load(AtomicOrdering::Acquire)
     }
 }
 
@@ -322,6 +338,18 @@ pub const RUNTIME_INBOX_CAPACITY: usize = 1024;
 ///
 /// `dispatcher` ships every outbound message; `tail_provider` /
 /// `wall_clock_provider` give the task fresh values per tick.
+///
+/// **R-14 — Arc cycle invariant.** Production wiring has
+/// `MeshNode → ReplicationInboundRouter → ReplicationRuntimeHandle
+/// → task → Arc<dyn ReplicationDispatcher = MeshNode>`. This is
+/// a strong reference cycle. It is broken by
+/// `ReplicationWiring::drop` (`manager.rs`): un-installing the
+/// router releases its Arc<RuntimeHandle> references, the
+/// runtime task observes the closed inbox receiver, exits, and
+/// drops its dispatcher Arc. Callers that do NOT route through
+/// `Redex` drop (e.g. holding a raw `ReplicationRuntimeHandle`
+/// past the dispatcher's owner) MUST call `cancel()` before
+/// dropping the dispatcher; otherwise the cycle leaks both.
 pub fn spawn_replication_runtime(
     inputs: RuntimeInputs,
     coordinator: Arc<ReplicationCoordinator>,
@@ -343,6 +371,7 @@ pub fn spawn_replication_runtime(
         inbox: tx,
         task: Mutex::new(Some(task)),
         coordinator,
+        stopped: AtomicBool::new(false),
     }
 }
 
@@ -1720,6 +1749,28 @@ mod tests {
             dispatcher.sync_responses.lock().is_empty(),
             "no SyncResponse on wrong-channel"
         );
+    }
+
+    /// R-11 regression: `is_stopped()` returns `false` until
+    /// `cancel()`'s await completes, even if a parallel
+    /// `cancel()` raced and took the JoinHandle out of the
+    /// slot. The explicit `stopped` flag (flipped only post-
+    /// await) is what guarantees this.
+    #[tokio::test]
+    async fn is_stopped_is_false_before_first_cancel_completes() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let handle = spawn_replication_runtime(inputs, coordinator, dispatcher, build_budget());
+        assert!(!handle.is_stopped(), "fresh runtime must report not stopped");
+        handle.cancel().await;
+        assert!(
+            handle.is_stopped(),
+            "post-cancel().await runtime must report stopped"
+        );
+        // Idempotent second cancel must not flip the flag back.
+        handle.cancel().await;
+        assert!(handle.is_stopped());
     }
 
     /// R-4 regression: SyncNack NotLeader must actively clear

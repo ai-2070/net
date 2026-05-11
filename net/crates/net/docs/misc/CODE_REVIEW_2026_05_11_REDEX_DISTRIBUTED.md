@@ -33,18 +33,18 @@ Tagged `[H | M | L]`:
 | R-8   | H   | FFI         | `net_redex_enable_replication` leaks `Box<Arc<MeshNode>>` on error paths  | ✅ |
 | R-9   | H   | tests       | DST harness `wall_clock_ms` reads real wall-clock time, not step counter  | ✅ |
 | R-10  | M   | runtime     | `current_role` captured before tracker lock; `tick()` runs against stale  | ✅ |
-| R-11  | M   | runtime     | `cancel()` race: `is_stopped()` can return true before task joined        | ⚪ |
+| R-11  | M   | runtime     | `cancel()` race: `is_stopped()` can return true before task joined        | ✅ |
 | R-12  | M   | runtime     | Only `Heartbeat` validates `channel_id`; other inbound types don't        | ✅ |
 | R-13  | M   | runtime     | `GapBeforeChunk` underflow if `first_seq <= local_next`                   | ✅ |
-| R-14  | M   | runtime     | Dispatcher `Arc` cycle: MeshNode → router → handle → task → dispatcher    | ⚪ |
+| R-14  | M   | runtime     | Dispatcher `Arc` cycle: MeshNode → router → handle → task → dispatcher    | 📝 documented invariant + drop order in spawn_replication_runtime |
 | R-15  | M   | step        | Lag-driven `SyncRequest` doesn't filter `believed_leader != self`         | ✅ |
 | R-16  | M   | step        | Dropped-leader leaves Replica without a Candidate path                    | 🚫 deferred — see plan §6 heartbeat cycle recovery |
 | R-17  | M   | catchup     | Empty chunk silently accepts any `first_seq`                              | ✅ |
 | R-18  | M   | catchup     | `prev + 1` u64 wrap in monotonicity loop without `checked_add`            | ✅ |
 | R-19  | M   | catchup     | 64 MiB hard ceiling not enforced for oversize first event                 | ✅ |
 | R-20  | M   | catchup     | `append_batch` error stringified — typed variants erased                  | 🚫 deferred — handle_disk_pressure already uniform |
-| R-21  | M   | manager     | `try_dispatch(Shutdown)` on reopen path is lossy at cap-1024              | ⚪ |
-| R-22  | M   | manager     | `NIC_PEAK_BYTES_PER_S = 125_000_000` hardcoded without `// TODO` tag      | ⚪ |
+| R-21  | M   | manager     | `try_dispatch(Shutdown)` on reopen path is lossy at cap-1024              | 📝 documented belt-and-suspenders (Arc-drop is the canonical exit) |
+| R-22  | M   | manager     | `NIC_PEAK_BYTES_PER_S = 125_000_000` hardcoded without `// TODO` tag      | ✅ |
 | R-23  | M   | wire        | `WireError::Truncated.need` formula reports nonsensical value             | ⚪ |
 | R-24  | M   | mesh        | Replication inbound dispatch is O(peers) per frame                        | ⚪ |
 | R-25  | M   | mesh        | `from_node` falls back to `0`, a valid NodeId sentinel collision          | ⚪ |

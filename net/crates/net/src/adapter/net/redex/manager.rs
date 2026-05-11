@@ -394,10 +394,14 @@ impl Redex {
 
         let heartbeat_ms = cfg.heartbeat_ms;
         let budget_fraction = cfg.replication_budget_fraction;
-        // NIC peak estimate — plan §6 wires the measured peak from
-        // the proximity-graph throughput probe. Until that lands,
-        // use a 1 Gbps placeholder (125_000_000 B/s). The fraction
-        // arm of `BandwidthBudget::new` scales this down.
+        // TODO(plan-§6): wire the measured NIC peak from the
+        // proximity-graph throughput probe here. Until that
+        // lands, use a 1 Gbps placeholder (125_000_000 B/s).
+        // The fraction arm of `BandwidthBudget::new` scales
+        // this down. Operators with >1 Gbps links will see
+        // under-utilization when budget_fraction approaches
+        // 1.0 until this constant is replaced with the
+        // measurement.
         const NIC_PEAK_BYTES_PER_S: u64 = 125_000_000;
         let budget = Arc::new(Mutex::new(BandwidthBudget::new(
             budget_fraction,
@@ -460,8 +464,16 @@ impl Redex {
 
         // Register on the router; if a prior handle was registered
         // for the same channel (reopen path), the predecessor is
-        // returned — `try_dispatch(Shutdown)` triggers a graceful
-        // exit on its next inbox poll.
+        // returned. R-21: try_dispatch(Shutdown) is best-effort
+        // belt-and-suspenders — `register()`'s swap dropped the
+        // router's Arc<RuntimeHandle> on the predecessor, which
+        // is the only sender into its inbox; the task observes a
+        // closed receiver on its next poll and exits via the
+        // `None` arm in the main loop (same shape as Shutdown
+        // itself). If the inbox happened to be at cap-1024 the
+        // try_dispatch returns Err(_) silently, which is fine
+        // because the closed-receiver path will still drive the
+        // task out.
         if let Some(prev) = wiring.router.register(channel_id, handle) {
             let _ = prev.try_dispatch(super::replication_runtime::Inbound::Shutdown);
         }
