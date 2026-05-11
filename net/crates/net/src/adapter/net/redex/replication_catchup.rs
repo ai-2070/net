@@ -711,6 +711,43 @@ mod tests {
         assert!(matches!(err, ApplyError::NonMonotonic { index: 2 }));
     }
 
+    /// R-18 regression: when the previous event's seq is
+    /// `u64::MAX`, `prev + 1` would wrap to 0 in release builds.
+    /// The fix uses `checked_add(1)` which returns `None` and
+    /// surfaces as `NonMonotonic`. This is structurally
+    /// unreachable in practice (u64::MAX events would take
+    /// ~584,000 years at one nanosecond per event), but the
+    /// surrounding code uses saturating arithmetic throughout,
+    /// so the symmetry matters.
+    #[test]
+    fn non_monotonic_wrap_at_u64_max_does_not_panic() {
+        let dst = build_file("redex/wrap");
+        let cid = channel_id_for("redex/wrap");
+        let response = SyncResponse {
+            channel_id: cid,
+            first_seq: u64::MAX,
+            leader_first_retained_seq: 0,
+            events: vec![
+                SyncEvent {
+                    event_seq: u64::MAX,
+                    payload: b"last".to_vec(),
+                },
+                // Whatever this seq is, `prev + 1` overflows so
+                // the loop must report NonMonotonic at index 1
+                // rather than panic.
+                SyncEvent {
+                    event_seq: 0,
+                    payload: b"wraparound".to_vec(),
+                },
+            ],
+        };
+        let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
+        assert!(
+            matches!(err, ApplyError::NonMonotonic { index: 1 }),
+            "u64::MAX wrap must surface NonMonotonic, got {err:?}"
+        );
+    }
+
     #[test]
     fn duplicate_seq_rejected_as_non_monotonic() {
         let dst = build_file("redex/dup");

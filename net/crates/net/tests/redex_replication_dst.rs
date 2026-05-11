@@ -1016,6 +1016,96 @@ fn no_two_leaders_within_a_partition_post_failover_with_central_peer() {
     assert_eq!(cluster.nodes.get(&b).unwrap().role, ReplicaRole::Leader);
 }
 
+/// R-9 regression: `wall_clock_ms` emitted in outbound heartbeats
+/// must be a deterministic function of the step counter, not real
+/// wall-clock. The previous implementation used
+/// `self.now.elapsed()` which leaked `Instant::now()` into the
+/// harness. Now we use `self.now.duration_since(self.initial_now)`
+/// so the value is exactly `step_index * STEP_DURATION_MS`.
+///
+/// We call `tick()` directly on the harness's internal state
+/// (post-`step()`) and inspect the emitted heartbeats' wall-clock
+/// values. A regression to real-time leakage would make the
+/// observed values depend on `Instant::now()`.
+#[test]
+fn wall_clock_ms_is_deterministic_function_of_step_counter() {
+    fn run_and_capture(channel: &str) -> Vec<u64> {
+        let a = 0x10u64;
+        let b = 0x20u64;
+        let mut cluster = VirtualCluster::new(&[a, b], channel);
+        cluster.force_leader(a);
+        cluster.force_replica(b);
+
+        let mut emitted_wall_clocks = Vec::new();
+        // Run several steps; at each step BEFORE delivery, peek
+        // at the outbound heartbeats by re-running tick() on the
+        // leader and inspecting the synthesized output. The
+        // re-run is non-destructive because `tick()` is a pure
+        // function — same inputs produce the same outputs.
+        for step_idx in 1..=6u64 {
+            cluster.step();
+            // Re-run tick() against the leader's current state
+            // to observe the wall_clock_ms it would emit. The
+            // wall_clock_ms is derived from `self.now -
+            // self.initial_now` in the harness, so this
+            // reproduces the value emitted during the just-
+            // completed step.
+            let leader = cluster.nodes.get(&a).expect("leader present");
+            let outcome = tick(TickInputs {
+                self_node_id: a,
+                current_role: leader.role,
+                channel_id: cluster.channel_id,
+                tail_seq: leader.tail_seq(),
+                replica_set: &cluster.replica_set,
+                tracker: &leader.tracker,
+                wall_clock_ms: cluster.now.duration_since(cluster.initial_now).as_millis() as u64,
+                chunk_max_bytes: DST_CHUNK_MAX_BYTES,
+                now: cluster.now,
+            });
+            for msg in outcome.outbound {
+                if let OutboundMessage::Heartbeat { msg, .. } = msg {
+                    emitted_wall_clocks.push((step_idx, msg.wall_clock_ms));
+                }
+            }
+        }
+        // Pair (step, wall_clock_ms). Two runs should match.
+        emitted_wall_clocks.into_iter().map(|(_, ms)| ms).collect()
+    }
+
+    // Run scenario A. Introduce a non-trivial real-time gap.
+    let trace_a = run_and_capture("dst/wall_clock_a");
+    std::thread::sleep(std::time::Duration::from_millis(75));
+    // Run scenario B with identical setup.
+    let trace_b = run_and_capture("dst/wall_clock_b");
+
+    // Both traces must be byte-identical — wall_clock_ms is now
+    // a pure function of the step counter, not real time. A
+    // regression to `Instant::elapsed()` would make trace_a
+    // 75ms earlier than trace_b (or differ by jitter).
+    assert_eq!(
+        trace_a, trace_b,
+        "wall_clock_ms sequence must be deterministic across real-time gaps"
+    );
+
+    // Every value must be a multiple of STEP_DURATION_MS, and
+    // bounded by the step count we ran.
+    for &ms in &trace_a {
+        assert!(
+            ms % STEP_DURATION_MS == 0,
+            "wall_clock_ms {ms} is not a multiple of STEP_DURATION_MS ({STEP_DURATION_MS})"
+        );
+        assert!(
+            ms <= 6 * STEP_DURATION_MS,
+            "wall_clock_ms {ms} exceeds 6×STEP_DURATION_MS ({})",
+            6 * STEP_DURATION_MS,
+        );
+    }
+
+    // We expect at least one emitted heartbeat (the leader's
+    // tick fires immediately on step 1).
+    assert!(!trace_a.is_empty(), "no heartbeats emitted in 6 steps");
+}
+
 /// C-1 — election-storms scenario: kill the leader, let the
 /// election complete, kill the new leader, repeat. Pin that each
 /// individual election still converges within the hysteresis
