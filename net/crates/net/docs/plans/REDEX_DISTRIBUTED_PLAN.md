@@ -4,13 +4,13 @@
 
 ## Status
 
-**Phases A, B, H (scaffolding) landed; remaining phases blocked on Capability Phase B (and partially F).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
+**Phases A, B, H (scaffolding), plus the pure-function pieces of C (state-machine validation) and E (`elect()` selection function) landed; remaining substrate work blocked on Capability Phase B (and partially F).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
 
 Hard prerequisites for the still-blocked phases:
 - **Capability Phase B** (tag-discovery primitives `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders`) — RedEX Phases C/D/E cannot start until this lands.
 - **Capability Phase F** (`PlacementFilter` + `IntentRegistry` + anti-affinity) — needed for *replica placement* in Phase C, but **not** for leader election. Election is decentralized and deterministic (nearest-RTT + NodeId tiebreak); see [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak).
 
-Phase A (wire protocol scaffold) ✅, Phase B (`ReplicationConfig` opt-in) ✅, and Phase H (metrics registry scaffolding) ⚠️ landed. Phase G needs Phase C's coordinator; Phase I needs cross-binding plumbing for `RedexFileConfig` that doesn't yet exist.
+Phase A (wire protocol scaffold) ✅, Phase B (`ReplicationConfig` opt-in) ✅, Phase H (metrics registry scaffolding) ⚠️, Phase C state-machine validation ⚠️, and Phase E `elect()` selection function ⚠️ landed. Phase D needs Phase C's coordinator + Capability B; Phase F (DST) builds on C/D/E; Phase G needs the coordinator; Phase I needs cross-binding plumbing for `RedexFileConfig` that doesn't yet exist.
 
 Activation gate (when Warriors as a whole ships) is unchanged: a workload requesting durability guarantees beyond single-node. Realistic triggers: payment-tier customer, compliance-bound data class, pilot whose RTO is "< 5 s on node failure."
 
@@ -442,14 +442,16 @@ Implementable in isolation; does not depend on Capability B/F. **Landed.**
 - `RedexFileConfig` is now `Clone` rather than `Copy` since `ReplicationConfig` carries a `Vec<NodeId>` under the `Pinned` variant. Internal consumers updated to `.clone()` where they previously relied on bit-copy.
 - 🔜 **Phase I**: cross-binding serde for `ReplicationConfig` over Node, Python, Go, C bindings.
 
-### Phase C — `ReplicationCoordinator` daemon (1.5 weeks)
+### Phase C — `ReplicationCoordinator` daemon (1.5 weeks) ⚠️ state-machine scaffolding landed
 
 **Hard prerequisite: Capability Phase B (tag-discovery primitives).** Cannot start until `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders` exist.
 
-- New `behavior::replication::ReplicationCoordinator` implementing `MeshDaemon`.
-- Spawn / register / withdraw lifecycle wired into `Redex::open_file` for replicated channels.
-- Heartbeat loop on `heartbeat_ms`; full 4-state machine `ReplicaState::{Leader, Replica, Candidate, Idle}` per [§3](#3-replicationcoordinator). All transitions exhaustive; pin in unit tests.
-- Capability tag emission on `Idle → Replica` and `Replica → Leader`; withdrawal on `* → Idle`. Uses Capability Phase B's `Mesh::announce_chain` / `Mesh::withdraw_chain`.
+- ✅ `redex::replication_state::StateTransition` — validated transition shape over `ReplicaRole::{Leader, Replica, Candidate, Idle}`. Distinguishes "pair not in plan §3 matrix" (`InvalidPair`) from "pair valid but wrong signal" (`SignalMismatch`); pins the seven specific-signal pairs plus `ChannelClose → *` from any state, including the idempotent `Idle → Idle` shutdown shape. 13 tests covering every valid transition + exhaustive matrix-negative coverage.
+- ✅ `TransitionSignal` enum (`CapabilitySelected` / `MissedHeartbeats` / `ElectionWon` / `ElectionLost` / `GracefulRelinquish` / `DiskPressureWithdraw` / `ChannelClose`) — pins the signal-keyed observability the metrics scaffolding from Phase H will route on (`election_thrash_total` counts `MissedHeartbeats` transitions, etc.).
+- 🔜 `behavior::replication::ReplicationCoordinator` implementing `MeshDaemon` — needs Capability B.
+- 🔜 Spawn / register / withdraw lifecycle wired into `Redex::open_file` for replicated channels — needs Capability B.
+- 🔜 Heartbeat loop on `heartbeat_ms` — needs Capability B + the coordinator daemon.
+- 🔜 Capability tag emission on `Idle → Replica` and `Replica → Leader`; withdrawal on `* → Idle`. Uses Capability Phase B's `Mesh::announce_chain` / `Mesh::withdraw_chain`.
 
 ### Phase D — Pull-based catch-up (1 week)
 
@@ -462,16 +464,17 @@ Implementable in isolation; does not depend on Capability B/F. **Landed.**
 - Skip-ahead path for gaps > `skip_threshold`.
 - Bandwidth-budget enforcer respecting `replication_budget_fraction`.
 
-### Phase E — Failover via deterministic nearest-RTT election (1 week)
+### Phase E — Failover via deterministic nearest-RTT election (1 week) ⚠️ pure-function scaffolding landed
 
 **Hard prerequisite: Phase C of this plan (which transitively requires Capability B). Does NOT depend on Capability F** — election is wire-free and `PlacementFilter`-free.
 
-- `ReplicationCoordinator` consumes `StandbyGroup` events for membership + failure detection only.
-- Implement the deterministic `elect()` selection function from [§4](#4-replica-selection-vs-leader-election); register it as `StandbyGroup`'s leader-selection hook for replicated channels (this is the one new `groups::standby` integration point — a pluggable selection-fn slot, NOT a replacement of the daemon-migration default).
-- Hysteresis: 3-missed-heartbeats threshold; tunable.
-- Capability-tag updates on leader change via `Mesh::announce_chain` (new leader self-announces); `StandbyGroup`'s existing promotion broadcast announces the winner.
-- Witness withdrawal: every peer replica that observes a leadership transition issues `Mesh::withdraw_chain(channel_id, by_node = previous_leader)` in parallel with its own state transition. Idempotent across N witnesses. Closes the stale-tag window in the partition-heal scenario faster than disconnect-observation reaping.
-- Pin the no-two-leaders-within-a-partition invariant in unit tests AND DST (Phase F). Cross-partition split-brain is documented as out-of-scope (operator concern).
+- ✅ `redex::replication_election::elect(replica_set, self_id, rtt_to, health_of) -> ElectionOutcome` — the pure deterministic selection function from [§4](#4-replica-selection-vs-leader-election). `ElectionOutcome::{SelfWins, PeerWins(NodeId), NoEligibleReplica}` distinguishes the three cases the coordinator branches on. Determinism contract pinned in unit tests: same `(replica_set, self_id, rtt, health)` produces same winner across every input-order permutation. 14 tests covering RTT-priority, lex-NodeId tie-break, self-vs-peer at equal RTT, unhealthy-self/peer/all, missing-RTT-treated-as-unmeasured, cross-partition independent evaluation.
+- 🔜 `ReplicationCoordinator` consumes `StandbyGroup` events for membership + failure detection only — needs Phase C.
+- 🔜 Register `elect()` as `StandbyGroup`'s leader-selection hook for replicated channels (the one new `groups::standby` integration point — a pluggable selection-fn slot, NOT a replacement of the daemon-migration default).
+- 🔜 Hysteresis: 3-missed-heartbeats threshold; tunable.
+- 🔜 Capability-tag updates on leader change via `Mesh::announce_chain` (new leader self-announces); `StandbyGroup`'s existing promotion broadcast announces the winner.
+- 🔜 Witness withdrawal: every peer replica that observes a leadership transition issues `Mesh::withdraw_chain(channel_id, by_node = previous_leader)` in parallel with its own state transition. Idempotent across N witnesses. Closes the stale-tag window in the partition-heal scenario faster than disconnect-observation reaping.
+- 🔜 Pin the no-two-leaders-within-a-partition invariant in unit tests AND DST (Phase F). Cross-partition split-brain is documented as out-of-scope (operator concern).
 
 ### Phase F — DST harness extension (1.5–3 weeks; widest variance)
 

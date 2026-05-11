@@ -26,7 +26,9 @@ mod manager;
 mod ordered;
 pub mod replication;
 mod replication_config;
+mod replication_election;
 mod replication_metrics;
+mod replication_state;
 mod retention;
 mod segment;
 mod typed;
@@ -51,8 +53,10 @@ pub use replication_config::{
     HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MIN, REPLICATION_BUDGET_FRACTION_DEFAULT,
     REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX, REPLICATION_FACTOR_MIN,
 };
+pub use replication_election::{elect, ElectionOutcome};
 pub use replication_metrics::{
     ChannelMetrics, ChannelMetricsAtomic, ReplicationMetricsRegistry,
     ReplicationMetricsSnapshot, MAX_TRACKED_CHANNELS, OVERFLOW_CHANNEL_LABEL,
 };
+pub use replication_state::{StateTransition, StateTransitionError, TransitionSignal};
 pub use typed::TypedRedexFile;
