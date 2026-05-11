@@ -533,9 +533,10 @@ impl GreedyRuntime {
             sweep
         };
 
+        let sink = self.inner.sink.clone();
+
         // 5. First-cache chain announcement.
         if is_new_channel {
-            let sink = self.inner.sink.clone();
             // Best-effort — log on failure but don't propagate.
             // Heartbeat / re-announcement upstream will retry.
             if let Err(e) = sink.announce_chain(origin_hash, 0).await {
@@ -547,22 +548,31 @@ impl GreedyRuntime {
             }
         }
 
-        // 6. Withdrawal announcements for evicted channels.
+        // 6. Withdrawal announcements for evicted channels. The
+        // cache surfaces (channel, origin_hash) pairs in the sweep
+        // so we can withdraw without a follow-up lookup. Skip the
+        // withdraw when origin_hash == 0 — that means no event
+        // landed before eviction, so nothing was announced.
         if !sweep.is_empty() {
             for evicted in &sweep.evicted {
                 self.inner
                     .metrics
-                    .for_channel(evicted.as_str())
+                    .for_channel(evicted.channel.as_str())
                     .incr_eviction();
                 self.inner
                     .metrics
-                    .for_channel(evicted.as_str())
+                    .for_channel(evicted.channel.as_str())
                     .set_bytes_resident(0);
-                // Note: we don't have the origin_hash for the
-                // evicted channel without an extra index. Leave
-                // withdrawal to the operator-driven path for now —
-                // a follow-up slice can track origin_hash per
-                // cache entry so withdrawals fire automatically.
+                if evicted.origin_hash != 0 {
+                    if let Err(e) = sink.withdraw_chain(evicted.origin_hash).await {
+                        tracing::trace!(
+                            channel = evicted.channel.as_str(),
+                            origin_hash = evicted.origin_hash,
+                            error = ?e,
+                            "greedy: chain withdraw failed"
+                        );
+                    }
+                }
             }
         }
 
@@ -853,6 +863,39 @@ mod tests {
             1,
             "second tick must suppress when rate is unchanged"
         );
+    }
+
+    /// Cluster-cap eviction must call `withdraw_chain` for each
+    /// evicted channel so reads route to other holders instead of
+    /// the now-empty cache file. Skip channels whose `origin_hash`
+    /// is zero — those never announced anything to withdraw.
+    #[tokio::test]
+    async fn cluster_cap_eviction_calls_withdraw() {
+        // per-channel cap = 1 MiB (validator floor), total cap =
+        // 1.5 MiB. One 1-MiB payload fits per channel; two 1-MiB
+        // payloads together exceed the cluster cap → A evicts.
+        let cfg = GreedyConfig::default()
+            .with_intent_match(super::super::IntentMatchPolicy::Disabled)
+            .with_per_channel_cap_bytes(super::super::config::MIN_PER_CHANNEL_CAP_BYTES)
+            .with_total_cap_bytes(super::super::config::MIN_PER_CHANNEL_CAP_BYTES + 512 * 1024);
+        let (rt, sink) = build_runtime(cfg);
+        let chain = chain_caps_with_scope("any");
+        let big = vec![0u8; 1024 * 1024];
+        rt.dispatch_event(&cn("test/cap-a"), 0xAAAA_1111, &chain, &big)
+            .await;
+        rt.dispatch_event(&cn("test/cap-b"), 0xBBBB_2222, &chain, &big)
+            .await;
+        // Both announces should have landed.
+        assert_eq!(sink.announces.lock().len(), 2);
+        // A was oldest by LRU → A withdraws.
+        let withdraws = sink.withdraws.lock().clone();
+        assert_eq!(
+            withdraws,
+            vec![0xAAAA_1111],
+            "evicted channel's origin_hash must be withdrawn"
+        );
+        assert!(!rt.contains(&cn("test/cap-a")));
+        assert!(rt.contains(&cn("test/cap-b")));
     }
 
     /// `note_read` is a no-op for heat when gravity isn't

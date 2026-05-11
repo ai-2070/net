@@ -32,7 +32,7 @@ Tagged `[B | H | M | L]`:
 
 | ID    | Pri | Area         | Title                                                                       | Status |
 |-------|-----|--------------|-----------------------------------------------------------------------------|--------|
-| D-1   | B   | greedy       | Cluster-cap eviction never calls `withdraw_chain`                          | ⏳ |
+| D-1   | B   | greedy       | Cluster-cap eviction never calls `withdraw_chain`                          | ✅ |
 | D-2   | B   | greedy       | Bandwidth-budget rejection silently drops events with no retry             | ⏳ |
 | D-3   | B   | greedy       | `cache.upsert` does not subtract old `bytes` on reopen → `total_bytes` drift | ⏳ |
 | D-4   | B   | python blob  | `PyBlobAdapter::drive_if_coroutine` builds a fresh `asyncio.run` event loop  | ⏳ |

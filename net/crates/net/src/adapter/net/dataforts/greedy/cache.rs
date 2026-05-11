@@ -72,14 +72,29 @@ impl std::fmt::Debug for GreedyCacheEntry {
     }
 }
 
-/// Outcome of an evict-to-fit pass. Names the channels removed so
-/// the caller can withdraw chain announcements via
-/// `MeshNode::withdraw_chain`.
-#[derive(Debug, Default)]
+/// One evicted entry. Carries the `origin_hash` alongside the
+/// channel name so the runtime can issue
+/// `ChainTagSink::withdraw_chain` without a follow-up lookup.
+/// `origin_hash == 0` means "no event landed in the cache before
+/// eviction" — runtime skips the withdraw in that case (there is
+/// nothing announced).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictedEntry {
+    /// Channel name whose cache entry was removed.
+    pub channel: ChannelName,
+    /// `origin_hash` recorded on the cache entry at eviction time;
+    /// `0` if no event landed before eviction.
+    pub origin_hash: u64,
+}
+
+/// Outcome of an evict-to-fit pass. Carries enough info for the
+/// caller to withdraw the chain announcement that registered each
+/// cache entry.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EvictionSweep {
     /// Channels removed from the cache, in eviction order
     /// (oldest first).
-    pub evicted: Vec<ChannelName>,
+    pub evicted: Vec<EvictedEntry>,
 }
 
 impl EvictionSweep {
@@ -91,6 +106,11 @@ impl EvictionSweep {
     /// Number of channels evicted this sweep.
     pub fn len(&self) -> usize {
         self.evicted.len()
+    }
+
+    /// Iterate evicted channel names.
+    pub fn channels(&self) -> impl Iterator<Item = &ChannelName> + '_ {
+        self.evicted.iter().map(|e| &e.channel)
     }
 }
 
@@ -279,10 +299,13 @@ impl GreedyCacheRegistry {
     fn evict_until_under_cap(&mut self) -> EvictionSweep {
         let mut evicted = Vec::new();
         while self.total_bytes > self.total_cap_bytes {
-            let Some((channel, _)) = self.evict_oldest() else {
+            let Some((channel, entry)) = self.evict_oldest() else {
                 break;
             };
-            evicted.push(channel);
+            evicted.push(EvictedEntry {
+                channel,
+                origin_hash: entry.origin_hash,
+            });
         }
         EvictionSweep { evicted }
     }
@@ -411,7 +434,8 @@ mod tests {
         assert!(sweep_a.is_empty());
         let sweep_b = reg.note_appended(&cn("b"), 600, base + Duration::from_secs(4));
         // After B's append, A is oldest (LRU); evict A.
-        assert_eq!(sweep_b.evicted, vec![cn("a")]);
+        let names: Vec<_> = sweep_b.channels().cloned().collect();
+        assert_eq!(names, vec![cn("a")]);
         assert!(!reg.contains(&cn("a")));
         assert_eq!(reg.total_bytes(), 600);
     }
@@ -448,7 +472,8 @@ mod tests {
         let sweep = reg.set_total_cap_bytes(3000);
         // A's 4000-byte share evicts first. After that total_bytes
         // drops to 4000 which is still > 3000, so B evicts too.
-        assert_eq!(sweep.evicted, vec![cn("a"), cn("b")]);
+        let names: Vec<_> = sweep.channels().cloned().collect();
+        assert_eq!(names, vec![cn("a"), cn("b")]);
         assert!(reg.is_empty());
     }
 
@@ -474,7 +499,54 @@ mod tests {
         reg.touch(&cn("a"), base + Duration::from_secs(4));
         // Push the cluster over cap. B is now the oldest; B evicts.
         let sweep = reg.note_appended(&cn("b"), 200, base + Duration::from_secs(5));
-        assert_eq!(sweep.evicted, vec![cn("b")]);
+        let names: Vec<_> = sweep.channels().cloned().collect();
+        assert_eq!(names, vec![cn("b")]);
         assert!(reg.contains(&cn("a")));
+    }
+
+    #[test]
+    fn eviction_sweep_carries_origin_hash_for_withdraw() {
+        // Cluster cap forces eviction; the sweep must surface the
+        // evicted entries' origin_hash values so the runtime can
+        // issue `withdraw_chain` without a follow-up lookup.
+        let redex = Redex::new();
+        let mut reg = GreedyCacheRegistry::new(1024);
+        let base = Instant::now();
+        reg.upsert(cn("a"), open_file(&redex, "a", 10_000), base);
+        reg.upsert(
+            cn("b"),
+            open_file(&redex, "b", 10_000),
+            base + Duration::from_secs(1),
+        );
+        reg.set_origin_hash(&cn("a"), 0xAAAA_AAAA_AAAA_AAAA);
+        reg.set_origin_hash(&cn("b"), 0xBBBB_BBBB_BBBB_BBBB);
+
+        reg.note_appended(&cn("a"), 600, base + Duration::from_secs(2));
+        let sweep = reg.note_appended(&cn("b"), 600, base + Duration::from_secs(3));
+        assert_eq!(sweep.len(), 1, "A should evict");
+        let evicted = &sweep.evicted[0];
+        assert_eq!(evicted.channel, cn("a"));
+        assert_eq!(evicted.origin_hash, 0xAAAA_AAAA_AAAA_AAAA);
+    }
+
+    #[test]
+    fn eviction_sweep_origin_hash_zero_when_unset() {
+        // An entry that never had an event landed has origin_hash =
+        // 0. The runtime treats this as "nothing announced" and
+        // skips the withdraw, but the cache must still surface the
+        // value (rather than synthesizing a phantom hash).
+        let redex = Redex::new();
+        let mut reg = GreedyCacheRegistry::new(1024);
+        let base = Instant::now();
+        reg.upsert(cn("a"), open_file(&redex, "a", 10_000), base);
+        reg.upsert(
+            cn("b"),
+            open_file(&redex, "b", 10_000),
+            base + Duration::from_secs(1),
+        );
+        reg.note_appended(&cn("a"), 600, base + Duration::from_secs(2));
+        let sweep = reg.note_appended(&cn("b"), 600, base + Duration::from_secs(3));
+        assert_eq!(sweep.len(), 1);
+        assert_eq!(sweep.evicted[0].origin_hash, 0);
     }
 }

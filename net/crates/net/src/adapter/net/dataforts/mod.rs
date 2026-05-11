@@ -24,7 +24,7 @@ pub mod gravity;
 #[cfg(feature = "dataforts")]
 pub use greedy::{
     should_admit, synthesize_cache_channel_name, AdmissionInputs, AdmissionVerdict,
-    AdmitRejectReason, ColocationPolicy, DispatchOutcome, EvictionSweep, GreedyCacheEntry,
+    AdmitRejectReason, ColocationPolicy, DispatchOutcome, EvictedEntry, EvictionSweep, GreedyCacheEntry,
     GreedyCacheRegistry, GreedyChannelMetrics, GreedyChannelMetricsAtomic, GreedyClusterMetrics,
     GreedyClusterMetricsAtomic, GreedyConfig, GreedyConfigError, GreedyMetricsRegistry,
     GreedyMetricsSnapshot, GreedyObserver, GreedyRuntime, IntentMatchPolicy, ScopeLabel,
