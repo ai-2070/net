@@ -187,11 +187,21 @@ impl GreedyCacheRegistry {
 
     /// Register a new channel's cache file. If the channel is
     /// already registered, replace the file reference and refresh
-    /// the LRU position (idempotent registration on reopen).
+    /// the LRU position (idempotent registration on reopen). The
+    /// previous entry's `bytes` are subtracted from `total_bytes`
+    /// and the new entry's count starts at zero — otherwise reopens
+    /// would accumulate phantom cluster usage that no `evict` could
+    /// ever drain.
     pub fn upsert(&mut self, channel: ChannelName, file: RedexFile, now: Instant) {
         let new_pos = self.allocate_lru_pos();
         if let Some(prev) = self.entries.get_mut(&channel) {
             let old_pos = prev.lru_pos;
+            // Subtract the previous entry's bytes from total_bytes.
+            // The new file's append count starts at zero — what's
+            // on disk is governed by RedexFile retention, not by
+            // the registry's accounting.
+            self.total_bytes = self.total_bytes.saturating_sub(prev.bytes);
+            prev.bytes = 0;
             prev.file = file;
             prev.last_read = now;
             prev.lru_pos = new_pos;
@@ -527,6 +537,31 @@ mod tests {
         let evicted = &sweep.evicted[0];
         assert_eq!(evicted.channel, cn("a"));
         assert_eq!(evicted.origin_hash, 0xAAAA_AAAA_AAAA_AAAA);
+    }
+
+    #[test]
+    fn upsert_on_reopen_subtracts_old_bytes_from_total() {
+        // Without subtraction on reopen, total_bytes accumulates
+        // phantom usage that no evict path can drain. Pin the fix:
+        // a reopen of the same channel zeroes the entry's byte
+        // count and removes its prior contribution from the
+        // cluster total.
+        let redex = Redex::new();
+        let mut reg = GreedyCacheRegistry::new(1_000_000);
+        let now = Instant::now();
+        reg.upsert(cn("test/a"), open_file(&redex, "test/a", 10_000), now);
+        reg.note_appended(&cn("test/a"), 500, now);
+        assert_eq!(reg.total_bytes(), 500);
+        assert_eq!(reg.get(&cn("test/a")).unwrap().bytes, 500);
+
+        // Reopen — both entry.bytes and total_bytes must reset.
+        reg.upsert(
+            cn("test/a"),
+            open_file(&redex, "test/a", 10_000),
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(reg.total_bytes(), 0, "reopen must subtract old bytes");
+        assert_eq!(reg.get(&cn("test/a")).unwrap().bytes, 0);
     }
 
     #[test]
