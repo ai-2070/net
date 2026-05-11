@@ -46,6 +46,16 @@ async fn build_node() -> Arc<MeshNode> {
 }
 
 async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
+    handshake_no_start(a, b).await;
+    a.start();
+    b.start();
+}
+
+/// Pair-handshake without `start()` — caller batches `start_all`
+/// after every pair has shaken. Required for >2-node topologies
+/// where `accept()` after `start()` is rejected (the post-start
+/// dispatcher would race the responder).
+async fn handshake_no_start(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
     let a_id = a.node_id();
     let b_id = b.node_id();
     let b_pub = *b.public_key();
@@ -54,8 +64,12 @@ async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
     let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
     a.connect(b_addr, &b_pub, b_id).await.expect("connect");
     accept.await.expect("accept task").expect("accept");
-    a.start();
-    b.start();
+}
+
+fn start_all(nodes: &[&Arc<MeshNode>]) {
+    for n in nodes {
+        n.start();
+    }
 }
 
 fn cn(s: &str) -> ChannelName {
@@ -326,4 +340,114 @@ async fn leader_close_triggers_replica_election_and_promotion() {
     );
 
     redex_b.close_file(&name).expect("close B");
+}
+
+/// Three-node replication — exercises the broadcast fanout path
+/// (leader emits heartbeats to N-1 replicas; lag gauge picks the
+/// worst replica). Pins that the runtime correctly addresses
+/// every replica in the set, not just the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_node_replication_fans_out_to_every_replica() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    let node_c = build_node().await;
+    // Full-mesh handshake: each pair needs a direct session
+    // for `peer_addr(node)` to resolve in the dispatcher.
+    // Use the no-start pattern so all three pairs shake before
+    // any node's runtime starts dispatching — `accept()` after
+    // `start()` is rejected.
+    handshake_no_start(&node_a, &node_b).await;
+    handshake_no_start(&node_a, &node_c).await;
+    handshake_no_start(&node_b, &node_c).await;
+    start_all(&[&node_a, &node_b, &node_c]);
+
+    let redex_a = Arc::new(Redex::new());
+    let redex_b = Arc::new(Redex::new());
+    let redex_c = Arc::new(Redex::new());
+    redex_a.enable_replication(node_a.clone());
+    redex_b.enable_replication(node_b.clone());
+    redex_c.enable_replication(node_c.clone());
+
+    let name = cn("repl/three_node");
+    let a_id = node_a.node_id();
+    let b_id = node_b.node_id();
+    let c_id = node_c.node_id();
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_factor(3)
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id, c_id])),
+    ));
+    let file_a = redex_a.open_file(&name, cfg.clone()).expect("open A");
+    let file_b = redex_b.open_file(&name, cfg.clone()).expect("open B");
+    let file_c = redex_c.open_file(&name, cfg).expect("open C");
+
+    let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
+    let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
+    let coord_c = redex_c.replication_coordinator_for(&name).unwrap();
+
+    // Drive: A is Leader; B and C are Replicas.
+    coord_a
+        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+        .await
+        .unwrap();
+    coord_a
+        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
+        .await
+        .unwrap();
+    coord_a
+        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
+        .await
+        .unwrap();
+    coord_b
+        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+        .await
+        .unwrap();
+    coord_c
+        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+        .await
+        .unwrap();
+
+    // Append on A; both B and C must catch up.
+    const N: u64 = 24;
+    for i in 0..N {
+        file_a
+            .append(format!("event-{i}").as_bytes())
+            .expect("append leader");
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut b_tail = 0u64;
+    let mut c_tail = 0u64;
+    while tokio::time::Instant::now() < deadline {
+        b_tail = file_b.next_seq();
+        c_tail = file_c.next_seq();
+        if b_tail == N && c_tail == N {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        b_tail, N,
+        "replica B did not catch up (got {b_tail}, expected {N})"
+    );
+    assert_eq!(
+        c_tail, N,
+        "replica C did not catch up (got {c_tail}, expected {N})"
+    );
+
+    // Spot-check payload contents on both replicas.
+    let events_b = file_b.read_range(0, N);
+    let events_c = file_c.read_range(0, N);
+    assert_eq!(events_b.len(), N as usize);
+    assert_eq!(events_c.len(), N as usize);
+    for i in 0..(N as usize) {
+        let expected = format!("event-{i}");
+        assert_eq!(events_b[i].payload.as_ref(), expected.as_bytes());
+        assert_eq!(events_c[i].payload.as_ref(), expected.as_bytes());
+    }
+
+    redex_a.close_file(&name).expect("close A");
+    redex_b.close_file(&name).expect("close B");
+    redex_c.close_file(&name).expect("close C");
 }
