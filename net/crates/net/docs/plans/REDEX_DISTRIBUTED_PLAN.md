@@ -520,10 +520,13 @@ This is the gating phase. Plan generously and treat regressions as test failures
 - 🔜 **MeshDaemon::snapshot() integration**: surface `tail_seq`, `last_sync_at`, `last_heartbeat_at`, current role per channel — needs a `MeshDaemon` surface that doesn't yet exist.
 - ✅ **Operator docs**: [`CONFIG_REPLICATION.md`](../CONFIG_REPLICATION.md) — quick start, every `ReplicationConfig` field explained, lifecycle diagram, observability section pinning the seven Prometheus shapes, failure-mode triage table, limits + non-goals. Cross-linked from [`STORAGE_AND_CORTEX.md`](../STORAGE_AND_CORTEX.md) (the "RedEX files default to strictly local" caveat now points operators at the opt-in surface).
 
-### Phase I — Bindings (1 week, parallelisable)
+### Phase I — Bindings (1 week, parallelisable) ⚠️ Node landed; Python + Go + C pending
 
-- Mostly serde for `ReplicationConfig` across Node, Python, Go, C bindings.
-- Mechanical; single engineer can do all four serially in a week, or four engineers can parallelise to 3 days.
+- ✅ **Node binding**: `Redex.enableReplication(mesh)`, `Redex.replicationRuntimeCount()`, `ReplicationConfigJs` (all six tunables plus `pinnedNodes: bigint[]`), `RedexFileConfigJs.replication?: ReplicationConfigJs`. `placement` and `onUnderCapacity` ride as enum strings (`"standard" | "pinned" | "colocation-strict"`, `"withdraw" | "evict-oldest"`) to keep the JS surface one level deep. Validation surfaces typed `redex:` errors before reaching the core. Gated on the `net` feature (the cortex-only build omits `enableReplication` since `NetMesh` isn't compiled). `index.d.ts` regenerated via `napi build --features redis,net,cortex,compute,groups`.
+- 🔜 **Python binding**: needs a structural change — current `Redex.open_file` uses positional pyo3 args (8+ Optional fields). Folding replication into a nested struct or a config-builder pattern is a separate PR.
+- 🔜 **Go binding**: same structural-change caveat — Go's Redex binding doesn't expose `open_file` config beyond `persistent`. Adding `replication` needs the FFI surface to grow.
+- 🔜 **C/FFI binding**: not investigated yet.
+- Mechanical once the structural-change shape is decided; remaining three bindings parallelize to ~2 days each.
 
 **Total: 4–9 focused weeks**. Lower bound assumes DST harness work fits in 1.5 weeks (existing harness extends cleanly; no new modeling primitives needed). Upper bound assumes DST work hits unforeseen complexity (3 weeks dedicated to harness + scenario depth). Treat the upper bound as the planning target.
 
