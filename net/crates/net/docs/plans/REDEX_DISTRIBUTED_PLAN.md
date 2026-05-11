@@ -4,13 +4,13 @@
 
 ## Status
 
-**Phases A + B landed; remaining phases blocked on Capability Phase B (and partially F).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
+**Phases A, B, H (scaffolding) landed; remaining phases blocked on Capability Phase B (and partially F).** All open design questions are ratified — see [Locked decisions](#locked-decisions).
 
 Hard prerequisites for the still-blocked phases:
 - **Capability Phase B** (tag-discovery primitives `Mesh::announce_chain` / `withdraw_chain` / `find_chain_holders`) — RedEX Phases C/D/E cannot start until this lands.
 - **Capability Phase F** (`PlacementFilter` + `IntentRegistry` + anti-affinity) — needed for *replica placement* in Phase C, but **not** for leader election. Election is decentralized and deterministic (nearest-RTT + NodeId tiebreak); see [Locked decision 3](#3-election-strategy--deterministic-nearest-rtt-with-nodeid-tiebreak).
 
-Phase A (wire protocol scaffold) ✅ and Phase B (`ReplicationConfig` opt-in) ✅ landed. Phases G–I can proceed in isolation as scaffolding.
+Phase A (wire protocol scaffold) ✅, Phase B (`ReplicationConfig` opt-in) ✅, and Phase H (metrics registry scaffolding) ⚠️ landed. Phase G needs Phase C's coordinator; Phase I needs cross-binding plumbing for `RedexFileConfig` that doesn't yet exist.
 
 Activation gate (when Warriors as a whole ships) is unchanged: a workload requesting durability guarantees beyond single-node. Realistic triggers: payment-tier customer, compliance-bound data class, pilot whose RTO is "< 5 s on node failure."
 
@@ -495,11 +495,18 @@ This is the gating phase. Plan generously and treat regressions as test failures
 - `EvictOldest` path: aggressive retention sweep; preserves replication factor at the cost of older data.
 - Pin both behaviors in test.
 
-### Phase H — Metrics + observability (3 days)
+### Phase H — Metrics + observability (3 days) ⚠️ scaffolding landed
 
-- All `dataforts_replication_*` metrics wired into `RpcMetricsRegistry`.
-- `MeshDaemon::snapshot()` for `ReplicationCoordinator`.
-- `BEHAVIOR.md` + `CONFIG_REPLICATION.md` operator docs.
+**Scaffolding side landed.** Coordinator integration + operator docs ship with Phase C.
+
+- ✅ `redex::replication_metrics::ReplicationMetricsRegistry` — per-channel `Arc<ChannelMetricsAtomic>` registry, bounded by `MAX_TRACKED_CHANNELS = 1024` with an `__overflow__` fold-bucket past the cap (mirrors `RpcMetricsRegistry`'s cardinality discipline).
+- ✅ Seven counter / gauge shapes pinned per [§11](#11-metrics): `dataforts_replication_lag_seconds{channel,role}`, `dataforts_replication_sync_bytes_total{channel}`, `dataforts_leader_changes_total{channel}`, `dataforts_replication_under_capacity_total{channel}`, `dataforts_replication_skip_ahead_total{channel}`, `dataforts_replication_election_thrash_total{channel}`, `dataforts_replication_witness_withdrawals_total{channel}`.
+- ✅ `ReplicationMetricsSnapshot::prometheus_text()` renderer — HELP + TYPE blocks per metric; sorted-by-channel emission for byte-stable goldens; unobserved lag roles omitted entirely (no NaN); Prometheus-spec label escaping for `\` / `"` / `\n` / `\r`.
+- ✅ `record_leader_lag` / `record_replica_lag` saturate `Duration::MAX` rather than panicking on overflow.
+- ✅ 13 unit tests covering idempotent `for_channel`, distinct-channel isolation, overflow fold + previously-seen-channel-skips-overflow, lag observability transitions, sorted snapshot, full Prometheus emission, label escaping, totals aggregation.
+- 🔜 **Phase C wiring**: `ReplicationCoordinator` increments the counters at its state-transition + heartbeat + sync seams.
+- 🔜 **Phase C**: `MeshDaemon::snapshot()` for `ReplicationCoordinator` surfacing `tail_seq`, `last_sync_at`, `last_heartbeat_at`, current role.
+- 🔜 **Phase C**: `BEHAVIOR.md` + `CONFIG_REPLICATION.md` operator docs (concrete behavior to document doesn't exist yet).
 
 ### Phase I — Bindings (1 week, parallelisable)
 

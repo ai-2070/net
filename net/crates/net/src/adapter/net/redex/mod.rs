@@ -26,6 +26,7 @@ mod manager;
 mod ordered;
 pub mod replication;
 mod replication_config;
+mod replication_metrics;
 mod retention;
 mod segment;
 mod typed;
@@ -49,5 +50,9 @@ pub use replication_config::{
     PlacementStrategy, ReplicationConfig, ReplicationConfigError, UnderCapacity,
     HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MIN, REPLICATION_BUDGET_FRACTION_DEFAULT,
     REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX, REPLICATION_FACTOR_MIN,
+};
+pub use replication_metrics::{
+    ChannelMetrics, ChannelMetricsAtomic, ReplicationMetricsRegistry,
+    ReplicationMetricsSnapshot, MAX_TRACKED_CHANNELS, OVERFLOW_CHANNEL_LABEL,
 };
 pub use typed::TypedRedexFile;
