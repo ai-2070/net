@@ -1,0 +1,29 @@
+net/crates/net/docs/misc/DATAFORTS_PLAN.md
+  s_4dbb97ea6ebffd::t_00d18af49890b9 60-69
+  s_4dbb97ea6ebffd::t_c50c8a85b17f8c 492
+  s_4dbb97ea6ebffd::t_181920662e6502 582
+  s_4dbb97ea6ebffd::t_acdf8b7429890f 739-902
+  s_4dbb97ea6ebffd::t_9c5c8d3c79f1fe 165
+  s_4dbb97ea6ebffd::t_0e7868b8746c21 335
+  s_4dbb97ea6ebffd::t_65217b64138cc6 410
+  s_4dbb97ea6ebffd::t_4b3d310a130be7 543
+  s_4dbb97ea6ebffd::t_ebb069daf0ac85 235
+  s_4dbb97ea6ebffd::t_9b2e13c6fef060 7-19
+  s_4dbb97ea6ebffd::t_3c590f281076d4 80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "208fdb8e752fec0ebf586bfeafe34407bff4559b",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
