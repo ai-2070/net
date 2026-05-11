@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_9163f300668f8b::t_e9d14e9210a80d 6108
+  s_9163f300668f8b::t_479d4e394e490c 1607
+  s_9163f300668f8b::t_42bedd12a88463 5910-5914
+  s_9163f300668f8b::t_92ac2cc87ce216 55
+  s_9163f300668f8b::t_698bb35f707b11 9144-9302
+  s_9163f300668f8b::t_e8e1d58bdcdcc2 1276-1284
+  s_9163f300668f8b::t_495a2c01216794 6198-6200,6205-6209
+  s_9163f300668f8b::t_29d75949025763 6037-6107,6109-6197,6201-6202,6210-6222
+  s_9163f300668f8b::t_d6df409d608dd7 6203-6204
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_9163f300668f8b::t_a18eb009a5eefb 7,9-11
+  s_9163f300668f8b::t_32c311725d13b2 447
+net/crates/net/tests/chain_discovery.rs
+  s_9163f300668f8b::t_ec2c8bafe13210 168-169,182-196
+  s_9163f300668f8b::t_5f6f1f05c0e0b7 82-85,87,89-91
+  s_9163f300668f8b::t_a2d8f86cc0633e 1-81,86,88,92-167,170-181,197-262
+net/crates/net/docs/plans/CAPABILITY_SYSTEM_PLAN.md
+  s_9163f300668f8b::t_cd8e4f98350de5 617-627
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "1a6c82d5451e4cf583e60d25f9575cbcfc43677d",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
