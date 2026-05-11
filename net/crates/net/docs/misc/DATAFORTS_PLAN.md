@@ -14,7 +14,7 @@
 | 2 — RedEX cross-node replication (`SUBPROTOCOL_REDEX`) | Warriors | ✅ shipped v0.14 | `adapter::net::redex::replication*` |
 | 1 — Greedy-LRU dataforts | Rebel Yell | ✅ shipped on `dataforts-phase-1` branch (behind `dataforts-greedy` feature) | `adapter::net::dataforts::greedy::*`, `Redex::enable_greedy_dataforts`, mesh inbound hook, all four bindings |
 | 3 — `BlobRef` + `BlobAdapter` hook | Rebel Yell | ⏳ open (independent — can ship parallel) | — |
-| 4 — Data gravity (heat-counter migration) | Rebel Yell | ⏳ open (depends on Phase 1) | — |
+| 4 — Data gravity (heat-counter migration) | Rebel Yell | ✅ shipped on `dataforts-phase-4` branch (behind `dataforts-gravity` feature) | `adapter::net::dataforts::gravity::*`, `Redex::enable_gravity_for_greedy`, `MeshNode::announce_heat`, all four bindings |
 | 5 — Read-your-writes guarantees | Rebel Yell | ⏳ open (independent) | — |
 | 6 — MeshDB extension (time-travel, lineage walks, cross-chain joins) | Deferred | ⏳ research-grade; out of either release | — |
 
@@ -64,7 +64,7 @@ Seven phases across two releases, sequenced by dependency:
 | 7 | Generalized 5-axis `PlacementFilter` + Mikoshi integration | **Warriors** | ✅ v0.13 | 1–2 weeks | Foundation for placement decisions across substrate (data + compute) | 0, 6 |
 | 2 | RedEX V2 — raw log-segment replication | **Warriors** | ✅ v0.14 | 4–9 weeks | Workload needs durability beyond single node | 0, 7 |
 | 1 | Greedy-LRU dataforts (composes `PlacementFilter`) | **Rebel Yell** | ✅ shipped (branch `dataforts-phase-1`) | 1–2 weeks | Rebel Yell ships | 0, 7 |
-| 4 | Data gravity (heat-counter migration) | **Rebel Yell** | ⏳ open | 1–2 weeks | Production telemetry shows access skew Phase 1 doesn't absorb | 0, 1 |
+| 4 | Data gravity (heat-counter migration) | **Rebel Yell** | ✅ shipped (branch `dataforts-phase-4`) | 1–2 weeks | Production telemetry shows access skew Phase 1 doesn't absorb | 0, 1 |
 | 3 | BlobRef + BlobAdapter hook trait | **Rebel Yell** (parallel-shippable with Warriors) | ⏳ open | 1–2 weeks | Payloads systematically exceed inline threshold (default 1 MB) | 0 (independent of 1, 2) |
 | 5 | Read-your-writes guarantees | **Rebel Yell** | ⏳ open | 2–4 weeks | App ergonomics request session-bounded consistency | — |
 
@@ -489,7 +489,7 @@ If a customer specifically cannot use any existing blob backend (extreme isolati
 
 ---
 
-## Phase 4 — Data gravity (heat-counter migration) ⏳ open
+## Phase 4 — Data gravity (heat-counter migration) ✅ shipped on `dataforts-phase-4`
 
 Once Phases 0 + 1 ship, the mesh has the substrate to observe which chains are most-read. Phase 4 closes the loop: nodes pull data toward themselves when read pressure justifies it. The features doc reframed this as **emergent behavior of greedy + heat counters**, not a separate migration engine — which collapses the effort estimate dramatically.
 
