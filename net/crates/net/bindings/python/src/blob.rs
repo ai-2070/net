@@ -14,9 +14,11 @@
 //! of scope. The current binding lets Python apps use blob storage
 //! today through a Rust-backed adapter.
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -231,4 +233,155 @@ pub fn blob_resolve<'py>(
         .detach(|| rt.block_on(async move { resolve_payload(&payload, adapter.as_ref()).await }))
         .map_err(map_blob_err)?;
     Ok(PyBytes::new(py, &bytes))
+}
+
+// =========================================================================
+// Python-implemented BlobAdapter wrapper
+// =========================================================================
+
+/// `BlobAdapter` impl that bridges to a Python object holding sync
+/// `store` / `fetch` / `fetch_range` / `exists` methods. Each call
+/// crosses the FFI via `spawn_blocking` + `Python::attach` so the
+/// tokio worker thread isn't pinned during Python execution.
+///
+/// The Python adapter MUST implement:
+/// ```python
+/// class MyAdapter:
+///     def store(self, blob_ref: BlobRef, data: bytes) -> None: ...
+///     def fetch(self, blob_ref: BlobRef) -> bytes: ...
+///     def fetch_range(self, blob_ref: BlobRef, start: int, end: int) -> bytes: ...
+///     def exists(self, blob_ref: BlobRef) -> bool: ...
+/// ```
+///
+/// Python exceptions raised inside any method bubble up as
+/// `BlobError::Backend(str(exc))`. Cleanly distinguishing
+/// `NotFound` from other backend errors at the bridge layer
+/// requires the Python adapter to expose a dedicated marker —
+/// future slice; for now everything collapses to Backend.
+pub struct PyBlobAdapter {
+    id: String,
+    py_obj: Arc<Py<PyAny>>,
+}
+
+impl PyBlobAdapter {
+    pub fn new(id: String, py_obj: Py<PyAny>) -> Self {
+        Self {
+            id,
+            py_obj: Arc::new(py_obj),
+        }
+    }
+}
+
+fn pyerr_to_backend(label: &str, err: PyErr) -> InnerBlobError {
+    InnerBlobError::Backend(format!("{}: {}", label, err))
+}
+
+#[async_trait]
+impl BlobAdapter for PyBlobAdapter {
+    fn adapter_id(&self) -> &str {
+        &self.id
+    }
+
+    async fn store(
+        &self,
+        blob_ref: &InnerBlobRef,
+        bytes: &[u8],
+    ) -> Result<(), InnerBlobError> {
+        let obj = self.py_obj.clone();
+        let blob = blob_ref.clone();
+        let data = bytes.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<(), InnerBlobError> {
+            Python::attach(|py| {
+                let py_blob = PyBlobRef { inner: blob };
+                let py_data = PyBytes::new(py, &data);
+                obj.bind(py)
+                    .call_method1("store", (py_blob, py_data))
+                    .map(|_| ())
+                    .map_err(|e| pyerr_to_backend("store", e))
+            })
+        })
+        .await
+        .map_err(|e| InnerBlobError::Backend(format!("spawn_blocking join: {}", e)))?
+    }
+
+    async fn fetch(&self, blob_ref: &InnerBlobRef) -> Result<Vec<u8>, InnerBlobError> {
+        let obj = self.py_obj.clone();
+        let blob = blob_ref.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, InnerBlobError> {
+            Python::attach(|py| {
+                let py_blob = PyBlobRef { inner: blob };
+                let ret = obj
+                    .bind(py)
+                    .call_method1("fetch", (py_blob,))
+                    .map_err(|e| pyerr_to_backend("fetch", e))?;
+                let bytes: Vec<u8> = ret
+                    .extract()
+                    .map_err(|e| pyerr_to_backend("fetch return", e))?;
+                Ok(bytes)
+            })
+        })
+        .await
+        .map_err(|e| InnerBlobError::Backend(format!("spawn_blocking join: {}", e)))?
+    }
+
+    async fn fetch_range(
+        &self,
+        blob_ref: &InnerBlobRef,
+        range: Range<u64>,
+    ) -> Result<Vec<u8>, InnerBlobError> {
+        let obj = self.py_obj.clone();
+        let blob = blob_ref.clone();
+        let start = range.start;
+        let end = range.end;
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, InnerBlobError> {
+            Python::attach(|py| {
+                let py_blob = PyBlobRef { inner: blob };
+                let ret = obj
+                    .bind(py)
+                    .call_method1("fetch_range", (py_blob, start, end))
+                    .map_err(|e| pyerr_to_backend("fetch_range", e))?;
+                let bytes: Vec<u8> = ret
+                    .extract()
+                    .map_err(|e| pyerr_to_backend("fetch_range return", e))?;
+                Ok(bytes)
+            })
+        })
+        .await
+        .map_err(|e| InnerBlobError::Backend(format!("spawn_blocking join: {}", e)))?
+    }
+
+    async fn exists(&self, blob_ref: &InnerBlobRef) -> Result<bool, InnerBlobError> {
+        let obj = self.py_obj.clone();
+        let blob = blob_ref.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool, InnerBlobError> {
+            Python::attach(|py| {
+                let py_blob = PyBlobRef { inner: blob };
+                let ret = obj
+                    .bind(py)
+                    .call_method1("exists", (py_blob,))
+                    .map_err(|e| pyerr_to_backend("exists", e))?;
+                let flag: bool = ret
+                    .extract()
+                    .map_err(|e| pyerr_to_backend("exists return", e))?;
+                Ok(flag)
+            })
+        })
+        .await
+        .map_err(|e| InnerBlobError::Backend(format!("spawn_blocking join: {}", e)))?
+    }
+}
+
+/// Register a Python-implemented BlobAdapter. `instance` must be a
+/// Python object with `store(blob_ref, data) -> None`,
+/// `fetch(blob_ref) -> bytes`,
+/// `fetch_range(blob_ref, start, end) -> bytes`, and
+/// `exists(blob_ref) -> bool` methods. Each call is dispatched to
+/// the Python instance via `spawn_blocking` so the substrate's
+/// tokio runtime isn't blocked during Python execution.
+#[pyfunction]
+pub fn register_blob_adapter(adapter_id: String, instance: Py<PyAny>) -> PyResult<()> {
+    let adapter: Arc<dyn BlobAdapter> = Arc::new(PyBlobAdapter::new(adapter_id.clone(), instance));
+    global_blob_adapter_registry()
+        .register(adapter)
+        .map_err(|e| BlobError::new_err(format!("{}", e)))
 }

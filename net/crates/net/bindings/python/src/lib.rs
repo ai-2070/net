@@ -2275,6 +2275,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_class::<blob::PyBlobRef>()?;
         m.add_function(wrap_pyfunction!(blob::register_filesystem_blob_adapter, m)?)?;
+        m.add_function(wrap_pyfunction!(blob::register_blob_adapter, m)?)?;
         m.add_function(wrap_pyfunction!(blob::unregister_blob_adapter, m)?)?;
         m.add_function(wrap_pyfunction!(blob::blob_adapter_registered, m)?)?;
         m.add_function(wrap_pyfunction!(blob::blob_adapter_ids, m)?)?;
