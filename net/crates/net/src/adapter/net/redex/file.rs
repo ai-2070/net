@@ -351,6 +351,22 @@ impl RedexFile {
         self.inner.state.lock().index.is_empty()
     }
 
+    /// Sum of `payload_len` across every currently-retained entry.
+    /// Reflects the substrate's authoritative view of bytes-on-disk
+    /// after retention trim; callers that maintain their own
+    /// monotonic byte counters (e.g. greedy's GreedyCacheRegistry)
+    /// use this to resync periodically. O(n) over the retained
+    /// index; cheap for the typical few-K-entry case but the caller
+    /// shouldn't call it per-event.
+    pub fn retained_bytes(&self) -> u64 {
+        let state = self.inner.state.lock();
+        state
+            .index
+            .iter()
+            .map(|e| u64::from(e.payload_len))
+            .sum()
+    }
+
     /// Next sequence to be assigned (== total append count since open,
     /// including any evicted head).
     ///

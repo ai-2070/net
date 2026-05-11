@@ -159,6 +159,29 @@ impl GreedyCacheRegistry {
         self.total_bytes
     }
 
+    /// Resync every cached entry's byte count against the
+    /// authoritative `RedexFile::retained_bytes` reading. The
+    /// registry's per-entry `bytes` counter is monotonic — `append`
+    /// adds, eviction subtracts, but retention trim inside the
+    /// `RedexFile` doesn't propagate back. Long-running hot,
+    /// retention-trimmed channels see `entry.bytes` drift
+    /// arbitrarily above what's actually on disk; eventually the
+    /// cluster-cap budget reads "full" while disk reads near-empty
+    /// and every admission false-rejects. Periodic resync re-anchors
+    /// `entry.bytes` (and `total_bytes`) on the substrate's view.
+    ///
+    /// O(n) over cached channels; intended for a periodic background
+    /// task (e.g. heartbeat-aligned) not the per-event hot path.
+    pub fn resync_bytes_from_files(&mut self) {
+        let mut new_total: u64 = 0;
+        for entry in self.entries.values_mut() {
+            let on_disk = entry.file.retained_bytes();
+            entry.bytes = on_disk;
+            new_total = new_total.saturating_add(on_disk);
+        }
+        self.total_bytes = new_total;
+    }
+
     /// Cluster-wide cap.
     pub fn total_cap_bytes(&self) -> u64 {
         self.total_cap_bytes
@@ -552,6 +575,49 @@ mod tests {
         let evicted = &sweep.evicted[0];
         assert_eq!(evicted.channel, cn("a"));
         assert_eq!(evicted.origin_hash, 0xAAAA_AAAA_AAAA_AAAA);
+    }
+
+    #[test]
+    fn resync_bytes_from_files_anchors_total_on_substrate_view() {
+        // Registry tracks monotonic appends; RedexFile retention is
+        // separate and runs via `sweep_retention()`. After enough
+        // appends + a sweep, on-disk bytes < registry's count.
+        // Resync re-anchors on the substrate's authoritative view.
+        let redex = Redex::new();
+        let mut reg = GreedyCacheRegistry::new(1_000_000);
+        let now = Instant::now();
+        let per_channel_cap = 2048u64;
+        reg.upsert(cn("test/a"), open_file(&redex, "test/a", per_channel_cap), now);
+
+        // Drive registry past the per-channel cap.
+        for _ in 0..20 {
+            let payload = vec![0u8; 1024];
+            let file = reg.get(&cn("test/a")).unwrap().file.clone();
+            file.append(&payload).unwrap();
+            reg.note_appended(&cn("test/a"), payload.len() as u64, now);
+        }
+        let pre_resync_bytes = reg.total_bytes();
+        assert!(
+            pre_resync_bytes >= 20 * 1024,
+            "registry must have accumulated monotonic bytes; got {}",
+            pre_resync_bytes,
+        );
+
+        // Trigger substrate-side retention trim.
+        let file = reg.get(&cn("test/a")).unwrap().file.clone();
+        file.sweep_retention();
+
+        // Resync — total drops to actual on-disk usage.
+        reg.resync_bytes_from_files();
+        let post_resync_bytes = reg.total_bytes();
+        assert!(
+            post_resync_bytes < pre_resync_bytes,
+            "resync must reduce drift (pre {} > post {})",
+            pre_resync_bytes,
+            post_resync_bytes,
+        );
+        // Entry's byte count was clamped too.
+        assert_eq!(reg.get(&cn("test/a")).unwrap().bytes, post_resync_bytes);
     }
 
     #[test]

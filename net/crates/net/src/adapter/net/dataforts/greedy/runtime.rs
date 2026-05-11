@@ -294,6 +294,18 @@ impl GreedyRuntime {
         self.inner.cache.lock().total_bytes()
     }
 
+    /// Resync the cache's per-entry byte counts against the
+    /// substrate's authoritative `RedexFile::retained_bytes` view.
+    /// Operators call this periodically (e.g. from a heartbeat-
+    /// aligned task) so the registry's monotonic counter doesn't
+    /// drift arbitrarily above what's actually on disk under hot,
+    /// retention-trimmed channels — without resync, cluster-cap
+    /// admission can false-reject indefinitely. O(n) over cached
+    /// channels; not for the hot path.
+    pub fn resync_cache_bytes(&self) {
+        self.inner.cache.lock().resync_bytes_from_files();
+    }
+
     /// True iff the local cache currently holds `channel`.
     pub fn contains(&self, channel: &ChannelName) -> bool {
         self.inner.cache.lock().contains(channel)
@@ -512,58 +524,46 @@ impl GreedyRuntime {
         }
 
         // 3. Lazy admission — open a per-channel cache file if we
-        //    don't have one yet, then append. Two concurrent
-        //    dispatch_event calls for the same new channel must
-        //    not both `upsert` (the second would orphan the first
-        //    file handle and announce the chain twice). We
-        //    double-check the cache after opening the file: only
-        //    the first caller's `upsert` lands; subsequent callers
-        //    drop their just-opened file on the floor.
-        let is_new_channel_outer = !self.inner.cache.lock().contains(channel);
-        let (file, is_new_channel) = if is_new_channel_outer {
-            let cfg = RedexFileConfig::default()
-                .with_retention_max_bytes(self.inner.config.per_channel_cap_bytes);
-            let opened = match self.inner.redex.open_file(channel, cfg) {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::trace!(
-                        channel = channel.as_str(),
-                        error = ?e,
-                        "greedy: failed to open cache file for new channel"
-                    );
-                    return DispatchOutcome::AppendFailed;
-                }
-            };
-            // Double-checked insert: another dispatch_event may
-            // have raced past the outer contains() check, opened
-            // its own file, and won. Re-check under the lock and
-            // only upsert if the channel is still absent. The
-            // loser's opened file drops here; harmless (RedexFile
-            // is Arc internally and reopening is idempotent).
-            let mut cache = self.inner.cache.lock();
-            if cache.contains(channel) {
-                let file = cache
-                    .get(channel)
-                    .map(|e| e.file.clone())
-                    .expect("just checked contains");
+        //    don't have one yet, then append. Steady-state (already-
+        //    cached channel) costs ONE cache.lock() acquisition; the
+        //    new-channel path costs two (the second one re-checks
+        //    under-lock after the file open, since opening is I/O
+        //    and can't be held under the cache lock). Two concurrent
+        //    dispatch_event calls for the same new channel both pass
+        //    the outer get() = None branch, both open a file, and
+        //    only one upsert lands — the loser's file is harmless to
+        //    drop (RedexFile is Arc-internal, reopen is idempotent).
+        let (file, is_new_channel) = {
+            let cache = self.inner.cache.lock();
+            if let Some(entry) = cache.get(channel) {
+                let file = entry.file.clone();
                 drop(cache);
                 (file, false)
             } else {
-                cache.upsert(channel.clone(), opened.clone(), now);
-                cache.set_origin_hash(channel, origin_hash);
                 drop(cache);
-                (opened, true)
+                let cfg = RedexFileConfig::default()
+                    .with_retention_max_bytes(self.inner.config.per_channel_cap_bytes);
+                let opened = match self.inner.redex.open_file(channel, cfg) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::trace!(
+                            channel = channel.as_str(),
+                            error = ?e,
+                            "greedy: failed to open cache file for new channel"
+                        );
+                        return DispatchOutcome::AppendFailed;
+                    }
+                };
+                let mut cache = self.inner.cache.lock();
+                if let Some(entry) = cache.get(channel) {
+                    // Lost the race; use the winner's handle.
+                    (entry.file.clone(), false)
+                } else {
+                    cache.upsert(channel.clone(), opened.clone(), now);
+                    cache.set_origin_hash(channel, origin_hash);
+                    (opened, true)
+                }
             }
-        } else {
-            // Channel present on outer check; read the handle out.
-            let cache = self.inner.cache.lock();
-            let Some(file) = cache.get(channel).map(|e| e.file.clone()) else {
-                // Raced with an evict between outer contains() and
-                // here; treat as a transient miss.
-                return DispatchOutcome::AppendFailed;
-            };
-            drop(cache);
-            (file, false)
         };
 
         if let Err(e) = file.append(payload) {
@@ -575,19 +575,20 @@ impl GreedyRuntime {
             return DispatchOutcome::AppendFailed;
         }
 
-        // 4. Byte accounting + cluster-cap eviction.
-        let sweep = {
+        // 4. Byte accounting + cluster-cap eviction. One lock
+        // acquisition covers both note_appended and the per-channel
+        // bytes_resident gauge read; the metrics set runs after
+        // dropping the lock so the contention window stays tight.
+        let (sweep, resident_bytes) = {
             let mut cache = self.inner.cache.lock();
             let sweep = cache.note_appended(channel, payload_bytes, now);
-            // Refresh per-channel bytes gauge.
-            if let Some(entry) = cache.get(channel) {
-                self.inner
-                    .metrics
-                    .for_channel(channel.as_str())
-                    .set_bytes_resident(entry.bytes);
-            }
-            sweep
+            let resident = cache.get(channel).map(|e| e.bytes).unwrap_or(0);
+            (sweep, resident)
         };
+        self.inner
+            .metrics
+            .for_channel(channel.as_str())
+            .set_bytes_resident(resident_bytes);
 
         let sink = self.inner.sink.clone();
 
