@@ -1,0 +1,25 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_REDEX_DISTRIBUTED.md
+  s_d760092f02a89c::t_35763fb7e1dc91 48-50
+  s_d760092f02a89c::t_6da9bf0f84f1b9 62-63
+net/crates/net/src/adapter/net/mesh.rs
+  s_d760092f02a89c::t_d8a4542d55eefc 3417-3421,3424-3426
+  s_d760092f02a89c::t_115af8b90c2a78 3422-3423
+net/crates/net/src/adapter/net/redex/replication.rs
+  s_d760092f02a89c::t_0d11b51991ad32 649-650
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "137f361310c28f1c43065d22021a570912850ad7",
+  "prompts": {},
+  "sessions": {
+    "s_d760092f02a89c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ef8b8023-dce0-4b44-bfb8-b07c462d6685",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
