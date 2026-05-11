@@ -5,7 +5,7 @@ name: Release Python
 # The pure-Python SDK `ai2070-net-sdk` ships via
 # `release-pypi-sdk.yml`.
 #
-# Tag schema: `python-v<semver>` (e.g. `python-v0.13.0`).
+# Tag schema: `python-v<semver>` (e.g. `python-v0.14.0`).
 #
 # Authentication: PyPI Trusted Publishing — the `pypi`
 # environment + `id-token: write` permission combination below.
