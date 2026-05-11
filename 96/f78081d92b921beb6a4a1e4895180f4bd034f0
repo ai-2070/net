@@ -1,0 +1,22 @@
+net/crates/net/src/ffi/cortex.rs
+  s_4dbb97ea6ebffd::t_695166644a3ad1 523-528
+  s_4dbb97ea6ebffd::t_64691d8bc1e5b6 2254-2257,2267-2271
+  s_4dbb97ea6ebffd::t_6a00cde1886388 809-813
+  s_4dbb97ea6ebffd::t_9fa5013d4651ac 2228-2253,2258-2266,2272-2282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "96f78081d92b921beb6a4a1e4895180f4bd034f0",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
