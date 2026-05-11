@@ -45,7 +45,7 @@ Tagged `[H | M | L]`:
 | R-20  | M   | catchup     | `append_batch` error stringified — typed variants erased                  | 🚫 deferred — handle_disk_pressure already uniform |
 | R-21  | M   | manager     | `try_dispatch(Shutdown)` on reopen path is lossy at cap-1024              | 📝 documented belt-and-suspenders (Arc-drop is the canonical exit) |
 | R-22  | M   | manager     | `NIC_PEAK_BYTES_PER_S = 125_000_000` hardcoded without `// TODO` tag      | ✅ |
-| R-23  | M   | wire        | `WireError::Truncated.need` formula reports nonsensical value             | ✅ (R-5 commit) |
+| R-23  | M   | wire        | `WireError::Truncated.need` formula reports nonsensical value             | ⚠️ reopened — see R-45 (SyncNack arm) |
 | R-24  | M   | mesh        | Replication inbound dispatch is O(peers) per frame                        | 🚫 deferred — needs session→node reverse-map across all subprotocols |
 | R-25  | M   | mesh        | `from_node` falls back to `0`, a valid NodeId sentinel collision          | ✅ |
 | R-26  | M   | bindings    | Python silently accepts both `colocation_strict` and `colocation-strict`  | ✅ |
@@ -67,10 +67,30 @@ Tagged `[H | M | L]`:
 | R-41  | L   | e2e         | Fixed 500ms `tokio::time::sleep` before leader close — flake risk         | ✅ |
 | R-42  | L   | node binding| `.d.ts` unconditionally emits `enableReplication` despite `cfg` gating    | 📝 documented cross-link to R-7 stub |
 | R-43  | L   | go binding  | `typedef ArcMeshNode` collides with upstream `net_compute_mesh_arc_t`     | 📝 documented as alias |
-| C-1   | M   | tests       | No DST scenario exercises "election storms" (plan §F)                     | ✅ |
+| C-1   | M   | tests       | No DST scenario exercises "election storms" (plan §F)                     | ⚠️ reopened — see R-46 (counter not asserted) |
 | C-2   | M   | tests       | Divergence-freedom check only runs on happy path, not after fault         | ✅ |
 | C-3   | M   | tests       | `chain_discovery.rs` tests are single-node only                           | 🚫 deferred — multi-peer coverage needs broader test harness |
 | C-4   | L   | tests       | No FFI test exercises `net_redex_enable_replication` success path        | 📝 R-8 regression test covers the error path; success path is e2e-only |
+| R-45  | M   | wire        | `SyncNack::from_bytes` `Truncated.need` formula still wrong (R-23 arm)    | ⏳ |
+| R-46  | M   | tests       | Election-storm DST scenario never references `election_thrash_total`     | ⏳ |
+| R-47  | M   | wire        | `SyncNack::to_bytes` truncates `detail` mid-UTF-8 codepoint               | ⏳ |
+| R-48  | M   | runtime     | Post-election second `transition_to` failure strands coordinator in Candidate | ⏳ |
+| R-49  | M   | runtime     | `cancel()` uses `inbox.send(Shutdown).await` — hangs on full bounded inbox | ⏳ |
+| R-50  | M   | runtime     | `let _ = current_role;` half-applied R-10 fix — dead binding              | ⏳ |
+| R-51  | M   | runtime     | Disk-pressure / channel-closed signals send invalid transitions from Leader / Candidate | ⏳ |
+| R-52  | M   | runtime     | `ReplicationRuntimeHandle` lacks `Drop` — task + dispatcher Arc cycle leaks if handle dropped out-of-band | ⏳ |
+| R-53  | M   | manager     | Reopen with differing replication config silently drops the new config    | ⏳ |
+| R-54  | M   | ffi         | `net_redex_open_file` / `net_redex_file_tail` don't pre-zero out-pointers on error paths | ⏳ |
+| R-55  | M   | py binding  | `runtime.block_on` in open/tail/watch paths holds the GIL across async work | ⏳ |
+| R-56  | M   | node binding| Sync `#[napi]` methods do blocking disk I/O on the JS event-loop thread   | ⏳ |
+| R-57  | L   | heartbeat   | `heartbeat_ms.saturating_mul(miss_threshold)` with bad config disables silence detection | ⏳ |
+| R-58  | L   | docs        | `include/README.md` lists symbols but is missing several `net_redex_*` entries | ⏳ |
+| R-59  | L   | e2e         | `replication_overhead_within_30_percent_budget` is wall-clock perf on shared CI — flake | ⏳ |
+| R-60  | L   | e2e         | `bandwidth_budget_is_observable_in_metrics` proves field plumbing, not that the budget engages | ⏳ |
+| R-61  | L   | loom        | Metrics loom model increments different counters per thread; no contention exercised | ⏳ |
+| R-62  | L   | budget      | `BandwidthBudget::try_consume` for a request larger than `capacity` can never succeed | ⏳ |
+| R-63  | L   | election    | Healthy peers with `rtt_to == None` are silently excluded from candidacy  | ⏳ |
+| R-64  | L   | go binding  | `factor` / `heartbeat_ms` out-of-range route to `ErrReplicationRequiresEnable`, not `ErrInvalidReplicationConfig` | ⏳ |
 
 ---
 
@@ -490,3 +510,209 @@ announces. Multi-peer paths are untested at this layer.
 All 6 new FFI tests assume "replication not enabled." Add a test that
 constructs a `Box<Arc<MeshNode>>`, calls `enable_replication`, observes
 `replication_runtime_count > 0` after `open_file`.
+
+---
+
+## 2026-05-12 — second pass
+
+A fresh review after the R-1…R-44 / C-1…C-4 fixes landed surfaced one
+regression in the SyncNack arm of the original R-23 fix, a real-coverage
+gap in the election-storm DST scenario, and a batch of runtime / binding
+hardening. Status column above tracks each item; descriptions below.
+
+### R-45: `SyncNack::from_bytes` `Truncated.need` formula still wrong
+`net/crates/net/src/adapter/net/redex/replication.rs:586`. The R-23 fix
+shipped for `SyncResponse` (`:463`, `:472` correctly compute
+`consumed + needed`), but `SyncNack::from_bytes` still computes
+`need = data.len() + (detail_len - cursor.remaining())`. This double-adds
+the consumed prefix; the reported `need` overstates the real requirement
+by `cursor.remaining()`.
+
+**Fix:** `need = (data.len() - cursor.remaining()) + detail_len` —
+consumed-so-far + still-needed. Regression test pinning the value.
+
+### R-46: Election-storm DST scenario never references `election_thrash_total`
+`net/crates/net/tests/redex_replication_dst.rs` — the
+`election_storm_two_rounds_each_converges_within_hysteresis` scenario
+satisfies "the storm shape exists" but the original C-1 ask was to assert
+`election_thrash_total` bumps. The harness currently drives state cells
+via `force_transition`, bypassing `ReplicationCoordinator`, so the metric
+is unreachable from this test.
+
+**Fix:** Route the second/third election transitions through
+`coordinator.transition_to(Candidate, MissedHeartbeats)` so the
+coordinator's metric increments fire, and assert the counter at the end.
+
+### R-47: `SyncNack::to_bytes` truncates `detail` mid-UTF-8 codepoint
+`replication.rs:553-563` — `detail_bytes[..detail_len]` is a byte slice;
+for a multi-byte UTF-8 codepoint straddling the
+`SYNC_NACK_DETAIL_MAX` boundary the truncation produces invalid UTF-8.
+The peer's `from_bytes` then fails the `std::str::from_utf8` check and
+the whole frame is rejected.
+
+**Fix:** Floor the cap to a UTF-8 char boundary before slicing.
+
+### R-48: Post-election second `transition_to` failure strands Candidate
+`replication_runtime.rs:564-578`. The R-2 fix correctly gates
+`clear_believed_leader` on `Ok(_)` from the second `transition_to`, but
+adds no fallback on `Err`. Candidate `tick()` emits nothing and triggers
+no transition, so the coordinator sits silent until an inbound heartbeat
+re-resolves a leader. Real possibility under chain-tag-sink failure.
+
+**Fix:** On `Err` from the post-election transition, fall back to
+`transition_to(Idle, GracefulRelinquish)` and clear the believed leader
+so the next tick re-enters discovery.
+
+### R-49: `cancel()` hangs on full inbox
+`replication_runtime.rs:291`. `self.inbox.send(Inbound::Shutdown).await`
+on a bounded mpsc (1024) with no `try_send` fast path. If the task is
+wedged on a slow tag-sink await and the inbox has 1024 frames queued,
+`cancel()` blocks indefinitely.
+
+**Fix:** Try `try_send` first; on `Full`, abort the task via
+`JoinHandle::abort()` and proceed to the `.await`.
+
+### R-50: Dead `let _ = current_role;` clutter
+`replication_runtime.rs:517`. Looks like a half-applied R-10 fix.
+`current_role` is captured in the tracker-lock critical section then
+immediately discarded. Either drop the binding entirely or wire it to
+the lag-metric path.
+
+**Fix:** Remove the binding; `tick()` already encodes the role for its
+outcome.
+
+### R-51: Invalid transitions silently logged on disk-pressure / channel-close
+`replication_runtime.rs` — `handle_disk_pressure` and the
+`SyncNackError::ChannelClosed` arm drive
+`transition_to(Idle, DiskPressureWithdraw)` unconditionally. The
+transition matrix only permits `Replica → Idle` for this signal; a
+Leader or Candidate observing the same event hits the matrix-reject
+arm and the runtime logs+drops. The leader keeps writing through disk
+pressure.
+
+**Fix:** Pick the signal per current role —
+`Leader → Idle` via `GracefulRelinquish`,
+`Candidate → Idle` via `GracefulRelinquish`,
+`Replica → Idle` via `DiskPressureWithdraw`.
+
+### R-52: `ReplicationRuntimeHandle` lacks `Drop`
+`replication_runtime.rs:248-316`. The R-14 fix documents the Arc-cycle
+invariant but the handle still has no `Drop`. Cycle break relies on
+`ReplicationWiring::drop` (`manager.rs:71-81`) un-installing the router.
+A handle dropped out-of-band (test scaffolding, future caller misuse)
+leaves the spawned task + dispatcher Arc alive until the inbox sender
+is gc'd elsewhere.
+
+**Fix:** Add `Drop` that issues `JoinHandle::abort()` on the stored
+task — best-effort, never blocks. The runtime's graceful Idle
+transition is best-effort already.
+
+### R-53: Reopen with differing replication config silently drops the new config
+`manager.rs:319-365`. `Entry::Occupied` returns the existing file
+without comparing the supplied `replication` block against the original.
+An operator re-opening with a different factor / heartbeat / placement
+reuses the original config with zero diagnostic.
+
+**Fix:** Compare the supplied config against the live channel; on
+mismatch return a typed error.
+
+### R-54: `net_redex_open_file` / `net_redex_file_tail` don't pre-zero out-pointers
+`src/ffi/cortex.rs:514-594` (`net_redex_open_file`),
+`:794-818` (`net_redex_file_tail`). On every non-zero return the
+out-pointer is left untouched. cgo / C consumers that read `*out_handle`
+after `rc != 0` see stale stack data.
+
+**Fix:** `*out_handle = std::ptr::null_mut();` at function entry; same
+for `out_cursor`.
+
+### R-55: Python `runtime.block_on` holds the GIL across async work
+`bindings/python/src/cortex.rs:743-790, 1205-1252, :566, :951, :1004,
+:1442, :1496`. Existing precedent in the same file (`:618`,
+`:831-836`, `:1299-1305`) wraps `block_on` in `py.detach(|| …)`. Same
+pattern is missing on the open / tail / watch paths — every other
+Python thread stalls during persistent-dir replay.
+
+**Fix:** Wrap each `runtime.block_on` in `py.detach(|| …)` so other
+Python threads can run.
+
+### R-56: Node redex methods block the JS event loop on disk I/O
+`bindings/node/src/cortex.rs:211-226, 492-498, 526-535, 576-578,
+583-585`. `Redex::open_file`, `RedexFile::append/read_range/sync/close`
+are sync `#[napi]`. With `persistent=true` + `FsyncPolicy::EveryN(1)`
+the fsync runs on the event-loop thread.
+
+**Fix:** Move the disk-I/O methods (`append`, `read_range`, `sync`,
+`close`) to `AsyncTask` / `spawn_blocking` so the event loop stays
+responsive.
+
+### R-57: `heartbeat_ms` validation gap
+`replication_heartbeat.rs:158,211`. `saturating_mul(heartbeat_ms,
+miss_threshold)` with `heartbeat_ms = u64::MAX` saturates, making
+`is_leader_silent` always false. The binding layer accepts
+`heartbeat_ms` up to `u64::MAX` because no upper ceiling is enforced.
+
+**Fix:** Pin a sane upper ceiling (`HEARTBEAT_MS_MAX = 300_000`) in
+the config validator.
+
+### R-58: `include/README.md` symbol list is incomplete
+`net/crates/net/include/README.md:521-528` — declares `net_redex_*`
+symbols but is missing `net_redex_file_close`, `net_redex_file_sync`,
+`net_redex_file_read_range`, `net_redex_file_tail`, `net_redex_tail_next`,
+`net_redex_tail_free`.
+
+**Fix:** Add the missing entries.
+
+### R-59: e2e overhead test will flake on shared CI
+`tests/redex_replication_e2e.rs:550-654` —
+`replication_overhead_within_30_percent_budget` is a wall-clock perf
+test with a 1.3× hard ratio; shared CI runners can blow this on noise.
+
+**Fix:** Mark `#[ignore]` so the test is opt-in via
+`cargo test -- --ignored`.
+
+### R-60: `bandwidth_budget_is_observable_in_metrics` doesn't engage the budget
+`tests/redex_replication_e2e.rs:669-765` — asserts
+`under_capacity_total == 0` on 256 events, proving the field is
+plumbed but not that the budget engages.
+
+**Fix:** Either drive enough load to engage the budget or rename to
+`bandwidth_budget_metric_field_is_plumbed` to reflect what is actually
+asserted.
+
+### R-61: Loom metrics model races different counters per thread
+`tests/loom_models.rs:574-672`. Each thread increments a different
+counter, so loom can't observe a lost-update bug; effectively
+single-threaded per counter.
+
+**Fix:** Add a contended case where ≥2 threads call
+`incr_leader_change` on the same counter.
+
+### R-62: `BandwidthBudget::try_consume` starves on oversize requests
+`replication_budget.rs:111-123`. Capacity caps at one-second's tokens;
+a single request larger than `capacity` can never succeed even after
+infinite refill. Coordinator must split or bypass — not documented as
+a guard here.
+
+**Fix:** Make `try_consume` clamp `bytes` against `capacity` (single
+oversize event admitted as a one-off after refill) OR document the
+caller-side requirement explicitly in the API doc.
+
+### R-63: Election excludes peers with `rtt_to == None`
+`replication_election.rs:120-134`. Healthy peers with missing RTT
+measurements are silently excluded from candidacy. In real partitions
+this inflates the dual-leader window when one survivor lacks RTT for
+the other.
+
+**Fix:** Fall back to `Duration::MAX` (or a configurable
+"unknown-RTT penalty") so the peer remains a candidate at lowest
+priority instead of being dropped.
+
+### R-64: Go FFI rc routing for replication-config validation
+`bindings/go/net/redex.go:484-487` vs `src/ffi/cortex.rs:578`.
+Heartbeat-below-min / factor-out-of-range cases surface as
+`ErrReplicationRequiresEnable` because the Go binding's
+`validateReplicationConfig` only checks shape (placement / pinned /
+leader_pinned) not numeric ranges.
+
+**Fix:** Extend `validateReplicationConfig` to cover `factor` and
+`heartbeat_ms` ranges so the typed Go error matches the actual fault.
