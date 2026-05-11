@@ -120,6 +120,14 @@ pub mod handle_guard;
 #[allow(missing_docs)]
 pub mod cortex;
 
+/// C FFI for the Dataforts Phase 3 blob surface. Exposes the
+/// BlobRef wire codec, the global adapter registry, and the
+/// `publish_blob` / `resolve_payload` helpers for cgo / native
+/// consumers.
+#[cfg(feature = "dataforts")]
+#[allow(missing_docs)]
+pub mod blob;
+
 /// C FFI for the encrypted-UDP mesh transport + channels. Requires
 /// the `net` feature (which brings in the crypto + transport). Go /
 /// cgo consumers target this surface alongside `ffi::cortex`. See
