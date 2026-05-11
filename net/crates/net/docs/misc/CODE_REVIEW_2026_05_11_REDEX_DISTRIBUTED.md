@@ -23,8 +23,8 @@ Tagged `[H | M | L]`:
 
 | ID    | Pri | Area        | Title                                                                     | Status |
 |-------|-----|-------------|---------------------------------------------------------------------------|--------|
-| R-1   | H   | runtime     | Role-flip TOCTOU between `coordinator.role()` check and catchup dispatch  | ⚪ |
-| R-2   | H   | runtime     | `clear_believed_leader` runs after failed Candidate transition            | ⚪ |
+| R-1   | H   | runtime     | Role-flip TOCTOU between `coordinator.role()` check and catchup dispatch  | ✅ |
+| R-2   | H   | runtime     | `clear_believed_leader` runs after failed Candidate transition            | ✅ |
 | R-3   | H   | coordinator | Chain-tag side effects not serialized between concurrent transitions     | ⚪ |
 | R-4   | H   | runtime     | NACK `NotLeader` / `BadRange` handlers are placeholder TODOs              | ⚪ |
 | R-5   | H   | wire        | Replica cannot disambiguate retention-trim from split-brain divergence    | ⚪ |
@@ -32,10 +32,10 @@ Tagged `[H | M | L]`:
 | R-7   | H   | bindings    | `enable_replication` silently absent without `net` feature                | ⚪ |
 | R-8   | H   | FFI         | `net_redex_enable_replication` leaks `Box<Arc<MeshNode>>` on error paths  | ⚪ |
 | R-9   | H   | tests       | DST harness `wall_clock_ms` reads real wall-clock time, not step counter  | ⚪ |
-| R-10  | M   | runtime     | `current_role` captured before tracker lock; `tick()` runs against stale  | ⚪ |
+| R-10  | M   | runtime     | `current_role` captured before tracker lock; `tick()` runs against stale  | ✅ |
 | R-11  | M   | runtime     | `cancel()` race: `is_stopped()` can return true before task joined        | ⚪ |
-| R-12  | M   | runtime     | Only `Heartbeat` validates `channel_id`; other inbound types don't        | ⚪ |
-| R-13  | M   | runtime     | `GapBeforeChunk` underflow if `first_seq <= local_next`                   | ⚪ |
+| R-12  | M   | runtime     | Only `Heartbeat` validates `channel_id`; other inbound types don't        | ✅ |
+| R-13  | M   | runtime     | `GapBeforeChunk` underflow if `first_seq <= local_next`                   | ✅ |
 | R-14  | M   | runtime     | Dispatcher `Arc` cycle: MeshNode → router → handle → task → dispatcher    | ⚪ |
 | R-15  | M   | step        | Lag-driven `SyncRequest` doesn't filter `believed_leader != self`         | ⚪ |
 | R-16  | M   | step        | Dropped-leader leaves Replica without a Candidate path                    | ⚪ |
