@@ -1,0 +1,29 @@
+net/crates/net/src/ffi/cortex.rs
+  s_9163f300668f8b::t_c50aef71b4c942 560-565
+  s_9163f300668f8b::t_a5e956b2718e30 281-379,393-471
+  s_9163f300668f8b::t_d387caea926004 2450-2530
+net/crates/net/bindings/go/net/redex.go
+  s_9163f300668f8b::t_8a2edf2d7896c4 1-458
+net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_9163f300668f8b::t_b51304b2018ba6 540
+  s_9163f300668f8b::t_ebce06dceb3e5e 544
+  s_9163f300668f8b::t_b43ae660c25abd 7
+net/crates/net/docs/CONFIG_REPLICATION.md
+  s_9163f300668f8b::t_6113215ca12c72 65-100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "28e698b9e80f245a6ee110751e80e5f0aaa334bc",
+  "prompts": {},
+  "sessions": {
+    "s_9163f300668f8b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d30b5b2-2a66-44b0-b6f5-009c4c62fd57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
