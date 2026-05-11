@@ -1,0 +1,36 @@
+net/crates/net/src/ffi/blob.rs
+  s_4dbb97ea6ebffd::t_5df1d6eb4390c3 148-151
+  s_4dbb97ea6ebffd::t_e00de7d212651d 856
+  s_4dbb97ea6ebffd::t_4889a1e0f7c348 128-132
+  s_4dbb97ea6ebffd::t_d08ada0a381b3a 239-246
+  s_4dbb97ea6ebffd::t_156afcfbac3358 294-300,306
+  s_4dbb97ea6ebffd::t_c47696774b852a 618-628
+  s_4dbb97ea6ebffd::t_8fbcfd41e57bd9 99-104
+  s_4dbb97ea6ebffd::t_30a5b54d3e9aa5 173-180
+net/crates/net/src/adapter/net/dataforts/blob/fs.rs
+  s_4dbb97ea6ebffd::t_277dc404656020 233
+net/crates/net/tests/dataforts_greedy_e2e.rs
+  s_4dbb97ea6ebffd::t_f57d9e40f21482 333
+net/crates/net/tests/dataforts_gravity_e2e.rs
+  s_4dbb97ea6ebffd::t_5929fd42bac3f3 168-175
+net/crates/net/src/adapter/net/dataforts/blob/conformance.rs
+  s_4dbb97ea6ebffd::t_b558dcd791dadf 74
+net/crates/net/src/ffi/cortex.rs
+  s_4dbb97ea6ebffd::t_af06bddc24cd11 3142,3155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "1330db085a5fd7ca0dae0bed7c39747e4d06a3be",
+  "prompts": {},
+  "sessions": {
+    "s_4dbb97ea6ebffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c67d4eb6-e577-4553-a99d-4a18ba3172ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
