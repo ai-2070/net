@@ -551,15 +551,28 @@ impl SyncNack {
     /// silently truncating the diagnostic is preferable to losing
     /// the structured error code entirely.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let detail_bytes = self.detail.as_bytes();
-        let detail_len = detail_bytes.len().min(SYNC_NACK_DETAIL_MAX);
+        // Truncate `detail` at a UTF-8 char boundary ≤ the wire cap.
+        // A byte-aligned cut can split a multi-byte codepoint,
+        // producing invalid UTF-8 that the decoder's `from_utf8`
+        // check then rejects — losing the structured error code.
+        let detail_str = if self.detail.len() <= SYNC_NACK_DETAIL_MAX {
+            self.detail.as_str()
+        } else {
+            let mut cut = SYNC_NACK_DETAIL_MAX;
+            while cut > 0 && !self.detail.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            &self.detail[..cut]
+        };
+        let detail_bytes = detail_str.as_bytes();
+        let detail_len = detail_bytes.len();
         let mut buf = Vec::with_capacity(3 + 32 + 8 + 1 + 2 + detail_len);
         put_header(&mut buf, DISPATCH_SYNC_NACK);
         buf.put_slice(self.channel_id.as_bytes());
         buf.put_u64_le(self.since_seq);
         buf.put_u8(self.error_code.to_wire());
         buf.put_u16_le(detail_len as u16);
-        buf.put_slice(&detail_bytes[..detail_len]);
+        buf.put_slice(detail_bytes);
         buf
     }
 
@@ -582,8 +595,12 @@ impl SyncNack {
             SyncNackError::from_wire(code_byte).ok_or(WireError::BadErrorCode(code_byte))?;
         let detail_len = cursor.get_u16_le() as usize;
         if cursor.remaining() < detail_len {
+            // Report total bytes needed correctly: consumed-so-far +
+            // still-needed. The previous formula double-counted the
+            // consumed prefix.
+            let consumed = data.len() - cursor.remaining();
             return Err(WireError::Truncated {
-                need: data.len() + (detail_len - cursor.remaining()),
+                need: consumed + detail_len,
                 have: data.len(),
             });
         }
@@ -900,6 +917,54 @@ mod tests {
         bytes[43] = 0;
         let err = SyncNack::from_bytes(&bytes).expect_err("must reject");
         assert!(matches!(err, WireError::BadErrorCode(0)));
+    }
+
+    #[test]
+    fn sync_nack_truncated_payload_reports_correct_need() {
+        // Build a valid encoding then chop bytes off the tail. The
+        // reported `need` must equal the full encoded length — i.e.
+        // consumed-so-far + still-needed — not a double-counted value
+        // that overstates the requirement.
+        let original = SyncNack {
+            channel_id: sample_channel_id(),
+            since_seq: 0x4242_4242_4242_4242,
+            error_code: SyncNackError::BadRange,
+            detail: "hello".to_string(),
+        };
+        let full = original.to_bytes();
+        // Lop one byte off so the detail body is short. We expect
+        // `need == full.len()` and `have == truncated.len()`.
+        let truncated = &full[..full.len() - 1];
+        match SyncNack::from_bytes(truncated).expect_err("must error") {
+            WireError::Truncated { need, have } => {
+                assert_eq!(need, full.len());
+                assert_eq!(have, truncated.len());
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_nack_truncates_oversized_detail_at_char_boundary() {
+        // Build a detail string whose byte cut at SYNC_NACK_DETAIL_MAX
+        // would split a multi-byte codepoint. The encoder must back
+        // off to a valid UTF-8 boundary so the decoder accepts the
+        // frame.
+        // "é" is 2 bytes (0xC3 0xA9). Pad with ASCII so the offset
+        // exactly straddles the cut.
+        let pad_len = SYNC_NACK_DETAIL_MAX - 1;
+        let mut detail = "a".repeat(pad_len);
+        detail.push('é'); // 2 bytes; the second byte falls past the cap
+        debug_assert!(detail.len() > SYNC_NACK_DETAIL_MAX);
+        let original = SyncNack {
+            channel_id: sample_channel_id(),
+            since_seq: 0,
+            error_code: SyncNackError::Backpressure,
+            detail,
+        };
+        let bytes = original.to_bytes();
+        let decoded = SyncNack::from_bytes(&bytes).expect("decode after truncate");
+        assert_eq!(decoded.detail.len(), pad_len);
     }
 
     #[test]
