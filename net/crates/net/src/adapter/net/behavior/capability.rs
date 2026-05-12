@@ -3344,6 +3344,20 @@ impl CapabilityIndex {
         self.origin_hash_collisions.load(Ordering::Relaxed)
     }
 
+    /// `true` when two or more distinct `node_id`s currently
+    /// claim the same wire `origin_hash`. Distinct from
+    /// "publisher not yet announced" (slot vacant) — the dispatch
+    /// path uses this to fail-closed on adversarial collision
+    /// while keeping the empty-caps fallback for the benign
+    /// cap-propagation race where the publisher's announcement
+    /// just hasn't arrived yet.
+    pub fn is_origin_hash_ambiguous(&self, origin_hash: u64) -> bool {
+        self.by_origin_hash
+            .get(&origin_hash)
+            .map(|slot| slot.unique().is_none())
+            .unwrap_or(false)
+    }
+
     /// Run `f` against the node's `CapabilitySet` without cloning.
     ///
     /// Holds the `DashMap` shard's read lock for the duration of

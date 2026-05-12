@@ -3860,17 +3860,21 @@ impl MeshNode {
         // last-hop peer) and not poisoned by cache holders'
         // `causal:<hex>` announcements.
         //
-        // `None` means publisher unknown — either no announcement
-        // has propagated yet, or the wire `origin_hash` is
-        // ambiguous (two indexed entities project to the same
-        // wire u32). The greedy observer is skipped for that
-        // event so scope / intent / colocation admission cannot
-        // be tricked into running against fabricated or
-        // mis-attributed caps. Empty `CapabilitySet` would
-        // resolve `dataforts.{greedy,gravity}.scope` to the
-        // default `Mesh`, which `scope_allows_cross` admits for
-        // any local scope — fail-open. Skipping observe_event
-        // entirely is the fail-closed equivalent.
+        // Two distinct failure modes for the lookup:
+        //
+        // - *Vacant* slot — no announcement has propagated yet
+        //   (benign cap-propagation race). Fall back to empty
+        //   caps so the observer admits the event under the
+        //   default-Mesh scope. Events from new publishers reach
+        //   the cache while their first announcement is in
+        //   flight.
+        //
+        // - *Ambiguous* slot — two or more distinct entities
+        //   claim the same wire u32 origin_hash. Adversarial.
+        //   Skip observe_event entirely so scope / intent /
+        //   colocation admission cannot be tricked into running
+        //   against either claimant's caps. Documented on
+        //   `CapabilityIndex::by_origin_hash`.
         //
         // Snapshotted once per packet rather than per-event; every
         // event in the same packet shares the same publisher.
@@ -3879,9 +3883,15 @@ impl MeshNode {
             std::sync::Arc<crate::adapter::net::behavior::capability::CapabilitySet>,
         > = if greedy.is_some() {
             let origin_hash: u64 = parsed.header.origin_hash.into();
-            ctx.capability_index
-                .get_by_origin_hash(origin_hash)
-                .map(std::sync::Arc::new)
+            if ctx.capability_index.is_origin_hash_ambiguous(origin_hash) {
+                None
+            } else {
+                let publisher_caps = ctx
+                    .capability_index
+                    .get_by_origin_hash(origin_hash)
+                    .unwrap_or_default();
+                Some(std::sync::Arc::new(publisher_caps))
+            }
         } else {
             None
         };
