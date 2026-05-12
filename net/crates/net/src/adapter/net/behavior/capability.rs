@@ -932,6 +932,39 @@ impl CapabilitySet {
         self
     }
 
+    /// Add a typed `BlobCapability` projection. Emits the matching
+    /// `dataforts.blob.*` tags via the projection's `write_into`.
+    /// Builder-style; producer-side counterpart to
+    /// `BlobCapability::from_capability_set`. Round-tripping
+    /// through both functions returns the original projection.
+    #[cfg(feature = "dataforts")]
+    pub fn with_blob_capability(
+        self,
+        blob: super::dataforts_capabilities::BlobCapability,
+    ) -> Self {
+        blob.write_into(self)
+    }
+
+    /// Add a typed `GreedyCapability` projection. Emits
+    /// `dataforts.greedy.*` tags.
+    #[cfg(feature = "dataforts")]
+    pub fn with_greedy_capability(
+        self,
+        greedy: super::dataforts_capabilities::GreedyCapability,
+    ) -> Self {
+        greedy.write_into(self)
+    }
+
+    /// Add a typed `GravityCapability` projection. Emits
+    /// `dataforts.gravity.*` tags.
+    #[cfg(feature = "dataforts")]
+    pub fn with_gravity_capability(
+        self,
+        gravity: super::dataforts_capabilities::GravityCapability,
+    ) -> Self {
+        gravity.write_into(self)
+    }
+
     /// Add a `scope:tenant:<id>` reserved tag, marking this
     /// announcement as advertised under the given tenant. Idempotent
     /// — repeated calls with the same id do not duplicate. Empty
@@ -5923,7 +5956,12 @@ mod tests {
     fn get_by_origin_hash_returns_none_for_unknown_origin() {
         let index = CapabilityIndex::new();
         let entity = super::super::super::identity::EntityId::from_bytes([1u8; 32]);
-        index.index(CapabilityAnnouncement::new(1, entity, 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(
+            1,
+            entity,
+            1,
+            CapabilitySet::new(),
+        ));
         // A different origin_hash that wasn't announced.
         assert!(index.get_by_origin_hash(0xDEAD_BEEF_u64).is_none());
     }

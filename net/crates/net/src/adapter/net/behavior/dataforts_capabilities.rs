@@ -136,6 +136,48 @@ impl BlobCapability {
         }
     }
 
+    /// Write this projection back into a [`CapabilitySet`] as a
+    /// `dataforts.*` tag triple. Producer-side counterpart to
+    /// [`Self::from_capability_set`] — operator code can build a
+    /// capability set without round-tripping through `add_tag`
+    /// strings. Tags emitted:
+    ///
+    /// - `dataforts.blob.storage` (presence) iff `storage = true`.
+    /// - `dataforts.blob.disk_total_gb=<n>` iff `disk_total_gb > 0`.
+    /// - `dataforts.blob.disk_free_gb=<n>` iff `disk_free_gb > 0`.
+    ///
+    /// Zero-valued fields are elided rather than emitted as
+    /// `=0` — matches the parser's default-on-absent semantics
+    /// so a round-trip through `from_capability_set` returns the
+    /// same value. The returned `CapabilitySet` is a new value;
+    /// `caps` is consumed in builder style.
+    pub fn write_into(self, caps: CapabilitySet) -> CapabilitySet {
+        let mut tags = caps.tags;
+        if self.storage {
+            tags.insert(Tag::AxisPresent {
+                axis: TaxonomyAxis::Dataforts,
+                key: "blob.storage".to_string(),
+            });
+        }
+        if self.disk_total_gb > 0 {
+            tags.insert(Tag::AxisValue {
+                axis: TaxonomyAxis::Dataforts,
+                key: "blob.disk_total_gb".to_string(),
+                value: self.disk_total_gb.to_string(),
+                separator: crate::adapter::net::behavior::tag::AxisSeparator::Eq,
+            });
+        }
+        if self.disk_free_gb > 0 {
+            tags.insert(Tag::AxisValue {
+                axis: TaxonomyAxis::Dataforts,
+                key: "blob.disk_free_gb".to_string(),
+                value: self.disk_free_gb.to_string(),
+                separator: crate::adapter::net::behavior::tag::AxisSeparator::Eq,
+            });
+        }
+        CapabilitySet { tags, ..caps }
+    }
+
     /// Read a `BlobCapability` projection out of a [`CapabilitySet`]'s
     /// tag set. Tags absent → field defaults (`storage = false`,
     /// `disk_*_gb = 0`).
@@ -187,6 +229,40 @@ pub struct GreedyCapability {
 }
 
 impl GreedyCapability {
+    /// Write this projection back into a [`CapabilitySet`] as
+    /// `dataforts.greedy.*` tags. Producer-side counterpart to
+    /// [`Self::from_capability_set`]. Tags emitted:
+    ///
+    /// - `dataforts.greedy.enabled` (presence) iff `enabled`.
+    /// - `dataforts.greedy.scope=<wire>` when `enabled` (the
+    ///   scope claim is only meaningful for participating nodes;
+    ///   emitting it on disabled nodes would mislead the parser).
+    /// - `dataforts.greedy.proximity=<n>` iff `proximity > 0`.
+    pub fn write_into(self, caps: CapabilitySet) -> CapabilitySet {
+        let mut tags = caps.tags;
+        if self.enabled {
+            tags.insert(Tag::AxisPresent {
+                axis: TaxonomyAxis::Dataforts,
+                key: "greedy.enabled".to_string(),
+            });
+            tags.insert(Tag::AxisValue {
+                axis: TaxonomyAxis::Dataforts,
+                key: "greedy.scope".to_string(),
+                value: self.scope.as_wire_str().to_string(),
+                separator: crate::adapter::net::behavior::tag::AxisSeparator::Eq,
+            });
+        }
+        if self.proximity > 0 {
+            tags.insert(Tag::AxisValue {
+                axis: TaxonomyAxis::Dataforts,
+                key: "greedy.proximity".to_string(),
+                value: self.proximity.to_string(),
+                separator: crate::adapter::net::behavior::tag::AxisSeparator::Eq,
+            });
+        }
+        CapabilitySet { tags, ..caps }
+    }
+
     /// Read the projection from a [`CapabilitySet`].
     pub fn from_capability_set(caps: &CapabilitySet) -> Self {
         let mut out = Self::default();
@@ -235,6 +311,35 @@ pub struct GravityCapability {
 }
 
 impl GravityCapability {
+    /// Write this projection back into a [`CapabilitySet`] as
+    /// `dataforts.gravity.*` tags. Producer-side counterpart to
+    /// [`Self::from_capability_set`]. Tag emission shape mirrors
+    /// [`GreedyCapability::write_into`].
+    pub fn write_into(self, caps: CapabilitySet) -> CapabilitySet {
+        let mut tags = caps.tags;
+        if self.enabled {
+            tags.insert(Tag::AxisPresent {
+                axis: TaxonomyAxis::Dataforts,
+                key: "gravity.enabled".to_string(),
+            });
+            tags.insert(Tag::AxisValue {
+                axis: TaxonomyAxis::Dataforts,
+                key: "gravity.scope".to_string(),
+                value: self.scope.as_wire_str().to_string(),
+                separator: crate::adapter::net::behavior::tag::AxisSeparator::Eq,
+            });
+        }
+        if self.proximity > 0 {
+            tags.insert(Tag::AxisValue {
+                axis: TaxonomyAxis::Dataforts,
+                key: "gravity.proximity".to_string(),
+                value: self.proximity.to_string(),
+                separator: crate::adapter::net::behavior::tag::AxisSeparator::Eq,
+            });
+        }
+        CapabilitySet { tags, ..caps }
+    }
+
     /// Read the projection from a [`CapabilitySet`].
     pub fn from_capability_set(caps: &CapabilitySet) -> Self {
         let mut out = Self::default();
@@ -404,5 +509,90 @@ mod tests {
         let g = GreedyCapability::from_capability_set(&caps);
         // Unknown scope value stays at the field default (Mesh).
         assert_eq!(g.scope, TopologyScope::Mesh);
+    }
+
+    // --- Typed setters / round-trip (PR-5k) ---
+
+    #[test]
+    fn blob_capability_write_into_round_trips() {
+        let original = BlobCapability::storage_participating(100, 42);
+        let caps = original.write_into(CapabilitySet::new());
+        let read_back = BlobCapability::from_capability_set(&caps);
+        assert_eq!(read_back, original);
+    }
+
+    #[test]
+    fn blob_capability_write_into_skips_zero_fields() {
+        let bc = BlobCapability {
+            storage: true,
+            disk_total_gb: 0,
+            disk_free_gb: 0,
+        };
+        let caps = bc.write_into(CapabilitySet::new());
+        // Storage tag emitted; disk-gb tags not (matches the
+        // parser's default-on-absent semantics).
+        assert!(caps
+            .tags
+            .iter()
+            .any(|t| matches!(t, Tag::AxisPresent { axis, key }
+                if *axis == TaxonomyAxis::Dataforts && key == "blob.storage")));
+        assert!(!caps.tags.iter().any(|t| matches!(t,
+            Tag::AxisValue { axis, key, .. }
+            if *axis == TaxonomyAxis::Dataforts && key == "blob.disk_total_gb")));
+    }
+
+    #[test]
+    fn greedy_capability_write_into_round_trips() {
+        let original = GreedyCapability {
+            enabled: true,
+            scope: TopologyScope::Zone,
+            proximity: 128,
+        };
+        let caps = original.write_into(CapabilitySet::new());
+        let read_back = GreedyCapability::from_capability_set(&caps);
+        assert_eq!(read_back, original);
+    }
+
+    #[test]
+    fn greedy_capability_disabled_skips_all_tags() {
+        let g = GreedyCapability::default();
+        let caps = g.write_into(CapabilitySet::new());
+        assert!(caps.tags.is_empty(), "disabled greedy must emit no tags");
+    }
+
+    #[test]
+    fn gravity_capability_write_into_round_trips() {
+        let original = GravityCapability {
+            enabled: true,
+            scope: TopologyScope::Region,
+            proximity: 64,
+        };
+        let caps = original.write_into(CapabilitySet::new());
+        let read_back = GravityCapability::from_capability_set(&caps);
+        assert_eq!(read_back, original);
+    }
+
+    #[test]
+    fn capability_set_with_typed_builders_round_trip() {
+        // Compose all three typed projections via the
+        // CapabilitySet builder methods, then read each back.
+        let blob = BlobCapability::storage_participating(100, 50);
+        let greedy = GreedyCapability {
+            enabled: true,
+            scope: TopologyScope::Mesh,
+            proximity: 128,
+        };
+        let gravity = GravityCapability {
+            enabled: true,
+            scope: TopologyScope::Region,
+            proximity: 64,
+        };
+        let caps = CapabilitySet::new()
+            .with_blob_capability(blob)
+            .with_greedy_capability(greedy)
+            .with_gravity_capability(gravity);
+        assert_eq!(BlobCapability::from_capability_set(&caps), blob);
+        assert_eq!(GreedyCapability::from_capability_set(&caps), greedy);
+        assert_eq!(GravityCapability::from_capability_set(&caps), gravity);
     }
 }
