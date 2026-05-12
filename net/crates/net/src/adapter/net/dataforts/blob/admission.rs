@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_rejects_scope_mismatch_local_zone_pub_zone_advertised() {
+    fn pull_admits_when_local_zone_and_publisher_mesh_covers_it() {
         // Local greedy scope=Zone, publisher carries
         // `dataforts.greedy.scope=mesh`. Local Zone is narrower
         // than publisher's Mesh → publisher's Mesh covers local
@@ -416,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_rejects_when_local_zone_and_publisher_makes_no_scope_claim() {
+    fn pull_admits_when_local_zone_and_publisher_makes_no_scope_claim() {
         // Local greedy scope=Zone, publisher has no scope tag →
         // defaults to Mesh; Zone is narrower than Mesh so
         // scope_at_least_as_narrow returns true → admit.

@@ -429,10 +429,7 @@ mod tests {
         assert_eq!(escape_prometheus_label(r#"a"b"#), r#"a\"b"#);
         assert_eq!(escape_prometheus_label("a\nb"), r"a\nb");
         // Compound case: every special character in one value.
-        assert_eq!(
-            escape_prometheus_label("a\\b\"c\nd"),
-            "a\\\\b\\\"c\\nd"
-        );
+        assert_eq!(escape_prometheus_label("a\\b\"c\nd"), "a\\\\b\\\"c\\nd");
         // Plain ASCII passes through unchanged.
         assert_eq!(escape_prometheus_label("mesh-prod"), "mesh-prod");
     }

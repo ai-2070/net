@@ -703,11 +703,12 @@ impl PyMeshBlobAdapter {
         Ok(PyBytes::new(py, &bytes))
     }
 
-    /// Fetch a byte range of `blob_ref`'s content. `start` and
-    /// `end` are inclusive / exclusive respectively. The
-    /// substrate does NOT verify partial fetches against the
-    /// full-content hash — callers using range fetch accept that
-    /// trade-off.
+    /// Fetch a byte range of `blob_ref`'s content. The range is
+    /// half-open `[start, end)` — `start` is inclusive, `end` is
+    /// exclusive, matching Python slice semantics
+    /// (`payload[start:end]`). The substrate does NOT verify
+    /// partial fetches against the full-content hash — callers
+    /// using range fetch accept that trade-off.
     pub fn fetch_range<'py>(
         &self,
         py: Python<'py>,

@@ -500,33 +500,30 @@ impl GreedyRuntime {
     /// cadence.
     #[cfg(feature = "dataforts")]
     pub async fn gravity_tick(&self) {
-        // Snapshot the sink + emissions list under the read lock,
-        // then drop the lock before awaiting the sink. Holding
-        // the gravity lock across an .await would block any
-        // concurrent set_gravity / clear_gravity for the duration
-        // of the wire emission.
-        let (sink, emissions) = {
+        // Snapshot the sink + emissions list + policy under a
+        // single read lock, then drop the lock before awaiting
+        // the sink. Holding the gravity lock across an .await
+        // would block any concurrent set_gravity / clear_gravity
+        // for the duration of the wire emission. Capturing the
+        // policy in the same block guarantees the normalization
+        // formula matches the policy that produced `emissions`
+        // — a second `gravity.read()` could observe a
+        // concurrently-installed policy (or `None` if cleared)
+        // and renormalize against a stale or unrelated curve.
+        let (sink, emissions, policy) = {
             let gravity = self.inner.gravity.read();
             let Some(gravity) = gravity.as_ref() else {
                 return;
             };
             let now = Instant::now();
             let emissions = gravity.heat.lock().tick(&gravity.policy, now);
-            (gravity.sink.clone(), emissions)
+            (gravity.sink.clone(), emissions, gravity.policy.clone())
         };
         // Coalesce the per-chain emissions into one
         // (origin_hash, Option<rate>) vector and submit through
         // the sink's batch path. The sink's default impl falls
         // back to per-chain calls; the MeshNode impl rewrites the
         // full capability set once and rebroadcasts once.
-        //
-        // Snapshot the policy reference so the normalization
-        // formula uses the operator-configured scale rather than a
-        // hard-coded saturating curve.
-        let policy = {
-            let gravity = self.inner.gravity.read();
-            gravity.as_ref().map(|g| g.policy.clone())
-        };
         let mut batch: Vec<(u64, Option<f64>)> = Vec::new();
         for (origin_hash, emission) in emissions {
             match emission {
@@ -539,10 +536,7 @@ impl GreedyRuntime {
                     // chain looked identical to "blazing"); the
                     // log form stretches the wire range across
                     // useful operating rates.
-                    let normalized = policy
-                        .as_ref()
-                        .map(|p| p.normalize_rate_for_wire(rate))
-                        .unwrap_or_else(|| (rate / (rate + 1.0)).min(1.0));
+                    let normalized = policy.normalize_rate_for_wire(rate);
                     batch.push((origin_hash, Some(normalized)));
                 }
                 super::super::gravity::HeatEmission::Withdraw => {

@@ -367,9 +367,14 @@ impl BlobRef {
     // Wire format
     // -----------------------------------------------------------
 
-    /// Encoded length in bytes. Cheap for both variants — the
-    /// Manifest serializes through postcard and the length is
-    /// reported after the encode finishes.
+    /// Encoded length in bytes. The `Small` variant is O(1) —
+    /// header size plus URI length. The `Manifest` variant pays
+    /// the full postcard serialization cost (the length is taken
+    /// from a temporary buffer) because postcard's leb128
+    /// length-prefixes make a closed-form size hard to predict.
+    /// Callers in a hot path that already need the bytes should
+    /// reuse [`Self::encode`] directly instead of pairing
+    /// `encoded_len` + `encode`.
     pub fn encoded_len(&self) -> usize {
         match self {
             Self::Small { uri, .. } => BLOB_REF_SMALL_HEADER_LEN + uri.len(),

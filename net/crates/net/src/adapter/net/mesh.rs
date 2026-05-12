@@ -10346,10 +10346,11 @@ mod chain_helper_tests {
     }
 
     /// Regression for the heat:blob DoS surface. A peer injects
-    /// >`MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags into a
-    /// single announcement; the filter drops the overflow. The
-    /// cap bounds the migration-controller amplification (each
-    /// surviving heat tag drives an `adapter.prefetch` attempt).
+    /// more than `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags
+    /// into a single announcement; the filter drops the overflow.
+    /// The cap bounds the migration-controller amplification
+    /// (each surviving heat tag drives an `adapter.prefetch`
+    /// attempt).
     #[cfg(feature = "dataforts")]
     #[test]
     fn filter_unauthorized_heat_tags_caps_blob_heat_flood_per_announce() {

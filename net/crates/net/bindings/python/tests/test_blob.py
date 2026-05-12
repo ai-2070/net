@@ -182,22 +182,37 @@ def test_mesh_blob_adapter_repr_includes_adapter_id() -> None:
     assert adapter.adapter_id == "py-repr"
 
 
-def test_mesh_blob_adapter_store_accepts_bytearray_input() -> None:
-    """Regression for the bytearray-soundness bug: `&[u8]` in
-    PyO3 accepts both `bytes` and `bytearray`, but the latter is
-    mutable + resizable so a raw-pointer capture across
-    `py.detach()` was unsound. The fix copies bytes under the
-    GIL; this test pins the bytearray path round-trips cleanly.
+def test_mesh_blob_adapter_store_copies_input_under_gil() -> None:
+    """Regression for the bytearray-soundness bug. The original
+    binding declared `data: &[u8]` and captured a raw slice across
+    `py.detach()` — fine for immutable `bytes`, but PyO3's older
+    `&[u8]` binding silently accepted mutable `bytearray` whose
+    backing buffer could move/reallocate while the GIL was
+    released. The fix has two layers:
+
+      1. PyO3 0.28's `&[u8]` is strict and rejects `bytearray`
+         outright with a `TypeError`. The unsound code path is
+         no longer reachable from Python; we pin this contract
+         here so a future PyO3 upgrade that loosens the type
+         check doesn't silently reopen the bug.
+      2. Even for the accepted `bytes` path, the binding copies
+         (`data.to_vec()`) BEFORE releasing the GIL, so a
+         hypothetical relaxation can't reintroduce UB.
+
+    The test asserts the type check fires (no silent acceptance)
+    and that the `bytes` happy path round-trips cleanly.
     """
     redex = Redex()
     adapter = _adapter(redex)
     raw = b"bytearray-soundness regression"
-    payload = bytearray(raw)
-    digest = _blake3_digest(bytes(payload))
-    ref = BlobRef("mesh://bytearray", digest, len(payload))
-    adapter.store(ref, payload)
-    fetched = adapter.fetch(ref)
-    assert fetched == raw
+    digest = _blake3_digest(raw)
+    ref = BlobRef("mesh://bytearray", digest, len(raw))
+    # Layer 1: bytearray is rejected at the FFI boundary — no UB.
+    with pytest.raises(TypeError):
+        adapter.store(ref, bytearray(raw))
+    # Layer 2: bytes happy path still round-trips after the copy.
+    adapter.store(ref, raw)
+    assert adapter.fetch(ref) == raw
 
 
 def test_mesh_blob_adapter_persistent_round_trips_across_calls() -> None:

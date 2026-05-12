@@ -566,9 +566,14 @@ mod tests {
     }
 
     #[test]
-    fn controller_skips_peers_without_blob_heat_tags() {
+    fn controller_ignores_chain_heat_shape_tags() {
+        // Chain-heat (`heat:<origin_hex>=<rate>`) and blob-heat
+        // (`heat:blob:<hash_hex>=<rate>`) share the `heat:`
+        // prefix but address different things. Only blob-heat
+        // bodies should surface as migration candidates; a peer
+        // whose only `heat:` tag is the chain-heat shape must
+        // produce zero candidates.
         let mut peer_caps = CapabilitySet::default();
-        // Chain-heat shape — should NOT surface as a blob candidate.
         peer_caps.tags.insert(Tag::Reserved {
             prefix: "heat:".to_string(),
             body: "deadbeefcafebabe=0.50".to_string(),
@@ -922,12 +927,16 @@ mod tests {
         let index = CapabilityIndex::new();
         let entity_a = EntityId::from_bytes([0x11; 32]);
         let entity_b = EntityId::from_bytes([0x22; 32]);
-        index.index(crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
-            100, entity_a, 1, a_caps,
-        ));
-        index.index(crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
-            200, entity_b, 1, b_caps,
-        ));
+        index.index(
+            crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
+                100, entity_a, 1, a_caps,
+            ),
+        );
+        index.index(
+            crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
+                200, entity_b, 1, b_caps,
+            ),
+        );
 
         // Local: 1 GiB free; the 4 GiB sibling fails the disk
         // gate. Top-level hashes are 1 KiB each, so they admit.
