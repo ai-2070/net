@@ -1,0 +1,48 @@
+net/crates/net/docs/plans/SDK_SECURITY_SURFACE_PLAN.md
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 565,857
+net/crates/net/bindings/python/src/lib.rs
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 1633
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 765,897
+net/crates/net/bindings/node/src/identity.rs
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 14,216
+net/crates/net/docs/plans/SDK_GO_PARITY_PLAN.md
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 42
+net/crates/net/docs/plans/SDK_PYTHON_PARITY_PLAN.md
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 91
+net/crates/net/sdk-ts/src/identity.ts
+  s_3a0a24a47d1a36::t_4185ce1bef19e6 131-133,142-145
+net/crates/net/include/net.go.h
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 517
+net/crates/net/bindings/python/tests/test_channel_auth.py
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 131,143
+net/crates/net/sdk-ts/test/identity.test.ts
+  s_3a0a24a47d1a36::t_15487ffd60d6d8 56-60
+net/crates/net/README.md
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 381
+net/crates/net/bindings/node/index.d.ts
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 315,817
+net/crates/net/sdk-ts/README.md
+  s_3a0a24a47d1a36::t_f5dad45396094b 346
+net/crates/net/docs/IDENTITY.md
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 56
+  s_3a0a24a47d1a36::t_412b54cbc9aef0 60-62
+net/crates/net/bindings/node/src/lib.rs
+  s_3a0a24a47d1a36::t_c3dd8f814acc40 1731
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "749b061fbd2b44a5c92c5771d369f3e484f4d037",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
