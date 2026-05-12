@@ -169,6 +169,33 @@ fn coerce_numeric(value: &serde_json::Value) -> Option<f64> {
     }
 }
 
+/// Extract a canonical string projection of the leaf at
+/// `path`. Used by Phase E-4 exact-distinct-count: the
+/// projection IS the equality key, so two leaves with the
+/// same projection count as the same distinct value.
+///
+/// Projections:
+/// - `"origin"` -> 16-char lowercase hex.
+/// - `"seq"` -> decimal.
+/// - JSON path -> the leaf's `serde_json::Value::to_string()`
+///   form (which canonicalises numbers, quotes strings,
+///   `"true"` / `"false"` for bools, `null` for null —
+///   distinct-count over `null` is intentionally meaningful
+///   here, mirroring SQL `COUNT(DISTINCT)` semantics).
+pub fn extract_string_projection(row: &ResultRow, path: &str) -> Option<String> {
+    match path {
+        "origin" => Some(format!("{:016x}", row.origin)),
+        "seq" => Some(row.seq.0.to_string()),
+        _ => extract_string_from_payload(&row.payload, path),
+    }
+}
+
+fn extract_string_from_payload(payload: &[u8], path: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let leaf = walk_json_path(&value, path)?;
+    Some(leaf.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

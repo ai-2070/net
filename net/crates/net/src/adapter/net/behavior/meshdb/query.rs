@@ -316,6 +316,17 @@ pub enum AggregateFn {
         /// Target percentile in `[0.0, 1.0]` (e.g. `0.99`).
         p: f64,
     },
+    /// Exact percentile. Sorts every value in the group and
+    /// picks the nearest-rank quantile. Bounded by the
+    /// executor's per-group memory budget; the approximate
+    /// `PercentileTDigest` ships once a consumer's data volume
+    /// justifies the fixed-memory tradeoff.
+    PercentileExact {
+        /// Field whose values are summarized.
+        field: Expr,
+        /// Target percentile in `[0.0, 1.0]` (e.g. `0.99`).
+        p: f64,
+    },
 }
 
 /// Row expression — a path / column reference / literal /
@@ -437,6 +448,38 @@ pub enum AggregateValue {
     /// group with no numeric rows yields a group with an
     /// empty `Avg` — surfaced via the `Avg(None)` variant).
     Avg(Option<f64>),
+    /// Minimum of a numeric field across rows in the group.
+    /// `None` when the group has no numeric rows.
+    Min(Option<f64>),
+    /// Maximum of a numeric field across rows in the group.
+    /// `None` when the group has no numeric rows.
+    Max(Option<f64>),
+    /// Exact distinct count over a row-intrinsic / JSON field.
+    /// Counts distinct **string projections** of the leaf value
+    /// (since `f64` doesn't have `Eq`, we project numerics to
+    /// their canonical string form). Rows whose field is
+    /// missing are skipped.
+    DistinctCount(u64),
+    /// Nearest-rank exact percentile over a numeric field.
+    /// `None` when the group has no numeric rows.
+    Percentile(Option<f64>),
+}
+
+/// Phase E-4 numeric reduction kind shared by Min / Max /
+/// Percentile. Kept separate from
+/// [`NumericAggregateKind`] (Sum / Avg) so the executor's
+/// match arms stay narrow.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum NumericReductionKind {
+    /// Minimum value in the group.
+    Min,
+    /// Maximum value in the group.
+    Max,
+    /// Nearest-rank percentile at `p ∈ [0.0, 1.0]`.
+    Percentile {
+        /// Target percentile in `[0.0, 1.0]`.
+        p: f64,
+    },
 }
 
 /// Phase E-3 numeric aggregate kind. Marks which function the

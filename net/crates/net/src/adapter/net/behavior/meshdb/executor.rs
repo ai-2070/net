@@ -44,7 +44,7 @@ use super::error::MeshError;
 use super::planner::{ExecutionPlan, JoinKeyMode, OperatorNode, OperatorPlan};
 use super::query::{
     AggregateRowPayload, AggregateValue, GroupKey, JoinKind, JoinedRowPayload,
-    NumericAggregateKind, ResultRow, SeqNum,
+    NumericAggregateKind, NumericReductionKind, ResultRow, SeqNum,
 };
 
 /// Unique id for a running query. Currently a monotonically-
@@ -281,6 +281,23 @@ fn collect_operator_rows<R: ChainReader + ?Sized>(
         } => {
             let rows = collect_operator_rows(input, reader)?;
             execute_aggregate_numeric(&rows, *group_by, field_path, *kind)
+        }
+        OperatorPlan::AggregateReduction {
+            input,
+            group_by,
+            field_path,
+            kind,
+        } => {
+            let rows = collect_operator_rows(input, reader)?;
+            execute_aggregate_reduction(&rows, *group_by, field_path, *kind)
+        }
+        OperatorPlan::AggregateDistinct {
+            input,
+            group_by,
+            field_path,
+        } => {
+            let rows = collect_operator_rows(input, reader)?;
+            execute_aggregate_distinct(&rows, *group_by, field_path)
         }
         OperatorPlan::Filter { input, predicate } => {
             let rows = collect_operator_rows(input, reader)?;
@@ -609,6 +626,140 @@ fn execute_aggregate_numeric(
         });
     }
     Ok(out)
+}
+
+/// Phase E-4 reduction aggregate (Min / Max / nearest-rank
+/// percentile). Collects every per-row numeric value into the
+/// group's bag, then reduces. `Percentile` sorts the bag using
+/// `total_cmp` (NaN-safe) and picks the `floor(p * (n-1))`th
+/// element.
+pub(super) fn execute_aggregate_reduction(
+    rows: &[ResultRow],
+    group_by: Option<JoinKeyMode>,
+    field_path: &str,
+    kind: NumericReductionKind,
+) -> Result<Vec<ResultRow>, MeshError> {
+    use std::collections::BTreeMap;
+
+    let mut acc: BTreeMap<Vec<u8>, (Option<GroupKey>, Vec<f64>)> = BTreeMap::new();
+    for row in rows {
+        let Some(value) = super::row::extract_numeric(row, field_path) else {
+            continue;
+        };
+        let (key_bytes, group) = match group_by {
+            None => (Vec::new(), None),
+            Some(mode) => (encode_join_key(row, mode), Some(group_key_for(row, mode))),
+        };
+        acc.entry(key_bytes).or_insert((group, Vec::new())).1.push(value);
+    }
+
+    let reduce = |values: &mut [f64]| -> Option<f64> {
+        if values.is_empty() {
+            return None;
+        }
+        match kind {
+            NumericReductionKind::Min => {
+                values.iter().copied().reduce(f64::min)
+            }
+            NumericReductionKind::Max => {
+                values.iter().copied().reduce(f64::max)
+            }
+            NumericReductionKind::Percentile { p } => {
+                values.sort_by(|a, b| a.total_cmp(b));
+                let idx = ((p.clamp(0.0, 1.0)) * (values.len() as f64 - 1.0)).floor() as usize;
+                values.get(idx).copied()
+            }
+        }
+    };
+
+    let mk_value = |reduced: Option<f64>| match kind {
+        NumericReductionKind::Min => AggregateValue::Min(reduced),
+        NumericReductionKind::Max => AggregateValue::Max(reduced),
+        NumericReductionKind::Percentile { .. } => AggregateValue::Percentile(reduced),
+    };
+
+    if group_by.is_none() {
+        let value = acc
+            .get_mut(&Vec::<u8>::new())
+            .map(|(_, vs)| reduce(vs))
+            .unwrap_or(None);
+        let payload = encode_aggregate_payload(None, mk_value(value))?;
+        return Ok(vec![ResultRow {
+            origin: 0,
+            seq: SeqNum(0),
+            payload,
+        }]);
+    }
+    let mut out = Vec::with_capacity(acc.len());
+    for (_, (group, mut values)) in acc {
+        let payload = encode_aggregate_payload(group, mk_value(reduce(&mut values)))?;
+        out.push(ResultRow {
+            origin: 0,
+            seq: SeqNum(0),
+            payload,
+        });
+    }
+    Ok(out)
+}
+
+/// Phase E-4 exact distinct count over the canonical string
+/// projection of `field_path`. Each group accumulates a
+/// `BTreeSet<String>` of projections.
+pub(super) fn execute_aggregate_distinct(
+    rows: &[ResultRow],
+    group_by: Option<JoinKeyMode>,
+    field_path: &str,
+) -> Result<Vec<ResultRow>, MeshError> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut acc: BTreeMap<Vec<u8>, (Option<GroupKey>, BTreeSet<String>)> = BTreeMap::new();
+    for row in rows {
+        let Some(value) = super::row::extract_string_projection(row, field_path) else {
+            continue;
+        };
+        let (key_bytes, group) = match group_by {
+            None => (Vec::new(), None),
+            Some(mode) => (encode_join_key(row, mode), Some(group_key_for(row, mode))),
+        };
+        acc.entry(key_bytes).or_insert((group, BTreeSet::new())).1.insert(value);
+    }
+
+    if group_by.is_none() {
+        let count = acc
+            .get(&Vec::<u8>::new())
+            .map(|(_, s)| s.len() as u64)
+            .unwrap_or(0);
+        let payload = encode_aggregate_payload(None, AggregateValue::DistinctCount(count))?;
+        return Ok(vec![ResultRow {
+            origin: 0,
+            seq: SeqNum(0),
+            payload,
+        }]);
+    }
+    let mut out = Vec::with_capacity(acc.len());
+    for (_, (group, set)) in acc {
+        let payload = encode_aggregate_payload(group, AggregateValue::DistinctCount(set.len() as u64))?;
+        out.push(ResultRow {
+            origin: 0,
+            seq: SeqNum(0),
+            payload,
+        });
+    }
+    Ok(out)
+}
+
+/// Build the [`GroupKey`] identifier matching `mode` from a
+/// row. Shared between the three group-by-aware aggregate
+/// helpers.
+fn group_key_for(row: &ResultRow, mode: JoinKeyMode) -> GroupKey {
+    match mode {
+        JoinKeyMode::Origin => GroupKey::Origin(row.origin),
+        JoinKeyMode::Seq => GroupKey::Seq(row.seq),
+        JoinKeyMode::OriginSeq => GroupKey::OriginSeq {
+            origin: row.origin,
+            seq: row.seq,
+        },
+    }
 }
 
 /// Wrap `group` + `value` in an [`AggregateRowPayload`] and
@@ -1658,6 +1809,189 @@ mod tests {
         let decoded: AggregateRowPayload =
             postcard::from_bytes(&rows[0].payload).unwrap();
         assert_eq!(decoded.value, AggregateValue::Avg(None));
+    }
+
+    #[tokio::test]
+    async fn aggregate_min_max_over_seq_return_bounds() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue, NumericReductionKind,
+        };
+
+        let chain = 0xAA;
+        let reader = Arc::new(InMemoryChainReader::default());
+        for s in [4u64, 1, 7, 3, 9] {
+            reader.append(chain, SeqNum(s), vec![]);
+        }
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let mk = |kind| ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateReduction {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: chain,
+                            start: SeqNum(1),
+                            end: SeqNum(20),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                    field_path: "seq".to_string(),
+                    kind,
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let row_value = |plan| async {
+            let running = executor.execute(plan).await.unwrap();
+            let rows: Vec<ResultRow> = collect_rows(running.rows)
+                .await
+                .into_iter()
+                .map(|r| r.unwrap())
+                .collect();
+            let decoded: AggregateRowPayload =
+                postcard::from_bytes(&rows[0].payload).unwrap();
+            decoded.value
+        };
+        assert_eq!(
+            row_value(mk(NumericReductionKind::Min)).await,
+            AggregateValue::Min(Some(1.0))
+        );
+        assert_eq!(
+            row_value(mk(NumericReductionKind::Max)).await,
+            AggregateValue::Max(Some(9.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_percentile_exact_picks_nearest_rank() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue, NumericReductionKind,
+        };
+
+        let chain = 0xAA;
+        let reader = Arc::new(InMemoryChainReader::default());
+        // 10 rows, seq 1..=10.
+        for s in 1..=10u64 {
+            reader.append(chain, SeqNum(s), vec![]);
+        }
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateReduction {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: chain,
+                            start: SeqNum(1),
+                            end: SeqNum(20),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                    field_path: "seq".to_string(),
+                    // p=0.9 -> floor(0.9 * 9) = 8 -> 9th element (0-indexed 8) = 9.0
+                    kind: NumericReductionKind::Percentile { p: 0.9 },
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let running = executor.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(decoded.value, AggregateValue::Percentile(Some(9.0)));
+    }
+
+    #[tokio::test]
+    async fn aggregate_distinct_count_skips_missing_fields() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue,
+        };
+
+        let chain = 0xAA;
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(chain, SeqNum(1), br#"{"user":"alice"}"#.to_vec());
+        reader.append(chain, SeqNum(2), br#"{"user":"bob"}"#.to_vec());
+        reader.append(chain, SeqNum(3), br#"{"user":"alice"}"#.to_vec()); // dup
+        reader.append(chain, SeqNum(4), b"not-json".to_vec());            // skipped
+        reader.append(chain, SeqNum(5), br#"{"user":"carol"}"#.to_vec());
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateDistinct {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: chain,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                    field_path: "user".to_string(),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let running = executor.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
+        // 3 distinct: alice, bob, carol.
+        assert_eq!(decoded.value, AggregateValue::DistinctCount(3));
+    }
+
+    #[tokio::test]
+    async fn aggregate_reduction_empty_input_returns_none() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue, NumericReductionKind,
+        };
+
+        let reader = Arc::new(InMemoryChainReader::default());
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateReduction {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::LatestRead { origin: 0xDEAD },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                    field_path: "seq".to_string(),
+                    kind: NumericReductionKind::Min,
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let running = executor.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(decoded.value, AggregateValue::Min(None));
     }
 
     #[tokio::test]

@@ -154,6 +154,13 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
                 // Phase E-3 federated numeric aggregate.
                 return self.execute_aggregate_numeric_federated(plan).await;
             }
+            OperatorPlan::AggregateReduction { .. } | OperatorPlan::AggregateDistinct { .. } => {
+                // Phase E-4: collect inner via transport,
+                // reduce locally using the same logic as the
+                // local executor (we recompose a single-node
+                // plan + run it locally).
+                return self.execute_aggregate_e4_federated(plan).await;
+            }
             OperatorPlan::Filter { .. } => {
                 // Phase E-2 federated filter: fetch the inner
                 // sub-plan via the transport, filter locally.
@@ -345,6 +352,57 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
 
         let handle = QueryHandle::new(self.allocate_id());
         let stream: ResultStream = Box::pin(futures::stream::iter(out));
+        Ok(RunningQuery {
+            handle,
+            rows: stream,
+        })
+    }
+
+    /// Phase E-4 federated reduction / distinct aggregate.
+    /// Fetches the inner sub-plan via the transport, then
+    /// reduces locally with the same routine the local
+    /// executor uses.
+    async fn execute_aggregate_e4_federated(
+        &self,
+        plan: ExecutionPlan,
+    ) -> Result<RunningQuery, MeshError> {
+        use super::executor::{execute_aggregate_distinct, execute_aggregate_reduction};
+        use super::planner::CostEstimate;
+
+        let output_rows = match plan.root.operator {
+            OperatorPlan::AggregateReduction {
+                input,
+                group_by,
+                field_path,
+                kind,
+            } => {
+                let inner = Box::pin(self.execute(ExecutionPlan {
+                    root: *input,
+                    total_cost: CostEstimate::default(),
+                }))
+                .await?;
+                let rows = drain_rows(inner.rows).await?;
+                execute_aggregate_reduction(&rows, group_by, &field_path, kind)?
+            }
+            OperatorPlan::AggregateDistinct {
+                input,
+                group_by,
+                field_path,
+            } => {
+                let inner = Box::pin(self.execute(ExecutionPlan {
+                    root: *input,
+                    total_cost: CostEstimate::default(),
+                }))
+                .await?;
+                let rows = drain_rows(inner.rows).await?;
+                execute_aggregate_distinct(&rows, group_by, &field_path)?
+            }
+            _ => unreachable!("execute_aggregate_e4_federated dispatched on wrong operator"),
+        };
+
+        let handle = QueryHandle::new(self.allocate_id());
+        let stream: ResultStream =
+            Box::pin(futures::stream::iter(output_rows.into_iter().map(Ok)));
         Ok(RunningQuery {
             handle,
             rows: stream,

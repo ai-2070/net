@@ -191,6 +191,33 @@ pub enum OperatorPlan {
         /// Which numeric function to apply.
         kind: super::query::NumericAggregateKind,
     },
+    /// Phase E-4 numeric reduction (Min / Max / exact
+    /// Percentile). Collects every per-row numeric value into
+    /// the group, then reduces. `Percentile` sorts the bag and
+    /// picks the nearest-rank quantile.
+    AggregateReduction {
+        /// Inner sub-plan whose rows are reduced.
+        input: Box<OperatorNode>,
+        /// Row-intrinsic group key.
+        group_by: Option<JoinKeyMode>,
+        /// Field path.
+        field_path: String,
+        /// Reduction kind.
+        kind: super::query::NumericReductionKind,
+    },
+    /// Phase E-4 exact distinct count over a row-intrinsic /
+    /// JSON field. Tracks the canonical string form of each
+    /// leaf value in a per-group `BTreeSet`. Bounded by the
+    /// executor's per-query memory budget.
+    AggregateDistinct {
+        /// Inner sub-plan whose rows are aggregated.
+        input: Box<OperatorNode>,
+        /// Row-intrinsic group key.
+        group_by: Option<JoinKeyMode>,
+        /// Field path. The leaf value's canonical string form
+        /// is what gets hashed for distinctness.
+        field_path: String,
+    },
     /// Inner hash-join of two sub-plans. Phase D-1 ships the
     /// in-memory hash-build-on-left / probe-on-right strategy
     /// against row-intrinsic keys (`origin` / `seq`); richer
@@ -638,10 +665,50 @@ where
                     kind: super::query::NumericAggregateKind::Avg,
                 }
             }
-            other => {
+            AggregateFn::Min { field } => {
+                let path = field_path_required(field, "Min")?;
+                OperatorPlan::AggregateReduction {
+                    input: Box::new(inner_plan.root),
+                    group_by: key_mode,
+                    field_path: path,
+                    kind: super::query::NumericReductionKind::Min,
+                }
+            }
+            AggregateFn::Max { field } => {
+                let path = field_path_required(field, "Max")?;
+                OperatorPlan::AggregateReduction {
+                    input: Box::new(inner_plan.root),
+                    group_by: key_mode,
+                    field_path: path,
+                    kind: super::query::NumericReductionKind::Max,
+                }
+            }
+            AggregateFn::PercentileExact { field, p } => {
+                if !p.is_finite() || !(0.0..=1.0).contains(p) {
+                    return Err(MeshError::PlannerError {
+                        detail: format!("PercentileExact p must be in [0.0, 1.0], got {p}"),
+                    });
+                }
+                let path = field_path_required(field, "PercentileExact")?;
+                OperatorPlan::AggregateReduction {
+                    input: Box::new(inner_plan.root),
+                    group_by: key_mode,
+                    field_path: path,
+                    kind: super::query::NumericReductionKind::Percentile { p: *p },
+                }
+            }
+            AggregateFn::DistinctCountExact { field } => {
+                let path = field_path_required(field, "DistinctCountExact")?;
+                OperatorPlan::AggregateDistinct {
+                    input: Box::new(inner_plan.root),
+                    group_by: key_mode,
+                    field_path: path,
+                }
+            }
+            AggregateFn::DistinctCountHll { .. } | AggregateFn::PercentileTDigest { .. } => {
                 return Err(MeshError::PlannerError {
                     detail: format!(
-                        "aggregate function {other:?} not yet implemented; sketches (DistinctCount, Percentile) land in Phase E-4"
+                        "aggregate function {agg_fn:?} requires a sketch implementation (HLL p=14 / T-Digest c=100 per locked decision #3); deferred to Phase F. Use DistinctCountExact / PercentileExact for now."
                     ),
                 });
             }
@@ -1066,6 +1133,12 @@ fn sum_cost(node: &OperatorNode) -> CostEstimate {
             acc.latency_ms = acc.latency_ms.saturating_add(inner.latency_ms);
         }
         OperatorPlan::AggregateNumeric { input, .. } => {
+            let inner = sum_cost(input);
+            acc.bandwidth_bytes = acc.bandwidth_bytes.saturating_add(inner.bandwidth_bytes);
+            acc.latency_ms = acc.latency_ms.saturating_add(inner.latency_ms);
+        }
+        OperatorPlan::AggregateReduction { input, .. }
+        | OperatorPlan::AggregateDistinct { input, .. } => {
             let inner = sum_cost(input);
             acc.bandwidth_bytes = acc.bandwidth_bytes.saturating_add(inner.bandwidth_bytes);
             acc.latency_ms = acc.latency_ms.saturating_add(inner.latency_ms);
@@ -2835,7 +2908,10 @@ mod tests {
 
     #[test]
     fn plan_aggregate_sketch_function_still_surfaces_planner_error() {
-        // DistinctCount + Percentile sketches land in Phase E-4.
+        // HLL / T-Digest sketch implementations are deferred to
+        // Phase F (or whenever a consumer's data volumes justify
+        // them); exact equivalents ship via DistinctCountExact /
+        // PercentileExact.
         let origin = 0x5558;
         let index = make_index_with_holder(1, origin);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
@@ -2850,7 +2926,8 @@ mod tests {
             .unwrap_err();
         match err {
             MeshError::PlannerError { detail } => {
-                assert!(detail.contains("Phase E-4"));
+                assert!(detail.contains("sketch implementation"), "got: {detail}");
+                assert!(detail.contains("DistinctCountExact"), "got: {detail}");
             }
             other => panic!("expected PlannerError; got {other:?}"),
         }
