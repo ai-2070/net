@@ -122,6 +122,25 @@ pub struct GreedyClusterMetricsAtomic {
     /// and surface the count instead. Operators see this rising
     /// when their publishers aren't configured to stamp origins.
     pub gravity_heat_unattributed_total: AtomicU64,
+    /// Cumulative G-1 blob-pull verdicts that returned `Admit` —
+    /// the local node would have speculatively pulled the blob
+    /// referenced by an admitted chain event. The actual fetch
+    /// path is a follow-up; this counter surfaces the decision
+    /// so operators can dashboard the policy independent of the
+    /// fetch wiring.
+    pub blob_pulls_admitted_total: AtomicU64,
+    /// G-1 blob-pull veto: local node lacks `dataforts.blob.storage`.
+    pub blob_pulls_rejected_no_storage_total: AtomicU64,
+    /// G-1 blob-pull veto: local greedy disabled.
+    pub blob_pulls_rejected_greedy_disabled_total: AtomicU64,
+    /// G-1 blob-pull veto: local greedy proximity is zero.
+    pub blob_pulls_rejected_proximity_zero_total: AtomicU64,
+    /// G-1 blob-pull veto: local node advertising
+    /// `dataforts:blob-storage-unhealthy`.
+    pub blob_pulls_rejected_unhealthy_total: AtomicU64,
+    /// G-1 blob-pull veto: publisher scope outside local greedy
+    /// scope boundary.
+    pub blob_pulls_rejected_scope_mismatch_total: AtomicU64,
 }
 
 impl GreedyClusterMetricsAtomic {
@@ -173,6 +192,45 @@ impl GreedyClusterMetricsAtomic {
     pub fn incr_gravity_heat_unattributed(&self) {
         self.gravity_heat_unattributed_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump the G-1 blob-pull admitted counter.
+    pub fn incr_blob_pull_admitted(&self) {
+        self.blob_pulls_admitted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump the G-1 blob-pull rejected counter for the supplied
+    /// reason. Each reason maps to a distinct
+    /// `dataforts_greedy_blob_pulls_rejected_total{reason=...}`
+    /// Prometheus label.
+    pub fn incr_blob_pull_rejected(
+        &self,
+        reason: crate::adapter::net::dataforts::blob::PullBlobReject,
+    ) {
+        use crate::adapter::net::dataforts::blob::PullBlobReject;
+        match reason {
+            PullBlobReject::NoStorageCap => {
+                self.blob_pulls_rejected_no_storage_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PullBlobReject::GreedyDisabled => {
+                self.blob_pulls_rejected_greedy_disabled_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PullBlobReject::ProximityZero => {
+                self.blob_pulls_rejected_proximity_zero_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PullBlobReject::Unhealthy => {
+                self.blob_pulls_rejected_unhealthy_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PullBlobReject::ScopeMismatch => {
+                self.blob_pulls_rejected_scope_mismatch_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -317,6 +375,30 @@ impl GreedyMetricsRegistry {
                     .cluster
                     .gravity_heat_unattributed_total
                     .load(Ordering::Relaxed),
+                blob_pulls_admitted_total: self
+                    .cluster
+                    .blob_pulls_admitted_total
+                    .load(Ordering::Relaxed),
+                blob_pulls_rejected_no_storage_total: self
+                    .cluster
+                    .blob_pulls_rejected_no_storage_total
+                    .load(Ordering::Relaxed),
+                blob_pulls_rejected_greedy_disabled_total: self
+                    .cluster
+                    .blob_pulls_rejected_greedy_disabled_total
+                    .load(Ordering::Relaxed),
+                blob_pulls_rejected_proximity_zero_total: self
+                    .cluster
+                    .blob_pulls_rejected_proximity_zero_total
+                    .load(Ordering::Relaxed),
+                blob_pulls_rejected_unhealthy_total: self
+                    .cluster
+                    .blob_pulls_rejected_unhealthy_total
+                    .load(Ordering::Relaxed),
+                blob_pulls_rejected_scope_mismatch_total: self
+                    .cluster
+                    .blob_pulls_rejected_scope_mismatch_total
+                    .load(Ordering::Relaxed),
             },
         }
     }
@@ -360,6 +442,18 @@ pub struct GreedyClusterMetrics {
     /// Cumulative gravity heat bumps skipped because the chain's
     /// `origin_hash == 0` (publisher didn't stamp identity).
     pub gravity_heat_unattributed_total: u64,
+    /// Cumulative G-1 blob-pull admit verdicts.
+    pub blob_pulls_admitted_total: u64,
+    /// G-1 blob-pull veto: no `dataforts.blob.storage`.
+    pub blob_pulls_rejected_no_storage_total: u64,
+    /// G-1 blob-pull veto: local greedy disabled.
+    pub blob_pulls_rejected_greedy_disabled_total: u64,
+    /// G-1 blob-pull veto: local greedy proximity zero.
+    pub blob_pulls_rejected_proximity_zero_total: u64,
+    /// G-1 blob-pull veto: local node unhealthy.
+    pub blob_pulls_rejected_unhealthy_total: u64,
+    /// G-1 blob-pull veto: publisher scope outside local boundary.
+    pub blob_pulls_rejected_scope_mismatch_total: u64,
 }
 
 /// Full snapshot — sorted channel list + cluster-wide counters.
@@ -469,6 +563,53 @@ impl GreedyMetricsSnapshot {
             self.cluster.gravity_heat_unattributed_total,
         );
 
+        // G-1 blob-pull admit counter.
+        let _ = writeln!(
+            out,
+            "# HELP dataforts_greedy_blob_pulls_admitted_total Cumulative G-1 blob-pull verdicts that returned Admit."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE dataforts_greedy_blob_pulls_admitted_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "dataforts_greedy_blob_pulls_admitted_total {}",
+            self.cluster.blob_pulls_admitted_total,
+        );
+
+        // G-1 blob-pull rejection counter, reason-labeled.
+        let _ = writeln!(
+            out,
+            "# HELP dataforts_greedy_blob_pulls_rejected_total Cumulative G-1 blob-pull rejections, split by reason."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE dataforts_greedy_blob_pulls_rejected_total counter"
+        );
+        for (reason, count) in [
+            ("no_storage", self.cluster.blob_pulls_rejected_no_storage_total),
+            (
+                "greedy_disabled",
+                self.cluster.blob_pulls_rejected_greedy_disabled_total,
+            ),
+            (
+                "proximity_zero",
+                self.cluster.blob_pulls_rejected_proximity_zero_total,
+            ),
+            ("unhealthy", self.cluster.blob_pulls_rejected_unhealthy_total),
+            (
+                "scope_mismatch",
+                self.cluster.blob_pulls_rejected_scope_mismatch_total,
+            ),
+        ] {
+            let _ = writeln!(
+                out,
+                "dataforts_greedy_blob_pulls_rejected_total{{reason=\"{}\"}} {}",
+                reason, count,
+            );
+        }
+
         out
     }
 
@@ -484,6 +625,12 @@ impl GreedyMetricsSnapshot {
             && self.cluster.io_budget_used_bytes == 0
             && self.cluster.observer_dropped_overloaded_total == 0
             && self.cluster.gravity_heat_unattributed_total == 0
+            && self.cluster.blob_pulls_admitted_total == 0
+            && self.cluster.blob_pulls_rejected_no_storage_total == 0
+            && self.cluster.blob_pulls_rejected_greedy_disabled_total == 0
+            && self.cluster.blob_pulls_rejected_proximity_zero_total == 0
+            && self.cluster.blob_pulls_rejected_unhealthy_total == 0
+            && self.cluster.blob_pulls_rejected_scope_mismatch_total == 0
     }
 }
 

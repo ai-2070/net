@@ -43,6 +43,9 @@ use super::admission::{should_admit, AdmissionInputs, AdmissionVerdict};
 use super::cache::GreedyCacheRegistry;
 use super::config::GreedyConfig;
 use super::metrics::{AdmitRejectReason, GreedyMetricsRegistry};
+use crate::adapter::net::dataforts::blob::{
+    classify_payload, should_pull_blob, EventPayload, PullBlobVerdict,
+};
 
 /// Trait the mesh dispatch loop uses to fan inbound events into
 /// the greedy runtime. Stays sync — the mesh's `process_local_packet`
@@ -614,6 +617,28 @@ impl GreedyRuntime {
             .metrics
             .for_channel(channel.as_str())
             .set_bytes_resident(resident_bytes);
+
+        // 4b. G-1 blob-pull verdict. The chain event was admitted +
+        // cached, so this is the moment to consider whether the
+        // local node should *additionally* pull any blob the event
+        // payload references. Decision-only in this PR — counters
+        // surface the verdict; the actual fetch path lands when
+        // remote blob fetch wires up. See
+        // `dataforts/blob/admission.rs::should_pull_blob` for the
+        // decision rule + the plan's § G-1 for the full contract.
+        if let Ok(EventPayload::Blob(_blob_ref)) = classify_payload(payload) {
+            match should_pull_blob(&local_caps, chain_caps) {
+                PullBlobVerdict::Admit => {
+                    self.inner.metrics.cluster().incr_blob_pull_admitted();
+                }
+                PullBlobVerdict::Reject(reason) => {
+                    self.inner
+                        .metrics
+                        .cluster()
+                        .incr_blob_pull_rejected(reason);
+                }
+            }
+        }
 
         let sink = self.inner.sink.clone();
 
@@ -1282,5 +1307,187 @@ mod tests {
         // No heat-sink to assert on; the test passes by not
         // panicking and by leaving gravity_enabled false.
         assert!(!rt.gravity_enabled());
+    }
+
+    // --- G-1 blob-pull verdict wiring (PR-5c) ---
+
+    /// Encode `payload` as a `BlobRef::Small`-bearing event payload
+    /// so the dispatch hook's `classify_payload` sees the magic +
+    /// version + body and decodes a real BlobRef. Mirrors the
+    /// production wire shape that `publish_blob` produces.
+    fn encode_blob_payload(payload: &[u8]) -> Vec<u8> {
+        use crate::adapter::net::dataforts::blob::BlobRef;
+        let hash: [u8; 32] = blake3::hash(payload).into();
+        BlobRef::small("mesh://test", hash, payload.len() as u64).encode()
+    }
+
+    /// `dataforts.blob.storage` + `dataforts.greedy.enabled` +
+    /// proximity tag set — qualifies as a participating local node
+    /// under `should_pull_blob`.
+    fn participating_blob_caps() -> CapabilitySet {
+        CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=50")
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=mesh")
+            .add_tag("dataforts.greedy.proximity=128")
+    }
+
+    fn publisher_mesh_scope_caps() -> CapabilitySet {
+        CapabilitySet::new()
+            .add_tag("dataforts.greedy.scope=mesh")
+            .add_tag("dataforts.gravity.scope=mesh")
+    }
+
+    #[tokio::test]
+    async fn inline_payload_does_not_bump_blob_pull_counters() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let chain = publisher_mesh_scope_caps();
+
+        // Plain bytes — no BlobRef discriminator → classify_payload
+        // reports Inline → G-1 hook is a no-op.
+        let outcome = rt
+            .dispatch_event(&cn("test/g1-inline"), 0xAA, &chain, b"plain payload")
+            .await;
+        assert_eq!(outcome, DispatchOutcome::Cached);
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_no_storage_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_greedy_disabled_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_proximity_zero_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_unhealthy_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_scope_mismatch_total, 0);
+    }
+
+    #[tokio::test]
+    async fn blobref_payload_with_participating_local_bumps_admitted() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let chain = publisher_mesh_scope_caps();
+        let encoded = encode_blob_payload(b"out of band content");
+
+        let outcome = rt
+            .dispatch_event(&cn("test/g1-admit"), 0xBB, &chain, &encoded)
+            .await;
+        assert_eq!(outcome, DispatchOutcome::Cached);
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 1);
+        assert_eq!(snap.cluster.blob_pulls_rejected_no_storage_total, 0);
+    }
+
+    #[tokio::test]
+    async fn blobref_payload_without_storage_cap_bumps_no_storage() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        // Local lacks `dataforts.blob.storage` → G-1 vetoes with
+        // NoStorageCap as soon as it sees the BlobRef.
+        let local = CapabilitySet::new()
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=mesh")
+            .add_tag("dataforts.greedy.proximity=128");
+        rt.set_local_caps(Arc::new(local));
+        let chain = publisher_mesh_scope_caps();
+        let encoded = encode_blob_payload(b"out of band content");
+
+        rt.dispatch_event(&cn("test/g1-nostorage"), 0xCC, &chain, &encoded)
+            .await;
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_no_storage_total, 1);
+    }
+
+    #[tokio::test]
+    async fn blobref_payload_with_greedy_disabled_bumps_greedy_disabled() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        // Storage cap present, but greedy is not enabled on the
+        // local node → G-1 vetoes with GreedyDisabled.
+        let local = CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=50");
+        rt.set_local_caps(Arc::new(local));
+        let chain = publisher_mesh_scope_caps();
+        let encoded = encode_blob_payload(b"out of band content");
+
+        rt.dispatch_event(&cn("test/g1-greedy-off"), 0xDD, &chain, &encoded)
+            .await;
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_greedy_disabled_total, 1);
+    }
+
+    #[tokio::test]
+    async fn blobref_payload_with_proximity_zero_bumps_proximity_zero() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        // Storage + greedy enabled, but proximity tag explicitly
+        // zero → operator-driven veto without flipping the master
+        // flag.
+        let local = CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=50")
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=mesh")
+            .add_tag("dataforts.greedy.proximity=0");
+        rt.set_local_caps(Arc::new(local));
+        let chain = publisher_mesh_scope_caps();
+        let encoded = encode_blob_payload(b"out of band content");
+
+        rt.dispatch_event(&cn("test/g1-prox-zero"), 0xEE, &chain, &encoded)
+            .await;
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_proximity_zero_total, 1);
+    }
+
+    #[tokio::test]
+    async fn admit_rejected_chain_does_not_evaluate_blob_pull() {
+        // When the chain admission stage rejects, dispatch_event
+        // returns early and never reaches the G-1 hook. Even an
+        // otherwise-pullable BlobRef payload must not bump the
+        // blob counters when the chain itself was rejected.
+        use super::super::ScopeLabel;
+        let cfg = GreedyConfig::default()
+            .with_scopes(vec![ScopeLabel::new("industrial")])
+            .with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let chain = chain_caps_with_scope("webcam");
+        let encoded = encode_blob_payload(b"would pull");
+
+        let outcome = rt
+            .dispatch_event(&cn("test/g1-chain-rejected"), 0xFF, &chain, &encoded)
+            .await;
+        assert!(matches!(
+            outcome,
+            DispatchOutcome::RejectedByAdmission(AdmitRejectReason::Scope)
+        ));
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.admit_rejected_scope_total, 1);
+        // Critically: zero blob-pull verdicts because dispatch_event
+        // returned before the G-1 hook ran.
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_no_storage_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_greedy_disabled_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_proximity_zero_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_unhealthy_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_scope_mismatch_total, 0);
     }
 }
