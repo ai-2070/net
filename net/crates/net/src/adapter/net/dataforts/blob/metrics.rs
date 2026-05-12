@@ -149,51 +149,76 @@ impl BlobMetricsSnapshot {
     /// pass it in as a separate argument so this struct stays
     /// snapshottable from `BlobMetrics` alone.
     pub fn to_prometheus_text(&self, adapter_id: &str, gc_pending_total: u64) -> String {
+        // Operator-supplied `adapter_id` is interpolated into
+        // Prometheus label values. Escape per the text-exposition
+        // spec (`\\`, `\"`, `\n`) so a `--adapter-id 'evil"\n#bogus'`
+        // input can't inject fake metric lines / labels.
+        let label = escape_prometheus_label(adapter_id);
+        let label = label.as_str();
         let mut out = String::new();
         out.push_str(&format!(
             "# HELP dataforts_blobs_stored_total Successful blob stores.\n\
              # TYPE dataforts_blobs_stored_total counter\n\
              dataforts_blobs_stored_total{{adapter=\"{}\"}} {}\n",
-            adapter_id, self.blobs_stored_total
+            label, self.blobs_stored_total
         ));
         out.push_str(&format!(
             "# HELP dataforts_blobs_fetched_total Successful blob fetches.\n\
              # TYPE dataforts_blobs_fetched_total counter\n\
              dataforts_blobs_fetched_total{{adapter=\"{}\"}} {}\n",
-            adapter_id, self.blobs_fetched_total
+            label, self.blobs_fetched_total
         ));
         out.push_str(&format!(
             "# HELP dataforts_blob_bytes_stored_total Bytes accepted by store.\n\
              # TYPE dataforts_blob_bytes_stored_total counter\n\
              dataforts_blob_bytes_stored_total{{adapter=\"{}\"}} {}\n",
-            adapter_id, self.bytes_stored_total
+            label, self.bytes_stored_total
         ));
         out.push_str(&format!(
             "# HELP dataforts_blob_gc_swept_total Blobs removed by GC sweep.\n\
              # TYPE dataforts_blob_gc_swept_total counter\n\
              dataforts_blob_gc_swept_total{{adapter=\"{}\"}} {}\n",
-            adapter_id, self.gc_swept_total
+            label, self.gc_swept_total
         ));
         out.push_str(&format!(
             "# HELP dataforts_blob_gc_pending_total Zero-refcount blobs waiting on retention floor.\n\
              # TYPE dataforts_blob_gc_pending_total gauge\n\
              dataforts_blob_gc_pending_total{{adapter=\"{}\"}} {}\n",
-            adapter_id, gc_pending_total
+            label, gc_pending_total
         ));
         out.push_str(&format!(
             "# HELP dataforts_blob_disk_used_bytes Bytes the adapter currently holds.\n\
              # TYPE dataforts_blob_disk_used_bytes gauge\n\
              dataforts_blob_disk_used_bytes{{adapter=\"{}\"}} {}\n",
-            adapter_id, self.disk_used_bytes
+            label, self.disk_used_bytes
         ));
         out.push_str(&format!(
             "# HELP dataforts_blob_disk_capacity_bytes Operator-configured disk cap.\n\
              # TYPE dataforts_blob_disk_capacity_bytes gauge\n\
              dataforts_blob_disk_capacity_bytes{{adapter=\"{}\"}} {}\n",
-            adapter_id, self.disk_capacity_bytes
+            label, self.disk_capacity_bytes
         ));
         out
     }
+}
+
+/// Escape a string for use as a Prometheus label value, per the
+/// text-exposition spec: backslash, double-quote, and newline
+/// each get a backslash prefix. Other characters are passed
+/// through unchanged. Used by the metrics emitter to defang
+/// operator-supplied `adapter_id` values that could otherwise
+/// inject new metric lines into the scrape body.
+fn escape_prometheus_label(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Health-gate verdict from [`evaluate_health_gate`]. Per the
@@ -389,5 +414,50 @@ mod tests {
     fn health_gate_clear_threshold_inclusive() {
         // Exactly 85 % → clear (`<=`).
         assert_eq!(evaluate_health_gate(85, 100, true), HealthGateAction::Clear);
+    }
+
+    // ========================================================================
+    // Prometheus label escaping (regression for the adapter_id
+    // injection surface)
+    // ========================================================================
+
+    #[test]
+    fn prometheus_label_escapes_backslash_quote_newline() {
+        // The three characters the Prometheus text-exposition spec
+        // requires escaping in label values.
+        assert_eq!(escape_prometheus_label(r"a\b"), r"a\\b");
+        assert_eq!(escape_prometheus_label(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_prometheus_label("a\nb"), r"a\nb");
+        // Compound case: every special character in one value.
+        assert_eq!(
+            escape_prometheus_label("a\\b\"c\nd"),
+            "a\\\\b\\\"c\\nd"
+        );
+        // Plain ASCII passes through unchanged.
+        assert_eq!(escape_prometheus_label("mesh-prod"), "mesh-prod");
+    }
+
+    #[test]
+    fn to_prometheus_text_escapes_adapter_id_against_injection() {
+        // An operator passing `--adapter-id 'evil"\n# bogus_metric{}1\n#'`
+        // (or any binding caller) must not be able to inject new
+        // metric lines into the scrape body. The label value
+        // should escape the closing-quote + newline so the body
+        // stays well-formed.
+        let snap = BlobMetricsSnapshot::default();
+        let body = snap.to_prometheus_text("evil\"\n# bogus_metric{} 1\n#", 0);
+        // The label value should be quoted-and-escaped inline,
+        // not closing the label early.
+        assert!(
+            body.contains(r#"adapter="evil\"\n# bogus_metric{} 1\n#""#),
+            "adapter_id must appear escaped inside the label value; got:\n{}",
+            body
+        );
+        // And no raw injected line should appear in the body.
+        assert!(
+            !body.contains("\nbogus_metric{}"),
+            "raw injected metric line must not survive escaping; got:\n{}",
+            body
+        );
     }
 }

@@ -338,8 +338,16 @@ where
     let controller = BlobMigrationController::new(local_caps, capability_index);
     let candidates = controller.candidates();
     let mut report = BlobMigrationTickReport::default();
-    // Dedup across candidate + sibling expansions so a hash that
-    // appears in both lists triggers exactly one prefetch.
+    // Dedup across candidate + sibling expansions so a *successful*
+    // prefetch of a hash isn't repeated when the same hash
+    // surfaces later via a different candidate's manifest list.
+    // Critically, only hashes whose prefetch actually fired (Admit
+    // + Ok at the adapter) land in this set — a hash that was
+    // rejected (e.g. InsufficientDisk against the first candidate's
+    // publisher caps) can still be reconsidered when a later
+    // candidate's caps reach it under different scope. Without
+    // that, a hash that rejected once gets silently stranded for
+    // the rest of the tick.
     let mut already_prefetched: std::collections::HashSet<[u8; 32]> =
         std::collections::HashSet::new();
     for candidate in candidates {
@@ -350,36 +358,46 @@ where
                 continue;
             }
         };
+        // Skip if a *prior* admit already prefetched this hash —
+        // this is the only short-circuit we apply pre-verdict.
+        // Rejection histories from prior candidates don't carry
+        // over.
+        if already_prefetched.contains(&candidate.hash) {
+            continue;
+        }
         let verdict = should_migrate_blob_to(local_caps, &candidate.publisher_caps, size);
         match verdict {
             MigrateBlobVerdict::Admit => {
-                // Prefetch the heated chunk itself.
-                if already_prefetched.insert(candidate.hash) {
-                    let blob_ref = BlobRef::small(
-                        format!("mesh://{}", hex32(&candidate.hash)),
-                        candidate.hash,
-                        size,
-                    );
-                    match adapter.prefetch(&blob_ref).await {
-                        Ok(()) => report.admitted += 1,
-                        Err(e) => {
-                            tracing::trace!(
-                                error = ?e,
-                                hash = ?candidate.hash,
-                                "blob migration: prefetch failed; counted"
-                            );
-                            report.prefetch_errors += 1;
-                        }
+                let blob_ref = BlobRef::small(
+                    format!("mesh://{}", hex32(&candidate.hash)),
+                    candidate.hash,
+                    size,
+                );
+                match adapter.prefetch(&blob_ref).await {
+                    Ok(()) => {
+                        report.admitted += 1;
+                        already_prefetched.insert(candidate.hash);
+                    }
+                    Err(e) => {
+                        tracing::trace!(
+                            error = ?e,
+                            hash = ?candidate.hash,
+                            "blob migration: prefetch failed; counted"
+                        );
+                        report.prefetch_errors += 1;
+                        // Don't insert: a failed prefetch hasn't
+                        // committed the migration, so a later
+                        // candidate is free to retry the same hash.
                     }
                 }
                 // Manifest expansion: query the resolver for
-                // siblings of the heated hash.
+                // siblings of the heated hash. Sibling verdicts
+                // share the same dedup discipline — rejected
+                // siblings stay reconsiderable for the rest of
+                // the tick.
                 let siblings = manifest_resolver(candidate.hash).unwrap_or_default();
                 for (sibling_hash, sibling_size) in siblings {
-                    if !already_prefetched.insert(sibling_hash) {
-                        // Either the candidate itself OR a
-                        // previously-expanded sibling already
-                        // prefetched this one; skip.
+                    if already_prefetched.contains(&sibling_hash) {
                         continue;
                     }
                     let sibling_verdict =
@@ -392,7 +410,10 @@ where
                                 sibling_size,
                             );
                             match adapter.prefetch(&blob_ref).await {
-                                Ok(()) => report.admitted += 1,
+                                Ok(()) => {
+                                    report.admitted += 1;
+                                    already_prefetched.insert(sibling_hash);
+                                }
                                 Err(e) => {
                                     tracing::trace!(
                                         error = ?e,
@@ -855,5 +876,105 @@ mod tests {
             "sibling rejects on disk gate"
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// Regression for the manifest dedup trap: a sibling that
+    /// rejects against one candidate's `publisher_caps` must not
+    /// be silently consumed from the dedup set; it stays
+    /// reconsiderable when the same hash surfaces under a later
+    /// candidate's manifest. Pre-fix shape inserted into
+    /// `already_prefetched` *before* the sibling verdict ran, so
+    /// a rejected sibling was stranded for the rest of the tick
+    /// and rejection counters under-counted. Fix moved insertion
+    /// to post-Admit+Ok-prefetch.
+    ///
+    /// Observable difference: two candidates whose manifest
+    /// resolvers both return the same `huge_sibling` hash (which
+    /// rejects `InsufficientDisk` against the local node). Post-
+    /// fix, the rejection count is 2 (one per candidate's
+    /// expansion); pre-fix would have been 1 (the second
+    /// expansion's verdict was skipped via the pre-verdict dedup
+    /// insert).
+    #[tokio::test]
+    async fn rejected_sibling_stays_reconsiderable_across_candidates() {
+        let (a_top_hash, a_hex) = hex64(0xC1);
+        let (b_top_hash, b_hex) = hex64(0xC2);
+        let (shared_sibling_hash, _shared_hex) = hex64(0xC3);
+
+        // Two peers, each advertising a heated top-level hash.
+        // Both publishers use mesh scope so the top-level verdict
+        // admits; the shared sibling rejects via InsufficientDisk
+        // because the local node has only 1 GiB free.
+        let mut a_caps = CapabilitySet::new()
+            .add_tag("dataforts.gravity.scope=mesh")
+            .add_tag("dataforts.greedy.scope=mesh");
+        a_caps.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.50", a_hex),
+        });
+        let mut b_caps = CapabilitySet::new()
+            .add_tag("dataforts.gravity.scope=mesh")
+            .add_tag("dataforts.greedy.scope=mesh");
+        b_caps.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.50", b_hex),
+        });
+        let index = CapabilityIndex::new();
+        let entity_a = EntityId::from_bytes([0x11; 32]);
+        let entity_b = EntityId::from_bytes([0x22; 32]);
+        index.index(crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
+            100, entity_a, 1, a_caps,
+        ));
+        index.index(crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
+            200, entity_b, 1, b_caps,
+        ));
+
+        // Local: 1 GiB free; the 4 GiB sibling fails the disk
+        // gate. Top-level hashes are 1 KiB each, so they admit.
+        let local = CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=1")
+            .add_tag("dataforts.gravity.enabled")
+            .add_tag("dataforts.gravity.scope=mesh")
+            .add_tag("dataforts.gravity.proximity=128");
+
+        let four_gib: u64 = 4 * (1 << 30);
+        let adapter = PrefetchRecorder::new();
+        let calls = adapter.calls.clone();
+        let report = drive_blob_migration_tick_with_manifest_resolver(
+            &local,
+            &index,
+            &adapter,
+            move |h| {
+                if h == shared_sibling_hash {
+                    Some(four_gib) // exceeds local 1 GiB free
+                } else {
+                    Some(1024) // top-level hashes are small
+                }
+            },
+            move |h| {
+                if h == a_top_hash || h == b_top_hash {
+                    Some(vec![(shared_sibling_hash, four_gib)])
+                } else {
+                    None
+                }
+            },
+        )
+        .await;
+
+        // Both top-level hashes admit + prefetch.
+        assert_eq!(report.admitted, 2);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // The shared sibling rejects InsufficientDisk under BOTH
+        // candidates' expansions — post-fix the second
+        // expansion's verdict runs because the rejected sibling
+        // wasn't trapped in the dedup set. Pre-fix this would
+        // have been 1.
+        assert_eq!(
+            report.rejected_insufficient_disk, 2,
+            "rejected siblings must remain reconsiderable across candidates; \
+             pre-fix would have been 1 (dedup ate the second expansion)"
+        );
     }
 }
