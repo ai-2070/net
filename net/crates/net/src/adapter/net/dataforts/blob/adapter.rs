@@ -189,6 +189,31 @@ pub trait BlobAdapter: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Hint to the adapter that `blob_ref`'s bytes will likely be
+    /// fetched soon — kick off any background pre-population
+    /// (cross-node replication, prefetch from cold storage,
+    /// warm-cache load) without blocking on completion. The
+    /// returned `Ok(())` means "the prefetch was initiated", not
+    /// "the bytes are now local".
+    ///
+    /// Default impl: no-op success. Override on adapters with a
+    /// meaningful pre-population path —
+    /// [`MeshBlobAdapter`](super::MeshBlobAdapter) opens each
+    /// constituent chunk channel against the local
+    /// [`Redex`](crate::adapter::net::redex::Redex) handle so the
+    /// per-chunk replication runtime spawns and begins syncing
+    /// from peers carrying the chunk's `causal:<hex>` tag. This is
+    /// the wiring greedy uses when its G-1 admit verdict fires
+    /// (PR-5i — actual fetch is best-effort, parallel to the
+    /// admission decision; greedy doesn't block on the prefetch).
+    ///
+    /// Errors surface back to the caller as
+    /// [`BlobError::Backend`] but are advisory — the calling
+    /// runtime typically counts and drops rather than retrying.
+    async fn prefetch(&self, _blob_ref: &BlobRef) -> Result<(), BlobError> {
+        Ok(())
+    }
+
     /// Return an operational snapshot of the blob. Used by the
     /// `net blob stat` CLI + the metrics exporters; surfaces size,
     /// replica counts (where the adapter knows), encoding, etc.

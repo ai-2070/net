@@ -239,7 +239,9 @@ impl MeshBlobAdapter {
         channel: &ChannelName,
     ) -> Result<(), BlobError> {
         let guard = self.auth_guard.as_ref().ok_or_else(|| {
-            BlobError::Backend("auth: delete_chunk_authorized requires AuthGuard wiring".to_string())
+            BlobError::Backend(
+                "auth: delete_chunk_authorized requires AuthGuard wiring".to_string(),
+            )
         })?;
         auth_allows_blob_op(guard, origin_hash, channel)?;
         self.delete_chunk(hash).await
@@ -305,9 +307,11 @@ impl MeshBlobAdapter {
         now_unix_ms: u64,
         disk_pressure_critical: bool,
     ) -> Result<u64, BlobError> {
-        let candidates =
-            self.refcount
-                .deletable_hashes(now_unix_ms, self.retention_floor, disk_pressure_critical);
+        let candidates = self.refcount.deletable_hashes(
+            now_unix_ms,
+            self.retention_floor,
+            disk_pressure_critical,
+        );
         let mut swept: u64 = 0;
         for hash in candidates {
             match self.delete_chunk(&hash).await {
@@ -522,15 +526,18 @@ impl BlobAdapter for MeshBlobAdapter {
                 for (i, (recomputed_chunk, chunk_bytes)) in recomputed_chunks.iter().enumerate() {
                     if recomputed_chunk.hash != chunks[i].hash {
                         return Err(BlobError::Backend(format!(
-                            "mesh blob: chunk {} hash mismatch", i,
+                            "mesh blob: chunk {} hash mismatch",
+                            i,
                         )));
                     }
                     if recomputed_chunk.size != chunks[i].size {
                         return Err(BlobError::Backend(format!(
-                            "mesh blob: chunk {} size mismatch", i,
+                            "mesh blob: chunk {} size mismatch",
+                            i,
                         )));
                     }
-                    self.store_chunk(&recomputed_chunk.hash, chunk_bytes).await?;
+                    self.store_chunk(&recomputed_chunk.hash, chunk_bytes)
+                        .await?;
                 }
                 Ok(())
             }
@@ -545,9 +552,7 @@ impl BlobAdapter for MeshBlobAdapter {
         let result = match blob_ref {
             BlobRef::Small { hash, .. } => self.fetch_chunk(hash).await,
             BlobRef::Manifest {
-                chunks,
-                total_size,
-                ..
+                chunks, total_size, ..
             } => {
                 let mut out = Vec::with_capacity(*total_size as usize);
                 let mut err: Option<BlobError> = None;
@@ -651,6 +656,37 @@ impl BlobAdapter for MeshBlobAdapter {
         Ok(())
     }
 
+    /// Open each chunk channel against the local
+    /// [`Redex`] handle using
+    /// the adapter's existing `chunk_file_config`. When
+    /// replication is configured + active on the underlying
+    /// handle, the per-channel runtime spawned by `open_file`
+    /// begins syncing from peers carrying the chunk's
+    /// `causal:<hex>` advertisement — that's the cross-node fetch
+    /// path. Returns `Ok(())` as soon as every chunk channel has
+    /// been opened; the actual chunk arrival is asynchronous and
+    /// reachable via `fetch` / `exists` once the
+    /// replication-runtime sync completes.
+    ///
+    /// No-op when the chunk is already locally present (the
+    /// `open_file` fast path on the existing entry skips the
+    /// spawn; the chunk-file `len()` check on a subsequent
+    /// `fetch` returns the bytes without going over the network).
+    async fn prefetch(&self, blob_ref: &BlobRef) -> Result<(), BlobError> {
+        let cfg = self.chunk_file_config();
+        let hashes: Vec<[u8; 32]> = match blob_ref {
+            BlobRef::Small { hash, .. } => vec![*hash],
+            BlobRef::Manifest { chunks, .. } => chunks.iter().map(|c| c.hash).collect(),
+        };
+        for hash in hashes {
+            let channel = Self::chunk_channel(&hash);
+            self.redex.open_file(&channel, cfg.clone()).map_err(|e| {
+                BlobError::Backend(format!("mesh blob: prefetch open chunk: {}", e))
+            })?;
+        }
+        Ok(())
+    }
+
     async fn stat(&self, blob_ref: &BlobRef) -> Result<BlobStat, BlobError> {
         // v0.2 PR-4a — `last_seen_unix_ms` now comes from the
         // refcount table when the hash is tracked. For Small
@@ -660,9 +696,7 @@ impl BlobAdapter for MeshBlobAdapter {
         // advertisement count wires up (PR-5).
         let replica_target = self.replication.as_ref().map(|c| c.factor);
         let last_seen_unix_ms = match blob_ref {
-            BlobRef::Small { hash, .. } => {
-                self.refcount.get(hash).map(|e| e.last_seen_unix_ms)
-            }
+            BlobRef::Small { hash, .. } => self.refcount.get(hash).map(|e| e.last_seen_unix_ms),
             BlobRef::Manifest { chunks, .. } => chunks
                 .iter()
                 .filter_map(|c| self.refcount.get(&c.hash).map(|e| e.last_seen_unix_ms))
@@ -764,7 +798,11 @@ mod tests {
     /// BLAKE3 a payload + wrap as a `BlobRef::Small`.
     fn small_ref_for(payload: &[u8]) -> BlobRef {
         let hash: [u8; 32] = blake3::hash(payload).into();
-        BlobRef::small(format!("mesh://{}", hex32(&hash)), hash, payload.len() as u64)
+        BlobRef::small(
+            format!("mesh://{}", hex32(&hash)),
+            hash,
+            payload.len() as u64,
+        )
     }
 
     #[tokio::test]
@@ -849,9 +887,7 @@ mod tests {
         // BlobRef::Manifest the same way an honest caller would.
         let chunked = chunk_payload(&payload).unwrap();
         let chunk_refs: Vec<ChunkRef> = match chunked {
-            ChunkedPayload::Chunked { chunks, .. } => {
-                chunks.into_iter().map(|(r, _)| r).collect()
-            }
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
             ChunkedPayload::Inline { .. } => panic!("expected Chunked for >4MiB payload"),
         };
         let blob = BlobRef::manifest("mesh://multi", Encoding::Replicated, chunk_refs).unwrap();
@@ -869,9 +905,7 @@ mod tests {
             .collect();
         let chunked = chunk_payload(&payload).unwrap();
         let chunk_refs: Vec<ChunkRef> = match chunked {
-            ChunkedPayload::Chunked { chunks, .. } => {
-                chunks.into_iter().map(|(r, _)| r).collect()
-            }
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
             _ => panic!("expected Chunked"),
         };
         let blob = BlobRef::manifest("mesh://range", Encoding::Replicated, chunk_refs).unwrap();
@@ -900,9 +934,7 @@ mod tests {
         let adapter = make_adapter();
         let payload: Vec<u8> = vec![0xAA; BLOB_CHUNK_SIZE_BYTES as usize + 1];
         let chunk_refs: Vec<ChunkRef> = match chunk_payload(&payload).unwrap() {
-            ChunkedPayload::Chunked { chunks, .. } => {
-                chunks.into_iter().map(|(r, _)| r).collect()
-            }
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
             _ => panic!("expected Chunked"),
         };
         let blob = BlobRef::manifest(
@@ -962,9 +994,7 @@ mod tests {
         let adapter = make_adapter();
         let real_payload: Vec<u8> = vec![0xAA; BLOB_CHUNK_SIZE_BYTES as usize + 1];
         let chunk_refs: Vec<ChunkRef> = match chunk_payload(&real_payload).unwrap() {
-            ChunkedPayload::Chunked { chunks, .. } => {
-                chunks.into_iter().map(|(r, _)| r).collect()
-            }
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
             _ => panic!("expected Chunked"),
         };
         let blob = BlobRef::manifest("mesh://x", Encoding::Replicated, chunk_refs).unwrap();
@@ -1121,8 +1151,7 @@ mod tests {
                 size: 1,
             },
         ];
-        let blob =
-            BlobRef::manifest("mesh://x", Encoding::Replicated, bogus_chunks).unwrap();
+        let blob = BlobRef::manifest("mesh://x", Encoding::Replicated, bogus_chunks).unwrap();
         let err = adapter.store(&blob, &payload).await.unwrap_err();
         assert!(matches!(err, BlobError::Backend(_)));
     }
@@ -1151,10 +1180,16 @@ mod tests {
         let origin: u64 = 0xCAFE_BABE;
         let (adapter, channel) = adapter_with_authorized_origin(origin);
         let hash = [0x11_u8; 32];
-        adapter.pin_authorized(hash, origin, &channel, 1_000).unwrap();
+        adapter
+            .pin_authorized(hash, origin, &channel, 1_000)
+            .unwrap();
         // Pinned entries are deletable=false under sweep — verify
         // via the refcount table accessor.
-        assert!(adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+        assert!(adapter
+            .refcount_table()
+            .get(&hash)
+            .map(|e| e.pinned)
+            .unwrap_or(false));
     }
 
     #[test]
@@ -1167,7 +1202,11 @@ mod tests {
             .pin_authorized(hash, intruder, &channel, 1_000)
             .unwrap_err();
         assert!(matches!(err, BlobError::Backend(_)));
-        assert!(!adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+        assert!(!adapter
+            .refcount_table()
+            .get(&hash)
+            .map(|e| e.pinned)
+            .unwrap_or(false));
     }
 
     #[test]
@@ -1180,7 +1219,11 @@ mod tests {
             .pin_authorized(hash, origin, &wrong, 1_000)
             .unwrap_err();
         assert!(matches!(err, BlobError::Backend(_)));
-        assert!(!adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+        assert!(!adapter
+            .refcount_table()
+            .get(&hash)
+            .map(|e| e.pinned)
+            .unwrap_or(false));
     }
 
     #[test]
@@ -1199,12 +1242,22 @@ mod tests {
         let origin: u64 = 0xC0FFEE;
         let (adapter, channel) = adapter_with_authorized_origin(origin);
         let hash = [0x55_u8; 32];
-        adapter.pin_authorized(hash, origin, &channel, 1_000).unwrap();
-        assert!(adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+        adapter
+            .pin_authorized(hash, origin, &channel, 1_000)
+            .unwrap();
+        assert!(adapter
+            .refcount_table()
+            .get(&hash)
+            .map(|e| e.pinned)
+            .unwrap_or(false));
         adapter
             .unpin_authorized(hash, origin, &channel, 2_000)
             .unwrap();
-        assert!(!adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+        assert!(!adapter
+            .refcount_table()
+            .get(&hash)
+            .map(|e| e.pinned)
+            .unwrap_or(false));
     }
 
     #[test]
@@ -1212,14 +1265,20 @@ mod tests {
         let origin: u64 = 0xC0FFEE;
         let (adapter, channel) = adapter_with_authorized_origin(origin);
         let hash = [0x66_u8; 32];
-        adapter.pin_authorized(hash, origin, &channel, 1_000).unwrap();
+        adapter
+            .pin_authorized(hash, origin, &channel, 1_000)
+            .unwrap();
         let intruder: u64 = 0xBAAD_F00D;
         let err = adapter
             .unpin_authorized(hash, intruder, &channel, 2_000)
             .unwrap_err();
         assert!(matches!(err, BlobError::Backend(_)));
         // Pin must still be in place — auth failure cannot remove it.
-        assert!(adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+        assert!(adapter
+            .refcount_table()
+            .get(&hash)
+            .map(|e| e.pinned)
+            .unwrap_or(false));
     }
 
     #[test]

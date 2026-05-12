@@ -141,6 +141,18 @@ pub struct GreedyClusterMetricsAtomic {
     /// G-1 blob-pull veto: publisher scope outside local greedy
     /// scope boundary.
     pub blob_pulls_rejected_scope_mismatch_total: AtomicU64,
+    /// PR-5i: cumulative `BlobAdapter::prefetch` calls that
+    /// returned `Ok(())` after a G-1 admit. The wire-side fetch
+    /// progress lives inside the per-chunk replication runtime;
+    /// this counter only surfaces that the prefetch was
+    /// initiated (the adapter contract makes no completion
+    /// promise — see `BlobAdapter::prefetch`).
+    pub blob_prefetches_ok_total: AtomicU64,
+    /// PR-5i: cumulative `BlobAdapter::prefetch` calls that
+    /// surfaced an error. Operators dashboard against
+    /// `blob_pulls_admitted_total` to spot a misconfigured
+    /// replication runtime (admits high, prefetches erroring).
+    pub blob_prefetches_err_total: AtomicU64,
 }
 
 impl GreedyClusterMetricsAtomic {
@@ -231,6 +243,18 @@ impl GreedyClusterMetricsAtomic {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Bump the PR-5i prefetch-ok counter.
+    pub fn incr_blob_prefetch_ok(&self) {
+        self.blob_prefetches_ok_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump the PR-5i prefetch-err counter.
+    pub fn incr_blob_prefetch_err(&self) {
+        self.blob_prefetches_err_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -399,6 +423,14 @@ impl GreedyMetricsRegistry {
                     .cluster
                     .blob_pulls_rejected_scope_mismatch_total
                     .load(Ordering::Relaxed),
+                blob_prefetches_ok_total: self
+                    .cluster
+                    .blob_prefetches_ok_total
+                    .load(Ordering::Relaxed),
+                blob_prefetches_err_total: self
+                    .cluster
+                    .blob_prefetches_err_total
+                    .load(Ordering::Relaxed),
             },
         }
     }
@@ -454,6 +486,10 @@ pub struct GreedyClusterMetrics {
     pub blob_pulls_rejected_unhealthy_total: u64,
     /// G-1 blob-pull veto: publisher scope outside local boundary.
     pub blob_pulls_rejected_scope_mismatch_total: u64,
+    /// PR-5i: prefetch attempts that returned `Ok(())`.
+    pub blob_prefetches_ok_total: u64,
+    /// PR-5i: prefetch attempts that surfaced an error.
+    pub blob_prefetches_err_total: u64,
 }
 
 /// Full snapshot — sorted channel list + cluster-wide counters.
@@ -588,7 +624,10 @@ impl GreedyMetricsSnapshot {
             "# TYPE dataforts_greedy_blob_pulls_rejected_total counter"
         );
         for (reason, count) in [
-            ("no_storage", self.cluster.blob_pulls_rejected_no_storage_total),
+            (
+                "no_storage",
+                self.cluster.blob_pulls_rejected_no_storage_total,
+            ),
             (
                 "greedy_disabled",
                 self.cluster.blob_pulls_rejected_greedy_disabled_total,
@@ -597,7 +636,10 @@ impl GreedyMetricsSnapshot {
                 "proximity_zero",
                 self.cluster.blob_pulls_rejected_proximity_zero_total,
             ),
-            ("unhealthy", self.cluster.blob_pulls_rejected_unhealthy_total),
+            (
+                "unhealthy",
+                self.cluster.blob_pulls_rejected_unhealthy_total,
+            ),
             (
                 "scope_mismatch",
                 self.cluster.blob_pulls_rejected_scope_mismatch_total,
@@ -607,6 +649,23 @@ impl GreedyMetricsSnapshot {
                 out,
                 "dataforts_greedy_blob_pulls_rejected_total{{reason=\"{}\"}} {}",
                 reason, count,
+            );
+        }
+
+        // PR-5i blob prefetch outcome counter.
+        let _ = writeln!(
+            out,
+            "# HELP dataforts_greedy_blob_prefetches_total Cumulative BlobAdapter::prefetch invocations from the G-1 admit path, split by outcome."
+        );
+        let _ = writeln!(out, "# TYPE dataforts_greedy_blob_prefetches_total counter");
+        for (outcome, count) in [
+            ("ok", self.cluster.blob_prefetches_ok_total),
+            ("err", self.cluster.blob_prefetches_err_total),
+        ] {
+            let _ = writeln!(
+                out,
+                "dataforts_greedy_blob_prefetches_total{{outcome=\"{}\"}} {}",
+                outcome, count,
             );
         }
 
@@ -631,6 +690,8 @@ impl GreedyMetricsSnapshot {
             && self.cluster.blob_pulls_rejected_proximity_zero_total == 0
             && self.cluster.blob_pulls_rejected_unhealthy_total == 0
             && self.cluster.blob_pulls_rejected_scope_mismatch_total == 0
+            && self.cluster.blob_prefetches_ok_total == 0
+            && self.cluster.blob_prefetches_err_total == 0
     }
 }
 
