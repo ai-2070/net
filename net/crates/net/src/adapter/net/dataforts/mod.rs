@@ -33,8 +33,8 @@ pub use greedy::{
 
 #[cfg(feature = "dataforts")]
 pub use gravity::{
-    should_emit_heat, DataGravityPolicy, DataGravityPolicyError, EmissionDecision, HeatCounter,
-    HeatEmission, HeatRegistry, HeatSink,
+    should_emit_heat, BlobHeatRegistry, DataGravityPolicy, DataGravityPolicyError,
+    EmissionDecision, HeatCounter, HeatEmission, HeatRegistry, HeatSink,
 };
 
 #[cfg(feature = "dataforts")]
@@ -49,6 +49,6 @@ pub use blob::{
     NoopAdapter, PublishWithBlobReceipt, PullBlobReject, PullBlobVerdict, RefcountEntry,
     BLOB_CHUNK_SIZE_BYTES, BLOB_MANIFEST_BODY_VERSION, BLOB_MANIFEST_MAX_CHUNKS,
     BLOB_REF_DISCRIMINATOR, BLOB_REF_MAGIC, BLOB_REF_MAX_SIZE, BLOB_REF_SMALL_HEADER_LEN,
-    BLOB_REF_VERSION_V1, BLOB_REF_VERSION_V2_MANIFEST, DEFAULT_RETENTION_FLOOR,
-    HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
+    BLOB_REF_VERSION_V1, BLOB_REF_VERSION_V2_MANIFEST, DEFAULT_BLOB_HEAT_HALF_LIFE,
+    DEFAULT_RETENTION_FLOOR, HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
 };

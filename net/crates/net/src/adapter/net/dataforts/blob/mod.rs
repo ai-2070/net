@@ -43,7 +43,7 @@ pub use dispatch::{
 };
 pub use error::BlobError;
 pub use fs::FileSystemAdapter;
-pub use mesh::MeshBlobAdapter;
+pub use mesh::{MeshBlobAdapter, DEFAULT_BLOB_HEAT_HALF_LIFE};
 pub use metrics::{
     evaluate_health_gate, BlobMetrics, BlobMetricsSnapshot, HealthGateAction,
     HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,

@@ -62,6 +62,14 @@ use crate::adapter::net::redex::{Redex, RedexFileConfig, ReplicationConfig};
 /// `dataforts/blob/<hex32>` keyed on its BLAKE3 hash.
 const CHUNK_CHANNEL_PREFIX: &str = "dataforts/blob/";
 
+/// Default half-life applied to per-chunk blob-heat counters when
+/// the operator opts into the heat-tracking path via
+/// [`MeshBlobAdapter::with_blob_heat`]. 60 s mirrors the chain
+/// heat half-life — a fetch every minute keeps the counter near
+/// steady state; cold blobs decay below the emit threshold inside
+/// a few minutes.
+pub const DEFAULT_BLOB_HEAT_HALF_LIFE: Duration = Duration::from_secs(60);
+
 /// `mesh://`-scheme adapter that stores chunks as content-addressed
 /// [`RedexFile`](crate::adapter::net::redex::RedexFile)s. See the
 /// module-level docs for the dispatch shape.
@@ -108,6 +116,18 @@ pub struct MeshBlobAdapter {
     /// variants are still reachable for system-internal callers
     /// (GC sweep, chain-fold refcount incr/decr).
     auth_guard: Option<Arc<AuthGuard>>,
+    /// Optional shared blob-heat registry. When wired (PR-5j-b),
+    /// every successful [`Self::fetch`] / [`Self::fetch_range`]
+    /// bumps the chunk's heat counter so the gravity layer can
+    /// observe per-blob read pressure. `None` (the default) keeps
+    /// fetches free of any heat side-effect. Cheap to clone
+    /// (`Arc<Mutex<...>>` inside); operators typically share
+    /// the same handle with the gravity controller's tick loop.
+    blob_heat: Option<Arc<parking_lot::Mutex<crate::adapter::net::dataforts::gravity::BlobHeatRegistry>>>,
+    /// Half-life applied to newly-entered blob-heat counters.
+    /// Defaults to [`DEFAULT_BLOB_HEAT_HALF_LIFE`] (60 s); operators
+    /// tune via [`Self::with_blob_heat`].
+    blob_heat_half_life: Duration,
 }
 
 impl MeshBlobAdapter {
@@ -127,6 +147,8 @@ impl MeshBlobAdapter {
             retention_floor: DEFAULT_RETENTION_FLOOR,
             metrics: BlobMetrics::new(),
             auth_guard: None,
+            blob_heat: None,
+            blob_heat_half_life: DEFAULT_BLOB_HEAT_HALF_LIFE,
         }
     }
 
@@ -175,6 +197,49 @@ impl MeshBlobAdapter {
     pub fn with_auth_guard(mut self, guard: Arc<AuthGuard>) -> Self {
         self.auth_guard = Some(guard);
         self
+    }
+
+    /// Wire a shared blob-heat registry. Each successful fetch
+    /// then bumps the chunk hash's heat counter so a gravity
+    /// tick can observe the read rate (PR-5j-b). The registry
+    /// handle is cheap to clone (`Arc<Mutex>` inside); operators
+    /// typically share the same handle with the gravity migration
+    /// controller's tick loop.
+    ///
+    /// `half_life` controls the per-counter decay; pass
+    /// [`DEFAULT_BLOB_HEAT_HALF_LIFE`] for the standard 60 s
+    /// half-life or a custom value when tuning aggressive vs
+    /// lazy migration cadence.
+    pub fn with_blob_heat(
+        mut self,
+        registry: Arc<
+            parking_lot::Mutex<crate::adapter::net::dataforts::gravity::BlobHeatRegistry>,
+        >,
+        half_life: Duration,
+    ) -> Self {
+        self.blob_heat = Some(registry);
+        self.blob_heat_half_life = half_life;
+        self
+    }
+
+    /// True iff this adapter is wired to bump a shared blob-heat
+    /// registry on fetch.
+    pub fn blob_heat_enabled(&self) -> bool {
+        self.blob_heat.is_some()
+    }
+
+    /// Bump the heat counters for every chunk hash a fetch
+    /// touched. No-op when no registry is wired. Pure side-effect
+    /// — returns nothing; failure to acquire the lock would be a
+    /// poisoned mutex, which is itself a bug worth panicking on.
+    fn bump_heat(&self, hashes: &[[u8; 32]]) {
+        if let Some(reg) = self.blob_heat.as_ref() {
+            let now = std::time::Instant::now();
+            let mut guard = reg.lock();
+            for h in hashes {
+                guard.entry_mut(*h, self.blob_heat_half_life, now).bump(now);
+            }
+        }
     }
 
     /// Pin `hash` against GC, gated by an
@@ -585,6 +650,18 @@ impl BlobAdapter for MeshBlobAdapter {
         };
         if result.is_ok() {
             self.metrics.record_fetch();
+            // PR-5j-b: bump blob heat for every chunk hash a
+            // successful fetch resolved. No-op when no registry
+            // is wired.
+            if self.blob_heat.is_some() {
+                let hashes: Vec<[u8; 32]> = match blob_ref {
+                    BlobRef::Small { hash, .. } => vec![*hash],
+                    BlobRef::Manifest { chunks, .. } => {
+                        chunks.iter().map(|c| c.hash).collect()
+                    }
+                };
+                self.bump_heat(&hashes);
+            }
         }
         result
     }
@@ -604,7 +681,7 @@ impl BlobAdapter for MeshBlobAdapter {
         if len == 0 {
             return Ok(Vec::new());
         }
-        match blob_ref {
+        let (result, touched): (Result<Vec<u8>, BlobError>, Vec<[u8; 32]>) = match blob_ref {
             BlobRef::Small { hash, size, .. } => {
                 if range.end > *size {
                     return Err(BlobError::Backend(format!(
@@ -612,23 +689,47 @@ impl BlobAdapter for MeshBlobAdapter {
                         range.end, size
                     )));
                 }
-                let bytes = self.fetch_chunk(hash).await?;
-                Ok(bytes[range.start as usize..range.end as usize].to_vec())
+                match self.fetch_chunk(hash).await {
+                    Ok(bytes) => (
+                        Ok(bytes[range.start as usize..range.end as usize].to_vec()),
+                        vec![*hash],
+                    ),
+                    Err(e) => (Err(e), Vec::new()),
+                }
             }
             BlobRef::Manifest { .. } => {
                 let requests = byte_range_to_chunks(blob_ref, range.start, range.end)?;
                 let mut out = Vec::with_capacity(len as usize);
                 let chunks = blob_ref.chunks();
-                for req in requests {
+                let mut touched = Vec::with_capacity(requests.len());
+                let mut err: Option<BlobError> = None;
+                for req in &requests {
                     let chunk = &chunks[req.chunk_index];
-                    let chunk_bytes = self.fetch_chunk(&chunk.hash).await?;
-                    out.extend_from_slice(
-                        &chunk_bytes[req.start_in_chunk as usize..req.end_in_chunk as usize],
-                    );
+                    match self.fetch_chunk(&chunk.hash).await {
+                        Ok(chunk_bytes) => {
+                            out.extend_from_slice(
+                                &chunk_bytes
+                                    [req.start_in_chunk as usize..req.end_in_chunk as usize],
+                            );
+                            touched.push(chunk.hash);
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
                 }
-                Ok(out)
+                if let Some(e) = err {
+                    (Err(e), Vec::new())
+                } else {
+                    (Ok(out), touched)
+                }
             }
+        };
+        if result.is_ok() && !touched.is_empty() {
+            self.bump_heat(&touched);
         }
+        result
     }
 
     async fn exists(&self, blob_ref: &BlobRef) -> Result<bool, BlobError> {
@@ -1346,5 +1447,92 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BlobError::Backend(_)));
+    }
+
+    // --- PR-5j-b: blob heat bumps on fetch ---
+
+    #[tokio::test]
+    async fn fetch_bumps_blob_heat_when_registry_wired() {
+        use crate::adapter::net::dataforts::gravity::BlobHeatRegistry;
+        let redex = Arc::new(Redex::new());
+        let registry = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
+        let adapter = MeshBlobAdapter::new("mesh-heat", redex).with_blob_heat(
+            registry.clone(),
+            DEFAULT_BLOB_HEAT_HALF_LIFE,
+        );
+        assert!(adapter.blob_heat_enabled());
+
+        let payload = b"hot blob".to_vec();
+        let blob = small_ref_for(&payload);
+        let hash = match &blob {
+            BlobRef::Small { hash, .. } => *hash,
+            _ => panic!("expected Small"),
+        };
+        adapter.store(&blob, &payload).await.unwrap();
+
+        // First fetch initializes the counter at rate=1.
+        let _ = adapter.fetch(&blob).await.unwrap();
+        {
+            let guard = registry.lock();
+            let counter = guard.get(&hash).expect("heat entry must exist after fetch");
+            assert!(counter.rate() > 0.0, "rate must be > 0 after one fetch");
+        }
+
+        // Second fetch bumps the same counter — rate climbs (modulo
+        // decay, which is negligible over the test's tight window).
+        let _ = adapter.fetch(&blob).await.unwrap();
+        let after_second = registry.lock().get(&hash).map(|c| c.rate()).unwrap_or(0.0);
+        assert!(after_second >= 1.0, "rate must remain >= 1.0 after second fetch (got {after_second})");
+    }
+
+    #[tokio::test]
+    async fn fetch_without_heat_registry_is_silent() {
+        let adapter = make_adapter();
+        assert!(!adapter.blob_heat_enabled());
+        let payload = b"silent fetch".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        // Fetch succeeds and doesn't touch any registry (there
+        // isn't one to touch — the assertion is implicit: no panic).
+        let bytes = adapter.fetch(&blob).await.unwrap();
+        assert_eq!(bytes, payload);
+    }
+
+    #[tokio::test]
+    async fn fetch_range_bumps_blob_heat_for_touched_chunks_only() {
+        use crate::adapter::net::dataforts::gravity::BlobHeatRegistry;
+        let redex = Arc::new(Redex::new());
+        let registry = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
+        let adapter = MeshBlobAdapter::new("mesh-heat-range", redex).with_blob_heat(
+            registry.clone(),
+            DEFAULT_BLOB_HEAT_HALF_LIFE,
+        );
+
+        // 2-chunk payload — fetch_range over the first chunk only
+        // should bump exactly hash[0], not hash[1].
+        let payload: Vec<u8> = (0..(BLOB_CHUNK_SIZE_BYTES as usize + 500))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let chunked = chunk_payload(&payload).unwrap();
+        let chunk_refs: Vec<ChunkRef> = match chunked {
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
+            _ => panic!("expected Chunked"),
+        };
+        let blob = BlobRef::manifest("mesh://heat", Encoding::Replicated, chunk_refs.clone())
+            .unwrap();
+        adapter.store(&blob, &payload).await.unwrap();
+
+        // Range entirely inside the first chunk.
+        let _ = adapter.fetch_range(&blob, 0..1024).await.unwrap();
+
+        let guard = registry.lock();
+        assert!(
+            guard.get(&chunk_refs[0].hash).is_some(),
+            "first chunk's heat must bump on fetch_range over its bytes"
+        );
+        assert!(
+            guard.get(&chunk_refs[1].hash).is_none(),
+            "second chunk's heat must NOT bump when range doesn't touch it"
+        );
     }
 }

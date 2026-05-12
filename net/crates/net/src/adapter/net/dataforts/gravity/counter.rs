@@ -308,6 +308,144 @@ impl HeatRegistry {
     }
 }
 
+/// Cluster-wide blob heat registry. Mirrors [`HeatRegistry`] but
+/// keyed by `[u8; 32]` (the chunk's BLAKE3 hash) rather than the
+/// chain's `u64` `origin_hash` — operators reading a `BlobRef`
+/// have the hash in hand and a `u64` projection would unnecessarily
+/// collapse it. Same LRU + cap discipline; same per-counter
+/// half-life decay; same tick semantics. PR-5j-a foundation for
+/// the gravity migration controller.
+#[derive(Debug)]
+pub struct BlobHeatRegistry {
+    counters: HashMap<[u8; 32], HeatCounter>,
+    cap: usize,
+}
+
+impl Default for BlobHeatRegistry {
+    fn default() -> Self {
+        Self {
+            counters: HashMap::new(),
+            cap: DEFAULT_HEAT_REGISTRY_CAP,
+        }
+    }
+}
+
+impl BlobHeatRegistry {
+    /// Empty registry with the default cap.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Empty registry with an explicit cap. `cap == 0` disables
+    /// the bound — only safe when an external loop guarantees
+    /// bounded entries (e.g. an adapter that prunes on chunk
+    /// delete).
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            counters: HashMap::new(),
+            cap,
+        }
+    }
+
+    /// Configured cap. `0` means unbounded.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Number of tracked blob hashes.
+    pub fn len(&self) -> usize {
+        self.counters.len()
+    }
+
+    /// True iff zero hashes tracked.
+    pub fn is_empty(&self) -> bool {
+        self.counters.is_empty()
+    }
+
+    /// Get-or-create the counter for `hash`. Returns a mutable
+    /// reference so the caller can `bump` / `decay_to` /
+    /// `record_emission` in one borrow.
+    ///
+    /// When `len() == cap` and the inserted key is new, the entry
+    /// with the oldest `last_update` is evicted first (LRU-style
+    /// replacement). `cap == 0` disables the bound.
+    pub fn entry_mut(
+        &mut self,
+        hash: [u8; 32],
+        half_life: Duration,
+        now: Instant,
+    ) -> &mut HeatCounter {
+        if !self.counters.contains_key(&hash) && self.cap > 0 && self.counters.len() >= self.cap {
+            self.evict_lru();
+        }
+        self.counters
+            .entry(hash)
+            .or_insert_with(|| HeatCounter::new(half_life, now))
+    }
+
+    fn evict_lru(&mut self) {
+        let victim = self
+            .counters
+            .iter()
+            .min_by_key(|(_, c)| c.last_update())
+            .map(|(k, _)| *k);
+        if let Some(key) = victim {
+            self.counters.remove(&key);
+        }
+    }
+
+    /// Read-only access to the counter for `hash`.
+    pub fn get(&self, hash: &[u8; 32]) -> Option<&HeatCounter> {
+        self.counters.get(hash)
+    }
+
+    /// Remove the counter for `hash`. Used on chunk delete /
+    /// GC sweep.
+    pub fn remove(&mut self, hash: &[u8; 32]) {
+        self.counters.remove(hash);
+    }
+
+    /// Iterate `(hash, counter)` pairs. Read-only.
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8; 32], &HeatCounter)> {
+        self.counters.iter()
+    }
+
+    /// Walk every tracked hash, applying decay through `now` and
+    /// asking `should_emit_heat` whether to emit. Returns the
+    /// list of `(hash, decision)` pairs the runtime acts on.
+    /// Mirrors [`HeatRegistry::tick`]; records emissions against
+    /// the counter so the next tick sees the updated snapshot,
+    /// and prunes fully-decayed + already-withdrawn entries.
+    pub fn tick(
+        &mut self,
+        policy: &super::DataGravityPolicy,
+        now: Instant,
+    ) -> Vec<([u8; 32], HeatEmission)> {
+        let mut out = Vec::new();
+        for (hash, counter) in self.counters.iter_mut() {
+            counter.decay_to(now);
+            let decision = super::should_emit_heat(counter.rate, counter.last_emitted, policy);
+            let emission = match decision {
+                super::EmissionDecision::Suppress => HeatEmission::Suppress,
+                super::EmissionDecision::Emit { rate } => {
+                    counter.record_emission(rate);
+                    HeatEmission::Emit { rate }
+                }
+                super::EmissionDecision::Withdraw => {
+                    counter.record_withdrawal();
+                    HeatEmission::Withdraw
+                }
+            };
+            if !matches!(emission, HeatEmission::Suppress) {
+                out.push((*hash, emission));
+            }
+        }
+        self.counters
+            .retain(|_, c| !(c.rate == 0.0 && c.last_emitted == Some(0.0)));
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +682,75 @@ mod tests {
             HeatEmission::Emit { rate } => assert!(rate >= 4.0 * 0.99),
             other => panic!("expected Emit, got {other:?}"),
         }
+    }
+
+    // --- BlobHeatRegistry coverage (PR-5j-a) ---
+
+    fn hash(seed: u8) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[0] = seed;
+        h
+    }
+
+    #[test]
+    fn blob_heat_registry_is_empty_by_default() {
+        let r = BlobHeatRegistry::new();
+        assert!(r.is_empty());
+        assert_eq!(r.cap(), DEFAULT_HEAT_REGISTRY_CAP);
+    }
+
+    #[test]
+    fn blob_heat_entry_mut_creates_then_bumps() {
+        let mut r = BlobHeatRegistry::new();
+        let half = Duration::from_secs(60);
+        let h = hash(0x01);
+        r.entry_mut(h, half, t0()).bump(t0());
+        let counter = r.get(&h).expect("entry should exist");
+        assert!(counter.rate() > 0.0);
+    }
+
+    #[test]
+    fn blob_heat_entry_mut_at_cap_evicts_lru() {
+        let base = t0();
+        let mut r = BlobHeatRegistry::with_cap(2);
+        let half = Duration::from_secs(60);
+        r.entry_mut(hash(0x01), half, base).bump(base);
+        r.entry_mut(hash(0x02), half, base + Duration::from_millis(10))
+            .bump(base + Duration::from_millis(10));
+        r.entry_mut(hash(0x03), half, base + Duration::from_millis(20))
+            .bump(base + Duration::from_millis(20));
+        // hash(0x01) was LRU when 0x03 inserted past cap → evicted.
+        assert!(r.get(&hash(0x01)).is_none());
+        assert!(r.get(&hash(0x02)).is_some());
+        assert!(r.get(&hash(0x03)).is_some());
+    }
+
+    #[test]
+    fn blob_heat_tick_emits_above_threshold() {
+        let mut r = BlobHeatRegistry::new();
+        let policy = super::super::policy::DataGravityPolicy::default();
+        let half = policy.decay_half_life;
+        let h = hash(0x42);
+        let now = t0();
+        // Several bumps in quick succession build rate quickly.
+        for _ in 0..8 {
+            r.entry_mut(h, half, now).bump(now);
+        }
+        let emissions = r.tick(&policy, now);
+        assert!(
+            emissions.iter().any(|(k, e)| *k == h
+                && matches!(e, HeatEmission::Emit { rate } if *rate > 0.0)),
+            "tick must emit for a heated hash; got {emissions:?}"
+        );
+    }
+
+    #[test]
+    fn blob_heat_remove_drops_entry() {
+        let mut r = BlobHeatRegistry::new();
+        let half = Duration::from_secs(60);
+        let h = hash(0x42);
+        r.entry_mut(h, half, t0()).bump(t0());
+        r.remove(&h);
+        assert!(r.is_empty());
     }
 }

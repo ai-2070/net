@@ -29,7 +29,9 @@ mod counter;
 mod policy;
 mod sink;
 
-pub use counter::{HeatCounter, HeatEmission, HeatRegistry, DEFAULT_HEAT_REGISTRY_CAP};
+pub use counter::{
+    BlobHeatRegistry, HeatCounter, HeatEmission, HeatRegistry, DEFAULT_HEAT_REGISTRY_CAP,
+};
 pub use policy::{
     should_emit_heat, DataGravityPolicy, DataGravityPolicyError, EmissionDecision,
     DEFAULT_DECAY_HALF_LIFE_SECS, DEFAULT_EMIT_THRESHOLD_RATIO,
