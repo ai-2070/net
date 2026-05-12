@@ -38,7 +38,7 @@ Tagged `[B | H | M | L]`:
 | B-3   | H   | blob mesh    | `publish_with_blob` advertises chunks before manifest commits          | ✅ (doc-reframe — drop "atomic" claim, document chunk-advertise vs publish ordering and what the contract is/isn't; regression test pins post-store per-chunk fetchability) |
 | B-4   | H   | blob mesh    | `heat:blob:` tags uncorroborated → orphan replication runtimes         | ✅ (per-peer admit budget at the migration controller — DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK; tracked via `skipped_peer_budget` for observability) |
 | B-5   | H   | migration    | `publisher_caps` sourced from heat emitter, not actual publisher       | ✅ (cross-advertiser scope narrowing — controller floors gravity/greedy scope to the narrowest claim across every peer advertising heat for the same hash; unparticipating peers excluded) |
-| B-6   | H   | blob mesh    | `delete_chunk_authorized` strands `RefcountEntry`                      | ⬜ |
+| B-6   | H   | blob mesh    | `delete_chunk_authorized` strands `RefcountEntry`                      | ✅ (refcount cleanup moved into `delete_chunk` itself so every caller — sweep + peer-initiated authorized — gets the cleanup; sweep_gc's duplicate remove dropped) |
 | B-7   | H   | blob mesh    | `store_chunk` TOCTOU between `is_empty()` and `append()`; no verify     | ⬜ |
 | B-8   | H   | cli          | `net-blob get --out` has no symlink / traversal guard                  | ⬜ |
 | B-9   | M   | greedy       | `set_blob_refcount_table` swap leaks +1's on prior table               | ⬜ |

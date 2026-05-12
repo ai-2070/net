@@ -425,16 +425,11 @@ impl MeshBlobAdapter {
         );
         let mut swept: u64 = 0;
         for hash in candidates {
-            match self.delete_chunk(&hash).await {
-                Ok(()) => {
-                    self.refcount.remove(&hash);
-                    swept = swept.saturating_add(1);
-                }
-                Err(_) => {
-                    // Leave the refcount entry in place so the
-                    // next sweep retries — chunk-file delete
-                    // failures shouldn't strand the refcount.
-                }
+            // delete_chunk drops the refcount entry on success
+            // and preserves it on error so the next sweep can
+            // retry.
+            if self.delete_chunk(&hash).await.is_ok() {
+                swept = swept.saturating_add(1);
             }
         }
         self.metrics.record_gc_swept(swept);
@@ -442,20 +437,26 @@ impl MeshBlobAdapter {
     }
 
     /// Delete a single chunk file by content hash. The chunk's
-    /// `RedexFile` is closed + removed from the Redex manager.
-    /// Idempotent on the success path — closing an already-closed
-    /// file returns `Ok(())` from the Redex layer. Used internally
-    /// by [`Self::sweep_gc`]; reachable directly for operators
-    /// running batched / dry-run flows against
-    /// [`BlobRefcountTable::deletable_hashes`].
+    /// `RedexFile` is closed + removed from the Redex manager,
+    /// and the refcount table entry is dropped on success so
+    /// `stat()` stops surfacing a stale `last_seen_unix_ms` for a
+    /// deleted blob and any subsequent re-store starts a fresh
+    /// retention-floor clock. Idempotent on the success path —
+    /// closing an already-closed file returns `Ok(())` from the
+    /// Redex layer. Used internally by [`Self::sweep_gc`] and by
+    /// the peer-initiated [`Self::delete_chunk_authorized`];
+    /// reachable directly for operators running batched / dry-run
+    /// flows against [`BlobRefcountTable::deletable_hashes`].
+    ///
+    /// On `Err` the refcount entry is preserved so the next sweep
+    /// can retry — chunk-file close failures shouldn't strand the
+    /// retention clock.
     pub async fn delete_chunk(&self, hash: &[u8; 32]) -> Result<(), BlobError> {
         let channel = Self::chunk_channel(hash);
-        // Best-effort delete — close the file + drop the entry
-        // from the Redex manager. The underlying disk reclaim
-        // happens on the Redex side via its close path.
         self.redex
             .close_file(&channel)
             .map_err(|e| BlobError::Backend(format!("mesh blob: close chunk: {}", e)))?;
+        self.refcount.remove(hash);
         Ok(())
     }
 
@@ -1459,6 +1460,9 @@ mod tests {
             BlobRef::Small { hash, .. } => *hash,
             _ => panic!("expected Small"),
         };
+        // Pre-condition: refcount entry exists from the store.
+        assert!(adapter.refcount_table().get(&hash).is_some());
+
         adapter
             .delete_chunk_authorized(&hash, origin, &channel)
             .await
@@ -1466,6 +1470,18 @@ mod tests {
         // The chunk file is closed — fetch surfaces NotFound.
         let err = adapter.fetch(&blob).await.unwrap_err();
         assert!(matches!(err, BlobError::NotFound(_)));
+        // Refcount entry must be cleaned up alongside the chunk file,
+        // so stat() stops reporting a stale last_seen and any
+        // subsequent re-store starts a fresh retention-floor clock.
+        assert!(
+            adapter.refcount_table().get(&hash).is_none(),
+            "authorized delete must drop the refcount entry"
+        );
+        let stat = adapter.stat(&blob).await.unwrap();
+        assert!(
+            stat.last_seen_unix_ms.is_none(),
+            "stat must not surface a stale last_seen for a deleted blob"
+        );
     }
 
     #[tokio::test]
