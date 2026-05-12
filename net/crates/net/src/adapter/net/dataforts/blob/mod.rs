@@ -18,10 +18,12 @@ pub mod conformance;
 pub mod dispatch;
 pub mod error;
 pub mod fs;
+pub mod mesh;
 pub mod noop;
 pub mod registry;
 
-pub use adapter::BlobAdapter;
+pub use adapter::{BlobAdapter, BlobStat};
+pub use mesh::MeshBlobAdapter;
 pub use blob_ref::{
     byte_range_to_chunks, chunk_payload, BlobRef, ChunkRangeRequest, ChunkRef, ChunkedPayload,
     Encoding, BLOB_CHUNK_SIZE_BYTES, BLOB_MANIFEST_BODY_VERSION, BLOB_MANIFEST_MAX_CHUNKS,

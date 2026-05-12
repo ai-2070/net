@@ -432,6 +432,76 @@ impl BlobAdapter for FileSystemAdapter {
         });
         Ok(Box::pin(stream))
     }
+
+    async fn delete(&self, blob_ref: &BlobRef) -> Result<(), BlobError> {
+        let (hash, uri) = expect_small(blob_ref)?;
+        let path = self.path_for(&hash);
+        let uri = sanitize_uri_for_error(uri);
+        let permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| backend("adapter concurrency semaphore closed"))?;
+        tokio::task::spawn_blocking(move || -> Result<(), BlobError> {
+            let _permit = permit;
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Delete-of-not-present is success — the
+                    // GC contract is "ensure absent," not "ensure
+                    // was-present-then-absent."
+                    let _ = uri;
+                    Ok(())
+                }
+                Err(e) => Err(backend(e)),
+            }
+        })
+        .await
+        .map_err(|e| backend(format!("join error: {}", e)))?
+    }
+
+    async fn stat(&self, blob_ref: &BlobRef) -> Result<super::adapter::BlobStat, BlobError> {
+        let (hash, uri) = expect_small(blob_ref)?;
+        let path = self.path_for(&hash);
+        let uri = sanitize_uri_for_error(uri);
+        let permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| backend("adapter concurrency semaphore closed"))?;
+        let advertised_size = blob_ref.size();
+        let advertised_encoding = blob_ref.encoding();
+        tokio::task::spawn_blocking(move || -> Result<super::adapter::BlobStat, BlobError> {
+            let _permit = permit;
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BlobError::NotFound(uri))
+                }
+                Err(e) => return Err(backend(e)),
+            };
+            // FS adapter doesn't participate in the substrate's
+            // `causal:` advertisement layer — replicas_observed /
+            // replica_target are zero / None. `last_seen` comes
+            // from filesystem mtime when available.
+            let last_seen_unix_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64);
+            Ok(super::adapter::BlobStat {
+                size: advertised_size.max(meta.len()),
+                replicas_observed: 0,
+                replica_target: None,
+                last_seen_unix_ms,
+                encoding: advertised_encoding,
+            })
+        })
+        .await
+        .map_err(|e| backend(format!("join error: {}", e)))?
+    }
 }
 
 #[cfg(test)]

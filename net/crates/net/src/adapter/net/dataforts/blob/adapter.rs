@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::Stream;
 
-use super::blob_ref::BlobRef;
+use super::blob_ref::{BlobRef, Encoding};
 use super::error::BlobError;
 
 /// Stream of byte chunks the substrate consumes from `fetch_stream`.
@@ -17,6 +17,38 @@ use super::error::BlobError;
 /// stops on the first error and discards any prior chunks (no
 /// partial-blob verification).
 pub type BlobByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, BlobError>> + Send>>;
+
+/// Operational snapshot returned by [`BlobAdapter::stat`]. Lives at
+/// the trait surface (every adapter must answer) but most fields
+/// are optional — adapters that can't cheaply observe (S3 / IPFS)
+/// fill in only what they know.
+#[derive(Clone, Debug, Default)]
+pub struct BlobStat {
+    /// Total payload size in bytes. Always known when [`BlobAdapter::stat`]
+    /// returns `Ok` — adapters that can't determine the size return
+    /// [`BlobError::NotFound`] instead.
+    pub size: u64,
+    /// Number of distinct nodes currently advertising this blob via
+    /// `causal:<hex>` capability tags. `0` for adapters that don't
+    /// participate in the substrate-side advertisement layer (FS,
+    /// S3 adapters); `Some(n)` for `MeshBlobAdapter`. Best-effort —
+    /// the count reflects the local node's view of the capability
+    /// index at the time of the call.
+    pub replicas_observed: u32,
+    /// Operator-configured replication factor for this adapter, if
+    /// any. `None` for adapters whose durability isn't governed by
+    /// the substrate (S3, IPFS — they rely on the backend's own
+    /// replication semantics); `Some(n)` for `MeshBlobAdapter`.
+    pub replica_target: Option<u8>,
+    /// Last wall-clock time (unix milliseconds) the blob was
+    /// touched (heartbeat advertisement, fetch, store). `None`
+    /// when the adapter doesn't track per-blob last-seen.
+    pub last_seen_unix_ms: Option<u64>,
+    /// Encoding of the stored content. `Some(Replicated)` for the
+    /// v0.2 path; `Some(ReedSolomon { k, m })` reserved for v0.3.
+    /// `None` for adapters that don't model encoding (FS, Noop).
+    pub encoding: Option<Encoding>,
+}
 
 /// Storage backend wrapped by the substrate's blob layer. Each
 /// adapter takes a [`BlobRef`]'s URI and serves the bytes it
@@ -135,5 +167,45 @@ pub trait BlobAdapter: Send + Sync + 'static {
             buf.extend_from_slice(&chunk?);
         }
         self.store(blob_ref, &buf).await
+    }
+
+    /// Best-effort delete. The substrate calls this on the GC
+    /// sweep path (v0.2 [`MeshBlobAdapter`](super::MeshBlobAdapter)); external-storage
+    /// adapters (S3 / IPFS) typically defer durability decisions
+    /// to the backend's own lifecycle policies and may treat this
+    /// as a no-op.
+    ///
+    /// Default impl: returns `Ok(())` without touching the backend
+    /// (no-op delete). Override for adapters that own the blob
+    /// lifecycle.
+    ///
+    /// Manifest-variant semantics — `delete` is **surface-only**:
+    /// a [`BlobRef::Manifest`] delete removes the manifest entry
+    /// (if any) but does NOT recursively remove its chunks. Chunks
+    /// are independently reference-counted at the substrate layer
+    /// and delete on their own GC cycle. See
+    /// `DATAFORTS_BLOB_STORAGE_PLAN.md` § Q4 for the rationale.
+    async fn delete(&self, _blob_ref: &BlobRef) -> Result<(), BlobError> {
+        Ok(())
+    }
+
+    /// Return an operational snapshot of the blob. Used by the
+    /// `net blob stat` CLI + the metrics exporters; surfaces size,
+    /// replica counts (where the adapter knows), encoding, etc.
+    ///
+    /// Default impl returns the `size` carried on the
+    /// [`BlobRef`] with every other field at default — adapters
+    /// that participate in the substrate's advertisement layer
+    /// (e.g. [`MeshBlobAdapter`](super::MeshBlobAdapter)) should override to fill in
+    /// `replicas_observed`, `replica_target`, `encoding`, and
+    /// `last_seen_unix_ms`. The size field comes from the
+    /// [`BlobRef`] itself, so adapters that don't track per-blob
+    /// metadata still answer this method correctly.
+    async fn stat(&self, blob_ref: &BlobRef) -> Result<BlobStat, BlobError> {
+        Ok(BlobStat {
+            size: blob_ref.size(),
+            encoding: blob_ref.encoding(),
+            ..Default::default()
+        })
     }
 }
