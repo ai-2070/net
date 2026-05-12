@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/dataforts/blob/conformance.rs
+  s_3a0a24a47d1a36::t_1e455104a093c1 124
+net/crates/net/src/adapter/net/dataforts/blob/blob_ref.rs
+  s_3a0a24a47d1a36::t_1e455104a093c1 260-263,445,544,721,897-898,901-904,927-933,1260-1261
+net/crates/net/src/ffi/blob.rs
+  s_3a0a24a47d1a36::t_1e455104a093c1 486-487,489-490
+net/crates/net/src/adapter/net/dataforts/blob/admission.rs
+  s_3a0a24a47d1a36::t_1e455104a093c1 284,353,394-399,415,426,500-505
+net/crates/net/src/adapter/net/dataforts/blob/metrics.rs
+  s_3a0a24a47d1a36::t_1e455104a093c1 111,349,365,385,391
+net/crates/net/bindings/node/src/blob.rs
+  s_3a0a24a47d1a36::t_1e455104a093c1 101
+net/crates/net/src/adapter/net/dataforts/blob/refcount.rs
+  s_3a0a24a47d1a36::t_1e455104a093c1 210-213
+net/crates/net/src/adapter/net/dataforts/blob/publish_with_blob.rs
+  s_3a0a24a47d1a36::t_1e455104a093c1 211,280
+net/crates/net/bindings/python/src/blob.rs
+  s_3a0a24a47d1a36::t_1e455104a093c1 124
+net/crates/net/src/adapter/net/dataforts/blob/mod.rs
+  s_3a0a24a47d1a36::t_1e455104a093c1 46-50,52-53
+net/crates/net/src/adapter/net/behavior/placement.rs
+  s_3a0a24a47d1a36::t_1e455104a093c1 3152-3156,3186-3191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "5eac931bb81413c325291f6b51daac4656643023",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
