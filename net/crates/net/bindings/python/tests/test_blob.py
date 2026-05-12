@@ -299,16 +299,35 @@ def test_mesh_blob_adapter_overflow_false_explicit_is_a_no_op() -> None:
     assert adapter.overflow_enabled is False
 
 
+def test_mesh_blob_adapter_overflow_dict_requires_explicit_enabled() -> None:
+    # `enabled` is mandatory in the dict form — the binding
+    # never auto-flips the master switch on a non-empty dict.
+    # Diverged from the Rust + Node bindings before; pin the
+    # explicit-or-error contract.
+    redex = Redex()
+    with pytest.raises(TypeError) as excinfo:
+        MeshBlobAdapter(
+            redex,
+            "py-implicit",
+            overflow={"high_water_ratio": 0.92, "max_pushes_per_tick": 4},
+        )
+    assert "enabled" in str(excinfo.value)
+
+
 def test_mesh_blob_adapter_overflow_dict_overrides_thresholds() -> None:
-    # A dict with threshold keys turns overflow on AND tunes
-    # the thresholds. Missing keys inherit defaults; the
-    # operator gets to override just the knobs they care
-    # about.
+    # A dict with `enabled=True` plus threshold keys turns
+    # overflow on AND tunes the thresholds. Missing keys
+    # inherit defaults; the operator gets to override just the
+    # knobs they care about.
     redex = Redex()
     adapter = MeshBlobAdapter(
         redex,
         "py-tuned",
-        overflow={"high_water_ratio": 0.92, "max_pushes_per_tick": 4},
+        overflow={
+            "enabled": True,
+            "high_water_ratio": 0.92,
+            "max_pushes_per_tick": 4,
+        },
     )
     assert adapter.overflow_enabled is True
     cfg = adapter.overflow_config
@@ -338,10 +357,14 @@ def test_mesh_blob_adapter_overflow_dict_with_enabled_false_does_not_flip_switch
 def test_mesh_blob_adapter_overflow_dict_scope_parsing() -> None:
     # All four scope tokens must round-trip cleanly. The
     # parser is case-insensitive on input + lowercase on
-    # output.
+    # output. `enabled` must be explicit.
     redex = Redex()
     for scope in ("node", "zone", "region", "mesh"):
-        adapter = MeshBlobAdapter(redex, f"py-{scope}", overflow={"scope": scope})
+        adapter = MeshBlobAdapter(
+            redex,
+            f"py-{scope}",
+            overflow={"enabled": True, "scope": scope},
+        )
         assert adapter.overflow_config["scope"] == scope
 
 
@@ -362,7 +385,11 @@ def test_mesh_blob_adapter_overflow_dict_unknown_key_raises() -> None:
 def test_mesh_blob_adapter_overflow_dict_bad_scope_raises_valueerror() -> None:
     redex = Redex()
     with pytest.raises(ValueError) as excinfo:
-        MeshBlobAdapter(redex, "py-badscope", overflow={"scope": "datacenter"})
+        MeshBlobAdapter(
+            redex,
+            "py-badscope",
+            overflow={"enabled": True, "scope": "datacenter"},
+        )
     assert "datacenter" in str(excinfo.value)
 
 

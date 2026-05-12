@@ -449,43 +449,81 @@ net-blob --format json overflow status
 
 Prints the configured boolean, the runtime `overflow_active` flag (set by the most recent tick on this process), the configured thresholds, and the cumulative counter family. JSON form is shape-stable: top-level keys `adapter` / `config` / `active` / `counters`, with every per-reason counter present even at zero (operator dashboards don't want missing keys).
 
-### Cross-binding — Python
+### Cross-binding surface
 
-`MeshBlobAdapter` gains an `overflow` kwarg + getter / setter surface:
+`MeshBlobAdapter` + the overflow surface ship across all four bindings (Rust, Python, Node/TypeScript, Go, C). Every binding takes a `MeshBlobAdapter` (or `MeshBlobAdapterHandle*` for C) at construction, exposes the v0.2 CRUD path (`store` / `fetch` / `exists` / `prometheus_text`), and surfaces the v0.3 overflow control as a paired getter/setter on `enabled` + `active` + `config`. Every binding uses the same `OverflowConfig` shape — `enabled` / `high_water_ratio` / `low_water_ratio` / `max_pushes_per_tick` / `scope` / `tick_interval_ms` — and accepts a `bool` form (the simple master-switch case) where the host language allows.
+
+**Rust** — `MeshBlobAdapter::with_overflow(OverflowConfig { .. })` builder, `set_overflow_enabled(bool)` / `set_overflow_config(OverflowConfig)` runtime setters, `overflow_enabled()` / `overflow_active()` / `overflow_config()` getters.
+
+**Python** — `MeshBlobAdapter(redex, "id", overflow=...)` kwarg accepting `bool` or `dict`; `set_overflow_enabled` / `set_overflow_config` methods; `overflow_enabled` / `overflow_active` / `overflow_config` properties. Dict path enforces typed errors: unknown keys raise `TypeError` (typo defense — `high_water_ration` doesn't silently fail); invalid scope strings raise `ValueError`.
 
 ```python
 from net import MeshBlobAdapter, Redex
 
 redex = Redex(persistent_dir="/data/blobs")
-
-# Simple boolean — turn on with defaults.
-adapter = MeshBlobAdapter(redex, "py-prod", overflow=True)
-
-# Typed dict — turn on + tune thresholds. Missing keys inherit defaults.
 adapter = MeshBlobAdapter(
     redex,
     "py-prod",
     overflow={"high_water_ratio": 0.90, "max_pushes_per_tick": 4, "scope": "zone"},
 )
-
-# Pre-stage config without flipping the switch (e.g. for testing).
-adapter = MeshBlobAdapter(
-    redex,
-    "py-stage",
-    overflow={"enabled": False, "high_water_ratio": 0.95},
-)
-
-# Runtime control.
 adapter.set_overflow_enabled(True)
-adapter.set_overflow_config({"enabled": True, "high_water_ratio": 0.88, ...})
-
-# Read-only inspection.
-adapter.overflow_enabled   # bool — master switch state
-adapter.overflow_active    # bool — runtime hysteresis state
-adapter.overflow_config    # dict — full typed snapshot
+print(adapter.overflow_active, adapter.overflow_config)
 ```
 
-The dict path enforces typed-error contracts: unknown keys raise `TypeError` (typo defense — `high_water_ration` doesn't silently fail); invalid scope strings raise `ValueError`. Node + Go bindings follow per-binding cadence (consistent with the v0.2 deferred-binding posture).
+**Node / TypeScript** — `new MeshBlobAdapter(redex, "id", { persistent?, overflow? })`; `overflow` accepts a typed `OverflowConfigJs` object. `setOverflowEnabled` / `setOverflowConfig` runtime methods; `overflowEnabled` / `overflowActive` / `overflowConfig` getters.
+
+```ts
+import { MeshBlobAdapter, Redex } from '@ai2070/net';
+
+const redex = new Redex({ persistentDir: '/data/blobs' });
+const adapter = new MeshBlobAdapter(redex, 'node-prod', {
+  persistent: true,
+  overflow: {
+    enabled: true,
+    highWaterRatio: 0.80,
+    lowWaterRatio: 0.65,
+    maxPushesPerTick: 8,
+    scope: 'zone',
+    tickIntervalMs: 30_000,
+  },
+});
+adapter.setOverflowEnabled(false);
+console.log(adapter.overflowEnabled, adapter.overflowActive, adapter.overflowConfig);
+```
+
+**Go** — `NewMeshBlobAdapter(redex, "id", *MeshBlobAdapterOpts)` constructor; `Opts.Overflow *OverflowConfig` is the typed config. `SetOverflowEnabled(bool)` / `SetOverflowConfig(*OverflowConfig)` methods; `OverflowEnabled()` / `OverflowActive()` / `OverflowConfig()` getters return `(value, error)` per Go convention. Typed sentinels: `ErrBlob` / `ErrBlobClosed` / `ErrBlobInvalidConfig`.
+
+```go
+adapter, _ := net.NewMeshBlobAdapter(redex, "go-prod", &net.MeshBlobAdapterOpts{
+    Persistent: true,
+    Overflow: &net.OverflowConfig{
+        Enabled:          true,
+        HighWaterRatio:   0.80,
+        MaxPushesPerTick: 8,
+        Scope:            "zone",
+    },
+})
+defer adapter.Close()
+adapter.SetOverflowEnabled(true)
+```
+
+**C FFI** — opaque `MeshBlobAdapterHandle*` from `net_mesh_blob_adapter_new(redex, "id", persistent, overflow_json)`; the overflow config arrives as a JSON string at the boundary so the C consumer doesn't have to mirror the typed struct. Eleven new functions: `_new` / `_free` / `_store` / `_fetch` / `_exists` / `_prometheus_text` plus the v0.3 control family (`_overflow_enabled` / `_overflow_active` / `_overflow_config` returning JSON / `_set_overflow_enabled` / `_set_overflow_config`).
+
+```c
+MeshBlobAdapterHandle* adapter = net_mesh_blob_adapter_new(
+    redex,
+    "c-prod",
+    /* persistent */ 1,
+    "{\"enabled\":true,\"high_water_ratio\":0.80,\"scope\":\"zone\"}"
+);
+net_mesh_blob_adapter_set_overflow_enabled(adapter, 0);
+char* cfg_json = net_mesh_blob_adapter_overflow_config(adapter);
+// ...consume cfg_json...
+net_free_string(cfg_json);
+net_mesh_blob_adapter_free(adapter);
+```
+
+The C surface requires building the cdylib with `dataforts,netdb,redex-disk`; the Go binding wraps these via cgo and the SDK READMEs document the per-binding shape ([Rust](../sdk/README.md#phase-35--active-blob-overflow-v03) / [Python](../sdk-py/README.md#dataforts-greedy-cache-gravity-blob-refs-read-your-writes) / [TypeScript](../sdk-ts/README.md#dataforts-greedy-cache-gravity-blob-refs-read-your-writes) / [Go](../../../../../go/README.md#dataforts-blob-storage) / [C](../../include/README.md#dataforts-blob-storage-meshblobadapter--v03-overflow)).
 
 ### Storage layout + safe-delete
 

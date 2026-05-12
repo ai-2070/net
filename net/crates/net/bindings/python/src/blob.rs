@@ -873,16 +873,21 @@ fn parse_overflow_spec(py: Python<'_>, spec: Bound<'_, PyAny>) -> PyResult<Inner
             unknown, allowed
         )));
     }
-    // Dict was non-empty + every key valid → default `enabled`
-    // to True so `{"high_water_ratio": 0.9}` does the
-    // expected thing (turn on with overrides). Operators
-    // wanting `{enabled: false, ...}` to pre-stage config
-    // without flipping the switch pass that key explicitly.
-    if !dict.is_empty() {
-        cfg.enabled = true;
-    }
+    // `enabled` is required to be explicit when the dict shape is
+    // used. The plan documents the contract as "kwarg = bool OR
+    // dict-with-explicit-enabled" — silently auto-flipping the
+    // master switch on any non-empty dict diverged from the Rust
+    // and Node bindings, and made it easy to ship a dict that
+    // looks like config-only but actually flips production on.
+    // The bool short-circuit above still covers the simple case
+    // (`overflow=True`).
     if let Some(v) = dict.get_item("enabled")? {
         cfg.enabled = v.extract::<bool>()?;
+    } else {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "overflow: dict form requires explicit 'enabled' key (True or False); \
+             pass overflow=True for the simple master-switch case",
+        ));
     }
     if let Some(v) = dict.get_item("high_water_ratio")? {
         cfg.high_water_ratio = v.extract::<f64>()?;
