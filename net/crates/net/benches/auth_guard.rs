@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use net::adapter::net::{AuthGuard, AuthVerdict, ChannelName};
+use net::adapter::net::{AuthGuard, AuthVerdict, ChannelHash, ChannelName};
 
 // ============================================================================
 // Single-thread microbenchmarks
@@ -71,7 +71,7 @@ fn bench_check_fast_cold_miss(c: &mut Criterion) {
         b.iter(|| {
             // Origin range that never appeared in `populated_guard`.
             let origin = 0xcafe_0000_u64 + i;
-            let channel_hash = (i & 0xffff) as u16;
+            let channel_hash = (i & 0xffff_ffff) as ChannelHash;
             let v = guard.check_fast(black_box(origin), black_box(channel_hash));
             i = i.wrapping_add(1);
             v
@@ -103,7 +103,7 @@ fn bench_check_fast_concurrent(c: &mut Criterion) {
             let mut i = t as u64;
             while s.load(Ordering::Relaxed) == 0 {
                 let origin = 0xdead_0000_u64 + (i & 0xff);
-                let channel_hash = (i % 10_000) as u16;
+                let channel_hash = (i % 10_000) as ChannelHash;
                 black_box(g.check_fast(origin, channel_hash));
                 i = i.wrapping_add(7);
             }
@@ -120,7 +120,7 @@ fn bench_check_fast_concurrent(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             let origin = 0xdead_0000_u64 + (i & 0xff);
-            let channel_hash = (i % 10_000) as u16;
+            let channel_hash = (i % 10_000) as ChannelHash;
             let v = guard.check_fast(black_box(origin), black_box(channel_hash));
             i = i.wrapping_add(1);
             v
