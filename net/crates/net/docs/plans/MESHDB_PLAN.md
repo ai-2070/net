@@ -544,7 +544,7 @@ Window {
 Contract:
 
 - Composes with `Aggregate` cleanly — the canonical pattern is `Aggregate(Window(Filter(Between(...))), …)`.
-- Required for Hermes telemetry + Deck metrics workloads (the activation triggers for streaming analytics).
+- Required for telemetry + Deck metrics workloads (the activation triggers for streaming analytics).
 - Ships AFTER basic folds, joins, and aggregation are stable in Phases A–D. Building windowing on an unstable aggregate substrate inverts the dependency.
 
 Rationale: Time-windowed aggregates ("count events per minute") are an extremely common workload — but they're a natural extension of the aggregate operator, not a foundational primitive. Phase E with `Window` slotted in keeps the dependency order honest and lets Phases A–D land their tests against a smaller surface.
