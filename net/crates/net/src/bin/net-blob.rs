@@ -271,7 +271,31 @@ async fn cmd_get(
     let bytes = adapter.fetch(&blob).await?;
     match out_path {
         Some(p) => {
-            fs::write(p, &bytes)?;
+            // Refuse to clobber an existing file or follow a
+            // symlink. The CLI may run with elevated privileges
+            // and a naive `fs::write` would happily overwrite
+            // /etc/passwd or follow a symlink an attacker
+            // pre-planted at the operator-supplied path.
+            // `create_new(true)` errors if the path already
+            // exists for any reason — that includes existing
+            // symlinks (the symlink path "exists" even if its
+            // target doesn't). Operators who legitimately want to
+            // overwrite must `rm` the file first; the noisy
+            // failure mode is the correct default for an operator
+            // CLI.
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(p)
+                .map_err(|e| {
+                    format!(
+                        "net-blob: refused to write to {}: {} (existing path or symlink; \
+                         remove it first if overwrite is intended)",
+                        p.display(),
+                        e
+                    )
+                })?;
+            f.write_all(&bytes)?;
             eprintln!("net-blob: wrote {} bytes to {}", bytes.len(), p.display());
         }
         None => {

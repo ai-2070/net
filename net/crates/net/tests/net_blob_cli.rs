@@ -162,6 +162,35 @@ fn put_human_format_prints_uri_hash_size() {
     );
 }
 
+/// `get --out` must refuse to clobber an existing file. The CLI
+/// is operator-facing and may run with elevated privileges; a
+/// naive `fs::write` would happily overwrite arbitrary paths the
+/// caller specifies. Pinning the create-new semantics so a future
+/// refactor doesn't silently lose this defense.
+#[test]
+fn get_out_refuses_to_clobber_existing_file() {
+    let tmp = TempDir::new("get-out-clobber");
+    let dir = tmp.path();
+    let input = dir.join("p.bin");
+    fs::write(&input, b"x").unwrap();
+    let put = run_net_blob(dir, &["--format", "json", "put", input.to_str().unwrap()]);
+    let hash = parse_put_hash(&put);
+
+    // Pre-create the output file. `get` must refuse to overwrite.
+    let output = dir.join("preexisting.bin");
+    fs::write(&output, b"do not clobber").unwrap();
+    let get = run_net_blob(dir, &["get", &hash, "--out", output.to_str().unwrap()]);
+    assert!(
+        !get.status.success(),
+        "get --out must error when the output path already exists"
+    );
+    let preserved = fs::read(&output).unwrap();
+    assert_eq!(
+        preserved, b"do not clobber",
+        "preexisting file contents must be untouched"
+    );
+}
+
 // ============================================================================
 // exists exit codes
 // ============================================================================
