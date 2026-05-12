@@ -121,11 +121,7 @@ impl PyBlobRef {
     }
 
     fn __repr__(&self) -> String {
-        let hash = self
-            .inner
-            .small_hash()
-            .copied()
-            .unwrap_or([0; 32]);
+        let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
         format!(
             "BlobRef(uri={:?}, size={}, hash={})",
             self.inner.uri(),

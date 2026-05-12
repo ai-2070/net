@@ -257,7 +257,10 @@ impl BlobRef {
     /// callers used `BlobRef::new(uri, hash, size)` which produced
     /// the single-blob shape; the new enum surface uses
     /// [`Self::small`] for the same shape.
-    #[deprecated(since = "0.15.0", note = "use `BlobRef::small` for explicit-variant construction")]
+    #[deprecated(
+        since = "0.15.0",
+        note = "use `BlobRef::small` for explicit-variant construction"
+    )]
     pub fn new(uri: impl Into<String>, hash: [u8; 32], size: u64) -> Self {
         Self::small(uri, hash, size)
     }
@@ -439,9 +442,7 @@ impl BlobRef {
         let version = bytes[4];
         match version {
             BLOB_REF_VERSION_V1 => Self::decode_small(version, &bytes[5..]).map(Some),
-            BLOB_REF_VERSION_V2_MANIFEST => {
-                Self::decode_manifest(version, &bytes[5..]).map(Some)
-            }
+            BLOB_REF_VERSION_V2_MANIFEST => Self::decode_manifest(version, &bytes[5..]).map(Some),
             other => Err(BlobError::UnsupportedVersion(other)),
         }
     }
@@ -540,8 +541,7 @@ impl BlobRef {
                 }
             }
             Self::Manifest { .. } => Err(BlobError::Decode(
-                "verify is undefined on a Manifest variant; verify chunks individually"
-                    .to_owned(),
+                "verify is undefined on a Manifest variant; verify chunks individually".to_owned(),
             )),
         }
     }
@@ -718,9 +718,7 @@ pub fn byte_range_to_chunks(
 ) -> Result<Vec<ChunkRangeRequest>, BlobError> {
     let (chunks, total_size) = match manifest {
         BlobRef::Manifest {
-            chunks,
-            total_size,
-            ..
+            chunks, total_size, ..
         } => (chunks.as_slice(), *total_size),
         BlobRef::Small { .. } => {
             return Err(BlobError::Decode(
@@ -896,15 +894,14 @@ mod tests {
             hash: [0xAA; 32],
             size: 1024,
         }];
-        let blob = BlobRef::manifest(
-            "mesh://rs",
-            Encoding::ReedSolomon { k: 4, m: 2 },
-            chunks,
-        )
-        .unwrap();
+        let blob =
+            BlobRef::manifest("mesh://rs", Encoding::ReedSolomon { k: 4, m: 2 }, chunks).unwrap();
         let bytes = blob.encode();
         let decoded = BlobRef::decode(&bytes).unwrap().unwrap();
-        assert_eq!(decoded.encoding(), Some(Encoding::ReedSolomon { k: 4, m: 2 }));
+        assert_eq!(
+            decoded.encoding(),
+            Some(Encoding::ReedSolomon { k: 4, m: 2 })
+        );
     }
 
     #[test]
@@ -927,10 +924,13 @@ mod tests {
 
     #[test]
     fn manifest_rejects_total_size_over_cap() {
-        let chunks = vec![ChunkRef {
-            hash: [0; 32],
-            size: u32::MAX,
-        }; 5];
+        let chunks = vec![
+            ChunkRef {
+                hash: [0; 32],
+                size: u32::MAX,
+            };
+            5
+        ];
         // 5 × 4 GiB ≈ 20 GiB > 16 GiB cap
         let err = BlobRef::manifest("mesh://", Encoding::Replicated, chunks).unwrap_err();
         assert!(matches!(err, BlobError::Decode(_)));
@@ -1257,9 +1257,8 @@ mod tests {
             let mut assembled = Vec::with_capacity((end - start) as usize);
             for r in requests {
                 let chunk = chunk_bytes[r.chunk_index];
-                assembled.extend_from_slice(
-                    &chunk[r.start_in_chunk as usize..r.end_in_chunk as usize],
-                );
+                assembled
+                    .extend_from_slice(&chunk[r.start_in_chunk as usize..r.end_in_chunk as usize]);
             }
             assert_eq!(
                 assembled,

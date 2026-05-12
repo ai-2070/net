@@ -98,11 +98,7 @@ impl BlobRef {
     /// manifests via a separate accessor.
     #[napi(getter)]
     pub fn hash(&self) -> Buffer {
-        let hash = self
-            .inner
-            .small_hash()
-            .copied()
-            .unwrap_or([0; 32]);
+        let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
         Buffer::from(hash.to_vec())
     }
 

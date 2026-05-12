@@ -31,13 +31,6 @@ pub use admission::{
     auth_allows_blob_op, should_migrate_blob_to, should_pull_blob, MigrateBlobReject,
     MigrateBlobVerdict, PullBlobReject, PullBlobVerdict,
 };
-pub use mesh::MeshBlobAdapter;
-pub use metrics::{
-    evaluate_health_gate, BlobMetrics, BlobMetricsSnapshot, HealthGateAction,
-    HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
-};
-pub use publish_with_blob::{publish_with_blob, BlobDurability, PublishWithBlobReceipt};
-pub use refcount::{should_sweep, BlobRefcountTable, RefcountEntry, DEFAULT_RETENTION_FLOOR};
 pub use blob_ref::{
     byte_range_to_chunks, chunk_payload, BlobRef, ChunkRangeRequest, ChunkRef, ChunkedPayload,
     Encoding, BLOB_CHUNK_SIZE_BYTES, BLOB_MANIFEST_BODY_VERSION, BLOB_MANIFEST_MAX_CHUNKS,
@@ -50,5 +43,12 @@ pub use dispatch::{
 };
 pub use error::BlobError;
 pub use fs::FileSystemAdapter;
+pub use mesh::MeshBlobAdapter;
+pub use metrics::{
+    evaluate_health_gate, BlobMetrics, BlobMetricsSnapshot, HealthGateAction,
+    HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
+};
 pub use noop::NoopAdapter;
+pub use publish_with_blob::{publish_with_blob, BlobDurability, PublishWithBlobReceipt};
+pub use refcount::{should_sweep, BlobRefcountTable, RefcountEntry, DEFAULT_RETENTION_FLOOR};
 pub use registry::{global_blob_adapter_registry, BlobAdapterRegistry, BlobAdapterRegistryError};

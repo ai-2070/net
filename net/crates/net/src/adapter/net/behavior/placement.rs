@@ -3149,7 +3149,11 @@ mod tests {
             size_bytes: 1024,
         };
         let score = placement.placement_score(&0x1111, &blob);
-        assert!(score.is_some(), "expected placement to admit, got {:?}", score);
+        assert!(
+            score.is_some(),
+            "expected placement to admit, got {:?}",
+            score
+        );
         // Default multi-axis composition without other gates is 1.0
         // — baseline parity with chain/replica passing through.
         assert_eq!(score, Some(1.0));
@@ -3179,10 +3183,12 @@ mod tests {
             .add_tag("dataforts.blob.storage")
             .add_tag("dataforts.blob.disk_total_gb=100")
             .add_tag("dataforts.blob.disk_free_gb=100");
-        unhealthy_caps.tags.insert(crate::adapter::net::behavior::Tag::Reserved {
-            prefix: "dataforts:".to_owned(),
-            body: "blob-storage-unhealthy".to_owned(),
-        });
+        unhealthy_caps
+            .tags
+            .insert(crate::adapter::net::behavior::Tag::Reserved {
+                prefix: "dataforts:".to_owned(),
+                body: "blob-storage-unhealthy".to_owned(),
+            });
         let index = index_with(&[(0x1111, unhealthy_caps)]);
         let placement = StandardPlacement::new(&index);
         let blob = Artifact::Blob {

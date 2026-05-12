@@ -483,13 +483,11 @@ fn expect_small_for_ffi(
         crate::adapter::net::dataforts::BlobRef::Small {
             uri, hash, size, ..
         } => Ok((uri.clone(), *hash, *size)),
-        crate::adapter::net::dataforts::BlobRef::Manifest { .. } => {
-            Err(InnerBlobError::Backend(
-                "CallbackBlobAdapter operates on Small blobs only; \
+        crate::adapter::net::dataforts::BlobRef::Manifest { .. } => Err(InnerBlobError::Backend(
+            "CallbackBlobAdapter operates on Small blobs only; \
                  chunked blobs are dispatched at the substrate above"
-                    .to_owned(),
-            ))
-        }
+                .to_owned(),
+        )),
     }
 }
 

@@ -938,10 +938,7 @@ impl CapabilitySet {
     /// `BlobCapability::from_capability_set`. Round-tripping
     /// through both functions returns the original projection.
     #[cfg(feature = "dataforts")]
-    pub fn with_blob_capability(
-        self,
-        blob: super::dataforts_capabilities::BlobCapability,
-    ) -> Self {
+    pub fn with_blob_capability(self, blob: super::dataforts_capabilities::BlobCapability) -> Self {
         blob.write_into(self)
     }
 

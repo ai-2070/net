@@ -281,10 +281,7 @@ fn scope_at_least_as_narrow(local: TopologyScope, publisher: TopologyScope) -> b
     use TopologyScope::*;
     matches!(
         (local, publisher),
-        (Node, _)
-            | (Zone, Zone | Region | Mesh)
-            | (Region, Region | Mesh)
-            | (Mesh, Mesh)
+        (Node, _) | (Zone, Zone | Region | Mesh) | (Region, Region | Mesh) | (Mesh, Mesh)
     )
 }
 
@@ -353,10 +350,7 @@ mod tests {
     fn pull_admits_participating_local_with_mesh_publisher() {
         let local = participating_local_node(TopologyScope::Mesh, 128);
         let publisher = publisher_with_mesh_scope();
-        assert_eq!(
-            should_pull_blob(&local, &publisher),
-            PullBlobVerdict::Admit
-        );
+        assert_eq!(should_pull_blob(&local, &publisher), PullBlobVerdict::Admit);
     }
 
     #[test]
@@ -397,10 +391,12 @@ mod tests {
     #[test]
     fn pull_rejects_unhealthy_local() {
         let mut local = participating_local_node(TopologyScope::Mesh, 128);
-        local.tags.insert(crate::adapter::net::behavior::Tag::Reserved {
-            prefix: "dataforts:".to_owned(),
-            body: "blob-storage-unhealthy".to_owned(),
-        });
+        local
+            .tags
+            .insert(crate::adapter::net::behavior::Tag::Reserved {
+                prefix: "dataforts:".to_owned(),
+                body: "blob-storage-unhealthy".to_owned(),
+            });
         let publisher = publisher_with_mesh_scope();
         assert_eq!(
             should_pull_blob(&local, &publisher),
@@ -416,10 +412,7 @@ mod tests {
         // → admit.
         let local = participating_local_node(TopologyScope::Zone, 128);
         let publisher = publisher_with_scope(TopologyScope::Mesh);
-        assert_eq!(
-            should_pull_blob(&local, &publisher),
-            PullBlobVerdict::Admit
-        );
+        assert_eq!(should_pull_blob(&local, &publisher), PullBlobVerdict::Admit);
     }
 
     #[test]
@@ -430,10 +423,7 @@ mod tests {
         // Pin this conservative-default behavior.
         let local = participating_local_node(TopologyScope::Zone, 128);
         let publisher = CapabilitySet::new();
-        assert_eq!(
-            should_pull_blob(&local, &publisher),
-            PullBlobVerdict::Admit
-        );
+        assert_eq!(should_pull_blob(&local, &publisher), PullBlobVerdict::Admit);
     }
 
     // --- should_migrate_blob_to ---
@@ -507,10 +497,12 @@ mod tests {
     #[test]
     fn migrate_rejects_unhealthy_target() {
         let mut target = participating_gravity_node(TopologyScope::Mesh, 128, 100);
-        target.tags.insert(crate::adapter::net::behavior::Tag::Reserved {
-            prefix: "dataforts:".to_owned(),
-            body: "blob-storage-unhealthy".to_owned(),
-        });
+        target
+            .tags
+            .insert(crate::adapter::net::behavior::Tag::Reserved {
+                prefix: "dataforts:".to_owned(),
+                body: "blob-storage-unhealthy".to_owned(),
+            });
         let publisher = publisher_with_mesh_scope();
         assert_eq!(
             should_migrate_blob_to(&target, &publisher, 1024),

@@ -207,7 +207,10 @@ impl BlobRefcountTable {
     /// the sweep would reclaim if every other condition were
     /// satisfied.
     pub fn zero_refcount_count(&self) -> usize {
-        self.inner.iter().filter(|e| e.value().refcount == 0).count()
+        self.inner
+            .iter()
+            .filter(|e| e.value().refcount == 0)
+            .count()
     }
 
     /// Walk the table and return the set of hashes deletable

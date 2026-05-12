@@ -208,8 +208,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir()
-            .join(format!("net-pwb-test-{}-{}", std::process::id(), n));
+        let root = std::env::temp_dir().join(format!("net-pwb-test-{}-{}", std::process::id(), n));
         let redex = Arc::new(Redex::new().with_persistent_dir(&root));
         let adapter = MeshBlobAdapter::new("mesh-pub-persistent", redex).with_persistent(true);
         (adapter, root)
@@ -278,9 +277,7 @@ mod tests {
             .collect();
         let chunked = chunk_payload(&payload).unwrap();
         let chunk_refs: Vec<ChunkRef> = match chunked {
-            ChunkedPayload::Chunked { chunks, .. } => {
-                chunks.into_iter().map(|(r, _)| r).collect()
-            }
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
             _ => panic!("expected Chunked"),
         };
         let blob_ref = BlobRef::manifest("mesh://multi", Encoding::Replicated, chunk_refs).unwrap();

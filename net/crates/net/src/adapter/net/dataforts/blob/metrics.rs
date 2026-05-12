@@ -108,9 +108,7 @@ impl BlobMetrics {
     /// Set `dataforts_blob_disk_used_bytes` to `bytes`. Caller
     /// invokes on the heartbeat cadence (default 5 s).
     pub fn set_disk_used_bytes(&self, bytes: u64) {
-        self.inner
-            .disk_used_bytes
-            .store(bytes, Ordering::Relaxed);
+        self.inner.disk_used_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Set `dataforts_blob_disk_capacity_bytes` to `bytes`. Caller
@@ -348,10 +346,7 @@ mod tests {
     fn health_gate_emit_when_over_95_percent_and_currently_healthy() {
         // 96 / 100 = 96 % >= 95 % emit threshold; not currently
         // unhealthy → Emit.
-        assert_eq!(
-            evaluate_health_gate(96, 100, false),
-            HealthGateAction::Emit
-        );
+        assert_eq!(evaluate_health_gate(96, 100, false), HealthGateAction::Emit);
     }
 
     #[test]
@@ -367,10 +362,7 @@ mod tests {
     fn health_gate_clear_when_under_85_percent_and_currently_unhealthy() {
         // 50 / 100 = 50 % <= 85 % clear threshold; unhealthy →
         // Clear.
-        assert_eq!(
-            evaluate_health_gate(50, 100, true),
-            HealthGateAction::Clear
-        );
+        assert_eq!(evaluate_health_gate(50, 100, true), HealthGateAction::Clear);
     }
 
     #[test]
@@ -390,18 +382,12 @@ mod tests {
     #[test]
     fn health_gate_emit_threshold_inclusive() {
         // Exactly 95 % → emit (`>=`).
-        assert_eq!(
-            evaluate_health_gate(95, 100, false),
-            HealthGateAction::Emit
-        );
+        assert_eq!(evaluate_health_gate(95, 100, false), HealthGateAction::Emit);
     }
 
     #[test]
     fn health_gate_clear_threshold_inclusive() {
         // Exactly 85 % → clear (`<=`).
-        assert_eq!(
-            evaluate_health_gate(85, 100, true),
-            HealthGateAction::Clear
-        );
+        assert_eq!(evaluate_health_gate(85, 100, true), HealthGateAction::Clear);
     }
 }

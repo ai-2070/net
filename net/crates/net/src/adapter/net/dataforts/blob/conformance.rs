@@ -121,9 +121,7 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
     // of `tampered`. Every adapter must verify and refuse.
     let tampered: Vec<u8> = format!("tampered-{}", run_nonce).into_bytes();
     let tampered_hash: [u8; 32] = blake3::hash(&tampered).into();
-    if !tampered.is_empty()
-        && Some(&tampered_hash) != blob.small_hash()
-    {
+    if !tampered.is_empty() && Some(&tampered_hash) != blob.small_hash() {
         match adapter.store(&blob, &tampered).await {
             Err(BlobError::HashMismatch { .. }) => {}
             Ok(()) => {
