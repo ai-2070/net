@@ -1,0 +1,26 @@
+.claude/skills/net-event-bus/dataforts.md
+  s_3a0a24a47d1a36::t_d58d2cb8330066 1-306
+.claude/skills/net-event-bus/SKILL.md
+  s_3a0a24a47d1a36::t_af6808ef5bb11c 26-28
+  s_3a0a24a47d1a36::t_0229681f3847e3 3
+.claude/skills/net-event-bus/redex.md
+  s_3a0a24a47d1a36::t_58be0e8e531754 1-266
+.claude/skills/net-event-bus/cortex.md
+  s_3a0a24a47d1a36::t_1cede0ce7c1535 1-269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "0988e348905614aa3f21b753d91ec2db6620a268",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
