@@ -56,6 +56,11 @@ pub const NET_ERR_BLOB_ADAPTER_NOT_REGISTERED: c_int = -119;
 /// across the FFI boundary (which is undefined behaviour for the
 /// C / cgo / Python callers).
 pub const NET_ERR_BLOB_PANIC: c_int = -117;
+/// Auth gate rejected the blob op: AuthGuard ACL miss, or no
+/// guard configured for an op that requires one. Distinct from
+/// `NET_ERR_BLOB_BACKEND` so bindings can route 401-style hits
+/// without parsing the error string.
+pub const NET_ERR_BLOB_UNAUTHORIZED: c_int = -120;
 
 fn runtime() -> &'static Arc<Runtime> {
     use std::sync::OnceLock;
@@ -100,6 +105,7 @@ fn err_to_code(e: &InnerBlobError) -> c_int {
         InnerBlobError::Decode(_) => NET_ERR_BLOB_DECODE,
         InnerBlobError::AdapterNotConfigured => NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED,
         InnerBlobError::AdapterNotRegistered(_) => NET_ERR_BLOB_ADAPTER_NOT_REGISTERED,
+        InnerBlobError::Unauthorized(_) => NET_ERR_BLOB_UNAUTHORIZED,
     }
 }
 

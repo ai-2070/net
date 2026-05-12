@@ -318,7 +318,7 @@ impl MeshBlobAdapter {
         now_unix_ms: u64,
     ) -> Result<(), BlobError> {
         let guard = self.auth_guard.as_ref().ok_or_else(|| {
-            BlobError::Backend("auth: pin_authorized requires AuthGuard wiring".to_string())
+            BlobError::Unauthorized("pin_authorized requires AuthGuard wiring".to_string())
         })?;
         auth_allows_blob_op(guard, origin_hash, channel)?;
         self.refcount.pin(hash, now_unix_ms);
@@ -338,7 +338,7 @@ impl MeshBlobAdapter {
         now_unix_ms: u64,
     ) -> Result<(), BlobError> {
         let guard = self.auth_guard.as_ref().ok_or_else(|| {
-            BlobError::Backend("auth: unpin_authorized requires AuthGuard wiring".to_string())
+            BlobError::Unauthorized("unpin_authorized requires AuthGuard wiring".to_string())
         })?;
         auth_allows_blob_op(guard, origin_hash, channel)?;
         self.refcount.unpin(hash, now_unix_ms);
@@ -362,9 +362,7 @@ impl MeshBlobAdapter {
         channel: &ChannelName,
     ) -> Result<(), BlobError> {
         let guard = self.auth_guard.as_ref().ok_or_else(|| {
-            BlobError::Backend(
-                "auth: delete_chunk_authorized requires AuthGuard wiring".to_string(),
-            )
+            BlobError::Unauthorized("delete_chunk_authorized requires AuthGuard wiring".to_string())
         })?;
         auth_allows_blob_op(guard, origin_hash, channel)?;
         self.delete_chunk(hash).await
@@ -1523,7 +1521,7 @@ mod tests {
         let err = adapter
             .pin_authorized(hash, intruder, &channel, 1_000)
             .unwrap_err();
-        assert!(matches!(err, BlobError::Backend(_)));
+        assert!(matches!(err, BlobError::Unauthorized(_)));
         assert!(!adapter
             .refcount_table()
             .get(&hash)
@@ -1540,7 +1538,7 @@ mod tests {
         let err = adapter
             .pin_authorized(hash, origin, &wrong, 1_000)
             .unwrap_err();
-        assert!(matches!(err, BlobError::Backend(_)));
+        assert!(matches!(err, BlobError::Unauthorized(_)));
         assert!(!adapter
             .refcount_table()
             .get(&hash)
@@ -1556,7 +1554,7 @@ mod tests {
         let err = adapter
             .pin_authorized(hash, 0xCAFE_BABE, &channel, 1_000)
             .unwrap_err();
-        assert!(matches!(err, BlobError::Backend(_)));
+        assert!(matches!(err, BlobError::Unauthorized(_)));
     }
 
     #[test]
@@ -1594,7 +1592,7 @@ mod tests {
         let err = adapter
             .unpin_authorized(hash, intruder, &channel, 2_000)
             .unwrap_err();
-        assert!(matches!(err, BlobError::Backend(_)));
+        assert!(matches!(err, BlobError::Unauthorized(_)));
         // Pin must still be in place — auth failure cannot remove it.
         assert!(adapter
             .refcount_table()
@@ -1611,7 +1609,7 @@ mod tests {
         let err = adapter
             .unpin_authorized(hash, 0xCAFE_BABE, &channel, 1_000)
             .unwrap_err();
-        assert!(matches!(err, BlobError::Backend(_)));
+        assert!(matches!(err, BlobError::Unauthorized(_)));
     }
 
     #[tokio::test]
@@ -1668,7 +1666,7 @@ mod tests {
             .delete_chunk_authorized(&hash, intruder, &channel)
             .await
             .unwrap_err();
-        assert!(matches!(err, BlobError::Backend(_)));
+        assert!(matches!(err, BlobError::Unauthorized(_)));
         // Chunk must still be readable — failed auth cannot delete.
         assert!(adapter.exists(&blob).await.unwrap());
     }
@@ -1682,7 +1680,7 @@ mod tests {
             .delete_chunk_authorized(&hash, 0xCAFE_BABE, &channel)
             .await
             .unwrap_err();
-        assert!(matches!(err, BlobError::Backend(_)));
+        assert!(matches!(err, BlobError::Unauthorized(_)));
     }
 
     // --- PR-5j-b: blob heat bumps on fetch ---

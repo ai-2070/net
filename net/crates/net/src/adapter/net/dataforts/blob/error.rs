@@ -57,6 +57,15 @@ pub enum BlobError {
     /// operators can tell apart "you forgot to set it" from
     /// "you didn't register the named adapter yet."
     AdapterNotRegistered(String),
+    /// Caller failed an authorization check on the blob op:
+    /// AuthGuard rejected the `(origin_hash, ChannelName)` ACL
+    /// lookup, or no guard was configured for an op that
+    /// requires one. Distinct from `Backend` so callers (and
+    /// metrics) can tell apart a 401-style security boundary hit
+    /// from a 500-style adapter failure. The string is the
+    /// authorization-side context; do not leak channel names or
+    /// principal identifiers if they're sensitive.
+    Unauthorized(String),
 }
 
 impl fmt::Display for BlobError {
@@ -80,6 +89,7 @@ impl fmt::Display for BlobError {
             Self::AdapterNotRegistered(id) => {
                 write!(f, "blob adapter \"{}\" not registered", id)
             }
+            Self::Unauthorized(msg) => write!(f, "blob op unauthorized: {}", msg),
         }
     }
 }

@@ -213,9 +213,10 @@ pub enum MigrateBlobReject {
 /// channel-name selection.
 ///
 /// Returns `Ok(())` when the operator is authorized; `Err` carries
-/// a typed [`BlobError::Backend`] with the diagnostic. The error
-/// shape matches the rest of the adapter surface so call sites
-/// don't need a separate auth-error type.
+/// a typed [`BlobError::Unauthorized`] with the origin_hash. The
+/// channel name is intentionally NOT included — names can carry
+/// tenant / project identifiers and we don't want them flowing
+/// to client bindings via error strings.
 pub fn auth_allows_blob_op(
     guard: &AuthGuard,
     origin_hash: u64,
@@ -224,10 +225,9 @@ pub fn auth_allows_blob_op(
     if guard.is_authorized_full(origin_hash, channel) {
         Ok(())
     } else {
-        Err(BlobError::Backend(format!(
-            "auth: {:#x} not authorized for channel {:?}",
-            origin_hash,
-            channel.as_str()
+        Err(BlobError::Unauthorized(format!(
+            "origin {:#x} not authorized",
+            origin_hash
         )))
     }
 }
@@ -527,7 +527,7 @@ mod tests {
         let channel = ChannelName::new("dataforts/test/auth").unwrap();
         // No allow_channel call → veto.
         let err = auth_allows_blob_op(&guard, 0xDEAD, &channel).unwrap_err();
-        assert!(matches!(err, BlobError::Backend(_)));
+        assert!(matches!(err, BlobError::Unauthorized(_)));
     }
 
     #[test]
@@ -540,7 +540,7 @@ mod tests {
         // Origin authorized for `allowed`, but op is against
         // `other` → veto.
         let err = auth_allows_blob_op(&guard, origin, &other).unwrap_err();
-        assert!(matches!(err, BlobError::Backend(_)));
+        assert!(matches!(err, BlobError::Unauthorized(_)));
     }
 
     // --- scope_at_least_as_narrow ---
