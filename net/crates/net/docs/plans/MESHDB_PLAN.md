@@ -4,9 +4,12 @@
 
 ## Status
 
-Design only. Activation gate: a workload that genuinely needs distributed queries beyond what local CortEX + the Warriors-shipped primitives satisfy. Realistic triggers: incident-investigation tooling that needs cross-site joins; replay debugging on retained chain history; aggregate analytics over a fleet of operators; lineage-aware audit + compliance reporting; AI-trained-on-mesh-data fine-tuning that needs to query across forked experiments.
+**Design-locked, prereqs-blocked.** All seven open design questions are ratified — see [Locked decisions](#locked-decisions). Activation gate (when implementation starts) requires two things still outstanding:
 
-This phase is the heaviest one in the deferred-work surface — multiple months of design work before implementation starts, and the design space is genuinely open. **Do not start without a concrete consumer.** Premature MeshDB is exactly the kind of substrate-engineering ego-spending that this plan is structured to avoid until activation.
+1. **A concrete consumer workload.** Realistic triggers: incident-investigation tooling that needs cross-site joins; replay debugging on retained chain history; aggregate analytics over a fleet of operators; lineage-aware audit + compliance reporting; AI-trained-on-mesh-data fine-tuning that needs to query across forked experiments. Hermes telemetry + Deck metrics are the near-term candidate consumers; until one of them generates production telemetry that needs federated queries, Phase A stays parked.
+2. **`CAPABILITY_SYSTEM_PLAN.md` shipped in code.** MeshDB's planner composes against `filter` / `match_axis` / `traverse` / `aggregate` / `nearest` and the `fork-of:` propagation. Spec is locked; implementation hasn't shipped. Without those primitives in code, MeshDB has nothing to plan against.
+
+This phase remains the heaviest one in the deferred-work surface. **Do not start without a concrete consumer.** Premature MeshDB is exactly the kind of substrate-engineering ego-spending that this plan is structured to avoid until activation.
 
 ## Frame
 
@@ -407,21 +410,141 @@ Six phases, in dependency order. Each is gated by activation of the workload tha
 
 ---
 
-## Open design questions to lock before implementation
+## Locked decisions
 
-1. **AST stability across versions.** As MeshDB evolves, the `MeshQuery` enum will gain variants. How do we handle forward/backward compatibility for serialized queries? **Recommendation:** version the AST explicitly (`MeshQuery::V1(QueryV1)` style); reject unknown versions cleanly; never silently drop fields.
+All seven open design questions ratified. Each item describes the decision, the contract the implementation must hold, and the rationale.
 
-2. **Default join watermark.** Streaming joins need a watermark for late-arrival handling. Default 5 seconds is a guess; real workloads will calibrate. **Recommendation:** ship with 5s default; expose per-query override; tune defaults after first production deployment.
+### 1. AST stability across versions
 
-3. **Sketch interoperability.** HLL and T-Digest variants exist with different parameters. Pick one canonical encoding so cross-node sketches merge cleanly. **Recommendation:** HLL with p=14 (16 KB sketches, ±0.81% error); T-Digest with compression=100 (compact sketches, ±0.5% on quantiles). Bake into the wire format.
+**Decision:** `MeshQuery` is explicitly versioned at the enum top level:
 
-4. **Distributed cache vs in-process only.** Do we ever push to distributed cache? **Recommendation:** no, not in this phase. Cross-node cache coherence is its own problem worth a separate phase. Per-node LRU is sufficient for the workloads in scope.
+```rust
+pub enum MeshQuery {
+    V1(QueryV1),
+    // V2(QueryV2), V3(QueryV3), ... as the AST evolves
+}
+```
 
-5. **Query language surface.** Stay programmatic-only, or build SQL-flavored / Cypher-flavored / GraphQL surface? **Recommendation:** programmatic only in this phase. Library users can build language surfaces as separate projects. Consistent with the protocol-as-product principle.
+Contract:
 
-6. **Per-query authentication.** Does a query carry its own auth context, or inherits the session's? **Recommendation:** inherits session's via existing AuthGuard; the query's reads are gated at the chain level by `subscribe_caps`; nothing query-specific needed.
+- Unknown versions reject cleanly at decode time (`MeshError::PlannerError { detail: "unsupported query version" }`).
+- Never silently drop fields. Forward-incompatible inputs return a typed error; they do not partially-decode.
+- Version tag appears in both JSON and postcard encodings.
+- Version increments **only** when adding or changing variant semantics. Adding a new operator variant inside an existing `Vn` is a non-bump if optional and unknown-to-old-planner-rejected.
+- Bindings enforce exhaustive matching on the version tag (no fall-through wildcards).
 
-7. **Streaming-aggregate windowing.** Time-windowed aggregates ("count events per minute") are extremely common. Build into the operator or layer above? **Recommendation:** build a `Window` operator (`Tumbling`, `Sliding`, `Session`) as part of Phase E; it composes with `Aggregate` cleanly and the workloads will demand it.
+Rationale: Maintains planner guarantees and prevents stringly-typed entropy. A query serialized today must either decode to the exact same plan years from now OR fail with a typed error — never silently degrade.
+
+### 2. Default join watermark
+
+**Decision:** Default `watermark = Duration::from_secs(5)` for streaming joins; overrideable per query.
+
+```rust
+Join {
+    left: Box<MeshQuery>,
+    right: Box<MeshQuery>,
+    on: JoinKey,
+    kind: JoinKind,
+    watermark: Duration,    // default 5s; ∞ for batch over closed ranges
+}
+```
+
+Contract:
+
+- Default ships at 5s.
+- Per-query override supported (any positive Duration; `Duration::MAX` ≡ ∞ for batch).
+- Watermark surfaces in result metadata so consumers know what semantics they got.
+- Real workloads (Hermes + Deck) generate telemetry post-ship; defaults retune ONLY after that data lands.
+
+Rationale: Provides correctness without stalling implementation; matches the plan's calibration note. 5s is a reasonable starting point that real telemetry can refine.
+
+### 3. Sketch interoperability
+
+**Decision:** Single canonical encoding per sketch type, baked into the wire surface:
+
+| Sketch | Parameter | Footprint | Error bound |
+|---|---|---|---|
+| HyperLogLog | `p = 14` | 16 KB | ±0.81 % distinct-count |
+| T-Digest | `compression = 100` | compact | ±0.5 % on quantiles |
+
+Contract:
+
+- All nodes treat these as the only valid sketch shapes. Cross-version merges would silently corrupt — reject with a typed error if a peer advertises a non-canonical sketch.
+- postcard encodes them as typed enum variants (`SketchPayload::HllP14(...)`, `SketchPayload::TDigestC100(...)`).
+- JSON uses the same tagged-struct form (`{"kind": "hll_p14", "data": "..."}`).
+- Cross-node merges are guaranteed identical semantics: a node receiving sketches from N other nodes computes the same merged result regardless of which subset it sees.
+
+Rationale: Sketch parameter drift is the canonical "v1 and v2 see different aggregate results" footgun in distributed analytics. Lock the parameters now, version-bump if changed.
+
+### 4. Distributed cache vs in-process only
+
+**Decision:** Per-node in-process LRU only. No distributed cache in this phase.
+
+Contract:
+
+- No cross-node coherence protocol.
+- No cache-state gossip.
+- No "cache miss → ask peer's cache" routing.
+- Cache invalidation keys on `(query_hash, capability_index_version)` and stays bound to the local process.
+- Phase E or later MAY revisit distributed caching as its own substrate-level feature with a dedicated plan.
+
+Rationale: Avoids solving a cache-coherence problem before it's justified. Per-node LRU is sufficient for the workloads in scope; cross-node cache coherence is its own multi-month research problem and would block Phase A on something the workloads don't need.
+
+### 5. Query language surface
+
+**Decision:** Programmatic-only. No SQL-, Cypher-, or GraphQL-flavored surface in core.
+
+Bindings expose `MeshQuery` in their idiomatic shape:
+
+| Binding | Surface |
+|---|---|
+| Rust | `MeshQuery` enum literal |
+| Python | dataclass / dict (same shape as `OverflowConfig` ships) |
+| Node/TypeScript | discriminated union (typed object form) |
+| Go | struct with json tags |
+| C | JSON blob via FFI |
+| Wire (inter-node) | postcard |
+
+Contract:
+
+- The typed AST per binding is the canonical user-facing surface.
+- External language surfaces (e.g. a community-built SQL-to-MeshQuery compiler) MAY be community libraries; they are NOT in the substrate.
+- Cross-binding parity is verified by serialization round-trip — every binding's AST must round-trip through both postcard and JSON without semantic drift.
+
+Rationale: Matches the protocol-as-product philosophy from the parent roadmap. A SQL-like surface is a downstream library concern; baking one into core would couple the substrate to a language design and create a second source of truth for query semantics. Preserves AST stability (locked decision #1) by keeping exactly one canonical form.
+
+### 6. Per-query authentication
+
+**Decision:** Queries inherit the session's auth context. No per-query auth override.
+
+Contract:
+
+- All chain reads gated via the existing chain-level `subscribe_caps` + `AuthGuard` machinery.
+- The planner never embeds auth tokens or capability claims into the AST.
+- Execution always uses the current `AuthGuard` from the requesting session.
+- A query that touches chains the session doesn't have `subscribe_caps` for returns the same typed denial the underlying read would return — no new error path.
+
+Rationale: Prevents auth complexity explosions in the AST + planner. Aligns with the existing RedEX subscriber model where ACL is enforced at chain-read time, not at query-construction time. Per-query-result redaction / row-level security stays as a follow-up doc.
+
+### 7. Streaming-aggregate windowing
+
+**Decision:** Add a `Window` operator in Phase E; not earlier.
+
+```rust
+Window {
+    inner: Box<MeshQuery>,
+    kind: WindowKind,      // Tumbling | Sliding | Session
+    duration: Duration,
+}
+```
+
+Contract:
+
+- Composes with `Aggregate` cleanly — the canonical pattern is `Aggregate(Window(Filter(Between(...))), …)`.
+- Required for Hermes telemetry + Deck metrics workloads (the activation triggers for streaming analytics).
+- Ships AFTER basic folds, joins, and aggregation are stable in Phases A–D. Building windowing on an unstable aggregate substrate inverts the dependency.
+
+Rationale: Time-windowed aggregates ("count events per minute") are an extremely common workload — but they're a natural extension of the aggregate operator, not a foundational primitive. Phase E with `Window` slotted in keeps the dependency order honest and lets Phases A–D land their tests against a smaller surface.
 
 ---
 
