@@ -6205,9 +6205,11 @@ impl MeshNode {
         // The wire `NetHeader::channel_hash` is a `u16` fast-path hint
         // — narrow the canonical [`ChannelHash`] (u32) to 16 bits for
         // the wire. Wire-side collisions are benign (the receiver
-        // disambiguates via `ChannelConfigMap::get_by_wire_hash` /
-        // `ChannelRegistry::get_by_wire_hash` and re-keys on the
-        // canonical 32-bit hash for ACL / storage decisions).
+        // disambiguates via `ChannelConfigRegistry::get_by_wire_hash`
+        // (Option, None on collision — collision-safe policy) /
+        // `ChannelRegistry::get_all_by_wire_hash` (Vec, full collision
+        // set — used by receive-side dispatch fan-out) and re-keys on
+        // the canonical 32-bit hash for ACL / storage decisions).
         builder.set_channel_hash(channel_hash as u16);
         // Stamp our identity's origin_hash so the receiver can
         // route per-chain logic (greedy cache, gravity heat

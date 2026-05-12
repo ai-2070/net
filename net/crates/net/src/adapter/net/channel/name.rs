@@ -216,7 +216,7 @@ impl std::fmt::Display for ChannelId {
 ///
 /// Detects canonical-hash collisions at creation time. Forwarding nodes only
 /// see the wire `u16` hash; the registry resolves wire-side ambiguity via
-/// [`Self::get_by_wire_hash`].
+/// [`Self::get_all_by_wire_hash`].
 pub struct ChannelRegistry {
     /// Canonical hash -> list of channels with that hash (rare at u32).
     by_hash: DashMap<ChannelHash, Vec<ChannelId>>,
@@ -285,7 +285,14 @@ impl ChannelRegistry {
     /// Look up all channels with a given wire `u16` hash (routinely multiple
     /// due to wire-bucket collisions at scale). Used by receive-side dispatch
     /// to disambiguate the wire fast-path hint into canonical channels.
-    pub fn get_by_wire_hash(&self, wire_hash: u16) -> Vec<ChannelId> {
+    ///
+    /// Returns the full collision set rather than collapsing to `None` on
+    /// collision — the receive-side caller wants to enumerate every
+    /// canonical that could have stamped this wire hash. This is the
+    /// opposite of [`ChannelConfigRegistry::get_by_wire_hash`], which
+    /// returns `None` on collision because the config caller wants a
+    /// single safe policy decision.
+    pub fn get_all_by_wire_hash(&self, wire_hash: u16) -> Vec<ChannelId> {
         self.by_wire_hash
             .get(&wire_hash)
             .map(|r| r.clone())
@@ -564,12 +571,12 @@ mod tests {
         let (id_a, _) = reg.register("sensors/lidar").unwrap();
         let (id_b, _) = reg.register("control/estop").unwrap();
 
-        // by_wire_hash returns the right channel for each wire bucket.
-        let by_wire_a = reg.get_by_wire_hash(id_a.wire_hash());
+        // get_all_by_wire_hash returns the right channel for each wire bucket.
+        let by_wire_a = reg.get_all_by_wire_hash(id_a.wire_hash());
         assert!(by_wire_a
             .iter()
             .any(|c| c.name().as_str() == "sensors/lidar"));
-        let by_wire_b = reg.get_by_wire_hash(id_b.wire_hash());
+        let by_wire_b = reg.get_all_by_wire_hash(id_b.wire_hash());
         assert!(by_wire_b
             .iter()
             .any(|c| c.name().as_str() == "control/estop"));
@@ -580,5 +587,46 @@ mod tests {
         // distinct.
         assert_eq!(reg.get_by_hash(id_a.hash()).len(), 1);
         assert_eq!(reg.get_by_hash(id_b.hash()).len(), 1);
+    }
+
+    #[test]
+    fn test_get_all_by_wire_hash_returns_full_collision_set() {
+        // `get_all_by_wire_hash` deliberately returns the full set of
+        // canonicals sharing a wire bucket rather than collapsing to
+        // `None` on collision — that's the contract that lets
+        // receive-side dispatch enumerate every canonical the inbound
+        // packet's wire hash could have come from. Construct a
+        // collision by brute force.
+        let reg = ChannelRegistry::new();
+        let mut seen = std::collections::HashMap::<u16, String>::new();
+        let (name_a, name_b) = (|| -> Option<(String, String)> {
+            for i in 0..200_000u64 {
+                let name = format!("reg/wcoll/{}", i);
+                let wire = wire_channel_hash(&name);
+                if let Some(prev) = seen.get(&wire) {
+                    return Some((prev.clone(), name));
+                }
+                seen.insert(wire, name);
+            }
+            None
+        })()
+        .expect("no wire collision in 200K candidates");
+
+        let (id_a, _) = reg.register(&name_a).unwrap();
+        let (id_b, _) = reg.register(&name_b).unwrap();
+        assert_eq!(id_a.wire_hash(), id_b.wire_hash());
+        assert_ne!(id_a.hash(), id_b.hash());
+
+        // Both canonicals are enumerable through the shared bucket.
+        let bucket = reg.get_all_by_wire_hash(id_a.wire_hash());
+        assert_eq!(bucket.len(), 2);
+        assert!(bucket.iter().any(|c| c.name().as_str() == name_a));
+        assert!(bucket.iter().any(|c| c.name().as_str() == name_b));
+
+        // Unknown bucket returns an empty Vec, not `None`.
+        let empty = reg.get_all_by_wire_hash(id_a.wire_hash().wrapping_add(1));
+        // Either truly empty, or this neighbour happens to also be a
+        // populated bucket — assert the API shape, not the contents.
+        let _ = empty;
     }
 }
