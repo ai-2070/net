@@ -1,0 +1,57 @@
+net/crates/net/src/adapter/net/behavior/meshdb/federated.rs
+  s_3a0a24a47d1a36::t_057cdc3e1a59f3 1429
+  s_3a0a24a47d1a36::t_9d8cd8800dbbf3 425,438
+  s_3a0a24a47d1a36::t_e51ecc5ac9865c 656,664-666,680-682,714,720-722,736-739,760-823
+  s_3a0a24a47d1a36::t_2456763ee8d24f 1498
+  s_3a0a24a47d1a36::t_ad47a164bc4b1f 485,487-491,498-501
+  s_3a0a24a47d1a36::t_75b4b68f0eee1b 607-610,617
+  s_3a0a24a47d1a36::t_ed00a415ea7055 839-842,844-845,848-849,854-857
+  s_3a0a24a47d1a36::t_988b88b1f1082f 255,278-280,282-292
+net/crates/net/src/adapter/net/behavior/meshdb/planner.rs
+  s_3a0a24a47d1a36::t_b94de2bc9b80ac 688-693,700
+  s_3a0a24a47d1a36::t_dcaef818b87942 251-252,254-257,259-262
+  s_3a0a24a47d1a36::t_1cfa1fda719e64 281-284,292-316
+  s_3a0a24a47d1a36::t_2f083adb86001e 2696,2703
+  s_3a0a24a47d1a36::t_5f83182017a028 2741,2748-2750,2758,2760-2766,2768
+  s_3a0a24a47d1a36::t_9dc2abe34ebc47 1450,1452-1456,1470,1474-1479
+net/crates/net/src/adapter/net/behavior/meshdb/executor.rs
+  s_3a0a24a47d1a36::t_deced1be4ea694 582-587
+  s_3a0a24a47d1a36::t_ce21e25402cfc4 537-538,540
+  s_3a0a24a47d1a36::t_d10098ccdb8eda 567
+  s_3a0a24a47d1a36::t_30d938a3dfff5a 1996
+  s_3a0a24a47d1a36::t_b841a6f47bc30b 327,329,335-341,343-350
+  s_3a0a24a47d1a36::t_aa54ba408b2b16 364,372-377,391-393
+  s_3a0a24a47d1a36::t_4f4797f26a64ce 428,434-436
+  s_3a0a24a47d1a36::t_77c04989c63476 1733
+  s_3a0a24a47d1a36::t_482b263f17f66c 825-829,837-845
+  s_3a0a24a47d1a36::t_508f2784e26f3d 44
+  s_3a0a24a47d1a36::t_9daf03cd0b4e24 270,272,275,284,293,301
+  s_3a0a24a47d1a36::t_5af4c13e8c18fb 517
+  s_3a0a24a47d1a36::t_8b11b6df96608f 648,661-666
+  s_3a0a24a47d1a36::t_e27a348b1ae212 725,737-742
+  s_3a0a24a47d1a36::t_91249c94ed3a70 886-890,892-893,898-969,972-982
+  s_3a0a24a47d1a36::t_c77837a1b17e3d 1297-1489
+  s_3a0a24a47d1a36::t_4418a35d271cc4 1524,1595
+  s_3a0a24a47d1a36::t_00e6a85bc73712 1658
+  s_3a0a24a47d1a36::t_89560f96a5a432 450-456
+  s_3a0a24a47d1a36::t_2fcf6dfd877dc0 1807
+  s_3a0a24a47d1a36::t_251bca65e8cd16 1952
+net/crates/net/src/adapter/net/behavior/meshdb/mod.rs
+  s_3a0a24a47d1a36::t_93d22ae78cfdb1 90-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "98b55c5d9305ca1e42fd648f46f33c2dfe8cd5ef",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
