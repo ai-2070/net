@@ -123,7 +123,8 @@ pub struct MeshBlobAdapter {
     /// fetches free of any heat side-effect. Cheap to clone
     /// (`Arc<Mutex<...>>` inside); operators typically share
     /// the same handle with the gravity controller's tick loop.
-    blob_heat: Option<Arc<parking_lot::Mutex<crate::adapter::net::dataforts::gravity::BlobHeatRegistry>>>,
+    blob_heat:
+        Option<Arc<parking_lot::Mutex<crate::adapter::net::dataforts::gravity::BlobHeatRegistry>>>,
     /// Half-life applied to newly-entered blob-heat counters.
     /// Defaults to [`DEFAULT_BLOB_HEAT_HALF_LIFE`] (60 s); operators
     /// tune via [`Self::with_blob_heat`].
@@ -656,9 +657,7 @@ impl BlobAdapter for MeshBlobAdapter {
             if self.blob_heat.is_some() {
                 let hashes: Vec<[u8; 32]> = match blob_ref {
                     BlobRef::Small { hash, .. } => vec![*hash],
-                    BlobRef::Manifest { chunks, .. } => {
-                        chunks.iter().map(|c| c.hash).collect()
-                    }
+                    BlobRef::Manifest { chunks, .. } => chunks.iter().map(|c| c.hash).collect(),
                 };
                 self.bump_heat(&hashes);
             }
@@ -1456,10 +1455,8 @@ mod tests {
         use crate::adapter::net::dataforts::gravity::BlobHeatRegistry;
         let redex = Arc::new(Redex::new());
         let registry = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
-        let adapter = MeshBlobAdapter::new("mesh-heat", redex).with_blob_heat(
-            registry.clone(),
-            DEFAULT_BLOB_HEAT_HALF_LIFE,
-        );
+        let adapter = MeshBlobAdapter::new("mesh-heat", redex)
+            .with_blob_heat(registry.clone(), DEFAULT_BLOB_HEAT_HALF_LIFE);
         assert!(adapter.blob_heat_enabled());
 
         let payload = b"hot blob".to_vec();
@@ -1482,7 +1479,10 @@ mod tests {
         // decay, which is negligible over the test's tight window).
         let _ = adapter.fetch(&blob).await.unwrap();
         let after_second = registry.lock().get(&hash).map(|c| c.rate()).unwrap_or(0.0);
-        assert!(after_second >= 1.0, "rate must remain >= 1.0 after second fetch (got {after_second})");
+        assert!(
+            after_second >= 1.0,
+            "rate must remain >= 1.0 after second fetch (got {after_second})"
+        );
     }
 
     #[tokio::test]
@@ -1503,10 +1503,8 @@ mod tests {
         use crate::adapter::net::dataforts::gravity::BlobHeatRegistry;
         let redex = Arc::new(Redex::new());
         let registry = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
-        let adapter = MeshBlobAdapter::new("mesh-heat-range", redex).with_blob_heat(
-            registry.clone(),
-            DEFAULT_BLOB_HEAT_HALF_LIFE,
-        );
+        let adapter = MeshBlobAdapter::new("mesh-heat-range", redex)
+            .with_blob_heat(registry.clone(), DEFAULT_BLOB_HEAT_HALF_LIFE);
 
         // 2-chunk payload — fetch_range over the first chunk only
         // should bump exactly hash[0], not hash[1].
@@ -1518,8 +1516,8 @@ mod tests {
             ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
             _ => panic!("expected Chunked"),
         };
-        let blob = BlobRef::manifest("mesh://heat", Encoding::Replicated, chunk_refs.clone())
-            .unwrap();
+        let blob =
+            BlobRef::manifest("mesh://heat", Encoding::Replicated, chunk_refs.clone()).unwrap();
         adapter.store(&blob, &payload).await.unwrap();
 
         // Range entirely inside the first chunk.

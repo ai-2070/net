@@ -738,8 +738,9 @@ mod tests {
         }
         let emissions = r.tick(&policy, now);
         assert!(
-            emissions.iter().any(|(k, e)| *k == h
-                && matches!(e, HeatEmission::Emit { rate } if *rate > 0.0)),
+            emissions
+                .iter()
+                .any(|(k, e)| *k == h && matches!(e, HeatEmission::Emit { rate } if *rate > 0.0)),
             "tick must emit for a heated hash; got {emissions:?}"
         );
     }
