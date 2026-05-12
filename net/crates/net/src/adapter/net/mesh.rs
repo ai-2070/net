@@ -5906,13 +5906,15 @@ impl MeshNode {
         // Three-way verdict:
         //
         // - `Allowed`: bloom hit + verified-cache entry says yes.
-        //   The verified cache is keyed on the 16-bit `channel_hash`
-        //   that rides the wire header, which collides routinely at
-        //   mesh scale — one subscriber's grant on channel A can
-        //   falsely admit them on channel B when the hashes alias.
-        //   Cross-check the canonical name against `exact` before
-        //   trusting the verdict; a mismatch means the allow came
-        //   from a different channel that happened to collide.
+        //   The verified cache is keyed on the canonical
+        //   [`ChannelHash`] (u32) — collision-resistant at realistic
+        //   deployment scale (~65 K channels before birthday-collision
+        //   threshold), but a sufficiently adversarial name selection
+        //   could still alias two channels. The exact-name ACL is
+        //   the unconditional backstop: cross-check the canonical
+        //   name against `exact` before trusting the verdict, so a
+        //   collision can only ever produce a brief miss, never a
+        //   policy swap.
         // - `Denied`: bloom miss — no auth entry exists for this
         //   (origin, channel). Skip the subscriber.
         // - `Unknown`: bloom hit but verified cache missed. Fall
