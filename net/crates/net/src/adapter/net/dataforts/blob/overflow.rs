@@ -544,11 +544,12 @@ pub trait OverflowPushSink: Send + Sync {
 pub struct BlobOverflowController<'a> {
     /// Local node's capability set. Read for the local
     /// gravity scope (target-selection scope filter) and
-    /// for the overflow-enabled self-check. The latter is
-    /// belt-and-suspenders — the adapter's setter already
-    /// gates `set_overflow_enabled(true)` against the local
-    /// state — but cheaper than threading the bool in
-    /// separately.
+    /// for the overflow-enabled self-check inside
+    /// [`drive_blob_overflow_tick`] (skip the tick until the
+    /// local `dataforts.blob.overflow` tag is visible on the
+    /// snapshot — otherwise every push would round-trip an
+    /// RPC and come back `Rejected(SenderNotOverflowing)`
+    /// while the announce propagates).
     pub local_caps: &'a CapabilitySet,
     /// Index of peer capability sets. The controller walks
     /// every overflow-enabled peer to score target
@@ -910,6 +911,28 @@ pub async fn drive_blob_overflow_tick(
     // never push. Pin this so toggling `enabled = false`
     // is a hard stop.
     if !controller.config.enabled || !fire {
+        report.disk_ratio_at_end = disk_ratio;
+        return report;
+    }
+
+    // Sender-side self-check (plan § "Open design questions"
+    // #5): the controller's `config.enabled` says the operator
+    // wants overflow on, but the wire-level contract is
+    // gated on `cap.blob.overflow` propagating through the
+    // capability index. If the local node hasn't yet
+    // advertised the tag (announce hasn't fired since
+    // `set_overflow_enabled(true)`, or `local_caps` was
+    // never rebuilt), every push would round-trip an RPC
+    // just to get rejected `SenderNotOverflowing` by every
+    // peer. Skip the tick cleanly until the tag is visible
+    // on the sender's own caps snapshot; the next
+    // `announce_capabilities` rebroadcast resolves the race.
+    let local_blob = BlobCapability::from_capability_set(controller.local_caps);
+    if !local_blob.overflow_enabled {
+        tracing::debug!(
+            "blob overflow: master switch on but local cap.blob.overflow not yet advertised; \
+             skipping tick until announce_capabilities propagates the tag"
+        );
         report.disk_ratio_at_end = disk_ratio;
         return report;
     }
@@ -1516,6 +1539,60 @@ mod tests {
         .await;
         assert_eq!(report.admitted, 0);
         assert_eq!(report.rejected_no_target, 1);
+        assert_eq!(sink.calls().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tick_skips_when_local_overflow_tag_not_advertised() {
+        // `OverflowConfig.enabled = true` but `local_caps`
+        // doesn't carry `dataforts.blob.overflow` — the
+        // operator flipped the master switch on the adapter
+        // but `announce_capabilities` hasn't rebuilt the
+        // local caps snapshot yet. Sender-side self-check
+        // (plan § Open design Q #5) must skip the tick:
+        // every push would round-trip an RPC and come back
+        // `Rejected(SenderNotOverflowing)`, wasting wire
+        // and bumping `push_errors` without making progress.
+        let now = Instant::now();
+        let (a, _) = hex64(0xAA);
+        let heat = heat_registry_with(now, &[(a, 0.0)]);
+        let refcount = refcount_with_zero(&[a], 1_000_000);
+        let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
+        let index = cap_index_with(&[peer]);
+        // Local caps WITHOUT `dataforts.blob.overflow` tag.
+        let local = CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.gravity.enabled")
+            .add_tag("dataforts.gravity.scope=mesh")
+            .add_tag("dataforts.gravity.proximity=128");
+        let cfg = OverflowConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let active = AtomicBool::new(false);
+        let sink = OverflowPushRecorder::new();
+
+        let report = drive_blob_overflow_tick(
+            &controller,
+            &sink,
+            OverflowTickObservation {
+                disk_used_bytes: 900,
+                disk_total_bytes: 1000,
+                hysteresis_active: &active,
+                now,
+            },
+            |_| Some(1024),
+        )
+        .await;
+        // Hysteresis still flips (disk genuinely crossed
+        // the high-water mark — the gauge should reflect
+        // that), but no pushes fire and no rejections
+        // count.
+        assert!(report.is_active_at_end);
+        assert_eq!(report.admitted, 0);
+        assert_eq!(report.push_errors, 0);
+        assert_eq!(report.rejected_no_target, 0);
         assert_eq!(sink.calls().len(), 0);
     }
 
