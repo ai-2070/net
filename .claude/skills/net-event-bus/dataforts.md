@@ -273,20 +273,6 @@ if err := tasks.WaitForToken(result.Token, 250*time.Millisecond); err != nil { /
 
 ---
 
-## Cross-cutting — channel hash widening (v0.15)
-
-Dataforts ships alongside the substrate-wide channel-hash widening. The canonical `ChannelHash` is `u32` (was `u16`); the wire `NetHeader::channel_hash` stays `u16` (per-packet width fixed by the 64-byte cache-line-aligned header). ACL / storage / config / RYW decisions key on the canonical `u32`; the wire `u16` is a fast-path filter hint only. `PermissionToken` wire form grew from 159 → 161 bytes.
-
-You'll see this if:
-- You hardcoded `channel_hash` as `u16` in application code — update to `u32` / `ChannelHash`.
-- You stamped wire packets with `name.hash()` expecting `u16` — use `name.wire_hash()` for the wire value, `name.hash()` for the canonical.
-- You hardcoded `159` as the token wire size in tests — update to `161`.
-- You parsed `TokenInfo.channelHash` as 16-bit — widen to 32-bit.
-
-See `RELEASE_v0.15_REBEL_YELL.md` § Channel-hash widening for the full migration.
-
----
-
 ## Common gotchas
 
 - **`dataforts` feature must be on.** Builds without it surface typed `RedexError` stubs from every `enable_*` entry point: `"requires the 'dataforts' feature; rebuild with --features dataforts"`. Pre-built release artifacts ship with the feature enabled.
