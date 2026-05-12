@@ -1120,11 +1120,13 @@ mod tests {
     fn test_regression_channel_hash_zero_is_not_wildcard() {
         // Regression (MEDIUM, BUGS.md): a token with `channel_hash = 0`
         // but no WILDCARD scope bit must NOT authorize arbitrary
-        // channels. A legitimate channel whose 16-bit xxh3 happens
-        // to hash to 0 (1 in 65 536) would otherwise turn a narrowly-
-        // scoped token into a universal grant — and since xxh3 is
-        // non-cryptographic, an attacker able to register names
-        // could brute-force such a collision.
+        // channels. A legitimate channel whose canonical xxh3-derived
+        // `ChannelHash` happens to hash to 0 would otherwise turn a
+        // narrowly-scoped token into a universal grant — and since
+        // xxh3 is non-cryptographic, an attacker able to register
+        // names could brute-force such a collision (cheap at the
+        // wire u16, but reachable at the canonical u32 too with
+        // enough names).
         let issuer = EntityKeypair::generate();
         let subject = EntityKeypair::generate();
 
