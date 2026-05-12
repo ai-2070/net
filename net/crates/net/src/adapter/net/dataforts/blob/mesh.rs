@@ -403,9 +403,24 @@ impl MeshBlobAdapter {
     /// transitions, the adapter's next capability rebroadcast
     /// adds (or removes) the `dataforts.blob.overflow` tag —
     /// peers see the change on the following announcement
-    /// cycle. The rebroadcast itself is the operator's
-    /// responsibility (call `MeshNode::announce_capabilities`
-    /// after the toggle).
+    /// cycle.
+    ///
+    /// The adapter doesn't hold a `MeshNode` handle (the two
+    /// are intentionally decoupled), so the rebroadcast itself
+    /// happens through one of:
+    ///
+    /// - `MeshNode::announce_blob_overflow_state(adapter)` —
+    ///   the convenience path: snapshots local caps, syncs the
+    ///   `dataforts.blob.overflow` tag to the adapter's
+    ///   current state, and announces in one call. Recommended.
+    /// - Manual `announce_capabilities(updated_set)` where
+    ///   `updated_set` carries the matching presence tag.
+    ///
+    /// Until the rebroadcast lands, the sender-side overflow
+    /// tick short-circuits (the local caps snapshot doesn't yet
+    /// reflect the new state — see
+    /// `drive_blob_overflow_tick`) and peers reject any inbound
+    /// nudge as `SenderNotOverflowing`.
     ///
     /// Cheap: one write-lock acquire, one bool store. Safe to
     /// call concurrently with reads via

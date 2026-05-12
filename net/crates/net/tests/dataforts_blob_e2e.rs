@@ -828,3 +828,56 @@ async fn overflow_push_rejected_when_receiver_not_participating() {
         ack
     );
 }
+
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn announce_blob_overflow_state_syncs_local_caps_with_adapter_toggle() {
+    // `MeshNode::announce_blob_overflow_state` reads the
+    // adapter's current `overflow_enabled` boolean and pushes
+    // a cap-set rebroadcast that matches. Operators who flip
+    // `set_overflow_enabled` use this helper instead of
+    // hand-rolling the snapshot + tag mutation + announce
+    // sequence. Regression: prior to the helper, peers would
+    // see stale caps after a toggle and the sender's tick
+    // self-check would short-circuit.
+    let node = build_node().await;
+    let adapter = Arc::new(MeshBlobAdapter::new("mesh-toggle", Arc::new(Redex::new())));
+
+    // Seed local caps with overflow OFF (the adapter default).
+    node.announce_capabilities(
+        BlobCapability::storage_participating(100, 80).write_into(
+            GravityCapability {
+                enabled: true,
+                scope: TopologyScope::Mesh,
+                proximity: 128,
+            }
+            .write_into(CapabilitySet::new()),
+        ),
+    )
+    .await
+    .expect("seed caps");
+
+    // Flip the adapter's master switch ON, then sync. The
+    // helper must rewrite local caps so subsequent reads
+    // observe the `dataforts.blob.overflow` tag.
+    adapter.set_overflow_enabled(true);
+    node.announce_blob_overflow_state(&adapter)
+        .await
+        .expect("sync caps after on");
+    let live = node.capability_index_arc().get(node.node_id()).unwrap();
+    assert!(
+        BlobCapability::from_capability_set(&live).overflow_enabled,
+        "after sync(on), local caps must carry the overflow tag"
+    );
+
+    // Flip back OFF. The helper must clear the tag.
+    adapter.set_overflow_enabled(false);
+    node.announce_blob_overflow_state(&adapter)
+        .await
+        .expect("sync caps after off");
+    let live = node.capability_index_arc().get(node.node_id()).unwrap();
+    assert!(
+        !BlobCapability::from_capability_set(&live).overflow_enabled,
+        "after sync(off), local caps must NOT carry the overflow tag"
+    );
+}

@@ -6978,6 +6978,52 @@ impl MeshNode {
         let handler = Arc::new(OverflowPushHandler::new(Arc::clone(self), adapter));
         self.serve_rpc(OVERFLOW_PUSH_SERVICE, handler)
     }
+
+    /// Rebroadcast the local capability set with the
+    /// `dataforts.blob.overflow` tag set to match `adapter`'s
+    /// current `overflow_enabled()` state. Convenience for
+    /// operators who flip [`super::dataforts::blob::MeshBlobAdapter::set_overflow_enabled`]
+    /// at runtime: the boolean lives on the adapter, but the
+    /// capability index reads from this node's announced caps,
+    /// so peers only observe the change after the next
+    /// announce. Without this helper, every toggle path needs a
+    /// matching `announce_capabilities` call — easy to forget,
+    /// and the symptom (sender keeps round-tripping pushes that
+    /// reject `SenderNotOverflowing`) is non-obvious.
+    ///
+    /// Snapshots the current user caps, sets / clears the
+    /// presence tag based on `adapter.overflow_enabled()`, and
+    /// announces the updated set. Returns the
+    /// [`AdapterError`] from the inner `announce_capabilities`
+    /// if the announce fails (rate-limited, transport down,
+    /// etc.).
+    pub async fn announce_blob_overflow_state(
+        &self,
+        adapter: &super::dataforts::blob::MeshBlobAdapter,
+    ) -> Result<(), super::AdapterError> {
+        use super::behavior::{BlobCapability, Tag, TaxonomyAxis};
+        let mut caps = self.user_caps_snapshot();
+        let enabled = adapter.overflow_enabled();
+        let present = BlobCapability::from_capability_set(&caps).overflow_enabled;
+        if enabled == present {
+            // Snapshot already matches the adapter's runtime
+            // state — nothing to broadcast. Still re-announce
+            // to push any caller-supplied caps that may have
+            // landed via a different path; cheap (rate-limited
+            // upstream).
+            return self.announce_capabilities(caps).await;
+        }
+        let target = Tag::AxisPresent {
+            axis: TaxonomyAxis::Dataforts,
+            key: "blob.overflow".to_string(),
+        };
+        if enabled {
+            caps.tags.insert(target);
+        } else {
+            caps.tags.remove(&target);
+        }
+        self.announce_capabilities(caps).await
+    }
 }
 
 #[cfg(feature = "net")]
