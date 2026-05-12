@@ -1,0 +1,31 @@
+net/crates/net/bindings/python/src/blob.rs
+  s_3a0a24a47d1a36::t_b5433c01f9551b 187-193,210-214
+  s_3a0a24a47d1a36::t_8bee87c877969a 186,197-208
+net/crates/net/src/ffi/mod.rs
+  s_3a0a24a47d1a36::t_e3fc3a052e2043 54-85
+net/crates/net/bindings/go/net/tasks.go
+  s_3a0a24a47d1a36::t_319c8b63aed572 460-476
+net/crates/net/bindings/go/net/memories.go
+  s_3a0a24a47d1a36::t_1506ffc019d415 417-420
+net/crates/net/src/adapter/net/dataforts/gravity/mod.rs
+  s_3a0a24a47d1a36::t_d8b2a22f5aff60 32
+net/crates/net/src/adapter/net/dataforts/gravity/policy.rs
+  s_3a0a24a47d1a36::t_49d847ee423b4d 245-260
+  s_3a0a24a47d1a36::t_8816a8f44b5843 364-385
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "67f8d8591e468d4aec3a4c101d193662650ff891",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
