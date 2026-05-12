@@ -1,0 +1,24 @@
+net/crates/net/tests/net_blob_cli.rs
+  s_94e23cfc41b168::t_9b1181ee1fd5c1 182
+  s_94e23cfc41b168::t_b9b8a225836f4e 165-181,183-193
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_12_DATAFORTS_BLOB.md
+  s_94e23cfc41b168::t_e0aff82fc21ba6 43
+net/crates/net/src/bin/net-blob.rs
+  s_94e23cfc41b168::t_0e16323cea4b35 274-298
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "d8e591c438423e8d2fff34741267198ca8f36993",
+  "prompts": {},
+  "sessions": {
+    "s_94e23cfc41b168": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed289da3-1d40-4bcf-88e2-b4aa796d2ba2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
