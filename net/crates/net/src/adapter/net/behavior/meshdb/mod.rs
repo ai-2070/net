@@ -85,7 +85,9 @@ pub use federated::{
     FederatedMeshQueryExecutor, LoopbackTransport, MeshDbTransport, ResponseStream,
     TransportError,
 };
-pub use planner::{ExecutionPlan, MeshQueryPlanner, OperatorNode, OperatorPlan};
+pub use planner::{
+    ExecutionPlan, LineageDirection, LineageEntry, MeshQueryPlanner, OperatorNode, OperatorPlan,
+};
 pub use protocol::{
     ContinuationToken, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,
 };

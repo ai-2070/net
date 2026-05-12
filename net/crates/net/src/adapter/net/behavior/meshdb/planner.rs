@@ -1,16 +1,16 @@
 //! `MeshQueryPlanner` — translates a [`MeshQuery`] AST into an
 //! [`ExecutionPlan`] tree the executor walks at run time.
 //!
-//! Phase A scope (this file): atomic operators (`At` / `Between`
-//! / `Latest`) plan completely; composite operators
-//! (`LineageBack`, `LineageForward`, `Join`, `Filter`,
+//! Phase A scope: atomic operators (`At` / `Between` / `Latest`)
+//! plan completely; composite operators (`Join`, `Filter`,
 //! `Aggregate`, `Project`, `OrderBy`) recurse into their inner
-//! sub-queries, plan the inner, and surface a
-//! `PlannerError { detail: "operator not yet implemented in
-//! this build" }` if the executor for the outer operator hasn't
-//! shipped yet. This lets downstream code (test fixtures,
-//! cross-binding integration) start consuming the planner shape
-//! today while the executor lands phase by phase.
+//! sub-queries, plan the inner, and surface
+//! `OperatorPlan::NotYetImplemented` until their phase activates.
+//! Phase C extended `LineageBack` / `LineageForward` to fully-
+//! planned leaf operators via [`OperatorPlan::LineageEmit`] —
+//! the walk runs at plan time against the capability-index
+//! snapshot, and the executor emits one [`super::query::ResultRow`]
+//! per entry.
 //!
 //! # Determinism contract
 //!
@@ -128,6 +128,31 @@ pub enum OperatorPlan {
         /// Filter predicate (wire form).
         predicate: PredicateWire,
     },
+    /// Materialized lineage walk — the planner snapshotted the
+    /// `fork-of:` graph (backward or forward) and produced
+    /// `entries` in walk order. The executor emits one
+    /// [`ResultRow`] per entry: `origin = entry.origin`,
+    /// `seq = entry.tip_seq.unwrap_or(SeqNum(0))`, payload
+    /// empty. Callers wanting full event content compose with
+    /// `At` / `Between` against each entry's origin.
+    ///
+    /// Walk-at-plan-time uses the local capability index as a
+    /// snapshot, matching the plan's "no lineage streaming"
+    /// scope for Phase C. Drift between snapshot + read time
+    /// is bounded by the CAP-ANN broadcast cadence.
+    ///
+    /// [`ResultRow`]: super::query::ResultRow
+    LineageEmit {
+        /// Start origin of the walk (post-`ChainRef::Discovered`
+        /// resolution).
+        origin: u64,
+        /// Walk direction.
+        direction: LineageDirection,
+        /// One entry per chain reached. Ordered: ancestors-
+        /// first for `Back`, BFS-asc-depth for `Forward`. Always
+        /// includes the start origin at index 0 with `depth = 0`.
+        entries: Vec<LineageEntry>,
+    },
     /// Placeholder operator — emitted by the planner when an
     /// operator's executor hasn't been wired yet. Carries a
     /// diagnostic so the executor can surface a useful
@@ -142,6 +167,32 @@ pub enum OperatorPlan {
         /// for composites whose inner already planned).
         input: Option<Box<OperatorNode>>,
     },
+}
+
+/// Direction of a [`OperatorPlan::LineageEmit`] walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineageDirection {
+    /// Walk `fork-of:` parents toward ancestors. The
+    /// `CapabilityIndex` answer is direct: each chain's
+    /// `fork-of:<parent_hash>` tag names its parent.
+    Back,
+    /// Walk `fork-of:` descendants. Scans every entry in the
+    /// capability index for a `fork-of:<this_origin>` tag,
+    /// BFS-style, sorted by chain hash for determinism.
+    Forward,
+}
+
+/// One chain reached during a [`OperatorPlan::LineageEmit`] walk.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LineageEntry {
+    /// Chain origin hash (substrate `u64`).
+    pub origin: u64,
+    /// Hops from the walk's start. `0` for the start origin.
+    pub depth: u32,
+    /// Best-known tip seq from the holders' `causal:` claims.
+    /// `None` when no holder advertises a `Tip` or `Range`
+    /// claim (e.g. presence-only).
+    pub tip_seq: Option<SeqNum>,
 }
 
 /// Planner cost estimate. Phase A uses a conservative
@@ -253,11 +304,11 @@ where
                 })
             }
 
-            QueryV1::LineageBack { .. } => {
-                self.plan_not_yet_implemented("LineageBack (Phase C)", None)
+            QueryV1::LineageBack { origin, max_depth } => {
+                self.plan_lineage(origin, *max_depth, LineageDirection::Back)
             }
-            QueryV1::LineageForward { .. } => {
-                self.plan_not_yet_implemented("LineageForward (Phase C)", None)
+            QueryV1::LineageForward { origin, max_depth } => {
+                self.plan_lineage(origin, *max_depth, LineageDirection::Forward)
             }
             QueryV1::Join { left, right, .. } => {
                 // Plan each side; emit a not-yet wrapper that
@@ -389,6 +440,240 @@ where
             target_nodes: targets,
             cost,
         })
+    }
+
+    /// Plan a `LineageBack` / `LineageForward` walk against
+    /// the local capability-index snapshot.
+    ///
+    /// Errors per `MeshError`:
+    /// - `LineageCycleDetected` if the walk revisits a chain
+    ///   (the `fork-of:` graph should be a DAG; cycles indicate
+    ///   broken upstream applications).
+    /// - `LineageMaxDepthExceeded` if the walk hits `max_depth`
+    ///   with more candidates still queued.
+    fn plan_lineage(
+        &self,
+        origin: &ChainRef,
+        max_depth: u32,
+        direction: LineageDirection,
+    ) -> Result<OperatorNode, MeshError> {
+        let origin_hash = self.resolve_origin(origin)?;
+        let entries = match direction {
+            LineageDirection::Back => self.walk_lineage_back(origin_hash, max_depth)?,
+            LineageDirection::Forward => self.walk_lineage_forward(origin_hash, max_depth)?,
+        };
+        // Lineage cost is a function of how many chains we
+        // touch; conservative bandwidth estimate is one
+        // ResultRow per entry (small, no payload), zero RTT
+        // since the walk already happened at plan time.
+        let cost = CostEstimate {
+            bandwidth_bytes: entries.len() as u64 * 64,
+            latency_ms: 0,
+        };
+        Ok(OperatorNode {
+            operator: OperatorPlan::LineageEmit {
+                origin: origin_hash,
+                direction,
+                entries,
+            },
+            target_nodes: vec![],
+            cost,
+        })
+    }
+
+    /// Walk `fork-of:` parents backward from `start`. Returns
+    /// entries in walk order (start first).
+    fn walk_lineage_back(
+        &self,
+        start: u64,
+        max_depth: u32,
+    ) -> Result<Vec<LineageEntry>, MeshError> {
+        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        visited.insert(start);
+        let mut entries = vec![LineageEntry {
+            origin: start,
+            depth: 0,
+            tip_seq: self.best_tip(start),
+        }];
+        let mut current = start;
+        for depth in 1..=max_depth {
+            let Some(parent) = self.parent_of(current) else {
+                return Ok(entries);
+            };
+            if !visited.insert(parent) {
+                // Cycle: parent already on the walk. Compute the
+                // path from the first occurrence so the error
+                // carries the cycle for debugging.
+                let mut cycle: Vec<u64> = entries
+                    .iter()
+                    .map(|e| e.origin)
+                    .skip_while(|o| *o != parent)
+                    .collect();
+                cycle.push(parent);
+                return Err(MeshError::LineageCycleDetected {
+                    origin: start,
+                    cycle,
+                });
+            }
+            entries.push(LineageEntry {
+                origin: parent,
+                depth,
+                tip_seq: self.best_tip(parent),
+            });
+            current = parent;
+        }
+        // Reached max_depth: if a further parent still exists,
+        // surface the bound. If the walk genuinely terminates
+        // exactly at the boundary, no error.
+        if self.parent_of(current).is_some() {
+            return Err(MeshError::LineageMaxDepthExceeded {
+                origin: start,
+                depth: max_depth,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Walk `fork-of:` descendants forward from `start`. BFS
+    /// with descendants sorted lex by chain hash so the result
+    /// is deterministic.
+    fn walk_lineage_forward(
+        &self,
+        start: u64,
+        max_depth: u32,
+    ) -> Result<Vec<LineageEntry>, MeshError> {
+        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        visited.insert(start);
+        let mut entries = vec![LineageEntry {
+            origin: start,
+            depth: 0,
+            tip_seq: self.best_tip(start),
+        }];
+        let mut frontier: Vec<(u64, u32)> = vec![(start, 0)];
+        while let Some((current, depth)) = frontier.first().copied() {
+            frontier.remove(0);
+            if depth >= max_depth {
+                if !self.children_of(current).is_empty() {
+                    return Err(MeshError::LineageMaxDepthExceeded {
+                        origin: start,
+                        depth: max_depth,
+                    });
+                }
+                continue;
+            }
+            let mut children = self.children_of(current);
+            children.sort_unstable();
+            for child in children {
+                if !visited.insert(child) {
+                    // In a DAG, no cycles. Defensive: a
+                    // multi-parent diamond shows up here as a
+                    // revisit, which is benign (we just don't
+                    // re-add). Treat this case as silently
+                    // pruned, not a cycle.
+                    continue;
+                }
+                entries.push(LineageEntry {
+                    origin: child,
+                    depth: depth + 1,
+                    tip_seq: self.best_tip(child),
+                });
+                frontier.push((child, depth + 1));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Find the parent origin for `child` in the capability
+    /// index. Scans every indexed node for the one that
+    /// advertises `child` via `causal:<hex>` and reads its
+    /// `fork-of:<parent_hex>` tag.
+    ///
+    /// Returns `None` when no node hosts `child` or the
+    /// hosting node carries no fork-of declaration.
+    /// Multi-chain hosts — a node with several `causal:` tags
+    /// alongside several `fork-of:` tags — are a Phase C
+    /// ambiguity: the first fork-of tag in iteration order
+    /// wins.
+    fn parent_of(&self, child: u64) -> Option<u64> {
+        for node_id in self.capability_index.all_nodes() {
+            let Some(caps) = self.capability_index.get(node_id) else {
+                continue;
+            };
+            let mut hosts_child = false;
+            let mut parent: Option<u64> = None;
+            for tag in &caps.tags {
+                let Tag::Reserved { prefix, body } = tag else {
+                    continue;
+                };
+                match (prefix.as_str(), parent) {
+                    ("causal:", _) if parse_causal_body(body) == Some(child) => {
+                        hosts_child = true;
+                    }
+                    ("fork-of:", None) => {
+                        parent = parse_fork_body(body);
+                    }
+                    _ => {}
+                }
+            }
+            if hosts_child {
+                return parent;
+            }
+        }
+        None
+    }
+
+    /// Find all chains advertising `fork-of:<parent>` — i.e.,
+    /// the direct descendants. Scans every node in the
+    /// capability index; the result is sorted by caller (BFS
+    /// needs deterministic order).
+    fn children_of(&self, parent: u64) -> Vec<u64> {
+        let mut out = Vec::new();
+        for node_id in self.capability_index.all_nodes() {
+            let Some(caps) = self.capability_index.get(node_id) else {
+                continue;
+            };
+            let mut has_fork_to_parent = false;
+            let mut owned_chain: Option<u64> = None;
+            for tag in &caps.tags {
+                let Tag::Reserved { prefix, body } = tag else {
+                    continue;
+                };
+                match prefix.as_str() {
+                    "fork-of:" if parse_fork_body(body) == Some(parent) => {
+                        has_fork_to_parent = true;
+                    }
+                    "causal:" => {
+                        // First causal tag wins (multi-chain
+                        // hosts are a Phase C ambiguity).
+                        if let Some(origin) = parse_causal_body(body) {
+                            owned_chain.get_or_insert(origin);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if has_fork_to_parent {
+                if let Some(chain) = owned_chain {
+                    if chain != parent {
+                        out.push(chain);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Best-known tip seq for `chain` across its holders. Picks
+    /// the highest [`CausalClaim::latest_tip`] across all
+    /// holders advertising the chain; `None` if all claims are
+    /// presence-only (no tip information).
+    fn best_tip(&self, chain: u64) -> Option<SeqNum> {
+        self.collect_coverage(chain)
+            .into_iter()
+            .filter_map(|c| c.claim.latest_tip())
+            .max()
     }
 
     /// Resolve a `ChainRef::OriginHash` or `ChainRef::Discovered`
@@ -599,11 +884,12 @@ fn sum_cost(node: &OperatorNode) -> CostEstimate {
             acc.bandwidth_bytes = acc.bandwidth_bytes.saturating_add(inner.bandwidth_bytes);
             acc.latency_ms = acc.latency_ms.saturating_add(inner.latency_ms);
         }
-        // Atomic operators + leaf `NotYetImplemented` —
-        // no children to sum.
+        // Atomic + leaf operators (`LineageEmit` is leaf:
+        // walk happens at plan time, no children to sum).
         OperatorPlan::AtRead { .. }
         | OperatorPlan::BetweenRead { .. }
         | OperatorPlan::LatestRead { .. }
+        | OperatorPlan::LineageEmit { .. }
         | OperatorPlan::NotYetImplemented { input: None, .. } => {}
     }
     acc
@@ -785,14 +1071,34 @@ fn parse_causal_origin(tag: &Tag) -> Option<u64> {
     if prefix != "causal:" {
         return None;
     }
+    parse_causal_body(body)
+}
+
+/// Parse a `causal:` body (everything after the `causal:`
+/// prefix) into a `u64` origin hash. Strips the optional
+/// `:<tip>` or `[start..end]` suffix before validating the
+/// 16-hex-char stem.
+fn parse_causal_body(body: &str) -> Option<u64> {
     let stem = body
         .split_once([':', '['])
         .map(|(s, _)| s)
-        .unwrap_or(body.as_str());
+        .unwrap_or(body);
     if stem.len() != 16 {
         return None;
     }
     u64::from_str_radix(stem, 16).ok()
+}
+
+/// Parse a `fork-of:<16-hex>` reserved tag's body into a `u64`
+/// parent origin hash. Returns `None` for any non-conforming
+/// body (wrong length, non-hex). Mirrors [`parse_causal_origin`]'s
+/// strictness so the lineage walk has the same shape contract as
+/// causal-tag parsing.
+fn parse_fork_body(body: &str) -> Option<u64> {
+    if body.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(body, 16).ok()
 }
 
 // Silence unused-import warning under feature-conditional
@@ -1563,5 +1869,348 @@ mod tests {
             .unwrap();
         assert_eq!(p.root.cost.latency_ms, 15);
         assert_eq!(p.root.cost.bandwidth_bytes, PHASE_A_ATOMIC_BANDWIDTH_BYTES);
+    }
+
+    // ========================================================================
+    // Phase C — lineage walks
+    // ========================================================================
+
+    /// Build a `fork-of:<hex>` reserved tag from a parent
+    /// origin hash. Mirrors `causal_tag` — `add_tag` would
+    /// silently drop reserved-prefix tags (routes through
+    /// `parse_user`), so build `Tag::Reserved` directly.
+    fn fork_tag(parent_hash: u64) -> Tag {
+        Tag::Reserved {
+            prefix: "fork-of:".to_string(),
+            body: chain_hex(parent_hash),
+        }
+    }
+
+    /// Capability set advertising `chain` plus a `fork-of:`
+    /// declaration pointing at `parent`. Models "this host
+    /// holds chain X which is forked from chain P".
+    fn caps_chain_forked_from(chain: u64, parent: u64) -> CapabilitySet {
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(causal_tag(chain_hex(chain)));
+        caps.tags.insert(fork_tag(parent));
+        caps
+    }
+
+    /// Capability set advertising `chain` plus a tip + a
+    /// `fork-of:` declaration. Used to verify `tip_seq`
+    /// propagation through lineage entries.
+    fn caps_chain_tip_forked_from(chain: u64, tip: u64, parent: u64) -> CapabilitySet {
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(causal_tag(format!(
+            "{}:{}",
+            chain_hex(chain),
+            tip
+        )));
+        caps.tags.insert(fork_tag(parent));
+        caps
+    }
+
+    /// Capability set advertising just `chain` (no fork-of:).
+    /// Models the "root chain" — has no parent.
+    fn caps_chain_only(chain: u64) -> CapabilitySet {
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(causal_tag(chain_hex(chain)));
+        caps
+    }
+
+    #[test]
+    fn parse_fork_body_round_trips_16_hex() {
+        assert_eq!(parse_fork_body("00000000deadbeef"), Some(0xDEAD_BEEF));
+        assert_eq!(
+            parse_fork_body(&chain_hex(0x1234_5678_9ABC_DEF0)),
+            Some(0x1234_5678_9ABC_DEF0)
+        );
+    }
+
+    #[test]
+    fn parse_fork_body_rejects_short_or_non_hex() {
+        assert!(parse_fork_body("deadbeef").is_none()); // too short
+        assert!(parse_fork_body("deadbeefcafebabe0").is_none()); // too long
+        assert!(parse_fork_body("zzzzzzzzzzzzzzzz").is_none()); // non-hex
+    }
+
+    #[test]
+    fn lineage_back_single_root_returns_only_start() {
+        let root = 0x0000_0000_0000_0001_u64;
+        let index = index_with(vec![(1, caps_chain_only(root))]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageBack {
+                origin: ChainRef::OriginHash(root),
+                max_depth: 5,
+            }))
+            .unwrap();
+        match plan.root.operator {
+            OperatorPlan::LineageEmit {
+                origin,
+                direction,
+                entries,
+            } => {
+                assert_eq!(origin, root);
+                assert_eq!(direction, LineageDirection::Back);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].origin, root);
+                assert_eq!(entries[0].depth, 0);
+                assert_eq!(entries[0].tip_seq, None);
+            }
+            other => panic!("expected LineageEmit; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lineage_back_walks_through_three_generations() {
+        // Grandparent (g) <- parent (p) <- child (c).
+        let g = 0x0000_0000_0000_00AA_u64;
+        let p = 0x0000_0000_0000_00BB_u64;
+        let c = 0x0000_0000_0000_00CC_u64;
+        let index = index_with(vec![
+            (10, caps_chain_only(g)),
+            (20, caps_chain_forked_from(p, g)),
+            (30, caps_chain_forked_from(c, p)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageBack {
+                origin: ChainRef::OriginHash(c),
+                max_depth: 5,
+            }))
+            .unwrap();
+        match plan.root.operator {
+            OperatorPlan::LineageEmit { entries, .. } => {
+                let chain: Vec<u64> = entries.iter().map(|e| e.origin).collect();
+                assert_eq!(chain, vec![c, p, g]);
+                let depths: Vec<u32> = entries.iter().map(|e| e.depth).collect();
+                assert_eq!(depths, vec![0, 1, 2]);
+            }
+            other => panic!("expected LineageEmit; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lineage_back_propagates_tip_seq_from_holders() {
+        // Holder advertises chain + tip + fork-of: — tip
+        // surfaces in the LineageEntry.
+        let parent = 0xAA;
+        let child = 0xBB;
+        let index = index_with(vec![
+            (1, caps_chain_tip_forked_from(parent, 99, 0)), // root: fork-of:0 ignored
+            (2, caps_chain_tip_forked_from(child, 42, parent)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageBack {
+                origin: ChainRef::OriginHash(child),
+                max_depth: 2,
+            }))
+            .unwrap();
+        match plan.root.operator {
+            OperatorPlan::LineageEmit { entries, .. } => {
+                // child entry carries tip 42; parent entry
+                // carries tip 99 (fork-of:0 from "root" doesn't
+                // chain further since no host advertises chain 0).
+                assert_eq!(entries[0].origin, child);
+                assert_eq!(entries[0].tip_seq, Some(SeqNum(42)));
+                assert_eq!(entries[1].origin, parent);
+                assert_eq!(entries[1].tip_seq, Some(SeqNum(99)));
+            }
+            other => panic!("expected LineageEmit; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lineage_back_detects_cycle() {
+        // Pathological: A -> B -> A. Cycle should surface.
+        let a = 0x000A;
+        let b = 0x000B;
+        let index = index_with(vec![
+            (1, caps_chain_forked_from(a, b)),
+            (2, caps_chain_forked_from(b, a)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageBack {
+                origin: ChainRef::OriginHash(a),
+                max_depth: 10,
+            }))
+            .unwrap_err();
+        match err {
+            MeshError::LineageCycleDetected { origin, cycle } => {
+                assert_eq!(origin, a);
+                // Cycle must contain both a and b.
+                assert!(cycle.contains(&a), "cycle missing a: {cycle:?}");
+                assert!(cycle.contains(&b), "cycle missing b: {cycle:?}");
+            }
+            other => panic!("expected LineageCycleDetected; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lineage_back_surfaces_max_depth_exceeded_when_walk_could_continue() {
+        // 4-generation chain, max_depth=2: walk is truncated
+        // and the planner surfaces the bound.
+        let g0 = 0x10;
+        let g1 = 0x11;
+        let g2 = 0x12;
+        let g3 = 0x13;
+        let index = index_with(vec![
+            (1, caps_chain_only(g0)),
+            (2, caps_chain_forked_from(g1, g0)),
+            (3, caps_chain_forked_from(g2, g1)),
+            (4, caps_chain_forked_from(g3, g2)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageBack {
+                origin: ChainRef::OriginHash(g3),
+                max_depth: 2,
+            }))
+            .unwrap_err();
+        match err {
+            MeshError::LineageMaxDepthExceeded { origin, depth } => {
+                assert_eq!(origin, g3);
+                assert_eq!(depth, 2);
+            }
+            other => panic!("expected LineageMaxDepthExceeded; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lineage_back_terminates_exactly_at_max_depth_without_error() {
+        // 3-generation chain, max_depth=2: walk is g2 -> g1 -> g0
+        // and at depth 2 the parent_of g0 is None — no error.
+        let g0 = 0x20;
+        let g1 = 0x21;
+        let g2 = 0x22;
+        let index = index_with(vec![
+            (1, caps_chain_only(g0)),
+            (2, caps_chain_forked_from(g1, g0)),
+            (3, caps_chain_forked_from(g2, g1)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageBack {
+                origin: ChainRef::OriginHash(g2),
+                max_depth: 2,
+            }))
+            .unwrap();
+        if let OperatorPlan::LineageEmit { entries, .. } = plan.root.operator {
+            assert_eq!(
+                entries.iter().map(|e| e.origin).collect::<Vec<_>>(),
+                vec![g2, g1, g0]
+            );
+        } else {
+            panic!("expected LineageEmit");
+        }
+    }
+
+    #[test]
+    fn lineage_forward_emits_descendants_bfs_sorted() {
+        // Root has two children (c1 < c2 by hash). c1 has one
+        // grandchild gc. BFS order: root, c1, c2, gc.
+        let root = 0x100;
+        let c1 = 0x110;
+        let c2 = 0x120;
+        let gc = 0x130;
+        let index = index_with(vec![
+            (1, caps_chain_only(root)),
+            (2, caps_chain_forked_from(c1, root)),
+            (3, caps_chain_forked_from(c2, root)),
+            (4, caps_chain_forked_from(gc, c1)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageForward {
+                origin: ChainRef::OriginHash(root),
+                max_depth: 5,
+            }))
+            .unwrap();
+        match plan.root.operator {
+            OperatorPlan::LineageEmit {
+                direction, entries, ..
+            } => {
+                assert_eq!(direction, LineageDirection::Forward);
+                let chain: Vec<u64> = entries.iter().map(|e| e.origin).collect();
+                // BFS asc-depth, lex-sorted within a depth.
+                assert_eq!(chain, vec![root, c1, c2, gc]);
+                let depths: Vec<u32> = entries.iter().map(|e| e.depth).collect();
+                assert_eq!(depths, vec![0, 1, 1, 2]);
+            }
+            other => panic!("expected LineageEmit; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lineage_forward_surfaces_max_depth_when_descendants_remain() {
+        // root -> c1 -> gc. max_depth=1: should surface bound
+        // because gc is still reachable beyond.
+        let root = 0x200;
+        let c1 = 0x210;
+        let gc = 0x220;
+        let index = index_with(vec![
+            (1, caps_chain_only(root)),
+            (2, caps_chain_forked_from(c1, root)),
+            (3, caps_chain_forked_from(gc, c1)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageForward {
+                origin: ChainRef::OriginHash(root),
+                max_depth: 1,
+            }))
+            .unwrap_err();
+        match err {
+            MeshError::LineageMaxDepthExceeded { origin, depth } => {
+                assert_eq!(origin, root);
+                assert_eq!(depth, 1);
+            }
+            other => panic!("expected LineageMaxDepthExceeded; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lineage_forward_with_no_descendants_returns_only_start() {
+        let leaf = 0x300;
+        let index = index_with(vec![(1, caps_chain_only(leaf))]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageForward {
+                origin: ChainRef::OriginHash(leaf),
+                max_depth: 10,
+            }))
+            .unwrap();
+        if let OperatorPlan::LineageEmit { entries, .. } = plan.root.operator {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].origin, leaf);
+        } else {
+            panic!("expected LineageEmit");
+        }
+    }
+
+    #[test]
+    fn lineage_emit_round_trips_through_postcard() {
+        // Pin the wire-encodability of LineageEmit so the
+        // protocol layer can carry it inside an ExecutionPlan
+        // without surprises.
+        let parent = 0xAA;
+        let child = 0xBB;
+        let index = index_with(vec![
+            (1, caps_chain_only(parent)),
+            (2, caps_chain_forked_from(child, parent)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageBack {
+                origin: ChainRef::OriginHash(child),
+                max_depth: 5,
+            }))
+            .unwrap();
+        let bytes = postcard::to_allocvec(&plan).unwrap();
+        let decoded: ExecutionPlan = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, plan);
     }
 }

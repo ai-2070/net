@@ -112,13 +112,34 @@ impl<T: MeshDbTransport> FederatedMeshQueryExecutor<T> {
 #[async_trait]
 impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecutor<T> {
     async fn execute(&self, plan: ExecutionPlan) -> Result<RunningQuery, MeshError> {
-        // Phase B-4 scope: atomic root operators only.
-        // Composite operators surface synchronously, mirroring
-        // the local executor's behavior.
+        // Phase B-4 scope: atomic root operators dispatch to
+        // remote target_nodes. LineageEmit is a planner-only
+        // leaf (walk happened at plan time, no remote work);
+        // emit its entries locally. Composite operators surface
+        // synchronously, mirroring the local executor.
         match &plan.root.operator {
             OperatorPlan::AtRead { .. }
             | OperatorPlan::BetweenRead { .. }
             | OperatorPlan::LatestRead { .. } => {}
+            OperatorPlan::LineageEmit { entries, .. } => {
+                use super::query::SeqNum;
+                let handle = QueryHandle::new(self.allocate_id());
+                let rows: Vec<Result<ResultRow, MeshError>> = entries
+                    .iter()
+                    .map(|entry| {
+                        Ok(ResultRow {
+                            origin: entry.origin,
+                            seq: entry.tip_seq.unwrap_or(SeqNum(0)),
+                            payload: Vec::new(),
+                        })
+                    })
+                    .collect();
+                let stream: ResultStream = Box::pin(futures::stream::iter(rows));
+                return Ok(RunningQuery {
+                    handle,
+                    rows: stream,
+                });
+            }
             OperatorPlan::Filter { .. } => {
                 return Err(MeshError::PlannerError {
                     detail: "Filter executor not yet implemented (Phase E)".to_string(),
@@ -657,6 +678,53 @@ mod tests {
                 .any(|r| matches!(r, Err(MeshError::QueryCancelled))),
             "expected at least one QueryCancelled, got {rows:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn lineage_emit_runs_locally_without_transport_dispatch() {
+        // LineageEmit is a planner-only leaf; the federated
+        // executor must NOT dispatch it to a remote node.
+        // Empty transport proves it: if any send happens,
+        // we'd surface NoRoute via ExecutorError. Instead,
+        // the entries are emitted as rows locally.
+        use super::super::planner::{LineageDirection, LineageEntry};
+
+        let transport = Arc::new(LoopbackTransport::new());
+        let fed = FederatedMeshQueryExecutor::new(transport);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::LineageEmit {
+                    origin: 0xAA,
+                    direction: LineageDirection::Forward,
+                    entries: vec![
+                        LineageEntry {
+                            origin: 0xAA,
+                            depth: 0,
+                            tip_seq: Some(SeqNum(1)),
+                        },
+                        LineageEntry {
+                            origin: 0xBB,
+                            depth: 1,
+                            tip_seq: None,
+                        },
+                    ],
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let running = fed.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].origin, 0xAA);
+        assert_eq!(rows[0].seq, SeqNum(1));
+        assert_eq!(rows[1].origin, 0xBB);
+        assert_eq!(rows[1].seq, SeqNum(0));
     }
 
     #[tokio::test]

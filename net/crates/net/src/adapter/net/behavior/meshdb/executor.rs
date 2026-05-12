@@ -238,6 +238,22 @@ fn walk_operator<R: ChainReader + 'static>(
             };
             Ok(stream_from_vec(row.into_iter().collect(), handle))
         }
+        OperatorPlan::LineageEmit { entries, .. } => {
+            // The planner walked the lineage at plan time;
+            // the executor just emits one ResultRow per
+            // entry. payload is empty by Phase C convention —
+            // callers wanting full event content compose with
+            // At / Between against each entry's origin.
+            let rows: Vec<ResultRow> = entries
+                .iter()
+                .map(|entry| ResultRow {
+                    origin: entry.origin,
+                    seq: entry.tip_seq.unwrap_or(SeqNum(0)),
+                    payload: Vec::new(),
+                })
+                .collect();
+            Ok(stream_from_vec(rows, handle))
+        }
         OperatorPlan::Filter { .. } => Err(MeshError::PlannerError {
             detail: "Filter executor not yet implemented (Phase E)".to_string(),
         }),
@@ -509,6 +525,53 @@ mod tests {
             }
             other => panic!("expected PlannerError, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn lineage_emit_yields_one_row_per_entry_in_walk_order() {
+        use crate::adapter::net::behavior::meshdb::planner::{
+            LineageDirection, LineageEntry,
+        };
+
+        // Reader is unused for LineageEmit (walk happens at
+        // plan time, executor just translates entries).
+        let reader = Arc::new(InMemoryChainReader::default());
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let plan = atomic_plan(OperatorPlan::LineageEmit {
+            origin: 0xAA,
+            direction: LineageDirection::Back,
+            entries: vec![
+                LineageEntry {
+                    origin: 0xAA,
+                    depth: 0,
+                    tip_seq: Some(SeqNum(7)),
+                },
+                LineageEntry {
+                    origin: 0xBB,
+                    depth: 1,
+                    tip_seq: None,
+                },
+                LineageEntry {
+                    origin: 0xCC,
+                    depth: 2,
+                    tip_seq: Some(SeqNum(42)),
+                },
+            ],
+        });
+
+        let running = executor.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!((rows[0].origin, rows[0].seq), (0xAA, SeqNum(7)));
+        // tip_seq=None → seq sentinel 0
+        assert_eq!((rows[1].origin, rows[1].seq), (0xBB, SeqNum(0)));
+        assert_eq!((rows[2].origin, rows[2].seq), (0xCC, SeqNum(42)));
+        // payload empty by Phase C convention.
+        assert!(rows.iter().all(|r| r.payload.is_empty()));
     }
 
     #[tokio::test]
