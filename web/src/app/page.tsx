@@ -4223,7 +4223,7 @@ function DatafortsSection() {
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.7] font-light mb-12">
         For 60 years, files were objects nailed to a location. A bucket in a
         region; a database in a cluster; a disk in a box.{" "}
-        <strong className="text-ink font-medium">
+        <strong className="text-accent font-medium">
           Dataforts treats storage as flow.
         </strong>{" "}
         Bytes find their level. Heat pulls them toward demand. Full disks spill
