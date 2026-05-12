@@ -754,4 +754,185 @@ mod tests {
         r.remove(&h);
         assert!(r.is_empty());
     }
+
+    // ========================================================================
+    // Concurrency stress (multi-thread bump / tick races)
+    //
+    // The registries are `HashMap` inside, designed to live under
+    // an outer `Arc<Mutex<...>>` (the production wiring on
+    // `MeshBlobAdapter`). These tests wrap the registry that way
+    // and assert the higher-level invariants — no panic under
+    // concurrent bumps from N threads, tick-during-bump remains
+    // safe, LRU eviction stays within the cap envelope.
+    // ========================================================================
+
+    /// N threads each bump the same chunk hash on a shared
+    /// `Arc<Mutex<BlobHeatRegistry>>`. After the race, the rate
+    /// must equal `threads × per_thread` (modulo a negligible
+    /// decay over the test's millisecond window). Pins the
+    /// outer-mutex serialization correctness for concurrent
+    /// fetch-path heat updates.
+    #[test]
+    fn blob_heat_concurrent_bump_accumulates_under_outer_mutex() {
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        let registry = Arc::new(Mutex::new(BlobHeatRegistry::new()));
+        let half = Duration::from_secs(60 * 60); // 1 h — negligible decay over the test
+        let target = hash(0xAB);
+        let threads = 8usize;
+        let per_thread = 1_000usize;
+        let start = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+
+        for _ in 0..threads {
+            let registry = registry.clone();
+            let start = start.clone();
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..per_thread {
+                    let now = Instant::now();
+                    let mut guard = registry.lock().unwrap();
+                    guard.entry_mut(target, half, now).bump(now);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        let guard = registry.lock().unwrap();
+        let counter = guard.get(&target).expect("entry must exist");
+        let expected = (threads * per_thread) as f64;
+        // Decay is negligible (1 h half-life over ms-window), but
+        // we allow a generous 1 % slop for the f64 math without
+        // making the test brittle.
+        let rate = counter.rate();
+        assert!(
+            rate > expected * 0.99,
+            "expected rate ≈ {} (8 × 1000 bumps); got {} (lower bound failed)",
+            expected,
+            rate,
+        );
+        assert!(
+            rate <= expected,
+            "expected rate ≤ {} (no double-counting); got {}",
+            expected,
+            rate,
+        );
+    }
+
+    /// Background `bump` storm on a single hash while a foreground
+    /// thread runs `tick(policy, now)` repeatedly. Asserts no panic
+    /// and the tick produces at least one emission per cycle
+    /// (the rate is well above the threshold ratio after the first
+    /// few bumps land). Pins the iter-mut-during-bump safety.
+    #[test]
+    fn blob_heat_tick_concurrent_with_bumps_is_panic_free() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        let registry = Arc::new(Mutex::new(BlobHeatRegistry::new()));
+        let policy = super::super::policy::DataGravityPolicy::default();
+        let half = policy.decay_half_life;
+        let target = hash(0xCD);
+        let stop = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(Barrier::new(2));
+
+        // Bump storm.
+        let bumper = {
+            let registry = registry.clone();
+            let stop = stop.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    let now = Instant::now();
+                    let mut guard = registry.lock().unwrap();
+                    guard.entry_mut(target, half, now).bump(now);
+                }
+            })
+        };
+
+        // Tick loop.
+        let ticker = {
+            let registry = registry.clone();
+            let stop = stop.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                let mut total = 0usize;
+                for _ in 0..200 {
+                    let now = Instant::now();
+                    let emissions = {
+                        let mut guard = registry.lock().unwrap();
+                        guard.tick(&policy, now)
+                    };
+                    total += emissions.len();
+                }
+                stop.store(true, Ordering::Relaxed);
+                total
+            })
+        };
+
+        bumper.join().expect("bumper panicked");
+        let total_emissions = ticker.join().expect("ticker panicked");
+        // The bumper guarantees rate > 0 for most of the ticker's
+        // window, so at least *some* emissions land. The exact
+        // count is non-deterministic under the race.
+        assert!(
+            total_emissions > 0,
+            "tick must surface at least one emission while bumps run"
+        );
+    }
+
+    /// LRU eviction under a tight cap with concurrent inserts from
+    /// N threads. Asserts len() stays within the cap × shards
+    /// envelope (the `entry_mut` len-check + `evict_lru` aren't
+    /// transactional under DashMap-less HashMap+Mutex, but the
+    /// outer mutex serializes the whole `entry_mut` call so the
+    /// overshoot is zero).
+    #[test]
+    fn blob_heat_lru_cap_holds_under_concurrent_inserts() {
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        let cap = 16usize;
+        let registry = Arc::new(Mutex::new(BlobHeatRegistry::with_cap(cap)));
+        let half = Duration::from_secs(60);
+        let threads = 4usize;
+        // Each thread inserts a distinct range of keys past the
+        // cap, so eviction must fire repeatedly.
+        let inserts_per_thread = 64u8;
+        let start = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+
+        for tid in 0..threads as u8 {
+            let registry = registry.clone();
+            let start = start.clone();
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for i in 0..inserts_per_thread {
+                    let k = hash(tid * inserts_per_thread + i);
+                    let now = Instant::now();
+                    let mut guard = registry.lock().unwrap();
+                    guard.entry_mut(k, half, now);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        let guard = registry.lock().unwrap();
+        // The cap is enforced under the outer mutex on the
+        // entry_mut hot path — len() must never exceed it.
+        assert!(
+            guard.len() <= cap,
+            "len() {} exceeded cap {} after concurrent inserts; LRU eviction is broken",
+            guard.len(),
+            cap,
+        );
+    }
 }

@@ -520,4 +520,255 @@ mod tests {
         // is unconditionally safe.
         let _ = t;
     }
+
+    // ========================================================================
+    // Concurrency stress (multi-thread incr/decr/pin/unpin races)
+    //
+    // The table is `Arc<DashMap<...>>` inside, so concurrent ops
+    // on the same hash serialize on DashMap's per-shard write lock.
+    // These tests assert the higher-level invariants (saturating
+    // arithmetic, balanced incr/decr, snapshot consistency, sweep
+    // panic-free) hold under realistic thread contention.
+    // ========================================================================
+
+    /// N threads each do `K` incr + `K` decr operations on the same
+    /// hash. Final refcount must be zero (balanced), the entry must
+    /// still exist (decr doesn't remove), and no thread panicked.
+    /// Pins the saturating arithmetic doesn't drift the net delta
+    /// when threads interleave around the `0` floor.
+    #[test]
+    fn concurrent_incr_decr_balanced_lands_at_zero() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let table = BlobRefcountTable::new();
+        let target = h(0x11);
+        // Seed the entry so decr doesn't fight an absent key.
+        table.incr(target, 0);
+
+        let threads = 8usize;
+        let ops_per_thread = 2_000u64;
+        let start = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let table = table.clone();
+            let start = start.clone();
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..ops_per_thread {
+                    table.incr(target, 0);
+                    table.decr(target, 0);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        let entry = table.get(&target).expect("entry must still exist");
+        // Balanced incr/decr above the seeded +1 → ends at the seed.
+        assert_eq!(
+            entry.refcount, 1,
+            "balanced incr/decr storm + seed must leave refcount at 1"
+        );
+    }
+
+    /// Concurrent `incr` from N threads on the same hash with no
+    /// decrs. Final refcount must equal the total incr count
+    /// (saturating arithmetic doesn't lose updates under contention)
+    /// up to `u32::MAX`. With 8 × 1000 increments we stay well
+    /// below the saturation boundary so the assert is exact.
+    #[test]
+    fn concurrent_incr_accumulates_exactly_under_saturation_cap() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let table = BlobRefcountTable::new();
+        let target = h(0x22);
+        let threads = 8usize;
+        let per_thread = 1_000u32;
+        let start = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let table = table.clone();
+            let start = start.clone();
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..per_thread {
+                    table.incr(target, 0);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        let entry = table.get(&target).expect("entry must exist");
+        assert_eq!(
+            entry.refcount as u64,
+            threads as u64 * per_thread as u64,
+            "incr from {} threads × {} should sum exactly",
+            threads,
+            per_thread
+        );
+    }
+
+    /// `decr` saturates at zero under concurrent over-decrement.
+    /// Floor `0` must hold even when N threads race to drive it
+    /// negative. Pins the saturating_sub semantic against a real
+    /// contention scenario rather than a single-thread regression.
+    #[test]
+    fn concurrent_decr_saturates_at_zero_under_overdecrement() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let table = BlobRefcountTable::new();
+        let target = h(0x33);
+        // Seed the entry with refcount=10 then have N threads
+        // try to drive it to -infinity via decr.
+        for _ in 0..10 {
+            table.incr(target, 0);
+        }
+
+        let threads = 8usize;
+        let per_thread = 100u32;
+        let start = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let table = table.clone();
+            let start = start.clone();
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..per_thread {
+                    table.decr(target, 0);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        let entry = table.get(&target).expect("entry must exist");
+        assert_eq!(
+            entry.refcount, 0,
+            "decr must saturate at 0 even when threads race past the floor"
+        );
+    }
+
+    /// `pin` / `unpin` races against concurrent `incr` / `decr`
+    /// on the same hash. Asserts no thread panics + the final
+    /// entry is consistent (some pinned state, some refcount
+    /// in range). Pins the cross-field mutation safety under
+    /// `and_modify` / `get_mut` contention.
+    #[test]
+    fn concurrent_pin_unpin_incr_decr_is_panic_free() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let table = BlobRefcountTable::new();
+        let target = h(0x44);
+        let threads = 4usize;
+        let per_thread = 1_000u32;
+        // Two thread roles: half do pin/unpin, half do incr/decr.
+        let start = Arc::new(Barrier::new(threads * 2));
+        let mut handles = Vec::with_capacity(threads * 2);
+
+        for _ in 0..threads {
+            let table = table.clone();
+            let start = start.clone();
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for i in 0..per_thread {
+                    if i % 2 == 0 {
+                        table.pin(target, i as u64);
+                    } else {
+                        table.unpin(target, i as u64);
+                    }
+                }
+            }));
+        }
+        for _ in 0..threads {
+            let table = table.clone();
+            let start = start.clone();
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for i in 0..per_thread {
+                    if i % 2 == 0 {
+                        table.incr(target, i as u64);
+                    } else {
+                        table.decr(target, i as u64);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        let entry = table
+            .get(&target)
+            .expect("entry must still exist after the race");
+        // Pin state is whichever ran last — both true and false
+        // are valid outcomes. Refcount stays in the saturating
+        // range [0, threads * per_thread / 2]. No data
+        // corruption, no panic.
+        assert!(
+            entry.refcount <= (threads as u32) * per_thread,
+            "refcount must stay within the saturating envelope; got {}",
+            entry.refcount
+        );
+    }
+
+    /// `deletable_hashes` (snapshot of sweep-eligible hashes)
+    /// runs concurrent with `incr` storms. Asserts no panic — the
+    /// DashMap iteration is shard-by-shard and a concurrent writer
+    /// updating an entry mid-iteration must not corrupt the result.
+    /// The exact deletable count is non-deterministic under the
+    /// race; we only pin "no panic + non-corrupting" here.
+    #[test]
+    fn deletable_hashes_concurrent_with_incr_is_panic_free() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let table = BlobRefcountTable::new();
+        // Pre-seed 32 hashes so the snapshot has real work to do.
+        for i in 0..32u8 {
+            table.store_observed(h(i), 0);
+        }
+
+        let threads = 4usize;
+        let per_thread = 2_000u32;
+        let start = Arc::new(Barrier::new(threads + 1));
+        let mut handles = Vec::with_capacity(threads + 1);
+
+        for tid in 0..threads as u8 {
+            let table = table.clone();
+            let start = start.clone();
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..per_thread {
+                    table.incr(h(tid), 0);
+                    table.decr(h(tid), 0);
+                }
+            }));
+        }
+        // Snapshotter: read deletable_hashes in a tight loop while
+        // the storms run. The retention floor of 0 + now_unix_ms=
+        // 1_000_000 keeps every entry eligible if its refcount is
+        // 0 — the loop just exercises the iteration safety.
+        let table_snap = table.clone();
+        let start_snap = start.clone();
+        handles.push(thread::spawn(move || {
+            start_snap.wait();
+            for _ in 0..200 {
+                let _ = table_snap.deletable_hashes(1_000_000, Duration::from_secs(0), false);
+            }
+        }));
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+        // Just having reached here without panicking is the assert.
+        assert!(table.len() >= 32);
+    }
 }
