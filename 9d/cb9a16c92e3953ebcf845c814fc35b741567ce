@@ -1,0 +1,33 @@
+net/crates/net/src/adapter/net/dataforts/blob/metrics.rs
+  s_94e23cfc41b168::t_f623381d8c9271 206-216,224
+  s_94e23cfc41b168::t_7f926c258cbc49 184-186
+  s_94e23cfc41b168::t_7c026f289244ca 358
+  s_94e23cfc41b168::t_4f82b0e429e657 432,434-437,441,443-446
+net/crates/net/src/adapter/net/behavior/placement.rs
+  s_94e23cfc41b168::t_f40045a229ffbb 576-591
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_12_DATAFORTS_BLOB.md
+  s_94e23cfc41b168::t_c66bee1dfab589 46-49
+net/crates/net/src/adapter/net/dataforts/blob/refcount.rs
+  s_94e23cfc41b168::t_21d571c3011335 215
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_94e23cfc41b168::t_f25315fd2589fd 740-742,744-754
+  s_94e23cfc41b168::t_d8a253f66fc74e 1447
+net/crates/net/src/adapter/net/behavior/dataforts_capabilities.rs
+  s_94e23cfc41b168::t_387b984c28b734 126-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "9dcb9a16c92e3953ebcf845c814fc35b741567ce",
+  "prompts": {},
+  "sessions": {
+    "s_94e23cfc41b168": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed289da3-1d40-4bcf-88e2-b4aa796d2ba2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
