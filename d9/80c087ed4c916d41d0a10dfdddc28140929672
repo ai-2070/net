@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/dataforts/mod.rs
+  s_3a0a24a47d1a36::t_29a364a5b6e306 43-44,51-56
+net/crates/net/src/adapter/net/dataforts/blob/mod.rs
+  s_3a0a24a47d1a36::t_bd59398c4375e9 49-51
+net/crates/net/src/adapter/net/dataforts/blob/migration.rs
+  s_3a0a24a47d1a36::t_6db5f438e94e29 281-418
+  s_3a0a24a47d1a36::t_23368de15eadd6 707-858
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "d980c087ed4c916d41d0a10dfdddc28140929672",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
