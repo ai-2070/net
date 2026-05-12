@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
+use super::admission::OverflowReject;
 use super::error::BlobError;
 use super::mesh::OverflowConfig;
 use super::refcount::BlobRefcountTable;
@@ -34,6 +36,86 @@ use crate::adapter::net::behavior::{
     is_blob_storage_unhealthy, BlobCapability, CapabilitySet, GravityCapability, TopologyScope,
 };
 use crate::adapter::net::dataforts::gravity::BlobHeatRegistry;
+
+/// Service-name token for the overflow-push nRPC channel.
+/// The sender constructs a request on
+/// `"{OVERFLOW_PUSH_SERVICE}.requests"` and listens on
+/// `"{OVERFLOW_PUSH_SERVICE}.replies.<origin>"`; the receiver
+/// registers a handler under the same service name via
+/// [`crate::adapter::net::MeshNode::serve_overflow_push`].
+///
+/// Held as a const so a typo on either side surfaces at
+/// compile time. The wire form is the literal string — no
+/// version suffix (per-tag versioning lives inside the wire
+/// payload, not the channel name).
+pub const OVERFLOW_PUSH_SERVICE: &str = "dataforts.blob.overflow_push";
+
+/// Wire request body for an overflow push. The sender encodes
+/// this via postcard + drops it into the nRPC payload; the
+/// receiver decodes, runs [`super::admission::should_accept_overflow_from`],
+/// and on Admit opens the chunk channel against the local
+/// adapter so the existing replication runtime can pull the
+/// bytes.
+///
+/// The chunk bytes themselves do NOT ride this request — the
+/// nRPC envelope carries the *nudge*, not the chunk payload.
+/// `size_bytes` is the resolved chunk size so the receive-side
+/// disk-gate can fire without round-tripping a `stat` call.
+///
+/// Wire layout: postcard's default `(field_order)` encoding.
+/// The field order is locked here for forward compatibility;
+/// adding new fields requires a versioned variant (the trait-
+/// object polymorphism on the postcard side is rigid). A
+/// future v2 would land as a separate type registered under
+/// a new service-name token, with v1 receivers ignoring the
+/// new channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverflowPush {
+    /// 32-byte BLAKE3 hash of the chunk to push.
+    pub blob_hash: [u8; 32],
+    /// Wire size of the chunk in bytes. Drives the receive-
+    /// side disk-gate.
+    pub size_bytes: u64,
+    /// Sender's canonical `node_id`. The receiver looks the
+    /// sender's [`CapabilitySet`] up in its local
+    /// [`CapabilityIndex`] keyed on this id; the admission
+    /// check reads `overflow_enabled` + scope tags from the
+    /// looked-up snapshot, not from the request body. Defends
+    /// against a sender forging its caps via the request — the
+    /// only authority is the verified capability index.
+    pub sender_node_id: u64,
+}
+
+/// Wire response body. Sender-side observes the result and
+/// either records the admission outcome (`Accepted`) or
+/// dispatches the typed reject reason to the per-reason
+/// counter family. The chunk-channel open on the receive
+/// side happens *during* `Accepted` — by the time the sender
+/// observes `Accepted`, the receiver has either successfully
+/// opened the channel or returned a typed error variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OverflowPushAck {
+    /// Receiver ran admission, returned Admit, and the
+    /// chunk channel open returned Ok. The bytes are now in
+    /// flight via the existing replication runtime; the
+    /// durability watermark observation (post-tick) is the
+    /// sender's signal to drop the local copy.
+    Accepted,
+    /// Receiver ran admission, returned Reject. Carries the
+    /// typed reason so the sender can break out per-reason
+    /// counters + decide whether to retry against the same
+    /// peer (e.g. `InsufficientDisk` won't change quickly; a
+    /// different target is the right move) or pick a new one.
+    Rejected(OverflowReject),
+    /// Receiver ran admission, returned Admit, but the
+    /// chunk channel open itself failed (the replication
+    /// runtime couldn't spawn, a transient disk error, etc.).
+    /// Wire-distinct from `Rejected` because the failure
+    /// mode is "we wanted to take it, our local plumbing
+    /// broke" rather than "we won't take it." Operators
+    /// alarm on `OpenChunkFailed` more aggressively.
+    OpenChunkFailed,
+}
 
 /// One overflow-push candidate the controller is considering
 /// for this tick. The push controller already selected a
@@ -162,6 +244,232 @@ pub fn step_overflow_hysteresis(
         active.store(now_active, Ordering::Relaxed);
     }
     now_active
+}
+
+/// Receive-side handler for the overflow nRPC. Implements
+/// [`cortex::RpcHandler`] so it slots into [`MeshNode::serve_rpc`]
+/// (under the [`OVERFLOW_PUSH_SERVICE`] service name). On each
+/// incoming request:
+///
+/// 1. Decode the postcard-encoded [`OverflowPush`].
+/// 2. Look up `sender_caps` in `capability_index` keyed on
+///    `request.sender_node_id`.
+/// 3. Run [`super::admission::should_accept_overflow_from`]
+///    against the live `local_caps` snapshot + the sender's
+///    caps + the chunk size.
+/// 4. On Admit: build a [`super::blob_ref::BlobRef::small`]
+///    from `(blob_hash, size_bytes)` and call
+///    [`super::adapter::BlobAdapter::prefetch`] — this opens
+///    the chunk channel with replication armed and the
+///    existing per-chunk replication runtime pulls the
+///    bytes from whoever advertises `causal:<hash>`
+///    (typically the sender). Returns
+///    [`OverflowPushAck::Accepted`] on success,
+///    [`OverflowPushAck::OpenChunkFailed`] on local-plumbing
+///    error.
+/// 5. On Reject: wrap the typed [`OverflowReject`] in
+///    [`OverflowPushAck::Rejected`] and return.
+///
+/// The handler holds `Arc<MeshNode>` so it reads live local
+/// caps + the capability index at each call rather than a
+/// build-time snapshot. Toggling `overflow_enabled` on the
+/// adapter is observable immediately on the next inbound
+/// push.
+///
+/// [`cortex::RpcHandler`]: crate::adapter::net::cortex::RpcHandler
+/// [`MeshNode::serve_rpc`]: crate::adapter::net::MeshNode::serve_rpc
+#[cfg(feature = "cortex")]
+pub struct OverflowPushHandler {
+    /// Reference to the local mesh node. Used for the
+    /// capability-index lookup + the local-caps snapshot.
+    /// Holds an `Arc` rather than a borrow because the
+    /// handler is registered into the nRPC fold which owns
+    /// it via `Arc<dyn RpcHandler>` — the handler outlives
+    /// any single tick.
+    pub mesh: Arc<crate::adapter::net::MeshNode>,
+    /// The local blob adapter. The handler calls
+    /// `adapter.prefetch(BlobRef)` on Admit to open the
+    /// chunk channel. Held by `Arc` for the same reason as
+    /// `mesh`; cheap to clone (the adapter is `Arc`-internal
+    /// throughout).
+    pub adapter: Arc<super::mesh::MeshBlobAdapter>,
+}
+
+#[cfg(feature = "cortex")]
+impl OverflowPushHandler {
+    /// Construct a handler. Operators wire this into the
+    /// receiver-side via
+    /// [`crate::adapter::net::MeshNode::serve_overflow_push`].
+    pub fn new(
+        mesh: Arc<crate::adapter::net::MeshNode>,
+        adapter: Arc<super::mesh::MeshBlobAdapter>,
+    ) -> Self {
+        Self { mesh, adapter }
+    }
+
+    /// Pure typed handler logic. Decoded request goes in,
+    /// typed ack comes out. Separate from the
+    /// [`crate::adapter::net::cortex::RpcHandler`] impl so
+    /// tests can drive the admission path without
+    /// constructing an [`crate::adapter::net::cortex::RpcContext`].
+    ///
+    /// Reads live `user_caps_snapshot` + capability-index
+    /// state on each call, so an operator toggling
+    /// `overflow_enabled` on the local node is observed by
+    /// the next inbound push.
+    pub async fn handle(&self, request: OverflowPush) -> OverflowPushAck {
+        use super::adapter::BlobAdapter;
+        use super::admission::{should_accept_overflow_from, OverflowVerdict};
+        use super::blob_ref::BlobRef;
+
+        // Look up sender caps from the capability index.
+        // Absent → use the empty default (which has
+        // `overflow_enabled = false`); the admission gate
+        // will then return `SenderNotOverflowing`.
+        let sender_caps = self
+            .mesh
+            .capability_index_arc()
+            .get(request.sender_node_id)
+            .unwrap_or_default();
+
+        // Snapshot local caps fresh per request so a
+        // concurrent `set_overflow_enabled(false)` is
+        // observed immediately.
+        let local_caps = self.mesh.user_caps_snapshot();
+
+        let verdict = should_accept_overflow_from(&local_caps, &sender_caps, request.size_bytes);
+        match verdict {
+            OverflowVerdict::Reject(reason) => OverflowPushAck::Rejected(reason),
+            OverflowVerdict::Admit => {
+                // Build the BlobRef::Small the prefetch path
+                // wants. The URI is `mesh://<hex>` — opaque
+                // to the adapter (content-hash is the
+                // authoritative address) but the convention
+                // matches existing migration code.
+                let mut hex = String::with_capacity(64);
+                for b in request.blob_hash {
+                    use std::fmt::Write;
+                    let _ = write!(&mut hex, "{:02x}", b);
+                }
+                let blob_ref = BlobRef::small(
+                    format!("mesh://{}", hex),
+                    request.blob_hash,
+                    request.size_bytes,
+                );
+                match self.adapter.prefetch(&blob_ref).await {
+                    Ok(()) => OverflowPushAck::Accepted,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            hash = %hex,
+                            sender = request.sender_node_id,
+                            "overflow push: prefetch failed after admit",
+                        );
+                        OverflowPushAck::OpenChunkFailed
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cortex")]
+#[async_trait]
+impl crate::adapter::net::cortex::RpcHandler for OverflowPushHandler {
+    async fn call(
+        &self,
+        ctx: crate::adapter::net::cortex::RpcContext,
+    ) -> Result<
+        crate::adapter::net::cortex::RpcResponsePayload,
+        crate::adapter::net::cortex::RpcHandlerError,
+    > {
+        use crate::adapter::net::cortex::{RpcHandlerError, RpcResponsePayload, RpcStatus};
+
+        // Decode the request body. Malformed bytes surface
+        // as a typed Internal error — the caller sees
+        // `RpcStatus::Internal` with a short diagnostic,
+        // distinct from `Application(code)` which we use for
+        // typed admission rejections.
+        let request: OverflowPush = postcard::from_bytes(&ctx.payload.body).map_err(|e| {
+            RpcHandlerError::Internal(format!("overflow push: decode failed: {e}"))
+        })?;
+
+        let ack = self.handle(request).await;
+
+        // Encode the ack into the response body. Encoding
+        // failure is an internal bug (postcard for our typed
+        // enum is total); surface as Internal.
+        let body = postcard::to_allocvec(&ack).map_err(|e| {
+            RpcHandlerError::Internal(format!("overflow push: encode ack failed: {e}"))
+        })?;
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: Vec::new(),
+            body,
+        })
+    }
+}
+
+/// Concrete [`OverflowPushSink`] implementation backed by a
+/// [`MeshNode`]. Wraps the sender-side nRPC call: each
+/// `push` invocation encodes the request, dispatches via
+/// [`MeshNode::call`] under the [`OVERFLOW_PUSH_SERVICE`]
+/// service name, decodes the typed [`OverflowPushAck`], and
+/// maps the outcome to the [`OverflowPushSink::push`]
+/// `Result` shape the controller expects.
+///
+/// Construct once per operator scheduler (the sink is cheap
+/// to clone — holds an `Arc<MeshNode>`). Pass to
+/// [`drive_blob_overflow_tick`] as `&dyn OverflowPushSink`.
+///
+/// [`MeshNode`]: crate::adapter::net::MeshNode
+/// [`MeshNode::call`]: crate::adapter::net::MeshNode::call
+#[cfg(feature = "cortex")]
+pub struct MeshNodeOverflowPushSink {
+    /// Reference to the local mesh. `Arc<MeshNode>` because
+    /// `MeshNode::call` is defined on `&Arc<Self>` — the
+    /// nRPC path needs the Arc to register the per-call
+    /// reply-channel subscription.
+    pub mesh: Arc<crate::adapter::net::MeshNode>,
+}
+
+#[cfg(feature = "cortex")]
+impl MeshNodeOverflowPushSink {
+    /// Wrap an existing mesh node as an overflow-push sink.
+    /// `Arc::clone` is cheap; one sink per operator scheduler
+    /// is the typical shape.
+    pub fn new(mesh: Arc<crate::adapter::net::MeshNode>) -> Self {
+        Self { mesh }
+    }
+}
+
+#[cfg(feature = "cortex")]
+#[async_trait]
+impl OverflowPushSink for MeshNodeOverflowPushSink {
+    async fn push(
+        &self,
+        hash: [u8; 32],
+        size_bytes: u64,
+        target_node_id: u64,
+    ) -> Result<(), BlobError> {
+        // Map an `OverflowPushAck::Rejected(reason)` /
+        // `OverflowPushAck::OpenChunkFailed` to a typed
+        // BlobError so the controller's `push_errors` counter
+        // gets bumped uniformly. `Accepted` returns Ok.
+        let ack = self
+            .mesh
+            .send_overflow_push(target_node_id, hash, size_bytes)
+            .await?;
+        match ack {
+            OverflowPushAck::Accepted => Ok(()),
+            OverflowPushAck::Rejected(reason) => Err(BlobError::Backend(format!(
+                "overflow push to {target_node_id:#x} rejected: {reason:?}"
+            ))),
+            OverflowPushAck::OpenChunkFailed => Err(BlobError::Backend(format!(
+                "overflow push to {target_node_id:#x} admitted but chunk open failed"
+            ))),
+        }
+    }
 }
 
 /// Sink trait for the actual push action. P3 wires the
@@ -1150,5 +1458,72 @@ mod tests {
         assert!(scope_covers(TopologyScope::Zone, TopologyScope::Zone));
         assert!(scope_covers(TopologyScope::Zone, TopologyScope::Region));
         assert!(scope_covers(TopologyScope::Zone, TopologyScope::Mesh));
+    }
+
+    // ========================================================================
+    // Wire types (P3) — postcard round-trip
+    //
+    // The receive side decodes `OverflowPush` from the nRPC payload and
+    // encodes `OverflowPushAck` back; the sender's
+    // `MeshNodeOverflowPushSink` does the inverse. Verify the encode +
+    // decode are total inverses for every typed variant so a sender +
+    // receiver on different builds can't observe wire-format divergence.
+    // ========================================================================
+
+    #[test]
+    fn overflow_push_request_round_trips_postcard() {
+        let req = OverflowPush {
+            blob_hash: [0xAA; 32],
+            size_bytes: 4 * (1 << 20),
+            sender_node_id: 0xDEAD_BEEF_u64,
+        };
+        let bytes = postcard::to_allocvec(&req).expect("encode");
+        let decoded: OverflowPush = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn overflow_push_ack_accepted_round_trips() {
+        let ack = OverflowPushAck::Accepted;
+        let bytes = postcard::to_allocvec(&ack).expect("encode");
+        let decoded: OverflowPushAck = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, ack);
+    }
+
+    #[test]
+    fn overflow_push_ack_rejected_carries_typed_reason() {
+        // Every `OverflowReject` variant round-trips inside
+        // the ack. Operators dashboard the typed reason on
+        // the sender side; the wire form must preserve it.
+        for reason in [
+            OverflowReject::NoStorageCap,
+            OverflowReject::NotParticipating,
+            OverflowReject::SenderNotOverflowing,
+            OverflowReject::Unhealthy,
+            OverflowReject::ScopeMismatch,
+            OverflowReject::InsufficientDisk,
+        ] {
+            let ack = OverflowPushAck::Rejected(reason);
+            let bytes = postcard::to_allocvec(&ack).expect("encode");
+            let decoded: OverflowPushAck = postcard::from_bytes(&bytes).expect("decode");
+            assert_eq!(decoded, ack, "ack with {:?} must round-trip", reason);
+        }
+    }
+
+    #[test]
+    fn overflow_push_ack_open_chunk_failed_round_trips() {
+        let ack = OverflowPushAck::OpenChunkFailed;
+        let bytes = postcard::to_allocvec(&ack).expect("encode");
+        let decoded: OverflowPushAck = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, ack);
+    }
+
+    #[test]
+    fn overflow_push_service_name_is_stable() {
+        // Pin the wire-level service-name token. A change here
+        // would silently break sender/receiver compatibility
+        // across builds (both pieces are gated by feature flag
+        // but ship in the same crate).
+        assert_eq!(OVERFLOW_PUSH_SERVICE, "dataforts.blob.overflow_push");
     }
 }

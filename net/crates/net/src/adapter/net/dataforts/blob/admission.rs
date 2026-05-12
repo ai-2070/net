@@ -292,7 +292,9 @@ pub enum OverflowVerdict {
 /// Reasons [`should_accept_overflow_from`] rejects an inbound
 /// push. Each maps to a distinct Prometheus counter label:
 /// `dataforts_blob_overflow_pushes_rejected_total{reason}`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Serializable so a receiver can carry the typed reason back
+/// to the sender in [`super::overflow::OverflowPushAck`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OverflowReject {
     /// Local node doesn't carry `dataforts.blob.storage`.
     NoStorageCap,
