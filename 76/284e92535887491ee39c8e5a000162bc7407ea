@@ -1,0 +1,27 @@
+net/crates/net/sdk-py/README.md
+  s_3a0a24a47d1a36::t_c33f65ae1eab7e 755-775,780-784,795,797,819,824-833
+net/crates/net/sdk-ts/README.md
+  s_3a0a24a47d1a36::t_c137a923ce45a8 895-918,923-926
+net/crates/net/README.md
+  s_3a0a24a47d1a36::t_71145898f11156 587,591-595,598-600,605-608,610-612,618-630,634,638,641-653,657
+net/crates/net/include/README.md
+  s_3a0a24a47d1a36::t_c5603104597643 615-623
+net/crates/net/sdk/README.md
+  s_3a0a24a47d1a36::t_51054531865b09 922-944,950-961,971-977,981-982,985-987,993-1002,1007,1014-1025,1034-1037,1040-1042
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "76284e92535887491ee39c8e5a000162bc7407ea",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
