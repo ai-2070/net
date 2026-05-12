@@ -140,6 +140,17 @@ pub struct PublishWithBlobReceipt {
 ///   published; callers can retry the durability wait via
 ///   [`MeshBlobAdapter::sync_blob`] or accept the lower
 ///   durability level and re-call with `BestEffort`.
+///
+///   Recovery contract: retry at the SAME durability level
+///   before falling back to a weaker one. `sync_blob` walks
+///   chunks sequentially and is idempotent — a mid-iteration
+///   failure leaves some chunks flushed and the rest not, but
+///   the second call re-walks all chunks and only the
+///   unflushed-yet ones do new I/O. Falling straight from
+///   `DurableOnLocal` to `BestEffort` after a partial sync
+///   would publish an event whose consumer can race the
+///   substrate's flush of the remaining chunks — pinning
+///   "retry same durability first" closes that window.
 /// - Mesh publish error — propagates as [`BlobError::Backend`].
 ///   The blob is stored + durable; only the event delivery
 ///   failed. Callers can retry the publish via

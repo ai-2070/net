@@ -196,15 +196,19 @@ impl<'a> BlobMigrationController<'a> {
     /// is what the most conservative publisher in the set would
     /// have wanted.
     pub fn candidates(&self) -> Vec<BlobMigrationCandidate> {
-        // Pass 1: walk every peer, collect (hash, node_id, caps, rate)
-        // tuples, AND aggregate the narrowest scope claims per hash
-        // across all peers that advertise it.
+        // Pass 1: walk every peer, record (node_id, hash, rate)
+        // tuples + aggregate the narrowest scope claim per hash.
+        // Cache each peer's caps once (NOT per heat tag) so a peer
+        // with N blob-heat tags doesn't force N clones of its full
+        // CapabilitySet into the intermediate buffer.
         struct ScopeFloor {
             gravity: Option<TopologyScope>,
             greedy: Option<TopologyScope>,
         }
-        let mut raw: Vec<(u64, [u8; 32], f64, CapabilitySet)> = Vec::new();
+        let mut raw: Vec<(u64, [u8; 32], f64)> = Vec::new();
         let mut floors: std::collections::HashMap<[u8; 32], ScopeFloor> =
+            std::collections::HashMap::new();
+        let mut peer_caps_cache: std::collections::HashMap<u64, CapabilitySet> =
             std::collections::HashMap::new();
 
         for node_id in self.capability_index.all_nodes() {
@@ -218,6 +222,7 @@ impl<'a> BlobMigrationController<'a> {
             let peer_gravity = GravityCapability::from_capability_set(&caps);
             let peer_greedy = GreedyCapability::from_capability_set(&caps);
 
+            let mut emitted_any = false;
             for tag in &caps.tags {
                 if let Some((hash, rate)) = parse_blob_heat_tag(tag) {
                     let entry = floors.entry(hash).or_insert(ScopeFloor {
@@ -236,14 +241,26 @@ impl<'a> BlobMigrationController<'a> {
                             None => peer_greedy.scope,
                         });
                     }
-                    raw.push((node_id, hash, rate, caps.clone()));
+                    raw.push((node_id, hash, rate));
+                    emitted_any = true;
                 }
+            }
+            if emitted_any {
+                peer_caps_cache.insert(node_id, caps);
             }
         }
 
         // Pass 2: emit candidates, applying the per-hash floor.
+        // One CapabilitySet clone per candidate at emission time
+        // (so each candidate carries its own owned, narrowed
+        // view); the per-peer cache above is the source of truth
+        // and was populated with exactly one snapshot per peer.
         let mut out = Vec::with_capacity(raw.len());
-        for (node_id, hash, rate, mut caps) in raw {
+        for (node_id, hash, rate) in raw {
+            let mut caps = match peer_caps_cache.get(&node_id) {
+                Some(c) => c.clone(),
+                None => continue, // shouldn't happen — defensive
+            };
             if let Some(floor) = floors.get(&hash) {
                 if let (Some(g), Some(gr)) = (floor.gravity, floor.greedy) {
                     narrow_scope_tags_in(&mut caps, g, gr);

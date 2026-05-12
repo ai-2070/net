@@ -48,8 +48,8 @@ Tagged `[B | H | M | L]`:
 | B-13  | M   | metrics      | `dataforts_blob_gc_pending_total` is `gauge`, violates naming          | ✅ (rename to `dataforts_blob_gc_pending`; existing assertions updated) |
 | B-14  | M   | metrics      | `escape_prometheus_label` omits `\r`                                   | ✅ (escape `\r` alongside `\n`; regression test extended) |
 | B-15  | M   | error model  | `BlobError::Backend("auth: ...")` catch-all for misconfig + 401        | ✅ (new `BlobError::Unauthorized(String)` variant; thread through admission + the three `*_authorized` adapter methods; FFI maps to `NET_ERR_BLOB_UNAUTHORIZED` (-120); tests tightened) |
-| B-16  | M   | blob mesh    | `sync_blob` partial-progress on failure with no rollback contract      | ⬜ |
-| B-17  | M   | migration    | `candidates()` clones full `CapabilitySet` per heat tag                | ⬜ |
+| B-16  | M   | blob mesh    | `sync_blob` partial-progress on failure with no rollback contract      | ✅ (doc-only — recovery contract pinned: retry at same durability before falling back to weaker level; sync_blob is idempotent so a retry is safe) |
+| B-17  | M   | migration    | `candidates()` clones full `CapabilitySet` per heat tag                | ✅ (cache peer caps once per peer in pass 1; clone once per candidate at emission rather than per heat tag) |
 | B-18  | L   | blob ref     | Manifest postcard decode allocates `Vec<ChunkRef>` before cap-check    | ⬜ |
 | B-19  | L   | gravity      | `with_cap(0)` "disables bound" is a footgun on typo                    | ⬜ |
 | B-20  | L   | capability   | `parse_wire` silently drops unknown scope tokens → default `Mesh`      | ⬜ |
