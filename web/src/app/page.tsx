@@ -4185,22 +4185,22 @@ const CAPABILITY_STRIP: ReadonlyArray<{
     num: "mesh.storage.1",
     name: "Overflow",
     isNew: true,
-    body: "Storage doesn't run out. When one disk fills up, the rest catch the spillover.",
+    body: "storage doesn't run out. when one disk fills up, the rest catch the spillover.",
   },
   {
     num: "mesh.storage.2",
     name: "Data Gravity",
-    body: "Files settle near the people who use them. Nobody moves them. They just end up there.",
+    body: "files settle near the people who use them. mobody moves them. they just end up there.",
   },
   {
     num: "mesh.storage.3",
     name: "Read-your-writes",
-    body: "If you wrote it, you can read it. Right now. No waiting on the cluster.",
+    body: "if you wrote it, you can read it. right now. no waiting on the cluster.",
   },
   {
     num: "mesh.storage.4",
     name: "BlobRef",
-    body: "One handle gets you any file. The mesh finds it — wherever it lives.",
+    body: "one handle gets you any file. the mesh finds it — wherever it lives.",
   },
 ];
 
