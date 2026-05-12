@@ -572,6 +572,12 @@ mod tests {
         assert_eq!(read_back, original);
     }
 
+    // The `CapabilitySet::with_*` typed setters live behind the
+    // `dataforts` feature flag (they take typed dataforts
+    // projections as arguments). The test calls them directly, so
+    // gate it on the feature too — without it, the methods don't
+    // exist and the test won't compile.
+    #[cfg(feature = "dataforts")]
     #[test]
     fn capability_set_with_typed_builders_round_trip() {
         // Compose all three typed projections via the

@@ -10059,6 +10059,13 @@ mod chain_helper_tests {
         }
     }
 
+    // The `MeshNode::blob_hex` / `is_blob_heat_for` /
+    // `replace_blob_heat_tags` helpers live behind the `dataforts`
+    // feature flag (they back the PR-5j-c blob-heat tag emission
+    // path on the production wire). Gate the tests so a build
+    // without the feature doesn't try to call non-existent
+    // methods.
+    #[cfg(feature = "dataforts")]
     #[test]
     fn blob_hex_is_lowercase_64_chars() {
         let zero = [0u8; 32];
@@ -10074,6 +10081,7 @@ mod chain_helper_tests {
         assert_eq!(hex.len(), 64);
     }
 
+    #[cfg(feature = "dataforts")]
     #[test]
     fn is_blob_heat_for_matches_blob_body_only() {
         let mut h = [0u8; 32];
@@ -10092,6 +10100,7 @@ mod chain_helper_tests {
         assert!(!MeshNode::is_blob_heat_for(&chain_tag, &hex));
     }
 
+    #[cfg(feature = "dataforts")]
     #[test]
     fn replace_blob_heat_tags_round_trip() {
         let mut h = [0u8; 32];
