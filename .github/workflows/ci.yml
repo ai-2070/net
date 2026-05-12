@@ -93,6 +93,8 @@ jobs:
         run: cargo test --test integration_netdb --features netdb
       - name: nRPC predicate-header integration
         run: cargo test --test integration_nrpc_predicate_header --features cortex
+      - name: Dataforts blob 3-node tests
+        run: cargo test --test net_blob_cli --features dataforts
 
   loom-tests:
     name: Loom concurrency models
