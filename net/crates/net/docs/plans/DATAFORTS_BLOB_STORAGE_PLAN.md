@@ -350,26 +350,39 @@ Greedy pulls **only blobs referenced by artifacts it already pulled**, not arbit
 - A node with `dataforts_greedy.proximity = 0` is functionally greedy-disabled for blobs even when `enabled = true`.
 - `dataforts_greedy.scope` is a hard boundary — `scope == Zone` means greedy doesn't pull blobs whose publisher is in a different zone, regardless of heat score.
 
-Counters: `dataforts_greedy_blob_pulls_admitted_total` / `…_rejected_total{reason}` where `reason ∈ { Scope, Proximity, NoStorageCap, GreedyDisabled, DiskPressure }`.
+Counters: `dataforts_greedy_blob_pulls_admitted_total` / `…_rejected_total{reason}` where `reason ∈ { NoStorageCap, GreedyDisabled, ProximityZero, Unhealthy, ScopeMismatch }`. Plus `dataforts_greedy_blob_prefetches_total{outcome ∈ { ok, err }}` once the runtime acts on an admit verdict via `BlobAdapter::prefetch` (PR-5i).
 
 ### G-2 — Gravity (Phase 4)
 
-Heat applies to blobs the same way it applies to chains:
+Heat applies to blobs the same way it applies to chains, but with its own data structures because the key shape differs (chain heat keys on the chain's `u64` `origin_hash`; blob heat keys on the chunk's 32-byte BLAKE3 hash).
 
-- Frequent `fetch` / `fetch_range` calls on a blob bump its `HeatCounter`.
-- Threshold-crossing emissions stamp `heat:<hex>=<rate>` onto the blob's existing capability advertisement (same code path as chain heat — blobs ride the `causal:` shape).
-- Hot blobs attract additional replicas; cold blobs decay and may reduce replica count to `replication_factor - 1` under disk pressure.
+The shipped pipeline (PR-5j-a..d):
+
+1. **`BlobHeatRegistry`** ([`dataforts::gravity::BlobHeatRegistry`](../../src/adapter/net/dataforts/gravity/counter.rs)) — mirrors `HeatRegistry` keyed on `[u8; 32]`. Same LRU + cap discipline; same half-life decay.
+2. **Fetch-path bump** — `MeshBlobAdapter::with_blob_heat(registry, half_life)` opts the adapter into bumping heat on every successful `fetch` / `fetch_range`. Only chunks the call actually touched bump (range fetches don't bump untouched chunks).
+3. **Tag emission** — `MeshBlobAdapter::tick_blob_heat(policy, sink)` walks the registry, applies decay, and routes each `Emit { rate }` / `Withdraw` decision through the `BlobHeatSink` trait. `MeshNode` implements the sink: the production wire form is a `heat:blob:<hex64>=<rate>` reserved tag added to the local `CapabilitySet` + rebroadcast via `announce_capabilities`. The `blob:` body sub-prefix keeps the tag disjoint from chain heat.
+4. **Migration controller** (G-3 below) consumes those tags.
 
 **Capability gating** (new in v0.2):
 
 - A node with `dataforts_gravity.enabled = false` doesn't pull migrating blobs, even if its heat score would otherwise win the placement.
 - `dataforts_gravity.scope` bounds the migration radius — `scope == Region` means a hot blob never drifts out of its source region, even when a higher-RTT node is the heat source. Multi-region deployments configure `scope = Region` by default; multi-cloud configures `scope = Zone` to keep migration off the WAN.
 - `dataforts_gravity.proximity` weights the score-based migration decision inside the allowed scope; `0` disables migration on this node.
-- Gravity-side replica reduction (cold blobs trim to `replication_factor - 1`) respects the `blob.storage` gate — a node that doesn't carry blobs at all isn't a candidate to *lose* one either.
 
 ### G-3 — Migration
 
-Blob replicas migrate under Phase 4 gravity exactly like chain replicas. No special cases. The same `ReplicationCoordinator` 4-state machine drives placement transitions; replica withdrawal under disk pressure follows the existing `UnderCapacity::Withdraw` path.
+Per-node pull, not centralized push. Each node runs `drive_blob_migration_tick(local_caps, capability_index, adapter, size_resolver)` at the gravity-tick cadence ([`dataforts::blob::migration`](../../src/adapter/net/dataforts/blob/migration.rs)):
+
+1. Walk peers in `capability_index`, parse each `heat:blob:<hex>=<rate>` tag via `parse_blob_heat_tag`.
+2. For each candidate `(hash, publisher_caps, rate)`, look up the chunk's wire size via the operator-supplied `size_resolver` callback.
+3. Run [`should_migrate_blob_to`](../../src/adapter/net/dataforts/blob/admission.rs) — the PR-5a primitive — against `local_caps + publisher_caps + size_bytes`. Verdict shape mirrors G-1's `should_pull_blob`.
+4. On admit, call [`BlobAdapter::prefetch`](../../src/adapter/net/dataforts/blob/adapter.rs) (PR-5i) with a `BlobRef::Small` constructed from `(hash, size)`. The adapter opens the chunk's content-addressed channel against the local Redex with replication config armed; the per-chunk replication runtime pulls the bytes from any holder advertising `causal:<hex>`.
+
+`drive_blob_migration_tick` returns a `BlobMigrationTickReport` with per-reason counters (`admitted`, `rejected_no_storage`, `rejected_gravity_disabled`, `rejected_proximity_zero`, `rejected_unhealthy`, `rejected_scope_mismatch`, `rejected_insufficient_disk`, `skipped_unknown_size`, `prefetch_errors`) so operators can dashboard the loop without hand-coding per-reason metrics.
+
+The originally-considered alternative — driving migration through the `ReplicationCoordinator`'s 4-state machine — is *not* what shipped. The controller is decoupled from chain replication: chain replicas migrate under the existing coordinator; blob chunks migrate by opening additional chunk channels and letting their independent per-channel coordinators do their thing. The two paths share replication primitives but not control flow.
+
+Manifest-aware migration (recursive prefetch of every constituent chunk of a `BlobRef::Manifest`) is a documented refinement — see the "Manifest-aware migration" item in the deferred list below.
 
 ### G-4 — Placement
 
@@ -507,47 +520,63 @@ Lock each via a single-line decision in the v0.2 release notes when the implemen
 
 ## Effort
 
-Five PRs in dependency order. Each is self-contained and can land independently behind the `dataforts` Cargo feature.
+The plan originally projected five PRs in dependency order (1 / 2 / 1 / 2 / 1–2 weeks each, 7–8 weeks total). The actual shipping shape ended up finer-grained — five became sixteen because several scope items inside the original PRs warranted their own commit + test pass. The per-commit summary lives in the [Shipping status](#shipping-status) table below; this section keeps the *planning units* the original effort estimate priced.
 
-### PR-1 — `BlobRef::Manifest` + chunking pure-logic (1 week)
+### Planning unit P1 — `BlobRef::Manifest` + chunking pure-logic (1 week)
 
 - `BlobRef::Manifest` variant + encode/decode round-trip.
 - Chunking algorithm + fixed-threshold split.
 - `ChunkRef` type + manifest body encoding (postcard + version byte).
 - Unit tests for chunk-index range math + idempotency.
 
-### PR-2 — `MeshBlobAdapter` + capability extension (2 weeks)
+**Shipped as:** PR-1.
+
+### Planning unit P2 — `MeshBlobAdapter` + capability extension (2 weeks)
 
 - `MeshBlobAdapter` impl against `Redex` + `MeshNode`.
 - `store` / `store_stream` / `fetch` / `fetch_range` / `delete` / `stat`.
 - `BlobStat` shape across bindings.
-- Reuses RedEX replication; **no new replication code** lands in this PR (gating discipline).
+- Reuses RedEX replication; **no new replication code** lands in this unit (gating discipline).
 - `BlobCapability` / `GreedyCapability` / `GravityCapability` / `TopologyScope` types land on `CapabilitySet`; postcard wire-compat with v0.15 nodes via tolerated trailing fields.
 - `Artifact::Blob` variant on `PlacementFilter`; `StandardPlacement::placement_score(&Artifact::Blob, node)` factors in `blob.storage` / `disk_free_gb` / health tag / failure-domain tags / proximity.
 - Conformance suite extension (T-4).
 
-### PR-3 — `publish_with_blob` + durability (1 week)
+**Shipped as:** PR-2a (adapter + delete/stat trait) + PR-2b (capability extension + `Artifact::Blob`). The split kept each commit's diff under ~600 lines.
+
+### Planning unit P3 — `publish_with_blob` + durability (1 week)
 
 - `BlobDurability` enum + waiting semantics.
 - Atomicity contract: store → wait → publish, with documented failure modes.
 - Integration tests against multi-node setup.
 
-### PR-4 — GC + pinning + operator surface (2 weeks)
+**Shipped as:** PR-3.
 
-- Refcount sources (chain folds, CortEX, query, scanner).
-- Sweep rules + retention floor + pin / unpin.
-- `net blob` CLI.
-- Prometheus metrics.
-- Health gate (`blob-storage-unhealthy` capability tag).
+### Planning unit P4 — GC + pinning + operator surface (2 weeks)
 
-### PR-5 — Dataforts integration + DST (1–2 weeks)
+- Refcount table + sweep rules + retention floor + pin / unpin (PR-4a).
+- Prometheus metrics + health gate (`blob-storage-unhealthy` capability tag) (PR-4a).
+- Refcount source wiring — greedy as the first chain-fold source (PR-5h, retrospectively part of this unit).
+- `net blob` CLI — *deferred*; no existing CLI bin in `net/crates/net` and the design depends on operator-vs-developer tool framing.
 
-- Greedy / gravity / placement / migration / RYW / auth wiring (G-1 through G-6).
-- Capability-gated admission paths — greedy + gravity respect `enabled` / `scope` / `proximity` per node.
-- DST harness extensions (T-3) including mixed-capability cluster scenarios (compute-only nodes refusing blob replicas, cross-region scope enforcement, proximity-weighted convergence).
-- Cross-binding fixtures (T-5).
+**Shipped as:** PR-4a + PR-5h. CLI deferred (see [Still deferred](#still-deferred--items-that-warrant-their-own-design-step)).
 
-**Total: 7–8 weeks focused.** Parallelism opportunities: PR-2 and PR-4's CLI work; PR-3 and PR-5's DST work. Worst-case sequential: 8 weeks.
+### Planning unit P5 — Dataforts integration + DST (1–2 weeks → 4–5 weeks actual)
+
+The original 1–2 week estimate undersold this unit by 2-3×. Greedy / gravity / placement / migration / RYW / auth wiring (G-1 through G-6) plus the supporting infrastructure expanded into eleven commits:
+
+- **Decision primitives (G-1/G-2/G-3/G-6):** `should_pull_blob`, `should_migrate_blob_to`, `auth_allows_blob_op` — PR-5a.
+- **G-6 wiring:** `MeshBlobAdapter::with_auth_guard` + `pin_authorized` / `unpin_authorized` / `delete_chunk_authorized` — PR-5b.
+- **G-1 wiring:** `dispatch_event` runs `should_pull_blob` after admission + bumps the blob-pull counter family — PR-5c.
+- **G-1 DST (T-3):** mixed-capability + cross-scope e2e tests — PR-5d, PR-5e.
+- **Plan doc shipping-status retrospective** — PR-5f.
+- **Chain-caps lookup refactor:** `CapabilityIndex::get_by_origin_hash` side index — PR-5g. Bumped from a "documented limitation" in PR-5e to an actual fix because the deterministic G-1 scope-mismatch reject e2e needed it.
+- **Typed capability setters** (`with_blob_capability` / `with_greedy_capability` / `with_gravity_capability`) — PR-5k.
+- **G-1 action wiring (PR-5i):** `BlobAdapter::prefetch` trait method + `MeshBlobAdapter` opens chunk channels with replication; greedy spawns prefetch on G-1 admit.
+- **G-2/G-3 wiring (PR-5j-series):** `BlobHeatRegistry` + fetch-path bumps (5j-a/b), `heat:blob:<hex>=<rate>` emission via `BlobHeatSink` (5j-c), and the `BlobMigrationController` + `drive_blob_migration_tick` consumer (5j-d).
+
+**Shipped as:** PR-5a..5k (excluding 5j-letters) + PR-5j-a/b/c/d. Cross-binding fixtures (T-5) and multi-node prefetch / migration e2e (3-node DST) remain deferred — see [Still deferred](#still-deferred--items-that-warrant-their-own-design-step).
+
+**Total: ~9 weeks actual** (vs. 7–8 weeks projected). The overshoot came almost entirely from P5: G-1..G-6 looked like one wiring pass but turned into eleven because (a) the chain_caps lookup was wrong-shaped under cache holders advertising `causal:<hex>` — needed a side-index refactor; (b) the gravity migration loop needed its own data structures (blob-heat registry, tag emission, controller) rather than riding the chain `ReplicationCoordinator`; (c) every wiring step landed with full unit + integration tests rather than a "wire it + test later" sequence. The slowdown was a deliberate testing trade — landing each step behind green gates kept the v0.2 surface debuggable instead of forcing a single big-bang integration PR.
 
 ---
 
