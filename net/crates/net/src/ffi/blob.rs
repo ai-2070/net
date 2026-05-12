@@ -28,11 +28,16 @@ use tokio::runtime::Runtime;
 use crate::adapter::net::behavior::TopologyScope;
 use crate::adapter::net::dataforts::{
     global_blob_adapter_registry, publish_blob, resolve_payload, BlobAdapter,
-    BlobError as InnerBlobError, BlobRef as InnerBlobRef, FileSystemAdapter,
+    BlobError as InnerBlobError, FileSystemAdapter,
 };
+// `InnerBlobRef` is only decoded inside the `MeshBlobAdapter`
+// store/fetch/exists entry points, which themselves require the
+// `dataforts + netdb + redex-disk` triple. Without the triple,
+// the import is unused and `-D warnings` fails CI.
 #[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
 use crate::adapter::net::dataforts::{
-    MeshBlobAdapter as InnerMeshBlobAdapter, OverflowConfig as InnerOverflowConfig,
+    BlobRef as InnerBlobRef, MeshBlobAdapter as InnerMeshBlobAdapter,
+    OverflowConfig as InnerOverflowConfig,
 };
 
 use super::NetError;
