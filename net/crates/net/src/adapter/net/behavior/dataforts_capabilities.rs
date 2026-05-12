@@ -123,6 +123,18 @@ pub struct BlobCapability {
     /// scoring (prefer nodes with more free space). Updated on
     /// heartbeat cadence; values older than one cadence are
     /// stale.
+    ///
+    /// **Eventually consistent.** Two independent placement
+    /// schedulers reading the same heartbeat-old value can both
+    /// decide to place onto the same candidate — the hard-
+    /// constraint check in `StandardPlacement::placement_score`
+    /// is correct for the single-scheduler case but does not
+    /// reserve capacity. Deployments running multiple schedulers
+    /// against shared candidates must route placement through a
+    /// single coordinator when the requested size approaches
+    /// disk_free_gb, or accept that races can co-place blobs
+    /// whose combined footprint exceeds the candidate's free
+    /// space.
     pub disk_free_gb: u64,
 }
 

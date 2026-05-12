@@ -212,7 +212,7 @@ impl BlobRefcountTable {
     }
 
     /// Total count of hashes with `refcount == 0`. Exposed for
-    /// `dataforts_blob_gc_pending_total` — operators see how much
+    /// `dataforts_blob_gc_pending` — operators see how much
     /// the sweep would reclaim if every other condition were
     /// satisfied.
     pub fn zero_refcount_count(&self) -> usize {

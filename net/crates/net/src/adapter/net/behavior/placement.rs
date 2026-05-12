@@ -573,6 +573,22 @@ impl<'a> PlacementFilter for StandardPlacement<'a> {
                         return None;
                     }
                     let required_gb = size_bytes.div_ceil(1 << 30);
+                    // `disk_free_gb` is the target's last-heartbeat-
+                    // observed free space. It is *eventually
+                    // consistent* — two independent schedulers may
+                    // see the same value and both decide to place
+                    // onto the same candidate. The hard-constraint
+                    // here keeps placements correct in the single-
+                    // scheduler case; deployments running multiple
+                    // schedulers against the same candidate set must
+                    // route the placement decision through a single
+                    // coordinator when `required_gb > disk_free_gb /
+                    // 2`, or accept that races can co-place blobs
+                    // whose combined size exceeds the candidate's
+                    // disk. Scope / proximity / intent axes above are
+                    // pure tag-set logic and deterministic across
+                    // schedulers — this is the only axis with this
+                    // caveat.
                     if blob_caps.disk_free_gb < required_gb {
                         return None;
                     }

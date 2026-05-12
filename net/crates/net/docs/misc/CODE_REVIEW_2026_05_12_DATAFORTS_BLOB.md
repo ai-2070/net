@@ -43,10 +43,10 @@ Tagged `[B | H | M | L]`:
 | B-8   | H   | cli          | `net-blob get --out` has no symlink / traversal guard                  | ✅ (use `OpenOptions::create_new(true)` so an existing path or symlink errors; regression test asserts the CLI preserves an existing file at the output path) |
 | B-9   | M   | greedy       | `set_blob_refcount_table` swap leaks +1's on prior table               | ✅ (swap and clear both decrement the outgoing table for every shadow-set hash; regression tests pin the balance) |
 | B-10  | M   | greedy       | `chain_blob_refs` shadow set unbounded per channel                     | ✅ (BoundedShadowSet wrapper with `MAX_TRACKED_BLOBS_PER_CHANNEL = 8192`; oldest entry evicts on overflow and the refcount is decremented) |
-| B-11  | M   | placement    | `disk_free_gb` axis can double-place under heartbeat staleness         | ⬜ |
-| B-12  | M   | blob mesh    | `MeshBlobAdapter::fetch` allocates `total_size as usize` upfront       | ⬜ |
-| B-13  | M   | metrics      | `dataforts_blob_gc_pending_total` is `gauge`, violates naming          | ⬜ |
-| B-14  | M   | metrics      | `escape_prometheus_label` omits `\r`                                   | ⬜ |
+| B-11  | M   | placement    | `disk_free_gb` axis can double-place under heartbeat staleness         | ✅ (doc-only — eventually-consistent caveat called out on both `disk_free_gb` field and the placement_score hard-constraint) |
+| B-12  | M   | blob mesh    | `MeshBlobAdapter::fetch` allocates `total_size as usize` upfront       | ✅ (drop the upfront capacity hint — Vec grows as needed) |
+| B-13  | M   | metrics      | `dataforts_blob_gc_pending_total` is `gauge`, violates naming          | ✅ (rename to `dataforts_blob_gc_pending`; existing assertions updated) |
+| B-14  | M   | metrics      | `escape_prometheus_label` omits `\r`                                   | ✅ (escape `\r` alongside `\n`; regression test extended) |
 | B-15  | M   | error model  | `BlobError::Backend("auth: ...")` catch-all for misconfig + 401        | ⬜ |
 | B-16  | M   | blob mesh    | `sync_blob` partial-progress on failure with no rollback contract      | ⬜ |
 | B-17  | M   | migration    | `candidates()` clones full `CapabilitySet` per heat tag                | ⬜ |

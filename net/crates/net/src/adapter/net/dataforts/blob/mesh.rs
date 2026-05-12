@@ -737,9 +737,21 @@ impl BlobAdapter for MeshBlobAdapter {
         let result = match blob_ref {
             BlobRef::Small { hash, .. } => self.fetch_chunk(hash).await,
             BlobRef::Manifest {
-                chunks, total_size, ..
+                chunks,
+                total_size: _,
+                ..
             } => {
-                let mut out = Vec::with_capacity(*total_size as usize);
+                // Let Vec grow as we extend. The declared
+                // `total_size` is bounded by `BLOB_REF_MAX_SIZE`
+                // (16 GiB) — pre-allocating that on a fetch of a
+                // hostile manifest forces an upfront allocation
+                // regardless of how many bytes actually arrive,
+                // and on 32-bit targets `as usize` truncates
+                // silently. Callers needing streaming on large
+                // blobs should use the substrate's per-chunk
+                // fetch path; this bulk-fetch hits the same
+                // memory cost on first byte either way.
+                let mut out: Vec<u8> = Vec::new();
                 let mut err: Option<BlobError> = None;
                 for chunk in chunks {
                     match self.fetch_chunk(&chunk.hash).await {
@@ -1432,7 +1444,7 @@ mod tests {
         let blob = small_ref_for(&payload);
         adapter.store(&blob, &payload).await.unwrap();
         let text = adapter.prometheus_text();
-        assert!(text.contains("dataforts_blob_gc_pending_total"));
+        assert!(text.contains("dataforts_blob_gc_pending"));
         assert!(text.contains("dataforts_blobs_stored_total"));
     }
 

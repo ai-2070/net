@@ -181,9 +181,9 @@ impl BlobMetricsSnapshot {
             label, self.gc_swept_total
         ));
         out.push_str(&format!(
-            "# HELP dataforts_blob_gc_pending_total Zero-refcount blobs waiting on retention floor.\n\
-             # TYPE dataforts_blob_gc_pending_total gauge\n\
-             dataforts_blob_gc_pending_total{{adapter=\"{}\"}} {}\n",
+            "# HELP dataforts_blob_gc_pending Zero-refcount blobs waiting on retention floor.\n\
+             # TYPE dataforts_blob_gc_pending gauge\n\
+             dataforts_blob_gc_pending{{adapter=\"{}\"}} {}\n",
             label, gc_pending_total
         ));
         out.push_str(&format!(
@@ -203,11 +203,17 @@ impl BlobMetricsSnapshot {
 }
 
 /// Escape a string for use as a Prometheus label value, per the
-/// text-exposition spec: backslash, double-quote, and newline
-/// each get a backslash prefix. Other characters are passed
-/// through unchanged. Used by the metrics emitter to defang
-/// operator-supplied `adapter_id` values that could otherwise
-/// inject new metric lines into the scrape body.
+/// text-exposition spec: backslash, double-quote, newline, and
+/// carriage return each get a backslash prefix. Other characters
+/// are passed through unchanged. Used by the metrics emitter to
+/// defang operator-supplied `adapter_id` values that could
+/// otherwise inject new metric lines into the scrape body.
+///
+/// `\r` is escaped in addition to the spec-required set because
+/// a raw CR before LF is a legitimate line terminator on
+/// Windows-aware downstream parsers; suppressing it alone would
+/// allow CRLF-shaped injection through an operator-supplied
+/// adapter_id even with `\n` neutered.
 fn escape_prometheus_label(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -215,6 +221,7 @@ fn escape_prometheus_label(input: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
             other => out.push(other),
         }
     }
@@ -348,7 +355,7 @@ mod tests {
         assert!(text.contains("dataforts_blobs_fetched_total{adapter=\"my-adapter\"} 1"));
         assert!(text.contains("dataforts_blob_bytes_stored_total{adapter=\"my-adapter\"} 1024"));
         assert!(text.contains("dataforts_blob_gc_swept_total{adapter=\"my-adapter\"} 2"));
-        assert!(text.contains("dataforts_blob_gc_pending_total{adapter=\"my-adapter\"} 7"));
+        assert!(text.contains("dataforts_blob_gc_pending{adapter=\"my-adapter\"} 7"));
         assert!(text.contains("dataforts_blob_disk_capacity_bytes{adapter=\"my-adapter\"}"));
         assert!(text.contains("dataforts_blob_disk_used_bytes{adapter=\"my-adapter\"}"));
     }
@@ -422,14 +429,21 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn prometheus_label_escapes_backslash_quote_newline() {
+    fn prometheus_label_escapes_backslash_quote_newline_carriage_return() {
         // The three characters the Prometheus text-exposition spec
-        // requires escaping in label values.
+        // requires escaping in label values, plus `\r` (a raw CR
+        // before LF is a legitimate line terminator on Windows-
+        // aware parsers, so we escape it too to close the CRLF-
+        // injection surface).
         assert_eq!(escape_prometheus_label(r"a\b"), r"a\\b");
         assert_eq!(escape_prometheus_label(r#"a"b"#), r#"a\"b"#);
         assert_eq!(escape_prometheus_label("a\nb"), r"a\nb");
+        assert_eq!(escape_prometheus_label("a\rb"), r"a\rb");
         // Compound case: every special character in one value.
-        assert_eq!(escape_prometheus_label("a\\b\"c\nd"), "a\\\\b\\\"c\\nd");
+        assert_eq!(
+            escape_prometheus_label("a\\b\"c\nd\re"),
+            "a\\\\b\\\"c\\nd\\re"
+        );
         // Plain ASCII passes through unchanged.
         assert_eq!(escape_prometheus_label("mesh-prod"), "mesh-prod");
     }
