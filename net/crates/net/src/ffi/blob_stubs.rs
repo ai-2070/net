@@ -12,15 +12,22 @@
 //! definitions for the symbols Go and other cgo consumers rely
 //! on. Each stub returns `NET_ERR_FEATURE_NOT_BUILT` (or null
 //! for pointer-typed returns) so callers route to a clean typed
-//! error rather than a load-time crash. Compiled iff the
-//! feature triple is OFF; when the triple is on, the real
-//! implementations in `ffi::blob` provide the symbols and this
-//! module is empty.
+//! error rather than a load-time crash.
+//!
+//! Active only when the cortex surface (`netdb + redex-disk`,
+//! which provides `RedexHandle` and `NET_ERR_FEATURE_NOT_BUILT`)
+//! is compiled in but `dataforts` is off — that's the
+//! configuration where a libnet cdylib exposes redex / cortex
+//! symbols to Go, the Go `blob.go` links the blob symbols
+//! unconditionally, but the dataforts feature wasn't selected.
+//! Builds without `netdb + redex-disk` have no cortex surface
+//! either; Go consumers in that shape can't link any of the
+//! redex / mesh / blob entry points and the stub set is moot.
 //!
 //! Mirrors the convention `ffi::cortex` already uses for the
 //! `net_redex_enable_greedy_dataforts` / `_gravity_*` symbols.
 
-#![cfg(not(all(feature = "dataforts", feature = "netdb", feature = "redex-disk")))]
+#![cfg(all(feature = "netdb", feature = "redex-disk", not(feature = "dataforts")))]
 
 use std::ffi::{c_char, c_int};
 use std::ptr;
