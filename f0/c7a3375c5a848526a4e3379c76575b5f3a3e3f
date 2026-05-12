@@ -1,0 +1,135 @@
+net/crates/net/tests/integration_redex.rs
+  s_3a0a24a47d1a36::t_35e3278142b620 617-623,625-629,631,635,640,647-649,654-655,670
+net/crates/net/bindings/python/src/identity.rs
+  s_3a0a24a47d1a36::t_a387f0884d4505 344-346,348
+  s_3a0a24a47d1a36::t_77d7e56d63ce7a 122
+net/crates/net/bindings/node/src/identity.rs
+  s_3a0a24a47d1a36::t_834b6ddff95170 381-385,387
+  s_3a0a24a47d1a36::t_ae6d7a68d1ecda 117
+  s_3a0a24a47d1a36::t_e58a0afd15dd4a 308-310,316
+net/crates/net/src/adapter/net/mod.rs
+  s_3a0a24a47d1a36::t_905e17671e95d3 85-87
+go/net.h
+  s_3a0a24a47d1a36::t_59be8d8a225d79 704-707
+net/crates/net/src/adapter/net/channel/name.rs
+  s_3a0a24a47d1a36::t_7affe9295baba9 138-148,151-153,155,159,163,184-186,188,191-200,205
+  s_3a0a24a47d1a36::t_163a19eaf9aab9 4-17,25-31
+  s_3a0a24a47d1a36::t_1d7baff53f338d 54,56-58,60,64-72
+  s_3a0a24a47d1a36::t_9cd334807bad47 217-219,221-225,235,240,260-263,276-278,285-294,307-308
+  s_3a0a24a47d1a36::t_5b80111bc93b79 542-583
+net/crates/net/src/adapter/net/subnet/gateway.rs
+  s_3a0a24a47d1a36::t_0bef6f5c8bfc91 227-230,232
+  s_3a0a24a47d1a36::t_bb229b93b94a22 129-136,139
+  s_3a0a24a47d1a36::t_a0bb1b05e9cd13 418-423,425-428,432-433,436,442-447,454,458
+net/crates/net/src/adapter/net/mesh.rs
+  s_3a0a24a47d1a36::t_0772c3e3f91256 60
+  s_3a0a24a47d1a36::t_f758a96da508a8 267-277,279-281,1095-1105,1107-1109
+  s_3a0a24a47d1a36::t_54d3494fda8ac0 4306,4334,4356
+  s_3a0a24a47d1a36::t_1743a45a02eacb 6094
+  s_3a0a24a47d1a36::t_65de28a8960646 265-266,1093-1094
+  s_3a0a24a47d1a36::t_9cef6cc75662ce 4357
+  s_3a0a24a47d1a36::t_2b6962c7ffff25 6156-6163
+  s_3a0a24a47d1a36::t_53a623fa07e15e 3750-3755,3757-3764,3766-3767,3770-3776
+  s_3a0a24a47d1a36::t_8acd1abd7d3211 4309-4324,4336-4347,4351,4358-4360
+net/crates/net/src/adapter/net/channel/config.rs
+  s_3a0a24a47d1a36::t_e5becba8b6c5da 159-164,171-176,196
+  s_3a0a24a47d1a36::t_170e1695daea27 236,238-239,242,245-247,249-250,253,264-274
+  s_3a0a24a47d1a36::t_7759196c7089c9 560-567,571-572,575,581-585,593-594,596-605,607
+  s_3a0a24a47d1a36::t_c8333022973b87 617-627,632-633,636,642-646,651-656,660,663-666
+  s_3a0a24a47d1a36::t_ae90d959d6e75f 321,324-327,331,348,352-353
+  s_3a0a24a47d1a36::t_9167441f9598db 7
+  s_3a0a24a47d1a36::t_c0902cf2baa875 370
+net/crates/net/src/adapter/net/channel/guard.rs
+  s_3a0a24a47d1a36::t_83c4b1a7e94277 124
+  s_3a0a24a47d1a36::t_65d8c74017fa49 41
+  s_3a0a24a47d1a36::t_786c39db3fdb75 437-438,440
+  s_3a0a24a47d1a36::t_f333765cd083e1 345-349
+  s_3a0a24a47d1a36::t_9704753fc2eb69 224
+  s_3a0a24a47d1a36::t_a49222849facc8 508,515
+  s_3a0a24a47d1a36::t_1f077a699cacb7 322
+  s_3a0a24a47d1a36::t_a47bd14c231965 735
+  s_3a0a24a47d1a36::t_c75a615a18e8c8 675,685,699
+  s_3a0a24a47d1a36::t_4c159a322982a8 13-21
+  s_3a0a24a47d1a36::t_5b6fa0763f63d9 109
+  s_3a0a24a47d1a36::t_81256323151183 146
+  s_3a0a24a47d1a36::t_2f1854ee139834 279
+  s_3a0a24a47d1a36::t_55d26e2a00fdef 307
+  s_3a0a24a47d1a36::t_c5a237495fdc73 543,548
+  s_3a0a24a47d1a36::t_803f9b65f5c4d2 596-602,605-608,618-621,629,631-632,638-651
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_3a0a24a47d1a36::t_681a022d8318d0 70-71,73-79,89-94
+net/crates/net/bindings/node/index.d.ts
+  s_3a0a24a47d1a36::t_2058cea6badabc 2420-2422
+  s_3a0a24a47d1a36::t_eea0b7ed26dd03 1508-1512
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md
+  s_3a0a24a47d1a36::t_f93dcff6aa8210 58
+go/identity.go
+  s_3a0a24a47d1a36::t_9d5b59d25d5ccc 492-495,498,503
+  s_3a0a24a47d1a36::t_403f85d18b1717 359
+net/crates/net/include/net.go.h
+  s_3a0a24a47d1a36::t_81aad0e250a464 706-709
+go/cortex_test.go
+  s_3a0a24a47d1a36::t_fe2f5976206185 10
+net/crates/net/src/adapter/net/channel/mod.rs
+  s_3a0a24a47d1a36::t_b704aafe064a81 19-22
+net/crates/net/src/adapter/net/identity/token.rs
+  s_3a0a24a47d1a36::t_17094b85e782c4 1911
+  s_3a0a24a47d1a36::t_311cc3553d3aa9 2180-2182,2184
+  s_3a0a24a47d1a36::t_1b89669354f314 2015,2030
+  s_3a0a24a47d1a36::t_c0724dadaab0de 1739
+  s_3a0a24a47d1a36::t_2a53d37686101a 552
+  s_3a0a24a47d1a36::t_6eea937d033a3a 36-37
+  s_3a0a24a47d1a36::t_81f3462a44cc15 91-92,104
+  s_3a0a24a47d1a36::t_8d9ebd7ba58078 211
+  s_3a0a24a47d1a36::t_5648c4813c5dc5 1838
+  s_3a0a24a47d1a36::t_a352ff3734bb2f 653
+  s_3a0a24a47d1a36::t_6090ac4dc802d3 479-483,485
+  s_3a0a24a47d1a36::t_e9cb64651d315c 507
+  s_3a0a24a47d1a36::t_45ba5738ad2978 2050
+  s_3a0a24a47d1a36::t_fe7d48841f1e93 324,328
+  s_3a0a24a47d1a36::t_0e878d5b63cfa5 109,114,130-132,147,150
+  s_3a0a24a47d1a36::t_d14d76725a8ee7 1945-1950,1964
+  s_3a0a24a47d1a36::t_f9a5abfc584693 426,428,442-443
+  s_3a0a24a47d1a36::t_d9196ab1325220 2203
+  s_3a0a24a47d1a36::t_554f5a6c543a62 684
+  s_3a0a24a47d1a36::t_004538e2402580 13
+  s_3a0a24a47d1a36::t_19e21e928d8018 172
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_3a0a24a47d1a36::t_2ab31672a663ea 261
+  s_3a0a24a47d1a36::t_128e69bd1deb1e 36
+  s_3a0a24a47d1a36::t_03430381d74b3c 1261
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_3a0a24a47d1a36::t_40e87d2b4f0966 682,685-687,689-696,702-708
+net/crates/net/src/ffi/mesh.rs
+  s_3a0a24a47d1a36::t_35d98ea66eedcc 2081
+  s_3a0a24a47d1a36::t_86fd8c77f8d45e 30
+  s_3a0a24a47d1a36::t_66551f9aa5083c 2403
+  s_3a0a24a47d1a36::t_469f8dc884ce41 2537-2540,2542
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_3a0a24a47d1a36::t_aa69088e215280 939-944
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_3a0a24a47d1a36::t_4a4f3087f23634 372
+  s_3a0a24a47d1a36::t_64133ca8a675e5 367-371
+net/crates/net/tests/three_node_integration.rs
+  s_3a0a24a47d1a36::t_bb54b784382dba 1516-1518,1521,1524
+net/crates/net/tests/dataforts_gravity_e2e.rs
+  s_3a0a24a47d1a36::t_8cbeb833275ff5 143,244
+net/crates/net/tests/dataforts_greedy_e2e.rs
+  s_3a0a24a47d1a36::t_8cbeb833275ff5 121,237,303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "f0c7a3375c5a848526a4e3379c76575b5f3a3e3f",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
