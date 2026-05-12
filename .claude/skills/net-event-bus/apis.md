@@ -1,6 +1,6 @@
 # Net SDK API Reference
 
-Verified against `net-sdk` v0.14.0 (Rust) / `@ai2070/net-sdk` ≥ 0.14.0 peer (TS) / `net-sdk` Python (current `main`). Last full pass: 2026-04-25. SdkError variant set re-verified 2026-05-02 after the `bugfixes-8` `Sampled` / `Unrouted` additions.
+Verified against `net-sdk` v0.15.0 (Rust) / `@ai2070/net-sdk` ≥ 0.15.0 peer (TS) / `net-sdk` Python (current `main`). Last full pass: 2026-04-25. SdkError variant set re-verified 2026-05-02 after the `bugfixes-8` `Sampled` / `Unrouted` additions.
 
 **Drift check before trusting these signatures:**
 ```bash

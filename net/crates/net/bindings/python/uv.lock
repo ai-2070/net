@@ -4,7 +4,7 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "ai2070-net"
-version = "0.14.0"
+version = "0.15.0"
 source = { editable = "." }
 
 [package.optional-dependencies]

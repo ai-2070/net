@@ -14,7 +14,7 @@ Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai2070-net-sdk = "0.14.0"
+ai2070-net-sdk = "0.15.0"
 ```
 
 The crate publishes as `ai2070-net-sdk` on crates.io but imports as `use net_sdk::...` (the in-source crate name is preserved via package aliasing).
