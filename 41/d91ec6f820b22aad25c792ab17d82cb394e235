@@ -1,0 +1,19 @@
+net/crates/net/docs/releases/RELEASE_v0.15_REBEL_YELL.md
+  s_95efa15f56b56b::t_431553ae5707a0 3-6,8-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "41d91ec6f820b22aad25c792ab17d82cb394e235",
+  "prompts": {},
+  "sessions": {
+    "s_95efa15f56b56b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4c8f73c-58ab-4251-8d94-26cebb8d367a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
