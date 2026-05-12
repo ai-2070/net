@@ -65,7 +65,7 @@ netdb = ["cortex"]
 # control surface, not a Cargo-feature decision. See
 # `docs/misc/DATAFORTS_PLAN.md` for the per-phase wiring + the
 # rationale for the single compile-time gate.
-dataforts = ["redex", "dep:blake3"]
+dataforts = ["redex", "redex-disk", "dep:blake3"]
 # NAT traversal — reflex probe + classification + rendezvous punch.
 # Stages 1–3 of `docs/NAT_TRAVERSAL_PLAN.md`. No new deps; rides
 # the existing mesh + subprotocol surface. Sits on top of `net`.
