@@ -551,6 +551,33 @@ Five PRs in dependency order. Each is self-contained and can land independently 
 
 ---
 
+## Shipping status
+
+| PR     | Commit       | Scope shipped                                                                                                   |
+|--------|--------------|-----------------------------------------------------------------------------------------------------------------|
+| PR-1   | `6d824d11`   | `BlobRef::Manifest` variant + chunking pure-logic.                                                              |
+| PR-2a  | `cd14ffe3`   | `MeshBlobAdapter` + `BlobAdapter::{delete,stat}` trait methods + `BlobStat` shape.                              |
+| PR-2b  | `d92de2b4`   | `BlobCapability` / `GreedyCapability` / `GravityCapability` / `TopologyScope` + `Artifact::Blob` placement.     |
+| PR-3   | `f49e7dd9`   | `publish_with_blob` + `BlobDurability` (BestEffort / DurableOnLocal / ReplicatedTo).                            |
+| PR-4a  | `a75b0df6`   | `BlobRefcountTable` + GC sweep + retention floor + pin/unpin + `BlobMetrics` + health gate hysteresis.          |
+| PR-5a  | `74dcaee8`   | Decision primitives: `should_pull_blob` (G-1), `should_migrate_blob_to` (G-2/G-3), `auth_allows_blob_op` (G-6). |
+| PR-5b  | `585a78ef`   | G-6 wiring: `MeshBlobAdapter::with_auth_guard` + `pin_authorized` / `unpin_authorized` / `delete_chunk_authorized`. |
+| PR-5c  | `36ed5656`   | G-1 wiring: `dispatch_event` runs `should_pull_blob` after admission + bumps blob-pull counter family.          |
+| PR-5d  | `6497ea81`   | G-1 e2e (T-3): admit on participating node, no_storage reject on compute-only, greedy_disabled reject.          |
+| PR-5e  | `762a06c4`   | G-1 e2e cross-scope admit path (Zone-local, Mesh-publisher); reject path blocked on chain_caps schema gap.      |
+
+### Still deferred — items that warrant their own design step
+
+- **Chain-caps lookup refactor.** `mesh.rs::process_local_packet` resolves the publisher's caps via `capability_index.all_nodes()` + a `causal:<hex>` walk, then falls back to the last-hop peer's caps. The walk picks up cache holders (greedy's first-cache `announce_chain` stamps `causal:<hex>` onto the holder's caps), so the resolved caps flip between publisher and holder depending on announcement timing. The wire `origin_hash` is BLAKE2s-derived from the publisher's entity (`EntityId::origin_hash`), while the capability index keys on the entity's `node_id` (a separate derivation) — so a direct lookup needs an `origin_hash → node_id` side index or an entity-id field on indexed entries. Blocks the matching G-1 scope-mismatch reject e2e and the equivalent intent / colocation reject paths.
+- **Remote blob fetch.** PR-5c records the G-1 admit verdict into `dataforts_greedy_blob_pulls_admitted_total` but does not act on it. Acting requires a remote-fetch path: discover holders via `causal:<hex>` (or a dedicated `holds:blob:<hex>` family) + pull chunks via a new RPC (or by riding `RedexFile` replication on the per-chunk channel). Touches the wire format.
+- **Gravity migration controller.** PR-5a ships `should_migrate_blob_to` as a primitive; PR-2b's `Artifact::Blob` gates placement scoring. But the gravity layer (Phase 4) only emits heat tags today — there is no migration state machine that consumes them. The plan's G-2 / G-3 wiring waits on that controller.
+- **Chain-fold refcount source.** `BlobRefcountTable::{incr,decr}` exist; `MeshBlobAdapter::store` stamps `first_seen`/`last_seen`. But no chain-fold path bumps refcounts when an event referencing a `BlobRef` lands, so GC's "deletable hashes" semantics is only meaningful for store-and-pin flows today. Wiring this needs an event-fold/CortEX integration point that decides when a reference is "live".
+- **Cross-binding fixtures (T-5).** Python / Node / Go binding wrappers exist for the v0.15 `BlobAdapter` shape but not for the v0.2 `MeshBlobAdapter` + `publish_with_blob` + `BlobRefcountTable` + `BlobMetrics` surfaces. Useful follow-up; not load-bearing for the substrate.
+- **`net blob` CLI.** Operator surface deferred from PR-4a's scope. Useful follow-up.
+- **Capability typed setters.** Today operator code constructs caps via `caps.add_tag("dataforts.blob.storage")` string-form. Typed setters (`caps.with_blob_capability(BlobCapability { ... })`) would tighten the producer-side surface. Small follow-up.
+
+---
+
 ## Activation gate
 
 A workload demonstrating *systematic* publishes above the inline threshold where the v0.15 external-hook surface is the wrong shape. Realistic triggers:
