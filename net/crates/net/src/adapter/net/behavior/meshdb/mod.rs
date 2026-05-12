@@ -32,6 +32,11 @@
 //!   `ResultBatch` + opaque `ContinuationToken`. Phase B-3
 //!   pins the wire format; Phase B-4 plugs it into the mesh's
 //!   subprotocol dispatch + a `FederatedMeshQueryExecutor`.
+//! - [`federated`] — `FederatedMeshQueryExecutor<T:
+//!   MeshDbTransport>` fans atomic operators out to remote
+//!   `target_nodes` via a pluggable transport, with
+//!   proximity-ordered failover. `LoopbackTransport` drives
+//!   in-process 3-node integration tests without a real wire.
 //!
 //! # AST versioning (locked decision #1)
 //!
@@ -66,6 +71,7 @@
 
 pub mod error;
 pub mod executor;
+pub mod federated;
 pub mod planner;
 pub mod protocol;
 pub mod query;
@@ -74,6 +80,10 @@ pub use error::{BudgetMetric, MeshError};
 pub use executor::{
     ChainReader, LocalMeshQueryExecutor, MeshQueryExecutor, QueryHandle, QueryId, ResultStream,
     RunningQuery,
+};
+pub use federated::{
+    FederatedMeshQueryExecutor, LoopbackTransport, MeshDbTransport, ResponseStream,
+    TransportError,
 };
 pub use planner::{ExecutionPlan, MeshQueryPlanner, OperatorNode, OperatorPlan};
 pub use protocol::{

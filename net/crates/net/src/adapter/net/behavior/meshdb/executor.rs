@@ -67,6 +67,16 @@ pub struct QueryHandle {
 }
 
 impl QueryHandle {
+    /// Construct a fresh handle with the given id. The cancel
+    /// flag starts cleared. Used by both [`LocalMeshQueryExecutor`]
+    /// and the federated executor in `super::federated`.
+    pub fn new(id: QueryId) -> Self {
+        Self {
+            id,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// The query's id.
     pub fn id(&self) -> QueryId {
         self.id
@@ -177,10 +187,7 @@ impl<R: ChainReader> LocalMeshQueryExecutor<R> {
 #[async_trait]
 impl<R: ChainReader + 'static> MeshQueryExecutor for LocalMeshQueryExecutor<R> {
     async fn execute(&self, plan: ExecutionPlan) -> Result<RunningQuery, MeshError> {
-        let handle = QueryHandle {
-            id: self.allocate_id(),
-            cancel: Arc::new(AtomicBool::new(false)),
-        };
+        let handle = QueryHandle::new(self.allocate_id());
         let rows = walk_operator(&plan.root, self.reader.clone(), handle.clone())?;
         Ok(RunningQuery { handle, rows })
     }
