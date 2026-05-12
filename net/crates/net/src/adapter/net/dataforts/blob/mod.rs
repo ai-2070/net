@@ -13,6 +13,7 @@
 //! etc. — by explicit locked decision.
 
 pub mod adapter;
+pub mod admission;
 pub mod blob_ref;
 pub mod conformance;
 pub mod dispatch;
@@ -26,6 +27,10 @@ pub mod refcount;
 pub mod registry;
 
 pub use adapter::{BlobAdapter, BlobStat};
+pub use admission::{
+    auth_allows_blob_op, should_migrate_blob_to, should_pull_blob, MigrateBlobReject,
+    MigrateBlobVerdict, PullBlobReject, PullBlobVerdict,
+};
 pub use mesh::MeshBlobAdapter;
 pub use metrics::{
     evaluate_health_gate, BlobMetrics, BlobMetricsSnapshot, HealthGateAction,
