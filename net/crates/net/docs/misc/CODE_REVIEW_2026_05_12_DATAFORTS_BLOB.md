@@ -37,7 +37,7 @@ Tagged `[B | H | M | L]`:
 | B-2   | H   | ci           | "3-node tests" CI step only runs `net_blob_cli`                        | ✅ (added `dataforts_blob_e2e` and `dataforts_greedy_e2e` to integration job; renamed the CLI step to match what it actually runs) |
 | B-3   | H   | blob mesh    | `publish_with_blob` advertises chunks before manifest commits          | ✅ (doc-reframe — drop "atomic" claim, document chunk-advertise vs publish ordering and what the contract is/isn't; regression test pins post-store per-chunk fetchability) |
 | B-4   | H   | blob mesh    | `heat:blob:` tags uncorroborated → orphan replication runtimes         | ✅ (per-peer admit budget at the migration controller — DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK; tracked via `skipped_peer_budget` for observability) |
-| B-5   | H   | migration    | `publisher_caps` sourced from heat emitter, not actual publisher       | ⬜ |
+| B-5   | H   | migration    | `publisher_caps` sourced from heat emitter, not actual publisher       | ✅ (cross-advertiser scope narrowing — controller floors gravity/greedy scope to the narrowest claim across every peer advertising heat for the same hash; unparticipating peers excluded) |
 | B-6   | H   | blob mesh    | `delete_chunk_authorized` strands `RefcountEntry`                      | ⬜ |
 | B-7   | H   | blob mesh    | `store_chunk` TOCTOU between `is_empty()` and `append()`; no verify     | ⬜ |
 | B-8   | H   | cli          | `net-blob get --out` has no symlink / traversal guard                  | ⬜ |

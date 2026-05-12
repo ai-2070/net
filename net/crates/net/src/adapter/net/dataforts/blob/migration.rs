@@ -21,11 +21,72 @@
 use std::sync::Arc;
 
 use crate::adapter::net::behavior::capability::{CapabilityIndex, CapabilitySet};
-use crate::adapter::net::behavior::tag::Tag;
+use crate::adapter::net::behavior::dataforts_capabilities::{
+    GravityCapability, GreedyCapability, TopologyScope,
+};
+use crate::adapter::net::behavior::tag::{AxisSeparator, Tag};
+use crate::adapter::net::behavior::TaxonomyAxis;
 
 use super::adapter::BlobAdapter;
 use super::admission::{should_migrate_blob_to, MigrateBlobReject, MigrateBlobVerdict};
 use super::blob_ref::BlobRef;
+
+/// `true` when `a` is at least as narrow as `b` in the
+/// `Node < Zone < Region < Mesh` ordering. Mirrors
+/// `scope_at_least_as_narrow` in `admission`; duplicated here so
+/// the migration controller can compute the narrowest claim
+/// across a set of heat advertisers without importing the
+/// admission internals.
+fn scope_at_least_as_narrow(a: TopologyScope, b: TopologyScope) -> bool {
+    use TopologyScope::*;
+    matches!(
+        (a, b),
+        (Node, _) | (Zone, Zone | Region | Mesh) | (Region, Region | Mesh) | (Mesh, Mesh)
+    )
+}
+
+/// Choose the narrower of two scope claims (Node < Zone < Region
+/// < Mesh). Used to floor publisher scope to the narrowest claim
+/// across all peers advertising the same blob.
+fn narrower_scope(a: TopologyScope, b: TopologyScope) -> TopologyScope {
+    if scope_at_least_as_narrow(a, b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// Replace the `dataforts.greedy.scope` and `dataforts.gravity.scope`
+/// tags in `caps` with the supplied floors. Used to apply
+/// cross-advertiser scope narrowing in
+/// `BlobMigrationController::candidates` — a single cache holder
+/// claiming a wider scope than the original publisher cannot
+/// launder admission decisions when the controller intersects
+/// every claimant's scope.
+fn narrow_scope_tags_in(
+    caps: &mut CapabilitySet,
+    gravity_floor: TopologyScope,
+    greedy_floor: TopologyScope,
+) {
+    caps.tags.retain(|t| match t {
+        Tag::AxisValue { axis, key, .. } if *axis == TaxonomyAxis::Dataforts => {
+            key != "greedy.scope" && key != "gravity.scope"
+        }
+        _ => true,
+    });
+    caps.tags.insert(Tag::AxisValue {
+        axis: TaxonomyAxis::Dataforts,
+        key: "greedy.scope".to_string(),
+        value: greedy_floor.as_wire_str().to_string(),
+        separator: AxisSeparator::Eq,
+    });
+    caps.tags.insert(Tag::AxisValue {
+        axis: TaxonomyAxis::Dataforts,
+        key: "gravity.scope".to_string(),
+        value: gravity_floor.as_wire_str().to_string(),
+        separator: AxisSeparator::Eq,
+    });
+}
 
 /// Parse a `heat:blob:<hex64>=<rate>` reserved tag into the
 /// `(hash, rate)` pair. Returns `None` when the tag isn't a
@@ -111,23 +172,96 @@ impl<'a> BlobMigrationController<'a> {
     /// (multiple peers advertising the same blob) surface as
     /// independent candidates — the caller's tie-breaker picks
     /// the migration target.
+    ///
+    /// ## Cross-advertiser scope narrowing
+    ///
+    /// `should_migrate_blob_to` reads the publisher's claimed
+    /// scope via `dataforts.{greedy,gravity}.scope` tags on
+    /// `publisher_caps`. The heat emitter is whichever peer
+    /// advertised the heat tag — that can be the original
+    /// publisher or any cache holder. A malicious cache holder
+    /// advertising a *wider* scope than the original publisher
+    /// would otherwise launder admission decisions on every
+    /// target: the heat-emitter caps drive the verdict.
+    ///
+    /// To defend against this, each candidate's `publisher_caps`
+    /// has its scope tags floored to the *narrowest* gravity /
+    /// greedy scope across every peer that advertises heat for
+    /// the same hash. Only peers with the respective `enabled`
+    /// flag contribute — a peer not participating in
+    /// gravity/greedy makes no scope claim and is excluded.
+    /// Identical hashes from a single advertiser are unchanged
+    /// (narrowest of one = that one). Multiple advertisers
+    /// claiming different scopes collapse to the narrowest, which
+    /// is what the most conservative publisher in the set would
+    /// have wanted.
     pub fn candidates(&self) -> Vec<BlobMigrationCandidate> {
-        let mut out = Vec::new();
+        // Pass 1: walk every peer, collect (hash, node_id, caps, rate)
+        // tuples, AND aggregate the narrowest scope claims per hash
+        // across all peers that advertise it.
+        struct ScopeFloor {
+            gravity: Option<TopologyScope>,
+            greedy: Option<TopologyScope>,
+        }
+        let mut raw: Vec<(u64, [u8; 32], f64, CapabilitySet)> = Vec::new();
+        let mut floors: std::collections::HashMap<[u8; 32], ScopeFloor> =
+            std::collections::HashMap::new();
+
         for node_id in self.capability_index.all_nodes() {
             let caps = match self.capability_index.get(node_id) {
                 Some(c) => c,
                 None => continue,
             };
+            // Peer's typed scope claims (only valid when the
+            // matching `enabled` flag is set; an unparticipating
+            // peer makes no claim and is excluded from the floor).
+            let peer_gravity = GravityCapability::from_capability_set(&caps);
+            let peer_greedy = GreedyCapability::from_capability_set(&caps);
+
             for tag in &caps.tags {
                 if let Some((hash, rate)) = parse_blob_heat_tag(tag) {
-                    out.push(BlobMigrationCandidate {
-                        hash,
-                        publisher_node_id: node_id,
-                        publisher_caps: caps.clone(),
-                        rate,
+                    let entry = floors.entry(hash).or_insert(ScopeFloor {
+                        gravity: None,
+                        greedy: None,
                     });
+                    if peer_gravity.enabled {
+                        entry.gravity = Some(match entry.gravity {
+                            Some(prev) => narrower_scope(prev, peer_gravity.scope),
+                            None => peer_gravity.scope,
+                        });
+                    }
+                    if peer_greedy.enabled {
+                        entry.greedy = Some(match entry.greedy {
+                            Some(prev) => narrower_scope(prev, peer_greedy.scope),
+                            None => peer_greedy.scope,
+                        });
+                    }
+                    raw.push((node_id, hash, rate, caps.clone()));
                 }
             }
+        }
+
+        // Pass 2: emit candidates, applying the per-hash floor.
+        let mut out = Vec::with_capacity(raw.len());
+        for (node_id, hash, rate, mut caps) in raw {
+            if let Some(floor) = floors.get(&hash) {
+                if let (Some(g), Some(gr)) = (floor.gravity, floor.greedy) {
+                    narrow_scope_tags_in(&mut caps, g, gr);
+                } else if let Some(g) = floor.gravity {
+                    let cur_greedy = GreedyCapability::from_capability_set(&caps).scope;
+                    narrow_scope_tags_in(&mut caps, g, cur_greedy);
+                } else if let Some(gr) = floor.greedy {
+                    let cur_gravity = GravityCapability::from_capability_set(&caps).scope;
+                    narrow_scope_tags_in(&mut caps, cur_gravity, gr);
+                }
+                // No enabled peer made any scope claim: leave caps as-is.
+            }
+            out.push(BlobMigrationCandidate {
+                hash,
+                publisher_node_id: node_id,
+                publisher_caps: caps,
+                rate,
+            });
         }
         out
     }
@@ -764,6 +898,151 @@ mod tests {
         assert_eq!(report.admitted, 0);
         assert_eq!(report.prefetch_errors, 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// A wider-scope cache holder advertising heat for a blob
+    /// must not be able to launder the migration verdict past a
+    /// narrower-scope publisher's intent. Candidates from both
+    /// peers see their `publisher_caps` floored to the narrowest
+    /// scope (Zone), so a local target with Region scope rejects
+    /// admission even though the cache holder's raw caps were
+    /// Mesh.
+    #[test]
+    fn cross_advertiser_scope_is_floored_to_narrowest_claim() {
+        let (hash, hex) = hex64(0xCA);
+        // Original publisher: gravity scope = Zone (narrow).
+        let mut publisher = CapabilitySet::new()
+            .with_gravity_capability(crate::adapter::net::behavior::GravityCapability {
+                enabled: true,
+                scope: TopologyScope::Zone,
+                proximity: 128,
+            })
+            .with_greedy_capability(crate::adapter::net::behavior::GreedyCapability {
+                enabled: true,
+                scope: TopologyScope::Zone,
+                proximity: 128,
+            });
+        publisher.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.50", hex),
+        });
+        // Malicious cache holder: gravity scope = Mesh (wide).
+        let mut cache_holder = CapabilitySet::new()
+            .with_gravity_capability(crate::adapter::net::behavior::GravityCapability {
+                enabled: true,
+                scope: TopologyScope::Mesh,
+                proximity: 128,
+            })
+            .with_greedy_capability(crate::adapter::net::behavior::GreedyCapability {
+                enabled: true,
+                scope: TopologyScope::Mesh,
+                proximity: 128,
+            });
+        cache_holder.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.40", hex),
+        });
+        let index = CapabilityIndex::new();
+        index.index(
+            crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
+                10,
+                EntityId::from_bytes([0xAA; 32]),
+                1,
+                publisher,
+            ),
+        );
+        index.index(
+            crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
+                20,
+                EntityId::from_bytes([0xBB; 32]),
+                1,
+                cache_holder,
+            ),
+        );
+
+        let local = CapabilitySet::default();
+        let controller = BlobMigrationController::new(&local, &index);
+        let candidates = controller.candidates();
+        assert_eq!(candidates.len(), 2);
+        for c in &candidates {
+            assert_eq!(c.hash, hash);
+            let gravity = GravityCapability::from_capability_set(&c.publisher_caps);
+            let greedy = GreedyCapability::from_capability_set(&c.publisher_caps);
+            assert_eq!(
+                gravity.scope,
+                TopologyScope::Zone,
+                "gravity scope floors to narrowest across all advertisers"
+            );
+            assert_eq!(
+                greedy.scope,
+                TopologyScope::Zone,
+                "greedy scope floors to narrowest across all advertisers"
+            );
+        }
+    }
+
+    /// The narrowing must IGNORE peers that don't actually
+    /// participate in gravity / greedy (no `.enabled` flag). A
+    /// peer claiming scope=Node but not enabled doesn't make a
+    /// real scope claim and shouldn't sink the floor.
+    #[test]
+    fn scope_narrowing_ignores_unparticipating_peers() {
+        let (_, hex) = hex64(0xCB);
+        // Real publisher: gravity Zone (enabled).
+        let mut publisher = CapabilitySet::new().with_gravity_capability(
+            crate::adapter::net::behavior::GravityCapability {
+                enabled: true,
+                scope: TopologyScope::Zone,
+                proximity: 128,
+            },
+        );
+        publisher.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.50", hex),
+        });
+        // A peer that announces a Node-scope tag but doesn't have
+        // `gravity.enabled`. Their unparticipating claim must NOT
+        // pull the floor to Node.
+        let mut tag_only = CapabilitySet::new();
+        tag_only.tags.insert(Tag::AxisValue {
+            axis: TaxonomyAxis::Dataforts,
+            key: "gravity.scope".to_string(),
+            value: "node".to_string(),
+            separator: AxisSeparator::Eq,
+        });
+        tag_only.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.30", hex),
+        });
+        let index = CapabilityIndex::new();
+        index.index(
+            crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
+                30,
+                EntityId::from_bytes([0xCC; 32]),
+                1,
+                publisher,
+            ),
+        );
+        index.index(
+            crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
+                40,
+                EntityId::from_bytes([0xDD; 32]),
+                1,
+                tag_only,
+            ),
+        );
+
+        let local = CapabilitySet::default();
+        let controller = BlobMigrationController::new(&local, &index);
+        let candidates = controller.candidates();
+        for c in &candidates {
+            let gravity = GravityCapability::from_capability_set(&c.publisher_caps);
+            assert_eq!(
+                gravity.scope,
+                TopologyScope::Zone,
+                "unparticipating peer's tag must not narrow the floor"
+            );
+        }
     }
 
     /// Per-peer admit budget: a single peer advertising N >
