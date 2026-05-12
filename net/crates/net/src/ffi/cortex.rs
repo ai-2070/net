@@ -293,6 +293,14 @@ impl RedexHandle {
     /// the inner `Arc<Redex>` to wrap it in a `MeshBlobAdapter`.
     /// The clone bumps the refcount; the redex's `HandleGuard`
     /// still gates concurrent `_free` on the original handle.
+    ///
+    /// Only `ffi::blob` (gated on the `dataforts + netdb +
+    /// redex-disk` triple) calls this today; without the
+    /// triple the method has no callers and the dead-code
+    /// lint trips. Suppress the lint at the method level so a
+    /// future feature-OFF caller doesn't also need the
+    /// `#[allow]` annotation.
+    #[allow(dead_code)]
     pub(crate) fn redex_arc(&self) -> Arc<InnerRedex> {
         (*self.inner).clone()
     }
