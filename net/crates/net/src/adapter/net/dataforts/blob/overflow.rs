@@ -117,6 +117,28 @@ pub enum OverflowPushAck {
     OpenChunkFailed,
 }
 
+/// Output of [`BlobOverflowController::candidate_batch`]: the
+/// list of candidates to push this tick, plus the precise
+/// count of hashes that were attempted for target selection
+/// but found no eligible peer. The pair lets the tick driver
+/// report `rejected_no_target` accurately — distinguishing
+/// "we tried and no peer qualified" from "we hit the per-tick
+/// push cap and never tried the rest."
+#[derive(Clone, Debug, Default)]
+pub struct OverflowCandidateBatch {
+    /// Candidates with a selected target peer, truncated to
+    /// `config.max_pushes_per_tick`.
+    pub candidates: Vec<BlobOverflowCandidate>,
+    /// Number of hashes the controller attempted target
+    /// selection for and got `None` back. Bounded above by
+    /// `config.max_pushes_per_tick` (the loop breaks once
+    /// `candidates.len()` reaches the cap, so further
+    /// hashes are never tried). The tick driver routes
+    /// this directly to `rejected_no_target` without
+    /// double-counting truncated hashes.
+    pub no_target_count: usize,
+}
+
 /// One overflow-push candidate the controller is considering
 /// for this tick. The push controller already selected a
 /// target peer for `hash`; the tick driver routes the actual
@@ -572,10 +594,23 @@ impl<'a> BlobOverflowController<'a> {
     }
 
     /// Compute every candidate for this tick — coldest first,
-    /// truncated to `config.max_pushes_per_tick`. `size_for_hash`
-    /// is an operator-supplied resolver (the controller doesn't
-    /// know chunk sizes directly; `MeshBlobAdapter::stat_chunk`
-    /// or an equivalent answers this).
+    /// truncated to `config.max_pushes_per_tick`. Convenience
+    /// wrapper around [`Self::candidate_batch`] that drops the
+    /// `no_target_count` companion when the caller only wants
+    /// the push list.
+    pub fn candidates(
+        &self,
+        now: Instant,
+        size_for_hash: impl Fn([u8; 32]) -> Option<u64>,
+    ) -> Vec<BlobOverflowCandidate> {
+        self.candidate_batch(now, size_for_hash).candidates
+    }
+
+    /// Compute candidates + the precise `no_target` accounting
+    /// for this tick. `size_for_hash` is an operator-supplied
+    /// resolver (the controller doesn't know chunk sizes
+    /// directly; `MeshBlobAdapter::stat_chunk` or an equivalent
+    /// answers this).
     ///
     /// The function:
     ///
@@ -593,17 +628,17 @@ impl<'a> BlobOverflowController<'a> {
     ///    1 GiB)` matching the local gravity scope; picks
     ///    the peer with the highest `disk_free_gb` (ties
     ///    broken by lowest `node_id`).
-    /// 5. Drops candidates with no eligible target; the
-    ///    tick reports those as `rejected_no_target` via
-    ///    the difference between the heat-registry
-    ///    candidate count and the returned vec length.
-    /// 6. Truncates the result to
-    ///    `config.max_pushes_per_tick`.
-    pub fn candidates(
+    /// 5. Counts a hash as `no_target` only when target
+    ///    selection was actually *attempted* and failed —
+    ///    hashes past the `max_pushes_per_tick` truncation
+    ///    point were never tried and are NOT no-target.
+    /// 6. Stops walking once
+    ///    `candidates.len() >= config.max_pushes_per_tick`.
+    pub fn candidate_batch(
         &self,
         now: Instant,
         size_for_hash: impl Fn([u8; 32]) -> Option<u64>,
-    ) -> Vec<BlobOverflowCandidate> {
+    ) -> OverflowCandidateBatch {
         // Step 1: snapshot heat-registry entries.
         let snap: Vec<([u8; 32], f64)> = {
             let guard = self.heat_registry.lock();
@@ -662,29 +697,37 @@ impl<'a> BlobOverflowController<'a> {
                 .then_with(|| a.0.cmp(&b.0))
         });
 
-        // Step 4-5: target selection per hash.
+        // Step 4-5: target selection per hash. `no_target`
+        // counts only hashes we ACTUALLY tried — the loop
+        // breaks at `max_pushes_per_tick` so the tail of
+        // `filtered` is never attempted and must not bump
+        // the counter.
         let local_gravity = GravityCapability::from_capability_set(self.local_caps);
-        let mut out: Vec<BlobOverflowCandidate> = Vec::new();
+        let mut candidates: Vec<BlobOverflowCandidate> = Vec::new();
+        let mut no_target_count: usize = 0;
         for (hash, cold_rate, size_bytes) in filtered {
-            if let Some((target_node_id, target_caps)) =
-                self.pick_target(size_bytes, local_gravity.scope)
-            {
-                out.push(BlobOverflowCandidate {
-                    hash,
-                    size_bytes,
-                    target_node_id,
-                    target_caps,
-                    cold_rate,
-                });
+            match self.pick_target(size_bytes, local_gravity.scope) {
+                Some((target_node_id, target_caps)) => {
+                    candidates.push(BlobOverflowCandidate {
+                        hash,
+                        size_bytes,
+                        target_node_id,
+                        target_caps,
+                        cold_rate,
+                    });
+                }
+                None => {
+                    no_target_count += 1;
+                }
             }
-            // No target: just skip; the tick will bump
-            // `rejected_no_target` based on how many
-            // candidates dropped out.
-            if out.len() >= self.config.max_pushes_per_tick {
+            if candidates.len() >= self.config.max_pushes_per_tick {
                 break;
             }
         }
-        out
+        OverflowCandidateBatch {
+            candidates,
+            no_target_count,
+        }
     }
 
     /// Find the best overflow-receiver peer for a chunk of
@@ -871,42 +914,17 @@ pub async fn drive_blob_overflow_tick(
         return report;
     }
 
-    // Compute candidates. `pre_pick_count` is the number
-    // of cold hashes that passed the pin / refcount / size
-    // filters; `candidates.len()` is the number that ALSO
-    // found a target peer. The difference is
-    // `rejected_no_target`.
-    let candidates = controller.candidates(now, &size_for_hash);
-    // Re-derive pre-pick count via a second pass (cheaper
-    // than threading it through `candidates`): walk the
-    // heat registry under read lock, count entries that
-    // pass the pin / refcount / size filter.
-    let pre_pick_count: usize = {
-        let guard = controller.heat_registry.lock();
-        guard
-            .iter()
-            .filter(|(h, _)| {
-                controller
-                    .refcount
-                    .get(h)
-                    .map(|e| !e.pinned && e.refcount == 0)
-                    .unwrap_or(false)
-                    && size_for_hash(**h).is_some()
-            })
-            .count()
-    };
-    // No-target candidates: pre_pick_count - candidates.len(),
-    // capped at config.max_pushes_per_tick so over-pre-pick
-    // doesn't inflate the counter.
-    let no_target = pre_pick_count
-        .saturating_sub(candidates.len())
-        .min(controller.config.max_pushes_per_tick);
-    report.rejected_no_target = no_target as u64;
+    // Compute candidates in one pass. `candidate_batch`
+    // tracks the no-target count inside its target-selection
+    // loop, so truncated-by-`max_pushes_per_tick` hashes never
+    // bump the counter (they were never tried).
+    let batch = controller.candidate_batch(now, &size_for_hash);
+    report.rejected_no_target = batch.no_target_count as u64;
 
     // Fire pushes. `max_pushes_per_tick = 0` is a valid
     // "trigger only, no real pushes" mode — the candidates
     // list will be empty so we drop straight through.
-    for candidate in candidates {
+    for candidate in batch.candidates {
         match sink
             .push(
                 candidate.hash,
@@ -1499,6 +1517,111 @@ mod tests {
         assert_eq!(report.admitted, 0);
         assert_eq!(report.rejected_no_target, 1);
         assert_eq!(sink.calls().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tick_no_target_excludes_truncated_hashes() {
+        // Pre-pick count exceeds `max_pushes_per_tick`: every
+        // attempted hash finds a target (so `rejected_no_target`
+        // must stay 0), the truncated tail is never tried, and
+        // exactly `max_pushes_per_tick` pushes fire. Regression
+        // against the prior `pre_pick - candidates.len()` math
+        // that conflated truncation with no-target.
+        let now = Instant::now();
+        let hashes: Vec<[u8; 32]> = (0..5).map(|i| hex64(i as u8).0).collect();
+        let entries: Vec<([u8; 32], f64)> = hashes.iter().map(|h| (*h, 0.0)).collect();
+        let heat = heat_registry_with(now, &entries);
+        let refcount = refcount_with_zero(&hashes, 1_000_000);
+        let peer = (99u64, [0x11; 32], overflow_peer_caps(80));
+        let index = cap_index_with(&[peer]);
+        let local = overflow_enabled_local_caps();
+        let cfg = OverflowConfig {
+            enabled: true,
+            max_pushes_per_tick: 2,
+            ..Default::default()
+        };
+        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let active = AtomicBool::new(false);
+        let sink = OverflowPushRecorder::new();
+
+        let report = drive_blob_overflow_tick(
+            &controller,
+            &sink,
+            OverflowTickObservation {
+                disk_used_bytes: 900,
+                disk_total_bytes: 1000,
+                hysteresis_active: &active,
+                now,
+            },
+            |_| Some(1024),
+        )
+        .await;
+        assert_eq!(report.admitted, 2);
+        assert_eq!(
+            report.rejected_no_target, 0,
+            "truncated hashes (never attempted) must NOT bump rejected_no_target"
+        );
+        assert_eq!(sink.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tick_no_target_counts_only_attempted_failures() {
+        // Mix: two hashes need 4 GiB; peer offers 80 GiB so
+        // both find targets. Two more hashes need 100 GiB; no
+        // peer can take them → both bump `rejected_no_target`.
+        // With max_pushes_per_tick=3 the loop stops after the
+        // 3rd successful push attempt, so we should see
+        // admitted=2 and no_target=2 (both attempted) — NOT a
+        // capped diff that would mis-attribute the truncation.
+        let now = Instant::now();
+        // Order by hash bytes (sort is coldest-first, ties by
+        // hash). Use distinct first bytes so order is
+        // predictable.
+        let (small1, _) = hex64(0x01);
+        let (big1, _) = hex64(0x02);
+        let (small2, _) = hex64(0x03);
+        let (big2, _) = hex64(0x04);
+        let heat = heat_registry_with(
+            now,
+            &[(small1, 0.0), (big1, 0.0), (small2, 0.0), (big2, 0.0)],
+        );
+        let refcount = refcount_with_zero(&[small1, big1, small2, big2], 1_000_000);
+        let peer = (99u64, [0x11; 32], overflow_peer_caps(80));
+        let index = cap_index_with(&[peer]);
+        let local = overflow_enabled_local_caps();
+        let cfg = OverflowConfig {
+            enabled: true,
+            max_pushes_per_tick: 3,
+            ..Default::default()
+        };
+        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let active = AtomicBool::new(false);
+        let sink = OverflowPushRecorder::new();
+
+        let size_for_hash = move |h: [u8; 32]| -> Option<u64> {
+            if h == big1 || h == big2 {
+                Some(100 * (1 << 30)) // 100 GiB — over peer's free
+            } else {
+                Some(1024) // tiny
+            }
+        };
+        let report = drive_blob_overflow_tick(
+            &controller,
+            &sink,
+            OverflowTickObservation {
+                disk_used_bytes: 900,
+                disk_total_bytes: 1000,
+                hysteresis_active: &active,
+                now,
+            },
+            size_for_hash,
+        )
+        .await;
+        // 2 small hashes fit (admitted), 2 big hashes have no
+        // target. The loop never hits the `max=3` cap because
+        // there are only 4 candidates total.
+        assert_eq!(report.admitted, 2);
+        assert_eq!(report.rejected_no_target, 2);
     }
 
     #[tokio::test]

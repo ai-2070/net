@@ -76,8 +76,8 @@ pub use migration::{
 pub use noop::NoopAdapter;
 pub use overflow::{
     drive_blob_overflow_tick, step_overflow_hysteresis, BlobOverflowCandidate,
-    BlobOverflowController, BlobOverflowTickReport, OverflowPushSink, OverflowTickContext,
-    OverflowTickObservation,
+    BlobOverflowController, BlobOverflowTickReport, OverflowCandidateBatch, OverflowPushSink,
+    OverflowTickContext, OverflowTickObservation,
 };
 pub use publish_with_blob::{publish_with_blob, BlobDurability, PublishWithBlobReceipt};
 pub use refcount::{should_sweep, BlobRefcountTable, RefcountEntry, DEFAULT_RETENTION_FLOOR};
