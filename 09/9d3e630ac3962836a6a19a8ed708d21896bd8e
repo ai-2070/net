@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/dataforts/blob/overflow.rs
+  s_3a0a24a47d1a36::t_87c14c6a5c9b20 1001-1012,1014-1015,1018,1030
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "099d3e630ac3962836a6a19a8ed708d21896bd8e",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
