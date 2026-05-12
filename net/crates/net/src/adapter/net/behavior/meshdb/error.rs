@@ -7,6 +7,7 @@
 
 use std::ops::Range;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::query::{ResultRow, SeqNum};
@@ -20,7 +21,7 @@ use super::query::{ResultRow, SeqNum};
 /// `#[non_exhaustive]` so phases B–F can add variants
 /// (`StreamingTimeout`, `WatermarkExpired`, etc.) without
 /// breaking source-side users.
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, PartialEq, Error, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum MeshError {
     /// No node holds the requested seq range. The `available`
@@ -150,7 +151,7 @@ pub enum MeshError {
 /// Identifies which configured budget tripped a
 /// `MeshError::QueryBudgetExceeded`. Mirrors the per-channel
 /// budget configuration shape (rows / duration / bytes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BudgetMetric {
     /// `query_max_rows` — total result-row count.
     MaxRows,

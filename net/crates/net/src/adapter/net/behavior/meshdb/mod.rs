@@ -27,6 +27,11 @@
 //!   abstraction. Phase B-2 handles the atomic operators end-
 //!   to-end; cross-node fan-out + partial-result resume land
 //!   in Phase B-4.
+//! - [`protocol`] — `MeshDbRequest` / `MeshDbResponse` wire
+//!   envelopes + `SUBPROTOCOL_MESHDB` slot + the streaming
+//!   `ResultBatch` + opaque `ContinuationToken`. Phase B-3
+//!   pins the wire format; Phase B-4 plugs it into the mesh's
+//!   subprotocol dispatch + a `FederatedMeshQueryExecutor`.
 //!
 //! # AST versioning (locked decision #1)
 //!
@@ -62,6 +67,7 @@
 pub mod error;
 pub mod executor;
 pub mod planner;
+pub mod protocol;
 pub mod query;
 
 pub use error::{BudgetMetric, MeshError};
@@ -70,6 +76,9 @@ pub use executor::{
     RunningQuery,
 };
 pub use planner::{ExecutionPlan, MeshQueryPlanner, OperatorNode, OperatorPlan};
+pub use protocol::{
+    ContinuationToken, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,
+};
 pub use query::{
     AggregateFn, ChainRef, Expr, JoinKey, JoinKind, MeshQuery, OrderDir, OrderKey, QueryV1,
     ResultRow, SeqNum,
