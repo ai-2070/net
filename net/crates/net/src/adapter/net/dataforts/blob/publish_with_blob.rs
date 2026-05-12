@@ -1,7 +1,7 @@
-//! `publish_with_blob` — atomic store-then-publish for events that
-//! reference a [`BlobRef`].
+//! `publish_with_blob` — store-then-publish helper with a
+//! durability bound for events that reference a [`BlobRef`].
 //!
-//! Closes the consumer-reads-event-before-blob-replicated race that
+//! Closes the consumer-reads-event-before-blob-readable race that
 //! a naive `blob_publish(...).await; mesh.publish(...).await`
 //! sequence opens up. Steps:
 //!
@@ -17,6 +17,28 @@
 //! durability wait happens before the publish so the consumer is
 //! guaranteed not to land an event whose bytes aren't yet
 //! reachable at the durability level the publisher promised.
+//!
+//! ## Ordering caveat — per-chunk advertisement precedes publish
+//!
+//! Step 2 opens one substrate-side chunk channel per chunk hash.
+//! When the adapter was configured with
+//! [`MeshBlobAdapter::with_replication`], each chunk-channel open
+//! triggers a `causal:<hex>` advertisement at the substrate's per-
+//! channel cadence — so peers can observe individual chunk
+//! advertisements *before* the manifest event reaches the wire in
+//! step 4. The contract is "consumer that learned of the BlobRef
+//! via the event payload sees its bytes durably reachable"; it is
+//! NOT "the chunk channels exist atomically with the manifest."
+//!
+//! In v0.2 this is benign — peers reach for chunks via the
+//! gravity migration controller (driven by `heat:blob:<hex>` tags
+//! emitted only after fetch traffic) or via the manifest carried
+//! in the event payload. Neither pathway acts on a bare
+//! `causal:<hex>` advertisement, so a peer cannot meaningfully
+//! prefetch a partially-stored manifest. Future code that scans
+//! the chunk-channel namespace independently MUST treat partial
+//! coverage as expected and either wait on the manifest or accept
+//! `BlobError::NotFound` on missing chunks.
 //!
 //! Three durability levels:
 //!
@@ -92,8 +114,10 @@ pub struct PublishWithBlobReceipt {
     pub publish_report: PublishReport,
 }
 
-/// Atomically store a blob + publish an event that references it.
-/// See the module-level docs for the four-step contract.
+/// Store a blob + publish an event that references it, with a
+/// durability bound between the two. See the module-level docs
+/// for the four-step contract and the ordering caveat on
+/// per-chunk advertisement.
 ///
 /// `bytes` is consumed as a `Bytes` (zero-copy when the caller
 /// already holds one); large payloads chunk automatically per the
@@ -147,7 +171,11 @@ pub async fn publish_with_blob(
 
     // Step 2: store via the adapter. `MeshBlobAdapter::store`
     // re-chunks + verifies, so passing `&bytes` works for both
-    // Small and Manifest variants uniformly.
+    // Small and Manifest variants uniformly. Per the module-level
+    // ordering caveat, this is the step that may emit per-chunk
+    // `causal:<hex>` advertisements via the substrate's
+    // replication runtime — before the manifest event reaches
+    // the wire in step 4.
     adapter.store(&blob_ref, &bytes).await?;
 
     // Step 3: durability wait.
@@ -263,6 +291,38 @@ mod tests {
         let blob_ref = BlobRef::small("mesh://ghost", [0xFF; 32], 0);
         let err = adapter.sync_blob(&blob_ref).await.unwrap_err();
         assert!(matches!(err, BlobError::NotFound(_)));
+    }
+
+    /// After `store + sync_blob` on a multi-chunk manifest, every
+    /// chunk is locally fetchable — pinning the durability bound
+    /// the consumer relies on once the manifest event reaches the
+    /// wire. The per-chunk causal-advertisement timing is
+    /// documented in the module header; this test pins what the
+    /// publisher *guarantees* the consumer about chunk
+    /// availability by the time `publish_with_blob` returns.
+    #[tokio::test]
+    async fn every_chunk_is_locally_fetchable_after_store_and_sync() {
+        use super::super::blob_ref::{ChunkRef, BLOB_CHUNK_SIZE_BYTES};
+
+        let (adapter, _root) = make_persistent_adapter();
+        // Two-chunk payload so we exercise more than one channel.
+        let payload: Vec<u8> = (0..(BLOB_CHUNK_SIZE_BYTES as usize + 4096))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let chunked = chunk_payload(&payload).unwrap();
+        let chunk_refs: Vec<ChunkRef> = match chunked {
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
+            _ => panic!("expected Chunked"),
+        };
+        assert!(chunk_refs.len() >= 2, "test fixture must produce ≥2 chunks");
+        let blob_ref = BlobRef::manifest("mesh://pwb", Encoding::Replicated, chunk_refs.clone())
+            .expect("manifest");
+        adapter.store(&blob_ref, &payload).await.unwrap();
+        adapter.sync_blob(&blob_ref).await.unwrap();
+        // The full-blob fetch path concatenates every chunk —
+        // success here pins per-chunk local reachability.
+        let fetched: Vec<u8> = adapter.fetch(&blob_ref).await.unwrap();
+        assert_eq!(fetched, payload);
     }
 
     /// `sync_blob` walks every chunk of a Manifest, not just the
