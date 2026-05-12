@@ -56,6 +56,14 @@ redex = ["net", "dep:tokio-stream", "dep:postcard"]
 redex-disk = ["redex"]
 cortex = ["redex"]
 netdb = ["cortex"]
+# MeshDB (Atomic Playboys) — federated query layer above the
+# capability-query primitives + CortEX folds. AST + planner
+# + executor for time-travel / lineage / cross-chain joins /
+# streaming aggregates across many nodes and chains.
+# Disabled by default; activation requires a concrete consumer
+# workload (Hermes telemetry + Deck metrics are the named
+# candidates). See `docs/plans/MESHDB_PLAN.md`.
+meshdb = ["cortex"]
 # Dataforts (Rebel Yell) — compile the dataforts module surface,
 # which covers every phase the plan calls runtime-toggleable:
 # greedy-LRU caching (Phase 1), data-gravity heat counters
