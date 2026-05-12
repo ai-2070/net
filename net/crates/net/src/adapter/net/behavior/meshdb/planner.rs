@@ -98,17 +98,17 @@ pub enum OperatorPlan {
     /// Read a single event at `seq` from one of the
     /// `target_nodes`.
     AtRead {
-        /// Resolved origin hash (post-`ChainRef::Discovered`
-        /// resolution).
-        origin: [u8; 32],
+        /// Resolved chain origin hash (post-`ChainRef::Discovered`
+        /// resolution; substrate `u64`).
+        origin: u64,
         /// Sequence number to read.
         seq: SeqNum,
     },
     /// Read events in `[start, end)` from one of the
     /// `target_nodes`. Half-open range.
     BetweenRead {
-        /// Resolved origin hash.
-        origin: [u8; 32],
+        /// Resolved chain origin hash.
+        origin: u64,
         /// Lower bound (inclusive).
         start: SeqNum,
         /// Upper bound (exclusive).
@@ -116,8 +116,8 @@ pub enum OperatorPlan {
     },
     /// Read the tip event from one of the `target_nodes`.
     LatestRead {
-        /// Resolved origin hash.
-        origin: [u8; 32],
+        /// Resolved chain origin hash.
+        origin: u64,
     },
     /// Composite — Filter inner rows by predicate. Phase E
     /// territory; the planner surface lands now so downstream
@@ -283,14 +283,32 @@ where
     }
 
     /// Plan an atomic `At(origin, seq)` read. Resolves the
-    /// origin via [`Self::resolve_origin`] then picks the
-    /// proximity-nearest holder advertising
-    /// `causal:<hex>:<tip_seq>` whose tip is `>= seq`. Phase A
-    /// is permissive: any node carrying the chain qualifies;
-    /// Phase B narrows to seq-range-covering holders.
+    /// origin, then picks holders whose advertised
+    /// `causal:` coverage includes `seq` — either an
+    /// inclusive range covering `seq`, or a tip-form holder
+    /// whose tip is `>= seq` (tip-form implies the holder
+    /// has the full prefix up to that tip), or a presence-
+    /// form holder (which makes no range claim and is taken
+    /// as a permissive fallback). Targets are ordered by
+    /// proximity (RTT-asc; ties broken lex-NodeId).
+    ///
+    /// Returns `HistoricalRangeUnavailable` when no holder's
+    /// advertised coverage includes `seq`, with hints
+    /// extracted from every advertised range / tip.
     fn plan_at(&self, origin: &ChainRef, seq: SeqNum) -> Result<OperatorNode, MeshError> {
         let origin_hash = self.resolve_origin(origin)?;
-        let targets = self.holders_of(&origin_hash);
+        let coverage = self.collect_coverage(origin_hash);
+        let targets = self.select_targets_at(&coverage, seq);
+        if targets.is_empty() && !coverage.is_empty() {
+            return Err(MeshError::HistoricalRangeUnavailable {
+                origin: origin_hash,
+                requested: seq..SeqNum(seq.0.saturating_add(1)),
+                available: coverage
+                    .into_iter()
+                    .filter_map(|c| c.claim.advertised())
+                    .collect(),
+            });
+        }
         let cost = self.atomic_cost(&targets);
         Ok(OperatorNode {
             operator: OperatorPlan::AtRead {
@@ -303,9 +321,21 @@ where
     }
 
     /// Plan an atomic `Between(origin, start, end)` read.
-    /// Phase A range gate: `start < end` required (otherwise
-    /// surface `PlannerError`); the holder must advertise the
-    /// chain. Phase B narrows to seq-range-aware routing.
+    /// Range gate: `start < end` (otherwise typed
+    /// `PlannerError`). Holder selection requires coverage
+    /// of the full requested range:
+    ///
+    /// - A tip-form holder (`causal:<hex>:<tip_seq>`) covers
+    ///   `[0, tip_seq + 1)`.
+    /// - A range-form holder (`causal:<hex>[s..e]`) covers
+    ///   `[s, e)` exactly.
+    /// - A presence-form holder (`causal:<hex>` bare) is
+    ///   admitted permissively — it makes no range claim
+    ///   and is treated as best-effort.
+    ///
+    /// Surfaces `HistoricalRangeUnavailable` when no holder
+    /// covers the full requested range, with available-range
+    /// hints from every covering / partial holder.
     fn plan_between(
         &self,
         origin: &ChainRef,
@@ -318,7 +348,18 @@ where
             });
         }
         let origin_hash = self.resolve_origin(origin)?;
-        let targets = self.holders_of(&origin_hash);
+        let coverage = self.collect_coverage(origin_hash);
+        let targets = self.select_targets_between(&coverage, start, end);
+        if targets.is_empty() && !coverage.is_empty() {
+            return Err(MeshError::HistoricalRangeUnavailable {
+                origin: origin_hash,
+                requested: start..end,
+                available: coverage
+                    .into_iter()
+                    .filter_map(|c| c.claim.advertised())
+                    .collect(),
+            });
+        }
         let cost = self.atomic_cost(&targets);
         Ok(OperatorNode {
             operator: OperatorPlan::BetweenRead {
@@ -331,10 +372,15 @@ where
         })
     }
 
-    /// Plan an atomic `Latest(origin)` read.
+    /// Plan an atomic `Latest(origin)` read. Any holder with
+    /// the chain in its capability index qualifies; tip-form
+    /// holders are preferred (their tip is the candidate
+    /// latest), then range-form (highest end-of-range), then
+    /// presence-form (no claim — best-effort fallback).
     fn plan_latest(&self, origin: &ChainRef) -> Result<OperatorNode, MeshError> {
         let origin_hash = self.resolve_origin(origin)?;
-        let targets = self.holders_of(&origin_hash);
+        let coverage = self.collect_coverage(origin_hash);
+        let targets = self.select_targets_latest(&coverage);
         let cost = self.atomic_cost(&targets);
         Ok(OperatorNode {
             operator: OperatorPlan::LatestRead {
@@ -346,17 +392,17 @@ where
     }
 
     /// Resolve a `ChainRef::OriginHash` or `ChainRef::Discovered`
-    /// to a concrete 32-byte origin hash.
+    /// to a concrete `u64` origin hash.
     ///
     /// For `Discovered`: rebuilds the typed `Predicate` from
     /// the stored `PredicateWire`, calls
     /// [`CapabilityQuery::filter`] on the capability index,
     /// then walks each matched node's `causal:<hex>` tags to
-    /// extract origin hashes. Phase A semantics: returns the
-    /// **first** origin hash (lex-sorted for determinism)
-    /// when multiple match. Multi-origin discovery (implicit
-    /// `Union` over all matched origins) lands in Phase B
-    /// when the executor learns to fan out across chains.
+    /// extract origin hashes. Returns the **first** origin
+    /// hash (lex-sorted for determinism) when multiple match.
+    /// Multi-origin discovery (implicit `Union` over all
+    /// matched origins) lands in Phase B when the executor
+    /// learns to fan out across chains.
     ///
     /// Errors:
     /// - `PlannerError` if the stored `PredicateWire` fails
@@ -364,7 +410,7 @@ where
     /// - `NoCapableHolder` if the predicate matches zero
     ///   nodes OR every matched node's caps carry no
     ///   `causal:` tag.
-    fn resolve_origin(&self, origin: &ChainRef) -> Result<[u8; 32], MeshError> {
+    fn resolve_origin(&self, origin: &ChainRef) -> Result<u64, MeshError> {
         match origin {
             ChainRef::OriginHash(h) => Ok(*h),
             ChainRef::Discovered(wire) => {
@@ -377,7 +423,7 @@ where
                 // Walk every matched node's caps + extract
                 // origins from `causal:<hex>*` tags. Dedupe +
                 // sort lex for determinism. Take the first.
-                let mut origins: std::collections::BTreeSet<[u8; 32]> =
+                let mut origins: std::collections::BTreeSet<u64> =
                     std::collections::BTreeSet::new();
                 for (_node_id, caps) in &candidates {
                     for tag in &caps.tags {
@@ -390,47 +436,113 @@ where
                     .into_iter()
                     .next()
                     .ok_or_else(|| MeshError::NoCapableHolder {
-                        origin: [0; 32],
+                        origin: 0,
                         requirement: format!("{:?}", predicate),
                     })
             }
         }
     }
 
-    /// Look up the set of `node_id`s holding `origin_hash`'s
-    /// chain. Phase A heuristic: scans the capability index
-    /// for `causal:<hex>*` reserved tags advertising the
-    /// origin, returns the deduped list lexicographically
-    /// sorted for determinism.
-    fn holders_of(&self, origin_hash: &[u8; 32]) -> Vec<u64> {
-        let hex = hex32(origin_hash);
-        // Use the existing capability index's `find_first_host`
-        // shape by scanning all nodes for a matching
-        // `causal:<hex>` reserved-prefix tag. We can't use
-        // `CapabilityQuery::match_axis` directly because
-        // `causal:` is `Tag::Reserved`, not `Tag::AxisPresent` /
-        // `AxisValue` — the typed axes don't cover it.
-        let mut holders: Vec<u64> = self
-            .capability_index
-            .all_nodes()
-            .into_iter()
-            .filter(|nid| {
-                self.capability_index
-                    .with_caps(*nid, |caps| {
-                        caps.tags.iter().any(|t| is_causal_for(t, &hex))
-                    })
-                    .unwrap_or(false)
-            })
-            .collect();
-        // Sort for determinism. `nearest`-style proximity
-        // ordering can layer on top in Phase A.3 once we wire
-        // the rtt_lookup; Phase A here ships the deterministic
-        // baseline.
-        holders.sort_unstable();
-        holders
+    /// Walk the capability index for every node advertising
+    /// `causal:<hex>*` for `origin_hash`. Each match emits one
+    /// [`HolderCoverage`] carrying the node_id, its RTT (if
+    /// the proximity graph has measured one), and the
+    /// advertised range / tip / presence form. Used by the
+    /// atomic operators' target-selection paths to narrow
+    /// to coverage-satisfying holders.
+    ///
+    /// Result is sorted in the canonical priority order
+    /// (RTT-asc, lex-NodeId tiebreak) so target selection is
+    /// deterministic across runs (load-bearing for the
+    /// locked-decision-#4 cache key).
+    fn collect_coverage(&self, origin_hash: u64) -> Vec<HolderCoverage> {
+        let hex = chain_hex(origin_hash);
+        let mut out: Vec<HolderCoverage> = Vec::new();
+        for node_id in self.capability_index.all_nodes() {
+            // Each node may advertise multiple `causal:`
+            // variants for the same chain (presence + tip +
+            // range during transitions). Pick the most
+            // specific one — range > tip > presence — so
+            // the planner gets the tightest claim.
+            let claim = self
+                .capability_index
+                .with_caps(node_id, |caps| {
+                    caps.tags
+                        .iter()
+                        .filter_map(|t| parse_causal_claim(t, &hex))
+                        .max_by_key(specificity_rank)
+                })
+                .unwrap_or(None);
+            if let Some(claim) = claim {
+                out.push(HolderCoverage {
+                    node_id,
+                    rtt: (self.rtt_lookup)(node_id),
+                    claim,
+                });
+            }
+        }
+        sort_by_proximity(&mut out);
+        out
     }
 
-    /// Cost-estimate stub for atomic operators (Phase A).
+    /// Select target node_ids for an `At(seq)` query. Walks
+    /// the pre-sorted (proximity-first, lex tiebreak)
+    /// coverage list and keeps holders whose claim covers
+    /// `seq`. Result preserves the priority order.
+    fn select_targets_at(&self, coverage: &[HolderCoverage], seq: SeqNum) -> Vec<u64> {
+        coverage
+            .iter()
+            .filter(|c| c.claim.covers_seq(seq))
+            .map(|c| c.node_id)
+            .collect()
+    }
+
+    /// Select target node_ids for a `Between(start, end)`
+    /// query. Walks the pre-sorted coverage list and keeps
+    /// holders whose claim covers the full `[start, end)`
+    /// requested range.
+    fn select_targets_between(
+        &self,
+        coverage: &[HolderCoverage],
+        start: SeqNum,
+        end: SeqNum,
+    ) -> Vec<u64> {
+        coverage
+            .iter()
+            .filter(|c| c.claim.covers_range(start, end))
+            .map(|c| c.node_id)
+            .collect()
+    }
+
+    /// Select target node_ids for a `Latest` query. Any
+    /// holder with the chain qualifies — there's no
+    /// coverage requirement since "latest" is whatever the
+    /// holder has on top. Order: holders advertising the
+    /// **highest** known tip first (most-current data); then
+    /// remaining holders in proximity order. Within
+    /// equal-tip holders, proximity-asc with lex-NodeId
+    /// tiebreak (inherited from `coverage`'s pre-sort).
+    fn select_targets_latest(&self, coverage: &[HolderCoverage]) -> Vec<u64> {
+        let mut with_tip: Vec<&HolderCoverage> = coverage
+            .iter()
+            .filter(|c| c.claim.latest_tip().is_some())
+            .collect();
+        // Stable sort so the proximity-sort within
+        // equal-tip groups carries through. Descending tip
+        // = larger first.
+        with_tip.sort_by_key(|c| std::cmp::Reverse(c.claim.latest_tip()));
+        let mut out: Vec<u64> = with_tip.iter().map(|c| c.node_id).collect();
+        // Append presence-only holders (no tip claim) in the
+        // pre-sorted order — they're the best-effort fallback.
+        for c in coverage {
+            if c.claim.latest_tip().is_none() {
+                out.push(c.node_id);
+            }
+        }
+        out
+    }
+
+    /// Cost-estimate stub for atomic operators.
     /// Bandwidth: heuristic constant per target node.
     /// Latency: proximity RTT to the nearest target, or
     /// `0` if no RTT data exists for any target.
@@ -497,47 +609,176 @@ fn sum_cost(node: &OperatorNode) -> CostEstimate {
     acc
 }
 
-/// Lowercase hex of a 32-byte origin hash. Matches the
-/// `chain_hex` convention used throughout the substrate.
-fn hex32(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(64);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+/// One holder's seq-coverage claim for an origin. Built by
+/// [`parse_causal_claim`] from a single `causal:<hex>*`
+/// reserved tag; carried alongside the holder's node_id +
+/// RTT inside [`HolderCoverage`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CausalClaim {
+    /// Bare `causal:<hex>` — no range claim. Permissive
+    /// fallback: the holder has the chain in some form,
+    /// but doesn't advertise what range.
+    Presence,
+    /// `causal:<hex>:<tip_seq>` — the holder advertises a
+    /// full prefix up to and including `tip_seq`. Covers
+    /// `[0, tip_seq + 1)`.
+    Tip { tip_seq: SeqNum },
+    /// `causal:<hex>[start..end]` — the holder advertises
+    /// exactly the half-open range `[start, end)`.
+    Range { start: SeqNum, end: SeqNum },
 }
 
-/// Is `tag` a `causal:<hex>*` reserved tag for the supplied
-/// origin-hash hex string? Mirrors `MeshNode::is_causal_for`
-/// (which is private); duplicated here so the planner doesn't
-/// depend on the mesh layer.
-fn is_causal_for(tag: &Tag, origin_hex: &str) -> bool {
-    if let Tag::Reserved { prefix, body } = tag {
-        if prefix != "causal:" {
-            return false;
+impl CausalClaim {
+    /// Does this claim cover the requested single `seq`?
+    /// `Presence` is permissive (best-effort).
+    fn covers_seq(&self, seq: SeqNum) -> bool {
+        match self {
+            Self::Presence => true,
+            Self::Tip { tip_seq } => seq.0 <= tip_seq.0,
+            Self::Range { start, end } => seq.0 >= start.0 && seq.0 < end.0,
         }
-        // `<hex>` exact match, or `<hex>:<tip_seq>`, or
-        // `<hex>[start..end]` — match the prefix up to the
-        // first `:` / `[` / end-of-string.
-        let stem = body
-            .split_once([':', '['])
-            .map(|(s, _)| s)
-            .unwrap_or(body.as_str());
-        stem == origin_hex
-    } else {
-        false
+    }
+
+    /// Does this claim cover the half-open requested range
+    /// `[start, end)` in full? `Presence` is permissive.
+    fn covers_range(&self, start: SeqNum, end: SeqNum) -> bool {
+        match self {
+            Self::Presence => true,
+            Self::Tip { tip_seq } => end.0 <= tip_seq.0.saturating_add(1),
+            Self::Range { start: s, end: e } => s.0 <= start.0 && end.0 <= e.0,
+        }
+    }
+
+    /// Render the claim as an advertised half-open range
+    /// (for `HistoricalRangeUnavailable.available` hints).
+    /// `None` for `Presence` (no advertised range).
+    fn advertised(&self) -> Option<std::ops::Range<SeqNum>> {
+        match self {
+            Self::Presence => None,
+            Self::Tip { tip_seq } => {
+                Some(SeqNum(0)..SeqNum(tip_seq.0.saturating_add(1)))
+            }
+            Self::Range { start, end } => Some(*start..*end),
+        }
+    }
+
+    /// Highest seq the claim implies the holder has. `None`
+    /// for `Presence` (no claim). Used by `Latest` target
+    /// selection to prefer the most-current data.
+    fn latest_tip(&self) -> Option<SeqNum> {
+        match self {
+            Self::Presence => None,
+            Self::Tip { tip_seq } => Some(*tip_seq),
+            Self::Range { end, .. } => Some(SeqNum(end.0.saturating_sub(1))),
+        }
     }
 }
 
-/// Extract the 32-byte origin hash from a `causal:<hex>*`
+/// One node's coverage record for a particular origin —
+/// node_id, measured RTT (if any), and the parsed
+/// `causal:` claim. Carried in the planner's coverage list.
+#[derive(Clone, Debug)]
+struct HolderCoverage {
+    /// node_id of the holder.
+    node_id: u64,
+    /// Round-trip-time from the local node to this holder
+    /// per the proximity graph. `None` when no
+    /// measurement exists yet.
+    rtt: Option<Duration>,
+    /// What the holder advertises about its coverage.
+    claim: CausalClaim,
+}
+
+/// Specificity rank for `max_by_key` selection within a
+/// single holder's `causal:` tag set. Higher = tighter
+/// coverage claim. `Range` > `Tip` > `Presence`.
+fn specificity_rank(claim: &CausalClaim) -> u8 {
+    match claim {
+        CausalClaim::Range { .. } => 2,
+        CausalClaim::Tip { .. } => 1,
+        CausalClaim::Presence => 0,
+    }
+}
+
+/// Sort `coverage` in-place by canonical priority:
+/// RTT-asc (closer first), unmeasured-RTT last, lex-NodeId
+/// tiebreak. Stable so equal-priority holders stay in
+/// node_id order across runs (load-bearing for the locked-
+/// decision-#4 cache key).
+fn sort_by_proximity(coverage: &mut [HolderCoverage]) {
+    coverage.sort_by(|a, b| match (a.rtt, b.rtt) {
+        (Some(ra), Some(rb)) => ra.cmp(&rb).then_with(|| a.node_id.cmp(&b.node_id)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.node_id.cmp(&b.node_id),
+    });
+}
+
+/// Lowercase 16-char hex of a `u64` origin hash. Mirrors
+/// `MeshNode::chain_hex` (which is private); duplicated
+/// here so the planner doesn't depend on the mesh layer.
+fn chain_hex(origin_hash: u64) -> String {
+    format!("{origin_hash:016x}")
+}
+
+/// Parse a `causal:<hex>*` reserved tag, matching on the
+/// supplied `origin_hex` stem. Returns `None` if the tag
+/// isn't a `causal:` tag, the body's stem doesn't match,
+/// or the variant suffix doesn't parse cleanly.
+///
+/// Recognized shapes (per `CAPABILITY_SYSTEM_PLAN.md` § 2):
+///
+/// - `causal:<hex>` → [`CausalClaim::Presence`]
+/// - `causal:<hex>:<tip_seq>` → [`CausalClaim::Tip`]
+/// - `causal:<hex>[<start>..<end>]` → [`CausalClaim::Range`]
+fn parse_causal_claim(tag: &Tag, origin_hex: &str) -> Option<CausalClaim> {
+    let Tag::Reserved { prefix, body } = tag else {
+        return None;
+    };
+    if prefix != "causal:" {
+        return None;
+    }
+    if !body.starts_with(origin_hex) {
+        return None;
+    }
+    let rest = &body[origin_hex.len()..];
+    if rest.is_empty() {
+        return Some(CausalClaim::Presence);
+    }
+    if let Some(tip_str) = rest.strip_prefix(':') {
+        // tip-form: parse the rest as decimal u64
+        let tip: u64 = tip_str.parse().ok()?;
+        return Some(CausalClaim::Tip {
+            tip_seq: SeqNum(tip),
+        });
+    }
+    if let Some(range_body) = rest.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        // range-form: `<start>..<end>` half-open
+        let (start_str, end_str) = range_body.split_once("..")?;
+        let start: u64 = start_str.parse().ok()?;
+        let end: u64 = end_str.parse().ok()?;
+        if start >= end {
+            // Substrate emits half-open with `start < end`; a
+            // degenerate range is malformed.
+            return None;
+        }
+        return Some(CausalClaim::Range {
+            start: SeqNum(start),
+            end: SeqNum(end),
+        });
+    }
+    // Unknown suffix shape — reject rather than partial-match.
+    None
+}
+
+/// Extract the `u64` origin hash from a `causal:<hex>*`
 /// reserved tag. Returns `None` if the tag isn't a `causal:`
-/// reserved tag, the body's stem isn't 64 hex chars, or any
+/// reserved tag, the body's stem isn't 16 hex chars, or any
 /// nibble fails to parse.
 ///
 /// Used by `ChainRef::Discovered` resolution to map every
 /// matched node's caps to its set of advertised origin hashes.
-fn parse_causal_origin(tag: &Tag) -> Option<[u8; 32]> {
+fn parse_causal_origin(tag: &Tag) -> Option<u64> {
     let Tag::Reserved { prefix, body } = tag else {
         return None;
     };
@@ -548,19 +789,16 @@ fn parse_causal_origin(tag: &Tag) -> Option<[u8; 32]> {
         .split_once([':', '['])
         .map(|(s, _)| s)
         .unwrap_or(body.as_str());
-    if stem.len() != 64 {
+    if stem.len() != 16 {
         return None;
     }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let pair = stem.get(i * 2..i * 2 + 2)?;
-        *byte = u8::from_str_radix(pair, 16).ok()?;
-    }
-    Some(out)
+    u64::from_str_radix(stem, 16).ok()
 }
 
-// Silence unused-import warning when no operator uses the
-// imported types in a particular planner-build configuration.
+// Silence unused-import warning under feature-conditional
+// configurations of the planner. `TaxonomyAxis` is held for
+// future reference by Phase B's discovery-time match_axis
+// path; `CapabilityQuery` is the trait the index implements.
 #[allow(dead_code)]
 const _PLANNER_USES_TAXONOMY_AXIS: TaxonomyAxis = TaxonomyAxis::Dataforts;
 #[allow(dead_code)]
@@ -569,35 +807,73 @@ fn _planner_uses_capability_query<Q: CapabilityQuery>(_q: &Q) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilityIndex, CapabilitySet};
+    use crate::adapter::net::behavior::capability::{
+        CapabilityAnnouncement, CapabilityIndex, CapabilitySet,
+    };
     use crate::adapter::net::identity::EntityId;
 
-    /// Build a fresh capability set carrying a single
-    /// `causal:<hex>` reserved tag for `origin_hash`. The
-    /// public `add_tag` builder silently drops reserved-
-    /// prefix tags (it routes through `Tag::parse_user`), so
-    /// the tests build the tag directly via `Tag::Reserved`
-    /// to mimic what `MeshNode::announce_chain` emits.
-    fn caps_with_causal(origin_hash: &[u8; 32]) -> CapabilitySet {
-        let hex = hex32(origin_hash);
-        let mut caps = CapabilitySet::new();
-        caps.tags.insert(Tag::Reserved {
+    /// Build a single `causal:<body>` reserved tag from the
+    /// supplied body string. The `add_tag` builder silently
+    /// drops reserved-prefix tags (it routes through
+    /// `Tag::parse_user`), so the tests build the tag directly
+    /// via `Tag::Reserved` to mimic what
+    /// `MeshNode::announce_chain` / `announce_chain_range`
+    /// emits at runtime.
+    fn causal_tag(body: impl Into<String>) -> Tag {
+        Tag::Reserved {
             prefix: "causal:".to_string(),
-            body: hex,
-        });
+            body: body.into(),
+        }
+    }
+
+    /// Build a fresh capability set carrying a single
+    /// `causal:<hex>` presence-form tag for `origin_hash`.
+    fn caps_with_causal_presence(origin_hash: u64) -> CapabilitySet {
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(causal_tag(chain_hex(origin_hash)));
         caps
     }
 
-    fn make_index_with_holder(node_id: u64, origin_hash: &[u8; 32]) -> CapabilityIndex {
-        let caps = caps_with_causal(origin_hash);
+    /// Build a fresh capability set carrying a single
+    /// `causal:<hex>:<tip>` tip-form tag for `origin_hash`.
+    fn caps_with_causal_tip(origin_hash: u64, tip: u64) -> CapabilitySet {
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(causal_tag(format!(
+            "{}:{}",
+            chain_hex(origin_hash),
+            tip
+        )));
+        caps
+    }
+
+    /// Build a fresh capability set carrying a single
+    /// `causal:<hex>[start..end]` range-form tag.
+    fn caps_with_causal_range(origin_hash: u64, start: u64, end: u64) -> CapabilitySet {
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(causal_tag(format!(
+            "{}[{}..{}]",
+            chain_hex(origin_hash),
+            start,
+            end
+        )));
+        caps
+    }
+
+    fn index_with(holders: Vec<(u64, CapabilitySet)>) -> CapabilityIndex {
         let index = CapabilityIndex::new();
-        index.index(CapabilityAnnouncement::new(
-            node_id,
-            EntityId::from_bytes([0x11; 32]),
-            1,
-            caps,
-        ));
+        for (node_id, caps) in holders {
+            index.index(CapabilityAnnouncement::new(
+                node_id,
+                EntityId::from_bytes([node_id as u8; 32]),
+                1,
+                caps,
+            ));
+        }
         index
+    }
+
+    fn make_index_with_holder(node_id: u64, origin_hash: u64) -> CapabilityIndex {
+        index_with(vec![(node_id, caps_with_causal_presence(origin_hash))])
     }
 
     fn empty_index() -> CapabilityIndex {
@@ -608,10 +884,180 @@ mod tests {
         None
     }
 
+    // ========================================================================
+    // CausalClaim parsing + coverage semantics
+    // ========================================================================
+
+    #[test]
+    fn parse_causal_presence_form() {
+        let origin = 0xDEAD_BEEF_CAFE_BABE_u64;
+        let hex = chain_hex(origin);
+        let claim = parse_causal_claim(&causal_tag(hex.clone()), &hex);
+        assert_eq!(claim, Some(CausalClaim::Presence));
+    }
+
+    #[test]
+    fn parse_causal_tip_form() {
+        let origin = 0x1234_5678_9ABC_DEF0_u64;
+        let hex = chain_hex(origin);
+        let claim = parse_causal_claim(&causal_tag(format!("{hex}:1000")), &hex);
+        assert_eq!(claim, Some(CausalClaim::Tip { tip_seq: SeqNum(1000) }));
+    }
+
+    #[test]
+    fn parse_causal_range_form() {
+        let origin = 0xAAAA_BBBB_CCCC_DDDD_u64;
+        let hex = chain_hex(origin);
+        let claim = parse_causal_claim(&causal_tag(format!("{hex}[100..500]")), &hex);
+        assert_eq!(
+            claim,
+            Some(CausalClaim::Range {
+                start: SeqNum(100),
+                end: SeqNum(500),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_causal_rejects_inverted_range() {
+        // Degenerate `[start..end]` with `start >= end` is
+        // malformed per the substrate emitter's contract.
+        let hex = chain_hex(1);
+        let claim = parse_causal_claim(&causal_tag(format!("{hex}[500..100]")), &hex);
+        assert_eq!(claim, None);
+    }
+
+    #[test]
+    fn parse_causal_rejects_unknown_suffix() {
+        let hex = chain_hex(1);
+        let claim = parse_causal_claim(&causal_tag(format!("{hex}?weird")), &hex);
+        assert_eq!(claim, None);
+    }
+
+    #[test]
+    fn parse_causal_rejects_wrong_hash() {
+        // `causal:<otherhex>:42` shouldn't match a query for
+        // a different chain even if it parses.
+        let other_hex = chain_hex(0xFFFF);
+        let claim = parse_causal_claim(&causal_tag(format!("{other_hex}:42")), &chain_hex(0xAAAA));
+        assert_eq!(claim, None);
+    }
+
+    #[test]
+    fn causal_claim_covers_seq_semantics() {
+        assert!(CausalClaim::Presence.covers_seq(SeqNum(0)));
+        assert!(CausalClaim::Presence.covers_seq(SeqNum(u64::MAX)));
+
+        let tip = CausalClaim::Tip { tip_seq: SeqNum(100) };
+        assert!(tip.covers_seq(SeqNum(0)));
+        assert!(tip.covers_seq(SeqNum(100)));
+        assert!(!tip.covers_seq(SeqNum(101)));
+
+        let range = CausalClaim::Range {
+            start: SeqNum(50),
+            end: SeqNum(150),
+        };
+        assert!(!range.covers_seq(SeqNum(49)));
+        assert!(range.covers_seq(SeqNum(50)));
+        assert!(range.covers_seq(SeqNum(149)));
+        assert!(!range.covers_seq(SeqNum(150))); // half-open
+    }
+
+    #[test]
+    fn causal_claim_covers_range_semantics() {
+        assert!(CausalClaim::Presence.covers_range(SeqNum(0), SeqNum(1_000)));
+
+        let tip = CausalClaim::Tip { tip_seq: SeqNum(100) };
+        // Tip covers [0, 101); requested end must be <= 101.
+        assert!(tip.covers_range(SeqNum(0), SeqNum(101)));
+        assert!(tip.covers_range(SeqNum(50), SeqNum(101)));
+        assert!(!tip.covers_range(SeqNum(0), SeqNum(102)));
+
+        let range = CausalClaim::Range {
+            start: SeqNum(100),
+            end: SeqNum(200),
+        };
+        assert!(range.covers_range(SeqNum(100), SeqNum(200)));
+        assert!(range.covers_range(SeqNum(150), SeqNum(175)));
+        assert!(!range.covers_range(SeqNum(50), SeqNum(150))); // starts below
+        assert!(!range.covers_range(SeqNum(150), SeqNum(250))); // ends above
+    }
+
+    #[test]
+    fn causal_claim_advertised_renders_half_open_range() {
+        assert_eq!(CausalClaim::Presence.advertised(), None);
+        assert_eq!(
+            (CausalClaim::Tip { tip_seq: SeqNum(99) }).advertised(),
+            Some(SeqNum(0)..SeqNum(100))
+        );
+        assert_eq!(
+            (CausalClaim::Range {
+                start: SeqNum(10),
+                end: SeqNum(50),
+            })
+            .advertised(),
+            Some(SeqNum(10)..SeqNum(50))
+        );
+    }
+
+    #[test]
+    fn causal_claim_latest_tip_ordering() {
+        assert_eq!(CausalClaim::Presence.latest_tip(), None);
+        assert_eq!(
+            (CausalClaim::Tip { tip_seq: SeqNum(42) }).latest_tip(),
+            Some(SeqNum(42))
+        );
+        // Range advertises `[start, end)` — latest is end-1.
+        assert_eq!(
+            (CausalClaim::Range {
+                start: SeqNum(10),
+                end: SeqNum(50),
+            })
+            .latest_tip(),
+            Some(SeqNum(49))
+        );
+    }
+
+    #[test]
+    fn parse_causal_origin_extracts_u64_from_each_form() {
+        let origin = 0xCAFE_BABE_DEAD_BEEF_u64;
+        let hex = chain_hex(origin);
+
+        // presence form
+        assert_eq!(parse_causal_origin(&causal_tag(hex.clone())), Some(origin));
+        // tip form
+        assert_eq!(
+            parse_causal_origin(&causal_tag(format!("{hex}:42"))),
+            Some(origin)
+        );
+        // range form
+        assert_eq!(
+            parse_causal_origin(&causal_tag(format!("{hex}[0..100]"))),
+            Some(origin)
+        );
+        // non-causal tag
+        assert_eq!(
+            parse_causal_origin(&Tag::Reserved {
+                prefix: "heat:".to_string(),
+                body: hex.clone(),
+            }),
+            None
+        );
+        // wrong-length stem
+        assert_eq!(
+            parse_causal_origin(&causal_tag("abc".to_string())),
+            None
+        );
+    }
+
+    // ========================================================================
+    // Atomic-operator planning (At / Between / Latest)
+    // ========================================================================
+
     #[test]
     fn plan_latest_returns_atomic_with_holder() {
-        let origin = [0xAB; 32];
-        let index = make_index_with_holder(42, &origin);
+        let origin = 0xABAB_ABAB_ABAB_ABAB_u64;
+        let index = make_index_with_holder(42, origin);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
@@ -627,16 +1073,16 @@ mod tests {
 
     #[test]
     fn plan_latest_with_no_holders_returns_empty_targets() {
-        // Phase A: the planner doesn't fail here — it produces
-        // a plan with an empty target list. The executor
-        // surfaces `HistoricalRangeUnavailable` when the plan
-        // runs against the empty target set. This split lets
-        // the test suite plan against empty indices.
+        // When no holder advertises the chain at all, the
+        // planner emits an empty target list rather than
+        // failing — the executor surfaces
+        // `HistoricalRangeUnavailable` against that empty
+        // set. (Phase A semantics; preserved in Phase B.)
         let index = empty_index();
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
-                origin: ChainRef::OriginHash([0; 32]),
+                origin: ChainRef::OriginHash(0),
             }))
             .expect("plan ok");
         assert!(plan.root.target_nodes.is_empty());
@@ -648,7 +1094,7 @@ mod tests {
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let err = planner
             .plan(&MeshQuery::V1(QueryV1::Between {
-                origin: ChainRef::OriginHash([0; 32]),
+                origin: ChainRef::OriginHash(0),
                 start: SeqNum(100),
                 end: SeqNum(50),
             }))
@@ -660,9 +1106,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_between_accepts_valid_range() {
-        let origin = [0x42; 32];
-        let index = make_index_with_holder(7, &origin);
+    fn plan_between_accepts_valid_range_with_covering_holder() {
+        // Holder advertises tip 1000 → covers [0, 1001). The
+        // requested [0, 1000) fits.
+        let origin = 0x4242_4242_4242_4242_u64;
+        let index = index_with(vec![(7, caps_with_causal_tip(origin, 1000))]);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Between {
@@ -678,12 +1126,13 @@ mod tests {
             }
             other => panic!("expected BetweenRead; got {other:?}"),
         }
+        assert_eq!(plan.root.target_nodes, vec![7]);
     }
 
     #[test]
     fn plan_at_routes_to_holder() {
-        let origin = [0xCC; 32];
-        let index = make_index_with_holder(99, &origin);
+        let origin = 0xCCCC_CCCC_CCCC_CCCC_u64;
+        let index = make_index_with_holder(99, origin);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::At {
@@ -702,23 +1151,17 @@ mod tests {
     }
 
     #[test]
-    fn plan_holders_sorted_for_determinism() {
-        // Two holders for the same chain — `holders_of` must
-        // return them in lexicographic node_id order so the
-        // plan is deterministic across runs.
-        let origin = [0xEE; 32];
-        let caps = caps_with_causal(&origin);
-        let index = CapabilityIndex::new();
-        // Insert in non-monotonic order to prove the sort
-        // happens inside `holders_of`.
-        for nid in [200u64, 50, 100] {
-            index.index(CapabilityAnnouncement::new(
-                nid,
-                EntityId::from_bytes([nid as u8; 32]),
-                1,
-                caps.clone(),
-            ));
-        }
+    fn plan_holders_lex_sorted_when_no_rtt() {
+        // No RTT data → fall back to lex-NodeId order for
+        // determinism. Three holders inserted in non-monotonic
+        // order; planner sort restores lex.
+        let origin = 0xEEEE_EEEE_EEEE_EEEE_u64;
+        let caps = caps_with_causal_presence(origin);
+        let index = index_with(vec![
+            (200, caps.clone()),
+            (50, caps.clone()),
+            (100, caps),
+        ]);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
@@ -728,33 +1171,252 @@ mod tests {
         assert_eq!(plan.root.target_nodes, vec![50, 100, 200]);
     }
 
+    // ========================================================================
+    // Phase B — replica-aware routing
+    // ========================================================================
+
+    #[test]
+    fn at_picks_holder_whose_tip_covers_seq() {
+        // Two holders: one with tip 50, one with tip 200.
+        // Query `At(100)` — only the tip-200 holder covers.
+        let origin = 0x1111_2222_3333_4444_u64;
+        let index = index_with(vec![
+            (50, caps_with_causal_tip(origin, 50)),
+            (200, caps_with_causal_tip(origin, 200)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::At {
+                origin: ChainRef::OriginHash(origin),
+                seq: SeqNum(100),
+            }))
+            .unwrap();
+        assert_eq!(plan.root.target_nodes, vec![200]);
+    }
+
+    #[test]
+    fn between_picks_only_holders_with_full_coverage() {
+        // Three holders. Query `Between(100, 500)`.
+        // - holder A: range [0..400] — doesn't cover (end<500)
+        // - holder B: range [50..600] — covers
+        // - holder C: tip 700 — covers (full prefix up to 700)
+        let origin = 0xFEED_FACE_FEED_FACE_u64;
+        let index = index_with(vec![
+            (1, caps_with_causal_range(origin, 0, 400)),
+            (2, caps_with_causal_range(origin, 50, 600)),
+            (3, caps_with_causal_tip(origin, 700)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::Between {
+                origin: ChainRef::OriginHash(origin),
+                start: SeqNum(100),
+                end: SeqNum(500),
+            }))
+            .unwrap();
+        // Holders B + C qualify; lex-sort puts them as [2, 3].
+        assert_eq!(plan.root.target_nodes, vec![2, 3]);
+    }
+
+    #[test]
+    fn between_surfaces_historical_range_unavailable_with_hints() {
+        // No holder covers the full requested range; planner
+        // surfaces `HistoricalRangeUnavailable` carrying the
+        // available-range hints for caller renegotiation.
+        let origin = 0xDEAD_DEAD_DEAD_DEAD_u64;
+        let index = index_with(vec![
+            (1, caps_with_causal_range(origin, 0, 100)),
+            (2, caps_with_causal_tip(origin, 50)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner
+            .plan(&MeshQuery::V1(QueryV1::Between {
+                origin: ChainRef::OriginHash(origin),
+                start: SeqNum(0),
+                end: SeqNum(500),
+            }))
+            .expect_err("no holder covers [0, 500)");
+        match err {
+            MeshError::HistoricalRangeUnavailable {
+                origin: o,
+                requested,
+                available,
+            } => {
+                assert_eq!(o, origin);
+                assert_eq!(requested, SeqNum(0)..SeqNum(500));
+                // Both holders' advertised ranges surface as
+                // hints. Order: per-coverage-list (proximity
+                // then lex); both unmeasured here so lex.
+                assert_eq!(
+                    available,
+                    vec![SeqNum(0)..SeqNum(100), SeqNum(0)..SeqNum(51)]
+                );
+            }
+            other => panic!("expected HistoricalRangeUnavailable; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn at_surfaces_historical_range_unavailable_when_no_coverage() {
+        // Holder advertises tip 50; query asks for seq 100.
+        let origin = 0xBABE_BABE_BABE_BABE_u64;
+        let index = index_with(vec![(1, caps_with_causal_tip(origin, 50))]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner
+            .plan(&MeshQuery::V1(QueryV1::At {
+                origin: ChainRef::OriginHash(origin),
+                seq: SeqNum(100),
+            }))
+            .expect_err("seq beyond tip");
+        match err {
+            MeshError::HistoricalRangeUnavailable {
+                requested,
+                available,
+                ..
+            } => {
+                // Requested rendered as a single-seq range.
+                assert_eq!(requested, SeqNum(100)..SeqNum(101));
+                assert_eq!(available, vec![SeqNum(0)..SeqNum(51)]);
+            }
+            other => panic!("expected HistoricalRangeUnavailable; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presence_form_holder_is_permissive_fallback() {
+        // A holder advertising bare `causal:<hex>` (no range
+        // claim) is admitted permissively — it makes no
+        // claim about coverage, so the executor will
+        // attempt the read and surface
+        // HistoricalRangeUnavailable if the read actually
+        // fails. Phase B planner trusts the presence claim.
+        let origin = 0xFADE_FADE_FADE_FADE_u64;
+        let index = index_with(vec![(1, caps_with_causal_presence(origin))]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::At {
+                origin: ChainRef::OriginHash(origin),
+                seq: SeqNum(999_999),
+            }))
+            .unwrap();
+        assert_eq!(plan.root.target_nodes, vec![1]);
+    }
+
+    #[test]
+    fn latest_prefers_holder_with_highest_tip() {
+        // Three holders with tips 50, 500, 200. Latest picks
+        // the holder with the highest tip first.
+        let origin = 0xCAFE_CAFE_CAFE_CAFE_u64;
+        let index = index_with(vec![
+            (1, caps_with_causal_tip(origin, 50)),
+            (2, caps_with_causal_tip(origin, 500)),
+            (3, caps_with_causal_tip(origin, 200)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::Latest {
+                origin: ChainRef::OriginHash(origin),
+            }))
+            .unwrap();
+        // Descending tip: 500 (node 2) > 200 (node 3) > 50 (node 1).
+        assert_eq!(plan.root.target_nodes, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn proximity_ordering_breaks_lex_default() {
+        // Three holders, all with bare presence claims. RTTs
+        // are 30ms, 10ms, 20ms for node_ids 100, 50, 200
+        // respectively. Lex order would be [50, 100, 200];
+        // proximity puts them in [50, 200, 100] order.
+        let origin = 0x3030_3030_3030_3030_u64;
+        let caps = caps_with_causal_presence(origin);
+        let index = index_with(vec![
+            (100, caps.clone()),
+            (50, caps.clone()),
+            (200, caps),
+        ]);
+        let rtt = |nid: u64| {
+            Some(match nid {
+                50 => Duration::from_millis(10),
+                200 => Duration::from_millis(20),
+                100 => Duration::from_millis(30),
+                _ => return None::<Duration>,
+            })
+        };
+        let planner = MeshQueryPlanner::new(&index, rtt);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::Latest {
+                origin: ChainRef::OriginHash(origin),
+            }))
+            .unwrap();
+        assert_eq!(plan.root.target_nodes, vec![50, 200, 100]);
+    }
+
+    #[test]
+    fn unmeasured_rtt_falls_last_lex_among_themselves() {
+        // RTT data exists for some holders, not others.
+        // Measured holders sort by RTT; unmeasured holders
+        // sort lex and land after every measured one.
+        let origin = 0x7070_7070_7070_7070_u64;
+        let caps = caps_with_causal_presence(origin);
+        let index = index_with(vec![
+            (1, caps.clone()),
+            (2, caps.clone()),
+            (3, caps.clone()),
+            (4, caps),
+        ]);
+        let rtt = |nid: u64| match nid {
+            2 => Some(Duration::from_millis(5)),
+            3 => Some(Duration::from_millis(15)),
+            _ => None,
+        };
+        let planner = MeshQueryPlanner::new(&index, rtt);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::Latest {
+                origin: ChainRef::OriginHash(origin),
+            }))
+            .unwrap();
+        // Measured: [2 (5ms), 3 (15ms)]; unmeasured: [1, 4].
+        assert_eq!(plan.root.target_nodes, vec![2, 3, 1, 4]);
+    }
+
+    #[test]
+    fn coverage_picks_most_specific_claim_when_holder_advertises_multiple() {
+        // One holder advertises BOTH presence AND tip 100.
+        // The planner picks the most specific (tip) so the
+        // coverage check uses the tighter claim.
+        let origin = 0x6060_6060_6060_6060_u64;
+        let hex = chain_hex(origin);
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(causal_tag(hex.clone())); // presence
+        caps.tags.insert(causal_tag(format!("{hex}:100"))); // tip 100
+        let index = index_with(vec![(7, caps)]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        // Query At(150) — only presence would qualify
+        // (permissive), but tip's `seq <= 100` rejects.
+        let err = planner
+            .plan(&MeshQuery::V1(QueryV1::At {
+                origin: ChainRef::OriginHash(origin),
+                seq: SeqNum(150),
+            }))
+            .expect_err("most-specific claim (tip) should not cover seq 150");
+        assert!(matches!(err, MeshError::HistoricalRangeUnavailable { .. }));
+    }
+
+    // ========================================================================
+    // ChainRef::Discovered resolution
+    // ========================================================================
+
     #[test]
     fn plan_chainref_discovered_resolves_via_filter() {
-        // The capability-system survey confirmed `filter` is the
-        // primitive Discovered resolution leans on. Set up a
-        // node carrying both a `dataforts.blob.storage` axis tag
-        // (matched by the predicate) AND a `causal:<hex>` reserved
-        // tag (extracted as the origin hash); the planner should
-        // resolve the predicate to the matching origin.
         use crate::adapter::net::behavior::predicate::Predicate;
         use crate::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
 
-        let origin = [0xCA; 32];
-        let hex = hex32(&origin);
-        let mut caps = CapabilitySet::new()
-            .add_tag("dataforts.blob.storage");
-        caps.tags.insert(Tag::Reserved {
-            prefix: "causal:".to_string(),
-            body: hex,
-        });
-        let index = CapabilityIndex::new();
-        index.index(CapabilityAnnouncement::new(
-            42,
-            EntityId::from_bytes([0x33; 32]),
-            1,
-            caps,
-        ));
-
+        let origin = 0xCAFE_BEEF_CAFE_BEEF_u64;
+        let hex = chain_hex(origin);
+        let mut caps = CapabilitySet::new().add_tag("dataforts.blob.storage");
+        caps.tags.insert(causal_tag(hex));
+        let index = index_with(vec![(42, caps)]);
         let pred = Predicate::Exists {
             key: TagKey {
                 axis: TaxonomyAxis::Dataforts,
@@ -776,9 +1438,6 @@ mod tests {
 
     #[test]
     fn plan_chainref_discovered_no_match_returns_no_capable_holder() {
-        // No node advertises `dataforts.blob.storage` → the
-        // predicate matches zero candidates → planner surfaces
-        // `NoCapableHolder` with the rendered requirement.
         use crate::adapter::net::behavior::predicate::Predicate;
         use crate::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
 
@@ -797,10 +1456,7 @@ mod tests {
             .expect_err("Discovered against empty index must surface NoCapableHolder");
         match err {
             MeshError::NoCapableHolder { requirement, .. } => {
-                assert!(
-                    requirement.contains("Exists"),
-                    "requirement should render the predicate; got {requirement:?}"
-                );
+                assert!(requirement.contains("Exists"));
             }
             other => panic!("expected NoCapableHolder; got {other:?}"),
         }
@@ -808,21 +1464,11 @@ mod tests {
 
     #[test]
     fn plan_chainref_discovered_match_with_no_causal_tag_surfaces_no_capable_holder() {
-        // Node matches the predicate but carries no
-        // `causal:<hex>` tag (the chain hasn't been advertised
-        // yet). Planner can't extract an origin → surfaces
-        // `NoCapableHolder` rather than fabricating.
         use crate::adapter::net::behavior::predicate::Predicate;
         use crate::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
 
         let caps = CapabilitySet::new().add_tag("dataforts.blob.storage");
-        let index = CapabilityIndex::new();
-        index.index(CapabilityAnnouncement::new(
-            7,
-            EntityId::from_bytes([0x44; 32]),
-            1,
-            caps,
-        ));
+        let index = index_with(vec![(7, caps)]);
         let pred = Predicate::Exists {
             key: TagKey {
                 axis: TaxonomyAxis::Dataforts,
@@ -838,47 +1484,14 @@ mod tests {
         assert!(matches!(err, MeshError::NoCapableHolder { .. }));
     }
 
-    #[test]
-    fn parse_causal_origin_round_trips_hex() {
-        // Helper round-trip: build a `causal:<hex>` tag from
-        // a known origin, parse it back, assert equality.
-        let origin = [0xDE; 32];
-        let hex = hex32(&origin);
-        let tag = Tag::Reserved {
-            prefix: "causal:".to_string(),
-            body: hex,
-        };
-        assert_eq!(parse_causal_origin(&tag), Some(origin));
-
-        // With a tip suffix.
-        let tag_with_tip = Tag::Reserved {
-            prefix: "causal:".to_string(),
-            body: format!("{}:42", hex32(&origin)),
-        };
-        assert_eq!(parse_causal_origin(&tag_with_tip), Some(origin));
-
-        // Non-causal tag returns None.
-        let not_causal = Tag::Reserved {
-            prefix: "heat:".to_string(),
-            body: hex32(&origin),
-        };
-        assert_eq!(parse_causal_origin(&not_causal), None);
-
-        // Wrong-length hex returns None.
-        let bad_hex = Tag::Reserved {
-            prefix: "causal:".to_string(),
-            body: "abc".to_string(),
-        };
-        assert_eq!(parse_causal_origin(&bad_hex), None);
-    }
+    // ========================================================================
+    // Composite operators + determinism + round-trip
+    // ========================================================================
 
     #[test]
     fn plan_composite_operator_surfaces_not_yet_implemented() {
-        // Phase A.1 plans atomic operators end-to-end; composite
-        // operators emit a `NotYetImplemented` wrapper that
-        // names the phase they ship in.
-        let origin = [0x99; 32];
-        let index = make_index_with_holder(1, &origin);
+        let origin = 0x9999_9999_9999_9999_u64;
+        let index = make_index_with_holder(1, origin);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let q = MeshQuery::V1(QueryV1::Aggregate {
             inner: Box::new(MeshQuery::V1(QueryV1::Latest {
@@ -900,11 +1513,11 @@ mod tests {
 
     #[test]
     fn plan_is_deterministic() {
-        // Same query + same index → same plan. Repeated calls
-        // must produce byte-identical encoded plans (the
-        // locked-decision-#4 cache key depends on this).
-        let origin = [0x55; 32];
-        let index = make_index_with_holder(11, &origin);
+        // Same query + same index → byte-identical encoded
+        // plan. Load-bearing for the locked-decision-#4
+        // cache key.
+        let origin = 0x5555_5555_5555_5555_u64;
+        let index = make_index_with_holder(11, origin);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let q = MeshQuery::V1(QueryV1::Latest {
             origin: ChainRef::OriginHash(origin),
@@ -918,8 +1531,8 @@ mod tests {
 
     #[test]
     fn execution_plan_round_trips_through_postcard() {
-        let origin = [0x11; 32];
-        let index = make_index_with_holder(3, &origin);
+        let origin = 0x1111_1111_1111_1111_u64;
+        let index = make_index_with_holder(3, origin);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let p = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
@@ -933,8 +1546,8 @@ mod tests {
 
     #[test]
     fn cost_estimate_propagates_rtt() {
-        let origin = [0x22; 32];
-        let index = make_index_with_holder(5, &origin);
+        let origin = 0x2222_2222_2222_2222_u64;
+        let index = make_index_with_holder(5, origin);
         let rtt = |nid: u64| {
             if nid == 5 {
                 Some(Duration::from_millis(15))

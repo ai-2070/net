@@ -27,11 +27,12 @@ pub enum MeshError {
     /// list carries the per-replica seq-range hints so
     /// callers can negotiate a different window.
     #[error(
-        "no holder for chain {origin:?} seq range {requested:?} (available: {available:?})"
+        "no holder for chain {origin:#x} seq range {requested:?} (available: {available:?})"
     )]
     HistoricalRangeUnavailable {
-        /// Chain whose range is missing.
-        origin: [u8; 32],
+        /// Chain whose range is missing (substrate `u64`
+        /// origin hash).
+        origin: u64,
         /// What the query asked for.
         requested: Range<SeqNum>,
         /// What the substrate can currently serve (per
@@ -42,10 +43,10 @@ pub enum MeshError {
     /// Lineage walk hit the depth bound before terminating.
     /// Carry the depth so callers can decide whether to
     /// retry with a wider bound.
-    #[error("lineage walk for {origin:?} exceeded max_depth={depth}")]
+    #[error("lineage walk for {origin:#x} exceeded max_depth={depth}")]
     LineageMaxDepthExceeded {
         /// Chain at which the walk started.
-        origin: [u8; 32],
+        origin: u64,
         /// Bound that was hit.
         depth: u32,
     },
@@ -54,12 +55,12 @@ pub enum MeshError {
     /// In principle the graph is a DAG; cycles indicate
     /// broken upstream applications. The cycle path is
     /// included for debugging.
-    #[error("lineage cycle detected starting at {origin:?}; cycle length={}", cycle.len())]
+    #[error("lineage cycle detected starting at {origin:#x}; cycle length={}", cycle.len())]
     LineageCycleDetected {
         /// Chain at which the walk started.
-        origin: [u8; 32],
+        origin: u64,
         /// The sequence of chain hashes that closed the cycle.
-        cycle: Vec<[u8; 32]>,
+        cycle: Vec<u64>,
     },
 
     /// A join's working-set memory exceeded the planner's
@@ -129,11 +130,11 @@ pub enum MeshError {
     /// `ChainRef::Discovered` resolved to zero candidates.
     /// Carry the requirement (in human-readable form) so
     /// callers can adjust their predicate.
-    #[error("no node holds chain {origin:?} matching the requirement: {requirement}")]
+    #[error("no node holds chain {origin:#x} matching the requirement: {requirement}")]
     NoCapableHolder {
         /// Origin hash (zeroed if the failure is at
         /// discovery time before any concrete hash is known).
-        origin: [u8; 32],
+        origin: u64,
         /// Rendered predicate or requirement string for
         /// diagnostics.
         requirement: String,
@@ -168,7 +169,7 @@ mod tests {
     #[test]
     fn historical_range_unavailable_display() {
         let e = MeshError::HistoricalRangeUnavailable {
-            origin: [0; 32],
+            origin: 0xDEAD_BEEF_CAFE_BABE,
             requested: SeqNum(100)..SeqNum(200),
             available: vec![SeqNum(0)..SeqNum(50)],
         };

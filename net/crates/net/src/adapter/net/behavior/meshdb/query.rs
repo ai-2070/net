@@ -188,16 +188,28 @@ pub enum QueryV1 {
 }
 
 /// How a [`MeshQuery`] addresses a chain.
+///
+/// # Origin-hash width
+///
+/// The plan doc speccd `OriginHash([u8; 32])` — 32-byte BLAKE3
+/// — but the substrate's chain identity is a `u64` derived
+/// from the publisher's identity, and the substrate's
+/// `causal:<hex16>` capability advertisement encodes that
+/// `u64` as 16 lowercase hex chars. MeshDB matches the
+/// substrate so the planner can look up holders against real
+/// `causal:` tags without a width-translation step. The plan
+/// doc is the spec-vs-reality outlier; Phase B reconciles
+/// here.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ChainRef {
-    /// Direct addressing by 32-byte origin hash. The planner
-    /// looks up holders via the capability index without any
-    /// discovery step.
-    OriginHash([u8; 32]),
+    /// Direct addressing by a chain's `u64` origin hash. The
+    /// planner looks up holders via the capability index
+    /// without any discovery step.
+    OriginHash(u64),
     /// Metadata-tag-driven discovery — e.g. "all chains with
     /// `intent:ml-training`". The planner resolves the
     /// predicate to concrete origin hashes via
-    /// `CapabilityQuery::match_axis` at plan time. Time-
+    /// `CapabilityQuery::filter` at plan time. Time-
     /// bounded; resolution is part of the plan output.
     Discovered(PredicateWire),
 }
@@ -356,12 +368,14 @@ pub struct OrderKey {
 /// + cache + continuation paths.
 ///
 /// Carries `Serialize + Deserialize` so the result-streaming
-/// protocol (Phase B) can postcard-encode batches without
-/// needing additional plumbing.
+/// protocol can postcard-encode batches without needing
+/// additional plumbing.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResultRow {
-    /// Origin hash of the chain this row came from.
-    pub origin: [u8; 32],
+    /// Origin hash of the chain this row came from. Substrate
+    /// chain identity (`u64`), matching the `causal:<hex16>`
+    /// capability-advertisement encoding.
+    pub origin: u64,
     /// Sequence number within that chain.
     pub seq: SeqNum,
     /// Opaque payload bytes (typically the event payload).
@@ -374,13 +388,13 @@ mod tests {
 
     fn small_query() -> MeshQuery {
         MeshQuery::V1(QueryV1::Latest {
-            origin: ChainRef::OriginHash([0xAB; 32]),
+            origin: ChainRef::OriginHash(0xABAB_ABAB_ABAB_ABAB),
         })
     }
 
     fn between_query() -> MeshQuery {
         MeshQuery::V1(QueryV1::Between {
-            origin: ChainRef::OriginHash([0x42; 32]),
+            origin: ChainRef::OriginHash(0x4242_4242_4242_4242),
             start: SeqNum(0),
             end: SeqNum(12345),
         })
@@ -490,7 +504,7 @@ mod tests {
 
     #[test]
     fn chainref_originhash_round_trips() {
-        let r = ChainRef::OriginHash([0xCD; 32]);
+        let r = ChainRef::OriginHash(0xCDCD_CDCD_CDCD_CDCD);
         let bytes = postcard::to_allocvec(&r).unwrap();
         let back: ChainRef = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, r);
@@ -544,7 +558,7 @@ mod tests {
     #[test]
     fn resultrow_round_trips_through_postcard() {
         let row = ResultRow {
-            origin: [0x77; 32],
+            origin: 0x7777_7777_7777_7777,
             seq: SeqNum(1024),
             payload: b"the bytes".to_vec(),
         };
