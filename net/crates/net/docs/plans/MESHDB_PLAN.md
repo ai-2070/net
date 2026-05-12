@@ -4,12 +4,13 @@
 
 ## Status
 
-**Phases A + B shipped behind the `meshdb` Cargo feature.** The AST, planner, executor, wire protocol, and federated executor are all in code; Phases C–F (lineage / joins / aggregates / caching + bindings) park until a concrete consumer workload activates them.
+**Phases A + B + C shipped behind the `meshdb` Cargo feature.** The AST, planner, executor, wire protocol, federated executor, and `fork-of:` lineage walks are all in code; Phases D–F (joins / aggregates / caching + bindings) park until a concrete consumer workload activates them.
 
 **Shipped surface** (gated behind `#[cfg(feature = "meshdb")]` at `src/adapter/net/behavior/meshdb/`):
 
 - **Phase A — AST + planner skeleton.** `MeshQuery::V1(QueryV1)` versioned outer enum with 10 operator variants (At / Between / Latest / Lineage{Back,Forward} / Join / Filter / Aggregate / Project / OrderBy). Postcard + JSON round-trippable. `MeshQueryPlanner` translates atomic operators to typed `ExecutionPlan`s; composite operators wrap their planned children in `NotYetImplemented` placeholders so the tree still type-checks. (`query.rs`, `planner.rs`, `error.rs`.)
 - **Phase B — Time-travel end-to-end.** Replica-aware routing via `CausalClaim` parsing of the three `causal:` tag forms (Presence / Tip / Range); proximity-ordered targets with most-specific-claim wins; `HistoricalRangeUnavailable` with per-replica available-range hints. `MeshQueryExecutor` async trait + `LocalMeshQueryExecutor<R: ChainReader>` walks atomic plans against a pluggable `ChainReader`. Wire protocol (`SUBPROTOCOL_MESHDB = 0x0F00`, `MeshDbRequest::{Execute, Resume, Cancel}`, `MeshDbResponse::{Batch, End, Error}`, `ResultBatch`, `ContinuationToken`). `FederatedMeshQueryExecutor<T: MeshDbTransport>` fans atomic operators out with NoRoute failover; `LoopbackTransport` drives 3-node integration tests in-process. Cooperative cancellation via `QueryHandle::cancel`. (`executor.rs`, `protocol.rs`, `federated.rs`.)
+- **Phase C — Lineage walks via `fork-of:` graph.** `OperatorPlan::LineageEmit { origin, direction, entries }` carries a materialized walk result. The planner walks the local capability-index snapshot at plan time (`parent_of` for back; BFS `children_of` lex-sorted for forward), with explicit visited-set cycle detection (`LineageCycleDetected`) and depth bounds (`LineageMaxDepthExceeded`). The executor emits one `ResultRow` per entry — payload empty; callers compose with `At` / `Between` for full event content. The federated executor handles `LineageEmit` locally (no remote dispatch needed; the walk already happened). (`planner.rs`, `executor.rs`, `federated.rs`.)
 - **Spec correction during B-1.** `ChainRef::OriginHash` + `ResultRow.origin` are `u64` (16-char hex), not `[u8; 32]` — the original plan was wrong about origin width; substrate uses `u64` throughout.
 
 **Substrate prereqs** (unchanged — all in code):
@@ -18,7 +19,7 @@
 - **`REDEX_DISTRIBUTED_PLAN.md`** — all phases shipped; replication makes time-travel queries tractable today.
 - **`CORTEX_ADAPTER_PLAN.md`** — shipped and exceeds spec; `CortexAdapter<State>` + `RedexFold<State>` + `watch` / `snapshot_and_watch` / `changes_with_lag()` all in code.
 
-**Remaining work** is consumer-driven: Phase C (lineage walks via `fork-of:`), Phase D (cross-chain joins with the locked 5-second watermark default), Phase E (streaming aggregates with the locked HLL p=14 / T-Digest c=100 sketch parameters, plus the Filter executor + Window operator), and Phase F (single-node LRU result cache + the programmatic-only language surface). The wire-subprotocol dispatch hookup (registering `SUBPROTOCOL_MESHDB` on `MeshNode`) lands when the federated executor moves out of test-only loopback; net-new surfaces (push-down fold-on-relay) come with their respective operators.
+**Remaining work** is consumer-driven: Phase D (cross-chain joins with the locked 5-second watermark default), Phase E (streaming aggregates with the locked HLL p=14 / T-Digest c=100 sketch parameters, plus the Filter executor + Window operator), and Phase F (single-node LRU result cache + the programmatic-only language surface). The wire-subprotocol dispatch hookup (registering `SUBPROTOCOL_MESHDB` on `MeshNode`) lands when the federated executor moves out of test-only loopback; net-new surfaces (push-down fold-on-relay) come with their respective operators.
 
 ## Frame
 
