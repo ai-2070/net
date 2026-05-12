@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/behavior/meshdb/executor.rs
+  s_3a0a24a47d1a36::t_2a1c05fe935f43 1486-1488
+  s_3a0a24a47d1a36::t_c8512a835f2a83 1534-1662
+  s_3a0a24a47d1a36::t_38a86434fff928 526-613
+  s_3a0a24a47d1a36::t_92860c9e3c8ab1 46-47
+  s_3a0a24a47d1a36::t_9cccfa96569dfc 1442-1444
+  s_3a0a24a47d1a36::t_c98389b2e418af 276-284
+net/crates/net/src/adapter/net/behavior/meshdb/query.rs
+  s_3a0a24a47d1a36::t_8a50aacb05bb9a 423-425,431-450
+net/crates/net/src/adapter/net/behavior/meshdb/mod.rs
+  s_3a0a24a47d1a36::t_c4df4acfa047b8 98-99
+net/crates/net/src/adapter/net/behavior/meshdb/planner.rs
+  s_3a0a24a47d1a36::t_5dd4a31722202f 2757,2761,2769-2849,2853
+  s_3a0a24a47d1a36::t_24b83fef4ebb77 603-605,618-619,623-650
+  s_3a0a24a47d1a36::t_2292a205c2700b 1344-1357
+  s_3a0a24a47d1a36::t_6713c156ec6d70 1068-1072
+  s_3a0a24a47d1a36::t_e36bb588e8b76f 174-193
+net/crates/net/src/adapter/net/behavior/meshdb/federated.rs
+  s_3a0a24a47d1a36::t_6a25b3cd9f5f9c 153-156
+  s_3a0a24a47d1a36::t_4983a8c81c5f3b 354-460
+net/crates/net/src/adapter/net/behavior/meshdb/row.rs
+  s_3a0a24a47d1a36::t_ab9fd2cd6554c6 127-171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "2053d36fd1987dc8b738dee54a9dbbda6adfe4e0",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
