@@ -1,4 +1,4 @@
-# Net — [*nRPC Out Now!*](#nrpc)
+# Net — [*Dataforts Out Now!*](#dataforts)
 
 **Network Event Transport** — a latency-first encrypted mesh protocol.
 
