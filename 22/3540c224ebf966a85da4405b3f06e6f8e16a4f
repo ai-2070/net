@@ -1,0 +1,22 @@
+net/crates/net/benches/auth_guard.rs
+  s_3a0a24a47d1a36::t_ee870077e3d4cc 106
+  s_3a0a24a47d1a36::t_e0669b34d0e01f 123
+  s_3a0a24a47d1a36::t_37edf5a9c8220a 74
+  s_3a0a24a47d1a36::t_c93b4cacee6057 17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "223540c224ebf966a85da4405b3f06e6f8e16a4f",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
