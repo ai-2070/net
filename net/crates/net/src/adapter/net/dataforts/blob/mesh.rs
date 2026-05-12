@@ -48,13 +48,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::adapter::{BlobAdapter, BlobStat};
+use super::admission::auth_allows_blob_op;
 use super::blob_ref::{
     byte_range_to_chunks, chunk_payload, BlobRef, ChunkRef, ChunkedPayload, Encoding,
 };
 use super::error::BlobError;
 use super::metrics::BlobMetrics;
 use super::refcount::{BlobRefcountTable, DEFAULT_RETENTION_FLOOR};
-use crate::adapter::net::channel::ChannelName;
+use crate::adapter::net::channel::{AuthGuard, ChannelName};
 use crate::adapter::net::redex::{Redex, RedexFileConfig, ReplicationConfig};
 
 /// Per-chunk storage channel prefix. Each blob chunk lives at
@@ -98,6 +99,15 @@ pub struct MeshBlobAdapter {
     /// Cheap to clone; shared with the operator's Prometheus
     /// scrape.
     metrics: BlobMetrics,
+    /// Optional auth guard used by [`Self::pin_authorized`] /
+    /// [`Self::unpin_authorized`] / [`Self::delete_chunk_authorized`]
+    /// to gate peer-initiated pin / unpin / delete ops against the
+    /// publishing chain's `(origin_hash, ChannelName)` ACL. `None`
+    /// (the default) leaves the `*_authorized` variants as a
+    /// misconfiguration — the unauth `pin` / `unpin` / `delete_chunk`
+    /// variants are still reachable for system-internal callers
+    /// (GC sweep, chain-fold refcount incr/decr).
+    auth_guard: Option<Arc<AuthGuard>>,
 }
 
 impl MeshBlobAdapter {
@@ -116,6 +126,7 @@ impl MeshBlobAdapter {
             refcount: BlobRefcountTable::new(),
             retention_floor: DEFAULT_RETENTION_FLOOR,
             metrics: BlobMetrics::new(),
+            auth_guard: None,
         }
     }
 
@@ -153,6 +164,85 @@ impl MeshBlobAdapter {
     pub fn with_disk_capacity(self, bytes: u64) -> Self {
         self.metrics.set_disk_capacity_bytes(bytes);
         self
+    }
+
+    /// Wire an [`AuthGuard`] handle so the `*_authorized` variants
+    /// of [`Self::pin`] / [`Self::unpin`] / [`Self::delete_chunk`]
+    /// can gate peer-initiated ops against the publishing chain's
+    /// `(origin_hash, ChannelName)` ACL. The unauth variants stay
+    /// reachable for system-internal callers (GC sweep,
+    /// chain-fold-driven refcount maintenance).
+    pub fn with_auth_guard(mut self, guard: Arc<AuthGuard>) -> Self {
+        self.auth_guard = Some(guard);
+        self
+    }
+
+    /// Pin `hash` against GC, gated by an
+    /// [`AuthGuard::is_authorized_full`] check on
+    /// `(origin_hash, channel)`. Returns
+    /// [`BlobError::Backend`] if the adapter has no guard
+    /// configured (operator misconfiguration on the peer-facing
+    /// path) or if the caller is not authorized for `channel`.
+    ///
+    /// `channel` is the canonical name of the chain that
+    /// originally published the blob — the caller of the pin op
+    /// must be authorized on that chain.
+    pub fn pin_authorized(
+        &self,
+        hash: [u8; 32],
+        origin_hash: u64,
+        channel: &ChannelName,
+        now_unix_ms: u64,
+    ) -> Result<(), BlobError> {
+        let guard = self.auth_guard.as_ref().ok_or_else(|| {
+            BlobError::Backend("auth: pin_authorized requires AuthGuard wiring".to_string())
+        })?;
+        auth_allows_blob_op(guard, origin_hash, channel)?;
+        self.refcount.pin(hash, now_unix_ms);
+        Ok(())
+    }
+
+    /// Unpin `hash`, gated by an
+    /// [`AuthGuard::is_authorized_full`] check on
+    /// `(origin_hash, channel)`. Returns
+    /// [`BlobError::Backend`] if no guard is configured or the
+    /// caller is not authorized.
+    pub fn unpin_authorized(
+        &self,
+        hash: [u8; 32],
+        origin_hash: u64,
+        channel: &ChannelName,
+        now_unix_ms: u64,
+    ) -> Result<(), BlobError> {
+        let guard = self.auth_guard.as_ref().ok_or_else(|| {
+            BlobError::Backend("auth: unpin_authorized requires AuthGuard wiring".to_string())
+        })?;
+        auth_allows_blob_op(guard, origin_hash, channel)?;
+        self.refcount.unpin(hash, now_unix_ms);
+        Ok(())
+    }
+
+    /// Delete a single chunk file by content hash, gated by an
+    /// [`AuthGuard::is_authorized_full`] check on
+    /// `(origin_hash, channel)`. Mirrors
+    /// [`Self::delete_chunk`] on the success path; returns a typed
+    /// `BlobError::Backend` if no guard is configured or the
+    /// caller is not authorized.
+    ///
+    /// System-internal callers (the GC sweep) use the unauth
+    /// [`Self::delete_chunk`] variant — only peer-initiated
+    /// deletes route through this gate.
+    pub async fn delete_chunk_authorized(
+        &self,
+        hash: &[u8; 32],
+        origin_hash: u64,
+        channel: &ChannelName,
+    ) -> Result<(), BlobError> {
+        let guard = self.auth_guard.as_ref().ok_or_else(|| {
+            BlobError::Backend("auth: delete_chunk_authorized requires AuthGuard wiring".to_string())
+        })?;
+        auth_allows_blob_op(guard, origin_hash, channel)?;
+        self.delete_chunk(hash).await
     }
 
     /// Refcount table reference. Operators bump via
@@ -1034,6 +1124,168 @@ mod tests {
         let blob =
             BlobRef::manifest("mesh://x", Encoding::Replicated, bogus_chunks).unwrap();
         let err = adapter.store(&blob, &payload).await.unwrap_err();
+        assert!(matches!(err, BlobError::Backend(_)));
+    }
+
+    // --- G-6 AuthGuard wiring on pin / unpin / delete_chunk ---
+
+    fn auth_channel() -> ChannelName {
+        ChannelName::new("dataforts/auth-test").unwrap()
+    }
+
+    fn other_channel() -> ChannelName {
+        ChannelName::new("dataforts/other").unwrap()
+    }
+
+    fn adapter_with_authorized_origin(origin_hash: u64) -> (MeshBlobAdapter, ChannelName) {
+        let redex = Arc::new(Redex::new());
+        let guard = Arc::new(AuthGuard::new());
+        let channel = auth_channel();
+        guard.allow_channel(origin_hash, &channel);
+        let adapter = MeshBlobAdapter::new("mesh-auth-test", redex).with_auth_guard(guard);
+        (adapter, channel)
+    }
+
+    #[test]
+    fn pin_authorized_admits_when_origin_is_in_acl() {
+        let origin: u64 = 0xCAFE_BABE;
+        let (adapter, channel) = adapter_with_authorized_origin(origin);
+        let hash = [0x11_u8; 32];
+        adapter.pin_authorized(hash, origin, &channel, 1_000).unwrap();
+        // Pinned entries are deletable=false under sweep — verify
+        // via the refcount table accessor.
+        assert!(adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+    }
+
+    #[test]
+    fn pin_authorized_rejects_when_origin_not_in_acl() {
+        let origin: u64 = 0xCAFE_BABE;
+        let (adapter, channel) = adapter_with_authorized_origin(origin);
+        let hash = [0x22_u8; 32];
+        let intruder: u64 = 0xDEAD_BEEF;
+        let err = adapter
+            .pin_authorized(hash, intruder, &channel, 1_000)
+            .unwrap_err();
+        assert!(matches!(err, BlobError::Backend(_)));
+        assert!(!adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+    }
+
+    #[test]
+    fn pin_authorized_rejects_when_origin_authorized_for_different_channel() {
+        let origin: u64 = 0xCAFE_BABE;
+        let (adapter, _) = adapter_with_authorized_origin(origin);
+        let wrong = other_channel();
+        let hash = [0x33_u8; 32];
+        let err = adapter
+            .pin_authorized(hash, origin, &wrong, 1_000)
+            .unwrap_err();
+        assert!(matches!(err, BlobError::Backend(_)));
+        assert!(!adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+    }
+
+    #[test]
+    fn pin_authorized_rejects_when_no_guard_configured() {
+        let adapter = make_adapter();
+        let hash = [0x44_u8; 32];
+        let channel = auth_channel();
+        let err = adapter
+            .pin_authorized(hash, 0xCAFE_BABE, &channel, 1_000)
+            .unwrap_err();
+        assert!(matches!(err, BlobError::Backend(_)));
+    }
+
+    #[test]
+    fn unpin_authorized_round_trips_against_pinned_hash() {
+        let origin: u64 = 0xC0FFEE;
+        let (adapter, channel) = adapter_with_authorized_origin(origin);
+        let hash = [0x55_u8; 32];
+        adapter.pin_authorized(hash, origin, &channel, 1_000).unwrap();
+        assert!(adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+        adapter
+            .unpin_authorized(hash, origin, &channel, 2_000)
+            .unwrap();
+        assert!(!adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+    }
+
+    #[test]
+    fn unpin_authorized_rejects_unauthorized_origin() {
+        let origin: u64 = 0xC0FFEE;
+        let (adapter, channel) = adapter_with_authorized_origin(origin);
+        let hash = [0x66_u8; 32];
+        adapter.pin_authorized(hash, origin, &channel, 1_000).unwrap();
+        let intruder: u64 = 0xBAAD_F00D;
+        let err = adapter
+            .unpin_authorized(hash, intruder, &channel, 2_000)
+            .unwrap_err();
+        assert!(matches!(err, BlobError::Backend(_)));
+        // Pin must still be in place — auth failure cannot remove it.
+        assert!(adapter.refcount_table().get(&hash).map(|e| e.pinned).unwrap_or(false));
+    }
+
+    #[test]
+    fn unpin_authorized_rejects_when_no_guard_configured() {
+        let adapter = make_adapter();
+        let hash = [0x77_u8; 32];
+        let channel = auth_channel();
+        let err = adapter
+            .unpin_authorized(hash, 0xCAFE_BABE, &channel, 1_000)
+            .unwrap_err();
+        assert!(matches!(err, BlobError::Backend(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_chunk_authorized_admits_when_origin_in_acl() {
+        let origin: u64 = 0xCAFE_BABE;
+        let (adapter, channel) = adapter_with_authorized_origin(origin);
+        let payload = b"authorized delete".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        assert!(adapter.exists(&blob).await.unwrap());
+
+        let hash = match &blob {
+            BlobRef::Small { hash, .. } => *hash,
+            _ => panic!("expected Small"),
+        };
+        adapter
+            .delete_chunk_authorized(&hash, origin, &channel)
+            .await
+            .unwrap();
+        // The chunk file is closed — fetch surfaces NotFound.
+        let err = adapter.fetch(&blob).await.unwrap_err();
+        assert!(matches!(err, BlobError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_chunk_authorized_rejects_unauthorized_origin() {
+        let origin: u64 = 0xCAFE_BABE;
+        let (adapter, channel) = adapter_with_authorized_origin(origin);
+        let payload = b"protected".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+
+        let hash = match &blob {
+            BlobRef::Small { hash, .. } => *hash,
+            _ => panic!("expected Small"),
+        };
+        let intruder: u64 = 0xDEAD_BEEF;
+        let err = adapter
+            .delete_chunk_authorized(&hash, intruder, &channel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::Backend(_)));
+        // Chunk must still be readable — failed auth cannot delete.
+        assert!(adapter.exists(&blob).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_chunk_authorized_rejects_when_no_guard_configured() {
+        let adapter = make_adapter();
+        let hash = [0x88_u8; 32];
+        let channel = auth_channel();
+        let err = adapter
+            .delete_chunk_authorized(&hash, 0xCAFE_BABE, &channel)
+            .await
+            .unwrap_err();
         assert!(matches!(err, BlobError::Backend(_)));
     }
 }
