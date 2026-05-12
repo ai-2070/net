@@ -752,15 +752,36 @@ Four phases:
   + colocation + storage-cap) plus a bandwidth budget gate decide
   whether to admit each inbound event. Cold channels evict under
   cluster-cap pressure and withdraw their `causal:<hex>`
-  advertisement.
-- **Phase 3 — `BlobRef` + blob adapters.** A `b"\xB0\xB1\xB2\xB3"`
-  magic + version + 32-byte BLAKE3 + size + URI reference whose
-  bytes live in the caller's storage (S3 / Ceph / IPFS / local
-  FS). The substrate carries the reference, not the blob.
+  advertisement. The runtime also observes `BlobRef`-shaped
+  payloads and runs the `should_pull_blob` admission gate; on
+  admit, the wired `BlobAdapter::prefetch` spawns a best-effort
+  pull via the per-chunk replication runtime.
+- **Phase 3 — `BlobRef` + blob adapters.** Two shapes:
+  - **External-hook variant (v0.15):** a `b"\xB0\xB1\xB2\xB3"`
+    magic + version + 32-byte BLAKE3 + size + URI reference
+    whose bytes live in the caller's storage (S3 / Ceph / IPFS
+    / local FS). Use `register_filesystem_blob_adapter` +
+    `blob_publish` / `blob_resolve` from Python.
+  - **Substrate-owned variant (v0.2):** the `MeshBlobAdapter`
+    Python class wraps the in-tree Rust adapter — every chunk
+    persists as a content-addressed `RedexFile` on the local
+    Redex, and replication wires through the existing per-
+    channel runtime. Methods: `store` / `fetch` / `fetch_range`
+    / `exists` / `prometheus_text`. The full v0.2 surface
+    (publish_with_blob, BlobRefcountTable, BlobMetrics,
+    prefetch, migration controller) is still being incrementally
+    exposed — operator scripts get the CRUD path today; the
+    deeper integration points run from Rust until each Python
+    wrapper lands.
 - **Phase 4 — Data gravity.** Per-chain read-rate counters with
   exponential decay. Threshold-crossing emissions stamp
   `heat:<hex>=<rate>` onto the chain's capability announcement;
   greedy weights cache pulls by `heat × scope-match × proximity`.
+  The v0.2 blob track adds parallel `BlobHeatRegistry` keyed on
+  chunk hash + `heat:blob:<hex>=<rate>` tag emission +
+  `drive_blob_migration_tick` consumer. These surfaces are
+  exposed from Rust today; Python wrappers land in a follow-up
+  cross-binding slice.
 - **Phase 5 — Read-your-writes.** Every `tasks.create`,
   `memories.insert`, etc. returns a `WriteToken`. Pass it to
   `tasks.wait_for_token(token, deadline_ms=…)` and the call
@@ -771,8 +792,9 @@ Four phases:
   without scheduling a wait).
 
 ```python
+import hashlib
 from net import (
-    NetMesh, Redex, Tasks, BlobRef, RedexError,
+    NetMesh, Redex, Tasks, BlobRef, RedexError, MeshBlobAdapter,
     register_filesystem_blob_adapter, blob_publish, blob_resolve,
 )
 
@@ -794,10 +816,21 @@ redex.enable_gravity_for_greedy(
     decay_half_life_secs=300,
 )
 
-# Phase 3 — register an adapter (filesystem ships in-tree).
+# Phase 3 v0.15 — external-hook variant.
 register_filesystem_blob_adapter('local', '/var/blobs')
 ref = blob_publish('local', 'local://obj/payload', some_bytes)
 back = blob_resolve(ref)
+
+# Phase 3 v0.2 — substrate-owned variant.
+mesh_blob = MeshBlobAdapter(redex, "mesh-app", persistent=True)
+payload = b"the substrate carries the bytes"
+import blake3  # `pip install blake3` for a parity hash
+h = blake3.blake3(payload).digest()
+br = BlobRef("mesh://demo", h, len(payload))
+mesh_blob.store(br, payload)
+back = mesh_blob.fetch(br)
+assert back == payload
+print(mesh_blob.prometheus_text())
 
 # Phase 5 — read-your-writes.
 tasks = Tasks.open(redex, origin_hash=mesh.origin_hash)

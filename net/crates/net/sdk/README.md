@@ -919,19 +919,46 @@ on the `Redex` handle). Four phases:
   + colocation + storage-cap) plus a bandwidth budget gate decide
   whether to admit each inbound event into a per-channel cache
   file. Cold channels evict under cluster-cap pressure and
-  withdraw their `causal:<hex>` advertisement.
-- **Phase 3 — `BlobRef` + `BlobAdapter`.** A 4-byte-magic +
-  version + 32-byte BLAKE3 + size + URI reference whose bytes
-  live in the caller's storage (S3 / Ceph / IPFS / local FS). The
-  substrate carries the reference, not the blob; adapters
-  implement `fetch` / `store` with default `fetch_stream` /
-  `store_stream` shims for multi-GB payloads.
+  withdraw their `causal:<hex>` advertisement. The runtime also
+  observes `BlobRef`-shaped payloads and asks `should_pull_blob`;
+  on admit, the wired `BlobAdapter::prefetch` spawns a best-
+  effort pull via the per-chunk replication runtime and the
+  chunk hash bumps a refcount table for chain-fold GC.
+- **Phase 3 — `BlobRef` + `BlobAdapter`.** Two shapes:
+  - **External-hook variant (v0.15):** a 4-byte-magic + version
+    + 32-byte BLAKE3 + size + URI reference whose bytes live in
+    the caller's storage (S3 / Ceph / IPFS / local FS). Adapters
+    implement `fetch` / `store` / `delete` / `stat` / `prefetch`
+    with default `fetch_stream` / `store_stream` shims for
+    multi-GB payloads.
+  - **Substrate-owned variant (v0.2):** `BlobRef::Manifest` for
+    multi-chunk blobs (4 MiB fixed chunking). `MeshBlobAdapter`
+    stores each chunk as a content-addressed `RedexFile` riding
+    the existing replication runtime. Wraps a
+    `BlobRefcountTable` for GC + pinning, `BlobMetrics` for
+    Prometheus, and an optional `AuthGuard` for `*_authorized`
+    peer-facing pin / unpin / delete variants. Atomic
+    `store → wait → publish` via `publish_with_blob` +
+    `BlobDurability::{BestEffort, DurableOnLocal,
+    ReplicatedTo(n)}`. Operator CLI: `cargo run --features cli
+    --bin net-blob -- --help`.
 - **Phase 4 — Data gravity.** Per-chain read-rate counters with
   exponential decay. Threshold-crossing emissions stamp
   `heat:<hex>=<rate>` onto the chain's existing capability
   announcement; the greedy admission gate weights cache pulls by
   heat × scope-match × proximity-rank. Cold chains evict first;
-  hot chains migrate toward the readers that drive the heat.
+  hot chains migrate toward the readers that drive the heat. The
+  v0.2 blob track adds a parallel `BlobHeatRegistry` keyed on the
+  chunk's BLAKE3 hash (fetch-path bumps via
+  `MeshBlobAdapter::with_blob_heat`), `heat:blob:<hex>=<rate>`
+  reserved-tag emission via the `BlobHeatSink` trait
+  (`MeshNode` is the production impl), and
+  `drive_blob_migration_tick` — observes peer-advertised heat,
+  runs `should_migrate_blob_to`, and on admit calls
+  `adapter.prefetch` on the chosen target. Manifest-aware
+  variant `drive_blob_migration_tick_with_manifest_resolver`
+  proactively prefetches every sibling chunk when one chunk of
+  a manifest gets hot.
 - **Phase 5 — Read-your-writes.** A `WriteToken { origin_hash,
   seq }` returned from every successful `Tasks` / `Memories`
   write. Pass it to `tasks.wait_for_token(token, deadline)` (or
@@ -941,31 +968,61 @@ on the `Redex` handle). Four phases:
   stalled fold surfaces `WaitForTokenError::FoldStopped` rather
   than a silent `Ok(())`.
 
+Capability projections feed admission: `BlobCapability` /
+`GreedyCapability` / `GravityCapability` / `TopologyScope`
+types read from `CapabilitySet` tags. Producer-side typed
+setters (`CapabilitySet::with_blob_capability(BlobCapability::
+storage_participating(100, 50))` + `with_greedy_capability` /
+`with_gravity_capability`) round-trip back to wire-form tags.
+
 ```rust,ignore
 use net::adapter::net::{MeshNode, Redex};
 use net::adapter::net::dataforts::{
-    DataGravityPolicy, GreedyConfig, IntentMatchPolicy,
+    BlobAdapter, BlobHeatRegistry, DataGravityPolicy, GreedyConfig,
+    IntentMatchPolicy, MeshBlobAdapter, DEFAULT_BLOB_HEAT_HALF_LIFE,
 };
 use net::adapter::net::behavior::capability::CapabilitySet;
+use net::adapter::net::behavior::dataforts_capabilities::{
+    BlobCapability, GreedyCapability, TopologyScope,
+};
 use std::sync::Arc;
 
 # async fn example(mesh: Arc<MeshNode>) -> Result<(), Box<dyn std::error::Error>> {
 let redex = Arc::new(Redex::new());
 
+let local_caps = Arc::new(
+    CapabilitySet::new()
+        .with_blob_capability(BlobCapability::storage_participating(100, 50))
+        .with_greedy_capability(GreedyCapability {
+            enabled: true,
+            scope: TopologyScope::Mesh,
+            proximity: 128,
+        }),
+);
+
 // Phase 1 — wire greedy into the mesh inbound dispatch.
 redex.enable_greedy_dataforts(
     mesh.clone(),
     GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled),
-    Arc::new(CapabilitySet::default()),
+    local_caps.clone(),
     Default::default(),
 )?;
 
 // Phase 4 — layer gravity on top (per-chain heat + tick loop).
 redex.enable_gravity_for_greedy(mesh.clone(), DataGravityPolicy::default())?;
 
-// Cache lookup — returns Some(RedexFile) when greedy has admitted
-// this chain; otherwise the caller falls back to a network fetch.
-// let file = redex.greedy_cache_for(&channel);
+// Phase 3 v0.2 — substrate-owned blob CAS. Share a `BlobHeatRegistry`
+// between the adapter's fetch-path bumps + the gravity tick.
+let blob_heat = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
+let blob_adapter: Arc<dyn BlobAdapter> = Arc::new(
+    MeshBlobAdapter::new("mesh-local", redex.clone())
+        .with_blob_heat(blob_heat.clone(), DEFAULT_BLOB_HEAT_HALF_LIFE),
+);
+
+// Greedy acts on G-1 admit verdicts by spawning `adapter.prefetch`.
+if let Some(runtime) = redex.greedy_runtime() {
+    runtime.set_blob_adapter(blob_adapter.clone());
+}
 # Ok(()) }
 ```
 
@@ -974,12 +1031,15 @@ The canonical `ChannelHash` is `u32` substrate-wide for ACL / config
 `u16` (fast-path filter hint). Wire-bucket collisions are benign —
 the substrate disambiguates via the registry's `by_wire_hash`
 reverse index and re-keys on the canonical 32-bit hash for all
-non-fast-path decisions.
+non-fast-path decisions. The publisher's wire `origin_hash`
+resolves to the announcement-side `node_id` via a
+`CapabilityIndex::get_by_origin_hash` side index — the same lookup
+the greedy + migration admission gates use for `chain_caps`.
 
 See [`docs/misc/DATAFORTS_FEATURES.md`](../docs/misc/DATAFORTS_FEATURES.md)
-for the audit (most of the Dataforts wishlist is already covered by
-core RedEX / CortEX / NetDB / capability primitives; Dataforts names
-and packages the remaining work).
+for the original audit and
+[`docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`](../docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md)
+for the v0.2 substrate-owned blob CAS plan + shipping status.
 
 ## nRPC (request / response over the mesh)
 

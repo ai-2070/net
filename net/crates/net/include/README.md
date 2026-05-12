@@ -612,9 +612,15 @@ config, channel-name validation, `replication: {...}` set without
 Dataforts is the compositional data plane on top of RedEX + the
 capability index. The C FFI surfaces the two enable / disable pairs
 needed to wire Phase 1 (greedy) and Phase 4 (gravity) into a Redex
-handle; blob refs (Phase 3) and read-your-writes (Phase 5) are
-higher-level than this FFI layer and are exposed through the
-Python / Node / Go bindings on top.
+handle; blob refs (Phase 3) and read-your-writes (Phase 5) — for
+both the v0.15 external-hook adapter shape AND the v0.2 substrate-
+owned `MeshBlobAdapter` — are higher-level than this FFI layer and
+are exposed through the Python / Node / Go bindings on top (the
+Python binding has a first slice of the v0.2 `MeshBlobAdapter`
+surface; Node + Go land in follow-up slices). The v0.2 gravity
+extensions (`BlobHeatRegistry`, `heat:blob:<hex>=<rate>` emission,
+`drive_blob_migration_tick` consumer) live entirely above the FFI
+boundary too.
 
 The cdylib must be built with the `dataforts` Cargo feature for
 these symbols to be live. Without the feature, the symbols still
