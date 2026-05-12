@@ -33,7 +33,7 @@ Tagged `[B | H | M | L]`:
 
 | ID    | Pri | Area         | Title                                                                  | Status |
 |-------|-----|--------------|------------------------------------------------------------------------|--------|
-| B-1   | H   | capability   | 32-bit `by_origin_hash` drives G-1 scope admission (collision → flip)  | ⬜ |
+| B-1   | H   | capability   | 32-bit `by_origin_hash` drives G-1 scope admission (collision → flip)  | ✅ (slot tracks all colliders; lookup returns None on ambiguity; dispatch fails closed) |
 | B-2   | H   | ci           | "3-node tests" CI step only runs `net_blob_cli`                        | ⬜ |
 | B-3   | H   | blob mesh    | `publish_with_blob` advertises chunks before manifest commits          | ⬜ |
 | B-4   | H   | blob mesh    | `heat:blob:` tags uncorroborated → orphan replication runtimes         | ⬜ |

@@ -3858,32 +3858,43 @@ impl MeshNode {
         // populated on every `index()` call. Unambiguous under
         // multi-hop relay (the lookup keys on the entity, not the
         // last-hop peer) and not poisoned by cache holders'
-        // `causal:<hex>` announcements. Falls back to empty caps
-        // (fail-closed for scope admission) when the publisher's
-        // announcement hasn't propagated yet.
+        // `causal:<hex>` announcements.
+        //
+        // `None` means publisher unknown — either no announcement
+        // has propagated yet, or the wire `origin_hash` is
+        // ambiguous (two indexed entities project to the same
+        // wire u32). The greedy observer is skipped for that
+        // event so scope / intent / colocation admission cannot
+        // be tricked into running against fabricated or
+        // mis-attributed caps. Empty `CapabilitySet` would
+        // resolve `dataforts.{greedy,gravity}.scope` to the
+        // default `Mesh`, which `scope_allows_cross` admits for
+        // any local scope — fail-open. Skipping observe_event
+        // entirely is the fail-closed equivalent.
         //
         // Snapshotted once per packet rather than per-event; every
         // event in the same packet shares the same publisher.
         #[cfg(feature = "dataforts")]
-        let chain_caps: std::sync::Arc<
-            crate::adapter::net::behavior::capability::CapabilitySet,
+        let chain_caps: Option<
+            std::sync::Arc<crate::adapter::net::behavior::capability::CapabilitySet>,
         > = if greedy.is_some() {
             let origin_hash: u64 = parsed.header.origin_hash.into();
-            let publisher_caps = ctx.capability_index.get_by_origin_hash(origin_hash);
-            std::sync::Arc::new(publisher_caps.unwrap_or_default())
+            ctx.capability_index
+                .get_by_origin_hash(origin_hash)
+                .map(std::sync::Arc::new)
         } else {
-            std::sync::Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default())
+            None
         };
 
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
             #[cfg(feature = "dataforts")]
-            if let Some(observer) = &greedy {
+            if let (Some(observer), Some(caps)) = (&greedy, &chain_caps) {
                 observer.observe_event(
                     parsed.header.channel_hash,
                     parsed.header.origin_hash.into(),
-                    chain_caps.clone(),
+                    caps.clone(),
                     event_data.clone(),
                 );
             }
