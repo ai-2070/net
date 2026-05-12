@@ -118,7 +118,7 @@ async fn greedy_caches_observed_events_published_from_peer() {
     // Poll for B's greedy runtime to absorb the events. The cache
     // channel is named via the synthesized hash convention.
     let runtime = redex_b.greedy_runtime().expect("runtime installed");
-    let synth = synthesize_cache_channel_name(name.hash());
+    let synth = synthesize_cache_channel_name(name.wire_hash());
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
@@ -234,7 +234,7 @@ async fn greedy_scope_filter_admits_when_publisher_advertises_matching_scope() {
     }
 
     let runtime = redex_b.greedy_runtime().expect("runtime installed");
-    let synth = synthesize_cache_channel_name(name.hash());
+    let synth = synthesize_cache_channel_name(name.wire_hash());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         if runtime.contains(&synth) && runtime.cached_bytes() > 0 {
@@ -300,7 +300,7 @@ async fn greedy_read_path_serves_cached_events() {
     // flow through the spawned-per-event tokio task in the mesh
     // hook; arrival can be staggered).
     let runtime = redex_b.greedy_runtime().expect("runtime");
-    let synth = synthesize_cache_channel_name(name.hash());
+    let synth = synthesize_cache_channel_name(name.wire_hash());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut cache_file_opt = None;
     while tokio::time::Instant::now() < deadline {

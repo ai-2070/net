@@ -936,7 +936,12 @@ def delegate_token(
     ...
 
 def channel_hash(channel: str) -> int:
-    """Hash a channel name to the 16-bit wire-format value."""
+    """Hash a channel name to its canonical 32-bit substrate identifier.
+
+    Used as the ACL/storage/config key (matches the ``channel_hash``
+    field on ``PermissionToken``). The wire ``NetHeader`` fast-path
+    hint is the low 16 bits of this value.
+    """
     ...
 
 def normalize_gpu_vendor(vendor: str) -> str:

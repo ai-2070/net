@@ -1505,9 +1505,11 @@ export interface ChannelConfigJs {
 }
 
 /**
- * Hash a channel name to the u16 used by `PermissionToken`. Exposed
- * so TS callers can compare their channel-name against a parsed
- * token's `channel_hash` without reaching for a library.
+ * Hash a channel name to its canonical 32-bit substrate identifier
+ * (matches `PermissionToken::channel_hash`). The wire `NetHeader`
+ * fast-path hint is the low 16 bits of this value. Exposed so TS
+ * callers can compare their channel-name against a parsed token's
+ * `channel_hash` without reaching for a library.
  */
 export declare function channelHash(channel: string): number
 
@@ -2415,7 +2417,9 @@ export declare const enum TaskStatus {
  * Parsed token view. All byte fields are 32 bytes except `signature`
  * (64 bytes). `not_before` / `not_after` are unix seconds as
  * `BigInt` to avoid JS number-precision loss. `scope` is the decoded
- * string array; `channel_hash` is the raw u16.
+ * string array; `channel_hash` is the canonical 32-bit substrate
+ * identifier (the wire `NetHeader` fast-path hint is the low 16 bits
+ * of this value).
  */
 export interface TokenInfo {
   issuer: Buffer

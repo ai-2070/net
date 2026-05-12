@@ -1513,13 +1513,15 @@ use net::adapter::net::{
     SubnetId, Visibility,
 };
 
-/// Helper: register a channel with the given visibility and return its hash.
+/// Helper: register a channel with the given visibility and return its
+/// wire `u16` hash (matches `SubnetGateway::should_forward`'s
+/// `channel_hash` argument, which is the per-packet wire field).
 fn register_channel(registry: &ChannelConfigRegistry, name: &str, vis: Visibility) -> u16 {
     let id = ChannelId::parse(name).expect("invalid channel name");
-    let hash = id.hash();
+    let wire = id.wire_hash();
     let config = ChannelConfig::new(id).with_visibility(vis);
     registry.insert(config);
-    hash
+    wire
 }
 
 /// 9.1 — Gateway blocks SubnetLocal traffic at boundary.

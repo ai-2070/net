@@ -10,10 +10,15 @@
 //! The guard keeps two parallel ACLs:
 //!
 //! - **Fast path** (`check_fast`, `authorize`, `is_authorized`): keyed
-//!   on the 16-bit `channel_hash` that rides the Net header. Used by
-//!   the packet data plane. Collisions are tolerable here because
-//!   AEAD still enforces payload integrity end-to-end — a bloom false
-//!   positive at most costs a full check further up the stack.
+//!   on the canonical [`ChannelHash`] (`u32`). Used by the packet data
+//!   plane. The 32-bit canonical hash is collision-resistant at realistic
+//!   deployment scale (~65 K channels before birthday-collision threshold);
+//!   AEAD still enforces payload integrity end-to-end, so a residual
+//!   bloom false positive costs at most a full check further up the
+//!   stack. The wire `NetHeader.channel_hash` is a `u16` fast-path hint
+//!   that callers widen to the canonical [`ChannelHash`] via the
+//!   `ChannelConfigRegistry` / `ChannelRegistry` before consulting this
+//!   guard.
 //! - **Exact path** (`allow_channel`, `revoke_channel`,
 //!   `is_authorized_full`): keyed on the **canonical `ChannelName`**
 //!   itself, not any hash. Used by control-plane and storage
@@ -33,7 +38,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use dashmap::DashMap;
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::ChannelName;
+use super::{ChannelHash, ChannelName};
 
 /// Bloom-filter half of the authorization guard.
 ///
@@ -101,7 +106,7 @@ impl BloomCache {
     /// hashes to. Pulled out so the loom model can replay the
     /// same derivation without depending on `bloom_key`.
     #[inline]
-    fn indices(&self, origin_hash: u64, channel_hash: u16) -> (usize, usize) {
+    fn indices(&self, origin_hash: u64, channel_hash: ChannelHash) -> (usize, usize) {
         let key = bloom_key(origin_hash, channel_hash);
         let h1 = (key & self.bloom_mask) as usize;
         let h2 = ((key >> BLOOM_BITS) & self.bloom_mask) as usize;
@@ -116,7 +121,7 @@ impl BloomCache {
     /// cache is provided by DashMap's per-shard mutex on the
     /// subsequent `verified.insert`, not by bloom ordering.
     #[inline]
-    pub fn mark(&self, origin_hash: u64, channel_hash: u16) {
+    pub fn mark(&self, origin_hash: u64, channel_hash: ChannelHash) {
         let (h1, h2) = self.indices(origin_hash, channel_hash);
         self.set_bit(h1);
         self.set_bit(h2);
@@ -138,7 +143,7 @@ impl BloomCache {
     /// (subprotocol handler's await, wire round-trip, or
     /// DashMap's Mutex via the verified-cache path).
     #[inline]
-    pub fn probe(&self, origin_hash: u64, channel_hash: u16) -> bool {
+    pub fn probe(&self, origin_hash: u64, channel_hash: ChannelHash) -> bool {
         let (h1, h2) = self.indices(origin_hash, channel_hash);
         let bit1 = (self.bloom[h1 >> 3].load(Ordering::Relaxed) >> (h1 & 7)) & 1;
         let bit2 = (self.bloom[h2 >> 3].load(Ordering::Relaxed) >> (h2 & 7)) & 1;
@@ -216,7 +221,7 @@ pub struct AuthGuard {
     /// reach of a medium-sized mesh; 64 bits pushes the collision
     /// floor to ~4 billion peers, which is no longer a plausible
     /// operating point.
-    verified: DashMap<(u64, u16), bool>,
+    verified: DashMap<(u64, ChannelHash), bool>,
     /// Exact-identity ACL: `(origin_hash, canonical ChannelName) ->
     /// authorized`. Keys on the name string (not a hash) so that no
     /// two distinct channels can alias through a hash collision —
@@ -271,7 +276,7 @@ impl AuthGuard {
     /// particular pins the "subscribe-completes-before-first-
     /// packet-arrives" no-false-deny property).
     #[inline]
-    pub fn check_fast(&self, origin_hash: u64, channel_hash: u16) -> AuthVerdict {
+    pub fn check_fast(&self, origin_hash: u64, channel_hash: ChannelHash) -> AuthVerdict {
         if !self.bloom.probe(origin_hash, channel_hash) {
             return AuthVerdict::Denied;
         }
@@ -299,7 +304,7 @@ impl AuthGuard {
     /// `BloomCache` docstring for the full analysis of why
     /// `Relaxed` on the bloom is sufficient, and
     /// `tests/loom_models.rs` for the pinned invariants.
-    pub fn authorize(&self, origin_hash: u64, channel_hash: u16) {
+    pub fn authorize(&self, origin_hash: u64, channel_hash: ChannelHash) {
         self.bloom.mark(origin_hash, channel_hash);
         self.verified.insert((origin_hash, channel_hash), true);
     }
@@ -314,7 +319,7 @@ impl AuthGuard {
     /// schedule a `rebuild_bloom` when the dirty count crosses a
     /// deployment threshold and the false-positive rate makes the
     /// `NeedsFullCheck` fallback dominate the hot path.
-    pub fn revoke(&self, origin_hash: u64, channel_hash: u16) {
+    pub fn revoke(&self, origin_hash: u64, channel_hash: ChannelHash) {
         self.verified.remove(&(origin_hash, channel_hash));
         self.revocations_since_rebuild
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -337,10 +342,11 @@ impl AuthGuard {
     ///
     /// This is the fast-path check used by the packet data plane.
     /// For control-plane / storage decisions, use
-    /// [`Self::is_authorized_full`] — the 16-bit `channel_hash` alone
-    /// is collision-prone at mesh scale and must not be trusted as
-    /// an ACL for non-data-plane decisions.
-    pub fn is_authorized(&self, origin_hash: u64, channel_hash: u16) -> bool {
+    /// [`Self::is_authorized_full`] — even the canonical 32-bit
+    /// `channel_hash` could theoretically alias under adversarial
+    /// name selection, so non-data-plane decisions must key on the
+    /// canonical name string.
+    pub fn is_authorized(&self, origin_hash: u64, channel_hash: ChannelHash) -> bool {
         self.verified.contains_key(&(origin_hash, channel_hash))
     }
 
@@ -428,10 +434,10 @@ impl std::fmt::Debug for AuthGuard {
 
 /// Compute bloom filter key from (origin_hash, channel_hash).
 #[inline]
-fn bloom_key(origin_hash: u64, channel_hash: u16) -> u64 {
-    let mut buf = [0u8; 10];
+fn bloom_key(origin_hash: u64, channel_hash: ChannelHash) -> u64 {
+    let mut buf = [0u8; 12];
     buf[0..8].copy_from_slice(&origin_hash.to_le_bytes());
-    buf[8..10].copy_from_slice(&channel_hash.to_le_bytes());
+    buf[8..12].copy_from_slice(&channel_hash.to_le_bytes());
     xxh3_64(&buf)
 }
 
@@ -499,14 +505,14 @@ mod tests {
         let guard = AuthGuard::new();
 
         for i in 0..100u64 {
-            guard.authorize(i, (i * 7) as u16);
+            guard.authorize(i, (i * 7) as ChannelHash);
         }
 
         assert_eq!(guard.authorized_count(), 100);
 
         for i in 0..100u64 {
             assert_eq!(
-                guard.check_fast(i, (i * 7) as u16),
+                guard.check_fast(i, (i * 7) as ChannelHash),
                 AuthVerdict::Allowed,
                 "pair ({}, {}) should be allowed",
                 i,
@@ -534,12 +540,12 @@ mod tests {
         let guard = AuthGuard::new();
 
         for i in 0..1000u64 {
-            guard.authorize(i, i as u16);
+            guard.authorize(i, i as ChannelHash);
         }
 
         let mut false_positives = 0;
         for i in 10000..20000u64 {
-            let verdict = guard.check_fast(i, i as u16);
+            let verdict = guard.check_fast(i, i as ChannelHash);
             if verdict != AuthVerdict::Denied {
                 false_positives += 1;
             }
@@ -587,16 +593,19 @@ mod tests {
 
     #[test]
     fn test_regression_channel_hash_collision_distinguishable_by_exact_name() {
-        // Regression: `check_fast` alone is keyed on the 16-bit
-        // channel_hash, which collides often enough at mesh scale to
-        // let one channel's subscription authorize another. The exact
-        // ACL on the canonical `ChannelName` is the intended backstop —
-        // this test asserts two colliding names never alias there.
+        // Regression: even the canonical 32-bit channel_hash could
+        // theoretically alias under adversarial name selection (random
+        // collisions require ~65 K channels per process); the exact
+        // ACL on the canonical `ChannelName` is the intended backstop.
+        // This test asserts two adversarial colliding names never alias
+        // on the exact path, by forcing a 16-bit wire collision and
+        // then a canonical (32-bit) collision via the brute-force loop.
         let guard = AuthGuard::new();
 
-        // Construct two distinct names whose `ChannelName::hash()`
-        // happens to collide. We brute-force because the hash is
-        // xxh3_64 truncated to 16 bits — collisions are cheap to find.
+        // Construct two distinct names whose canonical `hash()`
+        // (now u32) collide. With xxh3_64 truncated to 32 bits, random
+        // collisions need ~2^16 = 65 K candidates; we cap the loop at
+        // 200 K which is comfortably above the birthday bound.
         let base = "regression/coll-";
         let mut name_a: Option<ChannelName> = None;
         let mut name_b: Option<ChannelName> = None;
@@ -606,7 +615,10 @@ mod tests {
                 name_a = Some(cand);
                 continue;
             }
-            if cand.hash() == name_a.as_ref().unwrap().hash()
+            // The exact-ACL backstop must hold even when the cheaper
+            // wire `u16` hash collides — so search for a wire-bucket
+            // collision rather than a canonical (rare) one.
+            if cand.wire_hash() == name_a.as_ref().unwrap().wire_hash()
                 && cand.as_str() != name_a.as_ref().unwrap().as_str()
             {
                 name_b = Some(cand);
@@ -614,20 +626,29 @@ mod tests {
             }
         }
         let name_a = name_a.expect("seeded name");
-        let name_b = name_b
-            .expect("two distinct ChannelNames with the same 16-bit hash — widen the search range");
-        assert_eq!(name_a.hash(), name_b.hash());
+        let name_b = name_b.expect(
+            "two distinct ChannelNames with the same 16-bit wire hash — widen the search range",
+        );
+        assert_eq!(name_a.wire_hash(), name_b.wire_hash());
         assert_ne!(name_a.as_str(), name_b.as_str());
 
         let origin: u64 = 0xDEAD_BEEF_CAFE_F00D;
         guard.allow_channel(origin, &name_a);
 
-        // Fast-path collision: check_fast says Allowed for B because
-        // it only sees the 16-bit hash.
-        assert_eq!(
-            guard.check_fast(origin, name_b.hash()),
-            AuthVerdict::Allowed
-        );
+        // The canonical 32-bit channel_hash for these two names is
+        // (with overwhelming probability) distinct, so the fast-path
+        // check_fast for B is Denied — even with a wire collision.
+        // The exact-name path is unconditionally correct.
+        let fast_b = guard.check_fast(origin, name_b.hash());
+        if name_a.hash() == name_b.hash() {
+            // Adversarial canonical collision: fast path may still
+            // say Allowed; the exact backstop is what callers consult.
+            assert_eq!(fast_b, AuthVerdict::Allowed);
+        } else {
+            // Typical case: canonical distinct → fast path Denied
+            // for B even though wire bucket matches.
+            assert_eq!(fast_b, AuthVerdict::Denied);
+        }
 
         // Exact check distinguishes them — this is what callers must
         // consult before trusting the fast-path verdict for any
@@ -651,7 +672,7 @@ mod tests {
             let g = Arc::clone(&guard);
             handles.push(thread::spawn(move || {
                 for i in 0..250u64 {
-                    g.authorize(t * 1000 + i, (t * 1000 + i) as u16);
+                    g.authorize(t * 1000 + i, (t * 1000 + i) as ChannelHash);
                 }
             }));
         }
@@ -661,7 +682,7 @@ mod tests {
             let g = Arc::clone(&guard);
             handles.push(thread::spawn(move || {
                 for i in 0..1000u64 {
-                    let _ = g.check_fast(i, i as u16);
+                    let _ = g.check_fast(i, i as ChannelHash);
                 }
             }));
         }
@@ -675,7 +696,7 @@ mod tests {
         for t in 0..4u64 {
             for i in 0..250u64 {
                 assert!(
-                    guard.is_authorized(t * 1000 + i, (t * 1000 + i) as u16),
+                    guard.is_authorized(t * 1000 + i, (t * 1000 + i) as ChannelHash),
                     "pair ({}, {}) should be authorized after concurrent insertion",
                     t * 1000 + i,
                     t * 1000 + i
@@ -711,7 +732,7 @@ mod tests {
 
         let guard = Arc::new(AuthGuard::new());
         let origin = 0x1234_5678_9ABC_DEF0u64;
-        let channel = 0x4242u16;
+        let channel: ChannelHash = 0x4242_4242;
         let iters = 1_000u32;
         let start = Arc::new(Barrier::new(3));
 

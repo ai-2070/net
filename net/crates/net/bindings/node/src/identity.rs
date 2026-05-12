@@ -114,7 +114,7 @@ fn scope_to_strings(scope: TokenScope) -> Vec<String> {
 // Channel-name hashing — keep the hash function in one place
 // =========================================================================
 
-fn channel_to_hash(channel: &str) -> Result<u16> {
+fn channel_to_hash(channel: &str) -> Result<net::adapter::net::ChannelHash> {
     let name = net::adapter::net::ChannelName::new(channel)
         .map_err(|e| identity_err(format!("invalid channel name: {}", e)))?;
     Ok(name.hash())
@@ -305,13 +305,15 @@ impl Identity {
 /// Parsed token view. All byte fields are 32 bytes except `signature`
 /// (64 bytes). `not_before` / `not_after` are unix seconds as
 /// `BigInt` to avoid JS number-precision loss. `scope` is the decoded
-/// string array; `channel_hash` is the raw u16.
+/// string array; `channel_hash` is the canonical 32-bit substrate
+/// identifier (used for ACL/storage/config keys; the wire
+/// `NetHeader` fast-path hint is the low 16 bits of this value).
 #[napi(object)]
 pub struct TokenInfo {
     pub issuer: Buffer,
     pub subject: Buffer,
     pub scope: Vec<String>,
-    pub channel_hash: u16,
+    pub channel_hash: u32,
     pub not_before: BigInt,
     pub not_after: BigInt,
     pub delegation_depth: u8,
@@ -376,10 +378,12 @@ pub fn delegate_token(
     Ok(Buffer::from(child.to_bytes()))
 }
 
-/// Hash a channel name to the u16 used by `PermissionToken`. Exposed
-/// so TS callers can compare their channel-name against a parsed
-/// token's `channel_hash` without reaching for a library.
+/// Hash a channel name to its canonical 32-bit substrate identifier
+/// (matches `PermissionToken::channel_hash`). The wire `NetHeader`
+/// fast-path hint is the low 16 bits of this value. Exposed so TS
+/// callers can compare their channel-name against a parsed token's
+/// `channel_hash` without reaching for a library.
 #[napi]
-pub fn channel_hash(channel: String) -> Result<u16> {
+pub fn channel_hash(channel: String) -> Result<u32> {
     channel_to_hash(&channel)
 }

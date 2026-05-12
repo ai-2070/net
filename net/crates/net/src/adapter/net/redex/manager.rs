@@ -364,7 +364,12 @@ impl Redex {
     #[cfg(feature = "dataforts")]
     pub fn greedy_cache_for(&self, channel: &ChannelName) -> Option<RedexFile> {
         let runtime = self.greedy_runtime()?;
-        let synth = super::super::dataforts::synthesize_cache_channel_name(channel.hash());
+        // The greedy data-plane cache keys on the wire `u16` hash
+        // (that's what the inbound packet path carries); the
+        // canonical `u32` hash from `ChannelName::hash()` widens it
+        // for ACL / config / RYW elsewhere in the stack but the
+        // observe path stays on wire width.
+        let synth = super::super::dataforts::synthesize_cache_channel_name(channel.wire_hash());
         let file = runtime.cache_file(&synth)?;
         runtime.note_read(&synth);
         Some(file)

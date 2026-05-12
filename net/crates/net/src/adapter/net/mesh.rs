@@ -57,7 +57,7 @@ use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGra
 use super::behavior::tag::Tag;
 use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP};
 use super::channel::{
-    AckReason, AuthGuard, AuthVerdict, ChannelConfigRegistry, ChannelId, ChannelName,
+    AckReason, AuthGuard, AuthVerdict, ChannelConfigRegistry, ChannelHash, ChannelId, ChannelName,
     ChannelPublisher, OnFailure, PublishConfig, PublishReport, SubscriberRoster,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
@@ -262,7 +262,23 @@ struct DispatchCtx {
     /// dispatcher type lives there and the `--features net`-only
     /// build doesn't compile the cortex layer.
     #[cfg(feature = "cortex")]
-    rpc_inbound_dispatchers: Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
+    // Keyed by the wire `u16` hash that rides on
+    // `NetHeader::channel_hash` — that's what the inbound dispatch
+    // path has cheaply available at packet decode time. Each
+    // bucket stores a list of `(canonical ChannelHash, dispatcher)`
+    // entries so wire-bucket collisions don't cross dispatch lines;
+    // the canonical `u32` hash is what each dispatcher is keyed on.
+    // The `Vec` cost is paid only once per wire-bucket hit, and at
+    // typical sizing there is exactly one entry per bucket.
+    rpc_inbound_dispatchers: Arc<
+        DashMap<
+            u16,
+            Vec<(
+                ChannelHash,
+                crate::adapter::net::cortex::RpcInboundDispatcher,
+            )>,
+        >,
+    >,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
     ///
@@ -1074,7 +1090,23 @@ pub struct MeshNode {
     /// per packet on the hot path; absent registrations skip the
     /// branch entirely.
     #[cfg(feature = "cortex")]
-    rpc_inbound_dispatchers: Arc<DashMap<u16, crate::adapter::net::cortex::RpcInboundDispatcher>>,
+    // Keyed by the wire `u16` hash that rides on
+    // `NetHeader::channel_hash` — that's what the inbound dispatch
+    // path has cheaply available at packet decode time. Each
+    // bucket stores a list of `(canonical ChannelHash, dispatcher)`
+    // entries so wire-bucket collisions don't cross dispatch lines;
+    // the canonical `u32` hash is what each dispatcher is keyed on.
+    // The `Vec` cost is paid only once per wire-bucket hit, and at
+    // typical sizing there is exactly one entry per bucket.
+    rpc_inbound_dispatchers: Arc<
+        DashMap<
+            u16,
+            Vec<(
+                ChannelHash,
+                crate::adapter::net::cortex::RpcInboundDispatcher,
+            )>,
+        >,
+    >,
     /// Pending oneshots for in-flight `Mesh::call` invocations.
     /// Shared with the per-Mesh `RpcClientFold` so RESPONSE events
     /// arriving on reply channels complete the right call's
@@ -3715,18 +3747,33 @@ impl MeshNode {
         // it strips the channel name on ingress.
         //
         // Hot-path cost: one DashMap get per packet. Absent
-        // registrations skip the loop entirely.
+        // registrations skip the loop entirely. The bucket
+        // ordinarily holds exactly one `(canonical, dispatcher)`
+        // entry; wire-bucket collisions between independently-
+        // registered canonical channels fan-out to each registered
+        // canonical entry, with the canonical hash passed verbatim
+        // so dispatchers self-disambiguate on the receive side.
         #[cfg(feature = "cortex")]
-        if let Some(dispatcher) = ctx.rpc_inbound_dispatchers.get(&parsed.header.channel_hash) {
-            let dispatcher = dispatcher.clone();
-            let channel_hash = parsed.header.channel_hash;
+        if let Some(entry) = ctx.rpc_inbound_dispatchers.get(&parsed.header.channel_hash) {
+            // Snapshot the dispatchers + canonical hashes so the
+            // DashMap shard lock is released before invoking user
+            // code — the dispatcher closure may take other locks
+            // (mpsc sends, fold mutexes) and holding a DashMap
+            // shard guard across that risks lock-ordering hazards.
+            let pairs: Vec<(
+                ChannelHash,
+                crate::adapter::net::cortex::RpcInboundDispatcher,
+            )> = entry.iter().cloned().collect();
+            drop(entry);
             let origin_hash = parsed.header.origin_hash;
             for event_data in events.into_iter() {
-                dispatcher(crate::adapter::net::cortex::RpcInboundEvent {
-                    channel_hash,
-                    origin_hash,
-                    payload: event_data,
-                });
+                for (canonical, disp) in &pairs {
+                    disp(crate::adapter::net::cortex::RpcInboundEvent {
+                        channel_hash: *canonical,
+                        origin_hash,
+                        payload: event_data.clone(),
+                    });
+                }
             }
             return;
         }
@@ -4256,11 +4303,25 @@ impl MeshNode {
     #[cfg(feature = "cortex")]
     pub fn register_rpc_inbound(
         &self,
-        channel_hash: u16,
+        channel_hash: ChannelHash,
         dispatcher: crate::adapter::net::cortex::RpcInboundDispatcher,
     ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
-        self.rpc_inbound_dispatchers
-            .insert(channel_hash, dispatcher)
+        // The dispatcher map is indexed by the wire `u16` hash for
+        // O(1) lookup on the inbound packet path; each bucket holds
+        // a list of `(canonical ChannelHash, dispatcher)` entries so
+        // wire-bucket collisions between independently-registered
+        // canonical channels don't share a dispatcher slot. Replace
+        // any existing entry for the same canonical hash; otherwise
+        // append.
+        let wire = channel_hash as u16;
+        let mut entry = self.rpc_inbound_dispatchers.entry(wire).or_default();
+        for (existing_canonical, existing_disp) in entry.iter_mut() {
+            if *existing_canonical == channel_hash {
+                return Some(std::mem::replace(existing_disp, dispatcher));
+            }
+        }
+        entry.push((channel_hash, dispatcher));
+        None
     }
 
     /// Remove the registered dispatcher for `channel_hash`. Returns
@@ -4270,21 +4331,33 @@ impl MeshNode {
     #[cfg(feature = "cortex")]
     pub fn unregister_rpc_inbound(
         &self,
-        channel_hash: u16,
+        channel_hash: ChannelHash,
     ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
-        self.rpc_inbound_dispatchers
-            .remove(&channel_hash)
-            .map(|(_, v)| v)
+        let wire = channel_hash as u16;
+        let mut entry = self.rpc_inbound_dispatchers.get_mut(&wire)?;
+        let pos = entry.iter().position(|(c, _)| *c == channel_hash)?;
+        let (_, removed) = entry.remove(pos);
+        // If the bucket is now empty, release the slot so the wire
+        // hash no longer hits the dispatch fast path.
+        let is_empty = entry.is_empty();
+        drop(entry);
+        if is_empty {
+            self.rpc_inbound_dispatchers.remove(&wire);
+        }
+        Some(removed)
     }
 
     /// Cheap probe: is a dispatcher already registered for this
-    /// channel hash? Used by the caller-side
+    /// canonical channel hash? Used by the caller-side
     /// `ensure_reply_subscription` to skip a redundant registration
     /// when multiple targets serve the same service (they share
     /// one reply channel + one dispatcher per caller).
     #[cfg(feature = "cortex")]
-    pub fn rpc_inbound_dispatcher_registered(&self, channel_hash: u16) -> bool {
-        self.rpc_inbound_dispatchers.contains_key(&channel_hash)
+    pub fn rpc_inbound_dispatcher_registered(&self, channel_hash: ChannelHash) -> bool {
+        self.rpc_inbound_dispatchers
+            .get(&(channel_hash as u16))
+            .map(|entry| entry.iter().any(|(c, _)| *c == channel_hash))
+            .unwrap_or(false)
     }
 
     /// Per-Mesh shared `RpcClientPending` — accessor for the
@@ -6018,7 +6091,7 @@ impl MeshNode {
     pub(super) async fn publish_to_peer(
         &self,
         peer_node_id: u64,
-        channel_hash: u16,
+        channel_hash: ChannelHash,
         stream_id: u64,
         reliable: bool,
         events: &[Bytes],
@@ -6080,7 +6153,14 @@ impl MeshNode {
         // needs; the roster path is unaffected (the receiver's
         // shard-inbound queue still gets the event when no per-
         // channel dispatcher is registered).
-        builder.set_channel_hash(channel_hash);
+        //
+        // The wire `NetHeader::channel_hash` is a `u16` fast-path hint
+        // — narrow the canonical [`ChannelHash`] (u32) to 16 bits for
+        // the wire. Wire-side collisions are benign (the receiver
+        // disambiguates via `ChannelConfigMap::get_by_wire_hash` /
+        // `ChannelRegistry::get_by_wire_hash` and re-keys on the
+        // canonical 32-bit hash for ACL / storage decisions).
+        builder.set_channel_hash(channel_hash as u16);
         // Stamp our identity's origin_hash so the receiver can
         // route per-chain logic (greedy cache, gravity heat
         // counters, RYW tokens) against a real chain identifier

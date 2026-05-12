@@ -703,8 +703,10 @@ int      net_mesh_set_reflex_override(net_meshnode_t* handle,
  * active. */
 int      net_mesh_clear_reflex_override(net_meshnode_t* handle);
 
-/* Hash a channel name to its 16-bit wire representation. */
-int      net_channel_hash(const char* channel, uint16_t* out_hash);
+/* Hash a channel name to its canonical 32-bit substrate identifier
+ * (used for ACL/storage/config keys; the wire NetHeader fast-path
+ * hint is the low 16 bits of this value). */
+int      net_channel_hash(const char* channel, uint32_t* out_hash);
 
 /* =========================================================================
  * Capabilities (announce / find_nodes).

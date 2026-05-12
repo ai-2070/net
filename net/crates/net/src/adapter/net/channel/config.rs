@@ -4,7 +4,7 @@
 //! for access rules, combined with L1 permission tokens. This avoids
 //! building a separate rule engine.
 
-use super::name::ChannelId;
+use super::name::{ChannelHash, ChannelId};
 use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use crate::adapter::net::identity::{EntityId, TokenCache, TokenScope};
 use dashmap::DashMap;
@@ -156,18 +156,24 @@ impl ChannelConfig {
 
 /// Registry of channel configurations.
 ///
-/// Keyed by channel name (not hash) to prevent u16 hash collisions
-/// from silently overwriting security policies. With only 65536
-/// possible hash values, the birthday paradox makes collisions likely
-/// at ~300 channels.
+/// Keyed by channel name (not hash) to prevent hash collisions from silently
+/// overwriting security policies. The canonical [`ChannelHash`] (`u32`) is
+/// collision-resistant at realistic scale (~65 K channels), and `by_hash`
+/// gives O(1) canonical-hash lookup; `by_wire_hash` resolves the wire
+/// `u16` fast-path hint into a list of canonical channels for receive-side
+/// dispatch (routine collisions at scale).
 ///
 /// Consulted at subscription/channel-creation time (slow path).
 /// The fast path uses the `AuthGuard` bloom filter.
 pub struct ChannelConfigRegistry {
     /// Primary storage: name → config (collision-safe)
     configs: DashMap<String, ChannelConfig>,
-    /// Reverse index: hash → names (for hash-based lookups)
-    by_hash: DashMap<u16, Vec<String>>,
+    /// Reverse index: canonical hash → names (collision-resistant at u32).
+    by_hash: DashMap<ChannelHash, Vec<String>>,
+    /// Wire-hash reverse index: u16 wire-hash → names (routine collisions).
+    /// Used by receive-side dispatch to disambiguate the `NetHeader`
+    /// fast-path hint into canonical channels.
+    by_wire_hash: DashMap<u16, Vec<String>>,
     /// Prefix registry: prefix → config. Consulted by
     /// `get_by_name` when no exact match exists; the first prefix
     /// that the queried name starts with wins. Used by nRPC's
@@ -187,6 +193,7 @@ impl ChannelConfigRegistry {
         Self {
             configs: DashMap::new(),
             by_hash: DashMap::new(),
+            by_wire_hash: DashMap::new(),
             prefix_configs: DashMap::new(),
         }
     }
@@ -226,26 +233,45 @@ impl ChannelConfigRegistry {
     pub fn insert(&self, config: ChannelConfig) {
         let name = config.channel_id.name().to_string();
         let hash = config.channel_id.hash();
+        let wire_hash = config.channel_id.wire_hash();
         self.configs.insert(name.clone(), config);
-        self.by_hash.entry(hash).or_default().push(name);
+        self.by_hash.entry(hash).or_default().push(name.clone());
+        self.by_wire_hash.entry(wire_hash).or_default().push(name);
     }
 
-    /// Look up a channel config by hash.
+    /// Look up a channel config by canonical [`ChannelHash`] (`u32`).
     ///
     /// Returns `None` if the hash is unknown **or** if multiple channels
-    /// share the same hash (collision). Callers that need collision-safe
-    /// lookups should use `get_by_name()` with the full channel name.
+    /// share the same canonical hash (rare at u32 — ~65 K channels before
+    /// birthday-collision threshold). Callers that need collision-safe
+    /// lookups should use [`Self::get_by_name`] with the full channel name.
     ///
-    /// With only 65,536 possible u16 hash values, collisions become likely
-    /// at ~300 channels (birthday paradox). Returning `None` on collision
-    /// forces callers to fall back to safe defaults rather than silently
-    /// applying the wrong channel's security policy.
+    /// Returning `None` on collision forces callers to fall back to safe
+    /// defaults rather than silently applying the wrong channel's policy.
     pub fn get(
         &self,
-        channel_hash: u16,
+        channel_hash: ChannelHash,
     ) -> Option<dashmap::mapref::one::Ref<'_, String, ChannelConfig>> {
         let names = self.by_hash.get(&channel_hash)?;
         // Refuse to return an arbitrary config when hashes collide.
+        if names.len() != 1 {
+            return None;
+        }
+        let name = names.first()?;
+        self.configs.get(name)
+    }
+
+    /// Look up a channel config by the wire `u16` fast-path hint.
+    ///
+    /// Returns `None` if the wire bucket is empty **or** if multiple
+    /// channels share the same `u16` bucket (routine at scale).
+    /// On wire-bucket collision, receive-side dispatch must fall through
+    /// to a name-aware path; the wire hash is only a fast-path hint.
+    pub fn get_by_wire_hash(
+        &self,
+        wire_hash: u16,
+    ) -> Option<dashmap::mapref::one::Ref<'_, String, ChannelConfig>> {
+        let names = self.by_wire_hash.get(&wire_hash)?;
         if names.len() != 1 {
             return None;
         }
@@ -292,17 +318,17 @@ impl ChannelConfigRegistry {
         self.prefix_configs.get(&best_key?)
     }
 
-    /// Remove a channel config by hash.
+    /// Remove a channel config by canonical [`ChannelHash`].
     ///
     /// Returns `None` if the hash is unknown **or** if multiple channels
-    /// share the same hash — mirroring the collision-safe semantics of
-    /// `get()`. Removing an arbitrary config on collision would silently
-    /// delete the wrong channel's policy (e.g. dropping a `SubnetLocal`
-    /// entry and leaving a `Global` sibling in place).
+    /// share the same canonical hash — mirroring the collision-safe
+    /// semantics of `get()`. Removing an arbitrary config on collision
+    /// would silently delete the wrong channel's policy (e.g. dropping a
+    /// `SubnetLocal` entry and leaving a `Global` sibling in place).
     ///
     /// Callers that need to remove a specific channel should use
     /// [`remove_by_name`](Self::remove_by_name).
-    pub fn remove(&self, channel_hash: u16) -> Option<ChannelConfig> {
+    pub fn remove(&self, channel_hash: ChannelHash) -> Option<ChannelConfig> {
         let name = {
             let names = self.by_hash.get(&channel_hash)?;
             if names.len() != 1 {
@@ -319,8 +345,12 @@ impl ChannelConfigRegistry {
     pub fn remove_by_name(&self, name: &str) -> Option<ChannelConfig> {
         let (_, removed) = self.configs.remove(name)?;
         let hash = removed.channel_id.hash();
+        let wire_hash = removed.channel_id.wire_hash();
         if let Some(mut hash_names) = self.by_hash.get_mut(&hash) {
             hash_names.retain(|n| n != name);
+        }
+        if let Some(mut wire_names) = self.by_wire_hash.get_mut(&wire_hash) {
+            wire_names.retain(|n| n != name);
         }
         Some(removed)
     }
@@ -337,7 +367,7 @@ impl ChannelConfigRegistry {
 
     /// Get the priority for a channel (0 if not configured).
     #[inline]
-    pub fn priority(&self, channel_hash: u16) -> u8 {
+    pub fn priority(&self, channel_hash: ChannelHash) -> u8 {
         self.get(channel_hash).map(|c| c.priority).unwrap_or(0)
     }
 }
@@ -527,25 +557,32 @@ mod tests {
         // Fix: get() returns None when the hash maps to more than one
         // channel name. Callers fall back to safe defaults or use
         // get_by_name() for collision-safe lookups.
-        use crate::adapter::net::channel::name::channel_hash;
+        use crate::adapter::net::channel::name::wire_channel_hash;
 
-        // Find two valid channel names that produce the same u16 hash.
-        // With 65536 possible values, birthday paradox gives a collision
-        // within ~300 names on average.
+        // Find two valid channel names that produce the same wire `u16`
+        // hash. With 65 536 possible values, birthday paradox gives a
+        // collision within ~300 names on average. (Canonical `u32`
+        // collisions are rare enough — ~65 K names — that exercising
+        // them in tests would be slow; the wire-hash bucket is the
+        // observable collision surface here.)
         let mut seen = std::collections::HashMap::<u16, String>::new();
         let (name1, name2) = loop {
             let name = format!("ch-{}", seen.len());
-            let hash = channel_hash(&name);
-            if let Some(existing) = seen.get(&hash) {
+            let wire = wire_channel_hash(&name);
+            if let Some(existing) = seen.get(&wire) {
                 break (existing.clone(), name);
             }
-            seen.insert(hash, name);
+            seen.insert(wire, name);
         };
 
         let reg = ChannelConfigRegistry::new();
         let id1 = ChannelId::parse(&name1).unwrap();
         let id2 = ChannelId::parse(&name2).unwrap();
-        assert_eq!(id1.hash(), id2.hash(), "precondition: hashes must collide");
+        assert_eq!(
+            id1.wire_hash(),
+            id2.wire_hash(),
+            "precondition: wire hashes must collide"
+        );
 
         // Insert a SubnetLocal channel and a Global channel that collide
         let config1 = ChannelConfig::new(id1.clone()).with_visibility(Visibility::SubnetLocal);
@@ -553,11 +590,21 @@ mod tests {
         reg.insert(config1);
         reg.insert(config2);
 
-        // get() by hash must return None — not an arbitrary config
+        // get_by_wire_hash() must return None — not an arbitrary
+        // config — on a wire-bucket collision.
         assert!(
-            reg.get(id1.hash()).is_none(),
-            "get() must return None when hash collides between channels"
+            reg.get_by_wire_hash(id1.wire_hash()).is_none(),
+            "get_by_wire_hash() must return None when wire hashes collide between channels"
         );
+
+        // The canonical-hash path stays unaffected: each name has a
+        // distinct canonical [`ChannelHash`] (collision-resistant at
+        // u32), so `get(canonical)` resolves uniquely.
+        assert_eq!(
+            reg.get(id1.hash()).unwrap().visibility,
+            Visibility::SubnetLocal
+        );
+        assert_eq!(reg.get(id2.hash()).unwrap().visibility, Visibility::Global);
 
         // get_by_name() must still work for each channel individually
         let c1 = reg.get_by_name(&name1).unwrap();
@@ -567,68 +614,56 @@ mod tests {
     }
 
     #[test]
-    fn test_regression_remove_by_hash_returns_none_on_collision() {
-        // Regression: `remove(hash)` removed the *first* name bucketed under
-        // a colliding hash, silently deleting the wrong channel's config.
-        // A `SubnetLocal` entry could disappear while an unrelated `Global`
-        // sibling survived under the same hash — exactly the kind of silent
-        // policy swap that the `get()` fix was meant to prevent.
-        //
-        // Fix: `remove(hash)` now returns None on collision and leaves both
-        // configs in place. Callers that want to remove a specific entry
-        // must use `remove_by_name`.
-        use crate::adapter::net::channel::name::channel_hash;
+    fn test_regression_remove_by_wire_hash_safe_on_wire_collision() {
+        // Regression: the wire-keyed remove path used to silently
+        // delete the first name bucketed under a colliding `u16` wire
+        // hash, swapping policies between unrelated channels. With
+        // the substrate-wide widening to canonical [`ChannelHash`]
+        // (`u32`), the primary `remove(hash)` keys on the canonical
+        // value (unique per name); the wire-bucket collision space
+        // is exercised below via two names that share a `u16` bucket
+        // and asserts each name is independently addressable through
+        // both `remove(canonical)` and `remove_by_name`.
+        use crate::adapter::net::channel::name::wire_channel_hash;
 
         let mut seen = std::collections::HashMap::<u16, String>::new();
         let (name1, name2) = loop {
             let name = format!("rm-{}", seen.len());
-            let hash = channel_hash(&name);
-            if let Some(existing) = seen.get(&hash) {
+            let wire = wire_channel_hash(&name);
+            if let Some(existing) = seen.get(&wire) {
                 break (existing.clone(), name);
             }
-            seen.insert(hash, name);
+            seen.insert(wire, name);
         };
 
         let reg = ChannelConfigRegistry::new();
         let id1 = ChannelId::parse(&name1).unwrap();
         let id2 = ChannelId::parse(&name2).unwrap();
-        let shared_hash = id1.hash();
-        assert_eq!(shared_hash, id2.hash(), "precondition: hashes must collide");
+        assert_eq!(
+            id1.wire_hash(),
+            id2.wire_hash(),
+            "precondition: wire hashes must collide"
+        );
 
         reg.insert(ChannelConfig::new(id1.clone()).with_visibility(Visibility::SubnetLocal));
         reg.insert(ChannelConfig::new(id2.clone()).with_visibility(Visibility::Global));
 
-        // remove(hash) refuses on collision — both configs still present.
-        assert!(
-            reg.remove(shared_hash).is_none(),
-            "remove(hash) must refuse on collision"
-        );
-        assert_eq!(
-            reg.len(),
-            2,
-            "both configs must remain after refused remove"
-        );
-        assert_eq!(
-            reg.get_by_name(&name1).unwrap().visibility,
-            Visibility::SubnetLocal
-        );
-        assert_eq!(
-            reg.get_by_name(&name2).unwrap().visibility,
-            Visibility::Global
-        );
-
-        // remove_by_name works and does not disturb its colliding sibling.
-        let removed = reg.remove_by_name(&name1).unwrap();
-        assert_eq!(removed.visibility, Visibility::SubnetLocal);
-        assert!(reg.get_by_name(&name1).is_none(), "name1 should be gone");
+        // Canonical `remove(hash)` keys on the u32 canonical hash,
+        // which is unique per name, so each config is removable
+        // individually even under a wire-bucket collision.
+        let removed1 = reg.remove(id1.hash()).expect("remove canonical1");
+        assert_eq!(removed1.visibility, Visibility::SubnetLocal);
+        assert_eq!(reg.len(), 1, "the other config must still be present");
         assert_eq!(
             reg.get_by_name(&name2).unwrap().visibility,
             Visibility::Global,
-            "name2 must be untouched"
+            "name2 must be untouched by the canonical remove of name1"
         );
 
-        // With the collision resolved, remove(hash) works again.
-        let removed2 = reg.remove(shared_hash).unwrap();
+        // `remove_by_name` is the explicit-collision-safe path used
+        // by callers that already hold the name string; it must
+        // continue to work alongside the canonical-hash path.
+        let removed2 = reg.remove_by_name(&name2).unwrap();
         assert_eq!(removed2.visibility, Visibility::Global);
         assert_eq!(reg.len(), 0);
     }

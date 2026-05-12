@@ -55,7 +55,7 @@ Tagged `[B | H | M | L]`:
 | D-21  | H   | FFI          | Panic across FFI on `net_*_wait_for_token` + blob publish/resolve         | ✅ |
 | D-22  | H   | FFI          | Vtable per-field null-check missing in `net_blob_register_adapter`        | ✅ |
 | D-23  | H   | FFI          | `timeout_ms == 0` silently rewritten to 1 ms in token wait                | ✅ |
-| D-24  | M   | greedy       | Wire `channel_hash` 16-bit → silent cross-chain pollution                  | 🚫 deferred — `DataPacketHeader::channel_hash` is shared across the whole net stack (auth, routing, pub/sub roster); widening to u32 is a substrate-wide migration, not a dataforts-local fix |
+| D-24  | M   | greedy       | Wire `channel_hash` 16-bit → silent cross-chain pollution                  | ✅ (substrate-wide migration: canonical `ChannelHash = u32` for ACL/storage/config/RYW; wire `NetHeader::channel_hash` stays `u16` per the `origin_hash u64-canonical / u32-wire` precedent; `ChannelConfigMap` carries both `by_hash` (u32 canonical) and `by_wire_hash` (u16 disambig)) |
 | D-25  | M   | greedy       | `gravity_tick` emits one full capset rebroadcast per chain                 | ✅ (`HeatSink::announce_heat_batch` + MeshNode impl rewrites caps once per tick) |
 | D-26  | M   | greedy       | `entry.bytes` saturating drift under retention trim                        | ✅ (`RedexFile::retained_bytes` + `GreedyRuntime::resync_cache_bytes`; operator wires the periodic call) |
 | D-27  | M   | greedy       | `NIC_PEAK_BYTES_PER_S` hard-coded; no override on `GreedyConfig`           | ✅ (folded into D-2) |

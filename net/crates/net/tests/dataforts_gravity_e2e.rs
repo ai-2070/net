@@ -140,7 +140,7 @@ async fn read_hot_chain_emits_heat_tag_into_local_caps() {
 
     // Wait for the cache to populate.
     let runtime = redex_b.greedy_runtime().expect("runtime");
-    let synth = synthesize_cache_channel_name(name.hash());
+    let synth = synthesize_cache_channel_name(name.wire_hash());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         if runtime.contains(&synth) && runtime.cached_bytes() >= N {
@@ -241,7 +241,7 @@ async fn greedy_without_gravity_emits_no_heat_tags() {
 
     // Pump a few reads on B; without gravity these don't drive
     // any heat emission.
-    let synth = synthesize_cache_channel_name(name.hash());
+    let synth = synthesize_cache_channel_name(name.wire_hash());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         if runtime.contains(&synth) {
