@@ -247,6 +247,87 @@ async fn registered_dispatcher_receives_published_events() {
     assert_eq!(events[0].payload.as_ref(), b"hello-rpc");
 }
 
+/// Wire-bucket collision: two canonical `ChannelHash` values share a
+/// wire `u16` bucket. When a packet arrives stamped with that wire
+/// hash, every dispatcher registered in the bucket must be invoked
+/// and each must receive its own canonical hash on the
+/// `RpcInboundEvent` — that's how dispatchers self-disambiguate.
+///
+/// Pins the Many-entry branch of the inbound dispatch fast path,
+/// which lifts the common single-entry case out of the heap.
+#[tokio::test]
+async fn wire_bucket_collision_fans_out_to_every_registered_canonical() {
+    use net::adapter::net::channel::wire_channel_hash;
+
+    // Find two valid channel names that share a wire `u16` bucket.
+    // With 65 536 buckets and a few hundred candidates the birthday
+    // bound makes collision near-certain; bound the search anyway.
+    let mut seen = std::collections::HashMap::<u16, String>::new();
+    let (name1, name2) = (|| -> Option<(String, String)> {
+        for i in 0..200_000u64 {
+            let name = format!("test/rpc/coll/{}", i);
+            let wire = wire_channel_hash(&name);
+            if let Some(prev) = seen.get(&wire) {
+                return Some((prev.clone(), name));
+            }
+            seen.insert(wire, name);
+        }
+        None
+    })()
+    .expect("no wire-bucket collision in 200K candidates");
+
+    let ch1 = ChannelName::new(&name1).unwrap();
+    let ch2 = ChannelName::new(&name2).unwrap();
+    assert_eq!(ch1.wire_hash(), ch2.wire_hash());
+    assert_ne!(ch1.hash(), ch2.hash(), "canonical must differ");
+
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake_pair(&a, &b).await;
+
+    // B subscribes only to ch1.
+    b.subscribe_channel(a.node_id(), ch1.clone())
+        .await
+        .expect("subscribe");
+
+    // B registers a dispatcher for each canonical — both land in
+    // the same wire bucket.
+    let captured1: Arc<Mutex<Vec<RpcInboundEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured2: Arc<Mutex<Vec<RpcInboundEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap1 = captured1.clone();
+    let cap2 = captured2.clone();
+    let disp1: RpcInboundDispatcher = Arc::new(move |ev| cap1.lock().push(ev));
+    let disp2: RpcInboundDispatcher = Arc::new(move |ev| cap2.lock().push(ev));
+    assert!(b.register_rpc_inbound(ch1.hash(), disp1).is_none());
+    assert!(b.register_rpc_inbound(ch2.hash(), disp2).is_none());
+
+    // A publishes once on ch1.
+    let publisher = ChannelPublisher::new(ch1.clone(), PublishConfig::default());
+    a.publish(&publisher, Bytes::from_static(b"collide"))
+        .await
+        .expect("publish");
+
+    // Both dispatchers must receive the event (wire bucket fan-out),
+    // each tagged with its *own* canonical hash so receiver-side
+    // logic can self-filter.
+    assert!(
+        wait_until(
+            || !captured1.lock().is_empty() && !captured2.lock().is_empty(),
+            Duration::from_secs(2)
+        )
+        .await,
+        "both dispatchers should receive the event within 2s",
+    );
+    let e1 = captured1.lock();
+    let e2 = captured2.lock();
+    assert_eq!(e1.len(), 1);
+    assert_eq!(e2.len(), 1);
+    assert_eq!(e1[0].channel_hash, ch1.hash());
+    assert_eq!(e2[0].channel_hash, ch2.hash());
+    assert_eq!(e1[0].payload.as_ref(), b"collide");
+    assert_eq!(e2[0].payload.as_ref(), b"collide");
+}
+
 /// After unregistering the dispatcher, subsequent publishes flow
 /// through the shard inbound queue (back-compat). Without the
 /// unregister call, the dispatcher would keep receiving events;

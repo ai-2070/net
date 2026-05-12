@@ -3760,19 +3760,58 @@ impl MeshNode {
             // code — the dispatcher closure may take other locks
             // (mpsc sends, fold mutexes) and holding a DashMap
             // shard guard across that risks lock-ordering hazards.
-            let pairs: Vec<(
-                ChannelHash,
-                crate::adapter::net::cortex::RpcInboundDispatcher,
-            )> = entry.iter().cloned().collect();
+            //
+            // The bucket ordinarily holds exactly one entry; lift
+            // that case out of the heap so the per-packet fast path
+            // doesn't allocate. The N-entry fallback (wire-bucket
+            // collision between independently-registered canonical
+            // channels) collects into a Vec — paid once per packet
+            // when collisions actually exist.
+            enum Snapshot {
+                Single(
+                    ChannelHash,
+                    crate::adapter::net::cortex::RpcInboundDispatcher,
+                ),
+                Many(
+                    Vec<(
+                        ChannelHash,
+                        crate::adapter::net::cortex::RpcInboundDispatcher,
+                    )>,
+                ),
+            }
+            let snapshot = match entry.as_slice() {
+                [] => {
+                    drop(entry);
+                    return;
+                }
+                [only] => {
+                    let (c, d) = only.clone();
+                    Snapshot::Single(c, d)
+                }
+                many => Snapshot::Many(many.to_vec()),
+            };
             drop(entry);
             let origin_hash = parsed.header.origin_hash;
-            for event_data in events.into_iter() {
-                for (canonical, disp) in &pairs {
-                    disp(crate::adapter::net::cortex::RpcInboundEvent {
-                        channel_hash: *canonical,
-                        origin_hash,
-                        payload: event_data.clone(),
-                    });
+            match snapshot {
+                Snapshot::Single(canonical, disp) => {
+                    for event_data in events.into_iter() {
+                        disp(crate::adapter::net::cortex::RpcInboundEvent {
+                            channel_hash: canonical,
+                            origin_hash,
+                            payload: event_data,
+                        });
+                    }
+                }
+                Snapshot::Many(pairs) => {
+                    for event_data in events.into_iter() {
+                        for (canonical, disp) in &pairs {
+                            disp(crate::adapter::net::cortex::RpcInboundEvent {
+                                channel_hash: *canonical,
+                                origin_hash,
+                                payload: event_data.clone(),
+                            });
+                        }
+                    }
                 }
             }
             return;
