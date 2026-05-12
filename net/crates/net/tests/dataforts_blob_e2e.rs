@@ -39,9 +39,7 @@ use net::adapter::net::behavior::dataforts_capabilities::{
 use net::adapter::net::dataforts::blob::{
     drive_blob_migration_tick, BlobAdapter, BlobRef, MeshBlobAdapter,
 };
-use net::adapter::net::dataforts::gravity::{
-    BlobHeatRegistry, BlobHeatSink, DataGravityPolicy,
-};
+use net::adapter::net::dataforts::gravity::{BlobHeatRegistry, BlobHeatSink, DataGravityPolicy};
 use net::adapter::net::redex::{
     PlacementStrategy, Redex, ReplicaRole, ReplicationConfig, TransitionSignal,
 };
@@ -94,11 +92,7 @@ async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 /// Replica (B) for every constituent chunk of `blob_ref`. Manual
 /// because Phase-F placement-filter election isn't wired; the
 /// substrate's existing replication e2e drives the same path.
-async fn drive_chunk_roles_for(
-    blob_ref: &BlobRef,
-    redex_a: &Arc<Redex>,
-    redex_b: &Arc<Redex>,
-) {
+async fn drive_chunk_roles_for(blob_ref: &BlobRef, redex_a: &Arc<Redex>, redex_b: &Arc<Redex>) {
     let hashes: Vec<[u8; 32]> = match blob_ref {
         BlobRef::Small { hash, .. } => vec![*hash],
         BlobRef::Manifest { chunks, .. } => chunks.iter().map(|c| c.hash).collect(),
@@ -156,10 +150,9 @@ async fn mesh_blob_prefetch_replicates_chunks_from_peer() {
     let b_id = node_b.node_id();
     let rep_cfg = pinned_replication_cfg(a_id, b_id);
 
-    let adapter_a = MeshBlobAdapter::new("mesh-a", redex_a.clone())
-        .with_replication(rep_cfg.clone());
-    let adapter_b = MeshBlobAdapter::new("mesh-b", redex_b.clone())
-        .with_replication(rep_cfg);
+    let adapter_a =
+        MeshBlobAdapter::new("mesh-a", redex_a.clone()).with_replication(rep_cfg.clone());
+    let adapter_b = MeshBlobAdapter::new("mesh-b", redex_b.clone()).with_replication(rep_cfg);
 
     // A stores a payload — the chunk's content channel opens with
     // the replication config armed on A's side. The replication
@@ -233,8 +226,7 @@ async fn gravity_migration_controller_fetches_hot_blob() {
             heat_registry_a.clone(),
             net::adapter::net::dataforts::blob::DEFAULT_BLOB_HEAT_HALF_LIFE,
         );
-    let adapter_b = MeshBlobAdapter::new("mesh-b", redex_b.clone())
-        .with_replication(rep_cfg);
+    let adapter_b = MeshBlobAdapter::new("mesh-b", redex_b.clone()).with_replication(rep_cfg);
 
     // A announces participating caps so B's chain_caps lookup
     // surfaces them. Includes scope=mesh + gravity=enabled so the

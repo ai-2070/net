@@ -648,9 +648,10 @@ impl PyMeshBlobAdapter {
     #[new]
     #[pyo3(signature = (redex, adapter_id, *, persistent = false))]
     fn new(redex: &PyRedex, adapter_id: String, persistent: bool) -> Self {
-        let inner =
-            Arc::new(InnerMeshBlobAdapter::new(adapter_id.clone(), redex.inner_arc())
-                .with_persistent(persistent));
+        let inner = Arc::new(
+            InnerMeshBlobAdapter::new(adapter_id.clone(), redex.inner_arc())
+                .with_persistent(persistent),
+        );
         Self {
             inner,
             id: adapter_id,

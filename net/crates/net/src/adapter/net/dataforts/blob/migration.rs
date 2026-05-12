@@ -382,11 +382,8 @@ where
                         // prefetched this one; skip.
                         continue;
                     }
-                    let sibling_verdict = should_migrate_blob_to(
-                        local_caps,
-                        &candidate.publisher_caps,
-                        sibling_size,
-                    );
+                    let sibling_verdict =
+                        should_migrate_blob_to(local_caps, &candidate.publisher_caps, sibling_size);
                     match sibling_verdict {
                         MigrateBlobVerdict::Admit => {
                             let blob_ref = BlobRef::small(
@@ -538,8 +535,12 @@ mod tests {
         let controller = BlobMigrationController::new(&local, &index);
         let candidates = controller.candidates();
         assert_eq!(candidates.len(), 2);
-        assert!(candidates.iter().any(|c| c.hash == h1 && (c.rate - 0.50).abs() < 1e-6));
-        assert!(candidates.iter().any(|c| c.hash == h2 && (c.rate - 0.30).abs() < 1e-6));
+        assert!(candidates
+            .iter()
+            .any(|c| c.hash == h1 && (c.rate - 0.50).abs() < 1e-6));
+        assert!(candidates
+            .iter()
+            .any(|c| c.hash == h2 && (c.rate - 0.30).abs() < 1e-6));
         assert!(candidates.iter().all(|c| c.publisher_node_id == 99));
     }
 
@@ -699,8 +700,7 @@ mod tests {
         let local = participating_local("mesh", 128, 1);
         let adapter = PrefetchRecorder::new();
         let four_gib: u64 = 4 * (1 << 30);
-        let report =
-            drive_blob_migration_tick(&local, &index, &adapter, |_| Some(four_gib)).await;
+        let report = drive_blob_migration_tick(&local, &index, &adapter, |_| Some(four_gib)).await;
         assert_eq!(report.admitted, 0);
         assert_eq!(report.rejected_insufficient_disk, 1);
     }

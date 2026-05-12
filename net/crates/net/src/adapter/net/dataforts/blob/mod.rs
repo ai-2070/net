@@ -45,14 +45,14 @@ pub use dispatch::{
 pub use error::BlobError;
 pub use fs::FileSystemAdapter;
 pub use mesh::{MeshBlobAdapter, DEFAULT_BLOB_HEAT_HALF_LIFE};
+pub use metrics::{
+    evaluate_health_gate, BlobMetrics, BlobMetricsSnapshot, HealthGateAction,
+    HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
+};
 pub use migration::{
     drive_blob_migration_tick, drive_blob_migration_tick_arc,
     drive_blob_migration_tick_with_manifest_resolver, parse_blob_heat_tag, BlobMigrationCandidate,
     BlobMigrationController, BlobMigrationTickReport, ManifestSiblings,
-};
-pub use metrics::{
-    evaluate_health_gate, BlobMetrics, BlobMetricsSnapshot, HealthGateAction,
-    HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
 };
 pub use noop::NoopAdapter;
 pub use publish_with_blob::{publish_with_blob, BlobDurability, PublishWithBlobReceipt};

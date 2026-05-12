@@ -308,7 +308,10 @@ async fn cmd_exists(
     }
 }
 
-fn cmd_ls(adapter: &MeshBlobAdapter, fmt: OutputFormat) -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn cmd_ls(
+    adapter: &MeshBlobAdapter,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut entries: Vec<([u8; 32], RefcountEntry)> = adapter.refcount_table().snapshot();
     entries.sort_by_key(|(h, _)| *h);
     print_ls(&entries, fmt)?;
@@ -405,7 +408,10 @@ async fn cmd_gc(
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_metrics(adapter: &MeshBlobAdapter, _fmt: OutputFormat) -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn cmd_metrics(
+    adapter: &MeshBlobAdapter,
+    _fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Prometheus text body is its own format; --format is ignored
     // here. The JSON shape would be a separate metrics snapshot
     // we could surface later if operators want it.
@@ -523,11 +529,7 @@ fn read_input(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 
 fn parse_hash(s: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     if s.len() != 64 {
-        return Err(format!(
-            "expected a 64-char hex hash; got {} chars",
-            s.len()
-        )
-        .into());
+        return Err(format!("expected a 64-char hex hash; got {} chars", s.len()).into());
     }
     let mut out = [0u8; 32];
     for (i, b) in out.iter_mut().enumerate() {
@@ -573,4 +575,3 @@ fn now_unix_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-
