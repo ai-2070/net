@@ -202,6 +202,15 @@ impl BlobRefcountTable {
         self.inner.iter().filter(|e| e.value().pinned).count()
     }
 
+    /// Materialize every tracked `(hash, entry)` pair as an owned
+    /// vector. O(n) over the table; intended for diagnostic /
+    /// CLI use rather than per-event hot paths. Iteration order
+    /// is unspecified — sort on the receiver if a deterministic
+    /// order is needed.
+    pub fn snapshot(&self) -> Vec<([u8; 32], RefcountEntry)> {
+        self.inner.iter().map(|r| (*r.key(), *r.value())).collect()
+    }
+
     /// Total count of hashes with `refcount == 0`. Exposed for
     /// `dataforts_blob_gc_pending_total` — operators see how much
     /// the sweep would reclaim if every other condition were
