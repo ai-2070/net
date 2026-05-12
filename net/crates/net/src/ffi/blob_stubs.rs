@@ -123,6 +123,21 @@ pub extern "C" fn net_mesh_blob_adapter_set_overflow_config(
     NET_ERR_FEATURE_NOT_BUILT
 }
 
+/// `net_blob_free_buffer` lives in `ffi::blob` (gated on
+/// `dataforts`); cgo consumers call it on every `_fetch` reply
+/// regardless of feature build. Provide an always-on stub so the
+/// symbol resolves. The fetch stub never hands out a buffer, so
+/// this is a no-op on every realistic call path; the
+/// belt-and-suspenders null check defends against a caller that
+/// stashed a non-null pointer from a prior dataforts-on build.
+///
+/// # Safety
+/// `ptr` may be null; if non-null, it must originate from a
+/// matching `_fetch` call (which on this build never happens —
+/// the function then deliberately does nothing).
+#[unsafe(no_mangle)]
+pub extern "C" fn net_blob_free_buffer(_ptr: *mut u8, _len: usize) {}
+
 #[cfg(test)]
 mod tests {
     //! Contract checks on the stub bodies — every `c_int`

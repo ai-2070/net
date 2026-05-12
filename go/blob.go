@@ -5,7 +5,7 @@
 //
 // The adapter is Rust-backed (chunks live in Redex as
 // content-addressed `RedexFile`s); Go callers get a thin
-// wrapper over the opaque `MeshBlobAdapterHandle*` pointer.
+// wrapper over the opaque `net_mesh_blob_adapter_t*` pointer.
 // Mirrors the Python + Node bindings.
 //
 // # State persistence
@@ -34,55 +34,16 @@
 package net
 
 /*
+#include "net.h"
 #include <stdint.h>
 #include <stdlib.h>
 
-typedef struct MeshBlobAdapterHandle MeshBlobAdapterHandle;
-typedef struct RedexHandle RedexHandle;
-
-// v0.2 substrate-owned blob CAS — basic CRUD.
-extern MeshBlobAdapterHandle* net_mesh_blob_adapter_new(
-    RedexHandle* redex,
-    const char* adapter_id,
-    int persistent,
-    const char* overflow_json
-);
-extern void net_mesh_blob_adapter_free(MeshBlobAdapterHandle* handle);
-extern int net_mesh_blob_adapter_store(
-    const MeshBlobAdapterHandle* handle,
-    const uint8_t* blob_ref_bytes,
-    size_t blob_ref_len,
-    const uint8_t* data,
-    size_t data_len
-);
-extern int net_mesh_blob_adapter_fetch(
-    const MeshBlobAdapterHandle* handle,
-    const uint8_t* blob_ref_bytes,
-    size_t blob_ref_len,
-    uint8_t** out_data,
-    size_t* out_len
-);
-extern int net_mesh_blob_adapter_exists(
-    const MeshBlobAdapterHandle* handle,
-    const uint8_t* blob_ref_bytes,
-    size_t blob_ref_len,
-    int* out_exists
-);
-extern char* net_mesh_blob_adapter_prometheus_text(const MeshBlobAdapterHandle* handle);
-extern void net_blob_free_buffer(uint8_t* ptr, size_t len);
-
-// v0.3 active overflow.
-extern int net_mesh_blob_adapter_overflow_enabled(const MeshBlobAdapterHandle* handle);
-extern int net_mesh_blob_adapter_overflow_active(const MeshBlobAdapterHandle* handle);
-extern char* net_mesh_blob_adapter_overflow_config(const MeshBlobAdapterHandle* handle);
-extern int net_mesh_blob_adapter_set_overflow_enabled(
-    const MeshBlobAdapterHandle* handle,
-    int enabled
-);
-extern int net_mesh_blob_adapter_set_overflow_config(
-    const MeshBlobAdapterHandle* handle,
-    const char* config_json
-);
+// `net_blob_free_buffer` lives in include/net.h's blob section; the
+// MeshBlobAdapter wire surface that this file binds against is also
+// declared in net.h (added alongside this binding). All symbols
+// resolve at runtime via the libnet cdylib; consumers building
+// without the `dataforts + netdb + redex-disk` feature triple get
+// the `blob_stubs` fallbacks that return NET_ERR_FEATURE_NOT_BUILT.
 */
 import "C"
 
@@ -158,13 +119,13 @@ type MeshBlobAdapterOpts struct {
 	Overflow *OverflowConfig
 }
 
-// MeshBlobAdapter wraps `*MeshBlobAdapterHandle`. Cheap to
+// MeshBlobAdapter wraps `*net_mesh_blob_adapter_t`. Cheap to
 // share via the Go runtime; methods take an internal lock
 // around `Close()` to serialize FFI `_free` against any
 // concurrent in-flight op.
 type MeshBlobAdapter struct {
 	mu     sync.Mutex
-	handle *C.MeshBlobAdapterHandle
+	handle *C.net_mesh_blob_adapter_t
 }
 
 // NewMeshBlobAdapter constructs a substrate-owned blob adapter
