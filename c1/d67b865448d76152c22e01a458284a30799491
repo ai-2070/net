@@ -1,0 +1,30 @@
+net/crates/net/bindings/python/README.md
+  s_3a0a24a47d1a36::t_14317bd8c77bfc 379-470
+net/crates/net/README.md
+  s_3a0a24a47d1a36::t_126957c448b99e 585-626
+  s_3a0a24a47d1a36::t_1dd67c70a6ec20 1052
+net/crates/net/include/README.md
+  s_3a0a24a47d1a36::t_b755b93c25aca7 610-684
+net/crates/net/sdk-ts/README.md
+  s_3a0a24a47d1a36::t_2c55c063017243 877-954
+net/crates/net/sdk-py/README.md
+  s_3a0a24a47d1a36::t_e4f90b22c75f66 739-824
+net/crates/net/sdk/README.md
+  s_3a0a24a47d1a36::t_a149d7092fe889 907-983
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "c1d67b865448d76152c22e01a458284a30799491",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
