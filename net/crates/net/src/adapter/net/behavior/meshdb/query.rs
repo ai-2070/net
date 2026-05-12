@@ -185,6 +185,49 @@ pub enum QueryV1 {
         /// Optional row cap. `None` = unbounded.
         limit: Option<u64>,
     },
+    /// Composite — bucket rows into tumbling windows of fixed
+    /// size, then emit one [`super::query::WindowBoundary`] per
+    /// bucket carrying the rows inside it. Locked-decision #6
+    /// per the plan; Phase E-5 ships tumbling-on-seq
+    /// (overlapping / session windows defer until a consumer
+    /// drives the shape).
+    Window {
+        /// Inner sub-query whose rows are bucketed.
+        inner: Box<MeshQuery>,
+        /// Bucketing strategy.
+        spec: WindowSpec,
+    },
+}
+
+/// Window strategy for [`QueryV1::Window`]. Phase E-5 ships
+/// only the tumbling-on-seq variant; sliding + session windows
+/// extend cleanly via additional variants.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WindowSpec {
+    /// Non-overlapping fixed-size buckets keyed on
+    /// [`ResultRow::seq`]. Bucket `i` contains rows whose seq
+    /// falls in `[i * size, (i + 1) * size)`.
+    TumblingSeq {
+        /// Window size in seq units. Must be `>= 1`; the
+        /// planner rejects `0`.
+        size: u64,
+    },
+}
+
+/// One bucket emitted by the Window operator. Postcard-
+/// encoded inside each window output [`ResultRow`]'s
+/// `payload` (with `origin = 0` and `seq = SeqNum(<bucket_start>)`
+/// — the seq carries the bucket boundary so a downstream
+/// `OrderBy` can sort on it without decoding the payload).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowBoundary {
+    /// Inclusive bucket start (in seq units).
+    pub start: SeqNum,
+    /// Exclusive bucket end.
+    pub end: SeqNum,
+    /// Rows in this bucket, ordered by their original seq.
+    pub rows: Vec<ResultRow>,
 }
 
 /// How a [`MeshQuery`] addresses a chain.

@@ -44,7 +44,7 @@ use super::error::MeshError;
 use super::planner::{ExecutionPlan, JoinKeyMode, OperatorNode, OperatorPlan};
 use super::query::{
     AggregateRowPayload, AggregateValue, GroupKey, JoinKind, JoinedRowPayload,
-    NumericAggregateKind, NumericReductionKind, ResultRow, SeqNum,
+    NumericAggregateKind, NumericReductionKind, ResultRow, SeqNum, WindowBoundary, WindowSpec,
 };
 
 /// Unique id for a running query. Currently a monotonically-
@@ -298,6 +298,10 @@ fn collect_operator_rows<R: ChainReader + ?Sized>(
         } => {
             let rows = collect_operator_rows(input, reader)?;
             execute_aggregate_distinct(&rows, *group_by, field_path)
+        }
+        OperatorPlan::Window { input, spec } => {
+            let rows = collect_operator_rows(input, reader)?;
+            execute_window(rows, spec)
         }
         OperatorPlan::Filter { input, predicate } => {
             let rows = collect_operator_rows(input, reader)?;
@@ -742,6 +746,58 @@ pub(super) fn execute_aggregate_distinct(
         out.push(ResultRow {
             origin: 0,
             seq: SeqNum(0),
+            payload,
+        });
+    }
+    Ok(out)
+}
+
+/// Phase E-5 tumbling-on-seq window. Groups `rows` by seq /
+/// size, emits one sentinel [`ResultRow`] per non-empty
+/// bucket whose payload is a postcard-encoded
+/// [`WindowBoundary`]. The sentinel row's `seq` carries the
+/// bucket's start so an outer `OrderBy` can sort buckets
+/// without decoding payloads.
+pub(super) fn execute_window(
+    rows: Vec<ResultRow>,
+    spec: &WindowSpec,
+) -> Result<Vec<ResultRow>, MeshError> {
+    use std::collections::BTreeMap;
+
+    let size = match spec {
+        WindowSpec::TumblingSeq { size } => *size,
+    };
+    if size == 0 {
+        return Err(MeshError::PlannerError {
+            detail: "Window size must be >= 1".to_string(),
+        });
+    }
+
+    let mut buckets: BTreeMap<u64, Vec<ResultRow>> = BTreeMap::new();
+    for row in rows {
+        let bucket = row.seq.0 / size;
+        buckets.entry(bucket).or_default().push(row);
+    }
+
+    let mut out = Vec::with_capacity(buckets.len());
+    for (bucket, mut bucket_rows) in buckets {
+        // Within-bucket order: by seq, then by origin
+        // (deterministic for the cache-key contract).
+        bucket_rows.sort_by_key(|r| (r.seq, r.origin));
+        let start = bucket.saturating_mul(size);
+        let end = start.saturating_add(size);
+        let boundary = WindowBoundary {
+            start: SeqNum(start),
+            end: SeqNum(end),
+            rows: bucket_rows,
+        };
+        let payload = postcard::to_allocvec(&boundary).map_err(|e| MeshError::ExecutorError {
+            node: 0,
+            detail: format!("encode WindowBoundary: {e}"),
+        })?;
+        out.push(ResultRow {
+            origin: 0,
+            seq: SeqNum(start),
             payload,
         });
     }
@@ -1809,6 +1865,97 @@ mod tests {
         let decoded: AggregateRowPayload =
             postcard::from_bytes(&rows[0].payload).unwrap();
         assert_eq!(decoded.value, AggregateValue::Avg(None));
+    }
+
+    #[tokio::test]
+    async fn window_tumbling_seq_buckets_rows_in_order() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{WindowBoundary, WindowSpec};
+
+        let chain = 0xAA;
+        let reader = Arc::new(InMemoryChainReader::default());
+        // seqs 1..=7, window size 3 → buckets [0,3), [3,6), [6,9)
+        //   bucket 0: seqs 1, 2
+        //   bucket 1: seqs 3, 4, 5
+        //   bucket 2: seqs 6, 7
+        for s in 1..=7u64 {
+            reader.append(chain, SeqNum(s), format!("p-{s}").into_bytes());
+        }
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::Window {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: chain,
+                            start: SeqNum(1),
+                            end: SeqNum(20),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    spec: WindowSpec::TumblingSeq { size: 3 },
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let running = executor.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        // Buckets emit in seq-asc order; sentinel row's seq
+        // carries the bucket start.
+        assert_eq!(rows[0].seq, SeqNum(0));
+        assert_eq!(rows[1].seq, SeqNum(3));
+        assert_eq!(rows[2].seq, SeqNum(6));
+
+        let b0: WindowBoundary = postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(b0.start, SeqNum(0));
+        assert_eq!(b0.end, SeqNum(3));
+        let seqs0: Vec<u64> = b0.rows.iter().map(|r| r.seq.0).collect();
+        assert_eq!(seqs0, vec![1, 2]);
+
+        let b1: WindowBoundary = postcard::from_bytes(&rows[1].payload).unwrap();
+        assert_eq!(b1.rows.len(), 3);
+        let b2: WindowBoundary = postcard::from_bytes(&rows[2].payload).unwrap();
+        let seqs2: Vec<u64> = b2.rows.iter().map(|r| r.seq.0).collect();
+        assert_eq!(seqs2, vec![6, 7]);
+    }
+
+    #[tokio::test]
+    async fn window_size_zero_surfaces_planner_error() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::WindowSpec;
+
+        let reader = Arc::new(InMemoryChainReader::default());
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::Window {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::LatestRead { origin: 0xAA },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    spec: WindowSpec::TumblingSeq { size: 0 },
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let err = executor.execute(plan).await.unwrap_err();
+        match err {
+            MeshError::PlannerError { detail } => {
+                assert!(detail.contains("Window size"));
+            }
+            other => panic!("expected PlannerError; got {other:?}"),
+        }
     }
 
     #[tokio::test]

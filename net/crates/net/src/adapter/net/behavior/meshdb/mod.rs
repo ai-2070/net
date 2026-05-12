@@ -96,5 +96,5 @@ pub use protocol::{
 pub use query::{
     AggregateFn, AggregateRowPayload, AggregateValue, ChainRef, Expr, GroupKey, JoinKey, JoinKind,
     JoinedRowPayload, MeshQuery, NumericAggregateKind, NumericReductionKind, OrderDir, OrderKey,
-    QueryV1, ResultRow, SeqNum,
+    QueryV1, ResultRow, SeqNum, WindowBoundary, WindowSpec,
 };

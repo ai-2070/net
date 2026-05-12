@@ -161,6 +161,11 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
                 // plan + run it locally).
                 return self.execute_aggregate_e4_federated(plan).await;
             }
+            OperatorPlan::Window { .. } => {
+                // Phase E-5: collect inner via transport, then
+                // bucket locally.
+                return self.execute_window_federated(plan).await;
+            }
             OperatorPlan::Filter { .. } => {
                 // Phase E-2 federated filter: fetch the inner
                 // sub-plan via the transport, filter locally.
@@ -352,6 +357,35 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
 
         let handle = QueryHandle::new(self.allocate_id());
         let stream: ResultStream = Box::pin(futures::stream::iter(out));
+        Ok(RunningQuery {
+            handle,
+            rows: stream,
+        })
+    }
+
+    /// Phase E-5 federated tumbling window. Fetches the inner
+    /// sub-plan via the transport, then buckets locally.
+    async fn execute_window_federated(
+        &self,
+        plan: ExecutionPlan,
+    ) -> Result<RunningQuery, MeshError> {
+        use super::executor::execute_window;
+        use super::planner::CostEstimate;
+
+        let OperatorPlan::Window { input, spec } = plan.root.operator else {
+            unreachable!("execute_window_federated dispatched on non-Window");
+        };
+        let inner = Box::pin(self.execute(ExecutionPlan {
+            root: *input,
+            total_cost: CostEstimate::default(),
+        }))
+        .await?;
+        let rows = drain_rows(inner.rows).await?;
+        let output_rows = execute_window(rows, &spec)?;
+
+        let handle = QueryHandle::new(self.allocate_id());
+        let stream: ResultStream =
+            Box::pin(futures::stream::iter(output_rows.into_iter().map(Ok)));
         Ok(RunningQuery {
             handle,
             rows: stream,

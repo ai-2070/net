@@ -218,6 +218,18 @@ pub enum OperatorPlan {
         /// is what gets hashed for distinctness.
         field_path: String,
     },
+    /// Phase E-5 tumbling window operator. The executor reads
+    /// `input`'s rows, buckets them by
+    /// [`super::query::WindowSpec`], and emits one sentinel
+    /// [`super::query::ResultRow`] per non-empty bucket whose
+    /// `payload` is a postcard-encoded
+    /// [`super::query::WindowBoundary`].
+    Window {
+        /// Inner sub-plan whose rows are bucketed.
+        input: Box<OperatorNode>,
+        /// Window strategy.
+        spec: super::query::WindowSpec,
+    },
     /// Inner hash-join of two sub-plans. Phase D-1 ships the
     /// in-memory hash-build-on-left / probe-on-right strategy
     /// against row-intrinsic keys (`origin` / `seq`); richer
@@ -437,7 +449,38 @@ where
                 let input = self.plan(inner)?;
                 self.plan_not_yet_implemented("OrderBy (Phase A.2)", Some(Box::new(input.root)))
             }
+            QueryV1::Window { inner, spec } => self.plan_window(inner, spec),
         }
+    }
+
+    /// Plan a tumbling-window operator. Phase E-5 ships
+    /// `WindowSpec::TumblingSeq { size }` with `size >= 1`.
+    fn plan_window(
+        &self,
+        inner: &MeshQuery,
+        spec: &super::query::WindowSpec,
+    ) -> Result<OperatorNode, MeshError> {
+        match spec {
+            super::query::WindowSpec::TumblingSeq { size } if *size == 0 => {
+                return Err(MeshError::PlannerError {
+                    detail: "Window size must be >= 1".to_string(),
+                });
+            }
+            _ => {}
+        }
+        let inner_plan = self.plan(inner)?;
+        let cost = CostEstimate {
+            bandwidth_bytes: inner_plan.total_cost.bandwidth_bytes,
+            latency_ms: inner_plan.total_cost.latency_ms,
+        };
+        Ok(OperatorNode {
+            operator: OperatorPlan::Window {
+                input: Box::new(inner_plan.root),
+                spec: spec.clone(),
+            },
+            target_nodes: vec![],
+            cost,
+        })
     }
 
     /// Plan an atomic `At(origin, seq)` read. Resolves the
@@ -1138,7 +1181,8 @@ fn sum_cost(node: &OperatorNode) -> CostEstimate {
             acc.latency_ms = acc.latency_ms.saturating_add(inner.latency_ms);
         }
         OperatorPlan::AggregateReduction { input, .. }
-        | OperatorPlan::AggregateDistinct { input, .. } => {
+        | OperatorPlan::AggregateDistinct { input, .. }
+        | OperatorPlan::Window { input, .. } => {
             let inner = sum_cost(input);
             acc.bandwidth_bytes = acc.bandwidth_bytes.saturating_add(inner.bandwidth_bytes);
             acc.latency_ms = acc.latency_ms.saturating_add(inner.latency_ms);
