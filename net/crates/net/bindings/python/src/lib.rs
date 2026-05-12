@@ -2274,6 +2274,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "dataforts")]
     {
         m.add_class::<blob::PyBlobRef>()?;
+        m.add_class::<blob::PyMeshBlobAdapter>()?;
         m.add_function(wrap_pyfunction!(blob::register_filesystem_blob_adapter, m)?)?;
         m.add_function(wrap_pyfunction!(blob::register_blob_adapter, m)?)?;
         m.add_function(wrap_pyfunction!(blob::unregister_blob_adapter, m)?)?;

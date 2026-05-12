@@ -46,7 +46,7 @@ impl BlobAdapter for NoopAdapter {
     }
 
     async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
-        Err(BlobError::NotFound(blob_ref.uri.clone()))
+        Err(BlobError::NotFound(blob_ref.uri().to_owned()))
     }
 
     async fn fetch_range(
@@ -54,7 +54,7 @@ impl BlobAdapter for NoopAdapter {
         blob_ref: &BlobRef,
         _range: Range<u64>,
     ) -> Result<Vec<u8>, BlobError> {
-        Err(BlobError::NotFound(blob_ref.uri.clone()))
+        Err(BlobError::NotFound(blob_ref.uri().to_owned()))
     }
 
     async fn exists(&self, _blob_ref: &BlobRef) -> Result<bool, BlobError> {
@@ -67,7 +67,7 @@ mod tests {
     use super::*;
 
     fn fixture_ref() -> BlobRef {
-        BlobRef::new("noop://x", [0x00; 32], 0)
+        BlobRef::small("noop://x", [0x00; 32], 0)
     }
 
     #[tokio::test]

@@ -1635,7 +1635,7 @@ mod tests {
 
             // Store some content under a BlobRef + record the ref.
             let payload = b"out-of-band content";
-            let blob = BlobRef::new(
+            let blob = BlobRef::small(
                 "fs://routed",
                 blake3::hash(payload).into(),
                 payload.len() as u64,
@@ -1667,7 +1667,7 @@ mod tests {
             // UnsupportedScheme, which conflated config issues with
             // URI-scheme rejection).
             let payload = b"any";
-            let blob = BlobRef::new(
+            let blob = BlobRef::small(
                 "file:///orphan",
                 blake3::hash(payload).into(),
                 payload.len() as u64,
@@ -1706,7 +1706,7 @@ mod tests {
                 cfg,
             );
             let payload = b"x";
-            let blob = BlobRef::new(
+            let blob = BlobRef::small(
                 "file:///per-channel",
                 blake3::hash(payload).into(),
                 payload.len() as u64,
@@ -1723,7 +1723,7 @@ mod tests {
         async fn resolve_one_errors_when_configured_adapter_not_registered() {
             // Channel points at adapter id "ghost" which no one registered.
             let payload = b"any";
-            let blob = BlobRef::new(
+            let blob = BlobRef::small(
                 "file:///ghost",
                 blake3::hash(payload).into(),
                 payload.len() as u64,
@@ -1745,7 +1745,7 @@ mod tests {
             let adapter: Arc<NoopAdapter> = Arc::new(NoopAdapter::new(id.clone()));
             global_blob_adapter_registry().register(adapter).unwrap();
 
-            let blob = BlobRef::new("noop://nowhere", [0xAA; 32], 0);
+            let blob = BlobRef::small("noop://nowhere", [0xAA; 32], 0);
             let cfg = RedexFileConfig::default().with_blob_adapter_id(Some(id.clone()));
             let f = RedexFile::new(ChannelName::new("resolve-noop").unwrap(), cfg);
             let seq = f.append(&blob.encode()).unwrap();

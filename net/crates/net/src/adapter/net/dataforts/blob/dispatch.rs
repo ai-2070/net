@@ -73,9 +73,9 @@ pub async fn resolve_payload<A: BlobAdapter + ?Sized>(
         EventPayload::Blob(blob) => {
             let accepted = adapter.accepted_schemes();
             if !accepted.is_empty() {
-                let scheme = uri_scheme(&blob.uri);
+                let scheme = uri_scheme(blob.uri());
                 if !accepted.contains(&scheme) {
-                    return Err(BlobError::UnsupportedScheme(blob.uri.clone()));
+                    return Err(BlobError::UnsupportedScheme(blob.uri().to_owned()));
                 }
             }
             let fetched = adapter.fetch(&blob).await?;
@@ -123,7 +123,7 @@ pub async fn publish_blob_ref<A: BlobAdapter + ?Sized>(
     bytes: &[u8],
 ) -> Result<BlobRef, BlobError> {
     let hash: [u8; 32] = blake3::hash(bytes).into();
-    let blob = BlobRef::new(uri, hash, bytes.len() as u64);
+    let blob = BlobRef::small(uri, hash, bytes.len() as u64);
     adapter.store(&blob, bytes).await?;
     Ok(blob)
 }
@@ -135,7 +135,7 @@ mod tests {
     use super::*;
 
     fn fixture_blob_ref(payload: &[u8]) -> BlobRef {
-        BlobRef::new(
+        BlobRef::small(
             "file:///dispatch",
             blake3::hash(payload).into(),
             payload.len() as u64,
@@ -252,9 +252,9 @@ mod tests {
             .unwrap();
         // Hash is BLAKE3 of the payload.
         let expected: [u8; 32] = blake3::hash(payload).into();
-        assert_eq!(blob.hash, expected);
-        assert_eq!(blob.size, payload.len() as u64);
-        assert_eq!(blob.uri, "file:///structured");
+        assert_eq!(blob.small_hash(), Some(&expected));
+        assert_eq!(blob.size(), payload.len() as u64);
+        assert_eq!(blob.uri(), "file:///structured");
 
         // Stored content is fetchable + verifies.
         let fetched = adapter.fetch(&blob).await.unwrap();
@@ -280,7 +280,7 @@ mod tests {
         ));
         let adapter = FileSystemAdapter::new("scheme-test", &root);
         let payload = b"unused";
-        let blob = BlobRef::new(
+        let blob = BlobRef::small(
             "s3://attacker/key",
             blake3::hash(payload).into(),
             payload.len() as u64,
@@ -331,7 +331,7 @@ mod tests {
 
         let advertised = b"the truth";
         let actual: &[u8] = b"a different lie";
-        let blob = BlobRef::new(
+        let blob = BlobRef::small(
             "test://tamper",
             blake3::hash(advertised).into(),
             advertised.len() as u64,

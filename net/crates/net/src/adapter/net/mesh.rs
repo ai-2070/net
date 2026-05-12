@@ -1051,6 +1051,22 @@ const DEFAULT_HANDSHAKE_TTL: u8 = 16;
 /// while still bounding count-to-infinity worst cases.
 const MAX_HOPS: u8 = 16;
 
+/// Maximum number of `heat:blob:<hex>=<rate>` reserved tags
+/// accepted from a single peer announcement before the
+/// substrate-side filter starts dropping the overflow. Blob-heat
+/// isn't gated by a `causal:` claim like chain-heat is (the blob
+/// is content-addressed, so a forged hash claim doesn't grant
+/// privileges), but the gravity migration controller consumes
+/// the rate — without a cap, a peer spraying thousands of forged
+/// heat tags forces every healthy node to attempt that many
+/// `adapter.prefetch` calls. The cap bounds the amplification:
+/// at most this many blob-heat tags from any one announcement
+/// reach the capability index. 256 is comfortable for realistic
+/// per-node hot-blob counts (manifests with thousands of chunks
+/// would emit heat per chunk, but in practice a node's working
+/// set is well under this bound).
+const MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE: usize = 256;
+
 /// Multi-peer mesh node.
 ///
 /// Composes `NetSession` (per-peer encryption), `NetRouter` (forwarding),
@@ -3835,70 +3851,60 @@ impl MeshNode {
 
         // Resolve the publisher's capability set so the runtime's
         // scope / intent / colocation gates have something to
-        // evaluate against. We look up *any holder* of the chain's
-        // origin_hash via the capability index — not the last-hop
-        // peer's caps, which would silently invert scope/intent
-        // admission for relayed events. Falls back to empty caps
-        // (fail-closed for scope-axis admission) if no holder is
-        // indexed yet (subscribe-before-announce race).
+        // evaluate against. The wire `origin_hash` is the
+        // publisher's `EntityId::origin_hash()` projection;
+        // [`CapabilityIndex::get_by_origin_hash`] bridges that
+        // back to the indexed `node_id` via the side index
+        // populated on every `index()` call. Unambiguous under
+        // multi-hop relay (the lookup keys on the entity, not the
+        // last-hop peer) and not poisoned by cache holders'
+        // `causal:<hex>` announcements.
+        //
+        // Two distinct failure modes for the lookup:
+        //
+        // - *Vacant* slot — no announcement has propagated yet
+        //   (benign cap-propagation race). Fall back to empty
+        //   caps so the observer admits the event under the
+        //   default-Mesh scope. Events from new publishers reach
+        //   the cache while their first announcement is in
+        //   flight.
+        //
+        // - *Ambiguous* slot — two or more distinct entities
+        //   claim the same wire u32 origin_hash. Adversarial.
+        //   Skip observe_event entirely so scope / intent /
+        //   colocation admission cannot be tricked into running
+        //   against either claimant's caps. Documented on
+        //   `CapabilityIndex::by_origin_hash`.
         //
         // Snapshotted once per packet rather than per-event; every
         // event in the same packet shares the same publisher.
         #[cfg(feature = "dataforts")]
-        let chain_caps: std::sync::Arc<
-            crate::adapter::net::behavior::capability::CapabilitySet,
+        let chain_caps: Option<
+            std::sync::Arc<crate::adapter::net::behavior::capability::CapabilitySet>,
         > = if greedy.is_some() {
             let origin_hash: u64 = parsed.header.origin_hash.into();
-            let hex = Self::chain_hex(origin_hash);
-            // Preferred path: pick any node that advertises
-            // `causal:<hex>` — every holder of the chain shares the
-            // chain-level caps. This is the traveling-with-chain
-            // signal that's robust under multi-hop relay: the
-            // publisher's announce_chain emits `causal:<hex>` into
-            // its CapabilitySet, and the index carries that across
-            // hops. Without this lookup, a relayed event evaluates
-            // against the relay's last-hop caps, silently inverting
-            // scope/intent admission.
-            //
-            // Fallback: until the publisher has emitted a
-            // `causal:<hex>` announcement (or in deployments that
-            // don't run announce_chain), use the last-hop peer's
-            // caps. For a direct A→B path that IS the publisher;
-            // for a multi-hop path the relay's caps are a
-            // best-effort proxy until the chain announcement
-            // propagates. Final fallback: empty caps (fail-closed
-            // for scope-axis admission).
-            let publisher_caps = ctx
-                .capability_index
-                .all_nodes()
-                .into_iter()
-                .find_map(|nid| {
-                    let caps = ctx.capability_index.get(nid)?;
-                    if caps.tags.iter().any(|t| Self::is_causal_for(t, &hex)) {
-                        Some(caps)
-                    } else {
-                        None
-                    }
-                });
-            let chain_caps = publisher_caps.or_else(|| {
-                let peer_addr = session.peer_addr();
-                let from_node = ctx.addr_to_node.get(&peer_addr).map(|r| *r);
-                from_node.and_then(|nid| ctx.capability_index.get(nid))
-            });
-            std::sync::Arc::new(chain_caps.unwrap_or_default())
+            if ctx.capability_index.is_origin_hash_ambiguous(origin_hash) {
+                None
+            } else {
+                let publisher_caps = ctx
+                    .capability_index
+                    .get_by_origin_hash(origin_hash)
+                    .unwrap_or_default();
+                Some(std::sync::Arc::new(publisher_caps))
+            }
         } else {
-            std::sync::Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default())
+            None
         };
 
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
             #[cfg(feature = "dataforts")]
-            if let Some(observer) = &greedy {
+            if let (Some(observer), Some(caps)) = (&greedy, &chain_caps) {
                 observer.observe_event(
                     parsed.header.channel_hash,
                     parsed.header.origin_hash.into(),
-                    chain_caps.clone(),
+                    caps.clone(),
                     event_data.clone(),
                 );
             }
@@ -5113,10 +5119,36 @@ impl MeshNode {
                 }
             }
         }
+        // Per-announce cap on `heat:blob:*` tags. Blob-heat is
+        // intentionally not gated by a `causal:` claim (the blob
+        // is content-addressed, so a forged hash just produces a
+        // useless prefetch attempt). But the gravity migration
+        // controller consumes the *rate* via
+        // `should_migrate_blob_to`, so a peer spraying thousands
+        // of `heat:blob:<random>=1.0` tags would force every
+        // healthy node to attempt that many prefetches. The cap
+        // bounds the amplification: at most
+        // `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags
+        // survive the filter per inbound announcement.
+        let mut blob_heat_budget: usize = MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE;
         caps.tags.retain(|tag| match tag {
             Tag::Reserved { prefix, body } if prefix == "heat:" => {
-                // body shape: `<hex>=<rate>`. Hex is everything
-                // before the first `=`.
+                // Blob-heat tags (body shape `blob:<hex64>=<rate>`)
+                // ride a separate trust model: the blob is
+                // content-addressed, so a forged claim just causes
+                // a useless prefetch attempt at worst (no data
+                // corruption, no traffic redirection). Allow up
+                // to the per-announce cap; drop the overflow.
+                if body.starts_with("blob:") {
+                    if blob_heat_budget == 0 {
+                        return false;
+                    }
+                    blob_heat_budget -= 1;
+                    return true;
+                }
+                // Chain-heat shape: `<hex>=<rate>`. Hex is everything
+                // before the first `=`; strip when the peer didn't
+                // also claim the chain via `causal:<hex>`.
                 let hex_end = body.bytes().position(|b| b == b'=').unwrap_or(body.len());
                 claimed.contains(&body[..hex_end])
             }
@@ -6562,6 +6594,53 @@ impl MeshNode {
         }
     }
 
+    /// Format a 32-byte BLAKE3 hash as a 64-character lowercase
+    /// hex string. Used as the chunk identifier inside `heat:blob:
+    /// <hex64>=<rate>` reserved tags.
+    #[cfg(feature = "dataforts")]
+    fn blob_hex(hash: &[u8; 32]) -> String {
+        let mut s = String::with_capacity(64);
+        for b in hash {
+            use std::fmt::Write;
+            let _ = write!(s, "{:02x}", b);
+        }
+        s
+    }
+
+    /// True iff `tag` is a `heat:blob:<hex64>=...` reserved tag for
+    /// `hex64`. Mirrors [`Self::is_heat_for`] but matches the
+    /// blob-heat body sub-prefix so chain-heat tags and blob-heat
+    /// tags never collide.
+    #[cfg(feature = "dataforts")]
+    fn is_blob_heat_for(tag: &Tag, hex64: &str) -> bool {
+        match tag {
+            Tag::Reserved { prefix, body } if prefix == "heat:" => {
+                if !body.starts_with("blob:") {
+                    return false;
+                }
+                let rest = &body[5..];
+                if !rest.starts_with(hex64) {
+                    return false;
+                }
+                matches!(rest.as_bytes().get(hex64.len()), Some(b'='))
+            }
+            _ => false,
+        }
+    }
+
+    /// Strip every `heat:blob:<hex64>=*` tag for `hash` from `caps`
+    /// and insert `replacement` in its place. `None` is withdrawal.
+    /// Parallel to [`Self::replace_heat_tags`] for the per-blob
+    /// heat-tag family.
+    #[cfg(feature = "dataforts")]
+    fn replace_blob_heat_tags(caps: &mut CapabilitySet, hash: &[u8; 32], replacement: Option<Tag>) {
+        let hex = Self::blob_hex(hash);
+        caps.tags.retain(|t| !Self::is_blob_heat_for(t, &hex));
+        if let Some(t) = replacement {
+            caps.tags.insert(t);
+        }
+    }
+
     /// Read the current user-supplied baseline, defaulting to an
     /// empty `CapabilitySet` when no `announce_capabilities` has
     /// landed yet. Returns an owned snapshot — callers mutate the
@@ -6721,6 +6800,92 @@ impl super::dataforts::HeatSink for MeshNode {
         updates: &[(u64, Option<f64>)],
     ) -> Result<(), AdapterError> {
         MeshNode::announce_heat_batch(self, updates).await
+    }
+}
+
+#[cfg(feature = "dataforts")]
+impl MeshNode {
+    /// Advertise the `heat:blob:<hex64>=<rate>` reserved tag for
+    /// chunk `hash`. `rate` is clamped to `[0.0, 1.0]` to match
+    /// the chain-heat wire shape. PR-5j-c — operators wire this
+    /// via the [`BlobHeatSink`](super::dataforts::BlobHeatSink)
+    /// impl below; the [`MeshBlobAdapter::tick_blob_heat`](super::dataforts::MeshBlobAdapter::tick_blob_heat)
+    /// loop is the driver.
+    pub async fn announce_blob_heat(&self, hash: [u8; 32], rate: f64) -> Result<(), AdapterError> {
+        let clamped = if rate.is_finite() {
+            rate.clamp(0.0, 1.0)
+        } else {
+            return Err(AdapterError::Fatal(
+                "blob heat rate must be finite".to_string(),
+            ));
+        };
+        let hex = Self::blob_hex(&hash);
+        let replacement = Tag::parse(&format!("heat:blob:{hex}={clamped:.2}")).ok();
+        let mut snapshot = self.user_caps_snapshot();
+        Self::replace_blob_heat_tags(&mut snapshot, &hash, replacement);
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// Withdraw every `heat:blob:<hex>=*` tag for `hash` and
+    /// re-broadcast. Peers drop the blob-heat annotation.
+    pub async fn withdraw_blob_heat(&self, hash: [u8; 32]) -> Result<(), AdapterError> {
+        let mut snapshot = self.user_caps_snapshot();
+        Self::replace_blob_heat_tags(&mut snapshot, &hash, None);
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// Apply a batch of blob-heat emissions in a single
+    /// `announce_capabilities` round-trip. Each update is either
+    /// `Some(rate)` (replace this hash's `heat:blob:` tag) or
+    /// `None` (withdraw every blob-heat annotation for the hash).
+    /// Coalescing matches the chain-heat batch path so a busy
+    /// tick doesn't spawn N rebroadcasts.
+    pub async fn announce_blob_heat_batch(
+        &self,
+        updates: &[([u8; 32], Option<f64>)],
+    ) -> Result<(), AdapterError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut snapshot = self.user_caps_snapshot();
+        for (hash, rate_opt) in updates {
+            let replacement = match rate_opt {
+                Some(rate) if rate.is_finite() => {
+                    let clamped = rate.clamp(0.0, 1.0);
+                    let hex = Self::blob_hex(hash);
+                    Tag::parse(&format!("heat:blob:{hex}={clamped:.2}")).ok()
+                }
+                Some(_) => {
+                    tracing::trace!(
+                        hash = ?hash,
+                        "blob heat: non-finite rate skipped in batch"
+                    );
+                    continue;
+                }
+                None => None,
+            };
+            Self::replace_blob_heat_tags(&mut snapshot, hash, replacement);
+        }
+        self.announce_capabilities(snapshot).await
+    }
+}
+
+#[cfg(feature = "dataforts")]
+#[async_trait::async_trait]
+impl super::dataforts::BlobHeatSink for MeshNode {
+    async fn announce_blob_heat(&self, hash: [u8; 32], rate: f64) -> Result<(), AdapterError> {
+        MeshNode::announce_blob_heat(self, hash, rate).await
+    }
+
+    async fn withdraw_blob_heat(&self, hash: [u8; 32]) -> Result<(), AdapterError> {
+        MeshNode::withdraw_blob_heat(self, hash).await
+    }
+
+    async fn announce_blob_heat_batch(
+        &self,
+        updates: &[([u8; 32], Option<f64>)],
+    ) -> Result<(), AdapterError> {
+        MeshNode::announce_blob_heat_batch(self, updates).await
     }
 }
 
@@ -9947,6 +10112,75 @@ mod chain_helper_tests {
         }
     }
 
+    // The `MeshNode::blob_hex` / `is_blob_heat_for` /
+    // `replace_blob_heat_tags` helpers live behind the `dataforts`
+    // feature flag (they back the PR-5j-c blob-heat tag emission
+    // path on the production wire). Gate the tests so a build
+    // without the feature doesn't try to call non-existent
+    // methods.
+    #[cfg(feature = "dataforts")]
+    #[test]
+    fn blob_hex_is_lowercase_64_chars() {
+        let zero = [0u8; 32];
+        assert_eq!(MeshNode::blob_hex(&zero).len(), 64);
+        assert!(MeshNode::blob_hex(&zero).chars().all(|c| c == '0'));
+        let mut h = [0u8; 32];
+        h[0] = 0xDE;
+        h[1] = 0xAD;
+        h[31] = 0xFF;
+        let hex = MeshNode::blob_hex(&h);
+        assert!(hex.starts_with("dead"));
+        assert!(hex.ends_with("ff"));
+        assert_eq!(hex.len(), 64);
+    }
+
+    #[cfg(feature = "dataforts")]
+    #[test]
+    fn is_blob_heat_for_matches_blob_body_only() {
+        let mut h = [0u8; 32];
+        h[0] = 0x42;
+        let hex = MeshNode::blob_hex(&h);
+        let blob_tag = Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.5", hex),
+        };
+        assert!(MeshNode::is_blob_heat_for(&blob_tag, &hex));
+        // Chain-heat shape (no "blob:" sub-prefix) must NOT match.
+        let chain_tag = Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("{}=0.5", MeshNode::chain_hex(0x42)),
+        };
+        assert!(!MeshNode::is_blob_heat_for(&chain_tag, &hex));
+    }
+
+    #[cfg(feature = "dataforts")]
+    #[test]
+    fn replace_blob_heat_tags_round_trip() {
+        let mut h = [0u8; 32];
+        h[0] = 0x77;
+        let hex = MeshNode::blob_hex(&h);
+        let mut caps = CapabilitySet::default();
+        let initial = Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.10", hex),
+        };
+        caps.tags.insert(initial.clone());
+        // Replace with a fresh rate.
+        let replacement = Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.80", hex),
+        };
+        MeshNode::replace_blob_heat_tags(&mut caps, &h, Some(replacement.clone()));
+        assert!(caps.tags.contains(&replacement));
+        assert!(!caps.tags.contains(&initial));
+        // Withdraw — every heat:blob:<hex>=* drops.
+        MeshNode::replace_blob_heat_tags(&mut caps, &h, None);
+        assert!(!caps
+            .tags
+            .iter()
+            .any(|t| MeshNode::is_blob_heat_for(t, &hex)));
+    }
+
     fn causal_tag(body: impl Into<String>) -> Tag {
         Tag::Reserved {
             prefix: "causal:".to_string(),
@@ -10130,5 +10364,55 @@ mod chain_helper_tests {
             .tags
             .iter()
             .any(|t| MeshNode::is_causal_for(t, &owned_hex)));
+    }
+
+    /// Regression for the heat:blob DoS surface. A peer injects
+    /// more than `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags
+    /// into a single announcement; the filter drops the overflow.
+    /// The cap bounds the migration-controller amplification
+    /// (each surviving heat tag drives an `adapter.prefetch`
+    /// attempt).
+    #[cfg(feature = "dataforts")]
+    #[test]
+    fn filter_unauthorized_heat_tags_caps_blob_heat_flood_per_announce() {
+        let mut caps = CapabilitySet::default();
+        // Stuff in 2× the cap of distinct blob-heat tags.
+        let flood = MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE * 2;
+        for i in 0..flood {
+            let mut hash = [0u8; 32];
+            // Pack the index into bytes 0..8 so each hash is
+            // distinct without needing a hash function.
+            hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let hex = MeshNode::blob_hex(&hash);
+            caps.tags.insert(Tag::Reserved {
+                prefix: "heat:".to_string(),
+                body: format!("blob:{hex}=1.00"),
+            });
+        }
+        // Sanity: every distinct tag landed in the HashSet.
+        let pre_filter = caps
+            .tags
+            .iter()
+            .filter(|t| {
+                matches!(t, Tag::Reserved { prefix, body }
+                if prefix == "heat:" && body.starts_with("blob:"))
+            })
+            .count();
+        assert_eq!(pre_filter, flood);
+
+        MeshNode::filter_unauthorized_heat_tags(&mut caps);
+
+        let post_filter = caps
+            .tags
+            .iter()
+            .filter(|t| {
+                matches!(t, Tag::Reserved { prefix, body }
+                if prefix == "heat:" && body.starts_with("blob:"))
+            })
+            .count();
+        assert_eq!(
+            post_filter, MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE,
+            "filter must drop blob-heat tags past the per-announce cap"
+        );
     }
 }

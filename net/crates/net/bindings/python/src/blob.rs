@@ -27,9 +27,10 @@ use tokio::runtime::Runtime;
 use ::net::adapter::net::dataforts::{
     global_blob_adapter_registry, publish_blob, resolve_payload, BlobAdapter,
     BlobError as InnerBlobError, BlobRef as InnerBlobRef, FileSystemAdapter,
+    MeshBlobAdapter as InnerMeshBlobAdapter,
 };
 
-use crate::cortex::CortexError;
+use crate::cortex::{CortexError, PyRedex};
 
 pyo3::create_exception!(
     _net,
@@ -69,29 +70,35 @@ impl PyBlobRef {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&hash);
         Ok(Self {
-            inner: InnerBlobRef::new(uri, arr, size),
+            inner: InnerBlobRef::small(uri, arr, size),
         })
     }
 
     #[getter]
     fn version(&self) -> u8 {
-        self.inner.version
+        self.inner.version()
     }
 
     #[getter]
     fn uri(&self) -> &str {
-        &self.inner.uri
+        self.inner.uri()
     }
 
-    /// 32-byte BLAKE3 hash of the content.
+    /// 32-byte BLAKE3 hash of the content. For Small (the only
+    /// variant the Python constructor produces today); v0.2 will
+    /// surface chunked manifests via a separate accessor.
     #[getter]
     fn hash<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.inner.hash)
+        let hash = self
+            .inner
+            .small_hash()
+            .expect("PyBlobRef constructor only produces Small variants");
+        PyBytes::new(py, hash)
     }
 
     #[getter]
     fn size(&self) -> u64 {
-        self.inner.size
+        self.inner.size()
     }
 
     /// Emit the wire-encoded form (discriminator + version + hash +
@@ -115,11 +122,12 @@ impl PyBlobRef {
     }
 
     fn __repr__(&self) -> String {
+        let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
         format!(
             "BlobRef(uri={:?}, size={}, hash={})",
-            self.inner.uri,
-            self.inner.size,
-            hex32(&self.inner.hash)
+            self.inner.uri(),
+            self.inner.size(),
+            hex32(&hash)
         )
     }
 }
@@ -251,23 +259,20 @@ pub fn blob_publish<'py>(
             PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id))
         })?;
     let rt = shared_runtime()?;
-    // Defer the bytes copy past the GIL drop. Capture the raw
-    // pointer (as `usize` so the closure satisfies pyo3's `Ungil`
-    // bound; raw pointers aren't `Sync`) + length while the GIL
-    // is held (which keeps the caller's PyBytes / bytearray
-    // reference alive for the call); copy inside the detach
-    // scope so a multi-MB payload's memcpy doesn't stall the
-    // interpreter for the duration of the copy. SAFETY: caller's
-    // reference is alive for the entire function call so the
-    // underlying buffer doesn't move or get freed; the substrate's
-    // `publish_blob` takes `&[u8]` by borrow and doesn't smuggle
-    // the slice past its await.
-    let data_addr = data.as_ptr() as usize;
-    let data_len = data.len();
+    // Copy bytes WHILE the GIL is still held. PyO3's `&[u8]`
+    // extractor accepts both `bytes` (immutable) and `bytearray`
+    // (mutable + resizable). A mutable bytearray's buffer can
+    // move or reallocate if another Python thread mutates it
+    // while the GIL is released; the previous shape captured a
+    // raw pointer + length and copied inside `py.detach()`, which
+    // is unsound for the bytearray case. The copy here is
+    // bounded by the input size — typical blob payloads are
+    // ~70 bytes (wire-encoded BlobRef), so the GIL-hold window
+    // is negligible. For multi-MB stores route through
+    // `MeshBlobAdapter::store` on a PyBytes argument instead.
+    let data_owned = data.to_vec();
     let bytes = py
         .detach(|| -> Result<Vec<u8>, InnerBlobError> {
-            let data_owned: Vec<u8> =
-                unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len).to_vec() };
             rt.block_on(async move { publish_blob(adapter.as_ref(), uri, &data_owned).await })
         })
         .map_err(map_blob_err)?;
@@ -290,18 +295,13 @@ pub fn blob_resolve<'py>(
             PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id))
         })?;
     let rt = shared_runtime()?;
-    // Same GIL-drop-before-memcpy trick as `blob_publish`. The
-    // payload is usually small (a wire-encoded BlobRef is ~70
-    // bytes for the typical S3-URI case), but inline payloads
-    // can be large, and the resolve path is on the hot read side
-    // of fan-out.
-    let payload_addr = payload.as_ptr() as usize;
-    let payload_len = payload.len();
+    // Copy bytes under the GIL — see the rationale in
+    // `blob_publish`. PyO3's `&[u8]` accepts mutable `bytearray`,
+    // and a raw-pointer capture across `py.detach()` is unsound
+    // when the caller's buffer can be mutated by another thread.
+    let payload_owned = payload.to_vec();
     let bytes = py
         .detach(|| -> Result<Vec<u8>, InnerBlobError> {
-            let payload_owned: Vec<u8> = unsafe {
-                std::slice::from_raw_parts(payload_addr as *const u8, payload_len).to_vec()
-            };
             rt.block_on(async move { resolve_payload(&payload_owned, adapter.as_ref()).await })
         })
         .map_err(map_blob_err)?;
@@ -589,4 +589,160 @@ pub fn register_blob_adapter(adapter_id: String, instance: Py<PyAny>) -> PyResul
     global_blob_adapter_registry()
         .register(adapter)
         .map_err(|e| BlobError::new_err(format!("{}", e)))
+}
+
+// =========================================================================
+// MeshBlobAdapter — Dataforts v0.2 substrate-owned blob CAS
+// =========================================================================
+
+/// Python handle to a [`MeshBlobAdapter`](::net::adapter::net::
+/// dataforts::MeshBlobAdapter): the v0.2 substrate-owned blob
+/// content-addressable store. Each blob chunk lives as a
+/// content-addressed `RedexFile` at `dataforts/blob/<hex32>` on
+/// the wrapped `Redex` handle.
+///
+/// Construct from a `Redex` instance:
+///
+/// ```python
+/// from net import Redex, MeshBlobAdapter, BlobRef
+/// redex = Redex(persistent_dir="/var/lib/net/redex")
+/// adapter = MeshBlobAdapter(redex, "mesh-app")
+/// payload = b"the substrate carries the bytes"
+/// blob_ref = BlobRef("mesh://demo",
+///                    hashlib.blake3(payload).digest(),
+///                    len(payload))
+/// adapter.store(blob_ref, payload)
+/// back = adapter.fetch(blob_ref)
+/// assert back == payload
+/// ```
+///
+/// All adapter methods are blocking from Python's perspective —
+/// the binding pumps the substrate's tokio runtime under the
+/// hood, releasing the GIL for the duration of each call so
+/// concurrent Python threads aren't blocked.
+#[pyclass(name = "MeshBlobAdapter")]
+pub struct PyMeshBlobAdapter {
+    inner: Arc<InnerMeshBlobAdapter>,
+    id: String,
+}
+
+#[pymethods]
+impl PyMeshBlobAdapter {
+    /// Construct a substrate-owned blob adapter against `redex`.
+    /// `adapter_id` is the operator-facing identity surfaced in
+    /// Prometheus + log lines; it doubles as the registry key
+    /// when the adapter is also registered via
+    /// [`register_blob_adapter`].
+    ///
+    /// `persistent=True` flips the per-chunk `RedexFile`s into the
+    /// on-disk persistent path — requires the underlying `Redex`
+    /// to have been constructed with `persistent_dir=...`.
+    #[new]
+    #[pyo3(signature = (redex, adapter_id, *, persistent = false))]
+    fn new(redex: &PyRedex, adapter_id: String, persistent: bool) -> Self {
+        let inner = Arc::new(
+            InnerMeshBlobAdapter::new(adapter_id.clone(), redex.inner_arc())
+                .with_persistent(persistent),
+        );
+        Self {
+            inner,
+            id: adapter_id,
+        }
+    }
+
+    /// Adapter identity (the `adapter_id` passed at construction).
+    #[getter]
+    fn adapter_id(&self) -> &str {
+        &self.id
+    }
+
+    fn __repr__(&self) -> String {
+        format!("MeshBlobAdapter(id={:?})", self.id)
+    }
+
+    /// Store `data` under the content-address declared by
+    /// `blob_ref`. The substrate verifies that `blake3(data)`
+    /// matches `blob_ref.hash` before persisting; mismatches
+    /// raise `BlobError`. Idempotent — repeated stores of
+    /// identical bytes against the same hash are a no-op.
+    ///
+    /// Releases the GIL during the actual store.
+    pub fn store(&self, py: Python<'_>, blob_ref: &PyBlobRef, data: &[u8]) -> PyResult<()> {
+        let rt = shared_runtime()?;
+        let adapter = self.inner.clone();
+        let blob = blob_ref.as_inner().clone();
+        // Copy bytes WHILE the GIL is held. `&[u8]` accepts
+        // mutable `bytearray`, whose backing buffer can move or
+        // reallocate if another Python thread mutates it after
+        // the GIL is released. Capturing a raw pointer across
+        // `py.detach()` and reading inside the closure was
+        // unsound for that case.
+        let data_owned = data.to_vec();
+        py.detach(|| -> Result<(), InnerBlobError> {
+            rt.block_on(async move { adapter.store(&blob, &data_owned).await })
+        })
+        .map_err(map_blob_err)
+    }
+
+    /// Fetch the content-addressed bytes for `blob_ref`. Verifies
+    /// `blake3(returned) == blob_ref.hash`; raises `BlobError` on
+    /// mismatch or missing content.
+    pub fn fetch<'py>(
+        &self,
+        py: Python<'py>,
+        blob_ref: &PyBlobRef,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let rt = shared_runtime()?;
+        let adapter = self.inner.clone();
+        let blob = blob_ref.as_inner().clone();
+        let bytes = py
+            .detach(|| -> Result<Vec<u8>, InnerBlobError> {
+                rt.block_on(async move { adapter.fetch(&blob).await })
+            })
+            .map_err(map_blob_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Fetch a byte range of `blob_ref`'s content. The range is
+    /// half-open `[start, end)` — `start` is inclusive, `end` is
+    /// exclusive, matching Python slice semantics
+    /// (`payload[start:end]`). The substrate does NOT verify
+    /// partial fetches against the full-content hash — callers
+    /// using range fetch accept that trade-off.
+    pub fn fetch_range<'py>(
+        &self,
+        py: Python<'py>,
+        blob_ref: &PyBlobRef,
+        start: u64,
+        end: u64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let rt = shared_runtime()?;
+        let adapter = self.inner.clone();
+        let blob = blob_ref.as_inner().clone();
+        let bytes = py
+            .detach(|| -> Result<Vec<u8>, InnerBlobError> {
+                rt.block_on(async move { adapter.fetch_range(&blob, start..end).await })
+            })
+            .map_err(map_blob_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Probe local presence. Returns `True` when every chunk of
+    /// `blob_ref` is reachable on the local node, `False`
+    /// otherwise. Doesn't go over the wire.
+    pub fn exists(&self, py: Python<'_>, blob_ref: &PyBlobRef) -> PyResult<bool> {
+        let rt = shared_runtime()?;
+        let adapter = self.inner.clone();
+        let blob = blob_ref.as_inner().clone();
+        py.detach(|| -> Result<bool, InnerBlobError> {
+            rt.block_on(async move { adapter.exists(&blob).await })
+        })
+        .map_err(map_blob_err)
+    }
+
+    /// Render the adapter's Prometheus text body. Operators pipe
+    /// the result into an HTTP scrape endpoint.
+    pub fn prometheus_text(&self) -> String {
+        self.inner.prometheus_text()
+    }
 }

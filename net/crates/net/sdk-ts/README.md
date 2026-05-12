@@ -892,15 +892,38 @@ Four phases:
   + colocation + storage-cap) plus a bandwidth budget gate decide
   whether to admit each inbound event. Cold channels evict under
   cluster-cap pressure and withdraw their `causal:<hex>`
-  advertisement.
-- **Phase 3 — `BlobRef` + blob adapters.** A `[0xB0, 0xB1, 0xB2,
-  0xB3]` magic + version + 32-byte BLAKE3 + size + URI reference
-  whose bytes live in the caller's storage (S3 / Ceph / IPFS /
-  local FS). The substrate carries the reference, not the blob.
+  advertisement. The runtime also observes `BlobRef`-shaped
+  payloads + runs the `should_pull_blob` admission gate; on
+  admit the wired `BlobAdapter::prefetch` spawns a best-effort
+  pull via the per-chunk replication runtime.
+- **Phase 3 — `BlobRef` + blob adapters.** Two shapes:
+  - **External-hook variant (v0.15):** a `[0xB0, 0xB1, 0xB2,
+    0xB3]` magic + version + 32-byte BLAKE3 + size + URI
+    reference whose bytes live in the caller's storage (S3 /
+    Ceph / IPFS / local FS). Exposed today via
+    `registerFilesystemBlobAdapter` + `blobPublish` /
+    `blobResolve`.
+  - **Substrate-owned variant (v0.2):** the substrate stores
+    each chunk as a content-addressed `RedexFile`, riding the
+    existing replication runtime for cross-node placement.
+    Surfaces (`MeshBlobAdapter`, `publish_with_blob`,
+    `BlobRefcountTable`, `BlobMetrics`, `BlobAdapter::prefetch`)
+    are exposed from Rust today; the Python binding has a
+    first slice (`MeshBlobAdapter` CRUD). Node / TypeScript
+    wrappers haven't landed yet — operator scripts that need
+    the v0.2 surface from Node call out to the `net-blob` CLI
+    or to a Rust-side daemon RPC until the binding work
+    catches up. See
+    [`docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`](../docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md)
+    for the shipping status.
 - **Phase 4 — Data gravity.** Per-chain read-rate counters with
   exponential decay. Threshold-crossing emissions stamp
   `heat:<hex>=<rate>` onto the chain's capability announcement;
   greedy weights cache pulls by `heat × scope-match × proximity`.
+  The v0.2 blob track adds parallel `BlobHeatRegistry` keyed on
+  chunk hash + `heat:blob:<hex>=<rate>` tag emission +
+  `drive_blob_migration_tick` consumer — exposed from Rust
+  today; Node wrapper deferred.
 - **Phase 5 — Read-your-writes.** Every `tasks.create`,
   `memories.insert`, etc. returns a `WriteToken`. Pass it to
   `tasks.waitForToken(token, deadlineMs)` and the call resolves

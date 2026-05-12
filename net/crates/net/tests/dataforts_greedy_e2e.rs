@@ -433,3 +433,410 @@ async fn greedy_scope_filter_rejects_off_scope_events() {
 
     redex_b.disable_greedy_dataforts();
 }
+
+// --- G-1 blob-pull verdict e2e (PR-5d / T-3 mixed-capability) ---
+
+/// Encode `bytes` as a `BlobRef::Small`-shaped event payload so a
+/// remote node's greedy hook will decode it via `classify_payload`.
+/// Mirrors the wire shape `publish_blob` produces.
+fn encode_blob_payload(bytes: &[u8]) -> Bytes {
+    use net::adapter::net::dataforts::BlobRef;
+    let hash: [u8; 32] = blake3::hash(bytes).into();
+    Bytes::from(BlobRef::small("mesh://e2e", hash, bytes.len() as u64).encode())
+}
+
+/// Local capability set that qualifies for `should_pull_blob`:
+/// blob storage tag + greedy enabled + non-zero proximity +
+/// mesh-scope, with reasonable disk-free.
+fn participating_blob_caps() -> Arc<CapabilitySet> {
+    Arc::new(
+        CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=50")
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=mesh")
+            .add_tag("dataforts.greedy.proximity=128"),
+    )
+}
+
+/// Participating local node: A publishes blob-ref-shaped payloads
+/// on a subscribed channel. B's greedy runtime, configured with
+/// participating-blob caps, must run the G-1 verdict on every
+/// inbound event and bump `blob_pulls_admitted_total`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn greedy_blob_pull_admits_on_participating_local_node() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    let redex_b = Arc::new(Redex::new());
+    let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled);
+    redex_b
+        .enable_greedy_dataforts(
+            node_b.clone(),
+            cfg,
+            participating_blob_caps(),
+            IntentRegistry::new(),
+        )
+        .expect("enable greedy");
+
+    let name = cn("dataforts/test/g1-admit");
+    node_b
+        .subscribe_channel(node_a.node_id(), name.clone())
+        .await
+        .expect("subscribe");
+
+    let publisher = ChannelPublisher::new(name.clone(), PublishConfig::default());
+    const N: u64 = 4;
+    for i in 0..N {
+        let payload = encode_blob_payload(format!("blob-event-{i}").as_bytes());
+        node_a.publish(&publisher, payload).await.expect("publish");
+    }
+
+    let runtime = redex_b.greedy_runtime().expect("runtime installed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let snap = runtime.metrics().snapshot();
+        if snap.cluster.blob_pulls_admitted_total >= N {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snap = runtime.metrics().snapshot();
+    assert!(
+        snap.cluster.blob_pulls_admitted_total >= N,
+        "blob_pulls_admitted_total must bump once per blob-ref event; got {}",
+        snap.cluster.blob_pulls_admitted_total
+    );
+    assert_eq!(
+        snap.cluster.blob_pulls_rejected_no_storage_total, 0,
+        "no_storage rejects must stay zero when local participates"
+    );
+    assert_eq!(
+        snap.cluster.blob_pulls_rejected_greedy_disabled_total, 0,
+        "greedy_disabled rejects must stay zero when greedy tag is present"
+    );
+
+    redex_b.disable_greedy_dataforts();
+}
+
+/// Compute-only node refusing blob replicas: B's local caps lack
+/// `dataforts.blob.storage`, but greedy is enabled and admits the
+/// chain. The G-1 hook then vetoes the blob-pull with NoStorageCap
+/// for every blob-ref event. Pins the "compute-only nodes do not
+/// receive blob replicas" invariant from the plan's T-3 scenarios.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn greedy_blob_pull_vetoes_on_compute_only_node() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    let redex_b = Arc::new(Redex::new());
+    let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled);
+    // Compute-only: greedy enabled, but explicitly no blob.storage
+    // tag. The chain admission still admits (greedy permissive);
+    // G-1 then vetoes the blob pull.
+    let compute_only = Arc::new(
+        CapabilitySet::new()
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=mesh")
+            .add_tag("dataforts.greedy.proximity=128"),
+    );
+    redex_b
+        .enable_greedy_dataforts(node_b.clone(), cfg, compute_only, IntentRegistry::new())
+        .expect("enable greedy");
+
+    let name = cn("dataforts/test/g1-compute-only");
+    node_b
+        .subscribe_channel(node_a.node_id(), name.clone())
+        .await
+        .expect("subscribe");
+
+    let publisher = ChannelPublisher::new(name.clone(), PublishConfig::default());
+    const N: u64 = 4;
+    for i in 0..N {
+        let payload = encode_blob_payload(format!("blob-event-{i}").as_bytes());
+        node_a.publish(&publisher, payload).await.expect("publish");
+    }
+
+    let runtime = redex_b.greedy_runtime().expect("runtime installed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let snap = runtime.metrics().snapshot();
+        if snap.cluster.blob_pulls_rejected_no_storage_total >= N {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snap = runtime.metrics().snapshot();
+    assert!(
+        snap.cluster.blob_pulls_rejected_no_storage_total >= N,
+        "no_storage rejects must bump per blob-ref event on a compute-only node; got {}",
+        snap.cluster.blob_pulls_rejected_no_storage_total
+    );
+    assert_eq!(
+        snap.cluster.blob_pulls_admitted_total, 0,
+        "compute-only node must never admit a blob pull"
+    );
+
+    redex_b.disable_greedy_dataforts();
+}
+
+/// Greedy runtime installed but the local capability advertisement
+/// does NOT claim `dataforts.greedy.enabled`. The tag projection
+/// reports greedy-disabled, so the G-1 hook vetoes every blob pull
+/// with GreedyDisabled — even though the runtime itself is
+/// operational (chain admission still runs + caches events).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn greedy_blob_pull_vetoes_when_greedy_tag_absent() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    let redex_b = Arc::new(Redex::new());
+    let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled);
+    // Local has blob storage but the greedy tag projection reports
+    // disabled (no `dataforts.greedy.enabled` tag in the local
+    // capability set). The runtime is still installed; the *tag*
+    // is what G-1 reads.
+    let storage_only = Arc::new(
+        CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=50"),
+    );
+    redex_b
+        .enable_greedy_dataforts(node_b.clone(), cfg, storage_only, IntentRegistry::new())
+        .expect("enable greedy");
+
+    let name = cn("dataforts/test/g1-greedy-tag-absent");
+    node_b
+        .subscribe_channel(node_a.node_id(), name.clone())
+        .await
+        .expect("subscribe");
+
+    let publisher = ChannelPublisher::new(name.clone(), PublishConfig::default());
+    const N: u64 = 4;
+    for i in 0..N {
+        let payload = encode_blob_payload(format!("blob-event-{i}").as_bytes());
+        node_a.publish(&publisher, payload).await.expect("publish");
+    }
+
+    let runtime = redex_b.greedy_runtime().expect("runtime installed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let snap = runtime.metrics().snapshot();
+        if snap.cluster.blob_pulls_rejected_greedy_disabled_total >= N {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snap = runtime.metrics().snapshot();
+    assert!(
+        snap.cluster.blob_pulls_rejected_greedy_disabled_total >= N,
+        "greedy_disabled rejects must bump when local caps lack dataforts.greedy.enabled; got {}",
+        snap.cluster.blob_pulls_rejected_greedy_disabled_total
+    );
+    assert_eq!(
+        snap.cluster.blob_pulls_admitted_total, 0,
+        "blob pull must not admit when greedy tag is absent"
+    );
+
+    redex_b.disable_greedy_dataforts();
+}
+
+/// Wait up to `deadline` for B's capability index to surface at
+/// least `min_tags` tags advertised by `peer`. Mirrors the wait
+/// pattern in the pre-existing scope-match e2e test.
+async fn wait_for_peer_caps(
+    observer: &Arc<MeshNode>,
+    peer: u64,
+    min_tags: usize,
+    deadline: tokio::time::Instant,
+) {
+    while tokio::time::Instant::now() < deadline {
+        let landed = observer
+            .capability_index()
+            .get(peer)
+            .map(|c| c.tags.len())
+            .unwrap_or(0);
+        if landed >= min_tags {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Publisher-scope-covers-local: A advertises a wider scope
+/// (mesh) than B's local scope (zone). `scope_at_least_as_narrow
+/// (Zone, Mesh) = true`, so the G-1 hook admits — proves the
+/// scope-ordering rule is directional, not a hard scope-equality
+/// check. Pins the "narrower local + wider publisher = admit"
+/// half of the scope contract. The inverse direction is covered
+/// by `greedy_blob_pull_vetoes_on_cross_scope_publisher` below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn greedy_blob_pull_admits_when_publisher_scope_covers_local() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    let publisher_caps = CapabilitySet::new()
+        .add_tag("dataforts.greedy.scope=mesh")
+        .add_tag("dataforts.gravity.scope=mesh");
+    let pub_tag_count = publisher_caps.tags.len();
+    node_a
+        .announce_capabilities(publisher_caps)
+        .await
+        .expect("announce caps");
+    wait_for_peer_caps(
+        &node_b,
+        node_a.node_id(),
+        pub_tag_count,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+    )
+    .await;
+
+    let redex_b = Arc::new(Redex::new());
+    let local_caps_b = Arc::new(
+        CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=50")
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=zone")
+            .add_tag("dataforts.greedy.proximity=128"),
+    );
+    let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled);
+    redex_b
+        .enable_greedy_dataforts(node_b.clone(), cfg, local_caps_b, IntentRegistry::new())
+        .expect("enable greedy");
+
+    let name = cn("dataforts/test/g1-scope-covers");
+    node_b
+        .subscribe_channel(node_a.node_id(), name.clone())
+        .await
+        .expect("subscribe");
+
+    let publisher = ChannelPublisher::new(name.clone(), PublishConfig::default());
+    const N: u64 = 4;
+    for i in 0..N {
+        let payload = encode_blob_payload(format!("blob-event-{i}").as_bytes());
+        node_a.publish(&publisher, payload).await.expect("publish");
+    }
+
+    let runtime = redex_b.greedy_runtime().expect("runtime installed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let snap = runtime.metrics().snapshot();
+        if snap.cluster.blob_pulls_admitted_total >= N {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snap = runtime.metrics().snapshot();
+    assert!(
+        snap.cluster.blob_pulls_admitted_total >= N,
+        "blob_pulls_admitted_total must bump when local scope is narrower than publisher; got {}",
+        snap.cluster.blob_pulls_admitted_total,
+    );
+    assert_eq!(
+        snap.cluster.blob_pulls_rejected_scope_mismatch_total, 0,
+        "narrower-local + wider-publisher must not surface scope_mismatch"
+    );
+
+    redex_b.disable_greedy_dataforts();
+}
+
+/// Cross-scope publisher: A announces `dataforts.greedy.scope=zone`
+/// + `gravity.scope=zone`; B's local greedy scope is `region`.
+/// Scope ordering is `Node < Zone < Region < Mesh` — Region is
+/// wider than Zone, so `scope_at_least_as_narrow(Region, Zone) =
+/// false` and the G-1 hook vetoes with ScopeMismatch on every
+/// blob-ref event. Pins the cross-region-scope-enforcement
+/// scenario from the plan's T-3.
+///
+/// Now deterministic post-PR-5g: the mesh's `chain_caps` lookup
+/// uses `CapabilityIndex::get_by_origin_hash` (keyed on the
+/// wire-truncated entity origin_hash) so the publisher's caps
+/// always resolve unambiguously — no contamination from cache
+/// holders' `causal:<hex>` advertisements.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn greedy_blob_pull_vetoes_on_cross_scope_publisher() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    let publisher_caps = CapabilitySet::new()
+        .add_tag("dataforts.greedy.scope=zone")
+        .add_tag("dataforts.gravity.scope=zone");
+    let pub_tag_count = publisher_caps.tags.len();
+    node_a
+        .announce_capabilities(publisher_caps)
+        .await
+        .expect("announce caps");
+    wait_for_peer_caps(
+        &node_b,
+        node_a.node_id(),
+        pub_tag_count,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+    )
+    .await;
+
+    let redex_b = Arc::new(Redex::new());
+    let local_caps_b = Arc::new(
+        CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=50")
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=region")
+            .add_tag("dataforts.greedy.proximity=128"),
+    );
+    let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled);
+    redex_b
+        .enable_greedy_dataforts(node_b.clone(), cfg, local_caps_b, IntentRegistry::new())
+        .expect("enable greedy");
+
+    let name = cn("dataforts/test/g1-cross-scope");
+    node_b
+        .subscribe_channel(node_a.node_id(), name.clone())
+        .await
+        .expect("subscribe");
+
+    let publisher = ChannelPublisher::new(name.clone(), PublishConfig::default());
+    const N: u64 = 4;
+    for i in 0..N {
+        let payload = encode_blob_payload(format!("blob-event-{i}").as_bytes());
+        node_a.publish(&publisher, payload).await.expect("publish");
+    }
+
+    let runtime = redex_b.greedy_runtime().expect("runtime installed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let snap = runtime.metrics().snapshot();
+        if snap.cluster.blob_pulls_rejected_scope_mismatch_total >= N {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snap = runtime.metrics().snapshot();
+    assert!(
+        snap.cluster.blob_pulls_rejected_scope_mismatch_total >= N,
+        "scope_mismatch rejects must bump when publisher scope is narrower than local; \
+         got {} (full cluster snapshot: {:?})",
+        snap.cluster.blob_pulls_rejected_scope_mismatch_total,
+        snap.cluster,
+    );
+    assert_eq!(
+        snap.cluster.blob_pulls_admitted_total, 0,
+        "no blob pulls may admit across the scope boundary"
+    );
+
+    redex_b.disable_greedy_dataforts();
+}

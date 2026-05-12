@@ -4282,7 +4282,7 @@ function ClosingSection() {
             Cloud infrastructure solves the wrong problem. It moves compute
             closer to a central provider.{" "}
             <strong className="text-ink font-medium">
-              Net decouples compute from hardware and location.
+              Net decouples storage and compute from hardware and location.
             </strong>
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">

@@ -584,45 +584,77 @@ NetDB ships the same surface on Rust, Node (`@ai2070/net` napi bindings), and Py
 
 ## Dataforts
 
-Dataforts is the compositional data plane on top of the RedEX / CortEX / capability-index / proximity-graph substrate. It ships behind the `dataforts` Cargo feature and composes against existing primitives — there is no new wire protocol, no separate coordinator service. See [`docs/misc/DATAFORTS_FEATURES.md`](docs/misc/DATAFORTS_FEATURES.md) for the audit (most of the original wishlist was already covered by core primitives; Dataforts names and packages the remaining work).
+Dataforts is the compositional data plane on top of the RedEX / CortEX / capability-index / proximity-graph substrate. It ships behind the `dataforts` Cargo feature and composes against existing primitives — there is no new wire protocol, no separate coordinator service. See [`docs/misc/DATAFORTS_FEATURES.md`](docs/misc/DATAFORTS_FEATURES.md) for the audit (most of the original wishlist was already covered by core primitives; Dataforts names and packages the remaining work) and [`docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`](docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md) for the v0.2 substrate-owned blob CAS plan + shipping status.
 
 Four phases compose:
 
-- **Phase 1 — Greedy-LRU caching.** Per-node speculative caching of in-scope chains observed via the tail-subscription path. Five-axis admission (`scope` + `proximity` + `capability-preference` + `colocation` + `storage-cap`) and a bandwidth budget gate decide whether to admit an inbound event into a per-channel cache file. The cache evicts cold channels under the cluster-cap pressure and withdraws their `causal:<hex>` advertisements. Wires via [`Redex::enable_greedy_dataforts`](src/adapter/net/redex/manager.rs).
-- **Phase 3 — `BlobRef` + `BlobAdapter`.** A 4-byte-magic + version + 32-byte BLAKE3 + size + URI reference type whose bytes live in the caller's storage (S3, Ceph, IPFS, local FS) — the substrate carries the reference, not the blob. Adapters implement `fetch` / `store` (with default `fetch_stream` / `store_stream` shims for multi-GB payloads). Filesystem adapter (`FileSystemAdapter`) ships in-tree; user adapters register via [`BlobAdapterRegistry`](src/adapter/net/dataforts/blob/registry.rs).
-- **Phase 4 — Data gravity.** Per-chain read-rate counters with exponential decay. Threshold-crossing emissions stamp `heat:<hex>=<rate>` onto the chain's existing capability announcement; the greedy admission gate weights cache pulls by heat × scope-match × proximity-rank. Cold chains evict first; hot chains migrate toward the readers that drive the heat. Wires via [`Redex::enable_gravity_for_greedy`](src/adapter/net/redex/manager.rs).
+- **Phase 1 — Greedy-LRU caching.** Per-node speculative caching of in-scope chains observed via the tail-subscription path. Five-axis admission (`scope` + `proximity` + `capability-preference` + `colocation` + `storage-cap`) and a bandwidth budget gate decide whether to admit an inbound event into a per-channel cache file. The cache evicts cold channels under the cluster-cap pressure and withdraws their `causal:<hex>` advertisements. Wires via [`Redex::enable_greedy_dataforts`](src/adapter/net/redex/manager.rs). The runtime additionally observes `BlobRef`-shaped event payloads and asks [`should_pull_blob`](src/adapter/net/dataforts/blob/admission.rs); on admit, the wired [`BlobAdapter::prefetch`](src/adapter/net/dataforts/blob/adapter.rs) spawns a best-effort pull via the per-chunk replication runtime and the chunk hash bumps a refcount table for chain-fold GC bookkeeping.
+- **Phase 3 — `BlobRef` + `BlobAdapter`.** Two shapes:
+  - **External-hook variant (v0.15):** a 4-byte-magic + version + 32-byte BLAKE3 + size + URI reference whose bytes live in the caller's storage (S3 / Ceph / IPFS / local FS). Adapters implement `fetch` / `store` / `delete` / `stat` / `prefetch` (with default `fetch_stream` / `store_stream` shims for multi-GB payloads). Filesystem adapter (`FileSystemAdapter`) ships in-tree; user adapters register via [`BlobAdapterRegistry`](src/adapter/net/dataforts/blob/registry.rs).
+  - **Substrate-owned variant (v0.2):** `BlobRef::Manifest` for multi-chunk blobs (4 MiB fixed chunking; chunk-index range math via [`byte_range_to_chunks`](src/adapter/net/dataforts/blob/blob_ref.rs)). [`MeshBlobAdapter`](src/adapter/net/dataforts/blob/mesh.rs) stores each chunk as a content-addressed `RedexFile` at `dataforts/blob/<hex32>`, riding the existing replication runtime for cross-node placement. Wraps a [`BlobRefcountTable`](src/adapter/net/dataforts/blob/refcount.rs) for GC + pinning, a [`BlobMetrics`](src/adapter/net/dataforts/blob/metrics.rs) registry for Prometheus, and an optional `AuthGuard` for `*_authorized` peer-facing pin / unpin / delete variants. Atomic `store → wait → publish` via [`publish_with_blob`](src/adapter/net/dataforts/blob/publish_with_blob.rs) + `BlobDurability::{BestEffort, DurableOnLocal, ReplicatedTo(n)}`. Operator CLI: `cargo run --features cli --bin net-blob -- --help` (9 subcommands — `put` / `get` / `stat` / `exists` / `ls` / `pin` / `unpin` / `gc` / `metrics`).
+- **Phase 4 — Data gravity.** Per-chain read-rate counters with exponential decay. Threshold-crossing emissions stamp `heat:<hex>=<rate>` onto the chain's existing capability announcement; the greedy admission gate weights cache pulls by heat × scope-match × proximity-rank. Cold chains evict first; hot chains migrate toward the readers that drive the heat. Wires via [`Redex::enable_gravity_for_greedy`](src/adapter/net/redex/manager.rs). The v0.2 blob track adds a parallel [`BlobHeatRegistry`](src/adapter/net/dataforts/gravity/counter.rs) keyed on the chunk's BLAKE3 hash (fetch-path bumps via `MeshBlobAdapter::with_blob_heat`), a [`BlobHeatSink`](src/adapter/net/dataforts/gravity/sink.rs) trait for the `heat:blob:<hex>=<rate>` reserved-tag emission (`MeshNode` is the production impl), and [`drive_blob_migration_tick`](src/adapter/net/dataforts/blob/migration.rs) — observes peer-advertised heat tags, runs [`should_migrate_blob_to`](src/adapter/net/dataforts/blob/admission.rs), and on admit calls `adapter.prefetch` on the chosen target. Manifest-aware variant [`drive_blob_migration_tick_with_manifest_resolver`](src/adapter/net/dataforts/blob/migration.rs) proactively prefetches every sibling chunk when one chunk of a manifest gets hot.
 - **Phase 5 — Read-your-writes.** A `WriteToken { origin_hash, seq }` returned from every successful `Tasks` / `Memories` write. Pass it to `wait_for_token(token, deadline)` and the call blocks until the local fold has actually applied that sequence number — not just folded it — so a producer reads its own write through the cache deterministically. Token construction is doc-hidden; tokens are unforgeable only against the issuing adapter (origin-bound). The wait path tracks both `applied_through_seq` and `folded_through_seq` watermarks and surfaces `WaitForTokenError::FoldStopped` when the fold task crashes mid-wait, so a producer never gets a silent `Ok(())` against a stalled adapter.
 
-The canonical `ChannelHash` (`u32`) is the substrate-wide ACL / storage / config key after the channel-hash widening (see [Net Header](#net-header-64-bytes-cache-line-aligned)); the per-packet wire `channel_hash` stays `u16` (fast-path filter hint; collisions are benign because ACL / RYW / cache decisions key on the canonical hash via the registry-side disambiguation).
+Capability projections feed the admission gates: [`BlobCapability`](src/adapter/net/behavior/dataforts_capabilities.rs), `GreedyCapability`, `GravityCapability`, and `TopologyScope` types read from `CapabilitySet` tags (`dataforts.blob.storage`, `dataforts.greedy.scope=zone`, `dataforts.gravity.proximity=128`, etc.). Producer-side typed setters (`CapabilitySet::with_blob_capability(BlobCapability::storage_participating(100, 50))` + `with_greedy_capability` / `with_gravity_capability`) round-trip the projection back to wire-form tags.
+
+The canonical `ChannelHash` (`u32`) is the substrate-wide ACL / storage / config key after the channel-hash widening (see [Net Header](#net-header-64-bytes-cache-line-aligned)); the per-packet wire `channel_hash` stays `u16` (fast-path filter hint; collisions are benign because ACL / RYW / cache decisions key on the canonical hash via the registry-side disambiguation). The publisher's wire `origin_hash` resolves to the announcement-side `node_id` via a [`CapabilityIndex::get_by_origin_hash`](src/adapter/net/behavior/capability.rs) side index — the lookup the greedy + migration admission gates use for `chain_caps`.
 
 ```rust
 # #[cfg(feature = "dataforts")]
 # async fn example(mesh: std::sync::Arc<net::adapter::net::MeshNode>) -> Result<(), Box<dyn std::error::Error>> {
-use net::adapter::net::dataforts::{GreedyConfig, IntentMatchPolicy, DataGravityPolicy};
+use net::adapter::net::dataforts::{
+    BlobAdapter, BlobHeatRegistry, DataGravityPolicy, GreedyConfig, IntentMatchPolicy,
+    MeshBlobAdapter, DEFAULT_BLOB_HEAT_HALF_LIFE,
+};
 use net::adapter::net::behavior::capability::CapabilitySet;
+use net::adapter::net::behavior::dataforts_capabilities::{
+    BlobCapability, GreedyCapability, TopologyScope,
+};
 use net::adapter::net::Redex;
 use std::sync::Arc;
 
 let redex = Arc::new(Redex::new());
 
-// Phase 1: greedy cache wired into the mesh's inbound dispatch.
+// Typed local-caps build — Phase 1's admission + Phase 4's
+// migration controller both read these projections.
+let local_caps = Arc::new(
+    CapabilitySet::new()
+        .with_blob_capability(BlobCapability::storage_participating(100, 50))
+        .with_greedy_capability(GreedyCapability {
+            enabled: true,
+            scope: TopologyScope::Mesh,
+            proximity: 128,
+        }),
+);
+
+// Phase 1 — greedy cache wired into the mesh's inbound dispatch.
 redex.enable_greedy_dataforts(
     mesh.clone(),
     GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled),
-    Arc::new(CapabilitySet::default()),
+    local_caps.clone(),
     Default::default(),
 )?;
 
-// Phase 4: layer gravity on top (per-chain heat counters + tick loop).
+// Phase 4 — layer gravity on top (per-chain heat counters + tick loop).
 redex.enable_gravity_for_greedy(mesh.clone(), DataGravityPolicy::default())?;
 
-// `Redex::greedy_cache_for(channel)` returns a cached `RedexFile`
-// when greedy has admitted that chain; callers fall back to a
-// network fetch when it returns `None`.
+// Phase 3 v0.2 — substrate-owned blob CAS wired to the same Redex.
+// Share a `BlobHeatRegistry` between the adapter's fetch-path bumps
+// and the gravity migration controller's tick.
+let blob_heat = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
+let blob_adapter: Arc<dyn BlobAdapter> = Arc::new(
+    MeshBlobAdapter::new("mesh-local", redex.clone())
+        .with_blob_heat(blob_heat.clone(), DEFAULT_BLOB_HEAT_HALF_LIFE),
+);
+
+// Greedy acts on G-1 admit verdicts by spawning `adapter.prefetch`.
+if let Some(runtime) = redex.greedy_runtime() {
+    runtime.set_blob_adapter(blob_adapter.clone());
+}
 # Ok(()) }
 ```
 
-Phase 3 (blob) and Phase 5 (RYW) are wired on the same `Redex` handle — `BlobAdapterRegistry::register` for blob adapters, `tasks.wait_for_token(token, deadline)` / `memories.wait_for_token(...)` on the CortEX adapters for RYW.
+Phase 5 (RYW) is wired on the same `Redex` handle — `tasks.wait_for_token(token, deadline)` / `memories.wait_for_token(...)` on the CortEX adapters. `publish_with_blob` extends the same machinery: the `PublishWithBlobReceipt` carries the publish-event's `WriteToken` after the configured `BlobDurability` is satisfied.
 
 ## nRPC
 

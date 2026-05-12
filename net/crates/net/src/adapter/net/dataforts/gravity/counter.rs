@@ -184,11 +184,25 @@ impl HeatRegistry {
     /// Empty registry with an explicit cap. `cap == 0` disables
     /// the bound (use only when an external loop guarantees
     /// bounded entries — typically the greedy cache wiring).
+    ///
+    /// **Footgun**: passing `0` silently turns off memory
+    /// bounding on the registry. Prefer
+    /// [`Self::with_cap_unbounded`] when that is the intent so
+    /// the reader of the call site can tell unbounded-by-design
+    /// apart from "operator typo dropped the cap to zero."
     pub fn with_cap(cap: usize) -> Self {
         Self {
             counters: HashMap::new(),
             cap,
         }
+    }
+
+    /// Empty registry with the cap explicitly disabled. Use when
+    /// an external loop (typically the greedy cache wiring)
+    /// guarantees bounded entries and the registry just rides
+    /// along.
+    pub fn with_cap_unbounded() -> Self {
+        Self::with_cap(0)
     }
 
     /// Configured cap. `0` means unbounded.
@@ -302,6 +316,157 @@ impl HeatRegistry {
         // bump for the same origin re-enters the registry via
         // `entry_mut`; the LRU cap protects against unbounded
         // re-entries.
+        self.counters
+            .retain(|_, c| !(c.rate == 0.0 && c.last_emitted == Some(0.0)));
+        out
+    }
+}
+
+/// Cluster-wide blob heat registry. Mirrors [`HeatRegistry`] but
+/// keyed by `[u8; 32]` (the chunk's BLAKE3 hash) rather than the
+/// chain's `u64` `origin_hash` — operators reading a `BlobRef`
+/// have the hash in hand and a `u64` projection would unnecessarily
+/// collapse it. Same LRU + cap discipline; same per-counter
+/// half-life decay; same tick semantics. PR-5j-a foundation for
+/// the gravity migration controller.
+#[derive(Debug)]
+pub struct BlobHeatRegistry {
+    counters: HashMap<[u8; 32], HeatCounter>,
+    cap: usize,
+}
+
+impl Default for BlobHeatRegistry {
+    fn default() -> Self {
+        Self {
+            counters: HashMap::new(),
+            cap: DEFAULT_HEAT_REGISTRY_CAP,
+        }
+    }
+}
+
+impl BlobHeatRegistry {
+    /// Empty registry with the default cap.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Empty registry with an explicit cap. `cap == 0` disables
+    /// the bound — only safe when an external loop guarantees
+    /// bounded entries (e.g. an adapter that prunes on chunk
+    /// delete).
+    ///
+    /// **Footgun**: passing `0` silently turns off memory
+    /// bounding. Prefer [`Self::with_cap_unbounded`] when that
+    /// is the intent so a call-site reader can tell intentional
+    /// unboundedness apart from an operator typo.
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            counters: HashMap::new(),
+            cap,
+        }
+    }
+
+    /// Empty registry with the cap explicitly disabled. Use when
+    /// an external loop guarantees bounded entries (e.g. an
+    /// adapter that prunes on chunk delete) and the registry is
+    /// just riding along.
+    pub fn with_cap_unbounded() -> Self {
+        Self::with_cap(0)
+    }
+
+    /// Configured cap. `0` means unbounded.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Number of tracked blob hashes.
+    pub fn len(&self) -> usize {
+        self.counters.len()
+    }
+
+    /// True iff zero hashes tracked.
+    pub fn is_empty(&self) -> bool {
+        self.counters.is_empty()
+    }
+
+    /// Get-or-create the counter for `hash`. Returns a mutable
+    /// reference so the caller can `bump` / `decay_to` /
+    /// `record_emission` in one borrow.
+    ///
+    /// When `len() == cap` and the inserted key is new, the entry
+    /// with the oldest `last_update` is evicted first (LRU-style
+    /// replacement). `cap == 0` disables the bound.
+    pub fn entry_mut(
+        &mut self,
+        hash: [u8; 32],
+        half_life: Duration,
+        now: Instant,
+    ) -> &mut HeatCounter {
+        if !self.counters.contains_key(&hash) && self.cap > 0 && self.counters.len() >= self.cap {
+            self.evict_lru();
+        }
+        self.counters
+            .entry(hash)
+            .or_insert_with(|| HeatCounter::new(half_life, now))
+    }
+
+    fn evict_lru(&mut self) {
+        let victim = self
+            .counters
+            .iter()
+            .min_by_key(|(_, c)| c.last_update())
+            .map(|(k, _)| *k);
+        if let Some(key) = victim {
+            self.counters.remove(&key);
+        }
+    }
+
+    /// Read-only access to the counter for `hash`.
+    pub fn get(&self, hash: &[u8; 32]) -> Option<&HeatCounter> {
+        self.counters.get(hash)
+    }
+
+    /// Remove the counter for `hash`. Used on chunk delete /
+    /// GC sweep.
+    pub fn remove(&mut self, hash: &[u8; 32]) {
+        self.counters.remove(hash);
+    }
+
+    /// Iterate `(hash, counter)` pairs. Read-only.
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8; 32], &HeatCounter)> {
+        self.counters.iter()
+    }
+
+    /// Walk every tracked hash, applying decay through `now` and
+    /// asking `should_emit_heat` whether to emit. Returns the
+    /// list of `(hash, decision)` pairs the runtime acts on.
+    /// Mirrors [`HeatRegistry::tick`]; records emissions against
+    /// the counter so the next tick sees the updated snapshot,
+    /// and prunes fully-decayed + already-withdrawn entries.
+    pub fn tick(
+        &mut self,
+        policy: &super::DataGravityPolicy,
+        now: Instant,
+    ) -> Vec<([u8; 32], HeatEmission)> {
+        let mut out = Vec::new();
+        for (hash, counter) in self.counters.iter_mut() {
+            counter.decay_to(now);
+            let decision = super::should_emit_heat(counter.rate, counter.last_emitted, policy);
+            let emission = match decision {
+                super::EmissionDecision::Suppress => HeatEmission::Suppress,
+                super::EmissionDecision::Emit { rate } => {
+                    counter.record_emission(rate);
+                    HeatEmission::Emit { rate }
+                }
+                super::EmissionDecision::Withdraw => {
+                    counter.record_withdrawal();
+                    HeatEmission::Withdraw
+                }
+            };
+            if !matches!(emission, HeatEmission::Suppress) {
+                out.push((*hash, emission));
+            }
+        }
         self.counters
             .retain(|_, c| !(c.rate == 0.0 && c.last_emitted == Some(0.0)));
         out
@@ -544,5 +709,257 @@ mod tests {
             HeatEmission::Emit { rate } => assert!(rate >= 4.0 * 0.99),
             other => panic!("expected Emit, got {other:?}"),
         }
+    }
+
+    // --- BlobHeatRegistry coverage (PR-5j-a) ---
+
+    fn hash(seed: u8) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[0] = seed;
+        h
+    }
+
+    #[test]
+    fn blob_heat_registry_is_empty_by_default() {
+        let r = BlobHeatRegistry::new();
+        assert!(r.is_empty());
+        assert_eq!(r.cap(), DEFAULT_HEAT_REGISTRY_CAP);
+    }
+
+    #[test]
+    fn blob_heat_entry_mut_creates_then_bumps() {
+        let mut r = BlobHeatRegistry::new();
+        let half = Duration::from_secs(60);
+        let h = hash(0x01);
+        r.entry_mut(h, half, t0()).bump(t0());
+        let counter = r.get(&h).expect("entry should exist");
+        assert!(counter.rate() > 0.0);
+    }
+
+    #[test]
+    fn blob_heat_entry_mut_at_cap_evicts_lru() {
+        let base = t0();
+        let mut r = BlobHeatRegistry::with_cap(2);
+        let half = Duration::from_secs(60);
+        r.entry_mut(hash(0x01), half, base).bump(base);
+        r.entry_mut(hash(0x02), half, base + Duration::from_millis(10))
+            .bump(base + Duration::from_millis(10));
+        r.entry_mut(hash(0x03), half, base + Duration::from_millis(20))
+            .bump(base + Duration::from_millis(20));
+        // hash(0x01) was LRU when 0x03 inserted past cap → evicted.
+        assert!(r.get(&hash(0x01)).is_none());
+        assert!(r.get(&hash(0x02)).is_some());
+        assert!(r.get(&hash(0x03)).is_some());
+    }
+
+    #[test]
+    fn blob_heat_tick_emits_above_threshold() {
+        let mut r = BlobHeatRegistry::new();
+        let policy = super::super::policy::DataGravityPolicy::default();
+        let half = policy.decay_half_life;
+        let h = hash(0x42);
+        let now = t0();
+        // Several bumps in quick succession build rate quickly.
+        for _ in 0..8 {
+            r.entry_mut(h, half, now).bump(now);
+        }
+        let emissions = r.tick(&policy, now);
+        assert!(
+            emissions
+                .iter()
+                .any(|(k, e)| *k == h && matches!(e, HeatEmission::Emit { rate } if *rate > 0.0)),
+            "tick must emit for a heated hash; got {emissions:?}"
+        );
+    }
+
+    #[test]
+    fn blob_heat_remove_drops_entry() {
+        let mut r = BlobHeatRegistry::new();
+        let half = Duration::from_secs(60);
+        let h = hash(0x42);
+        r.entry_mut(h, half, t0()).bump(t0());
+        r.remove(&h);
+        assert!(r.is_empty());
+    }
+
+    // ========================================================================
+    // Concurrency stress (multi-thread bump / tick races)
+    //
+    // The registries are `HashMap` inside, designed to live under
+    // an outer `Arc<Mutex<...>>` (the production wiring on
+    // `MeshBlobAdapter`). These tests wrap the registry that way
+    // and assert the higher-level invariants — no panic under
+    // concurrent bumps from N threads, tick-during-bump remains
+    // safe, LRU eviction stays within the cap envelope.
+    // ========================================================================
+
+    /// N threads each bump the same chunk hash on a shared
+    /// `Arc<Mutex<BlobHeatRegistry>>`. After the race, the rate
+    /// must equal `threads × per_thread` (modulo a negligible
+    /// decay over the test's millisecond window). Pins the
+    /// outer-mutex serialization correctness for concurrent
+    /// fetch-path heat updates.
+    #[test]
+    fn blob_heat_concurrent_bump_accumulates_under_outer_mutex() {
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        let registry = Arc::new(Mutex::new(BlobHeatRegistry::new()));
+        let half = Duration::from_secs(60 * 60); // 1 h — negligible decay over the test
+        let target = hash(0xAB);
+        let threads = 8usize;
+        let per_thread = 1_000usize;
+        let start = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+
+        for _ in 0..threads {
+            let registry = registry.clone();
+            let start = start.clone();
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..per_thread {
+                    let now = Instant::now();
+                    let mut guard = registry.lock().unwrap();
+                    guard.entry_mut(target, half, now).bump(now);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        let guard = registry.lock().unwrap();
+        let counter = guard.get(&target).expect("entry must exist");
+        let expected = (threads * per_thread) as f64;
+        // Decay is negligible (1 h half-life over ms-window), but
+        // we allow a generous 1 % slop for the f64 math without
+        // making the test brittle.
+        let rate = counter.rate();
+        assert!(
+            rate > expected * 0.99,
+            "expected rate ≈ {} (8 × 1000 bumps); got {} (lower bound failed)",
+            expected,
+            rate,
+        );
+        assert!(
+            rate <= expected,
+            "expected rate ≤ {} (no double-counting); got {}",
+            expected,
+            rate,
+        );
+    }
+
+    /// Background `bump` storm on a single hash while a foreground
+    /// thread runs `tick(policy, now)` repeatedly. Asserts no panic
+    /// and the tick produces at least one emission per cycle
+    /// (the rate is well above the threshold ratio after the first
+    /// few bumps land). Pins the iter-mut-during-bump safety.
+    #[test]
+    fn blob_heat_tick_concurrent_with_bumps_is_panic_free() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        let registry = Arc::new(Mutex::new(BlobHeatRegistry::new()));
+        let policy = super::super::policy::DataGravityPolicy::default();
+        let half = policy.decay_half_life;
+        let target = hash(0xCD);
+        let stop = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(Barrier::new(2));
+
+        // Bump storm.
+        let bumper = {
+            let registry = registry.clone();
+            let stop = stop.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    let now = Instant::now();
+                    let mut guard = registry.lock().unwrap();
+                    guard.entry_mut(target, half, now).bump(now);
+                }
+            })
+        };
+
+        // Tick loop.
+        let ticker = {
+            let registry = registry.clone();
+            let stop = stop.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                let mut total = 0usize;
+                for _ in 0..200 {
+                    let now = Instant::now();
+                    let emissions = {
+                        let mut guard = registry.lock().unwrap();
+                        guard.tick(&policy, now)
+                    };
+                    total += emissions.len();
+                }
+                stop.store(true, Ordering::Relaxed);
+                total
+            })
+        };
+
+        bumper.join().expect("bumper panicked");
+        let total_emissions = ticker.join().expect("ticker panicked");
+        // The bumper guarantees rate > 0 for most of the ticker's
+        // window, so at least *some* emissions land. The exact
+        // count is non-deterministic under the race.
+        assert!(
+            total_emissions > 0,
+            "tick must surface at least one emission while bumps run"
+        );
+    }
+
+    /// LRU eviction under a tight cap with concurrent inserts from
+    /// N threads. Asserts len() stays within the cap × shards
+    /// envelope (the `entry_mut` len-check + `evict_lru` aren't
+    /// transactional under DashMap-less HashMap+Mutex, but the
+    /// outer mutex serializes the whole `entry_mut` call so the
+    /// overshoot is zero).
+    #[test]
+    fn blob_heat_lru_cap_holds_under_concurrent_inserts() {
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        let cap = 16usize;
+        let registry = Arc::new(Mutex::new(BlobHeatRegistry::with_cap(cap)));
+        let half = Duration::from_secs(60);
+        let threads = 4usize;
+        // Each thread inserts a distinct range of keys past the
+        // cap, so eviction must fire repeatedly.
+        let inserts_per_thread = 64u8;
+        let start = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+
+        for tid in 0..threads as u8 {
+            let registry = registry.clone();
+            let start = start.clone();
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for i in 0..inserts_per_thread {
+                    let k = hash(tid * inserts_per_thread + i);
+                    let now = Instant::now();
+                    let mut guard = registry.lock().unwrap();
+                    guard.entry_mut(k, half, now);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        let guard = registry.lock().unwrap();
+        // The cap is enforced under the outer mutex on the
+        // entry_mut hot path — len() must never exceed it.
+        assert!(
+            guard.len() <= cap,
+            "len() {} exceeded cap {} after concurrent inserts; LRU eviction is broken",
+            guard.len(),
+            cap,
+        );
     }
 }

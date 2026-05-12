@@ -43,6 +43,9 @@ use super::admission::{should_admit, AdmissionInputs, AdmissionVerdict};
 use super::cache::GreedyCacheRegistry;
 use super::config::GreedyConfig;
 use super::metrics::{AdmitRejectReason, GreedyMetricsRegistry};
+use crate::adapter::net::dataforts::blob::{
+    classify_payload, should_pull_blob, EventPayload, PullBlobVerdict,
+};
 
 /// Trait the mesh dispatch loop uses to fan inbound events into
 /// the greedy runtime. Stays sync — the mesh's `process_local_packet`
@@ -164,6 +167,38 @@ struct GreedyRuntimeInner {
     /// disable) once gravity is installed.
     #[cfg(feature = "dataforts")]
     gravity: parking_lot::RwLock<Option<GravityState>>,
+    /// Optional [`BlobRefcountTable`] handle used as a chain-fold
+    /// refcount source: every event admitted into the greedy
+    /// cache whose payload decodes to a `BlobRef` bumps the
+    /// referenced hash's refcount; the corresponding decrement
+    /// fires when the cache evicts the channel under LRU
+    /// pressure. Without this wiring the refcount table sees
+    /// only the passive `store_observed` stamps from
+    /// `MeshBlobAdapter::store_chunk`, so GC's `deletable_hashes`
+    /// path can't distinguish "still referenced by a cached
+    /// chain" from "orphaned chunk past retention". Operator
+    /// installs via [`GreedyRuntime::set_blob_refcount_table`].
+    #[cfg(feature = "dataforts")]
+    blob_refcount: parking_lot::RwLock<Option<super::super::blob::BlobRefcountTable>>,
+    /// Optional [`BlobAdapter`](super::super::blob::BlobAdapter)
+    /// handle used by the G-1 admit path to kick off a best-effort
+    /// `prefetch` of the referenced blob (PR-5i). When wired,
+    /// every admit verdict spawns one tokio task that calls
+    /// `adapter.prefetch(blob_ref)` so the chunk channels open
+    /// against the local Redex handle and the replication runtime
+    /// begins pulling from peers carrying the `causal:<hex>` tag.
+    /// Operator installs via
+    /// [`GreedyRuntime::set_blob_adapter`].
+    #[cfg(feature = "dataforts")]
+    blob_adapter: parking_lot::RwLock<Option<Arc<dyn super::super::blob::BlobAdapter>>>,
+    /// Per-channel set of `BlobRef` hashes the runtime has
+    /// admitted into the cache. Drives the matching decrement on
+    /// channel eviction so the refcount source is balanced.
+    /// `Mutex` because writes happen on the (hot) admit path and
+    /// on the (rarer) eviction sweep — RwLock's reader path
+    /// doesn't help here since every dispatch is a write.
+    #[cfg(feature = "dataforts")]
+    chain_blob_refs: Mutex<std::collections::HashMap<ChannelName, BoundedShadowSet>>,
     /// Bounds the number of in-flight `observe_event` spawn tasks.
     /// `observe_event` is the mesh hot-path entry; without a bound
     /// a flooding peer creates one outstanding task per event
@@ -172,6 +207,85 @@ struct GreedyRuntimeInner {
     /// `try_acquire_owned`-shaped: on saturation drop the event
     /// and bump a counter rather than blocking the mesh.
     observer_inflight: Arc<tokio::sync::Semaphore>,
+}
+
+/// Per-channel cap on the `chain_blob_refs` dedup set. Without
+/// this, a long-lived chatty channel publishing one new BlobRef
+/// per event grows the set unboundedly — only channel eviction
+/// drains it. The cap is conservative enough that a single
+/// channel's bookkeeping stays under ~256 KiB while still
+/// covering working sets two orders of magnitude larger than any
+/// reasonable steady-state stream. Operators with sustained
+/// working sets above the cap will see oldest BlobRefs evict from
+/// the shadow set + the refcount table decremented for those
+/// hashes — equivalent to "we no longer hold this reference at
+/// the greedy layer," which is the conservative direction (the
+/// adapter's GC sweep may then reclaim the chunk).
+#[cfg(feature = "dataforts")]
+const MAX_TRACKED_BLOBS_PER_CHANNEL: usize = 8192;
+
+/// Per-channel BlobRef shadow set used by the chain-fold refcount
+/// source. Insertion-ordered + presence-keyed so the runtime can
+/// dedupe on `(channel, hash)` pairs (BlobRef admit fires +1
+/// once per pair, not per event) and bound memory by evicting
+/// the oldest entry when the per-channel cap is hit.
+#[cfg(feature = "dataforts")]
+struct BoundedShadowSet {
+    set: std::collections::HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    cap: usize,
+}
+
+#[cfg(feature = "dataforts")]
+impl BoundedShadowSet {
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            set: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// Insert `hash` if not already present. Returns `true` on a
+    /// fresh insert, `false` when the hash was already present
+    /// (the caller treats this as a no-op admit).
+    fn insert(&mut self, hash: [u8; 32]) -> bool {
+        if self.set.insert(hash) {
+            self.order.push_back(hash);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pop + return the oldest entry, or `None` when empty.
+    /// Called by the runtime after a fresh insert pushed the set
+    /// past `cap` so the matching decrement against the refcount
+    /// table fires.
+    fn pop_oldest(&mut self) -> Option<[u8; 32]> {
+        let oldest = self.order.pop_front()?;
+        self.set.remove(&oldest);
+        Some(oldest)
+    }
+
+    fn over_cap(&self) -> bool {
+        self.order.len() > self.cap
+    }
+
+    /// Drain every hash, ordered oldest-first. Used on eviction +
+    /// table swap / clear so the caller can decrement each in
+    /// turn against the refcount table.
+    fn drain_all(&mut self) -> std::collections::VecDeque<[u8; 32]> {
+        self.set.clear();
+        std::mem::take(&mut self.order)
+    }
+}
+
+#[cfg(feature = "dataforts")]
+impl Default for BoundedShadowSet {
+    fn default() -> Self {
+        Self::with_cap(MAX_TRACKED_BLOBS_PER_CHANNEL)
+    }
 }
 
 /// Per-runtime data-gravity state. Behind the same gate as the
@@ -238,6 +352,12 @@ impl GreedyRuntime {
                 local_caps: Mutex::new(local_caps),
                 #[cfg(feature = "dataforts")]
                 gravity: parking_lot::RwLock::new(None),
+                #[cfg(feature = "dataforts")]
+                blob_refcount: parking_lot::RwLock::new(None),
+                #[cfg(feature = "dataforts")]
+                blob_adapter: parking_lot::RwLock::new(None),
+                #[cfg(feature = "dataforts")]
+                chain_blob_refs: Mutex::new(std::collections::HashMap::new()),
                 observer_inflight,
             }),
         }
@@ -277,6 +397,99 @@ impl GreedyRuntime {
     #[cfg(feature = "dataforts")]
     pub fn gravity_enabled(&self) -> bool {
         self.inner.gravity.read().is_some()
+    }
+
+    /// Wire a [`BlobRefcountTable`](super::super::blob::BlobRefcountTable)
+    /// so this runtime acts as a chain-fold refcount source: every
+    /// blob-ref-shaped event admitted into the cache bumps the
+    /// referenced hash's refcount, and the matching decrement
+    /// fires when the channel is evicted from the cache. Operators
+    /// typically pass `mesh_blob_adapter.refcount_table().clone()`
+    /// so the same table feeds the adapter's GC sweep.
+    ///
+    /// When called with an existing table already installed, the
+    /// outgoing table receives a matching decrement for every
+    /// hash currently in the shadow set — every prior admit's +1
+    /// is balanced — and the shadow set is then drained so the
+    /// new table starts from a clean slate. Without this, the old
+    /// table would keep leaked +1s on every channel currently in
+    /// the greedy cache (the eventual eviction would decrement
+    /// the *new* table instead), drifting the global accounting.
+    #[cfg(feature = "dataforts")]
+    pub fn set_blob_refcount_table(&self, table: super::super::blob::BlobRefcountTable) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut slot = self.inner.blob_refcount.write();
+        if let Some(old) = slot.take() {
+            // Balance the outgoing table against everything we
+            // previously incremented on it.
+            let mut shadow = self.inner.chain_blob_refs.lock();
+            for bucket in shadow.values_mut() {
+                for h in bucket.drain_all() {
+                    old.decr(h, now);
+                }
+            }
+            shadow.clear();
+        }
+        *slot = Some(table);
+    }
+
+    /// Disable the chain-fold refcount source. Every hash
+    /// currently in the shadow set receives a matching decrement
+    /// on the outgoing table so the global accounting stays
+    /// balanced; the shadow set is then drained. Idempotent.
+    #[cfg(feature = "dataforts")]
+    pub fn clear_blob_refcount_table(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut slot = self.inner.blob_refcount.write();
+        if let Some(old) = slot.take() {
+            let mut shadow = self.inner.chain_blob_refs.lock();
+            for bucket in shadow.values_mut() {
+                for h in bucket.drain_all() {
+                    old.decr(h, now);
+                }
+            }
+            shadow.clear();
+        }
+    }
+
+    /// True iff this runtime is wired as a blob refcount source.
+    #[cfg(feature = "dataforts")]
+    pub fn blob_refcount_enabled(&self) -> bool {
+        self.inner.blob_refcount.read().is_some()
+    }
+
+    /// Wire a [`BlobAdapter`](super::super::blob::BlobAdapter) so
+    /// the G-1 admit verdict actually kicks off a best-effort
+    /// prefetch — the runtime spawns one tokio task per admit
+    /// calling `adapter.prefetch(blob_ref)`. Without this wiring
+    /// G-1 stays decision-only (PR-5c semantics): the verdict
+    /// bumps the admitted counter but no fetch happens.
+    ///
+    /// Idempotent — replacing an already-installed adapter is
+    /// permitted; in-flight prefetch tasks finish against the
+    /// previous handle.
+    #[cfg(feature = "dataforts")]
+    pub fn set_blob_adapter(&self, adapter: Arc<dyn super::super::blob::BlobAdapter>) {
+        *self.inner.blob_adapter.write() = Some(adapter);
+    }
+
+    /// Disable the prefetch path. Subsequent admits stay
+    /// decision-only. Idempotent.
+    #[cfg(feature = "dataforts")]
+    pub fn clear_blob_adapter(&self) {
+        *self.inner.blob_adapter.write() = None;
+    }
+
+    /// True iff this runtime is wired to act on G-1 admits.
+    #[cfg(feature = "dataforts")]
+    pub fn blob_adapter_enabled(&self) -> bool {
+        self.inner.blob_adapter.read().is_some()
     }
 
     /// Borrow the metrics registry. Cheap clone of the inner Arc.
@@ -399,33 +612,30 @@ impl GreedyRuntime {
     /// cadence.
     #[cfg(feature = "dataforts")]
     pub async fn gravity_tick(&self) {
-        // Snapshot the sink + emissions list under the read lock,
-        // then drop the lock before awaiting the sink. Holding
-        // the gravity lock across an .await would block any
-        // concurrent set_gravity / clear_gravity for the duration
-        // of the wire emission.
-        let (sink, emissions) = {
+        // Snapshot the sink + emissions list + policy under a
+        // single read lock, then drop the lock before awaiting
+        // the sink. Holding the gravity lock across an .await
+        // would block any concurrent set_gravity / clear_gravity
+        // for the duration of the wire emission. Capturing the
+        // policy in the same block guarantees the normalization
+        // formula matches the policy that produced `emissions`
+        // — a second `gravity.read()` could observe a
+        // concurrently-installed policy (or `None` if cleared)
+        // and renormalize against a stale or unrelated curve.
+        let (sink, emissions, policy) = {
             let gravity = self.inner.gravity.read();
             let Some(gravity) = gravity.as_ref() else {
                 return;
             };
             let now = Instant::now();
             let emissions = gravity.heat.lock().tick(&gravity.policy, now);
-            (gravity.sink.clone(), emissions)
+            (gravity.sink.clone(), emissions, gravity.policy.clone())
         };
         // Coalesce the per-chain emissions into one
         // (origin_hash, Option<rate>) vector and submit through
         // the sink's batch path. The sink's default impl falls
         // back to per-chain calls; the MeshNode impl rewrites the
         // full capability set once and rebroadcasts once.
-        //
-        // Snapshot the policy reference so the normalization
-        // formula uses the operator-configured scale rather than a
-        // hard-coded saturating curve.
-        let policy = {
-            let gravity = self.inner.gravity.read();
-            gravity.as_ref().map(|g| g.policy.clone())
-        };
         let mut batch: Vec<(u64, Option<f64>)> = Vec::new();
         for (origin_hash, emission) in emissions {
             match emission {
@@ -438,10 +648,7 @@ impl GreedyRuntime {
                     // chain looked identical to "blazing"); the
                     // log form stretches the wire range across
                     // useful operating rates.
-                    let normalized = policy
-                        .as_ref()
-                        .map(|p| p.normalize_rate_for_wire(rate))
-                        .unwrap_or_else(|| (rate / (rate + 1.0)).min(1.0));
+                    let normalized = policy.normalize_rate_for_wire(rate);
                     batch.push((origin_hash, Some(normalized)));
                 }
                 super::super::gravity::HeatEmission::Withdraw => {
@@ -615,6 +822,38 @@ impl GreedyRuntime {
             .for_channel(channel.as_str())
             .set_bytes_resident(resident_bytes);
 
+        // 4b. G-1 blob-pull verdict + chain-fold refcount source.
+        // The chain event was admitted + cached, so this is the
+        // moment to consider whether the local node should
+        // *additionally* pull any blob the event payload
+        // references. Decision-only in this PR — counters surface
+        // the verdict; the actual fetch path lands when remote
+        // blob fetch wires up. See
+        // `dataforts/blob/admission.rs::should_pull_blob` for the
+        // decision rule + the plan's § G-1 for the full contract.
+        //
+        // When a refcount table is wired (PR-5h), the BlobRef hash
+        // is also folded into the table as a live reference. The
+        // matching decrement fires below in step 6 when the
+        // channel is evicted from the cache.
+        if let Ok(EventPayload::Blob(blob_ref)) = classify_payload(payload) {
+            match should_pull_blob(&local_caps, chain_caps) {
+                PullBlobVerdict::Admit => {
+                    self.inner.metrics.cluster().incr_blob_pull_admitted();
+                    // PR-5i: act on the admit when an adapter is
+                    // wired. Spawn so the hot dispatch path stays
+                    // non-blocking — actual chunk arrival is
+                    // asynchronous via the per-chunk replication
+                    // runtime spawned inside `prefetch`.
+                    self.spawn_blob_prefetch(blob_ref.clone());
+                }
+                PullBlobVerdict::Reject(reason) => {
+                    self.inner.metrics.cluster().incr_blob_pull_rejected(reason);
+                }
+            }
+            self.record_blob_ref(channel, &blob_ref);
+        }
+
         let sink = self.inner.sink.clone();
 
         // 5. First-cache chain announcement.
@@ -667,6 +906,16 @@ impl GreedyRuntime {
                 drop(gravity);
             }
 
+            // Decrement refcounts for every BlobRef hash the
+            // evicted channels had recorded. Balances the
+            // increment at step 4b so the refcount table tracks
+            // the "live references" semantics the GC sweep relies
+            // on. Drained under the inner lock so a concurrent
+            // dispatch on the same channel (post-eviction) starts
+            // from a clean slate.
+            #[cfg(feature = "dataforts")]
+            self.release_blob_refs_for_evicted(&sweep.evicted);
+
             for evicted in &sweep.evicted {
                 self.inner
                     .metrics
@@ -690,6 +939,117 @@ impl GreedyRuntime {
         }
 
         DispatchOutcome::Cached
+    }
+
+    /// Record one BlobRef-shaped event payload against the
+    /// per-channel shadow set + bump the refcount on the
+    /// underlying hash(es). No-op when no refcount table is
+    /// wired or when the channel has already recorded this
+    /// exact hash (set semantics — duplicate observations of the
+    /// same blob from the same channel don't double-count).
+    /// For `BlobRef::Manifest`, every constituent chunk hash is
+    /// recorded — the manifest body itself doesn't have its own
+    /// hash on the wire, so the per-chunk projection is the only
+    /// surface the refcount table can hold.
+    #[cfg(feature = "dataforts")]
+    fn record_blob_ref(&self, channel: &ChannelName, blob_ref: &super::super::blob::BlobRef) {
+        let table = match self.inner.blob_refcount.read().clone() {
+            Some(t) => t,
+            None => return,
+        };
+        let hashes: Vec<[u8; 32]> = match blob_ref {
+            super::super::blob::BlobRef::Small { hash, .. } => vec![*hash],
+            super::super::blob::BlobRef::Manifest { chunks, .. } => {
+                chunks.iter().map(|c| c.hash).collect()
+            }
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut seen = self.inner.chain_blob_refs.lock();
+        let bucket = seen.entry(channel.clone()).or_default();
+        for hash in hashes {
+            // Deduplicate per-channel: a chain re-publishing the
+            // same BlobRef across multiple events shouldn't
+            // accumulate refcount. The matching decrement at
+            // eviction also fires once per (channel, hash) pair.
+            if bucket.insert(hash) {
+                table.incr(hash, now_ms);
+                // Cap the per-channel shadow set so a long-lived
+                // chatty channel publishing one new BlobRef per
+                // event doesn't grow it unboundedly. On overflow,
+                // evict the oldest hash and decrement its
+                // refcount — equivalent to "the greedy layer no
+                // longer references this hash from this channel."
+                if bucket.over_cap() {
+                    if let Some(evicted) = bucket.pop_oldest() {
+                        table.decr(evicted, now_ms);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spawn a best-effort prefetch task against the wired
+    /// [`BlobAdapter`](super::super::blob::BlobAdapter). No-op
+    /// when no adapter is wired (G-1 stays decision-only — the
+    /// PR-5c behavior). The task counts success / error into the
+    /// cluster metric registry; the dispatch hot path never
+    /// waits on completion.
+    #[cfg(feature = "dataforts")]
+    fn spawn_blob_prefetch(&self, blob_ref: super::super::blob::BlobRef) {
+        let adapter = match self.inner.blob_adapter.read().clone() {
+            Some(a) => a,
+            None => return,
+        };
+        let metrics = self.inner.metrics.clone();
+        tokio::spawn(async move {
+            match adapter.prefetch(&blob_ref).await {
+                Ok(()) => metrics.cluster().incr_blob_prefetch_ok(),
+                Err(e) => {
+                    tracing::trace!(
+                        error = ?e,
+                        "greedy: blob prefetch failed; G-1 admit recorded, fetch best-effort"
+                    );
+                    metrics.cluster().incr_blob_prefetch_err();
+                }
+            }
+        });
+    }
+
+    /// On channel eviction, drain the shadow set and decrement
+    /// each recorded BlobRef hash. Pairs with
+    /// [`Self::record_blob_ref`] to keep the refcount table
+    /// balanced — every admit that incremented is followed by
+    /// exactly one decrement when the holding channel is evicted.
+    #[cfg(feature = "dataforts")]
+    fn release_blob_refs_for_evicted(&self, evicted: &[super::cache::EvictedEntry]) {
+        let table = match self.inner.blob_refcount.read().clone() {
+            Some(t) => t,
+            None => {
+                // Drain without decrementing if the table is
+                // disabled, so a future re-install doesn't see
+                // stale shadow entries.
+                let mut seen = self.inner.chain_blob_refs.lock();
+                for e in evicted {
+                    seen.remove(&e.channel);
+                }
+                return;
+            }
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut seen = self.inner.chain_blob_refs.lock();
+        for e in evicted {
+            if let Some(mut bucket) = seen.remove(&e.channel) {
+                for hash in bucket.drain_all() {
+                    table.decr(hash, now_ms);
+                }
+            }
+        }
     }
 }
 
@@ -1282,5 +1642,672 @@ mod tests {
         // No heat-sink to assert on; the test passes by not
         // panicking and by leaving gravity_enabled false.
         assert!(!rt.gravity_enabled());
+    }
+
+    // --- G-1 blob-pull verdict wiring (PR-5c) ---
+
+    /// Encode `payload` as a `BlobRef::Small`-bearing event payload
+    /// so the dispatch hook's `classify_payload` sees the magic +
+    /// version + body and decodes a real BlobRef. Mirrors the
+    /// production wire shape that `publish_blob` produces.
+    fn encode_blob_payload(payload: &[u8]) -> Vec<u8> {
+        use crate::adapter::net::dataforts::blob::BlobRef;
+        let hash: [u8; 32] = blake3::hash(payload).into();
+        BlobRef::small("mesh://test", hash, payload.len() as u64).encode()
+    }
+
+    /// `dataforts.blob.storage` + `dataforts.greedy.enabled` +
+    /// proximity tag set — qualifies as a participating local node
+    /// under `should_pull_blob`.
+    fn participating_blob_caps() -> CapabilitySet {
+        CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=50")
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=mesh")
+            .add_tag("dataforts.greedy.proximity=128")
+    }
+
+    fn publisher_mesh_scope_caps() -> CapabilitySet {
+        CapabilitySet::new()
+            .add_tag("dataforts.greedy.scope=mesh")
+            .add_tag("dataforts.gravity.scope=mesh")
+    }
+
+    #[tokio::test]
+    async fn inline_payload_does_not_bump_blob_pull_counters() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let chain = publisher_mesh_scope_caps();
+
+        // Plain bytes — no BlobRef discriminator → classify_payload
+        // reports Inline → G-1 hook is a no-op.
+        let outcome = rt
+            .dispatch_event(&cn("test/g1-inline"), 0xAA, &chain, b"plain payload")
+            .await;
+        assert_eq!(outcome, DispatchOutcome::Cached);
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_no_storage_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_greedy_disabled_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_proximity_zero_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_unhealthy_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_scope_mismatch_total, 0);
+    }
+
+    #[tokio::test]
+    async fn blobref_payload_with_participating_local_bumps_admitted() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let chain = publisher_mesh_scope_caps();
+        let encoded = encode_blob_payload(b"out of band content");
+
+        let outcome = rt
+            .dispatch_event(&cn("test/g1-admit"), 0xBB, &chain, &encoded)
+            .await;
+        assert_eq!(outcome, DispatchOutcome::Cached);
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 1);
+        assert_eq!(snap.cluster.blob_pulls_rejected_no_storage_total, 0);
+    }
+
+    #[tokio::test]
+    async fn blobref_payload_without_storage_cap_bumps_no_storage() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        // Local lacks `dataforts.blob.storage` → G-1 vetoes with
+        // NoStorageCap as soon as it sees the BlobRef.
+        let local = CapabilitySet::new()
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=mesh")
+            .add_tag("dataforts.greedy.proximity=128");
+        rt.set_local_caps(Arc::new(local));
+        let chain = publisher_mesh_scope_caps();
+        let encoded = encode_blob_payload(b"out of band content");
+
+        rt.dispatch_event(&cn("test/g1-nostorage"), 0xCC, &chain, &encoded)
+            .await;
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_no_storage_total, 1);
+    }
+
+    #[tokio::test]
+    async fn blobref_payload_with_greedy_disabled_bumps_greedy_disabled() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        // Storage cap present, but greedy is not enabled on the
+        // local node → G-1 vetoes with GreedyDisabled.
+        let local = CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=50");
+        rt.set_local_caps(Arc::new(local));
+        let chain = publisher_mesh_scope_caps();
+        let encoded = encode_blob_payload(b"out of band content");
+
+        rt.dispatch_event(&cn("test/g1-greedy-off"), 0xDD, &chain, &encoded)
+            .await;
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_greedy_disabled_total, 1);
+    }
+
+    #[tokio::test]
+    async fn blobref_payload_with_proximity_zero_bumps_proximity_zero() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        // Storage + greedy enabled, but proximity tag explicitly
+        // zero → operator-driven veto without flipping the master
+        // flag.
+        let local = CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=50")
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=mesh")
+            .add_tag("dataforts.greedy.proximity=0");
+        rt.set_local_caps(Arc::new(local));
+        let chain = publisher_mesh_scope_caps();
+        let encoded = encode_blob_payload(b"out of band content");
+
+        rt.dispatch_event(&cn("test/g1-prox-zero"), 0xEE, &chain, &encoded)
+            .await;
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_proximity_zero_total, 1);
+    }
+
+    #[tokio::test]
+    async fn admit_rejected_chain_does_not_evaluate_blob_pull() {
+        // When the chain admission stage rejects, dispatch_event
+        // returns early and never reaches the G-1 hook. Even an
+        // otherwise-pullable BlobRef payload must not bump the
+        // blob counters when the chain itself was rejected.
+        use super::super::ScopeLabel;
+        let cfg = GreedyConfig::default()
+            .with_scopes(vec![ScopeLabel::new("industrial")])
+            .with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let chain = chain_caps_with_scope("webcam");
+        let encoded = encode_blob_payload(b"would pull");
+
+        let outcome = rt
+            .dispatch_event(&cn("test/g1-chain-rejected"), 0xFF, &chain, &encoded)
+            .await;
+        assert!(matches!(
+            outcome,
+            DispatchOutcome::RejectedByAdmission(AdmitRejectReason::Scope)
+        ));
+
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.admit_rejected_scope_total, 1);
+        // Critically: zero blob-pull verdicts because dispatch_event
+        // returned before the G-1 hook ran.
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_no_storage_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_greedy_disabled_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_proximity_zero_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_unhealthy_total, 0);
+        assert_eq!(snap.cluster.blob_pulls_rejected_scope_mismatch_total, 0);
+    }
+
+    // --- Chain-fold refcount source (PR-5h) ---
+
+    fn encode_blob_payload_with_hash(payload: &[u8]) -> (Vec<u8>, [u8; 32]) {
+        use crate::adapter::net::dataforts::blob::BlobRef;
+        let hash: [u8; 32] = blake3::hash(payload).into();
+        let bytes = BlobRef::small("mesh://test", hash, payload.len() as u64).encode();
+        (bytes, hash)
+    }
+
+    #[tokio::test]
+    async fn blobref_event_with_refcount_table_increments_hash() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let table = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table.clone());
+        assert!(rt.blob_refcount_enabled());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, hash) = encode_blob_payload_with_hash(b"refcount source");
+        rt.dispatch_event(&cn("test/refcount-incr"), 0xAA, &chain, &encoded)
+            .await;
+
+        let entry = table.get(&hash).expect("hash must be in refcount table");
+        assert_eq!(entry.refcount, 1, "first observation bumps refcount to 1");
+    }
+
+    #[tokio::test]
+    async fn duplicate_blobref_within_channel_does_not_double_count() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let table = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table.clone());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, hash) = encode_blob_payload_with_hash(b"dedup me");
+        let channel = cn("test/refcount-dedup");
+        rt.dispatch_event(&channel, 0xBB, &chain, &encoded).await;
+        rt.dispatch_event(&channel, 0xBB, &chain, &encoded).await;
+        rt.dispatch_event(&channel, 0xBB, &chain, &encoded).await;
+
+        let entry = table.get(&hash).expect("hash in refcount table");
+        assert_eq!(
+            entry.refcount, 1,
+            "duplicate observations on the same channel must not stack the refcount"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_payload_with_refcount_table_does_not_increment() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let table = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table.clone());
+
+        let chain = publisher_mesh_scope_caps();
+        rt.dispatch_event(&cn("test/refcount-inline"), 0xCC, &chain, b"plain")
+            .await;
+
+        // No BlobRef discriminator → no hash to record.
+        assert_eq!(
+            table.zero_refcount_count(),
+            0,
+            "inline payloads must not bump refcount entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_decrements_refcounts_for_evicted_channel() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        // Match the shape from `cluster_cap_eviction_calls_withdraw`:
+        // per-channel cap = 1 MiB (validator floor); total cap = 1.5 MiB.
+        // One 1-MiB payload fits per channel; two 1-MiB payloads
+        // together exceed the cluster cap → channel A evicts when
+        // channel B is admitted.
+        let cfg = GreedyConfig::default()
+            .with_intent_match(super::super::IntentMatchPolicy::Disabled)
+            .with_per_channel_cap_bytes(super::super::config::MIN_PER_CHANNEL_CAP_BYTES)
+            .with_total_cap_bytes(super::super::config::MIN_PER_CHANNEL_CAP_BYTES + 512 * 1024);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let table = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table.clone());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded_a, hash_a) = encode_blob_payload_with_hash(b"channel A blob");
+
+        // Channel A: small BlobRef event first (bumps refcount[hash_a]
+        // to 1) — followed by a 1-MiB inline padding event that
+        // fills the per-channel cap so the cluster cap is near
+        // saturation. The BlobRef event itself is tiny (~40 bytes
+        // wire); the padding is what gets channel A to ~1 MiB.
+        let channel_a = cn("test/refcount-evict-a");
+        rt.dispatch_event(&channel_a, 0xAA, &chain, &encoded_a)
+            .await;
+        assert_eq!(
+            table.get(&hash_a).map(|e| e.refcount),
+            Some(1),
+            "hash_a bumped on admit"
+        );
+        let big = vec![0u8; 1024 * 1024];
+        rt.dispatch_event(&channel_a, 0xAA, &chain, &big).await;
+        assert!(rt.contains(&channel_a), "channel A must be cached");
+
+        // Channel B: 1-MiB inline payload pushes total bytes past
+        // the cluster cap → channel A (LRU oldest) evicts.
+        rt.dispatch_event(&cn("test/refcount-evict-b"), 0xBB, &chain, &big)
+            .await;
+
+        // hash_a's refcount must be back at 0 — eviction released it.
+        assert!(!rt.contains(&channel_a), "channel A must have evicted");
+        assert_eq!(
+            table.get(&hash_a).map(|e| e.refcount),
+            Some(0),
+            "hash_a refcount must drop on channel-A eviction (got {:?})",
+            table.get(&hash_a),
+        );
+    }
+
+    /// Swapping the refcount table while greedy holds in-flight
+    /// references must balance the outgoing table — every prior
+    /// admit's +1 receives a matching decrement against the table
+    /// being replaced. The new table starts from a clean slate.
+    /// Without this, the outgoing table strands +1s on the
+    /// currently-cached channels and the eventual eviction
+    /// decrements the *new* table instead, drifting accounting.
+    #[tokio::test]
+    async fn swapping_refcount_table_balances_outgoing() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+
+        let table_a = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table_a.clone());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, hash) = encode_blob_payload_with_hash(b"table-swap regression");
+        rt.dispatch_event(&cn("test/swap"), 0xEE, &chain, &encoded)
+            .await;
+        assert_eq!(
+            table_a.get(&hash).map(|e| e.refcount),
+            Some(1),
+            "table A registered the admit"
+        );
+
+        // Swap to table B. The runtime must decrement table A for
+        // every hash currently in the shadow set so table A stays
+        // balanced; the shadow set is drained.
+        let table_b = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table_b.clone());
+        assert_eq!(
+            table_a.get(&hash).map(|e| e.refcount),
+            Some(0),
+            "swap must decrement the outgoing table"
+        );
+        assert!(table_b.get(&hash).is_none(), "incoming table starts empty");
+
+        // A future admit on the new channel goes to table B only.
+        let (encoded2, hash2) = encode_blob_payload_with_hash(b"post-swap admit");
+        rt.dispatch_event(&cn("test/swap-2"), 0xEE, &chain, &encoded2)
+            .await;
+        assert_eq!(
+            table_b.get(&hash2).map(|e| e.refcount),
+            Some(1),
+            "post-swap admit bumps the new table"
+        );
+        // Table A must NOT see the new admit.
+        assert!(
+            table_a.get(&hash2).is_none(),
+            "outgoing table must not receive post-swap admits"
+        );
+    }
+
+    /// Direct unit tests on `BoundedShadowSet` pin the invariants
+    /// the chain-fold refcount source relies on: insertion-order
+    /// eviction, dedup on re-insert, and the oldest-first
+    /// `pop_oldest` contract.
+    #[test]
+    fn bounded_shadow_set_evicts_oldest_on_overflow() {
+        let mut s = BoundedShadowSet::with_cap(3);
+        let h = |b| {
+            let mut a = [0u8; 32];
+            a[0] = b;
+            a
+        };
+        assert!(s.insert(h(1)));
+        assert!(s.insert(h(2)));
+        assert!(s.insert(h(3)));
+        assert!(!s.over_cap());
+        // Fourth distinct insert pushes us over cap by one.
+        assert!(s.insert(h(4)));
+        assert!(s.over_cap());
+        // pop_oldest returns 1 (insertion order); set is now at cap.
+        assert_eq!(s.pop_oldest(), Some(h(1)));
+        assert!(!s.over_cap());
+        // pop_oldest a second time returns 2.
+        assert_eq!(s.pop_oldest(), Some(h(2)));
+    }
+
+    #[test]
+    fn bounded_shadow_set_dedups_on_reinsert() {
+        let mut s = BoundedShadowSet::with_cap(8);
+        let mut h = [0u8; 32];
+        h[0] = 0xAA;
+        assert!(s.insert(h));
+        // Second insert is a no-op (returns false), doesn't grow
+        // the order queue.
+        assert!(!s.insert(h));
+        assert!(!s.over_cap());
+        assert_eq!(s.pop_oldest(), Some(h));
+        assert_eq!(s.pop_oldest(), None);
+    }
+
+    #[test]
+    fn bounded_shadow_set_drain_returns_insertion_order() {
+        let mut s = BoundedShadowSet::with_cap(8);
+        let h = |b| {
+            let mut a = [0u8; 32];
+            a[0] = b;
+            a
+        };
+        for i in 0..5u8 {
+            s.insert(h(i));
+        }
+        let order: Vec<_> = s.drain_all().into_iter().collect();
+        assert_eq!(order, vec![h(0), h(1), h(2), h(3), h(4)]);
+        // After drain the set is empty.
+        assert!(s.pop_oldest().is_none());
+    }
+
+    /// Clearing the table must also balance the outgoing table
+    /// against the shadow set, otherwise the same accounting
+    /// drift the swap-path closes is reopened on clear.
+    #[tokio::test]
+    async fn clearing_refcount_table_balances_outgoing() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+
+        let table = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table.clone());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, hash) = encode_blob_payload_with_hash(b"clear regression");
+        rt.dispatch_event(&cn("test/clear"), 0xEF, &chain, &encoded)
+            .await;
+        assert_eq!(table.get(&hash).map(|e| e.refcount), Some(1));
+
+        rt.clear_blob_refcount_table();
+        assert_eq!(
+            table.get(&hash).map(|e| e.refcount),
+            Some(0),
+            "clear must decrement every shadow-set hash on the outgoing table"
+        );
+        assert!(!rt.blob_refcount_enabled());
+    }
+
+    #[tokio::test]
+    async fn refcount_source_disabled_when_no_table_wired() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        assert!(!rt.blob_refcount_enabled());
+        // No panic, no table — dispatch_event with a BlobRef still
+        // works; refcount path is a silent no-op.
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, _) = encode_blob_payload_with_hash(b"no table wired");
+        rt.dispatch_event(&cn("test/refcount-disabled"), 0xDD, &chain, &encoded)
+            .await;
+    }
+
+    // --- Remote blob prefetch wiring (PR-5i) ---
+
+    /// Recorder adapter — counts prefetch calls + lets a test
+    /// pick admit vs reject outcomes per-call. Mirrors the
+    /// `AdversarialAdapter` shape from `dispatch.rs` tests but
+    /// for the prefetch path.
+    struct RecorderAdapter {
+        prefetch_calls: Arc<std::sync::atomic::AtomicU64>,
+        prefetch_fail: bool,
+    }
+
+    impl RecorderAdapter {
+        fn new() -> Self {
+            Self {
+                prefetch_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                prefetch_fail: false,
+            }
+        }
+        fn with_failing_prefetch() -> Self {
+            Self {
+                prefetch_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                prefetch_fail: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::adapter::net::dataforts::blob::BlobAdapter for RecorderAdapter {
+        fn adapter_id(&self) -> &str {
+            "test-recorder"
+        }
+        async fn store(
+            &self,
+            _: &crate::adapter::net::dataforts::blob::BlobRef,
+            _: &[u8],
+        ) -> Result<(), crate::adapter::net::dataforts::blob::BlobError> {
+            unreachable!("test recorder only exercises prefetch")
+        }
+        async fn fetch(
+            &self,
+            _: &crate::adapter::net::dataforts::blob::BlobRef,
+        ) -> Result<Vec<u8>, crate::adapter::net::dataforts::blob::BlobError> {
+            unreachable!()
+        }
+        async fn fetch_range(
+            &self,
+            _: &crate::adapter::net::dataforts::blob::BlobRef,
+            _: std::ops::Range<u64>,
+        ) -> Result<Vec<u8>, crate::adapter::net::dataforts::blob::BlobError> {
+            unreachable!()
+        }
+        async fn exists(
+            &self,
+            _: &crate::adapter::net::dataforts::blob::BlobRef,
+        ) -> Result<bool, crate::adapter::net::dataforts::blob::BlobError> {
+            unreachable!()
+        }
+        async fn prefetch(
+            &self,
+            _: &crate::adapter::net::dataforts::blob::BlobRef,
+        ) -> Result<(), crate::adapter::net::dataforts::blob::BlobError> {
+            self.prefetch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.prefetch_fail {
+                Err(crate::adapter::net::dataforts::blob::BlobError::Backend(
+                    "test failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn g1_admit_with_adapter_wired_calls_prefetch() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let adapter = Arc::new(RecorderAdapter::new());
+        let calls = adapter.prefetch_calls.clone();
+        rt.set_blob_adapter(adapter);
+        assert!(rt.blob_adapter_enabled());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, _) = encode_blob_payload_with_hash(b"prefetch me");
+        rt.dispatch_event(&cn("test/prefetch-admit"), 0xAA, &chain, &encoded)
+            .await;
+
+        // Wait for the spawned prefetch task to land (best-effort
+        // async — give it a bounded window).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if calls.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "prefetch must be called exactly once per admit"
+        );
+
+        // Wait for the ok counter to land (the spawn writes the
+        // counter after the prefetch await).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            let snap = rt.metrics().snapshot();
+            if snap.cluster.blob_prefetches_ok_total >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_prefetches_ok_total, 1);
+        assert_eq!(snap.cluster.blob_prefetches_err_total, 0);
+    }
+
+    #[tokio::test]
+    async fn g1_reject_does_not_call_prefetch() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        // Compute-only local — should_pull_blob vetoes on
+        // NoStorageCap so the prefetch must NOT fire.
+        let compute_only = CapabilitySet::new()
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=mesh")
+            .add_tag("dataforts.greedy.proximity=128");
+        rt.set_local_caps(Arc::new(compute_only));
+        let adapter = Arc::new(RecorderAdapter::new());
+        let calls = adapter.prefetch_calls.clone();
+        rt.set_blob_adapter(adapter);
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, _) = encode_blob_payload_with_hash(b"vetoed");
+        rt.dispatch_event(&cn("test/prefetch-reject"), 0xBB, &chain, &encoded)
+            .await;
+
+        // Brief settle window — confirm no prefetch task spawned.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "veto must short-circuit before the prefetch spawn"
+        );
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_pulls_rejected_no_storage_total, 1);
+        assert_eq!(snap.cluster.blob_prefetches_ok_total, 0);
+    }
+
+    #[tokio::test]
+    async fn prefetch_failure_bumps_err_counter() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let adapter = Arc::new(RecorderAdapter::with_failing_prefetch());
+        rt.set_blob_adapter(adapter);
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, _) = encode_blob_payload_with_hash(b"will fail");
+        rt.dispatch_event(&cn("test/prefetch-err"), 0xCC, &chain, &encoded)
+            .await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            let snap = rt.metrics().snapshot();
+            if snap.cluster.blob_prefetches_err_total >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let snap = rt.metrics().snapshot();
+        assert_eq!(snap.cluster.blob_prefetches_err_total, 1);
+        assert_eq!(snap.cluster.blob_prefetches_ok_total, 0);
+    }
+
+    #[tokio::test]
+    async fn g1_admit_without_adapter_does_not_panic_or_count_prefetch() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        assert!(!rt.blob_adapter_enabled());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, _) = encode_blob_payload_with_hash(b"admit but no adapter");
+        rt.dispatch_event(&cn("test/prefetch-noadapter"), 0xDD, &chain, &encoded)
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let snap = rt.metrics().snapshot();
+        // Admit still counts (decision-only path stays correct).
+        assert_eq!(snap.cluster.blob_pulls_admitted_total, 1);
+        // No prefetch counters move when no adapter is wired.
+        assert_eq!(snap.cluster.blob_prefetches_ok_total, 0);
+        assert_eq!(snap.cluster.blob_prefetches_err_total, 0);
     }
 }

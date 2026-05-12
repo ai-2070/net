@@ -32,6 +32,24 @@ use super::error::BlobError;
 /// read-ahead window.
 pub const FS_STREAM_CHUNK_BYTES: usize = 256 * 1024;
 
+/// Extract `(hash, uri)` from a [`BlobRef::Small`] for the FS
+/// adapter's per-operation entry point. The FS adapter is the
+/// bottom layer of the blob stack — it operates on single
+/// content-addressed blobs; chunking + manifest dispatch happen
+/// at the layer above (the future `MeshBlobAdapter`). A
+/// [`BlobRef::Manifest`] passed here is a layering bug; return
+/// `BlobError::Backend` rather than silently mis-interpreting it.
+fn expect_small(blob_ref: &BlobRef) -> Result<([u8; 32], &str), BlobError> {
+    match blob_ref {
+        BlobRef::Small { hash, uri, .. } => Ok((*hash, uri.as_str())),
+        BlobRef::Manifest { .. } => Err(BlobError::Backend(
+            "FileSystemAdapter operates on Small blobs only; \
+             chunked blobs are handled by the layer above"
+                .to_owned(),
+        )),
+    }
+}
+
 /// Default cap on concurrent FS adapter spawn_blocking tasks. A
 /// burst of stores against the default tokio blocking pool (512
 /// threads) would otherwise starve other blocking work in the
@@ -126,6 +144,7 @@ impl BlobAdapter for FileSystemAdapter {
     }
 
     async fn store(&self, blob_ref: &BlobRef, bytes: &[u8]) -> Result<(), BlobError> {
+        let (expected_hash, _uri) = expect_small(blob_ref)?;
         // Verify the bytes hash to the BlobRef's hash BEFORE writing.
         // Without this an adapter author (or compromised binding) can
         // pre-seed an arbitrary hash slot with attacker content; a
@@ -133,16 +152,15 @@ impl BlobAdapter for FileSystemAdapter {
         // because the on-disk path is keyed only on the hash. Hash
         // here and reject mismatches at the trust boundary.
         let computed: [u8; 32] = blake3::hash(bytes).into();
-        if computed != blob_ref.hash {
+        if computed != expected_hash {
             return Err(BlobError::HashMismatch {
-                expected: blob_ref.hash,
+                expected: expected_hash,
                 actual: computed,
             });
         }
-        let path = self.path_for(&blob_ref.hash);
+        let path = self.path_for(&expected_hash);
         let root = self.root.clone();
         let bytes = bytes.to_vec();
-        let expected_hash = blob_ref.hash;
         let _permit = self
             .concurrency
             .clone()
@@ -264,8 +282,9 @@ impl BlobAdapter for FileSystemAdapter {
     }
 
     async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
-        let path = self.path_for(&blob_ref.hash);
-        let uri = sanitize_uri_for_error(&blob_ref.uri);
+        let (hash, uri) = expect_small(blob_ref)?;
+        let path = self.path_for(&hash);
+        let uri = sanitize_uri_for_error(uri);
         let _permit = self
             .concurrency
             .clone()
@@ -310,8 +329,9 @@ impl BlobAdapter for FileSystemAdapter {
                 len
             )));
         }
-        let path = self.path_for(&blob_ref.hash);
-        let uri = sanitize_uri_for_error(&blob_ref.uri);
+        let (hash, uri) = expect_small(blob_ref)?;
+        let path = self.path_for(&hash);
+        let uri = sanitize_uri_for_error(uri);
         let start = range.start;
         let _permit = self
             .concurrency
@@ -338,7 +358,8 @@ impl BlobAdapter for FileSystemAdapter {
     }
 
     async fn exists(&self, blob_ref: &BlobRef) -> Result<bool, BlobError> {
-        let path = self.path_for(&blob_ref.hash);
+        let (hash, _uri) = expect_small(blob_ref)?;
+        let path = self.path_for(&hash);
         let permit = self
             .concurrency
             .clone()
@@ -361,8 +382,9 @@ impl BlobAdapter for FileSystemAdapter {
         // the receiver. Bounded channel keeps the read-ahead window
         // tight so a slow consumer doesn't pile up unbounded memory
         // on the producer side.
-        let path = self.path_for(&blob_ref.hash);
-        let uri = sanitize_uri_for_error(&blob_ref.uri);
+        let (hash, uri) = expect_small(blob_ref)?;
+        let path = self.path_for(&hash);
+        let uri = sanitize_uri_for_error(uri);
         // Acquire-on-spawn: the streaming task holds the permit for
         // the duration of the read, mirroring the all-in-memory
         // path's concurrency bound.
@@ -410,6 +432,76 @@ impl BlobAdapter for FileSystemAdapter {
         });
         Ok(Box::pin(stream))
     }
+
+    async fn delete(&self, blob_ref: &BlobRef) -> Result<(), BlobError> {
+        let (hash, uri) = expect_small(blob_ref)?;
+        let path = self.path_for(&hash);
+        let uri = sanitize_uri_for_error(uri);
+        let permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| backend("adapter concurrency semaphore closed"))?;
+        tokio::task::spawn_blocking(move || -> Result<(), BlobError> {
+            let _permit = permit;
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Delete-of-not-present is success — the
+                    // GC contract is "ensure absent," not "ensure
+                    // was-present-then-absent."
+                    let _ = uri;
+                    Ok(())
+                }
+                Err(e) => Err(backend(e)),
+            }
+        })
+        .await
+        .map_err(|e| backend(format!("join error: {}", e)))?
+    }
+
+    async fn stat(&self, blob_ref: &BlobRef) -> Result<super::adapter::BlobStat, BlobError> {
+        let (hash, uri) = expect_small(blob_ref)?;
+        let path = self.path_for(&hash);
+        let uri = sanitize_uri_for_error(uri);
+        let permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| backend("adapter concurrency semaphore closed"))?;
+        let advertised_size = blob_ref.size();
+        let advertised_encoding = blob_ref.encoding();
+        tokio::task::spawn_blocking(move || -> Result<super::adapter::BlobStat, BlobError> {
+            let _permit = permit;
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BlobError::NotFound(uri))
+                }
+                Err(e) => return Err(backend(e)),
+            };
+            // FS adapter doesn't participate in the substrate's
+            // `causal:` advertisement layer — replicas_observed /
+            // replica_target are zero / None. `last_seen` comes
+            // from filesystem mtime when available.
+            let last_seen_unix_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64);
+            Ok(super::adapter::BlobStat {
+                size: advertised_size.max(meta.len()),
+                replicas_observed: 0,
+                replica_target: None,
+                last_seen_unix_ms,
+                encoding: advertised_encoding,
+            })
+        })
+        .await
+        .map_err(|e| backend(format!("join error: {}", e)))?
+    }
 }
 
 #[cfg(test)]
@@ -425,7 +517,7 @@ mod tests {
 
     fn make_ref(payload: &[u8], uri: &str) -> BlobRef {
         let hash: [u8; 32] = blake3::hash(payload).into();
-        BlobRef::new(uri, hash, payload.len() as u64)
+        BlobRef::small(uri, hash, payload.len() as u64)
     }
 
     fn cleanup(root: &Path) {
@@ -450,7 +542,7 @@ mod tests {
     async fn fetch_missing_returns_not_found() {
         let root = unique_root();
         let adapter = FileSystemAdapter::new("fs-test", &root);
-        let blob = BlobRef::new("file:///ghost", [0xFF; 32], 0);
+        let blob = BlobRef::small("file:///ghost", [0xFF; 32], 0);
         let err = adapter.fetch(&blob).await.unwrap_err();
         match err {
             BlobError::NotFound(uri) => assert_eq!(uri, "file:///ghost"),
@@ -500,7 +592,7 @@ mod tests {
     async fn fetch_range_reversed_is_error() {
         let root = unique_root();
         let adapter = FileSystemAdapter::new("fs-test", &root);
-        let blob = BlobRef::new("file:///r", [0x00; 32], 10);
+        let blob = BlobRef::small("file:///r", [0x00; 32], 10);
         let err = adapter.fetch_range(&blob, 5..3).await.unwrap_err();
         assert!(matches!(err, BlobError::Backend(_)));
         cleanup(&root);
@@ -517,7 +609,7 @@ mod tests {
         let real = b"real content";
         let fake = b"fake content";
         let real_hash: [u8; 32] = blake3::hash(real).into();
-        let blob = BlobRef::new("file:///impostor", real_hash, fake.len() as u64);
+        let blob = BlobRef::small("file:///impostor", real_hash, fake.len() as u64);
         let err = adapter.store(&blob, fake).await.unwrap_err();
         match err {
             BlobError::HashMismatch { expected, actual } => {
@@ -564,7 +656,7 @@ mod tests {
 
         let payload = b"the right content";
         let hash: [u8; 32] = blake3::hash(payload).into();
-        let blob = BlobRef::new("file:///toctou", hash, payload.len() as u64);
+        let blob = BlobRef::small("file:///toctou", hash, payload.len() as u64);
 
         // Pre-poison the canonical path with garbage.
         let shard = format!("{:02x}", hash[0]);
@@ -614,7 +706,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &shard_path).unwrap();
 
         let adapter = FileSystemAdapter::new("fs-symlink", &root);
-        let blob = BlobRef::new("file:///escape", hash, payload.len() as u64);
+        let blob = BlobRef::small("file:///escape", hash, payload.len() as u64);
         let err = adapter.store(&blob, payload).await.unwrap_err();
         match err {
             BlobError::Backend(msg) => assert!(
@@ -672,7 +764,7 @@ mod tests {
         use futures::StreamExt;
         let root = unique_root();
         let adapter = FileSystemAdapter::new("fs-stream-miss", &root);
-        let blob = BlobRef::new("file:///ghost", [0xFF; 32], 0);
+        let blob = BlobRef::small("file:///ghost", [0xFF; 32], 0);
         let mut stream = adapter.fetch_stream(&blob).await.unwrap();
         let first = stream.next().await.expect("must yield NotFound chunk");
         match first {

@@ -932,6 +932,36 @@ impl CapabilitySet {
         self
     }
 
+    /// Add a typed `BlobCapability` projection. Emits the matching
+    /// `dataforts.blob.*` tags via the projection's `write_into`.
+    /// Builder-style; producer-side counterpart to
+    /// `BlobCapability::from_capability_set`. Round-tripping
+    /// through both functions returns the original projection.
+    #[cfg(feature = "dataforts")]
+    pub fn with_blob_capability(self, blob: super::dataforts_capabilities::BlobCapability) -> Self {
+        blob.write_into(self)
+    }
+
+    /// Add a typed `GreedyCapability` projection. Emits
+    /// `dataforts.greedy.*` tags.
+    #[cfg(feature = "dataforts")]
+    pub fn with_greedy_capability(
+        self,
+        greedy: super::dataforts_capabilities::GreedyCapability,
+    ) -> Self {
+        greedy.write_into(self)
+    }
+
+    /// Add a typed `GravityCapability` projection. Emits
+    /// `dataforts.gravity.*` tags.
+    #[cfg(feature = "dataforts")]
+    pub fn with_gravity_capability(
+        self,
+        gravity: super::dataforts_capabilities::GravityCapability,
+    ) -> Self {
+        gravity.write_into(self)
+    }
+
     /// Add a `scope:tenant:<id>` reserved tag, marking this
     /// announcement as advertised under the given tenant. Idempotent
     /// — repeated calls with the same id do not duplicate. Empty
@@ -2403,6 +2433,86 @@ pub struct IndexedNode {
     /// punch target's `reflex_addr` from the index instead of
     /// probing it directly.
     pub reflex_addr: Option<std::net::SocketAddr>,
+    /// Wire-form origin_hash for this node's entity: the low
+    /// 32 bits of `EntityId::origin_hash()`, zero-extended back
+    /// to `u64` so it matches the receiver-side
+    /// `NetHeader::origin_hash.into()` projection inside the
+    /// mesh dispatch path. Cached at index time so
+    /// [`CapabilityIndex::remove`] can clean up the
+    /// `by_origin_hash` side index without re-deriving the
+    /// projection (which would require either an `EntityId` clone
+    /// on every entry or a re-keying scan).
+    pub origin_hash: u64,
+}
+
+/// One entry in the `by_origin_hash` side index.
+///
+/// `Single` is the common case — exactly one indexed `node_id`
+/// claims this wire hash. `Multiple` is the truncation-collision
+/// case; lookups return `None` so admission falls back to its
+/// publisher-unknown path. The `Vec` is sized for two-element
+/// adversarial cases — a real cluster sees zero or one entry per
+/// slot, and the allocation is amortized against the collision
+/// counter bump that already accompanies the transition.
+#[derive(Debug, Clone)]
+enum OriginHashSlot {
+    Single(u64),
+    Multiple(Vec<u64>),
+}
+
+impl OriginHashSlot {
+    /// Add `node_id`. Returns `true` on the *first* transition to
+    /// ambiguous state (Single → Multiple with a distinct id), so
+    /// callers can bump the collision counter exactly once per
+    /// new collision. Idempotent on re-add of the same id.
+    fn insert(&mut self, node_id: u64) -> bool {
+        match self {
+            Self::Single(existing) => {
+                if *existing == node_id {
+                    false
+                } else {
+                    *self = Self::Multiple(vec![*existing, node_id]);
+                    true
+                }
+            }
+            Self::Multiple(ids) => {
+                if !ids.contains(&node_id) {
+                    ids.push(node_id);
+                }
+                false
+            }
+        }
+    }
+
+    /// Remove `node_id`. Returns `true` when the slot is now
+    /// empty (caller drops the map entry). Demotes Multiple to
+    /// Single when only one claimant survives.
+    fn remove(&mut self, node_id: u64) -> bool {
+        match self {
+            Self::Single(existing) => *existing == node_id,
+            Self::Multiple(ids) => {
+                ids.retain(|id| *id != node_id);
+                match ids.len() {
+                    0 => true,
+                    1 => {
+                        *self = Self::Single(ids[0]);
+                        false
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    /// Resolve to a single `node_id`, or `None` when the slot is
+    /// ambiguous. Callers treat `None` as fail-closed for any
+    /// admission decision that consults publisher caps.
+    fn unique(&self) -> Option<u64> {
+        match self {
+            Self::Single(id) => Some(*id),
+            Self::Multiple(_) => None,
+        }
+    }
 }
 
 /// High-performance capability index with inverted indexes
@@ -2437,11 +2547,58 @@ pub struct CapabilityIndex {
     /// tags (`hardware.gpu` with no value) use the sentinel
     /// empty string `""` as the inner key.
     by_axis_key: DashMap<crate::adapter::net::behavior::tag::TagKey, DashMap<String, HashSet<u64>>>,
+    /// Side index: `wire origin_hash -> set of node_ids`.
+    ///
+    /// Wire packets carry the publisher's `origin_hash` as a u32
+    /// — the low 32 bits of `EntityId::origin_hash()` (BLAKE2s
+    /// projection under `net-origin-v1`) after `with_origin`'s
+    /// `as u32` truncation in
+    /// [`NetHeader`](crate::adapter::net::protocol::NetHeader).
+    /// Every other index keys on `node_id` (a separate projection
+    /// under `net-node-v1`). Without this side index, code paths
+    /// that have a wire origin_hash in hand (e.g. the inbound
+    /// packet header) need to walk every entry looking for a
+    /// matching tag or fall back to last-hop-peer heuristics —
+    /// both fragile under multi-hop relay. Direct lookup via
+    /// [`Self::get_by_origin_hash`] is O(1).
+    ///
+    /// Key shape is `u64` (zero-extended from the wire `u32`) to
+    /// match the receiver-side `parsed.header.origin_hash.into()`
+    /// projection inside `process_local_packet`.
+    ///
+    /// ## Collision behavior — fail-closed on ambiguity
+    ///
+    /// Two distinct entities can collide on the wire u32 (birthday
+    /// paradox at ~2¹⁶ entities). The slot tracks every `node_id`
+    /// claiming a given wire hash. [`Self::get_by_origin_hash`]
+    /// returns `Some(caps)` only when exactly one `node_id` is
+    /// mapped — when two or more claim the same slot the lookup
+    /// returns `None`, the caller falls back to its
+    /// publisher-unknown path, and scope/intent/colocation
+    /// admission fails closed. A deliberately-colliding peer can
+    /// therefore *suppress* a victim's caps from the admission
+    /// surface, but **cannot impersonate them** to widen scope.
+    /// The authorization surface is unaffected either way (ACLs
+    /// key on `ChannelHash` / `node_id`, not wire `origin_hash`).
+    ///
+    /// `collision_count` below increments on every fresh
+    /// transition from one claimant to two (i.e. the first time a
+    /// slot becomes ambiguous); operators dashboard it to detect
+    /// truncation-collision attacks. A full fix to disambiguate
+    /// requires widening the wire `origin_hash` to `u64`
+    /// (wire-format break), out of scope for v0.2.
+    by_origin_hash: DashMap<u64, OriginHashSlot>,
     /// Version tracking
     versions: DashMap<u64, u64>,
     /// Stats
     index_count: AtomicU64,
     query_count: AtomicU64,
+    /// Cumulative count of wire-origin_hash collisions detected
+    /// at `index()` time — bumped when the `by_origin_hash` slot
+    /// for a wire hash is overwritten by a different `node_id`.
+    /// See the docstring on `by_origin_hash` for the DoS surface
+    /// this counter surfaces. Read via [`Self::collision_count`].
+    origin_hash_collisions: AtomicU64,
 }
 
 impl CapabilityIndex {
@@ -2456,9 +2613,11 @@ impl CapabilityIndex {
             gpu_nodes: DashMap::new(),
             by_metadata: DashMap::new(),
             by_axis_key: DashMap::new(),
+            by_origin_hash: DashMap::new(),
             versions: DashMap::new(),
             index_count: AtomicU64::new(0),
             query_count: AtomicU64::new(0),
+            origin_hash_collisions: AtomicU64::new(0),
         }
     }
 
@@ -2536,7 +2695,11 @@ impl CapabilityIndex {
         let origin_remaining = Duration::from_nanos(origin_remaining_ns);
         let effective_ttl = local_ttl.min(origin_remaining);
 
-        // Store node
+        // Store node. The wire form of `origin_hash` is the low
+        // 32 bits of the entity projection (see `with_origin`'s
+        // truncation in NetHeader); reproduce that here so the
+        // side index keys match what receivers compute.
+        let origin_hash = (ann.entity_id.origin_hash() as u32) as u64;
         let indexed = IndexedNode {
             node_id,
             capabilities: ann.capabilities,
@@ -2544,8 +2707,25 @@ impl CapabilityIndex {
             indexed_at: Instant::now(),
             ttl: effective_ttl,
             reflex_addr: ann.reflex_addr,
+            origin_hash,
         };
         self.nodes.insert(node_id, indexed);
+        // Track collisions on the side index. A fresh Single
+        // slot is the common case; the Occupied branch merges the
+        // new node_id into the existing slot, bumping the
+        // collision counter on the first transition from one
+        // claimant to two distinct ones. See the collision-
+        // behavior docstring on `by_origin_hash`.
+        match self.by_origin_hash.entry(origin_hash) {
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(OriginHashSlot::Single(node_id));
+            }
+            dashmap::mapref::entry::Entry::Occupied(mut slot) => {
+                if slot.get_mut().insert(node_id) {
+                    self.origin_hash_collisions.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
 
         self.index_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -2562,6 +2742,16 @@ impl CapabilityIndex {
         let version_entry = self.versions.entry(node_id);
         if let Some((_, node)) = self.nodes.remove(&node_id) {
             self.remove_from_indexes(node_id, &node.capabilities);
+            // Tear down this node's claim on the origin_hash slot.
+            // Other colliding claimants stay; the slot is dropped
+            // only when no node_id remains.
+            if let dashmap::mapref::entry::Entry::Occupied(mut slot) =
+                self.by_origin_hash.entry(node.origin_hash)
+            {
+                if slot.get_mut().remove(node_id) {
+                    slot.remove();
+                }
+            }
         }
         if let Entry::Occupied(e) = version_entry {
             e.remove();
@@ -3106,6 +3296,66 @@ impl CapabilityIndex {
     /// Get node capabilities
     pub fn get(&self, node_id: u64) -> Option<CapabilitySet> {
         self.nodes.get(&node_id).map(|n| n.capabilities.clone())
+    }
+
+    /// Look up a node's `CapabilitySet` by `EntityId::origin_hash()`
+    /// rather than `node_id`. Wire packets carry the publisher's
+    /// `origin_hash` (a BLAKE2s projection of the entity key under
+    /// the `net-origin-v1` domain); the index keys on `node_id`
+    /// (a separate projection under `net-node-v1`). This accessor
+    /// bridges the two via the `by_origin_hash` side index so a
+    /// packet-side caller doesn't need to walk every entry.
+    ///
+    /// Returns `None` when either:
+    ///
+    /// 1. No announcement carrying that origin_hash has reached
+    ///    this node yet.
+    /// 2. Two or more distinct `node_id`s have claimed the same
+    ///    wire `origin_hash` (a truncation collision — see the
+    ///    collision-behavior docstring on `by_origin_hash`).
+    ///
+    /// Both cases are fail-closed for scope / intent / colocation
+    /// admission: the caller cannot tell them apart and treats a
+    /// missing result as "publisher unknown."
+    pub fn get_by_origin_hash(&self, origin_hash: u64) -> Option<CapabilitySet> {
+        let node_id = {
+            let slot = self.by_origin_hash.get(&origin_hash)?;
+            slot.unique()?
+        };
+        self.get(node_id)
+    }
+
+    /// Cumulative count of wire-`origin_hash` collisions detected
+    /// at `index()` time. Bumped every time a slot transitions
+    /// from one claimant to two distinct `node_id`s — i.e. the
+    /// first time the slot becomes ambiguous. Re-asserting a
+    /// node_id that already shares the slot is idempotent and
+    /// does not bump.
+    ///
+    /// Operators monitor this counter to detect deliberate
+    /// truncation-collision attacks against the scope-axis
+    /// admission gate — see the collision-behavior docstring on
+    /// `by_origin_hash` above. A non-zero count on a production
+    /// cluster is a signal worth investigating; the collision
+    /// itself doesn't bypass authorization or impersonate the
+    /// victim's caps, but the *victim's* caps are suppressed from
+    /// `get_by_origin_hash` for the duration of the collision.
+    pub fn collision_count(&self) -> u64 {
+        self.origin_hash_collisions.load(Ordering::Relaxed)
+    }
+
+    /// `true` when two or more distinct `node_id`s currently
+    /// claim the same wire `origin_hash`. Distinct from
+    /// "publisher not yet announced" (slot vacant) — the dispatch
+    /// path uses this to fail-closed on adversarial collision
+    /// while keeping the empty-caps fallback for the benign
+    /// cap-propagation race where the publisher's announcement
+    /// just hasn't arrived yet.
+    pub fn is_origin_hash_ambiguous(&self, origin_hash: u64) -> bool {
+        self.by_origin_hash
+            .get(&origin_hash)
+            .map(|slot| slot.unique().is_none())
+            .unwrap_or(false)
     }
 
     /// Run `f` against the node's `CapabilitySet` without cloning.
@@ -5819,5 +6069,377 @@ mod tests {
             .iter()
             .any(|t| matches!(t, TagT::Reserved { prefix, body }
                 if prefix == "scope:" && body == "tenant:acme")));
+    }
+
+    // ========================================================================
+    // origin_hash side index (PR-5g)
+    // ========================================================================
+
+    /// `get_by_origin_hash` returns the indexed `CapabilitySet`
+    /// when an announcement with a matching wire-form origin_hash
+    /// has been indexed. Key shape is the low 32 bits of
+    /// `EntityId::origin_hash()` (zero-extended back to u64) so
+    /// it matches the receiver-side `NetHeader::origin_hash.into()`
+    /// projection.
+    #[test]
+    fn get_by_origin_hash_returns_indexed_caps() {
+        // Use a non-zero entity so origin_hash is non-trivial —
+        // [0; 32] derives a fixed value, but a different key
+        // exercises the index more honestly.
+        let entity = super::super::super::identity::EntityId::from_bytes([7u8; 32]);
+        let wire_origin = (entity.origin_hash() as u32) as u64;
+        let index = CapabilityIndex::new();
+        let caps = CapabilitySet::new().add_tag("test-marker");
+        index.index(CapabilityAnnouncement::new(42, entity.clone(), 1, caps));
+
+        let resolved = index
+            .get_by_origin_hash(wire_origin)
+            .expect("side index must surface the indexed caps");
+        assert!(resolved
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "test-marker")));
+    }
+
+    /// Unknown origin_hash returns `None` — fail-closed for the
+    /// caller (mesh dispatch path defaults to empty caps and
+    /// scope-axis admission rejects).
+    #[test]
+    fn get_by_origin_hash_returns_none_for_unknown_origin() {
+        let index = CapabilityIndex::new();
+        let entity = super::super::super::identity::EntityId::from_bytes([1u8; 32]);
+        index.index(CapabilityAnnouncement::new(
+            1,
+            entity,
+            1,
+            CapabilitySet::new(),
+        ));
+        // A different origin_hash that wasn't announced.
+        assert!(index.get_by_origin_hash(0xDEAD_BEEF_u64).is_none());
+    }
+
+    /// `remove` tears down the side-index mapping so a stale
+    /// lookup doesn't surface caps from an evicted node.
+    #[test]
+    fn remove_clears_origin_hash_side_index() {
+        let entity = super::super::super::identity::EntityId::from_bytes([2u8; 32]);
+        let wire_origin = (entity.origin_hash() as u32) as u64;
+        let index = CapabilityIndex::new();
+        index.index(CapabilityAnnouncement::new(
+            99,
+            entity.clone(),
+            1,
+            CapabilitySet::new().add_tag("before"),
+        ));
+        assert!(index.get_by_origin_hash(wire_origin).is_some());
+
+        index.remove(99);
+        assert!(
+            index.get_by_origin_hash(wire_origin).is_none(),
+            "side index must clean up on remove"
+        );
+    }
+
+    /// Re-indexing the same `node_id` with a newer version replaces
+    /// the side index entry; the wire origin_hash continues to
+    /// resolve to the same node_id (entity is the same), and the
+    /// surfaced caps reflect the latest announcement.
+    #[test]
+    fn reindex_replaces_caps_under_same_origin_hash() {
+        let entity = super::super::super::identity::EntityId::from_bytes([3u8; 32]);
+        let wire_origin = (entity.origin_hash() as u32) as u64;
+        let index = CapabilityIndex::new();
+        index.index(CapabilityAnnouncement::new(
+            123,
+            entity.clone(),
+            1,
+            CapabilitySet::new().add_tag("v1-marker"),
+        ));
+        index.index(CapabilityAnnouncement::new(
+            123,
+            entity,
+            2,
+            CapabilitySet::new().add_tag("v2-marker"),
+        ));
+
+        let resolved = index
+            .get_by_origin_hash(wire_origin)
+            .expect("side index must point at the freshly-indexed node");
+        assert!(resolved
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "v2-marker")));
+        // The old version's caps shouldn't surface.
+        assert!(!resolved
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "v1-marker")));
+    }
+
+    /// Brute-force two distinct `EntityId`s whose wire-form
+    /// `origin_hash` (low 32 bits of the BLAKE2s projection)
+    /// collides. Birthday paradox in a 32-bit space: ~50 %
+    /// collision probability at ~2¹⁶ = 65 k samples; in practice
+    /// a 128 k sample sweep finds one in milliseconds.
+    ///
+    /// Returns `(entity_a, entity_b, wire_origin_hash)`. Both
+    /// entities have node_ids that match their `EntityId::node_id()`
+    /// derivation — both pass `node_id == entity_id.node_id()`
+    /// inside `handle_capability_announcement` — so the colliding
+    /// wire origin_hash is a real semantic concern, not a
+    /// constructible-only edge case.
+    fn find_colliding_entities() -> (
+        super::super::super::identity::EntityId,
+        super::super::super::identity::EntityId,
+        u64,
+    ) {
+        use super::super::super::identity::EntityId;
+        use std::collections::HashMap;
+        // `EntityId::origin_hash()` runs its own BLAKE2s over the
+        // 32-byte pubkey under domain `net-origin-v1`. We just
+        // need varied 32-byte inputs to sample the u32 wire-hash
+        // space — `seed.to_le_bytes()` in the first 8 bytes
+        // (zero padding elsewhere) gives us 2^64 distinct inputs
+        // without pulling in BLAKE3 or any other hash dep. Each
+        // seed → unique EntityId → effectively-random u32 wire
+        // origin_hash (per the BLAKE2s distribution).
+        let mut seen: HashMap<u32, EntityId> = HashMap::new();
+        for seed in 0u64..1 << 20 {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&seed.to_le_bytes());
+            let entity = EntityId::from_bytes(bytes);
+            let wire = entity.origin_hash() as u32;
+            if let Some(prev) = seen.get(&wire) {
+                if prev.as_bytes() != entity.as_bytes() {
+                    return (prev.clone(), entity, wire as u64);
+                }
+            }
+            seen.insert(wire, entity);
+        }
+        panic!("no wire-origin_hash collision found in 2^20 trials — birthday paradox math says this should be effectively impossible; check the derivation");
+    }
+
+    /// **Fail-closed on wire-origin_hash collision.** Two distinct
+    /// entities whose `EntityId::origin_hash()` truncates to the
+    /// same `u32` share a `by_origin_hash` slot. Under the
+    /// `OriginHashSlot::Multiple` shape, `get_by_origin_hash`
+    /// returns `None` for the duration of the collision so
+    /// admission cannot use either entity's caps. Both entities
+    /// remain individually reachable via `get(node_id_*)`.
+    ///
+    /// This shape suppresses the *victim's* caps from the
+    /// admission surface but cannot impersonate them: a colliding
+    /// peer can deny scope-axis admit decisions for legitimate
+    /// publishers, but cannot widen them. The mesh's
+    /// authorization paths (`ChannelHash` / `node_id`) are
+    /// untouched.
+    #[test]
+    fn get_by_origin_hash_returns_none_on_truncation_collision() {
+        let (entity_a, entity_b, wire) = find_colliding_entities();
+        let node_a: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+        let node_b: u64 = 0xBBBB_BBBB_BBBB_BBBB;
+
+        let index = CapabilityIndex::new();
+        // Index A first; the slot is Single(A) and lookup resolves.
+        index.index(CapabilityAnnouncement::new(
+            node_a,
+            entity_a.clone(),
+            1,
+            CapabilitySet::new().add_tag("from-A"),
+        ));
+        let resolved_a = index
+            .get_by_origin_hash(wire)
+            .expect("A must surface via wire origin_hash before B is indexed");
+        assert!(resolved_a
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "from-A")));
+
+        // Index B with the colliding wire origin_hash.
+        index.index(CapabilityAnnouncement::new(
+            node_b,
+            entity_b.clone(),
+            1,
+            CapabilitySet::new().add_tag("from-B"),
+        ));
+
+        // Lookup is now ambiguous → None. Neither A nor B's caps
+        // surface via the side index.
+        assert!(
+            index.get_by_origin_hash(wire).is_none(),
+            "ambiguous slot must fail-closed via None — the caller treats this as publisher-unknown for admission"
+        );
+
+        // Both entities are still independently indexed under
+        // their distinct node_ids — the collision only affects
+        // the origin_hash → node_id projection.
+        let direct_a = index
+            .get(node_a)
+            .expect("A's caps must still be reachable via node_id");
+        assert!(direct_a
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "from-A")));
+        let direct_b = index
+            .get(node_b)
+            .expect("B's caps must still be reachable via node_id");
+        assert!(direct_b
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "from-B")));
+    }
+
+    /// Removing one of two colliders demotes the slot back to
+    /// `Single` and the surviving entity resolves again. The
+    /// resolved caps must be the survivor's — never stale state
+    /// from the departed claimant.
+    #[test]
+    fn remove_under_collision_demotes_slot_to_survivor() {
+        let (entity_a, entity_b, wire) = find_colliding_entities();
+        let node_a: u64 = 0x1111_1111_1111_1111;
+        let node_b: u64 = 0x2222_2222_2222_2222;
+        let index = CapabilityIndex::new();
+        index.index(CapabilityAnnouncement::new(
+            node_a,
+            entity_a,
+            1,
+            CapabilitySet::new().add_tag("a-caps"),
+        ));
+        index.index(CapabilityAnnouncement::new(
+            node_b,
+            entity_b,
+            1,
+            CapabilitySet::new().add_tag("b-caps"),
+        ));
+        // While both are indexed the slot is ambiguous.
+        assert!(
+            index.get_by_origin_hash(wire).is_none(),
+            "both colliders indexed → ambiguous"
+        );
+
+        // Remove A — slot demotes to Single(B), lookup resolves to B.
+        index.remove(node_a);
+        let after = index
+            .get_by_origin_hash(wire)
+            .expect("survivor (B) must resolve after collider A is removed");
+        assert!(after
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "b-caps")));
+        // Sanity: A's stale caps must NOT surface.
+        assert!(
+            !after
+                .tags
+                .iter()
+                .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "a-caps")),
+            "stale collider caps must not leak after remove"
+        );
+
+        // Remove B too — slot disappears entirely.
+        index.remove(node_b);
+        assert!(
+            index.get_by_origin_hash(wire).is_none(),
+            "slot drops when no claimants remain"
+        );
+    }
+
+    /// Indexing two distinct entities at the same wire
+    /// `origin_hash` bumps `collision_count` exactly once. The
+    /// counter measures *new* ambiguity events; re-asserting a
+    /// node_id that already claims the slot is idempotent.
+    #[test]
+    fn collision_count_bumps_once_per_new_ambiguity_event() {
+        let (entity_a, entity_b, _wire) = find_colliding_entities();
+        let index = CapabilityIndex::new();
+        assert_eq!(index.collision_count(), 0, "counter starts at zero");
+        index.index(CapabilityAnnouncement::new(
+            0xAAAA,
+            entity_a,
+            1,
+            CapabilitySet::new().add_tag("a-caps"),
+        ));
+        assert_eq!(
+            index.collision_count(),
+            0,
+            "first indexing of a fresh wire-hash slot is not a collision"
+        );
+        index.index(CapabilityAnnouncement::new(
+            0xBBBB,
+            entity_b,
+            1,
+            CapabilitySet::new().add_tag("b-caps"),
+        ));
+        assert_eq!(
+            index.collision_count(),
+            1,
+            "Single → Multiple transition with a distinct node_id bumps once"
+        );
+
+        // Re-asserting the SAME node_id (A) does not introduce
+        // new ambiguity; the slot already holds {A, B}. Counter
+        // stays at 1.
+        let (entity_a2, _, _) = find_colliding_entities();
+        index.index(CapabilityAnnouncement::new(
+            0xAAAA,
+            entity_a2,
+            2,
+            CapabilitySet::new().add_tag("a-caps-v2"),
+        ));
+        assert_eq!(
+            index.collision_count(),
+            1,
+            "re-asserting an existing claimant must not bump the counter"
+        );
+    }
+
+    /// Pinning the security boundary: the dispatch-side admission
+    /// surface uses `get_by_origin_hash` to resolve the publisher
+    /// of an inbound event. When the wire origin_hash is
+    /// ambiguous, the lookup must return None so the caller skips
+    /// the admission gate entirely — admitting via either
+    /// claimant's caps (or via the default `Mesh` scope of an
+    /// empty `CapabilitySet`) would be a privilege-escalation
+    /// surface for a colliding attacker.
+    #[test]
+    fn admission_lookup_is_fail_closed_under_collision() {
+        let (entity_a, entity_b, wire) = find_colliding_entities();
+        let node_a: u64 = 0xA0A0_A0A0_A0A0_A0A0;
+        let node_b: u64 = 0xB0B0_B0B0_B0B0_B0B0;
+        let index = CapabilityIndex::new();
+
+        // A claims a narrow scope (Zone). B claims a wide scope
+        // (Mesh). Under the prior last-writer-wins semantics, B
+        // overwrites A's slot and a victim's narrow-scope claim
+        // is laundered into a Mesh claim — admission would admit
+        // mesh-wide pulls under A's wire hash.
+        index.index(CapabilityAnnouncement::new(
+            node_a,
+            entity_a,
+            1,
+            CapabilitySet::new()
+                .add_tag("a-publisher")
+                .add_tag("dataforts.greedy.scope=zone"),
+        ));
+        index.index(CapabilityAnnouncement::new(
+            node_b,
+            entity_b,
+            1,
+            CapabilitySet::new()
+                .add_tag("b-publisher")
+                .add_tag("dataforts.greedy.scope=mesh"),
+        ));
+
+        // The fail-closed contract: lookup returns None. Caller
+        // (mesh dispatch) treats this as publisher-unknown and
+        // skips the greedy admission entirely.
+        assert!(
+            index.get_by_origin_hash(wire).is_none(),
+            "ambiguous publisher caps must NOT resolve through the admission lookup"
+        );
+        assert_eq!(
+            index.collision_count(),
+            1,
+            "collision counter records the ambiguity event for operator observability"
+        );
     }
 }

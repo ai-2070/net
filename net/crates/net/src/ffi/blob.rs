@@ -56,6 +56,11 @@ pub const NET_ERR_BLOB_ADAPTER_NOT_REGISTERED: c_int = -119;
 /// across the FFI boundary (which is undefined behaviour for the
 /// C / cgo / Python callers).
 pub const NET_ERR_BLOB_PANIC: c_int = -117;
+/// Auth gate rejected the blob op: AuthGuard ACL miss, or no
+/// guard configured for an op that requires one. Distinct from
+/// `NET_ERR_BLOB_BACKEND` so bindings can route 401-style hits
+/// without parsing the error string.
+pub const NET_ERR_BLOB_UNAUTHORIZED: c_int = -120;
 
 fn runtime() -> &'static Arc<Runtime> {
     use std::sync::OnceLock;
@@ -100,6 +105,7 @@ fn err_to_code(e: &InnerBlobError) -> c_int {
         InnerBlobError::Decode(_) => NET_ERR_BLOB_DECODE,
         InnerBlobError::AdapterNotConfigured => NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED,
         InnerBlobError::AdapterNotRegistered(_) => NET_ERR_BLOB_ADAPTER_NOT_REGISTERED,
+        InnerBlobError::Unauthorized(_) => NET_ERR_BLOB_UNAUTHORIZED,
     }
 }
 
@@ -469,6 +475,28 @@ fn code_to_err(code: c_int, label: &str) -> InnerBlobError {
     }
 }
 
+/// Extract `(uri, hash, size)` from a [`BlobRef::Small`] for an FFI
+/// vtable call. The C vtable signature only supports single-hash
+/// blobs; chunked dispatch happens at the substrate's
+/// `MeshBlobAdapter` layer above this FFI shim. A
+/// [`BlobRef::Manifest`] passed here is a layering bug; surface
+/// `InnerBlobError::Backend` rather than silently truncating to the
+/// first chunk.
+fn expect_small_for_ffi(
+    blob_ref: &crate::adapter::net::dataforts::BlobRef,
+) -> std::result::Result<(String, [u8; 32], u64), InnerBlobError> {
+    match blob_ref {
+        crate::adapter::net::dataforts::BlobRef::Small {
+            uri, hash, size, ..
+        } => Ok((uri.clone(), *hash, *size)),
+        crate::adapter::net::dataforts::BlobRef::Manifest { .. } => Err(InnerBlobError::Backend(
+            "CallbackBlobAdapter operates on Small blobs only; \
+                 chunked blobs are dispatched at the substrate above"
+                .to_owned(),
+        )),
+    }
+}
+
 #[async_trait]
 impl BlobAdapter for CallbackBlobAdapter {
     fn adapter_id(&self) -> &str {
@@ -482,12 +510,11 @@ impl BlobAdapter for CallbackBlobAdapter {
     ) -> std::result::Result<(), InnerBlobError> {
         let vtable = self.vtable;
         let ctx = self.ctx.clone();
-        let uri = match std::ffi::CString::new(blob_ref.uri.clone()) {
+        let (uri_str, hash, size) = expect_small_for_ffi(blob_ref)?;
+        let uri = match std::ffi::CString::new(uri_str) {
             Ok(c) => c,
             Err(e) => return Err(InnerBlobError::Backend(format!("uri NUL: {}", e))),
         };
-        let hash = blob_ref.hash;
-        let size = blob_ref.size;
         let data = bytes.to_vec();
         tokio::task::spawn_blocking(move || -> std::result::Result<(), InnerBlobError> {
             let code = unsafe {
@@ -516,12 +543,11 @@ impl BlobAdapter for CallbackBlobAdapter {
     ) -> std::result::Result<Vec<u8>, InnerBlobError> {
         let vtable = self.vtable;
         let ctx = self.ctx.clone();
-        let uri = match std::ffi::CString::new(blob_ref.uri.clone()) {
+        let (uri_str, hash, size) = expect_small_for_ffi(blob_ref)?;
+        let uri = match std::ffi::CString::new(uri_str) {
             Ok(c) => c,
             Err(e) => return Err(InnerBlobError::Backend(format!("uri NUL: {}", e))),
         };
-        let hash = blob_ref.hash;
-        let size = blob_ref.size;
         tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, InnerBlobError> {
             let mut out_data: *mut u8 = ptr::null_mut();
             let mut out_len: usize = 0;
@@ -563,12 +589,11 @@ impl BlobAdapter for CallbackBlobAdapter {
     ) -> std::result::Result<Vec<u8>, InnerBlobError> {
         let vtable = self.vtable;
         let ctx = self.ctx.clone();
-        let uri = match std::ffi::CString::new(blob_ref.uri.clone()) {
+        let (uri_str, hash, size) = expect_small_for_ffi(blob_ref)?;
+        let uri = match std::ffi::CString::new(uri_str) {
             Ok(c) => c,
             Err(e) => return Err(InnerBlobError::Backend(format!("uri NUL: {}", e))),
         };
-        let hash = blob_ref.hash;
-        let size = blob_ref.size;
         let start = range.start;
         let end = range.end;
         tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, InnerBlobError> {
@@ -611,12 +636,11 @@ impl BlobAdapter for CallbackBlobAdapter {
     ) -> std::result::Result<bool, InnerBlobError> {
         let vtable = self.vtable;
         let ctx = self.ctx.clone();
-        let uri = match std::ffi::CString::new(blob_ref.uri.clone()) {
+        let (uri_str, hash, size) = expect_small_for_ffi(blob_ref)?;
+        let uri = match std::ffi::CString::new(uri_str) {
             Ok(c) => c,
             Err(e) => return Err(InnerBlobError::Backend(format!("uri NUL: {}", e))),
         };
-        let hash = blob_ref.hash;
-        let size = blob_ref.size;
         tokio::task::spawn_blocking(move || -> std::result::Result<bool, InnerBlobError> {
             let mut out_exists: c_int = 0;
             let code = unsafe {
