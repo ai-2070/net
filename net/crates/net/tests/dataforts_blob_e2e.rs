@@ -642,3 +642,242 @@ async fn handshake_no_start(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
     a.connect(b_addr, &b_pub, b_id).await.expect("connect");
     accept.await.expect("accept task").expect("accept");
 }
+
+// ============================================================================
+// Active-overflow wire integration (P3)
+//
+// The full overflow loop is sender-tick → controller picks coldest →
+// `send_overflow_push` → receiver's nRPC handler runs admission →
+// receiver opens chunk channel → bytes pull via the existing
+// replication runtime. Tests below exercise the *wire* slice (nudge +
+// admission + ack); the controller / tick driver is unit-tested in
+// the `dataforts::blob::overflow` module, and chunk-replication is
+// already covered by `mesh_blob_prefetch_replicates_chunks_from_peer`
+// above.
+// ============================================================================
+
+#[cfg(feature = "cortex")]
+fn overflow_enabled_caps(disk_free_gb: u64) -> CapabilitySet {
+    // Local caps for an overflow-participating node: storage
+    // + overflow opt-in + headroom + mesh-wide gravity scope.
+    // Mirrors the unit-test fixtures in
+    // `dataforts::blob::overflow::tests`.
+    BlobCapability {
+        storage: true,
+        disk_total_gb: 100,
+        disk_free_gb,
+        overflow_enabled: true,
+    }
+    .write_into(
+        GravityCapability {
+            enabled: true,
+            scope: TopologyScope::Mesh,
+            proximity: 128,
+        }
+        .write_into(CapabilitySet::new()),
+    )
+}
+
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overflow_push_nudge_round_trips_through_mesh_rpc() {
+    // Sender A nudges receiver B over the active-overflow nRPC.
+    // Both nodes carry the `dataforts.blob.overflow` capability
+    // tag + matching gravity scope; A's caps reach B via the
+    // standard gossip path. B registers `serve_overflow_push`
+    // pointing at a real `MeshBlobAdapter`; A calls
+    // `send_overflow_push`. The ack proves: postcard encode
+    // works, nRPC dispatch reaches B, B's admission ran and
+    // returned Admit, B's `adapter.prefetch` opened the chunk
+    // channel without erroring, the typed ack encode came back
+    // through the same path.
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    let redex_a = Arc::new(Redex::new());
+    let redex_b = Arc::new(Redex::new());
+    redex_a.enable_replication(node_a.clone());
+    redex_b.enable_replication(node_b.clone());
+
+    let a_id = node_a.node_id();
+    let b_id = node_b.node_id();
+    let rep_cfg =
+        ReplicationConfig::new().with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]));
+
+    let adapter_b =
+        Arc::new(MeshBlobAdapter::new("mesh-b", redex_b.clone()).with_replication(rep_cfg.clone()));
+
+    // Both nodes advertise overflow-participating caps. The
+    // admission gate reads from `user_caps_snapshot` on B and
+    // from the capability index for the sender — both must be
+    // populated.
+    node_a
+        .announce_capabilities(overflow_enabled_caps(80))
+        .await
+        .expect("A announce");
+    node_b
+        .announce_capabilities(overflow_enabled_caps(90))
+        .await
+        .expect("B announce");
+
+    // Receiver registers the overflow-push handler. The
+    // ServeHandle drops when the test ends, deregistering the
+    // handler automatically.
+    let _handle = node_b
+        .serve_overflow_push(Arc::clone(&adapter_b))
+        .expect("serve overflow push");
+
+    // Wait for gossip to settle so A's caps land in B's
+    // capability index (B's admission needs to see A's
+    // `dataforts.blob.overflow` tag). The
+    // `with_min_announce_interval(10ms)` in `test_config`
+    // makes this fast; 500ms is generous.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < deadline {
+        let caps = node_b.capability_index_arc().get(a_id).unwrap_or_default();
+        let blob = BlobCapability::from_capability_set(&caps);
+        if blob.overflow_enabled {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Fire the nudge. A 1 KiB blob — well under B's
+    // advertised disk-free.
+    let hash: [u8; 32] = blake3::hash(b"overflow-push-test-payload").into();
+    let ack = node_a
+        .send_overflow_push(b_id, hash, 1024)
+        .await
+        .expect("send overflow push");
+
+    use net::adapter::net::dataforts::blob::overflow::OverflowPushAck;
+    assert_eq!(
+        ack,
+        OverflowPushAck::Accepted,
+        "B must accept the nudge; got {:?}",
+        ack
+    );
+}
+
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overflow_push_rejected_when_receiver_not_participating() {
+    // Receiver B has storage + gravity but did NOT opt into
+    // overflow. A's nudge round-trips but B returns
+    // `Rejected(NotParticipating)`. Proves the rejection path
+    // also rides the wire correctly.
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    let redex_b = Arc::new(Redex::new());
+    redex_b.enable_replication(node_b.clone());
+
+    let adapter_b = Arc::new(MeshBlobAdapter::new("mesh-b", redex_b.clone()));
+
+    // A opts in; B does NOT.
+    node_a
+        .announce_capabilities(overflow_enabled_caps(80))
+        .await
+        .expect("A announce");
+
+    // B's caps: storage + gravity, but NO overflow tag.
+    let b_caps = BlobCapability::storage_participating(100, 90).write_into(
+        GravityCapability {
+            enabled: true,
+            scope: TopologyScope::Mesh,
+            proximity: 128,
+        }
+        .write_into(CapabilitySet::new()),
+    );
+    node_b
+        .announce_capabilities(b_caps)
+        .await
+        .expect("B announce");
+
+    let _handle = node_b
+        .serve_overflow_push(Arc::clone(&adapter_b))
+        .expect("serve overflow push");
+
+    // Wait for A's caps to propagate to B (admission reads
+    // sender_caps from B's index).
+    let a_id = node_a.node_id();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < deadline {
+        let caps = node_b.capability_index_arc().get(a_id).unwrap_or_default();
+        let blob = BlobCapability::from_capability_set(&caps);
+        if blob.overflow_enabled {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let hash: [u8; 32] = blake3::hash(b"overflow-rejected-test").into();
+    let ack = node_a
+        .send_overflow_push(node_b.node_id(), hash, 1024)
+        .await
+        .expect("send overflow push");
+
+    use net::adapter::net::dataforts::blob::admission::OverflowReject;
+    use net::adapter::net::dataforts::blob::overflow::OverflowPushAck;
+    assert_eq!(
+        ack,
+        OverflowPushAck::Rejected(OverflowReject::NotParticipating),
+        "B must reject NotParticipating; got {:?}",
+        ack
+    );
+}
+
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn announce_blob_overflow_state_syncs_local_caps_with_adapter_toggle() {
+    // `MeshNode::announce_blob_overflow_state` reads the
+    // adapter's current `overflow_enabled` boolean and pushes
+    // a cap-set rebroadcast that matches. Operators who flip
+    // `set_overflow_enabled` use this helper instead of
+    // hand-rolling the snapshot + tag mutation + announce
+    // sequence. Regression: prior to the helper, peers would
+    // see stale caps after a toggle and the sender's tick
+    // self-check would short-circuit.
+    let node = build_node().await;
+    let adapter = Arc::new(MeshBlobAdapter::new("mesh-toggle", Arc::new(Redex::new())));
+
+    // Seed local caps with overflow OFF (the adapter default).
+    node.announce_capabilities(
+        BlobCapability::storage_participating(100, 80).write_into(
+            GravityCapability {
+                enabled: true,
+                scope: TopologyScope::Mesh,
+                proximity: 128,
+            }
+            .write_into(CapabilitySet::new()),
+        ),
+    )
+    .await
+    .expect("seed caps");
+
+    // Flip the adapter's master switch ON, then sync. The
+    // helper must rewrite local caps so subsequent reads
+    // observe the `dataforts.blob.overflow` tag.
+    adapter.set_overflow_enabled(true);
+    node.announce_blob_overflow_state(&adapter)
+        .await
+        .expect("sync caps after on");
+    let live = node.capability_index_arc().get(node.node_id()).unwrap();
+    assert!(
+        BlobCapability::from_capability_set(&live).overflow_enabled,
+        "after sync(on), local caps must carry the overflow tag"
+    );
+
+    // Flip back OFF. The helper must clear the tag.
+    adapter.set_overflow_enabled(false);
+    node.announce_blob_overflow_state(&adapter)
+        .await
+        .expect("sync caps after off");
+    let live = node.capability_index_arc().get(node.node_id()).unwrap();
+    assert!(
+        !BlobCapability::from_capability_set(&live).overflow_enabled,
+        "after sync(off), local caps must NOT carry the overflow tag"
+    );
+}

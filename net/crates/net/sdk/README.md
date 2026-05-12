@@ -1014,10 +1014,15 @@ redex.enable_gravity_for_greedy(mesh.clone(), DataGravityPolicy::default())?;
 // Phase 3 v0.2 — substrate-owned blob CAS. Share a `BlobHeatRegistry`
 // between the adapter's fetch-path bumps + the gravity tick.
 let blob_heat = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
-let blob_adapter: Arc<dyn BlobAdapter> = Arc::new(
-    MeshBlobAdapter::new("mesh-local", redex.clone())
-        .with_blob_heat(blob_heat.clone(), DEFAULT_BLOB_HEAT_HALF_LIFE),
-);
+let mesh_adapter = MeshBlobAdapter::new("mesh-local", redex.clone())
+    .with_blob_heat(blob_heat.clone(), DEFAULT_BLOB_HEAT_HALF_LIFE);
+
+// Phase 3.5 / v0.3 — opt this node into active blob overflow. Off
+// by default; one bool flips it on. Operators dashboard via the
+// adapter's Prometheus body (`dataforts_blob_overflow_*` family).
+// mesh_adapter.set_overflow_enabled(true);
+
+let blob_adapter: Arc<dyn BlobAdapter> = Arc::new(mesh_adapter);
 
 // Greedy acts on G-1 admit verdicts by spawning `adapter.prefetch`.
 if let Some(runtime) = redex.greedy_runtime() {
@@ -1025,6 +1030,46 @@ if let Some(runtime) = redex.greedy_runtime() {
 }
 # Ok(()) }
 ```
+
+### Phase 3.5 — Active blob overflow (v0.3)
+
+Push-side complement of the pull-driven gravity migration.
+Disabled by default; opt in with `MeshBlobAdapter::with_overflow(...)`
+at construction or `set_overflow_enabled(true)` at runtime.
+When active, a node above the configured high-water disk ratio
+walks its `BlobHeatRegistry` coldest-first + pushes to overflow-
+enabled peers via the `MeshNode::send_overflow_push` nRPC.
+
+```rust,no_run
+# #[cfg(feature = "dataforts")]
+# async fn example(redex: std::sync::Arc<net::adapter::net::Redex>,
+#                  mesh: std::sync::Arc<net::adapter::net::MeshNode>)
+# -> Result<(), Box<dyn std::error::Error>> {
+use net::adapter::net::behavior::TopologyScope;
+use net::adapter::net::dataforts::{MeshBlobAdapter, OverflowConfig};
+
+// Construction-time, with typed tunables. Every field defaulted
+// via `..Default::default()` — only override what you care about.
+let adapter = MeshBlobAdapter::new("mesh-prod", redex.clone())
+    .with_overflow(OverflowConfig {
+        enabled: true,
+        high_water_ratio: 0.80,
+        low_water_ratio: 0.65,
+        max_pushes_per_tick: 8,
+        scope: TopologyScope::Zone,
+        tick_interval_ms: 30_000,
+    });
+
+// Receiver side: register the inbound push handler. Drop the
+// ServeHandle to deregister.
+let _handle = mesh.serve_overflow_push(std::sync::Arc::new(adapter))?;
+# Ok(()) }
+```
+
+Operators dashboard via the new `dataforts_blob_overflow_*`
+counter family in the adapter's `prometheus_text()` body
+(see the [release notes](../docs/releases/RELEASE_v0.15_REBEL_YELL.md#active-blob-overflow-phase-35--v03-blob-track)
+for the full metric list). CLI: `net-blob overflow status`.
 
 The canonical `ChannelHash` is `u32` substrate-wide for ACL / config
 / storage / RYW; the per-packet wire `NetHeader::channel_hash` stays

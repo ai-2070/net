@@ -4487,9 +4487,16 @@ impl MeshNode {
     }
 
     /// Capability index — accessor for `mesh_rpc::Mesh::find_service_nodes`
-    /// to query nodes carrying the `nrpc:<service>` tag.
+    /// to query nodes carrying the `nrpc:<service>` tag, plus
+    /// the dataforts-blob overflow handler (which reads sender
+    /// caps from this index on each inbound push) and operator
+    /// dashboards that want to inspect the live capability
+    /// view. The returned `Arc<CapabilityIndex>` exposes
+    /// read-only query methods (`get`, `query`, `all_nodes`);
+    /// the index is internally synchronized so concurrent reads
+    /// + the announce-driven writer don't tear.
     #[cfg(feature = "cortex")]
-    pub(super) fn capability_index_arc(
+    pub fn capability_index_arc(
         &self,
     ) -> Arc<crate::adapter::net::behavior::capability::CapabilityIndex> {
         self.capability_index.clone()
@@ -6645,7 +6652,12 @@ impl MeshNode {
     /// empty `CapabilitySet` when no `announce_capabilities` has
     /// landed yet. Returns an owned snapshot — callers mutate the
     /// snapshot and re-announce.
-    fn user_caps_snapshot(&self) -> CapabilitySet {
+    ///
+    /// `pub(crate)` so the dataforts-blob overflow handler can
+    /// read live local caps inside the inbound nRPC path — the
+    /// admission gate observes the *current* `overflow_enabled`
+    /// state on every push, not a build-time snapshot.
+    pub(crate) fn user_caps_snapshot(&self) -> CapabilitySet {
         self.user_caps.read().clone().unwrap_or_default()
     }
 
@@ -6886,6 +6898,131 @@ impl super::dataforts::BlobHeatSink for MeshNode {
         updates: &[([u8; 32], Option<f64>)],
     ) -> Result<(), AdapterError> {
         MeshNode::announce_blob_heat_batch(self, updates).await
+    }
+}
+
+#[cfg(all(feature = "dataforts", feature = "cortex"))]
+impl MeshNode {
+    /// Send an overflow push nudge to `target_node_id`. The
+    /// chunk bytes themselves don't ride this RPC — the
+    /// nudge tells the receiver to open the chunk channel
+    /// against its local Redex with replication armed; the
+    /// existing per-chunk replication runtime pulls the
+    /// bytes from any holder advertising `causal:<hash>`
+    /// (typically this node, since we're shedding it).
+    ///
+    /// `Ok(OverflowPushAck::Accepted)` means the receiver
+    /// accepted + opened the chunk channel. The sender still
+    /// has to observe the durability watermark (the target's
+    /// `causal:<hash>` advertisement) before deleting the
+    /// local copy — that's the safe-delete gate. Per the
+    /// overflow plan, this two-phase pattern lets a failed
+    /// open on the receive side (network blip during chunk
+    /// pull) keep the bytes alive on the sender.
+    ///
+    /// Maps non-`Ok` results to typed [`BlobError`] so the
+    /// controller's `push_errors` counter bumps uniformly.
+    /// See [`super::dataforts::blob::overflow::OverflowPushAck`]
+    /// for the variant breakdown.
+    ///
+    /// [`BlobError`]: super::dataforts::blob::BlobError
+    pub async fn send_overflow_push(
+        self: &Arc<Self>,
+        target_node_id: u64,
+        blob_hash: [u8; 32],
+        size_bytes: u64,
+    ) -> Result<super::dataforts::blob::overflow::OverflowPushAck, super::dataforts::blob::BlobError>
+    {
+        use super::dataforts::blob::overflow::{
+            OverflowPush, OverflowPushAck, OVERFLOW_PUSH_SERVICE,
+        };
+        use super::dataforts::blob::BlobError;
+
+        let request = OverflowPush {
+            blob_hash,
+            size_bytes,
+            sender_node_id: self.node_id(),
+        };
+        let body = postcard::to_allocvec(&request)
+            .map_err(|e| BlobError::Backend(format!("overflow push: encode failed: {e}")))?;
+        let reply = self
+            .call(
+                target_node_id,
+                OVERFLOW_PUSH_SERVICE,
+                bytes::Bytes::from(body),
+                super::mesh_rpc::CallOptions::default(),
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("overflow push: RPC failed: {e}")))?;
+        let ack: OverflowPushAck = postcard::from_bytes(&reply.body)
+            .map_err(|e| BlobError::Backend(format!("overflow push: decode ack failed: {e}")))?;
+        Ok(ack)
+    }
+
+    /// Register the receive-side overflow-push handler on
+    /// this node. The handler reads live local caps + the
+    /// capability index on each request, runs admission,
+    /// and on Admit opens the chunk channel against
+    /// `adapter` via [`super::dataforts::blob::adapter::BlobAdapter::prefetch`].
+    ///
+    /// Returns the [`super::mesh_rpc::ServeHandle`] the
+    /// operator drops to deregister the handler. Multiple
+    /// calls on the same node would conflict on the service
+    /// name; the second call returns
+    /// [`super::mesh_rpc::ServeError::AlreadyServing`].
+    pub fn serve_overflow_push(
+        self: &Arc<Self>,
+        adapter: Arc<super::dataforts::blob::MeshBlobAdapter>,
+    ) -> Result<super::mesh_rpc::ServeHandle, super::mesh_rpc::ServeError> {
+        use super::dataforts::blob::overflow::{OverflowPushHandler, OVERFLOW_PUSH_SERVICE};
+        let handler = Arc::new(OverflowPushHandler::new(Arc::clone(self), adapter));
+        self.serve_rpc(OVERFLOW_PUSH_SERVICE, handler)
+    }
+
+    /// Rebroadcast the local capability set with the
+    /// `dataforts.blob.overflow` tag set to match `adapter`'s
+    /// current `overflow_enabled()` state. Convenience for
+    /// operators who flip [`super::dataforts::blob::MeshBlobAdapter::set_overflow_enabled`]
+    /// at runtime: the boolean lives on the adapter, but the
+    /// capability index reads from this node's announced caps,
+    /// so peers only observe the change after the next
+    /// announce. Without this helper, every toggle path needs a
+    /// matching `announce_capabilities` call — easy to forget,
+    /// and the symptom (sender keeps round-tripping pushes that
+    /// reject `SenderNotOverflowing`) is non-obvious.
+    ///
+    /// Snapshots the current user caps, sets / clears the
+    /// presence tag based on `adapter.overflow_enabled()`, and
+    /// announces the updated set. Returns the
+    /// [`AdapterError`] from the inner `announce_capabilities`
+    /// if the announce fails (rate-limited, transport down,
+    /// etc.).
+    pub async fn announce_blob_overflow_state(
+        &self,
+        adapter: &super::dataforts::blob::MeshBlobAdapter,
+    ) -> Result<(), super::AdapterError> {
+        use super::behavior::{BlobCapability, Tag, TaxonomyAxis};
+        let mut caps = self.user_caps_snapshot();
+        let enabled = adapter.overflow_enabled();
+        let present = BlobCapability::from_capability_set(&caps).overflow_enabled;
+        if enabled == present {
+            // Snapshot already matches the adapter's runtime
+            // state — nothing to broadcast. Still re-announce
+            // to push any caller-supplied caps that may have
+            // landed via a different path; cheap (rate-limited
+            // upstream).
+            return self.announce_capabilities(caps).await;
+        }
+        let target = Tag::AxisPresent {
+            axis: TaxonomyAxis::Dataforts,
+            key: "blob.overflow".to_string(),
+        };
+        if enabled {
+            caps.tags.insert(target);
+        } else {
+            caps.tags.remove(&target);
+        }
+        self.announce_capabilities(caps).await
     }
 }
 

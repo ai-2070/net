@@ -1,17 +1,34 @@
-# Dataforts Blob Storage — Overflow extension (v0.3)
+# Dataforts Blob Storage — Active overflow extension (v0.3 blob track, shipped in v0.15)
 
 > Companion to [`DATAFORTS_BLOB_STORAGE_PLAN.md`](DATAFORTS_BLOB_STORAGE_PLAN.md). v0.2 mesh-native blob storage is intentionally pull-only — when a node's local disk crosses the unhealthy threshold, it advertises `dataforts:blob-storage-unhealthy` and other nodes' admission rejects inbound migrations. The local node never *pushes* its own blobs elsewhere; under sustained saturation a node either reclaims via GC or stops accepting new bytes. This document specifies the **active overflow** track that closes the loop: when a node fills up, it picks coldest blobs by inverse blob-heat and pushes them to peers that have free disk and have opted into receiving overflow.
 
 ## Status
 
-**Draft v0.1.** Targets Rebel Yell v0.3. No commits landed yet; this document is the scope-locking step before implementation begins. Hard prerequisites all shipped in v0.15:
+**Shipped in v0.15 — "Rebel Yell"** (2026-05-12). P1..P5 landed on the `dataforts-overflow` branch and merge into the v0.15 release alongside the mesh-native blob v0.2 track. Feature-complete: pure-logic admission + controller + tick + wire integration + Prometheus + CLI + Python binding. Hard prerequisites all also shipped in v0.15:
 
 - **`MeshBlobAdapter`** + chunked storage + refcount + GC (PR-5a..PR-5r).
 - **`BlobHeatRegistry`** — per-chunk heat counters with half-life decay (PR-5j-a/b).
 - **`CapabilityIndex` + `BlobCapability`** — disk-free / scope / health capability tags (PR-5k).
 - **Gravity migration controller** — proves the pull-side decision shape; the push side is its near-mirror (PR-5j-d, PR-5o).
 
-No backward-compat constraints: overflow is a new opt-in surface, disabled by default. Existing v0.2 deployments are unaffected. Enabling overflow on a node that hasn't enabled gravity / blob storage is a typed error at setter time.
+No backward-compat constraints: overflow is a new opt-in surface, disabled by default. Existing v0.2 deployments are unaffected. Enabling overflow on a node that hasn't enabled gravity / blob storage rejects with `OverflowReject::NoStorageCap` at admission time.
+
+### Shipping status
+
+| PR     | Commit       | Scope shipped                                                                                                   |
+|--------|--------------|-----------------------------------------------------------------------------------------------------------------|
+| P1     | `c55568a6`   | Pure-logic admission (`should_accept_overflow_from` + `OverflowVerdict` + `OverflowReject`) + `OverflowConfig` + `BlobCapability::overflow_enabled` field + `dataforts.blob.overflow` reserved tag + `MeshBlobAdapter::{with_overflow, set_overflow_enabled, overflow_enabled, overflow_config, set_overflow_config}`. 17 T-1 tests. |
+| P2     | `b87f4129`   | `BlobOverflowController` + `BlobOverflowTickReport` + `step_overflow_hysteresis` + `OverflowPushSink` trait + `drive_blob_overflow_tick` + `MeshBlobAdapter.overflow_active` hysteresis state. 20 T-1/T-2 tests. |
+| P3     | `8fbfa4fb`   | Wire types `OverflowPush` / `OverflowPushAck` + `OVERFLOW_PUSH_SERVICE` constant + `OverflowPushHandler` (`handle` + `RpcHandler` impl) + `MeshNode::{send_overflow_push, serve_overflow_push}` + `MeshNodeOverflowPushSink`. 7 wire + 2-node integration tests. |
+| P4     | `be6448d0`   | Prometheus counter family (`dataforts_blob_overflow_*` — admitted / errors / 6-label per-reason rejected / hysteresis transitions / active gauge / disk_ratio) + `BlobMetrics::{record_overflow_tick, record_overflow_reject}` + `MeshBlobAdapter::drive_overflow_tick` convenience + `net-blob overflow status` CLI subcommand + `OverflowTickContext` / `OverflowTickObservation` arg-bundling structs. 10 T-2 tests. |
+| P5     | (this PR)    | Python binding — `MeshBlobAdapter(redex, "id", overflow=...)` kwarg (bool or dict) + `.overflow_enabled` / `.overflow_active` / `.overflow_config` properties + `.set_overflow_enabled(bool)` + `.set_overflow_config(dict)` runtime setters. Typed-error path for unknown dict keys + invalid scope tokens. 12 pytest tests. |
+
+### Still deferred — items that warrant their own design step
+
+- **Durability watermark observation.** The plan calls for a sender-side helper (`MeshNode::wait_for_overflow_durability`) that polls the capability index for `causal:<hash>` advertisement before the sender drops its local copy. P3 + P4 ship the push side without the durability gate; the sender's "safe to delete" decision is currently implicit (rely on refcount + retention floor). A future P6 wires the explicit watermark observation + the configurable durability timeout.
+- **Node + Go bindings.** Python shipped first (the project's primary FFI consumer). Node + Go follow the same per-binding cadence as the v0.2 blob track (per the parent plan's deferred-binding posture); each binding's surface is ~100 LOC + idiomatic test fixtures.
+- **Operator-driven safe-delete on durability.** Once P6 lands the watermark observation, the controller's tick driver gains a `delete_after_durability` action that runs `adapter.delete_chunk(hash)` once the watermark confirms one external holder + `refcount == 0` + `!pinned`. Pre-P6 the local copy stays until the GC sweep collects it under retention.
+- **Cluster-wide rebalance.** v0.3 is per-node-local — each node decides independently what to push. A coordinated cluster-rebalance (consensus on "balance is X bytes off across these N nodes") is out of scope; it's a separate control-flow shape (gossip-driven consensus vs. local decision) and the local push has shipped without demonstrated need for the global view.
 
 ## Frame
 

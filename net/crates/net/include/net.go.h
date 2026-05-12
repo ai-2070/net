@@ -1560,6 +1560,62 @@ char* net_compute_standby_group_members_json(const net_compute_standby_group_t* 
 char* net_compute_standby_group_member_role(
     const net_compute_standby_group_t* h, uint32_t index);
 
+/* ========================================================================= */
+/* Dataforts MeshBlobAdapter (v0.2) + active overflow (v0.3)                 */
+/*                                                                           */
+/* All symbols require a libnet built with the                               */
+/* `dataforts + netdb + redex-disk` feature triple to provide real impls;    */
+/* otherwise the symbols still resolve (via the `blob_stubs` module) and     */
+/* return NET_ERR_FEATURE_NOT_BUILT / NULL.                                  */
+/* ========================================================================= */
+
+typedef struct net_mesh_blob_adapter_s net_mesh_blob_adapter_t;
+
+/* Free a buffer the adapter returned via `*out_data` (fetch path). */
+void net_blob_free_buffer(uint8_t* ptr, size_t len);
+
+net_mesh_blob_adapter_t* net_mesh_blob_adapter_new(
+    net_redex_t* redex,
+    const char* adapter_id,
+    int persistent,
+    const char* overflow_json
+);
+
+void net_mesh_blob_adapter_free(net_mesh_blob_adapter_t* handle);
+
+int net_mesh_blob_adapter_store(
+    const net_mesh_blob_adapter_t* handle,
+    const uint8_t* blob_ref_bytes,
+    size_t blob_ref_len,
+    const uint8_t* data,
+    size_t data_len
+);
+
+int net_mesh_blob_adapter_fetch(
+    const net_mesh_blob_adapter_t* handle,
+    const uint8_t* blob_ref_bytes,
+    size_t blob_ref_len,
+    uint8_t** out_data,
+    size_t* out_len
+);
+
+int net_mesh_blob_adapter_exists(
+    const net_mesh_blob_adapter_t* handle,
+    const uint8_t* blob_ref_bytes,
+    size_t blob_ref_len,
+    int* out_exists
+);
+
+char* net_mesh_blob_adapter_prometheus_text(const net_mesh_blob_adapter_t* handle);
+
+int net_mesh_blob_adapter_overflow_enabled(const net_mesh_blob_adapter_t* handle);
+int net_mesh_blob_adapter_overflow_active(const net_mesh_blob_adapter_t* handle);
+char* net_mesh_blob_adapter_overflow_config(const net_mesh_blob_adapter_t* handle);
+int net_mesh_blob_adapter_set_overflow_enabled(
+    const net_mesh_blob_adapter_t* handle, int enabled);
+int net_mesh_blob_adapter_set_overflow_config(
+    const net_mesh_blob_adapter_t* handle, const char* config_json);
+
 #ifdef __cplusplus
 }
 #endif

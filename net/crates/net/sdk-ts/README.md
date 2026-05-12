@@ -906,16 +906,26 @@ Four phases:
   - **Substrate-owned variant (v0.2):** the substrate stores
     each chunk as a content-addressed `RedexFile`, riding the
     existing replication runtime for cross-node placement.
-    Surfaces (`MeshBlobAdapter`, `publish_with_blob`,
+    `MeshBlobAdapter` is now available as a TypeScript class
+    on the `@ai2070/net` Node binding (CRUD path: `store` /
+    `fetch` / `fetchRange` / `exists` / `prometheusText`).
+    The deeper integration points (`publish_with_blob`,
     `BlobRefcountTable`, `BlobMetrics`, `BlobAdapter::prefetch`)
-    are exposed from Rust today; the Python binding has a
-    first slice (`MeshBlobAdapter` CRUD). Node / TypeScript
-    wrappers haven't landed yet — operator scripts that need
-    the v0.2 surface from Node call out to the `net-blob` CLI
-    or to a Rust-side daemon RPC until the binding work
-    catches up. See
+    are still Rust-only — operator scripts that need them
+    from TypeScript call out to the `net-blob` CLI or a Rust-
+    side daemon RPC until each follow-up wrapper lands. See
     [`docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`](../docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md)
     for the shipping status.
+- **Phase 3.5 — Active blob overflow (v0.3 blob track).** Push-
+  side complement of Phase 4's pull-driven migration. Disabled
+  by default; opt in via the `MeshBlobAdapter` constructor's
+  `overflow` option or the runtime `setOverflowEnabled(true)`
+  method. The full counter family
+  (`dataforts_blob_overflow_*` — admitted / 6-label per-reason
+  rejected / hysteresis edges / `active` gauge / `disk_ratio`)
+  lands in `prometheusText()`. See
+  [`docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md`](../docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md)
+  for design + per-PR shipping status.
 - **Phase 4 — Data gravity.** Per-chain read-rate counters with
   exponential decay. Threshold-crossing emissions stamp
   `heat:<hex>=<rate>` onto the chain's capability announcement;
@@ -956,6 +966,40 @@ redex.enableGravityForGreedy(mesh, {
 registerFilesystemBlobAdapter('local', '/var/blobs');
 const ref = await blobPublish('local', 'local://obj/payload', someBytes);
 const back = await blobResolve(ref);
+
+// Phase 3 v0.2 — substrate-owned `MeshBlobAdapter`.
+import { MeshBlobAdapter, BlobRef } from '@ai2070/net';
+const meshBlob = new MeshBlobAdapter(redex, 'mesh-app', {
+  persistent: true,
+});
+const hash = /* 32-byte BLAKE3 of `someBytes` */ Buffer.alloc(32);
+const blobRef = new BlobRef('mesh://demo', hash, BigInt(someBytes.length));
+await meshBlob.store(blobRef, someBytes);
+const fetched = await meshBlob.fetch(blobRef);
+
+// Phase 3.5 / v0.3 — active blob overflow.
+// At construction:
+const overflowed = new MeshBlobAdapter(redex, 'mesh-overflow', {
+  persistent: true,
+  overflow: {
+    enabled: true,
+    highWaterRatio: 0.80,
+    lowWaterRatio: 0.65,
+    maxPushesPerTick: 8,
+    scope: 'zone',
+    tickIntervalMs: 30000,
+  },
+});
+
+// Or flip the master switch at runtime — no rebuild required:
+overflowed.setOverflowEnabled(false);
+overflowed.setOverflowEnabled(true);
+
+// Inspection (read-only getters):
+console.log(overflowed.overflowEnabled);   // boolean
+console.log(overflowed.overflowActive);    // boolean — hysteresis state
+console.log(overflowed.overflowConfig);    // typed snapshot
+console.log(overflowed.prometheusText());  // includes dataforts_blob_overflow_*
 
 // Phase 5 — read-your-writes.
 const tasks = await Tasks.open(redex, { originHash: mesh.originHash });

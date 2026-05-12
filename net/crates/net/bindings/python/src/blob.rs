@@ -21,13 +21,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use tokio::runtime::Runtime;
 
+use ::net::adapter::net::behavior::TopologyScope;
 use ::net::adapter::net::dataforts::{
     global_blob_adapter_registry, publish_blob, resolve_payload, BlobAdapter,
     BlobError as InnerBlobError, BlobRef as InnerBlobRef, FileSystemAdapter,
-    MeshBlobAdapter as InnerMeshBlobAdapter,
+    MeshBlobAdapter as InnerMeshBlobAdapter, OverflowConfig as InnerOverflowConfig,
 };
 
 use crate::cortex::{CortexError, PyRedex};
@@ -637,17 +638,41 @@ impl PyMeshBlobAdapter {
     /// `persistent=True` flips the per-chunk `RedexFile`s into the
     /// on-disk persistent path — requires the underlying `Redex`
     /// to have been constructed with `persistent_dir=...`.
+    ///
+    /// `overflow` opts the adapter into the v0.3 active-overflow
+    /// surface (push-side shedding of cold blobs when local disk
+    /// crosses the high-water threshold). Accepts:
+    ///
+    /// - `False` (default) — v0.2 pull-only posture; no
+    ///   `dataforts.blob.overflow` capability tag advertised,
+    ///   inbound `OverflowPush` requests rejected.
+    /// - `True` — turn on with defaults (85 % high water / 70 %
+    ///   low water / 16 pushes per tick / Mesh scope / 30 s tick).
+    /// - `dict` — typed config. Keys: `enabled` (bool, defaults
+    ///   to `True` when the dict is non-empty), `high_water_ratio`
+    ///   (float), `low_water_ratio` (float), `max_pushes_per_tick`
+    ///   (int), `scope` (str: `"node"` / `"zone"` / `"region"` /
+    ///   `"mesh"`), `tick_interval_ms` (int). Missing keys
+    ///   inherit defaults.
     #[new]
-    #[pyo3(signature = (redex, adapter_id, *, persistent = false))]
-    fn new(redex: &PyRedex, adapter_id: String, persistent: bool) -> Self {
-        let inner = Arc::new(
-            InnerMeshBlobAdapter::new(adapter_id.clone(), redex.inner_arc())
-                .with_persistent(persistent),
-        );
-        Self {
-            inner,
-            id: adapter_id,
+    #[pyo3(signature = (redex, adapter_id, *, persistent = false, overflow = None))]
+    fn new(
+        py: Python<'_>,
+        redex: &PyRedex,
+        adapter_id: String,
+        persistent: bool,
+        overflow: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let mut builder = InnerMeshBlobAdapter::new(adapter_id.clone(), redex.inner_arc())
+            .with_persistent(persistent);
+        if let Some(spec) = overflow {
+            let cfg = parse_overflow_spec(py, spec)?;
+            builder = builder.with_overflow(cfg);
         }
+        Ok(Self {
+            inner: Arc::new(builder),
+            id: adapter_id,
+        })
     }
 
     /// Adapter identity (the `adapter_id` passed at construction).
@@ -658,6 +683,55 @@ impl PyMeshBlobAdapter {
 
     fn __repr__(&self) -> String {
         format!("MeshBlobAdapter(id={:?})", self.id)
+    }
+
+    /// True iff the adapter is currently advertising
+    /// `dataforts.blob.overflow` and accepting inbound
+    /// `OverflowPush` requests. Cheap (one read-lock acquire);
+    /// safe to call on a hot dashboard path.
+    #[getter]
+    fn overflow_enabled(&self) -> bool {
+        self.inner.overflow_enabled()
+    }
+
+    /// True iff the most recent tick observed local disk at
+    /// or above the high-water threshold. Stays `True`
+    /// through the hysteresis band on the way down; only
+    /// flips back to `False` once disk drops to or below the
+    /// low-water threshold. Tracks `dataforts_blob_overflow_active`.
+    #[getter]
+    fn overflow_active(&self) -> bool {
+        self.inner.overflow_active()
+    }
+
+    /// Snapshot the current overflow configuration as a
+    /// Python dict. Inspection-only — mutate via
+    /// [`set_overflow_enabled`] or [`set_overflow_config`].
+    #[getter]
+    fn overflow_config<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let cfg = self.inner.overflow_config();
+        overflow_config_to_dict(py, cfg)
+    }
+
+    /// Flip the overflow master switch at runtime. The
+    /// adapter's next capability rebroadcast adds (or
+    /// removes) the `dataforts.blob.overflow` tag; peers
+    /// observe the change on the following announcement
+    /// cycle. The rebroadcast itself is the operator's
+    /// responsibility (call `mesh.announce_capabilities`
+    /// after the toggle, or rely on the scheduled cadence).
+    fn set_overflow_enabled(&self, enabled: bool) {
+        self.inner.set_overflow_enabled(enabled);
+    }
+
+    /// Replace the entire overflow configuration in one
+    /// call. Useful for atomic enable + tune. `config` is a
+    /// dict with the same keys [`new`] accepts under the
+    /// `overflow` kwarg.
+    fn set_overflow_config(&self, py: Python<'_>, config: Bound<'_, PyAny>) -> PyResult<()> {
+        let cfg = parse_overflow_spec(py, config)?;
+        self.inner.set_overflow_config(cfg);
+        Ok(())
     }
 
     /// Store `data` under the content-address declared by
@@ -745,4 +819,129 @@ impl PyMeshBlobAdapter {
     pub fn prometheus_text(&self) -> String {
         self.inner.prometheus_text()
     }
+}
+
+/// Parse the Python-side `overflow` kwarg into an
+/// [`InnerOverflowConfig`]. Accepts three shapes:
+///
+/// - `True` / `False` — master switch with default thresholds.
+/// - `dict` with optional typed keys — keys not present
+///   inherit `OverflowConfig::default()`. Unknown keys raise
+///   `TypeError` so a typo doesn't silently fail (e.g.
+///   `high_water_ration` → operator sees the error rather
+///   than the default firing).
+/// - anything else — `TypeError`.
+fn parse_overflow_spec(py: Python<'_>, spec: Bound<'_, PyAny>) -> PyResult<InnerOverflowConfig> {
+    // Try bool first. PyO3's `extract::<bool>()` accepts only
+    // the exact Python `bool` type — `1` / `0` int values
+    // don't fall through, which matches the explicit
+    // "boolean or dict" contract.
+    if let Ok(enabled) = spec.extract::<bool>() {
+        return Ok(InnerOverflowConfig {
+            enabled,
+            ..InnerOverflowConfig::default()
+        });
+    }
+    // Otherwise expect a dict.
+    let dict = spec.cast::<PyDict>().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(
+            "overflow: expected bool or dict; got a different type",
+        )
+    })?;
+
+    let mut cfg = InnerOverflowConfig::default();
+    // Track unknown keys so we can surface a single TypeError
+    // listing all of them, instead of failing on the first.
+    let allowed = [
+        "enabled",
+        "high_water_ratio",
+        "low_water_ratio",
+        "max_pushes_per_tick",
+        "scope",
+        "tick_interval_ms",
+    ];
+    let mut unknown = Vec::<String>::new();
+    for (k, _) in dict.iter() {
+        let name: String = k.extract()?;
+        if !allowed.contains(&name.as_str()) {
+            unknown.push(name);
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "overflow: unknown key(s) {:?}; allowed: {:?}",
+            unknown, allowed
+        )));
+    }
+    // `enabled` is required to be explicit when the dict shape is
+    // used. The plan documents the contract as "kwarg = bool OR
+    // dict-with-explicit-enabled" — silently auto-flipping the
+    // master switch on any non-empty dict diverged from the Rust
+    // and Node bindings, and made it easy to ship a dict that
+    // looks like config-only but actually flips production on.
+    // The bool short-circuit above still covers the simple case
+    // (`overflow=True`).
+    if let Some(v) = dict.get_item("enabled")? {
+        cfg.enabled = v.extract::<bool>()?;
+    } else {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "overflow: dict form requires explicit 'enabled' key (True or False); \
+             pass overflow=True for the simple master-switch case",
+        ));
+    }
+    if let Some(v) = dict.get_item("high_water_ratio")? {
+        cfg.high_water_ratio = v.extract::<f64>()?;
+    }
+    if let Some(v) = dict.get_item("low_water_ratio")? {
+        cfg.low_water_ratio = v.extract::<f64>()?;
+    }
+    if let Some(v) = dict.get_item("max_pushes_per_tick")? {
+        cfg.max_pushes_per_tick = v.extract::<usize>()?;
+    }
+    if let Some(v) = dict.get_item("scope")? {
+        let s: String = v.extract()?;
+        cfg.scope = match s.to_ascii_lowercase().as_str() {
+            "node" => TopologyScope::Node,
+            "zone" => TopologyScope::Zone,
+            "region" => TopologyScope::Region,
+            "mesh" => TopologyScope::Mesh,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "overflow.scope: expected 'node'|'zone'|'region'|'mesh'; got {:?}",
+                    other
+                )));
+            }
+        };
+    }
+    if let Some(v) = dict.get_item("tick_interval_ms")? {
+        cfg.tick_interval_ms = v.extract::<u64>()?;
+    }
+    let _ = py; // Silence unused warning under cfg(feature) shapes.
+    Ok(cfg)
+}
+
+/// Render an [`InnerOverflowConfig`] as a Python dict. Inverse
+/// of [`parse_overflow_spec`] for dict shape; round-trip
+/// preserved (modulo `enabled` semantics: an
+/// `enabled = false` config that came in via a `dict` form
+/// round-trips as `{enabled: false, ...}` rather than `False`,
+/// since the dict shape carries the thresholds).
+fn overflow_config_to_dict<'py>(
+    py: Python<'py>,
+    cfg: InnerOverflowConfig,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("enabled", cfg.enabled)?;
+    dict.set_item("high_water_ratio", cfg.high_water_ratio)?;
+    dict.set_item("low_water_ratio", cfg.low_water_ratio)?;
+    dict.set_item("max_pushes_per_tick", cfg.max_pushes_per_tick)?;
+    let scope_str = match cfg.scope {
+        TopologyScope::Node => "node",
+        TopologyScope::Zone => "zone",
+        TopologyScope::Region => "region",
+        TopologyScope::Mesh => "mesh",
+    };
+    dict.set_item("scope", scope_str)?;
+    dict.set_item("tick_interval_ms", cfg.tick_interval_ms)?;
+    Ok(dict)
 }

@@ -386,3 +386,111 @@ fn put_reads_stdin_when_path_is_dash() {
     let v: serde_json::Value = serde_json::from_str(stdout_string(&out).trim()).expect("put JSON");
     assert_eq!(v["size"].as_u64().unwrap(), payload.len() as u64);
 }
+
+// ============================================================================
+// overflow status (v0.3 P4)
+// ============================================================================
+
+#[test]
+fn overflow_status_human_format_prints_disabled_by_default() {
+    // A fresh CLI invocation builds the adapter from defaults
+    // (overflow disabled, defaults for every threshold,
+    // zero counters). Human output must surface the
+    // `enabled: false` line so an operator running `status`
+    // sees the default-off contract at a glance.
+    let tmp = TempDir::new("overflow-status");
+    let out = run_net_blob(tmp.path(), &["overflow", "status"]);
+    assert!(
+        out.status.success(),
+        "overflow status must succeed on a clean dir; stderr={}",
+        stderr_string(&out)
+    );
+    let body = stdout_string(&out);
+    assert!(
+        body.contains("configured enabled:        false"),
+        "human output must show enabled=false on a default adapter; got:\n{}",
+        body
+    );
+    assert!(
+        body.contains("runtime active (this proc): false"),
+        "human output must show active=false when no tick has fired; got:\n{}",
+        body
+    );
+    assert!(
+        body.contains("pushes_admitted_total:     0"),
+        "human output must include the admitted counter at zero; got:\n{}",
+        body
+    );
+}
+
+#[test]
+fn overflow_status_json_format_shape_is_stable() {
+    // JSON output must include the canonical top-level keys
+    // `adapter`, `config`, `active`, `counters`. Operators
+    // pipe `--format json` into `jq` to filter; the shape
+    // must be stable across releases.
+    let tmp = TempDir::new("overflow-status-json");
+    let out = run_net_blob(tmp.path(), &["--format", "json", "overflow", "status"]);
+    assert!(out.status.success());
+    let body = stdout_string(&out);
+    let v: serde_json::Value =
+        serde_json::from_str(body.trim()).expect("overflow status JSON parse");
+    assert_eq!(v["config"]["enabled"], serde_json::json!(false));
+    assert_eq!(v["active"], serde_json::json!(false));
+    // The counters block exists + admitted starts at zero.
+    assert_eq!(v["counters"]["pushes_admitted_total"], serde_json::json!(0));
+    // Six per-reason rejection counters all present at zero
+    // (operator dashboards don't want missing keys).
+    for reason in [
+        "rejected_no_storage_cap_total",
+        "rejected_not_participating_total",
+        "rejected_sender_not_overflowing_total",
+        "rejected_unhealthy_total",
+        "rejected_scope_mismatch_total",
+        "rejected_insufficient_disk_total",
+    ] {
+        assert_eq!(
+            v["counters"][reason],
+            serde_json::json!(0),
+            "JSON output must include counter `{}` at zero",
+            reason
+        );
+    }
+}
+
+#[test]
+fn metrics_body_includes_overflow_counter_family() {
+    // The Prometheus body the `metrics` subcommand emits
+    // must include the v0.3 overflow counter family — even
+    // on a default (disabled, no-tick) adapter. Pin every
+    // metric name + the per-reason label family.
+    let tmp = TempDir::new("metrics-overflow");
+    let out = run_net_blob(tmp.path(), &["metrics"]);
+    assert!(out.status.success());
+    let body = stdout_string(&out);
+    for needle in [
+        "dataforts_blob_overflow_pushes_admitted_total",
+        "dataforts_blob_overflow_push_errors_total",
+        "dataforts_blob_overflow_pushed_bytes_total",
+        "dataforts_blob_overflow_rejected_no_target_total",
+        "dataforts_blob_overflow_rejected_total",
+        "dataforts_blob_overflow_high_water_triggered_total",
+        "dataforts_blob_overflow_low_water_cleared_total",
+        "dataforts_blob_overflow_active",
+        "dataforts_blob_overflow_disk_ratio",
+        // Per-reason label family.
+        "reason=\"no_storage_cap\"",
+        "reason=\"not_participating\"",
+        "reason=\"sender_not_overflowing\"",
+        "reason=\"unhealthy\"",
+        "reason=\"scope_mismatch\"",
+        "reason=\"insufficient_disk\"",
+    ] {
+        assert!(
+            body.contains(needle),
+            "metrics body must include `{}`; got:\n{}",
+            needle,
+            body
+        );
+    }
+}

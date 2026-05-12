@@ -45,6 +45,7 @@ The Rust crate, npm scope, and PyPI dist all publish under `ai2070-net*` / `@ai2
 - [Security surface](#security-surface)
 - [Daemons](#daemons)
 - [Mikoshi](#mikoshi)
+- [Dataforts](#dataforts)
 - [Invariants](#invariants)
 - [Device autonomy](#device-autonomy)
 - [Processing without storage](#processing-without-storage)
@@ -255,6 +256,24 @@ A daemon that needs to diverge becomes a fork group — N independent entities w
 A daemon that needs fault tolerance without duplicate work becomes a standby group — one active, N-1 idle. The active processes events. The standbys hold readiness. Periodic snapshots capture how far each standby is synced. When the active dies, the standby with the most recent snapshot promotes and replays the gap — the same replay mechanism migration uses. Zero wasted compute. The standbys are warm, not hot.
 
 All three patterns compose with migration. Any member of any group is a normal daemon in the registry. Mikoshi can move it without knowing it belongs to a group. The group coordinates. The mesh routes. The daemon doesn't know the difference.
+
+## Dataforts
+
+In Cyberpunk, dataforts are fortified pockets of corporate data — encrypted constructs that hold the assets a corporation cares about most, guarded by ICE and reached only by netrunners willing to spend cycles getting past the gate. The point isn't the storage. The point is that data has a posture, and getting to it means asking the thing that holds it.
+
+Dataforts in Net is the data layer that grows on top of the event bus. Every prior approach to "where does the data live" presupposes an answer — S3 holds it in a region, Ceph holds it across racks, IPFS holds it wherever a pin exists. Storage is a place. You go to the place to read. You ship to the place to write. Dataforts inverts that: blobs are content-addressed BLAKE3 chunks, the address of the data is the data, and the chunks live on whichever nodes have capacity and capability to hold them. There is no canonical home.
+
+Data is a fluid. Hot chunks — bytes that some node keeps fetching — get pulled toward the nodes that read them, because re-fetching the same hash leaves a copy behind. Cold chunks stay where they are or drain into nodes with spare disk. The same pressure that fills a near-empty node also empties a near-full one. Nothing tells the cluster to rebalance. The blobs move because the reads moved.
+
+Heat is per-chunk and decays. A chunk read a hundred times in the last minute has gravity; a chunk read once a year ago has none. The capability index advertises heat the same way it advertises disk-free, scope, and class. A peer with gravity for a given hash is the natural target when the chunk's current holder needs to shed, and the natural source when a new reader asks. Migration is the heat reading itself — no scheduler, no shuffle plan, no coordinator deciding where bytes should be. The reads decide.
+
+When a node crosses its high-water disk threshold, it picks the coldest chunks it holds and pushes them to peers with capacity. The receive side is opt-in via a capability tag — operators decide which nodes accept overflow and which stay pull-only. Pushes ride the existing per-chunk replication runtime; the only new wire shape is a one-shot nudge telling the receiver to open the chunk channel. Storage saturation no longer fails closed against new writes — the cluster bleeds pressure into peers that can absorb it, until either the workload subsides or those peers fill up too. A node that fills with cold blobs no longer has to choose between rejecting new bytes and running blind GC against bytes the rest of the mesh still wants.
+
+A producer that publishes a chunk and immediately reads it back never sees a gap. The publish path returns a write token; the read path waits on that token's durability watermark before returning the bytes. Read-your-own-writes is the producer's contract with itself — independent of replication factor, independent of cluster topology, independent of which peer ends up holding the chunk. The mesh doesn't promise global linearizability. It promises that you see what you just wrote, however many hops the bytes had to take to settle.
+
+These properties compose with the rest of the stack. RedEX writes a `BlobRef` into the event chain like any other event — the substrate verifies the BLAKE3 hash, the chain stays causal, the blob payload pulls separately when somebody needs it. CortEX folds events that reference blobs into views; the views pin the chunks they care about so gravity doesn't sweep them away. A drone, a workstation, and a datacenter can hold the same dataforts — different slices of the same content-addressed space, replicating according to who reads what, all encrypted in flight and on disk.
+
+There is no object store to provision. There is no cluster to operate. The data is on the mesh because the mesh is the data.
 
 ## Invariants
 

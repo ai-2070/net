@@ -650,7 +650,7 @@ Eighteen commits between the PR-5r ship-line and the v0.15 cut hardened the surf
 
 - **Cross-binding fixtures (T-5) for Node + Go.** Python lands in PR-5m (the project's primary FFI consumer); Node + Go follow per-binding rather than as one bulk PR — each language's surface is a few hundred lines and has its own idiomatic shape.
 - **End-to-end gravity-migration DST.** PR-5n's 3-node harness covers prefetch + migration via direct controller calls; the full A-publishes → A's fetches bump heat → A's tick emits `heat:blob:` → B observes via gossip → B's migration controller calls prefetch path needs deterministic-simulation wiring to test reproducibly. The unit + integration tests cover the path piecewise.
-- **Storage-overflow push-to-peer.** v0.2 is intentionally pull-only per § G-3. When local disk crosses the unhealthy threshold the node advertises `dataforts:blob-storage-unhealthy` and other nodes' admission rejects inbound migrations; the node itself doesn't actively push its blobs to peers with free disk. Scope-locked for v0.3 in [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`](DATAFORTS_BLOB_OVERFLOW_PLAN.md) — operator-opt-in boolean, `dataforts.blob.overflow` capability advertisement, inverse-heat eviction order, push via the existing chunk-channel replication runtime.
+- **Storage-overflow push-to-peer.** v0.2 is intentionally pull-only per § G-3. The **v0.3 active-overflow extension** shipped alongside v0.2 in v0.15 — see [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`](DATAFORTS_BLOB_OVERFLOW_PLAN.md). Operator-opt-in boolean, `dataforts.blob.overflow` capability advertisement, inverse-heat eviction order, push via the existing chunk-channel replication runtime, Prometheus counter family, `net-blob overflow status` CLI, Python binding.
 
 ---
 

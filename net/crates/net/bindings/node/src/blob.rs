@@ -32,9 +32,12 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 
+#[cfg(feature = "dataforts")]
+use ::net::adapter::net::behavior::TopologyScope;
 use ::net::adapter::net::dataforts::{
     global_blob_adapter_registry, publish_blob, resolve_payload, BlobAdapter,
     BlobError as InnerBlobError, BlobRef as InnerBlobRef, FileSystemAdapter,
+    MeshBlobAdapter as InnerMeshBlobAdapter, OverflowConfig as InnerOverflowConfig,
 };
 
 /// Stable error-prefix for the SDK's error router. JS-side callers
@@ -771,4 +774,278 @@ pub fn register_async_blob_adapter(
     global_blob_adapter_registry()
         .register(arc)
         .map_err(|e| blob_err("register_async_blob_adapter", e))
+}
+
+// =========================================================================
+// MeshBlobAdapter — v0.2 substrate-owned blob CAS (+ v0.3 overflow)
+// =========================================================================
+//
+// Mirrors the Python `MeshBlobAdapter` surface for Node operator
+// scripts. The adapter is Rust-backed (chunks live in Redex as
+// content-addressed files); JS callers get a thin napi wrapper
+// over `Arc<InnerMeshBlobAdapter>`.
+
+/// Operator-tunable knobs for the v0.3 active-overflow controller.
+/// Mirrors the Rust [`InnerOverflowConfig`] shape. Pass at
+/// construction via [`MeshBlobAdapter::new`]'s `overflow` option,
+/// or replace at runtime via [`MeshBlobAdapter::setOverflowConfig`].
+///
+/// Every field except `enabled` is optional — omit any knob to
+/// inherit the Rust-side default. Matches the Go and Python
+/// bindings' partial-config posture. Pass `{ enabled: true }` to
+/// turn overflow on with all-default thresholds; pass
+/// `{ enabled: true, highWaterRatio: 0.90 }` to override one knob.
+#[napi(object)]
+pub struct OverflowConfigJs {
+    /// Master switch. `false` = adapter never pushes, never
+    /// advertises the `dataforts.blob.overflow` capability tag,
+    /// never accepts inbound `OverflowPush` requests. Default
+    /// for new adapters.
+    pub enabled: bool,
+    /// Disk usage ratio at or above which the overflow tick
+    /// fires. Default `0.85`.
+    pub high_water_ratio: Option<f64>,
+    /// Disk usage ratio at or below which the controller
+    /// re-enters the inactive state. Hysteresis band between
+    /// `lowWaterRatio` and `highWaterRatio` preserves the
+    /// prior active state. Default `0.70`.
+    pub low_water_ratio: Option<f64>,
+    /// Per-tick push budget. Each push opens a chunk channel
+    /// with replication armed; this caps the bandwidth burst.
+    /// Default `16`.
+    pub max_pushes_per_tick: Option<u32>,
+    /// Topology scope bound on push-target selection: one of
+    /// `"node"` / `"zone"` / `"region"` / `"mesh"`. Default
+    /// `"mesh"`.
+    pub scope: Option<String>,
+    /// Tick cadence in milliseconds. Default `30000`.
+    pub tick_interval_ms: Option<u32>,
+}
+
+#[cfg(feature = "dataforts")]
+fn overflow_config_from_inner(cfg: InnerOverflowConfig) -> OverflowConfigJs {
+    OverflowConfigJs {
+        enabled: cfg.enabled,
+        high_water_ratio: Some(cfg.high_water_ratio),
+        low_water_ratio: Some(cfg.low_water_ratio),
+        max_pushes_per_tick: Some(cfg.max_pushes_per_tick as u32),
+        scope: Some(match cfg.scope {
+            TopologyScope::Node => "node".to_string(),
+            TopologyScope::Zone => "zone".to_string(),
+            TopologyScope::Region => "region".to_string(),
+            TopologyScope::Mesh => "mesh".to_string(),
+        }),
+        tick_interval_ms: Some(cfg.tick_interval_ms as u32),
+    }
+}
+
+#[cfg(feature = "dataforts")]
+fn overflow_config_to_inner(cfg: OverflowConfigJs) -> Result<InnerOverflowConfig> {
+    let mut inner = InnerOverflowConfig {
+        enabled: cfg.enabled,
+        ..InnerOverflowConfig::default()
+    };
+    if let Some(v) = cfg.high_water_ratio {
+        inner.high_water_ratio = v;
+    }
+    if let Some(v) = cfg.low_water_ratio {
+        inner.low_water_ratio = v;
+    }
+    if let Some(v) = cfg.max_pushes_per_tick {
+        inner.max_pushes_per_tick = v as usize;
+    }
+    if let Some(s) = cfg.scope {
+        inner.scope = match s.to_ascii_lowercase().as_str() {
+            "node" => TopologyScope::Node,
+            "zone" => TopologyScope::Zone,
+            "region" => TopologyScope::Region,
+            "mesh" => TopologyScope::Mesh,
+            other => {
+                return Err(blob_err(
+                    "overflow.scope",
+                    format!(
+                        "expected 'node'|'zone'|'region'|'mesh'; got {:?}",
+                        other.to_owned()
+                    ),
+                ));
+            }
+        };
+    }
+    if let Some(v) = cfg.tick_interval_ms {
+        inner.tick_interval_ms = v as u64;
+    }
+    Ok(inner)
+}
+
+/// Options for the `MeshBlobAdapter` constructor. Both fields
+/// optional — defaults match the Rust + Python bindings (no
+/// persistence, no overflow).
+#[napi(object)]
+pub struct MeshBlobAdapterOptions {
+    /// Opt every per-chunk file into disk persistence. Default
+    /// `false` (in-memory). Requires the underlying `Redex` to
+    /// have been constructed with `{ persistentDir: ... }`.
+    pub persistent: Option<bool>,
+    /// Active-overflow initial config. Pass `{ enabled: true }`
+    /// to opt in at defaults; pass a full
+    /// [`OverflowConfigJs`] to tune. Omit entirely for the v0.2
+    /// pull-only posture (the default).
+    pub overflow: Option<OverflowConfigJs>,
+}
+
+/// Substrate-owned blob storage adapter. Stores chunks as
+/// content-addressed `RedexFile`s and rides the existing
+/// per-chunk replication runtime for cross-node placement.
+///
+/// Mirrors the Python `MeshBlobAdapter` class. The async
+/// methods (`store` / `fetch` / `fetchRange` / `exists`) run
+/// the substrate's tokio runtime under napi's `tokio_rt`
+/// feature; the JS event loop isn't blocked.
+#[cfg(feature = "dataforts")]
+#[napi]
+pub struct MeshBlobAdapter {
+    inner: Arc<InnerMeshBlobAdapter>,
+    id: String,
+}
+
+#[cfg(feature = "dataforts")]
+#[napi]
+impl MeshBlobAdapter {
+    /// Construct the adapter. `redex` must outlive the adapter
+    /// (the napi class holds an `Arc` clone internally so this
+    /// is automatic). `adapterId` surfaces in the Prometheus
+    /// body's `adapter=...` label.
+    #[napi(constructor)]
+    pub fn new(
+        redex: &crate::cortex::Redex,
+        adapter_id: String,
+        options: Option<MeshBlobAdapterOptions>,
+    ) -> Result<Self> {
+        let opts = options.unwrap_or(MeshBlobAdapterOptions {
+            persistent: None,
+            overflow: None,
+        });
+        let persistent = opts.persistent.unwrap_or(false);
+        let mut builder = InnerMeshBlobAdapter::new(adapter_id.clone(), redex.inner_arc())
+            .with_persistent(persistent);
+        if let Some(overflow_cfg) = opts.overflow {
+            let cfg = overflow_config_to_inner(overflow_cfg)?;
+            builder = builder.with_overflow(cfg);
+        }
+        Ok(Self {
+            inner: Arc::new(builder),
+            id: adapter_id,
+        })
+    }
+
+    /// Adapter identity tag — surfaces in the Prometheus body.
+    #[napi(getter)]
+    pub fn adapter_id(&self) -> String {
+        self.id.clone()
+    }
+
+    /// Store `data` under the content-address declared by
+    /// `blobRef`. Verifies `blake3(data) == blobRef.hash`
+    /// before persisting; mismatches throw `"blob: ..."`.
+    /// Idempotent on identical bytes.
+    #[napi]
+    pub async fn store(&self, blob_ref: &BlobRef, data: Buffer) -> Result<()> {
+        let adapter = self.inner.clone();
+        let blob = blob_ref.inner.clone();
+        let data_owned: Vec<u8> = data.to_vec();
+        adapter
+            .store(&blob, &data_owned)
+            .await
+            .map_err(map_blob_err)
+    }
+
+    /// Fetch the content-addressed bytes for `blobRef`.
+    /// Verifies BLAKE3 against the supplied hash; throws on
+    /// mismatch or missing content.
+    #[napi]
+    pub async fn fetch(&self, blob_ref: &BlobRef) -> Result<Buffer> {
+        let adapter = self.inner.clone();
+        let blob = blob_ref.inner.clone();
+        let bytes = adapter.fetch(&blob).await.map_err(map_blob_err)?;
+        Ok(Buffer::from(bytes))
+    }
+
+    /// Fetch a half-open `[start, end)` byte range. The
+    /// substrate does NOT verify partial fetches against the
+    /// full-content hash — callers accept the trade-off.
+    #[napi]
+    pub async fn fetch_range(
+        &self,
+        blob_ref: &BlobRef,
+        start: BigInt,
+        end: BigInt,
+    ) -> Result<Buffer> {
+        let adapter = self.inner.clone();
+        let blob = blob_ref.inner.clone();
+        let (_, start_u, _) = start.get_u64();
+        let (_, end_u, _) = end.get_u64();
+        let bytes = adapter
+            .fetch_range(&blob, start_u..end_u)
+            .await
+            .map_err(map_blob_err)?;
+        Ok(Buffer::from(bytes))
+    }
+
+    /// Probe local presence. Returns `true` when every chunk of
+    /// `blobRef` is locally reachable.
+    #[napi]
+    pub async fn exists(&self, blob_ref: &BlobRef) -> Result<bool> {
+        let adapter = self.inner.clone();
+        let blob = blob_ref.inner.clone();
+        adapter.exists(&blob).await.map_err(map_blob_err)
+    }
+
+    /// Render the adapter's Prometheus text body. Includes the
+    /// v0.2 counter family + the v0.3 overflow counter family.
+    #[napi]
+    pub fn prometheus_text(&self) -> String {
+        self.inner.prometheus_text()
+    }
+
+    // ---- v0.3 active-overflow surface ----
+
+    /// True iff the adapter is currently advertising
+    /// `dataforts.blob.overflow` and accepting inbound
+    /// `OverflowPush` requests.
+    #[napi(getter)]
+    pub fn overflow_enabled(&self) -> bool {
+        self.inner.overflow_enabled()
+    }
+
+    /// True iff the most recent overflow tick observed local
+    /// disk at or above the high-water threshold. Tracks
+    /// `dataforts_blob_overflow_active`.
+    #[napi(getter)]
+    pub fn overflow_active(&self) -> bool {
+        self.inner.overflow_active()
+    }
+
+    /// Snapshot the current overflow configuration. Returns a
+    /// plain JS object with the typed knobs.
+    #[napi(getter)]
+    pub fn overflow_config(&self) -> OverflowConfigJs {
+        overflow_config_from_inner(self.inner.overflow_config())
+    }
+
+    /// Flip the overflow master switch at runtime. The
+    /// adapter's next capability rebroadcast adds (or removes)
+    /// the `dataforts.blob.overflow` tag.
+    #[napi]
+    pub fn set_overflow_enabled(&self, enabled: bool) {
+        self.inner.set_overflow_enabled(enabled);
+    }
+
+    /// Replace the entire overflow configuration. Useful for
+    /// atomic enable + tune in one call.
+    #[napi]
+    pub fn set_overflow_config(&self, config: OverflowConfigJs) -> Result<()> {
+        let cfg = overflow_config_to_inner(config)?;
+        self.inner.set_overflow_config(cfg);
+        Ok(())
+    }
 }

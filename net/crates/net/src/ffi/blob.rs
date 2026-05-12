@@ -24,9 +24,20 @@ use std::sync::Arc;
 
 use tokio::runtime::Runtime;
 
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+use crate::adapter::net::behavior::TopologyScope;
 use crate::adapter::net::dataforts::{
     global_blob_adapter_registry, publish_blob, resolve_payload, BlobAdapter,
     BlobError as InnerBlobError, FileSystemAdapter,
+};
+// `InnerBlobRef` is only decoded inside the `MeshBlobAdapter`
+// store/fetch/exists entry points, which themselves require the
+// `dataforts + netdb + redex-disk` triple. Without the triple,
+// the import is unused and `-D warnings` fails CI.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+use crate::adapter::net::dataforts::{
+    BlobRef as InnerBlobRef, MeshBlobAdapter as InnerMeshBlobAdapter,
+    OverflowConfig as InnerOverflowConfig,
 };
 
 use super::NetError;
@@ -722,6 +733,438 @@ pub unsafe extern "C" fn net_blob_register_callback_adapter(
         Ok(()) => 0,
         Err(_) => NET_ERR_BLOB_DUPLICATE_ID,
     }
+}
+
+// =========================================================================
+// MeshBlobAdapter — v0.2 substrate-owned blob CAS + v0.3 active overflow
+// =========================================================================
+//
+// Mirrors the Node + Python `MeshBlobAdapter` surface for the
+// Go binding via cgo. JSON-encoded configs at the FFI boundary
+// (matches the existing `net_redex_enable_greedy_dataforts` and
+// peers); the Go wrapper marshals from `struct{...}` into the
+// JSON shape before calling these.
+
+/// Opaque handle to a `MeshBlobAdapter`. The Box owns an
+/// `Arc<InnerMeshBlobAdapter>` so multiple handles can share
+/// the adapter — but the FFI surface only ever hands out one
+/// handle per `_new` call; the operator clones at the Go layer
+/// if they want fan-out. Free with [`net_mesh_blob_adapter_free`].
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+pub struct MeshBlobAdapterHandle {
+    inner: ManuallyDrop<Arc<InnerMeshBlobAdapter>>,
+}
+
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+use std::mem::ManuallyDrop;
+
+/// JSON shape for the `overflow` config option passed to
+/// [`net_mesh_blob_adapter_new`] + [`net_mesh_blob_adapter_set_overflow_config`].
+/// Mirrors the typed `OverflowConfig` from the Rust crate;
+/// `scope` is one of `"node" | "zone" | "region" | "mesh"`.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[derive(serde::Deserialize, serde::Serialize)]
+struct OverflowConfigJson {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    high_water_ratio: Option<f64>,
+    #[serde(default)]
+    low_water_ratio: Option<f64>,
+    #[serde(default)]
+    max_pushes_per_tick: Option<u64>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    tick_interval_ms: Option<u64>,
+}
+
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+fn parse_overflow_json(s: &str) -> Result<InnerOverflowConfig, c_int> {
+    if s.is_empty() {
+        return Ok(InnerOverflowConfig::default());
+    }
+    let raw: OverflowConfigJson =
+        serde_json::from_str(s).map_err(|_| -> c_int { NetError::InvalidJson.into() })?;
+    let mut cfg = InnerOverflowConfig {
+        enabled: raw.enabled,
+        ..InnerOverflowConfig::default()
+    };
+    if let Some(v) = raw.high_water_ratio {
+        cfg.high_water_ratio = v;
+    }
+    if let Some(v) = raw.low_water_ratio {
+        cfg.low_water_ratio = v;
+    }
+    if let Some(v) = raw.max_pushes_per_tick {
+        cfg.max_pushes_per_tick = v as usize;
+    }
+    if let Some(s) = raw.scope {
+        cfg.scope = match s.to_ascii_lowercase().as_str() {
+            "node" => TopologyScope::Node,
+            "zone" => TopologyScope::Zone,
+            "region" => TopologyScope::Region,
+            "mesh" => TopologyScope::Mesh,
+            _ => {
+                let code: c_int = NetError::InvalidJson.into();
+                return Err(code);
+            }
+        };
+    }
+    if let Some(v) = raw.tick_interval_ms {
+        cfg.tick_interval_ms = v;
+    }
+    Ok(cfg)
+}
+
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+fn overflow_to_json(cfg: InnerOverflowConfig) -> String {
+    let scope = match cfg.scope {
+        TopologyScope::Node => "node",
+        TopologyScope::Zone => "zone",
+        TopologyScope::Region => "region",
+        TopologyScope::Mesh => "mesh",
+    };
+    let raw = OverflowConfigJson {
+        enabled: cfg.enabled,
+        high_water_ratio: Some(cfg.high_water_ratio),
+        low_water_ratio: Some(cfg.low_water_ratio),
+        max_pushes_per_tick: Some(cfg.max_pushes_per_tick as u64),
+        scope: Some(scope.to_string()),
+        tick_interval_ms: Some(cfg.tick_interval_ms),
+    };
+    serde_json::to_string(&raw).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Construct a `MeshBlobAdapter` against `redex`.
+///
+/// - `redex` — pointer to a `RedexHandle` from `net_redex_new`. The
+///   adapter clones the inner `Arc<Redex>`; the redex handle stays
+///   valid after this call.
+/// - `adapter_id` — null-terminated UTF-8 identity tag.
+/// - `persistent` — `0` = in-memory chunks; `1` = disk-backed
+///   (requires the redex to have been opened with a `persistent_dir`).
+/// - `overflow_json` — null OR null-terminated JSON for the v0.3
+///   overflow config. Empty string / null = overflow off (the
+///   v0.2 default).
+///
+/// Returns a non-null handle on success. On error returns null and
+/// sets no errno-equivalent — operators check for null + retry with
+/// a well-formed JSON config. Free with `net_mesh_blob_adapter_free`.
+///
+/// # Safety
+/// `redex` must be a valid `RedexHandle*` returned from `net_redex_new`
+/// and not yet freed. `adapter_id` must be a valid null-terminated
+/// UTF-8 string. `overflow_json` may be null or a valid
+/// null-terminated UTF-8 JSON string.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_new(
+    redex: *mut super::cortex::RedexHandle,
+    adapter_id: *const c_char,
+    persistent: c_int,
+    overflow_json: *const c_char,
+) -> *mut MeshBlobAdapterHandle {
+    if redex.is_null() {
+        return ptr::null_mut();
+    }
+    let id = match unsafe { c_str_to_owned(adapter_id) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let overflow_str = if overflow_json.is_null() {
+        String::new()
+    } else {
+        match unsafe { c_str_to_owned(overflow_json) } {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        }
+    };
+    let overflow_cfg = match parse_overflow_json(&overflow_str) {
+        Ok(c) => c,
+        Err(_) => return ptr::null_mut(),
+    };
+    let redex_inner = unsafe { (*redex).redex_arc() };
+    let mut builder = InnerMeshBlobAdapter::new(id, redex_inner).with_persistent(persistent != 0);
+    if !overflow_str.is_empty() {
+        builder = builder.with_overflow(overflow_cfg);
+    }
+    Box::into_raw(Box::new(MeshBlobAdapterHandle {
+        inner: ManuallyDrop::new(Arc::new(builder)),
+    }))
+}
+
+/// Free a handle from [`net_mesh_blob_adapter_new`]. Idempotent
+/// against a null pointer.
+///
+/// # Safety
+/// `handle` must be a pointer returned by `net_mesh_blob_adapter_new`
+/// + not yet freed, or null.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_free(handle: *mut MeshBlobAdapterHandle) {
+    if handle.is_null() {
+        return;
+    }
+    let mut boxed = unsafe { Box::from_raw(handle) };
+    unsafe { ManuallyDrop::drop(&mut boxed.inner) };
+}
+
+/// Store `data` of `data_len` bytes under the content address
+/// declared by `blob_ref_bytes` (a previously-encoded `BlobRef`
+/// wire blob from `net_blob_publish` or constructed externally).
+///
+/// Returns `0` on success, `NET_ERR_BLOB_*` on adapter-side error,
+/// or `NetError::NullPointer` / `InvalidUtf8` for input validation.
+/// The substrate BLAKE3-verifies the bytes against the BlobRef
+/// hash before persisting.
+///
+/// # Safety
+/// `handle` is a valid `MeshBlobAdapterHandle*`. `blob_ref_bytes`
+/// + `data` point to readable buffers of the supplied lengths.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_store(
+    handle: *const MeshBlobAdapterHandle,
+    blob_ref_bytes: *const u8,
+    blob_ref_len: usize,
+    data: *const u8,
+    data_len: usize,
+) -> c_int {
+    if handle.is_null() || blob_ref_bytes.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
+    let blob_ref = match InnerBlobRef::decode(blob_slice) {
+        Ok(Some(b)) => b,
+        _ => return NET_ERR_BLOB_DECODE,
+    };
+    let data_slice = if data.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, data_len) }
+    };
+    let adapter = unsafe { (*handle).inner.clone() };
+    let data_owned = data_slice.to_vec();
+    let result = block_on(async move { (*adapter).store(&blob_ref, &data_owned).await });
+    match result {
+        Ok(()) => 0,
+        Err(e) => err_to_code(&e),
+    }
+}
+
+/// Fetch the content for `blob_ref_bytes`. On success writes a
+/// heap-allocated buffer pointer to `*out_data` + length to
+/// `*out_len` and returns `0`. The caller MUST free via
+/// [`net_blob_free_buffer`].
+///
+/// # Safety
+/// `handle`, `blob_ref_bytes`, `out_data`, `out_len` must all be
+/// non-null and point to valid memory of the appropriate type.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_fetch(
+    handle: *const MeshBlobAdapterHandle,
+    blob_ref_bytes: *const u8,
+    blob_ref_len: usize,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    if handle.is_null() || blob_ref_bytes.is_null() || out_data.is_null() || out_len.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
+    let blob_ref = match InnerBlobRef::decode(blob_slice) {
+        Ok(Some(b)) => b,
+        _ => return NET_ERR_BLOB_DECODE,
+    };
+    let adapter = unsafe { (*handle).inner.clone() };
+    let result = block_on(async move { (*adapter).fetch(&blob_ref).await });
+    match result {
+        Ok(bytes) => {
+            let mut boxed = bytes.into_boxed_slice();
+            let ptr_out = boxed.as_mut_ptr();
+            let len_out = boxed.len();
+            std::mem::forget(boxed);
+            unsafe {
+                *out_data = ptr_out;
+                *out_len = len_out;
+            }
+            0
+        }
+        Err(e) => err_to_code(&e),
+    }
+}
+
+/// Probe local presence — writes `1` to `*out_exists` if the chunk
+/// is locally reachable, `0` otherwise. Returns `0` on success or
+/// a `NET_ERR_*` code on failure.
+///
+/// # Safety
+/// `handle`, `blob_ref_bytes`, `out_exists` must all be non-null.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_exists(
+    handle: *const MeshBlobAdapterHandle,
+    blob_ref_bytes: *const u8,
+    blob_ref_len: usize,
+    out_exists: *mut c_int,
+) -> c_int {
+    if handle.is_null() || blob_ref_bytes.is_null() || out_exists.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
+    let blob_ref = match InnerBlobRef::decode(blob_slice) {
+        Ok(Some(b)) => b,
+        _ => return NET_ERR_BLOB_DECODE,
+    };
+    let adapter = unsafe { (*handle).inner.clone() };
+    let result = block_on(async move { (*adapter).exists(&blob_ref).await });
+    match result {
+        Ok(present) => {
+            unsafe { *out_exists = if present { 1 } else { 0 } };
+            0
+        }
+        Err(e) => err_to_code(&e),
+    }
+}
+
+/// Render the adapter's Prometheus text body. Returns a
+/// `CString::into_raw`-allocated `*mut c_char` that the caller
+/// MUST free via [`crate::ffi::net_free_string`]. Returns null on
+/// allocation failure (rare).
+///
+/// # Safety
+/// `handle` must be a valid `MeshBlobAdapterHandle*`.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_prometheus_text(
+    handle: *const MeshBlobAdapterHandle,
+) -> *mut c_char {
+    if handle.is_null() {
+        return ptr::null_mut();
+    }
+    let adapter = unsafe { (*handle).inner.clone() };
+    let body = (*adapter).prometheus_text();
+    match std::ffi::CString::new(body) {
+        Ok(s) => s.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+// ---- v0.3 active-overflow surface ----
+
+/// True / false for `overflow_enabled` on the adapter. Returns
+/// `1` / `0`; returns negative `NET_ERR_*` on null handle.
+///
+/// # Safety
+/// `handle` must be a valid `MeshBlobAdapterHandle*`.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_enabled(
+    handle: *const MeshBlobAdapterHandle,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let adapter = unsafe { (*handle).inner.clone() };
+    if (*adapter).overflow_enabled() {
+        1
+    } else {
+        0
+    }
+}
+
+/// True / false for `overflow_active` (the hysteresis runtime
+/// state). Same return shape as `_overflow_enabled`.
+///
+/// # Safety
+/// `handle` must be a valid `MeshBlobAdapterHandle*`.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_active(
+    handle: *const MeshBlobAdapterHandle,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let adapter = unsafe { (*handle).inner.clone() };
+    if (*adapter).overflow_active() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Snapshot the current overflow configuration as a JSON
+/// string. Returns a `CString::into_raw`-allocated `*mut c_char`
+/// the caller MUST free via [`crate::ffi::net_free_string`].
+///
+/// # Safety
+/// `handle` must be a valid `MeshBlobAdapterHandle*`.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_config(
+    handle: *const MeshBlobAdapterHandle,
+) -> *mut c_char {
+    if handle.is_null() {
+        return ptr::null_mut();
+    }
+    let adapter = unsafe { (*handle).inner.clone() };
+    let cfg = (*adapter).overflow_config();
+    let json = overflow_to_json(cfg);
+    match std::ffi::CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Flip the overflow master switch. Returns `0` on success,
+/// `NET_ERR_*` on null handle.
+///
+/// # Safety
+/// `handle` must be a valid `MeshBlobAdapterHandle*`.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_enabled(
+    handle: *const MeshBlobAdapterHandle,
+    enabled: c_int,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let adapter = unsafe { (*handle).inner.clone() };
+    (*adapter).set_overflow_enabled(enabled != 0);
+    0
+}
+
+/// Replace the entire overflow configuration with the JSON
+/// shape `config_json`. Returns `0` on success,
+/// `NetError::InvalidJson` on malformed input.
+///
+/// # Safety
+/// `handle` + `config_json` must be valid. `config_json` must be a
+/// null-terminated UTF-8 JSON string.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_config(
+    handle: *const MeshBlobAdapterHandle,
+    config_json: *const c_char,
+) -> c_int {
+    if handle.is_null() || config_json.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let s = match unsafe { c_str_to_owned(config_json) } {
+        Some(s) => s,
+        None => return NetError::InvalidUtf8.into(),
+    };
+    let cfg = match parse_overflow_json(&s) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let adapter = unsafe { (*handle).inner.clone() };
+    (*adapter).set_overflow_config(cfg);
+    0
 }
 
 #[cfg(test)]

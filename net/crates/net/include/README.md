@@ -688,6 +688,101 @@ Error codes: `0` = success, `NET_ERR_NULL_POINTER` = NULL handle,
 `NET_ERR_FEATURE_NOT_BUILT` = cdylib built without the `dataforts`
 feature, `NET_ERR_REDEX` = generic Redex / config failure.
 
+### Dataforts blob storage (`MeshBlobAdapter` + v0.3 overflow)
+
+Substrate-owned blob CAS. Requires the cdylib to be built with
+`dataforts,netdb,redex-disk` features enabled.
+
+```c
+typedef struct MeshBlobAdapterHandle MeshBlobAdapterHandle;
+
+// Construct. `redex` is a `*RedexHandle` from `net_redex_new`.
+// `persistent` 0/1 toggles disk-backed chunk files.
+// `overflow_json` is optional null-terminated JSON for the v0.3
+// active-overflow config; NULL or empty string keeps overflow off.
+//
+// Returns NULL on error (check feature gates + JSON validity).
+extern MeshBlobAdapterHandle* net_mesh_blob_adapter_new(
+    RedexHandle* redex,
+    const char* adapter_id,
+    int persistent,
+    const char* overflow_json
+);
+extern void net_mesh_blob_adapter_free(MeshBlobAdapterHandle* handle);
+
+// CRUD. `blob_ref_bytes` is a previously-encoded `BlobRef` wire
+// payload. Substrate verifies BLAKE3 on store; fetch returns a
+// caller-owned buffer (free with `net_blob_free_buffer`).
+extern int net_mesh_blob_adapter_store(
+    const MeshBlobAdapterHandle* handle,
+    const uint8_t* blob_ref_bytes,
+    size_t blob_ref_len,
+    const uint8_t* data,
+    size_t data_len
+);
+extern int net_mesh_blob_adapter_fetch(
+    const MeshBlobAdapterHandle* handle,
+    const uint8_t* blob_ref_bytes,
+    size_t blob_ref_len,
+    uint8_t** out_data,
+    size_t* out_len
+);
+extern int net_mesh_blob_adapter_exists(
+    const MeshBlobAdapterHandle* handle,
+    const uint8_t* blob_ref_bytes,
+    size_t blob_ref_len,
+    int* out_exists
+);
+
+// Prometheus text body — includes v0.2 counters + v0.3 overflow
+// counters. Free returned string with `net_free_string`.
+extern char* net_mesh_blob_adapter_prometheus_text(
+    const MeshBlobAdapterHandle* handle
+);
+
+// v0.3 active-overflow control surface.
+extern int net_mesh_blob_adapter_overflow_enabled(
+    const MeshBlobAdapterHandle* handle
+);  // returns 0 / 1, or negative NET_ERR_*
+extern int net_mesh_blob_adapter_overflow_active(
+    const MeshBlobAdapterHandle* handle
+);
+extern char* net_mesh_blob_adapter_overflow_config(
+    const MeshBlobAdapterHandle* handle
+);  // JSON; free with net_free_string
+extern int net_mesh_blob_adapter_set_overflow_enabled(
+    const MeshBlobAdapterHandle* handle,
+    int enabled
+);
+extern int net_mesh_blob_adapter_set_overflow_config(
+    const MeshBlobAdapterHandle* handle,
+    const char* config_json
+);
+```
+
+Overflow config JSON shape (every key optional except
+`enabled`):
+
+```json
+{
+  "enabled": true,
+  "high_water_ratio": 0.85,
+  "low_water_ratio": 0.70,
+  "max_pushes_per_tick": 16,
+  "scope": "mesh",
+  "tick_interval_ms": 30000
+}
+```
+
+`scope` values: `"node"` / `"zone"` / `"region"` / `"mesh"`.
+Malformed JSON / unknown scope token → `NET_ERR_*` from the
+`InvalidJson` family.
+
+Blob-specific error codes are in the `-110..` band — see
+[`bindings/go/net/blob.go`](../bindings/go/net/blob.go) for the
+Go wrapper that consumes this surface; the same `extern`
+declarations work from any C / C++ consumer.
+
 ## nRPC (request / response over the mesh)
 
 nRPC is the request/response convention layer (deadlines,
