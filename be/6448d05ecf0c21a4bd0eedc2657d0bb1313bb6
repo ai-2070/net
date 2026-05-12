@@ -1,0 +1,53 @@
+net/crates/net/src/adapter/net/dataforts/blob/metrics.rs
+  s_3a0a24a47d1a36::t_aed785bca4f1b9 98,100-106,108-137,139
+  s_3a0a24a47d1a36::t_9634ec83367a9b 274,288-349
+  s_3a0a24a47d1a36::t_fdc6a74ff426c2 408-482
+  s_3a0a24a47d1a36::t_878c78fb95d0d0 756-900,904,908,910-934,936-939
+  s_3a0a24a47d1a36::t_c6a97bb8790183 187-254,256-266
+  s_3a0a24a47d1a36::t_535c2284b3ce8e 50-79
+  s_3a0a24a47d1a36::t_82e9648d26445a 107,138,255,901-903,905-907,909,935
+net/crates/net/src/bin/net-blob.rs
+  s_3a0a24a47d1a36::t_840d1c9e6a5bf7 481-502,507,512-518,523-549,551-586
+  s_3a0a24a47d1a36::t_0790e2731dc8ff 235-237
+  s_3a0a24a47d1a36::t_82e9648d26445a 503-506,508-511,519-522,550
+  s_3a0a24a47d1a36::t_fae39e7ecc22e5 178-193
+net/crates/net/src/adapter/net/dataforts/blob/admission.rs
+  s_3a0a24a47d1a36::t_82e9648d26445a 715
+net/crates/net/tests/dataforts_blob_e2e.rs
+  s_3a0a24a47d1a36::t_82e9648d26445a 705-706,708-709,794-797
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_3a0a24a47d1a36::t_954f44dbe2b732 484,488
+  s_3a0a24a47d1a36::t_82e9648d26445a 441-442,2169-2172
+  s_3a0a24a47d1a36::t_0ccd5697ba356d 460-466,476,481-483,485,487,489-490,494-496,503-504,507-527
+  s_3a0a24a47d1a36::t_1b387b2df798f9 467-475,477-480,486,491-493,497-502,505-506
+  s_3a0a24a47d1a36::t_d5f466c0c8cb60 445-454
+net/crates/net/src/adapter/net/dataforts/blob/overflow.rs
+  s_3a0a24a47d1a36::t_d9b46ea7197cfb 342-349
+  s_3a0a24a47d1a36::t_e6e443bd6340df 1515-1520
+  s_3a0a24a47d1a36::t_13250c5ac0bab1 784-817,829-830,834,837-842
+  s_3a0a24a47d1a36::t_60cb4b8641b5f2 753-755
+  s_3a0a24a47d1a36::t_82e9648d26445a 400-401,738-739,911-915,1141,1293-1297
+  s_3a0a24a47d1a36::t_2f62101db1ed7a 750-752,756-783
+  s_3a0a24a47d1a36::t_fb574f75ec301f 1325-1330
+  s_3a0a24a47d1a36::t_801e22cd0f2b80 1360-1365,1398-1403,1437-1442,1478-1483
+net/crates/net/tests/net_blob_cli.rs
+  s_3a0a24a47d1a36::t_e4e4813dd911e3 389-496
+net/crates/net/src/adapter/net/dataforts/blob/mod.rs
+  s_3a0a24a47d1a36::t_f42fa5d1f7edb0 75-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "be6448d05ecf0c21a4bd0eedc2657d0bb1313bb6",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
