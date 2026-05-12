@@ -272,9 +272,10 @@ fn collect_operator_rows<R: ChainReader + ?Sized>(
             let rows = collect_operator_rows(input, reader)?;
             execute_aggregate_count(&rows, *group_by)
         }
-        OperatorPlan::Filter { .. } => Err(MeshError::PlannerError {
-            detail: "Filter executor not yet implemented (Phase E)".to_string(),
-        }),
+        OperatorPlan::Filter { input, predicate } => {
+            let rows = collect_operator_rows(input, reader)?;
+            execute_filter(rows, predicate)
+        }
         OperatorPlan::NotYetImplemented { detail, .. } => Err(MeshError::PlannerError {
             detail: format!("operator not yet implemented: {detail}"),
         }),
@@ -423,6 +424,34 @@ fn hash_join_full_outer(
             if !matched {
                 out.push(encode_joined_row(None, Some(r))?);
             }
+        }
+    }
+    Ok(out)
+}
+
+/// Phase E-2 row filter. Decodes the [`PredicateWire`] back to
+/// a typed `Predicate`, builds a synthetic per-row view via
+/// [`super::row::synthetic_row_view`], and evaluates the
+/// predicate against each row's view. Rows whose evaluation
+/// returns `true` pass through unchanged.
+fn execute_filter(
+    rows: Vec<ResultRow>,
+    wire: &crate::adapter::net::behavior::predicate::PredicateWire,
+) -> Result<Vec<ResultRow>, MeshError> {
+    use crate::adapter::net::behavior::predicate::EvalContext;
+
+    let predicate = wire
+        .clone()
+        .into_predicate()
+        .map_err(|e| MeshError::PlannerError {
+            detail: format!("Filter predicate rebuild failed: {e:?}"),
+        })?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (tags, metadata) = super::row::synthetic_row_view(&row);
+        let ctx = EvalContext::new(&tags, &metadata);
+        if predicate.evaluate(&ctx) {
+            out.push(row);
         }
     }
     Ok(out)
@@ -1402,34 +1431,147 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filter_operator_surfaces_planner_error_until_phase_e() {
+    async fn filter_keeps_rows_whose_synthetic_seq_matches() {
         use crate::adapter::net::behavior::predicate::Predicate;
         use crate::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
 
+        let chain = 0xCAFE;
         let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(chain, SeqNum(1), b"p-1".to_vec());
+        reader.append(chain, SeqNum(2), b"p-2".to_vec());
+        reader.append(chain, SeqNum(3), b"p-3".to_vec());
         let executor = LocalMeshQueryExecutor::new(reader);
-        let predicate = Predicate::Exists {
+
+        // Predicate: seq == "2" (string match via synthetic tag).
+        let predicate = Predicate::Equals {
             key: TagKey {
                 axis: TaxonomyAxis::Dataforts,
-                key: "blob.storage".to_string(),
+                key: "seq".to_string(),
             },
+            value: "2".to_string(),
         }
         .to_wire();
         let plan = atomic_plan(OperatorPlan::Filter {
             input: Box::new(OperatorNode {
-                operator: OperatorPlan::LatestRead { origin: 0x01 },
+                operator: OperatorPlan::BetweenRead {
+                    origin: chain,
+                    start: SeqNum(1),
+                    end: SeqNum(10),
+                },
                 target_nodes: vec![],
                 cost: CostEstimate::default(),
             }),
             predicate,
         });
 
-        let err = executor.execute(plan).await.unwrap_err();
-        match err {
-            MeshError::PlannerError { detail } => {
-                assert!(detail.contains("Filter"), "got: {detail}");
-            }
-            other => panic!("expected PlannerError, got {other:?}"),
+        let running = executor.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].seq, SeqNum(2));
+        assert_eq!(rows[0].payload, b"p-2");
+    }
+
+    #[tokio::test]
+    async fn filter_numeric_at_least_on_seq_keeps_upper_rows() {
+        use crate::adapter::net::behavior::predicate::Predicate;
+        use crate::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
+
+        let chain = 0xCAFE;
+        let reader = Arc::new(InMemoryChainReader::default());
+        for s in 1..=5u64 {
+            reader.append(chain, SeqNum(s), format!("p-{s}").into_bytes());
         }
+        let executor = LocalMeshQueryExecutor::new(reader);
+
+        let predicate = Predicate::NumericAtLeast {
+            key: TagKey {
+                axis: TaxonomyAxis::Dataforts,
+                key: "seq".to_string(),
+            },
+            threshold: 3.0,
+        }
+        .to_wire();
+        let plan = atomic_plan(OperatorPlan::Filter {
+            input: Box::new(OperatorNode {
+                operator: OperatorPlan::BetweenRead {
+                    origin: chain,
+                    start: SeqNum(1),
+                    end: SeqNum(10),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            }),
+            predicate,
+        });
+
+        let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        let seqs: Vec<u64> = rows.iter().map(|r| r.seq.0).collect();
+        assert_eq!(seqs, vec![3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn filter_on_flat_json_payload_field_keeps_matching_rows() {
+        use crate::adapter::net::behavior::predicate::Predicate;
+        use crate::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
+
+        let chain = 0xC0DE;
+        let reader = Arc::new(InMemoryChainReader::default());
+        // Rows carry JSON payloads with a "severity" field.
+        reader.append(
+            chain,
+            SeqNum(1),
+            br#"{"severity":"low"}"#.to_vec(),
+        );
+        reader.append(
+            chain,
+            SeqNum(2),
+            br#"{"severity":"high"}"#.to_vec(),
+        );
+        reader.append(
+            chain,
+            SeqNum(3),
+            br#"{"severity":"high","other":"x"}"#.to_vec(),
+        );
+        reader.append(chain, SeqNum(4), b"not-json".to_vec());
+        let executor = LocalMeshQueryExecutor::new(reader);
+
+        let predicate = Predicate::Equals {
+            key: TagKey {
+                axis: TaxonomyAxis::Dataforts,
+                key: "severity".to_string(),
+            },
+            value: "high".to_string(),
+        }
+        .to_wire();
+        let plan = atomic_plan(OperatorPlan::Filter {
+            input: Box::new(OperatorNode {
+                operator: OperatorPlan::BetweenRead {
+                    origin: chain,
+                    start: SeqNum(1),
+                    end: SeqNum(10),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            }),
+            predicate,
+        });
+        let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        // Rows 2 + 3 match; row 1 has severity=low (no), row 4
+        // is non-JSON (predicate fails silently).
+        let seqs: Vec<u64> = rows.iter().map(|r| r.seq.0).collect();
+        assert_eq!(seqs, vec![2, 3]);
     }
 }

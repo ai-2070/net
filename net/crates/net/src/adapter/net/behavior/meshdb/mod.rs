@@ -75,6 +75,7 @@ pub mod federated;
 pub mod planner;
 pub mod protocol;
 pub mod query;
+pub mod row;
 
 pub use error::{BudgetMetric, MeshError};
 pub use executor::{

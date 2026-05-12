@@ -151,9 +151,9 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
                 return self.execute_aggregate_count_federated(plan).await;
             }
             OperatorPlan::Filter { .. } => {
-                return Err(MeshError::PlannerError {
-                    detail: "Filter executor not yet implemented (Phase E)".to_string(),
-                });
+                // Phase E-2 federated filter: fetch the inner
+                // sub-plan via the transport, filter locally.
+                return self.execute_filter_federated(plan).await;
             }
             OperatorPlan::NotYetImplemented { detail, .. } => {
                 return Err(MeshError::PlannerError {
@@ -303,6 +303,50 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
 type JoinedPair = (Option<ResultRow>, Option<ResultRow>);
 
 impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
+    /// Phase E-2 federated row filter: fetch the inner sub-plan
+    /// via the transport, evaluate the predicate against each
+    /// row's synthetic view locally.
+    async fn execute_filter_federated(
+        &self,
+        plan: ExecutionPlan,
+    ) -> Result<RunningQuery, MeshError> {
+        use super::planner::CostEstimate;
+        use crate::adapter::net::behavior::predicate::EvalContext;
+
+        let OperatorPlan::Filter { input, predicate } = plan.root.operator else {
+            unreachable!("execute_filter_federated dispatched on non-Filter");
+        };
+
+        let inner = Box::pin(self.execute(ExecutionPlan {
+            root: *input,
+            total_cost: CostEstimate::default(),
+        }))
+        .await?;
+        let rows = drain_rows(inner.rows).await?;
+
+        let pred = predicate
+            .into_predicate()
+            .map_err(|e| MeshError::PlannerError {
+                detail: format!("Filter predicate rebuild failed: {e:?}"),
+            })?;
+
+        let mut out: Vec<Result<ResultRow, MeshError>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (tags, metadata) = super::row::synthetic_row_view(&row);
+            let ctx = EvalContext::new(&tags, &metadata);
+            if pred.evaluate(&ctx) {
+                out.push(Ok(row));
+            }
+        }
+
+        let handle = QueryHandle::new(self.allocate_id());
+        let stream: ResultStream = Box::pin(futures::stream::iter(out));
+        Ok(RunningQuery {
+            handle,
+            rows: stream,
+        })
+    }
+
     /// Phase E-1 federated count aggregate: fetch the inner
     /// sub-plan via the transport, group + count locally.
     async fn execute_aggregate_count_federated(
