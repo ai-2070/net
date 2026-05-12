@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/MESHDB_PLAN.md
+  s_3a0a24a47d1a36::t_7a4f55a1b205d5 7,9-13,15-19,21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "727ba14d1062259c288dad6b6dc22de7b9a3a699",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
