@@ -4,7 +4,7 @@
 
 ## Status
 
-**Draft v0.1.** Spec attached as [Appendix A — original Kyra spec](#appendix-a). Ships in **Rebel Yell v0.2** as Phase 3.5 (the spec is internally numbered v0.2 to mark the architectural shift from external-hook to mesh-native; the activation gate is the same as v0.15's Phase 3 — workloads whose payloads systematically exceed the inline threshold). Hard prerequisites are all shipping:
+**Shipped in v0.15 — "Rebel Yell"** (2026-05-12). The mesh-native blob storage track lands as Phase 3.5 of the seven-phase Dataforts roadmap: the substrate-owned CAS composes against the v0.15 `BlobAdapter` trait rather than replacing it, registered under the `mesh://` URI scheme. Spec attached as [Appendix A — original Kyra spec](#appendix-a). Activation gate matches v0.15's Phase 3 — workloads whose payloads systematically exceed the inline threshold. Hard prerequisites are all shipping:
 
 - **Phase 0** (capability-tag discovery + `blob:` tag shape) — landed v0.13.
 - **Phase 2** (RedEX V2, `SUBPROTOCOL_REDEX` replication coordinator) — landed v0.14.
@@ -602,13 +602,55 @@ The original 1–2 week estimate undersold this unit by 2-3×. Greedy / gravity 
 | PR-5j-a/b | `d005d1ce` | `BlobHeatRegistry` (mirrors `HeatRegistry` keyed on `[u8;32]`) + `MeshBlobAdapter::with_blob_heat` bumping on `fetch`/`fetch_range`. |
 | PR-5j-c | `dbda7208` | `BlobHeatSink` trait + `MeshNode::announce_blob_heat`/`withdraw_blob_heat`/`announce_blob_heat_batch` + `MeshBlobAdapter::tick_blob_heat` emission loop. |
 | PR-5j-d | `49e9f41d` | `parse_blob_heat_tag` + `BlobMigrationController` + `drive_blob_migration_tick` async helper; closes the Phase-4b gravity migration loop. |
+| PR-5l   | `12c521a9` | `net-blob` operator CLI bin (`put`/`get`/`exists`/`stat`/`ls`/`pin`/`unpin`/`gc`/`metrics`) gated behind the new `cli` Cargo feature. |
+| PR-5m   | `8109f5c5` | Python binding for `MeshBlobAdapter` (`store`/`fetch`/`fetch_range`/`exists`/`prometheus_text`) + `PyBlobRef` constructor + atexit drain hook. |
+| PR-5n   | `360a9a03` | Multi-node prefetch + migration e2e (`dataforts_blob_e2e.rs`) on a 3-node harness + heat-filter fix for blob-vs-chain disambiguation. |
+| PR-5o   | `d980c087` | Manifest-aware migration: `drive_blob_migration_tick_with_manifest_resolver` recursively prefetches every constituent chunk of a `BlobRef::Manifest`. |
+| PR-5q   | `c6b2b2bf` | Concurrency stress on `BlobRefcountTable` + `BlobHeatRegistry` under multi-thread tokio runtime; no torn state under flood. |
+| PR-5r   | `cce35895` | `CapabilityIndex::by_origin_hash` truncation-collision test + 3-node migration parity test + CLI integration tests + Python pytest suite. |
+| Hardening | (multiple) | Post-feature review bundle on the `dataforts-blob` branch: closes a DoS surface, a soundness hole, a race, a label-injection vector, a dedup trap, plus doc / test-name polish. See [Hardening — post-PR-5j hardening pass](#hardening--post-pr-5j-hardening-pass) below. |
+
+#### Hardening — post-PR-5j hardening pass
+
+Eighteen commits between the PR-5r ship-line and the v0.15 cut hardened the surface against the issues a focused second-pass review surfaced. The commits group by area:
+
+**DoS surfaces**
+- **`heat:blob:` flood cap.** `MeshNode::filter_unauthorized_heat_tags` caps incoming blob-heat tags at 256 per announcement; the post-fix cap bounds the migration-controller amplification (each surviving heat tag drives an `adapter.prefetch` attempt). (`31742dfd`)
+- **`get_by_origin_hash` truncation collision.** `CapabilityIndex::by_origin_hash` is a `u32`-keyed shortcut keyed on a truncated `origin_hash`. A `collision_count: AtomicU64` field surfaces last-writer-wins collisions on the admission hot path so operators can observe the rate without a wire-format change. (`ea559e19`)
+- **Per-peer prefetch admit cap per tick.** `BlobMigrationController` caps the number of admit verdicts that turn into prefetch calls per single peer per tick so a peer can't dominate the disk-bandwidth budget. (`0bef0b9a`)
+- **Per-channel `chain_blob_refs` shadow set cap.** The greedy runtime's per-channel blob-ref tracking is bounded — a misbehaving publisher can't inflate per-channel memory unboundedly. (`1c255b41`)
+
+**Soundness**
+- **Python `&[u8]` parameter captures.** `PyMeshBlobAdapter::store` / `blob_publish` / `blob_resolve` now copy bytes under the GIL (`data.to_vec()`) before `py.detach()` releases it. PyO3 0.28's strict `&[u8]` type check also rejects `bytearray` at the FFI boundary; the post-fix layer keeps the unsound capture-then-detach pattern from regressing in a future PyO3 relaxation. (`a9389868`)
+- **Capability index — fail closed on ambiguous wire origin_hash.** The wire `u32` truncation can collide; the lookup now fails closed when ambiguous and falls back to the empty-caps default for vacant slots. (`f7af0c17`, `2554502b`)
+- **`MeshBlobAdapter` serialized per-hash stores.** Concurrent stores against the same hash serialize through a per-hash lock; the storer verifies bytes already on disk match the content address before short-circuiting the idempotent re-store path. (`1369555a`)
+
+**Races**
+- **`gravity_tick` policy + emissions captured under one read lock.** Pre-fix `gravity_tick` took the gravity `RwLock` twice — once to snapshot sink + emissions, again to pull the policy for `normalize_rate_for_wire()`. A concurrent `set_gravity` / `clear_gravity` between the two reads could resurface a different policy (or none), so emissions computed under policy A would normalize against policy B. (`8a21009c`)
+- **Manifest dedup trap.** `drive_blob_migration_tick_with_manifest_resolver` only inserts hashes into the dedup set after a *successful* Admit + Ok prefetch; rejected siblings + prefetch errors stay reconsiderable when the same hash surfaces under a later candidate's manifest expansion. (`04247acd`)
+- **Migration scope floor across heat advertisers.** The publisher-scope check in `BlobMigrationController` floors at the narrowest claim across all heat advertisers for the same hash so a single broad-scope peer can't bypass a narrower-scope peer's gate. (`fb41a8c9`)
+
+**Label injection**
+- **Prometheus `adapter_id` escape.** Operator-supplied `adapter_id` is now run through a Prometheus text-exposition escape (`\\`, `\"`, `\n`) before being interpolated into label values, so a label payload can't close the quote and inject fake metric lines. (`04247acd`)
+
+**Operator surface hardening**
+- **`net-blob get --out` refuses to clobber existing files.** The CLI is operator-facing and may run with elevated privileges; a naive `fs::write` would happily overwrite arbitrary paths. Pinned via integration test. (`d8e591c4`)
+- **`delete_chunk` drops refcount entry.** Pre-fix only `sweep_gc` removed the refcount-table entry; an explicit `delete_chunk` left a zombie row. (`1d3ed332`)
+- **Typed `BlobError::Unauthorized`.** The auth-rejection surface gets its own variant so callers can disambiguate auth failure from other rejection modes. (`db096aff`)
+
+**Doc + test-name + build-graph polish**
+- **`dataforts = ["redex", "redex-disk", "dep:blake3"]`.** `--features dataforts` alone failed to compile because the blob path calls `RedexFile::sync()` (gated behind `redex-disk`); the feature graph now encodes the actual dep. (`8cf96b0e`)
+- **Admission test renames.** Two `pull_rejects_*` tests asserted `Admit` (Zone-narrower-than-Mesh and absent-publisher-scope-defaults-to-Mesh); renamed to `pull_admits_*`. `controller_skips_peers_without_blob_heat_tags` renamed to `controller_ignores_chain_heat_shape_tags` to match what it actually tests. (`8a21009c`)
+- **`BlobRef::encoded_len` doc.** Previously claimed "cheap for both variants"; now documents Small as O(1) and Manifest as full-encode-cost. (`8a21009c`)
+- **`PyMeshBlobAdapter::fetch_range` doc.** Spells out the half-open `[start, end)` shape tied to Python slice semantics instead of "inclusive / exclusive respectively". (`8a21009c`)
+- **`publish_with_blob` atomicity claim dropped.** The pre-fix doc overstated atomicity; the operation chunk-advertises before the publish, with the ordering documented inline. (`c941fe50`)
+- **Low / medium severity bundles.** Decode bound + cap footgun + scope warn + CLI hygiene + hex32 dedup + placement doc + fetch alloc + metrics naming + CRLF escape. (`594f6d64`, `9dcb9a16`)
 
 ### Still deferred — items that warrant their own design step
 
-- **Cross-binding fixtures (T-5).** Python / Node / Go binding wrappers exist for the v0.15 `BlobAdapter` shape but not for the v0.2 `MeshBlobAdapter` + `publish_with_blob` + `BlobRefcountTable` + `BlobMetrics` + `prefetch` + migration-controller surfaces. Useful follow-up; not load-bearing for the substrate. Likely shipped per-binding (Python first, given the project's primary FFI consumer) rather than as one bulk PR — each language's surface is a few hundred lines and has its own idiomatic shape.
-- **`net blob` CLI.** Operator surface deferred from PR-4a's scope. No existing CLI binary in `net/crates/net` today (no `[[bin]]` target + no `clap`/`argh` dep), so a `net blob` tool would start with bin scaffolding + an IPC/connection model to talk to a running `MeshNode`. Useful follow-up but needs design context (operator vs developer tool, daemon vs library mode) before scope crystallizes.
-- **Multi-node prefetch e2e.** PR-5i's prefetch tests use a `RecorderAdapter` mock at the unit level; PR-5j-d's migration tests use the same mock against a populated `CapabilityIndex`. A 3-node DST proving A publishes + advertises → B admits via G-1 + calls `prefetch` → C is the actual chunk holder + replicates to B is a useful follow-up but requires a 3-node harness the current 2-node `dataforts_greedy_e2e.rs` doesn't express. Same harness gap blocks an end-to-end gravity-migration DST: A publishes → A's fetches bump heat → A's gravity tick emits `heat:blob:` tags → B observes the tags via gossip → B's migration controller calls prefetch → B's chunk channels populate.
-- **Manifest-aware migration.** `parse_blob_heat_tag` surfaces a single 32-byte hash; the migration controller builds a `BlobRef::Small` from `(hash, size)` and prefetches that single chunk. Recursive per-chunk migration of `BlobRef::Manifest` blobs needs a side index relating the manifest hash to its chunk list — either an `EventMeta` projection the publisher maintains or a separate `manifest:<hex>:chunks=<list>` capability tag family. Useful refinement once a workload demonstrates manifest-sized blobs dominating the migration traffic.
+- **Cross-binding fixtures (T-5) for Node + Go.** Python lands in PR-5m (the project's primary FFI consumer); Node + Go follow per-binding rather than as one bulk PR — each language's surface is a few hundred lines and has its own idiomatic shape.
+- **End-to-end gravity-migration DST.** PR-5n's 3-node harness covers prefetch + migration via direct controller calls; the full A-publishes → A's fetches bump heat → A's tick emits `heat:blob:` → B observes via gossip → B's migration controller calls prefetch path needs deterministic-simulation wiring to test reproducibly. The unit + integration tests cover the path piecewise.
+- **Storage-overflow push-to-peer.** v0.2 is intentionally pull-only per § G-3. When local disk crosses the unhealthy threshold the node advertises `dataforts:blob-storage-unhealthy` and other nodes' admission rejects inbound migrations; the node itself doesn't actively push its blobs to peers with free disk. An active offload path (mirror of `should_migrate_blob_to` for receive-side acceptance, eviction order driven by inverse blob-heat) is a useful refinement when a workload demonstrates sustained local saturation.
 
 ---
 

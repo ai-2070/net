@@ -2,7 +2,7 @@
 
 *Named after Billy Idol's 1983 album / title track — a release that asks "more, more, more" of the substrate The Warriors laid down. v0.14 made replication the load-bearing layer underneath the channel surface. v0.15 stacks the four-phase Dataforts compositional layer on top: greedy-LRU caching pulls in-scope chains, data gravity drifts hot ones toward their readers, `BlobRef` carries content-addressed pointers without owning the bytes, and read-your-writes gives producers a session-bounded "did my write land yet?" handle. No new wire protocol — every phase composes against the existing capability index, proximity graph, and `causal:` tag layer that landed in The Warriors.*
 
-v0.15 lands **the full Rebel Yell roadmap from [`DATAFORTS_PLAN.md`](../misc/DATAFORTS_PLAN.md)** — Phases 1, 3, 4, and 5 of the seven-phase plan ship in this release, completing Dataforts as a compositional data plane on top of the v0.14 substrate. The full surface ships across Rust core, Python, Node, Go, and C FFI, with end-to-end mesh integration; greedy and gravity are runtime-toggleable policies (operators flip them on / off live against a running mesh, no rebuild required); the single `dataforts` Cargo feature gates whether the surface compiles at all.
+v0.15 lands **the full Rebel Yell roadmap from [`DATAFORTS_PLAN.md`](../misc/DATAFORTS_PLAN.md)** — Phases 1, 3, 4, and 5 of the seven-phase plan ship in this release, completing Dataforts as a compositional data plane on top of the v0.14 substrate. The full surface ships across Rust core, Python, Node, Go, and C FFI, with end-to-end mesh integration; greedy and gravity are runtime-toggleable policies (operators flip them on / off live against a running mesh, no rebuild required); the single `dataforts` Cargo feature gates whether the surface compiles at all. A **mesh-native blob storage extension (Phase 3.5)** lands in the same release — `MeshBlobAdapter` implements the v0.15 `BlobAdapter` trait against the local mesh's RedEX replication layer, so a Dataforts-enabled cluster has a working content-addressed blob store the moment `Redex::enable_replication(mesh)` is called. See [`DATAFORTS_BLOB_STORAGE_PLAN.md`](../plans/DATAFORTS_BLOB_STORAGE_PLAN.md) for the design.
 
 The hardening posture from the Black Diamond line continues. Two coordinated code-review passes landed before the v0.15 branch cut: the primary `dataforts-feature` review ([`docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md`](../misc/CODE_REVIEW_2026_05_11_DATAFORTS.md)) closed 54 numbered items D-1..D-54, an independent second pass surfaced 11 N-series items, all but three (deferred with rationale) closed. Five post-merge follow-up commits on the `channel-hash-32` branch hardened the RPC-inbound dispatcher hot path and tightened collision-lookup contracts.
 
@@ -160,6 +160,143 @@ Adapters can be written in the host language across every binding:
 - **C / cgo** — `NetBlobAdapterVtable` with per-field null-check at registration; partial vtables return `NET_ERR_BLOB_VTABLE_INVALID` rather than crashing on first dispatch (D-22).
 
 `BlobError::NotFound(uri)` sanitizes the URI before including it in the error string — control chars escape as `\xNN`, length caps at 256 bytes — so a binding logging the error can't be log-injected by an attacker who controls the URI (D-31).
+
+---
+
+## Mesh-native blob storage (Phase 3.5)
+
+Phase 3's `BlobRef` + `BlobAdapter` hook treats the substrate as a *carrier* for content-addressed pointers — the bytes live in S3 / Ceph / IPFS / the local FS. Phase 3.5 extends that hook with a **substrate-owned content-addressed store**: `MeshBlobAdapter` implements `BlobAdapter` against the local mesh's RedEX replication layer, registered under the `mesh://` URI scheme. A Dataforts-enabled cluster has a working blob store the moment `Redex::enable_replication(mesh)` is called; operators pick a `replication_factor` instead of standing up a separate storage system.
+
+The full plan + design rationale lives in [`DATAFORTS_BLOB_STORAGE_PLAN.md`](../plans/DATAFORTS_BLOB_STORAGE_PLAN.md). Shipped as PR-5a through PR-5r + a post-feature hardening bundle.
+
+### `MeshBlobAdapter`
+
+```rust
+let adapter = MeshBlobAdapter::new("mesh-prod", redex.clone())
+    .with_persistent(true)
+    .with_replication(ReplicationConfig::factor(3))
+    .with_retention_floor(Duration::from_secs(24 * 3600))
+    .with_disk_capacity(1 << 40)
+    .with_auth_guard(auth_guard.clone())
+    .with_blob_heat(blob_heat_registry, Duration::from_secs(60));
+```
+
+Implements `BlobAdapter::{store, fetch, fetch_range, exists, delete, stat, prefetch}` plus `store_stream` / `fetch_stream` for multi-GB payloads. `store` BLAKE3-verifies the supplied bytes against `blob_ref.hash` before persisting; idempotent — repeated stores of identical bytes against the same hash are a no-op. Chunks above the 4 MiB threshold split into independently-content-addressed `RedexFile`s, with a small manifest blob (one `BlobRef::Manifest`) carrying the chunk list.
+
+### `BlobRef::Manifest` + chunking
+
+`BlobRef` gains a `Manifest { encoding, chunks: Vec<ChunkRef>, size }` variant alongside the v0.15 `Small`. Wire form is forward-compatible — the 4-byte magic + version byte gate variants. `Encoding::Replicated` ships in v0.2; `Encoding::ReedSolomon { k, m }` is reserved on the wire for v0.3. Chunking is fixed-size 4 MiB; a 16 GiB blob holds 4096 chunk references (≈144 KiB manifest, within the inline path itself).
+
+### `publish_with_blob` — store-then-publish
+
+```rust
+let receipt = mesh.publish_with_blob(
+    channel,
+    payload_bytes,
+    BlobDurability::ReplicatedTo(3),
+).await?;
+```
+
+Stores the bytes to the configured durability, then publishes an event referencing the resulting `BlobRef`. The receipt carries a `WriteToken` whose `applied_through_seq` watermark composes with Phase 5's read-your-writes — a consumer calling `tasks.wait_for_token(token, deadline)` blocks until both the publish event has folded and the chunks have replicated to the requested durability. `BlobDurability::{BestEffort, DurableOnLocal, ReplicatedTo(n)}` chooses the trade-off between latency and the durability guarantee the receipt asserts.
+
+### Refcount + GC + pinning
+
+`BlobRefcountTable` tracks per-hash references from three sources: RedEX chain folds (PR-5h wires greedy into the increment / decrement path on cache admit / eviction), CortEX adapters indexing events, and direct `pin(blob_ref)` / `unpin(blob_ref)` operator calls. `sweep_gc(now, disk_pressure)` collects refcount = 0 + unpinned hashes whose `first_seen` is older than the retention floor (default 24 h); `disk_pressure = true` bypasses the floor for emergency reclaim. `delete_chunk` drops the refcount entry inline rather than waiting for the sweep.
+
+A health gate advertises `dataforts:blob-storage-unhealthy` when local disk crosses 95 % and clears at 85 % (hysteresis); other nodes' admission filters reject inbound migrations to an unhealthy node.
+
+### Capability extension
+
+Three new capability families compose against the existing 5-axis `PlacementFilter`:
+
+- **`BlobCapability`** — `storage`, `disk_total_gb`, `disk_free_gb`, `class`.
+- **`GreedyCapability`** — `enabled`, `scope`, `proximity`. Same shape as the chain-side greedy gate; blobs reuse the chain proximity score.
+- **`GravityCapability`** — `enabled`, `scope`, `proximity`. Independent of greedy; a node can participate in gravity migration without speculatively greedy-pulling.
+
+`PlacementFilter` gains an `Artifact::Blob { blob_hash, size_bytes, encoding, capabilities }` variant; the score function reads `blob.disk_free_gb` + `blob.storage` + `gravity.scope` to gate blob placement.
+
+`TopologyScope` (Node ⊂ Zone ⊂ Region ⊂ Mesh) is a hard boundary on greedy / gravity decisions — `scope == Zone` means the local node never pulls or accepts migration of a blob whose publisher is in a different zone.
+
+### G-1 / G-2 / G-3 — admission, gravity, migration
+
+Three pure-logic decision primitives plus the runtime that consumes them:
+
+- **`should_pull_blob(local_caps, publisher_caps)` (G-1).** Greedy admission verdict: `Admit` / `Reject(reason)` where `reason ∈ { NoStorageCap, GreedyDisabled, ProximityZero, Unhealthy, ScopeMismatch }`. Wired into `GreedyRuntime::dispatch_event` so admitted chains carrying `BlobRef`s trigger a `BlobAdapter::prefetch` on the referenced blob. Counters: `dataforts_greedy_blob_pulls_admitted_total` / `…_rejected_total{reason}`.
+- **`should_migrate_blob_to(target_caps, publisher_caps, size_bytes)` (G-2 / G-3).** Gravity migration verdict for `target_caps`; extends the `should_pull_blob` shape with a `disk_free_gb` headroom check (rounded up — `1.5 GiB blob → ceil(1.5) = 2 GiB required`). `MigrateBlobReject::InsufficientDisk` is the additional variant.
+- **`drive_blob_migration_tick(local_caps, capability_index, adapter, size_resolver)`** + the `_with_manifest_resolver` variant. Walks peers in the capability index, parses `heat:blob:<hex>=<rate>` reserved tags via `parse_blob_heat_tag`, runs `should_migrate_blob_to` against each candidate, and on admit calls `adapter.prefetch`. The manifest-resolver variant recursively prefetches every constituent chunk of a `BlobRef::Manifest` (PR-5o). Returns a `BlobMigrationTickReport` with per-reason counters for operator dashboards.
+
+Per-node pull, not centralized push — each node decides what to pull from its local capability view. The plan documents the storage-overflow push-to-peer track as deferred future work.
+
+### Blob heat — `heat:blob:<hex>=<rate>` tags
+
+Mirrors the chain-side gravity layer with a key-shape change: blob heat keys on the 32-byte chunk hash. `BlobHeatRegistry` (LRU + cap + half-life decay, same discipline as `HeatRegistry`); `MeshBlobAdapter::with_blob_heat(registry, half_life)` opts the adapter into bumping heat on every successful `fetch` / `fetch_range`. `MeshBlobAdapter::tick_blob_heat(policy, sink)` walks the registry and routes `Emit { rate }` / `Withdraw` decisions through the `BlobHeatSink` trait; `MeshNode` implements the sink by adding a `heat:blob:<hex64>=<rate>` reserved tag to the local capability set and rebroadcasting via `announce_capabilities`.
+
+The `blob:` body sub-prefix keeps blob-heat tags disjoint from chain-heat tags on the wire (`heat:<origin_hex>=<rate>` for chains, `heat:blob:<hash_hex>=<rate>` for blobs).
+
+### G-6 — Auth
+
+`pin_authorized` / `unpin_authorized` / `delete_chunk_authorized` gate on `AuthGuard::is_authorized_full(origin, channel)` against the chain that originally published the blob. The unauth `pin` / `unpin` / `delete_chunk` variants remain available for system-internal callers (GC sweep, chain-fold refcount increment / decrement). `BlobError::Unauthorized` is the typed rejection.
+
+### `net-blob` operator CLI
+
+Operator surface shipped behind the new `cli` Cargo feature (`features = ["dataforts", "redex-disk", "cli"]`). Subcommands:
+
+- `net-blob put <path>` — store + return the resulting `BlobRef`.
+- `net-blob get <hash> --out <path>` — fetch; refuses to clobber existing output files.
+- `net-blob exists <hash>` — exit 0 if present, exit 1 if absent.
+- `net-blob stat <hash>` — refcount + size + last-seen.
+- `net-blob ls` — list known content hashes.
+- `net-blob pin <hash>` / `net-blob unpin <hash>` — operator pin / unpin.
+- `net-blob gc [--retention <duration>] [--dry-run] [--disk-pressure]` — GC sweep. `--dry-run` lists candidates; `--disk-pressure` bypasses the retention floor.
+- `net-blob metrics` — Prometheus text body.
+
+`--format json` is available across every subcommand for scripting; `parse_duration` accepts `30s` / `5m` / `1h` / `24h` / `7d`.
+
+### Cross-binding — Python
+
+`net.MeshBlobAdapter` lands in the Python binding behind `--features dataforts`. Methods: `store(blob_ref, data)`, `fetch(blob_ref) -> bytes`, `fetch_range(blob_ref, start, end) -> bytes` (half-open `[start, end)`), `exists(blob_ref) -> bool`, `prometheus_text() -> str`. Plus a `PyBlobRef` constructor taking `(uri, hash_bytes, size)` and round-tripping through `encode()` / `BlobRef.from_encoded(bytes)`. Persistent mode (`MeshBlobAdapter(redex, "id", persistent=True)`) writes per-chunk `RedexFile`s to disk.
+
+Node + Go binding wrappers for the v0.2 `MeshBlobAdapter` surface are tracked as deferred per-binding follow-ups in the plan doc.
+
+### Hardening — post-PR-5j review pass
+
+Eighteen commits between PR-5r and the v0.15 cut closed second-pass review items. Grouped by area:
+
+**DoS surfaces**
+- `MeshNode::filter_unauthorized_heat_tags` caps incoming `heat:blob:` tags at 256 per announcement; the cap bounds migration-controller amplification (each surviving heat tag drives a `prefetch` attempt).
+- `CapabilityIndex::by_origin_hash` is a `u32`-truncated shortcut; an `AtomicU64 collision_count` field surfaces last-writer-wins collisions on the admission hot path for operator observability (a wire-format-preserving fix; full collision-safe indexing is out of scope for v0.15).
+- `BlobMigrationController` caps per-peer prefetch admits per tick so a single peer can't dominate the disk-bandwidth budget.
+- Per-channel `chain_blob_refs` shadow set in the greedy runtime is bounded; a misbehaving publisher can't inflate per-channel memory unboundedly.
+
+**Soundness**
+- Python `&[u8]` adapter parameters (`PyMeshBlobAdapter::store`, `blob_publish`, `blob_resolve`) now copy bytes under the GIL (`data.to_vec()`) before `py.detach()`. PyO3 0.28's strict `&[u8]` type-rejects `bytearray` at the FFI boundary; the post-fix copy keeps the capture-then-detach pattern safe against a hypothetical future PyO3 relaxation.
+- `CapabilityIndex` fails closed when a wire `u32 origin_hash` is ambiguous and falls back to the empty-caps default for vacant slots.
+- `MeshBlobAdapter` serializes concurrent stores against the same hash through a per-hash lock and BLAKE3-verifies bytes already on disk match the content address before short-circuiting the idempotent re-store path.
+
+**Races**
+- `gravity_tick` captures sink + emissions + policy under one read of the gravity RwLock. Pre-fix it took the lock twice; a concurrent `set_gravity` / `clear_gravity` between reads could renormalize emissions computed under policy A against policy B.
+- `drive_blob_migration_tick_with_manifest_resolver` only inserts hashes into the dedup set after a successful Admit + Ok prefetch; rejected siblings + prefetch errors stay reconsiderable when the same hash surfaces under a later candidate's manifest expansion.
+- `BlobMigrationController` floors the publisher-scope check at the narrowest claim across all heat advertisers for the same hash so a single broad-scope peer can't bypass a narrower-scope peer's gate.
+
+**Label injection**
+- Operator-supplied `adapter_id` is escaped per the Prometheus text-exposition spec (`\\`, `\"`, `\n`) before being interpolated into label values. A `--adapter-id 'evil"\n# bogus_metric{} 1\n#'` payload can't inject fake metric lines.
+
+**Operator-surface hardening**
+- `net-blob get --out` refuses to clobber existing output files (the CLI may run with elevated privileges).
+- `delete_chunk` drops the refcount entry inline rather than waiting for `sweep_gc`.
+- `BlobError::Unauthorized` typed variant separates auth-rejection from other rejection modes.
+
+**Build graph**
+- `dataforts = ["redex", "redex-disk", "dep:blake3"]`. `--features dataforts` alone previously failed to compile because the blob path calls `RedexFile::sync()` which is gated behind `redex-disk`. The feature graph now encodes the actual dep.
+
+**Doc + test-name polish**
+- Two `pull_rejects_*` admission tests asserted `Admit` (Zone-narrower-than-Mesh + absent-publisher-scope-defaults-to-Mesh) — renamed to `pull_admits_*`.
+- `controller_skips_peers_without_blob_heat_tags` renamed to `controller_ignores_chain_heat_shape_tags`.
+- `BlobRef::encoded_len` doc now documents Small as O(1) and Manifest as full-encode-cost (was "cheap for both variants").
+- `PyMeshBlobAdapter::fetch_range` doc spells out half-open `[start, end)` tied to Python slice semantics.
+- `publish_with_blob` doc drops the overstated atomicity claim and documents chunk-advertise ordering inline.
+
+The full per-commit log lives in the plan doc's [Shipping status](../plans/DATAFORTS_BLOB_STORAGE_PLAN.md#shipping-status) table under "Hardening — post-PR-5j hardening pass."
 
 ---
 
