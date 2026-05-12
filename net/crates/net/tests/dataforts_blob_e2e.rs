@@ -630,8 +630,8 @@ async fn three_node_parallel_migration_lands_blob_on_two_peers() {
 /// Pair-handshake without `start()` — used by the 3-node test
 /// because `accept()` after `start()` is rejected. The 2-node
 /// tests can call `handshake()` directly which does both;
-/// >2-node topologies need to batch the accepts before any
-/// `start()` lands.
+/// larger topologies (3+ nodes) need to batch the accepts
+/// before any `start()` lands.
 async fn handshake_no_start(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
     let a_id = a.node_id();
     let b_id = b.node_id();
