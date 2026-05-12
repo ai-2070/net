@@ -1,0 +1,19 @@
+net/crates/net/tests/dataforts_greedy_e2e.rs
+  s_3a0a24a47d1a36::t_36af76d01e23ca 436-650
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "6497ea819ea8f7823644ac4c8f88850038b660e9",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
