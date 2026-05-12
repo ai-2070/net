@@ -248,14 +248,18 @@ pub enum OperatorPlan {
         right: Box<OperatorNode>,
         /// How to extract the join key from each side's rows.
         key_mode: JoinKeyMode,
-        /// Inner / outer semantics. Phase D-1 supports only
-        /// `Inner`; other variants surface a `PlannerError`
-        /// at execute time and are deferred to Phase D-2.
+        /// Inner / outer semantics. All four kinds ship in
+        /// Phase D-2.
         kind: JoinKind,
+        /// Algorithm picker. Phase D-1 shipped
+        /// `HashBroadcast`; Phase D-2 adds `SortMerge` for
+        /// the unbounded-build-side case.
+        strategy: JoinStrategy,
         /// Late-arrival watermark per locked decision #2.
-        /// Phase D-1 ignores the value (snapshot semantics);
-        /// kept on the operator for protocol round-trip and
-        /// Phase D-2 streaming activation.
+        /// MeshDB's executor runs over snapshot inputs, so
+        /// the watermark is informational only at present —
+        /// streaming-window joins are a Phase F+ extension
+        /// once a consumer drives the streaming semantics.
         watermark: Duration,
     },
     /// Placeholder operator — emitted by the planner when an
@@ -274,11 +278,10 @@ pub enum OperatorPlan {
     },
 }
 
-/// Phase D-1 join-key extraction mode. Constrains keys to the
-/// row's intrinsic fields (`origin` / `seq`); richer key
-/// extraction over event payloads lands in Phase E once a
-/// row-schema layer exists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Join-key extraction mode. Started in Phase D-1 with row-
+/// intrinsic-only modes; Phase D-2 adds payload-keyed extraction
+/// via [`JoinKeyMode::Field`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinKeyMode {
     /// Hash on `ResultRow.origin` (8-byte LE encoding).
     Origin,
@@ -286,6 +289,31 @@ pub enum JoinKeyMode {
     Seq,
     /// Hash on the `(origin, seq)` tuple (16-byte LE encoding).
     OriginSeq,
+    /// Hash on the canonical string projection of a row's
+    /// payload field at `path`. JSON payloads only; rows whose
+    /// path resolves to a missing key, non-JSON payload, or
+    /// non-scalar leaf are silently dropped from the build
+    /// side (so unmatched-build outer-join semantics treat
+    /// them as if the row never existed).
+    Field(String),
+}
+
+/// Hash-join algorithm picker. Phase D-1 shipped broadcast
+/// hash; Phase D-2 adds sort-merge as an alternative for very
+/// large inputs whose build side wouldn't fit in memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinStrategy {
+    /// In-memory hash table on the build side, probe on the
+    /// other side. Best for small-or-medium build sides;
+    /// surfaces [`super::error::MeshError::JoinMemoryExceeded`]
+    /// past the configured bound.
+    HashBroadcast,
+    /// Sort both sides on the join key, then two-pointer
+    /// merge. Better for very large inputs that won't fit the
+    /// hash table's memory bound. Phase D-2's planner picks
+    /// hash by default; consumers driving the choice point at
+    /// sort-merge via the explicit operator.
+    SortMerge,
 }
 
 /// Direction of a [`OperatorPlan::LineageEmit`] walk.
@@ -657,12 +685,19 @@ where
                 .latency_ms
                 .max(right_plan.total_cost.latency_ms),
         };
+        // Phase D-2 strategy pick: hash-broadcast by default
+        // (matches the original Phase D-1 behaviour). A future
+        // refinement consults cardinality estimates from the
+        // capability index's `aggregate` primitive — see the
+        // plan's Cost Model section.
+        let strategy = JoinStrategy::HashBroadcast;
         Ok(OperatorNode {
             operator: OperatorPlan::HashJoin {
                 left: Box::new(left_plan.root),
                 right: Box::new(right_plan.root),
                 key_mode,
                 kind,
+                strategy,
                 watermark,
             },
             target_nodes: vec![],
@@ -1412,14 +1447,13 @@ fn parse_fork_body(body: &str) -> Option<u64> {
     u64::from_str_radix(body, 16).ok()
 }
 
-/// Derive the Phase D-1 [`JoinKeyMode`] from a [`JoinKey`].
+/// Derive the [`JoinKeyMode`] from a [`JoinKey`].
 ///
-/// Phase D-1 supports row-intrinsic keys only: both sides must
-/// agree on the same field, and that field must be `"origin"`
-/// or `"seq"` (special-cased) or the literal `"origin,seq"`
-/// composite. Anything else surfaces a `PlannerError` so the
-/// caller knows payload-keyed joins are deferred to Phase E
-/// (which needs row-schema decoding).
+/// Both sides must agree on the same field name. Row-intrinsic
+/// names (`"origin"`, `"seq"`, `"origin,seq"`) map to the
+/// matching `JoinKeyMode` enum variant; anything else is
+/// treated as a JSON payload path and maps to
+/// `JoinKeyMode::Field(path)` (Phase D-2 row-schema decoding).
 fn key_mode_for_join(on: &JoinKey) -> Result<JoinKeyMode, MeshError> {
     let left = field_name(&on.left_field).ok_or_else(|| MeshError::PlannerError {
         detail: format!("join left key must be a field reference, got {:?}", on.left_field),
@@ -1433,20 +1467,16 @@ fn key_mode_for_join(on: &JoinKey) -> Result<JoinKeyMode, MeshError> {
     if left != right {
         return Err(MeshError::PlannerError {
             detail: format!(
-                "join key sides must reference the same row field in Phase D-1 (left='{left}', right='{right}'); payload-keyed joins land in Phase E"
+                "join key sides must reference the same field name (left='{left}', right='{right}')"
             ),
         });
     }
-    match left {
-        "origin" => Ok(JoinKeyMode::Origin),
-        "seq" => Ok(JoinKeyMode::Seq),
-        "origin,seq" => Ok(JoinKeyMode::OriginSeq),
-        other => Err(MeshError::PlannerError {
-            detail: format!(
-                "join key '{other}' is not a row-intrinsic field; only 'origin' / 'seq' / 'origin,seq' supported in Phase D-1"
-            ),
-        }),
-    }
+    Ok(match left {
+        "origin" => JoinKeyMode::Origin,
+        "seq" => JoinKeyMode::Seq,
+        "origin,seq" => JoinKeyMode::OriginSeq,
+        other => JoinKeyMode::Field(other.to_string()),
+    })
 }
 
 /// Borrow the inner `&str` of an [`Expr::Field`]. Returns
@@ -2663,12 +2693,14 @@ mod tests {
             OperatorPlan::HashJoin {
                 key_mode,
                 kind,
+                strategy,
                 watermark,
                 left,
                 right,
             } => {
                 assert_eq!(key_mode, JoinKeyMode::Origin);
                 assert_eq!(kind, JoinKind::Inner);
+                assert_eq!(strategy, JoinStrategy::HashBroadcast);
                 assert_eq!(watermark, Duration::from_secs(5));
                 assert!(matches!(left.operator, OperatorPlan::LatestRead { .. }));
                 assert!(matches!(right.operator, OperatorPlan::LatestRead { .. }));
@@ -2706,14 +2738,16 @@ mod tests {
         let err = planner.plan(&join_query("origin", "seq", l, r)).unwrap_err();
         match err {
             MeshError::PlannerError { detail } => {
-                assert!(detail.contains("same row field") || detail.contains("disagree"));
+                assert!(detail.contains("same field name"), "got: {detail}");
             }
             other => panic!("expected PlannerError; got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_join_on_payload_field_surfaces_phase_e_planner_error() {
+    fn plan_join_on_payload_field_produces_field_key_mode() {
+        // Phase D-2 finish: payload-keyed joins resolve to
+        // JoinKeyMode::Field(<path>), not a PlannerError.
         let l = 0x7777;
         let r = 0x8888;
         let index = index_with(vec![
@@ -2721,14 +2755,17 @@ mod tests {
             (2, caps_with_causal_presence(r)),
         ]);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
-        let err = planner
+        let plan = planner
             .plan(&join_query("payload.request_id", "payload.request_id", l, r))
-            .unwrap_err();
-        match err {
-            MeshError::PlannerError { detail } => {
-                assert!(detail.contains("Phase D-1"));
+            .unwrap();
+        match plan.root.operator {
+            OperatorPlan::HashJoin { key_mode, .. } => {
+                assert_eq!(
+                    key_mode,
+                    JoinKeyMode::Field("payload.request_id".to_string())
+                );
             }
-            other => panic!("expected PlannerError; got {other:?}"),
+            other => panic!("expected HashJoin; got {other:?}"),
         }
     }
 

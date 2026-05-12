@@ -252,6 +252,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             right,
             key_mode,
             kind,
+            strategy,
             ..
         } = plan.root.operator
         else {
@@ -274,17 +275,22 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
         let left_rows = drain_rows(left_running.rows).await?;
         let right_rows = drain_rows(right_running.rows).await?;
 
-        let pairs = match kind {
-            JoinKind::Inner => federated_hash_join(left_rows, right_rows, key_mode, false, false)?,
-            JoinKind::LeftOuter => {
-                federated_hash_join(left_rows, right_rows, key_mode, true, false)?
+        let pairs = match (strategy, kind) {
+            (super::planner::JoinStrategy::HashBroadcast, JoinKind::Inner) => {
+                federated_hash_join(left_rows, right_rows, &key_mode, false, false)?
             }
-            JoinKind::RightOuter => {
-                // Swap: build on right, probe with left, then
-                // swap labels back when packing JoinedRowPayload.
-                federated_hash_join(right_rows, left_rows, key_mode, true, true)?
+            (super::planner::JoinStrategy::HashBroadcast, JoinKind::LeftOuter) => {
+                federated_hash_join(left_rows, right_rows, &key_mode, true, false)?
             }
-            JoinKind::FullOuter => federated_full_outer(left_rows, right_rows, key_mode)?,
+            (super::planner::JoinStrategy::HashBroadcast, JoinKind::RightOuter) => {
+                federated_hash_join(right_rows, left_rows, &key_mode, true, true)?
+            }
+            (super::planner::JoinStrategy::HashBroadcast, JoinKind::FullOuter) => {
+                federated_full_outer(left_rows, right_rows, &key_mode)?
+            }
+            (super::planner::JoinStrategy::SortMerge, k) => {
+                federated_sort_merge(left_rows, right_rows, &key_mode, k)?
+            }
         };
 
         let mut out: Vec<Result<ResultRow, MeshError>> = Vec::new();
@@ -416,7 +422,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
                 }))
                 .await?;
                 let rows = drain_rows(inner.rows).await?;
-                execute_aggregate_reduction(&rows, group_by, &field_path, kind)?
+                execute_aggregate_reduction(&rows, group_by.as_ref(), &field_path, kind)?
             }
             OperatorPlan::AggregateDistinct {
                 input,
@@ -429,7 +435,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
                 }))
                 .await?;
                 let rows = drain_rows(inner.rows).await?;
-                execute_aggregate_distinct(&rows, group_by, &field_path)?
+                execute_aggregate_distinct(&rows, group_by.as_ref(), &field_path)?
             }
             _ => unreachable!("execute_aggregate_e4_federated dispatched on wrong operator"),
         };
@@ -476,19 +482,23 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             let Some(value) = super::row::extract_numeric(row, &field_path) else {
                 continue;
             };
-            let (key_bytes, group) = match group_by {
+            let (key_bytes, group) = match &group_by {
                 None => (Vec::new(), None),
-                Some(mode) => (
-                    encode_join_key_federated(row, mode),
-                    Some(match mode {
+                Some(mode) => {
+                    let Some(bytes) = try_encode_join_key_federated(row, mode) else {
+                        continue;
+                    };
+                    let group = match mode {
                         super::planner::JoinKeyMode::Origin => GroupKey::Origin(row.origin),
                         super::planner::JoinKeyMode::Seq => GroupKey::Seq(row.seq),
                         super::planner::JoinKeyMode::OriginSeq => GroupKey::OriginSeq {
                             origin: row.origin,
                             seq: row.seq,
                         },
-                    }),
-                ),
+                        super::planner::JoinKeyMode::Field(_) => GroupKey::Origin(row.origin),
+                    };
+                    (bytes, Some(group))
+                }
             };
             let entry = acc.entry(key_bytes).or_insert((group, 0.0, 0));
             entry.1 += value;
@@ -594,14 +604,17 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             Some(mode) => {
                 let mut counts: BTreeMap<Vec<u8>, (GroupKey, u64)> = BTreeMap::new();
                 for row in &rows {
-                    let key_bytes = encode_join_key_federated(row, mode);
-                    let key = match mode {
+                    let Some(key_bytes) = try_encode_join_key_federated(row, &mode) else {
+                        continue;
+                    };
+                    let key = match &mode {
                         super::planner::JoinKeyMode::Origin => GroupKey::Origin(row.origin),
                         super::planner::JoinKeyMode::Seq => GroupKey::Seq(row.seq),
                         super::planner::JoinKeyMode::OriginSeq => GroupKey::OriginSeq {
                             origin: row.origin,
                             seq: row.seq,
                         },
+                        super::planner::JoinKeyMode::Field(_) => GroupKey::Origin(row.origin),
                     };
                     let entry = counts.entry(key_bytes).or_insert((key, 0));
                     entry.1 = entry.1.saturating_add(1);
@@ -640,7 +653,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
 fn federated_hash_join(
     build_rows: Vec<ResultRow>,
     probe_rows: Vec<ResultRow>,
-    key_mode: super::planner::JoinKeyMode,
+    key_mode: &super::planner::JoinKeyMode,
     emit_unmatched_build: bool,
     swap: bool,
 ) -> Result<Vec<JoinedPair>, MeshError> {
@@ -648,7 +661,9 @@ fn federated_hash_join(
     let mut build_bytes: u64 = 0;
     let mut build: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
     for row in build_rows {
-        let key = encode_join_key_federated(&row, key_mode);
+        let Some(key) = try_encode_join_key_federated(&row, key_mode) else {
+            continue;
+        };
         let approx = (row.payload.len() + key.len() + 64) as u64;
         build_bytes = build_bytes.saturating_add(approx);
         if build_bytes > super::executor::HASH_JOIN_MEMORY_BYTES {
@@ -662,7 +677,9 @@ fn federated_hash_join(
 
     let mut out = Vec::new();
     for p in probe_rows {
-        let key = encode_join_key_federated(&p, key_mode);
+        let Some(key) = try_encode_join_key_federated(&p, key_mode) else {
+            continue;
+        };
         if let Some(entries) = build.get_mut(&key) {
             for (b, matched) in entries.iter_mut() {
                 *matched = true;
@@ -694,13 +711,15 @@ fn federated_hash_join(
 fn federated_full_outer(
     left_rows: Vec<ResultRow>,
     right_rows: Vec<ResultRow>,
-    key_mode: super::planner::JoinKeyMode,
+    key_mode: &super::planner::JoinKeyMode,
 ) -> Result<Vec<JoinedPair>, MeshError> {
     use std::collections::HashMap;
     let mut build_bytes: u64 = 0;
     let mut right_map: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
     for row in right_rows {
-        let key = encode_join_key_federated(&row, key_mode);
+        let Some(key) = try_encode_join_key_federated(&row, key_mode) else {
+            continue;
+        };
         let approx = (row.payload.len() + key.len() + 64) as u64;
         build_bytes = build_bytes.saturating_add(approx);
         if build_bytes > super::executor::HASH_JOIN_MEMORY_BYTES {
@@ -714,7 +733,10 @@ fn federated_full_outer(
 
     let mut out = Vec::new();
     for l in left_rows {
-        let key = encode_join_key_federated(&l, key_mode);
+        let Some(key) = try_encode_join_key_federated(&l, key_mode) else {
+            out.push((Some(l), None));
+            continue;
+        };
         match right_map.get_mut(&key) {
             Some(entries) => {
                 for (r, matched) in entries.iter_mut() {
@@ -735,6 +757,75 @@ fn federated_full_outer(
     Ok(out)
 }
 
+/// Phase D-2 sort-merge mirror for the federated executor.
+fn federated_sort_merge(
+    left_rows: Vec<ResultRow>,
+    right_rows: Vec<ResultRow>,
+    key_mode: &super::planner::JoinKeyMode,
+    kind: super::query::JoinKind,
+) -> Result<Vec<JoinedPair>, MeshError> {
+    use super::query::JoinKind;
+    let mut left: Vec<(Vec<u8>, ResultRow)> = left_rows
+        .into_iter()
+        .filter_map(|r| try_encode_join_key_federated(&r, key_mode).map(|k| (k, r)))
+        .collect();
+    let mut right: Vec<(Vec<u8>, ResultRow)> = right_rows
+        .into_iter()
+        .filter_map(|r| try_encode_join_key_federated(&r, key_mode).map(|k| (k, r)))
+        .collect();
+    left.sort_by(|a, b| a.0.cmp(&b.0));
+    right.sort_by(|a, b| a.0.cmp(&b.0));
+    let emit_l = matches!(kind, JoinKind::LeftOuter | JoinKind::FullOuter);
+    let emit_r = matches!(kind, JoinKind::RightOuter | JoinKind::FullOuter);
+    let mut out = Vec::new();
+    let (mut li, mut ri) = (0usize, 0usize);
+    while li < left.len() && ri < right.len() {
+        match left[li].0.cmp(&right[ri].0) {
+            std::cmp::Ordering::Less => {
+                if emit_l {
+                    out.push((Some(left[li].1.clone()), None));
+                }
+                li += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                if emit_r {
+                    out.push((None, Some(right[ri].1.clone())));
+                }
+                ri += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                let key = left[li].0.clone();
+                let mut lj = li;
+                while lj < left.len() && left[lj].0 == key {
+                    lj += 1;
+                }
+                let mut rj = ri;
+                while rj < right.len() && right[rj].0 == key {
+                    rj += 1;
+                }
+                for l in &left[li..lj] {
+                    for r in &right[ri..rj] {
+                        out.push((Some(l.1.clone()), Some(r.1.clone())));
+                    }
+                }
+                li = lj;
+                ri = rj;
+            }
+        }
+    }
+    if emit_l {
+        for (_, l) in &left[li..] {
+            out.push((Some(l.clone()), None));
+        }
+    }
+    if emit_r {
+        for (_, r) in &right[ri..] {
+            out.push((None, Some(r.clone())));
+        }
+    }
+    Ok(out)
+}
+
 /// Drain a [`ResultStream`] into a `Vec<ResultRow>`. Errors
 /// short-circuit the drain with the first encountered error.
 async fn drain_rows(mut s: ResultStream) -> Result<Vec<ResultRow>, MeshError> {
@@ -745,23 +836,25 @@ async fn drain_rows(mut s: ResultStream) -> Result<Vec<ResultRow>, MeshError> {
     Ok(out)
 }
 
-/// Federated mirror of `executor::encode_join_key`. Duplicated
-/// to avoid a public crate-export of a Phase D-1 implementation
-/// detail; the two stay in lockstep by construction (key bytes
-/// are intentionally the same).
-fn encode_join_key_federated(
+/// Federated mirror of `executor::try_encode_join_key`. The
+/// two stay in lockstep by construction (key bytes are
+/// intentionally the same).
+fn try_encode_join_key_federated(
     row: &ResultRow,
-    mode: super::planner::JoinKeyMode,
-) -> Vec<u8> {
+    mode: &super::planner::JoinKeyMode,
+) -> Option<Vec<u8>> {
     use super::planner::JoinKeyMode;
     match mode {
-        JoinKeyMode::Origin => row.origin.to_le_bytes().to_vec(),
-        JoinKeyMode::Seq => row.seq.0.to_le_bytes().to_vec(),
+        JoinKeyMode::Origin => Some(row.origin.to_le_bytes().to_vec()),
+        JoinKeyMode::Seq => Some(row.seq.0.to_le_bytes().to_vec()),
         JoinKeyMode::OriginSeq => {
             let mut v = Vec::with_capacity(16);
             v.extend_from_slice(&row.origin.to_le_bytes());
             v.extend_from_slice(&row.seq.0.to_le_bytes());
-            v
+            Some(v)
+        }
+        JoinKeyMode::Field(path) => {
+            super::row::extract_string_projection(row, path).map(String::into_bytes)
         }
     }
 }
@@ -1333,6 +1426,7 @@ mod tests {
                     }),
                     key_mode: JoinKeyMode::Seq,
                     kind: JoinKind::Inner,
+                    strategy: super::super::planner::JoinStrategy::HashBroadcast,
                     watermark: Duration::from_secs(5),
                 },
                 target_nodes: vec![],
@@ -1401,6 +1495,7 @@ mod tests {
                     }),
                     key_mode: JoinKeyMode::Seq,
                     kind: JoinKind::LeftOuter,
+                    strategy: super::super::planner::JoinStrategy::HashBroadcast,
                     watermark: Duration::from_secs(5),
                 },
                 target_nodes: vec![],

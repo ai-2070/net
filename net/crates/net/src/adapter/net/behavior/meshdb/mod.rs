@@ -87,8 +87,8 @@ pub use federated::{
     TransportError,
 };
 pub use planner::{
-    ExecutionPlan, JoinKeyMode, LineageDirection, LineageEntry, MeshQueryPlanner, OperatorNode,
-    OperatorPlan,
+    ExecutionPlan, JoinKeyMode, JoinStrategy, LineageDirection, LineageEntry, MeshQueryPlanner,
+    OperatorNode, OperatorPlan,
 };
 pub use protocol::{
     ContinuationToken, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,

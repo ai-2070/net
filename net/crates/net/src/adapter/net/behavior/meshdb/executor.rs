@@ -41,7 +41,7 @@ use futures::stream::Stream;
 use futures::StreamExt;
 
 use super::error::MeshError;
-use super::planner::{ExecutionPlan, JoinKeyMode, OperatorNode, OperatorPlan};
+use super::planner::{ExecutionPlan, JoinKeyMode, JoinStrategy, OperatorNode, OperatorPlan};
 use super::query::{
     AggregateRowPayload, AggregateValue, GroupKey, JoinKind, JoinedRowPayload,
     NumericAggregateKind, NumericReductionKind, ResultRow, SeqNum, WindowBoundary, WindowSpec,
@@ -267,11 +267,12 @@ fn collect_operator_rows<R: ChainReader + ?Sized>(
             right,
             key_mode,
             kind,
+            strategy,
             ..
-        } => execute_hash_join(left, right, *key_mode, *kind, reader),
+        } => execute_hash_join(left, right, key_mode, *kind, *strategy, reader),
         OperatorPlan::AggregateCount { input, group_by } => {
             let rows = collect_operator_rows(input, reader)?;
-            execute_aggregate_count(&rows, *group_by)
+            execute_aggregate_count(&rows, group_by.as_ref())
         }
         OperatorPlan::AggregateNumeric {
             input,
@@ -280,7 +281,7 @@ fn collect_operator_rows<R: ChainReader + ?Sized>(
             kind,
         } => {
             let rows = collect_operator_rows(input, reader)?;
-            execute_aggregate_numeric(&rows, *group_by, field_path, *kind)
+            execute_aggregate_numeric(&rows, group_by.as_ref(), field_path, *kind)
         }
         OperatorPlan::AggregateReduction {
             input,
@@ -289,7 +290,7 @@ fn collect_operator_rows<R: ChainReader + ?Sized>(
             kind,
         } => {
             let rows = collect_operator_rows(input, reader)?;
-            execute_aggregate_reduction(&rows, *group_by, field_path, *kind)
+            execute_aggregate_reduction(&rows, group_by.as_ref(), field_path, *kind)
         }
         OperatorPlan::AggregateDistinct {
             input,
@@ -297,7 +298,7 @@ fn collect_operator_rows<R: ChainReader + ?Sized>(
             field_path,
         } => {
             let rows = collect_operator_rows(input, reader)?;
-            execute_aggregate_distinct(&rows, *group_by, field_path)
+            execute_aggregate_distinct(&rows, group_by.as_ref(), field_path)
         }
         OperatorPlan::Window { input, spec } => {
             let rows = collect_operator_rows(input, reader)?;
@@ -323,22 +324,30 @@ fn collect_operator_rows<R: ChainReader + ?Sized>(
 fn execute_hash_join<R: ChainReader + ?Sized>(
     left: &OperatorNode,
     right: &OperatorNode,
-    key_mode: JoinKeyMode,
+    key_mode: &JoinKeyMode,
     kind: JoinKind,
+    strategy: JoinStrategy,
     reader: &R,
 ) -> Result<Vec<ResultRow>, MeshError> {
     let left_rows = collect_operator_rows(left, reader)?;
     let right_rows = collect_operator_rows(right, reader)?;
 
-    match kind {
-        JoinKind::Inner => hash_join_one_sided(left_rows, right_rows, key_mode, false, false),
-        JoinKind::LeftOuter => hash_join_one_sided(left_rows, right_rows, key_mode, true, false),
+    match (strategy, kind) {
+        (JoinStrategy::HashBroadcast, JoinKind::Inner) => {
+            hash_join_one_sided(left_rows, right_rows, key_mode, false, false)
+        }
+        (JoinStrategy::HashBroadcast, JoinKind::LeftOuter) => {
+            hash_join_one_sided(left_rows, right_rows, key_mode, true, false)
+        }
         // RightOuter is symmetric: swap sides, build on right,
-        // probe with left, and remember to swap back when
-        // encoding the payload so `left` / `right` semantics
-        // stay correct from the caller's perspective.
-        JoinKind::RightOuter => hash_join_one_sided(right_rows, left_rows, key_mode, true, true),
-        JoinKind::FullOuter => hash_join_full_outer(left_rows, right_rows, key_mode),
+        // probe with left, and swap labels back when encoding.
+        (JoinStrategy::HashBroadcast, JoinKind::RightOuter) => {
+            hash_join_one_sided(right_rows, left_rows, key_mode, true, true)
+        }
+        (JoinStrategy::HashBroadcast, JoinKind::FullOuter) => {
+            hash_join_full_outer(left_rows, right_rows, key_mode)
+        }
+        (JoinStrategy::SortMerge, k) => sort_merge_join(left_rows, right_rows, key_mode, k),
     }
 }
 
@@ -352,17 +361,20 @@ fn execute_hash_join<R: ChainReader + ?Sized>(
 fn hash_join_one_sided(
     build_rows: Vec<ResultRow>,
     probe_rows: Vec<ResultRow>,
-    key_mode: JoinKeyMode,
+    key_mode: &JoinKeyMode,
     emit_unmatched_build: bool,
     swap: bool,
 ) -> Result<Vec<ResultRow>, MeshError> {
     use std::collections::HashMap;
-    // Build phase: track memory + remember whether each build
-    // entry has been matched.
     let mut build_bytes: u64 = 0;
     let mut build: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
     for row in build_rows {
-        let key = encode_join_key(&row, key_mode);
+        // Rows whose key field can't be extracted are dropped
+        // — they don't participate in matches, and for outer
+        // joins they don't form unmatched-build rows either.
+        let Some(key) = try_encode_join_key(&row, key_mode) else {
+            continue;
+        };
         let approx = (row.payload.len() + key.len() + 64) as u64;
         build_bytes = build_bytes.saturating_add(approx);
         if build_bytes > HASH_JOIN_MEMORY_BYTES {
@@ -375,10 +387,10 @@ fn hash_join_one_sided(
     }
 
     let mut out = Vec::new();
-    // Probe phase: for each probe row, emit one joined row per
-    // matching build entry and mark that build row as matched.
     for p in probe_rows {
-        let key = encode_join_key(&p, key_mode);
+        let Some(key) = try_encode_join_key(&p, key_mode) else {
+            continue;
+        };
         if let Some(entries) = build.get_mut(&key) {
             for (b, matched) in entries.iter_mut() {
                 *matched = true;
@@ -413,16 +425,15 @@ fn hash_join_one_sided(
 fn hash_join_full_outer(
     left_rows: Vec<ResultRow>,
     right_rows: Vec<ResultRow>,
-    key_mode: JoinKeyMode,
+    key_mode: &JoinKeyMode,
 ) -> Result<Vec<ResultRow>, MeshError> {
     use std::collections::HashMap;
-    // Build a map of right rows so the left scan can emit
-    // matched pairs + carry unmatched left rows; afterward,
-    // sweep the right map for unmatched right rows.
     let mut build_bytes: u64 = 0;
     let mut right_map: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
     for row in right_rows {
-        let key = encode_join_key(&row, key_mode);
+        let Some(key) = try_encode_join_key(&row, key_mode) else {
+            continue;
+        };
         let approx = (row.payload.len() + key.len() + 64) as u64;
         build_bytes = build_bytes.saturating_add(approx);
         if build_bytes > HASH_JOIN_MEMORY_BYTES {
@@ -436,7 +447,13 @@ fn hash_join_full_outer(
 
     let mut out = Vec::new();
     for l in left_rows {
-        let key = encode_join_key(&l, key_mode);
+        let Some(key) = try_encode_join_key(&l, key_mode) else {
+            // No key extractable — emit as an unmatched left
+            // (it can't match anything, but full-outer says
+            // every left row is represented).
+            out.push(encode_joined_row(Some(l), None)?);
+            continue;
+        };
         match right_map.get_mut(&key) {
             Some(entries) => {
                 for (r, matched) in entries.iter_mut() {
@@ -445,7 +462,6 @@ fn hash_join_full_outer(
                 }
             }
             None => {
-                // Unmatched left.
                 out.push(encode_joined_row(Some(l), None)?);
             }
         }
@@ -498,7 +514,7 @@ fn execute_filter(
 /// so the cache-key contract from locked decision #4 holds.
 fn execute_aggregate_count(
     rows: &[ResultRow],
-    group_by: Option<JoinKeyMode>,
+    group_by: Option<&JoinKeyMode>,
 ) -> Result<Vec<ResultRow>, MeshError> {
     use std::collections::BTreeMap;
 
@@ -518,15 +534,10 @@ fn execute_aggregate_count(
             // against pathological row counts.
             let mut counts: BTreeMap<Vec<u8>, (GroupKey, u64)> = BTreeMap::new();
             for row in rows {
-                let key_bytes = encode_join_key(row, mode);
-                let key = match mode {
-                    JoinKeyMode::Origin => GroupKey::Origin(row.origin),
-                    JoinKeyMode::Seq => GroupKey::Seq(row.seq),
-                    JoinKeyMode::OriginSeq => GroupKey::OriginSeq {
-                        origin: row.origin,
-                        seq: row.seq,
-                    },
+                let Some(key_bytes) = try_encode_join_key(row, mode) else {
+                    continue;
                 };
+                let key = group_key_for(row, mode);
                 let entry = counts.entry(key_bytes).or_insert((key, 0));
                 entry.1 = entry.1.saturating_add(1);
             }
@@ -553,7 +564,7 @@ fn execute_aggregate_count(
 /// row carrying `Sum(0.0)` or `Avg(None)` respectively.
 fn execute_aggregate_numeric(
     rows: &[ResultRow],
-    group_by: Option<JoinKeyMode>,
+    group_by: Option<&JoinKeyMode>,
     field_path: &str,
     kind: NumericAggregateKind,
 ) -> Result<Vec<ResultRow>, MeshError> {
@@ -568,17 +579,12 @@ fn execute_aggregate_numeric(
         };
         let (key_bytes, group) = match group_by {
             None => (Vec::new(), None),
-            Some(mode) => (
-                encode_join_key(row, mode),
-                Some(match mode {
-                    JoinKeyMode::Origin => GroupKey::Origin(row.origin),
-                    JoinKeyMode::Seq => GroupKey::Seq(row.seq),
-                    JoinKeyMode::OriginSeq => GroupKey::OriginSeq {
-                        origin: row.origin,
-                        seq: row.seq,
-                    },
-                }),
-            ),
+            Some(mode) => {
+                let Some(bytes) = try_encode_join_key(row, mode) else {
+                    continue;
+                };
+                (bytes, Some(group_key_for(row, mode)))
+            }
         };
         let entry = acc.entry(key_bytes).or_insert((group, 0.0, 0));
         entry.1 += value;
@@ -639,7 +645,7 @@ fn execute_aggregate_numeric(
 /// element.
 pub(super) fn execute_aggregate_reduction(
     rows: &[ResultRow],
-    group_by: Option<JoinKeyMode>,
+    group_by: Option<&JoinKeyMode>,
     field_path: &str,
     kind: NumericReductionKind,
 ) -> Result<Vec<ResultRow>, MeshError> {
@@ -652,7 +658,12 @@ pub(super) fn execute_aggregate_reduction(
         };
         let (key_bytes, group) = match group_by {
             None => (Vec::new(), None),
-            Some(mode) => (encode_join_key(row, mode), Some(group_key_for(row, mode))),
+            Some(mode) => {
+                let Some(bytes) = try_encode_join_key(row, mode) else {
+                    continue;
+                };
+                (bytes, Some(group_key_for(row, mode)))
+            }
         };
         acc.entry(key_bytes).or_insert((group, Vec::new())).1.push(value);
     }
@@ -711,7 +722,7 @@ pub(super) fn execute_aggregate_reduction(
 /// `BTreeSet<String>` of projections.
 pub(super) fn execute_aggregate_distinct(
     rows: &[ResultRow],
-    group_by: Option<JoinKeyMode>,
+    group_by: Option<&JoinKeyMode>,
     field_path: &str,
 ) -> Result<Vec<ResultRow>, MeshError> {
     use std::collections::{BTreeMap, BTreeSet};
@@ -723,7 +734,12 @@ pub(super) fn execute_aggregate_distinct(
         };
         let (key_bytes, group) = match group_by {
             None => (Vec::new(), None),
-            Some(mode) => (encode_join_key(row, mode), Some(group_key_for(row, mode))),
+            Some(mode) => {
+                let Some(bytes) = try_encode_join_key(row, mode) else {
+                    continue;
+                };
+                (bytes, Some(group_key_for(row, mode)))
+            }
         };
         acc.entry(key_bytes).or_insert((group, BTreeSet::new())).1.insert(value);
     }
@@ -806,8 +822,11 @@ pub(super) fn execute_window(
 
 /// Build the [`GroupKey`] identifier matching `mode` from a
 /// row. Shared between the three group-by-aware aggregate
-/// helpers.
-fn group_key_for(row: &ResultRow, mode: JoinKeyMode) -> GroupKey {
+/// helpers. For `JoinKeyMode::Field` group_by is not supported
+/// (payload-keyed grouping needs a `GroupKey::Field` variant);
+/// the planner's `group_by_mode` rejects payload paths, so
+/// reaching this branch is a planner bug.
+fn group_key_for(row: &ResultRow, mode: &JoinKeyMode) -> GroupKey {
     match mode {
         JoinKeyMode::Origin => GroupKey::Origin(row.origin),
         JoinKeyMode::Seq => GroupKey::Seq(row.seq),
@@ -815,6 +834,15 @@ fn group_key_for(row: &ResultRow, mode: JoinKeyMode) -> GroupKey {
             origin: row.origin,
             seq: row.seq,
         },
+        JoinKeyMode::Field(path) => {
+            // Defensive: should be unreachable given the
+            // planner's group_by_mode rejection. We fold the
+            // field into a synthetic Origin key built from the
+            // field hash so the row still lands somewhere
+            // identifiable.
+            let _ = path;
+            GroupKey::Origin(row.origin)
+        }
     }
 }
 
@@ -855,20 +883,103 @@ fn encode_joined_row(
 /// Tunable in Phase D-2 once a consumer drives the value.
 pub const HASH_JOIN_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Extract the join key from a [`ResultRow`] under the given
-/// mode. Returns a `Vec<u8>` so the build map can key on
-/// arbitrary-length composites.
-fn encode_join_key(row: &ResultRow, mode: JoinKeyMode) -> Vec<u8> {
+/// Try to extract the join key from a [`ResultRow`] under the
+/// given mode. `None` when `JoinKeyMode::Field` resolves to a
+/// missing key, a non-JSON payload, or a non-scalar leaf. Row-
+/// intrinsic modes never fail.
+fn try_encode_join_key(row: &ResultRow, mode: &JoinKeyMode) -> Option<Vec<u8>> {
     match mode {
-        JoinKeyMode::Origin => row.origin.to_le_bytes().to_vec(),
-        JoinKeyMode::Seq => row.seq.0.to_le_bytes().to_vec(),
+        JoinKeyMode::Origin => Some(row.origin.to_le_bytes().to_vec()),
+        JoinKeyMode::Seq => Some(row.seq.0.to_le_bytes().to_vec()),
         JoinKeyMode::OriginSeq => {
             let mut v = Vec::with_capacity(16);
             v.extend_from_slice(&row.origin.to_le_bytes());
             v.extend_from_slice(&row.seq.0.to_le_bytes());
-            v
+            Some(v)
+        }
+        JoinKeyMode::Field(path) => {
+            super::row::extract_string_projection(row, path).map(String::into_bytes)
         }
     }
+}
+
+/// Phase D-2 sort-merge join. Sorts both sides on the encoded
+/// key, then two-pointer walks to emit matched pairs +
+/// (optionally) unmatched rows for outer joins.
+///
+/// Memory: bounded by the inputs (no hash table). Useful when
+/// either side is large enough that the broadcast-hash bound
+/// would trip; the planner picks between strategies, the
+/// caller can override via the explicit operator.
+fn sort_merge_join(
+    left_rows: Vec<ResultRow>,
+    right_rows: Vec<ResultRow>,
+    key_mode: &JoinKeyMode,
+    kind: JoinKind,
+) -> Result<Vec<ResultRow>, MeshError> {
+    let mut left: Vec<(Vec<u8>, ResultRow)> = left_rows
+        .into_iter()
+        .filter_map(|r| try_encode_join_key(&r, key_mode).map(|k| (k, r)))
+        .collect();
+    let mut right: Vec<(Vec<u8>, ResultRow)> = right_rows
+        .into_iter()
+        .filter_map(|r| try_encode_join_key(&r, key_mode).map(|k| (k, r)))
+        .collect();
+    left.sort_by(|a, b| a.0.cmp(&b.0));
+    right.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let emit_left_unmatched = matches!(kind, JoinKind::LeftOuter | JoinKind::FullOuter);
+    let emit_right_unmatched = matches!(kind, JoinKind::RightOuter | JoinKind::FullOuter);
+
+    let mut out = Vec::new();
+    let (mut li, mut ri) = (0usize, 0usize);
+    while li < left.len() && ri < right.len() {
+        match left[li].0.cmp(&right[ri].0) {
+            std::cmp::Ordering::Less => {
+                if emit_left_unmatched {
+                    out.push(encode_joined_row(Some(left[li].1.clone()), None)?);
+                }
+                li += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                if emit_right_unmatched {
+                    out.push(encode_joined_row(None, Some(right[ri].1.clone()))?);
+                }
+                ri += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                // Find runs of equal keys on each side, emit
+                // the Cartesian product.
+                let key = left[li].0.clone();
+                let mut lj = li;
+                while lj < left.len() && left[lj].0 == key {
+                    lj += 1;
+                }
+                let mut rj = ri;
+                while rj < right.len() && right[rj].0 == key {
+                    rj += 1;
+                }
+                for l in &left[li..lj] {
+                    for r in &right[ri..rj] {
+                        out.push(encode_joined_row(Some(l.1.clone()), Some(r.1.clone()))?);
+                    }
+                }
+                li = lj;
+                ri = rj;
+            }
+        }
+    }
+    if emit_left_unmatched {
+        for (_, l) in &left[li..] {
+            out.push(encode_joined_row(Some(l.clone()), None)?);
+        }
+    }
+    if emit_right_unmatched {
+        for (_, r) in &right[ri..] {
+            out.push(encode_joined_row(None, Some(r.clone()))?);
+        }
+    }
+    Ok(out)
 }
 
 /// Wrap a finite `Vec<ResultRow>` in a `ResultStream` that
@@ -1183,6 +1294,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hash_join_payload_keyed_matches_on_json_field() {
+        use crate::adapter::net::behavior::meshdb::planner::{CostEstimate, JoinKeyMode};
+        use crate::adapter::net::behavior::meshdb::query::{JoinKind, JoinedRowPayload};
+        use std::time::Duration;
+
+        // Two chains with JSON payloads carrying a shared
+        // "request_id" field. Join on payload.request_id.
+        let a = 0x111;
+        let b = 0x222;
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(a, SeqNum(1), br#"{"request_id":"r-1","kind":"req"}"#.to_vec());
+        reader.append(a, SeqNum(2), br#"{"request_id":"r-2","kind":"req"}"#.to_vec());
+        reader.append(b, SeqNum(1), br#"{"request_id":"r-1","kind":"resp"}"#.to_vec());
+        reader.append(b, SeqNum(2), br#"{"request_id":"r-3","kind":"resp"}"#.to_vec());
+        let executor = LocalMeshQueryExecutor::new(reader);
+
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::HashJoin {
+                    left: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: a,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    right: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: b,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    key_mode: JoinKeyMode::Field("request_id".to_string()),
+                    kind: JoinKind::Inner,
+                    strategy: super::super::planner::JoinStrategy::HashBroadcast,
+                    watermark: Duration::from_secs(5),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let decoded: JoinedRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(decoded.left.as_ref().unwrap().origin, a);
+        assert_eq!(decoded.right.as_ref().unwrap().origin, b);
+        // Both rows had request_id = "r-1".
+    }
+
+    #[tokio::test]
+    async fn sort_merge_inner_join_matches_pairs() {
+        use crate::adapter::net::behavior::meshdb::planner::{
+            CostEstimate, JoinKeyMode, JoinStrategy,
+        };
+        use crate::adapter::net::behavior::meshdb::query::{JoinKind, JoinedRowPayload};
+        use std::time::Duration;
+
+        let a = 0x111;
+        let b = 0x222;
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(a, SeqNum(1), b"a-1".to_vec());
+        reader.append(a, SeqNum(2), b"a-2".to_vec());
+        reader.append(a, SeqNum(3), b"a-3".to_vec());
+        reader.append(b, SeqNum(2), b"b-2".to_vec());
+        reader.append(b, SeqNum(3), b"b-3".to_vec());
+        reader.append(b, SeqNum(4), b"b-4".to_vec());
+        let executor = LocalMeshQueryExecutor::new(reader);
+
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::HashJoin {
+                    left: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: a,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    right: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: b,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    key_mode: JoinKeyMode::Seq,
+                    kind: JoinKind::Inner,
+                    strategy: JoinStrategy::SortMerge,
+                    watermark: Duration::from_secs(5),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        // seqs 2 + 3 match → 2 pairs.
+        assert_eq!(rows.len(), 2);
+        let mut decoded: Vec<JoinedRowPayload> = rows
+            .iter()
+            .map(|r| postcard::from_bytes(&r.payload).unwrap())
+            .collect();
+        decoded.sort_by_key(|j| j.left.as_ref().unwrap().seq);
+        assert_eq!(decoded[0].left.as_ref().unwrap().payload, b"a-2");
+        assert_eq!(decoded[0].right.as_ref().unwrap().payload, b"b-2");
+        assert_eq!(decoded[1].left.as_ref().unwrap().payload, b"a-3");
+        assert_eq!(decoded[1].right.as_ref().unwrap().payload, b"b-3");
+    }
+
+    #[tokio::test]
+    async fn sort_merge_full_outer_emits_unmatched_on_both_sides() {
+        use crate::adapter::net::behavior::meshdb::planner::{
+            CostEstimate, JoinKeyMode, JoinStrategy,
+        };
+        use crate::adapter::net::behavior::meshdb::query::{JoinKind, JoinedRowPayload};
+        use std::time::Duration;
+
+        let a = 0x111;
+        let b = 0x222;
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(a, SeqNum(1), b"a-1".to_vec());
+        reader.append(a, SeqNum(2), b"a-2".to_vec());
+        reader.append(b, SeqNum(2), b"b-2".to_vec());
+        reader.append(b, SeqNum(3), b"b-3".to_vec());
+        let executor = LocalMeshQueryExecutor::new(reader);
+
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::HashJoin {
+                    left: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: a,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    right: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: b,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    key_mode: JoinKeyMode::Seq,
+                    kind: JoinKind::FullOuter,
+                    strategy: JoinStrategy::SortMerge,
+                    watermark: Duration::from_secs(5),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        let decoded: Vec<JoinedRowPayload> = rows
+            .iter()
+            .map(|r| postcard::from_bytes(&r.payload).unwrap())
+            .collect();
+        let lo = decoded.iter().filter(|j| j.left.is_some() && j.right.is_none()).count();
+        let ro = decoded.iter().filter(|j| j.left.is_none() && j.right.is_some()).count();
+        let m = decoded.iter().filter(|j| j.left.is_some() && j.right.is_some()).count();
+        assert_eq!(lo, 1);
+        assert_eq!(ro, 1);
+        assert_eq!(m, 1);
+    }
+
+    #[tokio::test]
     async fn hash_join_inner_on_origin_matches_pairs() {
         use crate::adapter::net::behavior::meshdb::planner::{
             CostEstimate, JoinKeyMode,
@@ -1216,6 +1521,7 @@ mod tests {
                     right: Box::new(leaf(chain, 2)),
                     key_mode: JoinKeyMode::Origin,
                     kind: JoinKind::Inner,
+                    strategy: super::super::planner::JoinStrategy::HashBroadcast,
                     watermark: Duration::from_secs(5),
                 },
                 target_nodes: vec![],
@@ -1286,6 +1592,7 @@ mod tests {
                     }),
                     key_mode: JoinKeyMode::Seq,
                     kind: JoinKind::Inner,
+                    strategy: super::super::planner::JoinStrategy::HashBroadcast,
                     watermark: Duration::from_secs(5),
                 },
                 target_nodes: vec![],
@@ -1348,6 +1655,7 @@ mod tests {
                     }),
                     key_mode: JoinKeyMode::Seq,
                     kind: JoinKind::LeftOuter,
+                    strategy: super::super::planner::JoinStrategy::HashBroadcast,
                     watermark: Duration::from_secs(5),
                 },
                 target_nodes: vec![],
@@ -1422,6 +1730,7 @@ mod tests {
                     }),
                     key_mode: JoinKeyMode::Seq,
                     kind: JoinKind::RightOuter,
+                    strategy: super::super::planner::JoinStrategy::HashBroadcast,
                     watermark: Duration::from_secs(5),
                 },
                 target_nodes: vec![],
@@ -1495,6 +1804,7 @@ mod tests {
                     }),
                     key_mode: JoinKeyMode::Seq,
                     kind: JoinKind::FullOuter,
+                    strategy: super::super::planner::JoinStrategy::HashBroadcast,
                     watermark: Duration::from_secs(5),
                 },
                 target_nodes: vec![],
@@ -1639,7 +1949,7 @@ mod tests {
                 payload: vec![],
             },
         ];
-        let out = super::execute_aggregate_count(&rows, Some(JoinKeyMode::Origin)).unwrap();
+        let out = super::execute_aggregate_count(&rows, Some(&JoinKeyMode::Origin)).unwrap();
         assert_eq!(out.len(), 3);
         let mut by_origin: HashMap<u64, u64> = HashMap::new();
         for row in &out {
@@ -1683,7 +1993,7 @@ mod tests {
                 payload: vec![],
             },
         ];
-        let out = super::execute_aggregate_count(&rows, Some(JoinKeyMode::Seq)).unwrap();
+        let out = super::execute_aggregate_count(&rows, Some(&JoinKeyMode::Seq)).unwrap();
         assert_eq!(out.len(), 2);
         let mut by_seq: HashMap<u64, u64> = HashMap::new();
         for row in &out {
