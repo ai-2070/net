@@ -74,7 +74,7 @@ Tagged `[B | H | M | L]`:
 | D-40  | M   | node blob    | `await_tsfn_promise` applies 30s timeout twice → 60s worst-case           | ✅ |
 | D-41  | M   | node cortex  | `DataGravityConfigJs.*_secs/_ms` u32 vs Python u64 vs Go uint64           | ✅ |
 | D-42  | M   | python blob  | `Py<PyAny>` adapters can outlive interpreter finalization                  | ✅ |
-| D-43  | M   | python blob  | `data.to_vec()` happens before GIL is released for large payloads          | 🚫 not-applicable — no `py.detach` in the current binding; review described a code path that doesn't exist |
+| D-43  | M   | python blob  | `data.to_vec()` happens before GIL is released for large payloads          | ✅ (reopened — code path exists; fix moves copy inside `py.detach`, see N-1) |
 | D-44  | M   | go binding   | Greedy/gravity numeric fields can't express literal `0` via `omitempty`   | 🚫 won't-fix — substrate rejects 0 for every affected field; `omitempty` is correct |
 | D-45  | M   | go binding   | No RYW surface — `wait_for_token` not exposed                              | ✅ (Go Tasks + Memories adapters land with `WaitForToken` + `PollForToken` + `WaitForTokenContext` non-blocking variant) |
 | D-46  | L   | greedy       | Heat normalization compression at the top end                              | ✅ (folded into D-30 fix) |
@@ -86,6 +86,26 @@ Tagged `[B | H | M | L]`:
 | D-52  | L   | FFI blob     | `OpaqueCtx(AtomicPtr<c_void>)` unnecessary atomicity                       | ✅ |
 | D-53  | L   | node blob    | Adapter `timeout` not user-tunable                                         | ✅ |
 | D-54  | L   | go binding   | `runtime.SetFinalizer` runs blocking `Close` on GC thread                  | ✅ (doc note) |
+
+## Independent second-pass findings (N-series)
+
+A separate review pass after the deferred-items work spot-checked the closed
+items and surfaced 11 findings — 1 correctness regression (D-43 had been
+closed incorrectly), 2 new High items, 7 Medium/Low, 1 doc-only.
+
+| ID    | Pri | Area          | Title                                                                                | Status |
+|-------|-----|---------------|--------------------------------------------------------------------------------------|--------|
+| N-1   | H   | python blob   | `data.to_vec()` copies with GIL held (reopens D-43)                                  | ✅ |
+| N-2   | H   | gravity       | `HeatRegistry` unbounded under gravity-only deployments                              | ✅ (independent cap + LRU + tick-prune) |
+| N-3   | H   | blob fs       | `path_for` doesn't defend against symlinks in the shard root                        | ✅ (canonicalize + starts_with root check) |
+| N-4   | M   | python cortex | Python `wait_for_token(deadline_ms=0)` didn't poll like FFI / Node / Go did          | ✅ (promoted `poll_for_token` to public; bindings agree) |
+| N-5   | M   | greedy        | Eviction held `gravity.heat.lock()` across `sink.withdraw_chain` (latent)            | ✅ (explicit drop + LOCK-ORDERING invariant doc) |
+| N-6   | M   | blob fs       | Windows rename-fallback TOCTOU on idempotent re-store                                | ✅ (hash-verify existing content; mismatch → Backend) |
+| N-7   | M   | ffi           | `catch_unwind` + caller-held locks → caller-side poisoning hazard                    | ✅ (doc note in `ffi/mod.rs` + per-binding READMEs) |
+| N-8   | M   | gravity       | Heat-tag rate-limit deferred (acknowledged in D-11)                                  | 🚫 deferred — flagged in tracking; per-peer rate-limit is its own slice |
+| N-9   | L   | gravity       | `should_emit_heat` MIN_POSITIVE guard direction                                      | ✅ (switched to `is_normal()` + EPSILON-floor; subnormal-prev test) |
+| N-10  | L   | python blob   | `atexit` drain swallows unregister errors                                            | ✅ (count drained vs missing; eprintln behind `NET_PY_TRACE_ATEXIT`) |
+| N-11  | L   | go binding    | Go context cancellation isn't propagated into the FFI wait                          | ✅ (doc note on `WaitForTokenContext` clarifying the cancellation contract) |
 
 ## Findings
 
