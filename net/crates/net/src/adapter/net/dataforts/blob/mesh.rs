@@ -459,6 +459,15 @@ impl MeshBlobAdapter {
         Ok(())
     }
 
+    /// Channel name for a given chunk hash. Public accessor so
+    /// e2e tests + operator tools can construct chunk channels for
+    /// `Redex::open_file` / `replication_coordinator_for` lookups
+    /// without re-implementing the `dataforts/blob/<hex32>` format
+    /// (and risking drift).
+    pub fn chunk_channel_for_hash(hash: &[u8; 32]) -> ChannelName {
+        Self::chunk_channel(hash)
+    }
+
     /// Channel name for a given chunk hash. Pure function; safe to
     /// inline.
     fn chunk_channel(hash: &[u8; 32]) -> ChannelName {

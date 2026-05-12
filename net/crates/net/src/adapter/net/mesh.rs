@@ -5084,8 +5084,18 @@ impl MeshNode {
         }
         caps.tags.retain(|tag| match tag {
             Tag::Reserved { prefix, body } if prefix == "heat:" => {
-                // body shape: `<hex>=<rate>`. Hex is everything
-                // before the first `=`.
+                // Blob-heat tags (body shape `blob:<hex64>=<rate>`)
+                // ride a separate trust model: the blob is
+                // content-addressed, so a forged claim just causes
+                // a useless prefetch attempt at worst (no data
+                // corruption, no traffic redirection). Let them
+                // through. PR-5j-c emission shape.
+                if body.starts_with("blob:") {
+                    return true;
+                }
+                // Chain-heat shape: `<hex>=<rate>`. Hex is everything
+                // before the first `=`; strip when the peer didn't
+                // also claim the chain via `causal:<hex>`.
                 let hex_end = body.bytes().position(|b| b == b'=').unwrap_or(body.len());
                 claimed.contains(&body[..hex_end])
             }
