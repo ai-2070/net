@@ -1,0 +1,22 @@
+net/crates/net/docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md
+  s_3a0a24a47d1a36::t_582ff0d1629289 673
+  s_3a0a24a47d1a36::t_4ec5fac3083c15 653
+net/crates/net/docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
+  s_3a0a24a47d1a36::t_8be1c9eaa1a338 1-664
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "2d666da555ee396b9a6566b7435a1cc97053aba0",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
