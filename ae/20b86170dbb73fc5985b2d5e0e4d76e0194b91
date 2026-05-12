@@ -1,0 +1,19 @@
+net/crates/net/bindings/node/src/blob.rs
+  s_95efa15f56b56b::t_fa8b9d1bfd3958 792-797,807,812,816,820,822,829-832,837-838,844,846-877
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "ae20b86170dbb73fc5985b2d5e0e4d76e0194b91",
+  "prompts": {},
+  "sessions": {
+    "s_95efa15f56b56b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4c8f73c-58ab-4251-8d94-26cebb8d367a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
