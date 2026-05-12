@@ -72,11 +72,12 @@ pub trait GreedyObserver: Send + Sync {
     /// the observer maps `channel_hash` to a cache-side
     /// [`ChannelName`] via [`synthesize_cache_channel_name`]. The
     /// data-plane greedy cache deliberately keys on the wire `u16`
-    /// (not the canonical [`ChannelHash`]) because that's the
-    /// identifier carried by the packet that triggered the observe
-    /// call; ACL / storage / config decisions key on the canonical
-    /// `u32` elsewhere in the stack and are not weakened by this
-    /// data-plane choice.
+    /// (not the canonical
+    /// [`ChannelHash`](crate::adapter::net::channel::ChannelHash))
+    /// because that's the identifier carried by the packet that
+    /// triggered the observe call; ACL / storage / config decisions
+    /// key on the canonical `u32` elsewhere in the stack and are not
+    /// weakened by this data-plane choice.
     fn observe_event(
         &self,
         channel_hash: u16,
@@ -91,7 +92,8 @@ pub trait GreedyObserver: Send + Sync {
 /// collisions are routine at scale and cause two real channels to
 /// share a cache file — a small mix-up at the data-plane cache
 /// layer; ACL and storage decisions key on the canonical
-/// [`ChannelHash`] (`u32`) and are not affected.
+/// [`ChannelHash`](crate::adapter::net::channel::ChannelHash)
+/// (`u32`) and are not affected.
 ///
 /// Naming convention `dataforts/greedy/<hex>` reserves a
 /// channel-namespace prefix that won't collide with application

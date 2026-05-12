@@ -699,12 +699,13 @@ pub fn response_wire_size(payload: &RpcResponsePayload) -> usize {
 /// One inbound event delivered to a registered RPC dispatcher.
 #[derive(Debug, Clone)]
 pub struct RpcInboundEvent {
-    /// Canonical [`ChannelHash`] (u32) of the channel this event
-    /// arrived on — widened from the per-packet wire `u16`
-    /// `NetHeader::channel_hash` via the registered-dispatcher
-    /// table at receive time. Collision-resistant at realistic
-    /// scale; the wire `u16` may bucket-collide but the canonical
-    /// hash uniquely identifies the registered dispatcher target.
+    /// Canonical [`ChannelHash`](crate::adapter::net::channel::ChannelHash)
+    /// (u32) of the channel this event arrived on — widened from the
+    /// per-packet wire `u16` `NetHeader::channel_hash` via the
+    /// registered-dispatcher table at receive time.
+    /// Collision-resistant at realistic scale; the wire `u16` may
+    /// bucket-collide but the canonical hash uniquely identifies the
+    /// registered dispatcher target.
     pub channel_hash: super::super::channel::ChannelHash,
     /// Caller's `origin_hash` from the packet header (32-bit
     /// routing projection of the AEAD-verified peer's full
