@@ -251,6 +251,19 @@ pub struct MeshBlobAdapter {
     /// P2 / P3; this field is the storage shape the rest of
     /// the work will compose against.
     overflow: Arc<parking_lot::RwLock<OverflowConfig>>,
+    /// Hysteresis state for [`super::overflow::drive_blob_overflow_tick`].
+    /// `true` iff the most recent tick observed disk usage at
+    /// or above the high-water threshold; `false` iff the most
+    /// recent tick observed disk usage at or below the
+    /// low-water threshold. In the hysteresis band between the
+    /// two, the prior value is preserved.
+    ///
+    /// Shared across adapter clones so an operator dashboard
+    /// reading from one clone sees the live state set by the
+    /// scheduler tick on another clone. `Relaxed` ordering is
+    /// fine — the tick driver is the single writer; reads are
+    /// observer-only.
+    overflow_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MeshBlobAdapter {
@@ -274,6 +287,7 @@ impl MeshBlobAdapter {
             blob_heat_half_life: DEFAULT_BLOB_HEAT_HALF_LIFE,
             in_flight_stores: Arc::new(DashMap::new()),
             overflow: Arc::new(parking_lot::RwLock::new(OverflowConfig::default())),
+            overflow_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -410,6 +424,34 @@ impl MeshBlobAdapter {
     /// one call.
     pub fn set_overflow_config(&self, config: OverflowConfig) {
         *self.overflow.write() = config;
+    }
+
+    /// True iff the most recent overflow tick observed local
+    /// disk at or above the high-water threshold (i.e. the
+    /// controller is actively shedding). Mirrors the
+    /// hysteresis state machine — stays `true` through the
+    /// hysteresis band on the way down and only flips back to
+    /// `false` once disk drops to or below the low-water
+    /// threshold.
+    ///
+    /// Read-only observer; the tick driver is the single
+    /// writer. Cheap (one atomic load) — safe to call on a
+    /// dashboard hot path.
+    pub fn overflow_active(&self) -> bool {
+        self.overflow_active.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Internal accessor — the P3 tick driver needs the raw
+    /// `Arc<AtomicBool>` so it can pass `&AtomicBool` into
+    /// [`super::overflow::drive_blob_overflow_tick`]. Crate-
+    /// internal because the wire-level state machine is the
+    /// only legitimate writer; operators get the read-only
+    /// view via [`Self::overflow_active`]. `#[allow(dead_code)]`
+    /// because P2 ships the surface without an in-tree caller
+    /// — the P3 push-sink integration lights up this seam.
+    #[allow(dead_code)]
+    pub(crate) fn overflow_active_handle(&self) -> &Arc<std::sync::atomic::AtomicBool> {
+        &self.overflow_active
     }
 
     /// True iff this adapter is wired to bump a shared blob-heat
@@ -2133,5 +2175,31 @@ mod tests {
         assert_eq!(cfg.high_water_ratio, 0.90);
         assert_eq!(cfg.max_pushes_per_tick, 32);
         assert_eq!(cfg.scope, TopologyScope::Region);
+    }
+
+    #[test]
+    fn overflow_active_starts_false_and_clones_share_state() {
+        // P2 hysteresis state is held behind an `Arc<AtomicBool>`
+        // on the adapter, so an operator dashboard reading
+        // `overflow_active()` on one clone sees the live state
+        // set by the tick driver on another clone. Verify the
+        // shared-state contract directly via the internal
+        // handle.
+        let adapter = make_adapter();
+        let clone = adapter.clone();
+        assert!(!adapter.overflow_active());
+        assert!(!clone.overflow_active());
+
+        adapter
+            .overflow_active_handle()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(adapter.overflow_active());
+        assert!(clone.overflow_active());
+
+        adapter
+            .overflow_active_handle()
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!adapter.overflow_active());
+        assert!(!clone.overflow_active());
     }
 }

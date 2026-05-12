@@ -23,6 +23,7 @@ pub mod mesh;
 pub mod metrics;
 pub mod migration;
 pub mod noop;
+pub mod overflow;
 pub mod publish_with_blob;
 pub mod refcount;
 pub mod registry;
@@ -69,6 +70,10 @@ pub use migration::{
     BlobMigrationController, BlobMigrationTickReport, ManifestSiblings,
 };
 pub use noop::NoopAdapter;
+pub use overflow::{
+    drive_blob_overflow_tick, step_overflow_hysteresis, BlobOverflowCandidate,
+    BlobOverflowController, BlobOverflowTickReport, OverflowPushSink,
+};
 pub use publish_with_blob::{publish_with_blob, BlobDurability, PublishWithBlobReceipt};
 pub use refcount::{should_sweep, BlobRefcountTable, RefcountEntry, DEFAULT_RETENTION_FLOOR};
 pub use registry::{global_blob_adapter_registry, BlobAdapterRegistry, BlobAdapterRegistryError};
