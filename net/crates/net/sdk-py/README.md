@@ -782,6 +782,16 @@ Four phases:
   `drive_blob_migration_tick` consumer. These surfaces are
   exposed from Rust today; Python wrappers land in a follow-up
   cross-binding slice.
+- **Phase 3.5 — Active blob overflow (v0.3 blob track).** Push-
+  side complement of Phase 4's pull-driven migration. Disabled
+  by default; opt in with `MeshBlobAdapter(..., overflow=True)`
+  at construction or `mesh_blob.set_overflow_enabled(True)` at
+  runtime. The kwarg also accepts a `dict` for typed tuning
+  (`{"enabled": True, "high_water_ratio": 0.80, "scope": "zone"}`).
+  Read-only properties: `overflow_enabled`, `overflow_active`,
+  `overflow_config`. Operators dashboard via the
+  `dataforts_blob_overflow_*` counter family in
+  `mesh_blob.prometheus_text()`.
 - **Phase 5 — Read-your-writes.** Every `tasks.create`,
   `memories.insert`, etc. returns a `WriteToken`. Pass it to
   `tasks.wait_for_token(token, deadline_ms=…)` and the call
@@ -831,6 +841,24 @@ mesh_blob.store(br, payload)
 back = mesh_blob.fetch(br)
 assert back == payload
 print(mesh_blob.prometheus_text())
+
+# Phase 3.5 / v0.3 — opt this node into active blob overflow.
+# Disabled by default; one boolean opts in. Operators tuning
+# thresholds pass a dict instead — missing keys inherit defaults,
+# unknown keys raise TypeError (typo defense).
+mesh_blob = MeshBlobAdapter(
+    redex,
+    "mesh-overflow",
+    persistent=True,
+    overflow={"enabled": True, "high_water_ratio": 0.80, "scope": "zone"},
+)
+print(mesh_blob.overflow_enabled)   # True
+print(mesh_blob.overflow_active)    # False (no tick has fired in-process yet)
+print(mesh_blob.overflow_config)    # {'enabled': True, 'high_water_ratio': 0.80, ...}
+
+# Runtime control — no need to rebuild the adapter:
+mesh_blob.set_overflow_enabled(False)
+mesh_blob.set_overflow_config({"enabled": True, "max_pushes_per_tick": 4})
 
 # Phase 5 — read-your-writes.
 tasks = Tasks.open(redex, origin_hash=mesh.origin_hash)

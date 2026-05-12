@@ -497,6 +497,103 @@ Errors surfaced as typed sentinels:
 `ErrCortexClosed`, `ErrCortexFold`, `ErrNetDb`, `ErrRedex`,
 `ErrStreamTimeout`, `ErrStreamEnded`.
 
+## Dataforts blob storage
+
+The v0.2 substrate-owned blob CAS + the v0.3 active-overflow
+extension surface on the Go binding via the `MeshBlobAdapter`
+struct.
+
+Build with `dataforts,netdb,redex-disk` enabled on the
+underlying Rust core (the published Go-binding cdylib already
+ships these features on).
+
+```go
+package main
+
+import (
+    "log"
+
+    netbinding "github.com/ai-2070/net/go"
+)
+
+func main() {
+    redex := netbinding.NewRedexWithPersistentDir("/var/lib/net/redex")
+    defer redex.Close()
+
+    // v0.2 — substrate-owned CRUD. Persistent rounds chunk bytes to
+    // disk via the underlying Redex.
+    adapter, err := netbinding.NewMeshBlobAdapter(redex, "go-prod", &netbinding.MeshBlobAdapterOpts{
+        Persistent: true,
+    })
+    if err != nil {
+        log.Fatalf("new adapter: %v", err)
+    }
+    defer adapter.Close()
+
+    // Store / fetch / exists — wire `BlobRef` is bytes from
+    // `BlobRef::encode()` (Rust) or `blobPublish` (TS/Python).
+    // Construct one Go-side via the encoder helpers when those
+    // land; today the operator pattern is publish-from-Rust +
+    // verify-from-Go using the bytes returned from `blobPublish`.
+    body, err := adapter.Fetch(blobRefBytes)
+    if err != nil {
+        log.Fatalf("fetch: %v", err)
+    }
+    _ = body
+
+    // Prometheus body (includes v0.2 counters + v0.3 overflow
+    // counters when active).
+    metrics, _ := adapter.PrometheusText()
+    log.Print(metrics)
+
+    // v0.3 active overflow — disabled by default.
+    overflowed, _ := netbinding.NewMeshBlobAdapter(redex, "go-overflow", &netbinding.MeshBlobAdapterOpts{
+        Persistent: true,
+        Overflow: &netbinding.OverflowConfig{
+            Enabled:          true,
+            HighWaterRatio:   0.80,
+            LowWaterRatio:    0.65,
+            MaxPushesPerTick: 8,
+            Scope:            "zone",
+            TickIntervalMs:   30000,
+        },
+    })
+    defer overflowed.Close()
+
+    // Runtime control:
+    _ = overflowed.SetOverflowEnabled(false)
+    _ = overflowed.SetOverflowEnabled(true)
+
+    // Inspection:
+    enabled, _ := overflowed.OverflowEnabled()
+    active, _ := overflowed.OverflowActive()
+    cfg, _ := overflowed.OverflowConfig()
+    log.Printf("overflow enabled=%v active=%v cfg=%+v", enabled, active, cfg)
+}
+```
+
+### Surface at a glance
+
+- `NewMeshBlobAdapter(*Redex, string, *MeshBlobAdapterOpts) (*MeshBlobAdapter, error)`
+- `(*MeshBlobAdapter).Close() error`
+- `(*MeshBlobAdapter).Store(blobRefBytes, data []byte) error`
+- `(*MeshBlobAdapter).Fetch(blobRefBytes []byte) ([]byte, error)`
+- `(*MeshBlobAdapter).Exists(blobRefBytes []byte) (bool, error)`
+- `(*MeshBlobAdapter).PrometheusText() (string, error)`
+- `(*MeshBlobAdapter).OverflowEnabled() (bool, error)`
+- `(*MeshBlobAdapter).OverflowActive() (bool, error)`
+- `(*MeshBlobAdapter).OverflowConfig() (*OverflowConfig, error)`
+- `(*MeshBlobAdapter).SetOverflowEnabled(bool) error`
+- `(*MeshBlobAdapter).SetOverflowConfig(*OverflowConfig) error`
+
+Errors surfaced as typed sentinels: `ErrBlob`, `ErrBlobClosed`,
+`ErrBlobInvalidConfig`.
+
+See [`docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md`](../net/crates/net/docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md)
+for the active-overflow design + shipping status; see
+[`docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`](../net/crates/net/docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md)
+for the v0.2 substrate-owned blob CAS design.
+
 ## Redis Streams consumer-side dedup helper
 
 The Net Redis adapter writes a stable `dedup_id` field on every

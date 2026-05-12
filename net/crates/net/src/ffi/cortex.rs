@@ -287,6 +287,17 @@ pub struct RedexHandle {
     guard: HandleGuard,
 }
 
+impl RedexHandle {
+    /// Crate-internal accessor — sibling FFI modules (the
+    /// blob FFI for `net_mesh_blob_adapter_new`) need to share
+    /// the inner `Arc<Redex>` to wrap it in a `MeshBlobAdapter`.
+    /// The clone bumps the refcount; the redex's `HandleGuard`
+    /// still gates concurrent `_free` on the original handle.
+    pub(crate) fn redex_arc(&self) -> Arc<InnerRedex> {
+        (*self.inner).clone()
+    }
+}
+
 /// Create a new Redex manager. `persistent_dir` may be NULL for
 /// heap-only. Returns a heap-allocated handle the caller must free
 /// with `net_redex_free`.

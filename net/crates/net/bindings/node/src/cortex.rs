@@ -170,6 +170,16 @@ pub struct Redex {
     inner: Arc<InnerRedex>,
 }
 
+impl Redex {
+    /// Internal accessor — sibling Node binding modules (e.g.
+    /// `blob` for `MeshBlobAdapter`) need a shared
+    /// `Arc<InnerRedex>` to compose against. Not exposed to JS
+    /// directly; the consuming napi class wraps it.
+    pub(crate) fn inner_arc(&self) -> Arc<InnerRedex> {
+        self.inner.clone()
+    }
+}
+
 #[napi]
 impl Redex {
     /// Open a new Redex manager.
