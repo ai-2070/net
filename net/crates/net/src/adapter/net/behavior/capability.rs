@@ -6040,13 +6040,18 @@ mod tests {
     ) {
         use super::super::super::identity::EntityId;
         use std::collections::HashMap;
+        // `EntityId::origin_hash()` runs its own BLAKE2s over the
+        // 32-byte pubkey under domain `net-origin-v1`. We just
+        // need varied 32-byte inputs to sample the u32 wire-hash
+        // space — `seed.to_le_bytes()` in the first 8 bytes
+        // (zero padding elsewhere) gives us 2^64 distinct inputs
+        // without pulling in BLAKE3 or any other hash dep. Each
+        // seed → unique EntityId → effectively-random u32 wire
+        // origin_hash (per the BLAKE2s distribution).
         let mut seen: HashMap<u32, EntityId> = HashMap::new();
-        for seed in 0u32..1 << 20 {
-            // Derive a varied 32-byte EntityId per seed so the
-            // u32 wire origin_hash space is sampled uniformly.
-            // BLAKE3 of the seed gives us that without an
-            // extra dep.
-            let bytes: [u8; 32] = blake3::hash(&seed.to_le_bytes()).into();
+        for seed in 0u64..1 << 20 {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&seed.to_le_bytes());
             let entity = EntityId::from_bytes(bytes);
             let wire = entity.origin_hash() as u32;
             if let Some(prev) = seen.get(&wire) {
