@@ -942,11 +942,11 @@ on the `Redex` handle). Four phases:
   than a silent `Ok(())`.
 
 ```rust,ignore
-use ai2070_net::adapter::net::{MeshNode, Redex};
-use ai2070_net::adapter::net::dataforts::{
+use net::adapter::net::{MeshNode, Redex};
+use net::adapter::net::dataforts::{
     DataGravityPolicy, GreedyConfig, IntentMatchPolicy,
 };
-use ai2070_net::adapter::net::behavior::capability::CapabilitySet;
+use net::adapter::net::behavior::capability::CapabilitySet;
 use std::sync::Arc;
 
 # async fn example(mesh: Arc<MeshNode>) -> Result<(), Box<dyn std::error::Error>> {
