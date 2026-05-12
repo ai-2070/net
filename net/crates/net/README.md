@@ -47,6 +47,7 @@ Crate / module names inside source code (`net::`, `net_sdk::`, `from net import`
 - [RedEX](#redex)
 - [CortEX](#cortex)
 - [NetDB](#netdb)
+- [Dataforts](#dataforts)
 - [nRPC](#nrpc)
 - [Module Map](#module-map)
 - [Adapters](#adapters)
@@ -661,6 +662,101 @@ if let Some(runtime) = redex.greedy_runtime() {
 ```
 
 Phase 5 (RYW) is wired on the same `Redex` handle — `tasks.wait_for_token(token, deadline)` / `memories.wait_for_token(...)` on the CortEX adapters. `publish_with_blob` extends the same machinery: the `PublishWithBlobReceipt` carries the publish-event's `WriteToken` after the configured `BlobDurability` is satisfied.
+
+### Capability tag schema
+
+Every Dataforts admission gate reads from a typed projection of the `CapabilitySet` tags announced by each peer. The projections live in [`src/adapter/net/behavior/dataforts_capabilities.rs`](src/adapter/net/behavior/dataforts_capabilities.rs); each has a `write_into(CapabilitySet) -> CapabilitySet` producer + `from_capability_set(&CapabilitySet) -> Self` parser, so the wire form round-trips through the typed shape.
+
+| Tag (sample wire form) | Projection field |
+|---|---|
+| `dataforts.blob.storage` | `BlobCapability::storage = true` (presence) |
+| `dataforts.blob.disk_total_gb=64` | `BlobCapability::disk_total_gb = 64` |
+| `dataforts.blob.disk_free_gb=12` | `BlobCapability::disk_free_gb = 12` |
+| `dataforts.blob.overflow` | `BlobCapability::overflow_enabled = true` (presence, v0.3) |
+| `dataforts.greedy.enabled` | `GreedyCapability::enabled = true` |
+| `dataforts.greedy.scope=zone` | `GreedyCapability::scope = TopologyScope::Zone` |
+| `dataforts.greedy.proximity=128` | `GreedyCapability::proximity = 128` |
+| `dataforts.gravity.enabled` | `GravityCapability::enabled = true` |
+| `dataforts.gravity.scope=region` | `GravityCapability::scope = TopologyScope::Region` |
+| `dataforts.gravity.proximity=200` | `GravityCapability::proximity = 200` |
+| `heat:<hex>=<rate>` | per-chain heat (per-source ACL via `AuthGuard`) |
+| `heat:blob:<hex>=<rate>` | per-chunk blob heat — drives `drive_blob_migration_tick` |
+| `causal:<hex>` | this node holds (a copy of) the chunk; withdrawn on eviction |
+| `dataforts:blob-storage-unhealthy` | reserved cross-axis health-gate tag; placement + admission skip the node |
+
+`TopologyScope ∈ { Node, Zone, Region, Mesh }` with case-insensitive parse and `Mesh` default; unknown tokens fall back to default with a `tracing::warn!`. The `dataforts:blob-storage-unhealthy` tag fires when local disk crosses 95% and clears at 85% (hysteresis pinned by `evaluate_health_gate` + `HEALTH_GATE_EMIT_THRESHOLD` / `HEALTH_GATE_CLEAR_THRESHOLD`). The placement filter skips `Artifact::Blob` placement against any node carrying it.
+
+### Greedy + gravity
+
+`GreedyConfig` shapes the per-event admission gate ([`src/adapter/net/dataforts/greedy/config.rs`](src/adapter/net/dataforts/greedy/config.rs)) — `scopes: Vec<ScopeLabel>`, `proximity_max_rtt: Option<Duration>`, `per_channel_cap_bytes`, `total_cap_bytes`, `bandwidth_budget_fraction: f32` (share of measured NIC peak), `nic_peak_bytes_per_s`, `intent_match: IntentMatchPolicy`, `colocation_policy: ColocationPolicy`, `observer_inflight_cap: usize`. The runtime decides per inbound event whether to admit to a per-channel cache file; cold channels evict under the cluster-cap pressure and the runtime withdraws their `causal:<hex>` advertisement via `Mesh::withdraw_chain` so peers re-route to a healthier holder.
+
+`DataGravityPolicy` ([`src/adapter/net/dataforts/gravity/`](src/adapter/net/dataforts/gravity/)) layers on top — `enabled`, `emit_threshold_ratio` (heat / `normalization_reference_rate` ratio that triggers a `heat:` rebroadcast), `decay_half_life_secs`, `tick_interval_ms`, `normalization_reference_rate` (the log-scale normalization the wire form normalizes against). Heat is per-chain. The decay math is `rate * 0.5.powf(elapsed_secs / half_life_secs)` with a cap at 64 half-lives → 0 to avoid denormals. The wire emission is log-scale-normalized so heats from a slow node and a busy node remain comparable across the mesh. Inbound `heat:` tags are authenticated against the publishing chain's `(origin_hash, ChannelName)` ACL via `AuthGuard::is_authorized_full` before any cache decision uses them; `origin_hash == 0` no longer collapses into "treat-as-server" (the pre-`dataforts-feature` semantics had a latent collapse bug — pinned by N-2 hardening).
+
+The v0.2 blob track adds a parallel [`BlobHeatRegistry`](src/adapter/net/dataforts/gravity/counter.rs) keyed on the chunk's 32-byte BLAKE3 hash. `MeshBlobAdapter::with_blob_heat(registry, half_life)` wires the fetch-path bumps. A `BlobHeatSink` trait abstracts the `heat:blob:<hex>=<rate>` reserved-tag emission for the migration controller; `MeshNode` is the production impl. The migration controller `drive_blob_migration_tick` observes peer-advertised `heat:blob:` tags, runs `should_migrate_blob_to`, and on Admit calls `adapter.prefetch` on the chosen target. The manifest-aware variant `drive_blob_migration_tick_with_manifest_resolver` proactively prefetches every sibling chunk when one chunk of a manifest gets hot — avoids the latency cliff where a hot chunk lands locally but its siblings still need a multi-hop fetch.
+
+### Blob storage
+
+Two `BlobRef` shapes share the same 5-byte header (4-byte magic `[0xB0, 0xB1, 0xB2, 0xB3]` + 1-byte version):
+
+- **`BlobRef::Small`** (version `0x01`) — inline header carries the 32-byte BLAKE3 hash + 8-byte size LE + a URI string (`mesh://<hex>`, `file://...`, custom schemes). Fixed `BLOB_REF_SMALL_HEADER_LEN = 45` bytes for the non-URI prefix. Payload lives in the caller's storage; the adapter dispatched by URI scheme reads it back.
+- **`BlobRef::Manifest`** (version `0x02`, body version `0x01`) — postcard-encoded manifest carries the manifest's own BLAKE3, the total payload size, and a list of per-chunk `(hash, size)` entries. Chunks are fixed at `BLOB_CHUNK_SIZE_BYTES = 4 MiB` (only the last chunk may be smaller); `BLOB_MANIFEST_MAX_CHUNKS = 8192` bounds the manifest size. The `byte_range_to_chunks` helper does the chunk-index range math for partial fetches; `chunk_payload` carries the per-chunk wire wrapper.
+
+`BlobAdapter` is the dispatch trait (`fetch` / `store` / `delete` / `stat` / `prefetch` + default `fetch_stream` / `store_stream` shims for multi-GB payloads). User adapters register via `BlobAdapterRegistry`; lookup is keyed on the URI scheme. `FileSystemAdapter` ships in-tree for the local-FS case.
+
+`MeshBlobAdapter` ([`src/adapter/net/dataforts/blob/mesh.rs`](src/adapter/net/dataforts/blob/mesh.rs)) is the substrate-owned variant: each chunk lives as a content-addressed `RedexFile` at `dataforts/blob/<hex32>` and rides the per-channel replication runtime for cross-node placement. The adapter wraps:
+
+- [`BlobRefcountTable`](src/adapter/net/dataforts/blob/refcount.rs) — per-hash refcount + pin bit + `first_seen_ms` timestamp + per-source map (cache / fold / external). `is_overflow_eligible(hash)` walks the per-source map (overflow can shed speculative-cache references but not fold references).
+- [`BlobMetrics`](src/adapter/net/dataforts/blob/metrics.rs) — Prometheus counter registry. Labels are operator-escaped (`adapter="..."` survives `"` / `\n` injection from operator config).
+- Optional `AuthGuard` — gates `*_authorized` peer-facing variants of pin / unpin / delete on the publishing chain's `(origin_hash, ChannelName)` ACL via the exact-name (not hash-based) check.
+- Optional `BlobHeatRegistry` — fetch-path bumps drive Phase 4 migration.
+
+GC is opt-in via `sweep_gc(retention)`. The default `DEFAULT_RETENTION_FLOOR = 60_000 ms` holds a chunk through bursty churn. Pinning is an explicit operator gesture; `pin(hash)` survives GC. The atomic store-then-publish path is `publish_with_blob(..., BlobDurability)` returning `PublishWithBlobReceipt { write_token, blob_ref }` — durability variants `BestEffort` (return immediately), `DurableOnLocal` (await local fsync), and `ReplicatedTo(n)` (await `causal:<hash>` advertisements from `n` peers).
+
+### Active overflow
+
+Disabled by default. `OverflowConfig { enabled, high_water_ratio, low_water_ratio, max_pushes_per_tick, scope, tick_interval_ms }` — defaults `enabled=false`, `high_water=0.85`, `low_water=0.70`, `max_pushes_per_tick=16`, `scope=Mesh`, `tick_interval_ms=30_000`. Construction via `MeshBlobAdapter::with_overflow(cfg)`; runtime toggle via `set_overflow_enabled(bool)` + `set_overflow_config(cfg)`. The cap-tag rebroadcast that propagates the toggle to peers rides [`MeshNode::announce_blob_overflow_state(adapter)`](src/adapter/net/mesh.rs) — snapshots local caps, syncs the `dataforts.blob.overflow` presence tag to the adapter's current state, and re-announces in one call.
+
+[`BlobOverflowController`](src/adapter/net/dataforts/blob/overflow.rs) holds five borrows — `local_caps`, `capability_index`, `heat_registry`, `refcount`, `config` — and exposes `candidate_batch(now, size_for_hash) -> OverflowCandidateBatch { candidates, no_target_count }`. The batch walks the heat registry coldest-first under a brief read lock, filters on `!pinned && refcount == 0`, sorts by `(decayed_rate, hash)` for determinism, and picks the per-hash target peer by `disk_free_gb DESC, node_id ASC` among peers advertising `dataforts.blob.overflow` with `disk_free_gb >= ceil(size / 1 GiB)` and `peer_scope` covering `local_scope`. Truncation at `max_pushes_per_tick` does NOT bump `rejected_no_target` (tracked separately so only attempted-and-failed selections count). The hysteresis state machine `step_overflow_hysteresis(active, disk_ratio, high, low)` is the same shape as the health gate — fires above `high`, clears below `low`, holds prior state in the band.
+
+`drive_blob_overflow_tick` composes the hysteresis state machine + the controller's candidate computation + the sink's push. Sender-side self-check skips the tick when the local `dataforts.blob.overflow` tag isn't yet visible on the snapshot — defends against the toggle-without-announce race where every push would round-trip an RPC just to come back `Rejected(SenderNotOverflowing)`. The sink is `OverflowPushSink`; production uses `MeshNodeOverflowPushSink` (wraps the [`MeshNode::send_overflow_push`](src/adapter/net/mesh.rs) nRPC under the `dataforts.blob.overflow_push` service name).
+
+Wire types ride the existing nRPC surface (no new subprotocol):
+
+```rust
+pub struct OverflowPush {
+    pub blob_hash: [u8; 32],
+    pub size_bytes: u64,
+    pub sender_node_id: u64,  // receiver looks sender caps up by this
+}
+pub enum OverflowPushAck { Accepted, Rejected(OverflowReject), OpenChunkFailed }
+pub enum OverflowReject {
+    NoStorageCap, NotParticipating, SenderNotOverflowing,
+    Unhealthy, ScopeMismatch, InsufficientDisk,
+}
+```
+
+The receive-side handler [`OverflowPushHandler`](src/adapter/net/dataforts/blob/overflow.rs) decodes the nudge, looks up `sender_caps` from the local capability index (defends against forged caps in the request body — the index is the authoritative source), runs `should_accept_overflow_from(local_caps, sender_caps, size_bytes)` (G-7), and on Admit calls `adapter.prefetch` to open the chunk channel with replication armed. The chunk bytes pull via the existing per-chunk replication runtime; the nudge is a pre-open optimization, not a chunk transport. Sender drops the local copy on the next sweep once the durability watermark fires (target's `causal:<hash>` advertisement appears in the capability index) — pre-watermark deletes risk losing the only copy; the deferred safe-delete-on-watermark gate lands in a future PR.
+
+### Read-your-writes
+
+`WriteToken { version, origin_hash, seq }` returned from every `Tasks` / `Memories` write. `wait_for_token(token, deadline)` blocks until the local fold has actually *applied* the sequence number — not just folded the underlying event — so a producer reads its own write through the cache deterministically. The wait tracks two watermarks (`applied_through_seq` and `folded_through_seq`); `WaitForTokenError::FoldStopped` surfaces when the fold task crashes mid-wait so a producer never gets a silent `Ok(())` against a stalled adapter. Non-blocking poll is `deadline_ms == 0` — returns the current watermark state without parking the caller. A process-wide in-flight cap bounds the number of concurrent waits; over-cap returns `WaitForTokenError::AtCapacity` synchronously so a misbehaving caller can't OOM the adapter.
+
+Token construction is doc-hidden; tokens are unforgeable only against the issuing adapter (origin-bound). `publish_with_blob` extends the same machinery — the `PublishWithBlobReceipt` carries the publish-event's `WriteToken` after the configured `BlobDurability` is satisfied, so producers can `wait_for_token` after `publish_with_blob(..., BlobDurability::ReplicatedTo(2))` and the wait completes once the chunk has landed on two peers AND the publish event has folded locally.
+
+### Prometheus + operator surface
+
+`MeshBlobAdapter::prometheus_text(adapter_id, gc_pending_total)` renders the full counter family. Names are stable wire contract; the `adapter` label is operator-escaped against injection. Counters and gauges shipped:
+
+- `dataforts_blobs_stored_total{adapter}` / `_fetched_total{adapter}` / `_bytes_stored_total{adapter}` — basic CRUD.
+- `dataforts_blob_gc_swept_total{adapter}` (counter) + `_gc_pending{adapter}` (gauge) — refcount-driven GC.
+- `dataforts_blob_disk_used_bytes{adapter}` / `_disk_capacity_bytes{adapter}` — operator-configured cap.
+- `dataforts_blob_overflow_pushes_admitted_total{adapter}` / `_push_errors_total{adapter}` / `_pushed_bytes_total{adapter}` — send-side overflow.
+- `dataforts_blob_overflow_rejected_no_target_total{adapter}` — controller computed a cold candidate but no overflow-enabled peer was reachable for it (truncated tail excluded).
+- `dataforts_blob_overflow_rejected_total{adapter,reason}` — receive-side admission rejections by reason (`no_storage_cap` / `not_participating` / `sender_not_overflowing` / `unhealthy` / `scope_mismatch` / `insufficient_disk`).
+- `dataforts_blob_overflow_high_water_triggered_total{adapter}` / `_low_water_cleared_total{adapter}` — hysteresis transitions (edge events, not steady-state ticks).
+- `dataforts_blob_overflow_active{adapter}` (gauge `0/1`) + `_disk_ratio{adapter}` (gauge `[0, 10]` clamped) — live hysteresis state.
+
+The CLI is `cargo run --features cli --bin net-blob -- --help` (10 subcommands): `put` / `get` / `stat` / `exists` / `ls` / `pin` / `unpin` / `gc` / `metrics` / `overflow status`. Every command supports `--format json` for machine consumption. `overflow status` prints the configured boolean, runtime `active` flag, thresholds, and per-process counter family.
 
 ## nRPC
 
