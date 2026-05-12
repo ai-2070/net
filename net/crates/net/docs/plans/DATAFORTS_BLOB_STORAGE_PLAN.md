@@ -650,7 +650,7 @@ Eighteen commits between the PR-5r ship-line and the v0.15 cut hardened the surf
 
 - **Cross-binding fixtures (T-5) for Node + Go.** Python lands in PR-5m (the project's primary FFI consumer); Node + Go follow per-binding rather than as one bulk PR — each language's surface is a few hundred lines and has its own idiomatic shape.
 - **End-to-end gravity-migration DST.** PR-5n's 3-node harness covers prefetch + migration via direct controller calls; the full A-publishes → A's fetches bump heat → A's tick emits `heat:blob:` → B observes via gossip → B's migration controller calls prefetch path needs deterministic-simulation wiring to test reproducibly. The unit + integration tests cover the path piecewise.
-- **Storage-overflow push-to-peer.** v0.2 is intentionally pull-only per § G-3. When local disk crosses the unhealthy threshold the node advertises `dataforts:blob-storage-unhealthy` and other nodes' admission rejects inbound migrations; the node itself doesn't actively push its blobs to peers with free disk. An active offload path (mirror of `should_migrate_blob_to` for receive-side acceptance, eviction order driven by inverse blob-heat) is a useful refinement when a workload demonstrates sustained local saturation.
+- **Storage-overflow push-to-peer.** v0.2 is intentionally pull-only per § G-3. When local disk crosses the unhealthy threshold the node advertises `dataforts:blob-storage-unhealthy` and other nodes' admission rejects inbound migrations; the node itself doesn't actively push its blobs to peers with free disk. Scope-locked for v0.3 in [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`](DATAFORTS_BLOB_OVERFLOW_PLAN.md) — operator-opt-in boolean, `dataforts.blob.overflow` capability advertisement, inverse-heat eviction order, push via the existing chunk-channel replication runtime.
 
 ---
 
@@ -670,6 +670,7 @@ If the workload comes via "we have S3 and want to keep using it" — v0.15's `Bl
 
 - [`DATAFORTS_PLAN.md`](../misc/DATAFORTS_PLAN.md) — the seven-phase plan including v0.15 Phase 3's external-hook shape.
 - [`DATAFORTS_FEATURES.md`](../misc/DATAFORTS_FEATURES.md) — the audit; mentions "deferred-but-named: full substrate-owned blob CAS" — this plan is that track.
+- [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`](DATAFORTS_BLOB_OVERFLOW_PLAN.md) — the v0.3 active overflow extension on top of this plan's pull-only posture.
 - [`REDEX_DISTRIBUTED_PLAN.md`](REDEX_DISTRIBUTED_PLAN.md) — the v0.14 replication runtime that blob chunks ride on. No replication-side changes needed for v0.2 blob.
 - [`RELEASE_v0.15_REBEL_YELL.md`](../releases/RELEASE_v0.15_REBEL_YELL.md) § Phase 3 — what shipped as the external-hook surface and what this plan extends.
 
