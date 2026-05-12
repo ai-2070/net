@@ -243,6 +243,51 @@ impl MeshBlobAdapter {
         }
     }
 
+    /// Run one tick of the blob-heat registry: walk every tracked
+    /// hash, apply decay, ask the supplied `policy` whether to
+    /// emit, and route each `Emit { rate }` / `Withdraw` decision
+    /// through `sink` (as `announce_blob_heat_batch`). Returns
+    /// the count of emissions that landed (Emit + Withdraw
+    /// combined). PR-5j-c emission path; operators drive from a
+    /// periodic task at `DataGravityPolicy::emit_interval`
+    /// cadence.
+    ///
+    /// No-op (`Ok(0)`) when no registry is wired. The emission
+    /// snapshot is taken under the registry lock; the lock is
+    /// released *before* awaiting the sink, so a concurrent
+    /// `fetch` on this adapter can keep bumping heat in parallel
+    /// (a parking_lot mutex held across `.await` would otherwise
+    /// poison reachability).
+    pub async fn tick_blob_heat(
+        &self,
+        policy: &crate::adapter::net::dataforts::gravity::DataGravityPolicy,
+        sink: &dyn crate::adapter::net::dataforts::gravity::BlobHeatSink,
+    ) -> Result<u64, BlobError> {
+        use crate::adapter::net::dataforts::gravity::HeatEmission;
+        let reg = match self.blob_heat.as_ref() {
+            Some(r) => r,
+            None => return Ok(0),
+        };
+        let emissions = {
+            let mut guard = reg.lock();
+            guard.tick(policy, std::time::Instant::now())
+        };
+        let mut updates: Vec<([u8; 32], Option<f64>)> = Vec::with_capacity(emissions.len());
+        for (hash, em) in &emissions {
+            match em {
+                HeatEmission::Emit { rate } => updates.push((*hash, Some(*rate))),
+                HeatEmission::Withdraw => updates.push((*hash, None)),
+                HeatEmission::Suppress => {}
+            }
+        }
+        if !updates.is_empty() {
+            sink.announce_blob_heat_batch(&updates).await.map_err(|e| {
+                BlobError::Backend(format!("blob heat tick: announce batch failed: {}", e))
+            })?;
+        }
+        Ok(updates.len() as u64)
+    }
+
     /// Pin `hash` against GC, gated by an
     /// [`AuthGuard::is_authorized_full`] check on
     /// `(origin_hash, channel)`. Returns
@@ -1496,6 +1541,78 @@ mod tests {
         // isn't one to touch — the assertion is implicit: no panic).
         let bytes = adapter.fetch(&blob).await.unwrap();
         assert_eq!(bytes, payload);
+    }
+
+    /// Recorder sink — captures every announce / withdraw call.
+    /// Used by the tick tests to assert on the emitted sequence.
+    #[derive(Default)]
+    struct RecorderBlobHeatSink {
+        announces: parking_lot::Mutex<Vec<([u8; 32], f64)>>,
+        withdraws: parking_lot::Mutex<Vec<[u8; 32]>>,
+    }
+
+    #[async_trait]
+    impl crate::adapter::net::dataforts::gravity::BlobHeatSink for RecorderBlobHeatSink {
+        async fn announce_blob_heat(
+            &self,
+            hash: [u8; 32],
+            rate: f64,
+        ) -> Result<(), crate::error::AdapterError> {
+            self.announces.lock().push((hash, rate));
+            Ok(())
+        }
+        async fn withdraw_blob_heat(
+            &self,
+            hash: [u8; 32],
+        ) -> Result<(), crate::error::AdapterError> {
+            self.withdraws.lock().push(hash);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_blob_heat_no_op_without_registry() {
+        let adapter = make_adapter();
+        let sink = RecorderBlobHeatSink::default();
+        let policy = crate::adapter::net::dataforts::gravity::DataGravityPolicy::default();
+        let emitted = adapter.tick_blob_heat(&policy, &sink).await.unwrap();
+        assert_eq!(emitted, 0);
+        assert!(sink.announces.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_blob_heat_emits_after_repeated_fetches() {
+        use crate::adapter::net::dataforts::gravity::BlobHeatRegistry;
+        let redex = Arc::new(Redex::new());
+        let registry = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
+        let adapter = MeshBlobAdapter::new("mesh-heat-tick", redex)
+            .with_blob_heat(registry.clone(), DEFAULT_BLOB_HEAT_HALF_LIFE);
+
+        let payload = b"hot tick".to_vec();
+        let blob = small_ref_for(&payload);
+        let hash = match &blob {
+            BlobRef::Small { hash, .. } => *hash,
+            _ => panic!("expected Small"),
+        };
+        adapter.store(&blob, &payload).await.unwrap();
+
+        // Build up heat with several reads.
+        for _ in 0..8 {
+            adapter.fetch(&blob).await.unwrap();
+        }
+
+        let sink = RecorderBlobHeatSink::default();
+        let policy = crate::adapter::net::dataforts::gravity::DataGravityPolicy::default();
+        let emitted = adapter.tick_blob_heat(&policy, &sink).await.unwrap();
+        assert!(
+            emitted >= 1,
+            "tick must emit at least one entry; got {emitted}"
+        );
+        let announces = sink.announces.lock().clone();
+        assert!(
+            announces.iter().any(|(h, rate)| *h == hash && *rate > 0.0),
+            "announce list must mention our hot hash with a positive rate; got {announces:?}"
+        );
     }
 
     #[tokio::test]

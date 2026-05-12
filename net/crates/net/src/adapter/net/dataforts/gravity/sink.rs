@@ -47,3 +47,41 @@ pub trait HeatSink: Send + Sync {
         Ok(())
     }
 }
+
+/// Wire-side surface for blob heat-tag emissions. Mirrors
+/// [`HeatSink`] but keys on the chunk's 32-byte BLAKE3 hash
+/// rather than the chain's `u64` `origin_hash`. PR-5j-c
+/// foundation for the gravity migration controller.
+///
+/// Wire form: `heat:blob:<hex64>=<rate>` reserved tag. The
+/// `heat:` prefix matches the chain-heat shape; the `blob:`
+/// body sub-prefix distinguishes the per-chunk projection.
+/// Mesh integrators implement this against a `MeshNode` whose
+/// `announce_capabilities` rebroadcast carries the tags forward.
+#[async_trait::async_trait]
+pub trait BlobHeatSink: Send + Sync {
+    /// Emit (or replace) the `heat:blob:<hex>=<rate>` reserved
+    /// tag for chunk `hash`. Idempotent — most recent call wins.
+    async fn announce_blob_heat(&self, hash: [u8; 32], rate: f64) -> Result<(), AdapterError>;
+
+    /// Withdraw every `heat:blob:<hex>=*` tag for chunk `hash`.
+    /// Idempotent; mirrors `HeatSink::withdraw_heat`.
+    async fn withdraw_blob_heat(&self, hash: [u8; 32]) -> Result<(), AdapterError>;
+
+    /// Batched form for coalescing a tick's worth of emissions
+    /// into one capability rebroadcast. Default impl falls back
+    /// to the per-hash methods; production impls override to
+    /// hold the rebroadcast until every update has landed.
+    async fn announce_blob_heat_batch(
+        &self,
+        updates: &[([u8; 32], Option<f64>)],
+    ) -> Result<(), AdapterError> {
+        for &(hash, rate_opt) in updates {
+            match rate_opt {
+                Some(rate) => self.announce_blob_heat(hash, rate).await?,
+                None => self.withdraw_blob_heat(hash).await?,
+            }
+        }
+        Ok(())
+    }
+}

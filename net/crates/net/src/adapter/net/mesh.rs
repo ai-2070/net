@@ -6531,6 +6531,53 @@ impl MeshNode {
         }
     }
 
+    /// Format a 32-byte BLAKE3 hash as a 64-character lowercase
+    /// hex string. Used as the chunk identifier inside `heat:blob:
+    /// <hex64>=<rate>` reserved tags.
+    #[cfg(feature = "dataforts")]
+    fn blob_hex(hash: &[u8; 32]) -> String {
+        let mut s = String::with_capacity(64);
+        for b in hash {
+            use std::fmt::Write;
+            let _ = write!(s, "{:02x}", b);
+        }
+        s
+    }
+
+    /// True iff `tag` is a `heat:blob:<hex64>=...` reserved tag for
+    /// `hex64`. Mirrors [`Self::is_heat_for`] but matches the
+    /// blob-heat body sub-prefix so chain-heat tags and blob-heat
+    /// tags never collide.
+    #[cfg(feature = "dataforts")]
+    fn is_blob_heat_for(tag: &Tag, hex64: &str) -> bool {
+        match tag {
+            Tag::Reserved { prefix, body } if prefix == "heat:" => {
+                if !body.starts_with("blob:") {
+                    return false;
+                }
+                let rest = &body[5..];
+                if !rest.starts_with(hex64) {
+                    return false;
+                }
+                matches!(rest.as_bytes().get(hex64.len()), Some(b'='))
+            }
+            _ => false,
+        }
+    }
+
+    /// Strip every `heat:blob:<hex64>=*` tag for `hash` from `caps`
+    /// and insert `replacement` in its place. `None` is withdrawal.
+    /// Parallel to [`Self::replace_heat_tags`] for the per-blob
+    /// heat-tag family.
+    #[cfg(feature = "dataforts")]
+    fn replace_blob_heat_tags(caps: &mut CapabilitySet, hash: &[u8; 32], replacement: Option<Tag>) {
+        let hex = Self::blob_hex(hash);
+        caps.tags.retain(|t| !Self::is_blob_heat_for(t, &hex));
+        if let Some(t) = replacement {
+            caps.tags.insert(t);
+        }
+    }
+
     /// Read the current user-supplied baseline, defaulting to an
     /// empty `CapabilitySet` when no `announce_capabilities` has
     /// landed yet. Returns an owned snapshot — callers mutate the
@@ -6690,6 +6737,92 @@ impl super::dataforts::HeatSink for MeshNode {
         updates: &[(u64, Option<f64>)],
     ) -> Result<(), AdapterError> {
         MeshNode::announce_heat_batch(self, updates).await
+    }
+}
+
+#[cfg(feature = "dataforts")]
+impl MeshNode {
+    /// Advertise the `heat:blob:<hex64>=<rate>` reserved tag for
+    /// chunk `hash`. `rate` is clamped to `[0.0, 1.0]` to match
+    /// the chain-heat wire shape. PR-5j-c — operators wire this
+    /// via the [`BlobHeatSink`](super::dataforts::BlobHeatSink)
+    /// impl below; the [`MeshBlobAdapter::tick_blob_heat`](super::dataforts::MeshBlobAdapter::tick_blob_heat)
+    /// loop is the driver.
+    pub async fn announce_blob_heat(&self, hash: [u8; 32], rate: f64) -> Result<(), AdapterError> {
+        let clamped = if rate.is_finite() {
+            rate.clamp(0.0, 1.0)
+        } else {
+            return Err(AdapterError::Fatal(
+                "blob heat rate must be finite".to_string(),
+            ));
+        };
+        let hex = Self::blob_hex(&hash);
+        let replacement = Tag::parse(&format!("heat:blob:{hex}={clamped:.2}")).ok();
+        let mut snapshot = self.user_caps_snapshot();
+        Self::replace_blob_heat_tags(&mut snapshot, &hash, replacement);
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// Withdraw every `heat:blob:<hex>=*` tag for `hash` and
+    /// re-broadcast. Peers drop the blob-heat annotation.
+    pub async fn withdraw_blob_heat(&self, hash: [u8; 32]) -> Result<(), AdapterError> {
+        let mut snapshot = self.user_caps_snapshot();
+        Self::replace_blob_heat_tags(&mut snapshot, &hash, None);
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// Apply a batch of blob-heat emissions in a single
+    /// `announce_capabilities` round-trip. Each update is either
+    /// `Some(rate)` (replace this hash's `heat:blob:` tag) or
+    /// `None` (withdraw every blob-heat annotation for the hash).
+    /// Coalescing matches the chain-heat batch path so a busy
+    /// tick doesn't spawn N rebroadcasts.
+    pub async fn announce_blob_heat_batch(
+        &self,
+        updates: &[([u8; 32], Option<f64>)],
+    ) -> Result<(), AdapterError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut snapshot = self.user_caps_snapshot();
+        for (hash, rate_opt) in updates {
+            let replacement = match rate_opt {
+                Some(rate) if rate.is_finite() => {
+                    let clamped = rate.clamp(0.0, 1.0);
+                    let hex = Self::blob_hex(hash);
+                    Tag::parse(&format!("heat:blob:{hex}={clamped:.2}")).ok()
+                }
+                Some(_) => {
+                    tracing::trace!(
+                        hash = ?hash,
+                        "blob heat: non-finite rate skipped in batch"
+                    );
+                    continue;
+                }
+                None => None,
+            };
+            Self::replace_blob_heat_tags(&mut snapshot, hash, replacement);
+        }
+        self.announce_capabilities(snapshot).await
+    }
+}
+
+#[cfg(feature = "dataforts")]
+#[async_trait::async_trait]
+impl super::dataforts::BlobHeatSink for MeshNode {
+    async fn announce_blob_heat(&self, hash: [u8; 32], rate: f64) -> Result<(), AdapterError> {
+        MeshNode::announce_blob_heat(self, hash, rate).await
+    }
+
+    async fn withdraw_blob_heat(&self, hash: [u8; 32]) -> Result<(), AdapterError> {
+        MeshNode::withdraw_blob_heat(self, hash).await
+    }
+
+    async fn announce_blob_heat_batch(
+        &self,
+        updates: &[([u8; 32], Option<f64>)],
+    ) -> Result<(), AdapterError> {
+        MeshNode::announce_blob_heat_batch(self, updates).await
     }
 }
 
@@ -9914,6 +10047,66 @@ mod chain_helper_tests {
         for h in [0u64, 1, 0x42, u64::MAX] {
             assert_eq!(MeshNode::chain_hex(h).len(), 16);
         }
+    }
+
+    #[test]
+    fn blob_hex_is_lowercase_64_chars() {
+        let zero = [0u8; 32];
+        assert_eq!(MeshNode::blob_hex(&zero).len(), 64);
+        assert!(MeshNode::blob_hex(&zero).chars().all(|c| c == '0'));
+        let mut h = [0u8; 32];
+        h[0] = 0xDE;
+        h[1] = 0xAD;
+        h[31] = 0xFF;
+        let hex = MeshNode::blob_hex(&h);
+        assert!(hex.starts_with("dead"));
+        assert!(hex.ends_with("ff"));
+        assert_eq!(hex.len(), 64);
+    }
+
+    #[test]
+    fn is_blob_heat_for_matches_blob_body_only() {
+        let mut h = [0u8; 32];
+        h[0] = 0x42;
+        let hex = MeshNode::blob_hex(&h);
+        let blob_tag = Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.5", hex),
+        };
+        assert!(MeshNode::is_blob_heat_for(&blob_tag, &hex));
+        // Chain-heat shape (no "blob:" sub-prefix) must NOT match.
+        let chain_tag = Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("{}=0.5", MeshNode::chain_hex(0x42)),
+        };
+        assert!(!MeshNode::is_blob_heat_for(&chain_tag, &hex));
+    }
+
+    #[test]
+    fn replace_blob_heat_tags_round_trip() {
+        let mut h = [0u8; 32];
+        h[0] = 0x77;
+        let hex = MeshNode::blob_hex(&h);
+        let mut caps = CapabilitySet::default();
+        let initial = Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.10", hex),
+        };
+        caps.tags.insert(initial.clone());
+        // Replace with a fresh rate.
+        let replacement = Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.80", hex),
+        };
+        MeshNode::replace_blob_heat_tags(&mut caps, &h, Some(replacement.clone()));
+        assert!(caps.tags.contains(&replacement));
+        assert!(!caps.tags.contains(&initial));
+        // Withdraw — every heat:blob:<hex>=* drops.
+        MeshNode::replace_blob_heat_tags(&mut caps, &h, None);
+        assert!(!caps
+            .tags
+            .iter()
+            .any(|t| MeshNode::is_blob_heat_for(t, &hex)));
     }
 
     fn causal_tag(body: impl Into<String>) -> Tag {

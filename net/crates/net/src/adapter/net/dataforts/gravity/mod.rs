@@ -38,4 +38,4 @@ pub use policy::{
     DEFAULT_NORMALIZATION_REFERENCE_RATE, MAX_EMIT_THRESHOLD_RATIO, MIN_EMIT_THRESHOLD_RATIO,
     MIN_NORMALIZATION_REFERENCE_RATE,
 };
-pub use sink::HeatSink;
+pub use sink::{BlobHeatSink, HeatSink};
