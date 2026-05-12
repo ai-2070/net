@@ -4185,22 +4185,22 @@ const CAPABILITY_STRIP: ReadonlyArray<{
     num: "mesh.storage.1",
     name: "Overflow",
     isNew: true,
-    body: "high-water push to peers with capacity · admission on receive · watermark hysteresis",
+    body: "Storage doesn't run out. When one disk fills up, the rest catch the spillover.",
   },
   {
     num: "mesh.storage.2",
     name: "Data Gravity",
-    body: "heat:blob tags announced peer-to-peer · log-scale decay · hot chunks colocate near demand",
+    body: "Files settle near the people who use them. Nobody moves them. They just end up there.",
   },
   {
     num: "mesh.storage.3",
     name: "Read-your-writes",
-    body: "WriteToken: (version, origin_hash, seq) · wait_for_token without coordinator round-trips",
+    body: "If you wrote it, you can read it. Right now. No waiting on the cluster.",
   },
   {
     num: "mesh.storage.4",
     name: "BlobRef",
-    body: "manifest hash + chunks · pluggable adapters · hash-verified on store",
+    body: "One handle gets you any file. The mesh finds it — wherever it lives.",
   },
 ];
 
