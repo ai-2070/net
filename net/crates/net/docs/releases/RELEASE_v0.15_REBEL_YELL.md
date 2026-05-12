@@ -2,7 +2,7 @@
 
 *Named after Billy Idol's 1983 album / title track — a release that asks "more, more, more" of the substrate The Warriors laid down. v0.14 made replication the load-bearing layer underneath the channel surface. v0.15 stacks the four-phase Dataforts compositional layer on top: greedy-LRU caching pulls in-scope chains, data gravity drifts hot ones toward their readers, `BlobRef` carries content-addressed pointers without owning the bytes, and read-your-writes gives producers a session-bounded "did my write land yet?" handle. No new wire protocol — every phase composes against the existing capability index, proximity graph, and `causal:` tag layer that landed in The Warriors.*
 
-v0.15 lands **the full Rebel Yell roadmap from [`DATAFORTS_PLAN.md`](../misc/DATAFORTS_PLAN.md)** — Phases 1, 3, 4, and 5 of the seven-phase plan ship in this release, completing Dataforts as a compositional data plane on top of the v0.14 substrate. The full surface ships across Rust core, Python, Node, Go, and C FFI, with end-to-end mesh integration; greedy and gravity are runtime-toggleable policies (operators flip them on / off live against a running mesh, no rebuild required); the single `dataforts` Cargo feature gates whether the surface compiles at all. A **mesh-native blob storage extension (Phase 3.5)** lands in the same release — `MeshBlobAdapter` implements the v0.15 `BlobAdapter` trait against the local mesh's RedEX replication layer, so a Dataforts-enabled cluster has a working content-addressed blob store the moment `Redex::enable_replication(mesh)` is called. See [`DATAFORTS_BLOB_STORAGE_PLAN.md`](../plans/DATAFORTS_BLOB_STORAGE_PLAN.md) for the design.
+v0.15 lands **the full Rebel Yell roadmap from [`DATAFORTS_PLAN.md`](../misc/DATAFORTS_PLAN.md)** — Phases 1, 3, 4, and 5 of the seven-phase plan ship in this release, completing Dataforts as a compositional data plane on top of the v0.14 substrate. The full surface ships across Rust core, Python, Node, Go, and C FFI, with end-to-end mesh integration; greedy and gravity are runtime-toggleable policies (operators flip them on / off live against a running mesh, no rebuild required); the single `dataforts` Cargo feature gates whether the surface compiles at all. A **mesh-native blob storage extension (Phase 3.5)** lands in the same release — `MeshBlobAdapter` implements the v0.15 `BlobAdapter` trait against the local mesh's RedEX replication layer, so a Dataforts-enabled cluster has a working content-addressed blob store the moment `Redex::enable_replication(mesh)` is called. See [`DATAFORTS_BLOB_STORAGE_PLAN.md`](../plans/DATAFORTS_BLOB_STORAGE_PLAN.md) for the design. The **v0.3 active-overflow extension** ships alongside — disabled by default, one boolean to turn on; when active, a node pushes its coldest blobs to overflow-enabled peers with free disk via a new nRPC. Design + per-PR shipping status in [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`](../plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md).
 
 The hardening posture from the Black Diamond line continues. Two coordinated code-review passes landed before the v0.15 branch cut: the primary `dataforts-feature` review ([`docs/misc/CODE_REVIEW_2026_05_11_DATAFORTS.md`](../misc/CODE_REVIEW_2026_05_11_DATAFORTS.md)) closed 54 numbered items D-1..D-54, an independent second pass surfaced 11 N-series items, all but three (deferred with rationale) closed. Five post-merge follow-up commits on the `channel-hash-32` branch hardened the RPC-inbound dispatcher hot path and tightened collision-lookup contracts.
 
@@ -297,6 +297,215 @@ Eighteen commits between PR-5r and the v0.15 cut closed second-pass review items
 - `publish_with_blob` doc drops the overstated atomicity claim and documents chunk-advertise ordering inline.
 
 The full per-commit log lives in the plan doc's [Shipping status](../plans/DATAFORTS_BLOB_STORAGE_PLAN.md#shipping-status) table under "Hardening — post-PR-5j hardening pass."
+
+---
+
+## Active blob overflow (Phase 3.5 / v0.3 blob track)
+
+v0.2 mesh-native blob storage is intentionally pull-only — when a node fills up, it advertises `dataforts:blob-storage-unhealthy` and other nodes' admission rejects inbound migrations. The local node never *pushes* its own blobs elsewhere; under sustained saturation a node either reclaims via GC or stops accepting new bytes. The **v0.3 active-overflow extension** closes the loop: when a node fills up, it picks coldest blobs by inverse blob-heat and pushes them to peers that have free disk and have opted into receiving overflow.
+
+The plan + design rationale lives in [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`](../plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md). Shipped as P1..P5 across five commits on the `dataforts-overflow` branch.
+
+### Disabled by default, one boolean to turn on
+
+Active overflow is **off** in v0.2 deployments — every existing call site keeps the v0.2 pull-only posture without code changes. To opt in, operators flip a single boolean on the adapter:
+
+```rust
+// Construction-time, simple form:
+let adapter = MeshBlobAdapter::new("mesh-prod", redex.clone())
+    .with_overflow(OverflowConfig { enabled: true, ..Default::default() });
+
+// Or with typed tunables:
+let adapter = MeshBlobAdapter::new("mesh-prod", redex.clone())
+    .with_overflow(OverflowConfig {
+        enabled: true,
+        high_water_ratio: 0.80,
+        low_water_ratio: 0.65,
+        max_pushes_per_tick: 8,
+        scope: TopologyScope::Zone,
+        tick_interval_ms: 30_000,
+    });
+
+// Runtime toggle — no rebuild:
+adapter.set_overflow_enabled(true);
+adapter.set_overflow_enabled(false);
+```
+
+When enabled, the adapter advertises `dataforts.blob.overflow` on its capability set; peer-selection on the push side filters by this tag so overflow targets only nodes that have themselves opted in. Symmetric opt-in: the receive-side admission gate rejects pushes from a sender that *isn't* overflow-enabled.
+
+### `OverflowConfig` thresholds
+
+```rust
+pub struct OverflowConfig {
+    pub enabled: bool,                  // master switch
+    pub high_water_ratio: f64,          // 0.85 default — triggers tick
+    pub low_water_ratio: f64,           // 0.70 default — clears tick (hysteresis)
+    pub max_pushes_per_tick: usize,     // 16 default — bandwidth burst cap
+    pub scope: TopologyScope,           // Mesh default — push-target scope bound
+    pub tick_interval_ms: u64,          // 30_000 default
+}
+```
+
+Hysteresis mirrors the existing `dataforts:blob-storage-unhealthy` health-gate (95% / 85%) with looser thresholds because overflow fires *before* the unhealthy advertisement — by the time a node is unhealthy, overflow has already been shedding for a while.
+
+### G-7 — Active overflow admission
+
+```rust
+pub fn should_accept_overflow_from(
+    local_caps: &CapabilitySet,
+    sender_caps: &CapabilitySet,
+    blob_size_bytes: u64,
+) -> OverflowVerdict;
+```
+
+Receive-side mirror of `should_migrate_blob_to`. Six ordered gates: `NoStorageCap` → `NotParticipating` → `SenderNotOverflowing` → `Unhealthy` → `ScopeMismatch` → `InsufficientDisk`. Each `OverflowReject` variant maps to a distinct Prometheus counter label so operators dashboard both sides.
+
+The ordering matters operationally: a compute-only node surfaces `NoStorageCap` rather than `NotParticipating`, even when both gates would reject — the most actionable signal wins.
+
+### `BlobOverflowController` + tick driver
+
+```rust
+pub struct BlobOverflowController<'a> {
+    pub local_caps: &'a CapabilitySet,
+    pub capability_index: &'a CapabilityIndex,
+    pub heat_registry: &'a Arc<Mutex<BlobHeatRegistry>>,
+    pub refcount: &'a BlobRefcountTable,
+    pub config: &'a OverflowConfig,
+}
+```
+
+The controller's `candidates(now, size_for_hash)` walks the heat registry in ascending-rate order (coldest first), filters out pinned + non-zero-refcount hashes, and for each remaining candidate selects an overflow-enabled peer with sufficient disk-free + matching scope. Target ranking: highest `disk_free_gb` wins (greedy spread across peers); ties broken by lowest `node_id` for determinism.
+
+`drive_blob_overflow_tick` composes the controller + hysteresis state machine + the `OverflowPushSink` trait:
+
+```rust
+pub async fn drive_blob_overflow_tick(
+    controller: &BlobOverflowController<'_>,
+    sink: &dyn OverflowPushSink,
+    observation: OverflowTickObservation<'_>,
+    size_for_hash: impl Fn([u8; 32]) -> Option<u64>,
+) -> BlobOverflowTickReport;
+```
+
+`OverflowTickObservation` bundles per-tick state (disk stats, hysteresis atomic, clock). The `BlobOverflowTickReport` carries every counter the Prometheus emitter needs.
+
+`MeshBlobAdapter::drive_overflow_tick(ctx, size_for_hash)` is the 2-arg convenience wrapper — composes the controller, threads the adapter's `refcount` / `config` / `overflow_active`, runs the tick, auto-records the report into the adapter's metrics.
+
+### Wire protocol — `OverflowPush` RPC
+
+```rust
+pub struct OverflowPush {
+    pub blob_hash: [u8; 32],
+    pub size_bytes: u64,
+    pub sender_node_id: u64,
+}
+
+pub enum OverflowPushAck {
+    Accepted,
+    Rejected(OverflowReject),
+    OpenChunkFailed,
+}
+```
+
+The chunk bytes themselves don't ride this RPC — the nudge tells the receiver to open the chunk channel against its local Redex with replication armed; the existing per-chunk replication runtime pulls the bytes from any holder advertising `causal:<hash>` (typically the sender). The RPC routes through the existing nRPC machinery under the `dataforts.blob.overflow_push` service name.
+
+- **Sender side**: `MeshNode::send_overflow_push(target, hash, size) -> Result<OverflowPushAck, BlobError>` — encodes the request, dispatches via `MeshNode::call`, decodes the typed ack.
+- **Receiver side**: `MeshNode::serve_overflow_push(adapter) -> ServeHandle` registers the `OverflowPushHandler` under the service name. Each inbound request reads live `user_caps_snapshot` + the capability index, runs admission, on Admit calls `adapter.prefetch(BlobRef::small(...))` to open the chunk channel.
+- **`MeshNodeOverflowPushSink`** — concrete `OverflowPushSink` impl wrapping `Arc<MeshNode>`. Maps non-Accepted acks to typed `BlobError::Backend` so the controller's `push_errors` counter bumps uniformly.
+
+`OverflowReject` carries `serde::{Serialize, Deserialize}` so the typed reason rides inside `OverflowPushAck::Rejected` across the wire intact.
+
+### Prometheus counter family
+
+The adapter's `prometheus_text()` body emits the full overflow surface:
+
+```text
+dataforts_blob_overflow_pushes_admitted_total{adapter="..."}     <counter>
+dataforts_blob_overflow_push_errors_total{adapter="..."}         <counter>
+dataforts_blob_overflow_pushed_bytes_total{adapter="..."}        <counter>
+dataforts_blob_overflow_rejected_no_target_total{adapter="..."}  <counter>
+dataforts_blob_overflow_rejected_total{adapter="...",reason="no_storage_cap"}        <counter>
+dataforts_blob_overflow_rejected_total{adapter="...",reason="not_participating"}     <counter>
+dataforts_blob_overflow_rejected_total{adapter="...",reason="sender_not_overflowing"} <counter>
+dataforts_blob_overflow_rejected_total{adapter="...",reason="unhealthy"}             <counter>
+dataforts_blob_overflow_rejected_total{adapter="...",reason="scope_mismatch"}        <counter>
+dataforts_blob_overflow_rejected_total{adapter="...",reason="insufficient_disk"}     <counter>
+dataforts_blob_overflow_high_water_triggered_total{adapter="..."} <counter>   # false→true edges
+dataforts_blob_overflow_low_water_cleared_total{adapter="..."}    <counter>   # true→false edges
+dataforts_blob_overflow_active{adapter="..."}                     <gauge 0/1>
+dataforts_blob_overflow_disk_ratio{adapter="..."}                 <gauge 0..1>
+```
+
+Sender's `push_errors_total` bumps on every non-Accepted ack (RPC transport + admission rejection + chunk open failure). The receiver's `rejected_total{reason}` family bumps on each admission rejection by variant — operators dashboarding both sides see matching volumes.
+
+Hysteresis transitions only bump on the **edge**: `false → true` increments `high_water_triggered_total`, `true → false` increments `low_water_cleared_total`. Repeated active-during ticks don't bump either counter, so the metrics count distinct "overflow episodes" rather than steady-state ticks.
+
+### `net-blob overflow status` CLI
+
+```text
+net-blob overflow status
+net-blob --format json overflow status
+```
+
+Prints the configured boolean, the runtime `overflow_active` flag (set by the most recent tick on this process), the configured thresholds, and the cumulative counter family. JSON form is shape-stable: top-level keys `adapter` / `config` / `active` / `counters`, with every per-reason counter present even at zero (operator dashboards don't want missing keys).
+
+### Cross-binding — Python
+
+`MeshBlobAdapter` gains an `overflow` kwarg + getter / setter surface:
+
+```python
+from net import MeshBlobAdapter, Redex
+
+redex = Redex(persistent_dir="/data/blobs")
+
+# Simple boolean — turn on with defaults.
+adapter = MeshBlobAdapter(redex, "py-prod", overflow=True)
+
+# Typed dict — turn on + tune thresholds. Missing keys inherit defaults.
+adapter = MeshBlobAdapter(
+    redex,
+    "py-prod",
+    overflow={"high_water_ratio": 0.90, "max_pushes_per_tick": 4, "scope": "zone"},
+)
+
+# Pre-stage config without flipping the switch (e.g. for testing).
+adapter = MeshBlobAdapter(
+    redex,
+    "py-stage",
+    overflow={"enabled": False, "high_water_ratio": 0.95},
+)
+
+# Runtime control.
+adapter.set_overflow_enabled(True)
+adapter.set_overflow_config({"enabled": True, "high_water_ratio": 0.88, ...})
+
+# Read-only inspection.
+adapter.overflow_enabled   # bool — master switch state
+adapter.overflow_active    # bool — runtime hysteresis state
+adapter.overflow_config    # dict — full typed snapshot
+```
+
+The dict path enforces typed-error contracts: unknown keys raise `TypeError` (typo defense — `high_water_ration` doesn't silently fail); invalid scope strings raise `ValueError`. Node + Go bindings follow per-binding cadence (consistent with the v0.2 deferred-binding posture).
+
+### Storage layout + safe-delete
+
+Sender doesn't immediately delete the local copy on `OverflowPushAck::Accepted` — the durability watermark observation (sender polls capability index for receiver's `causal:<hash>` advertisement) is deferred to a future P6 follow-up. Today the local copy stays until the standard GC sweep collects it under retention + refcount-zero.
+
+This is conservative-by-default: the receiver may have admitted but the chunk-pull could still fail before the bytes land. Operators running into "sender disk doesn't drain fast enough" today can flip `gc --disk-pressure` (which bypasses the retention floor for refcount-zero hashes) — the explicit watermark gate lands in v0.16+.
+
+### Hardening — clippy + arg-bundling
+
+The `OverflowTickContext<'a>` + `OverflowTickObservation<'a>` borrow structs bundle the tick-driver args so neither `drive_blob_overflow_tick` (4 args) nor `MeshBlobAdapter::drive_overflow_tick` (2 args) trips clippy's `too_many_arguments` lint. No `#[allow(clippy::too_many_arguments)]` anywhere in the overflow surface — the bundling earns the clean signatures.
+
+### Test coverage
+
+- **P1**: 17 pure-logic tests (`should_accept_overflow_from` × 8 reject variants + admit path + ordering, `BlobCapability::overflow_enabled` round-trip × 2, `OverflowConfig` adapter surface × 5).
+- **P2**: 20 controller / tick / hysteresis tests (`step_overflow_hysteresis` × 4 edge cases, `BlobOverflowController::candidates` × 7 filter paths, tick-driver tests × 6 against an `OverflowPushRecorder` mock, `scope_covers` × 2, `MeshBlobAdapter::overflow_active` shared-state × 1).
+- **P3**: 7 wire-format + integration tests (postcard round-trip × 5 variants + 2-node `MeshNode::send/serve_overflow_push` end-to-end × 2).
+- **P4**: 10 metrics + CLI tests (`record_overflow_tick` bumps × 4 paths, per-reason `record_overflow_reject` × 1, Prometheus body shape × 2, CLI `overflow status` Human + JSON + metrics-body inclusion × 3).
+- **P5**: 12 Python pytest tests (default-off + bool-true + bool-false + dict-overrides + dict-prestage + scope-parsing + unknown-key + bad-scope + bad-type + runtime-setter + whole-config-setter + round-trip × 12).
+
+Total: 66 new tests across the v0.3 overflow track.
 
 ---
 

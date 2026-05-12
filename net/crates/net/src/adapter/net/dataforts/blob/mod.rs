@@ -59,7 +59,11 @@ pub use dispatch::{
 };
 pub use error::BlobError;
 pub use fs::FileSystemAdapter;
-pub use mesh::{MeshBlobAdapter, DEFAULT_BLOB_HEAT_HALF_LIFE};
+pub use mesh::{
+    MeshBlobAdapter, OverflowConfig, DEFAULT_BLOB_HEAT_HALF_LIFE,
+    DEFAULT_OVERFLOW_HIGH_WATER_RATIO, DEFAULT_OVERFLOW_LOW_WATER_RATIO,
+    DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK, DEFAULT_OVERFLOW_TICK_INTERVAL_MS,
+};
 pub use metrics::{
     evaluate_health_gate, BlobMetrics, BlobMetricsSnapshot, HealthGateAction,
     HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,

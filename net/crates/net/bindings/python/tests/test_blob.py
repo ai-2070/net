@@ -241,3 +241,186 @@ def test_mesh_blob_adapter_persistent_round_trips_across_calls() -> None:
         # The chunk file persisted on disk; fetch must succeed.
         fetched = adapter_b.fetch(ref)
         assert fetched == payload
+
+
+# ============================================================================
+# Active-overflow surface (v0.3 P5)
+#
+# The push controller + tick driver themselves don't surface to Python yet
+# (the controller borrows live Rust state — operator scripts typically
+# don't drive ticks from Python). What does surface is the operator-toggle
+# surface: the master switch + the threshold knobs + the runtime active
+# gauge. These tests pin the bool / dict construction shape + the
+# runtime setter contract.
+# ============================================================================
+
+
+def test_mesh_blob_adapter_overflow_default_off() -> None:
+    # Out-of-the-box construction matches the v0.2 pull-only
+    # posture: overflow disabled, runtime active flag false.
+    # Existing call sites that don't pass `overflow=` see
+    # unchanged behavior.
+    redex = Redex()
+    adapter = MeshBlobAdapter(redex, "py-default")
+    assert adapter.overflow_enabled is False
+    assert adapter.overflow_active is False
+    cfg = adapter.overflow_config
+    assert cfg["enabled"] is False
+    assert cfg["scope"] == "mesh"
+    # The default thresholds are spelled out in the plan +
+    # the Rust DEFAULT_* constants. Pin the surface here so a
+    # future operator scanning `overflow_config` sees the
+    # canonical values.
+    assert cfg["high_water_ratio"] == 0.85
+    assert cfg["low_water_ratio"] == 0.70
+    assert cfg["max_pushes_per_tick"] == 16
+    assert cfg["tick_interval_ms"] == 30_000
+
+
+def test_mesh_blob_adapter_overflow_true_enables_with_defaults() -> None:
+    redex = Redex()
+    adapter = MeshBlobAdapter(redex, "py-on", overflow=True)
+    assert adapter.overflow_enabled is True
+    cfg = adapter.overflow_config
+    assert cfg["enabled"] is True
+    # Thresholds inherit defaults — the simple-bool path
+    # doesn't touch them.
+    assert cfg["high_water_ratio"] == 0.85
+    assert cfg["scope"] == "mesh"
+
+
+def test_mesh_blob_adapter_overflow_false_explicit_is_a_no_op() -> None:
+    # `overflow=False` is the explicit form of the default;
+    # ensures the kwarg accepts the bool even when the value
+    # matches the default. (PyO3 extract::<bool>() is strict
+    # about type — int 0 falls through to the dict path.)
+    redex = Redex()
+    adapter = MeshBlobAdapter(redex, "py-off", overflow=False)
+    assert adapter.overflow_enabled is False
+
+
+def test_mesh_blob_adapter_overflow_dict_overrides_thresholds() -> None:
+    # A dict with threshold keys turns overflow on AND tunes
+    # the thresholds. Missing keys inherit defaults; the
+    # operator gets to override just the knobs they care
+    # about.
+    redex = Redex()
+    adapter = MeshBlobAdapter(
+        redex,
+        "py-tuned",
+        overflow={"high_water_ratio": 0.92, "max_pushes_per_tick": 4},
+    )
+    assert adapter.overflow_enabled is True
+    cfg = adapter.overflow_config
+    assert cfg["high_water_ratio"] == 0.92
+    assert cfg["max_pushes_per_tick"] == 4
+    # Untouched keys still at defaults.
+    assert cfg["low_water_ratio"] == 0.70
+    assert cfg["scope"] == "mesh"
+
+
+def test_mesh_blob_adapter_overflow_dict_with_enabled_false_does_not_flip_switch() -> None:
+    # Operators who want to *pre-stage* a config without
+    # turning the switch on pass `enabled=False` explicitly.
+    redex = Redex()
+    adapter = MeshBlobAdapter(
+        redex,
+        "py-prestage",
+        overflow={"enabled": False, "high_water_ratio": 0.95},
+    )
+    assert adapter.overflow_enabled is False
+    cfg = adapter.overflow_config
+    assert cfg["enabled"] is False
+    # But the threshold override stuck.
+    assert cfg["high_water_ratio"] == 0.95
+
+
+def test_mesh_blob_adapter_overflow_dict_scope_parsing() -> None:
+    # All four scope tokens must round-trip cleanly. The
+    # parser is case-insensitive on input + lowercase on
+    # output.
+    redex = Redex()
+    for scope in ("node", "zone", "region", "mesh"):
+        adapter = MeshBlobAdapter(redex, f"py-{scope}", overflow={"scope": scope})
+        assert adapter.overflow_config["scope"] == scope
+
+
+def test_mesh_blob_adapter_overflow_dict_unknown_key_raises() -> None:
+    # Typo-defense: an unknown key like `high_water_ration`
+    # would silently fail (the override never lands; default
+    # fires). Pin TypeError so the operator sees the typo.
+    redex = Redex()
+    with pytest.raises(TypeError) as excinfo:
+        MeshBlobAdapter(
+            redex,
+            "py-typo",
+            overflow={"high_water_ration": 0.90},
+        )
+    assert "high_water_ration" in str(excinfo.value)
+
+
+def test_mesh_blob_adapter_overflow_dict_bad_scope_raises_valueerror() -> None:
+    redex = Redex()
+    with pytest.raises(ValueError) as excinfo:
+        MeshBlobAdapter(redex, "py-badscope", overflow={"scope": "datacenter"})
+    assert "datacenter" in str(excinfo.value)
+
+
+def test_mesh_blob_adapter_overflow_wrong_type_raises_typeerror() -> None:
+    # int / str / list etc. all hit the TypeError branch.
+    redex = Redex()
+    for bad in (1, "yes", [True]):
+        with pytest.raises(TypeError):
+            MeshBlobAdapter(redex, "py-badtype", overflow=bad)
+
+
+def test_mesh_blob_adapter_set_overflow_enabled_runtime_toggle() -> None:
+    # `set_overflow_enabled` flips the master switch without
+    # rebuilding the adapter. Operators flip it live on a
+    # daemon-side adapter.
+    redex = Redex()
+    adapter = MeshBlobAdapter(redex, "py-toggle")
+    assert adapter.overflow_enabled is False
+    adapter.set_overflow_enabled(True)
+    assert adapter.overflow_enabled is True
+    # The runtime active flag stays False — no tick fired.
+    assert adapter.overflow_active is False
+    adapter.set_overflow_enabled(False)
+    assert adapter.overflow_enabled is False
+
+
+def test_mesh_blob_adapter_set_overflow_config_replaces_whole_config() -> None:
+    # `set_overflow_config(dict)` atomically replaces the
+    # config. Useful when enable + tune should land together.
+    redex = Redex()
+    adapter = MeshBlobAdapter(redex, "py-replace")
+    adapter.set_overflow_config({
+        "enabled": True,
+        "high_water_ratio": 0.88,
+        "low_water_ratio": 0.66,
+        "max_pushes_per_tick": 32,
+        "scope": "zone",
+        "tick_interval_ms": 60_000,
+    })
+    cfg = adapter.overflow_config
+    assert cfg["enabled"] is True
+    assert cfg["high_water_ratio"] == 0.88
+    assert cfg["low_water_ratio"] == 0.66
+    assert cfg["max_pushes_per_tick"] == 32
+    assert cfg["scope"] == "zone"
+    assert cfg["tick_interval_ms"] == 60_000
+
+
+def test_mesh_blob_adapter_overflow_config_round_trips_through_set_then_get() -> None:
+    # Compose: get a snapshot, mutate one field, set it back,
+    # observe the field changed and others are unchanged.
+    # Pins the (parse → render) inverse-ness contract.
+    redex = Redex()
+    adapter = MeshBlobAdapter(redex, "py-roundtrip", overflow=True)
+    snap = adapter.overflow_config
+    snap["max_pushes_per_tick"] = 7
+    adapter.set_overflow_config(snap)
+    assert adapter.overflow_config["max_pushes_per_tick"] == 7
+    # Other fields preserved.
+    assert adapter.overflow_config["high_water_ratio"] == 0.85
+    assert adapter.overflow_config["scope"] == "mesh"
