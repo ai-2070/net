@@ -259,7 +259,7 @@ fn gc_dry_run_reports_zero_candidates_on_empty_dir() {
         stderr_string(&out)
     );
     let v: serde_json::Value = serde_json::from_str(stdout_string(&out).trim()).expect("gc JSON");
-    assert_eq!(v["dry_run"].as_bool().unwrap(), true);
+    assert!(v["dry_run"].as_bool().unwrap());
     // Refcount table is per-process; on a fresh CLI run with an
     // empty Redex dir, no candidates.
     assert_eq!(v["candidates"].as_array().unwrap().len(), 0);
