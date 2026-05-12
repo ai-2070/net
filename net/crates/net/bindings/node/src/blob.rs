@@ -789,6 +789,12 @@ pub fn register_async_blob_adapter(
 /// Mirrors the Rust [`InnerOverflowConfig`] shape. Pass at
 /// construction via [`MeshBlobAdapter::new`]'s `overflow` option,
 /// or replace at runtime via [`MeshBlobAdapter::setOverflowConfig`].
+///
+/// Every field except `enabled` is optional — omit any knob to
+/// inherit the Rust-side default. Matches the Go and Python
+/// bindings' partial-config posture. Pass `{ enabled: true }` to
+/// turn overflow on with all-default thresholds; pass
+/// `{ enabled: true, highWaterRatio: 0.90 }` to override one knob.
 #[napi(object)]
 pub struct OverflowConfigJs {
     /// Master switch. `false` = adapter never pushes, never
@@ -798,63 +804,77 @@ pub struct OverflowConfigJs {
     pub enabled: bool,
     /// Disk usage ratio at or above which the overflow tick
     /// fires. Default `0.85`.
-    pub high_water_ratio: f64,
+    pub high_water_ratio: Option<f64>,
     /// Disk usage ratio at or below which the controller
     /// re-enters the inactive state. Hysteresis band between
     /// `lowWaterRatio` and `highWaterRatio` preserves the
     /// prior active state. Default `0.70`.
-    pub low_water_ratio: f64,
+    pub low_water_ratio: Option<f64>,
     /// Per-tick push budget. Each push opens a chunk channel
     /// with replication armed; this caps the bandwidth burst.
     /// Default `16`.
-    pub max_pushes_per_tick: u32,
+    pub max_pushes_per_tick: Option<u32>,
     /// Topology scope bound on push-target selection: one of
     /// `"node"` / `"zone"` / `"region"` / `"mesh"`. Default
     /// `"mesh"`.
-    pub scope: String,
+    pub scope: Option<String>,
     /// Tick cadence in milliseconds. Default `30000`.
-    pub tick_interval_ms: u32,
+    pub tick_interval_ms: Option<u32>,
 }
 
 #[cfg(feature = "dataforts")]
 fn overflow_config_from_inner(cfg: InnerOverflowConfig) -> OverflowConfigJs {
     OverflowConfigJs {
         enabled: cfg.enabled,
-        high_water_ratio: cfg.high_water_ratio,
-        low_water_ratio: cfg.low_water_ratio,
-        max_pushes_per_tick: cfg.max_pushes_per_tick as u32,
-        scope: match cfg.scope {
+        high_water_ratio: Some(cfg.high_water_ratio),
+        low_water_ratio: Some(cfg.low_water_ratio),
+        max_pushes_per_tick: Some(cfg.max_pushes_per_tick as u32),
+        scope: Some(match cfg.scope {
             TopologyScope::Node => "node".to_string(),
             TopologyScope::Zone => "zone".to_string(),
             TopologyScope::Region => "region".to_string(),
             TopologyScope::Mesh => "mesh".to_string(),
-        },
-        tick_interval_ms: cfg.tick_interval_ms as u32,
+        }),
+        tick_interval_ms: Some(cfg.tick_interval_ms as u32),
     }
 }
 
 #[cfg(feature = "dataforts")]
 fn overflow_config_to_inner(cfg: OverflowConfigJs) -> Result<InnerOverflowConfig> {
-    let scope = match cfg.scope.to_ascii_lowercase().as_str() {
-        "node" => TopologyScope::Node,
-        "zone" => TopologyScope::Zone,
-        "region" => TopologyScope::Region,
-        "mesh" => TopologyScope::Mesh,
-        other => {
-            return Err(blob_err(
-                "overflow.scope",
-                format!("expected 'node'|'zone'|'region'|'mesh'; got {:?}", other),
-            ));
-        }
-    };
-    Ok(InnerOverflowConfig {
+    let mut inner = InnerOverflowConfig {
         enabled: cfg.enabled,
-        high_water_ratio: cfg.high_water_ratio,
-        low_water_ratio: cfg.low_water_ratio,
-        max_pushes_per_tick: cfg.max_pushes_per_tick as usize,
-        scope,
-        tick_interval_ms: cfg.tick_interval_ms as u64,
-    })
+        ..InnerOverflowConfig::default()
+    };
+    if let Some(v) = cfg.high_water_ratio {
+        inner.high_water_ratio = v;
+    }
+    if let Some(v) = cfg.low_water_ratio {
+        inner.low_water_ratio = v;
+    }
+    if let Some(v) = cfg.max_pushes_per_tick {
+        inner.max_pushes_per_tick = v as usize;
+    }
+    if let Some(s) = cfg.scope {
+        inner.scope = match s.to_ascii_lowercase().as_str() {
+            "node" => TopologyScope::Node,
+            "zone" => TopologyScope::Zone,
+            "region" => TopologyScope::Region,
+            "mesh" => TopologyScope::Mesh,
+            other => {
+                return Err(blob_err(
+                    "overflow.scope",
+                    format!(
+                        "expected 'node'|'zone'|'region'|'mesh'; got {:?}",
+                        other.to_owned()
+                    ),
+                ));
+            }
+        };
+    }
+    if let Some(v) = cfg.tick_interval_ms {
+        inner.tick_interval_ms = v as u64;
+    }
+    Ok(inner)
 }
 
 /// Options for the `MeshBlobAdapter` constructor. Both fields
