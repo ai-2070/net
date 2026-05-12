@@ -61,7 +61,7 @@ netdb = ["cortex"]
 # + executor for time-travel / lineage / cross-chain joins /
 # streaming aggregates across many nodes and chains.
 # Disabled by default; activation requires a concrete consumer
-# workload (Hermes telemetry + Deck metrics are the named
+# workload (telemetry + Deck metrics are the named
 # candidates). See `docs/plans/MESHDB_PLAN.md`.
 meshdb = ["cortex"]
 # Dataforts (Rebel Yell) — compile the dataforts module surface,
