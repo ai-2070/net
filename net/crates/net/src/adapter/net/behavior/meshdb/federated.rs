@@ -150,6 +150,10 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
                 // sub-plan via the transport, count locally.
                 return self.execute_aggregate_count_federated(plan).await;
             }
+            OperatorPlan::AggregateNumeric { .. } => {
+                // Phase E-3 federated numeric aggregate.
+                return self.execute_aggregate_numeric_federated(plan).await;
+            }
             OperatorPlan::Filter { .. } => {
                 // Phase E-2 federated filter: fetch the inner
                 // sub-plan via the transport, filter locally.
@@ -336,6 +340,113 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             let ctx = EvalContext::new(&tags, &metadata);
             if pred.evaluate(&ctx) {
                 out.push(Ok(row));
+            }
+        }
+
+        let handle = QueryHandle::new(self.allocate_id());
+        let stream: ResultStream = Box::pin(futures::stream::iter(out));
+        Ok(RunningQuery {
+            handle,
+            rows: stream,
+        })
+    }
+
+    /// Phase E-3 federated numeric aggregate (Sum / Avg).
+    async fn execute_aggregate_numeric_federated(
+        &self,
+        plan: ExecutionPlan,
+    ) -> Result<RunningQuery, MeshError> {
+        use super::planner::CostEstimate;
+        use super::query::{
+            AggregateRowPayload, AggregateValue, GroupKey, NumericAggregateKind, SeqNum,
+        };
+        use std::collections::BTreeMap;
+
+        let OperatorPlan::AggregateNumeric {
+            input,
+            group_by,
+            field_path,
+            kind,
+        } = plan.root.operator
+        else {
+            unreachable!("execute_aggregate_numeric_federated dispatched on non-AggregateNumeric");
+        };
+
+        let inner = Box::pin(self.execute(ExecutionPlan {
+            root: *input,
+            total_cost: CostEstimate::default(),
+        }))
+        .await?;
+        let rows = drain_rows(inner.rows).await?;
+
+        let mut acc: BTreeMap<Vec<u8>, (Option<GroupKey>, f64, u64)> = BTreeMap::new();
+        for row in &rows {
+            let Some(value) = super::row::extract_numeric(row, &field_path) else {
+                continue;
+            };
+            let (key_bytes, group) = match group_by {
+                None => (Vec::new(), None),
+                Some(mode) => (
+                    encode_join_key_federated(row, mode),
+                    Some(match mode {
+                        super::planner::JoinKeyMode::Origin => GroupKey::Origin(row.origin),
+                        super::planner::JoinKeyMode::Seq => GroupKey::Seq(row.seq),
+                        super::planner::JoinKeyMode::OriginSeq => GroupKey::OriginSeq {
+                            origin: row.origin,
+                            seq: row.seq,
+                        },
+                    }),
+                ),
+            };
+            let entry = acc.entry(key_bytes).or_insert((group, 0.0, 0));
+            entry.1 += value;
+            entry.2 = entry.2.saturating_add(1);
+        }
+
+        let mut out: Vec<Result<ResultRow, MeshError>> = Vec::new();
+        let mk_value = |sum: f64, count: u64| match kind {
+            NumericAggregateKind::Sum => AggregateValue::Sum(sum),
+            NumericAggregateKind::Avg => {
+                if count == 0 {
+                    AggregateValue::Avg(None)
+                } else {
+                    AggregateValue::Avg(Some(sum / count as f64))
+                }
+            }
+        };
+        if group_by.is_none() {
+            let (sum, count) = acc
+                .get(&Vec::<u8>::new())
+                .map(|(_, s, c)| (*s, *c))
+                .unwrap_or((0.0, 0));
+            let payload = postcard::to_allocvec(&AggregateRowPayload {
+                group: None,
+                value: mk_value(sum, count),
+            })
+            .map_err(|e| MeshError::ExecutorError {
+                node: 0,
+                detail: format!("encode AggregateRowPayload: {e}"),
+            })?;
+            out.push(Ok(ResultRow {
+                origin: 0,
+                seq: SeqNum(0),
+                payload,
+            }));
+        } else {
+            for (_, (group, sum, count)) in acc {
+                let payload = postcard::to_allocvec(&AggregateRowPayload {
+                    group,
+                    value: mk_value(sum, count),
+                })
+                .map_err(|e| MeshError::ExecutorError {
+                    node: 0,
+                    detail: format!("encode AggregateRowPayload: {e}"),
+                })?;
+                out.push(Ok(ResultRow {
+                    origin: 0,
+                    seq: SeqNum(0),
+                    payload,
+                }));
             }
         }
 

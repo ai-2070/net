@@ -171,6 +171,26 @@ pub enum OperatorPlan {
         /// Phase E-2 alongside row-schema decoding.
         group_by: Option<JoinKeyMode>,
     },
+    /// Phase E-3 numeric aggregate (Sum / Avg) over a
+    /// row-intrinsic or JSON-payload field. The executor
+    /// extracts a `f64` per row via
+    /// [`super::row::extract_numeric`], skips rows whose
+    /// extraction returns `None`, and emits one
+    /// [`super::query::ResultRow`] per group carrying a
+    /// postcard-encoded
+    /// [`super::query::AggregateRowPayload`].
+    AggregateNumeric {
+        /// Inner sub-plan whose rows are aggregated.
+        input: Box<OperatorNode>,
+        /// Row-intrinsic group key, or `None` for a single
+        /// bucket.
+        group_by: Option<JoinKeyMode>,
+        /// Field path to extract the numeric value from. See
+        /// [`super::row::extract_numeric`] for resolution.
+        field_path: String,
+        /// Which numeric function to apply.
+        kind: super::query::NumericAggregateKind,
+    },
     /// Inner hash-join of two sub-plans. Phase D-1 ships the
     /// in-memory hash-build-on-left / probe-on-right strategy
     /// against row-intrinsic keys (`origin` / `seq`); richer
@@ -580,33 +600,54 @@ where
         })
     }
 
-    /// Plan a Phase E-1 aggregate. Only `AggregateFn::Count` is
-    /// supported in this slice; richer aggregate functions land
-    /// once a consumer drives row-schema decoding.
+    /// Plan an aggregate. Phase E-1 shipped `Count`; Phase E-3
+    /// adds `Sum` and `Avg`. Other aggregate functions (sketches
+    /// in Phase E-4) still surface `PlannerError`.
     fn plan_aggregate(
         &self,
         inner: &MeshQuery,
         group_by: &[Expr],
         agg_fn: &AggregateFn,
     ) -> Result<OperatorNode, MeshError> {
-        if !matches!(agg_fn, AggregateFn::Count) {
-            return Err(MeshError::PlannerError {
-                detail: format!(
-                    "aggregate function {agg_fn:?} not yet implemented in Phase E-1; only Count supported (Sum / Avg / sketches land alongside row-schema decoding)"
-                ),
-            });
-        }
         let key_mode = group_by_mode(group_by)?;
         let inner_plan = self.plan(inner)?;
         let cost = CostEstimate {
             bandwidth_bytes: inner_plan.total_cost.bandwidth_bytes,
             latency_ms: inner_plan.total_cost.latency_ms,
         };
-        Ok(OperatorNode {
-            operator: OperatorPlan::AggregateCount {
+        let operator = match agg_fn {
+            AggregateFn::Count => OperatorPlan::AggregateCount {
                 input: Box::new(inner_plan.root),
                 group_by: key_mode,
             },
+            AggregateFn::Sum { field } => {
+                let path = field_path_required(field, "Sum")?;
+                OperatorPlan::AggregateNumeric {
+                    input: Box::new(inner_plan.root),
+                    group_by: key_mode,
+                    field_path: path,
+                    kind: super::query::NumericAggregateKind::Sum,
+                }
+            }
+            AggregateFn::Avg { field } => {
+                let path = field_path_required(field, "Avg")?;
+                OperatorPlan::AggregateNumeric {
+                    input: Box::new(inner_plan.root),
+                    group_by: key_mode,
+                    field_path: path,
+                    kind: super::query::NumericAggregateKind::Avg,
+                }
+            }
+            other => {
+                return Err(MeshError::PlannerError {
+                    detail: format!(
+                        "aggregate function {other:?} not yet implemented; sketches (DistinctCount, Percentile) land in Phase E-4"
+                    ),
+                });
+            }
+        };
+        Ok(OperatorNode {
+            operator,
             target_nodes: vec![],
             cost,
         })
@@ -1024,6 +1065,11 @@ fn sum_cost(node: &OperatorNode) -> CostEstimate {
             acc.bandwidth_bytes = acc.bandwidth_bytes.saturating_add(inner.bandwidth_bytes);
             acc.latency_ms = acc.latency_ms.saturating_add(inner.latency_ms);
         }
+        OperatorPlan::AggregateNumeric { input, .. } => {
+            let inner = sum_cost(input);
+            acc.bandwidth_bytes = acc.bandwidth_bytes.saturating_add(inner.bandwidth_bytes);
+            acc.latency_ms = acc.latency_ms.saturating_add(inner.latency_ms);
+        }
         OperatorPlan::NotYetImplemented {
             input: Some(input),
             ..
@@ -1292,6 +1338,20 @@ fn field_name(e: &Expr) -> Option<&str> {
     match e {
         Expr::Field(s) => Some(s.as_str()),
         _ => None,
+    }
+}
+
+/// Pull the field path out of an `Expr::Field` (which numeric
+/// aggregates require for their target field). Surfaces a
+/// `PlannerError` for any other expression shape.
+fn field_path_required(e: &Expr, op_name: &str) -> Result<String, MeshError> {
+    match e {
+        Expr::Field(s) => Ok(s.clone()),
+        other => Err(MeshError::PlannerError {
+            detail: format!(
+                "{op_name} requires Expr::Field(<path>) for its field argument, got {other:?}"
+            ),
+        }),
     }
 }
 
@@ -2694,11 +2754,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_aggregate_non_count_function_surfaces_planner_error() {
+    fn plan_aggregate_sum_produces_aggregate_numeric() {
         let origin = 0x5555;
         let index = make_index_with_holder(1, origin);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
-        let err = planner
+        let plan = planner
             .plan(&aggregate_query(
                 origin,
                 vec![],
@@ -2706,11 +2766,91 @@ mod tests {
                     field: Expr::Field("amount".to_string()),
                 },
             ))
+            .unwrap();
+        match plan.root.operator {
+            OperatorPlan::AggregateNumeric {
+                group_by,
+                field_path,
+                kind,
+                ..
+            } => {
+                assert_eq!(group_by, None);
+                assert_eq!(field_path, "amount");
+                assert_eq!(kind, super::super::query::NumericAggregateKind::Sum);
+            }
+            other => panic!("expected AggregateNumeric; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_aggregate_avg_with_group_by_produces_aggregate_numeric() {
+        let origin = 0x5556;
+        let index = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&aggregate_query(
+                origin,
+                vec![Expr::Field("origin".to_string())],
+                AggregateFn::Avg {
+                    field: Expr::Field("latency".to_string()),
+                },
+            ))
+            .unwrap();
+        if let OperatorPlan::AggregateNumeric {
+            group_by,
+            field_path,
+            kind,
+            ..
+        } = plan.root.operator
+        {
+            assert_eq!(group_by, Some(JoinKeyMode::Origin));
+            assert_eq!(field_path, "latency");
+            assert_eq!(kind, super::super::query::NumericAggregateKind::Avg);
+        } else {
+            panic!("expected AggregateNumeric");
+        }
+    }
+
+    #[test]
+    fn plan_aggregate_non_field_arg_surfaces_planner_error() {
+        let origin = 0x5557;
+        let index = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner
+            .plan(&aggregate_query(
+                origin,
+                vec![],
+                AggregateFn::Sum {
+                    field: Expr::LitInt(42),
+                },
+            ))
             .unwrap_err();
         match err {
             MeshError::PlannerError { detail } => {
-                assert!(detail.contains("Phase E-1"));
-                assert!(detail.contains("Count"));
+                assert!(detail.contains("Expr::Field"), "got: {detail}");
+            }
+            other => panic!("expected PlannerError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_aggregate_sketch_function_still_surfaces_planner_error() {
+        // DistinctCount + Percentile sketches land in Phase E-4.
+        let origin = 0x5558;
+        let index = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner
+            .plan(&aggregate_query(
+                origin,
+                vec![],
+                AggregateFn::DistinctCountHll {
+                    field: Expr::Field("user_id".to_string()),
+                },
+            ))
+            .unwrap_err();
+        match err {
+            MeshError::PlannerError { detail } => {
+                assert!(detail.contains("Phase E-4"));
             }
             other => panic!("expected PlannerError; got {other:?}"),
         }

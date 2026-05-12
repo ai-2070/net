@@ -420,14 +420,34 @@ pub struct AggregateRowPayload {
     pub value: AggregateValue,
 }
 
-/// Computed aggregate value. Phase E-1 ships `Count`; richer
-/// variants (`Sum`, `Avg`, sketches) land once a consumer drives
-/// the field-extraction layer.
+/// Computed aggregate value. Phase E-1 shipped `Count`; Phase
+/// E-3 adds `Sum` and `Avg`; sketches (`DistinctCount`,
+/// `Percentile`) land in Phase E-4.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AggregateValue {
     /// Row count within the group.
     Count(u64),
+    /// Sum of a numeric field across rows in the group. Rows
+    /// whose field is missing / non-numeric contribute `0.0`.
+    Sum(f64),
+    /// Arithmetic mean of a numeric field across rows in the
+    /// group. Rows whose field is missing / non-numeric are
+    /// excluded from both numerator and denominator (so a
+    /// group with no numeric rows yields a group with an
+    /// empty `Avg` — surfaced via the `Avg(None)` variant).
+    Avg(Option<f64>),
+}
+
+/// Phase E-3 numeric aggregate kind. Marks which function the
+/// executor applies when materializing
+/// [`super::planner::OperatorPlan::AggregateNumeric`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NumericAggregateKind {
+    /// Arithmetic sum.
+    Sum,
+    /// Arithmetic mean.
+    Avg,
 }
 
 /// Join-result envelope. The executor postcard-encodes one of

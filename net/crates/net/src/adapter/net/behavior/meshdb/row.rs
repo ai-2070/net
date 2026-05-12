@@ -124,6 +124,51 @@ fn flatten_json(
     }
 }
 
+/// Extract a numeric value from `row` at `path`. Used by
+/// Phase E-3 numeric aggregates (Sum / Avg).
+///
+/// Resolution order:
+/// - `"origin"` -> `row.origin as f64`. (Rarely useful — origin
+///   hashes aren't ordinal — but symmetric with `Filter`'s
+///   synthetic-tag exposure.)
+/// - `"seq"` -> `row.seq.0 as f64`.
+/// - any other path -> walk the JSON-decoded payload following
+///   dotted segments; coerce the leaf to `f64` (numbers
+///   directly, booleans 0/1, anything else `None`). Returns
+///   `None` for missing keys, non-JSON payloads, or
+///   non-coercible leaves.
+pub fn extract_numeric(row: &ResultRow, path: &str) -> Option<f64> {
+    match path {
+        "origin" => Some(row.origin as f64),
+        "seq" => Some(row.seq.0 as f64),
+        _ => extract_numeric_from_payload(&row.payload, path),
+    }
+}
+
+fn extract_numeric_from_payload(payload: &[u8], path: &str) -> Option<f64> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let leaf = walk_json_path(&value, path)?;
+    coerce_numeric(leaf)
+}
+
+fn walk_json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut cur = value;
+    for segment in path.split('.') {
+        cur = cur.get(segment)?;
+    }
+    Some(cur)
+}
+
+fn coerce_numeric(value: &serde_json::Value) -> Option<f64> {
+    use serde_json::Value::*;
+    match value {
+        Number(n) => n.as_f64(),
+        Bool(true) => Some(1.0),
+        Bool(false) => Some(0.0),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

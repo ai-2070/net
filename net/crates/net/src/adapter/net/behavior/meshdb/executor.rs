@@ -43,7 +43,8 @@ use futures::StreamExt;
 use super::error::MeshError;
 use super::planner::{ExecutionPlan, JoinKeyMode, OperatorNode, OperatorPlan};
 use super::query::{
-    AggregateRowPayload, AggregateValue, GroupKey, JoinKind, JoinedRowPayload, ResultRow, SeqNum,
+    AggregateRowPayload, AggregateValue, GroupKey, JoinKind, JoinedRowPayload,
+    NumericAggregateKind, ResultRow, SeqNum,
 };
 
 /// Unique id for a running query. Currently a monotonically-
@@ -271,6 +272,15 @@ fn collect_operator_rows<R: ChainReader + ?Sized>(
         OperatorPlan::AggregateCount { input, group_by } => {
             let rows = collect_operator_rows(input, reader)?;
             execute_aggregate_count(&rows, *group_by)
+        }
+        OperatorPlan::AggregateNumeric {
+            input,
+            group_by,
+            field_path,
+            kind,
+        } => {
+            let rows = collect_operator_rows(input, reader)?;
+            execute_aggregate_numeric(&rows, *group_by, field_path, *kind)
         }
         OperatorPlan::Filter { input, predicate } => {
             let rows = collect_operator_rows(input, reader)?;
@@ -511,6 +521,94 @@ fn execute_aggregate_count(
             Ok(out)
         }
     }
+}
+
+/// Phase E-3 numeric aggregate (Sum / Avg) over `rows`,
+/// extracting the field at `field_path` per row.
+///
+/// Rows whose field is missing / non-coercible are skipped
+/// silently — they neither contribute to the numerator nor the
+/// denominator. An ungrouped query over zero rows yields one
+/// row carrying `Sum(0.0)` or `Avg(None)` respectively.
+fn execute_aggregate_numeric(
+    rows: &[ResultRow],
+    group_by: Option<JoinKeyMode>,
+    field_path: &str,
+    kind: NumericAggregateKind,
+) -> Result<Vec<ResultRow>, MeshError> {
+    use std::collections::BTreeMap;
+
+    // Per-group accumulator: (sum, count_of_numeric_rows).
+    let mut acc: BTreeMap<Vec<u8>, (Option<GroupKey>, f64, u64)> = BTreeMap::new();
+
+    for row in rows {
+        let Some(value) = super::row::extract_numeric(row, field_path) else {
+            continue;
+        };
+        let (key_bytes, group) = match group_by {
+            None => (Vec::new(), None),
+            Some(mode) => (
+                encode_join_key(row, mode),
+                Some(match mode {
+                    JoinKeyMode::Origin => GroupKey::Origin(row.origin),
+                    JoinKeyMode::Seq => GroupKey::Seq(row.seq),
+                    JoinKeyMode::OriginSeq => GroupKey::OriginSeq {
+                        origin: row.origin,
+                        seq: row.seq,
+                    },
+                }),
+            ),
+        };
+        let entry = acc.entry(key_bytes).or_insert((group, 0.0, 0));
+        entry.1 += value;
+        entry.2 = entry.2.saturating_add(1);
+    }
+
+    // Ungrouped queries always emit exactly one row, even on
+    // empty input. Grouped queries skip empty buckets.
+    if group_by.is_none() {
+        let (sum, count) = acc
+            .get(&Vec::<u8>::new())
+            .map(|(_, s, c)| (*s, *c))
+            .unwrap_or((0.0, 0));
+        let value = match kind {
+            NumericAggregateKind::Sum => AggregateValue::Sum(sum),
+            NumericAggregateKind::Avg => {
+                if count == 0 {
+                    AggregateValue::Avg(None)
+                } else {
+                    AggregateValue::Avg(Some(sum / count as f64))
+                }
+            }
+        };
+        let payload = encode_aggregate_payload(None, value)?;
+        return Ok(vec![ResultRow {
+            origin: 0,
+            seq: SeqNum(0),
+            payload,
+        }]);
+    }
+
+    let mut out = Vec::with_capacity(acc.len());
+    for (_, (group, sum, count)) in acc {
+        let value = match kind {
+            NumericAggregateKind::Sum => AggregateValue::Sum(sum),
+            NumericAggregateKind::Avg => {
+                if count == 0 {
+                    AggregateValue::Avg(None)
+                } else {
+                    AggregateValue::Avg(Some(sum / count as f64))
+                }
+            }
+        };
+        let payload = encode_aggregate_payload(group, value)?;
+        out.push(ResultRow {
+            origin: 0,
+            seq: SeqNum(0),
+            payload,
+        });
+    }
+    Ok(out)
 }
 
 /// Wrap `group` + `value` in an [`AggregateRowPayload`] and
@@ -1341,8 +1439,9 @@ mod tests {
             let decoded: AggregateRowPayload =
                 postcard::from_bytes(&row.payload).unwrap();
             if let Some(GroupKey::Origin(o)) = decoded.group {
-                let AggregateValue::Count(c) = decoded.value;
-                by_origin.insert(o, c);
+                if let AggregateValue::Count(c) = decoded.value {
+                    by_origin.insert(o, c);
+                }
             }
         }
         assert_eq!(by_origin.get(&0xAA), Some(&2));
@@ -1384,8 +1483,9 @@ mod tests {
             let decoded: AggregateRowPayload =
                 postcard::from_bytes(&row.payload).unwrap();
             if let Some(GroupKey::Seq(SeqNum(s))) = decoded.group {
-                let AggregateValue::Count(c) = decoded.value;
-                by_seq.insert(s, c);
+                if let AggregateValue::Count(c) = decoded.value {
+                    by_seq.insert(s, c);
+                }
             }
         }
         assert_eq!(by_seq.get(&1), Some(&2));
@@ -1428,6 +1528,136 @@ mod tests {
         let decoded: AggregateRowPayload =
             postcard::from_bytes(&rows[0].payload).unwrap();
         assert_eq!(decoded.value, AggregateValue::Count(0));
+    }
+
+    #[tokio::test]
+    async fn aggregate_sum_on_seq_returns_total() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue, NumericAggregateKind,
+        };
+
+        let chain = 0xAA;
+        let reader = Arc::new(InMemoryChainReader::default());
+        for s in [1u64, 3, 7, 11] {
+            reader.append(chain, SeqNum(s), vec![]);
+        }
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateNumeric {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: chain,
+                            start: SeqNum(1),
+                            end: SeqNum(20),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                    field_path: "seq".to_string(),
+                    kind: NumericAggregateKind::Sum,
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+
+        let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let decoded: AggregateRowPayload =
+            postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(decoded.value, AggregateValue::Sum(22.0));
+    }
+
+    #[tokio::test]
+    async fn aggregate_avg_on_json_field_returns_mean() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue, NumericAggregateKind,
+        };
+
+        let chain = 0xBB;
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(chain, SeqNum(1), br#"{"latency_ms": 10}"#.to_vec());
+        reader.append(chain, SeqNum(2), br#"{"latency_ms": 30}"#.to_vec());
+        reader.append(chain, SeqNum(3), br#"{"latency_ms": 50}"#.to_vec());
+        reader.append(chain, SeqNum(4), b"not-json".to_vec()); // skipped
+        let executor = LocalMeshQueryExecutor::new(reader);
+
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateNumeric {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: chain,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                    field_path: "latency_ms".to_string(),
+                    kind: NumericAggregateKind::Avg,
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let decoded: AggregateRowPayload =
+            postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(decoded.value, AggregateValue::Avg(Some(30.0)));
+    }
+
+    #[tokio::test]
+    async fn aggregate_avg_empty_input_returns_avg_none() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue, NumericAggregateKind,
+        };
+
+        let reader = Arc::new(InMemoryChainReader::default());
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateNumeric {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::LatestRead { origin: 0xDEAD },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                    field_path: "seq".to_string(),
+                    kind: NumericAggregateKind::Avg,
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let decoded: AggregateRowPayload =
+            postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(decoded.value, AggregateValue::Avg(None));
     }
 
     #[tokio::test]
