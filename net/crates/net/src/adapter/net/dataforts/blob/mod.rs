@@ -19,13 +19,20 @@ pub mod dispatch;
 pub mod error;
 pub mod fs;
 pub mod mesh;
+pub mod metrics;
 pub mod noop;
 pub mod publish_with_blob;
+pub mod refcount;
 pub mod registry;
 
 pub use adapter::{BlobAdapter, BlobStat};
 pub use mesh::MeshBlobAdapter;
+pub use metrics::{
+    evaluate_health_gate, BlobMetrics, BlobMetricsSnapshot, HealthGateAction,
+    HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
+};
 pub use publish_with_blob::{publish_with_blob, BlobDurability, PublishWithBlobReceipt};
+pub use refcount::{should_sweep, BlobRefcountTable, RefcountEntry, DEFAULT_RETENTION_FLOOR};
 pub use blob_ref::{
     byte_range_to_chunks, chunk_payload, BlobRef, ChunkRangeRequest, ChunkRef, ChunkedPayload,
     Encoding, BLOB_CHUNK_SIZE_BYTES, BLOB_MANIFEST_BODY_VERSION, BLOB_MANIFEST_MAX_CHUNKS,

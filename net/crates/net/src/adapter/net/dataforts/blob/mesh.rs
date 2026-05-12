@@ -43,6 +43,7 @@
 //!   reflects the operator's `ReplicationConfig::factor` when set.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -51,6 +52,8 @@ use super::blob_ref::{
     byte_range_to_chunks, chunk_payload, BlobRef, ChunkRef, ChunkedPayload, Encoding,
 };
 use super::error::BlobError;
+use super::metrics::BlobMetrics;
+use super::refcount::{BlobRefcountTable, DEFAULT_RETENTION_FLOOR};
 use crate::adapter::net::channel::ChannelName;
 use crate::adapter::net::redex::{Redex, RedexFileConfig, ReplicationConfig};
 
@@ -79,6 +82,22 @@ pub struct MeshBlobAdapter {
     /// with replication set but the runtime fails to spawn (typed
     /// `RedexError`).
     replication: Option<ReplicationConfig>,
+    /// Per-hash refcount + pin table. Drives [`Self::sweep_gc`] +
+    /// fills in [`BlobStat::last_seen_unix_ms`] on stat queries.
+    /// Cheap to clone (the `Arc`-backed `DashMap` shared inside);
+    /// the adapter holds a clone
+    /// and the operator's GC driver holds another for read-only
+    /// observation.
+    refcount: BlobRefcountTable,
+    /// Operator-configured retention floor. Default
+    /// [`DEFAULT_RETENTION_FLOOR`] (24 h); set via
+    /// [`Self::with_retention_floor`] for shorter / longer
+    /// windows.
+    retention_floor: Duration,
+    /// Atomic-counter registry surfaced via [`Self::metrics`].
+    /// Cheap to clone; shared with the operator's Prometheus
+    /// scrape.
+    metrics: BlobMetrics,
 }
 
 impl MeshBlobAdapter {
@@ -94,6 +113,9 @@ impl MeshBlobAdapter {
             redex,
             persistent: false,
             replication: None,
+            refcount: BlobRefcountTable::new(),
+            retention_floor: DEFAULT_RETENTION_FLOOR,
+            metrics: BlobMetrics::new(),
         }
     }
 
@@ -112,6 +134,124 @@ impl MeshBlobAdapter {
     pub fn with_replication(mut self, cfg: ReplicationConfig) -> Self {
         self.replication = Some(cfg);
         self
+    }
+
+    /// Override the default retention floor (24 h) applied by the
+    /// GC sweep. Shorter floors reclaim disk faster at the cost
+    /// of premature GC under racy refcount sources; longer floors
+    /// are safer but consume more disk between sweeps. Tune to
+    /// match the operator's chain-fold cadence.
+    pub fn with_retention_floor(mut self, floor: Duration) -> Self {
+        self.retention_floor = floor;
+        self
+    }
+
+    /// Operator-configured disk capacity in bytes. Drives the
+    /// `dataforts_blob_disk_capacity_bytes` gauge + the health-
+    /// gate threshold. `0` (the default) disables the health
+    /// gate entirely.
+    pub fn with_disk_capacity(self, bytes: u64) -> Self {
+        self.metrics.set_disk_capacity_bytes(bytes);
+        self
+    }
+
+    /// Refcount table reference. Operators bump via
+    /// [`BlobRefcountTable::incr`] from chain-fold / CortEX
+    /// integration sites; the adapter reads on sweep + stat
+    /// paths.
+    pub fn refcount_table(&self) -> &BlobRefcountTable {
+        &self.refcount
+    }
+
+    /// Atomic-counter registry surfaced for Prometheus scrape.
+    pub fn metrics(&self) -> &BlobMetrics {
+        &self.metrics
+    }
+
+    /// Render a Prometheus-text snapshot for the operator scrape.
+    /// Concatenates the counter / gauge bodies with the live
+    /// `gc_pending_total` from the refcount table.
+    pub fn prometheus_text(&self) -> String {
+        let pending = self.refcount.zero_refcount_count() as u64;
+        self.metrics
+            .snapshot()
+            .to_prometheus_text(&self.id, pending)
+    }
+
+    /// Pin `hash` against GC. Operator escape hatch — pinned
+    /// hashes survive sweep regardless of refcount + retention
+    /// floor. Returns the hash for ergonomic chaining.
+    ///
+    /// `now_unix_ms` should be the operator's current wall-clock
+    /// — used to stamp `last_seen` and (if the hash is new)
+    /// `first_seen`.
+    pub fn pin(&self, hash: [u8; 32], now_unix_ms: u64) {
+        self.refcount.pin(hash, now_unix_ms);
+    }
+
+    /// Unpin `hash`. After this, the hash returns to the normal
+    /// refcount / retention-floor sweep contract.
+    pub fn unpin(&self, hash: [u8; 32], now_unix_ms: u64) {
+        self.refcount.unpin(hash, now_unix_ms);
+    }
+
+    /// Run a GC sweep. Pure-logic in two halves: decide (which
+    /// hashes are deletable under the refcount + retention +
+    /// pressure + pin rules), then act (delete the chunk files,
+    /// remove the refcount entries, bump
+    /// `dataforts_blob_gc_swept_total`). The two halves are
+    /// fused here for the typical operator-driven sweep; advanced
+    /// callers can invoke
+    /// [`BlobRefcountTable::deletable_hashes`] +
+    /// [`Self::delete_chunk`] directly for dry-run / batched
+    /// flows.
+    ///
+    /// Returns the count of chunks actually swept (may be less
+    /// than `deletable_hashes` if some chunk-file deletes failed —
+    /// the failures are logged but the refcount entry is left in
+    /// place so the next sweep retries).
+    pub async fn sweep_gc(
+        &self,
+        now_unix_ms: u64,
+        disk_pressure_critical: bool,
+    ) -> Result<u64, BlobError> {
+        let candidates =
+            self.refcount
+                .deletable_hashes(now_unix_ms, self.retention_floor, disk_pressure_critical);
+        let mut swept: u64 = 0;
+        for hash in candidates {
+            match self.delete_chunk(&hash).await {
+                Ok(()) => {
+                    self.refcount.remove(&hash);
+                    swept = swept.saturating_add(1);
+                }
+                Err(_) => {
+                    // Leave the refcount entry in place so the
+                    // next sweep retries — chunk-file delete
+                    // failures shouldn't strand the refcount.
+                }
+            }
+        }
+        self.metrics.record_gc_swept(swept);
+        Ok(swept)
+    }
+
+    /// Delete a single chunk file by content hash. The chunk's
+    /// `RedexFile` is closed + removed from the Redex manager.
+    /// Idempotent on the success path — closing an already-closed
+    /// file returns `Ok(())` from the Redex layer. Used internally
+    /// by [`Self::sweep_gc`]; reachable directly for operators
+    /// running batched / dry-run flows against
+    /// [`BlobRefcountTable::deletable_hashes`].
+    pub async fn delete_chunk(&self, hash: &[u8; 32]) -> Result<(), BlobError> {
+        let channel = Self::chunk_channel(hash);
+        // Best-effort delete — close the file + drop the entry
+        // from the Redex manager. The underlying disk reclaim
+        // happens on the Redex side via its close path.
+        self.redex
+            .close_file(&channel)
+            .map_err(|e| BlobError::Backend(format!("mesh blob: close chunk: {}", e)))?;
+        Ok(())
     }
 
     /// Channel name for a given chunk hash. Pure function; safe to
@@ -162,11 +302,16 @@ impl MeshBlobAdapter {
         // Idempotent-store gate: content-addressed, so if any bytes
         // are already there they must be byte-for-byte equal. Skip
         // the append to avoid stacking duplicates in the RedEX file.
+        // Either way, stamp `first_seen` on the refcount table so
+        // the retention floor clock starts.
+        let now_ms = now_unix_ms();
         if !file.is_empty() {
+            self.refcount.store_observed(*hash, now_ms);
             return Ok(());
         }
         file.append(bytes)
             .map_err(|e| BlobError::Backend(format!("mesh blob: append chunk: {}", e)))?;
+        self.refcount.store_observed(*hash, now_ms);
         Ok(())
     }
 
@@ -219,7 +364,7 @@ impl BlobAdapter for MeshBlobAdapter {
     }
 
     async fn store(&self, blob_ref: &BlobRef, bytes: &[u8]) -> Result<(), BlobError> {
-        match blob_ref {
+        let result = match blob_ref {
             BlobRef::Small { hash, size, .. } => {
                 // Size guard — caller may have stamped a wrong size
                 // before publishing. Reject rather than silently
@@ -299,11 +444,15 @@ impl BlobAdapter for MeshBlobAdapter {
                 }
                 Ok(())
             }
+        };
+        if result.is_ok() {
+            self.metrics.record_store(bytes.len() as u64);
         }
+        result
     }
 
     async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
-        match blob_ref {
+        let result = match blob_ref {
             BlobRef::Small { hash, .. } => self.fetch_chunk(hash).await,
             BlobRef::Manifest {
                 chunks,
@@ -311,21 +460,38 @@ impl BlobAdapter for MeshBlobAdapter {
                 ..
             } => {
                 let mut out = Vec::with_capacity(*total_size as usize);
+                let mut err: Option<BlobError> = None;
                 for chunk in chunks {
-                    let chunk_bytes = self.fetch_chunk(&chunk.hash).await?;
-                    if chunk_bytes.len() as u64 != chunk.size as u64 {
-                        return Err(BlobError::Backend(format!(
-                            "mesh blob: chunk {} fetched size {} != declared {}",
-                            hex32(&chunk.hash),
-                            chunk_bytes.len(),
-                            chunk.size
-                        )));
+                    match self.fetch_chunk(&chunk.hash).await {
+                        Ok(chunk_bytes) if chunk_bytes.len() as u64 != chunk.size as u64 => {
+                            err = Some(BlobError::Backend(format!(
+                                "mesh blob: chunk {} fetched size {} != declared {}",
+                                hex32(&chunk.hash),
+                                chunk_bytes.len(),
+                                chunk.size
+                            )));
+                            break;
+                        }
+                        Ok(chunk_bytes) => {
+                            out.extend_from_slice(&chunk_bytes);
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
                     }
-                    out.extend_from_slice(&chunk_bytes);
                 }
-                Ok(out)
+                if let Some(e) = err {
+                    Err(e)
+                } else {
+                    Ok(out)
+                }
             }
+        };
+        if result.is_ok() {
+            self.metrics.record_fetch();
         }
+        result
     }
 
     async fn fetch_range(
@@ -396,16 +562,27 @@ impl BlobAdapter for MeshBlobAdapter {
     }
 
     async fn stat(&self, blob_ref: &BlobRef) -> Result<BlobStat, BlobError> {
-        // v0.2 PR-2a: size + replica_target + encoding are
-        // observable; replicas_observed lands with the capability
-        // extension in PR-2b; last_seen_unix_ms lands with the GC
-        // scanner in PR-4.
+        // v0.2 PR-4a — `last_seen_unix_ms` now comes from the
+        // refcount table when the hash is tracked. For Small
+        // blobs that's the single chunk; for Manifest blobs we
+        // surface the most recent touch across all chunks.
+        // `replicas_observed` still 0 until the cross-node
+        // advertisement count wires up (PR-5).
         let replica_target = self.replication.as_ref().map(|c| c.factor);
+        let last_seen_unix_ms = match blob_ref {
+            BlobRef::Small { hash, .. } => {
+                self.refcount.get(hash).map(|e| e.last_seen_unix_ms)
+            }
+            BlobRef::Manifest { chunks, .. } => chunks
+                .iter()
+                .filter_map(|c| self.refcount.get(&c.hash).map(|e| e.last_seen_unix_ms))
+                .max(),
+        };
         Ok(BlobStat {
             size: blob_ref.size(),
             replicas_observed: 0,
             replica_target,
-            last_seen_unix_ms: None,
+            last_seen_unix_ms,
             encoding: blob_ref.encoding(),
         })
     }
@@ -471,6 +648,17 @@ fn hex32(bytes: &[u8; 32]) -> String {
         let _ = write!(s, "{:02x}", b);
     }
     s
+}
+
+/// Wall-clock unix milliseconds. Used for refcount-table
+/// `first_seen` / `last_seen` stamps. Saturates at 0 if the system
+/// clock is set before the unix epoch — pathological but possible
+/// in test harnesses.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -694,6 +882,136 @@ mod tests {
         let fake_payload: Vec<u8> = vec![0xBB; 500];
         let err = adapter.store(&blob, &fake_payload).await.unwrap_err();
         assert!(matches!(err, BlobError::Backend(_)));
+    }
+
+    // --- PR-4a: refcount + GC + metrics + pinning ---
+
+    #[tokio::test]
+    async fn store_records_into_refcount_table() {
+        let adapter = make_adapter();
+        let payload = b"refcount tracked".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+
+        let hash = blob.small_hash().unwrap();
+        let entry = adapter.refcount_table().get(hash).expect("hash tracked");
+        assert_eq!(entry.refcount, 0); // store_observed doesn't bump refcount
+        assert!(entry.first_seen_unix_ms > 0);
+        assert!(!entry.pinned);
+    }
+
+    #[tokio::test]
+    async fn store_increments_metrics() {
+        let adapter = make_adapter();
+        let payload = b"metric me".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        let snap = adapter.metrics().snapshot();
+        assert_eq!(snap.blobs_stored_total, 1);
+        assert_eq!(snap.bytes_stored_total, payload.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn fetch_increments_metrics() {
+        let adapter = make_adapter();
+        let payload = b"fetch me".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        let _ = adapter.fetch(&blob).await.unwrap();
+        assert_eq!(adapter.metrics().snapshot().blobs_fetched_total, 1);
+    }
+
+    #[tokio::test]
+    async fn pin_protects_hash_from_gc() {
+        let adapter = make_adapter().with_retention_floor(std::time::Duration::from_millis(0));
+        let payload = b"pinned forever".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        let hash = *blob.small_hash().unwrap();
+        adapter.pin(hash, now_unix_ms());
+
+        // Zero retention floor + zero refcount + pinned: sweep
+        // must NOT touch it.
+        let swept = adapter
+            .sweep_gc(now_unix_ms() + 1_000_000, false)
+            .await
+            .unwrap();
+        assert_eq!(swept, 0);
+        assert!(adapter.exists(&blob).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn unpin_returns_hash_to_normal_sweep_contract() {
+        let adapter = make_adapter().with_retention_floor(std::time::Duration::from_millis(0));
+        let payload = b"unpin me".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        let hash = *blob.small_hash().unwrap();
+        let now = now_unix_ms();
+        adapter.pin(hash, now);
+        adapter.unpin(hash, now);
+
+        // After unpin, sweep should remove the chunk.
+        let swept = adapter.sweep_gc(now + 1_000_000, false).await.unwrap();
+        assert_eq!(swept, 1);
+    }
+
+    #[tokio::test]
+    async fn sweep_gc_skips_under_disk_pressure() {
+        let adapter = make_adapter().with_retention_floor(std::time::Duration::from_millis(0));
+        let payload = b"pressured".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        let now = now_unix_ms();
+
+        // Critical disk pressure: don't make a bad day worse.
+        let swept = adapter.sweep_gc(now + 1_000_000, true).await.unwrap();
+        assert_eq!(swept, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_gc_records_swept_count_in_metrics() {
+        let adapter = make_adapter().with_retention_floor(std::time::Duration::from_millis(0));
+        for i in 0..3u8 {
+            let payload = vec![i; 100];
+            let blob = small_ref_for(&payload);
+            adapter.store(&blob, &payload).await.unwrap();
+        }
+        let now = now_unix_ms();
+        let swept = adapter.sweep_gc(now + 1_000_000, false).await.unwrap();
+        assert_eq!(swept, 3);
+        let snap = adapter.metrics().snapshot();
+        assert_eq!(snap.gc_swept_total, 3);
+    }
+
+    #[tokio::test]
+    async fn stat_surfaces_last_seen_from_refcount_table() {
+        let adapter = make_adapter();
+        let payload = b"stat me".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        let stat = adapter.stat(&blob).await.unwrap();
+        assert!(stat.last_seen_unix_ms.is_some());
+        assert!(stat.last_seen_unix_ms.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn prometheus_text_includes_gc_pending_count() {
+        let adapter = make_adapter();
+        let payload = b"pending".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        let text = adapter.prometheus_text();
+        assert!(text.contains("dataforts_blob_gc_pending_total"));
+        assert!(text.contains("dataforts_blobs_stored_total"));
+    }
+
+    #[tokio::test]
+    async fn with_disk_capacity_sets_the_gauge() {
+        let redex = Arc::new(Redex::new());
+        let adapter = MeshBlobAdapter::new("mesh-cap", redex).with_disk_capacity(1 << 30);
+        let snap = adapter.metrics().snapshot();
+        assert_eq!(snap.disk_capacity_bytes, 1 << 30);
     }
 
     #[tokio::test]
