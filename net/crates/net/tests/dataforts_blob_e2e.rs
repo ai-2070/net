@@ -702,12 +702,11 @@ async fn overflow_push_nudge_round_trips_through_mesh_rpc() {
 
     let a_id = node_a.node_id();
     let b_id = node_b.node_id();
-    let rep_cfg = ReplicationConfig::new()
-        .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]));
+    let rep_cfg =
+        ReplicationConfig::new().with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]));
 
-    let adapter_b = Arc::new(
-        MeshBlobAdapter::new("mesh-b", redex_b.clone()).with_replication(rep_cfg.clone()),
-    );
+    let adapter_b =
+        Arc::new(MeshBlobAdapter::new("mesh-b", redex_b.clone()).with_replication(rep_cfg.clone()));
 
     // Both nodes advertise overflow-participating caps. The
     // admission gate reads from `user_caps_snapshot` on B and
@@ -792,7 +791,10 @@ async fn overflow_push_rejected_when_receiver_not_participating() {
         }
         .write_into(CapabilitySet::new()),
     );
-    node_b.announce_capabilities(b_caps).await.expect("B announce");
+    node_b
+        .announce_capabilities(b_caps)
+        .await
+        .expect("B announce");
 
     let _handle = node_b
         .serve_overflow_push(Arc::clone(&adapter_b))

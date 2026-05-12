@@ -712,8 +712,7 @@ mod tests {
     /// because overflow reuses the gravity scope axis, and adds
     /// the `dataforts.blob.overflow` presence tag for opt-in.
     fn overflow_enabled_node(scope: TopologyScope, disk_free_gb: u64) -> CapabilitySet {
-        participating_gravity_node(scope, 128, disk_free_gb)
-            .add_tag("dataforts.blob.overflow")
+        participating_gravity_node(scope, 128, disk_free_gb).add_tag("dataforts.blob.overflow")
     }
 
     /// Fixture: a sender that's also overflow-enabled and

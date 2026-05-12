@@ -438,20 +438,93 @@ impl MeshBlobAdapter {
     /// writer. Cheap (one atomic load) — safe to call on a
     /// dashboard hot path.
     pub fn overflow_active(&self) -> bool {
-        self.overflow_active.load(std::sync::atomic::Ordering::Relaxed)
+        self.overflow_active
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Internal accessor — the P3 tick driver needs the raw
-    /// `Arc<AtomicBool>` so it can pass `&AtomicBool` into
-    /// [`super::overflow::drive_blob_overflow_tick`]. Crate-
-    /// internal because the wire-level state machine is the
-    /// only legitimate writer; operators get the read-only
-    /// view via [`Self::overflow_active`]. `#[allow(dead_code)]`
-    /// because P2 ships the surface without an in-tree caller
-    /// — the P3 push-sink integration lights up this seam.
+    /// Internal accessor — the raw `Arc<AtomicBool>` for the
+    /// hysteresis state. Crate-internal because the wire-
+    /// level state machine is the only legitimate writer;
+    /// operators get the read-only view via
+    /// [`Self::overflow_active`]. P2 exposed this seam for an
+    /// external tick driver; P4's
+    /// [`Self::drive_overflow_tick`] is the in-tree caller
+    /// (uses `&self.overflow_active` directly) — the public
+    /// hook is still useful for tests that want to assert
+    /// the atomic transitioned without driving a full tick.
     #[allow(dead_code)]
     pub(crate) fn overflow_active_handle(&self) -> &Arc<std::sync::atomic::AtomicBool> {
         &self.overflow_active
+    }
+
+    /// Convenience: drive one overflow tick + auto-record the
+    /// resulting report into the adapter's metrics registry.
+    /// Composes [`super::overflow::drive_blob_overflow_tick`]
+    /// with [`super::metrics::BlobMetrics::record_overflow_tick`]
+    /// so operators don't have to thread the report through
+    /// two calls on every tick.
+    ///
+    /// `ctx` carries everything the controller needs that the
+    /// adapter doesn't already own: the capability index, the
+    /// heat registry, the sink, the local caps snapshot, and
+    /// the disk-usage stats. The adapter contributes the
+    /// `refcount`, `config`, and `overflow_active` hysteresis
+    /// state from `self`. The closure `size_for_hash` stays
+    /// separate (closures don't sit in struct fields without
+    /// a `Box<dyn Fn>` wrapper that's heavier than the
+    /// inlined-impl-Fn shape).
+    ///
+    /// The controller's `config` is read live from
+    /// `self.overflow_config()` so an operator-toggled
+    /// threshold lands on the next tick.
+    ///
+    /// Returns the [`super::overflow::BlobOverflowTickReport`]
+    /// so callers can inspect per-tick state without a second
+    /// metrics scrape.
+    pub async fn drive_overflow_tick(
+        &self,
+        ctx: super::overflow::OverflowTickContext<'_>,
+        size_for_hash: impl Fn([u8; 32]) -> Option<u64>,
+    ) -> super::overflow::BlobOverflowTickReport {
+        let config = self.overflow_config();
+        let controller = super::overflow::BlobOverflowController::new(
+            ctx.local_caps,
+            ctx.capability_index,
+            ctx.heat_registry,
+            &self.refcount,
+            &config,
+        );
+        let observation = super::overflow::OverflowTickObservation {
+            disk_used_bytes: ctx.disk_used_bytes,
+            disk_total_bytes: ctx.disk_total_bytes,
+            hysteresis_active: &self.overflow_active,
+            now: std::time::Instant::now(),
+        };
+        let report = super::overflow::drive_blob_overflow_tick(
+            &controller,
+            ctx.sink,
+            observation,
+            size_for_hash,
+        )
+        .await;
+        self.metrics.record_overflow_tick(&report);
+        report
+    }
+
+    /// Bump the receive-side overflow rejection counter for
+    /// `reason`. Called by
+    /// [`super::overflow::OverflowPushHandler`] on every
+    /// inbound push that admission rejects; surfaces in the
+    /// adapter's Prometheus body as
+    /// `dataforts_blob_overflow_rejected_total{reason}`.
+    ///
+    /// The sender's own metrics bump
+    /// `dataforts_blob_overflow_push_errors_total` on the same
+    /// event (via the controller's `push_errors` counter);
+    /// the two surfaces are complementary so operators
+    /// dashboarding either side see matching volumes.
+    pub fn record_overflow_reject(&self, reason: super::admission::OverflowReject) {
+        self.metrics.record_overflow_reject(reason);
     }
 
     /// True iff this adapter is wired to bump a shared blob-heat
@@ -2093,7 +2166,10 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.high_water_ratio, DEFAULT_OVERFLOW_HIGH_WATER_RATIO);
         assert_eq!(cfg.low_water_ratio, DEFAULT_OVERFLOW_LOW_WATER_RATIO);
-        assert_eq!(cfg.max_pushes_per_tick, DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK);
+        assert_eq!(
+            cfg.max_pushes_per_tick,
+            DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK
+        );
         assert_eq!(cfg.scope, TopologyScope::Mesh);
         assert_eq!(cfg.tick_interval_ms, DEFAULT_OVERFLOW_TICK_INTERVAL_MS);
     }

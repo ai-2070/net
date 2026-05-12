@@ -339,7 +339,14 @@ impl OverflowPushHandler {
 
         let verdict = should_accept_overflow_from(&local_caps, &sender_caps, request.size_bytes);
         match verdict {
-            OverflowVerdict::Reject(reason) => OverflowPushAck::Rejected(reason),
+            OverflowVerdict::Reject(reason) => {
+                // Bump the per-reason rejection counter on
+                // the receive side. The sender's controller
+                // bumps `push_errors_total` separately;
+                // dashboards aggregate both surfaces.
+                self.adapter.record_overflow_reject(reason);
+                OverflowPushAck::Rejected(reason)
+            }
             OverflowVerdict::Admit => {
                 // Build the BlobRef::Small the prefetch path
                 // wants. The URI is `mesh://<hex>` — opaque
@@ -390,9 +397,8 @@ impl crate::adapter::net::cortex::RpcHandler for OverflowPushHandler {
         // `RpcStatus::Internal` with a short diagnostic,
         // distinct from `Application(code)` which we use for
         // typed admission rejections.
-        let request: OverflowPush = postcard::from_bytes(&ctx.payload.body).map_err(|e| {
-            RpcHandlerError::Internal(format!("overflow push: decode failed: {e}"))
-        })?;
+        let request: OverflowPush = postcard::from_bytes(&ctx.payload.body)
+            .map_err(|e| RpcHandlerError::Internal(format!("overflow push: decode failed: {e}")))?;
 
         let ack = self.handle(request).await;
 
@@ -729,8 +735,8 @@ impl<'a> BlobOverflowController<'a> {
             match &best {
                 None => best = Some((peer_blob.disk_free_gb, node_id, caps)),
                 Some((d, n, _)) => {
-                    let is_better =
-                        peer_blob.disk_free_gb > *d || (peer_blob.disk_free_gb == *d && node_id < *n);
+                    let is_better = peer_blob.disk_free_gb > *d
+                        || (peer_blob.disk_free_gb == *d && node_id < *n);
                     if is_better {
                         best = Some((peer_blob.disk_free_gb, node_id, caps));
                     }
@@ -739,6 +745,74 @@ impl<'a> BlobOverflowController<'a> {
         }
         best.map(|(_, node_id, caps)| (node_id, caps))
     }
+}
+
+/// Operator-supplied environmental borrows the
+/// [`super::mesh::MeshBlobAdapter::drive_overflow_tick`]
+/// convenience method threads through. Decouples the
+/// per-tick wiring (capability index, heat registry, sink,
+/// local caps, disk stats) from the adapter so the adapter
+/// stays a stateless slot-in.
+///
+/// All fields are borrows. The lifetime parameter `'a` ties
+/// the context to a single tick's await; operators
+/// reconstruct the context each tick from the live state.
+pub struct OverflowTickContext<'a> {
+    /// The mesh's capability index — read for target peer
+    /// selection (overflow tag + scope + disk_free + health
+    /// gate).
+    pub capability_index: &'a CapabilityIndex,
+    /// Per-chunk heat registry. The controller walks every
+    /// tracked hash, decays each rate to `now`, and ranks
+    /// candidates coldest-first.
+    pub heat_registry: &'a Arc<parking_lot::Mutex<BlobHeatRegistry>>,
+    /// Sink for the actual push action. Production wiring
+    /// uses [`MeshNodeOverflowPushSink`]; tests use a
+    /// recorder.
+    pub sink: &'a dyn OverflowPushSink,
+    /// Local caps snapshot — read for the local gravity
+    /// scope (target-selection scope filter).
+    pub local_caps: &'a CapabilitySet,
+    /// Local disk usage in bytes. Numerator of the
+    /// `disk_ratio` hysteresis input.
+    pub disk_used_bytes: u64,
+    /// Local disk total in bytes. Denominator. `0`
+    /// short-circuits the tick.
+    pub disk_total_bytes: u64,
+}
+
+/// Per-tick observables threaded through
+/// [`drive_blob_overflow_tick`]. Bundles the inputs that
+/// change every tick (disk stats + hysteresis handle + the
+/// clock value) so the tick driver stays a 4-arg signature
+/// even as the inputs grow.
+///
+/// Borrow-only: nothing here is owned. The hysteresis atomic
+/// is shared with the adapter's `overflow_active` field
+/// (P4); operator-driven tests can wire a fresh
+/// `AtomicBool` for isolation. `now` is captured at the
+/// tick call site so deterministic-simulation harnesses can
+/// inject a fixed `Instant` without mocking the system clock.
+pub struct OverflowTickObservation<'a> {
+    /// Local disk usage in bytes — the numerator of the
+    /// `disk_ratio` hysteresis input. `disk_used > disk_total`
+    /// is clamped inside the driver (defense against
+    /// misconfiguration).
+    pub disk_used_bytes: u64,
+    /// Local disk total in bytes — the denominator. `0`
+    /// short-circuits the tick to "never fire" (an
+    /// unconfigured disk cap shouldn't trigger pushes the
+    /// moment any chunk lands).
+    pub disk_total_bytes: u64,
+    /// Shared hysteresis state. Read at tick start, updated
+    /// by [`step_overflow_hysteresis`] to the post-tick
+    /// state. Wired to [`super::mesh::MeshBlobAdapter`]'s
+    /// `overflow_active` field in the production path.
+    pub hysteresis_active: &'a AtomicBool,
+    /// Clock value used to decay heat-registry rates. Pass
+    /// `Instant::now()` in production; tests can fix this
+    /// for reproducibility.
+    pub now: Instant,
 }
 
 /// Drive one overflow tick.
@@ -752,20 +826,20 @@ impl<'a> BlobOverflowController<'a> {
 ///
 /// Returns a [`BlobOverflowTickReport`] with per-reason
 /// counters. Operators aggregate the report into Prometheus
-/// metrics in P4.
-///
-/// Argument order matches the migration tick: state inputs
-/// first (controller + sink), then the per-tick observables
-/// (disk stats + hysteresis ref + now + size resolver).
+/// metrics via
+/// [`super::metrics::BlobMetrics::record_overflow_tick`].
 pub async fn drive_blob_overflow_tick(
     controller: &BlobOverflowController<'_>,
     sink: &dyn OverflowPushSink,
-    disk_used_bytes: u64,
-    disk_total_bytes: u64,
-    hysteresis_active: &AtomicBool,
-    now: Instant,
+    observation: OverflowTickObservation<'_>,
     size_for_hash: impl Fn([u8; 32]) -> Option<u64>,
 ) -> BlobOverflowTickReport {
+    let OverflowTickObservation {
+        disk_used_bytes,
+        disk_total_bytes,
+        hysteresis_active,
+        now,
+    } = observation;
     let mut report = BlobOverflowTickReport::default();
     let disk_ratio = if disk_total_bytes == 0 {
         // Adapter without a configured disk-cap reports
@@ -834,7 +908,11 @@ pub async fn drive_blob_overflow_tick(
     // list will be empty so we drop straight through.
     for candidate in candidates {
         match sink
-            .push(candidate.hash, candidate.size_bytes, candidate.target_node_id)
+            .push(
+                candidate.hash,
+                candidate.size_bytes,
+                candidate.target_node_id,
+            )
             .await
         {
             Ok(()) => {
@@ -1060,11 +1138,7 @@ mod tests {
         let (c, _) = hex64(0xCC);
         let heat = heat_registry_with(now, &[(a, 0.0), (b, 1.0), (c, 5.0)]);
         let refcount = refcount_with_zero(&[a, b, c], 1_000_000);
-        let peer = (
-            99u64,
-            [0x11; 32],
-            overflow_peer_caps(50),
-        );
+        let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
         let index = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
@@ -1216,7 +1290,11 @@ mod tests {
         };
         let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
         let cands = controller.candidates(now, |_| Some(1024));
-        assert_eq!(cands.len(), 2, "max_pushes_per_tick caps the candidate list");
+        assert_eq!(
+            cands.len(),
+            2,
+            "max_pushes_per_tick caps the candidate list"
+        );
     }
 
     // ========================================================================
@@ -1244,10 +1322,12 @@ mod tests {
         let report = drive_blob_overflow_tick(
             &controller,
             &sink,
-            500,
-            1000,
-            &active,
-            now,
+            OverflowTickObservation {
+                disk_used_bytes: 500,
+                disk_total_bytes: 1000,
+                hysteresis_active: &active,
+                now,
+            },
             |_| Some(1024),
         )
         .await;
@@ -1277,10 +1357,12 @@ mod tests {
         let report = drive_blob_overflow_tick(
             &controller,
             &sink,
-            900,
-            1000,
-            &active,
-            now,
+            OverflowTickObservation {
+                disk_used_bytes: 900,
+                disk_total_bytes: 1000,
+                hysteresis_active: &active,
+                now,
+            },
             |_| Some(1024),
         )
         .await;
@@ -1313,10 +1395,12 @@ mod tests {
         let report = drive_blob_overflow_tick(
             &controller,
             &sink,
-            900,
-            1000,
-            &active,
-            now,
+            OverflowTickObservation {
+                disk_used_bytes: 900,
+                disk_total_bytes: 1000,
+                hysteresis_active: &active,
+                now,
+            },
             |_| Some(1024),
         )
         .await;
@@ -1350,10 +1434,12 @@ mod tests {
         let report = drive_blob_overflow_tick(
             &controller,
             &sink,
-            900,
-            1000,
-            &active,
-            now,
+            OverflowTickObservation {
+                disk_used_bytes: 900,
+                disk_total_bytes: 1000,
+                hysteresis_active: &active,
+                now,
+            },
             |_| Some(1024),
         )
         .await;
@@ -1389,10 +1475,12 @@ mod tests {
         let report = drive_blob_overflow_tick(
             &controller,
             &sink,
-            900,
-            1000,
-            &active,
-            now,
+            OverflowTickObservation {
+                disk_used_bytes: 900,
+                disk_total_bytes: 1000,
+                hysteresis_active: &active,
+                now,
+            },
             |_| Some(1024),
         )
         .await;
@@ -1424,10 +1512,12 @@ mod tests {
         let report = drive_blob_overflow_tick(
             &controller,
             &sink,
-            500,
-            0, // disk_total = 0
-            &active,
-            now,
+            OverflowTickObservation {
+                disk_used_bytes: 500,
+                disk_total_bytes: 0, // disk_total = 0
+                hysteresis_active: &active,
+                now,
+            },
             |_| Some(1024),
         )
         .await;

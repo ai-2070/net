@@ -175,6 +175,22 @@ enum Cmd {
     },
     /// Print the adapter's Prometheus text body.
     Metrics,
+    /// Active-overflow operator commands (v0.3). Status-only
+    /// in the current ship; future actions land here.
+    Overflow {
+        #[command(subcommand)]
+        action: OverflowCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OverflowCmd {
+    /// Print the local overflow state: the configured
+    /// `enabled` boolean, the runtime `active` flag (set by
+    /// the most recent tick), the configured thresholds, and
+    /// the cumulative counter family (admitted / rejected /
+    /// errors / hysteresis transitions).
+    Status,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -216,6 +232,9 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             dry_run,
         } => cmd_gc(&adapter, &retention, disk_pressure, dry_run, cli.format).await,
         Cmd::Metrics => cmd_metrics(&adapter, cli.format),
+        Cmd::Overflow { action } => match action {
+            OverflowCmd::Status => cmd_overflow_status(&adapter, cli.format),
+        },
     }
 }
 
@@ -456,6 +475,112 @@ fn cmd_metrics(
     }
     let body = adapter.prometheus_text();
     print!("{}", body);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_overflow_status(
+    adapter: &MeshBlobAdapter,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // The CLI runs against a freshly-constructed adapter — the
+    // in-process `overflow_active` flag is always `false` here
+    // (no tick has fired in this process). What's persistent is
+    // the configured boolean + thresholds, which the operator
+    // reads to confirm the daemon-side config is what they
+    // expect. The cumulative counters are also process-local
+    // — `net-blob` is the wrong tool for cross-restart counter
+    // history; that's the Prometheus scraper's job. Print what
+    // we have, label what we don't.
+    let config = adapter.overflow_config();
+    let active = adapter.overflow_active();
+    let snap = adapter.metrics().snapshot();
+    let o = &snap.overflow;
+    match fmt {
+        OutputFormat::Human => {
+            println!("overflow status (adapter={})", adapter.adapter_id());
+            println!("  configured enabled:        {}", config.enabled);
+            println!("  runtime active (this proc): {}", active);
+            println!(
+                "  high_water_ratio:          {:.3}",
+                config.high_water_ratio
+            );
+            println!("  low_water_ratio:           {:.3}", config.low_water_ratio);
+            println!(
+                "  max_pushes_per_tick:       {}",
+                config.max_pushes_per_tick
+            );
+            println!("  scope:                     {:?}", config.scope);
+            println!("  tick_interval_ms:          {}", config.tick_interval_ms);
+            println!("  --- counters (this process) ---");
+            println!("  pushes_admitted_total:     {}", o.pushes_admitted_total);
+            println!("  push_errors_total:         {}", o.push_errors_total);
+            println!("  pushed_bytes_total:        {}", o.pushed_bytes_total);
+            println!(
+                "  rejected_no_target_total:  {}",
+                o.rejected_no_target_total
+            );
+            println!(
+                "  rejected (no_storage_cap): {}",
+                o.rejected_no_storage_cap_total
+            );
+            println!(
+                "  rejected (not_participating): {}",
+                o.rejected_not_participating_total
+            );
+            println!(
+                "  rejected (sender_not_overflowing): {}",
+                o.rejected_sender_not_overflowing_total
+            );
+            println!(
+                "  rejected (unhealthy):      {}",
+                o.rejected_unhealthy_total
+            );
+            println!(
+                "  rejected (scope_mismatch): {}",
+                o.rejected_scope_mismatch_total
+            );
+            println!(
+                "  rejected (insufficient_disk): {}",
+                o.rejected_insufficient_disk_total
+            );
+            println!(
+                "  high_water_triggered_total: {}",
+                o.high_water_triggered_total
+            );
+            println!("  low_water_cleared_total:   {}", o.low_water_cleared_total);
+            println!("  disk_ratio (last tick):    {:.3}", o.disk_ratio);
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "adapter": adapter.adapter_id(),
+                "config": {
+                    "enabled": config.enabled,
+                    "high_water_ratio": config.high_water_ratio,
+                    "low_water_ratio": config.low_water_ratio,
+                    "max_pushes_per_tick": config.max_pushes_per_tick,
+                    "scope": format!("{:?}", config.scope),
+                    "tick_interval_ms": config.tick_interval_ms,
+                },
+                "active": active,
+                "counters": {
+                    "pushes_admitted_total": o.pushes_admitted_total,
+                    "push_errors_total": o.push_errors_total,
+                    "pushed_bytes_total": o.pushed_bytes_total,
+                    "rejected_no_target_total": o.rejected_no_target_total,
+                    "rejected_no_storage_cap_total": o.rejected_no_storage_cap_total,
+                    "rejected_not_participating_total": o.rejected_not_participating_total,
+                    "rejected_sender_not_overflowing_total": o.rejected_sender_not_overflowing_total,
+                    "rejected_unhealthy_total": o.rejected_unhealthy_total,
+                    "rejected_scope_mismatch_total": o.rejected_scope_mismatch_total,
+                    "rejected_insufficient_disk_total": o.rejected_insufficient_disk_total,
+                    "high_water_triggered_total": o.high_water_triggered_total,
+                    "low_water_cleared_total": o.low_water_cleared_total,
+                    "disk_ratio": o.disk_ratio,
+                },
+            })
+        ),
+    }
     Ok(ExitCode::SUCCESS)
 }
 
