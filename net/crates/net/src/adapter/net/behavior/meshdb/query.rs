@@ -382,19 +382,27 @@ pub struct ResultRow {
     pub payload: Vec<u8>,
 }
 
-/// Phase D-1 join-result envelope. The executor postcard-
-/// encodes one of these into each joined [`ResultRow`]'s
-/// `payload` (with `origin = 0` and `seq = SeqNum(0)` as the
-/// sentinel-row markers). Callers consuming a Join operator's
-/// stream decode the payload to recover the original
-/// `(left, right)` rows.
+/// Join-result envelope. The executor postcard-encodes one of
+/// these into each joined [`ResultRow`]'s `payload` (with
+/// `origin = 0` and `seq = SeqNum(0)` as the sentinel-row
+/// markers). Callers consuming a Join operator's stream decode
+/// the payload to recover the original `(left, right)` rows.
+///
+/// Both sides are `Option` to accommodate the four
+/// [`JoinKind`]s:
+///
+/// - `Inner`: both `Some`.
+/// - `LeftOuter`: left always `Some`, right `Some` on match
+///   and `None` on miss.
+/// - `RightOuter`: symmetric — right always `Some`, left
+///   `Some` on match and `None` on miss.
+/// - `FullOuter`: matched pairs have both `Some`; unmatched
+///   rows from either side have the missing side `None`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JoinedRowPayload {
-    /// Left-side row contributing to the match.
-    pub left: ResultRow,
-    /// Right-side row contributing to the match. `None` for
-    /// LeftOuter unmatched rows (Phase D-2+; D-1 only produces
-    /// `Some`).
+    /// Left-side row, if present.
+    pub left: Option<ResultRow>,
+    /// Right-side row, if present.
     pub right: Option<ResultRow>,
 }
 

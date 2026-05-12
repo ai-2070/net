@@ -218,10 +218,7 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
 impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
     /// Phase D-1 federated hash-join: fetch both sides
     /// through the transport (recurse on this executor),
-    /// build a hash table on left, probe with right, emit
-    /// [`super::query::JoinedRowPayload`] inside sentinel
-    /// rows. Inner-join only — outer kinds surface
-    /// `PlannerError`.
+    /// hash-join locally. Supports all four [`JoinKind`]s.
     async fn execute_hash_join_federated(
         &self,
         plan: ExecutionPlan,
@@ -239,16 +236,9 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
         else {
             unreachable!("execute_hash_join_federated dispatched on non-HashJoin");
         };
-        if kind != JoinKind::Inner {
-            return Err(MeshError::PlannerError {
-                detail: format!(
-                    "join kind {kind:?} not yet implemented in Phase D-1; only Inner supported (outer joins land in D-2)"
-                ),
-            });
-        }
 
-        // Reuse the federated execute path for each side by
-        // wrapping the sub-plan in a fresh ExecutionPlan.
+        // Fetch each side through the federated executor so
+        // atomic leaves still dispatch via the transport.
         let left_running = Box::pin(self.execute(ExecutionPlan {
             root: *left,
             total_cost: CostEstimate::default(),
@@ -263,45 +253,34 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
         let left_rows = drain_rows(left_running.rows).await?;
         let right_rows = drain_rows(right_running.rows).await?;
 
-        // Build on left, probe with right; same memory bound
-        // as the local executor (a Phase D-2 refinement will
-        // make this configurable per-query).
-        use std::collections::HashMap;
-        let mut build: HashMap<Vec<u8>, Vec<ResultRow>> = HashMap::new();
-        let mut build_bytes: u64 = 0;
-        for row in left_rows {
-            let key = encode_join_key_federated(&row, key_mode);
-            let approx = (row.payload.len() + key.len() + 64) as u64;
-            build_bytes = build_bytes.saturating_add(approx);
-            if build_bytes > super::executor::HASH_JOIN_MEMORY_BYTES {
-                return Err(MeshError::JoinMemoryExceeded {
-                    strategy: "broadcast-hash-federated".to_string(),
-                    threshold_bytes: super::executor::HASH_JOIN_MEMORY_BYTES,
-                });
+        let pairs = match kind {
+            JoinKind::Inner => federated_hash_join(left_rows, right_rows, key_mode, false, false)?,
+            JoinKind::LeftOuter => {
+                federated_hash_join(left_rows, right_rows, key_mode, true, false)?
             }
-            build.entry(key).or_default().push(row);
-        }
+            JoinKind::RightOuter => {
+                // Swap: build on right, probe with left, then
+                // swap labels back when packing JoinedRowPayload.
+                federated_hash_join(right_rows, left_rows, key_mode, true, true)?
+            }
+            JoinKind::FullOuter => federated_full_outer(left_rows, right_rows, key_mode)?,
+        };
 
         let mut out: Vec<Result<ResultRow, MeshError>> = Vec::new();
-        for r in right_rows {
-            let key = encode_join_key_federated(&r, key_mode);
-            if let Some(lefts) = build.get(&key) {
-                for l in lefts {
-                    let payload = postcard::to_allocvec(&JoinedRowPayload {
-                        left: l.clone(),
-                        right: Some(r.clone()),
-                    })
-                    .map_err(|e| MeshError::ExecutorError {
-                        node: 0,
-                        detail: format!("encode JoinedRowPayload: {e}"),
-                    })?;
-                    out.push(Ok(ResultRow {
-                        origin: 0,
-                        seq: SeqNum(0),
-                        payload,
-                    }));
-                }
-            }
+        for (l, r) in pairs {
+            let payload = postcard::to_allocvec(&JoinedRowPayload {
+                left: l,
+                right: r,
+            })
+            .map_err(|e| MeshError::ExecutorError {
+                node: 0,
+                detail: format!("encode JoinedRowPayload: {e}"),
+            })?;
+            out.push(Ok(ResultRow {
+                origin: 0,
+                seq: SeqNum(0),
+                payload,
+            }));
         }
 
         let handle = QueryHandle::new(self.allocate_id());
@@ -311,6 +290,113 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             rows: stream,
         })
     }
+}
+
+/// One `(left, right)` pair before encoding as a
+/// [`super::query::JoinedRowPayload`]. Either side can be
+/// `None` for outer-join unmatched rows.
+type JoinedPair = (Option<ResultRow>, Option<ResultRow>);
+
+/// Hash-join body for the federated executor. Returns the
+/// matched (and optionally unmatched) `(left, right)` pairs
+/// before encoding so the caller can wrap them in
+/// [`super::query::JoinedRowPayload`].
+fn federated_hash_join(
+    build_rows: Vec<ResultRow>,
+    probe_rows: Vec<ResultRow>,
+    key_mode: super::planner::JoinKeyMode,
+    emit_unmatched_build: bool,
+    swap: bool,
+) -> Result<Vec<JoinedPair>, MeshError> {
+    use std::collections::HashMap;
+    let mut build_bytes: u64 = 0;
+    let mut build: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
+    for row in build_rows {
+        let key = encode_join_key_federated(&row, key_mode);
+        let approx = (row.payload.len() + key.len() + 64) as u64;
+        build_bytes = build_bytes.saturating_add(approx);
+        if build_bytes > super::executor::HASH_JOIN_MEMORY_BYTES {
+            return Err(MeshError::JoinMemoryExceeded {
+                strategy: "broadcast-hash-federated".to_string(),
+                threshold_bytes: super::executor::HASH_JOIN_MEMORY_BYTES,
+            });
+        }
+        build.entry(key).or_default().push((row, false));
+    }
+
+    let mut out = Vec::new();
+    for p in probe_rows {
+        let key = encode_join_key_federated(&p, key_mode);
+        if let Some(entries) = build.get_mut(&key) {
+            for (b, matched) in entries.iter_mut() {
+                *matched = true;
+                if swap {
+                    out.push((Some(p.clone()), Some(b.clone())));
+                } else {
+                    out.push((Some(b.clone()), Some(p.clone())));
+                }
+            }
+        }
+    }
+    if emit_unmatched_build {
+        for entries in build.into_values() {
+            for (b, matched) in entries {
+                if !matched {
+                    if swap {
+                        out.push((None, Some(b)));
+                    } else {
+                        out.push((Some(b), None));
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Full-outer mirror for [`federated_hash_join`].
+fn federated_full_outer(
+    left_rows: Vec<ResultRow>,
+    right_rows: Vec<ResultRow>,
+    key_mode: super::planner::JoinKeyMode,
+) -> Result<Vec<JoinedPair>, MeshError> {
+    use std::collections::HashMap;
+    let mut build_bytes: u64 = 0;
+    let mut right_map: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
+    for row in right_rows {
+        let key = encode_join_key_federated(&row, key_mode);
+        let approx = (row.payload.len() + key.len() + 64) as u64;
+        build_bytes = build_bytes.saturating_add(approx);
+        if build_bytes > super::executor::HASH_JOIN_MEMORY_BYTES {
+            return Err(MeshError::JoinMemoryExceeded {
+                strategy: "broadcast-hash-federated".to_string(),
+                threshold_bytes: super::executor::HASH_JOIN_MEMORY_BYTES,
+            });
+        }
+        right_map.entry(key).or_default().push((row, false));
+    }
+
+    let mut out = Vec::new();
+    for l in left_rows {
+        let key = encode_join_key_federated(&l, key_mode);
+        match right_map.get_mut(&key) {
+            Some(entries) => {
+                for (r, matched) in entries.iter_mut() {
+                    *matched = true;
+                    out.push((Some(l.clone()), Some(r.clone())));
+                }
+            }
+            None => out.push((Some(l), None)),
+        }
+    }
+    for entries in right_map.into_values() {
+        for (r, matched) in entries {
+            if !matched {
+                out.push((None, Some(r)));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Drain a [`ResultStream`] into a `Vec<ResultRow>`. Errors
@@ -931,11 +1017,78 @@ mod tests {
             .iter()
             .map(|r| postcard::from_bytes(&r.payload).unwrap())
             .collect();
-        decoded.sort_by_key(|j| j.left.seq);
-        assert_eq!(decoded[0].left.payload, b"a-2");
+        decoded.sort_by_key(|j| j.left.as_ref().unwrap().seq);
+        assert_eq!(decoded[0].left.as_ref().unwrap().payload, b"a-2");
         assert_eq!(decoded[0].right.as_ref().unwrap().payload, b"b-2");
-        assert_eq!(decoded[1].left.payload, b"a-5");
+        assert_eq!(decoded[1].left.as_ref().unwrap().payload, b"a-5");
         assert_eq!(decoded[1].right.as_ref().unwrap().payload, b"b-5");
+    }
+
+    #[tokio::test]
+    async fn federated_left_outer_emits_unmatched_lefts_via_transport() {
+        use super::super::planner::{CostEstimate, JoinKeyMode};
+        use super::super::query::{JoinKind, JoinedRowPayload};
+        use std::time::Duration;
+
+        // Left chain a: seqs 1,2. Right chain b: seq 2.
+        // LeftOuter on seq → 1 unmatched + 1 matched.
+        let a = 0xAAAA;
+        let b = 0xBBBB;
+        let node_a = local_executor_with(&[(a, 1, b"a-1"), (a, 2, b"a-2")]);
+        let node_b = local_executor_with(&[(b, 2, b"b-2")]);
+
+        let transport = Arc::new(LoopbackTransport::new());
+        transport.register(0xA, node_a);
+        transport.register(0xB, node_b);
+
+        let fed = FederatedMeshQueryExecutor::new(transport);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::HashJoin {
+                    left: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: a,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![0xA],
+                        cost: CostEstimate::default(),
+                    }),
+                    right: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: b,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![0xB],
+                        cost: CostEstimate::default(),
+                    }),
+                    key_mode: JoinKeyMode::Seq,
+                    kind: JoinKind::LeftOuter,
+                    watermark: Duration::from_secs(5),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let running = fed.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        let decoded: Vec<JoinedRowPayload> = rows
+            .iter()
+            .map(|r| postcard::from_bytes(&r.payload).unwrap())
+            .collect();
+        let matched = decoded.iter().filter(|j| j.right.is_some()).count();
+        let unmatched = decoded.iter().filter(|j| j.right.is_none()).count();
+        assert_eq!(matched, 1);
+        assert_eq!(unmatched, 1);
+        // The unmatched-left row must always have left=Some.
+        assert!(decoded.iter().all(|j| j.left.is_some()));
     }
 
     #[tokio::test]
