@@ -232,6 +232,17 @@ pub struct PyRedex {
     persistent_dir: Option<String>,
 }
 
+impl PyRedex {
+    /// Crate-internal accessor for the underlying `Redex` Arc.
+    /// Lets sibling binding modules (e.g. `blob::PyMeshBlobAdapter`)
+    /// wire a substrate-owned blob adapter against the same handle
+    /// without forcing the operator to manage two parallel Redex
+    /// instances. Not exposed to Python.
+    pub(crate) fn inner_arc(&self) -> Arc<InnerRedex> {
+        self.inner.clone()
+    }
+}
+
 #[pymethods]
 impl PyRedex {
     #[new]
