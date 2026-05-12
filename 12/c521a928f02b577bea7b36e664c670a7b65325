@@ -1,0 +1,27 @@
+net/crates/net/Cargo.toml
+  s_3a0a24a47d1a36::t_125148eae372d3 183-187
+  s_3a0a24a47d1a36::t_cf0bb0dfaa48c8 82-88
+  s_3a0a24a47d1a36::t_340bd4ded641e5 167-172
+net/crates/net/src/bin/net-blob.rs
+  s_3a0a24a47d1a36::t_e83dce1657746d 1-11,36-66,68-576
+  s_3a0a24a47d1a36::t_f5de5de379f874 12-35
+  s_3a0a24a47d1a36::t_fe96cedd45b57d 67
+net/crates/net/src/adapter/net/dataforts/blob/refcount.rs
+  s_3a0a24a47d1a36::t_b1c2c83aa27df8 205-213
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "12c521a928f02b577bea7b36e664c670a7b65325",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
