@@ -1,0 +1,30 @@
+net/crates/net/tests/dataforts_blob_e2e.rs
+  s_3a0a24a47d1a36::t_744d8db856a88b 380-644
+net/crates/net/tests/net_blob_cli.rs
+  s_3a0a24a47d1a36::t_56b2c339804228 1-216,218-253,255-361
+net/crates/net/Cargo.toml
+  s_3a0a24a47d1a36::t_9af78070a886a8 297-306
+net/crates/net/bindings/python/tests/test_blob.py
+  s_3a0a24a47d1a36::t_7e5cb4219f73d5 1-95,97-98,101-210
+  s_3a0a24a47d1a36::t_d80f9fc282e5bc 96,99-100
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_3a0a24a47d1a36::t_9fdfafd38dbc15 6023-6202
+net/crates/net/bindings/python/python/net/__init__.py
+  s_3a0a24a47d1a36::t_72dcf1b5686132 315-351
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "cce35895d227a5714d7ebe2940043a2d8668c556",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
