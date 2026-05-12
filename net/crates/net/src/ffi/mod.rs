@@ -160,6 +160,18 @@ pub mod cortex;
 #[allow(missing_docs)]
 pub mod blob;
 
+/// Stub definitions for the `net_mesh_blob_adapter_*` symbols
+/// when the `dataforts / netdb / redex-disk` feature triple is
+/// off. cgo / dlsym consumers link these symbols unconditionally
+/// (see `bindings/go/blob.go`), so a libnet built without the
+/// triple must still satisfy them — each stub returns
+/// `NET_ERR_FEATURE_NOT_BUILT` (or null) so Go programs route to
+/// a clean error rather than fail at program load. The module is
+/// empty when the feature triple is on (the real impls in
+/// `ffi::blob` cover the same symbol names).
+#[allow(missing_docs)]
+pub mod blob_stubs;
+
 /// C FFI for the encrypted-UDP mesh transport + channels. Requires
 /// the `net` feature (which brings in the crypto + transport). Go /
 /// cgo consumers target this surface alongside `ffi::cortex`. See
