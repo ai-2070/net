@@ -56,6 +56,7 @@ use super::blob_ref::{
 use super::error::BlobError;
 use super::metrics::BlobMetrics;
 use super::refcount::{BlobRefcountTable, DEFAULT_RETENTION_FLOOR};
+use crate::adapter::net::behavior::TopologyScope;
 use crate::adapter::net::channel::{AuthGuard, ChannelName};
 use crate::adapter::net::redex::{Redex, RedexFileConfig, ReplicationConfig};
 
@@ -70,6 +71,106 @@ const CHUNK_CHANNEL_PREFIX: &str = "dataforts/blob/";
 /// steady state; cold blobs decay below the emit threshold inside
 /// a few minutes.
 pub const DEFAULT_BLOB_HEAT_HALF_LIFE: Duration = Duration::from_secs(60);
+
+/// Default high-water disk-usage ratio that triggers the
+/// overflow tick. `0.85` lines up with the existing health-
+/// gate clear threshold so overflow fires *before* the
+/// `dataforts:blob-storage-unhealthy` advertisement — by the
+/// time the node is unhealthy, overflow has already been
+/// shedding for a while.
+pub const DEFAULT_OVERFLOW_HIGH_WATER_RATIO: f64 = 0.85;
+
+/// Default low-water disk-usage ratio that re-enters the
+/// "not actively overflowing" state. `0.70` gives 15 points
+/// of hysteresis to avoid flapping the active gauge near the
+/// boundary; mirrors the migration-controller / health-gate
+/// hysteresis discipline.
+pub const DEFAULT_OVERFLOW_LOW_WATER_RATIO: f64 = 0.70;
+
+/// Default per-tick push budget. Each push opens a chunk
+/// channel with replication armed, so the cap bounds the
+/// wire-side bandwidth burst when a node first crosses the
+/// high-water mark.
+pub const DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK: usize = 16;
+
+/// Default tick cadence. Independent of the gravity tick —
+/// overflow is push-driven by local disk state, not by
+/// inbound heat. 30 s is short enough that a node above the
+/// high-water mark reclaims meaningfully per minute without
+/// thrashing the disk-stat probe.
+pub const DEFAULT_OVERFLOW_TICK_INTERVAL_MS: u64 = 30_000;
+
+/// Operator-tunable knobs for the active-overflow controller
+/// (`BlobOverflowController`, lands in P2). P1 carries the
+/// type + the `MeshBlobAdapter` builder / getter / setter
+/// surface; the controller + tick driver land in P2.
+///
+/// `enabled` is the master switch. The remaining fields are
+/// thresholds + budgets the controller reads when overflow
+/// is active. Tuning the thresholds without flipping
+/// `enabled` is a valid operator gesture — the next
+/// `set_overflow_enabled(true)` call picks up the latest
+/// thresholds without rebuilding the adapter.
+///
+/// See [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`] for the full
+/// design.
+///
+/// [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`]: ../../../../../docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverflowConfig {
+    /// Operator-visible master switch. `false` by default;
+    /// the adapter never pushes, never advertises the
+    /// `dataforts.blob.overflow` tag, and never accepts
+    /// inbound pushes when this is `false`.
+    pub enabled: bool,
+    /// Local disk usage at or above this ratio triggers the
+    /// overflow tick (controller reads + fires pushes).
+    /// Bounded to `0.0..=1.0`; the setter clamps out-of-range
+    /// values rather than rejecting them, on the theory that
+    /// a misconfigured operator should still get a sane node.
+    /// Default [`DEFAULT_OVERFLOW_HIGH_WATER_RATIO`] (0.85).
+    pub high_water_ratio: f64,
+    /// Local disk usage at or below this ratio clears the
+    /// "actively overflowing" state. Must be strictly less
+    /// than `high_water_ratio` for the hysteresis to mean
+    /// anything; the setter doesn't enforce ordering (the
+    /// controller's tick logic treats `low >= high` as
+    /// "no hysteresis, fire every tick above low").
+    /// Default [`DEFAULT_OVERFLOW_LOW_WATER_RATIO`] (0.70).
+    pub low_water_ratio: f64,
+    /// Maximum number of hashes pushed per tick. `0` is a
+    /// degenerate "tick fires but pushes nothing" mode — the
+    /// controller bumps the trigger counter without admitting
+    /// any pushes. Useful for operator dashboards to observe
+    /// "would have fired N times" before enabling real pushes.
+    /// Default [`DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK`] (16).
+    pub max_pushes_per_tick: usize,
+    /// Topology scope bound on push-target selection. `Mesh`
+    /// by default — the controller may pick any overflow-
+    /// enabled peer in the mesh. `Zone` keeps overflow inside
+    /// the zone (multi-cloud deployments configure this to
+    /// keep overflow traffic off the WAN).
+    pub scope: TopologyScope,
+    /// Tick cadence in milliseconds. Operators drive the tick
+    /// from their scheduling loop; the value here documents
+    /// the recommended cadence and is surfaced in
+    /// `prometheus_text` so dashboards can label it.
+    /// Default [`DEFAULT_OVERFLOW_TICK_INTERVAL_MS`] (30 000).
+    pub tick_interval_ms: u64,
+}
+
+impl Default for OverflowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            high_water_ratio: DEFAULT_OVERFLOW_HIGH_WATER_RATIO,
+            low_water_ratio: DEFAULT_OVERFLOW_LOW_WATER_RATIO,
+            max_pushes_per_tick: DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK,
+            scope: TopologyScope::Mesh,
+            tick_interval_ms: DEFAULT_OVERFLOW_TICK_INTERVAL_MS,
+        }
+    }
+}
 
 /// `mesh://`-scheme adapter that stores chunks as content-addressed
 /// [`RedexFile`](crate::adapter::net::redex::RedexFile)s. See the
@@ -140,6 +241,16 @@ pub struct MeshBlobAdapter {
     /// concurrent stores, not by total distinct hashes ever
     /// seen.
     in_flight_stores: Arc<DashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
+    /// Active-overflow knobs (v0.3 P1 surface). Held behind
+    /// an `Arc<RwLock<_>>` so the boolean toggle + threshold
+    /// updates are cheap, lock-free for the steady-state
+    /// read, and visible across every adapter clone. Default
+    /// `OverflowConfig::default()` — `enabled = false`, so
+    /// existing call sites observe v0.2 behavior unchanged.
+    /// The push controller + receive-side handler land in
+    /// P2 / P3; this field is the storage shape the rest of
+    /// the work will compose against.
+    overflow: Arc<parking_lot::RwLock<OverflowConfig>>,
 }
 
 impl MeshBlobAdapter {
@@ -162,6 +273,7 @@ impl MeshBlobAdapter {
             blob_heat: None,
             blob_heat_half_life: DEFAULT_BLOB_HEAT_HALF_LIFE,
             in_flight_stores: Arc::new(DashMap::new()),
+            overflow: Arc::new(parking_lot::RwLock::new(OverflowConfig::default())),
         }
     }
 
@@ -233,6 +345,71 @@ impl MeshBlobAdapter {
         self.blob_heat = Some(registry);
         self.blob_heat_half_life = half_life;
         self
+    }
+
+    /// Install the supplied [`OverflowConfig`] as the initial
+    /// overflow state. The `enabled` field of `config` is
+    /// honored — passing `OverflowConfig { enabled: true, ..
+    /// Default::default() }` is the typical "turn on with
+    /// defaults" gesture. Subsequent
+    /// [`Self::set_overflow_enabled`] / [`Self::set_overflow_config`]
+    /// calls override the state set here.
+    ///
+    /// Default (no call to this builder) is
+    /// `OverflowConfig::default()` with `enabled = false` —
+    /// the v0.2 pull-only posture.
+    pub fn with_overflow(self, config: OverflowConfig) -> Self {
+        *self.overflow.write() = config;
+        self
+    }
+
+    /// True iff the adapter is currently advertising
+    /// `dataforts.blob.overflow` and accepting inbound
+    /// `OverflowPush` requests. Cheap (one read-lock acquire);
+    /// fine to call on the hot path.
+    ///
+    /// Returns the *runtime* state, so operators dashboarding
+    /// "is overflow on" against a recently-toggled node see
+    /// the live value rather than a build-time snapshot.
+    pub fn overflow_enabled(&self) -> bool {
+        self.overflow.read().enabled
+    }
+
+    /// Snapshot of the current overflow configuration. Returns
+    /// a copy of the `OverflowConfig` (it's `Copy`); the lock
+    /// is released before the return. Inspection-only; mutate
+    /// via [`Self::set_overflow_enabled`] or
+    /// [`Self::set_overflow_config`].
+    pub fn overflow_config(&self) -> OverflowConfig {
+        *self.overflow.read()
+    }
+
+    /// Flip the overflow master switch at runtime. No-op if
+    /// `enabled` matches the current state. When the boolean
+    /// transitions, the adapter's next capability rebroadcast
+    /// adds (or removes) the `dataforts.blob.overflow` tag —
+    /// peers see the change on the following announcement
+    /// cycle. The rebroadcast itself is the operator's
+    /// responsibility (call `MeshNode::announce_capabilities`
+    /// after the toggle).
+    ///
+    /// Cheap: one write-lock acquire, one bool store. Safe to
+    /// call concurrently with reads via
+    /// [`Self::overflow_enabled`] — the RwLock ensures the
+    /// observed value is consistent with one toggle event.
+    pub fn set_overflow_enabled(&self, enabled: bool) {
+        self.overflow.write().enabled = enabled;
+    }
+
+    /// Replace the entire overflow configuration in one call.
+    /// Useful when the operator wants to update thresholds
+    /// (high-water, low-water, push budget, scope) without
+    /// touching the master switch — pass the same `enabled`
+    /// value the adapter currently has, plus the new
+    /// thresholds. Or use this to atomically enable + tune in
+    /// one call.
+    pub fn set_overflow_config(&self, config: OverflowConfig) {
+        *self.overflow.write() = config;
     }
 
     /// True iff this adapter is wired to bump a shared blob-heat
@@ -1850,5 +2027,111 @@ mod tests {
             guard.get(&chunk_refs[1].hash).is_none(),
             "second chunk's heat must NOT bump when range doesn't touch it"
         );
+    }
+
+    // ========================================================================
+    // OverflowConfig + master switch (P1)
+    //
+    // P1 carries the type + the builder / getter / setter surface; the
+    // push controller + receive-side handler land in P2 / P3. These
+    // tests pin the storage contract — defaults match the disabled-by-
+    // default posture, the runtime toggle is observable across clones,
+    // and the typed config round-trips through the setter.
+    // ========================================================================
+
+    #[test]
+    fn overflow_disabled_by_default() {
+        // Out-of-the-box `MeshBlobAdapter::new` matches v0.2
+        // behavior: overflow off, default thresholds visible in
+        // the config snapshot.
+        let adapter = make_adapter();
+        assert!(!adapter.overflow_enabled());
+        let cfg = adapter.overflow_config();
+        assert_eq!(cfg, OverflowConfig::default());
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.high_water_ratio, DEFAULT_OVERFLOW_HIGH_WATER_RATIO);
+        assert_eq!(cfg.low_water_ratio, DEFAULT_OVERFLOW_LOW_WATER_RATIO);
+        assert_eq!(cfg.max_pushes_per_tick, DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK);
+        assert_eq!(cfg.scope, TopologyScope::Mesh);
+        assert_eq!(cfg.tick_interval_ms, DEFAULT_OVERFLOW_TICK_INTERVAL_MS);
+    }
+
+    #[test]
+    fn overflow_with_overflow_builder_seeds_initial_state() {
+        // `with_overflow(OverflowConfig { enabled: true, .. })`
+        // is the typical "turn on at construction" path.
+        let adapter = make_adapter().with_overflow(OverflowConfig {
+            enabled: true,
+            high_water_ratio: 0.80,
+            max_pushes_per_tick: 8,
+            ..Default::default()
+        });
+        assert!(adapter.overflow_enabled());
+        let cfg = adapter.overflow_config();
+        assert_eq!(cfg.high_water_ratio, 0.80);
+        assert_eq!(cfg.max_pushes_per_tick, 8);
+        // Unspecified fields inherit defaults.
+        assert_eq!(cfg.low_water_ratio, DEFAULT_OVERFLOW_LOW_WATER_RATIO);
+        assert_eq!(cfg.scope, TopologyScope::Mesh);
+    }
+
+    #[test]
+    fn overflow_set_enabled_runtime_toggle_observable() {
+        // The runtime setter is the operator's master switch
+        // for live deployments — it must be observable without
+        // rebuilding the adapter, and visible to existing clones.
+        let adapter = make_adapter();
+        let clone = adapter.clone();
+        assert!(!adapter.overflow_enabled());
+        assert!(!clone.overflow_enabled());
+
+        adapter.set_overflow_enabled(true);
+        assert!(adapter.overflow_enabled());
+        // The Arc<RwLock<_>> is shared across clones — flipping
+        // through one handle is visible from the other.
+        assert!(clone.overflow_enabled());
+
+        adapter.set_overflow_enabled(false);
+        assert!(!adapter.overflow_enabled());
+        assert!(!clone.overflow_enabled());
+    }
+
+    #[test]
+    fn overflow_set_config_replaces_full_config() {
+        // The whole-config setter lets operators atomically
+        // enable + tune in one call. Useful when the toggle
+        // and the threshold update should land together.
+        let adapter = make_adapter();
+        let new_cfg = OverflowConfig {
+            enabled: true,
+            high_water_ratio: 0.92,
+            low_water_ratio: 0.65,
+            max_pushes_per_tick: 4,
+            scope: TopologyScope::Zone,
+            tick_interval_ms: 60_000,
+        };
+        adapter.set_overflow_config(new_cfg);
+        assert_eq!(adapter.overflow_config(), new_cfg);
+        assert!(adapter.overflow_enabled());
+    }
+
+    #[test]
+    fn overflow_set_enabled_preserves_tunables() {
+        // Operators tuning the master switch shouldn't lose
+        // their threshold overrides. Verify the toggle path
+        // preserves the rest of the config.
+        let adapter = make_adapter().with_overflow(OverflowConfig {
+            enabled: false,
+            high_water_ratio: 0.90,
+            max_pushes_per_tick: 32,
+            scope: TopologyScope::Region,
+            ..Default::default()
+        });
+        adapter.set_overflow_enabled(true);
+        let cfg = adapter.overflow_config();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.high_water_ratio, 0.90);
+        assert_eq!(cfg.max_pushes_per_tick, 32);
+        assert_eq!(cfg.scope, TopologyScope::Region);
     }
 }

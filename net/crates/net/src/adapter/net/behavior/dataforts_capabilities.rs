@@ -136,16 +136,39 @@ pub struct BlobCapability {
     /// whose combined footprint exceeds the candidate's free
     /// space.
     pub disk_free_gb: u64,
+    /// Does this node participate in active overflow — push-side
+    /// shedding of cold blobs when local disk crosses the
+    /// high-water threshold, AND receive-side acceptance of
+    /// inbound `OverflowPush` requests from peers in the same
+    /// state? Default `false` keeps the v0.2 pull-only posture.
+    /// See [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`] for the v0.3
+    /// design that lights this up.
+    ///
+    /// [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`]: ../../../../../docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
+    pub overflow_enabled: bool,
 }
 
 impl BlobCapability {
     /// Convenience constructor for a storage-participating node.
+    /// `overflow_enabled` defaults to `false`; operators that
+    /// want active overflow construct via a struct literal or
+    /// call [`Self::with_overflow_enabled`].
     pub fn storage_participating(disk_total_gb: u64, disk_free_gb: u64) -> Self {
         Self {
             storage: true,
             disk_total_gb,
             disk_free_gb,
+            overflow_enabled: false,
         }
+    }
+
+    /// Builder-style toggle for the `overflow_enabled` field.
+    /// Useful in test fixtures and the rare operator code that
+    /// wants the convenience constructor's defaults plus
+    /// overflow.
+    pub fn with_overflow_enabled(mut self, enabled: bool) -> Self {
+        self.overflow_enabled = enabled;
+        self
     }
 
     /// Write this projection back into a [`CapabilitySet`] as a
@@ -157,6 +180,7 @@ impl BlobCapability {
     /// - `dataforts.blob.storage` (presence) iff `storage = true`.
     /// - `dataforts.blob.disk_total_gb=<n>` iff `disk_total_gb > 0`.
     /// - `dataforts.blob.disk_free_gb=<n>` iff `disk_free_gb > 0`.
+    /// - `dataforts.blob.overflow` (presence) iff `overflow_enabled = true`.
     ///
     /// Zero-valued fields are elided rather than emitted as
     /// `=0` — matches the parser's default-on-absent semantics
@@ -187,12 +211,18 @@ impl BlobCapability {
                 separator: crate::adapter::net::behavior::tag::AxisSeparator::Eq,
             });
         }
+        if self.overflow_enabled {
+            tags.insert(Tag::AxisPresent {
+                axis: TaxonomyAxis::Dataforts,
+                key: "blob.overflow".to_string(),
+            });
+        }
         CapabilitySet { tags, ..caps }
     }
 
     /// Read a `BlobCapability` projection out of a [`CapabilitySet`]'s
     /// tag set. Tags absent → field defaults (`storage = false`,
-    /// `disk_*_gb = 0`).
+    /// `disk_*_gb = 0`, `overflow_enabled = false`).
     pub fn from_capability_set(caps: &CapabilitySet) -> Self {
         let mut out = Self::default();
         for tag in &caps.tags {
@@ -201,6 +231,11 @@ impl BlobCapability {
                     if *axis == TaxonomyAxis::Dataforts && key == "blob.storage" =>
                 {
                     out.storage = true;
+                }
+                Tag::AxisPresent { axis, key }
+                    if *axis == TaxonomyAxis::Dataforts && key == "blob.overflow" =>
+                {
+                    out.overflow_enabled = true;
                 }
                 Tag::AxisValue {
                     axis, key, value, ..
@@ -553,10 +588,11 @@ mod tests {
             storage: true,
             disk_total_gb: 0,
             disk_free_gb: 0,
+            overflow_enabled: false,
         };
         let caps = bc.write_into(CapabilitySet::new());
-        // Storage tag emitted; disk-gb tags not (matches the
-        // parser's default-on-absent semantics).
+        // Storage tag emitted; disk-gb + overflow tags not
+        // (matches the parser's default-on-absent semantics).
         assert!(caps
             .tags
             .iter()
@@ -565,6 +601,47 @@ mod tests {
         assert!(!caps.tags.iter().any(|t| matches!(t,
             Tag::AxisValue { axis, key, .. }
             if *axis == TaxonomyAxis::Dataforts && key == "blob.disk_total_gb")));
+        assert!(!caps.tags.iter().any(|t| matches!(t,
+            Tag::AxisPresent { axis, key }
+            if *axis == TaxonomyAxis::Dataforts && key == "blob.overflow")));
+    }
+
+    #[test]
+    fn blob_capability_overflow_tag_round_trips() {
+        // Presence-only tag for the new v0.3 overflow opt-in.
+        // Mirrors `blob.storage` — the producer writes the
+        // tag iff `overflow_enabled = true`; the parser reads
+        // it back the same way.
+        let original = BlobCapability {
+            storage: true,
+            disk_total_gb: 100,
+            disk_free_gb: 50,
+            overflow_enabled: true,
+        };
+        let caps = original.write_into(CapabilitySet::new());
+        assert!(caps
+            .tags
+            .iter()
+            .any(|t| matches!(t, Tag::AxisPresent { axis, key }
+                if *axis == TaxonomyAxis::Dataforts && key == "blob.overflow")));
+        let read_back = BlobCapability::from_capability_set(&caps);
+        assert_eq!(read_back, original);
+    }
+
+    #[test]
+    fn blob_capability_overflow_absent_when_disabled() {
+        // The presence-only tag must not be emitted when
+        // `overflow_enabled = false`; a peer reading the caps
+        // should observe the node as overflow-disabled. Pin
+        // this against accidental "emit on every node" drift.
+        let bc = BlobCapability::storage_participating(100, 50);
+        assert!(!bc.overflow_enabled);
+        let caps = bc.write_into(CapabilitySet::new());
+        assert!(!caps.tags.iter().any(|t| matches!(t,
+            Tag::AxisPresent { axis, key }
+            if *axis == TaxonomyAxis::Dataforts && key == "blob.overflow")));
+        let read_back = BlobCapability::from_capability_set(&caps);
+        assert!(!read_back.overflow_enabled);
     }
 
     #[test]
