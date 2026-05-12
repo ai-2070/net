@@ -182,6 +182,24 @@ def test_mesh_blob_adapter_repr_includes_adapter_id() -> None:
     assert adapter.adapter_id == "py-repr"
 
 
+def test_mesh_blob_adapter_store_accepts_bytearray_input() -> None:
+    """Regression for the bytearray-soundness bug: `&[u8]` in
+    PyO3 accepts both `bytes` and `bytearray`, but the latter is
+    mutable + resizable so a raw-pointer capture across
+    `py.detach()` was unsound. The fix copies bytes under the
+    GIL; this test pins the bytearray path round-trips cleanly.
+    """
+    redex = Redex()
+    adapter = _adapter(redex)
+    raw = b"bytearray-soundness regression"
+    payload = bytearray(raw)
+    digest = _blake3_digest(bytes(payload))
+    ref = BlobRef("mesh://bytearray", digest, len(payload))
+    adapter.store(ref, payload)
+    fetched = adapter.fetch(ref)
+    assert fetched == raw
+
+
 def test_mesh_blob_adapter_persistent_round_trips_across_calls() -> None:
     """`persistent=True` writes per-chunk RedexFiles to disk.
     The first adapter stores, the second adapter (against the

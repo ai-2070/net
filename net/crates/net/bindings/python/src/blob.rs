@@ -259,23 +259,20 @@ pub fn blob_publish<'py>(
             PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id))
         })?;
     let rt = shared_runtime()?;
-    // Defer the bytes copy past the GIL drop. Capture the raw
-    // pointer (as `usize` so the closure satisfies pyo3's `Ungil`
-    // bound; raw pointers aren't `Sync`) + length while the GIL
-    // is held (which keeps the caller's PyBytes / bytearray
-    // reference alive for the call); copy inside the detach
-    // scope so a multi-MB payload's memcpy doesn't stall the
-    // interpreter for the duration of the copy. SAFETY: caller's
-    // reference is alive for the entire function call so the
-    // underlying buffer doesn't move or get freed; the substrate's
-    // `publish_blob` takes `&[u8]` by borrow and doesn't smuggle
-    // the slice past its await.
-    let data_addr = data.as_ptr() as usize;
-    let data_len = data.len();
+    // Copy bytes WHILE the GIL is still held. PyO3's `&[u8]`
+    // extractor accepts both `bytes` (immutable) and `bytearray`
+    // (mutable + resizable). A mutable bytearray's buffer can
+    // move or reallocate if another Python thread mutates it
+    // while the GIL is released; the previous shape captured a
+    // raw pointer + length and copied inside `py.detach()`, which
+    // is unsound for the bytearray case. The copy here is
+    // bounded by the input size — typical blob payloads are
+    // ~70 bytes (wire-encoded BlobRef), so the GIL-hold window
+    // is negligible. For multi-MB stores route through
+    // `MeshBlobAdapter::store` on a PyBytes argument instead.
+    let data_owned = data.to_vec();
     let bytes = py
         .detach(|| -> Result<Vec<u8>, InnerBlobError> {
-            let data_owned: Vec<u8> =
-                unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len).to_vec() };
             rt.block_on(async move { publish_blob(adapter.as_ref(), uri, &data_owned).await })
         })
         .map_err(map_blob_err)?;
@@ -298,18 +295,13 @@ pub fn blob_resolve<'py>(
             PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id))
         })?;
     let rt = shared_runtime()?;
-    // Same GIL-drop-before-memcpy trick as `blob_publish`. The
-    // payload is usually small (a wire-encoded BlobRef is ~70
-    // bytes for the typical S3-URI case), but inline payloads
-    // can be large, and the resolve path is on the hot read side
-    // of fan-out.
-    let payload_addr = payload.as_ptr() as usize;
-    let payload_len = payload.len();
+    // Copy bytes under the GIL — see the rationale in
+    // `blob_publish`. PyO3's `&[u8]` accepts mutable `bytearray`,
+    // and a raw-pointer capture across `py.detach()` is unsound
+    // when the caller's buffer can be mutated by another thread.
+    let payload_owned = payload.to_vec();
     let bytes = py
         .detach(|| -> Result<Vec<u8>, InnerBlobError> {
-            let payload_owned: Vec<u8> = unsafe {
-                std::slice::from_raw_parts(payload_addr as *const u8, payload_len).to_vec()
-            };
             rt.block_on(async move { resolve_payload(&payload_owned, adapter.as_ref()).await })
         })
         .map_err(map_blob_err)?;
@@ -679,11 +671,14 @@ impl PyMeshBlobAdapter {
         let rt = shared_runtime()?;
         let adapter = self.inner.clone();
         let blob = blob_ref.as_inner().clone();
-        let data_addr = data.as_ptr() as usize;
-        let data_len = data.len();
+        // Copy bytes WHILE the GIL is held. `&[u8]` accepts
+        // mutable `bytearray`, whose backing buffer can move or
+        // reallocate if another Python thread mutates it after
+        // the GIL is released. Capturing a raw pointer across
+        // `py.detach()` and reading inside the closure was
+        // unsound for that case.
+        let data_owned = data.to_vec();
         py.detach(|| -> Result<(), InnerBlobError> {
-            let data_owned: Vec<u8> =
-                unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len).to_vec() };
             rt.block_on(async move { adapter.store(&blob, &data_owned).await })
         })
         .map_err(map_blob_err)
