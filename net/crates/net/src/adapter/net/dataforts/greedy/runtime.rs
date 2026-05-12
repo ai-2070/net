@@ -329,21 +329,55 @@ impl GreedyRuntime {
     /// typically pass `mesh_blob_adapter.refcount_table().clone()`
     /// so the same table feeds the adapter's GC sweep.
     ///
-    /// Idempotent — replacing an already-installed handle is
-    /// allowed; the per-channel `chain_blob_refs` shadow set is
-    /// preserved so in-flight admits/evictions stay balanced.
+    /// When called with an existing table already installed, the
+    /// outgoing table receives a matching decrement for every
+    /// hash currently in the shadow set — every prior admit's +1
+    /// is balanced — and the shadow set is then drained so the
+    /// new table starts from a clean slate. Without this, the old
+    /// table would keep leaked +1s on every channel currently in
+    /// the greedy cache (the eventual eviction would decrement
+    /// the *new* table instead), drifting the global accounting.
     #[cfg(feature = "dataforts")]
     pub fn set_blob_refcount_table(&self, table: super::super::blob::BlobRefcountTable) {
-        *self.inner.blob_refcount.write() = Some(table);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut slot = self.inner.blob_refcount.write();
+        if let Some(old) = slot.take() {
+            // Balance the outgoing table against everything we
+            // previously incremented on it.
+            let mut shadow = self.inner.chain_blob_refs.lock();
+            for hashes in shadow.values() {
+                for h in hashes {
+                    old.decr(*h, now);
+                }
+            }
+            shadow.clear();
+        }
+        *slot = Some(table);
     }
 
-    /// Disable the chain-fold refcount source. The shadow set is
-    /// drained so a future re-install starts from a clean slate.
-    /// Idempotent.
+    /// Disable the chain-fold refcount source. Every hash
+    /// currently in the shadow set receives a matching decrement
+    /// on the outgoing table so the global accounting stays
+    /// balanced; the shadow set is then drained. Idempotent.
     #[cfg(feature = "dataforts")]
     pub fn clear_blob_refcount_table(&self) {
-        *self.inner.blob_refcount.write() = None;
-        self.inner.chain_blob_refs.lock().clear();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut slot = self.inner.blob_refcount.write();
+        if let Some(old) = slot.take() {
+            let mut shadow = self.inner.chain_blob_refs.lock();
+            for hashes in shadow.values() {
+                for h in hashes {
+                    old.decr(*h, now);
+                }
+            }
+            shadow.clear();
+        }
     }
 
     /// True iff this runtime is wired as a blob refcount source.
@@ -1828,6 +1862,91 @@ mod tests {
             "hash_a refcount must drop on channel-A eviction (got {:?})",
             table.get(&hash_a),
         );
+    }
+
+    /// Swapping the refcount table while greedy holds in-flight
+    /// references must balance the outgoing table — every prior
+    /// admit's +1 receives a matching decrement against the table
+    /// being replaced. The new table starts from a clean slate.
+    /// Without this, the outgoing table strands +1s on the
+    /// currently-cached channels and the eventual eviction
+    /// decrements the *new* table instead, drifting accounting.
+    #[tokio::test]
+    async fn swapping_refcount_table_balances_outgoing() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+
+        let table_a = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table_a.clone());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, hash) = encode_blob_payload_with_hash(b"table-swap regression");
+        rt.dispatch_event(&cn("test/swap"), 0xEE, &chain, &encoded)
+            .await;
+        assert_eq!(
+            table_a.get(&hash).map(|e| e.refcount),
+            Some(1),
+            "table A registered the admit"
+        );
+
+        // Swap to table B. The runtime must decrement table A for
+        // every hash currently in the shadow set so table A stays
+        // balanced; the shadow set is drained.
+        let table_b = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table_b.clone());
+        assert_eq!(
+            table_a.get(&hash).map(|e| e.refcount),
+            Some(0),
+            "swap must decrement the outgoing table"
+        );
+        assert!(table_b.get(&hash).is_none(), "incoming table starts empty");
+
+        // A future admit on the new channel goes to table B only.
+        let (encoded2, hash2) = encode_blob_payload_with_hash(b"post-swap admit");
+        rt.dispatch_event(&cn("test/swap-2"), 0xEE, &chain, &encoded2)
+            .await;
+        assert_eq!(
+            table_b.get(&hash2).map(|e| e.refcount),
+            Some(1),
+            "post-swap admit bumps the new table"
+        );
+        // Table A must NOT see the new admit.
+        assert!(
+            table_a.get(&hash2).is_none(),
+            "outgoing table must not receive post-swap admits"
+        );
+    }
+
+    /// Clearing the table must also balance the outgoing table
+    /// against the shadow set, otherwise the same accounting
+    /// drift the swap-path closes is reopened on clear.
+    #[tokio::test]
+    async fn clearing_refcount_table_balances_outgoing() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+
+        let table = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table.clone());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, hash) = encode_blob_payload_with_hash(b"clear regression");
+        rt.dispatch_event(&cn("test/clear"), 0xEF, &chain, &encoded)
+            .await;
+        assert_eq!(table.get(&hash).map(|e| e.refcount), Some(1));
+
+        rt.clear_blob_refcount_table();
+        assert_eq!(
+            table.get(&hash).map(|e| e.refcount),
+            Some(0),
+            "clear must decrement every shadow-set hash on the outgoing table"
+        );
+        assert!(!rt.blob_refcount_enabled());
     }
 
     #[tokio::test]

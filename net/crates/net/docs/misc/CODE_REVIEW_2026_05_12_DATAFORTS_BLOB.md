@@ -41,7 +41,7 @@ Tagged `[B | H | M | L]`:
 | B-6   | H   | blob mesh    | `delete_chunk_authorized` strands `RefcountEntry`                      | ✅ (refcount cleanup moved into `delete_chunk` itself so every caller — sweep + peer-initiated authorized — gets the cleanup; sweep_gc's duplicate remove dropped) |
 | B-7   | H   | blob mesh    | `store_chunk` TOCTOU between `is_empty()` and `append()`; no verify     | ✅ (per-hash advisory lock map; idempotent fast-path verifies existing bytes hash to the supplied value; regression tests for concurrent stores + poisoned-prior-write) |
 | B-8   | H   | cli          | `net-blob get --out` has no symlink / traversal guard                  | ✅ (use `OpenOptions::create_new(true)` so an existing path or symlink errors; regression test asserts the CLI preserves an existing file at the output path) |
-| B-9   | M   | greedy       | `set_blob_refcount_table` swap leaks +1's on prior table               | ⬜ |
+| B-9   | M   | greedy       | `set_blob_refcount_table` swap leaks +1's on prior table               | ✅ (swap and clear both decrement the outgoing table for every shadow-set hash; regression tests pin the balance) |
 | B-10  | M   | greedy       | `chain_blob_refs` shadow set unbounded per channel                     | ⬜ |
 | B-11  | M   | placement    | `disk_free_gb` axis can double-place under heartbeat staleness         | ⬜ |
 | B-12  | M   | blob mesh    | `MeshBlobAdapter::fetch` allocates `total_size as usize` upfront       | ⬜ |
