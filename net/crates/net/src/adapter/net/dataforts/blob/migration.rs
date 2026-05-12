@@ -133,6 +133,17 @@ impl<'a> BlobMigrationController<'a> {
     }
 }
 
+/// Per-peer admit budget applied inside one tick of the migration
+/// loop. `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` (256) bounds how many
+/// `heat:blob:` tags a single peer can survive the wire filter
+/// with; without an additional per-peer cap at the controller, a
+/// single adversarial peer could still drive 256 chunk-channel
+/// opens (each spawning a replication runtime) per tick. The
+/// budget caps it at a tighter steady-state number; operators
+/// running honest hot working sets larger than this can construct
+/// the controller manually and call `candidates()` themselves.
+pub const DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK: usize = 32;
+
 /// Outcome of one `drive_blob_migration_tick` pass. Counters give
 /// operators a per-tick view of how many migrations the gravity
 /// loop is admitting / rejecting / failing.
@@ -163,6 +174,15 @@ pub struct BlobMigrationTickReport {
     /// Candidates that admitted the decision but failed at the
     /// `adapter.prefetch` await.
     pub prefetch_errors: u64,
+    /// Candidates that passed every verdict gate but were skipped
+    /// because the per-peer admit budget for this tick was
+    /// exhausted. Operators monitor this counter to detect peers
+    /// trying to drive prefetch-volume amplification past the
+    /// wire-side `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` cap; a high
+    /// rate sustained over many ticks usually means the cap is
+    /// too tight for legitimate working sets and should be
+    /// raised, OR that the peer is adversarial.
+    pub skipped_peer_budget: u64,
 }
 
 impl BlobMigrationTickReport {
@@ -221,6 +241,11 @@ where
     let controller = BlobMigrationController::new(local_caps, capability_index);
     let candidates = controller.candidates();
     let mut report = BlobMigrationTickReport::default();
+    // Per-peer admit count for this tick. Capped at
+    // DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK to bound the
+    // chunk-channel-open amplification a single peer can drive
+    // even after surviving the wire-side heat-tag filter.
+    let mut peer_admits: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
     for candidate in candidates {
         let size = match size_for_hash(candidate.hash) {
             Some(s) => s,
@@ -232,6 +257,12 @@ where
         let verdict = should_migrate_blob_to(local_caps, &candidate.publisher_caps, size);
         match verdict {
             MigrateBlobVerdict::Admit => {
+                let count = peer_admits.entry(candidate.publisher_node_id).or_insert(0);
+                if *count >= DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK {
+                    report.skipped_peer_budget += 1;
+                    continue;
+                }
+                *count += 1;
                 // Build a `BlobRef::Small` from the hash + size —
                 // even when the underlying blob is a Manifest, the
                 // chunk channel for the manifest body hash will
@@ -350,6 +381,11 @@ where
     // the rest of the tick.
     let mut already_prefetched: std::collections::HashSet<[u8; 32]> =
         std::collections::HashSet::new();
+    // Per-peer admit budget — see drive_blob_migration_tick.
+    // Sibling prefetches charge against the heat-emitter peer's
+    // budget too; one heat tag can't smuggle in an unbounded
+    // sibling fan-out.
+    let mut peer_admits: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
     for candidate in candidates {
         let size = match size_for_hash(candidate.hash) {
             Some(s) => s,
@@ -368,6 +404,12 @@ where
         let verdict = should_migrate_blob_to(local_caps, &candidate.publisher_caps, size);
         match verdict {
             MigrateBlobVerdict::Admit => {
+                let count = peer_admits.entry(candidate.publisher_node_id).or_insert(0);
+                if *count >= DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK {
+                    report.skipped_peer_budget += 1;
+                    continue;
+                }
+                *count += 1;
                 let blob_ref = BlobRef::small(
                     format!("mesh://{}", hex32(&candidate.hash)),
                     candidate.hash,
@@ -404,6 +446,12 @@ where
                         should_migrate_blob_to(local_caps, &candidate.publisher_caps, sibling_size);
                     match sibling_verdict {
                         MigrateBlobVerdict::Admit => {
+                            let count = peer_admits.entry(candidate.publisher_node_id).or_insert(0);
+                            if *count >= DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK {
+                                report.skipped_peer_budget += 1;
+                                continue;
+                            }
+                            *count += 1;
                             let blob_ref = BlobRef::small(
                                 format!("mesh://{}", hex32(&sibling_hash)),
                                 sibling_hash,
@@ -716,6 +764,110 @@ mod tests {
         assert_eq!(report.admitted, 0);
         assert_eq!(report.prefetch_errors, 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// Per-peer admit budget: a single peer advertising N >
+    /// DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK heat tags must
+    /// see only the budgeted number reach `adapter.prefetch`. The
+    /// overflow surfaces via `skipped_peer_budget`.
+    #[tokio::test]
+    async fn drive_tick_caps_per_peer_admits_at_budget() {
+        let mut publisher_caps = CapabilitySet::new()
+            .add_tag("dataforts.gravity.scope=mesh")
+            .add_tag("dataforts.greedy.scope=mesh");
+        // Stuff in 2× the budget of distinct blob-heat tags.
+        let flood = DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK * 2;
+        for i in 0..flood {
+            let mut hash = [0u8; 32];
+            hash[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let mut hex = String::with_capacity(64);
+            for b in &hash {
+                use std::fmt::Write;
+                let _ = write!(hex, "{:02x}", b);
+            }
+            publisher_caps.tags.insert(Tag::Reserved {
+                prefix: "heat:".to_string(),
+                body: format!("blob:{}=0.50", hex),
+            });
+        }
+        let index = index_with_peer_heat(77, publisher_caps, 0x77);
+        let local = participating_local("mesh", 128, 1024);
+        let adapter = PrefetchRecorder::new();
+        let calls = adapter.calls.clone();
+        let report = drive_blob_migration_tick(&local, &index, &adapter, |_| Some(1024)).await;
+
+        assert_eq!(
+            report.admitted as usize, DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK,
+            "per-peer admit budget caps the prefetch fan-out"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed) as usize,
+            DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK
+        );
+        assert_eq!(
+            report.skipped_peer_budget as usize,
+            flood - DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK,
+            "overflow tags route into skipped_peer_budget"
+        );
+    }
+
+    /// Two peers each fully use their budget; the per-peer counters
+    /// are independent so total admits = 2 × budget.
+    #[tokio::test]
+    async fn drive_tick_per_peer_budgets_are_independent() {
+        let make_caps_with_heat = |scope: &str, seed_base: u8, count: usize| {
+            let mut caps = CapabilitySet::new()
+                .add_tag(format!("dataforts.gravity.scope={}", scope))
+                .add_tag(format!("dataforts.greedy.scope={}", scope));
+            for i in 0..count {
+                let mut hash = [0u8; 32];
+                hash[0] = seed_base;
+                hash[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+                let mut hex = String::with_capacity(64);
+                for b in &hash {
+                    use std::fmt::Write;
+                    let _ = write!(hex, "{:02x}", b);
+                }
+                caps.tags.insert(Tag::Reserved {
+                    prefix: "heat:".to_string(),
+                    body: format!("blob:{}=0.50", hex),
+                });
+            }
+            caps
+        };
+        let flood = DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK + 4;
+        let index = CapabilityIndex::new();
+        let entity_a = EntityId::from_bytes([0xA1; 32]);
+        let entity_b = EntityId::from_bytes([0xB2; 32]);
+        index.index(
+            crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
+                111,
+                entity_a,
+                1,
+                make_caps_with_heat("mesh", 0xA0, flood),
+            ),
+        );
+        index.index(
+            crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
+                222,
+                entity_b,
+                1,
+                make_caps_with_heat("mesh", 0xB0, flood),
+            ),
+        );
+        let local = participating_local("mesh", 128, 1024);
+        let adapter = PrefetchRecorder::new();
+        let report = drive_blob_migration_tick(&local, &index, &adapter, |_| Some(1024)).await;
+
+        assert_eq!(
+            report.admitted as usize,
+            2 * DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK,
+            "two peers each hit their own budget independently"
+        );
+        assert_eq!(
+            report.skipped_peer_budget as usize,
+            2 * (flood - DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK),
+        );
     }
 
     #[tokio::test]
