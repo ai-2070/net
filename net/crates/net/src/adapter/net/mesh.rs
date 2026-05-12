@@ -1051,6 +1051,22 @@ const DEFAULT_HANDSHAKE_TTL: u8 = 16;
 /// while still bounding count-to-infinity worst cases.
 const MAX_HOPS: u8 = 16;
 
+/// Maximum number of `heat:blob:<hex>=<rate>` reserved tags
+/// accepted from a single peer announcement before the
+/// substrate-side filter starts dropping the overflow. Blob-heat
+/// isn't gated by a `causal:` claim like chain-heat is (the blob
+/// is content-addressed, so a forged hash claim doesn't grant
+/// privileges), but the gravity migration controller consumes
+/// the rate — without a cap, a peer spraying thousands of forged
+/// heat tags forces every healthy node to attempt that many
+/// `adapter.prefetch` calls. The cap bounds the amplification:
+/// at most this many blob-heat tags from any one announcement
+/// reach the capability index. 256 is comfortable for realistic
+/// per-node hot-blob counts (manifests with thousands of chunks
+/// would emit heat per chunk, but in practice a node's working
+/// set is well under this bound).
+const MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE: usize = 256;
+
 /// Multi-peer mesh node.
 ///
 /// Composes `NetSession` (per-peer encryption), `NetRouter` (forwarding),
@@ -5082,15 +5098,31 @@ impl MeshNode {
                 }
             }
         }
+        // Per-announce cap on `heat:blob:*` tags. Blob-heat is
+        // intentionally not gated by a `causal:` claim (the blob
+        // is content-addressed, so a forged hash just produces a
+        // useless prefetch attempt). But the gravity migration
+        // controller consumes the *rate* via
+        // `should_migrate_blob_to`, so a peer spraying thousands
+        // of `heat:blob:<random>=1.0` tags would force every
+        // healthy node to attempt that many prefetches. The cap
+        // bounds the amplification: at most
+        // `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags
+        // survive the filter per inbound announcement.
+        let mut blob_heat_budget: usize = MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE;
         caps.tags.retain(|tag| match tag {
             Tag::Reserved { prefix, body } if prefix == "heat:" => {
                 // Blob-heat tags (body shape `blob:<hex64>=<rate>`)
                 // ride a separate trust model: the blob is
                 // content-addressed, so a forged claim just causes
                 // a useless prefetch attempt at worst (no data
-                // corruption, no traffic redirection). Let them
-                // through. PR-5j-c emission shape.
+                // corruption, no traffic redirection). Allow up
+                // to the per-announce cap; drop the overflow.
                 if body.starts_with("blob:") {
+                    if blob_heat_budget == 0 {
+                        return false;
+                    }
+                    blob_heat_budget -= 1;
                     return true;
                 }
                 // Chain-heat shape: `<hex>=<rate>`. Hex is everything
@@ -10311,5 +10343,54 @@ mod chain_helper_tests {
             .tags
             .iter()
             .any(|t| MeshNode::is_causal_for(t, &owned_hex)));
+    }
+
+    /// Regression for the heat:blob DoS surface. A peer injects
+    /// >`MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags into a
+    /// single announcement; the filter drops the overflow. The
+    /// cap bounds the migration-controller amplification (each
+    /// surviving heat tag drives an `adapter.prefetch` attempt).
+    #[cfg(feature = "dataforts")]
+    #[test]
+    fn filter_unauthorized_heat_tags_caps_blob_heat_flood_per_announce() {
+        let mut caps = CapabilitySet::default();
+        // Stuff in 2× the cap of distinct blob-heat tags.
+        let flood = MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE * 2;
+        for i in 0..flood {
+            let mut hash = [0u8; 32];
+            // Pack the index into bytes 0..8 so each hash is
+            // distinct without needing a hash function.
+            hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let hex = MeshNode::blob_hex(&hash);
+            caps.tags.insert(Tag::Reserved {
+                prefix: "heat:".to_string(),
+                body: format!("blob:{hex}=1.00"),
+            });
+        }
+        // Sanity: every distinct tag landed in the HashSet.
+        let pre_filter = caps
+            .tags
+            .iter()
+            .filter(|t| {
+                matches!(t, Tag::Reserved { prefix, body }
+                if prefix == "heat:" && body.starts_with("blob:"))
+            })
+            .count();
+        assert_eq!(pre_filter, flood);
+
+        MeshNode::filter_unauthorized_heat_tags(&mut caps);
+
+        let post_filter = caps
+            .tags
+            .iter()
+            .filter(|t| {
+                matches!(t, Tag::Reserved { prefix, body }
+                if prefix == "heat:" && body.starts_with("blob:"))
+            })
+            .count();
+        assert_eq!(
+            post_filter, MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE,
+            "filter must drop blob-heat tags past the per-announce cap"
+        );
     }
 }
