@@ -4,12 +4,15 @@
 
 ## Status
 
-**Design-locked, prereqs-blocked.** All seven open design questions are ratified — see [Locked decisions](#locked-decisions). Activation gate (when implementation starts) requires two things still outstanding:
+**Design-locked, prereqs-shipped, awaits consumer workload.** All seven open design questions are ratified — see [Locked decisions](#locked-decisions). The substrate prereqs are all in code:
 
-1. **A concrete consumer workload.** Realistic triggers: incident-investigation tooling that needs cross-site joins; replay debugging on retained chain history; aggregate analytics over a fleet of operators; lineage-aware audit + compliance reporting; AI-trained-on-mesh-data fine-tuning that needs to query across forked experiments. Hermes telemetry + Deck metrics are the near-term candidate consumers; until one of them generates production telemetry that needs federated queries, Phase A stays parked.
-2. **`CAPABILITY_SYSTEM_PLAN.md` shipped in code.** MeshDB's planner composes against `filter` / `match_axis` / `traverse` / `aggregate` / `nearest` and the `fork-of:` propagation. Spec is locked; implementation hasn't shipped. Without those primitives in code, MeshDB has nothing to plan against.
+- **Capability System primitives** — `filter` / `match_axis` / `traverse` / `aggregate` / `nearest` ship as the `CapabilityQuery` trait with a reference impl on `CapabilityIndex` (`src/adapter/net/behavior/query.rs`). `fork-of:` is emitted via `CapabilitySet::from_fork` (`capability.rs:1093`), reserved-prefix-enforced at `tag.rs:126`, walked by `traverse` with cycle detection. The Capability System plan's phase markers lag the code; see that plan's Status for the audit. Minor signature drift from this plan to reconcile at implementation time: `traverse` takes an explicit `start_node`, `nearest` takes an `rtt_lookup` closure, the aggregator trait uses `observe / finalize` instead of `fold`.
+- **`REDEX_DISTRIBUTED_PLAN.md`** — all phases shipped; replication makes time-travel queries tractable today.
+- **`CORTEX_ADAPTER_PLAN.md`** — shipped and exceeds spec; `CortexAdapter<State>` + `RedexFold<State>` + `watch` / `snapshot_and_watch` / `changes_with_lag()` all in code. MeshDB at the caller side can compose against today's surface without new traits.
 
-This phase remains the heaviest one in the deferred-work surface. **Do not start without a concrete consumer.** Premature MeshDB is exactly the kind of substrate-engineering ego-spending that this plan is structured to avoid until activation.
+The only remaining activation blocker is **a concrete consumer workload**. Realistic triggers: incident-investigation tooling that needs cross-site joins; replay debugging on retained chain history; aggregate analytics over a fleet of operators; lineage-aware audit + compliance reporting; AI-trained-on-mesh-data fine-tuning that needs to query across forked experiments. Hermes telemetry + Deck metrics are the near-term candidate consumers; until one of them generates production telemetry that needs federated queries, Phase A stays parked.
+
+This phase remains the heaviest one in the deferred-work surface. **Do not start without a concrete consumer.** Premature MeshDB is exactly the kind of substrate-engineering ego-spending that this plan is structured to avoid until activation. Net-new MeshDB-specific surfaces (push-down fold-on-relay; row-at-a-time `Stream<Item = ResultRow>` plumbing alongside the existing `Vec<T>`-shaped streams) land in Phases A–E as their respective operators need them.
 
 ## Frame
 
