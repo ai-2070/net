@@ -289,9 +289,9 @@ impl ChannelRegistry {
     /// Returns the full collision set rather than collapsing to `None` on
     /// collision — the receive-side caller wants to enumerate every
     /// canonical that could have stamped this wire hash. This is the
-    /// opposite of [`ChannelConfigRegistry::get_by_wire_hash`], which
-    /// returns `None` on collision because the config caller wants a
-    /// single safe policy decision.
+    /// opposite of [`super::ChannelConfigRegistry::get_by_wire_hash`],
+    /// which returns `None` on collision because the config caller wants
+    /// a single safe policy decision.
     pub fn get_all_by_wire_hash(&self, wire_hash: u16) -> Vec<ChannelId> {
         self.by_wire_hash
             .get(&wire_hash)
