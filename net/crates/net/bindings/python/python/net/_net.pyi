@@ -762,7 +762,7 @@ class NetMesh:
         """Subscribe to `channel` on `publisher_node_id`.
 
         Optional ``token`` is the serialized ``PermissionToken`` bytes
-        (159 bytes) — attach it when the publisher set
+        (161 bytes) — attach it when the publisher set
         ``require_token=True`` on the channel, or when the caller's
         caps don't satisfy ``subscribe_caps`` on their own.
 
@@ -894,7 +894,7 @@ class Identity:
     ) -> bytes:
         """Issue a scoped token to ``subject`` (32-byte entity id).
         Scope is a subset of ``['publish', 'subscribe', 'admin',
-        'delegate']``. Returns the 159-byte serialized
+        'delegate']``. Returns the 161-byte serialized
         ``PermissionToken``."""
         ...
     def install_token(self, token: bytes) -> None:

@@ -343,7 +343,7 @@ const token = identity.issueToken({
   delegationDepth: 0,          // 0 forbids re-delegation
 });
 
-// `token.bytes` is the transport-ready 159-byte blob.
+// `token.bytes` is the transport-ready 161-byte blob.
 // Ship it to the grantee; they hand it back on subscribe.
 ```
 

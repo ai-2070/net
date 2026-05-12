@@ -562,7 +562,7 @@ Errors: `ChannelAuthError` (from [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md
 ### Python (Stage F) — SHIPPED
 
 PyO3 surface mirrors Stage A–E. `PermissionToken` crosses the
-boundary as `bytes` (opaque 159-byte). `Identity` is a `#[pyclass]`.
+boundary as `bytes` (opaque 161-byte). `Identity` is a `#[pyclass]`.
 Errors: `IdentityError`, `TokenError` subclasses of Python's builtin
 `Exception`. The `TokenError` message has the form `"token: <kind>"`
 — programmatic callers parse with
@@ -854,7 +854,7 @@ wire format + signature invariance across hop bumps.
 
 ### Cross-SDK consistency
 
-- **Token wire format stability.** `PermissionToken` is 159 bytes today. Once SDKs expose `toBytes()` / `fromBytes()` any change to the layout is a breaking change across every SDK simultaneously. Add a version byte at position 0 before Stage B ships (mirrors the `NetDbBundle` version-byte ask from [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md)).
+- **Token wire format stability.** `PermissionToken` is 161 bytes today. Once SDKs expose `toBytes()` / `fromBytes()` any change to the layout is a breaking change across every SDK simultaneously. Add a version byte at position 0 before Stage B ships (mirrors the `NetDbBundle` version-byte ask from [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md)).
 - **Scope bitfield extension.** The four scopes today (`PUBLISH`, `SUBSCRIBE`, `ADMIN`, `DELEGATE`) consume 4 bits. Explicitly reserve bits 4–7 for future expansion and have SDKs ignore (with warning) any bits they don't recognize.
 
 ### Performance

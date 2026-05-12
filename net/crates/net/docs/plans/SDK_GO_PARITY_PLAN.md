@@ -39,7 +39,7 @@ Current Go state (from a fresh survey of
 
 - Greenfield C-ABI exports for ed25519 identity + token helpers (parse
   / verify / delegate / channel-hash / issue / install / lookup).
-  Tokens cross the boundary as raw `uint8_t*` buffers (159 bytes);
+  Tokens cross the boundary as raw `uint8_t*` buffers (161 bytes);
   entity ids as `uint8_t*` (32 bytes).
 - Greenfield C-ABI exports for capabilities (announce / find_nodes)
   and subnets (config extension on `net_mesh_new`). Capability sets,

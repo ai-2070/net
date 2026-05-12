@@ -128,9 +128,9 @@ function runMapped<T>(fn: () => T): T {
  * A signed, delegatable permission token. Construct via
  * `Identity.issueToken` (locally) or `Token.parse` (from wire bytes).
  *
- * The wire form is 159 bytes: issuer (32) + subject (32) + scope (4)
- * + channel hash (2) + not-before (8) + not-after (8) + delegation
- * depth (1) + nonce (8) + ed25519 signature (64).
+ * The wire form is 161 bytes: issuer (32) + subject (32) + scope (4)
+ * + channel hash (4, canonical 32-bit) + not-before (8) + not-after
+ * (8) + delegation depth (1) + nonce (8) + ed25519 signature (64).
  */
 export class Token {
   /** Raw serialized bytes. Safe to send over the wire. */
@@ -139,9 +139,10 @@ export class Token {
   readonly subject: Buffer;
   readonly scope: ReadonlySet<TokenScope>;
   /**
-   * u16 hash of the channel name this token authorizes. 0 = wildcard
-   * (all channels). Compare against `channelHash(name)` to check
-   * whether a token applies to a named channel.
+   * Canonical 32-bit hash of the channel name this token authorizes
+   * (combine with `wildcard` scope for cross-channel grants). Compare
+   * against `channelHash(name)` to check whether a token applies to a
+   * named channel.
    */
   readonly channelHash: number;
   readonly notBefore: Date;

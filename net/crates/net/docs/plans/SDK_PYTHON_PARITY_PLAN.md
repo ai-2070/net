@@ -88,7 +88,7 @@ parsing `str(e)`.
 
 ### Token + EntityId on the wire
 
-Match NAPI: tokens cross the boundary as `bytes` (the 159-byte
+Match NAPI: tokens cross the boundary as `bytes` (the 161-byte
 serialized `PermissionToken`). `EntityId` is a 32-byte `bytes`
 value. `Identity.issue_token` returns `bytes`; `install_token` /
 `lookup_token` consume / produce them. No Python-side `Token`

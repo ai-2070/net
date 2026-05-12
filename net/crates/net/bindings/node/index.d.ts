@@ -312,7 +312,7 @@ export declare class Identity {
   sign(message: Buffer): Buffer
   /**
    * Issue a scoped permission token to `subject`. Returns the
-   * 159-byte serialized token as a Buffer; hand it to the
+   * 161-byte serialized token as a Buffer; hand it to the
    * subscriber who will then call `installToken(bytes)`.
    *
    * `scope` is a subset of `["publish", "subscribe", "admin",
@@ -814,7 +814,7 @@ export declare class NetMesh {
    * or the membership-ack timeout elapses.
    *
    * Optional `token` is the serialized `PermissionToken` bytes
-   * (159 bytes) — attach it when the publisher set
+   * (161 bytes) — attach it when the publisher set
    * `requireToken = true` on the channel, or when the caller's
    * caps don't satisfy `subscribeCaps` on their own.
    */

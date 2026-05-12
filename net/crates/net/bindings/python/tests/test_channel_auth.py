@@ -128,7 +128,7 @@ def test_publish_open_channel_no_caps_enforced() -> None:
 def test_subscribe_channel_rejects_malformed_token_bytes() -> None:
     m = NetMesh(_port(7), PSK)
     try:
-        # 16 bytes is far too short for a 159-byte PermissionToken —
+        # 16 bytes is far too short for a 161-byte PermissionToken —
         # `from_bytes` must reject with `TokenError(invalid_format)`
         # *before* any membership request is dispatched, so there's
         # no network timeout to wait through.
@@ -140,7 +140,7 @@ def test_subscribe_channel_rejects_malformed_token_bytes() -> None:
 
 
 def test_subscribe_channel_accepts_structurally_valid_token() -> None:
-    # A well-formed, signed 159-byte token reaches the transport —
+    # A well-formed, signed 161-byte token reaches the transport —
     # structural parse succeeds client-side, so the failure we see
     # is a `ChannelError` for the missing peer rather than a
     # `TokenError`. Signature verification happens server-side; full

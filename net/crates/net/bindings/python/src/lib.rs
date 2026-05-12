@@ -1630,7 +1630,7 @@ mod mesh_bindings {
         /// arrives or the membership-ack timeout elapses.
         ///
         /// Optional `token` is the serialized `PermissionToken`
-        /// bytes (159 bytes) — attach it when the publisher sets
+        /// bytes (161 bytes) — attach it when the publisher sets
         /// `require_token=True` on the channel, or when the
         /// caller's caps don't satisfy `subscribe_caps` on their
         /// own.

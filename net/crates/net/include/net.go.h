@@ -514,7 +514,7 @@ int      net_mesh_subscribe_channel(net_meshnode_t* handle,
                                     uint64_t publisher_node_id,
                                     const char* channel);
 
-/* Subscribe with a serialized `PermissionToken` (159 bytes) attached.
+/* Subscribe with a serialized `PermissionToken` (161 bytes) attached.
  * Required when the publisher set `require_token=true`, or when the
  * subscriber's announced caps don't satisfy `subscribe_caps`. Parses
  * the token client-side — malformed bytes return
