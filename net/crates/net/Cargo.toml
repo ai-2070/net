@@ -294,6 +294,16 @@ name = "integration_placement_filter_callback"
 path = "tests/integration_placement_filter_callback.rs"
 required-features = ["net"]
 
+[[test]]
+# `net-blob` CLI integration test. Spawns the bin against a
+# temp persistent dir, exercises put / get / stat / exists /
+# ls / pin / gc / metrics subcommands, and asserts on the
+# observable shape (exit codes, stdout JSON, file bytes).
+# Gated on the same `cli` feature as the bin itself.
+name = "net_blob_cli"
+path = "tests/net_blob_cli.rs"
+required-features = ["cli"]
+
 [profile.release]
 lto = true
 codegen-units = 1

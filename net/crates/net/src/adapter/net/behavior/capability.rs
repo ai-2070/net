@@ -6020,4 +6020,184 @@ mod tests {
             .iter()
             .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "v1-marker")));
     }
+
+    /// Brute-force two distinct `EntityId`s whose wire-form
+    /// `origin_hash` (low 32 bits of the BLAKE2s projection)
+    /// collides. Birthday paradox in a 32-bit space: ~50 %
+    /// collision probability at ~2¹⁶ = 65 k samples; in practice
+    /// a 128 k sample sweep finds one in milliseconds.
+    ///
+    /// Returns `(entity_a, entity_b, wire_origin_hash)`. Both
+    /// entities have node_ids that match their `EntityId::node_id()`
+    /// derivation — both pass `node_id == entity_id.node_id()`
+    /// inside `handle_capability_announcement` — so the colliding
+    /// wire origin_hash is a real semantic concern, not a
+    /// constructible-only edge case.
+    fn find_colliding_entities() -> (
+        super::super::super::identity::EntityId,
+        super::super::super::identity::EntityId,
+        u64,
+    ) {
+        use super::super::super::identity::EntityId;
+        use std::collections::HashMap;
+        let mut seen: HashMap<u32, EntityId> = HashMap::new();
+        for seed in 0u32..1 << 20 {
+            // Derive a varied 32-byte EntityId per seed so the
+            // u32 wire origin_hash space is sampled uniformly.
+            // BLAKE3 of the seed gives us that without an
+            // extra dep.
+            let bytes: [u8; 32] = blake3::hash(&seed.to_le_bytes()).into();
+            let entity = EntityId::from_bytes(bytes);
+            let wire = entity.origin_hash() as u32;
+            if let Some(prev) = seen.get(&wire) {
+                if prev.as_bytes() != entity.as_bytes() {
+                    return (prev.clone(), entity, wire as u64);
+                }
+            }
+            seen.insert(wire, entity);
+        }
+        panic!("no wire-origin_hash collision found in 2^20 trials — birthday paradox math says this should be effectively impossible; check the derivation");
+    }
+
+    /// **Last-writer-wins under wire-origin_hash collision.** Two
+    /// distinct entities whose `EntityId::origin_hash()` truncates
+    /// to the same `u32` end up sharing the same `by_origin_hash`
+    /// slot. The side index is a `HashMap<u64, u64>` (wire-hash →
+    /// node_id), and `index()` calls `insert` unconditionally, so
+    /// the second indexing overwrites the first.
+    ///
+    /// `get_by_origin_hash(wire)` therefore surfaces entity B's
+    /// caps even though entity A also legitimately claims that
+    /// wire-form origin_hash. Entity A's caps remain reachable
+    /// via the `node_id`-keyed `get(node_id_a)` path; only the
+    /// origin_hash → node_id projection is one-to-one against
+    /// the wire, not against the entity.
+    ///
+    /// This is a documented limitation of the wire-format choice:
+    /// `NetHeader::origin_hash` is `u32` (per
+    /// `protocol.rs::NetHeader`), so a true bidirectional
+    /// `entity ↔ wire` mapping isn't possible at this resolution.
+    /// The mesh's authorization paths key on the canonical
+    /// `node_id` / `ChannelHash` (u32 / u64) elsewhere, so a
+    /// collision here doesn't grant either entity privileges
+    /// they didn't already have — it only affects which entity's
+    /// caps the greedy / migration `chain_caps` lookup surfaces.
+    ///
+    /// Pinned as a test so a future reader understands the
+    /// limitation; any refactor that promises true entity-level
+    /// distinguishability must address this collision behavior.
+    #[test]
+    fn get_by_origin_hash_last_writer_wins_on_truncation_collision() {
+        let (entity_a, entity_b, wire) = find_colliding_entities();
+        let node_a: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+        let node_b: u64 = 0xBBBB_BBBB_BBBB_BBBB;
+
+        let index = CapabilityIndex::new();
+        // Index A first.
+        index.index(CapabilityAnnouncement::new(
+            node_a,
+            entity_a.clone(),
+            1,
+            CapabilitySet::new().add_tag("from-A"),
+        ));
+        // Verify A is reachable via origin_hash before B lands.
+        let resolved_a = index
+            .get_by_origin_hash(wire)
+            .expect("A must surface via wire origin_hash before B is indexed");
+        assert!(resolved_a
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "from-A")));
+
+        // Index B with the colliding wire origin_hash.
+        index.index(CapabilityAnnouncement::new(
+            node_b,
+            entity_b.clone(),
+            1,
+            CapabilitySet::new().add_tag("from-B"),
+        ));
+
+        // get_by_origin_hash surfaces B's caps now (last-writer-wins).
+        let resolved = index
+            .get_by_origin_hash(wire)
+            .expect("wire origin_hash must still resolve after collision");
+        assert!(
+            resolved
+                .tags
+                .iter()
+                .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "from-B")),
+            "second indexer (B) must win the side-index slot under truncation collision"
+        );
+        assert!(
+            !resolved
+                .tags
+                .iter()
+                .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "from-A")),
+            "A's caps must NOT surface via origin_hash after B overwrites the slot"
+        );
+
+        // Both entities are still independently indexed under
+        // their distinct node_ids — the collision only affects
+        // the origin_hash → node_id projection, not the
+        // canonical node-keyed view.
+        let direct_a = index
+            .get(node_a)
+            .expect("A's caps must still be reachable via node_id");
+        assert!(direct_a
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "from-A")));
+        let direct_b = index
+            .get(node_b)
+            .expect("B's caps must still be reachable via node_id");
+        assert!(direct_b
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "from-B")));
+    }
+
+    /// `remove(node_a)` after a collision must NOT strand the
+    /// `by_origin_hash` slot pointing at A. The slot now belongs
+    /// to B (last-writer-wins); removing A leaves B's mapping
+    /// intact. The guarded-remove inside `CapabilityIndex::remove`
+    /// keys off `node_id` equality before clearing, so it skips
+    /// the slot when it points at B.
+    #[test]
+    fn remove_under_collision_does_not_strand_winner_slot() {
+        let (entity_a, entity_b, wire) = find_colliding_entities();
+        let node_a: u64 = 0x1111_1111_1111_1111;
+        let node_b: u64 = 0x2222_2222_2222_2222;
+        let index = CapabilityIndex::new();
+        index.index(CapabilityAnnouncement::new(
+            node_a,
+            entity_a,
+            1,
+            CapabilitySet::new().add_tag("a-caps"),
+        ));
+        index.index(CapabilityAnnouncement::new(
+            node_b,
+            entity_b,
+            1,
+            CapabilitySet::new().add_tag("b-caps"),
+        ));
+        // B owns the slot after both are indexed.
+        assert!(index
+            .get_by_origin_hash(wire)
+            .expect("post-index lookup")
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "b-caps")));
+
+        // Now remove A. The side-index entry points at B (not A),
+        // so the guarded `entry.get() == node_id` check fires false
+        // and the slot is preserved.
+        index.remove(node_a);
+        let after = index
+            .get_by_origin_hash(wire)
+            .expect("B's side-index slot must survive A's removal");
+        assert!(after
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "b-caps")));
+    }
 }

@@ -312,4 +312,41 @@ else:
         return body if colon == -1 else body[:colon].strip()
 
 
+# Dataforts blob surface. Present iff the native module was built
+# with the `dataforts` Cargo feature. Includes the v0.15 external-
+# hook adapter helpers (`register_filesystem_blob_adapter`,
+# `blob_publish`, `blob_resolve`) and the v0.2 substrate-owned
+# `MeshBlobAdapter` Python class.
+try:
+    from ._net import (
+        BlobError,
+        BlobRef,
+        MeshBlobAdapter,
+        blob_adapter_ids,
+        blob_adapter_registered,
+        blob_publish,
+        blob_resolve,
+        register_blob_adapter,
+        register_filesystem_blob_adapter,
+        unregister_blob_adapter,
+    )
+except ImportError:
+    pass
+else:
+    __all__.extend(
+        [
+            "BlobError",
+            "BlobRef",
+            "MeshBlobAdapter",
+            "blob_adapter_ids",
+            "blob_adapter_registered",
+            "blob_publish",
+            "blob_resolve",
+            "register_blob_adapter",
+            "register_filesystem_blob_adapter",
+            "unregister_blob_adapter",
+        ]
+    )
+
+
 __version__ = "0.15.0"

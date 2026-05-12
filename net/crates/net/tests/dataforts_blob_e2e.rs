@@ -377,3 +377,268 @@ async fn gravity_migration_controller_fetches_hot_blob() {
         "B's adapter must serve the migrated blob bytes"
     );
 }
+
+/// 3-node parallel migration: A publishes + heats; B and C
+/// **independently** observe A's `heat:blob:` advertisement via
+/// the capability gossip path and each runs
+/// `drive_blob_migration_tick` against its own
+/// `capability_index`. Both call `adapter.prefetch` and end up
+/// holding the chunk through the per-chunk replication runtime.
+///
+/// Demonstrates that the gravity migration loop scales to >2
+/// peers: every peer that observes the heat tag and admits the
+/// `should_migrate_blob_to` verdict independently kicks off its
+/// own pull. The shipped controller (`drive_blob_migration_tick`)
+/// is local-decision-only, so the parallelism is natural — no
+/// coordination across migrators required.
+///
+/// Setup: 3 nodes fully connected. All three adapters configured
+/// with `Pinned([a, b, c])` so the per-chunk replication runtime
+/// recognizes every peer as a valid replica when B / C call
+/// `prefetch`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_node_parallel_migration_lands_blob_on_two_peers() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    let node_c = build_node().await;
+    // Fully-connected mesh: A↔B, A↔C, B↔C. Order matters —
+    // `MeshNode::accept` after `start()` is rejected, so do
+    // every pair-handshake before any `start()`.
+    handshake_no_start(&node_a, &node_b).await;
+    handshake_no_start(&node_a, &node_c).await;
+    handshake_no_start(&node_b, &node_c).await;
+    node_a.start();
+    node_b.start();
+    node_c.start();
+
+    let redex_a = Arc::new(Redex::new());
+    let redex_b = Arc::new(Redex::new());
+    let redex_c = Arc::new(Redex::new());
+    redex_a.enable_replication(node_a.clone());
+    redex_b.enable_replication(node_b.clone());
+    redex_c.enable_replication(node_c.clone());
+
+    let a_id = node_a.node_id();
+    let b_id = node_b.node_id();
+    let c_id = node_c.node_id();
+    let rep_cfg = ReplicationConfig::new()
+        .with_heartbeat_ms(150)
+        .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id, c_id]));
+
+    // A's adapter feeds the heat registry via fetch-path bumps.
+    let heat_registry_a = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
+    let adapter_a = MeshBlobAdapter::new("mesh-a", redex_a.clone())
+        .with_replication(rep_cfg.clone())
+        .with_blob_heat(
+            heat_registry_a.clone(),
+            net::adapter::net::dataforts::blob::DEFAULT_BLOB_HEAT_HALF_LIFE,
+        );
+    let adapter_b =
+        MeshBlobAdapter::new("mesh-b", redex_b.clone()).with_replication(rep_cfg.clone());
+    let adapter_c = MeshBlobAdapter::new("mesh-c", redex_c.clone()).with_replication(rep_cfg);
+
+    // A announces participating caps for B and C's chain_caps
+    // lookup. The mesh gossip path delivers them to every peer's
+    // capability_index.
+    let publisher_caps = CapabilitySet::new()
+        .with_blob_capability(BlobCapability::storage_participating(100, 50))
+        .with_greedy_capability(GreedyCapability {
+            enabled: true,
+            scope: TopologyScope::Mesh,
+            proximity: 128,
+        })
+        .with_gravity_capability(GravityCapability {
+            enabled: true,
+            scope: TopologyScope::Mesh,
+            proximity: 128,
+        });
+    node_a
+        .announce_capabilities(publisher_caps)
+        .await
+        .expect("A announce");
+
+    // Wait for B AND C to learn A's caps before publishing.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        let b_tags = node_b
+            .capability_index()
+            .get(a_id)
+            .map(|c| c.tags.len())
+            .unwrap_or(0);
+        let c_tags = node_c
+            .capability_index()
+            .get(a_id)
+            .map(|c| c.tags.len())
+            .unwrap_or(0);
+        if b_tags >= 9 && c_tags >= 9 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A stores + heats via 8 fetches.
+    let payload = b"three node migration payload".to_vec();
+    let hash: [u8; 32] = blake3::hash(&payload).into();
+    let blob_ref = BlobRef::small(format!("mesh://{:?}", hash), hash, payload.len() as u64);
+    adapter_a.store(&blob_ref, &payload).await.expect("A store");
+    for _ in 0..8 {
+        adapter_a.fetch(&blob_ref).await.expect("A fetch");
+    }
+
+    // A emits `heat:blob:<hex>=<rate>` via tick → capability
+    // rebroadcast → B and C both observe.
+    let policy = DataGravityPolicy::default();
+    let sink: &dyn BlobHeatSink = &*node_a;
+    let emitted = adapter_a
+        .tick_blob_heat(&policy, sink)
+        .await
+        .expect("A tick_blob_heat");
+    assert!(emitted >= 1, "A's tick must emit at least one heat:blob");
+
+    // Wait for the heat:blob tag to land on both B and C.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut b_saw = false;
+    let mut c_saw = false;
+    while tokio::time::Instant::now() < deadline {
+        let blob_heat_present = |idx: &net::adapter::net::behavior::capability::CapabilityIndex| {
+            idx.get(a_id)
+                .map(|c| {
+                    c.tags.iter().any(|t| match t {
+                        net::adapter::net::behavior::tag::Tag::Reserved { prefix, body } => {
+                            prefix == "heat:" && body.starts_with("blob:")
+                        }
+                        _ => false,
+                    })
+                })
+                .unwrap_or(false)
+        };
+        if !b_saw {
+            b_saw = blob_heat_present(node_b.capability_index().as_ref());
+        }
+        if !c_saw {
+            c_saw = blob_heat_present(node_c.capability_index().as_ref());
+        }
+        if b_saw && c_saw {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        b_saw && c_saw,
+        "both B (saw={b_saw}) and C (saw={c_saw}) must surface A's heat:blob tag within 5s"
+    );
+
+    // B and C each run the migration tick independently. Each
+    // builds its own local caps + queries its own capability
+    // index. Both should admit + prefetch.
+    let local_caps_for_migrator = CapabilitySet::new()
+        .with_blob_capability(BlobCapability::storage_participating(100, 50))
+        .with_gravity_capability(GravityCapability {
+            enabled: true,
+            scope: TopologyScope::Mesh,
+            proximity: 128,
+        });
+    let report_b = drive_blob_migration_tick(
+        &local_caps_for_migrator,
+        node_b.capability_index().as_ref(),
+        &adapter_b,
+        |_| Some(payload.len() as u64),
+    )
+    .await;
+    let report_c = drive_blob_migration_tick(
+        &local_caps_for_migrator,
+        node_c.capability_index().as_ref(),
+        &adapter_c,
+        |_| Some(payload.len() as u64),
+    )
+    .await;
+    assert!(
+        report_b.admitted >= 1 && report_c.admitted >= 1,
+        "both B and C must admit the hot blob; got B={report_b:?}, C={report_c:?}"
+    );
+    assert_eq!(
+        report_b.prefetch_errors + report_c.prefetch_errors,
+        0,
+        "no prefetch errors expected"
+    );
+
+    // Drive the per-chunk replication roles for every replica
+    // pair (A leader, B+C replicas). The 2-node helper only
+    // covers two adapters; do all three here inline.
+    let channel = MeshBlobAdapter::chunk_channel_for_hash(&hash);
+    let coord_a = redex_a
+        .replication_coordinator_for(&channel)
+        .expect("coord A");
+    let coord_b = redex_b
+        .replication_coordinator_for(&channel)
+        .expect("coord B");
+    let coord_c = redex_c
+        .replication_coordinator_for(&channel)
+        .expect("coord C");
+    coord_a
+        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+        .await
+        .expect("A → Replica");
+    coord_a
+        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
+        .await
+        .expect("A → Candidate");
+    coord_a
+        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
+        .await
+        .expect("A → Leader");
+    coord_b
+        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+        .await
+        .expect("B → Replica");
+    coord_c
+        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+        .await
+        .expect("C → Replica");
+
+    // Both B and C should converge their chunk files to seq=1
+    // (the Small blob is one event). Use a generous deadline
+    // because the catch-up is heartbeat-driven on a 150ms cadence.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        let b_has = redex_b
+            .get_file(&channel)
+            .map(|f| f.next_seq() >= 1)
+            .unwrap_or(false);
+        let c_has = redex_c
+            .get_file(&channel)
+            .map(|f| f.next_seq() >= 1)
+            .unwrap_or(false);
+        if b_has && c_has {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let fetched_b = adapter_b
+        .fetch(&blob_ref)
+        .await
+        .expect("B fetch (after parallel migration)");
+    let fetched_c = adapter_c
+        .fetch(&blob_ref)
+        .await
+        .expect("C fetch (after parallel migration)");
+    assert_eq!(fetched_b, payload, "B's migrated bytes must equal source");
+    assert_eq!(fetched_c, payload, "C's migrated bytes must equal source");
+}
+
+/// Pair-handshake without `start()` — used by the 3-node test
+/// because `accept()` after `start()` is rejected. The 2-node
+/// tests can call `handshake()` directly which does both;
+/// >2-node topologies need to batch the accepts before any
+/// `start()` lands.
+async fn handshake_no_start(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let b_pub = *b.public_key();
+    let b_addr = b.local_addr();
+    let b_clone = b.clone();
+    let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
+    a.connect(b_addr, &b_pub, b_id).await.expect("connect");
+    accept.await.expect("accept task").expect("accept");
+}
