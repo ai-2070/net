@@ -1,0 +1,29 @@
+net/crates/net/docs/plans/CAPABILITY_SYSTEM_PLAN.md
+  s_3a0a24a47d1a36::t_eb513d371036f5 607-609
+  s_3a0a24a47d1a36::t_e7468ff426035d 650-658
+  s_3a0a24a47d1a36::t_07854676af092e 7-9
+  s_3a0a24a47d1a36::t_2dc59e34ca39fb 696-698
+  s_3a0a24a47d1a36::t_788ba61777de2e 633-635
+  s_3a0a24a47d1a36::t_194d179fab7bd5 666-668
+  s_3a0a24a47d1a36::t_b9ffd9ae096fc9 678-680
+net/crates/net/docs/plans/MESHDB_PLAN.md
+  s_3a0a24a47d1a36::t_01c3725bbcf517 7,9-11,13-15
+net/crates/net/docs/plans/CORTEX_ADAPTER_PLAN.md
+  s_3a0a24a47d1a36::t_1e3a28f830d82a 7-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "5d1670d9a2683777f04092cacfac7e6421cb2110",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
