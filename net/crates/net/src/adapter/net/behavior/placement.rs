@@ -84,6 +84,29 @@ pub enum Artifact<'a> {
         /// veto placement.
         optional: &'a CapabilitySet,
     },
+    /// Blob — placement decisions for Dataforts mesh-native blob
+    /// storage (v0.2 PR-2b). Carries the blob's content hash + size
+    /// so the placement gate can check the candidate's
+    /// `dataforts.blob.disk_free_gb` against the blob's storage cost.
+    /// Stable ordering during ties uses `blob_hash`.
+    ///
+    /// Hard constraints applied in
+    /// [`StandardPlacement::placement_score`]:
+    ///
+    /// - Target carries `dataforts.blob.storage = true`.
+    /// - Target NOT carrying the reserved
+    ///   `dataforts:blob-storage-unhealthy` tag.
+    /// - Target's `dataforts.blob.disk_free_gb` ≥ `size_bytes / 1 GiB`
+    ///   (rounded up).
+    Blob {
+        /// Content-address of the blob — manifest hash for a chunked
+        /// blob; Small-blob hash for a single content-addressed
+        /// payload. Used for stable ordering when ties occur.
+        blob_hash: [u8; 32],
+        /// Total payload size in bytes. Drives the
+        /// `dataforts.blob.disk_free_gb` hard-constraint check.
+        size_bytes: u64,
+    },
 }
 
 /// Substrate-level placement primitive. Trait surface locked by
@@ -523,6 +546,38 @@ impl<'a> PlacementFilter for StandardPlacement<'a> {
                     }
                 }
 
+                // `Artifact::Blob` hard constraints (v0.2 PR-2b):
+                //
+                // 1. Target advertises `dataforts.blob.storage`.
+                // 2. Target does NOT carry the reserved
+                //    `dataforts:blob-storage-unhealthy` tag.
+                // 3. Target's `dataforts.blob.disk_free_gb` is at
+                //    least `ceil(size_bytes / 1 GiB)`.
+                //
+                // Compute / replica / chain artifacts pass through
+                // these checks (the `if let` short-circuits when
+                // the variant doesn't match). The remaining
+                // multi-axis composition (scope / proximity /
+                // intent / colocation / resource / anti-affinity)
+                // still applies — blobs participate in those axes
+                // the same way chains do.
+                if let Artifact::Blob { size_bytes, .. } = artifact {
+                    use super::dataforts_capabilities::{
+                        is_blob_storage_unhealthy, BlobCapability,
+                    };
+                    let blob_caps = BlobCapability::from_capability_set(target_caps);
+                    if !blob_caps.storage {
+                        return None;
+                    }
+                    if is_blob_storage_unhealthy(target_caps) {
+                        return None;
+                    }
+                    let required_gb = size_bytes.div_ceil(1 << 30);
+                    if blob_caps.disk_free_gb < required_gb {
+                        return None;
+                    }
+                }
+
                 // Per-axis scoring (slice 5 of Phase F filled these
                 // in). Each takes the borrowed `&CapabilitySet`.
                 let scope = self.score_scope_axis(target_caps);
@@ -952,6 +1007,13 @@ fn artifact_metadata<'a>(artifact: &'a Artifact<'_>, key: &str) -> Option<&'a st
         } => try_caps(required).or_else(|| try_caps(optional)),
         Artifact::Chain { capabilities, .. } => try_caps(capabilities),
         Artifact::Replica { capabilities, .. } => try_caps(capabilities),
+        // `Artifact::Blob` carries no `CapabilitySet` — declarative
+        // hints (intent / colocate-with) live on the chain that
+        // *references* the blob, not on the blob itself. Return
+        // `None` so the metadata-driven axes (intent / colocation)
+        // are no-ops for blob placement; the substrate's existing
+        // scope / proximity / disk-free axes do the real work.
+        Artifact::Blob { .. } => None,
     }
 }
 
@@ -3041,6 +3103,115 @@ mod tests {
             capabilities: &replica_caps,
         };
         assert_eq!(placement.placement_score(&0x1111, &replica), Some(1.0));
+    }
+
+    // =====================================================================
+    // v0.2 PR-2b — `Artifact::Blob` placement gating.
+    //
+    // Pins four guarantees:
+    //   1. Target without `dataforts.blob.storage` → hard veto.
+    //   2. Target with `dataforts:blob-storage-unhealthy` reserved
+    //      tag → hard veto (operator-emitted under disk pressure).
+    //   3. Target with insufficient `dataforts.blob.disk_free_gb`
+    //      vs the blob's size → hard veto.
+    //   4. Target satisfying all three → score follows the existing
+    //      multi-axis composition (chain/replica baseline 1.0).
+    // =====================================================================
+
+    fn caps_with_blob_storage(disk_free_gb: u64) -> CapabilitySet {
+        CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag(format!("dataforts.blob.disk_total_gb={}", disk_free_gb))
+            .add_tag(format!("dataforts.blob.disk_free_gb={}", disk_free_gb))
+    }
+
+    #[test]
+    fn standard_blob_placement_rejects_node_without_blob_storage() {
+        // Target node has no `dataforts.blob.storage` tag — placement
+        // hard-vetoes.
+        let index = index_with(&[(0x1111, empty_caps())]);
+        let placement = StandardPlacement::new(&index);
+        let blob = Artifact::Blob {
+            blob_hash: [0xAA; 32],
+            size_bytes: 1024,
+        };
+        assert_eq!(placement.placement_score(&0x1111, &blob), None);
+    }
+
+    #[test]
+    fn standard_blob_placement_admits_storage_participating_node() {
+        // Target has `dataforts.blob.storage` + 100 GiB free; 1 KiB
+        // blob fits easily.
+        let index = index_with(&[(0x1111, caps_with_blob_storage(100))]);
+        let placement = StandardPlacement::new(&index);
+        let blob = Artifact::Blob {
+            blob_hash: [0xBB; 32],
+            size_bytes: 1024,
+        };
+        let score = placement.placement_score(&0x1111, &blob);
+        assert!(score.is_some(), "expected placement to admit, got {:?}", score);
+        // Default multi-axis composition without other gates is 1.0
+        // — baseline parity with chain/replica passing through.
+        assert_eq!(score, Some(1.0));
+    }
+
+    #[test]
+    fn standard_blob_placement_rejects_insufficient_disk_free() {
+        // Target has `dataforts.blob.storage` but only 2 GiB free;
+        // 10 GiB blob can't fit. Hard veto.
+        let index = index_with(&[(0x1111, caps_with_blob_storage(2))]);
+        let placement = StandardPlacement::new(&index);
+        let blob = Artifact::Blob {
+            blob_hash: [0xCC; 32],
+            size_bytes: 10 * (1 << 30), // 10 GiB
+        };
+        assert_eq!(placement.placement_score(&0x1111, &blob), None);
+    }
+
+    #[test]
+    fn standard_blob_placement_rejects_unhealthy_node() {
+        // Target advertises `dataforts.blob.storage` + ample disk, but
+        // also carries the unhealthy health-gate tag → hard veto.
+        // `add_tag` rejects reserved-prefix strings — insert the
+        // `Tag::Reserved` directly to bypass the application-facing
+        // parser.
+        let mut unhealthy_caps = CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=100");
+        unhealthy_caps.tags.insert(crate::adapter::net::behavior::Tag::Reserved {
+            prefix: "dataforts:".to_owned(),
+            body: "blob-storage-unhealthy".to_owned(),
+        });
+        let index = index_with(&[(0x1111, unhealthy_caps)]);
+        let placement = StandardPlacement::new(&index);
+        let blob = Artifact::Blob {
+            blob_hash: [0xDD; 32],
+            size_bytes: 1024,
+        };
+        assert_eq!(placement.placement_score(&0x1111, &blob), None);
+    }
+
+    #[test]
+    fn standard_blob_placement_disk_free_gb_rounds_up() {
+        // 1.5 GiB blob requires `ceil(1.5 GiB / 1 GiB) = 2` free
+        // GiB. Pin the rounding-up direction — under-counting would
+        // admit a placement that overflows the disk.
+        let one_and_a_half_gib: u64 = (1 << 30) + (1 << 29);
+
+        // 1 GiB free → too small, veto.
+        let index = index_with(&[(0x2222, caps_with_blob_storage(1))]);
+        let placement = StandardPlacement::new(&index);
+        let blob = Artifact::Blob {
+            blob_hash: [0xEE; 32],
+            size_bytes: one_and_a_half_gib,
+        };
+        assert_eq!(placement.placement_score(&0x2222, &blob), None);
+
+        // 2 GiB free → fits, admit.
+        let index2 = index_with(&[(0x3333, caps_with_blob_storage(2))]);
+        let placement2 = StandardPlacement::new(&index2);
+        assert!(placement2.placement_score(&0x3333, &blob).is_some());
     }
 
     // =====================================================================

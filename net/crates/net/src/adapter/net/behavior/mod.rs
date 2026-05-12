@@ -16,6 +16,7 @@ pub mod bloom;
 pub mod broadcast;
 pub mod capability;
 pub mod context;
+pub mod dataforts_capabilities;
 pub mod diff;
 pub mod loadbalance;
 pub mod metadata;
@@ -45,6 +46,11 @@ pub use capability::{
     CardinalityCache, CardinalityProvider, GpuInfo, GpuVendor, HardwareCapabilities, IndexedNode,
     MetadataChange, Modality, ModelCapability, ResourceLimits, Signature64, SoftwareCapabilities,
     ToolCapability,
+};
+
+pub use dataforts_capabilities::{
+    is_blob_storage_unhealthy, BlobCapability, GravityCapability, GreedyCapability, TopologyScope,
+    BLOB_STORAGE_UNHEALTHY_TAG,
 };
 
 // Capability System Plan Phase A foundations — the new typed-tag
