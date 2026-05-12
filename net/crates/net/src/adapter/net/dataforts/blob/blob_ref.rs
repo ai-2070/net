@@ -483,6 +483,33 @@ impl BlobRef {
     }
 
     fn decode_manifest(version: u8, rest: &[u8]) -> Result<Self, BlobError> {
+        // Bound the wire size BEFORE postcard allocates the
+        // `Vec<ChunkRef>`. Otherwise a malicious peer can stamp
+        // the chunks-length varint up to ~u32::MAX, forcing a
+        // multi-MB Vec allocation before our post-decode cap
+        // check at line ~25 below fires. The legitimate upper
+        // bound for a well-formed manifest body is:
+        //
+        //   uri (≤ 8 KiB after the substrate's outer length cap)
+        //   + 1 byte encoding discriminant
+        //   + 1 byte body_version
+        //   + ≤ 10 bytes total_size varint
+        //   + ≤ 5 bytes chunks-len varint (covers u32::MAX, far above our cap)
+        //   + BLOB_MANIFEST_MAX_CHUNKS chunks × ≤ 50 bytes max
+        //     each (32 hash + 5 size varint + 10 offset varint +
+        //     framing slack)
+        //
+        // Round up generously to a static upper bound. Anything
+        // past this is by construction malformed; reject without
+        // touching the allocator.
+        const MAX_MANIFEST_WIRE_BYTES: usize = 8192 + 32 + BLOB_MANIFEST_MAX_CHUNKS * 50;
+        if rest.len() > MAX_MANIFEST_WIRE_BYTES {
+            return Err(BlobError::Decode(format!(
+                "manifest body {} bytes exceeds legitimate upper bound {}",
+                rest.len(),
+                MAX_MANIFEST_WIRE_BYTES
+            )));
+        }
         let body: ManifestBody = postcard::from_bytes(rest)
             .map_err(|e| BlobError::Decode(format!("manifest body decode failed: {}", e)))?;
         if body.body_version != BLOB_MANIFEST_BODY_VERSION {

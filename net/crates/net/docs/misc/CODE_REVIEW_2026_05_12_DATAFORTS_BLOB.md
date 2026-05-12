@@ -50,15 +50,15 @@ Tagged `[B | H | M | L]`:
 | B-15  | M   | error model  | `BlobError::Backend("auth: ...")` catch-all for misconfig + 401        | ✅ (new `BlobError::Unauthorized(String)` variant; thread through admission + the three `*_authorized` adapter methods; FFI maps to `NET_ERR_BLOB_UNAUTHORIZED` (-120); tests tightened) |
 | B-16  | M   | blob mesh    | `sync_blob` partial-progress on failure with no rollback contract      | ✅ (doc-only — recovery contract pinned: retry at same durability before falling back to weaker level; sync_blob is idempotent so a retry is safe) |
 | B-17  | M   | migration    | `candidates()` clones full `CapabilitySet` per heat tag                | ✅ (cache peer caps once per peer in pass 1; clone once per candidate at emission rather than per heat tag) |
-| B-18  | L   | blob ref     | Manifest postcard decode allocates `Vec<ChunkRef>` before cap-check    | ⬜ |
-| B-19  | L   | gravity      | `with_cap(0)` "disables bound" is a footgun on typo                    | ⬜ |
-| B-20  | L   | capability   | `parse_wire` silently drops unknown scope tokens → default `Mesh`      | ⬜ |
-| B-21  | L   | cli          | `parse_duration` overflows on huge `n` without `checked_mul`           | ⬜ |
-| B-22  | L   | cli          | `--format` accepted but ignored by `cmd_metrics` and `cmd_get`         | ⬜ |
-| B-23  | L   | hygiene      | Two private copies of `hex32` (`migration.rs` ≡ `mesh.rs`)             | ⬜ |
-| B-24  | L   | tests        | `pin_then_ls_in_process_shows_pinned_entry` never invokes `ls`         | ⬜ |
-| B-25  | L   | blob mesh    | `chunk_exists` opens the channel (replication side-effect on probe)    | ⬜ |
-| B-26  | L   | docs         | parking_lot mutex "poisoning" comments are inaccurate                  | ⬜ |
+| B-18  | L   | blob ref     | Manifest postcard decode allocates `Vec<ChunkRef>` before cap-check    | ✅ (defensive wire-size upper bound rejects oversized frames before `postcard::from_bytes`) |
+| B-19  | L   | gravity      | `with_cap(0)` "disables bound" is a footgun on typo                    | ✅ (added `with_cap_unbounded()` helper for the explicit-unbounded intent; `with_cap` doc warns about the typo footgun) |
+| B-20  | L   | capability   | `parse_wire` silently drops unknown scope tokens → default `Mesh`      | ✅ (tracing::warn on every unknown scope token at `from_capability_set` time so operator typos are visible) |
+| B-21  | L   | cli          | `parse_duration` overflows on huge `n` without `checked_mul`           | ✅ (checked_mul against the unit multiplier; returns typed overflow error) |
+| B-22  | L   | cli          | `--format` accepted but ignored by `cmd_metrics` and `cmd_get`         | ✅ (both subcommands reject `--format json` explicitly rather than ignoring it) |
+| B-23  | L   | hygiene      | Two private copies of `hex32` (`migration.rs` ≡ `mesh.rs`)             | ✅ (single `pub(crate) fn hex32` in `dataforts::blob::mod.rs`; both modules now `use super::hex32`) |
+| B-24  | L   | tests        | `pin_then_ls_in_process_shows_pinned_entry` never invokes `ls`         | ✅ (renamed to `pin_and_unpin_subcommands_acknowledge_in_separate_processes` so name matches body) |
+| B-25  | L   | blob mesh    | `chunk_exists` opens the channel (replication side-effect on probe)    | ✅ (doc note on `chunk_exists` calling out the replication side effect) |
+| B-26  | L   | docs         | parking_lot mutex "poisoning" comments are inaccurate                  | ✅ (rewrite to mention `!Send` across `.await` — the actual concern correctly addressed by explicit scoping) |
 
 ## Findings
 

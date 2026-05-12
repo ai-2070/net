@@ -633,16 +633,7 @@ where
     report
 }
 
-/// Helper to format a chunk hash as a 64-char hex string.
-/// Local to this module so we don't widen the public surface.
-fn hex32(hash: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for b in hash {
-        use std::fmt::Write;
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
-}
+use super::hex32;
 
 #[cfg(test)]
 mod tests {

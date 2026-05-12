@@ -27,6 +27,20 @@ pub mod publish_with_blob;
 pub mod refcount;
 pub mod registry;
 
+/// Format a 32-byte content hash as the lowercase 64-char hex
+/// string used throughout the blob layer for channel names,
+/// `mesh://<hex>` URIs, log lines, and operator output. Single
+/// definition shared by every module that needs the rendering —
+/// `mesh.rs`, `migration.rs`, `metrics.rs`, etc.
+pub(crate) fn hex32(hash: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in hash {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
 pub use adapter::{BlobAdapter, BlobStat};
 pub use admission::{
     auth_allows_blob_op, should_migrate_blob_to, should_pull_blob, MigrateBlobReject,

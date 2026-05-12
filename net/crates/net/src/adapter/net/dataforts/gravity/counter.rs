@@ -184,11 +184,25 @@ impl HeatRegistry {
     /// Empty registry with an explicit cap. `cap == 0` disables
     /// the bound (use only when an external loop guarantees
     /// bounded entries — typically the greedy cache wiring).
+    ///
+    /// **Footgun**: passing `0` silently turns off memory
+    /// bounding on the registry. Prefer
+    /// [`Self::with_cap_unbounded`] when that is the intent so
+    /// the reader of the call site can tell unbounded-by-design
+    /// apart from "operator typo dropped the cap to zero."
     pub fn with_cap(cap: usize) -> Self {
         Self {
             counters: HashMap::new(),
             cap,
         }
+    }
+
+    /// Empty registry with the cap explicitly disabled. Use when
+    /// an external loop (typically the greedy cache wiring)
+    /// guarantees bounded entries and the registry just rides
+    /// along.
+    pub fn with_cap_unbounded() -> Self {
+        Self::with_cap(0)
     }
 
     /// Configured cap. `0` means unbounded.
@@ -340,11 +354,24 @@ impl BlobHeatRegistry {
     /// the bound — only safe when an external loop guarantees
     /// bounded entries (e.g. an adapter that prunes on chunk
     /// delete).
+    ///
+    /// **Footgun**: passing `0` silently turns off memory
+    /// bounding. Prefer [`Self::with_cap_unbounded`] when that
+    /// is the intent so a call-site reader can tell intentional
+    /// unboundedness apart from an operator typo.
     pub fn with_cap(cap: usize) -> Self {
         Self {
             counters: HashMap::new(),
             cap,
         }
+    }
+
+    /// Empty registry with the cap explicitly disabled. Use when
+    /// an external loop guarantees bounded entries (e.g. an
+    /// adapter that prunes on chunk delete) and the registry is
+    /// just riding along.
+    pub fn with_cap_unbounded() -> Self {
+        Self::with_cap(0)
     }
 
     /// Configured cap. `0` means unbounded.

@@ -243,8 +243,10 @@ impl MeshBlobAdapter {
 
     /// Bump the heat counters for every chunk hash a fetch
     /// touched. No-op when no registry is wired. Pure side-effect
-    /// — returns nothing; failure to acquire the lock would be a
-    /// poisoned mutex, which is itself a bug worth panicking on.
+    /// — returns nothing. The registry's lock is a parking_lot
+    /// `Mutex` which does NOT poison on panic, so any panic
+    /// inside another holder leaves the registry usable; we
+    /// acquire unconditionally without any poison handling.
     fn bump_heat(&self, hashes: &[[u8; 32]]) {
         if let Some(reg) = self.blob_heat.as_ref() {
             let now = std::time::Instant::now();
@@ -267,9 +269,13 @@ impl MeshBlobAdapter {
     /// No-op (`Ok(0)`) when no registry is wired. The emission
     /// snapshot is taken under the registry lock; the lock is
     /// released *before* awaiting the sink, so a concurrent
-    /// `fetch` on this adapter can keep bumping heat in parallel
-    /// (a parking_lot mutex held across `.await` would otherwise
-    /// poison reachability).
+    /// `fetch` on this adapter can keep bumping heat in parallel.
+    /// The lock is `!Send` across `.await` — holding it past an
+    /// `await` would also break the runtime's task model (a task
+    /// rescheduled to a different worker while holding a thread-
+    /// affine guard) — which is the real concern. parking_lot
+    /// mutexes don't poison; the explicit scoping below is about
+    /// preserving `Send` for the awaited future.
     pub async fn tick_blob_heat(
         &self,
         policy: &crate::adapter::net::dataforts::gravity::DataGravityPolicy,
@@ -945,6 +951,18 @@ impl MeshBlobAdapter {
     /// Local-storage existence probe — checks the chunk file is open
     /// with non-zero length. Sync; the `BlobAdapter::exists` async
     /// wrapper above just routes here.
+    ///
+    /// Side effect: when the adapter is configured with
+    /// [`MeshBlobAdapter::with_replication`], the underlying
+    /// `Redex::open_file` registers the chunk channel with the
+    /// replication runtime as part of the open. A pure
+    /// "probe-without-side-effects" semantic would require a
+    /// `stat`-only path that doesn't go through `open_file`;
+    /// today, an `exists` query on a not-yet-locally-resident
+    /// hash will cause the substrate to begin advertising +
+    /// pulling that hash. Callers running long-tail existence
+    /// scans against an arbitrarily-large hash list should be
+    /// aware that the side effect compounds.
     fn chunk_exists(&self, hash: &[u8; 32]) -> Result<bool, BlobError> {
         let channel = Self::chunk_channel(hash);
         let cfg = self.chunk_file_config();
@@ -994,14 +1012,7 @@ impl MeshBlobAdapter {
     }
 }
 
-fn hex32(bytes: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
-}
+use super::hex32;
 
 /// Wall-clock unix milliseconds. Used for refcount-table
 /// `first_seen` / `last_seen` stamps. Saturates at 0 if the system

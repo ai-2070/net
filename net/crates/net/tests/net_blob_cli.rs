@@ -320,15 +320,13 @@ fn metrics_emits_prometheus_text_with_dataforts_blob_prefix() {
 // ============================================================================
 
 #[test]
-fn pin_then_ls_in_process_shows_pinned_entry() {
+fn pin_and_unpin_subcommands_acknowledge_in_separate_processes() {
     let tmp = TempDir::new("pin-chain");
-    // The CLI's refcount table resets per-process, so the only
-    // way to observe a pin via `ls` is to chain the two ops in
-    // the same invocation. `net-blob` doesn't support compound
-    // subcommands today; we exercise the per-op behavior
-    // separately and pin the in-session shape via the unit
-    // tests inside the bin's source. Here we just verify the
-    // pin subcommand prints its acknowledgment.
+    // The CLI's refcount table resets per-process — pin in one
+    // invocation, ls in another, and the entry is gone. We can't
+    // observe a pin via a follow-up `ls` across invocations
+    // today. This test pins the per-op acknowledgment shape:
+    // `pin` and `unpin` both echo the hash in their output.
     let known = "0".repeat(64);
     let pin_out = run_net_blob(tmp.path(), &["pin", &known]);
     assert!(

@@ -291,6 +291,13 @@ impl GreedyCapability {
                     "greedy.scope" => {
                         if let Some(s) = TopologyScope::parse_wire(value) {
                             out.scope = s;
+                        } else {
+                            tracing::warn!(
+                                tag = "dataforts.greedy.scope",
+                                value = value.as_str(),
+                                "dataforts capability parse: unknown scope token; falling back to \
+                                 default (Mesh). Valid wire values: node / zone / region / mesh."
+                            );
                         }
                     }
                     "greedy.proximity" => {
@@ -368,6 +375,13 @@ impl GravityCapability {
                     "gravity.scope" => {
                         if let Some(s) = TopologyScope::parse_wire(value) {
                             out.scope = s;
+                        } else {
+                            tracing::warn!(
+                                tag = "dataforts.gravity.scope",
+                                value = value.as_str(),
+                                "dataforts capability parse: unknown scope token; falling back to \
+                                 default (Mesh). Valid wire values: node / zone / region / mesh."
+                            );
                         }
                     }
                     "gravity.proximity" => {

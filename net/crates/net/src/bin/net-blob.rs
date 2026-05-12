@@ -264,8 +264,16 @@ async fn cmd_get(
     hash_hex: &str,
     out_path: Option<&std::path::Path>,
     size: u64,
-    _fmt: OutputFormat,
+    fmt: OutputFormat,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // `get` writes raw blob bytes — JSON formatting isn't
+    // meaningful. Reject explicitly so operators piping into a
+    // JSON consumer see a clear error rather than corrupted bytes.
+    if matches!(fmt, OutputFormat::Json) {
+        return Err(
+            "get: --format json not supported; output is raw bytes (stdout or --out file)".into(),
+        );
+    }
     let hash = parse_hash(hash_hex)?;
     let blob = BlobRef::small(format!("mesh://{}", hex32(&hash)), hash, size);
     let bytes = adapter.fetch(&blob).await?;
@@ -434,11 +442,18 @@ async fn cmd_gc(
 
 fn cmd_metrics(
     adapter: &MeshBlobAdapter,
-    _fmt: OutputFormat,
+    fmt: OutputFormat,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    // Prometheus text body is its own format; --format is ignored
-    // here. The JSON shape would be a separate metrics snapshot
-    // we could surface later if operators want it.
+    // Prometheus text body is the only supported metrics shape.
+    // Reject --format json explicitly so operators piping into
+    // `jq` see a clear error rather than a downstream JSON parse
+    // failure.
+    if matches!(fmt, OutputFormat::Json) {
+        return Err(
+            "metrics: --format json not supported; only Prometheus text exposition is emitted"
+                .into(),
+        );
+    }
     let body = adapter.prometheus_text();
     print!("{}", body);
     Ok(ExitCode::SUCCESS)
@@ -574,13 +589,16 @@ fn parse_duration(s: &str) -> Result<Duration, Box<dyn std::error::Error>> {
     let n: u64 = num_part
         .parse()
         .map_err(|e| format!("retention prefix must be a non-negative integer: {}", e))?;
-    let secs = match unit_char {
-        's' | 'S' => n,
-        'm' | 'M' => n * 60,
-        'h' | 'H' => n * 3600,
-        'd' | 'D' => n * 86_400,
+    let multiplier: u64 = match unit_char {
+        's' | 'S' => 1,
+        'm' | 'M' => 60,
+        'h' | 'H' => 3600,
+        'd' | 'D' => 86_400,
         _ => return Err(format!("unknown retention unit `{}`", unit_char).into()),
     };
+    let secs = n
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("retention value `{}` overflows u64 seconds", s))?;
     Ok(Duration::from_secs(secs))
 }
 
