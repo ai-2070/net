@@ -42,7 +42,7 @@ Tagged `[B | H | M | L]`:
 | B-7   | H   | blob mesh    | `store_chunk` TOCTOU between `is_empty()` and `append()`; no verify     | ✅ (per-hash advisory lock map; idempotent fast-path verifies existing bytes hash to the supplied value; regression tests for concurrent stores + poisoned-prior-write) |
 | B-8   | H   | cli          | `net-blob get --out` has no symlink / traversal guard                  | ✅ (use `OpenOptions::create_new(true)` so an existing path or symlink errors; regression test asserts the CLI preserves an existing file at the output path) |
 | B-9   | M   | greedy       | `set_blob_refcount_table` swap leaks +1's on prior table               | ✅ (swap and clear both decrement the outgoing table for every shadow-set hash; regression tests pin the balance) |
-| B-10  | M   | greedy       | `chain_blob_refs` shadow set unbounded per channel                     | ⬜ |
+| B-10  | M   | greedy       | `chain_blob_refs` shadow set unbounded per channel                     | ✅ (BoundedShadowSet wrapper with `MAX_TRACKED_BLOBS_PER_CHANNEL = 8192`; oldest entry evicts on overflow and the refcount is decremented) |
 | B-11  | M   | placement    | `disk_free_gb` axis can double-place under heartbeat staleness         | ⬜ |
 | B-12  | M   | blob mesh    | `MeshBlobAdapter::fetch` allocates `total_size as usize` upfront       | ⬜ |
 | B-13  | M   | metrics      | `dataforts_blob_gc_pending_total` is `gauge`, violates naming          | ⬜ |

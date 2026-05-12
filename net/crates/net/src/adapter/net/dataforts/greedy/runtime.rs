@@ -198,8 +198,7 @@ struct GreedyRuntimeInner {
     /// on the (rarer) eviction sweep — RwLock's reader path
     /// doesn't help here since every dispatch is a write.
     #[cfg(feature = "dataforts")]
-    chain_blob_refs:
-        Mutex<std::collections::HashMap<ChannelName, std::collections::HashSet<[u8; 32]>>>,
+    chain_blob_refs: Mutex<std::collections::HashMap<ChannelName, BoundedShadowSet>>,
     /// Bounds the number of in-flight `observe_event` spawn tasks.
     /// `observe_event` is the mesh hot-path entry; without a bound
     /// a flooding peer creates one outstanding task per event
@@ -208,6 +207,85 @@ struct GreedyRuntimeInner {
     /// `try_acquire_owned`-shaped: on saturation drop the event
     /// and bump a counter rather than blocking the mesh.
     observer_inflight: Arc<tokio::sync::Semaphore>,
+}
+
+/// Per-channel cap on the `chain_blob_refs` dedup set. Without
+/// this, a long-lived chatty channel publishing one new BlobRef
+/// per event grows the set unboundedly — only channel eviction
+/// drains it. The cap is conservative enough that a single
+/// channel's bookkeeping stays under ~256 KiB while still
+/// covering working sets two orders of magnitude larger than any
+/// reasonable steady-state stream. Operators with sustained
+/// working sets above the cap will see oldest BlobRefs evict from
+/// the shadow set + the refcount table decremented for those
+/// hashes — equivalent to "we no longer hold this reference at
+/// the greedy layer," which is the conservative direction (the
+/// adapter's GC sweep may then reclaim the chunk).
+#[cfg(feature = "dataforts")]
+const MAX_TRACKED_BLOBS_PER_CHANNEL: usize = 8192;
+
+/// Per-channel BlobRef shadow set used by the chain-fold refcount
+/// source. Insertion-ordered + presence-keyed so the runtime can
+/// dedupe on `(channel, hash)` pairs (BlobRef admit fires +1
+/// once per pair, not per event) and bound memory by evicting
+/// the oldest entry when the per-channel cap is hit.
+#[cfg(feature = "dataforts")]
+struct BoundedShadowSet {
+    set: std::collections::HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    cap: usize,
+}
+
+#[cfg(feature = "dataforts")]
+impl BoundedShadowSet {
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            set: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// Insert `hash` if not already present. Returns `true` on a
+    /// fresh insert, `false` when the hash was already present
+    /// (the caller treats this as a no-op admit).
+    fn insert(&mut self, hash: [u8; 32]) -> bool {
+        if self.set.insert(hash) {
+            self.order.push_back(hash);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pop + return the oldest entry, or `None` when empty.
+    /// Called by the runtime after a fresh insert pushed the set
+    /// past `cap` so the matching decrement against the refcount
+    /// table fires.
+    fn pop_oldest(&mut self) -> Option<[u8; 32]> {
+        let oldest = self.order.pop_front()?;
+        self.set.remove(&oldest);
+        Some(oldest)
+    }
+
+    fn over_cap(&self) -> bool {
+        self.order.len() > self.cap
+    }
+
+    /// Drain every hash, ordered oldest-first. Used on eviction +
+    /// table swap / clear so the caller can decrement each in
+    /// turn against the refcount table.
+    fn drain_all(&mut self) -> std::collections::VecDeque<[u8; 32]> {
+        self.set.clear();
+        std::mem::take(&mut self.order)
+    }
+}
+
+#[cfg(feature = "dataforts")]
+impl Default for BoundedShadowSet {
+    fn default() -> Self {
+        Self::with_cap(MAX_TRACKED_BLOBS_PER_CHANNEL)
+    }
 }
 
 /// Per-runtime data-gravity state. Behind the same gate as the
@@ -348,9 +426,9 @@ impl GreedyRuntime {
             // Balance the outgoing table against everything we
             // previously incremented on it.
             let mut shadow = self.inner.chain_blob_refs.lock();
-            for hashes in shadow.values() {
-                for h in hashes {
-                    old.decr(*h, now);
+            for bucket in shadow.values_mut() {
+                for h in bucket.drain_all() {
+                    old.decr(h, now);
                 }
             }
             shadow.clear();
@@ -371,9 +449,9 @@ impl GreedyRuntime {
         let mut slot = self.inner.blob_refcount.write();
         if let Some(old) = slot.take() {
             let mut shadow = self.inner.chain_blob_refs.lock();
-            for hashes in shadow.values() {
-                for h in hashes {
-                    old.decr(*h, now);
+            for bucket in shadow.values_mut() {
+                for h in bucket.drain_all() {
+                    old.decr(h, now);
                 }
             }
             shadow.clear();
@@ -898,6 +976,17 @@ impl GreedyRuntime {
             // eviction also fires once per (channel, hash) pair.
             if bucket.insert(hash) {
                 table.incr(hash, now_ms);
+                // Cap the per-channel shadow set so a long-lived
+                // chatty channel publishing one new BlobRef per
+                // event doesn't grow it unboundedly. On overflow,
+                // evict the oldest hash and decrement its
+                // refcount — equivalent to "the greedy layer no
+                // longer references this hash from this channel."
+                if bucket.over_cap() {
+                    if let Some(evicted) = bucket.pop_oldest() {
+                        table.decr(evicted, now_ms);
+                    }
+                }
             }
         }
     }
@@ -955,8 +1044,8 @@ impl GreedyRuntime {
             .unwrap_or(0);
         let mut seen = self.inner.chain_blob_refs.lock();
         for e in evicted {
-            if let Some(hashes) = seen.remove(&e.channel) {
-                for hash in hashes {
+            if let Some(mut bucket) = seen.remove(&e.channel) {
+                for hash in bucket.drain_all() {
                     table.decr(hash, now_ms);
                 }
             }
@@ -1918,6 +2007,63 @@ mod tests {
             table_a.get(&hash2).is_none(),
             "outgoing table must not receive post-swap admits"
         );
+    }
+
+    /// Direct unit tests on `BoundedShadowSet` pin the invariants
+    /// the chain-fold refcount source relies on: insertion-order
+    /// eviction, dedup on re-insert, and the oldest-first
+    /// `pop_oldest` contract.
+    #[test]
+    fn bounded_shadow_set_evicts_oldest_on_overflow() {
+        let mut s = BoundedShadowSet::with_cap(3);
+        let h = |b| {
+            let mut a = [0u8; 32];
+            a[0] = b;
+            a
+        };
+        assert!(s.insert(h(1)));
+        assert!(s.insert(h(2)));
+        assert!(s.insert(h(3)));
+        assert!(!s.over_cap());
+        // Fourth distinct insert pushes us over cap by one.
+        assert!(s.insert(h(4)));
+        assert!(s.over_cap());
+        // pop_oldest returns 1 (insertion order); set is now at cap.
+        assert_eq!(s.pop_oldest(), Some(h(1)));
+        assert!(!s.over_cap());
+        // pop_oldest a second time returns 2.
+        assert_eq!(s.pop_oldest(), Some(h(2)));
+    }
+
+    #[test]
+    fn bounded_shadow_set_dedups_on_reinsert() {
+        let mut s = BoundedShadowSet::with_cap(8);
+        let mut h = [0u8; 32];
+        h[0] = 0xAA;
+        assert!(s.insert(h));
+        // Second insert is a no-op (returns false), doesn't grow
+        // the order queue.
+        assert!(!s.insert(h));
+        assert!(!s.over_cap());
+        assert_eq!(s.pop_oldest(), Some(h));
+        assert_eq!(s.pop_oldest(), None);
+    }
+
+    #[test]
+    fn bounded_shadow_set_drain_returns_insertion_order() {
+        let mut s = BoundedShadowSet::with_cap(8);
+        let h = |b| {
+            let mut a = [0u8; 32];
+            a[0] = b;
+            a
+        };
+        for i in 0..5u8 {
+            s.insert(h(i));
+        }
+        let order: Vec<_> = s.drain_all().into_iter().collect();
+        assert_eq!(order, vec![h(0), h(1), h(2), h(3), h(4)]);
+        // After drain the set is empty.
+        assert!(s.pop_oldest().is_none());
     }
 
     /// Clearing the table must also balance the outgoing table
