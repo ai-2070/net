@@ -4334,16 +4334,23 @@ impl MeshNode {
         channel_hash: ChannelHash,
     ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
         let wire = channel_hash as u16;
-        let mut entry = self.rpc_inbound_dispatchers.get_mut(&wire)?;
-        let pos = entry.iter().position(|(c, _)| *c == channel_hash)?;
-        let (_, removed) = entry.remove(pos);
-        // If the bucket is now empty, release the slot so the wire
-        // hash no longer hits the dispatch fast path.
-        let is_empty = entry.is_empty();
-        drop(entry);
-        if is_empty {
-            self.rpc_inbound_dispatchers.remove(&wire);
-        }
+        let removed = {
+            let mut entry = self.rpc_inbound_dispatchers.get_mut(&wire)?;
+            let pos = entry.iter().position(|(c, _)| *c == channel_hash)?;
+            let (_, removed) = entry.remove(pos);
+            removed
+        };
+        // Release the wire-bucket slot only if it's *still* empty when
+        // the shard lock comes back under our hand. A naive "check
+        // is_empty, drop the guard, then `remove`" would race with a
+        // concurrent `register_rpc_inbound` for a different canonical
+        // sharing the same wire bucket — that thread would push its
+        // entry between our drop and remove, and we'd then delete its
+        // freshly-registered dispatcher. `remove_if` evaluates its
+        // predicate while holding the shard lock, so the empty-check
+        // and remove are atomic.
+        self.rpc_inbound_dispatchers
+            .remove_if(&wire, |_, v| v.is_empty());
         Some(removed)
     }
 

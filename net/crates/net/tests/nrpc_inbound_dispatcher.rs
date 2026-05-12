@@ -110,6 +110,101 @@ async fn register_and_unregister_round_trip() {
     assert!(node.unregister_rpc_inbound(0xABCD).is_none());
 }
 
+/// Two canonical `ChannelHash` values that share the same wire `u16`
+/// bucket must register / unregister independently. Unregistering one
+/// canonical leaves the other addressable through both the registered
+/// probe and the next unregister.
+#[tokio::test]
+async fn unregister_preserves_sibling_in_same_wire_bucket() {
+    let node = build_node().await;
+    // Two canonical hashes whose low 16 bits collide.
+    let canonical_a: u32 = 0xDEAD_BEEF;
+    let canonical_b: u32 = 0xCAFE_BEEF;
+    assert_eq!(canonical_a as u16, canonical_b as u16);
+    assert_ne!(canonical_a, canonical_b);
+
+    let disp_a: RpcInboundDispatcher = Arc::new(|_| {});
+    let disp_b: RpcInboundDispatcher = Arc::new(|_| {});
+
+    assert!(node
+        .register_rpc_inbound(canonical_a, disp_a.clone())
+        .is_none());
+    assert!(node
+        .register_rpc_inbound(canonical_b, disp_b.clone())
+        .is_none());
+
+    assert!(node.rpc_inbound_dispatcher_registered(canonical_a));
+    assert!(node.rpc_inbound_dispatcher_registered(canonical_b));
+
+    // Unregister A — B must survive, despite sharing the wire bucket.
+    assert!(node.unregister_rpc_inbound(canonical_a).is_some());
+    assert!(!node.rpc_inbound_dispatcher_registered(canonical_a));
+    assert!(
+        node.rpc_inbound_dispatcher_registered(canonical_b),
+        "sibling canonical in the same wire bucket must outlive unregister of its peer"
+    );
+
+    // B is still removable through the canonical-keyed path.
+    assert!(node.unregister_rpc_inbound(canonical_b).is_some());
+    assert!(!node.rpc_inbound_dispatcher_registered(canonical_b));
+}
+
+/// Regression: the previous unregister path did
+/// `check is_empty → drop guard → remove(wire)`, which raced with a
+/// concurrent `register_rpc_inbound` for a different canonical sharing
+/// the same wire bucket. Under contention, the racing register's entry
+/// could be silently deleted. This test hammers the pattern with many
+/// register/unregister cycles for canonical A while a second thread
+/// keeps canonical B (same wire bucket) registered the whole time; B
+/// must remain registered throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unregister_race_does_not_drop_concurrent_sibling_registration() {
+    let node = build_node().await;
+    let canonical_a: u32 = 0xAAAA_1234;
+    let canonical_b: u32 = 0xBBBB_1234;
+    assert_eq!(canonical_a as u16, canonical_b as u16);
+
+    // Pin B for the duration of the test.
+    let disp_b: RpcInboundDispatcher = Arc::new(|_| {});
+    assert!(node
+        .register_rpc_inbound(canonical_b, disp_b.clone())
+        .is_none());
+
+    let iters = 2_000u32;
+    let churn = {
+        let node = node.clone();
+        tokio::task::spawn_blocking(move || {
+            let disp_a: RpcInboundDispatcher = Arc::new(|_| {});
+            for _ in 0..iters {
+                node.register_rpc_inbound(canonical_a, disp_a.clone());
+                node.unregister_rpc_inbound(canonical_a);
+            }
+        })
+    };
+
+    // Sample B's registration repeatedly from another thread; with
+    // the previous racy unregister, A's churn could clobber B.
+    let probe = {
+        let node = node.clone();
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..(iters * 4) {
+                assert!(
+                    node.rpc_inbound_dispatcher_registered(canonical_b),
+                    "B must remain registered while A churns in the same wire bucket"
+                );
+                std::hint::spin_loop();
+            }
+        })
+    };
+
+    churn.await.expect("churn task panicked");
+    probe.await.expect("probe task panicked");
+
+    // Final state: B still registered, A unregistered.
+    assert!(node.rpc_inbound_dispatcher_registered(canonical_b));
+    assert!(!node.rpc_inbound_dispatcher_registered(canonical_a));
+}
+
 /// End-to-end through the real network. A publishes on a channel B
 /// has subscribed to AND for which B has registered an inbound
 /// dispatcher. Assert: B's dispatcher receives the event.
