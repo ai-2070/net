@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 
 use super::adapter::{BlobAdapter, BlobStat};
 use super::admission::auth_allows_blob_op;
@@ -129,6 +130,16 @@ pub struct MeshBlobAdapter {
     /// Defaults to [`DEFAULT_BLOB_HEAT_HALF_LIFE`] (60 s); operators
     /// tune via [`Self::with_blob_heat`].
     blob_heat_half_life: Duration,
+    /// Per-hash advisory lock. Serializes concurrent
+    /// [`Self::store_chunk`] invocations on the same content
+    /// hash so two callers can't both observe the chunk file
+    /// empty and both append duplicate payloads. Entries are
+    /// created lazily on first store of a hash and best-effort
+    /// reclaimed once no caller is holding the lock; the map's
+    /// long-term size is bounded by the rate of distinct
+    /// concurrent stores, not by total distinct hashes ever
+    /// seen.
+    in_flight_stores: Arc<DashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl MeshBlobAdapter {
@@ -150,6 +161,7 @@ impl MeshBlobAdapter {
             auth_guard: None,
             blob_heat: None,
             blob_heat_half_life: DEFAULT_BLOB_HEAT_HALF_LIFE,
+            in_flight_stores: Arc::new(DashMap::new()),
         }
     }
 
@@ -496,6 +508,18 @@ impl MeshBlobAdapter {
     /// holds content (re-store of identical bytes against the same
     /// content-address), this is a no-op. Verifies the bytes hash
     /// to the supplied hash before writing.
+    ///
+    /// Concurrent stores of the same hash serialize through a per-
+    /// hash advisory lock so two callers can't both observe the
+    /// file empty and both append the same payload (the TOCTOU
+    /// would leave the chunk file with duplicate events; reads
+    /// still return correct bytes but the underlying storage
+    /// wastes space and the layout is non-deterministic). The
+    /// idempotent-skip branch also verifies the existing on-disk
+    /// bytes against the supplied hash before accepting — a
+    /// corrupted prior write (e.g. truncated replication catch-up)
+    /// surfaces as `HashMismatch` rather than silently passing the
+    /// honest caller's `store` call.
     async fn store_chunk(&self, hash: &[u8; 32], bytes: &[u8]) -> Result<(), BlobError> {
         // Defensive: verify the supplied bytes hash to the supplied
         // hash. The substrate-side `store` already verified at the
@@ -508,19 +532,59 @@ impl MeshBlobAdapter {
                 actual: computed,
             });
         }
+        // Per-hash serialization: one in-flight `store_chunk` per
+        // content hash at a time. The lock entry is created lazily
+        // and best-effort reclaimed after the store completes.
+        let lock = self
+            .in_flight_stores
+            .entry(*hash)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let result = {
+            let _guard = lock.lock().await;
+            self.store_chunk_locked(hash, bytes).await
+        };
+        // Best-effort cleanup: drop the local Arc, then remove the
+        // map entry only when no other caller is currently holding
+        // it. Concurrent waiters keep the Arc alive and the entry
+        // stays until the last one finishes.
+        drop(lock);
+        self.in_flight_stores
+            .remove_if(hash, |_, m| Arc::strong_count(m) == 1);
+        result
+    }
+
+    /// Body of [`Self::store_chunk`] run under the per-hash lock.
+    /// Split out so the lock-acquire / cleanup wrapper can early-
+    /// return cleanly via `?` without the per-hash entry leaking.
+    async fn store_chunk_locked(&self, hash: &[u8; 32], bytes: &[u8]) -> Result<(), BlobError> {
         let channel = Self::chunk_channel(hash);
         let cfg = self.chunk_file_config();
         let file = self
             .redex
             .open_file(&channel, cfg)
             .map_err(|e| BlobError::Backend(format!("mesh blob: open chunk file: {}", e)))?;
-        // Idempotent-store gate: content-addressed, so if any bytes
-        // are already there they must be byte-for-byte equal. Skip
-        // the append to avoid stacking duplicates in the RedEX file.
-        // Either way, stamp `first_seen` on the refcount table so
-        // the retention floor clock starts.
         let now_ms = now_unix_ms();
         if !file.is_empty() {
+            // Idempotent fast-path. Content-addressed semantics
+            // promise the on-disk bytes match the hash, but a
+            // corrupted prior write (e.g. replication catch-up
+            // wrote bad bytes before our honest store landed)
+            // would otherwise be silently affirmed. Verify before
+            // returning Ok.
+            let events = file.read_range(0, file.len() as u64);
+            let existing = events.into_iter().next().ok_or_else(|| {
+                BlobError::Backend(
+                    "mesh blob: chunk file non-empty but read returned no events".to_string(),
+                )
+            })?;
+            let computed_existing: [u8; 32] = blake3::hash(&existing.payload).into();
+            if computed_existing != *hash {
+                return Err(BlobError::HashMismatch {
+                    expected: *hash,
+                    actual: computed_existing,
+                });
+            }
             self.refcount.store_observed(*hash, now_ms);
             return Ok(());
         }
@@ -983,6 +1047,97 @@ mod tests {
         adapter.store(&blob, &payload).await.unwrap();
         let fetched = adapter.fetch(&blob).await.unwrap();
         assert_eq!(fetched, payload);
+    }
+
+    /// Concurrent stores of the same hash must serialize through
+    /// the per-hash advisory lock. Pre-fix, two callers could each
+    /// observe `file.is_empty() == true` and both `append`, leaving
+    /// the chunk file with duplicate events. The fetch path reads
+    /// the first event so reads stayed correct, but the on-disk
+    /// layout was non-deterministic and wasted space. Post-fix,
+    /// exactly one append lands; the second caller's fast-path
+    /// observes the bytes and skips.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_store_chunk_serializes_per_hash() {
+        let adapter = make_adapter();
+        let payload = b"concurrent serialize".to_vec();
+        let blob = small_ref_for(&payload);
+
+        // Fire N parallel stores of the same content.
+        let n = 16;
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let adapter = adapter.clone();
+            let blob = blob.clone();
+            let payload = payload.clone();
+            handles.push(tokio::spawn(
+                async move { adapter.store(&blob, &payload).await },
+            ));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        // Fetch must return the original bytes — and *only* the
+        // original bytes. A pre-fix run could leave the file with
+        // duplicate events; the read path takes the first event so
+        // the bytes still match, but we can additionally inspect
+        // the underlying chunk channel to assert exactly one event.
+        let fetched = adapter.fetch(&blob).await.unwrap();
+        assert_eq!(fetched, payload);
+        let hash = match &blob {
+            BlobRef::Small { hash, .. } => *hash,
+            _ => panic!("expected Small"),
+        };
+        let channel = MeshBlobAdapter::chunk_channel_for_hash(&hash);
+        let file = adapter
+            .redex
+            .open_file(&channel, RedexFileConfig::new())
+            .unwrap();
+        let events = file.read_range(0, file.len() as u64);
+        assert_eq!(
+            events.len(),
+            1,
+            "per-hash serialization must coalesce concurrent stores to one append"
+        );
+    }
+
+    /// Idempotent fast-path must verify the existing on-disk
+    /// bytes against the supplied hash. A pre-existing corrupted
+    /// payload at the same channel (e.g. truncated replication
+    /// catch-up) surfaces as `HashMismatch` rather than silently
+    /// being affirmed by an honest caller's `store`.
+    #[tokio::test]
+    async fn store_chunk_idempotent_path_verifies_existing_bytes() {
+        use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
+        let adapter = make_adapter();
+        // Pre-poison the chunk channel for our intended hash with
+        // bytes that DON'T hash to the advertised value.
+        let intended_payload = b"honest payload".to_vec();
+        let intended_hash: [u8; 32] = blake3::hash(&intended_payload).into();
+        let channel = MeshBlobAdapter::chunk_channel_for_hash(&intended_hash);
+        let file = adapter
+            .redex
+            .open_file(&channel, RedexFileConfig::new())
+            .unwrap();
+        // Append corrupted content (hash mismatch). Bypasses the
+        // adapter's verify because we're writing directly to the
+        // RedEX layer.
+        file.append(b"corrupted content").unwrap();
+
+        // Now an honest caller tries to store the intended payload.
+        // The adapter must NOT silently pass — the on-disk content
+        // doesn't match the advertised hash.
+        let blob = BlobRef::small(
+            "mesh://verify",
+            intended_hash,
+            intended_payload.len() as u64,
+        );
+        let err = adapter.store(&blob, &intended_payload).await.unwrap_err();
+        assert!(
+            matches!(err, BlobError::HashMismatch { .. }),
+            "idempotent fast-path must verify existing bytes; got {:?}",
+            err
+        );
     }
 
     #[tokio::test]
