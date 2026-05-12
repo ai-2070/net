@@ -582,6 +582,48 @@ Whole-db snapshot is a single call. `db.snapshot()` walks every enabled model un
 
 NetDB ships the same surface on Rust, Node (`@ai2070/net` napi bindings), and Python (`net._net` PyO3 bindings). The Node and Python handles carry the same CRUD + query methods; `NetDb.open(config)` on both sides is failure-atomic and supports the same whole-db snapshot bundle cross-language (postcard is stable across the FFI boundary).
 
+## Dataforts
+
+Dataforts is the compositional data plane on top of the RedEX / CortEX / capability-index / proximity-graph substrate. It ships behind the `dataforts` Cargo feature and composes against existing primitives — there is no new wire protocol, no separate coordinator service. See [`docs/misc/DATAFORTS_FEATURES.md`](docs/misc/DATAFORTS_FEATURES.md) for the audit (most of the original wishlist was already covered by core primitives; Dataforts names and packages the remaining work).
+
+Four phases compose:
+
+- **Phase 1 — Greedy-LRU caching.** Per-node speculative caching of in-scope chains observed via the tail-subscription path. Five-axis admission (`scope` + `proximity` + `capability-preference` + `colocation` + `storage-cap`) and a bandwidth budget gate decide whether to admit an inbound event into a per-channel cache file. The cache evicts cold channels under the cluster-cap pressure and withdraws their `causal:<hex>` advertisements. Wires via [`Redex::enable_greedy_dataforts`](src/adapter/net/redex/manager.rs).
+- **Phase 3 — `BlobRef` + `BlobAdapter`.** A 4-byte-magic + version + 32-byte BLAKE3 + size + URI reference type whose bytes live in the caller's storage (S3, Ceph, IPFS, local FS) — the substrate carries the reference, not the blob. Adapters implement `fetch` / `store` (with default `fetch_stream` / `store_stream` shims for multi-GB payloads). Filesystem adapter (`FileSystemAdapter`) ships in-tree; user adapters register via [`BlobAdapterRegistry`](src/adapter/net/dataforts/blob/registry.rs).
+- **Phase 4 — Data gravity.** Per-chain read-rate counters with exponential decay. Threshold-crossing emissions stamp `heat:<hex>=<rate>` onto the chain's existing capability announcement; the greedy admission gate weights cache pulls by heat × scope-match × proximity-rank. Cold chains evict first; hot chains migrate toward the readers that drive the heat. Wires via [`Redex::enable_gravity_for_greedy`](src/adapter/net/redex/manager.rs).
+- **Phase 5 — Read-your-writes.** A `WriteToken { origin_hash, seq }` returned from every successful `Tasks` / `Memories` write. Pass it to `wait_for_token(token, deadline)` and the call blocks until the local fold has actually applied that sequence number — not just folded it — so a producer reads its own write through the cache deterministically. Token construction is doc-hidden; tokens are unforgeable only against the issuing adapter (origin-bound). The wait path tracks both `applied_through_seq` and `folded_through_seq` watermarks and surfaces `WaitForTokenError::FoldStopped` when the fold task crashes mid-wait, so a producer never gets a silent `Ok(())` against a stalled adapter.
+
+The canonical `ChannelHash` (`u32`) is the substrate-wide ACL / storage / config key after the channel-hash widening (see [Net Header](#net-header-64-bytes-cache-line-aligned)); the per-packet wire `channel_hash` stays `u16` (fast-path filter hint; collisions are benign because ACL / RYW / cache decisions key on the canonical hash via the registry-side disambiguation).
+
+```rust
+# #[cfg(feature = "dataforts")]
+# async fn example(mesh: std::sync::Arc<net::adapter::net::MeshNode>) -> Result<(), Box<dyn std::error::Error>> {
+use net::adapter::net::dataforts::{GreedyConfig, IntentMatchPolicy, DataGravityPolicy};
+use net::adapter::net::behavior::capability::CapabilitySet;
+use net::adapter::net::Redex;
+use std::sync::Arc;
+
+let redex = Arc::new(Redex::new());
+
+// Phase 1: greedy cache wired into the mesh's inbound dispatch.
+redex.enable_greedy_dataforts(
+    mesh.clone(),
+    GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled),
+    Arc::new(CapabilitySet::default()),
+    Default::default(),
+)?;
+
+// Phase 4: layer gravity on top (per-chain heat counters + tick loop).
+redex.enable_gravity_for_greedy(mesh.clone(), DataGravityPolicy::default())?;
+
+// `Redex::greedy_cache_for(channel)` returns a cached `RedexFile`
+// when greedy has admitted that chain; callers fall back to a
+// network fetch when it returns `None`.
+# Ok(()) }
+```
+
+Phase 3 (blob) and Phase 5 (RYW) are wired on the same `Redex` handle — `BlobAdapterRegistry::register` for blob adapters, `tasks.wait_for_token(token, deadline)` / `memories.wait_for_token(...)` on the CortEX adapters for RYW.
+
 ## nRPC
 
 nRPC is the request/response convention layer riding on top of the pub/sub mesh + CortEX folds. It turns a directed channel pair (`<service>.requests` / `<service>.replies.<caller_origin>`) into a typed RPC surface with deadlines, queue-group fan-out, response streaming, and end-to-end cancellation.
@@ -1007,6 +1049,7 @@ net_shutdown(node);
 | RedEX disk durability | `redex-disk` | `redex` |
 | CortEX (adapter core + tasks + memories) | `cortex` | `redex` |
 | NetDB (unified query façade) | `netdb` | `cortex` |
+| Dataforts (greedy + gravity + blob + RYW) | `dataforts` | `cortex`, `blake3`, `xxhash-rust` |
 
 No features are enabled by default — opt into `redis`, `jetstream`, `net`, etc. explicitly.
 
