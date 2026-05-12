@@ -278,6 +278,144 @@ where
     drive_blob_migration_tick(local_caps, capability_index, &*adapter, size_for_hash).await
 }
 
+/// Manifest sibling list returned by an operator-supplied
+/// [`drive_blob_migration_tick_with_manifest_resolver`]
+/// callback.  Each entry is a `(chunk_hash, chunk_size)` pair —
+/// the migration controller calls `adapter.prefetch` on each
+/// pair as if it had been an independently-advertised
+/// candidate, attributing the verdict to the originally-heated
+/// hash so the per-reason counters stay coherent.
+///
+/// Empty vector is the "no siblings known" signal (equivalent to
+/// the resolver returning `None`); the migration short-circuits
+/// to the single-chunk path.
+pub type ManifestSiblings = Vec<([u8; 32], u64)>;
+
+/// Manifest-aware variant of [`drive_blob_migration_tick`]. Same
+/// observation → decide → act loop, but each admitted heat
+/// candidate first asks the operator-supplied `manifest_resolver`
+/// whether the hot hash is the head of a manifest the local node
+/// knows about. When it is, the controller proactively
+/// `adapter.prefetch`-es every sibling chunk too — closing the
+/// gap between "this single chunk is hot" and "this entire
+/// manifest is likely about to be fetched."
+///
+/// `manifest_resolver: Fn([u8; 32]) -> Option<ManifestSiblings>`
+/// is the operator's side-index hook:
+///
+/// - Return `None` (or an empty vec) to fall through to the
+///   single-chunk prefetch path. Equivalent to the plain
+///   [`drive_blob_migration_tick`] behavior.
+/// - Return `Some(siblings)` to attach a sibling list. The
+///   controller short-circuits any sibling that the
+///   single-chunk path already prefetched (the heated hash
+///   itself, plus dedup across siblings on duplicate candidates)
+///   so a sibling list overlapping the candidate set bumps
+///   `admitted` once per *distinct* hash. Sibling sizes drive
+///   their own `should_migrate_blob_to` disk-free gate; sibling
+///   verdicts route into the same per-reason rejection counters
+///   as the top-level candidate.
+///
+/// Producer-side: an operator typically maintains the side index
+/// at store time (`MeshBlobAdapter::store` of a
+/// `BlobRef::Manifest` knows the chunk list) and exposes
+/// `manifest_resolver` over an `Arc<DashMap>` shared with the
+/// gravity tick task. Future refinements can carry the manifest
+/// structure on the wire via a `manifest:<hex>:chunks=<list>`
+/// capability tag family — outside this primitive's scope.
+pub async fn drive_blob_migration_tick_with_manifest_resolver<A, F, M>(
+    local_caps: &CapabilitySet,
+    capability_index: &CapabilityIndex,
+    adapter: &A,
+    size_for_hash: F,
+    manifest_resolver: M,
+) -> BlobMigrationTickReport
+where
+    A: BlobAdapter + ?Sized,
+    F: Fn([u8; 32]) -> Option<u64>,
+    M: Fn([u8; 32]) -> Option<ManifestSiblings>,
+{
+    let controller = BlobMigrationController::new(local_caps, capability_index);
+    let candidates = controller.candidates();
+    let mut report = BlobMigrationTickReport::default();
+    // Dedup across candidate + sibling expansions so a hash that
+    // appears in both lists triggers exactly one prefetch.
+    let mut already_prefetched: std::collections::HashSet<[u8; 32]> =
+        std::collections::HashSet::new();
+    for candidate in candidates {
+        let size = match size_for_hash(candidate.hash) {
+            Some(s) => s,
+            None => {
+                report.skipped_unknown_size += 1;
+                continue;
+            }
+        };
+        let verdict = should_migrate_blob_to(local_caps, &candidate.publisher_caps, size);
+        match verdict {
+            MigrateBlobVerdict::Admit => {
+                // Prefetch the heated chunk itself.
+                if already_prefetched.insert(candidate.hash) {
+                    let blob_ref = BlobRef::small(
+                        format!("mesh://{}", hex32(&candidate.hash)),
+                        candidate.hash,
+                        size,
+                    );
+                    match adapter.prefetch(&blob_ref).await {
+                        Ok(()) => report.admitted += 1,
+                        Err(e) => {
+                            tracing::trace!(
+                                error = ?e,
+                                hash = ?candidate.hash,
+                                "blob migration: prefetch failed; counted"
+                            );
+                            report.prefetch_errors += 1;
+                        }
+                    }
+                }
+                // Manifest expansion: query the resolver for
+                // siblings of the heated hash.
+                let siblings = manifest_resolver(candidate.hash).unwrap_or_default();
+                for (sibling_hash, sibling_size) in siblings {
+                    if !already_prefetched.insert(sibling_hash) {
+                        // Either the candidate itself OR a
+                        // previously-expanded sibling already
+                        // prefetched this one; skip.
+                        continue;
+                    }
+                    let sibling_verdict = should_migrate_blob_to(
+                        local_caps,
+                        &candidate.publisher_caps,
+                        sibling_size,
+                    );
+                    match sibling_verdict {
+                        MigrateBlobVerdict::Admit => {
+                            let blob_ref = BlobRef::small(
+                                format!("mesh://{}", hex32(&sibling_hash)),
+                                sibling_hash,
+                                sibling_size,
+                            );
+                            match adapter.prefetch(&blob_ref).await {
+                                Ok(()) => report.admitted += 1,
+                                Err(e) => {
+                                    tracing::trace!(
+                                        error = ?e,
+                                        hash = ?sibling_hash,
+                                        "blob migration: manifest sibling prefetch failed"
+                                    );
+                                    report.prefetch_errors += 1;
+                                }
+                            }
+                        }
+                        MigrateBlobVerdict::Reject(r) => report.record_reject(r),
+                    }
+                }
+            }
+            MigrateBlobVerdict::Reject(r) => report.record_reject(r),
+        }
+    }
+    report
+}
+
 /// Helper to format a chunk hash as a 64-char hex string.
 /// Local to this module so we don't widen the public surface.
 fn hex32(hash: &[u8; 32]) -> String {
@@ -565,5 +703,157 @@ mod tests {
             drive_blob_migration_tick(&local, &index, &adapter, |_| Some(four_gib)).await;
         assert_eq!(report.admitted, 0);
         assert_eq!(report.rejected_insufficient_disk, 1);
+    }
+
+    // --- Manifest-aware migration (PR-5o) ---
+
+    #[tokio::test]
+    async fn manifest_resolver_prefetches_every_sibling_chunk() {
+        // Heat surfaces for the manifest's first chunk only;
+        // the resolver returns the full sibling list; the
+        // controller prefetches every chunk.
+        let publisher_caps = publisher_caps_with_heat(0x60, "mesh", "0.50");
+        let index = index_with_peer_heat(50, publisher_caps, 0xFF);
+        let local = participating_local("mesh", 128, 50);
+        let adapter = PrefetchRecorder::new();
+        let calls = adapter.calls.clone();
+
+        let (head_hash, _) = hex64(0x60);
+        let (s1, _) = hex64(0x61);
+        let (s2, _) = hex64(0x62);
+        let (s3, _) = hex64(0x63);
+        let siblings_for_head = vec![(s1, 1024), (s2, 2048), (s3, 4096)];
+
+        let report = drive_blob_migration_tick_with_manifest_resolver(
+            &local,
+            &index,
+            &adapter,
+            |_h| Some(1024),
+            |h| {
+                if h == head_hash {
+                    Some(siblings_for_head.clone())
+                } else {
+                    None
+                }
+            },
+        )
+        .await;
+        assert_eq!(report.admitted, 4, "head + 3 siblings = 4 admits");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert_eq!(report.prefetch_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn manifest_resolver_dedups_overlapping_sibling_and_candidate_lists() {
+        // Resolver claims a sibling list that includes the head
+        // hash itself plus a chunk that was independently
+        // heat-advertised. The dedup set short-circuits both,
+        // so prefetch fires exactly twice.
+        let (head_hash, head_hex) = hex64(0x70);
+        let (sibling_hash, sibling_hex) = hex64(0x71);
+        let mut publisher = CapabilitySet::new()
+            .add_tag("dataforts.gravity.scope=mesh")
+            .add_tag("dataforts.greedy.scope=mesh");
+        publisher.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.40", head_hex),
+        });
+        publisher.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("blob:{}=0.30", sibling_hex),
+        });
+        let index = index_with_peer_heat(99, publisher, 0xAB);
+        let local = participating_local("mesh", 128, 50);
+        let adapter = PrefetchRecorder::new();
+        let calls = adapter.calls.clone();
+
+        // Resolver returns the head AND a sibling that's already
+        // advertised — the controller must not double-prefetch.
+        let report = drive_blob_migration_tick_with_manifest_resolver(
+            &local,
+            &index,
+            &adapter,
+            |_h| Some(1024),
+            move |h| {
+                if h == head_hash {
+                    Some(vec![(head_hash, 1024), (sibling_hash, 2048)])
+                } else {
+                    None
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "dedup must collapse head + already-advertised sibling to 2 distinct prefetches"
+        );
+        // admitted is the same — counts distinct prefetches.
+        assert_eq!(report.admitted, 2);
+    }
+
+    #[tokio::test]
+    async fn manifest_resolver_none_falls_through_to_single_chunk_path() {
+        // Equivalent to plain drive_blob_migration_tick when the
+        // resolver always returns None.
+        let publisher_caps = publisher_caps_with_heat(0x80, "mesh", "0.50");
+        let index = index_with_peer_heat(50, publisher_caps, 0xCD);
+        let local = participating_local("mesh", 128, 50);
+        let adapter = PrefetchRecorder::new();
+        let calls = adapter.calls.clone();
+
+        let report = drive_blob_migration_tick_with_manifest_resolver(
+            &local,
+            &index,
+            &adapter,
+            |_h| Some(1024),
+            |_h| None,
+        )
+        .await;
+        assert_eq!(report.admitted, 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn manifest_sibling_rejection_routes_into_per_reason_counters() {
+        // Head admits + prefetches; one sibling exceeds disk
+        // free; the rejection counts against the same per-reason
+        // bucket the single-chunk path uses.
+        let publisher_caps = publisher_caps_with_heat(0x90, "mesh", "0.50");
+        let index = index_with_peer_heat(50, publisher_caps, 0xEF);
+        let local = participating_local("mesh", 128, 1); // 1 GiB free
+        let adapter = PrefetchRecorder::new();
+        let calls = adapter.calls.clone();
+
+        let (head_hash, _) = hex64(0x90);
+        let (sibling_hash, _) = hex64(0x91);
+        let four_gib: u64 = 4 * (1 << 30);
+
+        let report = drive_blob_migration_tick_with_manifest_resolver(
+            &local,
+            &index,
+            &adapter,
+            move |h| {
+                if h == sibling_hash {
+                    Some(four_gib) // too big
+                } else {
+                    Some(1024)
+                }
+            },
+            move |h| {
+                if h == head_hash {
+                    Some(vec![(sibling_hash, four_gib)])
+                } else {
+                    None
+                }
+            },
+        )
+        .await;
+        assert_eq!(report.admitted, 1, "head admits");
+        assert_eq!(
+            report.rejected_insufficient_disk, 1,
+            "sibling rejects on disk gate"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

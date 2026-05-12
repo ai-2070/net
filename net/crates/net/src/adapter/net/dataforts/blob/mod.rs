@@ -46,8 +46,9 @@ pub use error::BlobError;
 pub use fs::FileSystemAdapter;
 pub use mesh::{MeshBlobAdapter, DEFAULT_BLOB_HEAT_HALF_LIFE};
 pub use migration::{
-    drive_blob_migration_tick, drive_blob_migration_tick_arc, parse_blob_heat_tag,
-    BlobMigrationCandidate, BlobMigrationController, BlobMigrationTickReport,
+    drive_blob_migration_tick, drive_blob_migration_tick_arc,
+    drive_blob_migration_tick_with_manifest_resolver, parse_blob_heat_tag, BlobMigrationCandidate,
+    BlobMigrationController, BlobMigrationTickReport, ManifestSiblings,
 };
 pub use metrics::{
     evaluate_health_gate, BlobMetrics, BlobMetricsSnapshot, HealthGateAction,
