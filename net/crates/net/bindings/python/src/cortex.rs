@@ -23,11 +23,12 @@ use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
     TasksAdapter as InnerTasksAdapter,
 };
+use ::net::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use ::net::adapter::net::redex::{
     FsyncPolicy as InnerFsyncPolicy, PlacementStrategy as InnerPlacementStrategy,
     Redex as InnerRedex, RedexError as InnerRedexError, RedexEvent as InnerRedexEvent,
     RedexFile as InnerRedexFile, RedexFileConfig, ReplicationConfig as InnerReplicationConfig,
-    UnderCapacity as InnerUnderCapacity,
+    UnderCapacity as InnerUnderCapacity, WriteToken as InnerWriteToken,
 };
 use bytes::Bytes;
 
@@ -143,6 +144,76 @@ fn parse_memories_order_by(s: &str) -> PyResult<InnerMemoriesOrderBy> {
             other
         ))),
     }
+}
+
+// =========================================================================
+// WriteToken — typed handle to a specific write, returned by ingest
+// paths and consumed by read-your-writes wait primitives.
+// =========================================================================
+
+/// Address of a single write on a specific origin's chain. Pair it
+/// with a typed adapter's `wait_for_token(token, deadline_ms=...)`
+/// to make sure that adapter's fold has caught up to the write
+/// before reading state.
+#[pyclass(name = "WriteToken", frozen, eq, hash, from_py_object)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PyWriteToken {
+    inner: InnerWriteToken,
+}
+
+#[pymethods]
+impl PyWriteToken {
+    #[new]
+    fn new(origin_hash: u64, seq: u64) -> Self {
+        Self {
+            inner: InnerWriteToken::new(origin_hash, seq),
+        }
+    }
+
+    #[getter]
+    fn origin_hash(&self) -> u64 {
+        self.inner.origin_hash
+    }
+
+    #[getter]
+    fn seq(&self) -> u64 {
+        self.inner.seq
+    }
+
+    /// Parse a token from its `<16-hex-origin>:<seq>` string form.
+    #[staticmethod]
+    fn from_string(s: &str) -> PyResult<Self> {
+        s.parse::<InnerWriteToken>()
+            .map(|inner| Self { inner })
+            .map_err(|e| PyValueError::new_err(format!("invalid WriteToken: {}", e)))
+    }
+
+    fn __str__(&self) -> String {
+        self.inner.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "WriteToken(origin_hash=0x{:x}, seq={})",
+            self.inner.origin_hash, self.inner.seq
+        )
+    }
+}
+
+impl PyWriteToken {
+    fn as_inner(&self) -> InnerWriteToken {
+        self.inner
+    }
+}
+
+/// Lift a substrate `WaitForTokenError` to a `CortexError`. The
+/// Python surface intentionally collapses all three variants into
+/// one exception class — distinguishing them in app code requires
+/// inspecting the message — because the failure responses are
+/// usually the same (retry with fresh deadline / shed load /
+/// fix the token).
+fn map_wait_for_token_err(e: InnerWaitForTokenError) -> PyErr {
+    CortexError::new_err(format!("wait_for_token: {}", e))
 }
 
 // =========================================================================
@@ -380,6 +451,239 @@ impl PyRedex {
     /// `*_election_thrash_total`, `*_witness_withdrawals_total`.
     fn replication_prometheus_text(&self) -> String {
         self.inner.replication_prometheus_text()
+    }
+
+    /// Install greedy-LRU dataforts wiring rooted at `mesh`. The
+    /// runtime opens per-channel cache files against this Redex
+    /// and announces chains via the mesh's `ChainTagSink` impl.
+    ///
+    /// Locked defaults from `DATAFORTS_PLAN.md` § Phase 1: 100 MiB
+    /// per channel, 10 GiB total, 0.25 NIC fraction,
+    /// `AnyOfLocalCapabilities` intent, `SoftPreference`
+    /// colocation, 200 ms proximity. Override via the kwargs.
+    ///
+    /// Idempotent — a second call with greedy already enabled is
+    /// a no-op (use `disable_greedy_dataforts` + re-enable to
+    /// reconfigure).
+    ///
+    /// Raises `RedexError` on invalid config (range violations on
+    /// caps, bandwidth fraction, proximity).
+    #[cfg(all(feature = "net", feature = "dataforts"))]
+    #[pyo3(signature = (
+        mesh,
+        *,
+        scopes = None,
+        proximity_max_rtt_ms = None,
+        per_channel_cap_bytes = None,
+        total_cap_bytes = None,
+        bandwidth_budget_fraction = None,
+        nic_peak_bytes_per_s = None,
+        observer_inflight_cap = None,
+        intent_match = None,
+        colocation_policy = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn enable_greedy_dataforts(
+        &self,
+        mesh: &crate::mesh_bindings::NetMesh,
+        scopes: Option<Vec<String>>,
+        proximity_max_rtt_ms: Option<u64>,
+        per_channel_cap_bytes: Option<u64>,
+        total_cap_bytes: Option<u64>,
+        bandwidth_budget_fraction: Option<f64>,
+        nic_peak_bytes_per_s: Option<u64>,
+        observer_inflight_cap: Option<usize>,
+        intent_match: Option<String>,
+        colocation_policy: Option<String>,
+    ) -> PyResult<()> {
+        use net::adapter::net::dataforts::{
+            ColocationPolicy, GreedyConfig, IntentMatchPolicy, ScopeLabel,
+        };
+        let mut cfg = GreedyConfig::new();
+        if let Some(s) = scopes {
+            cfg = cfg.with_scopes(s.into_iter().map(ScopeLabel::new).collect());
+        }
+        if let Some(ms) = proximity_max_rtt_ms {
+            cfg = cfg.with_proximity_max_rtt(std::time::Duration::from_millis(ms));
+        }
+        if let Some(bytes) = per_channel_cap_bytes {
+            cfg = cfg.with_per_channel_cap_bytes(bytes);
+        }
+        if let Some(bytes) = total_cap_bytes {
+            cfg = cfg.with_total_cap_bytes(bytes);
+        }
+        if let Some(f) = bandwidth_budget_fraction {
+            cfg = cfg.with_bandwidth_budget_fraction(f as f32);
+        }
+        if let Some(peak) = nic_peak_bytes_per_s {
+            cfg = cfg.with_nic_peak_bytes_per_s(Some(peak));
+        }
+        if let Some(cap) = observer_inflight_cap {
+            cfg = cfg.with_observer_inflight_cap(cap);
+        }
+        if let Some(policy) = intent_match {
+            let parsed = match policy.as_str() {
+                "disabled" => IntentMatchPolicy::Disabled,
+                "any_of_local_capabilities" => IntentMatchPolicy::AnyOfLocalCapabilities,
+                "strict" => IntentMatchPolicy::Strict,
+                other => {
+                    return Err(RedexError::new_err(format!(
+                        "greedy intent_match {other:?} unknown (expected disabled, any_of_local_capabilities, strict)"
+                    )))
+                }
+            };
+            cfg = cfg.with_intent_match(parsed);
+        }
+        if let Some(policy) = colocation_policy {
+            let parsed = match policy.as_str() {
+                "ignore" => ColocationPolicy::Ignore,
+                "soft_preference" => ColocationPolicy::SoftPreference,
+                "strict_required" => ColocationPolicy::StrictRequired,
+                other => {
+                    return Err(RedexError::new_err(format!(
+                        "greedy colocation_policy {other:?} unknown (expected ignore, soft_preference, strict_required)"
+                    )))
+                }
+            };
+            cfg = cfg.with_colocation_policy(parsed);
+        }
+        let arc = mesh.node_arc_clone()?;
+        // Local-caps + intent-registry default to empty / substrate
+        // defaults respectively. Application code refreshes via
+        // `greedy_set_local_caps` and `greedy_register_intent`
+        // when fuller surfaces land.
+        let local_caps =
+            std::sync::Arc::new(net::adapter::net::behavior::capability::CapabilitySet::default());
+        let registry = net::adapter::net::behavior::placement::IntentRegistry::defaults();
+        self.inner
+            .enable_greedy_dataforts(arc, cfg, local_caps, registry)
+            .map_err(|e| RedexError::new_err(format!("greedy config invalid: {}", e)))
+    }
+
+    /// `cfg(not net)` stub. Mirrors the
+    /// `enable_replication` cross-feature surface so the same
+    /// call site doesn't TypeError before the feature-required
+    /// message surfaces.
+    #[cfg(not(all(feature = "net", feature = "dataforts")))]
+    #[pyo3(signature = (_mesh = None, **_kwargs))]
+    fn enable_greedy_dataforts(
+        &self,
+        _mesh: Option<Py<PyAny>>,
+        _kwargs: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        Err(RedexError::new_err(
+            "redex: enable_greedy_dataforts requires the `dataforts` feature; \
+             rebuild with --features dataforts",
+        ))
+    }
+
+    /// Un-install the greedy wiring. Idempotent — no-op when
+    /// greedy isn't enabled.
+    #[cfg(feature = "dataforts")]
+    fn disable_greedy_dataforts(&self) {
+        self.inner.disable_greedy_dataforts();
+    }
+
+    /// Number of channels currently in the greedy cache. `0` when
+    /// greedy isn't enabled.
+    #[cfg(feature = "dataforts")]
+    fn greedy_cached_channel_count(&self) -> u32 {
+        self.inner
+            .greedy_runtime()
+            .map(|r| r.cached_channel_count() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Render the greedy metrics as Prometheus text. Returns the
+    /// empty string when greedy isn't enabled.
+    ///
+    /// Covers per-channel `dataforts_greedy_cache_hits_total`,
+    /// `_serve_count_total`, `_evictions_total`,
+    /// `_bytes_resident`, plus the cluster-wide
+    /// `_admit_rejected_total{reason=...}` and
+    /// `_io_budget_used_bytes`.
+    #[cfg(feature = "dataforts")]
+    fn greedy_prometheus_text(&self) -> String {
+        self.inner
+            .greedy_runtime()
+            .map(|r| r.metrics().snapshot().prometheus_text())
+            .unwrap_or_default()
+    }
+
+    /// Install data-gravity heat-counter emission on the
+    /// already-installed greedy runtime. Validates the policy,
+    /// installs it on the runtime, and spawns a tokio task that
+    /// fires `gravity_tick().await` on `tick_interval_ms` cadence.
+    ///
+    /// Requires `enable_greedy_dataforts(mesh)` first — raises
+    /// `RedexError` if greedy isn't installed.
+    ///
+    /// Locked Phase-4 defaults: emit_threshold_ratio = 2.0,
+    /// decay_half_life = 30 min. Override via kwargs.
+    ///
+    /// Idempotent — a second call replaces the prior policy and
+    /// restarts the tick task. The heat registry resets on each
+    /// re-enable.
+    #[cfg(all(feature = "net", feature = "dataforts"))]
+    #[pyo3(signature = (
+        mesh,
+        *,
+        tick_interval_ms = 500,
+        enabled = true,
+        emit_threshold_ratio = None,
+        decay_half_life_secs = None,
+        normalization_reference_rate = None,
+    ))]
+    fn enable_gravity_for_greedy(
+        &self,
+        mesh: &crate::mesh_bindings::NetMesh,
+        tick_interval_ms: u64,
+        enabled: bool,
+        emit_threshold_ratio: Option<f64>,
+        decay_half_life_secs: Option<u64>,
+        normalization_reference_rate: Option<f64>,
+    ) -> PyResult<()> {
+        use net::adapter::net::dataforts::DataGravityPolicy;
+        let mut policy = DataGravityPolicy::new().with_enabled(enabled);
+        if let Some(r) = emit_threshold_ratio {
+            policy = policy.with_emit_threshold_ratio(r as f32);
+        }
+        if let Some(secs) = decay_half_life_secs {
+            policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs));
+        }
+        if let Some(reference) = normalization_reference_rate {
+            policy = policy.with_normalization_reference_rate(reference as f32);
+        }
+        let arc = mesh.node_arc_clone()?;
+        self.inner
+            .enable_gravity_for_greedy(
+                arc,
+                policy,
+                std::time::Duration::from_millis(tick_interval_ms),
+            )
+            .map_err(|e| RedexError::new_err(format!("gravity invalid: {}", e)))
+    }
+
+    /// Stub when `dataforts` isn't compiled in. Returns a
+    /// typed RedexError naming the missing feature.
+    #[cfg(not(all(feature = "net", feature = "dataforts")))]
+    #[pyo3(signature = (_mesh = None, **_kwargs))]
+    fn enable_gravity_for_greedy(
+        &self,
+        _mesh: Option<Py<PyAny>>,
+        _kwargs: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        Err(RedexError::new_err(
+            "redex: enable_gravity_for_greedy requires the `dataforts` feature; \
+             rebuild with --features dataforts",
+        ))
+    }
+
+    /// Uninstall the gravity layer. Idempotent — no-op when not
+    /// enabled. Greedy itself stays running.
+    #[cfg(feature = "dataforts")]
+    fn disable_gravity_for_greedy(&self) {
+        self.inner.disable_gravity_for_greedy();
     }
 }
 
@@ -842,6 +1146,42 @@ impl PyTasksAdapter {
         py.detach(|| {
             runtime.block_on(async move { inner.wait_for_seq(seq).await });
         });
+    }
+
+    /// Read-your-writes wait. Blocks until this adapter's fold has
+    /// applied through `token.seq`, or `deadline_ms` elapses.
+    /// Raises `CortexError` on timeout, on a wrong-origin token, or
+    /// when the per-channel wait queue is saturated. GIL is released
+    /// for the wait.
+    ///
+    /// `deadline_ms == 0` is a non-blocking poll: returns
+    /// immediately with success when the watermark already covers
+    /// `token.seq`, or a typed `CortexError` (timeout / wrong-origin
+    /// / fold-stopped) otherwise. Mirrors the FFI / Node / Go
+    /// `timeout_ms == 0` contract so all four bindings agree.
+    #[pyo3(signature = (token, deadline_ms = 1000))]
+    fn wait_for_token(
+        &self,
+        py: Python<'_>,
+        token: &PyWriteToken,
+        deadline_ms: u64,
+    ) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let inner_token = token.as_inner();
+        if deadline_ms == 0 {
+            return inner
+                .poll_for_token(inner_token)
+                .map_err(map_wait_for_token_err);
+        }
+        let runtime = self.runtime.clone();
+        py.detach(|| {
+            runtime.block_on(async move {
+                inner
+                    .wait_for_token(inner_token, std::time::Duration::from_millis(deadline_ms))
+                    .await
+            })
+        })
+        .map_err(map_wait_for_token_err)
     }
 
     /// Close the adapter. Idempotent.
@@ -1320,6 +1660,35 @@ impl PyMemoriesAdapter {
         py.detach(|| {
             runtime.block_on(async move { inner.wait_for_seq(seq).await });
         });
+    }
+
+    /// Read-your-writes wait. Mirrors `TasksAdapter.wait_for_token`
+    /// — raises `CortexError` on timeout, wrong-origin, or queue-
+    /// full saturation. `deadline_ms == 0` is a non-blocking poll
+    /// (same contract as the FFI / Node / Go bindings).
+    #[pyo3(signature = (token, deadline_ms = 1000))]
+    fn wait_for_token(
+        &self,
+        py: Python<'_>,
+        token: &PyWriteToken,
+        deadline_ms: u64,
+    ) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let inner_token = token.as_inner();
+        if deadline_ms == 0 {
+            return inner
+                .poll_for_token(inner_token)
+                .map_err(map_wait_for_token_err);
+        }
+        let runtime = self.runtime.clone();
+        py.detach(|| {
+            runtime.block_on(async move {
+                inner
+                    .wait_for_token(inner_token, std::time::Duration::from_millis(deadline_ms))
+                    .await
+            })
+        })
+        .map_err(map_wait_for_token_err)
     }
 
     fn close(&self) -> PyResult<()> {

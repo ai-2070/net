@@ -43,6 +43,7 @@ mod replication_step;
 mod retention;
 mod segment;
 mod typed;
+mod write_token;
 
 pub use config::{FsyncPolicy, RedexFileConfig};
 pub use entry::{RedexEntry, RedexFlags, REDEX_ENTRY_SIZE};
@@ -88,3 +89,4 @@ pub use replication_step::{
     election_outcome, tick, OutboundMessage, PendingTransition, StepOutcome, TickInputs,
 };
 pub use typed::TypedRedexFile;
+pub use write_token::{WriteToken, WriteTokenParseError};

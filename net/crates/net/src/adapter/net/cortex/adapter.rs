@@ -2,22 +2,56 @@
 //! state.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use parking_lot::RwLock;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, Notify, Semaphore};
 use tokio_stream::wrappers::BroadcastStream;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::super::channel::ChannelName;
-use super::super::redex::{Redex, RedexError, RedexEvent, RedexFile, RedexFileConfig, RedexFold};
+use super::super::redex::{
+    Redex, RedexError, RedexEvent, RedexFile, RedexFileConfig, RedexFold, WriteToken,
+};
 use super::config::{CortexAdapterConfig, FoldErrorPolicy, StartPosition};
 use super::envelope::IntoRedexPayload;
 use super::error::CortexAdapterError;
 use super::meta::EVENT_META_SIZE;
+
+/// Process-wide cap on in-flight RYW waits across every
+/// `CortexAdapter` in the process. `CortexAdapterConfig::ryw_inflight_cap`
+/// bounds per-adapter; this caps the total. Operators running
+/// thousands of adapters need the process-wide bound so the
+/// cumulative permit count doesn't dwarf the memory budget.
+///
+/// Default: no global cap. Operators install one at startup via
+/// [`set_global_ryw_inflight_cap`]; the install is one-shot
+/// (`OnceLock`), so subsequent calls return `false` and leave the
+/// previous cap in place.
+static GLOBAL_RYW_CAP: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Install a process-wide cap on concurrent `wait_for_token`
+/// permits across every `CortexAdapter` instance. Call once at
+/// process startup before any RYW traffic. `cap` is clamped to a
+/// minimum of 1.
+///
+/// Returns `true` if the cap was installed by this call, `false`
+/// if a prior call already installed one.
+pub fn set_global_ryw_inflight_cap(cap: usize) -> bool {
+    GLOBAL_RYW_CAP
+        .set(Arc::new(Semaphore::new(cap.max(1))))
+        .is_ok()
+}
+
+/// Lookup the installed global cap; `None` when no cap has been
+/// set (default).
+fn current_global_ryw_semaphore() -> Option<Arc<Semaphore>> {
+    GLOBAL_RYW_CAP.get().cloned()
+}
 
 /// One-file CortEX adapter: projects envelopes into RedEX payloads,
 /// tails the same file, drives a [`RedexFold`] implementation, and
@@ -122,6 +156,52 @@ struct AdapterInner<State> {
     /// Broadcast of RedEX seqs after each successful (or LogAndContinue-skipped)
     /// fold apply. Subscribers: see [`CortexAdapter::changes`].
     changes_tx: broadcast::Sender<u64>,
+    /// Per-adapter cap on concurrent `wait_for_token` callers. `None`
+    /// when `CortexAdapterConfig::ryw_inflight_cap == 0` (unbounded).
+    /// Otherwise sized to `ryw_inflight_cap` permits; each pending
+    /// wait holds one permit for its duration. Exceeding the cap
+    /// returns `WaitForTokenError::QueueFull` immediately.
+    ryw_inflight: Option<Arc<Semaphore>>,
+    /// Per-adapter RYW counters. See [`RywMetricsSnapshot`].
+    ryw_metrics: RywMetricsAtomic,
+}
+
+/// Atomic counters backing [`CortexAdapter::ryw_metrics`]. One
+/// instance lives on each adapter (each adapter is per-channel
+/// already, so channel-labeling falls out of the adapter identity).
+#[derive(Debug, Default)]
+struct RywMetricsAtomic {
+    waits_total: AtomicU64,
+    timeouts_total: AtomicU64,
+    queue_full_total: AtomicU64,
+    wrong_origin_total: AtomicU64,
+    wait_duration_nanos_sum: AtomicU64,
+}
+
+/// Snapshot of the RYW counters on a [`CortexAdapter`].
+///
+/// All counters are monotonic; computing a rate is the caller's job
+/// (divide deltas between two snapshots by the sampling interval).
+/// `wait_duration_nanos_sum / waits_total` approximates the mean
+/// wait time without a full histogram.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RywMetricsSnapshot {
+    /// Cumulative `wait_for_token` calls that took a permit (i.e.
+    /// were not rejected up-front with `QueueFull` / `WrongOrigin`).
+    pub waits_total: u64,
+    /// Cumulative waits that returned `Timeout`.
+    pub timeouts_total: u64,
+    /// Cumulative waits rejected with `QueueFull`.
+    pub queue_full_total: u64,
+    /// Cumulative waits rejected with `WrongOrigin` at the bound-
+    /// adapter layer. The generic `CortexAdapter::wait_for_token`
+    /// never increments this; only `TasksAdapter::wait_for_token`
+    /// and `MemoriesAdapter::wait_for_token` do, when their guard
+    /// fires.
+    pub wrong_origin_total: u64,
+    /// Sum of nanoseconds spent inside `wait_for_token` past the
+    /// permit acquisition. Divide by `waits_total` for the mean.
+    pub wait_duration_nanos_sum: u64,
 }
 
 impl<State> CortexAdapter<State> {
@@ -254,6 +334,43 @@ impl<State> CortexAdapter<State> {
         }
     }
 
+    /// RYW-strength wait. Resolves when the **applied** watermark
+    /// (events that actually ran through the fold body, not
+    /// recoverable-skipped) catches up to `seq`, OR when the fold
+    /// task stops before reaching `seq`.
+    ///
+    /// Returns `Ok(())` on a real apply-through, `Err(applied)`
+    /// where `applied` is the last successfully-applied seq on
+    /// stop. Differs from [`Self::wait_for_seq`] which resolves
+    /// on the folded watermark (including skipped events). RYW
+    /// requires applied, not folded — otherwise a producer whose
+    /// write hit a recoverable-decode skip would observe
+    /// `Ok(())` and then read state that doesn't reflect the
+    /// write.
+    pub async fn wait_for_applied_seq(&self, seq: u64) -> Result<(), Option<u64>> {
+        if seq < self.inner.start_seq {
+            return Ok(());
+        }
+        loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let watermark = self.inner.applied_through_seq.load(Ordering::Acquire);
+            if watermark != u64::MAX && watermark >= seq {
+                return Ok(());
+            }
+            if !self.inner.running.load(Ordering::Acquire) {
+                // Stopped without ever reaching seq. Surface the
+                // last-applied watermark so the caller can build
+                // a typed error.
+                let applied = self.applied_through_seq();
+                return Err(applied);
+            }
+            notified.await;
+        }
+    }
+
     /// Close the adapter. Stops the fold task (after it finishes any
     /// in-progress apply), leaves the RedEX file open so other
     /// adapters / callers can continue using it, and leaves the
@@ -328,7 +445,202 @@ impl<State> CortexAdapter<State> {
         buf.extend_from_slice(&tail);
         Ok(self.inner.file.append(&buf)?)
     }
+
+    /// Append an envelope and return a [`WriteToken`] addressing
+    /// the resulting write. The token is the typed handle the
+    /// read-your-writes API consumes via
+    /// [`Self::wait_for_token`]; equivalent to calling [`Self::ingest`]
+    /// and pairing the returned seq with the envelope's
+    /// `meta.origin_hash`, but does both in one shot so the binding
+    /// surface can round-trip a single value.
+    pub fn ingest_with_token<E: IntoRedexPayload>(
+        &self,
+        envelope: E,
+    ) -> Result<WriteToken, CortexAdapterError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(CortexAdapterError::Closed);
+        }
+        let (meta, tail) = envelope.into_redex_payload();
+        let origin_hash = meta.origin_hash;
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + tail.len());
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&tail);
+        let seq = self.inner.file.append(&buf)?;
+        Ok(WriteToken::new(origin_hash, seq))
+    }
+
+    /// Block until the fold task has processed every event up
+    /// through `token.seq`, or `deadline` elapses. Returns
+    /// `Err(WaitForTokenError::Timeout)` on deadline; `Ok(())`
+    /// once the watermark catches up (or the fold task stops —
+    /// see [`Self::wait_for_seq`] for the same caveat).
+    ///
+    /// The token's `origin_hash` is informational at this layer
+    /// — the generic [`CortexAdapter`] folds every event in its
+    /// RedEX file regardless of origin. Origin-bound adapters
+    /// (e.g. [`super::tasks::TasksAdapter`],
+    /// [`super::memories::MemoriesAdapter`]) layer their own
+    /// origin assertion on top.
+    pub async fn wait_for_token(
+        &self,
+        token: WriteToken,
+        deadline: Duration,
+    ) -> Result<(), WaitForTokenError> {
+        // Try-acquire FIRST so backpressure surfaces before the timer
+        // arms — under saturation a `QueueFull` is the correct
+        // diagnostic, not a `Timeout` masking it.
+        //
+        // Two-tier acquire: global cap (process-wide; bounds
+        // cumulative permit count across every adapter) then
+        // per-adapter cap. Both must succeed; if either is
+        // saturated we bump the metric and return QueueFull. The
+        // global permit is dropped at function return; tests that
+        // exercise saturation rely on this being held for the
+        // duration of the wait.
+        let _global_permit = match current_global_ryw_semaphore() {
+            Some(sem) => Some(sem.try_acquire_owned().map_err(|_| {
+                self.inner
+                    .ryw_metrics
+                    .queue_full_total
+                    .fetch_add(1, Ordering::Relaxed);
+                WaitForTokenError::QueueFull
+            })?),
+            None => None,
+        };
+        let _permit = match &self.inner.ryw_inflight {
+            Some(sem) => Some(sem.clone().try_acquire_owned().map_err(|_| {
+                self.inner
+                    .ryw_metrics
+                    .queue_full_total
+                    .fetch_add(1, Ordering::Relaxed);
+                WaitForTokenError::QueueFull
+            })?),
+            None => None,
+        };
+        self.inner
+            .ryw_metrics
+            .waits_total
+            .fetch_add(1, Ordering::Relaxed);
+        let started = tokio::time::Instant::now();
+        // RYW waits on the *applied* watermark, not the folded
+        // watermark — events skipped via recoverable_decode under
+        // FoldErrorPolicy::Stop advance folded but not applied,
+        // and a producer whose write hit such a skip must NOT
+        // observe Ok(()) (that would let them read state that
+        // doesn't reflect their write).
+        let outcome =
+            match tokio::time::timeout(deadline, self.wait_for_applied_seq(token.seq)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(applied_through_seq)) => Err(WaitForTokenError::FoldStopped {
+                    applied_through_seq,
+                }),
+                Err(_) => {
+                    self.inner
+                        .ryw_metrics
+                        .timeouts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(WaitForTokenError::Timeout)
+                }
+            };
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.inner
+            .ryw_metrics
+            .wait_duration_nanos_sum
+            .fetch_add(nanos, Ordering::Relaxed);
+        outcome
+    }
+
+    /// Snapshot the RYW counters for this adapter. Cheap; reads
+    /// four atomics under `Relaxed`.
+    pub fn ryw_metrics(&self) -> RywMetricsSnapshot {
+        let m = &self.inner.ryw_metrics;
+        RywMetricsSnapshot {
+            waits_total: m.waits_total.load(Ordering::Relaxed),
+            timeouts_total: m.timeouts_total.load(Ordering::Relaxed),
+            queue_full_total: m.queue_full_total.load(Ordering::Relaxed),
+            wrong_origin_total: m.wrong_origin_total.load(Ordering::Relaxed),
+            wait_duration_nanos_sum: m.wait_duration_nanos_sum.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Bump the `wrong_origin_total` RYW counter. Called by the
+    /// origin-bound adapter wrappers when their guard fires; not
+    /// part of the generic adapter's own happy path.
+    pub(super) fn note_wrong_origin(&self) {
+        self.inner
+            .ryw_metrics
+            .wrong_origin_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
+
+/// Errors surfaced by [`CortexAdapter::wait_for_token`] and the
+/// origin-bound adapters that wrap it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WaitForTokenError {
+    /// Deadline elapsed before the fold watermark advanced to
+    /// the token's seq. The write may still land later; the
+    /// caller can retry with a fresh deadline or accept the
+    /// stale read.
+    Timeout,
+    /// Token belongs to a different origin than this adapter
+    /// folds. Origin-bound adapters surface this to catch the
+    /// caller-side aliasing where a token from chain A is waited
+    /// on against an adapter bound to chain B — the wait would
+    /// otherwise hang on a seq that can never land here.
+    WrongOrigin {
+        /// origin the token was issued for.
+        token_origin: u64,
+        /// origin this adapter is bound to.
+        adapter_origin: u64,
+    },
+    /// Per-channel in-flight cap is saturated — back-pressure for
+    /// callers who can shed load instead of stacking unbounded
+    /// pending waits. See
+    /// [`super::config::CortexAdapterConfig::with_ryw_inflight_cap`].
+    QueueFull,
+    /// Fold task stopped before the token's seq was reached.
+    /// Under `FoldErrorPolicy::Stop` an unrecoverable fold error
+    /// halts the task, and any pending RYW wait observing
+    /// `running == false` surfaces this variant rather than a
+    /// silent `Ok(())` — otherwise a producer cannot distinguish
+    /// "your write is visible" from "the adapter is dead and
+    /// never will reach your write."
+    FoldStopped {
+        /// Last seq the fold task fully applied before stopping.
+        /// `None` if the task stopped before applying any event.
+        applied_through_seq: Option<u64>,
+    },
+}
+
+impl std::fmt::Display for WaitForTokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("read-your-writes wait timed out"),
+            Self::WrongOrigin {
+                token_origin,
+                adapter_origin,
+            } => write!(
+                f,
+                "token origin {:016x} != adapter origin {:016x}",
+                token_origin, adapter_origin
+            ),
+            Self::QueueFull => f.write_str("read-your-writes wait-queue saturated; retry later"),
+            Self::FoldStopped {
+                applied_through_seq,
+            } => match applied_through_seq {
+                Some(seq) => write!(
+                    f,
+                    "fold task stopped before reaching token seq (applied through {})",
+                    seq
+                ),
+                None => f.write_str("fold task stopped before applying any event"),
+            },
+        }
+    }
+}
+
+impl std::error::Error for WaitForTokenError {}
 
 impl<State: Send + Sync + 'static> CortexAdapter<State> {
     /// Open an adapter against a RedEX file.
@@ -413,6 +725,11 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             start_seq - 1
         };
         let (changes_tx, _) = broadcast::channel(CHANGES_BROADCAST_CAP);
+        let ryw_inflight = if adapter_config.ryw_inflight_cap == 0 {
+            None
+        } else {
+            Some(Arc::new(Semaphore::new(adapter_config.ryw_inflight_cap)))
+        };
         let inner = Arc::new(AdapterInner {
             file: file.clone(),
             state: state.clone(),
@@ -430,6 +747,8 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             notify: Notify::new(),
             shutdown: Notify::new(),
             changes_tx,
+            ryw_inflight,
+            ryw_metrics: RywMetricsAtomic::default(),
         });
 
         let policy = adapter_config.on_fold_error;
@@ -581,6 +900,7 @@ where
         let config = CortexAdapterConfig {
             start,
             on_fold_error: adapter_config.on_fold_error,
+            ryw_inflight_cap: adapter_config.ryw_inflight_cap,
         };
         // Route through `open_unchecked` so the externally-
         // rehydrated state can skip its event prefix.
@@ -862,6 +1182,172 @@ mod tests {
         assert_eq!(*adapter.state().read(), 10);
         assert_eq!(adapter.fold_errors(), 0);
         assert!(adapter.is_running());
+    }
+
+    #[tokio::test]
+    async fn ingest_with_token_carries_envelope_origin_and_assigned_seq() {
+        let redex = Redex::new();
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/ryw-token"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+
+        let origin: u64 = 0xCAFE_F00D_DEAD_BEEF;
+        let meta = EventMeta::new(1, 0, origin, 0, 0);
+        let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+        let token = adapter.ingest_with_token(env).unwrap();
+
+        assert_eq!(token.origin_hash, origin);
+        assert_eq!(token.seq, 0);
+
+        adapter
+            .wait_for_token(token, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(*adapter.state().read(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_token_returns_queue_full_above_cap() {
+        let redex = Redex::new();
+        let cfg = CortexAdapterConfig::default().with_ryw_inflight_cap(2);
+        let adapter = Arc::new(
+            CortexAdapter::<u64>::open(
+                &redex,
+                &cn("cortex/ryw-queue"),
+                RedexFileConfig::default(),
+                cfg,
+                CountFold,
+                0u64,
+            )
+            .unwrap(),
+        );
+
+        // Pin two waiters on a seq that never lands — they hold the
+        // permits until their deadline elapses.
+        let token = WriteToken::new(0xABCD_EF01, 999);
+        let a = adapter.clone();
+        let h1 = tokio::spawn(async move { a.wait_for_token(token, Duration::from_secs(5)).await });
+        let a = adapter.clone();
+        let h2 = tokio::spawn(async move { a.wait_for_token(token, Duration::from_secs(5)).await });
+
+        // Give both tasks a moment to claim their permits.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A third waiter on the same adapter should be rejected
+        // immediately with QueueFull — no wait, no timeout.
+        let started = tokio::time::Instant::now();
+        let err = adapter
+            .wait_for_token(token, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err, WaitForTokenError::QueueFull);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "QueueFull must return immediately, not wait for deadline"
+        );
+
+        // Drop the holders so their tasks finish on their own
+        // schedule.
+        let _ = (h1, h2);
+    }
+
+    #[tokio::test]
+    async fn ryw_metrics_track_waits_timeouts_and_queue_full() {
+        let redex = Redex::new();
+        let cfg = CortexAdapterConfig::default().with_ryw_inflight_cap(1);
+        let adapter = Arc::new(
+            CortexAdapter::<u64>::open(
+                &redex,
+                &cn("cortex/ryw-metrics"),
+                RedexFileConfig::default(),
+                cfg,
+                CountFold,
+                0u64,
+            )
+            .unwrap(),
+        );
+
+        // No waits yet → all zeros.
+        let s0 = adapter.ryw_metrics();
+        assert_eq!(s0, RywMetricsSnapshot::default());
+
+        // Pin a long waiter to hold the only permit, then attempt a
+        // second wait — it must hit QueueFull and bump that counter.
+        let token = WriteToken::new(0xABCD_EF01, 999);
+        let a = adapter.clone();
+        let holder = tokio::spawn(async move {
+            let _ = a.wait_for_token(token, Duration::from_secs(2)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let err = adapter
+            .wait_for_token(token, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err, WaitForTokenError::QueueFull);
+
+        // Wait for the holder to time out, then check the counters.
+        holder.await.unwrap();
+        let s1 = adapter.ryw_metrics();
+        assert_eq!(s1.waits_total, 1, "holder takes one permit + one wait slot");
+        assert_eq!(s1.timeouts_total, 1, "holder's deadline elapsed");
+        assert_eq!(s1.queue_full_total, 1, "saturating attempt was rejected");
+        assert_eq!(s1.wrong_origin_total, 0);
+        assert!(
+            s1.wait_duration_nanos_sum >= 1_000_000_000,
+            "holder waited at least its 2s deadline, observed {}ns",
+            s1.wait_duration_nanos_sum
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_token_with_zero_cap_skips_queue_check() {
+        let redex = Redex::new();
+        let cfg = CortexAdapterConfig::default().with_ryw_inflight_cap(0);
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/ryw-uncapped"),
+            RedexFileConfig::default(),
+            cfg,
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+
+        // With cap=0 the semaphore is None; the path goes straight
+        // to the deadline.
+        let token = WriteToken::new(0xABCD_EF01, 999);
+        let err = adapter
+            .wait_for_token(token, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(err, WaitForTokenError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn wait_for_token_times_out_when_seq_never_lands() {
+        let redex = Redex::new();
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/ryw-timeout"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+
+        let unreachable = WriteToken::new(0xDEAD_BEEF, 999);
+        let err = adapter
+            .wait_for_token(unreachable, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(err, WaitForTokenError::Timeout);
     }
 
     #[tokio::test]

@@ -51,6 +51,38 @@
 //! of a `Handle::try_current()` check on every poll would be
 //! measurable for the common path that doesn't hit the bug.
 //!
+//! # `catch_unwind` + caller-held locks
+//!
+//! Several FFI entries (`net_blob_publish`, `net_blob_resolve`,
+//! `net_*_wait_for_token`) wrap their body in
+//! `std::panic::catch_unwind(AssertUnwindSafe(...))` so a panic
+//! during the call returns a typed `NET_ERR_BLOB_PANIC` /
+//! `NET_ERR_PANIC` code rather than unwinding across the FFI
+//! boundary. That stops the substrate-side undefined behavior,
+//! but it does NOT make the wrapped code transparently panic-safe
+//! from the caller's perspective.
+//!
+//! **If the caller invokes an FFI op while holding an OS-level
+//! lock, a `sync.Mutex` (Go), `threading.Lock` (Python), or any
+//! other mutex with poisoning semantics, and the FFI body panics,
+//! the mutex is left in a poisoned state.** Subsequent acquires
+//! on the same mutex by the caller observe the poisoning and
+//! either error (Rust `parking_lot` with `poison_on_unwind`) or
+//! deadlock (Go's `sync.Mutex` doesn't poison; the caller has
+//! observed a return value that may not reflect the state of
+//! the FFI op).
+//!
+//! Recommended caller pattern: **do not hold a caller-side lock
+//! across an FFI call**. Acquire the lock, prepare the inputs,
+//! release the lock, then call the FFI. Re-acquire if you need
+//! to update caller state with the result.
+//!
+//! The hazard is documented per-binding in:
+//!   - Python: `bindings/python/README.md` (caller-mutex notes)
+//!   - Node:   `bindings/node/README.md`
+//!   - Go:     `bindings/go/net/redex.go` lifecycle docs
+//!   - C:      `include/net.h` (every wait-family declaration)
+//!
 //! # Memory Management
 //!
 //! - Handles returned by `net_init` must be freed with `net_shutdown`
@@ -119,6 +151,14 @@ pub mod handle_guard;
 #[cfg(all(feature = "netdb", feature = "redex-disk"))]
 #[allow(missing_docs)]
 pub mod cortex;
+
+/// C FFI for the Dataforts Phase 3 blob surface. Exposes the
+/// BlobRef wire codec, the global adapter registry, and the
+/// `publish_blob` / `resolve_payload` helpers for cgo / native
+/// consumers.
+#[cfg(feature = "dataforts")]
+#[allow(missing_docs)]
+pub mod blob;
 
 /// C FFI for the encrypted-UDP mesh transport + channels. Requires
 /// the `net` feature (which brings in the crypto + transport). Go /

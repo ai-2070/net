@@ -49,6 +49,8 @@ mod mesh;
 // `cortex` enabled, and unconditionally exposing them broke `--features
 // net` builds (mesh_rpc.rs references `super::cortex::*`). Gating both
 // keeps the bare-net build clean.
+#[cfg(feature = "dataforts")]
+pub mod dataforts;
 #[cfg(feature = "cortex")]
 pub mod mesh_rpc;
 #[cfg(feature = "cortex")]

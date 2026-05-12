@@ -351,6 +351,18 @@ impl RedexFile {
         self.inner.state.lock().index.is_empty()
     }
 
+    /// Sum of `payload_len` across every currently-retained entry.
+    /// Reflects the substrate's authoritative view of bytes-on-disk
+    /// after retention trim; callers that maintain their own
+    /// monotonic byte counters (e.g. greedy's GreedyCacheRegistry)
+    /// use this to resync periodically. O(n) over the retained
+    /// index; cheap for the typical few-K-entry case but the caller
+    /// shouldn't call it per-event.
+    pub fn retained_bytes(&self) -> u64 {
+        let state = self.inner.state.lock();
+        state.index.iter().map(|e| u64::from(e.payload_len)).sum()
+    }
+
     /// Next sequence to be assigned (== total append count since open,
     /// including any evicted head).
     ///
@@ -1029,6 +1041,74 @@ impl RedexFile {
         out
     }
 
+    /// Read a single event by sequence. Returns `None` when `seq`
+    /// has been evicted or was never appended. Convenience over
+    /// [`Self::read_range(seq, seq + 1)`]; saves the `Vec`
+    /// allocation when the caller only wants one event.
+    pub fn read_one(&self, seq: u64) -> Option<RedexEvent> {
+        let state = self.inner.state.lock();
+        for entry in state.index.iter() {
+            if entry.seq < seq {
+                continue;
+            }
+            if entry.seq > seq {
+                break;
+            }
+            return materialize(entry, &state.segment);
+        }
+        None
+    }
+
+    /// Read a single event and resolve its payload — inline events
+    /// return their bytes as-is, blob-ref events go through this
+    /// file's configured [`super::super::dataforts::blob::BlobAdapter`]
+    /// (looked up by `config.blob_adapter_id` in the global
+    /// registry) and have their BLAKE3 hash verified.
+    ///
+    /// Returns:
+    /// - `Ok(None)` — `seq` is not retained / never appended.
+    /// - `Ok(Some(bytes))` — resolved payload.
+    /// - `Err(BlobError::*)` — payload was a malformed BlobRef, the
+    ///   configured adapter id is unset / missing in the registry,
+    ///   the adapter's fetch failed, or the hash check failed.
+    #[cfg(feature = "dataforts")]
+    pub async fn resolve_one(
+        &self,
+        seq: u64,
+    ) -> Result<Option<bytes::Bytes>, super::super::dataforts::blob::BlobError> {
+        use super::super::dataforts::blob::{
+            classify_payload, global_blob_adapter_registry, BlobError, EventPayload,
+        };
+        let event = match self.read_one(seq) {
+            Some(ev) => ev,
+            None => return Ok(None),
+        };
+        match classify_payload(&event.payload)? {
+            EventPayload::Inline(_) => Ok(Some(event.payload)),
+            EventPayload::Blob(blob) => {
+                let adapter_id = self
+                    .inner
+                    .config
+                    .blob_adapter_id
+                    .as_deref()
+                    .ok_or(BlobError::AdapterNotConfigured)?;
+                // Resolve through the channel's bound registry when
+                // set; falls back to the process-wide global. The
+                // per-channel registry exists for multi-tenant
+                // binding hosts that want adapter-id scoping per
+                // tenant.
+                let adapter = match self.inner.config.blob_adapter_registry.as_ref() {
+                    Some(reg) => reg.get(adapter_id),
+                    None => global_blob_adapter_registry().get(adapter_id),
+                }
+                .ok_or_else(|| BlobError::AdapterNotRegistered(adapter_id.to_string()))?;
+                let fetched = adapter.fetch(&blob).await?;
+                blob.verify(&fetched)?;
+                Ok(Some(bytes::Bytes::from(fetched)))
+            }
+        }
+    }
+
     /// Run the retention policy synchronously. Exposed so a background
     /// task (heartbeat loop) can drive it; no hot-path cost.
     ///
@@ -1481,6 +1561,199 @@ mod tests {
         assert_eq!(f.append(b"b").unwrap(), 1);
         assert_eq!(f.append(b"c").unwrap(), 2);
         assert_eq!(f.next_seq(), 3);
+    }
+
+    #[test]
+    fn read_one_returns_appended_event() {
+        let f = make_file("t-read-one");
+        let seq = f.append(b"hello").unwrap();
+        let event = f.read_one(seq).expect("event present");
+        assert_eq!(event.entry.seq, seq);
+        assert_eq!(&event.payload[..], b"hello");
+    }
+
+    #[test]
+    fn read_one_returns_none_for_missing_seq() {
+        let f = make_file("t-read-one-miss");
+        f.append(b"first").unwrap();
+        // Seq 5 was never appended.
+        assert!(f.read_one(5).is_none());
+    }
+
+    #[test]
+    fn read_one_returns_none_after_eviction() {
+        let cfg = RedexFileConfig::default().with_retention_max_events(2);
+        let f = RedexFile::new(ChannelName::new("t-read-one-evicted").unwrap(), cfg);
+        for i in 0u8..5 {
+            f.append(&[i]).unwrap();
+        }
+        f.sweep_retention();
+        // Seq 0 + 1 should be gone; seq 4 should still be there.
+        assert!(f.read_one(0).is_none());
+        assert!(f.read_one(4).is_some());
+    }
+
+    #[cfg(feature = "dataforts")]
+    mod resolve_one_tests {
+        use super::super::super::super::dataforts::blob::{
+            global_blob_adapter_registry, BlobError, BlobRef, FileSystemAdapter, NoopAdapter,
+        };
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        fn unique_id(prefix: &str) -> String {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            format!("{}-{}-{}", prefix, std::process::id(), n)
+        }
+
+        #[tokio::test]
+        async fn resolve_one_passes_inline_payload_through() {
+            let cfg = RedexFileConfig::default();
+            let f = RedexFile::new(ChannelName::new("resolve-inline").unwrap(), cfg);
+            let seq = f.append(b"plain bytes").unwrap();
+            let bytes = f.resolve_one(seq).await.unwrap().expect("present");
+            assert_eq!(&bytes[..], b"plain bytes");
+        }
+
+        #[tokio::test]
+        async fn resolve_one_returns_none_for_missing_seq() {
+            let cfg = RedexFileConfig::default();
+            let f = RedexFile::new(ChannelName::new("resolve-missing").unwrap(), cfg);
+            assert!(f.resolve_one(123).await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn resolve_one_routes_blob_ref_through_configured_adapter() {
+            let id = unique_id("resolve-routing");
+            let root = std::env::temp_dir().join(format!("net-resolve-{}", id));
+            let adapter = Arc::new(FileSystemAdapter::new(id.clone(), &root));
+            global_blob_adapter_registry()
+                .register(adapter.clone())
+                .unwrap();
+
+            // Store some content under a BlobRef + record the ref.
+            let payload = b"out-of-band content";
+            let blob = BlobRef::new(
+                "fs://routed",
+                blake3::hash(payload).into(),
+                payload.len() as u64,
+            );
+            use super::super::super::super::dataforts::blob::BlobAdapter;
+            adapter.store(&blob, payload).await.unwrap();
+
+            // Open a channel that points at the registered adapter.
+            let cfg = RedexFileConfig::default().with_blob_adapter_id(Some(id.clone()));
+            let f = RedexFile::new(ChannelName::new("resolve-routed").unwrap(), cfg);
+            // Append the encoded BlobRef as the event payload.
+            let encoded = blob.encode();
+            let seq = f.append(&encoded).unwrap();
+
+            // resolve_one should fetch + verify and return the original payload.
+            let bytes = f.resolve_one(seq).await.unwrap().expect("present");
+            assert_eq!(&bytes[..], payload);
+
+            global_blob_adapter_registry().unregister(&id);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[tokio::test]
+        async fn resolve_one_errors_when_blob_adapter_id_unset() {
+            // BlobRef payload but no blob_adapter_id configured on
+            // the channel — surfaces as AdapterNotConfigured (the
+            // typed variant the substrate exposes since the
+            // dataforts review; previously overloaded onto
+            // UnsupportedScheme, which conflated config issues with
+            // URI-scheme rejection).
+            let payload = b"any";
+            let blob = BlobRef::new(
+                "file:///orphan",
+                blake3::hash(payload).into(),
+                payload.len() as u64,
+            );
+            let cfg = RedexFileConfig::default(); // blob_adapter_id = None
+            let f = RedexFile::new(ChannelName::new("resolve-orphan").unwrap(), cfg);
+            let seq = f.append(&blob.encode()).unwrap();
+            let err = f.resolve_one(seq).await.unwrap_err();
+            assert!(matches!(err, BlobError::AdapterNotConfigured));
+        }
+
+        #[tokio::test]
+        async fn resolve_one_routes_through_per_channel_registry() {
+            // Per-channel BlobAdapterRegistry isolates adapter ids
+            // for multi-tenant binding hosts. A tenant registers
+            // "s3-primary" into ITS registry; the global stays
+            // free of the id. resolve_one with the per-channel
+            // registry bound looks up successfully without the
+            // global ever seeing the id.
+            use super::super::super::super::dataforts::blob::{
+                BlobAdapter, BlobAdapterRegistry, NoopAdapter,
+            };
+            let tenant_id = unique_id("tenant-s3-primary");
+            let tenant_registry = Arc::new(BlobAdapterRegistry::new());
+            let tenant_adapter: Arc<dyn BlobAdapter> =
+                Arc::new(NoopAdapter::new(tenant_id.clone()));
+            tenant_registry.register(tenant_adapter).unwrap();
+            // The global is intentionally NOT given the id.
+            assert!(global_blob_adapter_registry().get(&tenant_id).is_none());
+
+            let cfg = RedexFileConfig::default()
+                .with_blob_adapter_id(Some(tenant_id.clone()))
+                .with_blob_adapter_registry(Some(tenant_registry.clone()));
+            let f = RedexFile::new(
+                ChannelName::new("resolve-per-channel-registry").unwrap(),
+                cfg,
+            );
+            let payload = b"x";
+            let blob = BlobRef::new(
+                "file:///per-channel",
+                blake3::hash(payload).into(),
+                payload.len() as u64,
+            );
+            let seq = f.append(&blob.encode()).unwrap();
+            // The tenant adapter (NoopAdapter) returns NotFound on
+            // fetch — confirms the routing landed at the tenant
+            // adapter, not at "AdapterNotRegistered" via the global.
+            let err = f.resolve_one(seq).await.unwrap_err();
+            assert!(matches!(err, BlobError::NotFound(_)));
+        }
+
+        #[tokio::test]
+        async fn resolve_one_errors_when_configured_adapter_not_registered() {
+            // Channel points at adapter id "ghost" which no one registered.
+            let payload = b"any";
+            let blob = BlobRef::new(
+                "file:///ghost",
+                blake3::hash(payload).into(),
+                payload.len() as u64,
+            );
+            let cfg =
+                RedexFileConfig::default().with_blob_adapter_id(Some("ghost-adapter-id".into()));
+            let f = RedexFile::new(ChannelName::new("resolve-ghost").unwrap(), cfg);
+            let seq = f.append(&blob.encode()).unwrap();
+            let err = f.resolve_one(seq).await.unwrap_err();
+            assert!(matches!(err, BlobError::AdapterNotRegistered(_)));
+        }
+
+        #[tokio::test]
+        async fn resolve_one_surfaces_not_found_from_adapter() {
+            // Channel routes to a registered Noop adapter; payload
+            // is a BlobRef → noop's fetch returns NotFound. Pins
+            // the adapter-error pass-through path.
+            let id = unique_id("resolve-noop");
+            let adapter: Arc<NoopAdapter> = Arc::new(NoopAdapter::new(id.clone()));
+            global_blob_adapter_registry().register(adapter).unwrap();
+
+            let blob = BlobRef::new("noop://nowhere", [0xAA; 32], 0);
+            let cfg = RedexFileConfig::default().with_blob_adapter_id(Some(id.clone()));
+            let f = RedexFile::new(ChannelName::new("resolve-noop").unwrap(), cfg);
+            let seq = f.append(&blob.encode()).unwrap();
+            let err = f.resolve_one(seq).await.unwrap_err();
+            assert!(matches!(err, BlobError::NotFound(_)));
+
+            global_blob_adapter_registry().unregister(&id);
+        }
     }
 
     /// Regression: `len_and_next_seq()` returns a consistent

@@ -49,6 +49,14 @@ nat-traversal = ["net", "net/nat-traversal"]
 # Builds on `nat-traversal`.
 port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk", "dep:async-trait"]
+# Dataforts (Rebel Yell) surface — compiles the operator methods
+# wiring greedy-LRU + data-gravity + future phases. Same shape as
+# the Python binding — depends on cortex transitively for the
+# Redex surface. Off by default; downstream consumers opt in.
+# Toggling greedy / gravity at runtime is via `Redex::enable_*`
+# methods; the Cargo feature only gates whether the binding
+# surface compiles at all.
+dataforts = ["cortex", "net", "net/dataforts"]
 # Compute surface — `DaemonRuntime`, `MeshDaemon`, migration.
 # Depends on `net` (mesh transport is what daemons ride) and
 # brings in `net-sdk` at its `compute` feature for the

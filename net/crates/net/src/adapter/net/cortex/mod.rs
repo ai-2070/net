@@ -31,8 +31,10 @@ pub mod memories;
 #[cfg(feature = "cortex")]
 pub mod tasks;
 
-pub use adapter::{ChangeEvent, CortexAdapter};
-pub use config::{CortexAdapterConfig, FoldErrorPolicy, StartPosition};
+pub use adapter::{
+    set_global_ryw_inflight_cap, ChangeEvent, CortexAdapter, RywMetricsSnapshot, WaitForTokenError,
+};
+pub use config::{CortexAdapterConfig, FoldErrorPolicy, StartPosition, RYW_INFLIGHT_CAP_DEFAULT};
 pub use envelope::{EventEnvelope, IntoRedexPayload};
 pub use error::CortexAdapterError;
 pub use meta::{

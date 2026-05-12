@@ -6,6 +6,8 @@
 // single security unit — they share `adapter::net`'s subprotocol
 // dispatch and operate together at runtime, so gating each module
 // separately would only enable combinations that aren't meaningful.
+#[cfg(feature = "dataforts")]
+mod blob;
 #[cfg(feature = "net")]
 mod capabilities;
 mod common;

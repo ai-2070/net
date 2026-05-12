@@ -2,6 +2,8 @@
 //!
 //! Provides high-performance event ingestion and consumption for Python.
 
+#[cfg(feature = "dataforts")]
+mod blob;
 #[cfg(feature = "cortex")]
 mod cortex;
 // Identity / capabilities / subnets ride the `net` feature as a
@@ -2224,6 +2226,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<cortex::PyRedexFile>()?;
         m.add_class::<cortex::PyRedexTailIter>()?;
         m.add_class::<cortex::PyRedexEvent>()?;
+        m.add_class::<cortex::PyWriteToken>()?;
         m.add_class::<cortex::PyTask>()?;
         m.add_class::<cortex::PyTasksAdapter>()?;
         m.add_class::<cortex::PyTaskWatchIter>()?;
@@ -2267,6 +2270,30 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             "RpcCancelledError",
             m.py().get_type::<mesh_rpc::RpcCancelledError>(),
         )?;
+    }
+    #[cfg(feature = "dataforts")]
+    {
+        m.add_class::<blob::PyBlobRef>()?;
+        m.add_function(wrap_pyfunction!(blob::register_filesystem_blob_adapter, m)?)?;
+        m.add_function(wrap_pyfunction!(blob::register_blob_adapter, m)?)?;
+        m.add_function(wrap_pyfunction!(blob::unregister_blob_adapter, m)?)?;
+        m.add_function(wrap_pyfunction!(blob::blob_adapter_registered, m)?)?;
+        m.add_function(wrap_pyfunction!(blob::blob_adapter_ids, m)?)?;
+        m.add_function(wrap_pyfunction!(blob::blob_publish, m)?)?;
+        m.add_function(wrap_pyfunction!(blob::blob_resolve, m)?)?;
+        m.add("BlobError", m.py().get_type::<blob::BlobError>())?;
+
+        // Register an atexit hook so the global blob-adapter
+        // registry is drained while the interpreter is still
+        // alive. Python-implemented adapters hold a Py<PyAny>;
+        // dropping one after interpreter finalization aborts the
+        // process via PyO3's safety guard. Draining here on
+        // shutdown frees those refs while the GIL is still
+        // acquirable.
+        let py = m.py();
+        let drain_fn = wrap_pyfunction!(blob::_drain_blob_adapters, m)?;
+        let atexit = py.import("atexit")?;
+        atexit.call_method1("register", (drain_fn,))?;
     }
     #[cfg(feature = "compute")]
     {

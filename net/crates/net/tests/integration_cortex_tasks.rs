@@ -11,11 +11,12 @@ use futures::StreamExt;
 use net::adapter::net::channel::ChannelName;
 use net::adapter::net::cortex::tasks::{OrderBy, TaskStatus, TasksAdapter, TASKS_CHANNEL};
 use net::adapter::net::cortex::{
-    compute_checksum, compute_checksum_with_meta, EventMeta, EVENT_META_SIZE,
+    compute_checksum, compute_checksum_with_meta, EventMeta, WaitForTokenError, EVENT_META_SIZE,
 };
 use net::adapter::net::redex::Redex;
 #[cfg(feature = "redex-disk")]
 use net::adapter::net::redex::RedexFileConfig;
+use net::adapter::net::redex::WriteToken;
 
 const ORIGIN: u64 = 0xABCD_EF01;
 
@@ -516,6 +517,7 @@ async fn test_regression_fold_rejects_checksum_mismatch() {
     let cfg = CortexAdapterConfig {
         start: StartPosition::FromBeginning,
         on_fold_error: FoldErrorPolicy::Stop,
+        ..Default::default()
     };
     let adapter = CortexAdapter::<TasksState>::open(
         &redex,
@@ -1180,4 +1182,38 @@ async fn test_regression_snapshot_and_watch_forwards_divergent_stream_initial() 
             trial
         );
     }
+}
+
+/// Regression: TasksAdapter::poll_for_token is a non-blocking
+/// synchronous check that should:
+/// 1. Return Ok(()) immediately when the watermark covers `seq`.
+/// 2. Return Timeout (NOT block) when it doesn't yet.
+/// 3. Return WrongOrigin when the token's origin_hash mismatches.
+///
+/// Pins the contract every binding's `wait_for_token(deadline=0)`
+/// is routed through.
+#[tokio::test]
+async fn poll_for_token_synchronous_non_blocking_check() {
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+
+    let seq = tasks.create(1, "ping", now_ns()).unwrap();
+    let token = WriteToken::new(ORIGIN, seq);
+
+    // Wait for the fold to apply through `seq` so poll can succeed.
+    tasks.wait_for_seq(seq).await;
+    tasks
+        .poll_for_token(token)
+        .expect("poll must succeed once seq applied");
+
+    // Future seq beyond the watermark must surface Timeout, not
+    // block, not error otherwise.
+    let future_token = WriteToken::new(ORIGIN, seq + 1_000_000);
+    let err = tasks.poll_for_token(future_token).unwrap_err();
+    assert!(matches!(err, WaitForTokenError::Timeout));
+
+    // Mismatched origin must surface WrongOrigin.
+    let alien_token = WriteToken::new(0xDEAD_BEEF, seq);
+    let err = tasks.poll_for_token(alien_token).unwrap_err();
+    assert!(matches!(err, WaitForTokenError::WrongOrigin { .. }));
 }

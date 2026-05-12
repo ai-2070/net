@@ -35,9 +35,10 @@ use crate::adapter::net::cortex::tasks::{
     OrderBy as TasksOrderBy, Task, TaskStatus, TasksAdapter as InnerTasksAdapter, TasksFilter,
     TasksWatcher,
 };
+use crate::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use crate::adapter::net::redex::{
     FsyncPolicy, Redex as InnerRedex, RedexError, RedexEvent, RedexFile as InnerRedexFile,
-    RedexFileConfig,
+    RedexFileConfig, WriteToken as InnerWriteToken,
 };
 
 use super::handle_guard::{HandleGuard, FFI_HANDLE_FREE_DEADLINE};
@@ -58,6 +59,58 @@ pub(crate) const NET_ERR_NETDB: c_int = -102;
 pub(crate) const NET_ERR_REDEX: c_int = -103;
 pub(crate) const NET_ERR_TIMEOUT: c_int = 1;
 pub(crate) const NET_ERR_STREAM_ENDED: c_int = 2;
+/// Read-your-writes wait rejected because the token belongs to a
+/// different origin than the bound adapter folds. See
+/// `WaitForTokenError::WrongOrigin`.
+pub(crate) const NET_ERR_WRONG_ORIGIN: c_int = -104;
+/// Read-your-writes wait rejected because the per-channel wait
+/// queue is saturated. See `WaitForTokenError::QueueFull`.
+pub(crate) const NET_ERR_QUEUE_FULL: c_int = -105;
+/// Read-your-writes wait failed because the fold task stopped
+/// before the token's seq was applied. See
+/// `WaitForTokenError::FoldStopped`.
+pub(crate) const NET_ERR_FOLD_STOPPED: c_int = -106;
+/// Feature not built into this `libnet` — the symbol exists for
+/// link-time compatibility but the runtime cannot honor it. Cgo /
+/// dlsym consumers see a stable error rather than a linker
+/// failure when they target a `libnet.so` built without the
+/// `dataforts` feature.
+#[allow(dead_code)] // only referenced from `#[cfg(not(feature = "dataforts"))]` stubs
+pub(crate) const NET_ERR_FEATURE_NOT_BUILT: c_int = -107;
+/// Panic surfaced from inside the substrate during a wait_for_token
+/// call. Caught with `catch_unwind` and reported here rather than
+/// unwinding across the FFI boundary (UB for C / cgo / Python).
+pub(crate) const NET_ERR_PANIC: c_int = -108;
+
+/// Non-blocking poll variant of wait_for_token: checks origin
+/// binding and the applied watermark, returns immediately. Maps
+/// to the same code set as the full wait, except QueueFull is
+/// not reachable (no permit is taken). Used by the FFI when the
+/// caller passes timeout_ms == 0 to mean "is the write visible
+/// yet?" without scheduling a Notified future.
+fn tasks_poll_for_token(adapter: &Arc<InnerTasksAdapter>, token: InnerWriteToken) -> c_int {
+    // Route through the adapter's public poll method so the FFI
+    // and every binding consume the same shape; previously the
+    // FFI had its own copy of the logic which the Python binding
+    // didn't share, producing observable divergence on
+    // `timeout_ms == 0` (now fixed in the Python `wait_for_token`
+    // by special-casing zero through this same call).
+    match adapter.poll_for_token(token) {
+        Ok(()) => 0,
+        Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+        Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
+        Err(_) => NET_ERR_TIMEOUT,
+    }
+}
+
+fn memories_poll_for_token(adapter: &Arc<InnerMemoriesAdapter>, token: InnerWriteToken) -> c_int {
+    match adapter.poll_for_token(token) {
+        Ok(()) => 0,
+        Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+        Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
+        Err(_) => NET_ERR_TIMEOUT,
+    }
+}
 
 // =========================================================================
 // Shared utilities
@@ -295,6 +348,54 @@ pub extern "C" fn net_redex_free(handle: *mut RedexHandle) {
 // FFI because there's no shared SDK wrapper — every binding goes
 // straight against the core `Redex` types.
 
+/// RAII guard around the `*mut Arc<MeshNode>` handle the
+/// `net_redex_enable_*` family of FFI entries receives. The
+/// caller contract is "the Arc is consumed regardless of return
+/// code"; without a guard every error path has to remember to
+/// drop the Box manually. Holding the pointer in a guard and
+/// calling `.take()` only on the success path keeps the drop
+/// branch single-sourced — and a future error variant added to
+/// any of these functions automatically inherits the leak-free
+/// behavior.
+///
+/// Constructed via `MeshArcOwned::new` after the FFI's null-check,
+/// consumed via `.take()` on the success path. The Drop impl
+/// frees the Box on every other exit (including panics, though
+/// these are also caught by `catch_unwind` at the FFI boundary).
+struct MeshArcOwned {
+    ptr: *mut Arc<crate::adapter::net::MeshNode>,
+}
+
+impl MeshArcOwned {
+    /// # Safety
+    /// `ptr` must be a non-null pointer produced by
+    /// `net_mesh_arc_clone` and not yet consumed.
+    unsafe fn new(ptr: *mut Arc<crate::adapter::net::MeshNode>) -> Self {
+        Self { ptr }
+    }
+
+    /// Take the Arc out of the guard, leaving Drop to no-op. Use
+    /// only on the success path.
+    ///
+    /// # Safety
+    /// Same conditions as [`Self::new`].
+    unsafe fn take(mut self) -> Arc<crate::adapter::net::MeshNode> {
+        let ptr = std::mem::replace(&mut self.ptr, std::ptr::null_mut());
+        unsafe { *Box::from_raw(ptr) }
+    }
+}
+
+impl Drop for MeshArcOwned {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: ptr was produced by `Box::into_raw` on the
+            // caller side (`net_mesh_arc_clone`) and is consumed
+            // here at most once because `take()` clears it.
+            unsafe { drop(Box::from_raw(self.ptr)) };
+        }
+    }
+}
+
 /// Install cross-node replication on this `Redex`. Consumes the
 /// `*mut Arc<MeshNode>` boxed pointer produced by
 /// `net_mesh_arc_clone` — caller MUST NOT free it again
@@ -312,36 +413,25 @@ pub extern "C" fn net_redex_enable_replication(
     redex: *mut RedexHandle,
     mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
 ) -> c_int {
-    // R-8: free `mesh_arc` on every error path. The Go binding
-    // (and every other C consumer) reads the rc + assumes the
-    // Arc was consumed regardless; without this drop the boxed
-    // Arc leaks on every NullPointer / ShuttingDown return.
     if redex.is_null() || mesh_arc.is_null() {
         if !mesh_arc.is_null() {
             // SAFETY: caller documented `mesh_arc` as produced by
             // `net_mesh_arc_clone`. Drop now to honor the
             // "consumed regardless" contract.
-            unsafe {
-                drop(Box::from_raw(mesh_arc));
-            }
+            unsafe { drop(Box::from_raw(mesh_arc)) };
         }
         return NetError::NullPointer.into();
     }
+    // SAFETY: caller documented `mesh_arc` as produced by
+    // `net_mesh_arc_clone`; checked non-null just above.
+    let arc_guard = unsafe { MeshArcOwned::new(mesh_arc) };
     let redex_ref = unsafe { &*redex };
     let _op = match redex_ref.guard.try_enter() {
         Some(op) => op,
-        None => {
-            // SAFETY: as above; drop the Arc the caller already
-            // gave up ownership of.
-            unsafe {
-                drop(Box::from_raw(mesh_arc));
-            }
-            return NetError::ShuttingDown.into();
-        }
+        None => return NetError::ShuttingDown.into(),
     };
-    // SAFETY: `mesh_arc` is documented as produced by
-    // `net_mesh_arc_clone`; consume the Box, take the Arc.
-    let mesh = unsafe { *Box::from_raw(mesh_arc) };
+    // SAFETY: take consumes the guard; subsequent exits no-op on Drop.
+    let mesh = unsafe { arc_guard.take() };
     redex_ref.inner.enable_replication(mesh);
     0
 }
@@ -394,6 +484,407 @@ pub extern "C" fn net_redex_replication_prometheus_text(redex: *const RedexHandl
         Ok(c) => c.into_raw(),
         Err(_) => CString::new("").unwrap().into_raw(),
     }
+}
+
+// =========================================================================
+// Greedy-LRU dataforts operator surface (DATAFORTS_PLAN § Phase 1)
+// =========================================================================
+//
+// Same shape as the replication FFI above. The Go binding consumes
+// `net_redex_enable_greedy_dataforts(mesh, config_json)`; the config
+// rides as a JSON-encoded `RedexGreedyConfigJson` so binding-side
+// validation surfaces typed errors before the install lands.
+
+/// JSON shape the Go (and any C-ABI) consumer encodes for
+/// `net_redex_enable_greedy_dataforts`. All fields optional —
+/// missing fields keep the substrate Phase-1 defaults.
+#[cfg(feature = "dataforts")]
+#[derive(serde::Deserialize, Default)]
+struct RedexGreedyConfigJson {
+    /// Scope filter (`scope:<label>` body matches admit). Empty /
+    /// missing admits regardless.
+    scopes: Option<Vec<String>>,
+    /// Maximum acceptable RTT to the chain's home node, in
+    /// milliseconds. Default `200`.
+    proximity_max_rtt_ms: Option<u64>,
+    /// Per-channel byte cap (floor 1 MiB, default 100 MiB).
+    per_channel_cap_bytes: Option<u64>,
+    /// Cluster-wide byte cap (default 10 GiB; must be ≥
+    /// `per_channel_cap_bytes`).
+    total_cap_bytes: Option<u64>,
+    /// I/O budget as a fraction of measured NIC peak. Range
+    /// `(0.0, 1.0]`. Default `0.25`.
+    bandwidth_budget_fraction: Option<f32>,
+    /// Override for the NIC peak (bytes/sec) the bandwidth budget
+    /// computes against. Default falls back to 1 Gbps; deployments
+    /// on faster NICs should set this explicitly to avoid the
+    /// `dataforts_greedy_admit_rejected_total{reason="bandwidth"}`
+    /// counter saturating under normal load.
+    nic_peak_bytes_per_s: Option<u64>,
+    /// Maximum in-flight `observe_event` tasks before the
+    /// observer drops events under load. Default `1024`. Floor 1.
+    observer_inflight_cap: Option<u64>,
+    /// `"disabled"` / `"any_of_local_capabilities"` (default) /
+    /// `"strict"`.
+    intent_match: Option<String>,
+    /// `"ignore"` / `"soft_preference"` (default) /
+    /// `"strict_required"`.
+    colocation_policy: Option<String>,
+}
+
+#[cfg(feature = "dataforts")]
+impl RedexGreedyConfigJson {
+    fn into_config(self) -> Result<crate::adapter::net::dataforts::GreedyConfig, &'static str> {
+        use crate::adapter::net::dataforts::{
+            ColocationPolicy, GreedyConfig, IntentMatchPolicy, ScopeLabel,
+        };
+        let mut cfg = GreedyConfig::new();
+        if let Some(scopes) = self.scopes {
+            cfg = cfg.with_scopes(scopes.into_iter().map(ScopeLabel::new).collect());
+        }
+        if let Some(ms) = self.proximity_max_rtt_ms {
+            cfg = cfg.with_proximity_max_rtt(std::time::Duration::from_millis(ms));
+        }
+        if let Some(b) = self.per_channel_cap_bytes {
+            cfg = cfg.with_per_channel_cap_bytes(b);
+        }
+        if let Some(b) = self.total_cap_bytes {
+            cfg = cfg.with_total_cap_bytes(b);
+        }
+        if let Some(f) = self.bandwidth_budget_fraction {
+            cfg = cfg.with_bandwidth_budget_fraction(f);
+        }
+        if let Some(peak) = self.nic_peak_bytes_per_s {
+            cfg = cfg.with_nic_peak_bytes_per_s(Some(peak));
+        }
+        if let Some(cap) = self.observer_inflight_cap {
+            cfg = cfg.with_observer_inflight_cap(cap as usize);
+        }
+        if let Some(policy) = self.intent_match {
+            let parsed = match policy.as_str() {
+                "disabled" => IntentMatchPolicy::Disabled,
+                "any_of_local_capabilities" => IntentMatchPolicy::AnyOfLocalCapabilities,
+                "strict" => IntentMatchPolicy::Strict,
+                _ => return Err("unknown intent_match"),
+            };
+            cfg = cfg.with_intent_match(parsed);
+        }
+        if let Some(policy) = self.colocation_policy {
+            let parsed = match policy.as_str() {
+                "ignore" => ColocationPolicy::Ignore,
+                "soft_preference" => ColocationPolicy::SoftPreference,
+                "strict_required" => ColocationPolicy::StrictRequired,
+                _ => return Err("unknown colocation_policy"),
+            };
+            cfg = cfg.with_colocation_policy(parsed);
+        }
+        Ok(cfg)
+    }
+}
+
+/// Install greedy-LRU dataforts wiring on this `Redex`. Same
+/// Arc-consumption contract as `net_redex_enable_replication`:
+/// `mesh_arc` is consumed regardless of return code.
+///
+/// `config_json` is optional — pass NULL or empty to use the
+/// locked Phase-1 defaults. JSON parse errors and validation
+/// errors surface as `NET_ERR_REDEX`.
+///
+/// Returns `0` on success; `NetError::NullPointer` (`-1`) when
+/// either redex or mesh_arc is NULL; `NetError::ShuttingDown`
+/// when the Redex is in `_free`-quiesce;
+/// `NetError::InvalidUtf8` / `NetError::InvalidJson` for malformed
+/// config; `NET_ERR_REDEX` for validation errors.
+#[cfg(all(feature = "net", feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_enable_greedy_dataforts(
+    redex: *mut RedexHandle,
+    mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
+    config_json: *const c_char,
+) -> c_int {
+    if redex.is_null() || mesh_arc.is_null() {
+        if !mesh_arc.is_null() {
+            unsafe { drop(Box::from_raw(mesh_arc)) };
+        }
+        return NetError::NullPointer.into();
+    }
+    // SAFETY: just verified non-null; documented as a Box from `net_mesh_arc_clone`.
+    let arc_guard = unsafe { MeshArcOwned::new(mesh_arc) };
+    let redex_ref = unsafe { &*redex };
+    let _op = match redex_ref.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let cfg_json: RedexGreedyConfigJson = if config_json.is_null() {
+        RedexGreedyConfigJson::default()
+    } else {
+        let Some(s) = (unsafe { c_str_to_owned(config_json) }) else {
+            return NetError::InvalidUtf8.into();
+        };
+        if s.is_empty() {
+            RedexGreedyConfigJson::default()
+        } else {
+            match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(_) => return NetError::InvalidJson.into(),
+            }
+        }
+    };
+    let cfg = match cfg_json.into_config() {
+        Ok(c) => c,
+        Err(_) => return NET_ERR_REDEX,
+    };
+    let mesh = unsafe { arc_guard.take() };
+    let local_caps = Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default());
+    let registry = crate::adapter::net::behavior::placement::IntentRegistry::defaults();
+    match redex_ref
+        .inner
+        .enable_greedy_dataforts(mesh, cfg, local_caps, registry)
+    {
+        Ok(()) => 0,
+        Err(_) => NET_ERR_REDEX,
+    }
+}
+
+/// Uninstall greedy wiring. Idempotent.
+#[cfg(feature = "dataforts")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_disable_greedy_dataforts(redex: *mut RedexHandle) -> c_int {
+    let Some(h) = (unsafe { redex.as_ref() }) else {
+        return NetError::NullPointer.into();
+    };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    h.inner.disable_greedy_dataforts();
+    0
+}
+
+/// Count of channels currently in the greedy cache. Returns `0`
+/// when greedy isn't enabled or on a NULL handle.
+#[cfg(feature = "dataforts")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_greedy_cached_channel_count(redex: *const RedexHandle) -> u32 {
+    let Some(h) = (unsafe { redex.as_ref() }) else {
+        return 0;
+    };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return 0,
+    };
+    h.inner
+        .greedy_runtime()
+        .map(|r| r.cached_channel_count() as u32)
+        .unwrap_or(0)
+}
+
+/// Render greedy metrics as Prometheus text. Caller frees via
+/// [`crate::ffi::net_free_string`]. Empty string when greedy
+/// isn't enabled; NULL on a NULL handle or shutting-down Redex.
+#[cfg(feature = "dataforts")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_greedy_prometheus_text(redex: *const RedexHandle) -> *mut c_char {
+    let Some(h) = (unsafe { redex.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return std::ptr::null_mut(),
+    };
+    let text = h
+        .inner
+        .greedy_runtime()
+        .map(|r| r.metrics().snapshot().prometheus_text())
+        .unwrap_or_default();
+    match CString::new(text) {
+        Ok(c) => c.into_raw(),
+        Err(_) => CString::new("").unwrap().into_raw(),
+    }
+}
+
+// =========================================================================
+// Data-gravity operator surface (DATAFORTS_PLAN § Phase 4)
+// =========================================================================
+
+/// JSON shape consumed by `net_redex_enable_gravity_for_greedy`.
+/// Mirrors the Python kwargs / Node `DataGravityConfigJs`.
+#[cfg(feature = "dataforts")]
+#[derive(serde::Deserialize, Default)]
+struct RedexGravityConfigJson {
+    /// `true` = counter active. Default `true`.
+    enabled: Option<bool>,
+    /// `[1.01, 10.0]`. Default `2.0`.
+    emit_threshold_ratio: Option<f32>,
+    /// Decay half-life in seconds. Default `1800` (30 min).
+    decay_half_life_secs: Option<u64>,
+    /// Tick cadence in milliseconds. Default `500`.
+    tick_interval_ms: Option<u64>,
+    /// Wire normalization reference rate. Higher value =
+    /// wider dynamic range on the [0.0, 1.0] wire encoding.
+    /// Default `1000.0`. See
+    /// `DataGravityPolicy::normalize_rate_for_wire`.
+    normalization_reference_rate: Option<f32>,
+}
+
+#[cfg(feature = "dataforts")]
+impl RedexGravityConfigJson {
+    fn into_policy_and_tick(
+        self,
+    ) -> (
+        crate::adapter::net::dataforts::DataGravityPolicy,
+        std::time::Duration,
+    ) {
+        let mut policy = crate::adapter::net::dataforts::DataGravityPolicy::new()
+            .with_enabled(self.enabled.unwrap_or(true));
+        if let Some(r) = self.emit_threshold_ratio {
+            policy = policy.with_emit_threshold_ratio(r);
+        }
+        if let Some(secs) = self.decay_half_life_secs {
+            policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs));
+        }
+        if let Some(reference) = self.normalization_reference_rate {
+            policy = policy.with_normalization_reference_rate(reference);
+        }
+        let tick = std::time::Duration::from_millis(self.tick_interval_ms.unwrap_or(500));
+        (policy, tick)
+    }
+}
+
+/// Install data-gravity heat-counter emission on the already-
+/// installed greedy runtime. Same Arc-consumption contract as
+/// `net_redex_enable_replication`: `mesh_arc` is consumed
+/// regardless of return code.
+///
+/// `config_json` is optional — NULL or empty uses the locked
+/// Phase-4 defaults.
+///
+/// Returns `0` on success; `NetError::NullPointer` on NULL
+/// inputs; `NetError::ShuttingDown` on Redex quiesce;
+/// `NetError::InvalidUtf8` / `NetError::InvalidJson` for
+/// malformed config; `NET_ERR_REDEX` when greedy isn't enabled
+/// first or the policy fails validation.
+#[cfg(all(feature = "net", feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_enable_gravity_for_greedy(
+    redex: *mut RedexHandle,
+    mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
+    config_json: *const c_char,
+) -> c_int {
+    if redex.is_null() || mesh_arc.is_null() {
+        if !mesh_arc.is_null() {
+            unsafe { drop(Box::from_raw(mesh_arc)) };
+        }
+        return NetError::NullPointer.into();
+    }
+    // SAFETY: just verified non-null; documented as a Box from `net_mesh_arc_clone`.
+    let arc_guard = unsafe { MeshArcOwned::new(mesh_arc) };
+    let redex_ref = unsafe { &*redex };
+    let _op = match redex_ref.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let cfg_json: RedexGravityConfigJson = if config_json.is_null() {
+        RedexGravityConfigJson::default()
+    } else {
+        let Some(s) = (unsafe { c_str_to_owned(config_json) }) else {
+            return NetError::InvalidUtf8.into();
+        };
+        if s.is_empty() {
+            RedexGravityConfigJson::default()
+        } else {
+            match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(_) => return NetError::InvalidJson.into(),
+            }
+        }
+    };
+    let (policy, tick) = cfg_json.into_policy_and_tick();
+    let mesh = unsafe { arc_guard.take() };
+    match redex_ref
+        .inner
+        .enable_gravity_for_greedy(mesh, policy, tick)
+    {
+        Ok(()) => 0,
+        Err(_) => NET_ERR_REDEX,
+    }
+}
+
+/// Uninstall gravity. Idempotent. Greedy stays running.
+#[cfg(feature = "dataforts")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_disable_gravity_for_greedy(redex: *mut RedexHandle) -> c_int {
+    let Some(h) = (unsafe { redex.as_ref() }) else {
+        return NetError::NullPointer.into();
+    };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    h.inner.disable_gravity_for_greedy();
+    0
+}
+
+// -------------------------------------------------------------------------
+// dataforts feature-OFF stubs. The Rust crate gates the dataforts surface
+// behind `#[cfg(feature = "dataforts")]`, but cgo / dlsym consumers of
+// `libnet.so` link against the symbols unconditionally. Without these
+// stubs a `libnet` built without the feature link-fails at Go program
+// startup with `undefined symbol`. The stubs return
+// `NET_ERR_FEATURE_NOT_BUILT` so consumers can route to a clean error
+// rather than crash.
+//
+// `mesh_arc` is still consumed to match the success-path contract.
+// -------------------------------------------------------------------------
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_enable_greedy_dataforts(
+    _redex: *mut RedexHandle,
+    mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
+    _config_json: *const c_char,
+) -> c_int {
+    if !mesh_arc.is_null() {
+        unsafe { drop(Box::from_raw(mesh_arc)) };
+    }
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_disable_greedy_dataforts(_redex: *mut RedexHandle) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_greedy_cached_channel_count(_redex: *const RedexHandle) -> u32 {
+    0
+}
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_greedy_prometheus_text(_redex: *const RedexHandle) -> *mut c_char {
+    std::ptr::null_mut()
+}
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_enable_gravity_for_greedy(
+    _redex: *mut RedexHandle,
+    mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
+    _config_json: *const c_char,
+) -> c_int {
+    if !mesh_arc.is_null() {
+        unsafe { drop(Box::from_raw(mesh_arc)) };
+    }
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_redex_disable_gravity_for_greedy(_redex: *mut RedexHandle) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
 }
 
 // =========================================================================
@@ -1192,6 +1683,50 @@ pub extern "C" fn net_tasks_wait_for_seq(
     })
 }
 
+/// Read-your-writes wait. Returns `0` on success, `NET_ERR_TIMEOUT`
+/// (`1`) on deadline, `NET_ERR_WRONG_ORIGIN` (`-104`) if the token's
+/// origin does not match this adapter, or `NET_ERR_QUEUE_FULL`
+/// (`-105`) if the per-channel wait queue is saturated.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_tasks_wait_for_token(
+    handle: *mut TasksAdapterHandle,
+    origin_hash: u64,
+    seq: u64,
+    timeout_ms: u32,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let adapter: Arc<InnerTasksAdapter> = Arc::clone(&tasks.inner);
+    let token = InnerWriteToken::new(origin_hash, seq);
+    // timeout_ms == 0 means "poll, don't wait": check the applied
+    // watermark and origin without scheduling a Notified future.
+    // Callers who want a minimum wait must pass at least 1.
+    if timeout_ms == 0 {
+        return tasks_poll_for_token(&adapter, token);
+    }
+    let deadline = std::time::Duration::from_millis(timeout_ms as u64);
+    // catch_unwind so a panic from the wait future cannot unwind
+    // across the FFI into the C / cgo / Python caller.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(async move {
+            match adapter.wait_for_token(token, deadline).await {
+                Ok(()) => 0,
+                Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
+                Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+                Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
+                Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
+            }
+        })
+    }));
+    result.unwrap_or(NET_ERR_PANIC)
+}
+
 #[derive(Deserialize, Default)]
 struct TasksFilterJson {
     status: Option<String>,
@@ -1796,6 +2331,45 @@ pub extern "C" fn net_memories_wait_for_seq(
             }
         }
     })
+}
+
+/// Read-your-writes wait. See [`net_tasks_wait_for_token`] for the
+/// return-code contract.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_memories_wait_for_token(
+    handle: *mut MemoriesAdapterHandle,
+    origin_hash: u64,
+    seq: u64,
+    timeout_ms: u32,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let adapter: Arc<InnerMemoriesAdapter> = Arc::clone(&mem.inner);
+    let token = InnerWriteToken::new(origin_hash, seq);
+    // timeout_ms == 0 means "poll, don't wait" (mirrors the
+    // contract on net_tasks_wait_for_token).
+    if timeout_ms == 0 {
+        return memories_poll_for_token(&adapter, token);
+    }
+    let deadline = std::time::Duration::from_millis(timeout_ms as u64);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(async move {
+            match adapter.wait_for_token(token, deadline).await {
+                Ok(()) => 0,
+                Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
+                Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+                Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
+                Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
+            }
+        })
+    }));
+    result.unwrap_or(NET_ERR_PANIC)
 }
 
 #[derive(Deserialize, Default)]
@@ -2649,5 +3223,98 @@ mod tests {
             pre_count,
             "net_redex_enable_replication must drop the boxed Arc on error paths"
         );
+    }
+
+    /// Parallel coverage for the greedy FFI surface — pin the
+    /// Arc-consumption contract on the NULL-redex error path
+    /// (same shape as the replication test above).
+    #[cfg(all(feature = "net", feature = "dataforts"))]
+    #[test]
+    fn enable_greedy_drops_mesh_arc_on_null_redex() {
+        use crate::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mesh = rt.block_on(async {
+            let identity = EntityKeypair::generate();
+            let cfg = MeshNodeConfig::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                [0u8; 32],
+            );
+            Arc::new(MeshNode::new(identity, cfg).await.unwrap())
+        });
+        let pre_count = Arc::strong_count(&mesh);
+        let boxed_arc: *mut Arc<MeshNode> = Box::into_raw(Box::new(mesh.clone()));
+        assert_eq!(Arc::strong_count(&mesh), pre_count + 1);
+
+        let rc = net_redex_enable_greedy_dataforts(ptr::null_mut(), boxed_arc, ptr::null());
+        let expected: c_int = NetError::NullPointer.into();
+        assert_eq!(rc, expected);
+        assert_eq!(
+            Arc::strong_count(&mesh),
+            pre_count,
+            "net_redex_enable_greedy_dataforts must drop the boxed Arc on error paths"
+        );
+    }
+
+    /// Smoke test: install greedy on a real Redex + mesh, observe
+    /// the channel-count + Prometheus text shape, then uninstall.
+    #[cfg(all(feature = "net", feature = "dataforts"))]
+    #[test]
+    fn greedy_enable_disable_round_trip() {
+        use crate::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
+        use std::ffi::CString;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mesh = rt.block_on(async {
+            let identity = EntityKeypair::generate();
+            let cfg = MeshNodeConfig::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                [0u8; 32],
+            );
+            Arc::new(MeshNode::new(identity, cfg).await.unwrap())
+        });
+
+        let r = redex();
+        let boxed_arc: *mut Arc<MeshNode> = Box::into_raw(Box::new(mesh.clone()));
+        // Minimal config — just disable intent matching so the
+        // empty-registry path doesn't gate us.
+        let cfg_json = CString::new(r#"{"intent_match":"disabled"}"#).unwrap();
+        let rc = net_redex_enable_greedy_dataforts(r, boxed_arc, cfg_json.as_ptr());
+        assert_eq!(rc, 0, "enable must succeed");
+
+        // No channels yet — count is 0.
+        assert_eq!(net_redex_greedy_cached_channel_count(r), 0);
+
+        // Prometheus text is non-null and contains the metric
+        // family header.
+        let p = net_redex_greedy_prometheus_text(r);
+        assert!(!p.is_null());
+        let text = unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned();
+        super::super::net_free_string(p);
+        assert!(
+            text.contains("dataforts_greedy_admit_rejected_total"),
+            "Prometheus text must include the admit-rejected metric family"
+        );
+
+        // Uninstall + verify.
+        assert_eq!(net_redex_disable_greedy_dataforts(r), 0);
+        let p_after = net_redex_greedy_prometheus_text(r);
+        assert!(!p_after.is_null());
+        let after_text = unsafe { std::ffi::CStr::from_ptr(p_after) }
+            .to_string_lossy()
+            .into_owned();
+        super::super::net_free_string(p_after);
+        assert!(
+            after_text.is_empty(),
+            "post-disable Prometheus text must be empty; got {after_text:?}"
+        );
+
+        net_redex_free(r);
     }
 }

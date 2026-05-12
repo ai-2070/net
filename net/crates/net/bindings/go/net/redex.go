@@ -104,6 +104,24 @@ extern int net_redex_enable_replication(RedexHandle* redex, ArcMeshNode* mesh_ar
 extern uint32_t net_redex_replication_runtime_count(const RedexHandle* redex);
 extern char* net_redex_replication_prometheus_text(const RedexHandle* redex);
 
+// Greedy-LRU dataforts operator surface — DATAFORTS_PLAN § Phase 1.
+extern int net_redex_enable_greedy_dataforts(
+    RedexHandle* redex,
+    ArcMeshNode* mesh_arc,
+    const char* config_json
+);
+extern int net_redex_disable_greedy_dataforts(RedexHandle* redex);
+extern uint32_t net_redex_greedy_cached_channel_count(const RedexHandle* redex);
+extern char* net_redex_greedy_prometheus_text(const RedexHandle* redex);
+
+// Data-gravity heat-counter layer (DATAFORTS_PLAN § Phase 4).
+extern int net_redex_enable_gravity_for_greedy(
+    RedexHandle* redex,
+    ArcMeshNode* mesh_arc,
+    const char* config_json
+);
+extern int net_redex_disable_gravity_for_greedy(RedexHandle* redex);
+
 extern int net_redex_open_file(
     RedexHandle* redex,
     const char* name,
@@ -173,6 +191,19 @@ var ErrInvalidReplicationConfig = fmt.Errorf("%w: invalid replication config", E
 type Redex struct {
 	mu     sync.Mutex
 	handle *C.RedexHandle
+}
+
+// Handle returns the underlying C pointer as `unsafe.Pointer` for
+// cross-file cgo consumers (Tasks / Memories adapters live in
+// separate .go files and each defines its own opaque
+// `RedexHandle` typedef; their cgo blocks treat the pointer-typed
+// parameter via the same C-side struct name, so a Go `*C.RedexHandle`
+// from this file can be passed through `unsafe.Pointer` and the
+// receiving file casts back). Returns `nil` once the Redex is closed.
+func (r *Redex) Handle() unsafe.Pointer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return unsafe.Pointer(r.handle)
 }
 
 // RedexFile wraps the C `*RedexFileHandle` for a single channel.
@@ -280,6 +311,17 @@ type RedexFileConfig struct {
 // =====================================================================
 // Redex lifecycle
 // =====================================================================
+//
+// Both NewRedex constructors install a finalizer that calls Close
+// on GC. The finalizer is a safety net for callers who forget the
+// explicit Close. **Prefer explicit Close**: the substrate's
+// net_redex_free wait_until_quiesced step can block waiting for
+// in-flight operations, and Go runs finalizers on a GC-owned
+// goroutine that should not stall. The same pattern is used by
+// every Go binding handle in this crate (Net, NetStream, Mesh,
+// etc.); it's a known shared footgun, not a dataforts regression.
+// Callers in long-running processes should pair every constructor
+// with a `defer r.Close()` and not rely on the finalizer.
 
 // NewRedex constructs an empty heap-only Redex manager. Never
 // fails; the returned handle is non-nil.
@@ -369,6 +411,210 @@ func (r *Redex) ReplicationPrometheusText() string {
 	}
 	defer C.net_free_string(c)
 	return C.GoString(c)
+}
+
+// GreedyConfig — operator-facing config for greedy-LRU dataforts
+// (Rebel Yell Phase 1). All fields optional; the substrate fills
+// in the locked Phase-1 defaults for any field left at the zero
+// value, with the exception of zero-meaning-no-filter semantics
+// noted per-field.
+//
+// Marshalled to the same JSON shape the Rust core's
+// `RedexGreedyConfigJson` deserializes — field tags pin the
+// wire-form names.
+type GreedyConfig struct {
+	// Scope filter. Empty / nil admits regardless of `scope:` tags.
+	Scopes []string `json:"scopes,omitempty"`
+	// Proximity bound (ms). 0 = use substrate default (200 ms).
+	ProximityMaxRttMs uint64 `json:"proximity_max_rtt_ms,omitempty"`
+	// Per-channel byte cap. 0 = use substrate default (100 MiB).
+	PerChannelCapBytes uint64 `json:"per_channel_cap_bytes,omitempty"`
+	// Total byte cap. 0 = use substrate default (10 GiB).
+	TotalCapBytes uint64 `json:"total_cap_bytes,omitempty"`
+	// I/O budget as a fraction of NIC peak. 0 = use substrate
+	// default (0.25). Range `(0.0, 1.0]`.
+	BandwidthBudgetFraction float32 `json:"bandwidth_budget_fraction,omitempty"`
+	// Override for the NIC peak (bytes/sec) the bandwidth budget
+	// computes against. 0 (or unset) = substrate default (1 Gbps).
+	// Deployments on faster NICs should set this explicitly to
+	// avoid the substrate's bandwidth-axis reject counter
+	// saturating under normal load.
+	NicPeakBytesPerS uint64 `json:"nic_peak_bytes_per_s,omitempty"`
+	// Maximum in-flight observe_event tasks before the observer
+	// drops events under load. 0 = use substrate default (1024).
+	// Floor 1.
+	ObserverInflightCap uint64 `json:"observer_inflight_cap,omitempty"`
+	// `"disabled"` / `"any_of_local_capabilities"` (default) /
+	// `"strict"`. Empty = substrate default.
+	IntentMatch string `json:"intent_match,omitempty"`
+	// `"ignore"` / `"soft_preference"` (default) /
+	// `"strict_required"`. Empty = substrate default.
+	ColocationPolicy string `json:"colocation_policy,omitempty"`
+}
+
+// ErrInvalidGreedyConfig is returned when the supplied greedy
+// config fails binding-side or substrate-side validation.
+var ErrInvalidGreedyConfig = fmt.Errorf("%w: greedy config invalid", ErrRedex)
+
+// EnableGreedyDataforts installs greedy-LRU dataforts wiring on
+// this Redex. Same Arc-consumption contract as EnableReplication:
+// `meshArcPtr` is consumed regardless of return code — do NOT
+// free it again.
+//
+// Pass nil for `config` to accept the locked Phase-1 defaults.
+//
+// Idempotent — repeated calls return nil without disturbing the
+// existing wiring.
+func (r *Redex) EnableGreedyDataforts(meshArcPtr unsafe.Pointer, config *GreedyConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return fmt.Errorf("%w: redex handle already closed", ErrRedex)
+	}
+	var cfgPtr *C.char
+	if config != nil {
+		buf, err := json.Marshal(config)
+		if err != nil {
+			return fmt.Errorf("%w: marshal config: %v", ErrInvalidGreedyConfig, err)
+		}
+		c := C.CString(string(buf))
+		defer C.free(unsafe.Pointer(c))
+		cfgPtr = c
+	}
+	rc := C.net_redex_enable_greedy_dataforts(
+		r.handle,
+		(*C.ArcMeshNode)(meshArcPtr),
+		cfgPtr,
+	)
+	if rc != 0 {
+		return fmt.Errorf("%w: enable_greedy_dataforts failed (rc=%d)", ErrRedex, int(rc))
+	}
+	return nil
+}
+
+// DisableGreedyDataforts un-installs the greedy wiring. Idempotent.
+func (r *Redex) DisableGreedyDataforts() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return fmt.Errorf("%w: redex handle already closed", ErrRedex)
+	}
+	rc := C.net_redex_disable_greedy_dataforts(r.handle)
+	if rc != 0 {
+		return fmt.Errorf("%w: disable_greedy_dataforts failed (rc=%d)", ErrRedex, int(rc))
+	}
+	return nil
+}
+
+// GreedyCachedChannelCount returns the number of channels
+// currently in the greedy cache. 0 when greedy isn't enabled.
+func (r *Redex) GreedyCachedChannelCount() uint32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return 0
+	}
+	return uint32(C.net_redex_greedy_cached_channel_count(r.handle))
+}
+
+// GreedyPrometheusText renders the greedy-LRU metrics as a
+// Prometheus-text document. Returns the empty string when greedy
+// isn't enabled.
+//
+// Covers per-channel `dataforts_greedy_cache_hits_total`,
+// `_serve_count_total`, `_evictions_total`, `_bytes_resident`,
+// plus the cluster-wide `_admit_rejected_total{reason=...}` and
+// `_io_budget_used_bytes`.
+func (r *Redex) GreedyPrometheusText() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return ""
+	}
+	c := C.net_redex_greedy_prometheus_text(r.handle)
+	if c == nil {
+		return ""
+	}
+	defer C.net_free_string(c)
+	return C.GoString(c)
+}
+
+// DataGravityConfig — operator-facing config for the data-gravity
+// heat-counter emission cycle (Rebel Yell Phase 4). All fields
+// optional; zero values keep the substrate defaults.
+type DataGravityConfig struct {
+	// Whether the counter + emission cycle is active. Default
+	// true; set to false to keep the config carried without
+	// emitting.
+	Enabled *bool `json:"enabled,omitempty"`
+	// Re-emission threshold ratio. Range [1.01, 10.0]. Default 2.0.
+	EmitThresholdRatio float32 `json:"emit_threshold_ratio,omitempty"`
+	// Decay half-life in seconds. Default 1800 (30 min).
+	DecayHalfLifeSecs uint64 `json:"decay_half_life_secs,omitempty"`
+	// Tick interval in milliseconds. Default 500.
+	TickIntervalMs uint64 `json:"tick_interval_ms,omitempty"`
+	// Wire normalization reference rate. Higher value = wider
+	// dynamic range on the [0.0, 1.0] wire encoding for heat
+	// tags. Default 1000.0. 0 (or unset) = substrate default.
+	NormalizationReferenceRate float32 `json:"normalization_reference_rate,omitempty"`
+}
+
+// EnableGravityForGreedy installs the data-gravity heat-counter
+// layer on top of an already-installed greedy runtime. Pass nil
+// for `config` to accept the locked Phase-4 defaults.
+//
+// Same Arc-consumption contract as EnableReplication: meshArcPtr
+// is consumed regardless of return code — do NOT free it again.
+//
+// Requires EnableGreedyDataforts to have been called first.
+// Returns a wrapped ErrRedex describing the failure on validation
+// errors or when greedy isn t installed.
+//
+// Idempotent — a second call replaces the prior policy and
+// restarts the tick task.
+func (r *Redex) EnableGravityForGreedy(
+	meshArcPtr unsafe.Pointer,
+	config *DataGravityConfig,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return fmt.Errorf("%w: redex handle already closed", ErrRedex)
+	}
+	var cfgPtr *C.char
+	if config != nil {
+		buf, err := json.Marshal(config)
+		if err != nil {
+			return fmt.Errorf("%w: marshal gravity config: %v", ErrRedex, err)
+		}
+		c := C.CString(string(buf))
+		defer C.free(unsafe.Pointer(c))
+		cfgPtr = c
+	}
+	rc := C.net_redex_enable_gravity_for_greedy(
+		r.handle,
+		(*C.ArcMeshNode)(meshArcPtr),
+		cfgPtr,
+	)
+	if rc != 0 {
+		return fmt.Errorf("%w: enable_gravity_for_greedy failed (rc=%d)", ErrRedex, int(rc))
+	}
+	return nil
+}
+
+// DisableGravityForGreedy un-installs the gravity layer. Greedy
+// stays running. Idempotent — no-op when not enabled.
+func (r *Redex) DisableGravityForGreedy() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return fmt.Errorf("%w: redex handle already closed", ErrRedex)
+	}
+	rc := C.net_redex_disable_gravity_for_greedy(r.handle)
+	if rc != 0 {
+		return fmt.Errorf("%w: disable_gravity_for_greedy failed (rc=%d)", ErrRedex, int(rc))
+	}
+	return nil
 }
 
 // validateReplicationConfig runs the binding-side checks so

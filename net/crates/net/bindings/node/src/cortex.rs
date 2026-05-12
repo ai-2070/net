@@ -30,11 +30,12 @@ use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
     TasksAdapter as InnerTasksAdapter,
 };
+use ::net::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use ::net::adapter::net::redex::{
     FsyncPolicy as InnerFsyncPolicy, PlacementStrategy as InnerPlacementStrategy,
     Redex as InnerRedex, RedexError as InnerRedexError, RedexEvent as InnerRedexEvent,
     RedexFile as InnerRedexFile, RedexFileConfig, ReplicationConfig as InnerReplicationConfig,
-    UnderCapacity as InnerUnderCapacity,
+    UnderCapacity as InnerUnderCapacity, WriteToken as InnerWriteToken,
 };
 use bytes::Bytes;
 
@@ -95,6 +96,66 @@ fn redex_config_from_persistent(persistent: Option<bool>) -> RedexFileConfig {
     } else {
         RedexFileConfig::default()
     }
+}
+
+// =========================================================================
+// WriteToken — typed handle to a specific write, returned by ingest
+// paths and consumed by read-your-writes wait primitives.
+// =========================================================================
+
+/// Address of a single write. Pair with a typed adapter's
+/// `waitForToken(token, deadlineMs)` to make sure the local fold has
+/// caught up to the write before reading state. `originHash` is the
+/// 64-bit chain identifier; `seq` is the per-chain monotonic
+/// sequence assigned by `RedexFile.append`.
+#[napi]
+#[derive(Clone, Copy)]
+pub struct WriteToken {
+    inner: InnerWriteToken,
+}
+
+#[napi]
+impl WriteToken {
+    #[napi(constructor)]
+    pub fn new(origin_hash: BigInt, seq: BigInt) -> Result<Self> {
+        Ok(Self {
+            inner: InnerWriteToken::new(bigint_u64(origin_hash)?, bigint_u64(seq)?),
+        })
+    }
+
+    #[napi(getter)]
+    pub fn origin_hash(&self) -> BigInt {
+        BigInt::from(self.inner.origin_hash)
+    }
+
+    #[napi(getter)]
+    pub fn seq(&self) -> BigInt {
+        BigInt::from(self.inner.seq)
+    }
+
+    /// Parse a token from its `<16-hex-origin>:<seq>` string form.
+    #[napi(factory)]
+    pub fn from_string(s: String) -> Result<Self> {
+        s.parse::<InnerWriteToken>()
+            .map(|inner| Self { inner })
+            .map_err(|e| Error::from_reason(format!("WriteToken parse: {}", e)))
+    }
+
+    #[napi(js_name = "toString")]
+    #[allow(clippy::inherent_to_string, clippy::wrong_self_convention)]
+    pub fn to_string(&self) -> String {
+        self.inner.to_string()
+    }
+}
+
+impl WriteToken {
+    fn as_inner(&self) -> InnerWriteToken {
+        self.inner
+    }
+}
+
+fn wait_for_token_err(e: InnerWaitForTokenError) -> Error {
+    cortex_err("wait_for_token", e)
 }
 
 // =========================================================================
@@ -161,11 +222,11 @@ impl Redex {
     /// (cortex-only build), surface a typed `redex:` error
     /// naming the missing feature instead of
     /// `TypeError: redex.enableReplication is not a function`.
-    /// Takes `napi::JsUnknown` so a JS call site with any
+    /// Takes `napi::Unknown` so a JS call site with any
     /// arg shape still reaches the typed error.
     #[cfg(not(feature = "net"))]
     #[napi]
-    pub fn enable_replication(&self, _mesh: napi::JsUnknown) -> Result<()> {
+    pub fn enable_replication(&self, _mesh: napi::Unknown) -> Result<()> {
         Err(redex_err(
             "enable_replication",
             "binding built without `net` feature; rebuild with --features net",
@@ -196,6 +257,228 @@ impl Redex {
     pub fn replication_prometheus_text(&self) -> String {
         self.inner.replication_prometheus_text()
     }
+
+    /// Install greedy-LRU dataforts wiring rooted at `mesh`. The
+    /// runtime opens per-channel cache files against this Redex
+    /// and announces chains via the mesh's `ChainTagSink` impl.
+    ///
+    /// Idempotent — a second call with greedy already enabled is
+    /// a no-op (use `disableGreedyDataforts` to reconfigure).
+    ///
+    /// Locked Phase-1 defaults from `DATAFORTS_PLAN.md`:
+    /// scopes empty (admit any), 200 ms proximity bound,
+    /// 100 MiB per channel, 10 GiB total, 0.25 NIC fraction,
+    /// `any_of_local_capabilities` intent, `soft_preference`
+    /// colocation.
+    ///
+    /// `intentMatch` values: `'disabled'` / `'any_of_local_capabilities'` / `'strict'`.
+    /// `colocationPolicy` values: `'ignore'` / `'soft_preference'` / `'strict_required'`.
+    #[cfg(all(feature = "net", feature = "dataforts"))]
+    #[napi]
+    pub fn enable_greedy_dataforts(
+        &self,
+        mesh: &crate::NetMesh,
+        config: Option<GreedyConfigJs>,
+    ) -> Result<()> {
+        use net::adapter::net::dataforts::{
+            ColocationPolicy, GreedyConfig, IntentMatchPolicy, ScopeLabel,
+        };
+        let cfg_js = config.unwrap_or_default();
+        let mut cfg = GreedyConfig::new();
+        if let Some(scopes) = cfg_js.scopes {
+            cfg = cfg.with_scopes(scopes.into_iter().map(ScopeLabel::new).collect());
+        }
+        if let Some(ms) = cfg_js.proximity_max_rtt_ms {
+            cfg = cfg.with_proximity_max_rtt(std::time::Duration::from_millis(ms as u64));
+        }
+        if let Some(b) = cfg_js.per_channel_cap_bytes {
+            let bytes = redex_bigint_u64("greedy.per_channel_cap_bytes", b)?;
+            cfg = cfg.with_per_channel_cap_bytes(bytes);
+        }
+        if let Some(b) = cfg_js.total_cap_bytes {
+            let bytes = redex_bigint_u64("greedy.total_cap_bytes", b)?;
+            cfg = cfg.with_total_cap_bytes(bytes);
+        }
+        if let Some(f) = cfg_js.bandwidth_budget_fraction {
+            cfg = cfg.with_bandwidth_budget_fraction(f as f32);
+        }
+        if let Some(peak) = cfg_js.nic_peak_bytes_per_s {
+            let peak_u64 = redex_bigint_u64("greedy.nic_peak_bytes_per_s", peak)?;
+            cfg = cfg.with_nic_peak_bytes_per_s(Some(peak_u64));
+        }
+        if let Some(cap) = cfg_js.observer_inflight_cap {
+            cfg = cfg.with_observer_inflight_cap(cap as usize);
+        }
+        if let Some(policy) = cfg_js.intent_match {
+            let parsed = match policy.as_str() {
+                "disabled" => IntentMatchPolicy::Disabled,
+                "any_of_local_capabilities" => IntentMatchPolicy::AnyOfLocalCapabilities,
+                "strict" => IntentMatchPolicy::Strict,
+                other => {
+                    return Err(redex_err(
+                        "enable_greedy_dataforts",
+                        format!("intentMatch {other:?} unknown"),
+                    ))
+                }
+            };
+            cfg = cfg.with_intent_match(parsed);
+        }
+        if let Some(policy) = cfg_js.colocation_policy {
+            let parsed = match policy.as_str() {
+                "ignore" => ColocationPolicy::Ignore,
+                "soft_preference" => ColocationPolicy::SoftPreference,
+                "strict_required" => ColocationPolicy::StrictRequired,
+                other => {
+                    return Err(redex_err(
+                        "enable_greedy_dataforts",
+                        format!("colocationPolicy {other:?} unknown"),
+                    ))
+                }
+            };
+            cfg = cfg.with_colocation_policy(parsed);
+        }
+        let arc = mesh.node_arc_clone()?;
+        let local_caps =
+            Arc::new(net::adapter::net::behavior::capability::CapabilitySet::default());
+        let registry = net::adapter::net::behavior::placement::IntentRegistry::defaults();
+        self.inner
+            .enable_greedy_dataforts(arc, cfg, local_caps, registry)
+            .map_err(|e| redex_err("enable_greedy_dataforts", e))
+    }
+
+    /// Stub for builds without the `dataforts` feature.
+    /// Surfaces a typed `redex:` error rather than the napi
+    /// `TypeError: ...is not a function`.
+    #[cfg(not(all(feature = "net", feature = "dataforts")))]
+    #[napi]
+    pub fn enable_greedy_dataforts(
+        &self,
+        _mesh: napi::Unknown,
+        _config: napi::Unknown,
+    ) -> Result<()> {
+        Err(redex_err(
+            "enable_greedy_dataforts",
+            "binding built without `dataforts` feature; rebuild with --features dataforts",
+        ))
+    }
+
+    /// Uninstall greedy wiring. Idempotent — no-op when not
+    /// enabled.
+    #[cfg(feature = "dataforts")]
+    #[napi]
+    pub fn disable_greedy_dataforts(&self) {
+        self.inner.disable_greedy_dataforts();
+    }
+
+    /// Stub for builds without the `dataforts` feature. No-op so
+    /// JS callers don't get a `TypeError: ...is not a function`.
+    #[cfg(not(feature = "dataforts"))]
+    #[napi]
+    pub fn disable_greedy_dataforts(&self) {}
+
+    /// Number of channels currently in the greedy cache. `0` when
+    /// greedy isn't enabled.
+    #[cfg(feature = "dataforts")]
+    #[napi]
+    pub fn greedy_cached_channel_count(&self) -> u32 {
+        self.inner
+            .greedy_runtime()
+            .map(|r| r.cached_channel_count() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Stub for builds without the `dataforts` feature. Reports
+    /// `0` so dashboards can treat absence as "greedy not enabled".
+    #[cfg(not(feature = "dataforts"))]
+    #[napi]
+    pub fn greedy_cached_channel_count(&self) -> u32 {
+        0
+    }
+
+    /// Render the greedy metrics as Prometheus text. Empty string
+    /// when greedy isn't enabled.
+    #[cfg(feature = "dataforts")]
+    #[napi]
+    pub fn greedy_prometheus_text(&self) -> String {
+        self.inner
+            .greedy_runtime()
+            .map(|r| r.metrics().snapshot().prometheus_text())
+            .unwrap_or_default()
+    }
+
+    /// Stub for builds without the `dataforts` feature. Returns
+    /// an empty string so a scrape integration sees no greedy
+    /// metrics.
+    #[cfg(not(feature = "dataforts"))]
+    #[napi]
+    pub fn greedy_prometheus_text(&self) -> String {
+        String::new()
+    }
+
+    /// Install data-gravity heat-counter emission on the
+    /// already-installed greedy runtime. Validates the policy
+    /// and spawns a tokio task that fires `gravityTick` on
+    /// `tickIntervalMs` cadence. Requires greedy to be enabled
+    /// first; throws a typed `redex:` error otherwise.
+    ///
+    /// Locked Phase-4 defaults from `DATAFORTS_PLAN.md`:
+    /// emitThresholdRatio = 2.0, decayHalfLifeSecs = 1800.
+    #[cfg(all(feature = "net", feature = "dataforts"))]
+    #[napi]
+    pub fn enable_gravity_for_greedy(
+        &self,
+        mesh: &crate::NetMesh,
+        config: Option<DataGravityConfigJs>,
+    ) -> Result<()> {
+        use net::adapter::net::dataforts::DataGravityPolicy;
+        let cfg_js = config.unwrap_or_default();
+        let mut policy = DataGravityPolicy::new().with_enabled(cfg_js.enabled.unwrap_or(true));
+        if let Some(r) = cfg_js.emit_threshold_ratio {
+            policy = policy.with_emit_threshold_ratio(r as f32);
+        }
+        if let Some(secs) = cfg_js.decay_half_life_secs {
+            let secs_u64 = bigint_u64(secs)?;
+            policy = policy.with_decay_half_life(std::time::Duration::from_secs(secs_u64));
+        }
+        if let Some(reference) = cfg_js.normalization_reference_rate {
+            policy = policy.with_normalization_reference_rate(reference as f32);
+        }
+        let tick = match cfg_js.tick_interval_ms {
+            Some(v) => std::time::Duration::from_millis(bigint_u64(v)?),
+            None => std::time::Duration::from_millis(500),
+        };
+        let arc = mesh.node_arc_clone()?;
+        self.inner
+            .enable_gravity_for_greedy(arc, policy, tick)
+            .map_err(|e| redex_err("enable_gravity_for_greedy", e))
+    }
+
+    /// Stub for builds without `dataforts`.
+    #[cfg(not(all(feature = "net", feature = "dataforts")))]
+    #[napi]
+    pub fn enable_gravity_for_greedy(
+        &self,
+        _mesh: napi::Unknown,
+        _config: napi::Unknown,
+    ) -> Result<()> {
+        Err(redex_err(
+            "enable_gravity_for_greedy",
+            "binding built without `dataforts` feature; rebuild with --features dataforts",
+        ))
+    }
+
+    /// Uninstall the gravity layer. Greedy stays running.
+    /// Idempotent.
+    #[cfg(feature = "dataforts")]
+    #[napi]
+    pub fn disable_gravity_for_greedy(&self) {
+        self.inner.disable_gravity_for_greedy();
+    }
+
+    /// Stub for builds without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    #[napi]
+    pub fn disable_gravity_for_greedy(&self) {}
 
     /// Open (or get) a raw RedEX file bound to `channelName`. Returns
     /// a handle for append / tail / read operations without going
@@ -295,6 +578,77 @@ pub struct ReplicationConfigJs {
     /// measured NIC peak. Range `(0.0, 1.0]`. Defaults to `0.5`
     /// when omitted.
     pub replication_budget_fraction: Option<f64>,
+}
+
+/// JS-side config for `Redex.enableGravityForGreedy`. Locked
+/// Phase-4 defaults — `DATAFORTS_PLAN.md` § Phase 4. All fields
+/// optional; omit any to keep the substrate default.
+#[cfg(feature = "dataforts")]
+#[napi(object)]
+#[derive(Default)]
+pub struct DataGravityConfigJs {
+    /// Whether the counter + emission cycle is active. Default
+    /// `true`; pass `false` to keep the policy carried but
+    /// suppress emissions.
+    pub enabled: Option<bool>,
+    /// Re-emission threshold ratio. Range `[1.01, 10.0]`. Default
+    /// `2.0`.
+    pub emit_threshold_ratio: Option<f64>,
+    /// Decay half-life in seconds. Default `1800` (30 min).
+    /// `BigInt` so values match the Python `u64` / Go `uint64`
+    /// shape; u32 here would overflow at ~136 years which is
+    /// silly but the cross-binding parity matters more.
+    pub decay_half_life_secs: Option<BigInt>,
+    /// Tick interval for the gravity tick task, in milliseconds.
+    /// Default `500`. `BigInt` for parity with Python u64 / Go
+    /// uint64; a u32 ms field overflows at ~49 days.
+    pub tick_interval_ms: Option<BigInt>,
+    /// Wire normalization reference rate. Higher value = wider
+    /// dynamic range on the `[0.0, 1.0]` wire encoding for heat
+    /// tags. Default `1000.0`.
+    pub normalization_reference_rate: Option<f64>,
+}
+
+/// JS-side config for `Redex.enableGreedyDataforts`. Locked
+/// Phase-1 defaults — `DATAFORTS_PLAN.md` § Phase 1. All fields
+/// optional; omit any to keep the substrate default.
+#[cfg(feature = "dataforts")]
+#[napi(object)]
+#[derive(Default)]
+pub struct GreedyConfigJs {
+    /// Scope filter — chains whose `scope:` tag matches any of
+    /// these admit. Empty / omitted admits regardless of scope.
+    pub scopes: Option<Vec<String>>,
+    /// Maximum acceptable RTT to the chain's home node, in
+    /// milliseconds. Default `200`.
+    pub proximity_max_rtt_ms: Option<u32>,
+    /// Per-channel byte cap on the cache substrate. Default
+    /// `100 * 1024 * 1024` (100 MiB). Floor `1 * 1024 * 1024`.
+    pub per_channel_cap_bytes: Option<BigInt>,
+    /// Total byte cap across every channel. LRU eviction drives
+    /// toward this bound. Default `10 * 1024 * 1024 * 1024` (10
+    /// GiB).
+    pub total_cap_bytes: Option<BigInt>,
+    /// I/O budget as a fraction of measured NIC peak.
+    /// Range `(0.0, 1.0]`. Default `0.25`.
+    pub bandwidth_budget_fraction: Option<f64>,
+    /// Override for the NIC peak (bytes/sec) the bandwidth budget
+    /// computes against. Default falls back to 1 Gbps. Deployments
+    /// on faster NICs should set this explicitly to avoid the
+    /// `bandwidth` reason saturating the admit_rejected counter
+    /// under normal load.
+    pub nic_peak_bytes_per_s: Option<BigInt>,
+    /// Maximum in-flight `observe_event` tasks. Default `1024`.
+    /// Floor 1. Past this many spawned tasks the observer drops
+    /// events with a metric increment rather than blocking the
+    /// mesh inbound hot path.
+    pub observer_inflight_cap: Option<u32>,
+    /// Intent-match policy. One of `"disabled"` /
+    /// `"any_of_local_capabilities"` (default) / `"strict"`.
+    pub intent_match: Option<String>,
+    /// Colocation policy. One of `"ignore"` / `"soft_preference"`
+    /// (default) / `"strict_required"`.
+    pub colocation_policy: Option<String>,
 }
 
 fn resolve_placement_strategy(
@@ -937,6 +1291,23 @@ impl TasksAdapter {
         Ok(())
     }
 
+    /// Read-your-writes wait. Blocks until this adapter's fold has
+    /// applied through `token.seq`, or `deadlineMs` elapses. Rejects
+    /// a wrong-origin token or a saturated wait queue (default cap
+    /// 1024) immediately. All three failure variants surface as a
+    /// `cortex:` prefixed napi `Error`.
+    #[napi]
+    pub async fn wait_for_token(&self, token: &WriteToken, deadline_ms: u32) -> Result<()> {
+        let inner_token = token.as_inner();
+        self.inner
+            .wait_for_token(
+                inner_token,
+                std::time::Duration::from_millis(deadline_ms as u64),
+            )
+            .await
+            .map_err(wait_for_token_err)
+    }
+
     /// Close the adapter. Idempotent.
     #[napi]
     pub fn close(&self) -> Result<()> {
@@ -1432,6 +1803,20 @@ impl MemoriesAdapter {
     pub async fn wait_for_seq(&self, seq: BigInt) -> Result<()> {
         self.inner.wait_for_seq(bigint_u64(seq)?).await;
         Ok(())
+    }
+
+    /// Read-your-writes wait. See `TasksAdapter.waitForToken` for
+    /// the full contract.
+    #[napi]
+    pub async fn wait_for_token(&self, token: &WriteToken, deadline_ms: u32) -> Result<()> {
+        let inner_token = token.as_inner();
+        self.inner
+            .wait_for_token(
+                inner_token,
+                std::time::Duration::from_millis(deadline_ms as u64),
+            )
+            .await
+            .map_err(wait_for_token_err)
     }
 
     /// Close the adapter. Idempotent.

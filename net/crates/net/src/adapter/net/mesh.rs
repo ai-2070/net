@@ -277,6 +277,12 @@ struct DispatchCtx {
     #[cfg(feature = "redex")]
     replication_inbound_router:
         Arc<parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>>,
+    /// Optional greedy-LRU observer. See the matching field doc on
+    /// `MeshNode`. The hot path takes a single read lock on every
+    /// standard-event packet; uncontended reads under
+    /// `parking_lot::RwLock` are single-digit-nanoseconds.
+    #[cfg(feature = "dataforts")]
+    greedy_observer: Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
@@ -1306,6 +1312,20 @@ pub struct MeshNode {
     #[cfg(feature = "redex")]
     replication_inbound_router:
         Arc<parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>>,
+    /// Optional greedy-LRU observer. `Redex` installs one of these
+    /// via [`Self::set_greedy_observer`] when the operator calls
+    /// `Redex::enable_greedy_dataforts(mesh, cfg)`; subsequent
+    /// inbound standard-event packets fan out through the observer
+    /// (in addition to the per-shard queue push the application's
+    /// tail drains from). `None` when greedy is not enabled; in
+    /// that case the hot path takes a single `parking_lot::RwLock`
+    /// read and falls through to the queue push.
+    ///
+    /// Same `parking_lot::RwLock<Option<Arc<dyn ...>>>` shape as
+    /// the replication router for the same reason — `dyn Trait` is
+    /// `!Sized` and `ArcSwapOption` doesn't accept it.
+    #[cfg(feature = "dataforts")]
+    greedy_observer: Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
     /// Monotonic version counter used when stamping our own
     /// announcements. `CapabilityIndex::index` skips older versions,
     /// so this must move forward across restarts if the caller wants
@@ -1631,6 +1651,8 @@ impl MeshNode {
             user_caps: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "redex")]
             replication_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(feature = "dataforts")]
+            greedy_observer: Arc::new(parking_lot::RwLock::new(None)),
             capability_version: Arc::new(AtomicU64::new(0)),
             local_subnet,
             local_subnet_policy,
@@ -2416,6 +2438,8 @@ impl MeshNode {
             migration_handler: self.migration_handler.clone(),
             #[cfg(feature = "redex")]
             replication_inbound_router: self.replication_inbound_router.clone(),
+            #[cfg(feature = "dataforts")]
+            greedy_observer: self.greedy_observer.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
             pending_direct_initiators: self.pending_direct_initiators.clone(),
             static_keypair: self.static_keypair.clone(),
@@ -3707,9 +3731,91 @@ impl MeshNode {
             return;
         }
 
+        // Greedy-LRU observer hook. Non-exclusive (in contrast to
+        // the nRPC dispatcher above): if installed, fans every
+        // event into the greedy runtime in addition to the
+        // application's tail. Greedy is best-effort — failures log
+        // + drop inside the runtime; the queue push below is
+        // never blocked or skipped on the observer's behalf.
+        //
+        // Hot-path cost: one `RwLock` read per packet (single-digit
+        // ns under parking_lot when uncontended) + one O(1)
+        // `addr_to_node` lookup + one capability_index lookup per
+        // event when the observer is installed. The runtime
+        // itself spawns a tokio task per event to absorb the
+        // async dispatch.
+        #[cfg(feature = "dataforts")]
+        let greedy = ctx.greedy_observer.read().clone();
+
+        // Resolve the publisher's capability set so the runtime's
+        // scope / intent / colocation gates have something to
+        // evaluate against. We look up *any holder* of the chain's
+        // origin_hash via the capability index — not the last-hop
+        // peer's caps, which would silently invert scope/intent
+        // admission for relayed events. Falls back to empty caps
+        // (fail-closed for scope-axis admission) if no holder is
+        // indexed yet (subscribe-before-announce race).
+        //
+        // Snapshotted once per packet rather than per-event; every
+        // event in the same packet shares the same publisher.
+        #[cfg(feature = "dataforts")]
+        let chain_caps: std::sync::Arc<
+            crate::adapter::net::behavior::capability::CapabilitySet,
+        > = if greedy.is_some() {
+            let origin_hash: u64 = parsed.header.origin_hash.into();
+            let hex = Self::chain_hex(origin_hash);
+            // Preferred path: pick any node that advertises
+            // `causal:<hex>` — every holder of the chain shares the
+            // chain-level caps. This is the traveling-with-chain
+            // signal that's robust under multi-hop relay: the
+            // publisher's announce_chain emits `causal:<hex>` into
+            // its CapabilitySet, and the index carries that across
+            // hops. Without this lookup, a relayed event evaluates
+            // against the relay's last-hop caps, silently inverting
+            // scope/intent admission.
+            //
+            // Fallback: until the publisher has emitted a
+            // `causal:<hex>` announcement (or in deployments that
+            // don't run announce_chain), use the last-hop peer's
+            // caps. For a direct A→B path that IS the publisher;
+            // for a multi-hop path the relay's caps are a
+            // best-effort proxy until the chain announcement
+            // propagates. Final fallback: empty caps (fail-closed
+            // for scope-axis admission).
+            let publisher_caps = ctx
+                .capability_index
+                .all_nodes()
+                .into_iter()
+                .find_map(|nid| {
+                    let caps = ctx.capability_index.get(nid)?;
+                    if caps.tags.iter().any(|t| Self::is_causal_for(t, &hex)) {
+                        Some(caps)
+                    } else {
+                        None
+                    }
+                });
+            let chain_caps = publisher_caps.or_else(|| {
+                let peer_addr = session.peer_addr();
+                let from_node = ctx.addr_to_node.get(&peer_addr).map(|r| *r);
+                from_node.and_then(|nid| ctx.capability_index.get(nid))
+            });
+            std::sync::Arc::new(chain_caps.unwrap_or_default())
+        } else {
+            std::sync::Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default())
+        };
+
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
+            #[cfg(feature = "dataforts")]
+            if let Some(observer) = &greedy {
+                observer.observe_event(
+                    parsed.header.channel_hash,
+                    parsed.header.origin_hash.into(),
+                    chain_caps.clone(),
+                    event_data.clone(),
+                );
+            }
             use std::fmt::Write;
             let mut event_id = String::with_capacity(24);
             let _ = write!(event_id, "{}:{}", seq, i);
@@ -4852,7 +4958,51 @@ impl MeshNode {
             Self::forward_capability_announcement(fwd_bytes, ann.node_id, from_node, ctx);
         }
 
+        // Strip unauthorized `heat:<hex>=...` tags before indexing.
+        // A peer can only annotate heat for chains it *also* claims
+        // to hold (i.e. advertises `causal:<hex>` for the same
+        // origin). Otherwise an arbitrary peer could publish
+        // `heat:<any_origin>=0.99` and poison gravity decisions on
+        // every other node. Self-announcements (from this node)
+        // skip the filter — we trust our own emit path.
+        let mut ann = ann;
+        if from_node != ctx.local_node_id {
+            Self::filter_unauthorized_heat_tags(&mut ann.capabilities);
+        }
         ctx.capability_index.index(ann);
+    }
+
+    /// Drop every `heat:<hex>=...` reserved tag from `caps` whose
+    /// `<hex>` is not matched by an accompanying `causal:<hex>*`
+    /// tag in the same set. This enforces "you can only annotate
+    /// heat for chains you advertise as holding," closing the
+    /// inbound-heat-tag forge surface.
+    fn filter_unauthorized_heat_tags(
+        caps: &mut crate::adapter::net::behavior::capability::CapabilitySet,
+    ) {
+        // Collect every hex this peer claims via causal: tags.
+        let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for tag in &caps.tags {
+            if let Tag::Reserved { prefix, body } = tag {
+                if prefix == "causal:" {
+                    // Hex is the prefix of body up to the first ':' / '['.
+                    let hex_end = body
+                        .bytes()
+                        .position(|b| b == b':' || b == b'[')
+                        .unwrap_or(body.len());
+                    claimed.insert(body[..hex_end].to_string());
+                }
+            }
+        }
+        caps.tags.retain(|tag| match tag {
+            Tag::Reserved { prefix, body } if prefix == "heat:" => {
+                // body shape: `<hex>=<rate>`. Hex is everything
+                // before the first `=`.
+                let hex_end = body.bytes().position(|b| b == b'=').unwrap_or(body.len());
+                claimed.contains(&body[..hex_end])
+            }
+            _ => true,
+        });
     }
 
     /// Fan an already-serialized capability announcement out to every
@@ -5931,6 +6081,15 @@ impl MeshNode {
         // shard-inbound queue still gets the event when no per-
         // channel dispatcher is registered).
         builder.set_channel_hash(channel_hash);
+        // Stamp our identity's origin_hash so the receiver can
+        // route per-chain logic (greedy cache, gravity heat
+        // counters, RYW tokens) against a real chain identifier
+        // rather than the protocol-level default of zero. The
+        // packet header carries a `u32` view of the `u64` keypair
+        // origin_hash; routing-hash collisions in the lower 32
+        // bits are benign for the chain-routing use case (the
+        // receiver compares full hashes when it matters).
+        builder.set_origin_hash(self.identity.entity_id().origin_hash());
         // Match the rest of the sender call sites
         // (`send_to_peer:3661`, `send_to_peer:3685`, `send_routed:3755`,
         // `send_routed:3785`, `send_on_stream:6110`, `mod.rs:1016, 1063`):
@@ -6242,6 +6401,37 @@ impl MeshNode {
         }
     }
 
+    /// True iff `tag` is a `heat:<hex>=...` reserved tag for the
+    /// supplied chain-hash. Used by [`Self::replace_heat_tags`]
+    /// to strip stale heat annotations before re-emission.
+    #[cfg(feature = "dataforts")]
+    fn is_heat_for(tag: &Tag, hex: &str) -> bool {
+        match tag {
+            Tag::Reserved { prefix, body } if prefix == "heat:" => {
+                // Body shape: `<hex>=<rate>`. Match the chain by
+                // prefix-then-`=` so we don't accidentally strip
+                // tags for a hex that begins with the target.
+                if !body.starts_with(hex) {
+                    return false;
+                }
+                matches!(body.as_bytes().get(hex.len()), Some(b'='))
+            }
+            _ => false,
+        }
+    }
+
+    /// Strip every `heat:<hex>=*` tag for `origin_hash` from
+    /// `caps` and insert `replacement` in its place. `None` is
+    /// withdrawal — every heat annotation for the chain drops.
+    #[cfg(feature = "dataforts")]
+    fn replace_heat_tags(caps: &mut CapabilitySet, origin_hash: u64, replacement: Option<Tag>) {
+        let hex = Self::chain_hex(origin_hash);
+        caps.tags.retain(|t| !Self::is_heat_for(t, &hex));
+        if let Some(t) = replacement {
+            caps.tags.insert(t);
+        }
+    }
+
     /// Read the current user-supplied baseline, defaulting to an
     /// empty `CapabilitySet` when no `announce_capabilities` has
     /// landed yet. Returns an owned snapshot — callers mutate the
@@ -6304,6 +6494,108 @@ impl MeshNode {
         self.announce_capabilities(snapshot).await
     }
 
+    /// Annotate the local capability set with a `heat:<hex>=<rate>`
+    /// reserved tag for `origin_hash` and re-broadcast. Replaces
+    /// any prior heat tag for the same chain — the most recent
+    /// call wins.
+    ///
+    /// `rate` is clamped to `[0.0, 1.0]` by the substrate's
+    /// `CapabilitySet::heat_level` builder; the wire emits the
+    /// clamped value with two decimal places. Data-gravity
+    /// callers normalize their unbounded read-rate to that range
+    /// before calling.
+    ///
+    /// Rebel Yell Phase 4. See
+    /// `docs/misc/DATAFORTS_PLAN.md` § Phase 4.
+    #[cfg(feature = "dataforts")]
+    pub async fn announce_heat(&self, origin_hash: u64, rate: f64) -> Result<(), AdapterError> {
+        let hex = Self::chain_hex(origin_hash);
+        let clamped = if rate.is_finite() {
+            rate.clamp(0.0, 1.0)
+        } else {
+            return Err(AdapterError::Fatal("heat rate must be finite".to_string()));
+        };
+        let replacement = Tag::parse(&format!("heat:{hex}={clamped:.2}")).ok();
+        let mut snapshot = self.user_caps_snapshot();
+        Self::replace_heat_tags(&mut snapshot, origin_hash, replacement);
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// Withdraw every `heat:<hex>=*` tag for `origin_hash` and
+    /// re-broadcast. Peers drop the heat annotation; the
+    /// chain's `causal:` advertisements are untouched.
+    #[cfg(feature = "dataforts")]
+    pub async fn withdraw_heat(&self, origin_hash: u64) -> Result<(), AdapterError> {
+        let mut snapshot = self.user_caps_snapshot();
+        Self::replace_heat_tags(&mut snapshot, origin_hash, None);
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// Apply a batch of heat emissions in a single
+    /// `announce_capabilities` round-trip. Each update is one of:
+    /// - `Some(rate)`: replace this chain's `heat:` tag with
+    ///   `heat:<hex>=<clamped rate>`.
+    /// - `None`: withdraw every `heat:` annotation for this chain.
+    ///
+    /// Used by `gravity_tick` to coalesce per-chain emissions. The
+    /// previous single-shot per-chain `announce_heat` loop rebroadcast
+    /// the full capability set N times per tick — O(n_chains² × n_tags)
+    /// wire work on a busy node. This batch path mutates the snapshot
+    /// once and rebroadcasts once.
+    ///
+    /// Non-finite rates skip silently (with a trace log).
+    #[cfg(feature = "dataforts")]
+    pub async fn announce_heat_batch(
+        &self,
+        updates: &[(u64, Option<f64>)],
+    ) -> Result<(), AdapterError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut snapshot = self.user_caps_snapshot();
+        for &(origin_hash, rate_opt) in updates {
+            let replacement = match rate_opt {
+                Some(rate) if rate.is_finite() => {
+                    let hex = Self::chain_hex(origin_hash);
+                    let clamped = rate.clamp(0.0, 1.0);
+                    Tag::parse(&format!("heat:{hex}={clamped:.2}")).ok()
+                }
+                Some(_) => {
+                    tracing::trace!(
+                        origin_hash = origin_hash,
+                        "heat: non-finite rate skipped in batch"
+                    );
+                    continue;
+                }
+                None => None,
+            };
+            Self::replace_heat_tags(&mut snapshot, origin_hash, replacement);
+        }
+        self.announce_capabilities(snapshot).await
+    }
+}
+
+#[cfg(feature = "dataforts")]
+#[async_trait::async_trait]
+impl super::dataforts::HeatSink for MeshNode {
+    async fn announce_heat(&self, origin_hash: u64, rate: f64) -> Result<(), AdapterError> {
+        MeshNode::announce_heat(self, origin_hash, rate).await
+    }
+
+    async fn withdraw_heat(&self, origin_hash: u64) -> Result<(), AdapterError> {
+        MeshNode::withdraw_heat(self, origin_hash).await
+    }
+
+    async fn announce_heat_batch(
+        &self,
+        updates: &[(u64, Option<f64>)],
+    ) -> Result<(), AdapterError> {
+        MeshNode::announce_heat_batch(self, updates).await
+    }
+}
+
+#[cfg(feature = "net")]
+impl MeshNode {
     /// Install (or replace) the `SUBPROTOCOL_REDEX` inbound
     /// router. Used by `Redex` to register a per-node router
     /// that owns the per-channel runtime registry; the mesh
@@ -6319,6 +6611,28 @@ impl MeshNode {
         router: Option<Arc<dyn super::redex::ReplicationInboundRouter>>,
     ) {
         *self.replication_inbound_router.write() = router;
+    }
+
+    /// Install (or uninstall) the greedy-LRU observer. `Redex`
+    /// calls this from
+    /// [`Redex::enable_greedy_dataforts`](super::redex::Redex)
+    /// to wire the inbound dispatch fanout. `None` uninstalls;
+    /// subsequent standard-event packets fall through the
+    /// observer hook untouched.
+    ///
+    /// Idempotent — re-installing replaces the previous handle.
+    /// Hot-path cost is unchanged when called with the same Arc.
+    #[cfg(feature = "dataforts")]
+    pub fn set_greedy_observer(&self, observer: Option<Arc<dyn super::dataforts::GreedyObserver>>) {
+        *self.greedy_observer.write() = observer;
+    }
+
+    /// True iff a greedy observer is currently installed. Useful
+    /// for tests and for the operator surface to confirm the
+    /// install landed.
+    #[cfg(feature = "dataforts")]
+    pub fn has_greedy_observer(&self) -> bool {
+        self.greedy_observer.read().is_some()
     }
 
     /// Return every node currently advertising any `causal:<hex>*`
@@ -9639,5 +9953,52 @@ mod chain_helper_tests {
             .collect();
         assert_eq!(variants.len(), 1, "exactly one causal: tag for our hash");
         assert_eq!(variants[0], &replacement);
+    }
+
+    #[test]
+    fn filter_unauthorized_heat_tags_strips_unclaimed_origins() {
+        // A peer can only annotate heat for chains it also
+        // advertises holding. Heat tags whose hex doesn't appear
+        // in any causal: tag in the same set get filtered out.
+        let mut caps = CapabilitySet::default();
+        let owned_hex = MeshNode::chain_hex(0xCAFE);
+        let forged_hex = MeshNode::chain_hex(0xDEAD);
+        caps.tags.insert(causal_tag(&owned_hex));
+        caps.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("{owned_hex}=0.50"),
+        });
+        caps.tags.insert(Tag::Reserved {
+            prefix: "heat:".to_string(),
+            body: format!("{forged_hex}=0.99"),
+        });
+        // Throw in a non-heat reserved tag — must survive.
+        caps.tags.insert(Tag::Reserved {
+            prefix: "scope:".to_string(),
+            body: "industrial".to_string(),
+        });
+
+        MeshNode::filter_unauthorized_heat_tags(&mut caps);
+
+        // Owned heat tag survives; forged one is gone.
+        let surviving_heat: Vec<_> = caps
+            .tags
+            .iter()
+            .filter_map(|t| match t {
+                Tag::Reserved { prefix, body } if prefix == "heat:" => Some(body.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(surviving_heat.len(), 1);
+        assert!(surviving_heat[0].starts_with(&owned_hex));
+        // Scope tag survived; causal tag survived.
+        assert!(caps.tags.iter().any(|t| matches!(
+            t,
+            Tag::Reserved { prefix, .. } if prefix == "scope:"
+        )));
+        assert!(caps
+            .tags
+            .iter()
+            .any(|t| MeshNode::is_causal_for(t, &owned_hex)));
     }
 }

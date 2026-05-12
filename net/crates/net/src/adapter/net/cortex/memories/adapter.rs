@@ -3,14 +3,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use super::super::super::channel::ChannelName;
-use super::super::super::redex::{Redex, RedexError, RedexFileConfig};
-use super::super::adapter::CortexAdapter;
+use super::super::super::redex::{Redex, RedexError, RedexFileConfig, WriteToken};
+use super::super::adapter::{CortexAdapter, WaitForTokenError};
 use super::super::config::CortexAdapterConfig;
 use super::super::envelope::EventEnvelope;
 use super::super::error::CortexAdapterError;
@@ -230,6 +231,46 @@ impl MemoriesAdapter {
         self.inner.wait_for_seq(seq).await;
     }
 
+    /// Block until the fold task has processed every event up
+    /// through `token.seq`, or `deadline` elapses. Read-your-writes
+    /// wait scoped to this adapter's origin — see the matching
+    /// `TasksAdapter::wait_for_token` for the rationale on the
+    /// origin guard.
+    pub async fn wait_for_token(
+        &self,
+        token: WriteToken,
+        deadline: Duration,
+    ) -> Result<(), WaitForTokenError> {
+        if token.origin_hash != self.origin_hash {
+            self.inner.note_wrong_origin();
+            return Err(WaitForTokenError::WrongOrigin {
+                token_origin: token.origin_hash,
+                adapter_origin: self.origin_hash,
+            });
+        }
+        self.inner.wait_for_token(token, deadline).await
+    }
+
+    /// Non-blocking RYW poll. See
+    /// [`super::super::tasks::TasksAdapter::poll_for_token`] for the
+    /// full contract — identical shape for Memories.
+    pub fn poll_for_token(&self, token: WriteToken) -> Result<(), WaitForTokenError> {
+        if token.origin_hash != self.origin_hash {
+            self.inner.note_wrong_origin();
+            return Err(WaitForTokenError::WrongOrigin {
+                token_origin: token.origin_hash,
+                adapter_origin: self.origin_hash,
+            });
+        }
+        match self.inner.applied_through_seq() {
+            Some(applied) if applied >= token.seq => Ok(()),
+            _ if !self.inner.is_running() => Err(WaitForTokenError::FoldStopped {
+                applied_through_seq: self.inner.applied_through_seq(),
+            }),
+            _ => Err(WaitForTokenError::Timeout),
+        }
+    }
+
     /// Close the adapter. See [`CortexAdapter::close`].
     pub fn close(&self) -> Result<(), CortexAdapterError> {
         self.inner.close()
@@ -244,6 +285,13 @@ impl MemoriesAdapter {
     /// lower-level surface.
     pub fn as_cortex(&self) -> &CortexAdapter<MemoriesState> {
         &self.inner
+    }
+
+    /// Origin hash this adapter is bound to. Stamped on every
+    /// outgoing `EventMeta`; tokens with a different origin reject
+    /// at `wait_for_token`.
+    pub fn origin_hash(&self) -> u64 {
+        self.origin_hash
     }
 
     /// Start building a reactive watcher.
