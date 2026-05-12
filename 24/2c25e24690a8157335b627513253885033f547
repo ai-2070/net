@@ -1,0 +1,28 @@
+net/crates/net/docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md
+  s_3a0a24a47d1a36::t_19152d143a976a 346-353
+  s_3a0a24a47d1a36::t_7573cedf3433f7 363-369
+  s_3a0a24a47d1a36::t_a6959a535db117 519,525-526
+  s_3a0a24a47d1a36::t_06c1210bdf50e2 489-491
+  s_3a0a24a47d1a36::t_4f69afcded3cb6 28,35-36
+  s_3a0a24a47d1a36::t_6e2b6efbe1b4e8 460-462
+  s_3a0a24a47d1a36::t_d7b6dacd167524 766-955
+  s_3a0a24a47d1a36::t_66459aa78f3d07 232-331
+  s_3a0a24a47d1a36::t_868d5f2ba382cd 546-547
+  s_3a0a24a47d1a36::t_576b6a3c8e3111 379-382
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "242c25e24690a8157335b627513253885033f547",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
