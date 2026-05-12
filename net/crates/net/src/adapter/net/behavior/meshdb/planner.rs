@@ -40,7 +40,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::error::MeshError;
-use super::query::{ChainRef, Expr, JoinKey, JoinKind, MeshQuery, QueryV1, SeqNum};
+use super::query::{
+    AggregateFn, ChainRef, Expr, JoinKey, JoinKind, MeshQuery, QueryV1, SeqNum,
+};
 use crate::adapter::net::behavior::capability::CapabilityIndex;
 use crate::adapter::net::behavior::predicate::PredicateWire;
 use crate::adapter::net::behavior::query::CapabilityQuery;
@@ -152,6 +154,22 @@ pub enum OperatorPlan {
         /// first for `Back`, BFS-asc-depth for `Forward`. Always
         /// includes the start origin at index 0 with `depth = 0`.
         entries: Vec<LineageEntry>,
+    },
+    /// Phase E-1 count aggregate. Executor collects the inner
+    /// sub-plan's rows, groups by the row-intrinsic key (or
+    /// uses a single bucket when `group_by` is `None`), and
+    /// emits one [`super::query::ResultRow`] per group whose
+    /// `payload` is a postcard-encoded
+    /// [`super::query::AggregateRowPayload`] carrying the
+    /// group identifier + count.
+    AggregateCount {
+        /// Inner sub-plan whose rows are counted.
+        input: Box<OperatorNode>,
+        /// Row-intrinsic group key. `None` = single bucket
+        /// (total count). Phase E-1 supports only the row-
+        /// intrinsic modes; payload-keyed grouping lands in
+        /// Phase E-2 alongside row-schema decoding.
+        group_by: Option<JoinKeyMode>,
     },
     /// Inner hash-join of two sub-plans. Phase D-1 ships the
     /// in-memory hash-build-on-left / probe-on-right strategy
@@ -359,10 +377,11 @@ where
                 kind,
                 watermark,
             } => self.plan_join(left, right, on, *kind, *watermark),
-            QueryV1::Aggregate { inner, .. } => {
-                let input = self.plan(inner)?;
-                self.plan_not_yet_implemented("Aggregate (Phase E)", Some(Box::new(input.root)))
-            }
+            QueryV1::Aggregate {
+                inner,
+                group_by,
+                agg_fn,
+            } => self.plan_aggregate(inner, group_by, agg_fn),
             QueryV1::Project { inner, .. } => {
                 let input = self.plan(inner)?;
                 self.plan_not_yet_implemented("Project (Phase A.2)", Some(Box::new(input.root)))
@@ -555,6 +574,38 @@ where
                 key_mode,
                 kind,
                 watermark,
+            },
+            target_nodes: vec![],
+            cost,
+        })
+    }
+
+    /// Plan a Phase E-1 aggregate. Only `AggregateFn::Count` is
+    /// supported in this slice; richer aggregate functions land
+    /// once a consumer drives row-schema decoding.
+    fn plan_aggregate(
+        &self,
+        inner: &MeshQuery,
+        group_by: &[Expr],
+        agg_fn: &AggregateFn,
+    ) -> Result<OperatorNode, MeshError> {
+        if !matches!(agg_fn, AggregateFn::Count) {
+            return Err(MeshError::PlannerError {
+                detail: format!(
+                    "aggregate function {agg_fn:?} not yet implemented in Phase E-1; only Count supported (Sum / Avg / sketches land alongside row-schema decoding)"
+                ),
+            });
+        }
+        let key_mode = group_by_mode(group_by)?;
+        let inner_plan = self.plan(inner)?;
+        let cost = CostEstimate {
+            bandwidth_bytes: inner_plan.total_cost.bandwidth_bytes,
+            latency_ms: inner_plan.total_cost.latency_ms,
+        };
+        Ok(OperatorNode {
+            operator: OperatorPlan::AggregateCount {
+                input: Box::new(inner_plan.root),
+                group_by: key_mode,
             },
             target_nodes: vec![],
             cost,
@@ -968,6 +1019,11 @@ fn sum_cost(node: &OperatorNode) -> CostEstimate {
                 .saturating_add(r.bandwidth_bytes);
             acc.latency_ms = acc.latency_ms.saturating_add(l.latency_ms.max(r.latency_ms));
         }
+        OperatorPlan::AggregateCount { input, .. } => {
+            let inner = sum_cost(input);
+            acc.bandwidth_bytes = acc.bandwidth_bytes.saturating_add(inner.bandwidth_bytes);
+            acc.latency_ms = acc.latency_ms.saturating_add(inner.latency_ms);
+        }
         OperatorPlan::NotYetImplemented {
             input: Some(input),
             ..
@@ -1237,6 +1293,47 @@ fn field_name(e: &Expr) -> Option<&str> {
         Expr::Field(s) => Some(s.as_str()),
         _ => None,
     }
+}
+
+/// Resolve a `group_by: Vec<Expr>` clause to a Phase E-1
+/// row-intrinsic [`JoinKeyMode`].
+///
+/// Returns `Ok(None)` for an empty `group_by` (single-bucket
+/// aggregate). Surfaces `PlannerError` for any payload-keyed
+/// or composite group_by we don't support yet.
+fn group_by_mode(group_by: &[Expr]) -> Result<Option<JoinKeyMode>, MeshError> {
+    if group_by.is_empty() {
+        return Ok(None);
+    }
+    if group_by.len() == 1 {
+        let name = field_name(&group_by[0]).ok_or_else(|| MeshError::PlannerError {
+            detail: format!(
+                "group_by[0] must be a field reference, got {:?}",
+                group_by[0]
+            ),
+        })?;
+        return match name {
+            "origin" => Ok(Some(JoinKeyMode::Origin)),
+            "seq" => Ok(Some(JoinKeyMode::Seq)),
+            other => Err(MeshError::PlannerError {
+                detail: format!(
+                    "group_by field '{other}' is not a row-intrinsic key; only 'origin' / 'seq' supported in Phase E-1"
+                ),
+            }),
+        };
+    }
+    if group_by.len() == 2 {
+        let l = field_name(&group_by[0]);
+        let r = field_name(&group_by[1]);
+        if matches!((l, r), (Some("origin"), Some("seq")) | (Some("seq"), Some("origin"))) {
+            return Ok(Some(JoinKeyMode::OriginSeq));
+        }
+    }
+    Err(MeshError::PlannerError {
+        detail: format!(
+            "group_by shape {group_by:?} not supported in Phase E-1; only [origin], [seq], or [origin, seq] are row-intrinsic"
+        ),
+    })
 }
 
 // Silence unused-import warning under feature-conditional
@@ -1934,22 +2031,24 @@ mod tests {
 
     #[test]
     fn plan_composite_operator_surfaces_not_yet_implemented() {
+        // Project remains deferred (Phase A.2 placeholder until a
+        // consumer drives column-extraction semantics). Use it as
+        // the canonical "wrapped sub-plan flows through
+        // NotYetImplemented" test now that Aggregate Count ships.
         let origin = 0x9999_9999_9999_9999_u64;
         let index = make_index_with_holder(1, origin);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
-        let q = MeshQuery::V1(QueryV1::Aggregate {
+        let q = MeshQuery::V1(QueryV1::Project {
             inner: Box::new(MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(origin),
             })),
-            group_by: vec![],
-            agg_fn: super::super::query::AggregateFn::Count,
+            columns: vec![Expr::Field("origin".to_string())],
         });
         let plan = planner.plan(&q).unwrap();
         match plan.root.operator {
             OperatorPlan::NotYetImplemented { detail, input } => {
-                assert!(detail.contains("Aggregate"));
-                assert!(detail.contains("Phase E"));
-                assert!(input.is_some(), "Aggregate's inner sub-plan must be carried");
+                assert!(detail.contains("Project"));
+                assert!(input.is_some(), "Project's inner sub-plan must be carried");
             }
             other => panic!("expected NotYetImplemented; got {other:?}"),
         }
@@ -2498,6 +2597,157 @@ mod tests {
         ]);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let plan = planner.plan(&join_query("origin", "origin", l, r)).unwrap();
+        let bytes = postcard::to_allocvec(&plan).unwrap();
+        let decoded: ExecutionPlan = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, plan);
+    }
+
+    // ========================================================================
+    // Phase E — aggregate planning (Count only in E-1)
+    // ========================================================================
+
+    fn aggregate_query(origin: u64, group_by: Vec<Expr>, agg_fn: AggregateFn) -> MeshQuery {
+        MeshQuery::V1(QueryV1::Aggregate {
+            inner: Box::new(MeshQuery::V1(QueryV1::Latest {
+                origin: ChainRef::OriginHash(origin),
+            })),
+            group_by,
+            agg_fn,
+        })
+    }
+
+    #[test]
+    fn plan_aggregate_count_no_group_by() {
+        let origin = 0x1111;
+        let index = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&aggregate_query(origin, vec![], AggregateFn::Count))
+            .unwrap();
+        match plan.root.operator {
+            OperatorPlan::AggregateCount { input, group_by } => {
+                assert_eq!(group_by, None);
+                assert!(matches!(input.operator, OperatorPlan::LatestRead { .. }));
+            }
+            other => panic!("expected AggregateCount; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_aggregate_count_group_by_origin() {
+        let origin = 0x2222;
+        let index = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&aggregate_query(
+                origin,
+                vec![Expr::Field("origin".to_string())],
+                AggregateFn::Count,
+            ))
+            .unwrap();
+        if let OperatorPlan::AggregateCount { group_by, .. } = plan.root.operator {
+            assert_eq!(group_by, Some(JoinKeyMode::Origin));
+        } else {
+            panic!("expected AggregateCount");
+        }
+    }
+
+    #[test]
+    fn plan_aggregate_count_group_by_seq() {
+        let origin = 0x3333;
+        let index = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&aggregate_query(
+                origin,
+                vec![Expr::Field("seq".to_string())],
+                AggregateFn::Count,
+            ))
+            .unwrap();
+        if let OperatorPlan::AggregateCount { group_by, .. } = plan.root.operator {
+            assert_eq!(group_by, Some(JoinKeyMode::Seq));
+        } else {
+            panic!("expected AggregateCount");
+        }
+    }
+
+    #[test]
+    fn plan_aggregate_count_group_by_origin_seq_composite() {
+        let origin = 0x4444;
+        let index = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&aggregate_query(
+                origin,
+                vec![
+                    Expr::Field("origin".to_string()),
+                    Expr::Field("seq".to_string()),
+                ],
+                AggregateFn::Count,
+            ))
+            .unwrap();
+        if let OperatorPlan::AggregateCount { group_by, .. } = plan.root.operator {
+            assert_eq!(group_by, Some(JoinKeyMode::OriginSeq));
+        } else {
+            panic!("expected AggregateCount");
+        }
+    }
+
+    #[test]
+    fn plan_aggregate_non_count_function_surfaces_planner_error() {
+        let origin = 0x5555;
+        let index = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner
+            .plan(&aggregate_query(
+                origin,
+                vec![],
+                AggregateFn::Sum {
+                    field: Expr::Field("amount".to_string()),
+                },
+            ))
+            .unwrap_err();
+        match err {
+            MeshError::PlannerError { detail } => {
+                assert!(detail.contains("Phase E-1"));
+                assert!(detail.contains("Count"));
+            }
+            other => panic!("expected PlannerError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_aggregate_group_by_payload_field_surfaces_planner_error() {
+        let origin = 0x6666;
+        let index = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner
+            .plan(&aggregate_query(
+                origin,
+                vec![Expr::Field("payload.severity".to_string())],
+                AggregateFn::Count,
+            ))
+            .unwrap_err();
+        match err {
+            MeshError::PlannerError { detail } => {
+                assert!(detail.contains("row-intrinsic"));
+            }
+            other => panic!("expected PlannerError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_aggregate_round_trips_through_postcard() {
+        let origin = 0x7777;
+        let index = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&aggregate_query(
+                origin,
+                vec![Expr::Field("origin".to_string())],
+                AggregateFn::Count,
+            ))
+            .unwrap();
         let bytes = postcard::to_allocvec(&plan).unwrap();
         let decoded: ExecutionPlan = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, plan);

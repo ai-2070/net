@@ -382,6 +382,54 @@ pub struct ResultRow {
     pub payload: Vec<u8>,
 }
 
+/// Row-intrinsic group key for [`OperatorPlan::AggregateCount`].
+/// Mirrors the shape of [`super::planner::JoinKeyMode`] but
+/// materializes the actual value (not just the mode) so the
+/// aggregate row can carry the group identifier verbatim.
+///
+/// [`OperatorPlan::AggregateCount`]: super::planner::OperatorPlan::AggregateCount
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GroupKey {
+    /// Grouped by [`ResultRow::origin`].
+    Origin(u64),
+    /// Grouped by [`ResultRow::seq`].
+    Seq(SeqNum),
+    /// Grouped by the `(origin, seq)` tuple.
+    OriginSeq {
+        /// Chain origin.
+        origin: u64,
+        /// Seq within that chain.
+        seq: SeqNum,
+    },
+}
+
+/// Aggregate-result envelope. The executor postcard-encodes one
+/// of these into each aggregate output [`ResultRow`]'s
+/// `payload` (with `origin = 0` and `seq = SeqNum(0)` as
+/// sentinel-row markers; the group identifier lives in the
+/// `group` field, not the row metadata, so the wire shape is
+/// uniform across grouped + ungrouped queries).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AggregateRowPayload {
+    /// Group identifier. `None` when the query had no
+    /// `group_by` (single-bucket aggregate).
+    pub group: Option<GroupKey>,
+    /// Phase E-1 ships `Count` only; future aggregate functions
+    /// (`Sum`, `Avg`, `DistinctCountHll`, `PercentileTDigest`)
+    /// land via additional variants on this enum.
+    pub value: AggregateValue,
+}
+
+/// Computed aggregate value. Phase E-1 ships `Count`; richer
+/// variants (`Sum`, `Avg`, sketches) land once a consumer drives
+/// the field-extraction layer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum AggregateValue {
+    /// Row count within the group.
+    Count(u64),
+}
+
 /// Join-result envelope. The executor postcard-encodes one of
 /// these into each joined [`ResultRow`]'s `payload` (with
 /// `origin = 0` and `seq = SeqNum(0)` as the sentinel-row

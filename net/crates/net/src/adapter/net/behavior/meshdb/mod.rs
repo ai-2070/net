@@ -93,6 +93,6 @@ pub use protocol::{
     ContinuationToken, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,
 };
 pub use query::{
-    AggregateFn, ChainRef, Expr, JoinKey, JoinKind, JoinedRowPayload, MeshQuery, OrderDir,
-    OrderKey, QueryV1, ResultRow, SeqNum,
+    AggregateFn, AggregateRowPayload, AggregateValue, ChainRef, Expr, GroupKey, JoinKey, JoinKind,
+    JoinedRowPayload, MeshQuery, OrderDir, OrderKey, QueryV1, ResultRow, SeqNum,
 };

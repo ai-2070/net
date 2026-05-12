@@ -145,6 +145,11 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
                 // via the transport, hash join locally.
                 return self.execute_hash_join_federated(plan).await;
             }
+            OperatorPlan::AggregateCount { .. } => {
+                // Phase E-1 federated aggregate: fetch the inner
+                // sub-plan via the transport, count locally.
+                return self.execute_aggregate_count_federated(plan).await;
+            }
             OperatorPlan::Filter { .. } => {
                 return Err(MeshError::PlannerError {
                     detail: "Filter executor not yet implemented (Phase E)".to_string(),
@@ -296,6 +301,90 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
 /// [`super::query::JoinedRowPayload`]. Either side can be
 /// `None` for outer-join unmatched rows.
 type JoinedPair = (Option<ResultRow>, Option<ResultRow>);
+
+impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
+    /// Phase E-1 federated count aggregate: fetch the inner
+    /// sub-plan via the transport, group + count locally.
+    async fn execute_aggregate_count_federated(
+        &self,
+        plan: ExecutionPlan,
+    ) -> Result<RunningQuery, MeshError> {
+        use super::planner::CostEstimate;
+        use super::query::{AggregateRowPayload, AggregateValue, GroupKey, SeqNum};
+        use std::collections::BTreeMap;
+
+        let OperatorPlan::AggregateCount { input, group_by } = plan.root.operator else {
+            unreachable!("execute_aggregate_count_federated dispatched on non-AggregateCount");
+        };
+
+        // Fetch the inner rows via the federated path so atomic
+        // leaves still dispatch through the transport.
+        let inner = Box::pin(self.execute(ExecutionPlan {
+            root: *input,
+            total_cost: CostEstimate::default(),
+        }))
+        .await?;
+        let rows = drain_rows(inner.rows).await?;
+
+        let mut out: Vec<Result<ResultRow, MeshError>> = Vec::new();
+        match group_by {
+            None => {
+                let payload =
+                    postcard::to_allocvec(&AggregateRowPayload {
+                        group: None,
+                        value: AggregateValue::Count(rows.len() as u64),
+                    })
+                    .map_err(|e| MeshError::ExecutorError {
+                        node: 0,
+                        detail: format!("encode AggregateRowPayload: {e}"),
+                    })?;
+                out.push(Ok(ResultRow {
+                    origin: 0,
+                    seq: SeqNum(0),
+                    payload,
+                }));
+            }
+            Some(mode) => {
+                let mut counts: BTreeMap<Vec<u8>, (GroupKey, u64)> = BTreeMap::new();
+                for row in &rows {
+                    let key_bytes = encode_join_key_federated(row, mode);
+                    let key = match mode {
+                        super::planner::JoinKeyMode::Origin => GroupKey::Origin(row.origin),
+                        super::planner::JoinKeyMode::Seq => GroupKey::Seq(row.seq),
+                        super::planner::JoinKeyMode::OriginSeq => GroupKey::OriginSeq {
+                            origin: row.origin,
+                            seq: row.seq,
+                        },
+                    };
+                    let entry = counts.entry(key_bytes).or_insert((key, 0));
+                    entry.1 = entry.1.saturating_add(1);
+                }
+                for (_, (group, count)) in counts {
+                    let payload = postcard::to_allocvec(&AggregateRowPayload {
+                        group: Some(group),
+                        value: AggregateValue::Count(count),
+                    })
+                    .map_err(|e| MeshError::ExecutorError {
+                        node: 0,
+                        detail: format!("encode AggregateRowPayload: {e}"),
+                    })?;
+                    out.push(Ok(ResultRow {
+                        origin: 0,
+                        seq: SeqNum(0),
+                        payload,
+                    }));
+                }
+            }
+        }
+
+        let handle = QueryHandle::new(self.allocate_id());
+        let stream: ResultStream = Box::pin(futures::stream::iter(out));
+        Ok(RunningQuery {
+            handle,
+            rows: stream,
+        })
+    }
+}
 
 /// Hash-join body for the federated executor. Returns the
 /// matched (and optionally unmatched) `(left, right)` pairs
@@ -1089,6 +1178,53 @@ mod tests {
         assert_eq!(unmatched, 1);
         // The unmatched-left row must always have left=Some.
         assert!(decoded.iter().all(|j| j.left.is_some()));
+    }
+
+    #[tokio::test]
+    async fn federated_aggregate_count_no_group_by_returns_total() {
+        use super::super::planner::CostEstimate;
+        use super::super::query::{AggregateRowPayload, AggregateValue};
+
+        let chain = 0xCAFE;
+        let node = local_executor_with(&[
+            (chain, 1, b"x"),
+            (chain, 2, b"y"),
+            (chain, 3, b"z"),
+            (chain, 4, b"w"),
+        ]);
+        let transport = Arc::new(LoopbackTransport::new());
+        transport.register(0xA, node);
+
+        let fed = FederatedMeshQueryExecutor::new(transport);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateCount {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: chain,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![0xA],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let running = fed.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(decoded.group, None);
+        assert_eq!(decoded.value, AggregateValue::Count(4));
     }
 
     #[tokio::test]

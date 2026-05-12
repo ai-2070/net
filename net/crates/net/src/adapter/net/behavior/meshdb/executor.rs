@@ -42,7 +42,9 @@ use futures::StreamExt;
 
 use super::error::MeshError;
 use super::planner::{ExecutionPlan, JoinKeyMode, OperatorNode, OperatorPlan};
-use super::query::{JoinKind, JoinedRowPayload, ResultRow, SeqNum};
+use super::query::{
+    AggregateRowPayload, AggregateValue, GroupKey, JoinKind, JoinedRowPayload, ResultRow, SeqNum,
+};
 
 /// Unique id for a running query. Currently a monotonically-
 /// increasing `u64` per executor; surfaces through metrics and
@@ -266,6 +268,10 @@ fn collect_operator_rows<R: ChainReader + ?Sized>(
             kind,
             ..
         } => execute_hash_join(left, right, *key_mode, *kind, reader),
+        OperatorPlan::AggregateCount { input, group_by } => {
+            let rows = collect_operator_rows(input, reader)?;
+            execute_aggregate_count(&rows, *group_by)
+        }
         OperatorPlan::Filter { .. } => Err(MeshError::PlannerError {
             detail: "Filter executor not yet implemented (Phase E)".to_string(),
         }),
@@ -420,6 +426,76 @@ fn hash_join_full_outer(
         }
     }
     Ok(out)
+}
+
+/// Phase E-1 count aggregate. Groups `rows` by the row-
+/// intrinsic key (or single bucket when `group_by` is `None`),
+/// then emits one sentinel row per group whose `payload` is a
+/// postcard-encoded [`AggregateRowPayload`].
+///
+/// Ordering: ungrouped emits exactly one row. Grouped emits
+/// rows in deterministic order (lex on the encoded group key)
+/// so the cache-key contract from locked decision #4 holds.
+fn execute_aggregate_count(
+    rows: &[ResultRow],
+    group_by: Option<JoinKeyMode>,
+) -> Result<Vec<ResultRow>, MeshError> {
+    use std::collections::BTreeMap;
+
+    match group_by {
+        None => {
+            let payload = encode_aggregate_payload(None, AggregateValue::Count(rows.len() as u64))?;
+            Ok(vec![ResultRow {
+                origin: 0,
+                seq: SeqNum(0),
+                payload,
+            }])
+        }
+        Some(mode) => {
+            // BTreeMap so iteration order is deterministic
+            // (lex on encoded key bytes). Per-group count
+            // accumulates as u64 — saturating to guard
+            // against pathological row counts.
+            let mut counts: BTreeMap<Vec<u8>, (GroupKey, u64)> = BTreeMap::new();
+            for row in rows {
+                let key_bytes = encode_join_key(row, mode);
+                let key = match mode {
+                    JoinKeyMode::Origin => GroupKey::Origin(row.origin),
+                    JoinKeyMode::Seq => GroupKey::Seq(row.seq),
+                    JoinKeyMode::OriginSeq => GroupKey::OriginSeq {
+                        origin: row.origin,
+                        seq: row.seq,
+                    },
+                };
+                let entry = counts.entry(key_bytes).or_insert((key, 0));
+                entry.1 = entry.1.saturating_add(1);
+            }
+            let mut out = Vec::with_capacity(counts.len());
+            for (_, (group, count)) in counts {
+                let payload = encode_aggregate_payload(Some(group), AggregateValue::Count(count))?;
+                out.push(ResultRow {
+                    origin: 0,
+                    seq: SeqNum(0),
+                    payload,
+                });
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Wrap `group` + `value` in an [`AggregateRowPayload`] and
+/// postcard-encode it.
+fn encode_aggregate_payload(
+    group: Option<GroupKey>,
+    value: AggregateValue,
+) -> Result<Vec<u8>, MeshError> {
+    postcard::to_allocvec(&AggregateRowPayload { group, value }).map_err(|e| {
+        MeshError::ExecutorError {
+            node: 0,
+            detail: format!("encode AggregateRowPayload: {e}"),
+        }
+    })
 }
 
 /// Wrap `(left, right)` in a [`JoinedRowPayload`], postcard-
@@ -1119,6 +1195,210 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn aggregate_count_no_group_by_returns_single_row_with_total() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue,
+        };
+
+        let chain = 0xABCD;
+        let reader = Arc::new(InMemoryChainReader::default());
+        for s in 1..=5u64 {
+            reader.append(chain, SeqNum(s), format!("p-{s}").into_bytes());
+        }
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateCount {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: chain,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+
+        let running = executor.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let decoded: AggregateRowPayload =
+            postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(decoded.group, None);
+        assert_eq!(decoded.value, AggregateValue::Count(5));
+    }
+
+    #[tokio::test]
+    async fn aggregate_count_group_by_origin_returns_per_chain_count() {
+        use crate::adapter::net::behavior::meshdb::planner::{CostEstimate, JoinKeyMode};
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue, GroupKey,
+        };
+        use std::collections::HashMap;
+
+        // The local executor's HashJoin reuses both chains as
+        // input rows; we drive a similar cross-chain pattern
+        // via HashJoin output rows... actually simpler: emit a
+        // sequence of rows from two BetweenReads stitched via a
+        // joinless leaf source. For Phase E-1 we only need
+        // multiple rows from one chain; group_by Origin then
+        // yields one bucket. To exercise two buckets, use a
+        // HashJoin with origin-mode then group by origin =
+        // overkill. Instead, use two AtReads via a contrived
+        // composite — not possible without a Union operator.
+        //
+        // Workaround: feed rows from a HashJoin Inner whose
+        // sentinel output rows all share origin=0; group_by
+        // Origin then puts everything in one bucket. Useful as
+        // a sanity check.
+        //
+        // Better: directly call execute_aggregate_count over a
+        // hand-crafted row Vec — that exercises the grouping
+        // logic without composing operators we don't yet have.
+        // Phase E-2's Union operator (or a richer test
+        // harness) is the right place to test multi-bucket
+        // origin-grouped aggregates over executor-emitted rows.
+        let rows = vec![
+            ResultRow {
+                origin: 0xAA,
+                seq: SeqNum(1),
+                payload: vec![],
+            },
+            ResultRow {
+                origin: 0xAA,
+                seq: SeqNum(2),
+                payload: vec![],
+            },
+            ResultRow {
+                origin: 0xBB,
+                seq: SeqNum(1),
+                payload: vec![],
+            },
+            ResultRow {
+                origin: 0xCC,
+                seq: SeqNum(1),
+                payload: vec![],
+            },
+            ResultRow {
+                origin: 0xCC,
+                seq: SeqNum(2),
+                payload: vec![],
+            },
+            ResultRow {
+                origin: 0xCC,
+                seq: SeqNum(3),
+                payload: vec![],
+            },
+        ];
+        let out = super::execute_aggregate_count(&rows, Some(JoinKeyMode::Origin)).unwrap();
+        assert_eq!(out.len(), 3);
+        let mut by_origin: HashMap<u64, u64> = HashMap::new();
+        for row in &out {
+            let decoded: AggregateRowPayload =
+                postcard::from_bytes(&row.payload).unwrap();
+            if let Some(GroupKey::Origin(o)) = decoded.group {
+                let AggregateValue::Count(c) = decoded.value;
+                by_origin.insert(o, c);
+            }
+        }
+        assert_eq!(by_origin.get(&0xAA), Some(&2));
+        assert_eq!(by_origin.get(&0xBB), Some(&1));
+        assert_eq!(by_origin.get(&0xCC), Some(&3));
+
+        let _ = CostEstimate::default(); // silence unused-import lint
+    }
+
+    #[tokio::test]
+    async fn aggregate_count_group_by_seq_buckets_by_seq() {
+        use crate::adapter::net::behavior::meshdb::planner::JoinKeyMode;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue, GroupKey,
+        };
+        use std::collections::HashMap;
+
+        let rows = vec![
+            ResultRow {
+                origin: 0xAA,
+                seq: SeqNum(1),
+                payload: vec![],
+            },
+            ResultRow {
+                origin: 0xBB,
+                seq: SeqNum(1),
+                payload: vec![],
+            },
+            ResultRow {
+                origin: 0xCC,
+                seq: SeqNum(7),
+                payload: vec![],
+            },
+        ];
+        let out = super::execute_aggregate_count(&rows, Some(JoinKeyMode::Seq)).unwrap();
+        assert_eq!(out.len(), 2);
+        let mut by_seq: HashMap<u64, u64> = HashMap::new();
+        for row in &out {
+            let decoded: AggregateRowPayload =
+                postcard::from_bytes(&row.payload).unwrap();
+            if let Some(GroupKey::Seq(SeqNum(s))) = decoded.group {
+                let AggregateValue::Count(c) = decoded.value;
+                by_seq.insert(s, c);
+            }
+        }
+        assert_eq!(by_seq.get(&1), Some(&2));
+        assert_eq!(by_seq.get(&7), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn aggregate_count_empty_input_returns_zero() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue,
+        };
+
+        let reader = Arc::new(InMemoryChainReader::default());
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateCount {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::LatestRead { origin: 0xDEAD },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let running = executor.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        // Ungrouped aggregate always emits one row, even on
+        // empty input (Count = 0).
+        assert_eq!(rows.len(), 1);
+        let decoded: AggregateRowPayload =
+            postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(decoded.value, AggregateValue::Count(0));
     }
 
     #[tokio::test]
