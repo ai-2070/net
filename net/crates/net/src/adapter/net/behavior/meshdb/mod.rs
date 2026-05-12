@@ -21,6 +21,12 @@
 //!   atomic operators (`At` / `Between` / `Latest`); other
 //!   variants surface `MeshError::PlannerError` until their
 //!   phase activates.
+//! - [`executor`] — `MeshQueryExecutor` async trait +
+//!   `LocalMeshQueryExecutor` walks the plan and emits
+//!   `ResultRow`s through a pluggable `ChainReader`
+//!   abstraction. Phase B-2 handles the atomic operators end-
+//!   to-end; cross-node fan-out + partial-result resume land
+//!   in Phase B-4.
 //!
 //! # AST versioning (locked decision #1)
 //!
@@ -54,10 +60,15 @@
 //! AST + planner skeleton is the only surface in code.
 
 pub mod error;
+pub mod executor;
 pub mod planner;
 pub mod query;
 
 pub use error::{BudgetMetric, MeshError};
+pub use executor::{
+    ChainReader, LocalMeshQueryExecutor, MeshQueryExecutor, QueryHandle, QueryId, ResultStream,
+    RunningQuery,
+};
 pub use planner::{ExecutionPlan, MeshQueryPlanner, OperatorNode, OperatorPlan};
 pub use query::{
     AggregateFn, ChainRef, Expr, JoinKey, JoinKind, MeshQuery, OrderDir, OrderKey, QueryV1,
