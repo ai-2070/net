@@ -1,0 +1,34 @@
+net/crates/net/src/adapter/net/dataforts/blob/migration.rs
+  s_3a0a24a47d1a36::t_ecb9bad468cfef 569-575
+  s_3a0a24a47d1a36::t_c13abe32208aee 930-939
+net/crates/net/src/adapter/net/dataforts/blob/metrics.rs
+  s_3a0a24a47d1a36::t_c13abe32208aee 432
+net/crates/net/src/adapter/net/mesh.rs
+  s_3a0a24a47d1a36::t_ecb9bad468cfef 10349-10353
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_3a0a24a47d1a36::t_ecb9bad468cfef 503-513,520,539
+net/crates/net/bindings/python/src/blob.rs
+  s_3a0a24a47d1a36::t_ecb9bad468cfef 706-711
+net/crates/net/bindings/python/tests/test_blob.py
+  s_3a0a24a47d1a36::t_e0c739d8a5d0d8 185-203,208-215
+net/crates/net/src/adapter/net/dataforts/blob/blob_ref.rs
+  s_3a0a24a47d1a36::t_ecb9bad468cfef 370-377
+net/crates/net/src/adapter/net/dataforts/blob/admission.rs
+  s_3a0a24a47d1a36::t_ecb9bad468cfef 408,419
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "8a21009cad941d843aa83199b47a5d09f50433ff",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
