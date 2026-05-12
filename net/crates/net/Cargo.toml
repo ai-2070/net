@@ -10,7 +10,7 @@ members = [
 
 [package]
 name = "ai2070-net"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "High-performance, schema-agnostic, backend-agnostic event bus"
 license = "Apache-2.0"
