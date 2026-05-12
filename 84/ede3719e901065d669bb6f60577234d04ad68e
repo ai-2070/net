@@ -1,0 +1,39 @@
+net/crates/net/docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md
+  s_3a0a24a47d1a36::t_83a278e668baa8 653
+net/crates/net/bindings/python/src/blob.rs
+  s_3a0a24a47d1a36::t_5bf6c2240f287d 846-850
+  s_3a0a24a47d1a36::t_f013024ddab695 31
+  s_3a0a24a47d1a36::t_0f6d73876a22f2 27,666-667,834
+  s_3a0a24a47d1a36::t_44779e9365bf27 641-656,658-665,668-670,672-675,688-734
+  s_3a0a24a47d1a36::t_ae9353a62f328c 823-833,835-845,851-942
+  s_3a0a24a47d1a36::t_84f49c1af1753e 24
+net/crates/net/src/adapter/net/dataforts/mod.rs
+  s_3a0a24a47d1a36::t_3c69ef3ba2e7a5 52-53,56-57
+net/crates/net/docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
+  s_3a0a24a47d1a36::t_f970f4416cd3f6 1
+  s_3a0a24a47d1a36::t_7541667bdad976 14-31
+  s_3a0a24a47d1a36::t_5d2bf2b6eb2145 7
+net/crates/net/src/adapter/net/dataforts/blob/mod.rs
+  s_3a0a24a47d1a36::t_0e694626d6a0a9 62-66
+net/crates/net/bindings/python/tests/test_blob.py
+  s_3a0a24a47d1a36::t_1bcc4fc66dd3b1 244-426
+net/crates/net/docs/releases/RELEASE_v0.15_REBEL_YELL.md
+  s_3a0a24a47d1a36::t_68924b25353d6e 303-511
+  s_3a0a24a47d1a36::t_76d5968215aebd 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "84ede3719e901065d669bb6f60577234d04ad68e",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
