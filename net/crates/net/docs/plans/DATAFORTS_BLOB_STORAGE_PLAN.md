@@ -25,14 +25,15 @@ Three load-bearing reasons it's mesh-native, not "ship an S3 adapter and call it
 
 ## What ships
 
-Six things, in dependency order:
+Seven things, in dependency order:
 
 1. **`BlobRef` enum extension** — `Small` keeps its v0.15 wire form; `Manifest` lands as a new tagged variant carrying a `ChunkRef` list + an `Encoding` discriminant (`Replicated` today; `ReedSolomon { k, m }` reserved for v0.3).
 2. **Chunking algorithm** — 4 MiB fixed threshold + chunk size. Below threshold: `BlobRef::Small`. Above: chunks stored independently as content-addressed RedEX files; manifest stored as a small blob (<128 bytes).
 3. **`MeshBlobAdapter`** — implements `BlobAdapter` against the local mesh. `store` / `store_stream` / `fetch` / `fetch_range` / `delete` / `stat`. Routed by the `mesh://` URI scheme.
 4. **`publish_with_blob` helper** — caller-level atomic that stores the bytes, waits for replica durability, then publishes the event referencing the resulting `BlobRef`. Closes the "consumer reads event before chunks are replicated" race.
 5. **GC + pinning** — refcount-driven sweep over content hashes. Reference sources: RedEX chain folds, CortEX adapters indexing events, direct mesh queries for referencing events. Pins via `pin(blob_ref)` / `unpin(blob_ref)` survive GC regardless of refcount. Retention floor (default 24 h) protects newly-stored blobs against premature collection.
-6. **Operator surface** — Prometheus metrics (`blobs_stored_total`, `bytes_replicated_total`, `blob_replication_lag_ms`, `blob_gc_swept_total`, `blob_disk_used_bytes`, etc.) + `net blob` CLI (`ls`, `stat`, `replicas`, `gc --dry-run`, `delete`, `pin`, `unpin`) + a "blob-storage-unhealthy" capability tag when local disk crosses 95 %.
+6. **Capability extension** — a minimal set of `cap.blob.*` + `cap.dataforts.*` capabilities lets `PlacementFilter` skip nodes that can't / shouldn't hold blobs, and lets greedy / gravity respect per-node behavioral traits + topology scope. **No new subprotocol; no new wire negotiation.** Three new fields on `CapabilitySet` + a new `Artifact::Blob` variant on `PlacementFilter`. See § 7 below.
+7. **Operator surface** — Prometheus metrics (`blobs_stored_total`, `bytes_replicated_total`, `blob_replication_lag_ms`, `blob_gc_swept_total`, `blob_disk_used_bytes`, etc.) + `net blob` CLI (`ls`, `stat`, `replicas`, `gc --dry-run`, `delete`, `pin`, `unpin`) + a `dataforts:blob-storage-unhealthy` capability tag when local disk crosses 95 %.
 
 What this plan does NOT ship (explicitly deferred):
 
@@ -228,6 +229,106 @@ net blob unpin <ref>              # release protection
 
 **Health gates.** When local disk > 95 %, the node advertises a `dataforts:blob-storage-unhealthy` capability tag. The `PlacementFilter` skips unhealthy nodes when placing new chunks; chain-level mesh ops are unaffected. The node clears the tag when disk drops back below 85 % (hysteresis).
 
+### 7. Capability extension
+
+The substrate must know **which nodes can hold blobs at all** and **how greedy / gravity should behave per node**. Both are per-node behavioral traits, not cluster-wide flags — a mesh routinely mixes compute-only nodes, storage-only nodes, and hybrids; a multi-region deployment routinely wants greedy bounded to a region. The right place for these is the existing `CapabilitySet`; the substrate already carries them across the mesh via the capability index and the `causal:` tag propagation path.
+
+**Three load-bearing reasons this is a capability, not a config flag:**
+
+1. **Mixed node roles.** A 50-node cluster running 10 compute-heavy nodes (no blob storage), 30 hybrid nodes, and 10 storage-heavy nodes can't be expressed as a global flag. Two nodes in the same mesh participate differently in placement, greedy, and gravity decisions.
+2. **No new wire protocol.** The capability index, the proximity graph, hierarchical summarization, and `find_nodes_by_filter` all already propagate per-node traits. Adding three new capability fields rides those primitives at no per-packet cost.
+3. **No multi-capability handshake.** Nodes that don't know about blob storage advertise `blob.storage = false` (default); they participate in chain-level ops unchanged. There's nothing to negotiate.
+
+The **minimal correct set**:
+
+```rust
+pub struct CapabilitySet {
+    // ... existing axes (hardware / software / devices / dataforts) ...
+    pub blob: BlobCapability,
+    pub dataforts_greedy: GreedyCapability,
+    pub dataforts_gravity: GravityCapability,
+}
+
+pub struct BlobCapability {
+    /// Does this node participate in blob storage at all?
+    pub storage: bool,
+    /// Operator-configured cap for blob disk (separate from RedEX disk).
+    pub disk_total_gb: u64,
+    /// Updated on heartbeat (default 5 s cadence). Drives placement
+    /// scoring + the `blob-storage-unhealthy` health gate.
+    pub disk_free_gb: u64,
+    /// Reserved for v0.3 tiering. `None` in v0.2.
+    pub class: Option<BlobClass>,    // Hot / Warm / Cold / Archive
+}
+
+pub struct GreedyCapability {
+    /// Does this node act as a greedy puller at all?
+    pub enabled: bool,
+    /// Topology boundary greedy is allowed to cross.
+    pub scope: TopologyScope,        // Node / Zone / Region / Mesh
+    /// Soft-preference weight (0–255). 0 = greedy disabled even
+    /// when `enabled = true`; high = prefer near peers; low =
+    /// allow farther peers under cost-tolerant policy.
+    pub proximity: u8,
+}
+
+pub struct GravityCapability {
+    /// Does this node participate in heat-driven migration?
+    pub enabled: bool,
+    pub scope: TopologyScope,
+    pub proximity: u8,
+}
+
+pub enum TopologyScope {
+    /// Migrate / pull only on the same node (debug / single-node).
+    Node,
+    /// Same failure-domain zone (rack / power domain).
+    Zone,
+    /// Same region (typically same datacenter / cloud region).
+    Region,
+    /// Whole mesh (no scope constraint).
+    Mesh,
+}
+```
+
+**`scope` vs. `proximity` — two control planes:**
+
+- `scope` is a **hard boundary**. `GreedyCapability::scope == Zone` means the node never pulls blobs originating outside its zone, no matter how attractive the heat score. `gravity_scope == Region` means a hot blob never drifts across regions, even if a higher-RTT node is the heat source. Hard cuts off the worst failure modes (cross-WAN egress costs, cross-region partition risk, compliance boundaries).
+- `proximity` is a **soft preference weight**. `greedy_proximity = 200` says "strongly prefer near peers"; `= 64` says "tolerate farther peers." `0` disables the policy even when `enabled = true`. Soft drives the score-based placement decisions inside the allowed scope.
+
+Both are needed because they answer different questions: scope answers *"is this peer eligible at all?"*, proximity answers *"among eligible peers, which to pick?"*.
+
+**`PlacementFilter::Artifact::Blob`:**
+
+```rust
+pub enum Artifact {
+    Chain { origin_hash: u64, capabilities: Arc<CapabilitySet> },
+    Replica { channel: ChannelName, capabilities: Arc<CapabilitySet> },
+    Daemon { daemon_id: String, required: Vec<Tag>, optional: Vec<Tag> },
+    // v0.2 — new:
+    Blob {
+        blob_hash: [u8; 32],
+        size_bytes: u64,
+        encoding: Encoding,
+        capabilities: Arc<CapabilitySet>,
+    },
+}
+```
+
+`StandardPlacement::placement_score(&Artifact::Blob, node)` factors in:
+
+- `node.blob.storage == true` — gate; non-storage nodes score 0.
+- `node.blob.disk_free_gb >= size_bytes / 1 GiB + slack` — disk-pressure gate.
+- `dataforts:blob-storage-unhealthy` tag absent — health gate.
+- failure-domain tags (rack / zone / region) for anti-affinity with existing replicas.
+- `proximity` (RTT to the publisher) — soft-weighted.
+
+The same `StandardPlacement` config that scores chains scores blobs. Operator knobs (`scope_filter`, `proximity_max_rtt`, `intent_match`, `colocation_policy`, `resource_axis`, `metadata_keys`) all apply unchanged.
+
+**Update frequency.** `disk_free_gb` updates on the heartbeat cadence (default 5 s); `storage` / `enabled` flags update only on operator action (no need to re-advertise every tick). The heartbeat-frequency update for `disk_free_gb` is the same rate the proximity graph already runs; no new traffic.
+
+**Cargo feature gate.** The capability extensions land behind the existing `dataforts` feature. Builds without the feature serialize the new fields as defaults (`storage: false`, `enabled: false`, `scope: Mesh`, `proximity: 0`) — wire-compatible with v0.15 nodes that don't know the fields exist, since `CapabilitySet` already serializes as a postcard struct that tolerates unknown trailing fields.
+
 ---
 
 ## Dataforts integration rules
@@ -242,7 +343,14 @@ Greedy pulls **only blobs referenced by artifacts it already pulled**, not arbit
 - Greedy does NOT speculatively pull blobs on the basis of `blob:<hex>` capability tags alone — that path would explode disk usage on referenced-once-per-million-events data.
 - Greedy DOES weight blob admission by the parent chain's heat (Phase 4) and proximity (Phase 7).
 
-Counter: `dataforts_greedy_blob_pulls_admitted_total` / `…_rejected_total`.
+**Capability gating** (new in v0.2):
+
+- A node with `dataforts_greedy.enabled = false` never speculatively pulls blobs, no matter what its parent chain admits.
+- A node with `blob.storage = false` never receives blob replicas at all (placement skips it).
+- A node with `dataforts_greedy.proximity = 0` is functionally greedy-disabled for blobs even when `enabled = true`.
+- `dataforts_greedy.scope` is a hard boundary — `scope == Zone` means greedy doesn't pull blobs whose publisher is in a different zone, regardless of heat score.
+
+Counters: `dataforts_greedy_blob_pulls_admitted_total` / `…_rejected_total{reason}` where `reason ∈ { Scope, Proximity, NoStorageCap, GreedyDisabled, DiskPressure }`.
 
 ### G-2 — Gravity (Phase 4)
 
@@ -251,6 +359,13 @@ Heat applies to blobs the same way it applies to chains:
 - Frequent `fetch` / `fetch_range` calls on a blob bump its `HeatCounter`.
 - Threshold-crossing emissions stamp `heat:<hex>=<rate>` onto the blob's existing capability advertisement (same code path as chain heat — blobs ride the `causal:` shape).
 - Hot blobs attract additional replicas; cold blobs decay and may reduce replica count to `replication_factor - 1` under disk pressure.
+
+**Capability gating** (new in v0.2):
+
+- A node with `dataforts_gravity.enabled = false` doesn't pull migrating blobs, even if its heat score would otherwise win the placement.
+- `dataforts_gravity.scope` bounds the migration radius — `scope == Region` means a hot blob never drifts out of its source region, even when a higher-RTT node is the heat source. Multi-region deployments configure `scope = Region` by default; multi-cloud configures `scope = Zone` to keep migration off the WAN.
+- `dataforts_gravity.proximity` weights the score-based migration decision inside the allowed scope; `0` disables migration on this node.
+- Gravity-side replica reduction (cold blobs trim to `replication_factor - 1`) respects the `blob.storage` gate — a node that doesn't carry blobs at all isn't a candidate to *lose* one either.
 
 ### G-3 — Migration
 
@@ -261,8 +376,10 @@ Blob replicas migrate under Phase 4 gravity exactly like chain replicas. No spec
 Blob placement uses the exact same primitives as chain placement:
 
 - `PlacementStrategy::Standard` defers to the 5-axis `PlacementFilter` (scope + proximity + capability-preference + colocation + storage-cap).
-- `PlacementStrategy::Pinned([NodeId])` skips the filter.
-- `PlacementStrategy::ColocationStrict` requires the blob to land on a node already carrying its colocation target.
+- `PlacementStrategy::Pinned([NodeId])` skips the filter — but still gates on `blob.storage = true`; pinning to a non-storage node returns a typed error at placement time, not silent corruption.
+- `PlacementStrategy::ColocationStrict` requires the blob to land on a node already carrying its colocation target AND `blob.storage = true`.
+
+`PlacementFilter::placement_score(&Artifact::Blob, node)` factors in `node.blob.storage`, `node.blob.disk_free_gb`, the `dataforts:blob-storage-unhealthy` health tag, failure-domain anti-affinity, and proximity (see § 7 above for the full scoring formula).
 
 Unified placement model. One operator knob set, not two.
 
@@ -340,6 +457,9 @@ Five layers, each with explicit DST scope where determinism is gate-able.
 - Reuse the `redex_replication_dst.rs` harness; add blob scenarios (multi-chunk store under partition, manifest-then-chunks ordering, retention-floor sweep timing).
 - Chunking idempotency under racing concurrent stores on the same content (both should resolve to the same `BlobRef`; the replication coordinator dedupes by content hash).
 - Partition-heal divergence-freedom — write the same logical content on both sides under a different `uri`; both produce the same `BlobRef` (because content-addressed); replicas converge.
+- **Mixed-capability cluster scenarios**: 3-node cluster with one compute-only (`blob.storage = false`), one storage-only, one hybrid — assert placement never lands chunks on the compute-only node, gravity never migrates toward it, and greedy never pulls toward it. Assert the *negative*: a compute-only node observing a `causal:<blob_hex>` advertisement does NOT bump its `HeatCounter`.
+- **Cross-scope enforcement**: 4-node cluster split across two zones (`zone:a` and `zone:b`) with `gravity_scope = Zone`. Heat-driven migration must stay within zones; cross-zone drift never happens regardless of heat differential.
+- **Proximity-weighted convergence**: 3-node cluster with mixed `proximity` weights (255 / 128 / 0). Hot blob originating from node A must converge toward the high-proximity node first; the zero-proximity node never receives speculative pulls even when it's the closest peer.
 
 ### T-4 — Conformance
 
@@ -366,6 +486,9 @@ These need a ratify-or-revise decision before PRs start.
 4. **`delete` semantics — recursive or surface-only?** A `BlobRef::Manifest` delete that auto-removes its chunks is convenient but breaks the dedup property (other manifests may reference the same chunks). Recommended: surface-only delete (manifest body removed; chunks deleted on their own GC cycle).
 5. **`publish_with_blob` failure mode — atomic rollback or surfaced error?** If step 2 (durability wait) times out, do we roll back the stored chunks? Recommended: no rollback. The chunks are content-addressed; an aborted publish leaves the blob in place. Future publishers with the same content will dedupe.
 6. **GC out-of-band scanner cadence.** Default 1 h is a guess; a node holding 10 M blobs might want less frequent sweeps. Recommended: 1 h default, `RedexFileConfig::blob_gc_scan_interval` operator override.
+7. **`disk_free_gb` heartbeat cadence.** 5 s default matches the proximity-graph heartbeat. Faster updates give placement decisions fresher data but increase advertisement volume; slower updates risk placing a chunk on a node that just filled up. Recommended: 5 s default, `BlobCapability::disk_free_update_interval` operator override.
+8. **Greedy / gravity capability default at first boot.** A fresh `dataforts`-enabled node could default to `enabled = true` (opt-out) or `enabled = false` (opt-in). Opt-out is friendlier for single-cluster deploys; opt-in is safer for multi-region pilots. Recommended: opt-out (`enabled = true`, `scope = Mesh`, `proximity = 128`) — match the v0.15 behavior so existing deployments don't see a policy change when the v0.2 capability fields land.
+9. **Capability scope granularity.** `TopologyScope { Node, Zone, Region, Mesh }` is intentionally coarse — finer granularity (e.g. `Rack`, `AvailabilityZone`) would require an explicit failure-domain hierarchy the substrate doesn't track today. Recommended: ship the four-variant enum; document `Zone` as "operator-defined failure boundary, typically rack-level" and let the operator's `scope:<label>` capability tags supply the actual mapping.
 
 Lock each via a single-line decision in the v0.2 release notes when the implementation lands.
 
@@ -393,12 +516,14 @@ Five PRs in dependency order. Each is self-contained and can land independently 
 - `ChunkRef` type + manifest body encoding (postcard + version byte).
 - Unit tests for chunk-index range math + idempotency.
 
-### PR-2 — `MeshBlobAdapter` (2 weeks)
+### PR-2 — `MeshBlobAdapter` + capability extension (2 weeks)
 
 - `MeshBlobAdapter` impl against `Redex` + `MeshNode`.
 - `store` / `store_stream` / `fetch` / `fetch_range` / `delete` / `stat`.
 - `BlobStat` shape across bindings.
 - Reuses RedEX replication; **no new replication code** lands in this PR (gating discipline).
+- `BlobCapability` / `GreedyCapability` / `GravityCapability` / `TopologyScope` types land on `CapabilitySet`; postcard wire-compat with v0.15 nodes via tolerated trailing fields.
+- `Artifact::Blob` variant on `PlacementFilter`; `StandardPlacement::placement_score(&Artifact::Blob, node)` factors in `blob.storage` / `disk_free_gb` / health tag / failure-domain tags / proximity.
 - Conformance suite extension (T-4).
 
 ### PR-3 — `publish_with_blob` + durability (1 week)
@@ -418,7 +543,8 @@ Five PRs in dependency order. Each is self-contained and can land independently 
 ### PR-5 — Dataforts integration + DST (1–2 weeks)
 
 - Greedy / gravity / placement / migration / RYW / auth wiring (G-1 through G-6).
-- DST harness extensions (T-3).
+- Capability-gated admission paths — greedy + gravity respect `enabled` / `scope` / `proximity` per node.
+- DST harness extensions (T-3) including mixed-capability cluster scenarios (compute-only nodes refusing blob replicas, cross-region scope enforcement, proximity-weighted convergence).
 - Cross-binding fixtures (T-5).
 
 **Total: 7–8 weeks focused.** Parallelism opportunities: PR-2 and PR-4's CLI work; PR-3 and PR-5's DST work. Worst-case sequential: 8 weeks.
@@ -636,4 +762,194 @@ If node disk > 95%: refuse new blob replicas; advertise as blob-storage-unhealth
 - trie-based manifest compression
 - delta-chunking for large versioned models
 - in-cluster caching layers (L1 blob cache)
+```
+
+### Appendix A.2 — capability extension (Kyra follow-up)
+
+Reproduced verbatim. Plan crosswalk: this content informs § 7 (capability extension), § G-1 / G-2 / G-4 (gating rules), and § T-3 (mixed-capability DST scenarios).
+
+```text
+Why you *do* need capability-announcement
+
+Blob storage is not "just another feature." It consumes:
+- disk
+- IO bandwidth
+- replication budget
+- placement slots
+- gravity migration paths
+- eviction space
+- node health signaling
+
+And you cannot assume every node:
+- has disk
+- has enough disk
+- is allowed to store blobs
+- wants to store blobs
+- is in the right failure domain
+- can handle blob replicas
+- can participate in migration
+- is not running compute-only workloads
+
+This is exactly what capability tags are for.
+
+One new capability:  capability: "blob-storage"
+Three derived qualities:
+  blob.disk_total_gb
+  blob.disk_free_gb
+  blob.replication_factor_supported = N
+
+Dataforts uses PlacementFilter:
+- P1 greedy only pulls blobs to nodes with blob-storage
+- P4 gravity only migrates blobs between nodes with blob-storage
+- Placement scoring can skip nodes without this capability
+
+Why you *do NOT* need full-blown capability-driven encodings:
+- no dedicated blob-storage subprotocol
+- no per-node storage classes
+- no advanced runtime negotiation
+- no multi-capability mesh announcements
+- no dynamic feature negotiation protocol
+- no capability handshakes
+- no versioned blob-support states
+
+Because:
+- every node already has RedEX
+- every node already can replicate chunks
+- every node already can publish
+- every node already participates in placement
+
+There's nothing new to negotiate at the wire level.
+
+So what capabilities do you actually add?
+1. cap.blob.storage = true|false
+2. cap.blob.disk_total_gb: u64
+3. cap.blob.disk_free_gb: u64                 (updated on heartbeat)
+4. (optional) cap.blob.class                  (cold/warm/hot — not required for v0.1)
+
+How Dataforts uses the capability:
+- P1 greedy placement: only pulls blobs to nodes with blob.storage = true
+- P4 gravity drift: moves hotter blobs to nodes with more free space;
+                    evicts/migrates cold blobs from overloaded nodes
+- P7 placement scoring: PlacementFilter gets a new Artifact::Blob type:
+      placement_score(&Artifact::Blob, node)
+  which incorporates disk_free_gb / failure-domain tags / blob-storage capability.
+
+GREEDY IS NOT A FEATURE FLAG. IT IS A BEHAVIORAL CAPABILITY OF A NODE.
+
+A node either:
+- has spare disk / CPU / bandwidth → can act as a greedy puller
+- or it doesn't → should not pull aggressively
+
+This is a per-node trait. Greedy belongs in the capability graph, not in
+global config.
+
+Greedy influences:
+- pull pressure
+- bandwidth budget
+- disk pressure
+- migration balance
+- initial replica placement
+- pull scheduling
+
+Two nodes in the same mesh might be:
+- compute-heavy nodes (no greedy)
+- storage-heavy nodes (greedy=true)
+- hybrid nodes (greedy weight = medium)
+
+Greedy is a local trait that Opus may surface globally, but the engine
+must treat it per-node.
+
+Correct form:
+  capabilities = {
+      "blob-storage": true,
+      "dataforts-greedy": true|false,
+      "dataforts-gravity": true|false,
+  }
+
+Later expand to:
+  "dataforts-greedy-weight": u8
+  "dataforts-gravity-weight": u8
+
+Engine behavior:
+  P1 Greedy (on artifact creation):
+    if node.cap["dataforts-greedy"]:
+        greedy_pull()
+    else:
+        skip_greedy
+
+  P4 Gravity (cluster-wide), but respects:
+    if !node.cap["blob-storage"]:
+        do not migrate blobs here
+
+Why greedy must be a capability instead of a flag:
+Future clusters will need mixed roles:
+- cold-tier storage nodes
+- hot-tier greedy nodes
+- compute-only nodes
+- archival storage nodes
+- limited-disk nodes
+
+Global flags cannot express this. Capability tags can.
+
+Greedy needs "scope":
+- same-node / same-zone / same-region / same-cloud / whole-mesh
+Because not every cluster wants greedy pulls across WAN:
+- local-region clusters → greedy across full mesh is fine
+- multi-region → greedy must stay local
+- multi-cloud → greedy must be scoped to avoid egress cost
+- edge deployments → greedy only within the same PoP
+
+  cap.dataforts.greedy_scope = "node" | "zone" | "region" | "mesh"
+
+Greedy needs "proximity":
+- high proximity: pull aggressively from near peers only
+- low proximity:  reach far if needed
+
+  cap.dataforts.greedy_proximity: u8 (0–255)
+
+Becomes a weight inside P1:
+- high proximity = prefer closer replicas
+- low proximity = allow farther replicas
+- proximity = 0 = greedy disabled
+
+Gravity needs the same fields:
+  cap.dataforts.gravity_scope
+  cap.dataforts.gravity_proximity
+
+Which control:
+- where gravity is allowed to migrate
+- how "far" a blob/chain can drift
+- which nodes compete for hot objects
+- how heat propagates across topology boundaries
+
+Minimal capability set:
+  Greedy:
+    cap.dataforts.greedy = true/false
+    cap.dataforts.greedy_scope = enum
+    cap.dataforts.greedy_proximity = u8
+  Gravity:
+    cap.dataforts.gravity = true/false
+    cap.dataforts.gravity_scope = enum
+    cap.dataforts.gravity_proximity = u8
+  Blob storage:
+    cap.blob_storage = true/false
+    cap.blob.disk_total_gb = u64
+    cap.blob.disk_free_gb = u64
+
+Why both scope and proximity?
+Different control planes:
+- Scope = hard boundary  ("Do not drift into other regions.")
+- Proximity = soft preference ("Prefer closer nodes even inside the region.")
+
+Both are needed for P1 greedy / P4 gravity / P7 placement filter / mixed
+node roles / multi-region meshes / multi-cloud setups / edge topologies
+/ disk-pressure-aware placement.
+
+Without them:
+- greedy pulls too far
+- gravity drifts across cost domains
+- artifacts oscillate between zones
+- blob replicas migrate out of locality
+- compute locality is broken
+- operators lose control over placement
 ```
