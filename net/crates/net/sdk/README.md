@@ -904,6 +904,83 @@ Replication overhead is ~1× of single-node append throughput in
 steady state — the runtime task runs on tokio at the heartbeat
 cadence; per-append work is unchanged.
 
+## Dataforts (greedy cache, gravity, blob refs, read-your-writes)
+
+Dataforts is the compositional data plane on top of RedEX / CortEX /
+capability-index / proximity-graph. Enable the `dataforts` feature
+on the underlying `ai2070-net` crate (the SDK is a thin wrapper —
+Dataforts surfaces are consumed via `net::adapter::net::dataforts::*`
+and `Redex::enable_greedy_dataforts` / `Redex::enable_gravity_for_greedy`
+on the `Redex` handle). Four phases:
+
+- **Phase 1 — Greedy-LRU caching.** Per-node speculative caching
+  of in-scope chains observed via the tail-subscription path.
+  Five-axis admission (scope + proximity + capability-preference
+  + colocation + storage-cap) plus a bandwidth budget gate decide
+  whether to admit each inbound event into a per-channel cache
+  file. Cold channels evict under cluster-cap pressure and
+  withdraw their `causal:<hex>` advertisement.
+- **Phase 3 — `BlobRef` + `BlobAdapter`.** A 4-byte-magic +
+  version + 32-byte BLAKE3 + size + URI reference whose bytes
+  live in the caller's storage (S3 / Ceph / IPFS / local FS). The
+  substrate carries the reference, not the blob; adapters
+  implement `fetch` / `store` with default `fetch_stream` /
+  `store_stream` shims for multi-GB payloads.
+- **Phase 4 — Data gravity.** Per-chain read-rate counters with
+  exponential decay. Threshold-crossing emissions stamp
+  `heat:<hex>=<rate>` onto the chain's existing capability
+  announcement; the greedy admission gate weights cache pulls by
+  heat × scope-match × proximity-rank. Cold chains evict first;
+  hot chains migrate toward the readers that drive the heat.
+- **Phase 5 — Read-your-writes.** A `WriteToken { origin_hash,
+  seq }` returned from every successful `Tasks` / `Memories`
+  write. Pass it to `tasks.wait_for_token(token, deadline)` (or
+  the memories counterpart) and the call blocks until the local
+  fold has actually *applied* that sequence number — tracking
+  both `applied_through_seq` and `folded_through_seq` so a
+  stalled fold surfaces `WaitForTokenError::FoldStopped` rather
+  than a silent `Ok(())`.
+
+```rust,ignore
+use net::adapter::net::{MeshNode, Redex};
+use net::adapter::net::dataforts::{
+    DataGravityPolicy, GreedyConfig, IntentMatchPolicy,
+};
+use net::adapter::net::behavior::capability::CapabilitySet;
+use std::sync::Arc;
+
+# async fn example(mesh: Arc<MeshNode>) -> Result<(), Box<dyn std::error::Error>> {
+let redex = Arc::new(Redex::new());
+
+// Phase 1 — wire greedy into the mesh inbound dispatch.
+redex.enable_greedy_dataforts(
+    mesh.clone(),
+    GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled),
+    Arc::new(CapabilitySet::default()),
+    Default::default(),
+)?;
+
+// Phase 4 — layer gravity on top (per-chain heat + tick loop).
+redex.enable_gravity_for_greedy(mesh.clone(), DataGravityPolicy::default())?;
+
+// Cache lookup — returns Some(RedexFile) when greedy has admitted
+// this chain; otherwise the caller falls back to a network fetch.
+// let file = redex.greedy_cache_for(&channel);
+# Ok(()) }
+```
+
+The canonical `ChannelHash` is `u32` substrate-wide for ACL / config
+/ storage / RYW; the per-packet wire `NetHeader::channel_hash` stays
+`u16` (fast-path filter hint). Wire-bucket collisions are benign —
+the substrate disambiguates via the registry's `by_wire_hash`
+reverse index and re-keys on the canonical 32-bit hash for all
+non-fast-path decisions.
+
+See [`docs/misc/DATAFORTS_FEATURES.md`](../docs/misc/DATAFORTS_FEATURES.md)
+for the audit (most of the Dataforts wishlist is already covered by
+core RedEX / CortEX / NetDB / capability primitives; Dataforts names
+and packages the remaining work).
+
 ## nRPC (request / response over the mesh)
 
 nRPC is the request/response convention layer riding on top of the

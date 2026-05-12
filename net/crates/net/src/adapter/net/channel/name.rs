@@ -1,14 +1,34 @@
 //! Named typed channels for Net.
 //!
 //! Channels are hierarchical named endpoints (e.g. `"sensors/lidar/front"`).
-//! The `channel_hash: u16` in the Net header is derived from the name via
-//! xxh3 truncation for wire-speed filtering by forwarding nodes.
+//! Two hashes are derived from the name via xxh3:
+//!
+//! - **Canonical [`ChannelHash`] (`u32`)** — used as the substrate-wide key
+//!   for auth (`AuthGuard`, `PermissionToken`), config (`ChannelConfigMap`),
+//!   storage (`RedexFile`), and metrics. ~4B buckets; birthday-collision
+//!   threshold ~65 K channels per process is well above realistic deployment
+//!   sizes, so this key is treated as collision-free in fast paths.
+//! - **Wire `u16`** — the fast-path hint stamped on every outgoing packet
+//!   header for wire-speed filtering by forwarding nodes. 65 K buckets;
+//!   routine collisions at scale. Mirrors the
+//!   `origin_hash: u64 canonical → u32 wire` precedent in the protocol
+//!   layer: per-packet width is fixed by the 64-byte header budget, and
+//!   wire-side collisions are benign (only affect filter precision, not
+//!   ACL or storage decisions, since those key on the canonical hash).
 
 use dashmap::DashMap;
 use xxhash_rust::xxh3::xxh3_64;
 
 /// Maximum channel name length in bytes.
 pub const MAX_NAME_LEN: usize = 255;
+
+/// Substrate-wide canonical hash for a [`ChannelName`].
+///
+/// 32-bit. Used as the canonical key for ACL, storage, and config decisions.
+/// Distinct from the wire `u16` hash on `NetHeader::channel_hash`, which is
+/// a per-packet fast-path filter hint and may collide; the canonical
+/// `ChannelHash` is what auth and storage decisions must key on.
+pub type ChannelHash = u32;
 
 /// A validated channel name.
 ///
@@ -31,16 +51,25 @@ impl ChannelName {
         &self.0
     }
 
-    /// Compute the u16 channel hash for the Net header.
+    /// Compute the canonical [`ChannelHash`] (32-bit) for the name.
     ///
-    /// This is the hint stamped on every outgoing packet — fast to
-    /// compare but only 65,536 buckets, so it has routine collisions
-    /// at mesh scale. Control-plane and storage authorization must
-    /// key on the canonical name string (see `AuthGuard::exact`)
-    /// so two unrelated channels don't share an ACL decision.
+    /// This is the substrate-wide key used for ACL, storage, and config
+    /// decisions. Collision-resistant at realistic deployment scale
+    /// (~65 K channels before birthday-collision threshold).
     #[inline]
-    pub fn hash(&self) -> u16 {
+    pub fn hash(&self) -> ChannelHash {
         channel_hash(&self.0)
+    }
+
+    /// Compute the wire `u16` channel hash for the Net header fast-path.
+    ///
+    /// The hint stamped on every outgoing packet — fast to compare but only
+    /// 65,536 buckets, so it has routine collisions at mesh scale.
+    /// Control-plane and storage authorization key on
+    /// [`ChannelName::hash`] (canonical `u32`), not on this wire hint.
+    #[inline]
+    pub fn wire_hash(&self) -> u16 {
+        wire_channel_hash(&self.0)
     }
 
     /// Get the number of path segments.
@@ -106,20 +135,32 @@ impl std::fmt::Display for ChannelName {
     }
 }
 
-/// Compute the u16 channel hash from a name string.
+/// Compute the canonical [`ChannelHash`] (32-bit) from a name string.
+///
+/// Uses xxh3_64 truncated to 32 bits. This is the substrate-wide canonical
+/// key for ACL, storage, and config — collision-resistant at realistic
+/// deployment scale.
+#[inline]
+pub fn channel_hash(name: &str) -> ChannelHash {
+    xxh3_64(name.as_bytes()) as u32
+}
+
+/// Compute the wire `u16` channel hash from a name string.
 ///
 /// Uses xxh3_64 truncated to 16 bits, consistent with the existing
-/// `stream_id_from_key` pattern in the routing module.
+/// `stream_id_from_key` pattern in the routing module. Used only for the
+/// `NetHeader::channel_hash` fast-path hint; ACL/storage decisions must
+/// use [`channel_hash`] (canonical `u32`).
 #[inline]
-pub fn channel_hash(name: &str) -> u16 {
+pub fn wire_channel_hash(name: &str) -> u16 {
     xxh3_64(name.as_bytes()) as u16
 }
 
-/// A channel identifier: name + cached hash.
+/// A channel identifier: name + cached canonical hash.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ChannelId {
     name: ChannelName,
-    hash: u16,
+    hash: ChannelHash,
 }
 
 impl ChannelId {
@@ -140,16 +181,28 @@ impl ChannelId {
         &self.name
     }
 
-    /// Get the cached u16 hash for the Net header.
+    /// Get the cached canonical [`ChannelHash`] (32-bit).
+    ///
+    /// Used as the substrate-wide key for auth, storage, and config.
     #[inline]
-    pub fn hash(&self) -> u16 {
+    pub fn hash(&self) -> ChannelHash {
         self.hash
+    }
+
+    /// Get the wire `u16` hash for stamping the `NetHeader` fast-path.
+    ///
+    /// Derived from the canonical hash by truncation; the wire `u16` is a
+    /// fast-path filter hint that may collide, while [`ChannelId::hash`]
+    /// (canonical `u32`) is the ACL/storage key.
+    #[inline]
+    pub fn wire_hash(&self) -> u16 {
+        self.hash as u16
     }
 }
 
 impl std::fmt::Debug for ChannelId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ChannelId({}, {:04x})", self.name, self.hash)
+        write!(f, "ChannelId({}, {:08x})", self.name, self.hash)
     }
 }
 
@@ -161,11 +214,15 @@ impl std::fmt::Display for ChannelId {
 
 /// Registry of channels, tracking name-to-hash mappings.
 ///
-/// Detects hash collisions at creation time. Forwarding nodes only
-/// see the u16 hash; the registry resolves ambiguity when needed.
+/// Detects canonical-hash collisions at creation time. Forwarding nodes only
+/// see the wire `u16` hash; the registry resolves wire-side ambiguity via
+/// [`Self::get_all_by_wire_hash`].
 pub struct ChannelRegistry {
-    /// Hash -> list of channels with that hash
-    by_hash: DashMap<u16, Vec<ChannelId>>,
+    /// Canonical hash -> list of channels with that hash (rare at u32).
+    by_hash: DashMap<ChannelHash, Vec<ChannelId>>,
+    /// Wire `u16` hash -> list of channels with that wire bucket
+    /// (routine collisions at scale; used for receive-side disambig).
+    by_wire_hash: DashMap<u16, Vec<ChannelId>>,
     /// Name -> channel ID (for fast lookup by name)
     by_name: DashMap<String, ChannelId>,
 }
@@ -175,11 +232,12 @@ impl ChannelRegistry {
     pub fn new() -> Self {
         Self {
             by_hash: DashMap::new(),
+            by_wire_hash: DashMap::new(),
             by_name: DashMap::new(),
         }
     }
 
-    /// Register a channel. Returns the ChannelId and whether a hash
+    /// Register a channel. Returns the ChannelId and whether a canonical-hash
     /// collision was detected with an existing channel.
     pub fn register(&self, name: &str) -> Result<(ChannelId, bool), ChannelError> {
         let id = ChannelId::parse(name)?;
@@ -199,6 +257,10 @@ impl ChannelRegistry {
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
                 hash_entry.push(id.clone());
+                self.by_wire_hash
+                    .entry(id.wire_hash())
+                    .or_default()
+                    .push(id.clone());
                 vacant.insert(id.clone());
             }
         }
@@ -211,10 +273,28 @@ impl ChannelRegistry {
         self.by_name.get(name).map(|r| r.clone())
     }
 
-    /// Look up all channels with a given hash (may be multiple due to collisions).
-    pub fn get_by_hash(&self, hash: u16) -> Vec<ChannelId> {
+    /// Look up all channels with a given canonical hash (may be multiple if
+    /// the rare u32 collision occurs).
+    pub fn get_by_hash(&self, hash: ChannelHash) -> Vec<ChannelId> {
         self.by_hash
             .get(&hash)
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    }
+
+    /// Look up all channels with a given wire `u16` hash (routinely multiple
+    /// due to wire-bucket collisions at scale). Used by receive-side dispatch
+    /// to disambiguate the wire fast-path hint into canonical channels.
+    ///
+    /// Returns the full collision set rather than collapsing to `None` on
+    /// collision — the receive-side caller wants to enumerate every
+    /// canonical that could have stamped this wire hash. This is the
+    /// opposite of [`ChannelConfigRegistry::get_by_wire_hash`], which
+    /// returns `None` on collision because the config caller wants a
+    /// single safe policy decision.
+    pub fn get_all_by_wire_hash(&self, wire_hash: u16) -> Vec<ChannelId> {
+        self.by_wire_hash
+            .get(&wire_hash)
             .map(|r| r.clone())
             .unwrap_or_default()
     }
@@ -230,6 +310,9 @@ impl ChannelRegistry {
         // Hold by_hash guard while removing from both maps
         if let Some(mut hash_entry) = self.by_hash.get_mut(&id.hash()) {
             hash_entry.retain(|c| c.name().as_str() != name);
+        }
+        if let Some(mut wire_entry) = self.by_wire_hash.get_mut(&id.wire_hash()) {
+            wire_entry.retain(|c| c.name().as_str() != name);
         }
 
         if self.by_name.remove(name).is_some() {
@@ -462,5 +545,88 @@ mod tests {
         let results = reg.get_by_hash(id.hash());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name().as_str(), "sensors/lidar");
+    }
+
+    #[test]
+    fn test_canonical_hash_is_u32_and_wire_is_u16() {
+        // The canonical hash is u32 (4 bytes); the wire hash is u16
+        // (2 bytes) and equals the low 16 bits of the canonical hash.
+        let name = "sensors/lidar";
+        let canonical: ChannelHash = channel_hash(name);
+        let wire: u16 = wire_channel_hash(name);
+        assert_eq!(canonical as u16, wire);
+        // Width assertions.
+        assert_eq!(std::mem::size_of::<ChannelHash>(), 4);
+        assert_eq!(std::mem::size_of_val(&wire), 2);
+    }
+
+    #[test]
+    fn test_registry_disambiguates_wire_hash() {
+        // Two channels that may share a u16 wire bucket (high probability
+        // with crafted input) must be uniquely separable by the canonical
+        // u32 hash. With random inputs we can't reliably force a u16
+        // collision, so this test exercises the wire-hash lookup API
+        // for the non-colliding case and asserts both lookup paths agree.
+        let reg = ChannelRegistry::new();
+        let (id_a, _) = reg.register("sensors/lidar").unwrap();
+        let (id_b, _) = reg.register("control/estop").unwrap();
+
+        // get_all_by_wire_hash returns the right channel for each wire bucket.
+        let by_wire_a = reg.get_all_by_wire_hash(id_a.wire_hash());
+        assert!(by_wire_a
+            .iter()
+            .any(|c| c.name().as_str() == "sensors/lidar"));
+        let by_wire_b = reg.get_all_by_wire_hash(id_b.wire_hash());
+        assert!(by_wire_b
+            .iter()
+            .any(|c| c.name().as_str() == "control/estop"));
+
+        // by_hash (canonical) returns exactly one channel per registered
+        // hash — collisions at u32 require ~65 K channels to become
+        // probable, so two registered channels are practically guaranteed
+        // distinct.
+        assert_eq!(reg.get_by_hash(id_a.hash()).len(), 1);
+        assert_eq!(reg.get_by_hash(id_b.hash()).len(), 1);
+    }
+
+    #[test]
+    fn test_get_all_by_wire_hash_returns_full_collision_set() {
+        // `get_all_by_wire_hash` deliberately returns the full set of
+        // canonicals sharing a wire bucket rather than collapsing to
+        // `None` on collision — that's the contract that lets
+        // receive-side dispatch enumerate every canonical the inbound
+        // packet's wire hash could have come from. Construct a
+        // collision by brute force.
+        let reg = ChannelRegistry::new();
+        let mut seen = std::collections::HashMap::<u16, String>::new();
+        let (name_a, name_b) = (|| -> Option<(String, String)> {
+            for i in 0..200_000u64 {
+                let name = format!("reg/wcoll/{}", i);
+                let wire = wire_channel_hash(&name);
+                if let Some(prev) = seen.get(&wire) {
+                    return Some((prev.clone(), name));
+                }
+                seen.insert(wire, name);
+            }
+            None
+        })()
+        .expect("no wire collision in 200K candidates");
+
+        let (id_a, _) = reg.register(&name_a).unwrap();
+        let (id_b, _) = reg.register(&name_b).unwrap();
+        assert_eq!(id_a.wire_hash(), id_b.wire_hash());
+        assert_ne!(id_a.hash(), id_b.hash());
+
+        // Both canonicals are enumerable through the shared bucket.
+        let bucket = reg.get_all_by_wire_hash(id_a.wire_hash());
+        assert_eq!(bucket.len(), 2);
+        assert!(bucket.iter().any(|c| c.name().as_str() == name_a));
+        assert!(bucket.iter().any(|c| c.name().as_str() == name_b));
+
+        // Unknown bucket returns an empty Vec, not `None`.
+        let empty = reg.get_all_by_wire_hash(id_a.wire_hash().wrapping_add(1));
+        // Either truly empty, or this neighbour happens to also be a
+        // populated bucket — assert the API shape, not the contents.
+        let _ = empty;
     }
 }

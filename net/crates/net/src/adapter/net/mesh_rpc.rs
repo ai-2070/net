@@ -33,7 +33,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::channel::{ChannelId, ChannelName, ChannelPublisher, PublishConfig};
+use super::channel::{ChannelHash, ChannelId, ChannelName, ChannelPublisher, PublishConfig};
 use super::cortex::{
     build_trace_headers, encode_stream_grant, EventMeta, RpcAsyncResponseEmitter,
     RpcCancellationToken, RpcClientFold, RpcContext, RpcHandler, RpcHandlerError,
@@ -258,7 +258,7 @@ pub enum CodecDirection {
 /// continue to completion regardless.
 pub struct ServeHandle {
     /// Channel hash to unregister on Drop.
-    channel_hash: u16,
+    channel_hash: ChannelHash,
     /// Service name to remove from `rpc_local_services` on Drop.
     service: String,
     /// The bridge task. Held only so callers can introspect /
@@ -1258,7 +1258,7 @@ impl MeshNode {
         target_node_id: u64,
         service: &str,
         reply_channel: ChannelName,
-        reply_hash: u16,
+        reply_hash: ChannelHash,
     ) -> Result<(), RpcError> {
         let registry = self.rpc_reply_subscriptions_arc();
         {

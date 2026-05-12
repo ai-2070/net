@@ -607,6 +607,81 @@ Error codes: `0` = success, `-1` = NULL pointer, `-103`
 config, channel-name validation, `replication: {...}` set without
 `enable_replication` having been called, etc.).
 
+## Dataforts (greedy cache, gravity)
+
+Dataforts is the compositional data plane on top of RedEX + the
+capability index. The C FFI surfaces the two enable / disable pairs
+needed to wire Phase 1 (greedy) and Phase 4 (gravity) into a Redex
+handle; blob refs (Phase 3) and read-your-writes (Phase 5) are
+higher-level than this FFI layer and are exposed through the
+Python / Node / Go bindings on top.
+
+The cdylib must be built with the `dataforts` Cargo feature for
+these symbols to be live. Without the feature, the symbols still
+link (unconditional `extern "C"` stubs) and return
+`NET_ERR_FEATURE_NOT_BUILT` so a Go / cgo program against an older
+build doesn't fail at module load.
+
+```c
+typedef struct ArcMeshNode ArcMeshNode;
+
+/* Enable Phase 1 — greedy-LRU caching against `redex`, observing
+ * inbound packets through `mesh_arc`'s shard dispatch. `config_json`
+ * follows the GreedyConfig shape (scopes, per-channel + total caps,
+ * bandwidth-budget fraction, intent / colocation policies). */
+extern int net_redex_enable_greedy_dataforts(
+    RedexHandle* redex,
+    ArcMeshNode* mesh_arc,
+    const char* config_json);
+extern int net_redex_disable_greedy_dataforts(RedexHandle* redex);
+
+/* Enable Phase 4 — data gravity. Requires greedy to be enabled
+ * first; the runtime drives a periodic tick that decays the per-
+ * chain heat counters and emits `heat:<hex>=<rate>` tags onto the
+ * chain's existing capability announcement. */
+extern int net_redex_enable_gravity_for_greedy(
+    RedexHandle* redex,
+    ArcMeshNode* mesh_arc,
+    const char* config_json);
+extern int net_redex_disable_gravity_for_greedy(RedexHandle* redex);
+
+/* Diagnostics. */
+extern uint32_t net_redex_greedy_cached_channel_count(const RedexHandle* redex);
+extern char*    net_redex_greedy_prometheus_text(const RedexHandle* redex);
+```
+
+```c
+RedexHandle* redex = net_redex_new();
+ArcMeshNode* mesh_arc = /* obtained via the mesh enable path */;
+
+const char* greedy_cfg =
+    "{\"scopes\":[\"region:us\"],"
+    " \"per_channel_cap_bytes\":67108864,"
+    " \"total_cap_bytes\":1073741824}";
+int rc = net_redex_enable_greedy_dataforts(redex, mesh_arc, greedy_cfg);
+if (rc != 0) { /* NET_ERR_FEATURE_NOT_BUILT / NET_ERR_REDEX */ }
+
+const char* gravity_cfg =
+    "{\"emit_threshold_ratio\":1.5,"
+    " \"decay_half_life_secs\":300}";
+rc = net_redex_enable_gravity_for_greedy(redex, mesh_arc, gravity_cfg);
+
+uint32_t cached = net_redex_greedy_cached_channel_count(redex);
+char* metrics = net_redex_greedy_prometheus_text(redex);
+/* ... pipe `metrics` into an HTTP scrape body ... */
+net_free_string(metrics);
+```
+
+The canonical `channel_hash` returned by `net_channel_hash` is
+`uint32_t` (substrate-wide ACL / config / storage / RYW key); the
+per-packet wire `NetHeader::channel_hash` stays `uint16_t` (fast-
+path filter hint). The `PermissionToken` wire form is 161 bytes
+(channel-hash field 2 → 4 bytes during the canonical widening).
+
+Error codes: `0` = success, `NET_ERR_NULL_POINTER` = NULL handle,
+`NET_ERR_FEATURE_NOT_BUILT` = cdylib built without the `dataforts`
+feature, `NET_ERR_REDEX` = generic Redex / config failure.
+
 ## nRPC (request / response over the mesh)
 
 nRPC is the request/response convention layer (deadlines,

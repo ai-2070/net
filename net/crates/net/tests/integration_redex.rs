@@ -614,42 +614,45 @@ fn test_redex_auth_enforcement() {
 
 #[test]
 fn test_regression_auth_does_not_grant_access_via_u16_collision() {
-    // Regression: `open_file` used to authorize on the 16-bit
-    // `channel_hash` alone, which collides on birthday terms at mesh
-    // scale (~256 names). An origin authorized for channel A could
-    // then open channel B whenever A.hash() == B.hash(). The fix
-    // keys the storage ACL on the canonical `ChannelName` string —
-    // two distinct names can never alias.
+    // Regression: `open_file` used to authorize on a truncated
+    // channel hash alone, which collides on birthday terms at mesh
+    // scale (~256 names for `u16`, ~65 K names for the post-widening
+    // canonical `u32`). An origin authorized for channel A could
+    // then open channel B whenever A and B hashed to the same value.
+    // The fix keys the storage ACL on the canonical `ChannelName`
+    // string — two distinct names can never alias.
     //
-    // Find a collision pair at runtime: with 65,536 buckets and a
-    // few hundred candidates, a match is near-certain. We search
-    // bounded so a pathological test env can't hang.
-    use net::adapter::net::channel::channel_hash;
+    // After the substrate-wide widening of `channel_hash` from
+    // `u16` to canonical `u32`, this test exercises the *wire-bucket
+    // collision* (the data-plane fast-path collision space) and
+    // pins that the name-keyed ACL still rejects the colliding name.
+    use net::adapter::net::channel::wire_channel_hash;
     let allowed = cn("auth/collision/allowed");
-    let target_hash = allowed.hash();
+    let target_wire = allowed.wire_hash();
     let mut colliding: Option<ChannelName> = None;
     for i in 0..1_000_000u64 {
         let candidate = format!("auth/collision/other/c{}", i);
-        if channel_hash(&candidate) == target_hash && candidate != allowed.as_str() {
+        if wire_channel_hash(&candidate) == target_wire && candidate != allowed.as_str() {
             colliding = Some(cn(&candidate));
             break;
         }
     }
-    let colliding = colliding.expect("no u16 hash collision in 1M candidates");
+    let colliding = colliding.expect("no u16 wire-hash collision in 1M candidates");
     assert_ne!(
         allowed.as_str(),
         colliding.as_str(),
         "collision pair must be distinct names"
     );
     assert_eq!(
-        allowed.hash(),
-        colliding.hash(),
-        "collision pair must share the 16-bit hash"
+        allowed.wire_hash(),
+        colliding.wire_hash(),
+        "collision pair must share the 16-bit wire hash"
     );
 
     let guard = Arc::new(AuthGuard::new());
     // Authorize ONLY the `allowed` channel. The colliding name
-    // shares the 16-bit hash but is a distinct canonical name.
+    // shares the 16-bit wire hash but is a distinct canonical name
+    // (different `u32` canonical hash with overwhelming probability).
     guard.allow_channel(0xDEAD_BEEF, &allowed);
 
     let r = Redex::with_auth(guard.clone(), 0xDEAD_BEEF);
@@ -664,7 +667,7 @@ fn test_regression_auth_does_not_grant_access_via_u16_collision() {
             r.open_file(&colliding, RedexFileConfig::default()),
             Err(RedexError::Unauthorized)
         ),
-        "u16 hash collision must NOT authorize access to a different channel"
+        "wire-hash collision must NOT authorize access to a different channel"
     );
 }
 

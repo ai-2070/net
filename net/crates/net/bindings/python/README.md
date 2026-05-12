@@ -376,6 +376,98 @@ the snapshot and an iterator seeded so that any divergent initial
 emission is forwarded through instead of dropped — see
 [`docs/STORAGE_AND_CORTEX.md`](../../docs/STORAGE_AND_CORTEX.md).
 
+## Dataforts (greedy cache, gravity, blob refs, read-your-writes)
+
+Dataforts is the compositional data plane on top of RedEX / CortEX
+/ capability-index / proximity-graph. The PyO3 module surfaces it
+as `Redex` methods, top-level blob helpers, and a `WriteToken` +
+`wait_for_token` pair on `Tasks` / `Memories`. Built behind the
+`dataforts` Cargo feature; pre-built wheels on PyPI ship with the
+feature enabled. A build without it raises `RedexError` from
+`enable_greedy_dataforts(...)` with `"requires the 'dataforts'
+feature; rebuild with --features dataforts"` rather than failing
+silently.
+
+Four phases:
+
+- **Phase 1 — Greedy-LRU caching.** Five-axis admission (scope +
+  proximity + capability-preference + colocation + storage-cap)
+  + bandwidth budget gate per-channel cache files. Cold channels
+  evict under cluster-cap pressure and withdraw their
+  `causal:<hex>` advertisement.
+- **Phase 3 — `BlobRef` + blob adapters.** A 4-byte-magic +
+  version + 32-byte BLAKE3 + size + URI reference whose bytes
+  live in the caller's storage (S3 / Ceph / IPFS / local FS).
+  Adapters implement `fetch` / `store` (sync or `async def`); the
+  filesystem adapter ships in-tree via
+  `register_filesystem_blob_adapter`. Custom adapters register
+  through `register_blob_adapter(adapter_id, instance)`. Async
+  adapters run on a binding-owned event loop on a dedicated
+  thread — adapter coroutines never share the calling thread's
+  event loop, so an `aiobotocore` / `httpx.AsyncClient` /
+  SQLAlchemy async engine inside the adapter is safe.
+- **Phase 4 — Data gravity.** Per-chain read-rate counters with
+  exponential decay. Threshold-crossing emissions stamp
+  `heat:<hex>=<rate>` onto the chain's capability announcement;
+  greedy weights cache pulls by `heat × scope-match × proximity`.
+- **Phase 5 — Read-your-writes.** Every `tasks.create`,
+  `memories.insert`, etc. returns a `WriteToken { origin_hash,
+  seq }` (frozen, hashable; constructor is `#[pyo3(doc_hidden)]` —
+  tokens are unforgeable only against the issuing adapter via
+  origin binding). `tasks.wait_for_token(token, deadline_ms=…)`
+  blocks until the local fold has *applied* that seq; tracks
+  both `applied_through_seq` and `folded_through_seq` so a
+  stalled fold raises `CortexError`. `deadline_ms=0` is a
+  non-blocking poll (no scheduling).
+
+```python
+from net import (
+    NetMesh, Redex, Tasks,
+    register_filesystem_blob_adapter, blob_publish, blob_resolve,
+)
+
+mesh = NetMesh(bind_addr='0.0.0.0:7000', psk='...')
+redex = Redex(persistent_dir='/var/lib/net/redex')
+
+# Phase 1 — wire greedy into the mesh inbound dispatch.
+redex.enable_greedy_dataforts(
+    mesh,
+    scopes=['region:us'],
+    total_cap_bytes=1 << 30,         # 1 GiB cluster-cap
+    per_channel_cap_bytes=64 << 20,
+)
+
+# Phase 4 — layer gravity on top.
+redex.enable_gravity_for_greedy(
+    mesh,
+    emit_threshold_ratio=1.5,
+    decay_half_life_secs=300,
+)
+
+# Phase 3 — filesystem adapter (ships in-tree).
+register_filesystem_blob_adapter('local', '/var/blobs')
+ref = blob_publish('local', 'local://obj/payload', some_bytes)
+back = blob_resolve(ref)
+
+# Phase 5 — read-your-writes.
+tasks = Tasks.open(redex, origin_hash=mesh.origin_hash)
+result = tasks.create(1, 'first', 100)
+tasks.wait_for_token(result.token, deadline_ms=250)
+# tasks.wait_for_token(token, deadline_ms=0) → non-blocking poll
+
+# Diagnostics.
+print(redex.greedy_cached_channel_count())
+print(redex.greedy_prometheus_text())
+```
+
+The canonical channel hash is 32-bit (`channel_hash(name)` returns
+`int` in the u32 range). The per-packet wire `NetHeader`
+`channel_hash` stays `u16` — fast-path filter hint, may
+bucket-collide at scale; ACL / config / cache / RYW decisions key
+on the canonical 32-bit hash via registry disambiguation. The
+`PermissionToken` wire form is 161 bytes (the channel-hash
+widening grew it from 159).
+
 ## Redis Streams consumer-side dedup helper
 
 The Net Redis adapter writes a stable `dedup_id` field on every

@@ -10,6 +10,7 @@ use ed25519_dalek::Signature;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::entity::{EntityId, EntityKeypair};
+use crate::adapter::net::channel::ChannelHash;
 
 /// Actions a token can authorize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,8 +33,8 @@ impl TokenScope {
     /// channel, regardless of the token's `channel_hash` field. Must be
     /// set explicitly by the issuer — the previous "`channel_hash == 0`
     /// means wildcard" overload is no longer honored, so a legitimate
-    /// channel whose 16-bit xxh3 happens to hash to 0 cannot
-    /// accidentally be authorized as a universal grant.
+    /// channel whose xxh3-truncated [`ChannelHash`] happens to hash to 0
+    /// cannot accidentally be authorized as a universal grant.
     pub const WILDCARD: Self = Self { bits: 0b1_0000 };
     /// Full access (all actions on a single channel). Does NOT include
     /// [`Self::WILDCARD`] — callers that want cross-channel access
@@ -87,8 +88,8 @@ impl TokenScope {
     }
 
     /// Optional channel hash filter. If set, token only applies to
-    /// channels matching this hash.
-    pub fn with_channel(self, channel_hash: u16) -> ScopedToken {
+    /// channels matching this canonical [`ChannelHash`].
+    pub fn with_channel(self, channel_hash: ChannelHash) -> ScopedToken {
         ScopedToken {
             scope: self,
             channel_hash: Some(channel_hash),
@@ -100,17 +101,17 @@ impl TokenScope {
 #[derive(Debug, Clone, Copy)]
 pub struct ScopedToken {
     pub scope: TokenScope,
-    pub channel_hash: Option<u16>,
+    pub channel_hash: Option<ChannelHash>,
 }
 
 /// A signed, delegatable permission token.
 ///
-/// Wire format (159 bytes):
+/// Wire format (161 bytes):
 /// ```text
 /// issuer:           32 bytes (EntityId)
 /// subject:          32 bytes (EntityId)
 /// scope:             4 bytes (u32)
-/// channel_hash:      2 bytes (u16, 0 = all channels)
+/// channel_hash:      4 bytes (ChannelHash, u32; combine with WILDCARD scope for "all channels")
 /// not_before:        8 bytes (u64 unix timestamp)
 /// not_after:         8 bytes (u64 unix timestamp)
 /// delegation_depth:  1 byte  (u8)
@@ -126,8 +127,9 @@ pub struct PermissionToken {
     pub subject: EntityId,
     /// What actions are permitted.
     pub scope: TokenScope,
-    /// Channel restriction (0 = all channels).
-    pub channel_hash: u16,
+    /// Channel restriction (canonical [`ChannelHash`]; combine with
+    /// [`TokenScope::WILDCARD`] for cross-channel grants).
+    pub channel_hash: ChannelHash,
     /// Valid from (unix timestamp seconds).
     pub not_before: u64,
     /// Valid until (unix timestamp seconds).
@@ -142,10 +144,10 @@ pub struct PermissionToken {
 
 impl PermissionToken {
     /// Size of the signed payload (everything before the signature).
-    const SIGNED_PAYLOAD_SIZE: usize = 32 + 32 + 4 + 2 + 8 + 8 + 1 + 8; // 95 bytes
+    const SIGNED_PAYLOAD_SIZE: usize = 32 + 32 + 4 + 4 + 8 + 8 + 1 + 8; // 97 bytes
 
     /// Total serialized size.
-    pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64; // 159 bytes
+    pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64; // 161 bytes
 
     /// Issue a new token.
     ///
@@ -167,7 +169,7 @@ impl PermissionToken {
         issuer_keypair: &EntityKeypair,
         subject: EntityId,
         scope: TokenScope,
-        channel_hash: u16,
+        channel_hash: ChannelHash,
         duration_secs: u64,
         delegation_depth: u8,
     ) -> Self {
@@ -206,7 +208,7 @@ impl PermissionToken {
         issuer_keypair: &EntityKeypair,
         subject: EntityId,
         scope: TokenScope,
-        channel_hash: u16,
+        channel_hash: ChannelHash,
         duration_secs: u64,
         delegation_depth: u8,
     ) -> Result<Self, TokenError> {
@@ -319,11 +321,11 @@ impl PermissionToken {
     ///
     /// The previous convention — `channel_hash == 0` meaning "wildcard,
     /// all channels" — is no longer honored. A legitimate channel
-    /// whose 16-bit xxh3 hashes to 0 (1 in 65 536) would otherwise
+    /// whose xxh3-truncated [`ChannelHash`] hashes to 0 would otherwise
     /// accidentally turn a narrowly-scoped token into a universal
     /// grant, which an attacker able to register channel names could
     /// brute-force since xxh3 is non-cryptographic.
-    pub fn authorizes(&self, action: TokenScope, channel: u16) -> bool {
+    pub fn authorizes(&self, action: TokenScope, channel: ChannelHash) -> bool {
         if !self.scope.contains(action) {
             return false;
         }
@@ -421,9 +423,9 @@ impl PermissionToken {
 
     /// Serialize the fields that are covered by the signature into
     /// a fixed-size stack buffer. The struct's signed-payload size
-    /// is a compile-time constant (95 bytes), so we don't need a
+    /// is a compile-time constant (97 bytes), so we don't need a
     /// heap allocation per verify — the previous `Vec::with_capacity`
-    /// allocated and freed 95 bytes on every signature check, which
+    /// allocated and freed bytes on every signature check, which
     /// is the hottest path on every authenticated mesh packet.
     /// Returning `[u8; SIGNED_PAYLOAD_SIZE]` keeps the layout
     /// identical to the heap version (the existing callers'
@@ -437,8 +439,8 @@ impl PermissionToken {
         off += 32;
         buf[off..off + 4].copy_from_slice(&self.scope.bits().to_le_bytes());
         off += 4;
-        buf[off..off + 2].copy_from_slice(&self.channel_hash.to_le_bytes());
-        off += 2;
+        buf[off..off + 4].copy_from_slice(&self.channel_hash.to_le_bytes());
+        off += 4;
         buf[off..off + 8].copy_from_slice(&self.not_before.to_le_bytes());
         off += 8;
         buf[off..off + 8].copy_from_slice(&self.not_after.to_le_bytes());
@@ -474,13 +476,13 @@ impl PermissionToken {
         let issuer = EntityId::from_bytes(data[0..32].try_into().unwrap());
         let subject = EntityId::from_bytes(data[32..64].try_into().unwrap());
         let scope = TokenScope::from_bits(u32::from_le_bytes(data[64..68].try_into().unwrap()));
-        let channel_hash = u16::from_le_bytes(data[68..70].try_into().unwrap());
-        let not_before = u64::from_le_bytes(data[70..78].try_into().unwrap());
-        let not_after = u64::from_le_bytes(data[78..86].try_into().unwrap());
-        let delegation_depth = data[86];
-        let nonce = u64::from_le_bytes(data[87..95].try_into().unwrap());
+        let channel_hash = ChannelHash::from_le_bytes(data[68..72].try_into().unwrap());
+        let not_before = u64::from_le_bytes(data[72..80].try_into().unwrap());
+        let not_after = u64::from_le_bytes(data[80..88].try_into().unwrap());
+        let delegation_depth = data[88];
+        let nonce = u64::from_le_bytes(data[89..97].try_into().unwrap());
         let mut signature = [0u8; 64];
-        signature.copy_from_slice(&data[95..159]);
+        signature.copy_from_slice(&data[97..161]);
 
         Ok(Self {
             issuer,
@@ -502,7 +504,7 @@ impl std::fmt::Debug for PermissionToken {
             .field("issuer", &self.issuer)
             .field("subject", &self.subject)
             .field("scope", &format!("{:04b}", self.scope.bits()))
-            .field("channel_hash", &format!("{:04x}", self.channel_hash))
+            .field("channel_hash", &format!("{:08x}", self.channel_hash))
             .field("delegation_depth", &self.delegation_depth)
             .field("nonce", &self.nonce)
             .finish()
@@ -547,7 +549,7 @@ pub const MAX_TOKENS_PER_SLOT: usize = 32;
 /// Capacity is bounded by [`MAX_TOKEN_SLOTS`] (slot count) and
 /// [`MAX_TOKENS_PER_SLOT`] (tokens-with-distinct-scope per slot).
 pub struct TokenCache {
-    tokens: DashMap<([u8; 32], u16), Vec<PermissionToken>>,
+    tokens: DashMap<([u8; 32], ChannelHash), Vec<PermissionToken>>,
 }
 
 impl TokenCache {
@@ -648,7 +650,7 @@ impl TokenCache {
         &self,
         subject: &EntityId,
         action: TokenScope,
-        channel_hash: u16,
+        channel_hash: ChannelHash,
     ) -> Result<(), TokenError> {
         // Try exact channel match first
         if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), channel_hash)) {
@@ -679,7 +681,7 @@ impl TokenCache {
     /// none are valid, returns any entry (so callers can still
     /// inspect for debugging). Callers that need a specific scope
     /// should use [`Self::check`] instead.
-    pub fn get(&self, subject: &EntityId, channel_hash: u16) -> Option<PermissionToken> {
+    pub fn get(&self, subject: &EntityId, channel_hash: ChannelHash) -> Option<PermissionToken> {
         let slot = self.tokens.get(&(*subject.as_bytes(), channel_hash))?;
         let tokens = slot.value();
         // Prefer a currently-valid token; otherwise fall back to
@@ -1118,11 +1120,13 @@ mod tests {
     fn test_regression_channel_hash_zero_is_not_wildcard() {
         // Regression (MEDIUM, BUGS.md): a token with `channel_hash = 0`
         // but no WILDCARD scope bit must NOT authorize arbitrary
-        // channels. A legitimate channel whose 16-bit xxh3 happens
-        // to hash to 0 (1 in 65 536) would otherwise turn a narrowly-
-        // scoped token into a universal grant — and since xxh3 is
-        // non-cryptographic, an attacker able to register names
-        // could brute-force such a collision.
+        // channels. A legitimate channel whose canonical xxh3-derived
+        // `ChannelHash` happens to hash to 0 would otherwise turn a
+        // narrowly-scoped token into a universal grant — and since
+        // xxh3 is non-cryptographic, an attacker able to register
+        // names could brute-force such a collision (cheap at the
+        // wire u16, but reachable at the canonical u32 too with
+        // enough names).
         let issuer = EntityKeypair::generate();
         let subject = EntityKeypair::generate();
 
@@ -1734,7 +1738,7 @@ mod tests {
         let issuer = EntityKeypair::generate();
         let subject_kp = EntityKeypair::generate();
         let subject_id = subject_kp.entity_id().clone();
-        let channel_hash = 0xABCDu16;
+        let channel_hash: ChannelHash = 0xABCD;
         let iters = 500u32;
         // Start barrier — without it thread scheduling can let
         // the evictor run its whole loop before the inserter
@@ -1833,7 +1837,7 @@ mod tests {
         let issuer = EntityKeypair::generate();
         let subject_kp = EntityKeypair::generate();
         let subject_id = subject_kp.entity_id().clone();
-        let channel_hash = 0xBEEFu16;
+        let channel_hash: ChannelHash = 0xBEEF;
 
         // Short-lived token: 1 s TTL. Insert it then let it
         // expire naturally during the race.
@@ -1906,7 +1910,7 @@ mod tests {
     /// padded into an EntityId, on `channel_hash`. We bypass the
     /// `insert(...)` signature-verify path by issuing real tokens —
     /// this is a fast-enough way to get many distinct subjects.
-    fn issue_token_for(seed: u64, channel_hash: u16, scope: TokenScope) -> PermissionToken {
+    fn issue_token_for(seed: u64, channel_hash: ChannelHash, scope: TokenScope) -> PermissionToken {
         let issuer = EntityKeypair::generate();
         // EntityKeypair::generate uses entropy; we just need many
         // distinct subjects, so a per-iteration generate is fine
@@ -1940,12 +1944,12 @@ mod tests {
         let cache = TokenCache::new();
 
         // Fill the cache to capacity using the same subject with
-        // varying channel_hash. `MAX_TOKEN_SLOTS` is 65_536 and
-        // channel_hash is u16 (also 65_536 distinct values), so
-        // we can pack the cache exactly to capacity. Building
-        // 65_536 PermissionTokens would do 65_536 ed25519 signs,
-        // which is too slow for a unit test — instead we
-        // pre-build one template token and clone-with-mutated
+        // varying channel_hash. `MAX_TOKEN_SLOTS` is 65_536; channel
+        // hash is `ChannelHash` (u32, ~4 B distinct values), so we
+        // pack the cache to capacity by varying the low bits.
+        // Building 65_536 PermissionTokens would do 65_536 ed25519
+        // signs, which is too slow for a unit test — instead we
+        // pre-build one template and clone with mutated
         // channel_hash. The signature stops being valid after the
         // mutation, but `insert_unchecked` skips verify, so the
         // cache shape under test is identical to the real path.
@@ -1957,18 +1961,11 @@ mod tests {
             3600,
             0,
         );
-        // u16 has exactly MAX_TOKEN_SLOTS (= 65_536) distinct
-        // values; `0..MAX_TOKEN_SLOTS as u16` would be `0..0` (cast
-        // overflow), so iterate inclusively instead.
         for ch in 0u32..MAX_TOKEN_SLOTS as u32 {
             let mut t = template.clone();
-            t.channel_hash = ch as u16;
+            t.channel_hash = ch as ChannelHash;
             cache.insert_unchecked(t);
         }
-        // Note: u16 has exactly MAX_TOKEN_SLOTS distinct values, so
-        // the cache should hold exactly MAX_TOKEN_SLOTS slots now.
-        // (We can't iterate beyond u16::MAX; this is a deliberate
-        // alignment with the cap.)
         let len_before_overflow = cache.tokens.len();
         assert_eq!(
             len_before_overflow, MAX_TOKEN_SLOTS,
@@ -2015,12 +2012,9 @@ mod tests {
             3600,
             0,
         );
-        // u16 has exactly MAX_TOKEN_SLOTS (= 65_536) distinct
-        // values; `0..MAX_TOKEN_SLOTS as u16` would be `0..0` (cast
-        // overflow), so iterate inclusively instead.
         for ch in 0u32..MAX_TOKEN_SLOTS as u32 {
             let mut t = template.clone();
-            t.channel_hash = ch as u16;
+            t.channel_hash = ch as ChannelHash;
             cache.insert_unchecked(t);
         }
         assert_eq!(cache.tokens.len(), MAX_TOKEN_SLOTS);
@@ -2035,7 +2029,7 @@ mod tests {
         assert_eq!(cache.tokens.len(), MAX_TOKEN_SLOTS, "slot count unchanged");
         let slot = cache
             .tokens
-            .get(&(*subject.entity_id().as_bytes(), 42))
+            .get(&(*subject.entity_id().as_bytes(), 42 as ChannelHash))
             .unwrap();
         assert_eq!(slot.value().len(), 1, "still one token in slot");
         assert_eq!(slot.value()[0].nonce, 9999, "refresh replaced the token");
@@ -2055,7 +2049,7 @@ mod tests {
         // produce many distinct scope values cheaply. Each token
         // stays at the same (subject, channel_hash) so they share
         // a slot.
-        let channel = 0xCAFE;
+        let channel: ChannelHash = 0xCAFE;
         let template = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
@@ -2185,10 +2179,11 @@ mod tests {
         let prefill = MAX_TOKEN_SLOTS - SLACK;
         for ch in 0u32..prefill as u32 {
             let mut t = template.clone();
-            t.channel_hash = ch as u16;
-            cache
-                .tokens
-                .insert((*subject.entity_id().as_bytes(), ch as u16), vec![t]);
+            t.channel_hash = ch as ChannelHash;
+            cache.tokens.insert(
+                (*subject.entity_id().as_bytes(), ch as ChannelHash),
+                vec![t],
+            );
         }
         assert_eq!(cache.tokens.len(), prefill);
 
@@ -2207,7 +2202,7 @@ mod tests {
             subj_bytes[0] ^= (tid as u8).wrapping_add(1);
             subj_bytes[1] ^= ((tid >> 8) as u8).wrapping_add(1);
             novel.subject = EntityId::from_bytes(subj_bytes);
-            novel.channel_hash = (prefill + tid) as u16;
+            novel.channel_hash = (prefill + tid) as ChannelHash;
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();

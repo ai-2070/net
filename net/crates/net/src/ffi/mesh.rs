@@ -27,7 +27,7 @@ use crate::adapter::net::identity::{
     EntityId, PermissionToken, TokenCache, TokenError as CoreTokenError, TokenScope,
 };
 use crate::adapter::net::{
-    ChannelConfig as InnerChannelConfig, ChannelConfigRegistry, ChannelId,
+    ChannelConfig as InnerChannelConfig, ChannelConfigRegistry, ChannelHash, ChannelId,
     ChannelName as InnerChannelName, ChannelPublisher, EntityKeypair, MeshNode, MeshNodeConfig,
     OnFailure as InnerOnFailure, PublishConfig as InnerPublishConfig,
     PublishReport as InnerPublishReport, Reliability, Stream as CoreStream, StreamConfig,
@@ -2078,7 +2078,7 @@ fn scope_to_strings(scope: TokenScope) -> Vec<&'static str> {
     out
 }
 
-fn channel_name_to_hash(channel: &str) -> Option<u16> {
+fn channel_name_to_hash(channel: &str) -> Option<ChannelHash> {
     InnerChannelName::new(channel).ok().map(|n| n.hash())
 }
 
@@ -2400,7 +2400,7 @@ struct ParsedTokenJson {
     issuer_hex: String,
     subject_hex: String,
     scope: Vec<&'static str>,
-    channel_hash: u16,
+    channel_hash: ChannelHash,
     not_before: u64,
     not_after: u64,
     delegation_depth: u8,
@@ -2534,10 +2534,12 @@ pub extern "C" fn net_delegate_token(
     }
 }
 
-/// Hash a channel name to its 16-bit wire-format value. Returns
-/// `NET_ERR_IDENTITY` for invalid names.
+/// Hash a channel name to its canonical 32-bit [`ChannelHash`]
+/// (substrate-wide ACL / config / storage key). The 16-bit wire
+/// hash used by `NetHeader::channel_hash` is the low 16 bits of
+/// the returned value. Returns `NET_ERR_IDENTITY` for invalid names.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_channel_hash(channel: *const c_char, out_hash: *mut u16) -> c_int {
+pub extern "C" fn net_channel_hash(channel: *const c_char, out_hash: *mut u32) -> c_int {
     if channel.is_null() || out_hash.is_null() {
         return NetError::NullPointer.into();
     }

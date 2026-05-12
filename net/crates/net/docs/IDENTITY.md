@@ -53,11 +53,13 @@ Created once at session startup via `OriginStamp::from_keypair()`. The `origin_h
 Signed, delegatable, expirable authorization primitives. Tokens authorize an entity to perform specific actions on specific channels.
 
 ```
-Wire format (159 bytes):
+Wire format (161 bytes):
   issuer:           32 bytes (EntityId)
   subject:          32 bytes (EntityId)
   scope:             4 bytes (u32 bitfield)
-  channel_hash:      2 bytes (u16, 0 = all channels)
+  channel_hash:      4 bytes (canonical ChannelHash, u32;
+                              combine with WILDCARD scope for
+                              cross-channel grants)
   not_before:        8 bytes (u64 unix timestamp)
   not_after:         8 bytes (u64 unix timestamp)
   delegation_depth:  1 byte  (u8)

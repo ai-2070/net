@@ -679,29 +679,34 @@ pub fn response_wire_size(payload: &RpcResponsePayload) -> usize {
 // drive the client fold). Without channel info on the queued
 // event, we can't filter from the consumer side.
 //
-// The hook below adds a per-`channel_hash` dispatcher map that the
+// The hook below adds a per-channel-hash dispatcher map that the
 // mesh's inbound dispatch consults BEFORE pushing to the shard
 // queue. If a dispatcher is registered for the event's
-// `channel_hash`, the event is routed there directly (bypassing
-// the shard queue); otherwise the existing shard-queue path runs.
+// canonical [`ChannelHash`], the event is routed there directly
+// (bypassing the shard queue); otherwise the existing shard-queue
+// path runs.
 //
-// Collision caveat: `channel_hash` is 16 bits. Two channels that
-// hash-collide will flow through the same dispatcher. The
-// collision probability per pair is ~1/65536; for N services
-// active simultaneously, the joint probability of any collision
-// is ~N²/131072. Phase 2 will widen the dispatch key (or carry
-// the full channel name on the inbound event) to close this gap;
-// for Phase 1 the limit is documented and operators size their
-// service set accordingly.
+// **Collision posture.** The dispatch event carries the canonical
+// 32-bit [`ChannelHash`] (joint-collision threshold ~65 K
+// channels, well above realistic deployment); the wire
+// `NetHeader::channel_hash` is `u16` and may bucket-collide at
+// scale, so the mesh's inbound dispatch indexes by the wire `u16`
+// and dispatches every canonical entry registered in that bucket
+// (the canonical match resolves on the dispatcher side). At
+// typical sizing this is a single entry per bucket.
 // ============================================================================
 
 /// One inbound event delivered to a registered RPC dispatcher.
 #[derive(Debug, Clone)]
 pub struct RpcInboundEvent {
-    /// 16-bit hash of the channel this event arrived on. The
-    /// `channel_hash` from `NetHeader`. Subject to collisions; see
-    /// the module-level note above.
-    pub channel_hash: u16,
+    /// Canonical [`ChannelHash`](crate::adapter::net::channel::ChannelHash)
+    /// (u32) of the channel this event arrived on — widened from the
+    /// per-packet wire `u16` `NetHeader::channel_hash` via the
+    /// registered-dispatcher table at receive time.
+    /// Collision-resistant at realistic scale; the wire `u16` may
+    /// bucket-collide but the canonical hash uniquely identifies the
+    /// registered dispatcher target.
+    pub channel_hash: super::super::channel::ChannelHash,
     /// Caller's `origin_hash` from the packet header (32-bit
     /// routing projection of the AEAD-verified peer's full
     /// `EntityKeypair::origin_hash()` — see `OriginStamp` doc).

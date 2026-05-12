@@ -119,7 +119,7 @@ fn bytes_to_entity_id(bytes: &[u8]) -> PyResult<EntityId> {
     Ok(EntityId::from_bytes(arr))
 }
 
-fn channel_to_hash(channel: &str) -> PyResult<u16> {
+fn channel_to_hash(channel: &str) -> PyResult<net::adapter::net::ChannelHash> {
     let name = net::adapter::net::ChannelName::new(channel)
         .map_err(|e| identity_err(format!("invalid channel name: {}", e)))?;
     Ok(name.hash())
@@ -341,8 +341,10 @@ pub fn delegate_token(
     Ok(child.to_bytes())
 }
 
-/// Hash a channel name to its 16-bit representation.
+/// Hash a channel name to its canonical 32-bit substrate identifier
+/// (used for ACL / config / storage keys; the wire `NetHeader`
+/// fast-path hint is the low 16 bits of this value).
 #[pyfunction]
-pub fn channel_hash(channel: &str) -> PyResult<u16> {
+pub fn channel_hash(channel: &str) -> PyResult<u32> {
     channel_to_hash(channel)
 }

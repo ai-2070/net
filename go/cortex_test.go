@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const testOrigin = uint32(0xABCDEF01)
+const testOrigin = uint64(0xABCDEF01)
 
 // ---------------------------------------------------------------------------
 // Redex + RedexFile

@@ -343,7 +343,7 @@ const token = identity.issueToken({
   delegationDepth: 0,          // 0 forbids re-delegation
 });
 
-// `token.bytes` is the transport-ready 159-byte blob.
+// `token.bytes` is the transport-ready 161-byte blob.
 // Ship it to the grantee; they hand it back on subscribe.
 ```
 
@@ -873,6 +873,84 @@ CortEX-boundary errors are typed and catchable via `instanceof`:
 
 All three are re-exported from `@ai2070/net-sdk`; you don't need a
 separate import path.
+
+## Dataforts (greedy cache, gravity, blob refs, read-your-writes)
+
+Dataforts is the compositional data plane on top of RedEX / CortEX
+/ capability-index / proximity-graph. The TypeScript surface exposes
+greedy + gravity through `Redex` methods, blob registration through
+top-level helpers, and read-your-writes through `WriteToken` +
+`waitForToken` on `Tasks` / `Memories`. The underlying native module
+is built with the `dataforts` Cargo feature; pre-built `@ai2070/net`
+release artifacts ship with the feature on.
+
+Four phases:
+
+- **Phase 1 — Greedy-LRU caching.** Per-node speculative caching
+  of in-scope chains observed via the tail-subscription path.
+  Five-axis admission (scope + proximity + capability-preference
+  + colocation + storage-cap) plus a bandwidth budget gate decide
+  whether to admit each inbound event. Cold channels evict under
+  cluster-cap pressure and withdraw their `causal:<hex>`
+  advertisement.
+- **Phase 3 — `BlobRef` + blob adapters.** A `[0xB0, 0xB1, 0xB2,
+  0xB3]` magic + version + 32-byte BLAKE3 + size + URI reference
+  whose bytes live in the caller's storage (S3 / Ceph / IPFS /
+  local FS). The substrate carries the reference, not the blob.
+- **Phase 4 — Data gravity.** Per-chain read-rate counters with
+  exponential decay. Threshold-crossing emissions stamp
+  `heat:<hex>=<rate>` onto the chain's capability announcement;
+  greedy weights cache pulls by `heat × scope-match × proximity`.
+- **Phase 5 — Read-your-writes.** Every `tasks.create`,
+  `memories.insert`, etc. returns a `WriteToken`. Pass it to
+  `tasks.waitForToken(token, deadlineMs)` and the call resolves
+  only after the local fold has *applied* that seq — tracking
+  both `appliedThroughSeq` and `foldedThroughSeq` so a stalled
+  fold surfaces a typed error, not a silent resolve.
+
+```ts
+import { Redex, Tasks, BlobRef, registerFilesystemBlobAdapter,
+         blobPublish, blobResolve, MeshNode } from '@ai2070/net';
+
+const mesh = new MeshNode({ bindAddr: '0.0.0.0:7000', psk: '…' });
+const redex = new Redex({ persistentDir: '/var/lib/net/redex' });
+
+// Phase 1 — wire greedy into the mesh inbound dispatch.
+redex.enableGreedyDataforts(mesh, {
+  scopes: ['region:us'],
+  totalCapBytes: 1n << 30n,   // 1 GiB cluster-cap
+  perChannelCapBytes: 64n << 20n,
+});
+
+// Phase 4 — layer gravity on top.
+redex.enableGravityForGreedy(mesh, {
+  enabled: true,
+  emitThresholdRatio: 1.5,
+  decayHalfLifeSecs: 300n,
+});
+
+// Phase 3 — register an adapter (filesystem ships in-tree).
+registerFilesystemBlobAdapter('local', '/var/blobs');
+const ref = await blobPublish('local', 'local://obj/payload', someBytes);
+const back = await blobResolve(ref);
+
+// Phase 5 — read-your-writes.
+const tasks = await Tasks.open(redex, { originHash: mesh.originHash });
+const { token } = await tasks.create(1, 'first', 100);
+await tasks.waitForToken(token, 250); // ms deadline; throws CortexError on timeout
+
+// Diagnostics.
+console.log(redex.greedyCachedChannelCount());
+console.log(redex.greedyPrometheusText());
+```
+
+The canonical channel hash is 32-bit (`channelHash(name)` returns
+`number` in the u32 range). The per-packet wire `NetHeader`
+`channel_hash` stays `u16` — fast-path filter hint, may
+bucket-collide at scale; ACL / config / cache / RYW decisions key on
+the canonical 32-bit hash via registry disambiguation. The
+`PermissionToken` wire form is 161 bytes (the 2-byte → 4-byte
+channel-hash widening grew it from 159).
 
 ## nRPC (request / response over the mesh)
 

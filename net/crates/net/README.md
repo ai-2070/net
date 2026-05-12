@@ -378,7 +378,7 @@ Channels decouple applications from node identity. A producer emits to `sensors/
 Identity, capability announcements, subnet visibility, and channel authentication work as a single unit behind the `net` feature. Every binding — Rust, TypeScript, Python, Go — surfaces the same pieces with the same wire contract:
 
 - **Ed25519 identities.** `Identity` bundles a caller-owned 32-byte seed with a local `TokenCache`. `node_id` and `entity_id` are reproducible across restarts when the seed is pinned on `MeshBuilder` (or `identity_seed` / `identitySeed` / `IdentitySeedHex` on the Python / TS / Go mesh constructors and configs).
-- **Permission tokens.** ed25519-signed grants tying a `(subject, scope, channel, TTL)` tuple together. `TokenScope` is a bitfield of `publish | subscribe | admin | delegate`; delegation is capped per-token and the chain is verified end-to-end. Tokens cross the boundary as 159-byte opaque buffers (no hex round-trip, no JSON tax).
+- **Permission tokens.** ed25519-signed grants tying a `(subject, scope, channel, TTL)` tuple together. `TokenScope` is a bitfield of `publish | subscribe | admin | delegate`; delegation is capped per-token and the chain is verified end-to-end. Tokens cross the boundary as 161-byte opaque buffers (no hex round-trip, no JSON tax).
 - **Capability announcements.** Multi-hop broadcast (up to `MAX_CAPABILITY_HOPS = 16`) of each node's `CapabilitySet` (hardware, software, models, tools, tags, limits). `find_nodes(filter)` queries the local index in constant time; self-match returns the owning node's id. Forwarders increment `hop_count` outside the signed envelope so the origin's ed25519 signature verifies at every hop; `(origin, version)` dedup drops duplicates at diamond-topology converge points. The `node_id → entity_id` binding is pinned TOFU-style on first sight. See [`MULTIHOP_CAPABILITY_PLAN.md`](docs/MULTIHOP_CAPABILITY_PLAN.md).
 - **Subnets.** A `SubnetId` is a 4-level u32; `SubnetPolicy` derives each peer's subnet from their capability tags so every node in the mesh agrees on the geometry without a central directory. `Visibility` on a channel gates publish fan-out and subscribe authorization against that geometry.
 - **Channel authentication.** `ChannelConfig` carries `publish_caps`, `subscribe_caps`, and `require_token`. Publishers check their own caps before fan-out; subscribers present a `PermissionToken` whose subject matches their entity id. Successful subscribes populate the `AuthGuard` fast path (4 KB bloom filter + verified-subscribe cache) so every subsequent publish packet admits or drops the subscriber in constant time. A periodic token-expiry sweep (default 30 s) evicts subscribers whose tokens age out; a per-peer auth-failure rate limiter (default 16 failures per 60 s window, 30 s throttle) short-circuits bad-token storms before ed25519 verification runs. Any denial surfaces as `Unauthorized` / `RateLimited` at the subscribe gate or as a `PublishReport` miss on the publish side.
@@ -581,6 +581,48 @@ let pending = db.tasks().state().read().find_many(&TasksFilter {
 Whole-db snapshot is a single call. `db.snapshot()` walks every enabled model under its own state lock (consistent per-model; there is no cross-model consistency guarantee because each model backs a separate RedEX file), returning a `NetDbSnapshot { tasks, memories }` bundle. `NetDbSnapshot::encode()` produces a single postcard blob for persistence; `NetDbSnapshot::decode(bytes)` round-trips it, and `NetDbBuilder::build_from_snapshot(&bundle)` restores every enabled model in one call. Models enabled via `with_*()` whose bundle entry is `None` are opened from scratch — the same fallback path used by a fresh `build`.
 
 NetDB ships the same surface on Rust, Node (`@ai2070/net` napi bindings), and Python (`net._net` PyO3 bindings). The Node and Python handles carry the same CRUD + query methods; `NetDb.open(config)` on both sides is failure-atomic and supports the same whole-db snapshot bundle cross-language (postcard is stable across the FFI boundary).
+
+## Dataforts
+
+Dataforts is the compositional data plane on top of the RedEX / CortEX / capability-index / proximity-graph substrate. It ships behind the `dataforts` Cargo feature and composes against existing primitives — there is no new wire protocol, no separate coordinator service. See [`docs/misc/DATAFORTS_FEATURES.md`](docs/misc/DATAFORTS_FEATURES.md) for the audit (most of the original wishlist was already covered by core primitives; Dataforts names and packages the remaining work).
+
+Four phases compose:
+
+- **Phase 1 — Greedy-LRU caching.** Per-node speculative caching of in-scope chains observed via the tail-subscription path. Five-axis admission (`scope` + `proximity` + `capability-preference` + `colocation` + `storage-cap`) and a bandwidth budget gate decide whether to admit an inbound event into a per-channel cache file. The cache evicts cold channels under the cluster-cap pressure and withdraws their `causal:<hex>` advertisements. Wires via [`Redex::enable_greedy_dataforts`](src/adapter/net/redex/manager.rs).
+- **Phase 3 — `BlobRef` + `BlobAdapter`.** A 4-byte-magic + version + 32-byte BLAKE3 + size + URI reference type whose bytes live in the caller's storage (S3, Ceph, IPFS, local FS) — the substrate carries the reference, not the blob. Adapters implement `fetch` / `store` (with default `fetch_stream` / `store_stream` shims for multi-GB payloads). Filesystem adapter (`FileSystemAdapter`) ships in-tree; user adapters register via [`BlobAdapterRegistry`](src/adapter/net/dataforts/blob/registry.rs).
+- **Phase 4 — Data gravity.** Per-chain read-rate counters with exponential decay. Threshold-crossing emissions stamp `heat:<hex>=<rate>` onto the chain's existing capability announcement; the greedy admission gate weights cache pulls by heat × scope-match × proximity-rank. Cold chains evict first; hot chains migrate toward the readers that drive the heat. Wires via [`Redex::enable_gravity_for_greedy`](src/adapter/net/redex/manager.rs).
+- **Phase 5 — Read-your-writes.** A `WriteToken { origin_hash, seq }` returned from every successful `Tasks` / `Memories` write. Pass it to `wait_for_token(token, deadline)` and the call blocks until the local fold has actually applied that sequence number — not just folded it — so a producer reads its own write through the cache deterministically. Token construction is doc-hidden; tokens are unforgeable only against the issuing adapter (origin-bound). The wait path tracks both `applied_through_seq` and `folded_through_seq` watermarks and surfaces `WaitForTokenError::FoldStopped` when the fold task crashes mid-wait, so a producer never gets a silent `Ok(())` against a stalled adapter.
+
+The canonical `ChannelHash` (`u32`) is the substrate-wide ACL / storage / config key after the channel-hash widening (see [Net Header](#net-header-64-bytes-cache-line-aligned)); the per-packet wire `channel_hash` stays `u16` (fast-path filter hint; collisions are benign because ACL / RYW / cache decisions key on the canonical hash via the registry-side disambiguation).
+
+```rust
+# #[cfg(feature = "dataforts")]
+# async fn example(mesh: std::sync::Arc<net::adapter::net::MeshNode>) -> Result<(), Box<dyn std::error::Error>> {
+use net::adapter::net::dataforts::{GreedyConfig, IntentMatchPolicy, DataGravityPolicy};
+use net::adapter::net::behavior::capability::CapabilitySet;
+use net::adapter::net::Redex;
+use std::sync::Arc;
+
+let redex = Arc::new(Redex::new());
+
+// Phase 1: greedy cache wired into the mesh's inbound dispatch.
+redex.enable_greedy_dataforts(
+    mesh.clone(),
+    GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled),
+    Arc::new(CapabilitySet::default()),
+    Default::default(),
+)?;
+
+// Phase 4: layer gravity on top (per-chain heat counters + tick loop).
+redex.enable_gravity_for_greedy(mesh.clone(), DataGravityPolicy::default())?;
+
+// `Redex::greedy_cache_for(channel)` returns a cached `RedexFile`
+// when greedy has admitted that chain; callers fall back to a
+// network fetch when it returns `None`.
+# Ok(()) }
+```
+
+Phase 3 (blob) and Phase 5 (RYW) are wired on the same `Redex` handle — `BlobAdapterRegistry::register` for blob adapters, `tasks.wait_for_token(token, deadline)` / `memories.wait_for_token(...)` on the CortEX adapters for RYW.
 
 ## nRPC
 
@@ -1007,6 +1049,7 @@ net_shutdown(node);
 | RedEX disk durability | `redex-disk` | `redex` |
 | CortEX (adapter core + tasks + memories) | `cortex` | `redex` |
 | NetDB (unified query façade) | `netdb` | `cortex` |
+| Dataforts (greedy + gravity + blob + RYW) | `dataforts` | `cortex`, `blake3`, `xxhash-rust` |
 
 No features are enabled by default — opt into `redis`, `jetstream`, `net`, etc. explicitly.
 

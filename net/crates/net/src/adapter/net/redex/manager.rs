@@ -364,7 +364,12 @@ impl Redex {
     #[cfg(feature = "dataforts")]
     pub fn greedy_cache_for(&self, channel: &ChannelName) -> Option<RedexFile> {
         let runtime = self.greedy_runtime()?;
-        let synth = super::super::dataforts::synthesize_cache_channel_name(channel.hash());
+        // The greedy data-plane cache keys on the wire `u16` hash
+        // (that's what the inbound packet path carries); the
+        // canonical `u32` hash from `ChannelName::hash()` widens it
+        // for ACL / config / RYW elsewhere in the stack but the
+        // observe path stays on wire width.
+        let synth = super::super::dataforts::synthesize_cache_channel_name(channel.wire_hash());
         let file = runtime.cache_file(&synth)?;
         runtime.note_read(&synth);
         Some(file)
@@ -874,12 +879,13 @@ mod tests {
     #[test]
     fn test_auth_fast_path_alone_does_not_authorize_open_file() {
         // Regression: `open_file` used to accept any origin that
-        // had the 16-bit `channel_hash` in its fast-path bloom. A
-        // different channel name whose 16-bit hash collided with an
-        // authorized one would then grant unauthorized storage
-        // access. The fix requires the canonical channel name in
-        // the exact ACL, so a fast-path-only authorization is
-        // insufficient.
+        // had the (then-truncated) `channel_hash` in its fast-path
+        // bloom. A different channel name whose canonical hash
+        // collided with an authorized one would then grant
+        // unauthorized storage access. The fix requires the canonical
+        // channel name in the exact ACL, so a fast-path-only
+        // authorization is insufficient — independent of the hash
+        // width on the fast path (now `ChannelHash` / u32).
         let guard = Arc::new(AuthGuard::new());
         let name = cn("sensitive");
         // Authorize the fast path ONLY (no allow_channel).

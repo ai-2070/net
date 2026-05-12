@@ -67,10 +67,17 @@ pub trait GreedyObserver: Send + Sync {
     /// Observe one inbound channel event. The implementation is
     /// responsible for any async work + backpressure.
     ///
-    /// `channel_hash` is the 16-bit wire-form hash carried in the
-    /// Net header — the mesh strips channel names on ingress, so
+    /// `channel_hash` is the wire `u16` hash carried in the
+    /// `NetHeader` — the mesh strips channel names on ingress, so
     /// the observer maps `channel_hash` to a cache-side
-    /// [`ChannelName`] via [`synthesize_cache_channel_name`].
+    /// [`ChannelName`] via [`synthesize_cache_channel_name`]. The
+    /// data-plane greedy cache deliberately keys on the wire `u16`
+    /// (not the canonical
+    /// [`ChannelHash`](crate::adapter::net::channel::ChannelHash))
+    /// because that's the identifier carried by the packet that
+    /// triggered the observe call; ACL / storage / config decisions
+    /// key on the canonical `u32` elsewhere in the stack and are not
+    /// weakened by this data-plane choice.
     fn observe_event(
         &self,
         channel_hash: u16,
@@ -80,13 +87,13 @@ pub trait GreedyObserver: Send + Sync {
     );
 }
 
-/// Synthesize a stable cache-side [`ChannelName`] from a 16-bit
-/// channel hash. Hash-collision risk is bounded — different real
-/// channels with the same hash share a cache file, which behaves
-/// as a small mix-up at the cache layer (events from both channels
-/// land in the same per-channel-hash retention bucket). Operators
-/// running greedy across high-churn channel spaces should monitor
-/// hash collisions via the substrate's existing observability.
+/// Synthesize a stable cache-side [`ChannelName`] from the wire
+/// `u16` channel hash carried by inbound packets. Wire-bucket
+/// collisions are routine at scale and cause two real channels to
+/// share a cache file — a small mix-up at the data-plane cache
+/// layer; ACL and storage decisions key on the canonical
+/// [`ChannelHash`](crate::adapter::net::channel::ChannelHash)
+/// (`u32`) and are not affected.
 ///
 /// Naming convention `dataforts/greedy/<hex>` reserves a
 /// channel-namespace prefix that won't collide with application
