@@ -2490,19 +2490,44 @@ pub struct CapabilityIndex {
     /// packet header) need to walk every entry looking for a
     /// matching tag or fall back to last-hop-peer heuristics —
     /// both fragile under multi-hop relay. Direct lookup via
-    /// [`Self::get_by_origin_hash`] is O(1) and unambiguous: at
-    /// most one publisher per wire origin_hash regardless of how
-    /// many cache holders advertise the chain.
+    /// [`Self::get_by_origin_hash`] is O(1).
     ///
     /// Key shape is `u64` (zero-extended from the wire `u32`) to
     /// match the receiver-side `parsed.header.origin_hash.into()`
     /// projection inside `process_local_packet`.
+    ///
+    /// ## DoS surface — last-writer-wins under truncation collision
+    ///
+    /// Two distinct entities can collide on the wire u32 (birthday
+    /// paradox at ~2¹⁶ entities). The slot is last-writer-wins, so
+    /// a later-indexing peer overwrites the earlier one. **A node
+    /// deliberately picking a colliding EntityId can announce
+    /// caps that deny the legitimate publisher's events** at the
+    /// admission gate on every peer that has indexed both. The
+    /// authorization surface is unaffected (ACLs key on
+    /// `ChannelHash` / `node_id`, not wire `origin_hash`), but
+    /// scope-axis admission decisions can be inverted.
+    ///
+    /// `collision_count` below increments every time the slot is
+    /// overwritten by a different `node_id`; operators monitor
+    /// the counter to detect attack attempts. A full fix requires
+    /// either widening the wire `origin_hash` to `u64` (wire-
+    /// format break) or storing every colliding node_id and doing
+    /// a permissive-merge at the lookup site (caller-side scope-
+    /// axis widening). Both are out of scope for v0.2; the
+    /// counter + documentation here is the v0.2 mitigation.
     by_origin_hash: DashMap<u64, u64>,
     /// Version tracking
     versions: DashMap<u64, u64>,
     /// Stats
     index_count: AtomicU64,
     query_count: AtomicU64,
+    /// Cumulative count of wire-origin_hash collisions detected
+    /// at `index()` time — bumped when the `by_origin_hash` slot
+    /// for a wire hash is overwritten by a different `node_id`.
+    /// See the docstring on `by_origin_hash` for the DoS surface
+    /// this counter surfaces. Read via [`Self::collision_count`].
+    origin_hash_collisions: AtomicU64,
 }
 
 impl CapabilityIndex {
@@ -2521,6 +2546,7 @@ impl CapabilityIndex {
             versions: DashMap::new(),
             index_count: AtomicU64::new(0),
             query_count: AtomicU64::new(0),
+            origin_hash_collisions: AtomicU64::new(0),
         }
     }
 
@@ -2613,7 +2639,17 @@ impl CapabilityIndex {
             origin_hash,
         };
         self.nodes.insert(node_id, indexed);
-        self.by_origin_hash.insert(origin_hash, node_id);
+        // Track collisions on the side index. `insert` returns
+        // the previous value when the key was already present; a
+        // non-`None` return whose node_id differs from the one
+        // we're storing means two distinct entities project to
+        // the same wire u32 origin_hash. See the DoS-surface
+        // docstring on `by_origin_hash`.
+        if let Some(prev_node) = self.by_origin_hash.insert(origin_hash, node_id) {
+            if prev_node != node_id {
+                self.origin_hash_collisions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         self.index_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -3201,6 +3237,21 @@ impl CapabilityIndex {
     pub fn get_by_origin_hash(&self, origin_hash: u64) -> Option<CapabilitySet> {
         let node_id = *self.by_origin_hash.get(&origin_hash)?;
         self.get(node_id)
+    }
+
+    /// Cumulative count of wire-`origin_hash` collisions detected
+    /// at `index()` time. Bumped every time the `by_origin_hash`
+    /// side index overwrites a slot with a *different* `node_id`.
+    /// Operators monitor this counter to detect deliberate
+    /// truncation-collision attacks against the scope-axis
+    /// admission gate — see the DoS-surface docstring on
+    /// `by_origin_hash` above. A non-zero count on a production
+    /// cluster is a signal worth investigating; the collision
+    /// itself doesn't bypass authorization, but a colliding
+    /// peer's caps may invert scope decisions made on inbound
+    /// events.
+    pub fn collision_count(&self) -> u64 {
+        self.origin_hash_collisions.load(Ordering::Relaxed)
     }
 
     /// Run `f` against the node's `CapabilitySet` without cloning.
@@ -6204,5 +6255,59 @@ mod tests {
             .tags
             .iter()
             .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "b-caps")));
+    }
+
+    /// Indexing two distinct entities at the same wire
+    /// `origin_hash` bumps the `collision_count` exactly once.
+    /// Operators dashboard this counter to detect the
+    /// truncation-collision DoS surface documented on
+    /// `by_origin_hash`.
+    #[test]
+    fn collision_count_bumps_when_truncation_collision_overwrites_slot() {
+        let (entity_a, entity_b, _wire) = find_colliding_entities();
+        let index = CapabilityIndex::new();
+        assert_eq!(index.collision_count(), 0, "counter starts at zero");
+        index.index(CapabilityAnnouncement::new(
+            0xAAAA,
+            entity_a,
+            1,
+            CapabilitySet::new().add_tag("a-caps"),
+        ));
+        assert_eq!(
+            index.collision_count(),
+            0,
+            "first indexing of a fresh wire-hash slot is not a collision"
+        );
+        index.index(CapabilityAnnouncement::new(
+            0xBBBB,
+            entity_b,
+            1,
+            CapabilitySet::new().add_tag("b-caps"),
+        ));
+        assert_eq!(
+            index.collision_count(),
+            1,
+            "second indexing on the same wire hash with a different node_id must bump the counter"
+        );
+
+        // Reindexing the SAME entity (same node_id) doesn't
+        // count as a collision — that's the normal version-bump
+        // path, not a distinct claim on the same slot.
+        let (entity_a2, _, _) = find_colliding_entities();
+        index.index(CapabilityAnnouncement::new(
+            0xAAAA, // same node_id as the first
+            entity_a2,
+            2, // newer version
+            CapabilitySet::new().add_tag("a-caps-v2"),
+        ));
+        // Note: this re-indexes the original (entity_a → 0xAAAA)
+        // slot, overwriting the (entity_b → 0xBBBB) entry in
+        // `by_origin_hash` again. The counter bumps again because
+        // 0xAAAA != 0xBBBB.
+        assert_eq!(
+            index.collision_count(),
+            2,
+            "re-asserting A over B's slot also bumps the counter"
+        );
     }
 }
