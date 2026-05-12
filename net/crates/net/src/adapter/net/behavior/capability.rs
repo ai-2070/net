@@ -2403,6 +2403,16 @@ pub struct IndexedNode {
     /// punch target's `reflex_addr` from the index instead of
     /// probing it directly.
     pub reflex_addr: Option<std::net::SocketAddr>,
+    /// Wire-form origin_hash for this node's entity: the low
+    /// 32 bits of `EntityId::origin_hash()`, zero-extended back
+    /// to `u64` so it matches the receiver-side
+    /// `NetHeader::origin_hash.into()` projection inside the
+    /// mesh dispatch path. Cached at index time so
+    /// [`CapabilityIndex::remove`] can clean up the
+    /// `by_origin_hash` side index without re-deriving the
+    /// projection (which would require either an `EntityId` clone
+    /// on every entry or a re-keying scan).
+    pub origin_hash: u64,
 }
 
 /// High-performance capability index with inverted indexes
@@ -2437,6 +2447,27 @@ pub struct CapabilityIndex {
     /// tags (`hardware.gpu` with no value) use the sentinel
     /// empty string `""` as the inner key.
     by_axis_key: DashMap<crate::adapter::net::behavior::tag::TagKey, DashMap<String, HashSet<u64>>>,
+    /// Side index: `wire origin_hash -> node_id`.
+    ///
+    /// Wire packets carry the publisher's `origin_hash` as a u32
+    /// — the low 32 bits of `EntityId::origin_hash()` (BLAKE2s
+    /// projection under `net-origin-v1`) after `with_origin`'s
+    /// `as u32` truncation in
+    /// [`NetHeader`](crate::adapter::net::protocol::NetHeader).
+    /// Every other index keys on `node_id` (a separate projection
+    /// under `net-node-v1`). Without this side index, code paths
+    /// that have a wire origin_hash in hand (e.g. the inbound
+    /// packet header) need to walk every entry looking for a
+    /// matching tag or fall back to last-hop-peer heuristics —
+    /// both fragile under multi-hop relay. Direct lookup via
+    /// [`Self::get_by_origin_hash`] is O(1) and unambiguous: at
+    /// most one publisher per wire origin_hash regardless of how
+    /// many cache holders advertise the chain.
+    ///
+    /// Key shape is `u64` (zero-extended from the wire `u32`) to
+    /// match the receiver-side `parsed.header.origin_hash.into()`
+    /// projection inside `process_local_packet`.
+    by_origin_hash: DashMap<u64, u64>,
     /// Version tracking
     versions: DashMap<u64, u64>,
     /// Stats
@@ -2456,6 +2487,7 @@ impl CapabilityIndex {
             gpu_nodes: DashMap::new(),
             by_metadata: DashMap::new(),
             by_axis_key: DashMap::new(),
+            by_origin_hash: DashMap::new(),
             versions: DashMap::new(),
             index_count: AtomicU64::new(0),
             query_count: AtomicU64::new(0),
@@ -2536,7 +2568,11 @@ impl CapabilityIndex {
         let origin_remaining = Duration::from_nanos(origin_remaining_ns);
         let effective_ttl = local_ttl.min(origin_remaining);
 
-        // Store node
+        // Store node. The wire form of `origin_hash` is the low
+        // 32 bits of the entity projection (see `with_origin`'s
+        // truncation in NetHeader); reproduce that here so the
+        // side index keys match what receivers compute.
+        let origin_hash = (ann.entity_id.origin_hash() as u32) as u64;
         let indexed = IndexedNode {
             node_id,
             capabilities: ann.capabilities,
@@ -2544,8 +2580,10 @@ impl CapabilityIndex {
             indexed_at: Instant::now(),
             ttl: effective_ttl,
             reflex_addr: ann.reflex_addr,
+            origin_hash,
         };
         self.nodes.insert(node_id, indexed);
+        self.by_origin_hash.insert(origin_hash, node_id);
 
         self.index_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -2562,6 +2600,17 @@ impl CapabilityIndex {
         let version_entry = self.versions.entry(node_id);
         if let Some((_, node)) = self.nodes.remove(&node_id) {
             self.remove_from_indexes(node_id, &node.capabilities);
+            // Tear down the origin_hash → node_id mapping. Guard
+            // against a racing re-index that may have already
+            // moved the slot to a fresh node_id: only remove if
+            // the slot still points at the node we just evicted.
+            if let dashmap::mapref::entry::Entry::Occupied(slot) =
+                self.by_origin_hash.entry(node.origin_hash)
+            {
+                if *slot.get() == node_id {
+                    slot.remove();
+                }
+            }
         }
         if let Entry::Occupied(e) = version_entry {
             e.remove();
@@ -3106,6 +3155,22 @@ impl CapabilityIndex {
     /// Get node capabilities
     pub fn get(&self, node_id: u64) -> Option<CapabilitySet> {
         self.nodes.get(&node_id).map(|n| n.capabilities.clone())
+    }
+
+    /// Look up a node's `CapabilitySet` by `EntityId::origin_hash()`
+    /// rather than `node_id`. Wire packets carry the publisher's
+    /// `origin_hash` (a BLAKE2s projection of the entity key under
+    /// the `net-origin-v1` domain); the index keys on `node_id`
+    /// (a separate projection under `net-node-v1`). This accessor
+    /// bridges the two via the `by_origin_hash` side index so a
+    /// packet-side caller doesn't need to walk every entry.
+    ///
+    /// Returns `None` when no announcement carrying that
+    /// origin_hash has reached this node yet — fail-closed for
+    /// scope / intent / colocation admission.
+    pub fn get_by_origin_hash(&self, origin_hash: u64) -> Option<CapabilitySet> {
+        let node_id = *self.by_origin_hash.get(&origin_hash)?;
+        self.get(node_id)
     }
 
     /// Run `f` against the node's `CapabilitySet` without cloning.
@@ -5819,5 +5884,105 @@ mod tests {
             .iter()
             .any(|t| matches!(t, TagT::Reserved { prefix, body }
                 if prefix == "scope:" && body == "tenant:acme")));
+    }
+
+    // ========================================================================
+    // origin_hash side index (PR-5g)
+    // ========================================================================
+
+    /// `get_by_origin_hash` returns the indexed `CapabilitySet`
+    /// when an announcement with a matching wire-form origin_hash
+    /// has been indexed. Key shape is the low 32 bits of
+    /// `EntityId::origin_hash()` (zero-extended back to u64) so
+    /// it matches the receiver-side `NetHeader::origin_hash.into()`
+    /// projection.
+    #[test]
+    fn get_by_origin_hash_returns_indexed_caps() {
+        // Use a non-zero entity so origin_hash is non-trivial —
+        // [0; 32] derives a fixed value, but a different key
+        // exercises the index more honestly.
+        let entity = super::super::super::identity::EntityId::from_bytes([7u8; 32]);
+        let wire_origin = (entity.origin_hash() as u32) as u64;
+        let index = CapabilityIndex::new();
+        let caps = CapabilitySet::new().add_tag("test-marker");
+        index.index(CapabilityAnnouncement::new(42, entity.clone(), 1, caps));
+
+        let resolved = index
+            .get_by_origin_hash(wire_origin)
+            .expect("side index must surface the indexed caps");
+        assert!(resolved
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "test-marker")));
+    }
+
+    /// Unknown origin_hash returns `None` — fail-closed for the
+    /// caller (mesh dispatch path defaults to empty caps and
+    /// scope-axis admission rejects).
+    #[test]
+    fn get_by_origin_hash_returns_none_for_unknown_origin() {
+        let index = CapabilityIndex::new();
+        let entity = super::super::super::identity::EntityId::from_bytes([1u8; 32]);
+        index.index(CapabilityAnnouncement::new(1, entity, 1, CapabilitySet::new()));
+        // A different origin_hash that wasn't announced.
+        assert!(index.get_by_origin_hash(0xDEAD_BEEF_u64).is_none());
+    }
+
+    /// `remove` tears down the side-index mapping so a stale
+    /// lookup doesn't surface caps from an evicted node.
+    #[test]
+    fn remove_clears_origin_hash_side_index() {
+        let entity = super::super::super::identity::EntityId::from_bytes([2u8; 32]);
+        let wire_origin = (entity.origin_hash() as u32) as u64;
+        let index = CapabilityIndex::new();
+        index.index(CapabilityAnnouncement::new(
+            99,
+            entity.clone(),
+            1,
+            CapabilitySet::new().add_tag("before"),
+        ));
+        assert!(index.get_by_origin_hash(wire_origin).is_some());
+
+        index.remove(99);
+        assert!(
+            index.get_by_origin_hash(wire_origin).is_none(),
+            "side index must clean up on remove"
+        );
+    }
+
+    /// Re-indexing the same `node_id` with a newer version replaces
+    /// the side index entry; the wire origin_hash continues to
+    /// resolve to the same node_id (entity is the same), and the
+    /// surfaced caps reflect the latest announcement.
+    #[test]
+    fn reindex_replaces_caps_under_same_origin_hash() {
+        let entity = super::super::super::identity::EntityId::from_bytes([3u8; 32]);
+        let wire_origin = (entity.origin_hash() as u32) as u64;
+        let index = CapabilityIndex::new();
+        index.index(CapabilityAnnouncement::new(
+            123,
+            entity.clone(),
+            1,
+            CapabilitySet::new().add_tag("v1-marker"),
+        ));
+        index.index(CapabilityAnnouncement::new(
+            123,
+            entity,
+            2,
+            CapabilitySet::new().add_tag("v2-marker"),
+        ));
+
+        let resolved = index
+            .get_by_origin_hash(wire_origin)
+            .expect("side index must point at the freshly-indexed node");
+        assert!(resolved
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "v2-marker")));
+        // The old version's caps shouldn't surface.
+        assert!(!resolved
+            .tags
+            .iter()
+            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "v1-marker")));
     }
 }

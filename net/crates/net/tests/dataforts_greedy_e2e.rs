@@ -676,21 +676,8 @@ async fn wait_for_peer_caps(
 /// (Zone, Mesh) = true`, so the G-1 hook admits — proves the
 /// scope-ordering rule is directional, not a hard scope-equality
 /// check. Pins the "narrower local + wider publisher = admit"
-/// half of the scope contract.
-///
-/// The inverse — publisher advertises a narrower scope than the
-/// local node, so scope_mismatch fires — isn't covered at the
-/// e2e level today: the mesh's `chain_caps` lookup
-/// (`mesh.rs:3871-3887`) walks `capability_index.all_nodes()`
-/// for any node carrying `causal:<hex>`, and the greedy
-/// first-cache `announce_chain` step adds that tag to the cache
-/// holder's caps shortly after the first event. So events 1..N
-/// see A's caps (narrow scope → scope_mismatch), but events
-/// N+1..M see the cache holder's caps (wider scope → admit) — a
-/// non-deterministic split that depends on the announce-chain
-/// timing. Pinning the reject path needs the chain_caps lookup
-/// to disambiguate "publisher" from "cache holder" first; that's
-/// a chain-caps-resolution refactor out of PR-5e's scope.
+/// half of the scope contract. The inverse direction is covered
+/// by `greedy_blob_pull_vetoes_on_cross_scope_publisher` below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn greedy_blob_pull_admits_when_publisher_scope_covers_local() {
     let node_a = build_node().await;
@@ -760,6 +747,95 @@ async fn greedy_blob_pull_admits_when_publisher_scope_covers_local() {
     assert_eq!(
         snap.cluster.blob_pulls_rejected_scope_mismatch_total, 0,
         "narrower-local + wider-publisher must not surface scope_mismatch"
+    );
+
+    redex_b.disable_greedy_dataforts();
+}
+
+/// Cross-scope publisher: A announces `dataforts.greedy.scope=zone`
+/// + `gravity.scope=zone`; B's local greedy scope is `region`.
+/// Scope ordering is `Node < Zone < Region < Mesh` — Region is
+/// wider than Zone, so `scope_at_least_as_narrow(Region, Zone) =
+/// false` and the G-1 hook vetoes with ScopeMismatch on every
+/// blob-ref event. Pins the cross-region-scope-enforcement
+/// scenario from the plan's T-3.
+///
+/// Now deterministic post-PR-5g: the mesh's `chain_caps` lookup
+/// uses `CapabilityIndex::get_by_origin_hash` (keyed on the
+/// wire-truncated entity origin_hash) so the publisher's caps
+/// always resolve unambiguously — no contamination from cache
+/// holders' `causal:<hex>` advertisements.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn greedy_blob_pull_vetoes_on_cross_scope_publisher() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    let publisher_caps = CapabilitySet::new()
+        .add_tag("dataforts.greedy.scope=zone")
+        .add_tag("dataforts.gravity.scope=zone");
+    let pub_tag_count = publisher_caps.tags.len();
+    node_a
+        .announce_capabilities(publisher_caps)
+        .await
+        .expect("announce caps");
+    wait_for_peer_caps(
+        &node_b,
+        node_a.node_id(),
+        pub_tag_count,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+    )
+    .await;
+
+    let redex_b = Arc::new(Redex::new());
+    let local_caps_b = Arc::new(
+        CapabilitySet::new()
+            .add_tag("dataforts.blob.storage")
+            .add_tag("dataforts.blob.disk_total_gb=100")
+            .add_tag("dataforts.blob.disk_free_gb=50")
+            .add_tag("dataforts.greedy.enabled")
+            .add_tag("dataforts.greedy.scope=region")
+            .add_tag("dataforts.greedy.proximity=128"),
+    );
+    let cfg = GreedyConfig::default().with_intent_match(IntentMatchPolicy::Disabled);
+    redex_b
+        .enable_greedy_dataforts(node_b.clone(), cfg, local_caps_b, IntentRegistry::new())
+        .expect("enable greedy");
+
+    let name = cn("dataforts/test/g1-cross-scope");
+    node_b
+        .subscribe_channel(node_a.node_id(), name.clone())
+        .await
+        .expect("subscribe");
+
+    let publisher = ChannelPublisher::new(name.clone(), PublishConfig::default());
+    const N: u64 = 4;
+    for i in 0..N {
+        let payload = encode_blob_payload(format!("blob-event-{i}").as_bytes());
+        node_a.publish(&publisher, payload).await.expect("publish");
+    }
+
+    let runtime = redex_b.greedy_runtime().expect("runtime installed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let snap = runtime.metrics().snapshot();
+        if snap.cluster.blob_pulls_rejected_scope_mismatch_total >= N {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snap = runtime.metrics().snapshot();
+    assert!(
+        snap.cluster.blob_pulls_rejected_scope_mismatch_total >= N,
+        "scope_mismatch rejects must bump when publisher scope is narrower than local; \
+         got {} (full cluster snapshot: {:?})",
+        snap.cluster.blob_pulls_rejected_scope_mismatch_total,
+        snap.cluster,
+    );
+    assert_eq!(
+        snap.cluster.blob_pulls_admitted_total, 0,
+        "no blob pulls may admit across the scope boundary"
     );
 
     redex_b.disable_greedy_dataforts();

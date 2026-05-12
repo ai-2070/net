@@ -3835,12 +3835,16 @@ impl MeshNode {
 
         // Resolve the publisher's capability set so the runtime's
         // scope / intent / colocation gates have something to
-        // evaluate against. We look up *any holder* of the chain's
-        // origin_hash via the capability index — not the last-hop
-        // peer's caps, which would silently invert scope/intent
-        // admission for relayed events. Falls back to empty caps
-        // (fail-closed for scope-axis admission) if no holder is
-        // indexed yet (subscribe-before-announce race).
+        // evaluate against. The wire `origin_hash` is the
+        // publisher's `EntityId::origin_hash()` projection;
+        // [`CapabilityIndex::get_by_origin_hash`] bridges that
+        // back to the indexed `node_id` via the side index
+        // populated on every `index()` call. Unambiguous under
+        // multi-hop relay (the lookup keys on the entity, not the
+        // last-hop peer) and not poisoned by cache holders'
+        // `causal:<hex>` announcements. Falls back to empty caps
+        // (fail-closed for scope admission) when the publisher's
+        // announcement hasn't propagated yet.
         //
         // Snapshotted once per packet rather than per-event; every
         // event in the same packet shares the same publisher.
@@ -3849,43 +3853,8 @@ impl MeshNode {
             crate::adapter::net::behavior::capability::CapabilitySet,
         > = if greedy.is_some() {
             let origin_hash: u64 = parsed.header.origin_hash.into();
-            let hex = Self::chain_hex(origin_hash);
-            // Preferred path: pick any node that advertises
-            // `causal:<hex>` — every holder of the chain shares the
-            // chain-level caps. This is the traveling-with-chain
-            // signal that's robust under multi-hop relay: the
-            // publisher's announce_chain emits `causal:<hex>` into
-            // its CapabilitySet, and the index carries that across
-            // hops. Without this lookup, a relayed event evaluates
-            // against the relay's last-hop caps, silently inverting
-            // scope/intent admission.
-            //
-            // Fallback: until the publisher has emitted a
-            // `causal:<hex>` announcement (or in deployments that
-            // don't run announce_chain), use the last-hop peer's
-            // caps. For a direct A→B path that IS the publisher;
-            // for a multi-hop path the relay's caps are a
-            // best-effort proxy until the chain announcement
-            // propagates. Final fallback: empty caps (fail-closed
-            // for scope-axis admission).
-            let publisher_caps = ctx
-                .capability_index
-                .all_nodes()
-                .into_iter()
-                .find_map(|nid| {
-                    let caps = ctx.capability_index.get(nid)?;
-                    if caps.tags.iter().any(|t| Self::is_causal_for(t, &hex)) {
-                        Some(caps)
-                    } else {
-                        None
-                    }
-                });
-            let chain_caps = publisher_caps.or_else(|| {
-                let peer_addr = session.peer_addr();
-                let from_node = ctx.addr_to_node.get(&peer_addr).map(|r| *r);
-                from_node.and_then(|nid| ctx.capability_index.get(nid))
-            });
-            std::sync::Arc::new(chain_caps.unwrap_or_default())
+            let publisher_caps = ctx.capability_index.get_by_origin_hash(origin_hash);
+            std::sync::Arc::new(publisher_caps.unwrap_or_default())
         } else {
             std::sync::Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default())
         };
