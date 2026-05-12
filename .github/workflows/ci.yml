@@ -93,8 +93,16 @@ jobs:
         run: cargo test --test integration_netdb --features netdb
       - name: nRPC predicate-header integration
         run: cargo test --test integration_nrpc_predicate_header --features cortex
-      - name: Dataforts CLI blob 3-node tests
+      - name: Dataforts net-blob CLI tests
         run: cargo test --test net_blob_cli --features dataforts,cli
+      - name: Dataforts blob e2e (multi-node + migration)
+        # The blob e2e suite includes the 3-node parallel migration
+        # scenario in `three_node_parallel_migration_lands_blob_on_two_peers`.
+        # `redex-disk` is required so MeshBlobAdapter can spin up a
+        # real on-disk RedEX per node.
+        run: cargo test --test dataforts_blob_e2e --features dataforts,redex-disk
+      - name: Dataforts greedy e2e (cache + speculative pull)
+        run: cargo test --test dataforts_greedy_e2e --features dataforts
 
   loom-tests:
     name: Loom concurrency models
