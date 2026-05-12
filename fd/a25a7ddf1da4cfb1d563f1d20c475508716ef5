@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_3ffd187e3557de::t_b56d8fb9720571 4337-4353
+net/crates/net/tests/nrpc_inbound_dispatcher.rs
+  s_3ffd187e3557de::t_d7579875f9b961 113-207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "fda25a7ddf1da4cfb1d563f1d20c475508716ef5",
+  "prompts": {},
+  "sessions": {
+    "s_3ffd187e3557de": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7100398a-fb64-4912-a1ad-87b8e42b5430",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
