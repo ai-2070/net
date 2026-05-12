@@ -3850,7 +3850,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
 function ComponentsSection() {
   return (
     <section id="components" className="border-b border-line px-6 py-20">
-      <SectionLabel>§07 / components on the mesh</SectionLabel>
+      <SectionLabel>§08 / components on the mesh</SectionLabel>
       <DisplayHeading>
         four primitives.
         <br />
@@ -3891,6 +3891,256 @@ function ComponentsSection() {
   );
 }
 
+interface BlobChunk {
+  hash: string;
+  node: string;
+  state: "hot" | "warm" | "cold";
+  migrating?: boolean;
+}
+
+const INITIAL_CHUNKS: ReadonlyArray<BlobChunk> = [
+  { hash: "01.7e3a", node: "node.0x7af3", state: "hot" },
+  { hash: "02.b6c1", node: "node.0x2c91", state: "hot" },
+  { hash: "03.4f02", node: "node.0xeb29", state: "warm" },
+  { hash: "04.9d18", node: "node.0xfbb1", state: "warm", migrating: true },
+  { hash: "05.0a2c", node: "node.0x9a3e", state: "cold" },
+];
+
+const CAPABILITY_STRIP: ReadonlyArray<{
+  num: string;
+  name: string;
+  body: string;
+  isNew?: boolean;
+}> = [
+  {
+    num: "mesh.storage.1",
+    name: "Overflow",
+    isNew: true,
+    body: "high-water push to peers with capacity · admission on receive · watermark hysteresis",
+  },
+  {
+    num: "mesh.storage.2",
+    name: "Data Gravity",
+    body: "heat:blob tags announced peer-to-peer · log-scale decay · hot chunks colocate near demand",
+  },
+  {
+    num: "mesh.storage.3",
+    name: "Read-your-writes",
+    body: "WriteToken: (version, origin_hash, seq) · wait_for_token without coordinator round-trips",
+  },
+  {
+    num: "mesh.storage.4",
+    name: "BlobRef",
+    body: "manifest hash + chunks · pluggable adapters · hash-verified on store",
+  },
+];
+
+function DatafortsBlobViz() {
+  const [chunks, setChunks] =
+    useState<ReadonlyArray<BlobChunk>>(INITIAL_CHUNKS);
+
+  useEffect(() => {
+    const NODE_POOL = [
+      "node.0x7af3",
+      "node.0x2c91",
+      "node.0xeb29",
+      "node.0xfbb1",
+      "node.0x9a3e",
+      "node.0x4d8d",
+      "node.0xb547",
+      "node.0xc1d5",
+    ];
+    const STATES: ReadonlyArray<BlobChunk["state"]> = ["hot", "warm", "cold"];
+
+    const id = window.setInterval(() => {
+      setChunks((prev) => {
+        const next = prev.map((c) => ({ ...c, migrating: false }));
+        const i = Math.floor(Math.random() * next.length);
+        const target = next[i];
+        if (!target) return next;
+        const newNode =
+          NODE_POOL[Math.floor(Math.random() * NODE_POOL.length)] ??
+          target.node;
+        const newState =
+          STATES[Math.floor(Math.random() * STATES.length)] ?? "warm";
+        next[i] = {
+          ...target,
+          node: newNode,
+          state: newState,
+          migrating: true,
+        };
+        return next;
+      });
+    }, 1800);
+    return () => window.clearInterval(id);
+  }, []);
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto_1.4fr] gap-4 items-stretch">
+      {/* LEFT: app view */}
+      <div className="border border-line bg-bg-2 p-5">
+        <div className="text-[10px] text-ink-dim tracking-[0.18em] uppercase mb-4 flex items-center justify-between">
+          <span>// your app sees</span>
+          <span className="font-mono text-ink-faint normal-case tracking-normal">
+            local
+          </span>
+        </div>
+        <pre className="font-mono text-[11px] leading-[1.9] text-ink whitespace-pre">
+          <span className="text-accent">blob://</span>0xa8e2c4d9b1...{"\n\n"}
+          <span className="text-ink-dim">size</span>
+          {"      "}142.4 MB{"\n"}
+          <span className="text-ink-dim">status</span>
+          {"    "}
+          <span className="text-accent">ready</span>
+          {"\n"}
+          <span className="text-ink-dim">opened</span>
+          {"    "}2.4 ms{"\n"}
+          <span className="text-ink-dim">hash</span>
+          {"      "}
+          <span className="text-accent">verified</span>
+          {"\n"}
+          <span className="text-ink-dim">backend</span>
+          {"   "}local fs (so it seems){"\n\n"}
+          <span className="text-ink-faint italic">
+            // a file. nothing else.
+          </span>
+        </pre>
+      </div>
+
+      {/* CENTER: linker */}
+      <div className="flex lg:flex-col items-center justify-center gap-3 py-4 lg:py-0 lg:px-3">
+        <div className="font-mono text-[9px] text-ink-dim tracking-[0.18em] uppercase">
+          same handle
+        </div>
+        <div className="text-accent text-[40px] leading-none rotate-90 lg:rotate-0">
+          ↔
+        </div>
+        <div className="font-mono text-[9px] text-accent tracking-[0.18em] uppercase">
+          BlobRef
+        </div>
+      </div>
+
+      {/* RIGHT: mesh view */}
+      <div className="border border-accent-dim bg-accent/[0.02] p-5">
+        <div className="text-[10px] text-accent tracking-[0.18em] uppercase mb-4 flex items-center justify-between">
+          <span>// the mesh actually holds</span>
+          <span className="flex items-center gap-1.5 font-mono normal-case tracking-normal text-ink-faint">
+            <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block animate-pulse-dot" />
+            5 chunks · 5 nodes
+          </span>
+        </div>
+        <div className="font-mono text-[11px] leading-[1.9]">
+          {chunks.map((c) => (
+            <div
+              key={c.hash}
+              className="flex items-baseline gap-3 whitespace-nowrap"
+            >
+              <span
+                className={
+                  c.state === "hot"
+                    ? "text-accent"
+                    : c.state === "cold"
+                      ? "text-warn"
+                      : "text-ink-dim"
+                }
+              >
+                ▮▮▮
+              </span>
+              <span className="text-ink-dim">chunk.{c.hash}</span>
+              <span className="text-ink-faint">→</span>
+              <span className="text-ink flex-1">{c.node}</span>
+              {c.migrating ? (
+                <span className="text-cyan font-semibold">⇄ migrating</span>
+              ) : (
+                <span
+                  className={
+                    c.state === "hot"
+                      ? "text-accent"
+                      : c.state === "cold"
+                        ? "text-warn"
+                        : "text-ink-faint"
+                  }
+                >
+                  {c.state}
+                </span>
+              )}
+            </div>
+          ))}
+          <div className="text-ink-faint italic mt-2 text-[10px]">
+            // <span className="text-accent">hot</span> = gravity pulling toward
+            consumers · <span className="text-warn">cold</span> = overflow
+            candidate · <span className="text-cyan">⇄</span> = chunk moving
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DatafortsSection() {
+  return (
+    <section
+      id="dataforts"
+      className="relative overflow-hidden border-b border-line px-6 py-20"
+    >
+      <SectionLabel>§07 / dataforts // new</SectionLabel>
+      <DisplayHeading>
+        storage flows
+        <br />
+        across the mesh.
+      </DisplayHeading>
+
+      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+        Every existing storage system fixes data to a place. A bucket lives in a
+        region; a database lives in a cluster; a disk lives in a box. Net treats
+        storage like a fluid:{" "}
+        <strong className="text-ink font-medium">
+          a handle anyone can read, content that flows toward whoever needs it.
+        </strong>
+      </p>
+
+      <DatafortsBlobViz />
+
+      {/* Capability strip — compact horizontal list */}
+      <div className="mt-12 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 border-t border-l border-line">
+        {CAPABILITY_STRIP.map((c) => (
+          <div
+            key={c.name}
+            className="border-r border-b border-line bg-bg-2/40 p-5"
+          >
+            <div className="flex items-baseline justify-between mb-2">
+              <span className="font-mono text-[10px] text-accent tracking-[0.14em]">
+                ▸ {c.num}
+              </span>
+              {c.isNew ? (
+                <span className="bg-accent text-bg px-1.5 py-0.5 text-[9px] font-bold tracking-[0.18em]">
+                  NEW
+                </span>
+              ) : null}
+            </div>
+            <h3 className="font-head text-[16px] leading-tight text-ink mb-2 tracking-[0.04em] lowercase">
+              {c.name}
+            </h3>
+            <p className="text-[11px] text-ink-dim leading-[1.55]">{c.body}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-10 border-l-2 border-accent pl-6 pr-6 py-5 bg-accent/[0.02] max-w-[900px]">
+        <p className="text-[17px] text-ink leading-[1.5] font-light">
+          Open the handle. Get bytes. Whether the chunks were written here,
+          fetched from a peer who cached them, or pulled back from a node that
+          overflowed them last hour —{" "}
+          <strong className="text-accent font-medium">
+            the API doesn&apos;t change.
+          </strong>{" "}
+          Storage stopped being a place.
+        </p>
+      </div>
+    </section>
+  );
+}
+
 function InstallSection() {
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -3908,7 +4158,7 @@ function InstallSection() {
 
   return (
     <section id="install" className="bg-bg-2 border-b border-line px-6 py-20">
-      <SectionLabel>§08 / install</SectionLabel>
+      <SectionLabel>§09 / install</SectionLabel>
       <DisplayHeading>
         five languages.
         <br />
@@ -4049,7 +4299,7 @@ const APPS: readonly AppCard[] = [
 function ApplicationsSection() {
   return (
     <section id="apps" className="border-b border-line px-6 py-20">
-      <SectionLabel>§09 / target applications</SectionLabel>
+      <SectionLabel>§10 / target applications</SectionLabel>
       <DisplayHeading>
         everything that
         <br />
@@ -4139,7 +4389,7 @@ function BlackwallViz() {
 function BlackwallSection() {
   return (
     <section id="wall" className="blackwall-bg border-b border-line px-6 py-20">
-      <SectionLabel>§10 / the blackwall</SectionLabel>
+      <SectionLabel>§11 / the blackwall</SectionLabel>
       <DisplayHeading>
         safety isn&apos;t declared.
         <br />
@@ -4198,7 +4448,7 @@ function ReleasesSection() {
 
   return (
     <section id="releases" className="border-b border-line px-6 py-20">
-      <SectionLabel>§11 / releases</SectionLabel>
+      <SectionLabel>§12 / releases</SectionLabel>
       <DisplayHeading>net releases.</DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
@@ -4269,7 +4519,7 @@ function ReleasesSection() {
 function ClosingSection() {
   return (
     <section id="post-cloud" className="border-b border-line px-6 py-20">
-      <SectionLabel>§12 / post-cloud</SectionLabel>
+      <SectionLabel>§13 / post-cloud</SectionLabel>
       <DisplayHeading>
         not anti-cloud.
         <br />
@@ -4591,6 +4841,7 @@ export default function Home(): JSX.Element {
         <BenchmarksSection />
         <MikoshiSection />
         <ComputeRuntimeSection />
+        <DatafortsSection />
         <ComponentsSection />
         <InstallSection />
         <ApplicationsSection />
