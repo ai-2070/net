@@ -424,6 +424,44 @@ impl MeshBlobAdapter {
             .map_err(|e| BlobError::Backend(format!("mesh blob: open chunk file: {}", e)))?;
         Ok(!file.is_empty())
     }
+
+    /// Flush every chunk file referenced by `blob_ref` to disk.
+    /// Used by `publish_with_blob` (see
+    /// `super::publish_with_blob`) under
+    /// [`BlobDurability::DurableOnLocal`](crate::adapter::net::dataforts::BlobDurability::DurableOnLocal)
+    /// to satisfy "blob survives local node restart" before the
+    /// publish step. No-op for `BestEffort`; `ReplicatedTo(n)`
+    /// composes this with a wait-for-replicas poll above.
+    ///
+    /// Iterates `BlobRef::Small` as a single chunk; iterates
+    /// `BlobRef::Manifest` over every `ChunkRef`. Each chunk's
+    /// underlying `RedexFile::sync` runs sequentially — the call
+    /// order is stable but partial-progress on error means some
+    /// chunks may have been flushed before the failure point.
+    /// Surface as `BlobError::Backend` for the operator to
+    /// retry / inspect.
+    pub async fn sync_blob(&self, blob_ref: &BlobRef) -> Result<(), BlobError> {
+        let hashes: Vec<[u8; 32]> = match blob_ref {
+            BlobRef::Small { hash, .. } => vec![*hash],
+            BlobRef::Manifest { chunks, .. } => chunks.iter().map(|c| c.hash).collect(),
+        };
+        for hash in hashes {
+            let channel = Self::chunk_channel(&hash);
+            // `get_file` returns `None` if no file is registered;
+            // a sync of a not-yet-stored chunk is a layering bug,
+            // surface a typed error.
+            let file = self.redex.get_file(&channel).ok_or_else(|| {
+                BlobError::NotFound(format!(
+                    "mesh blob: chunk {} not stored locally — sync_blob \
+                     requires prior store",
+                    hex32(&hash)
+                ))
+            })?;
+            file.sync()
+                .map_err(|e| BlobError::Backend(format!("mesh blob: chunk sync: {}", e)))?;
+        }
+        Ok(())
+    }
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {

@@ -20,10 +20,12 @@ pub mod error;
 pub mod fs;
 pub mod mesh;
 pub mod noop;
+pub mod publish_with_blob;
 pub mod registry;
 
 pub use adapter::{BlobAdapter, BlobStat};
 pub use mesh::MeshBlobAdapter;
+pub use publish_with_blob::{publish_with_blob, BlobDurability, PublishWithBlobReceipt};
 pub use blob_ref::{
     byte_range_to_chunks, chunk_payload, BlobRef, ChunkRangeRequest, ChunkRef, ChunkedPayload,
     Encoding, BLOB_CHUNK_SIZE_BYTES, BLOB_MANIFEST_BODY_VERSION, BLOB_MANIFEST_MAX_CHUNKS,

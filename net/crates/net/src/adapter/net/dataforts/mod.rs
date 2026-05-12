@@ -40,10 +40,11 @@ pub use gravity::{
 #[cfg(feature = "dataforts")]
 pub use blob::{
     byte_range_to_chunks, chunk_payload, classify_payload, global_blob_adapter_registry,
-    publish_blob, publish_blob_ref, resolve_payload, run_conformance_suite, BlobAdapter,
-    BlobAdapterRegistry, BlobAdapterRegistryError, BlobError, BlobRef, BlobStat, ChunkRangeRequest,
-    ChunkRef, ChunkedPayload, Encoding, EventPayload, FileSystemAdapter, MeshBlobAdapter,
-    NoopAdapter, BLOB_CHUNK_SIZE_BYTES, BLOB_MANIFEST_BODY_VERSION, BLOB_MANIFEST_MAX_CHUNKS,
+    publish_blob, publish_blob_ref, publish_with_blob, resolve_payload, run_conformance_suite,
+    BlobAdapter, BlobAdapterRegistry, BlobAdapterRegistryError, BlobDurability, BlobError, BlobRef,
+    BlobStat, ChunkRangeRequest, ChunkRef, ChunkedPayload, Encoding, EventPayload,
+    FileSystemAdapter, MeshBlobAdapter, NoopAdapter, PublishWithBlobReceipt,
+    BLOB_CHUNK_SIZE_BYTES, BLOB_MANIFEST_BODY_VERSION, BLOB_MANIFEST_MAX_CHUNKS,
     BLOB_REF_DISCRIMINATOR, BLOB_REF_MAGIC, BLOB_REF_MAX_SIZE, BLOB_REF_SMALL_HEADER_LEN,
     BLOB_REF_VERSION_V1, BLOB_REF_VERSION_V2_MANIFEST,
 };
