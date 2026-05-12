@@ -86,12 +86,13 @@ pub use federated::{
     TransportError,
 };
 pub use planner::{
-    ExecutionPlan, LineageDirection, LineageEntry, MeshQueryPlanner, OperatorNode, OperatorPlan,
+    ExecutionPlan, JoinKeyMode, LineageDirection, LineageEntry, MeshQueryPlanner, OperatorNode,
+    OperatorPlan,
 };
 pub use protocol::{
     ContinuationToken, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,
 };
 pub use query::{
-    AggregateFn, ChainRef, Expr, JoinKey, JoinKind, MeshQuery, OrderDir, OrderKey, QueryV1,
-    ResultRow, SeqNum,
+    AggregateFn, ChainRef, Expr, JoinKey, JoinKind, JoinedRowPayload, MeshQuery, OrderDir,
+    OrderKey, QueryV1, ResultRow, SeqNum,
 };

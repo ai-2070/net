@@ -40,7 +40,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::error::MeshError;
-use super::query::{ChainRef, MeshQuery, QueryV1, SeqNum};
+use super::query::{ChainRef, Expr, JoinKey, JoinKind, MeshQuery, QueryV1, SeqNum};
 use crate::adapter::net::behavior::capability::CapabilityIndex;
 use crate::adapter::net::behavior::predicate::PredicateWire;
 use crate::adapter::net::behavior::query::CapabilityQuery;
@@ -153,6 +153,34 @@ pub enum OperatorPlan {
         /// includes the start origin at index 0 with `depth = 0`.
         entries: Vec<LineageEntry>,
     },
+    /// Inner hash-join of two sub-plans. Phase D-1 ships the
+    /// in-memory hash-build-on-left / probe-on-right strategy
+    /// against row-intrinsic keys (`origin` / `seq`); richer
+    /// key extraction over event payloads lands in Phase E
+    /// once row schemas are decoded.
+    ///
+    /// The executor emits one [`super::query::ResultRow`] per
+    /// matched pair: `origin = 0` (sentinel), `seq = SeqNum(0)`
+    /// (sentinel), `payload =` postcard-encoded
+    /// [`super::query::JoinedRowPayload`] carrying the
+    /// original `(left, right)` rows.
+    HashJoin {
+        /// Left sub-plan.
+        left: Box<OperatorNode>,
+        /// Right sub-plan.
+        right: Box<OperatorNode>,
+        /// How to extract the join key from each side's rows.
+        key_mode: JoinKeyMode,
+        /// Inner / outer semantics. Phase D-1 supports only
+        /// `Inner`; other variants surface a `PlannerError`
+        /// at execute time and are deferred to Phase D-2.
+        kind: JoinKind,
+        /// Late-arrival watermark per locked decision #2.
+        /// Phase D-1 ignores the value (snapshot semantics);
+        /// kept on the operator for protocol round-trip and
+        /// Phase D-2 streaming activation.
+        watermark: Duration,
+    },
     /// Placeholder operator — emitted by the planner when an
     /// operator's executor hasn't been wired yet. Carries a
     /// diagnostic so the executor can surface a useful
@@ -167,6 +195,20 @@ pub enum OperatorPlan {
         /// for composites whose inner already planned).
         input: Option<Box<OperatorNode>>,
     },
+}
+
+/// Phase D-1 join-key extraction mode. Constrains keys to the
+/// row's intrinsic fields (`origin` / `seq`); richer key
+/// extraction over event payloads lands in Phase E once a
+/// row-schema layer exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinKeyMode {
+    /// Hash on `ResultRow.origin` (8-byte LE encoding).
+    Origin,
+    /// Hash on `ResultRow.seq.0` (8-byte LE encoding).
+    Seq,
+    /// Hash on the `(origin, seq)` tuple (16-byte LE encoding).
+    OriginSeq,
 }
 
 /// Direction of a [`OperatorPlan::LineageEmit`] walk.
@@ -310,14 +352,13 @@ where
             QueryV1::LineageForward { origin, max_depth } => {
                 self.plan_lineage(origin, *max_depth, LineageDirection::Forward)
             }
-            QueryV1::Join { left, right, .. } => {
-                // Plan each side; emit a not-yet wrapper that
-                // holds the left input. Phase D fills in the
-                // executor.
-                let _ = self.plan(right)?; // surface inner errors early
-                let left_plan = self.plan(left)?;
-                self.plan_not_yet_implemented("Join (Phase D)", Some(Box::new(left_plan.root)))
-            }
+            QueryV1::Join {
+                left,
+                right,
+                on,
+                kind,
+                watermark,
+            } => self.plan_join(left, right, on, *kind, *watermark),
             QueryV1::Aggregate { inner, .. } => {
                 let input = self.plan(inner)?;
                 self.plan_not_yet_implemented("Aggregate (Phase E)", Some(Box::new(input.root)))
@@ -475,6 +516,45 @@ where
                 origin: origin_hash,
                 direction,
                 entries,
+            },
+            target_nodes: vec![],
+            cost,
+        })
+    }
+
+    /// Plan a Phase D-1 hash join. Recurses on both sides,
+    /// then derives the [`JoinKeyMode`] from the [`JoinKey`].
+    /// Surfaces `PlannerError` when the key references
+    /// payload fields (deferred to Phase E) or the sides
+    /// disagree on which intrinsic field to key on.
+    fn plan_join(
+        &self,
+        left: &MeshQuery,
+        right: &MeshQuery,
+        on: &JoinKey,
+        kind: JoinKind,
+        watermark: Duration,
+    ) -> Result<OperatorNode, MeshError> {
+        let key_mode = key_mode_for_join(on)?;
+        let left_plan = self.plan(left)?;
+        let right_plan = self.plan(right)?;
+        let cost = CostEstimate {
+            bandwidth_bytes: left_plan
+                .total_cost
+                .bandwidth_bytes
+                .saturating_add(right_plan.total_cost.bandwidth_bytes),
+            latency_ms: left_plan
+                .total_cost
+                .latency_ms
+                .max(right_plan.total_cost.latency_ms),
+        };
+        Ok(OperatorNode {
+            operator: OperatorPlan::HashJoin {
+                left: Box::new(left_plan.root),
+                right: Box::new(right_plan.root),
+                key_mode,
+                kind,
+                watermark,
             },
             target_nodes: vec![],
             cost,
@@ -876,6 +956,18 @@ fn sum_cost(node: &OperatorNode) -> CostEstimate {
             acc.bandwidth_bytes = acc.bandwidth_bytes.saturating_add(inner.bandwidth_bytes);
             acc.latency_ms = acc.latency_ms.saturating_add(inner.latency_ms);
         }
+        OperatorPlan::HashJoin { left, right, .. } => {
+            let l = sum_cost(left);
+            let r = sum_cost(right);
+            // Bandwidth sums (both sides fully materialize);
+            // latency is the slower of the two (both fetched
+            // concurrently at execute time).
+            acc.bandwidth_bytes = acc
+                .bandwidth_bytes
+                .saturating_add(l.bandwidth_bytes)
+                .saturating_add(r.bandwidth_bytes);
+            acc.latency_ms = acc.latency_ms.saturating_add(l.latency_ms.max(r.latency_ms));
+        }
         OperatorPlan::NotYetImplemented {
             input: Some(input),
             ..
@@ -1099,6 +1191,52 @@ fn parse_fork_body(body: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(body, 16).ok()
+}
+
+/// Derive the Phase D-1 [`JoinKeyMode`] from a [`JoinKey`].
+///
+/// Phase D-1 supports row-intrinsic keys only: both sides must
+/// agree on the same field, and that field must be `"origin"`
+/// or `"seq"` (special-cased) or the literal `"origin,seq"`
+/// composite. Anything else surfaces a `PlannerError` so the
+/// caller knows payload-keyed joins are deferred to Phase E
+/// (which needs row-schema decoding).
+fn key_mode_for_join(on: &JoinKey) -> Result<JoinKeyMode, MeshError> {
+    let left = field_name(&on.left_field).ok_or_else(|| MeshError::PlannerError {
+        detail: format!("join left key must be a field reference, got {:?}", on.left_field),
+    })?;
+    let right = field_name(&on.right_field).ok_or_else(|| MeshError::PlannerError {
+        detail: format!(
+            "join right key must be a field reference, got {:?}",
+            on.right_field
+        ),
+    })?;
+    if left != right {
+        return Err(MeshError::PlannerError {
+            detail: format!(
+                "join key sides must reference the same row field in Phase D-1 (left='{left}', right='{right}'); payload-keyed joins land in Phase E"
+            ),
+        });
+    }
+    match left {
+        "origin" => Ok(JoinKeyMode::Origin),
+        "seq" => Ok(JoinKeyMode::Seq),
+        "origin,seq" => Ok(JoinKeyMode::OriginSeq),
+        other => Err(MeshError::PlannerError {
+            detail: format!(
+                "join key '{other}' is not a row-intrinsic field; only 'origin' / 'seq' / 'origin,seq' supported in Phase D-1"
+            ),
+        }),
+    }
+}
+
+/// Borrow the inner `&str` of an [`Expr::Field`]. Returns
+/// `None` for any other variant.
+fn field_name(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Field(s) => Some(s.as_str()),
+        _ => None,
+    }
 }
 
 // Silence unused-import warning under feature-conditional
@@ -2209,6 +2347,157 @@ mod tests {
                 max_depth: 5,
             }))
             .unwrap();
+        let bytes = postcard::to_allocvec(&plan).unwrap();
+        let decoded: ExecutionPlan = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, plan);
+    }
+
+    // ========================================================================
+    // Phase D — hash-join planning
+    // ========================================================================
+
+    fn join_query(left_field: &str, right_field: &str, left_chain: u64, right_chain: u64) -> MeshQuery {
+        MeshQuery::V1(QueryV1::Join {
+            left: Box::new(MeshQuery::V1(QueryV1::Latest {
+                origin: ChainRef::OriginHash(left_chain),
+            })),
+            right: Box::new(MeshQuery::V1(QueryV1::Latest {
+                origin: ChainRef::OriginHash(right_chain),
+            })),
+            on: JoinKey {
+                left_field: Expr::Field(left_field.to_string()),
+                right_field: Expr::Field(right_field.to_string()),
+            },
+            kind: JoinKind::Inner,
+            watermark: Duration::from_secs(5),
+        })
+    }
+
+    #[test]
+    fn plan_join_on_origin_produces_hash_join_with_origin_key() {
+        let l = 0x1111;
+        let r = 0x2222;
+        let index = index_with(vec![
+            (1, caps_with_causal_presence(l)),
+            (2, caps_with_causal_presence(r)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner.plan(&join_query("origin", "origin", l, r)).unwrap();
+        match plan.root.operator {
+            OperatorPlan::HashJoin {
+                key_mode,
+                kind,
+                watermark,
+                left,
+                right,
+            } => {
+                assert_eq!(key_mode, JoinKeyMode::Origin);
+                assert_eq!(kind, JoinKind::Inner);
+                assert_eq!(watermark, Duration::from_secs(5));
+                assert!(matches!(left.operator, OperatorPlan::LatestRead { .. }));
+                assert!(matches!(right.operator, OperatorPlan::LatestRead { .. }));
+            }
+            other => panic!("expected HashJoin; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_join_on_seq_produces_seq_key_mode() {
+        let l = 0x3333;
+        let r = 0x4444;
+        let index = index_with(vec![
+            (1, caps_with_causal_presence(l)),
+            (2, caps_with_causal_presence(r)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner.plan(&join_query("seq", "seq", l, r)).unwrap();
+        if let OperatorPlan::HashJoin { key_mode, .. } = plan.root.operator {
+            assert_eq!(key_mode, JoinKeyMode::Seq);
+        } else {
+            panic!("expected HashJoin");
+        }
+    }
+
+    #[test]
+    fn plan_join_with_mismatched_field_names_surfaces_planner_error() {
+        let l = 0x5555;
+        let r = 0x6666;
+        let index = index_with(vec![
+            (1, caps_with_causal_presence(l)),
+            (2, caps_with_causal_presence(r)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner.plan(&join_query("origin", "seq", l, r)).unwrap_err();
+        match err {
+            MeshError::PlannerError { detail } => {
+                assert!(detail.contains("same row field") || detail.contains("disagree"));
+            }
+            other => panic!("expected PlannerError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_join_on_payload_field_surfaces_phase_e_planner_error() {
+        let l = 0x7777;
+        let r = 0x8888;
+        let index = index_with(vec![
+            (1, caps_with_causal_presence(l)),
+            (2, caps_with_causal_presence(r)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner
+            .plan(&join_query("payload.request_id", "payload.request_id", l, r))
+            .unwrap_err();
+        match err {
+            MeshError::PlannerError { detail } => {
+                assert!(detail.contains("Phase D-1"));
+            }
+            other => panic!("expected PlannerError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_join_with_non_field_expression_surfaces_planner_error() {
+        let l = 0x9999;
+        let r = 0xAAAA;
+        let index = index_with(vec![
+            (1, caps_with_causal_presence(l)),
+            (2, caps_with_causal_presence(r)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let q = MeshQuery::V1(QueryV1::Join {
+            left: Box::new(MeshQuery::V1(QueryV1::Latest {
+                origin: ChainRef::OriginHash(l),
+            })),
+            right: Box::new(MeshQuery::V1(QueryV1::Latest {
+                origin: ChainRef::OriginHash(r),
+            })),
+            on: JoinKey {
+                left_field: Expr::LitString("origin".to_string()),
+                right_field: Expr::Field("origin".to_string()),
+            },
+            kind: JoinKind::Inner,
+            watermark: Duration::from_secs(5),
+        });
+        let err = planner.plan(&q).unwrap_err();
+        match err {
+            MeshError::PlannerError { detail } => {
+                assert!(detail.contains("field reference"));
+            }
+            other => panic!("expected PlannerError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_join_round_trips_through_postcard() {
+        let l = 0xCCCC;
+        let r = 0xDDDD;
+        let index = index_with(vec![
+            (1, caps_with_causal_presence(l)),
+            (2, caps_with_causal_presence(r)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner.plan(&join_query("origin", "origin", l, r)).unwrap();
         let bytes = postcard::to_allocvec(&plan).unwrap();
         let decoded: ExecutionPlan = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, plan);

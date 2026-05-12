@@ -41,8 +41,8 @@ use futures::stream::Stream;
 use futures::StreamExt;
 
 use super::error::MeshError;
-use super::planner::{ExecutionPlan, OperatorNode, OperatorPlan};
-use super::query::{ResultRow, SeqNum};
+use super::planner::{ExecutionPlan, JoinKeyMode, OperatorNode, OperatorPlan};
+use super::query::{JoinKind, JoinedRowPayload, ResultRow, SeqNum};
 
 /// Unique id for a running query. Currently a monotonically-
 /// increasing `u64` per executor; surfaces through metrics and
@@ -206,60 +206,161 @@ fn walk_operator<R: ChainReader + 'static>(
     reader: Arc<R>,
     handle: QueryHandle,
 ) -> Result<ResultStream, MeshError> {
+    let rows = collect_operator_rows(node, reader.as_ref())?;
+    Ok(stream_from_vec(rows, handle))
+}
+
+/// Synchronously walk an [`OperatorNode`] and collect all rows
+/// into a `Vec<ResultRow>`. Used by [`walk_operator`] (which
+/// then wraps the vec in a cancellation-aware stream) and by
+/// [`execute_hash_join`] (which materializes both sides for
+/// hashing). Every operator the local executor handles for
+/// Phase D-1 is finite + synchronous, so a single pass is
+/// fine.
+fn collect_operator_rows<R: ChainReader + ?Sized>(
+    node: &OperatorNode,
+    reader: &R,
+) -> Result<Vec<ResultRow>, MeshError> {
     match &node.operator {
-        OperatorPlan::AtRead { origin, seq } => {
-            let row = reader.read_one(*origin, *seq).map(|payload| ResultRow {
+        OperatorPlan::AtRead { origin, seq } => Ok(reader
+            .read_one(*origin, *seq)
+            .map(|payload| ResultRow {
                 origin: *origin,
                 seq: *seq,
                 payload,
-            });
-            Ok(stream_from_vec(row.into_iter().collect(), handle))
-        }
-        OperatorPlan::BetweenRead { origin, start, end } => {
-            let events = reader.read_range(*origin, *start, *end);
-            let rows: Vec<ResultRow> = events
-                .into_iter()
-                .map(|(seq, payload)| ResultRow {
-                    origin: *origin,
-                    seq,
-                    payload,
-                })
-                .collect();
-            Ok(stream_from_vec(rows, handle))
-        }
-        OperatorPlan::LatestRead { origin } => {
-            let row = match reader.latest_seq(*origin) {
-                Some(tip) => reader.read_one(*origin, tip).map(|payload| ResultRow {
+            })
+            .into_iter()
+            .collect()),
+        OperatorPlan::BetweenRead { origin, start, end } => Ok(reader
+            .read_range(*origin, *start, *end)
+            .into_iter()
+            .map(|(seq, payload)| ResultRow {
+                origin: *origin,
+                seq,
+                payload,
+            })
+            .collect()),
+        OperatorPlan::LatestRead { origin } => Ok(reader
+            .latest_seq(*origin)
+            .and_then(|tip| {
+                reader.read_one(*origin, tip).map(|payload| ResultRow {
                     origin: *origin,
                     seq: tip,
                     payload,
-                }),
-                None => None,
-            };
-            Ok(stream_from_vec(row.into_iter().collect(), handle))
-        }
-        OperatorPlan::LineageEmit { entries, .. } => {
-            // The planner walked the lineage at plan time;
-            // the executor just emits one ResultRow per
-            // entry. payload is empty by Phase C convention —
-            // callers wanting full event content compose with
-            // At / Between against each entry's origin.
-            let rows: Vec<ResultRow> = entries
-                .iter()
-                .map(|entry| ResultRow {
-                    origin: entry.origin,
-                    seq: entry.tip_seq.unwrap_or(SeqNum(0)),
-                    payload: Vec::new(),
                 })
-                .collect();
-            Ok(stream_from_vec(rows, handle))
-        }
+            })
+            .into_iter()
+            .collect()),
+        OperatorPlan::LineageEmit { entries, .. } => Ok(entries
+            .iter()
+            .map(|entry| ResultRow {
+                origin: entry.origin,
+                seq: entry.tip_seq.unwrap_or(SeqNum(0)),
+                payload: Vec::new(),
+            })
+            .collect()),
+        OperatorPlan::HashJoin {
+            left,
+            right,
+            key_mode,
+            kind,
+            ..
+        } => execute_hash_join(left, right, *key_mode, *kind, reader),
         OperatorPlan::Filter { .. } => Err(MeshError::PlannerError {
             detail: "Filter executor not yet implemented (Phase E)".to_string(),
         }),
         OperatorPlan::NotYetImplemented { detail, .. } => Err(MeshError::PlannerError {
             detail: format!("operator not yet implemented: {detail}"),
         }),
+    }
+}
+
+/// Phase D-1 hash-join: build on `left`, probe with `right`,
+/// emit one joined row per match. Inner-join only; other join
+/// kinds surface a `PlannerError` so D-2 can ship them
+/// separately. Tracks a memory bound across the build set —
+/// if exceeded, surfaces [`MeshError::JoinMemoryExceeded`].
+fn execute_hash_join<R: ChainReader + ?Sized>(
+    left: &OperatorNode,
+    right: &OperatorNode,
+    key_mode: JoinKeyMode,
+    kind: JoinKind,
+    reader: &R,
+) -> Result<Vec<ResultRow>, MeshError> {
+    if kind != JoinKind::Inner {
+        return Err(MeshError::PlannerError {
+            detail: format!(
+                "join kind {kind:?} not yet implemented in Phase D-1; only Inner supported (outer joins land in D-2)"
+            ),
+        });
+    }
+
+    use std::collections::HashMap;
+    let left_rows = collect_operator_rows(left, reader)?;
+    let right_rows = collect_operator_rows(right, reader)?;
+
+    // Track build-side memory: every row contributes its
+    // payload bytes + key bytes + per-row overhead. If the
+    // build set exceeds the threshold, surface JoinMemoryExceeded
+    // before continuing. Threshold is conservative for D-1
+    // (256 MiB) and intended to catch runaway joins, not be
+    // a tight per-query budget — that's Phase D-2 territory.
+    let mut build_bytes: u64 = 0;
+    let mut build: HashMap<Vec<u8>, Vec<ResultRow>> = HashMap::new();
+    for row in left_rows {
+        let key = encode_join_key(&row, key_mode);
+        let approx = (row.payload.len() + key.len() + 64) as u64;
+        build_bytes = build_bytes.saturating_add(approx);
+        if build_bytes > HASH_JOIN_MEMORY_BYTES {
+            return Err(MeshError::JoinMemoryExceeded {
+                strategy: "broadcast-hash".to_string(),
+                threshold_bytes: HASH_JOIN_MEMORY_BYTES,
+            });
+        }
+        build.entry(key).or_default().push(row);
+    }
+
+    let mut out = Vec::new();
+    for r in right_rows {
+        let key = encode_join_key(&r, key_mode);
+        if let Some(lefts) = build.get(&key) {
+            for l in lefts {
+                let payload = postcard::to_allocvec(&JoinedRowPayload {
+                    left: l.clone(),
+                    right: Some(r.clone()),
+                })
+                .map_err(|e| MeshError::ExecutorError {
+                    node: 0,
+                    detail: format!("encode JoinedRowPayload: {e}"),
+                })?;
+                out.push(ResultRow {
+                    origin: 0,
+                    seq: SeqNum(0),
+                    payload,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Phase D-1 hash-join memory bound. Per-query, build-side.
+/// Tunable in Phase D-2 once a consumer drives the value.
+pub const HASH_JOIN_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Extract the join key from a [`ResultRow`] under the given
+/// mode. Returns a `Vec<u8>` so the build map can key on
+/// arbitrary-length composites.
+fn encode_join_key(row: &ResultRow, mode: JoinKeyMode) -> Vec<u8> {
+    match mode {
+        JoinKeyMode::Origin => row.origin.to_le_bytes().to_vec(),
+        JoinKeyMode::Seq => row.seq.0.to_le_bytes().to_vec(),
+        JoinKeyMode::OriginSeq => {
+            let mut v = Vec::with_capacity(16);
+            v.extend_from_slice(&row.origin.to_le_bytes());
+            v.extend_from_slice(&row.seq.0.to_le_bytes());
+            v
+        }
     }
 }
 
@@ -572,6 +673,169 @@ mod tests {
         assert_eq!((rows[2].origin, rows[2].seq), (0xCC, SeqNum(42)));
         // payload empty by Phase C convention.
         assert!(rows.iter().all(|r| r.payload.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn hash_join_inner_on_origin_matches_pairs() {
+        use crate::adapter::net::behavior::meshdb::planner::{
+            CostEstimate, JoinKeyMode,
+        };
+        use crate::adapter::net::behavior::meshdb::query::{JoinKind, JoinedRowPayload};
+        use std::time::Duration;
+
+        // Left chain X with 3 events; right chain X has 2.
+        // (Same origin → both sides hash to the same key.)
+        let chain = 0xABCD;
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(chain, SeqNum(1), b"L-1".to_vec());
+        reader.append(chain, SeqNum(2), b"L-2".to_vec());
+        let executor = LocalMeshQueryExecutor::new(reader);
+
+        // Both sides read the same chain; with origin-keyed
+        // join, every left-row hashes to the same key, so
+        // each right row matches every left row.
+        let leaf = |o: u64, s: u64| OperatorNode {
+            operator: OperatorPlan::AtRead {
+                origin: o,
+                seq: SeqNum(s),
+            },
+            target_nodes: vec![],
+            cost: CostEstimate::default(),
+        };
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::HashJoin {
+                    left: Box::new(leaf(chain, 1)),
+                    right: Box::new(leaf(chain, 2)),
+                    key_mode: JoinKeyMode::Origin,
+                    kind: JoinKind::Inner,
+                    watermark: Duration::from_secs(5),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+
+        let running = executor.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        // 1 left row * 1 right row = 1 pair.
+        assert_eq!(rows.len(), 1);
+        // Sentinel row markers.
+        assert_eq!(rows[0].origin, 0);
+        assert_eq!(rows[0].seq, SeqNum(0));
+        let decoded: JoinedRowPayload =
+            postcard::from_bytes(&rows[0].payload).expect("decode JoinedRowPayload");
+        assert_eq!(decoded.left.payload, b"L-1");
+        assert_eq!(decoded.right.as_ref().unwrap().payload, b"L-2");
+    }
+
+    #[tokio::test]
+    async fn hash_join_seq_key_only_matches_equal_seqs() {
+        use crate::adapter::net::behavior::meshdb::planner::{
+            CostEstimate, JoinKeyMode,
+        };
+        use crate::adapter::net::behavior::meshdb::query::{JoinKind, JoinedRowPayload};
+        use std::time::Duration;
+
+        // Two different chains; join on seq. Only rows that
+        // share seq numbers across the chains match.
+        let a = 0x111;
+        let b = 0x222;
+        let reader = Arc::new(InMemoryChainReader::default());
+        // Chain A: seqs 1, 2, 3
+        reader.append(a, SeqNum(1), b"a-1".to_vec());
+        reader.append(a, SeqNum(2), b"a-2".to_vec());
+        reader.append(a, SeqNum(3), b"a-3".to_vec());
+        // Chain B: seqs 2, 4
+        reader.append(b, SeqNum(2), b"b-2".to_vec());
+        reader.append(b, SeqNum(4), b"b-4".to_vec());
+
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::HashJoin {
+                    left: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: a,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    right: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: b,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    key_mode: JoinKeyMode::Seq,
+                    kind: JoinKind::Inner,
+                    watermark: Duration::from_secs(5),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let running = executor.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        // Only seq=2 is in both chains → one matched pair.
+        assert_eq!(rows.len(), 1);
+        let decoded: JoinedRowPayload =
+            postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(decoded.left.payload, b"a-2");
+        assert_eq!(decoded.right.unwrap().payload, b"b-2");
+    }
+
+    #[tokio::test]
+    async fn hash_join_outer_kind_surfaces_planner_error() {
+        use crate::adapter::net::behavior::meshdb::planner::{
+            CostEstimate, JoinKeyMode,
+        };
+        use crate::adapter::net::behavior::meshdb::query::JoinKind;
+        use std::time::Duration;
+
+        let reader = Arc::new(InMemoryChainReader::default());
+        let executor = LocalMeshQueryExecutor::new(reader);
+        let leaf = |o: u64| OperatorNode {
+            operator: OperatorPlan::LatestRead { origin: o },
+            target_nodes: vec![],
+            cost: CostEstimate::default(),
+        };
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::HashJoin {
+                    left: Box::new(leaf(0x1)),
+                    right: Box::new(leaf(0x2)),
+                    key_mode: JoinKeyMode::Origin,
+                    kind: JoinKind::LeftOuter,
+                    watermark: Duration::from_secs(5),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let err = executor.execute(plan).await.unwrap_err();
+        match err {
+            MeshError::PlannerError { detail } => {
+                assert!(detail.contains("LeftOuter") || detail.contains("not yet"));
+            }
+            other => panic!("expected PlannerError; got {other:?}"),
+        }
     }
 
     #[tokio::test]

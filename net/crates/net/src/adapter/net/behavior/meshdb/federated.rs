@@ -140,6 +140,11 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
                     rows: stream,
                 });
             }
+            OperatorPlan::HashJoin { .. } => {
+                // Phase D-1 federated joins: fetch left + right
+                // via the transport, hash join locally.
+                return self.execute_hash_join_federated(plan).await;
+            }
             OperatorPlan::Filter { .. } => {
                 return Err(MeshError::PlannerError {
                     detail: "Filter executor not yet implemented (Phase E)".to_string(),
@@ -207,6 +212,135 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
 
         let rows = translate_responses(response_stream, handle.clone());
         Ok(RunningQuery { handle, rows })
+    }
+}
+
+impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
+    /// Phase D-1 federated hash-join: fetch both sides
+    /// through the transport (recurse on this executor),
+    /// build a hash table on left, probe with right, emit
+    /// [`super::query::JoinedRowPayload`] inside sentinel
+    /// rows. Inner-join only — outer kinds surface
+    /// `PlannerError`.
+    async fn execute_hash_join_federated(
+        &self,
+        plan: ExecutionPlan,
+    ) -> Result<RunningQuery, MeshError> {
+        use super::planner::CostEstimate;
+        use super::query::{JoinKind, JoinedRowPayload, SeqNum};
+
+        let OperatorPlan::HashJoin {
+            left,
+            right,
+            key_mode,
+            kind,
+            ..
+        } = plan.root.operator
+        else {
+            unreachable!("execute_hash_join_federated dispatched on non-HashJoin");
+        };
+        if kind != JoinKind::Inner {
+            return Err(MeshError::PlannerError {
+                detail: format!(
+                    "join kind {kind:?} not yet implemented in Phase D-1; only Inner supported (outer joins land in D-2)"
+                ),
+            });
+        }
+
+        // Reuse the federated execute path for each side by
+        // wrapping the sub-plan in a fresh ExecutionPlan.
+        let left_running = Box::pin(self.execute(ExecutionPlan {
+            root: *left,
+            total_cost: CostEstimate::default(),
+        }))
+        .await?;
+        let right_running = Box::pin(self.execute(ExecutionPlan {
+            root: *right,
+            total_cost: CostEstimate::default(),
+        }))
+        .await?;
+
+        let left_rows = drain_rows(left_running.rows).await?;
+        let right_rows = drain_rows(right_running.rows).await?;
+
+        // Build on left, probe with right; same memory bound
+        // as the local executor (a Phase D-2 refinement will
+        // make this configurable per-query).
+        use std::collections::HashMap;
+        let mut build: HashMap<Vec<u8>, Vec<ResultRow>> = HashMap::new();
+        let mut build_bytes: u64 = 0;
+        for row in left_rows {
+            let key = encode_join_key_federated(&row, key_mode);
+            let approx = (row.payload.len() + key.len() + 64) as u64;
+            build_bytes = build_bytes.saturating_add(approx);
+            if build_bytes > super::executor::HASH_JOIN_MEMORY_BYTES {
+                return Err(MeshError::JoinMemoryExceeded {
+                    strategy: "broadcast-hash-federated".to_string(),
+                    threshold_bytes: super::executor::HASH_JOIN_MEMORY_BYTES,
+                });
+            }
+            build.entry(key).or_default().push(row);
+        }
+
+        let mut out: Vec<Result<ResultRow, MeshError>> = Vec::new();
+        for r in right_rows {
+            let key = encode_join_key_federated(&r, key_mode);
+            if let Some(lefts) = build.get(&key) {
+                for l in lefts {
+                    let payload = postcard::to_allocvec(&JoinedRowPayload {
+                        left: l.clone(),
+                        right: Some(r.clone()),
+                    })
+                    .map_err(|e| MeshError::ExecutorError {
+                        node: 0,
+                        detail: format!("encode JoinedRowPayload: {e}"),
+                    })?;
+                    out.push(Ok(ResultRow {
+                        origin: 0,
+                        seq: SeqNum(0),
+                        payload,
+                    }));
+                }
+            }
+        }
+
+        let handle = QueryHandle::new(self.allocate_id());
+        let stream: ResultStream = Box::pin(futures::stream::iter(out));
+        Ok(RunningQuery {
+            handle,
+            rows: stream,
+        })
+    }
+}
+
+/// Drain a [`ResultStream`] into a `Vec<ResultRow>`. Errors
+/// short-circuit the drain with the first encountered error.
+async fn drain_rows(mut s: ResultStream) -> Result<Vec<ResultRow>, MeshError> {
+    let mut out = Vec::new();
+    while let Some(item) = s.next().await {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
+/// Federated mirror of `executor::encode_join_key`. Duplicated
+/// to avoid a public crate-export of a Phase D-1 implementation
+/// detail; the two stay in lockstep by construction (key bytes
+/// are intentionally the same).
+fn encode_join_key_federated(
+    row: &ResultRow,
+    mode: super::planner::JoinKeyMode,
+) -> Vec<u8> {
+    use super::planner::JoinKeyMode;
+    match mode {
+        JoinKeyMode::Origin => row.origin.to_le_bytes().to_vec(),
+        JoinKeyMode::Seq => row.seq.0.to_le_bytes().to_vec(),
+        JoinKeyMode::OriginSeq => {
+            let mut v = Vec::with_capacity(16);
+            v.extend_from_slice(&row.origin.to_le_bytes());
+            v.extend_from_slice(&row.seq.0.to_le_bytes());
+            v
+        }
     }
 }
 
@@ -725,6 +859,83 @@ mod tests {
         assert_eq!(rows[0].seq, SeqNum(1));
         assert_eq!(rows[1].origin, 0xBB);
         assert_eq!(rows[1].seq, SeqNum(0));
+    }
+
+    #[tokio::test]
+    async fn federated_hash_join_fetches_both_sides_and_emits_pairs() {
+        use super::super::planner::{CostEstimate, JoinKeyMode};
+        use super::super::query::{JoinKind, JoinedRowPayload};
+        use std::time::Duration;
+
+        // Two chains, each on a different node. The federated
+        // executor dispatches each Between read separately,
+        // then hash-joins the results locally.
+        let a = 0x111;
+        let b = 0x222;
+        let node_a = local_executor_with(&[
+            (a, 1, b"a-1"),
+            (a, 2, b"a-2"),
+            (a, 5, b"a-5"),
+        ]);
+        let node_b = local_executor_with(&[
+            (b, 2, b"b-2"),
+            (b, 3, b"b-3"),
+            (b, 5, b"b-5"),
+        ]);
+
+        let transport = Arc::new(LoopbackTransport::new());
+        transport.register(0xA, node_a);
+        transport.register(0xB, node_b);
+
+        let fed = FederatedMeshQueryExecutor::new(transport);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::HashJoin {
+                    left: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: a,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![0xA],
+                        cost: CostEstimate::default(),
+                    }),
+                    right: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: b,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![0xB],
+                        cost: CostEstimate::default(),
+                    }),
+                    key_mode: JoinKeyMode::Seq,
+                    kind: JoinKind::Inner,
+                    watermark: Duration::from_secs(5),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let running = fed.execute(plan).await.unwrap();
+        let rows: Vec<ResultRow> = collect_rows(running.rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // Seqs 2 and 5 match across both sides → 2 pairs.
+        assert_eq!(rows.len(), 2);
+        let mut decoded: Vec<JoinedRowPayload> = rows
+            .iter()
+            .map(|r| postcard::from_bytes(&r.payload).unwrap())
+            .collect();
+        decoded.sort_by_key(|j| j.left.seq);
+        assert_eq!(decoded[0].left.payload, b"a-2");
+        assert_eq!(decoded[0].right.as_ref().unwrap().payload, b"b-2");
+        assert_eq!(decoded[1].left.payload, b"a-5");
+        assert_eq!(decoded[1].right.as_ref().unwrap().payload, b"b-5");
     }
 
     #[tokio::test]
