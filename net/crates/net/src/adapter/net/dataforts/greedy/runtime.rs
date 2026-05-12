@@ -167,6 +167,31 @@ struct GreedyRuntimeInner {
     /// disable) once gravity is installed.
     #[cfg(feature = "dataforts")]
     gravity: parking_lot::RwLock<Option<GravityState>>,
+    /// Optional [`BlobRefcountTable`] handle used as a chain-fold
+    /// refcount source: every event admitted into the greedy
+    /// cache whose payload decodes to a `BlobRef` bumps the
+    /// referenced hash's refcount; the corresponding decrement
+    /// fires when the cache evicts the channel under LRU
+    /// pressure. Without this wiring the refcount table sees
+    /// only the passive `store_observed` stamps from
+    /// `MeshBlobAdapter::store_chunk`, so GC's `deletable_hashes`
+    /// path can't distinguish "still referenced by a cached
+    /// chain" from "orphaned chunk past retention". Operator
+    /// installs via [`GreedyRuntime::set_blob_refcount_table`].
+    #[cfg(feature = "dataforts")]
+    blob_refcount: parking_lot::RwLock<
+        Option<super::super::blob::BlobRefcountTable>,
+    >,
+    /// Per-channel set of `BlobRef` hashes the runtime has
+    /// admitted into the cache. Drives the matching decrement on
+    /// channel eviction so the refcount source is balanced.
+    /// `Mutex` because writes happen on the (hot) admit path and
+    /// on the (rarer) eviction sweep — RwLock's reader path
+    /// doesn't help here since every dispatch is a write.
+    #[cfg(feature = "dataforts")]
+    chain_blob_refs: Mutex<
+        std::collections::HashMap<ChannelName, std::collections::HashSet<[u8; 32]>>,
+    >,
     /// Bounds the number of in-flight `observe_event` spawn tasks.
     /// `observe_event` is the mesh hot-path entry; without a bound
     /// a flooding peer creates one outstanding task per event
@@ -241,6 +266,10 @@ impl GreedyRuntime {
                 local_caps: Mutex::new(local_caps),
                 #[cfg(feature = "dataforts")]
                 gravity: parking_lot::RwLock::new(None),
+                #[cfg(feature = "dataforts")]
+                blob_refcount: parking_lot::RwLock::new(None),
+                #[cfg(feature = "dataforts")]
+                chain_blob_refs: Mutex::new(std::collections::HashMap::new()),
                 observer_inflight,
             }),
         }
@@ -280,6 +309,40 @@ impl GreedyRuntime {
     #[cfg(feature = "dataforts")]
     pub fn gravity_enabled(&self) -> bool {
         self.inner.gravity.read().is_some()
+    }
+
+    /// Wire a [`BlobRefcountTable`](super::super::blob::BlobRefcountTable)
+    /// so this runtime acts as a chain-fold refcount source: every
+    /// blob-ref-shaped event admitted into the cache bumps the
+    /// referenced hash's refcount, and the matching decrement
+    /// fires when the channel is evicted from the cache. Operators
+    /// typically pass `mesh_blob_adapter.refcount_table().clone()`
+    /// so the same table feeds the adapter's GC sweep.
+    ///
+    /// Idempotent — replacing an already-installed handle is
+    /// allowed; the per-channel `chain_blob_refs` shadow set is
+    /// preserved so in-flight admits/evictions stay balanced.
+    #[cfg(feature = "dataforts")]
+    pub fn set_blob_refcount_table(
+        &self,
+        table: super::super::blob::BlobRefcountTable,
+    ) {
+        *self.inner.blob_refcount.write() = Some(table);
+    }
+
+    /// Disable the chain-fold refcount source. The shadow set is
+    /// drained so a future re-install starts from a clean slate.
+    /// Idempotent.
+    #[cfg(feature = "dataforts")]
+    pub fn clear_blob_refcount_table(&self) {
+        *self.inner.blob_refcount.write() = None;
+        self.inner.chain_blob_refs.lock().clear();
+    }
+
+    /// True iff this runtime is wired as a blob refcount source.
+    #[cfg(feature = "dataforts")]
+    pub fn blob_refcount_enabled(&self) -> bool {
+        self.inner.blob_refcount.read().is_some()
     }
 
     /// Borrow the metrics registry. Cheap clone of the inner Arc.
@@ -618,15 +681,21 @@ impl GreedyRuntime {
             .for_channel(channel.as_str())
             .set_bytes_resident(resident_bytes);
 
-        // 4b. G-1 blob-pull verdict. The chain event was admitted +
-        // cached, so this is the moment to consider whether the
-        // local node should *additionally* pull any blob the event
-        // payload references. Decision-only in this PR — counters
-        // surface the verdict; the actual fetch path lands when
-        // remote blob fetch wires up. See
+        // 4b. G-1 blob-pull verdict + chain-fold refcount source.
+        // The chain event was admitted + cached, so this is the
+        // moment to consider whether the local node should
+        // *additionally* pull any blob the event payload
+        // references. Decision-only in this PR — counters surface
+        // the verdict; the actual fetch path lands when remote
+        // blob fetch wires up. See
         // `dataforts/blob/admission.rs::should_pull_blob` for the
         // decision rule + the plan's § G-1 for the full contract.
-        if let Ok(EventPayload::Blob(_blob_ref)) = classify_payload(payload) {
+        //
+        // When a refcount table is wired (PR-5h), the BlobRef hash
+        // is also folded into the table as a live reference. The
+        // matching decrement fires below in step 6 when the
+        // channel is evicted from the cache.
+        if let Ok(EventPayload::Blob(blob_ref)) = classify_payload(payload) {
             match should_pull_blob(&local_caps, chain_caps) {
                 PullBlobVerdict::Admit => {
                     self.inner.metrics.cluster().incr_blob_pull_admitted();
@@ -638,6 +707,7 @@ impl GreedyRuntime {
                         .incr_blob_pull_rejected(reason);
                 }
             }
+            self.record_blob_ref(channel, &blob_ref);
         }
 
         let sink = self.inner.sink.clone();
@@ -692,6 +762,16 @@ impl GreedyRuntime {
                 drop(gravity);
             }
 
+            // Decrement refcounts for every BlobRef hash the
+            // evicted channels had recorded. Balances the
+            // increment at step 4b so the refcount table tracks
+            // the "live references" semantics the GC sweep relies
+            // on. Drained under the inner lock so a concurrent
+            // dispatch on the same channel (post-eviction) starts
+            // from a clean slate.
+            #[cfg(feature = "dataforts")]
+            self.release_blob_refs_for_evicted(&sweep.evicted);
+
             for evicted in &sweep.evicted {
                 self.inner
                     .metrics
@@ -715,6 +795,86 @@ impl GreedyRuntime {
         }
 
         DispatchOutcome::Cached
+    }
+
+    /// Record one BlobRef-shaped event payload against the
+    /// per-channel shadow set + bump the refcount on the
+    /// underlying hash(es). No-op when no refcount table is
+    /// wired or when the channel has already recorded this
+    /// exact hash (set semantics — duplicate observations of the
+    /// same blob from the same channel don't double-count).
+    /// For `BlobRef::Manifest`, every constituent chunk hash is
+    /// recorded — the manifest body itself doesn't have its own
+    /// hash on the wire, so the per-chunk projection is the only
+    /// surface the refcount table can hold.
+    #[cfg(feature = "dataforts")]
+    fn record_blob_ref(
+        &self,
+        channel: &ChannelName,
+        blob_ref: &super::super::blob::BlobRef,
+    ) {
+        let table = match self.inner.blob_refcount.read().clone() {
+            Some(t) => t,
+            None => return,
+        };
+        let hashes: Vec<[u8; 32]> = match blob_ref {
+            super::super::blob::BlobRef::Small { hash, .. } => vec![*hash],
+            super::super::blob::BlobRef::Manifest { chunks, .. } => {
+                chunks.iter().map(|c| c.hash).collect()
+            }
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut seen = self.inner.chain_blob_refs.lock();
+        let bucket = seen.entry(channel.clone()).or_default();
+        for hash in hashes {
+            // Deduplicate per-channel: a chain re-publishing the
+            // same BlobRef across multiple events shouldn't
+            // accumulate refcount. The matching decrement at
+            // eviction also fires once per (channel, hash) pair.
+            if bucket.insert(hash) {
+                table.incr(hash, now_ms);
+            }
+        }
+    }
+
+    /// On channel eviction, drain the shadow set and decrement
+    /// each recorded BlobRef hash. Pairs with
+    /// [`Self::record_blob_ref`] to keep the refcount table
+    /// balanced — every admit that incremented is followed by
+    /// exactly one decrement when the holding channel is evicted.
+    #[cfg(feature = "dataforts")]
+    fn release_blob_refs_for_evicted(
+        &self,
+        evicted: &[super::cache::EvictedEntry],
+    ) {
+        let table = match self.inner.blob_refcount.read().clone() {
+            Some(t) => t,
+            None => {
+                // Drain without decrementing if the table is
+                // disabled, so a future re-install doesn't see
+                // stale shadow entries.
+                let mut seen = self.inner.chain_blob_refs.lock();
+                for e in evicted {
+                    seen.remove(&e.channel);
+                }
+                return;
+            }
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut seen = self.inner.chain_blob_refs.lock();
+        for e in evicted {
+            if let Some(hashes) = seen.remove(&e.channel) {
+                for hash in hashes {
+                    table.decr(hash, now_ms);
+                }
+            }
+        }
     }
 }
 
@@ -1489,5 +1649,146 @@ mod tests {
         assert_eq!(snap.cluster.blob_pulls_rejected_proximity_zero_total, 0);
         assert_eq!(snap.cluster.blob_pulls_rejected_unhealthy_total, 0);
         assert_eq!(snap.cluster.blob_pulls_rejected_scope_mismatch_total, 0);
+    }
+
+    // --- Chain-fold refcount source (PR-5h) ---
+
+    fn encode_blob_payload_with_hash(payload: &[u8]) -> (Vec<u8>, [u8; 32]) {
+        use crate::adapter::net::dataforts::blob::BlobRef;
+        let hash: [u8; 32] = blake3::hash(payload).into();
+        let bytes = BlobRef::small("mesh://test", hash, payload.len() as u64).encode();
+        (bytes, hash)
+    }
+
+    #[tokio::test]
+    async fn blobref_event_with_refcount_table_increments_hash() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let table = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table.clone());
+        assert!(rt.blob_refcount_enabled());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, hash) = encode_blob_payload_with_hash(b"refcount source");
+        rt.dispatch_event(&cn("test/refcount-incr"), 0xAA, &chain, &encoded)
+            .await;
+
+        let entry = table.get(&hash).expect("hash must be in refcount table");
+        assert_eq!(entry.refcount, 1, "first observation bumps refcount to 1");
+    }
+
+    #[tokio::test]
+    async fn duplicate_blobref_within_channel_does_not_double_count() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let table = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table.clone());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, hash) = encode_blob_payload_with_hash(b"dedup me");
+        let channel = cn("test/refcount-dedup");
+        rt.dispatch_event(&channel, 0xBB, &chain, &encoded).await;
+        rt.dispatch_event(&channel, 0xBB, &chain, &encoded).await;
+        rt.dispatch_event(&channel, 0xBB, &chain, &encoded).await;
+
+        let entry = table.get(&hash).expect("hash in refcount table");
+        assert_eq!(
+            entry.refcount, 1,
+            "duplicate observations on the same channel must not stack the refcount"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_payload_with_refcount_table_does_not_increment() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let table = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table.clone());
+
+        let chain = publisher_mesh_scope_caps();
+        rt.dispatch_event(&cn("test/refcount-inline"), 0xCC, &chain, b"plain")
+            .await;
+
+        // No BlobRef discriminator → no hash to record.
+        assert_eq!(
+            table.zero_refcount_count(),
+            0,
+            "inline payloads must not bump refcount entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_decrements_refcounts_for_evicted_channel() {
+        use crate::adapter::net::dataforts::blob::BlobRefcountTable;
+        // Match the shape from `cluster_cap_eviction_calls_withdraw`:
+        // per-channel cap = 1 MiB (validator floor); total cap = 1.5 MiB.
+        // One 1-MiB payload fits per channel; two 1-MiB payloads
+        // together exceed the cluster cap → channel A evicts when
+        // channel B is admitted.
+        let cfg = GreedyConfig::default()
+            .with_intent_match(super::super::IntentMatchPolicy::Disabled)
+            .with_per_channel_cap_bytes(super::super::config::MIN_PER_CHANNEL_CAP_BYTES)
+            .with_total_cap_bytes(super::super::config::MIN_PER_CHANNEL_CAP_BYTES + 512 * 1024);
+        let (rt, _sink) = build_runtime(cfg);
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let table = BlobRefcountTable::new();
+        rt.set_blob_refcount_table(table.clone());
+
+        let chain = publisher_mesh_scope_caps();
+        let (encoded_a, hash_a) = encode_blob_payload_with_hash(b"channel A blob");
+
+        // Channel A: small BlobRef event first (bumps refcount[hash_a]
+        // to 1) — followed by a 1-MiB inline padding event that
+        // fills the per-channel cap so the cluster cap is near
+        // saturation. The BlobRef event itself is tiny (~40 bytes
+        // wire); the padding is what gets channel A to ~1 MiB.
+        let channel_a = cn("test/refcount-evict-a");
+        rt.dispatch_event(&channel_a, 0xAA, &chain, &encoded_a).await;
+        assert_eq!(
+            table.get(&hash_a).map(|e| e.refcount),
+            Some(1),
+            "hash_a bumped on admit"
+        );
+        let big = vec![0u8; 1024 * 1024];
+        rt.dispatch_event(&channel_a, 0xAA, &chain, &big).await;
+        assert!(rt.contains(&channel_a), "channel A must be cached");
+
+        // Channel B: 1-MiB inline payload pushes total bytes past
+        // the cluster cap → channel A (LRU oldest) evicts.
+        rt.dispatch_event(&cn("test/refcount-evict-b"), 0xBB, &chain, &big)
+            .await;
+
+        // hash_a's refcount must be back at 0 — eviction released it.
+        assert!(!rt.contains(&channel_a), "channel A must have evicted");
+        assert_eq!(
+            table.get(&hash_a).map(|e| e.refcount),
+            Some(0),
+            "hash_a refcount must drop on channel-A eviction (got {:?})",
+            table.get(&hash_a),
+        );
+    }
+
+    #[tokio::test]
+    async fn refcount_source_disabled_when_no_table_wired() {
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+        assert!(!rt.blob_refcount_enabled());
+        // No panic, no table — dispatch_event with a BlobRef still
+        // works; refcount path is a silent no-op.
+        rt.set_local_caps(Arc::new(participating_blob_caps()));
+        let chain = publisher_mesh_scope_caps();
+        let (encoded, _) = encode_blob_payload_with_hash(b"no table wired");
+        rt.dispatch_event(&cn("test/refcount-disabled"), 0xDD, &chain, &encoded)
+            .await;
     }
 }
