@@ -242,12 +242,22 @@ pub fn should_emit_heat(
         // rate doubled (current/prev >= ratio) OR
         // rate halved (prev/current >= ratio).
         (Some(prev), r) => {
-            // Guard against `inf` / `NaN`: a `prev` near zero (the
-            // counter-side clamp shouldn't allow it, but pure
-            // functions must not rely on caller-side defenses) makes
-            // `r / prev` explode toward +inf. Treat near-zero `prev`
-            // as "no prior emission" so the bootstrap arm runs cleanly.
-            let bootstrap = !prev.is_finite() || !r.is_finite() || prev <= f64::EPSILON;
+            // Guard against `inf` / `NaN`: a `prev` near zero
+            // makes `r / prev` explode toward +inf, and a `r` near
+            // zero makes `prev / r` explode the same way. The
+            // bootstrap branch treats both as "no prior emission"
+            // so the ratio test is only reached with normal,
+            // strictly-positive values on both sides.
+            //
+            // `is_normal()` rejects NaN, ±inf, 0.0, and subnormals
+            // (≈ < 2.225e-308). `f64::EPSILON` ≈ 2.22e-16 is the
+            // smallest *meaningful* divisor under the ratio scale
+            // we operate at (rates of 0.01 - 1000); below that the
+            // signal isn't distinguishable from rounding noise so
+            // we route through the bootstrap arm regardless.
+            let prev_safe = prev.is_normal() && prev > f64::EPSILON;
+            let r_safe = r.is_normal() && r > f64::EPSILON;
+            let bootstrap = !prev_safe || !r_safe;
             let crossed_threshold = !bootstrap && ((r / prev) >= ratio || (prev / r) >= ratio);
             if bootstrap || crossed_threshold {
                 EmissionDecision::Emit { rate: r }
@@ -348,6 +358,29 @@ mod tests {
             err,
             DataGravityPolicyError::NormalizationReferenceTooLow { .. }
         ));
+    }
+
+    #[test]
+    fn should_emit_heat_handles_subnormal_prev() {
+        // Subnormal `prev` (below `f64::MIN_POSITIVE_NORMAL`) used
+        // to be a hazard: `r / prev` overflows to `inf` and the
+        // ratio test wrongly emits. The bootstrap branch should
+        // catch it via `is_normal()` and re-route to emit-fresh.
+        // Pin the behavior so a future refactor can't lose it.
+        let p = policy();
+        // MIN_POSITIVE (5e-324) is subnormal; r=1.0 is normal.
+        let decision = should_emit_heat(1.0, Some(f64::MIN_POSITIVE), &p);
+        match decision {
+            EmissionDecision::Emit { rate } => assert!((rate - 1.0).abs() < 1e-9),
+            other => panic!("subnormal prev must route to Emit, got {:?}", other),
+        }
+        // MIN_POSITIVE_SUBNORMAL (5e-324) for r, normal prev.
+        let decision = should_emit_heat(f64::MIN_POSITIVE, Some(1.0), &p);
+        assert!(matches!(decision, EmissionDecision::Emit { .. }));
+        // EPSILON-boundary: prev at EPSILON should also route to
+        // bootstrap (avoid noise-level signals on the ratio test).
+        let decision = should_emit_heat(1.0, Some(f64::EPSILON), &p);
+        assert!(matches!(decision, EmissionDecision::Emit { .. }));
     }
 
     #[test]

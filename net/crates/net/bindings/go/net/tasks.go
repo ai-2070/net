@@ -457,6 +457,23 @@ func (a *TasksAdapter) PollForToken(token WriteToken) error {
 //
 // Recommended path for cancellable Go callers — `WaitForToken`
 // pins a thread for the supplied timeout.
+//
+// # Cancellation contract caveat
+//
+// `ctx.Done()` cancellation aborts the Go-side polling loop but
+// does NOT abort any in-flight `PollForToken` cgo call. Each
+// poll is non-blocking (returns immediately via the FFI's
+// `timeout_ms == 0` shape), so the worst-case window between
+// cancel and return is the duration of one poll — typically
+// sub-millisecond. The Rust substrate side has no cancellation
+// state to roll back; the next ingest/wait on the adapter is
+// unaffected.
+//
+// If you switch to `WaitForToken(token, timeout)` (single
+// blocking cgo call), `ctx.Done()` cannot interrupt the cgo
+// blocking phase — the call will return after `timeout` regardless
+// of context state. Use `WaitForTokenContext` for cancellable
+// waits.
 func (a *TasksAdapter) WaitForTokenContext(ctx context.Context, token WriteToken) error {
 	pollInterval := 10 * time.Millisecond
 	timer := time.NewTimer(pollInterval)

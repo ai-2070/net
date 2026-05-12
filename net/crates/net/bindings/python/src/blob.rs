@@ -183,11 +183,35 @@ pub fn blob_adapter_registered(adapter_id: &str) -> bool {
 /// still acquirable. Without this, a `Py<PyAny>` cleanup after
 /// interpreter finalization aborts the process via PyO3's safety
 /// guard. Idempotent.
+///
+/// Counts drained / missing entries and emits the summary to
+/// stderr only when `NET_PY_TRACE_ATEXIT` is set in the
+/// environment — quiet by default so production processes don't
+/// add noise to their shutdown logs, observable when operators
+/// need to debug a shutdown race. The Python binding doesn't link
+/// `tracing` directly so this is the lowest-dep diagnostic that
+/// works in any install.
 #[pyfunction]
 pub fn _drain_blob_adapters() {
     let registry = global_blob_adapter_registry();
-    for id in registry.ids() {
-        let _ = registry.unregister(&id);
+    let ids = registry.ids();
+    let total = ids.len();
+    let mut drained = 0usize;
+    let mut missing = 0usize;
+    for id in ids {
+        if registry.unregister(&id).is_some() {
+            drained += 1;
+        } else {
+            // Race: another caller unregistered between `ids()`
+            // and our `unregister`. Not a failure; just rare.
+            missing += 1;
+        }
+    }
+    if std::env::var_os("NET_PY_TRACE_ATEXIT").is_some() {
+        eprintln!(
+            "net.py: atexit blob-adapter drain — total={} drained={} missing={}",
+            total, drained, missing,
+        );
     }
 }
 

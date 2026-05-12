@@ -414,6 +414,10 @@ func (a *MemoriesAdapter) PollForToken(token WriteToken) error {
 
 // WaitForTokenContext polls until the write is observable or the
 // context cancels. Recommended path for cancellable Go callers.
+//
+// See `TasksAdapter.WaitForTokenContext` for the cancellation
+// contract caveat (cgo polls return promptly because each is
+// non-blocking; the cancellation gap is sub-millisecond).
 func (a *MemoriesAdapter) WaitForTokenContext(ctx context.Context, token WriteToken) error {
 	pollInterval := 10 * time.Millisecond
 	timer := time.NewTimer(pollInterval)
