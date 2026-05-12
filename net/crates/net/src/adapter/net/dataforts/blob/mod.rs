@@ -23,7 +23,10 @@ pub mod registry;
 
 pub use adapter::BlobAdapter;
 pub use blob_ref::{
-    BlobRef, BLOB_REF_DISCRIMINATOR, BLOB_REF_MAGIC, BLOB_REF_MAX_SIZE, BLOB_REF_VERSION_V1,
+    byte_range_to_chunks, chunk_payload, BlobRef, ChunkRangeRequest, ChunkRef, ChunkedPayload,
+    Encoding, BLOB_CHUNK_SIZE_BYTES, BLOB_MANIFEST_BODY_VERSION, BLOB_MANIFEST_MAX_CHUNKS,
+    BLOB_REF_DISCRIMINATOR, BLOB_REF_MAGIC, BLOB_REF_MAX_SIZE, BLOB_REF_SMALL_HEADER_LEN,
+    BLOB_REF_VERSION_V1, BLOB_REF_VERSION_V2_MANIFEST,
 };
 pub use conformance::run_conformance_suite;
 pub use dispatch::{

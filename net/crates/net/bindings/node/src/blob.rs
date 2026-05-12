@@ -79,29 +79,36 @@ impl BlobRef {
             return Err(blob_err("BlobRef", "size must be non-negative"));
         }
         Ok(Self {
-            inner: InnerBlobRef::new(uri, arr, size_u64),
+            inner: InnerBlobRef::small(uri, arr, size_u64),
         })
     }
 
     #[napi(getter)]
     pub fn version(&self) -> u8 {
-        self.inner.version
+        self.inner.version()
     }
 
     #[napi(getter)]
     pub fn uri(&self) -> &str {
-        &self.inner.uri
+        self.inner.uri()
     }
 
-    /// 32-byte BLAKE3 hash.
+    /// 32-byte BLAKE3 hash. For Small (the only variant the Node
+    /// constructor produces today); v0.2 will surface chunked
+    /// manifests via a separate accessor.
     #[napi(getter)]
     pub fn hash(&self) -> Buffer {
-        Buffer::from(self.inner.hash.to_vec())
+        let hash = self
+            .inner
+            .small_hash()
+            .copied()
+            .unwrap_or([0; 32]);
+        Buffer::from(hash.to_vec())
     }
 
     #[napi(getter)]
     pub fn size(&self) -> BigInt {
-        BigInt::from(self.inner.size)
+        BigInt::from(self.inner.size())
     }
 
     /// Wire-encoded form (discriminator + version + hash + size + uri).
@@ -353,10 +360,17 @@ where
 }
 
 fn js_blob_ref_parts(blob_ref: &InnerBlobRef) -> (String, Buffer, BigInt) {
+    // Node adapter callbacks operate on Small blobs only; the
+    // substrate's MeshBlobAdapter (v0.2) handles manifest dispatch
+    // before reaching the FFI shim. A Manifest reaching this helper
+    // is a layering bug — fall through with a zero hash so the
+    // downstream JS error path surfaces a typed mismatch rather
+    // than a panic.
+    let hash = blob_ref.small_hash().copied().unwrap_or([0; 32]);
     (
-        blob_ref.uri.clone(),
-        Buffer::from(blob_ref.hash.to_vec()),
-        BigInt::from(blob_ref.size),
+        blob_ref.uri().to_owned(),
+        Buffer::from(hash.to_vec()),
+        BigInt::from(blob_ref.size()),
     )
 }
 

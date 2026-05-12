@@ -69,29 +69,35 @@ impl PyBlobRef {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&hash);
         Ok(Self {
-            inner: InnerBlobRef::new(uri, arr, size),
+            inner: InnerBlobRef::small(uri, arr, size),
         })
     }
 
     #[getter]
     fn version(&self) -> u8 {
-        self.inner.version
+        self.inner.version()
     }
 
     #[getter]
     fn uri(&self) -> &str {
-        &self.inner.uri
+        self.inner.uri()
     }
 
-    /// 32-byte BLAKE3 hash of the content.
+    /// 32-byte BLAKE3 hash of the content. For Small (the only
+    /// variant the Python constructor produces today); v0.2 will
+    /// surface chunked manifests via a separate accessor.
     #[getter]
     fn hash<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.inner.hash)
+        let hash = self
+            .inner
+            .small_hash()
+            .expect("PyBlobRef constructor only produces Small variants");
+        PyBytes::new(py, hash)
     }
 
     #[getter]
     fn size(&self) -> u64 {
-        self.inner.size
+        self.inner.size()
     }
 
     /// Emit the wire-encoded form (discriminator + version + hash +
@@ -115,11 +121,16 @@ impl PyBlobRef {
     }
 
     fn __repr__(&self) -> String {
+        let hash = self
+            .inner
+            .small_hash()
+            .copied()
+            .unwrap_or([0; 32]);
         format!(
             "BlobRef(uri={:?}, size={}, hash={})",
-            self.inner.uri,
-            self.inner.size,
-            hex32(&self.inner.hash)
+            self.inner.uri(),
+            self.inner.size(),
+            hex32(&hash)
         )
     }
 }

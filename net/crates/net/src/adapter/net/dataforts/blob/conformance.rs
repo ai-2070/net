@@ -52,7 +52,7 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
     )
     .into_bytes();
     let hash: [u8; 32] = blake3::hash(&payload).into();
-    let blob = BlobRef::new(
+    let blob = BlobRef::small(
         format!("conformance://{}/payload", adapter.adapter_id()),
         hash,
         payload.len() as u64,
@@ -121,7 +121,9 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
     // of `tampered`. Every adapter must verify and refuse.
     let tampered: Vec<u8> = format!("tampered-{}", run_nonce).into_bytes();
     let tampered_hash: [u8; 32] = blake3::hash(&tampered).into();
-    if !tampered.is_empty() && tampered_hash != blob.hash {
+    if !tampered.is_empty()
+        && Some(&tampered_hash) != blob.small_hash()
+    {
         match adapter.store(&blob, &tampered).await {
             Err(BlobError::HashMismatch { .. }) => {}
             Ok(()) => {
@@ -132,9 +134,9 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
     }
 
     // fetch_range past end must error rather than silently truncate.
-    let past_end = blob.size + 1;
+    let past_end = blob.size() + 1;
     if adapter
-        .fetch_range(&blob, blob.size..past_end)
+        .fetch_range(&blob, blob.size()..past_end)
         .await
         .is_ok()
     {
@@ -146,7 +148,7 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
     let second_payload: Vec<u8> =
         format!("second-payload-{}-{}", std::process::id(), run_nonce).into_bytes();
     let second_hash: [u8; 32] = blake3::hash(&second_payload).into();
-    let second_blob = BlobRef::new(
+    let second_blob = BlobRef::small(
         format!("conformance://{}/second", adapter.adapter_id()),
         second_hash,
         second_payload.len() as u64,
@@ -195,7 +197,7 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
     // detect the suite by sentinel matching.
     ghost_hash[16..24].copy_from_slice(&(std::process::id() as u64).to_le_bytes());
     ghost_hash[24..32].copy_from_slice(b"NO-GHOST");
-    let ghost = BlobRef::new(
+    let ghost = BlobRef::small(
         format!("conformance://{}/ghost-{}", adapter.adapter_id(), run_nonce),
         ghost_hash,
         0,
