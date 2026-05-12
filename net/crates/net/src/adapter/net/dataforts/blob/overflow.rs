@@ -998,12 +998,24 @@ mod tests {
             .add_tag("dataforts.gravity.proximity=128")
     }
 
+    /// One recorded push call captured by the mock sink:
+    /// `(hash, size, target_node_id)`. Named so the type
+    /// stays readable in the `OverflowPushRecorder` field
+    /// + the `calls()` snapshot return.
+    type RecordedPushCall = ([u8; 32], u64, u64);
+
+    /// Shared call-log container the recorder mutates from
+    /// inside an `&self` push method. `Arc<Mutex<Vec<_>>>`
+    /// across clones so a test can hand a clone to the
+    /// sink + inspect from the test body.
+    type RecordedCallLog = Arc<parking_lot::Mutex<Vec<RecordedPushCall>>>;
+
     /// Recorder sink — records every push call's
-    /// `(hash, size, target)` tuple. The `fail` toggle lets
-    /// tests inject sink errors to exercise the
+    /// `(hash, size, target)` tuple. The `fail_count` toggle
+    /// lets tests inject sink errors to exercise the
     /// `push_errors` counter.
     struct OverflowPushRecorder {
-        calls: Arc<parking_lot::Mutex<Vec<([u8; 32], u64, u64)>>>,
+        calls: RecordedCallLog,
         fail_count: Arc<AtomicU64>,
     }
 
@@ -1015,7 +1027,7 @@ mod tests {
             }
         }
 
-        fn calls(&self) -> Vec<([u8; 32], u64, u64)> {
+        fn calls(&self) -> Vec<RecordedPushCall> {
             self.calls.lock().clone()
         }
     }
