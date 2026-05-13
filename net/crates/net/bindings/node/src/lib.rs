@@ -24,6 +24,11 @@ mod groups;
 mod identity;
 #[cfg(feature = "cortex")]
 mod mesh_rpc;
+// MeshDB query layer (Node SDK slice 1: factory AST + in-memory
+// ChainReader + async runner + Phase F cache options). Gated
+// behind the binding's `meshdb` Cargo feature.
+#[cfg(feature = "meshdb")]
+mod meshdb;
 #[cfg(feature = "net")]
 mod placement;
 #[cfg(feature = "redis")]

@@ -1227,6 +1227,176 @@ Cross-binding contract spec — including the canonical
 `cross_lang_echo_sum` service used by every binding's wire-format
 compat test — lives in [`../README.md#nrpc`](../README.md#nrpc).
 
+## MeshDB (federated query layer)
+
+MeshDB is the typed query layer above the RedEX / CortEX /
+capability-index substrate. The native binding builds with
+`--features meshdb`; MeshDB classes import from `@ai2070/net`.
+Architectural overview:
+[`../README.md#meshdb`](../README.md#meshdb).
+
+### Quick start
+
+```ts
+import {
+  InMemoryChainReader,
+  MeshQuery,
+  MeshQueryRunner,
+} from '@ai2070/net';
+
+const reader = new InMemoryChainReader();
+reader.append(0xabn, 1n, Buffer.from('v1'));
+reader.append(0xabn, 2n, Buffer.from('v2'));
+reader.append(0xabn, 3n, Buffer.from('v3'));
+
+const runner = new MeshQueryRunner(reader);
+
+// Atomic operator — emits the tip row.
+const stream = await runner.execute(MeshQuery.latest(0xabn));
+const rows = await stream.toArray();
+console.log(rows[0].seq, Buffer.from(rows[0].payload).toString());
+// 3n "v3"
+```
+
+`runner.execute(query)` returns a `Promise<MeshQueryStream>`;
+`.toArray()` drains the stream eagerly, `.next()` pulls one row
+at a time, and the `@ai2070/net/meshdb` re-export installs a
+`Symbol.asyncIterator` shim so `for await` works directly:
+
+```ts
+import '@ai2070/net/meshdb';  // installs the async-iterator shim
+import { MeshQuery, MeshQueryRunner } from '@ai2070/net';
+
+const stream = await runner.execute(MeshQuery.between(0xabn, 1n, 10n));
+for await (const row of stream as unknown as AsyncIterable<{ seq: bigint }>) {
+  console.log(row.seq);
+}
+```
+
+### Operator surface
+
+```ts
+import {
+  MeshQuery,
+  predicateEquals,
+  predicateAnd,
+  predicateNumericAtLeast,
+} from '@ai2070/net';
+
+// Fluent builder (common-ops shortcut).
+const query = MeshQuery.builder()
+  .between(0xabn, 1n, 100n)
+  .filter(
+    predicateAnd([
+      predicateEquals('severity', 'high'),
+      predicateNumericAtLeast('seq', 5),
+    ]),
+  )
+  .count(['origin'])
+  .build();
+
+// Or compose static factories directly.
+const between = MeshQuery.between(0xabn, 1n, 100n);
+const filtered = MeshQuery.filter(between, predicateEquals('severity', 'high'));
+const grouped = MeshQuery.count(filtered, ['origin']);
+```
+
+| Family | Factories / builder methods |
+|---|---|
+| Atomic | `MeshQuery.at`, `MeshQuery.between`, `MeshQuery.latest`, `MeshQuery.lineageEmit` |
+| Composite | `MeshQuery.filter`, `MeshQuery.window`, `MeshQuery.count`, `MeshQuery.sum/avg/min/max/percentile`, `MeshQuery.distinctCount`, `MeshQuery.join` |
+| Fluent builder | `MeshQuery.builder().<at|between|latest>(...).<filter|window|count|...>(...).build()` |
+| Predicate factories | `predicateExists`, `predicateEquals`, `predicateNumericAtLeast/AtMost/InRange`, `predicateStringPrefix/Matches`, `predicateSemverAtLeast`, `predicateAnd/Or/Not` |
+
+Field paths target row-intrinsic names (`"origin"` / `"seq"`) or
+dotted JSON-payload paths (`"a.b.c"`).
+
+### Sentinel row decoders
+
+Atomic rows expose `.payload` directly as `Uint8Array`. Composite
+rows carry postcard-encoded sentinel envelopes — decode via the
+module-level helpers:
+
+```ts
+import { decodeAggregate, decodeJoined, decodeWindow } from '@ai2070/net';
+
+const [aggRow] = await (
+  await runner.execute(MeshQuery.count(MeshQuery.between(0xabn, 1n, 4n)))
+).toArray();
+const result = decodeAggregate(aggRow);
+// { group: null, kind: 'count', value: 3, count: 3n }
+
+const [pair] = await (await runner.execute(joinQuery)).toArray();
+const joined = decodeJoined(pair);
+// { left: ResultRow|null, right: ResultRow|null }
+
+const [bucket] = await (await runner.execute(windowQuery)).toArray();
+const window = decodeWindow(bucket);
+// { start: bigint, end: bigint, rows: ResultRow[] }
+```
+
+Each decoder returns `null` for non-sentinel rows (atomic
+operator output), so callers branch on "did this row deserialise?"
+without a separate type query.
+
+### Phase F result cache
+
+Pass `enableCache: true` at runner construction; tune per-call via
+the optional second argument to `execute`:
+
+```ts
+import {
+  cachePolicyPermanent,
+  cachePolicyTimeBound,
+  MeshQueryRunner,
+} from '@ai2070/net';
+
+const runner = new MeshQueryRunner(reader, /* enableCache */ true);
+
+// Default — TimeBound TTL = 5 s (mirrors the join watermark).
+await runner.execute(query);
+
+// Explicit per-call policy.
+await runner.execute(query, { cachePolicy: cachePolicyPermanent() });
+await runner.execute(query, { cachePolicy: cachePolicyTimeBound(30) });
+await runner.execute(query, { bypassCache: true });
+```
+
+`cachePolicyPermanent()` is safe only when the query result is
+immutable under substrate semantics.
+
+### Lineage emit
+
+The SDK doesn't walk the `fork-of:` graph itself — callers supply
+pre-walked entries in walk order:
+
+```ts
+import { MeshQuery } from '@ai2070/net';
+
+const query = MeshQuery.lineageEmit(
+  0xaan,
+  [
+    { originHash: 0xaan, depth: 0, tipSeq: 5n },
+    { originHash: 0xbbn, depth: 1, tipSeq: 3n },
+    { originHash: 0xccn, depth: 2 }, // tipSeq omitted -> emits seq=0n
+  ],
+  'back',
+);
+// Compose with .at / .between to fetch event bodies per chain.
+```
+
+### Errors
+
+Every factory and runner method throws a plain `Error` whose
+`.message` carries a stable kind prefix on failure (planner /
+executor / invalid argument). The native binding pre-validates
+the AST at construction time, so most errors surface at the
+factory call rather than at `execute`.
+
+> **Note.** The `@ai2070/net-sdk` wrapper doesn't yet re-export
+> the MeshDB surface — import directly from `@ai2070/net` /
+> `@ai2070/net/meshdb`.
+
 ## Compute (daemons + migration)
 
 Run `MeshDaemon`s directly from TypeScript. `DaemonRuntime` owns

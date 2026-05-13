@@ -22,7 +22,7 @@
 //! Asserts: total arrivals across B and C equals N, both > 0
 //! (round-robin distributes work; no duplicates, no drops).
 
-#![cfg(feature = "net")]
+#![cfg(all(feature = "net", feature = "cortex"))]
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};

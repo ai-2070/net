@@ -230,13 +230,31 @@ enum RoutedRotationOutcome {
 
 /// Decide whether an inbound routed handshake is allowed to install
 /// new session keys for `peer_node_id`.
+///
+/// `new_ephemeral` is the initiator's ephemeral public key from msg1
+/// (first 32 bytes of the NKpsk0 wire payload, in the clear). When the
+/// existing session was built from msg1 with the SAME ephemeral the
+/// inbound msg1 is bit-for-bit a replay — a fresh responder ephemeral
+/// otherwise derives a NEW key pair every time, silently swapping
+/// session keys out from under the legitimate initiator. When the
+/// static matches but the ephemeral differs the same peer is
+/// legitimately re-initiating (fresh msg1 with a new ephemeral, which
+/// only the holder of the static + PSK can produce); accept the
+/// rotation.
 fn routed_rotation_outcome(
     existing: &PeerInfo,
     new_static: &[u8; 32],
+    new_ephemeral: &[u8; 32],
     session_timeout: Duration,
 ) -> RoutedRotationOutcome {
     if existing.remote_static_pub == *new_static {
-        return RoutedRotationOutcome::DropReplay;
+        // Same peer (by static). Distinguish exact-replay msg1
+        // from legitimate re-handshake using the initiator's
+        // ephemeral.
+        if existing.last_initiator_ephemeral.as_ref() == Some(new_ephemeral) {
+            return RoutedRotationOutcome::DropReplay;
+        }
+        return RoutedRotationOutcome::AcceptRotation;
     }
     if existing.session.is_timed_out(session_timeout) {
         RoutedRotationOutcome::AcceptRotation
@@ -806,6 +824,16 @@ struct PeerInfo {
     /// trusts. Zero-filled when the session was built without a real
     /// handshake (test paths).
     remote_static_pub: [u8; 32],
+    /// Initiator's Noise ephemeral public key from the msg1 that built
+    /// this session. NKpsk0 places this in the clear at the front of
+    /// msg1. The responder side records it here so the replay guard in
+    /// `routed_rotation_outcome` can distinguish a captured-and-
+    /// replayed msg1 (same E_i) from a legitimate re-handshake by the
+    /// same peer (fresh E_i). `None` when this `PeerInfo` was installed
+    /// from the INITIATOR side (where the field is moot — the rotation
+    /// gate only fires on the responder side) or from a test path
+    /// without a real handshake.
+    last_initiator_ephemeral: Option<[u8; 32]>,
 }
 
 /// In-flight initiator handshake. The dispatch loop consumes this when a
@@ -1977,6 +2005,9 @@ impl MeshNode {
                 addr: peer_addr,
                 session,
                 remote_static_pub,
+                // Initiator-side `connect`: replay-guard is a
+                // responder-side concern, leave empty.
+                last_initiator_ephemeral: None,
             },
         );
         self.addr_to_node.insert(peer_addr, peer_node_id);
@@ -2092,6 +2123,9 @@ impl MeshNode {
                 addr: peer_addr,
                 session,
                 remote_static_pub,
+                // `accept` runs before `start()`, so the routed-
+                // dispatch replay guard is moot; leave empty.
+                last_initiator_ephemeral: None,
             },
         );
         self.addr_to_node.insert(peer_addr, peer_node_id);
@@ -2387,12 +2421,21 @@ impl MeshNode {
         let shutdown_notify = self.shutdown_notify.clone();
 
         tokio::spawn(async move {
+            // `Duration::MAX` is the documented sentinel for
+            // "disable the loop". `tokio::time::interval(MAX)`
+            // panics under the hood (Instant + Duration::MAX
+            // overflows), so we skip the tick machinery entirely
+            // and just wait on shutdown.
+            if interval == Duration::MAX {
+                let _ = shutdown_notify.notified().await;
+                return;
+            }
             // `tokio::time::interval` panics on a zero period — guard
             // against a caller who set `capability_gc_interval` to
             // `Duration::ZERO` in `MeshNodeConfig`. A zero interval
             // isn't a sentinel for "disabled" (that's
-            // `Duration::MAX`), it's just pathological input; clamp
-            // to 1 s (see `nonzero_interval` for the rationale).
+            // `Duration::MAX`, handled above); it's just pathological
+            // input; clamp to 1 s (see `nonzero_interval`).
             let mut tick = tokio::time::interval(nonzero_interval(interval));
             // First tick fires immediately; skip it so we don't GC
             // empty state before any announcements have landed.
@@ -2436,6 +2479,17 @@ impl MeshNode {
         let shutdown_notify = self.shutdown_notify.clone();
 
         tokio::spawn(async move {
+            // `Duration::MAX` is the documented sentinel for
+            // "disable the periodic sweep" — callers rely on
+            // the lazy expiry check in `publish` instead.
+            // `tokio::time::interval(Duration::MAX)` panics
+            // when its `Instant::now() + period` overflows, so
+            // we skip the tick machinery entirely and just wait
+            // for shutdown.
+            if interval == Duration::MAX {
+                let _ = shutdown_notify.notified().await;
+                return;
+            }
             // Same zero-guard as `spawn_capability_gc_loop` —
             // tokio panics if the period is zero.
             let mut tick = tokio::time::interval(nonzero_interval(interval));
@@ -2908,6 +2962,22 @@ impl MeshNode {
                     return;
                 }
             };
+        // Capture the initiator's ephemeral (first 32 bytes of
+        // NKpsk0 msg1, in the clear) BEFORE read_message
+        // consumes the wire bytes. The replay guard in
+        // `routed_rotation_outcome` matches both static and
+        // ephemeral; same static + same ephemeral = exact replay
+        // (passive attacker resending captured bytes); same
+        // static + fresh ephemeral = legitimate re-handshake.
+        if parsed.payload.len() < 32 {
+            tracing::warn!(
+                "routed handshake: msg1 too short ({}); NKpsk0 msg1 must carry a 32-byte ephemeral prefix",
+                parsed.payload.len()
+            );
+            return;
+        }
+        let mut initiator_ephemeral = [0u8; 32];
+        initiator_ephemeral.copy_from_slice(&parsed.payload[..32]);
         let msg1_payload = match noise.read_message(&parsed.payload) {
             Ok(p) => p,
             Err(e) => {
@@ -3025,13 +3095,18 @@ impl MeshNode {
         let remote_static_pub = keys.remote_static_pub;
         match ctx.peers.entry(peer_node_id) {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                match routed_rotation_outcome(occ.get(), &remote_static_pub, ctx.session_timeout) {
+                match routed_rotation_outcome(
+                    occ.get(),
+                    &remote_static_pub,
+                    &initiator_ephemeral,
+                    ctx.session_timeout,
+                ) {
                     RoutedRotationOutcome::DropReplay => {
                         tracing::warn!(
                             peer_node_id,
                             "routed handshake: dropping msg1 — live session already \
                              established for this peer with matching remote_static_pub \
-                             (replay guard)"
+                             AND identical initiator ephemeral (replay guard)"
                         );
                         return;
                     }
@@ -3057,6 +3132,7 @@ impl MeshNode {
                             addr: source,
                             session,
                             remote_static_pub,
+                            last_initiator_ephemeral: Some(initiator_ephemeral),
                         });
                     }
                 }
@@ -3073,6 +3149,7 @@ impl MeshNode {
                     addr: source,
                     session,
                     remote_static_pub,
+                    last_initiator_ephemeral: Some(initiator_ephemeral),
                 });
             }
         }
@@ -8055,6 +8132,9 @@ impl MeshNode {
                 addr: relay_addr,
                 session,
                 remote_static_pub,
+                // Initiator-side `connect_via`: responder-side
+                // replay guard doesn't read this; leave empty.
+                last_initiator_ephemeral: None,
             },
         );
         self.peer_addrs.insert(dest_node_id, relay_addr);
@@ -9425,6 +9505,7 @@ mod heartbeat_aead_tests {
                 addr: next_hop,
                 session,
                 remote_static_pub: [0u8; 32],
+                last_initiator_ephemeral: None,
             },
         );
         peer_addrs.insert(peer_id, next_hop);
@@ -9480,6 +9561,7 @@ mod heartbeat_aead_tests {
                 addr: next_hop,
                 session,
                 remote_static_pub: [0u8; 32],
+                last_initiator_ephemeral: None,
             },
         );
         peer_addrs.insert(peer_id, next_hop);
@@ -9536,6 +9618,7 @@ mod heartbeat_aead_tests {
                 addr: fresh,
                 session,
                 remote_static_pub: [0u8; 32],
+                last_initiator_ephemeral: None,
             },
         );
         peer_addrs.insert(peer_id, fresh);
@@ -9761,20 +9844,49 @@ mod heartbeat_aead_tests {
     /// session's keys aren't overwritten by NKpsk0's fresh-ephemeral
     /// reply.
     #[test]
-    fn routed_rotation_outcome_drops_replay_for_matching_static() {
+    fn routed_rotation_outcome_drops_replay_for_matching_static_and_ephemeral() {
         let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         let static_a = [0xAAu8; 32];
+        let ephemeral_a = [0xCCu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
             addr,
             session,
             remote_static_pub: static_a,
+            last_initiator_ephemeral: Some(ephemeral_a),
         };
         assert_eq!(
-            routed_rotation_outcome(&info, &static_a, Duration::from_secs(30)),
+            routed_rotation_outcome(&info, &static_a, &ephemeral_a, Duration::from_secs(30)),
             RoutedRotationOutcome::DropReplay,
+        );
+    }
+
+    /// Regression for the pass-2 follow-up: a routed msg1 with the
+    /// SAME static but a DIFFERENT ephemeral is a legitimate
+    /// re-handshake from the same peer (only the static + PSK
+    /// holder can produce a fresh ephemeral). Pre-fix the gate
+    /// flagged this as a replay and refused — breaking the
+    /// `connect_direct` retarget path. AcceptRotation now.
+    #[test]
+    fn routed_rotation_outcome_accepts_reinit_with_fresh_ephemeral() {
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        let static_a = [0xAAu8; 32];
+        let ephemeral_old = [0xCCu8; 32];
+        let ephemeral_new = [0xDDu8; 32];
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            addr,
+            session,
+            remote_static_pub: static_a,
+            last_initiator_ephemeral: Some(ephemeral_old),
+        };
+        assert_eq!(
+            routed_rotation_outcome(&info, &static_a, &ephemeral_new, Duration::from_secs(30)),
+            RoutedRotationOutcome::AcceptRotation,
         );
     }
 
@@ -9796,10 +9908,12 @@ mod heartbeat_aead_tests {
             addr,
             session,
             remote_static_pub: [0xAAu8; 32],
+            last_initiator_ephemeral: Some([0xCCu8; 32]),
         };
         let new_static = [0xBBu8; 32];
+        let new_ephemeral = [0xDDu8; 32];
         assert_eq!(
-            routed_rotation_outcome(&info, &new_static, Duration::from_secs(30)),
+            routed_rotation_outcome(&info, &new_static, &new_ephemeral, Duration::from_secs(30),),
             RoutedRotationOutcome::RefuseFresh,
         );
     }
@@ -9820,14 +9934,16 @@ mod heartbeat_aead_tests {
             addr,
             session,
             remote_static_pub: [0xAAu8; 32],
+            last_initiator_ephemeral: Some([0xCCu8; 32]),
         };
         // Wait past a 1 ms session_timeout. `current_timestamp()`
         // uses wall-clock `SystemTime::now()` so a real sleep
         // advances it.
         std::thread::sleep(Duration::from_millis(5));
         let new_static = [0xBBu8; 32];
+        let new_ephemeral = [0xDDu8; 32];
         assert_eq!(
-            routed_rotation_outcome(&info, &new_static, Duration::from_millis(1)),
+            routed_rotation_outcome(&info, &new_static, &new_ephemeral, Duration::from_millis(1),),
             RoutedRotationOutcome::AcceptRotation,
         );
     }

@@ -1544,6 +1544,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-meshdb-ffi"
+version = "0.15.0"
+dependencies = [
+ "ai2070-net",
+ "futures",
+ "postcard",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "net-node"
 version = "0.15.0"
 dependencies = [
@@ -1558,6 +1569,7 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "postcard",
  "serde_json",
  "tokio",
  "xxhash-rust",
@@ -1574,6 +1586,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hex",
+ "postcard",
  "pyo3",
  "pyo3-build-config",
  "serde_json",

@@ -2599,6 +2599,16 @@ pub struct CapabilityIndex {
     /// See the docstring on `by_origin_hash` for the DoS surface
     /// this counter surfaces. Read via [`Self::collision_count`].
     origin_hash_collisions: AtomicU64,
+    /// Monotonic mutation version. Incremented on every
+    /// [`Self::index`], [`Self::remove`], and [`Self::gc`] call
+    /// — i.e. anything that can change observable capability
+    /// state. Read via [`Self::version`]; used by the MeshDB
+    /// result cache to pull-invalidate stale entries (per the
+    /// MeshDB plan's locked decision #4). Per design we bump
+    /// aggressively: if a workload sees too many invalidations
+    /// the fix is `bypass_cache` or `CachePolicy::Permanent` on
+    /// the affected queries, not softening this bump.
+    mutation_version: AtomicU64,
 }
 
 impl CapabilityIndex {
@@ -2618,7 +2628,16 @@ impl CapabilityIndex {
             index_count: AtomicU64::new(0),
             query_count: AtomicU64::new(0),
             origin_hash_collisions: AtomicU64::new(0),
+            mutation_version: AtomicU64::new(0),
         }
+    }
+
+    /// Monotonic mutation version. Bumps on every `index` /
+    /// `remove` / `gc` call. The MeshDB result cache snapshots
+    /// this at plan time and compares on lookup; any divergence
+    /// is treated as a cache miss (pull-based invalidation).
+    pub fn version(&self) -> u64 {
+        self.mutation_version.load(Ordering::Acquire)
     }
 
     /// Index a capability announcement.
@@ -2728,6 +2747,7 @@ impl CapabilityIndex {
         }
 
         self.index_count.fetch_add(1, Ordering::Relaxed);
+        self.mutation_version.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Remove node from index
@@ -2756,6 +2776,7 @@ impl CapabilityIndex {
         if let Entry::Occupied(e) = version_entry {
             e.remove();
         }
+        self.mutation_version.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Add node to inverted indexes.
@@ -3675,6 +3696,55 @@ mod tests {
             .add_tag("inference")
             .add_tag("gpu")
             .with_limits(ResourceLimits::new().with_max_concurrent(10))
+    }
+
+    #[test]
+    fn version_bumps_on_index_remove_and_gc() {
+        // Phase F locked decision: every mutation bumps the
+        // mutation_version monotonically. The MeshDB cache
+        // pull-invalidates on any divergence.
+        let index = CapabilityIndex::new();
+        assert_eq!(index.version(), 0);
+
+        let entity = super::super::super::identity::EntityId::from_bytes([7u8; 32]);
+        index.index(CapabilityAnnouncement::new(
+            1u64,
+            entity,
+            1,
+            sample_capability_set(),
+        ));
+        let after_first_index = index.version();
+        assert!(after_first_index >= 1);
+
+        index.index(CapabilityAnnouncement::new(
+            2u64,
+            super::super::super::identity::EntityId::from_bytes([8u8; 32]),
+            1,
+            sample_capability_set(),
+        ));
+        let after_second_index = index.version();
+        assert!(after_second_index > after_first_index);
+
+        index.remove(1u64);
+        let after_remove = index.version();
+        assert!(after_remove > after_second_index);
+
+        // gc delegates to remove; if the entries are still
+        // alive (we haven't aged them out) nothing happens.
+        // So set a TTL-zero announcement and gc to confirm
+        // the bump path covers gc-induced removes too.
+        let mut ann = CapabilityAnnouncement::new(
+            3u64,
+            super::super::super::identity::EntityId::from_bytes([9u8; 32]),
+            1,
+            sample_capability_set(),
+        );
+        ann.ttl_secs = 0;
+        index.index(ann);
+        let after_zero_ttl_index = index.version();
+        assert!(after_zero_ttl_index > after_remove);
+        index.gc();
+        assert!(index.version() > after_zero_ttl_index);
     }
 
     #[test]

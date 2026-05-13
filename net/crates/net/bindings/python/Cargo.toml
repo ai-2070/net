@@ -42,6 +42,11 @@ nat-traversal = ["net", "net/nat-traversal"]
 # on `nat-traversal`.
 port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk", "dep:async-trait"]
+# MeshDB query layer — federated AST + planner + executor + result cache.
+# Standalone of the `net` feature: the Python SDK's first MeshDB slice
+# ships a local executor over an in-memory ChainReader, so it doesn't
+# require the mesh's transport surface to be compiled.
+meshdb = ["net/meshdb", "dep:postcard"]
 # Dataforts surface (Rebel Yell) — compile the operator
 # methods that wire greedy-LRU + data-gravity + future phases.
 # Toggling between greedy / gravity / future phases is a
@@ -75,6 +80,11 @@ hex = { version = "0.4", optional = true }
 # same #[async_trait] macro the trait was defined with. Optional +
 # cortex-gated so non-cortex builds don't pull it in.
 async-trait = { version = "0.1", optional = true }
+# Postcard is the canonical MeshDB wire codec; the Python binding
+# decodes `AggregateRowPayload` / `JoinedRowPayload` /
+# `WindowBoundary` payloads from result-row bytes. Pulled in only
+# when the `meshdb` feature activates.
+postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
 
 [build-dependencies]
 pyo3-build-config = "0.28.0"

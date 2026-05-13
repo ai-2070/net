@@ -19,6 +19,8 @@ pub mod context;
 pub mod dataforts_capabilities;
 pub mod diff;
 pub mod loadbalance;
+#[cfg(feature = "meshdb")]
+pub mod meshdb;
 pub mod metadata;
 pub mod placement;
 pub mod placement_registry;

@@ -23,6 +23,12 @@ mod identity;
 // handler support lands as a follow-up phase.
 #[cfg(feature = "cortex")]
 mod mesh_rpc;
+// MeshDB query layer (Python SDK slice 1: factory AST +
+// in-memory ChainReader + sync runner). Gated behind the
+// crate's own `meshdb` Cargo feature so non-MeshDB builds
+// stay slim.
+#[cfg(feature = "meshdb")]
+mod meshdb;
 #[cfg(feature = "net")]
 mod placement;
 #[cfg(feature = "redis")]
@@ -2315,6 +2321,23 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<groups::PyForkGroup>()?;
         m.add_class::<groups::PyStandbyGroup>()?;
         m.add("GroupError", m.py().get_type::<groups::GroupError>())?;
+    }
+    #[cfg(feature = "meshdb")]
+    {
+        m.add_class::<meshdb::PyMeshQuery>()?;
+        m.add_class::<meshdb::PyResultRow>()?;
+        m.add_class::<meshdb::PyExecuteOptions>()?;
+        m.add_class::<meshdb::PyCachePolicy>()?;
+        m.add_class::<meshdb::PyInMemoryChainReader>()?;
+        m.add_class::<meshdb::PyMeshQueryRunner>()?;
+        m.add_class::<meshdb::PyAggregateResult>()?;
+        m.add_class::<meshdb::PyGroupKey>()?;
+        m.add_class::<meshdb::PyJoinedRow>()?;
+        m.add_class::<meshdb::PyWindowBoundary>()?;
+        m.add_class::<meshdb::PyLineageEntry>()?;
+        m.add_class::<meshdb::PyPredicate>()?;
+        m.add_class::<meshdb::PyQueryBuilder>()?;
+        m.add("MeshDbError", m.py().get_type::<meshdb::MeshDbError>())?;
     }
     Ok(())
 }

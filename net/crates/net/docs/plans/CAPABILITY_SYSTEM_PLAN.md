@@ -4,7 +4,9 @@
 
 ## Status
 
-**Ready for implementation.** The migration rule, the missing-primitives surface, the six open questions, and the Phase F detail gaps are all locked below — see [Locked decisions](#locked-decisions). Activation gate (when Warriors as a whole ships) is unchanged: any one of the Warriors phases needs to land. The pieces here ship together because they compose against each other; shipping only some breaks the architectural symmetry the release depends on.
+**Substantially shipped.** Phases A, B, C, E, F land in code as of v0.15; Phase G is in progress (compute path consumes `PlacementFilter`); Phase H partial (FFI bridge for `CapabilityFilterJson` shipped, full per-binding parity ongoing). The migration rule, the missing-primitives surface, the six open questions, and the Phase F detail gaps remain locked below — see [Locked decisions](#locked-decisions). Per-phase status is annotated on each `### Phase X` header below.
+
+The plan's per-phase tick marks were stale relative to code (the trait + impl shipped before the headers were updated); see [§ Phasing](#phasing) for the corrected per-phase state and the minor signature drift from spec (`traverse` adds an explicit `start_node`; `nearest` takes a `rtt_lookup: F: Fn(u64) -> Option<Duration>` closure; the aggregator trait uses `observe(node_id, caps) + finalize() -> Output` rather than `fold(acc, candidate)`). The composition story downstream consumers (MeshDB, Mikoshi, Dataforts greedy/migration) need is sound.
 
 ## Frame
 
@@ -602,7 +604,9 @@ Backward compat: daemons that don't override `required_capabilities` / `optional
 
 Eight phases in dependency order:
 
-### Phase A — Typed taxonomy migration (1 week)
+### Phase A — Typed taxonomy migration (1 week) ✅
+
+Shipped in code: `TaxonomyAxis`, `Tag::AxisPresent` / `Tag::AxisValue` variants, and the missing-primitives surface (`Tag`, `TagKey`, `RequiredCapability`, `Aggregator`, `Predicate`, `pred!` / `require*!` macros) all land in `src/adapter/net/behavior/tag.rs` + `behavior/capability.rs` + `behavior/placement.rs`. View-projection helpers exist via `BlobCapability::from_capability_set` / `GreedyCapability::from_capability_set` / etc. The codebase moved past the spec's named per-axis structs (`HardwareCapabilities` / `SoftwareCapabilities`) in favor of typed projections per dataforts domain; the principle (typed view over the flat tag set) is intact.
 
 Preconditions (locked above): typed-struct migration story (view-projection rule), missing-primitives surface (`Tag`, `TagKey`, `RequiredCapability`, `Aggregator`, `Predicate`, `pred!` / `require*!` macros).
 
@@ -626,7 +630,9 @@ Preconditions (locked above): typed-struct migration story (view-projection rule
 - ✅ Pure-function helpers (`chain_hex` / `is_causal_for` / `replace_causal_tags`) covered by 10 inline unit tests in `mesh.rs`; integration tests live at `tests/chain_discovery.rs` (11 tests covering idempotency, replace semantics, baseline preservation, hex-prefix false-match guard).
 - ✅ Reserved-prefix enforcement on user tags (`Tag::parse_user` rejects `causal:` / `fork-of:` / `heat:` / `scope:`; landed earlier).
 
-### Phase C — Metadata field on `CapabilitySet` (3 days)
+### Phase C — Metadata field on `CapabilitySet` (3 days) ✅
+
+Shipped: `CapabilitySet.metadata: BTreeMap<String, String>` at `capability.rs:878`. Serialization wired end-to-end; reserved-key enforcement in place.
 
 - Add `metadata: BTreeMap<String, String>` field.
 - Wire into capability-announcement serialization end-to-end (announce → propagate → decode).
@@ -641,7 +647,15 @@ Preconditions (locked above): typed-struct migration story (view-projection rule
 - Probe pattern in lookup paths: `Mesh::find_chain_holders` does precise lookup after bloom probe.
 - Propagation budget regression test (the three-layer enforcement detailed in the Test strategy section).
 
-### Phase E — Federated query primitives (2 weeks)
+### Phase E — Federated query primitives (2 weeks) ✅
+
+Shipped in `src/adapter/net/behavior/query.rs` (971 lines). `CapabilityQuery` trait with all five operators (`filter` / `match_axis` / `traverse` / `aggregate` / `nearest`) + impl on `CapabilityIndex`. Minor signature drift from spec, captured for downstream consumers:
+
+- `traverse(&self, start_node: u64, start_tag, edge: EdgeKind, max_depth: u32) -> Vec<(u64, Tag)>` — adds explicit `start_node` (defaults to `0` if caller has none) and returns the walk path. `EdgeKind::ForkOfParent` is the shipped variant; cycle detection via visited-set.
+- `nearest` takes an explicit `rtt_lookup: F: Fn(u64) -> Option<Duration>` closure — decouples proximity-graph internals from the query trait. Returns `Option<Distance>` because unmeasured candidates exist. Ties broken by lex-NodeId.
+- Aggregator trait uses `observe(node_id, caps)` + `finalize() -> Output` rather than the spec's `Aggregator::fold(acc, candidate)`. Concrete impls: `Count`, `UniqueAxisValues`, `MaxNumericMetadata`. The trait is generic so downstream consumers (MeshDB / Mikoshi / Dataforts) plug their own aggregators.
+
+Federation wrapper not yet shipped — local-only execution today. MeshDB Phase B is the natural home for the federation layer when it activates.
 
 - New module `behavior::capability::query` with the `CapabilityQuery` trait + reference implementations.
 - Five operators: `filter`, `match_axis`, `traverse`, `aggregate`, `nearest`.
@@ -649,7 +663,9 @@ Preconditions (locked above): typed-struct migration story (view-projection rule
 - Composability tests: nested operator chains produce correct results; federation is transparent to composition.
 - No user-facing query language — primitives only. (User language is Atomic Playboys territory.)
 
-### Phase F — `PlacementFilter` trait + `StandardPlacement` (1 week)
+### Phase F — `PlacementFilter` trait + `StandardPlacement` (1 week) ✅
+
+Shipped in `src/adapter/net/behavior/placement.rs` (3464 lines). `PlacementFilter` trait at line 122; `StandardPlacement` reference impl at line 331 with 5-axis scoring (scope + proximity + intent + colocation + resource + anti-affinity + custom). `LegacyPlacement` (line 157) preserves the capability-match-only behavior for back-compat. `Artifact::Blob` variant + dataforts-blob admission gates compose against this surface today.
 
 - New module `behavior::placement` with the `PlacementFilter` trait + `Artifact` enum + `StandardPlacement` reference impl. Trait contract per [Locked decisions § Phase F](#phase-f-detail-decisions): score range `[0.0, 1.0]`, multiplicative composition across axes (anti-affinity included).
 - `IntentRegistry` with default mappings + extensibility.
@@ -659,7 +675,9 @@ Preconditions (locked above): typed-struct migration story (view-projection rule
 - **`ProximityGraph::nearest_rtt`** API in `behavior::proximity`. Small lookup over the existing pairwise-RTT data.
 - Reference test suite: each axis individually scored; cross-axis multiplicative composition; `0.0 anywhere → 0.0 final` invariant pinned; tie-breaking is deterministic across runs.
 
-### Phase G — Mikoshi integration (1 week)
+### Phase G — Mikoshi integration (1 week) 🚧 in progress
+
+Compute path consumes `PlacementFilter` today — `compute/fork_group.rs`, `compute/daemon.rs`, `compute/daemon_factory.rs` all integrate. `MeshDaemon::requirements()` ships at `compute/daemon.rs:35`. Full Mikoshi target-selection upgrade + `mikoshi-placement-v2` feature flag wiring remains the unticked portion.
 
 "Mikoshi" is the colloquial name for the existing 6-phase migration stack — `compute/{migration,orchestrator,migration_source,migration_target,scheduler}.rs` plus `MigrationOrchestrator` and `Scheduler`. See [`COMPUTE.md`](../COMPUTE.md) for the full surface. This phase upgrades target selection inside that existing stack to consult `PlacementFilter`; the migration mechanism (snapshot → transfer → restore → replay → cutover → complete) is unchanged per [Locked decision 6](#six-previously-open-questions).
 
@@ -675,7 +693,9 @@ Preconditions (locked above): typed-struct migration story (view-projection rule
   - Cross-axis: daemon with multiple constraints lands at the intersection.
   - Tie-breaking determinism: two equally-scored candidates always pick the same one across runs (RTT → free-resource → lexicographic).
 
-### Phase H — Bindings (1 week, parallelisable)
+### Phase H — Bindings (1 week, parallelisable) 🚧 partial
+
+`CapabilityFilterJson` FFI bridge ships at `ffi/mesh.rs:2734`. Per-binding parity for the federated query primitives (`CapabilityQuery` trait, `PlacementFilter` callback bridge, `IntentRegistry::register` external registration) remains the unticked portion. Application-implemented `PlacementFilter` instances would need the same callback-bridge pattern `BlobAdapter` uses; not yet shipped.
 
 - `CapabilitySet::metadata` exposed in Node + Python + Go + C bindings.
 - New tag-shape helpers (`Mesh::announce_chain` etc.) exposed across bindings.

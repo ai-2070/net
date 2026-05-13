@@ -4,9 +4,36 @@
 
 ## Status
 
-Design only. Activation gate: a workload that genuinely needs distributed queries beyond what local CortEX + the Warriors-shipped primitives satisfy. Realistic triggers: incident-investigation tooling that needs cross-site joins; replay debugging on retained chain history; aggregate analytics over a fleet of operators; lineage-aware audit + compliance reporting; AI-trained-on-mesh-data fine-tuning that needs to query across forked experiments.
+**Phases A, C, D, E, F shipped behind the `meshdb` Cargo feature; Phase B is partial — federated executor in code, wire-subprotocol dispatch hookup outstanding.** AST, planner, local + federated executors, wire protocol envelopes, lineage walks, hash + sort-merge joins (row-intrinsic + payload-keyed, all four kinds), Count / Sum / Avg / Min / Max / DistinctCountExact / PercentileExact aggregates, Filter via synthetic-tag PredicateWire eval, tumbling-on-seq windowing, and the single-node LRU result cache with pull-based capability-version invalidation are all in code. Phase B's `FederatedMeshQueryExecutor` ships with a `LoopbackTransport` for integration tests; the real wire-side hookup that registers `SUBPROTOCOL_MESHDB` on `MeshNode` is the load-bearing remaining work to move federation out of test-only loopback. Other open items are bounded follow-ups: HLL p=14 / T-Digest c=100 sketch implementations behind `DistinctCountHll` / `PercentileTDigest`, and language bindings beyond the Python / Node / Go / C shims already shipped.
 
-This phase is the heaviest one in the deferred-work surface — multiple months of design work before implementation starts, and the design space is genuinely open. **Do not start without a concrete consumer.** Premature MeshDB is exactly the kind of substrate-engineering ego-spending that this plan is structured to avoid until activation.
+**Shipped surface** (gated behind `#[cfg(feature = "meshdb")]` at `src/adapter/net/behavior/meshdb/`):
+
+- **Phase A — AST + planner skeleton.** `MeshQuery::V1(QueryV1)` versioned outer enum with 10 operator variants (At / Between / Latest / Lineage{Back,Forward} / Join / Filter / Aggregate / Project / OrderBy). Postcard + JSON round-trippable. `MeshQueryPlanner` translates atomic operators to typed `ExecutionPlan`s; composite operators wrap their planned children in `NotYetImplemented` placeholders so the tree still type-checks. (`query.rs`, `planner.rs`, `error.rs`.)
+- **Phase B — Time-travel end-to-end.** 🚧 Partial: substrate complete, real wire-side hookup outstanding. Replica-aware routing via `CausalClaim` parsing of the three `causal:` tag forms (Presence / Tip / Range); proximity-ordered targets with most-specific-claim wins; `HistoricalRangeUnavailable` with per-replica available-range hints. `MeshQueryExecutor` async trait + `LocalMeshQueryExecutor<R: ChainReader>` walks atomic plans against a pluggable `ChainReader`. Wire protocol envelopes (`SUBPROTOCOL_MESHDB = 0x0F00`, `MeshDbRequest::{Execute, Resume, Cancel}`, `MeshDbResponse::{Batch, End, Error}`, `ResultBatch`, `ContinuationToken`) — defined; not yet registered on `MeshNode`'s subprotocol dispatch. `FederatedMeshQueryExecutor<T: MeshDbTransport>` fans atomic operators out with NoRoute failover; `LoopbackTransport` drives 3-node integration tests in-process. Cooperative cancellation via `QueryHandle::cancel`. (`executor.rs`, `protocol.rs`, `federated.rs`.)
+- **Phase C — Lineage walks via `fork-of:` graph.** `OperatorPlan::LineageEmit { origin, direction, entries }` carries a materialized walk result. The planner walks the local capability-index snapshot at plan time (`parent_of` for back; BFS `children_of` lex-sorted for forward), with explicit visited-set cycle detection (`LineageCycleDetected`) and depth bounds (`LineageMaxDepthExceeded`). The executor emits one `ResultRow` per entry — payload empty; callers compose with `At` / `Between` for full event content. The federated executor handles `LineageEmit` locally (no remote dispatch needed; the walk already happened). (`planner.rs`, `executor.rs`, `federated.rs`.)
+- **Phase D-1 — Inner hash-join on row-intrinsic keys.** `OperatorPlan::HashJoin { left, right, key_mode, kind, watermark }` with `JoinKeyMode::{Origin, Seq, OriginSeq}` for the join-key extraction modes Phase D-1 supports. The planner derives the mode from the `JoinKey` and surfaces `PlannerError` for payload-keyed or mismatched-field joins (deferred to Phase E). Both local and federated executors implement build-on-left / probe-on-right; the federated path recurses through itself so atomic leaves still dispatch via the transport. Joined rows are sentinel `ResultRow`s (`origin=0`, `seq=0`) whose payload is a postcard-encoded `JoinedRowPayload { left, right }`. `JoinMemoryExceeded` surfaces at the 256-MiB build-side bound.
+- **Phase D-2 — Outer hash-joins + sort-merge + payload-keyed joins.** All four `JoinKind`s ship (Inner / LeftOuter / RightOuter / FullOuter). `JoinKeyMode::Field(String)` extends the join key surface to JSON payload paths via `row::extract_string_projection`; `try_encode_join_key` returns `Option<Vec<u8>>` so rows whose key field can't be resolved are silently dropped from both sides. `JoinStrategy::{HashBroadcast, SortMerge}` lets the planner pick between in-memory hashing (default; trips `JoinMemoryExceeded` past the bound) and sort-merge (sort both sides + two-pointer walk; memory-bounded by the inputs). Watermark is informational under snapshot semantics; streaming activation needs Phase F+.
+- **Phase E — Filter + the aggregate surface + tumbling windows.**
+  - **E-1 Count.** `OperatorPlan::AggregateCount` over row-intrinsic group keys (`origin`, `seq`, `(origin, seq)`).
+  - **E-2 Filter.** Reuses the Capability System's `PredicateWire` via `row::synthetic_row_view`: every `ResultRow` projects to a synthetic `(Vec<Tag>, BTreeMap)` with `dataforts.origin`, `dataforts.seq`, and flat JSON-object payload fields. Non-JSON payloads are opaque; predicates against missing fields simply don't match.
+  - **E-3 Sum / Avg.** `OperatorPlan::AggregateNumeric` over `row::extract_numeric` (JSON path → `f64`). Rows whose field fails to resolve are skipped; `Avg(None)` covers the empty-group case.
+  - **E-4 Min / Max / DistinctCountExact / PercentileExact.** `OperatorPlan::AggregateReduction` (Min / Max / nearest-rank percentile via `f64::total_cmp`) + `OperatorPlan::AggregateDistinct` (canonical-string projection into a per-group `BTreeSet`). The HLL p=14 / T-Digest c=100 sketch variants remain `PlannerError` until a consumer drives the algorithmic complexity; the exact variants are the recommended path.
+  - **E-5 Window.** `QueryV1::Window { inner, spec: WindowSpec::TumblingSeq { size } }` buckets rows into fixed-size half-open intervals on `seq`; the executor emits one sentinel `ResultRow` per non-empty bucket with a postcard-encoded `WindowBoundary { start, end, rows }`. Sliding + session windows extend cleanly via additional `WindowSpec` variants when a consumer drives the shape.
+- **Phase F — Single-node LRU result cache.** Ships per the locked Phase F decisions:
+  - **Global cache version, no query-shape classification.** `CapabilityIndex` carries an `AtomicU64 mutation_version` that bumps on every `index` / `remove` / `gc` mutation. The MeshDB cache pull-invalidates: lookups encode the live version into the key (`CacheKey { plan_hash, capability_version }`); any divergence misses. Aggressive invalidation by design — softening it is not the answer to churn, the bypass flag is.
+  - **Default `CachePolicy::TimeBound { ttl: 5s }`** — mirrors the locked-decision-#2 join watermark. `Permanent` is the explicit-opt-in policy for queries over closed substrate ranges (`At`, bounded `Between`).
+  - **`ExecuteOptions::bypass_cache`** skips both lookup and writeback (Deck operator-view authoritative reads; Hermes skill-routing under churn; diagnostics).
+  - **Hand-rolled LRU** — `HashMap` + intrusive doubly-linked list over a `Vec<Node>`. Defaults: `LRU_MAX_ENTRIES = 1024`, `LRU_MAX_BYTES = 256 MiB`; either bound trips eviction of the LRU end. SipHash via `DefaultHasher` over postcard-encoded plan bytes; no new external dependency.
+  - **Top-level only.** Sub-plan executes inside the federated path bypass the cache; recursive caching at HashJoin sides / Aggregate inner is a follow-up if profiling justifies the bookkeeping.
+- **Spec correction during B-1.** `ChainRef::OriginHash` + `ResultRow.origin` are `u64` (16-char hex), not `[u8; 32]` — the original plan was wrong about origin width; substrate uses `u64` throughout.
+
+**Substrate prereqs** (unchanged — all in code):
+
+- **Capability System primitives** — `filter` / `match_axis` / `traverse` / `aggregate` / `nearest` ship as the `CapabilityQuery` trait with a reference impl on `CapabilityIndex` (`src/adapter/net/behavior/query.rs`). `fork-of:` is emitted via `CapabilitySet::from_fork` (`capability.rs:1093`), reserved-prefix-enforced at `tag.rs:126`, walked by `traverse` with cycle detection. Minor signature drift from this plan: `traverse` takes an explicit `start_node`, `nearest` takes an `rtt_lookup` closure, the aggregator trait uses `observe / finalize` instead of `fold`.
+- **`REDEX_DISTRIBUTED_PLAN.md`** — all phases shipped; replication makes time-travel queries tractable today.
+- **`CORTEX_ADAPTER_PLAN.md`** — shipped and exceeds spec; `CortexAdapter<State>` + `RedexFold<State>` + `watch` / `snapshot_and_watch` / `changes_with_lag()` all in code.
+
+**Remaining work** is bounded follow-ups, all consumer-driven: HLL p=14 / T-Digest c=100 sketch implementations behind `DistinctCountHll` / `PercentileTDigest` (the exact variants ship today); the wire-subprotocol dispatch hookup that registers `SUBPROTOCOL_MESHDB` on `MeshNode` (the federated executor exists; only the wire-side framing remains to move it out of test-only loopback); language bindings beyond Rust. Net-new surfaces (push-down fold-on-relay; streaming activation of the watermark on Window-joined sub-trees; sub-plan caching) come with their respective consumers.
 
 ## Frame
 
@@ -407,21 +434,141 @@ Six phases, in dependency order. Each is gated by activation of the workload tha
 
 ---
 
-## Open design questions to lock before implementation
+## Locked decisions
 
-1. **AST stability across versions.** As MeshDB evolves, the `MeshQuery` enum will gain variants. How do we handle forward/backward compatibility for serialized queries? **Recommendation:** version the AST explicitly (`MeshQuery::V1(QueryV1)` style); reject unknown versions cleanly; never silently drop fields.
+All seven open design questions ratified. Each item describes the decision, the contract the implementation must hold, and the rationale.
 
-2. **Default join watermark.** Streaming joins need a watermark for late-arrival handling. Default 5 seconds is a guess; real workloads will calibrate. **Recommendation:** ship with 5s default; expose per-query override; tune defaults after first production deployment.
+### 1. AST stability across versions
 
-3. **Sketch interoperability.** HLL and T-Digest variants exist with different parameters. Pick one canonical encoding so cross-node sketches merge cleanly. **Recommendation:** HLL with p=14 (16 KB sketches, ±0.81% error); T-Digest with compression=100 (compact sketches, ±0.5% on quantiles). Bake into the wire format.
+**Decision:** `MeshQuery` is explicitly versioned at the enum top level:
 
-4. **Distributed cache vs in-process only.** Do we ever push to distributed cache? **Recommendation:** no, not in this phase. Cross-node cache coherence is its own problem worth a separate phase. Per-node LRU is sufficient for the workloads in scope.
+```rust
+pub enum MeshQuery {
+    V1(QueryV1),
+    // V2(QueryV2), V3(QueryV3), ... as the AST evolves
+}
+```
 
-5. **Query language surface.** Stay programmatic-only, or build SQL-flavored / Cypher-flavored / GraphQL surface? **Recommendation:** programmatic only in this phase. Library users can build language surfaces as separate projects. Consistent with the protocol-as-product principle.
+Contract:
 
-6. **Per-query authentication.** Does a query carry its own auth context, or inherits the session's? **Recommendation:** inherits session's via existing AuthGuard; the query's reads are gated at the chain level by `subscribe_caps`; nothing query-specific needed.
+- Unknown versions reject cleanly at decode time (`MeshError::PlannerError { detail: "unsupported query version" }`).
+- Never silently drop fields. Forward-incompatible inputs return a typed error; they do not partially-decode.
+- Version tag appears in both JSON and postcard encodings.
+- Version increments **only** when adding or changing variant semantics. Adding a new operator variant inside an existing `Vn` is a non-bump if optional and unknown-to-old-planner-rejected.
+- Bindings enforce exhaustive matching on the version tag (no fall-through wildcards).
 
-7. **Streaming-aggregate windowing.** Time-windowed aggregates ("count events per minute") are extremely common. Build into the operator or layer above? **Recommendation:** build a `Window` operator (`Tumbling`, `Sliding`, `Session`) as part of Phase E; it composes with `Aggregate` cleanly and the workloads will demand it.
+Rationale: Maintains planner guarantees and prevents stringly-typed entropy. A query serialized today must either decode to the exact same plan years from now OR fail with a typed error — never silently degrade.
+
+### 2. Default join watermark
+
+**Decision:** Default `watermark = Duration::from_secs(5)` for streaming joins; overrideable per query.
+
+```rust
+Join {
+    left: Box<MeshQuery>,
+    right: Box<MeshQuery>,
+    on: JoinKey,
+    kind: JoinKind,
+    watermark: Duration,    // default 5s; ∞ for batch over closed ranges
+}
+```
+
+Contract:
+
+- Default ships at 5s.
+- Per-query override supported (any positive Duration; `Duration::MAX` ≡ ∞ for batch).
+- Watermark surfaces in result metadata so consumers know what semantics they got.
+- Real workloads (Hermes + Deck) generate telemetry post-ship; defaults retune ONLY after that data lands.
+
+Rationale: Provides correctness without stalling implementation; matches the plan's calibration note. 5s is a reasonable starting point that real telemetry can refine.
+
+### 3. Sketch interoperability
+
+**Decision:** Single canonical encoding per sketch type, baked into the wire surface:
+
+| Sketch | Parameter | Footprint | Error bound |
+|---|---|---|---|
+| HyperLogLog | `p = 14` | 16 KB | ±0.81 % distinct-count |
+| T-Digest | `compression = 100` | compact | ±0.5 % on quantiles |
+
+Contract:
+
+- All nodes treat these as the only valid sketch shapes. Cross-version merges would silently corrupt — reject with a typed error if a peer advertises a non-canonical sketch.
+- postcard encodes them as typed enum variants (`SketchPayload::HllP14(...)`, `SketchPayload::TDigestC100(...)`).
+- JSON uses the same tagged-struct form (`{"kind": "hll_p14", "data": "..."}`).
+- Cross-node merges are guaranteed identical semantics: a node receiving sketches from N other nodes computes the same merged result regardless of which subset it sees.
+
+Rationale: Sketch parameter drift is the canonical "v1 and v2 see different aggregate results" footgun in distributed analytics. Lock the parameters now, version-bump if changed.
+
+### 4. Distributed cache vs in-process only
+
+**Decision:** Per-node in-process LRU only. No distributed cache in this phase.
+
+Contract:
+
+- No cross-node coherence protocol.
+- No cache-state gossip.
+- No "cache miss → ask peer's cache" routing.
+- Cache invalidation keys on `(query_hash, capability_index_version)` and stays bound to the local process.
+- Phase E or later MAY revisit distributed caching as its own substrate-level feature with a dedicated plan.
+
+Rationale: Avoids solving a cache-coherence problem before it's justified. Per-node LRU is sufficient for the workloads in scope; cross-node cache coherence is its own multi-month research problem and would block Phase A on something the workloads don't need.
+
+### 5. Query language surface
+
+**Decision:** Programmatic-only. No SQL-, Cypher-, or GraphQL-flavored surface in core.
+
+Bindings expose `MeshQuery` in their idiomatic shape:
+
+| Binding | Surface |
+|---|---|
+| Rust | `MeshQuery` enum literal |
+| Python | dataclass / dict (same shape as `OverflowConfig` ships) |
+| Node/TypeScript | discriminated union (typed object form) |
+| Go | struct with json tags |
+| C | JSON blob via FFI |
+| Wire (inter-node) | postcard |
+
+Contract:
+
+- The typed AST per binding is the canonical user-facing surface.
+- External language surfaces (e.g. a community-built SQL-to-MeshQuery compiler) MAY be community libraries; they are NOT in the substrate.
+- Cross-binding parity is verified by serialization round-trip — every binding's AST must round-trip through both postcard and JSON without semantic drift.
+
+Rationale: Matches the protocol-as-product philosophy from the parent roadmap. A SQL-like surface is a downstream library concern; baking one into core would couple the substrate to a language design and create a second source of truth for query semantics. Preserves AST stability (locked decision #1) by keeping exactly one canonical form.
+
+### 6. Per-query authentication
+
+**Decision:** Queries inherit the session's auth context. No per-query auth override.
+
+Contract:
+
+- All chain reads gated via the existing chain-level `subscribe_caps` + `AuthGuard` machinery.
+- The planner never embeds auth tokens or capability claims into the AST.
+- Execution always uses the current `AuthGuard` from the requesting session.
+- A query that touches chains the session doesn't have `subscribe_caps` for returns the same typed denial the underlying read would return — no new error path.
+
+Rationale: Prevents auth complexity explosions in the AST + planner. Aligns with the existing RedEX subscriber model where ACL is enforced at chain-read time, not at query-construction time. Per-query-result redaction / row-level security stays as a follow-up doc.
+
+### 7. Streaming-aggregate windowing
+
+**Decision:** Add a `Window` operator in Phase E; not earlier.
+
+```rust
+Window {
+    inner: Box<MeshQuery>,
+    kind: WindowKind,      // Tumbling | Sliding | Session
+    duration: Duration,
+}
+```
+
+Contract:
+
+- Composes with `Aggregate` cleanly — the canonical pattern is `Aggregate(Window(Filter(Between(...))), …)`.
+- Required for telemetry + Deck metrics workloads (the activation triggers for streaming analytics).
+- Ships AFTER basic folds, joins, and aggregation are stable in Phases A–D. Building windowing on an unstable aggregate substrate inverts the dependency.
+
+Rationale: Time-windowed aggregates ("count events per minute") are an extremely common workload — but they're a natural extension of the aggregate operator, not a foundational primitive. Phase E with `Window` slotted in keeps the dependency order honest and lets Phases A–D land their tests against a smaller surface.
 
 ---
 

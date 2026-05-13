@@ -349,4 +349,51 @@ else:
     )
 
 
+# MeshDB surface. Present iff the native module was built with
+# the `meshdb` Cargo feature. Slice 1 shipped the atomic factory
+# AST + sync runner + Phase F cache options; slice 2 added the
+# composite-operator factories (window, aggregates, joins) and
+# the result-payload decoders; slice 3 adds the `Predicate`
+# builder and the `MeshQuery.filter()` factory.
+try:
+    from ._net import (
+        AggregateResult,
+        CachePolicy,
+        ExecuteOptions,
+        GroupKey,
+        InMemoryChainReader,
+        JoinedRow,
+        LineageEntry,
+        MeshDbError,
+        MeshQuery,
+        MeshQueryRunner,
+        Predicate,
+        QueryBuilder,
+        ResultRow,
+        WindowBoundary,
+    )
+except ImportError:
+    # `meshdb` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "AggregateResult",
+            "CachePolicy",
+            "ExecuteOptions",
+            "GroupKey",
+            "InMemoryChainReader",
+            "JoinedRow",
+            "LineageEntry",
+            "MeshDbError",
+            "MeshQuery",
+            "MeshQueryRunner",
+            "Predicate",
+            "QueryBuilder",
+            "ResultRow",
+            "WindowBoundary",
+        ]
+    )
+
+
 __version__ = "0.15.0"

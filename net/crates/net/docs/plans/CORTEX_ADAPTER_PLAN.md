@@ -4,7 +4,16 @@
 
 ## Status
 
-Design only. Lands after CortEX itself has a concrete v1 scope (not in this plan) and RedEX v1 has seen pilot usage. Companion to [`REDEX_PLAN.md`](REDEX_PLAN.md) and [`REDEX_V2_PLAN.md`](REDEX_V2_PLAN.md).
+**Shipped — exceeds spec.** The adapter boundary, the fold-driver, the watch / snapshot machinery, and typed-adapter exemplars (`TasksAdapter`, `MemoriesAdapter`) all landed in v0.13–v0.15 well beyond the §9 step list. Notable beyond-spec additions in code:
+
+- **`RedexFold<State>` trait** at `src/adapter/net/redex/fold.rs:15` (single `apply(&mut self, ev, state) -> Result<(), RedexError>` method).
+- **`CortexAdapter<State>` generic** in `src/adapter/net/cortex/adapter.rs` — `open` / `ingest` / `ingest_with_token` / `state` / `wait_for_seq` / `close` / `snapshot` / `open_from_snapshot` plus the v0.15 RYW token surface (`wait_for_token`, `WaitForTokenError`, `set_global_ryw_inflight_cap` exported).
+- **`TasksAdapter`** in `cortex/tasks/adapter.rs`, **`MemoriesAdapter`** in `cortex/memories/adapter.rs` — same `open` / `open_with_config` / `watch` / `snapshot_and_watch` / `snapshot` / `wait_for_token` shape on each.
+- **Watch surface** (`watch` + `snapshot_and_watch` returning `(initial: Vec<T>, stream: Pin<Box<dyn Stream<Item = Vec<T>>>>)`) and the underlying `CortexAdapter::changes() -> impl Stream<Item = u64>` / `changes_with_lag() -> impl Stream<Item = ChangeEvent>` — the plan's §3 explicitly **defers** watch + snapshot+tail; reality exceeds that.
+
+The plan's §9 step list (1–12) was a v1 design scope; the code has gone past it. Companion to [`REDEX_PLAN.md`](REDEX_PLAN.md) and [`REDEX_V2_PLAN.md`](REDEX_V2_PLAN.md) (both shipped).
+
+**MeshDB compose-ability:** A MeshDB-specific `CortexAdapter<MeshDBState>` drops in as a sibling to `TasksAdapter` / `MemoriesAdapter` without new traits. Two surfaces are net-new for MeshDB and not present today: (1) a fold-on-relay primitive for push-down execution at intermediate nodes (current `RedexFold` is single-node-tail-oriented); (2) row-at-a-time `Stream<Item = ResultRow>` shaped streams alongside the existing `Stream<Item = Vec<T>>` whole-result-set streams. Both can be layered above the existing adapter without modifying it.
 
 **Scope:** this plan covers the *adapter boundary* — the glue between CortEX (the query / fold plane) and RedEX (the storage primitive). It does **not** specify:
 

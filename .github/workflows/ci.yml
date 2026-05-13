@@ -34,6 +34,14 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib --features "net redex cortex netdb"
 
+      # Doctests live in `///` comment blocks across `src/` and `sdk/src/`.
+      # `cargo test --lib` does not execute them — they need a separate
+      # `cargo test --doc` invocation. Same feature set as the unit-test
+      # run so doc examples gated on those features compile.
+      - name: Run doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --doc --features "net redex cortex netdb"
+
   integration-tests:
     name: Integration tests (net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC)
     runs-on: ubuntu-latest
@@ -57,52 +65,135 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
 
+      # nextest gives us per-test process isolation, smarter scheduling,
+      # and `--no-fail-fast` semantics across grouped test binaries.
+      # Tests below are batched by feature set so cargo recompiles the
+      # library at most once per group instead of once per `--test` flag.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       # redis and jetstream integration tests are intentionally skipped:
       # `required-features = ["redis" | "jetstream"]` in Cargo.toml excludes
       # them from compilation under this feature set. Wire them in separately
       # once CI service containers are added.
-      - name: Net integration
-        run: cargo test --test integration_net --features net
-      - name: Three-node integration
-        run: cargo test --test three_node_integration --features net
-      - name: Mikoshi integration
-        run: cargo test --test migration_integration --features net
-      - name: Mikoshi placement-filter callback integration
-        run: cargo test --test integration_placement_filter_callback --features net
-      - name: RedEX integration
-        run: cargo test --test integration_redex --features redex
-      - name: RedEX replication e2e (real-wire two/three-node)
-        # Pulls in the `net` feature because the e2e suite uses
-        # `MeshNode` + `MeshNodeConfig` for the real-wire NKpsk0
-        # handshake. The `redex` feature is the actual gate (the
-        # tests are `#![cfg(feature = "redex")]`).
-        run: cargo test --test redex_replication_e2e --features "redex net"
-      - name: RedEX replication DST (deterministic simulation)
-        # Single-threaded harness; doesn't need `net` — runs the
-        # production state machine + election + catch-up + tracker
-        # logic against virtual nodes with explicit clock + message
-        # queue + partition matrix.
-        run: cargo test --test redex_replication_dst --features redex
-      - name: CortEX adapter integration
-        run: cargo test --test integration_cortex_adapter --features cortex
-      - name: CortEX tasks integration
-        run: cargo test --test integration_cortex_tasks --features cortex
-      - name: CortEX memories integration
-        run: cargo test --test integration_cortex_memories --features cortex
-      - name: NetDB integration
-        run: cargo test --test integration_netdb --features netdb
-      - name: nRPC predicate-header integration
-        run: cargo test --test integration_nrpc_predicate_header --features cortex
-      - name: Dataforts net-blob CLI tests
-        run: cargo test --test net_blob_cli --features dataforts,cli
-      - name: Dataforts blob e2e (multi-node + migration)
-        # The blob e2e suite includes the 3-node parallel migration
-        # scenario in `three_node_parallel_migration_lands_blob_on_two_peers`.
-        # `redex-disk` is required so MeshBlobAdapter can spin up a
-        # real on-disk RedEX per node.
-        run: cargo test --test dataforts_blob_e2e --features dataforts,redex-disk
-      - name: Dataforts greedy e2e (cache + speculative pull)
-        run: cargo test --test dataforts_greedy_e2e --features dataforts
+
+      # === Bus + FFI (no features) ========================================
+      - name: Bus + FFI
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast
+          --test bus_shutdown_drain
+          --test bus_stranded_flush
+          --test ffi_shutdown_race
+          --test ffi_poll_buffer
+
+      # === Net mesh + capability + discovery + migration + nRPC dispatch ==
+      # All --features net tests share one compile.
+      - name: Net mesh, capability, migration, nRPC dispatch
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features net
+          --test integration_net
+          --test three_node_integration
+          --test channel_auth
+          --test channel_auth_hardening
+          --test connect_post_start
+          --test failure_detector_matrix
+          --test parallel_bind_stress
+          --test peer_death_evicts_peer_map
+          --test send_subprotocol_malformed
+          --test subnet_enforcement
+          --test integration_placement_filter_callback
+          --test capability_broadcast
+          --test capability_multihop
+          --test capability_scope
+          --test capability_schema_doc_guard
+          --test chain_discovery
+          --test cross_lang_capability_fixtures
+          --test migration_integration
+          --test migration_target_failure_mid_chunking
+
+      # === NAT traversal ==================================================
+      - name: NAT traversal
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features "net nat-traversal"
+          --test connect_direct
+          --test nat_classify
+          --test peer_death_clears_capability_index
+          --test punch_keepalive
+          --test punch_keepalive_timing
+          --test reflex_probe
+          --test reflex_override
+          --test rendezvous_ack
+          --test rendezvous_coordinator
+
+      # === Port mapping (UPnP-IGD / NAT-PMP / PCP) ========================
+      - name: Port mapping
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features "net port-mapping"
+          --test port_mapping_null
+          --test port_mapping_real_router
+
+      # === RedEX ==========================================================
+      # `redex` chains to `net` in Cargo.toml (redex = ["net", ...]) so a
+      # single --features redex covers the e2e suite as well.
+      - name: RedEX
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features redex
+          --test integration_redex
+          --test redex_replication_dst
+          --test redex_replication_e2e
+
+      # === CortEX + nRPC service surface ==================================
+      - name: CortEX + nRPC
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features cortex
+          --test integration_cortex_adapter
+          --test integration_cortex_tasks
+          --test integration_cortex_memories
+          --test cortex_ryw_global_cap
+          --test integration_nrpc_loopback
+          --test integration_nrpc_mesh
+          --test integration_nrpc_streaming
+          --test integration_nrpc_service_discovery
+          --test integration_nrpc_predicate_header
+          --test integration_nrpc_cross_lang
+          --test nrpc_inbound_dispatcher
+          --test queue_group_dispatch
+
+      # === NetDB ==========================================================
+      - name: NetDB
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --no-fail-fast --features netdb --test integration_netdb
+
+      # === Dataforts (greedy + gravity) ===================================
+      - name: Dataforts greedy + gravity
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features dataforts
+          --test dataforts_greedy_e2e
+          --test dataforts_gravity_e2e
+
+      # === Dataforts blob e2e (multi-node + migration) ====================
+      # `redex-disk` is required so MeshBlobAdapter can spin up a real
+      # on-disk RedEX per node — separate from the in-memory dataforts
+      # group above so the on-disk paths get compiled.
+      - name: Dataforts blob e2e
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --no-fail-fast --features "dataforts redex-disk" --test dataforts_blob_e2e
+
+      # === Dataforts net-blob CLI =========================================
+      # Pulls in clap via the `cli` feature; kept separate so the
+      # non-CLI dataforts groups don't pay the clap compile cost.
+      - name: Dataforts net-blob CLI
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --no-fail-fast --features "dataforts cli" --test net_blob_cli
 
   loom-tests:
     name: Loom concurrency models
@@ -347,6 +438,94 @@ jobs:
 
       - name: Run tests
         run: pytest -v
+
+  sdk-py-tests:
+    name: Python SDK tests (sdk-py, pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net/sdk-py
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # sdk-py is the pure-Python layer over the `ai2070-net` bindings.
+      # Its `tests/conftest.py` stubs the native `net` extension before
+      # any SDK module loads, so the test run does not need maturin or
+      # the Rust toolchain. `--no-deps` skips resolving the runtime
+      # `ai2070-net>=0.15.0` requirement against PyPI.
+      - name: Install sdk-py (no deps) + test deps
+        run: |
+          pip install --upgrade pip
+          pip install --no-deps -e .
+          pip install pytest pydantic
+
+      - name: Run tests
+        run: pytest -v
+
+  go-tests:
+    name: Go bindings tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.21"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
+
+      # The Go bindings link against TWO cdylibs via cgo:
+      #   - `-lnet` (libnet.so, the main `ai2070-net` crate) from net.go
+      #   - `-lnet_compute` (libnet_compute.so, the `net-compute-ffi`
+      #     workspace member at bindings/go/compute-ffi) from compute.go
+      # Both end up in `net/crates/net/target/release/`.
+      #
+      # Features:
+      #   - `ai2070-net` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
+      #     for the mesh + cortex + blob + NAT + redis-dedup FFI surfaces
+      #     exercised by the Go test suite. `redis` only gates the
+      #     `RedisStreamDedup` symbol export — the dedup helper itself is
+      #     an in-memory LRU and does not need a Redis server at runtime.
+      #   - `net-compute-ffi` needs `test-helpers` so the FFI symbol
+      #     `net_compute_test_inject_synthetic_peer` (referenced by
+      #     `groups_testhelpers.go`) is exported.
+      #
+      # Built as one cargo invocation so feature unification on the
+      # shared `ai2070-net` dep doesn't cause a second compilation pass.
+      - name: Build net + net_compute cdylibs
+        working-directory: net/crates/net
+        run: >
+          cargo build --release
+          -p ai2070-net -p net-compute-ffi
+          --features "ai2070-net/netdb,ai2070-net/dataforts,ai2070-net/redex-disk,ai2070-net/nat-traversal,ai2070-net/redis,net-compute-ffi/test-helpers"
+
+      # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
+      # so local developers can run quick unit-style passes without the
+      # full mesh setup. CI wants the full coverage.
+      - name: Run Go tests
+        working-directory: go
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
+          RUN_INTEGRATION_TESTS: "1"
+        run: go test -v ./...
 
   clippy:
     name: Clippy

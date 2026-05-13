@@ -434,87 +434,210 @@ impl Predicate {
         PredicateWire { nodes, root_idx }
     }
 
-    /// Recursive helper: append `self` (and any sub-tree) into
+    /// Iterative helper: append `self` (and any sub-tree) into
     /// `nodes`, returning the index of the root of the sub-tree.
-    /// Post-order: children push first, then the parent referring
-    /// to them by index.
+    ///
+    /// Implemented as a heap-allocated work stack rather than
+    /// straight recursion. A deeply-nested predicate
+    /// (`Not(Not(Not(...)))` 10k deep, or `And([many And([...])])`)
+    /// otherwise overflows the thread stack — caller-controlled
+    /// input from the FFI shims can build arbitrarily-deep
+    /// `Predicate` trees via typed factories. Output is identical
+    /// to the prior recursive implementation: post-order
+    /// serialization, children at lower indices than their
+    /// parents.
     fn append_to_wire(&self, nodes: &mut Vec<PredicateNodeWire>) -> u32 {
-        let node = match self {
-            Self::Exists { key } => PredicateNodeWire::Exists { key: key.clone() },
-            Self::Equals { key, value } => PredicateNodeWire::Equals {
-                key: key.clone(),
-                value: value.clone(),
-            },
-            Self::NumericAtLeast { key, threshold } => PredicateNodeWire::NumericAtLeast {
-                key: key.clone(),
-                threshold: *threshold,
-            },
-            Self::NumericAtMost { key, threshold } => PredicateNodeWire::NumericAtMost {
-                key: key.clone(),
-                threshold: *threshold,
-            },
-            Self::NumericInRange { key, min, max } => PredicateNodeWire::NumericInRange {
-                key: key.clone(),
-                min: *min,
-                max: *max,
-            },
-            Self::SemverAtLeast { key, version } => PredicateNodeWire::SemverAtLeast {
-                key: key.clone(),
-                version: version.clone(),
-            },
-            Self::SemverAtMost { key, version } => PredicateNodeWire::SemverAtMost {
-                key: key.clone(),
-                version: version.clone(),
-            },
-            Self::SemverCompatible { key, version } => PredicateNodeWire::SemverCompatible {
-                key: key.clone(),
-                version: version.clone(),
-            },
-            Self::StringPrefix { key, prefix } => PredicateNodeWire::StringPrefix {
-                key: key.clone(),
-                prefix: prefix.clone(),
-            },
-            Self::StringMatches { key, pattern } => PredicateNodeWire::StringMatches {
-                key: key.clone(),
-                pattern: pattern.clone(),
-            },
-            Self::MetadataExists { key } => PredicateNodeWire::MetadataExists { key: key.clone() },
-            Self::MetadataEquals { key, value } => PredicateNodeWire::MetadataEquals {
-                key: key.clone(),
-                value: value.clone(),
-            },
-            Self::MetadataMatches { key, pattern } => PredicateNodeWire::MetadataMatches {
-                key: key.clone(),
-                pattern: pattern.clone(),
-            },
-            Self::MetadataNumericAtLeast { key, threshold } => {
-                PredicateNodeWire::MetadataNumericAtLeast {
-                    key: key.clone(),
-                    threshold: *threshold,
-                }
-            }
-            Self::And(children) => {
-                let child_idxs: Vec<u32> =
-                    children.iter().map(|c| c.append_to_wire(nodes)).collect();
-                PredicateNodeWire::And {
-                    children: child_idxs,
-                }
-            }
-            Self::Or(children) => {
-                let child_idxs: Vec<u32> =
-                    children.iter().map(|c| c.append_to_wire(nodes)).collect();
-                PredicateNodeWire::Or {
-                    children: child_idxs,
-                }
-            }
-            Self::Not(inner) => {
-                let child_idx = inner.append_to_wire(nodes);
-                PredicateNodeWire::Not { child: child_idx }
-            }
+        enum Step<'a> {
+            /// Visit a predicate. Leaves emit immediately;
+            /// composites schedule a matching `Finish*` after
+            /// pushing their children.
+            Visit(&'a Predicate),
+            /// Pop `n` child indices off `child_stack` and emit
+            /// an `And` referring to them, in the order the
+            /// children were visited (left to right).
+            FinishAnd(usize),
+            /// As `FinishAnd` but for `Or`.
+            FinishOr(usize),
+            /// Pop one child index off `child_stack` and emit a
+            /// `Not`.
+            FinishNot,
+        }
+
+        let mut work: Vec<Step<'_>> = Vec::with_capacity(8);
+        work.push(Step::Visit(self));
+        // Each child push records the node index it landed at;
+        // composite `Finish*` steps drain the trailing N entries.
+        let mut child_stack: Vec<u32> = Vec::with_capacity(8);
+
+        // Helper: emit a leaf node, push its index on the
+        // child_stack so the enclosing composite picks it up.
+        let emit = |nodes: &mut Vec<PredicateNodeWire>,
+                    child_stack: &mut Vec<u32>,
+                    node: PredicateNodeWire| {
+            let idx = nodes.len() as u32;
+            nodes.push(node);
+            child_stack.push(idx);
         };
-        let idx = nodes.len() as u32;
-        nodes.push(node);
-        idx
+
+        while let Some(step) = work.pop() {
+            match step {
+                Step::Visit(p) => match p {
+                    Self::Exists { key } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::Exists { key: key.clone() },
+                    ),
+                    Self::Equals { key, value } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::Equals {
+                            key: key.clone(),
+                            value: value.clone(),
+                        },
+                    ),
+                    Self::NumericAtLeast { key, threshold } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::NumericAtLeast {
+                            key: key.clone(),
+                            threshold: *threshold,
+                        },
+                    ),
+                    Self::NumericAtMost { key, threshold } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::NumericAtMost {
+                            key: key.clone(),
+                            threshold: *threshold,
+                        },
+                    ),
+                    Self::NumericInRange { key, min, max } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::NumericInRange {
+                            key: key.clone(),
+                            min: *min,
+                            max: *max,
+                        },
+                    ),
+                    Self::SemverAtLeast { key, version } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::SemverAtLeast {
+                            key: key.clone(),
+                            version: version.clone(),
+                        },
+                    ),
+                    Self::SemverAtMost { key, version } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::SemverAtMost {
+                            key: key.clone(),
+                            version: version.clone(),
+                        },
+                    ),
+                    Self::SemverCompatible { key, version } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::SemverCompatible {
+                            key: key.clone(),
+                            version: version.clone(),
+                        },
+                    ),
+                    Self::StringPrefix { key, prefix } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::StringPrefix {
+                            key: key.clone(),
+                            prefix: prefix.clone(),
+                        },
+                    ),
+                    Self::StringMatches { key, pattern } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::StringMatches {
+                            key: key.clone(),
+                            pattern: pattern.clone(),
+                        },
+                    ),
+                    Self::MetadataExists { key } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::MetadataExists { key: key.clone() },
+                    ),
+                    Self::MetadataEquals { key, value } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::MetadataEquals {
+                            key: key.clone(),
+                            value: value.clone(),
+                        },
+                    ),
+                    Self::MetadataMatches { key, pattern } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::MetadataMatches {
+                            key: key.clone(),
+                            pattern: pattern.clone(),
+                        },
+                    ),
+                    Self::MetadataNumericAtLeast { key, threshold } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::MetadataNumericAtLeast {
+                            key: key.clone(),
+                            threshold: *threshold,
+                        },
+                    ),
+                    Self::And(children) => {
+                        work.push(Step::FinishAnd(children.len()));
+                        // Push children in reverse so that the
+                        // leftmost child is popped first; this
+                        // preserves the left-to-right child
+                        // ordering of the recursive version.
+                        for c in children.iter().rev() {
+                            work.push(Step::Visit(c));
+                        }
+                    }
+                    Self::Or(children) => {
+                        work.push(Step::FinishOr(children.len()));
+                        for c in children.iter().rev() {
+                            work.push(Step::Visit(c));
+                        }
+                    }
+                    Self::Not(inner) => {
+                        work.push(Step::FinishNot);
+                        work.push(Step::Visit(inner));
+                    }
+                },
+                Step::FinishAnd(n) => {
+                    let start = child_stack.len() - n;
+                    let kids: Vec<u32> = child_stack.drain(start..).collect();
+                    let idx = nodes.len() as u32;
+                    nodes.push(PredicateNodeWire::And { children: kids });
+                    child_stack.push(idx);
+                }
+                Step::FinishOr(n) => {
+                    let start = child_stack.len() - n;
+                    let kids: Vec<u32> = child_stack.drain(start..).collect();
+                    let idx = nodes.len() as u32;
+                    nodes.push(PredicateNodeWire::Or { children: kids });
+                    child_stack.push(idx);
+                }
+                Step::FinishNot => {
+                    let child = child_stack
+                        .pop()
+                        .expect("Not body must emit one child before FinishNot");
+                    let idx = nodes.len() as u32;
+                    nodes.push(PredicateNodeWire::Not { child });
+                    child_stack.push(idx);
+                }
+            }
+        }
+
+        child_stack
+            .pop()
+            .expect("predicate must produce at least one node")
     }
 }
 
@@ -4037,5 +4160,68 @@ mod tests {
         let with_index = pred.evaluate_with_index(&cx, &index);
         let unplanned = pred.evaluate_unplanned(&cx);
         assert_eq!(with_index, unplanned);
+    }
+
+    #[test]
+    fn to_wire_handles_deep_nesting_without_stack_overflow() {
+        // Regression: the prior recursive append_to_wire would
+        // blow the thread stack on caller-controlled deeply
+        // nested predicates. The iterative version uses a
+        // heap-allocated work stack — depth-unbounded.
+        //
+        // Build a 10_000-deep `Not(Not(...Exists))` chain;
+        // confirm to_wire produces 10_001 nodes (10k Not + 1
+        // leaf) and that the root index is the topmost Not.
+        // (The mirror rebuild path `into_predicate` is still
+        // recursive — out of scope for this fix; the FFI parser
+        // caps depth at 64, and SDK consumers build trees via
+        // typed factories where recursion-driven depth is a
+        // developer-controlled property.)
+        let leaf = Predicate::Exists {
+            key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
+        };
+        let mut p = leaf;
+        for _ in 0..10_000 {
+            p = Predicate::Not(Box::new(p));
+        }
+        let wire = p.to_wire();
+        assert_eq!(wire.nodes.len(), 10_001);
+        let root = &wire.nodes[wire.root_idx as usize];
+        assert!(matches!(root, PredicateNodeWire::Not { .. }));
+    }
+
+    #[test]
+    fn to_wire_preserves_left_to_right_child_ordering() {
+        // The iterative walk pushes children in reverse so the
+        // leftmost child is popped first; pin the output to
+        // catch any regression that flips order.
+        let p = Predicate::And(vec![
+            Predicate::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "a"),
+            },
+            Predicate::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "b"),
+            },
+            Predicate::Exists {
+                key: TagKey::new(TaxonomyAxis::Hardware, "c"),
+            },
+        ]);
+        let wire = p.to_wire();
+        // 3 leaves + 1 And = 4 nodes.
+        assert_eq!(wire.nodes.len(), 4);
+        // Root is the And.
+        let PredicateNodeWire::And { children } = &wire.nodes[wire.root_idx as usize] else {
+            panic!("root should be And");
+        };
+        // Children should reference leaves at indices [0,1,2]
+        // — emitted in input order.
+        assert_eq!(children.as_slice(), &[0u32, 1, 2]);
+        // And each leaf should match the expected key.
+        for (i, key) in ["a", "b", "c"].iter().enumerate() {
+            let PredicateNodeWire::Exists { key: k } = &wire.nodes[i] else {
+                panic!("expected Exists at index {i}");
+            };
+            assert_eq!(k.key.as_str(), *key);
+        }
     }
 }

@@ -484,6 +484,143 @@ compat test — lives in [`../README.md#nrpc`](../README.md#nrpc).
 > follow-up plan as the security surface
 > ([`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md)).
 
+## MeshDB (federated query layer)
+
+MeshDB is the typed query layer above the RedEX / CortEX /
+capability-index substrate. Build with `--features meshdb` on the
+native binding (`maturin develop --features meshdb`); MeshDB
+classes import from the **`net`** package. Architectural
+overview: [`../README.md#meshdb`](../README.md#meshdb).
+
+### Quick start
+
+```python
+from net import InMemoryChainReader, MeshQuery, MeshQueryRunner
+
+reader = InMemoryChainReader()
+reader.append(0xAB, 1, b"v1")
+reader.append(0xAB, 2, b"v2")
+reader.append(0xAB, 3, b"v3")
+
+runner = MeshQueryRunner(reader)
+
+# Atomic operator — yields the tip row.
+rows = runner.execute(MeshQuery.latest(0xAB))
+assert rows[0].seq == 3
+assert rows[0].payload == b"v3"
+
+# Composite pipeline via the fluent builder.
+query = (
+    MeshQuery.builder()
+    .between(0xAB, 1, 4)
+    .count()
+    .build()
+)
+[agg_row] = runner.execute(query)
+assert agg_row.decode_aggregate().value == 3.0
+```
+
+The runner is synchronous — `execute(query) -> list[ResultRow]`
+drains the result stream against an internal Tokio runtime. The
+GIL is released around the executor call so a background thread
+can keep ticking.
+
+### Operator surface
+
+| Family | Factories / builder methods |
+|---|---|
+| Atomic | `MeshQuery.at(origin, seq)`, `MeshQuery.between(origin, start, end)`, `MeshQuery.latest(origin)`, `MeshQuery.lineage_emit(origin, entries, direction)` |
+| Composite | `MeshQuery.filter(inner, predicate)`, `MeshQuery.window(inner, size)`, `MeshQuery.count(inner, group_by=None)`, `MeshQuery.sum/avg/min/max/percentile(inner, field, ...)`, `MeshQuery.distinct_count(inner, field)`, `MeshQuery.join(left, right, kind, key, strategy=None, watermark_secs=None)` |
+| Fluent builder | `MeshQuery.builder().<at|between|latest>(...).<filter|window|count|...>(...).build()` — common-ops shortcut over the static factories |
+
+`Predicate` ships static factories paralleling the wire format:
+`Predicate.exists / equals / numeric_at_least / numeric_at_most /
+numeric_in_range / string_prefix / string_matches /
+semver_at_least` plus the boolean combinators `Predicate.and_ /
+or_ / not_`. Field paths target row-intrinsic names (`"origin"` /
+`"seq"`) or dotted JSON-payload paths (`"a.b.c"`).
+
+### Sentinel row decoders
+
+Atomic rows expose `.payload` directly. Composite rows carry
+postcard-encoded sentinels — decode with the typed methods:
+
+```python
+[agg] = runner.execute(MeshQuery.count(MeshQuery.between(0xAB, 1, 4)))
+result = agg.decode_aggregate()       # AggregateResult
+assert result.kind == "count"
+assert result.count == 3
+
+[bucket] = runner.execute(MeshQuery.window(MeshQuery.between(0xAB, 1, 10), 5))
+window = bucket.decode_window()       # WindowBoundary
+print(window.start, window.end, len(window.rows))
+
+[paired] = runner.execute(MeshQuery.join(left, right, "inner", "seq"))
+joined = paired.decode_joined()       # JoinedRow
+print(joined.left, joined.right)
+```
+
+`decode_*` returns `None` when the payload isn't a sentinel
+envelope (i.e. for atomic-operator rows), so callers branch on
+"did the decoder recognise this?" without a separate type query.
+
+### Phase F result cache
+
+Opt in at runner-construction time and tune per-call via
+`ExecuteOptions`:
+
+```python
+from net import CachePolicy, ExecuteOptions, MeshQueryRunner
+
+runner = MeshQueryRunner(reader, enable_cache=True)
+
+# Default: TimeBound TTL = 5 s (mirrors the join watermark).
+rows = runner.execute(query)
+
+# Permanent — only safe when the result is immutable under
+# substrate semantics.
+opts = ExecuteOptions(cache_policy=CachePolicy.permanent())
+rows = runner.execute(query, opts)
+
+# Custom TTL.
+opts = ExecuteOptions(cache_policy=CachePolicy.time_bound(30.0))
+rows = runner.execute(query, opts)
+
+# Bypass cache entirely (skip lookup + writeback).
+rows = runner.execute(query, ExecuteOptions(bypass_cache=True))
+```
+
+### Lineage emit
+
+The SDK doesn't walk the `fork-of:` graph itself — callers supply
+pre-walked entries in walk order:
+
+```python
+from net import LineageEntry, MeshQuery, MeshQueryRunner
+
+runner = MeshQueryRunner(reader)
+query = MeshQuery.lineage_emit(
+    0xAA,
+    [
+        LineageEntry(0xAA, 0, tip_seq=5),
+        LineageEntry(0xBB, 1, tip_seq=3),
+        LineageEntry(0xCC, 2),  # tip_seq omitted -> emits seq=0
+    ],
+    "back",
+)
+rows = runner.execute(query)
+# Compose with .at / .between to fetch event bodies per chain.
+```
+
+### Errors
+
+`MeshDbError` is the unified failure surface (planner / executor
+/ invalid arguments) — every factory and runner method raises it
+on error.
+
+> **Note.** The `net_sdk` wrapper doesn't yet re-export the
+> MeshDB surface — use the native `net` package directly.
+
 ## Compute (daemons + migration)
 
 The full compute surface — `DaemonRuntime`, `MeshDaemon`
