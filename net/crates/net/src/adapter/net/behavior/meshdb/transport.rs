@@ -59,7 +59,7 @@
 //! server; (3) the server's per-call task notices the cancel and
 //! short-circuits its row stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
@@ -96,6 +96,15 @@ pub const MESHDB_SERVER_OUTBOX_CAPACITY: usize = 64;
 /// the per-frame postcard encode + send cost. 64 is a starting
 /// guess — tunable when profiling shows it matters.
 pub const MESHDB_SERVER_BATCH_ROWS: usize = 64;
+
+/// Cap on the server's `pending_cancels` set — `(peer, call_id)`
+/// pairs that arrived as `Cancel` before the matching `Execute`.
+/// The set exists to cover UDP-reorder windows; a single peer
+/// shouldn't have hundreds of cancels outstanding, and a hostile
+/// peer that floods cancels can't grow this past the cap. When
+/// full the new entry is dropped (degraded: the late `Execute`
+/// runs normally rather than being short-circuited).
+pub const MESHDB_SERVER_PENDING_CANCELS_CAP: usize = 256;
 
 /// Sync, non-blocking router the mesh's inbound dispatch loop
 /// calls when a `SUBPROTOCOL_MESHDB` payload arrives. Mirrors the
@@ -458,6 +467,14 @@ pub struct MeshDbServer {
     /// `Cancel { call_id }` from a peer flips the matching
     /// handle's cancel flag.
     inflight: Arc<RwLock<HashMap<(u64, u64), ServerCallHandle>>>,
+    /// `(peer, call_id)` pairs whose `Cancel` arrived before the
+    /// matching `Execute` — covers the (rare) UDP-reorder window
+    /// where the wire delivers a follow-up cancel ahead of the
+    /// initial request. On `Execute` we check + drain the entry;
+    /// if present, the call short-circuits to `QueryCancelled`
+    /// without driving the executor. Capped at
+    /// `MESHDB_SERVER_PENDING_CANCELS_CAP`.
+    pending_cancels: Arc<RwLock<HashSet<(u64, u64)>>>,
 }
 
 struct ServerCallHandle {
@@ -474,6 +491,7 @@ impl MeshDbServer {
         Arc::new(Self {
             executor,
             inflight: Arc::new(RwLock::new(HashMap::new())),
+            pending_cancels: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
@@ -481,6 +499,12 @@ impl MeshDbServer {
     /// and operator dashboards.
     pub fn inflight_calls(&self) -> usize {
         self.inflight.read().len()
+    }
+
+    /// Number of `(peer, call_id)` cancels that arrived without a
+    /// matching `Execute` and are still parked. Test surface.
+    pub fn pending_cancels(&self) -> usize {
+        self.pending_cancels.read().len()
     }
 
     /// Spawn the per-call task that drives the executor and ships
@@ -495,6 +519,29 @@ impl MeshDbServer {
     ) {
         match request {
             MeshDbRequest::Execute { call_id, plan } => {
+                // Cover the UDP-reorder window: if a `Cancel` for
+                // this (peer, call_id) was parked before the
+                // `Execute` landed, drain it and short-circuit
+                // straight to `QueryCancelled` rather than driving
+                // the executor and racing the cancel into the
+                // tokio::select! arm in `run_server_call`.
+                let cancelled_early =
+                    self.pending_cancels.write().remove(&(peer, call_id));
+                if cancelled_early {
+                    let sender_clone = sender.clone();
+                    tokio::spawn(async move {
+                        let _ = sender_clone
+                            .send_frame(
+                                peer,
+                                MeshDbFrame::Response(MeshDbResponse::Error {
+                                    call_id,
+                                    error: MeshError::QueryCancelled,
+                                }),
+                            )
+                            .await;
+                    });
+                    return;
+                }
                 let cancel = Arc::new(Notify::new());
                 self.inflight.write().insert(
                     (peer, call_id),
@@ -512,10 +559,20 @@ impl MeshDbServer {
                 // Flip the cancel flag for the matching call (if
                 // any). The per-call task observes and exits at
                 // the next row boundary, sending a final
-                // `Error { QueryCancelled }`.
+                // `Error { QueryCancelled }`. If no matching call
+                // is in-flight, park the cancel — Execute may
+                // still be in the receive queue (UDP reorder).
                 let guard = self.inflight.read();
                 if let Some(handle) = guard.get(&(peer, call_id)) {
                     handle.cancel.notify_one();
+                } else {
+                    drop(guard);
+                    let mut pending = self.pending_cancels.write();
+                    if pending.len() < MESHDB_SERVER_PENDING_CANCELS_CAP {
+                        pending.insert((peer, call_id));
+                    }
+                    // Cap reached: drop. The late `Execute` runs
+                    // normally; degraded but bounded.
                 }
             }
             MeshDbRequest::Resume { call_id, .. } => {
@@ -968,6 +1025,131 @@ mod tests {
             .try_route(0xB, &frame.encode().unwrap())
             .expect_err("no caller -> error");
         assert!(matches!(err, MeshDbRouteError::UnknownCallId(999)));
+    }
+
+    #[tokio::test]
+    async fn server_cancel_before_execute_short_circuits_to_query_cancelled() {
+        // Pin: UDP reorder could in principle deliver `Cancel`
+        // ahead of `Execute` on the same subprotocol stream. The
+        // pre-fix behaviour: the cancel finds no matching
+        // inflight handle, gets silently dropped, and the
+        // following `Execute` then runs the executor to
+        // completion as if cancel was never requested. The fix
+        // parks early cancels in `pending_cancels`; when the
+        // matching `Execute` lands, the server short-circuits to
+        // `MeshError::QueryCancelled` without driving the
+        // executor.
+        //
+        // Drive the dispatch path directly via `dispatch_request`
+        // so we control the order without faking wire packets.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let wire = Arc::new(InMemoryWire::default());
+        let sender = Arc::new(SenderTo {
+            wire: wire.clone(),
+            local_node: 0xB,
+        });
+
+        // Executor that counts `execute` calls so we can prove
+        // the early-cancel path skipped the executor entirely.
+        use crate::adapter::net::behavior::meshdb::executor::{ExecuteOptions, RunningQuery};
+        struct CountingExecutor {
+            executor: Arc<dyn MeshQueryExecutor>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl MeshQueryExecutor for CountingExecutor {
+            async fn execute(&self, plan: ExecutionPlan) -> Result<RunningQuery, MeshError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.executor.execute(plan).await
+            }
+            async fn execute_with(
+                &self,
+                plan: ExecutionPlan,
+                options: ExecuteOptions,
+            ) -> Result<RunningQuery, MeshError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.executor.execute_with(plan, options).await
+            }
+        }
+
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(0xCAFE, SeqNum(7), b"never-read".to_vec());
+        let inner: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor: Arc<dyn MeshQueryExecutor> = Arc::new(CountingExecutor {
+            executor: inner,
+            calls: calls.clone(),
+        });
+        let server = MeshDbServer::new(executor);
+
+        // Register a caller-side dispatcher on the OTHER end so
+        // the server's outbound `MeshDbResponse::Error` has a
+        // place to land for verification. Caller node = 0xA.
+        let node_a: u64 = 0xA;
+        let sender_a = Arc::new(SenderTo {
+            wire: wire.clone(),
+            local_node: node_a,
+        });
+        let dispatcher_a = Arc::new(MeshDbWireDispatcher::new(sender_a));
+        wire.register(node_a, dispatcher_a.clone());
+
+        // Register a pretend inflight caller on A keyed by
+        // call_id so the server's outbound `Error` frame routes.
+        // Skip the usual `transport.send()` because we want to
+        // *manually* sequence Cancel-before-Execute on the
+        // server side.
+        let call_id = 0xC0FFEE_u64;
+        let (tx, mut rx) = mpsc::channel(8);
+        dispatcher_a.inflight.write().insert(
+            call_id,
+            InflightCaller {
+                tx,
+                target_node: 0xB,
+            },
+        );
+
+        // 1) Cancel arrives first — no Execute yet, so it parks.
+        let plan = atomic_plan(OperatorPlan::LatestRead { origin: 0xCAFE });
+        let server_sender: Arc<dyn MeshDbWireSender> = sender.clone();
+        server.dispatch_request(
+            node_a,
+            MeshDbRequest::Cancel { call_id },
+            server_sender.clone(),
+        );
+        assert_eq!(
+            server.pending_cancels(),
+            1,
+            "cancel without a matching inflight handle must be parked",
+        );
+
+        // 2) Execute lands — must short-circuit; executor is
+        // never driven; a single `QueryCancelled` reaches A.
+        server.dispatch_request(
+            node_a,
+            MeshDbRequest::Execute { call_id, plan },
+            server_sender,
+        );
+
+        // Drain the response and verify.
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("server response timed out")
+            .expect("server response channel closed");
+        match resp {
+            MeshDbResponse::Error {
+                call_id: got_id,
+                error: MeshError::QueryCancelled,
+            } => assert_eq!(got_id, call_id),
+            other => panic!("expected QueryCancelled; got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "executor must not be driven when cancel arrives first",
+        );
+        // Park slot drained.
+        assert_eq!(server.pending_cancels(), 0);
     }
 
     #[tokio::test]
