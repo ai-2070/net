@@ -230,6 +230,13 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
         }
     }
 
+    /// Clone the stats `Arc`. Useful for the [`super::runtime::MeshOsRuntime`]
+    /// stitching layer, which holds the Arc across `run()`'s
+    /// consumption of `self`.
+    pub fn stats_arc(&self) -> Arc<ExecutorStats> {
+        Arc::clone(&self.stats)
+    }
+
     /// Drive the executor until either the action receiver
     /// closes (the loop dropped its sender) or the inner
     /// dispatcher panics. Returns the accumulated stats.

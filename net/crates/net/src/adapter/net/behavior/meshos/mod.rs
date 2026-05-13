@@ -58,6 +58,7 @@ pub mod event_loop;
 pub mod executor;
 pub mod maintenance;
 pub mod reconcile;
+pub mod runtime;
 pub mod snapshot;
 pub mod sources;
 pub mod state;
@@ -87,6 +88,7 @@ pub use executor::{
     ExecutorStatsSnapshot, LoggingDispatcher,
 };
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
+pub use runtime::{MeshOsRuntime, RuntimeShutdownError, RuntimeStats};
 pub use sources::{
     attach_to_daemon_registry, attach_to_replication_coordinator, MeshOsDaemonLifecycleSink,
     MeshOsReplicaTransitionSink,
