@@ -15,11 +15,21 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+
 use net::adapter::net::behavior::meshos::{
-    ActionExecutor, AdminEvent, ChainId, DaemonIntent, DaemonIntentUpdate, DaemonLifecycleSignal,
-    DaemonRef, LocalReplicaIntent, LocalReplicaIntentUpdate, LoggingDispatcher,
-    MaintenanceTransition, MeshOsAction, MeshOsConfig, MeshOsEvent, MeshOsLoop, NodeId,
+    attach_to_daemon_registry, ActionExecutor, AdminEvent, ChainId, DaemonIntent,
+    DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent,
+    LocalReplicaIntentUpdate, LoggingDispatcher, MaintenanceTransition, MeshOsAction,
+    MeshOsConfig, MeshOsEvent, MeshOsLoop, NodeId,
 };
+use net::adapter::net::behavior::capability::CapabilityFilter;
+use net::adapter::net::compute::{
+    DaemonError, DaemonHostConfig, DaemonRegistry, MeshDaemon,
+};
+use net::adapter::net::compute::DaemonHost;
+use net::adapter::net::state::causal::CausalEvent;
+use net::adapter::net::EntityKeypair;
 
 const THIS_NODE: NodeId = 100;
 
@@ -278,6 +288,154 @@ async fn maintenance_enter_with_empty_workload_walks_to_steady_state() {
             } if *node == THIS_NODE
         )),
         "expected CommitMaintenanceTransition(target=Maintenance) in log; got {log:?}",
+    );
+}
+
+/// Minimal daemon for source-converter integration test —
+/// stateless, no-op `process`, named for `MeshDaemon::name`.
+struct NoopDaemon {
+    name: String,
+}
+
+impl MeshDaemon for NoopDaemon {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn requirements(&self) -> CapabilityFilter {
+        CapabilityFilter::default()
+    }
+    fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn registry_lifecycle_observer_flows_to_meshos_dispatcher() {
+    // End-to-end: install the MeshOS lifecycle sink on a real
+    // DaemonRegistry, register a daemon, then publish a
+    // matching DaemonIntentUpdate(Run). The registry fires
+    // `Registered`, the sink translates to
+    // DaemonLifecycleSignal::Started, the loop folds it into
+    // `lifecycle = Running`, and reconcile's daemon diff
+    // emits nothing (already in desired state).
+    //
+    // The interesting bit: without the sink the loop would
+    // see intent=Run + actual=Stopped (the default) and emit
+    // StartDaemon — which would be wrong, since the daemon is
+    // already up. The sink's job is to keep the loop's actual
+    // state in sync with reality.
+
+    let cfg = fast_config();
+    let (handle, dispatcher, loop_task, exec_task) = spawn_pipeline(cfg);
+
+    let registry = DaemonRegistry::new();
+    let _prior = attach_to_daemon_registry(&registry, handle.clone());
+
+    let kp = EntityKeypair::generate();
+    let daemon_id = kp.origin_hash();
+    let host = DaemonHost::new(
+        Box::new(NoopDaemon {
+            name: "watcher".into(),
+        }),
+        kp,
+        DaemonHostConfig::default(),
+    );
+    registry.register(host).unwrap();
+
+    // Tell MeshOS this daemon should be running. The id +
+    // name must match what the registry's `Registered` event
+    // carried.
+    handle
+        .publish(MeshOsEvent::DaemonIntentUpdate(DaemonIntentUpdate {
+            daemon: DaemonRef {
+                id: daemon_id,
+                name: "watcher".into(),
+            },
+            intent: DaemonIntent::Run,
+        }))
+        .await
+        .unwrap();
+
+    let log = drain_pipeline(
+        handle,
+        dispatcher,
+        loop_task,
+        exec_task,
+        Duration::from_millis(200),
+    )
+    .await;
+
+    // No StartDaemon should appear — the daemon's lifecycle
+    // already reads Running thanks to the sink.
+    let leaked: Vec<&DaemonRef> = log
+        .iter()
+        .filter_map(|a| match a {
+            MeshOsAction::StartDaemon { daemon } => Some(daemon),
+            _ => None,
+        })
+        .filter(|d| d.id == daemon_id)
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "sink failed to surface the lifecycle to the loop; got StartDaemon leaks: {leaked:?}",
+    );
+}
+
+#[tokio::test]
+async fn unregister_flows_through_to_actual_stopped_lifecycle() {
+    // Now flip the test: register the daemon AND publish
+    // intent=Run, then unregister. The actual lifecycle
+    // transitions Running → Stopped via the sink; intent is
+    // still Run; reconcile emits StartDaemon. End-to-end
+    // observation that the unregister side of the sink fires.
+    let cfg = fast_config();
+    let (handle, dispatcher, loop_task, exec_task) = spawn_pipeline(cfg);
+
+    let registry = DaemonRegistry::new();
+    let _prior = attach_to_daemon_registry(&registry, handle.clone());
+
+    let kp = EntityKeypair::generate();
+    let daemon_id = kp.origin_hash();
+    let host = DaemonHost::new(
+        Box::new(NoopDaemon {
+            name: "watcher".into(),
+        }),
+        kp,
+        DaemonHostConfig::default(),
+    );
+    registry.register(host).unwrap();
+    handle
+        .publish(MeshOsEvent::DaemonIntentUpdate(DaemonIntentUpdate {
+            daemon: DaemonRef {
+                id: daemon_id,
+                name: "watcher".into(),
+            },
+            intent: DaemonIntent::Run,
+        }))
+        .await
+        .unwrap();
+    // Let the Registered event flow + the loop process it.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Now unregister — the sink fires ExitedCleanly →
+    // lifecycle Stopped → reconcile sees Run + Stopped →
+    // StartDaemon.
+    registry.unregister(daemon_id).unwrap();
+
+    let log = drain_pipeline(
+        handle,
+        dispatcher,
+        loop_task,
+        exec_task,
+        Duration::from_millis(200),
+    )
+    .await;
+
+    assert!(
+        log.iter().any(|a| matches!(
+            a,
+            MeshOsAction::StartDaemon { daemon } if daemon.id == daemon_id
+        )),
+        "expected StartDaemon for id={daemon_id:#x} after unregister; got {log:?}",
     );
 }
 
