@@ -2917,4 +2917,207 @@ mod tests {
             try_encode_join_key(&row, &JoinKeyMode::Field("origin,seq".to_string())),
         );
     }
+
+    // ------------------------------------------------------------------
+    // Test-gap fillers (pass-2 NEW-m4 follow-up)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn filter_matches_unicode_payload_value() {
+        // Pin: predicate values with multi-byte UTF-8 round-trip
+        // through `synthetic_row_view` + the predicate evaluator
+        // without normalization or truncation. Specifically uses
+        // a CJK string + a combining-character grapheme cluster +
+        // an emoji ZWJ sequence so any byte / char / grapheme
+        // confusion shows up.
+        use crate::adapter::net::behavior::predicate::Predicate;
+        use crate::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
+
+        let chain = 0xC0DE;
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(chain, SeqNum(1), r#"{"user":"日本語"}"#.as_bytes().to_vec());
+        reader.append(chain, SeqNum(2), r#"{"user":"café"}"#.as_bytes().to_vec());
+        reader.append(
+            chain,
+            SeqNum(3),
+            r#"{"user":"👨‍👩‍👧‍👦"}"#.as_bytes().to_vec(),
+        );
+        reader.append(chain, SeqNum(4), br#"{"user":"plain"}"#.to_vec());
+        let executor = LocalMeshQueryExecutor::new(reader);
+
+        let predicate = Predicate::Equals {
+            key: TagKey {
+                axis: TaxonomyAxis::Dataforts,
+                key: "user".to_string(),
+            },
+            value: "日本語".to_string(),
+        }
+        .to_wire();
+        let plan = atomic_plan(OperatorPlan::Filter {
+            input: Box::new(OperatorNode {
+                operator: OperatorPlan::BetweenRead {
+                    origin: chain,
+                    start: SeqNum(1),
+                    end: SeqNum(10),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            }),
+            predicate,
+        });
+        let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let seqs: Vec<u64> = rows.iter().map(|r| r.seq.0).collect();
+        assert_eq!(seqs, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn aggregate_percentile_singleton_returns_the_only_value() {
+        // Pin: nearest-rank percentile over a 1-row input is a
+        // classic off-by-one edge — `floor(p * (n - 1))` with
+        // `n == 1` is always 0 regardless of `p`, so the result
+        // is the only value. Tested across the full p range so a
+        // regression that special-cased singleton wrong (e.g.
+        // returning `None` for non-zero p) trips immediately.
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue, NumericReductionKind,
+        };
+
+        let chain = 0xAA;
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(chain, SeqNum(42), vec![]);
+        let executor = LocalMeshQueryExecutor::new(reader);
+
+        for p in [0.0, 0.25, 0.5, 0.9, 1.0] {
+            let plan = ExecutionPlan {
+                root: OperatorNode {
+                    operator: OperatorPlan::AggregateReduction {
+                        input: Box::new(OperatorNode {
+                            operator: OperatorPlan::BetweenRead {
+                                origin: chain,
+                                start: SeqNum(1),
+                                end: SeqNum(100),
+                            },
+                            target_nodes: vec![],
+                            cost: CostEstimate::default(),
+                        }),
+                        group_by: None,
+                        field_path: "seq".to_string(),
+                        kind: NumericReductionKind::Percentile { p },
+                    },
+                    target_nodes: vec![],
+                    cost: CostEstimate::default(),
+                },
+                total_cost: CostEstimate::default(),
+            };
+            let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+                .await
+                .into_iter()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(rows.len(), 1, "p={p} should produce one bucket");
+            let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
+            assert_eq!(
+                decoded.value,
+                AggregateValue::Percentile(Some(42.0)),
+                "singleton at p={p} must return the only value",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_avg_singleton_returns_the_only_value() {
+        // Same singleton edge for `Avg`. Numerically `sum / count
+        // == value / 1 == value`; pin so a future divide-by-zero
+        // guard that bails too early can't reintroduce a None.
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, AggregateValue, NumericAggregateKind,
+        };
+
+        let chain = 0xAA;
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(chain, SeqNum(7), vec![]);
+        let executor = LocalMeshQueryExecutor::new(reader);
+
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateNumeric {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: chain,
+                            start: SeqNum(1),
+                            end: SeqNum(100),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                    field_path: "seq".to_string(),
+                    kind: NumericAggregateKind::Avg,
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
+        assert_eq!(decoded.value, AggregateValue::Avg(Some(7.0)));
+    }
+
+    #[tokio::test]
+    async fn aggregate_count_with_empty_input_group_by_origin_returns_zero_rows() {
+        // Pin: `group_by` distinct from `None` over empty input
+        // produces zero rows (not one zero-count row). The
+        // `None` case has its own existing pin
+        // (`aggregate_count_empty_input_returns_zero`); this is
+        // the symmetric assertion that groups don't fabricate
+        // empty buckets.
+        use crate::adapter::net::behavior::meshdb::planner::{
+            CostEstimate, JoinKeyMode,
+        };
+
+        let chain = 0xAA;
+        let reader = Arc::new(InMemoryChainReader::default());
+        let executor = LocalMeshQueryExecutor::new(reader);
+
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateCount {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: chain,
+                            start: SeqNum(1),
+                            end: SeqNum(100),
+                        },
+                        target_nodes: vec![],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: Some(JoinKeyMode::Origin),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        let rows: Vec<ResultRow> = collect_rows(executor.execute(plan).await.unwrap().rows)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            rows.is_empty(),
+            "group_by over empty input must not fabricate buckets; got {} row(s)",
+            rows.len()
+        );
+    }
 }
