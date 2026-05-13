@@ -4600,8 +4600,7 @@ function MeshAutoform() {
             "rgb(212, 220, 208)",
             <>
               drift_correct nodes({touched.length}){" "}
-              <span className="text-ink-faint">{touched.join(" ")}</span>{" "}
-              reflow
+              <span className="text-ink-faint">{touched.join(" ")}</span> reflow
             </>,
           );
         }
@@ -4623,8 +4622,7 @@ function MeshAutoform() {
               if (n.cap === "data" && i !== d.hostIdx) dataNodes.push(i);
             }
             if (dataNodes.length > 0) {
-              target =
-                dataNodes[Math.floor(Math.random() * dataNodes.length)]!;
+              target = dataNodes[Math.floor(Math.random() * dataNodes.length)]!;
             }
           }
           if (target < 0) {
@@ -4648,7 +4646,8 @@ function MeshAutoform() {
             "rgb(61, 240, 255)",
             <>
               {isGravity ? "gravity_pull " : "mikoshi      "}
-              daemon.0x{d.hex}{"  "}0x{fromHex} → 0x{toHex}{" "}
+              daemon.0x{d.hex}
+              {"  "}0x{fromHex} → 0x{toHex}{" "}
               <span style={{ color: `rgb(${capabilityRgb(toCap)})` }}>
                 [{toCap}]
               </span>
@@ -4774,7 +4773,7 @@ function MeshAutoform() {
             ctx.fillText("·", px, py);
           }
           // moving packet glyph
-          const packetT = ((edgeFlow + i * 0.13 + j * 0.07) % 1 + 1) % 1;
+          const packetT = (((edgeFlow + i * 0.13 + j * 0.07) % 1) + 1) % 1;
           const pkx = a.x + dx * packetT;
           const pky = a.y + dy * packetT;
           ctx.fillStyle = `rgba(196, 255, 61, ${opacity * 0.9})`;
@@ -4927,8 +4926,8 @@ function MeshAutoform() {
         <div>
           {feed.length === 0 ? (
             <div className="text-ink-faint">
-              <span className="text-accent animate-pulse-dot">█</span>{" "}
-              awaiting nodes...
+              <span className="text-accent animate-pulse-dot">█</span> awaiting
+              nodes...
             </div>
           ) : null}
           {feed.map((line) => (
@@ -4939,9 +4938,7 @@ function MeshAutoform() {
               <span className="text-ink-faint" style={{ minWidth: "9ch" }}>
                 {line.ts}
               </span>
-              <span
-                style={{ color: line.prefixColor, minWidth: "2ch" }}
-              >
+              <span style={{ color: line.prefixColor, minWidth: "2ch" }}>
                 {line.prefix}
               </span>
               <span className="text-ink flex-1 truncate">{line.body}</span>
@@ -4952,37 +4949,25 @@ function MeshAutoform() {
 
       <div className="flex flex-wrap gap-x-5 gap-y-2 border-t border-line px-4 py-3 text-[10px] tracking-[0.12em] text-ink-dim uppercase">
         <span className="flex items-center gap-2">
-          <span
-            className="font-mono"
-            style={{ color: "rgb(196, 255, 61)" }}
-          >
+          <span className="font-mono" style={{ color: "rgb(196, 255, 61)" }}>
             ◈
           </span>
           gpu
         </span>
         <span className="flex items-center gap-2">
-          <span
-            className="font-mono"
-            style={{ color: "rgb(107, 138, 30)" }}
-          >
+          <span className="font-mono" style={{ color: "rgb(107, 138, 30)" }}>
             ▣
           </span>
           vram
         </span>
         <span className="flex items-center gap-2">
-          <span
-            className="font-mono"
-            style={{ color: "rgb(61, 240, 255)" }}
-          >
+          <span className="font-mono" style={{ color: "rgb(61, 240, 255)" }}>
             ◉
           </span>
           region
         </span>
         <span className="flex items-center gap-2">
-          <span
-            className="font-mono"
-            style={{ color: "rgb(212, 220, 208)" }}
-          >
+          <span className="font-mono" style={{ color: "rgb(212, 220, 208)" }}>
             ◇
           </span>
           colo
@@ -4991,10 +4976,7 @@ function MeshAutoform() {
           <span className="font-mono text-ink">■</span> data · gravity well
         </span>
         <span className="flex items-center gap-2 sm:ml-auto">
-          <span
-            className="font-mono"
-            style={{ color: "rgb(61, 240, 255)" }}
-          >
+          <span className="font-mono" style={{ color: "rgb(61, 240, 255)" }}>
             ◆
           </span>
           daemon · mikoshi
@@ -5022,9 +5004,8 @@ const MESH_OS_CAPABILITY_STRIP: ReadonlyArray<{
   },
   {
     num: "mesh.os.3",
-    name: "Drift Correction",
-    isNew: true,
-    body: "conditions shift, the mesh rebalances. no operator in the loop. no central scheduler watching. self-organizing coordination.",
+    name: "Daemon Supervision",
+    body: "start, drain, restart, gate. exponential backoff. backpressure signals. graceful shutdown or forced.",
   },
   {
     num: "mesh.os.4",
@@ -5069,9 +5050,7 @@ function MeshOsSection() {
       <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
         <p className="text-[18px] text-ink leading-[1.5] font-light">
           The cluster thinks.{" "}
-          <strong className="text-accent font-medium">
-            The daemons move.
-          </strong>{" "}
+          <strong className="text-accent font-medium">The daemons move.</strong>{" "}
           The work gets done.
         </p>
       </div>
