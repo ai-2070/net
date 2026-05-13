@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::action::{MeshOsAction, PendingAction};
+use super::action::{ActionId, MeshOsAction, PendingAction};
 use super::config::BackpressureConfig;
 use super::event::{ChainId, DaemonRef};
 
@@ -67,7 +67,16 @@ pub struct BackpressureState {
     daemon_gates: HashMap<DaemonRef, Instant>,
     /// Sliding window of drain-triggered migrations within the
     /// current second. Bounded by `drain_rate_per_zone_per_sec`.
-    drain_window: Vec<Instant>,
+    /// Each entry is tagged with the admitting `ActionId` so
+    /// `release_failed_admit` removes by id (not by `Instant`
+    /// equality, which races when two admits land at the same
+    /// time anchor).
+    drain_window: Vec<(ActionId, Instant)>,
+    /// Action id of the most recent `PullReplica` that took the
+    /// `last_pull_admitted` slot. Used by `release_failed_admit`
+    /// to undo the reservation without clobbering a sibling's
+    /// admit that happens to share the same `Instant`.
+    last_pull_admitted_by: Option<ActionId>,
     /// Current action-queue depth observed by the executor. The
     /// executor pushes this in before calling `admit()` (the
     /// executor knows the depth; the admit layer reads it).
@@ -87,9 +96,14 @@ impl BackpressureState {
     /// Decide whether `action` may be dispatched now. Sync; no
     /// I/O; no allocations beyond the drain-window vec resize.
     /// `now` is the time anchor (passed in for testability +
-    /// deterministic admit-vs-reconcile sequencing).
+    /// deterministic admit-vs-reconcile sequencing); `action_id`
+    /// is the emitting `PendingAction`'s id, used to tag the
+    /// reservation so a failed dispatch can release the exact
+    /// slot it took (not a sibling's slot stamped at the same
+    /// `Instant`).
     pub fn admit(
         &mut self,
+        action_id: ActionId,
         action: &MeshOsAction,
         now: Instant,
         config: &BackpressureConfig,
@@ -117,6 +131,7 @@ impl BackpressureState {
                     }
                 }
                 self.last_pull_admitted = Some(now);
+                self.last_pull_admitted_by = Some(action_id);
                 self.chain_stabilization.insert(
                     *chain,
                     now.checked_add(config.replica_stabilization_window)
@@ -163,7 +178,7 @@ impl BackpressureState {
                         retry_after: Duration::from_millis(100),
                     };
                 }
-                self.drain_window.push(now);
+                self.drain_window.push((action_id, now));
                 AdmissionResult::Admit
             }
             // RequestPlacement / RequestEviction / MarkAvoid /
@@ -185,26 +200,33 @@ impl BackpressureState {
         self.daemon_gates.insert(daemon, until);
     }
 
-    /// Roll back the reservations [`admit`] made for `action` at
-    /// `now`. Call after a dispatch failure: the cooldowns admit
-    /// installed reflect a side effect that never happened, so
-    /// leaving them in place would gate unrelated future actions
-    /// for nothing. Safe under the executor's single-threaded
-    /// admit/dispatch sequence — any prior admit's reservations
-    /// had to have elapsed for this admit to return `Admit`.
-    pub fn release_failed_admit(&mut self, action: &MeshOsAction, now: Instant) {
+    /// Roll back the reservations [`admit`] made for the
+    /// `(action_id, action)` pair. Call after a dispatch failure:
+    /// the cooldowns admit installed reflect a side effect that
+    /// never happened, so leaving them in place would gate
+    /// unrelated future actions for nothing. The `action_id` tag
+    /// scopes the rollback to the matching admit so a sibling
+    /// admit at the same `Instant` doesn't lose its reservation.
+    pub fn release_failed_admit(&mut self, action_id: ActionId, action: &MeshOsAction) {
         match action {
             MeshOsAction::PullReplica { chain, .. } => {
-                if self.last_pull_admitted == Some(now) {
+                if self.last_pull_admitted_by == Some(action_id) {
                     self.last_pull_admitted = None;
+                    self.last_pull_admitted_by = None;
                 }
                 self.chain_stabilization.remove(chain);
             }
             MeshOsAction::DropReplica { chain } => {
                 self.chain_stabilization.remove(chain);
             }
-            MeshOsAction::MigrateBlob { .. } if self.drain_window.last() == Some(&now) => {
-                self.drain_window.pop();
+            MeshOsAction::MigrateBlob { .. } => {
+                if let Some(pos) = self
+                    .drain_window
+                    .iter()
+                    .position(|(id, _)| *id == action_id)
+                {
+                    self.drain_window.remove(pos);
+                }
             }
             _ => {}
         }
@@ -250,7 +272,7 @@ impl BackpressureState {
 
     fn gc_drain_window(&mut self, now: Instant) {
         let cutoff = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
-        self.drain_window.retain(|t| *t > cutoff);
+        self.drain_window.retain(|(_, t)| *t > cutoff);
     }
 }
 
@@ -278,7 +300,7 @@ pub fn admit(
     now: Instant,
     config: &BackpressureConfig,
 ) -> AdmissionResult {
-    state.admit(&pending.action, now, config)
+    state.admit(pending.id, &pending.action, now, config)
 }
 
 #[cfg(test)]
@@ -305,8 +327,13 @@ mod tests {
         base + Duration::from_millis(ms)
     }
 
+    fn aid(n: u64) -> ActionId {
+        ActionId(n)
+    }
+
     fn admit_pull(state: &mut BackpressureState, chain: ChainId, now: Instant) -> AdmissionResult {
         state.admit(
+            aid(chain),
             &MeshOsAction::PullReplica { chain, source: 1 },
             now,
             &BackpressureConfig::default(),
@@ -327,6 +354,7 @@ mod tests {
         let _ = admit_pull(&mut state, 1, t_ms(0));
         // Second pull at t=100ms (within the default 250 ms cooldown).
         match state.admit(
+            aid(2),
             &MeshOsAction::PullReplica {
                 chain: 2,
                 source: 1,
@@ -383,6 +411,7 @@ mod tests {
         let mut state = BackpressureState::new();
         let _ = admit_pull(&mut state, 1, t(0));
         match state.admit(
+            aid(2),
             &MeshOsAction::DropReplica { chain: 1 },
             t(10),
             &BackpressureConfig::default(),
@@ -398,6 +427,7 @@ mod tests {
         let d = dref("telemetry", 1);
         state.record_daemon_gate(d.clone(), t(60));
         match state.admit(
+            aid(1),
             &MeshOsAction::StartDaemon { daemon: d.clone() },
             t(0),
             &BackpressureConfig::default(),
@@ -421,6 +451,7 @@ mod tests {
         // Past the gate — admit.
         assert_eq!(
             state.admit(
+                aid(1),
                 &MeshOsAction::StartDaemon { daemon: d.clone() },
                 t(61),
                 &BackpressureConfig::default(),
@@ -449,6 +480,7 @@ mod tests {
         for i in 0..10 {
             assert_eq!(
                 state.admit(
+                    aid(100 + i),
                     &MeshOsAction::MigrateBlob {
                         blob: i,
                         from: 1,
@@ -462,6 +494,7 @@ mod tests {
         }
         // 11th in the same second → Defer.
         match state.admit(
+            aid(111),
             &MeshOsAction::MigrateBlob {
                 blob: 11,
                 from: 1,
@@ -481,6 +514,7 @@ mod tests {
         let cfg = BackpressureConfig::default();
         for i in 0..10 {
             let _ = state.admit(
+                aid(200 + i),
                 &MeshOsAction::MigrateBlob {
                     blob: i,
                     from: 1,
@@ -494,6 +528,7 @@ mod tests {
         // migrations admit again.
         assert_eq!(
             state.admit(
+                aid(299),
                 &MeshOsAction::MigrateBlob {
                     blob: 99,
                     from: 1,
@@ -575,8 +610,11 @@ mod tests {
                 target: MaintenanceTransition::Maintenance,
             },
         ];
-        for action in cases {
-            assert_eq!(state.admit(&action, t(0), &cfg), AdmissionResult::Admit);
+        for (idx, action) in cases.iter().enumerate() {
+            assert_eq!(
+                state.admit(aid(idx as u64 + 1), action, t(0), &cfg),
+                AdmissionResult::Admit,
+            );
         }
     }
 
@@ -588,6 +626,7 @@ mod tests {
         // First pull admits — cooldown + stabilization set.
         assert_eq!(
             state.admit(
+                aid(1),
                 &MeshOsAction::PullReplica {
                     chain: 1,
                     source: 2
@@ -601,11 +640,11 @@ mod tests {
         assert!(state.chain_stabilization.contains_key(&1));
         // Dispatch failed — release.
         state.release_failed_admit(
+            aid(1),
             &MeshOsAction::PullReplica {
                 chain: 1,
                 source: 2,
             },
-            now,
         );
         assert!(state.last_pull_admitted.is_none());
         assert!(!state.chain_stabilization.contains_key(&1));
@@ -614,6 +653,7 @@ mod tests {
         // forced Defer.
         assert_eq!(
             state.admit(
+                aid(2),
                 &MeshOsAction::PullReplica {
                     chain: 2,
                     source: 3
@@ -635,9 +675,12 @@ mod tests {
             from: 1,
             to: 2,
         };
-        assert_eq!(state.admit(&migrate, now, &cfg), AdmissionResult::Admit);
+        assert_eq!(
+            state.admit(aid(1), &migrate, now, &cfg),
+            AdmissionResult::Admit,
+        );
         assert_eq!(state.drain_window.len(), 1);
-        state.release_failed_admit(&migrate, now);
+        state.release_failed_admit(aid(1), &migrate);
         assert_eq!(state.drain_window.len(), 0);
     }
 
@@ -654,6 +697,7 @@ mod tests {
         let mut state = BackpressureState::new();
         let cfg = BackpressureConfig::default();
         let _ = state.admit(
+            aid(1),
             &MeshOsAction::PullReplica {
                 chain: 1,
                 source: 2,
@@ -663,6 +707,7 @@ mod tests {
         );
         let later = t_ms(300);
         let _ = state.admit(
+            aid(2),
             &MeshOsAction::PullReplica {
                 chain: 2,
                 source: 2,
@@ -672,11 +717,11 @@ mod tests {
         );
         assert_eq!(state.last_pull_admitted, Some(later));
         state.release_failed_admit(
+            aid(2),
             &MeshOsAction::PullReplica {
                 chain: 2,
                 source: 2,
             },
-            later,
         );
         // Anchor cleared; chain 2 stabilization removed.
         assert!(state.last_pull_admitted.is_none());
@@ -684,6 +729,44 @@ mod tests {
         // Chain 1's stabilization (installed by the first admit)
         // is untouched.
         assert!(state.chain_stabilization.contains_key(&1));
+    }
+
+    #[test]
+    fn release_failed_admit_removes_only_the_failing_drain_window_entry() {
+        // Two MigrateBlob admits at the same Instant. The second
+        // fails. release_failed_admit should remove the second's
+        // slot, not the first's, even though both have identical
+        // `Instant` timestamps. The drain-rate budget is
+        // preserved for the still-in-flight first migration.
+        let mut state = BackpressureState::new();
+        let cfg = BackpressureConfig::default();
+        let now = t_ms(0);
+        let first = MeshOsAction::MigrateBlob {
+            blob: 1,
+            from: 1,
+            to: 2,
+        };
+        let second = MeshOsAction::MigrateBlob {
+            blob: 2,
+            from: 1,
+            to: 2,
+        };
+        assert_eq!(
+            state.admit(aid(101), &first, now, &cfg),
+            AdmissionResult::Admit,
+        );
+        assert_eq!(
+            state.admit(aid(102), &second, now, &cfg),
+            AdmissionResult::Admit,
+        );
+        assert_eq!(state.drain_window.len(), 2);
+        // Second admit's dispatch fails — release by its id.
+        state.release_failed_admit(aid(102), &second);
+        assert_eq!(state.drain_window.len(), 1);
+        // The remaining slot belongs to the first admit
+        // (aid 101), preserving the budget already committed
+        // against the in-flight first migration.
+        assert_eq!(state.drain_window[0].0, aid(101));
     }
 
     #[test]

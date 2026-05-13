@@ -333,7 +333,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
         }
         match self
             .backpressure
-            .admit(&action.action, now, &self.config.backpressure)
+            .admit(action.id, &action.action, now, &self.config.backpressure)
         {
             AdmissionResult::Admit => {
                 self.dispatch_now_with_defer_count(action, now, prior_defers)
@@ -410,12 +410,12 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             }
             Err(err) => {
                 // Dispatch did not happen — roll back the
-                // reservations admit installed against
-                // `admit_anchor` so unrelated future actions
-                // aren't gated by a side effect that never
-                // occurred.
+                // reservations admit installed against this
+                // action's id so unrelated future actions aren't
+                // gated by a side effect that never occurred.
                 self.backpressure
-                    .release_failed_admit(&action.action, admit_anchor);
+                    .release_failed_admit(action.id, &action.action);
+                let _ = admit_anchor;
                 if let Some(after) = err.retry_after {
                     // Dispatch-error retries share the
                     // max_defer_count budget with admit-side
