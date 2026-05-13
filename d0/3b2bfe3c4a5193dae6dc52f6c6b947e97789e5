@@ -1,0 +1,24 @@
+net/crates/net/include/README.md
+  s_3a0a24a47d1a36::t_dd64b0d8515461 864-992
+  s_3a0a24a47d1a36::t_859c96ea3a9d45 14-16
+net/crates/net/include/net_meshdb.h
+  s_3a0a24a47d1a36::t_8d7cfe08bd89c3 1-418
+net/crates/net/examples/meshdb.c
+  s_3a0a24a47d1a36::t_0696c8017d532d 1-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "d03b2bfe3c4a5193dae6dc52f6c6b947e97789e5",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
