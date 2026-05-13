@@ -1608,6 +1608,40 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_eviction_is_idempotent_when_loop_writes_back_last_rebalance() {
+        // Regression for the C3 review item. The pure reconcile
+        // function reads `last_rebalance`; the canonical event
+        // loop writes it after consuming the emitted action. A
+        // re-run of reconcile within the cooldown window must
+        // emit nothing.
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        let first = scheduler_call(&actual, Some(&scorer));
+        assert_eq!(
+            first,
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN_A,
+                victim: THIS_NODE,
+            }],
+        );
+        // Simulate the loop's writeback after consuming the
+        // emitted action.
+        actual.last_rebalance.insert(CHAIN_A, base);
+        let second = scheduler_call(&actual, Some(&scorer));
+        assert!(
+            second.is_empty(),
+            "second reconcile within cooldown must not re-emit",
+        );
+    }
+
+    #[test]
     fn worst_holder_is_picked_as_victim() {
         let mut actual = MeshOsState::default();
         actual.replicas.insert(CHAIN_A, vec![THIS_NODE, 11, 12]);
