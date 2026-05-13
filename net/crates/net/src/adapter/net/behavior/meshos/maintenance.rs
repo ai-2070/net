@@ -95,6 +95,40 @@ pub enum MaintenanceState {
 }
 
 impl MaintenanceState {
+    /// Position in the state machine. Larger = further along.
+    /// `Active` is `0`, `Recovery` is `5`. A transition is valid
+    /// when the new position is `>=` the current position, OR
+    /// when the new state is `Active` (the `Recovery → Active`
+    /// terminal arc wraps to `0`). Same-position transitions
+    /// stay idempotent.
+    fn rank(&self) -> u8 {
+        match self {
+            MaintenanceState::Active => 0,
+            MaintenanceState::EnteringMaintenance { .. } => 1,
+            MaintenanceState::Maintenance { .. } => 2,
+            MaintenanceState::ExitingMaintenance { .. } => 3,
+            MaintenanceState::DrainFailed { .. } => 3,
+            MaintenanceState::Recovery { .. } => 4,
+        }
+    }
+
+    /// `true` when `new` is a permissible successor to `self`.
+    /// Forward arcs in the diagram + the `Recovery → Active`
+    /// terminal arc are valid; backward arcs (e.g., a late-
+    /// arriving `Maintenance` observed event after `Recovery`)
+    /// are not. Same-rank transitions are valid (idempotent
+    /// replay of the same observed state).
+    pub fn is_valid_successor(&self, new: &MaintenanceState) -> bool {
+        if matches!(new, MaintenanceState::Active) {
+            // Only Recovery → Active is the legal way to land
+            // back at Active. Other states transitioning to
+            // Active is a backward jump.
+            return matches!(self, MaintenanceState::Recovery { .. })
+                || matches!(self, MaintenanceState::Active);
+        }
+        new.rank() >= self.rank()
+    }
+
     /// `true` when the node is in any state other than
     /// `Active`. Used by reconcile to short-circuit replica /
     /// daemon emission while a maintenance window is in flight.
@@ -155,5 +189,45 @@ mod tests {
         let recovery = MaintenanceState::Recovery { since: base };
         assert!(recovery.is_non_active());
         assert!(!recovery.is_steady_maintenance());
+    }
+
+    #[test]
+    fn is_valid_successor_accepts_forward_arcs_only() {
+        let base = Instant::now();
+        let active = MaintenanceState::Active;
+        let entering = MaintenanceState::EnteringMaintenance {
+            since: base,
+            deadline: None,
+        };
+        let maintenance = MaintenanceState::Maintenance { since: base };
+        let exiting = MaintenanceState::ExitingMaintenance { since: base };
+        let drain_failed = MaintenanceState::DrainFailed {
+            since: base,
+            reason: "deadline".into(),
+        };
+        let recovery = MaintenanceState::Recovery { since: base };
+
+        // Forward arcs (allowed).
+        assert!(active.is_valid_successor(&entering));
+        assert!(entering.is_valid_successor(&maintenance));
+        assert!(entering.is_valid_successor(&drain_failed));
+        assert!(maintenance.is_valid_successor(&exiting));
+        assert!(drain_failed.is_valid_successor(&exiting));
+        assert!(exiting.is_valid_successor(&recovery));
+        assert!(recovery.is_valid_successor(&active));
+
+        // Same-state (idempotent) — allowed.
+        assert!(entering.is_valid_successor(&entering));
+        assert!(recovery.is_valid_successor(&recovery));
+
+        // Backward arcs (rejected).
+        assert!(!entering.is_valid_successor(&active));
+        assert!(!maintenance.is_valid_successor(&entering));
+        assert!(!recovery.is_valid_successor(&maintenance));
+        assert!(!exiting.is_valid_successor(&entering));
+        assert!(!drain_failed.is_valid_successor(&entering));
+        // Active is only reachable from Recovery (or Active).
+        assert!(!maintenance.is_valid_successor(&active));
+        assert!(!entering.is_valid_successor(&active));
     }
 }

@@ -226,6 +226,18 @@ impl MeshOsState {
         };
         self.maintenance.insert(node, mirror);
         if node == this_node {
+            // Forward-only transitions. A late-arriving observed
+            // event for an older state (e.g. a replay anomaly
+            // pushing Recovery back to Maintenance) is dropped.
+            if !self.local_maintenance.is_valid_successor(&state) {
+                tracing::warn!(
+                    target: "meshos",
+                    current = ?self.local_maintenance,
+                    rejected = ?state,
+                    "MaintenanceTransitionObserved rejected — not a forward arc",
+                );
+                return;
+            }
             self.local_maintenance = state;
         }
     }
@@ -649,5 +661,38 @@ mod tests {
             state.local_maintenance,
             MaintenanceState::ExitingMaintenance { .. }
         ));
+    }
+
+    #[test]
+    fn maintenance_transition_observed_rejects_backward_arc() {
+        // A late-arriving observed event for an older state must
+        // not push the local machine backward. Land in Recovery
+        // first, then publish an observed Maintenance — the
+        // local state stays in Recovery.
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        let base = Instant::now();
+        state.local_maintenance = MaintenanceState::Recovery { since: base };
+        // Backward arc — should be rejected.
+        state.apply(
+            &MeshOsEvent::MaintenanceTransitionObserved {
+                node: THIS_NODE,
+                state: MaintenanceState::Maintenance { since: base },
+            },
+            THIS_NODE,
+        );
+        match &state.local_maintenance {
+            MaintenanceState::Recovery { since } => assert_eq!(*since, base),
+            other => panic!("expected Recovery to be preserved, got {other:?}"),
+        }
+        // Forward arc — should be accepted.
+        state.apply(
+            &MeshOsEvent::MaintenanceTransitionObserved {
+                node: THIS_NODE,
+                state: MaintenanceState::Active,
+            },
+            THIS_NODE,
+        );
+        assert!(matches!(state.local_maintenance, MaintenanceState::Active));
     }
 }
