@@ -24,13 +24,19 @@
 //! - `2` — Invalid argument (null pointer, out-of-range, etc.)
 //! - `3` — Runtime / executor error
 //!
-//! The detail message for non-OK statuses is fetched via the
-//! existing `net_last_error_message()` helper (which the cortex
-//! FFI already populates from a thread-local). Slice 1 keeps
-//! errors stringly-typed; structured access lands when consumers
-//! ask for it.
+//! The detail message for non-OK statuses is fetched via
+//! `net_meshdb_last_error_message()` (the latest message
+//! populated on the calling thread; the pointer is valid until
+//! the next FFI call on the same thread). The structured kind
+//! discriminator — one of the [`MeshError`] variants
+//! (`"planner_error"`, `"executor_error"`,
+//! `"historical_range_unavailable"`, `"query_cancelled"`,
+//! `"runtime_panic"`, etc.) — is available via
+//! `net_meshdb_last_error_kind()`.
 
-use std::ffi::c_int;
+use std::cell::RefCell;
+use std::ffi::{c_char, c_int, CString};
+use std::panic::AssertUnwindSafe;
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
@@ -53,6 +59,106 @@ pub const NET_MESHDB_END: c_int = 1;
 pub const NET_MESHDB_INVALID_ARG: c_int = 2;
 /// Status code: planner or executor surfaced an error.
 pub const NET_MESHDB_RUNTIME_ERR: c_int = 3;
+
+// =====================================================================
+// Thread-local last-error reporting
+// =====================================================================
+//
+// FFI errors flow through a per-thread "last error" pair (message
+// + kind). Callers retrieve both via the `_last_error_*` getters;
+// pointers stay valid until the next FFI call on the same thread
+// touches the thread-local. Both panics from the async closure and
+// `MeshError`s from the executor populate this.
+
+thread_local! {
+    static LAST_ERROR_MESSAGE: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_ERROR_KIND: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+fn set_last_error_from_mesh(err: &MeshError) {
+    let msg = CString::new(err.to_string()).ok();
+    let kind = CString::new(mesh_error_kind(err)).ok();
+    LAST_ERROR_MESSAGE.with(|c| *c.borrow_mut() = msg);
+    LAST_ERROR_KIND.with(|c| *c.borrow_mut() = kind);
+}
+
+fn set_last_error_from_panic(payload: &(dyn std::any::Any + Send)) {
+    // Best-effort extraction of the panic message; both
+    // `&str` and `String` are the common payload shapes.
+    let detail = if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic across FFI boundary".to_string()
+    };
+    let msg = CString::new(format!("runtime panic: {detail}")).ok();
+    let kind = CString::new("runtime_panic").ok();
+    LAST_ERROR_MESSAGE.with(|c| *c.borrow_mut() = msg);
+    LAST_ERROR_KIND.with(|c| *c.borrow_mut() = kind);
+}
+
+fn set_last_error_static(message: &str, kind: &str) {
+    let msg = CString::new(message).ok();
+    let kind = CString::new(kind).ok();
+    LAST_ERROR_MESSAGE.with(|c| *c.borrow_mut() = msg);
+    LAST_ERROR_KIND.with(|c| *c.borrow_mut() = kind);
+}
+
+fn clear_last_error() {
+    LAST_ERROR_MESSAGE.with(|c| *c.borrow_mut() = None);
+    LAST_ERROR_KIND.with(|c| *c.borrow_mut() = None);
+}
+
+/// Map a [`MeshError`] to a stable string discriminator.
+/// Shared with the Python / Node shims via the substrate's
+/// `error_kind` helper once that lands; the variant set here
+/// is the canonical list.
+fn mesh_error_kind(err: &MeshError) -> &'static str {
+    match err {
+        MeshError::HistoricalRangeUnavailable { .. } => "historical_range_unavailable",
+        MeshError::LineageMaxDepthExceeded { .. } => "lineage_max_depth_exceeded",
+        MeshError::LineageCycleDetected { .. } => "lineage_cycle_detected",
+        MeshError::JoinMemoryExceeded { .. } => "join_memory_exceeded",
+        MeshError::QueryBudgetExceeded { .. } => "query_budget_exceeded",
+        MeshError::PartialResult { .. } => "partial_result",
+        MeshError::PlannerError { .. } => "planner_error",
+        MeshError::ExecutorError { .. } => "executor_error",
+        MeshError::NoCapableHolder { .. } => "no_capable_holder",
+        MeshError::QueryCancelled => "query_cancelled",
+        _ => "unknown",
+    }
+}
+
+/// Return the most recent error message recorded on this
+/// thread, or NULL if there is none. The pointer is valid
+/// until the next FFI call on the same thread that touches
+/// the thread-local. Callers must not free the returned
+/// pointer.
+#[no_mangle]
+pub extern "C" fn net_meshdb_last_error_message() -> *const c_char {
+    LAST_ERROR_MESSAGE.with(|c| match &*c.borrow() {
+        Some(s) => s.as_ptr(),
+        None => ptr::null(),
+    })
+}
+
+/// Return the most recent error kind recorded on this thread,
+/// or NULL if there is none. Same lifetime rules as
+/// `net_meshdb_last_error_message`.
+#[no_mangle]
+pub extern "C" fn net_meshdb_last_error_kind() -> *const c_char {
+    LAST_ERROR_KIND.with(|c| match &*c.borrow() {
+        Some(s) => s.as_ptr(),
+        None => ptr::null(),
+    })
+}
+
+/// Clear the thread-local last-error state.
+#[no_mangle]
+pub extern "C" fn net_meshdb_clear_last_error() {
+    clear_last_error();
+}
 
 /// Opaque handle to a Phase F-less local executor over an
 /// in-memory chain reader. Holds its own `Arc<InMemoryStore>`
@@ -983,27 +1089,43 @@ pub unsafe extern "C" fn net_meshdb_runner_execute(
     query: *mut MeshDbQuery,
 ) -> *mut MeshDbIter {
     if runner.is_null() || query.is_null() {
+        set_last_error_static("null runner or query handle", "invalid_arg");
         return ptr::null_mut();
     }
+    clear_last_error();
     let runner_ref = &*runner;
     let plan = (&*query).plan.clone();
     let executor = runner_ref.executor.clone();
     let runtime = runner_ref.runtime.clone();
-    let rows: Result<Vec<ResultRow>, MeshError> = runtime.block_on(async move {
-        use futures::StreamExt;
-        let running = executor
-            .execute_with(plan, ExecuteOptions::default())
-            .await?;
-        let mut stream = running.rows;
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            out.push(item?);
+    // catch_unwind: user-controlled operators (aggregate
+    // div-by-zero, OOM hash-join) can panic inside the async
+    // block. Unwinding across the C ABI is UB, so we trap
+    // here and map to NET_MESHDB_RUNTIME_ERR with the panic
+    // payload surfaced via net_meshdb_last_error_*.
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        runtime.block_on(async move {
+            use futures::StreamExt;
+            let running = executor
+                .execute_with(plan, ExecuteOptions::default())
+                .await?;
+            let mut stream = running.rows;
+            let mut out = Vec::new();
+            while let Some(item) = stream.next().await {
+                out.push(item?);
+            }
+            Ok::<Vec<ResultRow>, MeshError>(out)
+        })
+    }));
+    match result {
+        Ok(Ok(rows)) => Box::into_raw(Box::new(MeshDbIter { rows, next_idx: 0 })),
+        Ok(Err(err)) => {
+            set_last_error_from_mesh(&err);
+            ptr::null_mut()
         }
-        Ok(out)
-    });
-    match rows {
-        Ok(rows) => Box::into_raw(Box::new(MeshDbIter { rows, next_idx: 0 })),
-        Err(_) => ptr::null_mut(),
+        Err(panic_payload) => {
+            set_last_error_from_panic(&*panic_payload);
+            ptr::null_mut()
+        }
     }
 }
 
@@ -1034,8 +1156,10 @@ pub unsafe extern "C" fn net_meshdb_runner_execute_with(
     cache_ttl_secs: f64,
 ) -> *mut MeshDbIter {
     if runner.is_null() || query.is_null() {
+        set_last_error_static("null runner or query handle", "invalid_arg");
         return ptr::null_mut();
     }
+    clear_last_error();
     let runner_ref = &*runner;
     let plan = (&*query).plan.clone();
     let executor = runner_ref.executor.clone();
@@ -1062,19 +1186,28 @@ pub unsafe extern "C" fn net_meshdb_runner_execute_with(
         bypass_cache: bypass_cache != 0,
         cache_policy,
     };
-    let rows: Result<Vec<ResultRow>, MeshError> = runtime.block_on(async move {
-        use futures::StreamExt;
-        let running = executor.execute_with(plan, options).await?;
-        let mut stream = running.rows;
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            out.push(item?);
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        runtime.block_on(async move {
+            use futures::StreamExt;
+            let running = executor.execute_with(plan, options).await?;
+            let mut stream = running.rows;
+            let mut out = Vec::new();
+            while let Some(item) = stream.next().await {
+                out.push(item?);
+            }
+            Ok::<Vec<ResultRow>, MeshError>(out)
+        })
+    }));
+    match result {
+        Ok(Ok(rows)) => Box::into_raw(Box::new(MeshDbIter { rows, next_idx: 0 })),
+        Ok(Err(err)) => {
+            set_last_error_from_mesh(&err);
+            ptr::null_mut()
         }
-        Ok(out)
-    });
-    match rows {
-        Ok(rows) => Box::into_raw(Box::new(MeshDbIter { rows, next_idx: 0 })),
-        Err(_) => ptr::null_mut(),
+        Err(panic_payload) => {
+            set_last_error_from_panic(&*panic_payload);
+            ptr::null_mut()
+        }
     }
 }
 
@@ -1579,5 +1712,75 @@ mod tests {
             let q = net_meshdb_query_lineage_emit(0xAA, bad.as_ptr(), dir.as_ptr());
             assert!(q.is_null());
         }
+    }
+
+    #[test]
+    fn ffi_last_error_starts_null_and_clears_correctly() {
+        unsafe {
+            net_meshdb_clear_last_error();
+            assert!(net_meshdb_last_error_message().is_null());
+            assert!(net_meshdb_last_error_kind().is_null());
+        }
+    }
+
+    #[test]
+    fn ffi_null_handle_populates_last_error() {
+        unsafe {
+            net_meshdb_clear_last_error();
+            // Trigger the null-handle branch: passing a null
+            // runner should set the last-error to the
+            // invalid-arg kind and return a null iterator.
+            let q = net_meshdb_query_latest(0xAB);
+            let iter = net_meshdb_runner_execute(ptr::null_mut(), q);
+            assert!(iter.is_null());
+
+            let msg_ptr = net_meshdb_last_error_message();
+            let kind_ptr = net_meshdb_last_error_kind();
+            assert!(!msg_ptr.is_null());
+            assert!(!kind_ptr.is_null());
+            let kind = std::ffi::CStr::from_ptr(kind_ptr).to_str().unwrap();
+            assert_eq!(kind, "invalid_arg");
+
+            net_meshdb_query_free(q);
+        }
+    }
+
+    #[test]
+    fn ffi_mesh_error_kind_round_trip_covers_known_variants() {
+        // Pin the variant→string mapping so SDK consumers can
+        // branch on `kind` strings without grepping the substrate.
+        use net::adapter::net::behavior::meshdb::BudgetMetric;
+        assert_eq!(
+            mesh_error_kind(&MeshError::QueryCancelled),
+            "query_cancelled"
+        );
+        assert_eq!(
+            mesh_error_kind(&MeshError::PlannerError {
+                detail: "x".into()
+            }),
+            "planner_error"
+        );
+        assert_eq!(
+            mesh_error_kind(&MeshError::ExecutorError {
+                node: 0,
+                detail: "x".into()
+            }),
+            "executor_error"
+        );
+        assert_eq!(
+            mesh_error_kind(&MeshError::JoinMemoryExceeded {
+                strategy: "x".into(),
+                threshold_bytes: 0
+            }),
+            "join_memory_exceeded"
+        );
+        assert_eq!(
+            mesh_error_kind(&MeshError::QueryBudgetExceeded {
+                metric: BudgetMetric::MaxRows,
+                used: 0,
+                limit: 0
+            }),
+            "query_budget_exceeded"
+        );
     }
 }

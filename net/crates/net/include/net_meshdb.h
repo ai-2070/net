@@ -47,11 +47,24 @@
  *
  * Factory functions (query / runner / iter constructors) return a
  * pointer; NULL signals failure. The factory's failure mode is
- * "invalid input or planner rejection" — there is no detail
- * channel in the current FFI surface (callers that need structured
- * errors should use the Python / Node / Go SDKs which wrap this
- * one). A future revision may add `out_err` out-params on the
- * factory entry points.
+ * "invalid input or planner rejection".
+ *
+ * Detail for the most recent failure is available on a per-thread
+ * basis via `net_meshdb_last_error_message` (human-readable
+ * detail) and `net_meshdb_last_error_kind` (one of the
+ * `MeshError` variant tags such as `"planner_error"`,
+ * `"executor_error"`, `"query_cancelled"`, `"runtime_panic"`,
+ * `"invalid_arg"`, etc.). Both return NULL when no error has
+ * been recorded on the calling thread. Returned pointers are
+ * valid until the next FFI call on the same thread touches the
+ * thread-local; callers must NOT free them. Use
+ * `net_meshdb_clear_last_error` to reset state.
+ *
+ * Panics from user-controlled operators (aggregate division by
+ * zero, OOM in hash-join, etc.) are trapped by `catch_unwind`
+ * around the async closure; instead of unwinding across the C
+ * ABI (which is UB), the runner returns NULL and populates the
+ * last-error pair with kind `"runtime_panic"`.
  *
  * # Threading
  *
@@ -428,6 +441,29 @@ char* net_meshdb_decode_payload_json(
 /* Free a C-string returned by `net_meshdb_decode_payload_json`.
  * No-op on NULL. */
 void net_meshdb_free_string(char* s);
+
+/* =========================================================================
+ * Last-error reporting (thread-local)
+ * ========================================================================= */
+
+/* Most recent error message recorded on the calling thread, or
+ * NULL if no error has been recorded. The pointer is valid until
+ * the next FFI call on the same thread that touches the
+ * thread-local. Callers must NOT free the returned pointer. */
+const char* net_meshdb_last_error_message(void);
+
+/* Most recent error kind discriminator recorded on the calling
+ * thread. One of the `MeshError` variant tags
+ * (`"planner_error"`, `"executor_error"`, `"query_cancelled"`,
+ * `"join_memory_exceeded"`, `"query_budget_exceeded"`,
+ * `"runtime_panic"`, `"invalid_arg"`, etc.), or NULL if no error
+ * has been recorded. Same lifetime rules as the message. */
+const char* net_meshdb_last_error_kind(void);
+
+/* Reset the thread-local last-error pair to NULL. Useful as a
+ * defensive prelude in test harnesses that may have inherited
+ * state from a prior iteration. */
+void net_meshdb_clear_last_error(void);
 
 #ifdef __cplusplus
 } /* extern "C" */
