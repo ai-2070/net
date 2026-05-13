@@ -106,8 +106,6 @@ jobs:
           --test cross_lang_capability_fixtures
           --test migration_integration
           --test migration_target_failure_mid_chunking
-          --test nrpc_inbound_dispatcher
-          --test queue_group_dispatch
 
       # === NAT traversal ==================================================
       - name: NAT traversal
@@ -158,6 +156,8 @@ jobs:
           --test integration_nrpc_service_discovery
           --test integration_nrpc_predicate_header
           --test integration_nrpc_cross_lang
+          --test nrpc_inbound_dispatcher
+          --test queue_group_dispatch
 
       # === NetDB ==========================================================
       - name: NetDB
