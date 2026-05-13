@@ -140,9 +140,16 @@ pub extern "C" fn net_meshdb_reader_new() -> *mut MeshDbReader {
     }))
 }
 
-/// Free a reader handle. No-op on null. Safe to call even
-/// while a `MeshDbRunner` built from this reader is still
-/// live — the runner holds its own Arc clone of the store.
+/// Free a reader handle. No-op on null.
+///
+/// Freeing the reader does NOT tear down a `MeshDbRunner`
+/// built from it — the runner holds its own
+/// `Arc<InMemoryStore>` clone and stays usable. But once the
+/// reader is freed, calling `net_meshdb_reader_append` on
+/// that pointer is undefined behaviour (use-after-free). If
+/// you intend to keep appending after a runner is built,
+/// keep the reader alive too; otherwise free it after your
+/// last append.
 ///
 /// # Safety
 /// `reader` must be a pointer returned by
@@ -158,10 +165,16 @@ pub unsafe extern "C" fn net_meshdb_reader_free(reader: *mut MeshDbReader) {
 
 /// Append `(origin, seq, payload)` to the reader.
 ///
+/// New rows are visible to every `MeshDbRunner` that was
+/// constructed from this reader before or after the append —
+/// they share the same underlying `Arc<InMemoryStore>`.
+///
 /// # Safety
 /// `reader` must be a valid pointer returned by
-/// `net_meshdb_reader_new`. `payload` must be a valid pointer
-/// to `payload_len` bytes, or null when `payload_len == 0`.
+/// `net_meshdb_reader_new` and not yet freed — calling this
+/// after `net_meshdb_reader_free(reader)` is a use-after-free.
+/// `payload` must be a valid pointer to `payload_len` bytes,
+/// or null when `payload_len == 0`.
 #[no_mangle]
 pub unsafe extern "C" fn net_meshdb_reader_append(
     reader: *mut MeshDbReader,
@@ -867,12 +880,25 @@ pub unsafe extern "C" fn net_meshdb_query_free(query: *mut MeshDbQuery) {
 // =====================================================================
 
 /// Construct a runner that shares the given reader's
-/// underlying store via `Arc` clone. The caller may safely
-/// free the reader pointer afterwards — the runner keeps the
-/// store alive until itself is freed. Subsequent
-/// `net_meshdb_reader_append` calls on the original reader
-/// pointer are visible to this runner because they target the
-/// same `Arc<InMemoryStore>`.
+/// underlying store via `Arc` clone.
+///
+/// Ownership / lifetime — TWO valid patterns:
+///
+/// 1. **Snapshot then free**: append everything you need on
+///    the reader, build the runner, then call
+///    `net_meshdb_reader_free(reader)`. The runner stays
+///    usable; further `reader_append` calls on the freed
+///    pointer are UB.
+/// 2. **Keep the reader alive**: do not free the reader
+///    while you still want to call `reader_append` against
+///    it. New appends are visible to the runner (same
+///    underlying `Arc<InMemoryStore>`). Free the reader after
+///    the last append (the runner is still usable).
+///
+/// What you must NOT do: free the reader and then continue
+/// to `reader_append` against the freed pointer. The runner
+/// alone is not sufficient to keep the reader-handle struct
+/// alive.
 ///
 /// # Safety
 /// `reader` must be a valid pointer returned by

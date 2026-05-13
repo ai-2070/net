@@ -128,15 +128,30 @@ typedef struct MeshDbIter    MeshDbIter;
  * the current allocator. Free with `net_meshdb_reader_free`. */
 MeshDbReader* net_meshdb_reader_new(void);
 
-/* Free a reader handle. No-op on NULL. Safe to call while a
- * runner constructed from this reader is still live — the runner
- * holds its own `Arc<InMemoryStore>` clone. */
+/* Free a reader handle. No-op on NULL.
+ *
+ * Freeing the reader does NOT tear down a MeshDbRunner built
+ * from it — the runner holds its own Arc<InMemoryStore> clone
+ * and stays usable. Once the reader is freed, however, calling
+ * net_meshdb_reader_append on that pointer is undefined
+ * behaviour (use-after-free). Two valid patterns:
+ *
+ *   (a) snapshot-then-free: append everything you need, build
+ *       the runner, then free the reader. Do not append further.
+ *   (b) keep-alive: do not free the reader while you still want
+ *       to append. New appends are visible to the runner. Free
+ *       the reader after the last append. */
 void net_meshdb_reader_free(MeshDbReader* reader);
 
 /* Append `(origin, seq, payload)` to the reader. `payload` may
  * be NULL when `payload_len == 0`. Returns NET_MESHDB_OK on
  * success or NET_MESHDB_INVALID_ARG on a NULL reader / NULL
- * payload with non-zero length. */
+ * payload with non-zero length.
+ *
+ * New rows are visible to every MeshDbRunner that was
+ * constructed from this reader before or after the append —
+ * they share the same Arc<InMemoryStore>. Calling this after
+ * net_meshdb_reader_free(reader) is undefined behaviour. */
 int net_meshdb_reader_append(
     MeshDbReader* reader,
     uint64_t origin,
@@ -288,8 +303,11 @@ MeshDbQuery* net_meshdb_query_filter_json(
  * ========================================================================= */
 
 /* Build a cache-less runner over `reader`. The runner clones the
- * reader's `Arc<InMemoryStore>`; freeing the reader before the
- * runner is sound. Returns NULL on a NULL reader. */
+ * reader's `Arc<InMemoryStore>`; freeing the reader after the
+ * runner is built is sound — but see the lifetime note on
+ * `net_meshdb_reader_free`: once freed, calling
+ * `net_meshdb_reader_append` against the same pointer is UB.
+ * Returns NULL on a NULL reader. */
 MeshDbRunner* net_meshdb_runner_new(MeshDbReader* reader);
 
 /* Build a runner with the Phase F single-node LRU result cache
