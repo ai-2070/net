@@ -161,7 +161,7 @@ impl MeshOsState {
             MeshOsEvent::Tick => {
                 let now = Instant::now();
                 self.last_tick = Some(now);
-                self.gc_avoid_list();
+                self.gc_avoid_list(now);
                 self.release_elapsed_backoffs(now);
             }
             MeshOsEvent::ReplicaUpdate(update) => self.apply_replica(update),
@@ -285,13 +285,19 @@ impl MeshOsState {
         // commands also flip `local_maintenance` when they
         // target this node — the operator-driven transition
         // entry points into the state machine.
+        // Anchor admin-driven transitions on the most recent
+        // tick rather than wall-now so two replays of the same
+        // event sequence converge on the same `since` instants.
+        // Falls back to `Instant::now()` only on bootstrap
+        // before the first tick has fired.
+        let anchor = self.last_tick.unwrap_or_else(Instant::now);
         match admin {
             AdminEvent::EnterMaintenance { node, deadline } => {
                 self.maintenance
                     .insert(*node, MaintenanceMirror::EnteringMaintenance);
                 if *node == this_node {
                     self.local_maintenance = MaintenanceState::EnteringMaintenance {
-                        since: Instant::now(),
+                        since: anchor,
                         deadline: *deadline,
                     };
                 }
@@ -306,7 +312,7 @@ impl MeshOsState {
                     )
                 {
                     self.local_maintenance = MaintenanceState::ExitingMaintenance {
-                        since: Instant::now(),
+                        since: anchor,
                     };
                 }
             }
@@ -336,8 +342,7 @@ impl MeshOsState {
         }
     }
 
-    fn gc_avoid_list(&mut self) {
-        let now = Instant::now();
+    fn gc_avoid_list(&mut self, now: Instant) {
         self.avoid_list.retain(|_, entry| entry.until > now);
     }
 
@@ -542,6 +547,34 @@ mod tests {
             state.local_maintenance,
             MaintenanceState::EnteringMaintenance { .. }
         ));
+    }
+
+    #[test]
+    fn enter_maintenance_since_is_anchored_on_last_tick_for_replay_determinism() {
+        // Regression for I3: admin transitions used to sample
+        // `Instant::now()` inside the fold, so two replays of
+        // the same event sequence converged on different
+        // `since` values. Now they read the tick anchor.
+        const THIS_NODE: NodeId = 42;
+        let anchor = Instant::now();
+        let mut state = MeshOsState::default();
+        state.last_tick = Some(anchor);
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
+                node: THIS_NODE,
+                deadline: None,
+            }),
+            THIS_NODE,
+        );
+        match state.local_maintenance {
+            MaintenanceState::EnteringMaintenance { since, .. } => {
+                assert_eq!(
+                    since, anchor,
+                    "since must equal the tick anchor, not a fresh Instant::now",
+                );
+            }
+            other => panic!("expected EnteringMaintenance, got {other:?}"),
+        }
     }
 
     #[test]
