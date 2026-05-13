@@ -177,6 +177,14 @@ extern MeshDbIter* net_meshdb_runner_execute_with(
     int cache_policy_kind,
     double cache_ttl_secs
 );
+
+// Thread-local last-error pair populated by every FFI entry
+// point on a non-OK status. Pointers are valid until the next
+// FFI call on the same thread touches the thread-local; callers
+// must not free.
+extern const char* net_meshdb_last_error_message(void);
+extern const char* net_meshdb_last_error_kind(void);
+extern void net_meshdb_clear_last_error(void);
 */
 import "C"
 
@@ -207,6 +215,66 @@ var ErrMeshDBInvalidArg = errors.New("meshdb: invalid argument")
 // ErrMeshDBRuntime covers planner / executor failures surfaced
 // through `NET_MESHDB_RUNTIME_ERR`.
 var ErrMeshDBRuntime = errors.New("meshdb: runtime error")
+
+// MeshDBError wraps a sentinel (ErrMeshDBInvalidArg /
+// ErrMeshDBRuntime) with the FFI-supplied structured detail. The
+// `Kind` field carries one of the `MeshError` variant tags
+// (`planner_error`, `executor_error`, `query_cancelled`,
+// `historical_range_unavailable`, `runtime_panic`, …) so callers
+// can branch without parsing `Message`. `errors.Is(err,
+// ErrMeshDBRuntime)` continues to work via the wrapped sentinel.
+type MeshDBError struct {
+	Sentinel error  // ErrMeshDBInvalidArg or ErrMeshDBRuntime
+	Kind     string // FFI kind discriminator; empty when not reported
+	Message  string // FFI human-readable detail; empty when not reported
+}
+
+// Error renders as "meshdb: <sentinel> (kind=KIND): MSG" — falls
+// back to just the sentinel when the FFI didn't populate the
+// last-error pair.
+func (e *MeshDBError) Error() string {
+	if e == nil {
+		return "<nil meshdb error>"
+	}
+	if e.Kind == "" && e.Message == "" {
+		return e.Sentinel.Error()
+	}
+	if e.Kind != "" && e.Message != "" {
+		return fmt.Sprintf("%s (kind=%s): %s", e.Sentinel.Error(), e.Kind, e.Message)
+	}
+	if e.Kind != "" {
+		return fmt.Sprintf("%s (kind=%s)", e.Sentinel.Error(), e.Kind)
+	}
+	return fmt.Sprintf("%s: %s", e.Sentinel.Error(), e.Message)
+}
+
+// Unwrap exposes the sentinel for `errors.Is` routing.
+func (e *MeshDBError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Sentinel
+}
+
+// wrapMeshDBError reads the per-thread last-error pair from the
+// FFI and wraps a sentinel with the supplied detail. Always
+// returns a non-nil `*MeshDBError` so callers don't have to
+// nil-check before reading `.Kind`. Clears the thread-local
+// last-error state after reading so the next FFI call starts
+// fresh.
+func wrapMeshDBError(sentinel error) *MeshDBError {
+	err := &MeshDBError{Sentinel: sentinel}
+	msgPtr := C.net_meshdb_last_error_message()
+	if msgPtr != nil {
+		err.Message = C.GoString(msgPtr)
+	}
+	kindPtr := C.net_meshdb_last_error_kind()
+	if kindPtr != nil {
+		err.Kind = C.GoString(kindPtr)
+	}
+	C.net_meshdb_clear_last_error()
+	return err
+}
 
 // =====================================================================
 // Result row + result channel envelope
@@ -429,7 +497,7 @@ func (r *MeshDBRunner) ExecuteContext(
 		}
 		iter := C.net_meshdb_runner_execute(runnerPtr, queryPtr)
 		if iter == nil {
-			trySend(ctx, ch, MeshDBResult{Err: ErrMeshDBRuntime})
+			trySend(ctx, ch, MeshDBResult{Err: wrapMeshDBError(ErrMeshDBRuntime)})
 			return
 		}
 		defer C.net_meshdb_iter_free(iter)
@@ -527,7 +595,7 @@ func (r *MeshDBRunner) ExecuteWithContext(
 			ttl,
 		)
 		if iter == nil {
-			trySend(ctx, ch, MeshDBResult{Err: ErrMeshDBRuntime})
+			trySend(ctx, ch, MeshDBResult{Err: wrapMeshDBError(ErrMeshDBRuntime)})
 			return
 		}
 		defer C.net_meshdb_iter_free(iter)
@@ -579,10 +647,10 @@ func pumpIterRowsBody(ctx context.Context, iter *C.MeshDbIter, ch chan<- MeshDBR
 		case C.NET_MESHDB_END:
 			return
 		case C.NET_MESHDB_INVALID_ARG:
-			trySend(ctx, ch, MeshDBResult{Err: ErrMeshDBInvalidArg})
+			trySend(ctx, ch, MeshDBResult{Err: wrapMeshDBError(ErrMeshDBInvalidArg)})
 			return
 		default:
-			trySend(ctx, ch, MeshDBResult{Err: ErrMeshDBRuntime})
+			trySend(ctx, ch, MeshDBResult{Err: wrapMeshDBError(ErrMeshDBRuntime)})
 			return
 		}
 	}
