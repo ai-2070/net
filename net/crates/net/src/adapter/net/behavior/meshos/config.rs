@@ -93,6 +93,15 @@ pub struct BackpressureConfig {
     /// (`BackpressureOff` broadcast). Default 200. Hysteresis
     /// avoids on/off thrash near the threshold.
     pub cluster_backpressure_release: usize,
+
+    /// Maximum number of times the executor will re-defer a
+    /// single action before dropping it with a structured
+    /// failure record. Prevents a persistently-deferring action
+    /// (dispatcher returns `retry_after` forever, or a chain
+    /// whose stabilization window keeps re-arming) from
+    /// occupying the deferred-action heap indefinitely.
+    /// Default 16.
+    pub max_defer_count: u32,
 }
 
 impl Default for BackpressureConfig {
@@ -103,6 +112,7 @@ impl Default for BackpressureConfig {
             replica_stabilization_window: Duration::from_secs(60),
             cluster_backpressure_threshold: 1000,
             cluster_backpressure_release: 200,
+            max_defer_count: 16,
         }
     }
 }

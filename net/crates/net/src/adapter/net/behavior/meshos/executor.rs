@@ -197,6 +197,11 @@ impl ExecutorStats {
 struct DeferredEntry {
     retry_at: Instant,
     action: PendingAction,
+    /// Number of times this action has been deferred. Capped by
+    /// `BackpressureConfig::max_defer_count`; past the cap the
+    /// executor drops the action with a structured failure
+    /// record rather than keep it on the heap forever.
+    defer_count: u32,
 }
 
 impl PartialEq for DeferredEntry {
@@ -301,7 +306,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                 _ = sleep_until_opt(next_deadline), if next_deadline.is_some() => {
                     // SAFETY: peek above returned Some.
                     let due = self.deferred.pop().expect("deferred heap non-empty");
-                    self.handle_one(due.action).await;
+                    self.handle_one_retry(due.action, due.defer_count).await;
                 }
             }
         }
@@ -309,6 +314,10 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
     }
 
     async fn handle_one(&mut self, action: PendingAction) {
+        self.handle_one_retry(action, 0).await
+    }
+
+    async fn handle_one_retry(&mut self, action: PendingAction, prior_defers: u32) {
         let now = Instant::now();
         self.backpressure.tick(now);
         // Compute live queue depth (channel + deferred heap) and
@@ -335,12 +344,29 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             .backpressure
             .admit(&action.action, now, &self.config.backpressure)
         {
-            AdmissionResult::Admit => self.dispatch_now(action, now).await,
+            AdmissionResult::Admit => {
+                self.dispatch_now_with_defer_count(action, now, prior_defers).await
+            }
             AdmissionResult::Defer { retry_after } => {
+                let next_count = prior_defers.saturating_add(1);
+                if next_count > self.config.backpressure.max_defer_count {
+                    ExecutorStats::inc(&self.stats.failed);
+                    let reason = format!(
+                        "deferred {next_count} times — exceeds max_defer_count {}",
+                        self.config.backpressure.max_defer_count,
+                    );
+                    self.record_failure(
+                        format!("action-id:{}", action.id.0),
+                        reason.clone(),
+                    );
+                    let _ = append_failed(&self.chain_appender, &action, reason, None);
+                    return;
+                }
                 ExecutorStats::inc(&self.stats.deferred);
                 self.deferred.push(DeferredEntry {
                     retry_at: now + retry_after,
                     action,
+                    defer_count: next_count,
                 });
             }
             AdmissionResult::Gate {
@@ -364,7 +390,12 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
         }
     }
 
-    async fn dispatch_now(&mut self, action: PendingAction, admit_anchor: Instant) {
+    async fn dispatch_now_with_defer_count(
+        &mut self,
+        action: PendingAction,
+        admit_anchor: Instant,
+        prior_defers: u32,
+    ) {
         // Wrap the dispatcher in `catch_unwind` so a panicking
         // future doesn't unwind the executor task. The trait is
         // pluggable + third-party-installed; trust-but-isolate.
@@ -397,6 +428,28 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                 self.backpressure
                     .release_failed_admit(&action.action, admit_anchor);
                 if let Some(after) = err.retry_after {
+                    // Dispatch-error retries share the
+                    // max_defer_count budget with admit-side
+                    // defers — both occupy the same heap, both
+                    // are "this action couldn't run, try later".
+                    let next_count = prior_defers.saturating_add(1);
+                    if next_count > self.config.backpressure.max_defer_count {
+                        ExecutorStats::inc(&self.stats.failed);
+                        let reason = format!(
+                            "dispatch retry budget exhausted after {next_count} attempts",
+                        );
+                        self.record_failure(
+                            format!("action-id:{}", action.id.0),
+                            reason.clone(),
+                        );
+                        let _ = append_failed(
+                            &self.chain_appender,
+                            &action,
+                            reason,
+                            None,
+                        );
+                        return;
+                    }
                     ExecutorStats::inc(&self.stats.dispatch_retries);
                     let retry_ms = after.as_millis() as u64;
                     let _ = append_failed(
@@ -409,6 +462,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                     self.deferred.push(DeferredEntry {
                         retry_at: now + after,
                         action,
+                        defer_count: next_count,
                     });
                 } else {
                     ExecutorStats::inc(&self.stats.failed);
@@ -703,6 +757,67 @@ mod tests {
             .expect("executor did not exit after sender dropped")
             .expect("join");
         assert_eq!(stats.dispatched.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_retry_drops_after_exceeding_max_defer_count() {
+        // Regression for I7: a dispatcher that returns
+        // `retry_after` forever (a poison pill) used to occupy
+        // the deferred-action heap indefinitely. The defer
+        // budget caps total attempts; past the cap the
+        // executor drops the action with a failure record.
+        struct AlwaysRetry {
+            attempts: parking_lot::Mutex<u32>,
+        }
+        impl ActionDispatcher for AlwaysRetry {
+            fn dispatch<'a>(
+                &'a self,
+                _action: MeshOsAction,
+            ) -> BoxFuture<'a, Result<(), DispatchError>> {
+                Box::pin(async move {
+                    *self.attempts.lock() += 1;
+                    Err(DispatchError::retry(
+                        "transient",
+                        Duration::from_millis(5),
+                    ))
+                })
+            }
+        }
+
+        let mut cfg = MeshOsConfig::default();
+        cfg.backpressure.max_defer_count = 3;
+        let cfg = Arc::new(cfg);
+        let (tx, rx) = mpsc::channel(8);
+        let dispatcher = Arc::new(AlwaysRetry {
+            attempts: parking_lot::Mutex::new(0),
+        });
+        let exec = ActionExecutor::new(rx, cfg, Arc::clone(&dispatcher));
+        let task = tokio::spawn(exec.run());
+
+        tx.send(pending(
+            1,
+            MeshOsAction::CommitMaintenanceTransition {
+                node: 1,
+                target: MaintenanceTransition::Active,
+            },
+        ))
+        .await
+        .unwrap();
+        // Give the executor enough wall time for max_defer_count
+        // attempts + a few ms each.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(tx);
+        let stats = task.await.expect("join");
+        let attempts = *dispatcher.attempts.lock();
+        assert_eq!(
+            stats.failed.load(Ordering::Relaxed),
+            1,
+            "action must drop with a failure after exceeding max_defer_count",
+        );
+        assert!(
+            attempts >= 3 && attempts <= 5,
+            "expected ~max_defer_count dispatch attempts, got {attempts}",
+        );
     }
 
     #[tokio::test]
