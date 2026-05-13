@@ -661,6 +661,17 @@ impl PyMeshQuery {
         }
     }
 
+    /// Start a fluent builder. Equivalent to constructing a
+    /// fresh [`PyQueryBuilder`]; chainable methods (`at`,
+    /// `between`, `latest`, `filter`, `count`, `sum`, `avg`,
+    /// `min`, `max`, `percentile`, `distinct_count`, `window`,
+    /// `join`) compose into a final [`PyMeshQuery`] via
+    /// `.build()`.
+    #[staticmethod]
+    fn builder() -> PyQueryBuilder {
+        PyQueryBuilder { state: None }
+    }
+
     /// Filter `inner`'s rows by `predicate`. The executor builds
     /// a synthetic per-row tag view (origin / seq / flat JSON
     /// payload fields) and evaluates the predicate; rows whose
@@ -973,6 +984,189 @@ fn parse_join_strategy(s: Option<&str>) -> PyResult<JoinStrategy> {
         Some(other) => Err(MeshDbError::new_err(format!(
             "join strategy '{other}' not recognised; expected one of: hash_broadcast, sort_merge"
         ))),
+    }
+}
+
+/// Fluent builder for the common-ops query shape. Each
+/// chainable method returns a fresh builder so Python users
+/// can write `MeshQuery.builder().between(...).filter(...).count()`.
+///
+/// Source operators (`at` / `between` / `latest`) seed the
+/// pipeline; pipeline operators (`filter` / `count` / numeric
+/// aggregates / `window` / `join`) require a seeded state and
+/// surface a `MeshDbError` when called on an empty builder.
+/// `.build()` consumes the builder into a [`PyMeshQuery`].
+///
+/// Per the locked Phase F builder scope, this surface only
+/// covers the common ops — the rarer operators (`Lineage*`,
+/// payload-keyed grouping) still go through the
+/// [`PyMeshQuery`] factory methods.
+#[pyclass(name = "QueryBuilder", module = "net._net", from_py_object)]
+#[derive(Clone)]
+pub struct PyQueryBuilder {
+    state: Option<PyMeshQuery>,
+}
+
+#[pymethods]
+impl PyQueryBuilder {
+    /// Source: read a single event at `seq`. Resets any prior
+    /// builder state.
+    fn at(&self, origin: u64, seq: u64) -> Self {
+        Self {
+            state: Some(PyMeshQuery::at(origin, seq)),
+        }
+    }
+
+    /// Source: read events in the half-open seq range. Resets
+    /// any prior builder state.
+    fn between(&self, origin: u64, start: u64, end: u64) -> PyResult<Self> {
+        Ok(Self {
+            state: Some(PyMeshQuery::between(origin, start, end)?),
+        })
+    }
+
+    /// Source: read the tip event. Resets any prior builder
+    /// state.
+    fn latest(&self, origin: u64) -> Self {
+        Self {
+            state: Some(PyMeshQuery::latest(origin)),
+        }
+    }
+
+    /// Filter the current pipeline's rows by `predicate`.
+    fn filter(&self, predicate: &PyPredicate) -> PyResult<Self> {
+        let inner = self.require_state("filter")?;
+        Ok(Self {
+            state: Some(PyMeshQuery::filter(&inner, predicate)),
+        })
+    }
+
+    /// Count rows in the current pipeline.
+    #[pyo3(signature = (group_by=None))]
+    fn count(&self, group_by: Option<Vec<String>>) -> PyResult<Self> {
+        let inner = self.require_state("count")?;
+        Ok(Self {
+            state: Some(PyMeshQuery::count(&inner, group_by)?),
+        })
+    }
+
+    /// Sum / Avg / Min / Max / Percentile / DistinctCount over
+    /// the current pipeline. Same signatures as
+    /// [`PyMeshQuery`]'s factories.
+    #[pyo3(signature = (field, group_by=None))]
+    fn sum(&self, field: String, group_by: Option<Vec<String>>) -> PyResult<Self> {
+        let inner = self.require_state("sum")?;
+        Ok(Self {
+            state: Some(PyMeshQuery::sum(&inner, field, group_by)?),
+        })
+    }
+
+    #[pyo3(signature = (field, group_by=None))]
+    fn avg(&self, field: String, group_by: Option<Vec<String>>) -> PyResult<Self> {
+        let inner = self.require_state("avg")?;
+        Ok(Self {
+            state: Some(PyMeshQuery::avg(&inner, field, group_by)?),
+        })
+    }
+
+    #[pyo3(signature = (field, group_by=None))]
+    fn min(&self, field: String, group_by: Option<Vec<String>>) -> PyResult<Self> {
+        let inner = self.require_state("min")?;
+        Ok(Self {
+            state: Some(PyMeshQuery::min(&inner, field, group_by)?),
+        })
+    }
+
+    #[pyo3(signature = (field, group_by=None))]
+    fn max(&self, field: String, group_by: Option<Vec<String>>) -> PyResult<Self> {
+        let inner = self.require_state("max")?;
+        Ok(Self {
+            state: Some(PyMeshQuery::max(&inner, field, group_by)?),
+        })
+    }
+
+    #[pyo3(signature = (field, p, group_by=None))]
+    fn percentile(
+        &self,
+        field: String,
+        p: f64,
+        group_by: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        let inner = self.require_state("percentile")?;
+        Ok(Self {
+            state: Some(PyMeshQuery::percentile(&inner, field, p, group_by)?),
+        })
+    }
+
+    #[pyo3(signature = (field, group_by=None))]
+    fn distinct_count(
+        &self,
+        field: String,
+        group_by: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        let inner = self.require_state("distinct_count")?;
+        Ok(Self {
+            state: Some(PyMeshQuery::distinct_count(&inner, field, group_by)?),
+        })
+    }
+
+    /// Tumbling window on `seq` over the current pipeline.
+    fn window(&self, size: u64) -> PyResult<Self> {
+        let inner = self.require_state("window")?;
+        Ok(Self {
+            state: Some(PyMeshQuery::window(&inner, size)?),
+        })
+    }
+
+    /// Join the current pipeline (left) with `right` on
+    /// `key`. Equivalent to `MeshQuery.join(self.build(),
+    /// right, ...)`.
+    #[pyo3(signature = (right, kind, key, strategy=None, watermark_secs=5.0))]
+    fn join(
+        &self,
+        right: &PyMeshQuery,
+        kind: &str,
+        key: &str,
+        strategy: Option<&str>,
+        watermark_secs: f64,
+    ) -> PyResult<Self> {
+        let inner = self.require_state("join")?;
+        Ok(Self {
+            state: Some(PyMeshQuery::join(
+                &inner,
+                right,
+                kind,
+                key,
+                strategy,
+                watermark_secs,
+            )?),
+        })
+    }
+
+    /// Terminal: consume the builder into a `MeshQuery`.
+    /// Surfaces `MeshDbError` if the builder has no source
+    /// (`.at` / `.between` / `.latest` never called).
+    fn build(&self) -> PyResult<PyMeshQuery> {
+        self.require_state("build")
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.state {
+            None => "QueryBuilder(empty)".to_string(),
+            Some(q) => format!("QueryBuilder(state={})", q.__repr__()),
+        }
+    }
+}
+
+impl PyQueryBuilder {
+    /// Return a clone of the current state or surface a
+    /// helpful error naming the operator that needs one.
+    fn require_state(&self, op: &str) -> PyResult<PyMeshQuery> {
+        self.state.clone().ok_or_else(|| {
+            MeshDbError::new_err(format!(
+                "{op}: builder has no source — call .at(...), .between(...), or .latest(...) first"
+            ))
+        })
     }
 }
 

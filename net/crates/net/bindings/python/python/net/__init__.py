@@ -367,6 +367,7 @@ try:
         MeshQuery,
         MeshQueryRunner,
         Predicate,
+        QueryBuilder,
         ResultRow,
         WindowBoundary,
     )
@@ -386,6 +387,7 @@ else:
             "MeshQuery",
             "MeshQueryRunner",
             "Predicate",
+            "QueryBuilder",
             "ResultRow",
             "WindowBoundary",
         ]

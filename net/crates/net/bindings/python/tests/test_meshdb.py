@@ -20,6 +20,7 @@ try:
         MeshQuery,
         MeshQueryRunner,
         Predicate,
+        QueryBuilder,
         ResultRow,
         WindowBoundary,
     )
@@ -623,3 +624,186 @@ def test_filter_pipelined_with_aggregate() -> None:
     q = MeshQuery.count(highs)
     rows = runner.execute(q)
     assert rows[0].decode_aggregate().count == 3
+
+
+# ---------------------------------------------------------------------
+# Slice 4: fluent builder API.
+# ---------------------------------------------------------------------
+
+
+def test_builder_returns_query_builder_instance() -> None:
+    b = MeshQuery.builder()
+    assert isinstance(b, QueryBuilder)
+    assert "empty" in repr(b)
+
+
+def test_builder_build_without_source_raises() -> None:
+    with pytest.raises(MeshDbError) as excinfo:
+        MeshQuery.builder().build()
+    assert "no source" in str(excinfo.value)
+
+
+def test_builder_count_without_source_raises() -> None:
+    with pytest.raises(MeshDbError):
+        MeshQuery.builder().count()
+
+
+def test_builder_chain_at_then_build() -> None:
+    chain = 0xAB
+    reader = _reader_with([(chain, 7, b"v")])
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.builder().at(chain, 7).build()
+    rows = runner.execute(q)
+    assert len(rows) == 1
+    assert rows[0].seq == 7
+
+
+def test_builder_chain_between_filter_count_end_to_end() -> None:
+    chain = 0xC0DE
+    reader = _reader_with(
+        [
+            (chain, 1, b'{"severity":"high"}'),
+            (chain, 2, b'{"severity":"low"}'),
+            (chain, 3, b'{"severity":"high"}'),
+            (chain, 4, b'{"severity":"high"}'),
+            (chain, 5, b'{"severity":"low"}'),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = (
+        MeshQuery.builder()
+        .between(chain, 1, 10)
+        .filter(Predicate.equals("severity", "high"))
+        .count()
+        .build()
+    )
+    rows = runner.execute(q)
+    assert rows[0].decode_aggregate().count == 3
+
+
+def test_builder_between_window_pipeline() -> None:
+    chain = 0xAA
+    reader = _reader_with([(chain, s, f"p-{s}".encode()) for s in range(1, 8)])
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.builder().between(chain, 1, 20).window(3).build()
+    rows = runner.execute(q)
+    assert len(rows) == 3
+
+
+def test_builder_avg_with_group_by_origin() -> None:
+    chain = 0xAB
+    reader = _reader_with([(chain, s, b"") for s in (2, 4, 6)])
+    runner = MeshQueryRunner(reader)
+    q = (
+        MeshQuery.builder()
+        .between(chain, 1, 10)
+        .avg("seq", group_by=["origin"])
+        .build()
+    )
+    rows = runner.execute(q)
+    assert rows[0].decode_aggregate().value == pytest.approx(4.0)
+    assert rows[0].decode_aggregate().group.origin == chain
+
+
+def test_builder_join_with_existing_right_query() -> None:
+    a, b = 0x111, 0x222
+    reader = _reader_with(
+        [
+            (a, 1, b"a-1"),
+            (a, 2, b"a-2"),
+            (b, 1, b"b-1"),
+            (b, 2, b"b-2"),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    right_side = MeshQuery.builder().between(b, 1, 10).build()
+    q = (
+        MeshQuery.builder()
+        .between(a, 1, 10)
+        .join(right_side, kind="inner", key="seq")
+        .build()
+    )
+    rows = runner.execute(q)
+    # seqs 1 + 2 match → 2 pairs
+    assert len(rows) == 2
+    pairs = sorted(
+        (r.decode_joined().left.seq, r.decode_joined().right.seq) for r in rows
+    )
+    assert pairs == [(1, 1), (2, 2)]
+
+
+def test_builder_source_methods_reset_state() -> None:
+    # Each source call (at / between / latest) resets the
+    # pipeline. Test that after a source switch, the pipeline
+    # picks up cleanly.
+    chain = 0xAA
+    reader = _reader_with([(chain, 1, b"v"), (chain, 2, b"v")])
+    runner = MeshQueryRunner(reader)
+    b = MeshQuery.builder().at(chain, 99)  # nonexistent
+    # Reset to between
+    q = b.between(chain, 1, 5).count().build()
+    rows = runner.execute(q)
+    assert rows[0].decode_aggregate().count == 2
+
+
+def test_builder_is_immutable_per_step() -> None:
+    # Each chainable method returns a NEW builder; the
+    # original stays at its prior state. Verifies the fluent
+    # API doesn't accidentally mutate aliased builders.
+    base = MeshQuery.builder().between(0xAA, 1, 10)
+    a = base.count()
+    b = base.filter(Predicate.equals("seq", "1"))
+    # The two diverge: a produces a count plan; b produces a
+    # filter plan. The base stays at "between".
+    assert "count" in repr(a.build())
+    assert "filter" in repr(b.build())
+    assert "between" in repr(base.build())
+
+
+def test_builder_distinct_count_pipeline() -> None:
+    chain = 0xCD
+    reader = _reader_with(
+        [
+            (chain, 1, b'{"user":"alice"}'),
+            (chain, 2, b'{"user":"bob"}'),
+            (chain, 3, b'{"user":"alice"}'),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = (
+        MeshQuery.builder()
+        .between(chain, 1, 10)
+        .distinct_count("user")
+        .build()
+    )
+    rows = runner.execute(q)
+    assert rows[0].decode_aggregate().count == 2
+
+
+def test_builder_percentile_pipeline() -> None:
+    chain = 0xAB
+    reader = _reader_with([(chain, s, b"") for s in range(1, 11)])
+    runner = MeshQueryRunner(reader)
+    q = (
+        MeshQuery.builder()
+        .between(chain, 1, 20)
+        .percentile("seq", 0.5)
+        .build()
+    )
+    rows = runner.execute(q)
+    # p=0.5 → floor(0.5 * 9) = 4 → 5th element (0-indexed) = 5
+    assert rows[0].decode_aggregate().value == 5.0
+
+
+def test_builder_window_size_zero_rejected() -> None:
+    with pytest.raises(MeshDbError):
+        MeshQuery.builder().latest(0xAA).window(0)
+
+
+def test_builder_repr_reflects_current_state() -> None:
+    b = MeshQuery.builder()
+    assert "empty" in repr(b)
+    b2 = b.between(0xAA, 1, 10)
+    assert "between" in repr(b2)
+    b3 = b2.count()
+    assert "count" in repr(b3)
