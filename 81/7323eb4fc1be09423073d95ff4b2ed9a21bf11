@@ -1,0 +1,21 @@
+net/crates/net/README.md
+  s_630ab035313d41::t_44e4dc5797f99c 1263-1264
+  s_630ab035313d41::t_8372ef1b033084 868-906
+  s_630ab035313d41::t_d58eaeb5b2e677 53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "817323eb4fc1be09423073d95ff4b2ed9a21bf11",
+  "prompts": {},
+  "sessions": {
+    "s_630ab035313d41": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1a00700-50d8-4292-94fe-a7ef01c966ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
