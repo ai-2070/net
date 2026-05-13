@@ -954,6 +954,11 @@ fn encode_joined_row(
 /// Tunable in Phase D-2 once a consumer drives the value.
 pub const HASH_JOIN_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Hash-join probe table: key bytes → list of (row, matched-flag).
+/// The bool tracks whether the row has been matched by any probe
+/// — used by outer-join paths to emit unmatched-build rows.
+pub(crate) type HashJoinTable = std::collections::HashMap<Vec<u8>, Vec<(ResultRow, bool)>>;
+
 /// Build the hash-join probe table from a side of rows.
 ///
 /// Shared by the local executor's three hash-join variants
@@ -972,10 +977,9 @@ pub(crate) fn build_hash_join_table(
     rows: Vec<ResultRow>,
     key_mode: &JoinKeyMode,
     strategy_label: &str,
-) -> Result<std::collections::HashMap<Vec<u8>, Vec<(ResultRow, bool)>>, MeshError> {
-    use std::collections::HashMap;
+) -> Result<HashJoinTable, MeshError> {
     let mut build_bytes: u64 = 0;
-    let mut table: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
+    let mut table: HashJoinTable = HashJoinTable::new();
     for row in rows {
         let Some(key) = try_encode_join_key(&row, key_mode) else {
             continue;
