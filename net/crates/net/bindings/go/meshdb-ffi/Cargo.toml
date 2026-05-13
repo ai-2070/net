@@ -34,3 +34,7 @@ futures = "0.3"
 # so postcard isn't on the hot path here, but slice 2+ will
 # decode sentinel-row payloads on the Go side via this dep.
 postcard = { version = "1", default-features = false, features = ["alloc"] }
+# serde_json for the slice 3 predicate-JSON parser. The Go side
+# emits one JSON object per Filter call; the FFI parses it into
+# a typed `Predicate` then converts to PredicateWire.
+serde_json = "1"

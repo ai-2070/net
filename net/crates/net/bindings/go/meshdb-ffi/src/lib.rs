@@ -249,6 +249,8 @@ use net::adapter::net::behavior::meshdb::planner::{JoinKeyMode, JoinStrategy};
 use net::adapter::net::behavior::meshdb::query::{
     JoinKind, NumericAggregateKind, NumericReductionKind, WindowSpec,
 };
+use net::adapter::net::behavior::predicate::Predicate;
+use net::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
 
 unsafe fn parse_group_by_cstr(
     group_by: *const std::ffi::c_char,
@@ -471,6 +473,154 @@ pub unsafe extern "C" fn net_meshdb_query_join(
         watermark: std::time::Duration::from_secs_f64(watermark_secs),
     });
     Box::into_raw(Box::new(MeshDbQuery { plan }))
+}
+
+// =====================================================================
+// Slice 3: Filter + Predicate (JSON-encoded predicate)
+// =====================================================================
+//
+// The FFI accepts the predicate as a JSON object — same shape
+// the Python / Node SDKs build internally. Parsed here into the
+// typed `Predicate`, converted to PredicateWire, wrapped in a
+// Filter operator.
+//
+// JSON shape (mirrors Python `Predicate` factories):
+// - `{"kind":"exists","field":"<name>"}`
+// - `{"kind":"equals","field":"<name>","value":"<str>"}`
+// - `{"kind":"numeric_at_least","field":"<name>","threshold":N}`
+// - `{"kind":"numeric_at_most","field":"<name>","threshold":N}`
+// - `{"kind":"numeric_in_range","field":"<name>","min":N,"max":N}`
+// - `{"kind":"string_prefix","field":"<name>","prefix":"<str>"}`
+// - `{"kind":"string_matches","field":"<name>","pattern":"<str>"}`
+// - `{"kind":"semver_at_least","field":"<name>","version":"<str>"}`
+// - `{"kind":"and","children":[<pred>,...]}`
+// - `{"kind":"or","children":[<pred>,...]}`
+// - `{"kind":"not","child":<pred>}`
+//
+// Field names are row-intrinsic (`origin` / `seq`) or JSON
+// payload paths; matching is done against the synthetic per-row
+// tag view (see `row::synthetic_row_view`).
+
+/// Construct a `Filter(inner, predicate)` query. The predicate
+/// is a JSON object describing one of the shapes above; see the
+/// module comment for the schema. Returns null on parse error
+/// or any invalid argument.
+///
+/// # Safety
+/// `inner` valid pointer; `predicate_json` valid C-string of
+/// UTF-8 JSON.
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_query_filter_json(
+    inner: *const MeshDbQuery,
+    predicate_json: *const std::ffi::c_char,
+) -> *mut MeshDbQuery {
+    if inner.is_null() || predicate_json.is_null() {
+        return ptr::null_mut();
+    }
+    let Ok(json) = std::ffi::CStr::from_ptr(predicate_json).to_str() else {
+        return ptr::null_mut();
+    };
+    let Ok(predicate) = parse_predicate_json(json) else {
+        return ptr::null_mut();
+    };
+    let inner_node = (&*inner).plan.root.clone();
+    let plan = plan_of(OperatorPlan::Filter {
+        input: Box::new(inner_node),
+        predicate: predicate.to_wire(),
+    });
+    Box::into_raw(Box::new(MeshDbQuery { plan }))
+}
+
+fn parse_predicate_json(json: &str) -> std::result::Result<Predicate, ()> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|_| ())?;
+    parse_predicate_value(&value)
+}
+
+fn parse_predicate_value(v: &serde_json::Value) -> std::result::Result<Predicate, ()> {
+    let obj = v.as_object().ok_or(())?;
+    let kind = obj.get("kind").and_then(|k| k.as_str()).ok_or(())?;
+    let field = |k: &str| -> std::result::Result<TagKey, ()> {
+        let f = obj.get(k).and_then(|x| x.as_str()).ok_or(())?;
+        Ok(TagKey {
+            axis: TaxonomyAxis::Dataforts,
+            key: f.to_string(),
+        })
+    };
+    match kind {
+        "exists" => Ok(Predicate::Exists { key: field("field")? }),
+        "equals" => {
+            let value = obj.get("value").and_then(|x| x.as_str()).ok_or(())?;
+            Ok(Predicate::Equals {
+                key: field("field")?,
+                value: value.to_string(),
+            })
+        }
+        "numeric_at_least" => {
+            let threshold = obj.get("threshold").and_then(|x| x.as_f64()).ok_or(())?;
+            Ok(Predicate::NumericAtLeast {
+                key: field("field")?,
+                threshold,
+            })
+        }
+        "numeric_at_most" => {
+            let threshold = obj.get("threshold").and_then(|x| x.as_f64()).ok_or(())?;
+            Ok(Predicate::NumericAtMost {
+                key: field("field")?,
+                threshold,
+            })
+        }
+        "numeric_in_range" => {
+            let min = obj.get("min").and_then(|x| x.as_f64()).ok_or(())?;
+            let max = obj.get("max").and_then(|x| x.as_f64()).ok_or(())?;
+            if min > max {
+                return Err(());
+            }
+            Ok(Predicate::NumericInRange {
+                key: field("field")?,
+                min,
+                max,
+            })
+        }
+        "string_prefix" => {
+            let prefix = obj.get("prefix").and_then(|x| x.as_str()).ok_or(())?;
+            Ok(Predicate::StringPrefix {
+                key: field("field")?,
+                prefix: prefix.to_string(),
+            })
+        }
+        "string_matches" => {
+            let pattern = obj.get("pattern").and_then(|x| x.as_str()).ok_or(())?;
+            Ok(Predicate::StringMatches {
+                key: field("field")?,
+                pattern: pattern.to_string(),
+            })
+        }
+        "semver_at_least" => {
+            let version = obj.get("version").and_then(|x| x.as_str()).ok_or(())?;
+            Ok(Predicate::SemverAtLeast {
+                key: field("field")?,
+                version: version.to_string(),
+            })
+        }
+        "and" | "or" => {
+            let children_v = obj.get("children").and_then(|x| x.as_array()).ok_or(())?;
+            let mut children = Vec::with_capacity(children_v.len());
+            for c in children_v {
+                children.push(parse_predicate_value(c)?);
+            }
+            if kind == "and" {
+                Ok(Predicate::And(children))
+            } else {
+                Ok(Predicate::Or(children))
+            }
+        }
+        "not" => {
+            let child = obj.get("child").ok_or(())?;
+            let inner = parse_predicate_value(child)?;
+            Ok(Predicate::Not(Box::new(inner)))
+        }
+        _ => Err(()),
+    }
 }
 
 // =====================================================================
@@ -984,6 +1134,112 @@ mod tests {
             let json_ptr =
                 net_meshdb_decode_payload_json(bytes.as_ptr(), bytes.len());
             assert!(json_ptr.is_null());
+        }
+    }
+
+    /// Slice 3: filter via JSON predicate end-to-end.
+    /// `equals` on synthetic `seq` keeps the matching row only.
+    #[test]
+    fn ffi_filter_equals_via_json_predicate() {
+        unsafe {
+            let reader = net_meshdb_reader_new();
+            for s in 1u64..=3 {
+                let p = format!("p-{s}");
+                net_meshdb_reader_append(reader, 0xAB, s, p.as_ptr(), p.len());
+            }
+            let runner = net_meshdb_runner_new(reader);
+            let between = net_meshdb_query_between(0xAB, 1, 10);
+            let predicate_json =
+                std::ffi::CString::new(r#"{"kind":"equals","field":"seq","value":"2"}"#)
+                    .unwrap();
+            let filter =
+                net_meshdb_query_filter_json(between, predicate_json.as_ptr());
+            assert!(!filter.is_null());
+            let iter = net_meshdb_runner_execute(runner, filter);
+
+            let mut seqs: Vec<u64> = Vec::new();
+            for _ in 0..10 {
+                let mut origin: u64 = 0;
+                let mut seq: u64 = 0;
+                let mut p_ptr: *mut u8 = ptr::null_mut();
+                let mut p_len: usize = 0;
+                let status =
+                    net_meshdb_iter_next(iter, &mut origin, &mut seq, &mut p_ptr, &mut p_len);
+                if status == NET_MESHDB_END {
+                    break;
+                }
+                assert_eq!(status, NET_MESHDB_OK);
+                seqs.push(seq);
+                net_meshdb_payload_free(p_ptr, p_len);
+            }
+            assert_eq!(seqs, vec![2]);
+
+            net_meshdb_iter_free(iter);
+            net_meshdb_query_free(filter);
+            net_meshdb_query_free(between);
+            net_meshdb_runner_free(runner);
+            net_meshdb_reader_free(reader);
+        }
+    }
+
+    /// Slice 3: malformed predicate JSON returns null.
+    #[test]
+    fn ffi_filter_with_bad_json_returns_null() {
+        unsafe {
+            let inner = net_meshdb_query_latest(0x01);
+            let bad =
+                std::ffi::CString::new(r#"{"kind":"unknown","field":"x"}"#).unwrap();
+            let filter = net_meshdb_query_filter_json(inner, bad.as_ptr());
+            assert!(filter.is_null());
+            net_meshdb_query_free(inner);
+        }
+    }
+
+    /// Slice 3: composite predicate (and / numeric_at_least).
+    #[test]
+    fn ffi_filter_with_and_composition() {
+        unsafe {
+            let reader = net_meshdb_reader_new();
+            for s in 1u64..=5 {
+                let p = format!("p-{s}");
+                net_meshdb_reader_append(reader, 0xAB, s, p.as_ptr(), p.len());
+            }
+            let runner = net_meshdb_runner_new(reader);
+            let between = net_meshdb_query_between(0xAB, 1, 10);
+            // seq >= 3 AND seq <= 4 → only seqs 3 and 4
+            let predicate = std::ffi::CString::new(
+                r#"{"kind":"and","children":[
+                    {"kind":"numeric_at_least","field":"seq","threshold":3.0},
+                    {"kind":"numeric_at_most","field":"seq","threshold":4.0}
+                ]}"#,
+            )
+            .unwrap();
+            let filter = net_meshdb_query_filter_json(between, predicate.as_ptr());
+            assert!(!filter.is_null());
+            let iter = net_meshdb_runner_execute(runner, filter);
+
+            let mut seqs: Vec<u64> = Vec::new();
+            for _ in 0..10 {
+                let mut origin: u64 = 0;
+                let mut seq: u64 = 0;
+                let mut p_ptr: *mut u8 = ptr::null_mut();
+                let mut p_len: usize = 0;
+                let status =
+                    net_meshdb_iter_next(iter, &mut origin, &mut seq, &mut p_ptr, &mut p_len);
+                if status == NET_MESHDB_END {
+                    break;
+                }
+                assert_eq!(status, NET_MESHDB_OK);
+                seqs.push(seq);
+                net_meshdb_payload_free(p_ptr, p_len);
+            }
+            assert_eq!(seqs, vec![3, 4]);
+
+            net_meshdb_iter_free(iter);
+            net_meshdb_query_free(filter);
+            net_meshdb_query_free(between);
+            net_meshdb_runner_free(runner);
+            net_meshdb_reader_free(reader);
         }
     }
 

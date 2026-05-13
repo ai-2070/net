@@ -136,6 +136,12 @@ extern char* net_meshdb_decode_payload_json(
     size_t payload_len
 );
 extern void net_meshdb_free_string(char* s);
+
+// Slice 3: Filter via JSON-encoded predicate.
+extern MeshDbQuery* net_meshdb_query_filter_json(
+    const MeshDbQuery* inner,
+    const char* predicate_json
+);
 */
 import "C"
 
@@ -740,4 +746,118 @@ func (j jsonRow) toRow() MeshDBResultRow {
 		Seq:     j.Seq,
 		Payload: payload,
 	}
+}
+
+// =====================================================================
+// Slice 3: Filter + Predicate
+// =====================================================================
+//
+// The Go Predicate type is JSON-serialized then passed across
+// the FFI; the Rust side parses it into a typed `Predicate` and
+// converts to PredicateWire. Field names are row-intrinsic
+// (`origin` / `seq`) or JSON payload paths matched against the
+// synthetic per-row tag view.
+
+// MeshDBPredicate is the Go-side predicate builder. It marshals
+// to JSON in the shape the FFI parser expects. Construct via
+// the package-level factory functions
+// (`MeshDBPredicateEquals`, `MeshDBPredicateAnd`, ...). The
+// `Kind` discriminator is the JSON field tag.
+type MeshDBPredicate struct {
+	Kind      string             `json:"kind"`
+	Field     string             `json:"field,omitempty"`
+	Value     string             `json:"value,omitempty"`
+	Threshold *float64           `json:"threshold,omitempty"`
+	Min       *float64           `json:"min,omitempty"`
+	Max       *float64           `json:"max,omitempty"`
+	Prefix    string             `json:"prefix,omitempty"`
+	Pattern   string             `json:"pattern,omitempty"`
+	Version   string             `json:"version,omitempty"`
+	Children  []MeshDBPredicate  `json:"children,omitempty"`
+	Child     *MeshDBPredicate   `json:"child,omitempty"`
+}
+
+// MeshDBPredicateExists matches rows where `field` is present.
+func MeshDBPredicateExists(field string) MeshDBPredicate {
+	return MeshDBPredicate{Kind: "exists", Field: field}
+}
+
+// MeshDBPredicateEquals matches rows where `field == value` (string equality).
+func MeshDBPredicateEquals(field, value string) MeshDBPredicate {
+	return MeshDBPredicate{Kind: "equals", Field: field, Value: value}
+}
+
+// MeshDBPredicateNumericAtLeast: `field >= threshold`.
+func MeshDBPredicateNumericAtLeast(field string, threshold float64) MeshDBPredicate {
+	return MeshDBPredicate{Kind: "numeric_at_least", Field: field, Threshold: &threshold}
+}
+
+// MeshDBPredicateNumericAtMost: `field <= threshold`.
+func MeshDBPredicateNumericAtMost(field string, threshold float64) MeshDBPredicate {
+	return MeshDBPredicate{Kind: "numeric_at_most", Field: field, Threshold: &threshold}
+}
+
+// MeshDBPredicateNumericInRange: `min <= field <= max`.
+func MeshDBPredicateNumericInRange(field string, min, max float64) MeshDBPredicate {
+	return MeshDBPredicate{Kind: "numeric_in_range", Field: field, Min: &min, Max: &max}
+}
+
+// MeshDBPredicateStringPrefix: `field.startsWith(prefix)`.
+func MeshDBPredicateStringPrefix(field, prefix string) MeshDBPredicate {
+	return MeshDBPredicate{Kind: "string_prefix", Field: field, Prefix: prefix}
+}
+
+// MeshDBPredicateStringMatches: substring match (regex behind a
+// feature flag in the substrate; not exposed at the FFI yet).
+func MeshDBPredicateStringMatches(field, pattern string) MeshDBPredicate {
+	return MeshDBPredicate{Kind: "string_matches", Field: field, Pattern: pattern}
+}
+
+// MeshDBPredicateSemverAtLeast: `field >= version` (semver).
+func MeshDBPredicateSemverAtLeast(field, version string) MeshDBPredicate {
+	return MeshDBPredicate{Kind: "semver_at_least", Field: field, Version: version}
+}
+
+// MeshDBPredicateAnd: conjunction. Empty list is vacuously true
+// (substrate semantics).
+func MeshDBPredicateAnd(children ...MeshDBPredicate) MeshDBPredicate {
+	return MeshDBPredicate{Kind: "and", Children: children}
+}
+
+// MeshDBPredicateOr: disjunction. Empty list is vacuously false.
+func MeshDBPredicateOr(children ...MeshDBPredicate) MeshDBPredicate {
+	return MeshDBPredicate{Kind: "or", Children: children}
+}
+
+// MeshDBPredicateNot: negation.
+func MeshDBPredicateNot(child MeshDBPredicate) MeshDBPredicate {
+	return MeshDBPredicate{Kind: "not", Child: &child}
+}
+
+// MeshDBQueryFilter wraps `inner` in a Filter operator over
+// `predicate`. The predicate is JSON-encoded and passed across
+// the FFI boundary.
+func MeshDBQueryFilter(
+	inner *MeshDBQuery,
+	predicate MeshDBPredicate,
+) (*MeshDBQuery, error) {
+	if inner == nil || inner.ptr == nil {
+		return nil, fmt.Errorf("filter: inner is nil: %w", ErrMeshDBInvalidArg)
+	}
+	predJSON, err := json.Marshal(predicate)
+	if err != nil {
+		return nil, fmt.Errorf("filter: predicate marshal failed: %w", err)
+	}
+	predC := C.CString(string(predJSON))
+	defer C.free(unsafe.Pointer(predC))
+	ptr := C.net_meshdb_query_filter_json(inner.ptr, predC)
+	if ptr == nil {
+		return nil, fmt.Errorf(
+			"filter: factory returned null (check predicate shape): %w",
+			ErrMeshDBInvalidArg,
+		)
+	}
+	q := &MeshDBQuery{ptr: ptr}
+	runtime.SetFinalizer(q, func(q *MeshDBQuery) { q.Free() })
+	return q, nil
 }
