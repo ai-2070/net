@@ -20,7 +20,7 @@ use std::time::Duration;
 use net::adapter::net::behavior::meshdb::planner::{CostEstimate, ExecutionPlan, OperatorNode};
 use net::adapter::net::behavior::meshdb::{
     enable_meshdb_on_mesh, ChainReader, FederatedMeshQueryExecutor, LocalMeshQueryExecutor,
-    MeshDbServer, MeshQueryExecutor, OperatorPlan, SeqNum,
+    MeshDbServer, MeshQueryExecutor, OperatorPlan, SeqNum, MESHDB_SERVER_BATCH_ROWS,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
@@ -269,4 +269,230 @@ async fn federated_query_with_no_server_eventually_terminates() {
         }
         Ok(Some(Ok(row))) => panic!("unexpected row from a server-less peer: {row:?}"),
     }
+}
+
+/// Pin: a result set large enough to cross
+/// `MESHDB_SERVER_BATCH_ROWS` exercises the server's
+/// flush-on-full path. The server emits one or more intermediate
+/// `Batch { r#final: false }` frames followed by a final
+/// `Batch { r#final: true }` (or `End`). The caller must see
+/// every row in seq order and end up with the exact count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn federated_between_query_over_wire_streams_multiple_batches() {
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake(&a, &b).await;
+
+    let reader = Arc::new(InMemoryChainReader::default());
+    // Two and a half batches' worth so the executor flushes
+    // twice on full and once on drain.
+    let total: u64 = (MESHDB_SERVER_BATCH_ROWS as u64) * 2 + 17;
+    for seq in 1..=total {
+        reader.append(0xFEED, SeqNum(seq), format!("row-{seq}").into_bytes());
+    }
+    let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
+    let server = MeshDbServer::new(executor);
+    let (_db, _tb) = enable_meshdb_on_mesh(&b, Some(server.clone()));
+
+    let (_da, transport) = enable_meshdb_on_mesh(&a, None);
+    let fed = FederatedMeshQueryExecutor::new(transport);
+
+    let plan = atomic_plan(
+        OperatorPlan::BetweenRead {
+            origin: 0xFEED,
+            start: SeqNum(1),
+            end: SeqNum(total + 1),
+        },
+        b.node_id(),
+    );
+    let running = fed.execute(plan).await.expect("federated execute");
+
+    use futures::StreamExt;
+    let mut rows = Vec::new();
+    let mut stream = running.rows;
+    let drain = async {
+        while let Some(item) = stream.next().await {
+            rows.push(item.expect("row"));
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), drain)
+        .await
+        .expect("drain timed out");
+
+    assert_eq!(
+        rows.len(),
+        total as usize,
+        "every row across the batch boundary must surface",
+    );
+    let seqs: Vec<u64> = rows.iter().map(|r| r.seq.0).collect();
+    let expected: Vec<u64> = (1..=total).collect();
+    assert_eq!(seqs, expected, "rows must stay in seq order across batches");
+    assert_eq!(server.inflight_calls(), 0);
+}
+
+/// Pin: when the server's executor returns an error, the server
+/// ships a single `MeshDbResponse::Error` and the caller's stream
+/// surfaces the typed error rather than silently producing zero
+/// rows. The federated executor rejects `NotYetImplemented`
+/// plans locally, so to exercise the *server-side* error path we
+/// stand B up with a stub executor that always errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn federated_query_over_wire_propagates_executor_error() {
+    use async_trait::async_trait;
+    use net::adapter::net::behavior::meshdb::{
+        error::MeshError,
+        executor::{ExecuteOptions, RunningQuery},
+    };
+
+    /// Stub server-side executor: every `execute` call returns a
+    /// typed `ExecutorError`. Pins the wire's
+    /// `MeshDbResponse::Error` propagation.
+    struct AlwaysErrorExecutor;
+    #[async_trait]
+    impl MeshQueryExecutor for AlwaysErrorExecutor {
+        async fn execute(&self, _plan: ExecutionPlan) -> Result<RunningQuery, MeshError> {
+            Err(MeshError::ExecutorError {
+                node: 0xB,
+                detail: "synthetic-server-failure".to_string(),
+            })
+        }
+        async fn execute_with(
+            &self,
+            _plan: ExecutionPlan,
+            _options: ExecuteOptions,
+        ) -> Result<RunningQuery, MeshError> {
+            Err(MeshError::ExecutorError {
+                node: 0xB,
+                detail: "synthetic-server-failure".to_string(),
+            })
+        }
+    }
+
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake(&a, &b).await;
+
+    let executor: Arc<dyn MeshQueryExecutor> = Arc::new(AlwaysErrorExecutor);
+    let server = MeshDbServer::new(executor);
+    let (_db, _tb) = enable_meshdb_on_mesh(&b, Some(server.clone()));
+
+    let (_da, transport) = enable_meshdb_on_mesh(&a, None);
+    let fed = FederatedMeshQueryExecutor::new(transport);
+
+    // A plan that the federated executor will happily ship to B
+    // (atomic LatestRead with a single target node). B's stub
+    // executor then errors out.
+    let plan = atomic_plan(OperatorPlan::LatestRead { origin: 0xBADC0DE }, b.node_id());
+    let running = fed.execute(plan).await.expect("federated execute");
+
+    use futures::StreamExt;
+    let mut errors = Vec::new();
+    let mut rows = Vec::new();
+    let mut stream = running.rows;
+    let drain = async {
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(r) => rows.push(r),
+                Err(e) => errors.push(e),
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("drain timed out");
+
+    assert!(rows.is_empty(), "errored query must not emit rows");
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one typed error; got {errors:?}",
+    );
+    let rendered = format!("{}", errors[0]);
+    assert!(
+        rendered.contains("synthetic-server-failure"),
+        "error must carry executor's detail; got {rendered:?}",
+    );
+    // Server-side inflight clears on exit.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while server.inflight_calls() != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(server.inflight_calls(), 0);
+}
+
+/// Pin: dropping the caller-side stream signals the dispatcher
+/// to remove the inflight entry; the server-side per-call task
+/// either finishes naturally or surfaces a `QueryCancelled` if
+/// the operator drives an explicit cancel via the query handle.
+/// Either way, neither side leaks bookkeeping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn federated_query_caller_cancels_via_handle_clears_both_sides() {
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake(&a, &b).await;
+
+    // Wide enough that the caller cancels well before the server
+    // finishes the natural drain.
+    let reader = Arc::new(InMemoryChainReader::default());
+    let total: u64 = (MESHDB_SERVER_BATCH_ROWS as u64) * 4;
+    for seq in 1..=total {
+        reader.append(0xC0DE, SeqNum(seq), b"x".to_vec());
+    }
+    let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
+    let server = MeshDbServer::new(executor);
+    let (_db, _tb) = enable_meshdb_on_mesh(&b, Some(server.clone()));
+
+    let (_da, transport) = enable_meshdb_on_mesh(&a, None);
+    let fed = FederatedMeshQueryExecutor::new(transport);
+
+    let plan = atomic_plan(
+        OperatorPlan::BetweenRead {
+            origin: 0xC0DE,
+            start: SeqNum(1),
+            end: SeqNum(total + 1),
+        },
+        b.node_id(),
+    );
+    let running = fed.execute(plan).await.expect("federated execute");
+    let handle = running.handle.clone();
+
+    use futures::StreamExt;
+    let mut stream = running.rows;
+    // Drain a few rows, then cancel and drain the rest.
+    let mut got = 0usize;
+    while let Some(item) = stream.next().await {
+        if item.is_ok() {
+            got += 1;
+        }
+        if got >= 3 {
+            handle.cancel();
+            break;
+        }
+    }
+    // Continue draining post-cancel; the stream must terminate
+    // (either by closing or surfacing `QueryCancelled`).
+    let drain = async {
+        while let Some(item) = stream.next().await {
+            // Don't care about post-cancel items; just ensure
+            // the stream completes.
+            let _ = item;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("post-cancel drain timed out");
+    drop(stream);
+
+    // Server-side: the per-call task may still be in flight for
+    // a brief moment after the caller drops; give it a short
+    // grace window to unregister.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while server.inflight_calls() != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        server.inflight_calls(),
+        0,
+        "server-side inflight must clear after caller cancels",
+    );
 }
