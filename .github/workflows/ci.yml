@@ -439,6 +439,79 @@ jobs:
       - name: Run tests
         run: pytest -v
 
+  sdk-py-tests:
+    name: Python SDK tests (sdk-py, pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net/sdk-py
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # sdk-py is the pure-Python layer over the `ai2070-net` bindings.
+      # Its `tests/conftest.py` stubs the native `net` extension before
+      # any SDK module loads, so the test run does not need maturin or
+      # the Rust toolchain. `--no-deps` skips resolving the runtime
+      # `ai2070-net>=0.15.0` requirement against PyPI.
+      - name: Install sdk-py (no deps) + test deps
+        run: |
+          pip install --upgrade pip
+          pip install --no-deps -e .
+          pip install pytest pydantic
+
+      - name: Run tests
+        run: pytest -v
+
+  go-tests:
+    name: Go bindings tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.21"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
+
+      # The Go bindings link against `target/release/libnet.so` via cgo
+      # (`#cgo LDFLAGS: -L${SRCDIR}/../net/crates/net/target/release -lnet`
+      # in `go/net.go`). The bindings exercise mesh, cortex, blob, and
+      # NAT-traversal surfaces, so the cdylib needs the corresponding
+      # features at build time. `dataforts` enables the blob FFI used by
+      # `blob.go`; `netdb` chains to `cortex` → `redex` → `net`.
+      - name: Build net cdylib
+        working-directory: net/crates/net
+        run: cargo build --release --features "netdb dataforts redex-disk nat-traversal"
+
+      # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
+      # so local developers can run quick unit-style passes without the
+      # full mesh setup. CI wants the full coverage.
+      - name: Run Go tests
+        working-directory: go
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
+          RUN_INTEGRATION_TESTS: "1"
+        run: go test -v ./...
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
