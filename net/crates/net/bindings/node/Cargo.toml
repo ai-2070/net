@@ -78,6 +78,11 @@ groups = ["compute", "net-sdk/groups"]
 # `--features groups,test-helpers`; release / consumer builds stop
 # at `--features groups`.
 test-helpers = ["groups"]
+# MeshDB query layer — federated AST + planner + executor + result
+# cache. Standalone of `net`: the Node SDK's first MeshDB slice
+# ships a local executor over an in-memory ChainReader, so it
+# doesn't require the mesh transport surface to compile.
+meshdb = ["net/meshdb", "dep:postcard"]
 
 [dependencies]
 net = { package = "ai2070-net", version = "0.15.0", path = "../..", default-features = false }
@@ -97,6 +102,10 @@ bytes = "1.11.0"
 arc-swap = "1.7"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 hex = { version = "0.4", optional = true }
+# Postcard is the canonical MeshDB wire codec; the Node binding
+# decodes aggregate / joined-row / window payloads from result-row
+# bytes. Pulled in only when the `meshdb` feature activates.
+postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
 
 [build-dependencies]
 napi-build = "2.3.1"

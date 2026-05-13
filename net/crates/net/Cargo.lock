@@ -1558,6 +1558,7 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "postcard",
  "serde_json",
  "tokio",
  "xxhash-rust",
