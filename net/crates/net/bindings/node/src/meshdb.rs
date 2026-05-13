@@ -536,10 +536,16 @@ impl MeshQuery {
     ) -> Result<Self> {
         let kind = parse_join_kind(&kind)?;
         let strategy = parse_join_strategy(strategy.as_deref())?;
+        // Canonical join-key keywords across all shims:
+        // "origin", "seq", "origin,seq". Anything else is
+        // treated as a dotted JSON field path. The variant
+        // "origin+seq" was tolerated in earlier slices but is
+        // now rejected — cross-language conformance tests need
+        // one canonical encoding.
         let key_mode = match key.as_str() {
             "origin" => JoinKeyMode::Origin,
             "seq" => JoinKeyMode::Seq,
-            "origin,seq" | "origin+seq" => JoinKeyMode::OriginSeq,
+            "origin,seq" => JoinKeyMode::OriginSeq,
             other => JoinKeyMode::Field(other.to_string()),
         };
         let watermark = {
@@ -650,12 +656,11 @@ fn parse_group_by(group_by: Option<Vec<String>>) -> Result<Option<JoinKeyMode>> 
             ))),
         };
     }
-    if group_by.len() == 2 {
-        let mut pair = [group_by[0].as_str(), group_by[1].as_str()];
-        pair.sort();
-        if pair == ["origin", "seq"] {
-            return Ok(Some(JoinKeyMode::OriginSeq));
-        }
+    if group_by.len() == 2
+        && group_by[0].as_str() == "origin"
+        && group_by[1].as_str() == "seq"
+    {
+        return Ok(Some(JoinKeyMode::OriginSeq));
     }
     Err(mesh_err(format!(
         "groupBy shape {group_by:?} not supported; use [], ['origin'], ['seq'], or ['origin', 'seq']"

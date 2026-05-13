@@ -382,10 +382,15 @@ unsafe fn parse_group_by_cstr(
     if s.is_empty() {
         return Ok(None);
     }
+    // Canonical group_by tokens across all shims:
+    // "origin", "seq", "origin,seq". The variant "seq,origin"
+    // was tolerated in earlier slices but is now rejected —
+    // cross-language conformance tests need one canonical
+    // encoding.
     match s {
         "origin" => Ok(Some(JoinKeyMode::Origin)),
         "seq" => Ok(Some(JoinKeyMode::Seq)),
-        "origin,seq" | "seq,origin" => Ok(Some(JoinKeyMode::OriginSeq)),
+        "origin,seq" => Ok(Some(JoinKeyMode::OriginSeq)),
         _ => Err(()),
     }
 }
@@ -576,10 +581,14 @@ pub unsafe extern "C" fn net_meshdb_query_join(
         Some("sort_merge") => JoinStrategy::SortMerge,
         _ => return ptr::null_mut(),
     };
+    // Canonical join key tokens across all shims:
+    // "origin", "seq", "origin,seq". Anything else is treated
+    // as a dotted JSON field path. "seq,origin" was tolerated
+    // in earlier slices but is now rejected.
     let key_mode = match key.as_str() {
         "origin" => JoinKeyMode::Origin,
         "seq" => JoinKeyMode::Seq,
-        "origin,seq" | "seq,origin" => JoinKeyMode::OriginSeq,
+        "origin,seq" => JoinKeyMode::OriginSeq,
         other => JoinKeyMode::Field(other.to_string()),
     };
     let watermark_secs = if watermark_secs.is_finite() && watermark_secs >= 0.0 {
