@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/meshos/backpressure.rs
+  s_3bbc444b3ef3e5::t_8c39932bf94d54 1-563
+net/crates/net/src/adapter/net/behavior/meshos/mod.rs
+  s_3bbc444b3ef3e5::t_45f94f2b676163 53
+  s_3bbc444b3ef3e5::t_16715718e1664f 65-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b31a11397a7ffe6eb6712701729997dd898b48ae",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
