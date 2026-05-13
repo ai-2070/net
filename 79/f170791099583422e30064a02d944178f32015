@@ -1,0 +1,21 @@
+net/crates/net/bindings/go/net/meshdb.go
+  s_3bbc444b3ef3e5::t_9f1f81a6a54425 528-533,537
+  s_3bbc444b3ef3e5::t_b0758ac00e4448 554-576
+  s_3bbc444b3ef3e5::t_65de3170717c1d 184,189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "79f170791099583422e30064a02d944178f32015",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
