@@ -104,17 +104,27 @@ pub trait MeshDbTransport: Send + Sync {
 /// deferred until profiling justifies the bookkeeping.
 pub struct FederatedMeshQueryExecutor<T: MeshDbTransport> {
     transport: Arc<T>,
-    next_id: AtomicU64,
     cache: Option<Arc<dyn super::cache::ResultCache>>,
     capability_version: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
+
+/// Process-global counter feeding every federated executor's
+/// `call_id`s. The wire contract
+/// (`MeshDbRequest::Execute.call_id`) is "unique per (caller,
+/// executor) pair while in-flight"; a per-executor counter
+/// alone fails that contract when two federated executors on
+/// the same host hit a shared remote. A single process-global
+/// counter trivially satisfies uniqueness across every
+/// federated executor in the caller process while preserving
+/// the executor's lifetime-independent monotonic property the
+/// LoopbackTransport relies on.
+static FEDERATED_CALL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl<T: MeshDbTransport> FederatedMeshQueryExecutor<T> {
     /// Construct a cache-less federated executor.
     pub fn new(transport: Arc<T>) -> Self {
         Self {
             transport,
-            next_id: AtomicU64::new(1),
             cache: None,
             capability_version: None,
         }
@@ -130,14 +140,18 @@ impl<T: MeshDbTransport> FederatedMeshQueryExecutor<T> {
     ) -> Self {
         Self {
             transport,
-            next_id: AtomicU64::new(1),
             cache: Some(cache),
             capability_version: Some(capability_version),
         }
     }
 
+    /// Mint a process-unique `call_id` for a new federated
+    /// query. Drawn from a single static counter shared by
+    /// every federated executor in this process, so no two
+    /// in-flight calls can collide at a shared remote
+    /// demultiplexer.
     fn allocate_id(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+        FEDERATED_CALL_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -1702,6 +1716,24 @@ mod tests {
         let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
         assert_eq!(decoded.group, None);
         assert_eq!(decoded.value, AggregateValue::Count(4));
+    }
+
+    #[test]
+    fn call_id_is_unique_across_federated_executors_on_same_host() {
+        // Regression: per-executor counters previously
+        // collided when two federated executors on the same
+        // caller hit a shared remote. The process-global
+        // counter makes every allocated id unique across all
+        // federated executors in the process.
+        let t1 = Arc::new(LoopbackTransport::new());
+        let t2 = Arc::new(LoopbackTransport::new());
+        let fed1 = FederatedMeshQueryExecutor::new(t1);
+        let fed2 = FederatedMeshQueryExecutor::new(t2);
+        let mut seen = std::collections::HashSet::<u64>::new();
+        for _ in 0..32 {
+            assert!(seen.insert(fed1.allocate_id()), "fed1 self-collision");
+            assert!(seen.insert(fed2.allocate_id()), "fed2 self-collision");
+        }
     }
 
     #[tokio::test]
