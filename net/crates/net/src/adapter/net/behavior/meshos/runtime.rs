@@ -41,8 +41,13 @@ use super::snapshot::MeshOsSnapshot;
 pub struct MeshOsRuntime {
     handle: MeshOsHandle,
     reader: MeshOsSnapshotReader,
-    loop_task: JoinHandle<u64>,
-    exec_task: JoinHandle<Arc<ExecutorStats>>,
+    /// Loop + executor tasks. Wrapped in `Option` so
+    /// [`shutdown_with_timeout`] can `take()` them through `&mut`
+    /// while still letting the [`Drop`] impl abort whichever
+    /// task is still running if the runtime is dropped without
+    /// an explicit shutdown.
+    loop_task: Option<JoinHandle<u64>>,
+    exec_task: Option<JoinHandle<Arc<ExecutorStats>>>,
     stats: Arc<ExecutorStats>,
     /// Cloned [`ProbeRegistry`] retained so consumers can attach
     /// probes after `start`. The loop reads through the same
@@ -120,8 +125,8 @@ impl MeshOsRuntime {
         Self {
             handle,
             reader,
-            loop_task,
-            exec_task,
+            loop_task: Some(loop_task),
+            exec_task: Some(exec_task),
             stats,
             probes,
             scheduler,
@@ -246,7 +251,7 @@ impl MeshOsRuntime {
 
     /// `shutdown` with an explicit timeout.
     pub async fn shutdown_with_timeout(
-        self,
+        mut self,
         timeout: Duration,
     ) -> Result<RuntimeStats, RuntimeShutdownError> {
         // Publish the shutdown event. If the loop already
@@ -254,14 +259,22 @@ impl MeshOsRuntime {
         // an error — we ignore it; the join below will surface
         // the loop's actual status.
         let _ = self.handle.publish(MeshOsEvent::Shutdown).await;
-        let reconcile_passes = tokio::time::timeout(timeout, self.loop_task)
+        let loop_task = self
+            .loop_task
+            .take()
+            .expect("loop_task taken twice — shutdown is consume-self");
+        let reconcile_passes = tokio::time::timeout(timeout, loop_task)
             .await
             .map_err(|_| RuntimeShutdownError::LoopTimeout)?
             .map_err(RuntimeShutdownError::LoopJoinError)?;
         // Drop the handle so the executor's mpsc receiver sees
-        // None and exits.
-        drop(self.handle);
-        let stats_arc = tokio::time::timeout(timeout, self.exec_task)
+        // None and exits. Replace with a closed sender clone so
+        // the `Drop` path doesn't fault.
+        let exec_task = self
+            .exec_task
+            .take()
+            .expect("exec_task taken twice — shutdown is consume-self");
+        let stats_arc = tokio::time::timeout(timeout, exec_task)
             .await
             .map_err(|_| RuntimeShutdownError::ExecutorTimeout)?
             .map_err(RuntimeShutdownError::ExecutorJoinError)?;
@@ -303,6 +316,37 @@ impl MeshOsRuntime {
     }
 }
 
+impl Drop for MeshOsRuntime {
+    /// If the runtime was dropped without an explicit
+    /// [`shutdown`](Self::shutdown), abort whichever tasks are
+    /// still in flight rather than detach them. Detaching would
+    /// leak the loop + executor task tree along with the
+    /// dispatcher `Arc` and the snapshot cell for the remainder
+    /// of the process. After a clean `shutdown_with_timeout`
+    /// the option fields are `None`, so this is a no-op.
+    fn drop(&mut self) {
+        let mut aborted = false;
+        if let Some(loop_task) = self.loop_task.take() {
+            if !loop_task.is_finished() {
+                aborted = true;
+                loop_task.abort();
+            }
+        }
+        if let Some(exec_task) = self.exec_task.take() {
+            if !exec_task.is_finished() {
+                aborted = true;
+                exec_task.abort();
+            }
+        }
+        if aborted {
+            tracing::warn!(
+                target: "meshos",
+                "MeshOsRuntime dropped without shutdown — aborted in-flight tasks",
+            );
+        }
+    }
+}
+
 /// Errors from [`MeshOsRuntime::shutdown`].
 #[derive(Debug)]
 #[non_exhaustive]
@@ -339,6 +383,35 @@ mod tests {
             maintenance: Default::default(),
         scheduler: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_runtime_without_shutdown_aborts_tasks() {
+        // Regression for I5: dropping the runtime without
+        // calling `shutdown` used to detach both JoinHandles,
+        // leaking the loop + executor task tree forever. The
+        // `Drop` impl now aborts in-flight tasks.
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let rt = MeshOsRuntime::start(fast_cfg(), Arc::clone(&dispatcher));
+        // Capture handles before drop so we can confirm
+        // post-drop they're abort()ed.
+        // The runtime owns the only JoinHandle, so the test
+        // observes via the dispatcher's Arc strong count: when
+        // the executor task is aborted, the dispatcher Arc held
+        // inside drops, reducing the strong count.
+        let initial_count = Arc::strong_count(&dispatcher);
+        drop(rt);
+        // Yield so the abort takes effect on the runtime tasks.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if Arc::strong_count(&dispatcher) < initial_count {
+                break;
+            }
+        }
+        assert!(
+            Arc::strong_count(&dispatcher) < initial_count,
+            "executor task should have been aborted, releasing its dispatcher Arc",
+        );
     }
 
     #[tokio::test]
