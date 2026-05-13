@@ -1,0 +1,32 @@
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_3bbc444b3ef3e5::t_8c4ae274f1e7f2 715-717,720-722,725-727,732-734,737,740-742,747-749,752-754,757-759,762-764,770-772
+  s_3bbc444b3ef3e5::t_0bbc95a8dc947b 499,502-504
+  s_3bbc444b3ef3e5::t_6b290bb1c92ac1 831-833,836-838,841-843
+  s_3bbc444b3ef3e5::t_0b7f5264b74f29 596-602,605-607,610-612
+  s_3bbc444b3ef3e5::t_dd1dab1a36fa79 1186,1188
+  s_3bbc444b3ef3e5::t_aa748a8c31c02c 181-201
+  s_3bbc444b3ef3e5::t_1f75670565c60a 1220,1225-1231
+  s_3bbc444b3ef3e5::t_1617198edd8bdf 471-475
+  s_3bbc444b3ef3e5::t_424c43ef407f4b 575-577
+  s_3bbc444b3ef3e5::t_d37195933c7795 647,650-652,659-661,667-669
+  s_3bbc444b3ef3e5::t_24894dc8d7d79f 2040-2080
+  s_3bbc444b3ef3e5::t_19853f3a618d5d 385-387
+  s_3bbc444b3ef3e5::t_e0ec9332c01ced 532,535-537,540-542
+  s_3bbc444b3ef3e5::t_5efdd9eff5f552 1181,1187,1189-1192
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b2a10611aba84619ac1c4f89ade5fa25225b1045",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
