@@ -840,7 +840,12 @@ where
         // Reached max_depth: if a further parent still exists,
         // surface the bound. If the walk genuinely terminates
         // exactly at the boundary, no error.
-        if self.parent_of(current).is_some() {
+        //
+        // `max_depth == 0` is "just-the-origin" — the caller
+        // explicitly didn't ask for a walk, so a present parent
+        // is not a bound violation. Treat that case as a
+        // successful single-entry result.
+        if max_depth > 0 && self.parent_of(current).is_some() {
             return Err(MeshError::LineageMaxDepthExceeded {
                 origin: start,
                 depth: max_depth,
@@ -872,7 +877,12 @@ where
             // implementation did it twice (depth check + walk).
             let mut children = self.children_of(current);
             if depth >= max_depth {
-                if !children.is_empty() {
+                // `max_depth == 0` is "just-the-origin" — the
+                // caller explicitly didn't ask for a walk, so
+                // present children don't trip the bound. The
+                // start node is the only thing on the frontier
+                // at depth=0 in that case.
+                if max_depth > 0 && !children.is_empty() {
                     return Err(MeshError::LineageMaxDepthExceeded {
                         origin: start,
                         depth: max_depth,
@@ -2764,6 +2774,61 @@ mod tests {
             assert_eq!(entries[0].origin, leaf);
         } else {
             panic!("expected LineageEmit");
+        }
+    }
+
+    #[test]
+    fn lineage_back_with_max_depth_zero_returns_only_start_no_error() {
+        // Regression: max_depth=0 = "just-the-origin". A present
+        // parent must NOT trip LineageMaxDepthExceeded, because
+        // the caller explicitly asked for zero steps.
+        let g0 = 0x40;
+        let g1 = 0x41;
+        let index = index_with(vec![
+            (1, caps_chain_only(g0)),
+            (2, caps_chain_forked_from(g1, g0)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageBack {
+                origin: ChainRef::OriginHash(g1),
+                max_depth: 0,
+            }))
+            .expect("max_depth=0 must succeed even when a parent exists");
+        match plan.root.operator {
+            OperatorPlan::LineageEmit { entries, .. } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].origin, g1);
+                assert_eq!(entries[0].depth, 0);
+            }
+            other => panic!("expected LineageEmit; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lineage_forward_with_max_depth_zero_returns_only_start_no_error() {
+        // Same regression as above, forward variant. The start
+        // node has a descendant; max_depth=0 says "don't descend".
+        let parent = 0x50;
+        let child = 0x51;
+        let index = index_with(vec![
+            (1, caps_chain_only(parent)),
+            (2, caps_chain_forked_from(child, parent)),
+        ]);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageForward {
+                origin: ChainRef::OriginHash(parent),
+                max_depth: 0,
+            }))
+            .expect("max_depth=0 must succeed even when descendants exist");
+        match plan.root.operator {
+            OperatorPlan::LineageEmit { entries, .. } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].origin, parent);
+                assert_eq!(entries[0].depth, 0);
+            }
+            other => panic!("expected LineageEmit; got {other:?}"),
         }
     }
 
