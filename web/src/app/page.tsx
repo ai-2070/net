@@ -4261,340 +4261,384 @@ function DatafortsSection() {
 }
 
 // =========================================================================
-// MeshOS — Atomic Playboys. Cluster-behavior engine.
-// One canonical event loop. Reconciled actions. Maintenance state machine.
+// MeshOS — Atomic Playboys. Self-organizing cluster behavior.
+// AutoMesh: nodes drift in, edges form by proximity, daemons hop between
+// hosts (mikoshi), data nodes pull workloads via gravity wells, drift
+// correction nudges the formation toward a new equilibrium.
 // =========================================================================
 
-type MeshOsEventKind =
-  | "replica"
-  | "daemon"
-  | "rtt"
-  | "health"
-  | "admin"
-  | "blob"
-  | "intent"
-  | "maint";
+type MeshCapability = "gpu" | "vram" | "region" | "colo" | "data";
 
-type MeshOsActionKind =
-  | "PULL"
-  | "DROP"
-  | "PLACE"
-  | "EVICT"
-  | "RESTART"
-  | "DRAIN"
-  | "ENTER_M"
-  | "BACKOFF";
-
-interface MeshOsLoopEvent {
+interface AutoMeshNode {
   id: number;
-  ts: string;
-  kind: MeshOsEventKind;
-  body: string;
+  x: number;
+  y: number;
+  tx: number;
+  ty: number;
+  vx: number;
+  vy: number;
+  cap: MeshCapability;
+  spawnDelay: number;
+  age: number;
 }
 
-interface MeshOsLoopAction {
+interface AutoMeshDaemon {
   id: number;
-  ts: string;
-  kind: MeshOsActionKind;
-  body: string;
+  hostIdx: number;
+  migrating: boolean;
+  fromIdx: number;
+  toIdx: number;
+  migrateT: number;
 }
 
-interface MeshOsEventTpl {
-  weight: number;
-  kind: MeshOsEventKind;
-  gen: () => string;
+interface AutoMeshLayout {
+  count: number;
+  daemons: number;
+  edgeRadius: number;
 }
 
-interface MeshOsActionTpl {
-  weight: number;
-  kind: MeshOsActionKind;
-  gen: () => string;
+function autoMeshLayout(width: number): AutoMeshLayout {
+  if (width < 540) return { count: 12, daemons: 4, edgeRadius: 110 };
+  if (width < 880) return { count: 16, daemons: 5, edgeRadius: 130 };
+  return { count: 22, daemons: 7, edgeRadius: 150 };
 }
 
-const MESH_OS_HEALTH_STATES: ReadonlyArray<string> = [
-  "healthy",
-  "degraded",
-  "unhealthy",
-  "saturated",
-];
-
-const MESH_OS_ADMIN_VERBS: ReadonlyArray<string> = [
-  "EnterMaintenance",
-  "Drain",
-  "Cordon",
-  "Uncordon",
-  "RestartAllDaemons",
-  "ClearAvoidList",
-];
-
-const MESH_OS_MAINT_LABELS: ReadonlyArray<string> = [
-  "EnteringMaintenance",
-  "Maintenance",
-  "ExitingMaintenance",
-  "Recovery",
-];
-
-const MESH_OS_NODE_HEALTH: ReadonlyArray<string> = [
-  "healthy",
-  "degraded",
-  "unreachable",
-];
-
-const MESH_OS_EVENT_TEMPLATES: ReadonlyArray<MeshOsEventTpl> = [
-  {
-    weight: 5,
-    kind: "replica",
-    gen: () => `chain.${hex4()} · drift +${randInt(0, 2)} / -${randInt(0, 1)}`,
-  },
-  {
-    weight: 4,
-    kind: "daemon",
-    gen: () =>
-      `${pick(DAEMON_NAMES, "trader")}.${hex4()} · ${pick(MESH_OS_HEALTH_STATES, "healthy")}`,
-  },
-  {
-    weight: 5,
-    kind: "rtt",
-    gen: () =>
-      `peer 0x${hex4()} · ${randInt(20, 60)}ms → ${randInt(90, 320)}ms`,
-  },
-  {
-    weight: 3,
-    kind: "health",
-    gen: () => `node 0x${hex4()} · ${pick(MESH_OS_NODE_HEALTH, "healthy")}`,
-  },
-  {
-    weight: 2,
-    kind: "admin",
-    gen: () => `${pick(MESH_OS_ADMIN_VERBS, "Drain")}(0x${hex4()})`,
-  },
-  {
-    weight: 3,
-    kind: "blob",
-    gen: () => `announce 0x${hex4()} · ${(Math.random() * 12 + 1).toFixed(1)}M`,
-  },
-  {
-    weight: 3,
-    kind: "intent",
-    gen: () =>
-      `placement chain.${hex4()} · ${randInt(2, 3)} → ${randInt(3, 5)}`,
-  },
-  {
-    weight: 1,
-    kind: "maint",
-    gen: () => `0x${hex4()} · ${pick(MESH_OS_MAINT_LABELS, "Maintenance")}`,
-  },
-];
-
-const MESH_OS_EVENT_WEIGHT_TOTAL = MESH_OS_EVENT_TEMPLATES.reduce(
-  (a, t) => a + t.weight,
-  0,
-);
-
-function pickMeshOsEventTemplate(): MeshOsEventTpl {
-  let r = Math.random() * MESH_OS_EVENT_WEIGHT_TOTAL;
-  for (const t of MESH_OS_EVENT_TEMPLATES) {
-    r -= t.weight;
-    if (r <= 0) return t;
-  }
-  return MESH_OS_EVENT_TEMPLATES[0]!;
+function pickCapability(): MeshCapability {
+  const r = Math.random();
+  if (r < 0.18) return "data";
+  if (r < 0.4) return "gpu";
+  if (r < 0.6) return "vram";
+  if (r < 0.8) return "region";
+  return "colo";
 }
 
-const MESH_OS_ACTION_TEMPLATES: ReadonlyArray<MeshOsActionTpl> = [
-  {
-    weight: 5,
-    kind: "PULL",
-    gen: () => `chain.${hex4()} ← 0x${hex4()}`,
-  },
-  {
-    weight: 2,
-    kind: "DROP",
-    gen: () => `chain.${hex4()} @ 0x${hex4()}`,
-  },
-  {
-    weight: 3,
-    kind: "PLACE",
-    gen: () =>
-      `chain.${hex4()} · score ${(0.62 + Math.random() * 0.34).toFixed(2)}`,
-  },
-  {
-    weight: 2,
-    kind: "RESTART",
-    gen: () =>
-      `${pick(DAEMON_NAMES, "trader")}.${hex4()} · backoff ${randInt(200, 2400)}ms`,
-  },
-  {
-    weight: 2,
-    kind: "DRAIN",
-    gen: () =>
-      `${pick(DAEMON_NAMES, "trader")}.${hex4()} · grace ${randInt(2, 30)}s`,
-  },
-  {
-    weight: 1,
-    kind: "EVICT",
-    gen: () => `0x${hex4()} · stale replica`,
-  },
-  {
-    weight: 1,
-    kind: "ENTER_M",
-    gen: () => `0x${hex4()} · drain begin`,
-  },
-  {
-    weight: 1,
-    kind: "BACKOFF",
-    gen: () => `level ${randInt(1, 3)} · cooldown ${randInt(400, 1600)}ms`,
-  },
-];
-
-const MESH_OS_ACTION_WEIGHT_TOTAL = MESH_OS_ACTION_TEMPLATES.reduce(
-  (a, t) => a + t.weight,
-  0,
-);
-
-function pickMeshOsActionTemplate(): MeshOsActionTpl {
-  let r = Math.random() * MESH_OS_ACTION_WEIGHT_TOTAL;
-  for (const t of MESH_OS_ACTION_TEMPLATES) {
-    r -= t.weight;
-    if (r <= 0) return t;
-  }
-  return MESH_OS_ACTION_TEMPLATES[0]!;
-}
-
-interface MaintNodeState {
-  id: string;
-  stateIdx: number;
-  progress: number;
-}
-
-const MAINT_STATES: ReadonlyArray<{
-  short: string;
-  next: string;
-  color: string;
-}> = [
-  { short: "ACT", next: "ENT", color: "text-accent" },
-  { short: "ENT", next: "MNT", color: "text-cyan" },
-  { short: "MNT", next: "EXT", color: "text-ink" },
-  { short: "EXT", next: "REC", color: "text-cyan" },
-  { short: "REC", next: "ACT", color: "text-accent-dim" },
-];
-
-const MAINT_NODES_INITIAL: ReadonlyArray<MaintNodeState> = [
-  { id: "0x7af3", stateIdx: 0, progress: 0.2 },
-  { id: "0x2c91", stateIdx: 2, progress: 0.55 },
-  { id: "0xeb29", stateIdx: 1, progress: 0.4 },
-  { id: "0xfbb1", stateIdx: 4, progress: 0.75 },
-];
-
-const MESH_OS_BAR_WIDTH = 12;
-
-function meshOsEventColor(kind: MeshOsEventKind): string {
-  switch (kind) {
-    case "replica":
-      return "text-accent";
-    case "daemon":
-      return "text-cyan";
-    case "rtt":
-      return "text-ink-dim";
-    case "health":
-      return "text-cyan";
-    case "admin":
-      return "text-warn";
-    case "blob":
-      return "text-accent-dim";
-    case "intent":
-      return "text-accent";
-    case "maint":
-      return "text-warn";
-    default:
-      return "text-ink-dim";
+function capabilityRgb(cap: MeshCapability): string {
+  switch (cap) {
+    case "gpu":
+      return "196, 255, 61";
+    case "vram":
+      return "107, 138, 30";
+    case "region":
+      return "61, 240, 255";
+    case "colo":
+      return "212, 220, 208";
+    case "data":
+      return "255, 255, 255";
   }
 }
 
-function meshOsActionColor(kind: MeshOsActionKind): string {
-  switch (kind) {
-    case "PULL":
-    case "PLACE":
-      return "text-accent";
-    case "DROP":
-    case "EVICT":
-    case "ENTER_M":
-      return "text-warn";
-    case "RESTART":
-    case "DRAIN":
-      return "text-cyan";
-    case "BACKOFF":
-      return "text-ink-dim";
-    default:
-      return "text-ink-dim";
-  }
+function easeInOut(t: number): number {
+  return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 }
 
-function MeshOsConsole() {
-  const [tickHex, setTickHex] = useState(() => hex4());
-  const [tickMs, setTickMs] = useState(142);
-  const [events, setEvents] = useState<ReadonlyArray<MeshOsLoopEvent>>([]);
-  const [actions, setActions] = useState<ReadonlyArray<MeshOsLoopAction>>([]);
-  const [maint, setMaint] =
-    useState<ReadonlyArray<MaintNodeState>>(MAINT_NODES_INITIAL);
-  const [totals, setTotals] = useState({ events: 0, actions: 0 });
+function MeshAutoform() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
-    let evCount = 0;
-    let actCount = 0;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
 
-    const tick = (): void => {
-      const nEvents = randInt(2, 4);
-      const newEvents: MeshOsLoopEvent[] = [];
-      for (let i = 0; i < nEvents; i++) {
-        const t = pickMeshOsEventTemplate();
-        evCount += 1;
-        newEvents.push({
-          id: evCount,
-          ts: poolTs(),
-          kind: t.kind,
-          body: t.gen(),
-        });
-      }
-      setEvents((prev) => [...prev, ...newEvents].slice(-6));
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let W = 0;
+    let H = 0;
+    let layout: AutoMeshLayout = {
+      count: 16,
+      daemons: 5,
+      edgeRadius: 130,
+    };
+    let nodes: AutoMeshNode[] = [];
+    let daemons: AutoMeshDaemon[] = [];
+    let lastT = performance.now();
+    let driftTimer = 0;
+    let migrateTimer = 1.4;
+    let rafId = 0;
 
-      const nActions = randInt(1, 3);
-      const newActions: MeshOsLoopAction[] = [];
-      for (let i = 0; i < nActions; i++) {
-        const t = pickMeshOsActionTemplate();
-        actCount += 1;
-        newActions.push({
-          id: actCount,
-          ts: poolTs(),
-          kind: t.kind,
-          body: t.gen(),
-        });
-      }
-      setActions((prev) => [...prev, ...newActions].slice(-5));
-
-      setMaint((prev) =>
-        prev.map((m) => {
-          let nextProgress = m.progress + 0.06 + Math.random() * 0.1;
-          let nextIdx = m.stateIdx;
-          if (nextProgress >= 1) {
-            nextIdx = (m.stateIdx + 1) % MAINT_STATES.length;
-            nextProgress = 0;
-          }
-          return { ...m, stateIdx: nextIdx, progress: nextProgress };
-        }),
-      );
-
-      setTickHex(hex4());
-      setTickMs(randInt(110, 220));
-      setTotals({ events: evCount, actions: actCount });
+    const spawnFromEdge = (): { x: number; y: number } => {
+      const edge = Math.floor(Math.random() * 4);
+      if (edge === 0) return { x: -60, y: Math.random() * H };
+      if (edge === 1) return { x: W + 60, y: Math.random() * H };
+      if (edge === 2) return { x: Math.random() * W, y: -60 };
+      return { x: Math.random() * W, y: H + 60 };
     };
 
-    tick();
-    const id = window.setInterval(tick, 1500);
-    return () => window.clearInterval(id);
+    const newTarget = (): { x: number; y: number } => ({
+      x: W * 0.1 + Math.random() * W * 0.8,
+      y: H * 0.14 + Math.random() * H * 0.72,
+    });
+
+    const initNodes = (): void => {
+      nodes = [];
+      for (let i = 0; i < layout.count; i++) {
+        const start = spawnFromEdge();
+        const target = newTarget();
+        nodes.push({
+          id: i,
+          x: start.x,
+          y: start.y,
+          tx: target.x,
+          ty: target.y,
+          vx: 0,
+          vy: 0,
+          cap: pickCapability(),
+          spawnDelay: i * 85 + Math.random() * 50,
+          age: 0,
+        });
+      }
+    };
+
+    const initDaemons = (): void => {
+      daemons = [];
+      for (let i = 0; i < layout.daemons; i++) {
+        daemons.push({
+          id: i,
+          hostIdx: Math.floor(Math.random() * nodes.length),
+          migrating: false,
+          fromIdx: 0,
+          toIdx: 0,
+          migrateT: 0,
+        });
+      }
+    };
+
+    const resize = (): void => {
+      const rect = canvas.getBoundingClientRect();
+      W = rect.width;
+      H = rect.height;
+      canvas.width = Math.max(1, Math.floor(W * dpr));
+      canvas.height = Math.max(1, Math.floor(H * dpr));
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(dpr, dpr);
+      const nextLayout = autoMeshLayout(W);
+      if (nextLayout.count !== layout.count) {
+        layout = nextLayout;
+        initNodes();
+        initDaemons();
+      } else {
+        layout = nextLayout;
+        for (const n of nodes) {
+          const t = newTarget();
+          n.tx = t.x;
+          n.ty = t.y;
+        }
+      }
+    };
+
+    const frame = (): void => {
+      const now = performance.now();
+      const dt = Math.min(0.05, (now - lastT) / 1000);
+      lastT = now;
+
+      // spring physics toward target, with damping
+      for (const n of nodes) {
+        n.age += dt * 1000;
+        if (n.age < n.spawnDelay) continue;
+        const dx = n.tx - n.x;
+        const dy = n.ty - n.y;
+        n.vx += dx * 3.2 * dt;
+        n.vy += dy * 3.2 * dt;
+        n.vx *= Math.max(0, 1 - 2.4 * dt);
+        n.vy *= Math.max(0, 1 - 2.4 * dt);
+        n.x += n.vx * dt;
+        n.y += n.vy * dt;
+      }
+
+      // drift correction every ~5.5s — nudge 2-3 node targets
+      driftTimer += dt;
+      if (driftTimer > 5.5) {
+        driftTimer = 0;
+        const k = 2 + Math.floor(Math.random() * 2);
+        for (let i = 0; i < k; i++) {
+          const idx = Math.floor(Math.random() * nodes.length);
+          const n = nodes[idx];
+          if (n && n.age >= n.spawnDelay) {
+            const t = newTarget();
+            n.tx = t.x;
+            n.ty = t.y;
+          }
+        }
+      }
+
+      // mikoshi hop every ~2.2s
+      migrateTimer += dt;
+      if (migrateTimer > 2.2) {
+        migrateTimer = 0;
+        const idle = daemons.filter((d) => !d.migrating);
+        if (idle.length > 0 && nodes.length > 1) {
+          const d = idle[Math.floor(Math.random() * idle.length)]!;
+          let target = -1;
+          // 60% of the time prefer a data node (gravity pull)
+          if (Math.random() < 0.6) {
+            const dataNodes: number[] = [];
+            for (let i = 0; i < nodes.length; i++) {
+              const n = nodes[i]!;
+              if (n.cap === "data" && i !== d.hostIdx) dataNodes.push(i);
+            }
+            if (dataNodes.length > 0) {
+              target = dataNodes[Math.floor(Math.random() * dataNodes.length)]!;
+            }
+          }
+          if (target < 0) {
+            target = Math.floor(Math.random() * nodes.length);
+            let safety = 8;
+            while (target === d.hostIdx && safety-- > 0) {
+              target = Math.floor(Math.random() * nodes.length);
+            }
+          }
+          d.fromIdx = d.hostIdx;
+          d.toIdx = target;
+          d.migrating = true;
+          d.migrateT = 0;
+        }
+      }
+
+      // advance migrating daemons (~1.5s per hop)
+      for (const d of daemons) {
+        if (d.migrating) {
+          d.migrateT += dt / 1.5;
+          if (d.migrateT >= 1) {
+            d.migrating = false;
+            d.hostIdx = d.toIdx;
+            d.migrateT = 0;
+          }
+        }
+      }
+
+      // ============== RENDER ==============
+      ctx.fillStyle = "rgba(10, 12, 10, 0.45)";
+      ctx.fillRect(0, 0, W, H);
+
+      // faint dot grid
+      ctx.fillStyle = "rgba(45, 53, 44, 0.55)";
+      const gridStep = 26;
+      for (let x = gridStep / 2; x < W; x += gridStep) {
+        for (let y = gridStep / 2; y < H; y += gridStep) {
+          ctx.fillRect(x - 0.5, y - 0.5, 1, 1);
+        }
+      }
+
+      // gravity wells (data nodes only)
+      const wellT = now / 1000;
+      for (const n of nodes) {
+        if (n.cap !== "data") continue;
+        if (n.age < n.spawnDelay) continue;
+        for (let k = 0; k < 3; k++) {
+          const phase = (wellT * 0.45 + n.id * 0.21 + k * 0.33) % 1;
+          const r = 12 + phase * 70;
+          const a = 0.22 * (1 - phase);
+          ctx.strokeStyle = `rgba(196, 255, 61, ${a})`;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+
+      // edges — proximity-based, fade by distance
+      ctx.lineWidth = 1;
+      for (let i = 0; i < nodes.length; i++) {
+        const a = nodes[i]!;
+        if (a.age < a.spawnDelay) continue;
+        for (let j = i + 1; j < nodes.length; j++) {
+          const b = nodes[j]!;
+          if (b.age < b.spawnDelay) continue;
+          const dx = a.x - b.x;
+          const dy = a.y - b.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist > layout.edgeRadius) continue;
+          const opacity = (1 - dist / layout.edgeRadius) * 0.5;
+          ctx.strokeStyle = `rgba(196, 255, 61, ${opacity * 0.5})`;
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+        }
+      }
+
+      // nodes
+      for (const n of nodes) {
+        if (n.age < n.spawnDelay) continue;
+        const rgb = capabilityRgb(n.cap);
+        // fade-in
+        const fadeInMs = 600;
+        const sinceSpawn = n.age - n.spawnDelay;
+        const fade = Math.min(1, sinceSpawn / fadeInMs);
+        const isData = n.cap === "data";
+        ctx.fillStyle = `rgba(${rgb}, ${0.18 * fade})`;
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, isData ? 10 : 7, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = `rgba(${rgb}, ${fade})`;
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, isData ? 4 : 3, 0, Math.PI * 2);
+        ctx.fill();
+        // ring on data nodes for emphasis
+        if (isData) {
+          ctx.strokeStyle = `rgba(196, 255, 61, ${0.55 * fade})`;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, 7, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+
+      // daemons (and migration trails)
+      for (const d of daemons) {
+        const from = nodes[d.fromIdx];
+        const to = nodes[d.toIdx];
+        const host = nodes[d.hostIdx];
+        if (!host) continue;
+        let x = host.x;
+        let y = host.y - 9;
+        if (d.migrating && from && to) {
+          const tt = easeInOut(d.migrateT);
+          // slight arc lift
+          const arcLift = Math.sin(tt * Math.PI) * 12;
+          x = from.x + (to.x - from.x) * tt;
+          y = from.y + (to.y - from.y) * tt - arcLift;
+          // dashed trail
+          ctx.strokeStyle = "rgba(61, 240, 255, 0.65)";
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 4]);
+          ctx.beginPath();
+          ctx.moveTo(from.x, from.y);
+          ctx.lineTo(x, y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        ctx.fillStyle = "rgba(61, 240, 255, 0.35)";
+        ctx.beginPath();
+        ctx.arc(x, y, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
+        ctx.beginPath();
+        ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      rafId = requestAnimationFrame(frame);
+    };
+
+    const onResize = (): void => {
+      resize();
+    };
+
+    resize();
+    initNodes();
+    initDaemons();
+    ctx.fillStyle = "#0a0c0a";
+    ctx.fillRect(0, 0, W, H);
+    rafId = requestAnimationFrame(frame);
+    window.addEventListener("resize", onResize);
+    return () => {
+      cancelAnimationFrame(rafId);
+      window.removeEventListener("resize", onResize);
+    };
   }, []);
 
   return (
-    <div className="border border-line bg-bg-2 overflow-hidden font-mono text-[12px] leading-[1.75]">
+    <div className="relative border border-line bg-bg-2 overflow-hidden">
       <div className="flex items-center justify-between border-b border-line px-4 py-2 text-[10px] tracking-[0.14em] text-ink-dim uppercase">
         <span className="flex items-center gap-3">
           <span className="inline-flex gap-1">
@@ -4602,116 +4646,70 @@ function MeshOsConsole() {
             <span className="frame-dot-y w-[7px] h-[7px] rounded-full" />
             <span className="frame-dot-g w-[7px] h-[7px] rounded-full" />
           </span>
-          <span className="text-accent">$</span>
+          <span className="text-accent">▸</span>
           <span>
-            meshosctl tail{" "}
-            <span className="text-ink-faint">--live --node=local</span>
+            auto-mesh{" "}
+            <span className="text-ink-faint normal-case tracking-normal">
+              / nodes drift in · edges form by proximity · daemons follow
+              gravity
+            </span>
           </span>
         </span>
         <span className="flex items-center gap-1.5 normal-case tracking-normal">
           <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block animate-pulse-dot" />
-          <span className="text-accent">live</span>
+          <span className="text-accent">forming</span>
         </span>
       </div>
 
-      <div className="px-5 py-4">
-        <div className="text-ink-dim flex items-center gap-3 whitespace-nowrap">
-          <span>┌─ event loop</span>
-          <span className="text-ink-faint">single canonical stream</span>
-        </div>
-        <div className="text-ink mt-1 flex items-center gap-3 whitespace-nowrap">
-          <span className="text-ink-faint">│</span>
-          <span className="text-ink-dim">tick</span>
-          <span className="text-accent">#{tickHex}</span>
-          <span className="text-ink-faint">·</span>
-          <span className="text-ink">{tickMs}ms</span>
-          <span className="text-ink-faint">·</span>
-          <span className="text-ink-dim">events</span>
-          <span className="text-ink">{totals.events}</span>
-          <span className="text-ink-faint">→</span>
-          <span className="text-ink-dim">actions</span>
-          <span className="text-accent">{totals.actions}</span>
-        </div>
+      <canvas
+        ref={canvasRef}
+        className="block w-full h-[380px] md:h-[460px] lg:h-[520px]"
+        aria-hidden
+      />
 
-        <div className="text-ink-dim mt-3">├─ events / in</div>
-        <div className="min-h-[126px]">
-          {events.map((e) => {
-            const color = meshOsEventColor(e.kind);
-            return (
-              <div
-                key={e.id}
-                className="event-line-in flex items-baseline gap-3 whitespace-nowrap overflow-hidden"
-              >
-                <span className="text-ink-faint">│</span>
-                <span className="text-ink-faint" style={{ minWidth: "9ch" }}>
-                  {e.ts}
-                </span>
-                <span className={color} style={{ minWidth: "9ch" }}>
-                  [{e.kind}]
-                </span>
-                <span className="text-ink-dim flex-1 truncate">{e.body}</span>
-              </div>
-            );
-          })}
-        </div>
-
-        <div className="text-ink-dim mt-3">├─ actions / out</div>
-        <div className="min-h-[105px]">
-          {actions.map((a) => {
-            const color = meshOsActionColor(a.kind);
-            return (
-              <div
-                key={a.id}
-                className="event-line-in flex items-baseline gap-3 whitespace-nowrap overflow-hidden"
-              >
-                <span className="text-ink-faint">│</span>
-                <span className="text-ink-faint" style={{ minWidth: "9ch" }}>
-                  {a.ts}
-                </span>
-                <span className={color} style={{ minWidth: "10ch" }}>
-                  [{a.kind}]
-                </span>
-                <span className="text-ink flex-1 truncate">{a.body}</span>
-              </div>
-            );
-          })}
-        </div>
-
-        <div className="text-ink-dim mt-3">├─ maintenance / state machine</div>
-        {maint.map((m, i) => {
-          const state = MAINT_STATES[m.stateIdx] ?? MAINT_STATES[0]!;
-          const tree = i === maint.length - 1 ? "└─" : "├─";
-          return (
-            <div
-              key={m.id}
-              className="flex items-center gap-3 whitespace-nowrap"
-            >
-              <span className="text-ink-faint">│ {tree}</span>
-              <span className="text-ink" style={{ minWidth: "8ch" }}>
-                {m.id}
-              </span>
-              <span className={state.color} style={{ minWidth: "4ch" }}>
-                {state.short}
-              </span>
-              <span className="text-accent-dim">
-                {renderBar(m.progress, MESH_OS_BAR_WIDTH)}
-              </span>
-              <span className="text-ink-faint">→</span>
-              <span className="text-ink-dim">{state.next}</span>
-            </div>
-          );
-        })}
-
-        <div className="text-ink-dim mt-3">
-          └─ admit() · 0 deferred · 0 gated · cooldown clean
-        </div>
-
-        <div className="mt-4 text-ink-faint text-[10px] tracking-[0.04em]">
-          ▸ press <span className="text-accent">^C</span> to detach · reconcile
-          every <span className="text-accent">1.5s</span> · hysteresis{" "}
-          <span className="text-accent">·12</span> / cooldown{" "}
-          <span className="text-cyan">600ms</span>
-        </div>
+      <div className="flex flex-wrap gap-x-5 gap-y-2 border-t border-line px-4 py-3 text-[10px] tracking-[0.12em] text-ink-dim uppercase">
+        <span className="flex items-center gap-2">
+          <span
+            className="w-2 h-2 rounded-full inline-block"
+            style={{ background: "rgb(196, 255, 61)" }}
+          />
+          gpu
+        </span>
+        <span className="flex items-center gap-2">
+          <span
+            className="w-2 h-2 rounded-full inline-block"
+            style={{ background: "rgb(107, 138, 30)" }}
+          />
+          vram
+        </span>
+        <span className="flex items-center gap-2">
+          <span
+            className="w-2 h-2 rounded-full inline-block"
+            style={{ background: "rgb(61, 240, 255)" }}
+          />
+          region
+        </span>
+        <span className="flex items-center gap-2">
+          <span
+            className="w-2 h-2 rounded-full inline-block"
+            style={{ background: "rgb(212, 220, 208)" }}
+          />
+          colo
+        </span>
+        <span className="flex items-center gap-2">
+          <span
+            className="w-2 h-2 rounded-full inline-block ring-1 ring-accent"
+            style={{ background: "#ffffff" }}
+          />
+          data · gravity well
+        </span>
+        <span className="flex items-center gap-2 sm:ml-auto">
+          <span
+            className="inline-block w-3 h-px"
+            style={{ background: "rgb(61, 240, 255)" }}
+          />
+          mikoshi hop
+        </span>
       </div>
     </div>
   );
@@ -4777,7 +4775,7 @@ function MeshOsSection() {
         coordination at nanosecond scale.
       </p>
 
-      <MeshOsConsole />
+      <MeshAutoform />
 
       <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
         <p className="text-[18px] text-ink leading-[1.5] font-light">
