@@ -3848,7 +3848,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
 function ComponentsSection() {
   return (
     <section id="components" className="border-b border-line px-6 py-20">
-      <SectionLabel>§08 / components on the mesh</SectionLabel>
+      <SectionLabel>§09 / components on the mesh</SectionLabel>
       <DisplayHeading>
         four primitives.
         <br />
@@ -4260,6 +4260,553 @@ function DatafortsSection() {
   );
 }
 
+// =========================================================================
+// MeshOS — Atomic Playboys. Cluster-behavior engine.
+// One canonical event loop. Reconciled actions. Maintenance state machine.
+// =========================================================================
+
+type MeshOsEventKind =
+  | "replica"
+  | "daemon"
+  | "rtt"
+  | "health"
+  | "admin"
+  | "blob"
+  | "intent"
+  | "maint";
+
+type MeshOsActionKind =
+  | "PULL"
+  | "DROP"
+  | "PLACE"
+  | "EVICT"
+  | "RESTART"
+  | "DRAIN"
+  | "ENTER_M"
+  | "BACKOFF";
+
+interface MeshOsLoopEvent {
+  id: number;
+  ts: string;
+  kind: MeshOsEventKind;
+  body: string;
+}
+
+interface MeshOsLoopAction {
+  id: number;
+  ts: string;
+  kind: MeshOsActionKind;
+  body: string;
+}
+
+interface MeshOsEventTpl {
+  weight: number;
+  kind: MeshOsEventKind;
+  gen: () => string;
+}
+
+interface MeshOsActionTpl {
+  weight: number;
+  kind: MeshOsActionKind;
+  gen: () => string;
+}
+
+const MESH_OS_HEALTH_STATES: ReadonlyArray<string> = [
+  "healthy",
+  "degraded",
+  "unhealthy",
+  "saturated",
+];
+
+const MESH_OS_ADMIN_VERBS: ReadonlyArray<string> = [
+  "EnterMaintenance",
+  "Drain",
+  "Cordon",
+  "Uncordon",
+  "RestartAllDaemons",
+  "ClearAvoidList",
+];
+
+const MESH_OS_MAINT_LABELS: ReadonlyArray<string> = [
+  "EnteringMaintenance",
+  "Maintenance",
+  "ExitingMaintenance",
+  "Recovery",
+];
+
+const MESH_OS_NODE_HEALTH: ReadonlyArray<string> = [
+  "healthy",
+  "degraded",
+  "unreachable",
+];
+
+const MESH_OS_EVENT_TEMPLATES: ReadonlyArray<MeshOsEventTpl> = [
+  {
+    weight: 5,
+    kind: "replica",
+    gen: () => `chain.${hex4()} · drift +${randInt(0, 2)} / -${randInt(0, 1)}`,
+  },
+  {
+    weight: 4,
+    kind: "daemon",
+    gen: () =>
+      `${pick(DAEMON_NAMES, "trader")}.${hex4()} · ${pick(MESH_OS_HEALTH_STATES, "healthy")}`,
+  },
+  {
+    weight: 5,
+    kind: "rtt",
+    gen: () =>
+      `peer 0x${hex4()} · ${randInt(20, 60)}ms → ${randInt(90, 320)}ms`,
+  },
+  {
+    weight: 3,
+    kind: "health",
+    gen: () => `node 0x${hex4()} · ${pick(MESH_OS_NODE_HEALTH, "healthy")}`,
+  },
+  {
+    weight: 2,
+    kind: "admin",
+    gen: () => `${pick(MESH_OS_ADMIN_VERBS, "Drain")}(0x${hex4()})`,
+  },
+  {
+    weight: 3,
+    kind: "blob",
+    gen: () => `announce 0x${hex4()} · ${(Math.random() * 12 + 1).toFixed(1)}M`,
+  },
+  {
+    weight: 3,
+    kind: "intent",
+    gen: () =>
+      `placement chain.${hex4()} · ${randInt(2, 3)} → ${randInt(3, 5)}`,
+  },
+  {
+    weight: 1,
+    kind: "maint",
+    gen: () => `0x${hex4()} · ${pick(MESH_OS_MAINT_LABELS, "Maintenance")}`,
+  },
+];
+
+const MESH_OS_EVENT_WEIGHT_TOTAL = MESH_OS_EVENT_TEMPLATES.reduce(
+  (a, t) => a + t.weight,
+  0,
+);
+
+function pickMeshOsEventTemplate(): MeshOsEventTpl {
+  let r = Math.random() * MESH_OS_EVENT_WEIGHT_TOTAL;
+  for (const t of MESH_OS_EVENT_TEMPLATES) {
+    r -= t.weight;
+    if (r <= 0) return t;
+  }
+  return MESH_OS_EVENT_TEMPLATES[0]!;
+}
+
+const MESH_OS_ACTION_TEMPLATES: ReadonlyArray<MeshOsActionTpl> = [
+  {
+    weight: 5,
+    kind: "PULL",
+    gen: () => `chain.${hex4()} ← 0x${hex4()}`,
+  },
+  {
+    weight: 2,
+    kind: "DROP",
+    gen: () => `chain.${hex4()} @ 0x${hex4()}`,
+  },
+  {
+    weight: 3,
+    kind: "PLACE",
+    gen: () =>
+      `chain.${hex4()} · score ${(0.62 + Math.random() * 0.34).toFixed(2)}`,
+  },
+  {
+    weight: 2,
+    kind: "RESTART",
+    gen: () =>
+      `${pick(DAEMON_NAMES, "trader")}.${hex4()} · backoff ${randInt(200, 2400)}ms`,
+  },
+  {
+    weight: 2,
+    kind: "DRAIN",
+    gen: () =>
+      `${pick(DAEMON_NAMES, "trader")}.${hex4()} · grace ${randInt(2, 30)}s`,
+  },
+  {
+    weight: 1,
+    kind: "EVICT",
+    gen: () => `0x${hex4()} · stale replica`,
+  },
+  {
+    weight: 1,
+    kind: "ENTER_M",
+    gen: () => `0x${hex4()} · drain begin`,
+  },
+  {
+    weight: 1,
+    kind: "BACKOFF",
+    gen: () => `level ${randInt(1, 3)} · cooldown ${randInt(400, 1600)}ms`,
+  },
+];
+
+const MESH_OS_ACTION_WEIGHT_TOTAL = MESH_OS_ACTION_TEMPLATES.reduce(
+  (a, t) => a + t.weight,
+  0,
+);
+
+function pickMeshOsActionTemplate(): MeshOsActionTpl {
+  let r = Math.random() * MESH_OS_ACTION_WEIGHT_TOTAL;
+  for (const t of MESH_OS_ACTION_TEMPLATES) {
+    r -= t.weight;
+    if (r <= 0) return t;
+  }
+  return MESH_OS_ACTION_TEMPLATES[0]!;
+}
+
+interface MaintNodeState {
+  id: string;
+  stateIdx: number;
+  progress: number;
+}
+
+const MAINT_STATES: ReadonlyArray<{
+  short: string;
+  next: string;
+  color: string;
+}> = [
+  { short: "ACT", next: "ENT", color: "text-accent" },
+  { short: "ENT", next: "MNT", color: "text-cyan" },
+  { short: "MNT", next: "EXT", color: "text-ink" },
+  { short: "EXT", next: "REC", color: "text-cyan" },
+  { short: "REC", next: "ACT", color: "text-accent-dim" },
+];
+
+const MAINT_NODES_INITIAL: ReadonlyArray<MaintNodeState> = [
+  { id: "0x7af3", stateIdx: 0, progress: 0.2 },
+  { id: "0x2c91", stateIdx: 2, progress: 0.55 },
+  { id: "0xeb29", stateIdx: 1, progress: 0.4 },
+  { id: "0xfbb1", stateIdx: 4, progress: 0.75 },
+];
+
+const MESH_OS_BAR_WIDTH = 12;
+
+function meshOsEventColor(kind: MeshOsEventKind): string {
+  switch (kind) {
+    case "replica":
+      return "text-accent";
+    case "daemon":
+      return "text-cyan";
+    case "rtt":
+      return "text-ink-dim";
+    case "health":
+      return "text-cyan";
+    case "admin":
+      return "text-warn";
+    case "blob":
+      return "text-accent-dim";
+    case "intent":
+      return "text-accent";
+    case "maint":
+      return "text-warn";
+    default:
+      return "text-ink-dim";
+  }
+}
+
+function meshOsActionColor(kind: MeshOsActionKind): string {
+  switch (kind) {
+    case "PULL":
+    case "PLACE":
+      return "text-accent";
+    case "DROP":
+    case "EVICT":
+    case "ENTER_M":
+      return "text-warn";
+    case "RESTART":
+    case "DRAIN":
+      return "text-cyan";
+    case "BACKOFF":
+      return "text-ink-dim";
+    default:
+      return "text-ink-dim";
+  }
+}
+
+function MeshOsConsole() {
+  const [tickHex, setTickHex] = useState(() => hex4());
+  const [tickMs, setTickMs] = useState(142);
+  const [events, setEvents] = useState<ReadonlyArray<MeshOsLoopEvent>>([]);
+  const [actions, setActions] = useState<ReadonlyArray<MeshOsLoopAction>>([]);
+  const [maint, setMaint] =
+    useState<ReadonlyArray<MaintNodeState>>(MAINT_NODES_INITIAL);
+  const [totals, setTotals] = useState({ events: 0, actions: 0 });
+
+  useEffect(() => {
+    let evCount = 0;
+    let actCount = 0;
+
+    const tick = (): void => {
+      const nEvents = randInt(2, 4);
+      const newEvents: MeshOsLoopEvent[] = [];
+      for (let i = 0; i < nEvents; i++) {
+        const t = pickMeshOsEventTemplate();
+        evCount += 1;
+        newEvents.push({
+          id: evCount,
+          ts: poolTs(),
+          kind: t.kind,
+          body: t.gen(),
+        });
+      }
+      setEvents((prev) => [...prev, ...newEvents].slice(-6));
+
+      const nActions = randInt(1, 3);
+      const newActions: MeshOsLoopAction[] = [];
+      for (let i = 0; i < nActions; i++) {
+        const t = pickMeshOsActionTemplate();
+        actCount += 1;
+        newActions.push({
+          id: actCount,
+          ts: poolTs(),
+          kind: t.kind,
+          body: t.gen(),
+        });
+      }
+      setActions((prev) => [...prev, ...newActions].slice(-5));
+
+      setMaint((prev) =>
+        prev.map((m) => {
+          let nextProgress = m.progress + 0.06 + Math.random() * 0.1;
+          let nextIdx = m.stateIdx;
+          if (nextProgress >= 1) {
+            nextIdx = (m.stateIdx + 1) % MAINT_STATES.length;
+            nextProgress = 0;
+          }
+          return { ...m, stateIdx: nextIdx, progress: nextProgress };
+        }),
+      );
+
+      setTickHex(hex4());
+      setTickMs(randInt(110, 220));
+      setTotals({ events: evCount, actions: actCount });
+    };
+
+    tick();
+    const id = window.setInterval(tick, 1500);
+    return () => window.clearInterval(id);
+  }, []);
+
+  return (
+    <div className="border border-line bg-bg-2 overflow-hidden font-mono text-[12px] leading-[1.75]">
+      <div className="flex items-center justify-between border-b border-line px-4 py-2 text-[10px] tracking-[0.14em] text-ink-dim uppercase">
+        <span className="flex items-center gap-3">
+          <span className="inline-flex gap-1">
+            <span className="frame-dot-r w-[7px] h-[7px] rounded-full" />
+            <span className="frame-dot-y w-[7px] h-[7px] rounded-full" />
+            <span className="frame-dot-g w-[7px] h-[7px] rounded-full" />
+          </span>
+          <span className="text-accent">$</span>
+          <span>
+            meshosctl tail{" "}
+            <span className="text-ink-faint">--live --node=local</span>
+          </span>
+        </span>
+        <span className="flex items-center gap-1.5 normal-case tracking-normal">
+          <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block animate-pulse-dot" />
+          <span className="text-accent">live</span>
+        </span>
+      </div>
+
+      <div className="px-5 py-4">
+        <div className="text-ink-dim flex items-center gap-3 whitespace-nowrap">
+          <span>┌─ event loop</span>
+          <span className="text-ink-faint">single canonical stream</span>
+        </div>
+        <div className="text-ink mt-1 flex items-center gap-3 whitespace-nowrap">
+          <span className="text-ink-faint">│</span>
+          <span className="text-ink-dim">tick</span>
+          <span className="text-accent">#{tickHex}</span>
+          <span className="text-ink-faint">·</span>
+          <span className="text-ink">{tickMs}ms</span>
+          <span className="text-ink-faint">·</span>
+          <span className="text-ink-dim">events</span>
+          <span className="text-ink">{totals.events}</span>
+          <span className="text-ink-faint">→</span>
+          <span className="text-ink-dim">actions</span>
+          <span className="text-accent">{totals.actions}</span>
+        </div>
+
+        <div className="text-ink-dim mt-3">├─ events / in</div>
+        <div className="min-h-[126px]">
+          {events.map((e) => {
+            const color = meshOsEventColor(e.kind);
+            return (
+              <div
+                key={e.id}
+                className="event-line-in flex items-baseline gap-3 whitespace-nowrap overflow-hidden"
+              >
+                <span className="text-ink-faint">│</span>
+                <span className="text-ink-faint" style={{ minWidth: "9ch" }}>
+                  {e.ts}
+                </span>
+                <span className={color} style={{ minWidth: "9ch" }}>
+                  [{e.kind}]
+                </span>
+                <span className="text-ink-dim flex-1 truncate">{e.body}</span>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="text-ink-dim mt-3">├─ actions / out</div>
+        <div className="min-h-[105px]">
+          {actions.map((a) => {
+            const color = meshOsActionColor(a.kind);
+            return (
+              <div
+                key={a.id}
+                className="event-line-in flex items-baseline gap-3 whitespace-nowrap overflow-hidden"
+              >
+                <span className="text-ink-faint">│</span>
+                <span className="text-ink-faint" style={{ minWidth: "9ch" }}>
+                  {a.ts}
+                </span>
+                <span className={color} style={{ minWidth: "10ch" }}>
+                  [{a.kind}]
+                </span>
+                <span className="text-ink flex-1 truncate">{a.body}</span>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="text-ink-dim mt-3">├─ maintenance / state machine</div>
+        {maint.map((m, i) => {
+          const state = MAINT_STATES[m.stateIdx] ?? MAINT_STATES[0]!;
+          const tree = i === maint.length - 1 ? "└─" : "├─";
+          return (
+            <div
+              key={m.id}
+              className="flex items-center gap-3 whitespace-nowrap"
+            >
+              <span className="text-ink-faint">│ {tree}</span>
+              <span className="text-ink" style={{ minWidth: "8ch" }}>
+                {m.id}
+              </span>
+              <span className={state.color} style={{ minWidth: "4ch" }}>
+                {state.short}
+              </span>
+              <span className="text-accent-dim">
+                {renderBar(m.progress, MESH_OS_BAR_WIDTH)}
+              </span>
+              <span className="text-ink-faint">→</span>
+              <span className="text-ink-dim">{state.next}</span>
+            </div>
+          );
+        })}
+
+        <div className="text-ink-dim mt-3">
+          └─ admit() · 0 deferred · 0 gated · cooldown clean
+        </div>
+
+        <div className="mt-4 text-ink-faint text-[10px] tracking-[0.04em]">
+          ▸ press <span className="text-accent">^C</span> to detach · reconcile
+          every <span className="text-accent">1.5s</span> · hysteresis{" "}
+          <span className="text-accent">·12</span> / cooldown{" "}
+          <span className="text-cyan">600ms</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const MESH_OS_CAPABILITY_STRIP: ReadonlyArray<{
+  num: string;
+  name: string;
+  body: string;
+  isNew?: boolean;
+}> = [
+  {
+    num: "mesh.os.1",
+    name: "Event Loop",
+    body: "one canonical stream. one ordering. replicas, daemons, rtt, admin — all funnel through the same loop. deterministic behavior.",
+  },
+  {
+    num: "mesh.os.2",
+    name: "Reconcile",
+    body: "desired vs actual every tick. the diff becomes a minimal action list. no duelling reactors, no thrash.",
+  },
+  {
+    num: "mesh.os.3",
+    name: "Daemon Supervision",
+    body: "start, drain, restart, gate. exponential backoff. backpressure signals. graceful shutdown or forced.",
+  },
+  {
+    num: "mesh.os.4",
+    name: "Maintenance Nodes",
+    isNew: true,
+    body: "cordon, drain, swap, repair. chain-driven admin events. every node converges on the same interpretation.",
+  },
+];
+
+function MeshOsSection() {
+  return (
+    <section
+      id="meshos"
+      className="relative overflow-hidden border-b border-line px-6 py-20"
+    >
+      <SectionLabel>§08 / cluster os // new</SectionLabel>
+      <DisplayHeading>
+        MeshOS:
+        <br />
+        <span className="text-accent">
+          the cluster
+          <br />
+          behaves itself.
+        </span>
+      </DisplayHeading>
+
+      <p className="text-[16px] text-ink max-w-[740px] leading-[1.7] font-light mb-12">
+        Distributed systems have lived inside a hidden civil war — schedulers,
+        healers, balancers, all running as independent reactors, arguing about
+        the same state from different points of view.
+        <br />
+        <br />
+        <strong className="text-accent font-medium">
+          MeshOS collapses them into a single event loop.
+        </strong>{" "}
+        Replica updates, daemon lifecycles, RTT samples, admin actions, blob
+        announcements — every signal funnels through one canonical ordering.
+        Each tick produces a minimal action list to bring the mesh into
+        alignment. One stream. One reconcile. The cluster behaves itself.
+      </p>
+
+      <MeshOsConsole />
+
+      <div className="mt-12 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 border-t border-l border-line">
+        {MESH_OS_CAPABILITY_STRIP.map((c) => (
+          <div
+            key={c.name}
+            className="border-r border-b border-line bg-bg-2/40 p-5"
+          >
+            <div className="flex items-baseline justify-between mb-2">
+              <span className="font-mono text-[10px] text-accent tracking-[0.14em]">
+                ▸ {c.num}
+              </span>
+              {c.isNew ? (
+                <span className="bg-accent text-bg px-1.5 py-0.5 text-[9px] font-bold tracking-[0.18em]">
+                  NEW
+                </span>
+              ) : null}
+            </div>
+            <h3 className="font-head text-[16px] leading-tight text-ink mb-2 tracking-[0.04em] lowercase">
+              {c.name}
+            </h3>
+            <p className="text-[11px] text-ink-dim leading-[1.55]">{c.body}</p>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function InstallSection() {
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -4277,7 +4824,7 @@ function InstallSection() {
 
   return (
     <section id="install" className="bg-bg-2 border-b border-line px-6 py-20">
-      <SectionLabel>§09 / install</SectionLabel>
+      <SectionLabel>§10 / install</SectionLabel>
       <DisplayHeading>
         five languages.
         <br />
@@ -4418,7 +4965,7 @@ const APPS: readonly AppCard[] = [
 function ApplicationsSection() {
   return (
     <section id="apps" className="border-b border-line px-6 py-20">
-      <SectionLabel>§10 / target applications</SectionLabel>
+      <SectionLabel>§11 / target applications</SectionLabel>
       <DisplayHeading>
         everything that
         <br />
@@ -4508,7 +5055,7 @@ function BlackwallViz() {
 function BlackwallSection() {
   return (
     <section id="wall" className="blackwall-bg border-b border-line px-6 py-20">
-      <SectionLabel>§11 / the blackwall</SectionLabel>
+      <SectionLabel>§12 / the blackwall</SectionLabel>
       <DisplayHeading>
         safety isn&apos;t declared.
         <br />
@@ -4567,7 +5114,7 @@ function ReleasesSection() {
 
   return (
     <section id="releases" className="border-b border-line px-6 py-20">
-      <SectionLabel>§12 / releases</SectionLabel>
+      <SectionLabel>§13 / releases</SectionLabel>
       <DisplayHeading>net releases.</DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
@@ -4638,7 +5185,7 @@ function ReleasesSection() {
 function ClosingSection() {
   return (
     <section id="post-cloud" className="border-b border-line px-6 py-20">
-      <SectionLabel>§13 / post-cloud</SectionLabel>
+      <SectionLabel>§14 / post-cloud</SectionLabel>
       <DisplayHeading>
         not anti-cloud.
         <br />
@@ -4961,6 +5508,7 @@ export default function Home(): JSX.Element {
         <MikoshiSection />
         <ComputeRuntimeSection />
         <DatafortsSection />
+        <MeshOsSection />
         <ComponentsSection />
         <InstallSection />
         <ApplicationsSection />
