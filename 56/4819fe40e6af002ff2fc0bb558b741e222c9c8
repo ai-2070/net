@@ -1,0 +1,21 @@
+net/crates/net/docs/plans/MESHOS_PLAN.md
+  s_3bbc444b3ef3e5::t_c17ee82149b522 22
+  s_3bbc444b3ef3e5::t_6cdb667af7068c 44,46-49
+  s_3bbc444b3ef3e5::t_cf6b3ae5ce7570 7-21,23-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "564819fe40e6af002ff2fc0bb558b741e222c9c8",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
