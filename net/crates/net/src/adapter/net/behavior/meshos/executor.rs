@@ -33,6 +33,10 @@ use tokio::time::sleep_until;
 
 use super::action::{MeshOsAction, PendingAction};
 use super::backpressure::{AdmissionResult, BackpressureState};
+use super::chain::{
+    append_dispatched, append_failed, append_gated, ActionChainAppender,
+    NoOpActionChainAppender,
+};
 use super::config::MeshOsConfig;
 use super::snapshot::{FailureRecord, RECENT_FAILURES_CAPACITY};
 
@@ -199,6 +203,11 @@ pub struct ActionExecutor<D: ActionDispatcher> {
     deferred: BinaryHeap<DeferredEntry>,
     recent_failures: VecDeque<FailureRecord>,
     stats: Arc<ExecutorStats>,
+    /// Optional action-chain appender. Each admit/dispatch
+    /// outcome appends an [`super::chain::ActionChainRecord`].
+    /// Defaults to [`NoOpActionChainAppender`] — a real
+    /// appender wires only when a chain consumer is set up.
+    chain_appender: Arc<dyn ActionChainAppender>,
 }
 
 impl<D: ActionDispatcher> ActionExecutor<D> {
@@ -217,7 +226,17 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             deferred: BinaryHeap::new(),
             recent_failures: VecDeque::with_capacity(RECENT_FAILURES_CAPACITY),
             stats: Arc::new(ExecutorStats::default()),
+            chain_appender: Arc::new(NoOpActionChainAppender),
         }
+    }
+
+    /// Builder: install an action-chain appender. The default
+    /// `NoOpActionChainAppender` swallows every record; a real
+    /// appender (e.g. one writing to a RedEX chain consumed by
+    /// `MeshOsSnapshotFold`) takes over per-action recording.
+    pub fn with_chain_appender(mut self, appender: Arc<dyn ActionChainAppender>) -> Self {
+        self.chain_appender = appender;
+        self
     }
 
     /// Handle on the executor's live state — `stats` + the
@@ -279,9 +298,16 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             } => {
                 ExecutorStats::inc(&self.stats.gated);
                 let age = cooldown_until.saturating_duration_since(now);
+                let cooldown_ms = age.as_millis() as u64;
                 self.record_failure(
                     format!("action-id:{}", action.id.0),
-                    format!("gated ({reason}) for {} ms", age.as_millis()),
+                    format!("gated ({reason}) for {cooldown_ms} ms"),
+                );
+                let _ = append_gated(
+                    &self.chain_appender,
+                    &action,
+                    reason.to_string(),
+                    Some(cooldown_ms),
                 );
             }
         }
@@ -295,10 +321,18 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
         match result {
             Ok(()) => {
                 ExecutorStats::inc(&self.stats.dispatched);
+                let _ = append_dispatched(&self.chain_appender, &action);
             }
             Err(err) => {
                 if let Some(after) = err.retry_after {
                     ExecutorStats::inc(&self.stats.dispatch_retries);
+                    let retry_ms = after.as_millis() as u64;
+                    let _ = append_failed(
+                        &self.chain_appender,
+                        &action,
+                        err.reason.clone(),
+                        Some(retry_ms),
+                    );
                     let now = Instant::now();
                     self.deferred.push(DeferredEntry {
                         retry_at: now + after,
@@ -306,10 +340,12 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                     });
                 } else {
                     ExecutorStats::inc(&self.stats.failed);
+                    let reason = err.reason.clone();
                     self.record_failure(
                         format!("action-id:{}", action.id.0),
                         err.reason,
                     );
+                    let _ = append_failed(&self.chain_appender, &action, reason, None);
                 }
             }
         }

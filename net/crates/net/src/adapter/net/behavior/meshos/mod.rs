@@ -51,6 +51,7 @@
 
 pub mod action;
 pub mod backpressure;
+pub mod chain;
 pub mod config;
 pub mod control;
 pub mod event;
@@ -67,6 +68,11 @@ pub mod state;
 pub mod supervision;
 
 pub use action::{ActionId, AllocateActionId, MaintenanceTransition, MeshOsAction, PendingAction};
+pub use chain::{
+    append_dispatched, append_failed, append_gated, record_from, ActionChainAppender,
+    ActionChainRecord, ActionDisposition, AppendError, BufferingActionChainAppender,
+    MeshOsSnapshotFold, NoOpActionChainAppender,
+};
 pub use backpressure::{
     admit, AdmissionResult, BackpressureState, ClusterBackpressureChange,
 };
