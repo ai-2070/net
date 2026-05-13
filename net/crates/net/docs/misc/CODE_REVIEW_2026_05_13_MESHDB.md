@@ -209,16 +209,38 @@ behaviour change, regression-test by parity with existing lineage tests.
 
 **Where:** Python / Node test suites; Go ships no SDK tests.
 
-**Fix:** add at least one federated `LoopbackTransport`-driven smoke test in
-Python and Node (Go SDK tests are a separate follow-up — at minimum add a
-unit test that exercises the goroutine cancellation path from B5).
+**Status:** deferred. Adding federated SDK tests requires first exposing
+`FederatedMeshQueryExecutor` + `LoopbackTransport` through the Python / Node
+FFI shims (and the Go cdylib). Neither shim does today — the surface is a
+slice-sized addition. Substrate-level coverage of the federated path
+(including the cancellation-after-composite-materialization regression
+from B2 and the call_id uniqueness regression from M3) is solid;
+cross-language smoke tests come with the future federated SDK slice.
 
 ### M10 — No runner-side error-path coverage in SDKs
 
 **Where:** Python / Node tests only assert factory-time validation.
 
-**Fix:** add tests for `BudgetExceeded`, `JoinMemoryExceeded`, and the new
-`AmbiguousDiscovery` (M2). One test per shim is sufficient.
+**Status:** partial. The runner-side `MeshError` variants the review
+listed are not currently triggerable from the SDK surfaces today:
+
+- `JoinMemoryExceeded` threshold is 256 MiB — not realistically tripped
+  from a test.
+- `QueryBudgetExceeded` needs configurable per-query budgets the SDK
+  doesn't expose yet.
+- `AmbiguousDiscovery` needs the `ChainRef::Discovered` surface, also
+  not exposed.
+- `HistoricalRangeUnavailable` requires capability-index gating; the
+  Python / Node SDKs use a `ChainReader` directly with no caps index.
+
+What did ship: M5 added the `kind` discriminator on `MeshError`, with
+substrate tests pinning the variant→string mapping
+(`error::tests::kind_discriminator_is_stable_across_variants`). The
+Node SDK test `parseMeshDbErrorKind decodes the <<meshdb-kind:...>>
+prefix` covers the SDK-side plumbing that decodes a runtime error
+once one is raised. Real runtime triggers land with the future
+slices that add capability-index gating, configurable budgets, and
+the `Discovered` SDK surface.
 
 ## Minor
 

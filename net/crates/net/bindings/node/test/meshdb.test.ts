@@ -145,6 +145,26 @@ d('MeshDB factory + runner (slice 1)', () => {
     expect(tb.ttlSeconds).toBe(2.5);
   });
 
+  it('parseMeshDbErrorKind decodes the <<meshdb-kind:...>> prefix', async () => {
+    // The Rust binding embeds the structured error kind in the
+    // reason string as `<<meshdb-kind:KIND>>MSG`. Exercise the
+    // parser directly to pin the contract (a runtime trigger
+    // for substrate-side errors needs surfaces the SDK doesn't
+    // expose yet — capability-index gating, federated transport,
+    // configurable budgets — so we cover the plumbing here).
+    const { parseMeshDbErrorKind } = await import('../meshdb');
+    const synthetic = new Error('<<meshdb-kind:planner_error>>plan rejected');
+    const decoded = parseMeshDbErrorKind(synthetic);
+    expect(decoded).not.toBeNull();
+    expect(decoded?.kind).toBe('planner_error');
+    expect(decoded?.message).toBe('plan rejected');
+
+    const plain = new Error('some unrelated error');
+    expect(parseMeshDbErrorKind(plain)).toBeNull();
+    expect(parseMeshDbErrorKind('not an error')).toBeNull();
+    expect(parseMeshDbErrorKind(null)).toBeNull();
+  });
+
   it('cachePolicyTimeBound rejects non-finite / negative ttlSeconds at the factory', () => {
     // Regression: pre-fix, the factory stashed any number
     // and the converter silently rewrote bad values to 5.0.
