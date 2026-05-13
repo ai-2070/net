@@ -312,6 +312,14 @@ impl MeshOsLoop {
     /// Returns the final `reconcile_count` — used by tests; in
     /// production it's diagnostic-only.
     pub async fn run(mut self) -> u64 {
+        tracing::debug!(
+            target: "meshos",
+            this_node = self.config.this_node,
+            tick_interval_ms = self.config.tick_interval.as_millis() as u64,
+            event_queue_capacity = self.config.event_queue_capacity,
+            action_queue_capacity = self.config.action_queue_capacity,
+            "MeshOsLoop starting",
+        );
         // Tick timer — fires every `tick_interval`. Configured
         // to skip missed ticks rather than burst, since the
         // reconcile pass is the slow-and-steady cadence the plan
@@ -331,8 +339,20 @@ impl MeshOsLoop {
         loop {
             tokio::select! {
                 event = self.events_rx.recv() => {
-                    let Some(event) = event else { break };
+                    let Some(event) = event else {
+                        tracing::debug!(
+                            target: "meshos",
+                            reconcile_count = self.reconcile_count,
+                            "MeshOsLoop exiting — all handles dropped",
+                        );
+                        break;
+                    };
                     if matches!(event, MeshOsEvent::Shutdown) {
+                        tracing::debug!(
+                            target: "meshos",
+                            reconcile_count = self.reconcile_count,
+                            "MeshOsLoop exiting — Shutdown event received",
+                        );
                         break;
                     }
                     self.apply(&event);
