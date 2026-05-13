@@ -37,6 +37,83 @@ use crate::adapter::net::redex::{RedexError, RedexEvent, RedexFold};
 use super::action::{MeshOsAction, PendingAction};
 use super::snapshot::{action_kind_str, FailureRecord, MeshOsSnapshot, RECENT_FAILURES_CAPACITY};
 
+/// Current wire-format version for [`ActionChainRecord`].
+/// Prepended as a single byte before the postcard payload by
+/// [`encode_record`]; [`decode_record`] checks it before
+/// dispatching to the postcard decoder.
+///
+/// Bump when an incompatible change to the on-chain shape lands
+/// (variant removed, field type changed). Adding an
+/// [`ActionDisposition`] variant is still source-incompatible
+/// for `non_exhaustive` matches, but the version byte lets the
+/// decoder distinguish "unknown variant in the same wire
+/// format" from "older / newer wire format entirely."
+pub const WIRE_FORMAT_VERSION: u8 = 1;
+
+/// Encode an [`ActionChainRecord`] into the on-wire form: one
+/// version byte followed by the postcard-encoded payload.
+/// Production appenders that target a RedEX chain pass the
+/// returned bytes to the chain commit path.
+pub fn encode_record(record: &ActionChainRecord) -> Result<Vec<u8>, AppendError> {
+    let body = postcard::to_allocvec(record).map_err(|e| AppendError {
+        reason: format!("postcard encode: {e}"),
+    })?;
+    let mut bytes = Vec::with_capacity(1 + body.len());
+    bytes.push(WIRE_FORMAT_VERSION);
+    bytes.extend_from_slice(&body);
+    Ok(bytes)
+}
+
+/// Decode an on-wire [`ActionChainRecord`]. Rejects a missing
+/// or unknown version byte before attempting postcard decode so
+/// a forward-incompatible record surfaces as a clear error
+/// rather than a garbled deserialization.
+pub fn decode_record(bytes: &[u8]) -> Result<ActionChainRecord, DecodeError> {
+    let (&version, rest) = bytes
+        .split_first()
+        .ok_or(DecodeError::Empty)?;
+    if version != WIRE_FORMAT_VERSION {
+        return Err(DecodeError::UnsupportedVersion {
+            seen: version,
+            supported: WIRE_FORMAT_VERSION,
+        });
+    }
+    postcard::from_bytes(rest).map_err(|e| DecodeError::Postcard(e.to_string()))
+}
+
+/// Decode errors from [`decode_record`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DecodeError {
+    /// Wire payload was empty — no version byte.
+    Empty,
+    /// Wire payload carried a version this build doesn't
+    /// understand.
+    UnsupportedVersion {
+        /// Version byte the wire payload carried.
+        seen: u8,
+        /// Version this build supports.
+        supported: u8,
+    },
+    /// Postcard rejected the payload after the version byte.
+    Postcard(String),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::Empty => f.write_str("empty action-chain record payload"),
+            DecodeError::UnsupportedVersion { seen, supported } => write!(
+                f,
+                "unsupported action-chain wire version {seen}; this build expects {supported}",
+            ),
+            DecodeError::Postcard(s) => write!(f, "postcard decode: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
 /// Per-action chain record. Bounded shape — carries only what
 /// observers need to reason about the action chain without
 /// requiring `MeshOsAction` to be `Serialize`.
@@ -244,8 +321,8 @@ impl RedexFold<MeshOsSnapshot> for MeshOsSnapshotFold {
         ev: &RedexEvent,
         state: &mut MeshOsSnapshot,
     ) -> Result<(), RedexError> {
-        let record: ActionChainRecord = postcard::from_bytes(&ev.payload).map_err(|e| {
-            RedexError::Decode(format!("ActionChainRecord postcard decode: {e}"))
+        let record = decode_record(&ev.payload).map_err(|e| {
+            RedexError::Decode(format!("ActionChainRecord wire decode: {e}"))
         })?;
         match record.disposition {
             ActionDisposition::Dispatched => {
@@ -348,6 +425,13 @@ mod tests {
     }
 
     fn redex_event(payload: Vec<u8>) -> RedexEvent {
+        // Tests feed raw postcard bytes; the fold expects the on-wire form so prepend the version byte here.
+        let payload = {
+            let mut versioned = Vec::with_capacity(1 + payload.len());
+            versioned.push(WIRE_FORMAT_VERSION);
+            versioned.extend_from_slice(&payload);
+            versioned
+        };
         use crate::adapter::net::redex::RedexEntry;
         RedexEvent {
             entry: RedexEntry {
@@ -358,6 +442,45 @@ mod tests {
             },
             payload: bytes::Bytes::from(payload),
         }
+    }
+
+    #[test]
+    fn decode_rejects_payload_with_unknown_wire_version() {
+        // Regression for I10: bumping the wire version must
+        // surface as a clear error rather than a garbled
+        // deserialization on old/new asymmetry.
+        let r = record(1, "start_daemon", ActionDisposition::Dispatched);
+        let mut bytes = encode_record(&r).unwrap();
+        bytes[0] = 99;
+        let err = decode_record(&bytes).unwrap_err();
+        match err {
+            DecodeError::UnsupportedVersion { seen, supported } => {
+                assert_eq!(seen, 99);
+                assert_eq!(supported, WIRE_FORMAT_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_empty_payload() {
+        assert_eq!(decode_record(&[]).unwrap_err(), DecodeError::Empty);
+    }
+
+    #[test]
+    fn encode_decode_round_trip_preserves_record() {
+        let r = record(
+            42,
+            "pull_replica",
+            ActionDisposition::Failed {
+                reason: "boom".into(),
+                retry_after_ms: Some(500),
+            },
+        );
+        let bytes = encode_record(&r).unwrap();
+        assert_eq!(bytes[0], WIRE_FORMAT_VERSION);
+        let back = decode_record(&bytes).unwrap();
+        assert_eq!(back, r);
     }
 
     #[test]
