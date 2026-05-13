@@ -5,11 +5,14 @@
 //! Today's consumers wire the three pieces by hand:
 //!
 //! ```ignore
-//! let (mesh_loop, handle, actions_rx, reader) = MeshOsLoop::new(config.clone());
+//! let parts = MeshOsLoop::new(config.clone());
 //! let dispatcher = Arc::new(LoggingDispatcher::new());
-//! let exec = ActionExecutor::new(actions_rx, Arc::new(config), Arc::clone(&dispatcher));
-//! let loop_task = tokio::spawn(mesh_loop.run());
+//! let exec = ActionExecutor::new(parts.actions_rx, Arc::new(config), Arc::clone(&dispatcher));
+//! let loop_task = tokio::spawn(parts.mesh_loop.run());
 //! let exec_task = tokio::spawn(exec.run());
+//! // Prefer publish_timeout over publish for long-lived sources
+//! // so a wedged loop can't park the caller indefinitely.
+//! parts.handle.publish_timeout(event, Duration::from_millis(50)).await?;
 //! ```
 //!
 //! …which is fine for one or two integrations, awkward at
