@@ -1,0 +1,25 @@
+net/crates/net/bindings/node/meshdb.ts
+  s_3a0a24a47d1a36::t_fcbfb29508cd04 1-60
+net/crates/net/bindings/node/package.json
+  s_3a0a24a47d1a36::t_73192bb9e4b423 19-22
+net/crates/net/bindings/node/test/meshdb.test.ts
+  s_3a0a24a47d1a36::t_39f1308317cc0b 821-883
+net/crates/net/bindings/node/tsconfig.build.json
+  s_3a0a24a47d1a36::t_3b2be76a3adcfb 27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "b7f01f71c2f827435c9ea3ec65afaaf41d850ee4",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
