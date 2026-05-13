@@ -37,6 +37,8 @@ use super::executor::{ActionDispatcher, ActionExecutor, ExecutorStats, ExecutorS
 use super::probes::{HealthProbe, LocalityProbe};
 use super::scheduler::{PlacementScorer, SchedulerRegistry};
 use super::snapshot::MeshOsSnapshot;
+use super::sources::attach_to_daemon_registry;
+use crate::adapter::net::compute::DaemonRegistry;
 
 /// One-stop entry point. Spawns the loop + executor as tokio
 /// tasks; exposes the publish handle, snapshot reader, and
@@ -65,6 +67,13 @@ pub struct MeshOsRuntime {
     /// `action_queue_capacity`). Sampled by the runtime for
     /// operator visibility into the silent-loss path.
     dropped_actions: Arc<AtomicU64>,
+    /// Per-runtime daemon registry. Constructed on `start`; the
+    /// lifecycle observer that fans daemon-lifecycle events into
+    /// the loop is auto-attached. SDK consumers register daemons
+    /// against this handle; substrate code can also pass a
+    /// pre-built registry via [`Self::start_with_daemon_registry`]
+    /// to share state with code already managing daemons.
+    daemon_registry: Arc<DaemonRegistry>,
 }
 
 /// Plain-value rollup of the runtime's join statistics. Returned
@@ -106,14 +115,34 @@ impl MeshOsRuntime {
     }
 
     /// Like [`Self::start`], but accepts both probe and
-    /// scheduler registries. The most general entry point —
-    /// `start` and `start_with_probes` are conveniences over
-    /// this.
+    /// scheduler registries.
     pub fn start_full<D: ActionDispatcher>(
         config: MeshOsConfig,
         dispatcher: Arc<D>,
         probes: ProbeRegistry,
         scheduler: SchedulerRegistry,
+    ) -> Self {
+        Self::start_with_daemon_registry(
+            config,
+            dispatcher,
+            probes,
+            scheduler,
+            Arc::new(DaemonRegistry::new()),
+        )
+    }
+
+    /// Most general entry point. Accepts probe + scheduler
+    /// registries AND a pre-built [`DaemonRegistry`] the runtime
+    /// will attach its lifecycle sink to. `start`, `start_with_probes`,
+    /// and `start_full` build new registries internally; callers
+    /// that need to share a registry with other subsystems pass
+    /// theirs in here.
+    pub fn start_with_daemon_registry<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        dispatcher: Arc<D>,
+        probes: ProbeRegistry,
+        scheduler: SchedulerRegistry,
+        daemon_registry: Arc<DaemonRegistry>,
     ) -> Self {
         let super::event_loop::MeshOsLoopParts {
             mesh_loop,
@@ -125,6 +154,11 @@ impl MeshOsRuntime {
             .with_probe_registry(probes.clone())
             .with_scheduler_registry(scheduler.clone());
         let dropped_actions = mesh_loop.dropped_actions_counter();
+        // Wire the daemon-lifecycle source converter so registry
+        // events fan into the loop's event stream. Replaces any
+        // prior observer on the registry (one observer slot per
+        // registry).
+        let _prior = attach_to_daemon_registry(&daemon_registry, handle.clone());
         let cfg_arc = Arc::new(config);
         let exec = ActionExecutor::new(actions_rx, cfg_arc, dispatcher);
         let stats = exec.stats_arc();
@@ -139,6 +173,7 @@ impl MeshOsRuntime {
             probes,
             scheduler,
             dropped_actions,
+            daemon_registry,
         }
     }
 
@@ -181,6 +216,16 @@ impl MeshOsRuntime {
     /// own lifetime.
     pub fn probe_registry(&self) -> ProbeRegistry {
         self.probes.clone()
+    }
+
+    /// Borrow the runtime's [`DaemonRegistry`]. The lifecycle
+    /// sink is already attached, so any `register` /
+    /// `unregister` call on the returned registry surfaces as a
+    /// `DaemonLifecycleSignal` event in the loop's event stream.
+    /// SDK consumers (Rust + future language bindings) register
+    /// daemons through this handle.
+    pub fn daemon_registry(&self) -> &Arc<DaemonRegistry> {
+        &self.daemon_registry
     }
 
     /// Borrow the publish handle. Source converters
@@ -519,5 +564,44 @@ mod tests {
         // Just compile + run cleanly — the handle_clone path
         // is what source converters use to plug in.
         let _ = Instant::now();
+    }
+
+    #[tokio::test]
+    async fn daemon_registry_accessor_attaches_lifecycle_observer_on_start() {
+        // The runtime owns a DaemonRegistry and auto-attaches the
+        // daemon-lifecycle source converter during `start`. SDK
+        // consumers reach the registry via `daemon_registry()` and
+        // register daemons through it.
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let rt = MeshOsRuntime::start(fast_cfg(), Arc::clone(&dispatcher));
+        assert!(
+            rt.daemon_registry().has_lifecycle_observer(),
+            "runtime should auto-attach the daemon lifecycle observer",
+        );
+        // The accessor returns the same Arc each call — same
+        // shared registry, not a new one.
+        let a = Arc::as_ptr(rt.daemon_registry());
+        let b = Arc::as_ptr(rt.daemon_registry());
+        assert_eq!(a, b, "daemon_registry() must return the runtime-owned Arc");
+        let _ = rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn daemon_registry_can_be_pre_supplied_via_start_with_daemon_registry() {
+        // Callers that need to share a registry with other
+        // subsystems (the audit log, a metrics surface, etc.)
+        // pass theirs in via `start_with_daemon_registry`.
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let registry = Arc::new(DaemonRegistry::new());
+        let rt = MeshOsRuntime::start_with_daemon_registry(
+            fast_cfg(),
+            Arc::clone(&dispatcher),
+            ProbeRegistry::new(),
+            SchedulerRegistry::new(),
+            Arc::clone(&registry),
+        );
+        assert!(Arc::ptr_eq(rt.daemon_registry(), &registry));
+        assert!(registry.has_lifecycle_observer());
+        let _ = rt.shutdown().await;
     }
 }
