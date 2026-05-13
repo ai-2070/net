@@ -401,11 +401,11 @@ mod tests {
 
     #[tokio::test]
     async fn leader_lost_event_clears_replica_leader_via_none_update() {
-        // Regression for N3. When this coordinator steps down,
-        // the sink must surface a `ReplicaLeaderUpdate { leader:
-        // None }` so MeshOS clears its mirror — otherwise the
-        // loop carries a stale `replica_leader[chain] = THIS_NODE`
-        // until a different node's LeaderChanged overwrites it.
+        // When this coordinator steps down, the sink must surface
+        // a `ReplicaLeaderUpdate { leader: None }` so MeshOS
+        // clears its mirror — otherwise the loop carries a stale
+        // `replica_leader[chain] = THIS_NODE` until a different
+        // node's LeaderChanged overwrites it.
         const THIS_NODE: NodeId = 100;
         let MeshOsLoopParts {
             mesh_loop: loop_,
@@ -415,8 +415,15 @@ mod tests {
         } = MeshOsLoop::new(fast_cfg());
         let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
         let task = tokio::spawn(loop_.run());
-        // Push a LeaderChanged first so the fold has a stale
-        // pointer; then a LeaderLost should clear it.
+        // Seed the holders set first so the snapshot surfaces a
+        // ReplicaSnapshot for the chain; otherwise an absent
+        // entry could mask a regression where the fold drops the
+        // LeaderLost translation.
+        sink.observe(ReplicaTransitionEvent::BecameHolder {
+            origin_hash: 0xBADC0DE,
+            at: Instant::now(),
+        });
+        // Promote — leader is now Some(THIS_NODE).
         sink.observe(ReplicaTransitionEvent::LeaderChanged {
             origin_hash: 0xBADC0DE,
             at: Instant::now(),
@@ -430,15 +437,12 @@ mod tests {
         handle.publish(MeshOsEvent::Shutdown).await.unwrap();
         let _ = task.await;
         let snap = reader.read();
-        // After LeaderLost, the chain entry's leader field is
-        // None (it was Some(THIS_NODE) after LeaderChanged).
-        match snap.replicas.get(&0xBADC0DE) {
-            Some(entry) => assert_eq!(entry.leader, None, "LeaderLost should clear leader"),
-            None => {
-                // Either acceptable — fold may not surface a
-                // replicas entry when there's no holder set.
-            }
-        }
+        // Holders set has THIS_NODE; leader has been cleared.
+        let entry = snap
+            .replicas
+            .get(&0xBADC0DE)
+            .expect("replicas entry exists after BecameHolder");
+        assert_eq!(entry.leader, None, "LeaderLost should clear leader");
     }
 
     #[tokio::test]
