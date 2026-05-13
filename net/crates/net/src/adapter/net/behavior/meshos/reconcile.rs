@@ -1,7 +1,12 @@
 //! The pure-sync reconcile function. Locked decision #3:
 //! `reconcile(actual, desired) -> Vec<MeshOsAction>` is
-//! async-free, no I/O, no allocations beyond the returned
-//! action list. Testable as a sync table-driven fixture.
+//! async-free, no I/O. Testable as a sync table-driven fixture.
+//! The common no-op path allocates only the empty `Vec`; the
+//! diff arms allocate the returned actions plus intermediate
+//! `Vec<ChainId>`s used to sort iteration order
+//! deterministically. Pre-allocated string constants for the
+//! few reasons that ride into actions would shave the last
+//! bits of allocation but aren't on any hot path today.
 //!
 //! Phase B fills in the daemon-supervision arm — `StartDaemon`
 //! / `StopDaemon` / `ApplyBackoff` emit based on the diff
