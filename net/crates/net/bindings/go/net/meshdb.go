@@ -1272,32 +1272,49 @@ func NewMeshDBQueryBuilder() *MeshDBQueryBuilder {
 
 // At resets the builder to a fresh source: read seq at origin.
 //
-// If the builder already holds a state from a prior chain step,
-// the existing `*MeshDBQuery` handle is explicitly freed before
-// the new source is installed. Python / Node get away with GC;
-// Go's FFI handle is not GC-managed (finalizers run at unknown
-// later times), so we free deterministically here to avoid
-// accumulating handles in long-lived test harnesses.
+// Any prior chain step's state on the receiver is explicitly
+// freed (Python / Node get away with GC; Go's FFI handle is
+// not GC-managed and finalizers run at unknown later times, so
+// we free deterministically here to avoid accumulating handles
+// in long-lived test harnesses). Any accumulated builder error
+// is preserved on the new builder so a Build() further down the
+// chain still surfaces the first error.
+//
+// Aliasing caveat: the receiver's state is freed in place, so
+// alias references to THIS builder (`base := q.Between(...);
+// other := base.Count(); base.At(...)`) are not safe to
+// continue using as a builder. Construct a new builder via
+// `MeshQuery.builder()` per pipeline instead of resetting an
+// aliased one. (Result queries produced by `Count` / `Sum` /
+// etc. are independent: each factory clones the inner plan on
+// the FFI side, so freeing the input builder's state does not
+// affect a downstream pipeline that already consumed it.)
 func (b *MeshDBQueryBuilder) At(origin, seq uint64) *MeshDBQueryBuilder {
+	prevErr := b.consumeErr()
 	b.resetState()
-	return &MeshDBQueryBuilder{state: MeshDBQueryAt(origin, seq)}
+	return &MeshDBQueryBuilder{state: MeshDBQueryAt(origin, seq), err: prevErr}
 }
 
 // Between resets the builder to a fresh source: read events in
-// the half-open seq range. Frees any prior builder state — see
-// `At` for the lifetime rationale.
+// the half-open seq range. Same lifetime / aliasing semantics
+// as `At`. Errors from `MeshDBQueryBetween` are combined with
+// any prior accumulated error (first error wins).
 func (b *MeshDBQueryBuilder) Between(origin, start, end uint64) *MeshDBQueryBuilder {
+	prevErr := b.consumeErr()
 	b.resetState()
 	q, err := MeshDBQueryBetween(origin, start, end)
+	if prevErr != nil {
+		err = prevErr
+	}
 	return &MeshDBQueryBuilder{state: q, err: err}
 }
 
 // Latest resets the builder to a fresh source: read the tip
-// event of origin. Frees any prior builder state — see `At` for
-// the lifetime rationale.
+// event of origin. Same lifetime / aliasing semantics as `At`.
 func (b *MeshDBQueryBuilder) Latest(origin uint64) *MeshDBQueryBuilder {
+	prevErr := b.consumeErr()
 	b.resetState()
-	return &MeshDBQueryBuilder{state: MeshDBQueryLatest(origin)}
+	return &MeshDBQueryBuilder{state: MeshDBQueryLatest(origin), err: prevErr}
 }
 
 // resetState frees any handle currently held in `b.state`. Safe
@@ -1308,6 +1325,17 @@ func (b *MeshDBQueryBuilder) resetState() {
 	}
 	b.state.Free()
 	b.state = nil
+}
+
+// consumeErr returns the builder's accumulated error and clears
+// it on the receiver. Safe to call on a nil receiver.
+func (b *MeshDBQueryBuilder) consumeErr() error {
+	if b == nil {
+		return nil
+	}
+	e := b.err
+	b.err = nil
+	return e
 }
 
 // Filter wraps the current pipeline in a row filter.
