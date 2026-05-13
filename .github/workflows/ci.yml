@@ -492,15 +492,28 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
 
-      # The Go bindings link against `target/release/libnet.so` via cgo
-      # (`#cgo LDFLAGS: -L${SRCDIR}/../net/crates/net/target/release -lnet`
-      # in `go/net.go`). The bindings exercise mesh, cortex, blob, and
-      # NAT-traversal surfaces, so the cdylib needs the corresponding
-      # features at build time. `dataforts` enables the blob FFI used by
-      # `blob.go`; `netdb` chains to `cortex` → `redex` → `net`.
-      - name: Build net cdylib
+      # The Go bindings link against TWO cdylibs via cgo:
+      #   - `-lnet` (libnet.so, the main `ai2070-net` crate) from net.go
+      #   - `-lnet_compute` (libnet_compute.so, the `net-compute-ffi`
+      #     workspace member at bindings/go/compute-ffi) from compute.go
+      # Both end up in `net/crates/net/target/release/`.
+      #
+      # Features:
+      #   - `ai2070-net` needs `netdb,dataforts,redex-disk,nat-traversal`
+      #     for the mesh + cortex + blob + NAT FFI surfaces exercised by
+      #     the Go test suite.
+      #   - `net-compute-ffi` needs `test-helpers` so the FFI symbol
+      #     `net_compute_test_inject_synthetic_peer` (referenced by
+      #     `groups_testhelpers.go`) is exported.
+      #
+      # Built as one cargo invocation so feature unification on the
+      # shared `ai2070-net` dep doesn't cause a second compilation pass.
+      - name: Build net + net_compute cdylibs
         working-directory: net/crates/net
-        run: cargo build --release --features "netdb dataforts redex-disk nat-traversal"
+        run: >
+          cargo build --release
+          -p ai2070-net -p net-compute-ffi
+          --features "ai2070-net/netdb,ai2070-net/dataforts,ai2070-net/redex-disk,ai2070-net/nat-traversal,net-compute-ffi/test-helpers"
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
       # so local developers can run quick unit-style passes without the
