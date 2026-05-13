@@ -144,17 +144,17 @@ pub struct DaemonRef {
 pub enum DaemonLifecycleSignal {
     /// Daemon started successfully.
     Started {
-        /// Wall time of the start.
+        /// Monotonic timestamp of the start.
         at: Instant,
     },
     /// Daemon exited without error (graceful shutdown).
     ExitedCleanly {
-        /// Wall time of the exit.
+        /// Monotonic timestamp of the exit.
         at: Instant,
     },
     /// Daemon crashed; supervisor logged the reason.
     Crashed {
-        /// Wall time of the crash.
+        /// Monotonic timestamp of the crash.
         at: Instant,
         /// Operator-readable reason.
         reason: String,

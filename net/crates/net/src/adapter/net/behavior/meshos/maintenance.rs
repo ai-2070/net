@@ -57,7 +57,7 @@ pub enum MaintenanceState {
     /// for isolation. Replicas are migrating; non-essential
     /// daemons are stopping.
     EnteringMaintenance {
-        /// Wall time the transition was entered.
+        /// Monotonic timestamp when the transition was entered.
         since: Instant,
         /// Optional deadline. Past this point the loop flips to
         /// [`MaintenanceState::DrainFailed`] if conditions
@@ -67,13 +67,13 @@ pub enum MaintenanceState {
     /// Steady-state isolation. Replicas migrated, daemons
     /// stopped. Operator commands run unimpeded.
     Maintenance {
-        /// Wall time the steady state was entered.
+        /// Monotonic timestamp when the steady state was entered.
         since: Instant,
     },
     /// Operator requested resume; this node is restarting
     /// daemons + re-emitting capabilities.
     ExitingMaintenance {
-        /// Wall time the transition was entered.
+        /// Monotonic timestamp when the transition was entered.
         since: Instant,
     },
     /// Drain failed — replicas / daemons didn't converge before
@@ -81,7 +81,7 @@ pub enum MaintenanceState {
     /// underlying condition resolves or an admin
     /// `ExitMaintenance { force = true }` lands.
     DrainFailed {
-        /// Wall time the failure was recorded.
+        /// Monotonic timestamp when the failure was recorded.
         since: Instant,
         /// Operator-readable reason.
         reason: String,
@@ -89,7 +89,7 @@ pub enum MaintenanceState {
     /// Recovery ramp-up window. Node is rejoined but on the
     /// avoid list for new placements until the window elapses.
     Recovery {
-        /// Wall time the ramp-up started.
+        /// Monotonic timestamp when the ramp-up started.
         since: Instant,
     },
 }

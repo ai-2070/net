@@ -80,11 +80,11 @@ pub struct DaemonStatus {
     pub health: Option<DaemonHealth>,
     /// Latest self-reported saturation in `[0.0, 1.0]`.
     pub saturation: f32,
-    /// Wall time of the most recent `Started` signal.
+    /// Monotonic timestamp of the most recent `Started` signal.
     pub last_started: Option<Instant>,
-    /// Wall time of the most recent `ExitedCleanly` signal.
+    /// Monotonic timestamp of the most recent `ExitedCleanly` signal.
     pub last_exit: Option<Instant>,
-    /// Wall time of the most recent `Crashed` signal.
+    /// Monotonic timestamp of the most recent `Crashed` signal.
     pub last_crash: Option<Instant>,
     /// Lifecycle phase the supervisor believes the daemon is in.
     /// Default `Stopped`. Updated by the `apply_daemon` fold.

@@ -84,7 +84,7 @@ impl ChainTagSink for MeshNode {
 /// machine. Carries `origin_hash` so observers managing many
 /// coordinators (one per channel) can route the event.
 ///
-/// `at` is wall time at the transition. Plain data so observers
+/// `at` is the monotonic timestamp at the transition. Plain data so observers
 /// can buffer / async-forward without lifetime issues.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -94,7 +94,7 @@ pub enum ReplicaTransitionEvent {
     BecameHolder {
         /// Substrate-level chain identifier.
         origin_hash: u64,
-        /// Wall time of the transition.
+        /// Monotonic timestamp of the transition.
         at: Instant,
     },
     /// Coordinator entered `Idle` from any non-Idle state —
@@ -102,7 +102,7 @@ pub enum ReplicaTransitionEvent {
     Idled {
         /// Substrate-level chain identifier.
         origin_hash: u64,
-        /// Wall time of the transition.
+        /// Monotonic timestamp of the transition.
         at: Instant,
     },
     /// Leader changed for this channel — the coordinator

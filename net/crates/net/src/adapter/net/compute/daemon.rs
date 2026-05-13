@@ -269,7 +269,7 @@ pub enum DaemonLifecycleEvent {
         id: u64,
         /// `MeshDaemon::name`.
         name: String,
-        /// Wall time of the registration.
+        /// Monotonic timestamp of the registration.
         at: std::time::Instant,
     },
     /// Daemon unregistered (either via cleanup or migration
@@ -280,7 +280,7 @@ pub enum DaemonLifecycleEvent {
         /// Last known name (carried so observers don't need to
         /// look it up post-unregister).
         name: String,
-        /// Wall time of the unregistration.
+        /// Monotonic timestamp of the unregistration.
         at: std::time::Instant,
     },
     /// Daemon crashed during `process()`.
@@ -289,7 +289,7 @@ pub enum DaemonLifecycleEvent {
         id: u64,
         /// `MeshDaemon::name`.
         name: String,
-        /// Wall time of the crash.
+        /// Monotonic timestamp of the crash.
         at: std::time::Instant,
         /// Operator-readable reason from the daemon-side error.
         reason: String,
@@ -301,7 +301,7 @@ pub enum DaemonLifecycleEvent {
         id: u64,
         /// `MeshDaemon::name`.
         name: String,
-        /// Wall time of the observation.
+        /// Monotonic timestamp of the observation.
         at: std::time::Instant,
         /// New health value.
         health: DaemonHealth,
@@ -314,7 +314,7 @@ pub enum DaemonLifecycleEvent {
         id: u64,
         /// `MeshDaemon::name`.
         name: String,
-        /// Wall time of the observation.
+        /// Monotonic timestamp of the observation.
         at: std::time::Instant,
         /// New saturation value, `[0.0, 1.0]`.
         saturation: f32,
