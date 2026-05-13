@@ -1,0 +1,37 @@
+net/crates/net/bindings/python/Cargo.toml
+  s_3a0a24a47d1a36::t_b927cc8514cf17 83-87
+  s_3a0a24a47d1a36::t_700e0391a89a79 49
+net/crates/net/bindings/python/python/net/__init__.py
+  s_3a0a24a47d1a36::t_cf40a293786b0a 352-356,359,362,364,369,377,380,382,387
+net/crates/net/bindings/python/src/meshdb.rs
+  s_3a0a24a47d1a36::t_b153ac76284659 686-779
+  s_3a0a24a47d1a36::t_1df7e3fae0aafc 651-652,654-680
+  s_3a0a24a47d1a36::t_0642b2748f7342 52-55
+  s_3a0a24a47d1a36::t_3e59d96b50ede1 98-101,107-109,115-117,121
+  s_3a0a24a47d1a36::t_60d60322947b21 485-638
+  s_3a0a24a47d1a36::t_b67f8f44011693 191-194
+  s_3a0a24a47d1a36::t_7743d761fd2688 51
+  s_3a0a24a47d1a36::t_0241a924b75271 102-106,110-114,118-120,134-190,195-331
+  s_3a0a24a47d1a36::t_d3fed7a206383d 653
+net/crates/net/bindings/python/src/lib.rs
+  s_3a0a24a47d1a36::t_d9d4c7c85ee33f 2333-2336
+net/crates/net/bindings/python/tests/test_meshdb.py
+  s_3a0a24a47d1a36::t_d59f9ab0a7cdfc 13,16,18,23
+  s_3a0a24a47d1a36::t_c4e74ebfba7291 142-409
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "b343825148e465a50a966c7e0f8e69cd8d11ccc9",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

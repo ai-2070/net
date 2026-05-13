@@ -1,0 +1,27 @@
+net/crates/net/bindings/python/tests/test_meshdb.py
+  s_3a0a24a47d1a36::t_84ff3595235958 23
+  s_3a0a24a47d1a36::t_65035bca14f154 627-809
+net/crates/net/bindings/python/python/net/__init__.py
+  s_3a0a24a47d1a36::t_c3558e439275b5 370,390
+net/crates/net/bindings/python/src/meshdb.rs
+  s_3a0a24a47d1a36::t_cff910fa484e3f 664-674
+  s_3a0a24a47d1a36::t_b6041e1d397a71 990-1172
+net/crates/net/bindings/python/src/lib.rs
+  s_3a0a24a47d1a36::t_8922d0b3433c0c 2338
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "3acaa3d57fc02177e283b863ba2c8d1482354f87",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
