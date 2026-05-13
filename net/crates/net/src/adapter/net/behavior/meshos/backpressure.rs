@@ -80,11 +80,11 @@ pub struct BackpressureState {
     /// Current action-queue depth observed by the executor. The
     /// executor pushes this in before calling `admit()` (the
     /// executor knows the depth; the admit layer reads it).
-    pub queue_depth: usize,
+    pub(crate) queue_depth: usize,
     /// Whether the cluster-wide backpressure flag is currently
     /// asserted. Updated by `update_cluster_backpressure` per
     /// tick.
-    pub cluster_backpressure: bool,
+    pub(crate) cluster_backpressure: bool,
 }
 
 impl BackpressureState {

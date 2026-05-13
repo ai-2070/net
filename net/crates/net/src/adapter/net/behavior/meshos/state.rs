@@ -27,49 +27,49 @@ use super::supervision::BackoffTracker;
 #[derive(Clone, Debug, Default)]
 pub struct MeshOsState {
     /// Per-daemon observed status (Phase B fills the body).
-    pub daemons: HashMap<DaemonRef, DaemonStatus>,
+    pub(crate) daemons: HashMap<DaemonRef, DaemonStatus>,
     /// Replicas this node observes — keyed by chain id, valued
     /// by the set of holders the substrate knows about.
     /// `BTreeSet` keeps holder iteration deterministically
     /// sorted, which the Phase C lex-smallest victim selection
     /// reads as `.iter().next()`, and the per-chain holder set
     /// stays unique without explicit `contains` guards on add.
-    pub replicas: HashMap<ChainId, BTreeSet<NodeId>>,
+    pub(crate) replicas: HashMap<ChainId, BTreeSet<NodeId>>,
     /// Current leader for each chain (per
     /// `replication_election`). Reconcile reads this to decide
     /// whether `Request*` actions are admissible on this node.
-    pub replica_leader: HashMap<ChainId, NodeId>,
+    pub(crate) replica_leader: HashMap<ChainId, NodeId>,
     /// Per-peer RTT samples (latest only; Phase D adds the rolling window).
-    pub rtt: HashMap<NodeId, Duration>,
+    pub(crate) rtt: HashMap<NodeId, Duration>,
     /// Per-peer health (Phase D fills the body).
-    pub node_health: HashMap<NodeId, NodeHealth>,
+    pub(crate) node_health: HashMap<NodeId, NodeHealth>,
     /// Maintenance state for each peer (Phase E owns the
     /// transitions; here we only mirror what the admin chain
     /// committed).
-    pub maintenance: HashMap<NodeId, MaintenanceMirror>,
+    pub(crate) maintenance: HashMap<NodeId, MaintenanceMirror>,
     /// Phase E — this node's own maintenance state machine.
     /// Driven by admin events (operator commands) and observed
     /// transition confirmations from the chain. Reconcile reads
     /// it to decide whether to emit forward-transition actions.
-    pub local_maintenance: MaintenanceState,
+    pub(crate) local_maintenance: MaintenanceState,
     /// Blobs this node knows about, keyed by blob id.
-    pub blobs: HashMap<u64, BlobObservation>,
+    pub(crate) blobs: HashMap<u64, BlobObservation>,
     /// Peers currently on the local avoid list, with their TTL.
-    pub avoid_list: HashMap<NodeId, AvoidEntry>,
+    pub(crate) avoid_list: HashMap<NodeId, AvoidEntry>,
     /// Phase D-1 — last time the scheduler emitted a
     /// rebalance for this chain. Subsequent evaluations within
     /// `SchedulerConfig::cooldown` skip the chain to avoid
     /// flap.
-    pub last_rebalance: HashMap<ChainId, Instant>,
+    pub(crate) last_rebalance: HashMap<ChainId, Instant>,
     /// Phase B — the most recent `until` an `ApplyBackoff`
     /// action emitted for the daemon. The reconcile pass
     /// suppresses re-emission when the supervisor's
     /// `release_at()` hasn't moved past the value the loop
     /// last committed, so a daemon parked in `BackingOff`
     /// doesn't generate a fresh action every tick.
-    pub applied_backoffs: HashMap<DaemonRef, Instant>,
+    pub(crate) applied_backoffs: HashMap<DaemonRef, Instant>,
     /// Last `Tick` we processed — used by tests / diagnostics.
-    pub last_tick: Option<Instant>,
+    pub(crate) last_tick: Option<Instant>,
 }
 
 /// Per-daemon observed status. Phase B fleshes out the fields
@@ -378,16 +378,16 @@ pub struct DesiredState {
     /// Desired replica count per chain (cluster-wide). Reconcile
     /// reads this on the leader node to emit `RequestPlacement`
     /// (count short) / `RequestEviction` (count over) actions.
-    pub desired_replicas: HashMap<ChainId, u32>,
+    pub(crate) desired_replicas: HashMap<ChainId, u32>,
     /// Per-chain "should this node hold a replica?" intent.
     /// Source: the leader's `Request*` actions, projected via
     /// the Dataforts fold. Reconcile reads this to emit
     /// `PullReplica` / `DropReplica` actions.
-    pub desired_local_replicas: HashMap<ChainId, LocalReplicaIntent>,
+    pub(crate) desired_local_replicas: HashMap<ChainId, LocalReplicaIntent>,
     /// Per-daemon intent. Reconcile reads this against the
     /// actual `MeshOsState::daemons[*].lifecycle` to emit
     /// `StartDaemon` / `StopDaemon`.
-    pub desired_daemons: HashMap<DaemonRef, DaemonIntent>,
+    pub(crate) desired_daemons: HashMap<DaemonRef, DaemonIntent>,
 }
 
 impl DesiredState {
