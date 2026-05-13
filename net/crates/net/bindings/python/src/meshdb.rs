@@ -1,14 +1,21 @@
 //! Python bindings for MeshDB — federated query layer.
 //!
-//! # Slice 1 scope
+//! # Slice 1 + 2 scope
 //!
-//! The first Python SDK slice ships the absolute minimum to run an
-//! end-to-end MeshDB query from Python:
+//! Slice 1 shipped the minimum end-to-end (atomic factories,
+//! in-memory `ChainReader`, sync runner, Phase F cache options).
+//! Slice 2 expands the factory surface to cover composite
+//! operators + adds result-side decoders so callers can read
+//! the sentinel-row payloads emitted by aggregate / window /
+//! join operators.
 //!
-//! - [`PyMeshQuery`] — a 1:1-with-AST factory surface. Variants
-//!   construct via static methods (`MeshQuery.at(...)`,
-//!   `MeshQuery.between(...)`, `MeshQuery.latest(...)`). Other
-//!   variants land in slice 2.
+//! - [`PyMeshQuery`] — 1:1-with-AST factory surface.
+//!   - Slice 1: `at`, `between`, `latest`.
+//!   - Slice 2: `count`, `sum`, `avg`, `min`, `max`,
+//!     `distinct_count`, `percentile`, `window`, `join`.
+//!   - Deferred: `filter` (needs a Predicate Python surface),
+//!     `lineage_back` / `lineage_forward` (need a CapabilityIndex
+//!     plumbed through the runner).
 //! - [`PyInMemoryChainReader`] — Python-facing in-memory
 //!   `ChainReader` impl. Lets Python code `.append(origin, seq,
 //!   payload)` then run queries against the resulting fixture.
@@ -18,7 +25,12 @@
 //!   the row stream synchronously and returns a `list[ResultRow]`
 //!   (locked decision: Python is sync-first; async wrapper is a
 //!   follow-up).
-//! - [`PyResultRow`] — `(origin: int, seq: int, payload: bytes)`.
+//! - [`PyResultRow`] — `(origin: int, seq: int, payload: bytes)`
+//!   plus `.decode_aggregate()` / `.decode_joined()` /
+//!   `.decode_window()` helpers (slice 2) that postcard-decode
+//!   the sentinel-row payloads.
+//! - [`PyAggregateResult`] / [`PyGroupKey`] / [`PyJoinedRow`] /
+//!   [`PyWindowBoundary`] — slice 2 decoder pyclasses.
 //! - [`PyExecuteOptions`] + [`PyCachePolicy`] — Phase F cache
 //!   surface. Default is `TimeBound(5s)`; callers can pass
 //!   `CachePolicy.permanent()` or `bypass_cache=True`.
@@ -29,13 +41,14 @@
 //! # Builder
 //!
 //! The fluent builder API (`MeshQuery.query().between(...).filter(...)`)
-//! is slice 2. Slice 1 stays factory-only so the surface lands tight.
+//! is slice 4 per the locked roadmap; slices 1 + 2 stay
+//! factory-only so the surface lands tight.
 //!
 //! # Async
 //!
-//! Slice 1 is sync only — `runner.execute(...)` drains into a list.
-//! Locked decision: Python sync-first; pyo3-asyncio support is a
-//! later slice when a consumer needs it.
+//! Sync only — `runner.execute(...)` drains into a list. Locked
+//! decision: Python sync-first; pyo3-asyncio support is a later
+//! slice when a consumer needs it.
 
 use std::sync::{Arc, Mutex};
 
