@@ -57,6 +57,13 @@ pub struct MeshOsState {
     /// `SchedulerConfig::cooldown` skip the chain to avoid
     /// flap.
     pub last_rebalance: HashMap<ChainId, Instant>,
+    /// Phase B — the most recent `until` an `ApplyBackoff`
+    /// action emitted for the daemon. The reconcile pass
+    /// suppresses re-emission when the supervisor's
+    /// `release_at()` hasn't moved past the value the loop
+    /// last committed, so a daemon parked in `BackingOff`
+    /// doesn't generate a fresh action every tick.
+    pub applied_backoffs: HashMap<DaemonRef, Instant>,
     /// Last `Tick` we processed — used by tests / diagnostics.
     pub last_tick: Option<Instant>,
 }

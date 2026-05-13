@@ -371,11 +371,22 @@ impl MeshOsLoop {
             scorer.as_deref(),
         );
         // Record cooldowns for any RequestEviction we emit so
-        // the same chain doesn't flap on the next tick.
+        // the same chain doesn't flap on the next tick; track
+        // `ApplyBackoff` emissions so reconcile suppresses
+        // re-emit while the daemon stays in the same backoff
+        // window.
         let now = std::time::Instant::now();
         for action in &actions {
-            if let super::action::MeshOsAction::RequestEviction { chain, .. } = action {
-                self.actual.last_rebalance.insert(*chain, now);
+            match action {
+                super::action::MeshOsAction::RequestEviction { chain, .. } => {
+                    self.actual.last_rebalance.insert(*chain, now);
+                }
+                super::action::MeshOsAction::ApplyBackoff { daemon, until } => {
+                    self.actual
+                        .applied_backoffs
+                        .insert(daemon.clone(), *until);
+                }
+                _ => {}
             }
         }
         self.reconcile_count += 1;

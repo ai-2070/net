@@ -92,7 +92,12 @@ fn diff_daemons(
                             daemon: daemon.clone(),
                         });
                     } else if let Some(s) = status {
-                        emit_backoff_record_if_needed(daemon, s, out);
+                        emit_backoff_record_if_needed(
+                            daemon,
+                            s,
+                            actual.applied_backoffs.get(daemon).copied(),
+                            out,
+                        );
                     }
                 }
             },
@@ -405,13 +410,20 @@ fn all_daemons_healthy(actual: &MeshOsState) -> bool {
 fn emit_backoff_record_if_needed(
     daemon: &super::event::DaemonRef,
     status: &DaemonStatus,
+    last_applied: Option<Instant>,
     out: &mut Vec<MeshOsAction>,
 ) {
     // Only record `ApplyBackoff` on the snapshot when the gate
     // is actually open in the future — `is_admissible == false`
     // is the prerequisite. The action carries the same `until`
-    // the supervisor will honor.
+    // the supervisor will honor. Suppress re-emission when the
+    // loop has already committed the same `until`: a daemon
+    // parked in `BackingOff` would otherwise generate a fresh
+    // action every tick.
     if let Some(until) = status.backoff.state().release_at() {
+        if last_applied == Some(until) {
+            return;
+        }
         out.push(MeshOsAction::ApplyBackoff {
             daemon: daemon.clone(),
             until,
@@ -734,6 +746,63 @@ mod tests {
             [MeshOsAction::ApplyBackoff { daemon: d2, .. }] => assert_eq!(d2, &d),
             other => panic!("expected ApplyBackoff under crash-loop gate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_backoff_is_not_re_emitted_after_the_loop_records_it() {
+        // Regression for I1: a daemon parked in `CrashLooping`
+        // used to generate an `ApplyBackoff` action every tick.
+        // The loop now writes `applied_backoffs[daemon] = until`
+        // after consuming the action; reconcile suppresses the
+        // re-emit while `until` hasn't moved.
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(at(base, 1));
+        let d = daemon("telemetry", 1);
+        let mut status = DaemonStatus::default();
+        for i in 0..5 {
+            status.backoff.observe_crash(at(base, i));
+        }
+        let until = status
+            .backoff
+            .state()
+            .release_at()
+            .expect("crash-looping state carries a release_at");
+        actual.daemons.insert(d.clone(), status);
+        let mut desired = DesiredState::default();
+        desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
+
+        // First reconcile pass: emits ApplyBackoff.
+        let first = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert_eq!(first.len(), 1, "first pass should emit ApplyBackoff");
+
+        // Simulate the loop's writeback after consuming the
+        // emitted action.
+        actual.applied_backoffs.insert(d.clone(), until);
+
+        // Second reconcile pass with the same `until` — no
+        // re-emit.
+        let second = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert!(
+            second.is_empty(),
+            "second pass within the same backoff window must not re-emit ApplyBackoff",
+        );
     }
 
     #[test]
