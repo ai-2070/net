@@ -892,6 +892,7 @@ gcc -o app app.c -L target/release -lnet_meshdb -lpthread -ldl -lm
 
 ```c
 #include "net_meshdb.h"
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -909,9 +910,8 @@ int main(void) {
     size_t payload_len = 0;
     while (net_meshdb_iter_next(it, &origin, &seq, &payload, &payload_len)
            == NET_MESHDB_OK) {
-        printf("origin=0x%llx seq=%llu payload=%.*s\n",
-               (unsigned long long)origin, (unsigned long long)seq,
-               (int)payload_len, (const char*)payload);
+        printf("origin=0x%" PRIx64 " seq=%" PRIu64 " payload=%.*s\n",
+               origin, seq, (int)payload_len, (const char*)payload);
         net_meshdb_payload_free(payload, payload_len);
     }
 
@@ -936,6 +936,7 @@ Full runnable example: [`examples/meshdb.c`](../examples/meshdb.c).
 | Runner | `net_meshdb_runner_new`, `net_meshdb_runner_new_cached`, `net_meshdb_runner_free`, `net_meshdb_runner_execute`, `net_meshdb_runner_execute_with` |
 | Iterator | `net_meshdb_iter_next`, `net_meshdb_payload_free`, `net_meshdb_iter_free` |
 | Sentinel decoder | `net_meshdb_decode_payload_json`, `net_meshdb_free_string` |
+| Last error | `net_meshdb_last_error_message`, `net_meshdb_last_error_kind`, `net_meshdb_clear_last_error` |
 
 ### Error codes
 
@@ -946,9 +947,23 @@ Full runnable example: [`examples/meshdb.c`](../examples/meshdb.c).
 |  `2` | `NET_MESHDB_INVALID_ARG`       | NULL handle or out-of-range input.                   |
 |  `3` | `NET_MESHDB_RUNTIME_ERR`       | Planner / executor failure.                          |
 
-Factory functions return NULL on failure (no detail channel — use
-the Python / Node / Go SDKs which wrap this layer when structured
-errors matter).
+Structured detail for the most recent failure is available on a
+per-thread basis via `net_meshdb_last_error_message()` (a
+human-readable detail string) and `net_meshdb_last_error_kind()`
+(one of the `MeshError` variant tags such as `"planner_error"`,
+`"executor_error"`, `"query_cancelled"`,
+`"historical_range_unavailable"`, `"join_memory_exceeded"`,
+`"runtime_panic"`, `"invalid_arg"`, …). Both return NULL when no
+error has been recorded on the calling thread. Returned pointers
+are valid until the next FFI call on the same thread touches the
+thread-local; callers must NOT free them. Use
+`net_meshdb_clear_last_error()` to reset state explicitly.
+
+Panics from user-controlled operators (aggregate division by
+zero, OOM inside a hash-join, etc.) are trapped via
+`catch_unwind` on every entry point; instead of unwinding across
+the C ABI (UB), the function returns its declared failure value
+and the last-error pair is populated with kind `"runtime_panic"`.
 
 ### Cache options
 
