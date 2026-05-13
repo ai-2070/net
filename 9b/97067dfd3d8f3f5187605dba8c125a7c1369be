@@ -1,0 +1,55 @@
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_3bbc444b3ef3e5::t_210719399c74a8 276-282,313
+  s_3bbc444b3ef3e5::t_f841365a4ef18c 102-105
+  s_3bbc444b3ef3e5::t_5a0b396e86e8c5 225
+  s_3bbc444b3ef3e5::t_562531f2b0f9ea 1-38,42-101,106-124,126-212,214-221,223-224,226-275,283-312,314-376
+  s_3bbc444b3ef3e5::t_cc5de019737df0 125
+  s_3bbc444b3ef3e5::t_2db59daffda5ea 222
+  s_3bbc444b3ef3e5::t_0b8d69f7a66207 213
+  s_3bbc444b3ef3e5::t_14cf20b72b8fc0 39-41
+net/crates/net/Cargo.toml
+  s_3bbc444b3ef3e5::t_06f2f3c3306bd9 68-78
+net/crates/net/src/adapter/net/behavior/meshos/config.rs
+  s_3bbc444b3ef3e5::t_53819ccbd5fcb6 1-87
+net/crates/net/src/adapter/net/behavior/meshos/mod.rs
+  s_3bbc444b3ef3e5::t_3873bcaa2a76ce 1-62,64-67
+  s_3bbc444b3ef3e5::t_1ba17cd2829411 63
+net/crates/net/src/adapter/net/behavior/meshos/event.rs
+  s_3bbc444b3ef3e5::t_82460df45251e2 94,96,107-137,145,147-152,160,162,164,174-202
+  s_3bbc444b3ef3e5::t_8d785b5a7e6072 49,51,56-61,65-70
+  s_3bbc444b3ef3e5::t_892ce10d55e1db 215,217-222,225,227,230-231,233,235,238-239,241,244,246,249,251,254,256,259,261,263,266,268,277,279,281,283,292,294
+  s_3bbc444b3ef3e5::t_d415bf99a0b6a7 1-18,26-48,50,52-55,62-64,71-93,95,97-106,138-144,146,153-159,161,163,165-173,203-214,216,223-224,226,228-229,232,234,236-237,240,242-243,245,247-248,250,252-253,255,257-258,260,262,264-265,267,269-276,278,280,282,284-291,293,295-296
+  s_3bbc444b3ef3e5::t_794c787d2ed50b 19-25
+net/crates/net/src/adapter/net/behavior/meshos/action.rs
+  s_3bbc444b3ef3e5::t_5f0beb96ee61b6 27-31,40-42,49
+  s_3bbc444b3ef3e5::t_de6dc6d35eb420 20
+  s_3bbc444b3ef3e5::t_1be7e6c106c320 1-19,21-26,32-39,43-48,50-67,72-76,78,80,84-88,95-96,101-105,107,110-114,121-124,126,128,130-134,141-144,146,148,150-156,158,160-167,169,171-180,183,186,189,192,195,198-204,207,209,212-230
+  s_3bbc444b3ef3e5::t_9f9acb9113c0da 68-71,77,79,81-83,89-94,97-100,106,108-109,115-120,125,127,129,135-140,145,147,149,157,159,168,170,181-182,184-185,187-188,190-191,193-194,196-197,205-206,208,210-211
+net/crates/net/src/adapter/net/behavior/meshos/reconcile.rs
+  s_3bbc444b3ef3e5::t_1812a9471aac61 1-98
+net/crates/net/src/adapter/net/behavior/meshos/state.rs
+  s_3bbc444b3ef3e5::t_4d347f0ae09b14 52,54,56,58,60
+  s_3bbc444b3ef3e5::t_81d091644dbe5b 18
+  s_3bbc444b3ef3e5::t_018dfa207113d3 1-17,19-51,53,55,57,59,61-69,71,73,75,77,79,81-87,89,91-97,99,101-205,209-221
+  s_3bbc444b3ef3e5::t_24d9f6b13495e6 222-315
+  s_3bbc444b3ef3e5::t_4919d02d67604e 70,72,74,76,78,80,88,90,98,100
+  s_3bbc444b3ef3e5::t_660ad4d2fa6c9f 206-208
+net/crates/net/src/adapter/net/behavior/mod.rs
+  s_3bbc444b3ef3e5::t_793699a5758f88 24-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "9b97067dfd3d8f3f5187605dba8c125a7c1369be",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
