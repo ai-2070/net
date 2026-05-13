@@ -1,6 +1,6 @@
 [package]
 name = "net-node"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Node.js bindings for Net event bus"
@@ -85,8 +85,8 @@ test-helpers = ["groups"]
 meshdb = ["net/meshdb", "dep:postcard"]
 
 [dependencies]
-net = { package = "ai2070-net", version = "0.16.0", path = "../..", default-features = false }
-net-sdk = { package = "ai2070-net-sdk", version = "0.16.0", path = "../../sdk", default-features = false, optional = true }
+net = { package = "ai2070-net", version = "0.17.0", path = "../..", default-features = false }
+net-sdk = { package = "ai2070-net-sdk", version = "0.17.0", path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
 napi = { version = "3.7.0", default-features = false, features = ["napi4", "napi6", "async", "tokio_rt"] }
 napi-derive = "3.4.0"
