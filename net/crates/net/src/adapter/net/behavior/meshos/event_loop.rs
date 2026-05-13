@@ -68,11 +68,14 @@ pub struct MeshOsLoop {
     /// clone — no lock contention with reconcile.
     snapshot: Arc<ArcSwap<MeshOsSnapshot>>,
 
-    /// Pending-action ring buffer the snapshot folds into its
-    /// `pending` field. Bounded by the action-queue capacity;
-    /// each emission appends, each Tick rebuilds the snapshot
-    /// from it before clearing.
-    pending_snapshot_actions: Vec<PendingAction>,
+    /// Ring of the most-recently-emitted actions. The snapshot's
+    /// `pending` field renders this as "what reconcile recently
+    /// produced." Bounded by `action_queue_capacity`; older
+    /// entries drop FIFO when the cap is exceeded. The executor
+    /// does NOT signal completion back, so this is *not* a true
+    /// in-flight list — drained / completed actions stay in the
+    /// ring until they age out.
+    recent_emissions: Vec<PendingAction>,
 
     /// Pull-via-tick probes the loop polls on each Tick. Shared
     /// with the [`ProbeRegistry`] so consumers can install
@@ -297,7 +300,7 @@ impl MeshOsLoop {
             actual: MeshOsState::default(),
             desired: DesiredState::default(),
             snapshot,
-            pending_snapshot_actions: Vec::new(),
+            recent_emissions: Vec::new(),
             probes: ProbeRegistryInner::default(),
             scheduler: SchedulerRegistry::new(),
             reconcile_count: 0,
@@ -528,7 +531,7 @@ impl MeshOsLoop {
             // staying responsive is the higher-order property.
             // Count + log drops so the silent-loss path is
             // observable.
-            self.pending_snapshot_actions.push(pending.clone());
+            self.recent_emissions.push(pending.clone());
             if let Err(mpsc::error::TrySendError::Full(rejected)) =
                 self.actions_tx.try_send(pending)
             {
@@ -553,15 +556,15 @@ impl MeshOsLoop {
         // Bound the in-loop pending mirror so a backed-up
         // executor doesn't let snapshot pending grow unbounded.
         // Action queue capacity is the natural bound.
-        if self.pending_snapshot_actions.len() > self.config.action_queue_capacity {
-            let overflow = self.pending_snapshot_actions.len() - self.config.action_queue_capacity;
-            self.pending_snapshot_actions.drain(..overflow);
+        if self.recent_emissions.len() > self.config.action_queue_capacity {
+            let overflow = self.recent_emissions.len() - self.config.action_queue_capacity;
+            self.recent_emissions.drain(..overflow);
         }
     }
 
     fn publish_snapshot(&self) {
         let snap =
-            MeshOsSnapshot::from_state(&self.actual, &self.desired, &self.pending_snapshot_actions);
+            MeshOsSnapshot::from_state(&self.actual, &self.desired, &self.recent_emissions);
         self.snapshot.store(Arc::new(snap));
     }
 }
