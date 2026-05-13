@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/meshdb/planner.rs
+  s_3bbc444b3ef3e5::t_d30cfa5c785d08 2600-2601,2605-2606,2614-2674
+  s_3bbc444b3ef3e5::t_3a1413895ceb15 2602-2604,2607-2613
+net/crates/net/src/adapter/net/behavior/meshdb/executor.rs
+  s_3bbc444b3ef3e5::t_de330e493427e7 2920-3122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "12d869c8c383aee1e6a26de7da4e240476ae738c",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
