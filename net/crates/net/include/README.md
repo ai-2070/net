@@ -11,8 +11,9 @@ Latest release: [v0.10 — "Killing Moon" Phase III](../docs/RELEASE_v0.10_KILLI
 - `net.h` — narrow event-bus surface (init / ingest / poll / stats / shutdown). Uses the `NET_SDK_H` include guard.
 - `net.go.h` — broader mesh + compute surface (sessions, channels, capabilities, NAT, daemon dispatch, custom placement filters, daemon caps, predicate helpers, capability validation, predicate debug session). In-crate mirror of [`go/net.h`](../../../../go/net.h) at the repo root. Also uses `NET_SDK_H` and overlaps with the event-bus surface from `net.h`, but it is **not** a strict superset (`net_ingest_raw_ex`, `net_poll_ex`, and `net_stats_ex` are still `net.h`-only). Pick **one** of `net.h` or `net.go.h` per translation unit based on the symbols you need; if you need both surfaces in the same program, split across translation units.
 - `net_rpc.h` — nRPC C SDK (request/response surface for the separate `libnet_rpc` cdylib). Independent header guard (`NET_RPC_H`); composes cleanly alongside whichever of `net.h` / `net.go.h` you chose.
-- Libraries: `libnet.{so,dylib,dll}` (main) + `libnet_compute.{so,dylib,dll}` (compute) + `libnet_rpc.{so,dylib,dll}` (nRPC). Build with `cargo build --release --features ffi,net` for `libnet`; `-p net-compute-ffi` and `-p net-rpc-ffi` for the others.
-- Examples: `examples/basic.c` (event-bus quickstart) + `examples/capability.c` (stateless capability / predicate / where-header helpers).
+- `net_meshdb.h` — MeshDB C SDK (federated query layer over the capability-query primitives + CortEX folds; lives in the separate `libnet_meshdb` cdylib). Independent header guard (`NET_MESHDB_H`); composes cleanly alongside the other headers.
+- Libraries: `libnet.{so,dylib,dll}` (main) + `libnet_compute.{so,dylib,dll}` (compute) + `libnet_rpc.{so,dylib,dll}` (nRPC) + `libnet_meshdb.{so,dylib,dll}` (MeshDB). Build with `cargo build --release --features ffi,net` for `libnet`; `-p net-compute-ffi`, `-p net-rpc-ffi`, `-p net-meshdb-ffi` for the others.
+- Examples: `examples/basic.c` (event-bus quickstart) + `examples/capability.c` (stateless capability / predicate / where-header helpers) + `examples/meshdb.c` (MeshDB factory AST + runner + iterator + sentinel-envelope decoder).
 
 ## Build
 
@@ -859,6 +860,135 @@ runtime errors.
 For the canonical cross-binding contract spec — including the
 `cross_lang_echo_sum` service used by every binding's wire-format
 compat test — see [`net/README.md#nrpc`](../README.md#nrpc).
+
+## MeshDB (federated query layer)
+
+MeshDB is the query layer above the capability-query primitives +
+CortEX folds. The Python / Node / Go SDKs wrap this same FFI;
+non-Go C consumers get an in-tree header at
+[`net_meshdb.h`](./net_meshdb.h), backed by the separate
+`libnet_meshdb.{so,dylib,dll}` cdylib built from
+[`bindings/go/meshdb-ffi`](../bindings/go/meshdb-ffi).
+
+**Library:** `libnet_meshdb`. Build:
+
+```bash
+cargo build --release -p net-meshdb-ffi
+```
+
+**Header:** [`net_meshdb.h`](./net_meshdb.h) — independent header
+guard (`NET_MESHDB_H`); composes cleanly alongside the mesh /
+event-bus / nRPC headers in the same translation unit. The Go
+binding's `bindings/go/net/meshdb.go` cgo include block has been
+the de-facto contract for non-Go consumers since the MeshDB SDK
+landed; this header is the canonical drop-in.
+
+```c
+#include "net_meshdb.h"
+gcc -o app app.c -L target/release -lnet_meshdb -lpthread -ldl -lm
+```
+
+### Quick start
+
+```c
+#include "net_meshdb.h"
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    MeshDbReader* reader = net_meshdb_reader_new();
+    net_meshdb_reader_append(reader, 0xAB, 1, (uint8_t*)"hello", 5);
+    net_meshdb_reader_append(reader, 0xAB, 2, (uint8_t*)"world", 5);
+
+    MeshDbRunner* runner = net_meshdb_runner_new(reader);
+    MeshDbQuery* q = net_meshdb_query_latest(0xAB);
+    MeshDbIter* it = net_meshdb_runner_execute(runner, q);
+
+    uint64_t origin = 0, seq = 0;
+    uint8_t* payload = NULL;
+    size_t payload_len = 0;
+    while (net_meshdb_iter_next(it, &origin, &seq, &payload, &payload_len)
+           == NET_MESHDB_OK) {
+        printf("origin=0x%llx seq=%llu payload=%.*s\n",
+               (unsigned long long)origin, (unsigned long long)seq,
+               (int)payload_len, (const char*)payload);
+        net_meshdb_payload_free(payload, payload_len);
+    }
+
+    net_meshdb_iter_free(it);
+    net_meshdb_query_free(q);
+    net_meshdb_runner_free(runner);
+    net_meshdb_reader_free(reader);
+    return 0;
+}
+```
+
+Full runnable example: [`examples/meshdb.c`](../examples/meshdb.c).
+
+### Operator families
+
+| Family | Functions |
+|---|---|
+| Reader | `net_meshdb_reader_new`, `net_meshdb_reader_free`, `net_meshdb_reader_append` |
+| Atomic queries | `net_meshdb_query_at`, `net_meshdb_query_between`, `net_meshdb_query_latest`, `net_meshdb_query_lineage_emit` |
+| Composite queries | `net_meshdb_query_window`, `net_meshdb_query_count`, `net_meshdb_query_numeric_agg`, `net_meshdb_query_percentile`, `net_meshdb_query_join`, `net_meshdb_query_filter_json` |
+| Query lifecycle | `net_meshdb_query_free` |
+| Runner | `net_meshdb_runner_new`, `net_meshdb_runner_new_cached`, `net_meshdb_runner_free`, `net_meshdb_runner_execute`, `net_meshdb_runner_execute_with` |
+| Iterator | `net_meshdb_iter_next`, `net_meshdb_payload_free`, `net_meshdb_iter_free` |
+| Sentinel decoder | `net_meshdb_decode_payload_json`, `net_meshdb_free_string` |
+
+### Error codes
+
+| Code | Constant                       | Meaning                                              |
+| ---- | ------------------------------ | ---------------------------------------------------- |
+|  `0` | `NET_MESHDB_OK`                | Success.                                             |
+|  `1` | `NET_MESHDB_END`               | Iterator drained; no more rows.                      |
+|  `2` | `NET_MESHDB_INVALID_ARG`       | NULL handle or out-of-range input.                   |
+|  `3` | `NET_MESHDB_RUNTIME_ERR`       | Planner / executor failure.                          |
+
+Factory functions return NULL on failure (no detail channel — use
+the Python / Node / Go SDKs which wrap this layer when structured
+errors matter).
+
+### Cache options
+
+`net_meshdb_runner_execute_with` accepts the Phase F cache
+discriminator:
+
+| Constant                       | Meaning                                              |
+| ------------------------------ | ---------------------------------------------------- |
+| `NET_MESHDB_CACHE_PERMANENT`   | Cache until LRU eviction (immutable results only).   |
+| `NET_MESHDB_CACHE_TIME_BOUND`  | TTL expiry; `cache_ttl_secs` consulted (default 5.0). |
+
+### Sentinel-envelope decoder
+
+Atomic-operator rows (At / Between / Latest / LineageEmit) carry
+raw event bytes. Composite-operator rows (Count / Sum / Avg / Min
+/ Max / DistinctCount / Percentile / Join / Window) carry a
+postcard-encoded sentinel envelope; pass the payload through
+`net_meshdb_decode_payload_json` to get a tagged JSON string —
+NULL means "not a sentinel" (i.e. it's a plain row body). Wire
+JSON shapes:
+
+```json
+{"kind":"aggregate","group":{...|null},
+ "value":{"kind":"count","value":N,"count":N}}
+
+{"kind":"joined","left":{...|null},"right":{...|null}}
+
+{"kind":"window","start":N,"end":N,"rows":[{...},...]}
+```
+
+Each nested row is `{"origin":N,"seq":N,"payload":[<byte>,...]}`
+— JSON array of byte integers, no base64.
+
+### Federated executor
+
+Out of scope for the current C SDK surface — the FFI ships a
+local in-memory executor only. The Phase B federated-executor
+path will surface when the wire-subprotocol dispatch lands; until
+then, cross-node fan-out is reachable only through the Python /
+Node / Go SDK layers.
 
 ## Behavior changes in v0.10 (FFI)
 
