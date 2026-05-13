@@ -50,6 +50,7 @@
 //!   body. `MeshOsHandle::publish` is the source-side fan-in API.
 
 pub mod action;
+pub mod backpressure;
 pub mod config;
 pub mod control;
 pub mod event;
@@ -61,6 +62,9 @@ pub mod state;
 pub mod supervision;
 
 pub use action::{ActionId, AllocateActionId, MaintenanceTransition, MeshOsAction, PendingAction};
+pub use backpressure::{
+    admit, AdmissionResult, BackpressureState, ClusterBackpressureChange,
+};
 pub use config::{BackpressureConfig, LocalityConfig, MaintenanceConfig, MeshOsConfig};
 pub use maintenance::MaintenanceState;
 pub use snapshot::{
