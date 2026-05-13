@@ -195,12 +195,16 @@ fn diff_replicas(
         if actual_count < desired_count {
             out.push(MeshOsAction::RequestPlacement {
                 chain,
-                exclude: holders.cloned().unwrap_or_default(),
+                exclude: holders
+                    .map(|hs| hs.iter().copied().collect())
+                    .unwrap_or_default(),
             });
         } else if actual_count > desired_count {
             // Pick the lex-smallest holder as the victim;
-            // Phase D-1 swaps in a placement-score-based pick.
-            if let Some(victim) = holders.and_then(|hs| hs.iter().min()).copied() {
+            // BTreeSet's iter is sorted ascending, so `.next()`
+            // is the min. Phase D-1 swaps in a placement-score-
+            // based pick.
+            if let Some(victim) = holders.and_then(|hs| hs.iter().next()).copied() {
                 out.push(MeshOsAction::RequestEviction { chain, victim });
                 evicted.insert(chain);
             }
@@ -371,8 +375,8 @@ fn diff_scheduler(
                 continue;
             }
         }
-        let holders = match actual.replicas.get(&chain) {
-            Some(h) if !h.is_empty() => h.clone(),
+        let holders: Vec<NodeId> = match actual.replicas.get(&chain) {
+            Some(h) if !h.is_empty() => h.iter().copied().collect(),
             _ => continue,
         };
         // Pick the lowest-scoring holder. Use total_cmp on f32
@@ -533,7 +537,7 @@ mod tests {
         // park until their respective phases.
         let mut actual = MeshOsState::default();
         actual.daemons.insert(daemon("telemetry", 1), DaemonStatus::default());
-        actual.replicas.insert(0xCAFE_BABE as ChainId, vec![1, 2, 3]);
+        actual.replicas.insert(0xCAFE_BABE as ChainId, ::std::collections::BTreeSet::from([1, 2, 3]));
         actual.blobs.insert(
             42,
             BlobObservation {
@@ -875,7 +879,7 @@ mod tests {
     fn local_intent_hold_when_not_a_holder_emits_pull_replica() {
         let mut actual = MeshOsState::default();
         // Other peers hold the chain; this node doesn't.
-        actual.replicas.insert(CHAIN_A, vec![1, 2, 3]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([1, 2, 3]));
         let mut desired = DesiredState::default();
         desired
             .desired_local_replicas
@@ -901,7 +905,7 @@ mod tests {
     #[test]
     fn local_intent_hold_when_already_a_holder_emits_nothing() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![1, 2, THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([1, 2, THIS_NODE]));
         let mut desired = DesiredState::default();
         desired
             .desired_local_replicas
@@ -920,7 +924,7 @@ mod tests {
     #[test]
     fn local_intent_drop_when_actually_holding_emits_drop_replica() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![1, THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([1, THIS_NODE]));
         let mut desired = DesiredState::default();
         desired
             .desired_local_replicas
@@ -940,7 +944,7 @@ mod tests {
     #[test]
     fn local_intent_drop_when_not_holding_emits_nothing() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![1, 2]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([1, 2]));
         let mut desired = DesiredState::default();
         desired
             .desired_local_replicas
@@ -981,7 +985,7 @@ mod tests {
     #[test]
     fn leader_with_undercount_emits_request_placement() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![1, 2]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([1, 2]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 4);
@@ -1006,7 +1010,7 @@ mod tests {
     #[test]
     fn leader_with_overcount_emits_request_eviction_lex_smallest_victim() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![5, 2, 9]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([5, 2, 9]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 2);
@@ -1032,7 +1036,7 @@ mod tests {
     #[test]
     fn non_leader_does_not_emit_request_placement_even_under_undercount() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![1, 2]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([1, 2]));
         actual.replica_leader.insert(CHAIN_A, 999); // someone else is leader
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 4);
@@ -1053,7 +1057,7 @@ mod tests {
         // `Request*` is admissible from any node. We wait for
         // election to fire `ReplicaLeaderUpdate`.
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![1]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([1]));
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 3);
         assert!(reconcile(
@@ -1070,7 +1074,7 @@ mod tests {
     #[test]
     fn leader_at_exact_count_emits_nothing() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![1, 2, 3]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([1, 2, 3]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 3);
@@ -1189,8 +1193,8 @@ mod tests {
         // emit DropReplica for each chain THIS_NODE currently
         // holds.
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE, 1]);
-        actual.replicas.insert(CHAIN_B, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE, 1]));
+        actual.replicas.insert(CHAIN_B, ::std::collections::BTreeSet::from([THIS_NODE]));
 
         let mut desired = DesiredState::default();
         desired.apply_admin(
@@ -1223,7 +1227,7 @@ mod tests {
     #[test]
     fn drop_replicas_admin_event_targeted_at_other_node_is_a_noop_locally() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE, 1]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE, 1]));
         let mut desired = DesiredState::default();
         desired.apply_admin(
             &super::super::event::AdminEvent::DropReplicas {
@@ -1328,7 +1332,7 @@ mod tests {
             deadline: None,
         };
         // This node still holds a replica — block the transition.
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         let desired = DesiredState::default();
         let actions = reconcile(
             &actual,
@@ -1378,7 +1382,7 @@ mod tests {
             deadline: Some(deadline),
         };
         // Still holding a replica → drain unmet.
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         let desired = DesiredState::default();
         let actions = reconcile(
             &actual,
@@ -1591,7 +1595,7 @@ mod tests {
     #[test]
     fn no_scorer_yields_no_scheduler_actions() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let actions = scheduler_call(&actual, None);
         assert!(actions.is_empty());
@@ -1600,7 +1604,7 @@ mod tests {
     #[test]
     fn high_score_holder_is_not_rebalanced() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let scorer = FixedScorer {
             scores: [((CHAIN_A, THIS_NODE), 0.9)].into_iter().collect(),
@@ -1613,7 +1617,7 @@ mod tests {
     #[test]
     fn under_scoring_holder_emits_request_eviction_when_alternative_exceeds_hysteresis() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let scorer = FixedScorer {
             scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
@@ -1632,7 +1636,7 @@ mod tests {
     #[test]
     fn under_scoring_holder_with_no_alternative_does_not_emit() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let scorer = FixedScorer {
             scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
@@ -1646,7 +1650,7 @@ mod tests {
         // Score = 0.3; alternative = 0.4; gap = 0.1. Default
         // hysteresis_gap = 0.2 — should not emit.
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let scorer = FixedScorer {
             scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
@@ -1658,7 +1662,7 @@ mod tests {
     #[test]
     fn non_leader_does_not_emit_eviction_even_for_under_scoring_chain() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         actual.replica_leader.insert(CHAIN_A, 999); // someone else leads
         let scorer = FixedScorer {
             scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
@@ -1672,7 +1676,7 @@ mod tests {
         let base = anchor();
         let mut actual = MeshOsState::default();
         actual.last_tick = Some(base + Duration::from_secs(60)); // 1 min after rebalance
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         actual.last_rebalance.insert(CHAIN_A, base);
         let scorer = FixedScorer {
@@ -1688,7 +1692,7 @@ mod tests {
         let base = anchor();
         let mut actual = MeshOsState::default();
         actual.last_tick = Some(base + Duration::from_secs(6 * 60)); // 6 min in
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         actual.last_rebalance.insert(CHAIN_A, base);
         let scorer = FixedScorer {
@@ -1715,7 +1719,7 @@ mod tests {
         // Two holders for CHAIN_A; this_node is leader; desired
         // count is 1 — Phase C will emit eviction of lex-
         // smallest holder.
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE, 99]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE, 99]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 1);
@@ -1760,7 +1764,7 @@ mod tests {
         let base = anchor();
         let mut actual = MeshOsState::default();
         actual.last_tick = Some(base);
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let scorer = FixedScorer {
             scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
@@ -1787,7 +1791,7 @@ mod tests {
     #[test]
     fn worst_holder_is_picked_as_victim() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE, 11, 12]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE, 11, 12]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let scorer = FixedScorer {
             scores: [
@@ -1811,8 +1815,8 @@ mod tests {
     #[test]
     fn scheduler_emits_actions_in_chain_id_sorted_order() {
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_B, vec![THIS_NODE]);
-        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_B, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         actual.replica_leader.insert(CHAIN_B, THIS_NODE);
         let scorer = FixedScorer {
@@ -1840,8 +1844,8 @@ mod tests {
         // in chain-id ascending order regardless of HashMap
         // iteration. Pins the determinism contract.
         let mut actual = MeshOsState::default();
-        actual.replicas.insert(CHAIN_A, vec![1]);
-        actual.replicas.insert(CHAIN_B, vec![1]);
+        actual.replicas.insert(CHAIN_A, ::std::collections::BTreeSet::from([1]));
+        actual.replicas.insert(CHAIN_B, ::std::collections::BTreeSet::from([1]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         actual.replica_leader.insert(CHAIN_B, THIS_NODE);
         let mut desired = DesiredState::default();

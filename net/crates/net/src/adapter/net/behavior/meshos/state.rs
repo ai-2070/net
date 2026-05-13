@@ -10,7 +10,7 @@
 //! data (per-daemon backoff trackers, replica sets, avoid lists,
 //! maintenance state, etc.).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use super::event::{
@@ -30,7 +30,11 @@ pub struct MeshOsState {
     pub daemons: HashMap<DaemonRef, DaemonStatus>,
     /// Replicas this node observes — keyed by chain id, valued
     /// by the set of holders the substrate knows about.
-    pub replicas: HashMap<ChainId, Vec<NodeId>>,
+    /// `BTreeSet` keeps holder iteration deterministically
+    /// sorted, which the Phase C lex-smallest victim selection
+    /// reads as `.iter().next()`, and the per-chain holder set
+    /// stays unique without explicit `contains` guards on add.
+    pub replicas: HashMap<ChainId, BTreeSet<NodeId>>,
     /// Current leader for each chain (per
     /// `replication_election`). Reconcile reads this to decide
     /// whether `Request*` actions are admissible on this node.
@@ -233,14 +237,11 @@ impl MeshOsState {
     fn apply_replica(&mut self, update: &ReplicaUpdate) {
         match update {
             ReplicaUpdate::Added { chain, holder } | ReplicaUpdate::Repaired { chain, holder } => {
-                let entry = self.replicas.entry(*chain).or_default();
-                if !entry.contains(holder) {
-                    entry.push(*holder);
-                }
+                self.replicas.entry(*chain).or_default().insert(*holder);
             }
             ReplicaUpdate::Removed { chain, holder } | ReplicaUpdate::Lost { chain, holder } => {
                 if let Some(entry) = self.replicas.get_mut(chain) {
-                    entry.retain(|h| h != holder);
+                    entry.remove(holder);
                 }
             }
         }
@@ -436,7 +437,7 @@ mod tests {
         state.apply(&add(chain, 11), 0);
         state.apply(&add(chain, 12), 0);
         state.apply(&rm(chain, 11), 0);
-        assert_eq!(state.replicas.get(&chain), Some(&vec![12]));
+        assert_eq!(state.replicas.get(&chain), Some(&::std::collections::BTreeSet::from([12])));
     }
 
     #[test]
@@ -445,7 +446,7 @@ mod tests {
         let mut state = MeshOsState::default();
         state.apply(&add(chain, 7), 0);
         state.apply(&add(chain, 7), 0);
-        assert_eq!(state.replicas.get(&chain), Some(&vec![7]));
+        assert_eq!(state.replicas.get(&chain), Some(&::std::collections::BTreeSet::from([7])));
     }
 
     #[test]

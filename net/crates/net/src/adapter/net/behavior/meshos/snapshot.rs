@@ -327,7 +327,7 @@ impl MeshOsSnapshot {
             replicas.insert(
                 *chain,
                 ReplicaSnapshot {
-                    holders: holders.clone(),
+                    holders: holders.iter().copied().collect(),
                     desired_count: desired.desired_replicas.get(chain).copied(),
                     leader: actual.replica_leader.get(chain).copied(),
                 },
@@ -539,7 +539,7 @@ mod tests {
     fn snapshot_captures_replica_holders_and_leader_and_desired_count() {
         let mut actual = MeshOsState::default();
         actual.last_tick = Some(Instant::now());
-        actual.replicas.insert(0xAA, vec![1, 2, 3]);
+        actual.replicas.insert(0xAA, ::std::collections::BTreeSet::from([1, 2, 3]));
         actual.replica_leader.insert(0xAA, 1);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(0xAA, 5);
@@ -573,7 +573,7 @@ mod tests {
         status.health = Some(DaemonHealth::Healthy);
         actual.daemons.insert(d, status);
 
-        actual.replicas.insert(0xC0FFEE, vec![10, 11]);
+        actual.replicas.insert(0xC0FFEE, ::std::collections::BTreeSet::from([10, 11]));
         actual.replica_leader.insert(0xC0FFEE, 10);
         actual.rtt.insert(10, Duration::from_millis(45));
         actual.node_health.insert(10, NodeHealth::Healthy);
