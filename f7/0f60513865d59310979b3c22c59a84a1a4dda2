@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_13_MESHDB_PASS_2.md
+  s_6e043896b8e024::t_1e0812c92b32ee 1-373
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "f70f60513865d59310979b3c22c59a84a1a4dda2",
+  "prompts": {},
+  "sessions": {
+    "s_6e043896b8e024": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "458b1173-b495-4837-b7f6-99c7a2eeebdf",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
