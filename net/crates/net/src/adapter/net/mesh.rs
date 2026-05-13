@@ -2421,12 +2421,21 @@ impl MeshNode {
         let shutdown_notify = self.shutdown_notify.clone();
 
         tokio::spawn(async move {
+            // `Duration::MAX` is the documented sentinel for
+            // "disable the loop". `tokio::time::interval(MAX)`
+            // panics under the hood (Instant + Duration::MAX
+            // overflows), so we skip the tick machinery entirely
+            // and just wait on shutdown.
+            if interval == Duration::MAX {
+                let _ = shutdown_notify.notified().await;
+                return;
+            }
             // `tokio::time::interval` panics on a zero period — guard
             // against a caller who set `capability_gc_interval` to
             // `Duration::ZERO` in `MeshNodeConfig`. A zero interval
             // isn't a sentinel for "disabled" (that's
-            // `Duration::MAX`), it's just pathological input; clamp
-            // to 1 s (see `nonzero_interval` for the rationale).
+            // `Duration::MAX`, handled above); it's just pathological
+            // input; clamp to 1 s (see `nonzero_interval`).
             let mut tick = tokio::time::interval(nonzero_interval(interval));
             // First tick fires immediately; skip it so we don't GC
             // empty state before any announcements have landed.
@@ -2470,6 +2479,17 @@ impl MeshNode {
         let shutdown_notify = self.shutdown_notify.clone();
 
         tokio::spawn(async move {
+            // `Duration::MAX` is the documented sentinel for
+            // "disable the periodic sweep" — callers rely on
+            // the lazy expiry check in `publish` instead.
+            // `tokio::time::interval(Duration::MAX)` panics
+            // when its `Instant::now() + period` overflows, so
+            // we skip the tick machinery entirely and just wait
+            // for shutdown.
+            if interval == Duration::MAX {
+                let _ = shutdown_notify.notified().await;
+                return;
+            }
             // Same zero-guard as `spawn_capability_gc_loop` —
             // tokio panics if the period is zero.
             let mut tick = tokio::time::interval(nonzero_interval(interval));
