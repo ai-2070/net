@@ -558,8 +558,10 @@ mod tests {
         // `since` values. Now they read the tick anchor.
         const THIS_NODE: NodeId = 42;
         let anchor = Instant::now();
-        let mut state = MeshOsState::default();
-        state.last_tick = Some(anchor);
+        let mut state = MeshOsState {
+            last_tick: Some(anchor),
+            ..MeshOsState::default()
+        };
         state.apply(
             &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
                 node: THIS_NODE,

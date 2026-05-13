@@ -279,6 +279,7 @@ impl MeshOsLoop {
     /// loop + its publish handle + the action-queue receiver +
     /// the snapshot reader, bundled in [`MeshOsLoopParts`] so
     /// future additions don't break the constructor signature.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(config: MeshOsConfig) -> MeshOsLoopParts {
         let config = Arc::new(config);
         let (events_tx, events_rx) = mpsc::channel(config.event_queue_capacity);
@@ -594,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn loop_exits_cleanly_when_all_handles_drop() {
-        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: mut actions_rx, reader: _ } = MeshOsLoop::new(fast_test_config());
+        let MeshOsLoopParts { mesh_loop: loop_, handle, mut actions_rx, reader: _ } = MeshOsLoop::new(fast_test_config());
         let task = tokio::spawn(loop_.run());
         drop(handle);
         // Loop should drain quickly. `run` returns the

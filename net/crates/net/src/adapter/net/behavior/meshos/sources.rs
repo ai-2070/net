@@ -377,15 +377,16 @@ mod tests {
         // loop carries a stale `replica_leader[chain] = THIS_NODE`
         // until a different node's LeaderChanged overwrites it.
         const THIS_NODE: NodeId = 100;
-        let (mut loop_, handle, _, reader) = (|| {
-            let MeshOsLoopParts { mesh_loop: l, handle: h, actions_rx: ar, reader: r } = MeshOsLoop::new(fast_cfg());
-            (l, h, ar, r)
-        })();
-        // Push a LeaderChanged first so the fold has a stale
-        // pointer; then a LeaderLost should clear it.
-        let _ = &mut loop_;
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader,
+        } = MeshOsLoop::new(fast_cfg());
         let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
         let task = tokio::spawn(loop_.run());
+        // Push a LeaderChanged first so the fold has a stale
+        // pointer; then a LeaderLost should clear it.
         sink.observe(ReplicaTransitionEvent::LeaderChanged {
             origin_hash: 0xBADC0DE,
             at: Instant::now(),

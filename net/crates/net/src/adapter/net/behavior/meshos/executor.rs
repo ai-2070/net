@@ -819,7 +819,7 @@ mod tests {
             "action must drop with a failure after exceeding max_defer_count",
         );
         assert!(
-            attempts >= 3 && attempts <= 5,
+            (3..=5).contains(&attempts),
             "expected ~max_defer_count dispatch attempts, got {attempts}",
         );
     }

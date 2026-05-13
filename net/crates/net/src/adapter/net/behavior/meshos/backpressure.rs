@@ -207,10 +207,8 @@ impl BackpressureState {
             MeshOsAction::DropReplica { chain } => {
                 self.chain_stabilization.remove(chain);
             }
-            MeshOsAction::MigrateBlob { .. } => {
-                if self.drain_window.last() == Some(&now) {
-                    self.drain_window.pop();
-                }
+            MeshOsAction::MigrateBlob { .. } if self.drain_window.last() == Some(&now) => {
+                self.drain_window.pop();
             }
             _ => {}
         }
