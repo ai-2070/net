@@ -981,8 +981,7 @@ function HeroSection() {
 
           <p className="text-[13px] text-ink-dim mt-[18px] max-w-[580px] leading-[1.65]">
             No clients. No servers. No coordinators. The mesh propagates state,
-            not connections. Loosely inspired by the Net from Cyberpunk 2077 —
-            an engineering take on the concept.
+            not connections.
           </p>
 
           <div className="mt-11 flex gap-3 flex-wrap items-center">
@@ -1414,8 +1413,8 @@ function WhyNotBestEffortSection() {
 
         <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
           TCP was designed when nuclear war was a real possibility. Packets were
-          precious. Bandwidth was scarce. Routes were scarce. The network had to
-          guarantee delivery because the next packet might not get through.
+          precious. The network had to guarantee delivery because the next
+          packet might not get through.
         </p>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mt-6">
@@ -1485,6 +1484,26 @@ interface TopologyClass {
 
 const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
   {
+    header: "// net",
+    headerColor: "accent",
+    title: "NET → latency-first",
+    titleColor: "accent",
+    body: "The internet runs in milliseconds. NET runs in nanoseconds. Commodity hardware, commodity networks, no central coordination. Drop, route around, observe, derive.",
+    floor: "nanoseconds",
+    floorColor: "accent",
+    throughput: "~20M events/s · per core",
+  },
+  {
+    header: "// real-time",
+    headerColor: "ink-dim",
+    title: "CAN / EtherCAT / TSN",
+    titleColor: "ink",
+    body: "Specialized hardware, optimized for deterministic timing. Fixed topologies. Dedicated hardware. Time-slotted access. Guarantees only because you own the wire.",
+    floor: "microseconds*",
+    floorColor: "ink",
+    throughput: "~100K updates/s · dedicated bus",
+  },
+  {
     header: "// best-effort",
     headerColor: "ink-dim",
     title: "TCP / IP / HTTP / gRPC",
@@ -1493,26 +1512,6 @@ const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
     floor: "milliseconds",
     floorColor: "ink",
     throughput: "~10K req/s · per connection",
-  },
-  {
-    header: "// real-time",
-    headerColor: "ink-dim",
-    title: "CAN / EtherCAT / TSN",
-    titleColor: "ink",
-    body: "Optimized for deterministic timing. Fixed topologies. Dedicated hardware. Time-slotted access. Guarantees only because you own the wire.",
-    floor: "microseconds*",
-    floorColor: "ink",
-    throughput: "~100K updates/s · dedicated bus",
-  },
-  {
-    header: "// net",
-    headerColor: "accent",
-    title: "NET → latency-first",
-    titleColor: "accent",
-    body: "Real-time latencies on commodity hardware over commodity networks. Drop instead of queue. Route around instead of wait. Observe instead of coordinate. Derive instead of query. Mesh transport.",
-    floor: "nanoseconds",
-    floorColor: "accent",
-    throughput: "~20M events/s · per core",
   },
 ];
 
