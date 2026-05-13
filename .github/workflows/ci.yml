@@ -43,7 +43,7 @@ jobs:
         run: cargo test --doc --features "net redex cortex netdb"
 
   integration-tests:
-    name: Integration tests (net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC)
+    name: Integration tests (Net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC, Dataforts, MeshDB, MeshOS)
     runs-on: ubuntu-latest
     defaults:
       run:
