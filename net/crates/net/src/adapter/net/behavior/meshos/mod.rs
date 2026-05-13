@@ -55,6 +55,7 @@ pub mod config;
 pub mod control;
 pub mod event;
 pub mod event_loop;
+pub mod executor;
 pub mod maintenance;
 pub mod reconcile;
 pub mod snapshot;
@@ -80,6 +81,10 @@ pub use event::{
     NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
 };
 pub use event_loop::{MeshOsHandle, MeshOsHandleError, MeshOsLoop};
+pub use executor::{
+    ActionDispatcher, ActionExecutor, DispatchError, ExecutorHandle, ExecutorStats,
+    ExecutorStatsSnapshot, LoggingDispatcher,
+};
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
 pub use state::{
     AvoidEntry, BlobObservation, DaemonLifecycle, DaemonStatus, DesiredState, MaintenanceMirror,
