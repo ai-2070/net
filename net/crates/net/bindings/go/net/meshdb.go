@@ -95,11 +95,54 @@ extern int net_meshdb_iter_next(
 );
 extern void net_meshdb_payload_free(uint8_t* ptr, size_t len);
 extern void net_meshdb_iter_free(MeshDbIter* iter);
+
+// Slice 2: composite factories. `group_by` is a comma-separated
+// C-string of row-intrinsic field names (null / empty for no
+// grouping; "origin" / "seq" / "origin,seq").
+extern MeshDbQuery* net_meshdb_query_window(
+    const MeshDbQuery* inner,
+    uint64_t size
+);
+extern MeshDbQuery* net_meshdb_query_count(
+    const MeshDbQuery* inner,
+    const char* group_by
+);
+extern MeshDbQuery* net_meshdb_query_numeric_agg(
+    const MeshDbQuery* inner,
+    const char* kind,
+    const char* field,
+    const char* group_by
+);
+extern MeshDbQuery* net_meshdb_query_percentile(
+    const MeshDbQuery* inner,
+    const char* field,
+    double p,
+    const char* group_by
+);
+extern MeshDbQuery* net_meshdb_query_join(
+    const MeshDbQuery* left,
+    const MeshDbQuery* right,
+    const char* kind,
+    const char* key,
+    const char* strategy,
+    double watermark_secs
+);
+
+// Slice 2: payload decoder (JSON intermediate). Returns null
+// when the payload isn't a postcard-encoded aggregate / joined /
+// window envelope.
+extern char* net_meshdb_decode_payload_json(
+    const uint8_t* payload,
+    size_t payload_len
+);
+extern void net_meshdb_free_string(char* s);
 */
 import "C"
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"runtime"
 	"unsafe"
 )
@@ -344,4 +387,357 @@ func (r *MeshDBRunner) Free() {
 	C.net_meshdb_runner_free(r.ptr)
 	r.ptr = nil
 	runtime.SetFinalizer(r, nil)
+}
+
+// =====================================================================
+// Slice 2: composite factories
+// =====================================================================
+//
+// Each factory takes an inner *MeshDBQuery, planning the outer
+// operator on top. The inner is NOT consumed — callers retain
+// ownership and should Free it separately. Returns
+// ErrMeshDBInvalidArg when the factory returns null (caller
+// passed invalid args).
+
+// MeshDBQueryWindow constructs a tumbling-on-seq window with
+// the given bucket size. Errors when size == 0.
+func MeshDBQueryWindow(inner *MeshDBQuery, size uint64) (*MeshDBQuery, error) {
+	if inner == nil || inner.ptr == nil {
+		return nil, fmt.Errorf("window: inner is nil: %w", ErrMeshDBInvalidArg)
+	}
+	if size == 0 {
+		return nil, fmt.Errorf("window: size must be >= 1: %w", ErrMeshDBInvalidArg)
+	}
+	ptr := C.net_meshdb_query_window(inner.ptr, C.uint64_t(size))
+	if ptr == nil {
+		return nil, fmt.Errorf("window: factory returned null: %w", ErrMeshDBInvalidArg)
+	}
+	q := &MeshDBQuery{ptr: ptr}
+	runtime.SetFinalizer(q, func(q *MeshDBQuery) { q.Free() })
+	return q, nil
+}
+
+// MeshDBQueryCount counts the rows produced by `inner`. `groupBy`
+// is a slice of row-intrinsic field names: empty / nil for a
+// single-bucket count, ["origin"], ["seq"], or ["origin","seq"]
+// for grouped counts.
+func MeshDBQueryCount(inner *MeshDBQuery, groupBy []string) (*MeshDBQuery, error) {
+	if inner == nil || inner.ptr == nil {
+		return nil, fmt.Errorf("count: inner is nil: %w", ErrMeshDBInvalidArg)
+	}
+	gbStr, free := buildGroupByCStr(groupBy)
+	defer free()
+	ptr := C.net_meshdb_query_count(inner.ptr, gbStr)
+	if ptr == nil {
+		return nil, fmt.Errorf("count: factory returned null: %w", ErrMeshDBInvalidArg)
+	}
+	q := &MeshDBQuery{ptr: ptr}
+	runtime.SetFinalizer(q, func(q *MeshDBQuery) { q.Free() })
+	return q, nil
+}
+
+// MeshDBQuerySum / Avg / Min / Max / DistinctCount: numeric
+// aggregates over `field`. `kind` is one of: "sum", "avg",
+// "min", "max", "distinct_count".
+func MeshDBQueryNumericAgg(
+	inner *MeshDBQuery,
+	kind, field string,
+	groupBy []string,
+) (*MeshDBQuery, error) {
+	if inner == nil || inner.ptr == nil {
+		return nil, fmt.Errorf("%s: inner is nil: %w", kind, ErrMeshDBInvalidArg)
+	}
+	kindC := C.CString(kind)
+	defer C.free(unsafe.Pointer(kindC))
+	fieldC := C.CString(field)
+	defer C.free(unsafe.Pointer(fieldC))
+	gbStr, free := buildGroupByCStr(groupBy)
+	defer free()
+	ptr := C.net_meshdb_query_numeric_agg(inner.ptr, kindC, fieldC, gbStr)
+	if ptr == nil {
+		return nil, fmt.Errorf("%s: factory returned null: %w", kind, ErrMeshDBInvalidArg)
+	}
+	q := &MeshDBQuery{ptr: ptr}
+	runtime.SetFinalizer(q, func(q *MeshDBQuery) { q.Free() })
+	return q, nil
+}
+
+// MeshDBQueryPercentile: nearest-rank exact percentile. `p` is
+// clamped at the FFI boundary — must be finite in [0, 1].
+func MeshDBQueryPercentile(
+	inner *MeshDBQuery,
+	field string,
+	p float64,
+	groupBy []string,
+) (*MeshDBQuery, error) {
+	if inner == nil || inner.ptr == nil {
+		return nil, fmt.Errorf("percentile: inner is nil: %w", ErrMeshDBInvalidArg)
+	}
+	fieldC := C.CString(field)
+	defer C.free(unsafe.Pointer(fieldC))
+	gbStr, free := buildGroupByCStr(groupBy)
+	defer free()
+	ptr := C.net_meshdb_query_percentile(inner.ptr, fieldC, C.double(p), gbStr)
+	if ptr == nil {
+		return nil, fmt.Errorf(
+			"percentile: factory returned null (check p in [0,1]): %w",
+			ErrMeshDBInvalidArg,
+		)
+	}
+	q := &MeshDBQuery{ptr: ptr}
+	runtime.SetFinalizer(q, func(q *MeshDBQuery) { q.Free() })
+	return q, nil
+}
+
+// MeshDBQueryJoin: hash-join two queries. `kind` is one of
+// "inner" / "left_outer" / "right_outer" / "full_outer".
+// `key` is "origin", "seq", "origin,seq", or a JSON payload
+// path. `strategy` is "hash_broadcast" (default) or
+// "sort_merge"; empty string = default. `watermarkSecs` is
+// informational under snapshot semantics; pass 5.0 to match
+// the locked join watermark.
+func MeshDBQueryJoin(
+	left, right *MeshDBQuery,
+	kind, key, strategy string,
+	watermarkSecs float64,
+) (*MeshDBQuery, error) {
+	if left == nil || left.ptr == nil || right == nil || right.ptr == nil {
+		return nil, fmt.Errorf("join: left or right is nil: %w", ErrMeshDBInvalidArg)
+	}
+	kindC := C.CString(kind)
+	defer C.free(unsafe.Pointer(kindC))
+	keyC := C.CString(key)
+	defer C.free(unsafe.Pointer(keyC))
+	var stratC *C.char
+	if strategy != "" {
+		stratC = C.CString(strategy)
+		defer C.free(unsafe.Pointer(stratC))
+	}
+	ptr := C.net_meshdb_query_join(
+		left.ptr, right.ptr, kindC, keyC, stratC, C.double(watermarkSecs),
+	)
+	if ptr == nil {
+		return nil, fmt.Errorf(
+			"join: factory returned null (check kind / key / strategy): %w",
+			ErrMeshDBInvalidArg,
+		)
+	}
+	q := &MeshDBQuery{ptr: ptr}
+	runtime.SetFinalizer(q, func(q *MeshDBQuery) { q.Free() })
+	return q, nil
+}
+
+// buildGroupByCStr renders a Go []string as a comma-separated
+// C-string. Returns the *C.char + a free closure. nil/empty
+// slice => nil *C.char (FFI treats null as "no grouping").
+func buildGroupByCStr(groupBy []string) (*C.char, func()) {
+	if len(groupBy) == 0 {
+		return nil, func() {}
+	}
+	joined := groupBy[0]
+	for _, s := range groupBy[1:] {
+		joined += "," + s
+	}
+	c := C.CString(joined)
+	return c, func() { C.free(unsafe.Pointer(c)) }
+}
+
+// =====================================================================
+// Slice 2: payload decoder
+// =====================================================================
+//
+// Sentinel rows from aggregate / join / window operators carry
+// postcard-encoded envelopes in their payload. `DecodePayload`
+// calls the FFI's JSON decoder, then unmarshals into a tagged
+// Go struct. Plain at/between/latest rows (event payloads)
+// return (nil, nil) — `Decoded == nil` means "not a sentinel".
+
+// DecodedPayload is a tagged union over the three sentinel
+// envelope shapes. Exactly one of Aggregate / Joined / Window
+// is non-nil based on Kind.
+type DecodedPayload struct {
+	Kind      string                // "aggregate" | "joined" | "window"
+	Aggregate *DecodedAggregate     // populated when Kind == "aggregate"
+	Joined    *DecodedJoined        // populated when Kind == "joined"
+	Window    *DecodedWindowBoundary // populated when Kind == "window"
+}
+
+// DecodedAggregate is the decoded form of an aggregate sentinel
+// row. `Group` is nil for single-bucket (no group_by) results.
+type DecodedAggregate struct {
+	Group *DecodedGroupKey
+	Value DecodedAggregateValue
+}
+
+// DecodedGroupKey identifies which group an aggregate row
+// belongs to. Kind is "origin" / "seq" / "origin_seq".
+type DecodedGroupKey struct {
+	Kind   string
+	Origin uint64 // populated when Kind contains "origin"
+	Seq    uint64 // populated when Kind contains "seq"
+}
+
+// DecodedAggregateValue carries the numeric output of an
+// aggregate. Kind is "count" / "sum" / "avg" / "min" / "max" /
+// "distinct_count" / "percentile". `Value` is the float64 result
+// (nil for empty groups under avg/min/max/percentile). `Count`
+// mirrors Value as a uint64 for count / distinct_count kinds.
+type DecodedAggregateValue struct {
+	Kind  string
+	Value *float64
+	Count *uint64
+}
+
+// DecodedJoined holds the (left, right) pair from a join
+// sentinel row. Either side may be nil for outer-join unmatched
+// rows.
+type DecodedJoined struct {
+	Left  *MeshDBResultRow
+	Right *MeshDBResultRow
+}
+
+// DecodedWindowBoundary holds a window bucket: half-open
+// `[Start, End)` over seq, plus the rows that landed in it.
+type DecodedWindowBoundary struct {
+	Start uint64
+	End   uint64
+	Rows  []MeshDBResultRow
+}
+
+// DecodePayload parses a result-row's payload as a postcard-
+// encoded sentinel envelope. Returns (nil, nil) for plain
+// event-payload rows; (nil, err) on malformed FFI output.
+func DecodePayload(row MeshDBResultRow) (*DecodedPayload, error) {
+	if len(row.Payload) == 0 {
+		return nil, nil
+	}
+	cstr := C.net_meshdb_decode_payload_json(
+		(*C.uint8_t)(unsafe.Pointer(&row.Payload[0])),
+		C.size_t(len(row.Payload)),
+	)
+	if cstr == nil {
+		return nil, nil
+	}
+	defer C.net_meshdb_free_string(cstr)
+	jsonBytes := []byte(C.GoString(cstr))
+	return parseDecodedJSON(jsonBytes)
+}
+
+// parseDecodedJSON converts the FFI's JSON intermediate into a
+// typed DecodedPayload. Extracted so unit tests can exercise
+// the parser without an FFI round-trip.
+func parseDecodedJSON(jsonBytes []byte) (*DecodedPayload, error) {
+	var head struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(jsonBytes, &head); err != nil {
+		return nil, fmt.Errorf("decode payload: malformed FFI JSON: %w", err)
+	}
+	switch head.Kind {
+	case "aggregate":
+		return decodeAggregate(jsonBytes)
+	case "joined":
+		return decodeJoined(jsonBytes)
+	case "window":
+		return decodeWindow(jsonBytes)
+	default:
+		return nil, fmt.Errorf("decode payload: unknown kind %q", head.Kind)
+	}
+}
+
+func decodeAggregate(b []byte) (*DecodedPayload, error) {
+	var raw struct {
+		Group *struct {
+			Kind   string `json:"kind"`
+			Origin uint64 `json:"origin"`
+			Seq    uint64 `json:"seq"`
+		} `json:"group"`
+		Value struct {
+			Kind  string   `json:"kind"`
+			Value *float64 `json:"value"`
+			Count *uint64  `json:"count"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("decode aggregate: %w", err)
+	}
+	out := &DecodedAggregate{
+		Value: DecodedAggregateValue{
+			Kind:  raw.Value.Kind,
+			Value: raw.Value.Value,
+			Count: raw.Value.Count,
+		},
+	}
+	if raw.Group != nil {
+		out.Group = &DecodedGroupKey{
+			Kind:   raw.Group.Kind,
+			Origin: raw.Group.Origin,
+			Seq:    raw.Group.Seq,
+		}
+	}
+	return &DecodedPayload{Kind: "aggregate", Aggregate: out}, nil
+}
+
+func decodeJoined(b []byte) (*DecodedPayload, error) {
+	var raw struct {
+		Left  *jsonRow `json:"left"`
+		Right *jsonRow `json:"right"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("decode joined: %w", err)
+	}
+	out := &DecodedJoined{}
+	if raw.Left != nil {
+		row := raw.Left.toRow()
+		out.Left = &row
+	}
+	if raw.Right != nil {
+		row := raw.Right.toRow()
+		out.Right = &row
+	}
+	return &DecodedPayload{Kind: "joined", Joined: out}, nil
+}
+
+func decodeWindow(b []byte) (*DecodedPayload, error) {
+	var raw struct {
+		Start uint64    `json:"start"`
+		End   uint64    `json:"end"`
+		Rows  []jsonRow `json:"rows"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("decode window: %w", err)
+	}
+	rows := make([]MeshDBResultRow, 0, len(raw.Rows))
+	for _, jr := range raw.Rows {
+		rows = append(rows, jr.toRow())
+	}
+	return &DecodedPayload{
+		Kind:   "window",
+		Window: &DecodedWindowBoundary{Start: raw.Start, End: raw.End, Rows: rows},
+	}, nil
+}
+
+// jsonRow mirrors the FFI's per-row JSON shape:
+// `{"origin": N, "seq": N, "payload": [B0, B1, ...]}`.
+// Payload is decoded as `[]uint16` (rather than `[]byte`)
+// because Go's json package treats `[]byte` as a base64 string;
+// the FFI emits raw byte integers as a JSON array. Each value
+// in the array fits in u8 by construction so the cast back to
+// byte is lossless.
+type jsonRow struct {
+	Origin  uint64   `json:"origin"`
+	Seq     uint64   `json:"seq"`
+	Payload []uint16 `json:"payload"`
+}
+
+func (j jsonRow) toRow() MeshDBResultRow {
+	payload := make([]byte, len(j.Payload))
+	for i, b := range j.Payload {
+		payload[i] = byte(b)
+	}
+	return MeshDBResultRow{
+		Origin:  j.Origin,
+		Seq:     j.Seq,
+		Payload: payload,
+	}
 }

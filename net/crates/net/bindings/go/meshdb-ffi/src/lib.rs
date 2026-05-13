@@ -236,6 +236,396 @@ pub extern "C" fn net_meshdb_query_latest(origin: u64) -> *mut MeshDbQuery {
     Box::into_raw(Box::new(MeshDbQuery { plan }))
 }
 
+// =====================================================================
+// Slice 2: composite factories
+// =====================================================================
+//
+// Slice 2 group-by encoding: a C-string with comma-separated row-
+// intrinsic field names. `""` / null → no grouping; `"origin"`,
+// `"seq"`, `"origin,seq"` map to the typed `JoinKeyMode`. Other
+// values surface as null (caller treats as invalid args).
+
+use net::adapter::net::behavior::meshdb::planner::{JoinKeyMode, JoinStrategy};
+use net::adapter::net::behavior::meshdb::query::{
+    JoinKind, NumericAggregateKind, NumericReductionKind, WindowSpec,
+};
+
+unsafe fn parse_group_by_cstr(
+    group_by: *const std::ffi::c_char,
+) -> std::result::Result<Option<JoinKeyMode>, ()> {
+    if group_by.is_null() {
+        return Ok(None);
+    }
+    let s = std::ffi::CStr::from_ptr(group_by).to_str().map_err(|_| ())?;
+    if s.is_empty() {
+        return Ok(None);
+    }
+    match s {
+        "origin" => Ok(Some(JoinKeyMode::Origin)),
+        "seq" => Ok(Some(JoinKeyMode::Seq)),
+        "origin,seq" | "seq,origin" => Ok(Some(JoinKeyMode::OriginSeq)),
+        _ => Err(()),
+    }
+}
+
+unsafe fn cstr_to_string(s: *const std::ffi::c_char) -> Option<String> {
+    if s.is_null() {
+        return None;
+    }
+    std::ffi::CStr::from_ptr(s).to_str().ok().map(|x| x.to_string())
+}
+
+/// `Window(inner, size)` — tumbling on seq. Returns null when
+/// `size == 0`. `inner` is NOT consumed (caller still owns).
+///
+/// # Safety
+/// `inner` must be a valid `MeshDbQuery*` or null.
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_query_window(
+    inner: *const MeshDbQuery,
+    size: u64,
+) -> *mut MeshDbQuery {
+    if inner.is_null() || size == 0 {
+        return ptr::null_mut();
+    }
+    let inner_node = (&*inner).plan.root.clone();
+    let plan = plan_of(OperatorPlan::Window {
+        input: Box::new(inner_node),
+        spec: WindowSpec::TumblingSeq { size },
+    });
+    Box::into_raw(Box::new(MeshDbQuery { plan }))
+}
+
+/// `Count(inner, group_by)`. `group_by` is a comma-separated
+/// C-string of row-intrinsic field names; null / empty for a
+/// single bucket.
+///
+/// # Safety
+/// `inner` valid pointer; `group_by` null or valid C-string.
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_query_count(
+    inner: *const MeshDbQuery,
+    group_by: *const std::ffi::c_char,
+) -> *mut MeshDbQuery {
+    if inner.is_null() {
+        return ptr::null_mut();
+    }
+    let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
+        return ptr::null_mut();
+    };
+    let inner_node = (&*inner).plan.root.clone();
+    let plan = plan_of(OperatorPlan::AggregateCount {
+        input: Box::new(inner_node),
+        group_by: group_by_mode,
+    });
+    Box::into_raw(Box::new(MeshDbQuery { plan }))
+}
+
+/// `Sum / Avg / Min / Max / DistinctCount` aggregates. `kind` is
+/// one of: `"sum"`, `"avg"`, `"min"`, `"max"`, `"distinct_count"`.
+/// `field` is a row-intrinsic name (`"origin"` / `"seq"`) or a
+/// dotted JSON path. Returns null for unknown `kind` or invalid
+/// args.
+///
+/// # Safety
+/// `inner` valid pointer; `kind` + `field` valid C-strings.
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_query_numeric_agg(
+    inner: *const MeshDbQuery,
+    kind: *const std::ffi::c_char,
+    field: *const std::ffi::c_char,
+    group_by: *const std::ffi::c_char,
+) -> *mut MeshDbQuery {
+    if inner.is_null() {
+        return ptr::null_mut();
+    }
+    let (Some(kind), Some(field)) = (cstr_to_string(kind), cstr_to_string(field)) else {
+        return ptr::null_mut();
+    };
+    let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
+        return ptr::null_mut();
+    };
+    let inner_node = (&*inner).plan.root.clone();
+    let op = match kind.as_str() {
+        "sum" => OperatorPlan::AggregateNumeric {
+            input: Box::new(inner_node),
+            group_by: group_by_mode,
+            field_path: field,
+            kind: NumericAggregateKind::Sum,
+        },
+        "avg" => OperatorPlan::AggregateNumeric {
+            input: Box::new(inner_node),
+            group_by: group_by_mode,
+            field_path: field,
+            kind: NumericAggregateKind::Avg,
+        },
+        "min" => OperatorPlan::AggregateReduction {
+            input: Box::new(inner_node),
+            group_by: group_by_mode,
+            field_path: field,
+            kind: NumericReductionKind::Min,
+        },
+        "max" => OperatorPlan::AggregateReduction {
+            input: Box::new(inner_node),
+            group_by: group_by_mode,
+            field_path: field,
+            kind: NumericReductionKind::Max,
+        },
+        "distinct_count" => OperatorPlan::AggregateDistinct {
+            input: Box::new(inner_node),
+            group_by: group_by_mode,
+            field_path: field,
+        },
+        _ => return ptr::null_mut(),
+    };
+    Box::into_raw(Box::new(MeshDbQuery { plan: plan_of(op) }))
+}
+
+/// `Percentile(inner, field, p)`. `p` must be finite in
+/// `[0.0, 1.0]`. Returns null otherwise.
+///
+/// # Safety
+/// `inner` valid pointer; `field` valid C-string.
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_query_percentile(
+    inner: *const MeshDbQuery,
+    field: *const std::ffi::c_char,
+    p: f64,
+    group_by: *const std::ffi::c_char,
+) -> *mut MeshDbQuery {
+    if inner.is_null() || !p.is_finite() || !(0.0..=1.0).contains(&p) {
+        return ptr::null_mut();
+    }
+    let Some(field) = cstr_to_string(field) else {
+        return ptr::null_mut();
+    };
+    let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
+        return ptr::null_mut();
+    };
+    let inner_node = (&*inner).plan.root.clone();
+    let plan = plan_of(OperatorPlan::AggregateReduction {
+        input: Box::new(inner_node),
+        group_by: group_by_mode,
+        field_path: field,
+        kind: NumericReductionKind::Percentile { p },
+    });
+    Box::into_raw(Box::new(MeshDbQuery { plan }))
+}
+
+/// Hash-join two queries. `kind` is one of `"inner"` /
+/// `"left_outer"` / `"right_outer"` / `"full_outer"`. `key` is
+/// the field name shared by both sides — `"origin"` / `"seq"` /
+/// `"origin,seq"` map to the typed enum, anything else is a
+/// JSON payload path. `strategy` is `"hash_broadcast"` (default)
+/// or `"sort_merge"`. `watermark_secs` ≥ 0 (informational under
+/// snapshot semantics; 5.0 is the canonical default).
+///
+/// # Safety
+/// All pointers valid (left/right `MeshDbQuery*`; kind/key
+/// non-null; strategy nullable).
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_query_join(
+    left: *const MeshDbQuery,
+    right: *const MeshDbQuery,
+    kind: *const std::ffi::c_char,
+    key: *const std::ffi::c_char,
+    strategy: *const std::ffi::c_char,
+    watermark_secs: f64,
+) -> *mut MeshDbQuery {
+    if left.is_null() || right.is_null() {
+        return ptr::null_mut();
+    }
+    let (Some(kind), Some(key)) = (cstr_to_string(kind), cstr_to_string(key)) else {
+        return ptr::null_mut();
+    };
+    let kind = match kind.as_str() {
+        "inner" => JoinKind::Inner,
+        "left_outer" => JoinKind::LeftOuter,
+        "right_outer" => JoinKind::RightOuter,
+        "full_outer" => JoinKind::FullOuter,
+        _ => return ptr::null_mut(),
+    };
+    let strategy_str = cstr_to_string(strategy);
+    let strategy = match strategy_str.as_deref() {
+        None | Some("") | Some("hash_broadcast") => JoinStrategy::HashBroadcast,
+        Some("sort_merge") => JoinStrategy::SortMerge,
+        _ => return ptr::null_mut(),
+    };
+    let key_mode = match key.as_str() {
+        "origin" => JoinKeyMode::Origin,
+        "seq" => JoinKeyMode::Seq,
+        "origin,seq" | "seq,origin" => JoinKeyMode::OriginSeq,
+        other => JoinKeyMode::Field(other.to_string()),
+    };
+    let watermark_secs = if watermark_secs.is_finite() && watermark_secs >= 0.0 {
+        watermark_secs
+    } else {
+        5.0
+    };
+    let plan = plan_of(OperatorPlan::HashJoin {
+        left: Box::new((&*left).plan.root.clone()),
+        right: Box::new((&*right).plan.root.clone()),
+        key_mode,
+        kind,
+        strategy,
+        watermark: std::time::Duration::from_secs_f64(watermark_secs),
+    });
+    Box::into_raw(Box::new(MeshDbQuery { plan }))
+}
+
+// =====================================================================
+// Slice 2: payload decoder (JSON intermediate)
+// =====================================================================
+
+/// Try to decode a result-row payload into a JSON description.
+/// Returns a heap-allocated C-string on success, or null when
+/// the payload doesn't deserialize as any known sentinel
+/// envelope (atomic-operator rows return null — their payload
+/// is event data, not a postcard envelope).
+///
+/// JSON shape per variant:
+/// - Aggregate: `{"kind":"aggregate","group":{...|null},"value":{"kind":"count","count":42,"value":42.0}}`
+/// - Joined: `{"kind":"joined","left":{...|null},"right":{...|null}}`
+/// - Window: `{"kind":"window","start":N,"end":N,"rows":[{...},...]}`
+///
+/// Each row inside the JSON is `{"origin":N,"seq":N,"payload":"<base64>"}`.
+/// Free the returned C-string with `net_meshdb_free_string`.
+///
+/// # Safety
+/// `payload` must be a valid pointer to `payload_len` bytes
+/// (or null when `payload_len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_decode_payload_json(
+    payload: *const u8,
+    payload_len: usize,
+) -> *mut std::ffi::c_char {
+    if payload_len == 0 || payload.is_null() {
+        return ptr::null_mut();
+    }
+    let bytes = slice::from_raw_parts(payload, payload_len);
+    let json = match decode_to_json(bytes) {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    match std::ffi::CString::new(json) {
+        Ok(c) => c.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Free a string returned by `net_meshdb_decode_payload_json`.
+///
+/// # Safety
+/// `s` must be a pointer returned by the decoder or null.
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_free_string(s: *mut std::ffi::c_char) {
+    if s.is_null() {
+        return;
+    }
+    drop(std::ffi::CString::from_raw(s));
+}
+
+fn decode_to_json(bytes: &[u8]) -> Option<String> {
+    use net::adapter::net::behavior::meshdb::query::{
+        AggregateRowPayload, JoinedRowPayload, WindowBoundary,
+    };
+    if let Ok(p) = postcard::from_bytes::<AggregateRowPayload>(bytes) {
+        return Some(aggregate_to_json(&p));
+    }
+    if let Ok(p) = postcard::from_bytes::<JoinedRowPayload>(bytes) {
+        return Some(joined_to_json(&p));
+    }
+    if let Ok(p) = postcard::from_bytes::<WindowBoundary>(bytes) {
+        return Some(window_to_json(&p));
+    }
+    None
+}
+
+fn row_to_json_value(r: &ResultRow) -> String {
+    // Payload is encoded as a JSON array of byte integers. Avoids
+    // a base64 dep and lets Go decode trivially via the json
+    // package. Higher-level wrappers can re-pack into []byte.
+    let payload_bytes: Vec<String> = r.payload.iter().map(|b| b.to_string()).collect();
+    format!(
+        r#"{{"origin":{},"seq":{},"payload":[{}]}}"#,
+        r.origin,
+        r.seq.0,
+        payload_bytes.join(",")
+    )
+}
+
+fn group_key_to_json(g: &Option<net::adapter::net::behavior::meshdb::query::GroupKey>) -> String {
+    use net::adapter::net::behavior::meshdb::query::GroupKey as GK;
+    match g {
+        None => "null".to_string(),
+        Some(GK::Origin(o)) => format!(r#"{{"kind":"origin","origin":{o}}}"#),
+        Some(GK::Seq(s)) => format!(r#"{{"kind":"seq","seq":{}}}"#, s.0),
+        Some(GK::OriginSeq { origin, seq }) => format!(
+            r#"{{"kind":"origin_seq","origin":{origin},"seq":{}}}"#,
+            seq.0
+        ),
+    }
+}
+
+fn aggregate_value_to_json(
+    v: &net::adapter::net::behavior::meshdb::query::AggregateValue,
+) -> String {
+    use net::adapter::net::behavior::meshdb::query::AggregateValue as AV;
+    let (kind, value, count) = match v {
+        AV::Count(c) => ("count", Some(*c as f64), Some(*c)),
+        AV::Sum(s) => ("sum", Some(*s), None),
+        AV::Avg(opt) => ("avg", *opt, None),
+        AV::Min(opt) => ("min", *opt, None),
+        AV::Max(opt) => ("max", *opt, None),
+        AV::DistinctCount(c) => ("distinct_count", Some(*c as f64), Some(*c)),
+        AV::Percentile(opt) => ("percentile", *opt, None),
+        _ => ("unknown", None, None),
+    };
+    let value_json = value.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+    let count_json = count.map(|c| c.to_string()).unwrap_or_else(|| "null".to_string());
+    format!(
+        r#"{{"kind":"{kind}","value":{value_json},"count":{count_json}}}"#
+    )
+}
+
+fn aggregate_to_json(
+    p: &net::adapter::net::behavior::meshdb::query::AggregateRowPayload,
+) -> String {
+    format!(
+        r#"{{"kind":"aggregate","group":{},"value":{}}}"#,
+        group_key_to_json(&p.group),
+        aggregate_value_to_json(&p.value)
+    )
+}
+
+fn joined_to_json(
+    p: &net::adapter::net::behavior::meshdb::query::JoinedRowPayload,
+) -> String {
+    let left = p
+        .left
+        .as_ref()
+        .map(row_to_json_value)
+        .unwrap_or_else(|| "null".to_string());
+    let right = p
+        .right
+        .as_ref()
+        .map(row_to_json_value)
+        .unwrap_or_else(|| "null".to_string());
+    format!(r#"{{"kind":"joined","left":{left},"right":{right}}}"#)
+}
+
+fn window_to_json(
+    b: &net::adapter::net::behavior::meshdb::query::WindowBoundary,
+) -> String {
+    let rows: Vec<String> = b.rows.iter().map(row_to_json_value).collect();
+    format!(
+        r#"{{"kind":"window","start":{},"end":{},"rows":[{}]}}"#,
+        b.start.0,
+        b.end.0,
+        rows.join(",")
+    )
+}
+
 /// Free a query handle. No-op on null.
 ///
 /// # Safety
@@ -542,5 +932,98 @@ mod tests {
     fn between_with_inverted_range_returns_null() {
         let q = net_meshdb_query_between(0xAA, 5, 5);
         assert!(q.is_null());
+    }
+
+    /// Slice 2: count factory + JSON decoder end-to-end.
+    /// Aggregate sentinel rows carry a postcard-encoded
+    /// `AggregateRowPayload`; the JSON decoder turns it into a
+    /// `{"kind":"aggregate", "group":..., "value":...}` shape.
+    #[test]
+    fn ffi_count_factory_and_json_decoder() {
+        unsafe {
+            let reader = net_meshdb_reader_new();
+            for s in 1u64..=4 {
+                net_meshdb_reader_append(reader, 0x01, s, ptr::null(), 0);
+            }
+            let runner = net_meshdb_runner_new(reader);
+            let between = net_meshdb_query_between(0x01, 1, 10);
+            let count = net_meshdb_query_count(between, ptr::null());
+            assert!(!count.is_null());
+            let iter = net_meshdb_runner_execute(runner, count);
+            let mut origin: u64 = 0;
+            let mut seq: u64 = 0;
+            let mut p_ptr: *mut u8 = ptr::null_mut();
+            let mut p_len: usize = 0;
+            assert_eq!(
+                net_meshdb_iter_next(iter, &mut origin, &mut seq, &mut p_ptr, &mut p_len),
+                NET_MESHDB_OK
+            );
+            // Decode the sentinel-row payload to JSON.
+            let json_ptr = net_meshdb_decode_payload_json(p_ptr, p_len);
+            assert!(!json_ptr.is_null(), "expected a JSON-decodable payload");
+            let json = std::ffi::CStr::from_ptr(json_ptr).to_str().unwrap();
+            assert!(json.contains(r#""kind":"aggregate""#), "got: {json}");
+            assert!(json.contains(r#""kind":"count""#), "got: {json}");
+            assert!(json.contains(r#""count":4"#), "got: {json}");
+            net_meshdb_free_string(json_ptr);
+            net_meshdb_payload_free(p_ptr, p_len);
+            net_meshdb_iter_free(iter);
+            net_meshdb_query_free(count);
+            net_meshdb_query_free(between);
+            net_meshdb_runner_free(runner);
+            net_meshdb_reader_free(reader);
+        }
+    }
+
+    /// Slice 2: plain at-row payloads aren't postcard-encoded
+    /// sentinel envelopes — the decoder returns null.
+    #[test]
+    fn decode_plain_row_returns_null() {
+        unsafe {
+            let bytes = b"plain event bytes";
+            let json_ptr =
+                net_meshdb_decode_payload_json(bytes.as_ptr(), bytes.len());
+            assert!(json_ptr.is_null());
+        }
+    }
+
+    /// Slice 2: window factory plus the JSON decoder produces
+    /// `{"kind":"window", "start":..., "end":..., "rows":[...]}`.
+    #[test]
+    fn ffi_window_factory_and_json_decoder() {
+        unsafe {
+            let reader = net_meshdb_reader_new();
+            for s in 1u64..=5 {
+                let p = format!("p-{s}");
+                net_meshdb_reader_append(reader, 0x01, s, p.as_ptr(), p.len());
+            }
+            let runner = net_meshdb_runner_new(reader);
+            let between = net_meshdb_query_between(0x01, 1, 20);
+            let window = net_meshdb_query_window(between, 3);
+            assert!(!window.is_null());
+            let iter = net_meshdb_runner_execute(runner, window);
+            // First bucket [0, 3) — seqs 1, 2.
+            let mut origin: u64 = 0;
+            let mut seq: u64 = 0;
+            let mut p_ptr: *mut u8 = ptr::null_mut();
+            let mut p_len: usize = 0;
+            assert_eq!(
+                net_meshdb_iter_next(iter, &mut origin, &mut seq, &mut p_ptr, &mut p_len),
+                NET_MESHDB_OK
+            );
+            let json_ptr = net_meshdb_decode_payload_json(p_ptr, p_len);
+            assert!(!json_ptr.is_null());
+            let json = std::ffi::CStr::from_ptr(json_ptr).to_str().unwrap();
+            assert!(json.contains(r#""kind":"window""#), "got: {json}");
+            assert!(json.contains(r#""start":0"#), "got: {json}");
+            assert!(json.contains(r#""end":3"#), "got: {json}");
+            net_meshdb_free_string(json_ptr);
+            net_meshdb_payload_free(p_ptr, p_len);
+            net_meshdb_iter_free(iter);
+            net_meshdb_query_free(window);
+            net_meshdb_query_free(between);
+            net_meshdb_runner_free(runner);
+            net_meshdb_reader_free(reader);
+        }
     }
 }
