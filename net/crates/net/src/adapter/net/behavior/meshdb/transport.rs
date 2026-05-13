@@ -135,6 +135,20 @@ pub enum MeshDbRouteError {
     /// stream already terminated, or a stray frame from a
     /// peer running a stale generation.
     UnknownCallId(u64),
+    /// Inbound response carrying a `call_id` that *is* in-flight,
+    /// but `from_node` doesn't match the peer the call was
+    /// dispatched to. A mutually-authenticated mesh member sent a
+    /// response addressed at someone else's call — either a bug
+    /// or a hijack attempt. Carries the in-flight call's expected
+    /// peer + the actual sender for diagnostics.
+    WrongPeer {
+        /// The call_id the response carried.
+        call_id: u64,
+        /// The peer the caller dispatched the request to.
+        expected: u64,
+        /// The peer the response actually arrived from.
+        actual: u64,
+    },
     /// Inbound response, but the matching caller's inbox is
     /// full. Bounded backpressure — drop + log; the caller will
     /// either timeout or see the missing batch as a partial
@@ -148,6 +162,14 @@ impl std::fmt::Display for MeshDbRouteError {
             Self::Decode(e) => write!(f, "meshdb frame decode failed: {e}"),
             Self::NoServer => write!(f, "no MeshDbServer installed on this node"),
             Self::UnknownCallId(id) => write!(f, "no in-flight caller for call_id={id:#x}"),
+            Self::WrongPeer {
+                call_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "meshdb response for call_id={call_id:#x} arrived from node {actual:#x}; expected {expected:#x}"
+            ),
             Self::InboxFull(id) => write!(f, "caller mpsc full for call_id={id:#x}"),
         }
     }
@@ -175,8 +197,16 @@ pub trait MeshDbWireSender: Send + Sync {
 /// [`MeshDbWireTransport::send`] drains `rx` until a terminal
 /// frame arrives (`End` / `Error` / `Batch { final: true }`) or
 /// the caller drops it.
+///
+/// `target_node` is the peer the request was dispatched to.
+/// Responses that arrive from any other peer are rejected with
+/// `WrongPeer` rather than silently injected — `call_id`s are
+/// allocated from a process-global counter and predictable, so
+/// without this gate any mutually-authenticated mesh member
+/// could hijack another caller's stream by guessing the id.
 struct InflightCaller {
     tx: mpsc::Sender<MeshDbResponse>,
+    target_node: u64,
 }
 
 /// Concrete [`MeshDbInboundRouter`] implementation paired with a
@@ -252,6 +282,17 @@ impl MeshDbInboundRouter for MeshDbWireDispatcher {
                 let entry = guard
                     .get(&call_id)
                     .ok_or(MeshDbRouteError::UnknownCallId(call_id))?;
+                // Gate by sender: only the peer the request was
+                // dispatched to may inject responses into this
+                // call's stream. Mutually-authenticated mesh
+                // members are still bounded by their own node_id.
+                if entry.target_node != from_node {
+                    return Err(MeshDbRouteError::WrongPeer {
+                        call_id,
+                        expected: entry.target_node,
+                        actual: from_node,
+                    });
+                }
                 entry.tx.try_send(resp).map_err(|e| match e {
                     mpsc::error::TrySendError::Full(_) => MeshDbRouteError::InboxFull(call_id),
                     // Closed inbox = caller stream dropped =
@@ -262,7 +303,6 @@ impl MeshDbInboundRouter for MeshDbWireDispatcher {
                         MeshDbRouteError::UnknownCallId(call_id)
                     }
                 })?;
-                let _ = from_node; // unused — responses are addressed by call_id only.
                 Ok(())
             }
         }
@@ -303,7 +343,13 @@ impl MeshDbTransport for MeshDbWireTransport {
         // could ship msg back before our caller-table entry is
         // visible and the response would be dropped as
         // UnknownCallId.
-        self.inflight.write().insert(call_id, InflightCaller { tx });
+        self.inflight.write().insert(
+            call_id,
+            InflightCaller {
+                tx,
+                target_node: node,
+            },
+        );
         let send_result = self
             .sender
             .send_frame(node, MeshDbFrame::Request(request))
@@ -908,5 +954,100 @@ mod tests {
             .try_route(0xB, &frame.encode().unwrap())
             .expect_err("no caller -> error");
         assert!(matches!(err, MeshDbRouteError::UnknownCallId(999)));
+    }
+
+    #[tokio::test]
+    async fn wire_response_from_wrong_peer_rejected_without_injection() {
+        // Pin: `call_id`s come from a process-global counter and
+        // are therefore predictable. Without per-peer scoping any
+        // authenticated mesh member could craft a Response with
+        // someone else's call_id and inject arbitrary rows /
+        // errors into that caller's stream. This test stands up
+        // node A as the caller talking to node B (legitimate),
+        // then has node C send an unsolicited Response carrying
+        // A's call_id. The dispatcher must reject it with
+        // `WrongPeer` and the caller's stream must stay clean.
+        let wire = Arc::new(InMemoryWire::default());
+        let node_a: u64 = 0xA;
+        let node_b: u64 = 0xB;
+        let node_c: u64 = 0xC; // hostile
+
+        // Caller (A) — no server, just a transport pointed at B.
+        let sender_a = Arc::new(SenderTo {
+            wire: wire.clone(),
+            local_node: node_a,
+        });
+        let dispatcher_a = Arc::new(MeshDbWireDispatcher::new(sender_a));
+        wire.register(node_a, dispatcher_a.clone());
+
+        // Legitimate server (B) with a chain that holds one row,
+        // but we'll race C's spoofed response in first.
+        let reader_b = Arc::new(InMemoryChainReader::default());
+        reader_b.append(0xCAFE, SeqNum(7), b"real".to_vec());
+        let executor_b: Arc<dyn MeshQueryExecutor> =
+            Arc::new(LocalMeshQueryExecutor::new(reader_b));
+        let server_b = MeshDbServer::new(executor_b);
+        let sender_b = Arc::new(SenderTo {
+            wire: wire.clone(),
+            local_node: node_b,
+        });
+        let dispatcher_b = Arc::new(MeshDbWireDispatcher::new(sender_b));
+        dispatcher_b.set_server(Some(server_b));
+        wire.register(node_b, dispatcher_b);
+
+        // A issues a query at B and registers the inflight entry.
+        let transport_a = dispatcher_a.transport();
+        let plan_call_id = 0xDEAD_BEEF;
+        let mut stream = transport_a
+            .send(
+                node_b,
+                MeshDbRequest::Execute {
+                    call_id: plan_call_id,
+                    plan: atomic_plan(OperatorPlan::LatestRead { origin: 0xCAFE }),
+                },
+            )
+            .await
+            .expect("send to B");
+
+        // C tries to inject a Response carrying B's call_id.
+        let spoof = MeshDbFrame::Response(MeshDbResponse::Error {
+            call_id: plan_call_id,
+            error: MeshError::ExecutorError {
+                node: node_c,
+                detail: "spoofed".to_string(),
+            },
+        });
+        let err = dispatcher_a
+            .try_route(node_c, &spoof.encode().unwrap())
+            .expect_err("spoofed response must be rejected");
+        match err {
+            MeshDbRouteError::WrongPeer {
+                call_id,
+                expected,
+                actual,
+            } => {
+                assert_eq!(call_id, plan_call_id);
+                assert_eq!(expected, node_b);
+                assert_eq!(actual, node_c);
+            }
+            other => panic!("expected WrongPeer; got {other:?}"),
+        }
+
+        // B's legitimate response still arrives and the stream
+        // delivers exactly what the server produced.
+        let mut got = Vec::new();
+        while let Some(resp) = stream.next().await {
+            got.push(resp);
+        }
+        // Expect a terminal frame and no spoofed error to have
+        // leaked through.
+        assert!(
+            !got.iter().any(|r| matches!(
+                r,
+                MeshDbResponse::Error { error: MeshError::ExecutorError { detail, .. }, .. }
+                    if detail == "spoofed"
+            )),
+            "spoofed response must not be visible to the caller; got {got:?}",
+        );
     }
 }
