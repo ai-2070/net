@@ -4,7 +4,29 @@
 
 ## Status
 
-Design only. The features overview in [`MESHOS_FEATURES.md`](MESHOS_FEATURES.md) is the product brief; this doc is the implementation plan that turns it into shippable phases.
+**All seven phases (A through G) shipped behind the `meshos` Cargo feature**, plus the action executor + two source converters + the live snapshot reader. The features overview in [`MESHOS_FEATURES.md`](MESHOS_FEATURES.md) is the product brief; this doc has shipped its implementation plan as code.
+
+**Shipped surface** (gated behind `#[cfg(feature = "meshos")]` at `src/adapter/net/behavior/meshos/`):
+
+- **Phase A — `MeshOsLoop` skeleton.** Single-receiver event mux + heartbeat-cadence tick timer (default 500 ms) + reconcile pass + action queue. `MeshOsEvent` (12 variants), `MeshOsAction` (11 variants), `MeshOsState` + `DesiredState` folds, `MeshOsConfig` with sub-configs for backpressure / locality / maintenance. (`event.rs`, `action.rs`, `state.rs`, `config.rs`, `event_loop.rs`.)
+- **Phase B — Daemon supervision.** `BackoffTracker` runs the per-daemon restart gate (500 ms initial, doubling to 60 s cap; 5 crashes per rolling 60 s flips to `CrashLooping(5 min cooldown)`; stable-run reset). Reconcile emits `StartDaemon` / `StopDaemon { deadline = now + STOP_GRACE_PERIOD }` / `ApplyBackoff`. `MeshOsControl` (Instant-anchored) for the supervisor → daemon side-channel. (`supervision.rs`, `control.rs`.)
+- **Phase C — Replica enforcement.** Two arms — per-node `desired_local_replicas[chain] = Hold | Drop` drives `PullReplica` / `DropReplica`; cluster-wide `desired_replicas[chain] = N` drives `RequestPlacement` / `RequestEviction` from the elected leader only. Naive lex-smallest source/victim selection; the `MESH_SCHEDULER_PLAN` Phase D-1 refines with placement-score-based ranking.
+- **Phase D — Locality + admin events.** RTT samples above `degraded_rtt_threshold` (default 250 ms) emit `MarkAvoid`, gated by the per-peer avoid-list state. `AdminEvent::DropReplicas { node, chains }` projects to `desired_local_replicas[chain] = Drop` (one code path with the Phase C diff). `AdminEvent::ClearAvoidList` clears the fold. `LocalityConfig` tunables.
+- **Phase E — Maintenance state machine.** `MaintenanceState` enum: Active → EnteringMaintenance → Maintenance → ExitingMaintenance → Recovery → Active, with DrainFailed sideways arc. `MaintenanceConfig.recovery_ramp_window` (default 5 min). `MaintenanceTransitionObserved` event closes the chain-replay loop; `AdminEvent::EnterMaintenance` / `ExitMaintenance` are the operator entry points. (`maintenance.rs`.)
+- **Phase F — Behavior snapshot.** `MeshOsSnapshot` serializable projection (Instant fields flattened to relative milliseconds); `from_state(actual, desired, pending)` builder; postcard + JSON round-trip stability hatch. The live snapshot is published by the loop after every reconcile pass and exposed via `MeshOsSnapshotReader::read()`. (`snapshot.rs`.)
+- **Phase G — Backpressure.** Single `BackpressureState::admit(action, now, config) -> AdmissionResult` over every outbound action. Pull cooldown (250 ms), replica stabilization windows (60 s), per-daemon gate, drain rate-limit (10/s), cluster-wide hysteresis flag (1000 high / 200 low). (`backpressure.rs`.)
+- **Action executor.** `ActionExecutor` drains the queue, runs each action through admit, dispatches via a pluggable `ActionDispatcher` trait. `BinaryHeap`-ordered deferred re-queue for `AdmissionResult::Defer`; `DispatchError::retry(after)` re-enters through admit. `LoggingDispatcher` ships for tests / bootstrap. (`executor.rs`.)
+- **Source converters.** `DaemonRegistry` → `MeshOsDaemonLifecycleSink` (Phase B's daemon supervision feed) and `ReplicationCoordinator` → `MeshOsReplicaTransitionSink` (Phase C's replica feed). Generic `DaemonLifecycleObserver` and `ReplicaTransitionObserver` traits sit on the substrate side; MeshOS-side sinks adapt to the event loop. (`sources.rs`.)
+- **`MeshDaemon` trait extension.** Optional `health() -> DaemonHealth`, `saturation() -> f32`, `on_control(DaemonControl)` methods land on the trait itself (not feature-gated) with default impls. `DaemonHealth` is the canonical type re-exported into MeshOS; `DaemonControl` carries WASM-friendly relative-ms deadlines. `MeshOsControl::to_daemon_control(now)` bridges.
+
+**116 unit tests in the `meshos` module + 9 end-to-end pipeline integration tests + 13 daemon-registry + 9 daemon-trait + 15 replication-coordinator tests** (the latter three groups carry observer-hook regressions). Substrate builds clean both with and without `--features meshos`.
+
+**Remaining work** is bounded follow-ups, all consumer-driven:
+
+- **Proximity / heartbeat source converters.** Both follow the same `Observer + sink` pattern as the daemon and replication sources. The proximity converter needs an id-bridge (proximity uses `NodeId = [u8; 32]`; MeshOS uses `u64` for parity with MeshDB) — a substrate-internal hashing convention is the cleanest path.
+- **`MESH_SCHEDULER_PLAN.md` Phase D-1 body.** The continuous-rebalance scoring loop. The locality fold + avoid-list discipline from Phase D is the foundation it composes against; needs `PlacementFilter` integration on the score-driven path.
+- **`RedexFold<MeshOsSnapshot>` over the action chain.** The snapshot is queryable today via `MeshOsSnapshotReader::read()`; the CortEX fold form awaits a real action-chain commit path (the dispatcher would write `MeshOsAction` records to a chain; the fold consumes them).
+- **`MeshOsRuntime` stitching layer.** Bundles the loop + executor + dispatcher + reader into a single `start(config, dispatcher) -> Runtime` entry point. Today's consumers wire the three by hand — fine for one or two integrations, awkward at scale.
 
 Activation gate: a workload that actually exercises the reconciliation loop end-to-end — Dataforts placing replicas continuously, drain operations driving real evacuations, Deck consuming the behavior snapshot to render the cluster jungle. MeshOS without those consumers is a state machine looking for events to process; with them it is the cluster's nervous system.
 
@@ -19,12 +41,12 @@ Activation gate: a workload that actually exercises the reconciliation loop end-
 - **`CortexAdapter`** at `src/adapter/net/cortex/adapter.rs`. `watch` / `snapshot_and_watch` / `changes_with_lag()` — already the canonical Net → folded-state bridge. Phase F's Deck snapshot is one more `RedexFold` over MeshOS's own action stream.
 - **MeshDB** at `src/adapter/net/behavior/meshdb/`. Deck queries the behavior snapshot via MeshDB's federated executor. MeshOS does not duplicate the query layer.
 
-**Substrate gaps** that MeshOS introduces:
+**Substrate gaps that MeshOS closed:**
 
-- **No per-node canonical event loop today.** Every behavior subsystem (`ReplicationCoordinator`, `CortexAdapter`, `FederatedMeshQueryExecutor`) spawns its own `tokio` tasks. Phase A consolidates these into one `MeshOsLoop` per node — one stream → one reconcile → consistent actions. Existing subsystems become event *sources* into the loop, not independent reactors.
-- **No daemon health / saturation surface.** Phase B extends `MeshDaemon` with optional `health()` + `saturation()` methods (default impls return `Healthy` / `0.0`) and adds a `MeshOsControl` enum that supervised daemons receive (graceful shutdown, drain start, drain finish).
-- **No drain / cordon / maintenance metadata fields.** Phase D + E add `metadata.draining`, `metadata.drain_deadline`, `metadata.cordoned`, `metadata.maintenance_state` to the chain metadata surface. Drain signals propagate through RedEX, not RPC, so all nodes converge on identical interpretation.
-- **No `MESH_SCHEDULER_PLAN.md` implementation.** That plan's `LocalScheduler` design becomes the body of Phase D-1 here — same per-daemon score tracker, same hysteresis / cooldown / drain integration, but driven by the MeshOS event loop rather than its own task tree.
+- **The per-node canonical event loop now exists** at `behavior::meshos::event_loop::MeshOsLoop`. Existing subsystems become event sources via the `Observer + sink` pattern; the daemon registry and replication coordinator already ship their sinks (`MeshOsDaemonLifecycleSink`, `MeshOsReplicaTransitionSink`).
+- **`MeshDaemon` now has optional `health()` + `saturation()` + `on_control()` methods.** Default impls preserve source compatibility for every existing daemon. `DaemonHealth` lives in `compute::daemon`; `DaemonControl` is the WASM-friendly relative-duration form daemons receive.
+- **Drain / cordon / maintenance state machines run in MeshOS,** not the substrate metadata surface. The state machine in `behavior::meshos::maintenance` owns the transitions; admin chain commits ride existing `AdminEvent` variants in the loop's event stream. Operator-facing chain metadata fields land when an admin surface consumer drives the shape.
+- **`MESH_SCHEDULER_PLAN.md` Phase D-1 body** is the open follow-up: the continuous-rebalance scoring loop. The locality fold (Phase D's `MarkAvoid` emission, the avoid-list discipline, the `LocalityConfig` tunables) is in code as the foundation it composes against.
 
 ## Frame
 
