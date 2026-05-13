@@ -74,9 +74,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::error::MeshError;
 use super::executor::MeshQueryExecutor;
 use super::federated::{MeshDbTransport, ResponseStream, TransportError};
-use super::protocol::{
-    MeshDbFrame, MeshDbRequest, MeshDbResponse, ResultBatch,
-};
+use super::protocol::{MeshDbFrame, MeshDbRequest, MeshDbResponse, ResultBatch};
 
 /// Maximum number of `MeshDbResponse`s buffered per in-flight
 /// caller before the dispatcher's `try_route` reports the inbox
@@ -168,11 +166,7 @@ pub trait MeshDbWireSender: Send + Sync {
     /// underlying transport. Errors map to `TransportError` —
     /// `NoRoute` if the target isn't a known peer, `Other` for
     /// everything else.
-    async fn send_frame(
-        &self,
-        target_node: u64,
-        frame: MeshDbFrame,
-    ) -> Result<(), TransportError>;
+    async fn send_frame(&self, target_node: u64, frame: MeshDbFrame) -> Result<(), TransportError>;
 }
 
 /// State kept per in-flight outbound call. The dispatcher pushes
@@ -231,7 +225,6 @@ impl MeshDbWireDispatcher {
             inflight: self.inflight.clone(),
         })
     }
-
 }
 
 impl MeshDbInboundRouter for MeshDbWireDispatcher {
@@ -260,9 +253,7 @@ impl MeshDbInboundRouter for MeshDbWireDispatcher {
                     .get(&call_id)
                     .ok_or(MeshDbRouteError::UnknownCallId(call_id))?;
                 entry.tx.try_send(resp).map_err(|e| match e {
-                    mpsc::error::TrySendError::Full(_) => {
-                        MeshDbRouteError::InboxFull(call_id)
-                    }
+                    mpsc::error::TrySendError::Full(_) => MeshDbRouteError::InboxFull(call_id),
                     // Closed inbox = caller stream dropped =
                     // pretend we never saw the call_id so the
                     // dispatch logs the standard "no caller"
@@ -312,9 +303,7 @@ impl MeshDbTransport for MeshDbWireTransport {
         // could ship msg back before our caller-table entry is
         // visible and the response would be dropped as
         // UnknownCallId.
-        self.inflight
-            .write()
-            .insert(call_id, InflightCaller { tx });
+        self.inflight.write().insert(call_id, InflightCaller { tx });
         let send_result = self
             .sender
             .send_frame(node, MeshDbFrame::Request(request))
@@ -456,16 +445,7 @@ impl MeshDbServer {
                 let executor = self.executor.clone();
                 let inflight = self.inflight.clone();
                 tokio::spawn(async move {
-                    run_server_call(
-                        peer,
-                        call_id,
-                        plan,
-                        executor,
-                        sender,
-                        cancel,
-                        inflight,
-                    )
-                    .await;
+                    run_server_call(peer, call_id, plan, executor, sender, cancel, inflight).await;
                 });
             }
             MeshDbRequest::Cancel { call_id } => {
@@ -492,9 +472,8 @@ impl MeshDbServer {
                                 call_id,
                                 error: MeshError::ExecutorError {
                                     node: 0,
-                                    detail:
-                                        "Resume is not yet supported by the server side"
-                                            .to_string(),
+                                    detail: "Resume is not yet supported by the server side"
+                                        .to_string(),
                                 },
                             }),
                         )
@@ -543,7 +522,10 @@ async fn run_server_call(
             let _ = sender
                 .send_frame(
                     peer,
-                    MeshDbFrame::Response(MeshDbResponse::Error { call_id, error: err }),
+                    MeshDbFrame::Response(MeshDbResponse::Error {
+                        call_id,
+                        error: err,
+                    }),
                 )
                 .await;
             return;
@@ -659,11 +641,7 @@ impl MeshNodeMeshDbSender {
 
 #[async_trait]
 impl MeshDbWireSender for MeshNodeMeshDbSender {
-    async fn send_frame(
-        &self,
-        target_node: u64,
-        frame: MeshDbFrame,
-    ) -> Result<(), TransportError> {
+    async fn send_frame(&self, target_node: u64, frame: MeshDbFrame) -> Result<(), TransportError> {
         let mesh = self
             .mesh
             .upgrade()
@@ -728,18 +706,14 @@ mod tests {
 
     impl InMemoryWire {
         fn register(&self, local_node: u64, dispatcher: Arc<MeshDbWireDispatcher>) {
-            self.dispatchers
-                .lock()
-                .insert(local_node, dispatcher);
+            self.dispatchers.lock().insert(local_node, dispatcher);
         }
         fn set_local(&self, target_node: u64, local_node: u64) {
             // When we deliver to `target_node`, the receiving
             // dispatcher's `try_route` needs `from_node` =
             // `local_node` (i.e. our id from the target's
             // perspective).
-            self.from_node_of
-                .lock()
-                .insert(target_node, local_node);
+            self.from_node_of.lock().insert(target_node, local_node);
         }
     }
 
@@ -756,7 +730,9 @@ mod tests {
             target_node: u64,
             frame: MeshDbFrame,
         ) -> Result<(), TransportError> {
-            let bytes = frame.encode().map_err(|e| TransportError::Other(e.to_string()))?;
+            let bytes = frame
+                .encode()
+                .map_err(|e| TransportError::Other(e.to_string()))?;
             let dispatcher = self
                 .wire
                 .dispatchers
@@ -791,28 +767,14 @@ mod tests {
 
     impl ChainReader for InMemoryChainReader {
         fn read_one(&self, origin: u64, seq: SeqNum) -> Option<Vec<u8>> {
-            self.chains
-                .lock()
-                .unwrap()
-                .get(&origin)?
-                .get(&seq)
-                .cloned()
+            self.chains.lock().unwrap().get(&origin)?.get(&seq).cloned()
         }
-        fn read_range(
-            &self,
-            origin: u64,
-            start: SeqNum,
-            end: SeqNum,
-        ) -> Vec<(SeqNum, Vec<u8>)> {
+        fn read_range(&self, origin: u64, start: SeqNum, end: SeqNum) -> Vec<(SeqNum, Vec<u8>)> {
             self.chains
                 .lock()
                 .unwrap()
                 .get(&origin)
-                .map(|c| {
-                    c.range(start..end)
-                        .map(|(s, p)| (*s, p.clone()))
-                        .collect()
-                })
+                .map(|c| c.range(start..end).map(|(s, p)| (*s, p.clone())).collect())
                 .unwrap_or_default()
         }
         fn latest_seq(&self, origin: u64) -> Option<SeqNum> {
@@ -874,9 +836,10 @@ mod tests {
         // Build a federated executor on A whose transport is
         // dispatcher_a's; query the server on B for `Latest(0xCAFE)`.
         let transport_a = dispatcher_a.transport();
-        let fed_a = crate::adapter::net::behavior::meshdb::federated::FederatedMeshQueryExecutor::new(
-            transport_a,
-        );
+        let fed_a =
+            crate::adapter::net::behavior::meshdb::federated::FederatedMeshQueryExecutor::new(
+                transport_a,
+            );
         let plan = atomic_plan(OperatorPlan::LatestRead { origin: 0xCAFE });
         let running = fed_a
             .execute(plan)

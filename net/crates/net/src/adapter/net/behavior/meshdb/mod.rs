@@ -105,13 +105,13 @@ pub use planner::{
 pub use protocol::{
     ContinuationToken, MeshDbFrame, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,
 };
-pub use transport::{
-    enable_meshdb_on_mesh, MeshDbInboundRouter, MeshDbRouteError, MeshDbServer,
-    MeshDbWireDispatcher, MeshDbWireSender, MeshDbWireTransport, MeshNodeMeshDbSender,
-    MESHDB_RESPONSE_INBOX_CAPACITY, MESHDB_SERVER_BATCH_ROWS, MESHDB_SERVER_OUTBOX_CAPACITY,
-};
 pub use query::{
     AggregateFn, AggregateRowPayload, AggregateValue, ChainRef, Expr, GroupKey, JoinKey, JoinKind,
     JoinedRowPayload, MeshQuery, NumericAggregateKind, NumericReductionKind, OrderDir, OrderKey,
     QueryV1, ResultRow, SeqNum, WindowBoundary, WindowSpec,
+};
+pub use transport::{
+    enable_meshdb_on_mesh, MeshDbInboundRouter, MeshDbRouteError, MeshDbServer,
+    MeshDbWireDispatcher, MeshDbWireSender, MeshDbWireTransport, MeshNodeMeshDbSender,
+    MESHDB_RESPONSE_INBOX_CAPACITY, MESHDB_SERVER_BATCH_ROWS, MESHDB_SERVER_OUTBOX_CAPACITY,
 };

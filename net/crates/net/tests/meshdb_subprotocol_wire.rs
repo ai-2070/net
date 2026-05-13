@@ -17,11 +17,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use net::adapter::net::behavior::meshdb::planner::{CostEstimate, ExecutionPlan, OperatorNode};
 use net::adapter::net::behavior::meshdb::{
     enable_meshdb_on_mesh, ChainReader, FederatedMeshQueryExecutor, LocalMeshQueryExecutor,
     MeshDbServer, MeshQueryExecutor, OperatorPlan, SeqNum,
 };
-use net::adapter::net::behavior::meshdb::planner::{CostEstimate, ExecutionPlan, OperatorNode};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -87,23 +87,14 @@ impl InMemoryChainReader {
 
 impl ChainReader for InMemoryChainReader {
     fn read_one(&self, origin: u64, seq: SeqNum) -> Option<Vec<u8>> {
-        self.chains
-            .lock()
-            .unwrap()
-            .get(&origin)?
-            .get(&seq)
-            .cloned()
+        self.chains.lock().unwrap().get(&origin)?.get(&seq).cloned()
     }
     fn read_range(&self, origin: u64, start: SeqNum, end: SeqNum) -> Vec<(SeqNum, Vec<u8>)> {
         self.chains
             .lock()
             .unwrap()
             .get(&origin)
-            .map(|c| {
-                c.range(start..end)
-                    .map(|(s, p)| (*s, p.clone()))
-                    .collect()
-            })
+            .map(|c| c.range(start..end).map(|(s, p)| (*s, p.clone())).collect())
             .unwrap_or_default()
     }
     fn latest_seq(&self, origin: u64) -> Option<SeqNum> {
@@ -144,8 +135,7 @@ async fn federated_latest_query_over_real_wire() {
     // in-memory reader and install a MeshDbServer + dispatcher.
     let reader = Arc::new(InMemoryChainReader::default());
     reader.append(0xCAFE_BABE, SeqNum(7), b"hello-wire".to_vec());
-    let executor: Arc<dyn MeshQueryExecutor> =
-        Arc::new(LocalMeshQueryExecutor::new(reader));
+    let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
     let server = MeshDbServer::new(executor);
     let (_dispatcher_b, _transport_b) = enable_meshdb_on_mesh(&b, Some(server.clone()));
 
@@ -204,8 +194,7 @@ async fn federated_latest_query_over_wire_returns_empty_for_unknown_origin() {
     handshake(&a, &b).await;
 
     let reader = Arc::new(InMemoryChainReader::default()); // empty
-    let executor: Arc<dyn MeshQueryExecutor> =
-        Arc::new(LocalMeshQueryExecutor::new(reader));
+    let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
     let server = MeshDbServer::new(executor);
     let (_d, _t) = enable_meshdb_on_mesh(&b, Some(server));
 
@@ -213,7 +202,9 @@ async fn federated_latest_query_over_wire_returns_empty_for_unknown_origin() {
     let fed = FederatedMeshQueryExecutor::new(transport);
 
     let plan = atomic_plan(
-        OperatorPlan::LatestRead { origin: 0xDEAD_BEEF },
+        OperatorPlan::LatestRead {
+            origin: 0xDEAD_BEEF,
+        },
         b.node_id(),
     );
     let running = fed.execute(plan).await.expect("federated execute");
@@ -252,10 +243,7 @@ async fn federated_query_with_no_server_eventually_terminates() {
     let (_d_a, transport) = enable_meshdb_on_mesh(&a, None);
     let fed = FederatedMeshQueryExecutor::new(transport);
 
-    let plan = atomic_plan(
-        OperatorPlan::LatestRead { origin: 0xCAFE },
-        b.node_id(),
-    );
+    let plan = atomic_plan(OperatorPlan::LatestRead { origin: 0xCAFE }, b.node_id());
     let running = fed.execute(plan).await.expect("federated execute");
 
     use futures::StreamExt;
@@ -263,8 +251,7 @@ async fn federated_query_with_no_server_eventually_terminates() {
     // Caller waits up to 2 s for a row — none should arrive. Then
     // the caller drops the stream, which cleans up the dispatcher's
     // inflight entry via the ResponseStreamGuard.
-    let timeout_result =
-        tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
+    let timeout_result = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
     // Either the timeout fires (most likely — server silently drops
     // the request), or a `MeshError::QueryCancelled` arrives. Both
     // are acceptable "doesn't hang forever" outcomes.

@@ -316,11 +316,8 @@ struct DispatchCtx {
     /// shape as the replication router; the hot path takes a
     /// single read lock per `SUBPROTOCOL_MESHDB` packet.
     #[cfg(feature = "meshdb")]
-    meshdb_inbound_router: Arc<
-        parking_lot::RwLock<
-            Option<Arc<dyn super::behavior::meshdb::MeshDbInboundRouter>>,
-        >,
-    >,
+    meshdb_inbound_router:
+        Arc<parking_lot::RwLock<Option<Arc<dyn super::behavior::meshdb::MeshDbInboundRouter>>>>,
     /// Optional greedy-LRU observer. See the matching field doc on
     /// `MeshNode`. The hot path takes a single read lock on every
     /// standard-event packet; uncontended reads under
@@ -1411,11 +1408,8 @@ pub struct MeshNode {
     /// the replication router for the same reason — `dyn Trait`
     /// is `!Sized` and `ArcSwapOption` doesn't accept it.
     #[cfg(feature = "meshdb")]
-    meshdb_inbound_router: Arc<
-        parking_lot::RwLock<
-            Option<Arc<dyn super::behavior::meshdb::MeshDbInboundRouter>>,
-        >,
-    >,
+    meshdb_inbound_router:
+        Arc<parking_lot::RwLock<Option<Arc<dyn super::behavior::meshdb::MeshDbInboundRouter>>>>,
     /// Optional greedy-LRU observer. `Redex` installs one of these
     /// via [`Self::set_greedy_observer`] when the operator calls
     /// `Redex::enable_greedy_dataforts(mesh, cfg)`; subsequent
@@ -3619,9 +3613,7 @@ impl MeshNode {
         // installed = drop the frame silently (matches the
         // replication path's behaviour for unrouted channels).
         #[cfg(feature = "meshdb")]
-        if parsed.header.subprotocol_id
-            == super::behavior::meshdb::SUBPROTOCOL_MESHDB
-        {
+        if parsed.header.subprotocol_id == super::behavior::meshdb::SUBPROTOCOL_MESHDB {
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
             if events.is_empty() {
                 return;
