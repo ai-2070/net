@@ -1,0 +1,52 @@
+net/crates/net/sdk/src/lib.rs
+  s_3bbc444b3ef3e5::t_29e1e632ad597e 51-52
+net/crates/net/src/adapter/net/behavior/meshos/runtime.rs
+  s_3bbc444b3ef3e5::t_1605167eb0d2ab 147-156,158-168,188,192-194
+  s_3bbc444b3ef3e5::t_1c95c9873b8c4e 157
+net/crates/net/tests/meshos_pipeline.rs
+  s_3bbc444b3ef3e5::t_247d78d7414a26 654-738
+  s_3bbc444b3ef3e5::t_41cca444b22c4c 25-26
+net/crates/net/sdk/Cargo.toml
+  s_3bbc444b3ef3e5::t_1a656279110e43 79-85,91
+net/crates/net/sdk/src/meshos.rs
+  s_3bbc444b3ef3e5::t_5cc9e0e4b161bb 1-98,101-105
+  s_3bbc444b3ef3e5::t_fc45eabea2a909 99-100
+net/crates/net/src/adapter/net/behavior/meshos/mod.rs
+  s_3bbc444b3ef3e5::t_07b2968af27c1f 65
+  s_3bbc444b3ef3e5::t_24538fbdba371d 79
+  s_3bbc444b3ef3e5::t_499319739ebfee 100-104
+net/crates/net/src/adapter/net/behavior/meshos/control.rs
+  s_3bbc444b3ef3e5::t_f3ef316ebfa3c2 69-85
+net/crates/net/src/adapter/net/behavior/meshos/executor.rs
+  s_3bbc444b3ef3e5::t_93f4d59f5671c1 270-272
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_3bbc444b3ef3e5::t_2566c8d1172c69 114-153
+  s_3bbc444b3ef3e5::t_81cd29212cdabe 360-361
+  s_3bbc444b3ef3e5::t_bbf1084606e35a 590
+  s_3bbc444b3ef3e5::t_3069833cda44fa 562-589,591-603
+  s_3bbc444b3ef3e5::t_b1b355daaf22cc 411-422
+  s_3bbc444b3ef3e5::t_1150204fe84069 31,33
+net/crates/net/src/adapter/net/behavior/meshos/sdk.rs
+  s_3bbc444b3ef3e5::t_d2eba6fa12d1ca 541-550
+  s_3bbc444b3ef3e5::t_fea4794010271e 829-834,838-841
+  s_3bbc444b3ef3e5::t_f8b58bdfb6e205 1-172,178-338,371-540,551-705,707-828,835-837,842-980
+  s_3bbc444b3ef3e5::t_63498fd9cd2728 173-177
+  s_3bbc444b3ef3e5::t_2816beb5200b21 339-370
+  s_3bbc444b3ef3e5::t_5e98785040a6db 706
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "cb18309fa717232cfe3b3ef1b60e088ed6b3a75e",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
