@@ -112,7 +112,19 @@ pub enum ReplicaTransitionEvent {
     LeaderChanged {
         /// Substrate-level chain identifier.
         origin_hash: u64,
-        /// Wall time of the transition.
+        /// Monotonic timestamp of the transition.
+        at: Instant,
+    },
+    /// This coordinator stepped down from `Leader` to `Replica`
+    /// or `Idle`. MeshOS clears its mirror of
+    /// `MeshOsState::replica_leader[origin_hash]` when the
+    /// observer sees this — otherwise the loop would carry a
+    /// stale leader pointer until a different node's
+    /// `LeaderChanged` overwrites it.
+    LeaderLost {
+        /// Substrate-level chain identifier.
+        origin_hash: u64,
+        /// Monotonic timestamp of the transition.
         at: Instant,
     },
 }
@@ -420,6 +432,17 @@ impl ReplicationCoordinator {
                 | (ReplicaRole::Idle, ReplicaRole::Leader)
         ) {
             self.fire_transition(ReplicaTransitionEvent::LeaderChanged { origin_hash: origin, at });
+        }
+        // Step-down transitions surface as LeaderLost so the
+        // MeshOS sink can clear its `replica_leader` mirror —
+        // otherwise the loop would carry a stale pointer until
+        // a different node's LeaderChanged overwrites it.
+        if matches!(
+            (transition.from, transition.to),
+            (ReplicaRole::Leader, ReplicaRole::Replica)
+                | (ReplicaRole::Leader, ReplicaRole::Idle)
+        ) {
+            self.fire_transition(ReplicaTransitionEvent::LeaderLost { origin_hash: origin, at });
         }
 
         Ok(Some(transition))

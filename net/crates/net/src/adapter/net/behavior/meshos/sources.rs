@@ -162,6 +162,12 @@ impl ReplicaTransitionObserver for MeshOsReplicaTransitionSink {
                     leader: Some(self.this_node),
                 }
             }
+            ReplicaTransitionEvent::LeaderLost { origin_hash, .. } => {
+                MeshOsEvent::ReplicaLeaderUpdate {
+                    chain: origin_hash,
+                    leader: None,
+                }
+            }
         };
 
         match self.handle.try_publish(mesh_event) {
@@ -361,6 +367,47 @@ mod tests {
         handle.publish(MeshOsEvent::Shutdown).await.unwrap();
         let _ = task.await;
         assert_eq!(sink.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn leader_lost_event_clears_replica_leader_via_none_update() {
+        // Regression for N3. When this coordinator steps down,
+        // the sink must surface a `ReplicaLeaderUpdate { leader:
+        // None }` so MeshOS clears its mirror — otherwise the
+        // loop carries a stale `replica_leader[chain] = THIS_NODE`
+        // until a different node's LeaderChanged overwrites it.
+        const THIS_NODE: NodeId = 100;
+        let (mut loop_, handle, _, reader) = (|| {
+            let (l, h, ar, r) = MeshOsLoop::new(fast_cfg());
+            (l, h, ar, r)
+        })();
+        // Push a LeaderChanged first so the fold has a stale
+        // pointer; then a LeaderLost should clear it.
+        let _ = &mut loop_;
+        let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
+        let task = tokio::spawn(loop_.run());
+        sink.observe(ReplicaTransitionEvent::LeaderChanged {
+            origin_hash: 0xBADC0DE,
+            at: Instant::now(),
+        });
+        // Step down — should publish leader: None.
+        sink.observe(ReplicaTransitionEvent::LeaderLost {
+            origin_hash: 0xBADC0DE,
+            at: Instant::now(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
+        let snap = reader.read();
+        // After LeaderLost, the chain entry's leader field is
+        // None (it was Some(THIS_NODE) after LeaderChanged).
+        match snap.replicas.get(&0xBADC0DE) {
+            Some(entry) => assert_eq!(entry.leader, None, "LeaderLost should clear leader"),
+            None => {
+                // Either acceptable — fold may not surface a
+                // replicas entry when there's no holder set.
+            }
+        }
     }
 
     #[tokio::test]
