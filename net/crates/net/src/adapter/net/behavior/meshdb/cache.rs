@@ -29,7 +29,7 @@
 //! # Wire-key shape
 //!
 //! Plans are byte-identical-deterministic (locked decision
-//! #1). We postcard-encode the plan, run [`DefaultHasher`]
+//! #1). We postcard-encode the plan, run `DefaultHasher`
 //! (std-internal; not algorithm-stable across Rust releases,
 //! but stable within a binary) over the bytes, and pair the
 //! `u64` digest with the capability version. Hashing keeps
@@ -37,12 +37,12 @@
 //! lookups stay O(1).
 //!
 //! Not every plan is postcard-encodable — `Filter` /
-//! `Discovered` carry [`PredicateWire`](super::query::PredicateWire)
-//! which is `#[serde(tag = "kind")]` and falls outside
-//! postcard's supported subset. `for_plan` returns
-//! `Option<CacheKey>` so the executor can treat encode
-//! failures as a transparent cache bypass rather than a
-//! panic.
+//! `Discovered` carry a `PredicateWire` (from
+//! `crate::adapter::net::behavior::predicate`) which is
+//! `#[serde(tag = "kind")]` and falls outside postcard's
+//! supported subset on the decode side. `for_plan` returns
+//! `Option<CacheKey>` so the executor can treat any encode
+//! failure as a transparent cache bypass rather than a panic.
 //!
 //! # LRU mechanics
 //!

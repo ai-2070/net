@@ -160,17 +160,18 @@ pub struct RedexFileConfig {
     /// `cfg.validate().is_err()`.
     pub replication: Option<ReplicationConfig>,
 
-    /// Dataforts Phase 3 — id of the [`BlobAdapter`] this channel's
-    /// events resolve against when an event payload's first byte is
-    /// the `BlobRef` discriminator. `None` (default) means callers
-    /// of `RedexFile::resolve_one` MUST pass an adapter explicitly;
-    /// `Some(id)` lets them route through
-    /// `global_blob_adapter_registry()` automatically. The field is
-    /// advisory metadata at the RedEX layer — substrate reads still
-    /// return raw payload bytes; the resolution decision happens at
-    /// the convenience read helpers.
-    ///
-    /// [`BlobAdapter`]: super::super::dataforts::blob::BlobAdapter
+    /// Dataforts Phase 3 — id of the `BlobAdapter` (from the
+    /// `dataforts` module, gated behind the `dataforts`
+    /// feature) this channel's events resolve against when an
+    /// event payload's first byte is the `BlobRef`
+    /// discriminator. `None` (default) means callers of
+    /// `RedexFile::resolve_one` MUST pass an adapter
+    /// explicitly; `Some(id)` lets them route through
+    /// `global_blob_adapter_registry()` automatically. The
+    /// field is advisory metadata at the RedEX layer —
+    /// substrate reads still return raw payload bytes; the
+    /// resolution decision happens at the convenience read
+    /// helpers.
     pub blob_adapter_id: Option<String>,
 
     /// Per-channel override for the blob adapter registry. `None`
@@ -271,7 +272,8 @@ impl RedexFileConfig {
     }
 
     /// Set the dataforts blob adapter id used by
-    /// [`super::RedexFile::resolve_one`]. Pass `None` to clear.
+    /// `RedexFile::resolve_one` (under the `dataforts`
+    /// feature). Pass `None` to clear.
     pub fn with_blob_adapter_id(mut self, id: Option<String>) -> Self {
         self.blob_adapter_id = id;
         self
