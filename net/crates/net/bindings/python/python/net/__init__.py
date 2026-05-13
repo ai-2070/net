@@ -349,4 +349,34 @@ else:
     )
 
 
+# MeshDB surface (slice 1: factory AST + in-memory ChainReader +
+# sync runner + Phase F cache options). Present iff the native
+# module was built with the `meshdb` Cargo feature.
+try:
+    from ._net import (
+        CachePolicy,
+        ExecuteOptions,
+        InMemoryChainReader,
+        MeshDbError,
+        MeshQuery,
+        MeshQueryRunner,
+        ResultRow,
+    )
+except ImportError:
+    # `meshdb` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "CachePolicy",
+            "ExecuteOptions",
+            "InMemoryChainReader",
+            "MeshDbError",
+            "MeshQuery",
+            "MeshQueryRunner",
+            "ResultRow",
+        ]
+    )
+
+
 __version__ = "0.15.0"

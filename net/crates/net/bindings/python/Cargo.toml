@@ -42,6 +42,11 @@ nat-traversal = ["net", "net/nat-traversal"]
 # on `nat-traversal`.
 port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk", "dep:async-trait"]
+# MeshDB query layer — federated AST + planner + executor + result cache.
+# Standalone of the `net` feature: the Python SDK's first MeshDB slice
+# ships a local executor over an in-memory ChainReader, so it doesn't
+# require the mesh's transport surface to be compiled.
+meshdb = ["net/meshdb"]
 # Dataforts surface (Rebel Yell) — compile the operator
 # methods that wire greedy-LRU + data-gravity + future phases.
 # Toggling between greedy / gravity / future phases is a
