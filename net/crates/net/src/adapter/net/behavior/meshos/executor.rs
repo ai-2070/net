@@ -364,7 +364,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                 }
                 ExecutorStats::inc(&self.stats.deferred);
                 self.deferred.push(DeferredEntry {
-                    retry_at: now + retry_after,
+                    retry_at: now.checked_add(retry_after).unwrap_or(now),
                     action,
                     defer_count: next_count,
                 });
@@ -460,7 +460,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                     );
                     let now = Instant::now();
                     self.deferred.push(DeferredEntry {
-                        retry_at: now + after,
+                        retry_at: now.checked_add(after).unwrap_or(now),
                         action,
                         defer_count: next_count,
                     });

@@ -197,7 +197,9 @@ impl BackoffTracker {
         // longer cooldown.
         if self.crash_history.len() as u32 >= self.config.crash_loop_threshold {
             self.state = RestartState::CrashLooping {
-                until: now + self.config.crash_loop_cooldown,
+                until: now
+                    .checked_add(self.config.crash_loop_cooldown)
+                    .unwrap_or(now),
             };
             // Reset the per-restart backoff window so when the
             // cooldown elapses the daemon gets the initial
@@ -209,7 +211,7 @@ impl BackoffTracker {
         // Otherwise, advance to BackingOff with the current
         // window, then double it (capped at `max`) for the next
         // crash.
-        let until = now + self.next_backoff;
+        let until = now.checked_add(self.next_backoff).unwrap_or(now);
         self.state = RestartState::BackingOff { until };
         let doubled = self
             .next_backoff

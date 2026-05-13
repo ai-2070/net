@@ -109,7 +109,9 @@ impl BackpressureState {
                     }
                 }
                 if let Some(last) = self.last_pull_admitted {
-                    let next_admit = last + config.pull_cooldown;
+                    let next_admit = last
+                        .checked_add(config.pull_cooldown)
+                        .unwrap_or(last);
                     if next_admit > now {
                         return AdmissionResult::Defer {
                             retry_after: next_admit.saturating_duration_since(now),
@@ -118,7 +120,11 @@ impl BackpressureState {
                 }
                 self.last_pull_admitted = Some(now);
                 self.chain_stabilization
-                    .insert(*chain, now + config.replica_stabilization_window);
+                    .insert(
+                        *chain,
+                        now.checked_add(config.replica_stabilization_window)
+                            .unwrap_or(now),
+                    );
                 AdmissionResult::Admit
             }
             MeshOsAction::DropReplica { chain } => {
@@ -130,7 +136,11 @@ impl BackpressureState {
                     }
                 }
                 self.chain_stabilization
-                    .insert(*chain, now + config.replica_stabilization_window);
+                    .insert(
+                        *chain,
+                        now.checked_add(config.replica_stabilization_window)
+                            .unwrap_or(now),
+                    );
                 AdmissionResult::Admit
             }
             MeshOsAction::StartDaemon { daemon }

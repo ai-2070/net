@@ -120,7 +120,7 @@ fn diff_daemons(
                     out.push(MeshOsAction::StopDaemon {
                         daemon: daemon.clone(),
                         reason: "desired-state intent: Stop".to_string(),
-                        deadline: now + STOP_GRACE_PERIOD,
+                        deadline: now.checked_add(STOP_GRACE_PERIOD).unwrap_or(now),
                     });
                 }
                 DaemonLifecycle::Stopped | DaemonLifecycle::Stopping => {
