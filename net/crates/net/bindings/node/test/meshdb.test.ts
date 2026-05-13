@@ -889,16 +889,16 @@ d('MeshDB lineage_emit', () => {
       MeshQuery as unknown as {
         lineageEmit: (
           origin: bigint,
-          entries: Array<{ originHash: bigint; depth: number; tipSeq?: bigint | null }>,
+          entries: Array<{ originHash: bigint; depth: bigint; tipSeq?: bigint | null }>,
           direction: string,
         ) => InstanceType<typeof MeshQuery>;
       }
     ).lineageEmit(
       0xaan,
       [
-        { originHash: 0xaan, depth: 0, tipSeq: 5n },
-        { originHash: 0xbbn, depth: 1, tipSeq: 3n },
-        { originHash: 0xccn, depth: 2 },
+        { originHash: 0xaan, depth: 0n, tipSeq: 5n },
+        { originHash: 0xbbn, depth: 1n, tipSeq: 3n },
+        { originHash: 0xccn, depth: 2n },
       ],
       'back',
     );
@@ -918,11 +918,11 @@ d('MeshDB lineage_emit', () => {
       MeshQuery as unknown as {
         lineageEmit: (
           origin: bigint,
-          entries: Array<{ originHash: bigint; depth: number; tipSeq?: bigint | null }>,
+          entries: Array<{ originHash: bigint; depth: bigint; tipSeq?: bigint | null }>,
           direction: string,
         ) => InstanceType<typeof MeshQuery>;
       }
-    ).lineageEmit(0xaan, [{ originHash: 0xaan, depth: 0, tipSeq: 1n }], 'forward');
+    ).lineageEmit(0xaan, [{ originHash: 0xaan, depth: 0n, tipSeq: 1n }], 'forward');
     const stream = await runner.execute(q);
     const rows = await stream.toArray();
     expect(rows.map((r: { originHash: bigint; seq: bigint }) => [r.originHash, r.seq])).toEqual([
@@ -936,11 +936,11 @@ d('MeshDB lineage_emit', () => {
         MeshQuery as unknown as {
           lineageEmit: (
             origin: bigint,
-            entries: Array<{ originHash: bigint; depth: number }>,
+            entries: Array<{ originHash: bigint; depth: bigint }>,
             direction: string,
           ) => unknown;
         }
-      ).lineageEmit(0xaan, [{ originHash: 0xaan, depth: 0 }], 'sideways'),
+      ).lineageEmit(0xaan, [{ originHash: 0xaan, depth: 0n }], 'sideways'),
     ).toThrow();
   });
 
@@ -950,7 +950,7 @@ d('MeshDB lineage_emit', () => {
       MeshQuery as unknown as {
         lineageEmit: (
           origin: bigint,
-          entries: Array<{ originHash: bigint; depth: number }>,
+          entries: Array<{ originHash: bigint; depth: bigint }>,
           direction: string,
         ) => InstanceType<typeof MeshQuery>;
       }
@@ -958,6 +958,20 @@ d('MeshDB lineage_emit', () => {
     const stream = await runner.execute(q);
     const rows = await stream.toArray();
     expect(rows).toEqual([]);
+  });
+
+  it('rejects a depth that exceeds u32::MAX', () => {
+    expect(() =>
+      (
+        MeshQuery as unknown as {
+          lineageEmit: (
+            origin: bigint,
+            entries: Array<{ originHash: bigint; depth: bigint }>,
+            direction: string,
+          ) => unknown;
+        }
+      ).lineageEmit(0xaan, [{ originHash: 0xaan, depth: (1n << 33n) }], 'back'),
+    ).toThrow(/u32::MAX/);
   });
 });
 

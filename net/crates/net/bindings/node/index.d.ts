@@ -2149,13 +2149,19 @@ export interface JoinedRow {
  * `CapabilityIndex`, which isn't plumbed through the Node
  * runner yet. Callers maintain their own graph view and emit
  * entries in walk order: index 0 is the start origin with
- * `depth = 0`; ancestors / descendants follow.
+ * `depth = 0n`; ancestors / descendants follow.
  */
 export interface LineageEntry {
   /** Chain origin hash (substrate `u64`). */
   originHash: bigint
-  /** Hops from the walk's start. `0` for the start origin. */
-  depth: number
+  /**
+   * Hops from the walk's start. `0n` for the start origin.
+   * Substrate-side this is a `u32`; values outside that range
+   * are rejected at the `lineageEmit` factory. BigInt for
+   * shape parity with the other id-like fields on this
+   * struct.
+   */
+  depth: bigint
   /**
    * Best-known tip seq for this chain, if any. Surfaces in
    * the emitted row's `seq` field (defaults to `0` when
