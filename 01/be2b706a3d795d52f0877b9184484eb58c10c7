@@ -1,0 +1,26 @@
+net/crates/net/Cargo.toml
+  s_3a0a24a47d1a36::t_c993606610e30c 9
+net/crates/net/bindings/go/meshdb-ffi/Cargo.toml
+  s_3a0a24a47d1a36::t_07b12d540b57eb 1-36
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_3a0a24a47d1a36::t_eff9d5eca7d9d6 1-407,409-546
+  s_3a0a24a47d1a36::t_baf2c335e7e1de 408
+net/crates/net/bindings/go/net/meshdb.go
+  s_3a0a24a47d1a36::t_f5a35e7f16a9e3 1-347
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "01be2b706a3d795d52f0877b9184484eb58c10c7",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
