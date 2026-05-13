@@ -57,208 +57,135 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
 
+      # nextest gives us per-test process isolation, smarter scheduling,
+      # and `--no-fail-fast` semantics across grouped test binaries.
+      # Tests below are batched by feature set so cargo recompiles the
+      # library at most once per group instead of once per `--test` flag.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       # redis and jetstream integration tests are intentionally skipped:
       # `required-features = ["redis" | "jetstream"]` in Cargo.toml excludes
       # them from compilation under this feature set. Wire them in separately
       # once CI service containers are added.
 
-      # === Bus core (no features) =========================================
-      - name: Bus shutdown drain
+      # === Bus + FFI (no features) ========================================
+      - name: Bus + FFI
         if: ${{ !cancelled() }}
-        run: cargo test --test bus_shutdown_drain
-      - name: Bus stranded flush
-        if: ${{ !cancelled() }}
-        run: cargo test --test bus_stranded_flush
+        run: >
+          cargo nextest run --no-fail-fast
+          --test bus_shutdown_drain
+          --test bus_stranded_flush
+          --test ffi_shutdown_race
+          --test ffi_poll_buffer
 
-      # === FFI (no features) ==============================================
-      - name: FFI shutdown race
+      # === Net mesh + capability + discovery + migration + nRPC dispatch ==
+      # All --features net tests share one compile.
+      - name: Net mesh, capability, migration, nRPC dispatch
         if: ${{ !cancelled() }}
-        run: cargo test --test ffi_shutdown_race
-      - name: FFI poll buffer
-        if: ${{ !cancelled() }}
-        run: cargo test --test ffi_poll_buffer
-
-      # === Net mesh (transport / channel / peer / placement) ==============
-      - name: Net integration
-        if: ${{ !cancelled() }}
-        run: cargo test --test integration_net --features net
-      - name: Three-node integration
-        if: ${{ !cancelled() }}
-        run: cargo test --test three_node_integration --features net
-      - name: Channel auth
-        if: ${{ !cancelled() }}
-        run: cargo test --test channel_auth --features net
-      - name: Channel auth hardening
-        if: ${{ !cancelled() }}
-        run: cargo test --test channel_auth_hardening --features net
-      - name: Connect post-start
-        if: ${{ !cancelled() }}
-        run: cargo test --test connect_post_start --features net
-      - name: Failure detector matrix
-        if: ${{ !cancelled() }}
-        run: cargo test --test failure_detector_matrix --features net
-      - name: Parallel bind stress
-        if: ${{ !cancelled() }}
-        run: cargo test --test parallel_bind_stress --features net
-      - name: Peer-death evicts peer map
-        if: ${{ !cancelled() }}
-        run: cargo test --test peer_death_evicts_peer_map --features net
-      - name: Send subprotocol malformed
-        if: ${{ !cancelled() }}
-        run: cargo test --test send_subprotocol_malformed --features net
-      - name: Subnet enforcement
-        if: ${{ !cancelled() }}
-        run: cargo test --test subnet_enforcement --features net
-      - name: Placement-filter callback integration
-        if: ${{ !cancelled() }}
-        run: cargo test --test integration_placement_filter_callback --features net
-
-      # === Capability & discovery =========================================
-      - name: Capability broadcast
-        if: ${{ !cancelled() }}
-        run: cargo test --test capability_broadcast --features net
-      - name: Capability multihop
-        if: ${{ !cancelled() }}
-        run: cargo test --test capability_multihop --features net
-      - name: Capability scope
-        if: ${{ !cancelled() }}
-        run: cargo test --test capability_scope --features net
-      - name: Capability schema doc guard
-        if: ${{ !cancelled() }}
-        run: cargo test --test capability_schema_doc_guard --features net
-      - name: Chain discovery
-        if: ${{ !cancelled() }}
-        run: cargo test --test chain_discovery --features net
-      - name: Cross-lang capability fixtures
-        if: ${{ !cancelled() }}
-        run: cargo test --test cross_lang_capability_fixtures --features net
+        run: >
+          cargo nextest run --no-fail-fast --features net
+          --test integration_net
+          --test three_node_integration
+          --test channel_auth
+          --test channel_auth_hardening
+          --test connect_post_start
+          --test failure_detector_matrix
+          --test parallel_bind_stress
+          --test peer_death_evicts_peer_map
+          --test send_subprotocol_malformed
+          --test subnet_enforcement
+          --test integration_placement_filter_callback
+          --test capability_broadcast
+          --test capability_multihop
+          --test capability_scope
+          --test capability_schema_doc_guard
+          --test chain_discovery
+          --test cross_lang_capability_fixtures
+          --test migration_integration
+          --test migration_target_failure_mid_chunking
+          --test nrpc_inbound_dispatcher
+          --test queue_group_dispatch
 
       # === NAT traversal ==================================================
-      - name: Connect direct
+      - name: NAT traversal
         if: ${{ !cancelled() }}
-        run: cargo test --test connect_direct --features "net nat-traversal"
-      - name: NAT classify
-        if: ${{ !cancelled() }}
-        run: cargo test --test nat_classify --features "net nat-traversal"
-      - name: Peer-death clears capability index
-        if: ${{ !cancelled() }}
-        run: cargo test --test peer_death_clears_capability_index --features "net nat-traversal"
-      - name: Punch keepalive
-        if: ${{ !cancelled() }}
-        run: cargo test --test punch_keepalive --features "net nat-traversal"
-      - name: Punch keepalive timing
-        if: ${{ !cancelled() }}
-        run: cargo test --test punch_keepalive_timing --features "net nat-traversal"
-      - name: Reflex probe
-        if: ${{ !cancelled() }}
-        run: cargo test --test reflex_probe --features "net nat-traversal"
-      - name: Reflex override
-        if: ${{ !cancelled() }}
-        run: cargo test --test reflex_override --features "net nat-traversal"
-      - name: Rendezvous ack
-        if: ${{ !cancelled() }}
-        run: cargo test --test rendezvous_ack --features "net nat-traversal"
-      - name: Rendezvous coordinator
-        if: ${{ !cancelled() }}
-        run: cargo test --test rendezvous_coordinator --features "net nat-traversal"
+        run: >
+          cargo nextest run --no-fail-fast --features "net nat-traversal"
+          --test connect_direct
+          --test nat_classify
+          --test peer_death_clears_capability_index
+          --test punch_keepalive
+          --test punch_keepalive_timing
+          --test reflex_probe
+          --test reflex_override
+          --test rendezvous_ack
+          --test rendezvous_coordinator
 
       # === Port mapping (UPnP-IGD / NAT-PMP / PCP) ========================
-      - name: Port mapping null
+      - name: Port mapping
         if: ${{ !cancelled() }}
-        run: cargo test --test port_mapping_null --features "net port-mapping"
-      - name: Port mapping real router
-        if: ${{ !cancelled() }}
-        run: cargo test --test port_mapping_real_router --features "net port-mapping"
-
-      # === Mikoshi (migration) ============================================
-      - name: Mikoshi integration
-        if: ${{ !cancelled() }}
-        run: cargo test --test migration_integration --features net
-      - name: Mikoshi target-failure mid-chunking
-        if: ${{ !cancelled() }}
-        run: cargo test --test migration_target_failure_mid_chunking --features net
+        run: >
+          cargo nextest run --no-fail-fast --features "net port-mapping"
+          --test port_mapping_null
+          --test port_mapping_real_router
 
       # === RedEX ==========================================================
-      - name: RedEX integration
+      # `redex` chains to `net` in Cargo.toml (redex = ["net", ...]) so a
+      # single --features redex covers the e2e suite as well.
+      - name: RedEX
         if: ${{ !cancelled() }}
-        run: cargo test --test integration_redex --features redex
-      - name: RedEX replication e2e (real-wire two/three-node)
-        # Pulls in the `net` feature because the e2e suite uses
-        # `MeshNode` + `MeshNodeConfig` for the real-wire NKpsk0
-        # handshake. The `redex` feature is the actual gate (the
-        # tests are `#![cfg(feature = "redex")]`).
-        if: ${{ !cancelled() }}
-        run: cargo test --test redex_replication_e2e --features "redex net"
-      - name: RedEX replication DST (deterministic simulation)
-        # Single-threaded harness; doesn't need `net` — runs the
-        # production state machine + election + catch-up + tracker
-        # logic against virtual nodes with explicit clock + message
-        # queue + partition matrix.
-        if: ${{ !cancelled() }}
-        run: cargo test --test redex_replication_dst --features redex
+        run: >
+          cargo nextest run --no-fail-fast --features redex
+          --test integration_redex
+          --test redex_replication_dst
+          --test redex_replication_e2e
 
-      # === CortEX =========================================================
-      - name: CortEX adapter integration
+      # === CortEX + nRPC service surface ==================================
+      - name: CortEX + nRPC
         if: ${{ !cancelled() }}
-        run: cargo test --test integration_cortex_adapter --features cortex
-      - name: CortEX tasks integration
-        if: ${{ !cancelled() }}
-        run: cargo test --test integration_cortex_tasks --features cortex
-      - name: CortEX memories integration
-        if: ${{ !cancelled() }}
-        run: cargo test --test integration_cortex_memories --features cortex
-      - name: CortEX RYW global cap
-        if: ${{ !cancelled() }}
-        run: cargo test --test cortex_ryw_global_cap --features cortex
+        run: >
+          cargo nextest run --no-fail-fast --features cortex
+          --test integration_cortex_adapter
+          --test integration_cortex_tasks
+          --test integration_cortex_memories
+          --test cortex_ryw_global_cap
+          --test integration_nrpc_loopback
+          --test integration_nrpc_mesh
+          --test integration_nrpc_streaming
+          --test integration_nrpc_service_discovery
+          --test integration_nrpc_predicate_header
+          --test integration_nrpc_cross_lang
 
       # === NetDB ==========================================================
-      - name: NetDB integration
+      - name: NetDB
         if: ${{ !cancelled() }}
-        run: cargo test --test integration_netdb --features netdb
+        run: cargo nextest run --no-fail-fast --features netdb --test integration_netdb
 
-      # === nRPC ===========================================================
-      - name: nRPC inbound dispatcher
+      # === Dataforts (greedy + gravity) ===================================
+      - name: Dataforts greedy + gravity
         if: ${{ !cancelled() }}
-        run: cargo test --test nrpc_inbound_dispatcher --features net
-      - name: nRPC queue-group dispatch
-        if: ${{ !cancelled() }}
-        run: cargo test --test queue_group_dispatch --features net
-      - name: nRPC loopback
-        if: ${{ !cancelled() }}
-        run: cargo test --test integration_nrpc_loopback --features cortex
-      - name: nRPC mesh
-        if: ${{ !cancelled() }}
-        run: cargo test --test integration_nrpc_mesh --features cortex
-      - name: nRPC streaming
-        if: ${{ !cancelled() }}
-        run: cargo test --test integration_nrpc_streaming --features cortex
-      - name: nRPC service discovery
-        if: ${{ !cancelled() }}
-        run: cargo test --test integration_nrpc_service_discovery --features cortex
-      - name: nRPC predicate-header integration
-        if: ${{ !cancelled() }}
-        run: cargo test --test integration_nrpc_predicate_header --features cortex
-      - name: nRPC cross-lang
-        if: ${{ !cancelled() }}
-        run: cargo test --test integration_nrpc_cross_lang --features cortex
+        run: >
+          cargo nextest run --no-fail-fast --features dataforts
+          --test dataforts_greedy_e2e
+          --test dataforts_gravity_e2e
 
-      # === Dataforts ======================================================
-      - name: Dataforts net-blob CLI tests
+      # === Dataforts blob e2e (multi-node + migration) ====================
+      # `redex-disk` is required so MeshBlobAdapter can spin up a real
+      # on-disk RedEX per node — separate from the in-memory dataforts
+      # group above so the on-disk paths get compiled.
+      - name: Dataforts blob e2e
         if: ${{ !cancelled() }}
-        run: cargo test --test net_blob_cli --features dataforts,cli
-      - name: Dataforts blob e2e (multi-node + migration)
-        # The blob e2e suite includes the 3-node parallel migration
-        # scenario in `three_node_parallel_migration_lands_blob_on_two_peers`.
-        # `redex-disk` is required so MeshBlobAdapter can spin up a
-        # real on-disk RedEX per node.
+        run: cargo nextest run --no-fail-fast --features "dataforts redex-disk" --test dataforts_blob_e2e
+
+      # === Dataforts net-blob CLI =========================================
+      # Pulls in clap via the `cli` feature; kept separate so the
+      # non-CLI dataforts groups don't pay the clap compile cost.
+      - name: Dataforts net-blob CLI
         if: ${{ !cancelled() }}
-        run: cargo test --test dataforts_blob_e2e --features dataforts,redex-disk
-      - name: Dataforts greedy e2e (cache + speculative pull)
-        if: ${{ !cancelled() }}
-        run: cargo test --test dataforts_greedy_e2e --features dataforts
-      - name: Dataforts gravity e2e
-        if: ${{ !cancelled() }}
-        run: cargo test --test dataforts_gravity_e2e --features dataforts
+        run: cargo nextest run --no-fail-fast --features "dataforts cli" --test net_blob_cli
 
   loom-tests:
     name: Loom concurrency models
