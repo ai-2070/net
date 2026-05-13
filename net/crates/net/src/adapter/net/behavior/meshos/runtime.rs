@@ -266,9 +266,10 @@ impl MeshOsRuntime {
             .await
             .map_err(|_| RuntimeShutdownError::LoopTimeout)?
             .map_err(RuntimeShutdownError::LoopJoinError)?;
-        // Drop the handle so the executor's mpsc receiver sees
-        // None and exits. Replace with a closed sender clone so
-        // the `Drop` path doesn't fault.
+        // The loop just published `MeshOsEvent::Shutdown`, exited
+        // its run body, and dropped its `actions_tx`. The executor's
+        // `actions_rx.recv()` therefore returns `None` next pop,
+        // and `ActionExecutor::run` returns its accumulated stats.
         let exec_task = self
             .exec_task
             .take()
