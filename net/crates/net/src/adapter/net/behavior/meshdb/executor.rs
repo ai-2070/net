@@ -2937,11 +2937,7 @@ mod tests {
         let reader = Arc::new(InMemoryChainReader::default());
         reader.append(chain, SeqNum(1), r#"{"user":"日本語"}"#.as_bytes().to_vec());
         reader.append(chain, SeqNum(2), r#"{"user":"café"}"#.as_bytes().to_vec());
-        reader.append(
-            chain,
-            SeqNum(3),
-            r#"{"user":"👨‍👩‍👧‍👦"}"#.as_bytes().to_vec(),
-        );
+        reader.append(chain, SeqNum(3), r#"{"user":"👨‍👩‍👧‍👦"}"#.as_bytes().to_vec());
         reader.append(chain, SeqNum(4), br#"{"user":"plain"}"#.to_vec());
         let executor = LocalMeshQueryExecutor::new(reader);
 
@@ -3082,9 +3078,7 @@ mod tests {
         // (`aggregate_count_empty_input_returns_zero`); this is
         // the symmetric assertion that groups don't fabricate
         // empty buckets.
-        use crate::adapter::net::behavior::meshdb::planner::{
-            CostEstimate, JoinKeyMode,
-        };
+        use crate::adapter::net::behavior::meshdb::planner::{CostEstimate, JoinKeyMode};
 
         let chain = 0xAA;
         let reader = Arc::new(InMemoryChainReader::default());

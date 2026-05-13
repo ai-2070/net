@@ -550,8 +550,7 @@ impl MeshDbServer {
                 // straight to `QueryCancelled` rather than driving
                 // the executor and racing the cancel into the
                 // tokio::select! arm in `run_server_call`.
-                let cancelled_early =
-                    self.pending_cancels.write().remove(&(peer, call_id));
+                let cancelled_early = self.pending_cancels.write().remove(&(peer, call_id));
                 if cancelled_early {
                     let sender_clone = sender.clone();
                     tokio::spawn(async move {

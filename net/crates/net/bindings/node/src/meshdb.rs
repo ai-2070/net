@@ -58,9 +58,9 @@ use net::adapter::net::behavior::meshdb::{
     query::{
         clamp_join_watermark_secs, AggregateRowPayload as InnerAggregateRowPayload,
         AggregateValue as InnerAggregateValue, GroupKey as InnerGroupKey,
-        JoinKind as InnerJoinKind, JoinedRowPayload as InnerJoinedRowPayload,
-        NumericAggregateKind, NumericReductionKind, ResultRow as InnerResultRow,
-        WindowBoundary as InnerWindowBoundary, WindowSpec,
+        JoinKind as InnerJoinKind, JoinedRowPayload as InnerJoinedRowPayload, NumericAggregateKind,
+        NumericReductionKind, ResultRow as InnerResultRow, WindowBoundary as InnerWindowBoundary,
+        WindowSpec,
     },
     ExecutionPlan, SeqNum,
 };

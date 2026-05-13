@@ -766,7 +766,10 @@ mod tests {
     #[test]
     fn clamp_join_watermark_passes_through_finite_non_negative_seconds() {
         assert_eq!(clamp_join_watermark_secs(Some(0.0)), Duration::from_secs(0));
-        assert_eq!(clamp_join_watermark_secs(Some(2.5)), Duration::from_secs_f64(2.5));
+        assert_eq!(
+            clamp_join_watermark_secs(Some(2.5)),
+            Duration::from_secs_f64(2.5)
+        );
         assert_eq!(
             clamp_join_watermark_secs(Some(300.0)),
             Duration::from_secs(300),
