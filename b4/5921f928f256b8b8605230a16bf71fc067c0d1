@@ -1,0 +1,47 @@
+net/crates/net/src/adapter/net/behavior/meshos/state.rs
+  s_3bbc444b3ef3e5::t_aae5dc6221475f 419-421,429-430,451,491,510
+  s_3bbc444b3ef3e5::t_c897a2b7c54eb5 264,271-275,277,280-285,290-299
+  s_3bbc444b3ef3e5::t_294e64dbec5063 46-50
+  s_3bbc444b3ef3e5::t_a8a57869d8f864 466
+  s_3bbc444b3ef3e5::t_3e7cb07d253a3f 499-505
+  s_3bbc444b3ef3e5::t_466b8c55b2eeaf 21
+  s_3bbc444b3ef3e5::t_b29b93655d7daa 516-598
+  s_3bbc444b3ef3e5::t_45184f4bc58bf9 143-147,179,188-217
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_3bbc444b3ef3e5::t_deae30aeb80ae7 233
+  s_3bbc444b3ef3e5::t_7e7d182bf69ebc 190
+  s_3bbc444b3ef3e5::t_b0203a6a9887d7 199
+net/crates/net/src/adapter/net/behavior/meshos/mod.rs
+  s_3bbc444b3ef3e5::t_b47fcc18d5198d 57,63-64
+net/crates/net/src/adapter/net/behavior/meshos/event.rs
+  s_3bbc444b3ef3e5::t_4a5f167937e82c 108-121
+net/crates/net/src/adapter/net/behavior/meshos/reconcile.rs
+  s_3bbc444b3ef3e5::t_cd6e2ca797263c 1029-1280
+  s_3bbc444b3ef3e5::t_4106fe84804b6a 46,59
+  s_3bbc444b3ef3e5::t_8fc140fb05ec00 21-22,24
+  s_3bbc444b3ef3e5::t_ae34f7b1c6253f 236-314
+  s_3bbc444b3ef3e5::t_da8c2738ff5426 365-371,380-393,420-426,437-443,459-465,478-484,499-505,526-532,552-558,586-592,611-617,640-653,672-678,696-702,713-719,731-737,751-757,767-773,790-796,814-820,832-838,848-854,866-872,887-893,909-915,929-935,965-971,994-1000,1294-1300
+  s_3bbc444b3ef3e5::t_9b1162966dd195 1013-1019
+net/crates/net/src/adapter/net/behavior/meshos/config.rs
+  s_3bbc444b3ef3e5::t_21a6db4a7a49f3 45-48
+  s_3bbc444b3ef3e5::t_3ccb12deb7f923 60
+  s_3bbc444b3ef3e5::t_1f4652ee8be9c2 131-153
+net/crates/net/src/adapter/net/behavior/meshos/maintenance.rs
+  s_3bbc444b3ef3e5::t_3eee2b3157c3f8 1-164
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b45921f928f256b8b8605230a16bf71fc067c0d1",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
