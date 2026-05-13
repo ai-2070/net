@@ -14,7 +14,7 @@
 //! - unregistered channels still flow through the shard queue
 //!   (back-compat with all existing pub/sub consumers)
 
-#![cfg(feature = "net")]
+#![cfg(all(feature = "net", feature = "cortex"))]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
