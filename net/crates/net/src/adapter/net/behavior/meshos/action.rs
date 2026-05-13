@@ -58,6 +58,15 @@ impl AllocateActionId {
 /// `mark_avoid` / `apply_backoff`) plus the maintenance-state
 /// transitions Phase E drives.
 ///
+/// **`Instant`-typed deadlines are process-local.** `StopDaemon`
+/// and `ApplyBackoff` carry `std::time::Instant`, which is
+/// monotonic-per-process and not portable across nodes. These
+/// actions are produced and consumed inside one MeshOS process;
+/// the chain-recorded form (`ActionChainRecord`) flattens
+/// deadlines to Unix-epoch ms for cross-node replay. Don't move
+/// an in-process `MeshOsAction` over the wire — go through the
+/// chain record.
+///
 /// `#[non_exhaustive]` so phases B–G land their handlers without
 /// breaking downstream matches.
 #[derive(Clone, Debug, PartialEq)]
