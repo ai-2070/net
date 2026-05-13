@@ -297,7 +297,13 @@ impl MeshOsLoop {
             TokioInstant::now() + self.config.tick_interval,
             self.config.tick_interval,
         );
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // `Delay` over `Skip`: under load the reconcile cadence
+        // drifts but no tick is silently dropped, so the loop
+        // never falls behind on probe + reconcile passes that
+        // would surface stale state. `Burst` would amplify a
+        // backlog, which is what the locked-decision-1 "one
+        // pass per tick" guarantee is designed to prevent.
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
