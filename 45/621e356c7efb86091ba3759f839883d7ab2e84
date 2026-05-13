@@ -1,0 +1,38 @@
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_3bbc444b3ef3e5::t_c0a3a5928f9d33 502-546
+  s_3bbc444b3ef3e5::t_d4fceadf482ca8 286-291
+  s_3bbc444b3ef3e5::t_933c844f129f9c 1379-1384
+  s_3bbc444b3ef3e5::t_c432518a1a4460 349-355,362-372,378-381
+  s_3bbc444b3ef3e5::t_967b2f592b1b73 602-646
+  s_3bbc444b3ef3e5::t_c1377bdfe45940 1090-1105
+  s_3bbc444b3ef3e5::t_1963ab8a4226b0 760-776
+  s_3bbc444b3ef3e5::t_cfe21054139b6a 471-484
+  s_3bbc444b3ef3e5::t_6654cc53ce0ad0 1151-1156
+  s_3bbc444b3ef3e5::t_2d0de04fb3575b 151-180
+  s_3bbc444b3ef3e5::t_0b5745178045c8 899-912,921-926
+  s_3bbc444b3ef3e5::t_b629e266ab4c54 561-579
+  s_3bbc444b3ef3e5::t_50544ab8f378dc 1123-1141
+  s_3bbc444b3ef3e5::t_9e748b0f1ede5c 1913-1939
+  s_3bbc444b3ef3e5::t_7b922e76589bee 262-266
+  s_3bbc444b3ef3e5::t_9249b1367ee398 314-335
+  s_3bbc444b3ef3e5::t_f1765fd1c131f1 447-457
+  s_3bbc444b3ef3e5::t_22440f014eae3c 1035-1040
+  s_3bbc444b3ef3e5::t_437515e417cc90 664-665,667-668,671,674-679,682-683,685-715,717-718
+  s_3bbc444b3ef3e5::t_3d1a35ad149d1f 1322-1352,1363-1369
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "45621e356c7efb86091ba3759f839883d7ab2e84",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
