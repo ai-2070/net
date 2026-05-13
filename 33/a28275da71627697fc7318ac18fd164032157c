@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/behavior/meshdb/federated.rs
+  s_3bbc444b3ef3e5::t_f56f5834c8b745 111-122,148-152,154
+  s_3bbc444b3ef3e5::t_6fdc4a6dd3431a 1721-1738
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.7",
+  "base_commit_sha": "33a28275da71627697fc7318ac18fd164032157c",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
