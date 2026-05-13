@@ -26,6 +26,7 @@ use tokio::time::{interval_at, Instant as TokioInstant, MissedTickBehavior};
 use super::action::{AllocateActionId, PendingAction};
 use super::config::MeshOsConfig;
 use super::event::MeshOsEvent;
+use super::probes::{HealthProbe, LocalityProbe};
 use super::reconcile::reconcile;
 use super::snapshot::MeshOsSnapshot;
 use super::state::{DesiredState, MeshOsState};
@@ -69,9 +70,59 @@ pub struct MeshOsLoop {
     /// from it before clearing.
     pending_snapshot_actions: Vec<PendingAction>,
 
+    /// Pull-via-tick probes the loop polls on each Tick. Shared
+    /// with the [`ProbeRegistry`] so consumers can install
+    /// probes after `MeshOsLoop::new` (the runtime in particular
+    /// spawns the loop immediately and attaches probes via the
+    /// registry).
+    probes: ProbeRegistryInner,
+
     /// Reconcile-pass counter — used by tests / diagnostics to
     /// confirm reconcile fired exactly once per Tick.
     reconcile_count: u64,
+}
+
+/// Inner shared cell — `Vec`s of probes behind an
+/// `Arc<RwLock>` so the runtime + loop see the same set.
+#[derive(Clone, Default)]
+struct ProbeRegistryInner {
+    locality: Arc<parking_lot::RwLock<Vec<Arc<dyn LocalityProbe>>>>,
+    health: Arc<parking_lot::RwLock<Vec<Arc<dyn HealthProbe>>>>,
+}
+
+/// External handle for attaching probes to the loop after
+/// `MeshOsLoop::new` has consumed the loop (e.g. the runtime
+/// spawned it as a tokio task). Clone-shared with the loop.
+#[derive(Clone, Default)]
+pub struct ProbeRegistry {
+    inner: ProbeRegistryInner,
+}
+
+impl ProbeRegistry {
+    /// Construct an empty registry. The loop reads through this
+    /// instance after [`MeshOsLoop::with_probe_registry`]
+    /// installs it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install a [`LocalityProbe`]. Probes are polled by the
+    /// loop in registration order, once per Tick.
+    pub fn add_locality_probe(&self, probe: Arc<dyn LocalityProbe>) {
+        self.inner.locality.write().push(probe);
+    }
+
+    /// Install a [`HealthProbe`]. Probes are polled by the loop
+    /// in registration order, once per Tick.
+    pub fn add_health_probe(&self, probe: Arc<dyn HealthProbe>) {
+        self.inner.health.write().push(probe);
+    }
+
+    /// Count of installed probes. Diagnostic; useful for the
+    /// runtime's startup-readiness check.
+    pub fn probe_counts(&self) -> (usize, usize) {
+        (self.inner.locality.read().len(), self.inner.health.read().len())
+    }
 }
 
 /// Read-only handle to the loop's most recent snapshot.
@@ -174,9 +225,20 @@ impl MeshOsLoop {
             desired: DesiredState::default(),
             snapshot,
             pending_snapshot_actions: Vec::new(),
+            probes: ProbeRegistryInner::default(),
             reconcile_count: 0,
         };
         (me, handle, actions_rx, reader)
+    }
+
+    /// Attach a probe registry. The loop polls each registered
+    /// probe on every Tick, before reconcile. The registry is
+    /// shareable + cloneable, so callers retain it to add probes
+    /// after `MeshOsLoop::new` returns (the loop has been moved
+    /// into the spawned task at that point).
+    pub fn with_probe_registry(mut self, registry: ProbeRegistry) -> Self {
+        self.probes = registry.inner;
+        self
     }
 
     /// Drive the loop until either:
@@ -211,12 +273,35 @@ impl MeshOsLoop {
                     // it through the same `apply` path so the
                     // `last_tick` fold field updates uniformly.
                     self.apply(&MeshOsEvent::Tick);
+                    // Pull-via-tick probes — folded BEFORE
+                    // reconcile so the reconcile pass sees the
+                    // latest samples in this tick window.
+                    self.poll_probes();
                     self.run_reconcile().await;
                 }
             }
         }
 
         self.reconcile_count
+    }
+
+    /// Poll every registered locality / health probe and fold
+    /// the samples into the actual-state view. Idempotent — the
+    /// folds overwrite per-peer entries, so a re-poll within
+    /// the same tick produces the same state.
+    fn poll_probes(&mut self) {
+        let locality = self.probes.locality.read().clone();
+        for probe in &locality {
+            for (peer, rtt) in probe.rtt_samples() {
+                self.actual.rtt.insert(peer, rtt);
+            }
+        }
+        let health = self.probes.health.read().clone();
+        for probe in &health {
+            for (peer, hc) in probe.health_samples() {
+                self.actual.node_health.insert(peer, hc);
+            }
+        }
     }
 
     fn apply(&mut self, event: &MeshOsEvent) {
@@ -349,6 +434,104 @@ mod tests {
         // 4–7 reconcile passes; require at least 2 so a slow CI
         // host doesn't flake.
         assert!(count >= 2, "expected at least 2 reconcile passes, got {count}");
+    }
+
+    #[tokio::test]
+    async fn locality_probe_samples_fold_into_actual_rtt_via_snapshot() {
+        // A LocalityProbe is polled on every Tick; its samples
+        // land in MeshOsState::rtt; the snapshot's peers map
+        // surfaces them.
+        struct FixedProbe(Vec<(u64, std::time::Duration)>);
+        impl super::super::probes::LocalityProbe for FixedProbe {
+            fn rtt_samples(&self) -> Vec<(u64, std::time::Duration)> {
+                self.0.clone()
+            }
+        }
+
+        let registry = ProbeRegistry::new();
+        registry.add_locality_probe(std::sync::Arc::new(FixedProbe(vec![
+            (10, std::time::Duration::from_millis(33)),
+            (11, std::time::Duration::from_millis(150)),
+        ])));
+        let (loop_, handle, _, reader) =
+            MeshOsLoop::new(fast_test_config());
+        let loop_ = loop_.with_probe_registry(registry);
+        let task = tokio::spawn(loop_.run());
+
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        let snap = reader.read();
+        // Peer 10 surfaces with 33 ms.
+        let p10 = snap.peers.get(&10).expect("peer 10 in snapshot");
+        assert_eq!(p10.rtt_ms, Some(33));
+        let p11 = snap.peers.get(&11).expect("peer 11 in snapshot");
+        assert_eq!(p11.rtt_ms, Some(150));
+
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn health_probe_samples_fold_into_actual_health_via_snapshot() {
+        struct FixedProbe(Vec<(u64, super::super::event::NodeHealth)>);
+        impl super::super::probes::HealthProbe for FixedProbe {
+            fn health_samples(&self) -> Vec<(u64, super::super::event::NodeHealth)> {
+                self.0.clone()
+            }
+        }
+
+        let registry = ProbeRegistry::new();
+        registry.add_health_probe(std::sync::Arc::new(FixedProbe(vec![
+            (5, super::super::event::NodeHealth::Unreachable),
+        ])));
+        let (loop_, handle, _, reader) =
+            MeshOsLoop::new(fast_test_config());
+        let loop_ = loop_.with_probe_registry(registry);
+        let task = tokio::spawn(loop_.run());
+
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        let snap = reader.read();
+        let p5 = snap.peers.get(&5).expect("peer 5 in snapshot");
+        // Wire form differs from the enum form but the
+        // discriminator matches.
+        assert!(matches!(
+            p5.health,
+            Some(super::super::snapshot::PeerHealthSnapshot::Unreachable)
+        ));
+
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn probe_registry_attached_post_construction_is_polled_on_next_tick() {
+        // The runtime / production pattern: construct the loop,
+        // pass a shared registry through `with_probe_registry`,
+        // THEN install probes on the registry. The next Tick
+        // picks them up because both ends share the same Arc.
+        struct FixedProbe;
+        impl super::super::probes::LocalityProbe for FixedProbe {
+            fn rtt_samples(&self) -> Vec<(u64, std::time::Duration)> {
+                vec![(99, std::time::Duration::from_millis(7))]
+            }
+        }
+
+        let registry = ProbeRegistry::new();
+        let (loop_, handle, _, reader) =
+            MeshOsLoop::new(fast_test_config());
+        let loop_ = loop_.with_probe_registry(registry.clone());
+        let task = tokio::spawn(loop_.run());
+
+        // Add the probe AFTER spawning the loop — the shared
+        // Arc means the loop sees it on the next Tick.
+        registry.add_locality_probe(std::sync::Arc::new(FixedProbe));
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+
+        let snap = reader.read();
+        let p99 = snap.peers.get(&99).expect("peer 99 in snapshot");
+        assert_eq!(p99.rtt_ms, Some(7));
+
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
     }
 
     #[tokio::test]

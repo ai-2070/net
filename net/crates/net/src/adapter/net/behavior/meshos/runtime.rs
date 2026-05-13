@@ -28,8 +28,9 @@ use tokio::task::JoinHandle;
 
 use super::config::MeshOsConfig;
 use super::event::MeshOsEvent;
-use super::event_loop::{MeshOsHandle, MeshOsLoop, MeshOsSnapshotReader};
+use super::event_loop::{MeshOsHandle, MeshOsLoop, MeshOsSnapshotReader, ProbeRegistry};
 use super::executor::{ActionDispatcher, ActionExecutor, ExecutorStats, ExecutorStatsSnapshot};
+use super::probes::{HealthProbe, LocalityProbe};
 use super::snapshot::MeshOsSnapshot;
 
 /// One-stop entry point. Spawns the loop + executor as tokio
@@ -41,6 +42,10 @@ pub struct MeshOsRuntime {
     loop_task: JoinHandle<u64>,
     exec_task: JoinHandle<Arc<ExecutorStats>>,
     stats: Arc<ExecutorStats>,
+    /// Cloned [`ProbeRegistry`] retained so consumers can attach
+    /// probes after `start`. The loop reads through the same
+    /// shared cell, so additions take effect on the next Tick.
+    probes: ProbeRegistry,
 }
 
 /// Plain-value rollup of the runtime's join statistics. Returned
@@ -61,7 +66,21 @@ impl MeshOsRuntime {
     /// pass an [`super::executor::LoggingDispatcher`] for the
     /// log-only path.
     pub fn start<D: ActionDispatcher>(config: MeshOsConfig, dispatcher: Arc<D>) -> Self {
+        Self::start_with_probes(config, dispatcher, ProbeRegistry::new())
+    }
+
+    /// Like [`Self::start`], but accepts a pre-populated
+    /// [`ProbeRegistry`]. The registry is cloned and retained
+    /// — consumers can keep adding probes after `start_with_probes`
+    /// via [`Self::add_locality_probe`] / [`Self::add_health_probe`]
+    /// or by holding their own clone of the registry.
+    pub fn start_with_probes<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        dispatcher: Arc<D>,
+        probes: ProbeRegistry,
+    ) -> Self {
         let (mesh_loop, handle, actions_rx, reader) = MeshOsLoop::new(config.clone());
+        let mesh_loop = mesh_loop.with_probe_registry(probes.clone());
         let cfg_arc = Arc::new(config);
         let exec = ActionExecutor::new(actions_rx, cfg_arc, dispatcher);
         let stats = exec.stats_arc();
@@ -73,7 +92,27 @@ impl MeshOsRuntime {
             loop_task,
             exec_task,
             stats,
+            probes,
         }
+    }
+
+    /// Install a [`LocalityProbe`] on the live loop. The probe
+    /// is polled on the next Tick (and every Tick after).
+    pub fn add_locality_probe(&self, probe: Arc<dyn LocalityProbe>) {
+        self.probes.add_locality_probe(probe);
+    }
+
+    /// Install a [`HealthProbe`] on the live loop. Same cadence
+    /// as locality probes.
+    pub fn add_health_probe(&self, probe: Arc<dyn HealthProbe>) {
+        self.probes.add_health_probe(probe);
+    }
+
+    /// Clone the probe registry. Used by tests + advanced
+    /// callers that want to install probes outside the runtime's
+    /// own lifetime.
+    pub fn probe_registry(&self) -> ProbeRegistry {
+        self.probes.clone()
     }
 
     /// Borrow the publish handle. Source converters

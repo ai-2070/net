@@ -57,6 +57,7 @@ pub mod event;
 pub mod event_loop;
 pub mod executor;
 pub mod maintenance;
+pub mod probes;
 pub mod reconcile;
 pub mod runtime;
 pub mod snapshot;
@@ -82,7 +83,12 @@ pub use event::{
     DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent, LocalReplicaIntentUpdate, MeshOsEvent,
     NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
 };
-pub use event_loop::{MeshOsHandle, MeshOsHandleError, MeshOsLoop, MeshOsSnapshotReader};
+pub use event_loop::{
+    MeshOsHandle, MeshOsHandleError, MeshOsLoop, MeshOsSnapshotReader, ProbeRegistry,
+};
+pub use probes::{
+    HealthProbe, LocalityProbe, ProximityGraphHealthProbe, ProximityGraphLocalityProbe,
+};
 pub use executor::{
     ActionDispatcher, ActionExecutor, DispatchError, ExecutorHandle, ExecutorStats,
     ExecutorStatsSnapshot, LoggingDispatcher,
