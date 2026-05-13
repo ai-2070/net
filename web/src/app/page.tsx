@@ -4725,24 +4725,24 @@ const MESH_OS_CAPABILITY_STRIP: ReadonlyArray<{
 }> = [
   {
     num: "mesh.os.1",
-    name: "Event Loop",
-    body: "one canonical stream. one ordering. replicas, daemons, rtt, admin — all funnel through the same loop. deterministic behavior.",
+    name: "Mikoshi Lifecycle",
+    body: "spawn, migrate, supervise. daemons hop between machines without losing state, history, or place in the conversation.",
   },
   {
     num: "mesh.os.2",
-    name: "Reconcile",
-    body: "desired vs actual every tick. the diff becomes a minimal action list. no duelling reactors, no thrash.",
+    name: "Gravity Placement",
+    body: "workloads pull toward their data. compute lands near the bytes it touches — gravity-based scoring, not central scheduling.",
   },
   {
     num: "mesh.os.3",
-    name: "Daemon Supervision",
-    body: "start, drain, restart, gate. exponential backoff. backpressure signals. graceful shutdown or forced.",
+    name: "Drift Correction",
+    isNew: true,
+    body: "conditions shift, the mesh rebalances. no operator in the loop. no central scheduler watching. self-organizing coordination.",
   },
   {
     num: "mesh.os.4",
-    name: "Maintenance Nodes",
-    isNew: true,
-    body: "cordon, drain, swap, repair. chain-driven admin events. every node converges on the same interpretation.",
+    name: "Capability Match",
+    body: "nodes advertise what they can do — gpu, vram, region, colocation. MeshOS routes work to nodes that fit.",
   },
 ];
 
@@ -4757,30 +4757,39 @@ function MeshOsSection() {
         MeshOS:
         <br />
         <span className="text-accent">
-          the cluster
+          programs move.
           <br />
-          behaves itself.
+          clusters think.
         </span>
       </DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.7] font-light mb-12">
-        Distributed systems have lived inside a hidden civil war — schedulers,
-        healers, balancers, all running as independent reactors, arguing about
-        the same state from different points of view.
+        Programs move between machines without stopping. Daemons migrate
+        seamlessly across the mesh while maintaining full state.
         <br />
         <br />
         <strong className="text-accent font-medium">
-          MeshOS collapses them into a single event loop.
+          Placement happens intelligently —
         </strong>{" "}
-        Replica updates, daemon lifecycles, RTT samples, admin actions, blob
-        announcements — every signal funnels through one canonical ordering.
-        Each tick produces a minimal action list to bring the mesh into
-        alignment. One stream. One reconcile. The cluster behaves itself.
+        gravity pulls workloads toward their data, capabilities match tasks to
+        nodes, and drift detection triggers automatic rebalancing. No central
+        orchestrator. No single point of failure. Just self-organizing
+        coordination at nanosecond scale.
       </p>
 
       <MeshOsConsole />
 
-      <div className="mt-12 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 border-t border-l border-line">
+      <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
+        <p className="text-[18px] text-ink leading-[1.5] font-light">
+          The cluster thinks.{" "}
+          <strong className="text-accent font-medium">
+            The daemons move.
+          </strong>{" "}
+          The work gets done.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 border-t border-l border-line">
         {MESH_OS_CAPABILITY_STRIP.map((c) => (
           <div
             key={c.name}
