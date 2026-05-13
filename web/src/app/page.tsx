@@ -4181,17 +4181,17 @@ const CAPABILITY_STRIP: ReadonlyArray<{
     num: "mesh.storage.1",
     name: "Overflow",
     isNew: true,
-    body: "storage doesn't run out. when one disk fills up, the rest catch the spillover.",
+    body: "storage doesn't run out. when one disk fills up, the mesh catches the spillover.",
   },
   {
     num: "mesh.storage.2",
     name: "Data Gravity",
-    body: "files settle near the people who use them. mobody moves them. they just end up there.",
+    body: "the files aren't moved. files settle near nodes that use them.",
   },
   {
     num: "mesh.storage.3",
     name: "Read-your-writes",
-    body: "if you wrote it, you can read it. right now. no waiting on the cluster.",
+    body: "if you wrote it, you can read it. right now. no coordination lag.",
   },
   {
     num: "mesh.storage.4",
@@ -4217,13 +4217,17 @@ function DatafortsSection() {
       </DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.7] font-light mb-12">
-        For 60 years, files were objects nailed to a location. A bucket in a
-        region; a database in a cluster; a disk in a box.{" "}
+        For 60 years, files were objects nailed to a location — a disk in a box.
+        Traditional storage treats files like permanent objects locked to a
+        single machine.
+        <br />
+        <br />
         <strong className="text-accent font-medium">
           Dataforts treats storage as flow.
         </strong>{" "}
-        Bytes find their level. Heat pulls them toward demand. Full disks spill
-        into the pool. Open the handle — the mesh resolves the rest.
+        When a device approaches capacity, it overflows onto the mesh. The
+        folder stays local. The capacity is the mesh. Reads create gravity. Hot
+        data moves closer. Everything is in motion.
       </p>
 
       <DatafortsConsole />
@@ -4255,13 +4259,10 @@ function DatafortsSection() {
 
       <div className="mt-14 border-l-2 border-accent pl-6 pr-6 py-5 bg-accent/[0.02] max-w-[900px]">
         <p className="text-[17px] text-ink leading-[1.5] font-light">
-          Open the handle. Get bytes. Whether they were written here, cached by
-          a peer who needed them, or pulled back from a node that overflowed
-          them last hour —{" "}
           <strong className="text-accent font-medium">
-            the API doesn&apos;t change.
+            Storage is no longer a destination.
           </strong>{" "}
-          Storage stopped being a place.
+          It is a continuously moving layer of compute and flow.
         </p>
       </div>
     </section>
