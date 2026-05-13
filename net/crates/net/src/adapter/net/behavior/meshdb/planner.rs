@@ -916,17 +916,23 @@ where
     /// advertises `child` via `causal:<hex>` and reads its
     /// `fork-of:<parent_hex>` tag.
     ///
-    /// Returns `None` when no node hosts `child` or the
-    /// hosting node carries no fork-of declaration.
+    /// Returns `None` when no node hosts `child` or no hosting
+    /// node carries a fork-of declaration.
     ///
     /// Multi-chain hosts — a node with several `fork-of:` tags
-    /// — are a Phase C ambiguity. Since `caps.tags` is a
-    /// `HashSet` whose iteration order is RNG-dependent, we
-    /// collect every fork-of candidate, sort numerically, and
-    /// take the smallest. That keeps both the plan AND the
-    /// load-bearing cache key (locked decision #4) byte-stable
-    /// across runs.
+    /// — are a Phase C ambiguity. Same for multi-host
+    /// replication — two different nodes might both advertise
+    /// `causal:<child>` with different `fork-of:` tags.
+    /// `CapabilityIndex::all_nodes` iterates a `DashMap` whose
+    /// order is unstable across runs, AND `caps.tags` is a
+    /// `HashSet` with the same property. We collect every
+    /// `(parent_hash, node_id)` candidate across ALL hosting
+    /// nodes, sort it, and pick the smallest. That keeps both
+    /// the plan AND the load-bearing cache key (locked
+    /// decision #4) byte-stable across runs. Mirrors the
+    /// symmetric approach `children_of` already uses.
     fn parent_of(&self, child: u64) -> Option<u64> {
+        let mut candidates: Vec<(u64, u64)> = Vec::new();
         for node_id in self.capability_index.all_nodes() {
             let Some(caps) = self.capability_index.get(node_id) else {
                 continue;
@@ -950,11 +956,13 @@ where
                 }
             }
             if hosts_child {
-                fork_candidates.sort_unstable();
-                return fork_candidates.first().copied();
+                for parent in fork_candidates {
+                    candidates.push((parent, node_id));
+                }
             }
         }
-        None
+        candidates.sort_unstable();
+        candidates.first().map(|(parent, _)| *parent)
     }
 
     /// Find all chains advertising `fork-of:<parent>` — i.e.,
@@ -2418,6 +2426,46 @@ mod tests {
                 assert_eq!(
                     prev, &bytes,
                     "BFS plan must not depend on HashSet iter order"
+                );
+            }
+            last_encoding = Some(bytes);
+        }
+    }
+
+    #[test]
+    fn lineage_back_across_multiple_replica_hosts_is_deterministic() {
+        // Regression: pass-1 M1 made intra-node tag selection
+        // deterministic, but the outer parent_of loop still
+        // short-circuited on the first DashMap-iterated node
+        // that hosted the child via a `causal:` tag. Two nodes
+        // replicating the same chain origin with DIFFERENT
+        // fork-of declarations could produce different plans
+        // across runs.
+        let child = 0x0000_0000_0000_DDDD_u64;
+        let parent_a = 0x0000_0000_0000_0001_u64;
+        let parent_b = 0x0000_0000_0000_0002_u64;
+        // Two replicas of `child`; each declares a different parent.
+        let index = index_with(vec![
+            (1, caps_chain_forked_from(child, parent_a)),
+            (2, caps_chain_forked_from(child, parent_b)),
+            (3, caps_chain_only(parent_a)),
+            (4, caps_chain_only(parent_b)),
+        ]);
+
+        let mut last_encoding: Option<Vec<u8>> = None;
+        for _ in 0..32 {
+            let planner = MeshQueryPlanner::new(&index, rtt_none);
+            let plan = planner
+                .plan(&MeshQuery::V1(QueryV1::LineageBack {
+                    origin: ChainRef::OriginHash(child),
+                    max_depth: 1,
+                }))
+                .unwrap();
+            let bytes = postcard::to_allocvec(&plan).unwrap();
+            if let Some(prev) = &last_encoding {
+                assert_eq!(
+                    prev, &bytes,
+                    "parent_of must not depend on DashMap iter order across replicas",
                 );
             }
             last_encoding = Some(bytes);
