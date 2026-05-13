@@ -1,0 +1,19 @@
+net/crates/net/docs/releases/RELEASE_v0.16_EYE_OF_THE_TIGER.md
+  s_3bbc444b3ef3e5::t_7051c941f5ce9f 13,21,23,25,31,60,73,77,79,128,130,134,167,169,173,177,179,181,183,187,189,193,195,199,203,205,209,211,213,215,219,235,255,263,275,283,295,299-363,376,395,401
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "e9cdd09dea149f40001341c78579e1e965ecc8fc",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
