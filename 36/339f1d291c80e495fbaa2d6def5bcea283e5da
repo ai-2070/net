@@ -1,0 +1,32 @@
+net/crates/net/src/adapter/net/behavior/meshdb/executor.rs
+  s_3bbc444b3ef3e5::t_7c88fa13321295 471
+  s_3bbc444b3ef3e5::t_27355939f75744 514
+  s_3bbc444b3ef3e5::t_c37f49a5335b2d 957-995
+  s_3bbc444b3ef3e5::t_29117d81a752ff 909-915
+net/crates/net/src/adapter/net/behavior/meshdb/federated.rs
+  s_3bbc444b3ef3e5::t_c8cea3307f0c24 1052-1055,1057-1062
+  s_3bbc444b3ef3e5::t_2a2ef2dd96021a 647-649
+  s_3bbc444b3ef3e5::t_5be977cf84a282 773-775
+  s_3bbc444b3ef3e5::t_f1628180bd4f40 817-821
+  s_3bbc444b3ef3e5::t_48f649be0791b9 861-865
+  s_3bbc444b3ef3e5::t_0d02cecd7b2343 1051,1056
+net/crates/net/src/adapter/net/behavior/meshdb/cache.rs
+  s_3bbc444b3ef3e5::t_95d184185e07ff 494-497
+  s_3bbc444b3ef3e5::t_6aab37e5ebcaa9 144-146,148
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "36339f1d291c80e495fbaa2d6def5bcea283e5da",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
