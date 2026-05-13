@@ -14,20 +14,23 @@ All items below are being addressed; see the "Resolution" notes inline.
 
 ## Blockers
 
-### B1 — `CacheKey::for_plan` panics on `Filter` / `ChainRef::Discovered` plans
+### B1 — `CacheKey::for_plan` fragile to future un-encodable plans (downgraded from "panics")
 
 **Where:** `src/adapter/net/behavior/meshdb/cache.rs:99`.
 
-`postcard::to_allocvec(plan).expect("plan encode is infallible")` is wrong:
-`PredicateWire` rides `#[serde(tag = "kind")]`, which postcard rejects as
-`WontImplement`. The `query.rs` `complex_query_postcardable` test already
-documents this exact incompatibility. Any cache-enabled `Filter` or
-`Discovered` plan crashes the executor.
+The original review claim was that `postcard::to_allocvec(plan).expect(...)`
+panics on `Filter` / `Discovered` plans because `PredicateNodeWire` is
+`#[serde(tag = "kind")]`. Empirical check: postcard *encodes*
+internally-tagged enums fine — only `from_bytes` rejects them with
+`WontImplement`. Since the cache only encodes (for hashing), the original
+`expect` doesn't fire today.
 
-**Fix:** `CacheKey::for_plan` returns `Option<CacheKey>` and the cache treats
-an encode failure as a bypass. Regression test: build a `Filter` plan and
-assert `CacheKey::for_plan` returns `None` (and the executor still runs the
-query without caching).
+**Fix shipped anyway (defence in depth):** `CacheKey::for_plan` now returns
+`Option<CacheKey>`; cache call sites treat `None` as a transparent bypass.
+This is safe-by-default for any future plan variant that becomes
+un-encodable. Regression test: build a `Filter` plan, assert a stable
+`Some(_)` round-trip today, with the Option return as the load-bearing
+contract.
 
 ### B2 — `running.handle.cancel()` is a no-op for every composite federated query
 

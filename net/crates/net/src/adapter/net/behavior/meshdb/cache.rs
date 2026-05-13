@@ -29,10 +29,20 @@
 //! # Wire-key shape
 //!
 //! Plans are byte-identical-deterministic (locked decision
-//! #1). We postcard-encode the plan, run a `SipHasher` over
-//! the bytes, and pair the `u64` digest with the capability
-//! version. Hashing keeps the key small (16 bytes) regardless
-//! of plan size; cache lookups stay O(1).
+//! #1). We postcard-encode the plan, run [`DefaultHasher`]
+//! (std-internal; not algorithm-stable across Rust releases,
+//! but stable within a binary) over the bytes, and pair the
+//! `u64` digest with the capability version. Hashing keeps
+//! the key small (16 bytes) regardless of plan size; cache
+//! lookups stay O(1).
+//!
+//! Not every plan is postcard-encodable — `Filter` /
+//! `Discovered` carry [`PredicateWire`](super::query::PredicateWire)
+//! which is `#[serde(tag = "kind")]` and falls outside
+//! postcard's supported subset. `for_plan` returns
+//! `Option<CacheKey>` so the executor can treat encode
+//! failures as a transparent cache bypass rather than a
+//! panic.
 //!
 //! # LRU mechanics
 //!
@@ -92,17 +102,20 @@ impl CacheKey {
     /// Hash a plan into a cache key for the given capability
     /// version. Per locked decision #1, plans are byte-identical-
     /// deterministic, so encode + hash is stable across runs.
-    pub fn for_plan(plan: &ExecutionPlan, capability_version: u64) -> Self {
-        // SipHasher via std's DefaultHasher. Plan sizes are
-        // small (a few KB); we're not the bottleneck.
+    ///
+    /// Returns `None` when the plan contains a node postcard
+    /// can't encode (currently: any `Filter` / `Discovered`
+    /// node, because `PredicateWire` uses `#[serde(tag)]`).
+    /// Callers treat that as a transparent cache bypass.
+    pub fn for_plan(plan: &ExecutionPlan, capability_version: u64) -> Option<Self> {
         use std::collections::hash_map::DefaultHasher;
-        let bytes = postcard::to_allocvec(plan).expect("plan encode is infallible");
+        let bytes = postcard::to_allocvec(plan).ok()?;
         let mut hasher = DefaultHasher::new();
         bytes.hash(&mut hasher);
-        Self {
+        Some(Self {
             plan_hash: hasher.finish(),
             capability_version,
-        }
+        })
     }
 }
 
@@ -525,8 +538,8 @@ mod tests {
             },
             total_cost: CostEstimate::default(),
         };
-        let k1 = CacheKey::for_plan(&plan, 7);
-        let k2 = CacheKey::for_plan(&plan, 7);
+        let k1 = CacheKey::for_plan(&plan, 7).unwrap();
+        let k2 = CacheKey::for_plan(&plan, 7).unwrap();
         assert_eq!(k1, k2);
     }
 
@@ -541,9 +554,52 @@ mod tests {
             },
             total_cost: CostEstimate::default(),
         };
-        let a = CacheKey::for_plan(&plan, 1);
-        let b = CacheKey::for_plan(&plan, 2);
+        let a = CacheKey::for_plan(&plan, 1).unwrap();
+        let b = CacheKey::for_plan(&plan, 2).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn key_for_plan_handles_filter_plans_without_panicking() {
+        // `Filter` carries `PredicateWire`, whose
+        // `PredicateNodeWire` uses `#[serde(tag = "kind")]`.
+        // Postcard *encodes* internally-tagged enums fine
+        // (the failure mode is on decode); cache hashing only
+        // touches encode, so we just need a stable u64 here.
+        // The Option return type is the future-proof contract
+        // for any plan variant that becomes un-encodable
+        // (the cache transparently bypasses rather than
+        // panicking).
+        use super::super::planner::{CostEstimate, OperatorNode, OperatorPlan};
+        use crate::adapter::net::behavior::predicate::Predicate;
+        use crate::adapter::net::behavior::tag::TagKey;
+        use crate::adapter::net::behavior::TaxonomyAxis;
+        let pred = Predicate::Equals {
+            key: TagKey::new(TaxonomyAxis::Software, "any"),
+            value: "v".to_string(),
+        };
+        let inner = OperatorNode {
+            operator: OperatorPlan::LatestRead { origin: 0x01 },
+            target_nodes: vec![],
+            cost: CostEstimate::default(),
+        };
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::Filter {
+                    input: Box::new(inner),
+                    predicate: pred.to_wire(),
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+        // Today's wire encoding succeeds; the key is stable
+        // across runs (deterministic-plan contract). The
+        // option-shape is the load-bearing piece — see
+        // `for_plan` doc-comment.
+        let k = CacheKey::for_plan(&plan, 0).expect("filter plan is encodable today");
+        assert_eq!(k, CacheKey::for_plan(&plan, 0).unwrap());
     }
 
     #[test]

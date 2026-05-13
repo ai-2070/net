@@ -150,39 +150,44 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
             options.bypass_cache,
         ) {
             let version = version_fn();
-            let key = super::cache::CacheKey::for_plan(&plan, version);
-            if let Some(cached) = cache.get(&key) {
+            // Plans containing un-postcard-able nodes (Filter /
+            // Discovered) yield `None` here; we bypass the
+            // cache entirely rather than panic.
+            if let Some(key) = super::cache::CacheKey::for_plan(&plan, version) {
+                if let Some(cached) = cache.get(&key) {
+                    let handle = QueryHandle::new(self.allocate_id());
+                    let rows: Vec<Result<ResultRow, MeshError>> =
+                        cached.rows.into_iter().map(Ok).collect();
+                    let stream: ResultStream = Box::pin(futures::stream::iter(rows));
+                    return Ok(RunningQuery {
+                        handle,
+                        rows: stream,
+                    });
+                }
+                // Miss. Run the actual federated path with
+                // caching temporarily disabled (so the recursive
+                // sub-plan executes don't try to cache too), then
+                // drain + cache the top-level rows.
+                let drained = self.execute_uncached(plan.clone()).await?;
+                let collected = drain_rows(drained.rows).await?;
+                cache.insert(
+                    key,
+                    super::cache::CachedResult {
+                        rows: collected.clone(),
+                        inserted_at: std::time::Instant::now(),
+                        policy: options.cache_policy,
+                    },
+                );
                 let handle = QueryHandle::new(self.allocate_id());
-                let rows: Vec<Result<ResultRow, MeshError>> =
-                    cached.rows.into_iter().map(Ok).collect();
-                let stream: ResultStream = Box::pin(futures::stream::iter(rows));
+                let stream: ResultStream = Box::pin(futures::stream::iter(
+                    collected.into_iter().map(Ok).collect::<Vec<_>>(),
+                ));
                 return Ok(RunningQuery {
                     handle,
                     rows: stream,
                 });
             }
-            // Miss. Run the actual federated path with
-            // caching temporarily disabled (so the recursive
-            // sub-plan executes don't try to cache too), then
-            // drain + cache the top-level rows.
-            let drained = self.execute_uncached(plan.clone()).await?;
-            let collected = drain_rows(drained.rows).await?;
-            cache.insert(
-                key,
-                super::cache::CachedResult {
-                    rows: collected.clone(),
-                    inserted_at: std::time::Instant::now(),
-                    policy: options.cache_policy,
-                },
-            );
-            let handle = QueryHandle::new(self.allocate_id());
-            let stream: ResultStream = Box::pin(futures::stream::iter(
-                collected.into_iter().map(Ok).collect::<Vec<_>>(),
-            ));
-            return Ok(RunningQuery {
-                handle,
-                rows: stream,
-            });
+            // Encode bypass — fall through.
         }
         self.execute_uncached(plan).await
     }

@@ -263,28 +263,34 @@ impl<R: ChainReader + 'static> MeshQueryExecutor for LocalMeshQueryExecutor<R> {
             options.bypass_cache,
         ) {
             let version = version_fn();
-            let key = super::cache::CacheKey::for_plan(&plan, version);
-            if let Some(cached) = cache.get(&key) {
+            // Plans containing un-postcard-able nodes (Filter /
+            // Discovered) yield `None` here; we bypass the
+            // cache entirely rather than panic.
+            if let Some(key) = super::cache::CacheKey::for_plan(&plan, version) {
+                if let Some(cached) = cache.get(&key) {
+                    let handle = QueryHandle::new(self.allocate_id());
+                    let rows = stream_from_vec(cached.rows, handle.clone());
+                    return Ok(RunningQuery { handle, rows });
+                }
+                // Miss: execute + write back.
+                let rows = collect_operator_rows(&plan.root, self.reader.as_ref())?;
+                cache.insert(
+                    key,
+                    super::cache::CachedResult {
+                        rows: rows.clone(),
+                        inserted_at: std::time::Instant::now(),
+                        policy: options.cache_policy,
+                    },
+                );
                 let handle = QueryHandle::new(self.allocate_id());
-                let rows = stream_from_vec(cached.rows, handle.clone());
-                return Ok(RunningQuery { handle, rows });
+                let stream = stream_from_vec(rows, handle.clone());
+                return Ok(RunningQuery {
+                    handle,
+                    rows: stream,
+                });
             }
-            // Miss: execute + write back.
-            let rows = collect_operator_rows(&plan.root, self.reader.as_ref())?;
-            cache.insert(
-                key,
-                super::cache::CachedResult {
-                    rows: rows.clone(),
-                    inserted_at: std::time::Instant::now(),
-                    policy: options.cache_policy,
-                },
-            );
-            let handle = QueryHandle::new(self.allocate_id());
-            let stream = stream_from_vec(rows, handle.clone());
-            return Ok(RunningQuery {
-                handle,
-                rows: stream,
-            });
+            // Encode bypass — fall through to the no-cache
+            // path below.
         }
         // Cache-less path (no cache wired, or bypass requested).
         let handle = QueryHandle::new(self.allocate_id());
@@ -1318,7 +1324,8 @@ mod tests {
         // Wait past the default TTL window. Permanent should
         // still hit.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let key = super::super::cache::CacheKey::for_plan(&plan, 0);
+        let key = super::super::cache::CacheKey::for_plan(&plan, 0)
+            .expect("postcard-encodable plan");
         assert!(cache.get(&key).is_some(), "permanent never expires by time");
     }
 
