@@ -28,7 +28,9 @@ use tokio::time::{interval_at, Instant as TokioInstant, MissedTickBehavior};
 
 use super::action::{AllocateActionId, PendingAction};
 use super::config::MeshOsConfig;
+use super::control::{ControlSink, MeshOsControl};
 use super::event::MeshOsEvent;
+use super::maintenance::MaintenanceState;
 use super::probes::{HealthProbe, LocalityProbe};
 use super::reconcile::reconcile;
 use super::scheduler::SchedulerRegistry;
@@ -109,6 +111,46 @@ pub struct MeshOsLoop {
     /// constructed without an executor (e.g. unit tests) still
     /// publishes (with an empty ring).
     executor_failures: Option<Arc<RwLock<VecDeque<FailureRecord>>>>,
+    /// Optional control-event sink. When attached, the loop
+    /// translates this-node `local_maintenance` transitions and
+    /// future backpressure flips into [`MeshOsControl`] events
+    /// and forwards them through the sink. The SDK installs one
+    /// that fans events out to per-daemon channels via its
+    /// router; substrate-internal uses can ignore.
+    control_sink: Option<Arc<dyn ControlSink>>,
+    /// Discriminant of the most recent `local_maintenance` value
+    /// the loop observed. Updated on every `apply()` call so
+    /// state transitions caused by either an admin event or a
+    /// `MaintenanceTransitionObserved` (chain replay) surface
+    /// uniformly.
+    last_local_maintenance: MaintenanceDiscriminant,
+}
+
+/// Cheap-to-compare snapshot of [`MaintenanceState`]'s variant
+/// (no embedded `Instant` or `String`). Used by the loop to
+/// detect transitions without holding the full state value.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum MaintenanceDiscriminant {
+    #[default]
+    Active,
+    EnteringMaintenance,
+    Maintenance,
+    ExitingMaintenance,
+    DrainFailed,
+    Recovery,
+}
+
+impl MaintenanceDiscriminant {
+    fn from_state(state: &MaintenanceState) -> Self {
+        match state {
+            MaintenanceState::Active => Self::Active,
+            MaintenanceState::EnteringMaintenance { .. } => Self::EnteringMaintenance,
+            MaintenanceState::Maintenance { .. } => Self::Maintenance,
+            MaintenanceState::ExitingMaintenance { .. } => Self::ExitingMaintenance,
+            MaintenanceState::DrainFailed { .. } => Self::DrainFailed,
+            MaintenanceState::Recovery { .. } => Self::Recovery,
+        }
+    }
 }
 
 /// Inner shared cell — both probe lists behind one
@@ -315,6 +357,8 @@ impl MeshOsLoop {
             reconcile_count: 0,
             dropped_actions: Arc::new(AtomicU64::new(0)),
             executor_failures: None,
+            control_sink: None,
+            last_local_maintenance: MaintenanceDiscriminant::Active,
         };
         MeshOsLoopParts {
             mesh_loop: me,
@@ -361,6 +405,18 @@ impl MeshOsLoop {
         failures: Arc<RwLock<VecDeque<FailureRecord>>>,
     ) -> Self {
         self.executor_failures = Some(failures);
+        self
+    }
+
+    /// Attach a [`ControlSink`]. When set, the loop translates
+    /// this-node maintenance state transitions into
+    /// [`MeshOsControl`] events and forwards them through the
+    /// sink. The SDK installs a sink that routes events to
+    /// per-daemon control channels via its router; substrate
+    /// code that doesn't need the SDK surface can leave this
+    /// unset.
+    pub fn with_control_sink(mut self, sink: Arc<dyn ControlSink>) -> Self {
+        self.control_sink = Some(sink);
         self
     }
 
@@ -503,6 +559,48 @@ impl MeshOsLoop {
             _ => {}
         }
         self.actual.apply(event, self.config.this_node);
+        self.emit_maintenance_transitions();
+    }
+
+    /// Detect `local_maintenance` discriminant transitions and
+    /// fan-out the corresponding [`MeshOsControl`] through the
+    /// installed sink. Idempotent: re-entering the same
+    /// discriminant emits nothing. Forward arcs only — the fold
+    /// rejects late-arriving backward arcs upstream.
+    fn emit_maintenance_transitions(&mut self) {
+        let Some(sink) = self.control_sink.as_ref() else {
+            self.last_local_maintenance =
+                MaintenanceDiscriminant::from_state(&self.actual.local_maintenance);
+            return;
+        };
+        let current = MaintenanceDiscriminant::from_state(&self.actual.local_maintenance);
+        if current == self.last_local_maintenance {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let event = match (self.last_local_maintenance, current) {
+            (_, MaintenanceDiscriminant::EnteringMaintenance) => {
+                // Operator opened a drain. Use the configured
+                // deadline if the admin event carried one; else
+                // fall back to the maintenance-config default.
+                let deadline = match &self.actual.local_maintenance {
+                    MaintenanceState::EnteringMaintenance {
+                        deadline: Some(d), ..
+                    } => *d,
+                    _ => now + self.config.maintenance.default_drain_deadline,
+                };
+                Some(MeshOsControl::DrainStart { deadline })
+            }
+            (
+                MaintenanceDiscriminant::EnteringMaintenance,
+                MaintenanceDiscriminant::Maintenance | MaintenanceDiscriminant::DrainFailed,
+            ) => Some(MeshOsControl::DrainFinish),
+            _ => None,
+        };
+        self.last_local_maintenance = current;
+        if let Some(event) = event {
+            sink.emit(event);
+        }
     }
 
     async fn run_reconcile(&mut self) {

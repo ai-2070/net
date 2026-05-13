@@ -267,8 +267,9 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
 
     /// Clone the shared recent-failures ring. The runtime hands
     /// this to the loop so the snapshot publish path can copy it
-    /// into the [`MeshOsSnapshot::recent_failures`] field — the
-    /// chain-fold path is not the only failure surface.
+    /// into the [`super::snapshot::MeshOsSnapshot::recent_failures`]
+    /// field — the chain-fold path is not the only failure
+    /// surface.
     pub fn recent_failures_handle(&self) -> Arc<RwLock<VecDeque<FailureRecord>>> {
         Arc::clone(&self.recent_failures)
     }

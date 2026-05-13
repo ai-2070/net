@@ -22,8 +22,8 @@ use net::adapter::net::behavior::meshos::{
     attach_to_daemon_registry, ActionExecutor, AdminEvent, ChainId, DaemonIntent,
     DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent,
     LocalReplicaIntentUpdate, LoggingDispatcher, MaintenanceTransition, MeshOsAction, MeshOsConfig,
-    MeshOsEvent, MeshOsLoop, MeshOsLoopParts, MeshOsRuntime, MeshOsSnapshotReader, NodeId,
-    ReplicaUpdate,
+    MeshOsDaemonSdk, MeshOsEvent, MeshOsLoop, MeshOsLoopParts, MeshOsRuntime,
+    MeshOsSnapshotReader, NodeId, ReplicaUpdate,
 };
 use net::adapter::net::compute::DaemonHost;
 use net::adapter::net::compute::{DaemonError, DaemonHostConfig, DaemonRegistry, MeshDaemon};
@@ -650,4 +650,89 @@ async fn snapshot_reader_observes_replica_update_through_reconcile() {
         Duration::from_millis(50),
     )
     .await;
+}
+
+// ---------- MeshOsDaemonSdk end-to-end ----------
+
+/// Minimal daemon for the SDK end-to-end test. Records every
+/// `process()` invocation so the test can confirm the daemon
+/// is actually wired through `DaemonRegistry`.
+struct CountingDaemon {
+    name: String,
+    process_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl net::adapter::net::compute::MeshDaemon for CountingDaemon {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn requirements(&self) -> net::adapter::net::behavior::capability::CapabilityFilter {
+        Default::default()
+    }
+    fn process(
+        &mut self,
+        _event: &net::adapter::net::state::causal::CausalEvent,
+    ) -> Result<Vec<bytes::Bytes>, net::adapter::net::compute::DaemonError> {
+        self.process_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn sdk_drives_full_daemon_lifecycle_end_to_end() {
+    // Bring up MeshOsDaemonSdk over a LoggingDispatcher;
+    // register a real daemon; emit a CommitMaintenanceTransition
+    // with target=EnteringMaintenance and verify the daemon's
+    // control channel receives DrainStart via the SDK's
+    // routing dispatcher.
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let sdk = MeshOsDaemonSdk::start(fast_config(), Arc::clone(&dispatcher));
+
+    let kp = EntityKeypair::generate();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let daemon = CountingDaemon {
+        name: "sdk-e2e".into(),
+        process_count: std::sync::Arc::clone(&counter),
+    };
+    let mut handle = sdk
+        .register_daemon(Box::new(daemon), kp)
+        .expect("register");
+
+    // Emit the admin event that the loop's reconcile will
+    // translate to CommitMaintenanceTransition; the routing
+    // dispatcher fans the resulting transition out as
+    // DrainStart to every registered daemon.
+    sdk.runtime()
+        .handle()
+        .publish(MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
+            node: THIS_NODE,
+            deadline: None,
+        }))
+        .await
+        .unwrap();
+
+    // Wait for the loop tick → reconcile → executor dispatch →
+    // SDK router fan-out.
+    let recv =
+        tokio::time::timeout(Duration::from_secs(2), handle.next_control()).await;
+    let ev = recv.expect("control event timed out").expect("control receiver closed");
+    assert!(
+        matches!(
+            ev,
+            net::adapter::net::compute::DaemonControl::DrainStart { .. }
+        ),
+        "expected DrainStart fan-out, got {ev:?}",
+    );
+
+    // Capability publish stub returns Ok (chain commit lands in
+    // a future slice).
+    let result = handle
+        .publish_capabilities(Default::default());
+    assert!(result.is_ok());
+
+    let _ = handle
+        .graceful_shutdown(Duration::from_millis(50))
+        .await;
+    let _ = sdk.shutdown().await;
 }

@@ -48,6 +48,8 @@ pub mod mesh;
 pub mod mesh_rpc;
 #[cfg(all(feature = "net", feature = "cortex"))]
 pub mod mesh_rpc_resilience;
+#[cfg(feature = "meshos")]
+pub mod meshos;
 mod net;
 #[cfg(feature = "redis")]
 pub mod redis_dedup;

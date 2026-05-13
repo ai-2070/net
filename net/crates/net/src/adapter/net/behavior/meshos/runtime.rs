@@ -144,6 +144,29 @@ impl MeshOsRuntime {
         scheduler: SchedulerRegistry,
         daemon_registry: Arc<DaemonRegistry>,
     ) -> Self {
+        Self::start_with_options(
+            config,
+            dispatcher,
+            probes,
+            scheduler,
+            daemon_registry,
+            None,
+        )
+    }
+
+    /// Most-general constructor with an optional [`super::control::ControlSink`]
+    /// for fan-out of `MeshOsControl` events. The SDK uses this
+    /// path; substrate code that doesn't care about control
+    /// fan-out should call one of the simpler `start*`
+    /// constructors.
+    pub fn start_with_options<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        dispatcher: Arc<D>,
+        probes: ProbeRegistry,
+        scheduler: SchedulerRegistry,
+        daemon_registry: Arc<DaemonRegistry>,
+        control_sink: Option<Arc<dyn super::control::ControlSink>>,
+    ) -> Self {
         let super::event_loop::MeshOsLoopParts {
             mesh_loop,
             handle,
@@ -162,10 +185,13 @@ impl MeshOsRuntime {
         // the snapshot publish path copies executor-side
         // failures into the snapshot's `recent_failures` field —
         // the chain-fold path is not the only surface.
-        let mesh_loop = mesh_loop
+        let mut mesh_loop = mesh_loop
             .with_probe_registry(probes.clone())
             .with_scheduler_registry(scheduler.clone())
             .with_executor_failures(exec.recent_failures_handle());
+        if let Some(sink) = control_sink {
+            mesh_loop = mesh_loop.with_control_sink(sink);
+        }
         let dropped_actions = mesh_loop.dropped_actions_counter();
         let loop_task = tokio::spawn(mesh_loop.run());
         let exec_task = tokio::spawn(exec.run());

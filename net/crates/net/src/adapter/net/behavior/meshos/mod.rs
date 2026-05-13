@@ -62,6 +62,7 @@ pub mod probes;
 pub mod reconcile;
 pub mod runtime;
 pub mod scheduler;
+pub mod sdk;
 pub mod snapshot;
 pub mod sources;
 pub mod state;
@@ -75,7 +76,7 @@ pub use chain::{
     MeshOsSnapshotFold, NoOpActionChainAppender,
 };
 pub use config::{BackpressureConfig, LocalityConfig, MaintenanceConfig, MeshOsConfig};
-pub use control::MeshOsControl;
+pub use control::{ControlSink, MeshOsControl};
 pub use event::{
     AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,
     DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent, LocalReplicaIntentUpdate, MeshOsEvent,
@@ -96,6 +97,11 @@ pub use probes::{
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
 pub use runtime::{MeshOsRuntime, RuntimeShutdownError, RuntimeStats};
 pub use scheduler::{PlacementScorer, SchedulerConfig, SchedulerRegistry};
+pub use sdk::{
+    DaemonControlRouter, MaintenanceStateView, MeshOsDaemonHandle, MeshOsDaemonSdk,
+    MetadataView, SdkError, SdkRoutingDispatcher, DEFAULT_CONTROL_CHANNEL_CAPACITY,
+    DEFAULT_GRACEFUL_SHUTDOWN,
+};
 pub use snapshot::{
     action_kind_str, AvoidEntrySnapshot, DaemonHealthSnapshot, DaemonLifecycleSnapshot,
     DaemonSnapshot, FailureRecord, MaintenanceMirrorSnapshot, MaintenanceStateSnapshot,
