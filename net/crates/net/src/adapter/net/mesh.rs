@@ -9893,12 +9893,7 @@ mod heartbeat_aead_tests {
         let new_static = [0xBBu8; 32];
         let new_ephemeral = [0xDDu8; 32];
         assert_eq!(
-            routed_rotation_outcome(
-                &info,
-                &new_static,
-                &new_ephemeral,
-                Duration::from_secs(30),
-            ),
+            routed_rotation_outcome(&info, &new_static, &new_ephemeral, Duration::from_secs(30),),
             RoutedRotationOutcome::RefuseFresh,
         );
     }
@@ -9928,12 +9923,7 @@ mod heartbeat_aead_tests {
         let new_static = [0xBBu8; 32];
         let new_ephemeral = [0xDDu8; 32];
         assert_eq!(
-            routed_rotation_outcome(
-                &info,
-                &new_static,
-                &new_ephemeral,
-                Duration::from_millis(1),
-            ),
+            routed_rotation_outcome(&info, &new_static, &new_ephemeral, Duration::from_millis(1),),
             RoutedRotationOutcome::AcceptRotation,
         );
     }
