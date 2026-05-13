@@ -4260,9 +4260,8 @@ function DatafortsSection() {
       <div className="mt-14 border-l-2 border-accent pl-6 pr-6 py-5 bg-accent/[0.02] max-w-[900px]">
         <p className="text-[17px] text-ink leading-[1.5] font-light">
           <strong className="text-accent font-medium">
-            Storage is no longer a destination.
-          </strong>{" "}
-          It is a continuously moving layer of compute and flow.
+            Storage isn't a place anymore — it's a flow.
+          </strong>
         </p>
       </div>
     </section>
