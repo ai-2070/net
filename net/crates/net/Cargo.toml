@@ -6,6 +6,7 @@ members = [
     "bindings/python",
     "bindings/go/compute-ffi",
     "bindings/go/rpc-ffi",
+    "bindings/go/meshdb-ffi",
 ]
 
 [package]

@@ -1544,6 +1544,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-meshdb-ffi"
+version = "0.15.0"
+dependencies = [
+ "ai2070-net",
+ "futures",
+ "postcard",
+ "tokio",
+]
+
+[[package]]
 name = "net-node"
 version = "0.15.0"
 dependencies = [
