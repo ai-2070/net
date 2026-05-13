@@ -359,8 +359,11 @@ Closed:
 - Python `lineage_emit` doc-comment attached to the correct factory.
 - Go FFI `ffi_cached_runner_round_trips` actually asserts a cache hit (mutates the underlying store between calls and verifies the `Permanent`-policy fetch returns pre-mutation bytes).
 - `translate_responses` last-err rebuild uses the original error rather than re-constructing.
+- **Node `LineageEntry.depth` is `bigint`** (shape parity with `originHash` / `tipSeq`). The factory rejects values exceeding `u32::MAX` with a typed error. *Breaking* for any Node SDK caller that previously constructed entries with plain `number` literals: pass `0n`, `1n`, … instead of `0`, `1`, ….
 
-Deferred with rationale: Python `test_join_accepts_watermark_secs_kwarg` asserts row count only (clamp not observable from Python without substrate-level introspection); test gaps in Unicode tag bodies / large lineage chains / single-row aggregates (covered better at the substrate level than at the SDK boundary); `MeshDbRunner.executor: Arc<...>` is single-owner across all three shims (not load-bearing); `LineageEntry.depth: u32` exposed as plain JS `number` rather than `BigInt` (u32 fits losslessly; asymmetry with the BigInt fields acknowledged).
+Closed (additional, post-pass): **`MeshDbRunner.executor: Arc<LocalMeshQueryExecutor>` indirection dropped** across all three shims — the runner owns the executor directly, the FFI / NAPI / pyo3 entry points borrow it for the lifetime of the call.
+
+Deferred with rationale: Python `test_join_accepts_watermark_secs_kwarg` asserts row count only (clamp not observable from Python without substrate-level introspection); test gaps in Unicode tag bodies / large lineage chains / single-row aggregates (covered better at the substrate level than at the SDK boundary).
 
 ### Substrate-side hardening (alongside the MeshDB passes)
 
