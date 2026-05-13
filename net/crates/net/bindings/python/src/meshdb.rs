@@ -69,6 +69,8 @@ use net::adapter::net::behavior::meshdb::{
     ExecutionPlan, SeqNum,
 };
 use net::adapter::net::behavior::meshdb::MeshError;
+use net::adapter::net::behavior::predicate::Predicate;
+use net::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
 
 create_exception!(
     _net,
@@ -435,6 +437,170 @@ impl PyExecuteOptions {
     }
 }
 
+/// Predicate constructor for [`PyMeshQuery::filter`]. Wraps
+/// the substrate's [`Predicate`] enum; factory methods mirror
+/// the variants useful for row filtering against the synthetic
+/// per-row tag view (`row::synthetic_row_view`).
+///
+/// Field paths target the synthetic `Dataforts` axis: a
+/// row-intrinsic name like `"origin"` / `"seq"` resolves to
+/// the same key used by the join/aggregate keying surface; a
+/// JSON path like `"severity"` or `"a.b.c"` resolves to the
+/// flattened JSON-object payload field.
+///
+/// And / Or / Not compose by passing already-built
+/// [`PyPredicate`]s in via factory methods (Python doesn't get
+/// operator overloading in slice 3; if `&` / `|` / `~`
+/// ergonomics matter, slice 4 can layer them on).
+#[pyclass(name = "Predicate", module = "net._net", frozen, from_py_object)]
+#[derive(Clone)]
+pub struct PyPredicate {
+    inner: Predicate,
+}
+
+#[pymethods]
+impl PyPredicate {
+    /// `field` is present (any value).
+    #[staticmethod]
+    fn exists(field: String) -> Self {
+        Self {
+            inner: Predicate::Exists {
+                key: tag_key(&field),
+            },
+        }
+    }
+
+    /// `field == value` (string equality).
+    #[staticmethod]
+    fn equals(field: String, value: String) -> Self {
+        Self {
+            inner: Predicate::Equals {
+                key: tag_key(&field),
+                value,
+            },
+        }
+    }
+
+    /// `field >= threshold` (numeric).
+    #[staticmethod]
+    fn numeric_at_least(field: String, threshold: f64) -> Self {
+        Self {
+            inner: Predicate::NumericAtLeast {
+                key: tag_key(&field),
+                threshold,
+            },
+        }
+    }
+
+    /// `field <= threshold` (numeric).
+    #[staticmethod]
+    fn numeric_at_most(field: String, threshold: f64) -> Self {
+        Self {
+            inner: Predicate::NumericAtMost {
+                key: tag_key(&field),
+                threshold,
+            },
+        }
+    }
+
+    /// `min <= field <= max` (numeric, both bounds inclusive).
+    #[staticmethod]
+    fn numeric_in_range(field: String, min: f64, max: f64) -> PyResult<Self> {
+        if !(min.is_finite() && max.is_finite()) || min > max {
+            return Err(MeshDbError::new_err(format!(
+                "numeric_in_range: requires finite min <= max (got min={min}, max={max})"
+            )));
+        }
+        Ok(Self {
+            inner: Predicate::NumericInRange {
+                key: tag_key(&field),
+                min,
+                max,
+            },
+        })
+    }
+
+    /// `field.startswith(prefix)` (string).
+    #[staticmethod]
+    fn string_prefix(field: String, prefix: String) -> Self {
+        Self {
+            inner: Predicate::StringPrefix {
+                key: tag_key(&field),
+                prefix,
+            },
+        }
+    }
+
+    /// `pattern in field` (substring; semantics match the
+    /// substrate's `Predicate::StringMatches` Phase E note —
+    /// substring-only today, regex behind a feature flag
+    /// later).
+    #[staticmethod]
+    fn string_matches(field: String, pattern: String) -> Self {
+        Self {
+            inner: Predicate::StringMatches {
+                key: tag_key(&field),
+                pattern,
+            },
+        }
+    }
+
+    /// `field >= version` (semver).
+    #[staticmethod]
+    fn semver_at_least(field: String, version: String) -> Self {
+        Self {
+            inner: Predicate::SemverAtLeast {
+                key: tag_key(&field),
+                version,
+            },
+        }
+    }
+
+    /// Conjunction. Empty list evaluates to `True` (vacuous
+    /// match — mirrors the substrate semantics).
+    #[staticmethod]
+    #[pyo3(name = "and_")]
+    fn and_(predicates: Vec<PyPredicate>) -> Self {
+        Self {
+            inner: Predicate::And(predicates.into_iter().map(|p| p.inner).collect()),
+        }
+    }
+
+    /// Disjunction. Empty list evaluates to `False` (vacuous
+    /// miss).
+    #[staticmethod]
+    #[pyo3(name = "or_")]
+    fn or_(predicates: Vec<PyPredicate>) -> Self {
+        Self {
+            inner: Predicate::Or(predicates.into_iter().map(|p| p.inner).collect()),
+        }
+    }
+
+    /// Negation.
+    #[staticmethod]
+    #[pyo3(name = "not_")]
+    fn not_(predicate: PyPredicate) -> Self {
+        Self {
+            inner: Predicate::Not(Box::new(predicate.inner)),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Predicate({:?})", self.inner)
+    }
+}
+
+/// Build a [`TagKey`] keyed on the synthetic `Dataforts` axis.
+/// Every Python-facing predicate field path is rooted here
+/// because `row::synthetic_row_view` populates every leaf as
+/// a `Dataforts`-axis tag — see the MeshDB row module.
+fn tag_key(field: &str) -> TagKey {
+    TagKey {
+        axis: TaxonomyAxis::Dataforts,
+        key: field.to_string(),
+    }
+}
+
 /// 1:1 AST surface. Construct via static factory methods that
 /// mirror the Rust `OperatorPlan` variants. Slice 1 ships the
 /// atomic operators (`at`, `between`, `latest`); composite
@@ -490,6 +656,25 @@ impl PyMeshQuery {
     #[staticmethod]
     fn latest(origin: u64) -> Self {
         let op = OperatorPlan::LatestRead { origin };
+        Self {
+            plan: plan_of(op),
+        }
+    }
+
+    /// Filter `inner`'s rows by `predicate`. The executor builds
+    /// a synthetic per-row tag view (origin / seq / flat JSON
+    /// payload fields) and evaluates the predicate; rows whose
+    /// evaluation returns `True` pass through unchanged. Rows
+    /// whose payload isn't JSON are still filterable by their
+    /// row-intrinsic fields (`origin`, `seq`); payload field
+    /// references against a non-JSON payload simply don't
+    /// match.
+    #[staticmethod]
+    fn filter(inner: &PyMeshQuery, predicate: &PyPredicate) -> Self {
+        let op = OperatorPlan::Filter {
+            input: Box::new(inner.plan.root.clone()),
+            predicate: predicate.inner.to_wire(),
+        };
         Self {
             plan: plan_of(op),
         }
@@ -685,6 +870,7 @@ impl PyMeshQuery {
             OperatorPlan::HashJoin { kind, .. } => {
                 format!("MeshQuery.join(kind={kind:?})")
             }
+            OperatorPlan::Filter { .. } => "MeshQuery.filter(...)".to_string(),
             // Slice 2 doesn't yet expose factories for these
             // (Filter needs a Predicate surface; LineageBack /
             // LineageForward need a CapabilityIndex). The

@@ -19,6 +19,7 @@ try:
         MeshDbError,
         MeshQuery,
         MeshQueryRunner,
+        Predicate,
         ResultRow,
         WindowBoundary,
     )
@@ -407,3 +408,218 @@ def test_aggregate_result_repr_includes_kind_and_value() -> None:
     agg = rows[0].decode_aggregate()
     assert "count" in repr(agg)
     assert "3" in repr(agg)
+
+
+# ---------------------------------------------------------------------
+# Slice 3: Filter operator + Predicate builder.
+# ---------------------------------------------------------------------
+
+
+def test_filter_equals_on_synthetic_seq_keeps_matching_rows() -> None:
+    chain = 0xCAFE
+    reader = _reader_with([(chain, s, f"p-{s}".encode()) for s in (1, 2, 3)])
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.filter(
+        MeshQuery.between(chain, 1, 10),
+        Predicate.equals("seq", "2"),
+    )
+    rows = runner.execute(q)
+    assert len(rows) == 1
+    assert rows[0].seq == 2
+    assert rows[0].payload == b"p-2"
+
+
+def test_filter_numeric_at_least_on_seq_keeps_upper_rows() -> None:
+    chain = 0xCAFE
+    reader = _reader_with([(chain, s, b"") for s in range(1, 6)])
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.filter(
+        MeshQuery.between(chain, 1, 10),
+        Predicate.numeric_at_least("seq", 3.0),
+    )
+    seqs = [r.seq for r in runner.execute(q)]
+    assert seqs == [3, 4, 5]
+
+
+def test_filter_on_json_payload_field() -> None:
+    chain = 0xC0DE
+    reader = _reader_with(
+        [
+            (chain, 1, b'{"severity":"low"}'),
+            (chain, 2, b'{"severity":"high"}'),
+            (chain, 3, b'{"severity":"high","other":"x"}'),
+            (chain, 4, b"not-json"),  # falls through; row-intrinsic only
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.filter(
+        MeshQuery.between(chain, 1, 10),
+        Predicate.equals("severity", "high"),
+    )
+    seqs = [r.seq for r in runner.execute(q)]
+    assert seqs == [2, 3]
+
+
+def test_filter_and_composition() -> None:
+    chain = 0xC0DE
+    reader = _reader_with(
+        [
+            (chain, 1, b'{"severity":"high","region":"us"}'),
+            (chain, 2, b'{"severity":"high","region":"eu"}'),
+            (chain, 3, b'{"severity":"low","region":"us"}'),
+            (chain, 4, b'{"severity":"high","region":"us"}'),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.filter(
+        MeshQuery.between(chain, 1, 10),
+        Predicate.and_(
+            [
+                Predicate.equals("severity", "high"),
+                Predicate.equals("region", "us"),
+            ]
+        ),
+    )
+    seqs = [r.seq for r in runner.execute(q)]
+    assert seqs == [1, 4]
+
+
+def test_filter_or_composition() -> None:
+    chain = 0xC0DE
+    reader = _reader_with(
+        [
+            (chain, 1, b'{"severity":"low"}'),
+            (chain, 2, b'{"severity":"medium"}'),
+            (chain, 3, b'{"severity":"high"}'),
+            (chain, 4, b'{"severity":"critical"}'),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.filter(
+        MeshQuery.between(chain, 1, 10),
+        Predicate.or_(
+            [
+                Predicate.equals("severity", "high"),
+                Predicate.equals("severity", "critical"),
+            ]
+        ),
+    )
+    seqs = [r.seq for r in runner.execute(q)]
+    assert seqs == [3, 4]
+
+
+def test_filter_not_composition() -> None:
+    chain = 0xC0DE
+    reader = _reader_with(
+        [
+            (chain, 1, b'{"severity":"low"}'),
+            (chain, 2, b'{"severity":"high"}'),
+            (chain, 3, b'{"severity":"low"}'),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.filter(
+        MeshQuery.between(chain, 1, 10),
+        Predicate.not_(Predicate.equals("severity", "low")),
+    )
+    seqs = [r.seq for r in runner.execute(q)]
+    assert seqs == [2]
+
+
+def test_filter_numeric_in_range() -> None:
+    chain = 0xC0DE
+    reader = _reader_with(
+        [(chain, s, f'{{"latency_ms":{s * 10}}}'.encode()) for s in range(1, 6)]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.filter(
+        MeshQuery.between(chain, 1, 10),
+        Predicate.numeric_in_range("latency_ms", 20.0, 40.0),
+    )
+    seqs = [r.seq for r in runner.execute(q)]
+    assert seqs == [2, 3, 4]
+
+
+def test_filter_numeric_in_range_rejects_inverted_bounds() -> None:
+    with pytest.raises(MeshDbError):
+        Predicate.numeric_in_range("x", 10.0, 5.0)
+
+
+def test_filter_string_prefix() -> None:
+    chain = 0xC0DE
+    reader = _reader_with(
+        [
+            (chain, 1, b'{"user":"alice"}'),
+            (chain, 2, b'{"user":"bob"}'),
+            (chain, 3, b'{"user":"alfred"}'),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.filter(
+        MeshQuery.between(chain, 1, 10),
+        Predicate.string_prefix("user", "al"),
+    )
+    seqs = [r.seq for r in runner.execute(q)]
+    assert seqs == [1, 3]
+
+
+def test_filter_string_matches_substring() -> None:
+    chain = 0xC0DE
+    reader = _reader_with(
+        [
+            (chain, 1, b'{"path":"/api/users/alice"}'),
+            (chain, 2, b'{"path":"/api/jobs/123"}'),
+            (chain, 3, b'{"path":"/healthz"}'),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.filter(
+        MeshQuery.between(chain, 1, 10),
+        Predicate.string_matches("path", "/api/"),
+    )
+    seqs = [r.seq for r in runner.execute(q)]
+    assert seqs == [1, 2]
+
+
+def test_filter_passes_when_payload_is_not_json_and_predicate_is_row_intrinsic() -> None:
+    # Predicates that key off origin / seq still work on rows
+    # with non-JSON payloads — synthetic_row_view always
+    # populates the row-intrinsic tags.
+    chain = 0xCAFE
+    reader = _reader_with(
+        [
+            (chain, 1, b"raw-bytes-not-json"),
+            (chain, 2, b"more-raw-bytes"),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.filter(
+        MeshQuery.between(chain, 1, 10),
+        Predicate.numeric_at_least("seq", 2.0),
+    )
+    rows = runner.execute(q)
+    assert len(rows) == 1
+    assert rows[0].seq == 2
+
+
+def test_filter_pipelined_with_aggregate() -> None:
+    # Filter THEN aggregate — the canonical pattern. Tests that
+    # composite operators chain correctly via factory calls.
+    chain = 0xC0DE
+    reader = _reader_with(
+        [
+            (chain, 1, b'{"severity":"high"}'),
+            (chain, 2, b'{"severity":"high"}'),
+            (chain, 3, b'{"severity":"low"}'),
+            (chain, 4, b'{"severity":"high"}'),
+            (chain, 5, b'{"severity":"low"}'),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    highs = MeshQuery.filter(
+        MeshQuery.between(chain, 1, 10),
+        Predicate.equals("severity", "high"),
+    )
+    q = MeshQuery.count(highs)
+    rows = runner.execute(q)
+    assert rows[0].decode_aggregate().count == 3

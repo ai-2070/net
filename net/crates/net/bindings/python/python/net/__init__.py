@@ -351,9 +351,10 @@ else:
 
 # MeshDB surface. Present iff the native module was built with
 # the `meshdb` Cargo feature. Slice 1 shipped the atomic factory
-# AST + sync runner + Phase F cache options; slice 2 adds the
+# AST + sync runner + Phase F cache options; slice 2 added the
 # composite-operator factories (window, aggregates, joins) and
-# the result-payload decoders.
+# the result-payload decoders; slice 3 adds the `Predicate`
+# builder and the `MeshQuery.filter()` factory.
 try:
     from ._net import (
         AggregateResult,
@@ -365,6 +366,7 @@ try:
         MeshDbError,
         MeshQuery,
         MeshQueryRunner,
+        Predicate,
         ResultRow,
         WindowBoundary,
     )
@@ -383,6 +385,7 @@ else:
             "MeshDbError",
             "MeshQuery",
             "MeshQueryRunner",
+            "Predicate",
             "ResultRow",
             "WindowBoundary",
         ]
