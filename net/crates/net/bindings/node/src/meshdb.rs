@@ -1262,7 +1262,7 @@ impl InMemoryChainReader {
 /// so callers can `for await (const row of stream)`.
 #[napi]
 pub struct MeshQueryRunner {
-    executor: Arc<LocalMeshQueryExecutor<InMemoryStore>>,
+    executor: LocalMeshQueryExecutor<InMemoryStore>,
 }
 
 #[napi]
@@ -1282,9 +1282,7 @@ impl MeshQueryRunner {
         } else {
             LocalMeshQueryExecutor::new(store)
         };
-        Self {
-            executor: Arc::new(executor),
-        }
+        Self { executor }
     }
 
     /// Execute `query`. Returns a stream whose `next()` yields
