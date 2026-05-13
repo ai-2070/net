@@ -1,5 +1,5 @@
 //! Real-wire MeshDB transport — bridges
-//! [`MeshDbTransport`](super::federated::MeshDbTransport) into
+//! [`MeshDbTransport`] into
 //! the mesh's `SUBPROTOCOL_MESHDB` subprotocol dispatch.
 //!
 //! # Surface
@@ -13,10 +13,10 @@
 //!   in-flight caller.
 //! - [`MeshDbServer`] — owns a local [`MeshQueryExecutor`] and
 //!   produces a stream of responses for every inbound request.
-//!   Plug into [`MeshDbWireDispatcher::with_server`] to handle
+//!   Plug into [`MeshDbWireDispatcher::set_server`] to handle
 //!   server-side traffic; omit it for caller-only nodes.
 //! - [`MeshDbWireTransport`] — the
-//!   [`MeshDbTransport`](super::federated::MeshDbTransport)
+//!   [`MeshDbTransport`]
 //!   implementation that the
 //!   [`FederatedMeshQueryExecutor`](super::federated::FederatedMeshQueryExecutor)
 //!   speaks. Encodes outbound `MeshDbRequest`s as
@@ -619,7 +619,7 @@ async fn run_server_call(
 /// [`MeshDbWireSender`] backed by a live `MeshNode`. Resolves
 /// `target_node → SocketAddr` via the mesh's peer table and ships
 /// the encoded frame as a single `SUBPROTOCOL_MESHDB` event via
-/// [`MeshNode::send_subprotocol`].
+/// `MeshNode::send_subprotocol`.
 ///
 /// Holds the mesh as `Weak` to avoid a reference cycle —
 /// `MeshNode` owns the dispatcher (via the inbound-router slot)

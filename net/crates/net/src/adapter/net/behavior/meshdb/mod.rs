@@ -38,11 +38,11 @@
 //!   proximity-ordered failover. `LoopbackTransport` drives
 //!   in-process 3-node integration tests without a real wire.
 //! - [`transport`] — real-wire hookup. `MeshDbWireDispatcher`
-//!   implements [`MeshDbInboundRouter`](transport::MeshDbInboundRouter)
+//!   implements [`transport::MeshDbInboundRouter`]
 //!   for the mesh's `SUBPROTOCOL_MESHDB` dispatch arm;
-//!   [`MeshDbServer`](transport::MeshDbServer) drives the
+//!   [`transport::MeshDbServer`] drives the
 //!   server-side executor + streams responses back via the
-//!   sender. [`enable_meshdb_on_mesh`](transport::enable_meshdb_on_mesh)
+//!   sender. [`transport::enable_meshdb_on_mesh`]
 //!   plumbs everything onto a live `MeshNode`.
 //!
 //! # AST versioning (locked decision #1)
