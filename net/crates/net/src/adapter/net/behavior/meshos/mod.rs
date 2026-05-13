@@ -56,12 +56,19 @@ pub mod event;
 pub mod event_loop;
 pub mod maintenance;
 pub mod reconcile;
+pub mod snapshot;
 pub mod state;
 pub mod supervision;
 
 pub use action::{ActionId, AllocateActionId, MaintenanceTransition, MeshOsAction, PendingAction};
 pub use config::{BackpressureConfig, LocalityConfig, MaintenanceConfig, MeshOsConfig};
 pub use maintenance::MaintenanceState;
+pub use snapshot::{
+    action_kind_str, AvoidEntrySnapshot, DaemonHealthSnapshot, DaemonLifecycleSnapshot,
+    DaemonSnapshot, FailureRecord, MaintenanceMirrorSnapshot, MaintenanceStateSnapshot,
+    MeshOsSnapshot, PeerHealthSnapshot, PeerSnapshot, PendingActionSnapshot, ReplicaSnapshot,
+    RestartStateSnapshot, RECENT_FAILURES_CAPACITY,
+};
 pub use control::MeshOsControl;
 pub use event::{
     AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,
