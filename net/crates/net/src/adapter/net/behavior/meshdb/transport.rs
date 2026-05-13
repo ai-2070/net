@@ -809,8 +809,25 @@ impl MeshDbWireSender for MeshNodeMeshDbSender {
 /// Caller-only nodes leave `server` as `None`. Nodes that
 /// answer remote queries pass `Some(MeshDbServer::new(executor))`.
 ///
-/// Idempotent — calling twice replaces the previously-installed
-/// router on `mesh`.
+/// # Re-install semantics (not transparently idempotent)
+///
+/// Calling twice replaces the inbound-router slot on `mesh` with
+/// a *new* dispatcher and inflight table. **In-flight callers
+/// holding a transport returned by an earlier call keep writing
+/// into the old inflight table**, which the new dispatcher's
+/// `try_route` no longer consults — those callers' responses
+/// will arrive as `UnknownCallId` and be dropped. Server-side
+/// the same problem applies: a per-call task spawned by the old
+/// dispatcher's server keeps shipping responses via the old
+/// `MeshNodeMeshDbSender`, but the matching inflight entries on
+/// the calling peer's side have already been migrated.
+///
+/// Safe usage: install once at node startup. If you must
+/// re-install (operator surface swap, server hot-replace), drain
+/// every in-flight call against the prior dispatcher first.
+/// `set_server` on the original dispatcher is the right primitive
+/// for swapping just the server side without migrating the
+/// inflight table.
 pub fn enable_meshdb_on_mesh(
     mesh: &Arc<crate::adapter::net::MeshNode>,
     server: Option<Arc<MeshDbServer>>,
