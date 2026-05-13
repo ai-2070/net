@@ -1457,13 +1457,10 @@ function WhyNotBestEffortSection() {
 
         <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
           <p className="text-[18px] text-ink leading-[1.5] font-light">
-            The benchmark numbers aren&apos;t performance metrics. They&apos;re{" "}
-            <strong className="text-accent font-medium">
-              existence proofs
-            </strong>
-            . They demonstrate that the software layer is no longer the
-            bottleneck. The remaining latency is physics: NIC, wire, speed of
-            light. The software got out of the way.
+            The remaining latency is physics: NIC, wire, speed of light.{" "}
+            <span className="text-accent">
+              The software got out of the way.
+            </span>
           </p>
         </div>
       </div>
