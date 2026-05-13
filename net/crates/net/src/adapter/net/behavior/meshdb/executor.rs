@@ -145,40 +145,100 @@ pub trait ChainReader: Send + Sync {
     fn latest_seq(&self, origin: u64) -> Option<SeqNum>;
 }
 
+/// Per-call execution options. Phase F surfaces caching
+/// here: callers either accept the default
+/// `TimeBound { ttl: 5s }` policy or pass `Permanent` for
+/// queries they know are over a closed substrate range
+/// (`At` / bounded `Between`). [`Self::bypass_cache`] skips
+/// both lookup and writeback for diagnostics + authoritative
+/// reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ExecuteOptions {
+    /// Skip cache lookup AND writeback. Default `false`.
+    pub bypass_cache: bool,
+    /// Cache policy for this query. Default
+    /// `CachePolicy::TimeBound { ttl: 5s }`.
+    pub cache_policy: super::cache::CachePolicy,
+}
+
 /// The user-facing executor surface. Walks an
 /// [`ExecutionPlan`] and produces rows.
 ///
-/// Phase B-2 implementors:
-/// - [`LocalMeshQueryExecutor`] — single-node, reads through
-///   a [`ChainReader`].
-///
-/// Future phases: a `FederatedMeshQueryExecutor` that fans out
-/// to `target_nodes` over the transport, with partial-result
-/// + continuation-token semantics.
+/// Implementors ship with caching disabled by default;
+/// [`LocalMeshQueryExecutor::with_cache`] and
+/// [`super::federated::FederatedMeshQueryExecutor::with_cache`]
+/// wire the Phase F LRU. The default `execute(plan)` is
+/// equivalent to `execute_with(plan, ExecuteOptions::default())`
+/// so existing call sites need no change.
 #[async_trait]
 pub trait MeshQueryExecutor: Send + Sync {
-    /// Begin execution of `plan`. Returns a [`RunningQuery`]
-    /// with a row stream + a cancellable handle.
+    /// Begin execution of `plan` with default
+    /// [`ExecuteOptions`].
     ///
     /// Errors before stream construction (e.g. unresolved
     /// composite operator) surface synchronously; errors mid-
     /// stream surface as `Err` items in the stream.
-    async fn execute(&self, plan: ExecutionPlan) -> Result<RunningQuery, MeshError>;
+    async fn execute(&self, plan: ExecutionPlan) -> Result<RunningQuery, MeshError> {
+        self.execute_with(plan, ExecuteOptions::default()).await
+    }
+
+    /// Begin execution of `plan` with explicit options.
+    /// Cache-aware implementors honour [`ExecuteOptions::bypass_cache`]
+    /// and [`ExecuteOptions::cache_policy`]; cache-less ones
+    /// silently ignore both.
+    async fn execute_with(
+        &self,
+        plan: ExecutionPlan,
+        options: ExecuteOptions,
+    ) -> Result<RunningQuery, MeshError>;
 }
 
 /// Single-node executor. Generic over a [`ChainReader`] so the
 /// tests can drive it without needing a real RedEX file.
+///
+/// The executor optionally holds a Phase F result cache plus
+/// a snapshot of the local capability index's mutation
+/// version (read at lookup time). Without these hooks, the
+/// executor still runs but caching is a no-op (matches the
+/// trait's "implementors silently ignore options" contract).
 pub struct LocalMeshQueryExecutor<R: ChainReader> {
     reader: Arc<R>,
     next_id: AtomicU64,
+    cache: Option<Arc<dyn super::cache::ResultCache>>,
+    /// Closure that reads the live capability-index version.
+    /// Passed in at construction so the executor doesn't pull
+    /// in `CapabilityIndex` as a hard dep (tests can mock).
+    capability_version: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
 
 impl<R: ChainReader> LocalMeshQueryExecutor<R> {
-    /// Construct a new local executor.
+    /// Construct a cache-less local executor. `execute_with`
+    /// silently ignores [`ExecuteOptions::cache_policy`] and
+    /// [`ExecuteOptions::bypass_cache`] in this mode.
     pub fn new(reader: Arc<R>) -> Self {
         Self {
             reader,
             next_id: AtomicU64::new(1),
+            cache: None,
+            capability_version: None,
+        }
+    }
+
+    /// Construct a cache-aware local executor. The
+    /// `capability_version` closure is consulted at lookup
+    /// time to build the cache key; a divergence between the
+    /// stored entry's version and the live version is a
+    /// pull-invalidation miss per the locked Phase F design.
+    pub fn with_cache(
+        reader: Arc<R>,
+        cache: Arc<dyn super::cache::ResultCache>,
+        capability_version: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        Self {
+            reader,
+            next_id: AtomicU64::new(1),
+            cache: Some(cache),
+            capability_version: Some(capability_version),
         }
     }
 
@@ -189,7 +249,44 @@ impl<R: ChainReader> LocalMeshQueryExecutor<R> {
 
 #[async_trait]
 impl<R: ChainReader + 'static> MeshQueryExecutor for LocalMeshQueryExecutor<R> {
-    async fn execute(&self, plan: ExecutionPlan) -> Result<RunningQuery, MeshError> {
+    async fn execute_with(
+        &self,
+        plan: ExecutionPlan,
+        options: ExecuteOptions,
+    ) -> Result<RunningQuery, MeshError> {
+        // Cache fast path: try lookup; on hit, stream the
+        // materialized rows. On miss, run the operator tree,
+        // collect rows, write back (if applicable), then stream.
+        if let (Some(cache), Some(version_fn), false) = (
+            self.cache.as_ref(),
+            self.capability_version.as_ref(),
+            options.bypass_cache,
+        ) {
+            let version = version_fn();
+            let key = super::cache::CacheKey::for_plan(&plan, version);
+            if let Some(cached) = cache.get(&key) {
+                let handle = QueryHandle::new(self.allocate_id());
+                let rows = stream_from_vec(cached.rows, handle.clone());
+                return Ok(RunningQuery { handle, rows });
+            }
+            // Miss: execute + write back.
+            let rows = collect_operator_rows(&plan.root, self.reader.as_ref())?;
+            cache.insert(
+                key,
+                super::cache::CachedResult {
+                    rows: rows.clone(),
+                    inserted_at: std::time::Instant::now(),
+                    policy: options.cache_policy,
+                },
+            );
+            let handle = QueryHandle::new(self.allocate_id());
+            let stream = stream_from_vec(rows, handle.clone());
+            return Ok(RunningQuery {
+                handle,
+                rows: stream,
+            });
+        }
+        // Cache-less path (no cache wired, or bypass requested).
         let handle = QueryHandle::new(self.allocate_id());
         let rows = walk_operator(&plan.root, self.reader.clone(), handle.clone())?;
         Ok(RunningQuery { handle, rows })
@@ -1069,6 +1166,167 @@ mod tests {
 
     async fn collect_rows(rows: ResultStream) -> Vec<Result<ResultRow, MeshError>> {
         rows.collect::<Vec<_>>().await
+    }
+
+    #[tokio::test]
+    async fn cache_hit_serves_cached_rows_without_calling_reader() {
+        use super::super::cache::{LruResultCache, ResultCache};
+        use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
+
+        // Reader that counts reads — a cache hit should never
+        // touch it.
+        struct CountingReader {
+            inner: InMemoryChainReader,
+            reads: AtomicU64,
+        }
+        impl ChainReader for CountingReader {
+            fn read_one(&self, origin: u64, seq: SeqNum) -> Option<Vec<u8>> {
+                self.reads.fetch_add(1, AOrdering::Relaxed);
+                self.inner.read_one(origin, seq)
+            }
+            fn read_range(&self, o: u64, s: SeqNum, e: SeqNum) -> Vec<(SeqNum, Vec<u8>)> {
+                self.reads.fetch_add(1, AOrdering::Relaxed);
+                self.inner.read_range(o, s, e)
+            }
+            fn latest_seq(&self, o: u64) -> Option<SeqNum> {
+                self.reads.fetch_add(1, AOrdering::Relaxed);
+                self.inner.latest_seq(o)
+            }
+        }
+
+        let inner = InMemoryChainReader::default();
+        inner.append(0xAA, SeqNum(1), b"v".to_vec());
+        let reader = Arc::new(CountingReader {
+            inner,
+            reads: AtomicU64::new(0),
+        });
+
+        let cache: Arc<dyn ResultCache> = Arc::new(LruResultCache::default());
+        let version = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let v = version.clone();
+        let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> =
+            Arc::new(move || v.load(AOrdering::Acquire));
+        let executor = LocalMeshQueryExecutor::with_cache(
+            reader.clone(),
+            cache.clone(),
+            version_fn,
+        );
+
+        let plan = atomic_plan(OperatorPlan::AtRead {
+            origin: 0xAA,
+            seq: SeqNum(1),
+        });
+
+        // First execute: miss. Reader gets called.
+        let _ = collect_rows(executor.execute(plan.clone()).await.unwrap().rows).await;
+        let first_reads = reader.reads.load(AOrdering::Relaxed);
+        assert!(first_reads >= 1);
+
+        // Second execute, same plan + version: hit. No new reads.
+        let _ = collect_rows(executor.execute(plan).await.unwrap().rows).await;
+        let second_reads = reader.reads.load(AOrdering::Relaxed);
+        assert_eq!(second_reads, first_reads, "cache hit should not call reader");
+    }
+
+    #[tokio::test]
+    async fn cache_invalidated_on_version_bump() {
+        use super::super::cache::{LruResultCache, ResultCache};
+        use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
+
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(0xAA, SeqNum(1), b"v1".to_vec());
+        let cache: Arc<dyn ResultCache> = Arc::new(LruResultCache::default());
+        let version = Arc::new(AtomicU64::new(0));
+        let v = version.clone();
+        let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> =
+            Arc::new(move || v.load(AOrdering::Acquire));
+        let executor = LocalMeshQueryExecutor::with_cache(
+            reader.clone(),
+            cache.clone(),
+            version_fn,
+        );
+        let plan = atomic_plan(OperatorPlan::AtRead {
+            origin: 0xAA,
+            seq: SeqNum(1),
+        });
+
+        // Cache the result under version 0.
+        let _ = collect_rows(executor.execute(plan.clone()).await.unwrap().rows).await;
+        assert_eq!(cache.len(), 1);
+
+        // Bump version (simulates a capability index mutation).
+        version.fetch_add(1, AOrdering::AcqRel);
+
+        // Same plan, new version → new cache entry (the old one
+        // becomes unreachable by key but isn't dropped until LRU).
+        let _ = collect_rows(executor.execute(plan).await.unwrap().rows).await;
+        assert_eq!(cache.len(), 2, "different version → new entry");
+    }
+
+    #[tokio::test]
+    async fn cache_bypass_skips_both_lookup_and_writeback() {
+        use super::super::cache::{CachePolicy, LruResultCache, ResultCache};
+
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(0xAA, SeqNum(1), b"v".to_vec());
+        let cache: Arc<dyn ResultCache> = Arc::new(LruResultCache::default());
+        let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 0);
+        let executor = LocalMeshQueryExecutor::with_cache(
+            reader.clone(),
+            cache.clone(),
+            version_fn,
+        );
+
+        let plan = atomic_plan(OperatorPlan::AtRead {
+            origin: 0xAA,
+            seq: SeqNum(1),
+        });
+        let opts = ExecuteOptions {
+            bypass_cache: true,
+            cache_policy: CachePolicy::Permanent,
+        };
+        let _ =
+            collect_rows(executor.execute_with(plan, opts).await.unwrap().rows).await;
+        assert_eq!(cache.len(), 0, "bypass must not write back");
+    }
+
+    #[tokio::test]
+    async fn cache_permanent_policy_survives_ttl_window() {
+        use super::super::cache::{CachePolicy, LruResultCache, ResultCache};
+        use std::time::Duration;
+
+        let reader = Arc::new(InMemoryChainReader::default());
+        reader.append(0xAA, SeqNum(1), b"v".to_vec());
+        let cache: Arc<dyn ResultCache> = Arc::new(LruResultCache::default());
+        let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 0);
+        let executor = LocalMeshQueryExecutor::with_cache(
+            reader.clone(),
+            cache.clone(),
+            version_fn,
+        );
+
+        let plan = atomic_plan(OperatorPlan::AtRead {
+            origin: 0xAA,
+            seq: SeqNum(1),
+        });
+        let opts = ExecuteOptions {
+            bypass_cache: false,
+            cache_policy: CachePolicy::Permanent,
+        };
+        let _ = collect_rows(
+            executor
+                .execute_with(plan.clone(), opts)
+                .await
+                .unwrap()
+                .rows,
+        )
+        .await;
+
+        // Wait past the default TTL window. Permanent should
+        // still hit.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let key = super::super::cache::CacheKey::for_plan(&plan, 0);
+        assert!(cache.get(&key).is_some(), "permanent never expires by time");
     }
 
     #[tokio::test]

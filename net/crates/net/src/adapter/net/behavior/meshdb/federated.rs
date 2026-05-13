@@ -90,17 +90,43 @@ pub trait MeshDbTransport: Send + Sync {
 
 /// Federated executor — fans atomic operators out to
 /// `target_nodes` via the transport.
+///
+/// Like the local executor, optionally holds a Phase F cache
+/// alongside a capability-version closure for pull-invalidation.
+/// Phase F locked decision: only top-level plans cache —
+/// sub-plan caching (Aggregate inner, HashJoin sides) is
+/// deferred until profiling justifies the bookkeeping.
 pub struct FederatedMeshQueryExecutor<T: MeshDbTransport> {
     transport: Arc<T>,
     next_id: AtomicU64,
+    cache: Option<Arc<dyn super::cache::ResultCache>>,
+    capability_version: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
 
 impl<T: MeshDbTransport> FederatedMeshQueryExecutor<T> {
-    /// Construct a federated executor over the given transport.
+    /// Construct a cache-less federated executor.
     pub fn new(transport: Arc<T>) -> Self {
         Self {
             transport,
             next_id: AtomicU64::new(1),
+            cache: None,
+            capability_version: None,
+        }
+    }
+
+    /// Construct a cache-aware federated executor. Same
+    /// pull-invalidation semantics as
+    /// [`super::executor::LocalMeshQueryExecutor::with_cache`].
+    pub fn with_cache(
+        transport: Arc<T>,
+        cache: Arc<dyn super::cache::ResultCache>,
+        capability_version: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        Self {
+            transport,
+            next_id: AtomicU64::new(1),
+            cache: Some(cache),
+            capability_version: Some(capability_version),
         }
     }
 
@@ -111,7 +137,63 @@ impl<T: MeshDbTransport> FederatedMeshQueryExecutor<T> {
 
 #[async_trait]
 impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecutor<T> {
-    async fn execute(&self, plan: ExecutionPlan) -> Result<RunningQuery, MeshError> {
+    async fn execute_with(
+        &self,
+        plan: ExecutionPlan,
+        options: super::executor::ExecuteOptions,
+    ) -> Result<RunningQuery, MeshError> {
+        // Cache fast path. Top-level plans only; sub-plan
+        // recursion below this point bypasses caching.
+        if let (Some(cache), Some(version_fn), false) = (
+            self.cache.as_ref(),
+            self.capability_version.as_ref(),
+            options.bypass_cache,
+        ) {
+            let version = version_fn();
+            let key = super::cache::CacheKey::for_plan(&plan, version);
+            if let Some(cached) = cache.get(&key) {
+                let handle = QueryHandle::new(self.allocate_id());
+                let rows: Vec<Result<ResultRow, MeshError>> =
+                    cached.rows.into_iter().map(Ok).collect();
+                let stream: ResultStream = Box::pin(futures::stream::iter(rows));
+                return Ok(RunningQuery {
+                    handle,
+                    rows: stream,
+                });
+            }
+            // Miss. Run the actual federated path with
+            // caching temporarily disabled (so the recursive
+            // sub-plan executes don't try to cache too), then
+            // drain + cache the top-level rows.
+            let drained = self.execute_uncached(plan.clone()).await?;
+            let collected = drain_rows(drained.rows).await?;
+            cache.insert(
+                key,
+                super::cache::CachedResult {
+                    rows: collected.clone(),
+                    inserted_at: std::time::Instant::now(),
+                    policy: options.cache_policy,
+                },
+            );
+            let handle = QueryHandle::new(self.allocate_id());
+            let stream: ResultStream = Box::pin(futures::stream::iter(
+                collected.into_iter().map(Ok).collect::<Vec<_>>(),
+            ));
+            return Ok(RunningQuery {
+                handle,
+                rows: stream,
+            });
+        }
+        self.execute_uncached(plan).await
+    }
+}
+
+impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
+    /// The original cache-less execute path. Top-level cache
+    /// gating lives in `execute_with`; this method is the
+    /// fallback when no cache is wired or `bypass_cache` is
+    /// set.
+    async fn execute_uncached(&self, plan: ExecutionPlan) -> Result<RunningQuery, MeshError> {
         // Phase B-4 scope: atomic root operators dispatch to
         // remote target_nodes. LineageEmit is a planner-only
         // leaf (walk happened at plan time, no remote work);
@@ -261,12 +343,12 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
 
         // Fetch each side through the federated executor so
         // atomic leaves still dispatch via the transport.
-        let left_running = Box::pin(self.execute(ExecutionPlan {
+        let left_running = Box::pin(self.execute_uncached(ExecutionPlan {
             root: *left,
             total_cost: CostEstimate::default(),
         }))
         .await?;
-        let right_running = Box::pin(self.execute(ExecutionPlan {
+        let right_running = Box::pin(self.execute_uncached(ExecutionPlan {
             root: *right,
             total_cost: CostEstimate::default(),
         }))
@@ -339,7 +421,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             unreachable!("execute_filter_federated dispatched on non-Filter");
         };
 
-        let inner = Box::pin(self.execute(ExecutionPlan {
+        let inner = Box::pin(self.execute_uncached(ExecutionPlan {
             root: *input,
             total_cost: CostEstimate::default(),
         }))
@@ -381,7 +463,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
         let OperatorPlan::Window { input, spec } = plan.root.operator else {
             unreachable!("execute_window_federated dispatched on non-Window");
         };
-        let inner = Box::pin(self.execute(ExecutionPlan {
+        let inner = Box::pin(self.execute_uncached(ExecutionPlan {
             root: *input,
             total_cost: CostEstimate::default(),
         }))
@@ -416,7 +498,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
                 field_path,
                 kind,
             } => {
-                let inner = Box::pin(self.execute(ExecutionPlan {
+                let inner = Box::pin(self.execute_uncached(ExecutionPlan {
                     root: *input,
                     total_cost: CostEstimate::default(),
                 }))
@@ -429,7 +511,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
                 group_by,
                 field_path,
             } => {
-                let inner = Box::pin(self.execute(ExecutionPlan {
+                let inner = Box::pin(self.execute_uncached(ExecutionPlan {
                     root: *input,
                     total_cost: CostEstimate::default(),
                 }))
@@ -470,7 +552,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             unreachable!("execute_aggregate_numeric_federated dispatched on non-AggregateNumeric");
         };
 
-        let inner = Box::pin(self.execute(ExecutionPlan {
+        let inner = Box::pin(self.execute_uncached(ExecutionPlan {
             root: *input,
             total_cost: CostEstimate::default(),
         }))
@@ -576,7 +658,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
 
         // Fetch the inner rows via the federated path so atomic
         // leaves still dispatch through the transport.
-        let inner = Box::pin(self.execute(ExecutionPlan {
+        let inner = Box::pin(self.execute_uncached(ExecutionPlan {
             root: *input,
             total_cost: CostEstimate::default(),
         }))

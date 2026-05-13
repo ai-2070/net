@@ -69,6 +69,7 @@
 //! watermark, sketch parameters, common query shapes), Phase A's
 //! AST + planner skeleton is the only surface in code.
 
+pub mod cache;
 pub mod error;
 pub mod executor;
 pub mod federated;
@@ -77,6 +78,10 @@ pub mod protocol;
 pub mod query;
 pub mod row;
 
+pub use cache::{
+    CacheKey, CachePolicy, CachedResult, LruResultCache, ResultCache, LRU_MAX_BYTES,
+    LRU_MAX_ENTRIES,
+};
 pub use error::{BudgetMetric, MeshError};
 pub use executor::{
     ChainReader, LocalMeshQueryExecutor, MeshQueryExecutor, QueryHandle, QueryId, ResultStream,
