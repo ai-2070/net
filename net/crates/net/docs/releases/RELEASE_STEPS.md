@@ -6,7 +6,9 @@
 
 3. Draft release note
 
-4. Run commands
+4. Pull master
+
+5. Run commands
 
 ```bash
 # Main release
