@@ -148,6 +148,36 @@ pub extern "C" fn net_meshdb_clear_last_error() {
     clear_last_error();
 }
 
+/// Wrap an FFI entry-point body in `catch_unwind`. Unwinding
+/// across `extern "C"` is undefined behaviour; any panic that
+/// escapes a guarded body is trapped, recorded as the thread-
+/// local last-error pair with kind `"runtime_panic"`, and the
+/// supplied `$default` is returned. Use:
+///
+/// ```ignore
+/// pub extern "C" fn net_meshdb_thing() -> *mut Foo {
+///     ffi_guard!(ptr::null_mut(), {
+///         // body...
+///     })
+/// }
+/// ```
+///
+/// The two `runner_execute*` paths use a hand-rolled
+/// `catch_unwind` because they already need an inner closure
+/// around the tokio `block_on`; everywhere else uses this
+/// macro for uniformity.
+macro_rules! ffi_guard {
+    ($default:expr, $body:block) => {{
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(v) => v,
+            Err(payload) => {
+                set_last_error_from_panic(&*payload);
+                $default
+            }
+        }
+    }};
+}
+
 /// Opaque handle to a Phase F-less local executor over an
 /// in-memory chain reader. Holds its own `Arc<InMemoryStore>`
 /// clone so the runner survives even if the caller frees the
@@ -229,9 +259,11 @@ pub struct MeshDbReader {
 /// Allocates a heap object; caller owns the returned pointer.
 #[no_mangle]
 pub extern "C" fn net_meshdb_reader_new() -> *mut MeshDbReader {
-    Box::into_raw(Box::new(MeshDbReader {
-        store: Arc::new(InMemoryStore::default()),
-    }))
+    ffi_guard!(ptr::null_mut(), {
+        Box::into_raw(Box::new(MeshDbReader {
+            store: Arc::new(InMemoryStore::default()),
+        }))
+    })
 }
 
 /// Free a reader handle. No-op on null.
@@ -251,10 +283,12 @@ pub extern "C" fn net_meshdb_reader_new() -> *mut MeshDbReader {
 /// already.
 #[no_mangle]
 pub unsafe extern "C" fn net_meshdb_reader_free(reader: *mut MeshDbReader) {
-    if reader.is_null() {
-        return;
-    }
-    drop(Box::from_raw(reader));
+    ffi_guard!((), {
+        if reader.is_null() {
+            return;
+        }
+        drop(Box::from_raw(reader));
+    })
 }
 
 /// Append `(origin, seq, payload)` to the reader.
@@ -277,26 +311,28 @@ pub unsafe extern "C" fn net_meshdb_reader_append(
     payload: *const u8,
     payload_len: usize,
 ) -> c_int {
-    if reader.is_null() {
-        return NET_MESHDB_INVALID_ARG;
-    }
-    let payload_vec = if payload_len == 0 {
-        Vec::new()
-    } else if payload.is_null() {
-        return NET_MESHDB_INVALID_ARG;
-    } else {
-        slice::from_raw_parts(payload, payload_len).to_vec()
-    };
-    let reader_ref = &*reader;
-    reader_ref
-        .store
-        .chains
-        .lock()
-        .unwrap()
-        .entry(origin)
-        .or_default()
-        .insert(SeqNum(seq), payload_vec);
-    NET_MESHDB_OK
+    ffi_guard!(NET_MESHDB_RUNTIME_ERR, {
+        if reader.is_null() {
+            return NET_MESHDB_INVALID_ARG;
+        }
+        let payload_vec = if payload_len == 0 {
+            Vec::new()
+        } else if payload.is_null() {
+            return NET_MESHDB_INVALID_ARG;
+        } else {
+            slice::from_raw_parts(payload, payload_len).to_vec()
+        };
+        let reader_ref = &*reader;
+        reader_ref
+            .store
+            .chains
+            .lock()
+            .unwrap()
+            .entry(origin)
+            .or_default()
+            .insert(SeqNum(seq), payload_vec);
+        NET_MESHDB_OK
+    })
 }
 
 // =====================================================================
@@ -310,33 +346,39 @@ pub unsafe extern "C" fn net_meshdb_reader_append(
 /// Free with `net_meshdb_query_free`.
 #[no_mangle]
 pub extern "C" fn net_meshdb_query_at(origin: u64, seq: u64) -> *mut MeshDbQuery {
-    let plan = plan_of(OperatorPlan::AtRead {
-        origin,
-        seq: SeqNum(seq),
-    });
-    Box::into_raw(Box::new(MeshDbQuery { plan }))
+    ffi_guard!(ptr::null_mut(), {
+        let plan = plan_of(OperatorPlan::AtRead {
+            origin,
+            seq: SeqNum(seq),
+        });
+        Box::into_raw(Box::new(MeshDbQuery { plan }))
+    })
 }
 
 /// Construct a `Between(origin, start, end)` query (half-open).
 /// Returns null when `start >= end`.
 #[no_mangle]
 pub extern "C" fn net_meshdb_query_between(origin: u64, start: u64, end: u64) -> *mut MeshDbQuery {
-    if start >= end {
-        return ptr::null_mut();
-    }
-    let plan = plan_of(OperatorPlan::BetweenRead {
-        origin,
-        start: SeqNum(start),
-        end: SeqNum(end),
-    });
-    Box::into_raw(Box::new(MeshDbQuery { plan }))
+    ffi_guard!(ptr::null_mut(), {
+        if start >= end {
+            return ptr::null_mut();
+        }
+        let plan = plan_of(OperatorPlan::BetweenRead {
+            origin,
+            start: SeqNum(start),
+            end: SeqNum(end),
+        });
+        Box::into_raw(Box::new(MeshDbQuery { plan }))
+    })
 }
 
 /// Construct a `Latest(origin)` query.
 #[no_mangle]
 pub extern "C" fn net_meshdb_query_latest(origin: u64) -> *mut MeshDbQuery {
-    let plan = plan_of(OperatorPlan::LatestRead { origin });
-    Box::into_raw(Box::new(MeshDbQuery { plan }))
+    ffi_guard!(ptr::null_mut(), {
+        let plan = plan_of(OperatorPlan::LatestRead { origin });
+        Box::into_raw(Box::new(MeshDbQuery { plan }))
+    })
 }
 
 // =====================================================================
@@ -402,15 +444,17 @@ pub unsafe extern "C" fn net_meshdb_query_window(
     inner: *const MeshDbQuery,
     size: u64,
 ) -> *mut MeshDbQuery {
-    if inner.is_null() || size == 0 {
-        return ptr::null_mut();
-    }
-    let inner_node = (&*inner).plan.root.clone();
-    let plan = plan_of(OperatorPlan::Window {
-        input: Box::new(inner_node),
-        spec: WindowSpec::TumblingSeq { size },
-    });
-    Box::into_raw(Box::new(MeshDbQuery { plan }))
+    ffi_guard!(ptr::null_mut(), {
+        if inner.is_null() || size == 0 {
+            return ptr::null_mut();
+        }
+        let inner_node = (&*inner).plan.root.clone();
+        let plan = plan_of(OperatorPlan::Window {
+            input: Box::new(inner_node),
+            spec: WindowSpec::TumblingSeq { size },
+        });
+        Box::into_raw(Box::new(MeshDbQuery { plan }))
+    })
 }
 
 /// `Count(inner, group_by)`. `group_by` is a comma-separated
@@ -424,18 +468,20 @@ pub unsafe extern "C" fn net_meshdb_query_count(
     inner: *const MeshDbQuery,
     group_by: *const std::ffi::c_char,
 ) -> *mut MeshDbQuery {
-    if inner.is_null() {
-        return ptr::null_mut();
-    }
-    let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
-        return ptr::null_mut();
-    };
-    let inner_node = (&*inner).plan.root.clone();
-    let plan = plan_of(OperatorPlan::AggregateCount {
-        input: Box::new(inner_node),
-        group_by: group_by_mode,
-    });
-    Box::into_raw(Box::new(MeshDbQuery { plan }))
+    ffi_guard!(ptr::null_mut(), {
+        if inner.is_null() {
+            return ptr::null_mut();
+        }
+        let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
+            return ptr::null_mut();
+        };
+        let inner_node = (&*inner).plan.root.clone();
+        let plan = plan_of(OperatorPlan::AggregateCount {
+            input: Box::new(inner_node),
+            group_by: group_by_mode,
+        });
+        Box::into_raw(Box::new(MeshDbQuery { plan }))
+    })
 }
 
 /// `Sum / Avg / Min / Max / DistinctCount` aggregates. `kind` is
@@ -453,49 +499,51 @@ pub unsafe extern "C" fn net_meshdb_query_numeric_agg(
     field: *const std::ffi::c_char,
     group_by: *const std::ffi::c_char,
 ) -> *mut MeshDbQuery {
-    if inner.is_null() {
-        return ptr::null_mut();
-    }
-    let (Some(kind), Some(field)) = (cstr_to_string(kind), cstr_to_string(field)) else {
-        return ptr::null_mut();
-    };
-    let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
-        return ptr::null_mut();
-    };
-    let inner_node = (&*inner).plan.root.clone();
-    let op = match kind.as_str() {
-        "sum" => OperatorPlan::AggregateNumeric {
-            input: Box::new(inner_node),
-            group_by: group_by_mode,
-            field_path: field,
-            kind: NumericAggregateKind::Sum,
-        },
-        "avg" => OperatorPlan::AggregateNumeric {
-            input: Box::new(inner_node),
-            group_by: group_by_mode,
-            field_path: field,
-            kind: NumericAggregateKind::Avg,
-        },
-        "min" => OperatorPlan::AggregateReduction {
-            input: Box::new(inner_node),
-            group_by: group_by_mode,
-            field_path: field,
-            kind: NumericReductionKind::Min,
-        },
-        "max" => OperatorPlan::AggregateReduction {
-            input: Box::new(inner_node),
-            group_by: group_by_mode,
-            field_path: field,
-            kind: NumericReductionKind::Max,
-        },
-        "distinct_count" => OperatorPlan::AggregateDistinct {
-            input: Box::new(inner_node),
-            group_by: group_by_mode,
-            field_path: field,
-        },
-        _ => return ptr::null_mut(),
-    };
-    Box::into_raw(Box::new(MeshDbQuery { plan: plan_of(op) }))
+    ffi_guard!(ptr::null_mut(), {
+        if inner.is_null() {
+            return ptr::null_mut();
+        }
+        let (Some(kind), Some(field)) = (cstr_to_string(kind), cstr_to_string(field)) else {
+            return ptr::null_mut();
+        };
+        let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
+            return ptr::null_mut();
+        };
+        let inner_node = (&*inner).plan.root.clone();
+        let op = match kind.as_str() {
+            "sum" => OperatorPlan::AggregateNumeric {
+                input: Box::new(inner_node),
+                group_by: group_by_mode,
+                field_path: field,
+                kind: NumericAggregateKind::Sum,
+            },
+            "avg" => OperatorPlan::AggregateNumeric {
+                input: Box::new(inner_node),
+                group_by: group_by_mode,
+                field_path: field,
+                kind: NumericAggregateKind::Avg,
+            },
+            "min" => OperatorPlan::AggregateReduction {
+                input: Box::new(inner_node),
+                group_by: group_by_mode,
+                field_path: field,
+                kind: NumericReductionKind::Min,
+            },
+            "max" => OperatorPlan::AggregateReduction {
+                input: Box::new(inner_node),
+                group_by: group_by_mode,
+                field_path: field,
+                kind: NumericReductionKind::Max,
+            },
+            "distinct_count" => OperatorPlan::AggregateDistinct {
+                input: Box::new(inner_node),
+                group_by: group_by_mode,
+                field_path: field,
+            },
+            _ => return ptr::null_mut(),
+        };
+        Box::into_raw(Box::new(MeshDbQuery { plan: plan_of(op) }))
+    })
 }
 
 /// `Percentile(inner, field, p)`. `p` must be finite in
@@ -510,23 +558,25 @@ pub unsafe extern "C" fn net_meshdb_query_percentile(
     p: f64,
     group_by: *const std::ffi::c_char,
 ) -> *mut MeshDbQuery {
-    if inner.is_null() || !p.is_finite() || !(0.0..=1.0).contains(&p) {
-        return ptr::null_mut();
-    }
-    let Some(field) = cstr_to_string(field) else {
-        return ptr::null_mut();
-    };
-    let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
-        return ptr::null_mut();
-    };
-    let inner_node = (&*inner).plan.root.clone();
-    let plan = plan_of(OperatorPlan::AggregateReduction {
-        input: Box::new(inner_node),
-        group_by: group_by_mode,
-        field_path: field,
-        kind: NumericReductionKind::Percentile { p },
-    });
-    Box::into_raw(Box::new(MeshDbQuery { plan }))
+    ffi_guard!(ptr::null_mut(), {
+        if inner.is_null() || !p.is_finite() || !(0.0..=1.0).contains(&p) {
+            return ptr::null_mut();
+        }
+        let Some(field) = cstr_to_string(field) else {
+            return ptr::null_mut();
+        };
+        let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
+            return ptr::null_mut();
+        };
+        let inner_node = (&*inner).plan.root.clone();
+        let plan = plan_of(OperatorPlan::AggregateReduction {
+            input: Box::new(inner_node),
+            group_by: group_by_mode,
+            field_path: field,
+            kind: NumericReductionKind::Percentile { p },
+        });
+        Box::into_raw(Box::new(MeshDbQuery { plan }))
+    })
 }
 
 /// Hash-join two queries. `kind` is one of `"inner"` /
@@ -549,49 +599,51 @@ pub unsafe extern "C" fn net_meshdb_query_join(
     strategy: *const std::ffi::c_char,
     watermark_secs: f64,
 ) -> *mut MeshDbQuery {
-    if left.is_null() || right.is_null() {
-        return ptr::null_mut();
-    }
-    let (Some(kind), Some(key)) = (cstr_to_string(kind), cstr_to_string(key)) else {
-        return ptr::null_mut();
-    };
-    let kind = match kind.as_str() {
-        "inner" => JoinKind::Inner,
-        "left_outer" => JoinKind::LeftOuter,
-        "right_outer" => JoinKind::RightOuter,
-        "full_outer" => JoinKind::FullOuter,
-        _ => return ptr::null_mut(),
-    };
-    let strategy_str = cstr_to_string(strategy);
-    let strategy = match strategy_str.as_deref() {
-        None | Some("") | Some("hash_broadcast") => JoinStrategy::HashBroadcast,
-        Some("sort_merge") => JoinStrategy::SortMerge,
-        _ => return ptr::null_mut(),
-    };
-    // Canonical join key tokens across all shims:
-    // "origin", "seq", "origin,seq". Anything else is treated
-    // as a dotted JSON field path. "seq,origin" was tolerated
-    // in earlier slices but is now rejected.
-    let key_mode = match key.as_str() {
-        "origin" => JoinKeyMode::Origin,
-        "seq" => JoinKeyMode::Seq,
-        "origin,seq" => JoinKeyMode::OriginSeq,
-        other => JoinKeyMode::Field(other.to_string()),
-    };
-    let watermark_secs = if watermark_secs.is_finite() && watermark_secs >= 0.0 {
-        watermark_secs
-    } else {
-        5.0
-    };
-    let plan = plan_of(OperatorPlan::HashJoin {
-        left: Box::new((&*left).plan.root.clone()),
-        right: Box::new((&*right).plan.root.clone()),
-        key_mode,
-        kind,
-        strategy,
-        watermark: std::time::Duration::from_secs_f64(watermark_secs),
-    });
-    Box::into_raw(Box::new(MeshDbQuery { plan }))
+    ffi_guard!(ptr::null_mut(), {
+        if left.is_null() || right.is_null() {
+            return ptr::null_mut();
+        }
+        let (Some(kind), Some(key)) = (cstr_to_string(kind), cstr_to_string(key)) else {
+            return ptr::null_mut();
+        };
+        let kind = match kind.as_str() {
+            "inner" => JoinKind::Inner,
+            "left_outer" => JoinKind::LeftOuter,
+            "right_outer" => JoinKind::RightOuter,
+            "full_outer" => JoinKind::FullOuter,
+            _ => return ptr::null_mut(),
+        };
+        let strategy_str = cstr_to_string(strategy);
+        let strategy = match strategy_str.as_deref() {
+            None | Some("") | Some("hash_broadcast") => JoinStrategy::HashBroadcast,
+            Some("sort_merge") => JoinStrategy::SortMerge,
+            _ => return ptr::null_mut(),
+        };
+        // Canonical join key tokens across all shims:
+        // "origin", "seq", "origin,seq". Anything else is treated
+        // as a dotted JSON field path. "seq,origin" was tolerated
+        // in earlier slices but is now rejected.
+        let key_mode = match key.as_str() {
+            "origin" => JoinKeyMode::Origin,
+            "seq" => JoinKeyMode::Seq,
+            "origin,seq" => JoinKeyMode::OriginSeq,
+            other => JoinKeyMode::Field(other.to_string()),
+        };
+        let watermark_secs = if watermark_secs.is_finite() && watermark_secs >= 0.0 {
+            watermark_secs
+        } else {
+            5.0
+        };
+        let plan = plan_of(OperatorPlan::HashJoin {
+            left: Box::new((&*left).plan.root.clone()),
+            right: Box::new((&*right).plan.root.clone()),
+            key_mode,
+            kind,
+            strategy,
+            watermark: std::time::Duration::from_secs_f64(watermark_secs),
+        });
+        Box::into_raw(Box::new(MeshDbQuery { plan }))
+    })
 }
 
 /// `LineageEmit(origin, entries, direction)`. Emits one row per
@@ -609,59 +661,61 @@ pub unsafe extern "C" fn net_meshdb_query_lineage_emit(
     entries_json: *const std::ffi::c_char,
     direction: *const std::ffi::c_char,
 ) -> *mut MeshDbQuery {
-    if entries_json.is_null() || direction.is_null() {
-        return ptr::null_mut();
-    }
-    let Ok(json) = std::ffi::CStr::from_ptr(entries_json).to_str() else {
-        return ptr::null_mut();
-    };
-    let Ok(dir_str) = std::ffi::CStr::from_ptr(direction).to_str() else {
-        return ptr::null_mut();
-    };
-    let direction = match dir_str {
-        "back" => LineageDirection::Back,
-        "forward" => LineageDirection::Forward,
-        _ => return ptr::null_mut(),
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return ptr::null_mut();
-    };
-    let Some(arr) = value.as_array() else {
-        return ptr::null_mut();
-    };
-    let mut entries = Vec::with_capacity(arr.len());
-    for e in arr {
-        let Some(obj) = e.as_object() else {
+    ffi_guard!(ptr::null_mut(), {
+        if entries_json.is_null() || direction.is_null() {
+            return ptr::null_mut();
+        }
+        let Ok(json) = std::ffi::CStr::from_ptr(entries_json).to_str() else {
             return ptr::null_mut();
         };
-        let Some(entry_origin) = obj.get("origin").and_then(|x| x.as_u64()) else {
+        let Ok(dir_str) = std::ffi::CStr::from_ptr(direction).to_str() else {
             return ptr::null_mut();
         };
-        let Some(depth) = obj.get("depth").and_then(|x| x.as_u64()) else {
+        let direction = match dir_str {
+            "back" => LineageDirection::Back,
+            "forward" => LineageDirection::Forward,
+            _ => return ptr::null_mut(),
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
             return ptr::null_mut();
         };
-        let Ok(depth) = u32::try_from(depth) else {
+        let Some(arr) = value.as_array() else {
             return ptr::null_mut();
         };
-        let tip_seq = match obj.get("tip_seq") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(v) => match v.as_u64() {
-                Some(s) => Some(SeqNum(s)),
-                None => return ptr::null_mut(),
-            },
-        };
-        entries.push(LineageEntry {
-            origin: entry_origin,
-            depth,
-            tip_seq,
+        let mut entries = Vec::with_capacity(arr.len());
+        for e in arr {
+            let Some(obj) = e.as_object() else {
+                return ptr::null_mut();
+            };
+            let Some(entry_origin) = obj.get("origin").and_then(|x| x.as_u64()) else {
+                return ptr::null_mut();
+            };
+            let Some(depth) = obj.get("depth").and_then(|x| x.as_u64()) else {
+                return ptr::null_mut();
+            };
+            let Ok(depth) = u32::try_from(depth) else {
+                return ptr::null_mut();
+            };
+            let tip_seq = match obj.get("tip_seq") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => match v.as_u64() {
+                    Some(s) => Some(SeqNum(s)),
+                    None => return ptr::null_mut(),
+                },
+            };
+            entries.push(LineageEntry {
+                origin: entry_origin,
+                depth,
+                tip_seq,
+            });
+        }
+        let plan = plan_of(OperatorPlan::LineageEmit {
+            origin,
+            direction,
+            entries,
         });
-    }
-    let plan = plan_of(OperatorPlan::LineageEmit {
-        origin,
-        direction,
-        entries,
-    });
-    Box::into_raw(Box::new(MeshDbQuery { plan }))
+        Box::into_raw(Box::new(MeshDbQuery { plan }))
+    })
 }
 
 // =====================================================================
@@ -703,21 +757,23 @@ pub unsafe extern "C" fn net_meshdb_query_filter_json(
     inner: *const MeshDbQuery,
     predicate_json: *const std::ffi::c_char,
 ) -> *mut MeshDbQuery {
-    if inner.is_null() || predicate_json.is_null() {
-        return ptr::null_mut();
-    }
-    let Ok(json) = std::ffi::CStr::from_ptr(predicate_json).to_str() else {
-        return ptr::null_mut();
-    };
-    let Ok(predicate) = parse_predicate_json(json) else {
-        return ptr::null_mut();
-    };
-    let inner_node = (&*inner).plan.root.clone();
-    let plan = plan_of(OperatorPlan::Filter {
-        input: Box::new(inner_node),
-        predicate: predicate.to_wire(),
-    });
-    Box::into_raw(Box::new(MeshDbQuery { plan }))
+    ffi_guard!(ptr::null_mut(), {
+        if inner.is_null() || predicate_json.is_null() {
+            return ptr::null_mut();
+        }
+        let Ok(json) = std::ffi::CStr::from_ptr(predicate_json).to_str() else {
+            return ptr::null_mut();
+        };
+        let Ok(predicate) = parse_predicate_json(json) else {
+            return ptr::null_mut();
+        };
+        let inner_node = (&*inner).plan.root.clone();
+        let plan = plan_of(OperatorPlan::Filter {
+            input: Box::new(inner_node),
+            predicate: predicate.to_wire(),
+        });
+        Box::into_raw(Box::new(MeshDbQuery { plan }))
+    })
 }
 
 fn parse_predicate_json(json: &str) -> std::result::Result<Predicate, ()> {
@@ -840,18 +896,20 @@ pub unsafe extern "C" fn net_meshdb_decode_payload_json(
     payload: *const u8,
     payload_len: usize,
 ) -> *mut std::ffi::c_char {
-    if payload_len == 0 || payload.is_null() {
-        return ptr::null_mut();
-    }
-    let bytes = slice::from_raw_parts(payload, payload_len);
-    let json = match decode_to_json(bytes) {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
-    match std::ffi::CString::new(json) {
-        Ok(c) => c.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
+    ffi_guard!(ptr::null_mut(), {
+        if payload_len == 0 || payload.is_null() {
+            return ptr::null_mut();
+        }
+        let bytes = slice::from_raw_parts(payload, payload_len);
+        let json = match decode_to_json(bytes) {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
+        match std::ffi::CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    })
 }
 
 /// Free a string returned by `net_meshdb_decode_payload_json`.
@@ -860,10 +918,12 @@ pub unsafe extern "C" fn net_meshdb_decode_payload_json(
 /// `s` must be a pointer returned by the decoder or null.
 #[no_mangle]
 pub unsafe extern "C" fn net_meshdb_free_string(s: *mut std::ffi::c_char) {
-    if s.is_null() {
-        return;
-    }
-    drop(std::ffi::CString::from_raw(s));
+    ffi_guard!((), {
+        if s.is_null() {
+            return;
+        }
+        drop(std::ffi::CString::from_raw(s));
+    })
 }
 
 fn decode_to_json(bytes: &[u8]) -> Option<String> {
@@ -972,10 +1032,12 @@ fn window_to_json(b: &net::adapter::net::behavior::meshdb::query::WindowBoundary
 /// or null. Must not have been freed already.
 #[no_mangle]
 pub unsafe extern "C" fn net_meshdb_query_free(query: *mut MeshDbQuery) {
-    if query.is_null() {
-        return;
-    }
-    drop(Box::from_raw(query));
+    ffi_guard!((), {
+        if query.is_null() {
+            return;
+        }
+        drop(Box::from_raw(query));
+    })
 }
 
 // =====================================================================
@@ -1025,20 +1087,22 @@ fn shared_runtime() -> std::io::Result<Arc<Runtime>> {
 /// `net_meshdb_reader_new`, or null (which yields null).
 #[no_mangle]
 pub unsafe extern "C" fn net_meshdb_runner_new(reader: *mut MeshDbReader) -> *mut MeshDbRunner {
-    if reader.is_null() {
-        return ptr::null_mut();
-    }
-    let store = (&*reader).store.clone();
-    let runtime = match shared_runtime() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-    let executor: LocalMeshQueryExecutor<InMemoryStore> = LocalMeshQueryExecutor::new(store);
-    let runner = MeshDbRunner {
-        runtime,
-        executor: Arc::new(executor),
-    };
-    Box::into_raw(Box::new(runner))
+    ffi_guard!(ptr::null_mut(), {
+        if reader.is_null() {
+            return ptr::null_mut();
+        }
+        let store = (&*reader).store.clone();
+        let runtime = match shared_runtime() {
+            Ok(rt) => rt,
+            Err(_) => return ptr::null_mut(),
+        };
+        let executor: LocalMeshQueryExecutor<InMemoryStore> = LocalMeshQueryExecutor::new(store);
+        let runner = MeshDbRunner {
+            runtime,
+            executor: Arc::new(executor),
+        };
+        Box::into_raw(Box::new(runner))
+    })
 }
 
 /// Construct a runner with the Phase F LRU result cache wired
@@ -1056,23 +1120,25 @@ pub unsafe extern "C" fn net_meshdb_runner_new(reader: *mut MeshDbReader) -> *mu
 pub unsafe extern "C" fn net_meshdb_runner_new_cached(
     reader: *mut MeshDbReader,
 ) -> *mut MeshDbRunner {
-    if reader.is_null() {
-        return ptr::null_mut();
-    }
-    let store = (&*reader).store.clone();
-    let runtime = match shared_runtime() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-    let cache: Arc<dyn net::adapter::net::behavior::meshdb::cache::ResultCache> =
-        Arc::new(net::adapter::net::behavior::meshdb::cache::LruResultCache::default());
-    let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 0);
-    let executor: LocalMeshQueryExecutor<InMemoryStore> =
-        LocalMeshQueryExecutor::with_cache(store, cache, version_fn);
-    Box::into_raw(Box::new(MeshDbRunner {
-        runtime,
-        executor: Arc::new(executor),
-    }))
+    ffi_guard!(ptr::null_mut(), {
+        if reader.is_null() {
+            return ptr::null_mut();
+        }
+        let store = (&*reader).store.clone();
+        let runtime = match shared_runtime() {
+            Ok(rt) => rt,
+            Err(_) => return ptr::null_mut(),
+        };
+        let cache: Arc<dyn net::adapter::net::behavior::meshdb::cache::ResultCache> =
+            Arc::new(net::adapter::net::behavior::meshdb::cache::LruResultCache::default());
+        let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 0);
+        let executor: LocalMeshQueryExecutor<InMemoryStore> =
+            LocalMeshQueryExecutor::with_cache(store, cache, version_fn);
+        Box::into_raw(Box::new(MeshDbRunner {
+            runtime,
+            executor: Arc::new(executor),
+        }))
+    })
 }
 
 /// Free a runner handle.
@@ -1082,10 +1148,12 @@ pub unsafe extern "C" fn net_meshdb_runner_new_cached(
 /// or null.
 #[no_mangle]
 pub unsafe extern "C" fn net_meshdb_runner_free(runner: *mut MeshDbRunner) {
-    if runner.is_null() {
-        return;
-    }
-    drop(Box::from_raw(runner));
+    ffi_guard!((), {
+        if runner.is_null() {
+            return;
+        }
+        drop(Box::from_raw(runner));
+    })
 }
 
 /// Execute `query` on `runner`. Returns a heap-allocated
@@ -1251,35 +1319,37 @@ pub unsafe extern "C" fn net_meshdb_iter_next(
     payload_out_ptr: *mut *mut u8,
     payload_out_len: *mut usize,
 ) -> c_int {
-    if iter.is_null()
-        || origin_out.is_null()
-        || seq_out.is_null()
-        || payload_out_ptr.is_null()
-        || payload_out_len.is_null()
-    {
-        return NET_MESHDB_INVALID_ARG;
-    }
-    let iter_ref = &mut *iter;
-    if iter_ref.next_idx >= iter_ref.rows.len() {
-        return NET_MESHDB_END;
-    }
-    let row = &iter_ref.rows[iter_ref.next_idx];
-    iter_ref.next_idx += 1;
-    *origin_out = row.origin;
-    *seq_out = row.seq.0;
-    // Copy the payload into a fresh heap allocation owned by
-    // the caller — the rows Vec keeps its own copy intact for
-    // iterator-state purposes, but transferring a borrowed
-    // pointer would be unsound across the FFI boundary if the
-    // iter is later freed.
-    let payload = row.payload.clone();
-    let mut boxed = payload.into_boxed_slice();
-    let len = boxed.len();
-    let ptr = boxed.as_mut_ptr();
-    std::mem::forget(boxed);
-    *payload_out_ptr = ptr;
-    *payload_out_len = len;
-    NET_MESHDB_OK
+    ffi_guard!(NET_MESHDB_RUNTIME_ERR, {
+        if iter.is_null()
+            || origin_out.is_null()
+            || seq_out.is_null()
+            || payload_out_ptr.is_null()
+            || payload_out_len.is_null()
+        {
+            return NET_MESHDB_INVALID_ARG;
+        }
+        let iter_ref = &mut *iter;
+        if iter_ref.next_idx >= iter_ref.rows.len() {
+            return NET_MESHDB_END;
+        }
+        let row = &iter_ref.rows[iter_ref.next_idx];
+        iter_ref.next_idx += 1;
+        *origin_out = row.origin;
+        *seq_out = row.seq.0;
+        // Copy the payload into a fresh heap allocation owned by
+        // the caller — the rows Vec keeps its own copy intact for
+        // iterator-state purposes, but transferring a borrowed
+        // pointer would be unsound across the FFI boundary if the
+        // iter is later freed.
+        let payload = row.payload.clone();
+        let mut boxed = payload.into_boxed_slice();
+        let len = boxed.len();
+        let ptr = boxed.as_mut_ptr();
+        std::mem::forget(boxed);
+        *payload_out_ptr = ptr;
+        *payload_out_len = len;
+        NET_MESHDB_OK
+    })
 }
 
 /// Free a payload buffer returned by `net_meshdb_iter_next`.
@@ -1290,11 +1360,13 @@ pub unsafe extern "C" fn net_meshdb_iter_next(
 /// `net_meshdb_iter_next` for that pointer.
 #[no_mangle]
 pub unsafe extern "C" fn net_meshdb_payload_free(ptr: *mut u8, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
-    }
-    let boxed: Box<[u8]> = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len));
-    drop(boxed);
+    ffi_guard!((), {
+        if ptr.is_null() || len == 0 {
+            return;
+        }
+        let boxed: Box<[u8]> = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len));
+        drop(boxed);
+    })
 }
 
 /// Free an iterator handle.
@@ -1304,10 +1376,12 @@ pub unsafe extern "C" fn net_meshdb_payload_free(ptr: *mut u8, len: usize) {
 /// or null.
 #[no_mangle]
 pub unsafe extern "C" fn net_meshdb_iter_free(iter: *mut MeshDbIter) {
-    if iter.is_null() {
-        return;
-    }
-    drop(Box::from_raw(iter));
+    ffi_guard!((), {
+        if iter.is_null() {
+            return;
+        }
+        drop(Box::from_raw(iter));
+    })
 }
 
 fn plan_of(op: OperatorPlan) -> ExecutionPlan {
@@ -1835,5 +1909,32 @@ mod tests {
             }),
             "query_budget_exceeded"
         );
+    }
+
+    #[test]
+    fn ffi_guard_traps_panics_and_records_last_error() {
+        // Direct exercise of the ffi_guard! macro: a panic inside
+        // the wrapped body must NOT escape the closure, must
+        // populate the thread-local last-error pair with kind
+        // "runtime_panic", and must return the declared default.
+        // Pin this so future entry points can rely on it.
+        clear_last_error();
+        let out: *mut MeshDbQuery =
+            ffi_guard!(ptr::null_mut(), { panic!("simulated FFI body panic") });
+        assert!(out.is_null(), "ffi_guard must return its default on panic");
+        unsafe {
+            let kind = net_meshdb_last_error_kind();
+            assert!(!kind.is_null(), "last-error kind must be populated");
+            let kind_s = std::ffi::CStr::from_ptr(kind).to_str().unwrap();
+            assert_eq!(kind_s, "runtime_panic");
+            let msg = net_meshdb_last_error_message();
+            assert!(!msg.is_null());
+            let msg_s = std::ffi::CStr::from_ptr(msg).to_str().unwrap();
+            assert!(
+                msg_s.contains("simulated FFI body panic"),
+                "panic message should be preserved; got {msg_s:?}",
+            );
+        }
+        clear_last_error();
     }
 }
