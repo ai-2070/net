@@ -86,6 +86,25 @@ pub enum MeshOsEvent {
     /// be running here?" answer.
     DaemonIntentUpdate(DaemonIntentUpdate),
 
+    /// Desired-state per-node replica intent. "Should this node
+    /// hold a replica of `chain`?" Source (Phase C+): the
+    /// leader's `RequestPlacement` / `RequestEviction` actions
+    /// commit to the admin chain; each affected node's
+    /// Dataforts fold projects them into a local intent.
+    LocalReplicaIntent(LocalReplicaIntentUpdate),
+
+    /// Replica leadership changed. Source (Phase C+):
+    /// `replication_election`. The loop folds this into
+    /// `MeshOsState::replica_leader`; reconcile reads it to gate
+    /// `Request*` action emission.
+    ReplicaLeaderUpdate {
+        /// Chain whose leader changed.
+        chain: ChainId,
+        /// New leader, or `None` if leadership is currently
+        /// vacant.
+        leader: Option<NodeId>,
+    },
+
     /// Cooperative loop shutdown. The loop drains pending events
     /// (no more reconcile passes) and exits.
     Shutdown,
@@ -320,4 +339,27 @@ pub struct DaemonIntentUpdate {
     pub daemon: DaemonRef,
     /// New intent.
     pub intent: DaemonIntent,
+}
+
+/// Per-node replica intent — should this node hold a replica of
+/// the chain, or drop one it currently has? Phase C input
+/// shape; the Dataforts placement fold projects
+/// `RequestPlacement`/`RequestEviction` admin-chain commits
+/// into one of these for each affected node.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum LocalReplicaIntent {
+    /// This node should hold a replica of the chain.
+    Hold,
+    /// This node should NOT hold a replica of the chain.
+    Drop,
+}
+
+/// Update event for [`LocalReplicaIntent`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalReplicaIntentUpdate {
+    /// Chain whose local intent changed.
+    pub chain: ChainId,
+    /// New intent.
+    pub intent: LocalReplicaIntent,
 }

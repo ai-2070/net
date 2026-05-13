@@ -63,8 +63,8 @@ pub use config::{BackpressureConfig, MeshOsConfig};
 pub use control::MeshOsControl;
 pub use event::{
     AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,
-    DaemonLifecycleSignal, DaemonRef, MeshOsEvent, NodeHealth, NodeId, PlacementIntent,
-    ReplicaUpdate,
+    DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent, LocalReplicaIntentUpdate, MeshOsEvent,
+    NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
 };
 pub use event_loop::{MeshOsHandle, MeshOsHandleError, MeshOsLoop};
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};

@@ -10,6 +10,12 @@ use std::time::Duration;
 /// `Default::default()` produces the plan's stated defaults.
 #[derive(Clone, Debug)]
 pub struct MeshOsConfig {
+    /// Identity of the node this loop runs on. Used by Phase C
+    /// reconcile to decide whether the leader-only `Request*`
+    /// actions are admissible here. Default `0`; production
+    /// callers must override.
+    pub this_node: super::event::NodeId,
+
     /// How often the loop fires a [`super::event::MeshOsEvent::Tick`]
     /// to drive a reconcile pass. Default 500 ms — matches
     /// `MeshConfig::heartbeat_interval`. The reconcile pass
@@ -37,6 +43,7 @@ pub struct MeshOsConfig {
 impl Default for MeshOsConfig {
     fn default() -> Self {
         Self {
+            this_node: 0,
             tick_interval: Duration::from_millis(500),
             event_queue_capacity: 1024,
             action_queue_capacity: 1024,

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use super::event::{
     AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,
-    DaemonLifecycleSignal, DaemonRef, MeshOsEvent, NodeHealth, NodeId, PlacementIntent,
-    ReplicaUpdate,
+    DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent, LocalReplicaIntentUpdate, MeshOsEvent,
+    NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
 };
 use super::supervision::BackoffTracker;
 
@@ -30,6 +30,10 @@ pub struct MeshOsState {
     /// Replicas this node observes — keyed by chain id, valued
     /// by the set of holders the substrate knows about.
     pub replicas: HashMap<ChainId, Vec<NodeId>>,
+    /// Current leader for each chain (per
+    /// `replication_election`). Reconcile reads this to decide
+    /// whether `Request*` actions are admissible on this node.
+    pub replica_leader: HashMap<ChainId, NodeId>,
     /// Per-peer RTT samples (latest only; Phase D adds the rolling window).
     pub rtt: HashMap<NodeId, Duration>,
     /// Per-peer health (Phase D fills the body).
@@ -146,6 +150,16 @@ impl MeshOsState {
                 // Desired-state input; routed by the loop into
                 // `DesiredState`, no actual-state side effect.
             }
+            MeshOsEvent::LocalReplicaIntent(_) => {
+                // Desired-state input; routed by the loop.
+            }
+            MeshOsEvent::ReplicaLeaderUpdate { chain, leader } => {
+                if let Some(leader) = leader {
+                    self.replica_leader.insert(*chain, *leader);
+                } else {
+                    self.replica_leader.remove(chain);
+                }
+            }
             MeshOsEvent::RttSample { peer, rtt } => {
                 self.rtt.insert(*peer, *rtt);
             }
@@ -253,10 +267,15 @@ impl MeshOsState {
 /// the diff.
 #[derive(Clone, Debug, Default)]
 pub struct DesiredState {
-    /// Desired replica count per chain. The reconcile pass
-    /// compares this against `MeshOsState::replicas` to emit
-    /// `PullReplica` / `DropReplica` / `Request*` actions.
+    /// Desired replica count per chain (cluster-wide). Reconcile
+    /// reads this on the leader node to emit `RequestPlacement`
+    /// (count short) / `RequestEviction` (count over) actions.
     pub desired_replicas: HashMap<ChainId, u32>,
+    /// Per-chain "should this node hold a replica?" intent.
+    /// Source: the leader's `Request*` actions, projected via
+    /// the Dataforts fold. Reconcile reads this to emit
+    /// `PullReplica` / `DropReplica` actions.
+    pub desired_local_replicas: HashMap<ChainId, LocalReplicaIntent>,
     /// Per-daemon intent. Reconcile reads this against the
     /// actual `MeshOsState::daemons[*].lifecycle` to emit
     /// `StartDaemon` / `StopDaemon`.
@@ -264,7 +283,7 @@ pub struct DesiredState {
 }
 
 impl DesiredState {
-    /// Fold a placement-intent input event.
+    /// Fold a placement-intent input event (cluster-wide count).
     pub fn apply(&mut self, intent: &PlacementIntent) {
         self.desired_replicas
             .insert(intent.chain, intent.desired_replicas);
@@ -274,6 +293,12 @@ impl DesiredState {
     pub fn apply_daemon_intent(&mut self, update: &DaemonIntentUpdate) {
         self.desired_daemons
             .insert(update.daemon.clone(), update.intent);
+    }
+
+    /// Fold a per-node replica intent input event.
+    pub fn apply_local_replica_intent(&mut self, update: &LocalReplicaIntentUpdate) {
+        self.desired_local_replicas
+            .insert(update.chain, update.intent);
     }
 }
 
