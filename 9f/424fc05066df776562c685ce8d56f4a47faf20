@@ -1,0 +1,40 @@
+net/crates/net/src/adapter/net/behavior/meshos/backpressure.rs
+  s_f68bb950203003::t_9d9fe51ec1893c 430
+  s_f68bb950203003::t_305e953d317d88 629,643,656
+  s_f68bb950203003::t_b0703341d164b9 99-103,106
+  s_f68bb950203003::t_4e1d443ea73123 517,531
+  s_f68bb950203003::t_aec3ebfc96cff7 483,497
+  s_f68bb950203003::t_32d64bf011f07f 134
+  s_f68bb950203003::t_33c0a865681bc0 678-681,683
+  s_f68bb950203003::t_71fb1f03cc823e 357
+  s_f68bb950203003::t_f6d4257e4ece58 203-210,213,215,222-229
+  s_f68bb950203003::t_a9fd6312c035c3 330-333,336
+  s_f68bb950203003::t_3cb87951cd1a90 414
+  s_f68bb950203003::t_3062e69fbcb17b 275
+  s_f68bb950203003::t_92b6a6c3b4d051 17
+  s_f68bb950203003::t_28500dbbd83e57 70-79
+  s_f68bb950203003::t_86093f918f1880 181
+  s_f68bb950203003::t_ed98af8a6095e3 454
+  s_f68bb950203003::t_b624dda54b76ed 613-617
+  s_f68bb950203003::t_b6ecdf444f264f 700,710,720,734-769
+  s_f68bb950203003::t_fdacd3aa524944 303
+net/crates/net/src/adapter/net/behavior/meshos/executor.rs
+  s_f68bb950203003::t_573677625a8b18 413-415,417-418
+  s_f68bb950203003::t_232bb5f7f09859 336
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "9f424fc05066df776562c685ce8d56f4a47faf20",
+  "prompts": {},
+  "sessions": {
+    "s_f68bb950203003": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9226dcd-79b1-4985-9dd9-28aaac11c680",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
