@@ -142,6 +142,19 @@ extern MeshDbQuery* net_meshdb_query_filter_json(
     const MeshDbQuery* inner,
     const char* predicate_json
 );
+
+// Slice 5: Phase F cache options.
+#define NET_MESHDB_CACHE_PERMANENT 0
+#define NET_MESHDB_CACHE_TIME_BOUND 1
+
+extern MeshDbRunner* net_meshdb_runner_new_cached(MeshDbReader* reader);
+extern MeshDbIter* net_meshdb_runner_execute_with(
+    MeshDbRunner* runner,
+    MeshDbQuery* query,
+    int bypass_cache,
+    int cache_policy_kind,
+    double cache_ttl_secs
+);
 */
 import "C"
 
@@ -323,6 +336,23 @@ func NewMeshDBRunner(reader *MeshDBReader) *MeshDBRunner {
 	return r
 }
 
+// NewMeshDBRunnerCached constructs a runner with the Phase F
+// LRU result cache wired in. Pass `MeshDBExecuteOptions` to
+// `ExecuteWith` to control per-query policy (Permanent vs
+// TimeBound, bypass for diagnostics).
+func NewMeshDBRunnerCached(reader *MeshDBReader) *MeshDBRunner {
+	if reader == nil || reader.ptr == nil {
+		return nil
+	}
+	ptr := C.net_meshdb_runner_new_cached(reader.ptr)
+	if ptr == nil {
+		return nil
+	}
+	r := &MeshDBRunner{ptr: ptr}
+	runtime.SetFinalizer(r, func(r *MeshDBRunner) { r.Free() })
+	return r
+}
+
 // Execute runs `query` and returns a channel of results. The
 // channel is closed on EOF (success) or after the first error.
 // Callers stop reading + drop the channel reference to cancel;
@@ -370,6 +400,103 @@ func (r *MeshDBRunner) Execute(query *MeshDBQuery) (<-chan MeshDBResult, error) 
 				// runtime eventually GCs the goroutine. For
 				// production cancellation, callers should wrap
 				// in select{} + context.Done().
+				ch <- MeshDBResult{Row: row}
+			case C.NET_MESHDB_END:
+				return
+			case C.NET_MESHDB_INVALID_ARG:
+				ch <- MeshDBResult{Err: ErrMeshDBInvalidArg}
+				return
+			default:
+				ch <- MeshDBResult{Err: ErrMeshDBRuntime}
+				return
+			}
+		}
+	}()
+	return ch, nil
+}
+
+// MeshDBCachePolicyKind discriminates the Phase F cache
+// policies. Use the constants below — direct construction is
+// for advanced callers only.
+type MeshDBCachePolicyKind int
+
+const (
+	// MeshDBCachePermanent caches until LRU eviction. Use for
+	// queries whose result is immutable under substrate
+	// semantics (`At(origin, seq)`, closed `Between`).
+	MeshDBCachePermanent MeshDBCachePolicyKind = 0
+	// MeshDBCacheTimeBound applies a wall-clock TTL. Pair with
+	// `TTLSecs` (5.0 is the canonical default — mirrors the
+	// locked join watermark).
+	MeshDBCacheTimeBound MeshDBCachePolicyKind = 1
+)
+
+// MeshDBExecuteOptions is the Phase F per-execute options
+// surface. Zero value is the default policy (TimeBound, 5 s)
+// with caching active.
+type MeshDBExecuteOptions struct {
+	// BypassCache skips both lookup and writeback. Use for
+	// diagnostics, authoritative reads, or operator catalog
+	// churn paths.
+	BypassCache bool
+	// CachePolicy controls the cache-entry policy (Permanent vs
+	// TimeBound). Defaults to TimeBound.
+	CachePolicy MeshDBCachePolicyKind
+	// TTLSecs is consulted only when `CachePolicy ==
+	// MeshDBCacheTimeBound`. Non-finite or negative falls back
+	// to 5 s.
+	TTLSecs float64
+}
+
+// ExecuteWith runs `query` with explicit Phase F options. See
+// `Execute` for the channel semantics. The options struct's
+// zero value is `{TimeBound, 0 s}` — caller should set TTLSecs
+// to 5.0 for the canonical default; the FFI applies a fallback
+// when TTLSecs is non-finite or negative.
+func (r *MeshDBRunner) ExecuteWith(
+	query *MeshDBQuery,
+	options MeshDBExecuteOptions,
+) (<-chan MeshDBResult, error) {
+	if r == nil || r.ptr == nil {
+		return nil, ErrMeshDBInvalidArg
+	}
+	if query == nil || query.ptr == nil {
+		return nil, ErrMeshDBInvalidArg
+	}
+	bypass := C.int(0)
+	if options.BypassCache {
+		bypass = C.int(1)
+	}
+	iter := C.net_meshdb_runner_execute_with(
+		r.ptr,
+		query.ptr,
+		bypass,
+		C.int(options.CachePolicy),
+		C.double(options.TTLSecs),
+	)
+	if iter == nil {
+		return nil, ErrMeshDBRuntime
+	}
+	ch := make(chan MeshDBResult, 32)
+	go func() {
+		defer close(ch)
+		defer C.net_meshdb_iter_free(iter)
+		for {
+			var (
+				origin     C.uint64_t
+				seq        C.uint64_t
+				payloadPtr *C.uint8_t
+				payloadLen C.size_t
+			)
+			status := C.net_meshdb_iter_next(iter, &origin, &seq, &payloadPtr, &payloadLen)
+			switch status {
+			case C.NET_MESHDB_OK:
+				row := MeshDBResultRow{
+					Origin:  uint64(origin),
+					Seq:     uint64(seq),
+					Payload: C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen)),
+				}
+				C.net_meshdb_payload_free(payloadPtr, payloadLen)
 				ch <- MeshDBResult{Row: row}
 			case C.NET_MESHDB_END:
 				return

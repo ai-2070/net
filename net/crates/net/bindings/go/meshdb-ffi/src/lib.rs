@@ -825,6 +825,41 @@ pub unsafe extern "C" fn net_meshdb_runner_new(
     Box::into_raw(Box::new(runner))
 }
 
+/// Construct a runner with the Phase F LRU result cache wired
+/// in. Otherwise identical to `net_meshdb_runner_new`. The
+/// capability-version closure is fixed at `0` because no
+/// `CapabilityIndex` is plumbed through the Go FFI yet — the
+/// cache is single-node-LRU only. Pull-invalidation across
+/// version changes lands when the Go FFI grows a Phase B+
+/// transport / federated-executor path.
+///
+/// # Safety
+/// `reader` must be a valid pointer returned by
+/// `net_meshdb_reader_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_runner_new_cached(
+    reader: *mut MeshDbReader,
+) -> *mut MeshDbRunner {
+    if reader.is_null() {
+        return ptr::null_mut();
+    }
+    let store = (&*reader).store.clone();
+    let runtime = match Runtime::new() {
+        Ok(rt) => Arc::new(rt),
+        Err(_) => return ptr::null_mut(),
+    };
+    let cache: Arc<dyn net::adapter::net::behavior::meshdb::cache::ResultCache> = Arc::new(
+        net::adapter::net::behavior::meshdb::cache::LruResultCache::default(),
+    );
+    let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 0);
+    let executor: LocalMeshQueryExecutor<InMemoryStore> =
+        LocalMeshQueryExecutor::with_cache(store, cache, version_fn);
+    Box::into_raw(Box::new(MeshDbRunner {
+        runtime,
+        executor: Arc::new(executor),
+    }))
+}
+
 /// Free a runner handle.
 ///
 /// # Safety
@@ -864,6 +899,77 @@ pub unsafe extern "C" fn net_meshdb_runner_execute(
         let running = executor
             .execute_with(plan, ExecuteOptions::default())
             .await?;
+        let mut stream = running.rows;
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item?);
+        }
+        Ok(out)
+    });
+    match rows {
+        Ok(rows) => Box::into_raw(Box::new(MeshDbIter { rows, next_idx: 0 })),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Phase F cache-policy discriminator for
+/// `net_meshdb_runner_execute_with`. Permanent = 0,
+/// TimeBound = 1.
+pub const NET_MESHDB_CACHE_PERMANENT: c_int = 0;
+/// TimeBound cache policy — `ttl_secs` field is consulted.
+pub const NET_MESHDB_CACHE_TIME_BOUND: c_int = 1;
+
+/// Execute `query` with explicit Phase F options. Matches the
+/// Python / Node `execute_with` surface.
+///
+/// `bypass_cache` skips both lookup and writeback when non-zero.
+/// `cache_policy_kind` is `0` for Permanent, `1` for TimeBound.
+/// `cache_ttl_secs` is consulted only when policy is TimeBound;
+/// pass `5.0` to match the default. Caller-side may pass any
+/// non-finite / negative value to fall back to 5.0.
+///
+/// # Safety
+/// Both `runner` and `query` must be valid pointers, or null.
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_runner_execute_with(
+    runner: *mut MeshDbRunner,
+    query: *mut MeshDbQuery,
+    bypass_cache: c_int,
+    cache_policy_kind: c_int,
+    cache_ttl_secs: f64,
+) -> *mut MeshDbIter {
+    if runner.is_null() || query.is_null() {
+        return ptr::null_mut();
+    }
+    let runner_ref = &*runner;
+    let plan = (&*query).plan.clone();
+    let executor = runner_ref.executor.clone();
+    let runtime = runner_ref.runtime.clone();
+    let cache_policy = match cache_policy_kind {
+        NET_MESHDB_CACHE_PERMANENT => {
+            net::adapter::net::behavior::meshdb::cache::CachePolicy::Permanent
+        }
+        _ => {
+            // Default to TimeBound for any non-recognized kind;
+            // the `ttl_secs` argument falls through to 5 s when
+            // not finite / non-negative.
+            let ttl_secs = if cache_ttl_secs.is_finite() && cache_ttl_secs >= 0.0 {
+                cache_ttl_secs
+            } else {
+                5.0
+            };
+            net::adapter::net::behavior::meshdb::cache::CachePolicy::TimeBound {
+                ttl: std::time::Duration::from_secs_f64(ttl_secs),
+            }
+        }
+    };
+    let options = ExecuteOptions {
+        bypass_cache: bypass_cache != 0,
+        cache_policy,
+    };
+    let rows: Result<Vec<ResultRow>, MeshError> = runtime.block_on(async move {
+        use futures::StreamExt;
+        let running = executor.execute_with(plan, options).await?;
         let mut stream = running.rows;
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
@@ -1238,6 +1344,57 @@ mod tests {
             net_meshdb_iter_free(iter);
             net_meshdb_query_free(filter);
             net_meshdb_query_free(between);
+            net_meshdb_runner_free(runner);
+            net_meshdb_reader_free(reader);
+        }
+    }
+
+    /// Slice 5: Phase F cache-aware runner serves identical rows
+    /// on the second call without re-hitting the reader. Smoke
+    /// test only — cache observability requires deeper hooks.
+    #[test]
+    fn ffi_cached_runner_round_trips() {
+        unsafe {
+            let reader = net_meshdb_reader_new();
+            net_meshdb_reader_append(reader, 0x01, 1, b"v".as_ptr(), 1);
+            let runner = net_meshdb_runner_new_cached(reader);
+            let query = net_meshdb_query_at(0x01, 1);
+
+            // Execute with Permanent policy.
+            let iter1 = net_meshdb_runner_execute_with(
+                runner,
+                query,
+                0,
+                NET_MESHDB_CACHE_PERMANENT,
+                0.0,
+            );
+            assert!(!iter1.is_null());
+            net_meshdb_iter_free(iter1);
+
+            // Re-execute — should also succeed (cached hit
+            // path doesn't change observable result).
+            let iter2 = net_meshdb_runner_execute_with(
+                runner,
+                query,
+                0,
+                NET_MESHDB_CACHE_PERMANENT,
+                0.0,
+            );
+            assert!(!iter2.is_null());
+            net_meshdb_iter_free(iter2);
+
+            // Bypass cache — same result, different code path.
+            let iter3 = net_meshdb_runner_execute_with(
+                runner,
+                query,
+                1, // bypass_cache
+                NET_MESHDB_CACHE_TIME_BOUND,
+                5.0,
+            );
+            assert!(!iter3.is_null());
+            net_meshdb_iter_free(iter3);
+
+            net_meshdb_query_free(query);
             net_meshdb_runner_free(runner);
             net_meshdb_reader_free(reader);
         }
