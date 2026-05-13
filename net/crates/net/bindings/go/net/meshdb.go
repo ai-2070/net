@@ -396,10 +396,18 @@ func (r *MeshDBRunner) Execute(query *MeshDBQuery) (<-chan MeshDBResult, error) 
 
 // ExecuteContext runs `query` and pumps rows onto the returned
 // channel until EOF, the first error, or `ctx.Done()` fires.
-// On ctx cancellation the pumping goroutine frees the FFI
-// iterator, emits a final `MeshDBResult{Err: ctx.Err()}` to the
-// channel (so receivers see the cancellation), and closes the
-// channel.
+// The FFI execute call itself runs inside the spawned goroutine,
+// so the caller is never blocked on it — the caller can `select`
+// on `ctx.Done()` versus channel receives concurrently with the
+// executor. cgo calls are not preemptible mid-call, so an
+// already-running FFI execute will run to completion regardless
+// of ctx cancellation; the goroutine then frees the resulting
+// iterator and exits without pumping rows. Synchronous errors
+// from the executor (or the FFI returning null) surface as the
+// first `MeshDBResult{Err: ...}` on the channel rather than via
+// the returned error — keeps the cancellation surface uniform.
+// The returned error is reserved for argument-validation failure
+// (nil receiver / nil query).
 func (r *MeshDBRunner) ExecuteContext(
 	ctx context.Context,
 	query *MeshDBQuery,
@@ -410,12 +418,23 @@ func (r *MeshDBRunner) ExecuteContext(
 	if query == nil || query.ptr == nil {
 		return nil, ErrMeshDBInvalidArg
 	}
-	iter := C.net_meshdb_runner_execute(r.ptr, query.ptr)
-	if iter == nil {
-		return nil, ErrMeshDBRuntime
-	}
 	ch := make(chan MeshDBResult, 32)
-	go pumpIterRowsContext(ctx, iter, ch)
+	runnerPtr := r.ptr
+	queryPtr := query.ptr
+	go func() {
+		defer close(ch)
+		if err := ctx.Err(); err != nil {
+			trySend(ctx, ch, MeshDBResult{Err: err})
+			return
+		}
+		iter := C.net_meshdb_runner_execute(runnerPtr, queryPtr)
+		if iter == nil {
+			trySend(ctx, ch, MeshDBResult{Err: ErrMeshDBRuntime})
+			return
+		}
+		defer C.net_meshdb_iter_free(iter)
+		pumpIterRowsBody(ctx, iter, ch)
+	}()
 	return ch, nil
 }
 
@@ -468,7 +487,12 @@ func (r *MeshDBRunner) ExecuteWith(
 }
 
 // ExecuteWithContext is the cancellable variant of `ExecuteWith`.
-// Same channel-and-EOF semantics as `ExecuteContext`.
+// Same channel-and-EOF semantics as `ExecuteContext`: the FFI
+// execute call runs inside the spawned goroutine, never on the
+// caller's stack, so ctx.Done() races the FFI call rather than
+// being blocked by it. Runtime errors and ctx cancellation
+// surface as `MeshDBResult{Err: ...}` on the channel; the
+// returned error is argument-validation only.
 func (r *MeshDBRunner) ExecuteWithContext(
 	ctx context.Context,
 	query *MeshDBQuery,
@@ -484,29 +508,42 @@ func (r *MeshDBRunner) ExecuteWithContext(
 	if options.BypassCache {
 		bypass = C.int(1)
 	}
-	iter := C.net_meshdb_runner_execute_with(
-		r.ptr,
-		query.ptr,
-		bypass,
-		C.int(options.CachePolicy),
-		C.double(options.TTLSecs),
-	)
-	if iter == nil {
-		return nil, ErrMeshDBRuntime
-	}
 	ch := make(chan MeshDBResult, 32)
-	go pumpIterRowsContext(ctx, iter, ch)
+	runnerPtr := r.ptr
+	queryPtr := query.ptr
+	policyKind := C.int(options.CachePolicy)
+	ttl := C.double(options.TTLSecs)
+	go func() {
+		defer close(ch)
+		if err := ctx.Err(); err != nil {
+			trySend(ctx, ch, MeshDBResult{Err: err})
+			return
+		}
+		iter := C.net_meshdb_runner_execute_with(
+			runnerPtr,
+			queryPtr,
+			bypass,
+			policyKind,
+			ttl,
+		)
+		if iter == nil {
+			trySend(ctx, ch, MeshDBResult{Err: ErrMeshDBRuntime})
+			return
+		}
+		defer C.net_meshdb_iter_free(iter)
+		pumpIterRowsBody(ctx, iter, ch)
+	}()
 	return ch, nil
 }
 
-// pumpIterRowsContext is the shared row-pumping loop used by
-// `ExecuteContext` and `ExecuteWithContext`. Drains the FFI
-// iterator into `ch`, frees the iterator on exit, and selects
-// on `ctx.Done()` for every send so a cancelled context unblocks
-// the goroutine cleanly.
-func pumpIterRowsContext(ctx context.Context, iter *C.MeshDbIter, ch chan<- MeshDBResult) {
-	defer close(ch)
-	defer C.net_meshdb_iter_free(iter)
+// pumpIterRowsBody drives the row-pumping loop for an
+// already-allocated FFI iterator. It does NOT free the iterator
+// or close the channel — the caller's deferred close + free
+// own that. Splitting the body out lets `ExecuteContext` /
+// `ExecuteWithContext` run the FFI execute call from inside a
+// goroutine (so ctx.Done() races the executor) without
+// double-closing the channel from nested defers.
+func pumpIterRowsBody(ctx context.Context, iter *C.MeshDbIter, ch chan<- MeshDBResult) {
 	for {
 		// Cheap ctx check before reaching for the next FFI row;
 		// avoids one unused decode + free on cancellation.
