@@ -28,9 +28,15 @@
 //! [`QueryHandle::cancel`] is cooperative: the federated
 //! executor's row-translation task checks the cancel flag
 //! between responses and emits [`MeshError::QueryCancelled`].
-//! Out-of-band cancellation to the remote executor (so the
-//! remote can free its resources) lands in a later slice;
-//! Phase B-4 ships the local-side cancellation only.
+//! Composite operators (HashJoin / Aggregate* / Window /
+//! Filter) share one outer handle across their recursive
+//! sub-fetches AND wrap their materialized output streams in
+//! the cancel-aware adapter, so a single
+//! [`QueryHandle::cancel`] propagates through every nested
+//! stage rather than being a no-op on the outer materialized
+//! iterator. Out-of-band cancellation to the remote executor
+//! (so the remote can free its resources) lands in a later
+//! slice; Phase B-4 ships the local-side cancellation only.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -142,6 +148,11 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
         plan: ExecutionPlan,
         options: super::executor::ExecuteOptions,
     ) -> Result<RunningQuery, MeshError> {
+        // One outer handle is allocated here and threaded
+        // through every sub-fetch + final stream wrapper so
+        // `handle.cancel()` short-circuits the whole tree.
+        let handle = QueryHandle::new(self.allocate_id());
+
         // Cache fast path. Top-level plans only; sub-plan
         // recursion below this point bypasses caching.
         if let (Some(cache), Some(version_fn), false) = (
@@ -155,21 +166,23 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
             // cache entirely rather than panic.
             if let Some(key) = super::cache::CacheKey::for_plan(&plan, version) {
                 if let Some(cached) = cache.get(&key) {
-                    let handle = QueryHandle::new(self.allocate_id());
-                    let rows: Vec<Result<ResultRow, MeshError>> =
-                        cached.rows.into_iter().map(Ok).collect();
-                    let stream: ResultStream = Box::pin(futures::stream::iter(rows));
-                    return Ok(RunningQuery {
-                        handle,
-                        rows: stream,
-                    });
+                    let rows = stream_results_cancellable(
+                        cached.rows.into_iter().map(Ok).collect(),
+                        handle.clone(),
+                    );
+                    return Ok(RunningQuery { handle, rows });
                 }
                 // Miss. Run the actual federated path with
                 // caching temporarily disabled (so the recursive
                 // sub-plan executes don't try to cache too), then
                 // drain + cache the top-level rows.
-                let drained = self.execute_uncached(plan.clone()).await?;
+                let drained = self
+                    .execute_uncached_with_handle(plan.clone(), handle.clone())
+                    .await?;
                 let collected = drain_rows(drained.rows).await?;
+                if handle.is_cancelled() {
+                    return Err(MeshError::QueryCancelled);
+                }
                 cache.insert(
                     key,
                     super::cache::CachedResult {
@@ -178,27 +191,33 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
                         policy: options.cache_policy,
                     },
                 );
-                let handle = QueryHandle::new(self.allocate_id());
-                let stream: ResultStream = Box::pin(futures::stream::iter(
-                    collected.into_iter().map(Ok).collect::<Vec<_>>(),
-                ));
-                return Ok(RunningQuery {
-                    handle,
-                    rows: stream,
-                });
+                let rows = stream_results_cancellable(
+                    collected.into_iter().map(Ok).collect(),
+                    handle.clone(),
+                );
+                return Ok(RunningQuery { handle, rows });
             }
             // Encode bypass — fall through.
         }
-        self.execute_uncached(plan).await
+        self.execute_uncached_with_handle(plan, handle).await
     }
 }
 
 impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
-    /// The original cache-less execute path. Top-level cache
-    /// gating lives in `execute_with`; this method is the
-    /// fallback when no cache is wired or `bypass_cache` is
-    /// set.
-    async fn execute_uncached(&self, plan: ExecutionPlan) -> Result<RunningQuery, MeshError> {
+    /// Execute the plan threading the caller-supplied outer
+    /// [`QueryHandle`] through every sub-fetch and through the
+    /// returned row stream. This is the cancellation-correct
+    /// path: the outer handle's cancel flag short-circuits
+    /// inner stages between awaits and per-row in the
+    /// materialized output streams.
+    async fn execute_uncached_with_handle(
+        &self,
+        plan: ExecutionPlan,
+        handle: QueryHandle,
+    ) -> Result<RunningQuery, MeshError> {
+        if handle.is_cancelled() {
+            return Err(MeshError::QueryCancelled);
+        }
         // Phase B-4 scope: atomic root operators dispatch to
         // remote target_nodes. LineageEmit is a planner-only
         // leaf (walk happened at plan time, no remote work);
@@ -210,8 +229,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             | OperatorPlan::LatestRead { .. } => {}
             OperatorPlan::LineageEmit { entries, .. } => {
                 use super::query::SeqNum;
-                let handle = QueryHandle::new(self.allocate_id());
-                let rows: Vec<Result<ResultRow, MeshError>> = entries
+                let rows_vec: Vec<Result<ResultRow, MeshError>> = entries
                     .iter()
                     .map(|entry| {
                         Ok(ResultRow {
@@ -221,42 +239,34 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
                         })
                     })
                     .collect();
-                let stream: ResultStream = Box::pin(futures::stream::iter(rows));
-                return Ok(RunningQuery {
-                    handle,
-                    rows: stream,
-                });
+                let rows = stream_results_cancellable(rows_vec, handle.clone());
+                return Ok(RunningQuery { handle, rows });
             }
             OperatorPlan::HashJoin { .. } => {
-                // Phase D-1 federated joins: fetch left + right
-                // via the transport, hash join locally.
-                return self.execute_hash_join_federated(plan).await;
+                return self
+                    .execute_hash_join_federated(plan, handle)
+                    .await;
             }
             OperatorPlan::AggregateCount { .. } => {
-                // Phase E-1 federated aggregate: fetch the inner
-                // sub-plan via the transport, count locally.
-                return self.execute_aggregate_count_federated(plan).await;
+                return self
+                    .execute_aggregate_count_federated(plan, handle)
+                    .await;
             }
             OperatorPlan::AggregateNumeric { .. } => {
-                // Phase E-3 federated numeric aggregate.
-                return self.execute_aggregate_numeric_federated(plan).await;
+                return self
+                    .execute_aggregate_numeric_federated(plan, handle)
+                    .await;
             }
             OperatorPlan::AggregateReduction { .. } | OperatorPlan::AggregateDistinct { .. } => {
-                // Phase E-4: collect inner via transport,
-                // reduce locally using the same logic as the
-                // local executor (we recompose a single-node
-                // plan + run it locally).
-                return self.execute_aggregate_e4_federated(plan).await;
+                return self
+                    .execute_aggregate_e4_federated(plan, handle)
+                    .await;
             }
             OperatorPlan::Window { .. } => {
-                // Phase E-5: collect inner via transport, then
-                // bucket locally.
-                return self.execute_window_federated(plan).await;
+                return self.execute_window_federated(plan, handle).await;
             }
             OperatorPlan::Filter { .. } => {
-                // Phase E-2 federated filter: fetch the inner
-                // sub-plan via the transport, filter locally.
-                return self.execute_filter_federated(plan).await;
+                return self.execute_filter_federated(plan, handle).await;
             }
             OperatorPlan::NotYetImplemented { detail, .. } => {
                 return Err(MeshError::PlannerError {
@@ -265,7 +275,6 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             }
         }
 
-        let handle = QueryHandle::new(self.allocate_id());
         let targets = plan.root.target_nodes.clone();
 
         // Empty targets: legal "no holders" result. Emit an
@@ -288,14 +297,17 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
         let mut last_attempted: u64 = targets[0];
         let mut last_err: Option<TransportError> = None;
         for &target in &targets {
+            if handle.is_cancelled() {
+                return Err(MeshError::QueryCancelled);
+            }
             last_attempted = target;
             match self.transport.send(target, request.clone()).await {
                 Ok(s) => {
                     response_stream = Some(s);
                     break;
                 }
-                Err(TransportError::NoRoute(_)) => {
-                    last_err = Some(TransportError::NoRoute(target));
+                Err(err @ TransportError::NoRoute(_)) => {
+                    last_err = Some(err);
                     continue;
                 }
                 Err(other) => {
@@ -330,6 +342,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
     async fn execute_hash_join_federated(
         &self,
         plan: ExecutionPlan,
+        handle: QueryHandle,
     ) -> Result<RunningQuery, MeshError> {
         use super::planner::CostEstimate;
         use super::query::{JoinKind, JoinedRowPayload, SeqNum};
@@ -347,20 +360,38 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
         };
 
         // Fetch each side through the federated executor so
-        // atomic leaves still dispatch via the transport.
-        let left_running = Box::pin(self.execute_uncached(ExecutionPlan {
-            root: *left,
-            total_cost: CostEstimate::default(),
-        }))
+        // atomic leaves still dispatch via the transport. The
+        // shared handle is threaded into both sub-fetches so a
+        // cancel on the outer handle aborts both before the
+        // local hash-join runs.
+        let left_running = Box::pin(self.execute_uncached_with_handle(
+            ExecutionPlan {
+                root: *left,
+                total_cost: CostEstimate::default(),
+            },
+            handle.clone(),
+        ))
         .await?;
-        let right_running = Box::pin(self.execute_uncached(ExecutionPlan {
-            root: *right,
-            total_cost: CostEstimate::default(),
-        }))
+        if handle.is_cancelled() {
+            return Err(MeshError::QueryCancelled);
+        }
+        let right_running = Box::pin(self.execute_uncached_with_handle(
+            ExecutionPlan {
+                root: *right,
+                total_cost: CostEstimate::default(),
+            },
+            handle.clone(),
+        ))
         .await?;
+        if handle.is_cancelled() {
+            return Err(MeshError::QueryCancelled);
+        }
 
         let left_rows = drain_rows(left_running.rows).await?;
         let right_rows = drain_rows(right_running.rows).await?;
+        if handle.is_cancelled() {
+            return Err(MeshError::QueryCancelled);
+        }
 
         let pairs = match (strategy, kind) {
             (super::planner::JoinStrategy::HashBroadcast, JoinKind::Inner) => {
@@ -396,12 +427,8 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             }));
         }
 
-        let handle = QueryHandle::new(self.allocate_id());
-        let stream: ResultStream = Box::pin(futures::stream::iter(out));
-        Ok(RunningQuery {
-            handle,
-            rows: stream,
-        })
+        let rows = stream_results_cancellable(out, handle.clone());
+        Ok(RunningQuery { handle, rows })
     }
 }
 
@@ -417,6 +444,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
     async fn execute_filter_federated(
         &self,
         plan: ExecutionPlan,
+        handle: QueryHandle,
     ) -> Result<RunningQuery, MeshError> {
         use super::planner::CostEstimate;
         use crate::adapter::net::behavior::predicate::EvalContext;
@@ -425,12 +453,18 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             unreachable!("execute_filter_federated dispatched on non-Filter");
         };
 
-        let inner = Box::pin(self.execute_uncached(ExecutionPlan {
-            root: *input,
-            total_cost: CostEstimate::default(),
-        }))
+        let inner = Box::pin(self.execute_uncached_with_handle(
+            ExecutionPlan {
+                root: *input,
+                total_cost: CostEstimate::default(),
+            },
+            handle.clone(),
+        ))
         .await?;
         let rows = drain_rows(inner.rows).await?;
+        if handle.is_cancelled() {
+            return Err(MeshError::QueryCancelled);
+        }
 
         let pred = predicate
             .into_predicate()
@@ -447,12 +481,8 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             }
         }
 
-        let handle = QueryHandle::new(self.allocate_id());
-        let stream: ResultStream = Box::pin(futures::stream::iter(out));
-        Ok(RunningQuery {
-            handle,
-            rows: stream,
-        })
+        let rows = stream_results_cancellable(out, handle.clone());
+        Ok(RunningQuery { handle, rows })
     }
 
     /// Phase E-5 federated tumbling window. Fetches the inner
@@ -460,6 +490,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
     async fn execute_window_federated(
         &self,
         plan: ExecutionPlan,
+        handle: QueryHandle,
     ) -> Result<RunningQuery, MeshError> {
         use super::executor::execute_window;
         use super::planner::CostEstimate;
@@ -467,20 +498,23 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
         let OperatorPlan::Window { input, spec } = plan.root.operator else {
             unreachable!("execute_window_federated dispatched on non-Window");
         };
-        let inner = Box::pin(self.execute_uncached(ExecutionPlan {
-            root: *input,
-            total_cost: CostEstimate::default(),
-        }))
+        let inner = Box::pin(self.execute_uncached_with_handle(
+            ExecutionPlan {
+                root: *input,
+                total_cost: CostEstimate::default(),
+            },
+            handle.clone(),
+        ))
         .await?;
         let rows = drain_rows(inner.rows).await?;
+        if handle.is_cancelled() {
+            return Err(MeshError::QueryCancelled);
+        }
         let output_rows = execute_window(rows, &spec)?;
 
-        let handle = QueryHandle::new(self.allocate_id());
-        let stream: ResultStream = Box::pin(futures::stream::iter(output_rows.into_iter().map(Ok)));
-        Ok(RunningQuery {
-            handle,
-            rows: stream,
-        })
+        let out: Vec<Result<ResultRow, MeshError>> = output_rows.into_iter().map(Ok).collect();
+        let rows = stream_results_cancellable(out, handle.clone());
+        Ok(RunningQuery { handle, rows })
     }
 
     /// Phase E-4 federated reduction / distinct aggregate.
@@ -490,6 +524,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
     async fn execute_aggregate_e4_federated(
         &self,
         plan: ExecutionPlan,
+        handle: QueryHandle,
     ) -> Result<RunningQuery, MeshError> {
         use super::executor::{execute_aggregate_distinct, execute_aggregate_reduction};
         use super::planner::CostEstimate;
@@ -501,12 +536,18 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
                 field_path,
                 kind,
             } => {
-                let inner = Box::pin(self.execute_uncached(ExecutionPlan {
-                    root: *input,
-                    total_cost: CostEstimate::default(),
-                }))
+                let inner = Box::pin(self.execute_uncached_with_handle(
+                    ExecutionPlan {
+                        root: *input,
+                        total_cost: CostEstimate::default(),
+                    },
+                    handle.clone(),
+                ))
                 .await?;
                 let rows = drain_rows(inner.rows).await?;
+                if handle.is_cancelled() {
+                    return Err(MeshError::QueryCancelled);
+                }
                 execute_aggregate_reduction(&rows, group_by.as_ref(), &field_path, kind)?
             }
             OperatorPlan::AggregateDistinct {
@@ -514,29 +555,33 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
                 group_by,
                 field_path,
             } => {
-                let inner = Box::pin(self.execute_uncached(ExecutionPlan {
-                    root: *input,
-                    total_cost: CostEstimate::default(),
-                }))
+                let inner = Box::pin(self.execute_uncached_with_handle(
+                    ExecutionPlan {
+                        root: *input,
+                        total_cost: CostEstimate::default(),
+                    },
+                    handle.clone(),
+                ))
                 .await?;
                 let rows = drain_rows(inner.rows).await?;
+                if handle.is_cancelled() {
+                    return Err(MeshError::QueryCancelled);
+                }
                 execute_aggregate_distinct(&rows, group_by.as_ref(), &field_path)?
             }
             _ => unreachable!("execute_aggregate_e4_federated dispatched on wrong operator"),
         };
 
-        let handle = QueryHandle::new(self.allocate_id());
-        let stream: ResultStream = Box::pin(futures::stream::iter(output_rows.into_iter().map(Ok)));
-        Ok(RunningQuery {
-            handle,
-            rows: stream,
-        })
+        let out: Vec<Result<ResultRow, MeshError>> = output_rows.into_iter().map(Ok).collect();
+        let rows = stream_results_cancellable(out, handle.clone());
+        Ok(RunningQuery { handle, rows })
     }
 
     /// Phase E-3 federated numeric aggregate (Sum / Avg).
     async fn execute_aggregate_numeric_federated(
         &self,
         plan: ExecutionPlan,
+        handle: QueryHandle,
     ) -> Result<RunningQuery, MeshError> {
         use super::planner::CostEstimate;
         use super::query::{
@@ -554,12 +599,18 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             unreachable!("execute_aggregate_numeric_federated dispatched on non-AggregateNumeric");
         };
 
-        let inner = Box::pin(self.execute_uncached(ExecutionPlan {
-            root: *input,
-            total_cost: CostEstimate::default(),
-        }))
+        let inner = Box::pin(self.execute_uncached_with_handle(
+            ExecutionPlan {
+                root: *input,
+                total_cost: CostEstimate::default(),
+            },
+            handle.clone(),
+        ))
         .await?;
         let rows = drain_rows(inner.rows).await?;
+        if handle.is_cancelled() {
+            return Err(MeshError::QueryCancelled);
+        }
 
         let mut acc: BTreeMap<Vec<u8>, (Option<GroupKey>, f64, u64)> = BTreeMap::new();
         for row in &rows {
@@ -636,11 +687,10 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             }
         }
 
-        let handle = QueryHandle::new(self.allocate_id());
-        let stream: ResultStream = Box::pin(futures::stream::iter(out));
+        let rows_out = stream_results_cancellable(out, handle.clone());
         Ok(RunningQuery {
             handle,
-            rows: stream,
+            rows: rows_out,
         })
     }
 
@@ -649,6 +699,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
     async fn execute_aggregate_count_federated(
         &self,
         plan: ExecutionPlan,
+        handle: QueryHandle,
     ) -> Result<RunningQuery, MeshError> {
         use super::planner::CostEstimate;
         use super::query::{AggregateRowPayload, AggregateValue, GroupKey, SeqNum};
@@ -660,12 +711,18 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
 
         // Fetch the inner rows via the federated path so atomic
         // leaves still dispatch through the transport.
-        let inner = Box::pin(self.execute_uncached(ExecutionPlan {
-            root: *input,
-            total_cost: CostEstimate::default(),
-        }))
+        let inner = Box::pin(self.execute_uncached_with_handle(
+            ExecutionPlan {
+                root: *input,
+                total_cost: CostEstimate::default(),
+            },
+            handle.clone(),
+        ))
         .await?;
         let rows = drain_rows(inner.rows).await?;
+        if handle.is_cancelled() {
+            return Err(MeshError::QueryCancelled);
+        }
 
         let mut out: Vec<Result<ResultRow, MeshError>> = Vec::new();
         match group_by {
@@ -720,11 +777,10 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
             }
         }
 
-        let handle = QueryHandle::new(self.allocate_id());
-        let stream: ResultStream = Box::pin(futures::stream::iter(out));
+        let rows_out = stream_results_cancellable(out, handle.clone());
         Ok(RunningQuery {
             handle,
-            rows: stream,
+            rows: rows_out,
         })
     }
 }
@@ -917,6 +973,27 @@ async fn drain_rows(mut s: ResultStream) -> Result<Vec<ResultRow>, MeshError> {
         out.push(item?);
     }
     Ok(out)
+}
+
+/// Wrap a materialized `Vec<Result<ResultRow, MeshError>>` in
+/// a [`ResultStream`] that re-checks the outer
+/// [`QueryHandle`]'s cancel flag at every yield boundary. The
+/// federated composite operators (HashJoin / Aggregate* /
+/// Window / Filter) materialize their output before returning;
+/// without this wrapper, `handle.cancel()` after that point is
+/// a no-op against the resulting stream.
+fn stream_results_cancellable(
+    rows: Vec<Result<ResultRow, MeshError>>,
+    handle: QueryHandle,
+) -> ResultStream {
+    let stream = futures::stream::iter(rows).map(move |item| {
+        if handle.is_cancelled() {
+            Err(MeshError::QueryCancelled)
+        } else {
+            item
+        }
+    });
+    Box::pin(stream)
 }
 
 /// Federated mirror of `executor::try_encode_join_key`. The
@@ -1625,6 +1702,55 @@ mod tests {
         let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
         assert_eq!(decoded.group, None);
         assert_eq!(decoded.value, AggregateValue::Count(4));
+    }
+
+    #[tokio::test]
+    async fn cancel_after_composite_aggregate_short_circuits_materialized_stream() {
+        // Regression: pre-fix, federated composite operators
+        // (Aggregate / Join / Window / Filter) materialized
+        // their output into `futures::stream::iter(out)` and
+        // allocated a fresh `QueryHandle` per recursive call.
+        // The outer `running.handle.cancel()` was a no-op for
+        // every composite plan because the materialized iter
+        // ignored the cancel flag. This test pins the fixed
+        // behavior: cancel after composite materialization
+        // surfaces `QueryCancelled` from the row stream.
+        use super::super::planner::CostEstimate;
+
+        let chain = 0xC0DE;
+        let node = local_executor_with(&[(chain, 1, b"x"), (chain, 2, b"y"), (chain, 3, b"z")]);
+        let transport = Arc::new(LoopbackTransport::new());
+        transport.register(0xA, node);
+
+        let fed = FederatedMeshQueryExecutor::new(transport);
+        let plan = ExecutionPlan {
+            root: OperatorNode {
+                operator: OperatorPlan::AggregateCount {
+                    input: Box::new(OperatorNode {
+                        operator: OperatorPlan::BetweenRead {
+                            origin: chain,
+                            start: SeqNum(1),
+                            end: SeqNum(10),
+                        },
+                        target_nodes: vec![0xA],
+                        cost: CostEstimate::default(),
+                    }),
+                    group_by: None,
+                },
+                target_nodes: vec![],
+                cost: CostEstimate::default(),
+            },
+            total_cost: CostEstimate::default(),
+        };
+
+        let running = fed.execute(plan).await.unwrap();
+        running.handle.cancel();
+        let rows = collect_rows(running.rows).await;
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r, Err(MeshError::QueryCancelled))),
+            "expected QueryCancelled to surface from a cancelled composite stream, got {rows:?}"
+        );
     }
 
     #[tokio::test]
