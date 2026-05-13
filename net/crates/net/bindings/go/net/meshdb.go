@@ -91,11 +91,11 @@ extern MeshDbQuery* net_meshdb_query_latest(uint64_t origin);
 extern void net_meshdb_query_free(MeshDbQuery* query);
 
 // Runner + execute.
-extern MeshDbRunner* net_meshdb_runner_new(MeshDbReader* reader);
+extern MeshDbRunner* net_meshdb_runner_new(const MeshDbReader* reader);
 extern void net_meshdb_runner_free(MeshDbRunner* runner);
 extern MeshDbIter* net_meshdb_runner_execute(
     MeshDbRunner* runner,
-    MeshDbQuery* query
+    const MeshDbQuery* query
 );
 
 // Iterator.
@@ -169,10 +169,10 @@ extern MeshDbQuery* net_meshdb_query_filter_json(
 #define NET_MESHDB_CACHE_PERMANENT 0
 #define NET_MESHDB_CACHE_TIME_BOUND 1
 
-extern MeshDbRunner* net_meshdb_runner_new_cached(MeshDbReader* reader);
+extern MeshDbRunner* net_meshdb_runner_new_cached(const MeshDbReader* reader);
 extern MeshDbIter* net_meshdb_runner_execute_with(
     MeshDbRunner* runner,
-    MeshDbQuery* query,
+    const MeshDbQuery* query,
     int bypass_cache,
     int cache_policy_kind,
     double cache_ttl_secs

@@ -332,7 +332,7 @@ MeshDbQuery* net_meshdb_query_filter_json(
  * `net_meshdb_reader_free`: once freed, calling
  * `net_meshdb_reader_append` against the same pointer is UB.
  * Returns NULL on a NULL reader. */
-MeshDbRunner* net_meshdb_runner_new(MeshDbReader* reader);
+MeshDbRunner* net_meshdb_runner_new(const MeshDbReader* reader);
 
 /* Build a runner with the Phase F single-node LRU result cache
  * wired in. The capability-version closure is fixed at `0`
@@ -340,7 +340,7 @@ MeshDbRunner* net_meshdb_runner_new(MeshDbReader* reader);
  * pull-invalidation across version changes lands when this
  * surface grows a federated-executor path. Returns NULL on a
  * NULL reader. */
-MeshDbRunner* net_meshdb_runner_new_cached(MeshDbReader* reader);
+MeshDbRunner* net_meshdb_runner_new_cached(const MeshDbReader* reader);
 
 /* Free a runner handle. No-op on NULL. Outstanding iterators
  * remain valid (they own their drained rows independently of
@@ -351,10 +351,12 @@ void net_meshdb_runner_free(MeshDbRunner* runner);
  * result stream is drained into the returned iterator. Returns
  * NULL on planner / executor failure. The iterator is owned by
  * the caller — free via `net_meshdb_iter_free`. Both pointer
- * args may be safely null (yields NULL). */
+ * args may be safely null (yields NULL). Neither the runner
+ * nor the query is mutated across the call; C++ consumers
+ * holding a `const MeshDbQuery*` may pass it without a cast. */
 MeshDbIter* net_meshdb_runner_execute(
     MeshDbRunner* runner,
-    MeshDbQuery* query
+    const MeshDbQuery* query
 );
 
 /* Execute `query` with explicit Phase F options. Matches the
@@ -368,10 +370,11 @@ MeshDbIter* net_meshdb_runner_execute(
  *   `cache_ttl_secs`   — TTL for TimeBound. Ignored for Permanent.
  *                        Non-finite / negative falls back to 5.0.
  *
- * Returns NULL on the same failures as `_execute`. */
+ * Returns NULL on the same failures as `_execute`. Same
+ * const-correctness as `_execute`. */
 MeshDbIter* net_meshdb_runner_execute_with(
     MeshDbRunner* runner,
-    MeshDbQuery* query,
+    const MeshDbQuery* query,
     int bypass_cache,
     int cache_policy_kind,
     double cache_ttl_secs

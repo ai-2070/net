@@ -1001,6 +1001,17 @@ pub(crate) fn build_hash_join_table(
 /// given mode. `None` when `JoinKeyMode::Field` resolves to a
 /// missing key, a non-JSON payload, or a non-scalar leaf. Row-
 /// intrinsic modes never fail.
+///
+/// `JoinKeyMode::Field("origin")` / `Field("seq")` /
+/// `Field("origin,seq")` canonicalize to the matching
+/// row-intrinsic encoding (8 raw LE bytes, not the 16-char
+/// hex string). The planner already rewrites `Field("origin")`
+/// to `JoinKeyMode::Origin` (and likewise for the others), so
+/// no real query hits this — but the divergence used to be a
+/// footgun: a hand-rolled `OperatorPlan` in tests or a future
+/// planner path that emitted `Field("origin")` directly would
+/// produce a probe table whose keys didn't cross-correlate
+/// with a sibling `JoinKeyMode::Origin` table.
 fn try_encode_join_key(row: &ResultRow, mode: &JoinKeyMode) -> Option<Vec<u8>> {
     match mode {
         JoinKeyMode::Origin => Some(row.origin.to_le_bytes().to_vec()),
@@ -1011,9 +1022,17 @@ fn try_encode_join_key(row: &ResultRow, mode: &JoinKeyMode) -> Option<Vec<u8>> {
             v.extend_from_slice(&row.seq.0.to_le_bytes());
             Some(v)
         }
-        JoinKeyMode::Field(path) => {
-            super::row::extract_string_projection(row, path).map(String::into_bytes)
-        }
+        JoinKeyMode::Field(path) => match path.as_str() {
+            "origin" => Some(row.origin.to_le_bytes().to_vec()),
+            "seq" => Some(row.seq.0.to_le_bytes().to_vec()),
+            "origin,seq" => {
+                let mut v = Vec::with_capacity(16);
+                v.extend_from_slice(&row.origin.to_le_bytes());
+                v.extend_from_slice(&row.seq.0.to_le_bytes());
+                Some(v)
+            }
+            _ => super::row::extract_string_projection(row, path).map(String::into_bytes),
+        },
     }
 }
 
@@ -2865,5 +2884,37 @@ mod tests {
         // is non-JSON (predicate fails silently).
         let seqs: Vec<u64> = rows.iter().map(|r| r.seq.0).collect();
         assert_eq!(seqs, vec![2, 3]);
+    }
+
+    #[test]
+    fn join_key_field_origin_canonicalizes_to_intrinsic_encoding() {
+        // Regression: pre-fix, `JoinKeyMode::Field("origin")`
+        // hashed on the 16-char hex string while
+        // `JoinKeyMode::Origin` hashed on 8 raw LE bytes. Probe
+        // tables built under those two modes wouldn't cross-
+        // correlate even though they encode the same concept.
+        // The planner already rewrites `Field("origin")` to
+        // `Origin`, but a hand-rolled OperatorPlan in tests (or
+        // a future planner path emitting Field directly) would
+        // hit the divergence. try_encode_join_key now canon-
+        // icalizes Field("origin") / Field("seq") /
+        // Field("origin,seq") to the intrinsic encoding.
+        let row = ResultRow {
+            origin: 0xABCD_EF01_DEAD_BEEF,
+            seq: SeqNum(42),
+            payload: Vec::new(),
+        };
+        assert_eq!(
+            try_encode_join_key(&row, &JoinKeyMode::Origin),
+            try_encode_join_key(&row, &JoinKeyMode::Field("origin".to_string())),
+        );
+        assert_eq!(
+            try_encode_join_key(&row, &JoinKeyMode::Seq),
+            try_encode_join_key(&row, &JoinKeyMode::Field("seq".to_string())),
+        );
+        assert_eq!(
+            try_encode_join_key(&row, &JoinKeyMode::OriginSeq),
+            try_encode_join_key(&row, &JoinKeyMode::Field("origin,seq".to_string())),
+        );
     }
 }

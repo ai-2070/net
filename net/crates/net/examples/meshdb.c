@@ -128,6 +128,32 @@ int main(void) {
         net_meshdb_query_free(q);
     }
 
+    /* 4. Cached runner via execute_with — opt-in Phase F cache
+     * with Permanent policy. The second call should be served
+     * from the cache; the result is observably identical. */
+    {
+        MeshDbRunner* cached = net_meshdb_runner_new_cached(reader);
+        if (!cached) {
+            fprintf(stderr, "runner_new_cached returned NULL\n");
+            net_meshdb_runner_free(runner);
+            net_meshdb_reader_free(reader);
+            return 1;
+        }
+        MeshDbQuery* q = net_meshdb_query_latest(0xAB);
+        MeshDbIter* first = net_meshdb_runner_execute_with(
+            cached, q, /*bypass_cache=*/0,
+            NET_MESHDB_CACHE_PERMANENT, /*ttl=*/0.0);
+        drain_iter(first, "cached latest(0xAB) — first call (miss)");
+        net_meshdb_iter_free(first);
+        MeshDbIter* second = net_meshdb_runner_execute_with(
+            cached, q, /*bypass_cache=*/0,
+            NET_MESHDB_CACHE_PERMANENT, /*ttl=*/0.0);
+        drain_iter(second, "cached latest(0xAB) — second call (hit)");
+        net_meshdb_iter_free(second);
+        net_meshdb_query_free(q);
+        net_meshdb_runner_free(cached);
+    }
+
     net_meshdb_runner_free(runner);
     net_meshdb_reader_free(reader);
     return 0;

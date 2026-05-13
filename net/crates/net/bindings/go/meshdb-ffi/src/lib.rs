@@ -1175,7 +1175,7 @@ fn shared_runtime() -> std::io::Result<Arc<Runtime>> {
 /// `reader` must be a valid pointer returned by
 /// `net_meshdb_reader_new`, or null (which yields null).
 #[no_mangle]
-pub unsafe extern "C" fn net_meshdb_runner_new(reader: *mut MeshDbReader) -> *mut MeshDbRunner {
+pub unsafe extern "C" fn net_meshdb_runner_new(reader: *const MeshDbReader) -> *mut MeshDbRunner {
     ffi_guard!(ptr::null_mut(), {
         if reader.is_null() {
             invalid_arg_null!("net_meshdb_runner_new: null reader");
@@ -1213,7 +1213,7 @@ pub unsafe extern "C" fn net_meshdb_runner_new(reader: *mut MeshDbReader) -> *mu
 /// `net_meshdb_reader_new`, or null.
 #[no_mangle]
 pub unsafe extern "C" fn net_meshdb_runner_new_cached(
-    reader: *mut MeshDbReader,
+    reader: *const MeshDbReader,
 ) -> *mut MeshDbRunner {
     ffi_guard!(ptr::null_mut(), {
         if reader.is_null() {
@@ -1269,7 +1269,7 @@ pub unsafe extern "C" fn net_meshdb_runner_free(runner: *mut MeshDbRunner) {
 #[no_mangle]
 pub unsafe extern "C" fn net_meshdb_runner_execute(
     runner: *mut MeshDbRunner,
-    query: *mut MeshDbQuery,
+    query: *const MeshDbQuery,
 ) -> *mut MeshDbIter {
     if runner.is_null() || query.is_null() {
         set_last_error_static("null runner or query handle", "invalid_arg");
@@ -1333,7 +1333,7 @@ pub const NET_MESHDB_CACHE_TIME_BOUND: c_int = 1;
 #[no_mangle]
 pub unsafe extern "C" fn net_meshdb_runner_execute_with(
     runner: *mut MeshDbRunner,
-    query: *mut MeshDbQuery,
+    query: *const MeshDbQuery,
     bypass_cache: c_int,
     cache_policy_kind: c_int,
     cache_ttl_secs: f64,

@@ -984,6 +984,12 @@ fn try_encode_join_key_federated(
     mode: &super::planner::JoinKeyMode,
 ) -> Option<Vec<u8>> {
     use super::planner::JoinKeyMode;
+    // Mirrors the local executor's `try_encode_join_key`,
+    // including the canonicalization of
+    // `Field("origin"|"seq"|"origin,seq")` to the matching
+    // row-intrinsic encoding. The two functions must produce
+    // byte-identical output for the same (row, mode) pair so
+    // local and federated probe tables cross-correlate.
     match mode {
         JoinKeyMode::Origin => Some(row.origin.to_le_bytes().to_vec()),
         JoinKeyMode::Seq => Some(row.seq.0.to_le_bytes().to_vec()),
@@ -993,9 +999,17 @@ fn try_encode_join_key_federated(
             v.extend_from_slice(&row.seq.0.to_le_bytes());
             Some(v)
         }
-        JoinKeyMode::Field(path) => {
-            super::row::extract_string_projection(row, path).map(String::into_bytes)
-        }
+        JoinKeyMode::Field(path) => match path.as_str() {
+            "origin" => Some(row.origin.to_le_bytes().to_vec()),
+            "seq" => Some(row.seq.0.to_le_bytes().to_vec()),
+            "origin,seq" => {
+                let mut v = Vec::with_capacity(16);
+                v.extend_from_slice(&row.origin.to_le_bytes());
+                v.extend_from_slice(&row.seq.0.to_le_bytes());
+                Some(v)
+            }
+            _ => super::row::extract_string_projection(row, path).map(String::into_bytes),
+        },
     }
 }
 

@@ -111,7 +111,8 @@ export interface ParsedMeshDbError {
  */
 export function parseMeshDbErrorKind(err: unknown): ParsedMeshDbError | null {
   if (!(err instanceof Error)) return null;
-  const m = err.message.match(/^<<meshdb-kind:([a-z_]+)>>(.*)$/s);
+  // Accept digits too (`protocol_v2_mismatch`-style future kinds).
+  const m = err.message.match(/^<<meshdb-kind:([a-z0-9_]+)>>(.*)$/s);
   if (!m) return null;
   return { kind: m[1], message: m[2] };
 }
