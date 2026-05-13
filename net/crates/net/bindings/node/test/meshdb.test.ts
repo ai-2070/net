@@ -1022,4 +1022,63 @@ d('MeshDB AsyncIterable shim', () => {
     }
     expect(seen).toEqual([1n]);
   });
+
+  it('break inside for-await releases the backing row buffer', async () => {
+    // Regression: pre-fix, the AsyncIterable shim defined only
+    // `next()`. Breaking out of the loop left the backing Vec
+    // pinned on the AsyncMutex until JS GC fired. The new
+    // `return()` hook drains it eagerly via `release()`.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    require('../meshdb');
+    const reader = seed(
+      [1, 2, 3, 4, 5, 6].map((s) => [0xabn, BigInt(s), Buffer.from(`p-${s}`)]),
+    );
+    const runner = new MeshQueryRunner(reader);
+    const stream = await runner.execute(MeshQuery.between(0xabn, 1n, 10n));
+    const seen: number[] = [];
+    for await (const row of stream as unknown as AsyncIterable<{
+      seq: bigint;
+    }>) {
+      seen.push(Number(row.seq));
+      if (seen.length === 2) {
+        break;
+      }
+    }
+    expect(seen).toEqual([1, 2]);
+    // After release, toArray must report an empty drain.
+    const drained = await (
+      stream as unknown as { toArray(): Promise<unknown[]> }
+    ).toArray();
+    expect(drained).toEqual([]);
+  });
+
+  it('exception inside for-await releases the backing row buffer', async () => {
+    // The shim's `throw()` hook calls release before rethrowing.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    require('../meshdb');
+    const reader = seed(
+      [1, 2, 3, 4, 5].map((s) => [0xabn, BigInt(s), Buffer.from(`p-${s}`)]),
+    );
+    const runner = new MeshQueryRunner(reader);
+    const stream = await runner.execute(MeshQuery.between(0xabn, 1n, 10n));
+    const seen: number[] = [];
+    const sentinel = new Error('stop after 2');
+    await expect(
+      (async () => {
+        for await (const row of stream as unknown as AsyncIterable<{
+          seq: bigint;
+        }>) {
+          seen.push(Number(row.seq));
+          if (seen.length === 2) {
+            throw sentinel;
+          }
+        }
+      })(),
+    ).rejects.toBe(sentinel);
+    expect(seen).toEqual([1, 2]);
+    const drained = await (
+      stream as unknown as { toArray(): Promise<unknown[]> }
+    ).toArray();
+    expect(drained).toEqual([]);
+  });
 });

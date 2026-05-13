@@ -35,7 +35,10 @@ if (
   !(Symbol.asyncIterator in native.MeshQueryStream.prototype)
 ) {
   Object.defineProperty(native.MeshQueryStream.prototype, Symbol.asyncIterator, {
-    value(this: { next(): Promise<unknown | null> }) {
+    value(this: {
+      next(): Promise<unknown | null>;
+      release?(): Promise<void>;
+    }) {
       const stream = this;
       return {
         async next(): Promise<{ value: unknown; done: boolean }> {
@@ -44,6 +47,27 @@ if (
             return { value: undefined, done: true };
           }
           return { value: row, done: false };
+        },
+        // `return(value)` is invoked when a `for await (...)` loop
+        // `break`s, `return`s from the enclosing function, or an
+        // exception unwinds out of the loop body. Without this,
+        // the backing row Vec stays pinned on the AsyncMutex
+        // until JS GC eventually drops the stream — for a 10k+
+        // row result that's a sizeable memory pin.
+        async return(value: unknown): Promise<{ value: unknown; done: boolean }> {
+          if (typeof stream.release === "function") {
+            await stream.release();
+          }
+          return { value, done: true };
+        },
+        // `throw(err)` is the iteration-protocol's error path.
+        // Symmetric to `return()`: free the buffer, then
+        // re-surface the error to the caller.
+        async throw(err: unknown): Promise<{ value: unknown; done: boolean }> {
+          if (typeof stream.release === "function") {
+            await stream.release();
+          }
+          throw err;
         },
       };
     },

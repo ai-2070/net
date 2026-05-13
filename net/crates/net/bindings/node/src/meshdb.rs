@@ -1341,6 +1341,18 @@ impl MeshQueryStream {
         out.reverse();
         Ok(out)
     }
+
+    /// Discard any remaining rows immediately, freeing the
+    /// backing buffer. Used by the AsyncIterable `return()` /
+    /// `throw()` hooks so a `for await (...) { if (...) break; }`
+    /// loop releases the result vector promptly instead of
+    /// holding it pinned on the AsyncMutex until JS GC fires.
+    /// Subsequent `.next()` calls return `null`.
+    #[napi]
+    pub async fn release(&self) {
+        let mut g = self.rows.lock().await;
+        let _drop = std::mem::take(&mut *g);
+    }
 }
 
 fn mesh_err(msg: String) -> Error {
