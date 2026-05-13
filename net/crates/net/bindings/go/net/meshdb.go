@@ -861,3 +861,177 @@ func MeshDBQueryFilter(
 	runtime.SetFinalizer(q, func(q *MeshDBQuery) { q.Free() })
 	return q, nil
 }
+
+// =====================================================================
+// Slice 4: fluent QueryBuilder
+// =====================================================================
+//
+// Idiomatic Go-side composition over the package-level factory
+// functions. Each chain step returns a fresh builder so aliased
+// intermediates stay valid for parallel pipelines. Source
+// methods (.At / .Between / .Latest) reset prior state. Build
+// returns the accumulated MeshDBQuery (with finalizer
+// installed); calling Build on an empty builder is an error.
+//
+// Per locked scope: builder covers the common ops (At /
+// Between / Latest / Filter / Count / Sum / Avg / Min / Max /
+// Percentile / DistinctCount / Window / Join). Rarer
+// operators (lineage walks, payload-keyed group_by) still go
+// through the package-level factory funcs.
+//
+// Each builder step accumulates errors lazily: if any
+// intermediate factory returns an error, the builder records
+// it and Build surfaces the first error encountered. This
+// keeps chaining ergonomic — callers check error only at the
+// terminal Build call.
+
+// MeshDBQueryBuilder is the fluent builder handle.
+type MeshDBQueryBuilder struct {
+	state *MeshDBQuery
+	err   error
+}
+
+// NewMeshDBQueryBuilder returns an empty builder. Use one of
+// the source methods (At / Between / Latest) to seed it, then
+// chain transformations and call Build.
+func NewMeshDBQueryBuilder() *MeshDBQueryBuilder {
+	return &MeshDBQueryBuilder{}
+}
+
+// At resets the builder to a fresh source: read seq at origin.
+func (b *MeshDBQueryBuilder) At(origin, seq uint64) *MeshDBQueryBuilder {
+	return &MeshDBQueryBuilder{state: MeshDBQueryAt(origin, seq)}
+}
+
+// Between resets the builder to a fresh source: read events in
+// the half-open seq range.
+func (b *MeshDBQueryBuilder) Between(origin, start, end uint64) *MeshDBQueryBuilder {
+	q, err := MeshDBQueryBetween(origin, start, end)
+	return &MeshDBQueryBuilder{state: q, err: err}
+}
+
+// Latest resets the builder to a fresh source: read the tip
+// event of origin.
+func (b *MeshDBQueryBuilder) Latest(origin uint64) *MeshDBQueryBuilder {
+	return &MeshDBQueryBuilder{state: MeshDBQueryLatest(origin)}
+}
+
+// Filter wraps the current pipeline in a row filter.
+func (b *MeshDBQueryBuilder) Filter(predicate MeshDBPredicate) *MeshDBQueryBuilder {
+	if b.err != nil {
+		return b
+	}
+	if b.state == nil {
+		return &MeshDBQueryBuilder{err: fmt.Errorf(
+			"filter: builder has no source — call At/Between/Latest first: %w",
+			ErrMeshDBInvalidArg,
+		)}
+	}
+	q, err := MeshDBQueryFilter(b.state, predicate)
+	return &MeshDBQueryBuilder{state: q, err: err}
+}
+
+// Count over the current pipeline. `groupBy` is the same
+// row-intrinsic field-list as the factory.
+func (b *MeshDBQueryBuilder) Count(groupBy []string) *MeshDBQueryBuilder {
+	if b.err != nil {
+		return b
+	}
+	if b.state == nil {
+		return &MeshDBQueryBuilder{err: fmt.Errorf(
+			"count: builder has no source — call At/Between/Latest first: %w",
+			ErrMeshDBInvalidArg,
+		)}
+	}
+	q, err := MeshDBQueryCount(b.state, groupBy)
+	return &MeshDBQueryBuilder{state: q, err: err}
+}
+
+// Sum / Avg / Min / Max over the current pipeline. `kind` is
+// one of "sum"/"avg"/"min"/"max"/"distinct_count".
+func (b *MeshDBQueryBuilder) NumericAgg(
+	kind, field string,
+	groupBy []string,
+) *MeshDBQueryBuilder {
+	if b.err != nil {
+		return b
+	}
+	if b.state == nil {
+		return &MeshDBQueryBuilder{err: fmt.Errorf(
+			"%s: builder has no source — call At/Between/Latest first: %w",
+			kind, ErrMeshDBInvalidArg,
+		)}
+	}
+	q, err := MeshDBQueryNumericAgg(b.state, kind, field, groupBy)
+	return &MeshDBQueryBuilder{state: q, err: err}
+}
+
+// Percentile over the current pipeline.
+func (b *MeshDBQueryBuilder) Percentile(
+	field string,
+	p float64,
+	groupBy []string,
+) *MeshDBQueryBuilder {
+	if b.err != nil {
+		return b
+	}
+	if b.state == nil {
+		return &MeshDBQueryBuilder{err: fmt.Errorf(
+			"percentile: builder has no source — call At/Between/Latest first: %w",
+			ErrMeshDBInvalidArg,
+		)}
+	}
+	q, err := MeshDBQueryPercentile(b.state, field, p, groupBy)
+	return &MeshDBQueryBuilder{state: q, err: err}
+}
+
+// Window over the current pipeline.
+func (b *MeshDBQueryBuilder) Window(size uint64) *MeshDBQueryBuilder {
+	if b.err != nil {
+		return b
+	}
+	if b.state == nil {
+		return &MeshDBQueryBuilder{err: fmt.Errorf(
+			"window: builder has no source — call At/Between/Latest first: %w",
+			ErrMeshDBInvalidArg,
+		)}
+	}
+	q, err := MeshDBQueryWindow(b.state, size)
+	return &MeshDBQueryBuilder{state: q, err: err}
+}
+
+// Join the current pipeline (left) with `right`. See
+// `MeshDBQueryJoin` for the parameter docs.
+func (b *MeshDBQueryBuilder) Join(
+	right *MeshDBQuery,
+	kind, key, strategy string,
+	watermarkSecs float64,
+) *MeshDBQueryBuilder {
+	if b.err != nil {
+		return b
+	}
+	if b.state == nil {
+		return &MeshDBQueryBuilder{err: fmt.Errorf(
+			"join: builder has no source — call At/Between/Latest first: %w",
+			ErrMeshDBInvalidArg,
+		)}
+	}
+	q, err := MeshDBQueryJoin(b.state, right, kind, key, strategy, watermarkSecs)
+	return &MeshDBQueryBuilder{state: q, err: err}
+}
+
+// Build returns the accumulated MeshDBQuery. Returns the first
+// error encountered during chaining, or an error if no source
+// was seeded.
+func (b *MeshDBQueryBuilder) Build() (*MeshDBQuery, error) {
+	if b.err != nil {
+		return nil, b.err
+	}
+	if b.state == nil {
+		return nil, fmt.Errorf(
+			"build: builder has no source — call At/Between/Latest first: %w",
+			ErrMeshDBInvalidArg,
+		)
+	}
+	return b.state, nil
+}
