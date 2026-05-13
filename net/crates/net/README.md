@@ -828,6 +828,41 @@ See each SDK README for the typed surface, resilience helpers, and streaming sem
 - **Python (low-level binding)** — [`bindings/python/README.md`](bindings/python/README.md): the raw `net.MeshRpc` pyclass that the typed wrapper sits on top of.
 - **Go** — [`bindings/go/net/`](bindings/go/net/): reference cgo wrapper around the C ABI (`libnet_rpc`) at `bindings/go/rpc-ffi/`. Documents `MeshRpc.Call` / `CallService` / `Serve` / `CallStreaming` with ctx-cancel watcher; the Go module ships downstream.
 
+## MeshDB
+
+MeshDB is the federated query layer above the capability-query primitives and CortEX folds. It turns the substrate's per-chain RedEX logs into a queryable surface — atomic reads (`At` / `Between` / `Latest` / `LineageEmit`), composite operators (`Filter` / `Window` / aggregates / joins), and a single-node LRU result cache — without inventing a new wire protocol. Lives behind the `meshdb` Cargo feature; symbols live under [`adapter/net/behavior/meshdb/`](src/adapter/net/behavior/meshdb).
+
+**Architecture.** Two-layer split:
+
+- **Typed AST** (`MeshQuery::V1(QueryV1)`) — closed under composition, serde round-trippable via postcard + JSON. The outer enum is explicitly versioned so unknown versions reject cleanly at decode time. Operator variants are `#[non_exhaustive]` on the wire: adding a new operator inside an existing `Vn` is a non-bump when old planners reject unknown variants cleanly.
+- **Planner + executor.** `MeshQueryPlanner::plan(query)` lowers the AST into an `ExecutionPlan` tree the executor walks. `LocalMeshQueryExecutor<R: ChainReader>` runs the plan in-process against a pluggable `ChainReader`; `FederatedMeshQueryExecutor<T: MeshDbTransport>` fans atomic operators out to remote nodes via the mesh subprotocol (`SUBPROTOCOL_MESHDB`) with proximity-ordered failover. Both implementations share the `MeshQueryExecutor` async trait.
+
+**Operator inventory.**
+
+| Family | Operators |
+|---|---|
+| Atomic reads | `AtRead`, `BetweenRead`, `LatestRead`, `LineageEmit` (pre-walked entries form) |
+| Composite | `Filter` (synthetic-tag predicates over row-intrinsic + flattened JSON), `Window` (tumbling-on-seq), `AggregateCount`, `AggregateNumeric` (sum / avg), `AggregateReduction` (min / max / percentile), `AggregateDistinct`, `HashJoin` (inner / outer over row-intrinsic or payload-keyed keys; hash-broadcast + sort-merge strategies) |
+| Lineage | `LineageEmit { origin, direction, entries }` — emits one row per pre-walked `LineageEntry`. The SDK does NOT walk the `fork-of:` graph itself; callers maintain their own graph view (or use the substrate's `CapabilityIndex` directly) and feed entries in walk order. |
+
+**Result row shape.** `ResultRow { origin: u64, seq: SeqNum, payload: Vec<u8> }`. Atomic-operator rows carry the raw event body. Composite-operator rows carry a postcard-encoded sentinel envelope — `AggregateRowPayload`, `JoinedRowPayload`, or `WindowBoundary` — that the SDK wrappers decode at the consumer boundary (typed pyclasses in Python, POJOs in Node, a JSON intermediate in the C ABI).
+
+**Synthetic per-row view.** `Filter` and numeric aggregates wrap every `ResultRow` in a synthetic `CapabilitySet`-shaped view so the existing `PredicateWire` evaluation machinery reuses end-to-end. Tags follow `dataforts.origin = <16-hex>`, `dataforts.seq = <decimal>`, and `dataforts.<flat-json-path> = <scalar-as-string>` for every leaf scalar in a JSON-object payload (nested objects flatten with `.` separators; arrays are skipped). Payload-keyed joins read the same paths.
+
+**Result cache (Phase F).** `LruResultCache` is a per-node bounded LRU keyed on `(operator-fingerprint, cap-version)`. `ExecuteOptions::cache_policy` chooses `Permanent` (cache until LRU eviction; safe only for immutable results) or `TimeBound { ttl }` (TTL expiry; the canonical default is 5 s, mirroring the join watermark). `bypass_cache` skips both lookup and writeback. No invalidation broadcast — cache entries simply key on the capability-index version, so a version bump implicitly invalidates everything below it.
+
+**Wire envelope** (Phase B). `MeshDbRequest` / `MeshDbResponse` live on `SUBPROTOCOL_MESHDB` and stream results as `ResultBatch { rows, more, continuation }`. The continuation token is opaque (postcard-encoded executor state); callers replay it verbatim on the next `Execute` to resume a partially-drained query. Phase B-4 plugs the envelope into the mesh's subprotocol dispatch + the federated executor.
+
+**AST versioning.** `MeshQuery::V1(QueryV1)` is the only shipped version. `QueryV1` is `#[non_exhaustive]` source-side; postcard's varint discriminant + the "reject unknown variants cleanly" contract on the wire are the load-bearing pieces for forward compat. A future `V2` lands as a sibling variant — old decoders reject it with `MeshError::PlannerError { detail: "unsupported query version" }` rather than silently misparsing.
+
+**Per-binding usage.** Each SDK README documents the language-idiomatic surface:
+
+- **Rust** — [`sdk/README.md`](sdk/README.md): the `MeshQuery` AST + `LocalMeshQueryExecutor` directly from `net::adapter::net::behavior::meshdb`.
+- **TypeScript** — [`sdk-ts/README.md`](sdk-ts/README.md): `MeshQuery` static factories + `MeshQueryRunner` from `@ai2070/net`, with Promise-of-AsyncIterable execution and the `for await` shim from `@ai2070/net/meshdb`.
+- **Python** — [`sdk-py/README.md`](sdk-py/README.md): `MeshQuery` / `MeshQueryRunner` / `InMemoryChainReader` + the fluent `QueryBuilder` from the `net` package; sync runner around an internal Tokio runtime.
+- **Go** — [`bindings/go/net/meshdb.go`](bindings/go/net/meshdb.go): cgo wrapper over `libnet_meshdb`; `MeshDBQuery*` factories return a channel from `(*MeshDBRunner).Execute`.
+- **C / C++ / etc.** — [`include/net_meshdb.h`](include/net_meshdb.h): drop-in header for the `libnet_meshdb` cdylib (24 `net_meshdb_*` exports, sentinel-envelope JSON decoder at the FFI boundary).
+
 ## Module Map
 
 Top-level `src/` is the event-bus core; the heavy mesh code lives under `adapter/net/`.

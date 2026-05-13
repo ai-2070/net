@@ -1223,6 +1223,120 @@ Cross-binding contract spec — including the canonical
 `cross_lang_echo_sum` service used by every binding's wire-format
 compat test — lives in [`../README.md#nrpc`](../README.md#nrpc).
 
+## MeshDB (federated query layer)
+
+MeshDB is the typed query layer above the RedEX / CortEX / capability-index substrate. Enable the `meshdb` feature on `ai2070-net` and import the operators + executor directly from
+`net::adapter::net::behavior::meshdb`. Architectural overview: [`../README.md#meshdb`](../README.md#meshdb).
+
+### Local executor
+
+```rust
+# #[cfg(feature = "meshdb")]
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+use std::sync::Arc;
+use futures::StreamExt;
+use net::adapter::net::behavior::meshdb::{
+    executor::ExecuteOptions,
+    planner::CostEstimate,
+    ChainReader, ExecutionPlan, LocalMeshQueryExecutor, MeshQueryExecutor,
+    OperatorNode, OperatorPlan, ResultRow, SeqNum,
+};
+
+// Bring your own ChainReader. The substrate ships an in-memory
+// one in tests; production consumers wire RedEX or a federated
+// reader.
+struct InMemory { /* origin -> seq -> payload */ }
+impl ChainReader for InMemory {
+    fn read_one(&self, _origin: u64, _seq: SeqNum) -> Option<Vec<u8>> { None }
+    fn read_range(&self, _origin: u64, _start: SeqNum, _end: SeqNum)
+        -> Vec<(SeqNum, Vec<u8>)> { Vec::new() }
+    fn latest_seq(&self, _origin: u64) -> Option<SeqNum> { None }
+}
+
+// Build an ExecutionPlan directly. The local executor takes a
+// fully-resolved plan — the typed `MeshQueryPlanner` only adds
+// value when resolving `ChainRef::Discovered` predicates through
+// a CapabilityIndex (federated path).
+let plan = ExecutionPlan {
+    root: OperatorNode {
+        operator: OperatorPlan::LatestRead { origin: 0xAB },
+        target_nodes: vec![],
+        cost: CostEstimate::default(),
+    },
+    total_cost: CostEstimate::default(),
+};
+
+let executor = LocalMeshQueryExecutor::new(Arc::new(InMemory { /* ... */ }));
+let mut running = executor
+    .execute_with(plan, ExecuteOptions::default())
+    .await?;
+
+while let Some(item) = running.rows.next().await {
+    let row: ResultRow = item?;
+    println!("origin={:#x} seq={} bytes={}", row.origin, row.seq.0, row.payload.len());
+}
+# Ok(())
+# }
+```
+
+### Composite operators
+
+`OperatorPlan` covers the full surface — `Filter` (synthetic-tag
+predicate), `Window` (tumbling-on-seq), `AggregateCount` /
+`AggregateNumeric` (sum / avg) / `AggregateReduction` (min / max /
+percentile) / `AggregateDistinct`, `HashJoin` (inner / outer; hash-
+broadcast + sort-merge strategies), `LineageEmit` (pre-walked
+entries). Compose by nesting `OperatorNode`s: each composite
+operator takes a `Box<OperatorNode>` input plus its own knobs.
+Sentinel rows (aggregate / joined / window) carry postcard-encoded
+envelopes — decode via the typed `AggregateRowPayload` /
+`JoinedRowPayload` / `WindowBoundary` types re-exported from the
+same module.
+
+### Phase F cache
+
+`LocalMeshQueryExecutor::with_cache(reader, cache, version_fn)`
+wires the bounded LRU result cache. Per-call policy lives on
+`ExecuteOptions`:
+
+```rust,ignore
+use std::time::Duration;
+use net::adapter::net::behavior::meshdb::{
+    CachePolicy, MeshQueryExecutor, executor::ExecuteOptions,
+};
+
+// `executor` is a `LocalMeshQueryExecutor<R>` built via
+// `with_cache(reader, cache, version_fn)`; `plan` is an
+// ExecutionPlan from the `OperatorPlan` builder above.
+let opts = ExecuteOptions {
+    bypass_cache: false,
+    cache_policy: CachePolicy::TimeBound { ttl: Duration::from_secs(5) },
+};
+let _running = executor.execute_with(plan, opts).await?;
+```
+
+`CachePolicy::Permanent` skips TTL expiry — use only for queries
+whose result is immutable under substrate semantics.
+
+### Federated executor
+
+`FederatedMeshQueryExecutor<T: MeshDbTransport>` fans atomic
+operators out to remote nodes via a pluggable transport with
+proximity-ordered failover. The in-tree `LoopbackTransport`
+drives in-process N-node integration tests without a real wire;
+the production transport rides `SUBPROTOCOL_MESHDB` on
+`MeshNode` (wire envelopes in
+`net::adapter::net::behavior::meshdb::protocol`).
+
+### Errors
+
+`MeshError` carries planner / executor / transport failures —
+`PlannerError { detail }`, `HistoricalRangeUnavailable { origin,
+requested, available }`, `BudgetExceeded { metric, limit }`,
+and transport-level variants. Every variant is `Clone +
+PartialEq + Debug` so cache keys + diagnostics work without
+clone-on-error gymnastics.
+
 ## Compute (daemons + migration)
 
 Enable the `compute` feature to run `MeshDaemon`s from your SDK
