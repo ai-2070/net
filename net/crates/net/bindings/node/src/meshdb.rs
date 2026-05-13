@@ -41,6 +41,9 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tokio::sync::Mutex as AsyncMutex;
 
+use net::adapter::net::behavior::predicate::Predicate as InnerPredicate;
+use net::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
+
 use net::adapter::net::behavior::meshdb::{
     cache::{CachePolicy as InnerCachePolicy, LruResultCache},
     executor::{
@@ -370,6 +373,24 @@ impl MeshQuery {
         })
     }
 
+    /// Filter `inner`'s rows by `predicate`. The executor builds
+    /// a synthetic per-row tag view (origin / seq / flat JSON
+    /// payload fields) and evaluates the predicate; rows whose
+    /// evaluation returns `true` pass through unchanged. Rows
+    /// whose payload isn't JSON are still filterable by their
+    /// row-intrinsic fields (`origin`, `seq`); payload field
+    /// references against a non-JSON payload simply don't match.
+    #[napi(factory)]
+    pub fn filter(inner: &MeshQuery, predicate: Predicate) -> Result<Self> {
+        let typed = predicate_to_inner(predicate)?;
+        Ok(Self {
+            plan: plan_of(OperatorPlan::Filter {
+                input: Box::new(inner.plan.root.clone()),
+                predicate: typed.to_wire(),
+            }),
+        })
+    }
+
     /// Tumbling window on `seq` with the given bucket `size`.
     /// Emits one sentinel row per non-empty bucket; decode via
     /// `ResultRow.decodeWindow()`.
@@ -608,6 +629,288 @@ fn parse_join_strategy(s: Option<&str>) -> Result<JoinStrategy> {
         Some("sort_merge") => Ok(JoinStrategy::SortMerge),
         Some(other) => Err(mesh_err(format!(
             "join strategy '{other}' not recognised; expected hash_broadcast / sort_merge"
+        ))),
+    }
+}
+
+/// Tagged predicate object. `kind` discriminates the variant;
+/// the field set is the union of all variants' inputs (each
+/// variant uses a subset). Build with the module-level
+/// `predicate*` helpers — manual object literals work too if
+/// you're sure about the field set.
+///
+/// Field paths target the synthetic `Dataforts` axis: a
+/// row-intrinsic name like `"origin"` / `"seq"` resolves to the
+/// row's intrinsic; a JSON path like `"severity"` or `"a.b.c"`
+/// resolves to the flattened JSON-object payload.
+#[napi(object)]
+pub struct Predicate {
+    /// Variant discriminator. One of: `exists` / `equals` /
+    /// `numeric_at_least` / `numeric_at_most` /
+    /// `numeric_in_range` / `string_prefix` / `string_matches`
+    /// / `semver_at_least` / `and` / `or` / `not`.
+    pub kind: String,
+    /// Field name (axis-tag predicates).
+    pub field: Option<String>,
+    /// String value (equals).
+    pub value: Option<String>,
+    /// Numeric threshold (numeric_at_least / numeric_at_most).
+    pub threshold: Option<f64>,
+    /// Range lower bound (numeric_in_range).
+    pub min: Option<f64>,
+    /// Range upper bound (numeric_in_range).
+    pub max: Option<f64>,
+    /// String prefix (string_prefix).
+    pub prefix: Option<String>,
+    /// String pattern (string_matches).
+    pub pattern: Option<String>,
+    /// Version literal (semver_at_least).
+    pub version: Option<String>,
+    /// Child predicates (and / or / not — `not` uses a 1-element
+    /// list).
+    pub children: Option<Vec<Predicate>>,
+}
+
+/// Field is present (any value).
+#[napi(js_name = "predicateExists")]
+pub fn predicate_exists(field: String) -> Predicate {
+    Predicate {
+        kind: "exists".to_string(),
+        field: Some(field),
+        ..Predicate::empty()
+    }
+}
+
+/// `field == value` (string equality).
+#[napi(js_name = "predicateEquals")]
+pub fn predicate_equals(field: String, value: String) -> Predicate {
+    Predicate {
+        kind: "equals".to_string(),
+        field: Some(field),
+        value: Some(value),
+        ..Predicate::empty()
+    }
+}
+
+/// `field >= threshold` (numeric).
+#[napi(js_name = "predicateNumericAtLeast")]
+pub fn predicate_numeric_at_least(field: String, threshold: f64) -> Predicate {
+    Predicate {
+        kind: "numeric_at_least".to_string(),
+        field: Some(field),
+        threshold: Some(threshold),
+        ..Predicate::empty()
+    }
+}
+
+/// `field <= threshold` (numeric).
+#[napi(js_name = "predicateNumericAtMost")]
+pub fn predicate_numeric_at_most(field: String, threshold: f64) -> Predicate {
+    Predicate {
+        kind: "numeric_at_most".to_string(),
+        field: Some(field),
+        threshold: Some(threshold),
+        ..Predicate::empty()
+    }
+}
+
+/// `min <= field <= max`.
+#[napi(js_name = "predicateNumericInRange")]
+pub fn predicate_numeric_in_range(field: String, min: f64, max: f64) -> Result<Predicate> {
+    if !(min.is_finite() && max.is_finite()) || min > max {
+        return Err(mesh_err(format!(
+            "predicateNumericInRange: requires finite min <= max (got min={min}, max={max})"
+        )));
+    }
+    Ok(Predicate {
+        kind: "numeric_in_range".to_string(),
+        field: Some(field),
+        min: Some(min),
+        max: Some(max),
+        ..Predicate::empty()
+    })
+}
+
+/// `field.startsWith(prefix)`.
+#[napi(js_name = "predicateStringPrefix")]
+pub fn predicate_string_prefix(field: String, prefix: String) -> Predicate {
+    Predicate {
+        kind: "string_prefix".to_string(),
+        field: Some(field),
+        prefix: Some(prefix),
+        ..Predicate::empty()
+    }
+}
+
+/// Substring `pattern` in `field`.
+#[napi(js_name = "predicateStringMatches")]
+pub fn predicate_string_matches(field: String, pattern: String) -> Predicate {
+    Predicate {
+        kind: "string_matches".to_string(),
+        field: Some(field),
+        pattern: Some(pattern),
+        ..Predicate::empty()
+    }
+}
+
+/// `field >= version` (semver).
+#[napi(js_name = "predicateSemverAtLeast")]
+pub fn predicate_semver_at_least(field: String, version: String) -> Predicate {
+    Predicate {
+        kind: "semver_at_least".to_string(),
+        field: Some(field),
+        version: Some(version),
+        ..Predicate::empty()
+    }
+}
+
+/// Conjunction. Empty list evaluates to `true` (vacuous match).
+#[napi(js_name = "predicateAnd")]
+pub fn predicate_and(children: Vec<Predicate>) -> Predicate {
+    Predicate {
+        kind: "and".to_string(),
+        children: Some(children),
+        ..Predicate::empty()
+    }
+}
+
+/// Disjunction. Empty list evaluates to `false`.
+#[napi(js_name = "predicateOr")]
+pub fn predicate_or(children: Vec<Predicate>) -> Predicate {
+    Predicate {
+        kind: "or".to_string(),
+        children: Some(children),
+        ..Predicate::empty()
+    }
+}
+
+/// Negation.
+#[napi(js_name = "predicateNot")]
+pub fn predicate_not(child: Predicate) -> Predicate {
+    Predicate {
+        kind: "not".to_string(),
+        children: Some(vec![child]),
+        ..Predicate::empty()
+    }
+}
+
+impl Predicate {
+    fn empty() -> Self {
+        Self {
+            kind: String::new(),
+            field: None,
+            value: None,
+            threshold: None,
+            min: None,
+            max: None,
+            prefix: None,
+            pattern: None,
+            version: None,
+            children: None,
+        }
+    }
+}
+
+fn tag_key(field: &str) -> TagKey {
+    TagKey {
+        axis: TaxonomyAxis::Dataforts,
+        key: field.to_string(),
+    }
+}
+
+fn predicate_to_inner(p: Predicate) -> Result<InnerPredicate> {
+    let need_field = |p: &Predicate, kind: &str| {
+        p.field.clone().ok_or_else(|| {
+            mesh_err(format!(
+                "predicate '{kind}' requires `field`",
+            ))
+        })
+    };
+    match p.kind.as_str() {
+        "exists" => Ok(InnerPredicate::Exists {
+            key: tag_key(&need_field(&p, "exists")?),
+        }),
+        "equals" => {
+            let field = need_field(&p, "equals")?;
+            let value = p
+                .value
+                .clone()
+                .ok_or_else(|| mesh_err("predicate 'equals' requires `value`".to_string()))?;
+            Ok(InnerPredicate::Equals {
+                key: tag_key(&field),
+                value,
+            })
+        }
+        "numeric_at_least" => Ok(InnerPredicate::NumericAtLeast {
+            key: tag_key(&need_field(&p, "numeric_at_least")?),
+            threshold: p.threshold.ok_or_else(|| {
+                mesh_err("predicate 'numeric_at_least' requires `threshold`".to_string())
+            })?,
+        }),
+        "numeric_at_most" => Ok(InnerPredicate::NumericAtMost {
+            key: tag_key(&need_field(&p, "numeric_at_most")?),
+            threshold: p.threshold.ok_or_else(|| {
+                mesh_err("predicate 'numeric_at_most' requires `threshold`".to_string())
+            })?,
+        }),
+        "numeric_in_range" => Ok(InnerPredicate::NumericInRange {
+            key: tag_key(&need_field(&p, "numeric_in_range")?),
+            min: p
+                .min
+                .ok_or_else(|| mesh_err("predicate 'numeric_in_range' requires `min`".to_string()))?,
+            max: p
+                .max
+                .ok_or_else(|| mesh_err("predicate 'numeric_in_range' requires `max`".to_string()))?,
+        }),
+        "string_prefix" => Ok(InnerPredicate::StringPrefix {
+            key: tag_key(&need_field(&p, "string_prefix")?),
+            prefix: p
+                .prefix
+                .clone()
+                .ok_or_else(|| mesh_err("predicate 'string_prefix' requires `prefix`".to_string()))?,
+        }),
+        "string_matches" => Ok(InnerPredicate::StringMatches {
+            key: tag_key(&need_field(&p, "string_matches")?),
+            pattern: p.pattern.clone().ok_or_else(|| {
+                mesh_err("predicate 'string_matches' requires `pattern`".to_string())
+            })?,
+        }),
+        "semver_at_least" => Ok(InnerPredicate::SemverAtLeast {
+            key: tag_key(&need_field(&p, "semver_at_least")?),
+            version: p.version.clone().ok_or_else(|| {
+                mesh_err("predicate 'semver_at_least' requires `version`".to_string())
+            })?,
+        }),
+        "and" => {
+            let children = p.children.unwrap_or_default();
+            let mut converted: Vec<InnerPredicate> = Vec::with_capacity(children.len());
+            for c in children {
+                converted.push(predicate_to_inner(c)?);
+            }
+            Ok(InnerPredicate::And(converted))
+        }
+        "or" => {
+            let children = p.children.unwrap_or_default();
+            let mut converted: Vec<InnerPredicate> = Vec::with_capacity(children.len());
+            for c in children {
+                converted.push(predicate_to_inner(c)?);
+            }
+            Ok(InnerPredicate::Or(converted))
+        }
+        "not" => {
+            let mut children = p.children.unwrap_or_default();
+            if children.len() != 1 {
+                return Err(mesh_err(format!(
+                    "predicate 'not' requires exactly one child, got {}",
+                    children.len()
+                )));
+            }
+            Ok(InnerPredicate::Not(Box::new(predicate_to_inner(
+                children.remove(0),
+            )?)))
+        }
+        other => Err(mesh_err(format!(
+            "unknown predicate kind '{other}'"
         ))),
     }
 }

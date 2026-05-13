@@ -477,3 +477,215 @@ d('MeshDB composite operators + decoders (slice 2)', () => {
     expect(decodeWindow(rows[0])).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------
+// Slice 3: Predicate + Filter factory.
+// ---------------------------------------------------------------------
+
+d('MeshDB Filter + Predicate (slice 3)', () => {
+  const {
+    MeshQuery,
+    MeshQueryRunner,
+    InMemoryChainReader,
+    predicateEquals,
+    predicateExists,
+    predicateNumericAtLeast,
+    predicateNumericInRange,
+    predicateStringPrefix,
+    predicateStringMatches,
+    predicateAnd,
+    predicateOr,
+    predicateNot,
+  } = symbols as {
+    MeshQuery: typeof import('../index').MeshQuery;
+    MeshQueryRunner: typeof import('../index').MeshQueryRunner;
+    InMemoryChainReader: typeof import('../index').InMemoryChainReader;
+    predicateEquals: (field: string, value: string) => unknown;
+    predicateExists: (field: string) => unknown;
+    predicateNumericAtLeast: (field: string, threshold: number) => unknown;
+    predicateNumericInRange: (field: string, min: number, max: number) => unknown;
+    predicateStringPrefix: (field: string, prefix: string) => unknown;
+    predicateStringMatches: (field: string, pattern: string) => unknown;
+    predicateAnd: (children: unknown[]) => unknown;
+    predicateOr: (children: unknown[]) => unknown;
+    predicateNot: (child: unknown) => unknown;
+  };
+
+  const seed = (
+    rows: ReadonlyArray<readonly [bigint, bigint, Uint8Array]>,
+  ): InstanceType<typeof InMemoryChainReader> => {
+    const r = new InMemoryChainReader();
+    for (const [origin, seq, payload] of rows) {
+      r.append(origin, seq, Buffer.from(payload));
+    }
+    return r;
+  };
+
+  it('equals on synthetic seq keeps matching rows', async () => {
+    const chain = 0xcafen;
+    const reader = seed([1, 2, 3].map((s) => [chain, BigInt(s), Buffer.from(`p-${s}`)]));
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.filter(
+      MeshQuery.between(chain, 1n, 10n),
+      predicateEquals('seq', '2') as never,
+    );
+    const rows = await (await runner.execute(q)).toArray();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].seq).toBe(2n);
+    expect(Buffer.from(rows[0].payload).toString()).toBe('p-2');
+  });
+
+  it('numeric_at_least on seq keeps upper rows', async () => {
+    const chain = 0xcafen;
+    const reader = seed([1, 2, 3, 4, 5].map((s) => [chain, BigInt(s), Buffer.from('')]));
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.filter(
+      MeshQuery.between(chain, 1n, 10n),
+      predicateNumericAtLeast('seq', 3.0) as never,
+    );
+    const seqs = (await (await runner.execute(q)).toArray()).map((r) => Number(r.seq));
+    expect(seqs).toEqual([3, 4, 5]);
+  });
+
+  it('equals on a JSON payload field', async () => {
+    const chain = 0xc0den;
+    const reader = seed([
+      [chain, 1n, Buffer.from('{"severity":"low"}')],
+      [chain, 2n, Buffer.from('{"severity":"high"}')],
+      [chain, 3n, Buffer.from('{"severity":"high"}')],
+      [chain, 4n, Buffer.from('not-json')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.filter(
+      MeshQuery.between(chain, 1n, 10n),
+      predicateEquals('severity', 'high') as never,
+    );
+    const seqs = (await (await runner.execute(q)).toArray()).map((r) => Number(r.seq));
+    expect(seqs).toEqual([2, 3]);
+  });
+
+  it('and / or / not composition', async () => {
+    const chain = 0xc0den;
+    const reader = seed([
+      [chain, 1n, Buffer.from('{"severity":"high","region":"us"}')],
+      [chain, 2n, Buffer.from('{"severity":"high","region":"eu"}')],
+      [chain, 3n, Buffer.from('{"severity":"low","region":"us"}')],
+      [chain, 4n, Buffer.from('{"severity":"high","region":"us"}')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const andQ = MeshQuery.filter(
+      MeshQuery.between(chain, 1n, 10n),
+      predicateAnd([
+        predicateEquals('severity', 'high'),
+        predicateEquals('region', 'us'),
+      ]) as never,
+    );
+    const andSeqs = (await (await runner.execute(andQ)).toArray()).map((r) =>
+      Number(r.seq),
+    );
+    expect(andSeqs).toEqual([1, 4]);
+
+    const orQ = MeshQuery.filter(
+      MeshQuery.between(chain, 1n, 10n),
+      predicateOr([
+        predicateEquals('region', 'eu'),
+        predicateEquals('severity', 'low'),
+      ]) as never,
+    );
+    const orSeqs = (await (await runner.execute(orQ)).toArray()).map((r) =>
+      Number(r.seq),
+    );
+    expect(orSeqs.sort()).toEqual([2, 3]);
+
+    const notQ = MeshQuery.filter(
+      MeshQuery.between(chain, 1n, 10n),
+      predicateNot(predicateEquals('severity', 'high')) as never,
+    );
+    const notSeqs = (await (await runner.execute(notQ)).toArray()).map((r) =>
+      Number(r.seq),
+    );
+    expect(notSeqs).toEqual([3]);
+  });
+
+  it('numeric_in_range filters by inclusive bounds', async () => {
+    const chain = 0xc0den;
+    const reader = seed(
+      [1, 2, 3, 4, 5].map((s) => [
+        chain,
+        BigInt(s),
+        Buffer.from(`{"latency_ms":${s * 10}}`),
+      ]),
+    );
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.filter(
+      MeshQuery.between(chain, 1n, 10n),
+      predicateNumericInRange('latency_ms', 20.0, 40.0) as never,
+    );
+    const seqs = (await (await runner.execute(q)).toArray()).map((r) => Number(r.seq));
+    expect(seqs).toEqual([2, 3, 4]);
+  });
+
+  it('numeric_in_range rejects inverted bounds at factory', () => {
+    expect(() => predicateNumericInRange('x', 10.0, 5.0)).toThrow();
+  });
+
+  it('string_prefix + string_matches', async () => {
+    const chain = 0xc0den;
+    const reader = seed([
+      [chain, 1n, Buffer.from('{"user":"alice","path":"/api/users"}')],
+      [chain, 2n, Buffer.from('{"user":"bob","path":"/api/jobs"}')],
+      [chain, 3n, Buffer.from('{"user":"alfred","path":"/healthz"}')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const prefixQ = MeshQuery.filter(
+      MeshQuery.between(chain, 1n, 10n),
+      predicateStringPrefix('user', 'al') as never,
+    );
+    const prefixSeqs = (await (await runner.execute(prefixQ)).toArray()).map((r) =>
+      Number(r.seq),
+    );
+    expect(prefixSeqs).toEqual([1, 3]);
+
+    const matchesQ = MeshQuery.filter(
+      MeshQuery.between(chain, 1n, 10n),
+      predicateStringMatches('path', '/api/') as never,
+    );
+    const matchesSeqs = (await (await runner.execute(matchesQ)).toArray()).map((r) =>
+      Number(r.seq),
+    );
+    expect(matchesSeqs).toEqual([1, 2]);
+  });
+
+  it('predicateExists rejects rows without the field', async () => {
+    const chain = 0xc0den;
+    const reader = seed([
+      [chain, 1n, Buffer.from('{"severity":"high"}')],
+      [chain, 2n, Buffer.from('{"other":"x"}')],
+      [chain, 3n, Buffer.from('{"severity":"low"}')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.filter(
+      MeshQuery.between(chain, 1n, 10n),
+      predicateExists('severity') as never,
+    );
+    const seqs = (await (await runner.execute(q)).toArray()).map((r) => Number(r.seq));
+    expect(seqs).toEqual([1, 3]);
+  });
+
+  it('filter pipelined with aggregate count', async () => {
+    const chain = 0xc0den;
+    const reader = seed([
+      [chain, 1n, Buffer.from('{"severity":"high"}')],
+      [chain, 2n, Buffer.from('{"severity":"high"}')],
+      [chain, 3n, Buffer.from('{"severity":"low"}')],
+      [chain, 4n, Buffer.from('{"severity":"high"}')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const highs = MeshQuery.filter(
+      MeshQuery.between(chain, 1n, 10n),
+      predicateEquals('severity', 'high') as never,
+    );
+    const rows = await (await runner.execute(MeshQuery.count(highs, null))).toArray();
+    expect(decodeAggregateFn!(rows[0])).toMatchObject({ kind: 'count', count: 3n });
+  });
+});
