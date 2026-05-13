@@ -478,6 +478,16 @@ impl MeshOsLoop {
     }
 
     async fn run_reconcile(&mut self) {
+        // Anchor every per-tick timestamp on `last_tick` (set by
+        // `apply(Tick)` immediately before this call) so two
+        // replays of the same event stream produce identical
+        // `last_rebalance`, `applied_backoffs`, and
+        // `PendingAction.emitted_at` values. Bootstrap fallback to
+        // `Instant::now()` only when no Tick has fired yet.
+        let now = self
+            .actual
+            .last_tick
+            .unwrap_or_else(std::time::Instant::now);
         let scorer = self.scheduler.current();
         let actions = reconcile(
             &self.actual,
@@ -493,7 +503,6 @@ impl MeshOsLoop {
         // `ApplyBackoff` emissions so reconcile suppresses
         // re-emit while the daemon stays in the same backoff
         // window.
-        let now = std::time::Instant::now();
         for action in &actions {
             match action {
                 super::action::MeshOsAction::RequestEviction { chain, .. } => {
@@ -506,7 +515,6 @@ impl MeshOsLoop {
             }
         }
         self.reconcile_count += 1;
-        let now = std::time::Instant::now();
         let mut dropped_this_tick: u64 = 0;
         let mut first_dropped_kind: Option<&'static str> = None;
         for action in actions {
@@ -1131,6 +1139,64 @@ mod tests {
             snap.replicas.is_empty(),
             "post-Shutdown ReplicaUpdate must not enter the fold; saw {} entries",
             snap.replicas.len(),
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_emitted_at_anchored_on_last_tick_for_replay_determinism() {
+        // Reconcile must stamp every PendingAction.emitted_at on
+        // the same Instant the Tick fold wrote into
+        // actual.last_tick — not on a fresh Instant::now(). The
+        // snapshot derives `age_ms` from
+        // `now.saturating_duration_since(emitted_at)` against the
+        // same anchor, so an action emitted in the latest tick
+        // renders with age_ms == 0.
+        //
+        // We use a long tick interval and shut down right after
+        // the first tick fires so the read sees actions whose
+        // emitted_at matches the last_tick the snapshot is built
+        // against.
+        use super::super::event::AdminEvent;
+        let cfg = MeshOsConfig {
+            tick_interval: StdDuration::from_millis(80),
+            ..fast_test_config()
+        };
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader,
+        } = MeshOsLoop::new(cfg);
+        let task = tokio::spawn(loop_.run());
+        // Drive an EnterMaintenance — reconcile emits a
+        // CommitMaintenanceTransition that lands in the
+        // snapshot's `pending` mirror.
+        handle
+            .publish(MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
+                node: 1,
+                deadline: None,
+            }))
+            .await
+            .unwrap();
+        // Wait long enough for ONE tick to fire (80 ms), then
+        // shutdown before a second tick.
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
+        let snap = reader.read();
+        assert!(
+            !snap.pending.is_empty(),
+            "expected at least one pending action; saw none",
+        );
+        // The latest tick anchors the snapshot's now. Actions
+        // emitted in that tick render with age_ms == 0 only when
+        // reconcile uses last_tick for emitted_at.
+        let zero_age_count = snap.pending.iter().filter(|p| p.age_ms == 0).count();
+        assert!(
+            zero_age_count >= 1,
+            "expected at least one action emitted in the snapshot's tick to render \
+             age_ms == 0 (anchored on last_tick); pending = {:?}",
+            snap.pending,
         );
     }
 }
