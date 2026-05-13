@@ -252,6 +252,88 @@ pub enum DaemonControl {
     BackpressureOff,
 }
 
+/// Lifecycle event a [`DaemonLifecycleObserver`] receives when
+/// a daemon's state on this node changes. Plain-data (no
+/// references) so observers can buffer / async-forward without
+/// lifetime issues.
+///
+/// The integration with MeshOS lives in `behavior::meshos::sources` —
+/// a `MeshOsDaemonLifecycleSink` impls this trait and translates
+/// each event to the matching `MeshOsEvent::DaemonLifecycle`.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum DaemonLifecycleEvent {
+    /// Daemon registered on this node.
+    Registered {
+        /// `MeshDaemon::origin_hash`.
+        id: u64,
+        /// `MeshDaemon::name`.
+        name: String,
+        /// Wall time of the registration.
+        at: std::time::Instant,
+    },
+    /// Daemon unregistered (either via cleanup or migration
+    /// source-side teardown).
+    Unregistered {
+        /// `MeshDaemon::origin_hash`.
+        id: u64,
+        /// Last known name (carried so observers don't need to
+        /// look it up post-unregister).
+        name: String,
+        /// Wall time of the unregistration.
+        at: std::time::Instant,
+    },
+    /// Daemon crashed during `process()`.
+    Crashed {
+        /// `MeshDaemon::origin_hash`.
+        id: u64,
+        /// `MeshDaemon::name`.
+        name: String,
+        /// Wall time of the crash.
+        at: std::time::Instant,
+        /// Operator-readable reason from the daemon-side error.
+        reason: String,
+    },
+    /// Daemon's self-reported health changed (poller observed a
+    /// transition from the previous sample).
+    HealthChanged {
+        /// `MeshDaemon::origin_hash`.
+        id: u64,
+        /// `MeshDaemon::name`.
+        name: String,
+        /// Wall time of the observation.
+        at: std::time::Instant,
+        /// New health value.
+        health: DaemonHealth,
+    },
+    /// Daemon's self-reported saturation changed (poller
+    /// observed a transition exceeding the configured noise
+    /// floor — see `behavior::meshos` for the threshold).
+    SaturationChanged {
+        /// `MeshDaemon::origin_hash`.
+        id: u64,
+        /// `MeshDaemon::name`.
+        name: String,
+        /// Wall time of the observation.
+        at: std::time::Instant,
+        /// New saturation value, `[0.0, 1.0]`.
+        saturation: f32,
+    },
+}
+
+/// Observer hook for daemon lifecycle events. Implementations
+/// fan the events out to whichever consumer wants them — the
+/// MeshOS event loop being the canonical near-term consumer.
+///
+/// Methods are sync + non-blocking: observers must not block in
+/// `observe`. The `DaemonRegistry` calls `observe` while
+/// holding (briefly) per-call references; a slow observer
+/// would stall every other lifecycle path.
+pub trait DaemonLifecycleObserver: Send + Sync + 'static {
+    /// Receive one lifecycle event. Must not block.
+    fn observe(&self, event: DaemonLifecycleEvent);
+}
+
 /// Errors from daemon operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonError {

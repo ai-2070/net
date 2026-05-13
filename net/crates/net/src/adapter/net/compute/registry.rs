@@ -4,11 +4,14 @@
 //! correct daemon by origin_hash, and provides snapshot/lifecycle APIs.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
-use super::daemon::{DaemonError, DaemonStats};
+use super::daemon::{
+    DaemonError, DaemonLifecycleEvent, DaemonLifecycleObserver, DaemonStats,
+};
 use super::host::DaemonHost;
 use crate::adapter::net::state::causal::CausalEvent;
 use crate::adapter::net::state::snapshot::StateSnapshot;
@@ -32,6 +35,18 @@ use crate::adapter::net::state::snapshot::StateSnapshot;
 /// same shard.
 pub struct DaemonRegistry {
     daemons: DashMap<u64, Arc<Mutex<DaemonHost>>>,
+    /// Optional observer hook. When set, every successful
+    /// register / replace / unregister fires
+    /// [`DaemonLifecycleObserver::observe`] inside the
+    /// registry call so the consumer (MeshOS, audit log,
+    /// dashboard, etc.) sees a coherent stream.
+    ///
+    /// `parking_lot::RwLock` over `Option<Arc<...>>` mirrors the
+    /// hot-path router pattern used elsewhere in the substrate
+    /// (e.g. the meshdb inbound router on `MeshNode`): read
+    /// path is uncontended, write path (install / replace
+    /// observer) is rare.
+    observer: RwLock<Option<Arc<dyn DaemonLifecycleObserver>>>,
 }
 
 impl DaemonRegistry {
@@ -39,6 +54,36 @@ impl DaemonRegistry {
     pub fn new() -> Self {
         Self {
             daemons: DashMap::new(),
+            observer: RwLock::new(None),
+        }
+    }
+
+    /// Install a lifecycle observer. Replaces any prior
+    /// observer (one observer per registry). Returns the
+    /// previously-installed observer, if any, so callers can
+    /// chain or restore.
+    ///
+    /// Setting to `None` removes the observer; future register /
+    /// replace / unregister calls fire no observer event.
+    pub fn set_lifecycle_observer(
+        &self,
+        observer: Option<Arc<dyn DaemonLifecycleObserver>>,
+    ) -> Option<Arc<dyn DaemonLifecycleObserver>> {
+        let mut guard = self.observer.write();
+        std::mem::replace(&mut *guard, observer)
+    }
+
+    /// `true` when a lifecycle observer is installed.
+    pub fn has_lifecycle_observer(&self) -> bool {
+        self.observer.read().is_some()
+    }
+
+    /// Fire a lifecycle event through the observer, if any.
+    /// Cheap when no observer is installed (one RwLock read +
+    /// `is_none` check).
+    fn fire(&self, event: DaemonLifecycleEvent) {
+        if let Some(observer) = self.observer.read().clone() {
+            observer.observe(event);
         }
     }
 
@@ -47,6 +92,7 @@ impl DaemonRegistry {
     /// Returns an error if a daemon with the same origin_hash is already registered.
     pub fn register(&self, host: DaemonHost) -> Result<(), DaemonError> {
         let origin_hash = host.origin_hash();
+        let name = host.name().to_string();
         match self.daemons.entry(origin_hash) {
             dashmap::mapref::entry::Entry::Occupied(_) => Err(DaemonError::ProcessFailed(format!(
                 "daemon {:#x} already registered",
@@ -54,6 +100,11 @@ impl DaemonRegistry {
             ))),
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 entry.insert(Arc::new(Mutex::new(host)));
+                self.fire(DaemonLifecycleEvent::Registered {
+                    id: origin_hash,
+                    name,
+                    at: Instant::now(),
+                });
                 Ok(())
             }
         }
@@ -93,7 +144,18 @@ impl DaemonRegistry {
     /// residual window is small.
     pub fn replace(&self, host: DaemonHost) {
         let origin_hash = host.origin_hash();
+        let name = host.name().to_string();
         self.daemons.insert(origin_hash, Arc::new(Mutex::new(host)));
+        // `replace` is the swap path used by group lifecycles
+        // (replica/fork/standby). Fire a `Registered` event for
+        // the new host; if there was a prior host at this slot,
+        // the caller is responsible for firing `Unregistered`
+        // first (the registry can't observe the swap mid-call).
+        self.fire(DaemonLifecycleEvent::Registered {
+            id: origin_hash,
+            name,
+            at: Instant::now(),
+        });
     }
 
     /// Unregister a daemon. Drops the registry's ownership of the
@@ -128,10 +190,30 @@ impl DaemonRegistry {
     /// final `Arc` drops) — this is the same residual hazard
     /// [`Self::replace`] documents.
     pub fn unregister(&self, origin_hash: u64) -> Result<(), DaemonError> {
+        // Clone the host Arc out of the map (releasing the
+        // shard lock), then remove the slot, then try a
+        // best-effort name read. `try_lock` (not blocking
+        // `lock`) is load-bearing: this method can be called
+        // from inside a `with_host` closure on the same id,
+        // and that closure holds the inner Mutex — a blocking
+        // `lock` here would deadlock that case. When `try_lock`
+        // fails, observers see an empty name; they correlate by
+        // id with the prior `Registered` event.
+        let arc = self.get_arc(origin_hash);
         self.daemons
             .remove(&origin_hash)
             .map(|_| ())
-            .ok_or(DaemonError::NotFound(origin_hash))
+            .ok_or(DaemonError::NotFound(origin_hash))?;
+        let name = arc
+            .as_ref()
+            .and_then(|a| a.try_lock().map(|h| h.name().to_string()))
+            .unwrap_or_default();
+        self.fire(DaemonLifecycleEvent::Unregistered {
+            id: origin_hash,
+            name,
+            at: Instant::now(),
+        });
+        Ok(())
     }
 
     /// Clone the `Arc<Mutex<DaemonHost>>` out of the map, if

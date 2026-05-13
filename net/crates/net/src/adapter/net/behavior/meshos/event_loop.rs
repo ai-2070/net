@@ -64,7 +64,7 @@ pub struct MeshOsLoop {
 /// to clone (just clones the `mpsc::Sender`). Drop the last
 /// handle to signal end-of-events; the loop will exit after
 /// draining its current backlog.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MeshOsHandle {
     events: mpsc::Sender<MeshOsEvent>,
 }

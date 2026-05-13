@@ -22,7 +22,8 @@ pub mod standby_group;
 
 pub use bindings::{DaemonBindings, SubscriptionBinding};
 pub use daemon::{
-    DaemonControl, DaemonError, DaemonHealth, DaemonHostConfig, DaemonStats, MeshDaemon,
+    DaemonControl, DaemonError, DaemonHealth, DaemonHostConfig, DaemonLifecycleEvent,
+    DaemonLifecycleObserver, DaemonStats, MeshDaemon,
 };
 pub use daemon_factory::{DaemonFactoryRegistry, FactoryEntry};
 pub use fork_group::{ForkGroup, ForkGroupConfig, ForkInfo};

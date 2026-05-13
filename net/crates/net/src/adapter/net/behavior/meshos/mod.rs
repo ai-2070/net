@@ -59,6 +59,7 @@ pub mod executor;
 pub mod maintenance;
 pub mod reconcile;
 pub mod snapshot;
+pub mod sources;
 pub mod state;
 pub mod supervision;
 
@@ -86,6 +87,7 @@ pub use executor::{
     ExecutorStatsSnapshot, LoggingDispatcher,
 };
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
+pub use sources::{attach_to_daemon_registry, MeshOsDaemonLifecycleSink};
 pub use state::{
     AvoidEntry, BlobObservation, DaemonLifecycle, DaemonStatus, DesiredState, MaintenanceMirror,
     MeshOsState,
