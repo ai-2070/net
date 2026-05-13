@@ -3,6 +3,28 @@
 Branch: `meshdb` (46 commits, +21,443 / -633 LOC vs `master`).
 Baseline: `CODE_REVIEW_2026_05_13_MESHDB.md` (pass 1, closed).
 
+## Final status
+
+**Closed.** All Blockers (NEW-B1, NEW-B2, NEW-B3) and Majors (NEW-M1 …
+NEW-M9) fixed in-tree with regression tests where the substrate or
+SDK can express them. Minors m1 / m2 / m5 / m6 shipped as real fixes;
+m3 / m4 / m7 / m8 marked out of scope (acceptable as-is per the
+review's own categorization).
+
+Tests added:
+- substrate: `cache::tests::lru_rejects_oversized_entry_instead_of_self_evicting`,
+  `executor::tests::join_key_field_origin_canonicalizes_to_intrinsic_encoding`,
+  `planner::tests::lineage_back_with_max_depth_zero_returns_only_start_no_error`,
+  `planner::tests::lineage_forward_with_max_depth_zero_returns_only_start_no_error`,
+  `planner::tests::lineage_back_across_multiple_replica_hosts_is_deterministic`,
+  `predicate::tests::to_wire_handles_deep_nesting_without_stack_overflow`,
+  `predicate::tests::to_wire_preserves_left_to_right_child_ordering`.
+- Go FFI: `tests::ffi_guard_traps_panics_and_records_last_error`,
+  `tests::ffi_factory_validation_failure_populates_last_error`,
+  `tests::ffi_filter_with_pathologically_deep_predicate_returns_null`.
+- Node tests: `break inside for-await releases the backing row buffer`,
+  `exception inside for-await releases the backing row buffer`.
+
 This pass (1) verifies pass-1's "fix shipped" claims actually landed, and
 (2) surfaces new findings pass 1 missed. Item IDs (`NEW-B1`, `NEW-M3`, …)
 live in this doc only, per the no-review-IDs-in-code feedback rule.
