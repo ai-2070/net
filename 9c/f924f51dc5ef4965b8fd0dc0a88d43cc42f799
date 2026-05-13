@@ -1,0 +1,28 @@
+net/crates/net/bindings/go/net/meshdb.go
+  s_3a0a24a47d1a36::t_5e2888364404e5 391-721,727,731-733,738-740,742-743
+  s_3a0a24a47d1a36::t_7ba980d23f69f2 98-138,143,145
+  s_3a0a24a47d1a36::t_46bb896000fa48 722-726,728-730,734-737,741
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_3a0a24a47d1a36::t_47bb42e73f73a6 294,354,360,366,372,410,442-445,450-451,455-458
+  s_3a0a24a47d1a36::t_f4c454e3d9cbab 248-249,251-252,255,264-266
+  s_3a0a24a47d1a36::t_8e23414605292e 250
+  s_3a0a24a47d1a36::t_c14cecaeb1593a 545-548,550-553
+  s_3a0a24a47d1a36::t_82cfc2006d2c9a 239-247,253-254,256-263,267-293,295-353,355-359,361-365,367-371,373-409,411-441,446-449,452-454,459-544,549,554-628
+  s_3a0a24a47d1a36::t_4920dbd863c2e9 936-1028
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "9cf924f51dc5ef4965b8fd0dc0a88d43cc42f799",
+  "prompts": {},
+  "sessions": {
+    "s_3a0a24a47d1a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26413a7a-1c64-46c9-bae8-60574ab08641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
