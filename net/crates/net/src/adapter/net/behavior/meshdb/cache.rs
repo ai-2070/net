@@ -537,10 +537,7 @@ mod tests {
         // budget. Pre-fix this evicts the prior entry AND the
         // new one. Post-fix the new one is refused; the prior
         // entry survives.
-        cache.insert(
-            key(2, 0),
-            make_result(make_rows(4), CachePolicy::Permanent),
-        );
+        cache.insert(key(2, 0), make_result(make_rows(4), CachePolicy::Permanent));
         assert!(
             cache.get(&key(2, 0)).is_none(),
             "oversized insert must not be observable via get"

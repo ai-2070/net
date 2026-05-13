@@ -382,9 +382,7 @@ pub extern "C" fn net_meshdb_query_at(origin: u64, seq: u64) -> *mut MeshDbQuery
 pub extern "C" fn net_meshdb_query_between(origin: u64, start: u64, end: u64) -> *mut MeshDbQuery {
     ffi_guard!(ptr::null_mut(), {
         if start >= end {
-            invalid_arg_null!(
-                "net_meshdb_query_between: start must be strictly less than end"
-            );
+            invalid_arg_null!("net_meshdb_query_between: start must be strictly less than end");
         }
         let plan = plan_of(OperatorPlan::BetweenRead {
             origin,
@@ -597,9 +595,7 @@ pub unsafe extern "C" fn net_meshdb_query_percentile(
             invalid_arg_null!("net_meshdb_query_percentile: null inner query");
         }
         if !p.is_finite() || !(0.0..=1.0).contains(&p) {
-            invalid_arg_null!(
-                "net_meshdb_query_percentile: p must be finite in [0.0, 1.0]"
-            );
+            invalid_arg_null!("net_meshdb_query_percentile: p must be finite in [0.0, 1.0]");
         }
         let Some(field) = cstr_to_string(field) else {
             invalid_arg_null!(
@@ -717,14 +713,10 @@ pub unsafe extern "C" fn net_meshdb_query_lineage_emit(
             );
         }
         let Ok(json) = std::ffi::CStr::from_ptr(entries_json).to_str() else {
-            invalid_arg_null!(
-                "net_meshdb_query_lineage_emit: entries_json is not valid UTF-8"
-            );
+            invalid_arg_null!("net_meshdb_query_lineage_emit: entries_json is not valid UTF-8");
         };
         let Ok(dir_str) = std::ffi::CStr::from_ptr(direction).to_str() else {
-            invalid_arg_null!(
-                "net_meshdb_query_lineage_emit: direction is not valid UTF-8"
-            );
+            invalid_arg_null!("net_meshdb_query_lineage_emit: direction is not valid UTF-8");
         };
         let direction = match dir_str {
             "back" => LineageDirection::Back,
@@ -737,9 +729,7 @@ pub unsafe extern "C" fn net_meshdb_query_lineage_emit(
             invalid_arg_null!("net_meshdb_query_lineage_emit: entries_json is not valid JSON");
         };
         let Some(arr) = value.as_array() else {
-            invalid_arg_null!(
-                "net_meshdb_query_lineage_emit: entries_json must be a JSON array"
-            );
+            invalid_arg_null!("net_meshdb_query_lineage_emit: entries_json must be a JSON array");
         };
         let mut entries = Vec::with_capacity(arr.len());
         for e in arr {
@@ -749,9 +739,7 @@ pub unsafe extern "C" fn net_meshdb_query_lineage_emit(
                 );
             };
             let Some(entry_origin) = obj.get("origin").and_then(|x| x.as_u64()) else {
-                invalid_arg_null!(
-                    "net_meshdb_query_lineage_emit: entry.origin must be a u64"
-                );
+                invalid_arg_null!("net_meshdb_query_lineage_emit: entry.origin must be a u64");
             };
             let Some(depth) = obj.get("depth").and_then(|x| x.as_u64()) else {
                 invalid_arg_null!(
@@ -759,9 +747,7 @@ pub unsafe extern "C" fn net_meshdb_query_lineage_emit(
                 );
             };
             let Ok(depth) = u32::try_from(depth) else {
-                invalid_arg_null!(
-                    "net_meshdb_query_lineage_emit: entry.depth exceeds u32 range"
-                );
+                invalid_arg_null!("net_meshdb_query_lineage_emit: entry.depth exceeds u32 range");
             };
             let tip_seq = match obj.get("tip_seq") {
                 None | Some(serde_json::Value::Null) => None,
@@ -833,9 +819,7 @@ pub unsafe extern "C" fn net_meshdb_query_filter_json(
             );
         }
         let Ok(json) = std::ffi::CStr::from_ptr(predicate_json).to_str() else {
-            invalid_arg_null!(
-                "net_meshdb_query_filter_json: predicate_json is not valid UTF-8"
-            );
+            invalid_arg_null!("net_meshdb_query_filter_json: predicate_json is not valid UTF-8");
         };
         let Ok(predicate) = parse_predicate_json(json) else {
             invalid_arg_null!(
@@ -864,10 +848,7 @@ fn parse_predicate_json(json: &str) -> std::result::Result<Predicate, ()> {
     parse_predicate_value(&value, 0)
 }
 
-fn parse_predicate_value(
-    v: &serde_json::Value,
-    depth: u32,
-) -> std::result::Result<Predicate, ()> {
+fn parse_predicate_value(v: &serde_json::Value, depth: u32) -> std::result::Result<Predicate, ()> {
     if depth >= PREDICATE_PARSE_MAX_DEPTH {
         return Err(());
     }

@@ -482,9 +482,11 @@ impl Predicate {
         while let Some(step) = work.pop() {
             match step {
                 Step::Visit(p) => match p {
-                    Self::Exists { key } => {
-                        emit(nodes, &mut child_stack, PredicateNodeWire::Exists { key: key.clone() })
-                    }
+                    Self::Exists { key } => emit(
+                        nodes,
+                        &mut child_stack,
+                        PredicateNodeWire::Exists { key: key.clone() },
+                    ),
                     Self::Equals { key, value } => emit(
                         nodes,
                         &mut child_stack,
