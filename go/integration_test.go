@@ -51,6 +51,50 @@ func generatePSK() string {
 	return fmt.Sprintf("%x", b)
 }
 
+// parallelHandshake creates a responder + initiator pair concurrently.
+// Adapter init blocks on the NKpsk0 handshake (5s × 3 retries ≈ 15s
+// total budget), so sequential New() calls deadlock: the responder
+// waits for an initiator that hasn't been created yet, exhausts its
+// retries, and returns "initialization failed". Running both peers in
+// goroutines lets each New() make progress while its peer is coming
+// up. The 50ms delay before launching the initiator gives the
+// responder time to bind its socket so the first NKpsk0 packet
+// doesn't land on a closed port.
+func parallelHandshake(t *testing.T, responderCfg, initiatorCfg *Config) (*Net, *Net) {
+	t.Helper()
+
+	type result struct {
+		peer *Net
+		err  error
+	}
+	respCh := make(chan result, 1)
+	initCh := make(chan result, 1)
+
+	go func() {
+		p, err := New(responderCfg)
+		respCh <- result{p, err}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	go func() {
+		p, err := New(initiatorCfg)
+		initCh <- result{p, err}
+	}()
+
+	respRes := <-respCh
+	if respRes.err != nil {
+		t.Fatalf("Failed to create responder: %v", respRes.err)
+	}
+	initRes := <-initCh
+	if initRes.err != nil {
+		respRes.peer.Shutdown()
+		t.Fatalf("Failed to create initiator: %v", initRes.err)
+	}
+
+	return respRes.peer, initRes.peer
+}
+
 func TestNetGenerateKeypair(t *testing.T) {
 	skipIfNetNotEnabled(t)
 
@@ -93,46 +137,32 @@ func TestNetExchangeEvents(t *testing.T) {
 	// Generate shared PSK
 	psk := generatePSK()
 
-	// Create responder (binds first, waits for initiator)
-	responder, err := New(&Config{
-		NumShards: 1,
-		Net: &NetConfig{
-			BindAddr:    "127.0.0.1:19200",
-			PeerAddr:    "127.0.0.1:19201",
-			PSK:         psk,
-			Role:        "responder",
-			SecretKey:   responderKeypair.SecretKey,
-			PublicKey:   responderKeypair.PublicKey,
-			Reliability: "light",
+	responder, initiator := parallelHandshake(t,
+		&Config{
+			NumShards: 1,
+			Net: &NetConfig{
+				BindAddr:    "127.0.0.1:19200",
+				PeerAddr:    "127.0.0.1:19201",
+				PSK:         psk,
+				Role:        "responder",
+				SecretKey:   responderKeypair.SecretKey,
+				PublicKey:   responderKeypair.PublicKey,
+				Reliability: "light",
+			},
 		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to create responder: %v", err)
-	}
+		&Config{
+			NumShards: 1,
+			Net: &NetConfig{
+				BindAddr:      "127.0.0.1:19201",
+				PeerAddr:      "127.0.0.1:19200",
+				PSK:           psk,
+				Role:          "initiator",
+				PeerPublicKey: responderKeypair.PublicKey,
+				Reliability:   "light",
+			},
+		})
 	defer responder.Shutdown()
-
-	// Small delay to ensure responder is ready
-	time.Sleep(50 * time.Millisecond)
-
-	// Create initiator
-	initiator, err := New(&Config{
-		NumShards: 1,
-		Net: &NetConfig{
-			BindAddr:      "127.0.0.1:19201",
-			PeerAddr:      "127.0.0.1:19200",
-			PSK:           psk,
-			Role:          "initiator",
-			PeerPublicKey: responderKeypair.PublicKey,
-			Reliability:   "light",
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to create initiator: %v", err)
-	}
 	defer initiator.Shutdown()
-
-	// Wait for handshake to complete
-	time.Sleep(200 * time.Millisecond)
 
 	// Initiator sends events to responder
 	for i := 0; i < 5; i++ {
@@ -183,40 +213,30 @@ func TestNetBatchIngestion(t *testing.T) {
 
 	psk := generatePSK()
 
-	responder, err := New(&Config{
-		NumShards: 1,
-		Net: &NetConfig{
-			BindAddr:  "127.0.0.1:19202",
-			PeerAddr:  "127.0.0.1:19203",
-			PSK:       psk,
-			Role:      "responder",
-			SecretKey: responderKeypair.SecretKey,
-			PublicKey: responderKeypair.PublicKey,
+	responder, initiator := parallelHandshake(t,
+		&Config{
+			NumShards: 1,
+			Net: &NetConfig{
+				BindAddr:  "127.0.0.1:19202",
+				PeerAddr:  "127.0.0.1:19203",
+				PSK:       psk,
+				Role:      "responder",
+				SecretKey: responderKeypair.SecretKey,
+				PublicKey: responderKeypair.PublicKey,
+			},
 		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to create responder: %v", err)
-	}
+		&Config{
+			NumShards: 1,
+			Net: &NetConfig{
+				BindAddr:      "127.0.0.1:19203",
+				PeerAddr:      "127.0.0.1:19202",
+				PSK:           psk,
+				Role:          "initiator",
+				PeerPublicKey: responderKeypair.PublicKey,
+			},
+		})
 	defer responder.Shutdown()
-
-	time.Sleep(50 * time.Millisecond)
-
-	initiator, err := New(&Config{
-		NumShards: 1,
-		Net: &NetConfig{
-			BindAddr:      "127.0.0.1:19203",
-			PeerAddr:      "127.0.0.1:19202",
-			PSK:           psk,
-			Role:          "initiator",
-			PeerPublicKey: responderKeypair.PublicKey,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to create initiator: %v", err)
-	}
 	defer initiator.Shutdown()
-
-	time.Sleep(200 * time.Millisecond)
 
 	// Batch ingest
 	events := make([]string, 20)
@@ -250,46 +270,36 @@ func TestNetFullReliabilityMode(t *testing.T) {
 
 	psk := generatePSK()
 
-	responder, err := New(&Config{
-		NumShards: 1,
-		Net: &NetConfig{
-			BindAddr:            "127.0.0.1:19204",
-			PeerAddr:            "127.0.0.1:19205",
-			PSK:                 psk,
-			Role:                "responder",
-			SecretKey:           responderKeypair.SecretKey,
-			PublicKey:           responderKeypair.PublicKey,
-			Reliability:         "full",
-			HeartbeatIntervalMs: 1000,
-			SessionTimeoutMs:    10000,
+	responder, initiator := parallelHandshake(t,
+		&Config{
+			NumShards: 1,
+			Net: &NetConfig{
+				BindAddr:            "127.0.0.1:19204",
+				PeerAddr:            "127.0.0.1:19205",
+				PSK:                 psk,
+				Role:                "responder",
+				SecretKey:           responderKeypair.SecretKey,
+				PublicKey:           responderKeypair.PublicKey,
+				Reliability:         "full",
+				HeartbeatIntervalMs: 1000,
+				SessionTimeoutMs:    10000,
+			},
 		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to create responder: %v", err)
-	}
+		&Config{
+			NumShards: 1,
+			Net: &NetConfig{
+				BindAddr:            "127.0.0.1:19205",
+				PeerAddr:            "127.0.0.1:19204",
+				PSK:                 psk,
+				Role:                "initiator",
+				PeerPublicKey:       responderKeypair.PublicKey,
+				Reliability:         "full",
+				HeartbeatIntervalMs: 1000,
+				SessionTimeoutMs:    10000,
+			},
+		})
 	defer responder.Shutdown()
-
-	time.Sleep(50 * time.Millisecond)
-
-	initiator, err := New(&Config{
-		NumShards: 1,
-		Net: &NetConfig{
-			BindAddr:            "127.0.0.1:19205",
-			PeerAddr:            "127.0.0.1:19204",
-			PSK:                 psk,
-			Role:                "initiator",
-			PeerPublicKey:       responderKeypair.PublicKey,
-			Reliability:         "full",
-			HeartbeatIntervalMs: 1000,
-			SessionTimeoutMs:    10000,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to create initiator: %v", err)
-	}
 	defer initiator.Shutdown()
-
-	time.Sleep(200 * time.Millisecond)
 
 	// Send events with full reliability
 	for i := 0; i < 10; i++ {
@@ -321,40 +331,30 @@ func TestNetStats(t *testing.T) {
 
 	psk := generatePSK()
 
-	responder, err := New(&Config{
-		NumShards: 1,
-		Net: &NetConfig{
-			BindAddr:  "127.0.0.1:19206",
-			PeerAddr:  "127.0.0.1:19207",
-			PSK:       psk,
-			Role:      "responder",
-			SecretKey: responderKeypair.SecretKey,
-			PublicKey: responderKeypair.PublicKey,
+	responder, initiator := parallelHandshake(t,
+		&Config{
+			NumShards: 1,
+			Net: &NetConfig{
+				BindAddr:  "127.0.0.1:19206",
+				PeerAddr:  "127.0.0.1:19207",
+				PSK:       psk,
+				Role:      "responder",
+				SecretKey: responderKeypair.SecretKey,
+				PublicKey: responderKeypair.PublicKey,
+			},
 		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to create responder: %v", err)
-	}
+		&Config{
+			NumShards: 1,
+			Net: &NetConfig{
+				BindAddr:      "127.0.0.1:19207",
+				PeerAddr:      "127.0.0.1:19206",
+				PSK:           psk,
+				Role:          "initiator",
+				PeerPublicKey: responderKeypair.PublicKey,
+			},
+		})
 	defer responder.Shutdown()
-
-	time.Sleep(50 * time.Millisecond)
-
-	initiator, err := New(&Config{
-		NumShards: 1,
-		Net: &NetConfig{
-			BindAddr:      "127.0.0.1:19207",
-			PeerAddr:      "127.0.0.1:19206",
-			PSK:           psk,
-			Role:          "initiator",
-			PeerPublicKey: responderKeypair.PublicKey,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to create initiator: %v", err)
-	}
 	defer initiator.Shutdown()
-
-	time.Sleep(200 * time.Millisecond)
 
 	// Ingest some events
 	for i := 0; i < 25; i++ {
