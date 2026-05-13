@@ -205,7 +205,7 @@ macro_rules! invalid_arg_null {
 /// reader handle first.
 pub struct MeshDbRunner {
     runtime: Arc<Runtime>,
-    executor: Arc<LocalMeshQueryExecutor<InMemoryStore>>,
+    executor: LocalMeshQueryExecutor<InMemoryStore>,
 }
 
 /// Opaque handle to a planned query.
@@ -415,7 +415,7 @@ use net::adapter::net::behavior::meshdb::planner::{
     JoinKeyMode, JoinStrategy, LineageDirection, LineageEntry,
 };
 use net::adapter::net::behavior::meshdb::query::{
-    JoinKind, NumericAggregateKind, NumericReductionKind, WindowSpec,
+    clamp_join_watermark_secs, JoinKind, NumericAggregateKind, NumericReductionKind, WindowSpec,
 };
 use net::adapter::net::behavior::predicate::Predicate;
 use net::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
@@ -674,18 +674,14 @@ pub unsafe extern "C" fn net_meshdb_query_join(
             "origin,seq" => JoinKeyMode::OriginSeq,
             other => JoinKeyMode::Field(other.to_string()),
         };
-        let watermark_secs = if watermark_secs.is_finite() && watermark_secs >= 0.0 {
-            watermark_secs
-        } else {
-            5.0
-        };
+        let watermark = clamp_join_watermark_secs(Some(watermark_secs));
         let plan = plan_of(OperatorPlan::HashJoin {
             left: Box::new((&*left).plan.root.clone()),
             right: Box::new((&*right).plan.root.clone()),
             key_mode,
             kind,
             strategy,
-            watermark: std::time::Duration::from_secs_f64(watermark_secs),
+            watermark,
         });
         Box::into_raw(Box::new(MeshDbQuery { plan }))
     })
@@ -1173,10 +1169,7 @@ pub unsafe extern "C" fn net_meshdb_runner_new(reader: *const MeshDbReader) -> *
             }
         };
         let executor: LocalMeshQueryExecutor<InMemoryStore> = LocalMeshQueryExecutor::new(store);
-        let runner = MeshDbRunner {
-            runtime,
-            executor: Arc::new(executor),
-        };
+        let runner = MeshDbRunner { runtime, executor };
         Box::into_raw(Box::new(runner))
     })
 }
@@ -1216,10 +1209,7 @@ pub unsafe extern "C" fn net_meshdb_runner_new_cached(
         let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 0);
         let executor: LocalMeshQueryExecutor<InMemoryStore> =
             LocalMeshQueryExecutor::with_cache(store, cache, version_fn);
-        Box::into_raw(Box::new(MeshDbRunner {
-            runtime,
-            executor: Arc::new(executor),
-        }))
+        Box::into_raw(Box::new(MeshDbRunner { runtime, executor }))
     })
 }
 
@@ -1259,8 +1249,8 @@ pub unsafe extern "C" fn net_meshdb_runner_execute(
     clear_last_error();
     let runner_ref = &*runner;
     let plan = (&*query).plan.clone();
-    let executor = runner_ref.executor.clone();
-    let runtime = runner_ref.runtime.clone();
+    let executor = &runner_ref.executor;
+    let runtime = &runner_ref.runtime;
     // catch_unwind: user-controlled operators (aggregate
     // div-by-zero, OOM hash-join) can panic inside the async
     // block. Unwinding across the C ABI is UB, so we trap
@@ -1326,8 +1316,8 @@ pub unsafe extern "C" fn net_meshdb_runner_execute_with(
     clear_last_error();
     let runner_ref = &*runner;
     let plan = (&*query).plan.clone();
-    let executor = runner_ref.executor.clone();
-    let runtime = runner_ref.runtime.clone();
+    let executor = &runner_ref.executor;
+    let runtime = &runner_ref.runtime;
     let cache_policy = match cache_policy_kind {
         NET_MESHDB_CACHE_PERMANENT => {
             net::adapter::net::behavior::meshdb::cache::CachePolicy::Permanent

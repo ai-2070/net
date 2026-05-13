@@ -10,7 +10,7 @@ The same primitives that let The Warriors find a chain's holders let MeshDB find
 
 Federated execution arrives in code with the substrate. The `FederatedMeshQueryExecutor` fans atomic operators out to remote `target_nodes` via a pluggable `MeshDbTransport`; the `LoopbackTransport` drives three-node integration tests in-process. The wire-side hookup that registers the new `SUBPROTOCOL_MESHDB = 0x0F00` on `MeshNode`'s subprotocol dispatcher is the one piece that stays parked for a consumer to drive — the envelope shapes, the cancellation model, and the cross-node call multiplexing all ship in v0.16. The same model lifts MeshDB out of test-only loopback the moment a real subprotocol consumer (Hermes telemetry replay; Deck cross-rack metrics; AI fine-tuning across forked experiments) wires the dispatch.
 
-The bindings ship in lockstep. Python, Node, Go, and C SDKs all expose the full operator surface — `MeshQuery.at(...)` through `MeshQuery.join(...)`, the typed `Predicate` builder for filters, the fluent `QueryBuilder` for chained pipelines, the Phase F `CachePolicy { Permanent | TimeBound { ttl } }` knobs — plus a sentinel-envelope decoder that turns aggregate / joined / window result rows into host-language objects. Errors carry a structured `kind` discriminator (`planner_error`, `executor_error`, `join_memory_exceeded`, `ambiguous_discovery`, `query_cancelled`, `runtime_panic`, …) so callers can branch without parsing message strings. The substrate's `MeshError` is the single source of truth; every binding reflects it.
+The bindings ship in lockstep. Python, Node, Go, and C SDKs all expose the full operator surface — `MeshQuery.at(...)` through `MeshQuery.join(...)`, the typed `Predicate` builder for filters, the fluent `QueryBuilder` for chained pipelines, the `CachePolicy { Permanent | TimeBound { ttl } }` knobs — plus a sentinel-envelope decoder that turns aggregate / joined / window result rows into host-language objects. Errors carry a structured `kind` discriminator (`planner_error`, `executor_error`, `join_memory_exceeded`, `ambiguous_discovery`, `query_cancelled`, `runtime_panic`, …) so callers can branch without parsing message strings. The substrate's `MeshError` is the single source of truth; every binding reflects it.
 
 There is no separate query service to provision. There is no catalog to maintain. The query plan is on the mesh because the substrate is the database.
 
@@ -18,17 +18,17 @@ There is no separate query service to provision. There is no catalog to maintain
 
 *Named after Survivor's 1982 Rocky III anthem — a release that asks the substrate to *see*, after Rebel Yell asked it to hold. v0.15 made the Dataforts data plane stand up — content-addressed blobs, heat-driven gravity, read-your-writes. v0.16 stacks the MeshDB query plane on top: a federated AST + planner + executor that composes against the existing capability index, proximity graph, and `causal:` / `fork-of:` tag layer the Warriors substrate ships. No new substrate primitive — every operator rides what was already there. The `meshdb` Cargo feature gates whether the surface compiles at all; the substrate path is unchanged on non-meshdb builds.*
 
-v0.16 lands **the full MeshDB roadmap from [`MESHDB_PLAN.md`](../plans/MESHDB_PLAN.md)** — Phases A, C, D, E, F shipped behind the `meshdb` Cargo feature; Phase B is partial (the federated executor + transport-plug live in code with a `LoopbackTransport` driving in-process integration tests, but the wire-subprotocol hookup that registers `SUBPROTOCOL_MESHDB` on `MeshNode`'s dispatcher waits for a consumer to drive). AST + planner, local + federated executors, lineage walks, hash + sort-merge joins (row-intrinsic + payload-keyed, all four `JoinKind`s), Count / Sum / Avg / Min / Max / DistinctCountExact / PercentileExact aggregates, Filter via synthetic-tag `PredicateWire` evaluation, tumbling-on-seq windowing, and the single-node LRU result cache with pull-based capability-version invalidation are all in code. The full surface ships across Rust core and Python / Node / Go / C SDKs.
+v0.16 lands **the full MeshDB substrate behind the `meshdb` Cargo feature** — AST + planner, local + federated executors, lineage walks via the `fork-of:` graph, hash + sort-merge joins (row-intrinsic + payload-keyed, all four `JoinKind`s), Count / Sum / Avg / Min / Max / DistinctCountExact / PercentileExact aggregates, Filter via synthetic-tag `PredicateWire` evaluation, tumbling-on-seq windowing, and the single-node LRU result cache with pull-based capability-version invalidation are all in code. The wire-subprotocol hookup that registers `SUBPROTOCOL_MESHDB` on `MeshNode`'s dispatcher waits for a consumer to drive — the envelope shapes ship and the `FederatedMeshQueryExecutor` already speaks the protocol against a `LoopbackTransport` in three-node in-process integration tests today. The full surface ships across Rust core and Python / Node / Go / C SDKs.
 
-The hardening posture from the Black Diamond / Rebel Yell line continues. **Two coordinated code-review passes** landed before the v0.16 branch cut: pass 1 ([`docs/misc/CODE_REVIEW_2026_05_13_MESHDB.md`](../misc/CODE_REVIEW_2026_05_13_MESHDB.md)) surfaced 32 items (6 Blockers, 10 Majors, 12 Minors, 4 Nits); pass 2 ([`docs/misc/CODE_REVIEW_2026_05_13_MESHDB_PASS_2.md`](../misc/CODE_REVIEW_2026_05_13_MESHDB_PASS_2.md)) verified pass-1 closure and surfaced 20 new items (3 Blockers, 9 Majors, 8 Minors). Every Blocker and Major closed in-tree with regression tests; two pass-1 Majors and four pass-2 Minors deferred with rationale (substrate-side coverage is solid; the deferred items need SDK surfaces — `FederatedMeshQueryExecutor`, configurable budgets, `Discovered` — that ship with their respective future slices).
+The hardening posture from the Black Diamond / Rebel Yell line continues. **Two coordinated code-review passes** landed before the v0.16 branch cut, surfacing 52 items total — 9 Blockers, 19 Majors, 20 Minors, 4 Nits. Every Blocker and Major closed in-tree with regression tests; two Majors deferred with rationale (the deferred items need SDK surfaces — `FederatedMeshQueryExecutor` exposure, configurable budgets, `Discovered` resolution — that ship with their respective future slices). The four Minor deferrals all closed post-pass: substrate-side join-watermark clamp helper with `f64`-input tests pins the contract the Python `test_join_accepts_watermark_secs_kwarg` couldn't observe; substrate Unicode / singleton-aggregate / long-lineage test-gap fillers land; the `Arc<LocalMeshQueryExecutor>` indirection is dropped from all three runners; `LineageEntry.depth` is `BigInt` in the Node SDK for shape parity.
 
-Alongside MeshDB, v0.16 carries a substrate-level **routed-handshake replay-guard fix** that was masking as a flaky NAT-traversal test. The guard previously refused any legitimate re-handshake from a peer with the same Noise static, indistinguishable from a passive attacker replaying captured msg1 bytes. The fix tracks the initiator's Noise ephemeral (in the clear at the front of NKpsk0 msg1) and only refuses replays that match BOTH static and ephemeral — a fresh ephemeral can only be produced by the static + PSK holder, per the Noise threat model. Plus a Duration::MAX-sentinel handling fix in the periodic sweep loops (`spawn_token_sweep_loop`, `spawn_capability_gc_loop`) that previously panicked on Instant-overflow when the documented "disable the sweep" sentinel was used.
+Alongside MeshDB, v0.16 carries a substrate-level **routed-handshake replay-guard fix** that was masking as a flaky NAT-traversal test. The guard previously refused any legitimate re-handshake from a peer with the same Noise static, indistinguishable from a passive attacker replaying captured msg1 bytes. The fix tracks the initiator's Noise ephemeral (in the clear at the front of NKpsk0 msg1) and only refuses replays that match BOTH static and ephemeral — a fresh ephemeral can only be produced by the static + PSK holder, per the Noise threat model. Plus a `Duration::MAX`-sentinel handling fix in the periodic sweep loops (`spawn_token_sweep_loop`, `spawn_capability_gc_loop`) that previously panicked on Instant-overflow when the documented "disable the sweep" sentinel was used.
 
 The toolchain moves forward: Go 1.26, CI reads the Go version from `go/go.mod` (no more divergence between the local toolchain and the CI matrix), and the cross-binding cgo integration test creates responder / initiator nodes in parallel — eliminating the pre-fix handshake deadlock that randomly flaked the suite. Dependency bumps land cleanly: `ctor` 0.11.1 → 1.0.5, `napi` 3.8.6 → 3.9.0, `napi-build` 2.3.1 → 2.3.2, `napi-derive` 3.5.5 → 3.5.6.
 
 ---
 
-## Phase A — `MeshQuery` AST + planner skeleton
+## `MeshQuery` AST + planner
 
 The composable query language and the planner that translates queries into typed `ExecutionPlan`s. Lives in `src/adapter/net/behavior/meshdb/{query,planner,error}.rs`.
 
@@ -57,7 +57,7 @@ pub enum QueryV1 {
 }
 ```
 
-The `MeshQuery::V1(...)` wrapper is the locked-decision-#1 stability hatch — postcard + JSON round-trip carries the version tag at the front of every wire encoding. `ChainRef` separates direct origin-hash references (`OriginHash(u64)`) from capability-predicate references (`Discovered(PredicateWire)`); the planner resolves `Discovered` against the capability index at plan time and surfaces a typed `MeshError::AmbiguousDiscovery { matches }` when multiple origins match (deferring multi-origin fan-out until Phase B+ ships it explicitly, rather than silently truncating to the first match).
+The `MeshQuery::V1(...)` wrapper is the stability hatch — postcard + JSON round-trip carries the version tag at the front of every wire encoding, so a v2 AST can land alongside without breaking on-disk plans. `ChainRef` separates direct origin-hash references (`OriginHash(u64)`) from capability-predicate references (`Discovered(PredicateWire)`); the planner resolves `Discovered` against the capability index at plan time and surfaces a typed `MeshError::AmbiguousDiscovery { matches }` when multiple origins match (deferring multi-origin fan-out until a future slice ships it explicitly, rather than silently truncating to the first match).
 
 ### `MeshQueryPlanner`
 
@@ -70,13 +70,13 @@ impl<'a, F: Fn(NodeId) -> Option<Duration>> MeshQueryPlanner<'a, F> {
 
 Translates atomic operators to typed `ExecutionPlan`s with proximity-ordered `target_nodes` (RTT-asc, lex-NodeId tiebreak). Composite operators wrap their planned children in `NotYetImplemented` placeholders so the tree still type-checks for variants outside this release's executor coverage (`Project`, `OrderBy`).
 
-Plans are **byte-deterministic** — pass-2 review surfaced two non-determinism leaks that the planner closed in this release: (1) `caps.tags` is a `HashSet` whose iteration order is RNG-stable across a single process but not across runs, so `parent_of` / `children_of` / `collect_coverage` collect every candidate, sort numerically, and pick the smallest; (2) `CapabilityIndex::all_nodes` iterates a `DashMap` whose order is unstable, so cross-replica fork-of selection now collects across all hosting nodes before picking. The cache key is content-addressed off the plan, so byte determinism is load-bearing for cache hit rate.
+Plans are **byte-deterministic**. Two non-determinism leaks the review closed in this release: (1) `caps.tags` is a `HashSet` whose iteration order is RNG-stable across a single process but not across runs, so `parent_of` / `children_of` / `collect_coverage` collect every candidate, sort numerically, and pick the smallest; (2) `CapabilityIndex::all_nodes` iterates a `DashMap` whose order is unstable, so cross-replica fork-of selection now collects across all hosting nodes before picking. The cache key is content-addressed off the plan, so byte determinism is load-bearing for cache hit rate.
 
 ---
 
-## Phase B — Time-travel end-to-end 🚧
+## Time-travel + federated execution
 
-🚧 **Partial.** Substrate complete; wire-side subprotocol dispatch hookup outstanding.
+🚧 **Wire-side subprotocol dispatch hookup outstanding.** Substrate complete; the envelope shapes, the cancellation model, and a `LoopbackTransport`-driven three-node integration test all ship — the one piece that waits for a consumer is `MeshNode::register_subprotocol_handler(SUBPROTOCOL_MESHDB, ...)`.
 
 ### `MeshQueryExecutor` async trait + `LocalMeshQueryExecutor`
 
@@ -125,13 +125,13 @@ Envelopes are defined and round-trip cleanly; `MeshNode::register_subprotocol_ha
 
 Fans atomic operators out to their proximity-ordered `target_nodes` over `MeshDbTransport`. On `TransportError::NoRoute(target)` the executor falls through to the next target; any other transport error bubbles up inside `MeshError::ExecutorError`. Composite operators (`HashJoin` / `Aggregate*` / `Window` / `Filter`) recurse on the federated executor so atomic leaves still dispatch via the transport.
 
-**Cancellation correctness landed in pass 1.** Pre-fix, each recursive `execute_uncached` allocated a fresh `QueryHandle`; the outer `running.handle.cancel()` was a no-op against the materialized `futures::stream::iter(out)` output of composite operators. Post-fix, one outer handle is allocated in `execute_with` and threaded through `execute_uncached_with_handle` into every recursive sub-fetch, and a `stream_results_cancellable` adapter re-checks the cancel flag per emitted row.
+**Cancellation correctness.** Pre-fix, each recursive `execute_uncached` allocated a fresh `QueryHandle`; the outer `running.handle.cancel()` was a no-op against the materialized `futures::stream::iter(out)` output of composite operators. Post-fix, one outer handle is allocated in `execute_with` and threaded through `execute_uncached_with_handle` into every recursive sub-fetch, and a `stream_results_cancellable` adapter re-checks the cancel flag per emitted row.
 
-**Call-ID uniqueness landed in pass 1.** The wire contract says `call_id` is "unique per (caller, executor) pair while in-flight". Pre-fix, each `FederatedMeshQueryExecutor` drew IDs from its own `AtomicU64`, so two federated executors on the same caller could collide at a shared remote demultiplexer. Post-fix, a process-global `FEDERATED_CALL_ID_COUNTER` trivially satisfies the contract.
+**Call-ID uniqueness.** The wire contract says `call_id` is "unique per (caller, executor) pair while in-flight". Pre-fix, each `FederatedMeshQueryExecutor` drew IDs from its own `AtomicU64`, so two federated executors on the same caller could collide at a shared remote demultiplexer. Post-fix, a process-global `FEDERATED_CALL_ID_COUNTER` trivially satisfies the contract.
 
 ### Replay-guard fix in the mesh's routed-handshake path
 
-Pass-1 work surfaced a routed-handshake replay guard that flagged any legitimate re-handshake from a peer with the same Noise static as a passive replay attack — `connect_direct(peer, via = X)` against an existing session via R would time out at B's side because B refused the new handshake. The fix tracks the initiator's Noise ephemeral (in the clear at the front of NKpsk0 msg1 by Noise pattern) and only `DropReplay`s when BOTH the static AND the ephemeral match. A fresh ephemeral can only be produced by the static + PSK holder (the legitimate peer); a captured-and-replayed msg1 has the original ephemeral verbatim.
+Hardening surfaced a routed-handshake replay guard that flagged any legitimate re-handshake from a peer with the same Noise static as a passive replay attack — `connect_direct(peer, via = X)` against an existing session via R would time out at B's side because B refused the new handshake. The fix tracks the initiator's Noise ephemeral (in the clear at the front of NKpsk0 msg1 by Noise pattern) and only `DropReplay`s when BOTH the static AND the ephemeral match. A fresh ephemeral can only be produced by the static + PSK holder (the legitimate peer); a captured-and-replayed msg1 has the original ephemeral verbatim.
 
 ```rust
 struct PeerInfo {
@@ -164,59 +164,59 @@ fn routed_rotation_outcome(
 
 ---
 
-## Phase C — Lineage walks via `fork-of:` graph
+## Lineage walks via `fork-of:` graph
 
-`OperatorPlan::LineageEmit { origin, direction, entries }` carries a materialized walk result. The planner walks the local capability-index snapshot at plan time — `parent_of` for back, BFS `children_of` lex-sorted for forward, both deterministic across runs after pass-1 M1 and pass-2 M3. Cycle detection ships as explicit visited-set guards (`MeshError::LineageCycleDetected { origin, cycle }` with the path through the cycle for debugging). Depth bounds surface as `MeshError::LineageMaxDepthExceeded { origin, depth }`.
+`OperatorPlan::LineageEmit { origin, direction, entries }` carries a materialized walk result. The planner walks the local capability-index snapshot at plan time — `parent_of` for back, BFS `children_of` lex-sorted for forward, both deterministic across runs. Cycle detection ships as explicit visited-set guards (`MeshError::LineageCycleDetected { origin, cycle }` with the path through the cycle for debugging). Depth bounds surface as `MeshError::LineageMaxDepthExceeded { origin, depth }`.
 
 The executor emits one `ResultRow` per entry — payload empty, `origin = entry.origin`, `seq = entry.tip_seq.unwrap_or(SeqNum(0))`. Callers compose with `At` / `Between` to fetch event content for each ancestor / descendant. The federated executor handles `LineageEmit` locally (no remote dispatch needed; the walk already happened at plan time).
 
-**Pass 2 fix:** `max_depth = 0` is now correctly handled as "just-the-origin", not as a bound violation. Both walks previously surfaced `LineageMaxDepthExceeded` whenever the start origin had any unvisited neighbour, even when the caller explicitly asked for zero steps.
+`max_depth = 0` is correctly handled as "just-the-origin", not as a bound violation. Both walks previously surfaced `LineageMaxDepthExceeded` whenever the start origin had any unvisited neighbour, even when the caller explicitly asked for zero steps.
 
 ---
 
-## Phase D — Cross-chain joins
+## Cross-chain joins
 
-### D-1 — Inner hash-join on row-intrinsic keys
+### Inner hash-join on row-intrinsic keys
 
-`OperatorPlan::HashJoin { left, right, key_mode, kind, strategy, watermark }` with `JoinKeyMode::{Origin, Seq, OriginSeq}` for the join-key extraction modes Phase D-1 covers. Both local and federated executors implement build-on-left / probe-on-right; the federated path recurses through itself so atomic leaves still dispatch via the transport. Joined rows are sentinel `ResultRow`s (`origin = 0`, `seq = 0`) whose payload is a postcard-encoded `JoinedRowPayload { left, right }`. `MeshError::JoinMemoryExceeded` surfaces at the 256-MiB build-side bound.
+`OperatorPlan::HashJoin { left, right, key_mode, kind, strategy, watermark }` with `JoinKeyMode::{Origin, Seq, OriginSeq}` for the row-intrinsic join-key extraction modes. Both local and federated executors implement build-on-left / probe-on-right; the federated path recurses through itself so atomic leaves still dispatch via the transport. Joined rows are sentinel `ResultRow`s (`origin = 0`, `seq = 0`) whose payload is a postcard-encoded `JoinedRowPayload { left, right }`. `MeshError::JoinMemoryExceeded` surfaces at the 256-MiB build-side bound.
 
-### D-2 — Outer joins + sort-merge + payload-keyed
+### Outer joins + sort-merge + payload-keyed
 
 All four `JoinKind`s ship: `Inner` / `LeftOuter` / `RightOuter` / `FullOuter`. `JoinKeyMode::Field(String)` extends the join-key surface to JSON payload paths via `row::extract_string_projection`; `try_encode_join_key` returns `Option<Vec<u8>>` so rows whose key field can't be resolved are silently dropped from both sides. `JoinStrategy::{HashBroadcast, SortMerge}` lets the planner pick between in-memory hashing (default; trips `JoinMemoryExceeded` past the bound) and sort-merge (sort both sides + two-pointer walk; memory-bounded by the inputs).
 
-**Pass 1 m5:** the three-way duplicated hash-join body (local one-sided + local full-outer + federated mirror) factored into a shared `build_hash_join_table(rows, key_mode, strategy_label) -> Result<HashJoinTable, MeshError>` helper. **Pass 2 m1:** `try_encode_join_key` canonicalizes `JoinKeyMode::Field("origin"|"seq"|"origin,seq")` to the matching row-intrinsic encoding so probe tables built under `Origin` and `Field("origin")` cross-correlate.
+The three-way duplicated hash-join body (local one-sided + local full-outer + federated mirror) factored into a shared `build_hash_join_table(rows, key_mode, strategy_label) -> Result<HashJoinTable, MeshError>` helper. `try_encode_join_key` canonicalizes `JoinKeyMode::Field("origin"|"seq"|"origin,seq")` to the matching row-intrinsic encoding so probe tables built under `Origin` and `Field("origin")` cross-correlate.
 
-Watermark is informational under snapshot semantics; streaming activation needs a future windowed-join slice. The locked-decision-#2 default is 5 s.
+Watermark is informational under snapshot semantics; streaming activation needs a future windowed-join slice. The default is 5 s.
 
 ---
 
-## Phase E — Filter + aggregates + tumbling windows
+## Filter, aggregates, and tumbling windows
 
-### E-1 Count
+### Count
 
 `OperatorPlan::AggregateCount { input, group_by }` over row-intrinsic group keys (`Origin`, `Seq`, `OriginSeq`). Sentinel `ResultRow` per group with a postcard-encoded `AggregateRowPayload { group, value: Count(u64) }`.
 
-### E-2 Filter
+### Filter
 
 Reuses the Capability System's `PredicateWire`. Every `ResultRow` projects to a synthetic `(Vec<Tag>, BTreeMap)` view via `row::synthetic_row_view` — `dataforts.origin`, `dataforts.seq`, plus flat JSON-object payload fields. Non-JSON payloads are opaque; predicates against missing fields simply don't match.
 
-**Pass 2 NEW-M5:** the FFI's JSON predicate parser bounds caller-supplied recursion at 64 deep (`PREDICATE_PARSE_MAX_DEPTH`); the substrate's `Predicate::to_wire` converts from recursion to a heap-allocated work stack so 10k+-deep typed predicates from Python / Node factories don't overflow the Rust thread stack on every execute.
+The FFI's JSON predicate parser bounds caller-supplied recursion at 64 deep (`PREDICATE_PARSE_MAX_DEPTH`); the substrate's `Predicate::to_wire` converts from recursion to a heap-allocated work stack so 10k+-deep typed predicates from Python / Node factories don't overflow the Rust thread stack on every execute.
 
-### E-3 Sum / Avg
+### Sum / Avg
 
 `OperatorPlan::AggregateNumeric { input, group_by, field_path, kind: Sum | Avg }` over `row::extract_numeric` (JSON path → `f64`). Rows whose field fails to resolve are skipped; `Avg(None)` covers the empty-group case.
 
-### E-4 Min / Max / DistinctCountExact / PercentileExact
+### Min / Max / DistinctCountExact / PercentileExact
 
-`OperatorPlan::AggregateReduction { kind: Min | Max | Percentile { p } }` over `f64::total_cmp` (so `NaN` ordering is well-defined) + `OperatorPlan::AggregateDistinct { field_path }` (canonical-string projection into a per-group `BTreeSet`). Nearest-rank percentile per locked-decision-#3. The HLL p=14 / T-Digest c=100 sketch variants (`DistinctCountHll`, `PercentileTDigest`) remain `PlannerError` until a consumer drives the algorithmic complexity; the exact variants are the recommended path today.
+`OperatorPlan::AggregateReduction { kind: Min | Max | Percentile { p } }` over `f64::total_cmp` (so `NaN` ordering is well-defined) + `OperatorPlan::AggregateDistinct { field_path }` (canonical-string projection into a per-group `BTreeSet`). Nearest-rank percentile. The HLL p=14 / T-Digest c=100 sketch variants (`DistinctCountHll`, `PercentileTDigest`) remain `PlannerError` until a consumer drives the algorithmic complexity; the exact variants are the recommended path today.
 
-### E-5 Window
+### Tumbling-on-seq windows
 
-`QueryV1::Window { inner, spec: WindowSpec::TumblingSeq { size } }` buckets rows into fixed-size half-open intervals on `seq`; the executor emits one sentinel `ResultRow` per non-empty bucket with a postcard-encoded `WindowBoundary { start, end, rows }`. Sliding + session windows extend cleanly via additional `WindowSpec` variants when a consumer drives the shape (locked-decision-#7).
+`QueryV1::Window { inner, spec: WindowSpec::TumblingSeq { size } }` buckets rows into fixed-size half-open intervals on `seq`; the executor emits one sentinel `ResultRow` per non-empty bucket with a postcard-encoded `WindowBoundary { start, end, rows }`. Sliding + session windows extend cleanly via additional `WindowSpec` variants when a consumer drives the shape.
 
 ---
 
-## Phase F — Single-node LRU result cache
+## Result cache
 
 ### `CachePolicy` + `ExecuteOptions`
 
@@ -232,7 +232,7 @@ pub struct ExecuteOptions {
 }
 ```
 
-`TimeBound { ttl: 5s }` is the default policy (mirroring the locked-decision-#2 join watermark). `Permanent` is the explicit-opt-in for queries over closed substrate ranges (`At`, bounded `Between` with `end ≤ current_tip`). `bypass_cache` skips both lookup and writeback (Deck operator-view authoritative reads; Hermes skill-routing under churn; diagnostics).
+`TimeBound { ttl: 5s }` is the default policy (mirroring the join watermark). `Permanent` is the explicit-opt-in for queries over closed substrate ranges (`At`, bounded `Between` with `end ≤ current_tip`). `bypass_cache` skips both lookup and writeback (Deck operator-view authoritative reads; Hermes skill-routing under churn; diagnostics).
 
 ### Global cache version, pull-based invalidation
 
@@ -252,7 +252,7 @@ Returns `None` when the plan can't be postcard-encoded (currently: any plan vari
 
 `HashMap<CacheKey, Node>` + intrusive doubly-linked list over a `Vec<Node>`. Defaults: `LRU_MAX_ENTRIES = 1024`, `LRU_MAX_BYTES = 256 MiB`; either bound trips eviction of the LRU end. `DefaultHasher` over postcard-encoded plan bytes; no new external dependency.
 
-**Pass 2 NEW-M4:** `insert` of an oversized result (`approx_bytes() > max_bytes`) now refuses up-front instead of inserting at head and immediately evicting itself from the tail. Pre-fix, a `Permanent`-policy cache call for an oversized result silently re-ran the plan on every subsequent execute; post-fix the no-op insert leaves the cache entry-count + byte-count untouched and the prior entry at the same key (if any) survives.
+`insert` of an oversized result (`approx_bytes() > max_bytes`) refuses up-front instead of inserting at head and immediately evicting itself from the tail. Pre-fix, a `Permanent`-policy cache call for an oversized result silently re-ran the plan on every subsequent execute; post-fix the no-op insert leaves the cache entry-count + byte-count untouched and the prior entry at the same key (if any) survives.
 
 Top-level only — sub-plan executes inside the federated path bypass the cache. Recursive caching at HashJoin sides / Aggregate inner is a follow-up if profiling justifies the bookkeeping.
 
@@ -260,7 +260,7 @@ Top-level only — sub-plan executes inside the federated path bypass the cache.
 
 ## SDK shims — Python / Node / Go / C
 
-Every binding ships the full operator surface in lockstep: atomic factories (`at` / `between` / `latest`), composite factories (`window` / `count` / `numeric_agg` / `percentile` / `join` / `filter` / `lineage_emit`), the typed `Predicate` builder, the fluent `QueryBuilder`, the Phase F cache options, and a sentinel-envelope decoder that turns aggregate / joined / window result rows into host-language objects. The substrate's `MeshError` reflects through every shim with a structured `kind` discriminator.
+Every binding ships the full operator surface in lockstep: atomic factories (`at` / `between` / `latest`), composite factories (`window` / `count` / `numeric_agg` / `percentile` / `join` / `filter` / `lineage_emit`), the typed `Predicate` builder, the fluent `QueryBuilder`, the cache options, and a sentinel-envelope decoder that turns aggregate / joined / window result rows into host-language objects. The substrate's `MeshError` reflects through every shim with a structured `kind` discriminator.
 
 ### Python — pyo3 + maturin
 
@@ -272,7 +272,7 @@ Every binding ships the full operator surface in lockstep: atomic factories (`at
 
 `MeshQuery` / `MeshQueryRunner` / `MeshQueryStream` / `ResultRow` / `Predicate` ship through napi-rs 3.9. `runner.execute(query, options)` returns a `Promise<MeshQueryStream>`; the TS shim at `bindings/node/meshdb.ts` attaches `Symbol.asyncIterator` so `for await (const row of stream)` works.
 
-**Pass 2 NEW-M7:** the AsyncIterable shim now defines `return()` and `throw()` hooks that call `MeshQueryStream::release()` on a `break` / exception unwind, freeing the backing `Vec<ResultRow>` immediately rather than pinning it on the AsyncMutex until JS GC fires.
+The AsyncIterable shim defines `return()` and `throw()` hooks that call `MeshQueryStream::release()` on a `break` / exception unwind, freeing the backing `Vec<ResultRow>` immediately rather than pinning it on the AsyncMutex until JS GC fires.
 
 Node errors embed the kind discriminator in the reason string via a `<<meshdb-kind:KIND>>MSG` prefix; the SDK ships `parseMeshDbErrorKind(err) -> { kind, message } | null` to decode it.
 
@@ -280,7 +280,7 @@ Node errors embed the kind discriminator in the reason string via a `<<meshdb-ki
 
 `net-meshdb-ffi` is a cdylib exporting the C ABI (`net_meshdb_*` symbols); the Go-side reference contract at `bindings/go/net/meshdb.go` wraps it in a cgo-importing package with `MeshDBReader` / `MeshDBQuery` / `MeshDBRunner` / `MeshDBQueryStream` / `MeshDBPredicate` types. `Execute` returns a `<-chan MeshDBResult`; the fluent `MeshDBQueryBuilder` chains source / filter / aggregate / window / join steps.
 
-**Pass 2 NEW-B1 / NEW-B2 / NEW-B3 / NEW-M1 / NEW-M6 / NEW-M9** all closed for the Go SDK and the underlying FFI cdylib:
+Hardening closed for the Go SDK and the underlying FFI cdylib:
 
 - Safe `size_t → int` payload conversion via `unsafe.Slice` + `bytes.Clone` — refuses payloads above `math.MaxInt` with `ErrMeshDBRuntime` rather than letting `C.GoBytes`'s `C.int` cast silently truncate.
 - `ExecuteContext` / `ExecuteWithContext` run the FFI execute call inside the spawned goroutine; the caller is never blocked on cgo, and `ctx.Done()` races the executor concurrently with row pumping.
@@ -292,47 +292,80 @@ Node errors embed the kind discriminator in the reason string via a `<<meshdb-ki
 
 The C header at `include/net_meshdb.h` documents every entry point: opaque handles (`MeshDbReader` / `MeshDbQuery` / `MeshDbRunner` / `MeshDbIter`), atomic + composite factories, runner + execute, the sentinel-envelope decoder, and the per-thread last-error trio (`net_meshdb_last_error_message` / `_kind` / `_clear_last_error`). A runnable example at `examples/meshdb.c` walks the canonical lifecycle — reader populate → atomic / composite / lineage query → execute → drain — plus a fourth section exercising the cached runner under `NET_MESHDB_CACHE_PERMANENT`.
 
-**Pass 2 NEW-M5 + NEW-m5:** `runner_new` / `runner_new_cached` / `runner_execute` / `runner_execute_with` take their borrowed handles by `const T*` for C++ const-correctness; Rust FFI signatures match (`*const T`).
+`runner_new` / `runner_new_cached` / `runner_execute` / `runner_execute_with` take their borrowed handles by `const T*` for C++ const-correctness; Rust FFI signatures match (`*const T`).
 
 ---
 
-## Hardening — MeshDB two-pass code review
+## Hardening — MeshDB code review
 
-Two coordinated code-review passes landed before the v0.16 branch cut.
+Two coordinated review passes landed before the v0.16 branch cut. The first pass surfaced 32 items (6 Blockers, 10 Majors, 12 Minors, 4 Nits); the second pass verified those closures and surfaced 20 new items (3 Blockers, 9 Majors, 8 Minors). Every Blocker and Major closed in-tree with regression tests; two Majors and four Minors deferred with rationale (the deferred items need SDK surfaces — `FederatedMeshQueryExecutor` exposure, configurable budgets, `Discovered` resolution — that ship with future slices).
 
-### Pass 1
+### Blockers (9, all closed)
 
-[`docs/misc/CODE_REVIEW_2026_05_13_MESHDB.md`](../misc/CODE_REVIEW_2026_05_13_MESHDB.md). 32 items: 6 Blockers, 10 Majors, 12 Minors, 4 Nits. Every Blocker and Major closed in-tree with regression tests; two Majors (M9 federated SDK tests, M10 runner-side error-path coverage) deferred with rationale (the SDK surfaces needed to express the tests — federated executor exposure, configurable budgets, `Discovered` resolution — ship with future slices).
+- **`CacheKey::for_plan` now returns `Option<CacheKey>`.** Defence-in-depth against future un-encodable plans; pinned with a regression test verifying current Filter plans still encode.
+- **Federated `handle.cancel()` no longer no-ops on composite-operator output streams.** The outer handle is threaded through every recursive sub-fetch and the materialized output wraps in a cancel-aware adapter.
+- **Go FFI reader / runner lifetime contract documented.** Snapshot-then-free vs keep-alive, never free-then-append.
+- **Every Go FFI execute path traps panics via `catch_unwind`.** The structured `MeshError` (display + kind) flows through a thread-local `LAST_ERROR_*` and three getters.
+- **Go SDK `ExecuteContext` / `ExecuteWithContext` take `context.Context`.** Pumping goroutine `select`s on `ctx.Done()` per send. Drop-the-channel-to-cancel was a documented lie.
+- **`MeshDBQueryBuilder` source-resets free the prior `*MeshDBQuery` handle deterministically.**
+- **Go SDK `pumpIterRowsContext` no longer truncates `size_t` payloads to `C.int`.** `unsafe.Slice` + `bytes.Clone` + a `math.MaxInt` guard surfaces `ErrMeshDBRuntime` on oversized payloads rather than letting `C.GoBytes` silently sign-flip.
+- **`ExecuteContext` runs the FFI execute inside the spawned goroutine.** Pre-fix it ran on the caller's stack before the pump goroutine spawned, so `ctx.Done()` was ignored until the executor returned.
+- **Every FFI entry point (not just the two `runner_execute*` paths) wraps in `catch_unwind`** via a new `ffi_guard!($default, { ... })` macro. Panics become `null_mut()` / `NET_MESHDB_RUNTIME_ERR` with kind `runtime_panic` populated.
 
-**Blockers** (all closed):
-- **B1** — `CacheKey::for_plan` now returns `Option<CacheKey>` (defence-in-depth against future un-encodable plans); pinned with a regression test verifying current Filter plans still encode.
-- **B2** — Federated `handle.cancel()` no longer no-ops on composite-operator output streams; the outer handle is threaded through every recursive sub-fetch and the materialized output wraps in a cancel-aware adapter.
-- **B3** — Go FFI reader / runner lifetime contract documented: snapshot-then-free vs keep-alive, never free-then-append.
-- **B4** — Every Go FFI execute path traps panics via `catch_unwind`; the structured `MeshError` (display + kind) flows through a thread-local `LAST_ERROR_*` and three getters.
-- **B5** — Go SDK `ExecuteContext` / `ExecuteWithContext` take `context.Context`; pumping goroutine `select`s on `ctx.Done()` per send. Drop-the-channel-to-cancel was a documented lie.
-- **B6** — `MeshDBQueryBuilder` source-resets free the prior `*MeshDBQuery` handle deterministically.
+### Majors (19 — 13 closed in code, 6 deferred with rationale)
 
-**Majors** (all but M9 / M10 closed; M9 / M10 deferred with rationale).
+Closed:
 
-### Pass 2
+- **Planner non-determinism via `HashSet<Tag>` iteration.** `parent_of` / `children_of` / `collect_coverage` collect every candidate, sort, and pick the smallest with a deterministic tie-break key.
+- **`Discovered` resolution surfaces `MeshError::AmbiguousDiscovery { matches }`** when multiple origins match, rather than silently truncating to the first.
+- **`call_id` uniqueness** — process-global `FEDERATED_CALL_ID_COUNTER` replaces the per-executor counter.
+- **AST drift across FFI shims** — `"origin,seq"` canonicalized as the single accepted join-key separator across Python / Node / Go.
+- **Structured error `kind` discriminator** on `MeshError`; surfaced through every binding.
+- **Node cache-policy factory validation** brought to parity with Python / Go (reject non-finite / negative `ttlSeconds` at construction).
+- **Watermark API parity** on Python's `MeshQuery.join(...)` (already shipped; pinned with a regression test).
+- **BFS in lineage walks** uses `VecDeque::pop_front` and caches `children_of`.
+- **Go SDK wraps every non-OK FFI return** with `MeshDBError { Sentinel, Kind, Message }` that reads the thread-local last-error pair.
+- **Lineage walks accept `max_depth = 0`** as "just-the-origin"; previously a present parent / child tripped `LineageMaxDepthExceeded`.
+- **`parent_of` collects across all replica hosts** before picking the lex-smallest parent. Pre-fix the outer DashMap iteration short-circuited on the first hosting node, drifting the plan + cache key across runs.
+- **`LruResultCache::insert` of an oversized result refuses up-front** instead of silently evicting itself.
+- **JSON predicate parsing bounds depth at 64**; `Predicate::to_wire` converts to an iterative heap-allocated work stack.
+- **Every Go FFI factory's validation null-return populates `last_error_*`** with a descriptive `invalid_arg` message.
+- **Node AsyncIterable shim defines `return()` / `throw()`** that release the backing `Vec<ResultRow>` via a new `MeshQueryStream::release()` napi method.
+- **`include/README.md` error-reporting paragraph rewritten** to match the actual `net_meshdb_last_error_*` contract; operator-families table gains the last-error row; quickstart migrated to `<inttypes.h>` `PRIx64` / `PRIu64`.
+- **`MeshDBQueryBuilder` source-resets preserve `b.err`**; aliasing across source-resets documented explicitly.
 
-[`docs/misc/CODE_REVIEW_2026_05_13_MESHDB_PASS_2.md`](../misc/CODE_REVIEW_2026_05_13_MESHDB_PASS_2.md). 20 new items: 3 Blockers, 9 Majors, 8 Minors. Every Blocker and Major closed; four Minors (NEW-m3, NEW-m4, NEW-m7, NEW-m8) deferred as acceptable.
+Deferred with rationale:
 
-**Pass-2 Blockers** (all closed):
-- **NEW-B1** — Go SDK `pumpIterRowsContext` was truncating `size_t` payloads to `C.int`. `C.size_t` is 64-bit, `C.int` is 32-bit signed; `C.GoBytes` would silently sign-flip or truncate. Replaced with `unsafe.Slice` + `bytes.Clone` + a `math.MaxInt` guard that surfaces `ErrMeshDBRuntime` on oversized payloads.
-- **NEW-B2** — `ExecuteContext` was calling the FFI execute synchronously on the caller's goroutine before spawning the pump; long-running joins under `ctx.Done()` ignored the deadline until execute returned. Restructured: the FFI execute call now runs inside the pumping goroutine; the caller selects on `ctx.Done()` against the channel concurrently.
-- **NEW-B3** — Every FFI entry point (not just the two `runner_execute*` paths from pass-1 B4) wraps its body in `catch_unwind` via a new `ffi_guard!($default, { ... })` macro. Panics become `null_mut()` / `NET_MESHDB_RUNTIME_ERR` with kind `runtime_panic` populated.
+- **Federated SDK tests.** Need `FederatedMeshQueryExecutor` + `LoopbackTransport` exposed through the SDK shims; ships with a future federated-surface slice. Substrate-side coverage is solid in the meantime.
+- **Runner-side error-path coverage in SDKs.** The runtime `MeshError` variants the review listed (`JoinMemoryExceeded`, `QueryBudgetExceeded`, `AmbiguousDiscovery`, `HistoricalRangeUnavailable`) aren't currently triggerable from the SDK surfaces — they need configurable per-query budgets, `ChainRef::Discovered` exposure, and capability-index gating, none of which ship in v0.16. The `kind` discriminator plumbing is pinned with a Node-side `parseMeshDbErrorKind` test against synthetic errors.
 
-**Pass-2 Majors** (all closed):
-- **NEW-M1** — Go SDK wraps every non-OK FFI return with `MeshDBError { Sentinel, Kind, Message }` that reads the thread-local last-error pair. Brings Go to parity with Python's `MeshDbError.kind` and Node's `parseMeshDbErrorKind`.
-- **NEW-M2** — Lineage walks accept `max_depth = 0` as "just-the-origin"; previously a present parent / child tripped `LineageMaxDepthExceeded`.
-- **NEW-M3** — `parent_of` collects across all replica hosts before picking the lex-smallest parent. Pre-fix the outer DashMap iteration short-circuited on the first hosting node, drifting the plan + cache key across runs.
-- **NEW-M4** — `LruResultCache::insert` of an oversized result refuses up-front instead of silently evicting itself.
-- **NEW-M5** — JSON predicate parsing bounds depth at 64; `Predicate::to_wire` converts to an iterative heap-allocated work stack.
-- **NEW-M6** — Every Go FFI factory's validation null-return populates `last_error_*` with a descriptive `invalid_arg` message.
-- **NEW-M7** — Node AsyncIterable shim defines `return()` / `throw()` that release the backing `Vec<ResultRow>` via a new `MeshQueryStream::release()` napi method.
-- **NEW-M8** — `include/README.md` error-reporting paragraph rewritten to match the actual `net_meshdb_last_error_*` contract; operator-families table gains the last-error row; quickstart migrated to `<inttypes.h>` `PRIx64` / `PRIu64`.
-- **NEW-M9** — `MeshDBQueryBuilder` source-resets preserve `b.err`; aliasing across source-resets documented explicitly (reviewer's option b).
+### Minors (20) and Nits (4)
+
+Closed:
+
+- `group_key_for` defensive fallback for `JoinKeyMode::Field` replaced with `unreachable!()` and a descriptive message.
+- `row_overhead: u64 = 64` magic constant replaced with `std::mem::size_of::<ResultRow>() as u64`.
+- `translate_responses` emits `MeshError::ExecutorError` on premature transport stream termination instead of treating it as clean EOS.
+- The three-way duplicated hash-join body factored into the shared `build_hash_join_table` helper.
+- C header threading section documents move-safe / not-Sync semantics for `MeshDbRunner` and `MeshDbIter`.
+- `meshdb.ts` drops the typed-class re-export (the shim's job is just the AsyncIterable side-effect).
+- Shared `OnceLock<Runtime>` per FFI shim instead of `Runtime::new()` per runner.
+- `MESHDB_PLAN.md` and `CORTEX_ADAPTER_PLAN.md` reconciled with shipped reality.
+- `JoinKeyMode::Field("origin"|"seq"|"origin,seq")` canonicalizes to the matching row-intrinsic encoding.
+- `parseMeshDbErrorKind` regex accepts `[a-z0-9_]+` for future numeric-suffixed kinds.
+- C header const-correctness on `runner_new` / `runner_execute` / `runner_execute_with`.
+- C example exercises the cached runner.
+- `examples/meshdb.c` uses `<inttypes.h>` `PRIx64` / `PRIu64`.
+- Python `lineage_emit` doc-comment attached to the correct factory.
+- Go FFI `ffi_cached_runner_round_trips` actually asserts a cache hit (mutates the underlying store between calls and verifies the `Permanent`-policy fetch returns pre-mutation bytes).
+- `translate_responses` last-err rebuild uses the original error rather than re-constructing.
+- **Node `LineageEntry.depth` is `bigint`** (shape parity with `originHash` / `tipSeq`). The factory rejects values exceeding `u32::MAX` with a typed error. *Breaking* for any Node SDK caller that previously constructed entries with plain `number` literals: pass `0n`, `1n`, … instead of `0`, `1`, ….
+
+Closed (post-pass):
+
+- **`MeshDbRunner.executor: Arc<LocalMeshQueryExecutor>` indirection dropped** across all three shims — the runner owns the executor directly, the FFI / NAPI / pyo3 entry points borrow it for the lifetime of the call.
+- **Substrate-side join-watermark clamp helper** lands as `clamp_join_watermark_secs(secs: Option<f64>) -> Duration` in `behavior::meshdb::query`, alongside `DEFAULT_JOIN_WATERMARK_SECS = 5`. All three SDK shims now route their `f64` watermark input through the helper, and four substrate-level unit tests pin the contract (`None` / NaN / +/-inf / negative → 5 s; finite non-negative → passes through). Closes the deferred concern that the Python `test_join_accepts_watermark_secs_kwarg` could only assert row count, not the clamp choice.
+- **Substrate test-gap fillers** for the items the SDK suites couldn't reach cleanly: Unicode payload values (CJK / combining marks / emoji-ZWJ) under `Filter`; singleton-input percentile + avg aggregates across the full `p ∈ [0, 1]` range; empty-input `group_by = origin` aggregates that must not fabricate buckets; long-linear lineage walks (N = 500) backward and wide-fanout lineage walks (N = 1000) forward without stack overflow.
 
 ### Substrate-side hardening (alongside the MeshDB passes)
 
@@ -345,7 +378,7 @@ Two coordinated code-review passes landed before the v0.16 branch cut.
 
 ### Go 1.26
 
-The Go toolchain bumps from 1.21 to 1.26. CI now reads the Go version directly from `go/go.mod` (`go-version-file:` in `actions/setup-go@v5`) so the local toolchain and the CI matrix can't drift. The bump unlocks Go's improved `unsafe.Slice` ergonomics that the pass-2 NEW-B1 fix uses for safe `size_t → int` payload conversion.
+The Go toolchain bumps from 1.21 to 1.26. CI now reads the Go version directly from `go/go.mod` (`go-version-file:` in `actions/setup-go@v5`) so the local toolchain and the CI matrix can't drift. The bump unlocks Go's improved `unsafe.Slice` ergonomics that the safe `size_t → int` payload conversion uses.
 
 ### Integration-test parallel handshake setup
 
@@ -364,13 +397,13 @@ No source-level changes in the bindings — straight `Cargo.lock` refresh.
 
 ## Test hygiene
 
-- **Lib suite at 2705+ tests** (was 2645+ at v0.15 release). 60+ net new tests across the MeshDB phases + cross-cutting fixes; every numbered review item from both passes ships with at least one regression where the shape made one possible. Notable additions:
-  - **Substrate:** `error::tests::kind_discriminator_is_stable_across_variants`, `cache::tests::lru_rejects_oversized_entry_instead_of_self_evicting`, `cache::tests::key_for_plan_handles_filter_plans_without_panicking`, `federated::tests::cancel_after_composite_aggregate_short_circuits_materialized_stream`, `federated::tests::call_id_is_unique_across_federated_executors_on_same_host`, `planner::tests::plan_chainref_discovered_multiple_origins_surfaces_ambiguous_error`, `planner::tests::lineage_back_with_multiple_fork_of_tags_is_deterministic`, `planner::tests::lineage_back_across_multiple_replica_hosts_is_deterministic`, `planner::tests::lineage_{back,forward}_with_max_depth_zero_returns_only_start_no_error`, `predicate::tests::to_wire_handles_deep_nesting_without_stack_overflow`, `executor::tests::join_key_field_origin_canonicalizes_to_intrinsic_encoding`, `mesh::*::routed_rotation_outcome_accepts_reinit_with_fresh_ephemeral`.
+- **Lib suite at 2715+ tests** (was 2645+ at v0.15 release). 70+ net new tests across the MeshDB surfaces + cross-cutting fixes; every numbered review item from both hardening passes ships with at least one regression where the shape made one possible. Notable additions:
+  - **Substrate:** `error::tests::kind_discriminator_is_stable_across_variants`, `cache::tests::lru_rejects_oversized_entry_instead_of_self_evicting`, `cache::tests::key_for_plan_handles_filter_plans_without_panicking`, `federated::tests::cancel_after_composite_aggregate_short_circuits_materialized_stream`, `federated::tests::call_id_is_unique_across_federated_executors_on_same_host`, `planner::tests::plan_chainref_discovered_multiple_origins_surfaces_ambiguous_error`, `planner::tests::lineage_back_with_multiple_fork_of_tags_is_deterministic`, `planner::tests::lineage_back_across_multiple_replica_hosts_is_deterministic`, `planner::tests::lineage_{back,forward}_with_max_depth_zero_returns_only_start_no_error`, `planner::tests::lineage_back_walks_a_long_linear_chain_without_stack_overflow`, `planner::tests::lineage_forward_walks_a_wide_fanout_without_stack_overflow`, `predicate::tests::to_wire_handles_deep_nesting_without_stack_overflow`, `executor::tests::join_key_field_origin_canonicalizes_to_intrinsic_encoding`, `executor::tests::filter_matches_unicode_payload_value`, `executor::tests::aggregate_percentile_singleton_returns_the_only_value`, `executor::tests::aggregate_avg_singleton_returns_the_only_value`, `executor::tests::aggregate_count_with_empty_input_group_by_origin_returns_zero_rows`, `query::tests::clamp_join_watermark_{passes_through_finite_non_negative_seconds, falls_back_to_default_on_{none, non_finite, negative}}`, `mesh::*::routed_rotation_outcome_accepts_reinit_with_fresh_ephemeral`.
   - **Go FFI:** `ffi_guard_traps_panics_and_records_last_error`, `ffi_factory_validation_failure_populates_last_error`, `ffi_filter_with_pathologically_deep_predicate_returns_null`, `ffi_null_handle_populates_last_error`, `ffi_mesh_error_kind_round_trip_covers_known_variants`, instrumented `ffi_cached_runner_round_trips`.
   - **Python:** `test_join_accepts_watermark_secs_kwarg`.
-  - **Node:** `parseMeshDbErrorKind decodes the <<meshdb-kind:...>> prefix`, `cachePolicyTimeBound rejects non-finite / negative ttlSeconds at the factory`, `execute rejects a hand-rolled cachePolicy with a negative ttlSeconds`, `execute rejects a hand-rolled cachePolicy with an unknown kind`, `break inside for-await releases the backing row buffer`, `exception inside for-await releases the backing row buffer`.
+  - **Node:** `parseMeshDbErrorKind decodes the <<meshdb-kind:...>> prefix`, `cachePolicyTimeBound rejects non-finite / negative ttlSeconds at the factory`, `execute rejects a hand-rolled cachePolicy with a negative ttlSeconds`, `execute rejects a hand-rolled cachePolicy with an unknown kind`, `break inside for-await releases the backing row buffer`, `exception inside for-await releases the backing row buffer`, `lineageEmit rejects a depth that exceeds u32::MAX`.
 - **`cargo clippy --all-features --all-targets -D warnings` clean** across substrate + every binding crate. The MeshDB executor's hash-join probe-table type alias (`HashJoinTable`) lands to silence `clippy::type_complexity` on the shared helper.
-- **`cargo doc --features meshdb --no-deps` clean under `RUSTDOCFLAGS="-D warnings"`** — pass-1 fixes the broken intra-doc links in `cache.rs` (`DefaultHasher` / `PredicateWire`) and in `redex/config.rs` (the dataforts-gated `BlobAdapter` / `RedexFile::resolve_one` references that don't resolve under meshdb-only builds).
+- **`cargo doc --features meshdb --no-deps` clean under `RUSTDOCFLAGS="-D warnings"`** — broken intra-doc links in `cache.rs` (`DefaultHasher` / `PredicateWire`) and `redex/config.rs` (the dataforts-gated `BlobAdapter` / `RedexFile::resolve_one` references that don't resolve under meshdb-only builds) all closed.
 - **CI nextest groups + non-cascading test failures** so a flake in one integration test doesn't take down unrelated suites. The connect_direct retarget test that was masking the routed-handshake replay-guard bug now passes reliably.
 
 ---

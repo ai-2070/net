@@ -29,14 +29,21 @@
 //!   in Phase B-4.
 //! - [`protocol`] — `MeshDbRequest` / `MeshDbResponse` wire
 //!   envelopes + `SUBPROTOCOL_MESHDB` slot + the streaming
-//!   `ResultBatch` + opaque `ContinuationToken`. Phase B-3
-//!   pins the wire format; Phase B-4 plugs it into the mesh's
-//!   subprotocol dispatch + a `FederatedMeshQueryExecutor`.
+//!   `ResultBatch` + opaque `ContinuationToken` + the unified
+//!   [`protocol::MeshDbFrame`] tag the wire dispatcher demuxes
+//!   on.
 //! - [`federated`] — `FederatedMeshQueryExecutor<T:
 //!   MeshDbTransport>` fans atomic operators out to remote
 //!   `target_nodes` via a pluggable transport, with
 //!   proximity-ordered failover. `LoopbackTransport` drives
 //!   in-process 3-node integration tests without a real wire.
+//! - [`transport`] — real-wire hookup. `MeshDbWireDispatcher`
+//!   implements [`transport::MeshDbInboundRouter`]
+//!   for the mesh's `SUBPROTOCOL_MESHDB` dispatch arm;
+//!   [`transport::MeshDbServer`] drives the
+//!   server-side executor + streams responses back via the
+//!   sender. [`transport::enable_meshdb_on_mesh`]
+//!   plumbs everything onto a live `MeshNode`.
 //!
 //! # AST versioning (locked decision #1)
 //!
@@ -77,6 +84,7 @@ pub mod planner;
 pub mod protocol;
 pub mod query;
 pub mod row;
+pub mod transport;
 
 pub use cache::{
     CacheKey, CachePolicy, CachedResult, LruResultCache, ResultCache, LRU_MAX_BYTES,
@@ -95,10 +103,17 @@ pub use planner::{
     OperatorNode, OperatorPlan,
 };
 pub use protocol::{
-    ContinuationToken, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,
+    ContinuationToken, MeshDbFrame, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,
 };
 pub use query::{
-    AggregateFn, AggregateRowPayload, AggregateValue, ChainRef, Expr, GroupKey, JoinKey, JoinKind,
-    JoinedRowPayload, MeshQuery, NumericAggregateKind, NumericReductionKind, OrderDir, OrderKey,
-    QueryV1, ResultRow, SeqNum, WindowBoundary, WindowSpec,
+    clamp_join_watermark_secs, AggregateFn, AggregateRowPayload, AggregateValue, ChainRef, Expr,
+    GroupKey, JoinKey, JoinKind, JoinedRowPayload, MeshQuery, NumericAggregateKind,
+    NumericReductionKind, OrderDir, OrderKey, QueryV1, ResultRow, SeqNum, WindowBoundary,
+    WindowSpec, DEFAULT_JOIN_WATERMARK_SECS,
+};
+pub use transport::{
+    enable_meshdb_on_mesh, MeshDbInboundRouter, MeshDbRouteError, MeshDbServer,
+    MeshDbWireDispatcher, MeshDbWireSender, MeshDbWireTransport, MeshNodeMeshDbSender,
+    MESHDB_MAX_INBOUND_FRAME_BYTES, MESHDB_RESPONSE_INBOX_CAPACITY, MESHDB_SERVER_BATCH_ROWS,
+    MESHDB_SERVER_OUTBOX_CAPACITY, MESHDB_SERVER_PENDING_CANCELS_CAP,
 };

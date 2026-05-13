@@ -2597,6 +2597,82 @@ mod tests {
     }
 
     #[test]
+    fn lineage_back_walks_a_long_linear_chain_without_stack_overflow() {
+        // Pin: pass-2 NEW-m4 flagged "very-large lineage chains:
+        // largest test is 3 entries." Build a 500-deep linear
+        // fork-of chain and walk back from the tail. The
+        // planner's BFS uses `VecDeque::pop_front` and
+        // `parent_of` is sort-based (not recursive), so this is
+        // a depth-doesn't-overflow / time-bounded assertion.
+        //
+        // `parent_of` is O(nodes-in-index); BFS does O(depth)
+        // steps; total is O(depth²). 500 is bounded enough to
+        // run in single-digit seconds in dev profile while still
+        // exercising depths well past anything a recursive
+        // implementation would survive.
+        const N: u64 = 500;
+        let mut holders = Vec::with_capacity(N as usize);
+        holders.push((1, caps_chain_only(1)));
+        for i in 1..N {
+            holders.push((i + 1, caps_chain_forked_from(i + 1, i)));
+        }
+        let index = index_with(holders);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageBack {
+                origin: ChainRef::OriginHash(N),
+                max_depth: (N + 10) as u32,
+            }))
+            .expect("10k-deep walk plans cleanly");
+        match plan.root.operator {
+            OperatorPlan::LineageEmit { entries, .. } => {
+                assert_eq!(entries.len(), N as usize);
+                // First entry is the tail; last is the root.
+                assert_eq!(entries[0].origin, N);
+                assert_eq!(entries[0].depth, 0);
+                assert_eq!(entries[(N - 1) as usize].origin, 1);
+                assert_eq!(entries[(N - 1) as usize].depth, (N - 1) as u32);
+            }
+            other => panic!("expected LineageEmit; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lineage_forward_walks_a_wide_fanout_without_stack_overflow() {
+        // Symmetric stress: a single root with 1k direct
+        // children (no grandchildren). BFS over `children_of` +
+        // lex sort. Pins the wide-fanout shape; the linear chain
+        // pin above covers the deep shape.
+        const N: u64 = 1_000;
+        let root = 1;
+        let mut holders = Vec::with_capacity((N + 1) as usize);
+        holders.push((1, caps_chain_only(root)));
+        for i in 0..N {
+            let child = 2 + i;
+            holders.push((100 + i, caps_chain_forked_from(child, root)));
+        }
+        let index = index_with(holders);
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let plan = planner
+            .plan(&MeshQuery::V1(QueryV1::LineageForward {
+                origin: ChainRef::OriginHash(root),
+                max_depth: 5,
+            }))
+            .expect("1k-wide fan-out plans cleanly");
+        match plan.root.operator {
+            OperatorPlan::LineageEmit { entries, .. } => {
+                // Root + N children.
+                assert_eq!(entries.len(), (N + 1) as usize);
+                assert_eq!(entries[0].origin, root);
+                assert_eq!(entries[0].depth, 0);
+                // Children all at depth 1.
+                assert!(entries[1..].iter().all(|e| e.depth == 1));
+            }
+            other => panic!("expected LineageEmit; got {other:?}"),
+        }
+    }
+
+    #[test]
     fn lineage_back_walks_through_three_generations() {
         // Grandparent (g) <- parent (p) <- child (c).
         let g = 0x0000_0000_0000_00AA_u64;

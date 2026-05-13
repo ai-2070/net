@@ -46,6 +46,7 @@ use net::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
 
 use net::adapter::net::behavior::meshdb::{
     cache::{CachePolicy as InnerCachePolicy, LruResultCache},
+    error::MeshError,
     executor::{
         ChainReader as InnerChainReader, ExecuteOptions as InnerExecuteOptions,
         LocalMeshQueryExecutor, MeshQueryExecutor,
@@ -55,10 +56,11 @@ use net::adapter::net::behavior::meshdb::{
         LineageEntry as InnerLineageEntry, OperatorNode, OperatorPlan,
     },
     query::{
-        AggregateRowPayload as InnerAggregateRowPayload, AggregateValue as InnerAggregateValue,
-        GroupKey as InnerGroupKey, JoinKind as InnerJoinKind,
-        JoinedRowPayload as InnerJoinedRowPayload, NumericAggregateKind, NumericReductionKind,
-        ResultRow as InnerResultRow, WindowBoundary as InnerWindowBoundary, WindowSpec,
+        clamp_join_watermark_secs, AggregateRowPayload as InnerAggregateRowPayload,
+        AggregateValue as InnerAggregateValue, GroupKey as InnerGroupKey,
+        JoinKind as InnerJoinKind, JoinedRowPayload as InnerJoinedRowPayload, NumericAggregateKind,
+        NumericReductionKind, ResultRow as InnerResultRow, WindowBoundary as InnerWindowBoundary,
+        WindowSpec,
     },
     ExecutionPlan, SeqNum,
 };
@@ -165,14 +167,18 @@ pub struct WindowBoundary {
 /// `CapabilityIndex`, which isn't plumbed through the Node
 /// runner yet. Callers maintain their own graph view and emit
 /// entries in walk order: index 0 is the start origin with
-/// `depth = 0`; ancestors / descendants follow.
+/// `depth = 0n`; ancestors / descendants follow.
 #[napi(object)]
 pub struct LineageEntry {
     /// Chain origin hash (substrate `u64`).
     #[napi(js_name = "originHash")]
     pub origin_hash: BigInt,
-    /// Hops from the walk's start. `0` for the start origin.
-    pub depth: u32,
+    /// Hops from the walk's start. `0n` for the start origin.
+    /// Substrate-side this is a `u32`; values outside that range
+    /// are rejected at the `lineageEmit` factory. BigInt for
+    /// shape parity with the other id-like fields on this
+    /// struct.
+    pub depth: BigInt,
     /// Best-known tip seq for this chain, if any. Surfaces in
     /// the emitted row's `seq` field (defaults to `0` when
     /// absent).
@@ -557,14 +563,7 @@ impl MeshQuery {
             "origin,seq" => JoinKeyMode::OriginSeq,
             other => JoinKeyMode::Field(other.to_string()),
         };
-        let watermark = {
-            let secs = watermark_secs.unwrap_or(5.0);
-            if secs.is_finite() && secs >= 0.0 {
-                std::time::Duration::from_secs_f64(secs)
-            } else {
-                std::time::Duration::from_secs(5)
-            }
-        };
+        let watermark = clamp_join_watermark_secs(watermark_secs);
         Ok(Self {
             plan: plan_of(OperatorPlan::HashJoin {
                 left: Box::new(left.plan.root.clone()),
@@ -595,10 +594,17 @@ impl MeshQuery {
             .into_iter()
             .map(|e| -> Result<InnerLineageEntry> {
                 let entry_origin = bigint_u64(e.origin_hash)?;
+                let depth_u64 = bigint_u64(e.depth)?;
+                let depth = u32::try_from(depth_u64).map_err(|_| {
+                    mesh_err(format!(
+                        "lineageEmit: depth {depth_u64} exceeds u32::MAX ({})",
+                        u32::MAX
+                    ))
+                })?;
                 let tip_seq = e.tip_seq.map(bigint_u64).transpose()?.map(SeqNum);
                 Ok(InnerLineageEntry {
                     origin: entry_origin,
-                    depth: e.depth,
+                    depth,
                     tip_seq,
                 })
             })
@@ -1250,7 +1256,7 @@ impl InMemoryChainReader {
 /// so callers can `for await (const row of stream)`.
 #[napi]
 pub struct MeshQueryRunner {
-    executor: Arc<LocalMeshQueryExecutor<InMemoryStore>>,
+    executor: LocalMeshQueryExecutor<InMemoryStore>,
 }
 
 #[napi]
@@ -1270,9 +1276,7 @@ impl MeshQueryRunner {
         } else {
             LocalMeshQueryExecutor::new(store)
         };
-        Self {
-            executor: Arc::new(executor),
-        }
+        Self { executor }
     }
 
     /// Execute `query`. Returns a stream whose `next()` yields

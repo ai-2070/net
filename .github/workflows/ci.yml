@@ -172,6 +172,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo nextest run --no-fail-fast --features netdb --test integration_netdb
 
+      # === MeshDB =========================================================
+      # `meshdb` chains to cortex → redex → net, so a single
+      # --features meshdb covers the test's `feature = "net" + "meshdb"`
+      # gate.
+      - name: MeshDB
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --no-fail-fast --features meshdb --test meshdb_subprotocol_wire
+
       # === Dataforts (greedy + gravity) ===================================
       - name: Dataforts greedy + gravity
         if: ${{ !cancelled() }}

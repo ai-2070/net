@@ -311,6 +311,13 @@ struct DispatchCtx {
     #[cfg(feature = "redex")]
     replication_inbound_router:
         Arc<parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>>,
+    /// Optional MeshDB inbound router. See the matching field doc
+    /// on `MeshNode`. Same `parking_lot::RwLock<Option<Arc<dyn ...>>>`
+    /// shape as the replication router; the hot path takes a
+    /// single read lock per `SUBPROTOCOL_MESHDB` packet.
+    #[cfg(feature = "meshdb")]
+    meshdb_inbound_router:
+        Arc<parking_lot::RwLock<Option<Arc<dyn super::behavior::meshdb::MeshDbInboundRouter>>>>,
     /// Optional greedy-LRU observer. See the matching field doc on
     /// `MeshNode`. The hot path takes a single read lock on every
     /// standard-event packet; uncontended reads under
@@ -1388,6 +1395,21 @@ pub struct MeshNode {
     #[cfg(feature = "redex")]
     replication_inbound_router:
         Arc<parking_lot::RwLock<Option<Arc<dyn super::redex::ReplicationInboundRouter>>>>,
+    /// Optional MeshDB inbound router. The MeshDB transport
+    /// installs one of these via [`Self::set_meshdb_inbound_router`]
+    /// to receive `SUBPROTOCOL_MESHDB` frames (both inbound
+    /// requests for a server-side query handler and inbound
+    /// responses for in-flight federated calls). `None` when
+    /// MeshDB is not enabled; in that case the dispatch loop
+    /// takes a single `parking_lot::RwLock` read and drops the
+    /// frame.
+    ///
+    /// Same `parking_lot::RwLock<Option<Arc<dyn ...>>>` shape as
+    /// the replication router for the same reason — `dyn Trait`
+    /// is `!Sized` and `ArcSwapOption` doesn't accept it.
+    #[cfg(feature = "meshdb")]
+    meshdb_inbound_router:
+        Arc<parking_lot::RwLock<Option<Arc<dyn super::behavior::meshdb::MeshDbInboundRouter>>>>,
     /// Optional greedy-LRU observer. `Redex` installs one of these
     /// via [`Self::set_greedy_observer`] when the operator calls
     /// `Redex::enable_greedy_dataforts(mesh, cfg)`; subsequent
@@ -1727,6 +1749,8 @@ impl MeshNode {
             user_caps: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "redex")]
             replication_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(feature = "meshdb")]
+            meshdb_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "dataforts")]
             greedy_observer: Arc::new(parking_lot::RwLock::new(None)),
             capability_version: Arc::new(AtomicU64::new(0)),
@@ -2540,6 +2564,8 @@ impl MeshNode {
             migration_handler: self.migration_handler.clone(),
             #[cfg(feature = "redex")]
             replication_inbound_router: self.replication_inbound_router.clone(),
+            #[cfg(feature = "meshdb")]
+            meshdb_inbound_router: self.meshdb_inbound_router.clone(),
             #[cfg(feature = "dataforts")]
             greedy_observer: self.greedy_observer.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
@@ -3575,6 +3601,43 @@ impl MeshNode {
             }
             for payload in events {
                 Self::dispatch_replication_payload(&payload, from_node, router.as_ref());
+            }
+            return;
+        }
+
+        // MeshDB: federated query traffic on `SUBPROTOCOL_MESHDB`.
+        // Both directions (requests caller → server, responses
+        // server → caller) ride the same subprotocol slot; the
+        // `MeshDbInboundRouter::try_route` decodes the tagged
+        // frame and demuxes. `None` router = no MeshDB transport
+        // installed = drop the frame silently (matches the
+        // replication path's behaviour for unrouted channels).
+        #[cfg(feature = "meshdb")]
+        if parsed.header.subprotocol_id == super::behavior::meshdb::SUBPROTOCOL_MESHDB {
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            if events.is_empty() {
+                return;
+            }
+            let router_guard = ctx.meshdb_inbound_router.read();
+            let Some(router) = router_guard.as_ref() else {
+                // No router → drop silently.
+                return;
+            };
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+            // Mirror the REDEX guard: NodeId == 0 from an
+            // unknown sender is rejected.
+            if from_node == 0 {
+                return;
+            }
+            for payload in events {
+                if let Err(e) = router.try_route(from_node, &payload) {
+                    tracing::debug!(error = %e, from_node, "meshdb: drop frame");
+                }
             }
             return;
         }
@@ -7120,6 +7183,35 @@ impl MeshNode {
         router: Option<Arc<dyn super::redex::ReplicationInboundRouter>>,
     ) {
         *self.replication_inbound_router.write() = router;
+    }
+
+    /// Install (or replace) the `SUBPROTOCOL_MESHDB` inbound
+    /// router. The MeshDB transport installs one of these to
+    /// receive federated-query traffic — both inbound requests
+    /// (routed to the server-side query handler) and inbound
+    /// responses (routed to the matching in-flight caller).
+    ///
+    /// Passing `None` un-installs the router — subsequent
+    /// inbound MeshDB frames are dropped silently until a new
+    /// router is installed.
+    ///
+    /// Idempotent — re-installing replaces the previous handle.
+    /// Hot-path cost is one `parking_lot::RwLock` read per
+    /// inbound `SUBPROTOCOL_MESHDB` frame.
+    #[cfg(feature = "meshdb")]
+    pub fn set_meshdb_inbound_router(
+        &self,
+        router: Option<Arc<dyn super::behavior::meshdb::MeshDbInboundRouter>>,
+    ) {
+        *self.meshdb_inbound_router.write() = router;
+    }
+
+    /// True iff a MeshDB inbound router is currently installed.
+    /// Useful for tests and the operator surface to confirm the
+    /// install landed.
+    #[cfg(feature = "meshdb")]
+    pub fn has_meshdb_inbound_router(&self) -> bool {
+        self.meshdb_inbound_router.read().is_some()
     }
 
     /// Install (or uninstall) the greedy-LRU observer. `Redex`

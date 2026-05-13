@@ -67,8 +67,9 @@ use net::adapter::net::behavior::meshdb::{
         OperatorPlan,
     },
     query::{
-        AggregateRowPayload, AggregateValue, GroupKey, JoinKind, JoinedRowPayload,
-        NumericAggregateKind, NumericReductionKind, ResultRow, WindowBoundary, WindowSpec,
+        clamp_join_watermark_secs, AggregateRowPayload, AggregateValue, GroupKey, JoinKind,
+        JoinedRowPayload, NumericAggregateKind, NumericReductionKind, ResultRow, WindowBoundary,
+        WindowSpec,
     },
     ExecutionPlan, SeqNum,
 };
@@ -858,11 +859,7 @@ impl PyMeshQuery {
             "origin,seq" => JoinKeyMode::OriginSeq,
             other => JoinKeyMode::Field(other.to_string()),
         };
-        let watermark = if watermark_secs.is_finite() && watermark_secs >= 0.0 {
-            std::time::Duration::from_secs_f64(watermark_secs)
-        } else {
-            std::time::Duration::from_secs(5)
-        };
+        let watermark = clamp_join_watermark_secs(Some(watermark_secs));
         let op = OperatorPlan::HashJoin {
             left: Box::new(left.plan.root.clone()),
             right: Box::new(right.plan.root.clone()),
@@ -1360,7 +1357,7 @@ fn shared_runtime() -> Result<Arc<Runtime>, std::io::Error> {
 #[pyclass(name = "MeshQueryRunner", module = "net._net")]
 pub struct PyMeshQueryRunner {
     runtime: Arc<Runtime>,
-    executor: Arc<LocalMeshQueryExecutor<InMemoryStore>>,
+    executor: LocalMeshQueryExecutor<InMemoryStore>,
 }
 
 #[pymethods]
@@ -1384,10 +1381,7 @@ impl PyMeshQueryRunner {
         } else {
             LocalMeshQueryExecutor::new(store)
         };
-        Ok(Self {
-            runtime,
-            executor: Arc::new(executor),
-        })
+        Ok(Self { runtime, executor })
     }
 
     /// Execute `query` synchronously. Returns the full row list
@@ -1403,8 +1397,8 @@ impl PyMeshQueryRunner {
     ) -> PyResult<Vec<PyResultRow>> {
         let plan = query.plan.clone();
         let opts = options.map(|o| o.inner).unwrap_or_default();
-        let executor = self.executor.clone();
-        let runtime = self.runtime.clone();
+        let executor = &self.executor;
+        let runtime = &self.runtime;
         // Release the GIL while we drive the executor.
         py.detach(move || {
             runtime.block_on(async move {
