@@ -270,6 +270,18 @@ impl ResultCache for LruResultCache {
     fn insert(&self, key: CacheKey, result: CachedResult) {
         let mut g = self.inner.lock().unwrap();
         let bytes = result.approx_bytes();
+        // Refuse oversized entries up-front. Without this, the
+        // entry is inserted at head, then `evict_until_within_bounds`
+        // immediately evicts it from the tail (it's the only
+        // entry past the byte budget). The cache reports
+        // success but every subsequent `get` is a miss — and
+        // for `Permanent` policy that means the executor re-runs
+        // the plan every call instead of caching once. Reject
+        // explicitly so the caller can see "result too large to
+        // cache" via the no-op insert.
+        if bytes > g.max_bytes {
+            return;
+        }
         // Replace existing entry at this key, if any.
         if let Some(&idx) = g.by_key.get(&key) {
             let old_bytes = g.nodes[idx].bytes;
@@ -500,6 +512,43 @@ mod tests {
         cache.insert(key(2, 0), make_result(make_rows(1), CachePolicy::Permanent));
         // Bound forces one eviction.
         assert!(cache.len() <= 1);
+    }
+
+    #[test]
+    fn lru_rejects_oversized_entry_instead_of_self_evicting() {
+        // Regression: an entry whose `approx_bytes()` exceeds
+        // `max_bytes` used to be inserted at head, then
+        // immediately evicted from the tail (it's the only
+        // entry past the budget). `insert` returned cleanly but
+        // every subsequent `get` was a miss — and for the named
+        // Permanent use case ("cache this forever, it can't
+        // change") that meant the executor re-ran the plan on
+        // every call. Now the cache refuses oversized entries
+        // up-front; `len` stays at 0 and the prior entry (if
+        // any) is preserved.
+        let row_bytes = std::mem::size_of::<ResultRow>() as u64 + 8;
+        let cache = LruResultCache::new(usize::MAX, row_bytes + 1);
+
+        // Prime the cache with a small entry.
+        cache.insert(key(1, 0), make_result(make_rows(1), CachePolicy::Permanent));
+        assert_eq!(cache.len(), 1);
+
+        // Now attempt to insert an entry that's twice the
+        // budget. Pre-fix this evicts the prior entry AND the
+        // new one. Post-fix the new one is refused; the prior
+        // entry survives.
+        cache.insert(
+            key(2, 0),
+            make_result(make_rows(4), CachePolicy::Permanent),
+        );
+        assert!(
+            cache.get(&key(2, 0)).is_none(),
+            "oversized insert must not be observable via get"
+        );
+        assert!(
+            cache.get(&key(1, 0)).is_some(),
+            "prior entry must survive a refused oversized insert"
+        );
     }
 
     #[test]
