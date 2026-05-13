@@ -17,6 +17,7 @@
 //! none ship in Phase A. Tests drive events directly through the
 //! source channel to exercise the ordering contract.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -87,6 +88,13 @@ pub struct MeshOsLoop {
     /// Reconcile-pass counter — used by tests / diagnostics to
     /// confirm reconcile fired exactly once per Tick.
     reconcile_count: u64,
+
+    /// Actions reconcile emitted that the action-queue
+    /// `try_send` rejected because the executor was at
+    /// `action_queue_capacity`. Cloneable counter — the runtime
+    /// surfaces it through [`MeshOsRuntime::executor_stats`] for
+    /// operator visibility.
+    dropped_actions: Arc<AtomicU64>,
 }
 
 /// Inner shared cell — `Vec`s of probes behind an
@@ -235,8 +243,16 @@ impl MeshOsLoop {
             probes: ProbeRegistryInner::default(),
             scheduler: SchedulerRegistry::new(),
             reconcile_count: 0,
+            dropped_actions: Arc::new(AtomicU64::new(0)),
         };
         (me, handle, actions_rx, reader)
+    }
+
+    /// Clone the dropped-action counter. The runtime uses this
+    /// to surface the count through `ExecutorStatsSnapshot`;
+    /// tests can also assert against it directly.
+    pub fn dropped_actions_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.dropped_actions)
     }
 
     /// Attach a probe registry. The loop polls each registered
@@ -356,6 +372,8 @@ impl MeshOsLoop {
         }
         self.reconcile_count += 1;
         let now = std::time::Instant::now();
+        let mut dropped_this_tick: u64 = 0;
+        let mut first_dropped_kind: Option<&'static str> = None;
         for action in actions {
             let pending = PendingAction {
                 id: self.action_ids.next(),
@@ -365,11 +383,29 @@ impl MeshOsLoop {
             // Drop on backpressure rather than block reconcile —
             // the executor's job is to apply admit(); reconcile
             // staying responsive is the higher-order property.
-            // Phase G upgrades this to a proper admit/defer
-            // surface; Phase A's drop is harmless because no
-            // actions are emitted yet.
+            // Count + log drops so the silent-loss path is
+            // observable.
             self.pending_snapshot_actions.push(pending.clone());
-            let _ = self.actions_tx.try_send(pending);
+            if let Err(mpsc::error::TrySendError::Full(rejected)) =
+                self.actions_tx.try_send(pending)
+            {
+                dropped_this_tick += 1;
+                if first_dropped_kind.is_none() {
+                    first_dropped_kind =
+                        Some(super::snapshot::action_kind_str(&rejected.action));
+                }
+            }
+        }
+        if dropped_this_tick > 0 {
+            self.dropped_actions
+                .fetch_add(dropped_this_tick, Ordering::Relaxed);
+            tracing::warn!(
+                target: "meshos",
+                dropped = dropped_this_tick,
+                first_kind = first_dropped_kind.unwrap_or("?"),
+                queue_capacity = self.config.action_queue_capacity,
+                "reconcile output dropped — action queue full",
+            );
         }
         self.publish_snapshot();
         // Bound the in-loop pending mirror so a backed-up
@@ -414,7 +450,9 @@ mod tests {
     use std::time::Duration as StdDuration;
 
     use super::*;
-    use super::super::event::{ChainId, MeshOsEvent, ReplicaUpdate};
+    use super::super::event::{
+        ChainId, LocalReplicaIntent, LocalReplicaIntentUpdate, MeshOsEvent, ReplicaUpdate,
+    };
 
     #[tokio::test]
     async fn loop_exits_cleanly_when_all_handles_drop() {
@@ -444,6 +482,55 @@ mod tests {
             .expect("loop did not exit after Shutdown")
             .expect("join");
         let _ = count;
+    }
+
+    #[tokio::test]
+    async fn dropped_actions_counter_increments_when_action_queue_is_full() {
+        // Regression for C4: reconcile output silently dropped
+        // when the action mpsc is at capacity. Make the queue
+        // tiny, hold the receiver without draining, project a
+        // reconcile pass that emits multiple actions, assert the
+        // counter caught the drop.
+        let cfg = MeshOsConfig {
+            action_queue_capacity: 1,
+            tick_interval: StdDuration::from_millis(10),
+            ..fast_test_config()
+        };
+        let this_node = cfg.this_node;
+        let (loop_, handle, _actions_rx, _reader) = MeshOsLoop::new(cfg);
+        let counter = loop_.dropped_actions_counter();
+        let task = tokio::spawn(loop_.run());
+        // Put `this_node` as a holder of five chains.
+        for chain in 1..=5u64 {
+            handle
+                .publish(MeshOsEvent::ReplicaUpdate(ReplicaUpdate::Added {
+                    chain: chain as ChainId,
+                    holder: this_node,
+                }))
+                .await
+                .unwrap();
+        }
+        // Project local Drop intent → reconcile emits one
+        // DropReplica per chain on the next tick.
+        for chain in 1..=5u64 {
+            handle
+                .publish(MeshOsEvent::LocalReplicaIntent(LocalReplicaIntentUpdate {
+                    chain: chain as ChainId,
+                    intent: LocalReplicaIntent::Drop,
+                }))
+                .await
+                .unwrap();
+        }
+        // Let several ticks fire.
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
+        let dropped = counter.load(Ordering::Relaxed);
+        assert!(
+            dropped >= 1,
+            "expected at least one dropped reconcile action with \
+             action_queue_capacity = 1; got {dropped}",
+        );
     }
 
     #[tokio::test]

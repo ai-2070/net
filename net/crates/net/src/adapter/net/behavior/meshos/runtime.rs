@@ -21,6 +21,7 @@
 //! [`super::sources::attach_to_replication_coordinator`])
 //! plug into the runtime's handle.
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,6 +52,11 @@ pub struct MeshOsRuntime {
     /// install the placement scorer after `start`. Same
     /// shared-cell pattern as `probes`.
     scheduler: SchedulerRegistry,
+    /// Shared counter the loop increments when an emitted action
+    /// can't be enqueued (executor queue at
+    /// `action_queue_capacity`). Sampled by the runtime for
+    /// operator visibility into the silent-loss path.
+    dropped_actions: Arc<AtomicU64>,
 }
 
 /// Plain-value rollup of the runtime's join statistics. Returned
@@ -61,6 +67,10 @@ pub struct RuntimeStats {
     pub reconcile_passes: u64,
     /// Final executor counters.
     pub executor: ExecutorStatsSnapshot,
+    /// Total actions reconcile emitted that the action-queue
+    /// rejected because the executor was at
+    /// `action_queue_capacity`.
+    pub dropped_actions: u64,
 }
 
 impl MeshOsRuntime {
@@ -101,6 +111,7 @@ impl MeshOsRuntime {
         let mesh_loop = mesh_loop
             .with_probe_registry(probes.clone())
             .with_scheduler_registry(scheduler.clone());
+        let dropped_actions = mesh_loop.dropped_actions_counter();
         let cfg_arc = Arc::new(config);
         let exec = ActionExecutor::new(actions_rx, cfg_arc, dispatcher);
         let stats = exec.stats_arc();
@@ -114,7 +125,16 @@ impl MeshOsRuntime {
             stats,
             probes,
             scheduler,
+            dropped_actions,
         }
+    }
+
+    /// Sample the current count of reconcile-emitted actions
+    /// the executor's mpsc rejected (queue full). A growing
+    /// counter is the signal that reconcile is outpacing the
+    /// dispatcher.
+    pub fn dropped_actions(&self) -> u64 {
+        self.dropped_actions.load(AtomicOrdering::Relaxed)
     }
 
     /// Install / replace the active placement scorer. Subsequent
@@ -278,6 +298,7 @@ impl MeshOsRuntime {
                     .cluster_backpressure_releases
                     .load(std::sync::atomic::Ordering::Relaxed),
             },
+            dropped_actions: self.dropped_actions.load(AtomicOrdering::Relaxed),
         })
     }
 }
