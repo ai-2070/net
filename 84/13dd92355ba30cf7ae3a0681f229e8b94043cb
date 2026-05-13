@@ -1,0 +1,29 @@
+net/crates/net/src/adapter/net/behavior/meshos/config.rs
+  s_f68bb950203003::t_e6b0637643086e 10-14,16
+  s_f68bb950203003::t_fa9035ecbdeafb 74-123
+  s_f68bb950203003::t_478b224dc929e2 210-212,214
+  s_f68bb950203003::t_fe7163c713a475 127-129,131
+  s_f68bb950203003::t_2c5612bf3d62e7 181-183,185
+net/crates/net/src/adapter/net/behavior/meshos/scheduler.rs
+  s_f68bb950203003::t_bcad4dcbc6fb45 74-76,78
+net/crates/net/src/adapter/net/behavior/meshos/supervision.rs
+  s_f68bb950203003::t_37e8734d179039 23-25,27
+net/crates/net/tests/meshos_pipeline.rs
+  s_f68bb950203003::t_bf5eff34ef8023 36-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "8413dd92355ba30cf7ae3a0681f229e8b94043cb",
+  "prompts": {},
+  "sessions": {
+    "s_f68bb950203003": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9226dcd-79b1-4985-9dd9-28aaac11c680",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
