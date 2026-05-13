@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/DECK_SDK_PLAN.md
+  s_3bbc444b3ef3e5::t_84fe6a2fe1b41a 1-470
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "7b5da41b3b5e885715c51eab6cce4c6e2596c051",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
