@@ -106,6 +106,20 @@ pub const MESHDB_SERVER_BATCH_ROWS: usize = 64;
 /// runs normally rather than being short-circuited).
 pub const MESHDB_SERVER_PENDING_CANCELS_CAP: usize = 256;
 
+/// Maximum size (in bytes) of an inbound `SUBPROTOCOL_MESHDB`
+/// payload the dispatcher will attempt to decode. A mutually-
+/// authenticated peer that crafts an oversize frame is rejected
+/// at the wire boundary rather than allowed to allocate a huge
+/// postcard buffer / push large `MeshDbResponse::Batch` vectors
+/// onto a caller's mpsc.
+///
+/// 1 MiB matches the substrate's other per-frame defenses (the
+/// REDEX replication inbound path uses a similar bound) and is
+/// comfortably above the typical batch shape — 64 rows
+/// (`MESHDB_SERVER_BATCH_ROWS`) of postcard-encoded `ResultRow`s
+/// even at multi-KiB payloads each.
+pub const MESHDB_MAX_INBOUND_FRAME_BYTES: usize = 1024 * 1024;
+
 /// Sync, non-blocking router the mesh's inbound dispatch loop
 /// calls when a `SUBPROTOCOL_MESHDB` payload arrives. Mirrors the
 /// `ReplicationInboundRouter` shape — must not call into async
@@ -135,6 +149,10 @@ pub enum MeshDbRouteError {
     /// version, or this is a stray frame from a different
     /// subprotocol leak.
     Decode(postcard::Error),
+    /// Frame exceeded [`MESHDB_MAX_INBOUND_FRAME_BYTES`]. Rejected
+    /// before any decode work. Carries the observed length so
+    /// dashboards can flag misbehaving peers.
+    FrameTooLarge(usize),
     /// Inbound request, but this dispatcher has no
     /// [`MeshDbServer`] installed. Caller-only nodes return
     /// this; legitimate.
@@ -169,6 +187,10 @@ impl std::fmt::Display for MeshDbRouteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Decode(e) => write!(f, "meshdb frame decode failed: {e}"),
+            Self::FrameTooLarge(n) => write!(
+                f,
+                "meshdb inbound frame too large: {n} > {MESHDB_MAX_INBOUND_FRAME_BYTES} bytes"
+            ),
             Self::NoServer => write!(f, "no MeshDbServer installed on this node"),
             Self::UnknownCallId(id) => write!(f, "no in-flight caller for call_id={id:#x}"),
             Self::WrongPeer {
@@ -268,6 +290,9 @@ impl MeshDbWireDispatcher {
 
 impl MeshDbInboundRouter for MeshDbWireDispatcher {
     fn try_route(&self, from_node: u64, bytes: &[u8]) -> Result<(), MeshDbRouteError> {
+        if bytes.len() > MESHDB_MAX_INBOUND_FRAME_BYTES {
+            return Err(MeshDbRouteError::FrameTooLarge(bytes.len()));
+        }
         let frame = MeshDbFrame::decode(bytes).map_err(MeshDbRouteError::Decode)?;
         match frame {
             MeshDbFrame::Request(req) => {
@@ -1025,6 +1050,38 @@ mod tests {
             .try_route(0xB, &frame.encode().unwrap())
             .expect_err("no caller -> error");
         assert!(matches!(err, MeshDbRouteError::UnknownCallId(999)));
+    }
+
+    #[tokio::test]
+    async fn wire_dispatcher_rejects_oversize_frame_before_decode() {
+        // Pin: a frame larger than `MESHDB_MAX_INBOUND_FRAME_BYTES`
+        // is rejected at the wire boundary without attempting a
+        // postcard decode. Guards against a hostile peer pinning
+        // a large allocation in the dispatcher.
+        let wire = Arc::new(InMemoryWire::default());
+        let sender = Arc::new(SenderTo {
+            wire,
+            local_node: 0xA,
+        });
+        let dispatcher = Arc::new(MeshDbWireDispatcher::new(sender));
+        let oversize = vec![0u8; MESHDB_MAX_INBOUND_FRAME_BYTES + 1];
+        let err = dispatcher
+            .try_route(0xB, &oversize)
+            .expect_err("oversize -> error");
+        match err {
+            MeshDbRouteError::FrameTooLarge(n) => {
+                assert_eq!(n, MESHDB_MAX_INBOUND_FRAME_BYTES + 1);
+            }
+            other => panic!("expected FrameTooLarge; got {other:?}"),
+        }
+        // A frame at exactly the cap is allowed through to
+        // decode (which then fails on garbage, but the size
+        // gate doesn't trip).
+        let at_cap = vec![0xFFu8; MESHDB_MAX_INBOUND_FRAME_BYTES];
+        let err = dispatcher
+            .try_route(0xB, &at_cap)
+            .expect_err("garbage at cap -> decode error, not size error");
+        assert!(matches!(err, MeshDbRouteError::Decode(_)));
     }
 
     #[tokio::test]

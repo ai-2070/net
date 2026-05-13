@@ -114,5 +114,6 @@ pub use query::{
 pub use transport::{
     enable_meshdb_on_mesh, MeshDbInboundRouter, MeshDbRouteError, MeshDbServer,
     MeshDbWireDispatcher, MeshDbWireSender, MeshDbWireTransport, MeshNodeMeshDbSender,
-    MESHDB_RESPONSE_INBOX_CAPACITY, MESHDB_SERVER_BATCH_ROWS, MESHDB_SERVER_OUTBOX_CAPACITY,
+    MESHDB_MAX_INBOUND_FRAME_BYTES, MESHDB_RESPONSE_INBOX_CAPACITY, MESHDB_SERVER_BATCH_ROWS,
+    MESHDB_SERVER_OUTBOX_CAPACITY, MESHDB_SERVER_PENDING_CANCELS_CAP,
 };
