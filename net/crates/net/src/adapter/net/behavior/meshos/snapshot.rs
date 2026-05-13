@@ -290,11 +290,16 @@ impl MeshOsSnapshot {
     /// state + pending action queue. `pending` is whatever
     /// `MeshOsLoop` currently has emitted but not yet drained;
     /// callers pass it in (the loop has the queue, but the
-    /// snapshot doesn't own it).
+    /// snapshot doesn't own it). `recent_failures` mirrors the
+    /// executor's failure ring (the executor owns the writer
+    /// side; the loop reads it on publish) — the snapshot copies
+    /// it so consumers see executor-side dispatch failures even
+    /// when the chain-fold path is not wired up.
     pub fn from_state(
         actual: &MeshOsState,
         desired: &DesiredState,
         pending: &[PendingAction],
+        recent_failures: &[FailureRecord],
     ) -> Self {
         let now = actual.last_tick.unwrap_or_else(std::time::Instant::now);
 
@@ -444,7 +449,7 @@ impl MeshOsSnapshot {
             avoid_list,
             local_maintenance,
             pending,
-            recent_failures: VecDeque::new(),
+            recent_failures: recent_failures.iter().cloned().collect(),
         }
     }
 }
@@ -562,7 +567,7 @@ mod tests {
         status.saturation = 0.42;
         actual.daemons.insert(d.clone(), status);
         let desired = DesiredState::default();
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[]);
+        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[]);
         let daemon = snap.daemons.get(&1).expect("daemon present");
         assert_eq!(daemon.name, "telemetry");
         assert_eq!(daemon.lifecycle, DaemonLifecycleSnapshot::Running);
@@ -583,7 +588,7 @@ mod tests {
         actual.replica_leader.insert(0xAA, 1);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(0xAA, 5);
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[]);
+        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[]);
         let r = snap.replicas.get(&0xAA).expect("replica present");
         assert_eq!(r.holders, vec![1, 2, 3]);
         assert_eq!(r.desired_count, Some(5));
@@ -595,7 +600,7 @@ mod tests {
         let actual = MeshOsState::default();
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(0xBB, 3);
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[]);
+        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[]);
         let r = snap
             .replicas
             .get(&0xBB)
@@ -649,7 +654,7 @@ mod tests {
             emitted_at: base,
         }];
 
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &pending);
+        let snap = MeshOsSnapshot::from_state(&actual, &desired, &pending, &[]);
         let bytes = postcard::to_allocvec(&snap).expect("encode");
         let back: MeshOsSnapshot = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(snap, back);

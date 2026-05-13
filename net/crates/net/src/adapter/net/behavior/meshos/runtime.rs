@@ -150,10 +150,6 @@ impl MeshOsRuntime {
             actions_rx,
             reader,
         } = MeshOsLoop::new(config.clone());
-        let mesh_loop = mesh_loop
-            .with_probe_registry(probes.clone())
-            .with_scheduler_registry(scheduler.clone());
-        let dropped_actions = mesh_loop.dropped_actions_counter();
         // Wire the daemon-lifecycle source converter so registry
         // events fan into the loop's event stream. Replaces any
         // prior observer on the registry (one observer slot per
@@ -162,6 +158,15 @@ impl MeshOsRuntime {
         let cfg_arc = Arc::new(config);
         let exec = ActionExecutor::new(actions_rx, cfg_arc, dispatcher);
         let stats = exec.stats_arc();
+        // Share the executor's failures ring with the loop so
+        // the snapshot publish path copies executor-side
+        // failures into the snapshot's `recent_failures` field —
+        // the chain-fold path is not the only surface.
+        let mesh_loop = mesh_loop
+            .with_probe_registry(probes.clone())
+            .with_scheduler_registry(scheduler.clone())
+            .with_executor_failures(exec.recent_failures_handle());
+        let dropped_actions = mesh_loop.dropped_actions_counter();
         let loop_task = tokio::spawn(mesh_loop.run());
         let exec_task = tokio::spawn(exec.run());
         Self {
@@ -564,6 +569,54 @@ mod tests {
         // Just compile + run cleanly — the handle_clone path
         // is what source converters use to plug in.
         let _ = Instant::now();
+    }
+
+    #[tokio::test]
+    async fn snapshot_recent_failures_surfaces_executor_dispatch_failures() {
+        // Without the executor → loop failures ring wiring, every
+        // consumer of `runtime.snapshot().recent_failures` saw an
+        // empty deque — the executor maintained its own ring but
+        // nothing published it. This test seeds a dispatch
+        // failure via LoggingDispatcher::fail_next and asserts
+        // the snapshot reflects it.
+        use super::super::executor::DispatchError;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        dispatcher.fail_next(DispatchError::drop("synthetic failure"));
+        let rt = MeshOsRuntime::start(fast_cfg(), Arc::clone(&dispatcher));
+        // Drive an EnterMaintenance — reconcile emits a
+        // CommitMaintenanceTransition that the dispatcher's
+        // queued `fail_next` will reject, recording one failure
+        // on the executor's ring.
+        rt.handle()
+            .publish(MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
+                node: 1,
+                deadline: None,
+            }))
+            .await
+            .unwrap();
+        // Poll up to a couple of seconds for the executor to
+        // record + the loop to publish.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let failures = loop {
+            let snap = rt.snapshot();
+            if !snap.recent_failures.is_empty() {
+                break snap.recent_failures;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "expected at least one failure in snapshot; executor stats = {:?}",
+                    rt.executor_stats()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.reason.contains("synthetic failure")),
+            "expected the synthetic-failure record in {failures:?}",
+        );
+        let _ = rt.shutdown().await;
     }
 
     #[tokio::test]

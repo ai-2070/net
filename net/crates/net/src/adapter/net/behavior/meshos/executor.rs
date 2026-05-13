@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc;
 use tokio::time::sleep_until;
 
@@ -228,7 +228,13 @@ pub struct ActionExecutor<D: ActionDispatcher> {
     backpressure: BackpressureState,
     dispatcher: Arc<D>,
     deferred: BinaryHeap<DeferredEntry>,
-    recent_failures: VecDeque<FailureRecord>,
+    /// Bounded ring of recent dispatch failures. Shared with the
+    /// loop so the snapshot publish path can copy it into the
+    /// `MeshOsSnapshot::recent_failures` field without going
+    /// through the chain-fold path (which requires a real
+    /// `ActionChainAppender` to be wired). Writer is the
+    /// executor task; reader is the loop task on every publish.
+    recent_failures: Arc<RwLock<VecDeque<FailureRecord>>>,
     stats: Arc<ExecutorStats>,
     /// Optional action-chain appender. Each admit/dispatch
     /// outcome appends an [`super::chain::ActionChainRecord`].
@@ -251,10 +257,20 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             backpressure: BackpressureState::new(),
             dispatcher,
             deferred: BinaryHeap::new(),
-            recent_failures: VecDeque::with_capacity(RECENT_FAILURES_CAPACITY),
+            recent_failures: Arc::new(RwLock::new(VecDeque::with_capacity(
+                RECENT_FAILURES_CAPACITY,
+            ))),
             stats: Arc::new(ExecutorStats::default()),
             chain_appender: Arc::new(NoOpActionChainAppender),
         }
+    }
+
+    /// Clone the shared recent-failures ring. The runtime hands
+    /// this to the loop so the snapshot publish path can copy it
+    /// into the [`MeshOsSnapshot::recent_failures`] field — the
+    /// chain-fold path is not the only failure surface.
+    pub fn recent_failures_handle(&self) -> Arc<RwLock<VecDeque<FailureRecord>>> {
+        Arc::clone(&self.recent_failures)
     }
 
     /// Builder: install an action-chain appender. The default
@@ -455,14 +471,15 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
     }
 
     fn record_failure(&mut self, source: String, reason: String) {
-        if self.recent_failures.len() >= RECENT_FAILURES_CAPACITY {
-            self.recent_failures.pop_front();
-        }
         let recorded_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        self.recent_failures.push_back(FailureRecord {
+        let mut ring = self.recent_failures.write();
+        if ring.len() >= RECENT_FAILURES_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(FailureRecord {
             source,
             reason,
             recorded_at_ms,

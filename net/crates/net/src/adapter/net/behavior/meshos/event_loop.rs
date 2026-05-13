@@ -17,10 +17,12 @@
 //! none ship in Phase A. Tests drive events directly through the
 //! source channel to exercise the ordering contract.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tokio::time::{interval_at, Instant as TokioInstant, MissedTickBehavior};
 
@@ -30,7 +32,7 @@ use super::event::MeshOsEvent;
 use super::probes::{HealthProbe, LocalityProbe};
 use super::reconcile::reconcile;
 use super::scheduler::SchedulerRegistry;
-use super::snapshot::MeshOsSnapshot;
+use super::snapshot::{FailureRecord, MeshOsSnapshot};
 use super::state::{DesiredState, MeshOsState};
 
 /// Per-node MeshOS instance. Owns the actual + desired state
@@ -100,6 +102,13 @@ pub struct MeshOsLoop {
     /// surfaces it through [`MeshOsRuntime::executor_stats`] for
     /// operator visibility.
     dropped_actions: Arc<AtomicU64>,
+    /// Shared reference to the executor's recent-failures ring.
+    /// The executor task writes; the loop reads on every
+    /// `publish_snapshot` and copies the records into the
+    /// snapshot's `recent_failures` field. Optional so a loop
+    /// constructed without an executor (e.g. unit tests) still
+    /// publishes (with an empty ring).
+    executor_failures: Option<Arc<RwLock<VecDeque<FailureRecord>>>>,
 }
 
 /// Inner shared cell — both probe lists behind one
@@ -305,6 +314,7 @@ impl MeshOsLoop {
             scheduler: SchedulerRegistry::new(),
             reconcile_count: 0,
             dropped_actions: Arc::new(AtomicU64::new(0)),
+            executor_failures: None,
         };
         MeshOsLoopParts {
             mesh_loop: me,
@@ -336,6 +346,21 @@ impl MeshOsLoop {
     /// Cloneable + shareable like the probe registry.
     pub fn with_scheduler_registry(mut self, registry: SchedulerRegistry) -> Self {
         self.scheduler = registry;
+        self
+    }
+
+    /// Attach the executor's recent-failures ring. The loop reads
+    /// it on every `publish_snapshot` so the snapshot's
+    /// `recent_failures` field reflects executor-side dispatch
+    /// failures (the `MeshOsSnapshotFold` chain-record path is
+    /// not the only failure surface). The runtime calls this
+    /// after `ActionExecutor::new` so both halves of the pair
+    /// share the same ring.
+    pub fn with_executor_failures(
+        mut self,
+        failures: Arc<RwLock<VecDeque<FailureRecord>>>,
+    ) -> Self {
+        self.executor_failures = Some(failures);
         self
     }
 
@@ -563,8 +588,20 @@ impl MeshOsLoop {
     }
 
     fn publish_snapshot(&self) {
-        let snap =
-            MeshOsSnapshot::from_state(&self.actual, &self.desired, &self.recent_emissions);
+        // Read the executor's failures ring under a short read
+        // lock and copy it into the snapshot. The lock is held
+        // only across the clone to keep the executor's write
+        // path (record_failure) responsive.
+        let failures: Vec<FailureRecord> = match self.executor_failures.as_ref() {
+            Some(ring) => ring.read().iter().cloned().collect(),
+            None => Vec::new(),
+        };
+        let snap = MeshOsSnapshot::from_state(
+            &self.actual,
+            &self.desired,
+            &self.recent_emissions,
+            &failures,
+        );
         self.snapshot.store(Arc::new(snap));
     }
 }
