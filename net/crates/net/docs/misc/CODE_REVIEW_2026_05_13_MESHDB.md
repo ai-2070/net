@@ -10,7 +10,34 @@ severity, with each item labeled for tracking in this doc only (per the
 
 ## Status
 
-All items below are being addressed; see the "Resolution" notes inline.
+**Closed.** Every Blocker / Major / Minor / Nit was either fixed
+in-tree or — where the original claim turned out to be inaccurate
+on inspection — pinned with a regression test and the doc updated
+to record the corrected understanding. Tests added: substrate
+(`error::tests::kind_discriminator_is_stable_across_variants`,
+`cache::tests::key_for_plan_handles_filter_plans_without_panicking`,
+`federated::tests::cancel_after_composite_aggregate_short_circuits_materialized_stream`,
+`federated::tests::call_id_is_unique_across_federated_executors_on_same_host`,
+`planner::tests::plan_chainref_discovered_multiple_origins_surfaces_ambiguous_error`,
+`planner::tests::lineage_back_with_multiple_fork_of_tags_is_deterministic`),
+Go FFI shim (`ffi_last_error_starts_null_and_clears_correctly`,
+`ffi_null_handle_populates_last_error`,
+`ffi_mesh_error_kind_round_trip_covers_known_variants`, instrumented
+`ffi_cached_runner_round_trips`), Python tests
+(`test_join_accepts_watermark_secs_kwarg`), Node tests
+(`parseMeshDbErrorKind decodes the <<meshdb-kind:...>> prefix`,
+`cachePolicyTimeBound rejects non-finite / negative ttlSeconds at the
+factory`, `execute rejects a hand-rolled cachePolicy with a negative
+ttlSeconds`, `execute rejects a hand-rolled cachePolicy with an
+unknown kind`).
+
+Two items deferred because they need surfaces the SDK doesn't expose
+yet: M9 (federated SDK tests — requires plumbing
+`FederatedMeshQueryExecutor` + `LoopbackTransport` through Python /
+Node) and M10 partial (runner-side error-path tests — runtime
+`MeshError` variants need capability-index gating / configurable
+budgets / `Discovered` surface, none currently exposed). Both
+documented inline.
 
 ## Blockers
 
