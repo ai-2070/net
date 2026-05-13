@@ -1006,14 +1006,24 @@ mod tests {
     #[tokio::test]
     async fn shutdown_event_short_circuits_pending_events_after_it() {
         // Per the loop contract: Shutdown breaks the loop the
-        // moment it's dequeued. Events sent after Shutdown is
-        // sent are still dequeued by the channel (FIFO) but only
-        // up to the Shutdown event; after the loop breaks they
-        // remain undelivered.
-        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_test_config());
-        handle.publish(MeshOsEvent::Tick).await.unwrap();
+        // moment it's dequeued. Events queued behind Shutdown
+        // must NOT mutate state — the post-Shutdown
+        // ReplicaUpdate below should leave the snapshot's
+        // replica fold empty. Use a long tick interval so the
+        // reconcile arm doesn't race the assertion.
+        let cfg = MeshOsConfig {
+            tick_interval: StdDuration::from_secs(60),
+            ..fast_test_config()
+        };
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader,
+        } = MeshOsLoop::new(cfg);
         handle.publish(MeshOsEvent::Shutdown).await.unwrap();
-        // A post-Shutdown event: enqueued behind Shutdown.
+        // Post-Shutdown event: enqueued behind Shutdown. The
+        // loop must NOT apply it before exiting.
         handle
             .publish(MeshOsEvent::ReplicaUpdate(ReplicaUpdate::Added {
                 chain: 1,
@@ -1023,13 +1033,17 @@ mod tests {
             .unwrap();
         let count = tokio::time::timeout(StdDuration::from_secs(1), loop_.run())
             .await
-            .expect("loop did not exit on Shutdown")
-            ;
-        // First event (Tick) flowed through but did NOT trigger
-        // a reconcile pass (reconcile fires on the timer Tick,
-        // not on the event-payload Tick). So count stays 0.
-        // (The timer Tick happens on the tokio `interval` arm
-        // of `select!`, not from the application event.)
-        let _ = count;
+            .expect("loop did not exit on Shutdown");
+        // Reconcile never fired (Shutdown short-circuits the
+        // loop before any tick).
+        assert_eq!(count, 0, "Shutdown must break before reconcile fires");
+        // The post-Shutdown ReplicaUpdate must NOT have applied —
+        // the snapshot's replica fold stays empty.
+        let snap = reader.read();
+        assert!(
+            snap.replicas.is_empty(),
+            "post-Shutdown ReplicaUpdate must not enter the fold; saw {} entries",
+            snap.replicas.len(),
+        );
     }
 }
