@@ -185,11 +185,34 @@ impl MeshOsHandle {
     /// `event_queue_capacity`. Sources that need a fire-and-
     /// forget path can `try_send` directly on the underlying
     /// sender via `into_sender`.
+    ///
+    /// **Note on wedge risk:** if the loop is stuck (probe
+    /// holding a sync lock, dispatcher saturated, etc.) this
+    /// future never resolves. Long-lived sources that must
+    /// remain responsive should prefer
+    /// [`Self::publish_timeout`] or [`Self::try_publish`].
     pub async fn publish(&self, event: MeshOsEvent) -> Result<(), MeshOsHandleError> {
         self.events
             .send(event)
             .await
             .map_err(|_| MeshOsHandleError::LoopClosed)
+    }
+
+    /// Publish an event with a bounded wait. Returns
+    /// [`MeshOsHandleError::QueueFull`] if the source channel
+    /// stayed at capacity for the entire `timeout` window.
+    /// Sources that can't afford to park indefinitely on a
+    /// wedged loop should call this instead of [`Self::publish`].
+    pub async fn publish_timeout(
+        &self,
+        event: MeshOsEvent,
+        timeout: std::time::Duration,
+    ) -> Result<(), MeshOsHandleError> {
+        match tokio::time::timeout(timeout, self.events.send(event)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(MeshOsHandleError::LoopClosed),
+            Err(_) => Err(MeshOsHandleError::QueueFull),
+        }
     }
 
     /// Try to publish without awaiting. Returns
@@ -541,6 +564,37 @@ mod tests {
             .expect("loop did not exit after Shutdown")
             .expect("join");
         let _ = count;
+    }
+
+    #[tokio::test]
+    async fn publish_timeout_returns_queue_full_when_loop_is_wedged() {
+        // Regression for I11: `publish` parks indefinitely on a
+        // wedged loop. `publish_timeout` surfaces
+        // QueueFull after the configured window so sources don't
+        // stall.
+        let cfg = MeshOsConfig {
+            event_queue_capacity: 1,
+            ..fast_test_config()
+        };
+        let (_loop_, handle, _actions_rx, _reader) = MeshOsLoop::new(cfg);
+        // Don't spawn the loop — handle is alive but the
+        // receiver is parked inside `_loop_`. First publish
+        // fills the capacity-1 channel; second blocks
+        // indefinitely. publish_timeout surfaces QueueFull.
+        handle
+            .publish(MeshOsEvent::Tick)
+            .await
+            .expect("first send fits in the single-slot channel");
+        let started = std::time::Instant::now();
+        let err = handle
+            .publish_timeout(MeshOsEvent::Tick, StdDuration::from_millis(50))
+            .await
+            .expect_err("second send should time out");
+        assert!(matches!(err, MeshOsHandleError::QueueFull));
+        assert!(
+            started.elapsed() < StdDuration::from_millis(500),
+            "publish_timeout must honor its budget",
+        );
     }
 
     #[tokio::test]
