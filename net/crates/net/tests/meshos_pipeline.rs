@@ -33,16 +33,11 @@ use net::adapter::net::EntityKeypair;
 const THIS_NODE: NodeId = 100;
 
 fn fast_config() -> MeshOsConfig {
-    MeshOsConfig {
-        this_node: THIS_NODE,
-        tick_interval: Duration::from_millis(20),
-        event_queue_capacity: 64,
-        action_queue_capacity: 64,
-        backpressure: Default::default(),
-        locality: Default::default(),
-        maintenance: Default::default(),
-        scheduler: Default::default(),
-    }
+    MeshOsConfig::default()
+        .with_this_node(THIS_NODE)
+        .with_tick_interval(Duration::from_millis(20))
+        .with_event_queue_capacity(64)
+        .with_action_queue_capacity(64)
 }
 
 fn daemon(name: &str, id: u64) -> DaemonRef {

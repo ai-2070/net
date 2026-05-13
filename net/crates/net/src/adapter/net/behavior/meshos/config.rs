@@ -7,8 +7,13 @@
 use std::time::Duration;
 
 /// Tunable parameters for [`super::event_loop::MeshOsLoop`].
-/// `Default::default()` produces the plan's stated defaults.
+/// `Default::default()` produces the plan's stated defaults;
+/// external callers tweak fields via the `with_*` setters.
+///
+/// `#[non_exhaustive]` so phases that add knobs (new throttles,
+/// new ramp windows) don't break call sites in downstream crates.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct MeshOsConfig {
     /// Identity of the node this loop runs on. Used by Phase C
     /// reconcile to decide whether the leader-only `Request*`
@@ -66,10 +71,64 @@ impl Default for MeshOsConfig {
     }
 }
 
+impl MeshOsConfig {
+    /// Override the node id this loop runs on.
+    pub fn with_this_node(mut self, node: super::event::NodeId) -> Self {
+        self.this_node = node;
+        self
+    }
+
+    /// Override the tick interval.
+    pub fn with_tick_interval(mut self, interval: Duration) -> Self {
+        self.tick_interval = interval;
+        self
+    }
+
+    /// Override the event-source mpsc channel capacity.
+    pub fn with_event_queue_capacity(mut self, capacity: usize) -> Self {
+        self.event_queue_capacity = capacity;
+        self
+    }
+
+    /// Override the action-executor mpsc channel capacity.
+    pub fn with_action_queue_capacity(mut self, capacity: usize) -> Self {
+        self.action_queue_capacity = capacity;
+        self
+    }
+
+    /// Override the backpressure tunables.
+    pub fn with_backpressure(mut self, backpressure: BackpressureConfig) -> Self {
+        self.backpressure = backpressure;
+        self
+    }
+
+    /// Override the locality tunables.
+    pub fn with_locality(mut self, locality: LocalityConfig) -> Self {
+        self.locality = locality;
+        self
+    }
+
+    /// Override the maintenance tunables.
+    pub fn with_maintenance(mut self, maintenance: MaintenanceConfig) -> Self {
+        self.maintenance = maintenance;
+        self
+    }
+
+    /// Override the scheduler tunables.
+    pub fn with_scheduler(mut self, scheduler: super::scheduler::SchedulerConfig) -> Self {
+        self.scheduler = scheduler;
+        self
+    }
+}
+
 /// Phase G backpressure tunables — included in
 /// [`MeshOsConfig`] from Phase A so the `admit()` layer can read
 /// them once it lands, without breaking the config shape.
+///
+/// `#[non_exhaustive]`: phases that add throttles ride into the
+/// default impl without breaking downstream callers.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct BackpressureConfig {
     /// Minimum interval between admitted replica-pull actions.
     /// Default 250 ms.
@@ -119,7 +178,11 @@ impl Default for BackpressureConfig {
 
 /// Phase D locality tunables. Default values come from the
 /// plan's locked decisions; operators override per-node.
+///
+/// `#[non_exhaustive]`: phases that add locality signals ride
+/// into the default impl without breaking downstream callers.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct LocalityConfig {
     /// RTT samples above this threshold flag the peer as
     /// "degraded" and trigger a `MarkAvoid` action. Default
@@ -144,7 +207,11 @@ impl Default for LocalityConfig {
 }
 
 /// Phase E maintenance tunables.
+///
+/// `#[non_exhaustive]`: phases that add maintenance windows ride
+/// into the default impl without breaking downstream callers.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct MaintenanceConfig {
     /// Default drain deadline applied when `AdminEvent::EnterMaintenance`
     /// arrives without an explicit one. Default 10 min.

@@ -20,7 +20,11 @@ use std::time::{Duration, Instant};
 /// reproduces the plan's numbers: 500 ms initial, doubling, 60 s
 /// cap; 5 crashes per 60 s window flips to `CrashLooping`;
 /// 5-minute cooldown before the gate releases.
+///
+/// `#[non_exhaustive]`: future tuning (e.g. jitter percentage)
+/// rides in without breaking downstream callers.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct BackoffConfig {
     /// Backoff window after the first crash. Default 500 ms.
     pub initial: Duration,

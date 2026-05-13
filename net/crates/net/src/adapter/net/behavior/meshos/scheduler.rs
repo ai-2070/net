@@ -71,7 +71,11 @@ pub trait PlacementScorer: Send + Sync + 'static {
 /// Tunables for [`super::reconcile::reconcile`]'s scheduler arm.
 /// `Default::default()` reproduces the plan's numbers: score
 /// floor 0.5, hysteresis gap 0.2, 5 min cooldown.
+///
+/// `#[non_exhaustive]`: future scoring knobs ride in without
+/// breaking downstream callers.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SchedulerConfig {
     /// A holder's `score()` below this threshold flags the
     /// chain as a rebalance candidate. Default `0.5`.
