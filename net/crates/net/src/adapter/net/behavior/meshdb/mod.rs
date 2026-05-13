@@ -77,6 +77,7 @@ pub mod planner;
 pub mod protocol;
 pub mod query;
 pub mod row;
+pub mod transport;
 
 pub use cache::{
     CacheKey, CachePolicy, CachedResult, LruResultCache, ResultCache, LRU_MAX_BYTES,
@@ -95,7 +96,12 @@ pub use planner::{
     OperatorNode, OperatorPlan,
 };
 pub use protocol::{
-    ContinuationToken, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,
+    ContinuationToken, MeshDbFrame, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,
+};
+pub use transport::{
+    MeshDbInboundRouter, MeshDbRouteError, MeshDbServer, MeshDbWireDispatcher, MeshDbWireSender,
+    MeshDbWireTransport, MESHDB_RESPONSE_INBOX_CAPACITY, MESHDB_SERVER_BATCH_ROWS,
+    MESHDB_SERVER_OUTBOX_CAPACITY,
 };
 pub use query::{
     AggregateFn, AggregateRowPayload, AggregateValue, ChainRef, Expr, GroupKey, JoinKey, JoinKind,

@@ -201,6 +201,35 @@ pub enum MeshDbResponse {
     },
 }
 
+/// Single wire frame for `SUBPROTOCOL_MESHDB`. The subprotocol is
+/// bidirectional — both sides can be initiator and responder for
+/// different in-flight calls — so the on-wire envelope tags
+/// whether the payload is a request or a response. The dispatcher
+/// reads the tag to route to the local server (for `Request`s) or
+/// to the matching in-flight caller (for `Response`s).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum MeshDbFrame {
+    /// A request from this peer to us, addressed to our local
+    /// `MeshDbInboundRouter` for execution.
+    Request(MeshDbRequest),
+    /// A response from this peer addressed to one of our
+    /// in-flight calls; the transport demuxes by `call_id`.
+    Response(MeshDbResponse),
+}
+
+impl MeshDbFrame {
+    /// Encode to the wire (postcard).
+    pub fn encode(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+
+    /// Decode from the wire (postcard).
+    pub fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
@@ -412,6 +441,38 @@ mod tests {
             let bytes = postcard::to_allocvec(r).expect("encode");
             let _: MeshDbResponse = postcard::from_bytes(&bytes).expect("decode");
         }
+    }
+
+    #[test]
+    fn frame_round_trips_request_and_response_through_postcard() {
+        // The unified wire frame the mesh's subprotocol dispatch
+        // sees: a tagged enum that demuxes inbound bytes into
+        // either a server-side request or a caller-side response.
+        let request_frame = MeshDbFrame::Request(MeshDbRequest::Execute {
+            call_id: 0xDEAD_BEEF,
+            plan: sample_plan(),
+        });
+        let bytes = request_frame.encode().expect("encode request frame");
+        let decoded = MeshDbFrame::decode(&bytes).expect("decode request frame");
+        assert_eq!(decoded, request_frame);
+
+        let response_frame = MeshDbFrame::Response(MeshDbResponse::Batch {
+            call_id: 0xDEAD_BEEF,
+            batch: ResultBatch::last(vec![sample_row()]),
+        });
+        let bytes = response_frame.encode().expect("encode response frame");
+        let decoded = MeshDbFrame::decode(&bytes).expect("decode response frame");
+        assert_eq!(decoded, response_frame);
+    }
+
+    #[test]
+    fn frame_decode_rejects_garbage() {
+        // A handful of garbage byte sequences must not match
+        // either variant via postcard's discriminant prefix.
+        // Smoke-test that an arbitrary prefix-zero byte leads
+        // to a decode error rather than silent acceptance.
+        let result = MeshDbFrame::decode(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(result.is_err());
     }
 
     #[test]
