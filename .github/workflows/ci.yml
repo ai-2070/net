@@ -61,58 +61,44 @@ jobs:
       # `required-features = ["redis" | "jetstream"]` in Cargo.toml excludes
       # them from compilation under this feature set. Wire them in separately
       # once CI service containers are added.
-      - name: Net integration
-        run: cargo test --test integration_net --features net
-      - name: Three-node integration
-        run: cargo test --test three_node_integration --features net
-      - name: Mikoshi integration
-        run: cargo test --test migration_integration --features net
-      - name: Mikoshi placement-filter callback integration
-        run: cargo test --test integration_placement_filter_callback --features net
-      - name: RedEX integration
-        run: cargo test --test integration_redex --features redex
-      - name: RedEX replication e2e (real-wire two/three-node)
-        # Pulls in the `net` feature because the e2e suite uses
-        # `MeshNode` + `MeshNodeConfig` for the real-wire NKpsk0
-        # handshake. The `redex` feature is the actual gate (the
-        # tests are `#![cfg(feature = "redex")]`).
-        run: cargo test --test redex_replication_e2e --features "redex net"
-      - name: RedEX replication DST (deterministic simulation)
-        # Single-threaded harness; doesn't need `net` — runs the
-        # production state machine + election + catch-up + tracker
-        # logic against virtual nodes with explicit clock + message
-        # queue + partition matrix.
-        run: cargo test --test redex_replication_dst --features redex
-      - name: CortEX adapter integration
-        run: cargo test --test integration_cortex_adapter --features cortex
-      - name: CortEX tasks integration
-        run: cargo test --test integration_cortex_tasks --features cortex
-      - name: CortEX memories integration
-        run: cargo test --test integration_cortex_memories --features cortex
-      - name: NetDB integration
-        run: cargo test --test integration_netdb --features netdb
-      - name: nRPC predicate-header integration
-        run: cargo test --test integration_nrpc_predicate_header --features cortex
-      - name: Dataforts net-blob CLI tests
-        run: cargo test --test net_blob_cli --features dataforts,cli
-      - name: Dataforts blob e2e (multi-node + migration)
-        # The blob e2e suite includes the 3-node parallel migration
-        # scenario in `three_node_parallel_migration_lands_blob_on_two_peers`.
-        # `redex-disk` is required so MeshBlobAdapter can spin up a
-        # real on-disk RedEX per node.
-        run: cargo test --test dataforts_blob_e2e --features dataforts,redex-disk
-      - name: Dataforts greedy e2e (cache + speculative pull)
-        run: cargo test --test dataforts_greedy_e2e --features dataforts
-      - name: Dataforts gravity e2e
-        run: cargo test --test dataforts_gravity_e2e --features dataforts
+
+      # === Bus core (no features) =========================================
       - name: Bus shutdown drain
         run: cargo test --test bus_shutdown_drain
       - name: Bus stranded flush
         run: cargo test --test bus_stranded_flush
+
+      # === FFI (no features) ==============================================
       - name: FFI shutdown race
         run: cargo test --test ffi_shutdown_race
       - name: FFI poll buffer
         run: cargo test --test ffi_poll_buffer
+
+      # === Net mesh (transport / channel / peer / placement) ==============
+      - name: Net integration
+        run: cargo test --test integration_net --features net
+      - name: Three-node integration
+        run: cargo test --test three_node_integration --features net
+      - name: Channel auth
+        run: cargo test --test channel_auth --features net
+      - name: Channel auth hardening
+        run: cargo test --test channel_auth_hardening --features net
+      - name: Connect post-start
+        run: cargo test --test connect_post_start --features net
+      - name: Failure detector matrix
+        run: cargo test --test failure_detector_matrix --features net
+      - name: Parallel bind stress
+        run: cargo test --test parallel_bind_stress --features net
+      - name: Peer-death evicts peer map
+        run: cargo test --test peer_death_evicts_peer_map --features net
+      - name: Send subprotocol malformed
+        run: cargo test --test send_subprotocol_malformed --features net
+      - name: Subnet enforcement
+        run: cargo test --test subnet_enforcement --features net
+      - name: Placement-filter callback integration
+        run: cargo test --test integration_placement_filter_callback --features net
+
+      # === Capability & discovery =========================================
       - name: Capability broadcast
         run: cargo test --test capability_broadcast --features net
       - name: Capability multihop
@@ -123,31 +109,11 @@ jobs:
         run: cargo test --test capability_schema_doc_guard --features net
       - name: Chain discovery
         run: cargo test --test chain_discovery --features net
-      - name: Channel auth
-        run: cargo test --test channel_auth --features net
-      - name: Channel auth hardening
-        run: cargo test --test channel_auth_hardening --features net
-      - name: Connect post-start
-        run: cargo test --test connect_post_start --features net
       - name: Cross-lang capability fixtures
         run: cargo test --test cross_lang_capability_fixtures --features net
-      - name: Failure detector matrix
-        run: cargo test --test failure_detector_matrix --features net
-      - name: Mikoshi target-failure mid-chunking
-        run: cargo test --test migration_target_failure_mid_chunking --features net
-      - name: nRPC inbound dispatcher
-        run: cargo test --test nrpc_inbound_dispatcher --features net
-      - name: Parallel bind stress
-        run: cargo test --test parallel_bind_stress --features net
-      - name: Peer-death evicts peer map
-        run: cargo test --test peer_death_evicts_peer_map --features net
-      - name: Queue-group dispatch
-        run: cargo test --test queue_group_dispatch --features net
-      - name: Send subprotocol malformed
-        run: cargo test --test send_subprotocol_malformed --features net
-      - name: Subnet enforcement
-        run: cargo test --test subnet_enforcement --features net
-      - name: Connect direct (NAT)
+
+      # === NAT traversal ==================================================
+      - name: Connect direct
         run: cargo test --test connect_direct --features "net nat-traversal"
       - name: NAT classify
         run: cargo test --test nat_classify --features "net nat-traversal"
@@ -165,10 +131,54 @@ jobs:
         run: cargo test --test rendezvous_ack --features "net nat-traversal"
       - name: Rendezvous coordinator
         run: cargo test --test rendezvous_coordinator --features "net nat-traversal"
+
+      # === Port mapping (UPnP-IGD / NAT-PMP / PCP) ========================
       - name: Port mapping null
         run: cargo test --test port_mapping_null --features "net port-mapping"
       - name: Port mapping real router
         run: cargo test --test port_mapping_real_router --features "net port-mapping"
+
+      # === Mikoshi (migration) ============================================
+      - name: Mikoshi integration
+        run: cargo test --test migration_integration --features net
+      - name: Mikoshi target-failure mid-chunking
+        run: cargo test --test migration_target_failure_mid_chunking --features net
+
+      # === RedEX ==========================================================
+      - name: RedEX integration
+        run: cargo test --test integration_redex --features redex
+      - name: RedEX replication e2e (real-wire two/three-node)
+        # Pulls in the `net` feature because the e2e suite uses
+        # `MeshNode` + `MeshNodeConfig` for the real-wire NKpsk0
+        # handshake. The `redex` feature is the actual gate (the
+        # tests are `#![cfg(feature = "redex")]`).
+        run: cargo test --test redex_replication_e2e --features "redex net"
+      - name: RedEX replication DST (deterministic simulation)
+        # Single-threaded harness; doesn't need `net` — runs the
+        # production state machine + election + catch-up + tracker
+        # logic against virtual nodes with explicit clock + message
+        # queue + partition matrix.
+        run: cargo test --test redex_replication_dst --features redex
+
+      # === CortEX =========================================================
+      - name: CortEX adapter integration
+        run: cargo test --test integration_cortex_adapter --features cortex
+      - name: CortEX tasks integration
+        run: cargo test --test integration_cortex_tasks --features cortex
+      - name: CortEX memories integration
+        run: cargo test --test integration_cortex_memories --features cortex
+      - name: CortEX RYW global cap
+        run: cargo test --test cortex_ryw_global_cap --features cortex
+
+      # === NetDB ==========================================================
+      - name: NetDB integration
+        run: cargo test --test integration_netdb --features netdb
+
+      # === nRPC ===========================================================
+      - name: nRPC inbound dispatcher
+        run: cargo test --test nrpc_inbound_dispatcher --features net
+      - name: nRPC queue-group dispatch
+        run: cargo test --test queue_group_dispatch --features net
       - name: nRPC loopback
         run: cargo test --test integration_nrpc_loopback --features cortex
       - name: nRPC mesh
@@ -177,10 +187,24 @@ jobs:
         run: cargo test --test integration_nrpc_streaming --features cortex
       - name: nRPC service discovery
         run: cargo test --test integration_nrpc_service_discovery --features cortex
-      - name: CortEX RYW global cap
-        run: cargo test --test cortex_ryw_global_cap --features cortex
+      - name: nRPC predicate-header integration
+        run: cargo test --test integration_nrpc_predicate_header --features cortex
       - name: nRPC cross-lang
         run: cargo test --test integration_nrpc_cross_lang --features cortex
+
+      # === Dataforts ======================================================
+      - name: Dataforts net-blob CLI tests
+        run: cargo test --test net_blob_cli --features dataforts,cli
+      - name: Dataforts blob e2e (multi-node + migration)
+        # The blob e2e suite includes the 3-node parallel migration
+        # scenario in `three_node_parallel_migration_lands_blob_on_two_peers`.
+        # `redex-disk` is required so MeshBlobAdapter can spin up a
+        # real on-disk RedEX per node.
+        run: cargo test --test dataforts_blob_e2e --features dataforts,redex-disk
+      - name: Dataforts greedy e2e (cache + speculative pull)
+        run: cargo test --test dataforts_greedy_e2e --features dataforts
+      - name: Dataforts gravity e2e
+        run: cargo test --test dataforts_gravity_e2e --features dataforts
 
   loom-tests:
     name: Loom concurrency models
