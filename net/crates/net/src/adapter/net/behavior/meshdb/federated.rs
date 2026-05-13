@@ -1,12 +1,14 @@
 //! `FederatedMeshQueryExecutor` — fans out atomic operators to
 //! remote `target_nodes` over a pluggable [`MeshDbTransport`].
 //!
-//! Phase B-4 lands the cross-node executor + a [`LoopbackTransport`]
-//! for in-process integration testing. The real subprotocol
-//! wiring (registering the `SUBPROTOCOL_MESHDB` handler on the
-//! mesh, framing requests + responses on the wire) lands when a
-//! concrete consumer (Hermes telemetry / Deck metrics) drives
-//! the final shape.
+//! Two transport impls ship in v0.16: the in-process
+//! [`LoopbackTransport`] for substrate-side integration tests,
+//! and the real-wire
+//! [`MeshDbWireTransport`](super::transport::MeshDbWireTransport)
+//! that rides `SUBPROTOCOL_MESHDB` on the mesh's existing
+//! encrypted Net session. Call
+//! [`enable_meshdb_on_mesh`](super::transport::enable_meshdb_on_mesh)
+//! to install the dispatcher + transport on a live `MeshNode`.
 //!
 //! # Routing
 //!

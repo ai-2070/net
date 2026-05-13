@@ -61,7 +61,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use futures::stream::Stream;
@@ -629,6 +629,77 @@ async fn run_server_call(
     let _ = sender
         .send_frame(peer, MeshDbFrame::Response(MeshDbResponse::End { call_id }))
         .await;
+}
+
+// =============================================================================
+// MeshNode integration
+// =============================================================================
+
+/// [`MeshDbWireSender`] backed by a live `MeshNode`. Resolves
+/// `target_node → SocketAddr` via the mesh's peer table and ships
+/// the encoded frame as a single `SUBPROTOCOL_MESHDB` event via
+/// [`MeshNode::send_subprotocol`].
+///
+/// Holds the mesh as `Weak` to avoid a reference cycle —
+/// `MeshNode` owns the dispatcher (via the inbound-router slot)
+/// which owns the dispatcher's sender; making the back-link strong
+/// would leak both forever.
+pub struct MeshNodeMeshDbSender {
+    mesh: Weak<crate::adapter::net::MeshNode>,
+}
+
+impl MeshNodeMeshDbSender {
+    /// Construct from a strong reference; the sender holds Weak.
+    pub fn new(mesh: &Arc<crate::adapter::net::MeshNode>) -> Self {
+        Self {
+            mesh: Arc::downgrade(mesh),
+        }
+    }
+}
+
+#[async_trait]
+impl MeshDbWireSender for MeshNodeMeshDbSender {
+    async fn send_frame(
+        &self,
+        target_node: u64,
+        frame: MeshDbFrame,
+    ) -> Result<(), TransportError> {
+        let mesh = self
+            .mesh
+            .upgrade()
+            .ok_or_else(|| TransportError::Other("mesh node dropped".into()))?;
+        let peer_addr = mesh
+            .peer_addr(target_node)
+            .ok_or(TransportError::NoRoute(target_node))?;
+        let bytes = frame
+            .encode()
+            .map_err(|e| TransportError::Other(format!("frame encode: {e}")))?;
+        mesh.send_subprotocol(peer_addr, super::protocol::SUBPROTOCOL_MESHDB, &bytes)
+            .await
+            .map_err(|e| TransportError::Other(e.to_string()))
+    }
+}
+
+/// Install MeshDB wire-protocol handling on `mesh` and return the
+/// pair of (dispatcher, transport). The transport is what the
+/// federated executor speaks; the dispatcher is what the mesh's
+/// inbound dispatch loop calls.
+///
+/// Caller-only nodes leave `server` as `None`. Nodes that
+/// answer remote queries pass `Some(MeshDbServer::new(executor))`.
+///
+/// Idempotent — calling twice replaces the previously-installed
+/// router on `mesh`.
+pub fn enable_meshdb_on_mesh(
+    mesh: &Arc<crate::adapter::net::MeshNode>,
+    server: Option<Arc<MeshDbServer>>,
+) -> (Arc<MeshDbWireDispatcher>, Arc<MeshDbWireTransport>) {
+    let sender = Arc::new(MeshNodeMeshDbSender::new(mesh));
+    let dispatcher = Arc::new(MeshDbWireDispatcher::new(sender));
+    dispatcher.set_server(server);
+    let transport = dispatcher.transport();
+    mesh.set_meshdb_inbound_router(Some(dispatcher.clone() as Arc<dyn MeshDbInboundRouter>));
+    (dispatcher, transport)
 }
 
 #[cfg(test)]

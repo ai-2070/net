@@ -29,14 +29,21 @@
 //!   in Phase B-4.
 //! - [`protocol`] — `MeshDbRequest` / `MeshDbResponse` wire
 //!   envelopes + `SUBPROTOCOL_MESHDB` slot + the streaming
-//!   `ResultBatch` + opaque `ContinuationToken`. Phase B-3
-//!   pins the wire format; Phase B-4 plugs it into the mesh's
-//!   subprotocol dispatch + a `FederatedMeshQueryExecutor`.
+//!   `ResultBatch` + opaque `ContinuationToken` + the unified
+//!   [`protocol::MeshDbFrame`] tag the wire dispatcher demuxes
+//!   on.
 //! - [`federated`] — `FederatedMeshQueryExecutor<T:
 //!   MeshDbTransport>` fans atomic operators out to remote
 //!   `target_nodes` via a pluggable transport, with
 //!   proximity-ordered failover. `LoopbackTransport` drives
 //!   in-process 3-node integration tests without a real wire.
+//! - [`transport`] — real-wire hookup. `MeshDbWireDispatcher`
+//!   implements [`MeshDbInboundRouter`](transport::MeshDbInboundRouter)
+//!   for the mesh's `SUBPROTOCOL_MESHDB` dispatch arm;
+//!   [`MeshDbServer`](transport::MeshDbServer) drives the
+//!   server-side executor + streams responses back via the
+//!   sender. [`enable_meshdb_on_mesh`](transport::enable_meshdb_on_mesh)
+//!   plumbs everything onto a live `MeshNode`.
 //!
 //! # AST versioning (locked decision #1)
 //!
@@ -99,9 +106,9 @@ pub use protocol::{
     ContinuationToken, MeshDbFrame, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,
 };
 pub use transport::{
-    MeshDbInboundRouter, MeshDbRouteError, MeshDbServer, MeshDbWireDispatcher, MeshDbWireSender,
-    MeshDbWireTransport, MESHDB_RESPONSE_INBOX_CAPACITY, MESHDB_SERVER_BATCH_ROWS,
-    MESHDB_SERVER_OUTBOX_CAPACITY,
+    enable_meshdb_on_mesh, MeshDbInboundRouter, MeshDbRouteError, MeshDbServer,
+    MeshDbWireDispatcher, MeshDbWireSender, MeshDbWireTransport, MeshNodeMeshDbSender,
+    MESHDB_RESPONSE_INBOX_CAPACITY, MESHDB_SERVER_BATCH_ROWS, MESHDB_SERVER_OUTBOX_CAPACITY,
 };
 pub use query::{
     AggregateFn, AggregateRowPayload, AggregateValue, ChainRef, Expr, GroupKey, JoinKey, JoinKind,
