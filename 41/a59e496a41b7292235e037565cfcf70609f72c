@@ -1,0 +1,21 @@
+net/crates/net/tests/meshdb_subprotocol_wire.rs
+  s_ced434e69396ed::t_7aff84a4b3035b 23
+  s_ced434e69396ed::t_9046cfb989102f 273-332,339-340,371-374,376-381,386-411,413-414,420-498
+  s_ced434e69396ed::t_39149ac112625d 333-338,341-370,375,382-385,412,415-419
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "41a59e496a41b7292235e037565cfcf70609f72c",
+  "prompts": {},
+  "sessions": {
+    "s_ced434e69396ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "110b7060-6c04-4234-8a8c-573745ed066d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
