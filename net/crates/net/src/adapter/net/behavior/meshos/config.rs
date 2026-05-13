@@ -38,6 +38,10 @@ pub struct MeshOsConfig {
     /// fields in; the executor honors them once Phase G's
     /// `admit()` check lands.
     pub backpressure: BackpressureConfig,
+
+    /// Phase D — locality tuning (RTT thresholds, avoid-list
+    /// TTLs).
+    pub locality: LocalityConfig,
 }
 
 impl Default for MeshOsConfig {
@@ -48,6 +52,7 @@ impl Default for MeshOsConfig {
             event_queue_capacity: 1024,
             action_queue_capacity: 1024,
             backpressure: BackpressureConfig::default(),
+            locality: LocalityConfig::default(),
         }
     }
 }
@@ -89,6 +94,32 @@ impl Default for BackpressureConfig {
             replica_stabilization_window: Duration::from_secs(60),
             cluster_backpressure_threshold: 1000,
             cluster_backpressure_release: 200,
+        }
+    }
+}
+
+/// Phase D locality tunables. Default values come from the
+/// plan's locked decisions; operators override per-node.
+#[derive(Clone, Debug)]
+pub struct LocalityConfig {
+    /// RTT samples above this threshold flag the peer as
+    /// "degraded" and trigger a `MarkAvoid` action. Default
+    /// 250 ms — twice the heartbeat interval, so a peer whose
+    /// RTT is double the configured cadence is suspect.
+    pub degraded_rtt_threshold: Duration,
+
+    /// TTL applied to `MarkAvoid` actions emitted by Phase D
+    /// reconcile. Default 5 min — long enough to survive a
+    /// transient RTT spike, short enough that a recovered peer
+    /// gets re-evaluated.
+    pub avoid_ttl: Duration,
+}
+
+impl Default for LocalityConfig {
+    fn default() -> Self {
+        Self {
+            degraded_rtt_threshold: Duration::from_millis(250),
+            avoid_ttl: Duration::from_secs(5 * 60),
         }
     }
 }

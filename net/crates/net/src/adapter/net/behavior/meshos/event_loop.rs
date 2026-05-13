@@ -182,13 +182,21 @@ impl MeshOsLoop {
             MeshOsEvent::LocalReplicaIntent(update) => {
                 self.desired.apply_local_replica_intent(update)
             }
+            MeshOsEvent::AdminEvent(admin) => {
+                self.desired.apply_admin(admin, self.config.this_node);
+            }
             _ => {}
         }
         self.actual.apply(event);
     }
 
     async fn run_reconcile(&mut self) {
-        let actions = reconcile(&self.actual, &self.desired, self.config.this_node);
+        let actions = reconcile(
+            &self.actual,
+            &self.desired,
+            self.config.this_node,
+            &self.config.locality,
+        );
         self.reconcile_count += 1;
         let now = std::time::Instant::now();
         for action in actions {
@@ -220,6 +228,7 @@ pub(crate) fn fast_test_config() -> MeshOsConfig {
         event_queue_capacity: 64,
         action_queue_capacity: 64,
         backpressure: Default::default(),
+        locality: Default::default(),
     }
 }
 

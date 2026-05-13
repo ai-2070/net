@@ -222,9 +222,12 @@ impl MeshOsState {
     }
 
     fn apply_admin(&mut self, admin: &AdminEvent) {
-        // Phase A only mirrors the maintenance-state piece of
-        // the admin surface; the rest of the AdminEvent variants
-        // get handlers in Phase D / E.
+        // Phase A mirrored the maintenance-state arm; Phase D
+        // adds the avoid-list / cordon / drain handlers that
+        // don't need to ride DesiredState. The desired-state-
+        // side admin consequences (`DropReplicas`,
+        // `RestartAllDaemons`) are projected into DesiredState
+        // by the loop's `apply` path, not here.
         match admin {
             AdminEvent::EnterMaintenance { node, .. } => {
                 self.maintenance
@@ -233,6 +236,16 @@ impl MeshOsState {
             AdminEvent::ExitMaintenance { node } => {
                 self.maintenance
                     .insert(*node, MaintenanceMirror::ExitingMaintenance);
+            }
+            AdminEvent::ClearAvoidList { node: _ } => {
+                // The clear is unconditional on this node's
+                // fold — the admin chain commit applies to the
+                // target node, and every other node simply
+                // observes the chain entry. The desired-state-
+                // side reset is handled by reconcile's
+                // idempotent re-emission of `MarkAvoid` if the
+                // RTT is still bad.
+                self.avoid_list.clear();
             }
             _ => {}
         }
@@ -299,6 +312,23 @@ impl DesiredState {
     pub fn apply_local_replica_intent(&mut self, update: &LocalReplicaIntentUpdate) {
         self.desired_local_replicas
             .insert(update.chain, update.intent);
+    }
+
+    /// Project an admin chain commit into desired-state changes.
+    /// Phase D handles `DropReplicas` (forces `LocalReplicaIntent::Drop`
+    /// on the named chains for the named node). Other admin
+    /// variants either ride [`MeshOsState`] (maintenance,
+    /// avoid-list clear) or park for Phase E (cordon, drain).
+    pub fn apply_admin(&mut self, admin: &AdminEvent, this_node: NodeId) {
+        if let AdminEvent::DropReplicas { node, chains } = admin {
+            if *node != this_node {
+                return;
+            }
+            for chain in chains {
+                self.desired_local_replicas
+                    .insert(*chain, LocalReplicaIntent::Drop);
+            }
+        }
     }
 }
 
@@ -378,6 +408,27 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.apply(&intent);
         assert_eq!(desired.desired_replicas.get(&42), Some(&3));
+    }
+
+    #[test]
+    fn admin_event_clear_avoid_list_drops_all_entries() {
+        let mut state = MeshOsState::default();
+        state.avoid_list.insert(
+            1,
+            AvoidEntry {
+                reason: "rtt".into(),
+                until: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        state.avoid_list.insert(
+            2,
+            AvoidEntry {
+                reason: "manual".into(),
+                until: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ClearAvoidList { node: 7 }));
+        assert!(state.avoid_list.is_empty());
     }
 
     #[test]

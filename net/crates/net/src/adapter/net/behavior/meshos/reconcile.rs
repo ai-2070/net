@@ -19,6 +19,7 @@
 use std::time::{Duration, Instant};
 
 use super::action::MeshOsAction;
+use super::config::LocalityConfig;
 use super::event::{ChainId, DaemonIntent, LocalReplicaIntent, NodeId};
 use super::state::{DaemonLifecycle, DaemonStatus, DesiredState, MeshOsState};
 
@@ -28,17 +29,19 @@ use super::state::{DaemonLifecycle, DaemonStatus, DesiredState, MeshOsState};
 /// terminates. Mirror of the plan's "graceful shutdown" section.
 pub const STOP_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
-/// Pure-sync diff over `(actual, desired, this_node)`. Returns
-/// the minimal action list that would close the gap.
+/// Pure-sync diff over `(actual, desired, this_node, locality)`.
+/// Returns the minimal action list that would close the gap.
 ///
 /// `this_node` is the loop's identity; reconcile reads it to
 /// gate the leader-only `Request*` action variants (only the
 /// elected leader of a chain may commit placement / eviction
-/// for that chain — locked decision #6).
+/// for that chain — locked decision #6). `locality` carries the
+/// Phase D tunables (degraded-RTT threshold + `MarkAvoid` TTL).
 pub fn reconcile(
     actual: &MeshOsState,
     desired: &DesiredState,
     this_node: NodeId,
+    locality: &LocalityConfig,
 ) -> Vec<MeshOsAction> {
     let mut actions = Vec::new();
     // The reconcile pass is a sync sample; we use the
@@ -50,6 +53,7 @@ pub fn reconcile(
     let now = actual.last_tick.unwrap_or_else(Instant::now);
     diff_daemons(actual, desired, now, &mut actions);
     diff_replicas(actual, desired, this_node, &mut actions);
+    diff_locality(actual, now, locality, &mut actions);
     actions
 }
 
@@ -189,6 +193,43 @@ fn pick_pull_source(actual: &MeshOsState, chain: ChainId, this_node: NodeId) -> 
         .min()
 }
 
+/// Phase D — locality diff. For each peer whose latest RTT
+/// exceeds `degraded_rtt_threshold` AND who isn't already on
+/// the avoid list, emit `MarkAvoid { peer, reason, ttl }`.
+///
+/// The "already on the avoid list" gate is what keeps reconcile
+/// idempotent — a peer with a persistently bad RTT produces one
+/// `MarkAvoid` action, not one per tick.
+fn diff_locality(
+    actual: &MeshOsState,
+    now: Instant,
+    locality: &LocalityConfig,
+    out: &mut Vec<MeshOsAction>,
+) {
+    let _ = now;
+    // Sort the peer list so action emission is byte-stable
+    // across calls regardless of HashMap iteration order.
+    let mut peers: Vec<(NodeId, Duration)> = actual
+        .rtt
+        .iter()
+        .filter(|(_, rtt)| **rtt > locality.degraded_rtt_threshold)
+        .map(|(peer, rtt)| (*peer, *rtt))
+        .collect();
+    peers.sort_by_key(|(peer, _)| *peer);
+    for (peer, rtt) in peers {
+        if actual.avoid_list.contains_key(&peer) {
+            // Already avoided — reconcile is idempotent, no
+            // duplicate emission.
+            continue;
+        }
+        out.push(MeshOsAction::MarkAvoid {
+            peer,
+            reason: format!("rtt-degradation: {} ms", rtt.as_millis()),
+            ttl: locality.avoid_ttl,
+        });
+    }
+}
+
 fn emit_backoff_record_if_needed(
     daemon: &super::event::DaemonRef,
     status: &DaemonStatus,
@@ -239,7 +280,7 @@ mod tests {
     fn reconcile_empty_inputs_returns_no_actions() {
         let actual = MeshOsState::default();
         let desired = DesiredState::default();
-        assert!(reconcile(&actual, &desired, THIS_NODE).is_empty());
+        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
     }
 
     #[test]
@@ -248,8 +289,8 @@ mod tests {
         // replay-with-no-side-effect. Pin it explicitly.
         let actual = MeshOsState::default();
         let desired = DesiredState::default();
-        let first = reconcile(&actual, &desired, THIS_NODE);
-        let second = reconcile(&actual, &desired, THIS_NODE);
+        let first = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let second = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         assert_eq!(first, second);
     }
 
@@ -276,7 +317,7 @@ mod tests {
             },
         );
         let desired = DesiredState::default();
-        assert!(reconcile(&actual, &desired, THIS_NODE).is_empty());
+        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
     }
 
     #[test]
@@ -287,7 +328,7 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
 
-        let actions = reconcile(&actual, &desired, THIS_NODE);
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         assert_eq!(
             actions,
             vec![MeshOsAction::StartDaemon { daemon: d }],
@@ -303,7 +344,7 @@ mod tests {
         let mut desired = DesiredState::default();
         let d = daemon("telemetry", 1);
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
-        let actions = reconcile(&actual, &desired, THIS_NODE);
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         assert_eq!(actions, vec![MeshOsAction::StartDaemon { daemon: d }]);
     }
 
@@ -316,7 +357,7 @@ mod tests {
         actual.daemons.insert(d.clone(), status);
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d, DaemonIntent::Run);
-        assert!(reconcile(&actual, &desired, THIS_NODE).is_empty());
+        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
     }
 
     #[test]
@@ -331,7 +372,7 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Stop);
 
-        let actions = reconcile(&actual, &desired, THIS_NODE);
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         match actions.as_slice() {
             [MeshOsAction::StopDaemon {
                 daemon: d2,
@@ -352,7 +393,7 @@ mod tests {
         actual.daemons.insert(d.clone(), DaemonStatus::default());
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d, DaemonIntent::Stop);
-        assert!(reconcile(&actual, &desired, THIS_NODE).is_empty());
+        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
     }
 
     #[test]
@@ -372,7 +413,7 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
 
-        let actions = reconcile(&actual, &desired, THIS_NODE);
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         match actions.as_slice() {
             [MeshOsAction::ApplyBackoff {
                 daemon: d2,
@@ -400,7 +441,7 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
 
-        let actions = reconcile(&actual, &desired, THIS_NODE);
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         assert_eq!(actions, vec![MeshOsAction::StartDaemon { daemon: d }]);
     }
 
@@ -419,7 +460,7 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
 
-        let actions = reconcile(&actual, &desired, THIS_NODE);
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         match actions.as_slice() {
             [MeshOsAction::ApplyBackoff { daemon: d2, .. }] => assert_eq!(d2, &d),
             other => panic!("expected ApplyBackoff under crash-loop gate, got {other:?}"),
@@ -442,8 +483,8 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d1, DaemonIntent::Run);
         desired.desired_daemons.insert(d2, DaemonIntent::Run);
-        let a = reconcile(&actual, &desired, THIS_NODE);
-        let b = reconcile(&actual, &desired, THIS_NODE);
+        let a = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let b = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         assert_eq!(a, b);
         assert_eq!(a.len(), 2);
     }
@@ -462,7 +503,7 @@ mod tests {
         desired
             .desired_local_replicas
             .insert(CHAIN_A, LocalReplicaIntent::Hold);
-        let actions = reconcile(&actual, &desired, THIS_NODE);
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         assert_eq!(
             actions,
             vec![MeshOsAction::PullReplica {
@@ -480,7 +521,7 @@ mod tests {
         desired
             .desired_local_replicas
             .insert(CHAIN_A, LocalReplicaIntent::Hold);
-        assert!(reconcile(&actual, &desired, THIS_NODE).is_empty());
+        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
     }
 
     #[test]
@@ -491,7 +532,7 @@ mod tests {
         desired
             .desired_local_replicas
             .insert(CHAIN_A, LocalReplicaIntent::Drop);
-        let actions = reconcile(&actual, &desired, THIS_NODE);
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         assert_eq!(actions, vec![MeshOsAction::DropReplica { chain: CHAIN_A }]);
     }
 
@@ -503,7 +544,7 @@ mod tests {
         desired
             .desired_local_replicas
             .insert(CHAIN_A, LocalReplicaIntent::Drop);
-        assert!(reconcile(&actual, &desired, THIS_NODE).is_empty());
+        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
     }
 
     #[test]
@@ -517,7 +558,7 @@ mod tests {
         desired
             .desired_local_replicas
             .insert(CHAIN_A, LocalReplicaIntent::Hold);
-        assert!(reconcile(&actual, &desired, THIS_NODE).is_empty());
+        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
     }
 
     #[test]
@@ -527,7 +568,7 @@ mod tests {
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 4);
-        let actions = reconcile(&actual, &desired, THIS_NODE);
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         assert_eq!(
             actions,
             vec![MeshOsAction::RequestPlacement {
@@ -544,7 +585,7 @@ mod tests {
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 2);
-        let actions = reconcile(&actual, &desired, THIS_NODE);
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         // Naive Phase C-1 victim selection: lex-smallest holder.
         assert_eq!(
             actions,
@@ -562,7 +603,7 @@ mod tests {
         actual.replica_leader.insert(CHAIN_A, 999); // someone else is leader
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 4);
-        assert!(reconcile(&actual, &desired, THIS_NODE).is_empty());
+        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
     }
 
     #[test]
@@ -574,7 +615,7 @@ mod tests {
         actual.replicas.insert(CHAIN_A, vec![1]);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 3);
-        assert!(reconcile(&actual, &desired, THIS_NODE).is_empty());
+        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
     }
 
     #[test]
@@ -584,7 +625,137 @@ mod tests {
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 3);
-        assert!(reconcile(&actual, &desired, THIS_NODE).is_empty());
+        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+    }
+
+    // ----- Phase D: locality + admin events -----
+
+    #[test]
+    fn rtt_above_threshold_emits_mark_avoid_once() {
+        let mut actual = MeshOsState::default();
+        actual.rtt.insert(42, Duration::from_millis(500));
+        // Default LocalityConfig threshold is 250 ms; 500 ms
+        // exceeds → MarkAvoid emitted.
+        let desired = DesiredState::default();
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        match actions.as_slice() {
+            [MeshOsAction::MarkAvoid { peer, ttl, .. }] => {
+                assert_eq!(*peer, 42);
+                assert_eq!(*ttl, LocalityConfig::default().avoid_ttl);
+            }
+            other => panic!("expected one MarkAvoid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rtt_below_threshold_emits_nothing() {
+        let mut actual = MeshOsState::default();
+        actual.rtt.insert(42, Duration::from_millis(100));
+        let desired = DesiredState::default();
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn mark_avoid_is_idempotent_when_peer_already_on_avoid_list() {
+        let mut actual = MeshOsState::default();
+        actual.rtt.insert(42, Duration::from_millis(500));
+        actual.avoid_list.insert(
+            42,
+            AvoidEntry {
+                reason: "earlier".into(),
+                until: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        let desired = DesiredState::default();
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        assert!(
+            actions.is_empty(),
+            "MarkAvoid duplicated for already-avoided peer: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn mark_avoid_emission_is_sorted_by_peer_id_for_stability() {
+        let mut actual = MeshOsState::default();
+        actual.rtt.insert(7, Duration::from_millis(500));
+        actual.rtt.insert(3, Duration::from_millis(500));
+        actual.rtt.insert(11, Duration::from_millis(500));
+        let desired = DesiredState::default();
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let peers: Vec<NodeId> = actions
+            .iter()
+            .map(|a| match a {
+                MeshOsAction::MarkAvoid { peer, .. } => *peer,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(peers, vec![3, 7, 11]);
+    }
+
+    #[test]
+    fn drop_replicas_admin_event_projects_into_drop_intent() {
+        // Apply the admin event via DesiredState::apply_admin
+        // (mirrors what the loop does). Then reconcile should
+        // emit DropReplica for each chain THIS_NODE currently
+        // holds.
+        let mut actual = MeshOsState::default();
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE, 1]);
+        actual.replicas.insert(CHAIN_B, vec![THIS_NODE]);
+
+        let mut desired = DesiredState::default();
+        desired.apply_admin(
+            &super::super::event::AdminEvent::DropReplicas {
+                node: THIS_NODE,
+                chains: vec![CHAIN_A, CHAIN_B],
+            },
+            THIS_NODE,
+        );
+
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        // Two DropReplica actions, sorted by chain id.
+        assert_eq!(
+            actions,
+            vec![
+                MeshOsAction::DropReplica { chain: CHAIN_A },
+                MeshOsAction::DropReplica { chain: CHAIN_B },
+            ],
+        );
+    }
+
+    #[test]
+    fn drop_replicas_admin_event_targeted_at_other_node_is_a_noop_locally() {
+        let mut actual = MeshOsState::default();
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE, 1]);
+        let mut desired = DesiredState::default();
+        desired.apply_admin(
+            &super::super::event::AdminEvent::DropReplicas {
+                node: 999, // not this node
+                chains: vec![CHAIN_A],
+            },
+            THIS_NODE,
+        );
+        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn custom_locality_threshold_overrides_default() {
+        let mut actual = MeshOsState::default();
+        actual.rtt.insert(42, Duration::from_millis(150));
+        // Custom threshold of 100 ms — 150 ms now degrades.
+        let locality = LocalityConfig {
+            degraded_rtt_threshold: Duration::from_millis(100),
+            avoid_ttl: Duration::from_secs(60),
+        };
+        let desired = DesiredState::default();
+        let actions = reconcile(&actual, &desired, THIS_NODE, &locality);
+        match actions.as_slice() {
+            [MeshOsAction::MarkAvoid { peer, ttl, .. }] => {
+                assert_eq!(*peer, 42);
+                assert_eq!(*ttl, Duration::from_secs(60));
+            }
+            other => panic!("expected one MarkAvoid under tightened threshold, got {other:?}"),
+        }
     }
 
     #[test]
@@ -600,7 +771,7 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 3);
         desired.desired_replicas.insert(CHAIN_B, 3);
-        let actions = reconcile(&actual, &desired, THIS_NODE);
+        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
         // Two RequestPlacement, in chain-id order (A < B).
         assert_eq!(actions.len(), 2);
         match (&actions[0], &actions[1]) {

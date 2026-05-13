@@ -59,7 +59,7 @@ pub mod state;
 pub mod supervision;
 
 pub use action::{ActionId, AllocateActionId, MaintenanceTransition, MeshOsAction, PendingAction};
-pub use config::{BackpressureConfig, MeshOsConfig};
+pub use config::{BackpressureConfig, LocalityConfig, MeshOsConfig};
 pub use control::MeshOsControl;
 pub use event::{
     AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,
