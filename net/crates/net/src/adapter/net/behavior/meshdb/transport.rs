@@ -343,12 +343,26 @@ impl MeshDbTransport for MeshDbWireTransport {
         // could ship msg back before our caller-table entry is
         // visible and the response would be dropped as
         // UnknownCallId.
-        self.inflight.write().insert(
+        let prev = self.inflight.write().insert(
             call_id,
             InflightCaller {
                 tx,
                 target_node: node,
             },
+        );
+        // `call_id`s come from the process-global
+        // `FEDERATED_CALL_ID_COUNTER`, so a collision means either
+        // (a) someone hand-rolled a request bypassing the counter,
+        // or (b) the same call_id reached `send` twice (e.g. a
+        // retry that recycled the id). Both are bugs in the layer
+        // above us; debug_assert so the test suite catches them
+        // without paying a release-build cost. Release builds keep
+        // the latest-wins behaviour rather than rejecting — the
+        // earlier caller would otherwise hang forever on a stale
+        // tx that no one drains.
+        debug_assert!(
+            prev.is_none(),
+            "duplicate inflight call_id={call_id:#x}; previous caller silently overwritten",
         );
         let send_result = self
             .sender
