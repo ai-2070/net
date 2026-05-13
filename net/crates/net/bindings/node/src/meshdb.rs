@@ -47,8 +47,16 @@ use net::adapter::net::behavior::meshdb::{
         ChainReader as InnerChainReader, ExecuteOptions as InnerExecuteOptions,
         LocalMeshQueryExecutor, MeshQueryExecutor,
     },
-    planner::{CostEstimate, OperatorNode, OperatorPlan},
-    query::ResultRow as InnerResultRow,
+    planner::{
+        CostEstimate, JoinKeyMode, JoinStrategy, OperatorNode, OperatorPlan,
+    },
+    query::{
+        AggregateRowPayload as InnerAggregateRowPayload,
+        AggregateValue as InnerAggregateValue, GroupKey as InnerGroupKey,
+        JoinKind as InnerJoinKind, JoinedRowPayload as InnerJoinedRowPayload,
+        NumericAggregateKind, NumericReductionKind, ResultRow as InnerResultRow,
+        WindowBoundary as InnerWindowBoundary, WindowSpec,
+    },
     ExecutionPlan, SeqNum,
 };
 
@@ -59,40 +67,164 @@ use crate::common::bigint_u64;
 /// `originHash` is the 16-hex chain identifier; `seq` is the
 /// per-chain monotonic sequence; `payload` is opaque bytes
 /// (event body for plain reads, or a postcard-encoded envelope
-/// for aggregate / join / window sentinel rows — slice 2 adds
-/// the decoder methods).
-#[napi]
-#[derive(Clone)]
+/// for aggregate / join / window sentinel rows — see the
+/// `decodeAggregate` / `decodeJoined` / `decodeWindow`
+/// module-level helpers).
+///
+/// Plain object (not a class) so it can be nested inside
+/// `WindowBoundary.rows` / `JoinedRow.left` etc. without the
+/// `Vec<ResultRow>` marshalling restriction that
+/// `#[napi]` classes carry.
+#[napi(object)]
 pub struct ResultRow {
-    origin: u64,
-    seq: u64,
-    payload: Vec<u8>,
+    #[napi(js_name = "originHash")]
+    pub origin_hash: BigInt,
+    pub seq: BigInt,
+    pub payload: Buffer,
 }
 
-#[napi]
-impl ResultRow {
-    #[napi(getter, js_name = "originHash")]
-    pub fn origin_hash(&self) -> BigInt {
-        BigInt::from(self.origin)
-    }
+/// Try to decode `row.payload` as an aggregate payload.
+/// Returns `null` for rows that aren't aggregate sentinels.
+#[napi(js_name = "decodeAggregate")]
+pub fn decode_aggregate(row: ResultRow) -> Option<AggregateResult> {
+    let p: InnerAggregateRowPayload = postcard::from_bytes(&row.payload).ok()?;
+    Some(aggregate_result_from(p))
+}
 
-    #[napi(getter)]
-    pub fn seq(&self) -> BigInt {
-        BigInt::from(self.seq)
-    }
+/// Try to decode `row.payload` as a joined-row payload.
+/// Returns `null` when the bytes don't deserialize as a
+/// JoinedRow.
+#[napi(js_name = "decodeJoined")]
+pub fn decode_joined(row: ResultRow) -> Option<JoinedRow> {
+    let p: InnerJoinedRowPayload = postcard::from_bytes(&row.payload).ok()?;
+    Some(joined_row_from(p))
+}
 
-    #[napi(getter)]
-    pub fn payload(&self) -> Buffer {
-        Buffer::from(self.payload.clone())
+/// Try to decode `row.payload` as a window bucket. Returns
+/// `null` when the bytes don't deserialize as a
+/// WindowBoundary.
+#[napi(js_name = "decodeWindow")]
+pub fn decode_window(row: ResultRow) -> Option<WindowBoundary> {
+    let b: InnerWindowBoundary = postcard::from_bytes(&row.payload).ok()?;
+    Some(window_boundary_from(b))
+}
+
+/// Decoded aggregate-row payload (slice 2 decoder).
+///
+/// `kind` is one of `"count"` / `"sum"` / `"avg"` / `"min"` /
+/// `"max"` / `"distinct_count"` / `"percentile"`. `value` is the
+/// numeric output (always set for count / distinct_count;
+/// `null` for the others when the group held no numeric rows).
+/// `count` mirrors `value` as a BigInt for the count-flavored
+/// kinds so callers don't have to coerce floats.
+#[napi(object)]
+pub struct AggregateResult {
+    pub group: Option<GroupKey>,
+    pub kind: String,
+    pub value: Option<f64>,
+    pub count: Option<BigInt>,
+}
+
+/// Group-key identifier carried inside an `AggregateResult`.
+/// `kind` is `"origin"` / `"seq"` / `"origin_seq"`; the
+/// populated field(s) match the kind.
+#[napi(object)]
+pub struct GroupKey {
+    pub kind: String,
+    #[napi(js_name = "originHash")]
+    pub origin_hash: Option<BigInt>,
+    pub seq: Option<BigInt>,
+}
+
+/// Decoded join-row payload (slice 2 decoder). Either side is
+/// `null` for outer-join unmatched rows; inner-join rows have
+/// both populated.
+#[napi(object)]
+pub struct JoinedRow {
+    pub left: Option<ResultRow>,
+    pub right: Option<ResultRow>,
+}
+
+/// Decoded window-bucket payload (slice 2 decoder). `start`
+/// and `end` are the bucket's seq bounds (half-open); `rows`
+/// is the list of rows that fell in the bucket, in seq-asc
+/// order.
+#[napi(object)]
+pub struct WindowBoundary {
+    pub start: BigInt,
+    pub end: BigInt,
+    pub rows: Vec<ResultRow>,
+}
+
+fn aggregate_result_from(p: InnerAggregateRowPayload) -> AggregateResult {
+    let group = p.group.map(group_key_from);
+    let (kind, value, count) = match p.value {
+        InnerAggregateValue::Count(c) => {
+            ("count".to_string(), Some(c as f64), Some(BigInt::from(c)))
+        }
+        InnerAggregateValue::Sum(s) => ("sum".to_string(), Some(s), None),
+        InnerAggregateValue::Avg(opt) => ("avg".to_string(), opt, None),
+        InnerAggregateValue::Min(opt) => ("min".to_string(), opt, None),
+        InnerAggregateValue::Max(opt) => ("max".to_string(), opt, None),
+        InnerAggregateValue::DistinctCount(c) => (
+            "distinct_count".to_string(),
+            Some(c as f64),
+            Some(BigInt::from(c)),
+        ),
+        InnerAggregateValue::Percentile(opt) => ("percentile".to_string(), opt, None),
+        // AggregateValue is #[non_exhaustive] — future variants
+        // surface as `"unknown"` so wire round-trip works.
+        _ => ("unknown".to_string(), None, None),
+    };
+    AggregateResult {
+        group,
+        kind,
+        value,
+        count,
+    }
+}
+
+fn group_key_from(g: InnerGroupKey) -> GroupKey {
+    match g {
+        InnerGroupKey::Origin(o) => GroupKey {
+            kind: "origin".to_string(),
+            origin_hash: Some(BigInt::from(o)),
+            seq: None,
+        },
+        InnerGroupKey::Seq(s) => GroupKey {
+            kind: "seq".to_string(),
+            origin_hash: None,
+            seq: Some(BigInt::from(s.0)),
+        },
+        InnerGroupKey::OriginSeq { origin, seq } => GroupKey {
+            kind: "origin_seq".to_string(),
+            origin_hash: Some(BigInt::from(origin)),
+            seq: Some(BigInt::from(seq.0)),
+        },
+    }
+}
+
+fn joined_row_from(p: InnerJoinedRowPayload) -> JoinedRow {
+    JoinedRow {
+        left: p.left.map(ResultRow::from),
+        right: p.right.map(ResultRow::from),
+    }
+}
+
+fn window_boundary_from(b: InnerWindowBoundary) -> WindowBoundary {
+    WindowBoundary {
+        start: BigInt::from(b.start.0),
+        end: BigInt::from(b.end.0),
+        rows: b.rows.into_iter().map(ResultRow::from).collect(),
     }
 }
 
 impl From<InnerResultRow> for ResultRow {
     fn from(r: InnerResultRow) -> Self {
         Self {
-            origin: r.origin,
-            seq: r.seq.0,
-            payload: r.payload,
+            origin_hash: BigInt::from(r.origin),
+            seq: BigInt::from(r.seq.0),
+            payload: Buffer::from(r.payload),
         }
     }
 }
@@ -236,6 +368,247 @@ impl MeshQuery {
         Ok(Self {
             plan: plan_of(OperatorPlan::LatestRead { origin }),
         })
+    }
+
+    /// Tumbling window on `seq` with the given bucket `size`.
+    /// Emits one sentinel row per non-empty bucket; decode via
+    /// `ResultRow.decodeWindow()`.
+    #[napi(factory)]
+    pub fn window(inner: &MeshQuery, size: BigInt) -> Result<Self> {
+        let size = bigint_u64(size)?;
+        if size == 0 {
+            return Err(mesh_err("window: size must be >= 1".to_string()));
+        }
+        Ok(Self {
+            plan: plan_of(OperatorPlan::Window {
+                input: Box::new(inner.plan.root.clone()),
+                spec: WindowSpec::TumblingSeq { size },
+            }),
+        })
+    }
+
+    /// Count rows. `groupBy` is an optional list of row-
+    /// intrinsic field names: `null` / `[]` = single bucket;
+    /// `["origin"]`, `["seq"]`, or `["origin", "seq"]` for
+    /// per-group counts.
+    #[napi(factory)]
+    pub fn count(inner: &MeshQuery, group_by: Option<Vec<String>>) -> Result<Self> {
+        let group_by = parse_group_by(group_by)?;
+        Ok(Self {
+            plan: plan_of(OperatorPlan::AggregateCount {
+                input: Box::new(inner.plan.root.clone()),
+                group_by,
+            }),
+        })
+    }
+
+    /// Sum of a numeric field across rows. `field` is a row-
+    /// intrinsic name (`origin` / `seq`) or a dotted JSON path.
+    #[napi(factory)]
+    pub fn sum(
+        inner: &MeshQuery,
+        field: String,
+        group_by: Option<Vec<String>>,
+    ) -> Result<Self> {
+        Self::numeric_agg(inner, field, NumericAggregateKind::Sum, group_by)
+    }
+
+    /// Arithmetic mean. Rows where the field is missing /
+    /// non-numeric are excluded from both numerator + denom.
+    #[napi(factory)]
+    pub fn avg(
+        inner: &MeshQuery,
+        field: String,
+        group_by: Option<Vec<String>>,
+    ) -> Result<Self> {
+        Self::numeric_agg(inner, field, NumericAggregateKind::Avg, group_by)
+    }
+
+    /// Minimum value of a numeric field.
+    #[napi(factory)]
+    pub fn min(
+        inner: &MeshQuery,
+        field: String,
+        group_by: Option<Vec<String>>,
+    ) -> Result<Self> {
+        Self::reduction(inner, field, NumericReductionKind::Min, group_by)
+    }
+
+    /// Maximum value of a numeric field.
+    #[napi(factory)]
+    pub fn max(
+        inner: &MeshQuery,
+        field: String,
+        group_by: Option<Vec<String>>,
+    ) -> Result<Self> {
+        Self::reduction(inner, field, NumericReductionKind::Max, group_by)
+    }
+
+    /// Nearest-rank exact percentile at `p ∈ [0.0, 1.0]`. Same
+    /// field-extraction semantics as the numeric aggregates.
+    #[napi(factory)]
+    pub fn percentile(
+        inner: &MeshQuery,
+        field: String,
+        p: f64,
+        group_by: Option<Vec<String>>,
+    ) -> Result<Self> {
+        if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+            return Err(mesh_err(format!(
+                "percentile: p must be in [0.0, 1.0], got {p}"
+            )));
+        }
+        Self::reduction(inner, field, NumericReductionKind::Percentile { p }, group_by)
+    }
+
+    /// Exact distinct count over the canonical string
+    /// projection of a row-intrinsic / JSON field.
+    #[napi(factory, js_name = "distinctCount")]
+    pub fn distinct_count(
+        inner: &MeshQuery,
+        field: String,
+        group_by: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let group_by = parse_group_by(group_by)?;
+        Ok(Self {
+            plan: plan_of(OperatorPlan::AggregateDistinct {
+                input: Box::new(inner.plan.root.clone()),
+                group_by,
+                field_path: field,
+            }),
+        })
+    }
+
+    /// Inner / outer hash- or sort-merge-join. `kind` is one of
+    /// `"inner"` / `"left_outer"` / `"right_outer"` /
+    /// `"full_outer"`. `key` is the field name both sides share
+    /// — row-intrinsic names (`origin` / `seq` / `origin,seq`)
+    /// map to the typed enum; anything else is treated as a
+    /// JSON payload path. `strategy` defaults to
+    /// `"hash_broadcast"` (alternatives: `"sort_merge"`).
+    /// `watermarkSecs` is informational under snapshot
+    /// semantics.
+    #[napi(factory)]
+    pub fn join(
+        left: &MeshQuery,
+        right: &MeshQuery,
+        kind: String,
+        key: String,
+        strategy: Option<String>,
+        watermark_secs: Option<f64>,
+    ) -> Result<Self> {
+        let kind = parse_join_kind(&kind)?;
+        let strategy = parse_join_strategy(strategy.as_deref())?;
+        let key_mode = match key.as_str() {
+            "origin" => JoinKeyMode::Origin,
+            "seq" => JoinKeyMode::Seq,
+            "origin,seq" | "origin+seq" => JoinKeyMode::OriginSeq,
+            other => JoinKeyMode::Field(other.to_string()),
+        };
+        let watermark = {
+            let secs = watermark_secs.unwrap_or(5.0);
+            if secs.is_finite() && secs >= 0.0 {
+                std::time::Duration::from_secs_f64(secs)
+            } else {
+                std::time::Duration::from_secs(5)
+            }
+        };
+        Ok(Self {
+            plan: plan_of(OperatorPlan::HashJoin {
+                left: Box::new(left.plan.root.clone()),
+                right: Box::new(right.plan.root.clone()),
+                key_mode,
+                kind,
+                strategy,
+                watermark,
+            }),
+        })
+    }
+}
+
+impl MeshQuery {
+    fn numeric_agg(
+        inner: &MeshQuery,
+        field: String,
+        kind: NumericAggregateKind,
+        group_by: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let group_by = parse_group_by(group_by)?;
+        Ok(Self {
+            plan: plan_of(OperatorPlan::AggregateNumeric {
+                input: Box::new(inner.plan.root.clone()),
+                group_by,
+                field_path: field,
+                kind,
+            }),
+        })
+    }
+
+    fn reduction(
+        inner: &MeshQuery,
+        field: String,
+        kind: NumericReductionKind,
+        group_by: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let group_by = parse_group_by(group_by)?;
+        Ok(Self {
+            plan: plan_of(OperatorPlan::AggregateReduction {
+                input: Box::new(inner.plan.root.clone()),
+                group_by,
+                field_path: field,
+                kind,
+            }),
+        })
+    }
+}
+
+fn parse_group_by(group_by: Option<Vec<String>>) -> Result<Option<JoinKeyMode>> {
+    let Some(group_by) = group_by else {
+        return Ok(None);
+    };
+    if group_by.is_empty() {
+        return Ok(None);
+    }
+    if group_by.len() == 1 {
+        return match group_by[0].as_str() {
+            "origin" => Ok(Some(JoinKeyMode::Origin)),
+            "seq" => Ok(Some(JoinKeyMode::Seq)),
+            other => Err(mesh_err(format!(
+                "groupBy field '{other}' is not a row-intrinsic key; only 'origin' / 'seq' supported"
+            ))),
+        };
+    }
+    if group_by.len() == 2 {
+        let mut pair = [group_by[0].as_str(), group_by[1].as_str()];
+        pair.sort();
+        if pair == ["origin", "seq"] {
+            return Ok(Some(JoinKeyMode::OriginSeq));
+        }
+    }
+    Err(mesh_err(format!(
+        "groupBy shape {group_by:?} not supported; use [], ['origin'], ['seq'], or ['origin', 'seq']"
+    )))
+}
+
+fn parse_join_kind(s: &str) -> Result<InnerJoinKind> {
+    match s {
+        "inner" => Ok(InnerJoinKind::Inner),
+        "left_outer" => Ok(InnerJoinKind::LeftOuter),
+        "right_outer" => Ok(InnerJoinKind::RightOuter),
+        "full_outer" => Ok(InnerJoinKind::FullOuter),
+        other => Err(mesh_err(format!(
+            "join kind '{other}' not recognised; expected inner / left_outer / right_outer / full_outer"
+        ))),
+    }
+}
+
+fn parse_join_strategy(s: Option<&str>) -> Result<JoinStrategy> {
+    match s {
+        None | Some("hash_broadcast") => Ok(JoinStrategy::HashBroadcast),
+        Some("sort_merge") => Ok(JoinStrategy::SortMerge),
+        Some(other) => Err(mesh_err(format!(
+            "join strategy '{other}' not recognised; expected hash_broadcast / sort_merge"
+        ))),
     }
 }
 

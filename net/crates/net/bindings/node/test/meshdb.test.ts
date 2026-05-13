@@ -26,6 +26,16 @@ const hasMeshDb =
 
 const d = hasMeshDb ? describe : describe.skip;
 
+const {
+  decodeAggregate: decodeAggregateFn,
+  decodeJoined: decodeJoinedFn,
+  decodeWindow: decodeWindowFn,
+} = symbols as {
+  decodeAggregate?: (row: unknown) => unknown;
+  decodeJoined?: (row: unknown) => unknown;
+  decodeWindow?: (row: unknown) => unknown;
+};
+
 d('MeshDB factory + runner (slice 1)', () => {
   const {
     MeshQuery,
@@ -180,5 +190,290 @@ d('MeshDB factory + runner (slice 1)', () => {
     ]);
     expect(reader.latestSeq(0xfen)).toBe(20n);
     expect(reader.latestSeq(0xaan)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------
+// Slice 2: composite operator factories + decoders.
+// ---------------------------------------------------------------------
+
+d('MeshDB composite operators + decoders (slice 2)', () => {
+  const {
+    MeshQuery,
+    MeshQueryRunner,
+    InMemoryChainReader,
+  } = symbols as {
+    MeshQuery: typeof import('../index').MeshQuery;
+    MeshQueryRunner: typeof import('../index').MeshQueryRunner;
+    InMemoryChainReader: typeof import('../index').InMemoryChainReader;
+  };
+
+  const decodeAggregate = decodeAggregateFn as (row: unknown) => {
+    group: { kind: string; originHash?: bigint; seq?: bigint } | null;
+    kind: string;
+    value: number | null;
+    count: bigint | null;
+  } | null;
+  const decodeJoined = decodeJoinedFn as (row: unknown) => {
+    left: { originHash: bigint; seq: bigint; payload: Uint8Array } | null;
+    right: { originHash: bigint; seq: bigint; payload: Uint8Array } | null;
+  } | null;
+  const decodeWindow = decodeWindowFn as (row: unknown) => {
+    start: bigint;
+    end: bigint;
+    rows: { originHash: bigint; seq: bigint; payload: Uint8Array }[];
+  } | null;
+
+  const seed = (
+    rows: ReadonlyArray<readonly [bigint, bigint, Uint8Array]>,
+  ): InstanceType<typeof InMemoryChainReader> => {
+    const r = new InMemoryChainReader();
+    for (const [origin, seq, payload] of rows) {
+      r.append(origin, seq, Buffer.from(payload));
+    }
+    return r;
+  };
+
+  it('count with no groupBy returns a single aggregate row', async () => {
+    const chain = 0xabcdn;
+    const reader = seed([1, 2, 3, 4, 5].map((s) => [chain, BigInt(s), Buffer.from('')]));
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.count(MeshQuery.between(chain, 1n, 10n), null);
+    const rows = await (await runner.execute(q)).toArray();
+    expect(rows).toHaveLength(1);
+    const agg = decodeAggregate(rows[0]);
+    expect(agg).not.toBeNull();
+    expect(agg!.group).toBeNull();
+    expect(agg!.kind).toBe('count');
+    expect(agg!.count).toBe(5n);
+  });
+
+  it('count with groupBy origin returns per-origin counts', async () => {
+    const chain = 0xbbn;
+    const reader = seed([1, 2, 3].map((s) => [chain, BigInt(s), Buffer.from('')]));
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.count(MeshQuery.between(chain, 1n, 10n), ['origin']);
+    const rows = await (await runner.execute(q)).toArray();
+    expect(rows).toHaveLength(1);
+    const agg = decodeAggregate(rows[0])!;
+    expect(agg.kind).toBe('count');
+    expect(agg.group!.kind).toBe('origin');
+    expect(agg.group!.originHash).toBe(chain);
+    expect(agg.count).toBe(3n);
+  });
+
+  it('sum / avg / min / max over seq', async () => {
+    const chain = 0xabn;
+    const reader = seed(
+      [1, 3, 7, 11].map((s) => [chain, BigInt(s), Buffer.from('')]),
+    );
+    const runner = new MeshQueryRunner(reader);
+    const base = MeshQuery.between(chain, 1n, 20n);
+    const rows = async (q: import('../index').MeshQuery) =>
+      (await (await runner.execute(q)).toArray()).map((r) => decodeAggregate(r)!);
+    expect((await rows(MeshQuery.sum(base, 'seq', null)))[0].value).toBe(22.0);
+    expect((await rows(MeshQuery.avg(base, 'seq', null)))[0].value).toBeCloseTo(5.5);
+    expect((await rows(MeshQuery.min(base, 'seq', null)))[0].value).toBe(1.0);
+    expect((await rows(MeshQuery.max(base, 'seq', null)))[0].value).toBe(11.0);
+  });
+
+  it('percentile picks nearest-rank value', async () => {
+    const chain = 0xabn;
+    const reader = seed(
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((s) => [chain, BigInt(s), Buffer.from('')]),
+    );
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.percentile(
+      MeshQuery.between(chain, 1n, 20n),
+      'seq',
+      0.9,
+      null,
+    );
+    const rows = await (await runner.execute(q)).toArray();
+    expect(decodeAggregate(rows[0])!.value).toBe(9.0);
+  });
+
+  it('percentile rejects out-of-range p', () => {
+    const base = MeshQuery.latest(0xaan);
+    expect(() => MeshQuery.percentile(base, 'seq', 1.5, null)).toThrow();
+    expect(() => MeshQuery.percentile(base, 'seq', -0.1, null)).toThrow();
+  });
+
+  it('distinctCount over a JSON field', async () => {
+    const chain = 0xcdn;
+    const reader = seed([
+      [chain, 1n, Buffer.from('{"user":"alice"}')],
+      [chain, 2n, Buffer.from('{"user":"bob"}')],
+      [chain, 3n, Buffer.from('{"user":"alice"}')],
+      [chain, 4n, Buffer.from('{"user":"carol"}')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.distinctCount(
+      MeshQuery.between(chain, 1n, 10n),
+      'user',
+      null,
+    );
+    const rows = await (await runner.execute(q)).toArray();
+    const agg = decodeAggregate(rows[0])!;
+    expect(agg.kind).toBe('distinct_count');
+    expect(agg.count).toBe(3n);
+  });
+
+  it('window tumbling buckets rows in seq-asc order', async () => {
+    const chain = 0xaan;
+    const reader = seed(
+      [1, 2, 3, 4, 5, 6, 7].map((s) => [chain, BigInt(s), Buffer.from(`p-${s}`)]),
+    );
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.window(MeshQuery.between(chain, 1n, 20n), 3n);
+    const rows = await (await runner.execute(q)).toArray();
+    expect(rows).toHaveLength(3);
+    const bs = rows.map((r) => decodeWindow(r)!);
+    expect(bs[0].start).toBe(0n);
+    expect(bs[0].end).toBe(3n);
+    expect(bs[0].rows.map((r) => Number(r.seq))).toEqual([1, 2]);
+    expect(bs[1].rows.map((r) => Number(r.seq))).toEqual([3, 4, 5]);
+    expect(bs[2].rows.map((r) => Number(r.seq))).toEqual([6, 7]);
+  });
+
+  it('window size zero is rejected', () => {
+    expect(() => MeshQuery.window(MeshQuery.latest(0xaan), 0n)).toThrow(/size must/);
+  });
+
+  it('inner join on seq matches pairs', async () => {
+    const a = 0x111n;
+    const b = 0x222n;
+    const reader = seed([
+      [a, 1n, Buffer.from('a-1')],
+      [a, 2n, Buffer.from('a-2')],
+      [a, 3n, Buffer.from('a-3')],
+      [b, 2n, Buffer.from('b-2')],
+      [b, 4n, Buffer.from('b-4')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.join(
+      MeshQuery.between(a, 1n, 10n),
+      MeshQuery.between(b, 1n, 10n),
+      'inner',
+      'seq',
+      null,
+      null,
+    );
+    const rows = await (await runner.execute(q)).toArray();
+    const pairs = rows.map((r) => decodeJoined(r)!);
+    expect(pairs).toHaveLength(1);
+    expect(Buffer.from(pairs[0].left!.payload).toString()).toBe('a-2');
+    expect(Buffer.from(pairs[0].right!.payload).toString()).toBe('b-2');
+  });
+
+  it('left_outer join emits unmatched lefts', async () => {
+    const a = 0x111n;
+    const b = 0x222n;
+    const reader = seed([
+      [a, 1n, Buffer.from('a-1')],
+      [a, 2n, Buffer.from('a-2')],
+      [a, 3n, Buffer.from('a-3')],
+      [b, 2n, Buffer.from('b-2')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.join(
+      MeshQuery.between(a, 1n, 10n),
+      MeshQuery.between(b, 1n, 10n),
+      'left_outer',
+      'seq',
+      null,
+      null,
+    );
+    const rows = await (await runner.execute(q)).toArray();
+    const pairs = rows.map((r) => decodeJoined(r)!);
+    expect(pairs).toHaveLength(3);
+    expect(pairs.filter((p) => p.right !== null)).toHaveLength(1);
+    expect(pairs.filter((p) => p.right === null)).toHaveLength(2);
+  });
+
+  it('payload-keyed inner join on JSON field', async () => {
+    const a = 0x111n;
+    const b = 0x222n;
+    const reader = seed([
+      [a, 1n, Buffer.from('{"request_id":"r-1"}')],
+      [a, 2n, Buffer.from('{"request_id":"r-2"}')],
+      [b, 1n, Buffer.from('{"request_id":"r-1"}')],
+      [b, 2n, Buffer.from('{"request_id":"r-9"}')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.join(
+      MeshQuery.between(a, 1n, 10n),
+      MeshQuery.between(b, 1n, 10n),
+      'inner',
+      'request_id',
+      null,
+      null,
+    );
+    const rows = await (await runner.execute(q)).toArray();
+    const pairs = rows.map((r) => decodeJoined(r)!);
+    expect(pairs).toHaveLength(1);
+    expect(Buffer.from(pairs[0].left!.payload).toString()).toBe(
+      '{"request_id":"r-1"}',
+    );
+    expect(Buffer.from(pairs[0].right!.payload).toString()).toBe(
+      '{"request_id":"r-1"}',
+    );
+  });
+
+  it('sort_merge join returns same pairs as hash_broadcast', async () => {
+    const a = 0x111n;
+    const b = 0x222n;
+    const reader = seed([
+      [a, 1n, Buffer.from('a-1')],
+      [a, 2n, Buffer.from('a-2')],
+      [a, 5n, Buffer.from('a-5')],
+      [b, 2n, Buffer.from('b-2')],
+      [b, 5n, Buffer.from('b-5')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const baseLeft = MeshQuery.between(a, 1n, 10n);
+    const baseRight = MeshQuery.between(b, 1n, 10n);
+    const hash = MeshQuery.join(
+      baseLeft,
+      baseRight,
+      'inner',
+      'seq',
+      'hash_broadcast',
+      null,
+    );
+    const sm = MeshQuery.join(
+      baseLeft,
+      baseRight,
+      'inner',
+      'seq',
+      'sort_merge',
+      null,
+    );
+    const hashSeqs = (await (await runner.execute(hash)).toArray())
+      .map((r) => Number(decodeJoined(r)!.left!.seq))
+      .sort();
+    const smSeqs = (await (await runner.execute(sm)).toArray())
+      .map((r) => Number(decodeJoined(r)!.left!.seq))
+      .sort();
+    expect(hashSeqs).toEqual(smSeqs);
+    expect(hashSeqs).toEqual([2, 5]);
+  });
+
+  it('unknown join kind / strategy / groupBy field reject at factory', () => {
+    const base = MeshQuery.latest(0xaan);
+    expect(() => MeshQuery.join(base, base, 'cross', 'seq', null, null)).toThrow();
+    expect(() =>
+      MeshQuery.join(base, base, 'inner', 'seq', 'nested_loop', null),
+    ).toThrow();
+    expect(() => MeshQuery.count(base, ['payload.severity'])).toThrow();
+  });
+
+  it('decode helpers return null on shape mismatch', async () => {
+    const reader = seed([[0x01n, 1n, Buffer.from('raw-bytes')]]);
+    const runner = new MeshQueryRunner(reader);
+    const rows = await (await runner.execute(MeshQuery.at(0x01n, 1n))).toArray();
+    expect(decodeAggregate(rows[0])).toBeNull();
+    expect(decodeJoined(rows[0])).toBeNull();
+    expect(decodeWindow(rows[0])).toBeNull();
   });
 });
