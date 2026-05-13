@@ -56,11 +56,25 @@ pub fn reconcile(
     // `Instant::now()` for tests that call reconcile without
     // driving Ticks.
     let now = actual.last_tick.unwrap_or_else(Instant::now);
+    // Track which chains already saw a `RequestEviction` this
+    // tick so the Phase C count-driven arm and the Phase D-1
+    // scheduler arm don't both emit (possibly with different
+    // victims) for the same chain in the same pass.
+    let mut evicted_this_tick: std::collections::HashSet<ChainId> =
+        std::collections::HashSet::new();
     diff_daemons(actual, desired, now, &mut actions);
-    diff_replicas(actual, desired, this_node, &mut actions);
+    diff_replicas(actual, desired, this_node, &mut evicted_this_tick, &mut actions);
     diff_locality(actual, now, locality, &mut actions);
     diff_maintenance(actual, this_node, now, maintenance, &mut actions);
-    diff_scheduler(actual, this_node, scheduler, scorer, now, &mut actions);
+    diff_scheduler(
+        actual,
+        this_node,
+        scheduler,
+        scorer,
+        now,
+        &evicted_this_tick,
+        &mut actions,
+    );
     actions
 }
 
@@ -136,6 +150,7 @@ fn diff_replicas(
     actual: &MeshOsState,
     desired: &DesiredState,
     this_node: NodeId,
+    evicted: &mut std::collections::HashSet<ChainId>,
     out: &mut Vec<MeshOsAction>,
 ) {
     // Sort the chain ids so reconcile output is byte-stable
@@ -187,6 +202,7 @@ fn diff_replicas(
             // Phase D-1 swaps in a placement-score-based pick.
             if let Some(victim) = holders.and_then(|hs| hs.iter().min()).copied() {
                 out.push(MeshOsAction::RequestEviction { chain, victim });
+                evicted.insert(chain);
             }
         }
     }
@@ -325,6 +341,7 @@ fn diff_scheduler(
     config: &SchedulerConfig,
     scorer: Option<&dyn PlacementScorer>,
     now: Instant,
+    evicted_this_tick: &std::collections::HashSet<ChainId>,
     out: &mut Vec<MeshOsAction>,
 ) {
     let Some(scorer) = scorer else {
@@ -338,6 +355,12 @@ fn diff_scheduler(
     chains.sort();
 
     for chain in chains {
+        // Skip chains the Phase C count-driven arm already
+        // evicted from this tick — one eviction per chain per
+        // tick is the safety budget.
+        if evicted_this_tick.contains(&chain) {
+            continue;
+        }
         let leader = actual.replica_leader.get(&chain).copied();
         if leader != Some(this_node) {
             continue;
@@ -1674,6 +1697,57 @@ mod tests {
         };
         let actions = scheduler_call(&actual, Some(&scorer));
         assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn phase_c_overcount_eviction_suppresses_phase_d1_eviction_for_same_chain() {
+        // Regression for I2. Two leader-only arms can both fire
+        // a RequestEviction in one reconcile pass — Phase C
+        // when actual_count > desired_count, Phase D-1 when the
+        // worst score is below the floor. Without de-dup the
+        // same chain emits two evictions (possibly with
+        // different victims) in one tick. The pass now budgets
+        // one eviction per chain per tick — Phase C runs first,
+        // and the scheduler arm skips any chain it touched.
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        // Two holders for CHAIN_A; this_node is leader; desired
+        // count is 1 — Phase C will emit eviction of lex-
+        // smallest holder.
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE, 99]);
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let mut desired = DesiredState::default();
+        desired.desired_replicas.insert(CHAIN_A, 1);
+        // Scheduler would otherwise fire too — THIS_NODE scores
+        // 0.1, alternative 0.9.
+        let scorer = FixedScorer {
+            scores: [
+                ((CHAIN_A, THIS_NODE), 0.1),
+                ((CHAIN_A, 99), 0.1),
+            ]
+            .into_iter()
+            .collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            Some(&scorer),
+        );
+        let evictions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, MeshOsAction::RequestEviction { .. }))
+            .collect();
+        assert_eq!(
+            evictions.len(),
+            1,
+            "phase C and phase D-1 must not both evict the same chain in one tick",
+        );
     }
 
     #[test]
