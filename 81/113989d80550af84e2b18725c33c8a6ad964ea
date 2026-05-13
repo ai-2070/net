@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/meshdb/planner.rs
+  s_3bbc444b3ef3e5::t_f1382cfdc98eaa 880-885
+  s_3bbc444b3ef3e5::t_72b5286fe4bca7 2781-2834
+  s_3bbc444b3ef3e5::t_c1654ad93086e2 843-848
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "81113989d80550af84e2b18725c33c8a6ad964ea",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
