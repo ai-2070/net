@@ -21,6 +21,8 @@ pub mod diff;
 pub mod loadbalance;
 #[cfg(feature = "meshdb")]
 pub mod meshdb;
+#[cfg(feature = "meshos")]
+pub mod meshos;
 pub mod metadata;
 pub mod placement;
 pub mod placement_registry;

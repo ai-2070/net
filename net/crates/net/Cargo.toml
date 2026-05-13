@@ -65,6 +65,17 @@ netdb = ["cortex"]
 # workload (telemetry + Deck metrics are the named
 # candidates). See `docs/plans/MESHDB_PLAN.md`.
 meshdb = ["cortex"]
+# MeshOS (Atomic Playboys, follows MeshDB) — cluster-behavior
+# engine. One canonical event loop per node that reconciles
+# desired vs actual state, supervises daemons, enforces replica
+# placement, applies admin intent (drain / cordon /
+# maintenance), and folds the result into a behavior snapshot
+# for Deck. Phase A ships the skeleton (event mux + pure-sync
+# reconcile no-op + action executor); later phases fill in
+# supervision (B), replica enforcement (C), locality + admin
+# events (D), maintenance state machine (E), behavior snapshot
+# fold (F), and backpressure (G). See `docs/plans/MESHOS_PLAN.md`.
+meshos = ["cortex"]
 # Dataforts (Rebel Yell) — compile the dataforts module surface,
 # which covers every phase the plan calls runtime-toggleable:
 # greedy-LRU caching (Phase 1), data-gravity heat counters

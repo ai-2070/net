@@ -50,6 +50,7 @@ Crate / module names inside source code (`net::`, `net_sdk::`, `from net import`
 - [Dataforts](#dataforts)
 - [nRPC](#nrpc)
 - [MeshDB](#meshdb)
+- [MeshOS](#meshos)
 - [Module Map](#module-map)
 - [Adapters](#adapters)
 - [SDKs](#sdks)
@@ -864,6 +865,32 @@ MeshDB is the federated query layer above the capability-query primitives and Co
 - **Go** — [`bindings/go/net/meshdb.go`](bindings/go/net/meshdb.go): cgo wrapper over `libnet_meshdb`; `MeshDBQuery*` factories return a channel from `(*MeshDBRunner).Execute`.
 - **C / C++ / etc.** — [`include/net_meshdb.h`](include/net_meshdb.h): drop-in header for the `libnet_meshdb` cdylib (24 `net_meshdb_*` exports, sentinel-envelope JSON decoder at the FFI boundary).
 
+## MeshOS
+
+MeshOS is the cluster-behavior engine: one canonical event loop per node that reconciles **desired** state (from Dataforts placement intent) against **actual** state (from RedEX folds), supervises daemons, enforces replica placement, applies admin intent (drain / cordon / maintenance), emits backpressure under churn, and folds the result into a behavior snapshot for Deck. It composes — not duplicates — the substrate primitives that already ship: `PlacementFilter`, `CapabilityIndex`, `RedexFold`, the `MeshDaemon` trait, the migration orchestrator, replication election. Lives behind the `meshos` Cargo feature; symbols live under [`adapter/net/behavior/meshos/`](src/adapter/net/behavior/meshos).
+
+**Architecture.** Single-stream reactor. `MeshOsLoop` owns one `mpsc::Receiver<MeshOsEvent>` that fans replica updates, daemon lifecycle, RTT samples, admin events, blob announcements, and placement intent into a single sequence; the loop pops one event at a time, folds it into `MeshOsState`, and on every heartbeat-aligned tick (default 500 ms, `MissedTickBehavior::Delay`) runs the pure-sync `reconcile(actual, desired, ...) -> Vec<MeshOsAction>` and pushes the result through the action-executor channel. Reconcile is async-free, idempotent (replaying the same `(actual, desired)` after convergence emits an empty list), and tested as a table-driven sync fixture.
+
+**Reconcile arms (in order).** Daemon supervision (Phase B), replica enforcement (Phase C, leader-only `Request*` action arms), locality + admin events (Phase D), maintenance state machine (Phase E), continuous-rebalance scheduler (Phase D-1). Phase C and the D-1 scheduler share a per-tick eviction budget so the same chain doesn't double-evict in one pass.
+
+**Action surface.** `MeshOsAction` is `#[non_exhaustive]` and covers the seven action families the plan names: `StartDaemon` / `StopDaemon` / `MigrateBlob` / `PullReplica` / `ReduceHeat` / `MarkAvoid` / `ApplyBackoff`, plus `RequestPlacement` / `RequestEviction` (leader-only) and `CommitMaintenanceTransition`. Each action carries a process-local `ActionId` so Deck can correlate `pending` → `in-flight` → `completed`.
+
+**Backpressure layer (Phase G).** Every outbound action funnels through `BackpressureState::admit(action, now, config) -> AdmissionResult { Admit | Defer { retry_after } | Gate { cooldown_until, reason } }`. Throttles: 250 ms global pull cooldown, 60 s per-chain replica stabilization window, per-daemon crash-loop gate, 10/s drain rate limit, and a hysteresis flag (1000 high / 200 low) that flips cluster-wide backpressure on and broadcasts `DaemonControl::BackpressureOn { level }` / `Off` to supervised daemons through the dispatcher's `on_cluster_backpressure` hook. Dispatch failures route back through `admit` after `BackpressureState::release_failed_admit` rolls the reservations back, and the deferred-action heap caps repeat attempts at `BackpressureConfig::max_defer_count` (default 16) before recording a structured failure.
+
+**Daemon supervision (Phase B).** The `MeshDaemon` trait gains three additive methods with default impls — `health() -> DaemonHealth`, `saturation() -> f32`, `on_control(DaemonControl)` — so existing daemons compile unchanged. `DaemonControl` carries WASM-friendly relative-ms deadlines (`Shutdown { grace_period_ms }`, `DrainStart { grace_period_ms }`, `DrainFinish`, `BackpressureOn { level }`, `BackpressureOff`). `BackoffTracker` runs the per-daemon restart gate (500 ms initial, doubling to 60 s cap; 5 crashes per rolling 60 s flips to `CrashLooping { 5 min cooldown }`; stable-run resets).
+
+**Maintenance state machine (Phase E).** `MaintenanceState`: `Active → EnteringMaintenance → Maintenance → ExitingMaintenance → Recovery → Active`, with `DrainFailed` as the deadline-elapsed sideways arc. Replica freeze + daemon drain enter from `AdminEvent::EnterMaintenance`; the recovery ramp-up window (default 5 min) keeps the node on the avoid list for new placement so a freshly rejoined node doesn't get hammered. Transitions are tick-anchored (not `Instant::now()` inside the fold) so two replays of the same chain converge on the same `since` instants.
+
+**Source converters.** Two patterns. **Push-via-observer**: `DaemonRegistry` and `ReplicationCoordinator` ship `set_lifecycle_observer` / `set_transition_observer` hooks; `MeshOsDaemonLifecycleSink` and `MeshOsReplicaTransitionSink` translate each signal to a `MeshOsEvent` and `try_publish` it onto the loop's channel (drop counter on overflow, never blocks). **Pull-via-tick**: `ProximityGraphLocalityProbe` / `ProximityGraphHealthProbe` ride a shared `ProbeRegistry` and the loop polls them on every tick before reconcile, wrapped in `std::panic::catch_unwind` so a third-party probe panic doesn't unwind the loop task.
+
+**Behavior snapshot (Phase F).** `MeshOsSnapshot` is the postcard + JSON round-trippable projection consumers see — `daemons` / `replicas` / `peers` / `avoid_list` / `local_maintenance` / `pending` / `recent_failures` keyed for direct Deck rendering. `Instant` fields flatten to relative milliseconds at projection time. The loop publishes the latest snapshot through `arc_swap::ArcSwap<MeshOsSnapshot>` after every reconcile — `MeshOsSnapshotReader::read()` is one atomic load + an `Arc` clone, so concurrent readers never stall the loop's publish path.
+
+**Action-chain integration.** `ActionChainAppender` is the trait the executor calls per dispatch / failure / gate outcome; `MeshOsSnapshotFold` implements `RedexFold<MeshOsSnapshot>` over the chain so a downstream node folds the same `recent_failures` ring buffer that the producer sees. Records ride a one-byte wire-format version (`WIRE_FORMAT_VERSION = 1`) so a future variant addition surfaces as `RedexError::Decode("unsupported wire version …")` rather than a garbled deserialization. `BufferingActionChainAppender` is the test-only ring buffer (bounded, FIFO drop-oldest) and `NoOpActionChainAppender` ships as the bootstrap default until a consumer wires a real chain.
+
+**Stitching layer.** `MeshOsRuntime::start(config, dispatcher) -> Self` spawns the loop + executor as tokio tasks and returns a live runtime. Methods: `handle()` / `handle_clone()` (publish events), `snapshot()` / `snapshot_reader()` (read the latest fold), `executor_stats()` (live counters), `dropped_actions()` (loop-side drop counter for actions the executor queue rejected), `shutdown()` / `shutdown_with_timeout(timeout)` (clean drain + final `RuntimeStats`). Dropping the runtime without calling `shutdown` aborts the in-flight tasks with a `tracing::warn` rather than detaching them.
+
+**Activation gate.** A workload that exercises the loop end-to-end — Dataforts placing replicas, drain operations driving evacuations, Deck consuming the snapshot to render the cluster jungle. Without those, MeshOS is a reconciler with nothing to reconcile; the feature flag stays off by default.
+
 ## Module Map
 
 Top-level `src/` is the event-bus core; the heavy mesh code lives under `adapter/net/`.
@@ -1220,6 +1247,8 @@ net_shutdown(node);
 | CortEX (adapter core + tasks + memories) | `cortex` | `redex` |
 | NetDB (unified query façade) | `netdb` | `cortex` |
 | Dataforts (greedy + gravity + blob + RYW) | `dataforts` | `cortex`, `blake3`, `xxhash-rust` |
+| MeshDB (federated query AST + planner + executor) | `meshdb` | `cortex` |
+| MeshOS (cluster-behavior engine + behavior snapshot) | `meshos` | `cortex` |
 
 No features are enabled by default — opt into `redis`, `jetstream`, `net`, etc. explicitly.
 

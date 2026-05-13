@@ -34,8 +34,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use super::replication::ReplicaRole;
 use super::replication_config::ReplicationConfig;
@@ -76,6 +77,80 @@ impl ChainTagSink for MeshNode {
     async fn withdraw_chain(&self, origin_hash: u64) -> Result<(), AdapterError> {
         MeshNode::withdraw_chain(self, origin_hash).await
     }
+}
+
+/// Lifecycle event a [`ReplicaTransitionObserver`] receives
+/// when this coordinator transitions through its state
+/// machine. Carries `origin_hash` so observers managing many
+/// coordinators (one per channel) can route the event.
+///
+/// `at` is the monotonic timestamp at the transition. Plain data so observers
+/// can buffer / async-forward without lifetime issues.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ReplicaTransitionEvent {
+    /// Coordinator entered `Replica` or `Leader` from `Idle` —
+    /// this node is now a holder of the chain.
+    BecameHolder {
+        /// Substrate-level chain identifier.
+        origin_hash: u64,
+        /// Monotonic timestamp of the transition.
+        at: Instant,
+    },
+    /// Coordinator entered `Idle` from any non-Idle state —
+    /// this node is no longer a holder.
+    Idled {
+        /// Substrate-level chain identifier.
+        origin_hash: u64,
+        /// Monotonic timestamp of the transition.
+        at: Instant,
+    },
+    /// Leader changed for this channel — the coordinator
+    /// transitioned through a Leader entry (`Replica → Leader`
+    /// or `Candidate → Leader`). MeshOS uses this to update
+    /// `MeshOsState::replica_leader`.
+    LeaderChanged {
+        /// Substrate-level chain identifier.
+        origin_hash: u64,
+        /// Monotonic timestamp of the transition.
+        at: Instant,
+    },
+    /// This coordinator stepped down from `Leader` to `Replica`
+    /// — the node remains a holder but is no longer leader.
+    /// MeshOS clears its mirror of
+    /// `MeshOsState::replica_leader[origin_hash]` when the
+    /// observer sees this — otherwise the loop would carry a
+    /// stale leader pointer until a different node's
+    /// `LeaderChanged` overwrites it.
+    LeaderLost {
+        /// Substrate-level chain identifier.
+        origin_hash: u64,
+        /// Monotonic timestamp of the transition.
+        at: Instant,
+    },
+    /// This coordinator stepped down from `Leader` straight to
+    /// `Idle` — the node is no longer leader AND no longer a
+    /// holder. The two transitions are bundled into one event so
+    /// downstream sinks publish a single atomic update; firing
+    /// `Idled` and `LeaderLost` separately would let the events
+    /// channel drop one half under backpressure, leaving the
+    /// snapshot with either a phantom leader on a non-holder, or
+    /// a leader-less holder set.
+    LeaderLostAndIdled {
+        /// Substrate-level chain identifier.
+        origin_hash: u64,
+        /// Monotonic timestamp of the transition.
+        at: Instant,
+    },
+}
+
+/// Observer hook for replication-coordinator state changes.
+/// Implementations fan events out to whichever consumer wants
+/// them — the MeshOS event loop being the canonical
+/// near-term consumer. Methods are sync + non-blocking.
+pub trait ReplicaTransitionObserver: Send + Sync + 'static {
+    /// Receive one transition event. Must not block.
+    fn observe(&self, event: ReplicaTransitionEvent);
 }
 
 /// Errors the coordinator surfaces from its state-machine + tag-
@@ -137,6 +212,16 @@ pub struct ReplicationCoordinator {
     /// completes `withdraw_chain` first, leaving the mesh
     /// advertising a chain we've already withdrawn locally.
     transition_lock: tokio::sync::Mutex<()>,
+    /// Optional observer hook. When set, every successful state
+    /// transition that crosses the Idle ↔ {Replica, Leader}
+    /// boundary fires through it so consumers (MeshOS, audit,
+    /// dashboard) see a coherent replica-update stream.
+    ///
+    /// `parking_lot::RwLock` over `Option<Arc<dyn ...>>` mirrors
+    /// the hot-path router pattern used elsewhere (e.g.
+    /// `DaemonRegistry::observer`): uncontended read on the
+    /// firing path, rare write when an observer is installed.
+    observer: RwLock<Option<Arc<dyn ReplicaTransitionObserver>>>,
 }
 
 impl ReplicationCoordinator {
@@ -161,6 +246,31 @@ impl ReplicationCoordinator {
             state: Mutex::new(ReplicaRole::Idle),
             tail_seq: AtomicU64::new(0),
             transition_lock: tokio::sync::Mutex::new(()),
+            observer: RwLock::new(None),
+        }
+    }
+
+    /// Install a replica-transition observer. Replaces any prior
+    /// observer; returns the prior one if any. Pass `None` to
+    /// detach. Lock-free on the firing path; only the install
+    /// path takes the write lock.
+    pub fn set_transition_observer(
+        &self,
+        observer: Option<Arc<dyn ReplicaTransitionObserver>>,
+    ) -> Option<Arc<dyn ReplicaTransitionObserver>> {
+        let mut guard = self.observer.write();
+        std::mem::replace(&mut *guard, observer)
+    }
+
+    /// `true` when an observer is installed. Cheap (one RwLock
+    /// read).
+    pub fn has_transition_observer(&self) -> bool {
+        self.observer.read().is_some()
+    }
+
+    fn fire_transition(&self, event: ReplicaTransitionEvent) {
+        if let Some(observer) = self.observer.read().clone() {
+            observer.observe(event);
         }
     }
 
@@ -311,6 +421,63 @@ impl ReplicationCoordinator {
             _ => Ok(()),
         };
         result.map_err(CoordinatorError::TagSink)?;
+
+        // Fire the observer AFTER the sink call succeeds. If the
+        // sink call fails we don't fire — the state mutation
+        // already happened, but the operator-visible advertisement
+        // didn't; the next heartbeat cycle will retry and the
+        // observer fires then. (The transition_lock serializes
+        // both, so a retried `transition_to` runs the full chain
+        // again including the observer.)
+        let at = Instant::now();
+        match (transition.from, transition.to) {
+            (ReplicaRole::Idle, ReplicaRole::Replica)
+            | (ReplicaRole::Idle, ReplicaRole::Leader) => {
+                self.fire_transition(ReplicaTransitionEvent::BecameHolder {
+                    origin_hash: origin,
+                    at,
+                });
+            }
+            // Leader → Idle: fire ONE bundled event so a
+            // downstream sink can't drop half of the (holder
+            // removal, leader clear) pair under backpressure.
+            (ReplicaRole::Leader, ReplicaRole::Idle) => {
+                self.fire_transition(ReplicaTransitionEvent::LeaderLostAndIdled {
+                    origin_hash: origin,
+                    at,
+                });
+            }
+            (_, ReplicaRole::Idle) => {
+                self.fire_transition(ReplicaTransitionEvent::Idled {
+                    origin_hash: origin,
+                    at,
+                });
+            }
+            _ => {}
+        }
+        if matches!(
+            (transition.from, transition.to),
+            (ReplicaRole::Replica, ReplicaRole::Leader)
+                | (ReplicaRole::Candidate, ReplicaRole::Leader)
+                | (ReplicaRole::Idle, ReplicaRole::Leader)
+        ) {
+            self.fire_transition(ReplicaTransitionEvent::LeaderChanged {
+                origin_hash: origin,
+                at,
+            });
+        }
+        // Leader → Replica step-down — node remains a holder but
+        // is no longer leader. The Leader → Idle case is handled
+        // above by `LeaderLostAndIdled`.
+        if matches!(
+            (transition.from, transition.to),
+            (ReplicaRole::Leader, ReplicaRole::Replica)
+        ) {
+            self.fire_transition(ReplicaTransitionEvent::LeaderLost {
+                origin_hash: origin,
+                at,
+            });
+        }
 
         Ok(Some(transition))
     }

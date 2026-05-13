@@ -43,7 +43,7 @@ jobs:
         run: cargo test --doc --features "net redex cortex netdb"
 
   integration-tests:
-    name: Integration tests (net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC)
+    name: Integration tests (Net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC, Dataforts, MeshDB, MeshOS)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -172,14 +172,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo nextest run --no-fail-fast --features netdb --test integration_netdb
 
-      # === MeshDB =========================================================
-      # `meshdb` chains to cortex → redex → net, so a single
-      # --features meshdb covers the test's `feature = "net" + "meshdb"`
-      # gate.
-      - name: MeshDB
-        if: ${{ !cancelled() }}
-        run: cargo nextest run --no-fail-fast --features meshdb --test meshdb_subprotocol_wire
-
       # === Dataforts (greedy + gravity) ===================================
       - name: Dataforts greedy + gravity
         if: ${{ !cancelled() }}
@@ -202,6 +194,22 @@ jobs:
       - name: Dataforts net-blob CLI
         if: ${{ !cancelled() }}
         run: cargo nextest run --no-fail-fast --features "dataforts cli" --test net_blob_cli
+
+      # === MeshDB =========================================================
+      # `meshdb` chains to cortex → redex → net, so a single
+      # --features meshdb covers the test's `feature = "net" + "meshdb"`
+      # gate.
+      - name: MeshDB
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --no-fail-fast --features meshdb --test meshdb_subprotocol_wire
+
+      # === MeshOS =========================================================
+      # `meshos` chains to cortex → redex → net. End-to-end pipeline
+      # test pins the contract between MeshOsLoop reconcile → admit →
+      # ActionDispatcher across phases.
+      - name: MeshOS
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --no-fail-fast --features meshos --test meshos_pipeline
 
   loom-tests:
     name: Loom concurrency models
