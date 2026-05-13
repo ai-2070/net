@@ -889,19 +889,6 @@ MeshOS is the cluster-behavior engine: one canonical event loop per node that re
 
 **Stitching layer.** `MeshOsRuntime::start(config, dispatcher) -> Self` spawns the loop + executor as tokio tasks and returns a live runtime. Methods: `handle()` / `handle_clone()` (publish events), `snapshot()` / `snapshot_reader()` (read the latest fold), `executor_stats()` (live counters), `dropped_actions()` (loop-side drop counter for actions the executor queue rejected), `shutdown()` / `shutdown_with_timeout(timeout)` (clean drain + final `RuntimeStats`). Dropping the runtime without calling `shutdown` aborts the in-flight tasks with a `tracing::warn` rather than detaching them.
 
-**Locked decisions** (the contracts every phase relies on):
-
-1. One event loop per node, not per subsystem. Existing reactors become event sources.
-2. Admin events ride RedEX, not RPC. Chain-driven, signed, globally ordered.
-3. Reconcile is a pure sync function. All async sits in event sources + the action executor.
-4. Action emission ≠ action execution. Reconcile emits; the executor drains under backpressure.
-5. Maintenance state lives in chain metadata, not in-memory.
-6. The elected leader is the placement authority. Per-replica, only the leader acts on `Request*`.
-7. Tick cadence = heartbeat cadence (default 500 ms).
-8. `MeshDaemon` extension is additive only. WASM compatibility preserved.
-9. Behavior snapshot rides MeshDB, not a new wire protocol.
-10. One backpressure layer over all outbound actions.
-
 **Activation gate.** A workload that exercises the loop end-to-end — Dataforts placing replicas, drain operations driving evacuations, Deck consuming the snapshot to render the cluster jungle. Without those, MeshOS is a reconciler with nothing to reconcile; the feature flag stays off by default.
 
 ## Module Map
