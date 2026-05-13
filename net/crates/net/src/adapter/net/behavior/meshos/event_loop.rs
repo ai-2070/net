@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tokio::time::{interval_at, Instant as TokioInstant, MissedTickBehavior};
 
@@ -26,6 +27,7 @@ use super::action::{AllocateActionId, PendingAction};
 use super::config::MeshOsConfig;
 use super::event::MeshOsEvent;
 use super::reconcile::reconcile;
+use super::snapshot::MeshOsSnapshot;
 use super::state::{DesiredState, MeshOsState};
 
 /// Per-node MeshOS instance. Owns the actual + desired state
@@ -55,9 +57,43 @@ pub struct MeshOsLoop {
     /// daemon-intent feeds).
     desired: DesiredState,
 
+    /// Most recent post-reconcile snapshot. Updated on every
+    /// Tick after the reconcile pass; readable through
+    /// [`MeshOsSnapshotReader::read`] from any other task /
+    /// thread.
+    snapshot: Arc<RwLock<MeshOsSnapshot>>,
+
+    /// Pending-action ring buffer the snapshot folds into its
+    /// `pending` field. Bounded by the action-queue capacity;
+    /// each emission appends, each Tick rebuilds the snapshot
+    /// from it before clearing.
+    pending_snapshot_actions: Vec<PendingAction>,
+
     /// Reconcile-pass counter — used by tests / diagnostics to
     /// confirm reconcile fired exactly once per Tick.
     reconcile_count: u64,
+}
+
+/// Read-only handle to the loop's most recent snapshot.
+/// Construction returns one of these from
+/// [`MeshOsLoop::new`]; Deck / Phase F integrations clone the
+/// handle (cheap — one Arc clone) and call
+/// [`MeshOsSnapshotReader::read`] to sample the current view
+/// without entering the loop's event stream.
+#[derive(Clone, Debug)]
+pub struct MeshOsSnapshotReader {
+    snapshot: Arc<RwLock<MeshOsSnapshot>>,
+}
+
+impl MeshOsSnapshotReader {
+    /// Sample the most recent post-reconcile snapshot. Clones
+    /// the inner `MeshOsSnapshot` under a read lock — cheap
+    /// for the bounded shape, but callers that need to inspect
+    /// many fields should snapshot once and read off the local
+    /// copy.
+    pub fn read(&self) -> MeshOsSnapshot {
+        self.snapshot.read().clone()
+    }
 }
 
 /// Cloneable handle for publishing events into the loop. Cheap
@@ -118,11 +154,17 @@ impl MeshOsLoop {
     /// Construct a loop bound to the given config. Returns the
     /// loop (consumed by `run()`) and a [`MeshOsHandle`] that
     /// sources clone to publish events.
-    pub fn new(config: MeshOsConfig) -> (Self, MeshOsHandle, mpsc::Receiver<PendingAction>) {
+    pub fn new(
+        config: MeshOsConfig,
+    ) -> (Self, MeshOsHandle, mpsc::Receiver<PendingAction>, MeshOsSnapshotReader) {
         let config = Arc::new(config);
         let (events_tx, events_rx) = mpsc::channel(config.event_queue_capacity);
         let (actions_tx, actions_rx) = mpsc::channel(config.action_queue_capacity);
         let handle = MeshOsHandle { events: events_tx };
+        let snapshot = Arc::new(RwLock::new(MeshOsSnapshot::default()));
+        let reader = MeshOsSnapshotReader {
+            snapshot: Arc::clone(&snapshot),
+        };
         let me = Self {
             config,
             events_rx,
@@ -130,9 +172,11 @@ impl MeshOsLoop {
             action_ids: AllocateActionId::new(),
             actual: MeshOsState::default(),
             desired: DesiredState::default(),
+            snapshot,
+            pending_snapshot_actions: Vec::new(),
             reconcile_count: 0,
         };
-        (me, handle, actions_rx)
+        (me, handle, actions_rx, reader)
     }
 
     /// Drive the loop until either:
@@ -212,10 +256,28 @@ impl MeshOsLoop {
             // Phase G upgrades this to a proper admit/defer
             // surface; Phase A's drop is harmless because no
             // actions are emitted yet.
+            self.pending_snapshot_actions.push(pending.clone());
             let _ = self.actions_tx.try_send(pending);
+        }
+        self.publish_snapshot();
+        // Bound the in-loop pending mirror so a backed-up
+        // executor doesn't let snapshot pending grow unbounded.
+        // Action queue capacity is the natural bound.
+        if self.pending_snapshot_actions.len() > self.config.action_queue_capacity {
+            let overflow =
+                self.pending_snapshot_actions.len() - self.config.action_queue_capacity;
+            self.pending_snapshot_actions.drain(..overflow);
         }
     }
 
+    fn publish_snapshot(&self) {
+        let snap = MeshOsSnapshot::from_state(
+            &self.actual,
+            &self.desired,
+            &self.pending_snapshot_actions,
+        );
+        *self.snapshot.write() = snap;
+    }
 }
 
 /// Convenience: a config with a very short `tick_interval` for
@@ -243,7 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn loop_exits_cleanly_when_all_handles_drop() {
-        let (loop_, handle, mut actions_rx) = MeshOsLoop::new(fast_test_config());
+        let (loop_, handle, mut actions_rx, _) = MeshOsLoop::new(fast_test_config());
         let task = tokio::spawn(loop_.run());
         drop(handle);
         // Loop should drain quickly. `run` returns the
@@ -261,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn loop_exits_on_shutdown_event() {
-        let (loop_, handle, _) = MeshOsLoop::new(fast_test_config());
+        let (loop_, handle, _, _) = MeshOsLoop::new(fast_test_config());
         let task = tokio::spawn(loop_.run());
         handle.publish(MeshOsEvent::Shutdown).await.unwrap();
         let count = tokio::time::timeout(StdDuration::from_secs(1), task)
@@ -277,7 +339,7 @@ mod tests {
             tick_interval: StdDuration::from_millis(20),
             ..fast_test_config()
         };
-        let (loop_, handle, _) = MeshOsLoop::new(cfg);
+        let (loop_, handle, _, _) = MeshOsLoop::new(cfg);
         let task = tokio::spawn(loop_.run());
         // Let several ticks fire.
         tokio::time::sleep(StdDuration::from_millis(120)).await;
@@ -290,6 +352,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_reader_returns_updated_state_after_each_tick() {
+        // The reader should reflect the most recent
+        // post-reconcile snapshot. Fire some events that change
+        // state, let ticks fire, sample the reader.
+        let (loop_, handle, _, reader) = MeshOsLoop::new(fast_test_config());
+        let task = tokio::spawn(loop_.run());
+
+        // Add a replica observation.
+        handle
+            .publish(MeshOsEvent::ReplicaUpdate(ReplicaUpdate::Added {
+                chain: 0xC0FFEE,
+                holder: 7,
+            }))
+            .await
+            .unwrap();
+        // Give ticks time to fire + reconcile + publish.
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let snap = reader.read();
+        let entry = snap
+            .replicas
+            .get(&0xC0FFEE)
+            .expect("snapshot should carry the replica");
+        assert_eq!(entry.holders, vec![7]);
+
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_reader_is_cloneable_and_sees_same_state() {
+        let (loop_, handle, _, reader_a) = MeshOsLoop::new(fast_test_config());
+        let reader_b = reader_a.clone();
+        let task = tokio::spawn(loop_.run());
+
+        handle
+            .publish(MeshOsEvent::ReplicaUpdate(ReplicaUpdate::Added {
+                chain: 1,
+                holder: 1,
+            }))
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let snap_a = reader_a.read();
+        let snap_b = reader_b.read();
+        assert_eq!(snap_a, snap_b);
+
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn loop_drains_event_burst_without_panicking() {
         // Smoke test: the loop accepts a burst of arbitrary
         // events and exits cleanly when shutdown is published.
@@ -297,7 +412,7 @@ mod tests {
         // on `MeshOsState::apply` in `state::tests` — that
         // covers the substantive ordering guarantee without
         // having to crack open the consumed-loop's state.
-        let (loop_, handle, _) = MeshOsLoop::new(fast_test_config());
+        let (loop_, handle, _, _) = MeshOsLoop::new(fast_test_config());
 
         let chain: ChainId = 0xC0FFEE;
         let probe = tokio::spawn(async move {
@@ -338,7 +453,7 @@ mod tests {
         // Compile + type-check: `new` returns the triple, the
         // handle is cloneable, the actions receiver is the
         // documented type.
-        let (_loop_, handle, _actions_rx) = MeshOsLoop::new(MeshOsConfig::default());
+        let (_loop_, handle, _actions_rx, _) = MeshOsLoop::new(MeshOsConfig::default());
         let _clone = handle.clone();
     }
 
@@ -350,7 +465,7 @@ mod tests {
             event_queue_capacity: 1,
             ..fast_test_config()
         };
-        let (loop_, handle, _) = MeshOsLoop::new(cfg);
+        let (loop_, handle, _, _) = MeshOsLoop::new(cfg);
         handle.try_publish(MeshOsEvent::Tick).unwrap();
         match handle.try_publish(MeshOsEvent::Tick) {
             Err(MeshOsHandleError::QueueFull) => {}
@@ -368,7 +483,7 @@ mod tests {
         // sent are still dequeued by the channel (FIFO) but only
         // up to the Shutdown event; after the loop breaks they
         // remain undelivered.
-        let (loop_, handle, _) = MeshOsLoop::new(fast_test_config());
+        let (loop_, handle, _, _) = MeshOsLoop::new(fast_test_config());
         handle.publish(MeshOsEvent::Tick).await.unwrap();
         handle.publish(MeshOsEvent::Shutdown).await.unwrap();
         // A post-Shutdown event: enqueued behind Shutdown.

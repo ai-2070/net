@@ -21,7 +21,7 @@ use net::adapter::net::behavior::meshos::{
     attach_to_daemon_registry, ActionExecutor, AdminEvent, ChainId, DaemonIntent,
     DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent,
     LocalReplicaIntentUpdate, LoggingDispatcher, MaintenanceTransition, MeshOsAction,
-    MeshOsConfig, MeshOsEvent, MeshOsLoop, NodeId,
+    MeshOsConfig, MeshOsEvent, MeshOsLoop, MeshOsSnapshotReader, NodeId, ReplicaUpdate,
 };
 use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::compute::{
@@ -64,7 +64,7 @@ fn spawn_pipeline(
     tokio::task::JoinHandle<u64>,
     tokio::task::JoinHandle<Arc<net::adapter::net::behavior::meshos::ExecutorStats>>,
 ) {
-    let (mesh_loop, handle, actions_rx) = MeshOsLoop::new(cfg.clone());
+    let (mesh_loop, handle, actions_rx, _snapshot_reader) = MeshOsLoop::new(cfg.clone());
     let dispatcher = Arc::new(LoggingDispatcher::new());
     let exec = ActionExecutor::new(actions_rx, Arc::new(cfg), Arc::clone(&dispatcher));
     let loop_task = tokio::spawn(mesh_loop.run());
@@ -494,4 +494,61 @@ async fn admit_gates_held_daemon_so_dispatcher_never_sees_a_start() {
         )),
         "StartDaemon leaked through despite crash-loop gate; got {log:?}",
     );
+}
+
+/// Pipeline variant that returns the snapshot reader so the
+/// test can sample it post-reconcile.
+fn spawn_pipeline_with_reader(
+    cfg: MeshOsConfig,
+) -> (
+    net::adapter::net::behavior::meshos::MeshOsHandle,
+    Arc<LoggingDispatcher>,
+    tokio::task::JoinHandle<u64>,
+    tokio::task::JoinHandle<Arc<net::adapter::net::behavior::meshos::ExecutorStats>>,
+    MeshOsSnapshotReader,
+) {
+    let (mesh_loop, handle, actions_rx, reader) = MeshOsLoop::new(cfg.clone());
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let exec = ActionExecutor::new(actions_rx, Arc::new(cfg), Arc::clone(&dispatcher));
+    let loop_task = tokio::spawn(mesh_loop.run());
+    let exec_task = tokio::spawn(exec.run());
+    (handle, dispatcher, loop_task, exec_task, reader)
+}
+
+#[tokio::test]
+async fn snapshot_reader_observes_replica_update_through_reconcile() {
+    // Publish a ReplicaUpdate; let the loop fold + reconcile +
+    // publish the snapshot; sample via the reader. End-to-end
+    // observation that the snapshot path works post-reconcile.
+    let cfg = fast_config();
+    let (handle, dispatcher, loop_task, exec_task, reader) = spawn_pipeline_with_reader(cfg);
+
+    let chain: ChainId = 0xDEAD;
+    handle
+        .publish(MeshOsEvent::ReplicaUpdate(ReplicaUpdate::Added {
+            chain,
+            holder: 42,
+        }))
+        .await
+        .unwrap();
+
+    // Sample the reader before shutting down — wait for a
+    // tick + reconcile + snapshot publish to fire.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let snap = reader.read();
+    let entry = snap
+        .replicas
+        .get(&chain)
+        .expect("snapshot should include the replica update");
+    assert_eq!(entry.holders, vec![42]);
+
+    // Tidy.
+    let _ = drain_pipeline(
+        handle,
+        dispatcher,
+        loop_task,
+        exec_task,
+        Duration::from_millis(50),
+    )
+    .await;
 }

@@ -81,7 +81,7 @@ pub use event::{
     DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent, LocalReplicaIntentUpdate, MeshOsEvent,
     NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
 };
-pub use event_loop::{MeshOsHandle, MeshOsHandleError, MeshOsLoop};
+pub use event_loop::{MeshOsHandle, MeshOsHandleError, MeshOsLoop, MeshOsSnapshotReader};
 pub use executor::{
     ActionDispatcher, ActionExecutor, DispatchError, ExecutorHandle, ExecutorStats,
     ExecutorStatsSnapshot, LoggingDispatcher,
