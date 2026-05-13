@@ -2649,7 +2649,7 @@ mod tests {
         holders.push((1, caps_chain_only(root)));
         for i in 0..N {
             let child = 2 + i;
-            holders.push(((100 + i) as u64, caps_chain_forked_from(child, root)));
+            holders.push((100 + i, caps_chain_forked_from(child, root)));
         }
         let index = index_with(holders);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
