@@ -116,12 +116,27 @@ pub enum ReplicaTransitionEvent {
         at: Instant,
     },
     /// This coordinator stepped down from `Leader` to `Replica`
-    /// or `Idle`. MeshOS clears its mirror of
+    /// — the node remains a holder but is no longer leader.
+    /// MeshOS clears its mirror of
     /// `MeshOsState::replica_leader[origin_hash]` when the
     /// observer sees this — otherwise the loop would carry a
     /// stale leader pointer until a different node's
     /// `LeaderChanged` overwrites it.
     LeaderLost {
+        /// Substrate-level chain identifier.
+        origin_hash: u64,
+        /// Monotonic timestamp of the transition.
+        at: Instant,
+    },
+    /// This coordinator stepped down from `Leader` straight to
+    /// `Idle` — the node is no longer leader AND no longer a
+    /// holder. The two transitions are bundled into one event so
+    /// downstream sinks publish a single atomic update; firing
+    /// `Idled` and `LeaderLost` separately would let the events
+    /// channel drop one half under backpressure, leaving the
+    /// snapshot with either a phantom leader on a non-holder, or
+    /// a leader-less holder set.
+    LeaderLostAndIdled {
         /// Substrate-level chain identifier.
         origin_hash: u64,
         /// Monotonic timestamp of the transition.
@@ -423,6 +438,15 @@ impl ReplicationCoordinator {
                     at,
                 });
             }
+            // Leader → Idle: fire ONE bundled event so a
+            // downstream sink can't drop half of the (holder
+            // removal, leader clear) pair under backpressure.
+            (ReplicaRole::Leader, ReplicaRole::Idle) => {
+                self.fire_transition(ReplicaTransitionEvent::LeaderLostAndIdled {
+                    origin_hash: origin,
+                    at,
+                });
+            }
             (_, ReplicaRole::Idle) => {
                 self.fire_transition(ReplicaTransitionEvent::Idled {
                     origin_hash: origin,
@@ -442,13 +466,12 @@ impl ReplicationCoordinator {
                 at,
             });
         }
-        // Step-down transitions surface as LeaderLost so the
-        // MeshOS sink can clear its `replica_leader` mirror —
-        // otherwise the loop would carry a stale pointer until
-        // a different node's LeaderChanged overwrites it.
+        // Leader → Replica step-down — node remains a holder but
+        // is no longer leader. The Leader → Idle case is handled
+        // above by `LeaderLostAndIdled`.
         if matches!(
             (transition.from, transition.to),
-            (ReplicaRole::Leader, ReplicaRole::Replica) | (ReplicaRole::Leader, ReplicaRole::Idle)
+            (ReplicaRole::Leader, ReplicaRole::Replica)
         ) {
             self.fire_transition(ReplicaTransitionEvent::LeaderLost {
                 origin_hash: origin,

@@ -168,6 +168,15 @@ impl ReplicaTransitionObserver for MeshOsReplicaTransitionSink {
                     leader: None,
                 }
             }
+            ReplicaTransitionEvent::LeaderLostAndIdled { origin_hash, .. } => {
+                // Atomic pair: bundled into one MeshOsEvent so a
+                // queue-full drop can't split it into a phantom
+                // leader + holderless set.
+                MeshOsEvent::ReplicaLeaderLostAndRemoved {
+                    chain: origin_hash,
+                    holder: self.this_node,
+                }
+            }
         };
 
         match self.handle.try_publish(mesh_event) {
@@ -443,6 +452,61 @@ mod tests {
             .get(&0xBADC0DE)
             .expect("replicas entry exists after BecameHolder");
         assert_eq!(entry.leader, None, "LeaderLost should clear leader");
+    }
+
+    #[tokio::test]
+    async fn leader_to_idle_lands_as_one_event_clearing_leader_and_removing_holder() {
+        // Regression: a Leader → Idle transition used to fire two
+        // separate events (Idled + LeaderLost). If the channel
+        // were full one could drop, leaving the snapshot with
+        // either a phantom leader or a leader-less holder set.
+        // The substrate now fires `LeaderLostAndIdled` as one
+        // event; the sink translates it to one bundled
+        // `MeshOsEvent::ReplicaLeaderLostAndRemoved`.
+        const THIS_NODE: NodeId = 100;
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader,
+        } = MeshOsLoop::new(fast_cfg());
+        let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
+        let task = tokio::spawn(loop_.run());
+        // Seed: become a holder + leader.
+        sink.observe(ReplicaTransitionEvent::BecameHolder {
+            origin_hash: 0xDEADBEEF,
+            at: Instant::now(),
+        });
+        sink.observe(ReplicaTransitionEvent::LeaderChanged {
+            origin_hash: 0xDEADBEEF,
+            at: Instant::now(),
+        });
+        // Step down all the way to Idle — bundled event.
+        sink.observe(ReplicaTransitionEvent::LeaderLostAndIdled {
+            origin_hash: 0xDEADBEEF,
+            at: Instant::now(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
+        let snap = reader.read();
+        // Either the chain entry is absent (holder set empty —
+        // both holder removal and leader clear succeeded), or
+        // the entry has no holders AND no leader. A "phantom
+        // leader on no holder" or "holder without leader" is the
+        // exact regression we're guarding against.
+        if let Some(entry) = snap.replicas.get(&0xDEADBEEF) {
+            assert!(
+                !entry.holders.contains(&THIS_NODE),
+                "after LeaderLostAndIdled, THIS_NODE must not be in holders; got {:?}",
+                entry,
+            );
+            assert_eq!(
+                entry.leader, None,
+                "after LeaderLostAndIdled, leader must be cleared; got {:?}",
+                entry,
+            );
+        }
     }
 
     #[tokio::test]

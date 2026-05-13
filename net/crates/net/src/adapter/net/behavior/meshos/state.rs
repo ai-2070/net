@@ -186,6 +186,16 @@ impl MeshOsState {
                     self.replica_leader.remove(chain);
                 }
             }
+            MeshOsEvent::ReplicaLeaderLostAndRemoved { chain, holder } => {
+                // Atomic pair: clear the leader AND remove the
+                // holder. Two separate events could fragment
+                // under backpressure; bundling them in one fold
+                // call keeps the snapshot coherent.
+                self.replica_leader.remove(chain);
+                if let Some(entry) = self.replicas.get_mut(chain) {
+                    entry.remove(holder);
+                }
+            }
             MeshOsEvent::RttSample { peer, rtt } => {
                 self.rtt.insert(*peer, *rtt);
             }

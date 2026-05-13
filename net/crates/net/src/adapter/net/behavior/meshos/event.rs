@@ -105,6 +105,20 @@ pub enum MeshOsEvent {
         leader: Option<NodeId>,
     },
 
+    /// Bundled "leader stepped down AND node is no longer a
+    /// holder" event. Source: the replication coordinator's
+    /// `Leader → Idle` transition fires this as one event so a
+    /// downstream sink cannot drop half of the
+    /// (holder-removed, leader-cleared) pair under backpressure.
+    /// The fold updates both `replicas[chain]` (removes
+    /// `holder`) and `replica_leader[chain]` (clears) atomically.
+    ReplicaLeaderLostAndRemoved {
+        /// Chain whose holder + leader both changed.
+        chain: ChainId,
+        /// Node that lost both its holder slot and its leader role.
+        holder: NodeId,
+    },
+
     /// A maintenance-state transition was confirmed on the
     /// admin chain. Source (Phase E): the action executor's
     /// `CommitMaintenanceTransition` commit, re-observed via
