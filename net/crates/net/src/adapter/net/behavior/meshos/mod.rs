@@ -87,7 +87,10 @@ pub use executor::{
     ExecutorStatsSnapshot, LoggingDispatcher,
 };
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
-pub use sources::{attach_to_daemon_registry, MeshOsDaemonLifecycleSink};
+pub use sources::{
+    attach_to_daemon_registry, attach_to_replication_coordinator, MeshOsDaemonLifecycleSink,
+    MeshOsReplicaTransitionSink,
+};
 pub use state::{
     AvoidEntry, BlobObservation, DaemonLifecycle, DaemonStatus, DesiredState, MaintenanceMirror,
     MeshOsState,

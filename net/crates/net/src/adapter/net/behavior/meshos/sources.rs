@@ -27,8 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::adapter::net::compute::{DaemonLifecycleEvent, DaemonLifecycleObserver};
+use crate::adapter::net::redex::{ReplicaTransitionEvent, ReplicaTransitionObserver};
 
-use super::event::{DaemonLifecycleSignal, DaemonRef, MeshOsEvent};
+use super::event::{DaemonLifecycleSignal, DaemonRef, MeshOsEvent, NodeId, ReplicaUpdate};
 use super::event_loop::{MeshOsHandle, MeshOsHandleError};
 
 /// Adapts compute-side lifecycle events into MeshOS events. Hold
@@ -105,6 +106,84 @@ impl DaemonLifecycleObserver for MeshOsDaemonLifecycleSink {
             }
         }
     }
+}
+
+/// Adapts replication-coordinator transitions into MeshOS
+/// events. Hold behind `Arc`; install on each `ReplicationCoordinator`
+/// via `set_transition_observer`. Same drop-on-overflow posture
+/// as [`MeshOsDaemonLifecycleSink`].
+///
+/// `this_node` is the local node's identity; the sink fills it
+/// into every emitted `ReplicaUpdate::{Added, Removed}` so
+/// MeshOS reconcile sees consistent holder identities.
+#[derive(Debug)]
+pub struct MeshOsReplicaTransitionSink {
+    handle: MeshOsHandle,
+    this_node: NodeId,
+    dropped: AtomicU64,
+}
+
+impl MeshOsReplicaTransitionSink {
+    /// Construct a sink publishing to `handle`. `this_node` is
+    /// the local node's id, filled into emitted
+    /// `ReplicaUpdate { holder: this_node }` payloads.
+    pub fn new(handle: MeshOsHandle, this_node: NodeId) -> Self {
+        Self {
+            handle,
+            this_node,
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Total events the sink couldn't publish.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl ReplicaTransitionObserver for MeshOsReplicaTransitionSink {
+    fn observe(&self, event: ReplicaTransitionEvent) {
+        let mesh_event = match event {
+            ReplicaTransitionEvent::BecameHolder { origin_hash, .. } => {
+                MeshOsEvent::ReplicaUpdate(ReplicaUpdate::Added {
+                    chain: origin_hash,
+                    holder: self.this_node,
+                })
+            }
+            ReplicaTransitionEvent::Idled { origin_hash, .. } => {
+                MeshOsEvent::ReplicaUpdate(ReplicaUpdate::Removed {
+                    chain: origin_hash,
+                    holder: self.this_node,
+                })
+            }
+            ReplicaTransitionEvent::LeaderChanged { origin_hash, .. } => {
+                MeshOsEvent::ReplicaLeaderUpdate {
+                    chain: origin_hash,
+                    leader: Some(self.this_node),
+                }
+            }
+        };
+
+        match self.handle.try_publish(mesh_event) {
+            Ok(()) => {}
+            Err(MeshOsHandleError::QueueFull) | Err(MeshOsHandleError::LoopClosed) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// One-line wire-up: install the replica-transition sink on a
+/// `ReplicationCoordinator`. Returns the prior observer, if
+/// any. `this_node` rides into every emitted `ReplicaUpdate`.
+pub fn attach_to_replication_coordinator(
+    coord: &crate::adapter::net::redex::ReplicationCoordinator,
+    handle: MeshOsHandle,
+    this_node: NodeId,
+) -> Option<Arc<dyn ReplicaTransitionObserver>> {
+    coord.set_transition_observer(Some(Arc::new(MeshOsReplicaTransitionSink::new(
+        handle, this_node,
+    ))))
 }
 
 /// Helper: install the sink on a `DaemonRegistry` in one call.
@@ -227,6 +306,75 @@ mod tests {
         let _ = task.await;
 
         assert_eq!(sink.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn became_holder_event_publishes_replica_added() {
+        const THIS_NODE: NodeId = 100;
+        let (loop_, handle, _) = MeshOsLoop::new(fast_cfg());
+        let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
+        let task = tokio::spawn(loop_.run());
+
+        sink.observe(ReplicaTransitionEvent::BecameHolder {
+            origin_hash: 0xCAFE,
+            at: Instant::now(),
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
+        assert_eq!(sink.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn idled_event_publishes_replica_removed() {
+        const THIS_NODE: NodeId = 100;
+        let (loop_, handle, _) = MeshOsLoop::new(fast_cfg());
+        let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
+        let task = tokio::spawn(loop_.run());
+
+        sink.observe(ReplicaTransitionEvent::Idled {
+            origin_hash: 0xBEEF,
+            at: Instant::now(),
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
+        assert_eq!(sink.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn leader_changed_event_publishes_replica_leader_update() {
+        const THIS_NODE: NodeId = 100;
+        let (loop_, handle, _) = MeshOsLoop::new(fast_cfg());
+        let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
+        let task = tokio::spawn(loop_.run());
+
+        sink.observe(ReplicaTransitionEvent::LeaderChanged {
+            origin_hash: 0xC0FFEE,
+            at: Instant::now(),
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = task.await;
+        assert_eq!(sink.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn replica_sink_drops_increment_when_loop_is_closed() {
+        const THIS_NODE: NodeId = 100;
+        let (loop_, handle, _) = MeshOsLoop::new(fast_cfg());
+        let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = loop_.run().await;
+        drop(handle);
+        sink.observe(ReplicaTransitionEvent::BecameHolder {
+            origin_hash: 1,
+            at: Instant::now(),
+        });
+        assert_eq!(sink.dropped_count(), 1);
     }
 
     #[tokio::test]

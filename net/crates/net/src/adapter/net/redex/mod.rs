@@ -71,7 +71,8 @@ pub use replication_config::{
     REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX, REPLICATION_FACTOR_MIN,
 };
 pub use replication_coordinator::{
-    ChainTagSink, ChannelIdentity, CoordinatorError, ReplicationCoordinator,
+    ChainTagSink, ChannelIdentity, CoordinatorError, ReplicaTransitionEvent,
+    ReplicaTransitionObserver, ReplicationCoordinator,
 };
 pub use replication_election::{elect, ElectionOutcome};
 pub use replication_heartbeat::{HeartbeatTracker, PeerState, DEFAULT_MISS_THRESHOLD};
