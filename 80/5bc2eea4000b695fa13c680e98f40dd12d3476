@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/meshos/backpressure.rs
+  s_f68bb950203003::t_2e6ac3b8dd88b1 83,87
+net/crates/net/src/adapter/net/behavior/meshos/state.rs
+  s_f68bb950203003::t_70d354fa050c0a 381,386,390
+  s_f68bb950203003::t_536b5a134f03d7 30,37,41,43,45,49,54,56,58,63,70,72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "805bc2eea4000b695fa13c680e98f40dd12d3476",
+  "prompts": {},
+  "sessions": {
+    "s_f68bb950203003": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9226dcd-79b1-4985-9dd9-28aaac11c680",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
