@@ -284,7 +284,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             .backpressure
             .admit(&action.action, now, &self.config.backpressure)
         {
-            AdmissionResult::Admit => self.dispatch_now(action).await,
+            AdmissionResult::Admit => self.dispatch_now(action, now).await,
             AdmissionResult::Defer { retry_after } => {
                 ExecutorStats::inc(&self.stats.deferred);
                 self.deferred.push(DeferredEntry {
@@ -313,7 +313,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
         }
     }
 
-    async fn dispatch_now(&mut self, action: PendingAction) {
+    async fn dispatch_now(&mut self, action: PendingAction, admit_anchor: Instant) {
         let result = self
             .dispatcher
             .dispatch(action.action.clone())
@@ -324,6 +324,13 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                 let _ = append_dispatched(&self.chain_appender, &action);
             }
             Err(err) => {
+                // Dispatch did not happen — roll back the
+                // reservations admit installed against
+                // `admit_anchor` so unrelated future actions
+                // aren't gated by a side effect that never
+                // occurred.
+                self.backpressure
+                    .release_failed_admit(&action.action, admit_anchor);
                 if let Some(after) = err.retry_after {
                     ExecutorStats::inc(&self.stats.dispatch_retries);
                     let retry_ms = after.as_millis() as u64;
@@ -619,6 +626,53 @@ mod tests {
             .expect("executor did not exit after sender dropped")
             .expect("join");
         assert_eq!(stats.dispatched.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_failure_with_retry_releases_pull_cooldown() {
+        // Regression: a PullReplica admit sets the global pull
+        // cooldown; if dispatch fails the cooldown must be
+        // rolled back so unrelated pulls aren't gated by a side
+        // effect that never happened.
+        let (tx, rx) = mpsc::channel(8);
+        let cfg = fast_cfg();
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        // First dispatch fails with a long retry hint; the
+        // second admit (on a different chain) must succeed
+        // without waiting on the rolled-back cooldown.
+        dispatcher.fail_next(DispatchError::retry(
+            "transient",
+            Duration::from_secs(60),
+        ));
+        let exec = ActionExecutor::new(rx, cfg, Arc::clone(&dispatcher));
+        let task = tokio::spawn(exec.run());
+
+        tx.send(pending(
+            1,
+            MeshOsAction::PullReplica { chain: 1, source: 5 },
+        ))
+        .await
+        .unwrap();
+        // Brief settle: first action processed (admit + fail +
+        // release + heap push) before the second arrives.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(pending(
+            2,
+            MeshOsAction::PullReplica { chain: 2, source: 5 },
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(tx);
+
+        let stats = task.await.expect("join");
+        assert_eq!(
+            stats.dispatched.load(Ordering::Relaxed),
+            1,
+            "second pull should dispatch immediately after the first \
+             released its leaked cooldown",
+        );
+        assert_eq!(stats.dispatch_retries.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

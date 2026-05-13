@@ -179,6 +179,33 @@ impl BackpressureState {
         self.daemon_gates.insert(daemon, until);
     }
 
+    /// Roll back the reservations [`admit`] made for `action` at
+    /// `now`. Call after a dispatch failure: the cooldowns admit
+    /// installed reflect a side effect that never happened, so
+    /// leaving them in place would gate unrelated future actions
+    /// for nothing. Safe under the executor's single-threaded
+    /// admit/dispatch sequence — any prior admit's reservations
+    /// had to have elapsed for this admit to return `Admit`.
+    pub fn release_failed_admit(&mut self, action: &MeshOsAction, now: Instant) {
+        match action {
+            MeshOsAction::PullReplica { chain, .. } => {
+                if self.last_pull_admitted == Some(now) {
+                    self.last_pull_admitted = None;
+                }
+                self.chain_stabilization.remove(chain);
+            }
+            MeshOsAction::DropReplica { chain } => {
+                self.chain_stabilization.remove(chain);
+            }
+            MeshOsAction::MigrateBlob { .. } => {
+                if self.drain_window.last() == Some(&now) {
+                    self.drain_window.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Periodic-tick maintenance. Drops daemon gates that have
     /// elapsed; drops chain stabilization windows that have
     /// elapsed.
@@ -544,6 +571,90 @@ mod tests {
         for action in cases {
             assert_eq!(state.admit(&action, t(0), &cfg), AdmissionResult::Admit);
         }
+    }
+
+    #[test]
+    fn release_failed_admit_rolls_back_pull_cooldown_and_stabilization() {
+        let mut state = BackpressureState::new();
+        let cfg = BackpressureConfig::default();
+        let now = t_ms(0);
+        // First pull admits — cooldown + stabilization set.
+        assert_eq!(
+            state.admit(
+                &MeshOsAction::PullReplica { chain: 1, source: 2 },
+                now,
+                &cfg,
+            ),
+            AdmissionResult::Admit,
+        );
+        assert_eq!(state.last_pull_admitted, Some(now));
+        assert!(state.chain_stabilization.contains_key(&1));
+        // Dispatch failed — release.
+        state.release_failed_admit(
+            &MeshOsAction::PullReplica { chain: 1, source: 2 },
+            now,
+        );
+        assert!(state.last_pull_admitted.is_none());
+        assert!(!state.chain_stabilization.contains_key(&1));
+        // A pull on a different chain immediately after the
+        // release admits — the leaked cooldown would have
+        // forced Defer.
+        assert_eq!(
+            state.admit(
+                &MeshOsAction::PullReplica { chain: 2, source: 3 },
+                now,
+                &cfg,
+            ),
+            AdmissionResult::Admit,
+        );
+    }
+
+    #[test]
+    fn release_failed_admit_pops_drain_window_entry_for_migrate_blob() {
+        let mut state = BackpressureState::new();
+        let cfg = BackpressureConfig::default();
+        let now = t_ms(0);
+        let migrate = MeshOsAction::MigrateBlob { blob: 1, from: 1, to: 2 };
+        assert_eq!(state.admit(&migrate, now, &cfg), AdmissionResult::Admit);
+        assert_eq!(state.drain_window.len(), 1);
+        state.release_failed_admit(&migrate, now);
+        assert_eq!(state.drain_window.len(), 0);
+    }
+
+    #[test]
+    fn release_failed_admit_preserves_prior_admits_after_window() {
+        // PullReplica admits at t=0 (cooldown set), then a
+        // different chain admits at t=300ms (past the 250ms
+        // cooldown) and its dispatch fails. Release rolls back
+        // the second admit only; the first admit's pull (which
+        // succeeded) is conceptually unaffected, but since
+        // `last_pull_admitted` only tracks one anchor and the
+        // first cooldown has elapsed, the rollback leaves the
+        // state cleanly drained.
+        let mut state = BackpressureState::new();
+        let cfg = BackpressureConfig::default();
+        let _ = state.admit(
+            &MeshOsAction::PullReplica { chain: 1, source: 2 },
+            t_ms(0),
+            &cfg,
+        );
+        let later = t_ms(300);
+        let _ = state.admit(
+            &MeshOsAction::PullReplica { chain: 2, source: 2 },
+            later,
+            &cfg,
+        );
+        assert_eq!(state.last_pull_admitted, Some(later));
+        state.release_failed_admit(
+            &MeshOsAction::PullReplica { chain: 2, source: 2 },
+            later,
+        );
+        // Anchor cleared; chain 2 stabilization removed.
+        assert!(state.last_pull_admitted.is_none());
+        assert!(!state.chain_stabilization.contains_key(&2));
+        // Chain 1's stabilization (installed by the first admit)
+        // is untouched.
+        assert!(state.chain_stabilization.contains_key(&1));
     }
 
     #[test]
