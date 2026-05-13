@@ -2564,7 +2564,7 @@ pub extern "C" fn net_channel_hash(channel: *const c_char, out_hash: *mut u32) -
 use crate::adapter::net::behavior::capability::{
     AcceleratorInfo, AcceleratorType, CapabilityFilter, CapabilitySet, GpuInfo, GpuVendor,
     HardwareCapabilities, Modality, ModelCapability, ResourceLimits, SoftwareCapabilities,
-    ToolCapability,
+    ToolCapability, TAG_SCOPE_REGION_PREFIX, TAG_SCOPE_SUBNET_LOCAL, TAG_SCOPE_TENANT_PREFIX,
 };
 
 // ----- enum helpers (byte-for-byte mirrors of PyO3/NAPI) ---------------------
@@ -2954,8 +2954,23 @@ fn capability_set_from_json(caps: CapabilitySetJson) -> CapabilitySet {
     for t in caps.tools {
         cs = cs.add_tool(tool_from_json(t));
     }
+    // Reserved-prefix scope tags can't go through `add_tag` — it
+    // uses `Tag::parse_user` which rejects reserved prefixes and
+    // silently drops them, leaving the announcement with no scope
+    // and resolving to `CapabilityScope::Global` (visible to every
+    // tenant / region query). Route the three scope shapes to the
+    // typed helpers so wire-form `scope:*` strings from bindings
+    // land as `Tag::Reserved` entries the scope resolver sees.
     for tag in caps.tags {
-        cs = cs.add_tag(tag);
+        if tag == TAG_SCOPE_SUBNET_LOCAL {
+            cs = cs.with_subnet_local_scope();
+        } else if let Some(id) = tag.strip_prefix(TAG_SCOPE_TENANT_PREFIX) {
+            cs = cs.with_tenant_scope(id);
+        } else if let Some(name) = tag.strip_prefix(TAG_SCOPE_REGION_PREFIX) {
+            cs = cs.with_region_scope(name);
+        } else {
+            cs = cs.add_tag(tag);
+        }
     }
     if let Some(l) = caps.limits {
         cs = cs.with_limits(limits_from_json(l));
