@@ -1328,8 +1328,8 @@ mod tests {
         // Wait past the default TTL window. Permanent should
         // still hit.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let key = super::super::cache::CacheKey::for_plan(&plan, 0)
-            .expect("postcard-encodable plan");
+        let key =
+            super::super::cache::CacheKey::for_plan(&plan, 0).expect("postcard-encodable plan");
         assert!(cache.get(&key).is_some(), "permanent never expires by time");
     }
 

@@ -257,24 +257,16 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
                 return Ok(RunningQuery { handle, rows });
             }
             OperatorPlan::HashJoin { .. } => {
-                return self
-                    .execute_hash_join_federated(plan, handle)
-                    .await;
+                return self.execute_hash_join_federated(plan, handle).await;
             }
             OperatorPlan::AggregateCount { .. } => {
-                return self
-                    .execute_aggregate_count_federated(plan, handle)
-                    .await;
+                return self.execute_aggregate_count_federated(plan, handle).await;
             }
             OperatorPlan::AggregateNumeric { .. } => {
-                return self
-                    .execute_aggregate_numeric_federated(plan, handle)
-                    .await;
+                return self.execute_aggregate_numeric_federated(plan, handle).await;
             }
             OperatorPlan::AggregateReduction { .. } | OperatorPlan::AggregateDistinct { .. } => {
-                return self
-                    .execute_aggregate_e4_federated(plan, handle)
-                    .await;
+                return self.execute_aggregate_e4_federated(plan, handle).await;
             }
             OperatorPlan::Window { .. } => {
                 return self.execute_window_federated(plan, handle).await;
@@ -814,11 +806,8 @@ fn federated_hash_join(
     emit_unmatched_build: bool,
     swap: bool,
 ) -> Result<Vec<JoinedPair>, MeshError> {
-    let mut build = super::executor::build_hash_join_table(
-        build_rows,
-        key_mode,
-        "broadcast-hash-federated",
-    )?;
+    let mut build =
+        super::executor::build_hash_join_table(build_rows, key_mode, "broadcast-hash-federated")?;
 
     let mut out = Vec::new();
     for p in probe_rows {
@@ -858,11 +847,8 @@ fn federated_full_outer(
     right_rows: Vec<ResultRow>,
     key_mode: &super::planner::JoinKeyMode,
 ) -> Result<Vec<JoinedPair>, MeshError> {
-    let mut right_map = super::executor::build_hash_join_table(
-        right_rows,
-        key_mode,
-        "broadcast-hash-federated",
-    )?;
+    let mut right_map =
+        super::executor::build_hash_join_table(right_rows, key_mode, "broadcast-hash-federated")?;
 
     let mut out = Vec::new();
     for l in left_rows {

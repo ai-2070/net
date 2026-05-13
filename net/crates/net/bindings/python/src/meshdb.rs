@@ -791,14 +791,6 @@ impl PyMeshQuery {
         Ok(Self { plan: plan_of(op) })
     }
 
-    /// Inner / outer hash-join over row-intrinsic or JSON
-    /// payload keys. `kind` is one of `"inner"`,
-    /// `"left_outer"`, `"right_outer"`, `"full_outer"`.
-    /// `key` is the field name both sides share — row-
-    /// intrinsic names map to the typed enum
-    /// (`origin` / `seq` / `origin,seq`); anything else is
-    /// treated as a JSON payload path. `strategy` is
-    /// `"hash_broadcast"` (default) or `"sort_merge"`.
     /// Emit a pre-walked lineage as one ResultRow per entry.
     /// `entries` is a list of `LineageEntry` describing the
     /// chains reached during the walk (typically: index 0 is
@@ -832,6 +824,14 @@ impl PyMeshQuery {
         Ok(Self { plan: plan_of(op) })
     }
 
+    /// Inner / outer hash-join over row-intrinsic or JSON
+    /// payload keys. `kind` is one of `"inner"`,
+    /// `"left_outer"`, `"right_outer"`, `"full_outer"`.
+    /// `key` is the field name both sides share — row-
+    /// intrinsic names map to the typed enum
+    /// (`origin` / `seq` / `origin,seq`); anything else is
+    /// treated as a JSON payload path. `strategy` is
+    /// `"hash_broadcast"` (default) or `"sort_merge"`.
     /// `watermark_secs` is informational under snapshot
     /// semantics; kept on the operator for wire round-trip.
     #[staticmethod]
@@ -986,10 +986,7 @@ fn parse_group_by(group_by: Option<Vec<String>>) -> PyResult<Option<JoinKeyMode>
             ))),
         };
     }
-    if group_by.len() == 2
-        && group_by[0].as_str() == "origin"
-        && group_by[1].as_str() == "seq"
-    {
+    if group_by.len() == 2 && group_by[0].as_str() == "origin" && group_by[1].as_str() == "seq" {
         return Ok(Some(JoinKeyMode::OriginSeq));
     }
     Err(MeshDbError::new_err(format!(

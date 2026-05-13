@@ -1593,25 +1593,61 @@ mod tests {
     #[test]
     fn ffi_cached_runner_round_trips() {
         unsafe {
+            // Verify the cache is actually consulted by mutating
+            // the underlying store between calls and asserting the
+            // cached path returns the *first* observed value (stale),
+            // while bypass_cache returns the *current* value.
             let reader = net_meshdb_reader_new();
-            net_meshdb_reader_append(reader, 0x01, 1, b"v".as_ptr(), 1);
+            net_meshdb_reader_append(reader, 0x01, 1, b"v1".as_ptr(), 2);
             let runner = net_meshdb_runner_new_cached(reader);
             let query = net_meshdb_query_at(0x01, 1);
 
-            // Execute with Permanent policy.
+            let drain = |iter: *mut MeshDbIter| -> Vec<u8> {
+                let mut out = Vec::new();
+                loop {
+                    let mut origin: u64 = 0;
+                    let mut seq: u64 = 0;
+                    let mut payload_ptr: *mut u8 = ptr::null_mut();
+                    let mut payload_len: usize = 0;
+                    let rc = net_meshdb_iter_next(
+                        iter,
+                        &mut origin,
+                        &mut seq,
+                        &mut payload_ptr,
+                        &mut payload_len,
+                    );
+                    if rc != NET_MESHDB_OK {
+                        break;
+                    }
+                    out.extend_from_slice(slice::from_raw_parts(payload_ptr, payload_len));
+                    net_meshdb_payload_free(payload_ptr, payload_len);
+                }
+                out
+            };
+
+            // 1) Prime the cache with the initial payload.
             let iter1 =
                 net_meshdb_runner_execute_with(runner, query, 0, NET_MESHDB_CACHE_PERMANENT, 0.0);
             assert!(!iter1.is_null());
+            assert_eq!(drain(iter1), b"v1");
             net_meshdb_iter_free(iter1);
 
-            // Re-execute — should also succeed (cached hit
-            // path doesn't change observable result).
+            // 2) Mutate the underlying store (the runner shares
+            //    the reader's Arc<InMemoryStore>).
+            net_meshdb_reader_append(reader, 0x01, 1, b"v2".as_ptr(), 2);
+
+            // 3) Re-execute — Permanent cache returns stale "v1".
             let iter2 =
                 net_meshdb_runner_execute_with(runner, query, 0, NET_MESHDB_CACHE_PERMANENT, 0.0);
             assert!(!iter2.is_null());
+            assert_eq!(
+                drain(iter2),
+                b"v1",
+                "cached read must return the pre-mutation payload"
+            );
             net_meshdb_iter_free(iter2);
 
-            // Bypass cache — same result, different code path.
+            // 4) bypass_cache reads through to the live store.
             let iter3 = net_meshdb_runner_execute_with(
                 runner,
                 query,
@@ -1620,6 +1656,11 @@ mod tests {
                 5.0,
             );
             assert!(!iter3.is_null());
+            assert_eq!(
+                drain(iter3),
+                b"v2",
+                "bypass_cache must return the post-mutation payload"
+            );
             net_meshdb_iter_free(iter3);
 
             net_meshdb_query_free(query);
@@ -1769,9 +1810,7 @@ mod tests {
             "query_cancelled"
         );
         assert_eq!(
-            mesh_error_kind(&MeshError::PlannerError {
-                detail: "x".into()
-            }),
+            mesh_error_kind(&MeshError::PlannerError { detail: "x".into() }),
             "planner_error"
         );
         assert_eq!(

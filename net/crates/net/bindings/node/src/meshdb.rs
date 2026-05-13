@@ -665,10 +665,7 @@ fn parse_group_by(group_by: Option<Vec<String>>) -> Result<Option<JoinKeyMode>> 
             ))),
         };
     }
-    if group_by.len() == 2
-        && group_by[0].as_str() == "origin"
-        && group_by[1].as_str() == "seq"
-    {
+    if group_by.len() == 2 && group_by[0].as_str() == "origin" && group_by[1].as_str() == "seq" {
         return Ok(Some(JoinKeyMode::OriginSeq));
     }
     Err(mesh_err(format!(

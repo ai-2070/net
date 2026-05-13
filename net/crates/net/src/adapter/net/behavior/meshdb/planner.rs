@@ -2405,7 +2405,10 @@ mod tests {
                 .unwrap();
             let bytes = postcard::to_allocvec(&plan).unwrap();
             if let Some(prev) = &last_encoding {
-                assert_eq!(prev, &bytes, "BFS plan must not depend on HashSet iter order");
+                assert_eq!(
+                    prev, &bytes,
+                    "BFS plan must not depend on HashSet iter order"
+                );
             }
             last_encoding = Some(bytes);
         }

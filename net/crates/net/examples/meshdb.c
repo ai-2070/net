@@ -25,9 +25,10 @@
  */
 
 #include "../include/net_meshdb.h"
+#include <inttypes.h>
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int seed_chain(MeshDbReader* reader, uint64_t origin) {
     /* Three events on `origin`, seq 1..3. */
@@ -64,14 +65,12 @@ static void drain_iter(MeshDbIter* iter, const char* label) {
          * payload is a plain event body (atomic operator). */
         char* json = net_meshdb_decode_payload_json(payload, payload_len);
         if (json) {
-            printf("  origin=0x%llx seq=%llu sentinel=%s\n",
-                   (unsigned long long)origin, (unsigned long long)seq,
-                   json);
+            printf("  origin=0x%" PRIx64 " seq=%" PRIu64 " sentinel=%s\n",
+                   origin, seq, json);
             net_meshdb_free_string(json);
         } else {
-            printf("  origin=0x%llx seq=%llu payload=\"%.*s\"\n",
-                   (unsigned long long)origin, (unsigned long long)seq,
-                   (int)payload_len, (const char*)payload);
+            printf("  origin=0x%" PRIx64 " seq=%" PRIu64 " payload=\"%.*s\"\n",
+                   origin, seq, (int)payload_len, (const char*)payload);
         }
         net_meshdb_payload_free(payload, payload_len);
     }
