@@ -982,6 +982,23 @@ pub unsafe extern "C" fn net_meshdb_query_free(query: *mut MeshDbQuery) {
 // Runner + execute
 // =====================================================================
 
+/// Shared Tokio runtime — one per loaded cdylib, not one per
+/// runner. Spinning up a multi-thread runtime per runner was
+/// meaningful overhead for test harnesses that construct many
+/// runners; a single shared runtime suffices because each
+/// `runner_execute` blocks the calling thread until the row
+/// stream is drained anyway.
+fn shared_runtime() -> std::io::Result<Arc<Runtime>> {
+    use std::sync::OnceLock;
+    static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
+    if let Some(rt) = RT.get() {
+        return Ok(rt.clone());
+    }
+    let rt = Arc::new(Runtime::new()?);
+    let _ = RT.set(rt.clone());
+    Ok(RT.get().cloned().unwrap_or(rt))
+}
+
 /// Construct a runner that shares the given reader's
 /// underlying store via `Arc` clone.
 ///
@@ -1012,8 +1029,8 @@ pub unsafe extern "C" fn net_meshdb_runner_new(reader: *mut MeshDbReader) -> *mu
         return ptr::null_mut();
     }
     let store = (&*reader).store.clone();
-    let runtime = match Runtime::new() {
-        Ok(rt) => Arc::new(rt),
+    let runtime = match shared_runtime() {
+        Ok(rt) => rt,
         Err(_) => return ptr::null_mut(),
     };
     let executor: LocalMeshQueryExecutor<InMemoryStore> = LocalMeshQueryExecutor::new(store);
@@ -1043,8 +1060,8 @@ pub unsafe extern "C" fn net_meshdb_runner_new_cached(
         return ptr::null_mut();
     }
     let store = (&*reader).store.clone();
-    let runtime = match Runtime::new() {
-        Ok(rt) => Arc::new(rt),
+    let runtime = match shared_runtime() {
+        Ok(rt) => rt,
         Err(_) => return ptr::null_mut(),
     };
     let cache: Arc<dyn net::adapter::net::behavior::meshdb::cache::ResultCache> =

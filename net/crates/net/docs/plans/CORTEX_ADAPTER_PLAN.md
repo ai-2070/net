@@ -7,9 +7,9 @@
 **Shipped — exceeds spec.** The adapter boundary, the fold-driver, the watch / snapshot machinery, and typed-adapter exemplars (`TasksAdapter`, `MemoriesAdapter`) all landed in v0.13–v0.15 well beyond the §9 step list. Notable beyond-spec additions in code:
 
 - **`RedexFold<State>` trait** at `src/adapter/net/redex/fold.rs:15` (single `apply(&mut self, ev, state) -> Result<(), RedexError>` method).
-- **`CortexAdapter<State>` generic** at `src/adapter/net/cortex/adapter.rs:61` — `open` / `ingest` / `ingest_with_token` / `state` / `wait_for_seq` / `close` / `snapshot` / `open_from_snapshot` plus the v0.15 RYW token surface (`wait_for_token` at `adapter.rs:484`, `WaitForTokenError` at `:577`, `set_global_ryw_inflight_cap` exported).
-- **`TasksAdapter`** at `cortex/tasks/adapter.rs:59`, **`MemoriesAdapter`** at `cortex/memories/adapter.rs` — same `open` / `open_with_config` / `watch` / `snapshot_and_watch` / `snapshot` / `wait_for_token` shape on each.
-- **Watch surface** (`watch` + `snapshot_and_watch` returning `(initial: Vec<T>, stream: Pin<Box<dyn Stream<Item = Vec<T>>>>)`) and the underlying `CortexAdapter::changes() -> impl Stream<Item = u64>` / `changes_with_lag() -> impl Stream<Item = ChangeEvent>` (`adapter.rs:406` / `:425`) — the plan's §3 explicitly **defers** watch + snapshot+tail; reality exceeds that.
+- **`CortexAdapter<State>` generic** in `src/adapter/net/cortex/adapter.rs` — `open` / `ingest` / `ingest_with_token` / `state` / `wait_for_seq` / `close` / `snapshot` / `open_from_snapshot` plus the v0.15 RYW token surface (`wait_for_token`, `WaitForTokenError`, `set_global_ryw_inflight_cap` exported).
+- **`TasksAdapter`** in `cortex/tasks/adapter.rs`, **`MemoriesAdapter`** in `cortex/memories/adapter.rs` — same `open` / `open_with_config` / `watch` / `snapshot_and_watch` / `snapshot` / `wait_for_token` shape on each.
+- **Watch surface** (`watch` + `snapshot_and_watch` returning `(initial: Vec<T>, stream: Pin<Box<dyn Stream<Item = Vec<T>>>>)`) and the underlying `CortexAdapter::changes() -> impl Stream<Item = u64>` / `changes_with_lag() -> impl Stream<Item = ChangeEvent>` — the plan's §3 explicitly **defers** watch + snapshot+tail; reality exceeds that.
 
 The plan's §9 step list (1–12) was a v1 design scope; the code has gone past it. Companion to [`REDEX_PLAN.md`](REDEX_PLAN.md) and [`REDEX_V2_PLAN.md`](REDEX_V2_PLAN.md) (both shipped).
 

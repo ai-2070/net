@@ -53,11 +53,14 @@ if (
   });
 }
 
-// Re-export the shimmed types so consumers can rely on a single
-// import path. The named re-exports come straight from the native
-// binding; the shim above wires the prototype before they're used.
-export const { MeshQuery, MeshQueryRunner, MeshQueryStream, InMemoryChainReader } =
-  native as Record<string, unknown>;
+// NOTE: this module's primary purpose is the AsyncIterable
+// side-effect attached above. We deliberately do NOT re-export
+// the typed classes from here — going through `native as
+// Record<string, unknown>` would downgrade them to `unknown`,
+// silently weakening callers that imported them from
+// `@ai2070/net/meshdb` versus `@ai2070/net`. Use the typed
+// re-exports from `@ai2070/net` instead; this module only
+// needs `import "@ai2070/net/meshdb"` for the iterator shim.
 
 /**
  * Result of {@link parseMeshDbErrorKind}: extracted structured

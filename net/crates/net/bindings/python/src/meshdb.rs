@@ -1339,6 +1339,23 @@ impl PyInMemoryChainReader {
     }
 }
 
+/// Shared Tokio runtime — one per Python interpreter process,
+/// not one per runner. Spinning up a multi-thread runtime per
+/// runner was meaningful overhead for test harnesses that
+/// construct many runners; a single shared runtime suffices
+/// because the runner blocks the caller's thread anyway
+/// (sync-drain design).
+fn shared_runtime() -> Result<Arc<Runtime>, std::io::Error> {
+    use std::sync::OnceLock;
+    static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
+    if let Some(rt) = RT.get() {
+        return Ok(rt.clone());
+    }
+    let rt = Arc::new(Runtime::new()?);
+    let _ = RT.set(rt.clone());
+    Ok(RT.get().cloned().unwrap_or(rt))
+}
+
 /// Owns a [`LocalMeshQueryExecutor`] + a Tokio runtime; exposes
 /// `.execute(query, options) -> list[ResultRow]`. Sync drain by
 /// design — locked decision: Python is sync-first, async wrapper
@@ -1359,7 +1376,7 @@ impl PyMeshQueryRunner {
     #[new]
     #[pyo3(signature = (reader, enable_cache=false))]
     fn new(reader: &PyInMemoryChainReader, enable_cache: bool) -> PyResult<Self> {
-        let runtime = Runtime::new()
+        let runtime = shared_runtime()
             .map_err(|e| MeshDbError::new_err(format!("failed to construct tokio runtime: {e}")))?;
         let store = reader.inner.clone();
         let executor: LocalMeshQueryExecutor<InMemoryStore> = if enable_cache {
@@ -1371,7 +1388,7 @@ impl PyMeshQueryRunner {
             LocalMeshQueryExecutor::new(store)
         };
         Ok(Self {
-            runtime: Arc::new(runtime),
+            runtime,
             executor: Arc::new(executor),
         })
     }

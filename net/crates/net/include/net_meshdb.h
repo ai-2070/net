@@ -71,10 +71,21 @@
  * The crate owns a Tokio multi-thread runtime per `MeshDbRunner`.
  * `execute` / `execute_with` block the caller's thread until the
  * full result stream is drained into the returned iterator.
- * Multiple runners can coexist; each holds its own runtime. The
- * Go binding wraps `execute` in a goroutine to surface results
- * through a Go channel — non-Go consumers can pick whatever
- * threading discipline matches their language.
+ * Multiple runners can coexist; each holds its own runtime.
+ *
+ * Handles are safe to MOVE across threads (Send-equivalent) —
+ * the Go binding wraps `execute` in a goroutine to surface
+ * results through a Go channel. Concurrent calls from
+ * multiple threads on the SAME handle (Sync-equivalent
+ * behaviour) are NOT supported in this slice: a single
+ * `MeshDbRunner` or `MeshDbIter` must be used from one thread
+ * at a time (or guarded by external synchronisation). The
+ * thread-local last-error pair behaves like POSIX errno —
+ * each calling thread sees its own most-recent error.
+ *
+ * Non-Go consumers can pick whatever threading discipline
+ * matches their language as long as they respect the
+ * single-thread-at-a-time-per-handle constraint.
  *
  * # Wire-format payloads
  *
