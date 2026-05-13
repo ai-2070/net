@@ -21,7 +21,8 @@ use net::adapter::net::behavior::meshos::{
     attach_to_daemon_registry, ActionExecutor, AdminEvent, ChainId, DaemonIntent,
     DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent,
     LocalReplicaIntentUpdate, LoggingDispatcher, MaintenanceTransition, MeshOsAction,
-    MeshOsConfig, MeshOsEvent, MeshOsLoop, MeshOsSnapshotReader, NodeId, ReplicaUpdate,
+    MeshOsConfig, MeshOsEvent, MeshOsLoop, MeshOsRuntime, MeshOsSnapshotReader, NodeId,
+    ReplicaUpdate,
 };
 use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::compute::{
@@ -513,6 +514,100 @@ fn spawn_pipeline_with_reader(
     let loop_task = tokio::spawn(mesh_loop.run());
     let exec_task = tokio::spawn(exec.run());
     (handle, dispatcher, loop_task, exec_task, reader)
+}
+
+// ---------- MeshOsRuntime convenience-pattern tests ----------
+
+#[tokio::test]
+async fn runtime_pattern_drives_daemon_intent_to_start_daemon_dispatch() {
+    // The MeshOsRuntime convenience pattern: one call replaces
+    // the hand-wired loop + executor + handle + reader four-tuple.
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let rt = MeshOsRuntime::start(fast_config(), Arc::clone(&dispatcher));
+
+    let d = daemon("telemetry", 1);
+    rt.handle()
+        .publish(MeshOsEvent::DaemonIntentUpdate(DaemonIntentUpdate {
+            daemon: d.clone(),
+            intent: DaemonIntent::Run,
+        }))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let stats = rt.shutdown().await.expect("clean shutdown");
+
+    let log = dispatcher.log();
+    assert!(
+        log.iter().any(|a| matches!(
+            a,
+            MeshOsAction::StartDaemon { daemon } if *daemon == d
+        )),
+        "expected StartDaemon in dispatcher log; got {log:?}",
+    );
+    assert!(stats.executor.dispatched >= 1);
+}
+
+#[tokio::test]
+async fn runtime_pattern_with_registry_source_converter() {
+    // End-to-end demo of the recommended wiring:
+    //   1. MeshOsRuntime::start(...)
+    //   2. attach_to_daemon_registry(&registry, rt.handle_clone())
+    //   3. registry.register(...) — flows through to MeshOS.
+    //
+    // No DaemonIntentUpdate published here; we just verify the
+    // sink translates the lifecycle event into the loop's
+    // event stream (observable via the snapshot reader's
+    // daemons map).
+    use net::adapter::net::behavior::capability::CapabilityFilter;
+    use net::adapter::net::compute::{
+        DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon,
+    };
+    use net::adapter::net::state::causal::CausalEvent;
+    use net::adapter::net::EntityKeypair;
+
+    struct NoopDaemon {
+        name: String,
+    }
+    impl MeshDaemon for NoopDaemon {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn requirements(&self) -> CapabilityFilter {
+            CapabilityFilter::default()
+        }
+        fn process(&mut self, _event: &CausalEvent) -> Result<Vec<bytes::Bytes>, DaemonError> {
+            Ok(Vec::new())
+        }
+    }
+
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let rt = MeshOsRuntime::start(fast_config(), Arc::clone(&dispatcher));
+    let registry = DaemonRegistry::new();
+    let _prior = attach_to_daemon_registry(&registry, rt.handle_clone());
+
+    let kp = EntityKeypair::generate();
+    let daemon_id = kp.origin_hash();
+    let host = DaemonHost::new(
+        Box::new(NoopDaemon {
+            name: "watcher".into(),
+        }),
+        kp,
+        DaemonHostConfig::default(),
+    );
+    registry.register(host).unwrap();
+
+    // Wait for the Registered event to flow loop-side + tick +
+    // snapshot publish.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let snap = rt.snapshot();
+    let daemon = snap
+        .daemons
+        .get(&daemon_id)
+        .expect("snapshot should reflect the registered daemon");
+    assert_eq!(daemon.name, "watcher");
+
+    let _ = rt.shutdown().await;
 }
 
 #[tokio::test]
