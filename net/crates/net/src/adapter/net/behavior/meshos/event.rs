@@ -176,7 +176,7 @@ pub enum DaemonLifecycleSignal {
 }
 
 /// Daemon-self-reported health. Re-exported from the trait
-/// module ([`crate::adapter::net::compute::daemon::DaemonHealth`])
+/// module ([`crate::adapter::net::compute::DaemonHealth`])
 /// so MeshOS and the daemon trait stay in sync on one canonical
 /// type — `MeshDaemon::health() -> DaemonHealth` is the same
 /// `DaemonHealth` MeshOS folds.

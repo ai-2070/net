@@ -2,7 +2,7 @@
 //! supervised daemon receives from MeshOS, in the SDK's
 //! richer form (Instant-based deadlines). The supervisor
 //! integration layer converts to the WASM-friendly
-//! [`crate::adapter::net::compute::daemon::DaemonControl`]
+//! [`crate::adapter::net::compute::DaemonControl`]
 //! before invoking the daemon's `on_control` method.
 //!
 //! Two parallel forms intentionally:

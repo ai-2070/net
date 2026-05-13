@@ -44,7 +44,7 @@
 //! - [`config`] — `MeshOsConfig` + `BackpressureConfig`. Defaults
 //!   match the plan's locked decisions (tick = 500 ms heartbeat-
 //!   aligned; queue capacities = 1024).
-//! - [`reconcile`] — `reconcile(actual, desired) -> Vec<MeshOsAction>`
+//! - [`mod@reconcile`] — `reconcile(actual, desired) -> Vec<MeshOsAction>`
 //!   pure sync function. Phase A returns `vec![]`.
 //! - [`event_loop`] — `MeshOsLoop` + `MeshOsHandle`. The loop
 //!   body. `MeshOsHandle::publish` is the source-side fan-in API.

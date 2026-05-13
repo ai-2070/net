@@ -8,7 +8,7 @@
 //! event loop.
 //!
 //! First converter: [`MeshOsDaemonLifecycleSink`] — adapts the
-//! [`crate::adapter::net::compute::daemon::DaemonLifecycleObserver`]
+//! [`crate::adapter::net::compute::DaemonLifecycleObserver`]
 //! trait to MeshOS event publishing. Install via
 //! `DaemonRegistry::set_lifecycle_observer(sink)`; the
 //! registry's register / replace / unregister paths fire
