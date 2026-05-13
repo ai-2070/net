@@ -294,11 +294,14 @@ fn diff_maintenance(
 ) {
     let target = match &actual.local_maintenance {
         MaintenanceState::Active => None,
-        MaintenanceState::EnteringMaintenance { deadline, .. } => {
+        MaintenanceState::EnteringMaintenance { since, deadline, .. } => {
             if all_replicas_drained_locally(actual, this_node) && all_daemons_stopped(actual) {
                 Some(MaintenanceTransition::Maintenance)
             } else if deadline.map(|d| now >= d).unwrap_or(false) {
-                Some(MaintenanceTransition::DrainFailed)
+                let elapsed_ms = now.saturating_duration_since(*since).as_millis();
+                Some(MaintenanceTransition::DrainFailed {
+                    reason: format!("drain deadline elapsed after {elapsed_ms}ms"),
+                })
             } else {
                 None
             }
@@ -1449,13 +1452,20 @@ mod tests {
             &SchedulerConfig::default(),
             None,
         );
-        assert_eq!(
-            actions,
-            vec![MeshOsAction::CommitMaintenanceTransition {
-                node: THIS_NODE,
-                target: MaintenanceTransition::DrainFailed,
-            }],
-        );
+        assert_eq!(actions.len(), 1, "expected exactly one action; got {actions:?}");
+        match &actions[0] {
+            MeshOsAction::CommitMaintenanceTransition {
+                node,
+                target: MaintenanceTransition::DrainFailed { reason },
+            } => {
+                assert_eq!(*node, THIS_NODE);
+                assert!(
+                    reason.contains("drain deadline elapsed"),
+                    "expected drain deadline reason; got {reason:?}",
+                );
+            }
+            other => panic!("expected DrainFailed transition; got {other:?}"),
+        }
     }
 
     #[test]

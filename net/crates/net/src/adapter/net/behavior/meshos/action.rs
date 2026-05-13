@@ -184,7 +184,7 @@ pub enum MeshOsAction {
 /// Phase E. The set of maintenance-state transitions the
 /// reconcile pass can commit. Each transition is idempotent —
 /// applying it twice is a no-op.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum MaintenanceTransition {
     /// Active → EnteringMaintenance. Triggers replica freeze +
@@ -198,7 +198,15 @@ pub enum MaintenanceTransition {
     ExitingMaintenance,
     /// EnteringMaintenance → DrainFailed. Deadline elapsed with
     /// replicas / daemons unable to drain; needs operator action.
-    DrainFailed,
+    /// `reason` carries the deadline / observed-condition message
+    /// so the chain commit can record it; the
+    /// `MaintenanceTransitionObserved` fold consumes it into
+    /// `MaintenanceState::DrainFailed { reason }`.
+    DrainFailed {
+        /// Operator-readable reason recorded into the chain
+        /// commit and the local mirror.
+        reason: String,
+    },
     /// ExitingMaintenance → Recovery. Ramp-up window active;
     /// node is on the avoid list for new placements.
     Recovery,
