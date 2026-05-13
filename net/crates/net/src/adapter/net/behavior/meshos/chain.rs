@@ -324,6 +324,7 @@ impl RedexFold<MeshOsSnapshot> for MeshOsSnapshotFold {
         let record = decode_record(&ev.payload).map_err(|e| {
             RedexError::Decode(format!("ActionChainRecord wire decode: {e}"))
         })?;
+        let recorded_at_ms = record.emitted_at_ms;
         match record.disposition {
             ActionDisposition::Dispatched => {
                 // Successful dispatch isn't a failure — no
@@ -334,6 +335,7 @@ impl RedexFold<MeshOsSnapshot> for MeshOsSnapshotFold {
                     state,
                     format!("action-id:{}:{}", record.id, record.kind),
                     reason,
+                    recorded_at_ms,
                 );
             }
             ActionDisposition::Gated { reason, cooldown_ms } => {
@@ -345,6 +347,7 @@ impl RedexFold<MeshOsSnapshot> for MeshOsSnapshotFold {
                     state,
                     format!("action-id:{}:{}", record.id, record.kind),
                     detail,
+                    recorded_at_ms,
                 );
             }
         }
@@ -352,14 +355,19 @@ impl RedexFold<MeshOsSnapshot> for MeshOsSnapshotFold {
     }
 }
 
-fn push_failure(state: &mut MeshOsSnapshot, source: String, reason: String) {
+fn push_failure(
+    state: &mut MeshOsSnapshot,
+    source: String,
+    reason: String,
+    recorded_at_ms: u64,
+) {
     if state.recent_failures.len() >= RECENT_FAILURES_CAPACITY {
         state.recent_failures.pop_front();
     }
     state.recent_failures.push_back(FailureRecord {
         source,
         reason,
-        age_ms: 0,
+        recorded_at_ms,
     });
 }
 

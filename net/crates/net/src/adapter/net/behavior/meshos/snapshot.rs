@@ -269,9 +269,20 @@ pub struct FailureRecord {
     pub source: String,
     /// Operator-readable reason.
     pub reason: String,
-    /// Milliseconds before the snapshot when the failure was
-    /// recorded.
-    pub age_ms: u64,
+    /// Wall-clock millis-since-Unix-epoch when the failure was
+    /// recorded. Replay-stable (the same chain replayed on two
+    /// nodes produces the same value). Consumers compute the
+    /// relative "age" against their local clock at read time.
+    pub recorded_at_ms: u64,
+}
+
+impl FailureRecord {
+    /// Age in ms relative to `now_ms` (Unix-epoch ms). Returns 0
+    /// for records dated in the future from `now_ms`'s
+    /// perspective (clock skew between producer and consumer).
+    pub fn age_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.recorded_at_ms)
+    }
 }
 
 impl MeshOsSnapshot {
@@ -461,10 +472,18 @@ pub fn action_kind_str(action: &MeshOsAction) -> &'static str {
 /// Helper for tests + callers: dummy `now`-anchored
 /// recent-failure record builder.
 pub fn failure_record(source: impl Into<String>, reason: impl Into<String>, age: Duration) -> FailureRecord {
+    // `age` is interpreted as "this many ms before now"; produce
+    // a `recorded_at_ms` that, evaluated at the current
+    // wall-clock, projects back to `age`.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let recorded_at_ms = now_ms.saturating_sub(age.as_millis() as u64);
     FailureRecord {
         source: source.into(),
         reason: reason.into(),
-        age_ms: age.as_millis() as u64,
+        recorded_at_ms,
     }
 }
 
@@ -492,6 +511,22 @@ mod tests {
             id,
             name: name.into(),
         }
+    }
+
+    #[test]
+    fn failure_record_age_ms_derives_from_recorded_at_ms() {
+        // Regression for I12: the field used to be a constant
+        // `age_ms = 0`. It's now a Unix-epoch timestamp;
+        // consumers compute the relative age locally.
+        let r = FailureRecord {
+            source: "test".into(),
+            reason: "boom".into(),
+            recorded_at_ms: 1_000,
+        };
+        assert_eq!(r.age_ms(3_000), 2_000);
+        // Clock skew where a peer reports a record dated after
+        // the consumer's "now" produces 0 (saturating).
+        assert_eq!(r.age_ms(500), 0);
     }
 
     #[test]

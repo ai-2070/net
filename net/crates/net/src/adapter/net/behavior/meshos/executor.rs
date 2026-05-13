@@ -481,10 +481,14 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
         if self.recent_failures.len() >= RECENT_FAILURES_CAPACITY {
             self.recent_failures.pop_front();
         }
+        let recorded_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         self.recent_failures.push_back(FailureRecord {
             source,
             reason,
-            age_ms: 0,
+            recorded_at_ms,
         });
     }
 
