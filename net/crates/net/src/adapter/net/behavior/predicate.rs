@@ -471,9 +471,9 @@ impl Predicate {
 
         // Helper: emit a leaf node, push its index on the
         // child_stack so the enclosing composite picks it up.
-        let mut emit = |nodes: &mut Vec<PredicateNodeWire>,
-                        child_stack: &mut Vec<u32>,
-                        node: PredicateNodeWire| {
+        let emit = |nodes: &mut Vec<PredicateNodeWire>,
+                    child_stack: &mut Vec<u32>,
+                    node: PredicateNodeWire| {
             let idx = nodes.len() as u32;
             nodes.push(node);
             child_stack.push(idx);
