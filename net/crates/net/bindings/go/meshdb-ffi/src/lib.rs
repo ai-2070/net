@@ -178,6 +178,27 @@ macro_rules! ffi_guard {
     }};
 }
 
+/// Helper inside a factory body: record an "invalid_arg" last-
+/// error with the supplied detail and return `null_mut()`. Use:
+///
+/// ```ignore
+/// if inner.is_null() {
+///     invalid_arg_null!("net_meshdb_query_count: null inner");
+/// }
+/// ```
+///
+/// Pairs with `ffi_guard!`: every factory's null-return path
+/// populates the per-thread last-error pair so consumers can
+/// distinguish "bad group_by" from "null inner" via the kind +
+/// message getters. Without this, the bare `null_mut()` is
+/// indistinguishable from any other validation failure.
+macro_rules! invalid_arg_null {
+    ($detail:expr) => {{
+        set_last_error_static($detail, "invalid_arg");
+        return ptr::null_mut();
+    }};
+}
+
 /// Opaque handle to a Phase F-less local executor over an
 /// in-memory chain reader. Holds its own `Arc<InMemoryStore>`
 /// clone so the runner survives even if the caller frees the
@@ -361,7 +382,9 @@ pub extern "C" fn net_meshdb_query_at(origin: u64, seq: u64) -> *mut MeshDbQuery
 pub extern "C" fn net_meshdb_query_between(origin: u64, start: u64, end: u64) -> *mut MeshDbQuery {
     ffi_guard!(ptr::null_mut(), {
         if start >= end {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_between: start must be strictly less than end"
+            );
         }
         let plan = plan_of(OperatorPlan::BetweenRead {
             origin,
@@ -445,8 +468,11 @@ pub unsafe extern "C" fn net_meshdb_query_window(
     size: u64,
 ) -> *mut MeshDbQuery {
     ffi_guard!(ptr::null_mut(), {
-        if inner.is_null() || size == 0 {
-            return ptr::null_mut();
+        if inner.is_null() {
+            invalid_arg_null!("net_meshdb_query_window: null inner query");
+        }
+        if size == 0 {
+            invalid_arg_null!("net_meshdb_query_window: window size must be > 0");
         }
         let inner_node = (&*inner).plan.root.clone();
         let plan = plan_of(OperatorPlan::Window {
@@ -470,10 +496,12 @@ pub unsafe extern "C" fn net_meshdb_query_count(
 ) -> *mut MeshDbQuery {
     ffi_guard!(ptr::null_mut(), {
         if inner.is_null() {
-            return ptr::null_mut();
+            invalid_arg_null!("net_meshdb_query_count: null inner query");
         }
         let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_count: group_by must be null, empty, 'origin', 'seq', or 'origin,seq'"
+            );
         };
         let inner_node = (&*inner).plan.root.clone();
         let plan = plan_of(OperatorPlan::AggregateCount {
@@ -501,13 +529,17 @@ pub unsafe extern "C" fn net_meshdb_query_numeric_agg(
 ) -> *mut MeshDbQuery {
     ffi_guard!(ptr::null_mut(), {
         if inner.is_null() {
-            return ptr::null_mut();
+            invalid_arg_null!("net_meshdb_query_numeric_agg: null inner query");
         }
         let (Some(kind), Some(field)) = (cstr_to_string(kind), cstr_to_string(field)) else {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_numeric_agg: kind and field must be non-null UTF-8 C-strings"
+            );
         };
         let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_numeric_agg: group_by must be null, empty, 'origin', 'seq', or 'origin,seq'"
+            );
         };
         let inner_node = (&*inner).plan.root.clone();
         let op = match kind.as_str() {
@@ -540,7 +572,9 @@ pub unsafe extern "C" fn net_meshdb_query_numeric_agg(
                 group_by: group_by_mode,
                 field_path: field,
             },
-            _ => return ptr::null_mut(),
+            _ => invalid_arg_null!(
+                "net_meshdb_query_numeric_agg: kind must be 'sum', 'avg', 'min', 'max', or 'distinct_count'"
+            ),
         };
         Box::into_raw(Box::new(MeshDbQuery { plan: plan_of(op) }))
     })
@@ -559,14 +593,23 @@ pub unsafe extern "C" fn net_meshdb_query_percentile(
     group_by: *const std::ffi::c_char,
 ) -> *mut MeshDbQuery {
     ffi_guard!(ptr::null_mut(), {
-        if inner.is_null() || !p.is_finite() || !(0.0..=1.0).contains(&p) {
-            return ptr::null_mut();
+        if inner.is_null() {
+            invalid_arg_null!("net_meshdb_query_percentile: null inner query");
+        }
+        if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+            invalid_arg_null!(
+                "net_meshdb_query_percentile: p must be finite in [0.0, 1.0]"
+            );
         }
         let Some(field) = cstr_to_string(field) else {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_percentile: field must be a non-null UTF-8 C-string"
+            );
         };
         let Ok(group_by_mode) = parse_group_by_cstr(group_by) else {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_percentile: group_by must be null, empty, 'origin', 'seq', or 'origin,seq'"
+            );
         };
         let inner_node = (&*inner).plan.root.clone();
         let plan = plan_of(OperatorPlan::AggregateReduction {
@@ -601,23 +644,29 @@ pub unsafe extern "C" fn net_meshdb_query_join(
 ) -> *mut MeshDbQuery {
     ffi_guard!(ptr::null_mut(), {
         if left.is_null() || right.is_null() {
-            return ptr::null_mut();
+            invalid_arg_null!("net_meshdb_query_join: null left or right query");
         }
         let (Some(kind), Some(key)) = (cstr_to_string(kind), cstr_to_string(key)) else {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_join: kind and key must be non-null UTF-8 C-strings"
+            );
         };
         let kind = match kind.as_str() {
             "inner" => JoinKind::Inner,
             "left_outer" => JoinKind::LeftOuter,
             "right_outer" => JoinKind::RightOuter,
             "full_outer" => JoinKind::FullOuter,
-            _ => return ptr::null_mut(),
+            _ => invalid_arg_null!(
+                "net_meshdb_query_join: kind must be 'inner', 'left_outer', 'right_outer', or 'full_outer'"
+            ),
         };
         let strategy_str = cstr_to_string(strategy);
         let strategy = match strategy_str.as_deref() {
             None | Some("") | Some("hash_broadcast") => JoinStrategy::HashBroadcast,
             Some("sort_merge") => JoinStrategy::SortMerge,
-            _ => return ptr::null_mut(),
+            _ => invalid_arg_null!(
+                "net_meshdb_query_join: strategy must be null, 'hash_broadcast', or 'sort_merge'"
+            ),
         };
         // Canonical join key tokens across all shims:
         // "origin", "seq", "origin,seq". Anything else is treated
@@ -663,44 +712,64 @@ pub unsafe extern "C" fn net_meshdb_query_lineage_emit(
 ) -> *mut MeshDbQuery {
     ffi_guard!(ptr::null_mut(), {
         if entries_json.is_null() || direction.is_null() {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_lineage_emit: entries_json and direction must be non-null"
+            );
         }
         let Ok(json) = std::ffi::CStr::from_ptr(entries_json).to_str() else {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_lineage_emit: entries_json is not valid UTF-8"
+            );
         };
         let Ok(dir_str) = std::ffi::CStr::from_ptr(direction).to_str() else {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_lineage_emit: direction is not valid UTF-8"
+            );
         };
         let direction = match dir_str {
             "back" => LineageDirection::Back,
             "forward" => LineageDirection::Forward,
-            _ => return ptr::null_mut(),
+            _ => invalid_arg_null!(
+                "net_meshdb_query_lineage_emit: direction must be 'back' or 'forward'"
+            ),
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-            return ptr::null_mut();
+            invalid_arg_null!("net_meshdb_query_lineage_emit: entries_json is not valid JSON");
         };
         let Some(arr) = value.as_array() else {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_lineage_emit: entries_json must be a JSON array"
+            );
         };
         let mut entries = Vec::with_capacity(arr.len());
         for e in arr {
             let Some(obj) = e.as_object() else {
-                return ptr::null_mut();
+                invalid_arg_null!(
+                    "net_meshdb_query_lineage_emit: each entry must be a JSON object"
+                );
             };
             let Some(entry_origin) = obj.get("origin").and_then(|x| x.as_u64()) else {
-                return ptr::null_mut();
+                invalid_arg_null!(
+                    "net_meshdb_query_lineage_emit: entry.origin must be a u64"
+                );
             };
             let Some(depth) = obj.get("depth").and_then(|x| x.as_u64()) else {
-                return ptr::null_mut();
+                invalid_arg_null!(
+                    "net_meshdb_query_lineage_emit: entry.depth must be a non-negative integer"
+                );
             };
             let Ok(depth) = u32::try_from(depth) else {
-                return ptr::null_mut();
+                invalid_arg_null!(
+                    "net_meshdb_query_lineage_emit: entry.depth exceeds u32 range"
+                );
             };
             let tip_seq = match obj.get("tip_seq") {
                 None | Some(serde_json::Value::Null) => None,
                 Some(v) => match v.as_u64() {
                     Some(s) => Some(SeqNum(s)),
-                    None => return ptr::null_mut(),
+                    None => invalid_arg_null!(
+                        "net_meshdb_query_lineage_emit: entry.tip_seq must be null or a u64"
+                    ),
                 },
             };
             entries.push(LineageEntry {
@@ -759,13 +828,19 @@ pub unsafe extern "C" fn net_meshdb_query_filter_json(
 ) -> *mut MeshDbQuery {
     ffi_guard!(ptr::null_mut(), {
         if inner.is_null() || predicate_json.is_null() {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_filter_json: inner and predicate_json must be non-null"
+            );
         }
         let Ok(json) = std::ffi::CStr::from_ptr(predicate_json).to_str() else {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_filter_json: predicate_json is not valid UTF-8"
+            );
         };
         let Ok(predicate) = parse_predicate_json(json) else {
-            return ptr::null_mut();
+            invalid_arg_null!(
+                "net_meshdb_query_filter_json: predicate_json failed to parse (malformed or too deep)"
+            );
         };
         let inner_node = (&*inner).plan.root.clone();
         let plan = plan_of(OperatorPlan::Filter {
@@ -1103,12 +1178,18 @@ fn shared_runtime() -> std::io::Result<Arc<Runtime>> {
 pub unsafe extern "C" fn net_meshdb_runner_new(reader: *mut MeshDbReader) -> *mut MeshDbRunner {
     ffi_guard!(ptr::null_mut(), {
         if reader.is_null() {
-            return ptr::null_mut();
+            invalid_arg_null!("net_meshdb_runner_new: null reader");
         }
         let store = (&*reader).store.clone();
         let runtime = match shared_runtime() {
             Ok(rt) => rt,
-            Err(_) => return ptr::null_mut(),
+            Err(_) => {
+                set_last_error_static(
+                    "net_meshdb_runner_new: tokio runtime initialisation failed",
+                    "runtime_error",
+                );
+                return ptr::null_mut();
+            }
         };
         let executor: LocalMeshQueryExecutor<InMemoryStore> = LocalMeshQueryExecutor::new(store);
         let runner = MeshDbRunner {
@@ -1136,12 +1217,18 @@ pub unsafe extern "C" fn net_meshdb_runner_new_cached(
 ) -> *mut MeshDbRunner {
     ffi_guard!(ptr::null_mut(), {
         if reader.is_null() {
-            return ptr::null_mut();
+            invalid_arg_null!("net_meshdb_runner_new_cached: null reader");
         }
         let store = (&*reader).store.clone();
         let runtime = match shared_runtime() {
             Ok(rt) => rt,
-            Err(_) => return ptr::null_mut(),
+            Err(_) => {
+                set_last_error_static(
+                    "net_meshdb_runner_new_cached: tokio runtime initialisation failed",
+                    "runtime_error",
+                );
+                return ptr::null_mut();
+            }
         };
         let cache: Arc<dyn net::adapter::net::behavior::meshdb::cache::ResultCache> =
             Arc::new(net::adapter::net::behavior::meshdb::cache::LruResultCache::default());
@@ -1947,6 +2034,48 @@ mod tests {
             }),
             "query_budget_exceeded"
         );
+    }
+
+    #[test]
+    fn ffi_factory_validation_failure_populates_last_error() {
+        // Regression: every query_* factory + runner_new* used
+        // to return null on validation failure WITHOUT setting
+        // the thread-local last-error pair. Callers seeing a
+        // null couldn't distinguish "bad group_by" from "null
+        // inner" from "non-UTF-8 C-string". invalid_arg_null!
+        // now populates both message and kind.
+        unsafe {
+            net_meshdb_clear_last_error();
+            // start >= end is a validation failure on between.
+            let q = net_meshdb_query_between(0x01, 10, 5);
+            assert!(q.is_null());
+            let kind_ptr = net_meshdb_last_error_kind();
+            assert!(!kind_ptr.is_null());
+            let kind = std::ffi::CStr::from_ptr(kind_ptr).to_str().unwrap();
+            assert_eq!(kind, "invalid_arg");
+            let msg_ptr = net_meshdb_last_error_message();
+            assert!(!msg_ptr.is_null());
+            let msg = std::ffi::CStr::from_ptr(msg_ptr).to_str().unwrap();
+            assert!(
+                msg.contains("start must be strictly less than end"),
+                "expected descriptive validation message, got {msg:?}",
+            );
+
+            // Distinct validation path: percentile with p > 1.
+            let inner = net_meshdb_query_latest(0x02);
+            let field = std::ffi::CString::new("seq").unwrap();
+            let q2 = net_meshdb_query_percentile(inner, field.as_ptr(), 1.5, ptr::null());
+            assert!(q2.is_null());
+            let msg2 = std::ffi::CStr::from_ptr(net_meshdb_last_error_message())
+                .to_str()
+                .unwrap();
+            assert!(
+                msg2.contains("p must be finite"),
+                "expected percentile validation message, got {msg2:?}",
+            );
+            net_meshdb_query_free(inner);
+            net_meshdb_clear_last_error();
+        }
     }
 
     #[test]
