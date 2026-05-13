@@ -329,17 +329,51 @@ impl MeshOsLoop {
     /// the samples into the actual-state view. Idempotent — the
     /// folds overwrite per-peer entries, so a re-poll within
     /// the same tick produces the same state.
+    ///
+    /// Each probe call runs inside `catch_unwind` so a panicking
+    /// probe doesn't unwind the loop task. Probes are
+    /// third-party-installed by definition (the substrate hands
+    /// out the `ProbeRegistry`), so trust-but-isolate is the
+    /// right posture.
     fn poll_probes(&mut self) {
         let locality = self.probes.locality.read().clone();
         for probe in &locality {
-            for (peer, rtt) in probe.rtt_samples() {
-                self.actual.rtt.insert(peer, rtt);
+            let probe = Arc::clone(probe);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                probe.rtt_samples()
+            }));
+            match result {
+                Ok(samples) => {
+                    for (peer, rtt) in samples {
+                        self.actual.rtt.insert(peer, rtt);
+                    }
+                }
+                Err(_) => {
+                    tracing::error!(
+                        target: "meshos",
+                        "locality probe panicked — sample skipped this tick",
+                    );
+                }
             }
         }
         let health = self.probes.health.read().clone();
         for probe in &health {
-            for (peer, hc) in probe.health_samples() {
-                self.actual.node_health.insert(peer, hc);
+            let probe = Arc::clone(probe);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                probe.health_samples()
+            }));
+            match result {
+                Ok(samples) => {
+                    for (peer, hc) in samples {
+                        self.actual.node_health.insert(peer, hc);
+                    }
+                }
+                Err(_) => {
+                    tracing::error!(
+                        target: "meshos",
+                        "health probe panicked — sample skipped this tick",
+                    );
+                }
             }
         }
     }
@@ -501,6 +535,42 @@ mod tests {
             .expect("loop did not exit after Shutdown")
             .expect("join");
         let _ = count;
+    }
+
+    #[tokio::test]
+    async fn panicking_probe_does_not_kill_the_loop() {
+        // Regression for I6: a panicking probe used to unwind
+        // the loop task. The catch_unwind wrapper in
+        // `poll_probes` now logs + skips the bad sample so
+        // reconcile keeps running.
+        struct PanickyProbe;
+        impl super::super::probes::LocalityProbe for PanickyProbe {
+            fn rtt_samples(&self) -> Vec<(u64, std::time::Duration)> {
+                panic!("boom from probe");
+            }
+        }
+        let registry = ProbeRegistry::new();
+        registry.add_locality_probe(Arc::new(PanickyProbe));
+        let cfg = MeshOsConfig {
+            tick_interval: StdDuration::from_millis(10),
+            ..fast_test_config()
+        };
+        let (loop_, handle, _actions_rx, _reader) =
+            MeshOsLoop::new(cfg);
+        let loop_ = loop_.with_probe_registry(registry);
+        let task = tokio::spawn(loop_.run());
+        // Let several ticks fire — each one will invoke the
+        // panicking probe.
+        tokio::time::sleep(StdDuration::from_millis(60)).await;
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let count = tokio::time::timeout(StdDuration::from_secs(2), task)
+            .await
+            .expect("loop should still exit cleanly")
+            .expect("loop task survived probe panics");
+        assert!(
+            count >= 1,
+            "loop should have completed at least one reconcile pass despite probe panics",
+        );
     }
 
     #[tokio::test]

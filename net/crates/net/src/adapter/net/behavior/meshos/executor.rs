@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
+use futures::FutureExt;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::sleep_until;
@@ -364,10 +365,24 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
     }
 
     async fn dispatch_now(&mut self, action: PendingAction, admit_anchor: Instant) {
-        let result = self
-            .dispatcher
-            .dispatch(action.action.clone())
-            .await;
+        // Wrap the dispatcher in `catch_unwind` so a panicking
+        // future doesn't unwind the executor task. The trait is
+        // pluggable + third-party-installed; trust-but-isolate.
+        let dispatch_future = self.dispatcher.dispatch(action.action.clone());
+        let result = match std::panic::AssertUnwindSafe(dispatch_future)
+            .catch_unwind()
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::error!(
+                    target: "meshos",
+                    action_id = action.id.0,
+                    "dispatcher panicked — recording as drop",
+                );
+                Err(DispatchError::drop("dispatcher panicked"))
+            }
+        };
         match result {
             Ok(()) => {
                 ExecutorStats::inc(&self.stats.dispatched);
@@ -688,6 +703,79 @@ mod tests {
             .expect("executor did not exit after sender dropped")
             .expect("join");
         assert_eq!(stats.dispatched.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_panic_does_not_kill_executor() {
+        // Regression for I6: a panicking dispatcher future used
+        // to unwind the executor task. The catch_unwind wrapper
+        // converts the panic into a `DispatchError::drop`, so
+        // the executor continues servicing subsequent actions.
+        struct PanicOnce {
+            armed: parking_lot::Mutex<bool>,
+            log: Mutex<Vec<MeshOsAction>>,
+        }
+        impl ActionDispatcher for PanicOnce {
+            fn dispatch<'a>(
+                &'a self,
+                action: MeshOsAction,
+            ) -> BoxFuture<'a, Result<(), DispatchError>> {
+                Box::pin(async move {
+                    let armed = {
+                        let mut g = self.armed.lock();
+                        let was = *g;
+                        *g = false;
+                        was
+                    };
+                    if armed {
+                        panic!("boom");
+                    }
+                    self.log.lock().push(action);
+                    Ok(())
+                })
+            }
+        }
+
+        let (tx, rx) = mpsc::channel(8);
+        let cfg = fast_cfg();
+        let dispatcher = Arc::new(PanicOnce {
+            armed: parking_lot::Mutex::new(true),
+            log: Mutex::new(Vec::new()),
+        });
+        let exec = ActionExecutor::new(rx, cfg, Arc::clone(&dispatcher));
+        let task = tokio::spawn(exec.run());
+
+        tx.send(pending(
+            1,
+            MeshOsAction::CommitMaintenanceTransition {
+                node: 1,
+                target: MaintenanceTransition::Maintenance,
+            },
+        ))
+        .await
+        .unwrap();
+        tx.send(pending(
+            2,
+            MeshOsAction::CommitMaintenanceTransition {
+                node: 1,
+                target: MaintenanceTransition::Active,
+            },
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(tx);
+
+        let stats = task.await.expect(
+            "executor task should NOT have panicked despite dispatcher panic",
+        );
+        assert_eq!(
+            stats.dispatched.load(Ordering::Relaxed),
+            1,
+            "second action should have dispatched after the first panicked",
+        );
+        assert_eq!(stats.failed.load(Ordering::Relaxed), 1);
+        assert_eq!(dispatcher.log.lock().len(), 1);
     }
 
     #[tokio::test]
