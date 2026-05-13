@@ -336,10 +336,7 @@ impl MeshOsSnapshot {
         // Chains that have a desired count but no observed
         // holders still surface so Deck can render "0/N".
         for (chain, count) in &desired.desired_replicas {
-            replicas
-                .entry(*chain)
-                .or_insert_with(ReplicaSnapshot::default)
-                .desired_count = Some(*count);
+            replicas.entry(*chain).or_default().desired_count = Some(*count);
         }
 
         let peers: BTreeMap<NodeId, PeerSnapshot> = {
@@ -480,6 +477,7 @@ pub fn daemon_id(d: &DaemonRef) -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use std::time::Instant;
 

@@ -43,14 +43,15 @@
 
 use std::time::Instant;
 
-/// Per-node maintenance state. Carries `since` (for Deck render)
-/// + the deadline for `EnteringMaintenance` (so `DrainFailed`
-/// can fire on elapse) + the reason for `DrainFailed` (operator
-/// surfacing).
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Per-node maintenance state. Carries `since` (for Deck
+/// render), the deadline for `EnteringMaintenance` (so
+/// `DrainFailed` can fire on elapse), and the reason for
+/// `DrainFailed` (operator surfacing).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum MaintenanceState {
     /// Normal participation. Default state on construction.
+    #[default]
     Active,
     /// Operator requested maintenance; this node is preparing
     /// for isolation. Replicas are migrating; non-essential
@@ -91,12 +92,6 @@ pub enum MaintenanceState {
         /// Wall time the ramp-up started.
         since: Instant,
     },
-}
-
-impl Default for MaintenanceState {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 impl MaintenanceState {

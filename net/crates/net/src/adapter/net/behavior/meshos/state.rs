@@ -449,8 +449,8 @@ mod tests {
             },
         );
         state.apply(&MeshOsEvent::Tick, 0);
-        assert!(state.avoid_list.get(&1).is_none(), "expired entry not gc'd");
-        assert!(state.avoid_list.get(&2).is_some(), "fresh entry dropped");
+        assert!(!state.avoid_list.contains_key(&1), "expired entry not gc'd");
+        assert!(state.avoid_list.contains_key(&2), "fresh entry dropped");
     }
 
     #[test]

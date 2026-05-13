@@ -330,6 +330,7 @@ fn emit_backoff_record_if_needed(
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use std::time::Duration;
 

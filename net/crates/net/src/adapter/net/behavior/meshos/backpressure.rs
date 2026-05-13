@@ -406,8 +406,8 @@ mod tests {
         state.chain_stabilization.insert(1, t(10));
         state.tick(t(20));
         // Both entries are past their until and should be gone.
-        assert!(state.daemon_gates.get(&d).is_none());
-        assert!(state.chain_stabilization.get(&1).is_none());
+        assert!(!state.daemon_gates.contains_key(&d));
+        assert!(!state.chain_stabilization.contains_key(&1));
     }
 
     #[test]
