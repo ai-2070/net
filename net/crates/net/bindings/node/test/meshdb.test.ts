@@ -818,3 +818,66 @@ d('MeshDB QueryBuilder (slice 4)', () => {
     expect(decodeAggregate(rows[0])).toMatchObject({ kind: 'count', count: 2n });
   });
 });
+
+// ---------------------------------------------------------------------
+// AsyncIterable shim: `for await (const row of stream) { ... }`.
+// ---------------------------------------------------------------------
+
+d('MeshDB AsyncIterable shim', () => {
+  const {
+    MeshQuery,
+    MeshQueryRunner,
+    InMemoryChainReader,
+  } = symbols as {
+    MeshQuery: typeof import('../index').MeshQuery;
+    MeshQueryRunner: typeof import('../index').MeshQueryRunner;
+    InMemoryChainReader: typeof import('../index').InMemoryChainReader;
+  };
+
+  const seed = (
+    rows: ReadonlyArray<readonly [bigint, bigint, Uint8Array]>,
+  ): InstanceType<typeof InMemoryChainReader> => {
+    const r = new InMemoryChainReader();
+    for (const [origin, seq, payload] of rows) {
+      r.append(origin, seq, Buffer.from(payload));
+    }
+    return r;
+  };
+
+  it('for await iterates rows after shim import', async () => {
+    // Import the shim. Idempotent — re-imports are no-ops.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    require('../meshdb');
+    const reader = seed(
+      [1, 2, 3, 4].map((s) => [0xabn, BigInt(s), Buffer.from(`p-${s}`)]),
+    );
+    const runner = new MeshQueryRunner(reader);
+    const stream = await runner.execute(MeshQuery.between(0xabn, 1n, 10n));
+    const seen: number[] = [];
+    // The shim attaches Symbol.asyncIterator on the prototype;
+    // `for await` picks it up.
+    for await (const row of stream as unknown as AsyncIterable<{
+      seq: bigint;
+    }>) {
+      seen.push(Number(row.seq));
+    }
+    expect(seen).toEqual([1, 2, 3, 4]);
+  });
+
+  it('shim is idempotent: re-import does not break anything', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    require('../meshdb');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    require('../meshdb');
+    const reader = seed([[0xabn, 1n, Buffer.from('v')]]);
+    const runner = new MeshQueryRunner(reader);
+    const stream = await runner.execute(MeshQuery.latest(0xabn));
+    const seen: bigint[] = [];
+    for await (const row of stream as unknown as AsyncIterable<{
+      seq: bigint;
+    }>) {
+      seen.push(row.seq);
+    }
+    expect(seen).toEqual([1n]);
+  });
+});

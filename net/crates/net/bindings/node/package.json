@@ -16,6 +16,10 @@
     "./mesh_rpc": {
       "types": "./mesh_rpc.d.ts",
       "default": "./mesh_rpc.js"
+    },
+    "./meshdb": {
+      "types": "./meshdb.d.ts",
+      "default": "./meshdb.js"
     }
   },
   "napi": {
