@@ -58,3 +58,33 @@ if (
 // binding; the shim above wires the prototype before they're used.
 export const { MeshQuery, MeshQueryRunner, MeshQueryStream, InMemoryChainReader } =
   native as Record<string, unknown>;
+
+/**
+ * Result of {@link parseMeshDbErrorKind}: extracted structured
+ * discriminator + the human-readable message stripped of the
+ * `<<meshdb-kind:...>>` prefix.
+ */
+export interface ParsedMeshDbError {
+  kind: string;
+  message: string;
+}
+
+/**
+ * Pull the structured error kind out of a MeshDB error message.
+ *
+ * The Rust binding embeds the kind discriminator (one of the
+ * `MeshError` variant tags such as `planner_error`,
+ * `executor_error`, `query_cancelled`, `historical_range_unavailable`,
+ * `ambiguous_discovery`, etc.) at the start of the error message
+ * as `<<meshdb-kind:KIND>>MSG`. This helper parses it back.
+ *
+ * Returns `null` for errors that don't carry a kind prefix
+ * (SDK-side validation failures, factory rejections) — those
+ * surface with the plain message intact.
+ */
+export function parseMeshDbErrorKind(err: unknown): ParsedMeshDbError | null {
+  if (!(err instanceof Error)) return null;
+  const m = err.message.match(/^<<meshdb-kind:([a-z_]+)>>(.*)$/s);
+  if (!m) return null;
+  return { kind: m[1], message: m[2] };
+}

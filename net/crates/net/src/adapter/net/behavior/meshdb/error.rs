@@ -175,6 +175,37 @@ pub enum BudgetMetric {
     MaxBytesScanned,
 }
 
+impl MeshError {
+    /// Stable, short, snake_case string discriminator for the
+    /// variant. Used by the FFI shims (Python / Node / Go) to
+    /// expose a `kind` field on the host-language error so
+    /// callers can branch on the error type without parsing
+    /// the rendered message. Values are part of the public
+    /// SDK contract — adding new variants is fine, renaming
+    /// existing ones is a breaking change.
+    pub fn kind(&self) -> &'static str {
+        // `MeshError` is `#[non_exhaustive]`; the catchall keeps
+        // the match exhaustive on the source side if a future
+        // variant is added without immediately updating this
+        // dispatcher. Today every variant has a stable mapping.
+        #[allow(unreachable_patterns)]
+        match self {
+            MeshError::HistoricalRangeUnavailable { .. } => "historical_range_unavailable",
+            MeshError::LineageMaxDepthExceeded { .. } => "lineage_max_depth_exceeded",
+            MeshError::LineageCycleDetected { .. } => "lineage_cycle_detected",
+            MeshError::JoinMemoryExceeded { .. } => "join_memory_exceeded",
+            MeshError::QueryBudgetExceeded { .. } => "query_budget_exceeded",
+            MeshError::PartialResult { .. } => "partial_result",
+            MeshError::PlannerError { .. } => "planner_error",
+            MeshError::ExecutorError { .. } => "executor_error",
+            MeshError::NoCapableHolder { .. } => "no_capable_holder",
+            MeshError::AmbiguousDiscovery { .. } => "ambiguous_discovery",
+            MeshError::QueryCancelled => "query_cancelled",
+            _ => "unknown",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +231,54 @@ mod tests {
         let msg = format!("{e}");
         assert!(msg.contains("partial result"));
         assert!(msg.contains("0 rows"));
+    }
+
+    #[test]
+    fn kind_discriminator_is_stable_across_variants() {
+        // Pin the kind string for every variant the FFI shims
+        // expose. Renaming a value here is a breaking change to
+        // the Python / Node / Go SDK contracts.
+        assert_eq!(MeshError::QueryCancelled.kind(), "query_cancelled");
+        assert_eq!(
+            MeshError::PlannerError {
+                detail: "x".to_string()
+            }
+            .kind(),
+            "planner_error"
+        );
+        assert_eq!(
+            MeshError::ExecutorError {
+                node: 0,
+                detail: "x".to_string(),
+            }
+            .kind(),
+            "executor_error"
+        );
+        assert_eq!(
+            MeshError::JoinMemoryExceeded {
+                strategy: "x".to_string(),
+                threshold_bytes: 0,
+            }
+            .kind(),
+            "join_memory_exceeded"
+        );
+        assert_eq!(
+            MeshError::QueryBudgetExceeded {
+                metric: BudgetMetric::MaxRows,
+                used: 0,
+                limit: 0,
+            }
+            .kind(),
+            "query_budget_exceeded"
+        );
+        assert_eq!(
+            MeshError::AmbiguousDiscovery {
+                matches: vec![1, 2],
+                requirement: "p".to_string(),
+            }
+            .kind(),
+            "ambiguous_discovery"
+        );
     }
 
     #[test]

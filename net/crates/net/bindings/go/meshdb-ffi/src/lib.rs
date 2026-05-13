@@ -111,24 +111,11 @@ fn clear_last_error() {
 }
 
 /// Map a [`MeshError`] to a stable string discriminator.
-/// Shared with the Python / Node shims via the substrate's
-/// `error_kind` helper once that lands; the variant set here
-/// is the canonical list.
+/// Delegates to [`MeshError::kind`] in the substrate so all
+/// three FFI shims (Python / Node / Go) report the same
+/// `kind` string for the same variant.
 fn mesh_error_kind(err: &MeshError) -> &'static str {
-    match err {
-        MeshError::HistoricalRangeUnavailable { .. } => "historical_range_unavailable",
-        MeshError::LineageMaxDepthExceeded { .. } => "lineage_max_depth_exceeded",
-        MeshError::LineageCycleDetected { .. } => "lineage_cycle_detected",
-        MeshError::JoinMemoryExceeded { .. } => "join_memory_exceeded",
-        MeshError::QueryBudgetExceeded { .. } => "query_budget_exceeded",
-        MeshError::PartialResult { .. } => "partial_result",
-        MeshError::PlannerError { .. } => "planner_error",
-        MeshError::ExecutorError { .. } => "executor_error",
-        MeshError::NoCapableHolder { .. } => "no_capable_holder",
-        MeshError::AmbiguousDiscovery { .. } => "ambiguous_discovery",
-        MeshError::QueryCancelled => "query_cancelled",
-        _ => "unknown",
-    }
+    err.kind()
 }
 
 /// Return the most recent error message recorded on this

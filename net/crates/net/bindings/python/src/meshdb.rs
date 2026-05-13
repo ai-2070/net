@@ -1412,7 +1412,20 @@ impl PyMeshQueryRunner {
 }
 
 fn map_mesh_error(e: MeshError) -> PyErr {
-    MeshDbError::new_err(format!("{e}"))
+    use pyo3::Python;
+    let msg = format!("{e}");
+    let kind = e.kind();
+    let err = MeshDbError::new_err(msg);
+    Python::attach(|py| {
+        // Best-effort: attach the structured `kind`
+        // discriminator on the raised instance so Python
+        // callers can branch on `error.kind` without parsing
+        // the message. Stored as a static `&'static str`
+        // from `MeshError::kind()` so the value is part of the
+        // public SDK contract.
+        let _ = err.value(py).setattr("kind", kind);
+    });
+    err
 }
 
 // Tests live in `bindings/python/tests/test_meshdb.py` — the

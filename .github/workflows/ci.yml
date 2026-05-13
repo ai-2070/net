@@ -103,6 +103,84 @@ jobs:
         run: cargo test --test dataforts_blob_e2e --features dataforts,redex-disk
       - name: Dataforts greedy e2e (cache + speculative pull)
         run: cargo test --test dataforts_greedy_e2e --features dataforts
+      - name: Dataforts gravity e2e
+        run: cargo test --test dataforts_gravity_e2e --features dataforts
+      - name: Bus shutdown drain
+        run: cargo test --test bus_shutdown_drain
+      - name: Bus stranded flush
+        run: cargo test --test bus_stranded_flush
+      - name: FFI shutdown race
+        run: cargo test --test ffi_shutdown_race
+      - name: FFI poll buffer
+        run: cargo test --test ffi_poll_buffer
+      - name: Capability broadcast
+        run: cargo test --test capability_broadcast --features net
+      - name: Capability multihop
+        run: cargo test --test capability_multihop --features net
+      - name: Capability scope
+        run: cargo test --test capability_scope --features net
+      - name: Capability schema doc guard
+        run: cargo test --test capability_schema_doc_guard --features net
+      - name: Chain discovery
+        run: cargo test --test chain_discovery --features net
+      - name: Channel auth
+        run: cargo test --test channel_auth --features net
+      - name: Channel auth hardening
+        run: cargo test --test channel_auth_hardening --features net
+      - name: Connect post-start
+        run: cargo test --test connect_post_start --features net
+      - name: Cross-lang capability fixtures
+        run: cargo test --test cross_lang_capability_fixtures --features net
+      - name: Failure detector matrix
+        run: cargo test --test failure_detector_matrix --features net
+      - name: Mikoshi target-failure mid-chunking
+        run: cargo test --test migration_target_failure_mid_chunking --features net
+      - name: nRPC inbound dispatcher
+        run: cargo test --test nrpc_inbound_dispatcher --features net
+      - name: Parallel bind stress
+        run: cargo test --test parallel_bind_stress --features net
+      - name: Peer-death evicts peer map
+        run: cargo test --test peer_death_evicts_peer_map --features net
+      - name: Queue-group dispatch
+        run: cargo test --test queue_group_dispatch --features net
+      - name: Send subprotocol malformed
+        run: cargo test --test send_subprotocol_malformed --features net
+      - name: Subnet enforcement
+        run: cargo test --test subnet_enforcement --features net
+      - name: Connect direct (NAT)
+        run: cargo test --test connect_direct --features "net nat-traversal"
+      - name: NAT classify
+        run: cargo test --test nat_classify --features "net nat-traversal"
+      - name: Peer-death clears capability index
+        run: cargo test --test peer_death_clears_capability_index --features "net nat-traversal"
+      - name: Punch keepalive
+        run: cargo test --test punch_keepalive --features "net nat-traversal"
+      - name: Punch keepalive timing
+        run: cargo test --test punch_keepalive_timing --features "net nat-traversal"
+      - name: Reflex probe
+        run: cargo test --test reflex_probe --features "net nat-traversal"
+      - name: Reflex override
+        run: cargo test --test reflex_override --features "net nat-traversal"
+      - name: Rendezvous ack
+        run: cargo test --test rendezvous_ack --features "net nat-traversal"
+      - name: Rendezvous coordinator
+        run: cargo test --test rendezvous_coordinator --features "net nat-traversal"
+      - name: Port mapping null
+        run: cargo test --test port_mapping_null --features "net port-mapping"
+      - name: Port mapping real router
+        run: cargo test --test port_mapping_real_router --features "net port-mapping"
+      - name: nRPC loopback
+        run: cargo test --test integration_nrpc_loopback --features cortex
+      - name: nRPC mesh
+        run: cargo test --test integration_nrpc_mesh --features cortex
+      - name: nRPC streaming
+        run: cargo test --test integration_nrpc_streaming --features cortex
+      - name: nRPC service discovery
+        run: cargo test --test integration_nrpc_service_discovery --features cortex
+      - name: CortEX RYW global cap
+        run: cargo test --test cortex_ryw_global_cap --features cortex
+      - name: nRPC cross-lang
+        run: cargo test --test integration_nrpc_cross_lang --features cortex
 
   loom-tests:
     name: Loom concurrency models

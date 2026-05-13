@@ -1287,13 +1287,13 @@ impl MeshQueryRunner {
             .executor
             .execute_with(plan, opts)
             .await
-            .map_err(|e| mesh_err(format!("{e}")))?;
+            .map_err(|e| mesh_err_kinded(&e))?;
         let mut stream = running.rows;
         let mut out: Vec<ResultRow> = Vec::new();
         while let Some(item) = stream.next().await {
             match item {
                 Ok(row) => out.push(row.into()),
-                Err(e) => return Err(mesh_err(format!("{e}"))),
+                Err(e) => return Err(mesh_err_kinded(&e)),
             }
         }
         Ok(MeshQueryStream {
@@ -1338,5 +1338,24 @@ impl MeshQueryStream {
 }
 
 fn mesh_err(msg: String) -> Error {
+    // No kind information — used for SDK-side validation
+    // failures (predicate factory, group_by shape, etc.). The
+    // executor / planner paths use `mesh_err_kinded` below.
     Error::new(Status::GenericFailure, msg)
+}
+
+/// Wire a `MeshError` to a napi `Error`, embedding the
+/// structured kind discriminator in the reason string so the
+/// JS-side SDK can recover it.
+///
+/// Reason format: `<<meshdb-kind:KIND>>MSG`. The SDK exposes
+/// a helper that parses this back into `{kind, message}`.
+/// Errors raised from non-substrate paths (factory validation
+/// etc.) use plain `mesh_err`; consumers branch on whether the
+/// `<<meshdb-kind:` prefix is present.
+fn mesh_err_kinded(err: &MeshError) -> Error {
+    Error::new(
+        Status::GenericFailure,
+        format!("<<meshdb-kind:{}>>{}", err.kind(), err),
+    )
 }
