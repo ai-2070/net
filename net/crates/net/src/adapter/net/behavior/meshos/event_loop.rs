@@ -20,7 +20,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
 use tokio::time::{interval_at, Instant as TokioInstant, MissedTickBehavior};
 
@@ -63,8 +63,10 @@ pub struct MeshOsLoop {
     /// Most recent post-reconcile snapshot. Updated on every
     /// Tick after the reconcile pass; readable through
     /// [`MeshOsSnapshotReader::read`] from any other task /
-    /// thread.
-    snapshot: Arc<RwLock<MeshOsSnapshot>>,
+    /// thread. `ArcSwap` keeps the publish path one atomic
+    /// pointer store and the read path one atomic load + Arc
+    /// clone — no lock contention with reconcile.
+    snapshot: Arc<ArcSwap<MeshOsSnapshot>>,
 
     /// Pending-action ring buffer the snapshot folds into its
     /// `pending` field. Bounded by the action-queue capacity;
@@ -148,17 +150,23 @@ impl ProbeRegistry {
 /// without entering the loop's event stream.
 #[derive(Clone, Debug)]
 pub struct MeshOsSnapshotReader {
-    snapshot: Arc<RwLock<MeshOsSnapshot>>,
+    snapshot: Arc<ArcSwap<MeshOsSnapshot>>,
 }
 
 impl MeshOsSnapshotReader {
-    /// Sample the most recent post-reconcile snapshot. Clones
-    /// the inner `MeshOsSnapshot` under a read lock — cheap
-    /// for the bounded shape, but callers that need to inspect
-    /// many fields should snapshot once and read off the local
-    /// copy.
+    /// Sample the most recent post-reconcile snapshot. One
+    /// atomic load + one `Arc` clone — no lock acquisition, so
+    /// reads cannot stall the loop's publish path.
     pub fn read(&self) -> MeshOsSnapshot {
-        self.snapshot.read().clone()
+        (**self.snapshot.load()).clone()
+    }
+
+    /// Borrow the latest snapshot through an `Arc`. Avoids the
+    /// per-call deep clone when the caller only needs a few
+    /// fields. The returned guard pins the snapshot until
+    /// dropped — keep the borrow short.
+    pub fn load(&self) -> arc_swap::Guard<Arc<MeshOsSnapshot>> {
+        self.snapshot.load()
     }
 }
 
@@ -227,7 +235,7 @@ impl MeshOsLoop {
         let (events_tx, events_rx) = mpsc::channel(config.event_queue_capacity);
         let (actions_tx, actions_rx) = mpsc::channel(config.action_queue_capacity);
         let handle = MeshOsHandle { events: events_tx };
-        let snapshot = Arc::new(RwLock::new(MeshOsSnapshot::default()));
+        let snapshot = Arc::new(ArcSwap::from_pointee(MeshOsSnapshot::default()));
         let reader = MeshOsSnapshotReader {
             snapshot: Arc::clone(&snapshot),
         };
@@ -424,7 +432,7 @@ impl MeshOsLoop {
             &self.desired,
             &self.pending_snapshot_actions,
         );
-        *self.snapshot.write() = snap;
+        self.snapshot.store(Arc::new(snap));
     }
 }
 
@@ -482,6 +490,50 @@ mod tests {
             .expect("loop did not exit after Shutdown")
             .expect("join");
         let _ = count;
+    }
+
+    #[tokio::test]
+    async fn snapshot_reader_does_not_stall_under_concurrent_reads() {
+        // With ArcSwap, publish is a pointer store and read is
+        // a pointer load + Arc clone; concurrent readers cannot
+        // stall the publisher. Smoke-test by spawning many
+        // readers polling the snapshot in a tight loop while
+        // the loop ticks repeatedly.
+        let cfg = MeshOsConfig {
+            tick_interval: StdDuration::from_millis(5),
+            ..fast_test_config()
+        };
+        let (loop_, handle, _actions_rx, reader) = MeshOsLoop::new(cfg);
+        let task = tokio::spawn(loop_.run());
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let reader = reader.clone();
+            let stop = Arc::clone(&stop);
+            readers.push(tokio::spawn(async move {
+                let mut count = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let _snap = reader.read();
+                    count += 1;
+                    tokio::task::yield_now().await;
+                }
+                count
+            }));
+        }
+        // Let the loop fire ~10 ticks.
+        tokio::time::sleep(StdDuration::from_millis(60)).await;
+        stop.store(true, Ordering::Relaxed);
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _loop_count = task.await.expect("loop join");
+        let mut total = 0u64;
+        for r in readers {
+            total += r.await.expect("reader join");
+        }
+        assert!(
+            total > 0,
+            "readers should have made progress while the loop published",
+        );
     }
 
     #[tokio::test]
