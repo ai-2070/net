@@ -285,35 +285,44 @@ pub fn cache_policy_permanent() -> CachePolicy {
 }
 
 /// Build a `"time_bound"` cache policy object. `seconds`
-/// defaults to 5 s when omitted.
+/// defaults to 5 s when omitted. Negative or non-finite
+/// values are rejected at the factory (Python / Go behave the
+/// same way); the converter at execute-time no longer rewrites
+/// silently.
 #[napi(js_name = "cachePolicyTimeBound")]
-pub fn cache_policy_time_bound(seconds: Option<f64>) -> CachePolicy {
-    CachePolicy {
-        kind: "time_bound".to_string(),
-        ttl_seconds: seconds,
+pub fn cache_policy_time_bound(seconds: Option<f64>) -> Result<CachePolicy> {
+    let secs = seconds.unwrap_or(5.0);
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(mesh_err(format!(
+            "cachePolicyTimeBound: ttlSeconds must be a non-negative finite number; got {secs}"
+        )));
     }
+    Ok(CachePolicy {
+        kind: "time_bound".to_string(),
+        ttl_seconds: Some(secs),
+    })
 }
 
-fn cache_policy_to_inner(p: Option<CachePolicy>) -> InnerCachePolicy {
-    match p {
-        None => InnerCachePolicy::default(),
-        Some(p) => match p.kind.as_str() {
-            "permanent" => InnerCachePolicy::Permanent,
-            // Default + "time_bound" + any unknown kind →
-            // TimeBound, with the ttl_seconds field if
-            // present, else 5 s.
-            _ => {
-                let secs = p.ttl_seconds.unwrap_or(5.0);
-                let secs = if secs.is_finite() && secs >= 0.0 {
-                    secs
-                } else {
-                    5.0
-                };
-                InnerCachePolicy::TimeBound {
-                    ttl: std::time::Duration::from_secs_f64(secs),
-                }
+fn cache_policy_to_inner(p: Option<CachePolicy>) -> Result<InnerCachePolicy> {
+    let Some(p) = p else {
+        return Ok(InnerCachePolicy::default());
+    };
+    match p.kind.as_str() {
+        "permanent" => Ok(InnerCachePolicy::Permanent),
+        "time_bound" => {
+            let secs = p.ttl_seconds.unwrap_or(5.0);
+            if !secs.is_finite() || secs < 0.0 {
+                return Err(mesh_err(format!(
+                    "cachePolicy.ttlSeconds must be a non-negative finite number; got {secs}"
+                )));
             }
-        },
+            Ok(InnerCachePolicy::TimeBound {
+                ttl: std::time::Duration::from_secs_f64(secs),
+            })
+        }
+        other => Err(mesh_err(format!(
+            "cachePolicy.kind must be 'permanent' or 'time_bound'; got {other:?}"
+        ))),
     }
 }
 
@@ -328,14 +337,14 @@ pub struct ExecuteOptions {
     pub cache_policy: Option<CachePolicy>,
 }
 
-fn execute_options_to_inner(opts: Option<ExecuteOptions>) -> InnerExecuteOptions {
+fn execute_options_to_inner(opts: Option<ExecuteOptions>) -> Result<InnerExecuteOptions> {
     let Some(opts) = opts else {
-        return InnerExecuteOptions::default();
+        return Ok(InnerExecuteOptions::default());
     };
-    InnerExecuteOptions {
+    Ok(InnerExecuteOptions {
         bypass_cache: opts.bypass_cache.unwrap_or(false),
-        cache_policy: cache_policy_to_inner(opts.cache_policy),
-    }
+        cache_policy: cache_policy_to_inner(opts.cache_policy)?,
+    })
 }
 
 /// 1:1 AST factory surface. Construct via static methods that
@@ -1282,7 +1291,7 @@ impl MeshQueryRunner {
     ) -> Result<MeshQueryStream> {
         use futures::StreamExt;
         let plan = query.plan.clone();
-        let opts = execute_options_to_inner(options);
+        let opts = execute_options_to_inner(options)?;
         let running = self
             .executor
             .execute_with(plan, opts)

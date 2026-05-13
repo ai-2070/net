@@ -145,6 +145,38 @@ d('MeshDB factory + runner (slice 1)', () => {
     expect(tb.ttlSeconds).toBe(2.5);
   });
 
+  it('cachePolicyTimeBound rejects non-finite / negative ttlSeconds at the factory', () => {
+    // Regression: pre-fix, the factory stashed any number
+    // and the converter silently rewrote bad values to 5.0.
+    // Matches Python / Go which validate at construction.
+    expect(() => cachePolicyTimeBound(-1)).toThrow();
+    expect(() => cachePolicyTimeBound(Number.NaN)).toThrow();
+    expect(() => cachePolicyTimeBound(Number.POSITIVE_INFINITY)).toThrow();
+  });
+
+  it('execute rejects a hand-rolled cachePolicy with a negative ttlSeconds', async () => {
+    const reader = seed([[0xefn, 1n, Buffer.from('x')]]);
+    const runner = new MeshQueryRunner(reader, true);
+    const q = MeshQuery.at(0xefn, 1n);
+    await expect(
+      runner.execute(q, {
+        // Direct literal that bypasses the factory.
+        cachePolicy: { kind: 'time_bound', ttlSeconds: -1 } as never,
+      }),
+    ).rejects.toThrow();
+  });
+
+  it('execute rejects a hand-rolled cachePolicy with an unknown kind', async () => {
+    const reader = seed([[0xefn, 1n, Buffer.from('x')]]);
+    const runner = new MeshQueryRunner(reader, true);
+    const q = MeshQuery.at(0xefn, 1n);
+    await expect(
+      runner.execute(q, {
+        cachePolicy: { kind: 'forever', ttlSeconds: undefined } as never,
+      }),
+    ).rejects.toThrow();
+  });
+
   it('cache-enabled runner serves cached rows on the second call', async () => {
     const reader = seed([
       [0xeen, 1n, Buffer.from('x')],
