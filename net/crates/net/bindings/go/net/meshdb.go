@@ -9,13 +9,26 @@
 //
 // # Channels-based execution
 //
-// Per the locked Go SDK decision, `(*MeshQueryRunner).Execute`
-// returns `(<-chan MeshQueryResult, error)`. The wrapper spawns a
-// goroutine that pumps rows from the FFI iterator into the
-// channel; the goroutine closes the channel on EOF or on the first
-// error. Cancellation works the standard Go way — the caller stops
-// reading + drops the channel reference; the goroutine notices the
-// channel-send block, gives up, and frees the iterator.
+// Per the locked Go SDK decision, `(*MeshDBRunner).Execute` and
+// its ctx-aware variants return `(<-chan MeshDBResult, error)`.
+// The wrapper spawns a goroutine that pumps rows from the FFI
+// iterator into the channel; the goroutine closes the channel on
+// EOF or on the first error.
+//
+// # Cancellation
+//
+// `Execute(query)` is non-cancellable: dropping the channel
+// receiver does NOT signal the sender in Go, and the pumping
+// goroutine would block on `ch <- row` after the buffered window
+// (32) fills, leaking the goroutine and the FFI iterator. For
+// cancellable use, call `ExecuteContext(ctx, query)` (or
+// `ExecuteWithContext(ctx, query, options)`); the goroutine
+// selects on `ctx.Done()` for every send, frees the FFI iterator,
+// and closes the channel when the context fires.
+//
+// `Execute(query)` is preserved as a thin wrapper that calls
+// `ExecuteContext(context.Background(), query)`, so existing
+// callers keep working; new code should prefer the ctx variant.
 //
 // # Memory model
 //
@@ -168,6 +181,7 @@ extern MeshDbIter* net_meshdb_runner_execute_with(
 import "C"
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -372,7 +386,22 @@ func NewMeshDBRunnerCached(reader *MeshDBReader) *MeshDBRunner {
 // iterator pre-collects all rows); the goroutine here streams the
 // pre-collected rows onto the channel. Slice 2 may switch to
 // lazy iteration once we wire continuation tokens through.
+//
+// Non-cancellable. Use `ExecuteContext` for ctx-aware variants.
 func (r *MeshDBRunner) Execute(query *MeshDBQuery) (<-chan MeshDBResult, error) {
+	return r.ExecuteContext(context.Background(), query)
+}
+
+// ExecuteContext runs `query` and pumps rows onto the returned
+// channel until EOF, the first error, or `ctx.Done()` fires.
+// On ctx cancellation the pumping goroutine frees the FFI
+// iterator, emits a final `MeshDBResult{Err: ctx.Err()}` to the
+// channel (so receivers see the cancellation), and closes the
+// channel.
+func (r *MeshDBRunner) ExecuteContext(
+	ctx context.Context,
+	query *MeshDBQuery,
+) (<-chan MeshDBResult, error) {
 	if r == nil || r.ptr == nil {
 		return nil, ErrMeshDBInvalidArg
 	}
@@ -384,43 +413,7 @@ func (r *MeshDBRunner) Execute(query *MeshDBQuery) (<-chan MeshDBResult, error) 
 		return nil, ErrMeshDBRuntime
 	}
 	ch := make(chan MeshDBResult, 32)
-	go func() {
-		defer close(ch)
-		defer C.net_meshdb_iter_free(iter)
-		for {
-			var (
-				origin     C.uint64_t
-				seq        C.uint64_t
-				payloadPtr *C.uint8_t
-				payloadLen C.size_t
-			)
-			status := C.net_meshdb_iter_next(iter, &origin, &seq, &payloadPtr, &payloadLen)
-			switch status {
-			case C.NET_MESHDB_OK:
-				row := MeshDBResultRow{
-					Origin:  uint64(origin),
-					Seq:     uint64(seq),
-					Payload: C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen)),
-				}
-				C.net_meshdb_payload_free(payloadPtr, payloadLen)
-				// Channel send doubles as the cancellation
-				// signal: a dropped receiver causes us to block
-				// here, after which the test-harness or the
-				// runtime eventually GCs the goroutine. For
-				// production cancellation, callers should wrap
-				// in select{} + context.Done().
-				ch <- MeshDBResult{Row: row}
-			case C.NET_MESHDB_END:
-				return
-			case C.NET_MESHDB_INVALID_ARG:
-				ch <- MeshDBResult{Err: ErrMeshDBInvalidArg}
-				return
-			default:
-				ch <- MeshDBResult{Err: ErrMeshDBRuntime}
-				return
-			}
-		}
-	}()
+	go pumpIterRowsContext(ctx, iter, ch)
 	return ch, nil
 }
 
@@ -462,7 +455,20 @@ type MeshDBExecuteOptions struct {
 // zero value is `{TimeBound, 0 s}` — caller should set TTLSecs
 // to 5.0 for the canonical default; the FFI applies a fallback
 // when TTLSecs is non-finite or negative.
+//
+// Non-cancellable; use `ExecuteWithContext` for ctx-aware
+// variants.
 func (r *MeshDBRunner) ExecuteWith(
+	query *MeshDBQuery,
+	options MeshDBExecuteOptions,
+) (<-chan MeshDBResult, error) {
+	return r.ExecuteWithContext(context.Background(), query, options)
+}
+
+// ExecuteWithContext is the cancellable variant of `ExecuteWith`.
+// Same channel-and-EOF semantics as `ExecuteContext`.
+func (r *MeshDBRunner) ExecuteWithContext(
+	ctx context.Context,
 	query *MeshDBQuery,
 	options MeshDBExecuteOptions,
 ) (<-chan MeshDBResult, error) {
@@ -487,38 +493,73 @@ func (r *MeshDBRunner) ExecuteWith(
 		return nil, ErrMeshDBRuntime
 	}
 	ch := make(chan MeshDBResult, 32)
-	go func() {
-		defer close(ch)
-		defer C.net_meshdb_iter_free(iter)
-		for {
-			var (
-				origin     C.uint64_t
-				seq        C.uint64_t
-				payloadPtr *C.uint8_t
-				payloadLen C.size_t
-			)
-			status := C.net_meshdb_iter_next(iter, &origin, &seq, &payloadPtr, &payloadLen)
-			switch status {
-			case C.NET_MESHDB_OK:
-				row := MeshDBResultRow{
-					Origin:  uint64(origin),
-					Seq:     uint64(seq),
-					Payload: C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen)),
-				}
-				C.net_meshdb_payload_free(payloadPtr, payloadLen)
-				ch <- MeshDBResult{Row: row}
-			case C.NET_MESHDB_END:
-				return
-			case C.NET_MESHDB_INVALID_ARG:
-				ch <- MeshDBResult{Err: ErrMeshDBInvalidArg}
-				return
-			default:
-				ch <- MeshDBResult{Err: ErrMeshDBRuntime}
+	go pumpIterRowsContext(ctx, iter, ch)
+	return ch, nil
+}
+
+// pumpIterRowsContext is the shared row-pumping loop used by
+// `ExecuteContext` and `ExecuteWithContext`. Drains the FFI
+// iterator into `ch`, frees the iterator on exit, and selects
+// on `ctx.Done()` for every send so a cancelled context unblocks
+// the goroutine cleanly.
+func pumpIterRowsContext(ctx context.Context, iter *C.MeshDbIter, ch chan<- MeshDBResult) {
+	defer close(ch)
+	defer C.net_meshdb_iter_free(iter)
+	for {
+		// Cheap ctx check before reaching for the next FFI row;
+		// avoids one unused decode + free on cancellation.
+		select {
+		case <-ctx.Done():
+			trySend(ctx, ch, MeshDBResult{Err: ctx.Err()})
+			return
+		default:
+		}
+		var (
+			origin     C.uint64_t
+			seq        C.uint64_t
+			payloadPtr *C.uint8_t
+			payloadLen C.size_t
+		)
+		status := C.net_meshdb_iter_next(iter, &origin, &seq, &payloadPtr, &payloadLen)
+		switch status {
+		case C.NET_MESHDB_OK:
+			row := MeshDBResultRow{
+				Origin:  uint64(origin),
+				Seq:     uint64(seq),
+				Payload: C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen)),
+			}
+			C.net_meshdb_payload_free(payloadPtr, payloadLen)
+			if !trySend(ctx, ch, MeshDBResult{Row: row}) {
 				return
 			}
+		case C.NET_MESHDB_END:
+			return
+		case C.NET_MESHDB_INVALID_ARG:
+			trySend(ctx, ch, MeshDBResult{Err: ErrMeshDBInvalidArg})
+			return
+		default:
+			trySend(ctx, ch, MeshDBResult{Err: ErrMeshDBRuntime})
+			return
 		}
-	}()
-	return ch, nil
+	}
+}
+
+// trySend forwards `res` to `ch`, but selects on `ctx.Done()` so
+// the goroutine can exit if the consumer cancelled. Returns
+// `false` when ctx fired before the send completed.
+func trySend(ctx context.Context, ch chan<- MeshDBResult, res MeshDBResult) bool {
+	select {
+	case ch <- res:
+		return true
+	case <-ctx.Done():
+		// Best-effort: signal the cancellation to the consumer
+		// without blocking forever if the buffer is full.
+		select {
+		case ch <- MeshDBResult{Err: ctx.Err()}:
+		default:
+		}
+		return false
+	}
 }
 
 // Free releases the FFI handle.
@@ -1095,21 +1136,43 @@ func NewMeshDBQueryBuilder() *MeshDBQueryBuilder {
 }
 
 // At resets the builder to a fresh source: read seq at origin.
+//
+// If the builder already holds a state from a prior chain step,
+// the existing `*MeshDBQuery` handle is explicitly freed before
+// the new source is installed. Python / Node get away with GC;
+// Go's FFI handle is not GC-managed (finalizers run at unknown
+// later times), so we free deterministically here to avoid
+// accumulating handles in long-lived test harnesses.
 func (b *MeshDBQueryBuilder) At(origin, seq uint64) *MeshDBQueryBuilder {
+	b.resetState()
 	return &MeshDBQueryBuilder{state: MeshDBQueryAt(origin, seq)}
 }
 
 // Between resets the builder to a fresh source: read events in
-// the half-open seq range.
+// the half-open seq range. Frees any prior builder state — see
+// `At` for the lifetime rationale.
 func (b *MeshDBQueryBuilder) Between(origin, start, end uint64) *MeshDBQueryBuilder {
+	b.resetState()
 	q, err := MeshDBQueryBetween(origin, start, end)
 	return &MeshDBQueryBuilder{state: q, err: err}
 }
 
 // Latest resets the builder to a fresh source: read the tip
-// event of origin.
+// event of origin. Frees any prior builder state — see `At` for
+// the lifetime rationale.
 func (b *MeshDBQueryBuilder) Latest(origin uint64) *MeshDBQueryBuilder {
+	b.resetState()
 	return &MeshDBQueryBuilder{state: MeshDBQueryLatest(origin)}
+}
+
+// resetState frees any handle currently held in `b.state`. Safe
+// to call when `b` is nil or `b.state` is nil. Idempotent.
+func (b *MeshDBQueryBuilder) resetState() {
+	if b == nil || b.state == nil {
+		return
+	}
+	b.state.Free()
+	b.state = nil
 }
 
 // Filter wraps the current pipeline in a row filter.
