@@ -17,18 +17,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
+use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::behavior::meshos::{
     attach_to_daemon_registry, ActionExecutor, AdminEvent, ChainId, DaemonIntent,
     DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent,
-    LocalReplicaIntentUpdate, LoggingDispatcher, MaintenanceTransition, MeshOsAction,
-    MeshOsConfig, MeshOsEvent, MeshOsLoop, MeshOsLoopParts, MeshOsRuntime, MeshOsSnapshotReader,
-    NodeId, ReplicaUpdate,
-};
-use net::adapter::net::behavior::capability::CapabilityFilter;
-use net::adapter::net::compute::{
-    DaemonError, DaemonHostConfig, DaemonRegistry, MeshDaemon,
+    LocalReplicaIntentUpdate, LoggingDispatcher, MaintenanceTransition, MeshOsAction, MeshOsConfig,
+    MeshOsEvent, MeshOsLoop, MeshOsLoopParts, MeshOsRuntime, MeshOsSnapshotReader, NodeId,
+    ReplicaUpdate,
 };
 use net::adapter::net::compute::DaemonHost;
+use net::adapter::net::compute::{DaemonError, DaemonHostConfig, DaemonRegistry, MeshDaemon};
 use net::adapter::net::state::causal::CausalEvent;
 use net::adapter::net::EntityKeypair;
 
@@ -66,7 +64,12 @@ fn spawn_pipeline(
     tokio::task::JoinHandle<u64>,
     tokio::task::JoinHandle<Arc<net::adapter::net::behavior::meshos::ExecutorStats>>,
 ) {
-    let MeshOsLoopParts { mesh_loop, handle, actions_rx, reader: _snapshot_reader } = MeshOsLoop::new(cfg.clone());
+    let MeshOsLoopParts {
+        mesh_loop,
+        handle,
+        actions_rx,
+        reader: _snapshot_reader,
+    } = MeshOsLoop::new(cfg.clone());
     let dispatcher = Arc::new(LoggingDispatcher::new());
     let exec = ActionExecutor::new(actions_rx, Arc::new(cfg), Arc::clone(&dispatcher));
     let loop_task = tokio::spawn(mesh_loop.run());
@@ -509,7 +512,12 @@ fn spawn_pipeline_with_reader(
     tokio::task::JoinHandle<Arc<net::adapter::net::behavior::meshos::ExecutorStats>>,
     MeshOsSnapshotReader,
 ) {
-    let MeshOsLoopParts { mesh_loop, handle, actions_rx, reader } = MeshOsLoop::new(cfg.clone());
+    let MeshOsLoopParts {
+        mesh_loop,
+        handle,
+        actions_rx,
+        reader,
+    } = MeshOsLoop::new(cfg.clone());
     let dispatcher = Arc::new(LoggingDispatcher::new());
     let exec = ActionExecutor::new(actions_rx, Arc::new(cfg), Arc::clone(&dispatcher));
     let loop_task = tokio::spawn(mesh_loop.run());

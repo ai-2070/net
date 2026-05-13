@@ -68,22 +68,13 @@ pub mod state;
 pub mod supervision;
 
 pub use action::{ActionId, AllocateActionId, MaintenanceTransition, MeshOsAction, PendingAction};
+pub use backpressure::{admit, AdmissionResult, BackpressureState, ClusterBackpressureChange};
 pub use chain::{
     append_dispatched, append_failed, append_gated, record_from, ActionChainAppender,
     ActionChainRecord, ActionDisposition, AppendError, BufferingActionChainAppender,
     MeshOsSnapshotFold, NoOpActionChainAppender,
 };
-pub use backpressure::{
-    admit, AdmissionResult, BackpressureState, ClusterBackpressureChange,
-};
 pub use config::{BackpressureConfig, LocalityConfig, MaintenanceConfig, MeshOsConfig};
-pub use maintenance::MaintenanceState;
-pub use snapshot::{
-    action_kind_str, AvoidEntrySnapshot, DaemonHealthSnapshot, DaemonLifecycleSnapshot,
-    DaemonSnapshot, FailureRecord, MaintenanceMirrorSnapshot, MaintenanceStateSnapshot,
-    MeshOsSnapshot, PeerHealthSnapshot, PeerSnapshot, PendingActionSnapshot, ReplicaSnapshot,
-    RestartStateSnapshot, RECENT_FAILURES_CAPACITY,
-};
 pub use control::MeshOsControl;
 pub use event::{
     AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,
@@ -94,16 +85,23 @@ pub use event_loop::{
     MeshOsHandle, MeshOsHandleError, MeshOsLoop, MeshOsLoopParts, MeshOsSnapshotReader,
     ProbeRegistry,
 };
-pub use probes::{
-    HealthProbe, LocalityProbe, ProximityGraphHealthProbe, ProximityGraphLocalityProbe,
-};
 pub use executor::{
     ActionDispatcher, ActionExecutor, DispatchError, ExecutorHandle, ExecutorStats,
     ExecutorStatsSnapshot, LoggingDispatcher,
 };
+pub use maintenance::MaintenanceState;
+pub use probes::{
+    HealthProbe, LocalityProbe, ProximityGraphHealthProbe, ProximityGraphLocalityProbe,
+};
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
 pub use runtime::{MeshOsRuntime, RuntimeShutdownError, RuntimeStats};
 pub use scheduler::{PlacementScorer, SchedulerConfig, SchedulerRegistry};
+pub use snapshot::{
+    action_kind_str, AvoidEntrySnapshot, DaemonHealthSnapshot, DaemonLifecycleSnapshot,
+    DaemonSnapshot, FailureRecord, MaintenanceMirrorSnapshot, MaintenanceStateSnapshot,
+    MeshOsSnapshot, PeerHealthSnapshot, PeerSnapshot, PendingActionSnapshot, ReplicaSnapshot,
+    RestartStateSnapshot, RECENT_FAILURES_CAPACITY,
+};
 pub use sources::{
     attach_to_daemon_registry, attach_to_replication_coordinator, MeshOsDaemonLifecycleSink,
     MeshOsReplicaTransitionSink,

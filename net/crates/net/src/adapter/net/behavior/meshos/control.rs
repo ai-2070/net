@@ -81,9 +81,9 @@ impl MeshOsControl {
                 grace_period_ms: deadline.saturating_duration_since(now).as_millis() as u64,
             },
             MeshOsControl::DrainFinish => DaemonControl::DrainFinish,
-            MeshOsControl::BackpressureOn { level } => DaemonControl::BackpressureOn {
-                level: *level,
-            },
+            MeshOsControl::BackpressureOn { level } => {
+                DaemonControl::BackpressureOn { level: *level }
+            }
             MeshOsControl::BackpressureOff => DaemonControl::BackpressureOff,
         }
     }

@@ -210,9 +210,9 @@ pub fn attach_to_daemon_registry(
 mod tests {
     use std::time::Instant;
 
-    use super::*;
     use super::super::config::MeshOsConfig;
     use super::super::event_loop::{MeshOsLoop, MeshOsLoopParts};
+    use super::*;
     use crate::adapter::net::compute::DaemonHealth;
 
     fn fast_cfg() -> MeshOsConfig {
@@ -230,7 +230,12 @@ mod tests {
 
     #[tokio::test]
     async fn registered_event_publishes_started_signal() {
-        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_cfg());
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader: _,
+        } = MeshOsLoop::new(fast_cfg());
         let sink = MeshOsDaemonLifecycleSink::new(handle.clone());
         let task = tokio::spawn(loop_.run());
 
@@ -250,7 +255,12 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_count_increments_when_loop_is_closed() {
-        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_cfg());
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader: _,
+        } = MeshOsLoop::new(fast_cfg());
         let sink = MeshOsDaemonLifecycleSink::new(handle.clone());
         // Tear the loop down first.
         handle.publish(MeshOsEvent::Shutdown).await.unwrap();
@@ -274,7 +284,12 @@ mod tests {
         // the matching signal arm. Run all five and confirm
         // dropped_count stays at 0 (i.e. every publish
         // succeeded).
-        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_cfg());
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader: _,
+        } = MeshOsLoop::new(fast_cfg());
         let sink = MeshOsDaemonLifecycleSink::new(handle.clone());
         let task = tokio::spawn(loop_.run());
 
@@ -318,7 +333,12 @@ mod tests {
     #[tokio::test]
     async fn became_holder_event_publishes_replica_added() {
         const THIS_NODE: NodeId = 100;
-        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_cfg());
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader: _,
+        } = MeshOsLoop::new(fast_cfg());
         let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
         let task = tokio::spawn(loop_.run());
 
@@ -336,7 +356,12 @@ mod tests {
     #[tokio::test]
     async fn idled_event_publishes_replica_removed() {
         const THIS_NODE: NodeId = 100;
-        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_cfg());
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader: _,
+        } = MeshOsLoop::new(fast_cfg());
         let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
         let task = tokio::spawn(loop_.run());
 
@@ -354,7 +379,12 @@ mod tests {
     #[tokio::test]
     async fn leader_changed_event_publishes_replica_leader_update() {
         const THIS_NODE: NodeId = 100;
-        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_cfg());
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader: _,
+        } = MeshOsLoop::new(fast_cfg());
         let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
         let task = tokio::spawn(loop_.run());
 
@@ -414,7 +444,12 @@ mod tests {
     #[tokio::test]
     async fn replica_sink_drops_increment_when_loop_is_closed() {
         const THIS_NODE: NodeId = 100;
-        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_cfg());
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader: _,
+        } = MeshOsLoop::new(fast_cfg());
         let sink = MeshOsReplicaTransitionSink::new(handle.clone(), THIS_NODE);
         handle.publish(MeshOsEvent::Shutdown).await.unwrap();
         let _ = loop_.run().await;
@@ -429,7 +464,12 @@ mod tests {
     #[tokio::test]
     async fn attach_to_daemon_registry_installs_the_observer() {
         use crate::adapter::net::compute::DaemonRegistry;
-        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_cfg());
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader: _,
+        } = MeshOsLoop::new(fast_cfg());
         let registry = DaemonRegistry::new();
         // Consume the loop into a task so the handle's
         // mpsc receiver stays live for the observer-install

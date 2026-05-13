@@ -65,11 +65,7 @@ pub trait PlacementScorer: Send + Sync + 'static {
     /// current holders. The scheduler compares the returned
     /// score against the worst current holder's score plus
     /// hysteresis before committing.
-    fn best_alternative(
-        &self,
-        chain: ChainId,
-        exclude: &[NodeId],
-    ) -> Option<(NodeId, f32)>;
+    fn best_alternative(&self, chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)>;
 }
 
 /// Tunables for [`super::reconcile::reconcile`]'s scheduler arm.
@@ -155,11 +151,7 @@ mod tests {
         fn score(&self, chain: ChainId, node: NodeId) -> Option<f32> {
             self.scores.get(&(chain, node)).copied()
         }
-        fn best_alternative(
-            &self,
-            chain: ChainId,
-            exclude: &[NodeId],
-        ) -> Option<(NodeId, f32)> {
+        fn best_alternative(&self, chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)> {
             let (n, s) = self.alternatives.get(&chain).copied()?;
             if exclude.contains(&n) {
                 None

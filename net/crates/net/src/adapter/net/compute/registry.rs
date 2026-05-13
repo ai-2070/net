@@ -9,9 +9,7 @@ use std::time::Instant;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 
-use super::daemon::{
-    DaemonError, DaemonLifecycleEvent, DaemonLifecycleObserver, DaemonStats,
-};
+use super::daemon::{DaemonError, DaemonLifecycleEvent, DaemonLifecycleObserver, DaemonStats};
 use super::host::DaemonHost;
 use crate::adapter::net::state::causal::CausalEvent;
 use crate::adapter::net::state::snapshot::StateSnapshot;

@@ -418,10 +418,16 @@ impl ReplicationCoordinator {
         match (transition.from, transition.to) {
             (ReplicaRole::Idle, ReplicaRole::Replica)
             | (ReplicaRole::Idle, ReplicaRole::Leader) => {
-                self.fire_transition(ReplicaTransitionEvent::BecameHolder { origin_hash: origin, at });
+                self.fire_transition(ReplicaTransitionEvent::BecameHolder {
+                    origin_hash: origin,
+                    at,
+                });
             }
             (_, ReplicaRole::Idle) => {
-                self.fire_transition(ReplicaTransitionEvent::Idled { origin_hash: origin, at });
+                self.fire_transition(ReplicaTransitionEvent::Idled {
+                    origin_hash: origin,
+                    at,
+                });
             }
             _ => {}
         }
@@ -431,7 +437,10 @@ impl ReplicationCoordinator {
                 | (ReplicaRole::Candidate, ReplicaRole::Leader)
                 | (ReplicaRole::Idle, ReplicaRole::Leader)
         ) {
-            self.fire_transition(ReplicaTransitionEvent::LeaderChanged { origin_hash: origin, at });
+            self.fire_transition(ReplicaTransitionEvent::LeaderChanged {
+                origin_hash: origin,
+                at,
+            });
         }
         // Step-down transitions surface as LeaderLost so the
         // MeshOS sink can clear its `replica_leader` mirror —
@@ -439,10 +448,12 @@ impl ReplicationCoordinator {
         // a different node's LeaderChanged overwrites it.
         if matches!(
             (transition.from, transition.to),
-            (ReplicaRole::Leader, ReplicaRole::Replica)
-                | (ReplicaRole::Leader, ReplicaRole::Idle)
+            (ReplicaRole::Leader, ReplicaRole::Replica) | (ReplicaRole::Leader, ReplicaRole::Idle)
         ) {
-            self.fire_transition(ReplicaTransitionEvent::LeaderLost { origin_hash: origin, at });
+            self.fire_transition(ReplicaTransitionEvent::LeaderLost {
+                origin_hash: origin,
+                at,
+            });
         }
 
         Ok(Some(transition))

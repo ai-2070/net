@@ -212,18 +212,12 @@ impl MeshOsRuntime {
                 .stats
                 .dispatched
                 .load(std::sync::atomic::Ordering::Relaxed),
-            failed: self
-                .stats
-                .failed
-                .load(std::sync::atomic::Ordering::Relaxed),
+            failed: self.stats.failed.load(std::sync::atomic::Ordering::Relaxed),
             deferred: self
                 .stats
                 .deferred
                 .load(std::sync::atomic::Ordering::Relaxed),
-            gated: self
-                .stats
-                .gated
-                .load(std::sync::atomic::Ordering::Relaxed),
+            gated: self.stats.gated.load(std::sync::atomic::Ordering::Relaxed),
             dispatch_retries: self
                 .stats
                 .dispatch_retries
@@ -291,18 +285,12 @@ impl MeshOsRuntime {
                     .stats
                     .dispatched
                     .load(std::sync::atomic::Ordering::Relaxed),
-                failed: self
-                    .stats
-                    .failed
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                failed: self.stats.failed.load(std::sync::atomic::Ordering::Relaxed),
                 deferred: self
                     .stats
                     .deferred
                     .load(std::sync::atomic::Ordering::Relaxed),
-                gated: self
-                    .stats
-                    .gated
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                gated: self.stats.gated.load(std::sync::atomic::Ordering::Relaxed),
                 dispatch_retries: self
                     .stats
                     .dispatch_retries
@@ -371,11 +359,11 @@ pub enum RuntimeShutdownError {
 mod tests {
     use std::time::Instant;
 
-    use super::*;
     use super::super::action::MaintenanceTransition;
     use super::super::action::MeshOsAction;
     use super::super::event::AdminEvent;
     use super::super::executor::LoggingDispatcher;
+    use super::*;
 
     fn fast_cfg() -> MeshOsConfig {
         MeshOsConfig {
@@ -386,7 +374,7 @@ mod tests {
             backpressure: Default::default(),
             locality: Default::default(),
             maintenance: Default::default(),
-        scheduler: Default::default(),
+            scheduler: Default::default(),
         }
     }
 

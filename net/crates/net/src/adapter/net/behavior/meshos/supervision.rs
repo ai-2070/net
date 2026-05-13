@@ -181,7 +181,9 @@ impl BackoffTracker {
     /// count crosses the threshold.
     pub fn observe_crash(&mut self, now: Instant) {
         // Slide the crash window forward.
-        let cutoff = now.checked_sub(self.config.crash_loop_window).unwrap_or(now);
+        let cutoff = now
+            .checked_sub(self.config.crash_loop_window)
+            .unwrap_or(now);
         while self
             .crash_history
             .front()

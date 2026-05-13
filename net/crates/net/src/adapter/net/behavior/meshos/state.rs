@@ -218,13 +218,9 @@ impl MeshOsState {
         // simple mirror enum.
         let mirror = match &state {
             MaintenanceState::Active => MaintenanceMirror::Active,
-            MaintenanceState::EnteringMaintenance { .. } => {
-                MaintenanceMirror::EnteringMaintenance
-            }
+            MaintenanceState::EnteringMaintenance { .. } => MaintenanceMirror::EnteringMaintenance,
             MaintenanceState::Maintenance { .. } => MaintenanceMirror::Maintenance,
-            MaintenanceState::ExitingMaintenance { .. } => {
-                MaintenanceMirror::ExitingMaintenance
-            }
+            MaintenanceState::ExitingMaintenance { .. } => MaintenanceMirror::ExitingMaintenance,
             MaintenanceState::DrainFailed { .. } => MaintenanceMirror::DrainFailed,
             MaintenanceState::Recovery { .. } => MaintenanceMirror::Recovery,
         };
@@ -312,9 +308,7 @@ impl MeshOsState {
                         MaintenanceState::Maintenance { .. } | MaintenanceState::DrainFailed { .. }
                     )
                 {
-                    self.local_maintenance = MaintenanceState::ExitingMaintenance {
-                        since: anchor,
-                    };
+                    self.local_maintenance = MaintenanceState::ExitingMaintenance { since: anchor };
                 }
             }
             AdminEvent::ClearAvoidList { node: _ } => {
@@ -437,7 +431,10 @@ mod tests {
         state.apply(&add(chain, 11), 0);
         state.apply(&add(chain, 12), 0);
         state.apply(&rm(chain, 11), 0);
-        assert_eq!(state.replicas.get(&chain), Some(&::std::collections::BTreeSet::from([12])));
+        assert_eq!(
+            state.replicas.get(&chain),
+            Some(&::std::collections::BTreeSet::from([12]))
+        );
     }
 
     #[test]
@@ -446,7 +443,10 @@ mod tests {
         let mut state = MeshOsState::default();
         state.apply(&add(chain, 7), 0);
         state.apply(&add(chain, 7), 0);
-        assert_eq!(state.replicas.get(&chain), Some(&::std::collections::BTreeSet::from([7])));
+        assert_eq!(
+            state.replicas.get(&chain),
+            Some(&::std::collections::BTreeSet::from([7]))
+        );
     }
 
     #[test]
@@ -506,7 +506,10 @@ mod tests {
                 until: Instant::now() + Duration::from_secs(60),
             },
         );
-        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ClearAvoidList { node: 7 }), 0);
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ClearAvoidList { node: 7 }),
+            0,
+        );
         assert!(state.avoid_list.is_empty());
     }
 
@@ -525,7 +528,10 @@ mod tests {
             state.maintenance.get(&node).copied(),
             Some(MaintenanceMirror::EnteringMaintenance),
         );
-        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ExitMaintenance { node }), 0);
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ExitMaintenance { node }),
+            0,
+        );
         assert_eq!(
             state.maintenance.get(&node).copied(),
             Some(MaintenanceMirror::ExitingMaintenance),

@@ -69,9 +69,7 @@ pub fn encode_record(record: &ActionChainRecord) -> Result<Vec<u8>, AppendError>
 /// a forward-incompatible record surfaces as a clear error
 /// rather than a garbled deserialization.
 pub fn decode_record(bytes: &[u8]) -> Result<ActionChainRecord, DecodeError> {
-    let (&version, rest) = bytes
-        .split_first()
-        .ok_or(DecodeError::Empty)?;
+    let (&version, rest) = bytes.split_first().ok_or(DecodeError::Empty)?;
     if version != WIRE_FORMAT_VERSION {
         return Err(DecodeError::UnsupportedVersion {
             seen: version,
@@ -166,10 +164,7 @@ pub enum ActionDisposition {
 /// Build a record from a [`PendingAction`] + disposition.
 /// Wall-clock time is taken at call-time from `SystemTime`
 /// (the executor doesn't carry an explicit clock dep).
-pub fn record_from(
-    pending: &PendingAction,
-    disposition: ActionDisposition,
-) -> ActionChainRecord {
+pub fn record_from(pending: &PendingAction, disposition: ActionDisposition) -> ActionChainRecord {
     let emitted_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -316,14 +311,9 @@ impl ActionChainAppender for BufferingActionChainAppender {
 pub struct MeshOsSnapshotFold;
 
 impl RedexFold<MeshOsSnapshot> for MeshOsSnapshotFold {
-    fn apply(
-        &mut self,
-        ev: &RedexEvent,
-        state: &mut MeshOsSnapshot,
-    ) -> Result<(), RedexError> {
-        let record = decode_record(&ev.payload).map_err(|e| {
-            RedexError::Decode(format!("ActionChainRecord wire decode: {e}"))
-        })?;
+    fn apply(&mut self, ev: &RedexEvent, state: &mut MeshOsSnapshot) -> Result<(), RedexError> {
+        let record = decode_record(&ev.payload)
+            .map_err(|e| RedexError::Decode(format!("ActionChainRecord wire decode: {e}")))?;
         let recorded_at_ms = record.emitted_at_ms;
         match record.disposition {
             ActionDisposition::Dispatched => {
@@ -338,7 +328,10 @@ impl RedexFold<MeshOsSnapshot> for MeshOsSnapshotFold {
                     recorded_at_ms,
                 );
             }
-            ActionDisposition::Gated { reason, cooldown_ms } => {
+            ActionDisposition::Gated {
+                reason,
+                cooldown_ms,
+            } => {
                 let detail = match cooldown_ms {
                     Some(ms) => format!("gated ({reason}); cooldown {ms} ms"),
                     None => format!("gated ({reason})"),
@@ -355,12 +348,7 @@ impl RedexFold<MeshOsSnapshot> for MeshOsSnapshotFold {
     }
 }
 
-fn push_failure(
-    state: &mut MeshOsSnapshot,
-    source: String,
-    reason: String,
-    recorded_at_ms: u64,
-) {
+fn push_failure(state: &mut MeshOsSnapshot, source: String, reason: String, recorded_at_ms: u64) {
     if state.recent_failures.len() >= RECENT_FAILURES_CAPACITY {
         state.recent_failures.pop_front();
     }
@@ -407,7 +395,10 @@ pub fn append_gated(
 ) -> Result<(), AppendError> {
     appender.append(record_from(
         pending,
-        ActionDisposition::Gated { reason, cooldown_ms },
+        ActionDisposition::Gated {
+            reason,
+            cooldown_ms,
+        },
     ))
 }
 
@@ -420,8 +411,8 @@ const _: Option<MeshOsAction> = None;
 mod tests {
     use std::time::Instant;
 
-    use super::*;
     use super::super::action::{ActionId, MaintenanceTransition};
+    use super::*;
 
     fn record(id: u64, kind: &str, disposition: ActionDisposition) -> ActionChainRecord {
         ActionChainRecord {
@@ -594,10 +585,7 @@ mod tests {
         let bytes = postcard::to_allocvec(&r).unwrap();
         fold.apply(&redex_event(bytes), &mut state).unwrap();
         assert_eq!(state.recent_failures.len(), 1);
-        assert_eq!(
-            state.recent_failures[0].source,
-            "action-id:42:start_daemon",
-        );
+        assert_eq!(state.recent_failures[0].source, "action-id:42:start_daemon",);
         assert_eq!(state.recent_failures[0].reason, "process died");
     }
 
@@ -667,9 +655,7 @@ mod tests {
 
         use super::super::action::ActionId;
         use super::super::config::MeshOsConfig;
-        use super::super::executor::{
-            ActionExecutor, DispatchError, LoggingDispatcher,
-        };
+        use super::super::executor::{ActionExecutor, DispatchError, LoggingDispatcher};
 
         let (tx, rx) = mpsc::channel(8);
         let dispatcher = Arc::new(LoggingDispatcher::new());
@@ -698,9 +684,16 @@ mod tests {
 
         // The buffer should now hold one Failed record.
         let records = appender.records();
-        assert_eq!(records.len(), 1, "expected one chain record, got {records:?}");
+        assert_eq!(
+            records.len(),
+            1,
+            "expected one chain record, got {records:?}"
+        );
         assert_eq!(records[0].id, 99);
-        assert!(matches!(records[0].disposition, ActionDisposition::Failed { .. }));
+        assert!(matches!(
+            records[0].disposition,
+            ActionDisposition::Failed { .. }
+        ));
 
         // Replay through the fold; the snapshot's
         // recent_failures should reflect the failure.

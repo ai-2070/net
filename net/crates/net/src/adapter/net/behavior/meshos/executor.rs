@@ -33,12 +33,9 @@ use tokio::sync::mpsc;
 use tokio::time::sleep_until;
 
 use super::action::{MeshOsAction, PendingAction};
-use super::backpressure::{
-    AdmissionResult, BackpressureState, ClusterBackpressureChange,
-};
+use super::backpressure::{AdmissionResult, BackpressureState, ClusterBackpressureChange};
 use super::chain::{
-    append_dispatched, append_failed, append_gated, ActionChainAppender,
-    NoOpActionChainAppender,
+    append_dispatched, append_failed, append_gated, ActionChainAppender, NoOpActionChainAppender,
 };
 use super::config::MeshOsConfig;
 use super::snapshot::{FailureRecord, RECENT_FAILURES_CAPACITY};
@@ -55,10 +52,7 @@ pub trait ActionDispatcher: Send + Sync + 'static {
     /// Dispatch an admitted action. Errors record on the
     /// recent-failures ring buffer; the action is not retried
     /// (admit / defer is the retry surface).
-    fn dispatch<'a>(
-        &'a self,
-        action: MeshOsAction,
-    ) -> BoxFuture<'a, Result<(), DispatchError>>;
+    fn dispatch<'a>(&'a self, action: MeshOsAction) -> BoxFuture<'a, Result<(), DispatchError>>;
 
     /// Cluster-wide backpressure flag transitioned. The executor
     /// invokes this once per edge crossing — `Asserted` when the
@@ -141,10 +135,7 @@ impl LoggingDispatcher {
 }
 
 impl ActionDispatcher for LoggingDispatcher {
-    fn dispatch<'a>(
-        &'a self,
-        action: MeshOsAction,
-    ) -> BoxFuture<'a, Result<(), DispatchError>> {
+    fn dispatch<'a>(&'a self, action: MeshOsAction) -> BoxFuture<'a, Result<(), DispatchError>> {
         Box::pin(async move {
             if let Some(err) = self.fail_next.lock().take() {
                 return Err(err);
@@ -345,7 +336,8 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             .admit(&action.action, now, &self.config.backpressure)
         {
             AdmissionResult::Admit => {
-                self.dispatch_now_with_defer_count(action, now, prior_defers).await
+                self.dispatch_now_with_defer_count(action, now, prior_defers)
+                    .await
             }
             AdmissionResult::Defer { retry_after } => {
                 let next_count = prior_defers.saturating_add(1);
@@ -355,10 +347,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                         "deferred {next_count} times — exceeds max_defer_count {}",
                         self.config.backpressure.max_defer_count,
                     );
-                    self.record_failure(
-                        format!("action-id:{}", action.id.0),
-                        reason.clone(),
-                    );
+                    self.record_failure(format!("action-id:{}", action.id.0), reason.clone());
                     let _ = append_failed(&self.chain_appender, &action, reason, None);
                     return;
                 }
@@ -435,19 +424,10 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                     let next_count = prior_defers.saturating_add(1);
                     if next_count > self.config.backpressure.max_defer_count {
                         ExecutorStats::inc(&self.stats.failed);
-                        let reason = format!(
-                            "dispatch retry budget exhausted after {next_count} attempts",
-                        );
-                        self.record_failure(
-                            format!("action-id:{}", action.id.0),
-                            reason.clone(),
-                        );
-                        let _ = append_failed(
-                            &self.chain_appender,
-                            &action,
-                            reason,
-                            None,
-                        );
+                        let reason =
+                            format!("dispatch retry budget exhausted after {next_count} attempts",);
+                        self.record_failure(format!("action-id:{}", action.id.0), reason.clone());
+                        let _ = append_failed(&self.chain_appender, &action, reason, None);
                         return;
                     }
                     ExecutorStats::inc(&self.stats.dispatch_retries);
@@ -467,10 +447,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                 } else {
                     ExecutorStats::inc(&self.stats.failed);
                     let reason = err.reason.clone();
-                    self.record_failure(
-                        format!("action-id:{}", action.id.0),
-                        err.reason,
-                    );
+                    self.record_failure(format!("action-id:{}", action.id.0), err.reason);
                     let _ = append_failed(&self.chain_appender, &action, reason, None);
                 }
             }
@@ -491,7 +468,6 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             recorded_at_ms,
         });
     }
-
 }
 
 /// External handle for sampling executor live state.
@@ -560,10 +536,10 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::*;
     use super::super::action::{ActionId, MaintenanceTransition};
     use super::super::config::MeshOsConfig;
     use super::super::event::{ChainId, DaemonRef};
+    use super::*;
 
     fn pending(id: u64, action: MeshOsAction) -> PendingAction {
         PendingAction {
@@ -780,10 +756,7 @@ mod tests {
             ) -> BoxFuture<'a, Result<(), DispatchError>> {
                 Box::pin(async move {
                     *self.attempts.lock() += 1;
-                    Err(DispatchError::retry(
-                        "transient",
-                        Duration::from_millis(5),
-                    ))
+                    Err(DispatchError::retry("transient", Duration::from_millis(5)))
                 })
             }
         }
@@ -885,9 +858,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(tx);
 
-        let stats = task.await.expect(
-            "executor task should NOT have panicked despite dispatcher panic",
-        );
+        let stats = task
+            .await
+            .expect("executor task should NOT have panicked despite dispatcher panic");
         assert_eq!(
             stats.dispatched.load(Ordering::Relaxed),
             1,
@@ -939,8 +912,14 @@ mod tests {
             "depth dropped below the low-water mark at least once",
         );
         let log = dispatcher.backpressure_log();
-        assert!(matches!(log.first(), Some(ClusterBackpressureChange::Asserted)));
-        assert!(matches!(log.last(), Some(ClusterBackpressureChange::Released)));
+        assert!(matches!(
+            log.first(),
+            Some(ClusterBackpressureChange::Asserted)
+        ));
+        assert!(matches!(
+            log.last(),
+            Some(ClusterBackpressureChange::Released)
+        ));
     }
 
     #[tokio::test]
@@ -955,16 +934,16 @@ mod tests {
         // First dispatch fails with a long retry hint; the
         // second admit (on a different chain) must succeed
         // without waiting on the rolled-back cooldown.
-        dispatcher.fail_next(DispatchError::retry(
-            "transient",
-            Duration::from_secs(60),
-        ));
+        dispatcher.fail_next(DispatchError::retry("transient", Duration::from_secs(60)));
         let exec = ActionExecutor::new(rx, cfg, Arc::clone(&dispatcher));
         let task = tokio::spawn(exec.run());
 
         tx.send(pending(
             1,
-            MeshOsAction::PullReplica { chain: 1, source: 5 },
+            MeshOsAction::PullReplica {
+                chain: 1,
+                source: 5,
+            },
         ))
         .await
         .unwrap();
@@ -973,7 +952,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         tx.send(pending(
             2,
-            MeshOsAction::PullReplica { chain: 2, source: 5 },
+            MeshOsAction::PullReplica {
+                chain: 2,
+                source: 5,
+            },
         ))
         .await
         .unwrap();

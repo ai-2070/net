@@ -405,9 +405,8 @@ impl MeshOsSnapshot {
             MaintenanceState::EnteringMaintenance { since, deadline } => {
                 MaintenanceStateSnapshot::EnteringMaintenance {
                     since_ms: now.saturating_duration_since(*since).as_millis() as u64,
-                    deadline_remaining_ms: deadline.map(|d| {
-                        d.saturating_duration_since(now).as_millis() as u64
-                    }),
+                    deadline_remaining_ms: deadline
+                        .map(|d| d.saturating_duration_since(now).as_millis() as u64),
                 }
             }
             MaintenanceState::Maintenance { since } => MaintenanceStateSnapshot::Maintenance {
@@ -471,7 +470,11 @@ pub fn action_kind_str(action: &MeshOsAction) -> &'static str {
 
 /// Helper for tests + callers: dummy `now`-anchored
 /// recent-failure record builder.
-pub fn failure_record(source: impl Into<String>, reason: impl Into<String>, age: Duration) -> FailureRecord {
+pub fn failure_record(
+    source: impl Into<String>,
+    reason: impl Into<String>,
+    age: Duration,
+) -> FailureRecord {
     // `age` is interpreted as "this many ms before now"; produce
     // a `recorded_at_ms` that, evaluated at the current
     // wall-clock, projects back to `age`.
@@ -500,11 +503,11 @@ pub fn daemon_id(d: &DaemonRef) -> u64 {
 mod tests {
     use std::time::Instant;
 
-    use super::*;
     use super::super::action::{ActionId, MaintenanceTransition};
     use super::super::event::{DaemonHealth, NodeHealth};
     use super::super::maintenance::MaintenanceState;
     use super::super::state::{AvoidEntry, DaemonStatus, MaintenanceMirror};
+    use super::*;
 
     fn dref(name: &str, id: u64) -> DaemonRef {
         DaemonRef {
@@ -574,7 +577,9 @@ mod tests {
     fn snapshot_captures_replica_holders_and_leader_and_desired_count() {
         let mut actual = MeshOsState::default();
         actual.last_tick = Some(Instant::now());
-        actual.replicas.insert(0xAA, ::std::collections::BTreeSet::from([1, 2, 3]));
+        actual
+            .replicas
+            .insert(0xAA, ::std::collections::BTreeSet::from([1, 2, 3]));
         actual.replica_leader.insert(0xAA, 1);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(0xAA, 5);
@@ -591,7 +596,10 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(0xBB, 3);
         let snap = MeshOsSnapshot::from_state(&actual, &desired, &[]);
-        let r = snap.replicas.get(&0xBB).expect("missing chain not surfaced");
+        let r = snap
+            .replicas
+            .get(&0xBB)
+            .expect("missing chain not surfaced");
         assert_eq!(r.holders, Vec::<NodeId>::new());
         assert_eq!(r.desired_count, Some(3));
     }
@@ -608,11 +616,15 @@ mod tests {
         status.health = Some(DaemonHealth::Healthy);
         actual.daemons.insert(d, status);
 
-        actual.replicas.insert(0xC0FFEE, ::std::collections::BTreeSet::from([10, 11]));
+        actual
+            .replicas
+            .insert(0xC0FFEE, ::std::collections::BTreeSet::from([10, 11]));
         actual.replica_leader.insert(0xC0FFEE, 10);
         actual.rtt.insert(10, Duration::from_millis(45));
         actual.node_health.insert(10, NodeHealth::Healthy);
-        actual.maintenance.insert(11, MaintenanceMirror::Maintenance);
+        actual
+            .maintenance
+            .insert(11, MaintenanceMirror::Maintenance);
         actual.avoid_list.insert(
             999,
             AvoidEntry {
@@ -656,20 +668,32 @@ mod tests {
         // shipped variant so a refactor that drops one shows up
         // here.
         let cases: Vec<MeshOsAction> = vec![
-            MeshOsAction::StartDaemon { daemon: dref("a", 1) },
+            MeshOsAction::StartDaemon {
+                daemon: dref("a", 1),
+            },
             MeshOsAction::StopDaemon {
                 daemon: dref("a", 1),
                 reason: "x".into(),
                 deadline: Instant::now(),
             },
-            MeshOsAction::PullReplica { chain: 1, source: 2 },
+            MeshOsAction::PullReplica {
+                chain: 1,
+                source: 2,
+            },
             MeshOsAction::DropReplica { chain: 1 },
             MeshOsAction::RequestPlacement {
                 chain: 1,
                 exclude: vec![],
             },
-            MeshOsAction::RequestEviction { chain: 1, victim: 2 },
-            MeshOsAction::MigrateBlob { blob: 1, from: 2, to: 3 },
+            MeshOsAction::RequestEviction {
+                chain: 1,
+                victim: 2,
+            },
+            MeshOsAction::MigrateBlob {
+                blob: 1,
+                from: 2,
+                to: 3,
+            },
             MeshOsAction::ReduceHeat { blob: 1, by: 1 },
             MeshOsAction::MarkAvoid {
                 peer: 1,

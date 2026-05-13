@@ -109,9 +109,7 @@ impl BackpressureState {
                     }
                 }
                 if let Some(last) = self.last_pull_admitted {
-                    let next_admit = last
-                        .checked_add(config.pull_cooldown)
-                        .unwrap_or(last);
+                    let next_admit = last.checked_add(config.pull_cooldown).unwrap_or(last);
                     if next_admit > now {
                         return AdmissionResult::Defer {
                             retry_after: next_admit.saturating_duration_since(now),
@@ -119,12 +117,11 @@ impl BackpressureState {
                     }
                 }
                 self.last_pull_admitted = Some(now);
-                self.chain_stabilization
-                    .insert(
-                        *chain,
-                        now.checked_add(config.replica_stabilization_window)
-                            .unwrap_or(now),
-                    );
+                self.chain_stabilization.insert(
+                    *chain,
+                    now.checked_add(config.replica_stabilization_window)
+                        .unwrap_or(now),
+                );
                 AdmissionResult::Admit
             }
             MeshOsAction::DropReplica { chain } => {
@@ -135,12 +132,11 @@ impl BackpressureState {
                         };
                     }
                 }
-                self.chain_stabilization
-                    .insert(
-                        *chain,
-                        now.checked_add(config.replica_stabilization_window)
-                            .unwrap_or(now),
-                    );
+                self.chain_stabilization.insert(
+                    *chain,
+                    now.checked_add(config.replica_stabilization_window)
+                        .unwrap_or(now),
+                );
                 AdmissionResult::Admit
             }
             MeshOsAction::StartDaemon { daemon }
@@ -287,8 +283,8 @@ pub fn admit(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::action::{ActionId, MaintenanceTransition};
+    use super::*;
 
     fn dref(name: &str, id: u64) -> DaemonRef {
         DaemonRef {
@@ -564,7 +560,10 @@ mod tests {
                 chain: 1,
                 exclude: vec![],
             },
-            MeshOsAction::RequestEviction { chain: 1, victim: 2 },
+            MeshOsAction::RequestEviction {
+                chain: 1,
+                victim: 2,
+            },
             MeshOsAction::MarkAvoid {
                 peer: 1,
                 reason: "x".into(),
@@ -589,7 +588,10 @@ mod tests {
         // First pull admits — cooldown + stabilization set.
         assert_eq!(
             state.admit(
-                &MeshOsAction::PullReplica { chain: 1, source: 2 },
+                &MeshOsAction::PullReplica {
+                    chain: 1,
+                    source: 2
+                },
                 now,
                 &cfg,
             ),
@@ -599,7 +601,10 @@ mod tests {
         assert!(state.chain_stabilization.contains_key(&1));
         // Dispatch failed — release.
         state.release_failed_admit(
-            &MeshOsAction::PullReplica { chain: 1, source: 2 },
+            &MeshOsAction::PullReplica {
+                chain: 1,
+                source: 2,
+            },
             now,
         );
         assert!(state.last_pull_admitted.is_none());
@@ -609,7 +614,10 @@ mod tests {
         // forced Defer.
         assert_eq!(
             state.admit(
-                &MeshOsAction::PullReplica { chain: 2, source: 3 },
+                &MeshOsAction::PullReplica {
+                    chain: 2,
+                    source: 3
+                },
                 now,
                 &cfg,
             ),
@@ -622,7 +630,11 @@ mod tests {
         let mut state = BackpressureState::new();
         let cfg = BackpressureConfig::default();
         let now = t_ms(0);
-        let migrate = MeshOsAction::MigrateBlob { blob: 1, from: 1, to: 2 };
+        let migrate = MeshOsAction::MigrateBlob {
+            blob: 1,
+            from: 1,
+            to: 2,
+        };
         assert_eq!(state.admit(&migrate, now, &cfg), AdmissionResult::Admit);
         assert_eq!(state.drain_window.len(), 1);
         state.release_failed_admit(&migrate, now);
@@ -642,19 +654,28 @@ mod tests {
         let mut state = BackpressureState::new();
         let cfg = BackpressureConfig::default();
         let _ = state.admit(
-            &MeshOsAction::PullReplica { chain: 1, source: 2 },
+            &MeshOsAction::PullReplica {
+                chain: 1,
+                source: 2,
+            },
             t_ms(0),
             &cfg,
         );
         let later = t_ms(300);
         let _ = state.admit(
-            &MeshOsAction::PullReplica { chain: 2, source: 2 },
+            &MeshOsAction::PullReplica {
+                chain: 2,
+                source: 2,
+            },
             later,
             &cfg,
         );
         assert_eq!(state.last_pull_admitted, Some(later));
         state.release_failed_admit(
-            &MeshOsAction::PullReplica { chain: 2, source: 2 },
+            &MeshOsAction::PullReplica {
+                chain: 2,
+                source: 2,
+            },
             later,
         );
         // Anchor cleared; chain 2 stabilization removed.
@@ -677,6 +698,9 @@ mod tests {
             },
             emitted_at: t(0),
         };
-        assert_eq!(admit(&mut state, &pending, t(0), &cfg), AdmissionResult::Admit);
+        assert_eq!(
+            admit(&mut state, &pending, t(0), &cfg),
+            AdmissionResult::Admit
+        );
     }
 }

@@ -206,7 +206,10 @@ mod tests {
     #[test]
     fn fixed_locality_probe_returns_configured_samples() {
         let probe = FixedLocalityProbe {
-            samples: vec![(1, Duration::from_millis(50)), (2, Duration::from_millis(120))],
+            samples: vec![
+                (1, Duration::from_millis(50)),
+                (2, Duration::from_millis(120)),
+            ],
         };
         let samples = probe.rtt_samples();
         assert_eq!(samples.len(), 2);
