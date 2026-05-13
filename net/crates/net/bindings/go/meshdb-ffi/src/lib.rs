@@ -776,12 +776,26 @@ pub unsafe extern "C" fn net_meshdb_query_filter_json(
     })
 }
 
+/// Maximum nesting depth for caller-supplied predicate JSON.
+/// Deeply-nested `{"kind":"not","child":{...}}` chains otherwise
+/// overflow the FFI thread stack before serde_json's own depth
+/// guard fires. 64 is generous for any human-built predicate and
+/// keeps the recursion shallow enough that release-mode stack
+/// frames stay well below 1 MiB.
+const PREDICATE_PARSE_MAX_DEPTH: u32 = 64;
+
 fn parse_predicate_json(json: &str) -> std::result::Result<Predicate, ()> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|_| ())?;
-    parse_predicate_value(&value)
+    parse_predicate_value(&value, 0)
 }
 
-fn parse_predicate_value(v: &serde_json::Value) -> std::result::Result<Predicate, ()> {
+fn parse_predicate_value(
+    v: &serde_json::Value,
+    depth: u32,
+) -> std::result::Result<Predicate, ()> {
+    if depth >= PREDICATE_PARSE_MAX_DEPTH {
+        return Err(());
+    }
     let obj = v.as_object().ok_or(())?;
     let kind = obj.get("kind").and_then(|k| k.as_str()).ok_or(())?;
     let field = |k: &str| -> std::result::Result<TagKey, ()> {
@@ -853,7 +867,7 @@ fn parse_predicate_value(v: &serde_json::Value) -> std::result::Result<Predicate
             let children_v = obj.get("children").and_then(|x| x.as_array()).ok_or(())?;
             let mut children = Vec::with_capacity(children_v.len());
             for c in children_v {
-                children.push(parse_predicate_value(c)?);
+                children.push(parse_predicate_value(c, depth + 1)?);
             }
             if kind == "and" {
                 Ok(Predicate::And(children))
@@ -863,7 +877,7 @@ fn parse_predicate_value(v: &serde_json::Value) -> std::result::Result<Predicate
         }
         "not" => {
             let child = obj.get("child").ok_or(())?;
-            let inner = parse_predicate_value(child)?;
+            let inner = parse_predicate_value(child, depth + 1)?;
             Ok(Predicate::Not(Box::new(inner)))
         }
         _ => Err(()),
@@ -1609,6 +1623,30 @@ mod tests {
             let bad = std::ffi::CString::new(r#"{"kind":"unknown","field":"x"}"#).unwrap();
             let filter = net_meshdb_query_filter_json(inner, bad.as_ptr());
             assert!(filter.is_null());
+            net_meshdb_query_free(inner);
+        }
+    }
+
+    /// Slice 3: pathologically deep predicate JSON.
+    ///
+    /// Regression: caller-controlled JSON like `{"kind":"not",
+    /// "child":{"kind":"not",...}}` 30k deep used to overflow the
+    /// FFI thread stack before serde_json's own depth guard
+    /// fired. Now bounded at `PREDICATE_PARSE_MAX_DEPTH` (=64);
+    /// deeper input returns null instead of crashing the host.
+    #[test]
+    fn ffi_filter_with_pathologically_deep_predicate_returns_null() {
+        unsafe {
+            let inner = net_meshdb_query_latest(0x01);
+            // Build a 200-deep Not chain. Well past the 64-depth
+            // bound, far below what would otherwise overflow.
+            let mut json = String::from(r#"{"kind":"exists","field":"x"}"#);
+            for _ in 0..200 {
+                json = format!(r#"{{"kind":"not","child":{json}}}"#);
+            }
+            let c = std::ffi::CString::new(json).unwrap();
+            let filter = net_meshdb_query_filter_json(inner, c.as_ptr());
+            assert!(filter.is_null(), "depth bound must reject the predicate");
             net_meshdb_query_free(inner);
         }
     }
