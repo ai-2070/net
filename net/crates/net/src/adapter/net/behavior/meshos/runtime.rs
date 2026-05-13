@@ -112,7 +112,12 @@ impl MeshOsRuntime {
         probes: ProbeRegistry,
         scheduler: SchedulerRegistry,
     ) -> Self {
-        let (mesh_loop, handle, actions_rx, reader) = MeshOsLoop::new(config.clone());
+        let super::event_loop::MeshOsLoopParts {
+            mesh_loop,
+            handle,
+            actions_rx,
+            reader,
+        } = MeshOsLoop::new(config.clone());
         let mesh_loop = mesh_loop
             .with_probe_registry(probes.clone())
             .with_scheduler_registry(scheduler.clone());

@@ -91,7 +91,8 @@ pub use event::{
     NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
 };
 pub use event_loop::{
-    MeshOsHandle, MeshOsHandleError, MeshOsLoop, MeshOsSnapshotReader, ProbeRegistry,
+    MeshOsHandle, MeshOsHandleError, MeshOsLoop, MeshOsLoopParts, MeshOsSnapshotReader,
+    ProbeRegistry,
 };
 pub use probes::{
     HealthProbe, LocalityProbe, ProximityGraphHealthProbe, ProximityGraphLocalityProbe,

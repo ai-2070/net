@@ -247,13 +247,27 @@ pub enum MeshOsHandleError {
     QueueFull,
 }
 
+/// The result of [`MeshOsLoop::new`]. Held together so callers
+/// destructure the pieces they need; future fields (metrics,
+/// chain handles) can be added without breaking the
+/// constructor signature.
+pub struct MeshOsLoopParts {
+    /// The loop itself — consume by spawning [`MeshOsLoop::run`].
+    pub mesh_loop: MeshOsLoop,
+    /// Publish handle; clone for each source converter.
+    pub handle: MeshOsHandle,
+    /// Action-queue receiver, fed into [`super::executor::ActionExecutor::new`].
+    pub actions_rx: mpsc::Receiver<PendingAction>,
+    /// Snapshot reader; clone for each Deck / consumer.
+    pub reader: MeshOsSnapshotReader,
+}
+
 impl MeshOsLoop {
     /// Construct a loop bound to the given config. Returns the
-    /// loop (consumed by `run()`) and a [`MeshOsHandle`] that
-    /// sources clone to publish events.
-    pub fn new(
-        config: MeshOsConfig,
-    ) -> (Self, MeshOsHandle, mpsc::Receiver<PendingAction>, MeshOsSnapshotReader) {
+    /// loop + its publish handle + the action-queue receiver +
+    /// the snapshot reader, bundled in [`MeshOsLoopParts`] so
+    /// future additions don't break the constructor signature.
+    pub fn new(config: MeshOsConfig) -> MeshOsLoopParts {
         let config = Arc::new(config);
         let (events_tx, events_rx) = mpsc::channel(config.event_queue_capacity);
         let (actions_tx, actions_rx) = mpsc::channel(config.action_queue_capacity);
@@ -276,7 +290,12 @@ impl MeshOsLoop {
             reconcile_count: 0,
             dropped_actions: Arc::new(AtomicU64::new(0)),
         };
-        (me, handle, actions_rx, reader)
+        MeshOsLoopParts {
+            mesh_loop: me,
+            handle,
+            actions_rx,
+            reader,
+        }
     }
 
     /// Clone the dropped-action counter. The runtime uses this
@@ -558,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn loop_exits_cleanly_when_all_handles_drop() {
-        let (loop_, handle, mut actions_rx, _) = MeshOsLoop::new(fast_test_config());
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: mut actions_rx, reader: _ } = MeshOsLoop::new(fast_test_config());
         let task = tokio::spawn(loop_.run());
         drop(handle);
         // Loop should drain quickly. `run` returns the
@@ -576,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn loop_exits_on_shutdown_event() {
-        let (loop_, handle, _, _) = MeshOsLoop::new(fast_test_config());
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_test_config());
         let task = tokio::spawn(loop_.run());
         handle.publish(MeshOsEvent::Shutdown).await.unwrap();
         let count = tokio::time::timeout(StdDuration::from_secs(1), task)
@@ -596,7 +615,7 @@ mod tests {
             event_queue_capacity: 1,
             ..fast_test_config()
         };
-        let (_loop_, handle, _actions_rx, _reader) = MeshOsLoop::new(cfg);
+        let MeshOsLoopParts { mesh_loop: _loop_, handle, actions_rx: _actions_rx, reader: _reader } = MeshOsLoop::new(cfg);
         // Don't spawn the loop — handle is alive but the
         // receiver is parked inside `_loop_`. First publish
         // fills the capacity-1 channel; second blocks
@@ -635,8 +654,7 @@ mod tests {
             tick_interval: StdDuration::from_millis(10),
             ..fast_test_config()
         };
-        let (loop_, handle, _actions_rx, _reader) =
-            MeshOsLoop::new(cfg);
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _actions_rx, reader: _reader } = MeshOsLoop::new(cfg);
         let loop_ = loop_.with_probe_registry(registry);
         let task = tokio::spawn(loop_.run());
         // Let several ticks fire — each one will invoke the
@@ -664,7 +682,7 @@ mod tests {
             tick_interval: StdDuration::from_millis(5),
             ..fast_test_config()
         };
-        let (loop_, handle, _actions_rx, reader) = MeshOsLoop::new(cfg);
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _actions_rx, reader } = MeshOsLoop::new(cfg);
         let task = tokio::spawn(loop_.run());
 
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -710,7 +728,7 @@ mod tests {
             ..fast_test_config()
         };
         let this_node = cfg.this_node;
-        let (loop_, handle, _actions_rx, _reader) = MeshOsLoop::new(cfg);
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _actions_rx, reader: _reader } = MeshOsLoop::new(cfg);
         let counter = loop_.dropped_actions_counter();
         let task = tokio::spawn(loop_.run());
         // Put `this_node` as a holder of five chains.
@@ -752,7 +770,7 @@ mod tests {
             tick_interval: StdDuration::from_millis(20),
             ..fast_test_config()
         };
-        let (loop_, handle, _, _) = MeshOsLoop::new(cfg);
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(cfg);
         let task = tokio::spawn(loop_.run());
         // Let several ticks fire.
         tokio::time::sleep(StdDuration::from_millis(120)).await;
@@ -781,8 +799,7 @@ mod tests {
             (10, std::time::Duration::from_millis(33)),
             (11, std::time::Duration::from_millis(150)),
         ])));
-        let (loop_, handle, _, reader) =
-            MeshOsLoop::new(fast_test_config());
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader } = MeshOsLoop::new(fast_test_config());
         let loop_ = loop_.with_probe_registry(registry);
         let task = tokio::spawn(loop_.run());
 
@@ -811,8 +828,7 @@ mod tests {
         registry.add_health_probe(std::sync::Arc::new(FixedProbe(vec![
             (5, super::super::event::NodeHealth::Unreachable),
         ])));
-        let (loop_, handle, _, reader) =
-            MeshOsLoop::new(fast_test_config());
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader } = MeshOsLoop::new(fast_test_config());
         let loop_ = loop_.with_probe_registry(registry);
         let task = tokio::spawn(loop_.run());
 
@@ -844,8 +860,7 @@ mod tests {
         }
 
         let registry = ProbeRegistry::new();
-        let (loop_, handle, _, reader) =
-            MeshOsLoop::new(fast_test_config());
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader } = MeshOsLoop::new(fast_test_config());
         let loop_ = loop_.with_probe_registry(registry.clone());
         let task = tokio::spawn(loop_.run());
 
@@ -867,7 +882,7 @@ mod tests {
         // The reader should reflect the most recent
         // post-reconcile snapshot. Fire some events that change
         // state, let ticks fire, sample the reader.
-        let (loop_, handle, _, reader) = MeshOsLoop::new(fast_test_config());
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader } = MeshOsLoop::new(fast_test_config());
         let task = tokio::spawn(loop_.run());
 
         // Add a replica observation.
@@ -894,7 +909,8 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_reader_is_cloneable_and_sees_same_state() {
-        let (loop_, handle, _, reader_a) = MeshOsLoop::new(fast_test_config());
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: reader_a } =
+            MeshOsLoop::new(fast_test_config());
         let reader_b = reader_a.clone();
         let task = tokio::spawn(loop_.run());
 
@@ -923,7 +939,7 @@ mod tests {
         // on `MeshOsState::apply` in `state::tests` — that
         // covers the substantive ordering guarantee without
         // having to crack open the consumed-loop's state.
-        let (loop_, handle, _, _) = MeshOsLoop::new(fast_test_config());
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_test_config());
 
         let chain: ChainId = 0xC0FFEE;
         let probe = tokio::spawn(async move {
@@ -964,7 +980,7 @@ mod tests {
         // Compile + type-check: `new` returns the triple, the
         // handle is cloneable, the actions receiver is the
         // documented type.
-        let (_loop_, handle, _actions_rx, _) = MeshOsLoop::new(MeshOsConfig::default());
+        let MeshOsLoopParts { mesh_loop: _loop_, handle, actions_rx: _actions_rx, reader: _ } = MeshOsLoop::new(MeshOsConfig::default());
         let _clone = handle.clone();
     }
 
@@ -976,7 +992,7 @@ mod tests {
             event_queue_capacity: 1,
             ..fast_test_config()
         };
-        let (loop_, handle, _, _) = MeshOsLoop::new(cfg);
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(cfg);
         handle.try_publish(MeshOsEvent::Tick).unwrap();
         match handle.try_publish(MeshOsEvent::Tick) {
             Err(MeshOsHandleError::QueueFull) => {}
@@ -994,7 +1010,7 @@ mod tests {
         // sent are still dequeued by the channel (FIFO) but only
         // up to the Shutdown event; after the loop breaks they
         // remain undelivered.
-        let (loop_, handle, _, _) = MeshOsLoop::new(fast_test_config());
+        let MeshOsLoopParts { mesh_loop: loop_, handle, actions_rx: _, reader: _ } = MeshOsLoop::new(fast_test_config());
         handle.publish(MeshOsEvent::Tick).await.unwrap();
         handle.publish(MeshOsEvent::Shutdown).await.unwrap();
         // A post-Shutdown event: enqueued behind Shutdown.
