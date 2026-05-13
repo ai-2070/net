@@ -105,6 +105,20 @@ pub enum MeshOsEvent {
         leader: Option<NodeId>,
     },
 
+    /// A maintenance-state transition was confirmed on the
+    /// admin chain. Source (Phase E): the action executor's
+    /// `CommitMaintenanceTransition` commit, re-observed via
+    /// the chain. The fold uses this to advance
+    /// `MeshOsState::local_maintenance` (when `node ==
+    /// this_node`) and `MeshOsState::maintenance` (the per-peer
+    /// mirror).
+    MaintenanceTransitionObserved {
+        /// Node whose state advanced.
+        node: NodeId,
+        /// New state.
+        state: super::maintenance::MaintenanceState,
+    },
+
     /// Cooperative loop shutdown. The loop drains pending events
     /// (no more reconcile passes) and exits.
     Shutdown,

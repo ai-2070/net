@@ -42,6 +42,10 @@ pub struct MeshOsConfig {
     /// Phase D — locality tuning (RTT thresholds, avoid-list
     /// TTLs).
     pub locality: LocalityConfig,
+
+    /// Phase E — maintenance state machine tuning (drain
+    /// deadlines, recovery ramp-up window).
+    pub maintenance: MaintenanceConfig,
 }
 
 impl Default for MeshOsConfig {
@@ -53,6 +57,7 @@ impl Default for MeshOsConfig {
             action_queue_capacity: 1024,
             backpressure: BackpressureConfig::default(),
             locality: LocalityConfig::default(),
+            maintenance: MaintenanceConfig::default(),
         }
     }
 }
@@ -120,6 +125,29 @@ impl Default for LocalityConfig {
         Self {
             degraded_rtt_threshold: Duration::from_millis(250),
             avoid_ttl: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+/// Phase E maintenance tunables.
+#[derive(Clone, Debug)]
+pub struct MaintenanceConfig {
+    /// Default drain deadline applied when `AdminEvent::EnterMaintenance`
+    /// arrives without an explicit one. Default 10 min.
+    pub default_drain_deadline: Duration,
+
+    /// Ramp-up window after `ExitingMaintenance → Recovery`.
+    /// During this window the node is on the avoid list for new
+    /// placement; the loop transitions to `Active` once it
+    /// elapses. Default 5 min.
+    pub recovery_ramp_window: Duration,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            default_drain_deadline: Duration::from_secs(10 * 60),
+            recovery_ramp_window: Duration::from_secs(5 * 60),
         }
     }
 }

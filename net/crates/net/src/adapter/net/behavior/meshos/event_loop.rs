@@ -187,7 +187,7 @@ impl MeshOsLoop {
             }
             _ => {}
         }
-        self.actual.apply(event);
+        self.actual.apply(event, self.config.this_node);
     }
 
     async fn run_reconcile(&mut self) {
@@ -196,6 +196,7 @@ impl MeshOsLoop {
             &self.desired,
             self.config.this_node,
             &self.config.locality,
+            &self.config.maintenance,
         );
         self.reconcile_count += 1;
         let now = std::time::Instant::now();
@@ -229,6 +230,7 @@ pub(crate) fn fast_test_config() -> MeshOsConfig {
         action_queue_capacity: 64,
         backpressure: Default::default(),
         locality: Default::default(),
+        maintenance: Default::default(),
     }
 }
 

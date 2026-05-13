@@ -54,12 +54,14 @@ pub mod config;
 pub mod control;
 pub mod event;
 pub mod event_loop;
+pub mod maintenance;
 pub mod reconcile;
 pub mod state;
 pub mod supervision;
 
 pub use action::{ActionId, AllocateActionId, MaintenanceTransition, MeshOsAction, PendingAction};
-pub use config::{BackpressureConfig, LocalityConfig, MeshOsConfig};
+pub use config::{BackpressureConfig, LocalityConfig, MaintenanceConfig, MeshOsConfig};
+pub use maintenance::MaintenanceState;
 pub use control::MeshOsControl;
 pub use event::{
     AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,

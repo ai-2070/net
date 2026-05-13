@@ -18,9 +18,10 @@
 
 use std::time::{Duration, Instant};
 
-use super::action::MeshOsAction;
-use super::config::LocalityConfig;
+use super::action::{MaintenanceTransition, MeshOsAction};
+use super::config::{LocalityConfig, MaintenanceConfig};
 use super::event::{ChainId, DaemonIntent, LocalReplicaIntent, NodeId};
+use super::maintenance::MaintenanceState;
 use super::state::{DaemonLifecycle, DaemonStatus, DesiredState, MeshOsState};
 
 /// Default grace window granted to a `StopDaemon` action. The
@@ -42,6 +43,7 @@ pub fn reconcile(
     desired: &DesiredState,
     this_node: NodeId,
     locality: &LocalityConfig,
+    maintenance: &MaintenanceConfig,
 ) -> Vec<MeshOsAction> {
     let mut actions = Vec::new();
     // The reconcile pass is a sync sample; we use the
@@ -54,6 +56,7 @@ pub fn reconcile(
     diff_daemons(actual, desired, now, &mut actions);
     diff_replicas(actual, desired, this_node, &mut actions);
     diff_locality(actual, now, locality, &mut actions);
+    diff_maintenance(actual, this_node, now, maintenance, &mut actions);
     actions
 }
 
@@ -230,6 +233,85 @@ fn diff_locality(
     }
 }
 
+/// Phase E — maintenance state machine forward transitions.
+/// Each branch is a sync condition check; when the condition
+/// holds, emit a `CommitMaintenanceTransition` whose target is
+/// the next state. The action executor commits to the admin
+/// chain; the chain replay surfaces a
+/// `MaintenanceTransitionObserved` that the fold consumes to
+/// advance `local_maintenance`.
+///
+/// Idempotent: emitting the same transition twice is harmless
+/// (the chain commit is idempotent), and reconcile re-evaluates
+/// the condition each tick so a flapping condition produces one
+/// pending transition, not many.
+fn diff_maintenance(
+    actual: &MeshOsState,
+    this_node: NodeId,
+    now: Instant,
+    config: &MaintenanceConfig,
+    out: &mut Vec<MeshOsAction>,
+) {
+    let target = match &actual.local_maintenance {
+        MaintenanceState::Active => None,
+        MaintenanceState::EnteringMaintenance { deadline, .. } => {
+            if all_replicas_drained_locally(actual, this_node)
+                && all_daemons_stopped(actual)
+            {
+                Some(MaintenanceTransition::Maintenance)
+            } else if deadline.map(|d| now >= d).unwrap_or(false) {
+                Some(MaintenanceTransition::DrainFailed)
+            } else {
+                None
+            }
+        }
+        MaintenanceState::Maintenance { .. } => None,
+        MaintenanceState::ExitingMaintenance { .. } => {
+            if all_daemons_healthy(actual) {
+                Some(MaintenanceTransition::Recovery)
+            } else {
+                None
+            }
+        }
+        MaintenanceState::DrainFailed { .. } => None,
+        MaintenanceState::Recovery { since } => {
+            if now.saturating_duration_since(*since) >= config.recovery_ramp_window {
+                Some(MaintenanceTransition::Active)
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(target) = target {
+        out.push(MeshOsAction::CommitMaintenanceTransition {
+            node: this_node,
+            target,
+        });
+    }
+}
+
+fn all_replicas_drained_locally(actual: &MeshOsState, this_node: NodeId) -> bool {
+    actual
+        .replicas
+        .values()
+        .all(|holders| !holders.contains(&this_node))
+}
+
+fn all_daemons_stopped(actual: &MeshOsState) -> bool {
+    actual
+        .daemons
+        .values()
+        .all(|s| matches!(s.lifecycle, DaemonLifecycle::Stopped))
+}
+
+fn all_daemons_healthy(actual: &MeshOsState) -> bool {
+    use super::event::DaemonHealth;
+    actual.daemons.values().all(|s| {
+        matches!(s.lifecycle, DaemonLifecycle::Running)
+            && matches!(s.health, Some(DaemonHealth::Healthy) | None)
+    })
+}
+
 fn emit_backoff_record_if_needed(
     daemon: &super::event::DaemonRef,
     status: &DaemonStatus,
@@ -280,7 +362,13 @@ mod tests {
     fn reconcile_empty_inputs_returns_no_actions() {
         let actual = MeshOsState::default();
         let desired = DesiredState::default();
-        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        ).is_empty());
     }
 
     #[test]
@@ -289,8 +377,20 @@ mod tests {
         // replay-with-no-side-effect. Pin it explicitly.
         let actual = MeshOsState::default();
         let desired = DesiredState::default();
-        let first = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
-        let second = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let first = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        let second = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         assert_eq!(first, second);
     }
 
@@ -317,7 +417,13 @@ mod tests {
             },
         );
         let desired = DesiredState::default();
-        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        ).is_empty());
     }
 
     #[test]
@@ -328,7 +434,13 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
 
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         assert_eq!(
             actions,
             vec![MeshOsAction::StartDaemon { daemon: d }],
@@ -344,7 +456,13 @@ mod tests {
         let mut desired = DesiredState::default();
         let d = daemon("telemetry", 1);
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         assert_eq!(actions, vec![MeshOsAction::StartDaemon { daemon: d }]);
     }
 
@@ -357,7 +475,13 @@ mod tests {
         actual.daemons.insert(d.clone(), status);
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d, DaemonIntent::Run);
-        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        ).is_empty());
     }
 
     #[test]
@@ -372,7 +496,13 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Stop);
 
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         match actions.as_slice() {
             [MeshOsAction::StopDaemon {
                 daemon: d2,
@@ -393,7 +523,13 @@ mod tests {
         actual.daemons.insert(d.clone(), DaemonStatus::default());
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d, DaemonIntent::Stop);
-        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        ).is_empty());
     }
 
     #[test]
@@ -413,7 +549,13 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
 
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         match actions.as_slice() {
             [MeshOsAction::ApplyBackoff {
                 daemon: d2,
@@ -441,7 +583,13 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
 
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         assert_eq!(actions, vec![MeshOsAction::StartDaemon { daemon: d }]);
     }
 
@@ -460,7 +608,13 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
 
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         match actions.as_slice() {
             [MeshOsAction::ApplyBackoff { daemon: d2, .. }] => assert_eq!(d2, &d),
             other => panic!("expected ApplyBackoff under crash-loop gate, got {other:?}"),
@@ -483,8 +637,20 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d1, DaemonIntent::Run);
         desired.desired_daemons.insert(d2, DaemonIntent::Run);
-        let a = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
-        let b = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let a = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        let b = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         assert_eq!(a, b);
         assert_eq!(a.len(), 2);
     }
@@ -503,7 +669,13 @@ mod tests {
         desired
             .desired_local_replicas
             .insert(CHAIN_A, LocalReplicaIntent::Hold);
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         assert_eq!(
             actions,
             vec![MeshOsAction::PullReplica {
@@ -521,7 +693,13 @@ mod tests {
         desired
             .desired_local_replicas
             .insert(CHAIN_A, LocalReplicaIntent::Hold);
-        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        ).is_empty());
     }
 
     #[test]
@@ -532,7 +710,13 @@ mod tests {
         desired
             .desired_local_replicas
             .insert(CHAIN_A, LocalReplicaIntent::Drop);
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         assert_eq!(actions, vec![MeshOsAction::DropReplica { chain: CHAIN_A }]);
     }
 
@@ -544,7 +728,13 @@ mod tests {
         desired
             .desired_local_replicas
             .insert(CHAIN_A, LocalReplicaIntent::Drop);
-        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        ).is_empty());
     }
 
     #[test]
@@ -558,7 +748,13 @@ mod tests {
         desired
             .desired_local_replicas
             .insert(CHAIN_A, LocalReplicaIntent::Hold);
-        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        ).is_empty());
     }
 
     #[test]
@@ -568,7 +764,13 @@ mod tests {
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 4);
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         assert_eq!(
             actions,
             vec![MeshOsAction::RequestPlacement {
@@ -585,7 +787,13 @@ mod tests {
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 2);
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         // Naive Phase C-1 victim selection: lex-smallest holder.
         assert_eq!(
             actions,
@@ -603,7 +811,13 @@ mod tests {
         actual.replica_leader.insert(CHAIN_A, 999); // someone else is leader
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 4);
-        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        ).is_empty());
     }
 
     #[test]
@@ -615,7 +829,13 @@ mod tests {
         actual.replicas.insert(CHAIN_A, vec![1]);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 3);
-        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        ).is_empty());
     }
 
     #[test]
@@ -625,7 +845,13 @@ mod tests {
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 3);
-        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        ).is_empty());
     }
 
     // ----- Phase D: locality + admin events -----
@@ -637,7 +863,13 @@ mod tests {
         // Default LocalityConfig threshold is 250 ms; 500 ms
         // exceeds → MarkAvoid emitted.
         let desired = DesiredState::default();
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         match actions.as_slice() {
             [MeshOsAction::MarkAvoid { peer, ttl, .. }] => {
                 assert_eq!(*peer, 42);
@@ -652,7 +884,13 @@ mod tests {
         let mut actual = MeshOsState::default();
         actual.rtt.insert(42, Duration::from_millis(100));
         let desired = DesiredState::default();
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         assert!(actions.is_empty());
     }
 
@@ -668,7 +906,13 @@ mod tests {
             },
         );
         let desired = DesiredState::default();
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         assert!(
             actions.is_empty(),
             "MarkAvoid duplicated for already-avoided peer: {actions:?}"
@@ -682,7 +926,13 @@ mod tests {
         actual.rtt.insert(3, Duration::from_millis(500));
         actual.rtt.insert(11, Duration::from_millis(500));
         let desired = DesiredState::default();
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         let peers: Vec<NodeId> = actions
             .iter()
             .map(|a| match a {
@@ -712,7 +962,13 @@ mod tests {
             THIS_NODE,
         );
 
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         // Two DropReplica actions, sorted by chain id.
         assert_eq!(
             actions,
@@ -735,7 +991,13 @@ mod tests {
             },
             THIS_NODE,
         );
-        assert!(reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default()).is_empty());
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        ).is_empty());
     }
 
     #[test]
@@ -748,7 +1010,13 @@ mod tests {
             avoid_ttl: Duration::from_secs(60),
         };
         let desired = DesiredState::default();
-        let actions = reconcile(&actual, &desired, THIS_NODE, &locality);
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &locality,
+            &MaintenanceConfig::default(),
+        );
         match actions.as_slice() {
             [MeshOsAction::MarkAvoid { peer, ttl, .. }] => {
                 assert_eq!(*peer, 42);
@@ -756,6 +1024,258 @@ mod tests {
             }
             other => panic!("expected one MarkAvoid under tightened threshold, got {other:?}"),
         }
+    }
+
+    // ----- Phase E: maintenance state machine -----
+
+    #[test]
+    fn active_state_emits_no_maintenance_transition() {
+        let actual = MeshOsState::default(); // local_maintenance = Active
+        let desired = DesiredState::default();
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn entering_with_drained_replicas_and_stopped_daemons_emits_maintenance_transition() {
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual.local_maintenance = MaintenanceState::EnteringMaintenance {
+            since: base,
+            deadline: None,
+        };
+        // No replicas on this node; no running daemons. Transition admissible.
+        let desired = DesiredState::default();
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        assert_eq!(
+            actions,
+            vec![MeshOsAction::CommitMaintenanceTransition {
+                node: THIS_NODE,
+                target: MaintenanceTransition::Maintenance,
+            }],
+        );
+    }
+
+    #[test]
+    fn entering_with_remaining_replicas_does_not_transition_to_maintenance() {
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual.local_maintenance = MaintenanceState::EnteringMaintenance {
+            since: base,
+            deadline: None,
+        };
+        // This node still holds a replica — block the transition.
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        let desired = DesiredState::default();
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn entering_with_running_daemon_does_not_transition_to_maintenance() {
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual.local_maintenance = MaintenanceState::EnteringMaintenance {
+            since: base,
+            deadline: None,
+        };
+        let mut status = DaemonStatus::default();
+        status.lifecycle = DaemonLifecycle::Running;
+        actual.daemons.insert(daemon("telemetry", 1), status);
+        let desired = DesiredState::default();
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn entering_past_deadline_with_conditions_unmet_transitions_to_drain_failed() {
+        let base = anchor();
+        let deadline = base + Duration::from_secs(60);
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(deadline + Duration::from_secs(1)); // past deadline
+        actual.local_maintenance = MaintenanceState::EnteringMaintenance {
+            since: base,
+            deadline: Some(deadline),
+        };
+        // Still holding a replica → drain unmet.
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        let desired = DesiredState::default();
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        assert_eq!(
+            actions,
+            vec![MeshOsAction::CommitMaintenanceTransition {
+                node: THIS_NODE,
+                target: MaintenanceTransition::DrainFailed,
+            }],
+        );
+    }
+
+    #[test]
+    fn entering_past_deadline_with_conditions_met_prefers_maintenance_over_drain_failed() {
+        // Both conditions met at the boundary instant — the
+        // maintenance transition takes priority (it's the
+        // success path).
+        let base = anchor();
+        let deadline = base + Duration::from_secs(60);
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(deadline + Duration::from_secs(1));
+        actual.local_maintenance = MaintenanceState::EnteringMaintenance {
+            since: base,
+            deadline: Some(deadline),
+        };
+        // No replicas, no daemons → conditions met.
+        let desired = DesiredState::default();
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        assert_eq!(
+            actions,
+            vec![MeshOsAction::CommitMaintenanceTransition {
+                node: THIS_NODE,
+                target: MaintenanceTransition::Maintenance,
+            }],
+        );
+    }
+
+    #[test]
+    fn maintenance_steady_state_emits_no_transition() {
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual.local_maintenance = MaintenanceState::Maintenance { since: base };
+        let desired = DesiredState::default();
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn exiting_with_healthy_daemons_emits_recovery_transition() {
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual.local_maintenance = MaintenanceState::ExitingMaintenance { since: base };
+        let mut status = DaemonStatus::default();
+        status.lifecycle = DaemonLifecycle::Running;
+        actual.daemons.insert(daemon("telemetry", 1), status);
+        let desired = DesiredState::default();
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        assert_eq!(
+            actions,
+            vec![MeshOsAction::CommitMaintenanceTransition {
+                node: THIS_NODE,
+                target: MaintenanceTransition::Recovery,
+            }],
+        );
+    }
+
+    #[test]
+    fn recovery_before_ramp_window_elapses_emits_nothing() {
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base + Duration::from_secs(60)); // 1 min in
+        actual.local_maintenance = MaintenanceState::Recovery { since: base };
+        let desired = DesiredState::default();
+        // Default ramp window is 5 min — we're only 1 min in.
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn recovery_after_ramp_window_elapses_emits_active_transition() {
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base + Duration::from_secs(6 * 60)); // 6 min in
+        actual.local_maintenance = MaintenanceState::Recovery { since: base };
+        let desired = DesiredState::default();
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        assert_eq!(
+            actions,
+            vec![MeshOsAction::CommitMaintenanceTransition {
+                node: THIS_NODE,
+                target: MaintenanceTransition::Active,
+            }],
+        );
+    }
+
+    #[test]
+    fn drain_failed_emits_no_transition_until_operator_intervention() {
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual.local_maintenance = MaintenanceState::DrainFailed {
+            since: base,
+            reason: "deadline elapsed".into(),
+        };
+        let desired = DesiredState::default();
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
+        assert!(actions.is_empty());
     }
 
     #[test]
@@ -771,7 +1291,13 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(CHAIN_A, 3);
         desired.desired_replicas.insert(CHAIN_B, 3);
-        let actions = reconcile(&actual, &desired, THIS_NODE, &LocalityConfig::default());
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+        );
         // Two RequestPlacement, in chain-id order (A < B).
         assert_eq!(actions.len(), 2);
         match (&actions[0], &actions[1]) {

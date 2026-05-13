@@ -18,6 +18,7 @@ use super::event::{
     DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent, LocalReplicaIntentUpdate, MeshOsEvent,
     NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
 };
+use super::maintenance::MaintenanceState;
 use super::supervision::BackoffTracker;
 
 /// Folded view of what's happening on the cluster *right now*,
@@ -42,6 +43,11 @@ pub struct MeshOsState {
     /// transitions; here we only mirror what the admin chain
     /// committed).
     pub maintenance: HashMap<NodeId, MaintenanceMirror>,
+    /// Phase E — this node's own maintenance state machine.
+    /// Driven by admin events (operator commands) and observed
+    /// transition confirmations from the chain. Reconcile reads
+    /// it to decide whether to emit forward-transition actions.
+    pub local_maintenance: MaintenanceState,
     /// Blobs this node knows about, keyed by blob id.
     pub blobs: HashMap<u64, BlobObservation>,
     /// Peers currently on the local avoid list, with their TTL.
@@ -134,7 +140,11 @@ pub struct AvoidEntry {
 impl MeshOsState {
     /// Fold an event into the actual-state view. Called by the
     /// event loop after popping each event off the receiver.
-    pub fn apply(&mut self, event: &MeshOsEvent) {
+    /// `this_node` is the loop's identity — needed by the
+    /// Phase E fold to decide whether an `AdminEvent` /
+    /// `MaintenanceTransitionObserved` mutates this node's own
+    /// `local_maintenance` or just the per-peer mirror.
+    pub fn apply(&mut self, event: &MeshOsEvent, this_node: NodeId) {
         match event {
             MeshOsEvent::Tick => {
                 let now = Instant::now();
@@ -166,7 +176,7 @@ impl MeshOsState {
             MeshOsEvent::NodeHealth { peer, health } => {
                 self.node_health.insert(*peer, *health);
             }
-            MeshOsEvent::AdminEvent(admin) => self.apply_admin(admin),
+            MeshOsEvent::AdminEvent(admin) => self.apply_admin(admin, this_node),
             MeshOsEvent::BlobAnnouncement(blob) => self.apply_blob(blob),
             MeshOsEvent::PlacementIntent(_) => {
                 // Placement intent is desired-state input; the
@@ -175,6 +185,36 @@ impl MeshOsState {
             MeshOsEvent::Shutdown => {
                 // Shutdown is loop-control; no fold side effect.
             }
+            MeshOsEvent::MaintenanceTransitionObserved { node, state } => {
+                self.apply_maintenance_transition(*node, state.clone(), this_node);
+            }
+        }
+    }
+
+    fn apply_maintenance_transition(
+        &mut self,
+        node: NodeId,
+        state: MaintenanceState,
+        this_node: NodeId,
+    ) {
+        // Mirror the transition into the per-peer map (Deck +
+        // reconcile reads). Convert the rich state to the
+        // simple mirror enum.
+        let mirror = match &state {
+            MaintenanceState::Active => MaintenanceMirror::Active,
+            MaintenanceState::EnteringMaintenance { .. } => {
+                MaintenanceMirror::EnteringMaintenance
+            }
+            MaintenanceState::Maintenance { .. } => MaintenanceMirror::Maintenance,
+            MaintenanceState::ExitingMaintenance { .. } => {
+                MaintenanceMirror::ExitingMaintenance
+            }
+            MaintenanceState::DrainFailed { .. } => MaintenanceMirror::DrainFailed,
+            MaintenanceState::Recovery { .. } => MaintenanceMirror::Recovery,
+        };
+        self.maintenance.insert(node, mirror);
+        if node == this_node {
+            self.local_maintenance = state;
         }
     }
 
@@ -221,21 +261,42 @@ impl MeshOsState {
         }
     }
 
-    fn apply_admin(&mut self, admin: &AdminEvent) {
+    fn apply_admin(&mut self, admin: &AdminEvent, this_node: NodeId) {
         // Phase A mirrored the maintenance-state arm; Phase D
         // adds the avoid-list / cordon / drain handlers that
         // don't need to ride DesiredState. The desired-state-
         // side admin consequences (`DropReplicas`,
         // `RestartAllDaemons`) are projected into DesiredState
         // by the loop's `apply` path, not here.
+        //
+        // Phase E: the EnterMaintenance / ExitMaintenance
+        // commands also flip `local_maintenance` when they
+        // target this node — the operator-driven transition
+        // entry points into the state machine.
         match admin {
-            AdminEvent::EnterMaintenance { node, .. } => {
+            AdminEvent::EnterMaintenance { node, deadline } => {
                 self.maintenance
                     .insert(*node, MaintenanceMirror::EnteringMaintenance);
+                if *node == this_node {
+                    self.local_maintenance = MaintenanceState::EnteringMaintenance {
+                        since: Instant::now(),
+                        deadline: *deadline,
+                    };
+                }
             }
             AdminEvent::ExitMaintenance { node } => {
                 self.maintenance
                     .insert(*node, MaintenanceMirror::ExitingMaintenance);
+                if *node == this_node
+                    && matches!(
+                        self.local_maintenance,
+                        MaintenanceState::Maintenance { .. } | MaintenanceState::DrainFailed { .. }
+                    )
+                {
+                    self.local_maintenance = MaintenanceState::ExitingMaintenance {
+                        since: Instant::now(),
+                    };
+                }
             }
             AdminEvent::ClearAvoidList { node: _ } => {
                 // The clear is unconditional on this node's
@@ -355,9 +416,9 @@ mod tests {
         // order.
         let chain: ChainId = 0xC0FFEE;
         let mut state = MeshOsState::default();
-        state.apply(&add(chain, 11));
-        state.apply(&add(chain, 12));
-        state.apply(&rm(chain, 11));
+        state.apply(&add(chain, 11), 0);
+        state.apply(&add(chain, 12), 0);
+        state.apply(&rm(chain, 11), 0);
         assert_eq!(state.replicas.get(&chain), Some(&vec![12]));
     }
 
@@ -365,8 +426,8 @@ mod tests {
     fn replica_fold_is_idempotent_under_duplicate_add() {
         let chain: ChainId = 1;
         let mut state = MeshOsState::default();
-        state.apply(&add(chain, 7));
-        state.apply(&add(chain, 7));
+        state.apply(&add(chain, 7), 0);
+        state.apply(&add(chain, 7), 0);
         assert_eq!(state.replicas.get(&chain), Some(&vec![7]));
     }
 
@@ -387,7 +448,7 @@ mod tests {
                 until: Instant::now() + Duration::from_secs(60),
             },
         );
-        state.apply(&MeshOsEvent::Tick);
+        state.apply(&MeshOsEvent::Tick, 0);
         assert!(state.avoid_list.get(&1).is_none(), "expired entry not gc'd");
         assert!(state.avoid_list.get(&2).is_some(), "fresh entry dropped");
     }
@@ -402,7 +463,7 @@ mod tests {
             chain: 42,
             desired_replicas: 3,
         };
-        actual.apply(&MeshOsEvent::PlacementIntent(intent.clone()));
+        actual.apply(&MeshOsEvent::PlacementIntent(intent.clone()), 0);
         // PlacementIntent has no effect on actual state.
         assert!(actual.replicas.is_empty());
         let mut desired = DesiredState::default();
@@ -427,7 +488,7 @@ mod tests {
                 until: Instant::now() + Duration::from_secs(60),
             },
         );
-        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ClearAvoidList { node: 7 }));
+        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ClearAvoidList { node: 7 }), 0);
         assert!(state.avoid_list.is_empty());
     }
 
@@ -435,18 +496,104 @@ mod tests {
     fn admin_event_enter_then_exit_mirrors_into_maintenance_map() {
         let node: NodeId = 99;
         let mut state = MeshOsState::default();
-        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
-            node,
-            deadline: None,
-        }));
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
+                node,
+                deadline: None,
+            }),
+            0,
+        );
         assert_eq!(
             state.maintenance.get(&node).copied(),
             Some(MaintenanceMirror::EnteringMaintenance),
         );
-        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ExitMaintenance { node }));
+        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ExitMaintenance { node }), 0);
         assert_eq!(
             state.maintenance.get(&node).copied(),
             Some(MaintenanceMirror::ExitingMaintenance),
         );
+    }
+
+    #[test]
+    fn enter_maintenance_targeting_this_node_flips_local_state() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        assert!(matches!(state.local_maintenance, MaintenanceState::Active));
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
+                node: THIS_NODE,
+                deadline: None,
+            }),
+            THIS_NODE,
+        );
+        assert!(matches!(
+            state.local_maintenance,
+            MaintenanceState::EnteringMaintenance { .. }
+        ));
+    }
+
+    #[test]
+    fn enter_maintenance_targeting_other_node_only_updates_mirror() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
+                node: 99,
+                deadline: None,
+            }),
+            THIS_NODE,
+        );
+        assert!(matches!(state.local_maintenance, MaintenanceState::Active));
+        assert_eq!(
+            state.maintenance.get(&99).copied(),
+            Some(MaintenanceMirror::EnteringMaintenance),
+        );
+    }
+
+    #[test]
+    fn maintenance_transition_observed_for_this_node_advances_local_state() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        let base = Instant::now();
+        state.apply(
+            &MeshOsEvent::MaintenanceTransitionObserved {
+                node: THIS_NODE,
+                state: MaintenanceState::Maintenance { since: base },
+            },
+            THIS_NODE,
+        );
+        match state.local_maintenance {
+            MaintenanceState::Maintenance { since } => assert_eq!(since, base),
+            other => panic!("expected Maintenance, got {other:?}"),
+        }
+        // Mirror also updated.
+        assert_eq!(
+            state.maintenance.get(&THIS_NODE).copied(),
+            Some(MaintenanceMirror::Maintenance),
+        );
+    }
+
+    #[test]
+    fn exit_maintenance_only_transitions_from_maintenance_or_drain_failed() {
+        const THIS_NODE: NodeId = 42;
+        // From Active — exit is silent (no-op for local state).
+        let mut state = MeshOsState::default();
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ExitMaintenance { node: THIS_NODE }),
+            THIS_NODE,
+        );
+        assert!(matches!(state.local_maintenance, MaintenanceState::Active));
+        // From Maintenance — flips to ExitingMaintenance.
+        state.local_maintenance = MaintenanceState::Maintenance {
+            since: Instant::now(),
+        };
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ExitMaintenance { node: THIS_NODE }),
+            THIS_NODE,
+        );
+        assert!(matches!(
+            state.local_maintenance,
+            MaintenanceState::ExitingMaintenance { .. }
+        ));
     }
 }
