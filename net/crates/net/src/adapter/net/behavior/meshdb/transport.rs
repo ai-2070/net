@@ -484,7 +484,7 @@ impl Stream for ResponseStreamGuard {
 /// stream of [`MeshDbResponse`]s for every inbound
 /// [`MeshDbRequest::Execute`]. `Resume` and `Cancel` are
 /// supported at the protocol level; `Resume` returns a typed
-/// `MeshError::ExecutorError` until a consumer drives the
+/// `MeshError::PlannerError` until a consumer drives the
 /// continuation surface.
 pub struct MeshDbServer {
     executor: Arc<dyn MeshQueryExecutor>,
@@ -602,9 +602,11 @@ impl MeshDbServer {
             }
             MeshDbRequest::Resume { call_id, .. } => {
                 // Continuation tokens aren't surfaced from the
-                // executor today; respond with a typed error so
-                // the caller observes the missing capability
-                // rather than hanging.
+                // executor today. `PlannerError` is the right
+                // signal — the request was rejected at the
+                // planner/dispatch boundary, not faulted mid-
+                // execution; `ExecutorError{node:0}` would falsely
+                // implicate node 0 on operator dashboards.
                 let sender_clone = sender.clone();
                 tokio::spawn(async move {
                     let _ = sender_clone
@@ -612,10 +614,10 @@ impl MeshDbServer {
                             peer,
                             MeshDbFrame::Response(MeshDbResponse::Error {
                                 call_id,
-                                error: MeshError::ExecutorError {
-                                    node: 0,
-                                    detail: "Resume is not yet supported by the server side"
-                                        .to_string(),
+                                error: MeshError::PlannerError {
+                                    detail:
+                                        "MeshDbRequest::Resume is not yet supported by the server"
+                                            .to_string(),
                                 },
                             }),
                         )
@@ -1050,6 +1052,82 @@ mod tests {
             .try_route(0xB, &frame.encode().unwrap())
             .expect_err("no caller -> error");
         assert!(matches!(err, MeshDbRouteError::UnknownCallId(999)));
+    }
+
+    #[tokio::test]
+    async fn server_rejects_resume_with_planner_error() {
+        // Pin: Resume isn't surfaced from the executor yet. The
+        // server replies with `MeshError::PlannerError` so the
+        // caller observes a typed rejection rather than the
+        // pre-fix `ExecutorError{node:0}` which falsely
+        // implicated node 0 in dashboards.
+        let wire = Arc::new(InMemoryWire::default());
+        let node_a: u64 = 0xA;
+        let node_b: u64 = 0xB;
+
+        let sender_a = Arc::new(SenderTo {
+            wire: wire.clone(),
+            local_node: node_a,
+        });
+        let dispatcher_a = Arc::new(MeshDbWireDispatcher::new(sender_a));
+        wire.register(node_a, dispatcher_a.clone());
+
+        let reader = Arc::new(InMemoryChainReader::default());
+        let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
+        let server = MeshDbServer::new(executor);
+        let sender_b = Arc::new(SenderTo {
+            wire: wire.clone(),
+            local_node: node_b,
+        });
+        let dispatcher_b = Arc::new(MeshDbWireDispatcher::new(sender_b));
+        dispatcher_b.set_server(Some(server));
+        wire.register(node_b, dispatcher_b);
+
+        // Register an inflight entry on A so the server's
+        // outbound Error has somewhere to land.
+        let call_id = 0xBEEFu64;
+        let (tx, mut rx) = mpsc::channel(8);
+        dispatcher_a.inflight.write().insert(
+            call_id,
+            InflightCaller {
+                tx,
+                target_node: node_b,
+            },
+        );
+
+        // Ship Resume A→B.
+        let sender_to_b = SenderTo {
+            wire: wire.clone(),
+            local_node: node_a,
+        };
+        sender_to_b
+            .send_frame(
+                node_b,
+                MeshDbFrame::Request(MeshDbRequest::Resume {
+                    call_id,
+                    token: super::super::protocol::ContinuationToken::new(vec![1, 2, 3]),
+                }),
+            )
+            .await
+            .expect("Resume must route");
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for Resume rejection")
+            .expect("server closed channel");
+        match resp {
+            MeshDbResponse::Error {
+                call_id: got,
+                error: MeshError::PlannerError { detail },
+            } => {
+                assert_eq!(got, call_id);
+                assert!(
+                    detail.contains("Resume"),
+                    "detail should name the unsupported op; got {detail:?}",
+                );
+            }
+            other => panic!("expected PlannerError; got {other:?}"),
+        }
     }
 
     #[tokio::test]
