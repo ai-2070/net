@@ -375,6 +375,35 @@ def test_sort_merge_join_returns_same_pairs_as_hash() -> None:
     assert hash_rows == sm_rows == [2, 5]
 
 
+def test_join_accepts_watermark_secs_kwarg() -> None:
+    # Parity with Node / Go / C: `watermark_secs` keyword on
+    # MeshQuery.join is part of the public surface. Default is
+    # 5.0; non-finite / negative values fall back to 5 s.
+    a, b = 0x111, 0x222
+    reader = _reader_with([(a, 1, b"a"), (b, 1, b"b")])
+    runner = MeshQueryRunner(reader)
+    # Custom watermark accepted.
+    q = MeshQuery.join(
+        MeshQuery.between(a, 1, 10),
+        MeshQuery.between(b, 1, 10),
+        kind="inner",
+        key="seq",
+        watermark_secs=2.5,
+    )
+    rows = runner.execute(q)
+    assert len(rows) == 1
+    # Out-of-range silently clamps to 5 s (mirrors Go FFI / C).
+    q2 = MeshQuery.join(
+        MeshQuery.between(a, 1, 10),
+        MeshQuery.between(b, 1, 10),
+        kind="inner",
+        key="seq",
+        watermark_secs=float("nan"),
+    )
+    rows2 = runner.execute(q2)
+    assert len(rows2) == 1
+
+
 def test_unknown_join_kind_rejected_at_factory() -> None:
     base = MeshQuery.latest(0xAA)
     with pytest.raises(MeshDbError):

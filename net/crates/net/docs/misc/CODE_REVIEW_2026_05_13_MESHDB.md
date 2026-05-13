@@ -183,12 +183,18 @@ ttlSeconds: -1 }` is silently rewritten to 5.0.
 
 **Fix:** validate at the Node factory the same way Python / Go do.
 
-### M7 — Watermark API parity (Python lags Node / Go / C)
+### M7 — Watermark API parity (downgraded: Python already has it)
 
 **Where:** Python `MeshQuery.join(...)` does not surface `watermark_secs`;
 Node / Go / C do.
 
-**Fix:** add `watermark_secs` to the Python join factory.
+**Status:** false alarm. Empirical check:
+`bindings/python/src/meshdb.rs:838` already declares
+`#[pyo3(signature = (left, right, kind, key, strategy=None,
+watermark_secs=5.0))]` — the kwarg is on the public surface and matches
+Node / Go / C semantics (default 5.0, non-finite / negative clamped to
+5 s). No code change needed; pinned with a Python regression test
+covering both the default and the clamp.
 
 ### M8 — BFS in lineage walks uses `Vec::remove(0)` and double-evaluates `children_of`
 
