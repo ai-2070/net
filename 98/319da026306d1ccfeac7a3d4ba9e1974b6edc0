@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/behavior/meshos/runtime.rs
+  s_f68bb950203003::t_7c5d342d39bf86 488-502
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "98319da026306d1ccfeac7a3d4ba9e1974b6edc0",
+  "prompts": {},
+  "sessions": {
+    "s_f68bb950203003": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9226dcd-79b1-4985-9dd9-28aaac11c680",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
