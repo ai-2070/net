@@ -1,0 +1,37 @@
+net/crates/net/docs/plans/MESHOS_PLAN.md
+  s_3bbc444b3ef3e5::t_1b9b06793d4800 27
+  s_3bbc444b3ef3e5::t_3a059639831ba4 31-33
+  s_3bbc444b3ef3e5::t_f20d21af9d35ec 19-23
+net/crates/net/src/adapter/net/behavior/meshos/mod.rs
+  s_3bbc444b3ef3e5::t_10cdcabedc71a2 54
+  s_3bbc444b3ef3e5::t_dbffb63acc901c 71-75
+net/crates/net/src/adapter/net/behavior/meshos/executor.rs
+  s_3bbc444b3ef3e5::t_7c9534fb9c334a 301,304-310,324,329-335,343,348
+  s_3bbc444b3ef3e5::t_fcf7388c5bc896 229,233-239
+  s_3bbc444b3ef3e5::t_3a50732f85d26e 36-39
+  s_3bbc444b3ef3e5::t_1f2db74c34d9a7 206-210
+net/crates/net/src/adapter/net/behavior/meshos/chain.rs
+  s_3bbc444b3ef3e5::t_2949777e56172a 208
+  s_3bbc444b3ef3e5::t_aa03de8a06adf2 1-34,36-207,209-310,312-313,318-469,528-535,537-538,540-542
+  s_3bbc444b3ef3e5::t_d31dfaeef9d413 311
+  s_3bbc444b3ef3e5::t_34e006c7e4e0a0 35
+  s_3bbc444b3ef3e5::t_89c5d46a618e12 536,539
+  s_3bbc444b3ef3e5::t_59b2e24a4d628b 314-317
+  s_3bbc444b3ef3e5::t_8d3124b3ee3fbb 470-527
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "0b9337c7978c9add6d788e204be750e50efcdcf1",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
