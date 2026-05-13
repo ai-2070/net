@@ -99,12 +99,21 @@ pub struct MeshOsLoop {
     dropped_actions: Arc<AtomicU64>,
 }
 
-/// Inner shared cell — `Vec`s of probes behind an
-/// `Arc<RwLock>` so the runtime + loop see the same set.
+/// Inner shared cell — both probe lists behind one
+/// `Arc<RwLock>` so the runtime + loop see the same set AND
+/// [`ProbeRegistry::probe_counts`] is an atomic snapshot. The
+/// install path is rare; the per-tick poll already clones the
+/// lists out under the read lock, so the single-lock pattern
+/// costs nothing on the hot path.
+#[derive(Default)]
+struct ProbeListsInner {
+    locality: Vec<Arc<dyn LocalityProbe>>,
+    health: Vec<Arc<dyn HealthProbe>>,
+}
+
 #[derive(Clone, Default)]
 struct ProbeRegistryInner {
-    locality: Arc<parking_lot::RwLock<Vec<Arc<dyn LocalityProbe>>>>,
-    health: Arc<parking_lot::RwLock<Vec<Arc<dyn HealthProbe>>>>,
+    lists: Arc<parking_lot::RwLock<ProbeListsInner>>,
 }
 
 /// External handle for attaching probes to the loop after
@@ -126,19 +135,22 @@ impl ProbeRegistry {
     /// Install a [`LocalityProbe`]. Probes are polled by the
     /// loop in registration order, once per Tick.
     pub fn add_locality_probe(&self, probe: Arc<dyn LocalityProbe>) {
-        self.inner.locality.write().push(probe);
+        self.inner.lists.write().locality.push(probe);
     }
 
     /// Install a [`HealthProbe`]. Probes are polled by the loop
     /// in registration order, once per Tick.
     pub fn add_health_probe(&self, probe: Arc<dyn HealthProbe>) {
-        self.inner.health.write().push(probe);
+        self.inner.lists.write().health.push(probe);
     }
 
-    /// Count of installed probes. Diagnostic; useful for the
-    /// runtime's startup-readiness check.
+    /// Atomic snapshot of installed probe counts —
+    /// `(locality, health)`. One read lock covers both lists,
+    /// so the pair is consistent even if a concurrent
+    /// installer fires between them.
     pub fn probe_counts(&self) -> (usize, usize) {
-        (self.inner.locality.read().len(), self.inner.health.read().len())
+        let guard = self.inner.lists.read();
+        (guard.locality.len(), guard.health.len())
     }
 }
 
@@ -404,7 +416,13 @@ impl MeshOsLoop {
     /// out the `ProbeRegistry`), so trust-but-isolate is the
     /// right posture.
     fn poll_probes(&mut self) {
-        let locality = self.probes.locality.read().clone();
+        // Clone both lists out under a single read lock so a
+        // concurrent install between the locality and health
+        // passes doesn't see one half of an inconsistent pair.
+        let (locality, health) = {
+            let guard = self.probes.lists.read();
+            (guard.locality.clone(), guard.health.clone())
+        };
         for probe in &locality {
             let probe = Arc::clone(probe);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -424,7 +442,6 @@ impl MeshOsLoop {
                 }
             }
         }
-        let health = self.probes.health.read().clone();
         for probe in &health {
             let probe = Arc::clone(probe);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
