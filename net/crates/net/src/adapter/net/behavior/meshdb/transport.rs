@@ -589,8 +589,12 @@ async fn run_server_call(
     }
 
     // Flush any residual rows then emit the terminal End.
-    if !batch.is_empty() {
-        if sender
+    // The `last` flag on the batch is enough — no need for a
+    // separate End. Stay strict and emit End anyway for
+    // wire-uniformity; the caller-side stream guard treats
+    // either as terminal.
+    if !batch.is_empty()
+        && sender
             .send_frame(
                 peer,
                 MeshDbFrame::Response(MeshDbResponse::Batch {
@@ -600,13 +604,8 @@ async fn run_server_call(
             )
             .await
             .is_err()
-        {
-            return;
-        }
-        // The `last` flag on the batch is enough — no need for a
-        // separate End. Stay strict and emit End anyway for
-        // wire-uniformity; the caller-side stream guard treats
-        // either as terminal.
+    {
+        return;
     }
     let _ = sender
         .send_frame(peer, MeshDbFrame::Response(MeshDbResponse::End { call_id }))
