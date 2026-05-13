@@ -629,11 +629,7 @@ mod tests {
         // is internally-tagged (see `complex_query_postcardable`
         // doc-comment); JSON exercises the full surface
         // separately.
-        for q in [
-            small_query(),
-            between_query(),
-            complex_query_postcardable(),
-        ] {
+        for q in [small_query(), between_query(), complex_query_postcardable()] {
             let bytes = postcard::to_allocvec(&q).expect("encode");
             let decoded: MeshQuery = postcard::from_bytes(&bytes).expect("decode");
             assert_eq!(decoded, q);

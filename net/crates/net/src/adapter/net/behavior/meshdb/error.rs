@@ -27,9 +27,7 @@ pub enum MeshError {
     /// No node holds the requested seq range. The `available`
     /// list carries the per-replica seq-range hints so
     /// callers can negotiate a different window.
-    #[error(
-        "no holder for chain {origin:#x} seq range {requested:?} (available: {available:?})"
-    )]
+    #[error("no holder for chain {origin:#x} seq range {requested:?} (available: {available:?})")]
     HistoricalRangeUnavailable {
         /// Chain whose range is missing (substrate `u64`
         /// origin hash).

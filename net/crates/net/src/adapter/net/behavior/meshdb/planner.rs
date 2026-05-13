@@ -40,9 +40,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::error::MeshError;
-use super::query::{
-    AggregateFn, ChainRef, Expr, JoinKey, JoinKind, MeshQuery, QueryV1, SeqNum,
-};
+use super::query::{AggregateFn, ChainRef, Expr, JoinKey, JoinKind, MeshQuery, QueryV1, SeqNum};
 use crate::adapter::net::behavior::capability::CapabilityIndex;
 use crate::adapter::net::behavior::predicate::PredicateWire;
 use crate::adapter::net::behavior::query::CapabilityQuery;
@@ -1016,11 +1014,12 @@ where
         match origin {
             ChainRef::OriginHash(h) => Ok(*h),
             ChainRef::Discovered(wire) => {
-                let predicate = wire.clone().into_predicate().map_err(|e| {
-                    MeshError::PlannerError {
-                        detail: format!("Discovered predicate rebuild failed: {e:?}"),
-                    }
-                })?;
+                let predicate =
+                    wire.clone()
+                        .into_predicate()
+                        .map_err(|e| MeshError::PlannerError {
+                            detail: format!("Discovered predicate rebuild failed: {e:?}"),
+                        })?;
                 let candidates = self.capability_index.filter(&predicate);
                 // Walk every matched node's caps + extract
                 // origins from `causal:<hex>*` tags. Dedupe +
@@ -1203,7 +1202,9 @@ fn sum_cost(node: &OperatorNode) -> CostEstimate {
                 .bandwidth_bytes
                 .saturating_add(l.bandwidth_bytes)
                 .saturating_add(r.bandwidth_bytes);
-            acc.latency_ms = acc.latency_ms.saturating_add(l.latency_ms.max(r.latency_ms));
+            acc.latency_ms = acc
+                .latency_ms
+                .saturating_add(l.latency_ms.max(r.latency_ms));
         }
         OperatorPlan::AggregateCount { input, .. } => {
             let inner = sum_cost(input);
@@ -1223,8 +1224,7 @@ fn sum_cost(node: &OperatorNode) -> CostEstimate {
             acc.latency_ms = acc.latency_ms.saturating_add(inner.latency_ms);
         }
         OperatorPlan::NotYetImplemented {
-            input: Some(input),
-            ..
+            input: Some(input), ..
         } => {
             let inner = sum_cost(input);
             acc.bandwidth_bytes = acc.bandwidth_bytes.saturating_add(inner.bandwidth_bytes);
@@ -1287,9 +1287,7 @@ impl CausalClaim {
     fn advertised(&self) -> Option<std::ops::Range<SeqNum>> {
         match self {
             Self::Presence => None,
-            Self::Tip { tip_seq } => {
-                Some(SeqNum(0)..SeqNum(tip_seq.0.saturating_add(1)))
-            }
+            Self::Tip { tip_seq } => Some(SeqNum(0)..SeqNum(tip_seq.0.saturating_add(1))),
             Self::Range { start, end } => Some(*start..*end),
         }
     }
@@ -1425,10 +1423,7 @@ fn parse_causal_origin(tag: &Tag) -> Option<u64> {
 /// `:<tip>` or `[start..end]` suffix before validating the
 /// 16-hex-char stem.
 fn parse_causal_body(body: &str) -> Option<u64> {
-    let stem = body
-        .split_once([':', '['])
-        .map(|(s, _)| s)
-        .unwrap_or(body);
+    let stem = body.split_once([':', '[']).map(|(s, _)| s).unwrap_or(body);
     if stem.len() != 16 {
         return None;
     }
@@ -1456,7 +1451,10 @@ fn parse_fork_body(body: &str) -> Option<u64> {
 /// `JoinKeyMode::Field(path)` (Phase D-2 row-schema decoding).
 fn key_mode_for_join(on: &JoinKey) -> Result<JoinKeyMode, MeshError> {
     let left = field_name(&on.left_field).ok_or_else(|| MeshError::PlannerError {
-        detail: format!("join left key must be a field reference, got {:?}", on.left_field),
+        detail: format!(
+            "join left key must be a field reference, got {:?}",
+            on.left_field
+        ),
     })?;
     let right = field_name(&on.right_field).ok_or_else(|| MeshError::PlannerError {
         detail: format!(
@@ -1532,7 +1530,10 @@ fn group_by_mode(group_by: &[Expr]) -> Result<Option<JoinKeyMode>, MeshError> {
     if group_by.len() == 2 {
         let l = field_name(&group_by[0]);
         let r = field_name(&group_by[1]);
-        if matches!((l, r), (Some("origin"), Some("seq")) | (Some("seq"), Some("origin"))) {
+        if matches!(
+            (l, r),
+            (Some("origin"), Some("seq")) | (Some("seq"), Some("origin"))
+        ) {
             return Ok(Some(JoinKeyMode::OriginSeq));
         }
     }
@@ -1586,11 +1587,8 @@ mod tests {
     /// `causal:<hex>:<tip>` tip-form tag for `origin_hash`.
     fn caps_with_causal_tip(origin_hash: u64, tip: u64) -> CapabilitySet {
         let mut caps = CapabilitySet::new();
-        caps.tags.insert(causal_tag(format!(
-            "{}:{}",
-            chain_hex(origin_hash),
-            tip
-        )));
+        caps.tags
+            .insert(causal_tag(format!("{}:{}", chain_hex(origin_hash), tip)));
         caps
     }
 
@@ -1649,7 +1647,12 @@ mod tests {
         let origin = 0x1234_5678_9ABC_DEF0_u64;
         let hex = chain_hex(origin);
         let claim = parse_causal_claim(&causal_tag(format!("{hex}:1000")), &hex);
-        assert_eq!(claim, Some(CausalClaim::Tip { tip_seq: SeqNum(1000) }));
+        assert_eq!(
+            claim,
+            Some(CausalClaim::Tip {
+                tip_seq: SeqNum(1000)
+            })
+        );
     }
 
     #[test]
@@ -1696,7 +1699,9 @@ mod tests {
         assert!(CausalClaim::Presence.covers_seq(SeqNum(0)));
         assert!(CausalClaim::Presence.covers_seq(SeqNum(u64::MAX)));
 
-        let tip = CausalClaim::Tip { tip_seq: SeqNum(100) };
+        let tip = CausalClaim::Tip {
+            tip_seq: SeqNum(100),
+        };
         assert!(tip.covers_seq(SeqNum(0)));
         assert!(tip.covers_seq(SeqNum(100)));
         assert!(!tip.covers_seq(SeqNum(101)));
@@ -1715,7 +1720,9 @@ mod tests {
     fn causal_claim_covers_range_semantics() {
         assert!(CausalClaim::Presence.covers_range(SeqNum(0), SeqNum(1_000)));
 
-        let tip = CausalClaim::Tip { tip_seq: SeqNum(100) };
+        let tip = CausalClaim::Tip {
+            tip_seq: SeqNum(100),
+        };
         // Tip covers [0, 101); requested end must be <= 101.
         assert!(tip.covers_range(SeqNum(0), SeqNum(101)));
         assert!(tip.covers_range(SeqNum(50), SeqNum(101)));
@@ -1735,7 +1742,10 @@ mod tests {
     fn causal_claim_advertised_renders_half_open_range() {
         assert_eq!(CausalClaim::Presence.advertised(), None);
         assert_eq!(
-            (CausalClaim::Tip { tip_seq: SeqNum(99) }).advertised(),
+            (CausalClaim::Tip {
+                tip_seq: SeqNum(99)
+            })
+            .advertised(),
             Some(SeqNum(0)..SeqNum(100))
         );
         assert_eq!(
@@ -1752,7 +1762,10 @@ mod tests {
     fn causal_claim_latest_tip_ordering() {
         assert_eq!(CausalClaim::Presence.latest_tip(), None);
         assert_eq!(
-            (CausalClaim::Tip { tip_seq: SeqNum(42) }).latest_tip(),
+            (CausalClaim::Tip {
+                tip_seq: SeqNum(42)
+            })
+            .latest_tip(),
             Some(SeqNum(42))
         );
         // Range advertises `[start, end)` — latest is end-1.
@@ -1792,10 +1805,7 @@ mod tests {
             None
         );
         // wrong-length stem
-        assert_eq!(
-            parse_causal_origin(&causal_tag("abc".to_string())),
-            None
-        );
+        assert_eq!(parse_causal_origin(&causal_tag("abc".to_string())), None);
     }
 
     // ========================================================================
@@ -1905,11 +1915,7 @@ mod tests {
         // order; planner sort restores lex.
         let origin = 0xEEEE_EEEE_EEEE_EEEE_u64;
         let caps = caps_with_causal_presence(origin);
-        let index = index_with(vec![
-            (200, caps.clone()),
-            (50, caps.clone()),
-            (100, caps),
-        ]);
+        let index = index_with(vec![(200, caps.clone()), (50, caps.clone()), (100, caps)]);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
@@ -2078,11 +2084,7 @@ mod tests {
         // proximity puts them in [50, 200, 100] order.
         let origin = 0x3030_3030_3030_3030_u64;
         let caps = caps_with_causal_presence(origin);
-        let index = index_with(vec![
-            (100, caps.clone()),
-            (50, caps.clone()),
-            (200, caps),
-        ]);
+        let index = index_with(vec![(100, caps.clone()), (50, caps.clone()), (200, caps)]);
         let rtt = |nid: u64| {
             Some(match nid {
                 50 => Duration::from_millis(10),
@@ -2345,11 +2347,8 @@ mod tests {
     /// propagation through lineage entries.
     fn caps_chain_tip_forked_from(chain: u64, tip: u64, parent: u64) -> CapabilitySet {
         let mut caps = CapabilitySet::new();
-        caps.tags.insert(causal_tag(format!(
-            "{}:{}",
-            chain_hex(chain),
-            tip
-        )));
+        caps.tags
+            .insert(causal_tag(format!("{}:{}", chain_hex(chain), tip)));
         caps.tags.insert(fork_tag(parent));
         caps
     }
@@ -2662,7 +2661,12 @@ mod tests {
     // Phase D — hash-join planning
     // ========================================================================
 
-    fn join_query(left_field: &str, right_field: &str, left_chain: u64, right_chain: u64) -> MeshQuery {
+    fn join_query(
+        left_field: &str,
+        right_field: &str,
+        left_chain: u64,
+        right_chain: u64,
+    ) -> MeshQuery {
         MeshQuery::V1(QueryV1::Join {
             left: Box::new(MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(left_chain),
@@ -2735,7 +2739,9 @@ mod tests {
             (2, caps_with_causal_presence(r)),
         ]);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
-        let err = planner.plan(&join_query("origin", "seq", l, r)).unwrap_err();
+        let err = planner
+            .plan(&join_query("origin", "seq", l, r))
+            .unwrap_err();
         match err {
             MeshError::PlannerError { detail } => {
                 assert!(detail.contains("same field name"), "got: {detail}");
@@ -2756,7 +2762,12 @@ mod tests {
         ]);
         let planner = MeshQueryPlanner::new(&index, rtt_none);
         let plan = planner
-            .plan(&join_query("payload.request_id", "payload.request_id", l, r))
+            .plan(&join_query(
+                "payload.request_id",
+                "payload.request_id",
+                l,
+                r,
+            ))
             .unwrap();
         match plan.root.operator {
             OperatorPlan::HashJoin { key_mode, .. } => {

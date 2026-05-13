@@ -377,14 +377,13 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
 
         let mut out: Vec<Result<ResultRow, MeshError>> = Vec::new();
         for (l, r) in pairs {
-            let payload = postcard::to_allocvec(&JoinedRowPayload {
-                left: l,
-                right: r,
-            })
-            .map_err(|e| MeshError::ExecutorError {
-                node: 0,
-                detail: format!("encode JoinedRowPayload: {e}"),
-            })?;
+            let payload =
+                postcard::to_allocvec(&JoinedRowPayload { left: l, right: r }).map_err(|e| {
+                    MeshError::ExecutorError {
+                        node: 0,
+                        detail: format!("encode JoinedRowPayload: {e}"),
+                    }
+                })?;
             out.push(Ok(ResultRow {
                 origin: 0,
                 seq: SeqNum(0),
@@ -472,8 +471,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
         let output_rows = execute_window(rows, &spec)?;
 
         let handle = QueryHandle::new(self.allocate_id());
-        let stream: ResultStream =
-            Box::pin(futures::stream::iter(output_rows.into_iter().map(Ok)));
+        let stream: ResultStream = Box::pin(futures::stream::iter(output_rows.into_iter().map(Ok)));
         Ok(RunningQuery {
             handle,
             rows: stream,
@@ -523,8 +521,7 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
         };
 
         let handle = QueryHandle::new(self.allocate_id());
-        let stream: ResultStream =
-            Box::pin(futures::stream::iter(output_rows.into_iter().map(Ok)));
+        let stream: ResultStream = Box::pin(futures::stream::iter(output_rows.into_iter().map(Ok)));
         Ok(RunningQuery {
             handle,
             rows: stream,
@@ -668,15 +665,14 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
         let mut out: Vec<Result<ResultRow, MeshError>> = Vec::new();
         match group_by {
             None => {
-                let payload =
-                    postcard::to_allocvec(&AggregateRowPayload {
-                        group: None,
-                        value: AggregateValue::Count(rows.len() as u64),
-                    })
-                    .map_err(|e| MeshError::ExecutorError {
-                        node: 0,
-                        detail: format!("encode AggregateRowPayload: {e}"),
-                    })?;
+                let payload = postcard::to_allocvec(&AggregateRowPayload {
+                    group: None,
+                    value: AggregateValue::Count(rows.len() as u64),
+                })
+                .map_err(|e| MeshError::ExecutorError {
+                    node: 0,
+                    detail: format!("encode AggregateRowPayload: {e}"),
+                })?;
                 out.push(Ok(ResultRow {
                     origin: 0,
                     seq: SeqNum(0),
@@ -992,9 +988,7 @@ fn translate_responses(mut response_stream: ResponseStream, handle: QueryHandle)
 /// - Node marked offline via [`Self::set_offline`] →
 ///   [`TransportError::NoRoute`] (exercises failover).
 pub struct LoopbackTransport {
-    nodes: parking_lot::RwLock<
-        std::collections::HashMap<u64, LoopbackNode>,
-    >,
+    nodes: parking_lot::RwLock<std::collections::HashMap<u64, LoopbackNode>>,
 }
 
 struct LoopbackNode {
@@ -1058,9 +1052,10 @@ impl MeshDbTransport for LoopbackTransport {
 
         match request {
             MeshDbRequest::Execute { call_id, plan } => {
-                let running = exec.execute(plan).await.map_err(|e| {
-                    TransportError::Other(format!("remote execute failed: {e}"))
-                })?;
+                let running = exec
+                    .execute(plan)
+                    .await
+                    .map_err(|e| TransportError::Other(format!("remote execute failed: {e}")))?;
                 let stream = row_stream_to_responses(running.rows, call_id);
                 Ok(stream)
             }
@@ -1100,9 +1095,7 @@ fn row_stream_to_responses(mut rows: ResultStream, call_id: u64) -> ResponseStre
                     }
                 }
                 Err(error) => {
-                    let _ = tx
-                        .send(MeshDbResponse::Error { call_id, error })
-                        .await;
+                    let _ = tx.send(MeshDbResponse::Error { call_id, error }).await;
                     return;
                 }
             }
@@ -1147,12 +1140,7 @@ mod tests {
             self.chains.lock().unwrap().get(&origin)?.get(&seq).cloned()
         }
 
-        fn read_range(
-            &self,
-            origin: u64,
-            start: SeqNum,
-            end: SeqNum,
-        ) -> Vec<(SeqNum, Vec<u8>)> {
+        fn read_range(&self, origin: u64, start: SeqNum, end: SeqNum) -> Vec<(SeqNum, Vec<u8>)> {
             self.chains
                 .lock()
                 .unwrap()
@@ -1177,7 +1165,9 @@ mod tests {
         }
     }
 
-    fn local_executor_with(rows: &[(u64, u64, &[u8])]) -> Arc<LocalMeshQueryExecutor<InMemoryChainReader>> {
+    fn local_executor_with(
+        rows: &[(u64, u64, &[u8])],
+    ) -> Arc<LocalMeshQueryExecutor<InMemoryChainReader>> {
         let reader = Arc::new(InMemoryChainReader::default());
         for (origin, seq, payload) in rows {
             reader.append(*origin, SeqNum(*seq), payload.to_vec());
@@ -1196,12 +1186,7 @@ mod tests {
         }
     }
 
-    fn plan_between(
-        origin: u64,
-        start: u64,
-        end: u64,
-        target_nodes: Vec<u64>,
-    ) -> ExecutionPlan {
+    fn plan_between(origin: u64, start: u64, end: u64, target_nodes: Vec<u64>) -> ExecutionPlan {
         ExecutionPlan {
             root: OperatorNode {
                 operator: OperatorPlan::BetweenRead {
@@ -1226,11 +1211,8 @@ mod tests {
         // the plan to the first target; rows arrive over the
         // loopback transport.
         let chain = 0xCAFE_BABE_DEAD_BEEF;
-        let node_a = local_executor_with(&[
-            (chain, 1, b"a-1"),
-            (chain, 2, b"a-2"),
-            (chain, 3, b"a-3"),
-        ]);
+        let node_a =
+            local_executor_with(&[(chain, 1, b"a-1"), (chain, 2, b"a-2"), (chain, 3, b"a-3")]);
         let node_b = local_executor_with(&[]);
         let node_c = local_executor_with(&[]);
 
@@ -1388,11 +1370,8 @@ mod tests {
     #[tokio::test]
     async fn cancel_before_first_response_short_circuits_stream() {
         let chain = 0xFEED;
-        let node = local_executor_with(&[
-            (chain, 1, b"p-1"),
-            (chain, 2, b"p-2"),
-            (chain, 3, b"p-3"),
-        ]);
+        let node =
+            local_executor_with(&[(chain, 1, b"p-1"), (chain, 2, b"p-2"), (chain, 3, b"p-3")]);
         let transport = Arc::new(LoopbackTransport::new());
         transport.register(0xA, node);
 
@@ -1469,16 +1448,8 @@ mod tests {
         // then hash-joins the results locally.
         let a = 0x111;
         let b = 0x222;
-        let node_a = local_executor_with(&[
-            (a, 1, b"a-1"),
-            (a, 2, b"a-2"),
-            (a, 5, b"a-5"),
-        ]);
-        let node_b = local_executor_with(&[
-            (b, 2, b"b-2"),
-            (b, 3, b"b-3"),
-            (b, 5, b"b-5"),
-        ]);
+        let node_a = local_executor_with(&[(a, 1, b"a-1"), (a, 2, b"a-2"), (a, 5, b"a-5")]);
+        let node_b = local_executor_with(&[(b, 2, b"b-2"), (b, 3, b"b-3"), (b, 5, b"b-5")]);
 
         let transport = Arc::new(LoopbackTransport::new());
         transport.register(0xA, node_a);
@@ -1668,21 +1639,29 @@ mod tests {
 
         let fed = FederatedMeshQueryExecutor::new(transport);
 
-        let rows_x: Vec<_> =
-            collect_rows(fed.execute(plan_latest(chain_x, vec![0xA])).await.unwrap().rows)
+        let rows_x: Vec<_> = collect_rows(
+            fed.execute(plan_latest(chain_x, vec![0xA]))
                 .await
-                .into_iter()
-                .map(|r| r.unwrap())
-                .collect();
+                .unwrap()
+                .rows,
+        )
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
         assert_eq!(rows_x.len(), 1);
         assert_eq!(rows_x[0].payload, b"x-1");
 
-        let rows_y: Vec<_> =
-            collect_rows(fed.execute(plan_latest(chain_y, vec![0xB])).await.unwrap().rows)
+        let rows_y: Vec<_> = collect_rows(
+            fed.execute(plan_latest(chain_y, vec![0xB]))
                 .await
-                .into_iter()
-                .map(|r| r.unwrap())
-                .collect();
+                .unwrap()
+                .rows,
+        )
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
         assert_eq!(rows_y.len(), 1);
         assert_eq!(rows_y[0].payload, b"y-1");
     }

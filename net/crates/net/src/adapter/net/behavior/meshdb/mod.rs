@@ -88,8 +88,7 @@ pub use executor::{
     RunningQuery,
 };
 pub use federated::{
-    FederatedMeshQueryExecutor, LoopbackTransport, MeshDbTransport, ResponseStream,
-    TransportError,
+    FederatedMeshQueryExecutor, LoopbackTransport, MeshDbTransport, ResponseStream, TransportError,
 };
 pub use planner::{
     ExecutionPlan, JoinKeyMode, JoinStrategy, LineageDirection, LineageEntry, MeshQueryPlanner,

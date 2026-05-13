@@ -68,7 +68,12 @@ pub fn synthetic_row_view(row: &ResultRow) -> (Vec<Tag>, BTreeMap<String, String
 
 /// Push a single (key, value) pair as both a synthetic tag
 /// (`dataforts.<key>=<value>`) and a metadata entry.
-fn push_field(tags: &mut Vec<Tag>, metadata: &mut BTreeMap<String, String>, key: &str, value: &str) {
+fn push_field(
+    tags: &mut Vec<Tag>,
+    metadata: &mut BTreeMap<String, String>,
+    key: &str,
+    value: &str,
+) {
     tags.push(Tag::AxisValue {
         axis: TaxonomyAxis::Dataforts,
         key: key.to_string(),
@@ -198,8 +203,8 @@ fn extract_string_from_payload(payload: &[u8], path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::query::SeqNum;
+    use super::*;
 
     fn row_with_payload(origin: u64, seq: u64, payload: &str) -> ResultRow {
         ResultRow {
@@ -225,9 +230,15 @@ mod tests {
     fn origin_and_seq_are_always_synthesized() {
         let row = row_with_payload(0xABCD_EF01_2345_6789, 42, "");
         let (tags, metadata) = synthetic_row_view(&row);
-        assert_eq!(tag_value(&tags, "origin"), Some("abcdef0123456789".to_string()));
+        assert_eq!(
+            tag_value(&tags, "origin"),
+            Some("abcdef0123456789".to_string())
+        );
         assert_eq!(tag_value(&tags, "seq"), Some("42".to_string()));
-        assert_eq!(metadata.get("origin"), Some(&"abcdef0123456789".to_string()));
+        assert_eq!(
+            metadata.get("origin"),
+            Some(&"abcdef0123456789".to_string())
+        );
         assert_eq!(metadata.get("seq"), Some(&"42".to_string()));
     }
 
@@ -259,11 +270,7 @@ mod tests {
 
     #[test]
     fn nested_json_flattens_with_dotted_paths() {
-        let row = row_with_payload(
-            0x1,
-            0,
-            r#"{"a":{"b":{"c":"deep"}},"flat":1}"#,
-        );
+        let row = row_with_payload(0x1, 0, r#"{"a":{"b":{"c":"deep"}},"flat":1}"#);
         let (tags, _) = synthetic_row_view(&row);
         assert_eq!(tag_value(&tags, "a.b.c"), Some("deep".to_string()));
         assert_eq!(tag_value(&tags, "flat"), Some("1".to_string()));
@@ -271,15 +278,13 @@ mod tests {
 
     #[test]
     fn arrays_are_skipped_in_phase_e2() {
-        let row = row_with_payload(
-            0x1,
-            0,
-            r#"{"items":["x","y","z"],"name":"keep"}"#,
-        );
+        let row = row_with_payload(0x1, 0, r#"{"items":["x","y","z"],"name":"keep"}"#);
         let (tags, _) = synthetic_row_view(&row);
         // Array body absent; sibling scalar present.
         assert_eq!(tag_value(&tags, "name"), Some("keep".to_string()));
-        assert!(tags.iter().all(|t| !matches!(t, Tag::AxisValue { key, .. } if key.starts_with("items"))));
+        assert!(tags
+            .iter()
+            .all(|t| !matches!(t, Tag::AxisValue { key, .. } if key.starts_with("items"))));
     }
 
     #[test]

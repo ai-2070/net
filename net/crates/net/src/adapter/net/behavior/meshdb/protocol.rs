@@ -378,8 +378,7 @@ mod tests {
                 error: err,
             };
             let bytes = postcard::to_allocvec(&resp).expect("encode");
-            let decoded: MeshDbResponse =
-                postcard::from_bytes(&bytes).expect("decode");
+            let decoded: MeshDbResponse = postcard::from_bytes(&bytes).expect("decode");
             // Can't assert equality on Range<SeqNum> via
             // PartialEq derive? It does derive PartialEq on
             // MeshError. Smoke-test via Debug equality.
@@ -390,12 +389,10 @@ mod tests {
     #[test]
     fn full_session_round_trips_through_postcard() {
         // A realistic session: Execute, two Batches, an End.
-        let session = vec![
-            MeshDbRequest::Execute {
-                call_id: 1,
-                plan: sample_plan(),
-            },
-        ];
+        let session = vec![MeshDbRequest::Execute {
+            call_id: 1,
+            plan: sample_plan(),
+        }];
         let responses = vec![
             MeshDbResponse::Batch {
                 call_id: 1,

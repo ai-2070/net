@@ -762,7 +762,10 @@ pub(super) fn execute_aggregate_reduction(
                 (bytes, Some(group_key_for(row, mode)))
             }
         };
-        acc.entry(key_bytes).or_insert((group, Vec::new())).1.push(value);
+        acc.entry(key_bytes)
+            .or_insert((group, Vec::new()))
+            .1
+            .push(value);
     }
 
     let reduce = |values: &mut [f64]| -> Option<f64> {
@@ -770,12 +773,8 @@ pub(super) fn execute_aggregate_reduction(
             return None;
         }
         match kind {
-            NumericReductionKind::Min => {
-                values.iter().copied().reduce(f64::min)
-            }
-            NumericReductionKind::Max => {
-                values.iter().copied().reduce(f64::max)
-            }
+            NumericReductionKind::Min => values.iter().copied().reduce(f64::min),
+            NumericReductionKind::Max => values.iter().copied().reduce(f64::max),
             NumericReductionKind::Percentile { p } => {
                 values.sort_by(|a, b| a.total_cmp(b));
                 let idx = ((p.clamp(0.0, 1.0)) * (values.len() as f64 - 1.0)).floor() as usize;
@@ -838,7 +837,10 @@ pub(super) fn execute_aggregate_distinct(
                 (bytes, Some(group_key_for(row, mode)))
             }
         };
-        acc.entry(key_bytes).or_insert((group, BTreeSet::new())).1.insert(value);
+        acc.entry(key_bytes)
+            .or_insert((group, BTreeSet::new()))
+            .1
+            .insert(value);
     }
 
     if group_by.is_none() {
@@ -855,7 +857,8 @@ pub(super) fn execute_aggregate_distinct(
     }
     let mut out = Vec::with_capacity(acc.len());
     for (_, (group, set)) in acc {
-        let payload = encode_aggregate_payload(group, AggregateValue::DistinctCount(set.len() as u64))?;
+        let payload =
+            encode_aggregate_payload(group, AggregateValue::DistinctCount(set.len() as u64))?;
         out.push(ResultRow {
             origin: 0,
             seq: SeqNum(0),
@@ -1206,11 +1209,8 @@ mod tests {
         let v = version.clone();
         let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> =
             Arc::new(move || v.load(AOrdering::Acquire));
-        let executor = LocalMeshQueryExecutor::with_cache(
-            reader.clone(),
-            cache.clone(),
-            version_fn,
-        );
+        let executor =
+            LocalMeshQueryExecutor::with_cache(reader.clone(), cache.clone(), version_fn);
 
         let plan = atomic_plan(OperatorPlan::AtRead {
             origin: 0xAA,
@@ -1225,7 +1225,10 @@ mod tests {
         // Second execute, same plan + version: hit. No new reads.
         let _ = collect_rows(executor.execute(plan).await.unwrap().rows).await;
         let second_reads = reader.reads.load(AOrdering::Relaxed);
-        assert_eq!(second_reads, first_reads, "cache hit should not call reader");
+        assert_eq!(
+            second_reads, first_reads,
+            "cache hit should not call reader"
+        );
     }
 
     #[tokio::test]
@@ -1240,11 +1243,8 @@ mod tests {
         let v = version.clone();
         let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> =
             Arc::new(move || v.load(AOrdering::Acquire));
-        let executor = LocalMeshQueryExecutor::with_cache(
-            reader.clone(),
-            cache.clone(),
-            version_fn,
-        );
+        let executor =
+            LocalMeshQueryExecutor::with_cache(reader.clone(), cache.clone(), version_fn);
         let plan = atomic_plan(OperatorPlan::AtRead {
             origin: 0xAA,
             seq: SeqNum(1),
@@ -1271,11 +1271,8 @@ mod tests {
         reader.append(0xAA, SeqNum(1), b"v".to_vec());
         let cache: Arc<dyn ResultCache> = Arc::new(LruResultCache::default());
         let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 0);
-        let executor = LocalMeshQueryExecutor::with_cache(
-            reader.clone(),
-            cache.clone(),
-            version_fn,
-        );
+        let executor =
+            LocalMeshQueryExecutor::with_cache(reader.clone(), cache.clone(), version_fn);
 
         let plan = atomic_plan(OperatorPlan::AtRead {
             origin: 0xAA,
@@ -1285,8 +1282,7 @@ mod tests {
             bypass_cache: true,
             cache_policy: CachePolicy::Permanent,
         };
-        let _ =
-            collect_rows(executor.execute_with(plan, opts).await.unwrap().rows).await;
+        let _ = collect_rows(executor.execute_with(plan, opts).await.unwrap().rows).await;
         assert_eq!(cache.len(), 0, "bypass must not write back");
     }
 
@@ -1299,11 +1295,8 @@ mod tests {
         reader.append(0xAA, SeqNum(1), b"v".to_vec());
         let cache: Arc<dyn ResultCache> = Arc::new(LruResultCache::default());
         let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 0);
-        let executor = LocalMeshQueryExecutor::with_cache(
-            reader.clone(),
-            cache.clone(),
-            version_fn,
-        );
+        let executor =
+            LocalMeshQueryExecutor::with_cache(reader.clone(), cache.clone(), version_fn);
 
         let plan = atomic_plan(OperatorPlan::AtRead {
             origin: 0xAA,
@@ -1506,9 +1499,7 @@ mod tests {
 
     #[tokio::test]
     async fn lineage_emit_yields_one_row_per_entry_in_walk_order() {
-        use crate::adapter::net::behavior::meshdb::planner::{
-            LineageDirection, LineageEntry,
-        };
+        use crate::adapter::net::behavior::meshdb::planner::{LineageDirection, LineageEntry};
 
         // Reader is unused for LineageEmit (walk happens at
         // plan time, executor just translates entries).
@@ -1562,10 +1553,26 @@ mod tests {
         let a = 0x111;
         let b = 0x222;
         let reader = Arc::new(InMemoryChainReader::default());
-        reader.append(a, SeqNum(1), br#"{"request_id":"r-1","kind":"req"}"#.to_vec());
-        reader.append(a, SeqNum(2), br#"{"request_id":"r-2","kind":"req"}"#.to_vec());
-        reader.append(b, SeqNum(1), br#"{"request_id":"r-1","kind":"resp"}"#.to_vec());
-        reader.append(b, SeqNum(2), br#"{"request_id":"r-3","kind":"resp"}"#.to_vec());
+        reader.append(
+            a,
+            SeqNum(1),
+            br#"{"request_id":"r-1","kind":"req"}"#.to_vec(),
+        );
+        reader.append(
+            a,
+            SeqNum(2),
+            br#"{"request_id":"r-2","kind":"req"}"#.to_vec(),
+        );
+        reader.append(
+            b,
+            SeqNum(1),
+            br#"{"request_id":"r-1","kind":"resp"}"#.to_vec(),
+        );
+        reader.append(
+            b,
+            SeqNum(2),
+            br#"{"request_id":"r-3","kind":"resp"}"#.to_vec(),
+        );
         let executor = LocalMeshQueryExecutor::new(reader);
 
         let plan = ExecutionPlan {
@@ -1737,9 +1744,18 @@ mod tests {
             .iter()
             .map(|r| postcard::from_bytes(&r.payload).unwrap())
             .collect();
-        let lo = decoded.iter().filter(|j| j.left.is_some() && j.right.is_none()).count();
-        let ro = decoded.iter().filter(|j| j.left.is_none() && j.right.is_some()).count();
-        let m = decoded.iter().filter(|j| j.left.is_some() && j.right.is_some()).count();
+        let lo = decoded
+            .iter()
+            .filter(|j| j.left.is_some() && j.right.is_none())
+            .count();
+        let ro = decoded
+            .iter()
+            .filter(|j| j.left.is_none() && j.right.is_some())
+            .count();
+        let m = decoded
+            .iter()
+            .filter(|j| j.left.is_some() && j.right.is_some())
+            .count();
         assert_eq!(lo, 1);
         assert_eq!(ro, 1);
         assert_eq!(m, 1);
@@ -1747,9 +1763,7 @@ mod tests {
 
     #[tokio::test]
     async fn hash_join_inner_on_origin_matches_pairs() {
-        use crate::adapter::net::behavior::meshdb::planner::{
-            CostEstimate, JoinKeyMode,
-        };
+        use crate::adapter::net::behavior::meshdb::planner::{CostEstimate, JoinKeyMode};
         use crate::adapter::net::behavior::meshdb::query::{JoinKind, JoinedRowPayload};
         use std::time::Duration;
 
@@ -1807,9 +1821,7 @@ mod tests {
 
     #[tokio::test]
     async fn hash_join_seq_key_only_matches_equal_seqs() {
-        use crate::adapter::net::behavior::meshdb::planner::{
-            CostEstimate, JoinKeyMode,
-        };
+        use crate::adapter::net::behavior::meshdb::planner::{CostEstimate, JoinKeyMode};
         use crate::adapter::net::behavior::meshdb::query::{JoinKind, JoinedRowPayload};
         use std::time::Duration;
 
@@ -1866,8 +1878,7 @@ mod tests {
             .collect();
         // Only seq=2 is in both chains → one matched pair.
         assert_eq!(rows.len(), 1);
-        let decoded: JoinedRowPayload =
-            postcard::from_bytes(&rows[0].payload).unwrap();
+        let decoded: JoinedRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
         assert_eq!(decoded.left.unwrap().payload, b"a-2");
         assert_eq!(decoded.right.unwrap().payload, b"b-2");
     }
@@ -2083,9 +2094,18 @@ mod tests {
             .map(|r| postcard::from_bytes(&r.payload).unwrap())
             .collect();
         // Three buckets: (left-only), (matched), (right-only).
-        let left_only = decoded.iter().filter(|j| j.left.is_some() && j.right.is_none()).count();
-        let right_only = decoded.iter().filter(|j| j.left.is_none() && j.right.is_some()).count();
-        let matched = decoded.iter().filter(|j| j.left.is_some() && j.right.is_some()).count();
+        let left_only = decoded
+            .iter()
+            .filter(|j| j.left.is_some() && j.right.is_none())
+            .count();
+        let right_only = decoded
+            .iter()
+            .filter(|j| j.left.is_none() && j.right.is_some())
+            .count();
+        let matched = decoded
+            .iter()
+            .filter(|j| j.left.is_some() && j.right.is_some())
+            .count();
         assert_eq!(left_only, 1, "decoded = {decoded:?}");
         assert_eq!(right_only, 1, "decoded = {decoded:?}");
         assert_eq!(matched, 1, "decoded = {decoded:?}");
@@ -2102,9 +2122,7 @@ mod tests {
     #[tokio::test]
     async fn aggregate_count_no_group_by_returns_single_row_with_total() {
         use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
-        use crate::adapter::net::behavior::meshdb::query::{
-            AggregateRowPayload, AggregateValue,
-        };
+        use crate::adapter::net::behavior::meshdb::query::{AggregateRowPayload, AggregateValue};
 
         let chain = 0xABCD;
         let reader = Arc::new(InMemoryChainReader::default());
@@ -2139,8 +2157,7 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(rows.len(), 1);
-        let decoded: AggregateRowPayload =
-            postcard::from_bytes(&rows[0].payload).unwrap();
+        let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
         assert_eq!(decoded.group, None);
         assert_eq!(decoded.value, AggregateValue::Count(5));
     }
@@ -2211,8 +2228,7 @@ mod tests {
         assert_eq!(out.len(), 3);
         let mut by_origin: HashMap<u64, u64> = HashMap::new();
         for row in &out {
-            let decoded: AggregateRowPayload =
-                postcard::from_bytes(&row.payload).unwrap();
+            let decoded: AggregateRowPayload = postcard::from_bytes(&row.payload).unwrap();
             if let Some(GroupKey::Origin(o)) = decoded.group {
                 if let AggregateValue::Count(c) = decoded.value {
                     by_origin.insert(o, c);
@@ -2255,8 +2271,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         let mut by_seq: HashMap<u64, u64> = HashMap::new();
         for row in &out {
-            let decoded: AggregateRowPayload =
-                postcard::from_bytes(&row.payload).unwrap();
+            let decoded: AggregateRowPayload = postcard::from_bytes(&row.payload).unwrap();
             if let Some(GroupKey::Seq(SeqNum(s))) = decoded.group {
                 if let AggregateValue::Count(c) = decoded.value {
                     by_seq.insert(s, c);
@@ -2270,9 +2285,7 @@ mod tests {
     #[tokio::test]
     async fn aggregate_count_empty_input_returns_zero() {
         use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
-        use crate::adapter::net::behavior::meshdb::query::{
-            AggregateRowPayload, AggregateValue,
-        };
+        use crate::adapter::net::behavior::meshdb::query::{AggregateRowPayload, AggregateValue};
 
         let reader = Arc::new(InMemoryChainReader::default());
         let executor = LocalMeshQueryExecutor::new(reader);
@@ -2300,8 +2313,7 @@ mod tests {
         // Ungrouped aggregate always emits one row, even on
         // empty input (Count = 0).
         assert_eq!(rows.len(), 1);
-        let decoded: AggregateRowPayload =
-            postcard::from_bytes(&rows[0].payload).unwrap();
+        let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
         assert_eq!(decoded.value, AggregateValue::Count(0));
     }
 
@@ -2346,8 +2358,7 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(rows.len(), 1);
-        let decoded: AggregateRowPayload =
-            postcard::from_bytes(&rows[0].payload).unwrap();
+        let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
         assert_eq!(decoded.value, AggregateValue::Sum(22.0));
     }
 
@@ -2393,8 +2404,7 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(rows.len(), 1);
-        let decoded: AggregateRowPayload =
-            postcard::from_bytes(&rows[0].payload).unwrap();
+        let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
         assert_eq!(decoded.value, AggregateValue::Avg(Some(30.0)));
     }
 
@@ -2430,8 +2440,7 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(rows.len(), 1);
-        let decoded: AggregateRowPayload =
-            postcard::from_bytes(&rows[0].payload).unwrap();
+        let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
         assert_eq!(decoded.value, AggregateValue::Avg(None));
     }
 
@@ -2567,8 +2576,7 @@ mod tests {
                 .into_iter()
                 .map(|r| r.unwrap())
                 .collect();
-            let decoded: AggregateRowPayload =
-                postcard::from_bytes(&rows[0].payload).unwrap();
+            let decoded: AggregateRowPayload = postcard::from_bytes(&rows[0].payload).unwrap();
             decoded.value
         };
         assert_eq!(
@@ -2630,16 +2638,14 @@ mod tests {
     #[tokio::test]
     async fn aggregate_distinct_count_skips_missing_fields() {
         use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
-        use crate::adapter::net::behavior::meshdb::query::{
-            AggregateRowPayload, AggregateValue,
-        };
+        use crate::adapter::net::behavior::meshdb::query::{AggregateRowPayload, AggregateValue};
 
         let chain = 0xAA;
         let reader = Arc::new(InMemoryChainReader::default());
         reader.append(chain, SeqNum(1), br#"{"user":"alice"}"#.to_vec());
         reader.append(chain, SeqNum(2), br#"{"user":"bob"}"#.to_vec());
         reader.append(chain, SeqNum(3), br#"{"user":"alice"}"#.to_vec()); // dup
-        reader.append(chain, SeqNum(4), b"not-json".to_vec());            // skipped
+        reader.append(chain, SeqNum(4), b"not-json".to_vec()); // skipped
         reader.append(chain, SeqNum(5), br#"{"user":"carol"}"#.to_vec());
         let executor = LocalMeshQueryExecutor::new(reader);
         let plan = ExecutionPlan {
@@ -2805,16 +2811,8 @@ mod tests {
         let chain = 0xC0DE;
         let reader = Arc::new(InMemoryChainReader::default());
         // Rows carry JSON payloads with a "severity" field.
-        reader.append(
-            chain,
-            SeqNum(1),
-            br#"{"severity":"low"}"#.to_vec(),
-        );
-        reader.append(
-            chain,
-            SeqNum(2),
-            br#"{"severity":"high"}"#.to_vec(),
-        );
+        reader.append(chain, SeqNum(1), br#"{"severity":"low"}"#.to_vec());
+        reader.append(chain, SeqNum(2), br#"{"severity":"high"}"#.to_vec());
         reader.append(
             chain,
             SeqNum(3),
