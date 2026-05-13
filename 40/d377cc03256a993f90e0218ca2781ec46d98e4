@@ -1,0 +1,23 @@
+go/integration_test.go
+  s_7bb8e35670bd3c::t_140f6859cf27d6 140-151,153-163
+  s_7bb8e35670bd3c::t_b00c9574651996 54-97
+  s_7bb8e35670bd3c::t_7b7e2553126885 216-226,228-237
+  s_7bb8e35670bd3c::t_5dab8313a4feef 273-286,288-300
+  s_7bb8e35670bd3c::t_f159a5b7f68242 334-344,346-355
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "40d377cc03256a993f90e0218ca2781ec46d98e4",
+  "prompts": {},
+  "sessions": {
+    "s_7bb8e35670bd3c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d8d55bba-8fe3-43de-ae06-4b2fb9bc2b52",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
