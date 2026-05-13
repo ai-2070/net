@@ -81,6 +81,11 @@ pub enum MeshOsEvent {
     /// the Dataforts placement fold.
     PlacementIntent(PlacementIntent),
 
+    /// Desired-state daemon intent updated. Source (Phase B+):
+    /// the Dataforts daemon-placement fold. Per-daemon "should
+    /// be running here?" answer.
+    DaemonIntentUpdate(DaemonIntentUpdate),
+
     /// Cooperative loop shutdown. The loop drains pending events
     /// (no more reconcile passes) and exits.
     Shutdown,
@@ -293,4 +298,26 @@ pub struct PlacementIntent {
     pub chain: ChainId,
     /// Desired replica count for the chain.
     pub desired_replicas: u32,
+}
+
+/// Per-daemon intent — should this daemon be running on this
+/// node, or stopped? Source (Phase B+): the Dataforts
+/// daemon-placement fold.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DaemonIntent {
+    /// Daemon should be running locally.
+    Run,
+    /// Daemon should not be running locally.
+    Stop,
+}
+
+/// Desired-state daemon intent update. Paired form of
+/// [`DaemonIntent`] keyed by the [`DaemonRef`] it applies to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DaemonIntentUpdate {
+    /// Daemon whose intent changed.
+    pub daemon: DaemonRef,
+    /// New intent.
+    pub intent: DaemonIntent,
 }

@@ -51,17 +51,25 @@
 
 pub mod action;
 pub mod config;
+pub mod control;
 pub mod event;
 pub mod event_loop;
 pub mod reconcile;
 pub mod state;
+pub mod supervision;
 
 pub use action::{ActionId, AllocateActionId, MaintenanceTransition, MeshOsAction, PendingAction};
 pub use config::{BackpressureConfig, MeshOsConfig};
+pub use control::MeshOsControl;
 pub use event::{
-    AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonLifecycleSignal, DaemonRef,
-    MeshOsEvent, NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
+    AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,
+    DaemonLifecycleSignal, DaemonRef, MeshOsEvent, NodeHealth, NodeId, PlacementIntent,
+    ReplicaUpdate,
 };
 pub use event_loop::{MeshOsHandle, MeshOsHandleError, MeshOsLoop};
-pub use reconcile::reconcile;
-pub use state::{AvoidEntry, BlobObservation, DaemonStatus, DesiredState, MaintenanceMirror, MeshOsState};
+pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
+pub use state::{
+    AvoidEntry, BlobObservation, DaemonLifecycle, DaemonStatus, DesiredState, MaintenanceMirror,
+    MeshOsState,
+};
+pub use supervision::{BackoffConfig, BackoffTracker, RestartState};

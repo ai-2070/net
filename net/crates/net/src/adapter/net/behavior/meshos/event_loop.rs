@@ -176,8 +176,10 @@ impl MeshOsLoop {
     }
 
     fn apply(&mut self, event: &MeshOsEvent) {
-        if let MeshOsEvent::PlacementIntent(intent) = event {
-            self.desired.apply(intent);
+        match event {
+            MeshOsEvent::PlacementIntent(intent) => self.desired.apply(intent),
+            MeshOsEvent::DaemonIntentUpdate(update) => self.desired.apply_daemon_intent(update),
+            _ => {}
         }
         self.actual.apply(event);
     }

@@ -14,9 +14,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::event::{
-    AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonLifecycleSignal, DaemonRef,
-    MeshOsEvent, NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
+    AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,
+    DaemonLifecycleSignal, DaemonRef, MeshOsEvent, NodeHealth, NodeId, PlacementIntent,
+    ReplicaUpdate,
 };
+use super::supervision::BackoffTracker;
 
 /// Folded view of what's happening on the cluster *right now*,
 /// from this node's vantage. Updated by `apply` as events
@@ -44,9 +46,8 @@ pub struct MeshOsState {
     pub last_tick: Option<Instant>,
 }
 
-/// Per-daemon observed status. Phase A keeps it minimal; Phase B
-/// extends with backoff state, crash-loop flag, last-restart
-/// timestamps.
+/// Per-daemon observed status. Phase B fleshes out the fields
+/// reconcile reads to decide start / stop / backoff actions.
 #[derive(Clone, Debug, Default)]
 pub struct DaemonStatus {
     /// Latest self-reported health, if any.
@@ -59,6 +60,31 @@ pub struct DaemonStatus {
     pub last_exit: Option<Instant>,
     /// Wall time of the most recent `Crashed` signal.
     pub last_crash: Option<Instant>,
+    /// Lifecycle phase the supervisor believes the daemon is in.
+    /// Default `Stopped`. Updated by the `apply_daemon` fold.
+    pub lifecycle: DaemonLifecycle,
+    /// Per-daemon backoff tracker. Reconcile reads
+    /// `backoff.state()` to gate `StartDaemon` emission.
+    pub backoff: BackoffTracker,
+}
+
+/// Lifecycle phase the supervisor tracks per daemon. Used by
+/// reconcile to decide start / stop emissions.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DaemonLifecycle {
+    /// Daemon is not currently running on this node.
+    #[default]
+    Stopped,
+    /// `StartDaemon` action emitted; waiting for the supervisor
+    /// to confirm via `DaemonLifecycleSignal::Started`.
+    Starting,
+    /// Daemon is running. Default reconcile target when desired
+    /// intent is `Run`.
+    Running,
+    /// `StopDaemon` action emitted; waiting for clean exit or
+    /// forced termination.
+    Stopping,
 }
 
 /// Mirrored maintenance state, copied from chain metadata. The
@@ -107,12 +133,18 @@ impl MeshOsState {
     pub fn apply(&mut self, event: &MeshOsEvent) {
         match event {
             MeshOsEvent::Tick => {
-                self.last_tick = Some(Instant::now());
+                let now = Instant::now();
+                self.last_tick = Some(now);
                 self.gc_avoid_list();
+                self.release_elapsed_backoffs(now);
             }
             MeshOsEvent::ReplicaUpdate(update) => self.apply_replica(update),
             MeshOsEvent::DaemonLifecycle { daemon, signal } => {
                 self.apply_daemon(daemon, signal);
+            }
+            MeshOsEvent::DaemonIntentUpdate(_) => {
+                // Desired-state input; routed by the loop into
+                // `DesiredState`, no actual-state side effect.
             }
             MeshOsEvent::RttSample { peer, rtt } => {
                 self.rtt.insert(*peer, *rtt);
@@ -151,9 +183,21 @@ impl MeshOsState {
     fn apply_daemon(&mut self, daemon: &DaemonRef, signal: &DaemonLifecycleSignal) {
         let status = self.daemons.entry(daemon.clone()).or_default();
         match signal {
-            DaemonLifecycleSignal::Started { at } => status.last_started = Some(*at),
-            DaemonLifecycleSignal::ExitedCleanly { at } => status.last_exit = Some(*at),
-            DaemonLifecycleSignal::Crashed { at, .. } => status.last_crash = Some(*at),
+            DaemonLifecycleSignal::Started { at } => {
+                status.last_started = Some(*at);
+                status.lifecycle = DaemonLifecycle::Running;
+                status.backoff.observe_start(*at);
+            }
+            DaemonLifecycleSignal::ExitedCleanly { at } => {
+                status.last_exit = Some(*at);
+                status.lifecycle = DaemonLifecycle::Stopped;
+                status.backoff.observe_clean_exit(*at);
+            }
+            DaemonLifecycleSignal::Crashed { at, .. } => {
+                status.last_crash = Some(*at);
+                status.lifecycle = DaemonLifecycle::Stopped;
+                status.backoff.observe_crash(*at);
+            }
             DaemonLifecycleSignal::HealthChanged { health, .. } => {
                 status.health = Some(health.clone());
             }
@@ -196,6 +240,12 @@ impl MeshOsState {
         let now = Instant::now();
         self.avoid_list.retain(|_, entry| entry.until > now);
     }
+
+    fn release_elapsed_backoffs(&mut self, now: Instant) {
+        for status in self.daemons.values_mut() {
+            status.backoff.maybe_release(now);
+        }
+    }
 }
 
 /// Folded desired-state view — what Dataforts says the cluster
@@ -207,18 +257,29 @@ pub struct DesiredState {
     /// compares this against `MeshOsState::replicas` to emit
     /// `PullReplica` / `DropReplica` / `Request*` actions.
     pub desired_replicas: HashMap<ChainId, u32>,
+    /// Per-daemon intent. Reconcile reads this against the
+    /// actual `MeshOsState::daemons[*].lifecycle` to emit
+    /// `StartDaemon` / `StopDaemon`.
+    pub desired_daemons: HashMap<DaemonRef, DaemonIntent>,
 }
 
 impl DesiredState {
-    /// Fold a desired-state input event. Today only
-    /// `PlacementIntent` lands here; Phase B+ adds the
-    /// daemon-intent shape so the supervisor knows which daemons
-    /// should be running where.
+    /// Fold a placement-intent input event.
     pub fn apply(&mut self, intent: &PlacementIntent) {
         self.desired_replicas
             .insert(intent.chain, intent.desired_replicas);
     }
+
+    /// Fold a daemon-intent input event.
+    pub fn apply_daemon_intent(&mut self, update: &DaemonIntentUpdate) {
+        self.desired_daemons
+            .insert(update.daemon.clone(), update.intent);
+    }
 }
+
+/// Re-exported here so the test module + reconcile can refer to
+/// `state::RestartState` without crossing the supervision module.
+pub use super::supervision::RestartState as DaemonRestartState;
 
 #[cfg(test)]
 mod tests {
