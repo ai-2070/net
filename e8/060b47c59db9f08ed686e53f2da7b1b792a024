@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/behavior/meshos/chain.rs
+  s_630ab035313d41::t_c6b7117bbf795d 144-155,157-165,169,174-185,187,199-204,209-215
+  s_630ab035313d41::t_42989dc8bbb785 364-380
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "e8060b47c59db9f08ed686e53f2da7b1b792a024",
+  "prompts": {},
+  "sessions": {
+    "s_630ab035313d41": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1a00700-50d8-4292-94fe-a7ef01c966ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
