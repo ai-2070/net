@@ -485,9 +485,21 @@ mod tests {
             }))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let stats = rt.executor_stats();
-        // At least one CommitMaintenanceTransition dispatched.
+        // Poll until at least one action dispatches, rather than
+        // sleeping a fixed window. Bounded deadline so a wedged
+        // executor surfaces as a clear timeout rather than a
+        // silent stats==0 pass.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let stats = loop {
+            let stats = rt.executor_stats();
+            if stats.dispatched >= 1 {
+                break stats;
+            }
+            if Instant::now() >= deadline {
+                panic!("executor did not dispatch within 2s; final stats={stats:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         assert!(
             stats.dispatched >= 1,
             "expected at least one dispatch; got {stats:?}",
