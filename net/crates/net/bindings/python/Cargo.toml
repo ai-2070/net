@@ -1,6 +1,6 @@
 [package]
 name = "net-python"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Python bindings for Net event bus"
@@ -66,8 +66,8 @@ compute = ["net", "dep:net-sdk", "net-sdk/compute", "dep:dashmap"]
 groups = ["compute", "net-sdk/groups"]
 
 [dependencies]
-net = { package = "ai2070-net", version = "0.15.0", path = "../..", default-features = false }
-net-sdk = { package = "ai2070-net-sdk", version = "0.15.0", path = "../../sdk", default-features = false, optional = true }
+net = { package = "ai2070-net", version = "0.16.0", path = "../..", default-features = false }
+net-sdk = { package = "ai2070-net-sdk", version = "0.16.0", path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
 pyo3 = { version = "0.28.0", features = ["extension-module"] }
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "sync"] }

@@ -2,7 +2,7 @@ name: Release Rust crates
 
 # Publishes `ai2070-net` and `ai2070-net-sdk` to crates.io.
 #
-# Tag schema: `crates-v<semver>` (e.g. `crates-v0.15.0`). The two
+# Tag schema: `crates-v<semver>` (e.g. `crates-v0.16.0`). The two
 # crates publish in dependency order — `ai2070-net` first, then
 # `ai2070-net-sdk` once the index has caught up.
 #
