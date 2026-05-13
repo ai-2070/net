@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/redex/config.rs
+  s_3bbc444b3ef3e5::t_019b4131743358 163-174
+  s_3bbc444b3ef3e5::t_5b202d1b73e7dc 275-276
+net/crates/net/src/adapter/net/behavior/meshdb/cache.rs
+  s_3bbc444b3ef3e5::t_b9b6d6502c06cd 32,40-45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "9b7092516d585b7ba7e0ff39ae669ab3ca8275fc",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
