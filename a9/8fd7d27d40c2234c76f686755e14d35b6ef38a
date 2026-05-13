@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/behavior/meshdb/federated.rs
+  s_3bbc444b3ef3e5::t_02e441874d7df8 987-992,1002-1012
+net/crates/net/examples/meshdb.c
+  s_3bbc444b3ef3e5::t_3ec840394e68b3 131-156
+net/crates/net/bindings/go/net/meshdb.go
+  s_3bbc444b3ef3e5::t_eca950a2afb68c 94,98
+  s_3bbc444b3ef3e5::t_b0743cf879575a 172,175
+net/crates/net/src/adapter/net/behavior/meshdb/executor.rs
+  s_3bbc444b3ef3e5::t_a51a07b5c0b1f6 1004-1014,1025-1035
+  s_3bbc444b3ef3e5::t_91a72737259a4b 2888-2919
+net/crates/net/bindings/node/meshdb.ts
+  s_3bbc444b3ef3e5::t_4b82e69540d861 114-115
+net/crates/net/include/net_meshdb.h
+  s_3bbc444b3ef3e5::t_569fbaeef843be 335,343,354-356,359,373-374,377
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_3bbc444b3ef3e5::t_28334bbbdc1948 1216
+  s_3bbc444b3ef3e5::t_6818e94ddbfcf3 1336
+  s_3bbc444b3ef3e5::t_c5a239f3e04cd1 1178
+  s_3bbc444b3ef3e5::t_32b6193d442cfa 1272
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "a98fd7d27d40c2234c76f686755e14d35b6ef38a",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
