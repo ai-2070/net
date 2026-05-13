@@ -319,11 +319,6 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
         });
     }
 
-    /// Test-only view into the recent-failures ring buffer.
-    #[cfg(test)]
-    pub(crate) fn recent_failures(&self) -> &VecDeque<FailureRecord> {
-        &self.recent_failures
-    }
 }
 
 /// External handle for sampling executor live state.

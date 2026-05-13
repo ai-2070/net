@@ -137,6 +137,119 @@ pub trait MeshDaemon: Send + Sync {
         }
         Ok(())
     }
+
+    /// Self-reported health. Polled by the MeshOS supervisor on
+    /// each tick. Default `Healthy`.
+    ///
+    /// Daemons with a real health surface (queue-depth probes,
+    /// internal cache freshness, dependency readiness, etc.)
+    /// override to return a richer value. The supervisor surfaces
+    /// the latest sample on the behavior snapshot for Deck.
+    ///
+    /// Must complete in microseconds — same constraint as
+    /// `process()`. Heavy probes belong in a side task whose
+    /// result the daemon caches.
+    fn health(&self) -> DaemonHealth {
+        DaemonHealth::Healthy
+    }
+
+    /// Self-reported saturation, `0.0` (idle) to `1.0` (fully
+    /// loaded). Used by Phase D-1's mesh scheduler to decide
+    /// whether a daemon's host is a good candidate for new
+    /// work. Default `0.0`.
+    ///
+    /// Daemons without a meaningful saturation surface should
+    /// leave the default. The value is informational under the
+    /// current scheduler; a poor estimate doesn't cause
+    /// migrations to thrash.
+    fn saturation(&self) -> f32 {
+        0.0
+    }
+
+    /// Receive a control event from the supervisor. Default:
+    /// no-op (the daemon proceeds as normal regardless of the
+    /// control signal).
+    ///
+    /// Daemons that participate in graceful shutdown / drain /
+    /// backpressure override to react. The dispatch is sync —
+    /// the supervisor calls this between `process()` events on
+    /// the daemon's main task, so long-running work in
+    /// `on_control` blocks subsequent event processing.
+    fn on_control(&mut self, _event: DaemonControl) {}
+}
+
+/// Self-reported daemon health. Default trait impl returns
+/// `Healthy`; daemons with a real health surface override
+/// `MeshDaemon::health` to return a richer value.
+///
+/// Compiled into the substrate (not gated on the `meshos`
+/// feature) so daemons that compile against `MeshDaemon` can
+/// return this type without conditional compilation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DaemonHealth {
+    /// Daemon is fully operational.
+    Healthy,
+    /// Daemon is running but degraded. `reason` rides into the
+    /// behavior snapshot's recent-failures ring buffer + Deck
+    /// render.
+    Degraded {
+        /// Operator-readable reason.
+        reason: String,
+    },
+    /// Daemon is non-functional but hasn't crashed. The
+    /// supervisor records this and may emit a `StopDaemon`
+    /// action if the desired-state intent flips to `Stop`.
+    Unhealthy,
+}
+
+/// Supervisor → daemon control event. Delivered via
+/// `MeshDaemon::on_control`. Carries relative-duration
+/// deadlines (no `Instant`) so a daemon running under any
+/// clock source can react.
+///
+/// The MeshOS-side richer form `MeshOsControl` carries
+/// `Instant` deadlines for SDK scheduling; the supervisor
+/// integration layer converts via `MeshOsControl::to_daemon_control(now)`.
+///
+/// `#[non_exhaustive]` so later phases add control variants
+/// without breaking daemon implementations.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum DaemonControl {
+    /// Graceful shutdown. The daemon should finish in-flight
+    /// work and exit before `grace_period_ms` elapses. Past the
+    /// deadline the supervisor force-terminates.
+    Shutdown {
+        /// Milliseconds the daemon has before the supervisor
+        /// force-terminates.
+        grace_period_ms: u64,
+    },
+
+    /// Drain start. Stop accepting new work; in-flight work
+    /// continues until `grace_period_ms` elapses or `DrainFinish`
+    /// arrives.
+    DrainStart {
+        /// Milliseconds the drain has before forced cutoff.
+        grace_period_ms: u64,
+    },
+
+    /// Drain done. The daemon should exit immediately;
+    /// in-flight work may be abandoned.
+    DrainFinish,
+
+    /// Cluster-wide backpressure is asserted. The daemon should
+    /// reduce optional work (cache warmup, background indexing,
+    /// etc.) proportional to `level ∈ [0.0, 1.0]`. 1.0 means
+    /// "pause optional work entirely".
+    BackpressureOn {
+        /// Severity in `[0.0, 1.0]`. 0 means just-barely
+        /// triggered, 1 means catastrophic queue depth.
+        level: f32,
+    },
+
+    /// Cluster-wide backpressure cleared. Resume normal work.
+    BackpressureOff,
 }
 
 /// Errors from daemon operations.
@@ -307,5 +420,100 @@ mod tests {
         };
         // If the artifact type's Daemon variant changes shape,
         // this construction fails compile.
+    }
+
+    // MeshOS-supervision extension: health / saturation / on_control.
+    // Pin the defaults so a daemon written against the older trait
+    // continues to compile + behave under the new supervisor.
+
+    #[test]
+    fn health_default_is_healthy() {
+        let d = BareDaemon;
+        assert_eq!(d.health(), DaemonHealth::Healthy);
+    }
+
+    #[test]
+    fn saturation_default_is_zero() {
+        let d = BareDaemon;
+        assert_eq!(d.saturation(), 0.0);
+    }
+
+    /// Daemon that overrides the new MeshOS-supervision methods.
+    /// Pins the override surface daemon authors target when they
+    /// participate in graceful shutdown / drain / health reporting.
+    struct WatchedDaemon {
+        last_control: Option<DaemonControl>,
+        health: DaemonHealth,
+        saturation: f32,
+    }
+
+    impl MeshDaemon for WatchedDaemon {
+        fn name(&self) -> &str {
+            "watched"
+        }
+        fn requirements(&self) -> CapabilityFilter {
+            CapabilityFilter::default()
+        }
+        fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+            Ok(Vec::new())
+        }
+        fn health(&self) -> DaemonHealth {
+            self.health.clone()
+        }
+        fn saturation(&self) -> f32 {
+            self.saturation
+        }
+        fn on_control(&mut self, event: DaemonControl) {
+            self.last_control = Some(event);
+        }
+    }
+
+    #[test]
+    fn override_surfaces_for_health_and_saturation() {
+        let d = WatchedDaemon {
+            last_control: None,
+            health: DaemonHealth::Degraded {
+                reason: "queue depth".into(),
+            },
+            saturation: 0.42,
+        };
+        assert!(matches!(d.health(), DaemonHealth::Degraded { .. }));
+        assert!((d.saturation() - 0.42).abs() < 1e-6);
+    }
+
+    #[test]
+    fn on_control_receives_supervisor_events() {
+        let mut d = WatchedDaemon {
+            last_control: None,
+            health: DaemonHealth::Healthy,
+            saturation: 0.0,
+        };
+        d.on_control(DaemonControl::Shutdown {
+            grace_period_ms: 5_000,
+        });
+        assert!(matches!(
+            d.last_control,
+            Some(DaemonControl::Shutdown {
+                grace_period_ms: 5_000
+            })
+        ));
+        d.on_control(DaemonControl::BackpressureOn { level: 0.5 });
+        assert!(matches!(
+            d.last_control,
+            Some(DaemonControl::BackpressureOn { level }) if (level - 0.5).abs() < 1e-6
+        ));
+    }
+
+    #[test]
+    fn bare_daemon_ignores_control_events_silently() {
+        // Default `on_control` is a no-op — the daemon
+        // proceeds as normal. Critical for backward
+        // compatibility: existing daemons don't suddenly
+        // change behavior under the new supervisor.
+        let mut d = BareDaemon;
+        d.on_control(DaemonControl::DrainFinish);
+        d.on_control(DaemonControl::BackpressureOff);
+        // No state to assert — the contract is just "no panic,
+        // no side effect."
     }
 }

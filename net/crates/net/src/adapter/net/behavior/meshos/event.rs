@@ -175,21 +175,12 @@ pub enum DaemonLifecycleSignal {
     },
 }
 
-/// Daemon-self-reported health. Default trait impl on
-/// `MeshDaemon` (added in Phase B) returns `Healthy`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum DaemonHealth {
-    /// Daemon is fully operational.
-    Healthy,
-    /// Daemon is running but degraded — operator-readable reason.
-    Degraded {
-        /// Why the daemon is degraded.
-        reason: String,
-    },
-    /// Daemon is non-functional but hasn't crashed.
-    Unhealthy,
-}
+/// Daemon-self-reported health. Re-exported from the trait
+/// module ([`crate::adapter::net::compute::daemon::DaemonHealth`])
+/// so MeshOS and the daemon trait stay in sync on one canonical
+/// type — `MeshDaemon::health() -> DaemonHealth` is the same
+/// `DaemonHealth` MeshOS folds.
+pub use crate::adapter::net::compute::DaemonHealth;
 
 /// Peer-level health, derived from heartbeat liveness.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

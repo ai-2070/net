@@ -21,7 +21,9 @@ mod scheduler;
 pub mod standby_group;
 
 pub use bindings::{DaemonBindings, SubscriptionBinding};
-pub use daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon};
+pub use daemon::{
+    DaemonControl, DaemonError, DaemonHealth, DaemonHostConfig, DaemonStats, MeshDaemon,
+};
 pub use daemon_factory::{DaemonFactoryRegistry, FactoryEntry};
 pub use fork_group::{ForkGroup, ForkGroupConfig, ForkInfo};
 pub use group_coord::{GroupCoordinator, GroupError, GroupHealth, MemberInfo};
