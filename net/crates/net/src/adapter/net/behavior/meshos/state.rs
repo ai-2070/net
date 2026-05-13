@@ -52,6 +52,11 @@ pub struct MeshOsState {
     pub blobs: HashMap<u64, BlobObservation>,
     /// Peers currently on the local avoid list, with their TTL.
     pub avoid_list: HashMap<NodeId, AvoidEntry>,
+    /// Phase D-1 — last time the scheduler emitted a
+    /// rebalance for this chain. Subsequent evaluations within
+    /// `SchedulerConfig::cooldown` skip the chain to avoid
+    /// flap.
+    pub last_rebalance: HashMap<ChainId, Instant>,
     /// Last `Tick` we processed — used by tests / diagnostics.
     pub last_tick: Option<Instant>,
 }

@@ -60,6 +60,7 @@ pub mod maintenance;
 pub mod probes;
 pub mod reconcile;
 pub mod runtime;
+pub mod scheduler;
 pub mod snapshot;
 pub mod sources;
 pub mod state;
@@ -95,6 +96,7 @@ pub use executor::{
 };
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
 pub use runtime::{MeshOsRuntime, RuntimeShutdownError, RuntimeStats};
+pub use scheduler::{PlacementScorer, SchedulerConfig, SchedulerRegistry};
 pub use sources::{
     attach_to_daemon_registry, attach_to_replication_coordinator, MeshOsDaemonLifecycleSink,
     MeshOsReplicaTransitionSink,

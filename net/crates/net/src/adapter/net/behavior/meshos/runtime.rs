@@ -31,6 +31,7 @@ use super::event::MeshOsEvent;
 use super::event_loop::{MeshOsHandle, MeshOsLoop, MeshOsSnapshotReader, ProbeRegistry};
 use super::executor::{ActionDispatcher, ActionExecutor, ExecutorStats, ExecutorStatsSnapshot};
 use super::probes::{HealthProbe, LocalityProbe};
+use super::scheduler::{PlacementScorer, SchedulerRegistry};
 use super::snapshot::MeshOsSnapshot;
 
 /// One-stop entry point. Spawns the loop + executor as tokio
@@ -46,6 +47,10 @@ pub struct MeshOsRuntime {
     /// probes after `start`. The loop reads through the same
     /// shared cell, so additions take effect on the next Tick.
     probes: ProbeRegistry,
+    /// Cloned [`SchedulerRegistry`] retained so consumers can
+    /// install the placement scorer after `start`. Same
+    /// shared-cell pattern as `probes`.
+    scheduler: SchedulerRegistry,
 }
 
 /// Plain-value rollup of the runtime's join statistics. Returned
@@ -79,8 +84,23 @@ impl MeshOsRuntime {
         dispatcher: Arc<D>,
         probes: ProbeRegistry,
     ) -> Self {
+        Self::start_full(config, dispatcher, probes, SchedulerRegistry::new())
+    }
+
+    /// Like [`Self::start`], but accepts both probe and
+    /// scheduler registries. The most general entry point —
+    /// `start` and `start_with_probes` are conveniences over
+    /// this.
+    pub fn start_full<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        dispatcher: Arc<D>,
+        probes: ProbeRegistry,
+        scheduler: SchedulerRegistry,
+    ) -> Self {
         let (mesh_loop, handle, actions_rx, reader) = MeshOsLoop::new(config.clone());
-        let mesh_loop = mesh_loop.with_probe_registry(probes.clone());
+        let mesh_loop = mesh_loop
+            .with_probe_registry(probes.clone())
+            .with_scheduler_registry(scheduler.clone());
         let cfg_arc = Arc::new(config);
         let exec = ActionExecutor::new(actions_rx, cfg_arc, dispatcher);
         let stats = exec.stats_arc();
@@ -93,7 +113,22 @@ impl MeshOsRuntime {
             exec_task,
             stats,
             probes,
+            scheduler,
         }
+    }
+
+    /// Install / replace the active placement scorer. Subsequent
+    /// reconcile passes use the new scorer.
+    pub fn install_placement_scorer(
+        &self,
+        scorer: Arc<dyn PlacementScorer>,
+    ) -> Option<Arc<dyn PlacementScorer>> {
+        self.scheduler.install(scorer)
+    }
+
+    /// Clone the scheduler registry.
+    pub fn scheduler_registry(&self) -> SchedulerRegistry {
+        self.scheduler.clone()
     }
 
     /// Install a [`LocalityProbe`] on the live loop. The probe
@@ -265,6 +300,7 @@ mod tests {
             backpressure: Default::default(),
             locality: Default::default(),
             maintenance: Default::default(),
+        scheduler: Default::default(),
         }
     }
 

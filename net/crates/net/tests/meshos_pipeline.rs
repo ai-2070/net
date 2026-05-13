@@ -43,6 +43,7 @@ fn fast_config() -> MeshOsConfig {
         backpressure: Default::default(),
         locality: Default::default(),
         maintenance: Default::default(),
+        scheduler: Default::default(),
     }
 }
 

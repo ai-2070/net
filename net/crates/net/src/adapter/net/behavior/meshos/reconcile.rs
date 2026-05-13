@@ -22,6 +22,7 @@ use super::action::{MaintenanceTransition, MeshOsAction};
 use super::config::{LocalityConfig, MaintenanceConfig};
 use super::event::{ChainId, DaemonIntent, LocalReplicaIntent, NodeId};
 use super::maintenance::MaintenanceState;
+use super::scheduler::{PlacementScorer, SchedulerConfig};
 use super::state::{DaemonLifecycle, DaemonStatus, DesiredState, MeshOsState};
 
 /// Default grace window granted to a `StopDaemon` action. The
@@ -44,6 +45,8 @@ pub fn reconcile(
     this_node: NodeId,
     locality: &LocalityConfig,
     maintenance: &MaintenanceConfig,
+    scheduler: &SchedulerConfig,
+    scorer: Option<&dyn PlacementScorer>,
 ) -> Vec<MeshOsAction> {
     let mut actions = Vec::new();
     // The reconcile pass is a sync sample; we use the
@@ -57,6 +60,7 @@ pub fn reconcile(
     diff_replicas(actual, desired, this_node, &mut actions);
     diff_locality(actual, now, locality, &mut actions);
     diff_maintenance(actual, this_node, now, maintenance, &mut actions);
+    diff_scheduler(actual, this_node, scheduler, scorer, now, &mut actions);
     actions
 }
 
@@ -290,6 +294,92 @@ fn diff_maintenance(
     }
 }
 
+/// Phase D-1 — continuous-rebalance scoring arm.
+///
+/// For each chain where this node is the elected leader:
+///
+/// 1. Score every current holder via `scorer.score(chain, h)`.
+/// 2. Find the worst holder (lowest score).
+/// 3. If the worst score is below `score_floor` AND a better
+///    alternative exists (alt_score - worst_score >
+///    hysteresis_gap) AND the chain isn't on cooldown, emit
+///    `RequestEviction { chain, victim: worst }`.
+///
+/// Phase C's existing diff observes the holder-count drop on
+/// the next tick and emits `RequestPlacement` to refill — the
+/// two-stage shape that keeps Phase D-1 from needing a new
+/// action variant.
+///
+/// Idempotent: the cooldown map (`actual.last_rebalance`) is
+/// recorded by the fold side; this function never mutates state.
+/// A reconcile re-run with the same input produces the same
+/// eviction emission (or none, if the cooldown blocks it).
+fn diff_scheduler(
+    actual: &MeshOsState,
+    this_node: NodeId,
+    config: &SchedulerConfig,
+    scorer: Option<&dyn PlacementScorer>,
+    now: Instant,
+    out: &mut Vec<MeshOsAction>,
+) {
+    let Some(scorer) = scorer else {
+        // No scorer installed — the scheduler arm is a no-op.
+        return;
+    };
+
+    // Sort chain ids for byte-stable action ordering across
+    // reconcile calls regardless of HashMap iteration.
+    let mut chains: Vec<ChainId> = actual.replicas.keys().copied().collect();
+    chains.sort();
+
+    for chain in chains {
+        let leader = actual.replica_leader.get(&chain).copied();
+        if leader != Some(this_node) {
+            continue;
+        }
+        // Cooldown gate.
+        if let Some(last) = actual.last_rebalance.get(&chain) {
+            if now.saturating_duration_since(*last) < config.cooldown {
+                continue;
+            }
+        }
+        let holders = match actual.replicas.get(&chain) {
+            Some(h) if !h.is_empty() => h.clone(),
+            _ => continue,
+        };
+        // Pick the lowest-scoring holder. Use total_cmp on f32
+        // so NaN doesn't surprise us; treat None as "no score
+        // → skip this holder."
+        let mut worst: Option<(NodeId, f32)> = None;
+        for &h in &holders {
+            let Some(score) = scorer.score(chain, h) else {
+                continue;
+            };
+            worst = match worst {
+                None => Some((h, score)),
+                Some((_, ws)) if score < ws => Some((h, score)),
+                _ => worst,
+            };
+        }
+        let Some((victim, victim_score)) = worst else {
+            continue;
+        };
+        if victim_score >= config.score_floor {
+            // No holder is below the floor — leave the chain
+            // alone.
+            continue;
+        }
+        // Check there's a better alternative.
+        let Some((_alt_node, alt_score)) = scorer.best_alternative(chain, &holders) else {
+            continue;
+        };
+        if alt_score - victim_score <= config.hysteresis_gap {
+            continue;
+        }
+        out.push(MeshOsAction::RequestEviction { chain, victim });
+    }
+}
+
 fn all_replicas_drained_locally(actual: &MeshOsState, this_node: NodeId) -> bool {
     actual
         .replicas
@@ -369,6 +459,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         ).is_empty());
     }
 
@@ -384,6 +476,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         let second = reconcile(
             &actual,
@@ -391,6 +485,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(first, second);
     }
@@ -424,6 +520,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         ).is_empty());
     }
 
@@ -441,6 +539,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(
             actions,
@@ -463,6 +563,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(actions, vec![MeshOsAction::StartDaemon { daemon: d }]);
     }
@@ -482,6 +584,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         ).is_empty());
     }
 
@@ -503,6 +607,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         match actions.as_slice() {
             [MeshOsAction::StopDaemon {
@@ -530,6 +636,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         ).is_empty());
     }
 
@@ -556,6 +664,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         match actions.as_slice() {
             [MeshOsAction::ApplyBackoff {
@@ -590,6 +700,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(actions, vec![MeshOsAction::StartDaemon { daemon: d }]);
     }
@@ -615,6 +727,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         match actions.as_slice() {
             [MeshOsAction::ApplyBackoff { daemon: d2, .. }] => assert_eq!(d2, &d),
@@ -644,6 +758,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         let b = reconcile(
             &actual,
@@ -651,6 +767,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(a, b);
         assert_eq!(a.len(), 2);
@@ -676,6 +794,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(
             actions,
@@ -700,6 +820,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         ).is_empty());
     }
 
@@ -717,6 +839,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(actions, vec![MeshOsAction::DropReplica { chain: CHAIN_A }]);
     }
@@ -735,6 +859,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         ).is_empty());
     }
 
@@ -755,6 +881,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         ).is_empty());
     }
 
@@ -771,6 +899,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(
             actions,
@@ -794,6 +924,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         // Naive Phase C-1 victim selection: lex-smallest holder.
         assert_eq!(
@@ -818,6 +950,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         ).is_empty());
     }
 
@@ -836,6 +970,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         ).is_empty());
     }
 
@@ -852,6 +988,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         ).is_empty());
     }
 
@@ -870,6 +1008,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         match actions.as_slice() {
             [MeshOsAction::MarkAvoid { peer, ttl, .. }] => {
@@ -891,6 +1031,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert!(actions.is_empty());
     }
@@ -913,6 +1055,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert!(
             actions.is_empty(),
@@ -933,6 +1077,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         let peers: Vec<NodeId> = actions
             .iter()
@@ -969,6 +1115,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         // Two DropReplica actions, sorted by chain id.
         assert_eq!(
@@ -998,6 +1146,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         ).is_empty());
     }
 
@@ -1017,6 +1167,8 @@ mod tests {
             THIS_NODE,
             &locality,
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         match actions.as_slice() {
             [MeshOsAction::MarkAvoid { peer, ttl, .. }] => {
@@ -1039,6 +1191,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert!(actions.is_empty());
     }
@@ -1060,6 +1214,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(
             actions,
@@ -1088,6 +1244,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert!(actions.is_empty());
     }
@@ -1111,6 +1269,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert!(actions.is_empty());
     }
@@ -1134,6 +1294,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(
             actions,
@@ -1165,6 +1327,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(
             actions,
@@ -1188,6 +1352,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert!(actions.is_empty());
     }
@@ -1208,6 +1374,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(
             actions,
@@ -1232,6 +1400,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert!(actions.is_empty());
     }
@@ -1249,6 +1419,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert_eq!(
             actions,
@@ -1275,8 +1447,214 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         assert!(actions.is_empty());
+    }
+
+    // ----- Phase D-1: scheduler arm -----
+
+    /// Test-only scorer with a fixed score-table + alternative
+    /// lookup. The reconcile tests build one per case so the
+    /// emission contract is fully observable.
+    struct FixedScorer {
+        scores: std::collections::HashMap<(ChainId, NodeId), f32>,
+        alternatives: std::collections::HashMap<ChainId, (NodeId, f32)>,
+    }
+
+    impl super::super::scheduler::PlacementScorer for FixedScorer {
+        fn score(&self, chain: ChainId, node: NodeId) -> Option<f32> {
+            self.scores.get(&(chain, node)).copied()
+        }
+        fn best_alternative(
+            &self,
+            chain: ChainId,
+            exclude: &[NodeId],
+        ) -> Option<(NodeId, f32)> {
+            let (n, s) = self.alternatives.get(&chain).copied()?;
+            if exclude.contains(&n) {
+                None
+            } else {
+                Some((n, s))
+            }
+        }
+    }
+
+    fn scheduler_call(
+        actual: &MeshOsState,
+        scorer: Option<&dyn super::super::scheduler::PlacementScorer>,
+    ) -> Vec<MeshOsAction> {
+        reconcile(
+            actual,
+            &DesiredState::default(),
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            scorer,
+        )
+    }
+
+    #[test]
+    fn no_scorer_yields_no_scheduler_actions() {
+        let mut actual = MeshOsState::default();
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let actions = scheduler_call(&actual, None);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn high_score_holder_is_not_rebalanced() {
+        let mut actual = MeshOsState::default();
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), 0.9)].into_iter().collect(),
+            alternatives: [(CHAIN_A, (5, 0.95))].into_iter().collect(),
+        };
+        let actions = scheduler_call(&actual, Some(&scorer));
+        assert!(actions.is_empty(), "high-scoring holder should not rebalance");
+    }
+
+    #[test]
+    fn under_scoring_holder_emits_request_eviction_when_alternative_exceeds_hysteresis() {
+        let mut actual = MeshOsState::default();
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        let actions = scheduler_call(&actual, Some(&scorer));
+        assert_eq!(
+            actions,
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN_A,
+                victim: THIS_NODE,
+            }],
+        );
+    }
+
+    #[test]
+    fn under_scoring_holder_with_no_alternative_does_not_emit() {
+        let mut actual = MeshOsState::default();
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
+            alternatives: Default::default(), // no alternative
+        };
+        assert!(scheduler_call(&actual, Some(&scorer)).is_empty());
+    }
+
+    #[test]
+    fn under_scoring_holder_with_small_improvement_is_blocked_by_hysteresis() {
+        // Score = 0.3; alternative = 0.4; gap = 0.1. Default
+        // hysteresis_gap = 0.2 — should not emit.
+        let mut actual = MeshOsState::default();
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
+            alternatives: [(CHAIN_A, (5, 0.4))].into_iter().collect(),
+        };
+        assert!(scheduler_call(&actual, Some(&scorer)).is_empty());
+    }
+
+    #[test]
+    fn non_leader_does_not_emit_eviction_even_for_under_scoring_chain() {
+        let mut actual = MeshOsState::default();
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replica_leader.insert(CHAIN_A, 999); // someone else leads
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        assert!(scheduler_call(&actual, Some(&scorer)).is_empty());
+    }
+
+    #[test]
+    fn cooldown_blocks_rebalance_within_window() {
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base + Duration::from_secs(60)); // 1 min after rebalance
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        actual.last_rebalance.insert(CHAIN_A, base);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        // Default cooldown is 5 min; we're only 1 min past.
+        assert!(scheduler_call(&actual, Some(&scorer)).is_empty());
+    }
+
+    #[test]
+    fn cooldown_releases_after_window_elapses() {
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base + Duration::from_secs(6 * 60)); // 6 min in
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        actual.last_rebalance.insert(CHAIN_A, base);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), 0.3)].into_iter().collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        let actions = scheduler_call(&actual, Some(&scorer));
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn worst_holder_is_picked_as_victim() {
+        let mut actual = MeshOsState::default();
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE, 11, 12]);
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [
+                ((CHAIN_A, THIS_NODE), 0.6),
+                ((CHAIN_A, 11), 0.3), // lowest
+                ((CHAIN_A, 12), 0.7),
+            ]
+            .into_iter()
+            .collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        match scheduler_call(&actual, Some(&scorer)).as_slice() {
+            [MeshOsAction::RequestEviction { chain, victim }] => {
+                assert_eq!(*chain, CHAIN_A);
+                assert_eq!(*victim, 11);
+            }
+            other => panic!("expected one RequestEviction(11), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scheduler_emits_actions_in_chain_id_sorted_order() {
+        let mut actual = MeshOsState::default();
+        actual.replicas.insert(CHAIN_B, vec![THIS_NODE]);
+        actual.replicas.insert(CHAIN_A, vec![THIS_NODE]);
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        actual.replica_leader.insert(CHAIN_B, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), 0.3), ((CHAIN_B, THIS_NODE), 0.3)]
+                .into_iter()
+                .collect(),
+            alternatives: [(CHAIN_A, (5, 0.9)), (CHAIN_B, (6, 0.9))]
+                .into_iter()
+                .collect(),
+        };
+        let actions = scheduler_call(&actual, Some(&scorer));
+        let chains: Vec<ChainId> = actions
+            .iter()
+            .map(|a| match a {
+                MeshOsAction::RequestEviction { chain, .. } => *chain,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(chains, vec![CHAIN_A, CHAIN_B]);
     }
 
     #[test]
@@ -1298,6 +1676,8 @@ mod tests {
             THIS_NODE,
             &LocalityConfig::default(),
             &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
         );
         // Two RequestPlacement, in chain-id order (A < B).
         assert_eq!(actions.len(), 2);

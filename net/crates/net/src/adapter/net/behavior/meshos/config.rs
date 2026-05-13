@@ -46,6 +46,9 @@ pub struct MeshOsConfig {
     /// Phase E — maintenance state machine tuning (drain
     /// deadlines, recovery ramp-up window).
     pub maintenance: MaintenanceConfig,
+
+    /// Phase D-1 — continuous-rebalance scoring tunables.
+    pub scheduler: super::scheduler::SchedulerConfig,
 }
 
 impl Default for MeshOsConfig {
@@ -58,6 +61,7 @@ impl Default for MeshOsConfig {
             backpressure: BackpressureConfig::default(),
             locality: LocalityConfig::default(),
             maintenance: MaintenanceConfig::default(),
+            scheduler: super::scheduler::SchedulerConfig::default(),
         }
     }
 }

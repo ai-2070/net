@@ -28,6 +28,7 @@ use super::config::MeshOsConfig;
 use super::event::MeshOsEvent;
 use super::probes::{HealthProbe, LocalityProbe};
 use super::reconcile::reconcile;
+use super::scheduler::SchedulerRegistry;
 use super::snapshot::MeshOsSnapshot;
 use super::state::{DesiredState, MeshOsState};
 
@@ -76,6 +77,12 @@ pub struct MeshOsLoop {
     /// spawns the loop immediately and attaches probes via the
     /// registry).
     probes: ProbeRegistryInner,
+
+    /// Phase D-1 scheduler registry — single-slot pluggable
+    /// [`super::scheduler::PlacementScorer`]. Shared via Arc;
+    /// install via [`SchedulerRegistry::install`] before or
+    /// after `run()`.
+    scheduler: SchedulerRegistry,
 
     /// Reconcile-pass counter — used by tests / diagnostics to
     /// confirm reconcile fired exactly once per Tick.
@@ -226,6 +233,7 @@ impl MeshOsLoop {
             snapshot,
             pending_snapshot_actions: Vec::new(),
             probes: ProbeRegistryInner::default(),
+            scheduler: SchedulerRegistry::new(),
             reconcile_count: 0,
         };
         (me, handle, actions_rx, reader)
@@ -238,6 +246,14 @@ impl MeshOsLoop {
     /// into the spawned task at that point).
     pub fn with_probe_registry(mut self, registry: ProbeRegistry) -> Self {
         self.probes = registry.inner;
+        self
+    }
+
+    /// Attach a scheduler registry. The reconcile pass reads
+    /// the registered scorer to drive Phase D-1 rebalancing.
+    /// Cloneable + shareable like the probe registry.
+    pub fn with_scheduler_registry(mut self, registry: SchedulerRegistry) -> Self {
+        self.scheduler = registry;
         self
     }
 
@@ -320,13 +336,24 @@ impl MeshOsLoop {
     }
 
     async fn run_reconcile(&mut self) {
+        let scorer = self.scheduler.current();
         let actions = reconcile(
             &self.actual,
             &self.desired,
             self.config.this_node,
             &self.config.locality,
             &self.config.maintenance,
+            &self.config.scheduler,
+            scorer.as_deref(),
         );
+        // Record cooldowns for any RequestEviction we emit so
+        // the same chain doesn't flap on the next tick.
+        let now = std::time::Instant::now();
+        for action in &actions {
+            if let super::action::MeshOsAction::RequestEviction { chain, .. } = action {
+                self.actual.last_rebalance.insert(*chain, now);
+            }
+        }
         self.reconcile_count += 1;
         let now = std::time::Instant::now();
         for action in actions {
@@ -378,6 +405,7 @@ pub(crate) fn fast_test_config() -> MeshOsConfig {
         backpressure: Default::default(),
         locality: Default::default(),
         maintenance: Default::default(),
+        scheduler: Default::default(),
     }
 }
 

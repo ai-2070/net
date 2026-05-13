@@ -218,6 +218,7 @@ mod tests {
             backpressure: Default::default(),
             locality: Default::default(),
             maintenance: Default::default(),
+            scheduler: Default::default(),
         }
     }
 
