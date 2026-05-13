@@ -1,0 +1,27 @@
+net/crates/net/include/net_meshdb.h
+  s_3bbc444b3ef3e5::t_a5ceacbe23eb3b 50-67
+  s_3bbc444b3ef3e5::t_504e85655d7308 445-467
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_3bbc444b3ef3e5::t_4b65eacbc98222 1716-1785
+  s_3bbc444b3ef3e5::t_b6753f088be12c 63-162
+  s_3bbc444b3ef3e5::t_41ac03e412d0fa 27-35
+  s_3bbc444b3ef3e5::t_6df9fe17438127 1092,1095,1100-1127
+  s_3bbc444b3ef3e5::t_4622cc8391eaeb 37-39
+  s_3bbc444b3ef3e5::t_c5ae38916318f1 1159,1162,1189-1209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.7",
+  "base_commit_sha": "6fff1b91a01e4996f12e7555dee3b00a729b5028",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
