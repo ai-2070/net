@@ -1,0 +1,33 @@
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_3bbc444b3ef3e5::t_dc64f66143580d 985-1001
+  s_3bbc444b3ef3e5::t_a4981019169e16 1032-1033
+  s_3bbc444b3ef3e5::t_051f6a174e6de2 1063-1064
+net/crates/net/docs/plans/MESHDB_PLAN.md
+  s_3bbc444b3ef3e5::t_7f1d9f50d4ce8c 12
+  s_3bbc444b3ef3e5::t_f5dd0f6e2633b7 7
+net/crates/net/docs/plans/CORTEX_ADAPTER_PLAN.md
+  s_3bbc444b3ef3e5::t_589bc7ac9428e0 10-12
+net/crates/net/bindings/python/src/meshdb.rs
+  s_3bbc444b3ef3e5::t_5a7f617aa596b9 1342-1358
+  s_3bbc444b3ef3e5::t_039f392a4138d5 1379,1391
+net/crates/net/include/net_meshdb.h
+  s_3bbc444b3ef3e5::t_816fec6ed28c79 74-88
+net/crates/net/bindings/node/meshdb.ts
+  s_3bbc444b3ef3e5::t_65bcb0a40fe283 56-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "8c946609440b0ebafab709e49057ef938ab53858",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
