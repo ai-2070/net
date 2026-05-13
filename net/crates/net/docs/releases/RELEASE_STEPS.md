@@ -12,27 +12,27 @@
 
 ```bash
 # Main release
-git tag vX && git push origin vX
+git tag v0.16.0 && git push origin v0.16.0
 
 # Rust crates → crates.io
-git tag crates-vX && git push origin crates-vX
+git tag crates-v0.16.0 && git push origin crates-v0.16.0
 
 # Python binding wheels → PyPI (`ai2070-net`)
-git tag python-vX && git push origin python-vX
+git tag python-v0.16.0 && git push origin python-v0.16.0
 
 # Python SDK → PyPI (`ai2070-net-sdk`)
-git tag pypi-sdk-vX && git push origin pypi-sdk-vX
+git tag pypi-sdk-v0.16.0 && git push origin pypi-sdk-v0.16.0
 
 # Node binding → npm (`@ai2070/net`)
-git tag node-vX && git push origin node-vX
+git tag node-v0.16.0 && git push origin node-v0.16.0
 
 # TS SDK → npm (`@ai2070/net-sdk`)
-git tag npm-sdk-vX && git push origin npm-sdk-vX
+git tag npm-sdk-v0.16.0 && git push origin npm-sdk-v0.16.0
 ```
 
 
 If anything goes wrong during build:
 ```bash
 # Delete release tag
-git tag -d X && git push origin --delete X
+git tag -d 0.16.0 && git push origin --delete 0.16.0
 ```
