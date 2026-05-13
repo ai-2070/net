@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/predicate.rs
+  s_3bbc444b3ef3e5::t_a1f92c4201d420 4162-4171,4178-4188,4224
+  s_3bbc444b3ef3e5::t_975d848c21c765 437,439-448,450-616,618-623,625-631,634-638
+  s_3bbc444b3ef3e5::t_c0bee092c7e89d 4172-4177,4189-4223
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_3bbc444b3ef3e5::t_92aa4fde16e307 779-786,789,792-798
+  s_3bbc444b3ef3e5::t_870556c3ed6317 1630-1653
+  s_3bbc444b3ef3e5::t_480d82032aaadf 870,880
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "1f90177cdd1e4a0ab07766658d92a6b958dfe531",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
