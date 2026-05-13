@@ -644,7 +644,9 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
                             origin: row.origin,
                             seq: row.seq,
                         },
-                        super::planner::JoinKeyMode::Field(_) => GroupKey::Origin(row.origin),
+                        super::planner::JoinKeyMode::Field(_) => unreachable!(
+                            "JoinKeyMode::Field reached federated_aggregate_numeric; payload-keyed group_by is not supported",
+                        ),
                     };
                     (bytes, Some(group))
                 }
@@ -768,7 +770,9 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
                             origin: row.origin,
                             seq: row.seq,
                         },
-                        super::planner::JoinKeyMode::Field(_) => GroupKey::Origin(row.origin),
+                        super::planner::JoinKeyMode::Field(_) => unreachable!(
+                            "JoinKeyMode::Field reached federated_aggregate_count; payload-keyed group_by is not supported",
+                        ),
                     };
                     let entry = counts.entry(key_bytes).or_insert((key, 0));
                     entry.1 = entry.1.saturating_add(1);
@@ -810,23 +814,11 @@ fn federated_hash_join(
     emit_unmatched_build: bool,
     swap: bool,
 ) -> Result<Vec<JoinedPair>, MeshError> {
-    use std::collections::HashMap;
-    let mut build_bytes: u64 = 0;
-    let mut build: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
-    for row in build_rows {
-        let Some(key) = try_encode_join_key_federated(&row, key_mode) else {
-            continue;
-        };
-        let approx = (row.payload.len() + key.len() + 64) as u64;
-        build_bytes = build_bytes.saturating_add(approx);
-        if build_bytes > super::executor::HASH_JOIN_MEMORY_BYTES {
-            return Err(MeshError::JoinMemoryExceeded {
-                strategy: "broadcast-hash-federated".to_string(),
-                threshold_bytes: super::executor::HASH_JOIN_MEMORY_BYTES,
-            });
-        }
-        build.entry(key).or_default().push((row, false));
-    }
+    let mut build = super::executor::build_hash_join_table(
+        build_rows,
+        key_mode,
+        "broadcast-hash-federated",
+    )?;
 
     let mut out = Vec::new();
     for p in probe_rows {
@@ -866,23 +858,11 @@ fn federated_full_outer(
     right_rows: Vec<ResultRow>,
     key_mode: &super::planner::JoinKeyMode,
 ) -> Result<Vec<JoinedPair>, MeshError> {
-    use std::collections::HashMap;
-    let mut build_bytes: u64 = 0;
-    let mut right_map: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
-    for row in right_rows {
-        let Some(key) = try_encode_join_key_federated(&row, key_mode) else {
-            continue;
-        };
-        let approx = (row.payload.len() + key.len() + 64) as u64;
-        build_bytes = build_bytes.saturating_add(approx);
-        if build_bytes > super::executor::HASH_JOIN_MEMORY_BYTES {
-            return Err(MeshError::JoinMemoryExceeded {
-                strategy: "broadcast-hash-federated".to_string(),
-                threshold_bytes: super::executor::HASH_JOIN_MEMORY_BYTES,
-            });
-        }
-        right_map.entry(key).or_default().push((row, false));
-    }
+    let mut right_map = super::executor::build_hash_join_table(
+        right_rows,
+        key_mode,
+        "broadcast-hash-federated",
+    )?;
 
     let mut out = Vec::new();
     for l in left_rows {
@@ -1068,6 +1048,18 @@ fn translate_responses(mut response_stream: ResponseStream, handle: QueryHandle)
                 }
             }
         }
+        // Stream ended without a terminal frame (no End / Error
+        // / final-batch). All terminal arms above `return`, so
+        // reaching here means the transport dropped the stream
+        // prematurely. Per the protocol contract this is a
+        // transport-level error — surface it so consumers don't
+        // mistake premature drop for clean EOS.
+        let _ = tx
+            .send(Err(MeshError::ExecutorError {
+                node: 0,
+                detail: "transport stream ended before terminal frame".to_string(),
+            }))
+            .await;
     });
     Box::pin(ReceiverStream::new(rx))
 }

@@ -141,11 +141,11 @@ impl CachedResult {
         }
     }
 
-    /// Approximate in-memory byte size: payload bytes + a
-    /// fixed per-row overhead. Used to enforce
-    /// `LRU_MAX_BYTES`.
+    /// Approximate in-memory byte size: payload bytes + the
+    /// per-row struct overhead (origin + seq + Vec header).
+    /// Used to enforce `LRU_MAX_BYTES`.
     fn approx_bytes(&self) -> u64 {
-        let row_overhead: u64 = 64; // ResultRow header bytes (origin + seq + Vec header)
+        let row_overhead = std::mem::size_of::<ResultRow>() as u64;
         self.rows
             .iter()
             .map(|r| r.payload.len() as u64 + row_overhead)
@@ -491,8 +491,10 @@ mod tests {
 
     #[test]
     fn lru_evicts_when_byte_bound_trips() {
-        // 100-byte budget; each row ~72 bytes (64 overhead + 8 payload).
-        let cache = LruResultCache::new(usize::MAX, 100);
+        // Budget tuned to fit exactly one row given the live
+        // `ResultRow` size — see `CachedResult::approx_bytes`.
+        let row_bytes = std::mem::size_of::<ResultRow>() as u64 + 8; // 8-byte payload
+        let cache = LruResultCache::new(usize::MAX, row_bytes + 1);
         cache.insert(key(1, 0), make_result(make_rows(1), CachePolicy::Permanent));
         assert_eq!(cache.len(), 1);
         cache.insert(key(2, 0), make_result(make_rows(1), CachePolicy::Permanent));

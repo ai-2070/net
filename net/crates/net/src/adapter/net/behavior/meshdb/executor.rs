@@ -468,26 +468,7 @@ fn hash_join_one_sided(
     emit_unmatched_build: bool,
     swap: bool,
 ) -> Result<Vec<ResultRow>, MeshError> {
-    use std::collections::HashMap;
-    let mut build_bytes: u64 = 0;
-    let mut build: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
-    for row in build_rows {
-        // Rows whose key field can't be extracted are dropped
-        // — they don't participate in matches, and for outer
-        // joins they don't form unmatched-build rows either.
-        let Some(key) = try_encode_join_key(&row, key_mode) else {
-            continue;
-        };
-        let approx = (row.payload.len() + key.len() + 64) as u64;
-        build_bytes = build_bytes.saturating_add(approx);
-        if build_bytes > HASH_JOIN_MEMORY_BYTES {
-            return Err(MeshError::JoinMemoryExceeded {
-                strategy: "broadcast-hash".to_string(),
-                threshold_bytes: HASH_JOIN_MEMORY_BYTES,
-            });
-        }
-        build.entry(key).or_default().push((row, false));
-    }
+    let mut build = build_hash_join_table(build_rows, key_mode, "broadcast-hash")?;
 
     let mut out = Vec::new();
     for p in probe_rows {
@@ -530,23 +511,7 @@ fn hash_join_full_outer(
     right_rows: Vec<ResultRow>,
     key_mode: &JoinKeyMode,
 ) -> Result<Vec<ResultRow>, MeshError> {
-    use std::collections::HashMap;
-    let mut build_bytes: u64 = 0;
-    let mut right_map: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
-    for row in right_rows {
-        let Some(key) = try_encode_join_key(&row, key_mode) else {
-            continue;
-        };
-        let approx = (row.payload.len() + key.len() + 64) as u64;
-        build_bytes = build_bytes.saturating_add(approx);
-        if build_bytes > HASH_JOIN_MEMORY_BYTES {
-            return Err(MeshError::JoinMemoryExceeded {
-                strategy: "broadcast-hash".to_string(),
-                threshold_bytes: HASH_JOIN_MEMORY_BYTES,
-            });
-        }
-        right_map.entry(key).or_default().push((row, false));
-    }
+    let mut right_map = build_hash_join_table(right_rows, key_mode, "broadcast-hash")?;
 
     let mut out = Vec::new();
     for l in left_rows {
@@ -941,13 +906,13 @@ fn group_key_for(row: &ResultRow, mode: &JoinKeyMode) -> GroupKey {
             seq: row.seq,
         },
         JoinKeyMode::Field(path) => {
-            // Defensive: should be unreachable given the
-            // planner's group_by_mode rejection. We fold the
-            // field into a synthetic Origin key built from the
-            // field hash so the row still lands somewhere
-            // identifiable.
-            let _ = path;
-            GroupKey::Origin(row.origin)
+            // The planner rejects payload-keyed group_by today
+            // (no GroupKey::Field variant). A future path that
+            // emits this would silently collapse every row into
+            // a per-origin bucket — fail fast instead.
+            unreachable!(
+                "JoinKeyMode::Field({path:?}) reached group_key_for; payload-keyed group_by is not supported"
+            )
         }
     }
 }
@@ -988,6 +953,45 @@ fn encode_joined_row(
 /// Phase D-1 hash-join memory bound. Per-query, build-side.
 /// Tunable in Phase D-2 once a consumer drives the value.
 pub const HASH_JOIN_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Build the hash-join probe table from a side of rows.
+///
+/// Shared by the local executor's three hash-join variants
+/// (one-sided / full-outer / payload-keyed) and by the
+/// federated executor's mirror helpers. Encapsulates:
+/// - key extraction (rows with no extractable key are dropped),
+/// - per-row approximate-byte accounting against
+///   [`HASH_JOIN_MEMORY_BYTES`],
+/// - the `Vec<(ResultRow, bool)>` shape carrying the
+///   "already matched" flag used by outer joins.
+///
+/// `strategy_label` flows into [`MeshError::JoinMemoryExceeded`]
+/// so the diagnostic identifies the caller (broadcast-hash vs
+/// broadcast-hash-federated).
+pub(crate) fn build_hash_join_table(
+    rows: Vec<ResultRow>,
+    key_mode: &JoinKeyMode,
+    strategy_label: &str,
+) -> Result<std::collections::HashMap<Vec<u8>, Vec<(ResultRow, bool)>>, MeshError> {
+    use std::collections::HashMap;
+    let mut build_bytes: u64 = 0;
+    let mut table: HashMap<Vec<u8>, Vec<(ResultRow, bool)>> = HashMap::new();
+    for row in rows {
+        let Some(key) = try_encode_join_key(&row, key_mode) else {
+            continue;
+        };
+        let approx = (row.payload.len() + key.len() + 64) as u64;
+        build_bytes = build_bytes.saturating_add(approx);
+        if build_bytes > HASH_JOIN_MEMORY_BYTES {
+            return Err(MeshError::JoinMemoryExceeded {
+                strategy: strategy_label.to_string(),
+                threshold_bytes: HASH_JOIN_MEMORY_BYTES,
+            });
+        }
+        table.entry(key).or_default().push((row, false));
+    }
+    Ok(table)
+}
 
 /// Try to extract the join key from a [`ResultRow`] under the
 /// given mode. `None` when `JoinKeyMode::Field` resolves to a
